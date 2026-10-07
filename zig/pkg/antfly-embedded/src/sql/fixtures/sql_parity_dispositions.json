@@ -1543,13 +1543,21 @@
     },
     {
       "id": "sql-0188",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact unchanged SQL and parameters execute through mounted HTTP over native typed rows. PostgreSQL verifies the complete nonempty result, labels, types, ordering and SQL NULL provenance. Shared scalar and vector contracts additionally verify reversed and NULL BETWEEN bounds, boolean-only UNKNOWN tests and bounded allocation-free parameter evaluation.",
+      "evidence": [
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL executes one relational page with exact integer parameters", "gate": "sql-mounted-read-shapes"},
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL executes one relational page with exact integer parameters", "gate": "sql-postgres-read-reference"}
+      ]
     },
     {
       "id": "sql-0189",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact unchanged SQL and parameters execute through mounted HTTP over native typed rows. PostgreSQL verifies the complete nonempty result, labels, types, ordering and SQL NULL provenance. Shared scalar and vector contracts additionally verify reversed and NULL BETWEEN bounds, boolean-only UNKNOWN tests and bounded allocation-free parameter evaluation.",
+      "evidence": [
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL executes one relational page with exact integer parameters", "gate": "sql-mounted-read-shapes"},
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL executes one relational page with exact integer parameters", "gate": "sql-postgres-read-reference"}
+      ]
     },
     {
       "id": "sql-0190",
@@ -1931,8 +1939,12 @@
     },
     {
       "id": "sql-0225",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact unchanged SQL and parameters execute through mounted HTTP over native typed rows. PostgreSQL verifies the complete nonempty result, labels, types, ordering and SQL NULL provenance. Shared scalar and vector contracts additionally verify reversed and NULL BETWEEN bounds, boolean-only UNKNOWN tests and bounded allocation-free parameter evaluation.",
+      "evidence": [
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL executes one relational page with exact integer parameters", "gate": "sql-mounted-read-shapes"},
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL executes one relational page with exact integer parameters", "gate": "sql-postgres-read-reference"}
+      ]
     },
     {
       "id": "sql-0226",
@@ -2034,13 +2046,21 @@
     },
     {
       "id": "sql-0230",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact unchanged SQL and parameters execute through mounted HTTP over native typed rows. PostgreSQL verifies the complete nonempty result, labels, types, ordering and SQL NULL provenance. Shared scalar and vector contracts additionally verify reversed and NULL BETWEEN bounds, boolean-only UNKNOWN tests and bounded allocation-free parameter evaluation.",
+      "evidence": [
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL executes one relational page with exact integer parameters", "gate": "sql-mounted-read-shapes"},
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL executes one relational page with exact integer parameters", "gate": "sql-postgres-read-reference"}
+      ]
     },
     {
       "id": "sql-0231",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact unchanged SQL and parameters execute through mounted HTTP over native typed rows. PostgreSQL verifies the complete nonempty result, labels, types, ordering and SQL NULL provenance. Shared scalar and vector contracts additionally verify reversed and NULL BETWEEN bounds, boolean-only UNKNOWN tests and bounded allocation-free parameter evaluation.",
+      "evidence": [
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL executes one relational page with exact integer parameters", "gate": "sql-mounted-read-shapes"},
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL executes one relational page with exact integer parameters", "gate": "sql-postgres-read-reference"}
+      ]
     },
     {
       "id": "sql-0232",
@@ -6494,7 +6514,7 @@
     {
       "id": "sql-0672",
       "status": "rejected",
-      "reason": "Exact pinned original rejection is preserved by InvalidSqlSyntax at the complete-statement compiler boundary, with a nonempty source-bounded diagnostic and no backend acquisition. No SQL prefix is executed.",
+      "reason": "The parser recognizes STORED generation but rejects its scalar subquery with UnsupportedSqlShape and a source-bounded diagnostic before backend acquisition. PostgreSQL independently rejects this exact generated subquery with SQLSTATE 0A000. No SQL prefix is executed.",
       "evidence": [
         {
           "path": "zig/pkg/antfly/src/sql/parity_case_test.zig",
@@ -7245,7 +7265,7 @@
     {
       "id": "sql-0792",
       "status": "rejected",
-      "reason": "Exact pinned original rejection is preserved by InvalidSqlSyntax at the complete-statement compiler boundary, with a nonempty source-bounded diagnostic and no backend acquisition. No SQL prefix is executed.",
+      "reason": "The generated-column clause parses, then unsupported document-schema extension syntax rejects with UnsupportedSqlShape at the complete-statement compiler boundary, with a nonempty source-bounded diagnostic and no backend acquisition. No SQL prefix is executed.",
       "evidence": [
         {
           "path": "zig/pkg/antfly/src/sql/parity_case_test.zig",

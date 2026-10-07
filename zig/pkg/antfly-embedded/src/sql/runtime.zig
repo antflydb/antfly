@@ -355,6 +355,10 @@ pub const Context = struct {
         // SQL bigint uses a lossless string wire representation. A JSON
         // numeric scalar is still a JSON number, not a SQL bigint cell.
         if (kind == .json) return clone(self.arena, value_);
+        // Native preparation can preserve exact JSON numeric tokens rather
+        // than materialize i64 cells. The declared SQL type, not that physical
+        // JSON tag, determines the transport encoding. Normalize without f64.
+        if (kind == .integer) return self.outputValue(try describe.coerceAlloc(self.arena, value_, .integer));
         return self.outputValue(value_);
     }
 
@@ -1568,6 +1572,26 @@ fn jsonSize(value: Json) usize {
         },
         else => @sizeOf(Json),
     };
+}
+
+test "SQL integer output canonicalizes exact native tokens without changing JSON numbers" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var fixture: TestBackend = .{};
+    const context: Context = .{ .alloc = a, .arena = a, .backend = fixture.iface(), .binding = undefined, .parameters = &.{}, .limits = .{} };
+    for ([_][]const u8{ "3", "9007199254740993", "9223372036854775807", "-9223372036854775808" }) |text| {
+        const token: Json = .{ .number_string = text };
+        const wire = try context.outputDatum(Datum.json(token), .integer, null);
+        try std.testing.expectEqualStrings(text, wire.string);
+        try std.testing.expectEqualStrings(text, (try context.outputDatum(Datum.json(token), .json, null)).number_string);
+        var internal = context;
+        internal.typed_output = true;
+        try std.testing.expectEqual(try std.fmt.parseInt(i64, text, 10), (try internal.outputDatum(Datum.json(token), .integer, null)).integer);
+    }
+    try std.testing.expect((try context.outputDatum(.{}, .integer, null)) == .null);
+    try std.testing.expectError(error.SqlTypeMismatch, context.outputDatum(Datum.json(.{ .number_string = "9223372036854775808" }), .integer, null));
+    try std.testing.expectError(error.SqlTypeMismatch, context.outputDatum(Datum.json(.{ .number_string = "1.5" }), .integer, null));
 }
 
 fn mutationArrayOwnershipScenario(backing: std.mem.Allocator) !void {

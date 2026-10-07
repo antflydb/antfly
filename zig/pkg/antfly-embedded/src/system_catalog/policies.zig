@@ -65,6 +65,9 @@ pub const Predicate = struct {
                     const operand = self.instructions[node.operand].type.kind;
                     switch (node.op) {
                         .not, .is_true, .is_not_true, .is_false, .is_not_false => if (instruction.type.kind != .boolean or operand != .boolean) return error.InvalidRowPolicyProgram,
+                        // SQL binding canonicalizes these boolean-only syntax
+                        // forms to the existing null-test execution opcodes.
+                        .is_unknown, .is_not_unknown => return error.InvalidRowPolicyProgram,
                         .is_null, .is_not_null => if (instruction.type.kind != .boolean) return error.InvalidRowPolicyProgram,
                         .positive, .negative => if (instruction.type.kind == null or operand != instruction.type.kind or (operand != .integer and operand != .number)) return error.InvalidRowPolicyProgram,
                     }

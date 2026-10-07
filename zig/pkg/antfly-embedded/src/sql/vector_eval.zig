@@ -502,7 +502,7 @@ fn evaluateInput(a: std.mem.Allocator, program: *const scalar.Program, inputs: a
     return vectors[0];
 }
 pub fn unary(op: @import("ast.zig").Scalar.Unary, value: Datum) !Datum {
-    if (op == .is_null or op == .is_not_null) return Datum.json(.{ .bool = value.sql_null == (op == .is_null) });
+    if (op == .is_null or op == .is_not_null or op == .is_unknown or op == .is_not_unknown) return Datum.json(.{ .bool = value.sql_null == (op == .is_null or op == .is_unknown) });
     if (value.array != null) return error.SqlTypeMismatch;
     if (op == .is_true or op == .is_not_true or op == .is_false or op == .is_not_false) {
         const target = op == .is_true or op == .is_not_true;

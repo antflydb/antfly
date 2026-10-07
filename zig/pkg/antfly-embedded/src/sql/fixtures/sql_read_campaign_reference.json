@@ -936,6 +936,82 @@
       "affected": 0
     },
     {
+      "id": "sql-0188",
+      "columns": [
+        "id"
+      ],
+      "rows": [
+        [
+          "u6"
+        ],
+        [
+          "u5"
+        ],
+        [
+          "u4"
+        ],
+        [
+          "u1"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0189",
+      "columns": [
+        "id"
+      ],
+      "rows": [
+        [
+          "u6"
+        ],
+        [
+          "u5"
+        ],
+        [
+          "u4"
+        ],
+        [
+          "u1"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
       "id": "sql-0191",
       "columns": [
         "id"
@@ -2384,6 +2460,176 @@
       "affected": 0
     },
     {
+      "id": "sql-0225",
+      "columns": [
+        "id"
+      ],
+      "rows": [
+        [
+          "c1"
+        ],
+        [
+          "c2"
+        ],
+        [
+          "u1"
+        ],
+        [
+          "u10"
+        ],
+        [
+          "u11"
+        ],
+        [
+          "u12"
+        ],
+        [
+          "u13"
+        ],
+        [
+          "u14"
+        ],
+        [
+          "u15"
+        ],
+        [
+          "u16"
+        ],
+        [
+          "u17"
+        ],
+        [
+          "u18"
+        ],
+        [
+          "u19"
+        ],
+        [
+          "u2"
+        ],
+        [
+          "u20"
+        ],
+        [
+          "u21"
+        ],
+        [
+          "u22"
+        ],
+        [
+          "u23"
+        ],
+        [
+          "u24"
+        ],
+        [
+          "u3"
+        ],
+        [
+          "u4"
+        ],
+        [
+          "u5"
+        ],
+        [
+          "u6"
+        ],
+        [
+          "u7"
+        ],
+        [
+          "u8"
+        ],
+        [
+          "u9"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
       "id": "sql-0226",
       "columns": [
         "id"
@@ -2467,6 +2713,94 @@
         ],
         [
           "u11"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0230",
+      "columns": [
+        "id"
+      ],
+      "rows": [
+        [
+          "u1"
+        ],
+        [
+          "u3"
+        ],
+        [
+          "u4"
+        ],
+        [
+          "u5"
+        ],
+        [
+          "u6"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0231",
+      "columns": [
+        "id"
+      ],
+      "rows": [
+        [
+          "u1"
+        ],
+        [
+          "u3"
+        ],
+        [
+          "u4"
+        ],
+        [
+          "u5"
+        ],
+        [
+          "u6"
         ]
       ],
       "sql_nulls": [
@@ -4932,10 +5266,34 @@
     },
     {
       "id": "sql-0560",
-      "columns": ["customer_id", "modal_status"],
-      "rows": [["c1", "ready"], ["c2", "ready"]],
-      "sql_nulls": [[false, false], [false, false]],
-      "column_oids": [25, 25],
+      "columns": [
+        "customer_id",
+        "modal_status"
+      ],
+      "rows": [
+        [
+          "c1",
+          "ready"
+        ],
+        [
+          "c2",
+          "ready"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        25
+      ],
       "affected": 0
     },
     {
@@ -4955,9 +5313,9 @@
               }
             ],
             "values": [
-              15,
-              33,
-              51
+              15.0,
+              33.0,
+              51.0
             ],
             "sql_nulls": [
               false,
@@ -4976,9 +5334,9 @@
               }
             ],
             "values": [
-              18,
-              36,
-              54
+              18.0,
+              36.0,
+              54.0
             ],
             "sql_nulls": [
               false,
@@ -5006,42 +5364,162 @@
     },
     {
       "id": "sql-0562",
-      "columns": ["customer_id", "median_amount"],
-      "rows": [["c1", 33.0], ["c2", 36.0]],
-      "sql_nulls": [[false, false], [false, false]],
-      "column_oids": [25, 701],
+      "columns": [
+        "customer_id",
+        "median_amount"
+      ],
+      "rows": [
+        [
+          "c1",
+          33.0
+        ],
+        [
+          "c2",
+          36.0
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        701
+      ],
       "affected": 0
     },
     {
       "id": "sql-0563",
-      "columns": ["customer_id", "median_amount"],
-      "rows": [["c1", 33.0], ["c2", 36.0]],
-      "sql_nulls": [[false, false], [false, false]],
-      "column_oids": [25, 701],
+      "columns": [
+        "customer_id",
+        "median_amount"
+      ],
+      "rows": [
+        [
+          "c1",
+          33.0
+        ],
+        [
+          "c2",
+          36.0
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        701
+      ],
       "affected": 0
     },
     {
       "id": "sql-0564",
-      "columns": ["customer_id", "open_median"],
-      "rows": [["c1", null], ["c2", 12.0]],
-      "sql_nulls": [[false, true], [false, false]],
-      "column_oids": [25, 701],
+      "columns": [
+        "customer_id",
+        "open_median"
+      ],
+      "rows": [
+        [
+          "c1",
+          null
+        ],
+        [
+          "c2",
+          12.0
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          true
+        ],
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        701
+      ],
       "affected": 0
     },
     {
       "id": "sql-0565",
-      "columns": ["customer_id", "median_amount"],
-      "rows": [["c1", 33], ["c2", 36]],
-      "sql_nulls": [[false, false], [false, false]],
-      "column_oids": [25, 20],
+      "columns": [
+        "customer_id",
+        "median_amount"
+      ],
+      "rows": [
+        [
+          "c1",
+          33
+        ],
+        [
+          "c2",
+          36
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        20
+      ],
       "affected": 0
     },
     {
       "id": "sql-0566",
-      "columns": ["customer_id", "median_amount"],
-      "rows": [["c1", 33.0], ["c2", 36.0]],
-      "sql_nulls": [[false, false], [false, false]],
-      "column_oids": [25, 701],
+      "columns": [
+        "customer_id",
+        "median_amount"
+      ],
+      "rows": [
+        [
+          "c1",
+          33.0
+        ],
+        [
+          "c2",
+          36.0
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        701
+      ],
       "affected": 0
     },
     {
@@ -5573,5 +6051,6 @@
       "affected": 0
     }
   ],
+  "excluded": [],
   "server_version": 180006
 }

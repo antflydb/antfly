@@ -78,6 +78,8 @@ pub fn lowerColumns(alloc: std.mem.Allocator, columns: []const scalar.Column, ex
                     .not => "not",
                     .is_null => "is_null",
                     .is_not_null => "is_not_null",
+                    .is_unknown => "is_null",
+                    .is_not_unknown => "is_not_null",
                     else => return error.UnsupportedSqlShape,
                 };
                 break :blk try json(alloc, .{ .op = op, .args = &[_]Json{values[part.operand]} });

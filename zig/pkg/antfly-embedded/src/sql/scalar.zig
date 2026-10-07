@@ -559,6 +559,67 @@ test "SQL typed containment prepares immutable indexes and releases allocation f
     std.debug.print("SQL prepared containment: rows=10000 elapsed_ns={} row_allocations=0\n", .{std.Io.Clock.now(.awake, std.testing.io).nanoseconds - start});
 }
 
+test "SQL predicate modifiers match PostgreSQL values and boolean typing" {
+    const alloc = std.testing.allocator;
+    const fixture = try std.json.parseFromSlice(struct {
+        entries: []const struct { expression: []const u8, expected: Json },
+        type_errors: []const []const u8,
+    }, alloc, @embedFile("fixtures/sql_predicate_reference.json"), .{});
+    defer fixture.deinit();
+    try std.testing.expectEqual(@as(usize, 28), fixture.value.entries.len);
+    var none = std.heap.FixedBufferAllocator.init(&.{});
+    for (fixture.value.entries) |entry| {
+        var compiled = try @import("compiler.zig").compileScalar(alloc, entry.expression, .{});
+        defer compiled.deinit();
+        var program = try bind(alloc, compiled.expression, &.{}, &.{}, .{});
+        defer program.deinit();
+        const result = try program.evaluate(none.allocator(), &.{}, &.{}, .{});
+        try std.testing.expectEqual(entry.expected == .null, result.sql_null);
+        try std.testing.expectEqual(std.math.Order.eq, try compare(result.value, entry.expected));
+        try std.testing.expectEqual(ast.ColumnType.boolean, program.output_type.kind.?);
+    }
+    for (fixture.value.type_errors) |expression| {
+        var compiled = try @import("compiler.zig").compileScalar(alloc, expression, .{});
+        defer compiled.deinit();
+        try std.testing.expectError(error.SqlTypeMismatch, bind(alloc, compiled.expression, &.{}, &.{}, .{}));
+    }
+}
+
+test "SQL predicate modifiers use bounded zero-allocation parameter evaluation and typed vectors" {
+    const alloc = std.testing.allocator;
+    var expression = try @import("compiler.zig").compileScalar(alloc, "n BETWEEN SYMMETRIC $1 AND $2", .{});
+    defer expression.deinit();
+    var program = try bind(alloc, expression.expression, &.{.{ .name = "n", .type = .integer }}, &.{ .integer, .integer }, .{});
+    defer program.deinit();
+    var none = std.heap.FixedBufferAllocator.init(&.{});
+    const parameters: []const Json = &.{ .{ .integer = 9 }, .{ .integer = 2 } };
+    const start = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
+    var matched: usize = 0;
+    for (0..10000) |i| {
+        const result = try program.evaluate(none.allocator(), &.{Datum.json(.{ .integer = @intCast(i % 10) })}, parameters, .{});
+        matched += @intFromBool(result.value.bool);
+    }
+    try std.testing.expectEqual(@as(usize, 8000), matched);
+    std.debug.print("SQL symmetric BETWEEN: rows=10000 scratch_bytes=0 elapsed_ns={}\n", .{std.Io.Clock.now(.awake, std.testing.io).nanoseconds - start});
+    try std.testing.expectError(error.SqlProgramLimitExceeded, program.evaluate(none.allocator(), &.{Datum.json(.{ .integer = 7 })}, parameters, .{ .steps = 1 }));
+    for ([_][]const u8{ "b IS UNKNOWN", "b IS NOT UNKNOWN" }, 0..) |sql, mode| {
+        var compiled = try @import("compiler.zig").compileScalar(alloc, sql, .{});
+        defer compiled.deinit();
+        var boolean = try bind(alloc, compiled.expression, &.{.{ .name = "b", .type = .boolean }}, &.{}, .{});
+        defer boolean.deinit();
+        try std.testing.expectEqual(if (mode == 0) ast.Scalar.Unary.is_null else .is_not_null, boolean.instructions[boolean.root].operation.unary.op);
+        const rows: []const []const Datum = &.{ &.{.{}}, &.{Datum.json(.{ .bool = true })}, &.{Datum.json(.{ .bool = false })} };
+        const vector = (try @import("vector_eval.zig").evaluate(alloc, &boolean, rows, &.{})).?;
+        defer alloc.free(vector);
+        for (rows, vector, 0..) |row, actual, i| {
+            const scalar_value = try boolean.evaluate(none.allocator(), row, &.{}, .{});
+            try std.testing.expect(!actual.sql_null);
+            try std.testing.expectEqual((i == 0) == (mode == 0), actual.value.bool);
+            try std.testing.expectEqual(scalar_value.value.bool, actual.value.bool);
+        }
+    }
+}
+
 test "SQL bound array expressions match PostgreSQL scalar contracts" {
     const Entry = struct { sql: []const u8, value: Json };
     const fixture = try std.json.parseFromSlice(struct { reference: []const u8, entries: []const Entry }, std.testing.allocator, @embedFile("fixtures/sql_array_expression_reference.json"), .{});
@@ -1420,7 +1481,7 @@ const Binder = struct {
                         if (input.kind != null and !numeric(input.kind)) return error.SqlTypeMismatch;
                         break :blk input;
                     },
-                    .not, .is_true, .is_not_true, .is_false, .is_not_false => if (input.kind != null and input.kind != .boolean) return error.SqlTypeMismatch,
+                    .not, .is_true, .is_not_true, .is_false, .is_not_false, .is_unknown, .is_not_unknown => if (input.kind != null and input.kind != .boolean) return error.SqlTypeMismatch,
                     else => {},
                 }
                 break :blk .{ .kind = .boolean, .nullable = unary.op == .not and input.nullable };
@@ -1730,8 +1791,15 @@ const Binder = struct {
                 break :blk .{ .column = ordinal };
             },
             .cast => |cast| .{ .cast = .{ .operand = if (cast.type == .array) try self.compileArrayContext(cast.operand, if (self.typed_parameters and cast.operand.* == .literal and cast.operand.literal == .parameter and self.parameters[cast.operand.literal.parameter - 1].kind == null) .array else null, cast.element_type, depth + 1) else try self.compileArrayContext(cast.operand, cast.type, if (self.typed_parameters) cast.element_type else null, depth + 1), .type = cast.type, .element_type = cast.element_type } },
-            .unary => |unary| .{ .unary = .{ .op = unary.op, .operand = try self.compile(unary.operand, switch (unary.op) {
-                .not, .is_true, .is_not_true, .is_false, .is_not_false => .boolean,
+            // UNKNOWN is a boolean-only spelling of a null test. Validate its
+            // operand first, then emit existing VM opcodes so persisted policy
+            // DAGs do not require a new runtime capability for this syntax.
+            .unary => |unary| .{ .unary = .{ .op = switch (unary.op) {
+                .is_unknown => .is_null,
+                .is_not_unknown => .is_not_null,
+                else => unary.op,
+            }, .operand = try self.compile(unary.operand, switch (unary.op) {
+                .not, .is_true, .is_not_true, .is_false, .is_not_false, .is_unknown, .is_not_unknown => .boolean,
                 .positive, .negative => kind.kind,
                 else => null,
             }, depth + 1) } },
@@ -2021,9 +2089,9 @@ const Evaluator = struct {
                 if (datum.value == .null and cast.type != .json) return error.SqlTypeMismatch;
                 break :blk Datum.json(try self.convert(datum.value, cast.type));
             },
-            .unary => |unary| if (unary.op == .is_null or unary.op == .is_not_null) blk: {
+            .unary => |unary| if (unary.op == .is_null or unary.op == .is_not_null or unary.op == .is_unknown or unary.op == .is_not_unknown) blk: {
                 const datum = try self.runDatum(unary.operand, depth + 1);
-                break :blk Datum.json(.{ .bool = datum.sql_null == (unary.op == .is_null) });
+                break :blk Datum.json(.{ .bool = datum.sql_null == (unary.op == .is_null or unary.op == .is_unknown) });
             } else Datum.fromJson(try self.runLegacy(index, depth)),
             .binary => |binary| if (binary.op == .json_get or binary.op == .json_text) blk: {
                 const left = try self.runDatum(binary.left, depth + 1);
@@ -2430,7 +2498,7 @@ const Evaluator = struct {
             .cast => |cast| try self.convert(try self.run(cast.operand, depth + 1), cast.type),
             .unary => |unary| blk: {
                 const value = try self.run(unary.operand, depth + 1);
-                if (unary.op == .is_null or unary.op == .is_not_null) break :blk .{ .bool = (value == .null) == (unary.op == .is_null) };
+                if (unary.op == .is_null or unary.op == .is_not_null or unary.op == .is_unknown or unary.op == .is_not_unknown) break :blk .{ .bool = (value == .null) == (unary.op == .is_null or unary.op == .is_unknown) };
                 if (unary.op == .is_true or unary.op == .is_not_true or unary.op == .is_false or unary.op == .is_not_false) {
                     const target = unary.op == .is_true or unary.op == .is_not_true;
                     const matches = value == .bool and value.bool == target;

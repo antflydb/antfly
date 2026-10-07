@@ -754,10 +754,30 @@ guard prevents regeneration from silently removing them. The array-result
 original `sql-0561` is independently reconciled using PostgreSQL binary results,
 preserving dimensions, lower bounds, exact element OIDs and SQL NULL flags.
 The oracle rejects unsupported array element types instead of flattening them.
-The read golden now verifies 78 exact original contracts. `--include` can extend
+The read golden now verifies 83 exact original contracts. `--include` can extend
 a checked golden only when every existing contract still matches; unknown or
 duplicate IDs and rejected originals fail closed. Broader array architecture
 tests do not independently grant original-case disposition credit.
+
+Predicate modifiers share the existing typed expression pipeline:
+`BETWEEN SYMMETRIC` expands into both bound orientations using SQL
+three-valued comparisons, while explicit `ASYMMETRIC` retains the ordinary
+orientation. This deliberately does not use NULL-discarding LEAST/GREATEST.
+`IS [NOT] UNKNOWN` requires a boolean operand and binds to existing null-test
+VM opcodes, avoiding a new persisted policy capability. A shared 28-case fixture
+is checked independently against PostgreSQL, including reversed/NULL bounds,
+negation, precedence and exact bigints; three invalid operand types must fail.
+Scalar and typed-vector tests check SQL NULL provenance, allocation-fault
+cleanup and instruction limits. A 10,000-row parameterized probe requires zero
+per-row scratch allocations; its debug timing is not a production speed claim.
+
+The result boundary normalizes declared SQL integers without a floating-point
+round trip, including exact numeric tokens borrowed from native preparation.
+Both materialized and streaming HTTP output encode SQL integers as decimal
+strings while leaving JSON-column numbers numeric. Public regressions cover
+values beyond JavaScript's exact-integer range and mutation DEFAULT RETURNING.
+PostgreSQL stream tests consume the result's typed-cell interface rather than
+assuming legacy materialized rows.
 
 ```sh
 uv run --no-project --with 'psycopg[binary]==3.3.6' python scripts/generate_sql_postgres_reference.py mutation --check zig/pkg/antfly-embedded/src/sql/fixtures/sql_mutation_postgres_reference.json

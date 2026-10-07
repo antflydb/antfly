@@ -5589,9 +5589,10 @@ pub const AntflyApiHandler = struct {
                                 try std.json.Stringify.value(pattern.value, .{}, &writer.writer);
                             }
                             try writer.writer.writeByte(']');
-                        } else if (value.value == .integer) {
+                        } else if (definition.type == .integer) {
+                            const integer = try @import("antfly_local_sources").sql_describe.coerce(value.value, .integer);
                             var buffer: [20]u8 = undefined;
-                            const exact = try std.fmt.bufPrint(&buffer, "{d}", .{value.value.integer});
+                            const exact = try std.fmt.bufPrint(&buffer, "{d}", .{integer.integer});
                             try std.json.Stringify.value(exact, .{}, &writer.writer);
                         } else try std.json.Stringify.value(value.value, .{}, &writer.writer);
                     }
@@ -13790,6 +13791,28 @@ test "httpx SQL executes one relational page with exact integer parameters" {
     };
     try @import("sql_parity_reference.zig").runArrayExpressions(alloc, &handler);
     try @import("sql_parity_reference.zig").runInternalArrayQueries(alloc, &handler);
+    // SQL integer transport is lossless text, whereas a JSON numeric value
+    // remains a number even when its physical cell also uses an i64 tag.
+    for ([_]struct { sql: []const u8, integer: i64 }{
+        .{ .sql = "SELECT 3::bigint AS n, to_jsonb(3) AS j", .integer = 3 },
+        .{ .sql = "SELECT 9007199254740993::bigint AS n, to_jsonb(9007199254740993) AS j", .integer = 9007199254740993 },
+    }) |case| {
+        var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
+        defer request.deinit();
+        request.body = try std.json.Stringify.valueAlloc(alloc, .{ .statement = case.sql }, .{});
+        defer alloc.free(request.body.?);
+        var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try handler.executeSQL(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 200), response.status.code);
+        const result = try std.json.parseFromSlice(sql_wire.SQLResponse, alloc, response.body.?, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(sql_wire.SQLColumnType.integer, result.value.columns[0].type);
+        try std.testing.expectEqual(sql_wire.SQLColumnType.json, result.value.columns[1].type);
+        try std.testing.expectEqual(case.integer, try std.fmt.parseInt(i64, result.value.rows[0][0].string, 10));
+        try std.testing.expectEqual(case.integer, result.value.rows[0][1].integer);
+    }
     // These historical SQLite-positive originals are invalid in PostgreSQL:
     // an output alias is not an input variable inside ORDER BY arithmetic.
     for ([_][]const u8{ "sql-1219", "sql-1373" }) |id| try @import("sql_parity_reference.zig").expectRejection(alloc, &handler, id, "42703");
@@ -13826,7 +13849,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
         for (profile.value.entries, ids) |entry, *id| id.* = entry.id;
         // These source-owned pagination/array contracts must not silently disappear when
         // regenerating the campaign or discovering other unsupported shapes.
-        for ([_][]const u8{ "sql-0205", "sql-0206", "sql-0207", "sql-0220", "sql-0221", "sql-0222", "sql-0284", "sql-0302", "sql-0560", "sql-0561", "sql-0562", "sql-0563", "sql-0564", "sql-0565", "sql-0566", "sql-1226", "sql-1227", "sql-1340" }) |required| {
+        for ([_][]const u8{ "sql-0188", "sql-0189", "sql-0205", "sql-0206", "sql-0207", "sql-0220", "sql-0221", "sql-0222", "sql-0225", "sql-0230", "sql-0231", "sql-0284", "sql-0302", "sql-0560", "sql-0561", "sql-0562", "sql-0563", "sql-0564", "sql-0565", "sql-0566", "sql-1226", "sql-1227", "sql-1340" }) |required| {
             var found = false;
             for (ids) |id| if (std.mem.eql(u8, id, required)) {
                 found = true;
@@ -13834,7 +13857,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
             };
             try std.testing.expect(found);
         }
-        try parity.runReference(alloc, &campaign_handler, ids, reference_bytes);
+        try parity.runReferenceStrict(alloc, &campaign_handler, ids, reference_bytes);
     }
     try @import("sql_parity_reference.zig").runNativeContracts(alloc, &handler, &.{ "sql-0208", "sql-1369" });
     for ([_][]const u8{
@@ -14610,6 +14633,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
             try std.testing.expectEqual(@as(i64, 1), result.value.rows_affected);
             try std.testing.expectEqual(@as(usize, 1), result.value.rows.len);
             try std.testing.expectEqualStrings("reset", result.value.rows[0][0].string);
+            try std.testing.expect(result.value.rows[0][1] == .string);
             try std.testing.expectEqualStrings("3", result.value.rows[0][1].string);
         }
         for ([_]struct { body: []const u8, expected_id: ?[]const u8 }{
@@ -14863,8 +14887,10 @@ test "httpx SQL executes one relational page with exact integer parameters" {
             defer stream.close(stream.context);
             var page = try stream.next(stream.context, array_alloc, array_request, 1);
             defer page.result.deinit();
-            try std.testing.expectEqual(@as(usize, 1), page.result.rows.len);
-            var streamed = try sources.sql_array_wire.decode(alloc, .int64, page.result.rows[0][0], .{});
+            try std.testing.expectEqual(@as(usize, 1), page.result.rowCount());
+            const streamed_cell = try page.result.cell(array_alloc, 0, 0);
+            try std.testing.expect(!streamed_cell.sql_null);
+            var streamed = try sources.sql_array_wire.decode(alloc, .int64, streamed_cell.value, .{});
             defer streamed.deinit();
             try std.testing.expectEqual(std.math.Order.eq, try source_array.value.compare(streamed.value, &work));
         };

@@ -86,6 +86,25 @@ class PostgresReferenceTest(unittest.TestCase):
                     self.db.execute("SELECT " + case["expression"]).fetchone()[0],
                 )
 
+    def test_predicate_modifiers_match_shared_native_contracts(self):
+        import json
+        import psycopg
+
+        fixture = json.loads((FIXTURES / "sql_predicate_reference.json").read_text())
+        self.assertEqual(28, len(fixture["entries"]))
+        for case in fixture["entries"]:
+            with self.subTest(expression=case["expression"]):
+                cursor = self.db.execute("SELECT " + case["expression"])
+                self.assertEqual(16, cursor.description[0].type_code)
+                self.assertEqual(case["expected"], cursor.fetchone()[0])
+        for expression in fixture["type_errors"]:
+            with (
+                self.subTest(expression=expression),
+                self.assertRaises(psycopg.errors.DatatypeMismatch) as failure,
+            ):
+                self.db.execute("SELECT " + expression)
+            self.assertEqual("42804", failure.exception.sqlstate)
+
     def test_expression_defaults_and_stored_generation_assignment_contract(self):
         import psycopg
 

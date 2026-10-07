@@ -588,10 +588,19 @@ const Parser = struct {
                 const negated = self.tokens[self.pos].isKeyword(.not) and self.pos + 1 < self.tokens.len and (self.tokens[self.pos + 1].isKeyword(.in) or self.tokens[self.pos + 1].isKeyword(.between) or self.tokens[self.pos + 1].isKeyword(.like) or self.tokens[self.pos + 1].isKeyword(.ilike));
                 if (negated) self.pos += 1;
                 if (self.keyword(.between)) {
+                    const symmetric = self.ddlWord("symmetric");
+                    if (!symmetric) _ = self.ddlWord("asymmetric");
                     const low = try self.scalar(depth + 1, 4);
                     try self.expectKeyword(.@"and");
                     const high = try self.scalar(depth + 1, 4);
-                    left = try self.scalarNode(.{ .binary = .{ .op = .@"and", .left = try self.scalarNode(.{ .binary = .{ .op = .gte, .left = left, .right = low } }), .right = try self.scalarNode(.{ .binary = .{ .op = .lte, .left = left, .right = high } }) } });
+                    const operand = left;
+                    left = try self.scalarNode(.{ .binary = .{ .op = .@"and", .left = try self.scalarNode(.{ .binary = .{ .op = .gte, .left = operand, .right = low } }), .right = try self.scalarNode(.{ .binary = .{ .op = .lte, .left = operand, .right = high } }) } });
+                    // Preserve PostgreSQL's comparison/three-valued-logic
+                    // expansion. LEAST/GREATEST would discard NULL bounds.
+                    if (symmetric) {
+                        const reversed = try self.scalarNode(.{ .binary = .{ .op = .@"and", .left = try self.scalarNode(.{ .binary = .{ .op = .gte, .left = operand, .right = high } }), .right = try self.scalarNode(.{ .binary = .{ .op = .lte, .left = operand, .right = low } }) } });
+                        left = try self.scalarNode(.{ .binary = .{ .op = .@"or", .left = left, .right = reversed } });
+                    }
                     if (negated) left = try self.scalarNode(.{ .unary = .{ .op = .not, .operand = left } });
                     continue;
                 }
@@ -677,7 +686,7 @@ const Parser = struct {
                     try self.expectKeyword(.from);
                     left = try self.scalarNode(.{ .binary = .{ .op = if (negated) .is_not_distinct else .is_distinct, .left = left, .right = try self.scalar(depth + 1, 4) } });
                 } else {
-                    const op: ast.Scalar.Unary = if (self.keyword(.null)) (if (negated) .is_not_null else .is_null) else if (self.keyword(.true)) (if (negated) .is_not_true else .is_true) else if (self.keyword(.false)) (if (negated) .is_not_false else .is_false) else return self.fail(error.InvalidSqlSyntax, "expected NULL, TRUE, FALSE or DISTINCT");
+                    const op: ast.Scalar.Unary = if (self.keyword(.null)) (if (negated) .is_not_null else .is_null) else if (self.keyword(.true)) (if (negated) .is_not_true else .is_true) else if (self.keyword(.false)) (if (negated) .is_not_false else .is_false) else if (self.ddlWord("unknown")) (if (negated) .is_not_unknown else .is_unknown) else return self.fail(error.InvalidSqlSyntax, "expected NULL, TRUE, FALSE, UNKNOWN or DISTINCT");
                     left = try self.scalarNode(.{ .unary = .{ .op = op, .operand = left } });
                 }
                 continue;
@@ -2632,6 +2641,25 @@ test "compiler DDL literal defaults and count" {
     defer count.deinit();
     try std.testing.expect(count.statement.select.count_all);
     try std.testing.expectEqualStrings("total", count.statement.select.count_alias.?);
+}
+
+test "compiler predicate modifiers preserve keyword quoting and unwind allocation faults" {
+    for ([_][]const u8{ "TRUE IS \"unknown\"", "7 BETWEEN \"symmetric\" 9 AND 2", "7 BETWEEN SYMMETRIC ASYMMETRIC 9 AND 2" }) |sql| {
+        if (compileScalar(std.testing.allocator, sql, .{})) |result| {
+            var owned = result;
+            owned.deinit();
+            return error.ExpectedPredicateSyntaxFailure;
+        } else |_| {}
+    }
+    const Fixture = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            var compiled = try compileScalar(alloc, "($1 BETWEEN SYMMETRIC $2 AND $3) IS NOT UNKNOWN", .{});
+            defer compiled.deinit();
+            var program = try @import("scalar.zig").bind(alloc, compiled.expression, &.{}, &.{ .integer, .integer, .integer }, .{});
+            defer program.deinit();
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
 }
 
 test "compiler durable defaults and stored generated columns own complete scalar trees" {
