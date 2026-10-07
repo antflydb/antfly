@@ -30,6 +30,17 @@ pub fn open(alloc: std.mem.Allocator, native: catalog.Cursor, staged: *const tra
         alloc.destroy(cursor);
     }
     const arena = cursor.arena.allocator();
+    const projection_type = @import("antfly_local_sources").sql_document_row.Projection;
+    // A staged full postimage is parsed once, but only scan-demanded fields
+    // need typed preparation. Scalar-only reads must not decode every untouched
+    // array in a wide table. Conditions add their own inputs to this directory.
+    var names: std.ArrayList([]const u8) = .empty;
+    try names.appendSlice(arena, request.fields);
+    for (request.conditions) |condition| try names.append(arena, condition.column);
+    const full_projection = try projection_type.init(arena, table, names.items);
+    const full_layout = try full_projection.pageLayout(arena);
+    const selected_projection = try projection_type.init(arena, table, request.fields);
+    const selected_layout = try selected_projection.pageLayout(arena);
     var row_filter = if (row_filter_json) |filter| try @import("antfly_local_sources").search_pattern_filter.PreparedPatternFilter.init(alloc, filter) else null;
     defer if (row_filter) |*filter| filter.deinit();
     var rows: std.ArrayList(catalog.Row) = .empty;
@@ -46,29 +57,35 @@ pub fn open(alloc: std.mem.Allocator, native: catalog.Cursor, staged: *const tra
             if (value != .object) return error.InvalidSqlBackendResponse;
             if (row_filter) |*filter| if (!try filter.matchesJson(arena, write.key, value)) continue;
             var object: std.json.ObjectMap = .empty;
-            const nulls = try arena.alloc(bool, table.columns.len);
-            for (table.columns, nulls) |column, *sql_null| {
+            var nulls: std.ArrayList(bool) = .empty;
+            for (full_projection.columns) |column| {
+                if (!value.object.contains(column.path)) continue;
                 const raw = value.object.get(column.path) orelse .null;
                 const json_null = if (table.storage_mode == .document) column.type == .json and value.object.contains(column.path) else for (write.json_null_fields) |field| {
                     if (std.mem.eql(u8, field, column.path)) break true;
                 } else false;
-                sql_null.* = raw == .null and !json_null;
-                const typed = if (raw == .null) raw else try @import("antfly_local_sources").sql_describe.coerce(raw, column.type);
+                try nulls.append(arena, raw == .null and !json_null);
+                const typed = if (raw == .null or column.type == .array) raw else try @import("antfly_local_sources").sql_describe.coerce(raw, column.type);
                 try object.put(arena, column.path, typed);
             }
             const observed = for (entry.predicates.items) |predicate| {
                 if (std.mem.eql(u8, predicate.key, write.key)) break predicate;
             } else return error.InvalidSqlBackendResponse;
-            const row = catalog.Row{ .id = write.key, .version = observed.expected_version, .value = .{ .object = object }, .sql_nulls = nulls, .expected_content_digest = observed.expected_content_digest, .document = if (request.include_document) value else null };
+            const row = try full_projection.adaptBorrowed(arena, full_layout, catalog.Row{ .id = write.key, .version = observed.expected_version, .value = .{ .object = object }, .sql_nulls = nulls.items, .expected_content_digest = observed.expected_content_digest, .document = if (request.include_document) value else null });
             if (try matches(row, request.conditions)) {
-                var projected: std.json.ObjectMap = .empty;
-                const projected_nulls = try arena.alloc(bool, request.fields.len);
-                for (request.fields, projected_nulls) |field, *sql_null| {
-                    const cell = try row.cell(field);
-                    try projected.put(arena, field, cell.value);
-                    sql_null.* = cell.sql_null;
+                if (selected_projection.has_arrays) {
+                    try rows.append(arena, try selected_projection.adaptBorrowed(arena, selected_layout, row));
+                    continue;
                 }
-                try rows.append(arena, .{ .id = row.id, .version = row.version, .value = .{ .object = projected }, .sql_nulls = projected_nulls, .expected_content_digest = row.expected_content_digest, .document = row.document });
+                var projected: std.json.ObjectMap = .empty;
+                var projected_nulls: std.ArrayList(bool) = .empty;
+                for (selected_projection.columns) |column| {
+                    if (!try row.hasField(column.path)) continue;
+                    const cell = try row.cell(column.path);
+                    try projected.put(arena, column.path, cell.value);
+                    try projected_nulls.append(arena, cell.sql_null);
+                }
+                try rows.append(arena, .{ .id = row.id, .version = row.version, .value = .{ .object = projected }, .sql_nulls = projected_nulls.items, .expected_content_digest = row.expected_content_digest, .document = row.document });
             }
         }
     }
@@ -93,6 +110,7 @@ fn matches(row: catalog.Row, conditions: []const catalog.Condition) !bool {
             continue;
         }
         if (cell.sql_null or condition.value == .null) return false;
+        if (cell.array != null) return error.UnsupportedSqlShape;
         const order = try @import("antfly_local_sources").sql_scalar.compare(cell.value, condition.value);
         if (!switch (condition.op) {
             .eq => order == .eq,
@@ -194,7 +212,10 @@ test "SQL session overlay owns typed array rows after native pages and cursor cl
     var native: Test = .{};
     var staged = try transactions.parseCommitRequest(alloc, "{\"read_set\":[],\"tables\":{}}");
     defer staged.deinit(alloc);
-    const cursor = try open(alloc, .{ .ptr = &native, .next = Test.next, .close = Test.close }, &staged, .{ .id = 1, .physical_name = "t", .schema_version = 1, .columns = &.{} }, .{ .fields = &.{ "a", "missing" }, .limit = 1 }, null);
+    const cursor = try open(alloc, .{ .ptr = &native, .next = Test.next, .close = Test.close }, &staged, .{ .id = 1, .physical_name = "t", .schema_version = 1, .columns = &.{
+        .{ .name = "a", .path = "a", .type = .array, .element_type = .text },
+        .{ .name = "missing", .path = "missing", .type = .string },
+    } }, .{ .fields = &.{ "a", "missing" }, .limit = 1 }, null);
     const page = cursor.next(cursor.ptr, output.allocator(), 1) catch |err| {
         cursor.close(cursor.ptr);
         return err;
@@ -204,6 +225,51 @@ test "SQL session overlay owns typed array rows after native pages and cursor cl
     const array = (try page.rows[0].cell("a")).array.?;
     try std.testing.expectEqual(@as(i32, -2), array.dimensions[0].lower);
     try std.testing.expectEqualStrings("retained", array.elements[0].value.string);
+}
+
+test "SQL session overlay prepares staged arrays once and preserves omitted fields" {
+    const a = std.testing.allocator;
+    var output = std.heap.ArenaAllocator.init(a);
+    defer output.deinit();
+    const Native = struct {
+        fn next(_: *anyopaque, _: std.mem.Allocator, _: u32) !catalog.Page {
+            return .{ .rows = &.{} };
+        }
+        fn close(_: *anyopaque) void {}
+    };
+    var native: u8 = 0;
+    var staged = try transactions.parseCommitRequest(a,
+        \\{"read_set":[{"table":"t","key":"key","version":"0"}],"tables":{"t":{"inserts":{"key":{"a":{"dimensions":[{"length":2,"lower_bound":-2}],"values":["9223372036854775807",null],"sql_nulls":[false,true]},"j":{"dimensions":[{"length":2,"lower_bound":1}],"values":[null,null],"sql_nulls":[false,true]}}}}}}
+    );
+    defer staged.deinit(a);
+    const table: catalog.Table = .{ .id = 1, .physical_name = "t", .schema_version = 1, .columns = &.{
+        .{ .name = "a", .path = "a", .type = .array, .element_type = .int64 },
+        .{ .name = "j", .path = "j", .type = .array, .element_type = .jsonb },
+        .{ .name = "missing", .path = "missing", .type = .string },
+    } };
+    const cursor = try open(a, .{ .ptr = &native, .next = Native.next, .close = Native.close }, &staged, table, .{ .fields = &.{ "a", "j", "missing" }, .limit = 1 }, null);
+    const page = cursor.next(cursor.ptr, output.allocator(), 1) catch |err| {
+        cursor.close(cursor.ptr);
+        return err;
+    };
+    cursor.close(cursor.ptr);
+    try std.testing.expectEqual(@as(usize, 1), page.rows.len);
+    try std.testing.expect(!try page.rows[0].hasField("missing"));
+    const array = (try page.rows[0].cell("a")).array.?;
+    try std.testing.expectEqual(@as(i32, -2), array.dimensions[0].lower);
+    try std.testing.expectEqual(std.math.maxInt(i64), array.elements[0].value.integer);
+    try std.testing.expect(array.elements[1].sql_null);
+    const json = (try page.rows[0].cell("j")).array.?;
+    try std.testing.expect(json.elements[0].value == .null);
+    try std.testing.expect(!json.elements[0].sql_null);
+    try std.testing.expect(json.elements[1].sql_null);
+    const scalar = try open(a, .{ .ptr = &native, .next = Native.next, .close = Native.close }, &staged, table, .{ .fields = &.{"missing"}, .limit = 1 }, null);
+    defer scalar.close(scalar.ptr);
+    const narrow = try scalar.next(scalar.ptr, output.allocator(), 1);
+    try std.testing.expectEqual(@as(usize, 1), narrow.rows.len);
+    try std.testing.expect(narrow.rows[0].typed_cells == null);
+    try std.testing.expect(!try narrow.rows[0].hasField("missing"));
+    try std.testing.expect((try narrow.rows[0].cell("missing")).sql_null);
 }
 
 test "SQL session overlay merges pages and suppresses replaced and deleted rows" {

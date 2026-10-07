@@ -131,6 +131,51 @@ class PostgresReferenceTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 array_reference(bad, 1016)
 
+    def test_native_array_mutation_sequence_preserves_bounds_and_null_provenance(self):
+        cases = (
+            (
+                "INSERT INTO items (_id,a,j,n) VALUES ('a','[-1:1]={9007199254740993,NULL,2}'::bigint[],ARRAY['null'::jsonb,NULL],1) RETURNING a,j",
+                -1,
+                "9007199254740993",
+            ),
+            (
+                "UPDATE items SET n=2 WHERE _id='a' RETURNING a,j",
+                -1,
+                "9007199254740993",
+            ),
+            (
+                "INSERT INTO items (_id,a,j,n) SELECT 'b',a,j,n FROM items WHERE _id='a' RETURNING a,j",
+                -1,
+                "9007199254740993",
+            ),
+            (
+                "UPDATE items SET a='[3:4]={9223372036854775807,NULL}'::bigint[] WHERE _id='b' RETURNING a,j",
+                3,
+                "9223372036854775807",
+            ),
+            ("DELETE FROM items WHERE _id='b' RETURNING a,j", 3, "9223372036854775807"),
+            ("UPDATE items SET a=NULL WHERE _id='a' RETURNING a,j", None, None),
+        )
+        with self.db.transaction(force_rollback=True):
+            self.db.execute(
+                "CREATE TEMP TABLE items (_id text PRIMARY KEY,a bigint[],j jsonb[],n bigint)"
+            )
+            for statement, lower, first in cases:
+                with self.subTest(sql=statement):
+                    result = execute(self.db, self.case(statement))
+                    self.assertEqual([1016, 3807], result["column_oids"])
+                    self.assertEqual([[lower is None, False]], result["sql_nulls"])
+                    self.assertEqual(1, len(result["rows"]))
+                    array, json_array = result["rows"][0]
+                    if lower is None:
+                        self.assertIsNone(array)
+                    else:
+                        self.assertEqual(lower, array["dimensions"][0]["lower_bound"])
+                        self.assertEqual(first, array["values"][0])
+                        self.assertTrue(array["sql_nulls"][1])
+                    self.assertEqual([None, None], json_array["values"])
+                    self.assertEqual([False, True], json_array["sql_nulls"])
+
     def test_array_common_types_precede_set_identity(self):
         cases = (
             (

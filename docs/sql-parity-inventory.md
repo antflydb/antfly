@@ -210,9 +210,19 @@ existing representation. Explicit presence flags distinguish omitted fields
 from present SQL NULLs. Ownership-copy helpers preserve typed arrays, JSON null
 provenance and mutation metadata when session overlays retire native pages or
 MERGE retains point-read rows. These are read/ownership foundations, not complete
-array-column SQL activation: SQL DDL, typed-array mutation serialization and
-ordered/constraint index keys still require their own end-to-end gates. Original
-case dispositions remain unchanged.
+array-column SQL activation. Ordinary INSERT/UPDATE/DELETE now retain complete
+typed cells until one owned storage-envelope boundary. INSERT SELECT drains a
+bounded lossless result cursor before writer admission, preserving array identity
+and preventing self-inserts from observing their own writes. RETURNING binds a
+shared image projection once and only decodes requested array cells; DELETE
+preimages retain owned arrays. Staged session reads preserve bounds, omitted
+fields and JSONB null provenance after native page/cursor retirement. Native
+C-ABI sequences, PostgreSQL mutation observers and allocation-fault checks
+exercise these contracts. Nullable native API columns must explicitly allow
+null in their schema; this work does not weaken native JSON-schema validation.
+SQL DDL, broader assignment inference, conflict/joined/MERGE typed-array paths
+and ordered/constraint index keys still need end-to-end activation gates.
+Original case dispositions remain unchanged.
 
 Source commit: `79644dfa1605e8da0f486d021d1c1393577d6265`.
 Source path: `zig/pkg/antfly/src/sql/fixtures/sql_api_parity_source_corpus.json`.

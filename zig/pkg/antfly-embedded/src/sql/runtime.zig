@@ -370,6 +370,19 @@ pub const Context = struct {
         return self.outputCell(datum.value, kind);
     }
 
+    /// The mutation boundary owns one storage representation of each logical
+    /// cell. Arrays remain typed until here; their null JSON placeholder must
+    /// never be mistaken for either a SQL NULL or a JSONB null write.
+    pub fn storageDatum(self: Context, datum: Datum, column: catalog.Column) !Json {
+        const checked = try describe.coerceDatum(self.arena, datum, column.type, column.element_type);
+        if (checked.sql_null) {
+            if (!column.nullable) return error.SqlNotNullViolation;
+            return .null;
+        }
+        if (checked.array) |array| return @import("array_wire.zig").toJsonLeaky(self.arena, array.*, .{ .values = .{ .bytes = self.limits.retained_bytes }, .wire_bytes = self.limits.retained_bytes });
+        return clone(self.arena, checked.value);
+    }
+
     fn value(self: Context, input: ast.Value, column: catalog.Column) !Json {
         if (input == .string and column.type == .json)
             return self.binding.json_literals.get(input.string) orelse error.InvalidSqlBackendResponse;
@@ -910,11 +923,10 @@ pub const Context = struct {
                     if (key_index != null and i == key_index.?) continue;
                     if (statement.isDefault(row_index, i)) continue;
                     const datum = try self.insertValue(item, column, row_index, i, page.values[row_index - first][i]);
-                    const typed = datum.value;
-                    const json_null = typed == .null and !datum.sql_null;
-                    if (datum.sql_null and !column.nullable) return error.SqlNotNullViolation;
+                    const typed = try self.storageDatum(datum, column);
+                    const json_null = column.type == .json and typed == .null and !datum.sql_null;
                     if (json_null) try json_null_fields.append(self.arena, column.path);
-                    try putField(self.arena, &object, column.path, try clone(self.arena, typed));
+                    try putField(self.arena, &object, column.path, typed);
                 }
                 const document: Json = .{ .object = object };
                 retained = std.math.add(usize, retained, jsonSize(document) + key.string.len) catch return error.SqlProgramLimitExceeded;
@@ -940,50 +952,51 @@ pub const Context = struct {
         // Materialize a bounded statement result before any mutation. This
         // also releases source cursors before writer admission and prevents
         // self-inserts from reading their own writes (Halloween problem).
-        const selected = try input.select(source);
+        const selected = try input.typedQuery(source);
+        defer selected.close();
         const capture_count = if (statement.conflict) |clause| clause.capture_count else 0;
-        if (selected.columns.len != statement.columns.len + capture_count or selected.rows.len > self.limits.mutation_rows) return error.InvalidSqlBackendResponse;
-        if (statement.values_source_rows.len != 0 and selected.rows.len != statement.values_source_rows.len) return error.InvalidSqlBackendResponse;
-        const flags = selected.sql_nulls orelse if (selected.rows.len == 0) &.{} else return error.InvalidSqlBackendResponse;
-        if (flags.len != selected.rows.len) return error.InvalidSqlBackendResponse;
-        const mutations = try self.arena.alloc(catalog.Mutation, selected.rows.len);
-        const captured = try self.arena.alloc([]const @import("scalar.zig").Datum, selected.rows.len);
+        if (bound.columns.len != statement.columns.len + capture_count or selected.count() > self.limits.mutation_rows) return error.InvalidSqlBackendResponse;
+        if (statement.values_source_rows.len != 0 and selected.count() != statement.values_source_rows.len) return error.InvalidSqlBackendResponse;
+        const mutations = try self.arena.alloc(catalog.Mutation, selected.count());
+        const captured = try self.arena.alloc([]const Datum, selected.count());
         var keys: std.StringHashMapUnmanaged(void) = .empty;
-        for (selected.rows, flags, mutations, 0..) |row, nulls, *mutation, row_index| {
+        var scratch = std.heap.ArenaAllocator.init(self.alloc);
+        defer scratch.deinit();
+        var retained: usize = 0;
+        for (mutations, 0..) |*mutation, row_index| {
             try self.checkpoint();
-            if (row.len != statement.columns.len + capture_count or nulls.len != row.len) return error.InvalidSqlBackendResponse;
+            _ = scratch.reset(.retain_capacity);
+            const row = (try selected.next(scratch.allocator())) orelse return error.InvalidSqlBackendResponse;
+            if (row.len != statement.columns.len + capture_count) return error.InvalidSqlBackendResponse;
             if (capture_count != 0) {
-                const cells = try self.arena.alloc(@import("scalar.zig").Datum, capture_count);
-                for (cells, row[statement.columns.len..], nulls[statement.columns.len..]) |*cell, captured_value, sql_null| {
-                    if (sql_null and captured_value != .null) return error.InvalidSqlBackendResponse;
-                    cell.* = .{ .value = captured_value, .sql_null = sql_null };
+                const cells = try self.arena.alloc(Datum, capture_count);
+                for (cells, row[statement.columns.len..]) |*cell, value_| {
+                    cell.* = try operators.cloneDatum(self.arena, value_);
+                    retained = std.math.add(usize, retained, try operators.datumBytes(value_)) catch return error.SqlProgramLimitExceeded;
                 }
                 captured[row_index] = cells;
             } else captured[row_index] = &.{};
             var object: std.json.ObjectMap = .empty;
             var json_null_fields: std.ArrayList([]const u8) = .empty;
             var key: ?[]const u8 = null;
-            for (target_columns, selected.columns[0..statement.columns.len], row[0..statement.columns.len], nulls[0..statement.columns.len], 0..) |target, source_column, value_, sql_null, cell_index| {
+            for (target_columns, bound.columns[0..statement.columns.len], row[0..statement.columns.len], 0..) |target, source_column, value_, cell_index| {
                 if (statement.isDefault(row_index, cell_index)) continue;
-                if (sql_null and value_ != .null) return error.InvalidSqlBackendResponse;
-                if (sql_null and !target.nullable) return error.SqlNotNullViolation;
-                if (!sql_null and source_column.type != target.type and !(source_column.type == .integer and target.type == .number) and !(statement.values_source_rows.len != 0 and source_column.type == .string and (target.type == .datetime or target.type == .json or target.type == .uuid))) return error.SqlTypeMismatch;
-                const typed = try coerce(self.arena, value_, target.type);
+                if (!value_.sql_null and source_column.type != target.type and !(source_column.type == .integer and target.type == .number) and !(statement.values_source_rows.len != 0 and source_column.type == .string and (target.type == .datetime or target.type == .json or target.type == .uuid))) return error.SqlTypeMismatch;
+                const typed = try self.storageDatum(value_, target);
                 if (std.mem.eql(u8, target.name, "_id")) {
-                    if (sql_null or typed != .string or typed.string.len == 0) return error.SqlRowIdentityRequired;
+                    if (value_.sql_null or typed != .string or typed.string.len == 0) return error.SqlRowIdentityRequired;
                     if (!std.unicode.utf8ValidateSlice(typed.string)) return error.SqlTypeMismatch;
                     key = typed.string;
                 } else {
-                    if (!sql_null and typed == .null) try json_null_fields.append(self.arena, target.path);
-                    // The typed source already belongs to the same bounded
-                    // result arena: transfer references without JSON reparsing
-                    // or a second copy of large JSON/string cells.
+                    if (target.type == .json and !value_.sql_null and typed == .null) try json_null_fields.append(self.arena, target.path);
                     try putField(self.arena, &object, target.path, typed);
                 }
             }
             const identity = key orelse try (self.backend.vtable.generate_row_id orelse return error.SqlRowIdentityRequired)(self.backend.ptr, self.arena);
             if (identity.len == 0 or !std.unicode.utf8ValidateSlice(identity)) return error.InvalidSqlBackendResponse;
             if ((try keys.getOrPut(self.arena, identity)).found_existing and (statement.conflict == null or !@import("conflict.zig").allowsDuplicateKeys(statement.conflict.?))) return error.DuplicateSqlRow;
+            retained = std.math.add(usize, retained, jsonSize(.{ .object = object }) + identity.len) catch return error.SqlProgramLimitExceeded;
+            if (retained > self.limits.retained_bytes) return error.SqlProgramLimitExceeded;
             mutation.* = .{ .key = identity, .expected_version = 0, .unique_absence = true, .row = .{ .object = object }, .json_null_fields = json_null_fields.items };
         }
         try self.checkpoint();
@@ -1041,7 +1054,11 @@ pub const Context = struct {
     fn insertValue(self: Context, literal: ast.Value, column: catalog.Column, row: usize, cell: usize, evaluated: ?Datum) !Datum {
         if (self.binding.scalars.insert_rows.len != 0 and self.binding.scalars.insert_rows[row][cell] != null) {
             const result = evaluated orelse return error.InvalidSqlProgram;
-            return .{ .value = try coerce(self.arena, result.value, column.type), .sql_null = result.sql_null };
+            return describe.coerceDatum(self.arena, result, column.type, column.element_type);
+        }
+        if (literal == .parameter) {
+            if (literal.parameter == 0) return error.InvalidSqlParameters;
+            return describe.coerceDatum(self.arena, try self.parameterDatum(literal.parameter - 1), column.type, column.element_type);
         }
         const result = try self.value(literal, column);
         return .{ .value = result, .sql_null = result == .null and !(column.type == .json and literal == .string) };
@@ -1111,7 +1128,7 @@ pub const Context = struct {
                 // not row scratch. Retain it once, as on the literal path;
                 // do not clone a wide prepared payload for every target row.
                 const value_ = try self.evaluate(self.arena, program.?, &.{});
-                typed = if (value_.sql_null) .null else try coerce(self.arena, value_.value, column.type);
+                typed = try self.storageDatum(value_, column);
                 sql_null = value_.sql_null;
                 program = null;
             } else if (program == null) {
@@ -1179,6 +1196,7 @@ pub const Context = struct {
             defer page.deinit();
             if (page.rows.len > self.limits.page_rows) return error.InvalidSqlBackendResponse;
             if (page.rows.len > self.limits.scan_rows -| visited) return error.SqlProgramLimitExceeded;
+            var retained_layout: ?catalog.Row.TypedLayout = null;
             // Grow once per bounded native page. Arena-backed geometric growth
             // otherwise retains every superseded per-row staging buffer.
             try mutations.ensureUnusedCapacity(self.arena, @min(page.rows.len, self.limits.mutation_rows - mutations.items.len));
@@ -1201,7 +1219,6 @@ pub const Context = struct {
                     var document: ?Json = null;
                     var json_null_fields: std.ArrayList([]const u8) = .empty;
                     if (assignments != null) {
-                        if (row.value != .object) return error.InvalidSqlBackendResponse;
                         var copy: Json = .{ .object = .empty };
                         if (table_def.storage_mode == .document) {
                             const original = row.document orelse return error.InvalidSqlBackendResponse;
@@ -1218,20 +1235,20 @@ pub const Context = struct {
                         for (table_def.columns) |column| {
                             if (table_def.storage_mode == .document) continue;
                             if (column.generated or replaced.contains(column.path)) continue;
-                            if (row.value.object.get(column.path)) |old| {
+                            if (try row.hasField(column.path)) {
                                 const cell = try row.cell(column.path);
-                                if (old == .null and !cell.sql_null) try json_null_fields.append(self.arena, column.path);
-                                try putField(self.arena, &copy.object, column.path, try clone(self.arena, old));
+                                if (column.type == .json and cell.value == .null and !cell.sql_null) try json_null_fields.append(self.arena, column.path);
+                                try putField(self.arena, &copy.object, column.path, try self.storageDatum(cell, column));
                             }
                         }
                         for (bound_assignments, 0..) |bound, assignment_index| {
                             const assigned_value = if (bound.program) |program| blk: {
                                 const assigned = if (evaluated) |batch| batch.assignments[assignment_index].?[batch.positions[row_index].?] else try self.evaluate(scratch, program, expression_cells);
                                 if (assigned.sql_null and !bound.column.nullable) return error.SqlNotNullViolation;
-                                if (!assigned.sql_null and assigned.value == .null) try json_null_fields.append(self.arena, bound.column.path);
-                                break :blk try clone(self.arena, try coerce(self.arena, assigned.value, bound.column.type));
+                                if (bound.column.type == .json and !assigned.sql_null and assigned.value == .null) try json_null_fields.append(self.arena, bound.column.path);
+                                break :blk try self.storageDatum(assigned, bound.column);
                             } else blk: {
-                                if (!bound.sql_null and bound.value == .null) try json_null_fields.append(self.arena, bound.column.path);
+                                if (bound.column.type == .json and !bound.sql_null and bound.value == .null) try json_null_fields.append(self.arena, bound.column.path);
                                 break :blk bound.value;
                             };
                             try putField(self.arena, &copy.object, bound.column.path, assigned_value);
@@ -1244,7 +1261,10 @@ pub const Context = struct {
                     if (table_def.storage_mode == .document and row.expected_content_digest == null and row.version != 0) return error.InvalidSqlBackendResponse;
                     const previous = if (assignments == null and returning != null) blk: {
                         const owned = try self.arena.create(catalog.Row);
-                        owned.* = .{ .id = key, .version = row.version, .value = try clone(self.arena, row.value), .sql_nulls = if (row.sql_nulls) |flags| try self.arena.dupe(bool, flags) else null };
+                        if (row.typed_cells) |cells| if (retained_layout == null) {
+                            retained_layout = try cells.layout.clone(self.arena);
+                        };
+                        owned.* = try row.cloneWithLayout(self.arena, retained_layout);
                         break :blk owned;
                     } else null;
                     try mutations.append(self.arena, .{ .key = key, .expected_version = row.version, .expected_content_digest = row.expected_content_digest, .row = document, .json_null_fields = json_null_fields.items, .previous = previous });
@@ -1311,8 +1331,9 @@ pub const Context = struct {
             var context = self;
             context.binding = binding.*;
             if (self.binding.returning_query) |query| {
+                const images_adapter = try ReturningImages.init(self.arena, table, null);
                 const images = try self.arena.alloc(catalog.Row, prepared.len);
-                for (prepared, input, images) |mutation, original, *image| image.* = try mutationReturningRow(self.arena, table, mutation, original);
+                for (prepared, input, images) |mutation, original, *image| image.* = try images_adapter.row(self.arena, mutation, original);
                 context.returning_rows = images;
                 context.sink = null;
                 const projected = if (images.len == 0) Output{ .columns = binding.columns, .rows = &.{}, .sql_nulls = &.{}, .command_tag = "SELECT" } else try context.select(query);
@@ -1325,6 +1346,14 @@ pub const Context = struct {
                 if (projections.len == 0) {
                     for (table.columns) |column| try fields.append(self.arena, column.path);
                 } else for (projections) |projection| try fields.append(self.arena, if (projection.expression != null) "" else (try table.column(projection.field)).path);
+                // Bind just the requested cells and expression inputs. A wide
+                // untouched array must not be decoded merely to RETURN a key
+                // or scalar counter. Relational RETURNING queries above retain
+                // the complete row for their independently bound scan demands.
+                var image_fields: std.ArrayList([]const u8) = .empty;
+                for (fields.items) |field| if (field.len != 0) try image_fields.append(self.arena, field);
+                for (binding.scalars.required) |ordinal| try image_fields.append(self.arena, binding.scalars.columns[ordinal].name);
+                const images_adapter = try ReturningImages.init(self.arena, table, image_fields.items);
                 const rows = try self.arena.alloc([]const Json, prepared.len);
                 const flags = try self.arena.alloc([]const bool, prepared.len);
                 var external = false;
@@ -1332,10 +1361,10 @@ pub const Context = struct {
                     external = external or @import("decision_eval.zig").hasExternal(program);
                 };
                 if (external) {
-                    try context.decisionMutationReturning(table, fields.items, prepared, input, rows, flags);
+                    try context.decisionMutationReturning(images_adapter, fields.items, prepared, input, rows, flags);
                 } else for (prepared, input, rows, flags) |mutation, original, *cells, *nulls| {
                     try self.checkpoint();
-                    const row = try mutationReturningRow(self.arena, table, mutation, original);
+                    const row = try images_adapter.row(self.arena, mutation, original);
                     const expressions = try binding.scalars.cells(self.arena, row);
                     const projected = try context.projectValues(self.arena, row, fields.items, expressions);
                     const values = try self.arena.alloc(Json, projected.len);
@@ -1380,23 +1409,39 @@ pub const Context = struct {
         return output;
     }
 
-    fn mutationReturningRow(a: std.mem.Allocator, table: catalog.Table, mutation: catalog.Mutation, original: catalog.Mutation) !catalog.Row {
-        if (!std.mem.eql(u8, mutation.key, original.key) or mutation.expected_version != original.expected_version or (mutation.row == null) != (original.row == null)) return error.InvalidSqlBackendResponse;
-        const datum = mutation.row orelse return (original.previous orelse return error.InvalidSqlBackendResponse).*;
-        if (datum != .object) return error.InvalidSqlBackendResponse;
-        const nulls = try a.alloc(bool, datum.object.count());
-        for (datum.object.values(), nulls) |cell, *flag| flag.* = cell == .null;
-        for (mutation.json_null_fields) |name| {
-            const index = datum.object.getIndex(name) orelse return error.InvalidSqlBackendResponse;
-            if (!nulls[index] or (try table.column(name)).type != .json) return error.InvalidSqlBackendResponse;
-            nulls[index] = false;
+    const ReturningImages = struct {
+        table: catalog.Table,
+        projection: @import("document_row.zig").Projection,
+        layout: ?catalog.Row.TypedLayout,
+
+        fn init(a: std.mem.Allocator, table: catalog.Table, fields: ?[]const []const u8) !ReturningImages {
+            const names = fields orelse blk: {
+                const all = try a.alloc([]const u8, table.columns.len);
+                for (table.columns, all) |column, *name| name.* = column.name;
+                break :blk all;
+            };
+            const projection = try @import("document_row.zig").Projection.init(a, table, names);
+            return .{ .table = table, .projection = projection, .layout = try projection.pageLayout(a) };
         }
-        return .{ .id = mutation.key, .version = mutation.expected_version, .value = datum, .sql_nulls = nulls };
-    }
+
+        fn row(self: ReturningImages, a: std.mem.Allocator, mutation: catalog.Mutation, original: catalog.Mutation) !catalog.Row {
+            if (!std.mem.eql(u8, mutation.key, original.key) or mutation.expected_version != original.expected_version or (mutation.row == null) != (original.row == null)) return error.InvalidSqlBackendResponse;
+            const datum = mutation.row orelse return (original.previous orelse return error.InvalidSqlBackendResponse).*;
+            if (datum != .object) return error.InvalidSqlBackendResponse;
+            const nulls = try a.alloc(bool, datum.object.count());
+            for (datum.object.values(), nulls) |cell, *flag| flag.* = cell == .null;
+            for (mutation.json_null_fields) |name| {
+                const index = datum.object.getIndex(name) orelse return error.InvalidSqlBackendResponse;
+                if (!nulls[index] or (try self.table.column(name)).type != .json) return error.InvalidSqlBackendResponse;
+                nulls[index] = false;
+            }
+            return self.projection.adaptBorrowed(a, self.layout, .{ .id = mutation.key, .version = mutation.expected_version, .value = datum, .sql_nulls = nulls });
+        }
+    };
 
     /// Provider scratch must not accumulate in the retained mutation/output
     /// arena. Resolve RETURNING pages before publishing any native mutation.
-    fn decisionMutationReturning(self: Context, table: catalog.Table, fields: []const []const u8, prepared: []const catalog.Mutation, input: []const catalog.Mutation, rows: [][]const Json, flags: [][]const bool) !void {
+    fn decisionMutationReturning(self: Context, images: ReturningImages, fields: []const []const u8, prepared: []const catalog.Mutation, input: []const catalog.Mutation, rows: [][]const Json, flags: [][]const bool) !void {
         var first: usize = 0;
         while (first < prepared.len) {
             var arena = std.heap.ArenaAllocator.init(self.alloc);
@@ -1408,7 +1453,7 @@ pub const Context = struct {
             while (first + page.items.len < prepared.len and page.items.len < self.limits.page_rows) {
                 try self.checkpoint();
                 const index = first + page.items.len;
-                const row = try mutationReturningRow(scratch, table, prepared[index], input[index]);
+                const row = try images.row(scratch, prepared[index], input[index]);
                 const values = try self.binding.scalars.cells(scratch, row);
                 try page.append(scratch, row);
                 try cells.append(scratch, values);
@@ -1497,6 +1542,49 @@ fn jsonSize(value: Json) usize {
         },
         else => @sizeOf(Json),
     };
+}
+
+fn mutationArrayOwnershipScenario(backing: std.mem.Allocator) !void {
+    var arena = std.heap.ArenaAllocator.init(backing);
+    defer arena.deinit();
+    var fixture: TestBackend = .{};
+    const a = arena.allocator();
+    const context: Context = .{ .alloc = backing, .arena = a, .backend = fixture.iface(), .binding = undefined, .parameters = &.{}, .limits = .{} };
+    const column: catalog.Column = .{ .name = "a", .path = "a", .type = .array, .element_type = .jsonb };
+    var input = try @import("array_text.zig").decode(backing, .jsonb, "[0:2]={\"null\",NULL,\"{\\\"x\\\":[1,2]}\"}", .{});
+    const encoded = context.storageDatum(Datum.typedArray(&input.value), column) catch |err| {
+        input.deinit();
+        return err;
+    };
+    input.deinit();
+    try std.testing.expect((try context.storageDatum(.{}, column)) == .null);
+    try std.testing.expectError(error.SqlTypeMismatch, context.storageDatum(Datum.json(.null), column));
+    var required = column;
+    required.nullable = false;
+    try std.testing.expectError(error.SqlNotNullViolation, context.storageDatum(.{}, required));
+    const table: catalog.Table = .{ .id = 1, .physical_name = "items", .schema_version = 1, .columns = &.{ column, .{ .name = "j", .path = "j", .type = .json }, .{ .name = "n", .path = "n", .type = .integer } } };
+    var object: std.json.ObjectMap = .empty;
+    try object.put(a, "a", encoded);
+    try object.put(a, "j", .null);
+    try object.put(a, "n", .{ .integer = 3 });
+    const mutation: catalog.Mutation = .{ .key = "key", .expected_version = 0, .row = .{ .object = object }, .json_null_fields = &.{"j"} };
+    const adapter = try Context.ReturningImages.init(a, table, null);
+    const row = try adapter.row(a, mutation, mutation);
+    const array = (try row.cell("a")).array.?;
+    try std.testing.expectEqual(@as(i32, 0), array.dimensions[0].lower);
+    try std.testing.expect(array.elements[0].value == .null and !array.elements[0].sql_null);
+    try std.testing.expect(array.elements[1].sql_null);
+    try std.testing.expectEqualStrings("2", array.elements[2].value.object.get("x").?.array.items[1].number_string);
+    try std.testing.expect(!(try row.cell("j")).sql_null);
+    const narrow = try Context.ReturningImages.init(a, table, &.{"n"});
+    try std.testing.expect(!narrow.projection.has_arrays);
+    const scalar_row = try narrow.row(a, mutation, mutation);
+    try std.testing.expect(scalar_row.typed_cells == null);
+    try std.testing.expectEqual(@as(i64, 3), (try scalar_row.cell("n")).value.integer);
+}
+
+test "SQL mutation array boundary owns payloads and unwinds every allocation failure" {
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, mutationArrayOwnershipScenario, .{});
 }
 
 test "SQL result boundary preserves array ownership descriptors and NULL provenance" {

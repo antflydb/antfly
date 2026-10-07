@@ -1755,6 +1755,55 @@ test "capi SQL RETURNING uses native defaults generated values and versioned pre
     try std.testing.expectEqualStrings("5", generated_rows[0].array.items[1].string);
 }
 
+test "capi SQL array mutations retain native cells and returning provenance" {
+    var directory = try TestDirectory.init("capi-sql-array-mutations");
+    defer directory.cleanup();
+    const a = std.testing.allocator;
+    const path = try tempTestPath(a, directory.path(), "sql");
+    defer a.free(path);
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_open(path, &handle));
+    defer antfly_db_close(handle);
+    const schema =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"a":{"type":["sql_array","null"],"x-antfly-sql-type":"int64"},"j":{"type":"sql_array","x-antfly-sql-type":"jsonb"},"n":{"type":"integer"}},"additionalProperties":false}}}}
+    ;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_set_schema_json(handle, .fromSlice(schema)));
+    const Case = struct { sql: []const u8, lower: ?i64 = null, first: ?[]const u8 = null, whole_null: bool = false };
+    for ([_]Case{
+        .{ .sql = "INSERT INTO items (_id,a,j,n) VALUES ('a','[-1:1]={9007199254740993,NULL,2}'::bigint[],ARRAY['null'::jsonb,NULL],1) RETURNING a,j", .lower = -1, .first = "9007199254740993" },
+        .{ .sql = "UPDATE items SET n=2 WHERE _id='a' RETURNING a,j", .lower = -1, .first = "9007199254740993" },
+        .{ .sql = "INSERT INTO items (_id,a,j,n) SELECT 'b',a,j,n FROM items WHERE _id='a' RETURNING a,j", .lower = -1, .first = "9007199254740993" },
+        .{ .sql = "UPDATE items SET a='[3:4]={9223372036854775807,NULL}'::bigint[] WHERE _id='b' RETURNING a,j", .lower = 3, .first = "9223372036854775807" },
+        .{ .sql = "DELETE FROM items WHERE _id='b' RETURNING a,j", .lower = 3, .first = "9223372036854775807" },
+        .{ .sql = "UPDATE items SET a=NULL WHERE _id='a' RETURNING a,j", .whole_null = true },
+        .{ .sql = "SELECT a,j FROM items WHERE _id='a'", .whole_null = true },
+    }) |case| {
+        const request = try std.json.Stringify.valueAlloc(a, .{ .statement = case.sql }, .{});
+        defer a.free(request);
+        var out: capi.Buffer = .{};
+        defer freeRawBuffer(out.ptr, out.len);
+        // Exercise the same C-ABI request implementation without erasing the
+        // native error return trace behind the public diagnostic envelope.
+        try executeEmbeddedSql(asHandle(handle).?, "items", request, &out);
+        const response = try std.json.parseFromSlice(std.json.Value, a, out.ptr.?[0..out.len], .{});
+        defer response.deinit();
+        const rows = response.value.object.get("rows").?.array.items;
+        try std.testing.expectEqual(@as(usize, 1), rows.len);
+        const values = rows[0].array.items;
+        if (case.whole_null) {
+            try std.testing.expect(values[0] == .null);
+        } else {
+            try std.testing.expectEqual(case.lower.?, values[0].object.get("dimensions").?.array.items[0].object.get("lower_bound").?.integer);
+            try std.testing.expectEqualStrings(case.first.?, values[0].object.get("values").?.array.items[0].string);
+            try std.testing.expect(values[0].object.get("sql_nulls").?.array.items[1].bool);
+        }
+        const json = values[1].object;
+        try std.testing.expect(json.get("values").?.array.items[0] == .null);
+        try std.testing.expect(!json.get("sql_nulls").?.array.items[0].bool);
+        try std.testing.expect(json.get("sql_nulls").?.array.items[1].bool);
+    }
+}
+
 test "capi SQL uses native typed snapshots and atomic mutations" {
     var test_tmp = try TestDirectory.init("capi-sql");
     defer test_tmp.cleanup();
