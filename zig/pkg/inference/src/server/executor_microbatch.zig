@@ -105,7 +105,7 @@ test "microbatch owned collection cleans partial caller allocation failures" {
             try std.testing.expectEqualStrings("second", rows[1]);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Rows.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Rows.run, .{});
 }
 
 test "microbatch working budgets and task families are distinct execution keys" {
@@ -1145,7 +1145,7 @@ test "microbatch array enrollment drains groups on allocation failure" {
             };
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
 }
 
 test "microbatch concurrent array tails coalesce without item workers" {

@@ -15,7 +15,7 @@
 
 const public_table_http = @import("api/public_table_http.zig");
 
-test {
+test "public table HTTP module compiles" {
     _ = public_table_http;
     _ = @import("api/relational_rows.zig");
     _ = @import("api/tables.zig");

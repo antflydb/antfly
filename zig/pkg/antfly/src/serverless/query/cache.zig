@@ -3016,7 +3016,7 @@ test "serverless query cache batch publication releases allocations and reservat
             };
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
 
 test "serverless query cache bypasses oversized entries without evicting useful data" {

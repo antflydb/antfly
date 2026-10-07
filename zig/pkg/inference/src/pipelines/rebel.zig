@@ -734,5 +734,5 @@ test "tripletsToRecognizeOutput releases every partial allocation" {
         }
     };
 
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }

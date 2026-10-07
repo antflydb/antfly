@@ -189,7 +189,7 @@ test "CUDA boundary dense routing matches sparse heap order including negative a
         }
         try std.testing.expectEqual(largest, grouped.maximum_group_size);
     }
-    try std.testing.checkAllAllocationFailures(a, allocationCheck, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, allocationCheck, .{});
 }
 
 test "resident training sparse groups preserve repeated negative and high integer routing order" {
@@ -236,5 +236,5 @@ test "resident training sparse groups reject malformed resources and clean alloc
     try std.testing.expectError(error.InvalidResidentTrainingShape, plan(0, 5, .{}));
     try std.testing.expectError(error.ResourceLimitExceeded, plan(1024, 5, .{ .max_metadata_bytes = 1024 }));
     try std.testing.expectError(error.ResourceLimitExceeded, plan(1024, 5, .{ .max_sort_work = 1024 }));
-    try std.testing.checkAllAllocationFailures(a, allocationCheck, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, allocationCheck, .{});
 }

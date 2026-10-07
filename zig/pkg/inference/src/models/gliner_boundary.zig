@@ -608,7 +608,7 @@ test "gliner boundary parsing propagates and cleans up every allocation failure"
             try std.testing.expectEqual(@as(u32, 768), config.encoder.hidden_size);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{ base_config, base_encoder });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Check.run, .{ base_config, base_encoder });
 }
 
 test "gliner boundary encoder rejects negative overflowing and incompatible dimensions" {

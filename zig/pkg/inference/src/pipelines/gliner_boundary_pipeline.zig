@@ -1806,7 +1806,7 @@ test "gliner boundary classification presentation shares temperature fallback pr
             try std.testing.expectEqual(@as(usize, 3), output.output_values);
         }
     };
-    try std.testing.checkAllAllocationFailures(a, Check.run, .{ &ordinary, &raw });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Check.run, .{ &ordinary, &raw });
 }
 
 test "gliner boundary classification top_k preserves ordinary and structured presentation" {
@@ -1834,7 +1834,7 @@ test "gliner boundary classification top_k preserves ordinary and structured pre
             try std.testing.expectEqualStrings("right", output.classifications[2].labels[1].label);
         }
     };
-    try std.testing.checkAllAllocationFailures(a, Ordinary.run, .{ &ordinary, &ordinary_raw });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Ordinary.run, .{ &ordinary, &ordinary_raw });
 
     // Omitting top_k lets the whole collection use declared cardinalities.
     var mixed = try schema_mod.compile(a,
@@ -1855,7 +1855,7 @@ test "gliner boundary classification top_k preserves ordinary and structured pre
             try std.testing.expectEqualStrings("y", output.classifications[1].labels[1].label);
         }
     };
-    try std.testing.checkAllAllocationFailures(a, Structured.run, .{ &mixed, &mixed_raw });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Structured.run, .{ &mixed, &mixed_raw });
 
     // Independent callers cannot bypass compilation and silently discard a
     // non-default top_k. Reject before the first presentation allocation.

@@ -384,7 +384,7 @@ test "incremental seq2seq fuses prefill and cached steps with broadcast branch a
 }
 
 test "incremental seq2seq cache ownership unwinds allocation failures" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkIncremental, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, checkIncremental, .{});
 }
 
 test "incremental seq2seq requires explicit merged ABI" {

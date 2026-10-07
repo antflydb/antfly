@@ -128,9 +128,9 @@ test "deberta training Metal owned metadata views and attention release all allo
     const inputs = try Inputs.init(&cb, &host);
     defer inputs.deinit(&cb);
     const before = tensor.memoryStatsSnapshot();
-    try std.testing.checkAllAllocationFailures(a, checkedView, .{device.backend.provider_impl.raw_decode_runtime.?});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, checkedView, .{device.backend.provider_impl.raw_decode_runtime.?});
     try sameLive(before);
-    try std.testing.checkAllAllocationFailures(a, allocationCheck, .{ device.backend, inputs });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, allocationCheck, .{ device.backend, inputs });
     try sameLive(before);
     const result = try inputs.backward(&cb);
     cb.free(result);

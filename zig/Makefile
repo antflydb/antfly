@@ -36,9 +36,20 @@ build: ## Build the Antfly runtime; optional inference dependencies are provisio
 test: ## Run the default Zig test aggregate with bounded scheduler memory.
 	python3 tools/run_bounded_zig_build.py --zig "$(ZIG)" -- build test $(ZIG_BUILD_FLAGS)
 
-# PR CI uses reusable workflows from main; enable timings in the checked-out command too.
+# PR CI uses reusable workflows from main: keep timings and disposable-cache
+# policy in the checked-out command so the PR can validate them before merge.
 unit-test: ## Run the existing repository unit gate across libraries, Antfly, and inference.
-	ANTFLY_TEST_TIMINGS="$${ANTFLY_TEST_TIMINGS:-$${CI:+1}}" python3 tools/run_bounded_zig_build.py --zig "$(ZIG)" -- build lib-test antfly-unit-test inference-test inference-finetune-test unit-test-inventory $(ZIG_BUILD_FLAGS)
+	@unit_cache_flags=; \
+	if [ "$${CI:-}" = true ] && [ "$$(uname -s)" = Linux ] && [ "$${ZIG_LOCAL_CACHE_DIR##*/}" = zig-local ]; then \
+		unit_cache_flags=-Dunit-test-cache-release=true; \
+	fi; \
+	ANTFLY_TEST_TIMINGS="$${ANTFLY_TEST_TIMINGS:-$${CI:+1}}" python3 tools/run_bounded_zig_build.py --zig "$(ZIG)" -- build unit-test $$unit_cache_flags $(ZIG_BUILD_FLAGS); \
+	unit_status=$$?; \
+	if [ -n "$$unit_cache_flags" ]; then \
+		python3 tools/report_test_cache.py "$$ZIG_LOCAL_CACHE_DIR" || true; \
+		python3 tools/prune_completed_test_cache.py --release-phase "$$ZIG_LOCAL_CACHE_DIR" || unit_status=$$?; \
+	fi; \
+	exit $$unit_status
 
 antfly-unit-test: ## Run hermetic Antfly unit tests with bounded scheduler memory.
 	python3 tools/run_bounded_zig_build.py --zig "$(ZIG)" -- build antfly-unit-test $(ZIG_BUILD_FLAGS)

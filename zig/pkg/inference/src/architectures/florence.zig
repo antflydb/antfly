@@ -517,7 +517,7 @@ fn compactPreallocatedDecoderIncrementalCacheInPlace(
 
 test "Florence compaction publishes active shapes and preserves borrowed backing through repeated EOS" {
     try testCompactedCrossViews(std.testing.allocator);
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, testCompactedCrossViews, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, testCompactedCrossViews, .{});
 }
 
 fn testCompactedCrossViews(allocator: std.mem.Allocator) !void {
