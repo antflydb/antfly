@@ -30,6 +30,7 @@ const Checkpoint = struct {
 pub const Job = union(enum) {
     publication: local.metadata_lake_index_catalog.Publication,
     artifact: Ref,
+    contribution_page: Ref,
     chunk: artifacts.ChunkRef,
     page: struct { ref: tree.Ref, ordered_rows: bool },
 };
@@ -92,13 +93,21 @@ pub const Progress = struct {
                 _ = try self.record(chunk);
             },
             .artifact => |artifact| try collector.markArtifact(a, artifact),
+            .contribution_page => |page| {
+                if (!try self.expand(.{ .artifact_id = page.artifact_id, .checksum = page.checksum, .byte_len = page.byte_len }, "contributions")) return;
+                try stores.chargeReadBudget(&collector.remaining_reads, page.byte_len);
+                for (try @import("lake_index_directory.zig").loadContributionPage(a, collector.store, page, collector.cancellation(), null)) |contribution| try self.enqueue(.{ .artifact = contribution.artifact });
+            },
             .publication => |publication| {
                 try self.enqueue(.{ .chunk = .{ .artifact_id = publication.inventory.artifact_id, .checksum = publication.inventory.checksum, .byte_len = publication.inventory.byte_len } });
                 var hydrated = publication;
                 if (publication.directory) |directory| {
                     if (!try self.expand(.{ .artifact_id = directory.artifact_id, .checksum = directory.checksum, .byte_len = directory.byte_len }, "directory")) return;
                     try stores.chargeReadBudget(&collector.remaining_reads, directory.byte_len);
-                    try @import("lake_index_directory.zig").hydrate(a, collector.store, &hydrated, collector.cancellation(), null);
+                    const document = try @import("lake_index_directory.zig").loadDocument(a, collector.store, .{ .kind = .external_base_source, .artifact_id = directory.artifact_id, .checksum = directory.checksum, .byte_len = directory.byte_len }, collector.cancellation(), null);
+                    hydrated.declarations = document.declarations;
+                    hydrated.file_contributions = document.file_contributions;
+                    for (document.contribution_pages) |page| try self.enqueue(.{ .contribution_page = page });
                 }
                 for (hydrated.declarations) |declaration| try self.enqueue(.{ .artifact = declaration.artifact });
                 for (hydrated.file_contributions) |contribution| try self.enqueue(.{ .artifact = contribution.artifact });

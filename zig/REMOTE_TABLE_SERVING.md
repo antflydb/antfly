@@ -57,7 +57,10 @@ record extension. The query-definition projection carries that extension with
 the schema and desired indexes; identity-only projections omit it. Empty legacy
 records retain their original binary encoding and JSON shape. Publication requires
 metadata decoder capability 22 on every coordinated replica. Native reader
-sessions and reader-safe collection additionally require protocol 24.
+sessions and reader-safe collection require protocol 24 or later. Paged aggregate
+contribution directories require metadata and reader protocol 25; admission waits
+for that decoder capability on every coordinated replica. Protocol 24 publications
+remain readable and retain their reader-safe retirement obligations.
 
 Each build attempt records a monotonic generation, a unique token, a bounded
 lease, and separate digests for desired definitions, resolved source coverage,
@@ -503,6 +506,11 @@ optional columns become typed NULL vectors at the shared row-source boundary, so
 single-index builds, shared replay and ordered key generation agree on schema
 evolution without weakening required-column or type checks.
 
+Algebraic consumers participate in the same changed-file plan using authenticated
+recipe/file contributions. Mixing algebraic and search indexes therefore preserves
+delta replay. Unsupported reducer laws or deletion layouts conservatively request
+a complete replay.
+
 For compatible unchanged declarations, the shared build replay scans the union of
 changed files. New or unsupported producer recipes conservatively request a full
 shared scan. All candidate checkpoints, spill files and readers close on failure;
@@ -584,3 +592,43 @@ only after the metadata completion receipt. Interrupted checkpoint cleanup leave
 ordinary orphans for a later collection. Incomplete background passes reschedule
 without waiting the normal maintenance interval; a pass has a 120-second deadline
 to leave bounded time for checkpoint I/O. Dry-run collection remains read-only.
+
+
+### Immutable scan plans and aggregate reduction trees
+
+Cached Iceberg plans own the validated manifest, canonical public-row-ID file
+ordering, inverse file ranks, file-ID lookup map and row/byte estimates. Parquet
+and uncached Iceberg sources prepare the same structure once per source owner;
+Parquet listings are still refreshed for each query. Query owners borrow those bytes through a decoded-cache lease. Selective hydration
+maps and orders only candidate files rather than rebuilding a manifest-sized
+lookup or sorting every file for each candidate window. Provider version evidence
+lives in a sparse query-local overlay; full coverage checks and builds explicitly
+materialize an owned inventory. Ordered split children borrow their parent's plan
+and keep independent version overlays. Fresh metadata, credentials, coverage and
+delete-object checks remain required. Mutable prefix listings are not immutable
+snapshot plans.
+
+The SQL statement cursor forwards ordering proof, exact-count callbacks, parallel
+split callbacks and estimates. Split children close before their parent, which
+retains the statement's source and reader leases until all child work drains.
+
+Exact associative algebraic recipes use a compressed binary radix reduction tree
+keyed by snapshot-independent file digests. Hash-indexed contribution lookup
+reuses unchanged file partials and internal reductions. An append, replacement or
+removal rebuilds only affected ancestors, merging authenticated child partials
+through the existing bounded/spillable typed reducer. MIN/MAX use hierarchical
+merging, with no subtraction or approximate numeric conversion. Floating-point,
+distinct and unsupported recipes retain their ordinary exact rebuild path.
+
+Current leaf and internal contributions are retained in authenticated pages of at
+most 256 records and 1 MiB each, referenced by a version-2 declaration directory.
+The old 16,384-record incremental fallback is removed; the explicit catalog safety
+limit is 1,048,576 contributions, alongside build, artifact and spill budgets.
+Serving reads only declarations; builders load contribution pages for indexed
+reuse, and GC checkpoints page traversal before sweeping any payload. Metadata
+planning and contribution-directory publication still scale with live file/state
+count; reduction payload work scales with changed tree paths and group sizes.
+
+Dry-run GC completes its census independently of the destructive deletion budget.
+It does not hold the scheduler on the same table merely because eligible objects
+exceed `max_deleted`. Destructive collections retain their durable continuation.

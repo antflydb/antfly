@@ -45,7 +45,7 @@ pub fn openPinned(alloc: Allocator, table: catalog.Table, request: catalog.Scan,
     if (request.include_primary_digest or request.include_document or request.index_equality != null) return error.UnsupportedSqlExecution;
     try context.ensureActive();
     const binding = table.external_base_source orelse return error.InvalidSqlBackend;
-    try @import("../serverless/query/lake_scan_plan.zig").validateBindingInventory(binding.binding, source.inventory);
+    try source.validateBinding(binding.binding);
     if (request.after) |id| try @import("../storage/rowsource/identity.zig").validateContinuation(id, source.inventory);
     if (request.before) |id| try @import("../storage/rowsource/identity.zig").validateContinuation(id, source.inventory);
     var arena = std.heap.ArenaAllocator.init(alloc);
@@ -92,7 +92,7 @@ pub fn openPinned(alloc: Allocator, table: catalog.Table, request: catalog.Scan,
     var stream = try @import("../serverless/query/lake_stream.zig").Stream.init(alloc, source, columns.items, pruning.items, .{ .deadline_ns = normalized.deadline_ns, .cancellation = @import("../storage/object_storage.zig").CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) }, .{});
     errdefer stream.deinit();
     stream.identity_only = identity_only;
-    if (request.row_refs) |refs| try stream.selectRows(try @import("../serverless/query/lake_row_selection.zig").Selection.init(owned, source.inventory, refs));
+    if (request.row_refs) |refs| try stream.selectRows(try @import("../serverless/query/lake_row_selection.zig").Selection.initWithMap(owned, source.inventory, refs, source.fileMap()));
     if (source.iceberg_schema != null or std.mem.startsWith(u8, binding.binding.schema_fingerprint, "parquet-schema:") or std.mem.indexOf(u8, binding.binding.schema_fingerprint, ":hash=") != null) {
         var contract: std.ArrayList(@import("../serverless/query/lake_schema.zig").Column) = .empty;
         for (table.columns) |column| {
@@ -126,7 +126,10 @@ pub fn openPinned(alloc: Allocator, table: catalog.Table, request: catalog.Scan,
         owner.stream.filter = .{ .ptr = owner, .any_match = Owner.anyMatch };
     var estimated_rows: u64 = 0;
     var estimated_bytes: u64 = 0;
-    for (source.inventory.files) |file| {
+    if (source.estimates()) |estimate| {
+        estimated_rows = estimate.rows;
+        estimated_bytes = estimate.bytes;
+    } else for (source.inventory.files) |file| {
         estimated_rows +|= file.row_count;
         estimated_bytes +|= file.byte_len;
     }
@@ -444,6 +447,17 @@ const Owner = struct {
         return try self.splitChildren(a, count, false);
     }
     fn cloneVersionState(a: Allocator, source: *serving.ServingSource) !void {
+        const resolved = source.pinned_files.len == source.inventory.files.len and std.mem.allEqual(bool, source.pinned_files, true);
+        if (!source.inventory_owned or !source.lazy_versions or resolved) {
+            // An unopened child borrows the immutable plan and independently
+            // pins only its own files. Parent lifetime pins the plan lease.
+            source.versions = .empty;
+            source.pinned_files = &.{};
+            source.inventory_owned = false;
+            if (resolved) source.lazy_versions = false;
+            source.alloc = a;
+            return;
+        }
         const files = try a.alloc(@import("../serverless/external_source/types.zig").FileEntry, source.inventory.files.len);
         var owned: usize = 0;
         errdefer {
@@ -467,6 +481,8 @@ const Owner = struct {
         source.scanner.inventory = source.inventory;
     }
     fn freeVersionState(a: Allocator, source: *serving.ServingSource) void {
+        source.clearVersions();
+        if (!source.inventory_owned) return;
         for (source.inventory.files) |file| {
             a.free(file.etag);
             a.free(file.version_id);
@@ -1452,4 +1468,67 @@ test "lake SQL lazy ordered range ownership unwinds allocation failures" {
         }
     };
     try std.testing.checkAllAllocationFailures(a, Sweep.run, .{ &lake.source, lake.table });
+}
+
+test "lake SQL shared immutable plans retain sparse file versions and canonical ordering" {
+    const a = std.testing.allocator;
+    const codec = @import("../serverless/external_source/codec.zig");
+    const external = @import("../serverless/external_source/types.zig");
+    var cache = @import("../serverless/query/lake_serving_cache.zig").Cache.init(a);
+    defer cache.deinit();
+    var lake: TestLake = .{ .memory = TestLake.storage.MemoryObjectStorage.init(a) };
+    try lake.populate(a, 2, &.{ 1, 2, 3 });
+    defer lake.deinit(a);
+    var schema = try @import("../serverless/query/lake_schema.zig").icebergSchema(a, "{\"current-schema-id\":7,\"schemas\":[{\"schema-id\":7,\"fields\":[{\"id\":1,\"name\":\"amount\",\"required\":true,\"type\":\"long\"}]}]}", null);
+    defer schema.deinit();
+    lake.source.iceberg_schema = schema;
+    lake.inventory.format = .iceberg;
+    lake.table.external_base_source.?.binding.format = .iceberg;
+    var zero: [8]u8 = @splat(0);
+    lake.inventory.files[0].lower_bounds = try external.FieldMetric.cloneAll(a, &.{.{ .field_id = 1, .value = &zero }});
+    lake.inventory.files[0].upper_bounds = try external.FieldMetric.cloneAll(a, &.{.{ .field_id = 1, .value = &zero }});
+    const bytes = try codec.encodeAlloc(a, lake.inventory);
+    defer a.free(bytes);
+    const lease = try cache.decoded.create(1024 * 1024);
+    defer lease.release();
+    const ca = lease.item.budget.allocator();
+    lease.item.payload = .{ .snapshot = .{ .inventory = try codec.decodeAlloc(ca, bytes) } };
+    const manifest = &lease.item.payload.snapshot.inventory;
+    ca.free(manifest.files[1].etag);
+    ca.free(manifest.files[1].version_id);
+    manifest.files[1].etag = &.{};
+    manifest.files[1].version_id = try ca.dupe(u8, "iceberg:v1:data_seq=1");
+    try serving.ServingSource.prepareCachedPlan(lease.item);
+    lake.source.inventory = manifest.*;
+    lake.source.scanner.inventory = manifest.*;
+    lake.source.plan_lease = lease;
+    lake.source.inventory_owned = false;
+    lake.source.lazy_versions = true;
+    defer lake.source.clearVersions();
+    var client = lake.memory.client();
+    try client.deleteObject("bucket", "events/0.parquet", .{});
+    for (0..2) |_| {
+        const cursor = try openPinned(a, lake.table, .{ .fields = &.{"amount"}, .conditions = &.{.{ .column = "amount", .op = .eq, .value = .{ .integer = 2 } }}, .limit = 8 }, .{}, &lake.source);
+        defer cursor.close(cursor.ptr);
+        const owner: *Owner = @ptrCast(@alignCast(cursor.ptr));
+        try std.testing.expect(owner.stream.files.ptr == lease.item.file_order.?.ptr);
+        try std.testing.expect(!owner.stream.owns_files);
+        const page = try cursor.next(cursor.ptr, a, 8);
+        defer page.deinit();
+        try std.testing.expectEqual(@as(usize, 1), page.rows.len);
+        try std.testing.expectEqual(@as(usize, 1), lake.meter.stats);
+        try std.testing.expectEqual(@as(usize, 1), lake.source.versions.count());
+        try std.testing.expect(lake.source.pinned_files.len == 0);
+        try std.testing.expect(!lake.source.isFilePinned(0) and lake.source.isFilePinned(1));
+        try std.testing.expectEqual(@as(usize, 0), manifest.files[1].etag.len);
+        try std.testing.expect(lake.source.fileAt(1).etag.len != 0);
+    }
+    try lake.source.ownInventory();
+    defer lake.source.inventory.deinit(a);
+    defer a.free(lake.source.pinned_files);
+    try std.testing.expect(lake.source.inventory_owned);
+    try std.testing.expectEqual(@as(usize, 0), lake.source.versions.count());
+    try std.testing.expect(lake.source.pinned_files[1]);
+    try std.testing.expect(lake.source.inventory.files[1].etag.len != 0);
+    try std.testing.expectEqual(@as(usize, 0), manifest.files[1].etag.len);
 }

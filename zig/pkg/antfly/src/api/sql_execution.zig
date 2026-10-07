@@ -960,7 +960,7 @@ pub const Adapter = struct {
         errdefer statement.close(statement.ptr);
         const owner = try alloc.create(SingleStatementCursor);
         owner.* = .{ .alloc = alloc, .statement = statement };
-        return .{ .ptr = owner, .next = SingleStatementCursor.next, .next_columns = SingleStatementCursor.nextColumns, .set_dynamic_filter = SingleStatementCursor.setDynamicFilter, .close = SingleStatementCursor.close };
+        return owner.asCursor();
     }
 
     fn checkLakeRead(self: *Adapter, alloc: std.mem.Allocator, table: catalog.Table) !void {
@@ -1061,6 +1061,40 @@ pub const Adapter = struct {
     const SingleStatementCursor = struct {
         alloc: std.mem.Allocator,
         statement: catalog.StatementRead,
+        fn asCursor(self: *@This()) catalog.Cursor {
+            const child = self.statement.cursors[0];
+            return .{
+                .ptr = self,
+                .next = next,
+                .close = close,
+                .next_columns = if (child.next_columns != null) nextColumns else null,
+                .set_dynamic_filter = if (child.set_dynamic_filter != null) setDynamicFilter else null,
+                .count_rows = if (child.count_rows != null) countRows else null,
+                // Cursor's contract keeps children inside their parent's lifetime.
+                // The statement therefore pins their shared source until close.
+                .split_scan = if (child.split_scan != null) splitScan else null,
+                .split_ordered = if (child.split_ordered != null) splitOrdered else null,
+                .order_satisfied = child.order_satisfied,
+                .estimated_rows = child.estimated_rows,
+                .estimated_bytes = child.estimated_bytes,
+                .ordered_split_bytes = child.ordered_split_bytes,
+            };
+        }
+        fn countRows(raw: *anyopaque) !?u64 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const child = self.statement.cursors[0];
+            return child.count_rows.?(child.ptr);
+        }
+        fn splitScan(raw: *anyopaque, alloc: std.mem.Allocator, maximum: usize) !?[]catalog.Cursor {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const child = self.statement.cursors[0];
+            return child.split_scan.?(child.ptr, alloc, maximum);
+        }
+        fn splitOrdered(raw: *anyopaque, alloc: std.mem.Allocator, maximum: usize) !?[]catalog.Cursor {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const child = self.statement.cursors[0];
+            return child.split_ordered.?(child.ptr, alloc, maximum);
+        }
         fn next(raw: *anyopaque, alloc: std.mem.Allocator, limit: u32) !catalog.Page {
             const self: *@This() = @ptrCast(@alignCast(raw));
             const cursor = self.statement.cursors[0];
@@ -3227,4 +3261,59 @@ test "SQL mutation classification preserves wrapped definite conflicts and const
         .{ .status = 400, .body = "{malformed receipt", .expected = error.SqlMutationOutcomeUnknown },
     };
     for (cases) |case| try std.testing.expectEqual(case.expected, classifyMutationFailure(case.status, case.body).err);
+}
+
+test "SQL lake statement wrapper preserves ordering counts estimates and split source lifetime" {
+    const a = std.testing.allocator;
+    const Fixture = struct {
+        statement_closed: bool = false,
+        children: usize = 0,
+        fn next(_: *anyopaque, _: std.mem.Allocator, _: u32) !catalog.Page {
+            return .{ .rows = &.{} };
+        }
+        fn count(raw: *anyopaque) !?u64 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(!self.statement_closed);
+            return 12345;
+        }
+        fn childClose(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(!self.statement_closed);
+            self.children -= 1;
+        }
+        fn split(raw: *anyopaque, alloc: std.mem.Allocator, maximum: usize) !?[]catalog.Cursor {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(!self.statement_closed);
+            const children = try alloc.alloc(catalog.Cursor, @min(maximum, 2));
+            for (children) |*child| child.* = .{ .ptr = self, .next = next, .close = childClose, .count_rows = count };
+            self.children += children.len;
+            return children;
+        }
+        fn close(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(self.children == 0);
+            self.statement_closed = true;
+        }
+    };
+    var fixture: Fixture = .{};
+    const physical: catalog.Cursor = .{ .ptr = &fixture, .next = Fixture.next, .close = Fixture.close, .order_satisfied = true, .estimated_rows = 12345, .estimated_bytes = 98765, .ordered_split_bytes = 64, .count_rows = Fixture.count, .split_scan = Fixture.split, .split_ordered = Fixture.split };
+    const owner = try a.create(Adapter.SingleStatementCursor);
+    owner.* = .{ .alloc = a, .statement = .{ .ptr = &fixture, .cursors = &.{physical}, .close = Fixture.close } };
+    const wrapped = owner.asCursor();
+    try std.testing.expect(wrapped.order_satisfied);
+    try std.testing.expectEqual(physical.estimated_rows, wrapped.estimated_rows);
+    try std.testing.expectEqual(physical.estimated_bytes, wrapped.estimated_bytes);
+    try std.testing.expectEqual(physical.ordered_split_bytes, wrapped.ordered_split_bytes);
+    try std.testing.expect(wrapped.next_columns == null and wrapped.set_dynamic_filter == null);
+    try std.testing.expectEqual(@as(?u64, 12345), try wrapped.count_rows.?(wrapped.ptr));
+    for ([_]*const fn (*anyopaque, std.mem.Allocator, usize) anyerror!?[]catalog.Cursor{ wrapped.split_scan.?, wrapped.split_ordered.? }) |split| {
+        const children = (try split(wrapped.ptr, a, 4)).?;
+        for (children) |child| {
+            try std.testing.expectEqual(@as(?u64, 12345), try child.count_rows.?(child.ptr));
+            child.close(child.ptr);
+        }
+        a.free(children);
+    }
+    wrapped.close(wrapped.ptr);
+    try std.testing.expect(fixture.statement_closed);
 }

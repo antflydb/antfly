@@ -32,6 +32,12 @@ pub const Item = struct {
     budget: Budget,
     arena: std.heap.ArenaAllocator,
     payload: Payload = .{ .columns = &.{} },
+    // Snapshot-local canonical row-ID ordering and totals, computed once.
+    file_order: ?[]usize = null,
+    file_rank: ?[]usize = null,
+    file_by_id: std.StringHashMapUnmanaged(usize) = .empty,
+    estimated_rows: u64 = 0,
+    estimated_bytes: u64 = 0,
     refs: usize = 1,
     cached: bool = false,
     /// A decoded page pins its immutable chunk dictionary in this cache.
@@ -42,6 +48,9 @@ pub const Item = struct {
         const a = self.budget.backing;
         if (self.payload == .prepared) self.payload.prepared.destroy(self.budget.allocator());
         if (self.payload == .snapshot) self.payload.snapshot.deinit(self.budget.allocator());
+        self.file_by_id.deinit(self.budget.allocator());
+        if (self.file_rank) |rank| self.budget.allocator().free(rank);
+        if (self.file_order) |order| self.budget.allocator().free(order);
         self.arena.deinit();
         std.debug.assert(self.budget.live == 0);
         a.destroy(self);

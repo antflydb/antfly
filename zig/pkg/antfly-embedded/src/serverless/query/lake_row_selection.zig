@@ -26,22 +26,28 @@ pub const Selection = struct {
     /// Allocations belong to the caller's request arena. Strings need not be
     /// retained: validated references become inventory ordinals exactly once.
     pub fn init(a: A, inventory: external.Inventory, refs: []const rows.RowRef) !Selection {
+        return initWithMap(a, inventory, refs, null);
+    }
+    pub fn initWithMap(a: A, inventory: external.Inventory, refs: []const rows.RowRef, known: ?*const std.StringHashMapUnmanaged(usize)) !Selection {
         if (refs.len > max_candidates) return error.LakeCandidateBudgetExceeded;
         var files: std.StringHashMapUnmanaged(usize) = .empty;
         defer files.deinit(a);
-        try files.ensureTotalCapacity(a, @intCast(inventory.files.len));
-        for (inventory.files, 0..) |file, index| {
-            const entry = files.getOrPutAssumeCapacity(file.file_id);
-            if (entry.found_existing) return error.InvalidExternalLakeIndexCoverage;
-            entry.value_ptr.* = index;
+        if (known == null) {
+            try files.ensureTotalCapacity(a, @intCast(inventory.files.len));
+            for (inventory.files, 0..) |file, index| {
+                const entry = files.getOrPutAssumeCapacity(file.file_id);
+                if (entry.found_existing) return error.InvalidExternalLakeIndexCoverage;
+                entry.value_ptr.* = index;
+            }
         }
+        const by_id = known orelse &files;
         const coordinates = try a.alloc(Coordinate, refs.len);
         errdefer a.free(coordinates);
         for (refs, coordinates) |ref, *coordinate| {
             if (ref != .external) return error.ExternalLakeSnapshotMismatch;
             const r = ref.external;
             if (!std.mem.eql(u8, r.source_id, inventory.source_id) or !std.mem.eql(u8, r.snapshot_id, inventory.snapshot_id)) return error.ExternalLakeSnapshotMismatch;
-            const index = files.get(r.file_id) orelse return error.ExternalLakeSnapshotMismatch;
+            const index = by_id.get(r.file_id) orelse return error.ExternalLakeSnapshotMismatch;
             coordinate.* = .{ .file = index, .group = r.row_group_ordinal, .row = r.row_ordinal };
             // Directory Parquet inventories discover groups lazily. Their
             // physical ordinal bounds are checked against the opened footer.

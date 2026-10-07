@@ -84,6 +84,7 @@ pub const Stream = struct {
     limits: Limits,
     stats: Stats = .{},
     files: []usize,
+    owns_files: bool = true,
     selection: ?@import("lake_row_selection.zig").Selection = null,
     active_file: usize = 0,
     file_index: usize = 0,
@@ -257,36 +258,42 @@ pub const Stream = struct {
 
     pub fn init(alloc: Allocator, source: *serving.ServingSource, columns: []const []const u8, predicates: []const Predicate, context: Context, limits: Limits) !Stream {
         try context.ensureActive();
-        try source.inventory.validate();
-        const files = try alloc.alloc(usize, source.inventory.files.len);
-        for (files, 0..) |*index, i| index.* = i;
-        std.mem.sort(usize, files, source.inventory, struct {
-            fn less(inventory: external.Inventory, a: usize, b: usize) bool {
-                const left = identity.fileDigest(inventory.source_id, inventory.snapshot_id, inventory.files[a].file_id);
-                const right = identity.fileDigest(inventory.source_id, inventory.snapshot_id, inventory.files[b].file_id);
-                return std.mem.order(u8, &left, &right) == .lt;
-            }
-        }.less);
-        return .{ .alloc = alloc, .source = source, .columns = columns, .predicates = predicates, .context = context, .limits = limits, .files = files, .schema_contract = if (source.iceberg_schema) |schema| schema.columns else &.{} };
+        const cached_order = source.canonicalOrder();
+        if (cached_order == null) try source.inventory.validate();
+        const files = cached_order orelse try serving.ServingSource.canonicalFileOrder(alloc, source.inventory);
+        return .{ .alloc = alloc, .source = source, .columns = columns, .predicates = predicates, .context = context, .limits = limits, .files = files, .owns_files = cached_order == null, .schema_contract = if (source.iceberg_schema) |schema| schema.columns else &.{} };
     }
     /// A contribution scan keeps the parent snapshot and delete applicability,
     /// but schedules only one pinned object. All footer offsets remain file-local.
     pub fn restrictFile(self: *Stream, index: usize) !void {
         if (index >= self.source.inventory.files.len or self.file_index != 0 or self.discovered != null) return error.InvalidExternalLakeIndexCoverage;
         const files = try self.alloc.dupe(usize, &.{index});
-        self.alloc.free(self.files);
+        if (self.owns_files) self.alloc.free(self.files);
         self.files = files;
+        self.owns_files = true;
     }
     pub fn selectRows(self: *Stream, selection: @import("lake_row_selection.zig").Selection) !void {
         if (self.file_index != 0 or self.discovered != null or self.work != null) return error.InvalidLakeCandidateReference;
         var files: std.ArrayList(usize) = .empty;
         defer files.deinit(self.alloc);
-        for (self.files) |file| {
+        const rank = self.source.fileRanks();
+        if (!self.owns_files and rank != null) {
+            for (selection.coordinates) |coordinate| {
+                if (files.items.len == 0 or files.items[files.items.len - 1] != coordinate.file) try files.append(self.alloc, coordinate.file);
+            }
+            std.mem.sort(usize, files.items, rank.?, struct {
+                fn less(ranks: []const usize, left: usize, right: usize) bool {
+                    return ranks[left] < ranks[right];
+                }
+            }.less);
+            self.stats.files_pruned += self.files.len - files.items.len;
+        } else for (self.files) |file| {
             if (selection.fileMayMatch(file)) try files.append(self.alloc, file) else self.stats.files_pruned += 1;
         }
         const retained = try files.toOwnedSlice(self.alloc);
-        self.alloc.free(self.files);
+        if (self.owns_files) self.alloc.free(self.files);
         self.files = retained;
+        self.owns_files = true;
         self.selection = selection;
     }
     pub fn partitionCount(self: *Stream, maximum: usize) !usize {
@@ -340,7 +347,7 @@ pub const Stream = struct {
             self.alloc.free(work.units);
             self.alloc.destroy(work);
         };
-        self.alloc.free(self.files);
+        if (self.owns_files) self.alloc.free(self.files);
         self.mapped_columns.deinit(self.alloc);
         self.* = undefined;
     }
@@ -531,8 +538,8 @@ pub const Stream = struct {
         }
         // Next-file footer lookahead also helps single-row-group datasets.
         for (self.files[self.file_index..]) |index| {
-            if (self.source.lazy_versions and !self.source.pinned_files[index]) continue;
-            const upcoming = self.source.inventory.files[index];
+            if (self.source.lazy_versions and !self.source.isFilePinned(index)) continue;
+            const upcoming = self.source.fileAt(index);
             if (!self.fileMatches(upcoming)) continue;
             const object = try @import("lake_range_io.zig").objectRefForExternalFileUri(upcoming);
             const footer = try @import("lake_range_io.zig").planParquetFooterRead(object, 64 * 1024);
@@ -543,26 +550,45 @@ pub const Stream = struct {
     fn loadFile(self: *Stream, index: usize) !void {
         // Metadata and partition pruning happen before statting data objects.
         // Pin each surviving file once, before any footer or payload read.
-        if (self.source.lazy_versions and !self.source.pinned_files[index]) {
+        if (self.source.lazy_versions and !self.source.isFilePinned(index)) {
+            var entry = self.source.fileAt(index);
+            const sparse = !self.source.inventory_owned;
+            // The provider can replace version strings before a later check
+            // fails. Preserve those replacements for owned inventory teardown.
+            defer if (!sparse) {
+                self.source.inventory.files[index] = entry;
+            };
+            if (sparse) {
+                entry.etag = try self.source.alloc.dupe(u8, entry.etag);
+                errdefer self.source.alloc.free(entry.etag);
+                entry.version_id = try self.source.alloc.dupe(u8, entry.version_id);
+            }
+            errdefer if (sparse) {
+                self.source.alloc.free(entry.etag);
+                self.source.alloc.free(entry.version_id);
+            };
             var single = self.source.inventory;
-            single.files = self.source.inventory.files[index..][0..1];
+            single.files = @as(*[1]@TypeOf(entry), @ptrCast(&entry));
             single.deleted_row_groups = &.{};
             if (self.source.immutable_objects and self.source.verified_files != null) {
-                const file = &single.files[0];
-                const verified = self.source.verified_files.?.get(file.file_id) orelse return error.ExternalLakeSnapshotMismatch;
-                if (!std.mem.eql(u8, file.object_uri, verified.object_uri) or file.byte_len != verified.byte_len) return error.ExternalLakeSnapshotMismatch;
+                const verified = self.source.verified_files.?.get(entry.file_id) orelse return error.ExternalLakeSnapshotMismatch;
+                if (!std.mem.eql(u8, entry.object_uri, verified.object_uri) or entry.byte_len != verified.byte_len) return error.ExternalLakeSnapshotMismatch;
                 const etag = try self.source.alloc.dupe(u8, verified.etag);
                 errdefer self.source.alloc.free(etag);
                 const version = try self.source.alloc.dupe(u8, verified.version_id);
-                self.source.alloc.free(file.etag);
-                self.source.alloc.free(file.version_id);
-                file.etag = etag;
-                file.version_id = version;
+                self.source.alloc.free(entry.etag);
+                self.source.alloc.free(entry.version_id);
+                entry.etag = etag;
+                entry.version_id = version;
             } else try iceberg.pinInventoryDataFileObjectVersions(self.source.alloc, self.source.scanner.object_reader.client, &single);
-            self.source.pinned_files[index] = true;
+            if (sparse) try self.source.versions.put(self.source.alloc, index, entry) else {
+                self.source.inventory.files[index] = entry;
+                self.source.pinned_files[index] = true;
+            }
         }
+        var file_entry = self.source.fileAt(index);
         var inventory = self.source.inventory;
-        inventory.files = self.source.inventory.files[index..][0..1];
+        inventory.files = @as(*[1]@TypeOf(file_entry), @ptrCast(&file_entry));
         inventory.deleted_row_groups = &.{};
         if (self.schema_contract.len != 0 or self.source.scanner.shared_reader != null) {
             const lease = if (self.source.scanner.shared_reader) |reader| try reader.footer(inventory.files[0]) else null;

@@ -82,7 +82,15 @@ pub const Collector = struct {
             if (hydrated.directory) |directory| {
                 _ = try self.mark(.{ .artifact_id = directory.artifact_id, .checksum = directory.checksum, .byte_len = directory.byte_len });
                 try stores.chargeReadBudget(&self.remaining_reads, directory.byte_len);
-                try @import("lake_index_directory.zig").hydrate(sa, self.store, &hydrated, self.cancellation(), null);
+                const directories = @import("lake_index_directory.zig");
+                const document = try directories.loadDocument(sa, self.store, .{ .kind = .external_base_source, .artifact_id = directory.artifact_id, .checksum = directory.checksum, .byte_len = directory.byte_len }, self.cancellation(), null);
+                hydrated.declarations = document.declarations;
+                hydrated.file_contributions = document.file_contributions;
+                for (document.contribution_pages) |page| {
+                    _ = try self.mark(.{ .artifact_id = page.artifact_id, .checksum = page.checksum, .byte_len = page.byte_len });
+                    try stores.chargeReadBudget(&self.remaining_reads, page.byte_len);
+                    for (try directories.loadContributionPage(sa, self.store, page, self.cancellation(), null)) |contribution| try self.markArtifact(sa, contribution.artifact);
+                }
             }
             _ = try self.mark(.{ .artifact_id = publication.inventory.artifact_id, .checksum = publication.inventory.checksum, .byte_len = publication.inventory.byte_len });
             for (hydrated.declarations) |declaration| try self.markArtifact(sa, declaration.artifact);
@@ -92,7 +100,8 @@ pub const Collector = struct {
         // No destructive work until the complete bounded mark phase succeeds.
         try self.check();
         try self.store.visitScopedUploads(@import("lake_index_publication.zig").uploadDomainWithNamespace(self.table, self.identity, self.namespace), .{ .ptr = self, .visit = visit }, self.cancellation());
-        if (self.result.eligible > self.options.max_deleted) return self.result;
+        // A dry-run census has completed even when a destructive pass would
+        // exhaust its deletion budget. It has no durable sweep to resume.
         if (!self.options.dry_run) {
             try self.check();
             try self.store.cleanupRetiredScopedTemporaryRange(@import("lake_index_publication.zig").uploadDomainWithNamespace(self.table, self.identity, self.namespace), self.upload_floor, self.upload_cutoff, self.cancellation());
@@ -336,14 +345,14 @@ test "external lake native GC retains shared aggregate blocks and durable reader
     var sparse_upload = try store.put(sparse_bytes);
     defer sparse_upload.deinit(a);
     const sparse_ref: local.serverless_manifest_artifact_ref.ArtifactRef = .{ .name = "sparse", .kind = .sparse_segment, .metadata_version = @import("lake_index_native_sparse.zig").metadata_version, .artifact_id = sparse_upload.artifact_id, .checksum = sparse_upload.checksum, .byte_len = sparse_upload.byte_len };
-    const directory_one = try @import("lake_index_directory.zig").publish(ca, &store, &.{ .{ .name = "sum", .binding = binding, .artifact = root }, .{ .name = "old_sum", .binding = binding, .artifact = old_root }, .{ .name = row_root.name, .binding = row_binding, .artifact = row_root }, .{ .name = "text", .binding = text_binding, .artifact = text_ref }, .{ .name = "sparse", .binding = sparse_binding, .artifact = sparse_ref } }, .none);
+    const directory_one = try @import("lake_index_directory.zig").publishWithContributions(ca, &store, &.{ .{ .name = "sum", .binding = binding, .artifact = root }, .{ .name = "old_sum", .binding = binding, .artifact = old_root }, .{ .name = row_root.name, .binding = row_binding, .artifact = row_root }, .{ .name = "text", .binding = text_binding, .artifact = text_ref }, .{ .name = "sparse", .binding = sparse_binding, .artifact = sparse_ref } }, &.{.{ .file = @splat(1), .recipe = recipe.fingerprint(), .name = "sum", .artifact = root }}, .none);
     var orphan = try store.put("abandoned build artifact");
     defer orphan.deinit(a);
     var second_orphan = try store.put("another abandoned build artifact");
     defer second_orphan.deinit(a);
     const second_scope = try stores.UploadScope.forPublication(domain, 2, std.testing.io);
     store.upload_scope = second_scope;
-    const directory_two = try @import("lake_index_directory.zig").publish(ca, &store, &.{ .{ .name = "sum", .binding = binding, .artifact = root }, .{ .name = row_root.name, .binding = row_binding, .artifact = row_root }, .{ .name = "text", .binding = text_binding, .artifact = text_ref }, .{ .name = "sparse", .binding = sparse_binding, .artifact = sparse_ref } }, .none);
+    const directory_two = try @import("lake_index_directory.zig").publishWithContributions(ca, &store, &.{ .{ .name = "sum", .binding = binding, .artifact = root }, .{ .name = row_root.name, .binding = row_binding, .artifact = row_root }, .{ .name = "text", .binding = text_binding, .artifact = text_ref }, .{ .name = "sparse", .binding = sparse_binding, .artifact = sparse_ref } }, &.{.{ .file = @splat(1), .recipe = recipe.fingerprint(), .name = "sum", .artifact = root }}, .none);
     var publication: local.metadata_lake_index_catalog.Publication = .{
         .reader_protocol = 24,
         .namespace = namespace,
@@ -376,9 +385,11 @@ test "external lake native GC retains shared aggregate blocks and durable reader
     publication.directory = directory_two;
     harness.state = try harness.state.synchronize(ca, .{ .namespace = namespace, .generation = 2, .published = publication });
     const authority: lease_api.Authority = .{ .ptr = &harness, .context = .{}, .read = Harness.read, .mutate = Harness.mutate };
-    var planner: Collector = .{ .a = a, .table = 4, .authority = authority, .store = store, .identity = identity, .context = .{}, .token = @splat(7) };
+    var planner: Collector = .{ .a = a, .table = 4, .authority = authority, .store = store, .identity = identity, .context = .{}, .options = .{ .dry_run = true, .max_deleted = 1 }, .token = @splat(7) };
     const planned = try planner.run();
     try std.testing.expectEqual(@as(usize, 2), planned.eligible);
+    try std.testing.expect(planned.complete);
+    try std.testing.expectEqual(@as(usize, 0), planned.deleted);
     try std.testing.expectEqual(@as(u64, 3), harness.state.revision);
     // Each collector is destroyed between passes. A one-job mark budget is
     // intentionally smaller than this live graph, proving durable continuation.

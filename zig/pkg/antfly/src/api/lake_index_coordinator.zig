@@ -93,7 +93,7 @@ pub fn reconcile(a: A, io: std.Io, table: local.common_topology_records.TableRec
 /// obligation; do not mistake a matching definition signature for available
 /// derived storage. Transient provider errors retain the existing obligation.
 fn durableDirectoryAvailable(a: A, store: *Store, ready: catalog.Publication, cancellation: Cancellation) !bool {
-    if (ready.namespace == null or ready.reader_protocol != 24) return false;
+    if (ready.namespace == null or ready.reader_protocol != catalog.native_reader_protocol) return false;
     const directory = ready.directory orelse return false;
     var handle = store.artifactStore();
     handle.allocator = a;

@@ -100,10 +100,10 @@ pub const State = struct {
         next.namespace = catalog_state.namespace;
         next.pending = catalog_state.pending;
         if (next.reader_upload_floor == null) {
-            if (catalog_state.pending) |pending| if (pending.reader_protocol == 24) {
+            if (catalog_state.pending) |pending| if (pending.reader_protocol >= 24) {
                 next.reader_upload_floor = pending.generation;
             };
-            if (next.reader_upload_floor == null) if (catalog_state.published) |publication| if (publication.reader_protocol == 24) {
+            if (next.reader_upload_floor == null) if (catalog_state.published) |publication| if (publication.reader_protocol >= 24) {
                 next.reader_upload_floor = publication.generation;
             };
         }
@@ -199,7 +199,7 @@ pub const State = struct {
         }
         var retired_generations: std.ArrayList(u64) = .empty;
         for (self.publications) |publication| {
-            if (publication.reader_protocol != 24 or !std.meta.eql(publication.namespace, self.namespace) or !std.mem.eql(u8, &publication.signature.store, &store) or self.current == publication.generation) continue;
+            if (publication.reader_protocol < 24 or !std.meta.eql(publication.namespace, self.namespace) or !std.mem.eql(u8, &publication.signature.store, &store) or self.current == publication.generation) continue;
             const protected = for (self.readers) |reader| {
                 if (reader.generation == publication.generation and reader.expires_ms +| grace_ms >= now) break true;
             } else false;

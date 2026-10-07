@@ -121,12 +121,13 @@ pub fn buildWithLease(a: A, artifact_store: *stores.ArtifactStore, table: record
     var native_arena = std.heap.ArenaAllocator.init(a);
     defer native_arena.deinit();
     const na = native_arena.allocator();
+    const previous_contributions = if (current.value.published) |previous| if (reusable_directory and std.meta.eql(previous.namespace, current.value.namespace) and std.mem.eql(u8, &previous.signature.credentials, &signature.credentials) and std.mem.eql(u8, &previous.signature.store, &signature.store)) previous.file_contributions else &.{} else &.{};
     const replay_api = @import("lake_index_build_replay.zig");
     const replay_columns = try replay_api.columnsForBuild(a, na, table, &provider, base_source);
     var replay = replay_api.Replay.init(a, &provider, replay_columns);
     defer replay.deinit();
     if (current.value.published) |previous| if (candidates.len != 0 and std.mem.eql(u8, &previous.signature.desired, &signature.desired)) {
-        replay.only_files = try replay_api.changedFiles(a, na, &provider, scoped, candidates, cancellation);
+        replay.only_files = try replay_api.changedFiles(a, na, &provider, scoped, candidates, previous_contributions, cancellation);
     };
     if (replay_columns.len != 0) provider.replay = &replay;
     var legacy_indexes = try std.json.parseFromSliceLeaky(std.json.Value, na, table.indexes_json, .{ .allocate = .alloc_always });
@@ -140,7 +141,6 @@ pub fn buildWithLease(a: A, artifact_store: *stores.ArtifactStore, table: record
     const legacy_json = try std.json.Stringify.valueAlloc(na, legacy_indexes, .{});
     var manifest = try rebuild.reconcileResolvedExternalSourceSidecarsWithRuntimeAlloc(a, &scoped, provider.provider(), base_source, source.inventory, .{ .table_name = table.name, .schema_json = table.schema_json, .read_schema_json = table.read_schema_json, .indexes_json = legacy_json }, reusable, cancellation, .{ .published_generation = attempt.generation, .edge_generation = attempt.generation, .computed_at_ms = started }, .{}, scope);
     defer manifest.deinit(a);
-    const previous_contributions = if (current.value.published) |previous| if (reusable_directory and std.meta.eql(previous.namespace, current.value.namespace) and std.mem.eql(u8, &previous.signature.credentials, &signature.credentials) and std.mem.eql(u8, &previous.signature.store, &signature.store)) previous.file_contributions else &.{} else &.{};
     const native = try @import("lake_index_native_aggregates.zig").buildIncremental(a, na, table, source, &scoped, &provider, cancellation, reusable, previous_contributions);
     const native_declarations = native.declarations;
     const ordered = try @import("lake_index_native_rows.zig").buildIncremental(a, na, table, source, &scoped, &provider, cancellation, reusable, candidates);
@@ -195,7 +195,7 @@ test "external lake native publication builds scoped text artifacts and fences e
     defer fs_artifacts.deinit();
     var artifact_store = fs_artifacts.artifactStore();
     const store_identity: catalog.Digest = @splat(4);
-    const table: records.TableRecord = .{ .table_id = 4, .name = "lake", .schema_json = schema_json, .indexes_json = "{\"body_text\":{\"type\":\"full_text\",\"field\":\"body\"}}" };
+    const table: records.TableRecord = .{ .table_id = 4, .name = "lake", .schema_json = schema_json, .indexes_json = "{\"body_text\":{\"type\":\"full_text\",\"field\":\"body\"},\"stats\":{\"type\":\"algebraic\",\"materializations\":[{\"name\":\"rows\",\"op\":\"count\"}]}}" };
     const pending_bytes = try begin(a, std.testing.io, table, &source, store_identity, .{}, 100, 20);
     defer a.free(pending_bytes);
     var pending = table;
@@ -210,7 +210,7 @@ test "external lake native publication builds scoped text artifacts and fences e
     };
     var time: TestClock = .{};
     const clock: Clock = .{ .ptr = &time, .now_ms = TestClock.read };
-    const published_bytes = try build(a, &artifact_store, pending, &source, store_identity, .{}, .none, clock);
+    const published_bytes = try build(a, &artifact_store, pending, &source, store_identity, .{ .io = std.testing.io }, .none, clock);
     defer a.free(published_bytes);
     var published = pending;
     published.lake_index_catalog_json = published_bytes;
@@ -222,6 +222,7 @@ test "external lake native publication builds scoped text artifacts and fences e
     try std.testing.expect(parsed.value.pending == null);
     try std.testing.expect(publication.declarations.len > 0);
     for (publication.declarations) |declaration| {
+        if (declaration.artifact.kind != .text_segment) continue;
         try std.testing.expectEqual(local.serverless_manifest_artifact_ref.ArtifactKind.text_segment, declaration.artifact.kind);
         const upload = (try stores.uploadScopeFromArtifactId(declaration.artifact.artifact_id)).?;
         try std.testing.expectEqual(@as(u64, 1), upload.fencingToken());
@@ -297,6 +298,46 @@ test "external lake native publication builds scoped text artifacts and fences e
         try std.testing.expectError(error.NativeLakeTextCacheBusy, heap_limited.acquire(cache_io.io(), artifact_store, declaration.artifact, root, schema_json, cached_segments.cache, .{ .io = cache_io.io() }, .none));
         try std.testing.expectEqual(@as(usize, 0), heap_limited.heap_budget.live);
     }
+    // A mixed algebraic/text append must replay only the new Parquet file.
+    var appended = try client.putObject("antfly", "part-2.parquet", data, .{});
+    appended.deinit(a);
+    var next_source = try serving.ServingSource.open(a, .{ .storage_mode = .relational, .external_base_source = binding }, .{});
+    defer next_source.deinit();
+    const next_pending_bytes = try begin(a, std.testing.io, published, &next_source, store_identity, .{}, 102, 20);
+    defer a.free(next_pending_bytes);
+    var next_pending = published;
+    next_pending.lake_index_catalog_json = next_pending_bytes;
+    const Denied = struct {
+        var base: local.storage_object_storage.ObjectStorage = undefined;
+        fn get(_: *anyopaque, alloc: A, bucket: []const u8, key: []const u8, options: local.storage_object_storage.GetOptions) !local.storage_object_storage.GetResult {
+            if (std.mem.eql(u8, key, "part.parquet")) return error.UnexpectedUnchangedParquetRead;
+            var copy = base;
+            copy.allocator = alloc;
+            return copy.getObject(bucket, key, options);
+        }
+    };
+    Denied.base = next_source.scanner.object_reader.client;
+    var denied = Denied.base.vtable.*;
+    denied.get_object = Denied.get;
+    next_source.scanner.object_reader.client.vtable = &denied;
+    time.now = 103;
+    const next_bytes = try build(a, &artifact_store, next_pending, &next_source, store_identity, .{ .io = std.testing.io }, .none, clock);
+    defer a.free(next_bytes);
+    var next = try catalog.parse(a, next_bytes);
+    defer next.deinit();
+    try @import("lake_index_directory.zig").hydrate(next.arena.allocator(), artifact_store, &next.value.published.?, .none, null);
+    try std.testing.expectEqual(@as(usize, 2), next.value.published.?.declarations.len);
+    try std.testing.expectEqual(@as(usize, 3), next.value.published.?.file_contributions.len);
+    const aggregate = @import("lake_index_aggregate_artifact.zig");
+    for (next.value.published.?.declarations) |declaration| if (declaration.artifact.kind == .algebraic_segment) {
+        const recipe = try aggregate.loadRecipe(next.arena.allocator(), artifact_store, declaration.artifact, .none);
+        const reader = try aggregate.Reader.open(a, artifact_store, declaration.artifact, recipe, .none);
+        defer reader.cursor().close(reader);
+        const values = (try reader.cursor().next(reader, next.arena.allocator(), 8)).?;
+        var count = try local.sql_aggregate_partial.decode(a, values[0].aggregates[0], .{ .kind = .count });
+        defer count.deinit();
+        try std.testing.expectEqual(@as(u64, 4), count.count);
+    };
     time.now = 120;
     try std.testing.expectError(error.LakeIndexPublicationFenceChanged, build(a, &artifact_store, pending, &source, store_identity, .{}, .none, clock));
     var changed = pending;

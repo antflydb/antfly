@@ -13,6 +13,8 @@ pub const Digest = [32]u8;
 pub const Token = [16]u8;
 pub const DirectoryRef = struct { artifact_id: []const u8, checksum: []const u8, byte_len: u64, count: u32 };
 pub const max_directory_artifacts: usize = 4096;
+pub const native_reader_protocol: u16 = 25;
+pub const max_contributions: usize = 1024 * 1024;
 pub const max_directory_bytes: usize = 16 * 1024 * 1024;
 /// Physical namespace plus a named connection for current credential lookup.
 /// Credentials are never copied into publication metadata.
@@ -49,7 +51,7 @@ pub const Attempt = struct {
     started_at_ms: u64,
     lease_expires_at_ms: u64,
     fn validate(self: Attempt) !void {
-        if (self.reader_protocol != 0 and self.reader_protocol != 24) return error.InvalidLakeIndexCatalog;
+        if (self.reader_protocol != 0 and self.reader_protocol != 24 and self.reader_protocol != native_reader_protocol) return error.InvalidLakeIndexCatalog;
         if (self.store_locator) |locator| try locator.validate();
         try self.signature.validate();
         if (self.generation == 0 or std.mem.allEqual(u8, &self.token, 0) or self.lease_expires_at_ms <= self.started_at_ms) return error.InvalidLakeIndexCatalog;
@@ -84,7 +86,7 @@ pub const Publication = struct {
         }
     }
     pub fn validate(self: Publication) !void {
-        if (self.reader_protocol != 0 and self.reader_protocol != 24) return error.InvalidLakeIndexCatalog;
+        if (self.reader_protocol != 0 and self.reader_protocol != 24 and self.reader_protocol != native_reader_protocol) return error.InvalidLakeIndexCatalog;
         if (self.store_locator) |locator| try locator.validate();
         if (self.namespace) |namespace| if (std.mem.allEqual(u8, &namespace, 0)) return error.InvalidLakeIndexCatalog;
         if (self.generation == 0 or std.mem.allEqual(u8, &self.token, 0) or self.declarations.len > (if (self.directory != null) max_directory_artifacts else max_artifacts)) return error.InvalidLakeIndexCatalog;
@@ -92,7 +94,7 @@ pub const Publication = struct {
             if (directory.count > max_directory_artifacts or directory.byte_len > max_directory_bytes or (self.declarations.len != 0 and self.declarations.len != directory.count)) return error.InvalidLakeIndexCatalog;
             try artifactValid(.{ .kind = .doc_values, .artifact_id = directory.artifact_id, .checksum = directory.checksum, .byte_len = directory.byte_len });
         }
-        if (self.file_contributions.len > 16384) return error.InvalidLakeIndexCatalog;
+        if (self.file_contributions.len > max_contributions) return error.InvalidLakeIndexCatalog;
         for (self.file_contributions) |contribution| {
             if (contribution.name.len == 0 or contribution.name.len > 128 or std.mem.allEqual(u8, &contribution.file, 0) or std.mem.allEqual(u8, &contribution.recipe, 0) or contribution.artifact.kind != .algebraic_segment) return error.InvalidLakeIndexCatalog;
             try artifactValid(contribution.artifact);
@@ -155,7 +157,7 @@ pub const State = struct {
         if (self.pending) |attempt| if (attempt.lease_expires_at_ms > now_ms and std.meta.eql(attempt.signature, signature)) return error.LakeIndexBuildInProgress;
         var next = self;
         next.generation = std.math.add(u64, self.generation, 1) catch return error.LakeIndexGenerationExhausted;
-        next.pending = .{ .reader_protocol = 24, .generation = next.generation, .token = token, .signature = signature, .started_at_ms = now_ms, .lease_expires_at_ms = std.math.add(u64, now_ms, lease_ms) catch return error.InvalidLakeIndexCatalog };
+        next.pending = .{ .reader_protocol = native_reader_protocol, .generation = next.generation, .token = token, .signature = signature, .started_at_ms = now_ms, .lease_expires_at_ms = std.math.add(u64, now_ms, lease_ms) catch return error.InvalidLakeIndexCatalog };
         next.failure = null;
         try next.validate();
         return next;

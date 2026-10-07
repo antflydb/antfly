@@ -50,6 +50,17 @@ const Root = struct {
     state_slot: ?u16 = null,
 };
 
+/// Build planning reads authenticated recipe metadata, without aggregate blocks.
+pub fn loadRecipe(a: A, store: stores.ArtifactStore, artifact: Ref, cancellation: Cancellation) !recipes.Recipe {
+    if (!supportsMetadataVersion(artifact.metadata_version) or artifact.byte_len > max_root_bytes) return error.InvalidNativeAggregateArtifact;
+    const bytes = try readArtifact(a, store, .{ .artifact_id = artifact.artifact_id, .checksum = artifact.checksum, .byte_len = artifact.byte_len }, cancellation, null);
+    defer a.free(bytes);
+    const root = try std.json.parseFromSliceLeaky(Root, a, bytes, .{ .allocate = .alloc_always });
+    const reader = try Reader.open(a, store, artifact, root.recipe, cancellation);
+    defer reader.cursor().close(reader);
+    return root.recipe;
+}
+
 /// GC traverses authenticated root references without reading every leaf.
 /// Unknown formats fail closed rather than guessing that a root has no edges.
 pub fn descendantsAlloc(a: A, store: stores.ArtifactStore, artifact: Ref, cancellation: Cancellation) ![]const ChunkRef {

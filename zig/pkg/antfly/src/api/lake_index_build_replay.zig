@@ -69,14 +69,29 @@ pub fn columnsForBuild(a: A, out: A, table: local.common_topology_records.TableR
 }
 /// Union changed native files so delta builders share only the necessary input.
 /// Unknown/legacy producer formats conservatively request a complete replay.
-pub fn changedFiles(a: A, out: A, provider: *Provider, store: @import("../serverless/artifacts/store.zig").ArtifactStore, declarations: []const local.serverless_segment_sidecar_manifest.DeclaredArtifact, cancellation: Cancellation) !?[]const bool {
+pub fn changedFiles(a: A, out: A, provider: *Provider, store: @import("../serverless/artifacts/store.zig").ArtifactStore, declarations: []const local.serverless_segment_sidecar_manifest.DeclaredArtifact, contributions: []const local.metadata_lake_index_catalog.FileContribution, cancellation: Cancellation) !?[]const bool {
     const state = @import("lake_index_native_state.zig");
     const needed = try out.alloc(bool, provider.source.inventory.files.len);
     @memset(needed, false);
+    const aggregate = @import("lake_index_native_aggregates.zig");
+    var old: std.AutoHashMapUnmanaged([32]u8, void) = .empty;
+    defer old.deinit(a);
+    for (contributions) |contribution| try old.put(a, aggregate.contributionKey(contribution.file, contribution.recipe, contribution.name), {});
+    const file_keys = try a.alloc([32]u8, provider.source.inventory.files.len);
+    defer a.free(file_keys);
+    for (provider.source.inventory.files, file_keys) |file, *key| key.* = aggregate.fileIdentity(provider.source, file);
     for (declarations) |declaration| {
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();
         const ca = arena.allocator();
+        if (declaration.artifact.kind == .algebraic_segment) {
+            if (!@import("lake_index_aggregate_artifact.zig").supportsMetadataVersion(declaration.artifact.metadata_version)) return null;
+            const recipe = try @import("lake_index_aggregate_artifact.zig").loadRecipe(ca, store, declaration.artifact, cancellation);
+            if (!aggregate.incrementalRecipe(recipe) or provider.source.inventory.deleted_row_groups.len != 0 or (if (provider.source.scanner.iceberg_delete_plan) |plan| plan.files.len != 0 else false)) return null;
+            const fingerprint = recipe.fingerprint();
+            for (file_keys, needed) |key, *required| required.* = required.* or !old.contains(aggregate.contributionKey(key, fingerprint, declaration.name));
+            continue;
+        }
         const previous: []const state.File = switch (declaration.artifact.kind) {
             .text_segment => text: {
                 const native = @import("lake_index_native_text.zig");

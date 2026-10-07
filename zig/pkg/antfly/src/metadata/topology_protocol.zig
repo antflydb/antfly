@@ -49,8 +49,9 @@ const std = @import("std");
 /// records and query definitions; earlier decoders reject the extension.
 /// Version 23 moves lake artifact declarations into verified durable directories.
 /// Version 24 adds independent native lake reader/retirement authority.
-pub const current_version: u16 = 24;
-pub const lake_index_catalog_version: u16 = 24;
+/// Version 25 admits paged aggregate contribution directories and reduction trees.
+pub const current_version: u16 = 25;
+pub const lake_index_catalog_version: u16 = 25;
 pub const durable_activation_version: u16 = 9;
 pub const store_report_update_version: u16 = 8;
 // Preflight and final append require the same complete decoder capability.

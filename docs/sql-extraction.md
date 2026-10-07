@@ -385,8 +385,8 @@ retained roots. Deleting old attempt namespaces alone is unsafe.
 Retained publications record a physical store locator and a named connection,
 without copying credentials into metadata. Reopening resolves current credentials
 and rejects a connection redirected to another endpoint, root, bucket or prefix.
-A paginated native metadata work feed includes DROP tombstones. Protocol 24
-publications declare their reader contract; collection preserves legacy roots
+A paginated native metadata work feed includes DROP tombstones. Protocol 24 and
+25 publications declare their reader contract; collection preserves legacy roots
 and all upload generations below the first leased attempt, including temporary
 files. A protocol upgrade alone cannot prove old readers have drained.
 
@@ -3503,3 +3503,13 @@ refreshing delete evidence. Text corpus limits count unique physical segments
 across active generations, with sealed reader composition across overlapping
 roots. GC batches verified live-set probes and uses durable filesystem upload
 journal offsets; remote providers retain exclusive lexical continuations.
+
+
+Native lake scan and aggregate ownership refinements are specified in
+[REMOTE_TABLE_SERVING.md](../zig/REMOTE_TABLE_SERVING.md#immutable-scan-plans-and-aggregate-reduction-trees).
+The maintained contracts include transparent statement cursor capabilities,
+immutable snapshot plans with sparse version overlays, mixed algebraic/search
+delta replay, exact radix reduction trees, protocol-25 paged contribution records,
+and independently completing GC audit censuses. The regression tests enforce
+unchanged-file read rejection during mixed-index appends and aggregate append/
+removal, subtree reference reuse, immutable manifest retention and split lifetime.

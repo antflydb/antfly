@@ -692,18 +692,35 @@ def test_inline_aggregate_catalog_exceeds_legacy_declaration_limit(tmp_path):
                                  json={"statement": "SELECT COUNT(*) FROM capacity_lake"})
         assert response.ok, response.text
         assert response.json()["rows"] == [["3"]]
+        def contribution_ids(document):
+            records = list(document.get("file_contributions", []))
+            for page in document.get("contribution_pages", []):
+                candidates = (server.root / "artifacts").rglob(page["checksum"])
+                for candidate in candidates:
+                    if not candidate.is_file():
+                        continue
+                    payload = candidate.read_bytes()[-page["byte_len"]:]
+                    if hashlib.sha256(payload).hexdigest() == page["checksum"]:
+                        values = json.loads(payload)
+                        assert 0 < len(values) <= 256
+                        records.extend(values)
+                        break
+                else:
+                    pytest.fail(f"Missing authenticated contribution page: {page}")
+            return {item["artifact"]["artifact_id"] for item in records}
+
         directory_found = False
         old_contribution_ids = set()
         for path in (server.root / "artifacts").rglob("*"):
             if not path.is_file():
                 continue
             data = path.read_bytes()
-            marker = data.find(b'"format":"native-lake-index-directory-v1"')
+            marker = data.find(b'"format":"native-lake-index-directory-v')
             if marker >= 0:
                 document = json.loads(data[marker - 1:])
                 if len(document["declarations"]) == 320:
                     directory_found = True
-                    old_contribution_ids = {item["artifact"]["artifact_id"] for item in document["file_contributions"]}
+                    old_contribution_ids = contribution_ids(document)
                     break
         assert directory_found, "320 declarations were not published through an immutable directory"
         assert len(old_contribution_ids) == 320
@@ -741,11 +758,11 @@ def test_inline_aggregate_catalog_exceeds_legacy_declaration_limit(tmp_path):
             if not path.is_file():
                 continue
             data = path.read_bytes()
-            marker = data.find(b'"format":"native-lake-index-directory-v1"')
+            marker = data.find(b'"format":"native-lake-index-directory-v')
             if marker >= 0:
                 document = json.loads(data[marker - 1:])
                 if len(document["declarations"]) == 321:
-                    ids = {item["artifact"]["artifact_id"] for item in document["file_contributions"]}
+                    ids = contribution_ids(document)
                     assert old_contribution_ids <= ids
                     reused = True
                     break
