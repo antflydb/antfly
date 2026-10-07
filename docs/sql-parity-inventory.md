@@ -243,6 +243,20 @@ capacity of 46 versus 336 bytes; these are local microbenchmark observations,
 not production latency claims. Typed-array/element-width and temporal profiles
 remain separate unresolved work, not JSON approximations or synthetic credit.
 
+Native scalar-statement binding now retains precise parameter descriptors,
+including scalar widths and array element identities. Predicates, projections,
+ordering, INSERT values and UPDATE assignments share one bounded, execution-owned
+parameter frame. Programs check descriptor compatibility once before the row
+loop; lazy decision functions retain the existing provider-validation and demand
+machinery. PostgreSQL oracle checks cover mutation parameter OIDs and bare-target
+ambiguity: declared array types permit either projection order, while an
+untyped bare target followed by an incompatible cast retains SQLSTATE 42P08.
+Allocation-fault tests cover binding and preparation ownership. These native
+contracts do not activate typed array parameters through the public envelope,
+session/protocol metadata, aggregate/window/relation binding, or storage; those
+boundaries still require migration. No original inventory dispositions change
+on the strength of these supplemental component tests.
+
 The mutation fixture verifies complete RETURNING rows and labels, SQL NULL
 provenance, affected rows, persisted state and untouched rows. A failed RETURNING
 projection must leave physical primary bytes, version and content digest

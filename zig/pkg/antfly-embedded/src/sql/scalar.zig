@@ -166,6 +166,11 @@ pub const PreparedEvaluation = struct {
     program: *const Program,
     parameters: []const Datum,
 
+    pub fn evaluateInstruction(self: PreparedEvaluation, alloc: Allocator, index: u32) !Datum {
+        var context: Evaluator = .{ .program = self.program, .alloc = alloc, .cells = &.{}, .parameters = &.{}, .typed_parameters = self.parameters, .limits = .{} };
+        return context.runDatum(index, 0);
+    }
+
     pub fn evaluate(self: PreparedEvaluation, alloc: Allocator, cells: []const Datum, limits: EvalLimits) !Datum {
         var context: Evaluator = .{ .program = self.program, .alloc = alloc, .cells = cells, .parameters = &.{}, .typed_parameters = self.parameters, .limits = limits };
         const result = try context.runDatum(self.program.root, 0);
@@ -229,7 +234,7 @@ pub fn bindExpectedWithSettings(alloc: Allocator, expression: *const ast.Scalar,
     if (limits.parameters > 1024 or parameter_hints.len > limits.parameters or limits.nodes == 0) return error.SqlProgramLimitExceeded;
     var descriptors: [1024]Type = undefined;
     for (parameter_hints, descriptors[0..parameter_hints.len]) |kind, *descriptor| descriptor.* = .{ .kind = kind };
-    return bindDescriptors(alloc, expression, columns, descriptors[0..parameter_hints.len], expected, limits, settings, false);
+    return bindDescriptors(alloc, expression, columns, descriptors[0..parameter_hints.len], if (expected) |kind| Type{ .kind = kind } else null, limits, settings, false);
 }
 
 /// Precise native parameter binding; ingress must prepare an owned frame once
@@ -238,15 +243,24 @@ pub fn bindTyped(alloc: Allocator, expression: *const ast.Scalar, columns: []con
     return bindDescriptors(alloc, expression, columns, parameter_hints, null, limits, null, true);
 }
 
+pub fn bindTypedExpectedWithSettings(alloc: Allocator, expression: *const ast.Scalar, columns: []const Column, parameter_hints: []const Type, expected: ?Type, limits: BindLimits, settings: ?*const setting_catalog.View) !Program {
+    return bindDescriptors(alloc, expression, columns, parameter_hints, expected, limits, settings, true);
+}
+
 pub fn inferTypedParameters(alloc: Allocator, expression: *const ast.Scalar, columns: []const Column, parameters: []Type, limits: BindLimits) !bool {
+    return inferTypedParametersExpected(alloc, expression, columns, parameters, null, limits);
+}
+
+pub fn inferTypedParametersExpected(alloc: Allocator, expression: *const ast.Scalar, columns: []const Column, parameters: []Type, expected: ?Type, limits: BindLimits) !bool {
     if (limits.parameters > 1024 or parameters.len > limits.parameters) return error.SqlProgramLimitExceeded;
+    if (expected) |descriptor| try validateParameterType(descriptor);
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     var binder: Binder = .{ .alloc = arena.allocator(), .columns = columns, .limits = limits, .allow_unresolved = true, .typed_parameters = true };
     try binder.registerColumns();
     for (parameters) |descriptor| try validateParameterType(descriptor);
     for (parameters, binder.parameters[0..parameters.len]) |descriptor, *output| output.* = try normalizeParameterType(descriptor);
-    _ = try binder.compile(expression, null, 0);
+    _ = try binder.compileArrayContext(expression, if (expected) |kind| kind.kind else null, if (expected) |kind| kind.element_type else null, 0);
     if (binder.parameter_count > parameters.len) return error.InvalidSqlParameters;
     var changed = false;
     for (parameters, binder.parameters[0..parameters.len]) |*output, inferred| {
@@ -280,9 +294,10 @@ fn normalizeParameterType(descriptor: Type) !Type {
     return result;
 }
 
-fn bindDescriptors(alloc: Allocator, expression: *const ast.Scalar, columns: []const Column, parameter_hints: []const Type, expected: ?ast.ColumnType, limits: BindLimits, settings: ?*const setting_catalog.View, typed_parameters: bool) !Program {
+fn bindDescriptors(alloc: Allocator, expression: *const ast.Scalar, columns: []const Column, parameter_hints: []const Type, expected: ?Type, limits: BindLimits, settings: ?*const setting_catalog.View, typed_parameters: bool) !Program {
     if (limits.parameters > 1024 or parameter_hints.len > limits.parameters or limits.nodes == 0) return error.SqlProgramLimitExceeded;
     if (typed_parameters) for (parameter_hints) |descriptor| try validateParameterType(descriptor);
+    if (typed_parameters) if (expected) |descriptor| try validateParameterType(descriptor);
     const arena = try alloc.create(std.heap.ArenaAllocator);
     errdefer alloc.destroy(arena);
     arena.* = std.heap.ArenaAllocator.init(alloc);
@@ -294,7 +309,7 @@ fn bindDescriptors(alloc: Allocator, expression: *const ast.Scalar, columns: []c
         descriptor.* = try normalizeParameterType(descriptor.*);
     };
     binder.parameter_count = parameter_hints.len;
-    const root = try binder.compile(expression, expected, 0);
+    const root = try binder.compileArrayContext(expression, if (expected) |kind| kind.kind else null, if (expected) |kind| kind.element_type else null, 0);
     const output_type = binder.instructions.items[root].type;
     const instructions = try binder.instructions.toOwnedSlice(binder.alloc);
     const parameter_descriptors = try binder.alloc.dupe(Type, binder.parameters[0..binder.parameter_count]);

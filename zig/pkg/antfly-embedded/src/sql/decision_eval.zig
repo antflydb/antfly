@@ -105,6 +105,14 @@ fn validateRelation(a: std.mem.Allocator, provider: ?decisions.DecisionProvider,
     }
 }
 pub fn validate(a: std.mem.Allocator, provider: ?decisions.DecisionProvider, program: *const scalar.Program, parameters: []const std.json.Value) !void {
+    return validateCore(a, provider, program, parameters, null);
+}
+
+pub fn validatePrepared(a: std.mem.Allocator, provider: ?decisions.DecisionProvider, prepared: scalar.PreparedEvaluation) !void {
+    return validateCore(a, provider, prepared.program, &.{}, prepared);
+}
+
+fn validateCore(a: std.mem.Allocator, provider: ?decisions.DecisionProvider, program: *const scalar.Program, parameters: []const std.json.Value, prepared: ?scalar.PreparedEvaluation) !void {
     for (program.instructions) |instruction| {
         if (instruction.operation != .call) continue;
         const call = instruction.operation.call;
@@ -113,7 +121,7 @@ pub fn validate(a: std.mem.Allocator, provider: ?decisions.DecisionProvider, pro
         args[0] = .null;
         var nullable = false;
         for (call.args[1..], args[1..]) |index, *arg| {
-            const value = try program.evaluateInstruction(a, index, parameters);
+            const value = if (prepared) |bound| try bound.evaluateInstruction(a, index) else try program.evaluateInstruction(a, index, parameters);
             arg.* = value.value;
             nullable = nullable or value.sql_null;
         }
@@ -141,6 +149,10 @@ pub fn evaluateBatch(a: std.mem.Allocator, provider: ?decisions.DecisionProvider
 /// Resolve its conditional decision demands together without retaining provider
 /// payloads in the owned mutation arena.
 pub fn evaluateInvocations(a: std.mem.Allocator, provider: ?decisions.DecisionProvider, programs: []const *const scalar.Program, rows: []const []const scalar.Datum, parameters: []const std.json.Value) ![]const scalar.Datum {
+    return evaluateInvocationsCore(a, provider, programs, rows, parameters, null);
+}
+
+fn evaluateInvocationsCore(a: std.mem.Allocator, provider: ?decisions.DecisionProvider, programs: []const *const scalar.Program, rows: []const []const scalar.Datum, parameters: []const std.json.Value, prepared: ?[]const scalar.PreparedEvaluation) ![]const scalar.Datum {
     if (programs.len != rows.len) return error.InvalidSqlProgram;
     const output = try a.alloc(scalar.Datum, rows.len);
     const ready = try a.alloc(bool, rows.len);
@@ -157,7 +169,9 @@ pub fn evaluateInvocations(a: std.mem.Allocator, provider: ?decisions.DecisionPr
         for (rows, programs, 0..) |cells, program, i| {
             if (ready[i]) continue;
             var demand: ?scalar.DecisionDemand = null;
-            const value = program.evaluate(a, cells, parameters, .{ .decision_values = values[i], .decision_demand = &demand }) catch |err| {
+            const limits: scalar.EvalLimits = .{ .decision_values = values[i], .decision_demand = &demand };
+            const evaluated = if (prepared) |bound| bound[i].evaluate(a, cells, limits) else program.evaluate(a, cells, parameters, limits);
+            const value = evaluated catch |err| {
                 if (err != error.DecisionNotEvaluated) return err;
                 const pending = demand orelse return error.InvalidSqlProgram;
                 const questions = try decisions.questionsFor(a, pending.function, pending.args);
@@ -202,6 +216,13 @@ pub fn evaluate(a: std.mem.Allocator, provider: ?decisions.DecisionProvider, pro
     return (try evaluateBatch(a, provider, program, &.{cells}, parameters))[0];
 }
 
+/// Prepared invocations use the same lazy demand/provider machinery as legacy
+/// execution. Pure scalar calls neither allocate provider state nor rebind.
+pub fn evaluatePrepared(a: std.mem.Allocator, provider: ?decisions.DecisionProvider, prepared: scalar.PreparedEvaluation, cells: []const scalar.Datum) !scalar.Datum {
+    if (!hasExternal(prepared.program)) return prepared.evaluate(a, cells, .{});
+    return (try evaluateInvocationsCore(a, provider, &.{prepared.program}, &.{cells}, &.{}, &.{prepared}))[0];
+}
+
 pub fn hasExternal(program: *const scalar.Program) bool {
     for (program.instructions) |instruction| if (instruction.operation == .call and decisions.descriptor(@tagName(instruction.operation.call.function)) != null) return true;
     return false;
@@ -243,6 +264,28 @@ const Mock = struct {
 pub const testing = if (@import("builtin").is_test) struct {
     pub const Provider = Mock;
 } else struct {};
+
+test "SQL prepared statement frames preserve provider validation and lazy decisions" {
+    const a = std.testing.allocator;
+    var compiled = try @import("compiler.zig").compile(a, "SELECT CASE WHEN $1 THEN ai_probability('refund', $2, $3) ELSE 0 END", .{});
+    defer compiled.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var types: [3]scalar.Type = .{ .{}, .{}, .{} };
+    const bound = try @import("bound_scalars.zig").bindTyped(arena.allocator(), null, compiled.statement, &types, null, &.{});
+    var prepared = try bound.prepareParameters(a, &.{ .{ .text = "true" }, .{ .text = "Refund?" }, .{ .text = "local" } }, .{});
+    defer prepared.deinit();
+    var mock: Mock = .{};
+    try std.testing.expectError(error.DecisionProviderUnavailable, prepared.validateDecisions(arena.allocator(), null));
+    try prepared.validateDecisions(arena.allocator(), mock.provider());
+    try std.testing.expectEqual(@as(usize, 0), mock.calls);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.9), (try evaluatePrepared(arena.allocator(), mock.provider(), prepared.projections[0].?, &.{})).value.float, 0.001);
+    try std.testing.expectEqual(@as(usize, 1), mock.calls);
+    var inactive = try bound.prepareParameters(a, &.{ .{ .text = "false" }, .{ .text = "Refund?" }, .{ .text = "local" } }, .{});
+    defer inactive.deinit();
+    try std.testing.expectEqual(@as(f64, 0), (try evaluatePrepared(arena.allocator(), null, inactive.projections[0].?, &.{})).value.float);
+    try std.testing.expectEqual(@as(usize, 1), mock.calls);
+}
 
 test "SQL decisions batch requested rows and preserve NULL and conditional evaluation" {
     const compiler = @import("compiler.zig");

@@ -310,6 +310,64 @@ class PostgresReferenceTest(unittest.TestCase):
                 finally:
                     self.db.execute("DEALLOCATE ALL")
 
+    def test_statement_parameter_frames_match_postgres_target_and_mutation_typing(self):
+        import psycopg
+
+        cases = (
+            (
+                "(bigint[])",
+                "SELECT $1, cardinality($1::bigint[]) FROM frame_items "
+                "WHERE needle = ANY($1) ORDER BY cardinality($1)",
+                [1016],
+            ),
+            (
+                "",
+                "SELECT cardinality($1::bigint[]), $1 FROM frame_items "
+                "WHERE needle = ANY($1) ORDER BY cardinality($1)",
+                [1016],
+            ),
+            ("", "SELECT cardinality($1::integer[]), $1", [1007]),
+            (
+                "",
+                "UPDATE frame_items SET needle = cardinality($1::integer[]) "
+                "WHERE needle = $2",
+                [1007, 20],
+            ),
+            ("", "UPDATE frame_items SET needle = $1 WHERE needle = $2", [20, 20]),
+            (
+                "",
+                "INSERT INTO frame_items (needle) "
+                "VALUES (cardinality($1::integer[])), ($2)",
+                [1007, 20],
+            ),
+        )
+        for declarations, sql, oids in cases:
+            with self.subTest(sql=sql):
+                try:
+                    with self.db.transaction(force_rollback=True):
+                        self.db.execute("CREATE TABLE frame_items(needle bigint)")
+                        self.db.execute(
+                            "PREPARE statement_frame" + declarations + " AS " + sql
+                        )
+                        self.assertEqual(
+                            self.db.execute(
+                                "SELECT parameter_types::oid[] FROM pg_prepared_statements "
+                                "WHERE name='statement_frame'"
+                            ).fetchone()[0],
+                            oids,
+                        )
+                finally:
+                    self.db.execute("DEALLOCATE ALL")
+        for sql in ("SELECT $1, cardinality($1::integer[])", "SELECT $1, $1::smallint"):
+            with self.subTest(sql=sql):
+                try:
+                    with self.db.transaction(force_rollback=True):
+                        with self.assertRaises(psycopg.Error) as error:
+                            self.db.execute("PREPARE statement_frame AS " + sql)
+                        self.assertEqual(error.exception.sqlstate, "42P08")
+                finally:
+                    self.db.execute("DEALLOCATE ALL")
+
     def test_typed_array_scalar_expression_contracts(self):
         import json
         from pathlib import Path

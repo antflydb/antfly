@@ -23,6 +23,7 @@ test {
     _ = @import("antfly_local_sources").sql_compiler;
     _ = @import("antfly_local_sources").sql_scalar;
     _ = @import("antfly_local_sources").sql_parameter_frame;
+    _ = @import("antfly_local_sources").sql_bound_scalars;
     _ = @import("antfly_local_sources").sql_array_value;
     _ = @import("antfly_local_sources").sql_array_binary;
     _ = @import("antfly_local_sources").sql_decision_eval;

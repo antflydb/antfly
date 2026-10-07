@@ -21,8 +21,11 @@ const ast = @import("ast.zig");
 const catalog = @import("catalog.zig");
 pub const scalar = @import("scalar.zig");
 const Allocator = std.mem.Allocator;
+const parameter_frame = @import("parameter_frame.zig");
 
 pub const Bound = struct {
+    parameter_descriptors: []const scalar.Type = &.{},
+    typed_parameters: bool = false,
     columns: []const scalar.Column = &.{},
     projections: []const ?scalar.Program = &.{},
     orders: []const ?scalar.Program = &.{},
@@ -31,7 +34,20 @@ pub const Bound = struct {
     predicate: ?scalar.Program = null,
     required: []const u32 = &.{},
 
+    /// The immutable binding must outlive the execution. All programs borrow
+    /// one bounded frame; decoding and descriptor checks never enter row loops.
+    pub fn prepareParameters(self: *const Bound, backing: Allocator, inputs: []const parameter_frame.Input, limits: parameter_frame.Limits) !Prepared {
+        if (!self.typed_parameters) return error.UnsupportedSqlShape;
+        var frame = try parameter_frame.Frame.prepare(backing, self.parameter_descriptors, inputs, limits);
+        errdefer frame.deinit();
+        return Prepared.init(self, frame) catch |err| {
+            if (err == error.OutOfMemory and frame.budget.exhausted) return error.SqlProgramLimitExceeded;
+            return err;
+        };
+    }
+
     pub fn validateDecisions(self: Bound, alloc: Allocator, parameters: []const std.json.Value, provider: ?@import("../functions/decisions.zig").DecisionProvider) !void {
+        if (self.typed_parameters) return error.UnsupportedSqlShape;
         const evaluator = @import("decision_eval.zig");
         if (self.predicate) |*program| try evaluator.validate(alloc, provider, program, parameters);
         for (self.projections) |optional| if (optional) |*program| try evaluator.validate(alloc, provider, program, parameters);
@@ -71,8 +87,62 @@ pub const Bound = struct {
     }
 
     pub fn matchesWithProvider(self: Bound, alloc: Allocator, values: []const scalar.Datum, parameters: []const std.json.Value, provider: ?@import("../functions/decisions.zig").DecisionProvider) !bool {
+        if (self.typed_parameters) return error.UnsupportedSqlShape;
         const program = self.predicate orelse return true;
         const value = try @import("decision_eval.zig").evaluate(alloc, provider, &program, values, parameters);
+        if (value.sql_null) return false;
+        if (value.value != .bool) return error.SqlTypeMismatch;
+        return value.value.bool;
+    }
+};
+
+/// Execution-owned parameters and prebound program views. Values borrowed from
+/// the frame live until deinit; computed values use the caller's page arena.
+pub const Prepared = struct {
+    frame: parameter_frame.Frame,
+    predicate: ?scalar.PreparedEvaluation,
+    projections: []const ?scalar.PreparedEvaluation,
+    orders: []const ?scalar.PreparedEvaluation,
+    assignments: []const ?scalar.PreparedEvaluation,
+    insert_rows: []const []const ?scalar.PreparedEvaluation,
+
+    fn init(bound: *const Bound, frame: parameter_frame.Frame) !Prepared {
+        const a = frame.arena.allocator();
+        const rows = try a.alloc([]const ?scalar.PreparedEvaluation, bound.insert_rows.len);
+        for (bound.insert_rows, rows) |programs, *row| row.* = try bindPrograms(a, programs, &frame);
+        return .{
+            .frame = frame,
+            .predicate = if (bound.predicate) |*program| try program.bindParameters(&frame) else null,
+            .projections = try bindPrograms(a, bound.projections, &frame),
+            .orders = try bindPrograms(a, bound.orders, &frame),
+            .assignments = try bindPrograms(a, bound.assignments, &frame),
+            .insert_rows = rows,
+        };
+    }
+
+    fn bindPrograms(a: Allocator, programs: []const ?scalar.Program, frame: *const parameter_frame.Frame) ![]const ?scalar.PreparedEvaluation {
+        const result = try a.alloc(?scalar.PreparedEvaluation, programs.len);
+        for (programs, result) |*optional, *prepared| prepared.* = if (optional.*) |*program| try program.bindParameters(frame) else null;
+        return result;
+    }
+
+    pub fn deinit(self: *Prepared) void {
+        self.frame.deinit();
+        self.* = undefined;
+    }
+
+    pub fn validateDecisions(self: Prepared, a: Allocator, provider: ?@import("../functions/decisions.zig").DecisionProvider) !void {
+        const evaluator = @import("decision_eval.zig");
+        if (self.predicate) |program| try evaluator.validatePrepared(a, provider, program);
+        for (self.projections) |optional| if (optional) |program| try evaluator.validatePrepared(a, provider, program);
+        for (self.orders) |optional| if (optional) |program| try evaluator.validatePrepared(a, provider, program);
+        for (self.assignments) |optional| if (optional) |program| try evaluator.validatePrepared(a, provider, program);
+        for (self.insert_rows) |row| for (row) |optional| if (optional) |program| try evaluator.validatePrepared(a, provider, program);
+    }
+
+    pub fn matches(self: Prepared, a: Allocator, cells: []const scalar.Datum, provider: ?@import("../functions/decisions.zig").DecisionProvider) !bool {
+        const program = self.predicate orelse return true;
+        const value = try @import("decision_eval.zig").evaluatePrepared(a, provider, program, cells);
         if (value.sql_null) return false;
         if (value.value != .bool) return error.SqlTypeMismatch;
         return value.value.bool;
@@ -96,6 +166,111 @@ fn jsonColumn(table: ?catalog.Table, name: []const u8) bool {
     return column.type == .json;
 }
 
+test "SQL statements converge typed descriptors before emission and share one owned frame" {
+    const a = std.testing.allocator;
+    const table: catalog.Table = .{ .id = 1, .physical_name = "items", .schema_version = 1, .columns = &.{.{ .name = "needle", .path = "needle", .type = .integer }} };
+    for ([_][]const u8{
+        "SELECT $1, cardinality($1::bigint[]) FROM items WHERE needle = ANY($1) ORDER BY cardinality($1)",
+        "SELECT cardinality($1::bigint[]), $1 FROM items WHERE needle = ANY($1) ORDER BY cardinality($1)",
+    }) |sql| {
+        var compiled = try @import("compiler.zig").compile(a, sql, .{});
+        defer compiled.deinit();
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        var types: [1]scalar.Type = .{.{ .kind = .array, .element_type = .int64 }};
+        const bound = try bindTyped(arena.allocator(), table, compiled.statement, &types, null, &.{});
+        try std.testing.expectEqual(@as(?ast.ColumnType, .array), types[0].kind);
+        try std.testing.expectEqual(@as(?@import("array_value.zig").ElementType, .int64), types[0].element_type);
+        var input = [_]u8{ '{', '1', ',', '2', ',', 'N', 'U', 'L', 'L', '}' };
+        var prepared = try bound.prepareParameters(a, &.{.{ .text = &input }}, .{});
+        defer prepared.deinit();
+        @memset(&input, 0);
+        // Pointers must refer to programs owned by Bound, not loop temporaries.
+        for (prepared.projections, bound.projections) |view, *original| try std.testing.expect(view.?.program == &original.*.?);
+        var none = std.heap.FixedBufferAllocator.init(&.{});
+        try prepared.validateDecisions(none.allocator(), null);
+        const start = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
+        for (0..10000) |_| {
+            try std.testing.expect(try prepared.matches(none.allocator(), &.{scalar.Datum.json(.{ .integer = 2 })}, null));
+            try std.testing.expectEqual(@as(i64, 3), (try prepared.orders[0].?.evaluate(none.allocator(), &.{}, .{})).value.integer);
+            for (prepared.projections) |view| {
+                const result = try view.?.evaluate(none.allocator(), &.{}, .{});
+                if (result.array) |array| try std.testing.expect(array == prepared.frame.values[0].array.?) else try std.testing.expectEqual(@as(i64, 3), result.value.integer);
+            }
+        }
+        std.debug.print("SQL statement parameter frame: rows=10000 programs=4 decode_count=1 evaluation_scratch_bytes=0 peak_bytes={} elapsed_ns={}\n", .{ prepared.frame.budget.peak, std.Io.Clock.now(.awake, std.testing.io).nanoseconds - start });
+        try std.testing.expect(!try prepared.matches(none.allocator(), &.{scalar.Datum.json(.{ .integer = 9 })}, null));
+        try std.testing.expectError(error.UnsupportedSqlShape, bound.matches(none.allocator(), &.{}, &.{}));
+    }
+}
+
+test "SQL typed mutation scalar bindings preserve assignment parameter identity" {
+    const a = std.testing.allocator;
+    const table: catalog.Table = .{ .id = 1, .physical_name = "items", .schema_version = 1, .columns = &.{.{ .name = "needle", .path = "needle", .type = .integer }} };
+    for ([_][]const u8{
+        "UPDATE items SET needle = cardinality($1::integer[]) WHERE needle = $2",
+        "UPDATE items SET needle = $1 WHERE needle = $2",
+        "INSERT INTO items (needle) VALUES (cardinality($1::integer[])), ($2)",
+    }, 0..) |sql, index| {
+        var compiled = try @import("compiler.zig").compile(a, sql, .{});
+        defer compiled.deinit();
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        var types: [2]scalar.Type = .{ .{}, .{} };
+        const bound = try bindTyped(arena.allocator(), table, compiled.statement, &types, null, &.{});
+        var prepared = try bound.prepareParameters(a, &.{ .{ .text = if (index == 1) "3" else "{1,2,3}" }, .{ .text = "7" } }, .{});
+        defer prepared.deinit();
+        var none = std.heap.FixedBufferAllocator.init(&.{});
+        if (index < 2) {
+            try std.testing.expect(try prepared.matches(none.allocator(), &.{scalar.Datum.json(.{ .integer = 7 })}, null));
+            try std.testing.expectEqual(@as(i64, 3), (try prepared.assignments[0].?.evaluate(none.allocator(), &.{}, .{})).value.integer);
+        } else {
+            try std.testing.expectEqual(@as(i64, 3), (try prepared.insert_rows[0][0].?.evaluate(none.allocator(), &.{}, .{})).value.integer);
+            try std.testing.expectEqual(@as(i64, 7), (try prepared.insert_rows[1][0].?.evaluate(none.allocator(), &.{}, .{})).value.integer);
+        }
+    }
+}
+
+test "SQL typed statement frames reject invalid admission and unwind all allocation faults" {
+    const Faults = struct {
+        fn run(backing: Allocator) !void {
+            var vtable = backing.vtable.*;
+            vtable.resize = Allocator.noResize;
+            vtable.remap = Allocator.noRemap;
+            const a: Allocator = .{ .ptr = backing.ptr, .vtable = &vtable };
+            var compiled = try @import("compiler.zig").compile(a, "SELECT cardinality($1::integer[]), $1 ORDER BY cardinality($1)", .{});
+            defer compiled.deinit();
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            var types: [1]scalar.Type = .{.{}};
+            const bound = try bindTyped(arena.allocator(), null, compiled.statement, &types, null, &.{});
+            var prepared = try bound.prepareParameters(a, &.{.{ .text = "{1,2,NULL}" }}, .{});
+            defer prepared.deinit();
+            try std.testing.expect(prepared.projections[0].?.parameters.ptr == prepared.orders[0].?.parameters.ptr);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Faults.run, .{});
+    var compiled = try @import("compiler.zig").compile(std.testing.allocator, "SELECT cardinality($1::integer[]), $1", .{});
+    defer compiled.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var types: [1]scalar.Type = .{.{}};
+    const bound = try bindTyped(arena.allocator(), null, compiled.statement, &types, null, &.{});
+    try std.testing.expectError(error.SqlProgramLimitExceeded, bound.prepareParameters(std.testing.allocator, &.{.{ .text = "{1,2,NULL}" }}, .{ .bytes = 1 }));
+    try std.testing.expectError(error.InvalidSqlParameters, bound.prepareParameters(std.testing.allocator, &.{}, .{}));
+}
+
+test "SQL inferred bare target parameters retain PostgreSQL ambiguity diagnostics" {
+    for ([_][]const u8{ "SELECT $1, cardinality($1::integer[])", "SELECT $1, $1::smallint" }) |sql| {
+        var compiled = try @import("compiler.zig").compile(std.testing.allocator, sql, .{});
+        defer compiled.deinit();
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        var types: [1]scalar.Type = .{.{}};
+        try std.testing.expectError(error.ConflictingSqlParameterTypes, bindTyped(arena.allocator(), null, compiled.statement, &types, null, &.{}));
+    }
+}
+
 pub fn predicateScalar(alloc: Allocator, table: ?catalog.Table, predicate: *const ast.Predicate) !*const ast.Scalar {
     var builder: Builder = .{ .alloc = alloc, .table = table, .columns = &.{}, .parameters = &.{} };
     return builder.predicateExpression(predicate);
@@ -112,7 +287,25 @@ pub fn bindWithSettings(alloc: Allocator, table: ?catalog.Table, statement: ast.
 }
 
 pub fn bindWithParameterFallback(alloc: Allocator, table: ?catalog.Table, statement: ast.Statement, parameters: []?ast.ColumnType, settings: ?*const @import("setting_catalog.zig").View, fallbacks: []const ?ast.ColumnType) !Bound {
-    if (statement == .insert) return bindInsert(alloc, table orelse return error.UndefinedTable, statement.insert, parameters, settings, fallbacks);
+    if (parameters.len > 1024 or fallbacks.len > 1024) return error.SqlProgramLimitExceeded;
+    const descriptors = try alloc.alloc(scalar.Type, parameters.len);
+    for (parameters, descriptors) |kind, *descriptor| descriptor.* = .{ .kind = kind };
+    const fallback_descriptors = try alloc.alloc(scalar.Type, fallbacks.len);
+    for (fallbacks, fallback_descriptors) |kind, *descriptor| descriptor.* = .{ .kind = kind };
+    const result = try bindDescriptors(alloc, table, statement, descriptors, settings, fallback_descriptors, false);
+    for (parameters, descriptors) |*kind, descriptor| kind.* = descriptor.kind;
+    return result;
+}
+
+pub fn bindTyped(alloc: Allocator, table: ?catalog.Table, statement: ast.Statement, parameters: []scalar.Type, settings: ?*const @import("setting_catalog.zig").View, fallbacks: []const scalar.Type) !Bound {
+    if (parameters.len > 1024 or fallbacks.len > 1024) return error.SqlProgramLimitExceeded;
+    for (parameters) |descriptor| try scalar.validateParameterType(descriptor);
+    for (fallbacks) |descriptor| try scalar.validateParameterType(descriptor);
+    return bindDescriptors(alloc, table, statement, parameters, settings, fallbacks, true);
+}
+
+fn bindDescriptors(alloc: Allocator, table: ?catalog.Table, statement: ast.Statement, parameters: []scalar.Type, settings: ?*const @import("setting_catalog.zig").View, fallbacks: []const scalar.Type, typed_parameters: bool) !Bound {
+    if (statement == .insert) return bindInsert(alloc, table orelse return error.UndefinedTable, statement.insert, parameters, settings, fallbacks, typed_parameters);
     const needed = switch (statement) {
         .select => |select| blk: {
             if (needsResidual(table, select.predicate)) break :blk true;
@@ -128,7 +321,7 @@ pub fn bindWithParameterFallback(alloc: Allocator, table: ?catalog.Table, statem
         .delete => |delete| needsResidual(table, delete.predicate),
         else => false,
     };
-    if (table != null and !needed) return .{};
+    if (table != null and !needed and !typed_parameters) return .{};
     const table_columns: []const catalog.Column = if (table) |definition| definition.columns else &.{};
     const relations = @import("relation_binding.zig");
     const qualified_names = switch (statement) {
@@ -144,8 +337,8 @@ pub fn bindWithParameterFallback(alloc: Allocator, table: ?catalog.Table, statem
     const columns = try alloc.alloc(scalar.Column, table_columns.len + @intFromBool(table != null));
     for (table_columns, columns[0..table_columns.len]) |column, *out| out.* = .{ .name = column.name, .type = column.type, .nullable = column.nullable, .aliases = if (qualified_names) try table.?.columnAliases(alloc, column.name) else &.{} };
     if (table != null) columns[table_columns.len] = .{ .name = "_id", .type = .string, .nullable = false, .aliases = if (qualified_names) try table.?.columnAliases(alloc, "_id") else &.{} };
-    var builder: Builder = .{ .alloc = alloc, .table = table, .columns = columns, .parameters = parameters, .settings = settings, .fallbacks = fallbacks };
-    var out: Bound = .{ .columns = columns };
+    var builder: Builder = .{ .alloc = alloc, .table = table, .columns = columns, .parameters = parameters, .settings = settings, .fallbacks = fallbacks, .typed_parameters = typed_parameters };
+    var out: Bound = .{ .columns = columns, .typed_parameters = typed_parameters };
     const predicate = switch (statement) {
         .select => |select| select.predicate,
         .update => |update| update.predicate,
@@ -153,29 +346,43 @@ pub fn bindWithParameterFallback(alloc: Allocator, table: ?catalog.Table, statem
         else => null,
     };
     const predicate_expression = if (predicate) |node| try builder.predicateExpression(node) else null;
-    // Solve constraints across the statement before unconstrained projection
-    // parameters default to text. Projection order must not change typing.
+    // PostgreSQL resolves SELECT targets in source order. An untyped bare
+    // target retains its unknown/text identity even when a later occurrence
+    // constrains the parameter. Declared wire types do not have this ambiguity.
+    var unresolved_targets: [1024]bool = @splat(false);
+    if (typed_parameters and statement == .select) {
+        for (statement.select.columns) |projection| if (projection.expression) |expression| {
+            if (expression.* == .literal and expression.literal == .parameter) {
+                const slot = expression.literal.parameter;
+                if (slot == 0 or slot > parameters.len) return error.InvalidSqlParameters;
+                if (parameters[slot - 1].kind == null) unresolved_targets[slot - 1] = true;
+            }
+            _ = try builder.infer(expression, null);
+        };
+    }
+    // Converge shared descriptors before emitting any program. Programs must
+    // not freeze different input identities as projections are emitted.
     var pass: usize = 0;
     while (true) : (pass += 1) {
         if (pass > parameters.len + 1) return error.ConflictingSqlParameterTypes;
         var changed = false;
-        if (predicate_expression) |expression| changed = try scalar.inferParameters(alloc, expression, columns, parameters, .boolean, .{}) or changed;
+        if (predicate_expression) |expression| changed = try builder.infer(expression, .boolean) or changed;
         switch (statement) {
             .select => |select| {
                 for (select.columns) |projection| if (projection.expression) |expression| {
-                    changed = try scalar.inferParameters(alloc, expression, columns, parameters, null, .{}) or changed;
+                    changed = try builder.infer(expression, null) or changed;
                 };
                 for (select.order_by) |order| if (order.expression) |expression| {
-                    changed = try scalar.inferParameters(alloc, expression, columns, parameters, null, .{}) or changed;
+                    changed = try builder.infer(expression, null) or changed;
                 };
                 for ([_]?ast.Value{ select.limit, select.offset }) |optional| if (optional) |node| {
                     if (node == .parameter) {
                         if (node.parameter == 0 or node.parameter > parameters.len) return error.InvalidSqlParameters;
                         const slot = &parameters[node.parameter - 1];
-                        if (slot.*) |kind| {
+                        if (slot.kind) |kind| {
                             if (kind != .integer) return error.ConflictingSqlParameterTypes;
                         } else {
-                            slot.* = .integer;
+                            slot.* = .{ .kind = .integer, .element_type = if (typed_parameters) .int64 else null };
                             changed = true;
                         }
                     }
@@ -185,13 +392,17 @@ pub fn bindWithParameterFallback(alloc: Allocator, table: ?catalog.Table, statem
                 if (assignment.expression == null and assignment.value != .parameter) continue;
                 const column = try (table orelse return error.UndefinedColumn).column(assignment.field);
                 const expression = assignment.expression orelse try builder.node(.{ .literal = assignment.value });
-                changed = try scalar.inferParameters(alloc, expression, columns, parameters, column.type, .{}) or changed;
+                changed = try builder.infer(expression, column.type) or changed;
             },
             else => {},
         }
         if (!changed) break;
     }
-    if (predicate != null and (table == null or needsResidual(table, predicate))) {
+    try builder.freeze();
+    for (parameters, unresolved_targets[0..parameters.len]) |parameter, unresolved| {
+        if (unresolved and parameter.kind != .string) return error.ConflictingSqlParameterTypes;
+    }
+    if (predicate != null and (typed_parameters or table == null or needsResidual(table, predicate))) {
         out.predicate = try builder.program(predicate_expression.?, .boolean);
         if (out.predicate.?.output_type.kind != null and out.predicate.?.output_type.kind != .boolean) return error.SqlTypeMismatch;
     }
@@ -213,28 +424,31 @@ pub fn bindWithParameterFallback(alloc: Allocator, table: ?catalog.Table, statem
         .update => |update| {
             const programs = try alloc.alloc(?scalar.Program, update.assignments.len);
             @memset(programs, null);
-            for (update.assignments, programs) |assignment, *program| if (assignment.expression) |expression| {
+            for (update.assignments, programs) |assignment, *program| {
+                if (assignment.expression == null and !(typed_parameters and assignment.value == .parameter)) continue;
+                const expression = assignment.expression orelse try builder.node(.{ .literal = assignment.value });
                 const column = try (table orelse return error.UndefinedColumn).column(assignment.field);
                 program.* = try builder.program(expression, column.type);
                 const kind = program.*.?.output_type.kind;
                 if (kind != null and kind != column.type and !(kind == .integer and column.type == .number)) return error.SqlTypeMismatch;
-            };
+            }
             out.assignments = programs;
         },
         else => {},
     }
     out.required = try builder.required.toOwnedSlice(alloc);
+    out.parameter_descriptors = try alloc.dupe(scalar.Type, parameters);
     return out;
 }
 
-fn bindInsert(alloc: Allocator, table: catalog.Table, statement: ast.Insert, parameters: []?ast.ColumnType, settings: ?*const @import("setting_catalog.zig").View, fallbacks: []const ?ast.ColumnType) !Bound {
-    if (statement.expressions.len == 0) return .{};
+fn bindInsert(alloc: Allocator, table: catalog.Table, statement: ast.Insert, parameters: []scalar.Type, settings: ?*const @import("setting_catalog.zig").View, fallbacks: []const scalar.Type, typed_parameters: bool) !Bound {
+    if (statement.expressions.len == 0) return .{ .parameter_descriptors = try alloc.dupe(scalar.Type, parameters), .typed_parameters = typed_parameters };
     if (statement.expressions.len != statement.rows.len) return error.InvalidSqlParameters;
     if (statement.defaults.len != 0) {
         if (statement.defaults.len != statement.rows.len) return error.InvalidSqlParameters;
         for (statement.defaults) |mask| if (mask.len != statement.columns.len) return error.InvalidSqlParameters;
     }
-    var builder: Builder = .{ .alloc = alloc, .table = null, .columns = &.{}, .parameters = parameters, .settings = settings, .fallbacks = fallbacks };
+    var builder: Builder = .{ .alloc = alloc, .table = null, .columns = &.{}, .parameters = parameters, .settings = settings, .fallbacks = fallbacks, .typed_parameters = typed_parameters };
     var pass: usize = 0;
     while (true) : (pass += 1) {
         if (pass > parameters.len + 1) return error.ConflictingSqlParameterTypes;
@@ -245,54 +459,75 @@ fn bindInsert(alloc: Allocator, table: catalog.Table, statement: ast.Insert, par
                 if (statement.isDefault(row_index, cell_index)) continue;
                 const column = try table.column(name);
                 const node = expression orelse try builder.node(.{ .literal = literal });
-                changed = try scalar.inferParameters(alloc, node, &.{}, parameters, column.type, .{}) or changed;
+                changed = try builder.infer(node, column.type) or changed;
             }
         }
         if (!changed) break;
     }
+    try builder.freeze();
     const rows = try alloc.alloc([]const ?scalar.Program, statement.rows.len);
-    for (statement.expressions, rows) |expressions, *row| {
+    for (statement.expressions, statement.rows, rows) |expressions, literals, *row| {
         const programs = try alloc.alloc(?scalar.Program, expressions.len);
         @memset(programs, null);
-        for (expressions, statement.columns, programs) |expression, name, *program| if (expression) |node| {
+        for (expressions, literals, statement.columns, programs) |expression, literal, name, *program| {
+            if (expression == null and !(typed_parameters and literal == .parameter)) continue;
+            const node = expression orelse try builder.node(.{ .literal = literal });
             const column = try table.column(name);
             program.* = try builder.program(node, column.type);
             const kind = program.*.?.output_type.kind;
             if (kind != null and kind != column.type and !(kind == .integer and column.type == .number)) return error.SqlTypeMismatch;
-        };
+        }
         row.* = programs;
     }
-    return .{ .insert_rows = rows };
+    return .{ .insert_rows = rows, .parameter_descriptors = try alloc.dupe(scalar.Type, parameters), .typed_parameters = typed_parameters };
 }
 
 const Builder = struct {
     alloc: Allocator,
     table: ?catalog.Table,
     columns: []const scalar.Column,
-    parameters: []?ast.ColumnType,
+    parameters: []scalar.Type,
+    typed_parameters: bool = false,
     settings: ?*const @import("setting_catalog.zig").View = null,
-    fallbacks: []const ?ast.ColumnType = &.{},
+    fallbacks: []const scalar.Type = &.{},
     required: std.ArrayList(u32) = .empty,
     seen: std.AutoHashMapUnmanaged(u32, void) = .empty,
 
     fn program(self: *Builder, expression: *const ast.Scalar, expected: ?ast.ColumnType) !scalar.Program {
         // The statement-wide constraint pass has converged before emission.
         // Actual input kinds resolve polymorphic holes, not known SQL types.
-        for (self.parameters, 0..) |*parameter, index| {
-            if (parameter.* == null and index < self.fallbacks.len) parameter.* = self.fallbacks[index];
-        }
-        const result = try scalar.bindExpectedWithSettings(self.alloc, expression, self.columns, self.parameters, expected, .{}, self.settings);
+        var coarse: [1024]?ast.ColumnType = undefined;
+        for (self.parameters, coarse[0..self.parameters.len]) |descriptor, *kind| kind.* = descriptor.kind;
+        const result = if (self.typed_parameters) try scalar.bindTypedExpectedWithSettings(self.alloc, expression, self.columns, self.parameters, if (expected) |kind| scalar.Type{ .kind = kind } else null, .{}, self.settings) else try scalar.bindExpectedWithSettings(self.alloc, expression, self.columns, coarse[0..self.parameters.len], expected, .{}, self.settings);
         if (result.parameter_types.len > self.parameters.len) return error.InvalidSqlParameters;
-        for (result.parameter_types, self.parameters[0..result.parameter_types.len]) |inferred, *existing| {
-            if (inferred) |kind| {
-                if (existing.*) |prior| if (prior != kind) return error.ConflictingSqlParameterTypes;
-                existing.* = kind;
+        for (result.parameter_descriptors, self.parameters[0..result.parameter_types.len]) |inferred, *existing| {
+            if (inferred.kind) |kind| {
+                if (existing.kind) |prior| if (prior != kind or (self.typed_parameters and existing.element_type != null and existing.element_type != inferred.element_type)) return error.ConflictingSqlParameterTypes;
+                existing.* = inferred;
             }
         }
         for (result.required_columns) |ordinal| {
             if (!(try self.seen.getOrPut(self.alloc, ordinal)).found_existing) try self.required.append(self.alloc, ordinal);
         }
         return result;
+    }
+
+    fn freeze(self: *Builder) !void {
+        for (self.parameters, 0..) |*parameter, index| {
+            if (parameter.kind == null and index < self.fallbacks.len) parameter.* = self.fallbacks[index];
+            if (!self.typed_parameters) continue;
+            if (parameter.kind == null) parameter.* = .{ .kind = .string };
+            if (parameter.kind != .datetime and parameter.element_type == null) parameter.element_type = try scalar.parameterElementType(parameter.*);
+        }
+    }
+
+    fn infer(self: *Builder, expression: *const ast.Scalar, expected: ?ast.ColumnType) !bool {
+        if (self.typed_parameters) return scalar.inferTypedParametersExpected(self.alloc, expression, self.columns, self.parameters, if (expected) |kind| scalar.Type{ .kind = kind } else null, .{});
+        var coarse: [1024]?ast.ColumnType = undefined;
+        for (self.parameters, coarse[0..self.parameters.len]) |descriptor, *kind| kind.* = descriptor.kind;
+        const changed = try scalar.inferParameters(self.alloc, expression, self.columns, coarse[0..self.parameters.len], expected, .{});
+        for (self.parameters, coarse[0..self.parameters.len]) |*descriptor, kind| descriptor.* = .{ .kind = kind };
+        return changed;
     }
 
     fn node(self: *Builder, value: ast.Scalar) !*const ast.Scalar {
