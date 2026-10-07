@@ -1152,3 +1152,15 @@ all 50 steps and 85 tests (39 embedded, 46 coordinator), with no skips/leaks,
 including actual adapter callback wiring and the real transport fixture. Local inference grant transfer,
 backend CPU teams, background scheduling and default qualification are still
 required. Ordinary accepted writes do not attach the cancellable read callbacks.
+
+### Physical inference broker admission boundary (2026-10-07)
+
+Singleton calls and native groups share an optional immutable execution
+admission boundary outside shard locks. Collective control preserves live
+peers; callers canceled during admission are removed before backend work.
+Rejected admission, all-canceled cohorts and staging allocation failure release
+acquired grants. All 21 broker tests pass on native macOS and pinned Nix/glibc
+Linux; the [broker receipt](qualification/workload-pooling/receipts/2026-10-07/broker-admission-boundary/README.md)
+pins source and full logs. Production owner/CPU wiring, parent wait handoff,
+complete retained-memory accounting and whole-inference qualification remain
+pending. This boundary alone does not bound production inference execution.

@@ -356,7 +356,139 @@ pub const ExecutionControl = struct {
 
 pub const ExecuteFn = *const fn (ctx: *anyopaque, items: []const ExecuteItem) void;
 
+/// Immutable, process-local admission boundary for physical executor calls.
+/// begin may wait, but runs outside every broker shard lock. It borrows the
+/// complete cohort until finish and must use collective ExecutionControl:
+/// neither the leader's cancellation nor the earliest member deadline owns
+/// the physical batch. The provider installs CPU limits on this worker and
+/// retires them in finish, after the synchronous executor has joined.
+pub const ExecutionAdmission = struct {
+    context: *anyopaque,
+    begin: *const fn (*anyopaque, std.Io, Key, usize, ExecutionControl) anyerror!*anyopaque,
+    finish: *const fn (*anyopaque, *anyopaque) void,
+};
+
 const TicketState = enum { queued, executing, complete };
+
+test "microbatch execution admission covers singleton and native waves and releases failures" {
+    const Provider = struct {
+        broker: *Broker = undefined,
+        begins: usize = 0,
+        finishes: usize = 0,
+        bytes: usize = 0,
+        reject: bool = false,
+        active: bool = false,
+
+        fn begin(raw: *anyopaque, io: std.Io, _: Key, bytes: usize, control: ExecutionControl) !*anyopaque {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            // Taking the shard locks here proves admission runs outside them.
+            _ = self.broker.snapshot(io);
+            var collective = control;
+            try ExecutionControl.check(&collective);
+            self.begins += 1;
+            self.bytes += bytes;
+            if (self.reject) return error.RunnableAdmissionRejected;
+            std.debug.assert(!self.active);
+            self.active = true;
+            return self;
+        }
+        fn finish(raw: *anyopaque, handle: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(handle == raw and self.active);
+            self.active = false;
+            self.finishes += 1;
+        }
+        fn execute(raw: *anyopaque, items: []const ExecuteItem) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(self.active);
+            for (items) |item| item.slot.setValue(usize, item.payloadAs(usize).* * 2, if (items.len > 1) .native_batch else .serial);
+        }
+    };
+    var provider = Provider{};
+    var broker = Broker.initWithAdmission(std.testing.allocator, .{ .context = &provider, .begin = Provider.begin, .finish = Provider.finish });
+    provider.broker = &broker;
+    defer broker.deinit();
+    const payloads = [_]usize{ 1, 2, 3 };
+    const shapes = @as([3]Shape, @splat(.{ .bytes = 7 }));
+    const identities = @as([3]Identity, @splat(.{}));
+    for ([_]bool{ false, true }) |reject| {
+        provider.reject = reject;
+        for ([_]BatchMode{ .serial_compatibility, .native }) |mode| {
+            const capacity: usize = if (mode == .native) 2 else 1;
+            const results = try broker.submitBatchControlled(usize, usize, std.testing.io, std.testing.allocator, .{ .model = "admitted", .task = .read, .resource_class = .cpu }, .{ .mode = mode, .preferred_items = capacity, .max_items = capacity, .max_wait_us = 0 }, &shapes, &identities, null, .{}, &payloads, &provider, Provider.execute);
+            defer std.testing.allocator.free(results);
+            for (results, payloads) |result, payload| {
+                if (reject) try std.testing.expectEqual(error.RunnableAdmissionRejected, result.result.item_error.cause) else try std.testing.expectEqual(payload * 2, result.result.value);
+            }
+            try std.testing.expect(!provider.active);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 10), provider.begins);
+    try std.testing.expectEqual(@as(usize, 5), provider.finishes);
+    try std.testing.expectEqual(@as(usize, 84), provider.bytes);
+}
+
+test "microbatch admission wait removes canceled members without canceling live peers" {
+    const Provider = struct {
+        canceled: std.atomic.Value(bool) = .init(false),
+        cancel_all: bool = false,
+        second: std.atomic.Value(bool) = .init(false),
+        finishes: usize = 0,
+        calls: usize = 0,
+        fn begin(raw: *anyopaque, _: std.Io, _: Key, _: usize, control: ExecutionControl) !*anyopaque {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.canceled.store(true, .release);
+            if (self.cancel_all) self.second.store(true, .release);
+            var collective = control;
+            if (!self.cancel_all) try ExecutionControl.check(&collective);
+            return self;
+        }
+        fn finish(raw: *anyopaque, _: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.finishes += 1;
+        }
+        fn execute(raw: *anyopaque, items: []const ExecuteItem) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            std.debug.assert(items.len == 1);
+            for (items) |item| item.slot.setValue(usize, item.payloadAs(usize).*, .serial);
+        }
+    };
+    var provider = Provider{};
+    var broker = Broker.initWithAdmission(std.testing.allocator, .{ .context = &provider, .begin = Provider.begin, .finish = Provider.finish });
+    defer broker.deinit();
+    const payload: usize = 19;
+    for ([_]bool{ false, true }) |all| {
+        provider.cancel_all = all;
+        provider.canceled.store(false, .release);
+        provider.second.store(false, .release);
+        var outputs: [2]usize = undefined;
+        var slots = [_]ResultSlot{ .{ .output = &outputs[0] }, .{ .output = &outputs[1] } };
+        const items = [_]ExecuteItem{
+            .{ .allocator = std.testing.allocator, .identity = .{}, .payload = &payload, .slot = &slots[0], .control = .{ .cancellation = Cancellation.fromAtomic(&provider.canceled) } },
+            .{ .allocator = std.testing.allocator, .identity = .{}, .payload = &payload, .slot = &slots[1], .control = .{ .cancellation = Cancellation.fromAtomic(&provider.second) } },
+        };
+        broker.execute(std.testing.io, .{ .model = "admitted", .task = .read, .resource_class = .cpu }, 0, &items, &provider, Provider.execute);
+        try std.testing.expectEqual(error.Canceled, slots[0].err.?);
+        if (all) try std.testing.expectEqual(error.Canceled, slots[1].err.?) else try std.testing.expectEqual(payload, outputs[1]);
+    }
+    try std.testing.expectEqual(@as(usize, 2), provider.finishes);
+    try std.testing.expectEqual(@as(usize, 1), provider.calls);
+
+    // Failure to stage live members must still release an acquired grant.
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var failing_broker = Broker.initWithAdmission(failing.allocator(), broker.admission.?);
+    defer failing_broker.deinit();
+    provider.cancel_all = false;
+    provider.second.store(false, .release);
+    var output: usize = undefined;
+    var slot = ResultSlot{ .output = &output };
+    const item = ExecuteItem{ .allocator = std.testing.allocator, .identity = .{}, .payload = &payload, .slot = &slot };
+    failing_broker.execute(std.testing.io, .{ .model = "admitted", .task = .read, .resource_class = .cpu }, 0, &.{item}, &provider, Provider.execute);
+    try std.testing.expectEqual(error.OutOfMemory, slot.err.?);
+    try std.testing.expectEqual(@as(usize, 3), provider.finishes);
+    try std.testing.expectEqual(@as(usize, 1), provider.calls);
+}
 
 const Ticket = struct {
     item: ExecuteItem,
@@ -430,6 +562,7 @@ fn updateBrokerKeyHash(hasher: *std.hash.Wyhash, value: []const u8) void {
 
 pub const Broker = struct {
     allocator: std.mem.Allocator,
+    admission: ?ExecutionAdmission = null,
     /// Independent model/task cohorts never contend on one process-wide lock.
     /// Exact-key grouping remains unchanged within a shard.
     shards: [broker_shard_count]BrokerShard = @as([broker_shard_count]BrokerShard, @splat(.{})),
@@ -437,6 +570,43 @@ pub const Broker = struct {
 
     pub fn init(allocator: std.mem.Allocator) Broker {
         return .{ .allocator = allocator };
+    }
+
+    /// The provider and its owner lease must outlive all broker submissions.
+    /// Install before publication; changing admission while executing is unsafe.
+    pub fn initWithAdmission(allocator: std.mem.Allocator, admission: ExecutionAdmission) Broker {
+        return .{ .allocator = allocator, .admission = admission };
+    }
+
+    fn execute(self: *Broker, io: std.Io, key: Key, retained_bytes: usize, items: []const ExecuteItem, context: *anyopaque, callback: ExecuteFn) void {
+        const admission = self.admission orelse {
+            callback(context, items);
+            return;
+        };
+        const handle = admission.begin(admission.context, io, key, retained_bytes, .{ .items = items }) catch |err| {
+            for (items) |item| item.slot.fail(err);
+            return;
+        };
+        defer admission.finish(admission.context, handle);
+
+        // Admission can outlive individual callers. Recheck every member before
+        // exposing its payload to the backend, without shortening a live peer's
+        // lifetime or mutating the cohort borrowed by the admission provider.
+        const live = self.allocator.alloc(ExecuteItem, items.len) catch {
+            for (items) |item| item.slot.fail(error.OutOfMemory);
+            return;
+        };
+        defer self.allocator.free(live);
+        var count: usize = 0;
+        for (items) |item| {
+            item.control.check() catch |err| {
+                item.slot.fail(err);
+                continue;
+            };
+            live[count] = item;
+            count += 1;
+        }
+        if (count != 0) callback(context, live[0..count]);
     }
 
     pub fn deinit(self: *Broker) void {
@@ -540,7 +710,7 @@ pub const Broker = struct {
         // Serial compatibility is deliberately not queued: accepting a batch
         // envelope is not evidence that the underlying model fuses work.
         if (limits.mode != .native or limits.max_items == 1) {
-            execute_fn(execute_ctx, &.{ticket.item});
+            self.execute(io, key, shape.bytes, &.{ticket.item}, execute_ctx, execute_fn);
             if (!slot.completed) slot.fail(error.MissingMicrobatchResult);
             const shard = self.shardFor(key);
             shard.mutex.lockUncancelable(io);
@@ -830,7 +1000,7 @@ pub const Broker = struct {
         var native_batches: usize = 0;
         if (active_count > 0) {
             const execution_id = self.next_execution_id.fetchAdd(1, .monotonic);
-            group.execute_fn(group.execute_ctx, items[0..active_count]);
+            self.execute(io, group.key, group.bytes, items[0..active_count], group.execute_ctx, group.execute_fn);
             for (items[0..active_count], 0..) |item, index| {
                 if (!item.slot.completed) item.slot.fail(error.MissingMicrobatchResult);
                 item.slot.execution_id = execution_id;
