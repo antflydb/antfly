@@ -3571,3 +3571,31 @@ Public raw-array and pgwire descriptors/codecs, typed mutation capture and the
 broader scalar common-type/overload catalog remain unfinished. The original
 inventory remains 358 implemented, 136 rejected, 73 superseded and 1,019
 unresolved until exact-source mounted execution earns additional dispositions.
+
+### Lossless array result codec (2026-10-07)
+
+The shared array wire codec now represents non-NULL arrays as dimensions
+(`length`, `lower_bound`), flat row-major values and aligned SQL-null flags.
+Element type remains a bound-column descriptor; JSON shape never chooses a SQL
+type. Integers use exact canonical decimal strings. Finite floating values use
+JSON numbers, while NaN and infinities use explicit tokens instead of collapsing
+to JSON null. JSONB null elements and SQL NULL elements remain distinct.
+
+Streaming output validates and admits the complete value before destination
+writes, without per-cell serialization buffers. Retained byte output has one
+exact-sized allocation. Ordinal JSON output materializes directly without a
+stringify/parse round trip, and decode validates before retaining cells, clones
+payload ownership and can use a stable quota owner accounting arena capacity.
+Both ordinary JSON numeric parsing and exact number-token parsing preserve
+dimension metadata. The PostgreSQL text/binary fixtures cover element domains,
+bounds and NULL provenance; JSONB comparison is semantic because PostgreSQL's
+binary JSONB wrapper contains formatted JSON rather than canonical row bytes.
+Malformed shape/type/quota cases reject before cell allocation, and allocation
+faults exercise retained byte output, JSON materialization and decoded owners.
+
+A debug streaming workload emitted 262,144 cells / 3,439,056 bytes in about
+119 ms with zero encoder allocations. This is an absolute local workload, not
+a before/after speedup claim. Public activation is still guarded: generated
+column/array OpenAPI contracts, final-output integration, PostgreSQL element OID
+and result-codec integration, and transport-level original-case proofs are the
+next dependencies. This codec alone earns no original-case disposition credit.

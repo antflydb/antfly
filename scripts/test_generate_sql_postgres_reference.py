@@ -1482,6 +1482,24 @@ class PostgresReferenceTest(unittest.TestCase):
                         self.db.execute("SELECT " + case["sql"])
                 self.assertEqual(caught.exception.sqlstate, case["code"])
 
+    def test_array_element_overflow_retains_numeric_sqlstate(self):
+        import psycopg
+
+        for kind, value in (
+            ("int2", "32768"),
+            ("int4", "2147483648"),
+            ("int8", "9223372036854775808"),
+            ("int8", "-9223372036854775809"),
+            ("int8", "111111111111111111111111"),
+        ):
+            with self.subTest(kind=kind, value=value):
+                with self.assertRaises(psycopg.Error) as error:
+                    with self.db.transaction(force_rollback=True):
+                        self.db.execute(
+                            "SELECT %s::" + kind + "[]", ("{" + value + "}",)
+                        )
+                self.assertEqual("22003", error.exception.sqlstate)
+
     def test_typed_array_text_input_contracts(self):
         import json
         from pathlib import Path
