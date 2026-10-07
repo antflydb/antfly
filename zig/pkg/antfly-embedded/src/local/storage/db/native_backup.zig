@@ -1155,10 +1155,12 @@ fn collectArtifacts(
             .file => {
                 if (std.mem.eql(u8, entry.path, manifest_file_name)) continue;
                 if (result.items.len == max_artifacts) return error.NativeBackupManifestTooLarge;
-                try validateRelativePath(entry.path);
-                const path = try alloc.dupe(u8, entry.path);
+                // Normalize trusted walker output before recording portable
+                // inventory paths; external manifest validation stays strict.
+                const path = try fs_paths.joinStoragePathAlloc(alloc, &.{entry.path});
                 errdefer alloc.free(path);
-                const absolute = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ root, entry.path });
+                try validateRelativePath(path);
+                const absolute = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ root, path });
                 defer alloc.free(absolute);
                 const stat = try statRegularFile(io, absolute);
                 var digest: [Sha256.digest_length]u8 = undefined;
@@ -1166,8 +1168,8 @@ fn collectArtifacts(
                 const hex = std.fmt.bytesToHex(digest, .lower);
                 const sha256 = try alloc.dupe(u8, &hex);
                 errdefer alloc.free(sha256);
-                const ownership = try artifactOwnership(entry.path, projections);
-                const install_path = try artifactInstallPathAlloc(alloc, entry.path, ownership.role);
+                const ownership = try artifactOwnership(path, projections);
+                const install_path = try artifactInstallPathAlloc(alloc, path, ownership.role);
                 errdefer alloc.free(install_path);
                 try result.append(alloc, .{
                     .path = path,
@@ -1278,7 +1280,12 @@ fn validateCompleteInventory(
             .directory => {},
             .file => {
                 if (std.mem.eql(u8, entry.path, manifest_file_name)) continue;
-                if (!manifestContainsArtifact(manifest, entry.path))
+                const path = if (comptime @import("builtin").os.tag == .windows)
+                    try fs_paths.joinStoragePathAlloc(alloc, &.{entry.path})
+                else
+                    entry.path;
+                defer if (comptime @import("builtin").os.tag == .windows) alloc.free(path);
+                if (!manifestContainsArtifact(manifest, path))
                     return error.InvalidNativeBackupManifest;
             },
             else => return error.UnsupportedFileType,
@@ -1672,6 +1679,44 @@ test "shared vector acceleration corruption preserves native posting authority" 
     defer alloc.free(restored_vector);
     try std.testing.expect(try pathExists(std.testing.io, restored_posting));
     try std.testing.expect(!try pathExists(std.testing.io, restored_vector));
+}
+
+test "native generation inventory restores nested portable paths and rejects extra files" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var snapshot_tmp = std.testing.tmpDir(.{});
+    defer snapshot_tmp.cleanup();
+    var destination_tmp = std.testing.tmpDir(.{});
+    defer destination_tmp.cleanup();
+    const snapshot = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{snapshot_tmp.sub_path});
+    defer alloc.free(snapshot);
+    const destination = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{destination_tmp.sub_path});
+    defer alloc.free(destination);
+    try snapshot_tmp.dir.createDirPath(io, "primary-lsm/runs");
+    for ([_][]const u8{ "primary-lsm/manifest.bin", "primary-lsm/runs/1.tbl" }) |relative| {
+        const path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ snapshot, relative });
+        defer alloc.free(path);
+        _ = try writeFileDurable(io, path, "immutable");
+    }
+    _ = try finalizeCaptureGenerationWithCancellation(alloc, io, snapshot, 1, &.{}, .{
+        .artifact_format = "antfly-lsm-checkpoint",
+        .artifact_version = 1,
+        .source_backend = "lsm",
+    }, .none);
+    var loaded = (try validateAndMaterialize(alloc, io, snapshot, destination)).?;
+    defer loaded.deinit();
+    try std.testing.expectEqual(@as(usize, 2), loaded.value().artifacts.len);
+    try std.testing.expectEqualStrings("primary-lsm/runs/1.tbl", loaded.value().artifacts[1].path);
+    const restored = try std.fmt.allocPrint(alloc, "{s}/runs/1.tbl", .{destination});
+    defer alloc.free(restored);
+    const body = try readFileAlloc(alloc, io, restored, 64);
+    defer alloc.free(body);
+    try std.testing.expectEqualStrings("immutable", body);
+    const extra = try std.fmt.allocPrint(alloc, "{s}/primary-lsm/runs/2.tbl", .{snapshot});
+    defer alloc.free(extra);
+    _ = try writeFileDurable(io, extra, "extra");
+    try std.testing.expectError(error.InvalidNativeBackupManifest, validateAndMaterialize(alloc, io, snapshot, destination));
+    try std.testing.expectError(error.InvalidNativeBackupArtifactPath, validateRelativePath("primary-lsm\\runs\\1.tbl"));
 }
 
 test "native generation manifest captures validates and materializes generated artifacts" {

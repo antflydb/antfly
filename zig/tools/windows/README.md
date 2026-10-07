@@ -380,6 +380,31 @@ CrossOver fails that final replacement with `AccessDenied`; the macOS test
 passes. The cancellation regressions use a canceled event and re-arm the
 request before cleanup, without a timed release.
 
+Backup seal and generation inventory paths normalize Windows walker output to
+'/' before validating or matching portable manifests. Run the focused suite:
+
+```sh
+zig test -lc -target x86_64-windows-gnu -O Debug --test-no-exec \
+  --test-runner pkg/antfly-embedded/src/local/test_runner.zig \
+  --test-filter 'storage.db.native_backup' \
+  -femit-bin=/path/to/backup-test.exe \
+  --dep antfly_source_root=root --dep antfly_test_error_logs \
+  --dep antfly_hash --dep antfly_platform --dep antfly_runtime_fs \
+  --dep antfly_cancellation --dep antfly_cache_budget \
+  -Mroot=pkg/antfly-embedded/src/local/windows_backup_test.zig \
+  -Mantfly_hash=lib/hash/src/mod.zig -Mantfly_platform=lib/platform/src/root.zig \
+  --dep antfly_platform -Mantfly_runtime_fs=lib/runtime/src/fs.zig \
+  --dep antfly_platform -Mantfly_cancellation=lib/runtime/src/cancellation.zig \
+  --dep antfly_platform -Mantfly_cache_budget=lib/runtime/src/cache_budget.zig \
+  -Mantfly_test_error_logs=pkg/antfly-embedded/src/local/test_error_logs.zig
+```
+
+The repository runner verifies expected error logs. Both new inventory
+regressions pass under CrossOver. Five other tests fail because this Zig
+version's Windows `Io.Threaded` hardlink operation returns
+`OperationUnsupported`; this blocks native backup capture requiring pins.
+All 11 tests pass on macOS (include the filesystem capacity C source as above).
+
 ## Prior native Windows qualification
 
 On a GCE `windows-2022` VM: `lite init`, `lite serve`, table creation, batch
@@ -395,7 +420,9 @@ limited to Windows). After the cleanup it was only compile-checked for Windows
 ## Known gaps for supported Windows
 
 - No Windows CI. `zig build test` has not run on Windows.
-- Untested: vector or hybrid search, enrichments, backups, the distributed
+- Native backup pinning is blocked by Zig's unsupported Windows hardlinks.
+  Backup inventory tests pass; end-to-end backups remain unqualified.
+- Untested: vector or hybrid search, enrichments, the distributed
   (Raft) runtime, TLS client calls (CryptoAPI trust store), and long-running
   or concurrent load.
 - Lite files written by v0.2.x (format version 2) do not open on main. Convert

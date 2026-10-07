@@ -269,6 +269,41 @@ need verification. No replacement workaround or test skip was introduced.
 The new vacuum cleanup fix has not been included in a native Windows
 application or hard-reset qualification run.
 
+## Backup inventory review
+
+Windows directory walkers return native backslash separators. Backup seal
+inventories rejected a nested file as `InvalidBackupSeal`; a new nested-file
+regression reproduces that failure before the fix. Generation inventory
+collection and complete-inventory restore matching also used raw walker paths
+against portable '/' manifest paths. All three now normalize trusted walker
+output before inventory validation or matching. External manifest path
+validation remains strict, including rejection of backslashes and extra files.
+
+Two new regressions pass on macOS and Windows Debug and ReleaseFast under
+CrossOver: nested backup seal creation/reopening, and physical generation
+inventory finalization/validation/materialization with nested run paths. The
+latter also verifies rejection of an undeclared run and a backslash manifest
+path. These tests use generated placeholder payloads; they qualify inventory
+handling, not recovery of a real LSM checkpoint.
+
+The complete focused backup suite passes 11 tests on macOS, with zero skips or
+leaks and its one expected error log. Windows Debug and ReleaseFast each pass
+six tests and fail five, with zero skips or leaks. All five failures originate
+in `std.Io.Threaded.dirHardLink`, whose Windows implementation in this Zig
+version immediately returns `OperationUnsupported`. The failing tests cover
+explicit generation pins, shared vector acceleration capture, generation
+capture/materialization, materialization receipts and in-place mutation
+detection. The last test also reports its absent expected error log because
+pinning fails before it reaches the mutation check.
+
+This is a Windows runtime capability gap, distinct from Wine's open-file
+replacement limitation. Native backup capture that requires hardlinks remains
+blocked with this I/O runtime even after the path fixes. Supporting it requires
+an owning Windows I/O implementation of hardlinks that preserves source/pin
+identity and caller authority. A copy fallback or a direct Win32 bypass was
+not introduced. The focused root is `windows_backup_test.zig`; no backup test
+was skipped. The path fixes have not been rerun on native Windows.
+
 ## Cleanup
 
 The disposable VM, auto-delete boot disk, artifact bucket, service account,
