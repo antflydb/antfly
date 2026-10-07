@@ -576,3 +576,72 @@ the main-branch policy assertion fix is isolated in PR #996.
 These results do not extend the earlier native abrupt-reset/physical-durability
 qualification to this new application binary. Windows remains experimental;
 CrossOver cannot establish loss of the Windows OS cache.
+
+## Current main integration and owned-source publication (2026-10-07)
+
+Merged `origin/main` at `e19ac3c0830f3b3cd304a4ad116a47f93ab603cb`,
+preserving its bounded Lite transaction and remote-lake changes. Resolved four
+source conflicts and migrated its new executor callers to platform ownership.
+Normalized 36 incoming license headers, including two Apache engine sources
+that incorrectly carried ELv2 notices. The Apache boundary now verifies 1,905
+sources.
+
+The merged tests exposed an optional authenticated-page buffer treating a
+caller allocator limit as fatal. It now authenticates with bounded worker
+scratch when either allocator or cache admission rejects that optional page.
+The retained source/navigation peak in the 2 MiB segment test is 750 bytes.
+The existing cache-performance assertion incorrectly assumed physical reads
+remained uncached; the test now distinguishes source calls from disk reads,
+verifies the same identifiers, and retains its sixteenfold source-call reduction
+and 256 KiB cap (8,192 source calls versus three scoped calls in macOS Debug).
+
+The new native lease capability is available on Windows independently of
+memory mapping. Atomic publication also advertises its owned-source result;
+this fixes a compaction crash that dereferenced an absent mapping callback.
+A regression verifies publication preserves immutable bytes through replacement
+and storage-owner shutdown without a mapping capability. New lake builder
+permission calls select the target API, and temporary paths use the platform
+host-environment directory instead of hard-coded `/tmp`.
+
+The final native Windows Server 2022/NTFS run passes all 14 Debug and ReleaseFast
+executables: **168 passed, 50 capability-specific skips, zero failures and zero
+leaks**. All guest executable hashes match this final manifest:
+
+| Executable | SHA-256 |
+| --- | --- |
+| `compat-Debug.exe` | `54eb133c57294c59ddaa7689ef545107f09769562204b14ff7a1eab4d7d4219b` |
+| `hardlink-Debug.exe` | `217e89adaac74a9495d8e75279bf237242bab6dcaf53c858c95f382d12b203a4` |
+| `backup-Debug.exe` | `31aeb856ddd8c539f1e2b438110d1448b31fbe6aa022a481f31e4d710df0c2fb` |
+| `filesystem-Debug.exe` | `cb4d74b308c0439d574ff426094a0137b8c72b7a8bcd675deba4c0c5ca87c20f` |
+| `lite-Debug.exe` | `4b7cbc2ee53593336a829fc0211ae521d334bf0928556b48084f138e5f52861a` |
+| `storage-Debug.exe` | `319c19255e79489b91af62e017e49c2e6163341315d6ad3e89ffc3e97c295c92` |
+| `bridge-Debug.exe` | `3a9b3114f0f0eb533e6f4eb6cd05f4224e5709592a065d2171e82c310bdc80cc` |
+| `compat-ReleaseFast.exe` | `9163cc8ce13149495d5030dd4de174a28ca42605e3c1d19e336878fd342a3111` |
+| `hardlink-ReleaseFast.exe` | `8163279b0d7eea537b2e7fa83ec02ec8f98f5ca16691bf16d942c3e875f84600` |
+| `backup-ReleaseFast.exe` | `523dcc931983a079c22c1fc3f86f85ff2a5d93b92acf658ac8f522ddc681cc6c` |
+| `filesystem-ReleaseFast.exe` | `50787b46701a27d73399db5cd0a9d3020774ae2d8d2aff406380b7ace2309dfb` |
+| `lite-ReleaseFast.exe` | `b28fdb94f694c585ac065d66739f4e88213b5a17ad18d401f69fa3f01c8d5d3a` |
+| `storage-ReleaseFast.exe` | `c197fa137bc2a0f83d97ab66f721c7e196f11744f1d3e48e9743cc978e96b71f` |
+| `bridge-ReleaseFast.exe` | `dc359340c26765d16ae3ac73f71a9d1e95d0518b741c6bc3c86152663e96cfdd` |
+
+Evidence is retained in `/private/tmp/antfly-pr987-stock-merged-windows-tests/`
+(`native-results.json`, `manifest.json`, `qualified-source.json`, `resources.json`).
+CrossOver's final Lite tests in both modes report 29 passed, four mapped-artifact
+skips and four replacement failures, with zero leaks. The new publication test
+passes in both modes; all four failing replacement tests pass on native NTFS.
+These runs preserve the Wine failures in the test results.
+
+The corresponding macOS focused checks pass 99 tests with two Windows-specific
+skips; the final Lite executable passes 37/37. The application and native/browser
+module-boundary audit build pass **59/59 steps** with stock Zig, ONNX disabled
+and BLAS off. Final Windows executable SHA-256: `8ced3f3c1e881f6df53571e7914a4bc01efc94c2c395986251b2670167c8aae2`.
+CrossOver then verifies all 32 acknowledged documents and full-text entries
+after forced termination, passes 64 concurrent queries across both starts,
+and reports a valid database, no integrity issue and zero tail bytes.
+Evidence: `/private/tmp/antfly-pr987-stock-app-merged-publication-build.log` and
+`/private/tmp/antfly-pr987-stock-app-merged-qualified-smoke/`.
+
+Both disposable qualification environments have been deleted. No ingress
+firewall rules or tunnels were created. The stock Zig library remains unchanged;
+the historical physical-durability qualification and experimental Windows
+status retain the limits stated above.
