@@ -19,6 +19,10 @@ const std = @import("std");
 const ast = @import("ast.zig");
 const Value = std.json.Value;
 
+test {
+    _ = @import("schema_expression.zig");
+}
+
 fn value(alloc: std.mem.Allocator, input: anytype) !Value {
     return std.json.parseFromSliceLeaky(Value, alloc, try std.json.Stringify.valueAlloc(alloc, input, .{}), .{ .parse_numbers = false });
 }
@@ -225,11 +229,9 @@ pub fn apply(alloc: std.mem.Allocator, schema: *Value, ddl: ast.CatalogDdl) !boo
                 }
                 var replacement: ?Value = null;
                 if (change == .set_default) {
-                    const element: ?@import("array_value.zig").ElementType = if (property.object.get("x-antfly-sql-type")) |identity| blk: {
-                        if (identity != .string) return error.InvalidSqlBackendResponse;
-                        break :blk std.meta.stringToEnum(@import("array_value.zig").ElementType, identity.string) orelse return error.InvalidSqlBackendResponse;
-                    } else null;
-                    const column_type = try defaultColumnType(property, element);
+                    const column = try @import("schema_columns.zig").column(column_name, property);
+                    const element = column.element_type;
+                    const column_type = column.type;
                     const literal = try @import("ddl_runtime.zig").bindDefault(alloc, change.set_default.value, column_type, element);
                     replacement = try value(alloc, .{ .column = column_name, .expression = .{ .op = "literal", .type = if (column_type == .uuid) "string" else @tagName(column_type), .value = literal } });
                 }
@@ -241,34 +243,6 @@ pub fn apply(alloc: std.mem.Allocator, schema: *Value, ddl: ast.CatalogDdl) !boo
         },
     }
     return true;
-}
-
-fn defaultColumnType(property: Value, element: ?@import("array_value.zig").ElementType) !ast.ColumnType {
-    if (element) |kind| return switch (kind) {
-        .text => .string,
-        .uuid => .uuid,
-        .int16, .int32, .int64 => .integer,
-        .float32, .float64 => .number,
-        .boolean => .boolean,
-        .jsonb => .json,
-    };
-    const declared = property.object.get("type") orelse return error.UnsupportedSqlShape;
-    const name = if (declared == .string) declared.string else if (declared == .array) blk: {
-        var selected: ?[]const u8 = null;
-        for (declared.array.items) |item| {
-            if (item != .string) return error.UnsupportedSqlShape;
-            if (std.mem.eql(u8, item.string, "null")) continue;
-            if (selected != null) return error.UnsupportedSqlShape;
-            selected = item.string;
-        }
-        break :blk selected orelse return error.UnsupportedSqlShape;
-    } else return error.UnsupportedSqlShape;
-    const format = property.object.get("format") orelse .null;
-    if (std.mem.eql(u8, name, "keyword") or std.mem.eql(u8, name, "string") or std.mem.eql(u8, name, "text"))
-        return if (format == .string and std.mem.eql(u8, format.string, "uuid")) .uuid else .string;
-    if (std.mem.eql(u8, name, "numeric")) return .number;
-    if (std.mem.eql(u8, name, "array") or std.mem.eql(u8, name, "object")) return .json;
-    return std.meta.stringToEnum(ast.ColumnType, name) orelse error.UnsupportedSqlShape;
 }
 
 test "primary key schema lowering rejects deferred timing and empty keys" {

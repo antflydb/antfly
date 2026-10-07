@@ -31,18 +31,11 @@ pub fn lower(alloc: std.mem.Allocator, schema: Json, expression: *const ast.Scal
 const Lowered = struct { expression: Json, type: ast.ColumnType };
 
 pub fn lowerTyped(alloc: std.mem.Allocator, schema: Json, expression: *const ast.Scalar, expected: ?ast.ColumnType) !Lowered {
-    const default_type = schema.object.get("default_type") orelse return error.InvalidSqlBackendResponse;
-    const row = schema.object.get("document_schemas").?.object.get(default_type.string).?.object.get("schema").?;
-    const properties = row.object.get("properties").?;
+    const properties = try @import("schema_columns.zig").properties(schema);
     var columns = std.ArrayList(scalar.Column).empty;
     for (properties.object.keys(), properties.object.values()) |name, property| {
-        const wire_type = property.object.get("type").?.string;
-        const format = property.object.get("format") orelse .null;
-        const kind: ast.ColumnType = if (format == .string and std.mem.eql(u8, format.string, "uuid") and
-            (std.mem.eql(u8, wire_type, "keyword") or std.mem.eql(u8, wire_type, "string") or std.mem.eql(u8, wire_type, "text")))
-            .uuid
-        else if (std.mem.eql(u8, wire_type, "keyword")) .string else std.meta.stringToEnum(ast.ColumnType, wire_type) orelse return error.UnsupportedSqlShape;
-        try columns.append(alloc, .{ .name = name, .type = kind });
+        const column = try @import("schema_columns.zig").column(name, property);
+        try columns.append(alloc, .{ .name = name, .type = column.type, .element_type = column.element_type });
     }
     return lowerColumns(alloc, columns.items, expression, expected);
 }
@@ -54,6 +47,16 @@ pub fn lowerColumns(alloc: std.mem.Allocator, columns: []const scalar.Column, ex
     const values = try alloc.alloc(Json, program.instructions.len);
     for (program.instructions, values) |instruction, *out| {
         const kind = instruction.type.kind orelse return error.SqlTypeMismatch;
+        // The durable expression VM currently has int64/float64 arithmetic,
+        // not the query VM's narrower builtin overflow/rounding contracts.
+        // Keep shape discovery complete without silently lowering a different
+        // operation or manufacturing JSON-null placeholders for typed arrays.
+        if (kind == .array) return error.UnsupportedSqlShape;
+        if (instruction.operation == .binary or instruction.operation == .unary) {
+            const identity = instruction.type.element_type;
+            if ((kind == .integer and identity != null and identity != .int64) or
+                (kind == .number and identity == .float32)) return error.UnsupportedSqlShape;
+        }
         out.* = switch (instruction.operation) {
             .literal => |literal| try json(alloc, .{ .op = "literal", .type = if (kind == .uuid) "string" else @tagName(kind), .value = literal }),
             .column => |ordinal| try json(alloc, .{ .op = "column", .column = columns[ordinal].name }),
@@ -88,7 +91,17 @@ pub fn lowerColumns(alloc: std.mem.Allocator, columns: []const scalar.Column, ex
                 for (args, part.args) |*arg, index| arg.* = values[index];
                 break :blk try json(alloc, .{ .op = op, .args = args });
             },
-            .cast => |part| if (program.instructions[part.operand].type.kind == part.type) values[part.operand] else return error.UnsupportedSqlShape,
+            .cast => |part| blk: {
+                const source = program.instructions[part.operand].type;
+                if (source.kind != part.type) return error.UnsupportedSqlShape;
+                if (source.element_type != part.element_type) {
+                    const from = source.element_type orelse return error.UnsupportedSqlShape;
+                    const to = part.element_type orelse return error.UnsupportedSqlShape;
+                    const casts = @import("builtin_cast.zig");
+                    if (!casts.integral(from) or !casts.integral(to) or try casts.commonNumeric(from, to) != to) return error.UnsupportedSqlShape;
+                }
+                break :blk values[part.operand];
+            },
             .case_when, .in_list => return error.UnsupportedSqlShape,
         };
     }
@@ -123,4 +136,61 @@ fn collectPredicates(alloc: std.mem.Allocator, expression: Json, predicates: *st
     const literal = args.array.items[1];
     if (!std.mem.eql(u8, literal.object.get("op").?.string, "literal")) return error.UnsupportedSqlShape;
     try predicates.append(alloc, try json(alloc, .{ .column = column.string, .op = op, .value = literal.object.get("value") orelse .null }));
+}
+
+test "SQL schema expressions bind nullable catalog shapes and cold typed arrays" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const schema = try std.json.parseFromSliceLeaky(Json, a,
+        \\{"default_type":"row","document_schemas":{"row":{"schema":{"properties":{"n":{"type":["integer","null"],"x-antfly-sql-type":"int16"},"label":{"type":["keyword","null"]},"cold":{"type":["sql_array","null"],"x-antfly-sql-type":"int64"}}}}}}
+    , .{});
+    var check = try @import("compiler.zig").compileScalar(a, "n > 0 AND lower(label) = 'ready'", .{});
+    defer check.deinit();
+    const lowered = try lower(a, schema, check.expression, .boolean);
+    try std.testing.expectEqualStrings("and", lowered.object.get("op").?.string);
+    var index = try @import("compiler.zig").compileScalar(a, "lower(label)", .{});
+    defer index.deinit();
+    const key = try lowerTyped(a, schema, index.expression, null);
+    try std.testing.expectEqual(ast.ColumnType.string, key.type);
+    // Binding may discover every declared type, but may not erase an array
+    // dependency or narrow arithmetic into the native int64-only VM.
+    for ([_][]const u8{ "n + n > 0", "cold IS NULL", "CAST(n AS smallint) + CAST(n AS smallint) > 0" }) |sql| {
+        var unsupported = try @import("compiler.zig").compileScalar(a, sql, .{});
+        defer unsupported.deinit();
+        try std.testing.expectError(error.UnsupportedSqlShape, lower(a, schema, unsupported.expression, .boolean));
+    }
+}
+
+test "SQL schema expression catalog decoding rejects malformed and conflicting metadata" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var expression = try @import("compiler.zig").compileScalar(a, "n > 0", .{});
+    defer expression.deinit();
+    for ([_][]const u8{ "null", "{}", "{\"default_type\":1}", "{\"default_type\":\"row\",\"document_schemas\":null}" }) |text| {
+        const schema = try std.json.parseFromSliceLeaky(Json, a, text, .{});
+        try std.testing.expectError(error.InvalidSqlBackendResponse, lower(a, schema, expression.expression, .boolean));
+    }
+    for ([_][]const u8{ "null", "{\"type\":3}", "{\"type\":[\"integer\",1]}", "{\"type\":\"sql_array\"}", "{\"type\":\"boolean\",\"x-antfly-sql-type\":\"int16\"}" }) |text| {
+        const property = try std.json.parseFromSliceLeaky(Json, a, text, .{});
+        try std.testing.expectError(error.InvalidSqlBackendResponse, @import("schema_columns.zig").column("n", property));
+    }
+}
+
+test "SQL schema expression nullable catalog binding cleans up allocation faults" {
+    const Fixture = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const owned = arena.allocator();
+            const schema = try std.json.parseFromSliceLeaky(Json, owned,
+                \\{"default_type":"row","document_schemas":{"row":{"schema":{"properties":{"n":{"type":["integer","null"],"x-antfly-sql-type":"int16"},"cold":{"type":"sql_array","x-antfly-sql-type":"int64"}}}}}}
+            , .{});
+            var check = try @import("compiler.zig").compileScalar(owned, "n > 0", .{});
+            defer check.deinit();
+            _ = try lower(owned, schema, check.expression, .boolean);
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
 }

@@ -86,6 +86,48 @@ class PostgresReferenceTest(unittest.TestCase):
                     self.db.execute("SELECT " + case["expression"]).fetchone()[0],
                 )
 
+    def test_nullable_catalog_check_index_and_precise_default_contract(self):
+        import psycopg
+
+        with self.db.transaction(force_rollback=True):
+            self.db.execute("CREATE TABLE items(n smallint, label text, cold bigint[])")
+            self.db.execute(
+                "ALTER TABLE items ADD CONSTRAINT positive CHECK (n > 0 AND lower(label) = 'ready')"
+            )
+            self.db.execute(
+                "CREATE INDEX label_key ON items ((lower(label))) WHERE n > 0"
+            )
+            self.db.execute("ALTER TABLE items ALTER COLUMN n SET DEFAULT 7")
+            self.db.execute(
+                "INSERT INTO items(label,cold) VALUES ('READY','[-1:0]={9007199254740993,NULL}')"
+            )
+            self.db.execute("INSERT INTO items VALUES (NULL,'READY',NULL)")
+            self.assertEqual(
+                [(7, -1, 9007199254740993), (None, None, None)],
+                self.db.execute(
+                    "SELECT n,array_lower(cold,1),cold[-1] FROM items ORDER BY n NULLS LAST"
+                ).fetchall(),
+            )
+            for n, label in ((-1, "READY"), (1, "wrong")):
+                with self.subTest(n=n, label=label):
+                    with self.assertRaises(psycopg.errors.CheckViolation):
+                        with self.db.transaction():
+                            self.db.execute(
+                                "INSERT INTO items VALUES (%s,%s,NULL)", (n, label)
+                            )
+            # PostgreSQL retains the assignment cast and raises at use; the
+            # current native literal-default VM instead rejects at DDL bind.
+            self.db.execute("ALTER TABLE items ALTER COLUMN n SET DEFAULT 32768")
+            with self.assertRaises(psycopg.errors.NumericValueOutOfRange):
+                with self.db.transaction():
+                    self.db.execute("INSERT INTO items(label) VALUES ('READY')")
+            self.db.execute("ALTER TABLE items ALTER COLUMN n SET DEFAULT 7")
+            # The durable native expression VM must not silently widen this.
+            self.db.execute("INSERT INTO items VALUES (32767,'READY',NULL)")
+            with self.assertRaises(psycopg.errors.NumericValueOutOfRange):
+                with self.db.transaction():
+                    self.db.execute("SELECT n+n FROM items WHERE n=32767").fetchall()
+
     def test_joined_returning_preserves_target_postimage_and_source_array_identity(
         self,
     ):

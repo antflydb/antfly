@@ -13458,6 +13458,53 @@ test "httpx SQL joined source RETURNING preserves native array storage and Postg
     }
 }
 
+test "httpx SQL catalog expressions preserve nullable typed schemas through native admission" {
+    const alloc = std.testing.allocator;
+    const sources = @import("antfly_local_sources");
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var schema = try std.json.parseFromSliceLeaky(std.json.Value, a,
+        \\{"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"n":{"type":["integer","null"],"x-antfly-sql-type":"int16"},"label":{"type":["keyword","null"]},"cold":{"type":["sql_array","null"],"x-antfly-sql-type":"int64"}},"additionalProperties":false}}}}
+    , .{});
+    for ([_][]const u8{
+        "ALTER TABLE items ADD CONSTRAINT positive CHECK (n > 0 AND lower(label) = 'ready')",
+        "CREATE INDEX label_key ON items ((lower(label))) WHERE n > 0",
+        "ALTER TABLE items ALTER COLUMN n SET DEFAULT 7",
+    }) |sql| {
+        var compiled = try sources.sql_compiler.compile(a, sql, .{});
+        defer compiled.deinit();
+        try std.testing.expect(try sources.sql_schema_ddl.apply(a, &schema, compiled.statement.catalog_ddl));
+    }
+    const bytes = try std.json.Stringify.valueAlloc(a, schema, .{});
+    var validator = try sources.schema_mod.CompiledTableValidator.init(alloc, bytes);
+    defer validator.deinit(alloc);
+    const native = try sources.schema_mod.deriveRuntimeTableSchema(alloc, validator.schema);
+    defer sources.storage_schema.freeSchema(alloc, native);
+    try std.testing.expectEqual(@as(usize, 3), native.relational_columns.len);
+    var valid = try std.json.parseFromSliceLeaky(std.json.Value, a,
+        \\{"label":"READY","cold":{"dimensions":[{"length":2,"lower_bound":-1}],"values":["9007199254740993",null],"sql_nulls":[false,true]}}
+    , .{});
+    try validator.prepareValue(a, alloc, &valid);
+    try std.testing.expectEqual(@as(i64, 7), valid.object.get("n").?.integer);
+    const cold = try sources.sql_array_wire.decodeLeaky(a, .int64, valid.object.get("cold").?, .{});
+    try std.testing.expectEqual(@as(i32, -1), cold.dimensions[0].lower);
+    try std.testing.expectEqual(@as(i64, 9007199254740993), cold.elements[0].value.integer);
+    try std.testing.expect(cold.elements[1].sql_null);
+    for ([_][]const u8{ "{\"n\":-1,\"label\":\"READY\"}", "{\"n\":1,\"label\":\"wrong\"}" }) |document| {
+        var invalid = try std.json.parseFromSliceLeaky(std.json.Value, a, document, .{});
+        try std.testing.expectError(error.RelationalCheckViolation, validator.prepareValue(a, alloc, &invalid));
+    }
+    var nullable = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"n\":null,\"label\":\"READY\"}", .{});
+    try validator.prepareValue(a, alloc, &nullable);
+    try std.testing.expect(nullable.object.get("n").? == .null);
+    // A later invalid default cannot replace the admitted one.
+    var overflow = try sources.sql_compiler.compile(a, "ALTER TABLE items ALTER COLUMN n SET DEFAULT 32768", .{});
+    defer overflow.deinit();
+    try std.testing.expectError(error.SqlNumericOutOfRange, sources.sql_schema_ddl.apply(a, &schema, overflow.statement.catalog_ddl));
+    try std.testing.expectEqualStrings(bytes, try std.json.Stringify.valueAlloc(a, schema, .{}));
+}
+
 test "httpx SQL PostgreSQL mutations capture native source relations and complete storage" {
     // Exact-source non-key mutations. Logical PK/index-owner activation is
     // deliberately not claimed by this fixture: sql-0012, sql-0013,
