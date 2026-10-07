@@ -969,12 +969,12 @@ pub fn inferenceProviderEmbedDenseTextsWithContext(
     context: inference.managed_embedder.EmbeddingRequestContext,
 ) anyerror![][]f32 {
     try context.check();
-    return try invokeInferenceProviderControlled([][]f32, alloc, handle, .embed_dense_texts_with_context, .{
+    return try invokeInferenceProvider([][]f32, alloc, handle, .embed_dense_texts_with_context, .{
         .model = model,
         .texts = texts,
         .task_type = context.task_type.canonical(),
         .instruction = context.instruction,
-    }, context.request.deadline_ns, context.request.cancellation orelse .none);
+    }, context.request);
 }
 
 pub fn inferenceProviderEmbedSparseTexts(
@@ -1030,7 +1030,7 @@ pub fn inferenceProviderEmbedDensePartsWithContext(
     context: inference.managed_embedder.EmbeddingRequestContext,
 ) anyerror![][]f32 {
     try context.check();
-    return try inferenceProviderEmbedDensePartsBorrowed(
+    return try inferenceProviderEmbedDensePartsContext(
         handle,
         alloc,
         model,
@@ -1038,8 +1038,7 @@ pub fn inferenceProviderEmbedDensePartsWithContext(
         .embed_dense_parts_with_context,
         context.task_type.canonical(),
         context.instruction,
-        context.request.deadline_ns,
-        context.request.cancellation orelse .none,
+        context.request,
     );
 }
 
@@ -1053,6 +1052,19 @@ pub fn inferenceProviderEmbedDensePartsBorrowed(
     instruction: ?[]const u8,
     deadline_ns: ?u64,
     cancellation: CancellationToken,
+) ![][]f32 {
+    return try inferenceProviderEmbedDensePartsContext(handle, alloc, model, parts, operation, task_type, instruction, requestContextFromControls(deadline_ns, cancellation));
+}
+
+fn inferenceProviderEmbedDensePartsContext(
+    handle: *anyopaque,
+    alloc: std.mem.Allocator,
+    model: []const u8,
+    parts: []const template.ContentPart,
+    operation: inference_bridge.ProviderOperation,
+    task_type: ?[]const u8,
+    instruction: ?[]const u8,
+    request_context: ?inference.RequestContext,
 ) ![][]f32 {
     const embedding_wire = @import("antfly_inference_embedding_wire");
     const wire_parts = try alloc.alloc(template.ContentPart, parts.len);
@@ -1074,7 +1086,7 @@ pub fn inferenceProviderEmbedDensePartsBorrowed(
         },
         else => wire_part.* = part,
     };
-    return try invokeInferenceProviderWithBinaryControlled(
+    return try invokeInferenceProviderWithBinaryContext(
         [][]f32,
         alloc,
         handle,
@@ -1086,10 +1098,9 @@ pub fn inferenceProviderEmbedDensePartsBorrowed(
             .task_type = task_type,
             .instruction = instruction,
         },
-        deadline_ns,
+        request_context,
         payload_storage[0..payload_count],
         ref_storage[0..payload_count],
-        cancellation,
     );
 }
 
@@ -1153,7 +1164,7 @@ pub fn inferenceProviderRerankDocumentsWithContext(
             item_index += 1;
         }
     }
-    const result = try invokeInferenceProviderWithBinaryControlled(
+    const result = try invokeInferenceProviderWithBinaryContext(
         []f32,
         alloc,
         handle,
@@ -1164,10 +1175,9 @@ pub fn inferenceProviderRerankDocumentsWithContext(
             .documents = wire_documents,
             .attachment_count = payload_count,
         },
-        context.deadline_ns,
+        context,
         payload_storage[0..payload_count],
         ref_storage[0..payload_count],
-        context.cancellation orelse .none,
     );
     errdefer alloc.free(result);
     try context.check();
@@ -1183,11 +1193,11 @@ pub fn inferenceProviderRerankTextsWithContext(
     context: inference.RequestContext,
 ) anyerror![]f32 {
     try context.check();
-    const result = try invokeInferenceProviderControlled([]f32, alloc, handle, .rerank_texts, .{
+    const result = try invokeInferenceProvider([]f32, alloc, handle, .rerank_texts, .{
         .model = model,
         .query = query,
         .documents = documents,
-    }, context.deadline_ns, context.cancellation orelse .none);
+    }, context);
     errdefer alloc.free(result);
     try context.check();
     return result;
@@ -1464,7 +1474,7 @@ pub fn inferenceProviderChunkInputWithContext(
     context: inference.execution_context.RequestContext,
 ) anyerror![]inference_chunker.Chunk {
     try context.check();
-    const result = try inferenceProviderChunkInputControlled(handle, alloc, model, input, config, context.deadline_ns, context.cancellation orelse .none);
+    const result = try inferenceProviderChunkInputContext(handle, alloc, model, input, config, context);
     errdefer inference_chunker.types.freeChunks(alloc, result);
     try context.check();
     return result;
@@ -1479,20 +1489,31 @@ pub fn inferenceProviderChunkInputControlled(
     deadline_ns: ?u64,
     cancellation: CancellationToken,
 ) anyerror![]inference_chunker.Chunk {
+    return try inferenceProviderChunkInputContext(handle, alloc, model, input, config, requestContextFromControls(deadline_ns, cancellation));
+}
+
+fn inferenceProviderChunkInputContext(
+    handle: *anyopaque,
+    alloc: std.mem.Allocator,
+    model: []const u8,
+    input: inference_chunker.Input,
+    config: chunking_types.Config,
+    request_context: ?inference.RequestContext,
+) anyerror![]inference_chunker.Chunk {
     return switch (input) {
-        .text => try invokeInferenceProviderControlled([]inference_chunker.Chunk, alloc, handle, .chunk_input, .{
+        .text => try invokeInferenceProvider([]inference_chunker.Chunk, alloc, handle, .chunk_input, .{
             .model = model,
             .input = input,
             .config = config,
             .attachment_count = @as(usize, 0),
-        }, deadline_ns, cancellation),
+        }, request_context),
         .binary => |binary| blk: {
             const payloads = [_]inference_bridge.ProviderBinaryPayload{.{
                 .bytes = inference_bridge.String.init(binary.data),
                 .content_type = inference_bridge.String.init(binary.mime_type),
             }};
             const refs = [_]inference_bridge.ProviderAttachmentRef{.{ .attachment_index = 0, .item_index = 0 }};
-            break :blk try invokeInferenceProviderWithBinaryControlled(
+            break :blk try invokeInferenceProviderWithBinaryContext(
                 []inference_chunker.Chunk,
                 alloc,
                 handle,
@@ -1503,10 +1524,9 @@ pub fn inferenceProviderChunkInputControlled(
                     .config = config,
                     .attachment_count = @as(usize, 1),
                 },
-                deadline_ns,
+                request_context,
                 &payloads,
                 &refs,
-                cancellation,
             );
         },
     };
@@ -1793,7 +1813,7 @@ pub fn inferenceProviderEmbedDenseRasters(
     if (rasters.len == 0) return try alloc.alloc([]f32, 0);
     var borrowed = try rasterProviderPayloadsAlloc(alloc, rasters);
     defer borrowed.deinit(alloc);
-    const vectors = try invokeInferenceProviderWithBinaryControlled(
+    const vectors = try invokeInferenceProviderWithBinaryContext(
         [][]f32,
         alloc,
         handle,
@@ -1803,10 +1823,9 @@ pub fn inferenceProviderEmbedDenseRasters(
             .raster_count = rasters.len,
             .rasters = borrowed.metadata,
         },
-        context.request.deadline_ns,
+        context.request,
         borrowed.payloads,
         borrowed.refs,
-        context.request.cancellation orelse .none,
     );
     errdefer {
         for (vectors) |vector| alloc.free(vector);
