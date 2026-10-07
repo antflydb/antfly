@@ -106,7 +106,80 @@ pub const Input = union(enum) {
     datum: scalar.Datum,
     text: []const u8,
     binary: []const u8,
+    /// Lossless public array envelope, admitted only with a declared array
+    /// descriptor. Plain JSON arrays never acquire SQL-array semantics.
+    array_envelope: std.json.Value,
 };
+
+test "SQL statement frames compose independent programs without constraining unused slots" {
+    const a = std.testing.allocator;
+    var left_sql = try @import("compiler.zig").compileScalar(a, "$1::integer", .{});
+    defer left_sql.deinit();
+    var left = try scalar.bindTyped(a, left_sql.expression, &.{}, &.{}, .{});
+    defer left.deinit();
+    var right_sql = try @import("compiler.zig").compileScalar(a, "cardinality($2::bigint[])", .{});
+    defer right_sql.deinit();
+    var right = try scalar.bindTyped(a, right_sql.expression, &.{}, &.{}, .{});
+    defer right.deinit();
+    var constant_sql = try @import("compiler.zig").compileScalar(a, "1", .{});
+    defer constant_sql.deinit();
+    var constant = try scalar.bindTyped(a, constant_sql.expression, &.{}, &.{}, .{});
+    defer constant.deinit();
+    var frame = try Frame.prepareJson(a, &.{ .{ .kind = .integer, .element_type = .int32 }, .{ .kind = .array, .element_type = .int64 } }, &.{ .{ .string = "42" }, .{ .string = "[-1:1]={9007199254740993,NULL,2}" } }, .{});
+    defer frame.deinit();
+    const bound_left = try left.bindParameters(&frame);
+    const bound_right = try right.bindParameters(&frame);
+    const bound_constant = try constant.bindParameters(&frame);
+    var none: std.heap.FixedBufferAllocator = .init(&.{});
+    for (0..10000) |_| {
+        try std.testing.expectEqual(@as(i64, 42), (try bound_left.evaluate(none.allocator(), &.{}, .{})).value.integer);
+        try std.testing.expectEqual(@as(i64, 3), (try bound_right.evaluate(none.allocator(), &.{}, .{})).value.integer);
+        try std.testing.expectEqual(@as(i64, 1), (try bound_constant.evaluate(none.allocator(), &.{}, .{})).value.integer);
+    }
+    var wrong = try Frame.prepareJson(a, &.{ .{ .kind = .integer, .element_type = .int64 }, .{ .kind = .array, .element_type = .int32 } }, &.{ .{ .string = "42" }, .{ .string = "{1,2}" } }, .{});
+    defer wrong.deinit();
+    try std.testing.expectError(error.ConflictingSqlParameterTypes, left.bindParameters(&wrong));
+    try std.testing.expectError(error.ConflictingSqlParameterTypes, right.bindParameters(&wrong));
+}
+
+test "SQL JSON parameter ingress owns typed envelopes and shares wire and work admission" {
+    const a = std.testing.allocator;
+    const descriptor = scalar.Type{ .kind = .array, .element_type = .jsonb };
+    var source = try text.decode(a, .jsonb, "[0:2]={\"null\",NULL,\"{\\\"x\\\":[1,2]}\"}", .{});
+    defer source.deinit();
+    var input_owner: std.heap.ArenaAllocator = .init(a);
+    const envelope = try @import("array_wire.zig").toJsonLeaky(input_owner.allocator(), source.value, .{});
+    const encoded = try std.json.Stringify.valueAlloc(a, envelope, .{});
+    defer a.free(encoded);
+    var frame = try Frame.prepareJson(a, &.{descriptor}, &.{envelope}, .{ .wire_bytes = encoded.len });
+    defer frame.deinit();
+    input_owner.deinit();
+    const value = frame.values[0].array.?;
+    try std.testing.expectEqual(@as(i32, 0), value.dimensions[0].lower);
+    try std.testing.expect(!value.elements[0].sql_null and value.elements[0].value == .null);
+    try std.testing.expect(value.elements[1].sql_null);
+    try std.testing.expectEqualStrings("2", value.elements[2].value.object.get("x").?.array.items[1].number_string);
+    const Faults = struct {
+        fn run(backing: A, input: std.json.Value) !void {
+            var owner = try Frame.prepareJson(backing, &.{descriptor}, &.{input}, .{});
+            defer owner.deinit();
+        }
+    };
+    var retained: std.heap.ArenaAllocator = .init(a);
+    defer retained.deinit();
+    const input = try @import("array_wire.zig").toJsonLeaky(retained.allocator(), source.value, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Faults.run, .{input});
+    try std.testing.expectError(error.SqlProgramLimitExceeded, Frame.prepareJson(a, &.{ descriptor, descriptor }, &.{ input, input }, .{ .wire_bytes = encoded.len * 2 - 1 }));
+    const measured = try @import("array_wire.zig").decodeLeakyMeasured(retained.allocator(), .jsonb, input, .{});
+    try std.testing.expectError(error.SqlProgramLimitExceeded, Frame.prepareJson(a, &.{ descriptor, descriptor }, &.{ input, input }, .{ .work = measured.work * 2 + 1 }));
+    var json = try Frame.prepareJson(a, &.{.{ .kind = .json }}, &.{.{ .string = "null" }}, .{});
+    defer json.deinit();
+    try std.testing.expectEqualStrings("null", json.values[0].value.string);
+    var empty_json_array = std.json.Array.init(a);
+    defer empty_json_array.deinit();
+    try std.testing.expectError(error.SqlTypeMismatch, Frame.prepareJson(a, &.{descriptor}, &.{.{ .array = empty_json_array }}, .{}));
+    try std.testing.expectError(error.SqlTypeMismatch, Frame.prepareJson(a, &.{.{ .kind = .string }}, &.{.{ .number_string = "123" }}, .{}));
+}
 
 fn referenceType(name: []const u8) !scalar.Type {
     const array = std.mem.endsWith(u8, name, "[]");
@@ -290,6 +363,25 @@ pub const Frame = struct {
     values: []const scalar.Datum,
     work: usize,
 
+    /// JSON API ingress is type-directed, not shape-inferred. Exact scalar
+    /// text is decoded once; JSON strings remain JSON data for JSON columns.
+    /// Outer null follows the existing API's SQL NULL parameter convention.
+    pub fn prepareJson(backing: A, descriptors: []const scalar.Type, values: []const std.json.Value, limits: Limits) !Frame {
+        if (descriptors.len != values.len or values.len > 1024) return error.InvalidSqlParameters;
+        var inputs: [1024]Input = undefined;
+        for (descriptors, values, inputs[0..values.len]) |descriptor, value, *input| {
+            input.* = if (value == .null) .sql_null else if (descriptor.kind == .array) switch (value) {
+                .string => |bytes| .{ .text = bytes },
+                .object => .{ .array_envelope = value },
+                else => return error.SqlTypeMismatch,
+            } else if (descriptor.kind != .json and (value == .string or (value == .number_string and (descriptor.kind == .integer or descriptor.kind == .number))))
+                .{ .text = if (value == .string) value.string else value.number_string }
+            else
+                .{ .datum = scalar.Datum.json(value) };
+        }
+        return prepare(backing, descriptors, inputs[0..values.len], limits);
+    }
+
     pub fn deinit(self: *Frame) void {
         const backing = self.budget.backing;
         self.arena.deinit();
@@ -335,12 +427,12 @@ fn prepareLeaky(a: A, descriptors: []const scalar.Type, inputs: []const Input, l
     };
     const values = try a.alloc(scalar.Datum, inputs.len);
     for (types, inputs, values) |descriptor, input, *value| {
-        value.* = try decodeInput(a, descriptor, input, limits, &work);
+        value.* = try decodeInput(a, descriptor, input, limits, &work, &wire_bytes);
     }
     return .{ .descriptors = types, .values = values, .work = limits.work - work.remaining };
 }
 
-fn decodeInput(a: A, descriptor: scalar.Type, input: Input, limits: Limits, work: *arrays.Budget) !scalar.Datum {
+fn decodeInput(a: A, descriptor: scalar.Type, input: Input, limits: Limits, work: *arrays.Budget, wire_bytes: *usize) !scalar.Datum {
     if (input == .datum and input.datum.patterns != null) return error.SqlTypeMismatch;
     if (input == .sql_null or (input == .datum and input.datum.sql_null)) {
         if (!descriptor.nullable) return error.InvalidSqlParameters;
@@ -348,6 +440,7 @@ fn decodeInput(a: A, descriptor: scalar.Type, input: Input, limits: Limits, work
         return .{};
     }
     if (descriptor.kind == .datetime) {
+        if (input == .array_envelope) return error.SqlTypeMismatch;
         if (input == .binary) return error.UnsupportedSqlShape;
         const raw = if (input == .text) input.text else if (input.datum.array == null and input.datum.value == .string) input.datum.value.string else return error.SqlTypeMismatch;
         if (!std.unicode.utf8ValidateSlice(raw) or std.mem.indexOfScalar(u8, raw, 0) != null) return error.SqlInvalidTextEncoding;
@@ -372,9 +465,14 @@ fn decodeInput(a: A, descriptor: scalar.Type, input: Input, limits: Limits, work
             const decoded = try text.decodeLeaky(a, kind, input.text, .{ .values = value_limits, .wire_bytes = limits.wire_bytes });
             try work.consume(decoded.work);
             value.* = decoded.value;
-        } else {
+        } else if (input == .binary) {
             const decoded = try binary.decodeLeaky(a, kind, input.binary, .{ .values = value_limits, .wire_bytes = limits.wire_bytes });
             try work.consume(decoded.work);
+            value.* = decoded.value;
+        } else {
+            const decoded = try @import("array_wire.zig").decodeLeakyMeasured(a, kind, input.array_envelope, .{ .values = value_limits, .wire_bytes = limits.wire_bytes - wire_bytes.* });
+            try work.consume(decoded.work);
+            wire_bytes.* += decoded.wire_bytes;
             value.* = decoded.value;
         }
         return scalar.Datum.typedArray(value);
@@ -398,6 +496,7 @@ fn decodeInput(a: A, descriptor: scalar.Type, input: Input, limits: Limits, work
             return operators.cloneDatum(a, owned);
         },
         .sql_null => unreachable,
+        .array_envelope => return error.SqlTypeMismatch,
     };
     _ = try arrays.Value.initWithBudget(kind, &.{.{ .length = 1 }}, &.{value}, .{ .bytes = limits.bytes }, work);
     return value;

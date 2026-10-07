@@ -25,6 +25,7 @@ const MemoryBudget = @import("memory_budget.zig");
 const A = std.mem.Allocator;
 const Json = std.json.Value;
 pub const Options = struct { values: arrays.Limits = .{}, wire_bytes: usize = 8 * 1024 * 1024 };
+pub const Decoded = struct { value: arrays.Value, work: usize, wire_bytes: usize };
 
 const View = struct {
     value: arrays.Value,
@@ -167,6 +168,11 @@ fn dimensionInteger(raw: Json) !i64 {
 /// An allocation-free validation pass rejects malformed envelopes before any
 /// cell/payload storage is retained. Every retained payload is then cloned.
 pub fn decodeLeaky(a: A, kind: arrays.ElementType, input: Json, options: Options) !arrays.Value {
+    return (try decodeLeakyMeasured(a, kind, input, options)).value;
+}
+
+/// Reports validation and materialization work for a shared invocation budget.
+pub fn decodeLeakyMeasured(a: A, kind: arrays.ElementType, input: Json, options: Options) !Decoded {
     return decodeCells(true, a, kind, input, options);
 }
 
@@ -183,10 +189,10 @@ pub const Borrowed = struct {
 };
 
 pub fn decodeBorrowed(a: A, kind: arrays.ElementType, input: Json, options: Options) !Borrowed {
-    return .{ .value = try decodeCells(false, a, kind, input, options), .allocator = a };
+    return .{ .value = (try decodeCells(false, a, kind, input, options)).value, .allocator = a };
 }
 
-fn decodeCells(comptime own_payloads: bool, a: A, kind: arrays.ElementType, input: Json, options: Options) !arrays.Value {
+fn decodeCells(comptime own_payloads: bool, a: A, kind: arrays.ElementType, input: Json, options: Options) !Decoded {
     if (input != .object or input.object.count() != 3) return error.InvalidSqlArrayShape;
     const axes = try arrayField(input.object, "dimensions");
     const values = try arrayField(input.object, "values");
@@ -226,6 +232,7 @@ fn decodeCells(comptime own_payloads: bool, a: A, kind: arrays.ElementType, inpu
     var wire_size: std.Io.Writer.Discarding = .init(&.{});
     try std.json.Stringify.value(input, .{}, &wire_size.writer);
     if (wire_size.count > options.wire_bytes or wire_size.count > work.remaining / 2) return error.SqlProgramLimitExceeded;
+    try work.consume(@as(usize, @intCast(wire_size.count)) * 2);
     const cells = try a.alloc(arrays.Element, values.len);
     errdefer if (!own_payloads) a.free(cells);
     for (values, nulls, cells) |raw, flag, *cell| {
@@ -233,7 +240,7 @@ fn decodeCells(comptime own_payloads: bool, a: A, kind: arrays.ElementType, inpu
         cell.* = if (own_payloads) try operators.cloneDatum(a, decoded) else decoded;
     }
     const owned_dimensions = try a.dupe(arrays.Dimension, dimensions[0..axes.len]);
-    return .{ .element_type = kind, .dimensions = owned_dimensions, .elements = cells };
+    return .{ .value = .{ .element_type = kind, .dimensions = owned_dimensions, .elements = cells }, .work = options.values.work - work.remaining, .wire_bytes = @intCast(wire_size.count) };
 }
 
 /// Stable quota owner, including arena capacity and failure cleanup.

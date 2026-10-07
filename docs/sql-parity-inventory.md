@@ -178,11 +178,22 @@ retains a 976-byte frame (about 5 ms locally, not a production latency claim).
 Program, codec-owner and frame arenas have stable addresses; managed JSON array
 allocator references are rehomed before temporary quota wrappers expire.
 
-Statement-wide binding, public SDK/envelope descriptors and pgwire still need
-to adopt the precise frame contract; JSON compatibility ingress remains guarded
-against array parameters. Native datetime text inputs normalize to UTC, while
+Independent scalar programs can now borrow one statement frame without
+constraining unused parameter slots. Used slots still require exact descriptor
+identity, validated once at setup. Type-directed JSON frame preparation accepts
+declared array text or lossless envelopes, owns retained payloads, and shares
+wire/work admission across all inputs. Plain JSON arrays are not SQL arrays;
+JSON strings remain logical strings for JSON descriptors. Allocation-fault,
+input-owner retirement and combined-envelope quota regressions cover this
+preparation layer; a 10,000-iteration composed-program test uses zero scratch
+allocation. This does not yet activate public array parameter execution.
+
+Statement-wide runtime binding and public/pgwire parameter ingress still need
+to adopt the precise frame contract. Native datetime text inputs normalize to UTC, while
 datetime binary parameters remain guarded until their codec is bound.
-Array-valued public outputs, public array parameters, catalog storage and overloads converting
+Public array results now retain element identity, bounds and SQL NULL flags
+through generated HTTP descriptors and PostgreSQL text/binary result delivery.
+Public array parameters, catalog storage and overloads converting
 whole arrays to text/JSON remain explicit activation gaps. Default decimal
 constructors still need an exact NUMERIC array representation; direct narrowing
 or text casts of these constructors remain guarded (explicit real/double casts
@@ -572,8 +583,9 @@ input collection currently runs serially, without a false partial-merge claim.
 
 Array fractions share that same rank-event pass and retain dimensions, bounds,
 element types and SQL NULLs for internal SQL expressions. Requests additionally
-obey statement array/memory admission. Public typed-array result delivery is
-still unfinished and is rejected rather than approximated with JSON arrays.
+obey statement array/memory admission. Public typed-array result delivery now
+uses lossless HTTP envelopes and exact PostgreSQL array OIDs/codecs, rather
+than approximating SQL arrays with ordinary JSON arrays.
 Backends without an Io execute within the in-memory budget and reject spill
 admission before filesystem access. Forced-spill grouped tests verify one
 512-value domain, not three duplicate streams, across 128 interleaved groups;
@@ -585,7 +597,8 @@ Six unchanged originals (`sql-0560`, `sql-0562`–`sql-0566`) now pass the mount
 HTTP/native-storage gate and the reproducible PostgreSQL golden gate, including
 labels, type OIDs, complete values, ordering and SQL NULL flags. The required-ID
 guard prevents regeneration from silently removing them. The array-result
-original `sql-0561` remains unresolved pending the public typed-array contract.
+original `sql-0561` remains unresolved pending exact original-case reconciliation;
+the new public typed-array contract alone does not grant disposition credit.
 
 ```sh
 uv run --no-project --with 'psycopg[binary]==3.3.6' python scripts/generate_sql_postgres_reference.py mutation --check zig/pkg/antfly-embedded/src/sql/fixtures/sql_mutation_postgres_reference.json

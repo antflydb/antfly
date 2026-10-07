@@ -164,8 +164,17 @@ pub const Program = struct {
     /// Bind once per program/execution, not per row. Multiple programs from a
     /// statement share one frame after exact descriptor compatibility checks.
     pub fn bindParameters(self: *const Program, frame: *const @import("parameter_frame.zig").Frame) !PreparedEvaluation {
-        if (frame.descriptors.len != self.parameter_descriptors.len) return error.InvalidSqlParameters;
-        for (frame.descriptors, self.parameter_descriptors) |actual, expected| {
+        if (frame.descriptors.len != frame.values.len or frame.descriptors.len < self.parameter_descriptors.len) return error.InvalidSqlParameters;
+        // A statement frame is shared by independently bound programs. Only
+        // parameter instructions constrain this program: unused/defaulted
+        // descriptor slots must not reject a different program's array type.
+        // This validation is execution setup, never row-loop work.
+        for (self.instructions) |instruction| {
+            if (instruction.operation != .parameter) continue;
+            const ordinal = instruction.operation.parameter;
+            if (ordinal >= self.parameter_descriptors.len) return error.InvalidSqlParameters;
+            const actual = frame.descriptors[ordinal];
+            const expected = self.parameter_descriptors[ordinal];
             if (actual.kind != expected.kind or actual.element_type != expected.element_type or actual.nullable != expected.nullable) return error.ConflictingSqlParameterTypes;
         }
         return .{ .program = self, .parameters = frame.values };
