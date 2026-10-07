@@ -296,6 +296,7 @@ pub const Context = struct {
     }
 
     const BoundPredicates = struct {
+        complete: bool = true,
         terms: std.ArrayList(catalog.Condition) = .empty,
         primary_key: ?[]const u8 = null,
         empty: bool = false,
@@ -315,7 +316,10 @@ pub const Context = struct {
                 // Row identity has a separate native key boundary; never
                 // pretend it is a document property in a storage predicate.
                 const bound_value = try self.value(comparison.value, column);
-                if (column.type == .json) return;
+                if (column.type == .json) {
+                    output.complete = false;
+                    return;
+                }
                 // A JSON-null value is not SQL NULL. The current native
                 // condition envelope cannot express that operand, so retain
                 // this comparison in the already bound typed residual.
@@ -328,7 +332,10 @@ pub const Context = struct {
                     return;
                 }
                 if (std.mem.eql(u8, column.name, "_id")) {
-                    if (comparison.op != .eq) return; // Evaluated by the bound residual.
+                    if (comparison.op != .eq) {
+                        output.complete = false;
+                        return;
+                    }
                     if (bound_value.string.len == 0) {
                         output.empty = true;
                     } else {
@@ -349,7 +356,10 @@ pub const Context = struct {
             },
             .is_null => |test_null| {
                 const column = try table_def.column(test_null.field);
-                if (column.type == .json) return;
+                if (column.type == .json) {
+                    output.complete = false;
+                    return;
+                }
                 if (std.mem.eql(u8, column.name, "_id")) {
                     if (!test_null.negated) output.empty = true;
                     return;
@@ -362,7 +372,7 @@ pub const Context = struct {
             },
             // Push down only safe conjuncts. The complete bound residual is
             // evaluated before OFFSET/LIMIT/counting or mutation staging.
-            .disjunction, .negation, .scalar => {},
+            .disjunction, .negation, .scalar => output.complete = false,
         }
         if (output.terms.items.len > 256) return error.SqlProgramLimitExceeded;
     }
@@ -422,7 +432,7 @@ pub const Context = struct {
         var scan_state: ScanState = .{};
         defer scan_state.deinit();
         const requested_order = if (!self.binding.primary_order and !statement.count_all) try @import("describe.zig").scanOrder(self.arena, self.binding, statement) else &.{};
-        const scan_request: catalog.Scan = .{ .fields = native_fields.items, .primary_order = self.binding.primary_order, .order = requested_order, .primary_key = predicates.primary_key, .conditions = predicates.terms.items, .limit = @intCast(self.limits.page_rows) };
+        const scan_request: catalog.Scan = .{ .row_goal = if (statement.limit != null and predicates.complete and !statement.count_all) offset +| limit else null, .fields = native_fields.items, .primary_order = self.binding.primary_order, .order = requested_order, .primary_key = predicates.primary_key, .conditions = predicates.terms.items, .limit = @intCast(self.limits.page_rows) };
         var ordered_source = false;
         if (self.backend.vtable.supports_scan_order and requested_order.len != 0 and limit != 0 and !predicates.empty) {
             try scan_state.open(self, table_def, scan_request);
@@ -1326,6 +1336,7 @@ const TestBackend = struct {
     ambiguous: bool = false,
     outcome: catalog.MutationOutcome = .committed,
     point_reads: usize = 0,
+    row_goal: ?u64 = null,
     primary_order: bool = false,
     statement_opens: usize = 0,
     statement_closes: usize = 0,
@@ -1393,6 +1404,7 @@ const TestBackend = struct {
         try std.testing.expectEqual(@as(u32, 7), table_def.schema_version);
         self.pages += 1;
         self.primary_order = request.primary_order;
+        self.row_goal = request.row_goal;
         const from = if (request.primary_key orelse request.after) |key| try std.fmt.parseInt(usize, key, 10) else 0;
         if (request.primary_key != null) self.point_reads += 1;
         const count_rows = @min(if (request.primary_key != null) @as(u32, 1) else request.limit, self.row_count -| from);
@@ -3401,4 +3413,23 @@ test "SQL native aggregate materialization retains projection and fails closed a
     try std.testing.expectEqual(@as(usize, 3), driver.opened);
     try std.testing.expectEqual(driver.opened, driver.closed);
     try std.testing.expectEqual(@as(usize, 2), driver.base.pages);
+}
+
+test "SQL filtered LIMIT hints require a complete bound predicate and remain advisory" {
+    const cases = [_]struct { sql: []const u8, goal: ?u64 }{
+        .{ .sql = "SELECT id FROM things WHERE id >= 9007199254740993 LIMIT 2 OFFSET 1", .goal = 3 },
+        .{ .sql = "SELECT id FROM things WHERE id >= 9007199254740993 AND id < 9007199254740994 LIMIT 2 OFFSET 1", .goal = 3 },
+        .{ .sql = "SELECT id FROM things WHERE id = 9007199254740993 OR id = 0 LIMIT 2 OFFSET 1", .goal = null },
+        .{ .sql = "SELECT id FROM things WHERE _id LIKE '%' LIMIT 2 OFFSET 1", .goal = null },
+        .{ .sql = "SELECT id FROM things WHERE id + 1 > 0 LIMIT 2 OFFSET 1", .goal = null },
+    };
+    for (cases) |case| {
+        var backend: TestBackend = .{ .row_count = 19 };
+        var compiled = try compiler.compile(std.testing.allocator, case.sql, .{});
+        defer compiled.deinit();
+        var result = try execute(std.testing.allocator, backend.iface(), &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 2), result.output.rows.len);
+        try std.testing.expectEqual(case.goal, backend.row_goal);
+    }
 }

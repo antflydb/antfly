@@ -1,5 +1,18 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 //! Native metadata authority for immutable external-lake index generations.
 //! Builder leases and published coverage are pinned with the table definition.
 const std = @import("std");
@@ -13,7 +26,7 @@ pub const Digest = [32]u8;
 pub const Token = [16]u8;
 pub const DirectoryRef = struct { artifact_id: []const u8, checksum: []const u8, byte_len: u64, count: u32 };
 pub const max_directory_artifacts: usize = 4096;
-pub const native_reader_protocol: u16 = 29;
+pub const native_reader_protocol: u16 = 30;
 pub const max_contributions: usize = 1024 * 1024;
 pub const max_directory_bytes: usize = 16 * 1024 * 1024;
 /// Physical namespace plus a named connection for current credential lookup.
@@ -51,7 +64,7 @@ pub const Attempt = struct {
     started_at_ms: u64,
     lease_expires_at_ms: u64,
     fn validate(self: Attempt) !void {
-        if (self.reader_protocol != 0 and self.reader_protocol != 24 and self.reader_protocol != 25 and self.reader_protocol != 26 and self.reader_protocol != 27 and self.reader_protocol != 28 and self.reader_protocol != native_reader_protocol) return error.InvalidLakeIndexCatalog;
+        if (self.reader_protocol != 0 and self.reader_protocol != 24 and self.reader_protocol != 25 and self.reader_protocol != 26 and self.reader_protocol != 27 and self.reader_protocol != 28 and self.reader_protocol != 29 and self.reader_protocol != native_reader_protocol) return error.InvalidLakeIndexCatalog;
         if (self.store_locator) |locator| try locator.validate();
         try self.signature.validate();
         if (self.generation == 0 or std.mem.allEqual(u8, &self.token, 0) or self.lease_expires_at_ms <= self.started_at_ms) return error.InvalidLakeIndexCatalog;
@@ -96,7 +109,7 @@ pub const Publication = struct {
         }
     }
     pub fn validate(self: Publication) !void {
-        if (self.reader_protocol != 0 and self.reader_protocol != 24 and self.reader_protocol != 25 and self.reader_protocol != 26 and self.reader_protocol != 27 and self.reader_protocol != 28 and self.reader_protocol != native_reader_protocol) return error.InvalidLakeIndexCatalog;
+        if (self.reader_protocol != 0 and self.reader_protocol != 24 and self.reader_protocol != 25 and self.reader_protocol != 26 and self.reader_protocol != 27 and self.reader_protocol != 28 and self.reader_protocol != 29 and self.reader_protocol != native_reader_protocol) return error.InvalidLakeIndexCatalog;
         if (self.store_locator) |locator| try locator.validate();
         if (self.namespace) |namespace| if (std.mem.allEqual(u8, &namespace, 0)) return error.InvalidLakeIndexCatalog;
         if (self.generation == 0 or std.mem.allEqual(u8, &self.token, 0) or self.declarations.len > (if (self.directory != null) max_directory_artifacts else max_artifacts)) return error.InvalidLakeIndexCatalog;

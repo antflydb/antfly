@@ -567,6 +567,31 @@ pub const ColumnarBlock = struct {
         if (row >= self.count() or column >= self.values.len) return error.InvalidSqlSpill;
         return self.values[column].cell(row);
     }
+    /// Dictionary identities are local to this immutable block, including two
+    /// distinct identities for SQL NULL and JSON null.
+    pub fn dictionaryIdentity(self: ColumnarBlock, row: usize, column: usize, keys: bool) !?u64 {
+        const columns = if (keys) self.keys else self.values;
+        if (row >= self.count() or column >= columns.len) return error.InvalidSqlSpill;
+        const stored = columns[column];
+        if (stored.values != .dictionary) return null;
+        const flag = (stored.flags[row / 4] >> @as(u3, @intCast(row % 4 * 2))) & 3;
+        return if (flag != 0) flag - 1 else @as(u64, stored.values.dictionary.indices[row]) + 2;
+    }
+    pub fn dictionaryColumn(self: ColumnarBlock, a: Allocator, column: usize, keys: bool) !?@import("execution_batch.zig").Batch {
+        const columns = if (keys) self.keys else self.values;
+        if (column >= columns.len) return error.InvalidSqlSpill;
+        const stored = columns[column];
+        if (stored.values != .dictionary) return null;
+        const entries = stored.values.dictionary;
+        const values = try a.alloc(Datum, entries.size + 2);
+        errdefer a.free(values);
+        values[0] = .{};
+        values[1] = Datum.json(.null);
+        for (values[2..], 0..) |*value, index| value.* = Datum.json(entries.entry(index));
+        const indices = try a.alloc(u32, self.count());
+        for (indices, 0..) |*id, row| id.* = @intCast((try self.dictionaryIdentity(row, column, keys)).?);
+        return .{ .dictionary = .{ .values = values, .indices = indices } };
+    }
     pub fn keyCell(self: ColumnarBlock, row: usize, column: usize) !Datum {
         if (row >= self.count() or column >= self.keys.len) return error.InvalidSqlSpill;
         return self.keys[column].cell(row);
@@ -902,6 +927,14 @@ pub const Sequential = struct {
             self.offset = block.following;
             return block;
         }
+        /// Compact physical blocks; no intermediate Datum row matrix. Boundaries
+        /// supplied by replayBoundary() are always physical record boundaries.
+        pub fn nextOwned(self: *Reader) !?*OwnedBlock {
+            if (self.offset == self.end) return null;
+            const block = try self.run.readOwnedBlock(self.offset);
+            self.offset += block.count();
+            return block;
+        }
         pub fn deinit(self: *Reader) void {
             self.run.file.manager.allocator().free(self.run.file.read_buffer);
             self.run.read_arena.deinit();
@@ -1161,31 +1194,143 @@ pub const Sequential = struct {
                 fn identity(raw: *anyopaque, row_index: usize, column: usize) anyerror!?u64 {
                     const view: *@This() = @ptrCast(@alignCast(raw));
                     const encoded = view.block.encoded orelse return null;
-                    const stored = (if (view.keys) encoded.keys else encoded.values)[column];
-                    if (stored.values != .dictionary) return null;
-                    const flag = (stored.flags[row_index / 4] >> @as(u3, @intCast(row_index % 4 * 2))) & 3;
-                    return if (flag != 0) flag - 1 else @as(u64, stored.values.dictionary.indices[row_index]) + 2;
+                    return encoded.dictionaryIdentity(row_index, column, view.keys);
                 }
                 fn dictionary(raw: *anyopaque, alloc: Allocator, column: usize) anyerror!?@import("execution_batch.zig").Batch {
                     const view: *@This() = @ptrCast(@alignCast(raw));
                     const encoded = view.block.encoded orelse return null;
-                    const stored = (if (view.keys) encoded.keys else encoded.values)[column];
-                    if (stored.values != .dictionary) return null;
-                    const entries = stored.values.dictionary;
-                    const values = try alloc.alloc(Datum, entries.size + 2);
-                    errdefer alloc.free(values);
-                    values[0] = .{};
-                    values[1] = Datum.json(.null);
-                    for (values[2..], 0..) |*value, index| value.* = Datum.json(entries.entry(index));
-                    const indices = try alloc.alloc(u32, view.block.count());
-                    for (indices, 0..) |*id, row_index| id.* = @intCast((try identity(raw, row_index, column)).?);
-                    return .{ .dictionary = .{ .values = values, .indices = indices } };
+                    return encoded.dictionaryColumn(alloc, column, view.keys);
                 }
             };
             const view = try a.create(View);
             view.* = .{ .block = self, .keys = keys };
             return .{ .reader = .{ .ptr = view, .read = View.cell, .read_identity = View.identity, .read_dictionary = View.dictionary, .count = self.count(), .width = if (keys) self.keyWidth() else self.width() } };
         }
+        /// Export a typed column directly from validated spill buffers. Strings
+        /// and string dictionaries borrow the block; numeric wire values are
+        /// decoded once without constructing Datum dictionaries or row matrices.
+        /// Descriptor arrays belong to a; payloads expire with this block.
+        pub fn columnVector(self: *const OwnedBlock, a: Allocator, column: usize, kind: @import("../storage/rowsource/types.zig").ColumnKind) !@import("../storage/rowsource/types.zig").ColumnVector {
+            const types = @import("../storage/rowsource/types.zig");
+            if (column >= self.width()) return error.InvalidSqlSpill;
+            const count_rows = self.count();
+            const nulls = try a.alloc(u8, count_rows);
+            errdefer a.free(nulls);
+            const encoded = if (self.encoded) |block| block.values[column] else null;
+            for (nulls, 0..) |*flag, row_index| {
+                if (encoded) |stored| {
+                    if (stored.values != .dynamic) {
+                        const null_tag = (stored.flags[row_index / 4] >> @as(u3, @intCast(row_index % 4 * 2))) & 3;
+                        // A native typed source has a separate SQL NULL bitmap;
+                        // an untyped JSON-null lane cannot become a numeric value.
+                        if (null_tag > 1) return error.InvalidSqlSpill;
+                        flag.* = @intFromBool(null_tag == 1);
+                        continue;
+                    }
+                }
+                flag.* = @intFromBool((try self.cell(row_index, column)).sql_null);
+            }
+            const expected: u8 = switch (kind) {
+                .bool => 1,
+                .i64 => 2,
+                .f64 => 3,
+                .bytes, .json => 5,
+                else => return error.InvalidSqlSpill,
+            };
+            if (encoded) |stored| {
+                if (stored.values == .dictionary and kind != .json and kind != .bool) {
+                    const dictionary = stored.values.dictionary;
+                    if (dictionary.kind != expected) return error.InvalidSqlSpill;
+                    const ids = try a.alloc(u32, count_rows);
+                    errdefer a.free(ids);
+                    for (ids, dictionary.indices) |*id, value| id.* = value;
+                    const values: types.ColumnValues = switch (kind) {
+                        .i64 => blk: {
+                            const entries = try a.alloc(i64, dictionary.size);
+                            for (entries, 0..) |*entry, i| entry.* = std.mem.readInt(i64, dictionary.bytes[i * 8 ..][0..8], .little);
+                            break :blk .{ .dictionary_i64 = .{ .values = entries, .indices = ids } };
+                        },
+                        .f64 => blk: {
+                            const entries = try a.alloc(f64, dictionary.size);
+                            for (entries, 0..) |*entry, i| entry.* = @bitCast(std.mem.readInt(u64, dictionary.bytes[i * 8 ..][0..8], .little));
+                            break :blk .{ .dictionary_f64 = .{ .values = entries, .indices = ids } };
+                        },
+                        .bytes => .{ .dictionary_bytes = .{ .values = dictionary.texts, .indices = ids } },
+                        else => unreachable,
+                    };
+                    return .{ .name = "", .values = values, .nulls = .{ .bytes = nulls } };
+                }
+                if (stored.values == .texts and !stored.values.texts.decimal and (kind == .bytes or kind == .json)) {
+                    return .{ .name = "", .values = if (kind == .json) .{ .json = stored.values.texts.values } else .{ .bytes = stored.values.texts.values }, .nulls = .{ .bytes = nulls } };
+                }
+                if (stored.values == .fixed) {
+                    const fixed = stored.values.fixed;
+                    if (fixed.kind != expected) return error.InvalidSqlSpill;
+                    const values: types.ColumnValues = switch (kind) {
+                        .i64 => blk: {
+                            const entries = try a.alloc(i64, count_rows);
+                            for (entries, nulls, fixed.positions) |*entry, flag, position| entry.* = if (flag != 0) 0 else std.mem.readInt(i64, fixed.bytes[@as(usize, position) * 8 ..][0..8], .little);
+                            break :blk .{ .i64 = entries };
+                        },
+                        .f64 => blk: {
+                            const entries = try a.alloc(f64, count_rows);
+                            for (entries, nulls, fixed.positions) |*entry, flag, position| entry.* = if (flag != 0) 0 else @bitCast(std.mem.readInt(u64, fixed.bytes[@as(usize, position) * 8 ..][0..8], .little));
+                            break :blk .{ .f64 = entries };
+                        },
+                        .bool => blk: {
+                            const entries = try a.alloc(bool, count_rows);
+                            for (entries, nulls, fixed.positions) |*entry, flag, position| entry.* = flag == 0 and fixed.bytes[position] == 1;
+                            break :blk .{ .bool = entries };
+                        },
+                        else => return error.InvalidSqlSpill,
+                    };
+                    return .{ .name = "", .values = values, .nulls = .{ .bytes = nulls } };
+                }
+            }
+            // Legacy scalar records, all-NULL columns and boolean dictionaries
+            // keep the same typed contract without exposing heterogeneous cells.
+            const values: types.ColumnValues = switch (kind) {
+                .i64 => blk: {
+                    const entries = try a.alloc(i64, count_rows);
+                    errdefer a.free(entries);
+                    for (entries, nulls, 0..) |*entry, flag, i| {
+                        const value = (try self.cell(i, column)).value;
+                        entry.* = if (flag != 0) 0 else if (value == .integer) value.integer else return error.InvalidSqlSpill;
+                    }
+                    break :blk .{ .i64 = entries };
+                },
+                .f64 => blk: {
+                    const entries = try a.alloc(f64, count_rows);
+                    errdefer a.free(entries);
+                    for (entries, nulls, 0..) |*entry, flag, i| {
+                        const value = (try self.cell(i, column)).value;
+                        entry.* = if (flag != 0) 0 else if (value == .float) value.float else return error.InvalidSqlSpill;
+                    }
+                    break :blk .{ .f64 = entries };
+                },
+                .bool => blk: {
+                    const entries = try a.alloc(bool, count_rows);
+                    errdefer a.free(entries);
+                    for (entries, nulls, 0..) |*entry, flag, i| {
+                        const value = (try self.cell(i, column)).value;
+                        entry.* = if (flag != 0) false else if (value == .bool) value.bool else return error.InvalidSqlSpill;
+                    }
+                    break :blk .{ .bool = entries };
+                },
+                .bytes, .json => blk: {
+                    const entries = try a.alloc([]const u8, count_rows);
+                    errdefer a.free(entries);
+                    for (entries, nulls, 0..) |*entry, flag, i| {
+                        const value = (try self.cell(i, column)).value;
+                        entry.* = if (flag != 0) "" else if (value == .string) value.string else return error.InvalidSqlSpill;
+                    }
+                    break :blk if (kind == .json) .{ .json = entries } else .{ .bytes = entries };
+                },
+                else => return error.InvalidSqlSpill,
+            };
+            return .{ .name = "", .values = values, .nulls = .{ .bytes = nulls } };
+        }
+
         pub fn keyRowAlloc(self: *OwnedBlock, a: Allocator, index: usize) !Row {
             if (index >= self.count()) return error.InvalidSqlSpill;
             const keys = try a.alloc(Datum, self.keyWidth());
@@ -2529,6 +2674,12 @@ fn portableColumnBlockScenario(a: Allocator) !void {
         try std.testing.expectEqualStrings(row.values[3].value.number_string, (try block.cell(index, 3)).value.number_string);
         try std.testing.expectEqual(row.keys[0].sql_null, (try block.keyCell(index, 0)).sql_null);
     }
+    const dictionary = (try block.dictionaryColumn(arena.allocator(), 0, false)).?;
+    try std.testing.expectEqual(try block.dictionaryIdentity(0, 0, false), try block.dictionaryIdentity(2, 0, false));
+    try std.testing.expect((try block.dictionaryIdentity(0, 0, false)).? != (try block.dictionaryIdentity(1, 0, false)).?);
+    const selected = try dictionary.select(arena.allocator(), &.{ 31, 0, 2 });
+    try std.testing.expectEqual(@as(i64, -9007199254740993), (try selected.cell(arena.allocator(), 0, 0)).value.integer);
+    try std.testing.expectEqual(@as(i64, 9007199254740993), (try selected.cell(arena.allocator(), 2, 0)).value.integer);
     const borrowed = (try block.cell(0, 2)).value.string;
     try std.testing.expect(@intFromPtr(borrowed.ptr) >= @intFromPtr(bytes.ptr) and @intFromPtr(borrowed.ptr) + borrowed.len <= @intFromPtr(bytes.ptr) + bytes.len);
 }
@@ -2652,4 +2803,58 @@ test "SQL selected typed spill preserves dictionary integers and both null domai
             try std.testing.expectEqual(position % 3 == 1, value.sql_null);
         }
     }
+}
+
+fn typedSpillVectorScenario(a: Allocator) !void {
+    const Hook = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    var dummy: u8 = 0;
+    var manager: Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check };
+    defer manager.deinit();
+    var file = try Sequential.init(&manager, 64 * 1024);
+    defer file.close();
+    for (0..128) |row| _ = try file.append(.{ .values = &.{
+        if (row % 7 == 0) Datum{} else Datum.json(.{ .integer = 9007199254740993 }),
+        Datum.json(.{ .float = if (row % 2 == 0) -0.0 else 0.0 }),
+        if (row % 11 == 0) Datum{} else Datum.json(.{ .string = "repeated long string with embedded\x00NUL" }),
+        Datum.json(.{ .integer = @intCast(row) }),
+        Datum.json(.{ .bool = row % 3 == 0 }),
+        Datum{},
+        Datum.json(.{ .string = if (row % 2 == 0) "{\"a\":1}" else "null" }),
+    }, .keys = &.{}, .ordinal = row }, none);
+    const block = try file.readOwnedBlock(0);
+    defer block.release();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const out = arena.allocator();
+    const integer = try block.columnVector(out, 0, .i64);
+    const floating = try block.columnVector(out, 1, .f64);
+    const text = try block.columnVector(out, 2, .bytes);
+    const unique = try block.columnVector(out, 3, .i64);
+    const boolean = try block.columnVector(out, 4, .bool);
+    const missing = try block.columnVector(out, 5, .f64);
+    const json = try block.columnVector(out, 6, .json);
+    try std.testing.expect(integer.values == .dictionary_i64);
+    try std.testing.expect(floating.values == .dictionary_f64);
+    try std.testing.expect(text.values == .dictionary_bytes);
+    try std.testing.expect(unique.values == .i64);
+    for (0..block.count()) |row| {
+        try std.testing.expectEqual(row % 7 == 0, integer.nulls.isNull(row));
+        if (!integer.nulls.isNull(row)) try std.testing.expectEqual(@as(i64, 9007199254740993), try integer.integerAt(row));
+        const actual = floating.values.dictionary_f64.at(row);
+        try std.testing.expectEqual(@as(u64, @bitCast((try block.cell(row, 1)).value.float)), @as(u64, @bitCast(actual)));
+        try std.testing.expectEqual(row % 11 == 0, text.nulls.isNull(row));
+        if (!text.nulls.isNull(row)) try std.testing.expectEqualStrings((try block.cell(row, 2)).value.string, text.values.dictionary_bytes.at(row));
+        try std.testing.expectEqual(@as(i64, @intCast(row)), try unique.integerAt(row));
+        try std.testing.expectEqual(row % 3 == 0, boolean.values.bool[row]);
+        try std.testing.expect(missing.nulls.isNull(row));
+        try std.testing.expectEqualStrings((try block.cell(row, 6)).value.string, json.values.json[row]);
+    }
+    try std.testing.expectError(error.InvalidSqlSpill, block.columnVector(out, 3, .f64));
+}
+
+test "SQL typed spill vectors preserve dictionaries nulls exact integers and float bits under allocation failure" {
+    try typedSpillVectorScenario(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, typedSpillVectorScenario, .{});
 }

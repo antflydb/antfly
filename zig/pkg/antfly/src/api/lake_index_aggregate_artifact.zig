@@ -1,5 +1,18 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Elastic-2.0
+//
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
+//
+//     https://www.antfly.io/licensing/ELv2-license
+//
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
+
 //! Exact native aggregate roots authenticate bounded immutable column blocks.
 const std = @import("std");
 const local = @import("antfly_local_sources");
@@ -31,6 +44,25 @@ pub fn readArtifact(a: A, store: stores.ArtifactStore, ref: ChunkRef, cancellati
     if (cached) |cache| return cache.cache.readImmutableAlloc(a, cache.scope, ref.artifact_id, std.math.cast(usize, ref.byte_len) orelse return error.ArtifactTooLarge, try stores.sha256DigestFromChecksum(ref.checksum), cache.context, .{ .ptr = &loader, .load = @TypeOf(loader).load });
     return @TypeOf(loader).load(&loader, a);
 }
+/// Borrow a verified bounded block until the caller has copied/decoded its
+/// requested range. Current authority is checked even when payloads are warm.
+pub fn readArtifactLease(a: A, store: stores.ArtifactStore, ref: ChunkRef, cancellation: Cancellation, cached: ?CachedRead) !local.serverless_query_lake_serving_cache.Cache.ImmutableLease {
+    const Loader = struct {
+        store: stores.ArtifactStore,
+        ref: ChunkRef,
+        cancellation: Cancellation,
+        fn load(raw: *anyopaque, alloc: A) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return self.store.getVerifiedAllocWithCancellationUsingAllocator(alloc, self.ref.artifact_id, self.ref.byte_len, self.ref.checksum, self.cancellation);
+        }
+    };
+    var loader: Loader = .{ .store = store, .ref = ref, .cancellation = cancellation };
+    try stores.validateSha256ArtifactIdentity(ref.artifact_id, ref.checksum);
+    try cancellation.check();
+    if (cached) |cache| return cache.cache.readImmutableBlockLease(a, cache.scope, ref.artifact_id, std.math.cast(usize, ref.byte_len) orelse return error.ArtifactTooLarge, try stores.sha256DigestFromChecksum(ref.checksum), cache.context, .{ .ptr = &loader, .load = Loader.load });
+    return .{ .heap = .{ .alloc = a, .bytes = try Loader.load(&loader, a) } };
+}
+
 pub const metadata_version: u16 = 2;
 pub fn supportsMetadataVersion(version: u16) bool {
     return version == 1 or version == metadata_version or version == 3;
