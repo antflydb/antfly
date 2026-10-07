@@ -19,6 +19,17 @@ const backend = @import("backend.zig");
 const Budget = @import("budget.zig").Budget;
 const SharedBudget = @import("budget.zig").Shared;
 
+/// Idle inbound sessions block for their entire lifetime. They cannot borrow
+/// the bounded outbound API executor without exhausting its small task quota.
+/// Keep this owner stable until Server joins all connection tasks.
+pub fn initTransport(alloc: std.mem.Allocator, max_connections: u16) std.Io.Threaded {
+    return .init(alloc, .{
+        .async_limit = .nothing,
+        // Sessions plus accept, shared deadline and cancel handshakes.
+        .concurrent_limit = .limited(@as(usize, max_connections) + 6),
+    });
+}
+
 pub const Config = struct {
     io: std.Io,
     backend: backend.Backend,
@@ -430,4 +441,57 @@ test "pgwire idle sockets share one deadline owner and join under saturation" {
     }
     try std.testing.expectEqual(@as(u64, 1), listener.stats().expired_connections);
     listener.deinit();
+}
+
+test "pgwire retained sockets survive a saturated shared outbound executor" {
+    const io = std.testing.io;
+    var outbound = std.Io.Threaded.init(std.testing.allocator, .{
+        .async_limit = .nothing,
+        .concurrent_limit = .limited(8),
+    });
+    defer outbound.deinit();
+    const outbound_io = outbound.io();
+    var release: std.Io.Event = .unset;
+    var jobs: std.Io.Group = .init;
+    defer jobs.cancel(outbound_io);
+    defer release.set(outbound_io);
+    const Blocked = struct {
+        fn run(event: *std.Io.Event, task_io: std.Io) std.Io.Cancelable!void {
+            try event.wait(task_io);
+        }
+    };
+    for (0..8) |_| try jobs.concurrent(outbound_io, Blocked.run, .{ &release, outbound_io });
+    // The historical listener borrowed this executor. Saturation prevents even
+    // submitting its accept task, independently of SQL admission and auth.
+    try std.testing.expectError(error.ConcurrencyUnavailable, jobs.concurrent(outbound_io, Blocked.run, .{ &release, outbound_io }));
+
+    var transport = initTransport(std.testing.allocator, 32);
+    defer transport.deinit();
+    var listener = try start(std.testing.allocator, .{
+        .io = transport.io(),
+        .backend = undefined,
+        .bind_port = 0,
+        .max_connections = 32,
+        .limits = .{ .startup_timeout_ms = 30_000 },
+    });
+    defer listener.deinit();
+    var peers: [32]std.Io.net.Stream = undefined;
+    var opened: usize = 0;
+    defer for (peers[0..opened]) |peer| peer.close(io);
+    for (&peers) |*peer| {
+        peer.* = try listener.address().connect(io, .{ .mode = .stream });
+        opened += 1;
+    }
+    const deadline = std.Io.Clock.awake.now(io).addDuration(.fromSeconds(3));
+    while (listener.stats().deadline_entries != peers.len) {
+        if (std.Io.Clock.awake.now(io).nanoseconds >= deadline.nanoseconds) return error.ConnectionsDidNotStart;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expectEqual(@as(u32, 32), listener.stats().connections);
+    // All outbound slots remain occupied; the listener has not stolen one.
+    try std.testing.expectError(error.ConcurrencyUnavailable, jobs.concurrent(outbound_io, Blocked.run, .{ &release, outbound_io }));
+    const address = listener.address();
+    listener.deinit();
+    var rebound = try address.listen(io, .{ .reuse_address = true });
+    rebound.deinit(io);
 }

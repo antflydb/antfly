@@ -55,10 +55,7 @@ pub const Listener = struct {
         self.adapter = .{ .server = api };
         // Long-lived idle sessions must not consume the shared outbound lane.
         // One session task per connection plus accept, deadline and cancel slots.
-        self.transport_io = std.Io.Threaded.init(self.alloc, .{
-            .async_limit = .nothing,
-            .concurrent_limit = .limited(@as(usize, config.max_connections) + 6),
-        });
+        self.transport_io = @import("../pgwire/server.zig").initTransport(self.alloc, config.max_connections);
         errdefer self.transport_io.deinit();
         const io = self.transport_io.io();
         self.server = try @import("../pgwire/server.zig").start(self.alloc, .{

@@ -702,3 +702,16 @@ fail-fast comparisons pass, with 1,548–1,587 completed sustained waits. Origin
 failures and the exact workload change remain in the receipt ledger.
 These checks establish the named parser/control and allocation-owner contracts;
 they do not establish allocation-free physical mutating completion.
+
+After merging main at `ac2d3779ee`, the pgwire setup failure was traced to
+main's 16-slot shared API executor: each peer owns three tasks, so five idle
+peers plus accept fill it. The candidate's listener-owned transport is now
+initialized through the same helper exercised by a saturation regression.
+All 88 pgwire cases pass on macOS and pinned Nix glibc GNU Linux ReleaseSafe.
+The merged native API pooling target passes 55 selected contracts and all 50
+build steps.
+CI retains a focused baseline repair with capacity for main's existing three
+tasks per peer, without importing candidate SQL admission or allocation policy.
+The [merge verification receipt](qualification/workload-pooling/receipts/2026-10-06/main-ac2d-pgwire/README.md)
+records the regression and baseline patch. Historical failed matrices remain
+failed; this merge has no new full production performance receipts.

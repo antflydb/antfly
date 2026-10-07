@@ -71,6 +71,17 @@ artifacts. Such results compare against patched main; the patch does not change
 pooling policy or performance thresholds. Original startup failures are retained
 and cannot be interpreted as latency or throughput measurements.
 
+Older main also runs idle pgwire sessions on the shared outbound API executor.
+Those long-lived tasks exhaust its concurrency quota and close later accepted
+connections. The candidate uses a listener-owned executor bounded by the
+configured connection count. CI applies `baseline-pgwire-transport.patch` when
+needed and retains the applied diff; it changes only listener task ownership,
+leaving main's SQL admission and allocation policies intact. These are patched
+main comparisons. The saturation regression retains 32 sockets while an
+independent outbound executor is full, then verifies joined shutdown and port
+reuse. Historical failed setup receipts remain failed; fresh measurements are
+required to qualify the repaired baseline.
+
 ## Resource ledger and operator controls
 
 [RESOURCE_OWNERSHIP.md](RESOURCE_OWNERSHIP.md) records nested versus independent

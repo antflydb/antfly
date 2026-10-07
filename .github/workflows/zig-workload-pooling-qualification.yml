@@ -98,6 +98,17 @@ jobs:
             git -C /tmp/antfly-pooling-baseline diff -- zig/pkg/antfly-embedded/src/chatgpt/manager.zig \
               > qualification-bin/baseline-linux-startup.patch
           fi
+          # Older main puts idle pgwire sessions on the small outbound executor.
+          # Repair only that task ownership bug, preserving main's SQL policy.
+          pgwire_patch="$GITHUB_WORKSPACE/zig/qualification/workload-pooling/baseline-pgwire-transport.patch"
+          if git -C /tmp/antfly-pooling-baseline apply --check "$pgwire_patch"; then
+            git -C /tmp/antfly-pooling-baseline apply "$pgwire_patch"
+            git -C /tmp/antfly-pooling-baseline diff -- zig/pkg/antfly/src/api/sql_pgwire.zig \
+              > qualification-bin/baseline-pgwire-transport.patch
+          elif ! rg -q 'transport_io' /tmp/antfly-pooling-baseline/zig/pkg/antfly/src/api/sql_pgwire.zig; then
+            echo 'Baseline pgwire transport repair needs rebasing' >&2
+            exit 1
+          fi
           git rev-parse HEAD > qualification-bin/candidate/revision.txt
           git -C /tmp/antfly-pooling-baseline rev-parse HEAD > qualification-bin/baseline-revision.txt
           cd /tmp/antfly-pooling-baseline/zig
