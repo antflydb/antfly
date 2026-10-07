@@ -435,6 +435,7 @@ const Parser = struct {
 
     fn scalar(self: *Parser, depth: usize, minimum: u8) Error!*const ast.Scalar {
         if (depth >= self.limits.max_depth) return self.fail(error.SqlLimitExceeded, "SQL scalar nesting budget exceeded");
+        if (self.peek(.lbracket)) return self.fail(error.InvalidSqlSyntax, "bare array brackets require ARRAY constructor context");
         var left: *const ast.Scalar = undefined;
         if (self.keyword(.not)) {
             left = try self.scalarNode(.{ .unary = .{ .op = .not, .operand = try self.scalar(depth + 1, 3) } });
@@ -470,16 +471,8 @@ const Parser = struct {
             try self.expect(.rparen);
             left = try self.scalarNode(.{ .cast = .{ .operand = operand, .type = kind.type, .element_type = kind.element_type } });
         } else if (self.peek(.identifier) and !self.tokens[self.pos].owned and std.ascii.eqlIgnoreCase(self.tokens[self.pos].text, "array") and self.pos + 1 < self.tokens.len and self.tokens[self.pos + 1].kind == .lbracket) {
-            self.pos += 2;
-            var elements: std.ArrayList(*const ast.Scalar) = .empty;
-            if (!self.take(.rbracket)) {
-                while (true) {
-                    try elements.append(self.alloc, try self.scalar(depth + 1, 0));
-                    if (!self.take(.comma)) break;
-                }
-                try self.expect(.rbracket);
-            }
-            left = try self.scalarNode(.{ .call = .{ .name = "$array", .args = try elements.toOwnedSlice(self.alloc) } });
+            self.pos += 1;
+            left = try self.arrayConstructor(depth + 1);
         } else if (self.peek(.identifier) and !self.tokens[self.pos].owned and std.ascii.eqlIgnoreCase(self.tokens[self.pos].text, "timestamptz") and self.pos + 1 < self.tokens.len and self.tokens[self.pos + 1].kind == .string) {
             // Typed literals use the same validating/canonicalizing cast as
             // CAST(text AS timestamptz), including offset normalization.
@@ -730,6 +723,24 @@ const Parser = struct {
             left = try self.scalarNode(.{ .binary = .{ .op = op, .left = left, .right = try self.scalar(depth + 1, precedence + 1) } });
         }
         return left;
+    }
+
+    /// Bare nested brackets are array grammar, not a new scalar expression.
+    fn arrayConstructor(self: *Parser, depth: usize) Error!*const ast.Scalar {
+        if (depth >= self.limits.max_depth) return self.fail(error.SqlLimitExceeded, "SQL array nesting budget exceeded");
+        try self.expect(.lbracket);
+        var elements: std.ArrayList(*const ast.Scalar) = .empty;
+        if (!self.take(.rbracket)) {
+            const nested_brackets = self.peek(.lbracket);
+            while (true) {
+                if (self.peek(.lbracket) != nested_brackets) return self.fail(error.InvalidSqlSyntax, "nested array bracket lists cannot mix with scalar expressions");
+                const element = if (nested_brackets) try self.arrayConstructor(depth + 1) else try self.scalar(depth + 1, 0);
+                try elements.append(self.alloc, element);
+                if (!self.take(.comma)) break;
+            }
+            try self.expect(.rbracket);
+        }
+        return self.scalarNode(.{ .call = .{ .name = "$array", .args = try elements.toOwnedSlice(self.alloc) } });
     }
 
     fn checkScalarDepth(self: *Parser, expression: *const ast.Scalar, depth: usize) Error!void {

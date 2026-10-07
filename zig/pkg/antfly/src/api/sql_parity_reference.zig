@@ -531,7 +531,7 @@ pub fn runArrayExpressions(alloc: std.mem.Allocator, handler: anytype) !void {
         entries: []const struct { sql: []const u8, value: Json },
     }, alloc, fixtures.array_expression_reference, .{});
     defer reference.deinit();
-    try std.testing.expectEqual(@as(usize, 118), reference.value.entries.len);
+    try std.testing.expectEqual(@as(usize, 164), reference.value.entries.len);
     for (reference.value.entries) |entry| {
         const sql = try std.fmt.allocPrint(alloc, "SELECT {s} AS value", .{entry.sql});
         defer alloc.free(sql);
@@ -546,7 +546,7 @@ pub fn runArrayExpressions(alloc: std.mem.Allocator, handler: anytype) !void {
         try std.testing.expectEqual(@as(i64, 0), result.rows_affected);
         try std.testing.expect(try rowMatchesWithNulls(alloc, result.columns, result.rows[0], result.sql_nulls.?[0], &.{entry.value}, &.{entry.value == .null}));
     }
-    std.debug.print("SQL public array expression contracts: 118 passed; no original disposition credit\n", .{});
+    std.debug.print("SQL public array expression contracts: 164 passed; no original disposition credit\n", .{});
 }
 
 pub fn runReference(alloc: std.mem.Allocator, handler: anytype, case_ids: []const []const u8, reference_bytes: []const u8) !void {

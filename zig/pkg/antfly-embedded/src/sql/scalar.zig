@@ -238,7 +238,7 @@ test "SQL bound array expressions match PostgreSQL scalar contracts" {
     const Entry = struct { sql: []const u8, value: Json };
     const fixture = try std.json.parseFromSlice(struct { reference: []const u8, entries: []const Entry }, std.testing.allocator, @embedFile("fixtures/sql_array_expression_reference.json"), .{});
     defer fixture.deinit();
-    try std.testing.expectEqual(@as(usize, 118), fixture.value.entries.len);
+    try std.testing.expectEqual(@as(usize, 164), fixture.value.entries.len);
     for (fixture.value.entries) |entry| {
         var compiled = try @import("compiler.zig").compileScalar(std.testing.allocator, entry.sql, .{});
         defer compiled.deinit();
@@ -253,11 +253,98 @@ test "SQL bound array expressions match PostgreSQL scalar contracts" {
     }
 }
 
+test "SQL multidimensional constructors flatten typed cells and bound dynamic work" {
+    const Faults = struct {
+        fn run(a: Allocator) !void {
+            var compiled = try @import("compiler.zig").compileScalar(a, "ARRAY[[$1,2],[$2,NULL]]::bigint[]", .{});
+            defer compiled.deinit();
+            var program = try bind(a, compiled.expression, &.{}, &.{ .integer, .integer }, .{});
+            defer program.deinit();
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const result = try program.evaluate(arena.allocator(), &.{}, &.{ .{ .integer = 9007199254740993 }, .{ .integer = -9223372036854775807 } }, .{});
+            const array = result.array.?;
+            try std.testing.expectEqual(arrays.ElementType.int64, array.element_type);
+            try std.testing.expectEqual(@as(usize, 2), array.dimensions.len);
+            try std.testing.expectEqual(@as(usize, 4), array.elements.len);
+            try std.testing.expectEqual(@as(i64, 9007199254740993), array.elements[0].value.integer);
+            try std.testing.expectEqual(@as(i64, -9223372036854775807), array.elements[2].value.integer);
+            try std.testing.expect(array.elements[3].sql_null);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Faults.run, .{});
+    var constant = try @import("compiler.zig").compileScalar(std.testing.allocator, "needle = ANY(ARRAY[[1,2],[3,4]])", .{});
+    defer constant.deinit();
+    var dynamic = try @import("compiler.zig").compileScalar(std.testing.allocator, "needle = ANY(ARRAY[[$1,2],[$2,4]])", .{});
+    defer dynamic.deinit();
+    const columns = &.{Column{ .name = "needle", .type = .integer }};
+    var cached = try bind(std.testing.allocator, constant.expression, columns, &.{}, .{});
+    defer cached.deinit();
+    var uncached = try bind(std.testing.allocator, dynamic.expression, columns, &.{ .integer, .integer }, .{});
+    defer uncached.deinit();
+    var none = std.heap.FixedBufferAllocator.init(&.{});
+    var buffer: [4096]u8 = undefined;
+    var scratch = std.heap.FixedBufferAllocator.init(&buffer);
+    var elapsed: [2]i128 = undefined;
+    var counts: [2]usize = .{ 0, 0 };
+    var bytes: usize = 0;
+    const parameters: []const Json = &.{ .{ .integer = 1 }, .{ .integer = 3 } };
+    for ([_]*const Program{ &cached, &uncached }, 0..) |program, mode| {
+        const start = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
+        for (0..10000) |row| {
+            scratch.reset();
+            const result = try program.evaluate(if (mode == 0) none.allocator() else scratch.allocator(), &.{Datum.json(.{ .integer = if (row % 2 == 0) 1 else 9 })}, parameters, .{});
+            counts[mode] += @intFromBool(result.value.bool);
+            bytes = @max(bytes, scratch.end_index);
+        }
+        elapsed[mode] = std.Io.Clock.now(.awake, std.testing.io).nanoseconds - start;
+    }
+    try std.testing.expectEqual(@as(usize, 5000), counts[0]);
+    try std.testing.expectEqual(counts[0], counts[1]);
+    scratch.reset();
+    try std.testing.expectError(error.SqlProgramLimitExceeded, uncached.evaluate(scratch.allocator(), &.{Datum.json(.{ .integer = 1 })}, parameters, .{ .output_bytes = 1 }));
+    scratch.reset();
+    try std.testing.expectError(error.SqlProgramLimitExceeded, uncached.evaluate(scratch.allocator(), &.{Datum.json(.{ .integer = 1 })}, parameters, .{ .steps = 12 }));
+    std.debug.print("SQL multidimensional constructors: rows=10000 prepared_ns={} dynamic_ns={} prepared_scratch_bytes=0 dynamic_scratch_bytes={}\n", .{ elapsed[0], elapsed[1], bytes });
+}
+
+test "SQL multidimensional column constructors preserve bounds and admit heap scratch" {
+    const Faults = struct {
+        fn run(a: Allocator) !void {
+            var compiled = try @import("compiler.zig").compileScalar(a, "ARRAY[v,v,v,v,v,v,v,v,v,v,v,v,v,v,v,v,v]", .{});
+            defer compiled.deinit();
+            var program = try bind(a, compiled.expression, &.{.{ .name = "v", .type = .array, .element_type = .text }}, &.{}, .{});
+            defer program.deinit();
+            const input = try arrays.Value.init(.text, &.{.{ .lower = -1, .length = 1 }}, &.{arrays.Element.json(.{ .string = "é" })}, .{});
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const result = (try program.evaluate(arena.allocator(), &.{Datum.typedArray(&input)}, &.{}, .{})).array.?;
+            try std.testing.expectEqual(@as(usize, 17), result.elements.len);
+            try std.testing.expectEqual(@as(i32, -1), result.dimensions[1].lower);
+            try std.testing.expectEqualStrings("é", result.elements[16].value.string);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Faults.run, .{});
+    var compiled = try @import("compiler.zig").compileScalar(std.testing.allocator, "ARRAY[a,b]", .{});
+    defer compiled.deinit();
+    var program = try bind(std.testing.allocator, compiled.expression, &.{ .{ .name = "a", .type = .array, .element_type = .int32 }, .{ .name = "b", .type = .array, .element_type = .int32 } }, &.{}, .{});
+    defer program.deinit();
+    const cells = &.{arrays.Element.json(.{ .integer = 1 })};
+    const lower_zero = try arrays.Value.init(.int32, &.{.{ .lower = 0, .length = 1 }}, cells, .{});
+    const lower_one = try arrays.Value.init(.int32, &.{.{ .lower = 1, .length = 1 }}, cells, .{});
+    const six = try arrays.Value.init(.int32, &.{ .{ .length = 1 }, .{ .length = 1 }, .{ .length = 1 }, .{ .length = 1 }, .{ .length = 1 }, .{ .length = 1 } }, cells, .{});
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    try std.testing.expectError(error.SqlArraySubscriptError, program.evaluate(arena.allocator(), &.{ Datum.typedArray(&lower_zero), Datum.typedArray(&lower_one) }, &.{}, .{}));
+    try std.testing.expectError(error.SqlArraySubscriptError, program.evaluate(arena.allocator(), &.{ Datum{}, Datum.typedArray(&lower_one) }, &.{}, .{}));
+    try std.testing.expectError(error.SqlProgramLimitExceeded, program.evaluate(arena.allocator(), &.{ Datum.typedArray(&six), Datum.typedArray(&six) }, &.{}, .{}));
+}
+
 test "SQL array casts match PostgreSQL rejection diagnostics" {
     const Entry = struct { sql: []const u8, code: []const u8 };
     const fixture = try std.json.parseFromSlice(struct { reference: []const u8, entries: []const Entry }, std.testing.allocator, @embedFile("fixtures/sql_array_cast_errors.json"), .{});
     defer fixture.deinit();
-    try std.testing.expectEqual(@as(usize, 20), fixture.value.entries.len);
+    try std.testing.expectEqual(@as(usize, 45), fixture.value.entries.len);
     const Check = struct {
         fn evaluate(sql: []const u8) !void {
             var compiled = try @import("compiler.zig").compileScalar(std.testing.allocator, sql, .{});
@@ -291,7 +378,13 @@ test "SQL array binding retains element identity NULL provenance and bounded all
             const result = try program.evaluate(arena.allocator(), &.{}, &.{.{ .integer = 1 }}, .{});
             try std.testing.expect(result.value.bool);
         }
-        fn constant(a: Allocator) !void {
+        fn constant(backing: Allocator) !void {
+            // Arena resize is an optional optimization: make allocation-fault
+            // enumeration deterministic by exercising its allocate/copy path.
+            var vtable = backing.vtable.*;
+            vtable.resize = Allocator.noResize;
+            vtable.remap = Allocator.noRemap;
+            const a: Allocator = .{ .ptr = backing.ptr, .vtable = &vtable };
             var compiled = try @import("compiler.zig").compileScalar(a, "2 = ANY (ARRAY[1, 2, NULL]::smallint[]::bigint[])", .{});
             defer compiled.deinit();
             var program = try bind(a, compiled.expression, &.{}, &.{}, .{});
@@ -575,6 +668,7 @@ const Binder = struct {
     limits: BindLimits,
     names: std.StringHashMapUnmanaged(u32) = .empty,
     inferred: std.AutoHashMapUnmanaged(*const ast.Scalar, Type) = .empty,
+    explicit_arrays: std.AutoHashMapUnmanaged(*const ast.Scalar, arrays.ElementType) = .empty,
     instructions: std.ArrayList(Instruction) = .empty,
     translations: std.AutoHashMapUnmanaged(u32, *const TextTranslation) = .empty,
     dependencies: std.ArrayList(u32) = .empty,
@@ -613,8 +707,8 @@ const Binder = struct {
             },
             .cast => |cast| blk: {
                 if (cast.type == .array and cast.element_type == null) return error.InvalidSqlProgram;
-                const empty_constructor = cast.operand.* == .call and std.mem.eql(u8, cast.operand.call.name, "$array") and cast.operand.call.args.len == 0;
-                const source = if (cast.type == .array and empty_constructor) Type{ .kind = .array, .nullable = false, .element_type = cast.element_type } else try self.infer(cast.operand, depth + 1);
+                if (cast.type == .array) try self.typeArrayConstructors(cast.operand, cast.element_type.?, depth + 1);
+                const source = try self.infer(cast.operand, depth + 1);
                 if (cast.type == .array and source.kind != null and source.kind != .array and source.kind != .string) return error.SqlTypeMismatch;
                 if (cast.type == .array and source.kind == .array and !builtin_cast.allowed(source.element_type.?, cast.element_type.?)) return error.SqlCannotCoerce;
                 if (cast.type != .array and cast.element_type != null and source.kind != null and source.kind != .array and source.kind != .datetime) {
@@ -677,13 +771,25 @@ const Binder = struct {
                 if (function == .@"$array") {
                     if (call.args.len == 0) return error.UnknownSqlArrayType;
                     var element: Type = .{};
-                    for (call.args) |arg| element = try common(element, try self.infer(arg, depth + 1));
-                    if (element.kind == .array) return error.UnsupportedSqlShape;
+                    var unknown_text = false;
+                    for (call.args) |arg| {
+                        const actual = try self.infer(arg, depth + 1);
+                        // Unadorned string literals have PostgreSQL's unknown
+                        // identity, unlike an explicitly typed text value.
+                        if (arg.* == .literal and arg.literal == .string) {
+                            unknown_text = true;
+                            continue;
+                        }
+                        element = common(element, actual) catch |err| return if (err == error.SqlTypeMismatch) (if (element.kind == .array and actual.kind == .array) error.SqlCannotCoerce else error.SqlArrayConstructorTypeMismatch) else err;
+                    }
+                    if (element.kind == null and unknown_text) element.kind = .string;
+                    if (element.kind == .array) break :blk .{ .kind = .array, .nullable = false, .element_type = element.element_type };
                     var kind = try arrayElementType(element.kind orelse .string);
                     if (element.kind == .number and element.element_type != null) kind = element.element_type.?;
                     if (element.kind == .integer) {
                         kind = .int16;
                         for (call.args) |arg| {
+                            if (arg.* == .literal and arg.literal == .string) continue;
                             const actual = try self.infer(arg, depth + 1);
                             if (actual.kind == null) continue;
                             const width: arrays.ElementType = if (arg.* == .literal and arg.literal == .integer) (if (std.math.cast(i32, arg.literal.integer) != null) .int32 else .int64) else actual.element_type orelse .int64;
@@ -792,8 +898,34 @@ const Binder = struct {
         return result;
     }
 
+    /// An explicit constructor cast resolves/coerces its elements directly,
+    /// before independent child defaults (notably NULL/text) are selected.
+    fn typeArrayConstructors(self: *Binder, expression: *const ast.Scalar, element: arrays.ElementType, depth: usize) anyerror!void {
+        if (depth >= self.limits.depth) return error.SqlProgramLimitExceeded;
+        if (expression.* != .call or !std.mem.eql(u8, expression.call.name, "$array")) return;
+        if (self.inferred.count() >= self.limits.nodes) return error.SqlProgramLimitExceeded;
+        for (expression.call.args) |arg| {
+            try self.typeArrayConstructors(arg, element, depth + 1);
+            const actual = try self.infer(arg, depth + 1);
+            if (actual.kind) |kind| {
+                const source = actual.element_type orelse try arrayElementType(kind);
+                if (!builtin_cast.allowed(source, element)) return error.SqlCannotCoerce;
+                if (kind == .number and actual.element_type == null and (builtin_cast.integral(element) or element == .text)) return error.UnsupportedSqlShape;
+            }
+        }
+        try self.explicit_arrays.put(self.alloc, expression, element);
+        try self.inferred.put(self.alloc, expression, .{ .kind = .array, .nullable = false, .element_type = element });
+    }
+
     fn compile(self: *Binder, expression: *const ast.Scalar, expected: ?ast.ColumnType, depth: usize) anyerror!u32 {
         return self.compileArrayContext(expression, expected, null, depth);
+    }
+
+    fn arrayChildren(self: *const Binder, args: []const *const ast.Scalar) bool {
+        for (args) |arg| if (self.inferred.get(arg)) |kind| {
+            if (kind.kind == .array) return true;
+        };
+        return false;
     }
 
     fn compileArrayContext(self: *Binder, expression: *const ast.Scalar, expected: ?ast.ColumnType, array_element: ?arrays.ElementType, depth: usize) anyerror!u32 {
@@ -878,9 +1010,10 @@ const Binder = struct {
                     break :blk .{ .call = .{ .function = function, .args = &.{}, .setting_identity = resolved.identity } };
                 }
                 const args = try self.alloc.alloc(u32, call.args.len);
+                const nested_constructor = function == .@"$array" and self.arrayChildren(call.args);
                 for (call.args, args, 0..) |arg, *out, i| {
                     const desired: ?ast.ColumnType = switch (function) {
-                        .@"$array" => arrayScalarType(kind.element_type orelse return error.InvalidSqlProgram),
+                        .@"$array" => if (nested_constructor) .array else arrayScalarType(kind.element_type orelse return error.InvalidSqlProgram),
                         .@"$array_quantified" => if (i == 0) (if ((try self.infer(arg, depth + 1)).kind == .number) .number else arrayScalarType((try self.infer(call.args[1], depth + 1)).element_type.?)) else if (i == 1) .array else if (i == 2) .integer else .boolean,
                         .cardinality, .array_ndims, .array_length, .array_lower, .array_upper => if (i == 0) .array else .integer,
                         .ai_decide, .ai_choice, .ai_score, .ai_probability => if ((try self.infer(arg, depth + 1)).kind == .json) .json else .string,
@@ -903,6 +1036,21 @@ const Binder = struct {
                         else => kind.kind,
                     };
                     const actual = try self.infer(arg, depth + 1);
+                    if (function == .@"$array" and self.explicit_arrays.contains(expression) and actual.kind != null) {
+                        const target = kind.element_type orelse return error.InvalidSqlProgram;
+                        const coercion = try self.alloc.create(ast.Scalar);
+                        coercion.* = .{ .cast = .{ .operand = arg, .type = if (nested_constructor) .array else arrayScalarType(target), .element_type = target } };
+                        out.* = try self.compileArrayContext(coercion, desired, target, depth + 1);
+                        continue;
+                    }
+                    if (function == .@"$array" and arg.* == .literal and arg.literal == .string) {
+                        if (nested_constructor) {
+                            const coercion = try self.alloc.create(ast.Scalar);
+                            coercion.* = .{ .cast = .{ .operand = arg, .type = .array, .element_type = kind.element_type } };
+                            out.* = try self.compileArrayContext(coercion, .array, kind.element_type, depth + 1);
+                        } else out.* = try self.compileArrayContext(arg, desired, kind.element_type, depth + 1);
+                        continue;
+                    }
                     if (desired != null and actual.kind != null and desired != actual.kind and !(desired == .datetime and actual.kind == .string) and !(desired == .uuid and actual.kind == .string and uuidTextOperand(arg)) and !(numeric(desired) and numeric(actual.kind))) return error.SqlTypeMismatch;
                     out.* = try self.compileArrayContext(arg, desired, if (kind.kind == .array) kind.element_type else null, depth + 1);
                 }
@@ -1113,9 +1261,15 @@ const Evaluator = struct {
                 switch (call.function) {
                     .@"$array" => {
                         const kind = instruction.type.element_type orelse return error.InvalidSqlProgram;
+                        if (self.program.constant_arrays.get(index)) |prepared| {
+                            try self.charge(@sizeOf(arrays.Value) + prepared.elements.len * @sizeOf(arrays.Element) + prepared.dimensions.len * @sizeOf(arrays.Dimension));
+                            break :blk Datum.typedArray(prepared);
+                        }
+                        for (call.args) |arg| if (self.program.instructions[arg].type.kind == .array) {
+                            break :blk try self.nestedArray(call.args, kind, depth + 1);
+                        };
                         const cell_bytes = std.math.mul(usize, call.args.len, @sizeOf(arrays.Element)) catch return error.SqlProgramLimitExceeded;
                         try self.charge(cell_bytes + @sizeOf(arrays.Value) + @sizeOf(arrays.Dimension));
-                        if (self.program.constant_arrays.get(index)) |prepared| break :blk Datum.typedArray(prepared);
                         const elements = try self.alloc.alloc(arrays.Element, call.args.len);
                         for (call.args, elements) |arg, *out| {
                             const value = try self.runDatum(arg, depth + 1);
@@ -1439,6 +1593,57 @@ const Evaluator = struct {
                 break :blk parsed;
             } else value,
         };
+    }
+
+    /// Evaluate children once, admit a rectangular layout, then flatten into
+    /// one exact cell allocation. Payloads borrow the enclosing row/program
+    /// region; no JSON reconstruction or repeated evaluation is involved.
+    fn nestedArray(self: *Evaluator, args: []const u32, kind: arrays.ElementType, depth: usize) !Datum {
+        var local: [16]Datum = undefined;
+        const children = if (args.len <= local.len) local[0..args.len] else blk: {
+            try self.charge(std.math.mul(usize, args.len, @sizeOf(Datum)) catch return error.SqlProgramLimitExceeded);
+            break :blk try self.alloc.alloc(Datum, args.len);
+        };
+        var dimensions: []const arrays.Dimension = &.{};
+        var seen = false;
+        var count: usize = 0;
+        for (args, children) |arg, *child| {
+            child.* = try self.runDatum(arg, depth);
+            const shape: []const arrays.Dimension = if (child.sql_null) &.{} else (child.array orelse return error.SqlTypeMismatch).dimensions;
+            if (seen) {
+                if (shape.len != dimensions.len) return error.SqlArraySubscriptError;
+                for (shape, dimensions) |actual, expected| if (actual.length != expected.length or actual.lower != expected.lower) return error.SqlArraySubscriptError;
+            } else {
+                seen = true;
+                dimensions = shape;
+            }
+            if (child.array) |array| count = std.math.add(usize, count, array.elements.len) catch return error.SqlProgramLimitExceeded;
+        }
+        if (dimensions.len == 6 or count > std.math.maxInt(i32)) return error.SqlProgramLimitExceeded;
+        const rank = if (count == 0) 0 else dimensions.len + 1;
+        const cell_bytes = std.math.mul(usize, count, @sizeOf(arrays.Element)) catch return error.SqlProgramLimitExceeded;
+        try self.charge(cell_bytes + rank * @sizeOf(arrays.Dimension) + @sizeOf(arrays.Value));
+        const cells = try self.alloc.alloc(arrays.Element, count);
+        var at: usize = 0;
+        for (children) |child| if (child.array) |array| {
+            for (array.elements) |element| {
+                if (self.steps >= self.limits.steps) return error.SqlProgramLimitExceeded;
+                self.steps += 1;
+                cells[at] = if (element.sql_null) .{} else arrays.Element.json(try self.castBuiltin(element.value, array.element_type, kind));
+                at += 1;
+            }
+        };
+        const shape = try self.alloc.alloc(arrays.Dimension, rank);
+        if (rank != 0) {
+            shape[0] = .{ .length = std.math.cast(u32, args.len) orelse return error.SqlProgramLimitExceeded };
+            @memcpy(shape[1..], dimensions);
+        }
+        const value = try self.alloc.create(arrays.Value);
+        var work: arrays.Budget = .{ .remaining = self.limits.steps -| self.steps };
+        const initial = work.remaining;
+        value.* = try arrays.Value.initWithBudget(kind, shape, cells, .{}, &work);
+        self.steps += initial - work.remaining;
+        return Datum.typedArray(value);
     }
 
     fn castBuiltin(self: *Evaluator, value: Json, source: ?arrays.ElementType, target: arrays.ElementType) !Json {

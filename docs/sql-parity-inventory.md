@@ -110,9 +110,9 @@ int32, with SQLSTATE `54000`. The codec alone does not activate catalog types,
 public result descriptors or pgwire array parameters/results.
 
 SQL binding now distinguishes array types from both JSON and unknown NULL,
-including element identity. One-dimensional `ARRAY[...]` constructors feed
+including element identity. Scalar and multidimensional `ARRAY[...]` constructors feed
 strict comparisons, `ANY`/`ALL`/`SOME`, cardinality and dimension/bound queries.
-One hundred eighteen shared PostgreSQL expression contracts run through binding,
+One hundred sixty-four shared PostgreSQL expression contracts run through binding,
 native statement execution and the HTTP API, checking exact values and SQL
 NULL flags. Constant constructors are prepared once into the immutable
 program; the 10,000-row debug benchmark uses zero constructor scratch bytes
@@ -126,7 +126,7 @@ chains are prepared once and require no evaluation allocator. Scalar and
 vector integer arithmetic check their inferred widths; real arithmetic uses
 the scalar path to preserve float4 rounding. Floating-point casts round ties
 to even; JSONB numeric casts round exact decimal tokens away from zero without
-an intermediate double. Twenty shared PostgreSQL SQLSTATE contracts cover
+an intermediate double. Forty-five shared PostgreSQL SQLSTATE contracts cover
 invalid syntax, range overflow, unsupported cast pairs and array operators.
 Comparison operators require matching array element identities, while
 CASE/COALESCE use common-type promotion.
@@ -150,8 +150,21 @@ cover decoding and dynamic casts. Constant text casts are prepared once: a
 binary JSONB array inputs share pre-DOM nesting/work admission with scalar JSON
 casts. These supplemental contracts grant no original disposition credit.
 
-Array-valued public outputs, array parameters,
-multidimensional constructor syntax, catalog storage and overloads converting
+Nested constructors (including bracket shorthand) evaluate children once and
+admit matching dimensions/lower bounds before flattening into one exact typed
+cell allocation. Rank is capped at six; all-NULL/empty subarrays canonicalize
+to zero dimensions while mixed empty/nonempty shapes fail with `2202E`.
+Unknown string literals coerce to the selected scalar/array element identity;
+explicitly typed text does not. Explicit outer casts resolve/coerce elements before
+independent NULL/text defaults are selected. Invalid mixtures of bracket-list
+and scalar grammar are rejected rather than silently widening PostgreSQL syntax.
+Small constructors keep child references on the stack; large ones admit scratch
+memory against the execution quota.
+Allocation-fault and byte/work-limit tests cover dynamic scalar and typed-array
+column inputs. A 10,000-row debug probe used zero prepared scratch versus 792
+dynamic bytes (about 7 ms versus 21 ms locally, not a production latency claim).
+
+Array-valued public outputs, array parameters, catalog storage and overloads converting
 whole arrays to text/JSON remain explicit activation gaps. Default decimal
 constructors still need an exact NUMERIC array representation; direct narrowing
 or text casts of these constructors remain guarded (explicit real/double casts
