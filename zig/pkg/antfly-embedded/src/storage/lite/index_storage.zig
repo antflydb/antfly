@@ -54,7 +54,7 @@ pub const Store = struct {
         .read_file_range_alloc = readFileRangeAlloc,
         .open_immutable_source = openImmutableSource,
         // Root leases require hosted file descriptors and lock markers.
-        .open_leased_immutable_source = if (supports_mapped_artifacts) openLeasedImmutableSource else null,
+        .open_leased_immutable_source = if (supports_mapped_artifacts or builtin.os.tag == .windows) openLeasedImmutableSource else null,
         .map_immutable_artifact = if (supports_mapped_artifacts) mapImmutableArtifact else null,
         .file_size = fileSize,
         .read_file_trailer_alloc = readFileTrailerAlloc,
@@ -216,7 +216,7 @@ fn privateArtifactFile(allocator: Allocator, docs: *docstore.Store) !std.Io.File
     defer allocator.free(basename);
     const path = try std.fs.path.join(allocator, &.{ std.fs.path.dirname(docs.file.path) orelse ".", basename });
     defer allocator.free(path);
-    const file = try std.Io.Dir.cwd().createFile(io, path, .{ .read = true, .exclusive = true, .permissions = .fromMode(0o600) });
+    const file = try std.Io.Dir.cwd().createFile(io, path, .{ .read = true, .exclusive = true, .permissions = if (@hasDecl(std.Io.File.Permissions, "fromMode")) .fromMode(0o600) else .default_file });
     errdefer file.close(io);
     errdefer std.Io.Dir.cwd().deleteFile(io, path) catch {};
     try std.Io.Dir.cwd().deleteFile(io, path);
@@ -2178,7 +2178,7 @@ test "lite artifact leases transfer retired inode accounting between readers" {
     try std.testing.expect((try cursor.next()) == null);
 }
 
-test "lite artifact leases bounded range scope reduces native identity reads" {
+test "lite artifact leases bounded range scope reduces source identity reads" {
     const a = std.testing.allocator;
     const segment = @import("../../segment.zig");
     var tmp = native_platform.testing.tmpDir(.{});
@@ -2206,6 +2206,21 @@ test "lite artifact leases bounded range scope reduces native identity reads" {
     var reader = try segment.RangeSegmentReader.init(a, source, .{});
     source_open = false;
     defer reader.deinit();
+    // Native artifact and integrity caches may already eliminate physical
+    // reads. Measure calls to that source separately from actual disk reads.
+    const Counting = struct {
+        original: segment.SegmentSource,
+        calls: usize = 0,
+        fn read(ptr: *anyopaque, offset: u64, out_bytes: []u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try self.original.readInto(offset, out_bytes);
+        }
+        fn close(_: *anyopaque) void {}
+    };
+    var counting = Counting{ .original = reader.source };
+    reader.source = .{ .ranges = .{ .ptr = &counting, .length = counting.original.len(), .read_into = Counting.read, .close = Counting.close } };
+    defer reader.source = counting.original;
     const registry = docs.artifact_registry.?;
     var before = registry.testPageReads();
     for (0..count) |doc| {
@@ -2213,6 +2228,8 @@ test "lite artifact leases bounded range scope reduces native identity reads" {
         a.free(id);
     }
     const baseline = registry.testPageReads() - before;
+    const baseline_calls = counting.calls;
+    counting.calls = 0;
     var scope = try segment.RangeSegmentReader.ReadScope.init(a, &reader, 256 * 1024);
     defer scope.deinit();
     before = registry.testPageReads();
@@ -2223,9 +2240,10 @@ test "lite artifact leases bounded range scope reduces native identity reads" {
         try std.testing.expectEqualStrings(try std.fmt.bufPrint(&expected, "article-{d:0>6}", .{doc}), id);
     }
     const cached = registry.testPageReads() - before;
-    try std.testing.expect(cached < baseline / 16);
+    try std.testing.expect(baseline_calls >= count);
+    try std.testing.expect(counting.calls < baseline_calls / 16);
     try std.testing.expect(scope.cache.retainedBytes() <= 256 * 1024);
-    std.debug.print("LITE_RANGE_SCOPE documents={d} uncached_native_page_reads={d} cached_native_page_reads={d} cache_bytes={d}\n", .{ count, baseline, cached, scope.cache.retainedBytes() });
+    std.debug.print("LITE_RANGE_SCOPE documents={d} uncached_native_page_reads={d} cached_native_page_reads={d} source_reads={d} scoped_source_reads={d} cache_bytes={d}\n", .{ count, baseline, cached, baseline_calls, counting.calls, scope.cache.retainedBytes() });
 }
 
 test "lite artifact leases orphan service advances past live markers with bounded work" {

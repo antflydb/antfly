@@ -16,6 +16,13 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+/// Temporary file root selected from the native host environment.
+pub fn temporaryDirectory() []const u8 {
+    const env = @import("env.zig");
+    if (builtin.os.tag == .windows) return env.getenv("TEMP") orelse env.getenv("TMP") orelse ".";
+    return env.getenv("TMPDIR") orelse "/tmp";
+}
+
 pub const capacity_supported = builtin.link_libc and switch (builtin.os.tag) {
     .linux, .macos, .freebsd, .netbsd, .openbsd, .dragonfly, .illumos => true,
     else => false,

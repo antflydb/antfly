@@ -101,7 +101,7 @@ const NativeRun = struct {
         defer allocator.free(name);
         const path = try std.fs.path.join(allocator, &.{ directory, name });
         errdefer allocator.free(path);
-        const file = try std.Io.Dir.cwd().createFile(io, path, .{ .read = true, .exclusive = true, .permissions = .fromMode(0o600) });
+        const file = try std.Io.Dir.cwd().createFile(io, path, .{ .read = true, .exclusive = true, .permissions = if (@hasDecl(std.Io.File.Permissions, "fromMode")) .fromMode(0o600) else .default_file });
         errdefer file.close(io);
         errdefer std.Io.Dir.cwd().deleteFile(io, path) catch {};
         var claim: ?@import("storage/resource_manager.zig").CapacityReservation = null;

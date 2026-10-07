@@ -1,5 +1,18 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Elastic-2.0
+//
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
+//
+//     https://www.antfly.io/licensing/ELv2-license
+//
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
+
 //! Remote dense generations use the native HBC posting authority and its
 //! retained immutable checkpoint. No second posting codec or ranking implementation is involved.
 const std = @import("std");
@@ -81,9 +94,9 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         const io = provider.context.io orelse return error.UnsupportedSqlExecution;
         var random: [16]u8 = undefined;
         try io.randomSecure(&random);
-        const path = try std.fmt.allocPrintSentinel(a, "/tmp/antfly-lake-dense-{s}", .{std.fmt.bytesToHex(random, .lower)}, 0);
+        const path = try std.fmt.allocPrintSentinel(a, "{s}/antfly-lake-dense-{s}", .{ @import("antfly_platform").filesystem.temporaryDirectory(), std.fmt.bytesToHex(random, .lower) }, 0);
         defer a.free(path);
-        try std.Io.Dir.cwd().createDir(io, path, .fromMode(0o700));
+        try std.Io.Dir.cwd().createDir(io, path, if (@hasDecl(std.Io.File.Permissions, "fromMode")) .fromMode(0o700) else .default_dir);
         defer std.Io.Dir.cwd().deleteTree(io, path) catch {};
         const overlay = if (seed) |root| try files.Overlay.create(a, root.generation, store.*, path, provider.context, cancellation) else null;
         defer if (overlay) |candidate| candidate.release();

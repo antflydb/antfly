@@ -1,5 +1,18 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Elastic-2.0
+//
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
+//
+//     https://www.antfly.io/licensing/ELv2-license
+//
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
+
 //! Immutable native file generations exposed through the existing LSM storage
 //! port. Each independently authenticated block is shared by the lake cache;
 //! authorization, cancellation, and reader leases remain query-owned.
@@ -425,7 +438,7 @@ pub fn materialize(a: A, io: std.Io, root: Root, store: stores.ArtifactStore, ta
         const destination = try std.fmt.allocPrint(a, "{s}/{s}", .{ target, file.path });
         defer a.free(destination);
         if (std.fs.path.dirname(destination)) |parent| try std.Io.Dir.cwd().createDirPath(io, parent);
-        const output = try std.Io.Dir.cwd().createFile(io, destination, .{ .permissions = .fromMode(0o600) });
+        const output = try std.Io.Dir.cwd().createFile(io, destination, .{ .permissions = if (@hasDecl(std.Io.File.Permissions, "fromMode")) .fromMode(0o600) else .default_file });
         defer output.close(io);
         const input = try std.fmt.allocPrint(a, "{s}/{s}", .{ reader.prefix, file.path });
         defer a.free(input);

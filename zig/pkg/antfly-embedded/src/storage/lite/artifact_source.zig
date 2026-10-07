@@ -183,7 +183,7 @@ pub const Registry = struct {
         defer a.free(marker_name);
         const marker_path = try std.fs.path.join(a, &.{ std.fs.path.dirname(self.path) orelse ".", marker_name });
         errdefer a.free(marker_path);
-        const marker: ?std.Io.File = if (owner.read_only) null else try std.Io.Dir.cwd().createFile(runtime, marker_path, .{ .read = true, .exclusive = true, .lock = .exclusive, .lock_nonblocking = true, .permissions = .fromMode(0o600) });
+        const marker: ?std.Io.File = if (owner.read_only) null else try std.Io.Dir.cwd().createFile(runtime, marker_path, .{ .read = true, .exclusive = true, .lock = .exclusive, .lock_nonblocking = true, .permissions = if (@hasDecl(std.Io.File.Permissions, "fromMode")) .fromMode(0o600) else .default_file });
         errdefer if (marker) |file| {
             file.close(runtime);
             std.Io.Dir.cwd().deleteFile(runtime, marker_path) catch {};
