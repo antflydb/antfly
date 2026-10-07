@@ -27,6 +27,7 @@ from generate_sql_postgres_reference import (
     execute,
     postgres,
     read_reference,
+    mutation_reference,
     SEEDS,
     validate_ordered_groups,
 )
@@ -112,14 +113,21 @@ class PostgresReferenceTest(unittest.TestCase):
         import psycopg
         from generate_sql_postgres_reference import create_table, properties
 
-        fixtures = Path(__file__).resolve().parents[1] / "zig/pkg/antfly-embedded/src/sql/fixtures"
+        fixtures = (
+            Path(__file__).resolve().parents[1]
+            / "zig/pkg/antfly-embedded/src/sql/fixtures"
+        )
         profile = json.loads((fixtures / "sql_read_campaign_profile.json").read_text())
-        inventory = json.loads((fixtures / "sql_parity_inventory.json").read_text())["entries"]
+        inventory = json.loads((fixtures / "sql_parity_inventory.json").read_text())[
+            "entries"
+        ]
         cases = [case for case in inventory if case["id"] in {"sql-1219", "sql-1373"}]
         self.assertEqual(2, len(cases))
         self.assertNotIn("row_num", properties(profile["schema"]))
         with self.db.transaction(force_rollback=True):
-            create_table(self.db, "usage_records", properties(profile["schema"]), profile["rows"])
+            create_table(
+                self.db, "usage_records", properties(profile["schema"]), profile["rows"]
+            )
             for case in cases:
                 with self.subTest(id=case["id"]):
                     with self.assertRaises(psycopg.errors.UndefinedColumn) as error:
@@ -127,6 +135,244 @@ class PostgresReferenceTest(unittest.TestCase):
                             self.db.execute(case["sql"])
                     self.assertEqual("42703", error.exception.sqlstate)
                     self.assertIn('"row_num"', str(error.exception))
+
+    def mutation_profile(self):
+        return {
+            "schema": {
+                "default_type": "row",
+                "document_schemas": {
+                    "row": {
+                        "schema": {
+                            "properties": {
+                                "id": {"type": "keyword"},
+                                "amount": {"type": "integer"},
+                                "metadata": {"type": "json"},
+                            }
+                        }
+                    }
+                },
+            },
+            "primary_key": ["id"],
+            "rows": [
+                {
+                    "key": "a",
+                    "value": {"id": "u1", "amount": 5, "metadata": {"source": "api"}},
+                },
+                {"key": "b", "value": {"id": "u2", "amount": 9, "metadata": None}},
+            ],
+        }
+
+    def test_mutation_stream_records_authentic_counts_nulls_and_fresh_state(self):
+        cases = [
+            self.case(
+                "UPDATE usage_records SET amount=amount+$1 RETURNING id,amount", [1]
+            ),
+            self.case("DELETE FROM usage_records WHERE id='u1'"),
+            self.case(
+                "UPDATE usage_records SET metadata='null'::jsonb WHERE id='u1' RETURNING metadata"
+            ),
+            self.case(
+                "UPDATE usage_records SET metadata=NULL WHERE id='u1' RETURNING metadata"
+            ),
+            self.case(
+                "INSERT INTO usage_records (id,amount) VALUES ('u3',9007199254740993) RETURNING id,amount"
+            ),
+        ]
+        result = mutation_reference(self.db, cases, self.mutation_profile())
+        self.assertEqual([], result["excluded"])
+        entries = result["entries"]
+        self.assertEqual(
+            ["UPDATE", "DELETE", "UPDATE", "UPDATE", "INSERT"],
+            [entry["command_tag"] for entry in entries],
+        )
+        self.assertEqual([2, 1, 1, 1, 1], [entry["affected"] for entry in entries])
+        self.assertEqual([["u1", 6], ["u2", 10]], entries[0]["rows"])
+        self.assertEqual([25, 20], entries[0]["column_oids"])
+        self.assertEqual([], entries[1]["rows"])
+        self.assertEqual(
+            [["u2", 9, None]], entries[1]["final_tables"]["usage_records"]["rows"]
+        )
+        self.assertEqual([[False]], entries[2]["sql_nulls"])
+        self.assertEqual([[True]], entries[3]["sql_nulls"])
+        self.assertEqual(
+            [[False, False, False], [False, False, True]],
+            entries[2]["final_tables"]["usage_records"]["sql_nulls"],
+        )
+        self.assertEqual([["u3", 9007199254740993]], entries[4]["rows"])
+        self.assertEqual(3, len(entries[4]["final_tables"]["usage_records"]["rows"]))
+        self.assertIsNone(
+            self.db.execute("SELECT to_regclass('public.usage_records')").fetchone()[0]
+        )
+
+    def test_mutation_stream_joined_and_conflict_profiles_capture_every_table(self):
+        profile = self.mutation_profile()
+        profile["unique"] = [["amount"]]
+        profile["additional_tables"] = [
+            {
+                "name": "archived_records",
+                "schema": profile["schema"],
+                "primary_key": ["id"],
+                "rows": [
+                    {
+                        "key": "archived",
+                        "value": {
+                            "id": "u1",
+                            "amount": 3,
+                            "metadata": {"archive": True},
+                        },
+                    }
+                ],
+            }
+        ]
+        cases = [
+            self.case(
+                "UPDATE usage_records AS target SET amount=source.amount FROM archived_records AS source WHERE target.id=source.id RETURNING target.id,target.amount"
+            ),
+            self.case(
+                "INSERT INTO usage_records (id,amount) VALUES ('u1',2) ON CONFLICT (id) DO UPDATE SET amount=usage_records.amount+excluded.amount RETURNING id,amount"
+            ),
+            self.case(
+                "INSERT INTO usage_records (id,amount) VALUES ('u3',5) ON CONFLICT (amount) DO UPDATE SET metadata='null'::jsonb RETURNING id,metadata"
+            ),
+        ]
+        result = mutation_reference(self.db, cases, profile)
+        self.assertEqual([], result["excluded"])
+        self.assertEqual([["u1", 3]], result["entries"][0]["rows"])
+        self.assertEqual([["u1", 7]], result["entries"][1]["rows"])
+        self.assertEqual([["u1", None]], result["entries"][2]["rows"])
+        self.assertEqual([[False, False]], result["entries"][2]["sql_nulls"])
+        for entry in result["entries"]:
+            self.assertEqual(
+                {"usage_records", "archived_records"}, set(entry["final_tables"])
+            )
+            self.assertEqual(
+                [["u1", 3, {"archive": True}]],
+                entry["final_tables"]["archived_records"]["rows"],
+            )
+
+    def test_mutation_stream_quota_and_constraint_failures_recover_the_connection(self):
+        cases = [
+            self.case("INSERT INTO usage_records (id,amount) VALUES ('u1',1)"),
+            self.case(
+                "INSERT INTO usage_records (id,amount) SELECT 'new_'||n, n FROM generate_series(1,20) n RETURNING id,amount"
+            ),
+            self.case(
+                "INSERT INTO usage_records (id,amount) SELECT 'new_'||n, n FROM generate_series(1,20) n"
+            ),
+            self.case("SELECT 1"),
+            self.case(
+                "UPDATE usage_records SET amount=amount+1 WHERE id='u1' RETURNING amount"
+            ),
+        ]
+        result = mutation_reference(
+            self.db, cases, self.mutation_profile(), row_limit=2
+        )
+        self.assertEqual(4, len(result["excluded"]))
+        self.assertEqual("23505", result["excluded"][0]["sqlstate"])
+        self.assertIn("RETURNING exceeds row budget", result["excluded"][1]["reason"])
+        self.assertIn("exceeds row budget", result["excluded"][2]["reason"])
+        self.assertIn("not a mutation", result["excluded"][3]["reason"])
+        self.assertEqual([[6]], result["entries"][0]["rows"])
+        self.assertEqual(
+            [["u1", 6, {"source": "api"}], ["u2", 9, None]],
+            result["entries"][0]["final_tables"]["usage_records"]["rows"],
+        )
+
+    def test_original_postgres_mutation_campaign_goldens_are_complete_and_repeatable(
+        self,
+    ):
+        import json
+        from pathlib import Path
+
+        fixtures = (
+            Path(__file__).resolve().parents[1]
+            / "zig/pkg/antfly-embedded/src/sql/fixtures"
+        )
+        manifest = json.loads((fixtures / "sql_mutation_campaign.json").read_text())
+        profile = json.loads(
+            (fixtures / "sql_mutation_campaign_profile.json").read_text()
+        )
+        golden = json.loads(
+            (fixtures / "sql_mutation_postgres_reference.json").read_text()
+        )
+        inventory = json.loads((fixtures / "sql_parity_inventory.json").read_text())[
+            "entries"
+        ]
+        requested = {case["id"] for case in manifest["entries"]}
+        self.assertEqual(235, len(requested))
+        cases = [case for case in inventory if case["id"] in requested]
+        result = mutation_reference(self.db, cases, profile)
+        self.assertEqual(48, len(result["entries"]))
+        self.assertEqual(187, len(result["excluded"]))
+        self.assertEqual(
+            requested, {case["id"] for case in result["entries"] + result["excluded"]}
+        )
+        self.assertEqual(profile, golden["profile"])
+        self.assertEqual(golden["entries"], result["entries"])
+        for entry in result["entries"]:
+            self.assertGreater(entry["affected"], 0)
+            self.assertEqual(
+                {"usage_records", "archived_records", "source_records"},
+                set(entry["final_tables"]),
+            )
+        # Classifications are profile-scoped discovery, never disposition credit.
+        # In particular a missing arbiter is not a PostgreSQL syntax rejection.
+        excluded = {case["id"]: case for case in result["excluded"]}
+        self.assertEqual("42601", excluded["sql-0574"]["sqlstate"])
+        self.assertEqual("42P10", excluded["sql-1394"]["sqlstate"])
+
+    def test_mutation_stream_byte_quota_covers_returning_and_post_state(self):
+        cases = [
+            self.case(
+                "UPDATE usage_records SET amount=amount+1 WHERE id='u1' RETURNING repeat('x',4096)"
+            ),
+            self.case(
+                "UPDATE usage_records SET metadata=jsonb_build_object('payload',repeat('x',4096)) WHERE id='u1'"
+            ),
+            self.case(
+                "UPDATE usage_records SET amount=amount+1 WHERE id='u1' RETURNING amount"
+            ),
+        ]
+        result = mutation_reference(
+            self.db, cases, self.mutation_profile(), byte_limit=128
+        )
+        self.assertEqual(2, len(result["excluded"]))
+        self.assertIn("RETURNING exceeds byte budget", result["excluded"][0]["reason"])
+        self.assertIn(
+            "final state exceeds byte budget", result["excluded"][1]["reason"]
+        )
+        self.assertEqual([[6]], result["entries"][0]["rows"])
+        self.assertEqual(
+            [["u1", 6, {"source": "api"}], ["u2", 9, None]],
+            result["entries"][0]["final_tables"]["usage_records"]["rows"],
+        )
+
+    def test_mutation_profile_gaps_fail_closed_before_case_execution(self):
+        for change in [
+            lambda profile: profile.update(primary_key=["missing"]),
+            lambda profile: profile.update(unique=[[]]),
+            lambda profile: profile.update(checks=["amount > 0"]),
+            lambda profile: profile["schema"]["document_schemas"]["row"]["schema"][
+                "properties"
+            ]["metadata"].update(type="array"),
+            lambda profile: profile["schema"]["document_schemas"]["row"]["schema"][
+                "properties"
+            ]["amount"].update(default=1),
+            lambda profile: profile.update(
+                additional_tables=[
+                    {"name": "usage_records", "schema": profile["schema"], "rows": []}
+                ]
+            ),
+        ]:
+            profile = self.mutation_profile()
+            change(profile)
+            with self.assertRaises(ValueError):
+                mutation_reference(
+                    self.db, [self.case("DELETE FROM usage_records")], profile
+                )
+        self.assertIsNone(
+            self.db.execute("SELECT to_regclass('public.usage_records')").fetchone()[0]
+        )
 
     def test_like_explicit_escape_contracts(self):
         cases = [

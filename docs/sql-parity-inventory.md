@@ -323,10 +323,38 @@ original name, and qualified synonyms do not add per-row payload cells.
 
 The next mutation campaign is a fixed, source-owned 235-case cohort, not a
 completion claim: 91 INSERT/source cases, 76 nonjoined UPDATE/DELETE/source
-cases and 68 joined mutations. Compiler discovery currently admits 102/235;
+cases and 68 joined mutations. Compiler discovery currently admits 104/235;
 it never updates dispositions. Set `ANTFLY_SQL_MUTATION_DISCOVERY=1` to report
 individual compiler gaps. Its profiles separate point, conflict/index-owner,
 source, temporal and joined execution contracts.
+
+The PostgreSQL mutation oracle now covers the full fixed cohort for discovery.
+Its explicit profile declares logical primary keys and three separate tables;
+every successful case records the server's actual command tag and affected-row
+count, complete RETURNING labels/types/SQL NULL flags, and every table's complete
+post-state. Single-row libpq streaming bounds retained result rows before a
+large RETURNING result can be buffered. The oracle pins Psycopg 3.3.6 and uses a
+tested oracle-only cursor adapter to retain the terminal command result which
+that version's streaming interface discards. A shared 16 MiB wire-payload budget
+bounds retained result volume across RETURNING and every post-state table;
+single incoming row buffers and decoded Python object overhead are additional,
+not an exact process-RSS guarantee. Quota failures close, cancel and
+drain the stream before savepoint rollback; later cases must still see the
+original baseline. Schema setup is validated outside per-case discovery, and
+generated/default producers require explicit reset machinery rather than being
+mistakenly isolated by savepoint rollback.
+
+Forty-eight positive PostgreSQL mutation goldens are reproducible on this
+profile. The remaining 187 outcomes are **not** 187 unsupported-feature
+classifications: they include absent arbiters, missing typed profiles, ambiguous
+historical SQL, nondeterministic producers and non-exercising inputs. Missing
+partial/expression indexes and CHECK/FK owners still require their own profiles.
+Neither a PostgreSQL golden nor discovery alone changes an original disposition;
+the complete native endpoint, storage and owner contracts remain required.
+
+```sh
+uv run --no-project --with 'psycopg[binary]==3.3.6' python scripts/generate_sql_postgres_reference.py mutation --check zig/pkg/antfly-embedded/src/sql/fixtures/sql_mutation_postgres_reference.json
+```
 
 `sql-0571`, `sql-0572`, `sql-0606`, `sql-0607`, `sql-1488` and `sql-1493`
 execute exact SQL and parameters against a fresh native table for each case.

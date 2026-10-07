@@ -296,6 +296,194 @@ def cursor_result(cursor, case, read):
     }
 
 
+def mutation_reference(
+    db, cases, profile, row_limit=ROW_LIMIT, byte_limit=16 * 1024 * 1024
+):
+    """Exact mutations, isolated by savepoints, with complete multi-table state.
+
+    Psycopg 3.3.6 streaming discards the terminal command result. The pinned
+    adapter below retains its authentic command tag/count instead of inferring
+    affected rows from RETURNING or buffering the complete libpq result.
+    This is an oracle-only adapter, not production execution machinery.
+    """
+    import psycopg
+    from contextlib import closing
+    from psycopg import sql
+    from psycopg.generators import fetch
+    from psycopg.pq import ExecStatus
+
+    if psycopg.__version__ != "3.3.6":
+        raise RuntimeError("mutation streaming oracle requires pinned psycopg 3.3.6")
+    if not 0 < row_limit <= ROW_LIMIT:
+        raise ValueError("invalid mutation reference row limit")
+    if not 0 < byte_limit <= 64 * 1024 * 1024:
+        raise ValueError("invalid mutation reference byte limit")
+
+    class StreamingMutationCursor(psycopg.RawCursor):
+        terminal = None
+
+        def _stream_fetchone_gen(self, first):
+            result = yield from fetch(self._pgconn)
+            if result is None:
+                return None
+            if result.status in {ExecStatus.SINGLE_TUPLE, ExecStatus.TUPLES_CHUNK}:
+                self.pgresult = result
+                self._tx.set_pgresult(result, set_loaders=first)
+                if first:
+                    self._make_row = self._make_row_maker()
+                return result
+            if result.status in {ExecStatus.TUPLES_OK, ExecStatus.COMMAND_OK}:
+                self.terminal = result
+                while (yield from fetch(self._pgconn)) is not None:
+                    raise ValueError("multiple SQL results are not a mutation contract")
+                return None
+            return self._raise_for_result(result)
+
+    def collect(cursor, query, params, budget, label):
+        rows, nulls = [], []
+        # Single-row libpq mode bounds outstanding rows; byte admission bounds
+        # retained decoded output across RETURNING and every post-state table.
+        # Closing a partially consumed generator cancels/drains before rollback.
+        with closing(cursor.stream(query, params)) as stream:
+            for row in stream:
+                if len(rows) >= row_limit:
+                    raise ValueError(label + " exceeds row budget")
+                raw = [cursor.pgresult.get_value(0, i) for i in range(len(row))]
+                size = sum(len(cell) for cell in raw if cell is not None)
+                if size > budget[0]:
+                    raise ValueError(label + " exceeds byte budget")
+                budget[0] -= size
+                rows.append([encoded(cell) for cell in row])
+                nulls.append([cell is None for cell in raw])
+        terminal = cursor.terminal
+        if terminal is None or not terminal.command_status:
+            raise ValueError("missing command completion")
+        return {
+            "command_tag": terminal.command_status.decode("ascii").split()[0],
+            "affected": terminal.command_tuples,
+            "columns": [
+                terminal.fname(i).decode("utf-8") for i in range(terminal.nfields)
+            ],
+            "column_oids": [terminal.ftype(i) for i in range(terminal.nfields)],
+            "rows": rows,
+            "sql_nulls": nulls,
+        }
+
+    tables = [
+        {
+            "name": "usage_records",
+            "schema": profile["schema"],
+            "rows": profile["rows"],
+            "primary_key": profile.get("primary_key", []),
+            "unique": profile.get("unique", []),
+            "checks": profile.get("checks", []),
+            "foreign_keys": profile.get("foreign_keys", []),
+            "indexes": profile.get("indexes", []),
+        },
+        *profile.get("additional_tables", []),
+    ]
+    names = [table["name"] for table in tables]
+    if len(tables) > 8 or len(set(names)) != len(names):
+        raise ValueError("mutation profile requires distinct bounded table names")
+    if sum(len(table["rows"]) for table in tables) > row_limit:
+        raise ValueError("mutation seed rows exceed the profile budget")
+    entries, excluded = [], []
+    with db.transaction(force_rollback=True):
+        for table in tables:
+            props = properties(table["schema"])
+            if any(prop.get("type") == "array" for prop in props.values()):
+                raise ValueError("typed SQL arrays require a dedicated column profile")
+            if any(table.get(field) for field in ("checks", "foreign_keys", "indexes")):
+                raise ValueError("constraint/index owner profile is not declared")
+            if len(table.get("unique", [])) > 128 or any(
+                not key for key in table.get("unique", [])
+            ):
+                raise ValueError("unique constraints require bounded nonempty keys")
+            # Identity/default producers need per-case sequence/state reset;
+            # savepoint rollback alone is not an oracle for those contracts.
+            if any("generated" in prop or "default" in prop for prop in props.values()):
+                raise ValueError(
+                    "generated/default owner profile requires explicit reset"
+                )
+            create_table(db, table["name"], props, table["rows"])
+            keys = [("PRIMARY KEY", table.get("primary_key", []))]
+            keys += [("UNIQUE", key) for key in table.get("unique", [])]
+            for kind, columns in keys:
+                if not columns:
+                    continue
+                if len(set(columns)) != len(columns) or set(columns) - set(props):
+                    raise ValueError(
+                        "constraint columns must belong to the pinned schema"
+                    )
+                db.execute(
+                    sql.SQL("ALTER TABLE public.{} ADD {} ({})").format(
+                        sql.Identifier(table["name"]),
+                        sql.SQL(kind),
+                        sql.SQL(",").join(map(sql.Identifier, columns)),
+                    )
+                )
+        for case in cases:
+            try:
+                if re.search(
+                    r"\b(CURRENT_TIMESTAMP|CURRENT_DATE|CURRENT_TIME|random|randomblob|gen_random_uuid)\b",
+                    case["sql"],
+                    re.I,
+                ):
+                    raise ValueError(
+                        "nondeterministic/native producer profile required"
+                    )
+                with db.transaction(force_rollback=True):
+                    remaining = [byte_limit]
+                    with StreamingMutationCursor(db) as cursor:
+                        entry = collect(
+                            cursor,
+                            case["sql"],
+                            parameters(case),
+                            remaining,
+                            "mutation RETURNING",
+                        )
+                    tag = entry["command_tag"]
+                    affected = entry["affected"]
+                    if tag not in {"INSERT", "UPDATE", "DELETE", "MERGE"}:
+                        raise ValueError("statement is not a mutation")
+                    if affected is None or not 0 < affected <= row_limit:
+                        raise ValueError(
+                            "mutation is non-exercising or exceeds row budget"
+                        )
+                    entry.update(id=case["id"], final_tables={})
+                    for table in tables:
+                        columns = list(properties(table["schema"]))
+                        query = sql.SQL("SELECT {} FROM public.{} ORDER BY {}").format(
+                            sql.SQL(",").join(map(sql.Identifier, columns)),
+                            sql.Identifier(table["name"]),
+                            sql.SQL(",").join(map(sql.Identifier, columns)),
+                        )
+                        with StreamingMutationCursor(db) as cursor:
+                            state = collect(
+                                cursor, query, None, remaining, "mutation final state"
+                            )
+                        if state.pop("command_tag") != "SELECT":
+                            raise ValueError("invalid final state command")
+                        state.pop("affected")
+                        entry["final_tables"][table["name"]] = state
+                    entries.append(entry)
+            except (psycopg.Error, ValueError, KeyError, TypeError) as error:
+                excluded.append(
+                    {
+                        "id": case["id"],
+                        "sqlstate": getattr(error, "sqlstate", None),
+                        "reason": str(error),
+                    }
+                )
+    return {
+        "format": 3,
+        "reference": "PostgreSQL exact SQL",
+        "profile": profile,
+        "entries": entries,
+        "excluded": excluded,
+    }
+
+
 def read_reference(db, cases, profile):
     import psycopg
 
@@ -475,7 +663,7 @@ def document_reference(db, cases, schemas):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("campaign", choices=["read", "document", "lateral"])
+    parser.add_argument("campaign", choices=["read", "document", "lateral", "mutation"])
     parser.add_argument(
         "--check",
         type=Path,
@@ -501,11 +689,13 @@ def main():
     ]
     cases = [case for case in inventory if case["id"] in set(requested)]
     with postgres() as db:
-        if args.campaign in {"read", "lateral"}:
+        if args.campaign in {"read", "lateral", "mutation"}:
             profile = json.loads(
                 (FIXTURES / f"sql_{args.campaign}_campaign_profile.json").read_text()
             )
-            result = read_reference(db, cases, profile)
+            result = (
+                mutation_reference if args.campaign == "mutation" else read_reference
+            )(db, cases, profile)
         else:
             result = document_reference(
                 db,
