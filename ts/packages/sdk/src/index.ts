@@ -464,6 +464,7 @@ export type {
   SQLConnectionResponse,
   SQLDiagnostic,
   SQLMutationOutcome,
+  SQLParameterDescriptor,
   SQLPreparedExecutionRequest,
   SQLPreparedResponse,
   SQLPrepareRequest,

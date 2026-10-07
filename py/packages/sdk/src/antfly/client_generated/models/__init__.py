@@ -1243,6 +1243,7 @@ from .sql_connection_open_request import SQLConnectionOpenRequest
 from .sql_connection_response import SQLConnectionResponse
 from .sql_diagnostic import SQLDiagnostic
 from .sql_mutation_outcome import SQLMutationOutcome
+from .sql_parameter_descriptor import SQLParameterDescriptor
 from .sql_prepare_request import SQLPrepareRequest
 from .sql_prepared_execution_request import SQLPreparedExecutionRequest
 from .sql_prepared_response import SQLPreparedResponse
@@ -2658,6 +2659,7 @@ __all__ = (
     "SQLDDLReceiptState",
     "SQLDiagnostic",
     "SQLMutationOutcome",
+    "SQLParameterDescriptor",
     "SQLPreparedExecutionRequest",
     "SQLPreparedResponse",
     "SQLPrepareRequest",

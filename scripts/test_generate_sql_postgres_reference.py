@@ -1276,6 +1276,29 @@ class PostgresReferenceTest(unittest.TestCase):
                 finally:
                     self.db.execute("DEALLOCATE ALL")
 
+    def test_binary_array_input_oid_mismatch_uses_datatype_mismatch(self):
+        import struct
+        import psycopg
+        from psycopg.adapt import Dumper
+        from psycopg.pq import Format
+
+        class Payload:
+            pass
+
+        class ArrayDumper(Dumper):
+            oid = 1016
+            format = Format.BINARY
+
+            def dump(self, obj):
+                # Declared bigint[] parameter, binary header claims int4 cells.
+                return struct.pack("!iii", 0, 0, 23)
+
+        self.db.adapters.register_dumper(Payload, ArrayDumper)
+        with self.db.transaction(force_rollback=True):
+            with self.assertRaises(psycopg.Error) as raised:
+                self.db.execute("SELECT %s", (Payload(),))
+            self.assertEqual("42804", raised.exception.sqlstate)
+
     def test_wire_parameter_descriptors_preserve_declared_and_inferred_array_oids(self):
         for sql_type, oid in (
             ("boolean", 1000),

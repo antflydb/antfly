@@ -5709,13 +5709,16 @@ pub const AntflyApiHandler = struct {
                 const encoded_owner = try std.fmt.bufPrint(&owner_buffer, "{d}", .{self.adapter.server.localSessionNodeId()});
                 const parameter_types = description.arena.allocator().alloc(sql_wire.SQLColumnType, description.binding.parameter_types.len) catch |err| return if (binding_budget.exhausted) error.SqlProgramLimitExceeded else err;
                 for (description.binding.parameter_types, parameter_types) |kind, *output| output.* = if (kind) |value| switch (value) {
-                    .array => return error.UnsupportedSqlShape,
                     inline else => |tag| @field(sql_wire.SQLColumnType, @tagName(tag)),
                 } else .unknown;
-                const response = std.json.Stringify.valueAlloc(self.prepared_response_budget.allocator(), .{ .prepared_id = @as([]const u8, &id), .expires_at_ms = expires, .owner_node_id = encoded_owner, .parameter_types = parameter_types, .columns = description.binding.columns }, .{}) catch |err| return if (self.prepared_response_budget.exhausted) error.SqlProgramLimitExceeded else err;
+                const parameter_descriptors = try description.arena.allocator().alloc(sql_wire.SQLParameterDescriptor, parameter_types.len);
+                for (parameter_descriptors, parameter_types, description.binding.parameter_descriptors) |*output, kind, descriptor| output.* = .{ .type = kind, .nullable = descriptor.nullable, .element_type = if (descriptor.element_type) |element| switch (element) {
+                    inline else => |tag| @field(sql_wire.SQLArrayElementType, @tagName(tag)),
+                } else null };
+                const response = std.json.Stringify.valueAlloc(self.prepared_response_budget.allocator(), .{ .prepared_id = @as([]const u8, &id), .expires_at_ms = expires, .owner_node_id = encoded_owner, .parameter_types = parameter_types, .parameter_descriptors = parameter_descriptors, .columns = description.binding.columns }, .{}) catch |err| return if (self.prepared_response_budget.exhausted) error.SqlProgramLimitExceeded else err;
                 errdefer self.prepared_response_budget.allocator().free(response);
                 try self.adapter.context.ensureActive();
-                try prepared.create(self.adapter.server.txn_sessions.durable.?, .{ .id = id, .principal = resource_principal, .owner_node_id = self.adapter.server.localSessionNodeId(), .expires_at_ms = expires, .database = self.adapter.database, .namespace = self.adapter.namespace, .statement = self.statement, .session_id = if (attached_id) |session| std.fmt.bytesToHex(session, .lower) else null, .connection_id = self.adapter.connection_id, .connection_generation = self.adapter.connection_generation, .setting_epoch = if (compiled.uses_current_setting) description.settings.?.epoch else null, .parameter_types = description.binding.parameter_types, .bindings = bindings.items }, now_ms);
+                try prepared.create(self.adapter.server.txn_sessions.durable.?, .{ .id = id, .principal = resource_principal, .owner_node_id = self.adapter.server.localSessionNodeId(), .expires_at_ms = expires, .database = self.adapter.database, .namespace = self.adapter.namespace, .statement = self.statement, .session_id = if (attached_id) |session| std.fmt.bytesToHex(session, .lower) else null, .connection_id = self.adapter.connection_id, .connection_generation = self.adapter.connection_generation, .setting_epoch = if (compiled.uses_current_setting) description.settings.?.epoch else null, .parameter_types = description.binding.parameter_types, .parameter_descriptors = description.binding.parameter_descriptors, .bindings = bindings.items }, now_ms);
                 self.prepared_response = response;
                 return;
             }
@@ -5730,7 +5733,9 @@ pub const AntflyApiHandler = struct {
             defer execution.release();
             self.preparation.release();
             self.execution_entered = true;
-            self.result = self.adapter.execute(std.heap.page_allocator, compiled, self.parameters, .{ .result_rows = self.limit }, null) catch |err| {
+            var execution_backend = self.adapter.backend();
+            if (resource) |owned| execution_backend.parameter_descriptor_hints = owned.value.parameter_descriptors;
+            self.result = self.adapter.execute(std.heap.page_allocator, compiled, self.parameters, .{ .result_rows = self.limit }, if (resource != null) execution_backend else null) catch |err| {
                 self.failure = err;
                 return;
             };
@@ -13776,6 +13781,58 @@ test "httpx SQL executes one relational page with exact integer parameters" {
                 try std.testing.expectEqual(@as(u16, 200), closed_response.status.code);
             }
         }
+    }
+    {
+        var prepare_request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql/prepared");
+        defer prepare_request.deinit();
+        prepare_request.body = "{\"statement\":\"SELECT $1::bigint[] a,$2::integer+1 n FROM usage_records LIMIT 1\"}";
+        var prepare_context = httpx.Context.init(alloc, std.testing.io, &prepare_request);
+        defer prepare_context.deinit();
+        var prepared = try handler.prepareSQL(&prepare_context);
+        defer prepared.deinit();
+        try std.testing.expectEqual(@as(u16, 200), prepared.status.code);
+        const description = try std.json.parseFromSlice(sql_wire.SQLPreparedResponse, alloc, prepared.body.?, .{});
+        defer description.deinit();
+        try std.testing.expectEqual(@as(usize, 2), description.value.parameter_descriptors.len);
+        try std.testing.expectEqual(sql_wire.SQLColumnType.array, description.value.parameter_descriptors[0].type);
+        try std.testing.expectEqual(@as(?sql_wire.SQLArrayElementType, .int64), description.value.parameter_descriptors[0].element_type);
+        try std.testing.expectEqual(@as(?sql_wire.SQLArrayElementType, .int32), description.value.parameter_descriptors[1].element_type);
+        const cases = [_]struct { body: []const u8, success: bool }{
+            .{ .body = "{\"parameters\":[\"[-1:1]={9007199254740993,NULL,2}\",41]}", .success = true },
+            .{ .body = "{\"parameters\":[{\"dimensions\":[{\"length\":3,\"lower_bound\":-1}],\"values\":[\"9007199254740993\",null,\"2\"],\"sql_nulls\":[false,true,false]},41]}", .success = true },
+            .{ .body = "{\"parameters\":[\"{1}\",9007199254740993]}", .success = false },
+            .{ .body = "{\"parameters\":[[1,2],41]}", .success = false },
+            .{ .body = "{\"parameters\":[{\"dimensions\":[{\"length\":1,\"lower\":0}],\"values\":[\"1\"],\"sql_nulls\":[false]},41]}", .success = false },
+        };
+        for (cases) |case| {
+            var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql/prepared/id/execute");
+            defer request.deinit();
+            request.body = case.body;
+            var context = httpx.Context.init(alloc, std.testing.io, &request);
+            defer context.deinit();
+            var response = try handler.executePreparedSQL(&context, description.value.prepared_id);
+            defer response.deinit();
+            if (!case.success) {
+                try std.testing.expectEqual(@as(u16, 400), response.status.code);
+                continue;
+            }
+            try std.testing.expectEqual(@as(u16, 200), response.status.code);
+            const result = try std.json.parseFromSlice(sql_wire.SQLResponse, alloc, response.body.?, .{});
+            defer result.deinit();
+            try std.testing.expectEqualStrings("42", result.value.rows[0][1].string);
+            var actual = try @import("antfly_local_sources").sql_array_wire.decode(alloc, .int64, result.value.rows[0][0], .{});
+            defer actual.deinit();
+            try std.testing.expectEqual(@as(i32, -1), actual.value.dimensions[0].lower);
+            try std.testing.expectEqual(@as(i64, 9007199254740993), actual.value.elements[0].value.integer);
+            try std.testing.expect(actual.value.elements[1].sql_null);
+        }
+        var close_request = try httpx.Request.init(alloc, .DELETE, "http://127.0.0.1/db/v1/sql/prepared/id");
+        defer close_request.deinit();
+        var close_context = httpx.Context.init(alloc, std.testing.io, &close_request);
+        defer close_context.deinit();
+        var closed = try handler.closePreparedSQL(&close_context, description.value.prepared_id);
+        defer closed.deinit();
+        try std.testing.expectEqual(@as(u16, 200), closed.status.code);
     }
     // Force several physical pages through the real native adapter, not a
     // synthetic Backend claiming snapshot support. The cursor owns the view

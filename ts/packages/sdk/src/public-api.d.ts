@@ -4558,6 +4558,12 @@ export interface components {
             database: string;
             namespace: string;
         };
+        /** @description Immutable positional input contract. Element identity also preserves primitive widths; array inputs require it. Unknown slots have no SQL constraint. */
+        SQLParameterDescriptor: {
+            type: components["schemas"]["SQLColumnType"];
+            element_type?: components["schemas"]["SQLArrayElementType"];
+            nullable: boolean;
+        };
         SQLPreparedResponse: {
             prepared_id: string;
             /** Format: int64 */
@@ -4565,6 +4571,8 @@ export interface components {
             /** @description Exact decimal API owner identifier, preserved by JavaScript clients. */
             owner_node_id: string;
             parameter_types: components["schemas"]["SQLColumnType"][];
+            /** @description Precise positional contracts, aligned with parameter_types. Array arguments use the lossless SQLArrayValue envelope or PostgreSQL array text; plain JSON arrays are not SQL arrays. */
+            parameter_descriptors: components["schemas"]["SQLParameterDescriptor"][];
             columns: components["schemas"]["SQLColumn"][];
         };
         /** @description One typed setting value, matching the declared kind. */

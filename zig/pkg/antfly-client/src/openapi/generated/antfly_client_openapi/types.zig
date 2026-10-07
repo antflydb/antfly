@@ -37031,6 +37031,41 @@ pub const SQLMutationOutcome = enum {
     }
 };
 
+/// Immutable positional input contract. Element identity also preserves primitive widths; array inputs require it. Unknown slots have no SQL constraint.
+pub const SQLParameterDescriptor = struct {
+    type: SQLColumnType,
+    element_type: ?SQLArrayElementType = null,
+    nullable: bool,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "element_type", "element_type", true },
+        .{ "nullable", "nullable", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.element_type) |value| {
+            try jw.objectField("element_type");
+            try jw.write(value);
+        }
+        try jw.objectField("nullable");
+        try jw.write(self.nullable);
+        try jw.endObject();
+    }
+};
+
 pub const SQLPrepareRequest = struct {
     statement: []const u8,
     database: ?[]const u8 = null,
@@ -37133,6 +37168,8 @@ pub const SQLPreparedResponse = struct {
     /// Exact decimal API owner identifier, preserved by JavaScript clients.
     owner_node_id: []const u8,
     parameter_types: []const SQLColumnType,
+    /// Precise positional contracts, aligned with parameter_types. Array arguments use the lossless SQLArrayValue envelope or PostgreSQL array text; plain JSON arrays are not SQL arrays.
+    parameter_descriptors: []const SQLParameterDescriptor,
     columns: []const SQLColumn,
 };
 

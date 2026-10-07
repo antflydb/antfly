@@ -57,10 +57,16 @@ def test_prepared_sql_lifecycle_preserves_owner_and_execution_shape():
         "owner_node_id": "9007199254740993",
         "expires_at_ms": 123,
         "columns": [],
-        "parameter_types": [],
+        "parameter_types": ["array", "integer"],
+        "parameter_descriptors": [
+            {"type": "array", "element_type": "int64", "nullable": True},
+            {"type": "integer", "element_type": "int32", "nullable": True},
+        ],
     }
     with patch.object(client, "_request", return_value=prepared) as request:
-        assert client.prepare_sql(SQLPrepareRequest(statement="SELECT 1")).owner_node_id == "9007199254740993"
+        result = client.prepare_sql(SQLPrepareRequest(statement="SELECT $1::bigint[],$2::integer"))
+        assert result.owner_node_id == "9007199254740993"
+        assert [item.to_dict() for item in result.parameter_descriptors] == prepared["parameter_descriptors"]
         assert request.call_args.kwargs["follow_redirects"] is False
     with patch.object(client, "_request", return_value={"columns": [], "rows": [[1]]}):
         with pytest.raises(AntflyException, match="row width"):

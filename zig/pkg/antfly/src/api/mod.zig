@@ -249,6 +249,7 @@ test "api module compiles" {
     _ = @import("sql_schema_cache.zig");
     _ = sql_pgwire;
     _ = sql_session;
+    _ = @import("sql_prepared.zig");
     _ = @import("sql_connection_record.zig");
     _ = @import("sql_connections.zig");
     _ = cluster;

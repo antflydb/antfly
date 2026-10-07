@@ -12260,6 +12260,21 @@ components:
           type: string
         namespace:
           type: string
+    SQLParameterDescriptor:
+      type: object
+      additionalProperties: false
+      required:
+        - type
+        - nullable
+      description: Immutable positional input contract. Element identity also preserves primitive widths;
+        array inputs require it. Unknown slots have no SQL constraint.
+      properties:
+        type:
+          $ref: '#/components/schemas/SQLColumnType'
+        element_type:
+          $ref: '#/components/schemas/SQLArrayElementType'
+        nullable:
+          type: boolean
     SQLPreparedResponse:
       type: object
       additionalProperties: false
@@ -12268,6 +12283,7 @@ components:
         - expires_at_ms
         - owner_node_id
         - parameter_types
+        - parameter_descriptors
         - columns
       properties:
         prepared_id:
@@ -12285,6 +12301,14 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/SQLColumnType'
+        parameter_descriptors:
+          type: array
+          maxItems: 1024
+          description: Precise positional contracts, aligned with parameter_types. Array arguments use
+            the lossless SQLArrayValue envelope or PostgreSQL array text; plain JSON arrays are not SQL
+            arrays.
+          items:
+            $ref: '#/components/schemas/SQLParameterDescriptor'
         columns:
           type: array
           items:

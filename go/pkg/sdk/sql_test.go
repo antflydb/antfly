@@ -26,6 +26,23 @@ import (
 	"testing"
 )
 
+func TestPreparedSQLParameterContractsRetainElementIdentity(t *testing.T) {
+	var response SQLPreparedResponse
+	if err := json.Unmarshal([]byte(`{"prepared_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","expires_at_ms":123,"owner_node_id":"9007199254740993","parameter_types":["array","integer"],"parameter_descriptors":[{"type":"array","element_type":"int64","nullable":true},{"type":"integer","element_type":"int32","nullable":true}],"columns":[]}`), &response); err != nil {
+		t.Fatal(err)
+	}
+	if len(response.ParameterDescriptors) != 2 {
+		t.Fatalf("unexpected parameter count: %d", len(response.ParameterDescriptors))
+	}
+	var array SQLParameterDescriptor = response.ParameterDescriptors[0]
+	if array.Type != "array" || array.ElementType != "int64" || !array.Nullable {
+		t.Fatalf("lost array contract: %+v", array)
+	}
+	if response.ParameterDescriptors[1].ElementType != "int32" {
+		t.Fatal("lost primitive width")
+	}
+}
+
 func TestExecuteSQLPreservesBoundValuesAndResultOrdinals(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost || r.URL.Path != "/db/v1/sql" {

@@ -160,6 +160,7 @@ export type SQLConnectionResponse = components["schemas"]["SQLConnectionResponse
 export type SQLPrepareRequest = components["schemas"]["SQLPrepareRequest"];
 export type SQLPreparedExecutionRequest = components["schemas"]["SQLPreparedExecutionRequest"];
 export type SQLPreparedResponse = components["schemas"]["SQLPreparedResponse"];
+export type SQLParameterDescriptor = components["schemas"]["SQLParameterDescriptor"];
 export type SQLResponse = components["schemas"]["SQLResponse"];
 export type SQLArrayDimension = components["schemas"]["SQLArrayDimension"];
 export type SQLArrayElementType = components["schemas"]["SQLArrayElementType"];

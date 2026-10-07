@@ -14,8 +14,29 @@
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AntflyClient, SQLExecutionError } from "../src/client.js";
+import type { SQLPreparedResponse } from "../src/types.js";
 
 afterEach(() => vi.unstubAllGlobals());
+
+it("preserves precise prepared SQL array and integer parameter contracts", async () => {
+  const prepared: SQLPreparedResponse = {
+    prepared_id: "a".repeat(32),
+    expires_at_ms: 123,
+    owner_node_id: "9007199254740993",
+    parameter_types: ["array", "integer"],
+    parameter_descriptors: [
+      { type: "array", element_type: "int64", nullable: true },
+      { type: "integer", element_type: "int32", nullable: true },
+    ],
+    columns: [],
+  };
+  const fetch = vi.fn().mockResolvedValue(new Response(JSON.stringify(prepared)));
+  vi.stubGlobal("fetch", fetch);
+  const client = new AntflyClient({ baseUrl: "http://localhost:8080" });
+  const result = await client.prepareSQL({ statement: "SELECT $1::bigint[],$2::integer" });
+  expect(result).toEqual(prepared);
+  expect(result.parameter_descriptors[0].element_type).toBe("int64");
+});
 
 describe("durable SQL connection client", () => {
   const connection = {

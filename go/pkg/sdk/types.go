@@ -47,6 +47,7 @@ type (
 	SQLPrepareRequest           = oapi.SQLPrepareRequest
 	SQLPreparedExecutionRequest = oapi.SQLPreparedExecutionRequest
 	SQLPreparedResponse         = oapi.SQLPreparedResponse
+	SQLParameterDescriptor      = oapi.SQLParameterDescriptor
 	SQLResponse                 = oapi.SQLResponse
 	SQLColumn                   = oapi.SQLColumn
 	SQLColumnType               = oapi.SQLColumnType

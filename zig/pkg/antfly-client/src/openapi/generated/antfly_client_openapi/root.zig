@@ -780,6 +780,7 @@ pub const SQLDDLReceipt = types.SQLDDLReceipt;
 pub const SQLDDLReceiptState = types.SQLDDLReceiptState;
 pub const SQLDiagnostic = types.SQLDiagnostic;
 pub const SQLMutationOutcome = types.SQLMutationOutcome;
+pub const SQLParameterDescriptor = types.SQLParameterDescriptor;
 pub const SQLPrepareRequest = types.SQLPrepareRequest;
 pub const SQLPreparedExecutionRequest = types.SQLPreparedExecutionRequest;
 pub const SQLPreparedResponse = types.SQLPreparedResponse;

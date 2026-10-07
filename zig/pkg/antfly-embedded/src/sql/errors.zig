@@ -87,7 +87,7 @@ pub fn describe(err: anyerror) Diagnostic {
         error.SqlInvalidEscapeString => .{ .code = "22025", .message = "Escape string must be empty or one character." },
         error.SqlArraySubscriptError => .{ .code = "2202E", .message = "Array dimensions or bounds do not match.", .hint = "Use valid bounds and rectangular subarrays with matching dimensions." },
         error.SqlArrayConstructorTypeMismatch => .{ .code = "42804", .message = "Array constructor element types cannot be matched.", .hint = "Use compatible scalar elements or compatible subarrays." },
-        error.SqlInvalidTextRepresentation => .{ .code = "22P02", .message = "A value has invalid input syntax for the requested type.", .hint = "Check the value and the target type." },
+        error.SqlInvalidTextRepresentation, error.InvalidSqlArrayShape => .{ .code = "22P02", .message = "A value has invalid input syntax for the requested type.", .hint = "Check the value and the target type." },
         error.SqlNullValueNotAllowed => .{ .code = "22004", .message = "A required SQL value or JSON path element is null.", .hint = "Supply non-null JSON path elements." },
         error.SqlTransactionAlreadyActive => .{ .code = "25001", .message = "A transaction is already active in this session.", .retryable = false },
         error.SqlTransactionNotActive => .{ .code = "25P01", .message = "This command requires an active transaction.", .retryable = false },
@@ -199,6 +199,12 @@ test "SQL FK decoder upgrade is definite nonadmission not an ambiguous DDL outco
     const unknown = describe(error.SqlMutationOutcomeUnknown);
     try std.testing.expectEqual(@as(u16, 409), unknown.httpStatus());
     try std.testing.expectEqual(@as(?bool, false), unknown.retryable);
+}
+
+test "SQL typed parameter syntax errors are actionable client diagnostics" {
+    try std.testing.expectEqualStrings("22P02", describe(error.InvalidSqlArrayShape).code);
+    try std.testing.expectEqual(@as(u16, 400), describe(error.InvalidSqlArrayShape).httpStatus());
+    try std.testing.expectEqualStrings("22P03", describe(error.InvalidSqlBinaryRepresentation).code);
 }
 
 test "SQL diagnostics hide unrecognized implementation errors" {

@@ -1568,6 +1568,7 @@ test "pgwire result shape fences array element identity across prepared and curs
 test "pgwire typed parameter failures retain actionable PostgreSQL SQLSTATEs" {
     try std.testing.expectEqualStrings("22P02", sqlstate(error.SqlInvalidTextRepresentation));
     try std.testing.expectEqualStrings("22P03", sqlstate(error.InvalidSqlBinaryRepresentation));
+    try std.testing.expectEqualStrings("42804", sqlstate(error.SqlBinaryTypeMismatch));
     try std.testing.expectEqualStrings("22003", sqlstate(error.SqlNumericOutOfRange));
     try std.testing.expectEqualStrings("22021", sqlstate(error.SqlInvalidTextEncoding));
     try std.testing.expectEqualStrings("42P08", sqlstate(error.ConflictingSqlParameterTypes));
@@ -1582,11 +1583,11 @@ fn sqlstate(err: anyerror) []const u8 {
         error.UniqueConstraintViolation => "23505",
         error.ForeignKeyParentMissing, error.ForeignKeyReferenced => "23503",
         error.InvalidParameter => "22P02",
-        error.SqlInvalidTextRepresentation => "22P02",
-        error.InvalidSqlBinaryRepresentation, error.SqlBinaryTypeMismatch => "22P03",
+        error.SqlInvalidTextRepresentation, error.InvalidSqlArrayShape => "22P02",
+        error.InvalidSqlBinaryRepresentation, error.SqlBinaryTypeMismatch => @import("antfly_local_sources").sql_errors.describe(err).code,
         error.SqlNumericOutOfRange => "22003",
         error.SqlInvalidTextEncoding => "22021",
-        error.InvalidSqlArrayShape, error.SqlArraySubscriptError => "2202E",
+        error.SqlArraySubscriptError => "2202E",
         error.ConflictingSqlParameterTypes => "42P08",
         error.UnknownSqlParameterType => "42P18",
         error.InvalidStatementName => "26000",

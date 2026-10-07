@@ -189,13 +189,12 @@ preparation layer; a 10,000-iteration composed-program test uses zero scratch
 allocation. The statement-wide integration below now uses this preparation layer.
 
 Statement-wide runtime binding now adopts the precise frame contract. PostgreSQL
-wire retains precise parameter descriptors; public HTTP prepared-statement
-metadata still needs element descriptors before array input activation there.
+wire and public HTTP prepared statements retain precise parameter descriptors.
 Native datetime text inputs normalize to UTC, while
 datetime binary parameters remain guarded until their codec is bound.
 Public array results now retain element identity, bounds and SQL NULL flags
 through generated HTTP descriptors and PostgreSQL text/binary result delivery.
-HTTP prepared-statement array parameters, catalog storage and overloads converting
+Catalog storage and overloads converting
 whole arrays to text/JSON remain explicit activation gaps. Default decimal
 constructors still need an exact NUMERIC array representation; direct narrowing
 or text casts of these constructors remain guarded (explicit real/double casts
@@ -286,8 +285,8 @@ element descriptors rather than JSON placeholders. PostgreSQL oracle checks
 cover source-order inference, parameter widths, numeric function result types
 and array default promotion; allocation-fault tests cover nested plans and cursor
 ownership. A 10,000-iteration shared-program regression performs no evaluation
-scratch allocation. HTTP prepared-statement parameter metadata,
-physical array storage and exact NUMERIC arrays remain activation gaps. No original
+scratch allocation. Physical array storage and exact NUMERIC arrays remain
+activation gaps. No original
 inventory dispositions change on the strength of these supplemental contracts.
 
 PostgreSQL wire Parse now carries precise input descriptors, preserving int2/int4/
@@ -303,6 +302,16 @@ guarded where their exact codecs/identities are absent. Oracle tests independent
 verify the nine supported builtin array OIDs; wire tests cover inferred and
 declared input, both formats, SQL NULL, and prepared-owner retirement. These
 boundary contracts do not change the original case counts.
+
+HTTP prepared responses now expose generated SQLParameterDescriptor metadata,
+aligned with the coarse compatibility parameter_types list. Durable prepared
+resources retain the same widths, element identity and nullability; execution
+supplies that immutable contract to binding rather than re-inferring it from
+values. Resources with missing or inconsistent contracts are rejected and must
+be prepared again. Python and TypeScript SDKs export the generated descriptor;
+Go and Rust specifications carry the same contract. Malformed array envelopes
+are client input errors, not internal failures. NUMERIC and physical array
+storage remain separate unfinished work, with no additional disposition credit.
 
 Statement-invariant relation caches now use bounded replay storage rather than
 retaining an allocation per source row without a local spill boundary. Small
