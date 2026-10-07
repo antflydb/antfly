@@ -931,19 +931,15 @@ test "lite native staged abort removes staging despite pending cancellation" {
             const chunk: [64 * 1024]u8 = @splat('x');
             try sink.appendSlice(&chunk); // Force a physical staging file.
             self.started.set(i);
-            self.release.waitUncancelable(i); // Leave cancellation for abort.
-        }
-        fn releaseChild(i: std.Io, self: *@This()) void {
-            i.sleep(.fromMilliseconds(50), .awake) catch {};
-            self.release.set(i);
+            // Re-arm the cancellation delivered by the gate so it is
+            // deterministically pending when the deferred abort starts.
+            self.release.wait(i) catch i.recancel();
         }
     };
     var state: State = .{};
     var child = try io.concurrent(State.run, .{ io, &state, indexes.storage() });
     state.started.waitUncancelable(io);
-    var release = try io.concurrent(State.releaseChild, .{ io, &state });
     child.cancel(io);
-    release.await(io);
     if (state.failure) |err| return err;
     var iter = tmp.dir.iterate();
     while (try iter.next(io)) |entry| {

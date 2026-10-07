@@ -4,4 +4,5 @@
 // Focused Lite index storage qualification without application archives.
 test {
     _ = @import("storage/lite/index_storage.zig");
+    _ = @import("storage/lite/native.zig");
 }

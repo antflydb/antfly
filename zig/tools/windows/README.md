@@ -372,6 +372,14 @@ The suite passes all 24 tests on macOS. CrossOver passes 23 and fails the vacuum
 replacement test with `AccessDenied` in both Debug and ReleaseFast. Native
 Windows vacuum publication still needs verification; see the report.
 
+For all three cancellation cleanup regressions, substitute the filter
+`--test-filter 'pending cancellation'`. The root also includes native Lite
+tests, so `--test-filter 'lite native streaming vacuum rejects corrupt values before publication'`
+exercises corrupt-input cleanup and the subsequent successful-vacuum attempt.
+CrossOver fails that final replacement with `AccessDenied`; the macOS test
+passes. The cancellation regressions use a canceled event and re-arm the
+request before cleanup, without a timed release.
+
 ## Prior native Windows qualification
 
 On a GCE `windows-2022` VM: `lite init`, `lite serve`, table creation, batch

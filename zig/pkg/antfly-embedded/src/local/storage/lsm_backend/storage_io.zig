@@ -5551,22 +5551,16 @@ test "native streaming atomic abort removes staging despite pending cancellation
                 return;
             };
             self.started.set(i);
-            // Leave cancellation pending until abort starts. A cancellable
-            // gate would consume it before the cleanup we need to exercise.
-            self.release.waitUncancelable(i);
+            // Re-arm the cancellation delivered by the gate so it is
+            // deterministically pending when abort starts.
+            self.release.wait(i) catch i.recancel();
             sink.abort();
-        }
-        fn releaseChild(i: std.Io, self: *@This()) void {
-            i.sleep(.fromMilliseconds(50), .awake) catch {};
-            self.release.set(i);
         }
     };
     var state: State = .{};
     var child = try io.concurrent(State.run, .{ io, &state, test_tmp.path() });
     try state.started.wait(io);
-    var release = try io.concurrent(State.releaseChild, .{ io, &state });
     child.cancel(io);
-    release.await(io);
     if (state.failure) |err| return err;
     var native = try NativeStorage.init(std.testing.allocator, .threaded);
     defer native.deinit();

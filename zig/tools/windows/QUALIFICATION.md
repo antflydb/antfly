@@ -241,6 +241,34 @@ retained without an unlink-before-rename workaround or a skip.
 results do not extend the earlier native Windows reset qualification to the
 latest source changes.
 
+## Vacuum image cleanup review
+
+`VacuumImage.deinit` also deleted its unpublished prepared database through
+cancellable I/O. A controlled Windows regression leaves cancellation pending
+at cleanup and observes that the prepared path still exists afterward. Cleanup
+now blocks cancellation during deletion and restores protection before closing
+the prepared file and releasing any owned runtime. The original live database
+and its document remain usable after the discarded image is removed.
+
+The three cancellation cleanup regressions now wait for cancellation at an
+event and re-arm it immediately before cleanup, replacing the previous timed
+release. This guarantees pending cancellation without relying on scheduling
+within a 50 ms window. All three pass on macOS and Windows Debug and ReleaseFast
+under CrossOver. The focused root now explicitly includes native Lite tests.
+
+A six-test run, including failed index imports and corrupt vacuum input, passes
+all six tests on macOS. Windows Debug and ReleaseFast each have five passes and
+one failure, with no skips: `lite native streaming vacuum rejects corrupt
+values before publication` fails at its final successful-vacuum attempt after
+the corruption has been repaired. The failure is again `AccessDenied` at
+open-database replacement. Together with the earlier Lite index vacuum test
+and two object-store tests, four executed tests expose Wine's replacement
+limitation. Native Windows vacuum and object-store replacement behavior still
+need verification. No replacement workaround or test skip was introduced.
+
+The new vacuum cleanup fix has not been included in a native Windows
+application or hard-reset qualification run.
+
 ## Cleanup
 
 The disposable VM, auto-delete boot disk, artifact bucket, service account,
