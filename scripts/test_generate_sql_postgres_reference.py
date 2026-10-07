@@ -1349,7 +1349,11 @@ class PostgresReferenceTest(unittest.TestCase):
                         )
                 finally:
                     self.db.execute("DEALLOCATE ALL")
-        for sql in ("SELECT $1, cardinality($1::integer[])", "SELECT $1, $1::smallint"):
+        for sql in (
+            "SELECT $1, cardinality($1::integer[])",
+            "SELECT $1, $1::smallint",
+            "SELECT $1, $1 + 1",
+        ):
             with self.subTest(sql=sql):
                 try:
                     with self.db.transaction(force_rollback=True):
@@ -1358,6 +1362,124 @@ class PostgresReferenceTest(unittest.TestCase):
                         self.assertEqual(error.exception.sqlstate, "42P08")
                 finally:
                     self.db.execute("DEALLOCATE ALL")
+
+    def test_statement_parameter_integer_width_is_an_ingress_contract(self):
+        import psycopg
+
+        try:
+            self.db.execute("PREPARE width_frame AS SELECT $1 + 1, $1")
+            self.assertEqual(
+                [23],
+                self.db.execute(
+                    "SELECT parameter_types::oid[] FROM pg_prepared_statements "
+                    "WHERE name='width_frame'"
+                ).fetchone()[0],
+            )
+            self.assertEqual(
+                [(42, 41)], self.db.execute("EXECUTE width_frame(41)").fetchall()
+            )
+            with self.db.transaction(force_rollback=True):
+                with self.assertRaises(psycopg.Error) as error:
+                    self.db.execute("EXECUTE width_frame(9007199254740993)")
+                self.assertEqual("22003", error.exception.sqlstate)
+        finally:
+            self.db.execute("DEALLOCATE ALL")
+
+    def test_shared_invocation_array_plans_and_navigation_promotions(self):
+        queries = (
+            "SELECT cardinality($1::bigint[]),array_lower($1,1)",
+            "SELECT cardinality(q.a),array_lower(q.a,1) FROM (SELECT $1::bigint[] a) q",
+            "WITH q AS MATERIALIZED (SELECT $1::bigint[] a) SELECT cardinality(l.a),array_lower(r.a,1) FROM q l CROSS JOIN q r",
+            "SELECT max(cardinality($1::bigint[])),array_lower($1,1) FROM frame_items",
+            "SELECT cardinality(a),array_lower(a,1) FROM (SELECT $1::bigint[] a UNION SELECT $1::bigint[]) q",
+        )
+        try:
+            with self.db.transaction(force_rollback=True):
+                self.db.execute("CREATE TABLE frame_items(_id text,id bigint)")
+                self.db.execute(
+                    "INSERT INTO frame_items VALUES('0',9007199254740993),('1',9007199254740993)"
+                )
+                for sql in queries:
+                    with self.subTest(sql=sql):
+                        self.db.execute("PREPARE array_frame AS " + sql)
+                        self.assertEqual(
+                            [(3, -1)],
+                            self.db.execute(
+                                "EXECUTE array_frame('[-1:1]={9007199254740993,NULL,2}')"
+                            ).fetchall(),
+                        )
+                        self.db.execute("DEALLOCATE array_frame")
+                self.db.execute(
+                    "PREPARE array_frame AS SELECT lag($1::int2[],1,$2::float8[]) "
+                    "OVER (ORDER BY _id) a FROM frame_items"
+                )
+                self.assertEqual(
+                    [([3.5, None],), ([1.0, None, 2.0],)],
+                    self.db.execute(
+                        "EXECUTE array_frame('[-1:1]={1,NULL,2}','[0:1]={3.5,NULL}')"
+                    ).fetchall(),
+                )
+                self.db.execute("DEALLOCATE array_frame")
+                self.db.execute(
+                    "PREPARE array_frame AS WITH RECURSIVE r(n) AS "
+                    "(SELECT cardinality($1::integer[]) UNION ALL SELECT n-1 FROM r "
+                    "WHERE n>1) SELECT n FROM r ORDER BY n"
+                )
+                self.assertEqual(
+                    [(1,), (2,), (3,)],
+                    self.db.execute("EXECUTE array_frame('{1,2,3}')").fetchall(),
+                )
+        finally:
+            self.db.execute("DEALLOCATE ALL")
+
+    def test_assignment_does_not_widen_an_operator_parameter_contract(self):
+        import psycopg
+
+        try:
+            with self.db.transaction(force_rollback=True):
+                self.db.execute("CREATE TABLE width_items(_id text,n bigint)")
+                for cast, oid in (("", 23), ("::bigint", 20)):
+                    self.db.execute(
+                        "PREPARE assignment_frame AS INSERT INTO width_items(_id,n) "
+                        f"VALUES(lower('A'),$1{cast}+1),('b',$1{cast}+1)"
+                    )
+                    self.assertEqual(
+                        [oid],
+                        self.db.execute(
+                            "SELECT parameter_types::oid[] FROM pg_prepared_statements "
+                            "WHERE name='assignment_frame'"
+                        ).fetchone()[0],
+                    )
+                    if cast:
+                        self.db.execute("EXECUTE assignment_frame(9007199254740992)")
+                        self.assertEqual(
+                            [(9007199254740993,), (9007199254740993,)],
+                            self.db.execute("SELECT n FROM width_items").fetchall(),
+                        )
+                    else:
+                        with self.db.transaction(force_rollback=True):
+                            with self.assertRaises(psycopg.Error) as error:
+                                self.db.execute(
+                                    "EXECUTE assignment_frame(9007199254740992)"
+                                )
+                            self.assertEqual("22003", error.exception.sqlstate)
+                    self.db.execute("DEALLOCATE assignment_frame")
+                self.db.execute(
+                    "PREPARE function_frame AS SELECT sqrt(16)>$1,power(2,3)>$1"
+                )
+                self.assertEqual(
+                    [701],
+                    self.db.execute(
+                        "SELECT parameter_types::oid[] FROM pg_prepared_statements "
+                        "WHERE name='function_frame'"
+                    ).fetchone()[0],
+                )
+                self.assertEqual(
+                    [(True, True)],
+                    self.db.execute("EXECUTE function_frame(3)").fetchall(),
+                )
+        finally:
+            self.db.execute("DEALLOCATE ALL")
 
     def test_materialized_relation_replay_preserves_self_join_multiplicity(self):
         with self.db.transaction(force_rollback=True):

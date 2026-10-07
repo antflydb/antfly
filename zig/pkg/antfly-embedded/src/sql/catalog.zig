@@ -334,6 +334,9 @@ pub const Backend = struct {
     /// Request-owned transport types fill only unconstrained parameters after
     /// SQL inference. They never replace explicit or schema-derived types.
     parameter_fallback_types: []const ?ast.ColumnType = &.{},
+    /// Shared precise parameter constraints and execution frame for this
+    /// statement, including its lowered/derived/mutation child plans.
+    parameter_invocation: ?*@import("parameter_binding.zig").Invocation = null,
     /// Only set when every page belongs to the same retained statement read
     /// view. Catalog revisions and per-page read_index are not such a view.
     pinned_statement_snapshot: bool = false,

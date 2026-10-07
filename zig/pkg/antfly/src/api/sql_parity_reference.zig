@@ -767,7 +767,7 @@ pub fn runInternalArrayQueries(alloc: std.mem.Allocator, handler: anytype) !void
 
 fn runArrayResults(alloc: std.mem.Allocator, handler: anytype) !void {
     const sources = @import("antfly_local_sources");
-    const Case = struct { sql: []const u8, kind: sources.sql_array_value.ElementType, expected: ?[]const u8 };
+    const Case = struct { sql: []const u8, kind: sources.sql_array_value.ElementType, expected: ?[]const u8, params: []const u8 = "[]" };
     for ([_]Case{
         .{ .sql = "SELECT ARRAY[-9223372036854775808,NULL,9223372036854775807]::bigint[]", .kind = .int64, .expected = "{-9223372036854775808,NULL,9223372036854775807}" },
         .{ .sql = "SELECT '[0:1][3:4]={{1,NULL},{3,4}}'::int4[]", .kind = .int32, .expected = "[0:1][3:4]={{1,NULL},{3,4}}" },
@@ -776,8 +776,14 @@ fn runArrayResults(alloc: std.mem.Allocator, handler: anytype) !void {
         .{ .sql = "SELECT ARRAY['null'::jsonb,NULL,'{\"a\":[1,2]}'::jsonb]::jsonb[]", .kind = .jsonb, .expected = "{\"null\",NULL,\"{\\\"a\\\":[1,2]}\"}" },
         .{ .sql = "SELECT a FROM (SELECT ARRAY[1,NULL]::int2[] a UNION SELECT ARRAY[1,NULL]::int8[]) q ORDER BY 1", .kind = .int64, .expected = "{1,NULL}" },
         .{ .sql = "SELECT a,row_number() OVER (ORDER BY cardinality(a)) FROM (SELECT ARRAY[1,NULL]::int4[] a) q", .kind = .int32, .expected = "{1,NULL}" },
+        .{ .sql = "SELECT $1::bigint[] a,cardinality($1) n", .kind = .int64, .expected = "[-1:1]={9007199254740993,NULL,2}", .params = "[{\"string\":\"[-1:1]={9007199254740993,NULL,2}\"}]" },
+        .{ .sql = "SELECT q.a FROM (SELECT $1::bigint[] a) q", .kind = .int64, .expected = "[-1:1]={9007199254740993,NULL,2}", .params = "[{\"string\":\"[-1:1]={9007199254740993,NULL,2}\"}]" },
+        .{ .sql = "SELECT $1::bigint[]", .kind = .int64, .expected = "[0:1]={9007199254740993,NULL}", .params = "[{\"json\":\"{\\\"dimensions\\\":[{\\\"length\\\":2,\\\"lower_bound\\\":0}],\\\"values\\\":[\\\"9007199254740993\\\",null],\\\"sql_nulls\\\":[false,true]}\"}]" },
+        .{ .sql = "SELECT lag($1::int2[],1,$2::float8[]) OVER () a", .kind = .float64, .expected = "[0:1]={3.5,NULL}", .params = "[{\"string\":\"{1,2}\"},{\"string\":\"[0:1]={3.5,NULL}\"}]" },
     }) |entry| {
-        const case: fixtures.Corpus.Case = .{ .id = "array-result-contract", .name = entry.sql, .family = "array", .sql = entry.sql, .params = &.{}, .source_expectation = "success" };
+        const parameters = try std.json.parseFromSlice([]const Json, alloc, entry.params, .{ .parse_numbers = false });
+        defer parameters.deinit();
+        const case: fixtures.Corpus.Case = .{ .id = "array-result-contract", .name = entry.sql, .family = "array", .sql = entry.sql, .params = parameters.value, .source_expectation = "success" };
         const response = try execute(alloc, handler, &case);
         defer response.deinit();
         const result = response.value;

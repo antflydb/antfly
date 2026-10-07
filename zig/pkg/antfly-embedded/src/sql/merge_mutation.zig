@@ -491,26 +491,26 @@ fn bindArms(alloc: Allocator, backend: catalog.Backend, target: catalog.Table, s
     }
     const parameters = try alloc.dupe(?ast.ColumnType, input.parameter_types);
     for (unbound) |arm| {
-        if (arm.predicate) |predicate| _ = try scalar.inferParameters(alloc, predicate, columns, parameters, .boolean, .{});
+        if (arm.predicate) |predicate| _ = try scalar.inferParameters(alloc, predicate, columns, parameters, .boolean, .{ .invocation = backend.parameter_invocation });
         const values: []const Expression = switch (arm.action) {
             .update => |items| items,
             .insert => |items| items,
             .delete, .nothing => &.{},
         };
         for (values) |value| if (value.value) |expression| {
-            _ = try scalar.inferParameters(alloc, expression, columns, parameters, value.column.type, .{});
+            _ = try scalar.inferParameters(alloc, expression, columns, parameters, value.column.type, .{ .invocation = backend.parameter_invocation });
         };
     }
     const bound = try alloc.alloc(BoundArm, unbound.len);
     for (unbound, bound) |arm, *out| {
         out.matched = arm.matched;
-        out.predicate = if (arm.predicate) |predicate| try scalar.bindExpectedWithSettings(alloc, predicate, columns, parameters, .boolean, .{}, backend.settings_view) else null;
+        out.predicate = if (arm.predicate) |predicate| try scalar.bindExpectedWithSettings(alloc, predicate, columns, parameters, .boolean, .{ .invocation = backend.parameter_invocation }, backend.settings_view) else null;
         out.action = switch (arm.action) {
             .update, .insert => |values| blk: {
                 const assignments = try alloc.alloc(BoundAssignment, values.len);
                 for (values, assignments) |value, *assignment| assignment.* = .{
                     .column = value.column,
-                    .program = if (value.value) |expression| try scalar.bindExpectedWithSettings(alloc, expression, columns, parameters, value.column.type, .{}, backend.settings_view) else null,
+                    .program = if (value.value) |expression| try scalar.bindExpectedWithSettings(alloc, expression, columns, parameters, value.column.type, .{ .invocation = backend.parameter_invocation }, backend.settings_view) else null,
                 };
                 break :blk if (arm.action == .update) .{ .update = assignments } else .{ .insert = assignments };
             },
@@ -544,11 +544,11 @@ fn bindReturning(alloc: Allocator, backend: catalog.Backend, statement: ast.Merg
     }
     const lowered = try alloc.alloc(*const ast.Scalar, count);
     for (expressions, projections, lowered) |expression, projection, *out| out.* = if (projection.bound_column != null) expression else try relation_binding.lowerBoundExpression(alloc, relation.root.columns, expression);
-    for (lowered) |expression| _ = try scalar.inferParameters(alloc, expression, scalar_columns, parameters, null, .{});
+    for (lowered) |expression| _ = try scalar.inferParameters(alloc, expression, scalar_columns, parameters, null, .{ .invocation = backend.parameter_invocation });
     const programs = try alloc.alloc(scalar.Program, count);
     const columns = try alloc.alloc(describe.Column, count);
     for (lowered, names, programs, columns) |expression, name, *program, *column| {
-        program.* = try scalar.bindWithSettings(alloc, expression, scalar_columns, parameters, .{}, backend.settings_view);
+        program.* = try scalar.bindWithSettings(alloc, expression, scalar_columns, parameters, .{ .invocation = backend.parameter_invocation }, backend.settings_view);
         column.* = .{ .name = name, .type = program.output_type.kind orelse .string, .untyped_null = program.output_type.kind == null };
     }
     return .{ .columns = columns, .programs = programs };

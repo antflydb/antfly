@@ -177,12 +177,17 @@ fn runBound(alloc: std.mem.Allocator, arena: std.mem.Allocator, backend: catalog
     // Resolve exactly once so validation and execution cannot pin different
     // catalog identities within one statement.
     const binding = try describe.bind(arena, backend, compiled, &.{});
+    var statement_backend = backend;
+    statement_backend.parameter_invocation = binding.parameter_invocation;
+    if (binding.parameter_invocation) |invocation| try invocation.prepareJson(alloc, parameters, .{ .bytes = limits.retained_bytes, .wire_bytes = limits.retained_bytes });
+    defer if (binding.parameter_invocation) |invocation| invocation.deinitFrame();
+    const prepared_parameters = if (binding.parameter_invocation) |invocation| try invocation.compatibilityValues(arena) else parameters;
     var manager: ?@import("spill.zig").Manager = null;
     defer if (manager) |*owned| owned.deinit();
     if (backend.spill_manager == null and limits.spill_bytes != 0) if (backend.execution_io) |io| {
         manager = .{ .alloc = alloc, .io = io, .context = backend.ptr, .checkpoint = backend.vtable.checkpoint, .root = limits.spill_root, .max_bytes = limits.spill_bytes, .buffer_bytes = @min(4096, @max(128, limits.retained_bytes / 512)), .max_record_bytes = @max(@as(usize, 1024), @min(@as(usize, 4 * 1024 * 1024), limits.retained_bytes / 32)) };
     };
-    const context = Context{ .alloc = alloc, .arena = arena, .backend = backend, .binding = binding, .parameters = parameters, .limits = limits, .spill = backend.spill_manager orelse if (manager) |*owned| owned else null, .sink = sink };
+    const context = Context{ .alloc = alloc, .arena = arena, .backend = statement_backend, .binding = binding, .parameters = prepared_parameters, .limits = limits, .spill = backend.spill_manager orelse if (manager) |*owned| owned else null, .sink = sink };
     return context.run(compiled.statement);
 }
 
@@ -371,7 +376,18 @@ pub const Context = struct {
         if (input != .parameter) return describe.bindLiteral(self.arena, input, column.type);
         const index = input.parameter;
         if (index == 0 or index > self.parameters.len) return error.InvalidSqlParameters;
+        if (self.binding.parameter_invocation) |invocation| if (invocation.frame) |frame| {
+            const datum = try describe.coerceDatum(self.arena, frame.values[index - 1], column.type, column.element_type);
+            if (datum.array != null) return error.UnsupportedSqlShape;
+            return if (datum.sql_null) .null else datum.value;
+        };
         return coerce(self.arena, self.parameters[index - 1], column.type);
+    }
+
+    fn parameterDatum(self: Context, index: usize) !Datum {
+        if (index >= self.parameters.len) return error.InvalidSqlParameters;
+        if (self.binding.parameter_invocation) |invocation| if (invocation.frame) |frame| return frame.values[index];
+        return Datum.fromJson(self.parameters[index]);
     }
 
     pub fn count(self: Context, input: ?ast.Value, default: usize) !usize {
@@ -988,11 +1004,11 @@ pub const Context = struct {
                     if (statement.isDefault(end, column)) continue;
                     if (optional) |program| for (program.instructions) |instruction| {
                         const input_value = switch (instruction.operation) {
-                            .literal => |literal_value| literal_value,
-                            .parameter => |index| self.parameters[index],
+                            .literal => |literal_value| Datum.fromJson(literal_value),
+                            .parameter => |index| try self.parameterDatum(index),
                             else => continue,
                         };
-                        bytes +|= try operators.datumBytes(Datum.fromJson(input_value));
+                        bytes +|= try operators.datumBytes(input_value);
                     };
                 }
             }
@@ -1087,9 +1103,21 @@ pub const Context = struct {
             const column = try table_def.column(item.field);
             if (std.mem.eql(u8, column.name, "_id")) return error.UnsupportedSqlExecution;
             for (items[0..i]) |previous| if (std.mem.eql(u8, previous.field, item.field)) return error.DuplicateColumn;
-            const program = if (i < self.binding.scalars.assignments.len) self.binding.scalars.assignments[i] else null;
-            const typed = if (program == null) try self.value(item.value, column) else .null;
-            const sql_null = typed == .null and !(column.type == .json and item.value == .string);
+            var program = if (i < self.binding.scalars.assignments.len) self.binding.scalars.assignments[i] else null;
+            var typed: Json = .null;
+            var sql_null = true;
+            if (program != null and item.expression == null and item.value == .parameter) {
+                // A direct parameter assignment borrows the invocation frame,
+                // not row scratch. Retain it once, as on the literal path;
+                // do not clone a wide prepared payload for every target row.
+                const value_ = try self.evaluate(self.arena, program.?, &.{});
+                typed = if (value_.sql_null) .null else try coerce(self.arena, value_.value, column.type);
+                sql_null = value_.sql_null;
+                program = null;
+            } else if (program == null) {
+                typed = try self.value(item.value, column);
+                sql_null = typed == .null and !(column.type == .json and item.value == .string);
+            }
             if (program == null and sql_null and !column.nullable) return error.SqlNotNullViolation;
             // These constants are immutable for the entire statement. Own
             // them once, then share them across the prepared replacement rows.
@@ -2607,19 +2635,145 @@ test "SQL ordering handles expressions positions and explicit null placement" {
     }
 }
 
-test "SQL parameter inference is independent of projection order" {
-    var backend: TestBackend = .{};
-    for ([_][]const u8{ "SELECT $1, $1 + 1", "SELECT $1 + 1, $1" }) |statement| {
-        var compiled = try compiler.compile(std.testing.allocator, statement, .{});
+test "SQL shared invocation arrays cross derived set grouped window and recursive plans" {
+    const cases = [_]struct { sql: []const u8, rows: usize = 1 }{
+        .{ .sql = "SELECT cardinality($1::bigint[]),array_lower($1,1)" },
+        .{ .sql = "SELECT cardinality(q.a),array_lower(q.a,1) FROM (SELECT $1::bigint[] a) q" },
+        .{ .sql = "WITH q AS MATERIALIZED (SELECT $1::bigint[] a) SELECT cardinality(l.a),array_lower(r.a,1) FROM q l CROSS JOIN q r" },
+        .{ .sql = "SELECT max(cardinality($1::bigint[])),array_lower($1,1) FROM things" },
+        .{ .sql = "SELECT cardinality(a),array_lower(a,1) FROM (SELECT $1::bigint[] a UNION SELECT $1::bigint[]) q" },
+        .{ .sql = "SELECT cardinality($1::bigint[]),array_lower($1,1) FROM things ORDER BY _id", .rows = 2 },
+    };
+    for (cases) |case| {
+        var fixture: TestBackend = .{};
+        var compiled = try compiler.compile(std.testing.allocator, case.sql, .{});
         defer compiled.deinit();
-        var description = try describe.describe(std.testing.allocator, backend.iface(), &compiled, &.{});
-        defer description.deinit();
-        try std.testing.expectEqual(ast.ColumnType.integer, description.binding.parameter_types[0].?);
-        var result = try execute(std.testing.allocator, backend.iface(), &compiled, &.{.{ .integer = 9007199254740993 }}, .{});
+        var result = try execute(std.testing.allocator, fixture.iface(), &compiled, &.{.{ .string = "[-1:1]={9007199254740993,NULL,2}" }}, .{ .page_rows = 1 });
         defer result.deinit();
-        try std.testing.expectEqual(ast.ColumnType.integer, result.output.columns[0].type);
-        try std.testing.expectEqual(ast.ColumnType.integer, result.output.columns[1].type);
+        try std.testing.expectEqual(case.rows, result.output.rows.len);
+        for (result.output.rows) |row| {
+            try std.testing.expectEqualStrings("3", row[0].string);
+            try std.testing.expectEqualStrings("-1", row[1].string);
+        }
     }
+    var fixture: TestBackend = .{};
+    var window = try compiler.compile(std.testing.allocator, "SELECT lag($1::bigint[]) OVER (ORDER BY _id) a FROM things", .{});
+    defer window.deinit();
+    var result = try execute(std.testing.allocator, fixture.iface(), &window, &.{.{ .string = "[-1:1]={9007199254740993,NULL,2}" }}, .{});
+    defer result.deinit();
+    try std.testing.expect(result.output.sql_nulls.?[0][0]);
+    try std.testing.expect(!result.output.sql_nulls.?[1][0]);
+    var decoded = try @import("array_wire.zig").decode(std.testing.allocator, .int64, result.output.rows[1][0], .{});
+    defer decoded.deinit();
+    try std.testing.expectEqual(@as(i64, 9007199254740993), decoded.value.elements[0].value.integer);
+    try std.testing.expectEqual(@as(i32, -1), decoded.value.dimensions[0].lower);
+    try std.testing.expect(decoded.value.elements[1].sql_null);
+    var recursive = try compiler.compile(std.testing.allocator, "WITH RECURSIVE r(n) AS (SELECT cardinality($1::integer[]) UNION ALL SELECT n-1 FROM r WHERE n>1) SELECT n FROM r ORDER BY n", .{});
+    defer recursive.deinit();
+    var recursion = try execute(std.testing.allocator, fixture.iface(), &recursive, &.{.{ .string = "{1,2,3}" }}, .{});
+    defer recursion.deinit();
+    try std.testing.expectEqual(@as(usize, 3), recursion.output.rows.len);
+    for (recursion.output.rows, 1..) |row, n| try std.testing.expectEqual(n, try std.fmt.parseInt(usize, row[0].string, 10));
+}
+
+test "SQL invocation arrays own public envelopes and reject invalid inputs before reads" {
+    const a = std.testing.allocator;
+    var fixture: TestBackend = .{};
+    var source = try @import("array_text.zig").decode(a, .int64, "[-1:1]={9007199254740993,NULL,2}", .{});
+    defer source.deinit();
+    var input: std.heap.ArenaAllocator = .init(a);
+    const envelope = try @import("array_wire.zig").toJsonLeaky(input.allocator(), source.value, .{});
+    var compiled = try compiler.compile(a, "SELECT $1::bigint[] a,$2::integer+1 n", .{});
+    defer compiled.deinit();
+    var result = try execute(a, fixture.iface(), &compiled, &.{ envelope, .{ .integer = 41 } }, .{});
+    defer result.deinit();
+    input.deinit();
+    try std.testing.expectEqualStrings("42", result.output.rows[0][1].string);
+    var decoded = try @import("array_wire.zig").decode(a, .int64, result.output.rows[0][0], .{});
+    defer decoded.deinit();
+    try std.testing.expectEqual(@as(i64, 9007199254740993), decoded.value.elements[0].value.integer);
+    try std.testing.expectEqual(@as(i32, -1), decoded.value.dimensions[0].lower);
+    try std.testing.expect(decoded.value.elements[1].sql_null);
+    var checked = try compiler.compile(a, "SELECT id FROM things WHERE id=ANY($1::smallint[])", .{});
+    defer checked.deinit();
+    try std.testing.expectError(error.SqlNumericOutOfRange, execute(a, fixture.iface(), &checked, &.{.{ .string = "{32768}" }}, .{}));
+    try std.testing.expectEqual(@as(usize, 0), fixture.pages);
+    var json_array = std.json.Array.init(a);
+    defer json_array.deinit();
+    try std.testing.expectError(error.SqlTypeMismatch, execute(a, fixture.iface(), &checked, &.{.{ .array = json_array }}, .{}));
+    try std.testing.expectEqual(@as(usize, 0), fixture.pages);
+}
+
+test "SQL typed invocation ownership unwinds allocation faults across nested results" {
+    const Faults = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var fixture: TestBackend = .{};
+            var compiled = try compiler.compile(a, "WITH q AS MATERIALIZED (SELECT $1::bigint[] a) SELECT a,cardinality(a) FROM q", .{});
+            defer compiled.deinit();
+            var result = try execute(a, fixture.iface(), &compiled, &.{.{ .string = "[0:2]={9007199254740993,NULL,2}" }}, .{});
+            defer result.deinit();
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Faults.run, .{});
+}
+
+test "SQL typed array navigation promotes defaults without dropping bounds or SQL NULLs" {
+    const Faults = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var fixture: TestBackend = .{};
+            var compiled = try compiler.compile(a, "SELECT lag($1::int2[],1,$2::float8[]) OVER (ORDER BY _id) a FROM things", .{});
+            defer compiled.deinit();
+            var result = try execute(a, fixture.iface(), &compiled, &.{ .{ .string = "[-1:1]={1,NULL,2}" }, .{ .string = "[0:1]={3.5,NULL}" } }, .{});
+            defer result.deinit();
+            try std.testing.expectEqual(@as(?@import("array_value.zig").ElementType, .float64), result.output.columns[0].element_type);
+            try std.testing.expectEqual(@as(usize, 2), result.output.rows.len);
+            var first = try @import("array_wire.zig").decode(a, .float64, result.output.rows[0][0], .{});
+            defer first.deinit();
+            var second = try @import("array_wire.zig").decode(a, .float64, result.output.rows[1][0], .{});
+            defer second.deinit();
+            try std.testing.expectEqual(@as(i32, 0), first.value.dimensions[0].lower);
+            try std.testing.expectEqual(@as(f64, 3.5), first.value.elements[0].value.float);
+            try std.testing.expect(first.value.elements[1].sql_null);
+            try std.testing.expectEqual(@as(i32, -1), second.value.dimensions[0].lower);
+            try std.testing.expectEqual(@as(f64, 1), second.value.elements[0].value.float);
+            try std.testing.expect(second.value.elements[1].sql_null);
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Faults.run, .{});
+}
+
+test "SQL target parameters preserve PostgreSQL source order and integer widths" {
+    var backend: TestBackend = .{};
+    // A bare first target is unknown/text before the later int4 expression
+    // constrains the slot. PostgreSQL PREPARE rejects that ambiguity (42P08).
+    var ambiguous = try compiler.compile(std.testing.allocator, "SELECT $1, $1 + 1", .{});
+    defer ambiguous.deinit();
+    try std.testing.expectError(error.ConflictingSqlParameterTypes, describe.describe(std.testing.allocator, backend.iface(), &ambiguous, &.{}));
+    try std.testing.expectError(error.ConflictingSqlParameterTypes, execute(std.testing.allocator, backend.iface(), &ambiguous, &.{.{ .integer = 41 }}, .{}));
+    var compiled = try compiler.compile(std.testing.allocator, "SELECT $1 + 1, $1", .{});
+    defer compiled.deinit();
+    var description = try describe.describe(std.testing.allocator, backend.iface(), &compiled, &.{});
+    defer description.deinit();
+    try std.testing.expectEqual(ast.ColumnType.integer, description.binding.parameter_types[0].?);
+    try std.testing.expectEqual(@as(?@import("array_value.zig").ElementType, .int32), description.binding.parameter_descriptors[0].element_type);
+    var result = try execute(std.testing.allocator, backend.iface(), &compiled, &.{.{ .integer = 41 }}, .{});
+    defer result.deinit();
+    try std.testing.expectEqualStrings("42", result.output.rows[0][0].string);
+    try std.testing.expectEqualStrings("41", result.output.rows[0][1].string);
+    try std.testing.expectError(error.SqlNumericOutOfRange, execute(std.testing.allocator, backend.iface(), &compiled, &.{.{ .integer = 9007199254740993 }}, .{}));
+}
+
+test "SQL numeric function parameter contexts use result identity not argument width" {
+    var fixture: TestBackend = .{};
+    var compiled = try compiler.compile(std.testing.allocator, "SELECT sqrt(16)>$1,power(2,3)>$1", .{});
+    defer compiled.deinit();
+    var description = try describe.describe(std.testing.allocator, fixture.iface(), &compiled, &.{});
+    defer description.deinit();
+    try std.testing.expectEqual(ast.ColumnType.number, description.binding.parameter_types[0].?);
+    try std.testing.expectEqual(@as(?@import("array_value.zig").ElementType, .float64), description.binding.parameter_descriptors[0].element_type);
+    var result = try execute(std.testing.allocator, fixture.iface(), &compiled, &.{.{ .integer = 3 }}, .{});
+    defer result.deinit();
+    try std.testing.expect(result.output.rows[0][0].bool and result.output.rows[0][1].bool);
 }
 
 test "SQL mutation success preserves post-commit recovery outcomes" {

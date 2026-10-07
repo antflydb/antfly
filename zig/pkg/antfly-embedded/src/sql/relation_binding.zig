@@ -193,7 +193,7 @@ pub const ResolveAdapter = struct {
     backend: catalog.Backend,
     table: catalog.Table,
     pub fn iface(self: *ResolveAdapter) catalog.Backend {
-        return .{ .ptr = self, .settings_view = self.backend.settings_view, .parameter_fallback_types = self.backend.parameter_fallback_types, .decision_provider = self.backend.decision_provider, .vtable = &.{ .resolve = resolve, .scan = scan, .mutate = mutate, .checkpoint = checkpoint } };
+        return .{ .ptr = self, .settings_view = self.backend.settings_view, .parameter_fallback_types = self.backend.parameter_fallback_types, .parameter_invocation = self.backend.parameter_invocation, .decision_provider = self.backend.decision_provider, .vtable = &.{ .resolve = resolve, .scan = scan, .mutate = mutate, .checkpoint = checkpoint } };
     }
     fn resolve(ptr: *anyopaque, _: Allocator, _: ast.Name, action: catalog.Action) !catalog.Table {
         if (action != .read) return error.UnsupportedSqlExecution;
@@ -224,7 +224,7 @@ pub const TargetResolveAdapter = struct {
     cache_sources: bool = false,
     source_tables: std.StringHashMapUnmanaged(catalog.Table) = .empty,
     pub fn iface(self: *@This()) catalog.Backend {
-        return .{ .ptr = self, .settings_view = self.backend.settings_view, .parameter_fallback_types = self.backend.parameter_fallback_types, .decision_provider = self.backend.decision_provider, .vtable = &.{ .resolve = resolve, .scan = scan, .mutate = mutate, .checkpoint = checkpoint } };
+        return .{ .ptr = self, .settings_view = self.backend.settings_view, .parameter_fallback_types = self.backend.parameter_fallback_types, .parameter_invocation = self.backend.parameter_invocation, .decision_provider = self.backend.decision_provider, .vtable = &.{ .resolve = resolve, .scan = scan, .mutate = mutate, .checkpoint = checkpoint } };
     }
     fn resolve(ptr: *anyopaque, alloc: Allocator, name: ast.Name, action: catalog.Action) !catalog.Table {
         // This adapter is only used while binding the read side of a mutation.
@@ -304,7 +304,7 @@ const Builder = struct {
                     var result = if (kind == .continuous) try self.scalarNode(.{ .cast = .{ .operand = argument, .type = .number } }) else argument;
                     if (kind != .mode) {
                         const direct = try self.inferenceExpression(call.args[0], columns);
-                        const array = try @import("aggregate_binding.zig").arrayExpression(self.alloc, direct, self.shape_columns.items, self.parameters);
+                        const array = try @import("aggregate_binding.zig").arrayExpressionWithInvocation(self.alloc, direct, self.shape_columns.items, self.parameters, self.backend.parameter_invocation);
                         const coerced = try self.scalarNode(.{ .cast = .{ .operand = direct, .type = if (array) .array else .number, .element_type = if (array) .float64 else null } });
                         if (self.shape_only) try self.constraints.append(self.alloc, .{ .expression = coerced });
                         if (array) result = try self.scalarNode(.{ .call = .{ .name = "$array", .args = try self.alloc.dupe(*const ast.Scalar, &.{result}) } });
@@ -418,7 +418,7 @@ const Builder = struct {
             var changed = false;
             for (self.constraints.items, 0..) |constraint, index| {
                 if (index % 64 == 0) try self.backend.vtable.checkpoint(self.backend.ptr);
-                changed = try scalar.inferParameters(self.alloc, constraint.expression, self.shape_columns.items, self.parameters, constraint.expected, .{}) or changed;
+                changed = try scalar.inferParameters(self.alloc, constraint.expression, self.shape_columns.items, self.parameters, constraint.expected, .{ .invocation = self.backend.parameter_invocation }) or changed;
             }
             if (!changed) return;
         }
@@ -469,11 +469,11 @@ const Builder = struct {
                 const columns = try self.scalarColumns(prepared.source.columns);
                 if (prepared.lowered.predicate) |predicate_| {
                     const expression_ = try @import("bound_scalars.zig").predicateScalar(self.alloc, try self.virtualTable(prepared.source.columns), predicate_);
-                    changed = try scalar.inferParameters(self.alloc, expression_, columns, self.parameters, .boolean, .{}) or changed;
+                    changed = try scalar.inferParameters(self.alloc, expression_, columns, self.parameters, .boolean, .{ .invocation = self.backend.parameter_invocation }) or changed;
                 }
                 for (prepared.expressions, common, prepared.types) |expression_, kind, *output| {
                     const resolved = resolveUnknown(kind);
-                    changed = try scalar.inferParameters(self.alloc, expression_, columns, self.parameters, resolved.kind, .{}) or changed;
+                    changed = try scalar.inferParameters(self.alloc, expression_, columns, self.parameters, resolved.kind, .{ .invocation = self.backend.parameter_invocation }) or changed;
                     output.* = resolved;
                 }
             }
@@ -492,7 +492,7 @@ const Builder = struct {
             .boolean => return .{ .kind = .boolean, .nullable = false },
             .parameter => {},
         };
-        return scalar.inferOutput(self.alloc, expression_, columns, self.parameters);
+        return scalar.inferOutputWithInvocation(self.alloc, expression_, columns, self.parameters, self.backend.parameter_invocation);
     }
 
     fn resolveUnknown(kind: scalar.Type) scalar.Type {
@@ -553,11 +553,11 @@ const Builder = struct {
                 const columns = try self.scalarColumns(prepared.source.columns);
                 if (prepared.lowered.predicate) |predicate_| {
                     const expression_ = try @import("bound_scalars.zig").predicateScalar(self.alloc, try self.virtualTable(prepared.source.columns), predicate_);
-                    changed = try scalar.inferParameters(self.alloc, expression_, columns, self.parameters, .boolean, .{}) or changed;
+                    changed = try scalar.inferParameters(self.alloc, expression_, columns, self.parameters, .boolean, .{ .invocation = self.backend.parameter_invocation }) or changed;
                 }
                 for (prepared.expressions, common, prepared.types) |expression_, kind, *output| {
                     const resolved = resolveUnknown(kind);
-                    changed = try scalar.inferParameters(self.alloc, expression_, columns, self.parameters, resolved.kind, .{}) or changed;
+                    changed = try scalar.inferParameters(self.alloc, expression_, columns, self.parameters, resolved.kind, .{ .invocation = self.backend.parameter_invocation }) or changed;
                     output.* = resolved;
                 }
             }
@@ -627,7 +627,7 @@ const Builder = struct {
             .comparison => |part| blk: {
                 var kind: ?ast.ColumnType = null;
                 for (columns) |column| if (std.mem.eql(u8, column.internal, part.field)) {
-                    kind = if (column.origin) |origin| (try scalar.inferOutput(self.alloc, origin, self.shape_columns.items, self.parameters)).kind else column.type;
+                    kind = if (column.origin) |origin| (try scalar.inferOutputWithInvocation(self.alloc, origin, self.shape_columns.items, self.parameters, self.backend.parameter_invocation)).kind else column.type;
                 };
                 const literal = try self.scalarNode(.{ .literal = part.value });
                 const right = if (kind != null and part.value != .null) try self.scalarNode(.{ .cast = .{ .operand = literal, .type = kind.? } }) else literal;
@@ -1033,7 +1033,7 @@ const Builder = struct {
             if (names.len != 0 and names.len != expressions.len) return error.InvalidSqlParameters;
             const columns = try self.alloc.alloc(Column, expressions.len);
             for (columns, expressions, 0..) |*column, expression_, index| {
-                const output = try scalar.inferOutput(self.alloc, expression_, self.shape_columns.items, self.parameters);
+                const output = try scalar.inferOutputWithInvocation(self.alloc, expression_, self.shape_columns.items, self.parameters, self.backend.parameter_invocation);
                 column.* = .{
                     .name = if (names.len != 0) names[index] else if (lowered.count_all) lowered.count_alias orelse "count" else lowered.columns[index].alias orelse if (@import("aggregate_binding.zig").accepts(lowered) and lowered.columns[index].expression != null and lowered.columns[index].expression.?.* == .call) lowered.columns[index].expression.?.call.name else "?column?",
                     .internal = try self.internal(),
@@ -1050,7 +1050,7 @@ const Builder = struct {
             const projections = try self.alloc.dupe(ast.Projection, lowered.columns);
             const column_types = try self.scalarColumns(child.columns);
             for (projections, entry.expressions, entry.types) |*projection, expression_, kind| if (kind.kind) |known| {
-                const actual = try scalar.inferOutput(self.alloc, expression_, column_types, self.parameters);
+                const actual = try scalar.inferOutputWithInvocation(self.alloc, expression_, column_types, self.parameters, self.backend.parameter_invocation);
                 if (actual.kind != known or actual.element_type != kind.element_type)
                     projection.expression = try self.scalarNode(.{ .cast = .{ .operand = projection.expression orelse try self.scalarNode(.{ .column = projection.field }), .type = known, .element_type = kind.element_type } });
             };
@@ -1247,8 +1247,8 @@ const Builder = struct {
                         try self.constraints.append(self.alloc, .{ .expression = try self.inferenceExpression(guard_expression, left.columns), .expected = .boolean });
                     } else {
                         const types = try self.scalarColumns(left.columns);
-                        _ = try scalar.inferParameters(self.alloc, guard_expression, types, self.parameters, .boolean, .{});
-                        demand = try scalar.bindExpectedWithSettings(self.alloc, guard_expression, types, self.parameters, .boolean, .{}, self.backend.settings_view);
+                        _ = try scalar.inferParameters(self.alloc, guard_expression, types, self.parameters, .boolean, .{ .invocation = self.backend.parameter_invocation });
+                        demand = try scalar.bindExpectedWithSettings(self.alloc, guard_expression, types, self.parameters, .boolean, .{ .invocation = self.backend.parameter_invocation }, self.backend.settings_view);
                     }
                 }
                 const result = try self.joinNode(left, right, join.kind, expression_, apply_id);
@@ -1277,8 +1277,8 @@ const Builder = struct {
             return self.node(columns, .singleton);
         }
         const column_types = try self.scalarColumns(columns);
-        if (expression_) |condition| _ = try scalar.inferParameters(self.alloc, condition, column_types, self.parameters, .boolean, .{});
-        const program = if (expression_) |condition| try scalar.bindExpectedWithSettings(self.alloc, condition, column_types, self.parameters, .boolean, .{}, self.backend.settings_view) else null;
+        if (expression_) |condition| _ = try scalar.inferParameters(self.alloc, condition, column_types, self.parameters, .boolean, .{ .invocation = self.backend.parameter_invocation });
+        const program = if (expression_) |condition| try scalar.bindExpectedWithSettings(self.alloc, condition, column_types, self.parameters, .boolean, .{ .invocation = self.backend.parameter_invocation }, self.backend.settings_view) else null;
         if (program) |bound| if (bound.output_type.kind != null and bound.output_type.kind != .boolean) return error.SqlTypeMismatch;
         if (apply_id) |id| return self.node(columns, .{ .apply = .{ .id = id, .kind = kind, .left = left, .right = right, .condition = program } });
         var left_keys: std.ArrayList(scalar.Program) = .empty;
@@ -1329,8 +1329,8 @@ const Builder = struct {
         var right_node = binary.right;
         if (!sideLocal(left.columns, left_node) or !sideLocal(right.columns, right_node)) std.mem.swap(*const ast.Scalar, &left_node, &right_node);
         if (!sideLocal(left.columns, left_node) or !sideLocal(right.columns, right_node)) return;
-        try left_keys.append(self.alloc, try scalar.bindWithSettings(self.alloc, left_node, try self.scalarColumns(left.columns), self.parameters, .{}, self.backend.settings_view));
-        try right_keys.append(self.alloc, try scalar.bindWithSettings(self.alloc, right_node, try self.scalarColumns(right.columns), self.parameters, .{}, self.backend.settings_view));
+        try left_keys.append(self.alloc, try scalar.bindWithSettings(self.alloc, left_node, try self.scalarColumns(left.columns), self.parameters, .{ .invocation = self.backend.parameter_invocation }, self.backend.settings_view));
+        try right_keys.append(self.alloc, try scalar.bindWithSettings(self.alloc, right_node, try self.scalarColumns(right.columns), self.parameters, .{ .invocation = self.backend.parameter_invocation }, self.backend.settings_view));
     }
 };
 /// Expressions whose inputs belong to one side are valid hash keys too.

@@ -131,6 +131,36 @@ test "SQL pull stream owns polymorphic parameter types and preserves JSON numeri
     try std.testing.expectEqual(@as(usize, 1), fixture.opened);
 }
 
+test "SQL pull stream owns one typed array frame across delivery pages and allocation faults" {
+    const Faults = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var compiled = try compiler.compile(a, "SELECT n,cardinality($1::bigint[]),array_lower($1,1),$1 a FROM docs WHERE n=ANY($1) LIMIT $2", .{});
+            defer compiled.deinit();
+            var fixture: Fixture = .{ .count = 10 };
+            const text = try a.dupe(u8, "[0:4]={0,2,NULL,4,6}");
+            defer a.free(text);
+            const stream = (try Stream.open(a, fixture.backend(), &compiled, &.{ .{ .string = text }, .{ .integer = 3 } }, .{ .page_rows = 1 })).?;
+            defer stream.close();
+            @memset(text, 0);
+            // No second raw text/envelope copy is retained for compatibility.
+            try std.testing.expect(stream.context.parameters[0] == .null);
+            const peak = stream.parameter_invocation.?.frame.?.budget.peak;
+            for (0..3) |index| {
+                var page = try stream.next(1);
+                defer page.deinit();
+                try std.testing.expectEqual(@as(usize, 1), page.output.rows.len);
+                const row = page.output.rows[0];
+                try std.testing.expectEqual(@as(i64, @intCast(index * 2)), row[0].integer);
+                try std.testing.expectEqual(@as(i64, 5), row[1].integer);
+                try std.testing.expectEqual(@as(i64, 0), row[2].integer);
+                try std.testing.expect(row[3] == .object);
+                try std.testing.expectEqual(peak, stream.parameter_invocation.?.frame.?.budget.peak);
+            }
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Faults.run, .{});
+}
+
 test "SQL pull stream keeps one pinned policy setting across pages" {
     const settings = @import("setting_catalog.zig");
     const Owner = struct {
@@ -437,6 +467,7 @@ pub const Stream = struct {
     budget: Budget,
     arena: std.heap.ArenaAllocator,
     settings: ?*@import("setting_catalog.zig").View = null,
+    parameter_invocation: ?*@import("parameter_binding.zig").Invocation = null,
     context: runtime.Context,
     cursor: ?catalog.Cursor = null,
     spool: ?*Spool = null,
@@ -482,7 +513,9 @@ pub const Stream = struct {
         self.parallel = null;
         self.parallel_checked = false;
         self.settings = null;
+        self.parameter_invocation = null;
         errdefer if (self.settings) |view| view.deinit();
+        errdefer if (self.parameter_invocation) |invocation| invocation.deinitFrame();
         const arena = self.arena.allocator();
         var statement_backend = backend;
         statement_backend.parameter_fallback_types = try runtime.parameterFallbackTypes(arena, parameters);
@@ -493,10 +526,12 @@ pub const Stream = struct {
             statement_backend.settings_view = view;
         }
         const binding = try describe.bind(arena, statement_backend, compiled, &.{});
+        self.parameter_invocation = binding.parameter_invocation;
+        statement_backend.parameter_invocation = binding.parameter_invocation;
+        if (self.parameter_invocation) |invocation| try invocation.prepareJson(self.budget.allocator(), parameters, .{ .bytes = limits.retained_bytes, .wire_bytes = limits.retained_bytes });
         const statement = if (binding.relation) |relation| relation.statement else compiled.statement.select;
         self.context = .{ .alloc = self.budget.allocator(), .arena = arena, .backend = @import("decision_eval.zig").scopedBackend(statement_backend, binding), .binding = binding, .parameters = &.{}, .limits = limits, .typed_output = true };
-        const params = try arena.alloc(Json, parameters.len);
-        for (parameters, params) |value, *out| out.* = try self.context.outputValue(value);
+        const params = if (self.parameter_invocation) |invocation| try invocation.compatibilityValues(arena) else try arena.dupe(Json, parameters);
         self.context.parameters = params;
         try @import("decision_eval.zig").validateStatement(arena, statement_backend.decision_provider, binding, params);
         if (binding.aggregate != null or binding.window != null or binding.table == null or statement.count_all or (binding.order_keys.len != 0 and !binding.primary_order)) {
@@ -508,6 +543,7 @@ pub const Stream = struct {
             if (binding.aggregate) |bound| external = external or decisions.hasExternalPrograms(bound.outputs) or decisions.hasExternalPrograms(bound.orders);
             if (binding.window) |bound| external = external or decisions.hasExternalPrograms(bound.outputs) or decisions.hasExternalPrograms(bound.orders);
             if (external or (backend.execution_io == null and backend.spill_manager == null) or limits.spill_bytes == 0 or binding.table == null) {
+                if (self.parameter_invocation) |invocation| invocation.deinitFrame();
                 if (self.settings) |view| view.deinit();
                 self.arena.deinit();
                 alloc.destroy(self);
@@ -605,6 +641,7 @@ pub const Stream = struct {
         if (self.cursor) |cursor| cursor.close(cursor.ptr);
         if (self.after) |after| self.budget.allocator().free(after);
         if (self.settings) |view| view.deinit();
+        if (self.parameter_invocation) |invocation| invocation.deinitFrame();
         self.arena.deinit();
         std.debug.assert(self.budget.live == 0);
         self.budget.backing.destroy(self);

@@ -186,14 +186,15 @@ wire/work admission across all inputs. Plain JSON arrays are not SQL arrays;
 JSON strings remain logical strings for JSON descriptors. Allocation-fault,
 input-owner retirement and combined-envelope quota regressions cover this
 preparation layer; a 10,000-iteration composed-program test uses zero scratch
-allocation. This does not yet activate public array parameter execution.
+allocation. The statement-wide integration below now uses this preparation layer.
 
-Statement-wide runtime binding and public/pgwire parameter ingress still need
-to adopt the precise frame contract. Native datetime text inputs normalize to UTC, while
+Statement-wide runtime binding now adopts the precise frame contract. PostgreSQL
+wire and public prepared-statement parameter metadata still need precise element
+descriptors before array input activation. Native datetime text inputs normalize to UTC, while
 datetime binary parameters remain guarded until their codec is bound.
 Public array results now retain element identity, bounds and SQL NULL flags
 through generated HTTP descriptors and PostgreSQL text/binary result delivery.
-Public array parameters, catalog storage and overloads converting
+Prepared-statement array parameters, catalog storage and overloads converting
 whole arrays to text/JSON remain explicit activation gaps. Default decimal
 constructors still need an exact NUMERIC array representation; direct narrowing
 or text casts of these constructors remain guarded (explicit real/double casts
@@ -271,11 +272,22 @@ loop; lazy decision functions retain the existing provider-validation and demand
 machinery. PostgreSQL oracle checks cover mutation parameter OIDs and bare-target
 ambiguity: declared array types permit either projection order, while an
 untyped bare target followed by an incompatible cast retains SQLSTATE 42P08.
-Allocation-fault tests cover binding and preparation ownership. These native
-contracts do not activate typed array parameters through the public envelope,
-session/protocol metadata, aggregate/window/relation binding, or storage; those
-boundaries still require migration. No original inventory dispositions change
-on the strength of these supplemental component tests.
+Allocation-fault tests cover binding and preparation ownership.
+
+One statement-owned invocation now shares precise descriptors across scalar,
+aggregate, window, derived relation, CTE, recursive and set-operation binding.
+Preparation freezes these contracts and decodes inputs once before execution;
+cursor pulls retain that frame without copying the input payload again. Retired
+or unprepared frames cannot execute. Direct HTTP execution accepts cast-constrained
+array text and lossless envelopes, retaining bounds and SQL NULL flags through
+public results. Window navigation promotes numeric array defaults using their
+element descriptors rather than JSON placeholders. PostgreSQL oracle checks
+cover source-order inference, parameter widths, numeric function result types
+and array default promotion; allocation-fault tests cover nested plans and cursor
+ownership. A 10,000-iteration shared-program regression performs no evaluation
+scratch allocation. Prepared-statement/session and wire parameter metadata,
+physical array storage and exact NUMERIC arrays remain activation gaps. No original
+inventory dispositions change on the strength of these supplemental contracts.
 
 Statement-invariant relation caches now use bounded replay storage rather than
 retaining an allocation per source row without a local spill boundary. Small

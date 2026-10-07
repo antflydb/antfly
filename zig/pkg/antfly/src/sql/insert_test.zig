@@ -55,7 +55,13 @@ const Fixture = struct {
 
 test "SQL INSERT expressions infer batch parameters and preserve exact integers" {
     var fixture: Fixture = .{};
-    var compiled = try compiler.compile(std.testing.allocator, "INSERT INTO items (_id, n) VALUES (lower('A'), $1 + 1), ('b', $1 + 1)", .{});
+    // The int4 operator fixes $1 before bigint assignment coercion. An exact
+    // bigint input requires a bigint cast; the target cannot silently widen it.
+    var narrow = try compiler.compile(std.testing.allocator, "INSERT INTO items (_id, n) VALUES (lower('A'), $1 + 1), ('b', $1 + 1)", .{});
+    defer narrow.deinit();
+    try std.testing.expectError(error.SqlNumericOutOfRange, runtime.execute(std.testing.allocator, fixture.backend(), &narrow, &.{.{ .number_string = "9007199254740992" }}, .{}));
+    try std.testing.expectEqual(@as(usize, 0), fixture.calls);
+    var compiled = try compiler.compile(std.testing.allocator, "INSERT INTO items (_id, n) VALUES (lower('A'), $1::bigint + 1), ('b', $1::bigint + 1)", .{});
     defer compiled.deinit();
     var result = try runtime.execute(std.testing.allocator, fixture.backend(), &compiled, &.{.{ .number_string = "9007199254740992" }}, .{});
     defer result.deinit();

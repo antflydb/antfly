@@ -63,9 +63,13 @@ pub const Ordered = struct {
 };
 
 pub fn arrayExpression(alloc: Allocator, node: *const ast.Scalar, columns: []const scalar.Column, parameters: []const ?ast.ColumnType) !bool {
+    return arrayExpressionWithInvocation(alloc, node, columns, parameters, null);
+}
+
+pub fn arrayExpressionWithInvocation(alloc: Allocator, node: *const ast.Scalar, columns: []const scalar.Column, parameters: []const ?ast.ColumnType, invocation: ?*@import("parameter_binding.zig").Invocation) !bool {
     if (node.* == .cast and node.cast.type == .array) return true;
     if (node.* == .call and std.mem.eql(u8, node.call.name, "$array")) return true;
-    return (try scalar.inferOutput(alloc, node, columns, parameters)).kind == .array;
+    return (try scalar.inferOutputWithInvocation(alloc, node, columns, parameters, invocation)).kind == .array;
 }
 
 pub fn aggregateKind(name: []const u8) ?operators.Aggregate.Kind {
@@ -261,6 +265,11 @@ pub fn bind(alloc: Allocator, table: ?catalog.Table, statement: ast.Select, para
 }
 
 pub fn bindWithSettings(alloc: Allocator, table: ?catalog.Table, statement: ast.Select, parameters: []?ast.ColumnType, settings: ?*const @import("setting_catalog.zig").View) !Bound {
+    return bindWithInvocation(alloc, table, statement, parameters, settings, null);
+}
+
+pub fn bindWithInvocation(alloc: Allocator, table: ?catalog.Table, statement: ast.Select, parameters: []?ast.ColumnType, settings: ?*const @import("setting_catalog.zig").View, invocation: ?*@import("parameter_binding.zig").Invocation) !Bound {
+    const bind_limits = scalar.BindLimits{ .invocation = invocation };
     if (statement.columns.len == 0) return error.SqlGroupingError;
     var builder: Builder = .{ .alloc = alloc, .groups = statement.group_by, .table = table, .constants = statement.invocation_constants };
     const projection_nodes = try alloc.alloc(*const ast.Scalar, statement.columns.len);
@@ -326,21 +335,21 @@ pub fn bindWithSettings(alloc: Allocator, table: ?catalog.Table, statement: ast.
     while (true) : (inference_pass += 1) {
         if (inference_pass > parameters.len + 1) return error.ConflictingSqlParameterTypes;
         var changed = false;
-        for (inference_nodes) |node| changed = try scalar.inferParameters(alloc, node, source_columns, parameters, null, .{}) or changed;
-        for (builder.arguments.items) |argument| changed = try scalar.inferParameters(alloc, argument.expression.?, source_columns, parameters, null, .{}) or changed;
+        for (inference_nodes) |node| changed = try scalar.inferParameters(alloc, node, source_columns, parameters, null, bind_limits) or changed;
+        for (builder.arguments.items) |argument| changed = try scalar.inferParameters(alloc, argument.expression.?, source_columns, parameters, null, bind_limits) or changed;
         for (builder.filters.items) |slot| if (slot) |index| {
-            changed = try scalar.inferParameters(alloc, builder.arguments.items[index].expression.?, source_columns, parameters, .boolean, .{}) or changed;
+            changed = try scalar.inferParameters(alloc, builder.arguments.items[index].expression.?, source_columns, parameters, .boolean, bind_limits) or changed;
         };
         for (builder.ordered.items) |ordered| if (ordered.original_direct) |direct| {
-            const array = try arrayExpression(alloc, direct, source_columns, parameters);
+            const array = try arrayExpressionWithInvocation(alloc, direct, source_columns, parameters, invocation);
             const coerced = try builder.node(.{ .cast = .{ .operand = direct, .type = if (array) .array else .number, .element_type = if (array) .float64 else null } });
-            changed = try scalar.inferParameters(alloc, coerced, source_columns, parameters, null, .{}) or changed;
+            changed = try scalar.inferParameters(alloc, coerced, source_columns, parameters, null, bind_limits) or changed;
         };
-        if (inference_having) |node| changed = try scalar.inferParameters(alloc, node, source_columns, parameters, .boolean, .{}) or changed;
+        if (inference_having) |node| changed = try scalar.inferParameters(alloc, node, source_columns, parameters, .boolean, bind_limits) or changed;
         if (!changed) break;
     }
     var predicate: ast.Predicate = if (statement.predicate) |node| .{ .scalar = try bound_scalars.predicateScalar(alloc, table, node) } else undefined;
-    const input = try bound_scalars.bindWithSettings(alloc, table, .{ .select = .{ .table = statement.table, .columns = builder.arguments.items, .predicate = if (statement.predicate != null) &predicate else null, .limit = statement.limit, .offset = statement.offset } }, parameters, settings);
+    const input = try bound_scalars.bindWithInvocation(alloc, table, .{ .select = .{ .table = statement.table, .columns = builder.arguments.items, .predicate = if (statement.predicate != null) &predicate else null, .limit = statement.limit, .offset = statement.offset } }, parameters, settings, &.{}, invocation);
     const grouped_width = groups.len + builder.aggregates.items.len;
     const columns = try alloc.alloc(scalar.Column, grouped_width + builder.constants.len);
     for (columns[0..grouped_width], 0..) |*column, index| column.* = .{ .name = try std.fmt.allocPrint(alloc, "$grouped_{d}", .{index}), .type = .string };
@@ -381,10 +390,10 @@ pub fn bindWithSettings(alloc: Allocator, table: ?catalog.Table, statement: ast.
         const kind = orderedKind(call.name).?;
         var direct_program: ?scalar.Program = null;
         if (pending.direct) |direct| {
-            const array = try arrayExpression(alloc, direct, columns, parameters);
+            const array = try arrayExpressionWithInvocation(alloc, direct, columns, parameters, invocation);
             const coerced = try builder.node(.{ .cast = .{ .operand = direct, .type = if (array) .array else .number, .element_type = if (array) .float64 else null } });
-            _ = try scalar.inferParameters(alloc, coerced, columns, parameters, null, .{});
-            direct_program = try scalar.bindWithSettings(alloc, coerced, columns, parameters, .{}, settings);
+            _ = try scalar.inferParameters(alloc, coerced, columns, parameters, null, bind_limits);
+            direct_program = try scalar.bindWithSettings(alloc, coerced, columns, parameters, bind_limits, settings);
             if (array) {
                 const column = &columns[groups.len + pending.index];
                 column.element_type = if (kind == .continuous) .float64 else try scalar.parameterElementType(.{ .kind = column.type });
@@ -412,15 +421,15 @@ pub fn bindWithSettings(alloc: Allocator, table: ?catalog.Table, statement: ast.
     while (true) : (pass += 1) {
         if (pass > parameters.len + 1) return error.ConflictingSqlParameterTypes;
         var changed = false;
-        for (outputs) |node| changed = try scalar.inferParameters(alloc, node, columns, parameters, null, .{}) or changed;
-        for (order_nodes) |node| changed = try scalar.inferParameters(alloc, node, columns, parameters, null, .{}) or changed;
-        if (having) |node| changed = try scalar.inferParameters(alloc, node, columns, parameters, .boolean, .{}) or changed;
+        for (outputs) |node| changed = try scalar.inferParameters(alloc, node, columns, parameters, null, bind_limits) or changed;
+        for (order_nodes) |node| changed = try scalar.inferParameters(alloc, node, columns, parameters, null, bind_limits) or changed;
+        if (having) |node| changed = try scalar.inferParameters(alloc, node, columns, parameters, .boolean, bind_limits) or changed;
         if (!changed) break;
     }
     const programs = try alloc.alloc(scalar.Program, outputs.len);
     const names = try alloc.alloc([]const u8, outputs.len);
     for (outputs, programs, statement.columns, names) |node, *program, projection, *name| {
-        program.* = try scalar.bindWithSettings(alloc, node, columns, parameters, .{}, settings);
+        program.* = try scalar.bindWithSettings(alloc, node, columns, parameters, bind_limits, settings);
         name.* = try alloc.dupe(u8, projection.alias orelse if (projection.field.len != 0) projection.field else if (projection.expression.?.* == .call) projection.expression.?.call.name else "?column?");
     }
     const order_outputs = try alloc.alloc(?usize, order_nodes.len);
@@ -432,8 +441,8 @@ pub fn bindWithSettings(alloc: Allocator, table: ?catalog.Table, statement: ast.
         };
     }
     const orders = try alloc.alloc(scalar.Program, order_nodes.len);
-    for (order_nodes, orders) |node, *program| program.* = try scalar.bindWithSettings(alloc, node, columns, parameters, .{}, settings);
-    const having_program = if (having) |node| try scalar.bindExpectedWithSettings(alloc, node, columns, parameters, .boolean, .{}, settings) else null;
+    for (order_nodes, orders) |node, *program| program.* = try scalar.bindWithSettings(alloc, node, columns, parameters, bind_limits, settings);
+    const having_program = if (having) |node| try scalar.bindExpectedWithSettings(alloc, node, columns, parameters, .boolean, bind_limits, settings) else null;
     if (having_program) |program| if (program.output_type.kind != null and program.output_type.kind != .boolean) return error.SqlTypeMismatch;
     for (builder.filters.items) |slot| if (slot) |index| {
         const kind = input.projections[index].?.output_type.kind;

@@ -72,6 +72,8 @@ pub const OrderKey = struct {
     nulls_first: ?bool = null,
 };
 pub const BoundStatement = struct {
+    parameter_invocation: ?*@import("parameter_binding.zig").Invocation = null,
+    parameter_descriptors: []const @import("scalar.zig").Type = &.{},
     joined_mutation: ?*const @import("joined_mutation.zig").Bound = null,
     merge_mutation: ?*const @import("merge_mutation.zig").Candidates = null,
     conflict: ?@import("conflict.zig").Bound = null,
@@ -196,6 +198,23 @@ pub fn bind(allocator: std.mem.Allocator, backend: catalog.Backend, compiled: *c
 /// Internal plans retain full typed descriptors. Wire validation belongs only
 /// at the public statement boundary, never at a derived relation boundary.
 pub fn bindInternal(allocator: std.mem.Allocator, backend: catalog.Backend, compiled: *const compiler.Compiled, explicit_parameter_types: []const ?ast.ColumnType) anyerror!BoundStatement {
+    var statement_backend = backend;
+    if (statement_backend.parameter_invocation == null and compiled.parameter_count != 0) {
+        const invocation = try @import("parameter_binding.zig").Invocation.initLeaky(allocator, compiled.parameter_count);
+        invocation.fallbacks = backend.parameter_fallback_types;
+        statement_backend.parameter_invocation = invocation;
+    }
+    if (statement_backend.parameter_invocation) |invocation| try invocation.mergeCoarse(explicit_parameter_types);
+    var result = try bindImpl(allocator, statement_backend, compiled, explicit_parameter_types);
+    result.parameter_invocation = statement_backend.parameter_invocation;
+    if (statement_backend.parameter_invocation) |invocation| {
+        try invocation.mergeCoarse(result.parameter_types);
+        result.parameter_descriptors = invocation.descriptors;
+    }
+    return result;
+}
+
+fn bindImpl(allocator: std.mem.Allocator, backend: catalog.Backend, compiled: *const compiler.Compiled, explicit_parameter_types: []const ?ast.ColumnType) anyerror!BoundStatement {
     if (compiled.statement == .explain) {
         const inner: compiler.Compiled = .{ .arena = undefined, .statement = compiled.statement.explain.statement.*, .parameter_count = compiled.parameter_count };
         var inspected = try bindInternal(allocator, backend, &inner, explicit_parameter_types);
@@ -320,7 +339,7 @@ pub fn bindInternal(allocator: std.mem.Allocator, backend: catalog.Backend, comp
         @memset(parameters, null);
         @memcpy(parameters[0..explicit_parameter_types.len], explicit_parameter_types);
         const aggregate = try allocator.create(@import("aggregate_binding.zig").Bound);
-        aggregate.* = try @import("aggregate_binding.zig").bindWithSettings(allocator, table, compiled.statement.select, parameters, backend.settings_view);
+        aggregate.* = try @import("aggregate_binding.zig").bindWithInvocation(allocator, table, compiled.statement.select, parameters, backend.settings_view, backend.parameter_invocation);
         const columns = try allocator.alloc(Column, aggregate.outputs.len);
         for (columns, aggregate.names, aggregate.outputs) |*column, name, program| column.* = .{ .name = name, .type = internalKind(program.output_type.kind), .element_type = program.output_type.element_type, .untyped_null = program.output_type.kind == null };
         var json_literals: std.StringHashMapUnmanaged(Json) = .empty;
@@ -335,7 +354,7 @@ pub fn bindInternal(allocator: std.mem.Allocator, backend: catalog.Backend, comp
     }
     if (compiled.statement == .select and compiled.statement.select.table == null) {
         try backend.vtable.checkpoint(backend.ptr);
-        return bindConstantSelect(allocator, compiled, explicit_parameter_types, backend.settings_view, backend.parameter_fallback_types);
+        return bindConstantSelect(allocator, compiled, explicit_parameter_types, backend.settings_view, backend.parameter_fallback_types, backend.parameter_invocation);
     }
     if (compiled.statement == .merge) {
         try backend.vtable.checkpoint(backend.ptr);
@@ -407,7 +426,7 @@ pub fn bindInternal(allocator: std.mem.Allocator, backend: catalog.Backend, comp
     defer allocator.free(contexts);
     @memset(contexts, null);
     var context: Context = .{ .allocator = allocator, .backend = backend, .table = table, .parameters = parameters, .contexts = contexts };
-    if (!joined) context.scalars = try bound_scalars.bindWithParameterFallback(allocator, table, compiled.statement, parameters, backend.settings_view, backend.parameter_fallback_types);
+    if (!joined) context.scalars = try bound_scalars.bindWithInvocation(allocator, table, compiled.statement, parameters, backend.settings_view, backend.parameter_fallback_types, backend.parameter_invocation);
     const columns: []const Column = if (joined) &.{} else switch (compiled.statement) {
         .select => |statement| try context.select(statement),
         .insert => |statement| blk: {
@@ -498,7 +517,7 @@ fn returningReads(projections: ?[]const ast.Projection) bool {
     return false;
 }
 
-fn bindConstantSelect(alloc: std.mem.Allocator, compiled: *const compiler.Compiled, hints: []const ?ast.ColumnType, settings: ?*const @import("setting_catalog.zig").View, fallbacks: []const ?ast.ColumnType) !BoundStatement {
+fn bindConstantSelect(alloc: std.mem.Allocator, compiled: *const compiler.Compiled, hints: []const ?ast.ColumnType, settings: ?*const @import("setting_catalog.zig").View, fallbacks: []const ?ast.ColumnType, invocation: ?*@import("parameter_binding.zig").Invocation) !BoundStatement {
     const statement = compiled.statement.select;
     if (!statement.count_all and statement.columns.len == 0) return error.UndefinedColumn;
     const parameters = try alloc.alloc(?ast.ColumnType, compiled.parameter_count);
@@ -516,7 +535,7 @@ fn bindConstantSelect(alloc: std.mem.Allocator, compiled: *const compiler.Compil
             else => return error.InvalidSqlLimit,
         }
     };
-    const scalars = try bound_scalars.bindWithParameterFallback(alloc, null, compiled.statement, parameters, settings, fallbacks);
+    const scalars = try bound_scalars.bindWithInvocation(alloc, null, compiled.statement, parameters, settings, fallbacks, invocation);
     const columns = try alloc.alloc(Column, if (statement.count_all) 1 else statement.columns.len);
     if (statement.count_all) {
         columns[0] = .{ .name = try alloc.dupe(u8, statement.count_alias orelse "count"), .type = .integer };

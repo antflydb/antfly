@@ -60,7 +60,12 @@ pub const Column = struct {
     /// They are binding metadata, never additional physical row values.
     aliases: []const []const u8 = &.{},
 };
-pub const BindLimits = struct { nodes: usize = 8192, depth: usize = 64, parameters: usize = 1024 };
+pub const BindLimits = struct {
+    nodes: usize = 8192,
+    depth: usize = 64,
+    parameters: usize = 1024,
+    invocation: ?*@import("parameter_binding.zig").Invocation = null,
+};
 const decisions = @import("../functions/decisions.zig");
 pub const DecisionDemand = struct { instruction: u32, function: decisions.Function, args: []const Json };
 pub const EvalLimits = struct {
@@ -102,6 +107,9 @@ pub const Program = struct {
     parameter_descriptors: []const Type,
     required_columns: []const u32,
     settings: ?*const setting_catalog.View = null,
+    /// Statement-owned, stable-address contract. Preparation validates all
+    /// registered slices before publishing its immutable execution frame.
+    invocation: ?*@import("parameter_binding.zig").Invocation = null,
     /// Derived execution caches are never part of serialized instructions.
     translations: std.AutoHashMapUnmanaged(u32, *const TextTranslation) = .empty,
     constant_arrays: std.AutoHashMapUnmanaged(u32, *const arrays.Value) = .empty,
@@ -150,15 +158,20 @@ pub const Program = struct {
     /// NULL placeholders. Borrowed scalar results remain valid while the
     /// program, cells and parameters live; computed strings use alloc.
     pub fn evaluateInstruction(self: *const Program, alloc: Allocator, index: u32, parameters: []const Json) !Datum {
-        var context: Evaluator = .{ .program = self, .alloc = alloc, .cells = &.{}, .parameters = parameters, .limits = .{} };
+        var context: Evaluator = .{ .program = self, .alloc = alloc, .cells = &.{}, .parameters = parameters, .typed_parameters = self.preparedValues(), .limits = .{} };
         return context.runDatum(index, 0);
     }
 
     pub fn evaluate(self: *const Program, alloc: Allocator, cells: []const Datum, parameters: []const Json, limits: EvalLimits) !Datum {
-        var context: Evaluator = .{ .program = self, .alloc = alloc, .cells = cells, .parameters = parameters, .limits = limits };
+        var context: Evaluator = .{ .program = self, .alloc = alloc, .cells = cells, .parameters = parameters, .typed_parameters = self.preparedValues(), .limits = limits };
         const result = try context.runDatum(self.root, 0);
         _ = try context.validateJson(result.value, 0);
         return result;
+    }
+
+    fn preparedValues(self: *const Program) ?[]const Datum {
+        const invocation = self.invocation orelse return null;
+        return if (invocation.frame) |frame| frame.values else null;
     }
 
     /// Bind once per program/execution, not per row. Multiple programs from a
@@ -219,6 +232,7 @@ pub fn bindWithSettings(alloc: Allocator, expression: *const ast.Scalar, columns
 /// remain unknown; callers may repeat over all programs until no type changes,
 /// then choose protocol defaults only for positions still unconstrained.
 pub fn inferParameters(alloc: Allocator, expression: *const ast.Scalar, columns: []const Column, parameters: []?ast.ColumnType, expected: ?ast.ColumnType, limits: BindLimits) !bool {
+    if (limits.invocation) |invocation| return invocation.infer(alloc, expression, columns, parameters, if (expected) |kind| Type{ .kind = kind } else null, limits);
     if (limits.parameters > 1024 or parameters.len > limits.parameters) return error.SqlProgramLimitExceeded;
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -238,11 +252,19 @@ pub fn inferParameters(alloc: Allocator, expression: *const ast.Scalar, columns:
 /// Read a provisional result type without defaulting unresolved parameters or
 /// NULL literals. Relation-wide inference uses this before emitting programs.
 pub fn inferOutput(alloc: Allocator, expression: *const ast.Scalar, columns: []const Column, parameters: []const ?ast.ColumnType) !Type {
+    return inferOutputWithInvocation(alloc, expression, columns, parameters, null);
+}
+
+pub fn inferOutputWithInvocation(alloc: Allocator, expression: *const ast.Scalar, columns: []const Column, parameters: []const ?ast.ColumnType, invocation: ?*@import("parameter_binding.zig").Invocation) !Type {
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
-    var binder: Binder = .{ .alloc = arena.allocator(), .columns = columns, .limits = .{}, .allow_unresolved = true };
+    var binder: Binder = .{ .alloc = arena.allocator(), .columns = columns, .limits = .{}, .allow_unresolved = true, .typed_parameters = invocation != null };
     if (parameters.len > binder.parameters.len) return error.SqlProgramLimitExceeded;
     for (parameters, binder.parameters[0..parameters.len]) |kind, *descriptor| descriptor.* = .{ .kind = kind };
+    if (invocation) |owner| {
+        try owner.mergeCoarse(parameters);
+        @memcpy(binder.parameters[0..owner.descriptors.len], owner.descriptors);
+    }
     try binder.registerColumns();
     return binder.infer(expression, 0);
 }
@@ -252,6 +274,10 @@ pub fn bindExpected(alloc: Allocator, expression: *const ast.Scalar, columns: []
 }
 
 pub fn bindExpectedWithSettings(alloc: Allocator, expression: *const ast.Scalar, columns: []const Column, parameter_hints: []const ?ast.ColumnType, expected: ?ast.ColumnType, limits: BindLimits, settings: ?*const setting_catalog.View) !Program {
+    if (limits.invocation) |invocation| {
+        try invocation.mergeCoarse(parameter_hints);
+        return bindDescriptors(alloc, expression, columns, invocation.descriptors, if (expected) |kind| Type{ .kind = kind } else null, limits, settings, true);
+    }
     if (limits.parameters > 1024 or parameter_hints.len > limits.parameters or limits.nodes == 0) return error.SqlProgramLimitExceeded;
     var descriptors: [1024]Type = undefined;
     for (parameter_hints, descriptors[0..parameter_hints.len]) |kind, *descriptor| descriptor.* = .{ .kind = kind };
@@ -274,7 +300,10 @@ pub fn inferTypedParameters(alloc: Allocator, expression: *const ast.Scalar, col
 
 pub fn inferTypedParametersExpected(alloc: Allocator, expression: *const ast.Scalar, columns: []const Column, parameters: []Type, expected: ?Type, limits: BindLimits) !bool {
     if (limits.parameters > 1024 or parameters.len > limits.parameters) return error.SqlProgramLimitExceeded;
-    if (expected) |descriptor| try validateParameterType(descriptor);
+    // An expected array *family* is a constraint, not an input descriptor.
+    // Element identity may already come from the expression or shared hints.
+    // Authoritative input descriptors still require an explicit element type.
+    if (expected) |descriptor| if (descriptor.kind != .array or descriptor.element_type != null) try validateParameterType(descriptor);
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     var binder: Binder = .{ .alloc = arena.allocator(), .columns = columns, .limits = limits, .allow_unresolved = true, .typed_parameters = true };
@@ -318,7 +347,7 @@ fn normalizeParameterType(descriptor: Type) !Type {
 fn bindDescriptors(alloc: Allocator, expression: *const ast.Scalar, columns: []const Column, parameter_hints: []const Type, expected: ?Type, limits: BindLimits, settings: ?*const setting_catalog.View, typed_parameters: bool) !Program {
     if (limits.parameters > 1024 or parameter_hints.len > limits.parameters or limits.nodes == 0) return error.SqlProgramLimitExceeded;
     if (typed_parameters) for (parameter_hints) |descriptor| try validateParameterType(descriptor);
-    if (typed_parameters) if (expected) |descriptor| try validateParameterType(descriptor);
+    if (typed_parameters) if (expected) |descriptor| if (descriptor.kind != .array or descriptor.element_type != null) try validateParameterType(descriptor);
     const arena = try alloc.create(std.heap.ArenaAllocator);
     errdefer alloc.destroy(arena);
     arena.* = std.heap.ArenaAllocator.init(alloc);
@@ -349,6 +378,7 @@ fn bindDescriptors(alloc: Allocator, expression: *const ast.Scalar, columns: []c
         .translations = binder.translations,
     };
     try program.prepareConstantArrays(binder.alloc);
+    if (limits.invocation) |invocation| try invocation.register(&program);
     program.arena = arena;
     return program;
 }
@@ -873,6 +903,14 @@ fn common(left: Type, right: Type) !Type {
     const element: ?arrays.ElementType = if (left.kind == null) right.element_type else if (right.kind == null) left.element_type else if (kind == .integer) (if (left.element_type == null or right.element_type == null or left.element_type == .int64 or right.element_type == .int64) .int64 else if (left.element_type == .int32 or right.element_type == .int32) .int32 else .int16) else if (kind == .number) (if (left.element_type == .float64 or right.element_type == .float64) .float64 else if (left.element_type == .float32 or right.element_type == .float32) .float32 else null) else left.element_type orelse right.element_type;
     return .{ .kind = kind, .element_type = element, .nullable = left.nullable or right.nullable };
 }
+
+/// Typed operator boundaries use the same array conversion and admission as
+/// explicit scalar casts. Identity casts borrow; promotions retain SQL NULLs,
+/// dimensions and bounds without interpreting the JSON placeholder.
+pub fn castArrayDatum(alloc: Allocator, datum: Datum, target: arrays.ElementType, limits: EvalLimits) !Datum {
+    var context: Evaluator = .{ .program = undefined, .alloc = alloc, .cells = &.{}, .parameters = &.{}, .limits = limits };
+    return context.castArray(datum, target);
+}
 fn literalType(value: ast.Value) Type {
     return .{ .kind = switch (value) {
         .null, .parameter => null,
@@ -1179,7 +1217,15 @@ const Binder = struct {
                 if (function == .abs or function == .ceil or function == .floor or function == .round or function == .trunc or function == .sign or function == .sqrt or function == .power or function == .mod) {
                     if (merged.kind != null and !numeric(merged.kind)) return error.SqlTypeMismatch;
                 }
-                break :blk .{ .element_type = merged.element_type, .kind = switch (function) {
+                break :blk .{ .element_type = switch (function) {
+                    .sqrt, .power, .date_part => .float64,
+                    .length, .octet_length, .bit_length, .strpos, .ascii => .int32,
+                    .starts_with => .boolean,
+                    .to_jsonb, .jsonb_build_object => .jsonb,
+                    .date_trunc, .to_timestamp => null,
+                    .coalesce, .nullif, .greatest, .least, .abs, .ceil, .floor, .round, .trunc, .sign, .mod, .@"$single" => merged.element_type,
+                    else => .text,
+                }, .kind = switch (function) {
                     .to_jsonb, .jsonb_build_object => .json,
                     .length, .octet_length, .bit_length, .strpos, .ascii => .integer,
                     .starts_with, .@"$pattern_quantified" => .boolean,
@@ -1481,6 +1527,7 @@ const Evaluator = struct {
                     if (slot >= parameters.len) return error.InvalidSqlParameters;
                     break :blk parameters[slot];
                 }
+                if (self.program.invocation != null) return error.InvalidSqlParameters;
                 if (instruction.type.kind == .array) return error.UnsupportedSqlShape;
                 if (slot >= self.parameters.len) return error.InvalidSqlParameters;
                 const value = self.parameters[slot];
@@ -1508,20 +1555,7 @@ const Evaluator = struct {
                         value.* = decoded.value;
                         break :blk Datum.typedArray(value);
                     }
-                    const source = datum.array orelse return error.UnsupportedSqlShape;
-                    const target = cast.element_type orelse return error.InvalidSqlProgram;
-                    if (source.element_type == target) break :blk datum;
-                    if (!builtin_cast.allowed(source.element_type, target)) return error.SqlCannotCoerce;
-                    try self.charge(@sizeOf(arrays.Value) + source.elements.len * @sizeOf(arrays.Element));
-                    const cells = try self.alloc.alloc(arrays.Element, source.elements.len);
-                    for (source.elements, cells) |element, *cell| {
-                        if (self.steps >= self.limits.steps) return error.SqlProgramLimitExceeded;
-                        self.steps += 1;
-                        cell.* = if (element.sql_null or (source.element_type == .jsonb and element.value == .null and target != .text and target != .jsonb)) .{} else arrays.Element.json(try self.castBuiltin(element.value, source.element_type, target));
-                    }
-                    const value = try self.alloc.create(arrays.Value);
-                    value.* = try arrays.Value.init(target, source.dimensions, cells, .{});
-                    break :blk Datum.typedArray(value);
+                    break :blk try self.castArray(datum, cast.element_type orelse return error.InvalidSqlProgram);
                 }
                 if (datum.array != null) return error.SqlTypeMismatch;
                 if (cast.element_type) |target| {
@@ -2069,6 +2103,23 @@ const Evaluator = struct {
         const initial = work.remaining;
         value.* = try arrays.Value.initWithBudget(kind, shape, cells, .{}, &work);
         self.steps += initial - work.remaining;
+        return Datum.typedArray(value);
+    }
+
+    fn castArray(self: *Evaluator, datum: Datum, target: arrays.ElementType) !Datum {
+        if (datum.sql_null) return datum;
+        const source = datum.array orelse return error.UnsupportedSqlShape;
+        if (source.element_type == target) return datum;
+        if (!builtin_cast.allowed(source.element_type, target)) return error.SqlCannotCoerce;
+        try self.charge(@sizeOf(arrays.Value) + source.elements.len * @sizeOf(arrays.Element));
+        const cells = try self.alloc.alloc(arrays.Element, source.elements.len);
+        for (source.elements, cells) |element, *cell| {
+            if (self.steps >= self.limits.steps) return error.SqlProgramLimitExceeded;
+            self.steps += 1;
+            cell.* = if (element.sql_null or (source.element_type == .jsonb and element.value == .null and target != .text and target != .jsonb)) .{} else arrays.Element.json(try self.castBuiltin(element.value, source.element_type, target));
+        }
+        const value = try self.alloc.create(arrays.Value);
+        value.* = try arrays.Value.init(target, source.dimensions, cells, .{});
         return Datum.typedArray(value);
     }
 

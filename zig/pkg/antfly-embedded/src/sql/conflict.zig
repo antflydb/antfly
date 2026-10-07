@@ -86,9 +86,9 @@ pub fn bind(alloc: std.mem.Allocator, backend: catalog.Backend, table: catalog.T
                 if (ordinal + assignment.capture_span > clause.capture_count) return error.InvalidSqlBackendResponse;
                 if (assignment.capture_expression == null) continue;
             }
-            changed = try scalar.inferParameters(alloc, assignment.capture_expression orelse expression, columns, parameters, column.type, .{}) or changed;
+            changed = try scalar.inferParameters(alloc, assignment.capture_expression orelse expression, columns, parameters, column.type, .{ .invocation = backend.parameter_invocation }) or changed;
         }
-        if (clause.predicate) |expression| changed = try scalar.inferParameters(alloc, expression, columns, parameters, .boolean, .{}) or changed;
+        if (clause.predicate) |expression| changed = try scalar.inferParameters(alloc, expression, columns, parameters, .boolean, .{ .invocation = backend.parameter_invocation }) or changed;
         if (!changed) break;
     }
     const assignments = try alloc.alloc(?scalar.Program, clause.assignments.len);
@@ -109,9 +109,9 @@ pub fn bind(alloc: std.mem.Allocator, backend: catalog.Backend, table: catalog.T
             later.* = .{ .query = query, .binding = binding };
             continue;
         }
-        program.* = if (assignment.capture_ordinal != null and assignment.capture_expression == null) null else try scalar.bindExpectedWithSettings(alloc, assignment.capture_expression orelse assignment.expression.?, columns, parameters, (try table.column(assignment.field)).type, .{}, backend.settings_view);
+        program.* = if (assignment.capture_ordinal != null and assignment.capture_expression == null) null else try scalar.bindExpectedWithSettings(alloc, assignment.capture_expression orelse assignment.expression.?, columns, parameters, (try table.column(assignment.field)).type, .{ .invocation = backend.parameter_invocation }, backend.settings_view);
     }
-    return .{ .columns = columns, .row_width = count, .assignments = assignments, .deferred = deferred, .predicate = if (clause.predicate) |expression| try scalar.bindExpectedWithSettings(alloc, expression, columns, parameters, .boolean, .{}, backend.settings_view) else null, .arbiter_conditions = arbiter_conditions, .arbiter_expressions = arbiter_expressions };
+    return .{ .columns = columns, .row_width = count, .assignments = assignments, .deferred = deferred, .predicate = if (clause.predicate) |expression| try scalar.bindExpectedWithSettings(alloc, expression, columns, parameters, .boolean, .{ .invocation = backend.parameter_invocation }, backend.settings_view) else null, .arbiter_conditions = arbiter_conditions, .arbiter_expressions = arbiter_expressions };
 }
 
 fn bindArbiterPredicate(alloc: std.mem.Allocator, table: catalog.Table, expression: *const ast.Scalar) ![]const catalog.Condition {

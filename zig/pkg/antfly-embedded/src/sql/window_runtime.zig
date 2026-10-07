@@ -624,10 +624,12 @@ pub fn evaluate(context: anytype, cells: anytype, indices: anytype, sort: bindin
             },
             else => if (sliding) try running.query(context, cells, indices, spec, bounds) else try tree.?.querySet(selected),
         };
-        try setCell(cells, row, column, if (result.sql_null) result else .{
-            .value = try describe.coerceAlloc(if (comptime disk.isDisk(@TypeOf(cells))) result_arena.allocator() else context.arena, result.value, spec.type),
-            .sql_null = false,
-        });
+        const a = if (comptime disk.isDisk(@TypeOf(cells))) result_arena.allocator() else context.arena;
+        const typed = if (!result.sql_null and spec.type == .array)
+            try scalar.castArrayDatum(a, result, spec.element_type orelse return error.InvalidSqlProgram, .{ .output_bytes = context.limits.retained_bytes })
+        else
+            result;
+        try setCell(cells, row, column, try describe.coerceDatum(a, typed, spec.type, spec.element_type));
     }
 }
 

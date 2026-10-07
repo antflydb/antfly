@@ -24,6 +24,7 @@ const Allocator = std.mem.Allocator;
 const parameter_frame = @import("parameter_frame.zig");
 
 pub const Bound = struct {
+    invocation: ?*@import("parameter_binding.zig").Invocation = null,
     parameter_descriptors: []const scalar.Type = &.{},
     typed_parameters: bool = false,
     columns: []const scalar.Column = &.{},
@@ -47,7 +48,7 @@ pub const Bound = struct {
     }
 
     pub fn validateDecisions(self: Bound, alloc: Allocator, parameters: []const std.json.Value, provider: ?@import("../functions/decisions.zig").DecisionProvider) !void {
-        if (self.typed_parameters) return error.UnsupportedSqlShape;
+        if (self.typed_parameters and self.invocation == null) return error.UnsupportedSqlShape;
         const evaluator = @import("decision_eval.zig");
         if (self.predicate) |*program| try evaluator.validate(alloc, provider, program, parameters);
         for (self.projections) |optional| if (optional) |*program| try evaluator.validate(alloc, provider, program, parameters);
@@ -87,7 +88,7 @@ pub const Bound = struct {
     }
 
     pub fn matchesWithProvider(self: Bound, alloc: Allocator, values: []const scalar.Datum, parameters: []const std.json.Value, provider: ?@import("../functions/decisions.zig").DecisionProvider) !bool {
-        if (self.typed_parameters) return error.UnsupportedSqlShape;
+        if (self.typed_parameters and self.invocation == null) return error.UnsupportedSqlShape;
         const program = self.predicate orelse return true;
         const value = try @import("decision_eval.zig").evaluate(alloc, provider, &program, values, parameters);
         if (value.sql_null) return false;
@@ -313,13 +314,22 @@ pub fn bindWithSettings(alloc: Allocator, table: ?catalog.Table, statement: ast.
 }
 
 pub fn bindWithParameterFallback(alloc: Allocator, table: ?catalog.Table, statement: ast.Statement, parameters: []?ast.ColumnType, settings: ?*const @import("setting_catalog.zig").View, fallbacks: []const ?ast.ColumnType) !Bound {
+    return bindWithInvocation(alloc, table, statement, parameters, settings, fallbacks, null);
+}
+
+pub fn bindWithInvocation(alloc: Allocator, table: ?catalog.Table, statement: ast.Statement, parameters: []?ast.ColumnType, settings: ?*const @import("setting_catalog.zig").View, fallbacks: []const ?ast.ColumnType, invocation: ?*@import("parameter_binding.zig").Invocation) !Bound {
     if (parameters.len > 1024 or fallbacks.len > 1024) return error.SqlProgramLimitExceeded;
     const descriptors = try alloc.alloc(scalar.Type, parameters.len);
     for (parameters, descriptors) |kind, *descriptor| descriptor.* = .{ .kind = kind };
+    if (invocation) |owner| {
+        try owner.mergeCoarse(parameters);
+        if (parameters.len != owner.descriptors.len) return error.InvalidSqlParameters;
+        @memcpy(descriptors, owner.descriptors);
+    }
     const fallback_descriptors = try alloc.alloc(scalar.Type, fallbacks.len);
     for (fallbacks, fallback_descriptors) |kind, *descriptor| descriptor.* = .{ .kind = kind };
-    const result = try bindDescriptors(alloc, table, statement, descriptors, settings, fallback_descriptors, false);
-    for (parameters, descriptors) |*kind, descriptor| kind.* = descriptor.kind;
+    const result = try bindDescriptorsWithInvocation(alloc, table, statement, descriptors, settings, fallback_descriptors, invocation != null, invocation);
+    for (parameters, if (invocation) |owner| owner.descriptors else descriptors) |*kind, descriptor| kind.* = descriptor.kind;
     return result;
 }
 
@@ -331,7 +341,11 @@ pub fn bindTyped(alloc: Allocator, table: ?catalog.Table, statement: ast.Stateme
 }
 
 fn bindDescriptors(alloc: Allocator, table: ?catalog.Table, statement: ast.Statement, parameters: []scalar.Type, settings: ?*const @import("setting_catalog.zig").View, fallbacks: []const scalar.Type, typed_parameters: bool) !Bound {
-    if (statement == .insert) return bindInsert(alloc, table orelse return error.UndefinedTable, statement.insert, parameters, settings, fallbacks, typed_parameters);
+    return bindDescriptorsWithInvocation(alloc, table, statement, parameters, settings, fallbacks, typed_parameters, null);
+}
+
+fn bindDescriptorsWithInvocation(alloc: Allocator, table: ?catalog.Table, statement: ast.Statement, parameters: []scalar.Type, settings: ?*const @import("setting_catalog.zig").View, fallbacks: []const scalar.Type, typed_parameters: bool, invocation: ?*@import("parameter_binding.zig").Invocation) !Bound {
+    if (statement == .insert) return bindInsert(alloc, table orelse return error.UndefinedTable, statement.insert, parameters, settings, fallbacks, typed_parameters, invocation);
     const needed = switch (statement) {
         .select => |select| blk: {
             if (needsResidual(table, select.predicate)) break :blk true;
@@ -347,7 +361,10 @@ fn bindDescriptors(alloc: Allocator, table: ?catalog.Table, statement: ast.State
         .delete => |delete| needsResidual(table, delete.predicate),
         else => false,
     };
-    if (table != null and !needed and !typed_parameters) return .{};
+    // Catalog-directed literals/parameters use Context.value's prepared frame.
+    // Do not manufacture scalar programs and residual cells for native seeks,
+    // direct replacements or row bounds that already have a typed fast path.
+    if (table != null and !needed and (!typed_parameters or invocation != null)) return .{ .invocation = invocation };
     const table_columns: []const catalog.Column = if (table) |definition| definition.columns else &.{};
     const relations = @import("relation_binding.zig");
     const qualified_names = switch (statement) {
@@ -363,8 +380,8 @@ fn bindDescriptors(alloc: Allocator, table: ?catalog.Table, statement: ast.State
     const columns = try alloc.alloc(scalar.Column, table_columns.len + @intFromBool(table != null));
     for (table_columns, columns[0..table_columns.len]) |column, *out| out.* = .{ .name = column.name, .type = column.type, .element_type = column.element_type, .nullable = column.nullable, .aliases = if (qualified_names) try table.?.columnAliases(alloc, column.name) else &.{} };
     if (table != null) columns[table_columns.len] = .{ .name = "_id", .type = .string, .nullable = false, .aliases = if (qualified_names) try table.?.columnAliases(alloc, "_id") else &.{} };
-    var builder: Builder = .{ .alloc = alloc, .table = table, .columns = columns, .parameters = parameters, .settings = settings, .fallbacks = fallbacks, .typed_parameters = typed_parameters };
-    var out: Bound = .{ .columns = columns, .typed_parameters = typed_parameters };
+    var builder: Builder = .{ .alloc = alloc, .table = table, .columns = columns, .parameters = parameters, .settings = settings, .fallbacks = fallbacks, .typed_parameters = typed_parameters, .invocation = invocation };
+    var out: Bound = .{ .columns = columns, .typed_parameters = typed_parameters, .invocation = invocation };
     const predicate = switch (statement) {
         .select => |select| select.predicate,
         .update => |update| update.predicate,
@@ -425,7 +442,8 @@ fn bindDescriptors(alloc: Allocator, table: ?catalog.Table, statement: ast.State
         if (!changed) break;
     }
     try builder.freeze();
-    for (parameters, unresolved_targets[0..parameters.len]) |parameter, unresolved| {
+    for (parameters, unresolved_targets[0..parameters.len]) |*parameter, unresolved| {
+        if (unresolved and parameter.kind == null) parameter.* = .{ .kind = .string, .element_type = .text };
         if (unresolved and parameter.kind != .string) return error.ConflictingSqlParameterTypes;
     }
     if (predicate != null and (typed_parameters or table == null or needsResidual(table, predicate))) {
@@ -467,14 +485,14 @@ fn bindDescriptors(alloc: Allocator, table: ?catalog.Table, statement: ast.State
     return out;
 }
 
-fn bindInsert(alloc: Allocator, table: catalog.Table, statement: ast.Insert, parameters: []scalar.Type, settings: ?*const @import("setting_catalog.zig").View, fallbacks: []const scalar.Type, typed_parameters: bool) !Bound {
-    if (statement.expressions.len == 0) return .{ .parameter_descriptors = try alloc.dupe(scalar.Type, parameters), .typed_parameters = typed_parameters };
+fn bindInsert(alloc: Allocator, table: catalog.Table, statement: ast.Insert, parameters: []scalar.Type, settings: ?*const @import("setting_catalog.zig").View, fallbacks: []const scalar.Type, typed_parameters: bool, invocation: ?*@import("parameter_binding.zig").Invocation) !Bound {
+    if (statement.expressions.len == 0) return .{ .parameter_descriptors = try alloc.dupe(scalar.Type, parameters), .typed_parameters = typed_parameters, .invocation = invocation };
     if (statement.expressions.len != statement.rows.len) return error.InvalidSqlParameters;
     if (statement.defaults.len != 0) {
         if (statement.defaults.len != statement.rows.len) return error.InvalidSqlParameters;
         for (statement.defaults) |mask| if (mask.len != statement.columns.len) return error.InvalidSqlParameters;
     }
-    var builder: Builder = .{ .alloc = alloc, .table = null, .columns = &.{}, .parameters = parameters, .settings = settings, .fallbacks = fallbacks, .typed_parameters = typed_parameters };
+    var builder: Builder = .{ .alloc = alloc, .table = null, .columns = &.{}, .parameters = parameters, .settings = settings, .fallbacks = fallbacks, .typed_parameters = typed_parameters, .invocation = invocation };
     var pass: usize = 0;
     while (true) : (pass += 1) {
         if (pass > parameters.len + 1) return error.ConflictingSqlParameterTypes;
@@ -505,10 +523,11 @@ fn bindInsert(alloc: Allocator, table: catalog.Table, statement: ast.Insert, par
         }
         row.* = programs;
     }
-    return .{ .insert_rows = rows, .parameter_descriptors = try alloc.dupe(scalar.Type, parameters), .typed_parameters = typed_parameters };
+    return .{ .insert_rows = rows, .parameter_descriptors = try alloc.dupe(scalar.Type, parameters), .typed_parameters = typed_parameters, .invocation = invocation };
 }
 
 const Builder = struct {
+    invocation: ?*@import("parameter_binding.zig").Invocation = null,
     alloc: Allocator,
     table: ?catalog.Table,
     columns: []const scalar.Column,
@@ -524,7 +543,7 @@ const Builder = struct {
         // Actual input kinds resolve polymorphic holes, not known SQL types.
         var coarse: [1024]?ast.ColumnType = undefined;
         for (self.parameters, coarse[0..self.parameters.len]) |descriptor, *kind| kind.* = descriptor.kind;
-        const result = if (self.typed_parameters) try scalar.bindTypedExpectedWithSettings(self.alloc, expression, self.columns, self.parameters, if (expected) |kind| scalar.Type{ .kind = kind } else null, .{}, self.settings) else try scalar.bindExpectedWithSettings(self.alloc, expression, self.columns, coarse[0..self.parameters.len], expected, .{}, self.settings);
+        const result = if (self.typed_parameters) try scalar.bindTypedExpectedWithSettings(self.alloc, expression, self.columns, self.parameters, if (expected) |kind| scalar.Type{ .kind = kind } else null, .{ .invocation = self.invocation }, self.settings) else try scalar.bindExpectedWithSettings(self.alloc, expression, self.columns, coarse[0..self.parameters.len], expected, .{}, self.settings);
         if (result.parameter_types.len > self.parameters.len) return error.InvalidSqlParameters;
         for (result.parameter_descriptors, self.parameters[0..result.parameter_types.len]) |inferred, *existing| {
             if (inferred.kind) |kind| {
@@ -539,11 +558,11 @@ const Builder = struct {
     }
 
     fn freeze(self: *Builder) !void {
+        if (self.invocation) |owner| try owner.mergeInferred(self.parameters);
         for (self.parameters, 0..) |*parameter, index| {
             if (parameter.kind == null and index < self.fallbacks.len) parameter.* = self.fallbacks[index];
             if (!self.typed_parameters) continue;
-            if (parameter.kind == null) parameter.* = .{ .kind = .string };
-            if (parameter.kind != .datetime and parameter.element_type == null) parameter.element_type = try scalar.parameterElementType(parameter.*);
+            if (parameter.kind != null and parameter.kind != .datetime and parameter.element_type == null) parameter.element_type = try scalar.parameterElementType(parameter.*);
         }
     }
 

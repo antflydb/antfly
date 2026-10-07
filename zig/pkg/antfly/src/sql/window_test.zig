@@ -74,7 +74,7 @@ test "SQL execution transport types fill polymorphic holes without overriding SQ
     var prepared = try @import("antfly_local_sources").sql_describe.describe(std.testing.allocator, backend.backend(), &compiled, &.{.string});
     defer prepared.deinit();
     try std.testing.expectEqualSlices(?ast.ColumnType, &.{.string}, prepared.binding.parameter_types);
-    try std.testing.expectError(error.SqlTypeMismatch, runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{.{ .number_string = "9223372036854775808" }}, .{}));
+    try std.testing.expectError(error.SqlNumericOutOfRange, runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{.{ .number_string = "9223372036854775808" }}, .{}));
 }
 
 test "SQL JSON numeric scalars retain logical type across relation aggregate and window output" {
