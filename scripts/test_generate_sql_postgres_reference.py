@@ -259,6 +259,79 @@ class PostgresReferenceTest(unittest.TestCase):
                         self.db.execute("EXPLAIN " + sql)
                     self.assertEqual(state, error.exception.sqlstate)
 
+    def test_merge_array_arm_assignment_domains(self):
+        import psycopg
+
+        with self.db.transaction(force_rollback=True):
+            self.db.execute(
+                "CREATE TEMP TABLE target(_id text PRIMARY KEY DEFAULT 'generated',a bigint[],j jsonb[]);"
+                "CREATE TEMP TABLE source(id text,a smallint[],text_values text[]);"
+                "INSERT INTO target VALUES ('matched','{0}',ARRAY['null'::jsonb,NULL]);"
+                "INSERT INTO source VALUES ('matched','[3:4]={3,NULL}','{1}'),"
+                "('inserted','[3:4]={3,NULL}','{1}')"
+            )
+            prefix = "MERGE INTO target t USING source s ON t._id=s.id "
+            for expression, first, lower in (
+                ("s.a", 3, 3),
+                ("'[-1:1]={9007199254740993,NULL,2}'", 9007199254740993, -1),
+                ("ARRAY[1::smallint,NULL]", 1, 1),
+                ("NULL", None, None),
+                ("$1", 9223372036854775807, 5),
+            ):
+                with (
+                    self.subTest(expression=expression),
+                    self.db.transaction(force_rollback=True),
+                ):
+                    sql = (
+                        prefix
+                        + f"WHEN MATCHED THEN UPDATE SET a={expression} "
+                        + f"WHEN NOT MATCHED THEN INSERT (a) VALUES ({expression}) "
+                        + "RETURNING t.a,s.a,t.j,array_lower(t.a,1),"
+                        + "pg_typeof(t.a)::text,pg_typeof(s.a)::text"
+                    )
+                    if expression == "$1":
+                        self.db.execute("PREPARE antfly_merge_array AS " + sql)
+                        try:
+                            self.assertEqual(
+                                "bigint[]",
+                                self.db.execute(
+                                    "SELECT parameter_types[1]::text FROM pg_prepared_statements "
+                                    "WHERE name='antfly_merge_array'"
+                                ).fetchone()[0],
+                            )
+                            rows = self.db.execute(
+                                "EXECUTE antfly_merge_array('[5:6]={9223372036854775807,NULL}')"
+                            ).fetchall()
+                        finally:
+                            self.db.execute("DEALLOCATE antfly_merge_array")
+                    else:
+                        rows = self.db.execute(sql).fetchall()
+                    self.assertEqual(2, len(rows))
+                    for row in rows:
+                        if first is None:
+                            self.assertIsNone(row[0])
+                        else:
+                            self.assertEqual(first, row[0][0])
+                            self.assertIsNone(row[0][1])
+                        self.assertEqual([3, None], row[1])
+                        self.assertEqual((lower, "bigint[]", "smallint[]"), row[3:])
+            for expression, state in (
+                ("s.text_values", "42804"),
+                ("ARRAY['1']", "42804"),
+                ("ARRAY[]", "42P18"),
+            ):
+                with (
+                    self.subTest(expression=expression),
+                    self.db.transaction(force_rollback=True),
+                ):
+                    with self.assertRaises(psycopg.Error) as error:
+                        self.db.execute(
+                            "EXPLAIN "
+                            + prefix
+                            + f"WHEN MATCHED THEN UPDATE SET a={expression}"
+                        )
+                    self.assertEqual(state, error.exception.sqlstate)
+
     def test_array_conflict_mutations_preserve_typed_preimages_and_excluded(self):
         with self.db.transaction(force_rollback=True):
             self.db.execute(

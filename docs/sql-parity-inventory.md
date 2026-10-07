@@ -246,8 +246,20 @@ invalidating mutation keys, nested document members, bounds or JSONB null flags.
 Presence metadata is indexed once per row instead of rescanned per output cell.
 RETURNING ambiguity is checked against the already-authorized join scope; this
 does not activate FROM/USING source-value RETURNING, which still needs captured
-source-image execution. SQL DDL, MERGE typed-array paths and ordered/constraint
-index keys still need end-to-end activation gates.
+source-image execution. MERGE arm binding now preserves source, target and
+RETURNING array element identities, uses shared assignment coercions for unknown
+array literals, and converges statement-wide parameter constraints across arms.
+Binding/evaluator tests cover both UPDATE and INSERT domains, numeric-array
+widening, exact bigint literals and parameters, bounds and NULL elements.
+Constant and parameter arms use the same owned storage encoder as ordinary
+mutations; prepared-image tests verify array envelopes rather than the scalar
+JSON placeholder. PostgreSQL independently checks the same assignment and error
+domains. This does not activate MERGE's still-JSON-only candidate and RETURNING
+handoffs.
+Those paths need a bounded lossless replay shared by full-scan, point and index
+candidates while preserving ordered lazy arms and native read/version fences.
+SQL DDL and ordered/constraint index keys also still need end-to-end activation
+gates.
 Original case dispositions remain unchanged.
 
 Source commit: `79644dfa1605e8da0f486d021d1c1393577d6265`.

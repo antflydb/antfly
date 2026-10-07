@@ -374,14 +374,7 @@ pub const Context = struct {
     /// cell. Arrays remain typed until here; their null JSON placeholder must
     /// never be mistaken for either a SQL NULL or a JSONB null write.
     pub fn storageDatum(self: Context, datum: Datum, column: catalog.Column) !Json {
-        const assigned = if (column.type == .array) try @import("scalar.zig").assignArray(self.arena, datum, column.element_type orelse return error.SqlAssignmentTypeMismatch, .{ .output_bytes = self.limits.retained_bytes }) else datum;
-        const checked = try describe.coerceDatum(self.arena, assigned, column.type, column.element_type);
-        if (checked.sql_null) {
-            if (!column.nullable) return error.SqlNotNullViolation;
-            return .null;
-        }
-        if (checked.array) |array| return @import("array_wire.zig").toJsonLeaky(self.arena, array.*, .{ .values = .{ .bytes = self.limits.retained_bytes }, .wire_bytes = self.limits.retained_bytes });
-        return clone(self.arena, checked.value);
+        return encodeStorageDatum(self.arena, datum, column, self.limits.retained_bytes);
     }
 
     fn value(self: Context, input: ast.Value, column: catalog.Column) !Json {
@@ -1502,6 +1495,20 @@ fn fieldValue(root: Json, path: []const u8) Json {
 
 fn putField(arena: std.mem.Allocator, object: *std.json.ObjectMap, path: []const u8, value: Json) !void {
     try object.put(arena, path, value);
+}
+
+/// The single owned SQL-to-storage boundary, shared by ordinary mutations and
+/// independently prepared MERGE images. Never encode a typed array's JSON
+/// placeholder or retain payloads borrowed from an evaluator's scratch arena.
+pub fn encodeStorageDatum(arena: std.mem.Allocator, datum: Datum, column: catalog.Column, retained_bytes: usize) !Json {
+    const assigned = if (column.type == .array) try @import("scalar.zig").assignArray(arena, datum, column.element_type orelse return error.SqlAssignmentTypeMismatch, .{ .output_bytes = retained_bytes }) else datum;
+    const checked = try describe.coerceDatum(arena, assigned, column.type, column.element_type);
+    if (checked.sql_null) {
+        if (!column.nullable) return error.SqlNotNullViolation;
+        return .null;
+    }
+    if (checked.array) |array| return @import("array_wire.zig").toJsonLeaky(arena, array.*, .{ .values = .{ .bytes = retained_bytes }, .wire_bytes = retained_bytes });
+    return clone(arena, checked.value);
 }
 
 pub fn clone(arena: std.mem.Allocator, value: Json) error{ OutOfMemory, SqlProgramLimitExceeded }!Json {

@@ -312,7 +312,7 @@ pub const Candidates = struct {
                 if (assignment.program == null) continue; // DEFAULT: native preparation fills the absent cell.
                 const field = assignment.column;
                 if (datum.sql_null and !field.nullable) return error.SqlNotNullViolation;
-                const typed = try describe.coerce(datum.value, field.type);
+                const typed = try @import("runtime.zig").encodeStorageDatum(alloc, datum, field, max_bytes);
                 if (std.mem.eql(u8, field.name, "_id")) {
                     if (!inserting or datum.sql_null or typed != .string or typed.string.len == 0) return error.SqlRowIdentityRequired;
                     key = typed.string;
@@ -459,7 +459,7 @@ fn bindArms(alloc: Allocator, backend: catalog.Backend, target: catalog.Table, s
     if (relation.statement.columns.len != input.columns.len) return error.InvalidSqlBackendResponse;
     const columns = try alloc.alloc(scalar.Column, input.columns.len);
     for (relation.statement.columns, input.columns, columns, 0..) |projection, output, *column, index| {
-        column.* = .{ .name = if (projection.field.len != 0) projection.field else try std.fmt.allocPrint(alloc, "\x00merge_null_{d}", .{index}), .type = output.type };
+        column.* = .{ .name = if (projection.field.len != 0) projection.field else try std.fmt.allocPrint(alloc, "\x00merge_null_{d}", .{index}), .type = output.type, .element_type = output.element_type };
     }
     const unbound = try alloc.alloc(UnboundArm, statement.arms.len);
     for (statement.arms, unbound) |arm, *out| {
@@ -474,14 +474,16 @@ fn bindArms(alloc: Allocator, backend: catalog.Backend, target: catalog.Table, s
                         node.* = .{ .literal = assignment.value };
                         break :literal node;
                     };
-                    value.* = .{ .column = try target.column(assignment.field), .value = if (expression) |node| try relation_binding.lowerBoundExpression(alloc, relation.root.columns, node) else null };
+                    const field = try target.column(assignment.field);
+                    value.* = .{ .column = field, .value = if (expression) |node| try scalar.assignmentExpression(alloc, try relation_binding.lowerBoundExpression(alloc, relation.root.columns, node), .{ .kind = field.type, .element_type = field.element_type }) else null };
                 }
                 break :blk .{ .update = values };
             },
             .insert => |insert| blk: {
                 const values = try alloc.alloc(Expression, insert.values.len);
                 for (insert.columns, insert.values, values) |name, expression, *value| {
-                    value.* = .{ .column = try target.column(name), .value = if (expression) |node| try relation_binding.lowerBoundExpression(alloc, relation.root.columns, node) else null };
+                    const field = try target.column(name);
+                    value.* = .{ .column = field, .value = if (expression) |node| try scalar.assignmentExpression(alloc, try relation_binding.lowerBoundExpression(alloc, relation.root.columns, node), .{ .kind = field.type, .element_type = field.element_type }) else null };
                 }
                 break :blk .{ .insert = values };
             },
@@ -490,16 +492,31 @@ fn bindArms(alloc: Allocator, backend: catalog.Backend, target: catalog.Table, s
         };
     }
     const parameters = try alloc.dupe(?ast.ColumnType, input.parameter_types);
-    for (unbound) |arm| {
-        if (arm.predicate) |predicate| _ = try scalar.inferParameters(alloc, predicate, columns, parameters, .boolean, .{ .invocation = backend.parameter_invocation });
-        const values: []const Expression = switch (arm.action) {
-            .update => |items| items,
-            .insert => |items| items,
-            .delete, .nothing => &.{},
-        };
-        for (values) |value| if (value.value) |expression| {
-            _ = try scalar.inferParameters(alloc, expression, columns, parameters, value.column.type, .{ .invocation = backend.parameter_invocation });
-        };
+    // Constraints are shared by every arm, even though evaluation is lazy.
+    // Iterate to a fixed point so an earlier predicate can use a parameter
+    // whose precise array identity is supplied by a later assignment.
+    var pass: usize = 0;
+    while (true) : (pass += 1) {
+        if (pass > parameters.len + 1) return error.ConflictingSqlParameterTypes;
+        var changed = false;
+        for (unbound) |arm| {
+            if (arm.predicate) |predicate| changed = try scalar.inferParameters(alloc, predicate, columns, parameters, .boolean, .{ .invocation = backend.parameter_invocation }) or changed;
+            const values: []const Expression = switch (arm.action) {
+                .update => |items| items,
+                .insert => |items| items,
+                .delete, .nothing => &.{},
+            };
+            for (values) |value| if (value.value) |expression| {
+                const expected: scalar.Type = .{ .kind = value.column.type, .element_type = value.column.element_type };
+                changed = (if (backend.parameter_invocation) |owner|
+                    try owner.infer(alloc, expression, columns, parameters, expected, .{ .assignment = true })
+                else if (value.column.type == .array and parameters.len == 0)
+                    try scalar.inferTypedParametersExpected(alloc, expression, columns, &.{}, expected, .{ .assignment = true })
+                else
+                    try scalar.inferParameters(alloc, expression, columns, parameters, value.column.type, .{ .assignment = true })) or changed;
+            };
+        }
+        if (!changed) break;
     }
     const bound = try alloc.alloc(BoundArm, unbound.len);
     for (unbound, bound) |arm, *out| {
@@ -510,7 +527,15 @@ fn bindArms(alloc: Allocator, backend: catalog.Backend, target: catalog.Table, s
                 const assignments = try alloc.alloc(BoundAssignment, values.len);
                 for (values, assignments) |value, *assignment| assignment.* = .{
                     .column = value.column,
-                    .program = if (value.value) |expression| try scalar.bindExpectedWithSettings(alloc, expression, columns, parameters, value.column.type, .{ .invocation = backend.parameter_invocation }, backend.settings_view) else null,
+                    .program = if (value.value) |expression| bound_program: {
+                        const expected: scalar.Type = .{ .kind = value.column.type, .element_type = value.column.element_type };
+                        break :bound_program if (backend.parameter_invocation) |owner|
+                            try scalar.bindTypedExpectedWithSettings(alloc, expression, columns, owner.descriptors, expected, .{ .invocation = owner, .assignment = true }, backend.settings_view)
+                        else if (value.column.type == .array and parameters.len == 0)
+                            try scalar.bindTypedExpectedWithSettings(alloc, expression, columns, &.{}, expected, .{ .assignment = true }, backend.settings_view)
+                        else
+                            try scalar.bindExpectedWithSettings(alloc, expression, columns, parameters, value.column.type, .{ .assignment = true }, backend.settings_view);
+                    } else null,
                 };
                 break :blk if (arm.action == .update) .{ .update = assignments } else .{ .insert = assignments };
             },
@@ -540,7 +565,7 @@ fn bindReturning(alloc: Allocator, backend: catalog.Backend, statement: ast.Merg
     }
     const scalar_columns = try alloc.alloc(scalar.Column, input.columns.len);
     for (relation.statement.columns, input.columns, scalar_columns, 0..) |projection, column, *out, index| {
-        out.* = .{ .name = if (projection.field.len != 0) projection.field else try std.fmt.allocPrint(alloc, "\x00merge_null_{d}", .{index}), .type = column.type };
+        out.* = .{ .name = if (projection.field.len != 0) projection.field else try std.fmt.allocPrint(alloc, "\x00merge_null_{d}", .{index}), .type = column.type, .element_type = column.element_type };
     }
     const lowered = try alloc.alloc(*const ast.Scalar, count);
     for (expressions, projections, lowered) |expression, projection, *out| out.* = if (projection.bound_column != null) expression else try relation_binding.lowerBoundExpression(alloc, relation.root.columns, expression);
@@ -549,13 +574,140 @@ fn bindReturning(alloc: Allocator, backend: catalog.Backend, statement: ast.Merg
     const columns = try alloc.alloc(describe.Column, count);
     for (lowered, names, programs, columns) |expression, name, *program, *column| {
         program.* = try scalar.bindWithSettings(alloc, expression, scalar_columns, parameters, .{ .invocation = backend.parameter_invocation }, backend.settings_view);
-        column.* = .{ .name = name, .type = program.output_type.kind orelse .string, .untyped_null = program.output_type.kind == null };
+        column.* = .{ .name = name, .type = program.output_type.kind orelse .string, .element_type = program.output_type.element_type, .untyped_null = program.output_type.kind == null };
     }
     return .{ .columns = columns, .programs = programs };
 }
 
 fn qualifiedColumn(alloc: Allocator, column: relation_binding.Column) ![]const u8 {
     return if (column.qualifier.len == 0) column.name else std.fmt.allocPrint(alloc, "{s}\x00{s}", .{ column.qualifier, column.name });
+}
+
+test "MERGE arm domains retain array identity and shared assignment inference" {
+    const Fixture = struct {
+        fn resolve(_: *anyopaque, _: Allocator, name: ast.Name, action: catalog.Action) !catalog.Table {
+            try std.testing.expectEqualStrings("source", name.table);
+            try std.testing.expectEqual(catalog.Action.read, action);
+            return .{ .id = 2, .physical_name = "source", .schema_version = 1, .columns = &.{
+                .{ .name = "id", .path = "id", .type = .string },
+                .{ .name = "a", .path = "a", .type = .array, .element_type = .int16 },
+                .{ .name = "text_values", .path = "text_values", .type = .array, .element_type = .text },
+            } };
+        }
+        fn scan(_: *anyopaque, _: Allocator, _: catalog.Table, _: catalog.Scan) !catalog.Page {
+            return error.TestUnexpectedCall;
+        }
+        fn mutate(_: *anyopaque, _: Allocator, _: catalog.Table, _: []const catalog.Mutation) !catalog.MutationOutcome {
+            return error.TestUnexpectedCall;
+        }
+        fn checkpoint(_: *anyopaque) !void {}
+        fn generate(_: *anyopaque, a: Allocator) ![]const u8 {
+            return a.dupe(u8, "generated");
+        }
+    };
+    const target: catalog.Table = .{ .id = 1, .physical_name = "target", .schema_version = 1, .columns = &.{
+        .{ .name = "a", .path = "a", .type = .array, .element_type = .int64 },
+        .{ .name = "j", .path = "j", .type = .array, .element_type = .jsonb },
+    } };
+    const Case = struct { expression: []const u8, lower: ?i32 = 1, first: i64 = 1, failure: ?anyerror = null };
+    for ([_]Case{
+        .{ .expression = "s.a", .lower = 3, .first = 3 },
+        .{ .expression = "'[-1:1]={9007199254740993,NULL,2}'", .lower = -1, .first = 9007199254740993 },
+        .{ .expression = "ARRAY[1::smallint,NULL]" },
+        .{ .expression = "NULL", .lower = null },
+        .{ .expression = "$1", .lower = 5, .first = std.math.maxInt(i64) },
+        .{ .expression = "s.text_values", .failure = error.SqlAssignmentTypeMismatch },
+        .{ .expression = "ARRAY['1']", .failure = error.SqlAssignmentTypeMismatch },
+        .{ .expression = "ARRAY[]", .failure = error.UnknownSqlArrayType },
+    }) |case| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const sql = try std.fmt.allocPrint(a, "MERGE INTO target t USING source s ON t._id=s.id WHEN MATCHED THEN UPDATE SET a={s} WHEN NOT MATCHED THEN INSERT (a) VALUES ({s}) RETURNING t.a,s.a,t.j", .{ case.expression, case.expression });
+        var compiled = try compiler.compile(std.testing.allocator, sql, .{});
+        defer compiled.deinit();
+        var token: u8 = 0;
+        const owner = try @import("parameter_binding.zig").Invocation.initLeaky(a, compiled.parameter_count);
+        defer owner.deinitFrame();
+        const backend: catalog.Backend = .{ .ptr = &token, .parameter_invocation = owner, .vtable = &.{ .generate_row_id = Fixture.generate, .resolve = Fixture.resolve, .scan = Fixture.scan, .mutate = Fixture.mutate, .checkpoint = Fixture.checkpoint } };
+        if (case.failure) |failure| {
+            try std.testing.expectError(failure, bindCandidates(a, backend, target, &compiled, &.{}));
+            continue;
+        }
+        const bound = try bindCandidates(a, backend, target, &compiled, &.{});
+        const returning = bound.returning_plan.?;
+        for (returning.columns, [_]@import("array_value.zig").ElementType{ .int64, .int16, .jsonb }) |column, element| {
+            try std.testing.expectEqual(ast.ColumnType.array, column.type);
+            try std.testing.expectEqual(element, column.element_type.?);
+        }
+        const source = try @import("array_text.zig").decodeLeaky(a, .int16, "[3:4]={3,NULL}", .{});
+        const cells = try a.alloc(scalar.Datum, bound.query.columns.len);
+        @memset(cells, .{});
+        var source_found = false;
+        for (bound.query.columns, cells) |projection, *cell| {
+            if (std.mem.eql(u8, projection.field, "s\x00a")) {
+                cell.* = scalar.Datum.typedArray(&source.value);
+                source_found = true;
+            }
+        }
+        if (std.mem.eql(u8, case.expression, "s.a")) try std.testing.expect(source_found);
+        if (compiled.parameter_count != 0) {
+            try std.testing.expectEqual(@as(usize, 1), owner.descriptors.len);
+            try std.testing.expectEqual(@as(?ast.ColumnType, .array), owner.descriptors[0].kind);
+            try std.testing.expectEqual(@as(?@import("array_value.zig").ElementType, .int64), owner.descriptors[0].element_type);
+            const parameter = try @import("array_text.zig").decodeLeaky(a, .int64, "[5:6]={9223372036854775807,NULL}", .{});
+            const wire = try @import("array_wire.zig").toJsonLeaky(a, parameter.value, .{});
+            try owner.prepareJson(a, &.{wire}, .{});
+        }
+        for (bound.arms, 0..) |arm, ordinal| {
+            const assignments = switch (arm.action) {
+                .update, .insert => |values| values,
+                else => unreachable,
+            };
+            try std.testing.expectEqual(@as(?@import("array_value.zig").ElementType, .int64), assignments[0].program.?.output_type.element_type);
+            const values = try bound.evaluateValues(a, ordinal, cells, &.{});
+            try std.testing.expectEqual(@as(usize, 1), values.len);
+            if (case.lower) |lower| {
+                try std.testing.expect(!values[0].sql_null);
+                const array = values[0].array.?;
+                try std.testing.expectEqual(lower, array.dimensions[0].lower);
+                try std.testing.expectEqual(case.first, array.elements[0].value.integer);
+                try std.testing.expect(array.elements[1].sql_null);
+            } else {
+                try std.testing.expect(values[0].sql_null);
+                try std.testing.expect(values[0].array == null);
+            }
+        }
+        // Constant/parameter arms can be prepared independently of the pending
+        // lossless candidate reader. Verify the actual storage boundary, not
+        // only the evaluator: a non-NULL typed array has a NULL JSON placeholder.
+        if (!std.mem.eql(u8, case.expression, "s.a")) {
+            const row = try a.alloc(std.json.Value, cells.len);
+            const flags = try a.alloc(bool, cells.len);
+            @memset(row, .null);
+            @memset(flags, true);
+            for ([_]bool{ true, false }) |matched| {
+                row[0] = if (matched) .{ .string = "matched" } else .null;
+                flags[0] = !matched;
+                row[1] = .{ .string = "7" };
+                flags[1] = false;
+                row[2] = .{ .string = "" };
+                flags[2] = false;
+                const prepared = try bound.prepareMutations(a, backend, &.{row}, &.{flags}, &.{}, 2, 64 * 1024);
+                try std.testing.expectEqual(@as(usize, 1), prepared.len);
+                try std.testing.expectEqualStrings(if (matched) "matched" else "generated", prepared[0].key);
+                try std.testing.expectEqual(@as(?u64, if (matched) 7 else 0), prepared[0].expected_version);
+                const stored = prepared[0].row.?.object.get("a").?;
+                if (case.lower) |lower| {
+                    try std.testing.expect(stored != .null);
+                    const decoded = try @import("array_wire.zig").decodeLeaky(a, .int64, stored, .{});
+                    try std.testing.expectEqual(lower, decoded.dimensions[0].lower);
+                    try std.testing.expectEqual(case.first, decoded.elements[0].value.integer);
+                    try std.testing.expect(decoded.elements[1].sql_null);
+                } else try std.testing.expect(stored == .null);
+            }
+        }
+    }
 }
 
 const Equality = struct { target: relation_binding.Column, source: relation_binding.Column };
