@@ -87,6 +87,7 @@ pub const Stream = struct {
     headers_flags: u8 = 0,
     /// Accumulated DATA frame payloads for this stream.
     data_buf: std.ArrayListUnmanaged(u8) = .empty,
+    data_allocator: ?Allocator = null,
     protected_body_deadline_ms: ?i64 = null,
     /// Error from RST_STREAM or connection error, set by the receive loop.
     stream_error: ?anyerror = null,
@@ -140,7 +141,7 @@ pub const Stream = struct {
         if (self.data_budget) |budget| budget.release(self.data_budget_reserved);
         self.data_budget = null;
         self.data_budget_reserved = 0;
-        self.data_buf.deinit(allocator);
+        self.data_buf.deinit(self.data_allocator orelse allocator);
         freeDecodedHeaders(allocator, self.request_headers);
         freeDecodedHeaders(allocator, self.trailer_headers);
     }
@@ -169,7 +170,7 @@ pub const Stream = struct {
     pub fn responseWriteError(self: *const Self, is_server: bool) ?anyerror {
         const err = self.stream_error orelse return null;
         return if (err == error.BodyCapacityExceeded or
-            (is_server and err == error.StreamDataOverflow)) null else err;
+            (is_server and (err == error.StreamDataOverflow or err == error.OutOfMemory))) null else err;
     }
 
     /// Transitions state after sending END_STREAM.

@@ -29,6 +29,9 @@ pub const Config = struct {
     max_session_bytes: u64 = 0,
     max_retained_bytes: u64 = 0,
     limits: protocol.Limits = .{},
+    protected_frame_allocator: ?std.mem.Allocator = null,
+    control_allocator: ?std.mem.Allocator = null,
+    is_protected_control: ?*const fn ([]const u8) bool = null,
     // There is no built-in TLS termination yet. A remote bind must explicitly
     // acknowledge that TLS/authenticated private-network protection is supplied
     // by the deployment; never silently send passwords over a public socket.
@@ -242,7 +245,8 @@ pub fn start(alloc: std.mem.Allocator, config: Config) !Server {
         std.math.mul(usize, config.max_connections, config.limits.connection_bytes) catch return error.InvalidPgwireConfig
     else
         std.math.cast(usize, config.max_session_bytes) orelse return error.InvalidPgwireConfig;
-    if (session_bytes < config.limits.frame_bytes) return error.InvalidPgwireConfig;
+    if (session_bytes < config.limits.frame_bytes or
+        (config.protected_frame_allocator != null and config.limits.connection_bytes <= 32 << 10)) return error.InvalidPgwireConfig;
     const retained_bytes = if (config.max_retained_bytes == 0)
         std.math.mul(usize, config.max_connections, config.limits.retained_bytes) catch return error.InvalidPgwireConfig
     else
@@ -266,7 +270,18 @@ fn serveConnection(state: *State, stream: std.Io.net.Stream) void {
     const io = state.config.io;
     defer _ = state.active.fetchSub(1, .release);
     defer stream.close(io);
-    var budget = Budget{ .child = state.memory.allocator(), .limit = state.config.limits.connection_bytes };
+    const protected_bytes: usize = if (state.config.protected_frame_allocator != null) 32 << 10 else 0;
+    var budget = Budget{ .child = state.memory.allocator(), .limit = state.config.limits.connection_bytes - protected_bytes };
+    var frame_control = Budget{ .child = state.config.protected_frame_allocator orelse budget.allocator(), .limit = protected_bytes, .shared = &state.memory };
+    var frame_memory: @import("../common/allocation_budget.zig").Partitioned = .{
+        .foreground = .{ .child = budget.allocator(), .limit = budget.limit },
+        .control = .{ .child = frame_control.allocator(), .limit = protected_bytes },
+    };
+    defer {
+        std.debug.assert(frame_memory.foreground.stats().used_bytes == 0);
+        std.debug.assert(frame_memory.control.stats().used_bytes == 0);
+        std.debug.assert(frame_control.used == 0);
+    }
     var read_buffer: [8192]u8 = undefined;
     var write_buffer: [8192]u8 = undefined;
     var reader = stream.reader(io, &read_buffer);
@@ -278,6 +293,9 @@ fn serveConnection(state: *State, stream: std.Io.net.Stream) void {
         .reader = &reader.interface,
         .writer = &writer.interface,
         .limits = state.config.limits,
+        .frame_memory = if (protected_bytes != 0) &frame_memory else null,
+        .control_allocator = state.config.control_allocator,
+        .is_protected_control = state.config.is_protected_control,
         .retained_shared = &state.retained,
         .deadline_wakeup = &state.deadline_wakeup,
         .hooks = .{ .context = state, .register = State.register, .unregister = State.unregister, .cancel = State.cancel },

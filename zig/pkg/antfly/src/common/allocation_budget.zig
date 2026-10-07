@@ -168,6 +168,33 @@ pub const Partitioned = struct {
     }
 };
 
+/// Service-owned heaps retain their allocator until every client and stream
+/// joins. Foreground growth charges the node; control capacity is pinned once.
+pub const ServiceMemory = struct {
+    memory: Partitioned,
+    owner: Accounting,
+    pinned: usize,
+
+    pub fn init(child: std.mem.Allocator, owner: Accounting, foreground_bytes: usize, control_bytes: usize) !ServiceMemory {
+        if (!owner.reserve(control_bytes)) return error.OutOfMemory;
+        return .{
+            .memory = .{
+                .foreground = .{ .child = child, .accounting = owner, .limit = foreground_bytes },
+                .control = .{ .child = child, .limit = control_bytes },
+            },
+            .owner = owner,
+            .pinned = control_bytes,
+        };
+    }
+
+    pub fn deinit(self: *ServiceMemory) void {
+        std.debug.assert(self.memory.foreground.used.load(.acquire) == 0);
+        std.debug.assert(self.memory.control.used.load(.acquire) == 0);
+        self.owner.release(self.pinned);
+        self.* = undefined;
+    }
+};
+
 test "workload envelope preserves allocation provenance across control ownership transfers" {
     var memory: Partitioned = .{
         .foreground = .{ .child = std.testing.allocator, .limit = 32 },
@@ -214,4 +241,46 @@ test "workload envelope node accounting rolls back allocation and growth failure
     try std.testing.expectError(error.OutOfMemory, denied.allocator().alloc(u8, 10));
     try std.testing.expectEqual(@as(usize, 20), owner.remaining);
     try std.testing.expectEqual(@as(usize, 0), denied.stats().used_bytes);
+}
+
+test "workload envelope service control survives node exhaustion and returns its pin after joins" {
+    const Owner = struct {
+        used: usize = 0,
+        fn reserve(ptr: *anyopaque, bytes: usize) callconv(.c) bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (bytes > 128 - self.used) return false;
+            self.used += bytes;
+            return true;
+        }
+        fn release(ptr: *anyopaque, bytes: usize) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            std.debug.assert(self.used >= bytes);
+            self.used -= bytes;
+        }
+    };
+    var owner: Owner = .{};
+    const port: Accounting = .{ .ptr = &owner, .reserve_fn = Owner.reserve, .release_fn = Owner.release };
+    var service = try ServiceMemory.init(std.testing.allocator, port, 96, 32);
+    const foreground = service.memory.allocator(false);
+    const control = service.memory.allocator(true);
+    const ordinary = try foreground.alloc(u8, 96 - Partitioned.overhead(.of(u8)));
+    try std.testing.expectEqual(@as(usize, 128), owner.used);
+    try std.testing.expectError(error.OutOfMemory, foreground.alloc(u8, 1));
+    const acknowledgement = try control.alloc(u8, 16);
+    try std.testing.expectEqual(@as(usize, 128), owner.used);
+    try std.testing.expectError(error.OutOfMemory, control.alloc(u8, 32));
+    // Returned responses may be destroyed through the opposite allocator view.
+    foreground.free(acknowledgement);
+    control.free(ordinary);
+    try std.testing.expectEqual(@as(usize, 32), owner.used);
+    service.deinit();
+    try std.testing.expectEqual(@as(usize, 0), owner.used);
+    try std.testing.expectError(error.OutOfMemory, ServiceMemory.init(std.testing.allocator, port, 96, 129));
+    try std.testing.expectEqual(@as(usize, 0), owner.used);
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var failed = try ServiceMemory.init(failing.allocator(), port, 96, 32);
+    try std.testing.expectError(error.OutOfMemory, failed.memory.allocator(false).alloc(u8, 16));
+    try std.testing.expectEqual(@as(usize, 32), owner.used);
+    failed.deinit();
+    try std.testing.expectEqual(@as(usize, 0), owner.used);
 }

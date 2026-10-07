@@ -14,10 +14,15 @@ ceiling is a reservation limit, not a resident-set ceiling.
 | API control scratch and SQL retirement | Pinned storage-owner ResourceManager external reservation | Reserve `min(16 MiB, request ceiling / 8)` before publishing API; foreground cannot borrow it; release only after API workers, cursors and stores join |
 | API sessions, jobs, caches and owned durable session heap | Storage-owner ResourceManager external bytes | `admission.max_retained_memory_bytes`; stable allocator until actual destruction |
 | HTTP decoded context and buffered output | API foreground/control allocator; nested listener application quota | Held through response writer and cleanup; count once in storage-owner totals, despite appearing in both listener and API counters |
-| Native pgwire protocol/frame/session and transport-runtime heap | Pinned public transport allocator; nested connection/listener/retained quotas | Shares HTTP transport's reservation; native session/listener joins precede allocator destruction; adapter execution state retains its API allocation owner |
+| Native pgwire ordinary protocol/session and listener-runtime heap | Bulk partition of pinned public transport allocation; nested connection/listener/retained quotas | Shares HTTP transport's reservation; native session/listener joins precede allocator destruction; adapter execution state retains its API allocation owner |
+| Native pgwire bounded frames and command/error acknowledgements | Per-connection control partition backed by the public parser allocator | 32 KiB reserved within the original connection ceiling, with frame selection capped at 8 KiB; verified simple and extended controls execute through API control memory; retained prepared statements and portals retain their original owner |
 | SQL plan cache | Nested API foreground allocation | Existing 32 MiB cache cap; do not add again to storage-owner totals |
-| HTTP raw/transformed body storage, headers/parser/router/runtime heap | Pinned node reservation and bounded shared transport allocator | `min(64 MiB, API request ceiling)` reserved before HTTP/pgwire publication; body/task/connection limits remain nested; released after all listener/connection/runtime owners join |
-| Outbound HTTP request/output storage and sockets | Independent service transport owners | Operation/wait/byte/socket caps; streamed readers retain leases until close; API-owned portions also appear in API accounting |
+| HTTP raw/transformed body storage | Bulk partition of pinned node transport reservation | `min(64 MiB, API request ceiling)` total reservation includes the parser partition; body/task/connection limits remain nested; body allocations retain their original allocator until destruction |
+| HTTP headers/parser/router/runtime heap and bounded control bodies | Parser partition of the same transport reservation | `min(8 MiB, transport reservation / 8)`; ordinary bodies cannot consume it; bounded declared-length control candidates get an independent body quota; typed dispatch still verifies the operation |
+| Distributed-read reusable HTTP client heap | DataServer service foreground allocator, charged to node external bytes | `min(64 MiB, API retained ceiling / 4)`; client pool, waiter and forwarding-task limits remain nested; clients and streams join before allocator destruction |
+| Data mutation forwarding reusable HTTP client heap | Pinned DataServer service control allocator | `min(4 MiB, API request ceiling / 8)` pinned before API publication; isolated from distributed-read allocations; includes fresh forwarding as well as completion and does not promise progress if this partition itself is full |
+| Outbound returned bodies and streaming sinks | Caller-supplied allocation/output owner | Buffered response ceilings and stream backpressure remain independent; API callers charge their envelopes; the service client heap does not include caller-owned output |
+| Distributed join/graph and model/probe helper child arenas | Caller-supplied allocation owner through a synchronized allocator | 64 MiB local ceiling per fan-out group, nested within the caller ceiling; all child tasks join before arenas and the allocator owner retire; response copies remain caller-owned |
 | Caller-supplied stores and backend allocations ignoring supplied allocators | Caller/backend owner | Cannot infer limits from API configuration; caller must report its independent budget |
 | Native C/C++ model scratch, allocator metadata, OS threads/stacks/TLS, mappings and page cache | Native/kernel/backend owner | Not comprehensively intercepted; measure RSS/threads/FDs and audit backend-specific reservations |
 
@@ -35,9 +40,11 @@ outside the child accounting locks. Non-reclaiming commit fences never make this
 call, and parent eviction cannot bypass child ceilings.
 Root aggregate memory already includes child usage, so health reporting counts
 that aggregate once. Per-slice reporting combines distinct owner contributions.
-This coordinates managed storage, inference, API and public HTTP heaps; native
-scratch, OS memory and independently supplied service heaps still require
-measurement and their own ownership contracts.
+This coordinates managed storage, inference, API, public HTTP and DataServer
+outbound client heaps. Native scratch, OS memory and independently supplied
+backend heaps still require measurement and their own ownership contracts.
+Helpers without a supplied network I/O owner retain their bounded native
+threaded fallback; its threads and stacks are outside the caller heap quota.
 
 `ResourceManager.memory.external_bytes` includes pinned control/transport
 reservations, child-manager usage and foreground/persistent API charges. It is a subset of
@@ -67,17 +74,25 @@ at final destruction.
    mutations. Accepted durable work retains its own completion contract.
 5. Verified transaction controls bypass fresh-query/write/preparation/cache-fill
    admission, use independent bounded workers and the pinned control allocator.
+   Managed API initialization acquires the control workers before publication.
+   HTTP reserves protected tasks under both fail-fast and waiting policies;
+   fail-fast reserves them within its existing total task ceiling.
    Cleanup frees through allocation provenance. It cannot erase an already
    started durable decision.
 6. Closing transports joins writers/sessions before API allocators disappear;
    API joins accepted jobs and releases persistent state before returning pinned
    control capacity. The storage-owner manager is destroyed last.
 
-Pinned transport memory protects against exhaustion of the shared node budget;
-it does not grant a separate parser allocation reserve after the transport heap
-itself is exhausted. Existing connection/body ceilings still matter, and that
-distinct exhaustion schedule needs a native protected-progress receipt before
-defaults can change.
+The transport reservation now partitions parser/control allocation from ordinary
+raw body allocation. Native H1/H2 socket tests deny every ordinary body allocation
+and verify bounded rollback/status progress; H2 also verifies that an OOM response
+leaves the connection usable. Unknown-length and oversized candidate bodies use
+the ordinary partition. Pgwire fixtures deny ordinary frame/execution allocation
+and verify that bounded COMMIT and ROLLBACK frames and their acknowledgements
+remain usable, while an ordinary SELECT still fails. Candidate frame size alone
+does not authorize control execution: the backend grammar classifier verifies the
+statement. Parser exhaustion and physical mutating storage completion remain
+separate schedules; the API reserve alone cannot establish those guarantees.
 
 The native socket fixture now exhausts the real DB ResourceManager alongside
 API foreground allocations and foreground SQL workers, then verifies held-cursor

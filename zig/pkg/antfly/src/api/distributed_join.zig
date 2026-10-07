@@ -6698,7 +6698,7 @@ fn appendJoinReadJobs(ctx: JoinContext, alloc: std.mem.Allocator, source: table_
         return true;
     }
     const Slot = struct {
-        arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator),
+        arena: std.heap.ArenaAllocator,
         hits: ?std.json.Array = null,
         failure: ?anyerror = null,
         supported: bool = false,
@@ -6713,11 +6713,15 @@ fn appendJoinReadJobs(ctx: JoinContext, alloc: std.mem.Allocator, source: table_
     };
     var receiver = try ctx.fanout_io.?.receive();
     const io = receiver.io();
+    var fanout_memory: @import("../common/fanout_memory.zig").FanoutMemory = undefined;
+    fanout_memory.init(alloc, io, 64 << 20);
+    defer fanout_memory.deinit();
     const width = 8;
     var start: usize = 0;
     while (start < jobs.len) : (start += width) {
         try ctx.ensureExecutionDeadline();
-        var slots: [width]Slot = @splat(.{});
+        var slots: [width]Slot = undefined;
+        for (&slots) |*slot| slot.* = .{ .arena = .init(fanout_memory.allocator()) };
         defer for (&slots) |*slot| slot.arena.deinit();
         const batch = jobs[start..@min(start + width, jobs.len)];
         var tasks: std.Io.Group = .init;
@@ -9511,11 +9515,12 @@ test "distributed join authoritative topology includes a split hidden by cached 
     try std.testing.expect(try executeRightJoinDistributedLookupQuery(ctx, a, source, join, left.value.array.items) == null);
 }
 
-test "distributed join fanout bounds concurrency drains errors and preserves group order" {
+test "workload envelope distributed join fanout bounds concurrency drains errors and preserves group order" {
     const Fixture = struct {
         active: std.atomic.Value(usize) = .init(0),
         peak: std.atomic.Value(usize) = .init(0),
         calls: std.atomic.Value(usize) = .init(0),
+        allocation_failures: std.atomic.Value(usize) = .init(0),
         fail: bool = false,
         fn query(ptr: *anyopaque, alloc: std.mem.Allocator, group: u64, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -9526,7 +9531,10 @@ test "distributed join fanout bounds concurrency drains errors and preserves gro
             // Complete out of order to test deterministic publication.
             try std.Io.sleep(std.Options.debug_io, .fromMilliseconds(@intCast(10 - group % 8)), .awake);
             if (self.fail and group == 2) return error.TopologyChanged;
-            return .{ .json = try std.fmt.allocPrint(alloc, "{{\"responses\":[{{\"hits\":{{\"total\":{{\"value\":1,\"relation\":\"exact\"}},\"hits\":[{{\"_id\":\"{d}\",\"_source\":{{}}}}]}}}}]}}", .{group}) };
+            return .{ .json = std.fmt.allocPrint(alloc, "{{\"responses\":[{{\"hits\":{{\"total\":{{\"value\":1,\"relation\":\"exact\"}},\"hits\":[{{\"_id\":\"{d}\",\"_source\":{{}}}}]}}}}]}}", .{group}) catch |err| {
+                _ = self.allocation_failures.fetchAdd(1, .acq_rel);
+                return err;
+            } };
         }
     };
     var fixture: Fixture = .{};
@@ -9554,6 +9562,14 @@ test "distributed join fanout bounds concurrency drains errors and preserves gro
     try std.testing.expectError(error.TopologyChanged, appendJoinReadJobs(ctx, alloc, source, "customers", &jobs, &hits));
     try std.testing.expectEqual(@as(usize, 0), fixture.active.load(.acquire));
     try std.testing.expectEqual(@as(usize, 8), fixture.calls.load(.acquire));
+    try std.testing.expectEqual(published, hits.items.len);
+    fixture.fail = false;
+    fixture.calls.store(0, .release);
+    var parent_budget: @import("../common/allocation_budget.zig").Shared = .{ .child = alloc, .limit = 128 };
+    try std.testing.expectError(error.OutOfMemory, appendJoinReadJobs(ctx, parent_budget.allocator(), source, "customers", jobs[0..8], &hits));
+    try std.testing.expectEqual(@as(usize, 8), fixture.allocation_failures.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), fixture.active.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), parent_budget.stats().used_bytes);
     try std.testing.expectEqual(published, hits.items.len);
     var cancelled = std.atomic.Value(bool).init(true);
     ctx.cancellation = CancellationToken.fromAtomic(&cancelled);

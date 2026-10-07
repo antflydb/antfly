@@ -189,7 +189,10 @@ pub const Manager = struct {
         const path = try std.fs.path.join(alloc, &.{ root, "accounts.json" });
         errdefer alloc.free(path);
         try paths.createDirPathPortable(io, root);
-        var dir = try std.Io.Dir.cwd().openDir(io, root, .{});
+        // Linux opens non-iterable directories with O_PATH; fchmod cannot
+        // change permissions through that handle. Request a readable handle
+        // so permission tightening also works during default Linux startup.
+        var dir = try std.Io.Dir.cwd().openDir(io, root, .{ .iterate = true });
         defer dir.close(io);
         if (@import("builtin").os.tag != .windows) try dir.setPermissions(io, @fromBackingInt(0o700));
         const lock_path = try std.fs.path.join(alloc, &.{ root, "session.lock" });
@@ -911,6 +914,10 @@ test "chatgpt manager persists host identity and partitions personal registratio
     const root = try tmp.dir.realPathFileAlloc(io, ".", a);
     defer a.free(root);
     var instance = try Manager.init(a, io, root);
+    if (@import("builtin").os.tag != .windows) {
+        const stat = try tmp.dir.stat(io);
+        try std.testing.expectEqual(@as(u32, 0o700), @backingInt(stat.permissions) & 0o777);
+    }
     var initial = try instance.load(a);
     const host = try a.dupe(u8, initial.value.host_id);
     defer a.free(host);

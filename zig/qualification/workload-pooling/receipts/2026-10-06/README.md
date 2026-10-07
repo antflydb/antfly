@@ -2,6 +2,14 @@
 
 These receipts preserve successful and failed attempts; they do not qualify automatic defaults.
 
+The latest [Nix glibc ReleaseSafe ledger](nix-glibc-release-safe-b793/README.md)
+compares patched main b79388a7d6 with the parser/control and outbound/fan-out
+delivery. All 30 final candidate absolute profiles, nine fixed/fail-fast
+comparisons and six comparable fixed/main load comparisons pass unchanged gates.
+Main fails idle/combined pgwire setup; combined-versus-main timings are unavailable
+and the raw matrices remain failed. Source patches, startup/compiler failures,
+the stricter combined workload and all original receipts are preserved.
+
 ## macOS development measurements
 
 Baseline: unmodified origin/main `59b0d9cb84c22b2fddb63c86f80db413fef8fe17`.

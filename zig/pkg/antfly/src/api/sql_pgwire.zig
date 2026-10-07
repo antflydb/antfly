@@ -69,6 +69,9 @@ pub const Listener = struct {
             .max_connections = config.max_connections,
             .max_session_bytes = config.max_session_bytes,
             .max_retained_bytes = config.max_retained_bytes,
+            .protected_frame_allocator = if (api.parser_memory) |memory| memory.allocator() else null,
+            .control_allocator = api.controlAllocator(),
+            .is_protected_control = @import("sql_control.zig").classify,
             .limits = .{ .retained_bytes = config.retained_bytes_per_connection, .idle_transaction_timeout_ms = config.idle_transaction_timeout_ms },
             .allow_insecure_non_loopback = config.externally_protected_transport,
         });

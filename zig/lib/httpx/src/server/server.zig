@@ -220,6 +220,9 @@ pub const ServerConfig = struct {
     /// Stable owner for raw parser/body/HPACK, connection and runtime heaps.
     /// Must outlive listener shutdown and all connection/request joins.
     transport_allocator: ?Allocator = null,
+    /// Payloads use a separate owner so bulk uploads cannot spend parser memory.
+    request_body_allocator: ?Allocator = null,
+    protected_request_body_allocator: ?Allocator = null,
     protected_application_allocator: ?Allocator = null,
     application_memory_budget_bytes: usize = 256 * 1024 * 1024,
     protected_application_memory_bytes: usize = 16 * 1024 * 1024,
@@ -296,6 +299,7 @@ fn routeErrorStatus(err: anyerror) ?u16 {
 fn h2BodyAdmissionErrorStatus(err: anyerror) ?u16 {
     return switch (err) {
         error.BodyCapacityExceeded => 429,
+        error.OutOfMemory => 503,
         error.StreamDataOverflow => 413,
         else => null,
     };
@@ -1439,6 +1443,8 @@ pub const Server = struct {
         body_buffer_in_use_bytes: usize,
         body_buffer_peak_bytes: usize,
         body_buffer_rejected_total: u64,
+        control_body_buffer_capacity_bytes: usize,
+        control_body_buffer_in_use_bytes: usize,
         application_memory_capacity_bytes: usize = 0,
         application_memory_in_use_bytes: usize = 0,
         application_memory_peak_bytes: usize = 0,
@@ -1484,6 +1490,7 @@ pub const Server = struct {
     h1_body_budget: SharedBodyBudget,
     waiting_for_connection_permit: std.atomic.Value(bool) = .init(false),
     body_budget: SharedBodyBudget,
+    control_body_budget: SharedBodyBudget,
     application_memory: SharedBodyBudget,
     control_application_memory: SharedBodyBudget,
     owned_http_runtime: HttpRuntime,
@@ -1653,6 +1660,12 @@ pub const Server = struct {
     pub fn initWithConfig(allocator: Allocator, io: Io, config: ServerConfig) Self {
         const cfg = config.normalized();
         const transport_alloc = cfg.transport_allocator orelse allocator;
+        // Preserve the configured aggregate ceiling. A control may hold both
+        // raw and decoded bytes; ordinary requests cannot borrow its quota.
+        const control_body_bytes = if (cfg.protected_request_body_allocator != null and (cfg.is_protected_body_candidate != null or cfg.is_protected_request != null))
+            @min(cfg.request_body_buffer_budget_bytes / 8, std.math.mul(usize, cfg.protected_body_limit, cfg.protected_request_tasks *| 2) catch 0)
+        else
+            0;
 
         return .{
             .allocator = transport_alloc,
@@ -1662,7 +1675,8 @@ pub const Server = struct {
             .conn_semaphore = .{ .permits = cfg.max_connections },
             .request_permits = .init(cfg.max_request_tasks),
             .h1_body_budget = SharedBodyBudget.init(if (cfg.max_h1_inflight_bodies == 0) cfg.max_connections else cfg.max_h1_inflight_bodies),
-            .body_budget = SharedBodyBudget.init(cfg.request_body_buffer_budget_bytes),
+            .body_budget = SharedBodyBudget.init(cfg.request_body_buffer_budget_bytes - control_body_bytes),
+            .control_body_budget = SharedBodyBudget.init(control_body_bytes),
             .application_memory = SharedBodyBudget.init(cfg.application_memory_budget_bytes - cfg.protected_application_memory_bytes),
             .control_application_memory = SharedBodyBudget.init(cfg.protected_application_memory_bytes),
             .owned_http_runtime = HttpRuntime.init(transport_alloc, .{
@@ -1682,6 +1696,7 @@ pub const Server = struct {
     /// fields are atomically maintained by the accept/request paths.
     pub fn runtimeStats(self: *const Self) RuntimeStats {
         const body = self.body_budget.stats();
+        const control_body = self.control_body_budget.stats();
         return .{
             .max_connections = self.config.max_connections,
             .active_connections = self.active_connections.load(.acquire),
@@ -1694,10 +1709,13 @@ pub const Server = struct {
             .request_dispatch_rejections_total = self.request_dispatch_rejections_total.load(.acquire),
             .h2_stream_dispatch_rejections_total = self.h2_stream_dispatch_rejections_total.load(.acquire),
             .request_cancellations_total = self.request_cancellations_total.load(.acquire),
-            .body_buffer_capacity_bytes = body.capacity,
-            .body_buffer_in_use_bytes = body.in_use,
-            .body_buffer_peak_bytes = body.peak_in_use,
-            .body_buffer_rejected_total = body.rejected_total,
+            .body_buffer_capacity_bytes = body.capacity + control_body.capacity,
+            .body_buffer_in_use_bytes = body.in_use + control_body.in_use,
+            // Sum of partition high-water marks is a conservative aggregate.
+            .body_buffer_peak_bytes = body.peak_in_use + control_body.peak_in_use,
+            .body_buffer_rejected_total = body.rejected_total +| control_body.rejected_total,
+            .control_body_buffer_capacity_bytes = control_body.capacity,
+            .control_body_buffer_in_use_bytes = control_body.in_use,
             .application_memory_capacity_bytes = self.application_memory.stats().capacity + self.control_application_memory.stats().capacity,
             .application_memory_in_use_bytes = self.application_memory.stats().in_use,
             .application_memory_peak_bytes = self.application_memory.stats().peak_in_use,
@@ -2236,6 +2254,8 @@ pub const Server = struct {
         parser.max_body_size = self.config.max_body_size;
         parser.max_headers = self.config.max_headers;
         parser.body_budget = &self.body_budget;
+        parser.body_memory_context = self;
+        parser.body_memory_resolver = resolveBodyMemory;
         if (self.router.hasBodyLimits()) {
             parser.request_body_limit_context = self;
             parser.request_body_limit_resolver = resolveRequestBodyLimit;
@@ -2277,6 +2297,10 @@ pub const Server = struct {
                     },
                     error.BodyCapacityExceeded => {
                         try self.sendError(&sock, 429);
+                        return;
+                    },
+                    error.OutOfMemory => {
+                        try self.sendError(&sock, 503);
                         return;
                     },
                     error.HeaderTooLarge, error.TooManyHeaders => {
@@ -2344,6 +2368,10 @@ pub const Server = struct {
                     },
                     error.BodyCapacityExceeded => {
                         try self.sendError(&sock, 429);
+                        return;
+                    },
+                    error.OutOfMemory => {
+                        try self.sendError(&sock, 503);
                         return;
                     },
                     error.HeaderTooLarge, error.TooManyHeaders => {
@@ -2441,7 +2469,7 @@ pub const Server = struct {
             var ctx = Context.init(application_scope.allocator(), self.io, &req);
             ctx.max_file_size = self.config.max_file_size;
             ctx.max_request_body_size = resolveRequestBodyLimit(self, req.method, req.uri.path) orelse self.config.max_body_size;
-            req.body_budget = &self.body_budget;
+            req.body_budget = parser.body_budget;
             ctx.h1_sock = &sock;
             var h1_stream_reader: ?Context.H1StreamReader = if (parser.headers_only and
                 (parser.chunked or (parser.content_length orelse 0) > 0)) .{
@@ -2628,6 +2656,32 @@ pub const Server = struct {
         return true;
     }
 
+    fn resolveBodyMemory(ptr: *anyopaque, method: types.Method, request_target: []const u8, length: ?u64) @import("../protocol/body_budget.zig").BodyMemory {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        if (self.config.protected_request_body_allocator) |allocator| {
+            const candidate = (if (self.config.is_protected_request) |classify| classify(method, request_target) else false) or
+                (if (self.config.is_protected_body_candidate) |classify| classify(method, request_target) else false);
+            if (self.config.protected_request_tasks > 0 and
+                length != null and length.? <= self.config.protected_body_limit and candidate)
+            {
+                return .{ .allocator = allocator, .budget = &self.control_body_budget, .max_bytes = @intCast(length.?) };
+            }
+        }
+        return .{ .allocator = self.config.request_body_allocator orelse self.allocator, .budget = &self.body_budget };
+    }
+
+    fn resolveH2BodyMemory(ptr: *anyopaque, headers: []const @import("../protocol/hpack.zig").DecodedHeader) @import("../protocol/body_budget.zig").BodyMemory {
+        var method: ?types.Method = null;
+        var target: ?[]const u8 = null;
+        var length: ?u64 = null;
+        for (headers) |header| {
+            if (mem.eql(u8, header.name, ":method")) method = types.Method.fromString(header.value);
+            if (mem.eql(u8, header.name, ":path")) target = header.value;
+            if (std.ascii.eqlIgnoreCase(header.name, "content-length")) length = std.fmt.parseInt(u64, header.value, 10) catch null;
+        }
+        return resolveBodyMemory(ptr, method orelse .GET, target orelse "/", length);
+    }
+
     fn resolveRequestBodyLimit(ptr: *anyopaque, method: types.Method, request_target: []const u8) ?usize {
         const self: *Self = @ptrCast(@alignCast(ptr));
         const path = if (mem.indexOfScalar(u8, request_target, '?')) |query| request_target[0..query] else request_target;
@@ -2675,6 +2729,8 @@ pub const Server = struct {
         defer self.clearH2Control(control);
         h2.max_stream_data_size = self.config.max_body_size;
         h2.recv_data_budget = &self.body_budget;
+        h2.recv_body_memory_context = self;
+        h2.recv_body_memory_resolver = resolveH2BodyMemory;
         h2.local_settings.initial_window_size = self.config.h2_initial_window_size;
         h2.local_settings.max_concurrent_streams = self.config.h2_max_concurrent_streams;
         try h2.applyPeerSettings(settings_payload);
@@ -2835,6 +2891,8 @@ pub const Server = struct {
         defer self.clearH2Control(control);
         h2.max_stream_data_size = self.config.max_body_size;
         h2.recv_data_budget = &self.body_budget;
+        h2.recv_body_memory_context = self;
+        h2.recv_body_memory_resolver = resolveH2BodyMemory;
         h2.local_settings.initial_window_size = self.config.h2_initial_window_size;
         h2.local_settings.max_concurrent_streams = self.config.h2_max_concurrent_streams;
 
@@ -3287,6 +3345,7 @@ pub const Server = struct {
         ctx.h2_stream_id = stream_id;
         if (getH2Stream(h2, stream_id)) |stream| {
             ctx.cancellation = &stream.cancellation;
+            req.body_budget = stream.data_budget orelse &self.body_budget;
         }
         defer ctx.deinit();
 
@@ -6844,7 +6903,7 @@ test "protected dispatch reserves slots and returns them after completion" {
     try std.testing.expectEqual(@as(u32, 3), server.request_permits.load(.acquire));
 }
 
-test "protected dispatch H2 frame pump serves status while ordinary handlers are full" {
+test "protected dispatch H2 frame pump serves controls with full handlers and exhausted body heap" {
     const State = struct {
         var entered: std.atomic.Value(usize) = .init(0);
         var release: Io.Event = .unset;
@@ -6875,6 +6934,7 @@ test "protected dispatch H2 frame pump serves status while ordinary handlers are
     var runtime = Io.Threaded.init(alloc, .{});
     defer runtime.deinit();
     const io = runtime.io();
+    var payload_heap = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
     var server = Server.initWithConfig(alloc, io, .{
         .host = "127.0.0.1",
         .port = 0,
@@ -6885,6 +6945,8 @@ test "protected dispatch H2 frame pump serves status while ordinary handlers are
         .is_protected_body_candidate = State.candidate,
         .is_protected_body_request = State.bodyControl,
         .body_read_timeout_ms = 50,
+        .request_body_allocator = payload_heap.allocator(),
+        .protected_request_body_allocator = alloc,
     });
     defer server.deinit();
     try server.get("/query", Handler.from(State.query));
@@ -6928,7 +6990,7 @@ test "protected dispatch H2 frame pump serves status while ordinary handlers are
     peer.stream_manager.removeStream(streams[3].id);
     for ([_][]const u8{ "ROLLBACK", "SELECT", "ROLL" }, 0..) |body, index| {
         const candidate = try peer.stream_manager.createStream();
-        const headers = try H2Connection.buildRequestHeaders("POST", "/control", "http", "localhost", &.{}, alloc);
+        const headers = try H2Connection.buildRequestHeaders("POST", "/control", "http", "localhost", &.{.{ .name = "content-length", .value = if (index == 1) "6" else "8" }}, alloc);
         defer alloc.free(headers);
         try peer.sendHeaders(&socket, candidate.id, headers, false);
         try peer.writeData(&socket, candidate.id, body, index != 2);
@@ -7044,4 +7106,122 @@ test "protected dispatch memory reserve survives retained foreground output" {
     protected.allocator().free(acknowledgement);
     try std.testing.expectEqual(@as(usize, 896), server.runtimeStats().application_memory_in_use_bytes);
     try std.testing.expectEqual(@as(usize, 0), server.runtimeStats().control_application_memory_in_use_bytes);
+}
+
+test "protected dispatch H1 rejects bulk allocation failure and parses bounded controls" {
+    const State = struct {
+        fn fixed(method: types.Method, path: []const u8) bool {
+            return method == .GET and mem.eql(u8, path, "/status");
+        }
+        fn candidate(method: types.Method, path: []const u8) bool {
+            return method == .POST and mem.eql(u8, path, "/control");
+        }
+        fn body(_: types.Method, _: []const u8, bytes: []const u8) bool {
+            return mem.eql(u8, bytes, "ROLLBACK");
+        }
+        fn respond(ctx: *Context) !Response {
+            return ctx.text("ready");
+        }
+    };
+    const alloc = std.testing.allocator;
+    var runtime = Io.Threaded.init(alloc, .{});
+    defer runtime.deinit();
+    const io = runtime.io();
+    var payload = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    var server = Server.initWithConfig(alloc, io, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .max_connections = 4,
+        .max_request_tasks = 4,
+        .protected_request_tasks = 1,
+        .is_protected_request = State.fixed,
+        .is_protected_body_candidate = State.candidate,
+        .is_protected_body_request = State.body,
+        .request_body_allocator = payload.allocator(),
+        .protected_request_body_allocator = alloc,
+    });
+    defer server.deinit();
+    try server.post("/echo", Handler.from(State.respond));
+    try server.post("/control", Handler.from(State.respond));
+    try server.get("/status", Handler.from(State.respond));
+    var task = Server.ListenerTask.init(&server);
+    try task.start();
+    defer {
+        server.stop();
+        task.join() catch {};
+    }
+    const requests = [_][]const u8{
+        "POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4\r\nConnection: close\r\n\r\ndata",
+        "POST /control HTTP/1.1\r\nHost: localhost\r\nContent-Length: 8\r\nConnection: close\r\n\r\nROLLBACK",
+        "GET /status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    };
+    for (requests, [_][]const u8{ "503", "200", "200" }) |request, status| {
+        var socket = try Socket.connect(server.boundAddress().?, io);
+        defer socket.close();
+        try socket.setRecvTimeout(5000);
+        try socket.sendAll(request);
+        var bytes: [4096]u8 = undefined;
+        const n = try socket.recv(&bytes);
+        try std.testing.expect(n > 12);
+        try std.testing.expectEqualStrings(status, bytes[9..12]);
+    }
+    server.stop();
+    try task.join();
+    try std.testing.expectEqual(@as(usize, 0), server.control_body_budget.stats().in_use);
+    try std.testing.expectEqual(@as(usize, 0), server.body_budget.stats().in_use);
+}
+
+test "protected dispatch H2 payload OOM leaves the connection usable for status" {
+    const alloc = std.testing.allocator;
+    var runtime = Io.Threaded.init(alloc, .{});
+    defer runtime.deinit();
+    const io = runtime.io();
+    var payload = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    var server = Server.initWithConfig(alloc, io, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .max_connections = 2,
+        .max_request_tasks = 4,
+        .request_body_allocator = payload.allocator(),
+    });
+    defer server.deinit();
+    const respond = struct {
+        fn call(ctx: *Context) !Response {
+            if (ctx.request.method == .POST) _ = try ctx.body();
+            return ctx.text("ready");
+        }
+    }.call;
+    try server.post("/echo", Handler.from(respond));
+    try server.get("/status", Handler.from(respond));
+    var task = Server.ListenerTask.init(&server);
+    try task.start();
+    defer {
+        server.stop();
+        task.join() catch {};
+    }
+    var socket = try Socket.connect(server.boundAddress().?, io);
+    defer socket.close();
+    try socket.setRecvTimeout(5000);
+    var peer = H2Connection.initClient(alloc, io);
+    defer peer.deinit();
+    try peer.sendClientPreface(&socket);
+    const rejected = try peer.stream_manager.createStream();
+    const headers = try H2Connection.buildRequestHeaders("POST", "/echo", "http", "localhost", &.{.{ .name = "content-length", .value = "4" }}, alloc);
+    defer alloc.free(headers);
+    try peer.sendHeaders(&socket, rejected.id, headers, false);
+    try peer.writeData(&socket, rejected.id, "data", true);
+    while (!rejected.completed) _ = try peer.processOneFrame(&socket, &socket);
+    var status: ?[]const u8 = null;
+    for (rejected.request_headers.?) |header| if (mem.eql(u8, header.name, ":status")) {
+        status = header.value;
+    };
+    try std.testing.expectEqualStrings("503", status.?);
+    peer.stream_manager.removeStream(rejected.id);
+    const control = try peer.stream_manager.createStream();
+    const control_headers = try H2Connection.buildRequestHeaders("GET", "/status", "http", "localhost", &.{}, alloc);
+    defer alloc.free(control_headers);
+    try peer.sendHeaders(&socket, control.id, control_headers, true);
+    while (!control.completed) _ = try peer.processOneFrame(&socket, &socket);
+    try std.testing.expectEqualStrings("ready", control.data_buf.items);
+    try std.testing.expectEqual(@as(usize, 0), server.body_budget.stats().in_use);
 }

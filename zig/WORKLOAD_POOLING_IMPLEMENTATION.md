@@ -32,6 +32,17 @@ Baseline: `e4d707de5634a8d758c606b4432037e1a1682052`. Design:
 - Canonical configuration and regenerated Zig bindings. Queue depth, charged
   input bytes, capacities, wait ceiling, wait histogram, expiration/cancellation,
   and draining metrics extend the existing admission namespace.
+- Default protected HTTP tasks, parser/body partitions and bounded pgwire frame
+  and acknowledgement memory. Verified SQL controls use the API control arena;
+  fail-fast reserves control tasks within its existing ceiling. Ordinary bodies
+  and frames cannot consume these partitions.
+- Separate node-accounted outbound read and forwarding client heaps, plus
+  synchronized caller-charged join/graph/model/probe child arenas. Clients and
+  tasks join before their allocation owners retire; caller results keep their
+  original charge.
+- A combined retained-client pressure manifest and CI using pinned Nix glibc Zig
+  on Linux. Qualification retains failed attempts and explicit source patches;
+  see [the latest receipt ledger](qualification/workload-pooling/receipts/2026-10-06/nix-glibc-release-safe-b793/README.md).
 
 ## Opt-in configuration
 
@@ -68,7 +79,8 @@ retain their own resource owners.
 
 ### Protected dispatch and native executor ownership
 
-With waiting enabled, the public HTTP transport reserves four request slots for
+The public HTTP transport reserves four request slots under both fail-fast and
+waiting policies for
 fixed GET status/health/readiness paths, existing transaction commit/abort/savepoint
 rollback paths, SQL resource retirement, and supported SQL transaction completion. Ordinary requests cannot consume that
 reserve. SQL body classification uses the execution grammar, accepts only COMMIT,
@@ -85,8 +97,9 @@ absolute timer bound classification. One joined watchdog per H2 connection exist
 and expires incomplete bodies; idle sockets do not retain scheduling workers. Complete bodies must prove they are controls
 before dispatch; fresh queries receive REFUSED_STREAM. The frame pump continues.
 
-Outstanding handler capacity is the smaller of the existing connection ceiling
-and `existing request-task capacity + queue count + 4`. The shared HttpRuntime
+With waiting enabled, outstanding handler capacity is the smaller of the existing connection ceiling
+and `existing request-task capacity + queue count + 4`. Fail-fast reserves the
+protected slots within its existing total request-task ceiling. The shared HttpRuntime
 reserves the resulting capacity before bind. Existing connection, descriptor,
 body-byte, slow-upload and per-H2-connection stream ceilings still apply. The
 existing separate health listener remains necessary when public connections are
@@ -320,10 +333,11 @@ when control cleanup destroys state created by a foreground request.
 | API foreground/control | API scratch and backend allocations using `server.alloc`, SQL plan cache, retained read runtime, in-memory transaction/session registry; released on actual destruction |
 | API persistent state | 256 MiB default independent envelope; API-owned session/job stores and queues, provider/routing caches, foreign registries, and opened durable session backend heap; released on actual destruction |
 | HTTP application scope | Context/decoded values and response buffers, shared 256 MiB listener envelope with a verified-control reserve; held until writer and request cleanup join |
-| HTTP raw body | Existing shared raw/transformed-body reservation; independent of output and context storage |
-| Pgwire | Existing aggregate connection allocation cap plus independent retained-state cap; prepared/portal/cursor owners keep stable allocator addresses |
-| Outbound service clients | Active/waiting/socket and queued-byte limits remain independent per stable transport owner |
-| Storage/models/durable backend | Existing independent owners; allocations outside supplied allocators are not intercepted by these envelopes |
+| HTTP raw body and parser | Bulk and parser/control partitions within the original pinned node transport ceiling; raw/transformed-body quotas remain nested and separate from output/context storage |
+| Pgwire | Existing aggregate connection allocation cap plus independent retained-state cap; 32 KiB control-frame partition within each original connection ceiling; prepared/portal/cursor owners keep stable allocator addresses |
+| Outbound DataServer clients | Read-client heap charges node growth; forwarding-client control heap is pinned before publication; active/waiting/socket and queued-byte limits remain nested per stable transport owner |
+| Helper and distributed fan-out arenas | Synchronized child allocator charges the caller's owner, with a 64 MiB per-group ceiling; every child joins before owner destruction and result merging |
+| Storage/models/durable backend | Managed storage/models share the linked node owner; independently supplied backend allocations outside supplied allocators retain their own budgets |
 
 The root allocator includes provenance-header and alignment overhead. The HTTP
 scope counts requested buffer bytes. Neither is a total-process RSS guarantee:
@@ -383,15 +397,18 @@ checks. Neither profile qualifies distributed recovery.
 
 Still required for the full design:
 
-- Linux and larger deployment envelopes, controlled open-loop overload, slow
-  consumers/retained cursors with combined descriptor/body/heap pressure, and
-  distributed control progress through storage, locks and remote owners.
+- Complete Linux release qualification: all 30 final candidate absolute profiles
+  pass, but main fails idle/combined pgwire setup and its combined load comparison
+  is unavailable. Raw matrices remain failed. Arbitrary
+  distributed storage/lock/remote-owner exhaustion remains beyond the named
+  protected progress schedules.
 - A complete ledger and coordinated sizing for independent storage/model/durable
   allocations; total-process accounting is not established by API interception.
-- Context capabilities for any remaining legacy/host callbacks that cannot
-  receive cancellation; hot policy changes and operator suspension.
-- Helper/fan-out isolation, fairness, cooperative quanta and distributed
-  uncertainty ledgers.
+- Context capabilities for remaining legacy/host callbacks that cannot receive
+  cancellation. Native hot query policy changes and operator suspension exist.
+- Fairness, cooperative quanta and complete distributed uncertainty ledgers.
+  Caller-charged helper/fan-out isolation exists; native/backend costs outside
+  those allocators still need independent ownership qualification.
 - Main-versus-candidate performance receipts and measured automatic sizing/default
   query waiting. Waiting remains opt-in until those release gates pass.
 
@@ -643,5 +660,45 @@ storage context ownership/ABI fixture also passes in ReleaseSafe,
 and the GNU Linux signal-stack fixture passes with the pinned Nix compiler.
 Linux qualification uses identical stripped ReleaseSafe settings after preserving
 the unqualified unstripped attempt that exceeded the storage compiler claim.
-Linux production builds and qualification remain in progress;
-waiting remains opt-in.
+Both Linux GNU ARM64 production builds against origin/main b79388a7d6 completed
+all 45 steps using pinned Nix glibc Zig and stripped ReleaseSafe. The GNU
+signal-stack fixture and all 99 resource/transaction/filesystem cases pass.
+The first small/large matrices failed before measurement in both variants:
+the default ChatGPT credential store attempted `fchmod` on an `O_PATH` directory
+handle. The focused readable-handle fix retains `0700` and is applied identically
+to main and candidate, with explicit patched-baseline provenance. The credential
+fixture passes on macOS and with unstripped ReleaseSafe Linux tests; stripped
+Linux test compilation crashes in Zig. Production binaries remain stripped.
+Startup failures and compiler diagnostics are retained under
+`receipts/2026-10-06/nix-glibc-release-safe-b793`.
+The startup-fixed final candidate passes all 30 small/large/mixed/waiting/combined
+absolute profiles. All nine fixed/fail-fast comparisons and six comparable
+fixed/main load comparisons pass unchanged performance gates. Main fails
+idle/combined pgwire setup, so combined-versus-main timings remain unavailable
+and the raw matrices fail. Waiting remains opt-in; these are not automatic
+default qualification receipts.
+
+The parser/control and outbound/fan-out accounting delivery has passed 54 native
+ReleaseSafe pooling cases, 12 protected HTTP cases and 12 connection-helper cases.
+The corrected pgwire target explicitly imports its protocol module; earlier
+focused two-test summaries ran anonymous imports, although the broad pooling
+suite did run the two original protocol cases. Three named startup/frame/control
+cases and all 87 pgwire cases now pass on macOS and GNU Linux.
+The combined-pressure diagnostic smoke also exposed and corrected a startup
+ParameterStatus allocation/free owner mismatch before rebuilding the candidate.
+The pressure harness passes
+14 tests; the test-selection auditor passes 10. The linked data-runtime target
+passes all 91 build steps and its forwarding fixture with the read-client heap
+exhausted and the control executor saturated. The generated control catalog now
+exports bounded admission after the main merge, and partition inventories are
+inserted before runtime arguments so linked selections retain their strict audit.
+The new Linux combined-pressure manifest retains authenticated connections,
+cursors and unfinished uploads throughout mixed writes and slow-reader load.
+Its latency, throughput, resource and recovery thresholds are unchanged.
+The first 16-slot combined profile retained every candidate client but correctly
+failed its completed-wait gate. A stricter one-slot rerun preserves all load,
+client/resource settings and thresholds; all six candidate runs and all three
+fail-fast comparisons pass, with 1,548–1,587 completed sustained waits. Original
+failures and the exact workload change remain in the receipt ledger.
+These checks establish the named parser/control and allocation-owner contracts;
+they do not establish allocation-free physical mutating completion.

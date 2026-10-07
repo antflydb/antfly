@@ -99,6 +99,9 @@ pub const Session = struct {
     reader: *std.Io.Reader,
     writer: *std.Io.Writer,
     limits: Limits = .{},
+    frame_memory: ?*@import("../common/allocation_budget.zig").Partitioned = null,
+    control_allocator: ?std.mem.Allocator = null,
+    is_protected_control: ?*const fn ([]const u8) bool = null,
     hooks: ?CancelHooks = null,
     identity: ?backend.Identity = null,
     database: ?[]u8 = null,
@@ -217,7 +220,7 @@ pub const Session = struct {
                 else => return err,
             };
             const payload = try self.readPayload(4);
-            defer self.alloc.free(payload);
+            defer self.freePayload(payload);
             if (tag == 'X') {
                 if (payload.len != 0) return error.ProtocolViolation;
                 return;
@@ -262,7 +265,7 @@ pub const Session = struct {
         var negotiation_count: u8 = 0;
         while (true) {
             const payload = try self.readPayload(8);
-            defer self.alloc.free(payload);
+            defer self.freePayload(payload);
             var cursor = Cursor{ .bytes = payload };
             const version = try cursor.int(u32);
             switch (version) {
@@ -312,7 +315,7 @@ pub const Session = struct {
                     const password_payload = try self.readPayload(5);
                     defer {
                         std.crypto.secureZero(u8, password_payload);
-                        self.alloc.free(password_payload);
+                        self.freePayload(password_payload);
                     }
                     var password_cursor = Cursor{ .bytes = password_payload };
                     const password = try password_cursor.string();
@@ -347,10 +350,24 @@ pub const Session = struct {
         }
     }
 
+    fn freePayload(self: *Session, payload: []u8) void {
+        const alloc = if (self.frame_memory) |memory| memory.allocator(false) else self.alloc;
+        alloc.free(payload);
+    }
+
+    fn wireAllocator(self: *Session) std.mem.Allocator {
+        return if (self.frame_memory) |memory| memory.allocator(true) else self.alloc;
+    }
+
+    fn protectedControl(self: *Session, statement: []const u8) bool {
+        return self.control_allocator != null and if (self.is_protected_control) |classify| classify(statement) else false;
+    }
+
     fn readPayload(self: *Session, minimum: u32) ![]u8 {
         const len = try self.reader.takeInt(u32, .big);
         if (len < minimum or len > self.limits.frame_bytes) return error.ProtocolViolation;
-        return self.reader.readAlloc(self.alloc, len - 4);
+        const alloc = if (self.frame_memory) |memory| memory.allocator(len - 4 <= 8192) else self.alloc;
+        return self.reader.readAlloc(alloc, len - 4);
     }
 
     fn effectiveNamespace(self: *const Session) []const u8 {
@@ -696,7 +713,8 @@ pub const Session = struct {
                 if (std.mem.trim(u8, statement, " \t\r\n;").len == 0) {
                     try self.message('I', "");
                 } else {
-                    var arena = std.heap.ArenaAllocator.init(self.alloc);
+                    const protected = self.protectedControl(statement);
+                    var arena = std.heap.ArenaAllocator.init(if (protected) self.control_allocator.? else self.alloc);
                     defer arena.deinit();
                     if (try self.sessionCommand(arena.allocator(), statement)) {
                         if (self.status == .idle) {
@@ -706,7 +724,7 @@ pub const Session = struct {
                         try self.ready();
                         return;
                     }
-                    if (try self.simpleStream(statement)) {
+                    if (!protected and try self.simpleStream(statement)) {
                         if (self.status == .idle) self.clearPortals();
                         try self.ready();
                         return;
@@ -854,7 +872,7 @@ pub const Session = struct {
                 };
                 if (!portal.stream_opened) {
                     portal.stream_opened = true;
-                    if (self.source.vtable.open_stream) |open| if (try commands.settingCommand(portal.arena.allocator(), portal.statement) == null) {
+                    if (self.source.vtable.open_stream) |open| if (!self.protectedControl(portal.statement) and try commands.settingCommand(portal.arena.allocator(), portal.statement) == null) {
                         self.cancel_requested.store(false, .release);
                         self.executing.store(true, .release);
                         defer self.executing.store(false, .release);
@@ -870,7 +888,7 @@ pub const Session = struct {
                     return;
                 }
                 if (portal.result == null) {
-                    portal.result = try self.execute(portal.arena.allocator(), portal.statement, portal.parameters, portal.types, portal.description.binding_guard, portal.description.setting_epoch);
+                    portal.result = try self.execute(if (self.protectedControl(portal.statement)) self.control_allocator.? else portal.arena.allocator(), portal.statement, portal.parameters, portal.types, portal.description.binding_guard, portal.description.setting_epoch);
                     const result = portal.result.?;
                     if (!columnsEqual(portal.description.columns, result.columns)) return error.ResultShapeChanged;
                 }
@@ -1413,19 +1431,19 @@ pub const Session = struct {
     }
 
     fn parameterStatus(self: *Session, name: []const u8, value: []const u8) !void {
-        const payload = try std.mem.concat(self.alloc, u8, &.{ name, &.{0}, value, &.{0} });
-        defer self.alloc.free(payload);
+        const payload = try std.mem.concat(self.wireAllocator(), u8, &.{ name, &.{0}, value, &.{0} });
+        defer self.freePayload(payload);
         try self.message('S', payload);
     }
 
     pub fn sendError(self: *Session, code: []const u8, message_text: []const u8) !void {
-        const payload = try std.mem.concat(self.alloc, u8, &.{ "SERROR\x00C", code, "\x00M", message_text, "\x00\x00" });
-        defer self.alloc.free(payload);
+        const payload = try std.mem.concat(self.wireAllocator(), u8, &.{ "SERROR\x00C", code, "\x00M", message_text, "\x00\x00" });
+        defer self.freePayload(payload);
         try self.message('E', payload);
     }
 
     fn sendDiagnostic(self: *Session, tag: u8, diagnostic: backend.Diagnostic, outcome: ?backend.MutationOutcome) !void {
-        var bytes = std.Io.Writer.Allocating.init(self.alloc);
+        var bytes = std.Io.Writer.Allocating.init(self.wireAllocator());
         defer bytes.deinit();
         try bytes.writer.writeAll(if (tag == 'N') "SNOTICE\x00C" else "SERROR\x00C");
         try bytes.writer.writeAll(&diagnostic.code.?);
@@ -1469,8 +1487,8 @@ pub const Session = struct {
 
     fn command(self: *Session, tag: []const u8) !void {
         if (std.mem.indexOfScalar(u8, tag, 0) != null) return error.InvalidResult;
-        const payload = try std.mem.concat(self.alloc, u8, &.{ tag, &.{0} });
-        defer self.alloc.free(payload);
+        const payload = try std.mem.concat(self.wireAllocator(), u8, &.{ tag, &.{0} });
+        defer self.freePayload(payload);
         try self.message('C', payload);
     }
 
@@ -1608,6 +1626,133 @@ fn sqlstate(err: anyerror) []const u8 {
         error.UnsupportedParameterType, error.UnsupportedParameterFormat, error.UnsupportedResultFormat, error.UnsupportedProtocolMessage, error.UnsupportedContinuation, error.UnsupportedResultPrecision, error.UnsupportedStatement, error.ResultShapeChanged => "0A000",
         else => "XX000",
     };
+}
+
+test "workload envelope pgwire authenticated startup retires partitioned frames under bulk OOM" {
+    const Fixture = struct {
+        authenticated: bool = false,
+        fn authenticate(ptr: *anyopaque, _: std.mem.Allocator, user: []const u8, password: []const u8) !backend.Identity {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (!std.mem.eql(u8, user, "admin") or !std.mem.eql(u8, password, "test")) return error.AuthenticationFailed;
+            self.authenticated = true;
+            return .{ .context = self, .release = release };
+        }
+        fn release(_: *anyopaque, _: std.mem.Allocator) void {}
+        fn disconnect(_: *anyopaque, _: backend.Identity, _: ?[]const u8) void {}
+    };
+    var fixture: Fixture = .{};
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var memory: @import("../common/allocation_budget.zig").Partitioned = .{
+        .foreground = .{ .child = failing.allocator(), .limit = 1 << 20 },
+        .control = .{ .child = std.testing.allocator, .limit = 32 << 10 },
+    };
+    var reader = std.Io.Reader.fixed("\x00\x00\x00\x14\x00\x03\x00\x00user\x00admin\x00\x00p\x00\x00\x00\x09test\x00");
+    var output = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer output.deinit();
+    var session: Session = .{
+        .alloc = failing.allocator(),
+        .io = std.testing.io,
+        .source = .{ .context = &fixture, .vtable = &.{ .authenticate = Fixture.authenticate, .describe = undefined, .execute = undefined, .disconnect = Fixture.disconnect } },
+        .reader = &reader,
+        .writer = &output.writer,
+        .frame_memory = &memory,
+    };
+    defer session.deinit();
+    try std.testing.expect(try session.startup());
+    try std.testing.expect(fixture.authenticated);
+    var response = Cursor{ .bytes = output.written() };
+    var parameters: usize = 0;
+    var ready = false;
+    while (response.offset < response.bytes.len) {
+        const tag = try response.int(u8);
+        const length = try response.int(u32);
+        const payload = try response.take(length - 4);
+        if (tag == 'S') parameters += 1;
+        if (tag == 'Z') {
+            try std.testing.expectEqualStrings("I", payload);
+            ready = true;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 7), parameters);
+    try std.testing.expect(ready);
+    try std.testing.expectEqual(@as(usize, 0), memory.foreground.stats().used_bytes);
+    try std.testing.expectEqual(@as(usize, 0), memory.control.stats().used_bytes);
+}
+
+test "workload envelope pgwire frame parsing preserves control reserve under bulk OOM" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var memory: @import("../common/allocation_budget.zig").Partitioned = .{
+        .foreground = .{ .child = failing.allocator(), .limit = 1 << 20 },
+        .control = .{ .child = std.testing.allocator, .limit = 32 << 10 },
+    };
+    var reader = std.Io.Reader.fixed("\x00\x00\x00\x0bCOMMIT\x00");
+    var session: Session = .{ .alloc = failing.allocator(), .io = std.testing.io, .source = undefined, .reader = &reader, .writer = undefined, .frame_memory = &memory };
+    const payload = try session.readPayload(4);
+    try std.testing.expectEqualStrings("COMMIT\x00", payload);
+    try std.testing.expect(memory.control.stats().used_bytes > 0);
+    session.freePayload(payload);
+    try std.testing.expectEqual(@as(usize, 0), memory.control.stats().used_bytes);
+    var oversized: [8197]u8 = undefined;
+    std.mem.writeInt(u32, oversized[0..4], oversized.len, .big);
+    @memset(oversized[4..], 'x');
+    reader = std.Io.Reader.fixed(&oversized);
+    try std.testing.expectError(error.OutOfMemory, session.readPayload(4));
+    try std.testing.expectEqual(@as(usize, 0), memory.foreground.stats().used_bytes);
+    try std.testing.expectEqual(@as(usize, 0), memory.control.stats().used_bytes);
+}
+
+test "workload envelope pgwire verified simple controls acknowledge under bulk OOM" {
+    const Fixture = struct {
+        completed: usize = 0,
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, _: backend.Identity, req: backend.Request) !backend.Result {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const tag = try alloc.dupe(u8, req.statement);
+            self.completed += 1;
+            return .{ .command_tag = tag };
+        }
+        fn release(_: *anyopaque, _: std.mem.Allocator) void {}
+        fn disconnect(_: *anyopaque, _: backend.Identity, _: ?[]const u8) void {}
+    };
+    var fixture: Fixture = .{};
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var memory: @import("../common/allocation_budget.zig").Partitioned = .{
+        .foreground = .{ .child = failing.allocator(), .limit = 1 << 20 },
+        .control = .{ .child = std.testing.allocator, .limit = 32 << 10 },
+    };
+    var output = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer output.deinit();
+    var session: Session = .{
+        .alloc = failing.allocator(),
+        .io = std.testing.io,
+        .source = .{ .context = &fixture, .vtable = &.{ .authenticate = undefined, .describe = undefined, .execute = Fixture.execute, .disconnect = Fixture.disconnect } },
+        .identity = .{ .context = &fixture, .release = Fixture.release },
+        .reader = undefined,
+        .writer = &output.writer,
+        .status = .in_transaction,
+        .frame_memory = &memory,
+        .control_allocator = std.testing.allocator,
+        .is_protected_control = @import("../api/sql_control.zig").classify,
+    };
+    defer session.deinit();
+    // Startup emits ParameterStatus before serving queries. Its allocation
+    // must use the same partitioned owner as its free, even when bulk is full.
+    try session.parameterStatus("server_encoding", "UTF8");
+    try std.testing.expectEqual(@as(u8, 'S'), output.written()[0]);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "server_encoding\x00UTF8\x00") != null);
+    try std.testing.expectEqual(@as(usize, 0), memory.control.stats().used_bytes);
+    session.setDeadline(session.limits.statement_timeout_ms);
+    try session.dispatch('Q', "COMMIT\x00");
+    try std.testing.expectEqual(@as(usize, 1), fixture.completed);
+    try std.testing.expectEqual(backend.TransactionStatus.idle, session.status);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "COMMIT\x00") != null);
+    session.status = .failed;
+    try session.dispatch('Q', "ROLLBACK\x00");
+    try std.testing.expectEqual(@as(usize, 2), fixture.completed);
+    try std.testing.expectEqual(backend.TransactionStatus.idle, session.status);
+    try std.testing.expectError(error.OutOfMemory, session.dispatch('Q', "SELECT 1\x00"));
+    try std.testing.expectEqual(@as(usize, 2), fixture.completed);
+    try session.sendError("53300", "ordinary transport capacity unavailable");
+    try std.testing.expectEqual(@as(usize, 0), memory.control.stats().used_bytes);
 }
 
 test "pgwire retained session idle transaction deadline covers failed owners" {

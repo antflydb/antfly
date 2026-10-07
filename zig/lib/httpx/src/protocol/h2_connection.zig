@@ -77,6 +77,8 @@ pub const H2Connection = struct {
     /// Optional aggregate budget shared by all server-side H2 connections.
     /// Each stream reservation is released by Stream.deinit().
     recv_data_budget: ?*SharedBodyBudget = null,
+    recv_body_memory_context: ?*anyopaque = null,
+    recv_body_memory_resolver: ?*const fn (*anyopaque, []const hpack.DecodedHeader) @import("body_budget.zig").BodyMemory = null,
 
     /// Timeout for writeDataBlocking to wait for flow-control window space.
     /// Prevents indefinite blocking when a peer stops sending WINDOW_UPDATE.
@@ -875,6 +877,14 @@ pub const H2Connection = struct {
 
                     stream_mod.freeDecodedHeaders(self.allocator, stream.request_headers);
                     stream.request_headers = dec.headers;
+                    if (self.recv_body_memory_resolver) |resolve| {
+                        if (self.recv_body_memory_context) |context| {
+                            const memory = resolve(context, dec.headers);
+                            stream.data_allocator = memory.allocator;
+                            stream.data_budget = memory.budget;
+                            stream.max_data_size = memory.max_bytes;
+                        }
+                    }
 
                     if (!self.is_server) {
                         if (stream.max_error_data_size) |limit| error_limit: {
@@ -998,7 +1008,7 @@ pub const H2Connection = struct {
                         return;
                     }
                 }
-                const budget = self.recv_data_budget;
+                const budget = if (self.recv_body_memory_resolver != null) stream.data_budget else self.recv_data_budget;
                 if (budget) |shared| {
                     if (!shared.tryReserve(data_payload.len)) {
                         stream.stream_error = error.BodyCapacityExceeded;
@@ -1008,9 +1018,13 @@ pub const H2Connection = struct {
                         return;
                     }
                 }
-                stream.data_buf.appendSlice(self.allocator, data_payload) catch |err| {
+                stream.data_buf.appendSlice(stream.data_allocator orelse self.allocator, data_payload) catch |err| {
                     if (budget) |shared| shared.release(data_payload.len);
-                    return err;
+                    stream.stream_error = err;
+                    stream.completed = true;
+                    if (stream.data_event) |ev| ev.set(self.io);
+                    stream.completion_event.set(self.io);
+                    return;
                 };
                 if (budget) |shared| {
                     stream.data_budget = shared;
@@ -1097,7 +1111,7 @@ pub const H2Connection = struct {
                         // A server handler already waiting on this body can
                         // translate aggregate ingress exhaustion into a 429
                         // response, then reset the still-open remote half.
-                        const is_body_capacity = if (stream.stream_error) |err| err == error.BodyCapacityExceeded else false;
+                        const is_body_capacity = if (stream.stream_error) |err| err == error.BodyCapacityExceeded or err == error.OutOfMemory else false;
                         if (!(is_body_capacity and stream.data_event != null)) {
                             const code: Http2ErrorCode = if (is_body_capacity)
                                 .enhance_your_calm
@@ -1160,7 +1174,7 @@ pub const H2Connection = struct {
                 if (sf.header.frame_type == .data) {
                     if (self.stream_manager.getStream(sf.header.stream_id)) |stream| {
                         if (stream.stream_error != null) {
-                            const is_body_capacity = if (stream.stream_error) |err| err == error.BodyCapacityExceeded else false;
+                            const is_body_capacity = if (stream.stream_error) |err| err == error.BodyCapacityExceeded or err == error.OutOfMemory else false;
                             if (!(is_body_capacity and stream.data_event != null)) {
                                 const code: Http2ErrorCode = if (is_body_capacity)
                                     .enhance_your_calm

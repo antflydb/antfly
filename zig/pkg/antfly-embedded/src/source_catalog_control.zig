@@ -64,6 +64,7 @@ pub const capi_types = @import("capi/types.zig");
 pub const chunking_mod = @import("chunking/mod.zig");
 pub const chunking_types = @import("chunking/types.zig");
 pub const common_byte_copy = @import("common/byte_copy.zig");
+pub const common_bounded_admission = @import("common/bounded_admission.zig");
 pub const common_config = @import("common/config.zig");
 pub const common_credential_safety = @import("common/credential_safety.zig");
 pub const common_credential_source_identity = @import("common/credential_source_identity.zig");

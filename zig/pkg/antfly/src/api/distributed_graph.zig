@@ -1504,8 +1504,8 @@ const GraphExpandFanoutSlot = struct {
     result: ?GraphExpandResponse = null,
     err: ?anyerror = null,
 
-    fn init() GraphExpandFanoutSlot {
-        return .{ .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator) };
+    fn init(alloc: std.mem.Allocator) GraphExpandFanoutSlot {
+        return .{ .arena = std.heap.ArenaAllocator.init(alloc) };
     }
 
     pub fn deinit(self: *GraphExpandFanoutSlot) void {
@@ -1519,8 +1519,8 @@ const GraphHydrateFanoutSlot = struct {
     result: ?GraphHydrateResponse = null,
     err: ?anyerror = null,
 
-    fn init() GraphHydrateFanoutSlot {
-        return .{ .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator) };
+    fn init(alloc: std.mem.Allocator) GraphHydrateFanoutSlot {
+        return .{ .arena = std.heap.ArenaAllocator.init(alloc) };
     }
 
     pub fn deinit(self: *GraphHydrateFanoutSlot) void {
@@ -1534,8 +1534,8 @@ const GraphEdgesFanoutSlot = struct {
     result: ?GraphEdgesResponse = null,
     err: ?anyerror = null,
 
-    fn init() GraphEdgesFanoutSlot {
-        return .{ .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator) };
+    fn init(alloc: std.mem.Allocator) GraphEdgesFanoutSlot {
+        return .{ .arena = std.heap.ArenaAllocator.init(alloc) };
     }
 
     pub fn deinit(self: *GraphEdgesFanoutSlot) void {
@@ -2984,12 +2984,15 @@ const DistributedEdgeReader = struct {
 
         if (fanout_io) |io| {
             if (plan.parallel) {
+                var fanout_memory: @import("../common/fanout_memory.zig").FanoutMemory = undefined;
+                fanout_memory.init(a, io, 64 << 20);
+                defer fanout_memory.deinit();
                 const slots = try a.alloc(GraphEdgesFanoutSlot, plan.width);
                 defer {
                     for (slots) |*slot| slot.deinit();
                     a.free(slots);
                 }
-                for (slots) |*slot| slot.* = .init();
+                for (slots) |*slot| slot.* = .init(fanout_memory.allocator());
 
                 const Fiber = struct {
                     fn run(
@@ -3104,7 +3107,7 @@ const DistributedEdgeReader = struct {
                     }
                     for (slots[0..wave_len]) |*slot| {
                         slot.deinit();
-                        slot.* = .init();
+                        slot.* = .init(fanout_memory.allocator());
                     }
                 }
                 return try edges.toOwnedSlice(a);
@@ -4529,8 +4532,12 @@ fn executeDistributedTraverse(
                         break;
                     }
                 }
+                var fanout_memory: @import("../common/fanout_memory.zig").FanoutMemory = undefined;
+                fanout_memory.init(alloc, io, 64 << 20);
+                defer fanout_memory.deinit();
                 const slots = try executeGraphExpandBatchesParallel(
                     alloc,
+                    fanout_memory.allocator(),
                     io,
                     graph_fanout_plan.width,
                     worker,
@@ -7056,10 +7063,10 @@ fn collectGraphExpandBatchEntries(
     return entries;
 }
 
-fn initGraphExpandFanoutSlots(alloc: std.mem.Allocator, count: usize) ![]GraphExpandFanoutSlot {
+fn initGraphExpandFanoutSlots(alloc: std.mem.Allocator, worker_alloc: std.mem.Allocator, count: usize) ![]GraphExpandFanoutSlot {
     const slots = try alloc.alloc(GraphExpandFanoutSlot, count);
     errdefer alloc.free(slots);
-    for (slots) |*slot| slot.* = .init();
+    for (slots) |*slot| slot.* = .init(worker_alloc);
     return slots;
 }
 
@@ -7070,6 +7077,7 @@ fn deinitGraphExpandFanoutSlots(alloc: std.mem.Allocator, slots: []GraphExpandFa
 
 fn executeGraphExpandBatchesParallel(
     alloc: std.mem.Allocator,
+    worker_alloc: std.mem.Allocator,
     io: std.Io,
     width: usize,
     worker: Worker,
@@ -7084,7 +7092,7 @@ fn executeGraphExpandBatchesParallel(
     allow_legacy_wire_fallback: bool,
     consistency: raft_mod.ReadConsistency,
 ) ![]GraphExpandFanoutSlot {
-    const slots = try initGraphExpandFanoutSlots(alloc, entries.len);
+    const slots = try initGraphExpandFanoutSlots(alloc, worker_alloc, entries.len);
     errdefer deinitGraphExpandFanoutSlots(alloc, slots);
 
     const Fiber = struct {
@@ -7543,12 +7551,15 @@ fn hydrateHitsForKeys(
             entry_index += 1;
         }
 
+        var fanout_memory: @import("../common/fanout_memory.zig").FanoutMemory = undefined;
+        fanout_memory.init(alloc, io, 64 << 20);
+        defer fanout_memory.deinit();
         const slots = try alloc.alloc(GraphHydrateFanoutSlot, entries.len);
         defer {
             for (slots) |*slot| slot.deinit();
             alloc.free(slots);
         }
-        for (slots) |*slot| slot.* = .init();
+        for (slots) |*slot| slot.* = .init(fanout_memory.allocator());
 
         const Fiber = struct {
             fn run(

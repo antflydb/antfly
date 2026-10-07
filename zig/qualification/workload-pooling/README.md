@@ -51,6 +51,26 @@ Fixture failures produce a failed receipt. Credentials and raw pgwire error
 messages are excluded. It covers retained cursors; extended-protocol prepared
 portals and slow-consumer overload still require their own performance profiles.
 
+`linux-combined-pressure.json` retains 32 authenticated pgwire peers, eight
+cursors across COMMIT, 32 HTTP keep-alive peers and eight unfinished 4 MiB
+uploads throughout the open-loop phases. The mixed phases also include slow
+response readers and existing-row writes. The profile keeps the original
+latency, throughput, RSS, descriptor and recovery gates, requires measured
+waiting, and compares three rotated repetitions against main and fail-fast.
+Setup rejects cursor errors; verification rejects closed upload sockets,
+reconnected HTTP peers or missing cursor rows. All retained clients close before
+descriptor recovery is sampled. Declared upload bytes describe the offered
+pressure; they are not a claim about actual allocator capacity or total RSS.
+
+Linux default startup also initializes the optional local ChatGPT credential
+store. Zig's non-iterable Linux directory handles use `O_PATH`, which cannot be
+used with `fchmod`. The candidate opens an iterable handle before enforcing
+`0700`. When an older baseline needs the same fix, CI applies
+`baseline-linux-startup.patch` and retains the applied diff alongside its build
+artifacts. Such results compare against patched main; the patch does not change
+pooling policy or performance thresholds. Original startup failures are retained
+and cannot be interpreted as latency or throughput measurements.
+
 ## Resource ledger and operator controls
 
 [RESOURCE_OWNERSHIP.md](RESOURCE_OWNERSHIP.md) records nested versus independent

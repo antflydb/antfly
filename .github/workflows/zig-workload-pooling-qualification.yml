@@ -57,14 +57,32 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: ${{ steps.toolchain.outputs.python_build }}
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
       - name: Build and test candidate
         working-directory: zig
         run: |
-          zig build antfly antfly-workload-pooling-test shared-signal-stack-test resource-budget-test antfly-storage-owner-test \
+          zig build antfly antfly-workload-pooling-test lib-httpx-protected-dispatch-test antfly-api-connections-test \
+            shared-signal-stack-test resource-budget-test antfly-storage-owner-test \
             '-Dstorage-owner-test-filter=opaque storage context enforces owner lifetime and shares process storage state' \
             -Dtarget=x86_64-linux-gnu -Dcpu=baseline -Doptimize=ReleaseSafe -Dstrip=true -j1 \
             --maxrss "$ANTFLY_ZIG_MAX_RSS" --cache-dir "$RUNNER_TEMP/pooling-candidate-cache" \
             --prefix ../qualification-bin/candidate 2>&1 | tee ../qualification-bin/candidate-build.log
+          zig build antfly-data-runtime-test \
+            '-Dtest-filter=data raft forwarding progresses while the control executor is saturated' \
+            -Dtarget=x86_64-linux-gnu -Dcpu=baseline -Doptimize=ReleaseSafe -Dstrip=true -j1 \
+            --maxrss "$ANTFLY_ZIG_MAX_RSS" --cache-dir "$RUNNER_TEMP/pooling-candidate-cache" \
+            2>&1 | tee ../qualification-bin/candidate-forwarding-tests.log
+          zig build pgwire-test \
+            -Dtarget=x86_64-linux-gnu -Dcpu=baseline -Doptimize=ReleaseSafe -Dstrip=false -j1 \
+            --maxrss "$ANTFLY_ZIG_MAX_RSS" --cache-dir "$RUNNER_TEMP/pooling-candidate-cache" \
+            2>&1 | tee ../qualification-bin/candidate-pgwire-tests.log
+          # Nix Zig 0.17 ARM64 crashes compiling this stripped test partition;
+          # keep test diagnostics while leaving performance binaries stripped.
+          zig build antfly-api-auth-test \
+            '-Dtest-filter=chatgpt manager persists host identity and partitions personal registrations' \
+            -Dtarget=x86_64-linux-gnu -Dcpu=baseline -Doptimize=ReleaseSafe -Dstrip=false -j1 \
+            --maxrss "$ANTFLY_ZIG_MAX_RSS" --cache-dir "$RUNNER_TEMP/pooling-candidate-cache" \
+            2>&1 | tee ../qualification-bin/candidate-credential-permission-tests.log
       - name: Build baseline
         env:
           BASELINE_REF: ${{ inputs.baseline_ref }}
@@ -72,6 +90,14 @@ jobs:
           git fetch --no-tags origin "$BASELINE_REF"
           git worktree add --detach /tmp/antfly-pooling-baseline FETCH_HEAD
           git -C /tmp/antfly-pooling-baseline submodule update --init --recursive
+          # Older main opens the credential directory with O_PATH, then calls
+          # fchmod. Apply the same startup fix as the candidate and retain it.
+          startup_patch="$GITHUB_WORKSPACE/zig/qualification/workload-pooling/baseline-linux-startup.patch"
+          if git -C /tmp/antfly-pooling-baseline apply --check "$startup_patch"; then
+            git -C /tmp/antfly-pooling-baseline apply "$startup_patch"
+            git -C /tmp/antfly-pooling-baseline diff -- zig/pkg/antfly-embedded/src/chatgpt/manager.zig \
+              > qualification-bin/baseline-linux-startup.patch
+          fi
           git rev-parse HEAD > qualification-bin/candidate/revision.txt
           git -C /tmp/antfly-pooling-baseline rev-parse HEAD > qualification-bin/baseline-revision.txt
           cd /tmp/antfly-pooling-baseline/zig
@@ -110,6 +136,7 @@ jobs:
             --manifest zig/qualification/workload-pooling/linux-small.json \
             --manifest zig/qualification/workload-pooling/linux-mixed-load.json \
             --manifest zig/qualification/workload-pooling/linux-waiting-pressure.json \
+            --manifest zig/qualification/workload-pooling/linux-combined-pressure.json \
             --repetitions 3 \
             --output-dir qualification-receipts/small
       - name: Qualify larger Linux envelope

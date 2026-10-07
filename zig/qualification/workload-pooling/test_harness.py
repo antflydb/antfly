@@ -14,9 +14,44 @@ from load_clients import (
     waiting_evidence_failures,
 )
 from run_matrix import variant_order
+from pressure_clients import PressureClients
 
 
 class QualificationTests(unittest.TestCase):
+    def test_retained_pressure_rejects_disconnected_upload_and_closes_on_failure(self):
+        import socket
+        import urllib.parse
+
+        pressure = PressureClients(
+            urllib.parse.urlsplit("http://127.0.0.1:8080/db/v1/status"),
+            5432,
+            dict(
+                fixture_rows=2,
+                retained_pressure=dict(slow_uploads=1, upload_bytes=4096),
+            ),
+        )
+        upload, remote = socket.socketpair()
+        pressure.uploads.append(upload)
+        remote.close()
+        try:
+            with self.assertRaisesRegex(RuntimeError, "rejected or closed"):
+                pressure.verify()
+        finally:
+            pressure.close()
+        self.assertEqual(-1, upload.fileno())
+        self.assertEqual([], pressure.uploads)
+
+    def test_retained_pressure_rejects_impossible_cursor_and_body_ownership(self):
+        for config in (
+            dict(held_cursors=2, pgwire_connections=1),
+            dict(slow_uploads=1, upload_bytes=1),
+            dict(http_connections=-1),
+        ):
+            with self.assertRaises(ValueError):
+                PressureClients(
+                    None, 5432, dict(fixture_rows=2, retained_pressure=config)
+                )
+
     def test_pressure_profile_requires_measured_waiting(self):
         for diagnostics in (None, {}, {"wait_completed_total": 0}):
             self.assertEqual(

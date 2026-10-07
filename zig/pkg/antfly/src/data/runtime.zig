@@ -5807,10 +5807,14 @@ pub const DataServer = struct {
     /// executor lanes and may be shared by every httpx listener in this role.
     http_observer_lease: ?backend_runtime_mod.BackendRuntime.WorkerLease = null,
     owned_http_runtime: ?*httpx.HttpRuntime = null,
+    owned_http_runtime_allocator: ?std.mem.Allocator = null,
     listener_cfg: antfly.raft.transport.std_http_listener.StdHttpListenerConfig,
     listener: ?*DataPublicHttpRuntime = null,
     query_io_impl: ?std.Io.Threaded = null,
     distributed_read_http_executor: ?*antfly.common.http.IoHttpExecutor = null,
+    distributed_read_http_mutex: std.atomic.Mutex = .unlocked,
+    outbound_memory: ?*@import("../common/allocation_budget.zig").ServiceMemory = null,
+    outbound_memory_mutex: std.atomic.Mutex = .unlocked,
     raft_forward_http_executor: ?*antfly.common.http.IoHttpExecutor = null,
     raft_forward_http_mutex: std.atomic.Mutex = .unlocked,
     lsm_maintenance_mutex: std.atomic.Mutex = .unlocked,
@@ -6871,6 +6875,7 @@ pub const DataServer = struct {
             .reserve_fn = reserveApiMemory,
             .release_fn = releaseApiMemory,
         };
+        _ = try self.ensureOutboundMemory();
         self.http_server = try antfly.public_api.ApiHttpServer.initWithConfig(
             self.alloc,
             api_server_cfg,
@@ -6886,6 +6891,19 @@ pub const DataServer = struct {
         const ttl_port: server_coordinated_ttl.Port = .{ .ptr = self, .expire_fn = expireRelationalRows };
         _ = self.write_source.withCoordinatedTtl(ttl_port);
         if (self.data_raft_apply) |apply_sm| _ = apply_sm.write_source.withCoordinatedTtl(ttl_port);
+    }
+
+    fn ensureOutboundMemory(self: *DataServer) !*@import("../common/allocation_budget.zig").ServiceMemory {
+        platform_sync.lockYielding(&self.outbound_memory_mutex);
+        defer self.outbound_memory_mutex.unlock();
+        if (self.outbound_memory) |memory| return memory;
+        if (comptime linked_storage) _ = try self.ensureKernelOwnerSource();
+        const Memory = @import("../common/allocation_budget.zig").ServiceMemory;
+        const memory = try self.alloc.create(Memory);
+        errdefer self.alloc.destroy(memory);
+        memory.* = try Memory.init(self.alloc, .{ .ptr = self, .reserve_fn = reserveApiMemory, .release_fn = releaseApiMemory }, @min(64 << 20, self.api_server_cfg.retained_memory_bytes / 4), @min(4 << 20, self.api_server_cfg.request_memory_bytes / 8));
+        self.outbound_memory = memory;
+        return memory;
     }
 
     fn reserveApiMemory(ptr: *anyopaque, bytes: usize) callconv(.c) bool {
@@ -9404,7 +9422,11 @@ pub const DataServer = struct {
         self.provisioned_index_repair_shutdown.store(true, .release);
         self.lsm_maintenance_stop.store(true, .release);
         self.lsm_maintenance_wake.store(true, .release);
-        if (self.distributed_read_http_executor) |executor| executor.beginShutdown();
+        {
+            platform_sync.lockYielding(&self.distributed_read_http_mutex);
+            defer self.distributed_read_http_mutex.unlock();
+            if (self.distributed_read_http_executor) |executor| executor.beginShutdown();
+        }
         {
             platform_sync.lockYielding(&self.raft_forward_http_mutex);
             defer self.raft_forward_http_mutex.unlock();
@@ -9441,8 +9463,9 @@ pub const DataServer = struct {
         self.listener = null;
         if (self.owned_http_runtime) |http_runtime| {
             http_runtime.deinit();
-            self.alloc.destroy(http_runtime);
+            (self.owned_http_runtime_allocator orelse self.alloc).destroy(http_runtime);
             self.owned_http_runtime = null;
+            self.owned_http_runtime_allocator = null;
         }
         if (self.http_observer_lease) |*lease| lease.release();
         self.http_observer_lease = null;
@@ -9576,6 +9599,25 @@ pub const DataServer = struct {
         self.store_report_publisher.deinit(self.alloc);
         self.store_status_heartbeat_cache.clear(self.alloc);
         if (self.restore_terminal_ledger) |*ledger| ledger.deinit();
+        // Service allocators borrow the node manager. Retire every client and
+        // stream before unpinning control bytes or destroying that manager.
+        if (self.raft_forward_http_executor) |executor| {
+            const allocator = executor.alloc;
+            executor.deinit();
+            allocator.destroy(executor);
+            self.raft_forward_http_executor = null;
+        }
+        if (self.distributed_read_http_executor) |executor| {
+            const allocator = executor.alloc;
+            executor.deinit();
+            allocator.destroy(executor);
+            self.distributed_read_http_executor = null;
+        }
+        if (self.outbound_memory) |memory| {
+            memory.deinit();
+            self.alloc.destroy(memory);
+            self.outbound_memory = null;
+        }
         self.provisioned_storage.deinit();
         // Any explicitly constructed owner belongs to DataServer, independent
         // of the compiler unit's storage boundary. Native reconciliation does
@@ -9601,16 +9643,6 @@ pub const DataServer = struct {
         if (self.remote_metadata) |remote_metadata| {
             remote_metadata.deinit();
             self.alloc.destroy(remote_metadata);
-        }
-        if (self.raft_forward_http_executor) |executor| {
-            executor.deinit();
-            self.alloc.destroy(executor);
-            self.raft_forward_http_executor = null;
-        }
-        if (self.distributed_read_http_executor) |executor| {
-            executor.deinit();
-            self.alloc.destroy(executor);
-            self.distributed_read_http_executor = null;
         }
         self.graph_cleanup_sweep.deinit();
         self.initial_fk_retirement_recovery_cursor.deinit();
@@ -9639,9 +9671,10 @@ pub const DataServer = struct {
 
     fn ensureHttpRuntime(self: *DataServer) !*httpx.HttpRuntime {
         if (self.owned_http_runtime) |runtime| return runtime;
-        const runtime = try self.alloc.create(httpx.HttpRuntime);
-        errdefer self.alloc.destroy(runtime);
         const listener_config = if (self.http_server) |*api| api.configurePublicHttpTransport(publicApiHttpxConfig(self.listener_cfg, null)) else publicApiHttpxConfig(self.listener_cfg, null);
+        const allocator = listener_config.transport_allocator orelse self.alloc;
+        const runtime = try allocator.create(httpx.HttpRuntime);
+        errdefer allocator.destroy(runtime);
         const borrowed_io: ?httpx.HttpRuntime.BorrowedIo = if (self.backend_runtime) |backend_runtime|
             if (backend_runtime.usesBorrowedIo()) .{
                 .listener = backend_runtime.controlIo() orelse backend_runtime.apiIo() orelse return error.BackendRuntimeUnavailable,
@@ -9652,7 +9685,7 @@ pub const DataServer = struct {
             null;
         var observer_lease = try (try self.ensureBackendRuntime()).acquireWorkers(.{});
         errdefer observer_lease.release();
-        runtime.* = httpx.HttpRuntime.init(self.alloc, .{
+        runtime.* = httpx.HttpRuntime.init(allocator, .{
             .observer_io = observer_lease.io(),
             .max_active_h1_requests = listener_config.max_connections,
             .max_active_connections = @as(usize, listener_config.max_connections) +| health_metrics.max_connections,
@@ -9661,6 +9694,7 @@ pub const DataServer = struct {
         });
         self.http_observer_lease = observer_lease;
         self.owned_http_runtime = runtime;
+        self.owned_http_runtime_allocator = allocator;
         return runtime;
     }
 
@@ -12607,8 +12641,9 @@ pub const DataServer = struct {
         defer self.raft_forward_http_mutex.unlock();
         if (self.background_jobs_shutdown.load(.acquire)) return error.Canceled;
         if (self.raft_forward_http_executor == null) {
-            const executor = try self.alloc.create(antfly.common.http.IoHttpExecutor);
-            executor.* = antfly.common.http.IoHttpExecutor.init(self.alloc, io, .{});
+            const allocator = (try self.ensureOutboundMemory()).memory.allocator(true);
+            const executor = try allocator.create(antfly.common.http.IoHttpExecutor);
+            executor.* = antfly.common.http.IoHttpExecutor.init(allocator, io, .{});
             self.raft_forward_http_executor = executor;
         }
         const executor = self.raft_forward_http_executor.?;
@@ -12617,6 +12652,9 @@ pub const DataServer = struct {
     }
 
     fn distributedReadExecutor(self: *DataServer) !antfly.common.http.RequestExecutor {
+        platform_sync.lockYielding(&self.distributed_read_http_mutex);
+        defer self.distributed_read_http_mutex.unlock();
+        if (self.background_jobs_shutdown.load(.acquire)) return error.Canceled;
         if (self.distributed_read_http_executor == null) {
             const runtime = self.backend_runtime orelse return error.BackendRuntimeUnavailable;
             var lane = runtime.acquireRequestForwardLane() catch |err| switch (err) {
@@ -12624,13 +12662,14 @@ pub const DataServer = struct {
                 else => return err,
             };
             defer lane.release();
-            const executor = try self.alloc.create(antfly.common.http.IoHttpExecutor);
+            const allocator = (try self.ensureOutboundMemory()).memory.allocator(false);
+            const executor = try allocator.create(antfly.common.http.IoHttpExecutor);
             // Query/API workers synchronously await these requests. The HTTP
             // client needs nested request/connect/socket watchdog tasks, so it
             // must not compete with callers on the API lane. Reuse the bounded
             // forwarding lane and one keep-alive client; reserve the complete
             // task graph for each request below, before any bytes are sent.
-            executor.* = antfly.common.http.IoHttpExecutor.init(self.alloc, lane.io(), .{ .keep_alive = true });
+            executor.* = antfly.common.http.IoHttpExecutor.init(allocator, lane.io(), .{ .keep_alive = true });
             self.distributed_read_http_executor = executor;
         }
         return .{
@@ -34747,7 +34786,7 @@ fn consumerTests() type {
                     antfly.public_api.table_catalog.emptyCatalogSource(),
                 ),
                 .status_source = undefined,
-                .api_server_cfg = undefined,
+                .api_server_cfg = .{},
                 .query_async_limit = .nothing,
                 .listener_cfg = undefined,
             };
@@ -34803,6 +34842,13 @@ fn consumerTests() type {
             try std.testing.expect(server.raft_forward_http_executor != server.distributed_read_http_executor);
             var foreign_vtable = forward_lane.io().vtable.*;
             try std.testing.expectError(error.ForwardTransportAuthorityChanged, server.raftForwardTransport(.{ .userdata = forward_lane.io().userdata, .vtable = &foreign_vtable }));
+            // Reusable read-client allocations share the node ledger, but
+            // cannot consume the already-pinned forwarding-client heap.
+            const service_memory = server.outbound_memory.?;
+            var read_pressure = service_memory.memory.foreground.limit - service_memory.memory.foreground.stats().used_bytes;
+            try std.testing.expect(service_memory.memory.foreground.reserve(read_pressure));
+            defer if (read_pressure != 0) service_memory.memory.foreground.release(read_pressure);
+            try std.testing.expectError(error.OutOfMemory, service_memory.memory.allocator(false).alloc(u8, 1));
             var client = antfly.public_api.ApiHttpClient.init(alloc, transport);
             var response = try client.fetchGroupBatchWithForwarding(
                 peer.baseUrl(),
@@ -34818,6 +34864,9 @@ fn consumerTests() type {
             try std.testing.expectEqualStrings("{\"inserted\":1}", response.body);
             try serving.await(std.testing.io);
             try std.testing.expectEqual(@as(usize, 1), peer.route_hits[0]);
+            try std.testing.expect(service_memory.memory.control.stats().peak_bytes > 0);
+            service_memory.memory.foreground.release(read_pressure);
+            read_pressure = 0;
 
             // Strong reads (including FK preflight) await peer lookups from
             // API workers. Fill that lane completely and prove the peer HTTP

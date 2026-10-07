@@ -12,6 +12,7 @@ import threading
 import time
 import urllib.parse
 from idle_clients import auth_headers, sample, seed_fixture, status
+from pressure_clients import PressureClients
 
 
 def percentile(values, p):
@@ -397,6 +398,7 @@ def main():
         "phases": [],
     }
     failures = []
+    pressure = None
     try:
         target = urllib.parse.urlsplit(args.status_url)
         seed_fixture(
@@ -419,6 +421,28 @@ def main():
                 failures.append("warm-up did not complete every operation successfully")
         status(args.status_url)
         receipt["baseline"] = sample(args.pid)
+        pressure = PressureClients(target, args.pgwire_port, manifest)
+        receipt["retained_pressure_setup"] = pressure.start()
+        if pressure.uploads and os.environ.get("ANTFLY_QUALIFICATION_POLICY") in (
+            "fixed",
+            "failfast",
+        ):
+            # Header ingress is asynchronous. Require real managed body heap
+            # ownership before timing; declared Content-Length alone is insufficient.
+            deadline = time.monotonic() + manifest["request_timeout_seconds"]
+            while True:
+                memory = workload_snapshot(target)["memory"]
+                if (
+                    memory["transport"]["used_bytes"]
+                    >= receipt["retained_pressure_setup"]["declared_upload_bytes"]
+                ):
+                    receipt["retained_pressure_memory_setup"] = memory
+                    break
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(
+                        "unfinished uploads did not retain the offered body heap"
+                    )
+                time.sleep(0.05)
         for phase in manifest["phases"]:
             measured = run_phase(target, phase, manifest, args.pid)
             receipt["phases"].append(measured)
@@ -474,6 +498,8 @@ def main():
             and os.environ.get("ANTFLY_QUALIFICATION_POLICY") == "fixed"
         ):
             receipt["operator_controls"] = verify_operator_controls(target)
+        receipt["retained_pressure_verified"] = pressure.verify()
+        pressure.close()
         time.sleep(manifest["recovery_seconds"])
         receipt["recovery"] = sample(args.pid)
         receipt["recovery_status_seconds"] = status(args.status_url)
@@ -487,6 +513,9 @@ def main():
     except Exception as error:
         # Exception types are useful; response messages may contain user data.
         failures.append("qualification failed: " + type(error).__name__)
+    finally:
+        if pressure is not None:
+            pressure.close()
     receipt.update(passed=not failures, failures=failures)
     args.output.write_text(json.dumps(receipt, indent=2) + "\n")
     print(json.dumps({"passed": receipt["passed"], "failures": failures}))

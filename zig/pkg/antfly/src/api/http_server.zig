@@ -3868,6 +3868,7 @@ pub const ApiHttpServer = struct {
     request_memory: ?*RequestMemory = null,
     control_memory_reserved: usize = 0,
     transport_memory: ?*@import("../common/allocation_budget.zig").Shared = null,
+    parser_memory: ?*@import("../common/allocation_budget.zig").Shared = null,
     transport_memory_reserved: usize = 0,
     cfg: ApiHttpServerConfig,
     query_admission: RequestAdmission,
@@ -4307,6 +4308,7 @@ pub const ApiHttpServer = struct {
         control: ?@import("../common/allocation_budget.zig").Shared.Stats,
         retained: ?@import("../common/allocation_budget.zig").Shared.Stats,
         transport: ?@import("../common/allocation_budget.zig").Shared.Stats,
+        parser: ?@import("../common/allocation_budget.zig").Shared.Stats,
     };
 
     pub fn workloadMemoryStats(self: *const ApiHttpServer) WorkloadMemoryStats {
@@ -4318,6 +4320,7 @@ pub const ApiHttpServer = struct {
             .control = if (self.request_memory) |m| m.control.stats() else null,
             .retained = if (self.state_memory) |m| m.stats() else null,
             .transport = if (self.transport_memory) |m| m.stats() else null,
+            .parser = if (self.parser_memory) |m| m.stats() else null,
         };
     }
 
@@ -4414,7 +4417,9 @@ pub const ApiHttpServer = struct {
     pub fn configurePublicHttpTransport(self: *const ApiHttpServer, config: httpx.ServerConfig) httpx.ServerConfig {
         var result = configurePublicHttpTransportForConfig(self.cfg, config);
         result.application_allocator = self.alloc;
-        result.transport_allocator = if (self.transport_memory) |memory| memory.allocator() else null;
+        result.transport_allocator = if (self.parser_memory) |memory| memory.allocator() else null;
+        result.request_body_allocator = if (self.transport_memory) |memory| memory.allocator() else null;
+        result.protected_request_body_allocator = result.transport_allocator;
         result.protected_application_allocator = @constCast(self).controlAllocator();
         return result;
     }
@@ -4634,10 +4639,15 @@ pub const ApiHttpServer = struct {
         errdefer if (!memory_transferred) alloc.destroy(memory);
         const control_bytes = @min(16 << 20, cfg.request_memory_bytes / 8);
         const transport_bytes = @min(64 << 20, cfg.request_memory_bytes);
+        const parser_bytes = @min(8 << 20, transport_bytes / 8);
         const transport_memory = try alloc.create(@import("../common/allocation_budget.zig").Shared);
         var transport_transferred = false;
         errdefer if (!transport_transferred) alloc.destroy(transport_memory);
-        transport_memory.* = .{ .child = backing, .limit = transport_bytes };
+        transport_memory.* = .{ .child = backing, .limit = transport_bytes - parser_bytes };
+        const parser_memory = try alloc.create(@import("../common/allocation_budget.zig").Shared);
+        var parser_transferred = false;
+        errdefer if (!parser_transferred) alloc.destroy(parser_memory);
+        parser_memory.* = .{ .child = backing, .limit = parser_bytes };
         var control_transferred = false;
         if (cfg.memory_accounting) |owner| if (!owner.reserve(control_bytes + transport_bytes)) return error.OutOfMemory;
         errdefer if (!control_transferred) {
@@ -4678,6 +4688,8 @@ pub const ApiHttpServer = struct {
         server.request_memory = memory;
         server.control_memory_reserved = if (cfg.memory_accounting != null) control_bytes else 0;
         server.transport_memory = transport_memory;
+        server.parser_memory = parser_memory;
+        parser_transferred = true;
         server.transport_memory_reserved = if (cfg.memory_accounting != null) transport_bytes else 0;
         transport_transferred = true;
         control_transferred = true;
@@ -4685,6 +4697,9 @@ pub const ApiHttpServer = struct {
         state_transferred = true;
         memory_transferred = true;
         errdefer server.deinit();
+        // Establish the control lane before foreground work can spend the
+        // shared worker envelope, including the default fail-fast policy.
+        if (cfg.backend_runtime != null) _ = try server.sqlControlIo();
         if (cfg.session_store_path) |path| {
             if (cfg.session_store != null) return error.InvalidApiServerConfig;
             const opened = try server.state_alloc.create(transactions_api.OpenedSessionStore);
@@ -4874,6 +4889,10 @@ pub const ApiHttpServer = struct {
         }
         if (self.cfg.memory_accounting) |owner| owner.release(self.control_memory_reserved);
         if (self.transport_memory) |memory| {
+            std.debug.assert(memory.used.load(.acquire) == 0);
+            self.owner_alloc.destroy(memory);
+        }
+        if (self.parser_memory) |memory| {
             std.debug.assert(memory.used.load(.acquire) == 0);
             self.owner_alloc.destroy(memory);
         }
@@ -56855,16 +56874,30 @@ fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *con
 /// Connection, upload and aggregate body ceilings remain authoritative.
 pub fn configurePublicHttpTransportForConfig(cfg: ApiHttpServerConfig, config: httpx.ServerConfig) httpx.ServerConfig {
     var result = config.normalized();
-    if (cfg.query_waiting.max_wait_ms == 0) return result;
-    result.max_request_tasks = @min(result.max_connections, result.max_request_tasks +| cfg.query_waiting.max_queued_requests +| 4);
-    // Reapply the user's stream ceiling after expanding task capacity. The
-    // first normalization may have clamped it to the old ordinary task count.
-    result.h2_max_concurrent_streams = config.h2_max_concurrent_streams;
+    if (cfg.query_waiting.max_wait_ms != 0) {
+        result.max_request_tasks = @min(result.max_connections, result.max_request_tasks +| cfg.query_waiting.max_queued_requests +| 4);
+        // Reapply the user's stream ceiling after expanding task capacity.
+        result.h2_max_concurrent_streams = config.h2_max_concurrent_streams;
+    }
     result.protected_request_tasks = 4;
     result.is_protected_request = protectedHttpRequest;
     result.is_protected_body_candidate = protectedSqlBodyCandidate;
     result.is_protected_body_request = protectedSqlBodyRequest;
     return result.normalized();
+}
+
+test "workload envelope fail-fast transport reserves controls within its task ceiling" {
+    const config: httpx.ServerConfig = .{ .max_connections = 16, .max_request_tasks = 8, .h2_max_concurrent_streams = 16 };
+    const failfast = configurePublicHttpTransportForConfig(.{}, config);
+    try std.testing.expectEqual(@as(u32, 8), failfast.max_request_tasks);
+    try std.testing.expectEqual(@as(u32, 4), failfast.protected_request_tasks);
+    try std.testing.expect(failfast.is_protected_request.?(.GET, "/db/v1/status"));
+    try std.testing.expect(!failfast.is_protected_request.?(.GET, "/db/v1/tables"));
+    try std.testing.expect(failfast.is_protected_body_request.?(.POST, "/db/v1/sql", "{\"statement\":\"ROLLBACK\"}"));
+    try std.testing.expect(!failfast.is_protected_body_request.?(.POST, "/db/v1/sql", "{\"statement\":\"SELECT 1\"}"));
+    const waiting = configurePublicHttpTransportForConfig(.{ .query_waiting = .{ .max_wait_ms = 250, .max_queued_requests = 4, .max_queued_bytes = 1 << 20 } }, config);
+    try std.testing.expectEqual(@as(u32, 16), waiting.max_request_tasks);
+    try std.testing.expectEqual(@as(u32, 4), waiting.protected_request_tasks);
 }
 
 pub fn isProtectedHttpControl(method: httpx.Method, target: []const u8, body: []const u8) bool {
@@ -56965,12 +56998,16 @@ test "workload envelope pins HTTP transport and control through node memory exha
     try std.testing.expectError(error.OutOfMemory, server.alloc.alloc(u8, 1));
     var transport = httpx.Server.initWithConfig(alloc, std.testing.io, server.configurePublicHttpTransport(.{}));
     defer transport.deinit();
+    const bulk_memory = server.transport_memory.?;
+    const bulk = try bulk_memory.allocator().alloc(u8, bulk_memory.limit);
+    defer bulk_memory.allocator().free(bulk);
+    try std.testing.expectError(error.OutOfMemory, transport.config.request_body_allocator.?.alloc(u8, 1));
     const raw = try transport.allocator.alloc(u8, 4096);
     defer transport.allocator.free(raw);
     const control = try server.controlAllocator().alloc(u8, 1024);
     defer server.alloc.free(control);
     try std.testing.expectError(error.OutOfMemory, transport.allocator.alloc(u8, server.transport_memory.?.limit + 1));
-    try std.testing.expect(server.workloadMemoryStats().transport.?.used_bytes >= raw.len);
+    try std.testing.expect(server.workloadMemoryStats().parser.?.used_bytes >= raw.len);
     try std.testing.expectEqual(@as(u64, 4 << 20), node.snapshot().memory.used_bytes);
 }
 
