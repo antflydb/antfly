@@ -40,14 +40,19 @@ test: ## Run the default Zig test aggregate with bounded scheduler memory.
 # policy in the checked-out command so the PR can validate them before merge.
 unit-test: ## Run the existing repository unit gate across libraries, Antfly, and inference.
 	@unit_cache_flags=; \
-	if [ "$${CI:-}" = true ] && [ "$$(uname -s)" = Linux ] && [ "$${ZIG_LOCAL_CACHE_DIR##*/}" = zig-local ]; then \
+	build_args=($(ZIG_BUILD_FLAGS)); \
+	unit_cache_dir="$${ZIG_LOCAL_CACHE_DIR:-}"; \
+	for ((i=0; i<$${#build_args[@]}; i++)); do \
+		if [ "$${build_args[i]}" = --cache-dir ]; then unit_cache_dir="$${build_args[i+1]:-}"; fi; \
+	done; \
+	if [ "$${CI:-}" = true ] && [ "$$(uname -s)" = Linux ] && [ "$${unit_cache_dir##*/}" = zig-local ]; then \
 		unit_cache_flags=-Dunit-test-cache-release=true; \
 	fi; \
-	ANTFLY_TEST_TIMINGS="$${ANTFLY_TEST_TIMINGS:-$${CI:+1}}" python3 tools/run_bounded_zig_build.py --zig "$(ZIG)" -- build unit-test $$unit_cache_flags $(ZIG_BUILD_FLAGS); \
+	ANTFLY_TEST_TIMINGS="$${ANTFLY_TEST_TIMINGS:-$${CI:+1}}" python3 tools/run_bounded_zig_build.py --zig "$(ZIG)" -- build unit-test $$unit_cache_flags "$${build_args[@]}"; \
 	unit_status=$$?; \
 	if [ -n "$$unit_cache_flags" ]; then \
-		python3 tools/report_test_cache.py "$$ZIG_LOCAL_CACHE_DIR" || true; \
-		python3 tools/prune_completed_test_cache.py --release-phase "$$ZIG_LOCAL_CACHE_DIR" || unit_status=$$?; \
+		python3 tools/report_test_cache.py "$$unit_cache_dir" || true; \
+		python3 tools/prune_completed_test_cache.py --release-phase "$$unit_cache_dir" || unit_status=$$?; \
 	fi; \
 	exit $$unit_status
 

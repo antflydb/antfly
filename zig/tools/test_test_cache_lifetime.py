@@ -157,6 +157,41 @@ pub fn build(b: *std.Build) void {
                 self.assertIn("Released completed phase compiler cache", output)
                 self.assertEqual(list(cache.iterdir()), [])
 
+            # An explicit Zig cache override wins over the environment. Retire
+            # that cache and leave the unrelated environment cache untouched.
+            (root / "library.zig").write_text(
+                "export fn library_probe() u32 { return 42; }\n"
+            )
+            sentinel = cache / "unrelated-cache-entry"
+            sentinel.write_text("preserve")
+            override = root / "cache with spaces" / "zig-local"
+            result = subprocess.run(
+                [
+                    "make",
+                    "unit-test",
+                    f'ZIG_BUILD_FLAGS=--cache-dir "{override}" --maxrss 2147483648 -j2',
+                ],
+                cwd=root,
+                env=environment,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            output = result.stdout + result.stderr
+            self.assertEqual(result.returncode, 0, output)
+            self.assertIn("Released completed phase compiler cache", output)
+            self.assertEqual(list(override.iterdir()), [])
+            self.assertEqual(sentinel.read_text(), "preserve")
+            result = subprocess.run(
+                ["zig", "build", "unit-test", "--cache-dir", str(override)],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(len(list(override.glob("o/*/shared-probe"))), 1)
+
 
 if __name__ == "__main__":
     unittest.main()
