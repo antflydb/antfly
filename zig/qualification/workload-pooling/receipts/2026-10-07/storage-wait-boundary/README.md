@@ -47,3 +47,7 @@ The next integration must propagate request-local wait authority to exact sleep,
 event or socket waits, retain CPU capacity for preparation/decoding, reacquire and
 validate before consuming results, and preserve original deadlines and read-index
 request identity. Accepted durable work keeps its existing completion owner.
+
+The repository commit hook reformatted the qualifier. Both complete qualifiers
+were rerun after that change; the adjacent receipts match the committed runner
+and all eight other sources exactly.
