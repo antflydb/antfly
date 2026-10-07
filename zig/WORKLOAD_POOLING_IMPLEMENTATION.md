@@ -1016,3 +1016,15 @@ required fixture names/counts, zero exits and no skips/leaks. The
 preserves commands, compiler/image hashes and complete build/runtime logs.
 Complete production qualification of the write snapshot and broader scheduler
 ownership/default rollout remain pending.
+
+### Complete GNU write-integration production build (2026-10-07)
+
+Frozen source `2cf1393dfc` completes all 53 GNU AArch64 production build steps,
+including all seven native archives and the installed CLI. The pinned Nix/glibc
+compiler used an explicit 26 GiB compile scheduling allowance on the unchanged
+23.43 GiB Docker VM; this is not default-budget qualification. The exact ELF
+also passes `--help` under two CPUs and 2 GiB with no extra swap. The
+[production receipt](qualification/workload-pooling/receipts/2026-10-07/write-runnable/README.md)
+records complete output and source/compiler/artifact hashes. Full service
+pressure, the newer isolated provider/shared-owner candidate, and native
+post-write whole production qualification remain pending.

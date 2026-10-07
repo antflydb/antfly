@@ -66,3 +66,18 @@ script was therefore rerun against the same artifacts under the unchanged
 and `linux-runtime.log.gz` records that terminal run. The separate
 [compiler claim receipt](compiler-claims/README.md) records the measured routed
 implementation reservation and five profile/graph checks on both platforms.
+
+## Complete GNU production build
+
+The frozen `2cf1393dfc` snapshot builds all seven native production archives and
+the installed GNU AArch64 CLI: all 53 build steps pass. `linux-production.json`
+pins the source commit/tree, critical source bytes, compiler image and installed
+ELF hash; `linux-production.log.gz` retains the complete compiler output. This
+run used an explicit 26 GiB compile scheduling allowance on the unchanged
+23.43 GiB physical Docker VM. It is not a passing default-budget claim.
+
+The exact installed CLI also passes `--help` under an enforced two-CPU, 2 GiB
+cgroup with zero swap allowance; `linux-production-help.log.gz` retains output.
+This is a startup smoke check, not live-service load or default qualification.
+The provider/shared-owner candidate is not part of this snapshot, and native
+full production evidence remains pinned to the earlier pre-write snapshot.
