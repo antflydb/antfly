@@ -908,3 +908,31 @@ preserves matching post-format source hashes, owner artifact hashes and complete
 commands/logs. The explicit embedded boundary covers 738 sources. Actual storage
 wait propagation, parallel children and wider workload integration remain required;
 this interface does not by itself release capacity in those backends.
+
+
+Request-local SQL scan waits now reach the DataServer read-index barrier through
+the checked callback interface. Only actual owner-lock and quorum/apply polling
+sleeps relinquish runnable ownership. Registration and retries retain one stable
+request context; failed resumption cancels its tracker registration through the
+original cleanup owner. Scheduled group admission remains serial, and long-lived
+retained remote cursors clear the borrowed callback before opening physical
+views. Dynamic snapshot bootstrap and other storage/RPC waits remain pending.
+
+All 269 embedded SQL, 118 coordinator SQL and 13 read-gate contracts pass on both
+macOS and pinned Nix/glibc GNU AArch64. The six controlled event-wait schedules
+prove cancellation, expiry, shutdown, I/O failure and authority failure without
+stranding slots or metadata. They do not prove real DataServer quorum/apply delay.
+The actual owner-lock regression and retained-owner poison-callback regression
+are undergoing separate Linux verification. Three checked callback and all 25
+error ABI tests also pass on both platforms with exact updated catalog hashes.
+The [read-index receipt](qualification/workload-pooling/receipts/2026-10-07/read-index-waits/README.md)
+preserves initial and corrected snapshot manifests and complete logs.
+
+Whole native CLI qualification found a missing generated read-fence export in
+the control catalog and a scheduler field passed to an unsupported serverless
+bootstrap. The export is regenerated; serverless explicitly rejects that opt-in
+policy while its execution owner awaits integration. The initial distributed
+runtime archive compiled successfully with the new wait hooks, but the complete
+CLI failed on those two configuration issues. Complete corrected production
+qualification remains pending. The Linux SQL compiler reservation reflects its
+observed 2.31 GB peak; executor runtime limits remain unchanged.

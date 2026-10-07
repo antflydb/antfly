@@ -871,6 +871,7 @@ pub const Adapter = struct {
         };
         scan_request.opts.execution_deadline_ns = (try self.context.platformDeadline()).deadline_ns;
         scan_request.opts.cancellation = self.context.cancellation;
+        if (self.read_guard != null and self.runnable != null) scan_request.opts.execution_wait = .{ .ptr = self, .begin = spillWaitBegin, .end = spillWaitEnd };
         scan_request.opts.row_policy_principal_proof = (try self.rowPolicyProof(alloc, table)) orelse "";
         scan_request.opts.row_policy_database = (table.scope orelse return error.InvalidSqlBackendResponse).database;
         if (request.primary_key != null) {

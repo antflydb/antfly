@@ -87,7 +87,7 @@ test "execution wait checked dispatch preserves scheduler and authority errors" 
     var boundary: Boundary = .{ .ptr = &owner, .begin = Owner.begin, .end = Owner.end, .boundary_dispatch = Owner.dispatch };
     try boundary.beginWait();
     try boundary.endWait();
-    const failures = [_]anyerror{ error.RunnableWaitTimeout, error.SchedulerClosed, error.SchedulerFull, error.InvalidRunnableTransition, error.InvalidReadFenceTransition, error.ExecutionWaitUnsupported, error.Forbidden, error.CatalogGenerationChanged, error.RowPolicyCatalogChanged, error.Canceled, error.DeadlineExceeded, error.OutOfMemory };
+    const failures = [_]anyerror{ error.RunnableWaitTimeout, error.SchedulerClosed, error.SchedulerFull, error.InvalidRunnableTransition, error.InvalidReadFenceTransition, error.ExecutionWaitUnsupported, error.ReadSafetyBarrierUnavailable, error.BackendRuntimeUnavailable, error.Forbidden, error.CatalogGenerationChanged, error.RowPolicyCatalogChanged, error.Canceled, error.DeadlineExceeded, error.OutOfMemory };
     for (failures) |err| {
         owner.fail = err;
         try std.testing.expect(error_abi.errorHasStableDetail(err));

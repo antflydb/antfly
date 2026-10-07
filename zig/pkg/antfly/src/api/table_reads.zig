@@ -4263,7 +4263,8 @@ pub const ProvisionedTableReadSource = struct {
         const allow_stale_fallback = !strict_relational and !(consistency == .read_index and request == .lookup and
             self.source().strict_read_index_absence);
         const plan = planFanout(.query, self.io_impl, group_ids.len);
-        if (!plan.parallel) {
+        const single_execution_owner = request == .scan and request.scan.opts.execution_wait != null;
+        if (!plan.parallel or single_execution_owner) {
             for (group_ids) |group_id| {
                 try prepareProvisionedGroupConsistency(self.read_safety_barrier, group_id, request, consistency, allow_stale_fallback);
             }

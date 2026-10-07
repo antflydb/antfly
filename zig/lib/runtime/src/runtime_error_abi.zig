@@ -33,6 +33,8 @@ test "execution wait scheduling details are append-only and preserve behavior cl
         .{ .err = error.InvalidRunnableTransition, .code = .internal },
         .{ .err = error.InvalidReadFenceTransition, .code = .internal },
         .{ .err = error.ExecutionWaitUnsupported, .code = .unsupported },
+        .{ .err = error.ReadSafetyBarrierUnavailable, .code = .unavailable },
+        .{ .err = error.BackendRuntimeUnavailable, .code = .unavailable },
     };
     for (cases) |case| {
         const transported = statusFromError(case.err);
@@ -748,6 +750,8 @@ pub const Detail = enum(c_int) {
     invalid_runnable_transition,
     invalid_read_fence_transition,
     execution_wait_unsupported,
+    read_safety_barrier_unavailable,
+    backend_runtime_unavailable,
 };
 
 pub const Status = extern struct {
@@ -771,6 +775,8 @@ pub fn statusFromError(err: anyerror) Status {
         error.InvalidRunnableTransition => status(.internal, .invalid_runnable_transition),
         error.InvalidReadFenceTransition => status(.internal, .invalid_read_fence_transition),
         error.ExecutionWaitUnsupported => status(.unsupported, .execution_wait_unsupported),
+        error.ReadSafetyBarrierUnavailable => status(.unavailable, .read_safety_barrier_unavailable),
+        error.BackendRuntimeUnavailable => status(.unavailable, .backend_runtime_unavailable),
         error.ExternalLakeReadOnly => status(.forbidden, .external_lake_read_only),
         error.ExternalLakeSnapshotMismatch => status(.conflict, .external_lake_snapshot_mismatch),
         error.ExternalLakeSchemaMismatch => status(.conflict, .external_lake_schema_mismatch),
@@ -1470,6 +1476,8 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .invalid_runnable_transition => "InvalidRunnableTransition",
         .invalid_read_fence_transition => "InvalidReadFenceTransition",
         .execution_wait_unsupported => "ExecutionWaitUnsupported",
+        .read_safety_barrier_unavailable => "ReadSafetyBarrierUnavailable",
+        .backend_runtime_unavailable => "BackendRuntimeUnavailable",
         .external_lake_read_only => "ExternalLakeReadOnly",
         .external_lake_snapshot_mismatch => "ExternalLakeSnapshotMismatch",
         .external_lake_schema_mismatch => "ExternalLakeSchemaMismatch",

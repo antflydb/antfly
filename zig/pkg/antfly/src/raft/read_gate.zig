@@ -229,6 +229,169 @@ pub const alreadyReadSafeBarrier = read_contract.alreadyReadSafeBarrier;
 pub const unavailableReadSafetyBarrier = read_contract.unavailableReadSafetyBarrier;
 pub const EnrichmentReadIndexRequester = read_contract.EnrichmentReadIndexRequester;
 pub const EnrichmentReadGate = read_contract.EnrichmentReadGate;
+
+test "read-index execution waits keep stale and already-safe reads free of false yields" {
+    const Wait = @import("antfly_local_sources").common_execution_wait.Boundary;
+    const Recorder = struct {
+        calls: usize = 0,
+        begins: usize = 0,
+        ends: usize = 0,
+        fn legacy(raw: *anyopaque, _: u64, _: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+        }
+        fn begin(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.begins += 1;
+        }
+        fn end(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.ends += 1;
+        }
+    };
+    var recorder: Recorder = .{};
+    const wait: Wait = .{ .ptr = &recorder, .begin = Recorder.begin, .end = Recorder.end };
+    const legacy: ReadSafetyBarrier = .{ .ptr = &recorder, .vtable = &.{ .wait_read_safe = Recorder.legacy } };
+    const gate = EnrichmentReadGate.init(legacy);
+    try gate.prepareScan(7, "", "", .{ .execution_wait = wait }, .stale);
+    try std.testing.expectEqual(@as(usize, 0), recorder.calls);
+    try std.testing.expectError(error.ExecutionWaitUnsupported, gate.prepareScan(7, "", "", .{ .execution_wait = wait }, .read_index));
+    try std.testing.expectEqual(@as(usize, 0), recorder.calls);
+    try gate.prepareScan(7, "", "", .{}, .read_index);
+    try std.testing.expectEqual(@as(usize, 1), recorder.calls);
+    try EnrichmentReadGate.init(alreadyReadSafeBarrier()).prepareScan(7, "", "", .{ .execution_wait = wait }, .read_index);
+    try std.testing.expectError(error.ReadSafetyBarrierUnavailable, EnrichmentReadGate.init(unavailableReadSafetyBarrier()).prepareScan(7, "", "", .{ .execution_wait = wait }, .read_index));
+    try std.testing.expectEqual(@as(usize, 0), recorder.begins);
+    try std.testing.expectEqual(@as(usize, 0), recorder.ends);
+}
+
+test "read-index execution waits preserve request identity and retire ownership after failed resume" {
+    const runnable = @import("antfly_local_sources").common_request_admission.runnable_scheduler;
+    const Wait = @import("antfly_local_sources").common_execution_wait.Boundary;
+    const Case = enum { success, canceled, deadline, shutdown, io_error, forbidden };
+    const Owner = struct {
+        execution: runnable.Execution = .{},
+        canceled: std.atomic.Value(bool) = .init(false),
+        revoked: bool = false,
+        fn requested(raw: *const anyopaque) bool {
+            const flag: *const std.atomic.Value(bool) = @ptrCast(@alignCast(raw));
+            return flag.load(.acquire);
+        }
+        fn begin(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.execution.park(.resource_blocked);
+        }
+        fn end(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.execution.enter(.query);
+            if (self.revoked) return error.Forbidden;
+        }
+    };
+    const Provider = struct {
+        io: std.Io,
+        owner: *Owner,
+        entered: std.Io.Event = .unset,
+        release: std.Io.Event = .unset,
+        fail: bool,
+        registered: bool = false,
+        continued: bool = false,
+        fn legacy(_: *anyopaque, _: u64, _: []const u8) !void {
+            return error.LegacyBarrierMustNotRun;
+        }
+        fn scheduled(raw: *anyopaque, group: u64, ctx: []const u8, wait: Wait) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(@as(u64, 77), group);
+            try std.testing.expectEqualStrings("enrichment:scan:read_index", ctx);
+            self.registered = true;
+            defer self.registered = false;
+            // Registration/probing retains execution; only the actual event
+            // wait runs without a permit, under the same request identity.
+            const entry = &self.owner.execution.entry.?;
+            try std.testing.expectEqual(@import("antfly_local_sources").common_request_admission.runnable_scheduler.State.running, entry.scheduler.?.state(entry));
+            try wait.run(awaitReady, .{self});
+            try std.testing.expectEqualStrings("enrichment:scan:read_index", ctx);
+            self.continued = true;
+        }
+        fn awaitReady(self: *@This()) !void {
+            try std.testing.expect(self.registered);
+            self.entered.set(self.io);
+            try self.release.wait(self.io);
+            if (self.fail) return error.Timeout;
+        }
+    };
+    const Worker = struct {
+        provider: *Provider,
+        wait: Wait,
+        failure: ?anyerror = null,
+        fn run(self: *@This()) void {
+            const barrier: ReadSafetyBarrier = .{ .ptr = self.provider, .vtable = &.{ .wait_read_safe = Provider.legacy, .wait_read_safe_with_execution = Provider.scheduled } };
+            EnrichmentReadGate.init(barrier).prepareScan(77, "", "", .{ .execution_wait = self.wait }, .read_index) catch |err| {
+                self.failure = err;
+            };
+        }
+    };
+    const io = std.testing.io;
+    for (std.enums.values(Case)) |case| {
+        var scheduler = try runnable.Scheduler.init(.{ .slots = 2, .max_operations = 8, .max_bytes = 100, .control_bytes = 10, .max_wait_ms = 2000 });
+        defer scheduler.close();
+        var owner: Owner = .{};
+        defer owner.execution.finish();
+        const deadline: u64 = @intCast(std.Io.Clock.awake.now(io).addDuration(.fromMilliseconds(if (case == .deadline) 500 else 5000)).nanoseconds);
+        try owner.execution.start(&scheduler, .{ .io = io, .retained_bytes = 17, .deadline_ns = deadline, .cancellation = .{ .ptr = &owner.canceled, .requested = Owner.requested } }, .query);
+        var provider: Provider = .{ .io = io, .owner = &owner, .fail = case == .io_error };
+        var worker: Worker = .{ .provider = &provider, .wait = .{ .ptr = &owner, .begin = Owner.begin, .end = Owner.end } };
+        var group: std.Io.Group = .init;
+        defer group.cancel(io);
+        defer provider.release.set(io);
+        try group.concurrent(io, Worker.run, .{&worker});
+        try provider.entered.waitTimeout(io, .{ .duration = .{ .raw = .fromSeconds(3), .clock = .awake } });
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().runnable_slots);
+        try std.testing.expectEqual(@as(usize, 1), scheduler.stats().resource_blocked);
+        try std.testing.expectEqual(@as(u64, 17), scheduler.stats().retained_bytes);
+        var other: runnable.Execution = .{};
+        defer other.finish();
+        try other.start(&scheduler, .{ .io = io }, .query);
+        var control: runnable.Execution = .{};
+        defer control.finish();
+        try control.start(&scheduler, .{ .io = io }, .control);
+        try std.testing.expectEqual(@as(usize, 2), scheduler.stats().runnable_slots);
+        control.finish();
+        switch (case) {
+            .canceled => owner.canceled.store(true, .release),
+            .deadline => try io.sleep(.fromMilliseconds(600), .awake),
+            .shutdown => scheduler.close(),
+            .forbidden => owner.revoked = true,
+            else => {},
+        }
+        provider.release.set(io);
+        if (case == .success or case == .io_error or case == .forbidden) {
+            const until = std.Io.Clock.awake.now(io).addDuration(.fromSeconds(3));
+            while (scheduler.stats().queued != 1) {
+                if (std.Io.Clock.awake.now(io).nanoseconds >= until.nanoseconds) return error.ResumeDidNotQueue;
+                try io.sleep(.fromMilliseconds(1), .awake);
+            }
+            other.finish();
+        }
+        try group.await(io);
+        try std.testing.expect(!provider.registered);
+        try std.testing.expectEqual(case == .success, provider.continued);
+        try std.testing.expectEqual(deadline, owner.execution.entry.?.options.deadline_ns.?);
+        try std.testing.expectEqual(@as(?anyerror, switch (case) {
+            .success => null,
+            .canceled => error.Canceled,
+            .deadline => error.DeadlineExceeded,
+            .shutdown => error.SchedulerClosed,
+            .io_error => error.Timeout,
+            .forbidden => error.Forbidden,
+        }), worker.failure);
+        other.finish();
+        owner.execution.finish();
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().runnable_slots);
+        try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+        std.debug.print("read-index wait case {s}: request identity preserved, operations=0 slots=0\n", .{@tagName(case)});
+    }
+}
 test "frozen read quorum proof is observable without falsely completing apply" {
     var tracker = AppliedReadTracker.init(std.testing.allocator, 7);
     defer tracker.deinit();

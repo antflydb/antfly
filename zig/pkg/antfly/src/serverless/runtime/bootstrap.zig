@@ -78,6 +78,8 @@ pub const BootstrapConfig = struct {
     secret_store: ?*common_secrets.FileStore = null,
     query_max_concurrent_requests: u32 = common_config.default_query_max_concurrent_requests,
     graph_execution_limits: @import("antfly_local_sources").graph_work_budget.Limits = .{},
+    /// Native runnable execution is not yet integrated with the serverless owner.
+    runnable_policy: ?@import("antfly_local_sources").common_request_admission.runnable_scheduler.Config = null,
     write_max_concurrent_requests: u32 = common_config.default_write_max_concurrent_requests,
     /// CPU fanout available to one graph-metric kernel. Work is scheduled on
     /// the shared std.Io backend, so deployments can align this with their
@@ -697,6 +699,7 @@ fn workLeaseOwnerIdAlloc(alloc: Allocator, io: std.Io) ![]u8 {
 }
 
 pub fn validateConfig(alloc: Allocator, cfg: BootstrapConfig) !void {
+    if (cfg.runnable_policy != null) return error.RunnableSchedulingUnsupported;
     if (cfg.tick_interval_ms == 0) return error.InvalidTickInterval;
     if (cfg.graph_metric_max_parallelism == 0 or cfg.graph_metric_max_parallelism > build_mod.max_graph_metric_compute_parallelism)
         return error.InvalidGraphMetricBuildOptions;
@@ -1360,6 +1363,9 @@ test "runtime bootstrap requires bounded query cache budgets" {
     try validateConfig(alloc, base);
 
     var invalid = base;
+    invalid.runnable_policy = .{};
+    try std.testing.expectError(error.RunnableSchedulingUnsupported, validateConfig(alloc, invalid));
+    invalid = base;
     invalid.query_cache_max_bytes = 0;
     try std.testing.expectError(error.InvalidQueryCacheBudget, validateConfig(alloc, invalid));
     invalid = base;

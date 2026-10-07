@@ -10330,7 +10330,7 @@ pub const DataServer = struct {
     fn dataReadSafetyBarrier(self: *DataServer) antfly.raft.ReadSafetyBarrier {
         return .{
             .ptr = self,
-            .vtable = &.{ .wait_read_safe = waitDataReadSafe, .capture_frozen = captureFrozenReadProof, .validate_frozen = validateFrozenReadProof },
+            .vtable = &.{ .wait_read_safe = waitDataReadSafe, .capture_frozen = captureFrozenReadProof, .validate_frozen = validateFrozenReadProof, .wait_read_safe_with_execution = waitDataReadSafeWithExecution },
         };
     }
 
@@ -10484,6 +10484,14 @@ pub const DataServer = struct {
         };
     }
 
+    fn waitDataReadSafeWithExecution(ptr: *anyopaque, group_id: u64, request_ctx: []const u8, wait: @import("antfly_local_sources").common_execution_wait.Boundary) anyerror!void {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        self.waitDataReadSafeWithExecutionOptions(group_id, request_ctx, null, .none, wait) catch |err| switch (err) {
+            error.ReadIndexTimeout => return error.Timeout,
+            else => return err,
+        };
+    }
+
     /// Called with data_raft_mutex held. The provider's completion marker is
     /// advanced only after the native delegate and projection finish. Neither
     /// live core applied nor persisted snapshot index proves installation.
@@ -10505,6 +10513,17 @@ pub const DataServer = struct {
         request_ctx: []const u8,
         timeout_ms: ?u32,
         cancellation: antfly.db.types.CancellationToken,
+    ) anyerror!void {
+        return self.waitDataReadSafeWithExecutionOptions(group_id, request_ctx, timeout_ms, cancellation, null);
+    }
+
+    fn waitDataReadSafeWithExecutionOptions(
+        self: *DataServer,
+        group_id: u64,
+        request_ctx: []const u8,
+        timeout_ms: ?u32,
+        cancellation: antfly.db.types.CancellationToken,
+        execution_wait: ?@import("antfly_local_sources").common_execution_wait.Boundary,
     ) anyerror!void {
         var zig017_return_error: ?anyerror = null;
         const raft = self.data_raft orelse return zig017_failure: {
@@ -10561,7 +10580,7 @@ pub const DataServer = struct {
                 break :zig017_failure error.ReadIndexTimeout;
             };
             if (self.data_raft_mutex.tryLock()) break;
-            (io.sleep(.fromMilliseconds(1), .awake) catch |zig017_err| {
+            ((if (execution_wait) |wait| wait.run(std.Io.sleep, .{ io, std.Io.Duration.fromMilliseconds(1), std.Io.Clock.awake }) else io.sleep(.fromMilliseconds(1), .awake)) catch |zig017_err| {
                 zig017_return_error = zig017_err;
                 return zig017_err;
             });
@@ -10620,7 +10639,7 @@ pub const DataServer = struct {
                 retry_delay_ns = @min(retry_delay_ns * 2, std.time.ns_per_s);
                 next_request_ns = self.dataRaftMonotonicNs() +| retry_delay_ns;
             }
-            (io.sleep(.fromMilliseconds(1), .awake) catch |zig017_err| {
+            ((if (execution_wait) |wait| wait.run(std.Io.sleep, .{ io, std.Io.Duration.fromMilliseconds(1), std.Io.Clock.awake }) else io.sleep(.fromMilliseconds(1), .awake)) catch |zig017_err| {
                 zig017_return_error = zig017_err;
                 return zig017_err;
             });
@@ -36583,6 +36602,115 @@ fn consumerTests() type {
             try std.testing.expectEqual(@as(usize, 0), server.data_raft_apply.?.read_barriers.pendingCount());
             try std.testing.expect(server.data_raft_mutex.tryLock());
             server.data_raft_mutex.unlock();
+        }
+
+        test "data raft read safety execution wait retires registration after failed resume" {
+            const runnable = @import("antfly_local_sources").common_request_admission.runnable_scheduler;
+            const Case = enum { canceled, deadline, shutdown, forbidden };
+            const Reader = struct {
+                server: *DataServer,
+                execution: runnable.Execution = .{},
+                canceled: std.atomic.Value(bool) = .init(false),
+                entered: std.Io.Event = .unset,
+                release: std.Io.Event = .unset,
+                revoked: bool = false,
+                begins: usize = 0,
+                ends: usize = 0,
+                failure: ?anyerror = null,
+
+                fn requested(raw: *const anyopaque) bool {
+                    const flag: *const std.atomic.Value(bool) = @ptrCast(@alignCast(raw));
+                    return flag.load(.acquire);
+                }
+                fn begin(raw: *anyopaque) !void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    try self.execution.park(.resource_blocked);
+                    self.begins += 1;
+                }
+                fn end(raw: *anyopaque) !void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.ends += 1;
+                    // The production owner's real polling sleep has finished.
+                    // Hold resumption so the fixture can exercise other work
+                    // and failures while the Raft owner lock remains occupied.
+                    self.entered.set(std.testing.io);
+                    try self.release.wait(std.testing.io);
+                    try self.execution.enter(.query);
+                    if (self.revoked) return error.Forbidden;
+                }
+                fn run(self: *@This()) void {
+                    defer self.execution.finish();
+                    self.server.dataReadSafetyBarrier().waitReadSafeWithExecution(7001, "scheduled-owner-admission", .{
+                        .ptr = self,
+                        .begin = begin,
+                        .end = end,
+                    }) catch |err| {
+                        self.failure = err;
+                    };
+                }
+            };
+            const alloc = std.testing.allocator;
+            const io = std.testing.io;
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/scheduled-read-owner", .{tmp.sub_path});
+            defer alloc.free(root);
+            var server = try DataServer.initFromMetadataApiUrl(alloc, .{
+                .replica_root_dir = root,
+                .store_registration = .{ .node_id = 1, .store_id = 1, .api_url = "http://127.0.0.1:1" },
+            }, "http://127.0.0.1:2");
+            defer server.deinit();
+            for (std.enums.values(Case)) |case| {
+                var scheduler = try runnable.Scheduler.init(.{ .slots = 2, .max_operations = 8, .max_bytes = 100, .control_bytes = 10, .max_wait_ms = 2000 });
+                defer scheduler.close();
+                var reader: Reader = .{ .server = &server };
+                defer reader.execution.finish();
+                const deadline: u64 = @intCast(std.Io.Clock.awake.now(io).addDuration(.fromMilliseconds(if (case == .deadline) 100 else 5000)).nanoseconds);
+                try reader.execution.start(&scheduler, .{ .io = io, .retained_bytes = 17, .deadline_ns = deadline, .cancellation = .{ .ptr = &reader.canceled, .requested = Reader.requested } }, .query);
+                lockAtomic(&server.data_raft_mutex);
+                defer server.data_raft_mutex.unlock();
+                var group: std.Io.Group = .init;
+                defer group.cancel(io);
+                defer reader.release.set(io);
+                try group.concurrent(io, Reader.run, .{&reader});
+                try reader.entered.waitTimeout(io, .{ .duration = .{ .raw = .fromSeconds(3), .clock = .awake } });
+                try std.testing.expectEqual(@as(usize, 1), server.data_raft_apply.?.read_barriers.pendingCount());
+                try std.testing.expectEqual(@as(usize, 0), scheduler.stats().runnable_slots);
+                try std.testing.expectEqual(@as(usize, 1), scheduler.stats().resource_blocked);
+                try std.testing.expectEqual(@as(u64, 17), scheduler.stats().retained_bytes);
+                try std.testing.expectEqual(@as(?u64, deadline), reader.execution.entry.?.options.deadline_ns);
+                var other: runnable.Execution = .{};
+                defer other.finish();
+                try other.start(&scheduler, .{ .io = io }, .query);
+                var control: runnable.Execution = .{};
+                defer control.finish();
+                try control.start(&scheduler, .{ .io = io }, .control);
+                try std.testing.expectEqual(@as(usize, 2), scheduler.stats().runnable_slots);
+                switch (case) {
+                    .canceled => reader.canceled.store(true, .release),
+                    .deadline => try io.sleep(.fromMilliseconds(200), .awake),
+                    .shutdown => scheduler.close(),
+                    .forbidden => reader.revoked = true,
+                }
+                control.finish();
+                other.finish();
+                reader.release.set(io);
+                try group.await(io);
+                const expected: anyerror = switch (case) {
+                    .canceled => error.Canceled,
+                    .deadline => error.DeadlineExceeded,
+                    .shutdown => error.SchedulerClosed,
+                    .forbidden => error.Forbidden,
+                };
+                try std.testing.expectEqual(@as(?anyerror, expected), reader.failure);
+                try std.testing.expectEqual(@as(usize, 1), reader.begins);
+                try std.testing.expectEqual(@as(usize, 1), reader.ends);
+                try std.testing.expectEqual(@as(usize, 0), server.data_raft_apply.?.read_barriers.pendingCount());
+                try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+                try std.testing.expectEqual(@as(usize, 0), scheduler.stats().runnable_slots);
+                try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+                std.debug.print("data read-index owner wait case {s}: pending=0 operations=0 slots=0\n", .{@tagName(case)});
+            }
         }
 
         test "data raft native snapshot requires an install completion receipt" {

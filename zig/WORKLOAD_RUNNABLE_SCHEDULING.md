@@ -148,8 +148,18 @@ records three wait fixtures and all 25 error ABI fixtures passing on both
 platforms, including a separately compiled callback owner and explicit rejection
 of incompatible layouts. The qualifier verifies that the foreign dispatcher is
 used, rather than taking the local-call shortcut. This establishes the interface;
-request-local propagation to real storage/read-index/RPC waits is still required.
-Parallel children cannot share this single-worker execution owner. Accepted
+SQL scan options now carry a borrowed request-local execution wait to read-index
+barriers. The DataServer releases capacity only around its real owner-lock and
+quorum/apply polling sleeps; registration, probing and retransmission retain CPU
+ownership. Each resume uses the original entry and deadline and validates the
+read fence before continuing. Group barrier preparation stays serial for this
+single-worker owner, and retained remote cursors discard the borrowed callback.
+The [read-index receipt](qualification/workload-pooling/receipts/2026-10-07/read-index-waits/README.md)
+records 400 SQL/read-gate contracts passing on both platforms and checked callback
+qualification. Actual DataServer failure schedules, retained-owner callback
+retirement, complete production/API qualification and real quorum/apply delay
+schedules remain separate gates. Snapshot bootstrap, general storage and RPC
+waits still require propagation. Parallel children cannot share this single-worker execution owner. Accepted
 durable completion retains its own owner and cannot depend on a fresh grant.
 
 ## Integration order and completion requirements

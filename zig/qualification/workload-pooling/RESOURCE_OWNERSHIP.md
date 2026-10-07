@@ -127,7 +127,15 @@ Private spill reads/writes and directory/file creation currently release runnabl
 capacity. Owned creation results are discarded if reacquisition or the subsequent
 authority checkpoint fails; mandatory cleanup does not need a new grant. The
 [creation qualification](receipts/2026-10-07/spill-creation-waits/README.md) covers
-real handle retirement on both platforms. General storage/RPC waits and cleanup
+real handle retirement on both platforms. SQL scan preparation now passes a
+borrowed wait to read-index barriers; the DataServer parks only for its actual
+owner-lock and quorum/apply polling sleeps, and resumes the same execution owner
+before probing or consuming completion. Failed resume retires the read-index
+registration. Group admission is serial while borrowing this single-worker
+owner, and remote registry cursors clear the borrowed wait. The
+[read-index receipt](receipts/2026-10-07/read-index-waits/README.md) distinguishes
+contract evidence from pending actual DataServer/quorum and whole production
+qualification. Snapshot bootstrap, general storage/RPC waits and cleanup
 execution ownership still need suspension boundaries. Authority validation
 itself performs catalog I/O: extending these boundaries must avoid recursively
 validating a guard already in validation, and must reacquire execution capacity

@@ -168,6 +168,8 @@ pub const Owner = struct {
         query.schema_version = scope.schema_version;
         opts.relational_query = query;
         opts.columnar_stats = null;
+        // A registry cursor outlives the incoming request execution owner.
+        opts.execution_wait = null;
         opts.cancellation = CancellationToken.fromAtomic(&owned.cancelled);
         opts.execution_deadline_ns = deadline_ns;
         owned.view = try capture_value.fence.open(alloc, from, to, opts);
@@ -199,6 +201,8 @@ pub const Owner = struct {
         query.schema_version = scope.schema_version;
         opts.relational_query = query;
         opts.columnar_stats = null;
+        // A registry cursor outlives the incoming request execution owner.
+        opts.execution_wait = null;
         opts.cancellation = CancellationToken.fromAtomic(&owned.cancelled);
         opts.execution_deadline_ns = deadline_ns;
         owned.view = try retained.snapshot.open(alloc, from, to, opts);
@@ -301,8 +305,12 @@ fn consumerTests() type {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     self.cursor_token = opts.cancellation.?;
                     try std.testing.expectEqual(@as(?u32, 5), opts.relational_query.?.schema_version);
+                    try std.testing.expect(opts.execution_wait == null);
                     try std.testing.expect(self.cursor_token.ptr != self.capture_token.ptr);
                     return .{ .ptr = self, .vtable = &.{ .next = next, .close = close } };
+                }
+                fn borrowedWait(_: *anyopaque) !void {
+                    return error.BorrowedExecutionMustNotEscape;
                 }
                 fn next(ptr: *anyopaque, alloc: std.mem.Allocator, _: u32) !reads.RelationalReadView.Page {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -324,13 +332,14 @@ fn consumerTests() type {
             const capture = (try owner.capture(scope, 1, route, "rows", deadline)).?;
             try owner.validateCapture(scope, capture);
             const snapshot = try owner.captureSnapshot(scope, capture, 1, deadline);
-            const cursor = try owner.open(scope, capture, 1, "", "", .{ .relational_query = .{ .fields = &.{} } }, deadline);
+            const borrowed_wait: @import("antfly_local_sources").common_execution_wait.Boundary = .{ .ptr = &fixture, .begin = Fixture.borrowedWait, .end = Fixture.borrowedWait };
+            const cursor = try owner.open(scope, capture, 1, "", "", .{ .relational_query = .{ .fields = &.{} }, .execution_wait = borrowed_wait }, deadline);
             try registry.close(capture, scope);
             try std.testing.expectEqual(1, fixture.captures_closed);
             var wrong_scope = scope;
             wrong_scope.group_id += 1;
             try std.testing.expectError(error.RetainedReadScopeChanged, owner.openSnapshot(wrong_scope, snapshot, 1, "", "", .{ .relational_query = .{ .fields = &.{} } }, deadline));
-            const delayed = try owner.openSnapshot(scope, snapshot, 1, "", "", .{ .relational_query = .{ .fields = &.{} } }, deadline);
+            const delayed = try owner.openSnapshot(scope, snapshot, 1, "", "", .{ .relational_query = .{ .fields = &.{} }, .execution_wait = borrowed_wait }, deadline);
             try registry.close(snapshot, scope);
             try std.testing.expectEqual(1, fixture.snapshots_closed);
             var delayed_page = try owner.next(std.testing.allocator, scope, delayed, 0, 10);

@@ -175,6 +175,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "data server can register a store without enabling data raft",
         "data server registered data raft uses wal state backend by default",
         "data raft read safety deadline and cancellation cover owner lock admission",
+        "data raft read safety execution wait retires registration after failed resume",
         "data raft read safety barrier completes only after matching ReadState apply",
         "data raft native snapshot requires an install completion receipt",
         "data runtime native FK retirement preserves source ownership and exact cold path",

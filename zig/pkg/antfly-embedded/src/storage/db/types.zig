@@ -1514,6 +1514,9 @@ pub const RelationalRowQuery = struct {
 };
 
 pub const ScanOptions = struct {
+    /// Request-local, single-worker execution owner. Never serialize or forward
+    /// this callback to another process or concurrently executing child.
+    execution_wait: ?@import("../../common/execution_wait.zig").Boundary = null,
     /// Retain the full document only for a version-fenced SQL mutation.
     sql_document_preimage: bool = false,
     /// Collect durable logical range guards only for explicitly guarded SQL.
