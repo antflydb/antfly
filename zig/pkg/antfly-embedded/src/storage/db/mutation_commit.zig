@@ -2649,6 +2649,40 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // the source document, artifacts, and replay append. This makes
             // `.full_index` an exact coverage fence and leaves asynchronous replay
             // responsible only for requests retained in generated_enrichment_refs.
+            // Local producer receipts are fenced by the latest primary mutation,
+            // not by the immutable document identity. Stamp in the primary batch.
+            if (self.core.hasGeneratedEnrichmentTargets() and !try orderedCoverageActive(self.core.store)) {
+                const readiness = @import("artifact_producer_readiness.zig");
+                for (identity_upsert_keys.items, identity_upsert_write_indexes.items) |document, write_index| {
+                    // An identical logical row creates no producer replay debt.
+                    if (!derived_changed_flags[write_index]) continue;
+                    const key = try readiness.localPrimaryRevisionKeyAlloc(self.alloc, document);
+                    owned_store_keys.append(self.alloc, key) catch |err| {
+                        self.alloc.free(key);
+                        return err;
+                    };
+                    const value = try self.alloc.alloc(u8, 8);
+                    owned_store_values.append(self.alloc, value) catch |err| {
+                        self.alloc.free(value);
+                        return err;
+                    };
+                    std.mem.writeInt(u64, value[0..8], sequence, .little);
+                    try store_writes.append(self.alloc, .{ .key = key, .value = value });
+                }
+                for (effective_req.deletes) |document| {
+                    const key = try readiness.localPrimaryRevisionKeyAlloc(self.alloc, document);
+                    owned_store_keys.append(self.alloc, key) catch |err| {
+                        self.alloc.free(key);
+                        return err;
+                    };
+                    try delete_keys.append(self.alloc, key);
+                }
+            }
+            var local_coverage_guard = if (precomputed_generated.coverage_outcomes.len != 0)
+                self.core.index_manager.lockLocalCoverage()
+            else
+                index_manager_mod.IndexManager.LocalCoverageGuard{};
+            defer local_coverage_guard.release();
             try appendPrecomputedCoverageOutcomeMutations(
                 self.alloc,
                 self.core.store,
@@ -2802,6 +2836,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 schedule_replication_recovery_on_exit = durable_replication_batch_outbox_key != null or durable_replication_replay_outbox_key != null;
                 break :blk transactions_mod.ResolutionOutcome{ .applied = true, .replay_sequence = sequence };
             };
+            local_coverage_guard.release();
             if (graph_publication) |*lease| lease.release();
             if (!transaction_applied.applied) {
                 unlockProfiledApply(self, profile, &apply_mutex_held, apply_lock_acquired_ns);

@@ -22717,457 +22717,23 @@ fn runtimeAppendRelationItem(
     artifact_value: std.json.Value,
     edge_limit: usize,
 ) !void {
-    if (item != .object) return;
-    const mapped_edge_type = if (mapping.edge_type_template.len > 0)
-        try runtimeRenderGraphArtifactTemplateAlloc(alloc, mapping.edge_type_template, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value)
-    else
-        null;
-    defer if (mapped_edge_type) |value| alloc.free(value);
-    const edge_type = if (mapped_edge_type) |value|
-        std.mem.trim(u8, value, &std.ascii.whitespace)
-    else
-        runtimeJsonStringField(item, "type") orelse runtimeJsonStringField(item, "edge_type") orelse runtimeJsonStringField(item, "relation") orelse return;
-    if (edge_type.len == 0) return;
-
-    const mapped_source = if (mapping.source_template.len > 0)
-        try runtimeRenderGraphArtifactTemplateAlloc(alloc, mapping.source_template, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value)
-    else
-        null;
-    defer if (mapped_source) |value| alloc.free(value);
-    // Mirrors db.zig appendRelationItem: owning document routes the row, the
-    // topological source may resolve canonically; an entity-referencing
-    // source with no canonical identity drops the edge (resolution replay
-    // re-renders it), and legacy inline endpoint objects keep the document.
-    var source_table: ?[]const u8 = null;
-    const source_doc = blk: {
-        if (mapped_source) |value| break :blk value;
-        const source_value = item.object.get("source") orelse break :blk doc_key;
-        if (runtimeResolveGraphEndpointEntity(source_value, artifact_value)) |entity| {
-            const canonical = runtimeCanonicalEntityDocumentId(entity) orelse return;
-            source_table = runtimeCanonicalEntityTable(entity);
-            break :blk canonical;
-        }
-        break :blk switch (source_value) {
-            .string => |external| if (external.len > 0) external else doc_key,
-            else => doc_key,
-        };
-    };
-    if (source_doc.len == 0) return error.InvalidGraphEdges;
-    const mapped_id = if (mapping.edge_id_template.len > 0)
-        try runtimeRenderGraphArtifactTemplateAlloc(alloc, mapping.edge_id_template, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value)
-    else
-        null;
-    defer if (mapped_id) |value| alloc.free(value);
-    const edge_id = mapped_id orelse "";
-    if (mapped_id != null and edge_id.len == 0) return error.InvalidGraphEdges;
-
-    const mapped_target = if (mapping.target_template.len > 0)
-        try runtimeRenderGraphArtifactTemplateAlloc(alloc, mapping.target_template, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value)
-    else
-        null;
-    defer if (mapped_target) |value| alloc.free(value);
-    const target_doc = if (mapped_target) |value| blk: {
-        const trimmed = std.mem.trim(u8, value, &std.ascii.whitespace);
-        if (trimmed.len == 0) return;
-        break :blk trimmed;
-    } else blk: {
-        const target_value = item.object.get("target") orelse return;
-        break :blk runtimeJsonEndpointDocumentIdResolved(target_value, artifact_value) orelse return;
-    };
-    const target_table: ?[]const u8 = if (mapped_target != null) null else blk: {
-        const target_value = item.object.get("target") orelse break :blk null;
-        const entity = runtimeResolveGraphEndpointEntity(target_value, artifact_value) orelse break :blk null;
-        break :blk runtimeCanonicalEntityTable(entity);
-    };
-    if (writes.items.len >= edge_limit) return error.ResourceLimitExceeded;
-
-    const weight = if (mapping.weight_template.len > 0) blk: {
-        const rendered = try runtimeRenderGraphArtifactTemplateAlloc(alloc, mapping.weight_template, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value);
-        defer alloc.free(rendered);
-        const trimmed = std.mem.trim(u8, rendered, &std.ascii.whitespace);
-        break :blk if (trimmed.len > 0) try std.fmt.parseFloat(f64, trimmed) else 1.0;
-    } else runtimeJsonFloatField(item, "weight") orelse runtimeJsonFloatField(item, "confidence") orelse 1.0;
-    if (!std.math.isFinite(weight)) return error.InvalidGraphEdges;
-    const metadata_json = if (mapping.metadata_template_json.len > 0) blk: {
-        const rendered = try runtimeRenderGraphArtifactMetadataTemplateAlloc(alloc, mapping.metadata_template_json, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value);
-        // Mirrors db.zig: a custom metadata template must not strip the
-        // resolved endpoint's home-table tag.
-        const table = target_table orelse break :blk rendered;
-        defer alloc.free(rendered);
-        break :blk try runtimePrependTargetTableToMetadataJsonAlloc(alloc, table, rendered);
-    } else if (target_table) |table|
-        try runtimePrependTargetTableToItemMetadataAlloc(alloc, table, item)
-    else
-        try std.json.Stringify.valueAlloc(alloc, item, .{});
-    var owned_metadata = metadata_json;
-    errdefer alloc.free(owned_metadata);
-    if (source_table) |table| {
-        const tagged = try graph_metadata_tables.withTableAlloc(alloc, "source_table", table, owned_metadata, mapping.metadata_template_json.len > 0);
-        alloc.free(owned_metadata);
-        owned_metadata = tagged;
-    }
-
-    const owned_index_name = try alloc.dupe(u8, index_name);
-    errdefer alloc.free(owned_index_name);
-    const owned_source = try alloc.dupe(u8, source_doc);
-    errdefer alloc.free(owned_source);
-    const owned_target = try alloc.dupe(u8, target_doc);
-    errdefer alloc.free(owned_target);
-    const owned_edge_type = try alloc.dupe(u8, edge_type);
-    errdefer alloc.free(owned_edge_type);
-    const owned_id = try alloc.dupe(u8, edge_id);
-    errdefer alloc.free(owned_id);
-    const owner_document = if (edge_id.len > 0 and !std.mem.eql(u8, source_doc, doc_key)) try alloc.dupe(u8, doc_key) else "";
-    errdefer if (owner_document.len > 0) alloc.free(owner_document);
-    const owned_owner = if (edge_id.len == 0 and !std.mem.eql(u8, source_doc, doc_key)) try alloc.dupe(u8, doc_key) else "";
-    errdefer if (owned_owner.len > 0) alloc.free(@constCast(owned_owner));
-    try writes.append(alloc, .{
-        .edge_id = owned_id,
-        .owner_document = owner_document,
-        .index_name = owned_index_name,
-        .source = owned_source,
-        .target = owned_target,
-        .edge_type = owned_edge_type,
-        .weight = weight,
-        .metadata_json = owned_metadata,
-        .owner = owned_owner,
-    });
-}
-
-fn runtimeRenderGraphArtifactTemplateAlloc(
-    alloc: Allocator,
-    template_source: []const u8,
-    doc_key: []const u8,
-    doc_value: ?std.json.Value,
-    item: std.json.Value,
-    item_index: usize,
-    artifact_name: []const u8,
-    artifact_content_type: []const u8,
-    artifact_value: std.json.Value,
-) ![]u8 {
-    var out = std.ArrayListUnmanaged(u8).empty;
-    errdefer out.deinit(alloc);
-    var pos: usize = 0;
-    while (pos < template_source.len) {
-        const start = std.mem.indexOfPos(u8, template_source, pos, "{{") orelse {
-            try out.appendSlice(alloc, template_source[pos..]);
-            break;
-        };
-        try out.appendSlice(alloc, template_source[pos..start]);
-        const body_start = start + 2;
-        const end = std.mem.indexOfPos(u8, template_source, body_start, "}}") orelse {
-            try out.appendSlice(alloc, template_source[start..]);
-            break;
-        };
-        const expr = std.mem.trim(u8, template_source[body_start..end], &std.ascii.whitespace);
-        const rendered = try runtimeRenderGraphArtifactExpressionAlloc(alloc, expr, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value);
-        defer alloc.free(rendered);
-        try out.appendSlice(alloc, rendered);
-        pos = end + 2;
-    }
-    return try out.toOwnedSlice(alloc);
-}
-
-fn runtimeRenderGraphArtifactExpressionAlloc(
-    alloc: Allocator,
-    expr: []const u8,
-    doc_key: []const u8,
-    doc_value: ?std.json.Value,
-    item: std.json.Value,
-    item_index: usize,
-    artifact_name: []const u8,
-    artifact_content_type: []const u8,
-    artifact_value: std.json.Value,
-) ![]u8 {
-    if (std.mem.startsWith(u8, expr, "default ")) {
-        var parts = std.mem.tokenizeAny(u8, expr["default ".len..], &std.ascii.whitespace);
-        const path = parts.next() orelse return try alloc.dupe(u8, "");
-        const fallback = parts.next() orelse "";
-        const value = runtimeGraphTemplateValue(path, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value);
-        const text = if (value) |found| try runtimeGraphJsonValueTextAlloc(alloc, found) else try alloc.dupe(u8, fallback);
-        if (std.mem.trim(u8, text, &std.ascii.whitespace).len == 0 and fallback.len > 0) {
-            alloc.free(text);
-            return try alloc.dupe(u8, fallback);
-        }
-        return text;
-    }
-    if (runtimeGraphTemplateValue(expr, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value)) |value| {
-        return try runtimeGraphJsonValueTextAlloc(alloc, value);
-    }
-    return try alloc.dupe(u8, "");
-}
-
-fn runtimeGraphTemplateValue(
-    path: []const u8,
-    doc_key: []const u8,
-    doc_value: ?std.json.Value,
-    item: std.json.Value,
-    item_index: usize,
-    artifact_name: []const u8,
-    artifact_content_type: []const u8,
-    artifact_value: std.json.Value,
-) ?std.json.Value {
-    if (std.mem.eql(u8, path, "_doc.key")) return .{ .string = doc_key };
-    if (std.mem.startsWith(u8, path, "_doc.value.")) {
-        const doc = doc_value orelse return null;
-        return runtimeSelectJsonDotPath(doc, path["_doc.value.".len..]);
-    }
-    if (std.mem.eql(u8, path, "_artifact.name")) return .{ .string = artifact_name };
-    if (std.mem.eql(u8, path, "_artifact.content_type")) return .{ .string = artifact_content_type };
-    if (std.mem.eql(u8, path, "_artifact.value")) return artifact_value;
-    if (std.mem.startsWith(u8, path, "_artifact.value.")) return runtimeSelectJsonDotPath(artifact_value, path["_artifact.value.".len..]);
-    if (std.mem.eql(u8, path, "_item_index")) return .{ .integer = @intCast(item_index) };
-    if (std.mem.eql(u8, path, "_item")) return item;
-    if (std.mem.startsWith(u8, path, "_item.")) return runtimeSelectGraphItemDotPath(item, path["_item.".len..], artifact_value);
-    return null;
-}
-
-fn runtimeSelectGraphItemDotPath(item: std.json.Value, path: []const u8, artifact_value: std.json.Value) ?std.json.Value {
-    if (std.mem.eql(u8, path, "source") or std.mem.startsWith(u8, path, "source.")) {
-        if (item != .object) return null;
-        const endpoint = item.object.get("source") orelse return null;
-        const selected = runtimeResolveGraphEndpointEntity(endpoint, artifact_value) orelse endpoint;
-        if (std.mem.eql(u8, path, "source")) return selected;
-        return runtimeSelectJsonDotPath(selected, path["source.".len..]);
-    }
-    if (std.mem.eql(u8, path, "target") or std.mem.startsWith(u8, path, "target.")) {
-        if (item != .object) return null;
-        const endpoint = item.object.get("target") orelse return null;
-        const selected = runtimeResolveGraphEndpointEntity(endpoint, artifact_value) orelse endpoint;
-        if (std.mem.eql(u8, path, "target")) return selected;
-        return runtimeSelectJsonDotPath(selected, path["target.".len..]);
-    }
-    return runtimeSelectJsonDotPath(item, path);
-}
-
-fn runtimeSelectJsonDotPath(root: std.json.Value, path: []const u8) ?std.json.Value {
-    var current = root;
-    var parts = std.mem.splitScalar(u8, path, '.');
-    while (parts.next()) |part| {
-        if (part.len == 0) return null;
-        if (current != .object) return null;
-        current = current.object.get(part) orelse return null;
-    }
-    return current;
-}
-
-fn runtimeGraphJsonValueTextAlloc(alloc: Allocator, value: std.json.Value) ![]u8 {
-    return switch (value) {
-        .null => try alloc.dupe(u8, ""),
-        .bool => |b| try alloc.dupe(u8, if (b) "true" else "false"),
-        .integer => |n| try std.fmt.allocPrint(alloc, "{d}", .{n}),
-        .float => |n| try std.fmt.allocPrint(alloc, "{d}", .{n}),
-        .number_string => |s| try alloc.dupe(u8, s),
-        .string => |s| try alloc.dupe(u8, s),
-        .array, .object => try std.json.Stringify.valueAlloc(alloc, value, .{}),
-    };
-}
-
-fn runtimeRenderGraphArtifactMetadataTemplateAlloc(
-    alloc: Allocator,
-    metadata_template_json: []const u8,
-    doc_key: []const u8,
-    doc_value: ?std.json.Value,
-    item: std.json.Value,
-    item_index: usize,
-    artifact_name: []const u8,
-    artifact_content_type: []const u8,
-    artifact_value: std.json.Value,
-) ![]u8 {
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, metadata_template_json, .{ .parse_numbers = false });
-    defer parsed.deinit();
-    var rendered = try runtimeRenderGraphArtifactMetadataValueAlloc(alloc, parsed.value, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value);
-    defer runtimeFreeGraphRenderedJsonValue(alloc, &rendered);
-    return try std.json.Stringify.valueAlloc(alloc, rendered, .{});
-}
-
-fn runtimeRenderGraphArtifactMetadataValueAlloc(
-    alloc: Allocator,
-    value: std.json.Value,
-    doc_key: []const u8,
-    doc_value: ?std.json.Value,
-    item: std.json.Value,
-    item_index: usize,
-    artifact_name: []const u8,
-    artifact_content_type: []const u8,
-    artifact_value: std.json.Value,
-) !std.json.Value {
-    return switch (value) {
-        .string => |text| .{ .string = try runtimeRenderGraphArtifactTemplateAlloc(alloc, text, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value) },
-        .array => |array| blk: {
-            var out = std.json.Array.init(alloc);
-            errdefer out.deinit();
-            for (array.items) |child| try out.append(try runtimeRenderGraphArtifactMetadataValueAlloc(alloc, child, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value));
-            break :blk .{ .array = out };
-        },
-        .object => |object| blk: {
-            var out = std.json.ObjectMap.empty;
-            errdefer out.deinit(alloc);
-            var it = object.iterator();
-            while (it.next()) |entry| {
-                try out.put(alloc, try alloc.dupe(u8, entry.key_ptr.*), try runtimeRenderGraphArtifactMetadataValueAlloc(alloc, entry.value_ptr.*, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value));
-            }
-            break :blk .{ .object = out };
-        },
-        else => value,
-    };
-}
-
-fn runtimeFreeGraphRenderedJsonValue(alloc: Allocator, value: *std.json.Value) void {
-    switch (value.*) {
-        .string => |text| alloc.free(@constCast(text)),
-        .array => |*array| {
-            for (array.items) |*item| runtimeFreeGraphRenderedJsonValue(alloc, item);
-            array.deinit();
-        },
-        .object => |*object| {
-            var it = object.iterator();
-            while (it.next()) |entry| {
-                alloc.free(@constCast(entry.key_ptr.*));
-                runtimeFreeGraphRenderedJsonValue(alloc, entry.value_ptr);
-            }
-            object.deinit(alloc);
-        },
-        else => {},
-    }
-    value.* = .null;
-}
-
-fn runtimeJsonEndpointDocumentId(value: std.json.Value) ?[]const u8 {
-    return switch (value) {
-        .string => value.string,
-        .object => runtimeJsonStringField(value, "document_id") orelse runtimeJsonStringField(value, "doc_key") orelse runtimeJsonStringField(value, "key") orelse runtimeJsonStringField(value, "id") orelse runtimeJsonStringField(value, "local_id") orelse if (value.object.get("doc_ref")) |doc_ref| runtimeJsonEndpointDocumentId(doc_ref) else null,
-        else => null,
-    };
-}
-
-fn runtimeJsonEndpointDocumentIdResolved(value: std.json.Value, artifact_value: std.json.Value) ?[]const u8 {
-    // Mirrors db.zig jsonEndpointDocumentIdResolved: an endpoint referencing
-    // an extraction entity renders its canonical identity or nothing at all
-    // (the live path has no resolutions yet, so entity-referencing relations
-    // are deferred to the resolution replay); non-entity endpoints keep the
-    // external-node passthrough.
-    if (runtimeResolveGraphEndpointEntity(value, artifact_value)) |entity| {
-        return runtimeCanonicalEntityDocumentId(entity);
-    }
-    return runtimeJsonEndpointDocumentId(value);
-}
-
-fn runtimeCanonicalEntityDocumentId(entity: std.json.Value) ?[]const u8 {
-    if (entity != .object) return null;
-    if (runtimeJsonStringField(entity, "document_id") orelse runtimeJsonStringField(entity, "doc_key") orelse runtimeJsonStringField(entity, "key")) |id| return id;
-    if (entity.object.get("doc_ref")) |doc_ref| return runtimeJsonEndpointDocumentId(doc_ref);
-    return null;
-}
-
-fn runtimeCanonicalEntityTable(entity: std.json.Value) ?[]const u8 {
-    if (entity != .object) return null;
-    if (runtimeJsonStringField(entity, "table")) |table| return table;
-    if (entity.object.get("doc_ref")) |doc_ref| return runtimeJsonStringField(doc_ref, "table");
-    return null;
-}
-
-/// Mirrors db.zig's prependTableTagToMetadataJsonAlloc for the runtime
-/// renderer: tag an already-rendered metadata object with a resolved
-/// endpoint's home table unless the template rendered its own tag.
-fn runtimePrependTableTagToMetadataJsonAlloc(alloc: Allocator, comptime tag: []const u8, table: []const u8, metadata_json: []const u8) ![]u8 {
-    return graph_metadata_tables.withTableAlloc(alloc, tag, table, metadata_json, true);
-}
-
-fn runtimePrependTargetTableToMetadataJsonAlloc(alloc: Allocator, target_table: []const u8, metadata_json: []const u8) ![]u8 {
-    return try runtimePrependTableTagToMetadataJsonAlloc(alloc, "target_table", target_table, metadata_json);
-}
-
-fn runtimePrependTargetTableToItemMetadataAlloc(alloc: Allocator, target_table: []const u8, item: std.json.Value) ![]u8 {
-    const item_json = try std.json.Stringify.valueAlloc(alloc, item, .{});
-    defer alloc.free(item_json);
-    return graph_metadata_tables.withTableAlloc(alloc, "target_table", target_table, item_json, false);
-}
-
-fn runtimeResolveGraphEndpointEntity(value: std.json.Value, artifact_value: std.json.Value) ?std.json.Value {
-    switch (value) {
-        .string => return runtimeFindGraphArtifactEntity(artifact_value, value.string),
-        .object => {
-            if (runtimeJsonIntegerField(value, "entity_index")) |entity_index| return runtimeGraphArtifactEntityAtIndex(artifact_value, entity_index);
-            const entity_id = runtimeJsonStringField(value, "entity_id") orelse runtimeJsonStringField(value, "id") orelse runtimeJsonStringField(value, "local_id") orelse return null;
-            return runtimeFindGraphArtifactEntity(artifact_value, entity_id);
-        },
-        else => return null,
-    }
-}
-
-fn runtimeFindGraphArtifactEntity(artifact_value: std.json.Value, entity_id: []const u8) ?std.json.Value {
-    if (artifact_value != .object) return null;
-    if (artifact_value.object.get("_entities")) |resolved| {
-        if (runtimeFindGraphArtifactEntityIn(resolved, entity_id)) |entity| return entity;
-    }
-    const entities = artifact_value.object.get("entities") orelse return null;
-    return runtimeFindGraphArtifactEntityIn(entities, entity_id);
-}
-
-fn runtimeFindGraphArtifactEntityIn(entities: std.json.Value, entity_id: []const u8) ?std.json.Value {
-    return switch (entities) {
-        .array => |array| blk: {
-            for (array.items) |entity| {
-                const id = runtimeJsonStringField(entity, "id") orelse runtimeJsonStringField(entity, "local_id") orelse continue;
-                if (std.mem.eql(u8, id, entity_id)) break :blk entity;
-            }
-            break :blk null;
-        },
-        .object => entities.object.get(entity_id),
-        else => null,
-    };
-}
-
-fn runtimeGraphArtifactEntityAtIndex(artifact_value: std.json.Value, entity_index: i64) ?std.json.Value {
-    if (entity_index < 0 or artifact_value != .object) return null;
-    const index: usize = @intCast(entity_index);
-    const raw_entity: ?std.json.Value = blk: {
-        const entities = artifact_value.object.get("entities") orelse break :blk null;
-        if (entities != .array or index >= entities.array.items.len) break :blk null;
-        break :blk entities.array.items[index];
-    };
-    if (artifact_value.object.get("_entities")) |resolved| {
-        // Mirrors db.zig's graphArtifactEntityAtIndex: the injected
-        // resolution map is keyed by mention local id, and an id-less
-        // extraction entity resolves under its decimal array position.
-        var buf: [20]u8 = undefined;
-        const positional_id = std.fmt.bufPrint(&buf, "{d}", .{index}) catch unreachable;
-        const local_id = if (raw_entity) |entity|
-            runtimeJsonStringField(entity, "id") orelse runtimeJsonStringField(entity, "local_id") orelse positional_id
-        else
-            positional_id;
-        if (runtimeFindGraphArtifactEntityIn(resolved, local_id)) |entity| return entity;
-        if (resolved == .array and index < resolved.array.items.len) return resolved.array.items[index];
-    }
-    return raw_entity;
-}
-
-fn runtimeJsonStringField(value: std.json.Value, field: []const u8) ?[]const u8 {
-    if (value != .object) return null;
-    const found = value.object.get(field) orelse return null;
-    return if (found == .string) found.string else null;
-}
-
-fn runtimeJsonIntegerField(value: std.json.Value, field: []const u8) ?i64 {
-    if (value != .object) return null;
-    const found = value.object.get(field) orelse return null;
-    return switch (found) {
-        .integer => found.integer,
-        .number_string => |text| std.fmt.parseInt(i64, text, 10) catch null,
-        else => null,
-    };
-}
-
-fn runtimeJsonFloatField(value: std.json.Value, field: []const u8) ?f64 {
-    if (value != .object) return null;
-    const found = value.object.get(field) orelse return null;
-    return switch (found) {
-        .float => found.float,
-        .integer => @floatFromInt(found.integer),
-        .number_string => |text| std.fmt.parseFloat(f64, text) catch null,
-        else => null,
-    };
+    // Replay and recovery must interpret extraction endpoints identically.
+    // In particular, an unresolved source belongs to the producer document
+    // when no resolver is configured, rather than silently dropping its edge.
+    try @import("../graph_restore_materialization.zig").appendRelationItem(
+        alloc,
+        writes,
+        index_name,
+        doc_key,
+        doc_value,
+        item,
+        item_index,
+        mapping,
+        artifact_name,
+        artifact_content_type,
+        artifact_value,
+        edge_limit,
+    );
 }
 
 fn sameChunkedDenseBatchKey(
@@ -29903,49 +29469,13 @@ fn storePutBatchWithRetry(runtime: anytype, writes: []const KVPair, deletes: []c
     }
 }
 
-fn storeCoverageBatchWithRetry(runtime: *EnrichmentRuntime, writes: []const KVPair, deletes: []const []const u8, transitions: []const CoverageOutcomeTransition) !void {
-    var attempt: usize = 0;
-    while (true) : (attempt += 1) {
-        try heartbeatEnrichmentLease(runtime);
-        const fence = try requiredRuntimeStoreWriteFence(runtime);
-        var batch = runtime.store.beginBatch() catch |err| switch (err) {
-            error.WriterLocked => {
-                if (attempt >= writer_locked_retry_count) return err;
-                backoffWriterLockRetry();
-                continue;
-            },
-            else => return err,
-        };
-        var committed = false;
-        defer if (!committed) batch.abort();
-        try validateRuntimeStoreWriteFenceTxn(runtime, &batch, fence);
-        // A late receipt cannot restore completion after a newer primary
-        // version reopened debt, even in the window after replay append.
-        for (transitions) |transition| if (transition.source_document) |document| {
-            const identity = @import("../doc_identity.zig");
-            const ordinal = (try identity.lookupOrdinalTxn(runtime.alloc, &batch, document)) orelse return error.EnrichmentSourceChanged;
-            const state = (try identity.lookupStateTxn(&batch, ordinal)) orelse return error.InvalidDocIdentity;
-            if (!state.isLive() or transition.source_sequence == 0 or state.created_generation > transition.source_sequence)
-                return error.EnrichmentSourceChanged;
-        };
-        for (writes) |write| try batch.put(write.key, write.value);
-        for (deletes) |key| batch.delete(key) catch |err| switch (err) {
-            error.NotFound => {},
-            else => return err,
-        };
-        try validateRuntimeStoreWriteFenceTxn(runtime, &batch, fence);
-        batch.commit() catch |err| switch (err) {
-            error.WriterLocked => {
-                if (attempt >= writer_locked_retry_count) return err;
-                backoffWriterLockRetry();
-                continue;
-            },
-            else => return err,
-        };
-        committed = true;
-        try runtime.store.sync(false);
-        return;
-    }
+fn coverageReceiptIsCurrent(runtime: *EnrichmentRuntime, txn: anytype, transition: CoverageOutcomeTransition) !bool {
+    const document = transition.source_document orelse return true;
+    const identity = @import("../doc_identity.zig");
+    const ordinal = (try identity.lookupOrdinalTxn(runtime.alloc, txn, document)) orelse return false;
+    const state = (try identity.lookupStateTxn(txn, ordinal)) orelse return error.InvalidDocIdentity;
+    const revision = (try @import("../artifact_producer_readiness.zig").localPrimaryRevision(runtime.alloc, txn, document)) orelse state.created_generation;
+    return state.isLive() and transition.source_sequence != 0 and revision <= transition.source_sequence;
 }
 
 fn saveAppliedSequenceWithRetry(runtime: *EnrichmentRuntime, scope: []const u8, sequence: u64) !void {
@@ -30479,6 +30009,8 @@ fn applyCoverageOutcomeTransitions(runtime: *EnrichmentRuntime, transitions: []c
         }
         retained = pending_retained;
         if (retained > 0) {
+            var local_coverage_guard = runtime.index_manager.lockLocalCoverage();
+            defer local_coverage_guard.release();
             applyCoverageOutcomeTransitionsForIndex(runtime, ordered[group_start .. group_start + retained]) catch |err| {
                 if (failure_fence) |fence| fence.unlock();
                 apply_guard.unlock();
@@ -30492,7 +30024,49 @@ fn applyCoverageOutcomeTransitions(runtime: *EnrichmentRuntime, transitions: []c
 }
 
 fn applyCoverageOutcomeTransitionsForIndex(runtime: *EnrichmentRuntime, transitions: []const CoverageOutcomeTransition) !void {
+    var attempt: usize = 0;
+    while (true) : (attempt += 1) {
+        applyCurrentCoverageOutcomeTransitionsForIndex(runtime, transitions) catch |err| {
+            if (err == error.WriterLocked and attempt < writer_locked_retry_count) {
+                backoffWriterLockRetry();
+                continue;
+            }
+            return err;
+        };
+        return;
+    }
+}
+
+fn coverageCounterInTxn(alloc: Allocator, txn: *backend_erased.Batch, transition: CoverageOutcomeTransition, outcome: CoverageOutcome) !u64 {
+    const raw = txn.get(transition.counter_keys[@backingInt(outcome)]) catch |err| if (err == error.NotFound) null else return err;
+    if (raw) |value| {
+        if (value.len != 8) return error.InvalidDerivedCoverageCounter;
+        return std.mem.readInt(u64, value[0..8], .little);
+    }
+    if (transition.source_specific) return 0;
+    // Legacy aggregate counters may predate their maintained tuples.
+    const lower = try internal_keys.derivedCoverageOutcomeMarkerPrefixAlloc(alloc, transition.index_name, transition.generation);
+    defer alloc.free(lower);
+    var cursor = try txn.openCursor();
+    defer cursor.close();
+    var row = try cursor.seekAtOrAfter(lower);
+    var result: u64 = 0;
+    while (row) |entry| {
+        if (!std.mem.startsWith(u8, entry.key, lower)) break;
+        if (std.mem.eql(u8, entry.value, coverageOutcomeName(outcome))) result += 1;
+        row = try cursor.next();
+    }
+    return result;
+}
+
+fn applyCurrentCoverageOutcomeTransitionsForIndex(runtime: *EnrichmentRuntime, transitions: []const CoverageOutcomeTransition) !void {
     if (transitions.len == 0) return;
+    try heartbeatEnrichmentLease(runtime);
+    const fence = try requiredRuntimeStoreWriteFence(runtime);
+    var batch = try runtime.store.beginBatch();
+    var committed = false;
+    defer if (!committed) batch.abort();
+    try validateRuntimeStoreWriteFenceTxn(runtime, &batch, fence);
 
     var writes = std.ArrayListUnmanaged(KVPair).empty;
     defer writes.deinit(runtime.alloc);
@@ -30512,6 +30086,7 @@ fn applyCoverageOutcomeTransitionsForIndex(runtime: *EnrichmentRuntime, transiti
     const counterState = struct {
         fn get(
             runtime_value: *EnrichmentRuntime,
+            txn: *backend_erased.Batch,
             states: *std.ArrayListUnmanaged(CounterState),
             indexes: *std.StringHashMapUnmanaged(usize),
             transition: CoverageOutcomeTransition,
@@ -30520,8 +30095,7 @@ fn applyCoverageOutcomeTransitionsForIndex(runtime: *EnrichmentRuntime, transiti
             const outcome_index = @backingInt(outcome);
             const counter_key = transition.counter_keys[outcome_index];
             if (indexes.get(counter_key)) |index| return index;
-            const current_count = (try loadDerivedCoverageOutcomeCounter(runtime_value, counter_key)) orelse
-                (if (transition.source_specific) 0 else try scanDerivedCoverageOutcome(runtime_value, transition.index_name, transition.generation, outcome));
+            const current_count = try coverageCounterInTxn(runtime_value.alloc, txn, transition, outcome);
             const index = states.items.len;
             try states.append(runtime_value.alloc, .{ .key = counter_key, .outcome = outcome, .count = current_count });
             try indexes.put(runtime_value.alloc, counter_key, index);
@@ -30533,16 +30107,16 @@ fn applyCoverageOutcomeTransitionsForIndex(runtime: *EnrichmentRuntime, transiti
     var receipt_arena = std.heap.ArenaAllocator.init(runtime.alloc);
     defer receipt_arena.deinit();
     for (transitions) |transition| {
+        if (!try coverageReceiptIsCurrent(runtime, &batch, transition)) continue;
         const target_outcome = transition.outcome;
         if (seen_transitions.contains(transition.marker_key)) continue;
         try seen_transitions.put(runtime.alloc, transition.marker_key, {});
 
         inline for (std.meta.tags(CoverageOutcome)) |candidate_outcome| {
-            _ = try counterState(runtime, &counter_states, &counter_indexes, transition, candidate_outcome);
+            _ = try counterState(runtime, &batch, &counter_states, &counter_indexes, transition, candidate_outcome);
         }
 
-        const existing_value = try storeGetOptionalAllocWithRetry(runtime, transition.marker_key);
-        defer if (existing_value) |value| runtime.alloc.free(value);
+        const existing_value = batch.get(transition.marker_key) catch |err| if (err == error.NotFound) null else return err;
         const existing_outcome: ?CoverageOutcome = if (existing_value) |value|
             std.meta.stringToEnum(CoverageOutcome, value) orelse return error.InvalidDerivedCoverageOutcome
         else
@@ -30561,12 +30135,12 @@ fn applyCoverageOutcomeTransitionsForIndex(runtime: *EnrichmentRuntime, transiti
         }
         if (!weaker_than_existing_failure and (existing_outcome == null or existing_outcome.? != target_outcome)) {
             if (existing_outcome) |previous_outcome| {
-                const previous_state_index = try counterState(runtime, &counter_states, &counter_indexes, transition, previous_outcome);
+                const previous_state_index = try counterState(runtime, &batch, &counter_states, &counter_indexes, transition, previous_outcome);
                 if (counter_states.items[previous_state_index].count == 0) return error.InvalidDerivedCoverageCounter;
                 counter_states.items[previous_state_index].count -= 1;
                 if (previous_outcome == .skipped) skipped_delta -= 1;
             }
-            const state_index = try counterState(runtime, &counter_states, &counter_indexes, transition, target_outcome);
+            const state_index = try counterState(runtime, &batch, &counter_states, &counter_indexes, transition, target_outcome);
             counter_states.items[state_index].count +|= 1;
             try writes.append(runtime.alloc, .{
                 .key = transition.marker_key,
@@ -30583,7 +30157,11 @@ fn applyCoverageOutcomeTransitionsForIndex(runtime: *EnrichmentRuntime, transiti
             .value = internal_keys.encodeDerivedCoverageOutcomeCount(&state.value, state.count),
         });
     }
-    try storeCoverageBatchWithRetry(runtime, writes.items, &.{}, transitions);
+    for (writes.items) |write| try batch.put(write.key, write.value);
+    try validateRuntimeStoreWriteFenceTxn(runtime, &batch, fence);
+    try batch.commit();
+    committed = true;
+    try runtime.store.sync(false);
     if (skipped_delta > 0) {
         runtime.skipped_source_count +|= @intCast(skipped_delta);
     } else if (skipped_delta < 0) {

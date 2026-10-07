@@ -7108,6 +7108,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         ) !void {
             if (doc_keys.len == 0) return;
             if (try orderedCoverageActive(store)) return;
+            var local_coverage_guard = index_manager.lockLocalCoverage();
+            defer local_coverage_guard.release();
             const generation = index_manager.coverageGenerationForIndex(index_name) orelse return;
             try deleteDerivedCoverageScopeForDocKeys(alloc, store, index_name, generation, doc_keys);
             var pinned = try index_manager.acquireWritePlanSnapshot();
@@ -7124,6 +7126,32 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             }
         }
 
+        fn derivedCoverageOutcomeCounterValueForTxn(
+            alloc: Allocator,
+            txn: *docstore_mod.DocStore.Txn,
+            index_name: []const u8,
+            generation: u64,
+            outcome: []const u8,
+        ) !u64 {
+            const key = try internal_keys.derivedCoverageOutcomeCountKeyAlloc(alloc, index_name, generation, outcome);
+            defer alloc.free(key);
+            const raw = txn.get(key) catch |err| if (err == error.NotFound) null else return err;
+            if (raw) |value| return try internal_keys.decodeDerivedCoverageOutcomeCount(value);
+            // Only legacy tuples without maintained counters need a prefix scan.
+            const prefix = try internal_keys.derivedCoverageOutcomeMarkerPrefixAlloc(alloc, index_name, generation);
+            defer alloc.free(prefix);
+            var cursor = try txn.openCursor();
+            defer cursor.close();
+            var row = try cursor.seekAtOrAfter(prefix);
+            var count: u64 = 0;
+            while (row) |entry| {
+                if (!std.mem.startsWith(u8, entry.key, prefix)) break;
+                if (std.mem.eql(u8, entry.value, outcome)) count += 1;
+                row = try cursor.next();
+            }
+            return count;
+        }
+
         fn deleteDerivedCoverageScopeForDocKeys(
             alloc: Allocator,
             store: *docstore_mod.DocStore,
@@ -7131,81 +7159,62 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             generation: u64,
             doc_keys: []const []const u8,
         ) !void {
-            var deletes = std.ArrayListUnmanaged([]const u8).empty;
-            defer {
-                for (deletes.items) |key| alloc.free(@constCast(key));
-                deletes.deinit(alloc);
-            }
-            var unique_deletes = std.StringHashMapUnmanaged(void).empty;
-            defer unique_deletes.deinit(alloc);
-
+            // Read receipts, revalidate their primary revisions, and retire their
+            // counters in one writer transaction. A missing marker observed before
+            // acquiring the writer must never erase a concurrent completion.
+            var txn = try store.beginWriteTxn();
+            var committed = false;
+            defer if (!committed) txn.abort();
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            const scratch = arena.allocator();
+            var seen: std.StringHashMapUnmanaged(void) = .empty;
             const outcomes = std.meta.tags(DerivedCoverageOutcome);
+            var counts: [outcomes.len]u64 = undefined;
+            inline for (outcomes, 0..) |outcome, i| {
+                counts[i] = try derivedCoverageOutcomeCounterValueForTxn(scratch, &txn, index_name, generation, @tagName(outcome));
+            }
             var removed_counts = @as([outcomes.len]u64, @splat(0));
+            const readiness = @import("artifact_producer_readiness.zig");
+            const source_specific = !std.mem.eql(u8, index_name, readiness.localScopeIndex(index_name));
             for (doc_keys) |doc_key| {
-                const marker_key = try internal_keys.derivedCoverageOutcomeKeyAlloc(alloc, index_name, generation, doc_key);
-                errdefer alloc.free(marker_key);
-                if (unique_deletes.contains(marker_key)) {
-                    alloc.free(marker_key);
-                    continue;
-                }
-                const existing = store.get(alloc, marker_key) catch |err| switch (err) {
-                    error.NotFound => null,
-                    else => return err,
-                };
-                if (existing) |value| {
-                    defer alloc.free(value);
-                    if (!std.mem.eql(u8, index_name, @import("artifact_producer_readiness.zig").localScopeIndex(index_name))) {
-                        const revision_key = try @import("artifact_producer_readiness.zig").localReceiptRevisionKeyAlloc(alloc, marker_key);
-                        defer alloc.free(revision_key);
-                        var read = try store.beginReadTxn();
-                        defer read.abort();
-                        const revision = read.get(revision_key) catch |err| if (err == error.NotFound) null else return err;
-                        const ordinal = try @import("doc_identity.zig").lookupOrdinalTxn(alloc, &read, doc_key);
-                        const identity = if (ordinal) |id| try @import("doc_identity.zig").lookupStateTxn(&read, id) else null;
-                        // Replay cannot erase a receipt published for this
-                        // primary revision before its invalidation turn.
-                        if (revision) |bytes| {
-                            if (bytes.len != 8) return error.InvalidDerivedCoverageOutcome;
-                            if (identity) |state| if (state.isLive() and std.mem.readInt(u64, bytes[0..8], .little) >= state.created_generation) {
-                                alloc.free(marker_key);
-                                continue;
-                            };
+                const marker_key = try internal_keys.derivedCoverageOutcomeKeyAlloc(scratch, index_name, generation, doc_key);
+                if (seen.contains(marker_key)) continue;
+                try seen.put(scratch, marker_key, {});
+                const existing = txn.get(marker_key) catch |err| if (err == error.NotFound) null else return err;
+                const value = existing orelse continue;
+                const outcome = std.meta.stringToEnum(DerivedCoverageOutcome, value) orelse return error.InvalidDerivedCoverageOutcome;
+                if (source_specific) {
+                    const revision_key = try readiness.localReceiptRevisionKeyAlloc(scratch, marker_key);
+                    const revision = txn.get(revision_key) catch |err| if (err == error.NotFound) null else return err;
+                    const ordinal = try @import("doc_identity.zig").lookupOrdinalTxn(scratch, &txn, doc_key);
+                    const identity = if (ordinal) |id| try @import("doc_identity.zig").lookupStateTxn(&txn, id) else null;
+                    if (revision) |bytes| {
+                        if (bytes.len != 8) return error.InvalidDerivedCoverageOutcome;
+                        if (identity) |state| {
+                            // Untouched older documents have no primary stamp yet.
+                            // New primary writes always install it atomically.
+                            const primary = (try readiness.localPrimaryRevision(scratch, &txn, doc_key)) orelse state.created_generation;
+                            if (state.isLive() and std.mem.readInt(u64, bytes[0..8], .little) >= primary) continue;
                         }
-                        try deletes.append(alloc, try alloc.dupe(u8, revision_key));
                     }
-                    const outcome = std.meta.stringToEnum(DerivedCoverageOutcome, value) orelse return error.InvalidDerivedCoverageOutcome;
-                    removed_counts[@backingInt(outcome)] +|= 1;
+                    txn.delete(revision_key) catch |err| if (err != error.NotFound) return err;
                 }
-                try deletes.append(alloc, marker_key);
-                errdefer _ = deletes.pop();
-                try unique_deletes.put(alloc, marker_key, {});
+                try txn.delete(marker_key);
+                removed_counts[@backingInt(outcome)] += 1;
             }
-
-            if (deletes.items.len == 0) return;
-            var total_removed: u64 = 0;
-            for (removed_counts) |count| total_removed +|= count;
-            if (total_removed == 0) {
-                try store.putBatch(&.{}, deletes.items);
-                return;
+            var removed: u64 = 0;
+            for (outcomes, removed_counts, 0..) |outcome, count, i| {
+                if (count == 0) continue;
+                removed += count;
+                if (counts[i] < count) return error.InvalidDerivedCoverageCounter;
+                const key = try internal_keys.derivedCoverageOutcomeCountKeyAlloc(scratch, index_name, generation, @tagName(outcome));
+                var bytes: [8]u8 = undefined;
+                try txn.put(key, internal_keys.encodeDerivedCoverageOutcomeCount(&bytes, counts[i] - count));
             }
-
-            var counter_keys: [outcomes.len]?[]u8 = @splat(null);
-            defer for (counter_keys) |key| if (key) |value| alloc.free(value);
-            var counter_values: [outcomes.len][8]u8 = undefined;
-            var counter_writes: [outcomes.len]docstore_mod.KVPair = undefined;
-            var counter_write_count: usize = 0;
-            for (outcomes, removed_counts, 0..) |outcome, removed_count, outcome_index| {
-                if (removed_count == 0) continue;
-                const current_count = try derivedCoverageOutcomeCounterValueForStore(alloc, store, index_name, generation, @tagName(outcome));
-                if (current_count < removed_count) return error.InvalidDerivedCoverageCounter;
-                counter_keys[outcome_index] = try internal_keys.derivedCoverageOutcomeCountKeyAlloc(alloc, index_name, generation, @tagName(outcome));
-                counter_writes[counter_write_count] = .{
-                    .key = counter_keys[outcome_index].?,
-                    .value = internal_keys.encodeDerivedCoverageOutcomeCount(&counter_values[outcome_index], current_count - removed_count),
-                };
-                counter_write_count += 1;
-            }
-            try store.putBatch(counter_writes[0..counter_write_count], deletes.items);
+            if (removed == 0) return;
+            try txn.commit();
+            committed = true;
         }
 
         pub fn denseApplyUsesLocalStreamingSession(ctx: *const AsyncContext, index_name: []const u8) bool {

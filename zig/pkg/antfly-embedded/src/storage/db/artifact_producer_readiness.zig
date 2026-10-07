@@ -346,7 +346,9 @@ pub fn localScopeAlloc(alloc: std.mem.Allocator, index: []const u8, artifact: []
         };
     }
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
-    hash.update("antfly:local-source-completion:v1:");
+    // Revision-fenced receipts use a new namespace so historical counter drift
+    // is repaired once by the existing bounded source recovery owner.
+    hash.update("antfly:local-source-completion:v2:");
     for (requirements.nodes) |node| {
         if ((node.kind == .generated or node.kind == .unit_children) and (relevant.contains(node.artifact) or relevant.contains(node.embedding))) hash.update(&node.id);
     }
@@ -357,6 +359,17 @@ pub fn localScopeAlloc(alloc: std.mem.Allocator, index: []const u8, artifact: []
 pub fn localScopeIndex(scope: []const u8) []const u8 {
     return scope[0 .. std.mem.indexOf(u8, scope, "\x00producer-source:") orelse scope.len];
 }
+/// Primary replay revision for local producers. Identity creation generations
+/// fence delete/recreate, but deliberately do not advance on an overwrite.
+pub fn localPrimaryRevisionKeyAlloc(alloc: std.mem.Allocator, document: []const u8) ![]u8 {
+    return std.mem.concat(alloc, u8, &.{ "\x00\x00__source_primary_revision__:", document });
+}
+pub fn localPrimaryRevision(alloc: std.mem.Allocator, txn: anytype, document: []const u8) !?u64 {
+    const key = try localPrimaryRevisionKeyAlloc(alloc, document);
+    defer alloc.free(key);
+    return optionalRevision(txn, key);
+}
+
 pub fn localReceiptRevisionKeyAlloc(alloc: std.mem.Allocator, marker: []const u8) ![]u8 {
     return std.mem.concat(alloc, u8, &.{ "\x00\x00__source_completion_revision__:", marker });
 }
@@ -477,6 +490,13 @@ test "producer readiness local source receipts exclude upstream and sibling grap
     defer alloc.free(graph);
     try std.testing.expect(!std.mem.eql(u8, text, graph));
     try std.testing.expectEqualStrings("search", localScopeIndex(graph));
+    var legacy_hash = std.crypto.hash.sha2.Sha256.init(.{});
+    legacy_hash.update("antfly:local-source-completion:v1:");
+    var legacy_digest: [32]u8 = undefined;
+    legacy_hash.final(&legacy_digest);
+    const legacy_graph = try std.mem.concat(alloc, u8, &.{ "search", "\x00producer-source:", "relations", "\x00", &legacy_digest });
+    defer alloc.free(legacy_graph);
+    try std.testing.expect(!std.mem.eql(u8, graph, legacy_graph));
     nodes[0].id = @splat(9);
     const changed_text = try localScopeAlloc(alloc, "search", "chunks", &plan);
     defer alloc.free(changed_text);

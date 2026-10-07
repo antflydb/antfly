@@ -31,6 +31,18 @@ pub const AddTestsResult = struct {
 
 pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const antfly_test_mod = options.antfly_test_mod;
+    const producer_receipt_filters = [_][]const u8{
+        "producer readiness",
+        "derived coverage outcome transitions are exclusive and idempotent",
+        "graph projection preserves numeric literals in enrichment metadata and templates",
+    };
+    const producer_receipt_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &producer_receipt_filters,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-storage-producer-receipts-test", "Run primary revision receipt and cached graph publication regressions")
+        .dependOn(&addCuratedTestRunArtifact(b, producer_receipt_tests, &producer_receipt_filters).step);
     const relationship_identity_filters = [_][]const u8{
         "db graph endpoint cleanup pages",
         "derived worker pause",

@@ -75542,6 +75542,45 @@ test "db graph artifact edges are visible to graph search queries" {
     try std.testing.expect(result.graph_results[0].hits[0].stored_data != null);
 }
 
+test "producer readiness cached graph relations survive metadata overwrite and reopen" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("db");
+    defer directory.cleanup();
+    var fake = TestAssetProducer{ .extractor_output =
+        \\{"entities":[{"text":"Alice"},{"text":"doc:b"}],"relations":[{"type":"mentions","source":{"entity_index":0},"target":{"entity_index":1},"score":1.0}]}
+    };
+    const config: types.IndexConfig = .{
+        .name = "relations_graph",
+        .kind = .graph,
+        .config_json =
+        \\{"sources":[{"artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation","nodes":{"model":"document","target":"{{ _item.target.text }}"},"edge":{"weight":"{{ _item.score }}"}}],"artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"target_doc"},"content_type":"application/json","producer_json":{"type":"extractor","config":{"provider":"mock"}}}}
+        ,
+    };
+    {
+        var db = try DB.open(alloc, std.mem.span(directory.path().ptr), .{ .enrichment = .{ .asset_producer = fake.producer() } });
+        defer db.close();
+        try db.addIndex(config);
+        for ([_][]const u8{
+            "{\"title\":\"before\",\"target_doc\":\"doc:b\"}",
+            "{\"title\":\"after\",\"target_doc\":\"doc:b\"}",
+        }) |value| {
+            try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = value }}, .sync_level = .full_index });
+            try db.runUntilIdle();
+            const edges = try db.getEdges(alloc, config.name, "doc:a", "mentions", .out);
+            defer graph_mod.GraphIndex.freeEdges(alloc, edges);
+            try std.testing.expectEqual(@as(usize, 1), edges.len);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), fake.extractor_calls);
+    var reopened = try DB.open(alloc, std.mem.span(directory.path().ptr), .{ .enrichment = .{ .asset_producer = fake.producer() } });
+    defer reopened.close();
+    try reopened.runUntilIdle();
+    const edges = try reopened.getEdges(alloc, config.name, "doc:a", "mentions", .out);
+    defer graph_mod.GraphIndex.freeEdges(alloc, edges);
+    try std.testing.expectEqual(@as(usize, 1), edges.len);
+    try std.testing.expectEqual(@as(usize, 1), fake.extractor_calls);
+}
+
 test "db graph artifact external node targets return ids without document hydration" {
     const alloc = std.testing.allocator;
 
@@ -102328,6 +102367,34 @@ test "producer readiness local receipt migration retires only after source and c
     // Synchronous publication precedes its replay invalidation turn. The
     // current revision's receipt must survive that turn after an overwrite.
     try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"gold submarine\"}" }}, .sync_level = .full_index });
+    try std.testing.expect(try db.localArtifactSourceRecoveryIsServiceable(alloc, entry.intent));
+    // An asynchronous overwrite keeps the identity's creation generation but
+    // advances its primary revision. Its previous receipt must reopen debt.
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"bronze submarine\"}" }}, .sync_level = .write });
+    try local_mutation.deleteDerivedCoverageForDocKeys(alloc, db.core.store, db.core.index_manager, cfg.name, &.{"doc"});
+    {
+        var proof = try db.core.index_manager.acquireWritePlanSnapshot();
+        defer proof.release();
+        const pending_scope = try @import("artifact_producer_readiness.zig").localScopeAlloc(alloc, cfg.name, "copied", proof.plan());
+        defer alloc.free(pending_scope);
+        const marker = try internal_keys.derivedCoverageOutcomeKeyAlloc(alloc, pending_scope, db.core.index_manager.coverageGenerationForIndex(cfg.name).?, "doc");
+        defer alloc.free(marker);
+        try std.testing.expectError(error.NotFound, db.core.store.get(alloc, marker));
+    }
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"gold submarine\"}" }}, .sync_level = .full_index });
+    try std.testing.expect(try db.localArtifactSourceRecoveryIsServiceable(alloc, entry.intent));
+    // A repeated row must keep its producer revision even after another
+    // document has advanced the table's replay sequence.
+    var before_read = try db.core.store.beginReadTxn();
+    const primary_before = try @import("artifact_producer_readiness.zig").localPrimaryRevision(alloc, &before_read, "doc");
+    before_read.abort();
+    try db.batch(.{ .writes = &.{.{ .key = "other", .value = "{\"body\":\"other submarine\"}" }}, .sync_level = .full_index });
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"gold submarine\"}" }}, .sync_level = .write });
+    var after_read = try db.core.store.beginReadTxn();
+    const primary_after = try @import("artifact_producer_readiness.zig").localPrimaryRevision(alloc, &after_read, "doc");
+    after_read.abort();
+    try std.testing.expectEqual(primary_before, primary_after);
+    try local_mutation.deleteDerivedCoverageForDocKeys(alloc, db.core.store, db.core.index_manager, cfg.name, &.{ "doc", "doc" });
     try std.testing.expect(try db.localArtifactSourceRecoveryIsServiceable(alloc, entry.intent));
     const checkpoint = try db.core.loadProjectionCheckpoint(alloc, cfg.name);
     try db.core.saveProjectionCheckpoint(cfg.name, .{
