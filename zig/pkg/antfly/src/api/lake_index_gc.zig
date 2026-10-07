@@ -151,7 +151,7 @@ pub const Collector = struct {
     /// upgrade, while serving and rebuild selection continue to require current metadata.
     fn retainedNativeRoot(self: *Collector, a: A, comptime native: type, ref: local.serverless_manifest_artifact_ref.ArtifactRef) !native.Root {
         if (ref.metadata_version == native.metadata_version) return native.loadRoot(a, self.store, ref, self.cancellation(), null);
-        const supported_old = if (@hasField(native.Root, "tuple_encoding")) ref.metadata_version >= 2 and ref.metadata_version < native.metadata_version else ref.metadata_version +| 1 == native.metadata_version;
+        const supported_old = if (@hasField(native.Root, "seekable")) ref.metadata_version >= 1 and ref.metadata_version < native.metadata_version else if (@hasField(native.Root, "tuple_encoding")) ref.metadata_version >= 2 and ref.metadata_version < native.metadata_version else ref.metadata_version +| 1 == native.metadata_version;
         if (!supported_old) return error.InvalidNativeLakeGcReference;
         const limit = if (@hasDecl(native, "max_root_bytes")) native.max_root_bytes else @import("lake_index_native_files.zig").max_root_bytes;
         if (ref.byte_len > limit) return error.InvalidNativeLakeGcReference;
@@ -197,6 +197,14 @@ pub const Collector = struct {
         var visitor: Visitor = .{ .collector = self, .a = a };
         try @import("../serverless/graph_segment/page_tree.zig").walkPage(a, pages.store(), root, &visitor);
     }
+    pub fn markTextDirectory(self: *Collector, a: A, ref: artifacts.ChunkRef) !void {
+        const fresh = if (self.progress) |progress| try progress.expand(ref, "native-text-directory-v1") else try self.mark(ref);
+        if (!fresh) return;
+        try stores.chargeReadBudget(&self.remaining_reads, ref.byte_len);
+        const directory = try @import("lake_index_seekable_text.zig").loadDirectory(a, .{ .store = self.store, .cache = null, .context = .{}, .cancellation = self.cancellation() }, ref);
+        for (directory.metadata) |piece| _ = try self.mark(piece.ref);
+        for (directory.blocks) |piece| _ = try self.mark(piece.ref);
+    }
     pub fn markArtifact(self: *Collector, a: A, ref: local.serverless_manifest_artifact_ref.ArtifactRef) !void {
         const root_chunk: artifacts.ChunkRef = .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len };
         const fresh = if (self.progress) |progress| try progress.expand(root_chunk, @tagName(ref.kind)) else try self.mark(root_chunk);
@@ -233,10 +241,14 @@ pub const Collector = struct {
                 } else if (ref.metadata_version != 0) return error.InvalidNativeLakeGcReference;
             },
             .text_segment => {
-                if ((ref.metadata_version == @import("lake_index_native_text.zig").metadata_version or ref.metadata_version +| 1 == @import("lake_index_native_text.zig").metadata_version)) {
+                if (ref.metadata_version >= 1 and ref.metadata_version <= @import("lake_index_native_text.zig").metadata_version) {
                     try stores.chargeReadBudget(&self.remaining_reads, ref.byte_len);
                     const root = try self.retainedNativeRoot(a, @import("lake_index_native_text.zig"), ref);
-                    for (root.segments) |segment| _ = try self.mark(segment);
+                    for (root.segments) |segment| {
+                        if (root.seekable) {
+                            if (self.progress) |progress| try progress.enqueue(.{ .text_directory = segment }) else try self.markTextDirectory(a, segment);
+                        } else _ = try self.mark(segment);
+                    }
                 } else if (ref.metadata_version != 0) return error.InvalidNativeLakeGcReference;
             },
             .sparse_segment => {

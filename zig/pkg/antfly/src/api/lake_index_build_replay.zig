@@ -263,7 +263,7 @@ pub const Replay = struct {
         } else .{ .begin = .{ .row = 0, .byte = 0 }, .end = self.run.?.size };
         const cursor = try a.create(Cursor);
         errdefer a.destroy(cursor);
-        cursor.* = .{ .owner = self, .reader = try self.run.?.reader(a, range.begin, range.end), .arena = .init(a), .columns = binding.column_bindings, .cancellation = cancellation };
+        cursor.* = .{ .owner = self, .reader = try self.run.?.readerSealed(a, range.begin, range.end), .arena = .init(a), .columns = binding.column_bindings, .cancellation = cancellation };
         return .{ .kind = binding.source_kind, .ctx = cursor, .next_batch = Cursor.next, .deinit_fn = Cursor.deinit };
     }
     const Cursor = struct {

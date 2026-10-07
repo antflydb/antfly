@@ -893,7 +893,7 @@ fn executeScoredPhraseFilter(
         var missing_term = false;
         var lead_index: usize = 0;
         for (phrase_filter.terms, 0..) |term, i| {
-            const lookup = inv_reader.lookup(term) orelse {
+            const lookup = (try inv_reader.lookupChecked(term)) orelse {
                 missing_term = true;
                 break;
             };
@@ -1714,7 +1714,7 @@ fn initFastTermStates(
     const scoring_doc_count = snap.scoringDocCount();
 
     for (terms) |term| {
-        const lookup_result = inv_reader.lookup(term.term) orelse {
+        const lookup_result = (try inv_reader.lookupChecked(term.term)) orelse {
             if (require_all_terms) return null;
             continue;
         };

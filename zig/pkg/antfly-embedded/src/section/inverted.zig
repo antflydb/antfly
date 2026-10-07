@@ -2145,7 +2145,14 @@ const PostingAccumulator = struct {
 // ============================================================================
 
 /// Reads the origin/main v23 format and the current production format.
+pub const PostingsLoader = struct {
+    ptr: *anyopaque,
+    context: ?*anyopaque = null,
+    base: usize = 0,
+    ensure: *const fn (*anyopaque, ?*anyopaque, usize) anyerror!void,
+};
 pub const InvertedIndexReader = struct {
+    postings_loader: ?PostingsLoader = null,
     alloc: Allocator,
     data: []const u8,
     doc_count: u32,
@@ -2384,6 +2391,12 @@ pub const InvertedIndexReader = struct {
     /// Consults the per-segment term bloom filter before walking the FST
     /// when present, so absent-term lookups skip the FST traversal entirely.
     pub fn lookup(self: *const InvertedIndexReader, term: []const u8) ?LookupResult {
+        std.debug.assert(self.postings_loader == null);
+        return self.lookupChecked(term) catch unreachable;
+    }
+    /// Remote readers propagate I/O and request-authority failures rather
+    /// than turning them into an absent term.
+    pub fn lookupChecked(self: *const InvertedIndexReader, term: []const u8) !?LookupResult {
         if (self.term_bloom) |filter| {
             const h = termBloomHashes(term);
             if (!filter.maybeContainsHashes(h.h1, h.h2)) return null;
@@ -2399,7 +2412,7 @@ pub const InvertedIndexReader = struct {
             } };
         }
 
-        return .{ .postings = self.readPostings(dict_value) };
+        return .{ .postings = try self.readPostingsChecked(dict_value) };
     }
 
     /// Iterate all terms in the dictionary using the block-ceiling FST iterator.
@@ -2534,6 +2547,10 @@ pub const InvertedIndexReader = struct {
         return error.NotFound;
     }
 
+    fn readPostingsChecked(self: *const InvertedIndexReader, offset: u64) !TermPostings {
+        if (self.postings_loader) |loader| try loader.ensure(loader.ptr, loader.context, loader.base + self.postings_offset + @as(usize, @intCast(offset)));
+        return self.readPostings(offset);
+    }
     fn readPostings(self: *const InvertedIndexReader, offset: u64) TermPostings {
         // Dictionary values are deliberately u64. A force-merged full-text
         // section can exceed 4 GiB even though document IDs remain u32; do not
@@ -2753,7 +2770,7 @@ pub const TermIterator = struct {
                     .norm_bits = self.reader.normForDoc(@intCast(fstValDecode1Hit(value).doc_num)),
                 } }
             else
-                .{ .postings = self.reader.readPostings(value) };
+                .{ .postings = try self.reader.readPostingsChecked(value) };
 
             return .{ .term = self.current_key.items, .result = result };
         }

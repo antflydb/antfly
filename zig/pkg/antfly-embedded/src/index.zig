@@ -56,6 +56,8 @@ fn spinOrYield() void {
 }
 
 /// An entry in a snapshot: one segment plus optional deletion bitmap.
+pub const SegmentReader = segment_mod.SegmentReader;
+pub const PostingsLoader = segment_mod.PostingsLoader;
 pub const SegmentData = union(enum) {
     heap: []u8,
     mmap: []align(std.heap.page_size_min) u8,
@@ -64,6 +66,7 @@ pub const SegmentData = union(enum) {
         owner: *anyopaque,
         release: *const fn (*anyopaque) void,
         file_backed: bool,
+        postings_loader: ?PostingsLoader = null,
         advise_random: ?*const fn (*anyopaque) void = null,
         discard_clean_pages: ?*const fn (*anyopaque) void = null,
     },
@@ -1042,7 +1045,7 @@ pub const IndexSnapshot = struct {
                 upper_bound = 0;
                 if (try seg.reader.invertedIndex(field)) |inv_reader| {
                     for (terms, 0..) |term, term_idx| {
-                        const lookup_result = inv_reader.lookup(term) orelse continue;
+                        const lookup_result = (try inv_reader.lookupChecked(term)) orelse continue;
                         const df = if (term_doc_freqs[term_idx] != 0) term_doc_freqs[term_idx] else lookup_result.docFreq();
                         upper_bound += switch (lookup_result) {
                             .postings => |p| if (p.block_max) |block_max|
@@ -1097,7 +1100,7 @@ pub const IndexSnapshot = struct {
                 var added_terms: usize = 0;
 
                 for (terms, 0..) |term, term_idx| {
-                    const lookup_result = inv_reader.lookup(term) orelse continue;
+                    const lookup_result = (try inv_reader.lookupChecked(term)) orelse continue;
                     const iter = try lookup_result.iterator(alloc);
 
                     const block_max: ?inverted.BlockMaxInfo = switch (lookup_result) {
@@ -1295,7 +1298,7 @@ pub const IndexSnapshot = struct {
         var total: u32 = 0;
         for (self.segments) |*seg| {
             const inv_reader = (try seg.reader.invertedIndex(field)) orelse continue;
-            const lookup_result = inv_reader.lookup(term) orelse continue;
+            const lookup_result = (try inv_reader.lookupChecked(term)) orelse continue;
             total +|= lookup_result.docFreq();
         }
 
@@ -1335,7 +1338,7 @@ pub const IndexSnapshot = struct {
 
         const resolved = self.resolveDocId(doc_nums[0]) orelse return null;
         const inv_reader = (try self.segments[resolved.seg_idx].reader.invertedIndex(field)) orelse return null;
-        const lookup = inv_reader.lookup(term) orelse return null;
+        const lookup = (try inv_reader.lookupChecked(term)) orelse return null;
         var postings = try lookup.iterator(alloc);
         defer postings.deinit();
         const hit = (try postings.advanceTo(resolved.local_id)) orelse return null;
@@ -1552,6 +1555,27 @@ pub const IndexWriter = struct {
         fork.next_epoch = snapshot_ref.epoch + 1;
         for (snapshot_ref.segments) |segment| fork.next_segment_id = @max(fork.next_segment_id, segment.id + 1);
         return fork;
+    }
+
+    /// A query owns its authority context; immutable segment bytes and their
+    /// loaded posting blocks remain shared across readers and generations.
+    pub fn acquireSnapshotWithReadContext(self: *IndexWriter, context: *anyopaque) !*IndexSnapshot {
+        const old = self.acquireSnapshot();
+        defer old.release();
+        const segments = try self.alloc.dupe(SegmentEntry, old.segments);
+        errdefer self.alloc.free(segments);
+        var totals = try cloneGlobalFieldLens(self.alloc, old.global_total_field_len);
+        errdefer totals.deinit(self.alloc);
+        const empty = try IndexWriter.init(self.alloc);
+        const snapshot_ref = empty.current;
+        snapshot_ref.segments = segments;
+        snapshot_ref.global_total_field_len = totals;
+        snapshot_ref.epoch = old.epoch;
+        for (segments) |*segment| {
+            segment.retain();
+            if (segment.reader.postings_loader) |*loader| loader.context = context;
+        }
+        return snapshot_ref;
     }
 
     pub const ImmutableSegment = struct { snapshot: *IndexSnapshot, ordinal: usize, target_id: u64 };
@@ -1982,6 +2006,7 @@ pub const IndexWriter = struct {
         errdefer if (owned) |*data| data.deinit(self.alloc);
 
         var reader = try segment_mod.SegmentReader.init(self.alloc, owned.?.bytes());
+        if (owned.? == .owned_view) reader.postings_loader = owned.?.owned_view.postings_loader;
         errdefer reader.deinit();
 
         const old = @atomicLoad(*IndexSnapshot, &self.current, .acquire);
@@ -2095,6 +2120,7 @@ pub const IndexWriter = struct {
 
         for (replacements, 0..) |*replacement, i| {
             replacement_readers[i] = try segment_mod.SegmentReader.init(self.alloc, replacement.data.bytes());
+            if (replacement.data == .owned_view) replacement_readers[i].postings_loader = replacement.data.owned_view.postings_loader;
             replacement_readers_initialized += 1;
         }
 

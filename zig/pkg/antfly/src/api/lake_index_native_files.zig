@@ -240,7 +240,12 @@ pub const Reader = struct {
         errdefer block.release();
         while (block.state.load(.acquire) == .loading) {
             try self.check();
-            if (self.context.io) |io| try block.ready.wait(io) else @import("antfly_platform").time.yieldNow();
+            if (self.context.io) |io| {
+                block.ready.waitTimeout(io, .{ .duration = .{ .clock = .awake, .raw = .fromMilliseconds(10) } }) catch |err| switch (err) {
+                    error.Timeout => continue,
+                    else => return err,
+                };
+            } else @import("antfly_platform").time.yieldNow();
         }
         try self.check();
         if (block.state.load(.acquire) == .failed) return block.failure;
@@ -911,4 +916,43 @@ test "external lake native chunk flights overlap distinct loads and share identi
     }
     try std.testing.expectEqual(@as(usize, 2), spy.loads.load(.acquire));
     try std.testing.expectEqual(@as(usize, 2), reader.block_bytes);
+}
+
+test "external lake chunk wait observes its own deadline" {
+    const io = std.testing.io;
+    const block = try std.heap.page_allocator.create(Reader.Block);
+    block.* = .{ .id = "pending", .size = 0, .used = 0, .refs = .init(2) };
+    defer block.release();
+    var reader: Reader = .{ .root = undefined, .prefix = "", .store = undefined, .scratch = std.testing.allocator, .context = .{ .io = io, .deadline_ns = @import("antfly_platform").time.monotonicNs() + 100 * std.time.ns_per_ms } };
+    const Worker = struct {
+        reader: *Reader,
+        block: *Reader.Block,
+        done: std.atomic.Value(bool) = .init(false),
+        fn run(self: *@This()) void {
+            const result = self.reader.awaitBlock(self.block) catch {
+                self.done.store(true, .release);
+                return;
+            };
+            result.release();
+            self.done.store(true, .release);
+        }
+    };
+    var worker: Worker = .{ .reader = &reader, .block = block };
+    var task = io.concurrent(Worker.run, .{&worker}) catch |err| {
+        block.release();
+        return err;
+    };
+    var joined = false;
+    defer if (!joined) task.cancel(io);
+    try io.sleep(.fromMilliseconds(250), .awake);
+    const honored_deadline = worker.done.load(.acquire);
+    // Always unblock and join before reporting the assertion.
+    if (!honored_deadline) {
+        block.failure = error.TestLeaderFailed;
+        block.state.store(.failed, .release);
+        block.ready.set(io);
+    }
+    task.await(io);
+    joined = true;
+    try std.testing.expect(honored_deadline);
 }

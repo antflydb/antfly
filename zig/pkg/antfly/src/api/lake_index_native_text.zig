@@ -14,12 +14,13 @@ const Declared = local.serverless_segment_sidecar_manifest.DeclaredArtifact;
 const Ref = local.serverless_manifest_artifact_ref.ArtifactRef;
 const Cancellation = @import("antfly_cancellation").CancellationToken;
 const A = std.mem.Allocator;
-pub const metadata_version: u16 = 2;
+pub const metadata_version: u16 = 3;
 pub const max_root_bytes = 4 * 1024 * 1024;
 pub const max_segments = 8192;
 pub const FileGroup = struct { file: state.File, segments: []const artifacts.ChunkRef };
 pub const Root = struct {
     version: u16 = metadata_version,
+    seekable: bool = false,
     domain: [32]u8,
     binding: local.serverless_segment_source_binding.Binding,
     config_json: []const u8,
@@ -71,6 +72,8 @@ pub const SegmentLoader = struct {
 pub const CachedSegments = struct {
     store: stores.ArtifactStore,
     cache: artifacts.CachedRead,
+    seekable: bool = false,
+    query_owned: bool = false,
     pub fn loader(self: *CachedSegments) SegmentLoader {
         return .{ .ptr = self, .load = load };
     }
@@ -95,6 +98,10 @@ pub const CachedSegments = struct {
     fn load(raw: *anyopaque, a: A, ref: artifacts.ChunkRef, cancellation: Cancellation) !local.index.SegmentData {
         const self: *CachedSegments = @ptrCast(@alignCast(raw));
         try cancellation.check();
+        if (self.seekable) {
+            const read: @import("lake_index_seekable_text.zig").Read = .{ .store = self.store, .cache = self.cache, .context = self.cache.context, .cancellation = cancellation };
+            return if (self.query_owned) @import("lake_index_seekable_text.zig").loadQueryScoped(a, read, ref) else @import("lake_index_seekable_text.zig").load(a, read, ref);
+        }
         const Provider = struct {
             store: stores.ArtifactStore,
             ref: artifacts.ChunkRef,
@@ -126,7 +133,7 @@ pub fn loadWriter(a: A, store: stores.ArtifactStore, root: Root, cancellation: C
     for (root.segments, replacements, 0..) |segment, *replacement, ordinal| {
         try cancellation.check();
         try stores.chargeReadBudget(&read_bytes, segment.byte_len);
-        const data = if (loader) |mapped| try mapped.load(mapped.ptr, a, segment, cancellation) else local.index.SegmentData.fromOwnedHeap(try artifacts.readArtifact(a, store, segment, cancellation, cache));
+        const data = if (loader) |mapped| try mapped.load(mapped.ptr, a, segment, cancellation) else if (root.seekable) try @import("lake_index_seekable_text.zig").load(a, .{ .store = store, .cache = cache, .context = if (cache) |cached| cached.context else .{}, .cancellation = cancellation }, segment) else local.index.SegmentData.fromOwnedHeap(try artifacts.readArtifact(a, store, segment, cancellation, cache));
         replacement.* = .{ .id = ordinal + 1, .data = data };
         loaded += 1;
     }
@@ -160,7 +167,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             for (paths, runtime.relational_columns) |*path, column| path.* = column.name;
             binding.column_bindings = paths;
         }
-        binding.index_config_hash = try std.fmt.allocPrint(ca, "native-text-corpus-v2:{s}", .{want.binding.index_config_hash});
+        binding.index_config_hash = try std.fmt.allocPrint(ca, "native-text-corpus-v3:{s}", .{want.binding.index_config_hash});
         const recipe = state.recipe(table, spec.config_json);
         const prior = for (reusable) |declaration| {
             if (declaration.artifact.kind == .text_segment and declaration.artifact.metadata_version == metadata_version and std.mem.eql(u8, declaration.name, want.name) and rebuild.bindingsEqual(declaration.binding, binding)) break declaration;
@@ -245,7 +252,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             builder = mapper.TextProjectionBatchBuilder.initWithSelectedField(batch_arena.allocator(), analysis, runtime, null, selected_field);
             input_bytes = 0;
         }
-        const root: Root = .{ .domain = store.upload_scope.?.domain, .binding = binding, .config_json = spec.config_json, .segments = segments.items, .recipe = recipe, .file_groups = groups };
+        const root: Root = .{ .seekable = true, .domain = store.upload_scope.?.domain, .binding = binding, .config_json = spec.config_json, .segments = segments.items, .recipe = recipe, .file_groups = groups };
         try root.validate();
         const bytes = try std.json.Stringify.valueAlloc(ca, root, .{});
         if (bytes.len > max_root_bytes) return error.NativeLakeTextCorpusTooLarge;
@@ -267,7 +274,7 @@ fn flush(a: A, out: A, store: *stores.ArtifactStore, batch: mapper.TextProjectio
         output_bytes.* += bytes.len;
         var upload = store.*;
         upload.allocator = out;
-        const ref = try upload.putWithCancellation(bytes, cancellation);
+        const ref = try @import("lake_index_seekable_text.zig").publish(a, out, &upload, bytes, cancellation);
         try segments.append(out, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len });
     }
 }

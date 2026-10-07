@@ -348,12 +348,12 @@ const Owner = struct {
 };
 
 pub fn openPinned(a: A, server: *server_api.ApiHttpServer, table: catalog.Table, request: catalog.Scan, context: operation.RequestContext, source: *local.serverless_query_lake_serving.ServingSource) !catalog.Cursor {
-    return (try openWithPolicy(a, server, table, request, context, source, .required)) orelse error.ExternalLakeIndexUnavailable;
+    return (try openWithPolicy(a, server, table, request, context, source, .required, null)) orelse error.ExternalLakeIndexUnavailable;
 }
 
 pub fn tryOpenAuto(a: A, server: *server_api.ApiHttpServer, table: catalog.Table, request: catalog.Scan, context: operation.RequestContext, source: *local.serverless_query_lake_serving.ServingSource) !?catalog.Cursor {
     if (request.index_range != null or request.primary_order or request.row_refs != null or request.primary_key != null) return null;
-    if (request.index_equality != null) return openWithPolicy(a, server, table, request, context, source, .automatic);
+    if (request.index_equality != null) return openWithPolicy(a, server, table, request, context, source, .automatic, null);
     const definitions = table.external_indexes orelse return null;
     if (definitions.schema_json.len == 0 or server.source.lakeIndexLifecycleAuthority(context) == null) return null;
     var arena = std.heap.ArenaAllocator.init(a);
@@ -362,9 +362,22 @@ pub fn tryOpenAuto(a: A, server: *server_api.ApiHttpServer, table: catalog.Table
     var parsed = try local.schema_mod.parseValidatedTableSchema(a, definitions.schema_json);
     defer parsed.deinit(a);
     const indexes = (try parsed.relationalIndexDefinitions(ca)) orelse return null;
-    const chosen = try chooseAccess(ca, indexes, request);
-    const indexed = chosen orelse return null;
-    return openWithPolicy(a, server, table, indexed, context, source, .automatic);
+    // Enumerate usable paths, then cost authenticated range cardinalities
+    // after partial-predicate proof and covering checks.
+    var best: ?catalog.Cursor = null;
+    errdefer if (best) |cursor| cursor.close(cursor.ptr);
+    var best_cost: u64 = std.math.maxInt(u64);
+    for (indexes) |index| {
+        const indexed = (try chooseAccess(ca, &.{index}, request)) orelse continue;
+        var cost: u64 = 0;
+        const cursor = (try openWithPolicy(a, server, table, indexed, context, source, .automatic, &cost)) orelse continue;
+        if (cost < best_cost) {
+            if (best) |prior| prior.close(prior.ptr);
+            best = cursor;
+            best_cost = cost;
+        } else cursor.close(cursor.ptr);
+    }
+    return best;
 }
 
 fn orderedBy(index: local.storage_relational_index.RelationalIndexDefinition, request: catalog.Scan, equal_count: usize) bool {
@@ -423,7 +436,7 @@ fn chooseAccess(a: A, indexes: []const local.storage_relational_index.Relational
     return best;
 }
 
-fn openWithPolicy(a: A, server: *server_api.ApiHttpServer, table: catalog.Table, request: catalog.Scan, context: operation.RequestContext, source: *local.serverless_query_lake_serving.ServingSource, policy: @import("lake_index_selection.zig").Policy) !?catalog.Cursor {
+fn openWithPolicy(a: A, server: *server_api.ApiHttpServer, table: catalog.Table, request: catalog.Scan, context: operation.RequestContext, source: *local.serverless_query_lake_serving.ServingSource, policy: @import("lake_index_selection.zig").Policy, estimated_cost: ?*u64) !?catalog.Cursor {
     const index_name = if (request.index_range) |range| range.name else if (request.index_equality) |equality| equality.name else return error.ExternalLakeIndexUnavailable;
     if (request.primary_order or request.row_refs != null) return error.UnsupportedSqlExecution;
     const definitions = table.external_indexes orelse return error.ExternalLakeIndexUnavailable;
@@ -557,6 +570,16 @@ fn openWithPolicy(a: A, server: *server_api.ApiHttpServer, table: catalog.Table,
         equal_count += 1;
     }
     const order_satisfied = request.index_range != null and orderedBy(definition, request, equal_count);
+    if (estimated_cost) |cost| {
+        const candidates = if (empty_range) 0 else try owner.reader.countRange(ca, lower, upper);
+        var source_rows: u64 = 0;
+        for (source.inventory.files) |file| source_rows +|= file.row_count;
+        source_rows = @max(source_rows, if (root.page) |page| page.records else 0);
+        cost.* = accessCost(candidates, owner.covered, order_satisfied);
+        // Broad non-covering ranges prefer sequential physical page decoding.
+        const scan_cost = source_rows *| @as(u64, if (order_satisfied) 2 else 1);
+        if (cost.* > scan_cost and candidates != 0) return null;
+    }
     keep = true;
     return .{ .order_satisfied = order_satisfied, .ptr = owner, .next = Owner.next, .next_columns = Owner.nextColumns, .set_dynamic_filter = Owner.setDynamicFilter, .close = Owner.close };
 }
@@ -607,4 +630,17 @@ test "external lake ordered access plans equality prefixes ranges directions and
     var wrong_nulls = request;
     wrong_nulls.order = &.{.{ .column = "ts", .descending = true, .nulls_first = false }};
     try std.testing.expect(!orderedBy(index, wrong_nulls, 1));
+}
+
+/// Relative work units. Covering rows avoid random Parquet page gathers.
+fn accessCost(candidates: u64, covered: bool, ordered_access: bool) u64 {
+    const row_cost = if (covered) candidates / 8 else candidates *| 8;
+    return (row_cost +| 32) / @as(u64, if (ordered_access) 2 else 1);
+}
+
+test "external lake access cost favors selective and covering ranges" {
+    try std.testing.expect(accessCost(10, false, false) < 1000);
+    try std.testing.expect(accessCost(900, false, false) > 1000);
+    try std.testing.expect(accessCost(900, true, false) < 1000);
+    try std.testing.expect(accessCost(900, true, true) < accessCost(900, true, false));
 }

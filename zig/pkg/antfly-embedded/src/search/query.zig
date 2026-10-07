@@ -39,20 +39,8 @@ const typed_dv = @import("../section/typed_doc_values.zig");
 const geo = @import("geo.zig");
 const synonyms_mod = @import("../section/synonyms.zig");
 
-pub const FilterError = error{
-    OutOfMemory,
-    InvalidData,
-    InvalidMagic,
-    UnsupportedVersion,
-    InvalidFST,
-    SnappyError,
-    InvalidFormat,
-    InvalidAddress,
-    InvalidChunk,
-    CorruptInput,
-    InvalidSegment,
-    CrcMismatch,
-};
+// Remote posting readers preserve transport, cancellation and lease errors.
+pub const FilterError = anyerror;
 
 const geo_filter_earth_radius_meters: f64 = 6371008.8;
 
@@ -144,7 +132,7 @@ pub const TermFilter = struct {
         errdefer result.deinit();
 
         // Look up the primary term
-        if (inv_reader.lookup(self.term)) |lookup_result| {
+        if ((try inv_reader.lookupChecked(self.term))) |lookup_result| {
             switch (lookup_result) {
                 .postings => |p| {
                     var bm = try p.docBitmap(alloc);
@@ -168,7 +156,7 @@ pub const TermFilter = struct {
                 }
                 for (terms) |syn_term| {
                     if (std.mem.eql(u8, syn_term, self.term)) continue; // skip primary
-                    if (inv_reader.lookup(syn_term)) |syn_result| {
+                    if ((try inv_reader.lookupChecked(syn_term))) |syn_result| {
                         switch (syn_result) {
                             .postings => |p| {
                                 var bm = try p.docBitmap(alloc);
@@ -450,7 +438,7 @@ pub const PhraseFilter = struct {
         defer lookups.deinit(alloc);
 
         for (self.terms) |term| {
-            const lr = inv_reader.lookup(term) orelse {
+            const lr = (try inv_reader.lookupChecked(term)) orelse {
                 // Term not found — no phrase match possible
                 return roaring.RoaringBitmap.init(alloc);
             };
@@ -1294,7 +1282,7 @@ fn addGeoCellCandidatesToBitmap(
 ) FilterError!bool {
     if (cell_prefix.len >= geo.index_geohash_precision) {
         profile.direct_lookups += 1;
-        if (inv_reader.lookup(cell_prefix[0..geo.index_geohash_precision])) |lookup_result| {
+        if ((try inv_reader.lookupChecked(cell_prefix[0..geo.index_geohash_precision]))) |lookup_result| {
             try addLookupResultToBitmap(alloc, result, lookup_result);
         }
         return result.cardinality() <= profile.candidate_doc_budget;
@@ -1367,7 +1355,7 @@ pub const MultiPhraseFilter = struct {
                     errdefer alloc.free(owned_term);
                     try seen_terms.put(alloc, owned_term, {});
                     try owned_seen_terms.append(alloc, owned_term);
-                    const lr = inv_reader.lookup(term) orelse continue;
+                    const lr = (try inv_reader.lookupChecked(term)) orelse continue;
                     try position_lookups[pos_idx].append(alloc, lr);
                     any_found = true;
                     switch (lr) {
@@ -1392,7 +1380,7 @@ pub const MultiPhraseFilter = struct {
                     errdefer alloc.free(owned_term);
                     try seen_terms.put(alloc, owned_term, {});
                     try owned_seen_terms.append(alloc, owned_term);
-                    const lr = inv_reader.lookup(expanded_term) orelse continue;
+                    const lr = (try inv_reader.lookupChecked(expanded_term)) orelse continue;
                     try position_lookups[pos_idx].append(alloc, lr);
                     any_found = true;
                     switch (lr) {
@@ -1647,7 +1635,7 @@ pub const WildcardFilter = struct {
 
         if (plan.exact) {
             if (comptime collect_stats) stats.?.exact_lookup = true;
-            if (inv_reader.lookup(literal_prefix)) |lookup| {
+            if ((try inv_reader.lookupChecked(literal_prefix))) |lookup| {
                 if (comptime collect_stats) stats.?.matching_terms = 1;
                 try unionTermEntry(alloc, &result, .{ .term = literal_prefix, .result = lookup });
             }

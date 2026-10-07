@@ -63,6 +63,7 @@ pub const Cache = struct {
         while (true) {
             return self.acquireOnce(io, store, root_ref, root, schema_json, cached, context, cancellation) catch |err| {
                 if (err == error.NativeLakeTextCacheRetry) continue;
+                if (err == error.NativeLakeTextCacheBusy) self.evictIdle();
                 return err;
             };
         }
@@ -85,7 +86,7 @@ pub const Cache = struct {
                 self.mutex.unlock();
                 errdefer entry.release();
                 try entry.awaitReady(io, context);
-                return entry.source();
+                return try entry.source(store, cached, context, cancellation);
             }
         };
         self.mutex.unlock();
@@ -119,7 +120,7 @@ pub const Cache = struct {
                 self.mutex.unlock();
                 errdefer entry.release();
                 try entry.awaitReady(io, context);
-                return entry.source();
+                return try entry.source(store, cached, context, cancellation);
             }
             if (entry.references.load(.acquire) != 1) {
                 self.mutex.unlock();
@@ -250,7 +251,7 @@ pub const Cache = struct {
         entry.state.store(.ready, .release);
         entry.ready.set(io);
         try context.ensureActive();
-        return entry.source();
+        return try entry.source(store, cached, context, cancellation);
     }
     pub fn deinit(self: *Cache) void {
         platform.sync.lockYielding(&self.mutex);
@@ -300,12 +301,14 @@ const Entry = struct {
     failure: ?anyerror = null,
     arena: std.heap.ArenaAllocator,
     writer: ?local.index.IndexWriter = null,
+    seekable: bool = false,
     analysis: local.introducer.TextAnalysisConfig = .{},
     schema: ?local.storage_schema.TableSchema = null,
     name: []const u8 = "",
     allocator: A,
     resource_manager: ?*local.storage_resource_manager.ResourceManager = null,
     fn build(self: *Entry, io: std.Io, store: stores.ArtifactStore, root: corpus.Root, name: []const u8, schema_json: []const u8, cached: artifacts.CachedRead, cancellation: Cancellation, base: ?*Entry, peers: []const *Entry) !void {
+        self.seekable = root.seekable;
         const a = self.arena.allocator();
         var schema = try local.schema_mod.parseValidatedTableSchema(a, schema_json);
         defer schema.deinit(a);
@@ -351,7 +354,7 @@ const Entry = struct {
         defer self.allocator.free(replacements);
         var loaded: usize = 0;
         defer for (replacements[0..loaded]) |*replacement| replacement.data.deinit(self.allocator);
-        var loader: corpus.CachedSegments = .{ .store = store, .cache = cached };
+        var loader: corpus.CachedSegments = .{ .store = store, .cache = cached, .seekable = root.seekable, .query_owned = true };
         var read_bytes: u64 = 512 * 1024 * 1024;
         var position: usize = 0;
         while (position < additions.items.len) {
@@ -404,8 +407,22 @@ const Entry = struct {
         try context.ensureActive();
         if (self.failure) |failure| return failure;
     }
-    fn source(self: *Entry) local.storage_db_query_search_exec.PinnedTextSource {
-        return .{ .snapshot = self.writer.?.acquireSnapshot(), .name = self.name, .text_analysis = self.analysis, .runtime_schema = self.schema, .owner = self, .release_owner = releaseSource };
+    const QueryLease = struct {
+        entry: *Entry,
+        read: @import("lake_index_seekable_text.zig").Read,
+        fn release(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const entry = self.entry;
+            entry.allocator.destroy(self);
+            entry.release();
+        }
+    };
+    fn source(self: *Entry, store: stores.ArtifactStore, cached: artifacts.CachedRead, context: Context, cancellation: Cancellation) !local.storage_db_query_search_exec.PinnedTextSource {
+        if (!self.seekable) return .{ .snapshot = self.writer.?.acquireSnapshot(), .name = self.name, .text_analysis = self.analysis, .runtime_schema = self.schema, .owner = self, .release_owner = releaseSource };
+        const lease = self.allocator.create(QueryLease) catch return error.NativeLakeTextCacheBusy;
+        errdefer self.allocator.destroy(lease);
+        lease.* = .{ .entry = self, .read = .{ .store = store, .cache = cached, .context = context, .cancellation = cancellation } };
+        return .{ .snapshot = self.writer.?.acquireSnapshotWithReadContext(&lease.read) catch |err| return if (err == error.OutOfMemory) error.NativeLakeTextCacheBusy else err, .name = self.name, .text_analysis = self.analysis, .runtime_schema = self.schema, .owner = lease, .release_owner = QueryLease.release };
     }
     fn releaseSource(raw: *anyopaque) void {
         const self: *Entry = @ptrCast(@alignCast(raw));

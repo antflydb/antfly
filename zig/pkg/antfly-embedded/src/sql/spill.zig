@@ -910,6 +910,13 @@ pub const Sequential = struct {
     };
     pub fn reader(self: *Sequential, a: Allocator, begin: Position, end: u64) !Reader {
         try self.seal();
+        return self.readerSealed(a, begin, end);
+    }
+    /// Independent cursors over an already frozen run. Unlike reader(), this
+    /// never flushes or mutates the owner's writer state and can be called by
+    /// concurrent replay consumers. The owner joins them before writing/close.
+    pub fn readerSealed(self: *const Sequential, a: Allocator, begin: Position, end: u64) !Reader {
+        std.debug.assert(self.pending.items.len == 0 and self.file.write_buffer.len == 0 and self.file.write_job == null);
         if (begin.row > end or end > self.size or begin.byte > self.file.size) return error.InvalidSqlSpill;
         var file = self.file;
         file.read_buffer = &.{};

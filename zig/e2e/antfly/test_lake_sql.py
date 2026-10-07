@@ -948,6 +948,12 @@ def test_native_remote_text_corpus_scores_filters_and_restart(tmp_path):
         assert len(hits) == 4, result
         assert {hit["_source"]["label"] for hit in hits} == {"row-17", "row-18", "row-129", "row-2055"}
         assert all(hit["_score"] > 0 for hit in hits)
+        prefix_request = dict(request, full_text_search={"prefix": "need", "field": "body"})
+        prefix_result = call("POST", "/tables/lake_text/query", prefix_request)
+        assert {hit["_id"] for hit in prefix_result["hits"]["hits"]} == {hit["_id"] for hit in hits}
+        absent = call("POST", "/tables/lake_text/query", dict(request,
+                      full_text_search={"term": "absent", "field": "body"}))
+        assert absent["hits"]["hits"] == [], absent
         default_result = call("POST", "/tables/lake_text/query",
                               {"full_text_search": {"match": "needle", "field": "body"}, "full_text_index": "all_text", "limit": 10})
         assert [(hit["_id"], hit["_score"]) for hit in default_result["hits"]["hits"]] == [(hit["_id"], hit["_score"]) for hit in hits], default_result
@@ -1000,6 +1006,9 @@ def test_native_remote_text_corpus_scores_filters_and_restart(tmp_path):
         assert [(hit["_id"], hit["_score"]) for hit in sparse_reopened["hits"]["hits"]] == [(hit["_id"], hit["_score"]) for hit in sparse_result["hits"]["hits"]]
         warm = call("POST", "/tables/lake_text/query", request)
         assert [(hit["_id"], hit["_score"]) for hit in warm["hits"]["hits"]] == [(hit["_id"], hit["_score"]) for hit in hits]
+        prefix_reopened = call("POST", "/tables/lake_text/query", prefix_request)
+        assert [(hit["_id"], hit["_score"]) for hit in prefix_reopened["hits"]["hits"]] == [
+            (hit["_id"], hit["_score"]) for hit in prefix_result["hits"]["hits"]]
         continued = call("POST", "/tables/lake_text/query", dict(ordered_request,
                          search_after=sort_tuple, remote_snapshot=snapshot_token))
         assert [hit["_id"] for hit in continued["hits"]["hits"]] == [hit["_id"] for hit in hits[1:]], continued

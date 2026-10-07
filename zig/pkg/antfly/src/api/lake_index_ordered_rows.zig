@@ -329,6 +329,10 @@ pub const Reader = struct {
         if (cached != null) self.pages.read_cache = .{ .ptr = self, .read = readPage };
         self.cursor = try tree.Cursor.init(a, self.pages.store(), root.page, lower, upper);
     }
+    /// Enclosed immutable subtrees carry exact counts without leaf reads.
+    pub fn countRange(self: *Reader, a: A, lower: []const u8, upper: ?[]const u8) !u64 {
+        return tree.countRange(a, self.pages.store(), self.root.page, lower, upper);
+    }
     fn readPage(raw: *anyopaque, a: A, store: *stores.ArtifactStore, ref: Ref, offset: u64, len: usize, _: [32]u8, cancellation: Cancellation, budget: *u64) ![]u8 {
         const self: *Reader = @ptrCast(@alignCast(raw));
         if (offset != 0 or len != ref.byte_len) return error.InvalidNativeLakeRowIndex;

@@ -731,3 +731,38 @@ staging name. Fenced journal sweep batches remove staging alongside payload
 census, using the same durable continuation and collection cutoff. Legacy
 nonce staging cleanup and private checkpoint reclamation run after the durable
 completion receipt; they cannot prevent a completed collection from advancing.
+
+Native text corpus version 3 separates authenticated segment metadata from
+64 KiB posting blocks. Opening a corpus reads dictionaries, norms, identities
+and typed values, while exact term lookup and dictionary expansion fetch only
+the intersecting posting blocks. Absent terms need no posting reads. The local
+WAND/phrase/filter kernels and global BM25 statistics are shared with ordinary
+native segments. Concurrent queries share immutable segment storage and block
+flights, but each receives its own snapshot view and current store capability,
+deadline, cancellation and reader lease. Posting read failures propagate as
+errors, never as absent terms. Persistent immutable caching applies to metadata
+and posting blocks; decoded segment storage remains under the corpus heap
+budget. This reduces cold I/O without removing corpus memory admission limits.
+GC traverses every metadata and posting reference; retained version 1 and 2
+roots remain understood during upgrade. Reader/topology protocol 29 fences
+publication of the new format during rolling upgrades. The coordinator sees
+older publication protocols and refreshes them automatically; text queries wait
+for the new publication rather than interpreting the previous layout.
+
+Automatic ordered-index access now enumerates eligible definitions, proves
+partial predicates and covering columns, and counts candidate ranges through
+authenticated B+tree subtree counts. It compares selective gathers and covering
+reads with a sequential Parquet scan. The initial cost model uses conservative
+relative work units (random hydration costs more than sequential rows), with an
+ordering benefit; it does not yet estimate physical clustering or LIMIT-aware
+residual selectivity. Explicit index requests retain their required semantics.
+
+Aggregate contribution construction runs bounded waves of independent file
+reducers through the shared scheduler once replay capture is complete. Workers
+borrow immutable per-file replay readers and own spill state. The coordinator
+shares synchronized input-work admission across workers and joins them before
+publishing artifacts or changing contribution ownership. Fully retained subtrees still bypass leaf
+construction. Without replay, construction keeps the serial path rather than
+sharing mutable source discovery state across workers. Recursive join spill
+partitioning now selects typed blocks into child files, reusing key scratch and
+preserving physical ordinals without materializing payload row matrices.

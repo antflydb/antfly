@@ -32,6 +32,7 @@ pub const Job = union(enum) {
     artifact: Ref,
     contribution_page: Ref,
     chunk: artifacts.ChunkRef,
+    text_directory: artifacts.ChunkRef,
     page: struct { ref: tree.Ref, ordered_rows: bool, contributions: bool = false },
 };
 pub const Progress = struct {
@@ -93,6 +94,7 @@ pub const Progress = struct {
                 _ = try self.record(chunk);
             },
             .artifact => |artifact| try collector.markArtifact(a, artifact),
+            .text_directory => |ref| try collector.markTextDirectory(a, ref),
             .contribution_page => |page| {
                 if (!try self.expand(.{ .artifact_id = page.artifact_id, .checksum = page.checksum, .byte_len = page.byte_len }, "contributions")) return;
                 try stores.chargeReadBudget(&collector.remaining_reads, page.byte_len);

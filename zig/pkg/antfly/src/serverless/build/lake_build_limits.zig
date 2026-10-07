@@ -107,6 +107,7 @@ pub const WorkingSetAllocator = struct {
 
 pub const Budget = struct {
     limits: Limits,
+    mutex: std.atomic.Mutex = .unlocked,
     batches: usize = 0,
     rows: u64 = 0,
     input_bytes: usize = 0,
@@ -117,6 +118,10 @@ pub const Budget = struct {
     }
 
     pub fn admitBatch(self: *Budget, batch: rowsource.ColumnBatch) !void {
+        // Parallel file reducers share total-work admission, independently
+        // of each worker's private spill and allocator lifetime.
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.mutex.unlock();
         self.batches = std.math.add(usize, self.batches, 1) catch return error.LakeSidecarBuildBudgetExceeded;
         if (self.batches > self.limits.max_batches) return error.LakeSidecarBuildBudgetExceeded;
         self.rows = std.math.add(u64, self.rows, batch.rowCount()) catch return error.LakeSidecarBuildBudgetExceeded;

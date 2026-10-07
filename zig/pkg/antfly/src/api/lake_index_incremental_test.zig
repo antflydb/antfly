@@ -96,7 +96,8 @@ test "external lake incremental native publication appends replaces removes and 
                 try std.testing.expectEqual(expected, pooled.snapshot.liveDocCount());
                 var warm = try corpora.acquire(std.testing.io, store, declaration.artifact, root, schema_json, .{ .cache = &read_cache, .scope = @splat(1), .context = .{} }, .{}, .none);
                 defer warm.deinit();
-                try std.testing.expect(warm.snapshot == pooled.snapshot);
+                try std.testing.expect(warm.snapshot != pooled.snapshot);
+                for (warm.snapshot.segments, pooled.snapshot.segments) |left, right| try std.testing.expect(left.shared == right.shared);
                 if (std.mem.eql(u8, declaration.name, "all_text")) {
                     var encoded_bytes = declaration.artifact.byte_len;
                     for (root.segments) |segment| encoded_bytes += segment.byte_len;

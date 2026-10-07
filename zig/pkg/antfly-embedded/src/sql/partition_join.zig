@@ -449,13 +449,34 @@ pub const Join = struct {
                 while (offset < file.size) {
                     try self.manager.check();
                     _ = self.scratch.reset(.free_all);
-                    const row = try file.readBorrowed(offset);
-                    const hash = (try operators.HashJoin.keyHash(row.row.keys)) orelse 0;
-                    const child = &children[@intFromBool(hash & bit != 0)];
-                    const target = if (build_side) &child.build else &child.probes;
-                    if (target.* == null) target.* = try self.partitionFile();
-                    _ = try target.*.?.append(row.row, spill.none);
-                    offset = row.following;
+                    var input = try file.readInputBlockBorrowed(offset);
+                    defer input.deinit();
+                    const block = input.view();
+                    const a = self.scratch.allocator();
+                    const values = try block.batch(a, false);
+                    const keys = try block.batch(a, true);
+                    const selections = try a.alloc(usize, block.count());
+                    const ordinals = try a.alloc(u64, block.count());
+                    const key_cells = try a.alloc(Datum, block.keyWidth());
+                    const sides = try a.alloc(bool, block.count());
+                    for (sides, 0..) |*side, index| {
+                        for (key_cells, 0..) |*cell, column| cell.* = try block.keyCell(index, column);
+                        const hash = (try operators.HashJoin.keyHash(key_cells)) orelse 0;
+                        side.* = hash & bit != 0;
+                    }
+                    for (&children, 0..) |*child, side| {
+                        var count: usize = 0;
+                        for (sides, 0..) |selected, index| if (selected == (side != 0)) {
+                            selections[count] = index;
+                            ordinals[count] = block.ordinal(index);
+                            count += 1;
+                        };
+                        if (count == 0) continue;
+                        const target = if (build_side) &child.build else &child.probes;
+                        if (target.* == null) target.* = try self.partitionFile();
+                        try target.*.?.appendBatch(try values.select(a, selections[0..count]), try keys.select(a, selections[0..count]), ordinals[0..count]);
+                    }
+                    offset += block.count();
                 }
             }
         }

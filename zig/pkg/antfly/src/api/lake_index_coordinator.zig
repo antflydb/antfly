@@ -268,6 +268,19 @@ test "external lake native coordinator fences ambiguous admission and reuses dur
     try std.testing.expectEqual(@as(u64, 3), recovered.value.published.?.generation);
     try std.testing.expectEqual(published.value.namespace, recovered.value.namespace);
     try std.testing.expect(try durableDirectoryAvailable(a, &store, recovered.value.published.?, .none));
+    // A complete older directory is still a refresh obligation after a
+    // reader-format upgrade, even when every source signature is unchanged.
+    recovered.value.published.?.reader_protocol = 28;
+    const historical = try catalog.encode(a, recovered.value);
+    if (mock.owned) |bytes| a.free(bytes);
+    mock.owned = historical;
+    mock.table.lake_index_catalog_json = historical;
+    try reconcile(a, std.testing.io, mock.table, &source, &store, authority, .{}, .none, clock, options);
+    try std.testing.expectEqual(@as(usize, 7), mock.commits);
+    var upgraded = try catalog.parse(a, mock.table.lake_index_catalog_json);
+    defer upgraded.deinit();
+    try std.testing.expectEqual(catalog.native_reader_protocol, upgraded.value.published.?.reader_protocol);
+    try std.testing.expectEqual(@as(u64, 4), upgraded.value.published.?.generation);
 }
 
 test "external lake lease renewal extends a live fence and never replays an ambiguous CAS" {

@@ -308,7 +308,92 @@ const LeafResolver = struct {
     budget: *@import("../serverless/build/lake_build_limits.zig").Budget,
     cancellation: @import("antfly_cancellation").CancellationToken,
     contributions: *std.ArrayList(local.metadata_lake_index_catalog.FileContribution),
+    const Job = struct {
+        resolver: *LeafResolver,
+        leaf: Reduction.Leaf,
+        a: A,
+        spill: local.sql_spill.Manager = undefined,
+        group: ?*operators.Grouped = null,
+        budget: *@import("../serverless/build/lake_build_limits.zig").Budget,
+        fn run(self: *@This()) anyerror!void {
+            const owner = self.resolver;
+            self.spill = .{ .alloc = self.a, .io = owner.provider.context.io.?, .context = &owner.provider.context, .checkpoint = check, .async_writes = false };
+            const specs = try self.a.alloc(operators.AggregateSpec, owner.recipe.inputs.len);
+            defer self.a.free(specs);
+            for (owner.recipe.inputs, specs) |input, *spec| spec.* = input.spec;
+            self.group = try operators.Grouped.create(self.a, specs, .{ .groups = 2_000_000, .bytes = 8 * 1024 * 1024, .spill = &self.spill });
+            if (owner.recipe.keys.len == 0) try self.group.?.ensureGlobalGroup();
+            var provider = owner.provider.*;
+            provider.only_file = self.leaf.index;
+            try consumeCohort(self.a, &provider, owner.binding, owner.recipe, self.group.?, self.budget, owner.cancellation);
+        }
+        fn check(raw: *anyopaque) !void {
+            const context: *local.serverless_query_lake_read_context.Context = @ptrCast(@alignCast(raw));
+            try context.ensureActive();
+        }
+        fn deinit(self: *@This()) void {
+            if (self.group) |group| group.deinit();
+            self.spill.deinit();
+        }
+    };
+    fn present(self: *@This(), leaf: Reduction.Leaf) !bool {
+        var scratch = std.heap.ArenaAllocator.init(self.a);
+        defer scratch.deinit();
+        for (self.names, 0..) |name, slot| {
+            const single: recipes.Recipe = .{ .keys = self.recipe.keys, .inputs = self.recipe.inputs[slot..][0..1] };
+            const key = contributionKey(leaf.key, single.fingerprint(), name);
+            if (self.old.contains(key)) continue;
+            if (self.index) |index| if (try index.lookup(scratch.allocator(), key) != null) continue;
+            return false;
+        }
+        return true;
+    }
+    /// Only ready replay readers are shared. Capturing the scan, uploading
+    /// artifacts and changing contribution ownership remain coordinator work.
+    fn resolveParallel(self: *@This(), leaves: []const Reduction.Leaf) ![]const Reduction.Leaf {
+        const io = self.provider.context.io.?;
+        const replay = self.provider.replay orelse return leaves;
+        if (leaves.len < 2 or leaves.len > 8 or self.metadata_count) return leaves;
+        var needed: [8]bool = @splat(false);
+        var count: usize = 0;
+        for (leaves, 0..) |leaf, i| {
+            needed[i] = leaf.refs.len == 0 and !try self.present(leaf);
+            count += @intFromBool(needed[i]);
+        }
+        if (count < 2) return leaves;
+        // Freeze the replay before any worker can borrow a per-file reader.
+        const input = (try replay.open(self.a, self.binding, null, self.cancellation)) orelse return leaves;
+        input.deinit(self.a);
+        var locked: local.sql_parallel_scheduler.LockedAllocator = .{ .backing = self.a };
+        var jobs: [8]Job = undefined;
+        var tasks: [8]?local.sql_parallel_scheduler.Task(anyerror!void) = @splat(null);
+        var initialized: [8]bool = @splat(false);
+        defer {
+            for (&tasks) |*task| if (task.*) |*pending| {
+                if (pending.future != null) pending.cancel(io) catch {};
+            };
+            for (initialized, 0..) |ready, i| if (ready) jobs[i].deinit();
+        }
+        for (leaves, 0..) |leaf, i| if (needed[i]) {
+            jobs[i] = .{ .resolver = self, .leaf = leaf, .a = locked.allocator(), .budget = self.budget };
+            // Initialize even when a task is canceled before its first call.
+            jobs[i].spill = .{ .alloc = locked.allocator(), .io = io, .context = &self.provider.context, .checkpoint = Job.check, .async_writes = false };
+            initialized[i] = true;
+            tasks[i] = local.sql_parallel_scheduler.global().submit(io, 8 * 1024 * 1024, Job.run, .{&jobs[i]});
+            if (tasks[i] == null) try jobs[i].run();
+        };
+        // Join every worker before allocating through the coordinator arena.
+        for (&tasks) |*task| if (task.*) |*pending| try pending.await(io);
+        const resolved = try self.out.alloc(Reduction.Leaf, leaves.len);
+        for (leaves, resolved, 0..) |leaf, *result, i| {
+            result.* = if (leaf.refs.len != 0) leaf else try self.resolveWithPartial(leaf, if (needed[i]) jobs[i].group else null);
+        }
+        return resolved;
+    }
     fn resolve(self: *@This(), leaf: Reduction.Leaf) !Reduction.Leaf {
+        return self.resolveWithPartial(leaf, null);
+    }
+    fn resolveWithPartial(self: *@This(), leaf: Reduction.Leaf, prepared: ?*operators.Grouped) !Reduction.Leaf {
         try self.cancellation.check();
         try self.provider.context.ensureActive();
         const refs = try self.out.alloc(local.serverless_manifest_artifact_ref.ArtifactRef, self.names.len);
@@ -328,13 +413,15 @@ const LeafResolver = struct {
             const specs = try self.a.alloc(operators.AggregateSpec, self.recipe.inputs.len);
             defer self.a.free(specs);
             for (self.recipe.inputs, specs) |input, *spec| spec.* = input.spec;
-            const partial = try operators.Grouped.create(self.a, specs, .{ .groups = 2_000_000, .bytes = 8 * 1024 * 1024, .spill = self.spill });
-            defer partial.deinit();
-            if (self.recipe.keys.len == 0) try partial.ensureGlobalGroup();
-            self.provider.only_file = leaf.index;
-            defer self.provider.only_file = null;
-            const file = self.source.inventory.files[leaf.index];
-            if (self.metadata_count and self.source.inventory.format == .iceberg) try partial.addGlobalCount(file.row_count) else try consumeCohort(self.a, self.provider, self.binding, self.recipe, partial, self.budget, self.cancellation);
+            const partial = prepared orelse try operators.Grouped.create(self.a, specs, .{ .groups = 2_000_000, .bytes = 8 * 1024 * 1024, .spill = self.spill });
+            defer if (prepared == null) partial.deinit();
+            if (prepared == null) {
+                if (self.recipe.keys.len == 0) try partial.ensureGlobalGroup();
+                self.provider.only_file = leaf.index;
+                defer self.provider.only_file = null;
+                const file = self.source.inventory.files[leaf.index];
+                if (self.metadata_count and self.source.inventory.format == .iceberg) try partial.addGlobalCount(file.row_count) else try consumeCohort(self.a, self.provider, self.binding, self.recipe, partial, self.budget, self.cancellation);
+            }
             const published = if (self.recipe.keys.len != 0) try artifacts.publishPartitioned(self.a, self.out, self.store, self.names, partial, self.recipe, self.spill, self.cancellation) else try artifacts.publishCohort(self.a, self.out, self.store, self.names, partial, self.recipe, self.cancellation);
             @memcpy(refs, published);
             self.out.free(published);
@@ -418,8 +505,10 @@ const Reduction = struct {
             }
             self.out.free(retained_refs);
         }
-        const left = try self.reduce(leaves[0..split]);
-        const right = try self.reduce(leaves[split..]);
+        const prepared = if (self.resolver) |resolver| try resolver.resolveParallel(leaves) else leaves;
+        defer if (prepared.ptr != leaves.ptr) self.out.free(prepared);
+        const left = try self.reduce(prepared[0..split]);
+        const right = try self.reduce(prepared[split..]);
         const refs = try self.out.alloc(local.serverless_manifest_artifact_ref.ArtifactRef, self.names.len);
         var complete = true;
         for (self.names, 0..) |name, slot| {
@@ -792,13 +881,18 @@ test "external lake aggregate radix reductions reuse unchanged subtrees across a
         denied.get_object = Denied.get;
         if (phase != 0) source.scanner.object_reader.client.vtable = &denied;
         var provider: @import("lake_index_row_source.zig").Provider = .{ .source = &source, .context = .{ .io = std.testing.io } };
+        var replay = @import("lake_index_build_replay.zig").Replay.init(a, &provider, &.{"amount"});
+        defer replay.deinit();
+        provider.replay = &replay;
         if (phase != 0) {
             const changed = (try @import("lake_index_build_replay.zig").changedFiles(a, output.allocator(), &provider, store, previous.declarations, previous.contributions, .none)).?;
+            replay.only_files = changed;
             var count: usize = 0;
             for (changed) |file| count += @intFromBool(file);
             try std.testing.expectEqual(@as(usize, if (phase == 1) 1 else 0), count);
         }
         const built = try buildIncremental(a, output.allocator(), table, &source, &store, &provider, .none, &.{}, previous.contributions);
+        if (phase == 0) try std.testing.expect(replay.ready);
         try std.testing.expectEqual(@as(usize, 4), built.declarations.len);
         try std.testing.expectEqual((2 * source.inventory.files.len - 1) * 4, built.contributions.len);
         if (phase != 0) {

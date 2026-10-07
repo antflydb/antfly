@@ -273,7 +273,7 @@ test "external lake native publication builds scoped text artifacts and fences e
         const cache_root = try std.fs.path.join(a, &.{ directory.path(), "text-read-cache" });
         defer a.free(cache_root);
         try cache.ensurePersistent(cache_io.io(), cache_root, .{}, .{});
-        var cached_segments: native_text.CachedSegments = .{ .store = artifact_store, .cache = .{ .cache = &cache, .scope = @splat(4), .context = .{ .io = cache_io.io() } } };
+        var cached_segments: native_text.CachedSegments = .{ .store = artifact_store, .seekable = root.seekable, .cache = .{ .cache = &cache, .scope = @splat(4), .context = .{ .io = cache_io.io() } } };
         {
             var cold = try native_text.loadWriter(a, artifact_store, root, .none, null, cached_segments.loader());
             defer cold.deinit();
@@ -286,7 +286,7 @@ test "external lake native publication builds scoped text artifacts and fences e
         defer warm.deinit();
         const warm_snapshot = warm.acquireSnapshot();
         defer warm_snapshot.release();
-        for (warm_snapshot.segments) |segment| try std.testing.expect(segment.data.isFileBacked());
+        for (warm_snapshot.segments) |segment| try std.testing.expect(segment.reader.postings_loader != null);
         const warm_results = try warm_snapshot.search(a, "body", &.{"first"}, 10);
         defer a.free(warm_results.hits);
         try std.testing.expectEqual(results.total_count, warm_results.total_count);
@@ -300,7 +300,8 @@ test "external lake native publication builds scoped text artifacts and fences e
             defer first.deinit();
             var second = try corpora.acquire(cache_io.io(), artifact_store, declaration.artifact, root, schema_json, cached_segments.cache, .{ .io = cache_io.io() }, .none);
             defer second.deinit();
-            try std.testing.expectEqual(first.snapshot, second.snapshot);
+            try std.testing.expect(first.snapshot != second.snapshot);
+            for (first.snapshot.segments, second.snapshot.segments) |left, right| try std.testing.expect(left.shared == right.shared);
             try std.testing.expectError(error.NativeLakeTextCacheBusy, corpora.acquire(cache_io.io(), artifact_store, declaration.artifact, root, other_schema, cached_segments.cache, .{ .io = cache_io.io() }, .none));
         }
         // Once both readers drain the idle corpus can be replaced without
