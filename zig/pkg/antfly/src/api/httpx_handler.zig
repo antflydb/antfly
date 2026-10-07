@@ -13539,15 +13539,12 @@ test "httpx SQL executes one relational page with exact integer parameters" {
             defer ctx.deinit();
             var response = try handler.executeSQL(&ctx);
             defer response.deinit();
-            try std.testing.expectEqual(@as(u16, 200), response.status.code);
-            const result = try std.json.parseFromSlice(sql_wire.SQLResponse, alloc, response.body.?, .{});
+            // PostgreSQL does not expose SELECT labels to HAVING, even when
+            // the label is also a legal bare GROUP BY / ORDER BY name.
+            try std.testing.expectEqual(@as(u16, 400), response.status.code);
+            const result = try std.json.parseFromSlice(sql_wire.SQLDiagnostic, alloc, response.body.?, .{});
             defer result.deinit();
-            try std.testing.expectEqual(@as(usize, 1), result.value.rows.len);
-            try std.testing.expectEqual(@as(usize, 2), result.value.columns.len);
-            try std.testing.expectEqualStrings("status_key", result.value.columns[0].name);
-            try std.testing.expectEqualStrings("row_count", result.value.columns[1].name);
-            try std.testing.expectEqualStrings("open", result.value.rows[0][0].string);
-            try std.testing.expectEqualStrings("6", result.value.rows[0][1].string);
+            try std.testing.expectEqualStrings("42703", result.value.code);
         }
     }
     {

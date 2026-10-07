@@ -205,7 +205,7 @@ original entry remains identifiable by its canonical hash (sorted JSON keys,
 compact separators, UTF-8 without ASCII escaping).
 
 The matching `sql_parity_dispositions.json` must account for every ID exactly once.
-The current branch records 355 implemented, 136 rejected and 70 superseded
+The current branch records 352 implemented, 136 rejected and 73 superseded
 cases, with 1,025 still unresolved. The earlier batches add 77 exact compiler
 rejection contracts, 115 mounted native reads, twelve native UPDATE/DELETE
 contracts and six independently referenced mutations
@@ -420,7 +420,7 @@ Conditional scalar reads now use compiler-generated masked Apply producers.
 CASE, COALESCE and boolean short-circuit operators retain SQL NULL truth rules,
 and a producer is not opened until its branch is demanded. Prerequisite values
 are materialized once; binding and authorization still cover every branch.
-The shared PostgreSQL/native fixture checks 79 result contracts and 34 error
+The shared PostgreSQL/native fixture checks 85 result contracts and 44 error
 contracts, including demanded cardinality failures and invalid names in dead
 branches. Mutation tests additionally verify that an unused RETURNING producer
 reads no source rows, a demanded failure publishes no mutations, and unused
@@ -590,10 +590,18 @@ fail before mutation binding or native authorization.
 `sql-0019` has mounted `/db/v1/sql` execution of its exact computed-order
 `LIMIT 5` query over native typed rows. Nine distinct ranked rows verify the
 five returned IDs, excluded lower-ranked rows, and exact large-integer output.
-`sql-0020`, `sql-1254`, and `sql-1255` execute their exact grouped-read SQL
-through the same native-backed endpoint. Their evidence checks expression
-grouping, output-alias resolution in `GROUP BY`/`HAVING`, and the aggregate
-result across mixed-case source values.
+`sql-0020`, `sql-1254`, and `sql-1255` are PostgreSQL-tested supersessions of
+the original HAVING output-label extension, not successful grouped reads.
+Their exact unchanged SQL returns SQLSTATE 42703 through the native-backed
+endpoint and the PostgreSQL oracle. HAVING and compound ORDER BY / GROUP BY
+expressions use the input namespace. Bare GROUP BY labels are available only
+when no input column matches; bare ORDER BY labels prefer the output namespace.
+Duplicate labels are ambiguous only when their expressions differ. Missing
+input columns return 42703, while existing ungrouped input columns return 42803.
+The shared fixture covers collisions, equal/different duplicate labels, grouped
+source expressions, and undefined labels with the same PostgreSQL/native SQL.
+These corrections do not reduce the unresolved count or claim unsupported
+features as implemented.
 `sql-1221`, `sql-1222`, `sql-1256` through `sql-1264`
 execute their exact CTE queries through that endpoint. The fixture distinguishes
 JSON source filtering, missing JSON fields, missing status, CTE column aliases,

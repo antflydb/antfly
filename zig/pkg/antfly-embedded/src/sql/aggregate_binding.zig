@@ -110,9 +110,6 @@ const Builder = struct {
     alloc: Allocator,
     groups: []const *const ast.Scalar,
     table: ?catalog.Table = null,
-    output_columns: []const ast.Projection = &.{},
-    output_nodes: []const *const ast.Scalar = &.{},
-    aliases_enabled: bool = false,
     arguments: std.ArrayList(ast.Projection) = .empty,
     aggregates: std.ArrayList(*const ast.Scalar) = .empty,
     inputs: std.ArrayList(?usize) = .empty,
@@ -134,27 +131,6 @@ const Builder = struct {
             if (std.mem.eql(u8, input.column, name))
                 return self.node(.{ .column = try std.fmt.allocPrint(self.alloc, "$constant_{d}", .{index}) });
         };
-        if (self.aliases_enabled and input.* == .column) {
-            const source_exists = if (self.table) |definition| blk: {
-                _ = definition.column(input.column) catch break :blk false;
-                break :blk true;
-            } else false;
-            if (!source_exists) {
-                var match: ?usize = null;
-                for (self.output_columns, 0..) |projection, index| if (projection.alias) |alias| {
-                    if (!std.mem.eql(u8, alias, input.column)) continue;
-                    if (match != null) return error.AmbiguousSqlColumn;
-                    match = index;
-                };
-                if (match) |index| {
-                    // Output aliases are visible to HAVING/ORDER BY, but the
-                    // projection itself cannot recursively reference aliases.
-                    self.aliases_enabled = false;
-                    defer self.aliases_enabled = true;
-                    return self.rewrite(self.output_nodes[index]);
-                }
-            }
-        }
         if (input.* == .call and aggregateKind(input.call.name) != null) {
             const call = input.call;
             if (call.star and call.distinct) return error.InvalidSqlParameters;
@@ -179,7 +155,15 @@ const Builder = struct {
             return self.slot(self.groups.len + index);
         }
         return self.node(switch (input.*) {
-            .column => if (self.inference) input.* else return error.SqlGroupingError,
+            .column => if (self.inference) input.* else {
+                // Resolve the input namespace before enforcing grouping.
+                // Output labels are not visible inside HAVING or compound
+                // sort/group expressions (42703), while a real, ungrouped
+                // input column is a grouping error (42803).
+                const definition = self.table orelse return error.UndefinedColumn;
+                _ = try definition.column(input.column);
+                return error.SqlGroupingError;
+            },
             .literal => input.*,
             .unary => |unary| .{ .unary = .{ .op = unary.op, .operand = try self.rewrite(unary.operand) } },
             .binary => |binary| .{ .binary = .{ .op = binary.op, .left = try self.rewrite(binary.left), .right = try self.rewrite(binary.right) } },
@@ -209,10 +193,9 @@ pub fn bind(alloc: Allocator, table: ?catalog.Table, statement: ast.Select, para
 
 pub fn bindWithSettings(alloc: Allocator, table: ?catalog.Table, statement: ast.Select, parameters: []?ast.ColumnType, settings: ?*const @import("setting_catalog.zig").View) !Bound {
     if (statement.columns.len == 0) return error.SqlGroupingError;
-    var builder: Builder = .{ .alloc = alloc, .groups = statement.group_by, .table = table, .output_columns = statement.columns, .constants = statement.invocation_constants };
+    var builder: Builder = .{ .alloc = alloc, .groups = statement.group_by, .table = table, .constants = statement.invocation_constants };
     const projection_nodes = try alloc.alloc(*const ast.Scalar, statement.columns.len);
     for (statement.columns, projection_nodes) |projection, *node| node.* = projection.expression orelse try builder.node(.{ .column = projection.field });
-    builder.output_nodes = projection_nodes;
     const groups = try alloc.alloc(*const ast.Scalar, statement.group_by.len);
     for (statement.group_by, groups) |group, *out| {
         out.* = group;
@@ -225,10 +208,14 @@ pub fn bindWithSettings(alloc: Allocator, table: ?catalog.Table, statement: ast.
                 _ = definition.column(group.column) catch break :blk false;
                 break :blk true;
             } else false;
-            if (!source_exists) for (statement.columns, projection_nodes) |projection, node| if (projection.alias) |alias| if (std.mem.eql(u8, alias, group.column)) {
-                out.* = node;
-                break;
-            };
+            if (!source_exists) {
+                var match: ?*const ast.Scalar = null;
+                for (statement.columns, projection_nodes) |projection, node| if (std.mem.eql(u8, projection.alias orelse projection.field, group.column)) {
+                    if (match) |previous| if (!same(previous, node)) return error.AmbiguousSqlColumn;
+                    match = node;
+                };
+                if (match) |node| out.* = node;
+            }
         }
         if (contains(out.*)) return error.SqlGroupingError;
         try builder.arguments.append(alloc, .{ .expression = out.* });
@@ -236,7 +223,6 @@ pub fn bindWithSettings(alloc: Allocator, table: ?catalog.Table, statement: ast.
     builder.groups = groups;
     const outputs = try alloc.alloc(*const ast.Scalar, projection_nodes.len);
     for (projection_nodes, outputs) |node, *out| out.* = try builder.rewrite(node);
-    builder.aliases_enabled = true;
     const having = if (statement.having) |node| try builder.rewrite(node) else null;
     const order_nodes = try alloc.alloc(*const ast.Scalar, statement.order_by.len);
     for (statement.order_by, order_nodes) |order, *out| {
@@ -247,7 +233,7 @@ pub fn bindWithSettings(alloc: Allocator, table: ?catalog.Table, statement: ast.
         } else if (expression == null) {
             var found: ?usize = null;
             for (statement.columns, 0..) |projection, index| if (std.mem.eql(u8, projection.alias orelse projection.field, order.field)) {
-                if (found != null) return error.AmbiguousSqlColumn;
+                if (found) |previous| if (!same(projection_nodes[previous], projection_nodes[index])) return error.AmbiguousSqlColumn;
                 found = index;
             };
             expression = if (found) |index| projection_nodes[index] else try builder.node(.{ .column = order.field });
@@ -265,9 +251,7 @@ pub fn bindWithSettings(alloc: Allocator, table: ?catalog.Table, statement: ast.
         break :blk result;
     } else &.{};
     const inference_nodes = try alloc.alloc(*const ast.Scalar, projection_nodes.len);
-    builder.aliases_enabled = false;
     for (projection_nodes, inference_nodes) |node, *out| out.* = try builder.rewrite(node);
-    builder.aliases_enabled = true;
     const inference_having = if (statement.having) |node| try builder.rewrite(node) else null;
     var inference_pass: usize = 0;
     while (true) : (inference_pass += 1) {
@@ -359,14 +343,15 @@ test "aggregate binding rejects nested aggregate and ungrouped row references" {
         defer compiled.deinit();
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer arena.deinit();
-        if (std.mem.eql(u8, sql, "SELECT count()")) try std.testing.expectError(error.InvalidSqlParameters, bind(arena.allocator(), null, compiled.statement.select, &.{})) else try std.testing.expectError(error.SqlGroupingError, bind(arena.allocator(), null, compiled.statement.select, &.{}));
+        const expected = if (std.mem.eql(u8, sql, "SELECT count()")) error.InvalidSqlParameters else if (std.mem.eql(u8, sql, "SELECT missing, count(*)")) error.UndefinedColumn else error.SqlGroupingError;
+        try std.testing.expectError(expected, bind(arena.allocator(), null, compiled.statement.select, &.{}));
     }
 }
 
-test "aggregate HAVING resolves grouped and aggregate output aliases" {
+test "aggregate HAVING binds input expressions while bare sort and group labels resolve outputs" {
     for ([_][]const u8{
-        "SELECT lower('OPEN') AS status_key, count(*) AS row_count GROUP BY lower('OPEN') HAVING status_key = 'open' ORDER BY status_key",
-        "SELECT 1 AS k, count(*) AS row_count GROUP BY k HAVING row_count > 0 ORDER BY k",
+        "SELECT lower('OPEN') AS status_key, count(*) AS row_count GROUP BY lower('OPEN') HAVING lower('OPEN') = 'open' ORDER BY status_key",
+        "SELECT 1 AS k, count(*) AS row_count GROUP BY k HAVING count(*) > 0 ORDER BY k",
     }) |sql| {
         var compiled = try @import("compiler.zig").compile(std.testing.allocator, sql, .{});
         defer compiled.deinit();
@@ -378,10 +363,10 @@ test "aggregate HAVING resolves grouped and aggregate output aliases" {
     }
 }
 
-test "aggregate HAVING rejects ambiguous output aliases" {
+test "aggregate HAVING cannot see even ambiguous output aliases" {
     var compiled = try @import("compiler.zig").compile(std.testing.allocator, "SELECT 1 AS k, 2 AS k, count(*) AS n GROUP BY 1, 2 HAVING k = 1", .{});
     defer compiled.deinit();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    try std.testing.expectError(error.AmbiguousSqlColumn, bind(arena.allocator(), null, compiled.statement.select, &.{}));
+    try std.testing.expectError(error.UndefinedColumn, bind(arena.allocator(), null, compiled.statement.select, &.{}));
 }

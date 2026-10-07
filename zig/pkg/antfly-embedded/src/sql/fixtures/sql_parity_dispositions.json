@@ -464,8 +464,8 @@
     },
     {
       "id": "sql-0020",
-      "status": "implemented",
-      "reason": "Exact source SQL executes through mounted HTTP over native typed rows; lower(status) grouping, HAVING output-alias filtering, and the grouped count are asserted.",
+      "status": "superseded",
+      "reason": "PostgreSQL supersedes the original HAVING output-alias extension: the exact SQL returns UndefinedColumn (42703) through the mounted native endpoint. The PostgreSQL oracle independently verifies that the SELECT label is not visible to HAVING; bare GROUP BY and ORDER BY labels retain their own namespace rules.",
       "evidence": [
         {
           "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
@@ -11410,8 +11410,8 @@
     },
     {
       "id": "sql-1254",
-      "status": "implemented",
-      "reason": "Exact expression-grouped aggregate SQL executes through mounted HTTP over native typed rows with HAVING output-alias filtering and the grouped count asserted.",
+      "status": "superseded",
+      "reason": "PostgreSQL supersedes the original HAVING output-alias extension: the exact SQL returns UndefinedColumn (42703) through the mounted native endpoint. The PostgreSQL oracle independently verifies that the SELECT label is not visible to HAVING; bare GROUP BY and ORDER BY labels retain their own namespace rules.",
       "evidence": [
         {
           "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
@@ -11422,8 +11422,8 @@
     },
     {
       "id": "sql-1255",
-      "status": "implemented",
-      "reason": "Exact source SQL executes through mounted HTTP over native typed rows; GROUP BY and HAVING resolve the expression alias and return the asserted count.",
+      "status": "superseded",
+      "reason": "PostgreSQL supersedes the original HAVING output-alias extension: the exact SQL returns UndefinedColumn (42703) through the mounted native endpoint. The PostgreSQL oracle independently verifies that the SELECT label is not visible to HAVING; bare GROUP BY and ORDER BY labels retain their own namespace rules.",
       "evidence": [
         {
           "path": "zig/pkg/antfly/src/api/httpx_handler.zig",

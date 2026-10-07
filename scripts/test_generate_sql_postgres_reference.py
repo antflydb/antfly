@@ -40,6 +40,32 @@ class PostgresReferenceTest(unittest.TestCase):
         cls.db = cls.server.__enter__()
         cls.addClassCleanup(cls.server.__exit__, None, None, None)
 
+    def test_original_grouped_output_labels_are_not_visible_to_having(self):
+        import json
+        from pathlib import Path
+        import psycopg
+
+        inventory = json.loads(
+            (
+                Path(__file__).resolve().parents[1]
+                / "zig/pkg/antfly-embedded/src/sql/fixtures/sql_parity_inventory.json"
+            ).read_text()
+        )
+        cases = [
+            case
+            for case in inventory["entries"]
+            if case["id"] in {"sql-0020", "sql-1254", "sql-1255"}
+        ]
+        self.assertEqual(3, len(cases))
+        with self.db.transaction(force_rollback=True):
+            self.db.execute("CREATE TABLE usage_records(status text)")
+            for case in cases:
+                with self.subTest(id=case["id"]):
+                    with self.assertRaises(psycopg.errors.UndefinedColumn) as error:
+                        with self.db.transaction(force_rollback=True):
+                            self.db.execute(case["sql"])
+                    self.assertEqual("42703", error.exception.sqlstate)
+
     def test_original_catalog_subquery_defaults_are_not_postgres_features(self):
         import json
         from pathlib import Path
@@ -516,8 +542,8 @@ class PostgresReferenceTest(unittest.TestCase):
                 / "zig/pkg/antfly-embedded/src/sql/fixtures/sql_conditional_subquery_reference.json"
             ).read_text()
         )
-        self.assertEqual(79, len(fixture["entries"]))
-        self.assertEqual(34, len(fixture["errors"]))
+        self.assertEqual(85, len(fixture["entries"]))
+        self.assertEqual(44, len(fixture["errors"]))
         for case in fixture["entries"]:
             with self.subTest(sql=case["sql"]):
                 self.assertEqual(

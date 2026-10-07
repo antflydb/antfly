@@ -1,6 +1,12 @@
 {
   "reference": "PostgreSQL 18 demand-driven conditional subquery values and SQLSTATE contracts",
   "entries": [
+    {"sql": "SELECT COUNT(*) FROM (SELECT SUM(2) AS k,SUM(2) AS k ORDER BY k) t", "rows": [1]},
+    {"sql": "SELECT COUNT(*) FROM (SELECT 1 AS k,1 AS k,COUNT(*) GROUP BY k) t", "rows": [1]},
+    {"sql": "SELECT SUM(x) AS k FROM (SELECT 1 AS x,2 AS k UNION ALL SELECT 3,2) t GROUP BY k", "rows": [4]},
+    {"sql": "SELECT x+1 AS x FROM (SELECT 1 AS x UNION ALL SELECT 2) t GROUP BY x ORDER BY x DESC LIMIT 1", "rows": [3]},
+    {"sql": "SELECT -x AS x FROM (SELECT 1 AS x UNION ALL SELECT 2) t GROUP BY x ORDER BY x+1 DESC LIMIT 1", "rows": [-2]},
+    {"sql": "SELECT SUM(x) AS x FROM (SELECT 1 AS x UNION ALL SELECT 2) t GROUP BY x HAVING x=1", "rows": [1]},
     {"sql": "SELECT CASE WHEN TRUE THEN 7 ELSE (SELECT 1 UNION ALL SELECT 2) END", "rows": [7]},
     {"sql": "SELECT CASE WHEN FALSE THEN (SELECT 1 UNION ALL SELECT 2) ELSE 8 END", "rows": [8]},
     {"sql": "SELECT CASE WHEN NULL THEN (SELECT 1 UNION ALL SELECT 2) ELSE 8 END", "rows": [8]},
@@ -82,6 +88,16 @@
     {"sql": "SELECT (SELECT SUM(i.x) OVER () FROM (SELECT 1 AS x UNION ALL SELECT 2 UNION ALL SELECT 3) i LIMIT 1)", "rows": [6]}
   ],
   "errors": [
+    {"sql": "SELECT 1 AS k,SUM(2) AS total HAVING total>0", "code": "42703"},
+    {"sql": "SELECT 1 AS k,SUM(2) AS total GROUP BY k ORDER BY total+1", "code": "42703"},
+    {"sql": "SELECT 1 AS k,2 AS k,COUNT(*) GROUP BY k", "code": "42702"},
+    {"sql": "SELECT SUM(2) AS k,COUNT(*) AS k ORDER BY k", "code": "42702"},
+    {"sql": "SELECT missing,COUNT(*)", "code": "42703"},
+    {"sql": "SELECT x,COUNT(*) FROM (SELECT 1 AS x) t", "code": "42803"},
+    {"sql": "SELECT 1 AS k,COUNT(*) GROUP BY k+1", "code": "42703"},
+    {"sql": "SELECT x+1 AS k,COUNT(*) FROM (SELECT 1 AS x) t GROUP BY k+1", "code": "42703"},
+    {"sql": "SELECT lower('OPEN') AS status_key,COUNT(*) GROUP BY lower('OPEN') HAVING status_key='open'", "code": "42703"},
+    {"sql": "SELECT SUM(x) AS k FROM (SELECT 1 AS x) t GROUP BY x ORDER BY k+1", "code": "42703"},
     {"sql": "SELECT CASE WHEN TRUE THEN (SELECT 1 UNION ALL SELECT 2) ELSE 7 END", "code": "21000"},
     {"sql": "SELECT COALESCE(NULL::bigint, (SELECT 1 UNION ALL SELECT 2))", "code": "21000"},
     {"sql": "SELECT NULL::boolean AND (SELECT TRUE UNION ALL SELECT FALSE)", "code": "21000"},

@@ -680,7 +680,7 @@ const Builder = struct {
         result.columns = try projections.toOwnedSlice(self.alloc);
         result.predicate = if (statement.predicate) |input| try self.predicate(source.columns, input) else null;
         const groups = try self.alloc.alloc(*const ast.Scalar, statement.group_by.len);
-        for (statement.group_by, groups) |input, *out| out.* = try self.expression(source.columns, input, result.columns);
+        for (statement.group_by, groups) |input, *out| out.* = try self.expression(source.columns, input, if (input.* == .column) result.columns else &.{});
         result.group_by = groups;
         result.having = if (statement.having) |input| try self.expression(source.columns, input, &.{}) else null;
         const window_orders = @import("window_binding.zig").accepts(statement);
