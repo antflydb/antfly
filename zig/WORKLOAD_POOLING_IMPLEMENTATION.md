@@ -1049,3 +1049,15 @@ separate archive execution and whole-production startup/shutdown of the new
 wiring remain pending. Inference/background execution admission, inherited
 provider grants across the inference boundary, completion ownership, pressure
 qualification and automatic defaults remain required.
+
+### Weighted execution capsules (2026-10-07)
+
+The stable execution capsule can now admit explicit slot demand while keeping
+its original count, memory and deadline owners across yields, waits and class
+transitions. Existing callers remain one-slot. Atomic demand rejection has an
+append-only stable error ABI detail. All 15 scheduler and 26 error-ABI contracts
+pass natively and with pinned Nix/glibc GNU AArch64; the
+[weighted receipt](qualification/workload-pooling/receipts/2026-10-07/weighted-execution/README.md)
+pins source bytes and complete output. Cross-archive execution operations,
+inference/background callers and CPU-team enforcement remain pending, along
+with the full API/production gate for these bytes and automatic defaults.

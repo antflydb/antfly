@@ -479,9 +479,14 @@ pub const Execution = struct {
     resume_generation: u64 = 0,
 
     pub fn start(self: *Execution, scheduler: ?*Scheduler, options: admission.Options, class: Class) !void {
+        try self.startWithSlots(scheduler, options, class, 1);
+    }
+    /// One stable capsule can account for a bounded CPU team. Its demand stays
+    /// attached across yields and waits, independently of retained memory.
+    pub fn startWithSlots(self: *Execution, scheduler: ?*Scheduler, options: admission.Options, class: Class, slots: usize) !void {
         std.debug.assert(self.entry == null);
         const owner = scheduler orelse return;
-        self.entry = .{ .options = options, .class = class, .bytes = options.retained_bytes };
+        self.entry = .{ .options = options, .class = class, .slots = slots, .bytes = options.retained_bytes };
         errdefer self.finish();
         try owner.submit(&self.entry.?);
         try owner.wait(&self.entry.?);
@@ -525,6 +530,46 @@ pub const Execution = struct {
 
 fn testEntry(class: Class, slots: usize, bytes: u64) Entry {
     return .{ .options = .{ .io = std.testing.io }, .class = class, .slots = slots, .bytes = bytes };
+}
+
+test "runnable scheduler weighted execution retains CPU demand across waits and class changes" {
+    var scheduler = try Scheduler.init(.{ .slots = 4, .checkpoint_budget = 1 });
+    defer scheduler.close();
+    var inference: Execution = .{};
+    defer inference.finish();
+    try inference.startWithSlots(&scheduler, .{ .io = std.testing.io, .retained_bytes = 11 }, .inference, 2);
+    var background: Execution = .{};
+    defer background.finish();
+    try background.startWithSlots(&scheduler, .{ .io = std.testing.io, .retained_bytes = 7 }, .background, 1);
+    var control: Execution = .{};
+    defer control.finish();
+    try control.start(&scheduler, .{ .io = std.testing.io }, .control);
+    try std.testing.expectEqual(@as(usize, 4), scheduler.stats().runnable_slots);
+    try std.testing.expectEqual(@as(usize, 1), scheduler.stats().control_slots);
+    try inference.park(.resource_blocked);
+    try std.testing.expectEqual(@as(usize, 2), scheduler.stats().runnable_slots);
+    try std.testing.expectEqual(@as(u64, 18), scheduler.stats().retained_bytes);
+    try inference.enter(.inference);
+    try inference.checkpoint();
+    try std.testing.expect(inference.resume_generation > 2);
+    try std.testing.expectEqual(@as(usize, 4), scheduler.stats().runnable_slots);
+    background.finish();
+    control.finish();
+    try inference.park(.output_blocked);
+    try inference.enter(.query);
+    try std.testing.expectEqual(Class.query, inference.entry.?.class);
+    try std.testing.expectEqual(@as(usize, 2), scheduler.stats().runnable_slots);
+    inference.finish();
+    try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+    try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+    var invalid: Execution = .{};
+    defer invalid.finish();
+    for ([_]usize{ 0, 4 }) |slots| {
+        try std.testing.expectError(error.InvalidRunnableDemand, invalid.startWithSlots(&scheduler, .{ .io = std.testing.io, .retained_bytes = 19 }, .query, slots));
+        try std.testing.expect(invalid.entry == null);
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+    }
 }
 
 test "runnable scheduler node owner outlives independent borrowers and executions" {

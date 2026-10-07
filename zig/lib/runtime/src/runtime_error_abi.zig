@@ -24,6 +24,14 @@ const std = @import("std");
 
 pub const abi_version: u32 = 1;
 
+test "runnable demand error remains append-only and rejects forged behavior" {
+    try std.testing.expectEqual(@backingInt(Detail.backend_runtime_unavailable) + 1, @backingInt(Detail.invalid_runnable_demand));
+    const value = statusFromError(error.InvalidRunnableDemand);
+    try std.testing.expectEqual(@backingInt(Code.invalid_argument), value.code);
+    try std.testing.expectEqual(error.InvalidRunnableDemand, errorFromStatus(value));
+    try std.testing.expectEqual(error.RuntimeBoundaryFailure, errorFromStatus(.{ .code = @backingInt(Code.internal), .detail = value.detail }));
+}
+
 test "execution wait scheduling details are append-only and preserve behavior classes" {
     try std.testing.expectEqual(@backingInt(Detail.invalid_sql_spill) + 1, @backingInt(Detail.runnable_wait_timeout));
     const cases = [_]struct { err: anyerror, code: Code }{
@@ -752,6 +760,7 @@ pub const Detail = enum(c_int) {
     execution_wait_unsupported,
     read_safety_barrier_unavailable,
     backend_runtime_unavailable,
+    invalid_runnable_demand,
 };
 
 pub const Status = extern struct {
@@ -773,6 +782,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.SchedulerClosed => status(.unavailable, .scheduler_closed),
         error.SchedulerFull => status(.retryable, .scheduler_full),
         error.InvalidRunnableTransition => status(.internal, .invalid_runnable_transition),
+        error.InvalidRunnableDemand => status(.invalid_argument, .invalid_runnable_demand),
         error.InvalidReadFenceTransition => status(.internal, .invalid_read_fence_transition),
         error.ExecutionWaitUnsupported => status(.unsupported, .execution_wait_unsupported),
         error.ReadSafetyBarrierUnavailable => status(.unavailable, .read_safety_barrier_unavailable),
@@ -1474,6 +1484,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .scheduler_closed => "SchedulerClosed",
         .scheduler_full => "SchedulerFull",
         .invalid_runnable_transition => "InvalidRunnableTransition",
+        .invalid_runnable_demand => "InvalidRunnableDemand",
         .invalid_read_fence_transition => "InvalidReadFenceTransition",
         .execution_wait_unsupported => "ExecutionWaitUnsupported",
         .read_safety_barrier_unavailable => "ReadSafetyBarrierUnavailable",
