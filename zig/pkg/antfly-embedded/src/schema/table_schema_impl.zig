@@ -260,6 +260,7 @@ pub const DocumentProperty = struct {
     antfly_index: ?bool = null,
     integer_only: bool = false,
     format: ?[]const u8 = null,
+    sql_type: ?relational_wire.SQLBuiltinType = null,
     allows_null: bool = false,
     const_value: ?[]const u8 = null,
     minimum: ?f64 = null,
@@ -485,6 +486,9 @@ const SchemaContext = struct {
 /// Slice identities remain stable when schema/property structs are copied.
 pub const CompiledValidationPlan = struct {
     const PropertyMap = std.StringHashMapUnmanaged(usize);
+    const SqlColumn = struct { name: []const u8, kind: @import("../common/sql_builtin_type.zig").Type, generated: bool };
+    /// Names borrow the immutable schema. No schema traversal on row admission.
+    sql_columns: []const SqlColumn = &.{},
     properties: std.AutoHashMapUnmanaged(usize, PropertyMap) = .empty,
     patterns: std.StringHashMapUnmanaged(schema_regex.PreparedPattern) = .empty,
     checks: ?*@import("relational_checks.zig").Set = null,
@@ -493,6 +497,21 @@ pub const CompiledValidationPlan = struct {
     pub fn init(alloc: std.mem.Allocator, schema: TableSchema) !CompiledValidationPlan {
         var plan: CompiledValidationPlan = .{};
         errdefer plan.deinit(alloc);
+        var sql_columns: std.ArrayList(SqlColumn) = .empty;
+        defer sql_columns.deinit(alloc);
+        if (schema.storage_mode == .relational) for (schema.document_schemas) |document| {
+            for (document.properties) |property| if (property.sql_type) |kind| {
+                const generated = generated: {
+                    if (schema.generated_columns) |columns| for (columns.value.array.items) |entry| {
+                        const name = entry.object.get("column").?.string;
+                        if (std.mem.eql(u8, name, property.name)) break :generated true;
+                    };
+                    break :generated false;
+                };
+                try sql_columns.append(alloc, .{ .name = property.name, .kind = @import("../common/sql_builtin_type.zig").Type.fromWire(kind), .generated = generated });
+            };
+        };
+        plan.sql_columns = try sql_columns.toOwnedSlice(alloc);
         for (schema.document_schemas) |document| try plan.addProperty(alloc, makeRootDocumentProperty(document));
         if (schema.column_defaults != null or schema.generated_columns != null) {
             const runtime = try @import("mod.zig").deriveRelationalCheckLayout(alloc, schema);
@@ -508,6 +527,7 @@ pub const CompiledValidationPlan = struct {
     }
 
     pub fn deinit(self: *CompiledValidationPlan, alloc: std.mem.Allocator) void {
+        alloc.free(self.sql_columns);
         if (self.checks) |checks| checks.deinit();
         if (self.expressions) |expressions| expressions.deinit();
         var maps = self.properties.valueIterator();
@@ -517,6 +537,43 @@ pub const CompiledValidationPlan = struct {
         while (patterns.next()) |pattern| pattern.deinit();
         self.patterns.deinit(alloc);
         self.* = undefined;
+    }
+
+    fn normalizeSql(self: *const CompiledValidationPlan, alloc: std.mem.Allocator, root: *std.json.Value, preserve: bool, ignore_generated: bool) !void {
+        if (root.* != .object) return;
+        const casts = @import("../sql/builtin_cast.zig");
+        for (self.sql_columns) |column| {
+            if (ignore_generated and column.generated) continue;
+            const cell = root.object.getPtr(column.name) orelse continue;
+            if (cell.* == .null) continue;
+            switch (column.kind) {
+                .int16, .int32, .int64 => {
+                    const integer = exactI64JsonNumber(cell.*) orelse return error.InvalidBatchRequest;
+                    _ = casts.checkedInteger(integer, column.kind) catch return error.InvalidBatchRequest;
+                    if (!preserve) cell.* = .{ .integer = integer };
+                },
+                .float32, .float64 => {
+                    if (cell.* != .integer and cell.* != .float and cell.* != .number_string) return error.InvalidBatchRequest;
+                    const original = casts.floatValue(f64, cell.*) catch return error.InvalidBatchRequest;
+                    const canonical = if (column.kind == .float32) casts.floatValue(f32, cell.*) catch return error.InvalidBatchRequest else original;
+                    if (!std.math.isFinite(canonical) or (preserve and canonical != original)) return error.InvalidBatchRequest;
+                    if (!preserve) cell.* = .{ .float = canonical };
+                },
+                .text, .uuid => {
+                    if (cell.* != .string or !std.unicode.utf8ValidateSlice(cell.string) or std.mem.indexOfScalar(u8, cell.string, 0) != null) return error.InvalidBatchRequest;
+                    if (column.kind == .uuid) {
+                        const uuid = @import("../common/uuid.zig");
+                        const canonical = uuid.format(uuid.parse(cell.string) catch return error.InvalidBatchRequest);
+                        if (!std.mem.eql(u8, cell.string, &canonical)) {
+                            if (preserve) return error.InvalidBatchRequest;
+                            cell.string = try alloc.dupe(u8, &canonical);
+                        }
+                    }
+                },
+                .boolean => if (cell.* != .bool) return error.InvalidBatchRequest,
+                .jsonb => {},
+            }
+        }
     }
 
     fn addPattern(self: *CompiledValidationPlan, alloc: std.mem.Allocator, pattern: []const u8) !void {
@@ -836,7 +893,7 @@ fn validateDocumentJsonWithPlan(
     defer parsed.deinit();
     if (compiled) |plan| {
         return prepareDocumentValueWithPlan(parsed.arena.allocator(), alloc, schema, &parsed.value, physical_fields, plan);
-    } else if (schema.column_defaults != null or schema.generated_columns != null) {
+    } else if (schema.storage_mode == .relational or schema.column_defaults != null or schema.generated_columns != null) {
         var plan = try CompiledValidationPlan.init(alloc, schema);
         defer plan.deinit(alloc);
         return prepareDocumentValueWithPlan(parsed.arena.allocator(), alloc, schema, &parsed.value, physical_fields, &plan);
@@ -949,6 +1006,11 @@ pub fn validateDocumentValueWithPlan(
     physical_fields: []const PhysicalFieldValidation,
     compiled: ?*const CompiledValidationPlan,
 ) !void {
+    if (compiled == null and schema.storage_mode == .relational) {
+        var plan = try CompiledValidationPlan.init(alloc, schema);
+        defer plan.deinit(alloc);
+        return validateDocumentValueInternal(alloc, schema, value, physical_fields, &plan, true, &.{});
+    }
     return validateDocumentValueInternal(alloc, schema, value, physical_fields, compiled, true, &.{});
 }
 
@@ -962,7 +1024,11 @@ pub fn prepareDocumentValueWithPlan(
     physical_fields: []const PhysicalFieldValidation,
     compiled: *const CompiledValidationPlan,
 ) !void {
-    if (compiled.expressions) |expressions| try expressions.applyJson(owned_alloc, value);
+    try compiled.normalizeSql(owned_alloc, value, false, true);
+    if (compiled.expressions) |expressions| {
+        try expressions.applyJson(owned_alloc, value);
+        try compiled.normalizeSql(owned_alloc, value, false, false);
+    }
     return validateDocumentValueInternal(scratch, schema, value, physical_fields, compiled, false, &.{});
 }
 
@@ -971,7 +1037,13 @@ pub fn prepareDocumentValueWithPlan(
 /// datums; nested nulls and unrelated SQL NULLs retain ordinary validation.
 pub fn prepareTypedDocumentValueWithPlan(owned_alloc: std.mem.Allocator, scratch: std.mem.Allocator, schema: TableSchema, value: *std.json.Value, physical_fields: []const PhysicalFieldValidation, compiled: *const CompiledValidationPlan, json_null_fields: []const []const u8, preserve: bool) !void {
     if (value.* != .object) return error.InvalidBatchRequest;
-    if (!preserve) if (compiled.expressions) |expressions| try expressions.applyJson(owned_alloc, value);
+    if (!preserve) {
+        try compiled.normalizeSql(owned_alloc, value, false, true);
+        if (compiled.expressions) |expressions| {
+            try expressions.applyJson(owned_alloc, value);
+            try compiled.normalizeSql(owned_alloc, value, false, false);
+        }
+    }
     const pointers = try scratch.alloc(*const std.json.Value, json_null_fields.len);
     defer scratch.free(pointers);
     for (json_null_fields, pointers) |name, *pointer| {
@@ -998,6 +1070,7 @@ fn validateDocumentValueInternal(
     };
 
     const document_schema = try resolveDocumentSchema(schema, root);
+    if (compiled) |plan| try plan.normalizeSql(alloc, value, true, false);
     if (verify_generated) if (compiled) |plan| {
         if (plan.expressions) |expressions| try expressions.verifyJson(alloc, value.*);
     } else if (schema.generated_columns != null) {
@@ -1300,6 +1373,8 @@ fn validateDocumentSchemaDefinitionWithContext(context: SchemaContext, value: st
 }
 
 fn validateDocumentSchemaKeywords(context: SchemaContext, object: std.json.ObjectMap) anyerror!void {
+    // SQL identities belong to root column properties, never the row object.
+    if (object.contains("x-antfly-sql-type")) return error.InvalidSchemaUpdateRequest;
     if (object.get("type")) |schema_type| {
         if (schema_type != .null) _ = try validateTypeSpecDefinition(schema_type, true);
     }
@@ -2607,6 +2682,7 @@ fn validateParsedStorageModeSchema(schema: TableSchema) !void {
 }
 
 fn propertyContainsRelationalOnlySchemaType(property: DocumentProperty) bool {
+    if (property.sql_type != null) return true;
     if (property.field_type) |field_type| {
         if (std.mem.eql(u8, field_type, "geopoint") or
             std.mem.eql(u8, field_type, "geoshape") or
@@ -2631,6 +2707,24 @@ fn propertyContainsRelationalOnlySchemaType(property: DocumentProperty) bool {
     if (property.contains_schema) |child| if (propertyContainsRelationalOnlySchemaType(child.*)) return true;
     if (property.item) |child| if (propertyContainsRelationalOnlySchemaType(child.*)) return true;
     if (property.unevaluated_items_schema) |child| if (propertyContainsRelationalOnlySchemaType(child.*)) return true;
+    return false;
+}
+
+fn propertyContainsSqlType(property: DocumentProperty) bool {
+    if (property.sql_type != null) return true;
+    const info = @typeInfo(DocumentProperty).@"struct";
+    inline for (info.field_names, info.field_types) |name, Field| {
+        const child = @field(property, name);
+        if (Field == []DocumentProperty) {
+            for (child) |entry| if (propertyContainsSqlType(entry)) return true;
+        } else if (Field == ?*DocumentProperty) {
+            if (child) |entry| if (propertyContainsSqlType(entry.*)) return true;
+        } else if (Field == []PatternProperty) {
+            for (child) |entry| if (propertyContainsSqlType(entry.property.*)) return true;
+        } else if (Field == []DependentSchema) {
+            for (child) |entry| if (propertyContainsSqlType(entry.schema.*)) return true;
+        }
+    }
     return false;
 }
 
@@ -2730,6 +2824,9 @@ fn validateParsedRelationalSchema(schema: TableSchema) !void {
         return error.InvalidSchemaUpdateRequest;
     }
     for (document_schema.properties) |property| {
+        var descendants = property;
+        descendants.sql_type = null;
+        if (propertyContainsSqlType(descendants)) return error.InvalidSchemaUpdateRequest;
         if (!isRelationalStorageProperty(property) or !relationalPhysicalConstraintsAreExact(property)) {
             return error.InvalidSchemaUpdateRequest;
         }
@@ -3060,6 +3157,20 @@ fn parseAnonymousPropertyKeywords(alloc: std.mem.Allocator, context: SchemaConte
         ParsedTypeSpec{};
     const field_type = type_spec.field_type;
     errdefer if (field_type) |owned| alloc.free(owned);
+    const sql_type: ?relational_wire.SQLBuiltinType = if (object.get("x-antfly-sql-type")) |value| blk: {
+        if (value != .string) return error.InvalidSchemaUpdateRequest;
+        const kind = std.meta.stringToEnum(relational_wire.SQLBuiltinType, value.string) orelse return error.InvalidSchemaUpdateRequest;
+        const physical = field_type orelse return error.InvalidSchemaUpdateRequest;
+        const matches = switch (kind) {
+            .text, .uuid => std.mem.eql(u8, physical, "string") or std.mem.eql(u8, physical, "keyword") or std.mem.eql(u8, physical, "text"),
+            .int16, .int32, .int64 => type_spec.integer_only or std.mem.eql(u8, physical, "integer"),
+            .float32, .float64 => !type_spec.integer_only and (std.mem.eql(u8, physical, "numeric") or std.mem.eql(u8, physical, "number")),
+            .boolean => std.mem.eql(u8, physical, "boolean"),
+            .jsonb => std.mem.eql(u8, physical, "json"),
+        };
+        if (!matches) return error.InvalidSchemaUpdateRequest;
+        break :blk kind;
+    } else null;
     const format = if (object.get("format")) |format_value|
         switch (format_value) {
             .string => |format_string| try alloc.dupe(u8, format_string),
@@ -3069,6 +3180,9 @@ fn parseAnonymousPropertyKeywords(alloc: std.mem.Allocator, context: SchemaConte
     else
         null;
     errdefer if (format) |owned| alloc.free(owned);
+    if (sql_type) |kind| if (format) |name| {
+        if (std.mem.eql(u8, name, "uuid") and kind != .uuid) return error.InvalidSchemaUpdateRequest;
+    };
     const allows_null = type_spec.allows_null or parseNullableFlag(object);
     const const_value = if (object.get("const")) |const_schema_value|
         try stringifyJsonValue(alloc, const_schema_value)
@@ -3491,6 +3605,7 @@ fn parseAnonymousPropertyKeywords(alloc: std.mem.Allocator, context: SchemaConte
         .antfly_index = antfly_index,
         .integer_only = type_spec.integer_only,
         .format = format,
+        .sql_type = sql_type,
         .allows_null = allows_null,
         .const_value = const_value,
         .minimum = minimum,
@@ -4184,6 +4299,12 @@ fn validateDocumentFieldValueWithContext(
 
     if ((property.antfly_index orelse true)) {
         if (property.antfly_field) |mapping| try validateMappedFieldValue(mapping, value.*);
+    }
+
+    if (property.sql_type == .jsonb) {
+        const json_order = @import("../sql/json_order.zig");
+        var budget = json_order.Budget{ .remaining = 8 * 1024 * 1024 };
+        json_order.validateTextDomain(value.*, &budget, 0) catch return error.InvalidBatchRequest;
     }
 
     if (property.all_of.len > 0) {

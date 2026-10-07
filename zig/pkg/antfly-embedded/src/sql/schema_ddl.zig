@@ -223,22 +223,52 @@ pub fn apply(alloc: std.mem.Allocator, schema: *Value, ddl: ast.CatalogDdl) !boo
                         };
                     }
                 }
-                const defaults = try list(schema, alloc, "column_defaults");
-                if (named(defaults.items, column_name, "column")) |i| _ = defaults.orderedRemove(i);
+                var replacement: ?Value = null;
                 if (change == .set_default) {
-                    const type_name = property.object.get("type").?.string;
-                    const format = property.object.get("format") orelse .null;
-                    const column_type: ast.ColumnType = if (format == .string and std.mem.eql(u8, format.string, "uuid") and
-                        (std.mem.eql(u8, type_name, "keyword") or std.mem.eql(u8, type_name, "string") or std.mem.eql(u8, type_name, "text")))
-                        .uuid
-                    else if (std.mem.eql(u8, type_name, "keyword")) .string else std.meta.stringToEnum(ast.ColumnType, type_name) orelse return error.UnsupportedSqlShape;
-                    const literal = try @import("describe.zig").bindLiteral(alloc, change.set_default.value, column_type);
-                    try defaults.append(try value(alloc, .{ .column = column_name, .expression = .{ .op = "literal", .type = if (column_type == .uuid) "string" else @tagName(column_type), .value = literal } }));
+                    const element: ?@import("array_value.zig").ElementType = if (property.object.get("x-antfly-sql-type")) |identity| blk: {
+                        if (identity != .string) return error.InvalidSqlBackendResponse;
+                        break :blk std.meta.stringToEnum(@import("array_value.zig").ElementType, identity.string) orelse return error.InvalidSqlBackendResponse;
+                    } else null;
+                    const column_type = try defaultColumnType(property, element);
+                    const literal = try @import("ddl_runtime.zig").bindDefault(alloc, change.set_default.value, column_type, element);
+                    replacement = try value(alloc, .{ .column = column_name, .expression = .{ .op = "literal", .type = if (column_type == .uuid) "string" else @tagName(column_type), .value = literal } });
                 }
+                const defaults = try list(schema, alloc, "column_defaults");
+                if (replacement != null) try defaults.ensureUnusedCapacity(1);
+                if (named(defaults.items, column_name, "column")) |i| _ = defaults.orderedRemove(i);
+                if (replacement) |entry| defaults.appendAssumeCapacity(entry);
             }
         },
     }
     return true;
+}
+
+fn defaultColumnType(property: Value, element: ?@import("array_value.zig").ElementType) !ast.ColumnType {
+    if (element) |kind| return switch (kind) {
+        .text => .string,
+        .uuid => .uuid,
+        .int16, .int32, .int64 => .integer,
+        .float32, .float64 => .number,
+        .boolean => .boolean,
+        .jsonb => .json,
+    };
+    const declared = property.object.get("type") orelse return error.UnsupportedSqlShape;
+    const name = if (declared == .string) declared.string else if (declared == .array) blk: {
+        var selected: ?[]const u8 = null;
+        for (declared.array.items) |item| {
+            if (item != .string) return error.UnsupportedSqlShape;
+            if (std.mem.eql(u8, item.string, "null")) continue;
+            if (selected != null) return error.UnsupportedSqlShape;
+            selected = item.string;
+        }
+        break :blk selected orelse return error.UnsupportedSqlShape;
+    } else return error.UnsupportedSqlShape;
+    const format = property.object.get("format") orelse .null;
+    if (std.mem.eql(u8, name, "keyword") or std.mem.eql(u8, name, "string") or std.mem.eql(u8, name, "text"))
+        return if (format == .string and std.mem.eql(u8, format.string, "uuid")) .uuid else .string;
+    if (std.mem.eql(u8, name, "numeric")) return .number;
+    if (std.mem.eql(u8, name, "array") or std.mem.eql(u8, name, "object")) return .json;
+    return std.meta.stringToEnum(ast.ColumnType, name) orelse error.UnsupportedSqlShape;
 }
 
 test "primary key schema lowering rejects deferred timing and empty keys" {

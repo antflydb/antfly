@@ -348,33 +348,10 @@ fn validateElement(kind: ElementType, element: Element, budget: *Budget) !void {
         },
         .boolean => if (value != .bool) return error.SqlTypeMismatch,
         .jsonb => {
-            try validateJsonText(value, budget, 0);
+            try json_order.validateTextDomain(value, budget, 0);
             _ = try json_order.hash(value, budget, 0);
         },
     }
-}
-
-/// JSONB strings and object keys have PostgreSQL text-domain restrictions,
-/// even when the generic JSON representation permits embedded NUL bytes.
-fn validateJsonText(value: std.json.Value, budget: *Budget, depth: usize) !void {
-    try budget.consume(1);
-    if (depth > 64) return error.SqlProgramLimitExceeded;
-    switch (value) {
-        .string => |text| try validateText(text, budget),
-        .array => |items| for (items.items) |item| try validateJsonText(item, budget, depth + 1),
-        .object => |items| {
-            for (items.keys(), items.values()) |key, item| {
-                try validateText(key, budget);
-                try validateJsonText(item, budget, depth + 1);
-            }
-        },
-        else => {},
-    }
-}
-
-fn validateText(text: []const u8, budget: *Budget) !void {
-    try budget.consume(text.len);
-    if (!std.unicode.utf8ValidateSlice(text) or std.mem.indexOfScalar(u8, text, 0) != null) return error.SqlTypeMismatch;
 }
 
 fn compareElement(kind: ElementType, a: Element, b: Element, budget: *Budget) !std.math.Order {

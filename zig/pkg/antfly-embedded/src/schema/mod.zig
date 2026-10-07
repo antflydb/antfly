@@ -233,6 +233,138 @@ const compiled_check_fixture =
     \\{"version":1,"storage_mode":"relational","default_type":"row","checks":[{"name":"positive","column":"id","op":"gt","value":"9007199254740992"},{"name":"known","column":"name","op":"is_not_null"},{"name":"active","column":"name","op":"eq","value":"ACTIVE","collation":"ci"}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"name":{"type":"keyword"}},"additionalProperties":false}}}}
 ;
 
+const precise_sql_fixture =
+    \\{"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"n":{"type":"integer","x-antfly-sql-type":"int16"},"f":{"type":"number","x-antfly-sql-type":"float32"},"id":{"type":"keyword","x-antfly-sql-type":"uuid"},"text":{"type":"keyword","x-antfly-sql-type":"text"}},"additionalProperties":false}}}}
+;
+
+test "relational index system SQL public scalar domains normalize before validation and reject noncanonical restore" {
+    const alloc = std.testing.allocator;
+    var validator = try CompiledTableValidator.init(alloc, precise_sql_fixture);
+    defer validator.deinit(alloc);
+    const runtime = try deriveRuntimeTableSchema(alloc, validator.schema);
+    defer storage_schema.freeSchema(alloc, runtime);
+    try std.testing.expectEqual(@import("../common/sql_builtin_type.zig").Type.int16, runtime.relational_columns[0].sql_element_type.?);
+    try std.testing.expectEqual(@import("../common/sql_builtin_type.zig").Type.float32, runtime.relational_columns[1].sql_element_type.?);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"n":32767,"f":0.1,"id":"{A0EEBC999C0B4EF8BB6D6BB9BD380A11}","text":"valid"}
+    , .{ .parse_numbers = false });
+    defer parsed.deinit();
+    try std.testing.expectError(error.InvalidBatchRequest, validator.prepareTypedValue(parsed.arena.allocator(), alloc, &parsed.value, &.{}, true));
+    try validator.prepareTypedValue(parsed.arena.allocator(), alloc, &parsed.value, &.{}, false);
+    try std.testing.expectEqual(@as(f64, @as(f32, 0.1)), parsed.value.object.get("f").?.float);
+    try std.testing.expectEqual(@as(i64, 32767), parsed.value.object.get("n").?.integer);
+    try std.testing.expectEqualStrings("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11", parsed.value.object.get("id").?.string);
+    try validator.prepareTypedValue(parsed.arena.allocator(), alloc, &parsed.value, &.{}, true);
+    for ([_][]const u8{
+        \\{"n":32768}
+        ,
+        \\{"n":-32769}
+        ,
+        \\{"n":"1"}
+        ,
+        \\{"f":"0.1"}
+        ,
+        \\{"f":1e40}
+        ,
+        \\{"f":1e-50}
+        ,
+        \\{"text":"invalid\u0000text"}
+    }) |json| {
+        var invalid = try std.json.parseFromSlice(std.json.Value, alloc, json, .{ .parse_numbers = false });
+        defer invalid.deinit();
+        try std.testing.expectError(error.InvalidBatchRequest, validator.prepareValue(invalid.arena.allocator(), alloc, &invalid.value));
+    }
+}
+
+test "relational index system SQL public scalar annotation is explicit compatible and root scoped" {
+    const alloc = std.testing.allocator;
+    const cases = [_][]const u8{
+        \\{"type":"integer","x-antfly-sql-type":"float32"}
+        ,
+        \\{"type":"number","x-antfly-sql-type":"int32"}
+        ,
+        \\{"type":"keyword","x-antfly-sql-type":"invalid"}
+        ,
+        \\{"type":"keyword","x-antfly-sql-type":null}
+        ,
+        \\{"type":"keyword","format":"uuid","x-antfly-sql-type":"text"}
+        ,
+        \\{"type":"array","items":{"type":"integer","x-antfly-sql-type":"int16"}}
+        ,
+        \\{"type":"integer","allOf":[{"type":"integer","x-antfly-sql-type":"int16"}]}
+    };
+    for (cases) |property| {
+        const json = try std.fmt.allocPrint(alloc, "{{\"storage_mode\":\"relational\",\"default_type\":\"row\",\"document_schemas\":{{\"row\":{{\"schema\":{{\"type\":\"object\",\"properties\":{{\"n\":{s}}},\"additionalProperties\":false}}}}}}}}", .{property});
+        defer alloc.free(json);
+        try std.testing.expectError(error.InvalidSchemaUpdateRequest, CompiledTableValidator.init(alloc, json));
+    }
+    var old = try CompiledTableValidator.init(alloc,
+        \\{"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"n":{"type":"integer","format":"int16"}},"additionalProperties":false}}}}
+    );
+    defer old.deinit(alloc);
+    const runtime = try deriveRuntimeTableSchema(alloc, old.schema);
+    defer storage_schema.freeSchema(alloc, runtime);
+    try std.testing.expect(runtime.relational_columns[0].sql_element_type == null);
+    var wide = try std.json.parseFromSlice(std.json.Value, alloc, "{\"n\":9007199254740993}", .{ .parse_numbers = false });
+    defer wide.deinit();
+    try old.prepareValue(wide.arena.allocator(), alloc, &wide.value);
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, CompiledTableValidator.init(alloc,
+        \\{"default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"n":{"type":"integer","x-antfly-sql-type":"int16"}}}}}}
+    ));
+}
+
+test "relational index system SQL public scalar preparation cleans up every allocation failure" {
+    const Check = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            var validator = try CompiledTableValidator.init(alloc, precise_sql_fixture);
+            defer validator.deinit(alloc);
+            var parsed = try std.json.parseFromSlice(std.json.Value, alloc, "{\"id\":\"{A0EEBC999C0B4EF8BB6D6BB9BD380A11}\",\"f\":0.1}", .{ .parse_numbers = false });
+            defer parsed.deinit();
+            try validator.prepareValue(parsed.arena.allocator(), alloc, &parsed.value);
+            try validator.prepareTypedValue(parsed.arena.allocator(), alloc, &parsed.value, &.{}, true);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+}
+
+test "relational index system SQL precise generated values normalize before dependencies CHECK and restore verification" {
+    const alloc = std.testing.allocator;
+    var validator = try CompiledTableValidator.init(alloc,
+        \\{"storage_mode":"relational","default_type":"row","generated_columns":[{"column":"f","expression":{"op":"literal","type":"number","value":0.1}},{"column":"g","expression":{"op":"column","column":"f"}}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"f":{"type":"number","x-antfly-sql-type":"float32","minimum":0.100000001},"g":{"type":"number","x-antfly-sql-type":"float64"}},"additionalProperties":false}}}}
+    );
+    defer validator.deinit(alloc);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, "{\"f\":\"output-only\"}", .{});
+    defer parsed.deinit();
+    try validator.prepareValue(parsed.arena.allocator(), alloc, &parsed.value);
+    const rounded: f64 = @as(f32, 0.1);
+    try std.testing.expectEqual(rounded, parsed.value.object.get("f").?.float);
+    try std.testing.expectEqual(rounded, parsed.value.object.get("g").?.float);
+    try validator.prepareTypedValue(parsed.arena.allocator(), alloc, &parsed.value, &.{}, true);
+    parsed.value.object.getPtr("g").?.* = .{ .float = 0.1 };
+    try std.testing.expectError(error.InvalidRelationalGeneratedValue, validator.prepareTypedValue(parsed.arena.allocator(), alloc, &parsed.value, &.{}, true));
+}
+
+test "relational index system SQL JSONB domain rejects nested NUL on ingress and field-local restore" {
+    const alloc = std.testing.allocator;
+    var validator = try CompiledTableValidator.init(alloc,
+        \\{"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"j":{"type":"json","x-antfly-sql-type":"jsonb"}},"additionalProperties":false}}}}
+    );
+    defer validator.deinit(alloc);
+    try std.testing.expect(!validator.restore.full_root);
+    try std.testing.expectEqualSlices(usize, &.{0}, validator.restore.properties);
+    for ([_][]const u8{
+        \\{"j":{"nested":["a\u0000b"]}}
+        ,
+        \\{"j":{"invalid\u0000key":1}}
+    }) |json| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{ .parse_numbers = false });
+        defer parsed.deinit();
+        try std.testing.expectError(error.InvalidBatchRequest, validator.prepareValue(parsed.arena.allocator(), alloc, &parsed.value));
+        const cell = parsed.value.object.get("j").?;
+        try std.testing.expectError(error.InvalidBatchRequest, impl.validateRelationalRestoreProperty(alloc, validator.schema, 0, &cell, &validator.execution, false));
+    }
+}
+
 test "compiled CHECK validation preserves exact integers NULL and collation" {
     const alloc = std.testing.allocator;
     var compiled = try CompiledTableValidator.init(alloc, compiled_check_fixture);
@@ -640,6 +772,7 @@ fn deriveRuntimeRelationalColumns(
                 .allows_null = documentPropertyAllowsNull(property),
                 .is_json = uses_json,
                 .json_kind = runtimeRelationalJsonKind(property),
+                .sql_element_type = if (property.sql_type) |kind| @import("../common/sql_builtin_type.zig").Type.fromWire(kind) else null,
             });
             name = null;
             path = null;

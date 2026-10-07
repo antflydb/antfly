@@ -14110,6 +14110,15 @@ export interface components {
                 [key: string]: components["schemas"]["DocumentSubfieldMapping"];
             };
         };
+        /**
+         * @description Exact PostgreSQL builtin identity for a relational root scalar column.
+         *     Set the JSON Schema property's `x-antfly-sql-type` annotation to one of
+         *     these values. The underlying property type must match. SQL array storage
+         *     is not implied by this annotation. Existing unannotated schemas retain
+         *     their original domains.
+         * @enum {string}
+         */
+        SQLBuiltinType: "text" | "int16" | "int32" | "int64" | "float32" | "float64" | "boolean" | "uuid" | "jsonb";
         /** @description Defines the structure of a document type */
         DocumentSchema: {
             /** @description A description of the document type. */

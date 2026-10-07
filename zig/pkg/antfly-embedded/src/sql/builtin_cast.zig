@@ -15,7 +15,7 @@
 
 //! PostgreSQL builtin coercion primitives; no allocation or mutable global state.
 const std = @import("std");
-const Kind = @import("array_value.zig").ElementType;
+const Kind = @import("../common/sql_builtin_type.zig").Type;
 pub const whitespace = " \t\n\r\x0b\x0c";
 pub fn integral(kind: Kind) bool {
     return kind == .int16 or kind == .int32 or kind == .int64;

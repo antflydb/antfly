@@ -27,6 +27,14 @@ pub const Type = enum(u8) {
     uuid = 7,
     jsonb = 8,
 
+    /// Public enums are generated from OpenAPI; keep durable tags independent
+    /// while checking that every generated identity has a storage counterpart.
+    pub fn fromWire(value: anytype) Type {
+        return switch (value) {
+            inline else => |kind| @field(Type, @tagName(kind)),
+        };
+    }
+
     pub fn oid(self: Type) u32 {
         return switch (self) {
             .text => 25,

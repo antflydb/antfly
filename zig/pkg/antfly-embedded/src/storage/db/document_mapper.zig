@@ -6445,6 +6445,26 @@ test "relational UUID ingress shares canonical typed bytes and semantic hash" {
     try std.testing.expectEqualStrings("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11", upper.parsedValue().object.get("id").?.string);
 }
 
+test "relational index system SQL float4 preparation hashes and indexes canonical logical values" {
+    const alloc = std.testing.allocator;
+    const parsed = try schema_api.parseValidatedTableSchema(alloc,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"f":{"type":"number","x-antfly-sql-type":"float32"}},"additionalProperties":false}}}}
+    );
+    const schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed);
+    defer runtime_schema.freeSchema(alloc, schema);
+    var validator = try schema_api.CompiledTableValidator.takeParsed(alloc, parsed);
+    defer validator.deinit(alloc);
+    var layout = try relational_row_codec.PhysicalLayout.init(alloc, schema);
+    defer layout.deinit();
+    var source = try PreparedRelationalWrite.init(alloc, "row", "{\"f\":0.1}", validator, schema, &layout);
+    defer source.deinit(alloc);
+    var canonical = try PreparedRelationalWrite.init(alloc, "row", "{\"f\":0.10000000149011612}", validator, schema, &layout);
+    defer canonical.deinit(alloc);
+    try std.testing.expectEqualSlices(u8, &source.semantic_hash, &canonical.semantic_hash);
+    try std.testing.expectEqualSlices(u8, source.packed_row, canonical.packed_row);
+    try std.testing.expectEqual(@as(f64, @as(f32, 0.1)), source.parsedValue().object.get("f").?.float);
+}
+
 test "sparse relational preparation preserves canonical hash order with one physical sort" {
     const alloc = std.testing.allocator;
     const columns = [_]runtime_schema.RelationalColumn{

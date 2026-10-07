@@ -22018,6 +22018,15 @@ pub const DB = struct {
     fn validateStorageModeCompatibilityLocked(self: *DB, next_schema: schema_mod.TableSchema) !?u64 {
         if (self.core.schema) |current_schema| {
             if (current_schema.storage_mode != next_schema.storage_mode) return error.InvalidSchemaUpdateRequest;
+            // A new epoch cannot reinterpret retained rows or index keys under
+            // a different SQL domain. Explicit typed conversion belongs to the
+            // staged rewrite path, not ordinary metadata publication.
+            if (current_schema.storage_mode == .relational) for (current_schema.relational_columns) |previous| {
+                for (next_schema.relational_columns) |next| {
+                    if (std.mem.eql(u8, previous.path, next.path) and previous.sql_element_type != next.sql_element_type)
+                        return error.InvalidSchemaUpdateRequest;
+                }
+            };
             // Attaching/detaching an external base must never hide or resurrect
             // native rows under the same identity. Create a new table instead.
             if ((current_schema.external_base_source == null) != (next_schema.external_base_source == null)) return error.InvalidSchemaUpdateRequest;

@@ -186,6 +186,7 @@ fn derive(entry: *Entry, json: []const u8) !void {
         .path = try owned.dupe(u8, column.path),
         .nullable = !column.required or column.allows_null,
         .generated = generated.contains(column.name),
+        .element_type = column.sql_element_type,
         .type = @import("antfly_local_sources").sql_document_row.relationalType(parsed, column.name, switch (column.column_type) {
             .string => .string,
             .integer => .integer,
@@ -308,4 +309,34 @@ test "SQL schema cache preserves logical UUID over physical keywords" {
     , 7, "items");
     try std.testing.expectEqual(@import("antfly_local_sources").sql_ast.ColumnType.uuid, (try table.column("u")).type);
     try std.testing.expectEqual(@import("antfly_local_sources").sql_ast.ColumnType.string, (try table.column("label")).type);
+}
+
+test "SQL schema cache preserves every declared scalar builtin width through DDL" {
+    const alloc = std.testing.allocator;
+    const sources = @import("antfly_local_sources");
+    var cache = Cache.init(alloc);
+    defer cache.deinit();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var create = try sources.sql_compiler.compile(a, "CREATE TABLE widths (t text, s smallint, i integer, b bigint, r real, d double precision, flag boolean, u uuid, j jsonb)", .{});
+    defer create.deinit();
+    const schema_json = try sources.sql_ddl_runtime.createSchemaAlloc(a, create.statement.create_table);
+    const table = try cache.resolve(std.testing.io, a, schema_json, 7, "widths");
+    const expected = [_]struct { name: []const u8, kind: sources.sql_array_value.ElementType, oid: u32 }{
+        .{ .name = "t", .kind = .text, .oid = 25 },
+        .{ .name = "s", .kind = .int16, .oid = 21 },
+        .{ .name = "i", .kind = .int32, .oid = 23 },
+        .{ .name = "b", .kind = .int64, .oid = 20 },
+        .{ .name = "r", .kind = .float32, .oid = 700 },
+        .{ .name = "d", .kind = .float64, .oid = 701 },
+        .{ .name = "flag", .kind = .boolean, .oid = 16 },
+        .{ .name = "u", .kind = .uuid, .oid = 2950 },
+        .{ .name = "j", .kind = .jsonb, .oid = 3802 },
+    };
+    for (expected) |entry| {
+        const column = try table.column(entry.name);
+        try std.testing.expectEqual(entry.kind, column.element_type.?);
+        try std.testing.expectEqual(entry.oid, column.element_type.?.oid());
+    }
 }

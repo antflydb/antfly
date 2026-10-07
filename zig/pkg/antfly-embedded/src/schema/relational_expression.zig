@@ -542,7 +542,7 @@ pub const Set = struct {
         for (self.order) |index| {
             const binding = &self.bindings[index];
             if (!binding.generated and (present[binding.ordinal] or defaults == .preserve_absence or (default_mask != null and !default_mask.?[binding.ordinal]))) continue;
-            values[binding.ordinal] = try binding.plan.evaluateNode(alloc, .{ .values = values }, @intCast(binding.plan.nodes.len - 1), &budget);
+            values[binding.ordinal] = try self.normalizeBinding(alloc, binding.ordinal, try binding.plan.evaluateNode(alloc, .{ .values = values }, @intCast(binding.plan.nodes.len - 1), &budget));
             present[binding.ordinal] = true;
         }
     }
@@ -599,7 +599,7 @@ pub const Set = struct {
         for (self.table.relational_columns, self.read_columns, 0..) |column, read, ordinal| {
             if (!read) continue;
             const physical = row.ordinalForName(column.name) orelse continue;
-            if (row.table_schema.relational_columns[physical].column_type != column.column_type) return error.InvalidRelationalGeneratedValue;
+            if (row.table_schema.relational_columns[physical].column_type != column.column_type or row.table_schema.relational_columns[physical].sql_element_type != column.sql_element_type) return error.InvalidRelationalGeneratedValue;
             const cell = (try row.findCell(physical)) orelse continue;
             present[ordinal] = true;
             if (cell.is_null) continue;
@@ -622,9 +622,29 @@ pub const Set = struct {
             const binding = &self.bindings[index];
             if (!binding.generated) continue;
             if (!present[binding.ordinal]) return error.InvalidRelationalGeneratedValue;
-            const expected = try binding.plan.evaluateNode(alloc, .{ .values = values }, @intCast(binding.plan.nodes.len - 1), &budget);
+            const expected = try self.normalizeBinding(alloc, binding.ordinal, try binding.plan.evaluateNode(alloc, .{ .values = values }, @intCast(binding.plan.nodes.len - 1), &budget));
             if (!valuesEqual(expected, values[binding.ordinal])) return error.InvalidRelationalGeneratedValue;
         }
+    }
+
+    /// Stored expressions obey the target domain before dependent expressions
+    /// execute. Restore evaluates the identical conversion, never raw float8
+    /// arithmetic against an already-rounded float4 physical value.
+    fn normalizeBinding(self: *const Set, alloc: Allocator, ordinal: usize, value: Value) !Value {
+        if (value == .null) return value;
+        const kind = self.table.relational_columns[ordinal].sql_element_type orelse return value;
+        const casts = @import("../sql/builtin_cast.zig");
+        return switch (kind) {
+            .int16, .int32, .int64 => .{ .integer = casts.checkedInteger(value.integer, kind) catch return error.InvalidRelationalExpressionInput },
+            .float32 => .{ .number = casts.floatValue(f32, .{ .float = value.number }) catch return error.InvalidRelationalExpressionInput },
+            .uuid => blk: {
+                const uuid = @import("../common/uuid.zig");
+                const canonical = uuid.format(uuid.parse(value.string) catch return error.InvalidRelationalExpressionInput);
+                if (std.mem.eql(u8, value.string, &canonical)) break :blk value;
+                break :blk .{ .string = try alloc.dupe(u8, &canonical) };
+            },
+            else => value,
+        };
     }
 
     fn readValues(self: *const Set, alloc: Allocator, document: std.json.Value, values: []Value, present: []bool, ignore_generated: bool) !void {

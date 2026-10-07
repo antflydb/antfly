@@ -55,6 +55,29 @@ pub const Budget = struct {
     }
 };
 
+/// PostgreSQL JSONB strings and object keys obey the text domain recursively.
+/// Share this allocation-free walk between arrays, native ingress and restore.
+pub fn validateTextDomain(value: Json, budget: *Budget, depth: usize) !void {
+    try budget.consume(1);
+    if (depth > 64) return error.SqlProgramLimitExceeded;
+    switch (value) {
+        .string => |text| try validateText(text, budget),
+        .array => |items| for (items.items) |item| try validateTextDomain(item, budget, depth + 1),
+        .object => |items| {
+            for (items.keys(), items.values()) |key, item| {
+                try validateText(key, budget);
+                try validateTextDomain(item, budget, depth + 1);
+            }
+        },
+        else => {},
+    }
+}
+
+fn validateText(text: []const u8, budget: *Budget) !void {
+    try budget.consume(text.len);
+    if (!std.unicode.utf8ValidateSlice(text) or std.mem.indexOfScalar(u8, text, 0) != null) return error.SqlTypeMismatch;
+}
+
 /// The caller owns the allocation region and its byte admission. All retained
 /// tokens own their bytes, including exact decimal tokens and escaped strings.
 pub fn parseTextLeaky(a: std.mem.Allocator, text: []const u8, budget: *Budget) !Json {

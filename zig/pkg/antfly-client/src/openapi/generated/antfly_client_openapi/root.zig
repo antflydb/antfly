@@ -772,6 +772,7 @@ pub const RuntimeDecl = types.RuntimeDecl;
 pub const SQLArrayDimension = types.SQLArrayDimension;
 pub const SQLArrayElementType = types.SQLArrayElementType;
 pub const SQLArrayValue = types.SQLArrayValue;
+pub const SQLBuiltinType = types.SQLBuiltinType;
 pub const SQLColumn = types.SQLColumn;
 pub const SQLColumnType = types.SQLColumnType;
 pub const SQLConnectionOpenRequest = types.SQLConnectionOpenRequest;

@@ -32,6 +32,7 @@ pub const RelationalIndexOwnerKind = types.RelationalIndexOwnerKind;
 pub const RelationalIndexPredicate = types.RelationalIndexPredicate;
 pub const RelationalScalarExpression = types.RelationalScalarExpression;
 pub const RelationalUniqueConstraint = types.RelationalUniqueConstraint;
+pub const SQLBuiltinType = types.SQLBuiltinType;
 pub const TableSchema = types.TableSchema;
 pub const TableStorageMode = types.TableStorageMode;
 pub const TemplateFieldMapping = types.TemplateFieldMapping;

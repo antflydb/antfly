@@ -72,6 +72,41 @@ test "relational index system SQL precise schema publication upgrades catalog at
     try std.testing.expectEqual(@as(i64, 32767), parsed.value.object.get("n").?.integer);
 }
 
+test "relational index system SQL public scalar schema survives LSM reopen and rejects domain reinterpretation" {
+    const json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"n":{"type":"integer","x-antfly-sql-type":"int16"},"f":{"type":"number","x-antfly-sql-type":"float32"}},"additionalProperties":false}}}}
+    ;
+    var directory = try @import("../../common/test_directory.zig").TestDirectory.init("sql-public-scalar-reopen");
+    defer directory.cleanup();
+    {
+        var db = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false, .primary_backend = .{ .lsm = .{} } });
+        defer db.close();
+        try db.setSchemaJson(alloc, json);
+        try db.batch(.{ .writes = &.{.{ .key = "valid", .value = "{\"n\":32767,\"f\":0.1}" }} });
+        try std.testing.expectError(error.InvalidBatchRequest, db.batch(.{ .writes = &.{ .{ .key = "not-committed", .value = "{\"n\":1}" }, .{ .key = "overflow", .value = "{\"n\":32768}" } } }));
+        try std.testing.expect((try db.get(alloc, "not-committed")) == null);
+        var changed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
+        defer changed.deinit();
+        changed.value.object.getPtr("version").?.* = .{ .integer = 2 };
+        const property = changed.value.object.getPtr("document_schemas").?.object.getPtr("row").?.object.getPtr("schema").?.object.getPtr("properties").?.object.getPtr("n").?;
+        property.object.getPtr("x-antfly-sql-type").?.* = .{ .string = "int32" };
+        const widened = try std.json.Stringify.valueAlloc(alloc, changed.value, .{});
+        defer alloc.free(widened);
+        try std.testing.expectError(error.InvalidSchemaUpdateRequest, db.setSchemaJson(alloc, widened));
+        try std.testing.expectEqual(@as(u32, 1), db.core.schema.?.version);
+    }
+    var reopened = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false, .primary_backend = .{ .lsm = .{} } });
+    defer reopened.close();
+    try std.testing.expectEqual(@import("../../common/sql_builtin_type.zig").Type.int16, reopened.core.schema.?.relational_columns[0].sql_element_type.?);
+    const bytes = (try reopened.get(alloc, "valid")).?;
+    defer alloc.free(bytes);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(i64, 32767), parsed.value.object.get("n").?.integer);
+    try std.testing.expectEqual(@as(f64, @as(f32, 0.1)), parsed.value.object.get("f").?.float);
+    try std.testing.expectError(error.InvalidBatchRequest, reopened.batch(.{ .writes = &.{.{ .key = "bad", .value = "{\"n\":-32769}" }} }));
+}
+
 test "relational index system statement fence never waits on partial prepared transactions" {
     var directory = try @import("../../common/test_directory.zig").TestDirectory.init("statement-fence");
     defer directory.cleanup();
@@ -790,7 +825,15 @@ test "relational index system mixed schema scan compiles each snapshot layout on
     try std.testing.expect(reader.source_cache_hits >= 510);
     try std.testing.expect(reader.binding_bytes <= 2 * 1024 * 1024);
     std.debug.print("mixed schema LSM scan: rows={d} compilations={d} hits={d} elapsed_us={d}\n", .{ count, reader.source_compilations, reader.source_cache_hits, (time.monotonicNs() - started) / 1000 });
-    try std.testing.checkAllAllocationFailures(alloc, mixedScanAllocations, .{&db});
+    // SafeAllocator can sometimes grow an arena in place and sometimes must
+    // move it, depending on earlier fault runs. An exhaustive allocation-index
+    // sweep requires stable allocation counts. Force the allocate/copy path;
+    // every growth allocation is still faulted and leak-checked.
+    var no_resize_vtable = alloc.vtable.*;
+    no_resize_vtable.resize = std.mem.Allocator.noResize;
+    no_resize_vtable.remap = std.mem.Allocator.noRemap;
+    const stable_backing = std.mem.Allocator{ .ptr = alloc.ptr, .vtable = &no_resize_vtable };
+    try std.testing.checkAllAllocationFailures(stable_backing, mixedScanAllocations, .{&db});
 }
 
 fn expressionKeyAllocations(test_alloc: std.mem.Allocator) !void {

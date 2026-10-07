@@ -78,6 +78,9 @@ pub fn relationalType(schema: anytype, name: []const u8, physical: ast.ColumnTyp
 }
 
 fn propertyType(property: anytype) ast.ColumnType {
+    if (comptime @hasField(@TypeOf(property), "sql_type")) {
+        if (property.sql_type == .uuid) return .uuid;
+    }
     const name = property.field_type orelse return .json;
     if (std.mem.eql(u8, name, "integer") or property.integer_only) return .integer;
     if (std.mem.eql(u8, name, "number") or std.mem.eql(u8, name, "numeric")) return .number;

@@ -1389,6 +1389,53 @@ pub const RelationalUniqueConstraint = struct {
     }
 };
 
+/// Exact PostgreSQL builtin identity for a relational root scalar column. Set the JSON Schema property's `x-antfly-sql-type` annotation to one of these values. The underlying property type must match. SQL array storage is not implied by this annotation. Existing unannotated schemas retain their original domains.
+pub const SQLBuiltinType = enum {
+    text,
+    int16,
+    int32,
+    int64,
+    float32,
+    float64,
+    boolean,
+    uuid,
+    jsonb,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .text => "text",
+            .int16 => "int16",
+            .int32 => "int32",
+            .int64 => "int64",
+            .float32 => "float32",
+            .float64 => "float64",
+            .boolean => "boolean",
+            .uuid => "uuid",
+            .jsonb => "jsonb",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "text", .text },
+            .{ "int16", .int16 },
+            .{ "int32", .int32 },
+            .{ "int64", .int64 },
+            .{ "float32", .float32 },
+            .{ "float64", .float64 },
+            .{ "boolean", .boolean },
+            .{ "uuid", .uuid },
+            .{ "jsonb", .jsonb },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// Schema definition for a table with multiple document types
 pub const TableSchema = struct {
     /// Backend-managed schema generation used for migrations. Omit it from create and update requests.

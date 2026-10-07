@@ -1706,15 +1706,7 @@ const Parser = struct {
     }
 
     fn columnDefinition(self: *Parser, name_value: []const u8) Error!ast.Column {
-        const start = self.pos;
         const declared = try self.castType();
-        if (declared.type != .array) {
-            // Preserve the scalar DDL admission set until durable schemas can
-            // enforce every precise scalar width. Parsing a cast does not
-            // authorize silently widening a newly accepted stored type.
-            self.pos = start;
-            _ = try self.columnType();
-        }
         return .{ .name = name_value, .type = declared.type, .element_type = declared.element_type };
     }
 
@@ -2611,7 +2603,7 @@ test "compiler array DDL retains PostgreSQL builtin element identity without dim
     }
 }
 
-test "compiler precise DDL descriptors do not silently admit widened scalar storage" {
+test "compiler precise DDL descriptors retain scalar storage widths" {
     var compiled = try compile(std.testing.allocator, "CREATE TABLE widths (i integer, b bigint, f double precision, j json, a jsonb[])", .{});
     defer compiled.deinit();
     const columns = compiled.statement.create_table.columns;
@@ -2624,7 +2616,9 @@ test "compiler precise DDL descriptors do not silently admit widened scalar stor
     for ([_][]const u8{ "smallint", "real", "int2", "float4" }) |declaration| {
         const sql = try std.fmt.allocPrint(std.testing.allocator, "CREATE TABLE widths (i {s})", .{declaration});
         defer std.testing.allocator.free(sql);
-        try std.testing.expectError(error.UnsupportedSqlShape, compile(std.testing.allocator, sql, .{}));
+        var precise = try compile(std.testing.allocator, sql, .{});
+        defer precise.deinit();
+        try std.testing.expect(precise.statement.create_table.columns[0].element_type != null);
     }
     for ([_][]const u8{
         "CREATE TABLE arrays (a json[])",

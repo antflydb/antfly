@@ -1237,6 +1237,7 @@ from .sort_profile_sort_lifecycle_state import SortProfileSortLifecycleState
 from .sql_array_dimension import SQLArrayDimension
 from .sql_array_element_type import SQLArrayElementType
 from .sql_array_value import SQLArrayValue
+from .sql_builtin_type import SQLBuiltinType
 from .sql_column import SQLColumn
 from .sql_column_type import SQLColumnType
 from .sql_connection_open_request import SQLConnectionOpenRequest
@@ -2651,6 +2652,7 @@ __all__ = (
     "SQLArrayDimension",
     "SQLArrayElementType",
     "SQLArrayValue",
+    "SQLBuiltinType",
     "SQLColumn",
     "SQLColumnType",
     "SQLConnectionOpenRequest",

@@ -3842,9 +3842,8 @@ Native contracts cover sixteen declarations and aliases, CREATE/ALTER descriptor
 equivalence, nullability, malformed dimensions, bounded token admission and
 every allocation-failure point. Independent PostgreSQL catalog checks compare
 exact OIDs and nullability for both DDL forms and verify that empty arrays are
-accepted regardless of declared dimensions. Existing scalar DDL admission is
-unchanged; this does not silently activate narrow scalar storage types merely
-because casts already recognize them.
+accepted regardless of declared dimensions. This descriptor work did not itself
+activate narrow scalar storage; the complete scalar boundary is described below.
 
 This is schema-boundary groundwork, not stored-array activation or additional
 original-case credit. Durable schema metadata, physical array cells, native
@@ -3881,7 +3880,49 @@ does not change merely because this SQL metadata is present.
 Deployed format-15 document/relational catalogs remain readable without a write
 on open. New schema publication atomically advances the catalog capability to
 the runtime schema format; a catalog that advertises only format 15 cannot
-authorize a schema carrying precise descriptors. This is native storage
-groundwork: public schema/DDL activation, stored array cells, and the complete
-typed read/mutation/backup path are still unfinished. No original-case
+authorize a schema carrying precise descriptors. Stored array cells and their
+complete typed read/mutation/backup activation remain unfinished. No original-case
 dispositions are credited for this infrastructure alone.
+
+### Public scalar SQL domains and canonical preparation
+
+Relational root scalar properties can explicitly declare `x-antfly-sql-type`,
+using the OpenAPI-generated `SQLBuiltinType` enum. The native property type must
+match its SQL domain. SQL CREATE/ADD COLUMN emits this annotation for known
+builtins, and catalog loading retains all nine builtin identities and numeric
+widths. Python, TypeScript, Go and Zig models are generated from the public
+specification. The Rust SDK specification is synchronized as well.
+
+Existing standard `format` annotations do not acquire new SQL range semantics.
+Document tables and nested/composed scalar annotations are rejected rather than
+silently losing SQL identity during physical-layout derivation. SQL arrays are
+not inferred from JSON array properties. Stored-array DDL remains guarded.
+
+An immutable compiled column plan normalizes owned input before checks, hashes
+and index extraction. Integer widths are checked without floating-point
+conversion; float4 inputs are rounded once into their canonical widened value;
+UUID strings are canonicalized. Numeric strings are not implicitly admitted by
+the native JSON write API. CREATE/ALTER defaults use the same precise widths,
+and an invalid replacement default leaves the original schema intact. Stored
+expressions convert into their target domain before dependent expressions run;
+restore evaluates the same conversions to verify generated results. Output-only
+generated fields do not validate caller-supplied replacement values.
+
+Restore verifies rather than repairs scalar values. JSONB string/key validation
+shares the bounded, allocation-free text-domain walk used by typed arrays,
+including field-local restore checks. Ordinary schema updates cannot reinterpret
+a retained column under another SQL domain; explicit typed conversion remains
+required and is not yet implemented. Native nonfinite scalar-number storage is
+still unsupported, and this work does not claim complete PostgreSQL JSONB
+numeric-domain parity.
+
+Native contracts cover public-schema validation, canonical preparation, generated
+dependencies, allocation failures, canonical semantic hashes/row bytes, LSM
+reopen and mixed-batch atomicity. PostgreSQL independently verifies the native
+scalar fixture's exact float4 value, catalog OIDs, integer/float range errors and
+text NUL rejection. The mixed-schema allocation-failure sweep forces the backing
+allocator's allocate/copy growth path, so optional in-place arena resizing cannot
+change the number of fault points between trials; every growth allocation remains
+faulted and leak-checked. These are shared architecture contracts, not new
+original-case credits: 365 implemented, 136 rejected, 73 superseded and 1,012
+unresolved remain the authoritative inventory.
