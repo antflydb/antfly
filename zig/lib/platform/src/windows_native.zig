@@ -54,7 +54,9 @@ extern "ws2_32" fn WSAStartup(version: u16, data: *anyopaque) callconv(.winapi) 
 extern "ws2_32" fn WSASocketW(family: i32, mode: i32, protocol: i32, info: ?*anyopaque, group: u32, flags: u32) callconv(.winapi) usize;
 extern "ws2_32" fn closesocket(socket: usize) callconv(.winapi) c_int;
 extern "ws2_32" fn connect(socket: usize, address: [*]const u8, len: i32) callconv(.winapi) c_int;
-extern "ws2_32" fn accept(socket: usize, address: [*]u8, len: *i32) callconv(.winapi) usize;
+extern "ws2_32" fn getsockname(socket: usize, address: [*]u8, len: *i32) callconv(.winapi) c_int;
+extern "ws2_32" fn getpeername(socket: usize, address: [*]u8, len: *i32) callconv(.winapi) c_int;
+extern "ws2_32" fn WSAIoctl(socket: usize, code: u32, input: *const anyopaque, input_len: u32, output: *anyopaque, output_len: u32, returned: *u32, overlapped: ?*Overlapped, completion: ?*anyopaque) callconv(.winapi) c_int;
 extern "ws2_32" fn WSASend(socket: usize, buffers: *const anyopaque, count: u32, sent: *u32, flags: u32, overlapped: ?*anyopaque, completion: ?*anyopaque) callconv(.winapi) c_int;
 extern "ws2_32" fn WSARecv(socket: usize, buffers: *const anyopaque, count: u32, received: *u32, flags: *u32, overlapped: ?*anyopaque, completion: ?*anyopaque) callconv(.winapi) c_int;
 extern "ws2_32" fn shutdown(socket: usize, how: i32) callconv(.winapi) c_int;
@@ -158,13 +160,69 @@ pub fn connectSocket(socket: windows.HANDLE, address: []const u8) std.Io.net.IpA
     }
 }
 
-pub fn acceptSocket(socket: windows.HANDLE, address: []u8) std.Io.net.Server.AcceptError!windows.HANDLE {
+/// AcceptEx owns an unconnected socket and an overlapped request. Canceling
+/// affects only this accept; drain it before freeing its event/address buffer,
+/// and leave the listener usable by subsequent accepts.
+pub fn acceptSocket(socket: windows.HANDLE, address: []u8, options: std.Io.net.Server.AcceptOptions, comptime wait: anytype) std.Io.net.Server.AcceptError!windows.HANDLE {
     var len: i32 = @intCast(address.len);
-    const accepted = accept(@intFromPtr(socket), address.ptr, &len);
-    if (accepted == std.math.maxInt(usize)) {
-        return if (WSAGetLastError() == 10004) error.Canceled else socketError();
+    if (getsockname(@intFromPtr(socket), address.ptr, &len) != 0) return acceptSocketError(WSAGetLastError());
+    const family = std.mem.readInt(u16, address[0..2], .little);
+    const mode: i32 = switch (options.mode) {
+        .stream => 1,
+        .dgram => 2,
+        .raw => 3,
+        .rdm => 4,
+        .seqpacket => 5,
+    };
+    const accepted = try openSocket(family, mode, if (options.protocol) |protocol| @intCast(@backingInt(protocol)) else 0);
+    errdefer closeSocket(accepted);
+    const AcceptEx = *const fn (usize, usize, *anyopaque, u32, u32, u32, *u32, *Overlapped) callconv(.winapi) BOOL;
+    const Guid = extern struct { a: u32, b: u16, c: u16, d: [8]u8 };
+    const id: Guid = .{ .a = 0xb5367df1, .b = 0xcbac, .c = 0x11cf, .d = .{ 0x95, 0xca, 0x00, 0x80, 0x5f, 0x48, 0xa1, 0x92 } };
+    var accept_ex: AcceptEx = undefined;
+    var returned: u32 = 0;
+    // Resolve from the listener's provider, rather than assuming a process-wide
+    // extension address. SIO_GET_EXTENSION_FUNCTION_POINTER is synchronous.
+    if (WSAIoctl(@intFromPtr(socket), 0xc8000006, &id, @sizeOf(Guid), @ptrCast(&accept_ex), @sizeOf(AcceptEx), &returned, null, null) != 0) return acceptSocketError(WSAGetLastError());
+    var operation: Overlapped = .{ .event = try createIoEvent() };
+    defer windows.CloseHandle(operation.event.?);
+    // SOCKADDR_STORAGE plus the 16 provider bytes required by AcceptEx.
+    const address_size = 128 + 16;
+    var addresses: [2 * address_size]u8 align(8) = undefined;
+    var received: u32 = 0;
+    // Zero receive length: accept completes on connection, without waiting for
+    // application bytes (important for protocols where the server speaks first).
+    if (accept_ex(@intFromPtr(socket), @intFromPtr(accepted), &addresses, 0, address_size, address_size, &received, &operation) == 0) {
+        const code = WSAGetLastError();
+        if (code != 997) return acceptSocketError(code);
+        var flags: u32 = 0;
+        wait(operation.event.?) catch |err| {
+            _ = CancelIoEx(socket, &operation);
+            _ = WSAGetOverlappedResult(@intFromPtr(socket), &operation, &received, 1, &flags);
+            return err;
+        };
+        if (WSAGetOverlappedResult(@intFromPtr(socket), &operation, &received, 0, &flags) == 0) return acceptSocketError(WSAGetLastError());
     }
-    return @ptrFromInt(accepted);
+    // Adopt the listener context before querying the peer or handing the
+    // socket to higher layers. The accepted socket keeps overlapped mode.
+    if (setsockopt(accepted, 0xffff, 0x700b, std.mem.asBytes(&socket).ptr, @sizeOf(windows.HANDLE)) != 0) return acceptSocketError(WSAGetLastError());
+    len = @intCast(address.len);
+    if (getpeername(@intFromPtr(accepted), address.ptr, &len) != 0) return acceptSocketError(WSAGetLastError());
+    return accepted;
+}
+
+fn acceptSocketError(code: c_int) std.Io.net.Server.AcceptError {
+    return switch (code) {
+        995, 10004 => error.Canceled,
+        10022, 10038 => error.SocketNotListening,
+        10035 => error.WouldBlock,
+        10024 => error.ProcessFdQuotaExceeded,
+        10050 => error.NetworkDown,
+        10053, 10054 => error.ConnectionAborted,
+        10055 => error.SystemResources,
+        10013 => error.BlockedByFirewall,
+        else => windows.unexpectedError(@fromBackingInt(@intCast(@as(u32, @intCast(code))))),
+    };
 }
 
 /// Each operation owns its event and OVERLAPPED until completion, including

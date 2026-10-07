@@ -112,6 +112,10 @@ const PosixC = struct {
     }
 };
 
+// Windows descriptors retain the mode selected at open; reconstructing a File
+// from its handle loses the asynchronous contract required by positional reads.
+const FileDescriptor = if (builtin.os.tag == .windows) std.Io.File else std.posix.fd_t;
+
 var mmap_temp_counter: std.atomic.Value(u64) = .init(0);
 
 /// Return the byte offset of a borrowed slice inside its complete mmap.
@@ -128,7 +132,7 @@ pub fn mappedSliceOffset(full: []const u8, slice: []const u8) ?usize {
 /// Memory-mapped file region. The mapped bytes are valid until `deinit()` is called.
 pub const MmapRegion = struct {
     data: []align(std.heap.page_size_min) u8,
-    fd: std.posix.fd_t,
+    fd: FileDescriptor,
     /// Whether deinit should evict clean pages from the kernel page cache.
     /// Model stores default to the historical memory-conservative behavior;
     /// CUDA full-residency admission can explicitly retain the cache so a
@@ -372,7 +376,7 @@ pub fn fileIdentity(allocator: std.mem.Allocator, path: []const u8) !FileIdentit
     return fileIdentityFromFd(allocator, fd);
 }
 
-fn fileIdentityFromFd(allocator: std.mem.Allocator, fd: std.posix.fd_t) !FileIdentity {
+fn fileIdentityFromFd(allocator: std.mem.Allocator, fd: FileDescriptor) !FileIdentity {
     if (comptime builtin.os.tag != .linux) return error.UnsupportedPlatform;
     const linux = std.os.linux;
     var statx = std.mem.zeroes(linux.Statx);
@@ -475,7 +479,7 @@ pub fn readRegionInto(allocator: std.mem.Allocator, path: []const u8, offset: u6
     try readRegionFromFd(fd, buf, offset);
 }
 
-fn readRegionFromFd(fd: std.posix.fd_t, buf: []u8, offset: u64) !void {
+fn readRegionFromFd(fd: FileDescriptor, buf: []u8, offset: u64) !void {
     var total: usize = 0;
     while (total < buf.len) {
         const read_off = try std.math.add(u64, offset, total);
@@ -532,9 +536,9 @@ pub fn prefetchFile(
     return prefetchFileContents(io, allocator, fd, file_size, workers);
 }
 
-fn prefetchFileContents(io: std.Io, allocator: std.mem.Allocator, fd: std.posix.fd_t, file_size: u64, workers: usize) !FilePrefetchResult {
+fn prefetchFileContents(io: std.Io, allocator: std.mem.Allocator, fd: FileDescriptor, file_size: u64, workers: usize) !FilePrefetchResult {
     const Worker = struct {
-        fd: std.posix.fd_t,
+        fd: FileDescriptor,
         start: u64,
         end: u64,
         bytes: u64 = 0,
@@ -660,9 +664,9 @@ pub fn renameNoReplace(allocator: std.mem.Allocator, old_path: []const u8, new_p
     }
 }
 
-fn fileSizeFromFd(fd: std.posix.fd_t) !usize {
+fn fileSizeFromFd(fd: FileDescriptor) !usize {
     if (comptime builtin.os.tag == .windows) {
-        const stat = handleFile(fd).stat(windowsIo()) catch return error.StatFailed;
+        const stat = fd.stat(windowsIo()) catch return error.StatFailed;
         return std.math.cast(usize, stat.size) orelse error.FileTooLarge;
     }
     if (builtin.os.tag == .linux) {
@@ -700,10 +704,6 @@ fn windowsIo() std.Io {
     return native_platform.Threaded.global_single_threaded.io();
 }
 
-fn handleFile(fd: std.posix.fd_t) std.Io.File {
-    return .{ .handle = fd, .flags = .{ .nonblocking = false } };
-}
-
 const WindowsMapping = struct {
     const HANDLE = std.os.windows.HANDLE;
     const PAGE_READONLY: u32 = 0x02;
@@ -715,10 +715,10 @@ const WindowsMapping = struct {
 };
 
 /// Read-only shared mapping of `size` bytes from the start of `fd`.
-fn mapReadOnly(fd: std.posix.fd_t, size: usize) ![]align(std.heap.page_size_min) u8 {
+fn mapReadOnly(fd: FileDescriptor, size: usize) ![]align(std.heap.page_size_min) u8 {
     if (comptime builtin.os.tag == .windows) {
         const W = WindowsMapping;
-        const mapping = W.CreateFileMappingW(fd, null, W.PAGE_READONLY, 0, 0, null) orelse return error.MemoryMappingNotSupported;
+        const mapping = W.CreateFileMappingW(fd.handle, null, W.PAGE_READONLY, 0, 0, null) orelse return error.MemoryMappingNotSupported;
         // The view keeps the section object alive after its handle closes.
         defer _ = W.CloseHandle(mapping);
         const base = W.MapViewOfFile(mapping, W.FILE_MAP_READ, 0, 0, size) orelse return error.MemoryMappingNotSupported;
@@ -736,10 +736,9 @@ fn unmap(data: []align(std.heap.page_size_min) u8) void {
     native_platform.filesystem.unmapMemory(data);
 }
 
-fn openReadOnlyZ(path_z: [:0]const u8) !std.posix.fd_t {
+fn openReadOnlyZ(path_z: [:0]const u8) !FileDescriptor {
     if (comptime builtin.os.tag == .windows) {
-        const file = try native_platform.filesystem.openPositionalReadOnly(windowsIo(), .cwd(), path_z);
-        return file.handle;
+        return native_platform.filesystem.openPositionalReadOnly(windowsIo(), .cwd(), path_z);
     }
     // std.posix.openatZ preserves actionable failures such as AccessDenied,
     // NotDir, and descriptor exhaustion while still retrying EINTR. Flattening
@@ -748,9 +747,9 @@ fn openReadOnlyZ(path_z: [:0]const u8) !std.posix.fd_t {
     return std.posix.openatZ(std.posix.AT.FDCWD, path_z.ptr, .{ .ACCMODE = .RDONLY }, 0);
 }
 
-fn closeFd(fd: std.posix.fd_t) void {
+fn closeFd(fd: FileDescriptor) void {
     if (comptime builtin.os.tag == .freestanding) return;
-    if (comptime builtin.os.tag == .windows) return handleFile(fd).close(windowsIo());
+    if (comptime builtin.os.tag == .windows) return fd.close(windowsIo());
     if (comptime builtin.link_libc) {
         _ = c.close(fd);
     } else {
@@ -758,9 +757,9 @@ fn closeFd(fd: std.posix.fd_t) void {
     }
 }
 
-fn readAt(fd: std.posix.fd_t, buf: []u8, offset: u64) !usize {
+fn readAt(fd: FileDescriptor, buf: []u8, offset: u64) !usize {
     if (comptime builtin.os.tag == .windows) {
-        return handleFile(fd).readPositional(windowsIo(), &.{buf}, offset) catch error.ReadFailed;
+        return fd.readPositional(windowsIo(), &.{buf}, offset) catch error.ReadFailed;
     }
     // Prefer the raw Linux syscall even in libc-linked builds so the hot
     // prefetch/read path can distinguish and retry EINTR deterministically.
@@ -782,7 +781,7 @@ fn readAt(fd: std.posix.fd_t, buf: []u8, offset: u64) !usize {
     return error.ReadFailed;
 }
 
-fn writeAllAt(fd: std.posix.fd_t, bytes: []const u8, offset: u64) !void {
+fn writeAllAt(fd: FileDescriptor, bytes: []const u8, offset: u64) !void {
     var total: usize = 0;
     while (total < bytes.len) {
         const write_off = try std.math.add(u64, offset, total);
@@ -941,5 +940,40 @@ test "prefetchFile reads every byte with bounded workers" {
             try std.testing.expectEqual(@as(u64, payload.len), result.bytes);
             try std.testing.expectEqual(std.math.clamp(workers, 1, 8), result.workers);
         }
+    }
+}
+
+test "file readers preserve positional mode across model consumers" {
+    const allocator = std.testing.allocator;
+    const io = native_platform.testing.io;
+    var tmp = native_platform.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const payload = "abcdefgh";
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.bin", .data = payload });
+    const path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, "model.bin" });
+    defer allocator.free(path);
+    const full = try readFile(allocator, path);
+    defer allocator.free(full);
+    try std.testing.expectEqualStrings(payload, full);
+    try std.testing.expectError(error.FileTooLarge, readFileMax(allocator, path, 7));
+    const region = try readRegion(allocator, path, 2, 3);
+    defer allocator.free(region);
+    try std.testing.expectEqualStrings("cde", region);
+    var bytes: [3]u8 = undefined;
+    try readRegionInto(allocator, path, 4, &bytes);
+    try std.testing.expectEqualStrings("efg", &bytes);
+    try std.testing.expectError(error.RegionOutOfBounds, readRegionInto(allocator, path, 7, &bytes));
+    var mapped = try MmapRegion.init(allocator, path);
+    defer mapped.deinit();
+    try std.testing.expectEqualStrings(payload, mapped.data);
+    // Public prefetch remains capability-gated. Exercise its shared positional
+    // reader directly, including parallel reads of the retained Windows File.
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
+    defer allocator.free(path_z);
+    const fd = try openReadOnlyZ(path_z);
+    defer closeFd(fd);
+    for ([_]usize{ 1, 4, 8 }) |workers| {
+        const result = try prefetchFileContents(io, allocator, fd, payload.len, workers);
+        try std.testing.expectEqual(@as(u64, payload.len), result.bytes);
     }
 }

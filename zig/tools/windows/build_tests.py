@@ -47,6 +47,10 @@ def module(root, dependencies, tail):
 
 
 SUITES = {
+    "model-file": (
+        ["file readers preserve positional mode"],
+        module("pkg/inference/src/util/c_file.zig", ["antfly_platform"], PLATFORM),
+    ),
     "compat": (
         ["Windows "],
         module("tools/windows/compat_test.zig", ["antfly_platform"], PLATFORM),

@@ -12904,9 +12904,8 @@ fn netAcceptWindows(userdata: ?*anyopaque, listen_handle: net.Socket.Handle, opt
     const compat = @import("windows_native.zig");
     if (compat.isWine()) {
         var address: PosixAddress = undefined;
-        const syscall: Syscall = try .start();
-        const socket = compat.acceptSocket(listen_handle, @as([]u8, @ptrCast(&address))) catch |err| return syscall.fail(err);
-        syscall.finish();
+        try Thread.checkCancel();
+        const socket = try compat.acceptSocket(listen_handle, @as([]u8, @ptrCast(&address)), options, waitSocketEvent);
         return .{ .handle = socket, .address = addressFromPosix(&address) };
     }
     if (!have_networking) return error.NetworkDown;

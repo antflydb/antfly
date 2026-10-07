@@ -683,3 +683,48 @@ native and Wine results, source hashes and verified cleanup),
 `/private/tmp/pr987-io-fix-app-smoke`. Both disposable VM environments and
 all temporary boot disks, buckets, service accounts, subnets and networks
 have been deleted; their absence was verified.
+
+
+## Model-file ownership and idle accept cancellation (2026-10-07)
+
+This follow-up fixes two failures reproduced at PR head `14792aed6a`.
+The model reader discarded the positional file's asynchronous mode, then
+reconstructed a synchronous `File` and reached `unreachable` on a pending
+read. Windows descriptors now retain the complete `std.Io.File` through
+reads, mapping, parallel prefetch, stat and close. POSIX descriptors retain
+their existing representation.
+
+Wine accepts now use an owned `AcceptEx` request with zero receive length,
+a per-operation event and the executor's cancellation wakeup. Cancellation
+uses `CancelIoEx` for that request and drains completion before releasing
+its socket, address storage and event. A successful accept adopts the
+listener context before returning the peer address. The native AFD accept
+path and the installed Zig standard library are unchanged.
+
+The default qualification archive adds a model-file consumer suite covering
+whole-file and region reads, admission/bounds failures, mmap and parallel
+prefetch. The compatibility suite adds 16 idle accept cancellations with
+listener reuse and server-first traffic, plus cancellation of a parked accept
+group before listener closure.
+
+All four focused Debug/ReleaseFast executables pass on both CrossOver and
+Windows Server 2022 build `10.0.20348.0` on NTFS: **22 passed, zero skips,
+zero failures and zero leaks** per environment. Native executable hashes
+match the manifest. macOS passes all seven model-file tests, both focused
+optimization modes, and all 14 platform build steps including 13 Python
+process checks. The full Windows application and native/browser module
+boundary audits pass **59/59 steps**.
+
+The application SHA-256 is
+`aeaf3dbcb9ba77aa15c9f2aba48964f2e60447d85beb1c5f361284004a26df11`.
+Its CrossOver smoke passes 64 queries across forced termination/reopen,
+verifies all 32 acknowledged documents and full-text entries, and reports
+valid storage with zero tail bytes. This is not an additional native
+application VM-reset durability run.
+
+Evidence is retained in `/private/tmp/pr987-ownership-fix` (manifest,
+source hashes, native/Wine results and cleanup records),
+`/private/tmp/pr987-ownership-native`,
+`/private/tmp/pr987-ownership-c-file-native.log`,
+`/private/tmp/pr987-ownership-app-build.log`, and
+`/private/tmp/pr987-ownership-app-smoke`.

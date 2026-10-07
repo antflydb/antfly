@@ -274,3 +274,55 @@ test "Windows shim clocks advance and condition timeout preserves the mutex" {
     try std.testing.expectEqual(std.c.E.SUCCESS, native_platform.c.pthread_mutex_trylock(&mutex));
     try std.testing.expectEqual(std.c.E.SUCCESS, native_platform.c.pthread_mutex_unlock(&mutex));
 }
+
+fn idleAccept(io: std.Io, server: *std.Io.net.Server, started: *std.Io.Event) std.Io.net.Server.AcceptError!void {
+    started.set(io);
+    const peer = try server.accept(io);
+    peer.close(io);
+}
+
+test "Windows canceling idle accepts drains requests and preserves the listener" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const io = native_platform.testing.io;
+    const address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var server = try address.listen(io, .{});
+    defer server.deinit(io);
+    for (0..16) |iteration| {
+        var started: std.Io.Event = .unset;
+        var future = try io.concurrent(idleAccept, .{ io, &server, &started });
+        defer future.cancel(io) catch {};
+        try started.wait(io);
+        if (iteration % 2 == 0) try io.sleep(.fromMilliseconds(20), .awake);
+        try std.testing.expectError(error.Canceled, future.cancel(io));
+        // A drained accept must not steal the next connection. Do not send
+        // bytes before accepting: server-first protocols must also work.
+        const client = try server.socket.address.connect(io, .{ .mode = .stream });
+        defer client.close(io);
+        const peer = try server.accept(io);
+        defer peer.close(io);
+        try std.testing.expectEqual(std.Io.net.IpAddress.Family.ip4, std.meta.activeTag(peer.socket.address));
+        var writer = peer.writer(io, &.{});
+        try writer.interface.writeAll("x");
+        try writer.interface.flush();
+        var reader = client.reader(io, &.{});
+        var byte: [1]u8 = undefined;
+        try reader.interface.readSliceAll(&byte);
+        try std.testing.expectEqual(@as(u8, 'x'), byte[0]);
+    }
+    // Mirrors server shutdown: cancel/join the accept group before closing
+    // the listener, without requiring a connection to wake it.
+    var started: std.Io.Event = .unset;
+    var tasks: std.Io.Group = .init;
+    defer tasks.cancel(io);
+    try tasks.concurrent(io, groupedIdleAccept, .{ io, &server, &started });
+    try started.wait(io);
+    try io.sleep(.fromMilliseconds(20), .awake);
+    tasks.cancel(io);
+}
+
+fn groupedIdleAccept(io: std.Io, server: *std.Io.net.Server, started: *std.Io.Event) std.Io.Cancelable!void {
+    idleAccept(io, server, started) catch |err| switch (err) {
+        error.Canceled => return error.Canceled,
+        else => std.debug.panic("unexpected accept failure: {t}", .{err}),
+    };
+}
