@@ -220,49 +220,21 @@ pub fn buildIndexed(a: A, out: A, table: local.common_topology_records.TableReco
             const incremental = incrementalRecipe(recipe) and source.inventory.deleted_row_groups.len == 0 and (if (source.scanner.iceberg_delete_plan) |plan| plan.files.len == 0 else true);
             if (incremental and file_keys.len != 0) {
                 const leaves = try ca.alloc(Reduction.Leaf, file_keys.len);
-                for (source.inventory.files, file_keys, leaves, 0..) |file, file_key, *leaf, file_index| {
-                    try cancellation.check();
-                    try provider.context.ensureActive();
-                    const refs = try out.alloc(local.serverless_manifest_artifact_ref.ArtifactRef, cohort.items.len);
-                    var all_present = true;
-                    var from_index = true;
-                    for (cohort.items, 0..) |request_index, slot| {
-                        const single = requests.items[request_index].recipe;
-                        const key = contributionKey(file_key, single.fingerprint(), names[slot]);
-                        if (old.get(key)) |old_index| {
-                            refs[slot] = old_contributions[old_index].artifact;
-                            from_index = false;
-                        } else if (contribution_lookup) |lookup| {
-                            if (try lookup.lookup(out, key)) |value| refs[slot] = value.artifact else all_present = false;
-                        } else all_present = false;
-                    }
-                    if (!all_present) {
-                        const partial = try operators.Grouped.create(a, specs, .{ .groups = 2_000_000, .bytes = 8 * 1024 * 1024, .spill = &spill });
-                        defer partial.deinit();
-                        if (recipe.keys.len == 0) try partial.ensureGlobalGroup();
-                        native_provider.only_file = file_index;
-                        if (metadata_count and source.inventory.format == .iceberg) try partial.addGlobalCount(file.row_count) else try consumeCohort(a, &native_provider, binding, recipe, partial, &budget, cancellation);
-                        const published = if (recipe.keys.len != 0) try artifacts.publishPartitioned(a, out, store, names, partial, recipe, &spill, cancellation) else try artifacts.publishCohort(a, out, store, names, partial, recipe, cancellation);
-                        @memcpy(refs, published);
-                        out.free(published);
-                    }
-                    if (all_present and from_index and contribution_lookup != null) {
-                        for (cohort.items, names) |request_index, name| try contribution_lookup.?.retain(contributionKey(file_key, requests.items[request_index].recipe.fingerprint(), name));
-                    } else for (refs, cohort.items, names) |ref, request_index, name| try contributions.append(out, .{ .file = file_key, .recipe = requests.items[request_index].recipe.fingerprint(), .name = name, .artifact = ref });
-                    leaf.* = .{ .key = file_key, .refs = refs };
-                }
+                for (file_keys, leaves, 0..) |file_key, *leaf, file_index| leaf.* = .{ .key = file_key, .index = file_index };
+                var resolver: LeafResolver = .{ .a = a, .out = out, .provider = &native_provider, .source = source, .binding = binding, .recipe = recipe, .names = names, .old = &old, .previous = old_contributions, .index = contribution_lookup, .metadata_count = metadata_count, .store = store, .spill = &spill, .budget = &budget, .cancellation = cancellation, .contributions = &contributions };
                 native_provider.only_file = null;
                 std.mem.sort(Reduction.Leaf, leaves, {}, struct {
                     fn less(_: void, left: Reduction.Leaf, right: Reduction.Leaf) bool {
                         return std.mem.order(u8, &left.key, &right.key) == .lt;
                     }
                 }.less);
-                var reduction: Reduction = .{ .a = a, .out = out, .store = store, .recipe = recipe, .specs = specs, .names = names, .old = &old, .previous = old_contributions, .index = contribution_lookup, .contributions = &contributions, .spill = &spill, .cancellation = cancellation };
+                var reduction: Reduction = .{ .a = a, .out = out, .store = store, .recipe = recipe, .specs = specs, .names = names, .old = &old, .previous = old_contributions, .index = contribution_lookup, .contributions = &contributions, .spill = &spill, .cancellation = cancellation, .resolver = &resolver };
                 defer reduction.shape_keys.deinit(a);
                 const root = try reduction.reduce(leaves);
                 for (root.refs, names, cohort.items) |artifact, name, index| {
                     var slot_binding = binding;
                     slot_binding.index_config_hash = try recipeIdentity(out, requests.items[index].recipe);
+                    if (contribution_lookup) |lookup| try lookup.includeRoot(contributionKey(root.key, requests.items[index].recipe.fingerprint(), name));
                     try declarations.append(out, .{ .name = name, .binding = slot_binding, .artifact = artifact });
                 }
                 continue;
@@ -290,9 +262,12 @@ pub fn incrementalRecipe(recipe: recipes.Recipe) bool {
     return true;
 }
 pub fn fileIdentity(source: *local.serverless_query_lake_serving.ServingSource, file: local.serverless_external_source_types.FileEntry) [32]u8 {
+    return inventoryFileIdentity(source.inventory, file);
+}
+pub fn inventoryFileIdentity(inventory: local.serverless_external_source_types.Inventory, file: local.serverless_external_source_types.FileEntry) [32]u8 {
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
     hash.update("native-file-contribution-v1");
-    for ([_][]const u8{ source.inventory.source_id, source.inventory.schema_fingerprint, file.file_id, file.object_uri, file.etag, file.version_id }) |bytes| {
+    for ([_][]const u8{ inventory.source_id, inventory.schema_fingerprint, file.file_id, file.object_uri, file.etag, file.version_id }) |bytes| {
         var length: [8]u8 = undefined;
         std.mem.writeInt(u64, &length, bytes.len, .little);
         hash.update(&length);
@@ -316,8 +291,64 @@ pub fn contributionKey(file: [32]u8, recipe: [32]u8, name: []const u8) [32]u8 {
 // a file leaves unrelated subtree identities unchanged. Every internal node
 // is itself an ordinary exact aggregate artifact, so existing readers and GC
 // retain their authenticated block format and bounded reducer semantics.
+const LeafResolver = struct {
+    a: A,
+    out: A,
+    provider: *@import("lake_index_row_source.zig").Provider,
+    source: *local.serverless_query_lake_serving.ServingSource,
+    binding: local.serverless_segment_source_binding.Binding,
+    recipe: recipes.Recipe,
+    names: []const []const u8,
+    old: *const ContributionIndex,
+    previous: []const local.metadata_lake_index_catalog.FileContribution,
+    index: ?*@import("lake_index_contributions.zig").Index,
+    metadata_count: bool,
+    store: *stores.ArtifactStore,
+    spill: *local.sql_spill.Manager,
+    budget: *@import("../serverless/build/lake_build_limits.zig").Budget,
+    cancellation: @import("antfly_cancellation").CancellationToken,
+    contributions: *std.ArrayList(local.metadata_lake_index_catalog.FileContribution),
+    fn resolve(self: *@This(), leaf: Reduction.Leaf) !Reduction.Leaf {
+        try self.cancellation.check();
+        try self.provider.context.ensureActive();
+        const refs = try self.out.alloc(local.serverless_manifest_artifact_ref.ArtifactRef, self.names.len);
+        var all_present = true;
+        var from_index = true;
+        for (self.names, 0..) |name, slot| {
+            const single: recipes.Recipe = .{ .keys = self.recipe.keys, .inputs = self.recipe.inputs[slot..][0..1] };
+            const key = contributionKey(leaf.key, single.fingerprint(), name);
+            if (self.old.get(key)) |old_index| {
+                refs[slot] = self.previous[old_index].artifact;
+                from_index = false;
+            } else if (self.index) |lookup| {
+                if (try lookup.lookup(self.out, key)) |value| refs[slot] = value.artifact else all_present = false;
+            } else all_present = false;
+        }
+        if (!all_present) {
+            const specs = try self.a.alloc(operators.AggregateSpec, self.recipe.inputs.len);
+            defer self.a.free(specs);
+            for (self.recipe.inputs, specs) |input, *spec| spec.* = input.spec;
+            const partial = try operators.Grouped.create(self.a, specs, .{ .groups = 2_000_000, .bytes = 8 * 1024 * 1024, .spill = self.spill });
+            defer partial.deinit();
+            if (self.recipe.keys.len == 0) try partial.ensureGlobalGroup();
+            self.provider.only_file = leaf.index;
+            defer self.provider.only_file = null;
+            const file = self.source.inventory.files[leaf.index];
+            if (self.metadata_count and self.source.inventory.format == .iceberg) try partial.addGlobalCount(file.row_count) else try consumeCohort(self.a, self.provider, self.binding, self.recipe, partial, self.budget, self.cancellation);
+            const published = if (self.recipe.keys.len != 0) try artifacts.publishPartitioned(self.a, self.out, self.store, self.names, partial, self.recipe, self.spill, self.cancellation) else try artifacts.publishCohort(self.a, self.out, self.store, self.names, partial, self.recipe, self.cancellation);
+            @memcpy(refs, published);
+            self.out.free(published);
+        }
+        for (refs, self.names, 0..) |ref, name, slot| {
+            const single: recipes.Recipe = .{ .keys = self.recipe.keys, .inputs = self.recipe.inputs[slot..][0..1] };
+            if (all_present and from_index and self.index != null) try self.index.?.retain(contributionKey(leaf.key, single.fingerprint(), name)) else try self.contributions.append(self.out, .{ .file = leaf.key, .recipe = single.fingerprint(), .name = name, .artifact = ref });
+        }
+        return .{ .key = leaf.key, .refs = refs, .index = leaf.index };
+    }
+};
+
 const Reduction = struct {
-    const Leaf = struct { key: [32]u8, refs: []const local.serverless_manifest_artifact_ref.ArtifactRef };
+    const Leaf = struct { key: [32]u8, refs: []const local.serverless_manifest_artifact_ref.ArtifactRef = &.{}, index: usize = 0 };
     a: A,
     out: A,
     store: *stores.ArtifactStore,
@@ -330,6 +361,7 @@ const Reduction = struct {
     contributions: *std.ArrayList(local.metadata_lake_index_catalog.FileContribution),
     spill: *local.sql_spill.Manager,
     cancellation: @import("antfly_cancellation").CancellationToken,
+    resolver: ?*LeafResolver = null,
     shape_keys: std.AutoHashMapUnmanaged([2][32]u8, [32]u8) = .empty,
     fn shapeKey(self: *@This(), leaves: []const Leaf) anyerror![32]u8 {
         if (leaves.len == 1) return leaves[0].key;
@@ -355,7 +387,7 @@ const Reduction = struct {
     }
     fn reduce(self: *@This(), leaves: []const Leaf) anyerror!Leaf {
         try self.cancellation.check();
-        if (leaves.len == 1) return leaves[0];
+        if (leaves.len == 1) return if (leaves[0].refs.len != 0) leaves[0] else try self.resolver.?.resolve(leaves[0]);
         const split = splitAt(leaves);
         if (split == 0) return error.InvalidLakeIndexCatalog;
         const key = try self.shapeKey(leaves);
@@ -834,6 +866,7 @@ test "external lake partitioned aggregate trees retain unaffected groups with la
     defer output.deinit();
     var previous: BuildResult = .{ .declarations = &.{}, .contributions = &.{} };
     var previous_root: ?@import("../serverless/graph_segment/page_tree.zig").Ref = null;
+    var previous_roots: []const [32]u8 = &.{};
     const Denied = struct {
         var base: local.storage_object_storage.ObjectStorage = undefined;
         var append: bool = false;
@@ -863,6 +896,8 @@ test "external lake partitioned aggregate trees retain unaffected groups with la
         var index: @import("lake_index_contributions.zig").Index = undefined;
         try index.init(a, store, previous_root, .none);
         defer index.deinit();
+        index.counted = true;
+        index.prior_roots = previous_roots;
         if (phase != 0) {
             const changed = (try @import("lake_index_build_replay.zig").changedFilesIndexed(a, output.allocator(), &provider, store, previous.declarations, &.{}, .none, &index)).?;
             var count: usize = 0;
@@ -871,11 +906,9 @@ test "external lake partitioned aggregate trees retain unaffected groups with la
         }
         const built = try buildIndexed(a, output.allocator(), table, &source, &store, &provider, .none, &.{}, &.{}, &index);
         try std.testing.expectEqual(@as(usize, 4), built.declarations.len);
-        if (phase == 0) try std.testing.expect(built.contributions.len >= (2 * source.inventory.files.len - 1) * 4) else {
-            try std.testing.expect(index.retained.count() > source.inventory.files.len * 4);
-            try std.testing.expect(built.contributions.len < index.retained.count());
-        }
+        if (phase == 0) try std.testing.expect(built.contributions.len >= (2 * source.inventory.files.len - 1) * 4) else try std.testing.expect(built.contributions.len < previous_root.?.records);
         previous_root = try index.update(built.contributions);
+        previous_roots = try index.rootKeys(output.allocator());
         const unchanged = try index.update(built.contributions);
         try std.testing.expect(previous_root.?.eql(unchanged.?));
         try std.testing.expect(previous_root.?.records >= (2 * source.inventory.files.len - 1) * 4);
@@ -902,9 +935,13 @@ test "external lake partitioned aggregate trees retain unaffected groups with la
         var retained_index: @import("lake_index_contributions.zig").Index = undefined;
         try retained_index.init(a, metadata_store, previous_root, .none);
         defer retained_index.deinit();
+        retained_index.counted = true;
+        retained_index.prior_roots = previous_roots;
         const retained_build = try buildIndexed(a, output.allocator(), table, &source, &metadata_store, &provider, .none, &.{}, &.{}, &retained_index);
         try std.testing.expectEqual(@as(usize, 0), retained_build.contributions.len);
+        const reads_before = retained_index.reads;
         const retained_root = (try retained_index.update(retained_build.contributions)).?;
+        try std.testing.expectEqual(reads_before, retained_index.reads);
         try std.testing.expect(previous_root.?.eql(retained_root));
         for (built.declarations, retained_build.declarations) |before, after| try std.testing.expectEqualStrings(before.artifact.artifact_id, after.artifact.artifact_id);
         for (built.declarations, 0..) |declaration, slot| {

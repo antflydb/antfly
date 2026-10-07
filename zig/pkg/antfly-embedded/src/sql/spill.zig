@@ -667,6 +667,62 @@ pub const Sequential = struct {
         self.size += 1;
         return offset;
     }
+    /// Encode borrowed columns synchronously. Neither payloads nor row arrays
+    /// enter the per-run staging arena; physical dictionary values stay borrowed.
+    pub fn appendBatch(self: *Sequential, values: @import("execution_batch.zig").Batch, keys: @import("execution_batch.zig").Batch, ordinals: []const u64) !void {
+        if (values.len() != keys.len() or values.len() != ordinals.len) return error.InvalidSqlSpill;
+        try self.flush();
+        var begin: usize = 0;
+        while (begin < values.len()) {
+            try self.file.manager.check();
+            var scratch = std.heap.ArenaAllocator.init(self.file.manager.allocator());
+            defer scratch.deinit();
+            const a = scratch.allocator();
+            var end = begin;
+            var estimated: usize = 24;
+            while (end < values.len() and end - begin < 256) {
+                var cost: usize = 8;
+                for (0..values.width()) |column| cost +|= try operators.datumBytes(try values.cell(a, end, column));
+                for (0..keys.width()) |column| cost +|= try operators.datumBytes(try keys.cell(a, end, column));
+                if (end != begin and cost > self.block_bytes -| estimated) break;
+                estimated +|= cost;
+                end += 1;
+            }
+            var bytes: std.ArrayList(u8) = .empty;
+            var encoder: Encoder = .{ .manager = self.file.manager, .a = a, .bytes = &bytes, .limit = self.file.manager.max_record_bytes };
+            try encoder.word(end - begin);
+            try encoder.word(values.width());
+            try encoder.word(keys.width());
+            for (ordinals[begin..end]) |ordinal| try encoder.word(ordinal);
+            try encodeBatchColumns(&encoder, values, begin, end);
+            try encodeBatchColumns(&encoder, keys, begin, end);
+            try self.writeEncoded(bytes.items);
+            self.size += end - begin;
+            begin = end;
+        }
+    }
+    fn encodeBatchColumns(encoder: *Encoder, batch: @import("execution_batch.zig").Batch, begin: usize, end: usize) !void {
+        // One bounded column of borrowed cells feeds the shared physical codec.
+        // Dictionary choice, SQL NULL and JSON null retain exactly one format.
+        var cells: [256]Datum = undefined;
+        var rows: [256]Row = undefined;
+        var positions: [256]usize = undefined;
+        for (positions[0 .. end - begin], begin..) |*position, index| position.* = index;
+        const selected = try batch.select(encoder.a, positions[0 .. end - begin]);
+        for (0..batch.width()) |column| {
+            const dictionary = try selected.dictionaryColumn(encoder.a, column);
+            defer if (dictionary) |physical| {
+                encoder.a.free(physical.dictionary.values);
+                encoder.a.free(physical.dictionary.indices);
+            };
+            if (dictionary) |physical| if (physical != .dictionary or physical.len() != end - begin) return error.InvalidSqlSpill;
+            for (begin..end, 0..) |index, lane| {
+                cells[lane] = if (dictionary) |physical| try physical.cell(encoder.a, lane, 0) else try batch.cell(encoder.a, index, column);
+                rows[lane] = .{ .values = cells[lane..][0..1], .keys = &.{}, .ordinal = 0 };
+            }
+            try encodeColumns(encoder, rows[0 .. end - begin], false);
+        }
+    }
     fn tag(value: Datum) u8 {
         if (value.patterns != null) return 255;
         return switch (value.value) {
@@ -806,22 +862,26 @@ pub const Sequential = struct {
         for (rows) |row| try encoder.word(row.ordinal);
         try encodeColumns(&encoder, rows, false);
         try encodeColumns(&encoder, rows, true);
-        const compressed = if (manager.compression == .snappy and bytes.items.len >= 1024) try snappy.encode(manager.allocator(), bytes.items) else null;
+        try self.writeEncoded(bytes.items);
+        self.pending.clearRetainingCapacity();
+        _ = self.write_arena.reset(.free_all);
+        self.pending_bytes = 0;
+    }
+    fn writeEncoded(self: *Sequential, bytes: []const u8) !void {
+        const manager = self.file.manager;
+        const compressed = if (manager.compression == .snappy and bytes.len >= 1024) try snappy.encode(manager.allocator(), bytes) else null;
         defer if (compressed) |value| manager.allocator().free(value);
-        const use_compressed = compressed != null and compressed.?.len + 32 < bytes.items.len;
-        const stored = if (use_compressed) compressed.? else bytes.items;
+        const use_compressed = compressed != null and compressed.?.len + 32 < bytes.len;
+        const stored = if (use_compressed) compressed.? else bytes;
         var header: [17]u8 = undefined;
         std.mem.writeInt(u64, header[0..8], stored.len, .little);
-        std.mem.writeInt(u64, header[8..16], std.hash.Wyhash.hash(0, bytes.items), .little);
+        std.mem.writeInt(u64, header[8..16], std.hash.Wyhash.hash(0, bytes), .little);
         header[16] = @intFromBool(use_compressed);
         self.file.buffer_bytes = self.buffer_bytes;
         const offset = self.file.size;
         try self.file.writeRaw(offset, &header);
         try self.file.writeRaw(offset + header.len, stored);
         manager.compressed_records += @intFromBool(use_compressed);
-        self.pending.clearRetainingCapacity();
-        _ = self.write_arena.reset(.free_all);
-        self.pending_bytes = 0;
     }
     pub const Position = struct { row: u64, byte: u64 };
     /// Flush a column-block boundary for indexed replay without sealing the run.
@@ -1285,13 +1345,18 @@ pub const Sequential = struct {
 };
 
 pub const Sort = struct {
+    const Entry = struct { normalized: ?@import("sort_key.zig").Key, position: usize, ordinal: u64 };
     manager: *Manager,
     a: Allocator,
     orders: []const operators.Order,
     memory_bytes: usize,
     merge_fan_in: usize = 8,
     arena: std.heap.ArenaAllocator,
-    rows: std.ArrayList(Row) = .empty,
+    // Sorting moves only memcomparable prefixes, stable payload positions and
+    // ordinals. Typed stores retain payloads and authoritative fallback keys.
+    rows: std.ArrayList(Entry) = .empty,
+    values: @import("typed_store.zig").Store,
+    keys: @import("typed_store.zig").Store,
     estimated: usize = 0,
     runs: [32]?Sequential = @splat(null),
     run_levels: [32]u8 = @splat(0),
@@ -1341,16 +1406,15 @@ pub const Sort = struct {
             try self.sort.sortRows();
             var file = try Sequential.init(self.sort.manager, self.sort.blockBytes());
             errdefer file.close();
-            for (self.sort.rows.items) |row| {
-                try self.sort.manager.check();
-                _ = try file.append(row, none);
-            }
+            try self.sort.writeRows(&file);
             try file.seal();
             return file;
         }
         fn destroy(self: *RunJob) void {
             const a = self.sort.a;
             self.sort.arena.deinit();
+            self.sort.values.deinit();
+            self.sort.keys.deinit();
             self.sort.rows.deinit(a);
             a.destroy(self);
         }
@@ -1365,7 +1429,7 @@ pub const Sort = struct {
     pub fn init(a: Allocator, manager: *Manager, orders: []const operators.Order, memory_bytes: usize) Sort {
         _ = a;
         const backing = manager.allocator();
-        return .{ .manager = manager, .a = backing, .orders = orders, .memory_bytes = memory_bytes, .arena = std.heap.ArenaAllocator.init(backing) };
+        return .{ .manager = manager, .a = backing, .orders = orders, .memory_bytes = memory_bytes, .arena = std.heap.ArenaAllocator.init(backing), .values = .init(backing), .keys = .init(backing) };
     }
     pub fn deinit(self: *Sort) void {
         if (self.pending_run) |job| {
@@ -1378,6 +1442,8 @@ pub const Sort = struct {
         }
         for (self.owned_heads) |block| if (block) |owner| owner.release();
         self.arena.deinit();
+        self.values.deinit();
+        self.keys.deinit();
         self.rows.deinit(self.a);
         for (&self.runs) |*run| if (run.*) |*file| file.close();
         for (self.outputs[0..self.output_count], self.head_arenas[0..self.output_count]) |*file, *arena| {
@@ -1398,14 +1464,18 @@ pub const Sort = struct {
         for (row.keys) |v| bytes +|= try operators.datumBytes(v);
         if (bytes > self.memory_bytes / 3) return error.SqlProgramLimitExceeded;
         self.max_row_bytes = @max(self.max_row_bytes, bytes);
-        if (self.rows.items.len != 0 and (bytes > self.memory_bytes / (if (self.parallel_runs and self.memory_bytes >= 128 * 1024) @as(usize, 8) else 4) -| self.estimated)) try self.flush();
-        const a = self.arena.allocator();
-        const values = try a.alloc(Datum, row.values.len);
-        const keys = try a.alloc(Datum, row.keys.len);
-        for (row.values, values) |v, *out| out.* = try operators.cloneDatum(a, v);
-        for (row.keys, keys) |v, *out| out.* = try operators.cloneDatum(a, v);
-        try self.rows.append(self.a, .{ .values = values, .keys = keys, .ordinal = row.ordinal, .normalized = row.normalized });
-        self.estimated += bytes;
+        if (self.rows.items.len != 0 and (self.values.columns.len != row.values.len or self.keys.columns.len != row.keys.len)) try self.flush();
+        var retained = @sizeOf(Entry) +| try self.values.appendBytes(row.values) +| try self.keys.appendBytes(row.keys);
+        if (self.rows.items.len != 0 and (retained > self.memory_bytes / (if (self.parallel_runs and self.memory_bytes >= 128 * 1024) @as(usize, 8) else 4) -| self.estimated)) {
+            try self.flush();
+            retained = @sizeOf(Entry) +| try self.values.appendBytes(row.values) +| try self.keys.appendBytes(row.keys);
+        }
+        try self.rows.ensureUnusedCapacity(self.a, 1);
+        const position = self.values.len;
+        _ = try self.values.append(row.values);
+        _ = try self.keys.append(row.keys);
+        self.rows.appendAssumeCapacity(.{ .position = position, .ordinal = row.ordinal, .normalized = row.normalized });
+        self.estimated +|= retained;
         self.total += 1;
     }
     fn radixRows(self: *Sort) !bool {
@@ -1416,7 +1486,7 @@ pub const Sort = struct {
             const key = row.normalized orelse return false;
             if (!key.complete or key.types != first.types or key.len != first.len) return false;
         }
-        const scratch = try self.a.alloc(Row, self.rows.items.len);
+        const scratch = try self.a.alloc(Entry, self.rows.items.len);
         defer self.a.free(scratch);
         var source = self.rows.items;
         var target = scratch;
@@ -1441,43 +1511,77 @@ pub const Sort = struct {
                 target[offsets[byte]] = row;
                 offsets[byte] += 1;
             }
-            std.mem.swap([]Row, &source, &target);
+            std.mem.swap([]Entry, &source, &target);
         }
         if (source.ptr != self.rows.items.ptr) @memcpy(self.rows.items, source);
         self.radix_runs += 1;
         return true;
     }
-    fn radixByte(row: Row, pass: usize, length: usize) u8 {
+    fn radixByte(row: Entry, pass: usize, length: usize) u8 {
         return if (pass < length) row.normalized.?.bytes[pass] else @truncate(row.ordinal >> @as(u6, @intCast((7 - (pass - length)) * 8)));
+    }
+    fn entryRow(self: *Sort, a: Allocator, entry: Entry, payload: bool) !Row {
+        return .{ .values = if (payload) try self.values.row(a, entry.position) else &.{}, .keys = try self.keys.row(a, entry.position), .ordinal = entry.ordinal, .normalized = entry.normalized };
     }
     fn sortRows(self: *Sort) !void {
         if (try self.radixRows()) return;
         const Comparator = struct {
-            orders: []const operators.Order,
+            sort: *Sort,
+            scratch: std.heap.ArenaAllocator,
             err: ?anyerror = null,
-            fn less(comparator: *@This(), left: Row, right: Row) bool {
-                return (operators.compareRows(left, right, comparator.orders) catch |err| {
-                    comparator.err = err;
+            fn less(comparator: *@This(), left: Entry, right: Entry) bool {
+                _ = comparator.scratch.reset(.retain_capacity);
+                const a = comparator.scratch.allocator();
+                return comparator.compare(a, left, right) catch |err| {
+                    comparator.err = comparator.err orelse err;
                     return left.ordinal < right.ordinal;
-                }) == .lt;
+                };
+            }
+            fn compare(comparator: *@This(), a: Allocator, left: Entry, right: Entry) !bool {
+                if (left.normalized) |lkey| if (right.normalized) |rkey| if (@import("sort_key.zig").compare(lkey, rkey)) |order| {
+                    return if (order == .eq) left.ordinal < right.ordinal else order == .lt;
+                };
+                return (try operators.compareRows(try comparator.sort.entryRow(a, left, false), try comparator.sort.entryRow(a, right, false), comparator.sort.orders)) == .lt;
             }
         };
-        var comparator: Comparator = .{ .orders = self.orders };
-        std.sort.pdq(Row, self.rows.items, &comparator, Comparator.less);
+        var comparator: Comparator = .{ .sort = self, .scratch = .init(self.a) };
+        defer comparator.scratch.deinit();
+        std.sort.pdq(Entry, self.rows.items, &comparator, Comparator.less);
         if (comparator.err) |err| return err;
+    }
+    fn writeRows(self: *Sort, file: *Sequential) !void {
+        var begin: usize = 0;
+        while (begin < self.rows.items.len) {
+            var scratch = std.heap.ArenaAllocator.init(self.a);
+            defer scratch.deinit();
+            const a = scratch.allocator();
+            const end = @min(self.rows.items.len, begin + 256);
+            var positions: [256]usize = undefined;
+            var ordinals: [256]u64 = undefined;
+            for (self.rows.items[begin..end], 0..) |entry, index| {
+                positions[index] = entry.position;
+                ordinals[index] = entry.ordinal;
+            }
+            const values: @import("execution_batch.zig").Batch = .{ .retained = .{ .store = &self.values, .count = self.values.len } };
+            const keys: @import("execution_batch.zig").Batch = .{ .retained = .{ .store = &self.keys, .count = self.keys.len } };
+            try file.appendBatch(try values.select(a, positions[0 .. end - begin]), try keys.select(a, positions[0 .. end - begin]), ordinals[0 .. end - begin]);
+            begin = end;
+        }
     }
     fn flush(self: *Sort) !void {
         try self.collectRun();
         if (self.rows.items.len == 0) return;
         if (self.parallel_runs and self.memory_bytes >= 128 * 1024) {
             const job = try self.a.create(RunJob);
-            job.* = .{ .sort = .{ .manager = self.manager, .a = self.a, .orders = self.orders, .memory_bytes = self.memory_bytes / 2, .arena = self.arena, .rows = self.rows, .parallel_runs = false } };
+            job.* = .{ .sort = .{ .manager = self.manager, .a = self.a, .orders = self.orders, .memory_bytes = self.memory_bytes / 2, .arena = self.arena, .rows = self.rows, .values = self.values, .keys = self.keys, .parallel_runs = false } };
             if (@import("parallel_scheduler.zig").global().submit(self.manager.io, self.estimated +| self.blockBytes() * 4, RunJob.run, .{job})) |task| {
                 job.task = task;
                 self.pending_run = job;
                 self.parallel_runs_started += 1;
                 self.arena = .init(self.a);
                 self.rows = .empty;
+                self.values = .init(self.a);
+                self.keys = .init(self.a);
                 self.estimated = 0;
                 return;
             }
@@ -1488,9 +1592,13 @@ pub const Sort = struct {
         var run = try Sequential.init(self.manager, self.blockBytes());
         var transferred = false;
         errdefer if (!transferred) run.close();
-        for (self.rows.items) |row| _ = try run.append(row, none);
+        try self.writeRows(&run);
         try run.seal();
         _ = self.arena.reset(.free_all);
+        self.values.deinit();
+        self.keys.deinit();
+        self.values = .init(self.a);
+        self.keys = .init(self.a);
         self.rows.clearAndFree(self.a);
         self.estimated = 0;
         transferred = true;
@@ -1716,8 +1824,9 @@ pub const Sort = struct {
         row: Row,
         block: ?*Sequential.OwnedBlock = null,
         index: usize = 0,
+        values: ?*const @import("typed_store.zig").Store = null,
         pub fn cell(self: RowLease, column: usize) !Datum {
-            return if (self.block) |block| block.cell(self.index, column) else self.row.values[column];
+            return if (self.block) |block| block.cell(self.index, column) else if (self.values) |values| values.cell(values.a, self.index, column) else self.row.values[column];
         }
         pub fn release(self: RowLease) void {
             if (self.block) |block| block.release();
@@ -1764,9 +1873,9 @@ pub const Sort = struct {
             return .{ .row = .{ .values = &.{}, .keys = &.{}, .ordinal = head.row.ordinal }, .block = owner, .index = position };
         }
         if (self.offset < self.rows.items.len) {
-            const row = self.rows.items[@intCast(self.offset)];
+            const entry = self.rows.items[@intCast(self.offset)];
             self.offset += 1;
-            return .{ .row = row };
+            return .{ .row = .{ .values = &.{}, .keys = &.{}, .ordinal = entry.ordinal }, .values = &self.values, .index = entry.position };
         }
         return null;
     }
@@ -1774,13 +1883,13 @@ pub const Sort = struct {
         if (self.leased_reads) {
             const lease = (try self.nextLeased()) orelse return null;
             defer lease.release();
-            const row = if (lease.block) |block| try block.row(a, lease.index) else lease.row;
-            defer if (lease.block) |block| {
-                if (block.encoded != null) {
+            const row = if (lease.block) |block| try block.row(a, lease.index) else if (lease.values != null) try self.entryRow(a, .{ .position = lease.index, .ordinal = lease.row.ordinal, .normalized = null }, true) else lease.row;
+            defer {
+                if (lease.values != null or (if (lease.block) |block| block.encoded != null else false)) {
                     a.free(row.values);
                     a.free(row.keys);
                 }
-            };
+            }
             const values = try a.alloc(Datum, row.values.len);
             for (row.values, values) |value, *out| out.* = try operators.cloneDatum(a, value);
             const keys: []Datum = if (retain_keys) try a.alloc(Datum, row.keys.len) else &.{};
@@ -1806,7 +1915,9 @@ pub const Sort = struct {
             return .{ .values = values, .keys = keys, .ordinal = head.row.ordinal };
         }
         if (self.offset < self.rows.items.len) {
-            const row = self.rows.items[@intCast(self.offset)];
+            const row = try self.entryRow(a, self.rows.items[@intCast(self.offset)], true);
+            defer a.free(row.values);
+            defer a.free(row.keys);
             self.offset += 1;
             const values = try a.alloc(Datum, row.values.len);
             const keys: []Datum = if (retain_keys) try a.alloc(Datum, row.keys.len) else &.{};
@@ -2467,4 +2578,71 @@ test "SQL spill independent replay readers seek column block boundaries and reta
     }
     try std.testing.expectEqual(null, try first.next(1));
     try std.testing.expectEqual(null, try second.next(1));
+}
+
+test "SQL typed sort keeps wide payloads in memory and leases columns across pulls" {
+    var budget: @import("memory_budget.zig") = .{ .backing = std.testing.allocator, .limit = 2 * 1024 * 1024 };
+    const a = budget.allocator();
+    var context: u8 = 0;
+    var manager: Manager = .{ .alloc = a, .io = std.testing.io, .context = &context, .checkpoint = struct {
+        fn check(_: *anyopaque) !void {}
+    }.check };
+    defer manager.deinit();
+    var sort = Sort.init(a, &manager, &.{.{}}, 2 * 1024 * 1024);
+    defer sort.deinit();
+    sort.parallel_runs = false;
+    for (0..2048) |i| {
+        const key = Datum.json(.{ .integer = @intCast(2047 - i) });
+        var row: [16]Datum = undefined;
+        for (&row, 0..) |*value, column| value.* = Datum.json(.{ .integer = 9007199254740993 + key.value.integer * 16 + @as(i64, @intCast(column)) });
+        try sort.add(.{ .values = &row, .keys = &.{key}, .ordinal = i });
+    }
+    const first = (try sort.nextLeased()).?;
+    defer first.release();
+    try std.testing.expectEqual(@as(usize, 0), manager.files);
+    try std.testing.expectEqual(@as(usize, 1), sort.radix_runs);
+    for (1..2048) |i| {
+        const lease = (try sort.nextLeased()).?;
+        defer lease.release();
+        try std.testing.expectEqual(@as(i64, 9007199254740993 + @as(i64, @intCast(i * 16 + 15))), (try lease.cell(15)).value.integer);
+    }
+    try std.testing.expectEqual(@as(i64, 9007199254740993), (try first.cell(0)).value.integer);
+    try std.testing.expect((try sort.nextLeased()) == null);
+}
+
+test "SQL selected typed spill preserves dictionary integers and both null domains without evaluating excluded IDs" {
+    const a = std.testing.allocator;
+    var context: u8 = 0;
+    var manager: Manager = .{ .alloc = a, .io = std.testing.io, .context = &context, .checkpoint = struct {
+        fn check(_: *anyopaque) !void {}
+    }.check };
+    defer manager.deinit();
+    var file = try Sequential.init(&manager, 32 * 1024);
+    defer file.close();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var indices: [300]u32 = undefined;
+    var selection: [299]usize = undefined;
+    var ordinals: [299]u64 = undefined;
+    for (&indices, 0..) |*id, i| id.* = @intCast(i % 3);
+    indices[5] = 999;
+    for (&selection, &ordinals, 0..) |*position, *ordinal, i| {
+        position.* = if (i < 5) i else i + 1;
+        ordinal.* = position.*;
+    }
+    const batch: @import("execution_batch.zig").Batch = .{ .dictionary = .{ .values = &.{ Datum.json(.{ .integer = 9007199254740993 }), .{}, Datum.json(.null) }, .indices = &indices } };
+    const selected = try batch.select(arena.allocator(), &selection);
+    const dictionary = (try selected.dictionaryColumn(arena.allocator(), 0)).?;
+    try std.testing.expectEqual(@as(usize, 3), dictionary.dictionary.values.len);
+    try file.appendBatch(selected, .{ .vectors = .{ .values = &.{}, .count = selection.len } }, &ordinals);
+    try file.seal();
+    for (selection, 0..) |position, offset| {
+        const row = (try file.readBorrowed(offset)).row;
+        try std.testing.expectEqual(@as(u64, position), row.ordinal);
+        const value = row.values[0];
+        if (position % 3 == 0) try std.testing.expectEqual(@as(i64, 9007199254740993), value.value.integer) else {
+            try std.testing.expect(value.value == .null);
+            try std.testing.expectEqual(position % 3 == 1, value.sql_null);
+        }
+    }
 }

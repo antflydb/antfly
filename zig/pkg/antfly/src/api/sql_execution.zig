@@ -839,10 +839,15 @@ pub const Adapter = struct {
         }
         fn close(raw: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            const a = self.a;
             const cursor = self.child;
             cursor.close(cursor.ptr);
             self.store.deinit();
+            self.destroyControl();
+        }
+        /// Both failed opens and completed cursors release dependent owners
+        /// before freeing the descriptor that holds those owners.
+        fn destroyControl(self: *@This()) void {
+            const a = self.a;
             if (self.reader_lease) |lease| lease.deinit();
             self.arena.deinit();
             a.destroy(self);
@@ -897,14 +902,11 @@ pub const Adapter = struct {
         var source = try local.serverless_query_lake_serving.ServingSource.openCached(a, .{ .storage_mode = .relational, .external_base_source = table.external_base_source }, options.lakeOptions(), context, &self.server.lake_read_cache);
         defer source.deinit();
         const owner = try a.create(AggregateArtifactCursor);
+        owner.a = a;
         owner.reader_lease = null;
-        var keep_owner = false;
-        defer if (!keep_owner) {
-            if (owner.reader_lease) |lease| lease.deinit();
-        };
-        defer if (!keep_owner) a.destroy(owner);
         owner.arena = .init(a);
-        defer if (!keep_owner) owner.arena.deinit();
+        var keep_owner = false;
+        defer if (!keep_owner) owner.destroyControl();
         owner.store = @import("lake_index_store.zig").Store.openNative(a, self.server.cfg.node_config, self.server.cfg.secret_store, true, self.server.cfg.deployment_mode, self.server.cfg.native_lake_artifact_base_dir) catch |err| {
             try context.ensureActive();
             if (err == error.OutOfMemory) return err;
@@ -3316,4 +3318,19 @@ test "SQL lake statement wrapper preserves ordering counts estimates and split s
     }
     wrapped.close(wrapped.ptr);
     try std.testing.expect(fixture.statement_closed);
+}
+
+test "lake SQL failed aggregate admission releases control before its descriptor" {
+    const FailedOpen = struct {
+        fn open(a: std.mem.Allocator) !void {
+            const owner = try a.create(Adapter.AggregateArtifactCursor);
+            owner.a = a;
+            owner.reader_lease = null;
+            owner.arena = .init(a);
+            defer owner.destroyControl();
+            _ = try owner.arena.allocator().alloc(u8, 128);
+            return error.NativeArtifactStorageRequired;
+        }
+    };
+    try std.testing.expectError(error.NativeArtifactStorageRequired, FailedOpen.open(std.testing.allocator));
 }

@@ -111,6 +111,49 @@ pub const Batch = union(enum) {
         }
         return .{ .dictionary = .{ .values = try values.toOwnedSlice(a), .indices = indices } };
     }
+    /// Borrow a physical selection without evaluating unselected cells. The
+    /// descriptor and dictionary ID maps belong to the caller's scratch arena.
+    pub fn select(self: *const Batch, a: A, selection: []const usize) !Batch {
+        const View = struct {
+            source: *const Batch,
+            selection: []const usize,
+            fn read(raw: *anyopaque, alloc: A, row_index: usize, column: usize) !scalar.Datum {
+                const view: *@This() = @ptrCast(@alignCast(raw));
+                return view.source.cell(alloc, view.selection[row_index], column);
+            }
+            fn dictionary(raw: *anyopaque, alloc: A, column: usize) !?Batch {
+                const view: *@This() = @ptrCast(@alignCast(raw));
+                var ids: std.AutoHashMapUnmanaged(u64, u32) = .empty;
+                defer ids.deinit(alloc);
+                var values: std.ArrayList(scalar.Datum) = .empty;
+                defer values.deinit(alloc);
+                const indices = try alloc.alloc(u32, view.selection.len);
+                var transferred = false;
+                defer if (!transferred) alloc.free(indices);
+                for (view.selection, indices) |position, *id| {
+                    const identity_ = (try view.source.dictionaryIdentity(position, column)) orelse return null;
+                    const entry = try ids.getOrPut(alloc, identity_);
+                    if (!entry.found_existing) {
+                        entry.value_ptr.* = @intCast(values.items.len);
+                        try values.append(alloc, try view.source.cell(alloc, position, column));
+                    }
+                    id.* = entry.value_ptr.*;
+                }
+                const dictionary_values = try values.toOwnedSlice(alloc);
+                transferred = true;
+                return .{ .dictionary = .{ .values = dictionary_values, .indices = indices } };
+            }
+
+            fn identity(raw: *anyopaque, row_index: usize, column: usize) !?u64 {
+                const view: *@This() = @ptrCast(@alignCast(raw));
+                return view.source.dictionaryIdentity(view.selection[row_index], column);
+            }
+        };
+        for (selection) |index| if (index >= self.len()) return error.InvalidSqlBackendResponse;
+        const view = try a.create(View);
+        view.* = .{ .source = self, .selection = selection };
+        return .{ .reader = .{ .ptr = view, .count = selection.len, .width = self.width(), .read = View.read, .read_dictionary = View.dictionary, .read_identity = View.identity } };
+    }
     pub fn cell(self: Batch, a: A, index: usize, column: usize) anyerror!scalar.Datum {
         if (index >= self.len() or column >= self.width()) return error.InvalidSqlBackendResponse;
         return switch (self) {

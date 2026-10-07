@@ -35,8 +35,9 @@ pub const Cursor = struct {
         block: ?*@import("spill.zig").Sequential.OwnedBlock = null,
         index: usize = 0,
         values: []const @import("scalar.zig").Datum = &.{},
+        typed: ?*const @import("typed_store.zig").Store = null,
         fn cell(self: Location, column: usize) !@import("scalar.zig").Datum {
-            return if (self.block) |block| block.cell(self.index, column) else self.values[column];
+            return if (self.block) |block| block.cell(self.index, column) else if (self.typed) |typed| typed.cell(typed.a, self.index, column) else self.values[column];
         }
     };
     pub const Lease = struct {
@@ -73,7 +74,7 @@ pub const Cursor = struct {
                         skipped.release();
                     }
                     const lease = (try sort.nextLeased()) orelse return error.InvalidSqlSpill;
-                    rows[count_rows] = .{ .block = lease.block, .index = lease.index, .values = lease.row.values };
+                    rows[count_rows] = .{ .block = lease.block, .index = lease.index, .values = lease.row.values, .typed = lease.values };
                     if (lease.block) |block| {
                         const existing = for (blocks[0..held]) |prior| {
                             if (prior == block) break true;

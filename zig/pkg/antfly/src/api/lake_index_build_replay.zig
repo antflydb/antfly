@@ -96,6 +96,7 @@ pub fn changedFilesIndexed(a: A, out: A, provider: *Provider, store: @import("..
                 const lookup_key = aggregate.contributionKey(key, fingerprint, declaration.name);
                 if (!required.* and !old.contains(lookup_key)) {
                     required.* = if (index) |lookup| missing: {
+                        if (lookup.has_file_coverage) break :missing !lookup.covered_files.contains(key);
                         var scratch = std.heap.ArenaAllocator.init(a);
                         defer scratch.deinit();
                         break :missing (try lookup.lookup(scratch.allocator(), lookup_key)) == null;

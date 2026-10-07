@@ -303,12 +303,36 @@ pub const Join = struct {
     }
     pub fn addBatch(self: *Join, build_side: bool, batch: @import("execution_batch.zig").Batch, keys: []const []const Datum, begin: usize) !void {
         if (keys.len != batch.len() or begin > keys.len) return error.InvalidSqlBackendResponse;
-        var arena = std.heap.ArenaAllocator.init(self.a);
-        defer arena.deinit();
-        for (begin..keys.len) |index| {
-            _ = arena.reset(.retain_capacity);
-            const ordinal = self.next_ordinals[@intFromBool(build_side)];
-            try self.add(build_side, try batch.row(arena.allocator(), index), keys[index], ordinal);
+        var offset = begin;
+        const key_batch: @import("execution_batch.zig").Batch = .{ .rows = keys };
+        while (offset < keys.len) {
+            try self.manager.check();
+            var arena = std.heap.ArenaAllocator.init(self.a);
+            defer arena.deinit();
+            const a = arena.allocator();
+            const end = @min(keys.len, offset + 256);
+            var selections: [16][256]usize = undefined;
+            var ordinals: [16][256]u64 = undefined;
+            var counts: [16]usize = @splat(0);
+            for (offset..end) |index| {
+                const ordinal = self.next_ordinals[@intFromBool(build_side)];
+                const partition = (try self.admit(build_side, keys[index], ordinal)) orelse continue;
+                const lane = counts[partition];
+                selections[partition][lane] = index;
+                ordinals[partition][lane] = ordinal;
+                counts[partition] += 1;
+                const costs = if (build_side) &self.build_cost else &self.probe_cost;
+                if (costs[partition] == 0) costs[partition] = @import("typed_store.zig").columnMetadataBytes(batch.width() + keys[index].len) *| 2;
+                costs[partition] +|= 128;
+                for (0..batch.width()) |column| costs[partition] +|= (try @import("typed_store.zig").retainedCellBytes(try batch.cell(a, index, column))) *| 2;
+                for (keys[index]) |value| costs[partition] +|= (try @import("typed_store.zig").retainedCellBytes(value)) *| 2;
+            }
+            for (counts[0..self.partitions], 0..) |count, partition| {
+                if (count == 0) continue;
+                const file = try self.inputFile(build_side, partition);
+                try file.appendBatch(try batch.select(a, selections[partition][0..count]), try key_batch.select(a, selections[partition][0..count]), ordinals[partition][0..count]);
+            }
+            offset = end;
         }
     }
     pub fn close(self: *Join) void {
@@ -358,7 +382,7 @@ pub const Join = struct {
     }
     // The caller supplies all build rows before probe rows. This invariant
     // keeps the runtime filter complete and prevents false-negative matches.
-    pub fn add(self: *Join, build: bool, values: []const Datum, keys: []const Datum, ordinal: usize) !void {
+    fn admit(self: *Join, build: bool, keys: []const Datum, ordinal: usize) !?usize {
         if (self.finished or (build and self.probing_started)) return error.InvalidSqlBackendResponse;
         if (!build) self.probing_started = true;
         const input_side = @intFromBool(build);
@@ -369,30 +393,29 @@ pub const Join = struct {
             const mask = @as(u64, 1) << @as(u6, @intCast(bit % 64));
             if (build) self.filter[bit / 64] |= mask else if (!self.outer_left and self.filter[bit / 64] & mask == 0) {
                 self.filtered_rows += 1;
-                return;
+                return null;
             }
         } else if ((!build and !self.outer_left) or (build and !self.outer_right)) {
             self.filtered_rows += @intFromBool(!build);
-            return;
+            return null;
         }
         const side: usize = @intFromBool(build);
         if (self.rows[side] >= self.limits.rows) return error.SqlProgramLimitExceeded;
         self.rows[side] += 1;
         const partition: usize = @intCast((hash orelse 0) & (self.partitions - 1));
+        return partition;
+    }
+    fn inputFile(self: *Join, build: bool, partition: usize) !*spill.Sequential {
         const slot = if (build) &self.build[partition] else &self.probes[partition];
-        if (slot.* == null) {
-            slot.* = try spill.Sequential.init(self.manager, @min(4096, self.workspace_bytes / 512));
-            // Both sides may keep sixteen open partition files. Reserve a
-            // bounded share for their I/O buffers rather than exhausting a
-            // small statement before a build partition can be loaded.
-            slot.*.?.buffer_bytes = @max(128, @min(4096, self.workspace_bytes / 512));
-        }
-        _ = try slot.*.?.append(.{ .values = values, .keys = keys, .ordinal = ordinal }, spill.none);
+        if (slot.* == null) slot.* = try self.partitionFile();
+        return &slot.*.?;
+    }
+    pub fn add(self: *Join, build: bool, values: []const Datum, keys: []const Datum, ordinal: usize) !void {
+        const partition = (try self.admit(build, keys, ordinal)) orelse return;
+        _ = try (try self.inputFile(build, partition)).append(.{ .values = values, .keys = keys, .ordinal = ordinal }, spill.none);
         const costs = if (build) &self.build_cost else &self.probe_cost;
         const typed = @import("typed_store.zig");
         if (costs[partition] == 0) costs[partition] = typed.columnMetadataBytes(values.len + keys.len) *| 2;
-        // Hash links and bucket capacity coexist with typed vectors. Reserve
-        // growth headroom without pricing every primitive as a boxed Datum.
         costs[partition] +|= 128;
         for (values) |value| costs[partition] +|= (try typed.retainedCellBytes(value)) *| 2;
         for (keys) |value| costs[partition] +|= (try typed.retainedCellBytes(value)) *| 2;
@@ -590,19 +613,34 @@ test "SQL partitioned join retains one partition and preserves residual outer ma
     const Hook = struct {
         fn check(_: *anyopaque) !void {}
     };
-    for ([_]usize{ 64 * 1024, 512 * 1024 }) |bytes| {
+    for ([_]usize{ 64 * 1024, 512 * 1024 }) |bytes| for ([_]bool{ false, true }) |batched| {
         var dummy: u8 = 0;
         var manager: spill.Manager = .{ .alloc = std.testing.allocator, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check };
         defer manager.deinit();
         const join = try Join.create(std.testing.allocator, &manager, bytes, 10000, 200000, true, true);
         defer join.close();
-        for (0..1000) |i| {
-            const key = Datum.json(.{ .integer = @intCast(i) });
-            try join.add(true, &.{key}, &.{key}, i);
-        }
-        for (500..1500) |i| {
-            const key = Datum.json(.{ .integer = @intCast(i) });
-            try join.add(false, &.{key}, &.{key}, i);
+        if (batched) {
+            var build_cells: [1000]Datum = undefined;
+            var probe_cells: [1000]Datum = undefined;
+            var build_rows: [1000][]const Datum = undefined;
+            var probe_rows: [1000][]const Datum = undefined;
+            for (&build_cells, &probe_cells, &build_rows, &probe_rows, 0..) |*build_cell, *probe_cell, *build_row, *probe_row, i| {
+                build_cell.* = Datum.json(.{ .integer = @intCast(i) });
+                probe_cell.* = Datum.json(.{ .integer = @intCast(i + 500) });
+                build_row.* = build_cells[i..][0..1];
+                probe_row.* = probe_cells[i..][0..1];
+            }
+            try join.addBatch(true, .{ .rows = &build_rows }, &build_rows, 0);
+            try join.addBatch(false, .{ .rows = &probe_rows }, &probe_rows, 0);
+        } else {
+            for (0..1000) |i| {
+                const key = Datum.json(.{ .integer = @intCast(i) });
+                try join.add(true, &.{key}, &.{key}, i);
+            }
+            for (500..1500) |i| {
+                const key = Datum.json(.{ .integer = @intCast(i) });
+                try join.add(false, &.{key}, &.{key}, i);
+            }
         }
         var matches: usize = 0;
         var lefts: usize = 0;
@@ -624,7 +662,7 @@ test "SQL partitioned join retains one partition and preserves residual outer ma
         try std.testing.expectEqual(@as(usize, 501), rights);
         try std.testing.expect(join.partitions_loaded > 1);
         if (bytes >= 512 * 1024) try std.testing.expect(join.parallel_builds_started > 0);
-    }
+    };
 }
 
 test "SQL partitioned join runtime filter preserves null and skew semantics" {

@@ -126,7 +126,26 @@ pub fn buildWithLease(a: A, artifact_store: *stores.ArtifactStore, table: record
     var contribution_index: contributions_api.Index = undefined;
     const previous_root = if (current.value.published) |previous| if (reusable_directory and std.meta.eql(previous.namespace, current.value.namespace) and std.mem.eql(u8, &previous.signature.credentials, &signature.credentials) and std.mem.eql(u8, &previous.signature.store, &signature.store)) if (previous.contribution_index) |bytes| try std.json.parseFromSliceLeaky(@import("../serverless/graph_segment/page_tree.zig").Ref, na, bytes, .{}) else null else null else null;
     try contribution_index.init(a, scoped, previous_root, cancellation);
+    const previous_ownership = if (current.value.published) |previous| previous.contribution_ownership_version else 0;
+    contribution_index.counted = true;
+    contribution_index.migrating = previous_root != null and previous_ownership == 0;
+    contribution_index.prior_roots = if (previous_root != null and previous_ownership == 1) current.value.published.?.contribution_roots else &.{};
     defer contribution_index.deinit();
+    // The authenticated inventory supplies the file delta once per refresh.
+    // Counted ownership proves all prior files belong to the unchanged recipes;
+    // replay need not point-probe every file/recipe in the contribution tree.
+    if (previous_root != null and previous_ownership == 1) {
+        const previous = current.value.published.?;
+        if (std.mem.eql(u8, &previous.signature.desired, &signature.desired) and source.inventory.deleted_row_groups.len == 0 and (if (source.scanner.iceberg_delete_plan) |plan| plan.files.len == 0 else true)) {
+            if (previous.inventory.byte_len > (local.serverless_external_source_mod.codec.DecodeLimits{}).max_artifact_bytes) return error.ExternalSourceInventoryTooLarge;
+            const bytes = try @import("lake_index_aggregate_artifact.zig").readArtifact(na, scoped, .{ .artifact_id = previous.inventory.artifact_id, .checksum = previous.inventory.checksum, .byte_len = previous.inventory.byte_len }, cancellation, null);
+            const old_inventory = try local.serverless_external_source_mod.decodeInventoryAlloc(na, bytes);
+            if (old_inventory.deleted_row_groups.len == 0) {
+                for (old_inventory.files) |file| try contribution_index.covered_files.put(a, @import("lake_index_native_aggregates.zig").inventoryFileIdentity(old_inventory, file), {});
+                contribution_index.has_file_coverage = true;
+            }
+        }
+    }
     const replay_api = @import("lake_index_build_replay.zig");
     const replay_columns = try replay_api.columnsForBuild(a, na, table, &provider, base_source);
     var replay = replay_api.Replay.init(a, &provider, replay_columns);

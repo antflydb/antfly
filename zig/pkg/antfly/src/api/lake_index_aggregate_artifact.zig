@@ -144,6 +144,38 @@ pub fn publishCohort(a: A, result_alloc: A, store: *stores.ArtifactStore, names:
     return references;
 }
 
+/// Cache only authenticated immutable directory metadata. The expected query
+/// recipe and the live reader lease are checked on every open, including hits.
+fn loadRoot(a: A, store: stores.ArtifactStore, artifact: Ref, cancellation: Cancellation, cached: ?CachedRead) !Root {
+    if (artifact.kind != .algebraic_segment or !supportsMetadataVersion(artifact.metadata_version) or artifact.byte_len > max_root_bytes) return error.InvalidNativeAggregateArtifact;
+    const bytes = try readArtifact(a, store, .{ .artifact_id = artifact.artifact_id, .byte_len = artifact.byte_len, .checksum = artifact.checksum }, cancellation, cached);
+    defer a.free(bytes);
+    const root = try std.json.parseFromSliceLeaky(Root, a, bytes, .{ .allocate = .alloc_always });
+    if (!std.mem.eql(u8, root.format, if (artifact.metadata_version == 1) "native-sql-aggregate-v1" else if (artifact.metadata_version == 3) "native-sql-aggregate-v3" else "native-sql-aggregate-v2") or !std.mem.eql(u8, root.name, artifact.name) or root.blocks.len > max_blocks) return error.InvalidNativeAggregateArtifact;
+    if (artifact.metadata_version == 1) {
+        if (root.state_recipe != null or root.state_slot != null) return error.InvalidNativeAggregateArtifact;
+    } else {
+        const state_recipe = root.state_recipe orelse return error.InvalidNativeAggregateArtifact;
+        const slot = root.state_slot orelse return error.InvalidNativeAggregateArtifact;
+        if (state_recipe.inputs.len > 256 or slot >= state_recipe.inputs.len or !root.recipe.eql(.{ .keys = state_recipe.keys, .inputs = state_recipe.inputs[slot .. slot + 1] })) return error.InvalidNativeAggregateArtifact;
+    }
+    if (artifact.metadata_version != 3 and root.partitions.len != 0) return error.InvalidNativeAggregateArtifact;
+    if (artifact.metadata_version == 3 and (root.blocks.len != 0 or root.partitions.len > 64)) return error.InvalidNativeAggregateArtifact;
+    var count: u64 = 0;
+    for (root.partitions, 0..) |part, i| {
+        if (part.bucket >= 64 or (i != 0 and root.partitions[i - 1].bucket >= part.bucket) or part.artifact.kind != .algebraic_segment or part.artifact.metadata_version != 2 or !std.mem.eql(u8, part.artifact.name, root.name) or part.artifact.byte_len > max_root_bytes) return error.InvalidNativeAggregateArtifact;
+        try stores.validateSha256ArtifactIdentity(part.artifact.artifact_id, part.artifact.checksum);
+        count = std.math.add(u64, count, part.groups) catch return error.InvalidNativeAggregateArtifact;
+    }
+    for (root.blocks) |block| {
+        if (block.rows == 0 or block.rows > 256 or block.artifact.byte_len > max_block_bytes) return error.InvalidNativeAggregateArtifact;
+        try stores.validateSha256ArtifactIdentity(block.artifact.artifact_id, block.artifact.checksum);
+        count = std.math.add(u64, count, block.rows) catch return error.InvalidNativeAggregateArtifact;
+    }
+    if (count != root.groups) return error.InvalidNativeAggregateArtifact;
+    return root;
+}
+
 pub const Reader = struct {
     a: A,
     store: stores.ArtifactStore,
@@ -152,6 +184,7 @@ pub const Reader = struct {
     control: std.heap.ArenaAllocator,
     page: std.heap.ArenaAllocator,
     root: Root,
+    metadata: ?@import("lake_index_decoded_metadata.zig").Owned(Root) = null,
     block: ?spill.ColumnarBlock = null,
     block_index: usize = 0,
     position: usize = 0,
@@ -175,31 +208,11 @@ pub const Reader = struct {
         var control = std.heap.ArenaAllocator.init(a);
         errdefer control.deinit();
         const ca = control.allocator();
-        const bytes = try readArtifact(ca, store, .{ .artifact_id = artifact.artifact_id, .byte_len = artifact.byte_len, .checksum = artifact.checksum }, cancellation, cached);
-        const root = try std.json.parseFromSliceLeaky(Root, ca, bytes, .{ .allocate = .alloc_always });
-        if (!std.mem.eql(u8, root.format, if (artifact.metadata_version == 1) "native-sql-aggregate-v1" else if (artifact.metadata_version == 3) "native-sql-aggregate-v3" else "native-sql-aggregate-v2") or !std.mem.eql(u8, root.name, artifact.name) or !root.recipe.eql(recipe) or root.blocks.len > max_blocks) return error.InvalidNativeAggregateArtifact;
-        if (artifact.metadata_version == 1) {
-            if (root.state_recipe != null or root.state_slot != null) return error.InvalidNativeAggregateArtifact;
-        } else {
-            const state_recipe = root.state_recipe orelse return error.InvalidNativeAggregateArtifact;
-            const slot = root.state_slot orelse return error.InvalidNativeAggregateArtifact;
-            if (state_recipe.inputs.len > 256 or slot >= state_recipe.inputs.len or !root.recipe.eql(.{ .keys = state_recipe.keys, .inputs = state_recipe.inputs[slot .. slot + 1] })) return error.InvalidNativeAggregateArtifact;
-        }
-        if (artifact.metadata_version != 3 and root.partitions.len != 0) return error.InvalidNativeAggregateArtifact;
-        if (artifact.metadata_version == 3 and (root.blocks.len != 0 or root.partitions.len > 64)) return error.InvalidNativeAggregateArtifact;
-        var count: u64 = 0;
-        for (root.partitions, 0..) |part, i| {
-            if (part.bucket >= 64 or (i != 0 and root.partitions[i - 1].bucket >= part.bucket) or part.artifact.kind != .algebraic_segment or part.artifact.metadata_version != 2 or !std.mem.eql(u8, part.artifact.name, root.name) or part.artifact.byte_len > max_root_bytes) return error.InvalidNativeAggregateArtifact;
-            try stores.validateSha256ArtifactIdentity(part.artifact.artifact_id, part.artifact.checksum);
-            count = std.math.add(u64, count, part.groups) catch return error.InvalidNativeAggregateArtifact;
-        }
-        for (root.blocks) |block| {
-            if (block.rows == 0 or block.rows > 256 or block.artifact.byte_len > max_block_bytes) return error.InvalidNativeAggregateArtifact;
-            try stores.validateSha256ArtifactIdentity(block.artifact.artifact_id, block.artifact.checksum);
-            count = std.math.add(u64, count, block.rows) catch return error.InvalidNativeAggregateArtifact;
-        }
-        if (count != root.groups) return error.InvalidNativeAggregateArtifact;
-        self.* = .{ .a = a, .store = store, .cancellation = cancellation, .cached = cached, .control = control, .page = .init(a), .root = root };
+        const metadata = if (cached) |cache| try @import("lake_index_decoded_metadata.zig").acquire(Root, cache, store, artifact, cancellation, loadRoot) else null;
+        errdefer if (metadata) |owned| owned.release();
+        const root = if (metadata) |owned| owned.value.* else try loadRoot(ca, store, artifact, cancellation, null);
+        if (!root.recipe.eql(recipe)) return error.InvalidNativeAggregateArtifact;
+        self.* = .{ .a = a, .store = store, .cancellation = cancellation, .cached = cached, .control = control, .page = .init(a), .root = root, .metadata = metadata };
         return self;
     }
     /// Roots may fuse only when authenticated state recipes and the entire
@@ -341,6 +354,7 @@ pub const Reader = struct {
         const a = self.a;
         if (self.child) |child| child.cursor().close(child);
         self.page.deinit();
+        if (self.metadata) |owned| owned.release();
         self.control.deinit();
         a.destroy(self);
     }
@@ -626,9 +640,16 @@ test "external lake partitioned cohorts fuse once per block and decline late mis
     }.check, .async_writes = false };
     defer manager.deinit();
     const refs = try publishPartitioned(a, out, &store, &.{ "stats.sum", "stats.count" }, group, recipe, &manager, .none);
-    const left = try Reader.open(a, store, refs[0], .{ .keys = recipe.keys, .inputs = recipe.inputs[0..1] }, .none);
+    var cache = local.serverless_query_lake_serving_cache.Cache.init(a);
+    defer cache.deinit();
+    const cached: CachedRead = .{ .cache = &cache, .scope = @splat(8), .context = .{ .io = std.testing.io } };
+    const same = try Reader.openWithCache(a, store, refs[0], .{ .keys = recipe.keys, .inputs = recipe.inputs[0..1] }, .none, cached);
+    defer same.cursor().close(same);
+    const left = try Reader.openWithCache(a, store, refs[0], .{ .keys = recipe.keys, .inputs = recipe.inputs[0..1] }, .none, cached);
+    try std.testing.expect(left.metadata.?.value == same.metadata.?.value);
+    try std.testing.expectError(error.InvalidNativeAggregateArtifact, Reader.openWithCache(a, store, refs[0], .{ .keys = recipe.keys, .inputs = recipe.inputs[1..2] }, .none, cached));
     defer left.cursor().close(left);
-    const right = try Reader.open(a, store, refs[1], .{ .keys = recipe.keys, .inputs = recipe.inputs[1..2] }, .none);
+    const right = try Reader.openWithCache(a, store, refs[1], .{ .keys = recipe.keys, .inputs = recipe.inputs[1..2] }, .none, cached);
     defer right.cursor().close(right);
     try std.testing.expect(left.root.partitions.len > 1);
     try left.setOutputSlot(1);

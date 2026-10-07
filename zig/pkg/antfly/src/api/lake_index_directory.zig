@@ -11,6 +11,8 @@ pub const Document = struct {
     declarations: []const local.serverless_segment_sidecar_manifest.DeclaredArtifact,
     file_contributions: []const catalog.FileContribution = &.{},
     contribution_index: ?@import("../serverless/graph_segment/page_tree.zig").Ref = null,
+    contribution_roots: []const catalog.Digest = &.{},
+    contribution_ownership_version: u16 = 0,
     contribution_pages: []const local.serverless_manifest_artifact_ref.ArtifactRef = &.{},
 };
 pub fn publish(a: A, store: *stores.ArtifactStore, declarations: []const local.serverless_segment_sidecar_manifest.DeclaredArtifact, cancellation: @import("antfly_cancellation").CancellationToken) !catalog.DirectoryRef {
@@ -75,6 +77,8 @@ pub fn hydrateLazy(a: A, store: stores.ArtifactStore, publication: *catalog.Publ
     const document = try loadDocument(a, store, .{ .kind = .external_base_source, .artifact_id = directory.artifact_id, .checksum = directory.checksum, .byte_len = directory.byte_len }, cancellation, cached);
     if (document.declarations.len != directory.count) return error.InvalidLakeIndexCatalog;
     publication.declarations = document.declarations;
+    publication.contribution_roots = document.contribution_roots;
+    publication.contribution_ownership_version = document.contribution_ownership_version;
     if (document.contribution_index) |root| publication.contribution_index = try std.json.Stringify.valueAlloc(a, root, .{});
     var contributions: std.ArrayList(catalog.FileContribution) = .empty;
     try contributions.appendSlice(a, document.file_contributions);
@@ -95,6 +99,13 @@ pub fn loadDocument(a: A, store: stores.ArtifactStore, ref: local.serverless_man
     if (document.contribution_index) |root| {
         try root.validate();
         if (!std.mem.eql(u8, document.format, "native-lake-index-directory-v3") or root.records > catalog.max_contributions or document.file_contributions.len != 0 or document.contribution_pages.len != 0) return error.InvalidLakeIndexCatalog;
+    }
+    if (document.contribution_ownership_version > 1 or document.contribution_roots.len > catalog.max_directory_artifacts or
+        (document.contribution_ownership_version == 0 and document.contribution_roots.len != 0) or
+        (document.contribution_ownership_version == 1 and (document.contribution_index != null) != (document.contribution_roots.len != 0)) or
+        (document.contribution_index == null and document.contribution_roots.len != 0)) return error.InvalidLakeIndexCatalog;
+    for (document.contribution_roots, 0..) |key, i| {
+        if (std.mem.allEqual(u8, &key, 0) or (i != 0 and std.mem.order(u8, &document.contribution_roots[i - 1], &key) != .lt)) return error.InvalidLakeIndexCatalog;
     }
     for (document.contribution_pages) |page| {
         if (page.kind != .external_base_source or page.byte_len == 0 or page.byte_len > max_contribution_page_bytes) return error.InvalidLakeIndexCatalog;
@@ -121,7 +132,9 @@ pub fn publishIndexed(a: A, store: *stores.ArtifactStore, declarations: []const 
     if (declarations.len > catalog.max_directory_artifacts) return error.InvalidLakeIndexCatalog;
     try (local.serverless_segment_sidecar_manifest.Manifest{ .artifacts = declarations }).validate();
     const root = try index.update(contributions);
-    const bytes = try std.json.Stringify.valueAlloc(a, Document{ .format = "native-lake-index-directory-v3", .declarations = declarations, .contribution_index = root }, .{});
+    const roots = try index.rootKeys(a);
+    defer a.free(roots);
+    const bytes = try std.json.Stringify.valueAlloc(a, Document{ .format = "native-lake-index-directory-v3", .declarations = declarations, .contribution_index = root, .contribution_roots = roots, .contribution_ownership_version = if (index.counted) 1 else 0 }, .{});
     defer a.free(bytes);
     if (bytes.len > catalog.max_directory_bytes) return error.InvalidLakeIndexCatalog;
     var upload = store.*;

@@ -635,28 +635,33 @@ exceed `max_deleted`. Destructive collections retain their durable continuation.
 
 ### Keyed contribution state, grouped partitions, and cold-load admission
 
-Reader/topology protocol 27 persists reduction ownership in
-`native-lake-index-directory-v3`; protocol 26 introduced that directory and
-`native-sql-aggregate-v3`. Readers retain compatibility with protocols 24/25/26
-and aggregate versions 1/2. Coordinated metadata admission prevents publishing
-these directories while an older metadata voter is still active.
+Reader/topology protocol 28 adds counted contribution ownership to
+`native-lake-index-directory-v3`. Protocol 27 introduced ownership edges;
+protocol 26 introduced that directory and `native-sql-aggregate-v3`. Readers
+retain compatibility with protocols 24/25/26/27 and aggregate versions 1/2.
+Coordinated metadata admission prevents publishing new ownership semantics
+while an older metadata voter is still active.
 
-A v3 directory authenticates a native immutable page-tree root keyed by the
-file/reduction identity, exact recipe, and materialization name. Builders look
-up inherited contributions lazily, using a hash-indexed build-local page cache
-bounded to 4096 pages and 128 MiB. Reduction nodes persist bounded ownership
-edges to two child contributions and up to 64 range aliases. Builders probe
-unchanged nodes before descending into reduction work and retain their
-ownership graph without opening aggregate roots or range directories. Legacy
-records acquire ownership on their next refresh. Publication authenticates the
-retained lookup identities, adopts fully retained page branches by reference,
-drops obsolete branches without fetching their leaves, and applies changed
-records. It avoids canonicalizing every inherited record and keeps only the
-current live graph, rather than retaining an ever-growing history. Planning
-and ownership validation still visit the live file/key set;
-it does not promise constant-time snapshot refresh. Serving reads only the
-small declaration directory. Durable GC checkpoints contribution-tree pages
-and their aggregate references as ordinary authenticated frontier jobs.
+A v3 directory authenticates an immutable page-tree root keyed by file/reduction
+identity, exact recipe, and materialization name. Builders look up inherited
+contributions lazily, using a hash-indexed page cache bounded to 4096 pages and
+128 MiB. Reduction nodes own two child contributions and up to 64 terminal range
+aliases. The directory records the publication root set; each contribution
+records its incoming ownership count. Refresh adds new roots before retiring
+old roots, traversing descendants only when their count crosses zero. Shared
+subtrees survive without loading their descendants. Changed records update the
+immutable page tree, preserving old generations for pinned readers. A no-op
+ownership update needs no contribution-page reads.
+
+Builders probe unchanged reduction nodes before resolving file contributions.
+For unchanged definitions without delete plans, an authenticated prior inventory
+also supplies a shared file-membership set for replay admission, avoiding one
+contribution lookup per file and recipe. Snapshot inventory planning and reduction
+shape calculation still require linear file metadata/CPU work; refresh is not
+constant time. Legacy uncounted generations perform a one-time ownership census
+and prune before publishing counted state. Subsequent refreshes touch changed
+ownership paths and newly live/dead subgraphs. Durable GC checkpoints contribution
+pages and aggregate references as authenticated frontier jobs.
 
 Exact incremental grouped reducers partition keys by their semantic hash into
 64 immutable ranges. Each file contribution and reduction root authenticates
@@ -674,7 +679,20 @@ Compatible partitioned cohorts fuse SUM/COUNT/MIN/MAX slots and decode each
 shared block once. Fusion checks every child directory before changing slot
 maps; a mismatch anywhere leaves the readers independent. Preflight retains
 one directory pair at a time and bounded per-partition slot maps, then serving
-retains one active child reader.
+retains one active child reader. Parsed authenticated aggregate directories share the bounded decoded
+metadata cache and its single-flight loaders across fusion preflights and serving.
+Recipe and slot compatibility is checked on every reader admission, including
+cache hits.
+
+Sort runs retain payloads and fallback keys in typed column stores and sort
+compact position/ordinal references with normalized keys. In-memory results lease
+those columns; payload rows are materialized only at owned output boundaries.
+Spilled runs gather bounded column batches directly into the existing typed spill
+codec. Partitioned joins likewise hash bounded input batches into partition
+selections and write typed columns without cloning a row per input. Both paths
+retain existing cancellation, memory, disk quota, checksum, and exact null/numeric
+semantics. Compression and physical spill formats remain shared with ordinary
+native execution.
 
 Unordered parallel scans discover file footers and physical plans in bounded
 waves through the shared native scheduler. Each planner owns version pins and

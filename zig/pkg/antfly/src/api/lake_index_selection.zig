@@ -122,6 +122,8 @@ fn selectVerified(a: A, table: sql.Table, source: *local.serverless_query_lake_s
             if (document.declarations.len != directory.count) return error.InvalidLakeIndexCatalog;
             state.value.published.?.declarations = document.declarations;
             state.value.published.?.file_contributions = document.file_contributions;
+            state.value.published.?.contribution_roots = document.contribution_roots;
+            state.value.published.?.contribution_ownership_version = document.contribution_ownership_version;
             try state.value.published.?.validate();
         }
     } else try @import("lake_index_directory.zig").hydrateLazy(state.arena.allocator(), artifacts, &state.value.published.?, normalized, cached);

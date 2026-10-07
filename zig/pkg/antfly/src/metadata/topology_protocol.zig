@@ -52,8 +52,9 @@ const std = @import("std");
 /// Version 25 admits paged aggregate contribution directories and reduction trees.
 /// Version 26 admits keyed contribution trees and partitioned aggregate roots.
 /// Version 27 persists reduction ownership for exact contribution retention.
-pub const current_version: u16 = 27;
-pub const lake_index_catalog_version: u16 = 27;
+/// Version 28 maintains immutable ownership counts and publication root sets.
+pub const current_version: u16 = 28;
+pub const lake_index_catalog_version: u16 = 28;
 pub const durable_activation_version: u16 = 9;
 pub const store_report_update_version: u16 = 8;
 // Preflight and final append require the same complete decoder capability.
