@@ -799,7 +799,7 @@ test "boundary training source immutable canonical views share aligned bytes wit
 }
 
 test "boundary training source allocation failures release tensor views metadata and stable budget" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, exerciseSourceParts, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, exerciseSourceParts, .{});
 }
 
 test "boundary training source rejects non-FP32 metadata invalid ranges nonfinite values and excessive JSON depth" {

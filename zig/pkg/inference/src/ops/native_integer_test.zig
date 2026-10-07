@@ -155,5 +155,5 @@ fn allocationCase(a: std.mem.Allocator) !void {
 }
 
 test "native integer tensor ownership survives allocation failures" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, allocationCase, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, allocationCase, .{});
 }

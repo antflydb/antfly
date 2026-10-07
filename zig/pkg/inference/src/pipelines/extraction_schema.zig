@@ -877,7 +877,7 @@ test "extraction classification top_k rejection releases all nested allocations"
         "{\"classifications\":[{\"name\":\"t\",\"labels\":[\"a\",\"b\"],\"mode\":\"multi\",\"min_labels\":2,\"max_labels\":2,\"top_k\":1}]}",
         "{\"entities\":[\"person\"],\"entity_attributes\":{\"status\":{\"labels\":[\"active\",\"former\"]}},\"classifications\":[{\"name\":\"ordinary\",\"labels\":[\"a\",\"b\"],\"label_definitions\":{\"a\":{\"description\":\"First label\"}},\"examples\":[[\"Example\",\"a\"]],\"top_k\":2},{\"name\":\"structured\",\"labels\":[\"x\",\"y\"],\"ordered\":false}]}",
         "{\"classifications\":[{\"name\":\"t\",\"labels\":[\"a\",\"b\"],\"top_k\":1}],\"classification_constraints\":[{\"type\":\"LabelRef\",\"task\":\"t\",\"label\":\"a\"}]}",
-    }) |json| try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{json});
+    }) |json| try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Check.run, .{json});
 }
 
 test "extraction JointIE validates typed endpoints and remains distinct" {
@@ -921,5 +921,5 @@ test "extraction compiler owns nested allocations on every failure" {
             try std.testing.expectEqual(@as(usize, 1), compiled.schema.entity_attributes.len);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
 }

@@ -23,7 +23,13 @@ not establish the pod's storage budget. A failing run filled the measured
 49 GiB PVC, but filesystem usage alone does not identify the size of compiler
 outputs versus other cache contents. Completed phases retire local outputs
 and manifests together before starting the next phase, and the full job also
-removes its local cache on exit. Measure peak usage with this cleanup before
-increasing storage or splitting the unit suite. Do not delete individual
-executables while leaving live manifests, or remove a phase cache while one
+removes its local cache on exit. The unit jobs release completed test
+artifacts only after their last selected test or inventory consumer exits.
+Their invocation-local cache is then retired, including manifests, before
+any subsequent build. `report_test_cache.py` records retained bytes by artifact
+kind and the largest files after the unit phase, including failed runs. It
+reports allocated blocks separately from logical length because Zig's ELF
+outputs can be sparse. Compare these measurements before increasing storage
+or splitting the unit suite. Do not reuse manifests whose outputs have been
+removed, or remove a phase cache while one
 of its builds, tests, or inventory consumers is still running.

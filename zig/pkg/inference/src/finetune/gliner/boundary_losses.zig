@@ -1099,7 +1099,7 @@ fn allocationLifecycle(a: Allocator) !void {
     defer consistency.deinit();
 }
 test "boundary training all kernels release allocations on every failure" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, allocationLifecycle, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, allocationLifecycle, .{});
 }
 
 test "CUDA boundary Poisson count backward rounds the rate before subtracting the target" {

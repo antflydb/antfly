@@ -486,7 +486,7 @@ fn allocationLifecycle(a: Allocator) !void {
     defer document_.deinit();
 }
 test "boundary training selection releases allocations on all failure points" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, allocationLifecycle, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, allocationLifecycle, .{});
 }
 
 test "boundary training selection validates limits masks cancellation and empty shapes" {

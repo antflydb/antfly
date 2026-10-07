@@ -775,7 +775,7 @@ fn allocationLifecycle(a: Allocator) !void {
     defer natural_matched.deinit();
 }
 test "boundary training matching releases allocations on all failure points" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, allocationLifecycle, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, allocationLifecycle, .{});
 }
 
 test "boundary training matching bounds cancellation and empty supervision" {

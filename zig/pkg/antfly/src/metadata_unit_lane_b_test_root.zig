@@ -36,7 +36,7 @@ const transition_controller = @import("metadata/transition_controller.zig");
 const transition_driver = @import("metadata/transition_driver.zig");
 const replication_backfill = @import("metadata/replication_backfill.zig");
 
-test {
+comptime {
     _ = service;
     _ = catalog_projection_reader;
     _ = admin_read_operations;

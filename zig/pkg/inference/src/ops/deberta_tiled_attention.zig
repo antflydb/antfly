@@ -529,7 +529,7 @@ test "tiled DeBERTa BLAS attention allocations cancellation and finite validatio
             defer allocator.free(result);
         }
     };
-    try std.testing.checkAllAllocationFailures(a, Check.run, .{ shape, input });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Check.run, .{ shape, input });
     const Cancel = struct {
         calls: usize = 0,
         fn check(raw: ?*anyopaque) !void {
