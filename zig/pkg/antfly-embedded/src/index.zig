@@ -57,6 +57,7 @@ fn spinOrYield() void {
 
 /// An entry in a snapshot: one segment plus optional deletion bitmap.
 pub const SegmentReader = segment_mod.SegmentReader;
+pub const SegmentSource = @import("segment_source.zig").Source;
 pub const PostingsLoader = segment_mod.PostingsLoader;
 pub const SegmentData = union(enum) {
     native: @import("segment_source.zig").Source,
@@ -572,6 +573,10 @@ pub const SegmentEntry = struct {
     reader: segment_mod.SegmentReader,
     layout_stats: segment_mod.SegmentLayoutStats = .{},
     shared: *SegmentShared,
+    // Query-bound native readers borrow the same physical segment pin but own
+    // their decoder/navigation state and capability-bound source separately.
+    query_base_reader: ?segment_mod.SegmentReader = null,
+    query_source: ?SegmentSource = null,
 
     pub fn typedMergeWorkingSetBytes(self: *const SegmentEntry) !u64 {
         const cached = self.shared.typed_merge_estimate.load(.acquire);
@@ -629,6 +634,13 @@ pub const SegmentEntry = struct {
     /// resources, runs its retired cleanup (if any), and destroys the
     /// shared cell.
     fn releaseRef(self: *SegmentEntry) void {
+        if (self.query_base_reader) |base| {
+            self.reader.deinit();
+            self.query_source.?.close();
+            self.reader = base;
+            self.query_base_reader = null;
+            self.query_source = null;
+        }
         if (@atomicRmw(u32, &self.shared.ref_count, .Sub, 1, .acq_rel) != 1) return;
         const alloc = self.reader.alloc;
         const seg_id = self.id;
@@ -1658,18 +1670,32 @@ pub const IndexWriter = struct {
     pub fn acquireSnapshotWithReadContext(self: *IndexWriter, context: *anyopaque) !*IndexSnapshot {
         const old = self.acquireSnapshot();
         defer old.release();
+        var transferred = false;
         const segments = try self.alloc.dupe(SegmentEntry, old.segments);
-        errdefer self.alloc.free(segments);
+        errdefer if (!transferred) self.alloc.free(segments);
         var totals = try cloneGlobalFieldLens(self.alloc, old.global_total_field_len);
-        errdefer totals.deinit(self.alloc);
+        errdefer if (!transferred) totals.deinit(self.alloc);
         const empty = try IndexWriter.init(self.alloc);
         const snapshot_ref = empty.current;
         snapshot_ref.segments = segments;
         snapshot_ref.global_total_field_len = totals;
         snapshot_ref.epoch = old.epoch;
+        transferred = true;
+        for (segments) |*segment| segment.retain();
+        errdefer snapshot_ref.release();
         for (segments) |*segment| {
-            segment.retain();
             if (segment.reader.postings_loader) |*loader| loader.context = context;
+            if (segment.data == .native and segment.data.native == .ranges) {
+                const range = segment.data.native.ranges;
+                if (range.bind_read_context) |bind| {
+                    var source = try bind(range.ptr, self.alloc, context);
+                    errdefer source.close();
+                    const reader = try segment_mod.SegmentReader.initSource(self.alloc, source);
+                    segment.query_base_reader = segment.reader;
+                    segment.query_source = source;
+                    segment.reader = reader;
+                }
+            }
         }
         return snapshot_ref;
     }

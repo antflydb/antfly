@@ -46,6 +46,9 @@ pub const Source = union(enum) {
         close: *const fn (*anyopaque) void,
         checksum: ?*const fn (*anyopaque, u64, u64) anyerror!u32 = null,
         retained_bytes: ?*const fn (*anyopaque) usize = null,
+        /// Bind an independent query capability without changing the shared source.
+        bind_read_context: ?*const fn (*anyopaque, std.mem.Allocator, *anyopaque) anyerror!Source = null,
+        seal_read_context: ?*const fn (*anyopaque) void = null,
         resource_manager: ?*resources.ResourceManager = null,
     },
 

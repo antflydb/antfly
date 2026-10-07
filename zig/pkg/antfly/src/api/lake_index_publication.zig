@@ -286,7 +286,7 @@ test "external lake native publication builds scoped text artifacts and fences e
         defer warm.deinit();
         const warm_snapshot = warm.acquireSnapshot();
         defer warm_snapshot.release();
-        for (warm_snapshot.segments) |segment| try std.testing.expect(segment.reader.postings_loader != null);
+        for (warm_snapshot.segments) |segment| try std.testing.expect(segment.reader.native != null);
         const warm_results = try warm_snapshot.search(a, "body", &.{"first"}, 10);
         defer a.free(warm_results.hits);
         try std.testing.expectEqual(results.total_count, warm_results.total_count);

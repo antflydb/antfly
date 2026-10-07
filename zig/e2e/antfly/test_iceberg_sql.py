@@ -48,6 +48,8 @@ def _export_table(table, root):
         path.write_bytes(b"AFOBJ001" + struct.pack("<QI", len(payload), 0)
                          + hashlib.sha256(payload).hexdigest().encode() + payload)
 
+    avro_files = []
+    exported_lengths = {}
     for path in directory.rglob("*"):
         if not path.is_file():
             continue
@@ -55,13 +57,24 @@ def _export_table(table, root):
         if path.suffix == ".avro":
             reader = fastavro.reader(io.BytesIO(payload))
             records = remote(list(reader))
-            out = io.BytesIO()
-            fastavro.writer(out, reader.writer_schema, records, codec=reader.codec,
-                            metadata={k: v for k, v in reader.metadata.items() if not k.startswith("avro.")})
-            payload = out.getvalue()
+            avro_files.append((path, reader.writer_schema, reader.codec,
+                               {k: v for k, v in reader.metadata.items() if not k.startswith("avro.")}, records))
+            continue
         elif path.name.endswith(".metadata.json"):
             payload = json.dumps(remote(json.loads(payload))).encode()
         put(path.relative_to(directory).as_posix(), payload)
+    # Manifest-list lengths describe the rewritten Avro payloads exactly.
+    avro_files.sort(key=lambda entry: bool(entry[4] and "manifest_path" in entry[4][0]))
+    for path, schema, codec, metadata, records in avro_files:
+        for record in records:
+            if "manifest_path" in record:
+                record["manifest_length"] = exported_lengths[record["manifest_path"]]
+        out = io.BytesIO()
+        fastavro.writer(out, schema, records, codec=codec, metadata=metadata)
+        payload = out.getvalue()
+        key = path.relative_to(directory).as_posix()
+        exported_lengths["object://antfly/" + key] = len(payload)
+        put(key, payload)
     latest = Path(unquote(urlparse(table.metadata_location).path))
     put("metadata/v1.metadata.json", json.dumps(remote(json.loads(latest.read_bytes()))).encode())
     put("metadata/version-hint.text", b"1\n")

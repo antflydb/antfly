@@ -575,7 +575,6 @@ fn openWithPolicy(a: A, server: *server_api.ApiHttpServer, table: catalog.Table,
         var source_rows: u64 = 0;
         for (source.inventory.files) |file| source_rows +|= file.row_count;
         source_rows = @max(source_rows, if (root.page) |page| page.records else 0);
-        const consumed = if (order_satisfied) if (request.row_goal) |goal| @min(candidates, goal) else candidates else candidates;
         var physical_bytes: u64 = 0;
         var row_groups: u64 = 0;
         for (source.inventory.files) |file| {
@@ -586,18 +585,8 @@ fn openWithPolicy(a: A, server: *server_api.ApiHttpServer, table: catalog.Table,
                 }
             }
         }
-        cost.* = accessCost(consumed, owner.covered, order_satisfied);
-        // Random candidates may touch one decode region each until all groups
-        // are visited. Charge projected bytes instead of total file width.
-        if (!owner.covered and row_groups != 0 and source_rows != 0) {
-            const touched = @min(consumed, row_groups);
-            const gather_bytes = (physical_bytes / row_groups) *| touched;
-            const sequential_bytes = physical_bytes;
-            cost.* +|= gather_bytes / 1024;
-            if (cost.* > source_rows +| (sequential_bytes / 1024) and !order_satisfied and candidates != 0) return null;
-        }
-        // Broad non-covering ranges prefer sequential physical page decoding.
-        const scan_cost = source_rows *| @as(u64, if (order_satisfied) 2 else 1);
+        cost.* = estimatedAccessCost(candidates, owner.covered, order_satisfied, request.row_goal, physical_bytes, row_groups);
+        const scan_cost = (source_rows +| (physical_bytes / 1024)) *| @as(u64, if (order_satisfied) 2 else 1);
         if (cost.* > scan_cost and candidates != 0) return null;
     }
     keep = true;
@@ -656,6 +645,24 @@ test "external lake ordered access plans equality prefixes ranges directions and
 fn accessCost(candidates: u64, covered: bool, ordered_access: bool) u64 {
     const row_cost = if (covered) candidates / 8 else candidates *| 8;
     return (row_cost +| 32) / @as(u64, if (ordered_access) 2 else 1);
+}
+
+fn estimatedAccessCost(candidates: u64, covered: bool, ordered_access: bool, row_goal: ?u64, projected_bytes: u64, row_groups: u64) u64 {
+    const consumed = if (ordered_access) if (row_goal) |goal| @min(candidates, goal) else candidates else candidates;
+    var cost = accessCost(consumed, covered, ordered_access);
+    // Random candidates may touch one decode region each until all groups
+    // are visited. Unknown clustering uses this conservative upper estimate.
+    if (!covered and row_groups != 0) cost +|= ((projected_bytes / row_groups) *| @min(consumed, row_groups)) / 1024;
+    return cost;
+}
+
+test "external lake access costs SQL row goals only under proven order and charges projected locality" {
+    const broad = estimatedAccessCost(100000, false, true, null, 10000000, 1000);
+    const top_one = estimatedAccessCost(100000, false, true, 1, 10000000, 1000);
+    try std.testing.expect(top_one < broad / 100);
+    try std.testing.expectEqual(estimatedAccessCost(100000, false, false, null, 10000000, 1000), estimatedAccessCost(100000, false, false, 1, 10000000, 1000));
+    try std.testing.expect(estimatedAccessCost(10, false, false, null, 10000000, 1) > estimatedAccessCost(10, false, false, null, 10000000, 1000));
+    try std.testing.expectEqual(estimatedAccessCost(10, true, false, null, 10000000, 1), estimatedAccessCost(10, true, false, null, 10000000, 1000));
 }
 
 test "external lake access cost favors selective and covering ranges" {

@@ -732,30 +732,42 @@ census, using the same durable continuation and collection cutoff. Legacy
 nonce staging cleanup and private checkpoint reclamation run after the durable
 completion receipt; they cannot prevent a completed collection from advancing.
 
-Native text corpus version 3 separates authenticated segment metadata from
-64 KiB posting blocks. Opening a corpus reads dictionaries, norms, identities
-and typed values, while exact term lookup and dictionary expansion fetch only
-the intersecting posting blocks. Absent terms need no posting reads. The local
-WAND/phrase/filter kernels and global BM25 statistics are shared with ordinary
-native segments. Concurrent queries share immutable segment storage and block
-flights, but each receives its own snapshot view and current store capability,
-deadline, cancellation and reader lease. Posting read failures propagate as
-errors, never as absent terms. Persistent immutable caching applies to metadata
-and posting blocks; decoded segment storage remains under the corpus heap
-budget. This reduces cold I/O without removing corpus memory admission limits.
-GC traverses every metadata and posting reference; retained version 1 and 2
-roots remain understood during upgrade. Reader/topology protocol 29 fences
-publication of the new format during rolling upgrades. The coordinator sees
-older publication protocols and refreshes them automatically; text queries wait
-for the new publication rather than interpreting the previous layout.
+Native text corpus version 4 publishes authenticated 64 KiB ranges across the
+native segment. Readers use the shared native range codecs, retaining bounded
+navigation and decoder scratch instead of allocating and zeroing a segment-sized
+heap buffer. Term-frequency probes read dictionary addresses and posting headers;
+WAND seeks fetch only the document chunks they visit, and position records are
+read when phrase consumers request them. A block checksum may bring neighboring
+bytes into cache, so the minimum read unit remains 64 KiB. Each query binds its
+current store capability, deadline, cancellation and reader lease to a private
+native reader. The shared corpus drops opening-request authority after admission.
+Immutable artifact caching shares verified blocks across queries without sharing
+capabilities. GC traverses all range references and still understands retained
+version 1–3 roots. Reader/topology protocol 30 triggers automatic republication of
+older corpora during rolling upgrades.
 
-Automatic ordered-index access now enumerates eligible definitions, proves
-partial predicates and covering columns, and counts candidate ranges through
-authenticated B+tree subtree counts. It compares selective gathers and covering
-reads with a sequential Parquet scan. The initial cost model uses conservative
-relative work units (random hydration costs more than sequential rows), with an
-ordering benefit; it does not yet estimate physical clustering or LIMIT-aware
-residual selectivity. Explicit index requests retain their required semantics.
+Automatic ordered-index access enumerates eligible definitions, proves partial
+predicates and covering columns, and counts ranges using authenticated B+tree
+subtree counts. Costing includes projected compressed column bytes and a
+conservative estimate of touched row groups. An explicit SQL OFFSET + LIMIT is an
+advisory row goal when no residual predicate exists and the index proves the full
+ordering. It never limits scan pages or changes residual semantics. Unknown
+residual selectivity costs the entire candidate range. Actual page clustering
+statistics remain a possible future refinement; explicit index requests retain
+their required semantics.
+
+Build replay writes bounded columnar spill blocks directly from native vectors,
+without an intermediate row matrix or decimal coordinate strings. Consumer
+cursors retain compact spill blocks and preserve numeric/string dictionary IDs
+while borrowing payloads until the next batch. Independent per-file cursors seek
+to physical record boundaries and share the same bounded spill owner.
+
+The `iceberg_integration` E2E uses PyIceberg commits and PyArrow Parquet files,
+including partitioned manifests, append snapshots, field-ID-preserving rename,
+copy-on-write deletion, pinned history, HTTP SQL, pgwire, and cold restart.
+`e2e-full` installs the lake and Iceberg writer extras and runs it; base E2E
+excludes it like PostgreSQL integration. Missing full-suite writer dependencies
+are a failure, not a silently skipped test.
 
 Aggregate contribution construction runs bounded waves of independent file
 reducers through the shared scheduler once replay capture is complete. Workers

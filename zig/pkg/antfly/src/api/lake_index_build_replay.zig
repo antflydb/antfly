@@ -211,7 +211,7 @@ pub const Replay = struct {
             // Bind borrowed source vectors once; the spill codec gathers one
             // bounded column at a time and chooses its physical dictionary.
             var capture_batch: CaptureBatch = .{ .batch = batch, .columns = self.columns };
-            const values: local.sql_execution_batch.Batch = .{ .reader = .{ .ptr = &capture_batch, .read = CaptureBatch.cell, .count = batch.rowCount(), .width = self.columns.len } };
+            const values: local.sql_execution_batch.Batch = .{ .reader = .{ .ptr = &capture_batch, .read = CaptureBatch.cell, .read_identity = CaptureBatch.identity, .read_dictionary = CaptureBatch.dictionary, .count = batch.rowCount(), .width = self.columns.len } };
             var begin: usize = 0;
             while (begin < batch.rowCount()) {
                 const external = switch (batch.row_refs[begin]) {
@@ -262,6 +262,40 @@ pub const Replay = struct {
     const CaptureBatch = struct {
         batch: rows.ColumnBatch,
         columns: []const []const u8,
+        fn identity(raw: *anyopaque, row: usize, ordinal: usize) !?u64 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const column = self.batch.findColumn(self.columns[ordinal]) orelse return error.RowSourceColumnKindMismatch;
+            const ids = switch (column.values) {
+                .dictionary_i64 => |v| v.indices,
+                .dictionary_f64 => |v| v.indices,
+                .dictionary_bytes => |v| v.indices,
+                else => return null,
+            };
+            return if (column.nulls.isNull(row)) 0 else @as(u64, ids[row]) + 2;
+        }
+        fn dictionary(raw: *anyopaque, a: A, ordinal: usize) !?local.sql_execution_batch.Batch {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const column = self.batch.findColumn(self.columns[ordinal]) orelse return error.RowSourceColumnKindMismatch;
+            const count = switch (column.values) {
+                .dictionary_i64 => |v| v.values.len,
+                .dictionary_f64 => |v| v.values.len,
+                .dictionary_bytes => |v| v.values.len,
+                else => return null,
+            };
+            const entries = try a.alloc(local.sql_scalar.Datum, count + 2);
+            errdefer a.free(entries);
+            entries[0] = .{};
+            entries[1] = local.sql_scalar.Datum.json(.null);
+            for (entries[2..], 0..) |*entry, index| entry.* = local.sql_scalar.Datum.json(switch (column.values) {
+                .dictionary_i64 => |v| .{ .integer = v.values[index] },
+                .dictionary_f64 => |v| .{ .float = v.values[index] },
+                .dictionary_bytes => |v| .{ .string = v.values[index] },
+                else => unreachable,
+            });
+            const ids = try a.alloc(u32, self.batch.rowCount());
+            for (ids, 0..) |*id, index| id.* = @intCast((try identity(raw, index, ordinal)).?);
+            return .{ .dictionary = .{ .values = entries, .indices = ids } };
+        }
         fn cell(raw: *anyopaque, _: A, row: usize, ordinal: usize) !local.sql_scalar.Datum {
             const self: *@This() = @ptrCast(@alignCast(raw));
             const column = self.batch.findColumn(self.columns[ordinal]) orelse return error.RowSourceColumnKindMismatch;
@@ -388,7 +422,7 @@ pub const Replay = struct {
                         }
                         break :blk .{ .bool = v };
                     },
-                    .bytes, .json => |kind| blk: {
+                    .bytes, .json => blk: {
                         const v = try a.alloc([]const u8, block.count());
                         for (v, 0..) |*value, index| {
                             const cell = try block.cell(index, ordinal);
