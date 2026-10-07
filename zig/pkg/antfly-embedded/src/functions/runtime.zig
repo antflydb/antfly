@@ -54,6 +54,9 @@ pub const Runtime = struct {
     limits: *quotas.Registry = &quotas.process_registry,
     http: *httpx.Client,
     io: std.Io,
+    /// A scheduled parent without independently admitted children evaluates
+    /// provider jobs on its own worker. Preserve parallel batches otherwise.
+    parallel_work: bool = true,
     context: ?execution.RequestContext = null,
     secret_store: ?*secrets.FileStore = null,
     antfly_provider: ?managed.AntflyProvider = null,
@@ -205,7 +208,7 @@ pub const Runtime = struct {
                 job.* = .{ .runtime = self, .request = request, .cfg = try self.registry.getDeciderConfig(request.decider), .arena = undefined, .budget = .{ .backing = std.heap.smp_allocator, .limit = 8 * 1024 * 1024 } };
                 job.arena = std.heap.ArenaAllocator.init(job.budget.allocator());
                 initialized += 1;
-                try group.concurrent(self.io, Job.run, .{job});
+                if (self.parallel_work) try group.concurrent(self.io, Job.run, .{job}) else Job.run(job);
             }
             try group.await(self.io);
             self.batches += 1;
@@ -357,4 +360,48 @@ test "decision functions HTTP ceiling rejects oversized advertised bodies before
         try std.testing.expectEqual(@as(?anyerror, error.DecisionLimitExceeded), failure);
         try std.testing.expectEqual(@as(u64, 0), runtime.rows);
     }
+}
+
+test "decision functions serial provider batches remain on the admitted parent worker" {
+    const a = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var client = httpx.Client.initWithConfig(a, io, .{ .keep_alive = false });
+    defer client.deinit();
+    var registry = registry_mod.Registry.init(a);
+    defer registry.deinit();
+    try registry.registerDeciderConfig("serial", .{ .provider = .antfly, .model = "serial-model", .api_key = "serial-test", .batch_size = 2, .max_rows = 2 });
+    const Provider = struct {
+        thread: std.Thread.Id,
+        calls: usize = 0,
+        fn decide(ptr: *anyopaque, alloc: std.mem.Allocator, body: []const u8, _: ?execution.RequestContext) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(self.thread, std.Thread.getCurrentId());
+            var parsed = try std.json.parseFromSlice(decisions.Json, alloc, body, .{});
+            defer parsed.deinit();
+            try std.testing.expectEqualStrings(if (self.calls == 0) "first" else "second", parsed.value.object.get("state").?.string);
+            self.calls += 1;
+            return alloc.dupe(u8, "{\"model\":\"serial-model\",\"answers\":{\"answer\":{\"type\":\"noul\",\"noul\":0.9}},\"usage\":{\"input_tokens\":2,\"output_tokens\":0}}");
+        }
+    };
+    var embedded: Provider = .{ .thread = std.Thread.getCurrentId() };
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const questions = try decisions.questionsFor(arena.allocator(), .ai_probability, &.{ .{ .string = "first" }, .{ .string = "Question?" }, .{ .string = "serial" } });
+    var runtime: Runtime = .{
+        .registry = &registry,
+        .http = &client,
+        .io = io,
+        .parallel_work = false,
+        .antfly_provider = .{ .ptr = &embedded, .embed_dense_texts = undefined, .embed_sparse_texts = undefined, .decide_json = Provider.decide },
+    };
+    const results = try runtime.provider().evaluateBatch(arena.allocator(), &.{
+        .{ .input = "first", .decider = "serial", .questions = questions },
+        .{ .input = "second", .decider = "serial", .questions = questions },
+    });
+    try std.testing.expectEqual(@as(usize, 2), embedded.calls);
+    try std.testing.expectEqual(@as(usize, 2), results.len);
+    try std.testing.expectEqual(@as(u64, 2), runtime.rows);
+    try std.testing.expectEqual(@as(u64, 1), runtime.batches);
 }

@@ -108,8 +108,9 @@ The opt-in runnable scheduler is separate from coarse operation admission. A
 scheduled SQL read retains its operation, snapshot, output and memory owners
 while it gives up a runnable slot during cooperative yields, private positional
 spill I/O and retained PG output waits. Slot reacquisition preserves the original
-statement deadline. Mutation execution remains outside this integration; accepted
-durable work keeps its existing completion owner.
+statement deadline. Ordinary SQL writes retain a write-class grant through worker
+completion, as described below; accepted durable work keeps its existing completion
+owner and does not borrow read-only suspension callbacks.
 
 Scheduled HTTP SELECT/EXPLAIN and retained PG SELECT streams keep at most 64
 owned table authority pins. Before continuing after a new runnable grant, and
@@ -168,3 +169,9 @@ write integration passes all 75 selected API contracts on native macOS and
 pinned Nix/glibc GNU AArch64 with zero skips or leaks. Both exact Linux artifacts
 also pass under two CPUs and 2 GiB without extra swap. Complete production
 qualification and stalled accepted mutation schedules remain pending.
+
+Scheduled SQL decision-provider batches also execute serially on their parent
+worker until provider children acquire independently owned execution entries.
+This confines provider frontend CPU to the existing grant; it does not schedule
+model-server/backend inference or release the grant during provider waits.
+Unscheduled decision batches retain their existing parallel behavior.

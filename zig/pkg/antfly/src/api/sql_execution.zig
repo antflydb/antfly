@@ -162,6 +162,7 @@ pub const Adapter = struct {
                 return .{
                     .registry = &config.registry,
                     .io = self.server.embedding_provider_runtime.io,
+                    .parallel_work = self.runnable == null and !self.serial_execution,
                     .http = try self.server.embedding_provider_runtime.httpClient(),
                     .context = .{ .io = self.server.embedding_provider_runtime.io, .deadline_ns = normalized.deadline_ns, .cancellation = normalized.cancellation },
                     .secret_store = self.server.cfg.secret_store,
