@@ -1191,3 +1191,7 @@ Nix/glibc Linux; [worker budget receipts](qualification/workload-pooling/receipt
 pin source and output. Actual subprocess and production dispatcher/archive
 qualification are still pending, along with whole API/default overload gates.
 The separate local-parent ABI v29 gate does not qualify these worker bytes.
+
+### Owning-thread inference checkpoints (2026-10-07, focused gates passed)
+
+Borrowed local provider phases now lend their scheduler checkpoint to the owning OS worker through a synchronous TLS scope. Existing inference execution checks can yield/check original parent authority; watchdogs and parallel children do not receive the borrowed callback. Nested scopes restore in stack order, and callbacks are removed before returning the grant. All eight focused host/wire contracts pass on macOS and pinned Nix/glibc Linux; [receipts](qualification/workload-pooling/receipts/2026-10-07/inference-owning-checkpoints/README.md) retain hashes, commands, full logs and the initial mountpoint failure. These focused contracts do not qualify model numerical work, subprocess physical scheduling, other resource waits or automatic defaults. Full API and production qualification must use these newer source bytes.

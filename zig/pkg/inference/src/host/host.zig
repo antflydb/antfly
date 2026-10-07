@@ -1032,7 +1032,16 @@ fn invokeBorrowedProvider(context: *const inference_bridge.ProviderInvokeContext
         try transfer.returnToParent();
         return err;
     };
+    const ParentCheckpoint = struct {
+        fn check(raw: *anyopaque) !void {
+            const grant: *const inference_bridge.runnable_abi.Borrowed = @ptrCast(@alignCast(raw));
+            const status = grant.checkpoint(grant.context);
+            if (!status.isOk()) return inference_bridge.errorFromStatus(status);
+        }
+    };
+    var checkpoint_scope = inference.execution_control.CheckpointScope.init(.{ .context = @constCast(borrow), .check_fn = ParentCheckpoint.check });
     const result = callback(context);
+    checkpoint_scope.deinit();
     scope.deinit();
     errdefer discardProviderResponse(context);
     // Authority and original-deadline failures take precedence over a newly
@@ -1044,10 +1053,13 @@ fn invokeBorrowedProvider(context: *const inference_bridge.ProviderInvokeContext
 test "runnable execution local provider restores parent and discards output on failed authority return" {
     const Parent = struct {
         reject_return: bool = false,
+        checkpoints: usize = 0,
         class: c_int = @backingInt(inference_bridge.runnable_abi.Class.query),
         parked: bool = false,
         enters: usize = 0,
-        fn check(_: *anyopaque) callconv(.c) inference_bridge.Status {
+        fn check(raw: *anyopaque) callconv(.c) inference_bridge.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.checkpoints += 1;
             return .ok;
         }
         fn park(raw: *anyopaque, _: c_int) callconv(.c) inference_bridge.Status {
@@ -1069,6 +1081,7 @@ test "runnable execution local provider restores parent and discards output on f
         fn invoke(context: *const inference_bridge.ProviderInvokeContext) !void {
             const self: *@This() = @ptrCast(@alignCast(context.runnable.?.context));
             try std.testing.expectEqual(@backingInt(inference_bridge.runnable_abi.Class.inference), self.class);
+            try (inference.InferenceExecutionControl{}).check();
             try std.testing.expectEqual(@as(?usize, 1), @import("inference_linalg").pool.scopedWorkerLimit());
             var executor = borrowedProviderExecutor(std.testing.allocator);
             defer executor.deinit();
@@ -1110,6 +1123,10 @@ test "runnable execution local provider restores parent and discards output on f
         }
         try std.testing.expectEqual(@as(usize, 2), parent.enters);
         try std.testing.expectEqual(@backingInt(inference_bridge.runnable_abi.Class.query), parent.class);
+        const checkpoints = parent.checkpoints;
+        try std.testing.expect(checkpoints >= 2);
+        try (inference.InferenceExecutionControl{}).check();
+        try std.testing.expectEqual(checkpoints, parent.checkpoints);
         try std.testing.expectEqual(@as(?usize, null), @import("inference_linalg").pool.scopedWorkerLimit());
     }
 }
@@ -3802,3 +3819,7 @@ const PullProgressReporter = struct {
         if (callback(self.context.progress_context, &view) == 0) self.cancelled.store(true, .release);
     }
 };
+
+test "runnable execution local provider checkpoints stay on the owning worker" {
+    try inference.execution_control.testSynchronousCheckpoint();
+}
