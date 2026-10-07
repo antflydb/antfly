@@ -384,15 +384,20 @@ test "decision functions serial provider batches remain on the admitted parent w
     defer registry.deinit();
     try registry.registerDeciderConfig("serial", .{ .provider = .antfly, .model = "serial-model", .api_key = "serial-test", .batch_size = 2, .max_rows = 2 });
     const Provider = struct {
+        const Runnable = admission_mod.runnable_scheduler;
         thread: std.Thread.Id,
         calls: usize = 0,
         checkpoints: usize = 0,
         stop_after_provider: bool = false,
+        parent_grant: ?*Runnable.Execution = null,
+        scheduler: ?*Runnable.Scheduler = null,
+        close_after_provider: bool = false,
         fn checkpoint(ptr: *anyopaque) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expectEqual(self.thread, std.Thread.getCurrentId());
             self.checkpoints += 1;
             if (self.stop_after_provider and self.calls != 0) return error.ParentExecutionStopped;
+            if (self.parent_grant) |grant| try grant.checkpoint();
         }
         fn decide(ptr: *anyopaque, alloc: std.mem.Allocator, body: []const u8, _: ?execution.RequestContext) ![]u8 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -401,6 +406,16 @@ test "decision functions serial provider batches remain on the admitted parent w
             defer parsed.deinit();
             try std.testing.expectEqualStrings(if (self.calls == 0) "first" else "second", parsed.value.object.get("state").?.string);
             self.calls += 1;
+            if (self.scheduler) |scheduler| {
+                try std.testing.expectEqual(@as(usize, 1), scheduler.stats().runnable_slots);
+                try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+                try std.testing.expectEqual(@as(u64, 17), scheduler.stats().retained_bytes);
+                var control: Runnable.Execution = .{};
+                defer control.finish();
+                try control.start(scheduler, .{ .io = self.parent_grant.?.entry.?.options.io }, .control);
+                try std.testing.expectEqual(@as(usize, 1), scheduler.stats().control_slots);
+                if (self.close_after_provider) scheduler.close();
+            }
             return std.fmt.allocPrint(alloc, "{{\"model\":\"serial-model\",\"answers\":{{\"answer\":{{\"type\":\"noul\",\"noul\":{d}}}}},\"usage\":{{\"input_tokens\":2,\"output_tokens\":0}}}}", .{@as(f64, if (self.calls == 1) 0.1 else 0.9)});
         }
     };
@@ -456,4 +471,38 @@ test "decision functions serial provider batches remain on the admitted parent w
     }));
     try std.testing.expectEqual(@as(usize, 1), embedded.calls);
     try std.testing.expectEqual(@as(u64, 0), runtime.rows);
+
+    var scheduler = try admission_mod.runnable_scheduler.Scheduler.init(.{ .slots = 2, .checkpoint_budget = 1 });
+    defer scheduler.close();
+    var parent_grant: admission_mod.runnable_scheduler.Execution = .{};
+    defer parent_grant.finish();
+    embedded.parent_grant = &parent_grant;
+    embedded.scheduler = &scheduler;
+    embedded.stop_after_provider = false;
+    embedded.calls = 0;
+    try parent_grant.start(&scheduler, .{ .io = io, .retained_bytes = 17 }, .query);
+    _ = try runtime.provider().evaluateBatch(arena.allocator(), &.{
+        .{ .input = "first", .decider = "serial", .questions = questions },
+        .{ .input = "second", .decider = "serial", .questions = questions },
+    });
+    try std.testing.expect(parent_grant.resume_generation > 1);
+    try std.testing.expectEqual(@as(usize, 2), embedded.calls);
+    parent_grant.finish();
+    try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+    try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+
+    embedded.calls = 0;
+    embedded.close_after_provider = true;
+    runtime.rows = 0;
+    try parent_grant.start(&scheduler, .{ .io = io, .retained_bytes = 17 }, .query);
+    try std.testing.expectError(error.SchedulerClosed, runtime.provider().evaluateBatch(arena.allocator(), &.{
+        .{ .input = "first", .decider = "serial", .questions = questions },
+        .{ .input = "second", .decider = "serial", .questions = questions },
+    }));
+    try std.testing.expectEqual(@as(usize, 1), embedded.calls);
+    try std.testing.expectEqual(@as(u64, 0), runtime.rows);
+    parent_grant.finish();
+    try std.testing.expectEqual(@as(usize, 0), scheduler.stats().runnable_slots);
+    try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+    try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
 }

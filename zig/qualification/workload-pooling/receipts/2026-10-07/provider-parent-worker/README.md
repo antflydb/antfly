@@ -35,3 +35,12 @@ is never invoked. All 24 selected native tests and 47 build steps pass.
 `native-checkpoint.json` pins candidate sources, with the complete output in
 `native-checkpoint.log.gz`. The full SQL API and Linux gates remain pending;
 provider I/O still holds its grant and backend inference has no new admission.
+
+The same provider fixture now also borrows a real scheduler execution. With
+a one-checkpoint quantum, it verifies successful grant reacquisition, parent
+operation/byte retention, and protected control grant entry during invocation.
+Closing the scheduler after provider completion stops result consumption and
+prevents the second invocation. Explicit retirement returns slots, operations
+and bytes to zero. `native-scheduler.json` pins this candidate and
+`native-scheduler.log.gz` records all 47 build steps and 24 passing native tests.
+This is a provider/runtime contract, not a full SQL control or load test.
