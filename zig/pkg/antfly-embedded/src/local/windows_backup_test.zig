@@ -6,4 +6,5 @@ pub const consumer_tests_only = true;
 test {
     _ = @import("storage/db/native_backup_seal.zig");
     _ = @import("storage/db/native_backup.zig");
+    _ = @import("storage/db/snapshot_staging.zig");
 }

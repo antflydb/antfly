@@ -389,6 +389,7 @@ ZIG_LIB_DIR=/path/to/zig-lib-windows-overlay \
   zig test -lc -target x86_64-windows-gnu -O Debug --test-no-exec \
   --test-runner pkg/antfly-embedded/src/local/test_runner.zig \
   --test-filter 'storage.db.native_backup' \
+  --test-filter 'storage.db.snapshot_staging' \
   -femit-bin=/path/to/backup-test.exe \
   --dep antfly_source_root=root --dep antfly_test_error_logs \
   --dep antfly_hash --dep antfly_platform --dep antfly_runtime_fs \
@@ -402,11 +403,11 @@ ZIG_LIB_DIR=/path/to/zig-lib-windows-overlay \
 ```
 
 The repository runner verifies expected error logs. With the current overlay,
-all 12 tests pass under CrossOver in Debug and ReleaseFast and on macOS
+all 14 tests pass under CrossOver in Debug and ReleaseFast and on macOS
 (include the filesystem capacity C source as above). This includes the five
 previously blocked by hardlinks and a new pending-cancellation pin cleanup
-regression. The earlier 11-test suite also passed on native Windows NTFS in
-both configurations; the cleanup follow-up has not been rerun there.
+regression, plus two snapshot staging cleanup regressions. The earlier 11-test
+suite also passed on native Windows NTFS in both configurations; the cleanup follow-up has not been rerun there.
 
 The overlay appends `threaded_windows_hardlink.zig` inside `std.Io.Threaded`.
 Directory and file hardlinks therefore retain the caller's I/O authority and

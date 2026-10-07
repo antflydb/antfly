@@ -13,6 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+const snapshot_staging = @import("snapshot_staging.zig");
 const execution_resources = @import("execution_resources.zig");
 const read_projection = @import("read_projection.zig");
 // Canonical execution types come from execution_resources. This compile-time
@@ -19112,7 +19113,7 @@ pub const DB = struct {
         const staging = try createSnapshotStagingRoot(self.alloc, io, parent, id);
         defer self.alloc.free(staging);
         var published = false;
-        defer if (!published) std.Io.Dir.cwd().deleteTree(io, staging) catch {};
+        defer if (!published) snapshot_staging.cleanup(io, staging);
         const total = try seal.exportTo(self.alloc, io, root, handle, staging, output_cancellation);
         try seal.recordExport(self.alloc, io, staging, handle, total);
         try output_cancellation.check();
@@ -19175,7 +19176,7 @@ pub const DB = struct {
             const parent = std.fs.path.dirname(root) orelse return error.InvalidBackupSeal;
             const temporary = try createSnapshotStagingRoot(self.alloc, io, parent, "portable-decoder");
             defer self.alloc.free(temporary);
-            defer std.Io.Dir.cwd().deleteTree(io, temporary) catch {};
+            defer snapshot_staging.cleanup(io, temporary);
             var backend = try @import("../lsm_backend.zig").Backend.open(self.alloc, temporary, .{ .read_runtime = @import("../lsm_backend/storage_io.zig").ReadRuntime.init(io) });
             defer backend.close();
             var store = try docstore_mod.DocStore.openRuntime(self.alloc, try backend.runtimeStore(self.alloc, .{ .name = "docs" }));
@@ -19305,7 +19306,7 @@ pub const DB = struct {
         } else try createSnapshotStagingRoot(self.alloc, io, snapshot_parent, id);
         defer self.alloc.free(staging_root);
         var published = false;
-        defer if (!published) std.Io.Dir.cwd().deleteTree(io, staging_root) catch {};
+        defer if (!published) snapshot_staging.cleanup(io, staging_root);
 
         if (!include_generated) {
             // Portable snapshots omit generated files, but their replay log and
@@ -54112,24 +54113,7 @@ fn snapshotPathExists(io: Io, path: []const u8) !bool {
 }
 
 fn createSnapshotStagingRoot(alloc: Allocator, io: Io, parent: []const u8, id: []const u8) ![]u8 {
-    for (0..64) |_| {
-        var entropy: [8]u8 = undefined;
-        try @import("antfly_platform").entropy.fill(io, &entropy);
-        const nonce = std.fmt.bytesToHex(entropy, .lower);
-        const candidate = try std.fmt.allocPrint(alloc, "{s}/.{s}.staging-{s}", .{ parent, id, &nonce });
-        errdefer alloc.free(candidate);
-        std.Io.Dir.cwd().createDir(io, candidate, .default_dir) catch |err| switch (err) {
-            error.PathAlreadyExists => {
-                alloc.free(candidate);
-                continue;
-            },
-            else => return err,
-        };
-        errdefer std.Io.Dir.cwd().deleteTree(io, candidate) catch {};
-        try fs_paths.syncDirPortable(io, parent);
-        return candidate;
-    }
-    return error.SnapshotStagingCollision;
+    return snapshot_staging.createRoot(alloc, io, parent, id);
 }
 
 fn publishSnapshotStaging(io: Io, parent: []const u8, staging: []const u8, destination: []const u8) !void {

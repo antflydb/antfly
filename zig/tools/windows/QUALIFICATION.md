@@ -402,13 +402,47 @@ error log. Formatting and whitespace checks pass. This cleanup follow-up has
 not been included in a native NTFS run or a full application rebuild; the earlier
 native and application results above qualify their specified source snapshots.
 
+## Snapshot staging cancellation cleanup
+
+The DB snapshot exporter still discarded staging-path ownership after a
+cancelable tree deletion. Normal snapshot construction, sealed export,
+temporary portable decoding and staging-directory creation unwind now use a
+shared `snapshot_staging.cleanup` helper. It protects only tree deletion and
+restores the prior cancellation protection before subsequent cleanup runs.
+Staging creation was extracted into the same module for focused fault injection;
+its unique-name, collision-retry and parent-sync behavior is preserved.
+
+Two regressions cover recursive deletion of copied payloads under pending
+cancellation and creation unwind after an injected parent-sync failure with
+cancellation pending. Both also verify cancellation is restored; the first
+checks that a neighboring published file is untouched. Both fail on macOS
+when the protection is removed, leaving the tree behind. With protection,
+all 14 focused backup/staging tests pass on macOS and Windows Debug and
+ReleaseFast under CrossOver (zero skips, failures or leaks; one expected error
+log). Zig formatting and whitespace checks pass. No new native NTFS run was
+performed for this staging follow-up.
+
+The full Windows Debug application build passed 46/46 steps using the same
+Wine-compatible Zig overlay, with ONNX disabled and BLAS off. Its executable
+at `/private/tmp/antfly-pr987-staging-app/bin/antfly.exe` has SHA-256
+`56cb490cc5ec51a2f2053a78676097763b5c4d3dc0eb5d1471cb43fb16ae1272`.
+The CrossOver smoke test verified all 32 acknowledged documents and their
+full-text entries after forced termination and reopening, passed 64 concurrent
+queries across both runs, and reported `valid=true`, zero tail bytes and no
+issue from `lite check`. Evidence remains in
+`/private/tmp/antfly-pr987-staging-app-smoke` and
+`/private/tmp/antfly-pr987-staging-app-build.log`. These checks include the pin
+cleanup and snapshot staging follow-ups. The accumulated review changes target
+PR #987's `dovinmu/antfly:experimental/windows-build` branch.
+
 ## Cleanup
 
 The disposable VM, auto-delete boot disk, artifact bucket, service account,
 IAP firewall rule, subnet and network were deleted after the final integrity
 check. Resource listings confirm their absence. Both local IAP tunnels were
 stopped. Generated evidence remains in the local temporary directory above.
-All review changes are committed locally; no branch was pushed.
+At completion of native qualification, all review changes were committed
+locally and no branch had been pushed.
 
 ## Remaining qualification limits
 
