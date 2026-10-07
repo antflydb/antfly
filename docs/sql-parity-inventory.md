@@ -405,8 +405,21 @@ and atomic failure. Native allocation-fault tests check ownership cleanup. A
 1,024-target/1,024-source regression checks one capture and exactly 2,048 input
 rows read, rather than a source rescan per target. The fixed multi-table test
 router validates routing and lifetime, not distributed concurrent snapshot
-coordination; conditional subquery evaluation and constraint-owner activation
-remain separate unfinished work.
+coordination; constraint-owner activation remains separate unfinished work.
+
+Conditional scalar reads now use compiler-generated masked Apply producers.
+CASE, COALESCE and boolean short-circuit operators retain SQL NULL truth rules,
+and a producer is not opened until its branch is demanded. Prerequisite values
+are materialized once; binding and authorization still cover every branch.
+The shared PostgreSQL/native fixture checks 22 result contracts and six error
+contracts, including demanded cardinality failures and invalid names in dead
+branches. Mutation tests additionally verify that an unused RETURNING producer
+reads no source rows, a demanded failure publishes no mutations, and unused
+branches do not bypass source authorization. This does not establish aggregate
+FILTER demand, projection demand after WHERE, or distributed concurrent
+snapshot correctness; those remain
+separate validation/implementation work. No original inventory disposition is
+changed by this shared-operator fixture.
 
 ```sh
 uv run --no-project --with 'psycopg[binary]==3.3.6' python scripts/generate_sql_postgres_reference.py mutation --check zig/pkg/antfly-embedded/src/sql/fixtures/sql_mutation_postgres_reference.json

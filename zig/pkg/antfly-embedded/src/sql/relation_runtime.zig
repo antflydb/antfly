@@ -719,6 +719,21 @@ fn Engine(comptime Context: type) type {
                         self.left_values = owned;
                         self.left_matched = false;
                         self.engine.outer_values[apply.id] = owned;
+                        if (apply.demand) |program| {
+                            const demand = try self.engine.context.evaluate(self.arena.allocator(), program, owned);
+                            if (!demand.sql_null and demand.value != .bool) return error.SqlTypeMismatch;
+                            if (demand.sql_null or !demand.value.bool) {
+                                // Do not create the right iterator: even an
+                                // invariant cached producer may fail on first
+                                // evaluation. Preserve one NULL-extended row.
+                                self.engine.clearOuter(apply.id);
+                                self.left_values = null;
+                                const output = try alloc.alloc(Datum, self.node.columns.len);
+                                @memset(output, .{});
+                                for (owned, output[0..owned.len]) |value, *out| out.* = try operators.cloneDatum(alloc, value);
+                                return output;
+                            }
+                        }
                         self.right = try createContext(self.engine, apply.right, self.recursive_id, true);
                     }
                     _ = self.scratch.reset(.free_all);

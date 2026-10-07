@@ -1,0 +1,35 @@
+{
+  "reference": "PostgreSQL 18 demand-driven conditional subquery values and SQLSTATE contracts",
+  "entries": [
+    {"sql": "SELECT CASE WHEN TRUE THEN 7 ELSE (SELECT 1 UNION ALL SELECT 2) END", "rows": [7]},
+    {"sql": "SELECT CASE WHEN FALSE THEN (SELECT 1 UNION ALL SELECT 2) ELSE 8 END", "rows": [8]},
+    {"sql": "SELECT CASE WHEN NULL THEN (SELECT 1 UNION ALL SELECT 2) ELSE 8 END", "rows": [8]},
+    {"sql": "SELECT CASE WHEN (SELECT TRUE) THEN 4 ELSE (SELECT 1 UNION ALL SELECT 2) END", "rows": [4]},
+    {"sql": "SELECT CASE WHEN TRUE THEN 4 WHEN (SELECT TRUE UNION ALL SELECT FALSE) THEN 5 ELSE 6 END", "rows": [4]},
+    {"sql": "SELECT CASE WHEN FALSE THEN 4 WHEN (SELECT TRUE) THEN 5 ELSE 6 END", "rows": [5]},
+    {"sql": "SELECT COALESCE(7, (SELECT 1 UNION ALL SELECT 2))", "rows": [7]},
+    {"sql": "SELECT COALESCE(NULL::bigint, (SELECT 4), (SELECT 1 UNION ALL SELECT 2))", "rows": [4]},
+    {"sql": "SELECT COALESCE((SELECT NULL::bigint), (SELECT 4))", "rows": [4]},
+    {"sql": "SELECT FALSE AND (SELECT TRUE UNION ALL SELECT FALSE)", "rows": [false]},
+    {"sql": "SELECT TRUE OR (SELECT TRUE UNION ALL SELECT FALSE)", "rows": [true]},
+    {"sql": "SELECT NULL::boolean AND (SELECT FALSE)", "rows": [false]},
+    {"sql": "SELECT NULL::boolean OR (SELECT TRUE)", "rows": [true]},
+    {"sql": "SELECT NULL::boolean AND (SELECT TRUE)", "rows": [null]},
+    {"sql": "SELECT CASE WHEN o.x=1 THEN 7 ELSE (SELECT i.y FROM (SELECT 2 AS y) i WHERE i.y=o.x) END FROM (SELECT 1 AS x UNION ALL SELECT 2 UNION ALL SELECT 3) o ORDER BY o.x", "rows": [7,2,null]},
+    {"sql": "SELECT COALESCE(o.x, (SELECT i.y FROM (SELECT 4 AS y) i)) FROM (SELECT 1 AS x UNION ALL SELECT NULL::bigint) o ORDER BY o.x NULLS LAST", "rows": [1,4]},
+    {"sql": "SELECT CASE WHEN o.x=1 THEN COALESCE(NULL::bigint,(SELECT 7)) ELSE CASE WHEN o.x=2 THEN (SELECT 8) ELSE 9 END END FROM (SELECT 1 AS x UNION ALL SELECT 2 UNION ALL SELECT 3) o ORDER BY o.x", "rows": [7,8,9]},
+    {"sql": "SELECT CASE WHEN o.x=1 THEN 7 ELSE (SELECT i.y FROM (SELECT 2 AS y UNION ALL SELECT 2) i WHERE i.y=o.x) END FROM (SELECT 1 AS x) o", "rows": [7]},
+    {"sql": "SELECT CASE WHEN FALSE THEN EXISTS(SELECT 1) ELSE TRUE END", "rows": [true]},
+    {"sql": "SELECT CASE WHEN TRUE THEN 2 IN (SELECT 2 UNION ALL SELECT NULL::bigint) ELSE FALSE END", "rows": [true]},
+    {"sql": "SELECT CASE WHEN FALSE THEN 2 IN (SELECT 2) ELSE TRUE END", "rows": [true]},
+    {"sql": "SELECT CASE WHEN TRUE THEN 2 = ANY (SELECT 2 UNION ALL SELECT NULL::bigint) ELSE FALSE END", "rows": [true]}
+  ],
+  "errors": [
+    {"sql": "SELECT CASE WHEN TRUE THEN (SELECT 1 UNION ALL SELECT 2) ELSE 7 END", "code": "21000"},
+    {"sql": "SELECT COALESCE(NULL::bigint, (SELECT 1 UNION ALL SELECT 2))", "code": "21000"},
+    {"sql": "SELECT NULL::boolean AND (SELECT TRUE UNION ALL SELECT FALSE)", "code": "21000"},
+    {"sql": "SELECT NULL::boolean OR (SELECT TRUE UNION ALL SELECT FALSE)", "code": "21000"},
+    {"sql": "SELECT CASE WHEN o.x=1 THEN 7 ELSE (SELECT i.y FROM (SELECT 2 AS y UNION ALL SELECT 2) i WHERE i.y=o.x) END FROM (SELECT 1 AS x UNION ALL SELECT 2) o ORDER BY o.x", "code": "21000"},
+    {"sql": "SELECT CASE WHEN FALSE THEN (SELECT missing FROM (SELECT 1 AS x) i) ELSE 7 END", "code": "42703"}
+  ]
+}

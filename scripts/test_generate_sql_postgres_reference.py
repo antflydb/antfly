@@ -505,6 +505,32 @@ class PostgresReferenceTest(unittest.TestCase):
                     self.db.execute(invalid["sql"])
             self.assertEqual("42703", error.exception.sqlstate)
 
+    def test_conditional_subquery_demand_reference(self):
+        import json
+        from pathlib import Path
+        import psycopg
+
+        fixture = json.loads(
+            (
+                Path(__file__).resolve().parents[1]
+                / "zig/pkg/antfly-embedded/src/sql/fixtures/sql_conditional_subquery_reference.json"
+            ).read_text()
+        )
+        self.assertEqual(22, len(fixture["entries"]))
+        self.assertEqual(6, len(fixture["errors"]))
+        for case in fixture["entries"]:
+            with self.subTest(sql=case["sql"]):
+                self.assertEqual(
+                    [(value,) for value in case["rows"]],
+                    self.db.execute(case["sql"]).fetchall(),
+                )
+        for case in fixture["errors"]:
+            with self.subTest(sql=case["sql"]):
+                with self.assertRaises(psycopg.Error) as error:
+                    with self.db.transaction(force_rollback=True):
+                        self.db.execute(case["sql"]).fetchall()
+                self.assertEqual(case["code"], error.exception.sqlstate)
+
     def test_logical_json_parameters_and_identity_casts_preserve_strings(self):
         from psycopg.types.json import Jsonb
 

@@ -129,7 +129,15 @@ pub const Relation = union(enum) {
         prepared_rows: bool = false,
     },
     derived: struct { query: *const Select, alias: []const u8, columns: []const []const u8 = &.{}, hidden: bool = false, lateral: bool = false },
-    join: struct { kind: JoinKind, left: *const Relation, right: *const Relation, condition: ?*const Scalar = null },
+    join: struct {
+        kind: JoinKind,
+        left: *const Relation,
+        right: *const Relation,
+        condition: ?*const Scalar = null,
+        /// Compiler-only left-domain demand. A masked LEFT LATERAL producer
+        /// is not opened or evaluated for an undemanded row.
+        demand: ?*const Scalar = null,
+    },
 };
 pub const JoinKind = enum { inner, left, right, full, cross };
 pub const Insert = struct {

@@ -34,6 +34,45 @@ const Backend = struct {
     }
 };
 
+test "SQL masked Apply preserves PostgreSQL conditional subquery demand and NULL truth" {
+    const fixture = try std.json.parseFromSlice(struct {
+        reference: []const u8,
+        entries: []const struct { sql: []const u8, rows: []const std.json.Value },
+        errors: []const struct { sql: []const u8, code: []const u8 },
+    }, std.testing.allocator, @import("antfly_local_sources").sql_parity_fixtures.conditional_subquery_reference, .{});
+    defer fixture.deinit();
+    var backend: Backend = .{};
+    for (fixture.value.entries) |entry| {
+        var compiled = try compiler.compile(std.testing.allocator, entry.sql, .{});
+        defer compiled.deinit();
+        var result = runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{}) catch |err| {
+            std.debug.print("masked Apply contract failed: {s} {s}\n", .{ entry.sql, @errorName(err) });
+            return err;
+        };
+        defer result.deinit();
+        try std.testing.expectEqual(entry.rows.len, result.output.rows.len);
+        for (result.output.rows, result.output.sql_nulls.?, entry.rows) |row, nulls, want| {
+            try std.testing.expectEqual(@as(usize, 1), row.len);
+            try std.testing.expectEqual(want == .null, nulls[0]);
+            switch (want) {
+                .null => try std.testing.expect(row[0] == .null),
+                .bool => |value| try std.testing.expectEqual(value, row[0].bool),
+                .integer => |value| try std.testing.expectEqual(value, try std.fmt.parseInt(i64, row[0].string, 10)),
+                else => return error.UnexpectedConditionalContractValue,
+            }
+        }
+    }
+    for (fixture.value.errors) |entry| {
+        var compiled = try compiler.compile(std.testing.allocator, entry.sql, .{});
+        defer compiled.deinit();
+        if (runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{})) |value| {
+            var result = value;
+            result.deinit();
+            return error.ExpectedConditionalSubqueryFailure;
+        } else |err| try std.testing.expectEqualStrings(entry.code, @import("antfly_local_sources").sql_errors.describe(err).code);
+    }
+}
+
 test "SQL nested join buffers own borrowed text and JSON across upstream pulls" {
     const Fixture = struct {
         const Owner = @This();

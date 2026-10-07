@@ -256,6 +256,33 @@ test "SQL RETURNING relations share one cut and evaluate prepared postimages bef
     }
 }
 
+test "SQL masked Apply RETURNING skips dead sources and keeps demanded failure atomic" {
+    var dead: Backend = .{ .returning_mode = true };
+    var compiled = try compiler.compile(std.testing.allocator, "UPDATE target SET n=n+10,cold='new' RETURNING n,CASE WHEN n<0 THEN (SELECT delta FROM source) ELSE 0 END", .{});
+    defer compiled.deinit();
+    var result = try runtime.execute(std.testing.allocator, dead.backend(), &compiled, &.{}, .{});
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u64, 2), result.output.rows_affected);
+    for (result.output.rows) |row| try std.testing.expectEqualStrings("0", row[1].string);
+    try std.testing.expectEqual(@as(usize, 2), dead.rows_read);
+    try std.testing.expectEqual(@as(usize, 1), dead.captures);
+    try std.testing.expectEqual(@as(usize, 1), dead.closes);
+    try std.testing.expectEqual(@as(usize, 1), dead.commits);
+
+    var demanded: Backend = .{ .returning_mode = true };
+    var failing = try compiler.compile(std.testing.allocator, "UPDATE target SET n=n+10,cold='new' RETURNING n,CASE WHEN n=11 THEN (SELECT delta FROM source WHERE id='a') ELSE (SELECT delta FROM source) END", .{});
+    defer failing.deinit();
+    try std.testing.expectError(error.SqlCardinalityViolation, runtime.execute(std.testing.allocator, demanded.backend(), &failing, &.{}, .{}));
+    try std.testing.expectEqual(@as(usize, 1), demanded.captures);
+    try std.testing.expectEqual(@as(usize, 1), demanded.closes);
+    try std.testing.expectEqual(@as(usize, 0), demanded.commits);
+
+    var denied: Backend = .{ .returning_mode = true, .deny_source = true };
+    try std.testing.expectError(error.Forbidden, runtime.execute(std.testing.allocator, denied.backend(), &compiled, &.{}, .{}));
+    try std.testing.expectEqual(@as(usize, 0), denied.captures);
+    try std.testing.expectEqual(@as(usize, 0), denied.commits);
+}
+
 test "SQL RETURNING source errors cardinality and zero candidates never publish invalid images" {
     for ([_]struct { sql: []const u8, failure: anyerror }{
         .{ .sql = "UPDATE target SET cold='new' RETURNING (SELECT delta FROM source)", .failure = error.SqlCardinalityViolation },

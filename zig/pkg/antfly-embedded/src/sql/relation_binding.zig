@@ -108,7 +108,7 @@ pub const Node = struct {
         materialized_ref: *const Node,
         scan: struct { index: usize, source_columns: []const []const u8 },
         join: struct { kind: ast.JoinKind, left: *const Node, right: *const Node, condition: ?scalar.Program, left_keys: []const scalar.Program, right_keys: []const scalar.Program, correlation: bool = false },
-        apply: struct { id: usize, kind: ast.JoinKind, left: *const Node, right: *const Node, condition: ?scalar.Program },
+        apply: struct { id: usize, kind: ast.JoinKind, left: *const Node, right: *const Node, condition: ?scalar.Program, demand: ?scalar.Program = null },
         query: struct { source: *const Node, statement: ast.Select, binding: describe.BoundStatement },
         set: struct { kind: ast.SetKind, all: bool, left: *const Node, right: *const Node },
         /// Compiler-generated INSERT VALUES arms in input order. Each arm
@@ -1073,13 +1073,32 @@ const Builder = struct {
                     if (join.kind == .right or join.kind == .full) {
                         if (self.outer_used[id]) return error.InvalidLateralReference;
                         try self.uncorrelated(source, id);
-                    } else apply_id = id;
+                    } else {
+                        apply_id = id;
+                        // An unused outer binding must not prevent replay of
+                        // an invariant producer after its first demanded row.
+                        if (!self.outer_used[id]) try self.uncorrelated(source, id);
+                    }
                     break :right source;
                 } else try self.relation(join.right, scope, depth + 1);
                 for (left.columns) |a| for (right.columns) |b| if (std.mem.eql(u8, a.qualifier, b.qualifier)) return error.AmbiguousSqlColumn;
                 const columns = try self.joinColumns(left, right, join.kind);
                 const expression_ = if (join.condition) |condition| try self.expression(columns, condition, &.{}) else null;
-                break :blk try self.joinNode(left, right, join.kind, expression_, apply_id);
+                var demand: ?scalar.Program = null;
+                if (join.demand) |mask| {
+                    if (!lateral or join.kind != .left or apply_id == null) return error.InvalidSqlBackendResponse;
+                    const guard_expression = try self.expression(left.columns, mask, &.{});
+                    if (self.shape_only) {
+                        try self.constraints.append(self.alloc, .{ .expression = try self.inferenceExpression(guard_expression, left.columns), .expected = .boolean });
+                    } else {
+                        const types = try self.scalarColumns(left.columns);
+                        _ = try scalar.inferParameters(self.alloc, guard_expression, types, self.parameters, .boolean, .{});
+                        demand = try scalar.bindExpectedWithSettings(self.alloc, guard_expression, types, self.parameters, .boolean, .{}, self.backend.settings_view);
+                    }
+                }
+                const result = try self.joinNode(left, right, join.kind, expression_, apply_id);
+                if (!self.shape_only and demand != null) @constCast(result).operation.apply.demand = demand;
+                break :blk result;
             },
         };
     }
@@ -1295,6 +1314,7 @@ fn projectScans(builder: *Builder, node: *const Node, needed: *std.StringHashMap
         },
         .apply => |apply| {
             if (apply.condition) |program| for (program.required_columns) |ordinal| try needed.put(builder.alloc, node.columns[ordinal].internal, {});
+            if (apply.demand) |program| for (program.required_columns) |ordinal| try needed.put(builder.alloc, apply.left.columns[ordinal].internal, {});
             try projectScans(builder, apply.right, needed);
             try projectScans(builder, apply.left, needed);
         },

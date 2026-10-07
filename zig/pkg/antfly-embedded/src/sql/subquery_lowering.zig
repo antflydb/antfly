@@ -43,9 +43,9 @@ pub fn has(node: *const ast.Scalar) bool {
 }
 
 /// A read in one of these positions is not demanded on every row. Moving it
-/// into a grouped/hoisted child could expose cardinality, type, or permission
-/// errors from a branch SQL would never evaluate. This is the admission
-/// boundary until a masked Apply operator owns branch-row and snapshot state.
+/// into a grouped/hoisted child could expose runtime cardinality/value errors
+/// from a branch SQL would never evaluate. Binding/authorization still cover
+/// every branch; masked Apply owns execution demand, not permission bypasses.
 pub fn hasConditional(node: *const ast.Scalar) bool {
     return switch (node.*) {
         .literal, .column => false,
@@ -213,7 +213,9 @@ const Builder = struct {
         return switch (value.*) {
             .table => false,
             .derived => |part| self.nestedOuterSelect(part.query, scope),
-            .join => |part| self.nestedOuterRelation(part.left, scope) or self.nestedOuterRelation(part.right, scope) or if (part.condition) |condition| self.nestedOuterScalar(condition, scope) else false,
+            .join => |part| self.nestedOuterRelation(part.left, scope) or self.nestedOuterRelation(part.right, scope) or
+                (if (part.condition) |condition| self.nestedOuterScalar(condition, scope) else false) or
+                (if (part.demand) |demand| self.nestedOuterScalar(demand, scope) else false),
         };
     }
     fn nestedOuterSelect(self: *Builder, query: *const ast.Select, parent: ?*const NestedScope) bool {
@@ -723,30 +725,93 @@ const Builder = struct {
         return self.scalar(.{ .case_when = .{ .branches = branches, .otherwise = try self.scalar(.{ .literal = .{ .boolean = false } }) } });
     }
     fn rewrite(self: *Builder, input: *const ast.Scalar) anyerror!*const ast.Scalar {
+        return self.rewriteDemand(input, null);
+    }
+
+    fn mask(self: *Builder, parent: ?*const ast.Scalar, predicate: *const ast.Scalar) !*const ast.Scalar {
+        return if (parent) |prior| self.scalar(.{ .binary = .{ .op = .@"and", .left = prior, .right = predicate } }) else predicate;
+    }
+
+    fn testValue(self: *Builder, op: ast.Scalar.Unary, value: *const ast.Scalar) !*const ast.Scalar {
+        return self.scalar(.{ .unary = .{ .op = op, .operand = value } });
+    }
+
+    /// A hidden one-cell producer materializes branch prerequisites exactly
+    /// once. It retains the original source's visible names and qualifiers.
+    /// Physical children remain in the enclosing captured relation plan.
+    fn produce(self: *Builder, value: *const ast.Scalar, demand: ?*const ast.Scalar) !*const ast.Scalar {
+        const alias = try std.fmt.allocPrint(self.alloc, "$demand_{d}", .{self.serial});
+        self.serial += 1;
+        if (self.serial > 64 or self.outer.contains(alias)) return error.SqlProgramLimitExceeded;
+        try self.outer.put(self.alloc, alias, {});
+        const query = try self.alloc.create(ast.Select);
+        query.* = .{ .columns = try self.alloc.dupe(ast.Projection, &.{.{ .alias = "$value", .expression = value }}) };
+        self.source = try self.relation(.{ .join = .{
+            .kind = .left,
+            .left = self.source,
+            .right = try self.relation(.{ .derived = .{ .query = query, .alias = alias, .hidden = true, .lateral = true } }),
+            .demand = demand,
+        } });
+        return self.field(alias, "$value");
+    }
+
+    fn prerequisite(self: *Builder, value: *const ast.Scalar, demand: ?*const ast.Scalar) !*const ast.Scalar {
+        return if (value.* == .literal or value.* == .column) value else self.produce(value, demand);
+    }
+
+    fn rewriteDemand(self: *Builder, input: *const ast.Scalar, demand: ?*const ast.Scalar) anyerror!*const ast.Scalar {
         if (!has(input)) return input;
-        if (input.* == .call and input.call.subquery != null) return self.subquery(input);
-        if (hasConditional(input)) return error.UnsupportedSqlShape;
+        if (input.* == .call and input.call.subquery != null) return if (demand != null) self.produce(input, demand) else self.subquery(input);
         return self.scalar(switch (input.*) {
             .call => |part| blk: {
                 var copy = part;
                 const args = try self.alloc.alloc(*const ast.Scalar, part.args.len);
-                for (part.args, args) |arg, *out| out.* = try self.rewrite(arg);
+                var remaining = demand;
+                for (part.args, args, 0..) |arg, *out, i| {
+                    out.* = try self.rewriteDemand(arg, remaining);
+                    if (std.mem.eql(u8, part.name, "coalesce") and i + 1 < args.len) {
+                        out.* = try self.prerequisite(out.*, remaining);
+                        remaining = try self.mask(remaining, try self.testValue(.is_null, out.*));
+                    }
+                }
                 copy.args = args;
-                copy.filter = if (part.filter) |filter| try self.rewrite(filter) else null;
+                copy.filter = if (part.filter) |filter| try self.rewriteDemand(filter, demand) else null;
                 break :blk .{ .call = copy };
             },
-            .unary => |part| .{ .unary = .{ .op = part.op, .operand = try self.rewrite(part.operand) } },
-            .binary => |part| .{ .binary = .{ .op = part.op, .left = try self.rewrite(part.left), .right = try self.rewrite(part.right) } },
-            .cast => |part| .{ .cast = .{ .type = part.type, .element_type = part.element_type, .operand = try self.rewrite(part.operand) } },
+            .unary => |part| .{ .unary = .{ .op = part.op, .operand = try self.rewriteDemand(part.operand, demand) } },
+            .binary => |part| blk: {
+                var left = try self.rewriteDemand(part.left, demand);
+                var right_demand = demand;
+                if (part.op == .@"and" or part.op == .@"or") {
+                    left = try self.prerequisite(left, demand);
+                    right_demand = try self.mask(demand, try self.testValue(if (part.op == .@"and") .is_not_false else .is_not_true, left));
+                }
+                break :blk .{ .binary = .{ .op = part.op, .left = left, .right = try self.rewriteDemand(part.right, right_demand) } };
+            },
+            .cast => |part| .{ .cast = .{ .type = part.type, .element_type = part.element_type, .operand = try self.rewriteDemand(part.operand, demand) } },
             .case_when => |part| blk: {
                 const branches = try self.alloc.alloc(ast.Scalar.Branch, part.branches.len);
-                for (part.branches, branches) |branch, *out| out.* = .{ .condition = try self.rewrite(branch.condition), .value = try self.rewrite(branch.value) };
-                break :blk .{ .case_when = .{ .branches = branches, .otherwise = if (part.otherwise) |other| try self.rewrite(other) else null } };
+                var remaining = demand;
+                for (part.branches, branches) |branch, *out| {
+                    const condition = try self.prerequisite(try self.rewriteDemand(branch.condition, remaining), remaining);
+                    out.* = .{ .condition = condition, .value = try self.rewriteDemand(branch.value, try self.mask(remaining, try self.testValue(.is_true, condition))) };
+                    remaining = try self.mask(remaining, try self.testValue(.is_not_true, condition));
+                }
+                break :blk .{ .case_when = .{ .branches = branches, .otherwise = if (part.otherwise) |other| try self.rewriteDemand(other, remaining) else null } };
             },
             .in_list => |part| blk: {
+                const operand = try self.prerequisite(try self.rewriteDemand(part.operand, demand), demand);
+                var remaining: ?*const ast.Scalar = try self.mask(demand, try self.testValue(.is_not_null, operand));
                 const values = try self.alloc.alloc(*const ast.Scalar, part.values.len);
-                for (part.values, values) |item, *out| out.* = try self.rewrite(item);
-                break :blk .{ .in_list = .{ .operand = try self.rewrite(part.operand), .values = values, .negated = part.negated } };
+                for (part.values, values, 0..) |item, *out, i| {
+                    out.* = try self.rewriteDemand(item, remaining);
+                    if (i + 1 < values.len) {
+                        out.* = try self.prerequisite(out.*, remaining);
+                        const equal = try self.scalar(.{ .binary = .{ .op = .eq, .left = operand, .right = out.* } });
+                        remaining = try self.mask(remaining, try self.testValue(.is_not_true, equal));
+                    }
+                }
+                break :blk .{ .in_list = .{ .operand = operand, .values = values, .negated = part.negated } };
             },
             else => unreachable,
         });

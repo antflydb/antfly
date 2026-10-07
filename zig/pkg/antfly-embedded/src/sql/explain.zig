@@ -128,9 +128,10 @@ fn relationPlan(alloc: Allocator, bound: *const relation.Bound, node: *const rel
         .recursive_ref => .{ .node_type = "Recursive Reference" },
         .outer_ref => .{ .node_type = "Outer Reference" },
         .apply => |apply| blk: {
-            const source: Plan = .{ .node_type = "Lateral Apply", .join_kind = @tagName(apply.kind), .plans = try alloc.dupe(Plan, &.{ try relationPlan(alloc, bound, apply.left, verbose, depth + 1, remaining), try relationPlan(alloc, bound, apply.right, verbose, depth + 1, remaining) }) };
+            const source: Plan = .{ .node_type = if (apply.demand != null) "Masked Apply" else "Lateral Apply", .join_kind = @tagName(apply.kind), .plans = try alloc.dupe(Plan, &.{ try relationPlan(alloc, bound, apply.left, verbose, depth + 1, remaining), try relationPlan(alloc, bound, apply.right, verbose, depth + 1, remaining) }) };
             var functions: std.ArrayList([]const u8) = .empty;
             if (apply.condition) |*program| try decisionFunctions(alloc, program, &functions);
+            if (apply.demand) |*program| try decisionFunctions(alloc, program, &functions);
             if (functions.items.len == 0) break :blk source;
             break :blk .{ .node_type = "DecisionEval", .functions = functions.items, .plans = try alloc.dupe(Plan, &.{source}) };
         },

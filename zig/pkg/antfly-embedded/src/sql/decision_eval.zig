@@ -100,6 +100,7 @@ fn validateRelation(a: std.mem.Allocator, provider: ?decisions.DecisionProvider,
             try validateRelation(a, provider, part.left, parameters);
             try validateRelation(a, provider, part.right, parameters);
             if (part.condition) |*program| try validate(a, provider, program, parameters);
+            if (part.demand) |*program| try validate(a, provider, program, parameters);
         },
         .set => |part| {
             try validateRelation(a, provider, part.left, parameters);
