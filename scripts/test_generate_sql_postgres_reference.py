@@ -176,6 +176,67 @@ class PostgresReferenceTest(unittest.TestCase):
                     self.assertEqual([None, None], json_array["values"])
                     self.assertEqual([False, True], json_array["sql_nulls"])
 
+    def test_builtin_array_assignment_matrix_and_parameter_contexts(self):
+        import psycopg
+
+        types = (
+            "smallint",
+            "integer",
+            "bigint",
+            "real",
+            "double precision",
+            "boolean",
+            "text",
+            "uuid",
+            "jsonb",
+        )
+        with self.db.transaction(force_rollback=True):
+            self.db.execute(
+                "CREATE TEMP TABLE assignment_probe("
+                + ",".join(f"c{i} {kind}[]" for i, kind in enumerate(types))
+                + ")"
+            )
+            for source_index, source in enumerate(types):
+                for target_index, target in enumerate(types):
+                    allowed = (
+                        source_index == target_index
+                        or target == "text"
+                        or (source_index < 5 and target_index < 5)
+                    )
+                    query = f"EXPLAIN INSERT INTO assignment_probe(c{target_index}) SELECT NULL::{source}[]"
+                    with self.subTest(source=source, target=target):
+                        with self.db.transaction(force_rollback=True):
+                            if allowed:
+                                self.db.execute(query)
+                            else:
+                                with self.assertRaises(
+                                    psycopg.errors.DatatypeMismatch
+                                ) as error:
+                                    self.db.execute(query)
+                                self.assertEqual("42804", error.exception.sqlstate)
+            for query, state in (
+                ("INSERT INTO assignment_probe(c2) VALUES (ARRAY[])", "42P18"),
+                ("INSERT INTO assignment_probe(c2) VALUES (ARRAY['1'])", "42804"),
+                (
+                    "PREPARE antfly_array_conflict AS INSERT INTO assignment_probe(c0,c2) VALUES ($1,$1)",
+                    "42P08",
+                ),
+            ):
+                with self.subTest(sql=query), self.db.transaction(force_rollback=True):
+                    with self.assertRaises(psycopg.Error) as error:
+                        self.db.execute(query)
+                    self.assertEqual(state, error.exception.sqlstate)
+            self.db.execute(
+                "PREPARE antfly_array_assignment AS INSERT INTO assignment_probe(c0) VALUES ($1)"
+            )
+            try:
+                observed = self.db.execute(
+                    "SELECT parameter_types::text FROM pg_prepared_statements WHERE name='antfly_array_assignment'"
+                ).fetchone()[0]
+                self.assertEqual("{smallint[]}", observed)
+            finally:
+                self.db.execute("DEALLOCATE antfly_array_assignment")
+
     def test_array_common_types_precede_set_identity(self):
         cases = (
             (

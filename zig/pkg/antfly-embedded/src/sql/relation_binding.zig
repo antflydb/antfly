@@ -278,9 +278,10 @@ const Builder = struct {
     outer_scope: ?*const OuterScope = null,
     outer_next: usize = 0,
     outer_used: [32]bool = @splat(false),
+    assignment_expected: []const scalar.Type = &.{},
     const OuterScope = struct { id: usize, columns: []const Column, parent: ?*const OuterScope, cte_boundary: usize };
     const RecursiveFrame = struct { id: usize, query: *const ast.Select, columns: []const Column, parent: ?*const RecursiveFrame };
-    const Constraint = struct { expression: *const ast.Scalar, expected: ?ast.ColumnType = null };
+    const Constraint = struct { expression: *const ast.Scalar, expected: ?ast.ColumnType = null, expected_type: ?scalar.Type = null };
 
     const Prepared = struct { source: *const Node, lowered: ast.Select, expressions: []const *const ast.Scalar, types: []scalar.Type };
 
@@ -407,6 +408,23 @@ const Builder = struct {
         const normalized = if (subqueries.accepts(statement)) try subqueries.lower(self.alloc, statement) else statement;
         const root = try self.querySource(normalized, &.{}, 0);
         const expressions = try self.constrainSelect(root, try self.lower(root, normalized));
+        if (self.assignment_expected.len != 0) {
+            if (expressions.len != self.assignment_expected.len) return error.InvalidSqlParameters;
+            var contexts: std.AutoHashMapUnmanaged(u32, scalar.Type) = .empty;
+            for (expressions, self.assignment_expected) |expression_, descriptor| {
+                if (expression_.* == .literal and expression_.literal == .parameter) {
+                    const index = expression_.literal.parameter;
+                    if (index == 0 or index > self.parameters.len) return error.InvalidSqlParameters;
+                    const unknown = if (self.backend.parameter_invocation) |owner| owner.descriptors[index - 1].kind == null else self.parameters[index - 1] == null;
+                    if (unknown) {
+                        const entry = try contexts.getOrPut(self.alloc, index);
+                        if (entry.found_existing and !std.meta.eql(entry.value_ptr.*, descriptor)) return error.ConflictingSqlParameterTypes;
+                        entry.value_ptr.* = descriptor;
+                    }
+                }
+                try self.constraints.append(self.alloc, .{ .expression = expression_, .expected_type = descriptor });
+            }
+        }
         if (expected.len != 0) {
             if (expressions.len != expected.len) return error.InvalidSqlParameters;
             for (expressions, expected) |expression_, kind| try self.constraints.append(self.alloc, .{ .expression = expression_, .expected = kind });
@@ -418,7 +436,10 @@ const Builder = struct {
             var changed = false;
             for (self.constraints.items, 0..) |constraint, index| {
                 if (index % 64 == 0) try self.backend.vtable.checkpoint(self.backend.ptr);
-                changed = try scalar.inferParameters(self.alloc, constraint.expression, self.shape_columns.items, self.parameters, constraint.expected, .{ .invocation = self.backend.parameter_invocation }) or changed;
+                changed = if (constraint.expected_type) |descriptor|
+                    try (self.backend.parameter_invocation orelse return error.UnsupportedSqlShape).infer(self.alloc, constraint.expression, self.shape_columns.items, self.parameters, descriptor, .{ .assignment = true }) or changed
+                else
+                    try scalar.inferParameters(self.alloc, constraint.expression, self.shape_columns.items, self.parameters, constraint.expected, .{ .invocation = self.backend.parameter_invocation }) or changed;
             }
             if (!changed) return;
         }
@@ -1607,6 +1628,14 @@ pub fn inferExpected(alloc: Allocator, backend: catalog.Backend, statement: ast.
     if (std.mem.indexOfScalar(?ast.ColumnType, parameters, null) == null) return;
     var shape: Builder = .{ .alloc = alloc, .backend = backend, .parameters = parameters, .shape_only = true, .node_limit = if (statement.generated_values) 8192 else 256 };
     try shape.inferShape(statement, expected);
+}
+
+/// Precise assignment domains flow through the same catalog-only origin and
+/// scope analysis as SELECT inference; no source cursor or value is evaluated.
+pub fn inferExpectedTypes(alloc: Allocator, backend: catalog.Backend, statement: ast.Select, parameters: []?ast.ColumnType, expected: []const scalar.Type) !void {
+    if (std.mem.indexOfScalar(?ast.ColumnType, parameters, null) == null) return;
+    var shape: Builder = .{ .alloc = alloc, .backend = backend, .parameters = parameters, .shape_only = true, .node_limit = if (statement.generated_values) 8192 else 256, .assignment_expected = expected };
+    try shape.inferShape(statement, &.{});
 }
 
 /// Catalog-only output domain for mutation wildcard dependencies. The caller

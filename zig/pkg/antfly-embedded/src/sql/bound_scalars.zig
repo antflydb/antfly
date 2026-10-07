@@ -355,7 +355,10 @@ fn bindDescriptorsWithInvocation(alloc: Allocator, table: ?catalog.Table, statem
         },
         .update => |update| blk: {
             if (needsResidual(table, update.predicate)) break :blk true;
-            for (update.assignments) |assignment| if (assignment.expression != null) break :blk true;
+            for (update.assignments) |assignment| {
+                if (assignment.expression != null) break :blk true;
+                if (table) |definition| if ((try definition.column(assignment.field)).type == .array and (assignment.value == .string or assignment.value == .parameter)) break :blk true;
+            }
             break :blk false;
         },
         .delete => |delete| needsResidual(table, delete.predicate),
@@ -432,10 +435,10 @@ fn bindDescriptorsWithInvocation(alloc: Allocator, table: ?catalog.Table, statem
                 };
             },
             .update => |update| for (update.assignments) |assignment| {
-                if (assignment.expression == null and assignment.value != .parameter) continue;
                 const column = try (table orelse return error.UndefinedColumn).column(assignment.field);
-                const expression = assignment.expression orelse try builder.node(.{ .literal = assignment.value });
-                changed = try builder.infer(expression, column.type) or changed;
+                if (assignment.expression == null and assignment.value != .parameter and !(column.type == .array and assignment.value == .string)) continue;
+                const expression = try builder.assignmentNode(assignment.expression, assignment.value, column);
+                changed = try builder.inferAssignment(expression, column) or changed;
             },
             else => {},
         }
@@ -469,10 +472,10 @@ fn bindDescriptorsWithInvocation(alloc: Allocator, table: ?catalog.Table, statem
             const programs = try alloc.alloc(?scalar.Program, update.assignments.len);
             @memset(programs, null);
             for (update.assignments, programs) |assignment, *program| {
-                if (assignment.expression == null and !(typed_parameters and assignment.value == .parameter)) continue;
-                const expression = assignment.expression orelse try builder.node(.{ .literal = assignment.value });
                 const column = try (table orelse return error.UndefinedColumn).column(assignment.field);
-                program.* = try builder.program(expression, column.type);
+                if (assignment.expression == null and !(typed_parameters and assignment.value == .parameter) and !(column.type == .array and assignment.value == .string)) continue;
+                const expression = try builder.assignmentNode(assignment.expression, assignment.value, column);
+                program.* = try builder.assignmentProgram(expression, column);
                 const kind = program.*.?.output_type.kind;
                 if (kind != null and kind != column.type and !(kind == .integer and column.type == .number)) return error.SqlTypeMismatch;
             }
@@ -502,8 +505,8 @@ fn bindInsert(alloc: Allocator, table: catalog.Table, statement: ast.Insert, par
             for (row, expressions, statement.columns, 0..) |literal, expression, name, cell_index| {
                 if (statement.isDefault(row_index, cell_index)) continue;
                 const column = try table.column(name);
-                const node = expression orelse try builder.node(.{ .literal = literal });
-                changed = try builder.infer(node, column.type) or changed;
+                const node = try builder.assignmentNode(expression, literal, column);
+                changed = try builder.inferAssignment(node, column) or changed;
             }
         }
         if (!changed) break;
@@ -514,16 +517,62 @@ fn bindInsert(alloc: Allocator, table: catalog.Table, statement: ast.Insert, par
         const programs = try alloc.alloc(?scalar.Program, expressions.len);
         @memset(programs, null);
         for (expressions, literals, statement.columns, programs) |expression, literal, name, *program| {
-            if (expression == null and !(typed_parameters and literal == .parameter)) continue;
-            const node = expression orelse try builder.node(.{ .literal = literal });
             const column = try table.column(name);
-            program.* = try builder.program(node, column.type);
+            if (expression == null and !(typed_parameters and literal == .parameter) and !(column.type == .array and literal == .string)) continue;
+            const node = try builder.assignmentNode(expression, literal, column);
+            program.* = try builder.assignmentProgram(node, column);
             const kind = program.*.?.output_type.kind;
             if (kind != null and kind != column.type and !(kind == .integer and column.type == .number)) return error.SqlTypeMismatch;
         }
         row.* = programs;
     }
     return .{ .insert_rows = rows, .parameter_descriptors = try alloc.dupe(scalar.Type, parameters), .typed_parameters = typed_parameters, .invocation = invocation };
+}
+
+fn arrayAssignmentBindingScenario(backing: Allocator) !void {
+    var arena = std.heap.ArenaAllocator.init(backing);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const table: catalog.Table = .{ .id = 1, .physical_name = "items", .schema_version = 1, .columns = &.{
+        .{ .name = "a", .path = "a", .type = .array, .element_type = .int64 },
+        .{ .name = "b", .path = "b", .type = .array, .element_type = .int16 },
+    } };
+    var compiled = try @import("compiler.zig").compile(backing, "INSERT INTO items (_id,a,b) VALUES ('x','[-1:1]={1,NULL,2}',$1)", .{});
+    defer compiled.deinit();
+    var descriptors = [_]scalar.Type{.{}};
+    const bound = try bindTyped(a, table, compiled.statement, &descriptors, null, &.{});
+    try std.testing.expectEqual(@as(?@import("array_value.zig").ElementType, .int16), descriptors[0].element_type);
+    var prepared = try bound.prepareParameters(backing, &.{.{ .text = "{3,NULL}" }}, .{});
+    defer prepared.deinit();
+    var none = std.heap.FixedBufferAllocator.init(&.{});
+    for (0..10000) |_| {
+        const literal = try prepared.insert_rows[0][1].?.evaluate(none.allocator(), &.{}, .{});
+        try std.testing.expectEqual(@as(i32, -1), literal.array.?.dimensions[0].lower);
+        try std.testing.expect(literal.array.?.elements[1].sql_null);
+        const parameter = try prepared.insert_rows[0][2].?.evaluate(none.allocator(), &.{}, .{});
+        try std.testing.expect(parameter.array == prepared.frame.values[0].array);
+    }
+}
+
+test "SQL array assignments prepare unknown literals and precise parameters once with no row scratch" {
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, arrayAssignmentBindingScenario, .{});
+}
+
+test "SQL undeclared repeated array assignment parameters retain one consistent target identity" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const table: catalog.Table = .{ .id = 1, .physical_name = "items", .schema_version = 1, .columns = &.{
+        .{ .name = "a", .path = "a", .type = .array, .element_type = .int64 },
+        .{ .name = "b", .path = "b", .type = .array, .element_type = .int16 },
+    } };
+    var compiled = try @import("compiler.zig").compile(a, "INSERT INTO items (b,a) VALUES ($1,$1)", .{});
+    defer compiled.deinit();
+    var unknown = [_]scalar.Type{.{}};
+    try std.testing.expectError(error.ConflictingSqlParameterTypes, bindTyped(a, table, compiled.statement, &unknown, null, &.{}));
+    var declared = [_]scalar.Type{.{ .kind = .array, .element_type = .int16 }};
+    _ = try bindTyped(a, table, compiled.statement, &declared, null, &.{});
+    try std.testing.expectEqual(@as(?@import("array_value.zig").ElementType, .int16), declared[0].element_type);
 }
 
 const Builder = struct {
@@ -537,13 +586,18 @@ const Builder = struct {
     fallbacks: []const scalar.Type = &.{},
     required: std.ArrayList(u32) = .empty,
     seen: std.AutoHashMapUnmanaged(u32, void) = .empty,
+    assignment_contexts: std.AutoHashMapUnmanaged(u32, scalar.Type) = .empty,
 
     fn program(self: *Builder, expression: *const ast.Scalar, expected: ?ast.ColumnType) !scalar.Program {
+        return self.programType(expression, if (expected) |kind| .{ .kind = kind } else null, false);
+    }
+
+    fn programType(self: *Builder, expression: *const ast.Scalar, expected: ?scalar.Type, assignment: bool) !scalar.Program {
         // The statement-wide constraint pass has converged before emission.
         // Actual input kinds resolve polymorphic holes, not known SQL types.
         var coarse: [1024]?ast.ColumnType = undefined;
         for (self.parameters, coarse[0..self.parameters.len]) |descriptor, *kind| kind.* = descriptor.kind;
-        const result = if (self.typed_parameters) try scalar.bindTypedExpectedWithSettings(self.alloc, expression, self.columns, self.parameters, if (expected) |kind| scalar.Type{ .kind = kind } else null, .{ .invocation = self.invocation }, self.settings) else try scalar.bindExpectedWithSettings(self.alloc, expression, self.columns, coarse[0..self.parameters.len], expected, .{}, self.settings);
+        const result = if (self.typed_parameters or (self.parameters.len == 0 and expected != null and expected.?.kind == .array)) try scalar.bindTypedExpectedWithSettings(self.alloc, expression, self.columns, self.parameters, expected, .{ .invocation = self.invocation, .assignment = assignment }, self.settings) else try scalar.bindExpectedWithSettings(self.alloc, expression, self.columns, coarse[0..self.parameters.len], if (expected) |kind| kind.kind else null, .{ .assignment = assignment }, self.settings);
         if (result.parameter_types.len > self.parameters.len) return error.InvalidSqlParameters;
         for (result.parameter_descriptors, self.parameters[0..result.parameter_types.len]) |inferred, *existing| {
             if (inferred.kind) |kind| {
@@ -567,12 +621,42 @@ const Builder = struct {
     }
 
     fn infer(self: *Builder, expression: *const ast.Scalar, expected: ?ast.ColumnType) !bool {
-        if (self.typed_parameters) return scalar.inferTypedParametersExpected(self.alloc, expression, self.columns, self.parameters, if (expected) |kind| scalar.Type{ .kind = kind } else null, .{});
+        return self.inferType(expression, if (expected) |kind| .{ .kind = kind } else null, false);
+    }
+
+    fn inferType(self: *Builder, expression: *const ast.Scalar, expected: ?scalar.Type, assignment: bool) !bool {
+        if (self.typed_parameters or (self.parameters.len == 0 and expected != null and expected.?.kind == .array)) return scalar.inferTypedParametersExpected(self.alloc, expression, self.columns, self.parameters, expected, .{ .assignment = assignment });
         var coarse: [1024]?ast.ColumnType = undefined;
         for (self.parameters, coarse[0..self.parameters.len]) |descriptor, *kind| kind.* = descriptor.kind;
-        const changed = try scalar.inferParameters(self.alloc, expression, self.columns, coarse[0..self.parameters.len], expected, .{});
+        const changed = try scalar.inferParameters(self.alloc, expression, self.columns, coarse[0..self.parameters.len], if (expected) |kind| kind.kind else null, .{ .assignment = assignment });
         for (self.parameters, coarse[0..self.parameters.len]) |*descriptor, kind| descriptor.* = .{ .kind = kind };
         return changed;
+    }
+
+    fn assignmentNode(self: *Builder, expression: ?*const ast.Scalar, literal: ast.Value, column: catalog.Column) !*const ast.Scalar {
+        const node_ = expression orelse try self.node(.{ .literal = literal });
+        if (column.type == .array and node_.* == .literal and node_.literal == .string)
+            return self.node(.{ .cast = .{ .operand = node_, .type = .array, .element_type = column.element_type orelse return error.SqlAssignmentTypeMismatch } });
+        return node_;
+    }
+
+    fn inferAssignment(self: *Builder, expression: *const ast.Scalar, column: catalog.Column) !bool {
+        var expected: scalar.Type = .{ .kind = column.type, .element_type = column.element_type };
+        if (self.typed_parameters and expected.kind != .datetime and expected.element_type == null) expected.element_type = try scalar.parameterElementType(expected);
+        if (self.typed_parameters and expression.* == .literal and expression.literal == .parameter) {
+            const index = expression.literal.parameter;
+            if (index == 0 or index > self.parameters.len) return error.InvalidSqlParameters;
+            if (self.assignment_contexts.get(index)) |prior| {
+                if (prior.kind != expected.kind or prior.element_type != expected.element_type) return error.ConflictingSqlParameterTypes;
+            } else if (self.parameters[index - 1].kind == null) try self.assignment_contexts.put(self.alloc, index, expected);
+        }
+        return self.inferType(expression, expected, true);
+    }
+
+    fn assignmentProgram(self: *Builder, expression: *const ast.Scalar, column: catalog.Column) !scalar.Program {
+        const program_ = try self.programType(expression, .{ .kind = column.type, .element_type = column.element_type }, true);
+        if (program_.output_type.kind != null and program_.output_type.kind != column.type and !(program_.output_type.kind == .integer and column.type == .number)) return error.SqlAssignmentTypeMismatch;
+        return program_;
     }
 
     fn node(self: *Builder, value: ast.Scalar) !*const ast.Scalar {

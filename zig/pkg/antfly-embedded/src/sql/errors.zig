@@ -90,6 +90,7 @@ pub fn describe(err: anyerror) Diagnostic {
         error.SqlInvalidEscapeString => .{ .code = "22025", .message = "Escape string must be empty or one character." },
         error.SqlArraySubscriptError => .{ .code = "2202E", .message = "Array dimensions or bounds do not match.", .hint = "Use valid bounds and rectangular subarrays with matching dimensions." },
         error.SqlArrayConstructorTypeMismatch => .{ .code = "42804", .message = "Array constructor element types cannot be matched.", .hint = "Use compatible scalar elements or compatible subarrays." },
+        error.SqlAssignmentTypeMismatch => .{ .code = "42804", .message = "The expression type cannot be assigned to this column.", .hint = "Use a compatible value or an explicit cast to the column type." },
         error.SqlInvalidTextRepresentation, error.InvalidSqlArrayShape => .{ .code = "22P02", .message = "A value has invalid input syntax for the requested type.", .hint = "Check the value and the target type." },
         error.SqlNullValueNotAllowed => .{ .code = "22004", .message = "A required SQL argument or JSON path element is null.", .hint = "Supply non-null values for required arguments and path elements." },
         error.SqlTransactionAlreadyActive => .{ .code = "25001", .message = "A transaction is already active in this session.", .retryable = false },

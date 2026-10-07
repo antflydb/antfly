@@ -220,8 +220,15 @@ fields and JSONB null provenance after native page/cursor retirement. Native
 C-ABI sequences, PostgreSQL mutation observers and allocation-fault checks
 exercise these contracts. Nullable native API columns must explicitly allow
 null in their schema; this work does not weaken native JSON-schema validation.
-SQL DDL, broader assignment inference, conflict/joined/MERGE typed-array paths
-and ordered/constraint index keys still need end-to-end activation gates.
+Ordinary array assignments now infer precise target element identities for
+unknown parameters and array string literals. Literals and parameters are
+prepared once; repeated evaluation needs no row scratch allocation. Assignment
+coercions use the shared bounded cast kernel, distinguishing numeric-array
+coercions and builtin-to-text assignments from explicit-only text-to-numeric
+casts. INSERT SELECT carries target domains through catalog-only source
+inference, retaining bounds and SQL NULL elements at the storage boundary.
+SQL DDL, conflict/joined/MERGE typed-array paths and ordered/constraint index
+keys still need end-to-end activation gates.
 Original case dispositions remain unchanged.
 
 Source commit: `79644dfa1605e8da0f486d021d1c1393577d6265`.

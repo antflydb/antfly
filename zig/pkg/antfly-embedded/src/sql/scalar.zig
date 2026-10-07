@@ -65,6 +65,7 @@ pub const BindLimits = struct {
     depth: usize = 64,
     parameters: usize = 1024,
     invocation: ?*@import("parameter_binding.zig").Invocation = null,
+    assignment: bool = false,
 };
 const decisions = @import("../functions/decisions.zig");
 pub const DecisionDemand = struct { instruction: u32, function: decisions.Function, args: []const Json };
@@ -337,6 +338,27 @@ pub fn validateParameterType(descriptor: Type) !void {
 pub fn parameterElementType(descriptor: Type) !arrays.ElementType {
     try validateParameterType(descriptor);
     return descriptor.element_type orelse try arrayElementType(descriptor.kind orelse return error.UnknownSqlParameterType);
+}
+
+/// Shared assignment coercion for typed source cursors and mutation cells.
+/// Identity borrows the source; converted cells belong to alloc, and dimension
+/// metadata borrows the pinned source until the caller's ownership boundary.
+pub fn assignArray(alloc: Allocator, datum: Datum, target: arrays.ElementType, limits: EvalLimits) !Datum {
+    if (datum.value != .null or datum.patterns != null) return error.SqlAssignmentTypeMismatch;
+    if (datum.sql_null) {
+        if (datum.array != null) return error.SqlAssignmentTypeMismatch;
+        return datum;
+    }
+    const source = datum.array orelse return error.SqlAssignmentTypeMismatch;
+    if (!builtin_cast.assignmentAllowed(source.element_type, target)) return error.SqlAssignmentTypeMismatch;
+    if (source.element_type == target) return datum;
+    // Reuse the exact bounded scalar/array CAST kernel without constructing
+    // instructions, serializing JSON, or registering another parameter frame.
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const program: Program = .{ .arena = &arena, .instructions = &.{}, .root = 0, .output_type = .{}, .parameter_types = &.{}, .parameter_descriptors = &.{}, .required_columns = &.{} };
+    var evaluator: Evaluator = .{ .program = &program, .alloc = alloc, .cells = &.{}, .parameters = &.{}, .limits = limits };
+    return evaluator.castArray(datum, target);
 }
 
 fn normalizeParameterType(descriptor: Type) !Type {
@@ -1584,6 +1606,7 @@ const Binder = struct {
     fn compileArrayContext(self: *Binder, expression: *const ast.Scalar, expected: ?ast.ColumnType, array_element: ?arrays.ElementType, depth: usize) anyerror!u32 {
         if (depth >= self.limits.depth or self.instructions.items.len >= self.limits.nodes) return error.SqlProgramLimitExceeded;
         const empty_constructor = expression.* == .call and std.mem.eql(u8, expression.call.name, "$array") and expression.call.args.len == 0;
+        if (depth == 0 and empty_constructor and self.limits.assignment) return error.UnknownSqlArrayType;
         var kind = if (empty_constructor and array_element != null) Type{ .kind = .array, .element_type = array_element, .nullable = false } else try self.infer(expression, depth);
         if (expression.* == .literal and expression.literal == .parameter) kind = self.parameters[expression.literal.parameter - 1];
         if (kind.kind == null) kind.kind = expected;
@@ -1791,6 +1814,7 @@ const Binder = struct {
         const index: u32 = @intCast(self.instructions.items.len);
         try self.instructions.append(self.alloc, instruction);
         if (expected == .array and array_element != null and kind.kind == .array and kind.element_type != array_element) {
+            if (depth == 0 and self.limits.assignment and !builtin_cast.assignmentAllowed(kind.element_type orelse return error.SqlAssignmentTypeMismatch, array_element.?)) return error.SqlAssignmentTypeMismatch;
             if (self.instructions.items.len >= self.limits.nodes) return error.SqlProgramLimitExceeded;
             const promoted: u32 = @intCast(self.instructions.items.len);
             try self.instructions.append(self.alloc, .{ .type = .{ .kind = .array, .element_type = array_element, .nullable = kind.nullable }, .operation = .{ .cast = .{ .operand = index, .type = .array, .element_type = array_element } } });
@@ -1799,6 +1823,42 @@ const Binder = struct {
         return index;
     }
 };
+
+test "SQL array assignment casts match the PostgreSQL builtin matrix without relaxing explicit CAST" {
+    const names = [_][]const u8{ "smallint", "integer", "bigint", "real", "double precision", "boolean", "text", "uuid", "jsonb" };
+    const kinds = [_]arrays.ElementType{ .int16, .int32, .int64, .float32, .float64, .boolean, .text, .uuid, .jsonb };
+    for (kinds, names, 0..) |source, name, source_index| {
+        const text = try std.fmt.allocPrint(std.testing.allocator, "SELECT NULL::{s}[]", .{name});
+        defer std.testing.allocator.free(text);
+        var compiled = try @import("compiler.zig").compile(std.testing.allocator, text, .{});
+        defer compiled.deinit();
+        const expression = compiled.statement.select.columns[0].expression.?;
+        for (kinds, 0..) |target, target_index| {
+            const allowed = source_index == target_index or target_index == 6 or (source_index < 5 and target_index < 5);
+            try std.testing.expectEqual(allowed, builtin_cast.assignmentAllowed(source, target));
+            const expected: Type = .{ .kind = .array, .element_type = target };
+            if (allowed) {
+                var program = try bindTypedExpectedWithSettings(std.testing.allocator, expression, &.{}, &.{}, expected, .{ .assignment = true }, null);
+                defer program.deinit();
+                try std.testing.expectEqual(target, program.output_type.element_type.?);
+            } else try std.testing.expectError(error.SqlAssignmentTypeMismatch, bindTypedExpectedWithSettings(std.testing.allocator, expression, &.{}, &.{}, expected, .{ .assignment = true }, null));
+        }
+    }
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var empty = try @import("compiler.zig").compile(std.testing.allocator, "SELECT ARRAY[]", .{});
+    defer empty.deinit();
+    try std.testing.expectError(error.UnknownSqlArrayType, bindTypedExpectedWithSettings(std.testing.allocator, empty.statement.select.columns[0].expression.?, &.{}, &.{}, .{ .kind = .array, .element_type = .int64 }, .{ .assignment = true }, null));
+    var input = try @import("array_text.zig").decode(std.testing.allocator, .int64, "[-3:-2]={32768,NULL}", .{});
+    defer input.deinit();
+    try std.testing.expectError(error.SqlNumericOutOfRange, assignArray(arena.allocator(), Datum.typedArray(&input.value), .int16, .{}));
+    const text = try assignArray(arena.allocator(), Datum.typedArray(&input.value), .text, .{});
+    try std.testing.expectEqual(@as(i32, -3), text.array.?.dimensions[0].lower);
+    try std.testing.expectEqualStrings("32768", text.array.?.elements[0].value.string);
+    try std.testing.expect(text.array.?.elements[1].sql_null);
+    try std.testing.expectError(error.SqlAssignmentTypeMismatch, assignArray(arena.allocator(), text, .int64, .{}));
+    try std.testing.expectError(error.SqlProgramLimitExceeded, assignArray(arena.allocator(), Datum.typedArray(&input.value), .text, .{ .steps = 0 }));
+}
 
 const Evaluator = struct {
     program: *const Program,

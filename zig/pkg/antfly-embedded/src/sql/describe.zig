@@ -177,6 +177,13 @@ fn typedValuesSource(allocator: std.mem.Allocator, source: *const ast.Select, in
         if (insertion.isDefault(default_row, cell_index)) continue;
         const expression = projection.expression orelse return error.InvalidSqlBackendResponse;
         if (expression.* != .literal or original == .parameter) continue;
+        const column = try table.column(name);
+        if (column.type == .array and original == .string) {
+            const cast = try allocator.create(ast.Scalar);
+            cast.* = .{ .cast = .{ .operand = expression, .type = .array, .element_type = column.element_type orelse return error.SqlAssignmentTypeMismatch } };
+            projection.expression = cast;
+            continue;
+        }
         const literal = try allocator.create(ast.Scalar);
         literal.* = .{ .literal = try assignmentLiteral(original, (try table.column(name)).type) };
         projection.expression = literal;
@@ -459,6 +466,22 @@ fn bindImpl(allocator: std.mem.Allocator, backend: catalog.Backend, compiled: *c
             source_query = (try typedValuesSource(allocator, source, insertion, table, &row_index)).*;
             if (row_index != insertion.values_source_rows.len) return error.InvalidSqlParameters;
         }
+        // Only still-unknown root string literals inherit a target array
+        // domain. Typed text and strings already resolved inside a derived
+        // relation keep their identity and require an explicit SQL cast.
+        if (insertion.values_source_rows.len == 0) {
+            const projections = try allocator.dupe(ast.Projection, source_query.columns);
+            for (projections[0..@min(projections.len, insertion.columns.len)], insertion.columns[0..@min(projections.len, insertion.columns.len)]) |*projection, name| {
+                const column = try table.column(name);
+                if (column.type != .array) continue;
+                const expression = projection.expression orelse continue;
+                if (expression.* != .literal or expression.literal != .string) continue;
+                const cast = try allocator.create(ast.Scalar);
+                cast.* = .{ .cast = .{ .operand = expression, .type = .array, .element_type = column.element_type orelse return error.SqlAssignmentTypeMismatch } };
+                projection.expression = cast;
+            }
+            source_query.columns = projections;
+        }
         // Source-aware RETURNING must capture simple INSERT SELECT inputs in
         // the same read set as its own physical subqueries, too.
         if (relational_returning and source_query.source == null) if (source_query.table) |name| {
@@ -472,17 +495,27 @@ fn bindImpl(allocator: std.mem.Allocator, backend: catalog.Backend, compiled: *c
         // immutable catalog identities separately from the target binding.
         const capture_count = if (insertion.conflict) |clause| clause.capture_count else 0;
         const expected = try allocator.alloc(ast.ColumnType, insertion.columns.len + capture_count);
-        for (insertion.columns, expected[0..insertion.columns.len]) |name, *kind| kind.* = (try table.column(name)).type;
+        const expected_types = try allocator.alloc(@import("scalar.zig").Type, expected.len);
+        for (insertion.columns, expected[0..insertion.columns.len], expected_types[0..insertion.columns.len]) |name, *kind, *descriptor| {
+            const column = try table.column(name);
+            kind.* = column.type;
+            descriptor.* = .{ .kind = column.type, .element_type = column.element_type };
+        }
         if (capture_count != 0) for (insertion.conflict.?.assignments) |assignment| if (assignment.capture_ordinal) |ordinal| {
-            for (ordinal..ordinal + assignment.capture_span) |capture_index| expected[insertion.columns.len + capture_index] = (try table.column(assignment.field)).type;
+            for (ordinal..ordinal + assignment.capture_span) |capture_index| {
+                const column = try table.column(assignment.field);
+                expected[insertion.columns.len + capture_index] = column.type;
+                expected_types[insertion.columns.len + capture_index] = .{ .kind = column.type, .element_type = column.element_type };
+            }
         };
-        try @import("relation_binding.zig").inferExpected(allocator, backend, source_query, parameters, expected);
+        try @import("relation_binding.zig").inferExpectedTypes(allocator, backend, source_query, parameters, expected_types);
         const lowered: compiler.Compiled = .{ .arena = undefined, .statement = .{ .select = source_query }, .parameter_count = compiled.parameter_count };
         const bound = try allocator.create(BoundStatement);
         bound.* = try bindInternal(allocator, backend, &lowered, parameters);
         if (bound.columns.len != expected.len) return error.InvalidSqlParameters;
         for (bound.columns[0..insertion.columns.len], insertion.columns) |source_column, name| {
             const destination = try table.column(name);
+            if (source_column.type == .array and destination.type == .array and !@import("builtin_cast.zig").assignmentAllowed(source_column.element_type orelse return error.SqlAssignmentTypeMismatch, destination.element_type orelse return error.SqlAssignmentTypeMismatch)) return error.SqlAssignmentTypeMismatch;
             const untyped_null = source_column.untyped_null;
             if (!untyped_null and source_column.type != destination.type and !(source_column.type == .integer and destination.type == .number) and !(insertion.values_source_rows.len != 0 and source_column.type == .string and (destination.type == .datetime or destination.type == .json or destination.type == .uuid))) return error.SqlTypeMismatch;
         }
@@ -739,12 +772,12 @@ const Context = struct {
         try self.predicate(statement.predicate);
         var seen: std.StringHashMapUnmanaged(void) = .empty;
         defer seen.deinit(self.allocator);
-        for (statement.assignments) |assignment| {
+        for (statement.assignments, 0..) |assignment, index| {
             const column = try self.table.column(assignment.field);
             if (std.mem.eql(u8, column.name, "_id")) return error.UnsupportedSqlExecution;
             if (column.generated) return error.SqlGeneratedColumnWrite;
             if ((try seen.getOrPut(self.allocator, assignment.field)).found_existing) return error.DuplicateColumn;
-            if (assignment.expression == null) try self.value(assignment.value, column, true);
+            if (assignment.expression == null and (index >= self.scalars.assignments.len or self.scalars.assignments[index] == null)) try self.value(assignment.value, column, true);
         }
         // Execution's patch-by-replacement plan reads only untouched columns;
         // replacing a wide table must not require projecting overwritten data.

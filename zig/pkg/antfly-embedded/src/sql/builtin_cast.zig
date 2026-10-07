@@ -38,6 +38,14 @@ pub fn allowed(source: Kind, target: Kind) bool {
     return source == .jsonb and (integral(target) or floating(target) or target == .boolean);
 }
 
+/// PostgreSQL assignment context is narrower than an explicit CAST. Numeric
+/// narrowing is legal (and range checked at execution); text input is legal
+/// only while still an unknown literal, not as an already typed text value.
+pub fn assignmentAllowed(source: Kind, target: Kind) bool {
+    return source == target or target == .text or
+        ((integral(source) or floating(source)) and (integral(target) or floating(target)));
+}
+
 pub fn checkedInteger(value: i64, target: Kind) !i64 {
     if (target == .int16 and std.math.cast(i16, value) == null) return error.SqlNumericOutOfRange;
     if (target == .int32 and std.math.cast(i32, value) == null) return error.SqlNumericOutOfRange;

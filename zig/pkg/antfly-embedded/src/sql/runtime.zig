@@ -374,7 +374,8 @@ pub const Context = struct {
     /// cell. Arrays remain typed until here; their null JSON placeholder must
     /// never be mistaken for either a SQL NULL or a JSONB null write.
     pub fn storageDatum(self: Context, datum: Datum, column: catalog.Column) !Json {
-        const checked = try describe.coerceDatum(self.arena, datum, column.type, column.element_type);
+        const assigned = if (column.type == .array) try @import("scalar.zig").assignArray(self.arena, datum, column.element_type orelse return error.SqlAssignmentTypeMismatch, .{ .output_bytes = self.limits.retained_bytes }) else datum;
+        const checked = try describe.coerceDatum(self.arena, assigned, column.type, column.element_type);
         if (checked.sql_null) {
             if (!column.nullable) return error.SqlNotNullViolation;
             return .null;
@@ -1123,7 +1124,7 @@ pub const Context = struct {
             var program = if (i < self.binding.scalars.assignments.len) self.binding.scalars.assignments[i] else null;
             var typed: Json = .null;
             var sql_null = true;
-            if (program != null and item.expression == null and item.value == .parameter) {
+            if (program != null and item.expression == null and (item.value == .parameter or (column.type == .array and item.value == .string))) {
                 // A direct parameter assignment borrows the invocation frame,
                 // not row scratch. Retain it once, as on the literal path;
                 // do not clone a wide prepared payload for every target row.
@@ -1558,7 +1559,7 @@ fn mutationArrayOwnershipScenario(backing: std.mem.Allocator) !void {
     };
     input.deinit();
     try std.testing.expect((try context.storageDatum(.{}, column)) == .null);
-    try std.testing.expectError(error.SqlTypeMismatch, context.storageDatum(Datum.json(.null), column));
+    try std.testing.expectError(error.SqlAssignmentTypeMismatch, context.storageDatum(Datum.json(.null), column));
     var required = column;
     required.nullable = false;
     try std.testing.expectError(error.SqlNotNullViolation, context.storageDatum(.{}, required));
