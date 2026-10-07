@@ -46,6 +46,7 @@ unit-test: ## Run the existing repository unit gate across libraries, Antfly, an
 		if [ "$${build_args[i]}" = --cache-dir ]; then unit_cache_dir="$${build_args[i+1]:-}"; fi; \
 	done; \
 	if [ "$${CI:-}" = true ] && [ "$$(uname -s)" = Linux ] && [ "$${unit_cache_dir##*/}" = zig-local ]; then \
+		unit_cache_dir="$$(python3 tools/prune_completed_test_cache.py --validate-phase "$$unit_cache_dir")" || exit $$?; \
 		unit_cache_flags=-Dunit-test-cache-release=true; \
 	fi; \
 	ANTFLY_TEST_TIMINGS="$${ANTFLY_TEST_TIMINGS:-$${CI:+1}}" python3 tools/run_bounded_zig_build.py --zig "$(ZIG)" -- build unit-test $$unit_cache_flags "$${build_args[@]}"; \

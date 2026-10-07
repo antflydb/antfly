@@ -157,19 +157,21 @@ pub fn build(b: *std.Build) void {
                 self.assertIn("Released completed phase compiler cache", output)
                 self.assertEqual(list(cache.iterdir()), [])
 
-            # An explicit Zig cache override wins over the environment. Retire
-            # that cache and leave the unrelated environment cache untouched.
+            # An explicit relative override wins over the environment. Retire
+            # its normalized path and preserve the unrelated environment cache.
             (root / "library.zig").write_text(
                 "export fn library_probe() u32 { return 42; }\n"
             )
             sentinel = cache / "unrelated-cache-entry"
             sentinel.write_text("preserve")
             override = root / "cache with spaces" / "zig-local"
+            (root / "nested").mkdir()
+            override_arg = Path("nested") / ".." / "cache with spaces" / "zig-local"
             result = subprocess.run(
                 [
                     "make",
                     "unit-test",
-                    f'ZIG_BUILD_FLAGS=--cache-dir "{override}" --maxrss 2147483648 -j2',
+                    f'ZIG_BUILD_FLAGS=--cache-dir "{override_arg}" --maxrss 2147483648 -j2',
                 ],
                 cwd=root,
                 env=environment,
@@ -190,6 +192,24 @@ pub fn build(b: *std.Build) void {
                 timeout=120,
             )
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(len(list(override.glob("o/*/shared-probe"))), 1)
+
+            # Reject redirected paths before any build can delete artifacts.
+            link = root / "redirected" / "zig-local"
+            link.parent.mkdir()
+            link.symlink_to(override, target_is_directory=True)
+            result = subprocess.run(
+                ["make", "unit-test", f"ZIG_BUILD_FLAGS=--cache-dir {link}"],
+                cwd=root,
+                env=environment,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            output = result.stdout + result.stderr
+            self.assertNotEqual(result.returncode, 0, output)
+            self.assertIn("real job-owned zig-local directory", output)
+            self.assertNotIn("Released completed compiler outputs", output)
             self.assertEqual(len(list(override.glob("o/*/shared-probe"))), 1)
 
 
