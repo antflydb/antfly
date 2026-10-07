@@ -6428,7 +6428,7 @@ pub const Node = struct {
                 item.slot.fail(err);
                 continue;
             };
-            item.slot.setValue(if (scoring) []f32 else []gliner_mod.Entity, row, @fromBackingInt(@backingInt(observation.execution(items.len))));
+            item.slot.setOwnedValue(if (scoring) []f32 else []gliner_mod.Entity, row, @fromBackingInt(@backingInt(observation.execution(items.len))), shared, free);
         }
     }
 
@@ -6449,6 +6449,11 @@ pub const Node = struct {
         var pipeline = embedding_mod.EmbeddingPipeline.init(allocator, model.session, model.getTokenizer(), .{ .text_prefix = model.manifest.embedding_profile.document.prefix });
         const owned = try applyDenseEmbeddingRequestOptions(allocator, &pipeline, &model.manifest, .{ .model = "", .input = .null, .encoding_format = null, .dimensions = null, .task_type = task_type, .instruction = instruction });
         return .{ .prefix = pipeline.config.text_prefix, .owned = owned };
+    }
+
+    fn freeReadRow(allocator: std.mem.Allocator, result: readers_api.Result) void {
+        var owned = result;
+        readers_api.deinitResult(allocator, &owned);
     }
 
     fn freeDenseRow(allocator: std.mem.Allocator, row: []f32) void {
@@ -6551,7 +6556,7 @@ pub const Node = struct {
                 item.slot.fail(err);
                 continue;
             };
-            item.slot.setValue(DirectSparseEmbedding, row, @fromBackingInt(@backingInt(observation.execution(items.len))));
+            item.slot.setOwnedValue(DirectSparseEmbedding, row, @fromBackingInt(@backingInt(observation.execution(items.len))), alloc, freeSparseRow);
         }
     }
 
@@ -6586,7 +6591,7 @@ pub const Node = struct {
                 item.slot.fail(err);
                 continue;
             };
-            item.slot.setValue([]f32, vector, @fromBackingInt(@backingInt(observation.execution(items.len))));
+            item.slot.setOwnedValue([]f32, vector, @fromBackingInt(@backingInt(observation.execution(items.len))), alloc, freeDenseRow);
         }
     }
 
@@ -6673,7 +6678,7 @@ pub const Node = struct {
                 item.slot.fail(err);
                 continue;
             };
-            item.slot.setValue([]f32, row, @fromBackingInt(@backingInt(batch.execution)));
+            item.slot.setOwnedValue([]f32, row, @fromBackingInt(@backingInt(batch.execution)), shared, freeDenseRow);
         }
     }
 
@@ -6863,11 +6868,11 @@ pub const Node = struct {
                 item.slot.fail(err);
                 continue;
             };
-            item.slot.setValue([]f32, vector, switch (batch.execution) {
+            item.slot.setOwnedValue([]f32, vector, switch (batch.execution) {
                 .native_batch => .native_batch,
                 .serial => .serial,
                 .fallback => .fallback,
-            });
+            }, alloc, freeDenseRow);
         }
         alloc.free(vectors);
     }
@@ -7934,7 +7939,7 @@ pub const Node = struct {
                 item.slot.fail(err);
                 continue;
             };
-            item.slot.setValue(readers_api.Result, result, execution);
+            item.slot.setOwnedValue(readers_api.Result, result, execution, item.allocator, freeReadRow);
         }
     }
 
@@ -8042,7 +8047,7 @@ pub const Node = struct {
                 item.slot.fail(err);
                 continue;
             };
-            item.slot.setValue(readers_api.Result, result, execution);
+            item.slot.setOwnedValue(readers_api.Result, result, execution, item.allocator, freeReadRow);
         }
     }
 

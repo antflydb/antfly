@@ -290,8 +290,11 @@ pub const ResultSlot = struct {
     /// Executor-local physical subgroup identity. Zero means one physical
     /// batch for the coalesced group; capacity subdivision supplies distinct keys.
     physical_group_key: usize = 0,
+    release_allocator: ?std.mem.Allocator = null,
+    release_value: ?*const fn (std.mem.Allocator, *anyopaque) void = null,
 
     pub fn setValue(self: *ResultSlot, comptime T: type, value: T, execution: Execution) void {
+        self.discardValue();
         const output: *T = @ptrCast(@alignCast(self.output));
         output.* = value;
         self.execution = execution;
@@ -299,7 +302,31 @@ pub const ResultSlot = struct {
         self.completed = true;
     }
 
+    /// The slot owns this value until the joined caller takes its result.
+    /// A later member/admission fence can reject publication without leaking.
+    pub fn setOwnedValue(self: *ResultSlot, comptime T: type, value: T, execution: Execution, allocator: std.mem.Allocator, comptime release: *const fn (std.mem.Allocator, T) void) void {
+        self.setValue(T, value, execution);
+        const Cleanup = struct {
+            fn run(alloc: std.mem.Allocator, raw: *anyopaque) void {
+                const output: *T = @ptrCast(@alignCast(raw));
+                release(alloc, output.*);
+                output.* = undefined;
+            }
+        };
+        self.release_allocator = allocator;
+        self.release_value = Cleanup.run;
+    }
+
+    fn discardValue(self: *ResultSlot) void {
+        const release = self.release_value orelse return;
+        const allocator = self.release_allocator.?;
+        self.release_value = null;
+        self.release_allocator = null;
+        release(allocator, self.output);
+    }
+
     pub fn fail(self: *ResultSlot, err: anyerror) void {
+        self.discardValue();
         self.err = err;
         self.completed = true;
     }
@@ -329,6 +356,15 @@ pub const ItemControl = struct {
         if (self.cancellation.isCancelled() or
             (if (self.cancel_requested) |signal| signal.load(.acquire) else false))
             return error.Canceled;
+    }
+
+    pub fn checkPublication(self: ItemControl) !void {
+        // A late executor cancellation still joins and hands owned outputs to
+        // its caller for teardown. Original member deadlines/cancellation may
+        // reject publication after the physical call has completed.
+        var original = self;
+        original.cancel_requested = null;
+        try original.check();
     }
 };
 
@@ -366,6 +402,9 @@ pub const ExecutionAdmission = struct {
     context: *anyopaque,
     begin: *const fn (*anyopaque, std.Io, Key, usize, ExecutionControl) anyerror!*anyopaque,
     finish: *const fn (*anyopaque, *anyopaque) void,
+    /// Final owning-worker fence after the callback, before callers can take
+    /// results. A rejected grant must dispose all owned published values.
+    checkpoint: ?*const fn (*anyopaque, *anyopaque) anyerror!void = null,
 };
 
 const TicketState = enum { queued, executing, complete };
@@ -580,7 +619,7 @@ pub const Broker = struct {
 
     fn execute(self: *Broker, io: std.Io, key: Key, retained_bytes: usize, items: []const ExecuteItem, context: *anyopaque, callback: ExecuteFn) void {
         const admission = self.admission orelse {
-            callback(context, items);
+            self.executeAndFence(items, context, callback, null, null);
             return;
         };
         const handle = admission.begin(admission.context, io, key, retained_bytes, .{ .items = items }) catch |err| {
@@ -606,7 +645,24 @@ pub const Broker = struct {
             live[count] = item;
             count += 1;
         }
-        if (count != 0) callback(context, live[0..count]);
+        if (count != 0) self.executeAndFence(live[0..count], context, callback, admission, handle);
+    }
+
+    fn executeAndFence(_: *Broker, items: []const ExecuteItem, context: *anyopaque, callback: ExecuteFn, admission: ?ExecutionAdmission, handle: ?*anyopaque) void {
+        callback(context, items);
+        var admission_error: ?anyerror = null;
+        if (admission) |active| if (active.checkpoint) |check| {
+            check(active.context, handle.?) catch |err| {
+                admission_error = err;
+            };
+        };
+        for (items) |item| {
+            item.control.checkPublication() catch |err| {
+                item.slot.fail(err);
+                continue;
+            };
+            if (admission_error) |err| item.slot.fail(err);
+        }
     }
 
     pub fn deinit(self: *Broker) void {
@@ -1380,9 +1436,9 @@ test "microbatch array rechecks cancellation between bounded waves" {
     const results = try broker.submitBatchControlled(usize, usize, std.testing.io, std.testing.allocator, .{ .model = "reader", .task = .read, .resource_class = .gpu }, .{ .mode = .native, .preferred_items = 2, .max_items = 2 }, &shapes, &identities, null, Cancellation.fromAtomic(&executor.canceled), &inputs, &executor, Executor.run);
     defer std.testing.allocator.free(results);
     try std.testing.expectEqual(@as(usize, 1), executor.calls);
-    try std.testing.expectEqual(@as(usize, 1), results[0].result.value);
-    try std.testing.expectEqual(@as(usize, 2), results[1].result.value);
-    for (results[2..]) |result| try std.testing.expectEqual(error.Canceled, result.result.item_error.cause);
+    // Original cancellation after the first physical wave also fences its
+    // completed outputs; subsequent waves never execute.
+    for (results) |result| try std.testing.expectEqual(error.Canceled, result.result.item_error.cause);
 }
 
 test "microbatch broker flattens an existing request batch" {
@@ -1614,7 +1670,11 @@ test "microbatch cancellation after execution starts returns owned output" {
                     item.slot.fail(err);
                     continue;
                 };
-                item.slot.setValue([]u8, value, .native_batch);
+                item.slot.setOwnedValue([]u8, value, .native_batch, item.allocator, struct {
+                    fn release(alloc: std.mem.Allocator, bytes: []u8) void {
+                        alloc.free(bytes);
+                    }
+                }.release);
             }
         }
 
@@ -1822,4 +1882,87 @@ test "microbatch broker bypasses nonnative work and honors cancellation deadline
         TestExecutor.run,
     );
     try std.testing.expectEqual(error.DeadlineExceeded, foreign_clock_result.result.item_error.cause);
+}
+
+test "microbatch post execution fences dispose owned values and preserve healthy peers" {
+    const Value = struct {
+        bytes: []u8,
+        releases: *usize,
+        fn release(alloc: std.mem.Allocator, value: @This()) void {
+            value.releases.* += 1;
+            alloc.free(value.bytes);
+        }
+    };
+    const Executor = struct {
+        releases: *usize,
+        cancel_after: ?*std.atomic.Value(bool) = null,
+        fn run(raw: *anyopaque, items: []const ExecuteItem) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            for (items) |item| {
+                const bytes = item.allocator.dupe(u8, "owned") catch |err| {
+                    item.slot.fail(err);
+                    continue;
+                };
+                item.slot.setOwnedValue(Value, .{ .bytes = bytes, .releases = self.releases }, .native_batch, item.allocator, Value.release);
+            }
+            if (self.cancel_after) |signal| signal.store(true, .release);
+        }
+    };
+    const Provider = struct {
+        reject: bool = true,
+        finishes: usize = 0,
+        fn begin(raw: *anyopaque, _: std.Io, _: Key, _: usize, _: ExecutionControl) !*anyopaque {
+            return raw;
+        }
+        fn check(raw: *anyopaque, _: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.reject) return error.Forbidden;
+        }
+        fn finish(raw: *anyopaque, _: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.finishes += 1;
+        }
+    };
+    var releases: usize = 0;
+    var provider = Provider{};
+    var broker = Broker.initWithAdmission(std.testing.allocator, .{ .context = &provider, .begin = Provider.begin, .finish = Provider.finish, .checkpoint = Provider.check });
+    defer broker.deinit();
+    const payload: usize = 0;
+    var outputs: [2]Value = undefined;
+    var slots = [_]ResultSlot{ .{ .output = &outputs[0] }, .{ .output = &outputs[1] } };
+    var canceled = std.atomic.Value(bool).init(false);
+    const items = [_]ExecuteItem{
+        .{ .allocator = std.testing.allocator, .identity = .{}, .payload = &payload, .slot = &slots[0], .control = .{ .cancellation = Cancellation.fromAtomic(&canceled) } },
+        .{ .allocator = std.testing.allocator, .identity = .{}, .payload = &payload, .slot = &slots[1] },
+    };
+    var executor = Executor{ .releases = &releases };
+    const key = Key{ .model = "owned", .task = .read, .resource_class = .cpu };
+    broker.execute(std.testing.io, key, 0, &items, &executor, Executor.run);
+    try std.testing.expectEqual(@as(usize, 2), releases);
+    for (&slots) |*slot| {
+        try std.testing.expectEqual(error.Forbidden, slot.err.?);
+        slot.fail(error.Forbidden); // Cleanup stays single-release.
+    }
+    try std.testing.expectEqual(@as(usize, 2), releases);
+    try std.testing.expectEqual(@as(usize, 1), provider.finishes);
+    slots = .{ .{ .output = &outputs[0] }, .{ .output = &outputs[1] } };
+    provider.reject = false;
+    executor.cancel_after = &canceled;
+    broker.execute(std.testing.io, key, 0, &items, &executor, Executor.run);
+    try std.testing.expectEqual(@as(usize, 3), releases);
+    try std.testing.expectEqual(error.Canceled, slots[0].err.?);
+    try std.testing.expect(slots[1].err == null);
+    Value.release(std.testing.allocator, outputs[1]);
+    try std.testing.expectEqual(@as(usize, 4), releases);
+    try std.testing.expectEqual(@as(usize, 2), provider.finishes);
+    // The unscheduled path uses the same original-member publication fence.
+    slots = .{ .{ .output = &outputs[0] }, .{ .output = &outputs[1] } };
+    canceled.store(false, .release);
+    broker.admission = null;
+    broker.execute(std.testing.io, key, 0, &items, &executor, Executor.run);
+    try std.testing.expectEqual(@as(usize, 5), releases);
+    try std.testing.expectEqual(error.Canceled, slots[0].err.?);
+    try std.testing.expect(slots[1].err == null);
+    Value.release(std.testing.allocator, outputs[1]);
+    try std.testing.expectEqual(@as(usize, 6), releases);
 }

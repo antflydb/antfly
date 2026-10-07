@@ -1,0 +1,28 @@
+{
+  "pid": 64095,
+  "state": "terminal",
+  "started": 1791404629.138269,
+  "argv": [
+    "/Users/ajroetker/bin/zig-0.17.0/zig",
+    "test",
+    "-Osafe",
+    "--dep",
+    "antfly_runtime_abi",
+    "--dep",
+    "inference_linalg",
+    "-Mroot=zig/pkg/inference/src/server/runnable_execution.zig",
+    "-Mantfly_runtime_abi=zig/lib/runtime/src/root.zig",
+    "-Minference_linalg=zig/lib/linalg/src/mod.zig",
+    "--cache-dir",
+    "/private/tmp/antfly-broker-owner-native-cache"
+  ],
+  "source_sha256": {
+    "zig/pkg/inference/src/server/executor_microbatch.zig": "ca370a708a5dda44185383b207e6925bfe19828c4c977e5d98c685e093f46334",
+    "zig/pkg/inference/src/server/server.zig": "cfde61609bc895bd65a2a7105e72c612b75755fea43fbd0df8861c98ea8a8ad9",
+    "zig/pkg/inference/src/server/tensor_microbatch.zig": "9fefb59e53f169f8125cf36a0ee0d360906909238994246575b6fd8e42928acf",
+    "zig/pkg/inference/src/pipelines/embedding.zig": "5184b2ae45188af4b690d9643a8464c715381551f9110fb2d1310b21858d1a59"
+  },
+  "compiler_pid": 64114,
+  "exit_code": 1,
+  "finished": 1791404636.300338
+}

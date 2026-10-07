@@ -1207,3 +1207,7 @@ Contended model gates now park the synchronous borrowed provider grant and reacq
 ### Nested admitted inference wait scopes (2026-10-07, focused gates passed)
 
 An independently admitted child scope can run checkpoints and resource waits while its caller remains parked, then restore that caller's suspended state. Resource waits use guarded checkpoints to avoid recursive yields through collective/member cancellation checks. Combined host/wire and real-owner gates pass all 18 tests on native macOS and pinned Nix/glibc Linux; [receipts](qualification/workload-pooling/receipts/2026-10-07/inference-nested-waits/README.md) record both runner summaries and five source hashes. Production broker admission, numerical/workload fairness, worker physical waits and consolidated API/production/default qualification remain pending.
+
+### Broker result publication ownership (native focused gate passed)
+
+Owned result slots now dispose allocated values exactly once when final member or admission fences reject publication. Original request cancellation also fences completed physical waves, while late I/O executor cancellation retains joined caller cleanup. All 23 native broker/adapter tests pass; [receipt](qualification/workload-pooling/receipts/2026-10-07/broker-result-ownership/README.md) preserves the initial expectation failure and final passing output. Production owning producers were converted but are not compiled by this focused gate; production/numerical and GNU qualification remain required.
