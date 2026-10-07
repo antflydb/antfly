@@ -1780,6 +1780,11 @@ test "capi SQL array mutations retain native cells and returning provenance" {
         .{ .sql = "INSERT INTO items (_id,a,j,n) SELECT 'p','[-1:1]={9007199254740993,NULL,2}',ARRAY['null'::jsonb,NULL],1 RETURNING a,j", .lower = -1, .first = "9007199254740993" },
         .{ .sql = "INSERT INTO items (_id,a,j,n) SELECT 'q',$1,ARRAY['null'::jsonb,NULL],1 RETURNING a,j", .parameters = &.{.{ .string = "[-1:1]={9007199254740993,NULL,2}" }}, .lower = -1, .first = "9007199254740993" },
         .{ .sql = "INSERT INTO items (_id,a,j,n) SELECT 'r',ARRAY[1::smallint,NULL],ARRAY['null'::jsonb,NULL],1 RETURNING a,j", .lower = 1, .first = "1" },
+        .{ .sql = "INSERT INTO items (_id,a,j,n) VALUES ('a',ARRAY[0],ARRAY[NULL::jsonb],9) ON CONFLICT (_id) DO UPDATE SET n=excluded.n RETURNING a,j", .lower = -1, .first = "9007199254740993" },
+        .{ .sql = "INSERT INTO items (_id,a,j,n) VALUES ('a','[3:4]={9223372036854775807,NULL}',ARRAY['null'::jsonb,NULL],9) ON CONFLICT (_id) DO UPDATE SET a=excluded.a,j=excluded.j WHERE items.a='[-1:1]={9007199254740993,NULL,2}'::bigint[] RETURNING a,j", .lower = 3, .first = "9223372036854775807" },
+        .{ .sql = "INSERT INTO items (_id,n) VALUES ('a',9) ON CONFLICT (_id) DO UPDATE SET a='[-1:1]={9007199254740993,NULL,2}' RETURNING a,j", .lower = -1, .first = "9007199254740993" },
+        .{ .sql = "INSERT INTO items (_id,n) VALUES ('a',9) ON CONFLICT (_id) DO UPDATE SET a=ARRAY[1::smallint,NULL] RETURNING a,j", .lower = 1, .first = "1" },
+        .{ .sql = "INSERT INTO items (_id,n) VALUES ('a',9) ON CONFLICT (_id) DO UPDATE SET a=$1 RETURNING a,j", .parameters = &.{.{ .string = "[-1:1]={9007199254740993,NULL,2}" }}, .lower = -1, .first = "9007199254740993" },
         .{ .sql = "UPDATE items SET a=NULL WHERE _id='a' RETURNING a,j", .whole_null = true },
         .{ .sql = "SELECT a,j FROM items WHERE _id='a'", .whole_null = true },
     }) |case| {
@@ -1807,16 +1812,18 @@ test "capi SQL array mutations retain native cells and returning provenance" {
         try std.testing.expect(!json.get("sql_nulls").?.array.items[0].bool);
         try std.testing.expect(json.get("sql_nulls").?.array.items[1].bool);
     }
-    for ([_]struct { sql: []const u8, state: []const u8 }{
+    for ([_]struct { sql: []const u8, state: []const u8, code: capi.ErrorCode = .invalid_argument }{
         .{ .sql = "UPDATE items SET a=ARRAY[] WHERE _id='a'", .state = "42P18" },
         .{ .sql = "UPDATE items SET a=ARRAY['1'] WHERE _id='a'", .state = "42804" },
         .{ .sql = "UPDATE items SET a='{1,2}'::text WHERE _id='a'", .state = "42804" },
+        .{ .sql = "INSERT INTO items (_id,n) VALUES ('a',9) ON CONFLICT (_id) DO UPDATE SET a=(SELECT a FROM items WHERE _id='q') RETURNING a,j", .state = "0A000", .code = .unsupported },
+        .{ .sql = "INSERT INTO items (_id,n) VALUES ('a',9) ON CONFLICT (_id) DO UPDATE SET a=coalesce((SELECT a FROM items WHERE _id='q'),excluded.a) RETURNING a,j", .state = "0A000", .code = .unsupported },
     }) |case| {
         const request = try std.json.Stringify.valueAlloc(a, .{ .statement = case.sql }, .{});
         defer a.free(request);
         var out: capi.Buffer = .{};
         defer freeRawBuffer(out.ptr, out.len);
-        try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_db_sql_json(handle, .fromSlice("items"), .fromSlice(request), &out));
+        try std.testing.expectEqual(case.code, antfly_db_sql_json(handle, .fromSlice("items"), .fromSlice(request), &out));
         const parsed = try std.json.parseFromSlice(std.json.Value, a, out.ptr.?[0..out.len], .{});
         defer parsed.deinit();
         try std.testing.expectEqualStrings(case.state, parsed.value.object.get("error").?.object.get("code").?.string);

@@ -523,10 +523,10 @@ fn bindImpl(allocator: std.mem.Allocator, backend: catalog.Backend, compiled: *c
         result.parameter_types = bound.parameter_types;
     };
     if (compiled.statement == .insert) if (compiled.statement.insert.conflict) |clause| {
-        const capture_types = try allocator.alloc(ast.ColumnType, clause.capture_count);
+        const capture_types = try allocator.alloc(@import("scalar.zig").Type, clause.capture_count);
         if (clause.capture_count != 0) {
             const source = result.insert_source orelse return error.InvalidSqlBackendResponse;
-            for (source.columns[compiled.statement.insert.columns.len..], capture_types) |column, *kind| kind.* = column.type;
+            for (source.columns[compiled.statement.insert.columns.len..], capture_types) |column, *descriptor| descriptor.* = .{ .kind = column.type, .element_type = column.element_type };
         }
         result.conflict = try @import("conflict.zig").bind(allocator, backend, table, projection_name, target_aliased, clause, parameters, capture_types);
     };

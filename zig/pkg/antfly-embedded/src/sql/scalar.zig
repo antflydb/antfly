@@ -340,6 +340,15 @@ pub fn parameterElementType(descriptor: Type) !arrays.ElementType {
     return descriptor.element_type orelse try arrayElementType(descriptor.kind orelse return error.UnknownSqlParameterType);
 }
 
+/// Only an unresolved root string literal inherits the target array domain.
+/// Explicit text expressions retain their identity and require an SQL cast.
+pub fn assignmentExpression(alloc: Allocator, expression: *const ast.Scalar, expected: Type) !*const ast.Scalar {
+    if (expected.kind != .array or expression.* != .literal or expression.literal != .string) return expression;
+    const cast = try alloc.create(ast.Scalar);
+    cast.* = .{ .cast = .{ .operand = expression, .type = .array, .element_type = expected.element_type orelse return error.SqlAssignmentTypeMismatch } };
+    return cast;
+}
+
 /// Shared assignment coercion for typed source cursors and mutation cells.
 /// Identity borrows the source; converted cells belong to alloc, and dimension
 /// metadata borrows the pinned source until the caller's ownership boundary.

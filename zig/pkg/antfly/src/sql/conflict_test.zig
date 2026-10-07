@@ -67,6 +67,7 @@ const Fixture = struct {
     scalar_error: bool = false,
     scalar_two_rows: bool = false,
     captures: usize = 0,
+    arrays: bool = false,
     capture_states: [8]Cursor = undefined,
     capture_cursors: [8]catalog.Cursor = undefined,
     fn owners(ptr: *anyopaque, alloc: Allocator, _: catalog.Table, columns: []const []const u8, _: []const catalog.ConflictExpression, _: []const catalog.Condition, input: []const catalog.Mutation) ![]const catalog.ConflictOwner {
@@ -84,8 +85,15 @@ const Fixture = struct {
     fn backend(self: *Fixture) catalog.Backend {
         return .{ .ptr = self, .predicate_only_mutations = true, .atomic_statement_read_set = self.guarded, .coordinated_point_reads = self.guarded, .dynamic_statement_read_set = self.dynamic, .vtable = &.{ .resolve = resolve, .scan = scan, .open_scan = open, .open_statement = openStatement, .mutate = mutate, .mutate_prepared = mutate, .prepare_mutations = prepare, .checkpoint = checkpoint } };
     }
-    fn resolve(_: *anyopaque, _: Allocator, _: ast.Name, action: catalog.Action) !catalog.Table {
+    fn resolve(ptr: *anyopaque, _: Allocator, _: ast.Name, action: catalog.Action) !catalog.Table {
+        const self: *Fixture = @ptrCast(@alignCast(ptr));
         try std.testing.expect(action == .read_write or action == .read);
+        if (self.arrays) return .{ .id = 1, .physical_name = "items", .schema_version = 7, .columns = &.{
+            .{ .name = "n", .path = "n", .type = .integer, .nullable = false },
+            .{ .name = "g", .path = "g", .type = .integer, .generated = true },
+            .{ .name = "a", .path = "a", .type = .array, .element_type = .int64 },
+            .{ .name = "j", .path = "j", .type = .array, .element_type = .jsonb },
+        } };
         return .{ .id = 1, .physical_name = "items", .schema_version = 7, .columns = &.{
             .{ .name = "n", .path = "n", .type = .integer, .nullable = false },
             .{ .name = "g", .path = "g", .type = .integer, .generated = true },
@@ -109,6 +117,7 @@ const Fixture = struct {
         empty_pages: usize = 0,
         pages_seen: usize = 0,
         two_rows: bool = false,
+        arrays: bool = false,
         fn next(ptr: *anyopaque, alloc: Allocator, _: u32) !catalog.Page {
             const self: *Cursor = @ptrCast(@alignCast(ptr));
             if (!std.mem.startsWith(u8, self.key, "existing")) return .{ .rows = &.{} };
@@ -123,6 +132,18 @@ const Fixture = struct {
             try object.put(alloc, "g", .{ .integer = 8 });
             const rows = try alloc.alloc(catalog.Row, if (self.two_rows) 2 else 1);
             rows[0] = .{ .id = self.key, .version = 9, .value = .{ .object = object } };
+            if (self.arrays) {
+                const local = @import("antfly_local_sources");
+                const integers = try local.sql_array_text.decodeLeaky(alloc, .int64, "[-1:1]={9007199254740993,NULL,2}", .{});
+                const json = try local.sql_array_text.decodeLeaky(alloc, .jsonb, "{\"null\",NULL}", .{});
+                try object.put(alloc, "a", try local.sql_array_wire.toJsonLeaky(alloc, integers.value, .{}));
+                try object.put(alloc, "j", try local.sql_array_wire.toJsonLeaky(alloc, json.value, .{}));
+                rows[0].value = .{ .object = object };
+                var fixture: Fixture = .{ .arrays = true };
+                const projection = try local.sql_document_row.Projection.init(alloc, try resolve(&fixture, alloc, .{ .table = "items" }, .read), &.{ "n", "g", "a", "j" });
+                defer projection.deinit(alloc);
+                rows[0] = try projection.adaptBorrowed(alloc, try projection.pageLayout(alloc), rows[0]);
+            }
             if (self.two_rows) rows[1] = rows[0];
             return .{ .rows = rows, .after = token };
         }
@@ -138,7 +159,7 @@ const Fixture = struct {
         if (request.primary_key == null and self.scalar_error) return error.TestScalarReadFailure;
         const key = request.primary_key orelse if (self.dynamic) "existing" else return error.UnexpectedFullScan;
         const cursor = try alloc.create(Cursor);
-        cursor.* = .{ .allocator = alloc, .key = key, .page_token_bytes = self.page_token_bytes, .empty_pages = self.empty_pages, .two_rows = request.primary_key == null and self.scalar_two_rows };
+        cursor.* = .{ .allocator = alloc, .key = key, .page_token_bytes = self.page_token_bytes, .empty_pages = self.empty_pages, .two_rows = request.primary_key == null and self.scalar_two_rows, .arrays = self.arrays };
         return .{ .ptr = cursor, .next = Cursor.next, .close = Cursor.closeOwned };
     }
     fn openStatement(ptr: *anyopaque, _: Allocator, scans: []const catalog.StatementScan) !catalog.StatementRead {
@@ -147,7 +168,7 @@ const Fixture = struct {
         if (scans.len > self.capture_cursors.len) return error.SqlProgramLimitExceeded;
         self.captures += 1;
         for (scans, self.capture_states[0..scans.len], self.capture_cursors[0..scans.len]) |scan_request, *state, *cursor| {
-            state.* = .{ .key = scan_request.request.primary_key orelse "existing" };
+            state.* = .{ .key = scan_request.request.primary_key orelse "existing", .arrays = self.arrays };
             cursor.* = .{ .ptr = state, .next = Cursor.next, .close = Cursor.close };
         }
         return .{ .ptr = self, .cursors = self.capture_cursors[0..scans.len], .close = Cursor.close };
@@ -288,6 +309,7 @@ test "SQL conflict assignment subqueries fail closed before owner-side masked Ap
         "INSERT INTO items (_id,n) VALUES ('existing',3) ON CONFLICT (_id) DO UPDATE SET n=CASE WHEN TRUE THEN (SELECT n FROM items WHERE _id='existing') ELSE 0 END",
         "INSERT INTO items (_id,n) VALUES ('existing',3) ON CONFLICT (_id) DO UPDATE SET n=COALESCE((SELECT n FROM items WHERE _id='existing'), n)",
         "INSERT INTO items (_id,n) VALUES ('existing',3) ON CONFLICT (_id) DO UPDATE SET n=CASE WHEN EXISTS(SELECT n FROM items WHERE _id='existing') THEN 1 ELSE 0 END",
+        "INSERT INTO items (_id,n) VALUES ('existing',3) ON CONFLICT (_id) DO UPDATE SET a=coalesce((SELECT a FROM items WHERE _id='existing'),excluded.a) RETURNING a,j",
     }) |sql| try std.testing.expectError(error.UnsupportedSqlShape, compiler.compile(std.testing.allocator, sql, .{}));
 }
 
@@ -301,6 +323,38 @@ test "SQL original conflict scalar cases require a deferred owner-side read" {
         var compiled = try compiler.compile(std.testing.allocator, sql, .{});
         defer compiled.deinit();
         try std.testing.expectEqual(@as(usize, 1), compiled.statement.insert.conflict.?.deferred_count);
+    }
+}
+
+test "SQL coordinated conflict scalar sources preserve precise arrays and native fences" {
+    const local = @import("antfly_local_sources");
+    for ([_]struct { sql: []const u8, whole_null: bool = false }{
+        .{ .sql = "INSERT INTO items (_id,n) VALUES ('existing',3) ON CONFLICT (_id) DO UPDATE SET a=(SELECT a FROM items WHERE _id='existing') RETURNING a,j" },
+        .{ .sql = "INSERT INTO items (_id,n) VALUES ('existing',3) ON CONFLICT (_id) DO UPDATE SET a=(SELECT a FROM items WHERE _id='absent') RETURNING a,j", .whole_null = true },
+    }) |case| {
+        var compiled = try compiler.compile(std.testing.allocator, case.sql, .{});
+        defer compiled.deinit();
+        var fixture: Fixture = .{ .guarded = true, .dynamic = true, .arrays = true };
+        var result = try runtime.execute(std.testing.allocator, fixture.backend(), &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), fixture.commits);
+        try std.testing.expectEqual(@as(usize, 1), fixture.affected);
+        try std.testing.expectEqual(@as(i64, 4), fixture.seen_n);
+        try std.testing.expectEqual(@as(usize, 1), result.output.rows.len);
+        if (case.whole_null) {
+            try std.testing.expect(result.output.rows[0][0] == .null);
+            try std.testing.expect(result.output.sql_nulls.?[0][0]);
+        } else {
+            var integers = try local.sql_array_wire.decode(std.testing.allocator, .int64, result.output.rows[0][0], .{});
+            defer integers.deinit();
+            try std.testing.expectEqual(@as(i32, -1), integers.value.dimensions[0].lower);
+            try std.testing.expectEqual(@as(i64, 9007199254740993), integers.value.elements[0].value.integer);
+            try std.testing.expect(integers.value.elements[1].sql_null);
+        }
+        var json = try local.sql_array_wire.decode(std.testing.allocator, .jsonb, result.output.rows[0][1], .{});
+        defer json.deinit();
+        try std.testing.expect(!json.value.elements[0].sql_null);
+        try std.testing.expect(json.value.elements[1].sql_null);
     }
 }
 

@@ -227,8 +227,19 @@ coercions use the shared bounded cast kernel, distinguishing numeric-array
 coercions and builtin-to-text assignments from explicit-only text-to-numeric
 casts. INSERT SELECT carries target domains through catalog-only source
 inference, retaining bounds and SQL NULL elements at the storage boundary.
-SQL DDL, conflict/joined/MERGE typed-array paths and ordered/constraint index
-keys still need end-to-end activation gates.
+Conflict writes now retain declared element identities for old/excluded cells
+and captured-output descriptors, including direct deferred typed-array queries.
+Replacement images use the same typed storage boundary and preserve omitted fields. Batched
+decision evaluation owns old-row payloads once, shares qualified aliases, and
+retains only field-presence metadata rather than another complete preimage.
+Native conflict sequences, coordinated-read backend contracts, independent
+PostgreSQL observers and exhaustive allocation-failure/page-retirement checks
+cover these contracts. Standalone conflict subqueries retain the existing
+capability rejection until atomic range-read protection is activated. Nested
+CASE/COALESCE conflict subqueries still require owner-masked Apply activation;
+they are not hoisted into eager INSERT-source evaluation. SQL DDL,
+joined/MERGE typed-array paths and ordered/constraint index keys still need
+end-to-end activation gates.
 Original case dispositions remain unchanged.
 
 Source commit: `79644dfa1605e8da0f486d021d1c1393577d6265`.

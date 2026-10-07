@@ -635,9 +635,7 @@ const Builder = struct {
 
     fn assignmentNode(self: *Builder, expression: ?*const ast.Scalar, literal: ast.Value, column: catalog.Column) !*const ast.Scalar {
         const node_ = expression orelse try self.node(.{ .literal = literal });
-        if (column.type == .array and node_.* == .literal and node_.literal == .string)
-            return self.node(.{ .cast = .{ .operand = node_, .type = .array, .element_type = column.element_type orelse return error.SqlAssignmentTypeMismatch } });
-        return node_;
+        return scalar.assignmentExpression(self.alloc, node_, .{ .kind = column.type, .element_type = column.element_type });
     }
 
     fn inferAssignment(self: *Builder, expression: *const ast.Scalar, column: catalog.Column) !bool {

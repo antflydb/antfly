@@ -126,6 +126,20 @@ pub fn projectValue(alloc: std.mem.Allocator, table: catalog.Table, id: []const 
     return (try Projection.init(alloc, table, fields)).projectValue(alloc, id, version, root);
 }
 
+/// Decode a declared storage cell once while its native page or prepared
+/// mutation remains pinned. Already typed cells stay borrowed; array payloads
+/// never pass through the scalar JSON placeholder coercion path.
+pub fn declaredCell(alloc: std.mem.Allocator, column: catalog.Column, raw: catalog.Row.Cell) !catalog.Row.Cell {
+    if (column.type == .array and !raw.sql_null and raw.array == null) {
+        const kind = column.element_type orelse return error.InvalidSqlBackendResponse;
+        const decoded = try @import("array_wire.zig").decodeBorrowed(alloc, kind, raw.value, .{});
+        const array = try alloc.create(@import("array_value.zig").Value);
+        array.* = decoded.value;
+        return catalog.Row.Cell.typedArray(array);
+    }
+    return @import("describe.zig").coerceDatum(alloc, raw, column.type, column.element_type);
+}
+
 /// Compile once per scan, not once per row. Binding is O(schema + projection)
 /// and decoding O(projected fields + selected JSON bytes), independent of the
 /// width of the declared schema. The scan arena owns all names and slots.
@@ -197,13 +211,7 @@ pub const Projection = struct {
             present.* = try row.hasField(column.path);
             const raw = try row.cell(column.path);
             if (raw.sql_null and !column.nullable) return error.InvalidSqlBackendResponse;
-            if (column.type == .array and !raw.sql_null and raw.array == null) {
-                const kind = column.element_type orelse return error.InvalidSqlBackendResponse;
-                const decoded = try @import("array_wire.zig").decodeBorrowed(alloc, kind, raw.value, .{});
-                const array = try alloc.create(@import("array_value.zig").Value);
-                array.* = decoded.value;
-                cell.* = catalog.Row.Cell.typedArray(array);
-            } else cell.* = try @import("describe.zig").coerceDatum(alloc, raw, column.type, column.element_type);
+            cell.* = try declaredCell(alloc, column, raw);
         }
         var result = row;
         result.value = .null;

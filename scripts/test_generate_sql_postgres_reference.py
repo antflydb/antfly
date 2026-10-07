@@ -176,6 +176,61 @@ class PostgresReferenceTest(unittest.TestCase):
                     self.assertEqual([None, None], json_array["values"])
                     self.assertEqual([False, True], json_array["sql_nulls"])
 
+    def test_array_conflict_mutations_preserve_typed_preimages_and_excluded(self):
+        with self.db.transaction(force_rollback=True):
+            self.db.execute(
+                "CREATE TEMP TABLE items(_id text PRIMARY KEY,a bigint[],j jsonb[],n bigint)"
+            )
+            self.db.execute(
+                "INSERT INTO items VALUES ('a','[-1:1]={9007199254740993,NULL,2}',ARRAY['null'::jsonb,NULL],1)"
+            )
+            self.db.execute("INSERT INTO items SELECT 'q',a,j,n FROM items")
+            for sql, bounds, first in (
+                (
+                    "INSERT INTO items (_id,a,j,n) VALUES ('a',ARRAY[0],ARRAY[NULL::jsonb],9) ON CONFLICT (_id) DO UPDATE SET n=excluded.n RETURNING a,j",
+                    -1,
+                    9007199254740993,
+                ),
+                (
+                    "INSERT INTO items (_id,a,j,n) VALUES ('a','[3:4]={9223372036854775807,NULL}',ARRAY['null'::jsonb,NULL],9) ON CONFLICT (_id) DO UPDATE SET a=excluded.a,j=excluded.j WHERE items.a='[-1:1]={9007199254740993,NULL,2}'::bigint[] RETURNING a,j",
+                    3,
+                    9223372036854775807,
+                ),
+                (
+                    "INSERT INTO items (_id,n) VALUES ('a',9) ON CONFLICT (_id) DO UPDATE SET a='[-1:1]={9007199254740993,NULL,2}' RETURNING a,j",
+                    -1,
+                    9007199254740993,
+                ),
+                (
+                    "INSERT INTO items (_id,n) VALUES ('a',9) ON CONFLICT (_id) DO UPDATE SET a=ARRAY[1::smallint,NULL] RETURNING a,j",
+                    1,
+                    1,
+                ),
+                (
+                    "INSERT INTO items (_id,n) VALUES ('a',9) ON CONFLICT (_id) DO UPDATE SET a=(SELECT a FROM items WHERE _id='q') RETURNING a,j",
+                    -1,
+                    9007199254740993,
+                ),
+                (
+                    "INSERT INTO items (_id,n) VALUES ('a',9) ON CONFLICT (_id) DO UPDATE SET a=coalesce((SELECT a FROM items WHERE _id='q'),excluded.a) RETURNING a,j",
+                    -1,
+                    9007199254740993,
+                ),
+            ):
+                with self.subTest(sql=sql):
+                    row = self.db.execute(sql).fetchone()
+                    self.assertEqual(first, row[0][0])
+                    self.assertIsNone(row[0][1])
+                    observed = self.db.execute(
+                        "SELECT array_lower(a,1),j[1] IS NULL,j[2] IS NULL FROM items WHERE _id='a'"
+                    ).fetchone()
+                    self.assertEqual((bounds, False, True), observed)
+            row = self.db.execute(
+                "INSERT INTO items (_id,n) VALUES ('a',9) ON CONFLICT (_id) DO UPDATE SET a=(SELECT a FROM items WHERE _id='absent') RETURNING a,j"
+            ).fetchone()
+            self.assertIsNone(row[0])
+            self.assertEqual([None, None], row[1])
+
     def test_builtin_array_assignment_matrix_and_parameter_contexts(self):
         import psycopg
 
