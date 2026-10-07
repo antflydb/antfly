@@ -5079,12 +5079,23 @@ pub fn writeMergedInvertedSectionSlotsWithDeletes(
 ) !void {
     if (sections.len != doc_counts.len) return error.InvalidData;
     if (deleted_docs) |deleted| if (deleted.len != sections.len) return error.InvalidData;
-    const maps = try alloc.alloc(RankDocMap, sections.len);
+    const maps = try prepareRankDocMaps(alloc, doc_counts, deleted_docs);
+    defer deinitRankDocMaps(alloc, maps);
+    const last = if (maps.len > 0) maps[maps.len - 1] else RankDocMap{ .len = 0, .offset = 0 };
+    const count = last.offset + (last.len - @as(u32, @intCast(if (last.deleted) |d| d.cardinality() else 0)));
+    try writeMergedInvertedSectionSlotsWithRankMaps(alloc, sink, sections, doc_counts, maps, count, config);
+}
+
+pub fn deinitRankDocMaps(alloc: Allocator, maps: []RankDocMap) void {
+    for (maps) |*map| if (map.rank_index) |*rank| rank.deinit();
+    alloc.free(maps);
+}
+
+pub fn prepareRankDocMaps(alloc: Allocator, doc_counts: []const u32, deleted_docs: ?[]const ?roaring.RoaringBitmap) ![]RankDocMap {
+    if (deleted_docs) |deleted| if (deleted.len != doc_counts.len) return error.InvalidData;
+    const maps = try alloc.alloc(RankDocMap, doc_counts.len);
     for (maps) |*map| map.* = .{ .len = 0, .offset = 0 };
-    defer {
-        for (maps) |*map| if (map.rank_index) |*rank| rank.deinit();
-        alloc.free(maps);
-    }
+    errdefer deinitRankDocMaps(alloc, maps);
     var offset: u32 = 0;
     for (doc_counts, maps, 0..) |count, *map, i| {
         const deleted = if (deleted_docs) |d| d[i] else null;
@@ -5097,7 +5108,11 @@ pub fn writeMergedInvertedSectionSlotsWithDeletes(
         if (deleted) |d| map.rank_index = try roaring.FrozenRankIndex.init(alloc, d);
         offset = try std.math.add(u32, offset, count - @as(u32, @intCast(cardinality)));
     }
-    try writeMappedInvertedSection(alloc, sink, sections, doc_counts, maps, offset, config);
+    return maps;
+}
+
+pub fn writeMergedInvertedSectionSlotsWithRankMaps(alloc: Allocator, sink: anytype, sections: anytype, doc_counts: []const u32, maps: []const RankDocMap, doc_count: u32, config: IndexConfig) !void {
+    try writeMappedInvertedSection(alloc, sink, sections, doc_counts, maps, doc_count, config);
 }
 
 const StreamedNorms = struct { len: usize };
@@ -5160,6 +5175,7 @@ pub const FileDocMap = struct {
     len: u32,
     ids: @import("../segment_source.zig").View,
     records: @import("../segment_source.zig").View,
+    monotonic: bool = true,
 };
 const FileNormStream = struct {
     len: usize,
@@ -5641,7 +5657,11 @@ fn MergedPostingStream(comptime Maps: type) type {
 }
 
 fn monotonicDocMaps(maps: anytype) bool {
-    if (std.meta.Elem(@TypeOf(maps)) == AffineDocMap or std.meta.Elem(@TypeOf(maps)) == RankDocMap or std.meta.Elem(@TypeOf(maps)) == FileDocMap) return true;
+    if (std.meta.Elem(@TypeOf(maps)) == FileDocMap) {
+        for (maps) |map| if (!map.monotonic) return false;
+        return true;
+    }
+    if (std.meta.Elem(@TypeOf(maps)) == AffineDocMap or std.meta.Elem(@TypeOf(maps)) == RankDocMap) return true;
     for (maps) |map| {
         var previous: ?u32 = null;
         for (map) |id| {
