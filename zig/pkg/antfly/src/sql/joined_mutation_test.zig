@@ -57,6 +57,8 @@ const Backend = struct {
     generated_mode: bool = false,
     deny_source: bool = false,
     returning_mode: bool = false,
+    cold_source: bool = false,
+    cold_width: usize = 0,
     inserting: bool = false,
     row_count: usize = 2,
     rows_read: usize = 0,
@@ -68,7 +70,7 @@ const Backend = struct {
     writes: usize = 0,
     states: [8]Cursor = undefined,
     cursors: [8]catalog.Cursor = undefined,
-    fn resolve(ptr: *anyopaque, _: std.mem.Allocator, name: ast.Name, action: catalog.Action) !catalog.Table {
+    fn resolve(ptr: *anyopaque, alloc: std.mem.Allocator, name: ast.Name, action: catalog.Action) !catalog.Table {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         if (std.mem.eql(u8, name.table, "target")) {
             try std.testing.expect(action == .read_write);
@@ -77,7 +79,17 @@ const Backend = struct {
         }
         try std.testing.expectEqual(catalog.Action.read, action);
         if (self.deny_source) return error.Forbidden;
-        return .{ .id = 2, .physical_name = "source", .schema_version = 1, .columns = &.{ .{ .name = "id", .path = "id", .type = .string }, .{ .name = "delta", .path = "delta", .type = .integer } } };
+        if (self.cold_width != 0) {
+            const columns = try alloc.alloc(catalog.Column, self.cold_width + 2);
+            columns[0] = .{ .name = "id", .path = "id", .type = .string };
+            columns[1] = .{ .name = "delta", .path = "delta", .type = .integer };
+            for (columns[2..], 0..) |*column, index| {
+                const field = try std.fmt.allocPrint(alloc, "cold{d}", .{index});
+                column.* = .{ .name = field, .path = field, .type = .string };
+            }
+            return .{ .id = 2, .physical_name = "source", .schema_version = 1, .columns = columns };
+        }
+        return .{ .id = 2, .physical_name = "source", .schema_version = 1, .columns = if (self.cold_source) &.{ .{ .name = "id", .path = "id", .type = .string }, .{ .name = "delta", .path = "delta", .type = .integer }, .{ .name = "cold", .path = "cold", .type = .string } } else &.{ .{ .name = "id", .path = "id", .type = .string }, .{ .name = "delta", .path = "delta", .type = .integer } } };
     }
     fn open(ptr: *anyopaque, _: std.mem.Allocator, scans: []const catalog.StatementScan) !catalog.StatementRead {
         const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -85,6 +97,7 @@ const Backend = struct {
         self.captures += 1;
         self.last_scan_count = scans.len;
         for (scans, self.states[0..scans.len], self.cursors[0..scans.len]) |scan_, *state, *cursor| {
+            if (self.cold_source) for (scan_.request.fields) |field| try std.testing.expect(!std.mem.startsWith(u8, field, "cold"));
             state.* = .{ .owner = self, .request = scan_ };
             cursor.* = .{ .ptr = state, .next = Cursor.next, .close = undefined };
             if (scan_.table.id == 1 and !self.returning_mode) {
@@ -463,6 +476,75 @@ test "SQL scalar cardinality reads two rows from an unestimated million-row sour
     try std.testing.expectEqual(@as(usize, 1), backend.captures);
     try std.testing.expectEqual(@as(usize, 1), backend.closes);
     try std.testing.expectEqual(@as(usize, 0), backend.commits);
+}
+
+test "SQL sorted scalar producers execute only selected parents and retain cold scan pruning" {
+    const cases = [_]struct { sql: []const u8, calls: usize, rows: usize, scans: usize = 512 }{
+        .{ .sql = "SELECT (SELECT ai_probability(o.id,'Refund?','local')) FROM source o ORDER BY o.delta DESC LIMIT $1 OFFSET $2", .calls = 2, .rows = 2 },
+        .{ .sql = "SELECT (SELECT ai_probability(o.id,'Refund?','local')) FROM source o ORDER BY o.delta DESC LIMIT 0 OFFSET $2", .calls = 0, .rows = 0, .scans = 0 },
+        .{ .sql = "SELECT (SELECT ai_probability(o.id,'Refund?','local')) AS p FROM source o ORDER BY p LIMIT $1 OFFSET $2", .calls = 512, .rows = 2 },
+        .{ .sql = "SELECT o.delta AS rank,(SELECT ai_probability(o.id,'Refund?','local')) FROM source o ORDER BY rank DESC LIMIT $1 OFFSET $2", .calls = 2, .rows = 2 },
+        .{ .sql = "SELECT o.delta,(SELECT ai_probability(o.id,'Refund?','local')) FROM source o ORDER BY 1 DESC LIMIT $1 OFFSET $2", .calls = 2, .rows = 2 },
+        .{ .sql = "SELECT ai_probability(o.id,'Sort?','local') AS rank,(SELECT ai_probability(o.id,'Output?','local')) FROM source o ORDER BY rank DESC LIMIT $1 OFFSET $2", .calls = 514, .rows = 2 },
+        .{ .sql = "SELECT ai_probability(o.id,'Sort?','local') AS rank,(SELECT ai_probability(o.id,'Output?','local')) FROM source o WHERE o.delta>5000 ORDER BY rank DESC LIMIT $1 OFFSET $2", .calls = 14, .rows = 2 },
+        .{ .sql = "SELECT (SELECT ai_probability(o.id,'Sort?','local')) AS rank,(SELECT ai_probability(o.id,'Output?','local')) FROM source o ORDER BY rank DESC LIMIT $1 OFFSET $2", .calls = 514, .rows = 2 },
+        .{ .sql = "SELECT (SELECT ai_probability(o.id,'Output?','local')) FROM source o ORDER BY (SELECT ai_probability(o.id,'Sort?','local')) DESC LIMIT $1 OFFSET $2", .calls = 514, .rows = 2 },
+        .{ .sql = "SELECT (SELECT ai_probability(o.id,'Refund?','local')) FROM source o LIMIT $1 OFFSET $2", .calls = 3, .rows = 2, .scans = 3 },
+    };
+    for (cases) |case| {
+        var backend: Backend = .{ .returning_mode = true, .cold_source = true, .row_count = 512 };
+        var provider: @import("antfly_local_sources").sql_decision_eval.testing.Provider = .{};
+        var iface = backend.backend();
+        iface.decision_provider = provider.provider();
+        var compiled = try compiler.compile(std.testing.allocator, case.sql, .{});
+        defer compiled.deinit();
+        var result = try runtime.execute(std.testing.allocator, iface, &compiled, &.{ .{ .integer = 2 }, .{ .integer = 1 } }, .{ .page_rows = 4 });
+        defer result.deinit();
+        try std.testing.expectEqual(case.rows, result.output.rows.len);
+        try std.testing.expectEqual(case.calls, provider.calls);
+        try std.testing.expectEqual(case.scans, backend.rows_read);
+        try std.testing.expectEqual(@as(usize, 1), backend.captures);
+        try std.testing.expectEqual(@as(usize, 1), backend.closes);
+        try std.testing.expectEqual(@as(usize, 0), backend.commits);
+        if (result.output.columns.len == 2 and result.output.columns[0].type == .integer) {
+            try std.testing.expectEqualStrings("5110", result.output.rows[0][0].string);
+            try std.testing.expectEqualStrings("5100", result.output.rows[1][0].string);
+        }
+    }
+}
+
+test "SQL transparent sorted selection forwards wide cold scopes without widening public limits" {
+    var backend: Backend = .{ .returning_mode = true, .cold_source = true, .cold_width = 512 };
+    var wildcard = try compiler.compile(std.testing.allocator, "SELECT * FROM source", .{});
+    defer wildcard.deinit();
+    try std.testing.expectError(error.SqlProgramLimitExceeded, runtime.execute(std.testing.allocator, backend.backend(), &wildcard, &.{}, .{}));
+    try std.testing.expectEqual(@as(usize, 0), backend.captures);
+    var compiled = try compiler.compile(std.testing.allocator, "SELECT (SELECT o.delta+1) FROM source o ORDER BY o.delta DESC LIMIT 1", .{});
+    defer compiled.deinit();
+    var result = try runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{ .page_rows = 1 });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), result.output.rows.len);
+    try std.testing.expectEqualStrings("21", result.output.rows[0][0].string);
+    try std.testing.expectEqual(@as(usize, 2), backend.rows_read);
+    try std.testing.expectEqual(@as(usize, 1), backend.captures);
+    try std.testing.expectEqual(@as(usize, 1), backend.closes);
+}
+
+test "SQL transparent sorted selection unwinds every allocation failure" {
+    const Faults = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var backend: Backend = .{ .returning_mode = true, .cold_source = true };
+            defer if (backend.captures != backend.closes) @panic("selection capture leaked");
+            var compiled = try compiler.compile(a, "SELECT (SELECT o.delta+1) AS rank,(SELECT o.delta+1) AS v FROM source o ORDER BY rank DESC LIMIT $1 OFFSET $2", .{});
+            defer compiled.deinit();
+            var result = try runtime.execute(a, backend.backend(), &compiled, &.{ .{ .integer = 1 }, .{ .integer = 0 } }, .{ .page_rows = 1 });
+            defer result.deinit();
+            try std.testing.expectEqual(@as(usize, 1), result.output.rows.len);
+            try std.testing.expectEqualStrings("21", result.output.rows[0][0].string);
+            try std.testing.expectEqualStrings("21", result.output.rows[0][1].string);
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Faults.run, .{});
 }
 
 test "SQL bounded scalar producers retain one capture and reusable correlation builds" {

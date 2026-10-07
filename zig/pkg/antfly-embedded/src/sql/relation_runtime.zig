@@ -546,7 +546,7 @@ fn Engine(comptime Context: type) type {
                 var rows: std.ArrayList([]const Datum) = .empty;
                 var retained: usize = 0;
                 while (rows.items.len < maximum) {
-                    const values = (self.next(a) catch |err| blk: {
+                    const values = (self.nextDemand(a, maximum - rows.items.len) catch |err| blk: {
                         if (failure) |out| {
                             out.* = err;
                             break :blk null;
@@ -618,7 +618,7 @@ fn Engine(comptime Context: type) type {
                                 _ = self.arena.reset(.free_all);
                                 self.pages += 1;
                                 if (self.pages > self.engine.context.limits.scan_pages) return error.SqlProgramLimitExceeded;
-                                const wanted: u32 = @intCast(@min(self.engine.context.limits.executionRows(), @max(@as(usize, 1), self.engine.context.limits.retained_bytes / (16 * 1024 + self.node.columns.len * @sizeOf(Datum) * 16))));
+                                const wanted: u32 = @intCast(@min(self.batch_demand orelse std.math.maxInt(usize), @min(self.engine.context.limits.executionRows(), @max(@as(usize, 1), self.engine.context.limits.retained_bytes / (16 * 1024 + self.node.columns.len * @sizeOf(Datum) * 16)))));
                                 self.column_page = try pull(cursor.ptr, self.arena.allocator(), wanted);
                                 try self.column_page.?.batch.validate();
                                 if (self.column_page.?.selection.len > wanted) return error.InvalidSqlBackendResponse;
@@ -646,8 +646,9 @@ fn Engine(comptime Context: type) type {
                             _ = self.arena.reset(.free_all);
                             self.pages += 1;
                             if (self.pages > self.engine.context.limits.scan_pages) return error.SqlProgramLimitExceeded;
-                            self.page = try cursor.next(cursor.ptr, self.arena.allocator(), @intCast(@min(self.engine.context.limits.page_rows, @max(@as(usize, 1), self.engine.context.limits.retained_bytes / (16 * 1024 + self.node.columns.len * @sizeOf(Datum) * 16)))));
-                            if (self.page.?.rows.len > self.engine.context.limits.page_rows) return error.InvalidSqlBackendResponse;
+                            const wanted = @min(self.batch_demand orelse std.math.maxInt(usize), @min(self.engine.context.limits.page_rows, @max(@as(usize, 1), self.engine.context.limits.retained_bytes / (16 * 1024 + self.node.columns.len * @sizeOf(Datum) * 16))));
+                            self.page = try cursor.next(cursor.ptr, self.arena.allocator(), @intCast(wanted));
+                            if (self.page.?.rows.len > wanted) return error.InvalidSqlBackendResponse;
                             self.page_index = 0;
                             self.eof = self.page.?.after == null;
                         }
@@ -719,12 +720,23 @@ fn Engine(comptime Context: type) type {
                     },
                 };
             }
+            /// Carry a pull's prefetch ceiling through row adapters too. This
+            /// does not cap total scan work or truncate a join build.
+            fn nextDemand(self: *Iterator, alloc: Allocator, maximum: usize) anyerror!?[]const Datum {
+                const previous = self.batch_demand;
+                self.batch_demand = if (previous) |prior| @min(prior, maximum) else maximum;
+                defer self.batch_demand = previous;
+                return self.next(alloc);
+            }
             fn nextApply(self: *Iterator, alloc: Allocator, apply: @FieldType(@FieldType(binding.Node, "operation"), "apply")) anyerror!?[]const Datum {
                 while (true) {
                     try self.engine.checkpoint();
                     if (self.left_values == null) {
                         _ = self.arena.reset(.free_all);
-                        const values = try self.left.?.next(self.arena.allocator()) orelse return null;
+                        const values = (if (apply.kind == .left)
+                            try self.left.?.nextDemand(self.arena.allocator(), self.batch_demand orelse std.math.maxInt(usize))
+                        else
+                            try self.left.?.next(self.arena.allocator())) orelse return null;
                         const owned = try self.arena.allocator().alloc(Datum, values.len);
                         for (values, owned) |value, *out| out.* = try operators.cloneDatum(self.arena.allocator(), value);
                         self.left_values = owned;
@@ -925,9 +937,12 @@ fn Engine(comptime Context: type) type {
                     var rows: std.ArrayList(catalog.Row) = .empty;
                     var cells: std.ArrayList([]const Datum) = .empty;
                     // Each nested stage leaves room for upstream pages, bindings and spill operators.
-                    const wanted = @min(@min(context.limits.page_rows, @max(@as(usize, 1), context.limits.retained_bytes / (16 * 1024 + query.source.columns.len * @sizeOf(Datum) * 16))), self.query_remaining +| self.query_skip);
+                    const wanted = @min(self.batch_demand orelse std.math.maxInt(usize), @min(@min(context.limits.page_rows, @max(@as(usize, 1), context.limits.retained_bytes / (16 * 1024 + query.source.columns.len * @sizeOf(Datum) * 16))), self.query_remaining +| self.query_skip));
                     while (rows.items.len < wanted) {
-                        const input = try self.left.?.next(scratch) orelse break;
+                        const input = (if (context.binding.scalars.predicate == null)
+                            try self.left.?.nextDemand(scratch, wanted - rows.items.len)
+                        else
+                            try self.left.?.next(scratch)) orelse break;
                         try self.engine.checkpoint();
                         var object: std.json.ObjectMap = .empty;
                         const nulls = try scratch.alloc(bool, input.len);
@@ -1434,7 +1449,7 @@ fn Engine(comptime Context: type) type {
                 var bytes: usize = 0;
                 var stopped_for_bytes = false;
                 while (rows.items.len < limit) {
-                    const values = try self.iterator.next(alloc) orelse break;
+                    const values = try self.iterator.nextDemand(alloc, limit - rows.items.len) orelse break;
                     for (values) |value| bytes +|= try operators.datumBytes(value);
                     var object: std.json.ObjectMap = .empty;
                     const nulls = try alloc.alloc(bool, values.len);

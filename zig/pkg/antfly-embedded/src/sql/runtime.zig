@@ -516,7 +516,12 @@ pub const Context = struct {
             // Native pages bound scan work independently of the number of
             // residual matches still needed. LIMIT 1 must not impose a
             // 1024-row scan ceiling on a selective scalar predicate.
-            const wanted = self.limits.page_rows;
+            // Unfiltered, unsorted pulls can bound prefetch to output demand
+            // without changing residual scan capacity or sort/count inputs.
+            const wanted = if (top_k == null and !statement.count_all and self.binding.scalars.predicate == null)
+                @min(self.limits.page_rows, (offset -| scanned) +| (limit -| rows.items.len) +| @intFromBool(statement.limit == null))
+            else
+                self.limits.page_rows;
             const page = try scan_state.page(self, page_arena.allocator(), table_def, .{
                 .fields = native_fields.items,
                 .primary_order = self.binding.primary_order,
@@ -2744,7 +2749,9 @@ test "SQL decision CTE pages preserve projection demand offset and limit" {
     const Case = struct { sql: []const u8, rows: usize, calls: usize, max_batch: usize };
     const cases = [_]Case{
         .{ .sql = "WITH c AS (SELECT ai_probability(_id,'Refund?','local') AS p FROM things) SELECT p,p FROM c WHERE p>0.8", .rows = 19, .calls = 19, .max_batch = 4 },
-        .{ .sql = "WITH c AS (SELECT ai_probability(_id,'Refund?','local') AS p FROM things LIMIT 5 OFFSET 3) SELECT p FROM c", .rows = 5, .calls = 5, .max_batch = 4 },
+        // The first source page skips three rows and produces one value. The
+        // enclosing four-row page then demands only three additional values.
+        .{ .sql = "WITH c AS (SELECT ai_probability(_id,'Refund?','local') AS p FROM things LIMIT 5 OFFSET 3) SELECT p FROM c", .rows = 5, .calls = 5, .max_batch = 3 },
         .{ .sql = "WITH c AS (SELECT _id FROM things WHERE ai_probability(_id,'Refund?','local')>0.8) SELECT _id FROM c", .rows = 19, .calls = 19, .max_batch = 4 },
         .{ .sql = "WITH c AS (SELECT CASE WHEN FALSE THEN ai_probability(_id,'Refund?','local') ELSE 0 END AS p FROM things) SELECT p FROM c", .rows = 19, .calls = 0, .max_batch = 0 },
         .{ .sql = "WITH c AS (SELECT ai_probability(_id,'Refund?','local') AS p FROM things LIMIT 0) SELECT p FROM c", .rows = 0, .calls = 0, .max_batch = 0 },

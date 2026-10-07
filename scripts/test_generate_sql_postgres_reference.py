@@ -516,8 +516,8 @@ class PostgresReferenceTest(unittest.TestCase):
                 / "zig/pkg/antfly-embedded/src/sql/fixtures/sql_conditional_subquery_reference.json"
             ).read_text()
         )
-        self.assertEqual(56, len(fixture["entries"]))
-        self.assertEqual(20, len(fixture["errors"]))
+        self.assertEqual(62, len(fixture["entries"]))
+        self.assertEqual(25, len(fixture["errors"]))
         for case in fixture["entries"]:
             with self.subTest(sql=case["sql"]):
                 self.assertEqual(
@@ -530,6 +530,18 @@ class PostgresReferenceTest(unittest.TestCase):
                     with self.db.transaction(force_rollback=True):
                         self.db.execute(case["sql"]).fetchall()
                 self.assertEqual(case["code"], error.exception.sqlstate)
+
+    def test_sorted_scalar_outputs_retain_computed_aliases(self):
+        for sql in (
+            "SELECT o.x+1 AS rank,(SELECT i.y FROM (SELECT 1 AS y UNION ALL SELECT 2) i WHERE o.x=1) AS v FROM (SELECT 1 AS x UNION ALL SELECT 2) o ORDER BY rank DESC LIMIT 1",
+            "SELECT (SELECT o.x+1) AS rank,(SELECT i.y FROM (SELECT 1 AS y UNION ALL SELECT 2) i WHERE o.x=1) AS v FROM (SELECT 1 AS x UNION ALL SELECT 2) o ORDER BY rank DESC LIMIT 1",
+        ):
+            with self.subTest(sql=sql):
+                cursor = self.db.execute(sql)
+                self.assertEqual(
+                    ["rank", "v"], [column.name for column in cursor.description]
+                )
+                self.assertEqual([(3, None)], cursor.fetchall())
 
     def test_negative_row_bounds_validate_only_demanded_execution(self):
         import psycopg

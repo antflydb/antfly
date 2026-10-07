@@ -420,7 +420,7 @@ Conditional scalar reads now use compiler-generated masked Apply producers.
 CASE, COALESCE and boolean short-circuit operators retain SQL NULL truth rules,
 and a producer is not opened until its branch is demanded. Prerequisite values
 are materialized once; binding and authorization still cover every branch.
-The shared PostgreSQL/native fixture checks 56 result contracts and twenty error
+The shared PostgreSQL/native fixture checks 62 result contracts and 25 error
 contracts, including demanded cardinality failures and invalid names in dead
 branches. Mutation tests additionally verify that an unused RETURNING producer
 reads no source rows, a demanded failure publishes no mutations, and unused
@@ -479,8 +479,29 @@ error is not exposed after two valid scalar rows. Value programs stay inside
 their correlated demand instead of being eagerly evaluated for unused groups;
 safe column/literal equality decorrelation retains its grouped fast path.
 This is not a claim that sorts, aggregates or windows can skip input required
-by their own semantics. Post-sort projection demand, cross-level aggregate
-lifting and output staging remain separate unfinished work.
+by their own semantics.
+
+Row-source scalar projections now have a transparent selection stage: sort-required
+producers execute before sorting, while independent output producers execute only
+for selected rows. Computed sort aliases retain one materialized value, reused by
+the final projection. The stage preserves original column identities, correlation
+frames and NULL provenance instead of introducing a user-visible derived scope.
+Cold forwarded columns do not become physical scan dependencies; an internal
+512-cold-column regression retains the public projection-width limit. Unfiltered
+pulls propagate remaining output demand without reducing residual-filter scan
+capacity or truncating join builds.
+
+Native counters check 512 sort candidates with only two independent output
+invocations, 512 required sort invocations plus two output invocations, and twelve
+WHERE-qualified sort invocations plus two outputs. All use one captured read.
+Without sorting, PostgreSQL's projection-before-OFFSET behavior is retained:
+LIMIT 2 OFFSET 1 demands exactly three scalar outputs and source rows, and a
+cardinality failure on a skipped row remains observable. These are tested plan
+contracts, not a promise of identical error precedence across PostgreSQL optimizer
+rewrites or constant folding. Allocation-fault tests cover selection-stage cleanup.
+Grouped/window scalar-output staging, cross-level aggregate lifting and wildcard
+ORDER BY ordinal mapping remain unfinished. These shared execution regressions
+do not change the original-case dispositions or the 1,025 unresolved total.
 
 ```sh
 uv run --no-project --with 'psycopg[binary]==3.3.6' python scripts/generate_sql_postgres_reference.py mutation --check zig/pkg/antfly-embedded/src/sql/fixtures/sql_mutation_postgres_reference.json

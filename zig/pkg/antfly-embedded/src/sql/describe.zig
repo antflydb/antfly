@@ -649,7 +649,7 @@ const Context = struct {
             const column = try self.table.column(projection.field);
             if (!std.mem.eql(u8, column.name, "_id")) {
                 _ = try native_fields.getOrPut(self.allocator, column.path);
-                if (native_fields.count() > 256) return error.SqlProgramLimitExceeded;
+                if (native_fields.count() > 256 and !statement.internal_projection) return error.SqlProgramLimitExceeded;
             }
             output.* = .{ .name = try self.allocator.dupe(u8, projection.alias orelse column.name), .type = try publicKind(column.type) };
         }

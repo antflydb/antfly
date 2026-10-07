@@ -96,7 +96,7 @@ const Names = std.StringHashMapUnmanaged(void);
 fn aliases(alloc: Allocator, relation: *const ast.Relation, names: *Names) !void {
     switch (relation.*) {
         .table => |table| try names.put(alloc, table.alias orelse table.name.table, {}),
-        .derived => |query| try names.put(alloc, query.alias, {}),
+        .derived => |query| if (query.preserve_scope) try aliases(alloc, query.query.source.?, names) else try names.put(alloc, query.alias, {}),
         .join => |join| {
             try aliases(alloc, join.left, names);
             try aliases(alloc, join.right, names);
@@ -894,6 +894,37 @@ const Builder = struct {
         });
     }
 };
+fn rowProjectionReads(statement: ast.Select) bool {
+    if (statement.group_by.len != 0 or statement.having != null or
+        @import("aggregate_binding.zig").accepts(statement) or @import("window_binding.zig").accepts(statement)) return false;
+    for (statement.columns) |column| if (column.expression) |value| if (has(value)) return true;
+    return false;
+}
+
+fn selectionOrders(alloc: Allocator, statement: ast.Select) !?[]ast.Order {
+    if (statement.order_by.len == 0 or !rowProjectionReads(statement)) return null;
+    var wildcard = false;
+    for (statement.columns) |column| {
+        wildcard = wildcard or column.wildcard;
+    }
+    const normalized = try @import("order_aliases.zig").normalize(alloc, statement);
+    const orders = try alloc.dupe(ast.Order, normalized.order_by);
+    for (orders) |*order| {
+        if (order.position) |position| {
+            if (wildcard or position == 0 or position > statement.columns.len) return null;
+            const column = statement.columns[position - 1];
+            order.position = null;
+            order.expression = column.expression orelse blk: {
+                const value = try alloc.create(ast.Scalar);
+                value.* = .{ .column = column.field };
+                break :blk value;
+            };
+        }
+        if (order.expression != null) order.field = "";
+    }
+    return orders;
+}
+
 pub fn lower(alloc: Allocator, statement: ast.Select) !ast.Select {
     if (statement.values_arms.len != 0) {
         const arms = try alloc.alloc(*const ast.Select, statement.values_arms.len);
@@ -914,6 +945,25 @@ pub fn lower(alloc: Allocator, statement: ast.Select) !ast.Select {
         var result = statement;
         result.set_operation = .{ .kind = set.kind, .all = set.all, .left = left, .right = right };
         return result;
+    }
+    if (statement.offset != null and statement.order_by.len == 0 and rowProjectionReads(statement)) {
+        // Without a sort PostgreSQL's projection is below OFFSET: a scalar
+        // cardinality/value error on a skipped row still belongs to execution.
+        // A streaming derived producer preserves that boundary without
+        // materializing rows or changing their output labels/types.
+        const projected = try alloc.create(ast.Select);
+        projected.* = statement;
+        projected.limit = null;
+        projected.offset = null;
+        projected.scalar_cardinality_limit = false;
+        const source = try alloc.create(ast.Relation);
+        source.* = .{ .derived = .{ .query = projected, .alias = "$offset_output" } };
+        return .{
+            .source = source,
+            .limit = statement.limit,
+            .offset = statement.offset,
+            .scalar_cardinality_limit = statement.scalar_cardinality_limit,
+        };
     }
     var builder: Builder = .{ .alloc = alloc, .source = undefined };
     if (statement.source) |source| builder.source = source else if (statement.table) |table| builder.source = try builder.relation(.{ .table = .{ .name = table } }) else {
@@ -939,6 +989,42 @@ pub fn lower(alloc: Allocator, statement: ast.Select) !ast.Select {
         if (needs_row_demand) demand = try builder.testValue(.is_true, value);
     }
     const columns = try alloc.dupe(ast.Projection, statement.columns);
+    if (try selectionOrders(alloc, statement)) |orders| {
+        for (orders) |*order| if (order.expression) |value| {
+            if (value.* == .column) continue;
+            var matched = false;
+            for (statement.columns, columns) |original, *column| {
+                if (original.expression != value) continue;
+                if (column.expression == value) column.expression = try builder.prerequisite(try builder.rewriteDemand(value, demand), demand);
+                if (column.alias == null) column.alias = "?column?";
+                order.expression = column.expression;
+                matched = true;
+                break;
+            }
+            // Sort-required reads run before selection, independent output
+            // reads after it. A shared alias owns one computed value, never
+            // a second invocation when the selected row is projected.
+            if (!matched and has(value)) order.expression = try builder.prerequisite(try builder.rewriteDemand(value, demand), demand);
+        };
+        const selected = try alloc.create(ast.Select);
+        selected.* = .{
+            .source = builder.source,
+            .predicate = result.predicate,
+            .order_by = orders,
+            .order_aliases_expanded = true,
+            .limit = statement.limit,
+            .offset = statement.offset,
+            .scalar_cardinality_limit = statement.scalar_cardinality_limit,
+        };
+        builder.source = try builder.relation(.{ .derived = .{ .query = selected, .alias = "$selected", .preserve_scope = true } });
+        result.predicate = null;
+        result.order_by = &.{};
+        result.limit = null;
+        result.offset = null;
+        result.scalar_cardinality_limit = false;
+        result.selection_staged = true;
+        demand = null;
+    }
     for (columns) |*column| if (column.expression) |value| {
         if (column.alias == null and has(value)) column.alias = if (value.* == .call and value.call.subquery != null and std.mem.eql(u8, value.call.name, "$exists")) "exists" else "?column?";
         column.expression = try builder.rewriteDemand(value, demand);
@@ -948,7 +1034,7 @@ pub fn lower(alloc: Allocator, statement: ast.Select) !ast.Select {
     for (statement.group_by, groups) |value, *out| out.* = try builder.rewriteDemand(value, demand);
     result.group_by = groups;
     result.having = if (statement.having) |value| try builder.rewriteDemand(value, demand) else null;
-    const orders = try alloc.dupe(ast.Order, statement.order_by);
+    const orders = try alloc.dupe(ast.Order, result.order_by);
     for (orders) |*order| if (order.expression) |value| {
         order.expression = try builder.rewriteDemand(value, demand);
     };

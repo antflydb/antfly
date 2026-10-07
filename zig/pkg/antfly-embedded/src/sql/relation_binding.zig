@@ -109,7 +109,7 @@ pub const Node = struct {
         scan: struct { index: usize, source_columns: []const []const u8 },
         join: struct { kind: ast.JoinKind, left: *const Node, right: *const Node, condition: ?scalar.Program, left_keys: []const scalar.Program, right_keys: []const scalar.Program, correlation: bool = false },
         apply: struct { id: usize, kind: ast.JoinKind, left: *const Node, right: *const Node, condition: ?scalar.Program, demand: ?scalar.Program = null },
-        query: struct { source: *const Node, statement: ast.Select, binding: describe.BoundStatement },
+        query: struct { source: *const Node, statement: ast.Select, binding: describe.BoundStatement, preserve_scope: bool = false },
         set: struct { kind: ast.SetKind, all: bool, left: *const Node, right: *const Node },
         /// Compiler-generated INSERT VALUES arms in input order. Each arm
         /// retains its own captured source dependencies, but execution opens
@@ -766,6 +766,7 @@ const Builder = struct {
 
     fn querySource(self: *Builder, statement: ast.Select, scope: []const ast.Cte, depth: usize) anyerror!*const Node {
         const source = try self.querySourceBody(statement, scope, depth);
+        if (statement.selection_staged) return source;
         const nearest = self.outer_scope orelse return source;
         var outer: ?*const Node = null;
         var frame: ?*const OuterScope = nearest;
@@ -903,6 +904,36 @@ const Builder = struct {
         if (statement.table) |table| return self.relation(&.{ .table = .{ .name = table } }, ctes, depth + 1);
         return self.node(&.{}, .singleton);
     }
+    fn selectionStage(self: *Builder, query: ast.Select, scope: []const ast.Cte, depth: usize) anyerror!*const Node {
+        // Bind names once against the original catalog domain, not a derived
+        // table alias. Forward the same internal identities and provenance so
+        // later correlated producers and wildcard expansion retain their scope.
+        const source = try self.querySource(query, scope, depth + 1);
+        var boundary = query;
+        boundary.columns = &.{.{ .expression = try self.scalarNode(.{ .literal = .{ .integer = 1 } }) }};
+        var lowered = try self.lower(source, boundary);
+        lowered.internal_projection = true;
+        const projections = try self.alloc.alloc(ast.Projection, source.columns.len);
+        for (source.columns, projections) |column, *projection| projection.* = .{
+            .field = column.internal,
+            .alias = column.internal,
+            .expression = if (column.untyped_null) try self.scalarNode(.{ .literal = .null }) else null,
+        };
+        lowered.columns = projections;
+        if (self.shape_only) {
+            _ = try self.constrainSelect(source, lowered);
+            return self.node(source.columns, .singleton);
+        }
+        const table = try self.virtualTable(source.columns);
+        var adapter: ResolveAdapter = .{ .backend = self.backend, .table = table };
+        const compiled: compiler.Compiled = .{ .arena = undefined, .statement = .{ .select = lowered }, .parameter_count = @intCast(self.parameters.len) };
+        const bound = try describe.bind(self.alloc, adapter.iface(), &compiled, self.parameters);
+        for (bound.parameter_types, self.parameters) |hint, *parameter| if (hint != null) {
+            parameter.* = hint;
+        };
+        return self.node(source.columns, .{ .query = .{ .source = source, .statement = lowered, .binding = bound, .preserve_scope = true } });
+    }
+
     fn derived(self: *Builder, query: *const ast.Select, alias: []const u8, names: []const []const u8, scope: []const ast.Cte, depth: usize) anyerror!*const Node {
         if (@import("subquery_lowering.zig").accepts(query.*)) {
             const rewritten = try self.alloc.create(ast.Select);
@@ -1081,7 +1112,7 @@ const Builder = struct {
                 break :blk try self.node(columns, .{ .scan = .{ .index = index, .source_columns = source_columns } });
             },
             .derived => |query| blk: {
-                const result = try self.derived(query.query, query.alias, query.columns, scope, depth + 1);
+                const result = if (query.preserve_scope) try self.selectionStage(query.query.*, scope, depth + 1) else try self.derived(query.query, query.alias, query.columns, scope, depth + 1);
                 if (query.hidden) for (@constCast(result.columns)) |*column| {
                     column.visible = false;
                 };
@@ -1349,7 +1380,11 @@ fn projectScans(builder: *Builder, node: *const Node, needed: *std.StringHashMap
             try projectScans(builder, apply.left, needed);
         },
         .query => |query| {
-            try markSelect(builder.alloc, needed, query.statement);
+            var required = query.statement;
+            // Transparent outputs retain ordinal slots, but cold forwarded
+            // columns must not become physical scan dependencies.
+            if (query.preserve_scope) required.columns = &.{};
+            try markSelect(builder.alloc, needed, required);
             try projectScans(builder, query.source, needed);
         },
         .set => |set| {

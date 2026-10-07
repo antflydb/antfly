@@ -110,6 +110,12 @@ pub const Select = struct {
     /// Compiler-only scalar-query demand, applied after validating the user's
     /// LIMIT and after the child's ordering/OFFSET/grouping semantics.
     scalar_cardinality_limit: bool = false,
+    /// A compiler-owned transparent selection frame already carries the
+    /// enclosing query's outer bindings; do not append them a second time.
+    selection_staged: bool = false,
+    /// Compiler-only ordinal forwarding; its width is not a user projection
+    /// or a physical storage-field request. Retained-memory limits still apply.
+    internal_projection: bool = false,
 
     pub fn capRows(self: Select, requested: usize) usize {
         return if (self.scalar_cardinality_limit) @min(requested, 2) else requested;
@@ -135,7 +141,15 @@ pub const Relation = union(enum) {
         /// Compiler-owned RETURNING input, never a physical table scan.
         prepared_rows: bool = false,
     },
-    derived: struct { query: *const Select, alias: []const u8, columns: []const []const u8 = &.{}, hidden: bool = false, lateral: bool = false },
+    derived: struct {
+        query: *const Select,
+        alias: []const u8,
+        columns: []const []const u8 = &.{},
+        hidden: bool = false,
+        lateral: bool = false,
+        /// Internal selection boundary, not a user-visible derived scope.
+        preserve_scope: bool = false,
+    },
     join: struct {
         kind: JoinKind,
         left: *const Relation,

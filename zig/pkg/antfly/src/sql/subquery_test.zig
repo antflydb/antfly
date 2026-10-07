@@ -70,8 +70,27 @@ test "SQL masked Apply preserves PostgreSQL conditional subquery demand and NULL
         if (runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{})) |value| {
             var result = value;
             result.deinit();
+            std.debug.print("conditional subquery unexpectedly succeeded: {s}\n", .{entry.sql});
             return error.ExpectedConditionalSubqueryFailure;
         } else |err| try std.testing.expectEqualStrings(entry.code, @import("antfly_local_sources").sql_errors.describe(err).code);
+    }
+}
+
+test "SQL sorted scalar outputs retain computed aliases and NULL provenance" {
+    var backend: Backend = .{};
+    for ([_][]const u8{
+        "SELECT o.x+1 AS rank,(SELECT i.y FROM (SELECT 1 AS y UNION ALL SELECT 2) i WHERE o.x=1) AS v FROM (SELECT 1 AS x UNION ALL SELECT 2) o ORDER BY rank DESC LIMIT 1",
+        "SELECT (SELECT o.x+1) AS rank,(SELECT i.y FROM (SELECT 1 AS y UNION ALL SELECT 2) i WHERE o.x=1) AS v FROM (SELECT 1 AS x UNION ALL SELECT 2) o ORDER BY rank DESC LIMIT 1",
+    }) |sql| {
+        var compiled = try compiler.compile(std.testing.allocator, sql, .{});
+        defer compiled.deinit();
+        var result = try runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), result.output.rows.len);
+        try std.testing.expectEqualStrings("rank", result.output.columns[0].name);
+        try std.testing.expectEqualStrings("v", result.output.columns[1].name);
+        try std.testing.expectEqualStrings("3", result.output.rows[0][0].string);
+        try std.testing.expect(result.output.sql_nulls.?[0][1]);
     }
 }
 
@@ -485,7 +504,8 @@ test "SQL membership bounded hash projections share one capture instead of per r
         var output = try runtime.execute(execution_alloc, fixture.backend(), &ordered, &.{}, .{ .retained_bytes = 32 * 1024 * 1024 });
         defer output.deinit();
         try std.testing.expectEqual(fixture.count, try std.fmt.parseInt(usize, output.output.rows[0][0].string, 10));
-        try std.testing.expectEqual(fixture.count + (if (case_index == 2) @min(fixture.count, 256) else fixture.count), fixture.rows);
+        // An invariant EXISTS needs one witness, not a speculative full page.
+        try std.testing.expectEqual(fixture.count + (if (case_index == 2) @as(usize, 1) else fixture.count), fixture.rows);
         try std.testing.expectEqual(@as(usize, 1), fixture.captures);
         try std.testing.expectEqual(@as(usize, 1), fixture.closes);
         std.debug.print("SQL subquery: shape={s} rows={d} native_rows={d} native_scans=2 captures=1 peak_bytes={d} elapsed_ns={d}\n", .{ if (case_index == 2) "uncorrelated-exists" else "ordered", fixture.count, fixture.rows, output.peakMemoryBytes(), std.Io.Clock.awake.now(std.testing.io).nanoseconds - ordered_start });
