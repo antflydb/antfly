@@ -4382,3 +4382,20 @@ float4 results to avoid shortest-text conversion artifacts.
 Array-dependent durable expressions, exact decimal assignment semantics,
 temporal operations and special floating-point domains remain architecture
 gaps. No original-case dispositions are changed by these component regressions.
+
+Durable conditional programs use an ordered `case_when` node, not eager
+evaluation or duplicated boolean rewrites. It evaluates each condition once,
+treats UNKNOWN as not TRUE, and evaluates only the selected result (or the
+mandatory fallback). SQL lowering supplies a typed NULL fallback when ELSE is
+omitted and explicitly promotes numeric CASE and COALESCE results to their
+bound common domain. The durable VM admits at most fifteen branches, within
+the existing node, depth and per-row byte budgets. Conditional programs also
+require schema capability 18, even when their results are nonnumeric.
+The shared thirty-two-expression PostgreSQL/native fixture covers searched and
+simple CASE, typed NULL fallback, branch-local overflow, unselected division by
+zero, mixed-width COALESCE, and float4-to-float8 selection. Fault probes cover
+preparation ownership; a 10,000-row local debug sample took approximately 1.97 ms
+with a failing allocator proving zero per-row scratch allocations. This is a
+component latency sample, not a production throughput claim. Native admission
+also exercises conditional checks and expression indexes through atomic batch
+failure, LSM reopen and portable restore.

@@ -29,7 +29,7 @@ pub const max_depth = 16;
 pub const max_output_bytes = 1024 * 1024;
 pub const max_allocated_bytes = 4 * max_output_bytes;
 
-const Op = enum { literal, column, add, subtract, multiply, divide, negate, concat, coalesce, lower_ascii, upper_ascii, eq, ne, gt, gte, lt, lte, is_null, is_not_null, is_distinct, is_not_distinct, @"and", @"or", not, cast };
+const Op = enum { literal, column, add, subtract, multiply, divide, negate, concat, coalesce, lower_ascii, upper_ascii, eq, ne, gt, gte, lt, lte, is_null, is_not_null, is_distinct, is_not_distinct, @"and", @"or", not, cast, case_when };
 const Node = struct {
     op: Op,
     kind: Kind,
@@ -139,6 +139,15 @@ pub const Plan = struct {
             if (value != .null and !valueHasKind(value, node.kind)) return error.InvalidRelationalExpressionInput;
             if (value == .number and !std.math.isFinite(value.number)) return error.InvalidRelationalExpressionInput;
             return value;
+        }
+        if (node.op == .case_when) {
+            var i: usize = 0;
+            while (i + 1 < node.children.len) : (i += 2) {
+                const condition = try self.evaluateNode(alloc, source, node.children[i], budget);
+                if (condition != .null and condition.boolean)
+                    return self.evaluateNode(alloc, source, node.children[i + 1], budget);
+            }
+            return self.evaluateNode(alloc, source, node.children[node.children.len - 1], budget);
         }
         if (node.op == .coalesce) {
             for (node.children) |child| {
@@ -443,6 +452,7 @@ const Compiler = struct {
                 const valid = switch (op) {
                     .negate, .lower_ascii, .upper_ascii, .not, .is_null, .is_not_null, .cast => length == 1,
                     .concat, .coalesce, .@"and", .@"or" => length >= 2 and length <= 32,
+                    .case_when => length >= 3 and length <= 31 and length % 2 == 1,
                     else => length == 2,
                 };
                 if (!valid) return error.InvalidRelationalExpression;
@@ -450,8 +460,12 @@ const Compiler = struct {
                 const children = try self.alloc.alloc(u16, length);
                 for (args.array.items, children) |arg, *child| child.* = try self.compile(arg, depth + 1);
                 node.children = children;
-                node.kind = self.nodes.items[children[0]].kind;
-                for (children[1..]) |child| if (self.nodes.items[child].kind != node.kind) return error.InvalidRelationalExpressionType;
+                node.kind = self.nodes.items[children[if (op == .case_when) children.len - 1 else 0]].kind;
+                if (op == .case_when) {
+                    for (children[0 .. children.len - 1], 0..) |child, i| {
+                        if (self.nodes.items[child].kind != (if (i % 2 == 0) Kind.boolean else node.kind)) return error.InvalidRelationalExpressionType;
+                    }
+                } else for (children[1..]) |child| if (self.nodes.items[child].kind != node.kind) return error.InvalidRelationalExpressionType;
                 if (isComparison(op)) {
                     if (input.object.get("collation")) |collation| {
                         if (collation != .string or node.kind != .string) return error.UnsupportedRelationalIndexCollation;
@@ -472,10 +486,11 @@ const Compiler = struct {
                     },
                     .add, .subtract, .multiply, .divide, .negate => if (node.kind != .integer and node.kind != .number) return error.InvalidRelationalExpressionType,
                     .concat, .lower_ascii, .upper_ascii => if (node.kind != .string) return error.InvalidRelationalExpressionType,
-                    .coalesce => {
+                    .coalesce, .case_when => {
                         if (node.kind == .integer or node.kind == .number) {
-                            const identity = numericIdentity(self.nodes.items[children[0]]);
-                            const same = for (children[1..]) |child| {
+                            const identity = numericIdentity(self.nodes.items[children[children.len - 1]]);
+                            const same = for (children, 0..) |child, i| {
+                                if (op == .case_when and i % 2 == 0 and i + 1 < children.len) continue;
                                 if (numericIdentity(self.nodes.items[child]) != identity) break false;
                             } else true;
                             if (same) node.sql_type = identity;
@@ -529,7 +544,7 @@ test "relational declarations SQL numeric programs retain narrow domains and che
         .{ .name = "f", .path = "f", .column_type = .number, .sql_element_type = .float32 },
         .{ .name = "d", .path = "d", .column_type = .number, .sql_element_type = .float64 },
     } };
-    const Case = struct { sql: []const u8, n: i64 = 1, i: i64 = 1, d: f64 = 2.5, expected: std.json.Value = .null, @"error": ?[]const u8 = null };
+    const Case = struct { sql: []const u8, n: ?i64 = 1, i: i64 = 1, d: f64 = 2.5, expected: std.json.Value = .null, @"error": ?[]const u8 = null };
     const fixture = try std.json.parseFromSlice(struct { reference: []const u8, entries: []const Case }, alloc, @embedFile("../sql/fixtures/sql_numeric_expression_reference.json"), .{});
     defer fixture.deinit();
     for (fixture.value.entries) |case| {
@@ -543,16 +558,94 @@ test "relational declarations SQL numeric programs retain narrow domains and che
             ast.ColumnType.integer => .integer,
             .number => .number,
             .boolean => .boolean,
+            .string => .string,
             else => unreachable,
         };
         var plan = try Plan.init(alloc, table, lowered.expression, expected);
         defer plan.deinit();
-        const cells = [_]Value{ .{ .integer = case.n }, .{ .integer = case.i }, .{ .integer = 9007199254740993 }, .{ .number = 16777216 }, .{ .number = case.d } };
+        const cells = [_]Value{ if (case.n) |n| .{ .integer = n } else .null, .{ .integer = case.i }, .{ .integer = 9007199254740993 }, .{ .number = 16777216 }, .{ .number = case.d } };
         if (case.@"error") |state| {
             const failure = if (std.mem.eql(u8, state, "22003")) error.RelationalExpressionOverflow else if (std.mem.eql(u8, state, "22012")) error.RelationalExpressionDivisionByZero else return error.TestUnexpectedSqlstate;
             try std.testing.expectError(failure, plan.evaluate(alloc, &cells));
         } else try std.testing.expect(valuesEqual(try checks.valueFromJson(a, expected, case.expected, true), try plan.evaluate(alloc, &cells)));
     }
+}
+
+test "relational declarations SQL numeric programs conditional allocation faults and zero scratch evaluation" {
+    const Fixture = struct {
+        fn run(alloc: Allocator) !void {
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            const a = arena.allocator();
+            var compiled = try @import("../sql/compiler.zig").compileScalar(a, "CASE WHEN n>0 THEN CAST(n AS integer) ELSE 1/(i-i) END", .{});
+            defer compiled.deinit();
+            const columns = [_]@import("../sql/scalar.zig").Column{
+                .{ .name = "n", .type = .integer, .element_type = .int16 },
+                .{ .name = "i", .type = .integer, .element_type = .int32 },
+            };
+            const table: schema.TableSchema = .{ .storage_mode = .relational, .relational_columns = &.{
+                .{ .name = "n", .path = "n", .column_type = .integer, .sql_element_type = .int16 },
+                .{ .name = "i", .path = "i", .column_type = .integer, .sql_element_type = .int32 },
+            } };
+            const lowered = try @import("../sql/schema_expression.zig").lowerColumns(a, &columns, compiled.expression, null);
+            var plan = try Plan.init(alloc, table, lowered.expression, .integer);
+            defer plan.deinit();
+            const start = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
+            var total: i64 = 0;
+            for (0..10000) |i| {
+                total += (try plan.evaluate(std.testing.failing_allocator, &.{ .{ .integer = @intCast(i + 1) }, .{ .integer = 1 } })).integer;
+            }
+            try std.testing.expectEqual(@as(i64, 50005000), total);
+            try std.testing.expectError(error.RelationalExpressionDivisionByZero, plan.evaluate(std.testing.failing_allocator, &.{ .null, .{ .integer = 1 } }));
+            // Fault probes reach this point only after all preparation succeeds.
+            std.debug.print("SQL durable CASE: rows=10000 scratch_bytes=0 elapsed_ns={}\n", .{std.Io.Clock.now(.awake, std.testing.io).nanoseconds - start});
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
+test "relational declarations SQL numeric programs fence nonnumeric conditional generated columns" {
+    const alloc = std.testing.allocator;
+    var validator = try @import("mod.zig").CompiledTableValidator.init(alloc,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","column_defaults":[{"column":"x","expression":{"op":"literal","type":"string","value":"ready"}}],"generated_columns":[{"column":"y","expression":{"op":"case_when","args":[{"op":"is_null","args":[{"op":"column","column":"x"}]},{"op":"literal","type":"string","value":"missing"},{"op":"column","column":"x"}]}}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"x":{"type":["keyword","null"]},"y":{"type":"keyword"}},"required":["y"],"additionalProperties":false}}}}
+    );
+    defer validator.deinit(alloc);
+    const expressions = validator.execution.expressions.?;
+    try std.testing.expect(expressions.table.requires_typed_expressions);
+    const runtime = try @import("mod.zig").deriveRuntimeTableSchema(alloc, validator.schema);
+    defer schema.freeSchema(alloc, runtime);
+    try std.testing.expect(runtime.requires_typed_expressions);
+    var missing = try std.json.parseFromSlice(std.json.Value, alloc, "{}", .{});
+    defer missing.deinit();
+    try expressions.applyJson(missing.arena.allocator(), &missing.value);
+    try std.testing.expectEqualStrings("ready", missing.value.object.get("y").?.string);
+    try expressions.verifyJson(alloc, missing.value);
+    var explicit = try std.json.parseFromSlice(std.json.Value, alloc, "{\"x\":null}", .{});
+    defer explicit.deinit();
+    try expressions.applyJson(explicit.arena.allocator(), &explicit.value);
+    try std.testing.expectEqualStrings("missing", explicit.value.object.get("y").?.string);
+    try expressions.verifyJson(alloc, explicit.value);
+    try explicit.value.object.put(explicit.arena.allocator(), "y", .{ .string = "forged" });
+    try std.testing.expectError(error.InvalidRelationalGeneratedValue, expressions.verifyJson(alloc, explicit.value));
+}
+
+test "relational declarations SQL numeric programs reject malformed conditional domains" {
+    const alloc = std.testing.allocator;
+    for ([_][]const u8{
+        \\{"op":"case_when","args":[{"op":"literal","type":"integer","value":1},{"op":"literal","type":"integer","value":1},{"op":"literal","type":"integer","value":0}]}
+        ,
+        \\{"op":"case_when","args":[{"op":"literal","type":"boolean","value":true},{"op":"literal","type":"integer","value":1},{"op":"literal","type":"string","value":"bad"}]}
+        ,
+    }) |text| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, alloc, text, .{});
+        defer parsed.deinit();
+        try std.testing.expectError(error.InvalidRelationalExpressionType, Plan.init(alloc, .{}, parsed.value, .integer));
+    }
+    const even = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"op":"case_when","args":[{"op":"literal","type":"boolean","value":true},{"op":"literal","type":"integer","value":1}]}
+    , .{});
+    defer even.deinit();
+    try std.testing.expectError(error.InvalidRelationalExpression, Plan.init(alloc, .{}, even.value, .integer));
 }
 
 /// Immutable schema-owned defaults and generated-column dependency graph.

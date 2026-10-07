@@ -40,6 +40,13 @@ class RelationalScalarExpression:
     argument, and performs a checked conversion when evaluated (not when
     the schema is compiled). Floating-to-integer casts round ties to even.
     Only int16/int32/int64/float32/float64 identities are accepted here.
+    case_when takes alternating boolean conditions and result expressions,
+    followed by a mandatory fallback result (3 to 31 arguments, at most
+    15 branches). Conditions are evaluated in order; only the selected
+    result is evaluated, and a NULL condition is not TRUE. All result
+    expressions must have the same physical type. Numeric SQL lowering
+    records builtin result-domain promotions as explicit casts. This
+    operation requires schema capability version 18.
 
         Attributes:
             op (RelationalExpressionOp):

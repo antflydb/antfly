@@ -17,6 +17,21 @@
     {"sql":"CAST(b AS real)","expected":9007199254740992.0},
     {"sql":"CAST(CAST(d AS real) AS double precision)","d":0.1,"expected":0.10000000149011612},
     {"sql":"false AND n+n>0","n":30000,"expected":false},
-    {"sql":"1/(i-i)","error":"22012"}
+    {"sql":"1/(i-i)","error":"22012"},
+    {"sql":"COALESCE(n,i)+1","n":null,"i":2147483647,"error":"22003"},
+    {"sql":"COALESCE(n,d)","expected":1.0},
+    {"sql":"COALESCE(n)+n","n":30000,"error":"22003"},
+    {"sql":"COALESCE(n)","n":null,"expected":null},
+    {"sql":"CASE WHEN n>0 THEN n ELSE i END+1","expected":2},
+    {"sql":"CASE WHEN n>0 THEN n+n ELSE i END","n":30000,"error":"22003"},
+    {"sql":"CASE WHEN n<0 THEN n+n ELSE i END","n":30000,"expected":1},
+    {"sql":"CASE WHEN n IS NULL THEN 7 ELSE n END","n":null,"expected":7},
+    {"sql":"CASE WHEN n>0 THEN n END","n":null,"expected":null},
+    {"sql":"CASE WHEN n>0 THEN 'yes' WHEN n=0 THEN 'zero' ELSE 'no' END","expected":"yes"},
+    {"sql":"CASE WHEN NULL THEN n+n ELSE i END","n":30000,"expected":1},
+    {"sql":"CASE WHEN n>0 THEN f ELSE d END","expected":16777216.0},
+    {"sql":"CASE WHEN n>0 THEN COALESCE(n,i) ELSE 1/(i-i) END","expected":1},
+    {"sql":"CASE n WHEN 1 THEN n WHEN 2 THEN i ELSE 0 END","expected":1},
+    {"sql":"(CASE WHEN n>0 THEN f ELSE CAST(d AS real) END + CAST(1 AS real))-f","expected":0.0}
   ]
 }

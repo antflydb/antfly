@@ -68,6 +68,30 @@ func TestRelationalNumericAssignmentCastBuiltinIdentity(t *testing.T) {
 	}
 }
 
+func TestRelationalConditionalExpressionContract(t *testing.T) {
+	var expression RelationalScalarExpression
+	if err := json.Unmarshal([]byte(`{"op":"case_when","args":[{"op":"literal","type":"boolean","value":true},{"op":"column","column":"source"},{"op":"literal","type":"integer","sql_type":"int32","value":null}]}`), &expression); err != nil {
+		t.Fatal(err)
+	}
+	if !expression.Op.Valid() || expression.Op != oapi.RelationalExpressionOpCaseWhen || len(expression.Args) != 3 {
+		t.Fatalf("lost conditional contract: %+v", expression)
+	}
+	if expression.Args[1].Column != "source" || expression.Args[2].SqlType != oapi.SQLBuiltinTypeInt32 {
+		t.Fatalf("lost ordered branches or typed fallback: %+v", expression.Args)
+	}
+	encoded, err := json.Marshal(expression)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var restored RelationalScalarExpression
+	if err := json.Unmarshal(encoded, &restored); err != nil {
+		t.Fatal(err)
+	}
+	if restored.Op != expression.Op || len(restored.Args) != 3 || restored.Args[1].Column != "source" {
+		t.Fatalf("conditional changed after transport: %s", encoded)
+	}
+}
+
 func (fn relationalHTTPDoer) Do(req *http.Request) (*http.Response, error) { return fn(req) }
 
 func TestRelationalRowQueryPreservesExactInteger(t *testing.T) {

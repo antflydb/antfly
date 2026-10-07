@@ -765,7 +765,7 @@ pub const documentNumberToF64 = impl.documentNumberToF64;
 fn typedNumericJson(expression: std.json.Value, depth: usize) bool {
     if (depth > 16 or expression != .object) return false;
     if (expression.object.contains("sql_type")) return true;
-    if (expression.object.get("op")) |op| if (op == .string and std.mem.eql(u8, op.string, "cast")) return true;
+    if (expression.object.get("op")) |op| if (op == .string and (std.mem.eql(u8, op.string, "cast") or std.mem.eql(u8, op.string, "case_when"))) return true;
     if (expression.object.get("args")) |args| if (args == .array) for (args.array.items) |arg| {
         if (typedNumericJson(arg, depth + 1)) return true;
     };
@@ -774,7 +774,7 @@ fn typedNumericJson(expression: std.json.Value, depth: usize) bool {
 
 fn typedNumericWire(expression: anytype, depth: usize) bool {
     if (depth > 16) return false;
-    if (expression.sql_type != null or expression.op == .cast) return true;
+    if (expression.sql_type != null or expression.op == .cast or expression.op == .case_when) return true;
     if (expression.args) |args| for (args) |arg| if (typedNumericWire(arg, depth + 1)) return true;
     return false;
 }
@@ -902,6 +902,8 @@ pub fn deriveRelationalCheckLayout(alloc: std.mem.Allocator, schema: ParsedTable
         .default_type = "",
         .ttl_field = "",
         .storage_mode = .relational,
+        .requires_public_schema = true,
+        .requires_typed_expressions = requiresTypedExpressions(schema),
         .relational_columns = try deriveRuntimeRelationalColumns(alloc, schema),
     };
 }

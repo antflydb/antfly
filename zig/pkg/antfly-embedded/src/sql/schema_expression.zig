@@ -20,6 +20,14 @@ const ast = @import("ast.zig");
 const scalar = @import("scalar.zig");
 const Json = std.json.Value;
 
+fn promoteNumeric(alloc: std.mem.Allocator, value: Json, source: scalar.Type, target: scalar.Type) !Json {
+    if (target.kind != .integer and target.kind != .number) return value;
+    const identity: @import("array_value.zig").ElementType = target.element_type orelse if (target.kind == .integer) .int64 else .float64;
+    const source_identity: @import("array_value.zig").ElementType = source.element_type orelse if (source.kind == .integer) .int64 else .float64;
+    if (source.kind == target.kind and source_identity == identity) return value;
+    return json(alloc, .{ .op = "cast", .type = @tagName(target.kind.?), .sql_type = @tagName(identity), .args = &[_]Json{value} });
+}
+
 fn json(alloc: std.mem.Allocator, input: anytype) !Json {
     return std.json.parseFromSliceLeaky(Json, alloc, try std.json.Stringify.valueAlloc(alloc, input, .{}), .{ .parse_numbers = false });
 }
@@ -78,14 +86,10 @@ pub fn lowerColumns(alloc: std.mem.Allocator, columns: []const scalar.Column, ex
                     .add, .subtract, .multiply, .divide => {
                         // The query VM promotes operands at execution time. A
                         // durable program must record that promotion explicitly.
-                        const identity: @import("array_value.zig").ElementType = instruction.type.element_type orelse if (kind == .integer) .int64 else .float64;
                         const indexes = [_]usize{ part.left, part.right };
                         const operands = [_]*Json{ &left, &right };
                         for (indexes, operands) |index, operand| {
-                            const source = program.instructions[index].type;
-                            const source_identity: @import("array_value.zig").ElementType = source.element_type orelse if (source.kind == .integer) .int64 else .float64;
-                            if (source.kind != kind or source_identity != identity)
-                                operand.* = try json(alloc, .{ .op = "cast", .type = @tagName(kind), .sql_type = @tagName(identity), .args = &[_]Json{operand.*} });
+                            operand.* = try promoteNumeric(alloc, operand.*, program.instructions[index].type, instruction.type);
                         }
                     },
                     else => {},
@@ -100,7 +104,11 @@ pub fn lowerColumns(alloc: std.mem.Allocator, columns: []const scalar.Column, ex
                     else => return error.UnsupportedSqlShape,
                 };
                 const args = try alloc.alloc(Json, part.args.len);
-                for (args, part.args) |*arg, index| arg.* = values[index];
+                for (args, part.args) |*arg, index| arg.* = if (part.function == .coalesce)
+                    try promoteNumeric(alloc, values[index], program.instructions[index].type, instruction.type)
+                else
+                    values[index];
+                if (part.function == .coalesce and args.len == 1) break :blk args[0];
                 break :blk try json(alloc, .{ .op = op, .args = args });
             },
             .cast => |part| blk: {
@@ -113,7 +121,22 @@ pub fn lowerColumns(alloc: std.mem.Allocator, columns: []const scalar.Column, ex
                 if (source.element_type != part.element_type) return error.UnsupportedSqlShape;
                 break :blk values[part.operand];
             },
-            .case_when, .in_list => return error.UnsupportedSqlShape,
+            .case_when => |part| blk: {
+                if (part.branches.len == 0 or part.branches.len > 15) return error.SqlLimitExceeded;
+                const args = try alloc.alloc(Json, part.branches.len * 2 + 1);
+                for (part.branches, 0..) |branch, i| {
+                    args[i * 2] = values[branch.condition];
+                    args[i * 2 + 1] = try promoteNumeric(alloc, values[branch.value], program.instructions[branch.value].type, instruction.type);
+                }
+                args[args.len - 1] = if (part.otherwise) |other|
+                    try promoteNumeric(alloc, values[other], program.instructions[other].type, instruction.type)
+                else if (kind == .integer or kind == .number)
+                    try json(alloc, .{ .op = "literal", .type = @tagName(kind), .sql_type = @tagName(instruction.type.element_type orelse if (kind == .integer) @as(@import("array_value.zig").ElementType, .int64) else .float64), .value = @as(?u8, null) })
+                else
+                    try json(alloc, .{ .op = "literal", .type = if (kind == .uuid) "string" else @tagName(kind), .value = @as(?u8, null) });
+                break :blk try json(alloc, .{ .op = "case_when", .args = args });
+            },
+            .in_list => return error.UnsupportedSqlShape,
         };
         const typed_numeric = switch (instruction.operation) {
             .literal => kind == .integer or kind == .number,
@@ -184,6 +207,25 @@ test "SQL schema expressions bind nullable catalog shapes and cold typed arrays"
     var array = try @import("compiler.zig").compileScalar(a, "cold IS NULL", .{});
     defer array.deinit();
     try std.testing.expectError(error.UnsupportedSqlShape, lower(a, schema, array.expression, .boolean));
+}
+
+test "SQL schema conditional expressions enforce durable branch admission" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const columns = [_]scalar.Column{.{ .name = "n", .type = .integer, .element_type = .int16 }};
+    const branches: [16][]const u8 = @splat("WHEN n>0 THEN n ");
+    for ([_]usize{ 15, 16 }) |count| {
+        const sql = try std.mem.concat(a, u8, &.{ "CASE ", try std.mem.join(a, "", branches[0..count]), "ELSE n END" });
+        var compiled = try @import("compiler.zig").compileScalar(a, sql, .{});
+        defer compiled.deinit();
+        if (count == 16) {
+            try std.testing.expectError(error.SqlLimitExceeded, lowerColumns(a, &columns, compiled.expression, null));
+        } else {
+            const lowered = try lowerColumns(a, &columns, compiled.expression, null);
+            try std.testing.expectEqual(@as(usize, 31), lowered.expression.object.get("args").?.array.items.len);
+        }
+    }
 }
 
 test "SQL schema expression catalog decoding rejects malformed and conflicting metadata" {

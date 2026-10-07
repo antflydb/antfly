@@ -13696,7 +13696,7 @@ export interface components {
             aggregates?: components["schemas"]["AlgebraicAggregateConfig"][];
         };
         /** @enum {string} */
-        RelationalExpressionOp: "literal" | "column" | "add" | "subtract" | "multiply" | "divide" | "negate" | "concat" | "coalesce" | "lower_ascii" | "upper_ascii" | "eq" | "ne" | "gt" | "gte" | "lt" | "lte" | "is_null" | "is_not_null" | "is_distinct" | "is_not_distinct" | "and" | "or" | "not" | "cast";
+        RelationalExpressionOp: "literal" | "column" | "add" | "subtract" | "multiply" | "divide" | "negate" | "concat" | "coalesce" | "lower_ascii" | "upper_ascii" | "eq" | "ne" | "gt" | "gte" | "lt" | "lte" | "is_null" | "is_not_null" | "is_distinct" | "is_not_distinct" | "and" | "or" | "not" | "cast" | "case_when";
         /** @enum {string} */
         RelationalExpressionType: "string" | "blob" | "boolean" | "datetime" | "integer" | "number";
         /**
@@ -13735,6 +13735,13 @@ export interface components {
          *     argument, and performs a checked conversion when evaluated (not when
          *     the schema is compiled). Floating-to-integer casts round ties to even.
          *     Only int16/int32/int64/float32/float64 identities are accepted here.
+         *     case_when takes alternating boolean conditions and result expressions,
+         *     followed by a mandatory fallback result (3 to 31 arguments, at most
+         *     15 branches). Conditions are evaluated in order; only the selected
+         *     result is evaluated, and a NULL condition is not TRUE. All result
+         *     expressions must have the same physical type. Numeric SQL lowering
+         *     records builtin result-domain promotions as explicit casts. This
+         *     operation requires schema capability version 18.
          */
         RelationalScalarExpression: {
             op: components["schemas"]["RelationalExpressionOp"];

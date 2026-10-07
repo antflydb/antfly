@@ -13517,9 +13517,14 @@ test "httpx SQL numeric expression schemas preserve deferred defaults atomic wri
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const a = arena.allocator();
-    var compiled = try sources.sql_compiler.compile(a, "CREATE TABLE items (n smallint DEFAULT 32768, f real DEFAULT 0.1, CONSTRAINT sum_positive CHECK (n+n>0))", .{});
+    var compiled = try sources.sql_compiler.compile(a, "CREATE TABLE items (n smallint DEFAULT 32768, f real DEFAULT 0.1, CONSTRAINT sum_positive CHECK (CASE WHEN n IS NULL THEN true WHEN n>0 THEN n+n>0 ELSE false END))", .{});
     defer compiled.deinit();
-    const schema = try sources.sql_ddl_runtime.createSchemaAlloc(a, compiled.statement.create_table);
+    const schema_bytes = try sources.sql_ddl_runtime.createSchemaAlloc(a, compiled.statement.create_table);
+    var schema_json = try std.json.parseFromSliceLeaky(std.json.Value, a, schema_bytes, .{});
+    var index = try sources.sql_compiler.compile(a, "CREATE INDEX conditional_n ON items ((CASE WHEN n IS NULL THEN 0 ELSE CAST(n AS integer) END))", .{});
+    defer index.deinit();
+    try std.testing.expect(try sources.sql_schema_ddl.apply(a, &schema_json, index.statement.catalog_ddl));
+    const schema = try std.json.Stringify.valueAlloc(a, schema_json, .{});
     var directory = try sources.common_test_directory.TestDirectory.init("sql-numeric-expressions");
     defer directory.cleanup();
     var target = try sources.common_test_directory.TestDirectory.init("sql-numeric-expressions-restore");

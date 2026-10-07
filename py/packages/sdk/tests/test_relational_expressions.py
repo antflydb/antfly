@@ -34,3 +34,20 @@ def test_generated_numeric_assignment_cast_preserves_builtin_identity():
     assert model.expression.sql_type is SQLBuiltinType.INT16
     assert model.expression.args[0].sql_type is SQLBuiltinType.INT32
     assert model.to_dict() == value
+
+
+def test_generated_conditional_expression_keeps_order_and_null_fallback():
+    value = {
+        "column": "n",
+        "expression": {
+            "op": "case_when",
+            "args": [
+                {"op": "literal", "type": "boolean", "value": True},
+                {"op": "column", "column": "source"},
+                {"op": "literal", "type": "integer", "sql_type": "int32", "value": None},
+            ],
+        },
+    }
+    model = RelationalColumnExpression.from_dict(value)
+    assert model.expression.op is RelationalExpressionOp.CASE_WHEN
+    assert model.to_dict() == value

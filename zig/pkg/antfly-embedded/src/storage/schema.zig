@@ -267,7 +267,7 @@ pub const TableSchema = struct {
     /// Runtime-only embedders have no public constraints to restore. A schema
     /// derived from the public API must never silently lose those constraints.
     requires_public_schema: bool = false,
-    /// Typed numeric/cast expression semantics require capability 18 even if
+    /// Typed numeric/cast/conditional semantics require capability 18 even if
     /// the table's physical columns use only older coarse scalar layouts.
     requires_typed_expressions: bool = false,
     exact_fields: []const ExactField = &.{},
