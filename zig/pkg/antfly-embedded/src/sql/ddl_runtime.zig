@@ -176,6 +176,23 @@ test "SQL DDL lowers exact defaults nullability and native relational types" {
     try std.testing.expectEqualStrings("id", parsed.value.object.get("document_schemas").?.object.get("row").?.object.get("schema").?.object.get("required").?.array.items[0].string);
 }
 
+test "SQL array DDL refuses schema publication before typed storage admission" {
+    var create = try @import("compiler.zig").compile(std.testing.allocator, "CREATE TABLE arrays (a int4[2][3])", .{});
+    defer create.deinit();
+    try std.testing.expectError(error.UnsupportedSqlShape, createSchemaAlloc(std.testing.allocator, create.statement.create_table));
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var base = try @import("compiler.zig").compile(alloc, "CREATE TABLE arrays (id bigint)", .{});
+    defer base.deinit();
+    const original = try createSchemaAlloc(alloc, base.statement.create_table);
+    var schema = try std.json.parseFromSliceLeaky(std.json.Value, alloc, original, .{});
+    var alter = try @import("compiler.zig").compile(alloc, "ALTER TABLE arrays ADD COLUMN a jsonb[]", .{});
+    defer alter.deinit();
+    try std.testing.expectError(error.UnsupportedSqlShape, @import("schema_ddl.zig").apply(alloc, &schema, alter.statement.catalog_ddl));
+    try std.testing.expectEqualStrings(original, try std.json.Stringify.valueAlloc(alloc, schema, .{}));
+}
+
 test "SQL UUID CREATE TABLE retains typed native schema format" {
     var compiled = try @import("compiler.zig").compile(std.testing.allocator, "CREATE TABLE prepared_usage_records (id uuid)", .{});
     defer compiled.deinit();

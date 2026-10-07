@@ -3828,3 +3828,28 @@ allocation over 10,000 rows and measured approximately 3.7 ms in a debug build
 Mounted HTTP contracts check exact envelopes and
 cross-width array parameters. This remains shared execution progress, not
 additional original-case credit or stored-array activation.
+
+### Declared array schema identity
+
+CREATE TABLE and ALTER TABLE ADD COLUMN now retain the declared builtin element
+identity in the immutable SQL AST, using the same type parser as casts. The
+descriptor distinguishes all nine admitted array element domains, including
+int2/int4/int8 and float4/float8, rather than collapsing an array into JSON or a
+coarse numeric column. Declared dimension counts and sizes do not constrain
+actual PostgreSQL array values and are not retained as type identity.
+
+Native contracts cover sixteen declarations and aliases, CREATE/ALTER descriptor
+equivalence, nullability, malformed dimensions, bounded token admission and
+every allocation-failure point. Independent PostgreSQL catalog checks compare
+exact OIDs and nullability for both DDL forms and verify that empty arrays are
+accepted regardless of declared dimensions. Existing scalar DDL admission is
+unchanged; this does not silently activate narrow scalar storage types merely
+because casts already recognize them.
+
+This is schema-boundary groundwork, not stored-array activation or additional
+original-case credit. Durable schema metadata, physical array cells, native
+read/mutation adaptation and canonical backup/restore validation remain to be
+connected. CREATE array schemas still fail before publication; ALTER failure
+leaves the original schema unchanged. These guards must only be removed after
+the complete typed storage path is verified. The inventory remains 365
+implemented, 136 rejected, 73 superseded and 1,012 unresolved.

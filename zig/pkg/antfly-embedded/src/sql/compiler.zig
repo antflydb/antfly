@@ -1705,6 +1705,19 @@ const Parser = struct {
         return self.fail(error.UnsupportedSqlShape, "unsupported SQL column type");
     }
 
+    fn columnDefinition(self: *Parser, name_value: []const u8) Error!ast.Column {
+        const start = self.pos;
+        const declared = try self.castType();
+        if (declared.type != .array) {
+            // Preserve the scalar DDL admission set until durable schemas can
+            // enforce every precise scalar width. Parsing a cast does not
+            // authorize silently widening a newly accepted stored type.
+            self.pos = start;
+            _ = try self.columnType();
+        }
+        return .{ .name = name_value, .type = declared.type, .element_type = declared.element_type };
+    }
+
     pub fn createTable(self: *Parser) Error!ast.CreateTable {
         const if_not_exists = self.keyword(.@"if");
         if (if_not_exists) {
@@ -1733,7 +1746,7 @@ const Parser = struct {
             if (std.mem.eql(u8, column, "_id")) return self.fail(error.UnsupportedSqlShape, "_id is reserved for row identity");
             const entry = try seen.getOrPut(self.alloc, column);
             if (entry.found_existing) return self.fail(error.DuplicateSqlColumn, "duplicate CREATE TABLE column");
-            var definition: ast.Column = .{ .name = column, .type = try self.columnType() };
+            var definition = try self.columnDefinition(column);
             var null_seen = false;
             var default_seen = false;
             while (true) {
@@ -1809,7 +1822,7 @@ const Parser = struct {
                 }
                 _ = self.keyword(.column);
                 const column_name = try self.identifier();
-                var column: ast.Column = .{ .name = column_name, .type = try self.columnType() };
+                var column = try self.columnDefinition(column_name);
                 if (self.keyword(.not)) {
                     try self.expectKeyword(.null);
                     column.nullable = false;
@@ -2562,6 +2575,84 @@ test "compiler DDL literal defaults and count" {
     defer count.deinit();
     try std.testing.expect(count.statement.select.count_all);
     try std.testing.expectEqualStrings("total", count.statement.select.count_alias.?);
+}
+
+test "compiler array DDL retains PostgreSQL builtin element identity without dimension constraints" {
+    const Element = @import("array_value.zig").ElementType;
+    const cases = .{
+        .{ .declaration = "text[]", .element = Element.text, .oid = @as(u32, 1009) },
+        .{ .declaration = "smallint[]", .element = Element.int16, .oid = @as(u32, 1005) },
+        .{ .declaration = "int2[7]", .element = Element.int16, .oid = @as(u32, 1005) },
+        .{ .declaration = "integer[]", .element = Element.int32, .oid = @as(u32, 1007) },
+        .{ .declaration = "int[][]", .element = Element.int32, .oid = @as(u32, 1007) },
+        .{ .declaration = "int4[2][3]", .element = Element.int32, .oid = @as(u32, 1007) },
+        .{ .declaration = "bigint[]", .element = Element.int64, .oid = @as(u32, 1016) },
+        .{ .declaration = "int8[0]", .element = Element.int64, .oid = @as(u32, 1016) },
+        .{ .declaration = "real[]", .element = Element.float32, .oid = @as(u32, 1021) },
+        .{ .declaration = "float4[]", .element = Element.float32, .oid = @as(u32, 1021) },
+        .{ .declaration = "double precision[]", .element = Element.float64, .oid = @as(u32, 1022) },
+        .{ .declaration = "float8[]", .element = Element.float64, .oid = @as(u32, 1022) },
+        .{ .declaration = "boolean[]", .element = Element.boolean, .oid = @as(u32, 1000) },
+        .{ .declaration = "bool[]", .element = Element.boolean, .oid = @as(u32, 1000) },
+        .{ .declaration = "uuid[]", .element = Element.uuid, .oid = @as(u32, 2951) },
+        .{ .declaration = "jsonb[]", .element = Element.jsonb, .oid = @as(u32, 3807) },
+    };
+    inline for (cases) |case| {
+        var create = try compile(std.testing.allocator, "CREATE TABLE arrays (payload " ++ case.declaration ++ " NOT NULL)", .{});
+        defer create.deinit();
+        const column = create.statement.create_table.columns[0];
+        try std.testing.expectEqual(ast.ColumnType.array, column.type);
+        try std.testing.expectEqual(case.element, column.element_type.?);
+        try std.testing.expectEqual(case.oid, column.element_type.?.arrayOid());
+        try std.testing.expect(!column.nullable);
+        var alter = try compile(std.testing.allocator, "ALTER TABLE arrays ADD COLUMN payload " ++ case.declaration ++ " NOT NULL", .{});
+        defer alter.deinit();
+        try std.testing.expectEqualDeep(column, alter.statement.catalog_ddl.schema_change.?.add_column);
+    }
+}
+
+test "compiler precise DDL descriptors do not silently admit widened scalar storage" {
+    var compiled = try compile(std.testing.allocator, "CREATE TABLE widths (i integer, b bigint, f double precision, j json, a jsonb[])", .{});
+    defer compiled.deinit();
+    const columns = compiled.statement.create_table.columns;
+    try std.testing.expectEqual(@import("array_value.zig").ElementType.int32, columns[0].element_type.?);
+    try std.testing.expectEqual(@import("array_value.zig").ElementType.int64, columns[1].element_type.?);
+    try std.testing.expectEqual(@import("array_value.zig").ElementType.float64, columns[2].element_type.?);
+    try std.testing.expectEqual(ast.ColumnType.json, columns[3].type);
+    try std.testing.expect(columns[3].element_type == null);
+    try std.testing.expectEqual(ast.ColumnType.array, columns[4].type);
+    for ([_][]const u8{ "smallint", "real", "int2", "float4" }) |declaration| {
+        const sql = try std.fmt.allocPrint(std.testing.allocator, "CREATE TABLE widths (i {s})", .{declaration});
+        defer std.testing.allocator.free(sql);
+        try std.testing.expectError(error.UnsupportedSqlShape, compile(std.testing.allocator, sql, .{}));
+    }
+    for ([_][]const u8{
+        "CREATE TABLE arrays (a json[])",
+        "CREATE TABLE arrays (a datetime[])",
+        "CREATE TABLE arrays (a \"integer\"[])",
+    }) |sql| try std.testing.expectError(error.UnsupportedSqlShape, compile(std.testing.allocator, sql, .{}));
+    for ([_][]const u8{
+        "CREATE TABLE arrays (a int[)",
+        "CREATE TABLE arrays (a int[1.5])",
+        "CREATE TABLE arrays (a int[-1])",
+        "CREATE TABLE arrays (a int[2147483648])",
+        "ALTER TABLE arrays ADD COLUMN a int[2",
+    }) |sql| try std.testing.expectError(error.InvalidSqlSyntax, compile(std.testing.allocator, sql, .{}));
+}
+
+fn arrayDdlAllocationFailureCase(alloc: std.mem.Allocator) !void {
+    for ([_][]const u8{
+        "CREATE TABLE arrays (a int2[2][3] NOT NULL, b jsonb[], c uuid[])",
+        "ALTER TABLE arrays ADD COLUMN a double precision[][] NOT NULL",
+    }) |sql| {
+        var compiled = try compile(alloc, sql, .{});
+        defer compiled.deinit();
+    }
+}
+
+test "compiler array DDL releases all allocations on failure and retains bounded parsing" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, arrayDdlAllocationFailureCase, .{});
+    try std.testing.expectError(error.SqlLimitExceeded, compile(std.testing.allocator, "CREATE TABLE arrays (a int[2][3])", .{ .max_tokens = 8 }));
 }
 
 test "compiler balances long boolean chains rather than retaining linear tree depth" {
