@@ -116,7 +116,7 @@ pub const Program = struct {
             ordinal.* = if (old) |index| @intCast(index) else null;
             if (old) |index| {
                 const previous = from[index];
-                if (previous.column_type != column.column_type or previous.is_json != column.is_json or previous.json_kind != column.json_kind)
+                if (previous.column_type != column.column_type or previous.is_json != column.is_json or previous.json_kind != column.json_kind or previous.sql_element_type != column.sql_element_type)
                     return error.RelationalRewriteTypeChange;
             }
         }

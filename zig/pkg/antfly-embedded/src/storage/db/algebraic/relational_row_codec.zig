@@ -337,6 +337,7 @@ fn serializeOrdinalInternal(
             cell.is_dense_vector != (column.column_type == .dense_vector))
             return error.InvalidRelationalRow;
         if (validate_json_cells) try validateCell(alloc, cell);
+        try validateSqlCell(column, cell);
         if (!cell.is_null and isVariableColumn(column)) {
             const bytes = switch (cell.value) {
                 .bytes_val => |value| value,
@@ -1720,6 +1721,7 @@ fn ordinalCellFromPayloadWithValidation(
         .value = typed_value,
     };
     if (!cellValueIsSerializable(cell)) return error.InvalidRelationalRow;
+    try validateSqlCell(column, cell);
     // Consumers address f32 elements directly; retain this structural check
     // even when semantic payload validation was done at the ingestion boundary.
     if (!is_null and cell.is_dense_vector and payload.len % @sizeOf(f32) != 0)
@@ -2030,6 +2032,106 @@ fn cellValueIsSerializable(cell: Cell) bool {
         },
         else => true,
     };
+}
+
+/// Allocation-free exact-type checks apply to both prepared writes and strict
+/// restore/read validation. A trusted physical checksum does not authorize a
+/// value outside its immutable declared SQL domain.
+fn validateSqlCell(column: runtime_schema.RelationalColumn, cell: Cell) !void {
+    const kind = column.sql_element_type orelse return;
+    if (cell.is_null) return;
+    switch (kind) {
+        .int16, .int32, .int64 => {
+            if (cell.value != .i64_val) return error.InvalidRelationalRow;
+            if ((kind == .int16 and std.math.cast(i16, cell.value.i64_val) == null) or
+                (kind == .int32 and std.math.cast(i32, cell.value.i64_val) == null)) return error.InvalidRelationalRow;
+        },
+        .float32, .float64 => {
+            if (cell.value != .f64_val or !std.math.isFinite(cell.value.f64_val)) return error.InvalidRelationalRow;
+            if (kind == .float32) {
+                const narrowed: f32 = @floatCast(cell.value.f64_val);
+                if (@as(f64, narrowed) != cell.value.f64_val) return error.NonCanonicalRelationalRow;
+            }
+        },
+        .text, .uuid => {
+            if (cell.value != .bytes_val or !std.unicode.utf8ValidateSlice(cell.value.bytes_val) or
+                std.mem.indexOfScalar(u8, cell.value.bytes_val, 0) != null) return error.InvalidRelationalRow;
+            if (kind == .uuid) {
+                const uuid = @import("../../../common/uuid.zig");
+                const canonical = uuid.format(uuid.parse(cell.value.bytes_val) catch return error.InvalidRelationalRow);
+                if (!std.mem.eql(u8, &canonical, cell.value.bytes_val)) return error.NonCanonicalRelationalRow;
+            }
+        },
+        .boolean => if (cell.value != .bool_val) return error.InvalidRelationalRow,
+        .jsonb => if (cell.value != .bytes_val or !cell.is_json) return error.InvalidRelationalRow,
+    }
+}
+
+test "relational index system SQL cells enforce exact domains on writes and checksummed restore" {
+    const Type = @import("../../../common/sql_builtin_type.zig").Type;
+    const Case = struct { kind: Type, physical: runtime_schema.RelationalColumnType, value: typed_dv.TypedValue, err: ?anyerror = null };
+    const cases = [_]Case{
+        .{ .kind = .int16, .physical = .integer, .value = .{ .i64_val = -32768 } },
+        .{ .kind = .int16, .physical = .integer, .value = .{ .i64_val = 32767 } },
+        .{ .kind = .int16, .physical = .integer, .value = .{ .i64_val = -32769 }, .err = error.InvalidRelationalRow },
+        .{ .kind = .int16, .physical = .integer, .value = .{ .i64_val = 32768 }, .err = error.InvalidRelationalRow },
+        .{ .kind = .int32, .physical = .integer, .value = .{ .i64_val = -2147483648 } },
+        .{ .kind = .int32, .physical = .integer, .value = .{ .i64_val = 2147483647 } },
+        .{ .kind = .int32, .physical = .integer, .value = .{ .i64_val = 2147483648 }, .err = error.InvalidRelationalRow },
+        .{ .kind = .int64, .physical = .integer, .value = .{ .i64_val = 9007199254740993 } },
+        .{ .kind = .float32, .physical = .number, .value = .{ .f64_val = @as(f32, 0.1) } },
+        .{ .kind = .float32, .physical = .number, .value = .{ .f64_val = -0.0 } },
+        .{ .kind = .float32, .physical = .number, .value = .{ .f64_val = 0.1 }, .err = error.NonCanonicalRelationalRow },
+        .{ .kind = .float32, .physical = .number, .value = .{ .f64_val = 3.4e39 }, .err = error.NonCanonicalRelationalRow },
+        .{ .kind = .float64, .physical = .number, .value = .{ .f64_val = 0.1 } },
+        .{ .kind = .text, .physical = .string, .value = .{ .bytes_val = "hello" } },
+        .{ .kind = .text, .physical = .string, .value = .{ .bytes_val = "a\x00b" }, .err = error.InvalidRelationalRow },
+        .{ .kind = .uuid, .physical = .string, .value = .{ .bytes_val = "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11" } },
+        .{ .kind = .uuid, .physical = .string, .value = .{ .bytes_val = "A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11" }, .err = error.NonCanonicalRelationalRow },
+        .{ .kind = .uuid, .physical = .string, .value = .{ .bytes_val = "invalid" }, .err = error.InvalidRelationalRow },
+        .{ .kind = .boolean, .physical = .boolean, .value = .{ .bool_val = true } },
+        .{ .kind = .jsonb, .physical = .json, .value = .{ .bytes_val = "null" } },
+    };
+    const alloc = std.testing.allocator;
+    for (cases) |case| {
+        const column: runtime_schema.RelationalColumn = .{
+            .name = "v",
+            .path = "v",
+            .column_type = case.physical,
+            .sql_element_type = case.kind,
+            .allows_null = true,
+            .is_json = case.kind == .jsonb,
+            .json_kind = if (case.kind == .jsonb) .any else .none,
+        };
+        const cell: Cell = .{ .ordinal = 0, .path = "v", .value_type = columnValueType(case.physical), .value = case.value, .is_json = column.is_json };
+        var untyped = column;
+        untyped.sql_element_type = null;
+        // A physically valid old-domain row has a correct checksum. Admission
+        // under a precise schema must still enforce that schema's domain.
+        const bytes = try serializeOrdinal(alloc, 1, &.{untyped}, &.{cell}, @splat(0));
+        defer alloc.free(bytes);
+        const table: runtime_schema.TableSchema = .{ .version = 1, .storage_mode = .relational, .relational_columns = &.{column} };
+        var layout = try PhysicalLayout.init(alloc, table);
+        defer layout.deinit();
+        if (case.err) |err| {
+            try std.testing.expectError(err, serializeOrdinal(alloc, 1, &.{column}, &.{cell}, @splat(0)));
+            try std.testing.expectError(err, serializePreparedOrdinal(alloc, 1, &.{column}, &.{cell}, @splat(0)));
+            try std.testing.expectError(err, validateOrdinalWithLayout(bytes, table, &layout));
+            try std.testing.expectError(err, findCellByOrdinalWithLayout(bytes, table, &layout, 0));
+        } else {
+            const precise = try serializeOrdinal(alloc, 1, &.{column}, &.{cell}, @splat(0));
+            defer alloc.free(precise);
+            try std.testing.expectEqualSlices(u8, bytes, precise);
+            try validateOrdinalWithLayout(bytes, table, &layout);
+            const read = (try findCellByOrdinalWithLayout(bytes, table, &layout, 0)).?;
+            try std.testing.expectEqualDeep(case.value, read.value);
+        }
+        var sql_null = cell;
+        sql_null.is_null = true;
+        const null_bytes = try serializeOrdinal(alloc, 1, &.{column}, &.{sql_null}, @splat(0));
+        defer alloc.free(null_bytes);
+        try validateOrdinalWithLayout(null_bytes, table, &layout);
+    }
 }
 
 fn validateCell(alloc: Allocator, cell: Cell) !void {

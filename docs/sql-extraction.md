@@ -3853,3 +3853,35 @@ connected. CREATE array schemas still fail before publication; ALTER failure
 leaves the original schema unchanged. These guards must only be removed after
 the complete typed storage path is verified. The inventory remains 365
 implemented, 136 rejected, 73 superseded and 1,012 unresolved.
+
+### Durable precise SQL type contracts
+
+SQL binding and immutable runtime schemas share one storage-independent builtin
+identity definition, retaining the existing scalar/array PostgreSQL OIDs.
+Runtime schema format 16 adds an optional precise SQL descriptor per physical
+column. Canonical schema equality includes it; serializing a declared type into
+an older format fails instead of silently dropping the descriptor. The decoder
+preflights descriptor tags, complete structure and physical-type compatibility
+before ownership transfers. Schemas without precise declarations retain their
+existing SQL admission behavior.
+
+Prepared and ordinary row encoding, strict decode/restore, and projected reads
+check declared integer widths, canonical float4 widening, UUID spelling and
+SQL text encoding without allocating. A physically valid checksum alone does
+not admit an out-of-domain value. Existing native limitations on nonfinite
+scalar number cells remain explicit; this does not claim stored PostgreSQL
+NaN/infinity support. Index-cover fingerprints and source binding retain the
+precise descriptor. Ordered tuple and expression fingerprints also bind their
+declared domains, and cold tuple/row source binding rejects an unconverted
+domain change even when coarse physical types match. Byte-retaining rewrite
+plans refuse descriptor changes
+until an explicit typed conversion path exists. Full-text projection identity
+does not change merely because this SQL metadata is present.
+
+Deployed format-15 document/relational catalogs remain readable without a write
+on open. New schema publication atomically advances the catalog capability to
+the runtime schema format; a catalog that advertises only format 15 cannot
+authorize a schema carrying precise descriptors. This is native storage
+groundwork: public schema/DDL activation, stored array cells, and the complete
+typed read/mutation/backup path are still unfinished. No original-case
+dispositions are credited for this infrastructure alone.

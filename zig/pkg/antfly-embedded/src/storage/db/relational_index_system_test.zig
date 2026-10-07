@@ -32,6 +32,46 @@ test {
     _ = @import("antfly_server_test_sources").local_test_sources.storage_retained_read_registry;
 }
 
+test "relational index system SQL precise schema publication upgrades catalog atomically and survives LSM reopen" {
+    const storage_schema = @import("../schema.zig");
+    const catalog = @import("table_catalog.zig");
+    var directory = try @import("../../common/test_directory.zig").TestDirectory.init("sql-precise-type-reopen");
+    defer directory.cleanup();
+    {
+        var db = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false });
+        defer db.close();
+        // A deployed document owner with no schema requires only format 15.
+        // Seed the durable fixture; do not introduce an upgrade write on open.
+        var previous = db.core.table_catalog;
+        previous.schema_format_version = 15;
+        const bytes = previous.encode();
+        var transaction = try db.core.store.beginWriteTxn();
+        errdefer transaction.abort();
+        try transaction.put(catalog.key, &bytes);
+        try transaction.commit();
+    }
+    {
+        var db = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false });
+        defer db.close();
+        try std.testing.expectEqual(@as(u32, 15), db.core.table_catalog.schema_format_version);
+        try db.setSchema(.{ .version = 1, .storage_mode = .relational, .relational_columns = &.{.{ .name = "n", .path = "n", .column_type = .integer, .sql_element_type = .int16 }} });
+        try std.testing.expectEqual(storage_schema.storage_format_version, db.core.table_catalog.schema_format_version);
+        try db.batch(.{ .writes = &.{.{ .key = "valid", .value = "{\"n\":32767}" }} });
+        try std.testing.expectError(error.InvalidRelationalRow, db.batch(.{ .writes = &.{ .{ .key = "not-committed", .value = "{\"n\":1}" }, .{ .key = "invalid", .value = "{\"n\":32768}" } } }));
+        try std.testing.expect((try db.get(alloc, "not-committed")) == null);
+        try std.testing.expect((try db.get(alloc, "invalid")) == null);
+    }
+    var reopened = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false });
+    defer reopened.close();
+    try std.testing.expectEqual(storage_schema.storage_format_version, reopened.core.table_catalog.schema_format_version);
+    try std.testing.expectEqual(@import("../../common/sql_builtin_type.zig").Type.int16, reopened.core.schema.?.relational_columns[0].sql_element_type.?);
+    const bytes = (try reopened.get(alloc, "valid")).?;
+    defer alloc.free(bytes);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(i64, 32767), parsed.value.object.get("n").?.integer);
+}
+
 test "relational index system statement fence never waits on partial prepared transactions" {
     var directory = try @import("../../common/test_directory.zig").TestDirectory.init("statement-fence");
     defer directory.cleanup();

@@ -27,44 +27,7 @@ pub const Budget = json_order.Budget;
 
 /// Element widths are part of the type, not inferred from JSON payload shape.
 /// Text uses the binary/C collation. Other collations require a bound codec.
-pub const ElementType = enum {
-    text,
-    int16,
-    int32,
-    int64,
-    float32,
-    float64,
-    boolean,
-    uuid,
-    jsonb,
-
-    pub fn oid(self: ElementType) u32 {
-        return switch (self) {
-            .text => 25,
-            .int16 => 21,
-            .int32 => 23,
-            .int64 => 20,
-            .float32 => 700,
-            .float64 => 701,
-            .boolean => 16,
-            .uuid => 2950,
-            .jsonb => 3802,
-        };
-    }
-    pub fn arrayOid(self: ElementType) u32 {
-        return switch (self) {
-            .text => 1009,
-            .int16 => 1005,
-            .int32 => 1007,
-            .int64 => 1016,
-            .float32 => 1021,
-            .float64 => 1022,
-            .boolean => 1000,
-            .uuid => 2951,
-            .jsonb => 3807,
-        };
-    }
-};
+pub const ElementType = @import("../common/sql_builtin_type.zig").Type;
 
 pub const Dimension = struct { length: u32, lower: i32 = 1 };
 pub const Limits = struct { elements: usize = 65536, bytes: usize = 8 * 1024 * 1024, work: usize = 1_048_576 };

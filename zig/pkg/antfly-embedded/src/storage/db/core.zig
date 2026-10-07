@@ -1541,6 +1541,9 @@ pub const DBCore = struct {
         next_catalog.mode_initialized = true;
         next_catalog.storage_mode = table_schema.storage_mode;
         next_catalog.active_schema_version = table_schema.version;
+        // This transaction publishes the current runtime schema encoding and
+        // its capability requirement together, including same-epoch retries.
+        next_catalog.schema_format_version = schema_mod.storage_format_version;
         if (reconciled_row_count) |row_count| next_catalog.row_count = @intFromBool(row_count != 0);
         next_catalog.reconciled = true;
         const same_index_catalog = if (prepared.relational_indexes) |indexes|

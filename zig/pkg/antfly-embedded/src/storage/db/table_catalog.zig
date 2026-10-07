@@ -118,7 +118,10 @@ pub const Catalog = struct {
             if (reserved != 0) return error.InvalidTableCatalog;
         };
         if (catalog.transaction_admission_bytes == 0) return error.InvalidTableCatalog;
-        if (catalog.schema_format_version != schema_mod.storage_format_version or
+        // The preceding deployed schema format remains readable. Merely
+        // opening an owner must not rewrite it or make all document tables
+        // unavailable when precise SQL descriptors are introduced.
+        if ((catalog.schema_format_version != 15 and catalog.schema_format_version != schema_mod.storage_format_version) or
             catalog.row_format_version != row_codec.ordinal_version)
             return error.UnsupportedTableCapabilityVersion;
         return catalog;
@@ -132,6 +135,9 @@ pub const Catalog = struct {
             if (!self.mode_initialized or self.storage_mode != schema.storage_mode or
                 self.active_schema_version != schema.version)
                 return error.TableCatalogSchemaMismatch;
+            if (self.schema_format_version < 16) for (schema.relational_columns) |column| {
+                if (column.sql_element_type != null) return error.UnsupportedTableCapabilityVersion;
+            };
             return;
         }
         if (self.storage_mode != .document or self.active_schema_version != 0)
@@ -146,6 +152,24 @@ pub fn load(alloc: std.mem.Allocator, store: anytype) !?Catalog {
     };
     defer alloc.free(raw);
     return try Catalog.decode(raw);
+}
+
+test "relational index system SQL catalog admits deployed schemas but fences precise type capabilities" {
+    const old: Catalog = .{ .schema_format_version = 15, .mode_initialized = true, .storage_mode = .relational, .active_schema_version = 1 };
+    const raw = old.encode();
+    const decoded = try Catalog.decode(&raw);
+    const plain: schema_mod.TableSchema = .{ .version = 1, .storage_mode = .relational, .relational_columns = &.{.{ .name = "n", .path = "n", .column_type = .integer }} };
+    try decoded.validateForSchema(plain);
+    var typed = plain;
+    typed.relational_columns = &.{.{ .name = "n", .path = "n", .column_type = .integer, .sql_element_type = .int32 }};
+    try std.testing.expectError(error.UnsupportedTableCapabilityVersion, decoded.validateForSchema(typed));
+    var current = old;
+    current.schema_format_version = schema_mod.storage_format_version;
+    const current_raw = current.encode();
+    try (try Catalog.decode(&current_raw)).validateForSchema(typed);
+    var unsupported = raw;
+    std.mem.writeInt(u32, unsupported[16..20], 14, .little);
+    try std.testing.expectError(error.UnsupportedTableCapabilityVersion, Catalog.decode(&unsupported));
 }
 
 test "table catalog has a stable canonical representation" {

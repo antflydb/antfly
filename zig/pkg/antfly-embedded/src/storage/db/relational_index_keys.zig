@@ -192,6 +192,16 @@ pub const TuplePlan = struct {
             if (key.expression) |expression| hasher.update(&expression.fingerprint);
             hasher.update(&.{ @backingInt(key.column_type), @intFromBool(key.descending), @intFromBool(key.nulls_first), @intFromBool(key.fold_ascii) });
         }
+        const has_sql_types = for (keys) |key| {
+            if (key.expression == null and table_schema.relational_columns[key.ordinal].sql_element_type != null) break true;
+        } else false;
+        if (has_sql_types) {
+            hasher.update("antfly:ordered-tuple:sql-types:v1\x00");
+            for (keys) |key| {
+                const kind = if (key.expression == null) table_schema.relational_columns[key.ordinal].sql_element_type else null;
+                hasher.update(&.{if (kind) |value| @backingInt(value) + 1 else 0});
+            }
+        }
         var fingerprint: [std.crypto.hash.Blake3.digest_length]u8 = undefined;
         hasher.final(&fingerprint);
         return .{ .alloc = alloc, .layout = layout, .columns = table_schema.relational_columns, .keys = keys, .fingerprint = fingerprint };
@@ -214,6 +224,7 @@ pub const TuplePlan = struct {
             return std.mem.eql(u8, &expression.fingerprint, &rhs.fingerprint);
         }
         if (right.expression != null) return false;
+        if (self.columns[left.ordinal].sql_element_type != other.columns[right.ordinal].sql_element_type) return false;
         return std.mem.eql(u8, self.columns[left.ordinal].name, other.columns[right.ordinal].name);
     }
 
@@ -248,7 +259,8 @@ pub const TuplePlan = struct {
             const name = self.columns[original.ordinal].name;
             const ordinal = layout.ordinalForName(source.relational_columns, name) orelse
                 return error.RelationalIndexColumnNotFound;
-            if (source.relational_columns[ordinal].column_type != original.column_type)
+            if (source.relational_columns[ordinal].column_type != original.column_type or
+                source.relational_columns[ordinal].sql_element_type != self.columns[original.ordinal].sql_element_type)
                 return error.RelationalIndexColumnTypeMismatch;
             key.ordinal = @intCast(ordinal);
             initialized += 1;
@@ -771,6 +783,37 @@ test "relational tuple wide row allocation benchmark and append rollback" {
     try output.appendSlice(alloc, "existing-prefix");
     try std.testing.expectError(error.OutOfMemory, wide_plan.append(no_alloc.allocator(), &output, view));
     try std.testing.expectEqualStrings("existing-prefix", output.items);
+}
+
+test "relational index system SQL tuples bind precise direct and expression domains across cold sources" {
+    const alloc = std.testing.allocator;
+    const old: schema.TableSchema = .{ .version = 1, .storage_mode = .relational, .relational_columns = &.{.{ .name = "n", .path = "n", .column_type = .integer, .sql_element_type = .int16 }} };
+    const current: schema.TableSchema = .{ .version = 2, .storage_mode = .relational, .relational_columns = &.{.{ .name = "n", .path = "n", .column_type = .integer, .sql_element_type = .int32 }} };
+    var old_layout = try rows.PhysicalLayout.init(alloc, old);
+    defer old_layout.deinit();
+    var current_layout = try rows.PhysicalLayout.init(alloc, current);
+    defer current_layout.deinit();
+    for ([_]indexes.RelationalIndexKey{
+        .{ .column = "n" },
+        .{ .expression_json = "{\"op\":\"column\",\"column\":\"n\"}", .result_type = .integer },
+    }) |definition| {
+        var before = try TuplePlan.init(alloc, old, &old_layout, &.{definition});
+        defer before.deinit();
+        var after = try TuplePlan.init(alloc, current, &current_layout, &.{definition});
+        defer after.deinit();
+        try std.testing.expect(!std.mem.eql(u8, &before.fingerprint, &after.fingerprint));
+        try std.testing.expect(!before.sameEqualityKey(0, after, 0));
+        try std.testing.expectError(error.RelationalIndexColumnTypeMismatch, after.projectSource(alloc, old, &old_layout));
+        var same = try after.projectSource(alloc, current, &current_layout);
+        defer same.deinit();
+        try std.testing.expectEqualSlices(u8, &same.fingerprint, &after.fingerprint);
+        const cells = [_]rows.Cell{.{ .ordinal = 0, .path = "n", .value_type = .i64_val, .value = .{ .i64_val = 7 } }};
+        var old_tuple = try testTupleAlloc(alloc, before, old, &cells);
+        defer old_tuple.deinit(alloc);
+        var new_tuple = try testTupleAlloc(alloc, after, current, &cells);
+        defer new_tuple.deinit(alloc);
+        try std.testing.expectEqualSlices(u8, old_tuple.bytes, new_tuple.bytes);
+    }
 }
 
 test "relational tuple definition identity tracks semantics instead of epoch placement" {

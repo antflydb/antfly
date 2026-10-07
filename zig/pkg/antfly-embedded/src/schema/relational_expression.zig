@@ -390,6 +390,10 @@ const Compiler = struct {
                 if (std.mem.indexOfScalar(u32, self.dependencies.items, node.ordinal) == null) try self.dependencies.append(self.alloc, node.ordinal);
                 self.frame(name.string);
                 self.frame(@tagName(node.kind));
+                if (self.table.relational_columns[node.ordinal].sql_element_type) |kind| {
+                    self.frame("precise SQL builtin type");
+                    self.frame(@tagName(kind));
+                }
             },
             else => {
                 const args = input.object.get("args") orelse return error.InvalidRelationalExpression;
