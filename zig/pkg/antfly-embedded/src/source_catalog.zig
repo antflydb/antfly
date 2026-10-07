@@ -259,6 +259,7 @@ pub const storage_db_artifact_producer_baseline = @import("storage/db/artifact_p
 pub const storage_db_artifact_producer_context = @import("storage/db/artifact_producer_context.zig");
 pub const storage_db_artifact_producer_dispatch = @import("storage/db/artifact_producer_dispatch.zig");
 pub const storage_db_artifact_producer_input = @import("storage/db/artifact_producer_input.zig");
+pub const storage_db_artifact_producer_readiness = @import("storage/db/artifact_producer_readiness.zig");
 pub const storage_db_artifact_producer_obligations = @import("storage/db/artifact_producer_obligations.zig");
 pub const storage_db_artifact_producer_provenance = @import("storage/db/artifact_producer_provenance.zig");
 pub const storage_db_artifact_producer_retry = @import("storage/db/artifact_producer_retry.zig");

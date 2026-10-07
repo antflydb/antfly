@@ -458,6 +458,8 @@ const CoverageOutcomeTransition = struct {
     marker_key: []u8,
     counter_keys: [coverage_outcome_count][]u8,
     failure_guards: std.ArrayListUnmanaged(FailureIdentity) = .empty,
+    source_specific: bool = false,
+    source_document: ?[]u8 = null,
 };
 
 const graph_stage_prefix = "\x00\x00__graph_stage__:v1:";
@@ -2152,6 +2154,7 @@ fn enrichmentErrorDisposition(err: anyerror) EnrichmentErrorDisposition {
         => .fatal_worker,
 
         error.InvalidAssetProducerConfig,
+        error.ModelNotFound,
         error.GenerateBatchItemRejected,
         error.InvalidExtractorResponse,
         error.InvalidDocumentExtractionConfig,
@@ -2160,6 +2163,12 @@ fn enrichmentErrorDisposition(err: anyerror) EnrichmentErrorDisposition {
         error.InvalidEmbeddingResponse,
         error.InvalidEmbeddingDimensions,
         error.ReadRequestFailed,
+        error.ExtractionInvalidRequest,
+        error.ExtractionUnauthorized,
+        error.ExtractionForbidden,
+        error.ExtractionNotFound,
+        error.ExtractionRequestTooLarge,
+        error.ExtractionRequestRejected,
         error.OcrPromptEcho,
         error.TrivialOcrOutput,
         error.UnsupportedEmbeddingProvider,
@@ -2663,7 +2672,7 @@ fn isEnrichmentControlError(err: anyerror) bool {
 }
 
 test "enrichment distinguishes transient capacity from permanent resource limits" {
-    try std.testing.expect(isRetryableEnrichmentError(error.ModelNotFound));
+    try std.testing.expect(!isRetryableEnrichmentError(error.ModelNotFound));
     try std.testing.expect(isRetryableEnrichmentError(error.ResourceTemporarilyUnavailable));
     try std.testing.expect(!isRetryableEnrichmentError(error.ResourceLimitExceeded));
 }
@@ -2673,6 +2682,11 @@ test "enrichment retries unknown errors and isolates known permanent errors" {
     try std.testing.expectEqual(EnrichmentErrorDisposition.terminal_request, enrichmentErrorDisposition(error.UnsupportedEmbeddingProvider));
     try std.testing.expectEqual(EnrichmentErrorDisposition.terminal_request, enrichmentErrorDisposition(error.InvalidEmbeddingDimensions));
     try std.testing.expectEqual(EnrichmentErrorDisposition.terminal_request, enrichmentErrorDisposition(error.ReadRequestFailed));
+    inline for (.{ error.ExtractionInvalidRequest, error.ExtractionUnauthorized, error.ExtractionForbidden, error.ExtractionNotFound, error.ExtractionRequestTooLarge, error.ExtractionRequestRejected }) |err| {
+        try std.testing.expectEqual(EnrichmentErrorDisposition.terminal_request, enrichmentErrorDisposition(err));
+    }
+    try std.testing.expectEqual(EnrichmentErrorDisposition.retryable_request, enrichmentErrorDisposition(error.ExtractionRateLimited));
+    try std.testing.expectEqual(EnrichmentErrorDisposition.retryable_request, enrichmentErrorDisposition(error.ExtractionTransientFailure));
     try std.testing.expectEqual(EnrichmentErrorDisposition.terminal_request, enrichmentErrorDisposition(error.OcrPromptEcho));
     try std.testing.expectEqual(EnrichmentErrorDisposition.terminal_request, enrichmentErrorDisposition(error.TrivialOcrOutput));
     try std.testing.expectEqual(EnrichmentErrorDisposition.fatal_worker, enrichmentErrorDisposition(error.OutOfMemory));
@@ -9647,7 +9661,7 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
     try scheduler.restoreTextUnits(alloc, &units);
     try std.testing.expectEqual(@as(usize, 0), scheduler.typed_replay_transactions);
     scheduler.current = 1;
-    try completeRuntimeDocumentExtractionGeneratedTextBatchWithAllocator(&runtime, alloc, alloc, producer, config, .{ .max_items = 2, .max_bytes = 64 * 1024 * 1024 }, "https://example.test/source.pdf", "content-identity", "pdf", "application/pdf", &units, .ocr, null);
+    try completeRuntimeDocumentExtractionGeneratedTextBatchWithAllocator(&runtime, alloc, alloc, producer, config, .{ .max_items = 2, .max_bytes = 64 * 1024 * 1024 }, "https://example.test/source.pdf", &.{}, "content-identity", "pdf", "application/pdf", &units, .ocr, null);
     try std.testing.expect(std.mem.startsWith(u8, units[0].text, "Reader"));
     try std.testing.expect(std.mem.startsWith(u8, units[1].text, "Reader"));
     try std.testing.expectEqual(@as(usize, 1), scheduler.typed_replay_transactions);
@@ -10296,7 +10310,7 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
             const first_page = batch.results[0].rendered.?;
             const second_page = batch.results[1].rendered.?;
             const pixels = @max(@as(u64, first_page.width) * first_page.height, @as(u64, second_page.width) * second_page.height);
-            try completeRuntimeDocumentExtractionGeneratedTextBatchWithAllocator(&runtime, alloc, alloc, bounded_producer, config, .{ .max_items = 2, .render_items = 2, .max_bytes = 64 * 1024 * 1024, .max_pixels = pixels }, "source.pdf", "pixel-owner", "pdf", "application/pdf", &pending, .ocr, coordinator);
+            try completeRuntimeDocumentExtractionGeneratedTextBatchWithAllocator(&runtime, alloc, alloc, bounded_producer, config, .{ .max_items = 2, .render_items = 2, .max_bytes = 64 * 1024 * 1024, .max_pixels = pixels }, "source.pdf", &.{}, "pixel-owner", "pdf", "application/pdf", &pending, .ocr, coordinator);
             try std.testing.expectEqual(@as(usize, 2), owner.calls);
             try std.testing.expect(!owner.rejected_oversize);
             for (pending) |unit| try std.testing.expectEqualStrings("completed", unit.extraction_status.?);
@@ -12219,6 +12233,15 @@ fn processAsset(
 
     if (producer_cfg.type == .document_extraction) {
         try processDocumentExtractionAsset(runtime, request, raw, source_text, producer_cfg.config_json, key, prepared_sources, window);
+        // Failed/empty extraction owns its explicit outcome below. A converged
+        // manifest is the final receipt after all unit/chunk publication.
+        const manifest = try storeGetOptionalAllocWithRetry(runtime, key);
+        defer if (manifest) |value| runtime.alloc.free(value);
+        if (manifest) |value| {
+            if (!try documentExtractionManifestHasLastError(runtime.alloc, value) and
+                !try documentExtractionEmptyCoverageIsTerminalFailure(runtime.alloc, value))
+                try queueArtifactCoverageOutcomeForRequest(runtime, window, request, .produced);
+        }
         return;
     }
 
@@ -15434,6 +15457,7 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatchWithBackingAllocator(
         config,
         batch_policy,
         source_url,
+        source_bytes,
         source_fingerprint,
         route_type,
         source_content_type,
@@ -17291,6 +17315,7 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatchWithAllocator(
     config: document_extraction_mod.Config,
     batch_policy: GeneratedTextBatchPolicy,
     source_url: []const u8,
+    source_bytes: []const u8,
     source_fingerprint: []const u8,
     route_type: []const u8,
     source_content_type: []const u8,
@@ -17325,6 +17350,8 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatchWithAllocator(
         .ocr => document_extraction_mod.effectiveOcrConfigJson(config),
         .transcript => config.transcription_config_json,
     };
+    const borrowed_audio = kind == .transcript and (try isAppleGeneratedTextProvider(working_alloc, config_json));
+    const audio_media = [_]asset_producer_mod.EncodedMedia{.{ .bytes = source_bytes, .mime_type = source_content_type }};
     const method = switch (kind) {
         .ocr => "ocr_text",
         .transcript => "transcript_text",
@@ -17603,7 +17630,8 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatchWithAllocator(
             .source_text = if (has_rendered_media) "" else source_url,
             .source_parts_json = parts_json,
             .content_type = runtimeGeneratedTextContentType(kind, producer_type),
-            .inline_media_trusted = has_rendered_media,
+            .inline_media_trusted = has_rendered_media or borrowed_audio,
+            .media = if (borrowed_audio) &audio_media else &.{},
             .source_fingerprint = source_fingerprint,
             .item_id = unit.unit_id,
             .page_number = unit.page_number,
@@ -18282,7 +18310,12 @@ fn applyRuntimeGeneratedUnitTextInPlace(
     defer parsed.deinit(alloc);
     var grounded_ocr_text_len: usize = if (kind == .ocr) parsed.text.len else 0;
     if (kind == .ocr and document_extraction_mod.isOcrPromptEcho(parsed.text, ocr_prompt)) return error.OcrPromptEcho;
-    if (kind == .ocr and !document_extraction_mod.hasMeaningfulOcrContent(parsed.text)) return error.TrivialOcrOutput;
+    // A validated reader response with no observations is a successful OCR
+    // attempt (photos, blank and redacted pages commonly have no text). Empty
+    // generator/plain output and punctuation remain invalid, not silent success.
+    const reader_no_text = kind == .ocr and output_mode == .structured_reader and
+        std.mem.trim(u8, parsed.text, &std.ascii.whitespace).len == 0 and parsed.regions.len == 0;
+    if (kind == .ocr and !reader_no_text and !document_extraction_mod.hasMeaningfulOcrContent(parsed.text)) return error.TrivialOcrOutput;
     if (kind == .ocr) {
         if (unit.ocr_failure_stage) |value| alloc.free(value);
         unit.ocr_failure_stage = null;
@@ -18304,7 +18337,7 @@ fn applyRuntimeGeneratedUnitTextInPlace(
             unit.ocr_output_quality = owned_output_quality;
         }
         if (text_choice == .embedded) {
-            const owned_extraction_status = try alloc.dupe(u8, "completed_embedded_preferred");
+            const owned_extraction_status = try alloc.dupe(u8, if (reader_no_text and std.mem.trim(u8, unit.text, &std.ascii.whitespace).len == 0) "completed_no_text" else "completed_embedded_preferred");
             errdefer alloc.free(owned_extraction_status);
             const owned_method = try alloc.dupe(u8, "pdf_text");
             errdefer alloc.free(owned_method);
@@ -18357,7 +18390,7 @@ fn applyRuntimeGeneratedUnitTextInPlace(
     }
     const owned_method = try alloc.dupe(u8, method);
     errdefer alloc.free(owned_method);
-    const owned_status = try alloc.dupe(u8, status);
+    const owned_status = try alloc.dupe(u8, if (reader_no_text) "completed_no_text" else status);
     errdefer alloc.free(owned_status);
 
     const render_warning = unit.extraction_warning;
@@ -18382,7 +18415,7 @@ fn applyRuntimeGeneratedUnitTextInPlace(
     unit.extraction_status = owned_status;
     switch (kind) {
         .ocr => {
-            unit.ocr_used = true;
+            unit.ocr_used = !reader_no_text;
             unit.ocr_confidence = parsed.confidence;
             unit.ocr_bbox = parsed.bbox;
             if (unit.text_regions.len > 0) alloc.free(unit.text_regions);
@@ -22684,457 +22717,23 @@ fn runtimeAppendRelationItem(
     artifact_value: std.json.Value,
     edge_limit: usize,
 ) !void {
-    if (item != .object) return;
-    const mapped_edge_type = if (mapping.edge_type_template.len > 0)
-        try runtimeRenderGraphArtifactTemplateAlloc(alloc, mapping.edge_type_template, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value)
-    else
-        null;
-    defer if (mapped_edge_type) |value| alloc.free(value);
-    const edge_type = if (mapped_edge_type) |value|
-        std.mem.trim(u8, value, &std.ascii.whitespace)
-    else
-        runtimeJsonStringField(item, "type") orelse runtimeJsonStringField(item, "edge_type") orelse runtimeJsonStringField(item, "relation") orelse return;
-    if (edge_type.len == 0) return;
-
-    const mapped_source = if (mapping.source_template.len > 0)
-        try runtimeRenderGraphArtifactTemplateAlloc(alloc, mapping.source_template, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value)
-    else
-        null;
-    defer if (mapped_source) |value| alloc.free(value);
-    // Mirrors db.zig appendRelationItem: owning document routes the row, the
-    // topological source may resolve canonically; an entity-referencing
-    // source with no canonical identity drops the edge (resolution replay
-    // re-renders it), and legacy inline endpoint objects keep the document.
-    var source_table: ?[]const u8 = null;
-    const source_doc = blk: {
-        if (mapped_source) |value| break :blk value;
-        const source_value = item.object.get("source") orelse break :blk doc_key;
-        if (runtimeResolveGraphEndpointEntity(source_value, artifact_value)) |entity| {
-            const canonical = runtimeCanonicalEntityDocumentId(entity) orelse return;
-            source_table = runtimeCanonicalEntityTable(entity);
-            break :blk canonical;
-        }
-        break :blk switch (source_value) {
-            .string => |external| if (external.len > 0) external else doc_key,
-            else => doc_key,
-        };
-    };
-    if (source_doc.len == 0) return error.InvalidGraphEdges;
-    const mapped_id = if (mapping.edge_id_template.len > 0)
-        try runtimeRenderGraphArtifactTemplateAlloc(alloc, mapping.edge_id_template, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value)
-    else
-        null;
-    defer if (mapped_id) |value| alloc.free(value);
-    const edge_id = mapped_id orelse "";
-    if (mapped_id != null and edge_id.len == 0) return error.InvalidGraphEdges;
-
-    const mapped_target = if (mapping.target_template.len > 0)
-        try runtimeRenderGraphArtifactTemplateAlloc(alloc, mapping.target_template, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value)
-    else
-        null;
-    defer if (mapped_target) |value| alloc.free(value);
-    const target_doc = if (mapped_target) |value| blk: {
-        const trimmed = std.mem.trim(u8, value, &std.ascii.whitespace);
-        if (trimmed.len == 0) return;
-        break :blk trimmed;
-    } else blk: {
-        const target_value = item.object.get("target") orelse return;
-        break :blk runtimeJsonEndpointDocumentIdResolved(target_value, artifact_value) orelse return;
-    };
-    const target_table: ?[]const u8 = if (mapped_target != null) null else blk: {
-        const target_value = item.object.get("target") orelse break :blk null;
-        const entity = runtimeResolveGraphEndpointEntity(target_value, artifact_value) orelse break :blk null;
-        break :blk runtimeCanonicalEntityTable(entity);
-    };
-    if (writes.items.len >= edge_limit) return error.ResourceLimitExceeded;
-
-    const weight = if (mapping.weight_template.len > 0) blk: {
-        const rendered = try runtimeRenderGraphArtifactTemplateAlloc(alloc, mapping.weight_template, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value);
-        defer alloc.free(rendered);
-        const trimmed = std.mem.trim(u8, rendered, &std.ascii.whitespace);
-        break :blk if (trimmed.len > 0) try std.fmt.parseFloat(f64, trimmed) else 1.0;
-    } else runtimeJsonFloatField(item, "weight") orelse runtimeJsonFloatField(item, "confidence") orelse 1.0;
-    if (!std.math.isFinite(weight)) return error.InvalidGraphEdges;
-    const metadata_json = if (mapping.metadata_template_json.len > 0) blk: {
-        const rendered = try runtimeRenderGraphArtifactMetadataTemplateAlloc(alloc, mapping.metadata_template_json, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value);
-        // Mirrors db.zig: a custom metadata template must not strip the
-        // resolved endpoint's home-table tag.
-        const table = target_table orelse break :blk rendered;
-        defer alloc.free(rendered);
-        break :blk try runtimePrependTargetTableToMetadataJsonAlloc(alloc, table, rendered);
-    } else if (target_table) |table|
-        try runtimePrependTargetTableToItemMetadataAlloc(alloc, table, item)
-    else
-        try std.json.Stringify.valueAlloc(alloc, item, .{});
-    var owned_metadata = metadata_json;
-    errdefer alloc.free(owned_metadata);
-    if (source_table) |table| {
-        const tagged = try graph_metadata_tables.withTableAlloc(alloc, "source_table", table, owned_metadata, mapping.metadata_template_json.len > 0);
-        alloc.free(owned_metadata);
-        owned_metadata = tagged;
-    }
-
-    const owned_index_name = try alloc.dupe(u8, index_name);
-    errdefer alloc.free(owned_index_name);
-    const owned_source = try alloc.dupe(u8, source_doc);
-    errdefer alloc.free(owned_source);
-    const owned_target = try alloc.dupe(u8, target_doc);
-    errdefer alloc.free(owned_target);
-    const owned_edge_type = try alloc.dupe(u8, edge_type);
-    errdefer alloc.free(owned_edge_type);
-    const owned_id = try alloc.dupe(u8, edge_id);
-    errdefer alloc.free(owned_id);
-    const owner_document = if (edge_id.len > 0 and !std.mem.eql(u8, source_doc, doc_key)) try alloc.dupe(u8, doc_key) else "";
-    errdefer if (owner_document.len > 0) alloc.free(owner_document);
-    const owned_owner = if (edge_id.len == 0 and !std.mem.eql(u8, source_doc, doc_key)) try alloc.dupe(u8, doc_key) else "";
-    errdefer if (owned_owner.len > 0) alloc.free(@constCast(owned_owner));
-    try writes.append(alloc, .{
-        .edge_id = owned_id,
-        .owner_document = owner_document,
-        .index_name = owned_index_name,
-        .source = owned_source,
-        .target = owned_target,
-        .edge_type = owned_edge_type,
-        .weight = weight,
-        .metadata_json = owned_metadata,
-        .owner = owned_owner,
-    });
-}
-
-fn runtimeRenderGraphArtifactTemplateAlloc(
-    alloc: Allocator,
-    template_source: []const u8,
-    doc_key: []const u8,
-    doc_value: ?std.json.Value,
-    item: std.json.Value,
-    item_index: usize,
-    artifact_name: []const u8,
-    artifact_content_type: []const u8,
-    artifact_value: std.json.Value,
-) ![]u8 {
-    var out = std.ArrayListUnmanaged(u8).empty;
-    errdefer out.deinit(alloc);
-    var pos: usize = 0;
-    while (pos < template_source.len) {
-        const start = std.mem.indexOfPos(u8, template_source, pos, "{{") orelse {
-            try out.appendSlice(alloc, template_source[pos..]);
-            break;
-        };
-        try out.appendSlice(alloc, template_source[pos..start]);
-        const body_start = start + 2;
-        const end = std.mem.indexOfPos(u8, template_source, body_start, "}}") orelse {
-            try out.appendSlice(alloc, template_source[start..]);
-            break;
-        };
-        const expr = std.mem.trim(u8, template_source[body_start..end], &std.ascii.whitespace);
-        const rendered = try runtimeRenderGraphArtifactExpressionAlloc(alloc, expr, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value);
-        defer alloc.free(rendered);
-        try out.appendSlice(alloc, rendered);
-        pos = end + 2;
-    }
-    return try out.toOwnedSlice(alloc);
-}
-
-fn runtimeRenderGraphArtifactExpressionAlloc(
-    alloc: Allocator,
-    expr: []const u8,
-    doc_key: []const u8,
-    doc_value: ?std.json.Value,
-    item: std.json.Value,
-    item_index: usize,
-    artifact_name: []const u8,
-    artifact_content_type: []const u8,
-    artifact_value: std.json.Value,
-) ![]u8 {
-    if (std.mem.startsWith(u8, expr, "default ")) {
-        var parts = std.mem.tokenizeAny(u8, expr["default ".len..], &std.ascii.whitespace);
-        const path = parts.next() orelse return try alloc.dupe(u8, "");
-        const fallback = parts.next() orelse "";
-        const value = runtimeGraphTemplateValue(path, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value);
-        const text = if (value) |found| try runtimeGraphJsonValueTextAlloc(alloc, found) else try alloc.dupe(u8, fallback);
-        if (std.mem.trim(u8, text, &std.ascii.whitespace).len == 0 and fallback.len > 0) {
-            alloc.free(text);
-            return try alloc.dupe(u8, fallback);
-        }
-        return text;
-    }
-    if (runtimeGraphTemplateValue(expr, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value)) |value| {
-        return try runtimeGraphJsonValueTextAlloc(alloc, value);
-    }
-    return try alloc.dupe(u8, "");
-}
-
-fn runtimeGraphTemplateValue(
-    path: []const u8,
-    doc_key: []const u8,
-    doc_value: ?std.json.Value,
-    item: std.json.Value,
-    item_index: usize,
-    artifact_name: []const u8,
-    artifact_content_type: []const u8,
-    artifact_value: std.json.Value,
-) ?std.json.Value {
-    if (std.mem.eql(u8, path, "_doc.key")) return .{ .string = doc_key };
-    if (std.mem.startsWith(u8, path, "_doc.value.")) {
-        const doc = doc_value orelse return null;
-        return runtimeSelectJsonDotPath(doc, path["_doc.value.".len..]);
-    }
-    if (std.mem.eql(u8, path, "_artifact.name")) return .{ .string = artifact_name };
-    if (std.mem.eql(u8, path, "_artifact.content_type")) return .{ .string = artifact_content_type };
-    if (std.mem.eql(u8, path, "_artifact.value")) return artifact_value;
-    if (std.mem.startsWith(u8, path, "_artifact.value.")) return runtimeSelectJsonDotPath(artifact_value, path["_artifact.value.".len..]);
-    if (std.mem.eql(u8, path, "_item_index")) return .{ .integer = @intCast(item_index) };
-    if (std.mem.eql(u8, path, "_item")) return item;
-    if (std.mem.startsWith(u8, path, "_item.")) return runtimeSelectGraphItemDotPath(item, path["_item.".len..], artifact_value);
-    return null;
-}
-
-fn runtimeSelectGraphItemDotPath(item: std.json.Value, path: []const u8, artifact_value: std.json.Value) ?std.json.Value {
-    if (std.mem.eql(u8, path, "source") or std.mem.startsWith(u8, path, "source.")) {
-        if (item != .object) return null;
-        const endpoint = item.object.get("source") orelse return null;
-        const selected = runtimeResolveGraphEndpointEntity(endpoint, artifact_value) orelse endpoint;
-        if (std.mem.eql(u8, path, "source")) return selected;
-        return runtimeSelectJsonDotPath(selected, path["source.".len..]);
-    }
-    if (std.mem.eql(u8, path, "target") or std.mem.startsWith(u8, path, "target.")) {
-        if (item != .object) return null;
-        const endpoint = item.object.get("target") orelse return null;
-        const selected = runtimeResolveGraphEndpointEntity(endpoint, artifact_value) orelse endpoint;
-        if (std.mem.eql(u8, path, "target")) return selected;
-        return runtimeSelectJsonDotPath(selected, path["target.".len..]);
-    }
-    return runtimeSelectJsonDotPath(item, path);
-}
-
-fn runtimeSelectJsonDotPath(root: std.json.Value, path: []const u8) ?std.json.Value {
-    var current = root;
-    var parts = std.mem.splitScalar(u8, path, '.');
-    while (parts.next()) |part| {
-        if (part.len == 0) return null;
-        if (current != .object) return null;
-        current = current.object.get(part) orelse return null;
-    }
-    return current;
-}
-
-fn runtimeGraphJsonValueTextAlloc(alloc: Allocator, value: std.json.Value) ![]u8 {
-    return switch (value) {
-        .null => try alloc.dupe(u8, ""),
-        .bool => |b| try alloc.dupe(u8, if (b) "true" else "false"),
-        .integer => |n| try std.fmt.allocPrint(alloc, "{d}", .{n}),
-        .float => |n| try std.fmt.allocPrint(alloc, "{d}", .{n}),
-        .number_string => |s| try alloc.dupe(u8, s),
-        .string => |s| try alloc.dupe(u8, s),
-        .array, .object => try std.json.Stringify.valueAlloc(alloc, value, .{}),
-    };
-}
-
-fn runtimeRenderGraphArtifactMetadataTemplateAlloc(
-    alloc: Allocator,
-    metadata_template_json: []const u8,
-    doc_key: []const u8,
-    doc_value: ?std.json.Value,
-    item: std.json.Value,
-    item_index: usize,
-    artifact_name: []const u8,
-    artifact_content_type: []const u8,
-    artifact_value: std.json.Value,
-) ![]u8 {
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, metadata_template_json, .{ .parse_numbers = false });
-    defer parsed.deinit();
-    var rendered = try runtimeRenderGraphArtifactMetadataValueAlloc(alloc, parsed.value, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value);
-    defer runtimeFreeGraphRenderedJsonValue(alloc, &rendered);
-    return try std.json.Stringify.valueAlloc(alloc, rendered, .{});
-}
-
-fn runtimeRenderGraphArtifactMetadataValueAlloc(
-    alloc: Allocator,
-    value: std.json.Value,
-    doc_key: []const u8,
-    doc_value: ?std.json.Value,
-    item: std.json.Value,
-    item_index: usize,
-    artifact_name: []const u8,
-    artifact_content_type: []const u8,
-    artifact_value: std.json.Value,
-) !std.json.Value {
-    return switch (value) {
-        .string => |text| .{ .string = try runtimeRenderGraphArtifactTemplateAlloc(alloc, text, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value) },
-        .array => |array| blk: {
-            var out = std.json.Array.init(alloc);
-            errdefer out.deinit();
-            for (array.items) |child| try out.append(try runtimeRenderGraphArtifactMetadataValueAlloc(alloc, child, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value));
-            break :blk .{ .array = out };
-        },
-        .object => |object| blk: {
-            var out = std.json.ObjectMap.empty;
-            errdefer out.deinit(alloc);
-            var it = object.iterator();
-            while (it.next()) |entry| {
-                try out.put(alloc, try alloc.dupe(u8, entry.key_ptr.*), try runtimeRenderGraphArtifactMetadataValueAlloc(alloc, entry.value_ptr.*, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value));
-            }
-            break :blk .{ .object = out };
-        },
-        else => value,
-    };
-}
-
-fn runtimeFreeGraphRenderedJsonValue(alloc: Allocator, value: *std.json.Value) void {
-    switch (value.*) {
-        .string => |text| alloc.free(@constCast(text)),
-        .array => |*array| {
-            for (array.items) |*item| runtimeFreeGraphRenderedJsonValue(alloc, item);
-            array.deinit();
-        },
-        .object => |*object| {
-            var it = object.iterator();
-            while (it.next()) |entry| {
-                alloc.free(@constCast(entry.key_ptr.*));
-                runtimeFreeGraphRenderedJsonValue(alloc, entry.value_ptr);
-            }
-            object.deinit(alloc);
-        },
-        else => {},
-    }
-    value.* = .null;
-}
-
-fn runtimeJsonEndpointDocumentId(value: std.json.Value) ?[]const u8 {
-    return switch (value) {
-        .string => value.string,
-        .object => runtimeJsonStringField(value, "document_id") orelse runtimeJsonStringField(value, "doc_key") orelse runtimeJsonStringField(value, "key") orelse runtimeJsonStringField(value, "id") orelse runtimeJsonStringField(value, "local_id") orelse if (value.object.get("doc_ref")) |doc_ref| runtimeJsonEndpointDocumentId(doc_ref) else null,
-        else => null,
-    };
-}
-
-fn runtimeJsonEndpointDocumentIdResolved(value: std.json.Value, artifact_value: std.json.Value) ?[]const u8 {
-    // Mirrors db.zig jsonEndpointDocumentIdResolved: an endpoint referencing
-    // an extraction entity renders its canonical identity or nothing at all
-    // (the live path has no resolutions yet, so entity-referencing relations
-    // are deferred to the resolution replay); non-entity endpoints keep the
-    // external-node passthrough.
-    if (runtimeResolveGraphEndpointEntity(value, artifact_value)) |entity| {
-        return runtimeCanonicalEntityDocumentId(entity);
-    }
-    return runtimeJsonEndpointDocumentId(value);
-}
-
-fn runtimeCanonicalEntityDocumentId(entity: std.json.Value) ?[]const u8 {
-    if (entity != .object) return null;
-    if (runtimeJsonStringField(entity, "document_id") orelse runtimeJsonStringField(entity, "doc_key") orelse runtimeJsonStringField(entity, "key")) |id| return id;
-    if (entity.object.get("doc_ref")) |doc_ref| return runtimeJsonEndpointDocumentId(doc_ref);
-    return null;
-}
-
-fn runtimeCanonicalEntityTable(entity: std.json.Value) ?[]const u8 {
-    if (entity != .object) return null;
-    if (runtimeJsonStringField(entity, "table")) |table| return table;
-    if (entity.object.get("doc_ref")) |doc_ref| return runtimeJsonStringField(doc_ref, "table");
-    return null;
-}
-
-/// Mirrors db.zig's prependTableTagToMetadataJsonAlloc for the runtime
-/// renderer: tag an already-rendered metadata object with a resolved
-/// endpoint's home table unless the template rendered its own tag.
-fn runtimePrependTableTagToMetadataJsonAlloc(alloc: Allocator, comptime tag: []const u8, table: []const u8, metadata_json: []const u8) ![]u8 {
-    return graph_metadata_tables.withTableAlloc(alloc, tag, table, metadata_json, true);
-}
-
-fn runtimePrependTargetTableToMetadataJsonAlloc(alloc: Allocator, target_table: []const u8, metadata_json: []const u8) ![]u8 {
-    return try runtimePrependTableTagToMetadataJsonAlloc(alloc, "target_table", target_table, metadata_json);
-}
-
-fn runtimePrependTargetTableToItemMetadataAlloc(alloc: Allocator, target_table: []const u8, item: std.json.Value) ![]u8 {
-    const item_json = try std.json.Stringify.valueAlloc(alloc, item, .{});
-    defer alloc.free(item_json);
-    return graph_metadata_tables.withTableAlloc(alloc, "target_table", target_table, item_json, false);
-}
-
-fn runtimeResolveGraphEndpointEntity(value: std.json.Value, artifact_value: std.json.Value) ?std.json.Value {
-    switch (value) {
-        .string => return runtimeFindGraphArtifactEntity(artifact_value, value.string),
-        .object => {
-            if (runtimeJsonIntegerField(value, "entity_index")) |entity_index| return runtimeGraphArtifactEntityAtIndex(artifact_value, entity_index);
-            const entity_id = runtimeJsonStringField(value, "entity_id") orelse runtimeJsonStringField(value, "id") orelse runtimeJsonStringField(value, "local_id") orelse return null;
-            return runtimeFindGraphArtifactEntity(artifact_value, entity_id);
-        },
-        else => return null,
-    }
-}
-
-fn runtimeFindGraphArtifactEntity(artifact_value: std.json.Value, entity_id: []const u8) ?std.json.Value {
-    if (artifact_value != .object) return null;
-    if (artifact_value.object.get("_entities")) |resolved| {
-        if (runtimeFindGraphArtifactEntityIn(resolved, entity_id)) |entity| return entity;
-    }
-    const entities = artifact_value.object.get("entities") orelse return null;
-    return runtimeFindGraphArtifactEntityIn(entities, entity_id);
-}
-
-fn runtimeFindGraphArtifactEntityIn(entities: std.json.Value, entity_id: []const u8) ?std.json.Value {
-    return switch (entities) {
-        .array => |array| blk: {
-            for (array.items) |entity| {
-                const id = runtimeJsonStringField(entity, "id") orelse runtimeJsonStringField(entity, "local_id") orelse continue;
-                if (std.mem.eql(u8, id, entity_id)) break :blk entity;
-            }
-            break :blk null;
-        },
-        .object => entities.object.get(entity_id),
-        else => null,
-    };
-}
-
-fn runtimeGraphArtifactEntityAtIndex(artifact_value: std.json.Value, entity_index: i64) ?std.json.Value {
-    if (entity_index < 0 or artifact_value != .object) return null;
-    const index: usize = @intCast(entity_index);
-    const raw_entity: ?std.json.Value = blk: {
-        const entities = artifact_value.object.get("entities") orelse break :blk null;
-        if (entities != .array or index >= entities.array.items.len) break :blk null;
-        break :blk entities.array.items[index];
-    };
-    if (artifact_value.object.get("_entities")) |resolved| {
-        // Mirrors db.zig's graphArtifactEntityAtIndex: the injected
-        // resolution map is keyed by mention local id, and an id-less
-        // extraction entity resolves under its decimal array position.
-        var buf: [20]u8 = undefined;
-        const positional_id = std.fmt.bufPrint(&buf, "{d}", .{index}) catch unreachable;
-        const local_id = if (raw_entity) |entity|
-            runtimeJsonStringField(entity, "id") orelse runtimeJsonStringField(entity, "local_id") orelse positional_id
-        else
-            positional_id;
-        if (runtimeFindGraphArtifactEntityIn(resolved, local_id)) |entity| return entity;
-        if (resolved == .array and index < resolved.array.items.len) return resolved.array.items[index];
-    }
-    return raw_entity;
-}
-
-fn runtimeJsonStringField(value: std.json.Value, field: []const u8) ?[]const u8 {
-    if (value != .object) return null;
-    const found = value.object.get(field) orelse return null;
-    return if (found == .string) found.string else null;
-}
-
-fn runtimeJsonIntegerField(value: std.json.Value, field: []const u8) ?i64 {
-    if (value != .object) return null;
-    const found = value.object.get(field) orelse return null;
-    return switch (found) {
-        .integer => found.integer,
-        .number_string => |text| std.fmt.parseInt(i64, text, 10) catch null,
-        else => null,
-    };
-}
-
-fn runtimeJsonFloatField(value: std.json.Value, field: []const u8) ?f64 {
-    if (value != .object) return null;
-    const found = value.object.get(field) orelse return null;
-    return switch (found) {
-        .float => found.float,
-        .integer => @floatFromInt(found.integer),
-        .number_string => |text| std.fmt.parseFloat(f64, text) catch null,
-        else => null,
-    };
+    // Replay and recovery must interpret extraction endpoints identically.
+    // In particular, an unresolved source belongs to the producer document
+    // when no resolver is configured, rather than silently dropping its edge.
+    try @import("../graph_restore_materialization.zig").appendRelationItem(
+        alloc,
+        writes,
+        index_name,
+        doc_key,
+        doc_value,
+        item,
+        item_index,
+        mapping,
+        artifact_name,
+        artifact_content_type,
+        artifact_value,
+        edge_limit,
+    );
 }
 
 fn sameChunkedDenseBatchKey(
@@ -28389,6 +27988,23 @@ fn queueArtifactCoverageOutcomeForRequest(
         };
         if (!is_graph and !is_full_text) continue;
         try queueDerivedCoverageOutcomeForIndex(runtime, window, index_name, request, outcome);
+        const readiness = @import("../artifact_producer_readiness.zig");
+        var pinned = try runtime.index_manager.acquireWritePlanSnapshot();
+        defer pinned.release();
+        const requirements = if (pinned.plan().completion_plan) |*value| value else return error.ArtifactCatalogDrift;
+        _ = requirements.providerFor(request) catch return error.EnrichmentSourceChanged;
+        const sources = blk: {
+            runtime.index_manager.catalog_mutex.lockShared();
+            defer runtime.index_manager.catalog_mutex.unlockShared();
+            break :blk try runtime.index_manager.artifactSourceNamesForIndexAlloc(runtime.alloc, index_name);
+        };
+        defer freeAffectedIndexes(runtime, sources);
+        for (sources) |source| {
+            if (!readiness.localSourceProduced(pinned.plan(), requestArtifactName(request), source)) continue;
+            const scope = try readiness.localScopeAlloc(runtime.alloc, index_name, source, pinned.plan());
+            defer runtime.alloc.free(scope);
+            try queueDerivedCoverageOutcomeForScope(runtime, window, index_name, scope, request, outcome);
+        }
     }
 }
 
@@ -29853,40 +29469,13 @@ fn storePutBatchWithRetry(runtime: anytype, writes: []const KVPair, deletes: []c
     }
 }
 
-fn storeCoverageBatchWithRetry(runtime: *EnrichmentRuntime, writes: []const KVPair, deletes: []const []const u8) !void {
-    var attempt: usize = 0;
-    while (true) : (attempt += 1) {
-        try heartbeatEnrichmentLease(runtime);
-        const fence = try requiredRuntimeStoreWriteFence(runtime);
-        var batch = runtime.store.beginBatch() catch |err| switch (err) {
-            error.WriterLocked => {
-                if (attempt >= writer_locked_retry_count) return err;
-                backoffWriterLockRetry();
-                continue;
-            },
-            else => return err,
-        };
-        var committed = false;
-        defer if (!committed) batch.abort();
-        try validateRuntimeStoreWriteFenceTxn(runtime, &batch, fence);
-        for (writes) |write| try batch.put(write.key, write.value);
-        for (deletes) |key| batch.delete(key) catch |err| switch (err) {
-            error.NotFound => {},
-            else => return err,
-        };
-        try validateRuntimeStoreWriteFenceTxn(runtime, &batch, fence);
-        batch.commit() catch |err| switch (err) {
-            error.WriterLocked => {
-                if (attempt >= writer_locked_retry_count) return err;
-                backoffWriterLockRetry();
-                continue;
-            },
-            else => return err,
-        };
-        committed = true;
-        try runtime.store.sync(false);
-        return;
-    }
+fn coverageReceiptIsCurrent(runtime: *EnrichmentRuntime, txn: anytype, transition: CoverageOutcomeTransition) !bool {
+    const document = transition.source_document orelse return true;
+    const identity = @import("../doc_identity.zig");
+    const ordinal = (try identity.lookupOrdinalTxn(runtime.alloc, txn, document)) orelse return false;
+    const state = (try identity.lookupStateTxn(txn, ordinal)) orelse return error.InvalidDocIdentity;
+    const revision = (try @import("../artifact_producer_readiness.zig").localPrimaryRevision(runtime.alloc, txn, document)) orelse state.created_generation;
+    return state.isLive() and transition.source_sequence != 0 and revision <= transition.source_sequence;
 }
 
 fn saveAppliedSequenceWithRetry(runtime: *EnrichmentRuntime, scope: []const u8, sequence: u64) !void {
@@ -30167,6 +29756,7 @@ fn appendCoverageFailureGuard(
 
 fn deinitCoverageOutcomeTransition(alloc: Allocator, transition: CoverageOutcomeTransition) void {
     alloc.free(transition.index_name);
+    if (transition.source_document) |document| alloc.free(document);
     alloc.free(transition.marker_key);
     for (transition.counter_keys) |key| alloc.free(key);
     var failure_guards = transition.failure_guards;
@@ -30258,9 +29848,32 @@ fn queueDerivedCoverageOutcomeForIndex(
     request: enrichment_types.GeneratedEnrichmentRequest,
     outcome: CoverageOutcome,
 ) !void {
+    return queueDerivedCoverageOutcomeForScope(runtime, window, index_name, null, request, outcome);
+}
+
+fn queueDerivedCoverageOutcomeForScope(
+    runtime: *EnrichmentRuntime,
+    window: *GeneratedReplayWindow,
+    index_name: []const u8,
+    scope: ?[]const u8,
+    request: enrichment_types.GeneratedEnrichmentRequest,
+    outcome: CoverageOutcome,
+) !void {
     const generation = runtime.index_manager.coverageGenerationForIndex(index_name) orelse return;
     var transition = try initCoverageOutcomeTransition(runtime, index_name, generation, request.doc_key, request.sequence, outcome);
     errdefer deinitCoverageOutcomeTransition(runtime.alloc, transition);
+    if (scope) |name| {
+        const marker = try internal_keys.derivedCoverageOutcomeKeyAlloc(runtime.alloc, name, generation, request.doc_key);
+        runtime.alloc.free(transition.marker_key);
+        transition.marker_key = marker;
+        inline for (std.meta.tags(CoverageOutcome), 0..) |candidate, i| {
+            const selected = try internal_keys.derivedCoverageOutcomeCountKeyAlloc(runtime.alloc, name, generation, @tagName(candidate));
+            runtime.alloc.free(transition.counter_keys[i]);
+            transition.counter_keys[i] = selected;
+        }
+        transition.source_specific = true;
+        transition.source_document = try runtime.alloc.dupe(u8, request.doc_key);
+    }
     const identity_key = transition.marker_key;
     if (window.coverage_transition_keys.getKey(identity_key)) |existing_key| {
         for (window.coverage_transitions.items) |*queued| {
@@ -30358,7 +29971,17 @@ fn applyCoverageOutcomeTransitions(runtime: *EnrichmentRuntime, transitions: []c
         var group_end = group_start + 1;
         while (group_end < ordered.len and std.mem.eql(u8, ordered[group_start].index_name, ordered[group_end].index_name)) : (group_end += 1) {}
 
-        var apply_guard = runtime.index_manager.lockVectorIndexApply(ordered[group_start].index_name) catch |err| switch (err) {
+        const index_kind = blk: {
+            runtime.index_manager.catalog_mutex.lockShared();
+            defer runtime.index_manager.catalog_mutex.unlockShared();
+            const config = runtime.index_manager.get(ordered[group_start].index_name) orelse break :blk null;
+            break :blk @as(?types.IndexKind, config.kind);
+        };
+        if (index_kind == null) {
+            group_start = group_end;
+            continue;
+        }
+        var apply_guard = runtime.index_manager.lockManagedIndexApply(.{ .name = ordered[group_start].index_name, .kind = index_kind.? }) catch |err| switch (err) {
             error.IndexNotFound => {
                 group_start = group_end;
                 continue;
@@ -30386,6 +30009,8 @@ fn applyCoverageOutcomeTransitions(runtime: *EnrichmentRuntime, transitions: []c
         }
         retained = pending_retained;
         if (retained > 0) {
+            var local_coverage_guard = runtime.index_manager.lockLocalCoverage();
+            defer local_coverage_guard.release();
             applyCoverageOutcomeTransitionsForIndex(runtime, ordered[group_start .. group_start + retained]) catch |err| {
                 if (failure_fence) |fence| fence.unlock();
                 apply_guard.unlock();
@@ -30399,7 +30024,49 @@ fn applyCoverageOutcomeTransitions(runtime: *EnrichmentRuntime, transitions: []c
 }
 
 fn applyCoverageOutcomeTransitionsForIndex(runtime: *EnrichmentRuntime, transitions: []const CoverageOutcomeTransition) !void {
+    var attempt: usize = 0;
+    while (true) : (attempt += 1) {
+        applyCurrentCoverageOutcomeTransitionsForIndex(runtime, transitions) catch |err| {
+            if (err == error.WriterLocked and attempt < writer_locked_retry_count) {
+                backoffWriterLockRetry();
+                continue;
+            }
+            return err;
+        };
+        return;
+    }
+}
+
+fn coverageCounterInTxn(alloc: Allocator, txn: *backend_erased.Batch, transition: CoverageOutcomeTransition, outcome: CoverageOutcome) !u64 {
+    const raw = txn.get(transition.counter_keys[@backingInt(outcome)]) catch |err| if (err == error.NotFound) null else return err;
+    if (raw) |value| {
+        if (value.len != 8) return error.InvalidDerivedCoverageCounter;
+        return std.mem.readInt(u64, value[0..8], .little);
+    }
+    if (transition.source_specific) return 0;
+    // Legacy aggregate counters may predate their maintained tuples.
+    const lower = try internal_keys.derivedCoverageOutcomeMarkerPrefixAlloc(alloc, transition.index_name, transition.generation);
+    defer alloc.free(lower);
+    var cursor = try txn.openCursor();
+    defer cursor.close();
+    var row = try cursor.seekAtOrAfter(lower);
+    var result: u64 = 0;
+    while (row) |entry| {
+        if (!std.mem.startsWith(u8, entry.key, lower)) break;
+        if (std.mem.eql(u8, entry.value, coverageOutcomeName(outcome))) result += 1;
+        row = try cursor.next();
+    }
+    return result;
+}
+
+fn applyCurrentCoverageOutcomeTransitionsForIndex(runtime: *EnrichmentRuntime, transitions: []const CoverageOutcomeTransition) !void {
     if (transitions.len == 0) return;
+    try heartbeatEnrichmentLease(runtime);
+    const fence = try requiredRuntimeStoreWriteFence(runtime);
+    var batch = try runtime.store.beginBatch();
+    var committed = false;
+    defer if (!committed) batch.abort();
+    try validateRuntimeStoreWriteFenceTxn(runtime, &batch, fence);
 
     var writes = std.ArrayListUnmanaged(KVPair).empty;
     defer writes.deinit(runtime.alloc);
@@ -30419,6 +30086,7 @@ fn applyCoverageOutcomeTransitionsForIndex(runtime: *EnrichmentRuntime, transiti
     const counterState = struct {
         fn get(
             runtime_value: *EnrichmentRuntime,
+            txn: *backend_erased.Batch,
             states: *std.ArrayListUnmanaged(CounterState),
             indexes: *std.StringHashMapUnmanaged(usize),
             transition: CoverageOutcomeTransition,
@@ -30427,8 +30095,7 @@ fn applyCoverageOutcomeTransitionsForIndex(runtime: *EnrichmentRuntime, transiti
             const outcome_index = @backingInt(outcome);
             const counter_key = transition.counter_keys[outcome_index];
             if (indexes.get(counter_key)) |index| return index;
-            const current_count = (try loadDerivedCoverageOutcomeCounter(runtime_value, counter_key)) orelse
-                try scanDerivedCoverageOutcome(runtime_value, transition.index_name, transition.generation, outcome);
+            const current_count = try coverageCounterInTxn(runtime_value.alloc, txn, transition, outcome);
             const index = states.items.len;
             try states.append(runtime_value.alloc, .{ .key = counter_key, .outcome = outcome, .count = current_count });
             try indexes.put(runtime_value.alloc, counter_key, index);
@@ -30437,17 +30104,19 @@ fn applyCoverageOutcomeTransitionsForIndex(runtime: *EnrichmentRuntime, transiti
     }.get;
 
     var skipped_delta: i64 = 0;
+    var receipt_arena = std.heap.ArenaAllocator.init(runtime.alloc);
+    defer receipt_arena.deinit();
     for (transitions) |transition| {
+        if (!try coverageReceiptIsCurrent(runtime, &batch, transition)) continue;
         const target_outcome = transition.outcome;
         if (seen_transitions.contains(transition.marker_key)) continue;
         try seen_transitions.put(runtime.alloc, transition.marker_key, {});
 
         inline for (std.meta.tags(CoverageOutcome)) |candidate_outcome| {
-            _ = try counterState(runtime, &counter_states, &counter_indexes, transition, candidate_outcome);
+            _ = try counterState(runtime, &batch, &counter_states, &counter_indexes, transition, candidate_outcome);
         }
 
-        const existing_value = try storeGetOptionalAllocWithRetry(runtime, transition.marker_key);
-        defer if (existing_value) |value| runtime.alloc.free(value);
+        const existing_value = batch.get(transition.marker_key) catch |err| if (err == error.NotFound) null else return err;
         const existing_outcome: ?CoverageOutcome = if (existing_value) |value|
             std.meta.stringToEnum(CoverageOutcome, value) orelse return error.InvalidDerivedCoverageOutcome
         else
@@ -30457,14 +30126,21 @@ fn applyCoverageOutcomeTransitionsForIndex(runtime: *EnrichmentRuntime, transiti
         // A later successful replay may replace one, but an empty downstream
         // consumer must not relabel the same failure as an intentional skip.
         const weaker_than_existing_failure = existing_outcome == .terminal_failed and target_outcome == .skipped;
+        if (transition.source_specific and !weaker_than_existing_failure) {
+            const receipt_alloc = receipt_arena.allocator();
+            const key = try @import("../artifact_producer_readiness.zig").localReceiptRevisionKeyAlloc(receipt_alloc, transition.marker_key);
+            const value = try receipt_alloc.alloc(u8, 8);
+            std.mem.writeInt(u64, value[0..8], transition.source_sequence, .little);
+            try writes.append(runtime.alloc, .{ .key = key, .value = value });
+        }
         if (!weaker_than_existing_failure and (existing_outcome == null or existing_outcome.? != target_outcome)) {
             if (existing_outcome) |previous_outcome| {
-                const previous_state_index = try counterState(runtime, &counter_states, &counter_indexes, transition, previous_outcome);
+                const previous_state_index = try counterState(runtime, &batch, &counter_states, &counter_indexes, transition, previous_outcome);
                 if (counter_states.items[previous_state_index].count == 0) return error.InvalidDerivedCoverageCounter;
                 counter_states.items[previous_state_index].count -= 1;
                 if (previous_outcome == .skipped) skipped_delta -= 1;
             }
-            const state_index = try counterState(runtime, &counter_states, &counter_indexes, transition, target_outcome);
+            const state_index = try counterState(runtime, &batch, &counter_states, &counter_indexes, transition, target_outcome);
             counter_states.items[state_index].count +|= 1;
             try writes.append(runtime.alloc, .{
                 .key = transition.marker_key,
@@ -30481,7 +30157,11 @@ fn applyCoverageOutcomeTransitionsForIndex(runtime: *EnrichmentRuntime, transiti
             .value = internal_keys.encodeDerivedCoverageOutcomeCount(&state.value, state.count),
         });
     }
-    try storeCoverageBatchWithRetry(runtime, writes.items, &.{});
+    for (writes.items) |write| try batch.put(write.key, write.value);
+    try validateRuntimeStoreWriteFenceTxn(runtime, &batch, fence);
+    try batch.commit();
+    committed = true;
+    try runtime.store.sync(false);
     if (skipped_delta > 0) {
         runtime.skipped_source_count +|= @intCast(skipped_delta);
     } else if (skipped_delta < 0) {
@@ -34790,4 +34470,36 @@ test "graph projection routing writer honors root tags without nested suppressio
         try std.testing.expectEqualStrings(if (custom) "custom_companies" else "companies", (try scratch.table(writes[0].metadata_json, "target_table")).?);
         if (!custom) try std.testing.expect(std.mem.indexOf(u8, writes[0].metadata_json, "1.00000000000000000000001") != null);
     }
+}
+
+fn isAppleGeneratedTextProvider(alloc: Allocator, config_json: []const u8) !bool {
+    var parsed = try std.json.parseFromSlice(struct { provider: []const u8 = "" }, alloc, config_json, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    return std.mem.eql(u8, parsed.value.provider, "apple");
+}
+
+test "document extraction accepts validated reader no-text results without hiding invalid output" {
+    const Runner = struct {
+        fn run(alloc: Allocator) !void {
+            for ([_][]const u8{ "", "EFTA02731411" }) |embedded| {
+                var unit = try cloneDocumentExtractionUnit(alloc, .{
+                    .unit_id = @constCast("page-1"),
+                    .unit_type = @constCast("page"),
+                    .text = @constCast(embedded),
+                    .method = @constCast("pdf_text"),
+                    .extraction_status = @constCast("pending_ocr"),
+                    .page_number = 1,
+                });
+                defer unit.deinit(alloc);
+                const response = try alloc.dupe(u8, "[{\"text\":\"\",\"regions_json\":\"[]\"}]");
+                try applyRuntimeGeneratedUnitText(alloc, alloc, &unit, response, "reader", "completed", .ocr, .structured_reader, .{}, "<OCR>");
+                try std.testing.expectEqualStrings(embedded, unit.text);
+                try std.testing.expectEqualStrings(if (embedded.len == 0) "completed_no_text" else "completed_embedded_preferred", unit.extraction_status.?);
+                try std.testing.expect(unit.ocr_attempted and !unit.ocr_used);
+                try std.testing.expect(unit.ocr_failure_stage == null);
+                try std.testing.expect(unit.ocr_output_quality != null);
+            }
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }

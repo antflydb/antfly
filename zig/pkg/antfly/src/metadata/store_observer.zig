@@ -616,7 +616,8 @@ fn runtimeIndexSourceReplayEqual(
         if (!std.mem.eql(u8, left.artifact_name, right.artifact_name) or
             left.published_sequence != right.published_sequence or
             left.target_sequence != right.target_sequence or
-            left.failed != right.failed) return false;
+            left.failed != right.failed or
+            left.producer_complete != right.producer_complete) return false;
     }
     return true;
 }

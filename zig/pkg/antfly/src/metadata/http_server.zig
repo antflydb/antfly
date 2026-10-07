@@ -4190,6 +4190,7 @@ const ParsedRuntimeIndexSourceReplayStatus = struct {
     published_sequence: ?u64 = null,
     target_sequence: ?u64 = null,
     failed: ?bool = null,
+    producer_complete: ?bool = null,
 };
 
 const ParsedRuntimeGroupStatus = struct {
@@ -4609,6 +4610,7 @@ fn cloneParsedRuntimeIndexStatus(
             .published_sequence = source.published_sequence orelse 0,
             .target_sequence = source.target_sequence orelse 0,
             .failed = source.failed orelse false,
+            .producer_complete = source.producer_complete orelse false,
         };
         source_count += 1;
     }

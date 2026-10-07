@@ -183,7 +183,7 @@ pub const GeneratedEnrichmentRequest = struct {
     /// non-empty, the runtime samples the document's same-shard graph
     /// adjacency into the rendered producer input before dispatch.
     neighbor_context_json: []const u8 = "",
-    /// Pinned transitive dependency on committed graph adjacency.
+    /// Pinned dependency on committed graph adjacency or asset publication.
     requires_committed_graph: bool = false,
     execution_json: []const u8 = "",
     /// Upstream materialized asset for a chunk-backed request, pinned with the
