@@ -411,7 +411,7 @@ Conditional scalar reads now use compiler-generated masked Apply producers.
 CASE, COALESCE and boolean short-circuit operators retain SQL NULL truth rules,
 and a producer is not opened until its branch is demanded. Prerequisite values
 are materialized once; binding and authorization still cover every branch.
-The shared PostgreSQL/native fixture checks 32 result contracts and nine error
+The shared PostgreSQL/native fixture checks 45 result contracts and eleven error
 contracts, including demanded cardinality failures and invalid names in dead
 branches. Mutation tests additionally verify that an unused RETURNING producer
 reads no source rows, a demanded failure publishes no mutations, and unused
@@ -422,13 +422,31 @@ unused branches. Predicates without downstream subquery consumers retain their
 existing execution path rather than acquiring an unnecessary Apply.
 
 A mixed-demand correlation regression checks 128, 512 and 1,024 target rows:
-captured input rows are exactly twice the target count, with 8,023, 31,958 and
-63,863 execution checkpoints respectively. It checks cross-size linear growth,
+captured input rows are exactly twice the target count, with 5,672, 22,584 and
+45,118 execution checkpoints respectively. It checks cross-size linear growth,
 not just physical cursor reads, and allocation-fault injection covers both
 demanded and bypassed producers. These are native fixture work counters, not a
-production latency claim. Post-group HAVING/output and LIMIT demand, and
-distributed concurrent snapshot correctness still need separate work. No
-original inventory disposition is changed by these shared-operator fixtures.
+production latency claim.
+
+Scalar producers now preserve the complete child query before applying the
+zero/one/multiple-row contract, including correlated ORDER/LIMIT/OFFSET,
+explicit grouping and HAVING. Simple equality decorrelation retains its grouped
+fast path; a catalog-bound lateral child handles query boundaries and non-keyed
+correlation without moving the child's paging or predicates. Source-free
+children retain qualified and unqualified outer-column binding. Referenced outer
+constants remain available in explicit grouped domains; truly ungrouped inner
+columns still produce PostgreSQL SQLSTATE 42803. Native ordered/grouped probes
+each read 1,024 input rows under one capture for 512 targets, with 19,808/20,988
+checkpoints. Fault injection covers demanded and bypassed ordered producers.
+These bounds prove statement-owned reuse, not an indexed strategy for arbitrary
+non-equality predicates. Catalog-bound aggregate-level admission rejects
+outer-owned aggregates until their enclosing-query lifting is implemented;
+PostgreSQL reference tests record the required single outer result, and native
+tests reject incorrect per-parent execution before capture. Global aggregates
+that project outer constants, second-row streaming cardinality cutoff,
+post-group output demand, top-level LIMIT demand and distributed concurrent
+snapshot correctness still need separate work. No original inventory
+disposition is changed by these shared-operator fixtures.
 
 ```sh
 uv run --no-project --with 'psycopg[binary]==3.3.6' python scripts/generate_sql_postgres_reference.py mutation --check zig/pkg/antfly-embedded/src/sql/fixtures/sql_mutation_postgres_reference.json

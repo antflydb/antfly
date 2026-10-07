@@ -759,9 +759,72 @@ const Builder = struct {
         return if (value.* == .literal or value.* == .column) value else self.produce(value, demand);
     }
 
+    /// Preserve the complete child query's domain (including its sort, page,
+    /// grouping and HAVING) inside a lateral producer. Summarize only its
+    /// resulting rows: the scalar cardinality contract must not count rows
+    /// discarded by the child's own operators. Invariant children and hash
+    /// builds use the enclosing Apply engine's statement-owned caches.
+    fn scalarProducer(self: *Builder, original: *const ast.Select, demand: ?*const ast.Scalar) !*const ast.Scalar {
+        // The positional derived-column descriptor validates arity after
+        // wildcard/set expansion, even when the producer is never demanded.
+        const alias = try std.fmt.allocPrint(self.alloc, "$scalar_demand_{d}", .{self.serial});
+        self.serial += 1;
+        if (self.serial > 64 or self.outer.contains(alias)) return error.SqlProgramLimitExceeded;
+        try self.outer.put(self.alloc, alias, {});
+        const query = try self.alloc.create(ast.Select);
+        query.* = .{
+            .source = try self.relation(.{ .derived = .{ .query = original, .alias = "$scalar_input", .columns = &.{"$value"} } }),
+            .columns = try self.alloc.dupe(ast.Projection, &.{
+                .{ .alias = "$count", .expression = try self.scalar(.{ .call = .{ .name = "count", .args = &.{}, .star = true } }) },
+                .{ .alias = "$value", .expression = try self.call("min", &.{try self.field("$scalar_input", "$value")}) },
+            }),
+        };
+        self.source = try self.relation(.{ .join = .{
+            .kind = .left,
+            .left = self.source,
+            .right = try self.relation(.{ .derived = .{ .query = query, .alias = alias, .hidden = true, .lateral = true } }),
+            .demand = demand,
+        } });
+        return self.call("$single", &.{ try self.field(alias, "$value"), try self.field(alias, "$count") });
+    }
+
+    fn scalarBoundary(query: ast.Select) bool {
+        return query.set_operation != null or query.ctes.len != 0 or query.order_by.len != 0 or query.limit != null or query.offset != null or query.group_by.len != 0 or query.having != null or @import("window_binding.zig").accepts(query);
+    }
+
+    fn scalarNeedsApply(self: *Builder, query: ast.Select) !bool {
+        if (scalarBoundary(query)) return true;
+        var local: Names = .empty;
+        if (query.source) |source| try aliases(self.alloc, source, &local) else if (query.table) |table| try local.put(self.alloc, table.table, {});
+        for (query.columns) |projection| {
+            if (projection.wildcard) continue;
+            const value = projection.expression orelse try self.scalar(.{ .column = projection.field });
+            if (self.referencesOuter(value, local)) return true;
+            // A source-free child has no local columns. Resolve any names in
+            // its actual outer frame, including unqualified references, rather
+            // than treating them as inputs to an uncorrelated aggregate.
+            if (query.source == null and query.table == null and self.referenceSides(value, local) != 0) return true;
+        }
+        if (query.predicate) |predicate| {
+            // Keep equality decorrelation's grouped, statement-wide fast path.
+            // Preflight before modifying the relation: non-keyed correlation
+            // instead retains the original predicate inside a lateral child.
+            var keys: std.ArrayList(Key) = .empty;
+            _ = self.extract(try self.predicateScalar(predicate), local, &keys, null) catch |err| switch (err) {
+                error.UnsupportedSqlShape => return true,
+                else => return err,
+            };
+        }
+        return false;
+    }
+
     fn rewriteDemand(self: *Builder, input: *const ast.Scalar, demand: ?*const ast.Scalar) anyerror!*const ast.Scalar {
         if (!has(input)) return input;
-        if (input.* == .call and input.call.subquery != null) return if (demand != null) self.produce(input, demand) else self.subquery(input);
+        if (input.* == .call and input.call.subquery != null) {
+            if (std.mem.eql(u8, input.call.name, "$scalar") and (demand != null or try self.scalarNeedsApply(input.call.subquery.?.*)))
+                return self.scalarProducer(input.call.subquery.?, demand);
+            return if (demand != null) self.produce(input, demand) else self.subquery(input);
+        }
         return self.scalar(switch (input.*) {
             .call => |part| blk: {
                 var copy = part;

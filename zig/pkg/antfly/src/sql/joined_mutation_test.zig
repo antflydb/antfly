@@ -409,6 +409,33 @@ test "SQL masked Apply correlated producers reuse captured inputs under mixed de
     }
 }
 
+test "SQL bounded scalar producers retain one capture and reusable correlation builds" {
+    const count = 512;
+    for ([_][]const u8{
+        "UPDATE target t SET n=n+9,cold='new' RETURNING n,(SELECT delta FROM source s WHERE s.delta=t.n ORDER BY s.delta DESC LIMIT 1)",
+        "UPDATE target t SET n=n+9,cold='new' RETURNING n,(SELECT delta FROM source s WHERE s.delta=t.n GROUP BY s.delta HAVING s.delta=t.n)",
+    }) |sql| {
+        var backend: Backend = .{ .returning_mode = true, .row_count = count };
+        var compiled = try compiler.compile(std.testing.allocator, sql, .{});
+        defer compiled.deinit();
+        var result = try runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{ .result_rows = count, .page_rows = 17 });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(u64, count), result.output.rows_affected);
+        try std.testing.expectEqual(@as(usize, 2 * count), backend.rows_read);
+        try std.testing.expect(backend.checkpoints < 60 * count);
+        try std.testing.expectEqual(@as(usize, 1), backend.captures);
+        try std.testing.expectEqual(@as(usize, 1), backend.closes);
+        try std.testing.expectEqual(@as(usize, 1), backend.commits);
+        for (result.output.rows, result.output.sql_nulls.?, 0..) |row, flags, i| {
+            const n: i64 = @intCast(i + 10);
+            try std.testing.expectEqual(n, try std.fmt.parseInt(i64, row[0].string, 10));
+            try std.testing.expectEqual(@rem(n, 10) != 0, flags[1]);
+            if (!flags[1]) try std.testing.expectEqual(n, try std.fmt.parseInt(i64, row[1].string, 10));
+        }
+        std.debug.print("SQL bounded scalar: inputs={} checkpoints={} peak_bytes={}\n", .{ backend.rows_read, backend.checkpoints, result.peakMemoryBytes() });
+    }
+}
+
 test "SQL masked Apply unwinds allocation faults across demanded and bypassed producers" {
     const Faults = struct {
         fn run(a: std.mem.Allocator) !void {
@@ -416,7 +443,7 @@ test "SQL masked Apply unwinds allocation faults across demanded and bypassed pr
             defer {
                 if (backend.captures != backend.closes) @panic("masked Apply capture leaked");
             }
-            var compiled = try compiler.compile(a, "UPDATE target t SET n=n+9,cold='new' RETURNING n,CASE WHEN n=10 THEN (SELECT delta FROM source s WHERE s.delta=t.n) ELSE -1 END", .{});
+            var compiled = try compiler.compile(a, "UPDATE target t SET n=n+9,cold='new' RETURNING n,CASE WHEN n=10 THEN (SELECT delta FROM source s WHERE s.delta=t.n ORDER BY s.delta DESC LIMIT 1) ELSE -1 END", .{});
             defer compiled.deinit();
             var result = try runtime.execute(a, backend.backend(), &compiled, &.{}, .{});
             defer result.deinit();

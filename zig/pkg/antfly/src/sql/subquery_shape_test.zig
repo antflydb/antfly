@@ -99,11 +99,8 @@ test "SQL subquery shapes resolve untyped standalone output to text" {
     }
 }
 
-test "SQL subquery shapes reject correlation across complete value boundaries" {
+test "SQL subquery shapes retain quantified correlation boundary admission" {
     const queries = [_][]const u8{
-        "SELECT (SELECT i.y FROM (SELECT 1 AS k, 2 AS y) i WHERE i.k=o.x ORDER BY i.y LIMIT 1) FROM (SELECT 1 AS x) o",
-        "SELECT (SELECT SUM(i.y) FROM (SELECT 1 AS k, 2 AS y) i WHERE i.k=o.x GROUP BY i.k) FROM (SELECT 1 AS x) o",
-        "SELECT (SELECT ROW_NUMBER() OVER (ORDER BY i.y) FROM (SELECT 1 AS k, 2 AS y) i WHERE i.k=o.x) FROM (SELECT 1 AS x) o",
         "SELECT o.x IN (SELECT i.y FROM (SELECT 1 AS k, 2 AS y) i WHERE i.k=o.x ORDER BY i.y LIMIT 1) FROM (SELECT 1 AS x) o",
         "SELECT o.x < ANY (SELECT SUM(i.y) FROM (SELECT 1 AS k, 2 AS y) i WHERE i.k=o.x GROUP BY i.k) FROM (SELECT 1 AS x) o",
         "SELECT o.x = ALL (SELECT ROW_NUMBER() OVER (ORDER BY i.y) FROM (SELECT 1 AS k, 2 AS y) i WHERE i.k=o.x) FROM (SELECT 1 AS x) o",
@@ -113,6 +110,22 @@ test "SQL subquery shapes reject correlation across complete value boundaries" {
         var compiled = try compiler.compile(std.testing.allocator, sql, .{});
         defer compiled.deinit();
         try std.testing.expectError(error.UndefinedColumn, runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{}));
+    }
+    try std.testing.expectEqual(@as(usize, 0), backend.calls);
+}
+
+test "SQL scalar query boundaries retain outer aggregate ownership admission" {
+    var backend: Backend = .{};
+    // PostgreSQL produces one outer aggregate row containing 3. A lateral
+    // per-parent implementation returning 1,2 would silently change ownership.
+    for ([_][]const u8{
+        "SELECT (SELECT SUM(o.x)) FROM (SELECT 1 AS x UNION ALL SELECT 2) o",
+        "SELECT CASE WHEN TRUE THEN (SELECT SUM(o.x)) ELSE 0 END FROM (SELECT 1 AS x UNION ALL SELECT 2) o",
+        "SELECT (SELECT SUM(x)) FROM (SELECT 1 AS x UNION ALL SELECT 2) o",
+    }) |sql| {
+        var compiled = try compiler.compile(std.testing.allocator, sql, .{});
+        defer compiled.deinit();
+        try std.testing.expectError(error.UnsupportedSqlShape, runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{}));
     }
     try std.testing.expectEqual(@as(usize, 0), backend.calls);
 }

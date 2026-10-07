@@ -702,6 +702,30 @@ const Builder = struct {
             wrapper.* = .{ .scalar = if (self.shape_only) try self.shapePredicate(source.columns, predicate_) else try @import("bound_scalars.zig").predicateScalar(self.alloc, try self.virtualTable(source.columns), predicate_) };
             result.predicate = wrapper;
         }
+        if (self.outer_scope != null) {
+            for (result.columns) |projection| if (projection.expression) |value| try validateAggregateLevel(self.alloc, source.columns, value);
+            if (result.having) |value| try validateAggregateLevel(self.alloc, source.columns, value);
+            for (result.order_by) |order| if (order.expression) |value| try validateAggregateLevel(self.alloc, source.columns, value);
+        }
+        if (result.group_by.len != 0) {
+            // Outer-frame values are constants for this lateral invocation,
+            // not ungrouped columns of its inner input. Retain only referenced
+            // constants in the grouped domain. Do not do this for global
+            // aggregates: converting their empty grouping set into keyed
+            // grouping would incorrectly remove the empty-input result row.
+            var needed: std.StringHashMapUnmanaged(void) = .empty;
+            try markSelect(self.alloc, &needed, result);
+            var grouped: std.ArrayList(*const ast.Scalar) = .empty;
+            try grouped.appendSlice(self.alloc, result.group_by);
+            for (source.columns) |column| {
+                if (column.outer_frame == null or !needed.contains(column.internal)) continue;
+                const present = for (grouped.items) |group| {
+                    if (group.* == .column and std.mem.eql(u8, group.column, column.internal)) break true;
+                } else false;
+                if (!present) try grouped.append(self.alloc, try self.scalarNode(.{ .column = column.internal }));
+            }
+            result.group_by = grouped.items;
+        }
         return result;
     }
 
@@ -1327,6 +1351,54 @@ fn projectScans(builder: *Builder, node: *const Node, needed: *std.StringHashMap
             try projectScans(builder, set.right, needed);
         },
         .values => |arms| for (arms) |arm| try projectScans(builder, arm, needed),
+    }
+}
+
+/// PostgreSQL owns an aggregate at the nearest query level referenced by its
+/// arguments/FILTER. Until cross-level aggregate lifting is emitted, reject
+/// an outer-owned aggregate rather than silently aggregating once per Apply.
+/// Names are already bound here, so unqualified references and lexical
+/// shadowing receive the same treatment as fully qualified references.
+fn validateAggregateLevel(alloc: Allocator, columns: []const Column, input: *const ast.Scalar) anyerror!void {
+    switch (input.*) {
+        .column, .literal => {},
+        .unary => |part| try validateAggregateLevel(alloc, columns, part.operand),
+        .cast => |part| try validateAggregateLevel(alloc, columns, part.operand),
+        .binary => |part| {
+            try validateAggregateLevel(alloc, columns, part.left);
+            try validateAggregateLevel(alloc, columns, part.right);
+        },
+        .case_when => |part| {
+            for (part.branches) |branch| {
+                try validateAggregateLevel(alloc, columns, branch.condition);
+                try validateAggregateLevel(alloc, columns, branch.value);
+            }
+            if (part.otherwise) |value| try validateAggregateLevel(alloc, columns, value);
+        },
+        .in_list => |part| {
+            try validateAggregateLevel(alloc, columns, part.operand);
+            for (part.values) |value| try validateAggregateLevel(alloc, columns, value);
+        },
+        .call => |part| {
+            const aggregates = @import("aggregate_binding.zig");
+            if (part.window == null and aggregates.aggregateKind(part.name) != null) {
+                // Preserve the ordinary grouping diagnostic for illegal
+                // aggregate nesting; do not replace it with admission failure.
+                for (part.args) |arg| if (aggregates.contains(arg)) return;
+                if (part.filter) |filter| if (aggregates.contains(filter)) return;
+                var names: std.StringHashMapUnmanaged(void) = .empty;
+                for (part.args) |arg| try markExpression(alloc, &names, arg);
+                if (part.filter) |filter| try markExpression(alloc, &names, filter);
+                var level: ?u8 = null;
+                for (columns) |column| if (names.contains(column.internal)) {
+                    level = if (level) |prior| @min(prior, column.outer_level) else column.outer_level;
+                };
+                if (level != null and level.? != 0) return error.UnsupportedSqlShape;
+                return;
+            }
+            for (part.args) |arg| try validateAggregateLevel(alloc, columns, arg);
+            if (part.filter) |filter| try validateAggregateLevel(alloc, columns, filter);
+        },
     }
 }
 

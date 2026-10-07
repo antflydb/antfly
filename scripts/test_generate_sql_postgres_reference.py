@@ -516,8 +516,8 @@ class PostgresReferenceTest(unittest.TestCase):
                 / "zig/pkg/antfly-embedded/src/sql/fixtures/sql_conditional_subquery_reference.json"
             ).read_text()
         )
-        self.assertEqual(32, len(fixture["entries"]))
-        self.assertEqual(9, len(fixture["errors"]))
+        self.assertEqual(45, len(fixture["entries"]))
+        self.assertEqual(11, len(fixture["errors"]))
         for case in fixture["entries"]:
             with self.subTest(sql=case["sql"]):
                 self.assertEqual(
@@ -530,6 +530,18 @@ class PostgresReferenceTest(unittest.TestCase):
                     with self.db.transaction(force_rollback=True):
                         self.db.execute(case["sql"]).fetchall()
                 self.assertEqual(case["code"], error.exception.sqlstate)
+
+    def test_correlated_aggregate_ownership_requires_outer_query_execution(self):
+        # These are still native admission boundaries, not resolved parity
+        # cases. Record the oracle result so a per-parent SUM cannot silently
+        # replace PostgreSQL's outer-owned aggregate in a later activation.
+        for sql in [
+            "SELECT (SELECT SUM(o.x)) FROM (SELECT 1 AS x UNION ALL SELECT 2) o",
+            "SELECT CASE WHEN TRUE THEN (SELECT SUM(o.x)) ELSE 0 END FROM (SELECT 1 AS x UNION ALL SELECT 2) o",
+            "SELECT (SELECT SUM(x)) FROM (SELECT 1 AS x UNION ALL SELECT 2) o",
+        ]:
+            with self.subTest(sql=sql):
+                self.assertEqual([(3,)], self.db.execute(sql).fetchall())
 
     def test_logical_json_parameters_and_identity_casts_preserve_strings(self):
         from psycopg.types.json import Jsonb
