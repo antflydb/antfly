@@ -447,16 +447,17 @@ const Execution = struct {
             };
             a.free(result);
         }
-        var first: usize = 0;
-        while (first < keys.len) {
-            const end = @min(first + 256, keys.len);
-            defer first = end;
+        if (keys.len == 0) return result;
+        // One selection spans the complete ranked result. The cursor orders
+        // physical coordinates once; by_key scatters bounded pages back into
+        // rank order and fans duplicate identities out to their consumers.
+        hydrate: {
             var arena = std.heap.ArenaAllocator.init(a);
             defer arena.deinit();
             const ca = arena.allocator();
-            const refs = try ca.alloc(local.storage_rowsource_types.RowRef, end - first);
-            const canonical = try ca.alloc([]const u8, end - first);
-            for (keys[first..end], canonical, refs) |input_key, *mapped, *ref| {
+            const refs = try ca.alloc(local.storage_rowsource_types.RowRef, keys.len);
+            const canonical = try ca.alloc([]const u8, keys.len);
+            for (keys, canonical, refs) |input_key, *mapped, *ref| {
                 const key = try publicKey(raw, ca, input_key);
                 mapped.* = key;
                 if (key.len != 96 or !std.mem.startsWith(u8, key, "lake1:") or key[70] != ':' or key[79] != ':') return error.ExternalLakeSnapshotMismatch;
@@ -464,7 +465,7 @@ const Execution = struct {
                 ref.* = .{ .external = .{ .source_id = self.source.inventory.source_id, .snapshot_id = self.source.inventory.snapshot_id, .file_id = file, .row_group_ordinal = std.fmt.parseUnsigned(u32, key[71..79], 16) catch return error.ExternalLakeSnapshotMismatch, .row_ordinal = std.fmt.parseUnsigned(u64, key[80..96], 16) catch return error.ExternalLakeSnapshotMismatch } };
             }
             var by_key: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(usize)) = .empty;
-            for (canonical, first..) |key, position| {
+            for (canonical, 0..) |key, position| {
                 const entry = try by_key.getOrPut(ca, key);
                 if (!entry.found_existing) entry.value_ptr.* = .empty;
                 try entry.value_ptr.append(ca, position);
@@ -476,7 +477,7 @@ const Execution = struct {
             };
             var request = self.request;
             request.cancellation = .{ .ptr = self, .is_cancelled_fn = canceled };
-            const cursor = try local.sql_lake_cursor.openPinned(a, self.table, .{ .fields = fields, .row_refs = refs, .limit = 256 }, request, self.source);
+            const cursor = try local.sql_lake_cursor.openPinned(a, self.table, .{ .fields = fields, .row_refs = refs, .limit = std.math.cast(u32, keys.len) orelse return error.QueryResponseTooLarge }, request, self.source);
             defer cursor.close(cursor.ptr);
             if (T == std.json.Value or T == types.ColumnSource) if (cursor.next_columns) |next_columns| {
                 while (true) {
@@ -513,7 +514,7 @@ const Execution = struct {
                     }
                     if (page.after == null) break;
                 }
-                continue;
+                break :hydrate;
             };
             if (T == types.ColumnSource) return error.UnsupportedSqlExecution;
             while (true) {

@@ -3615,6 +3615,72 @@ fn hasColumnSources(hits: []const db_mod.types.SearchHit) bool {
     return false;
 }
 
+// Metadata is encoded once into small owned spans. Source segments retain
+// projected typed descriptors, borrowing scalar bytes from the hit's page.
+// The complete exact length is known before transport starts, without replaying
+// the envelope encoder or retaining a full encoded response buffer.
+const ColumnWirePlan = struct {
+    const Prepared = @import("../storage/db/column_source.zig").Prepared;
+    const Segment = union(enum) { metadata: []const u8, source: Prepared };
+    a: std.mem.Allocator,
+    segments: std.ArrayList(Segment) = .empty,
+    length: usize = 0,
+    maximum: usize,
+    failure: ?anyerror = null,
+    buffer: [4096]u8 = undefined,
+    writer: std.Io.Writer = undefined,
+    fn init(self: *@This(), a: std.mem.Allocator, maximum: usize) void {
+        self.* = .{ .a = a, .maximum = maximum };
+        self.writer = .{ .vtable = &.{ .drain = drain }, .buffer = &self.buffer };
+    }
+    fn account(self: *@This(), length: usize) !void {
+        const total = std.math.add(usize, self.length, length) catch return error.QueryResponseTooLarge;
+        if (total > self.maximum) return error.QueryResponseTooLarge;
+        self.length = total;
+    }
+    fn metadata(self: *@This(), bytes: []const u8) !void {
+        if (bytes.len == 0) return;
+        try self.account(bytes.len);
+        try self.segments.append(self.a, .{ .metadata = try self.a.dupe(u8, bytes) });
+    }
+    fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const self: *@This() = @alignCast(@fieldParentPtr("writer", w));
+        self.metadata(w.buffered()) catch |err| {
+            self.failure = err;
+            return error.WriteFailed;
+        };
+        w.end = 0;
+        var length: usize = 0;
+        for (data[0 .. data.len - 1]) |bytes| {
+            self.metadata(bytes) catch |err| {
+                self.failure = err;
+                return error.WriteFailed;
+            };
+            length += bytes.len;
+        }
+        const pattern = data[data.len - 1];
+        for (0..splat) |_| self.metadata(pattern) catch |err| {
+            self.failure = err;
+            return error.WriteFailed;
+        };
+        return length + pattern.len * splat;
+    }
+    fn source(self: *@This(), prepared: Prepared) !void {
+        try self.writer.flush();
+        try self.account(prepared.encoded_len);
+        try self.segments.append(self.a, .{ .source = prepared });
+    }
+    fn emit(self: *@This(), writer: *std.Io.Writer, req: db_mod.types.SearchRequest) !void {
+        for (self.segments.items) |segment| {
+            if (req.cancellation) |token| try token.check();
+            switch (segment) {
+                .metadata => |bytes| try writer.writeAll(bytes),
+                .source => |prepared| try std.json.Stringify.value(prepared, .{}, writer),
+            }
+        }
+    }
+};
+
 // Preserve the generated response envelope while replacing only source delivery.
 // The serializer retains no per-hit source/projection trees across writes.
 fn ColumnWireResult(comptime T: type) type {
@@ -3624,6 +3690,7 @@ fn ColumnWireResult(comptime T: type) type {
         req: db_mod.types.SearchRequest,
         scratch: *std.heap.ArenaAllocator,
         failure: *?anyerror,
+        plan: ?*ColumnWirePlan = null,
         pub fn jsonStringify(self: @This(), w: *std.json.Stringify) std.json.Stringify.Error!void {
             try w.beginObject();
             inline for (@typeInfo(T).@"struct".field_names) |name| {
@@ -3645,7 +3712,19 @@ fn ColumnWireResult(comptime T: type) type {
                                 if (hit.column_source) |source| {
                                     if (self.req.include_stored) {
                                         try w.objectField(field);
-                                        source.write(self.scratch, db_mod.types.LookupOptions{ .fields = self.req.fields, .include_all_fields = self.req.include_all_fields }, w) catch |err| {
+                                        const options: db_mod.types.LookupOptions = .{ .fields = self.req.fields, .include_all_fields = self.req.include_all_fields };
+                                        if (self.plan) |plan| {
+                                            const prepared = source.prepare(plan.a, self.scratch, options) catch |err| {
+                                                self.failure.* = err;
+                                                return error.WriteFailed;
+                                            };
+                                            try w.beginWriteRaw();
+                                            plan.source(prepared) catch |err| {
+                                                self.failure.* = plan.failure orelse err;
+                                                return error.WriteFailed;
+                                            };
+                                            w.endWriteRaw();
+                                        } else source.write(self.scratch, options, w) catch |err| {
                                             if (err != error.WriteFailed) self.failure.* = err;
                                             return error.WriteFailed;
                                         };
@@ -3673,28 +3752,28 @@ fn encodeColumnWire(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest, b
     var failure: ?anyerror = null;
     var scratch = std.heap.ArenaAllocator.init(alloc);
     defer scratch.deinit();
-    const wrapped = ColumnWireResult(@TypeOf(base)){ .base = base, .hits = hits, .req = req, .scratch = &scratch, .failure = &failure };
-    const envelope = .{ .responses = &.{wrapped} };
     const options: std.json.Stringify.Options = .{ .emit_null_optional_fields = false };
     if (delivery) |sink| {
-        var count_buffer: [4096]u8 = undefined;
-        var count: std.Io.Writer.Discarding = .init(&count_buffer);
-        std.json.Stringify.value(envelope, options, &count.writer) catch |err| return failure orelse err;
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        var plan: ColumnWirePlan = undefined;
+        plan.init(arena.allocator(), sink.max_bytes);
+        const wrapped = ColumnWireResult(@TypeOf(base)){ .base = base, .hits = hits, .req = req, .scratch = &scratch, .failure = &failure, .plan = &plan };
+        std.json.Stringify.value(.{ .responses = &.{wrapped} }, options, &plan.writer) catch |err| return failure orelse (plan.failure orelse err);
+        plan.writer.flush() catch |err| return plan.failure orelse err;
         if (failure) |err| return err;
-        const length = std.math.cast(usize, count.fullCount()) orelse return error.QueryResponseTooLarge;
-        if (length > sink.max_bytes) return error.QueryResponseTooLarge;
-        // Allocate the empty ownership marker before committing transport state.
         const empty = try alloc.alloc(u8, 0);
         errdefer alloc.free(empty);
-        try sink.start_fn(sink.ptr, length);
+        try sink.start_fn(sink.ptr, plan.length);
         var output: @import("query_response.zig").Delivery.Writer = .{ .sink = sink };
         output.init(sink);
-        std.json.Stringify.value(envelope, options, &output.writer) catch return error.QueryDeliveryFailed;
+        plan.emit(&output.writer, req) catch return error.QueryDeliveryFailed;
         output.writer.flush() catch return error.QueryDeliveryFailed;
-        delivered.* = length;
+        delivered.* = plan.length;
         return empty;
     }
-    return std.json.Stringify.valueAlloc(alloc, envelope, options) catch |err| return failure orelse err;
+    const wrapped = ColumnWireResult(@TypeOf(base)){ .base = base, .hits = hits, .req = req, .scratch = &scratch, .failure = &failure };
+    return std.json.Stringify.valueAlloc(alloc, .{ .responses = &.{wrapped} }, options) catch |err| return failure orelse err;
 }
 
 pub fn encodeQueryResponses(
@@ -18700,6 +18779,8 @@ test "external lake streamed column delivery validates limits before headers and
     const columns = [_]rows.ColumnVector{
         .{ .name = "body", .values = .{ .bytes = &.{"needle"} } },
         .{ .name = "amount", .values = .{ .i64 = &.{9007199254740993} } },
+        .{ .name = "escaped\nkey", .values = .{ .bytes = &.{"a\x00\n\t\\\"é😀"} } },
+        .{ .name = "nested", .values = .{ .json = &.{"{\"visible\":\"value\\n\",\"private\":0}"} } },
     };
     const page = try db_mod.types.ColumnSourcePage.copy(a, .{ .snapshot = .{ .table_id = "docs", .snapshot_id = "one" }, .row_refs = &refs, .columns = &columns }, &.{0});
     defer page.release();
@@ -18749,7 +18830,7 @@ test "external lake streamed column delivery validates limits before headers and
     capture.fail = true;
     try std.testing.expectError(error.QueryDeliveryFailed, encodeQueryResponsesWithDelivery(a, "docs", .{}, .{}, result, capture.sink(expected.json.len)));
     try std.testing.expectEqual(@as(usize, 2), capture.starts);
-    // Invalid JSON is rejected in the validation/count pass before a sink starts.
+    // Invalid JSON is rejected during plan preparation before a sink starts.
     const bad_columns = [_]rows.ColumnVector{.{ .name = "bad", .values = .{ .json = &.{"{invalid}"} } }};
     const bad_page = try db_mod.types.ColumnSourcePage.copy(a, .{ .snapshot = .{ .table_id = "docs", .snapshot_id = "one" }, .row_refs = &refs, .columns = &bad_columns }, &.{0});
     defer bad_page.release();

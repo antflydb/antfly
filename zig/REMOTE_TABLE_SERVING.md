@@ -929,7 +929,7 @@ allocator; highlighting likewise borrows one
 row at a time, including fields excluded from the public projection. Internal hit
 codecs serialize source values rather than owner pointers. Exact integers, source
 omission, nested inclusion/exclusion, and internal-field stripping retain their
-existing behavior. Final response-size limits and the owned response buffer remain.
+existing behavior. Internal callers retain owned responses; eligible public calls use the prepared streaming delivery described below.
 
 Boolean conjunctions check local required-term lookups before requesting global
 scoring frequencies, retaining successful navigation for iterator construction.
@@ -941,8 +941,11 @@ cache admission. A leader probes verified RAM/mapped/disk residency and reads
 only contiguous cold runs; fifteen warm units plus one cold unit transfer only
 64 KiB. Concurrent leaders for different units can share the verified physical
 result even when RAM admission is denied. Flight payloads are temporary leases,
-with no second resident copy of a pack. Every consumer still authenticates its
-unit and checks its own current authority. Waiting readers use their own
+with no second resident copy of a pack. The physical loader authenticates each
+unit once and carries its digest proof with a retained slice owner. Cache admission
+copies a unit once into independently evictable RAM residency; denied admission
+returns the original physical slice without copying or hashing again. Each
+consumer checks its own current authority. Waiting readers use their own
 cancellation/deadline; a canceled leader does not cancel another reader.
 Planners never join unit flights while owning a physical flight, avoiding
 cycles between overlapping unit and pack leaders.
@@ -951,20 +954,34 @@ Required multi-pack reads use at most four lanes through the shared scheduler.
 Each lane owns bounded scratch and a disjoint output slice; saturation runs
 required work inline. All lanes join on success, failure, or cancellation before
 query capabilities and output storage can be released. Speculative hints keep
-their separate transient admission and may yield under pressure.
+their separate transient admission and may yield under pressure. A required
+cache hit reaps only completed speculation: it does not wait for unrelated units
+in an overlapping pack. Quiesce still cancels and joins all remaining tasks.
+
+Final hydration builds one physical row selection for the complete ranked result,
+including duplicate identity consumers. A single pinned cursor visits selected
+files/row groups in physical order and returns bounded pages; an identity map
+scatters each page into rank order. Crossing a 256-hit boundary no longer reopens
+a cursor or revisits the same physical group solely because of rank batching.
 
 Eligible single public remote searches deliver the existing JSON envelope
-through a synchronous transport sink. A validation/count pass rejects malformed
-sources, cancellation, and the caller's response-size ceiling before headers
-commit. A second pass writes through a 16 KiB buffer with transport backpressure;
-no complete response buffer or per-hit JSON source tree is retained. The query,
-publication reader lease, and selected column pages remain alive through the
-last write. A disconnect or error after commitment terminates the stream rather
-than retrying execution or sending a second response. Internal/group callers,
-composed dispatch consumers, and NDJSON multi-query retain buffered delivery.
-The two-pass encoding trades additional serialization CPU for bounded response
-memory and preserves pre-commit error semantics; it is not a measured latency
-claim. Existing row/candidate limits and caller response ceilings still apply.
+through a synchronous transport sink. A prepared wire plan encodes metadata
+once and compiles projected source descriptors before committing headers. Scalar
+strings borrow immutable column pages; numbers and complex JSON fragments are
+canonicalized once. Exact JSON escaping and punctuation lengths enforce the
+caller's response-size ceiling before transport starts. Transient JSON/projection
+trees are discarded after each source is prepared, including escaped strings.
+
+The plan emits its ordered metadata/source segments through a 16 KiB writer with
+transport backpressure, without replaying envelope serialization or projection.
+Plan memory scales with compact field descriptors, encoded metadata and complex
+JSON fragments; it is not a constant-memory result cursor. Scalar source strings
+are not copied into a full response buffer. The query, publication reader lease,
+and selected column pages remain alive through the last write. A disconnect or
+error after commitment terminates the stream rather than retrying execution or
+sending a second response. Internal/group callers, composed dispatch consumers,
+and NDJSON multi-query retain buffered delivery. Existing row/candidate limits
+and caller response ceilings still apply. No wall-clock speedup is claimed.
 
 The `x-antfly-response-streaming` OpenAPI operation flag exports optional
 transport streaming for global, table, and namespace query routes through the

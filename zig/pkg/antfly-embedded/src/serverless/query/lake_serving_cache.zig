@@ -285,6 +285,65 @@ pub const Cache = struct {
         if (lease == .mapped) return self.admitMapping(key, lease.mapped);
         return lease;
     }
+    /// Authentication proof for immutable bytes. Producers authenticate once,
+    /// then pair the proof with an owner that keeps that exact slice alive.
+    pub const VerifiedBytes = struct {
+        bytes: []const u8,
+        digest: [32]u8,
+        pub fn authenticate(bytes: []const u8, digest: [32]u8) !@This() {
+            var actual: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(bytes, &actual, .{});
+            if (!std.mem.eql(u8, &actual, &digest)) return error.ArtifactIntegrityMismatch;
+            return .{ .bytes = bytes, .digest = digest };
+        }
+    };
+    pub const VerifiedLease = struct { value: VerifiedBytes, owner: ranges.RangeLease };
+    /// Look up authenticated unit residency without starting a unit flight.
+    /// Pack loaders coordinate misses with their own shared physical flight.
+    pub fn lookupImmutableBlockLease(self: *Cache, a: Allocator, scope: [32]u8, identity: []const u8, length: usize, digest: [32]u8, context: Context) !?ImmutableLease {
+        try context.ensureActive();
+        const key = try immutableKey(a, scope, identity, length, digest);
+        defer a.free(key);
+        if (self.pin(key)) |value| {
+            errdefer value.release();
+            try context.ensureActive();
+            return .{ .shared = value };
+        }
+        if (self.pinMapping(key)) |value| {
+            errdefer value.release();
+            try context.ensureActive();
+            return .{ .mapping = value };
+        }
+        if (self.persistent) |*disk| if (try disk.readMapped(a, key, length, digest, context)) |value| {
+            self.recordRead(true, length);
+            var lease = self.admitMapping(key, value);
+            errdefer lease.deinit();
+            try context.ensureActive();
+            return lease;
+        };
+        return null;
+    }
+    /// Consume a verified slice lease. Admission copies a unit once into its
+    /// independently evictable RAM entry; denied admission returns the original
+    /// shared physical slice, without an intermediate allocation or rehash.
+    pub fn admitVerifiedBlock(self: *Cache, a: Allocator, scope: [32]u8, identity: []const u8, length: usize, digest: [32]u8, context: Context, verified: VerifiedLease) !ImmutableLease {
+        var retained = true;
+        defer if (retained) verified.owner.release();
+        try context.ensureActive();
+        if (verified.value.bytes.ptr != verified.owner.bytes.ptr or verified.value.bytes.len != verified.owner.bytes.len or verified.value.bytes.len != length or !std.mem.eql(u8, &verified.value.digest, &digest)) return error.ArtifactIntegrityMismatch;
+        const key = try immutableKey(a, scope, identity, length, digest);
+        defer a.free(key);
+        if (self.persistent) |*disk| _ = disk.enqueueWrite(key, verified.value.bytes);
+        self.store(key, verified.value.bytes) catch {};
+        if (self.pin(key)) |value| {
+            errdefer value.release();
+            try context.ensureActive();
+            return .{ .shared = value };
+        }
+        try context.ensureActive();
+        retained = false;
+        return .{ .shared = verified.owner };
+    }
     /// Probe verified residency without joining unit flights or issuing provider I/O.
     /// Physical read planners must never wait on a unit flight while owning a
     /// physical flight: another unit leader may already be waiting on them.
@@ -1197,4 +1256,37 @@ test "external lake disk pressure reclaims idle mappings while preserving active
     defer admitted.deinit();
     try std.testing.expect(admitted == .mapping);
     try std.testing.expectEqualStrings("verified block", active.bytes());
+}
+
+test "external lake verified slice admission retains denied ownership and copies resident units once" {
+    const a = std.testing.allocator;
+    var cache = Cache.init(a);
+    defer cache.deinit();
+    const Owner = struct {
+        released: usize = 0,
+        fn release(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.released += 1;
+        }
+    };
+    var owner: Owner = .{};
+    const bytes = "verified unit";
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    const verified: Cache.VerifiedLease = .{ .value = try Cache.VerifiedBytes.authenticate(bytes, digest), .owner = .{ .bytes = bytes, .owner = .{ .shared = .{ .ptr = &owner, .release_fn = Owner.release } } } };
+    cache.max_entries = 0;
+    var denied = try cache.admitVerifiedBlock(a, @splat(1), "unit", bytes.len, digest, .{}, verified);
+    try std.testing.expect(denied.bytes().ptr == bytes.ptr);
+    try std.testing.expectEqual(@as(usize, 0), owner.released);
+    denied.deinit();
+    try std.testing.expectEqual(@as(usize, 1), owner.released);
+    cache.max_entries = 4096;
+    var admitted = try cache.admitVerifiedBlock(a, @splat(1), "unit", bytes.len, digest, .{}, verified);
+    defer admitted.deinit();
+    try std.testing.expect(admitted.bytes().ptr != bytes.ptr);
+    try std.testing.expectEqualStrings(bytes, admitted.bytes());
+    try std.testing.expectEqual(@as(usize, 2), owner.released);
+    try std.testing.expectError(error.ArtifactIntegrityMismatch, cache.admitVerifiedBlock(a, @splat(2), "unit", bytes.len + 1, digest, .{}, verified));
+    try std.testing.expectEqual(@as(usize, 3), owner.released);
+    try std.testing.expectError(error.ArtifactIntegrityMismatch, Cache.VerifiedBytes.authenticate("corrupt", digest));
 }

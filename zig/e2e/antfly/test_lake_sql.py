@@ -1423,6 +1423,25 @@ def test_native_remote_text_corpus_scores_filters_and_restart(tmp_path):
             assert source["amount"] == base + int(source["label"].removeprefix("row-")), hit
             assert source["body"] == "filler document", hit
             assert hit["_highlights"]["body"], hit
+        # A rare-term disjunction ranks scattered rows before common rows.
+        # Physical hydration must scatter bounded pages back into score order.
+        ranked = call(
+            "POST", "/tables/lake_text/query",
+            {"full_text_search": {"disjuncts": [
+                {"match": "needle", "field": "body"},
+                {"match": "filler", "field": "body"}]},
+             "full_text_index": "body_text", "fields": ["label", "amount"],
+             "order_by": [{"field": "_score", "desc": True}], "limit": 600})
+        ranked_hits = ranked["hits"]["hits"]
+        assert len(ranked_hits) == 600, ranked
+        ranked_ids = [hit["_id"] for hit in ranked_hits]
+        assert len(set(ranked_ids)) == 600
+        assert ranked_ids != sorted(ranked_ids)
+        ranked_scores = [hit["_score"] for hit in ranked_hits]
+        assert ranked_scores == sorted(ranked_scores, reverse=True)
+        for hit in ranked_hits:
+            row = int(hit["_source"]["label"].removeprefix("row-"))
+            assert hit["_source"]["amount"] == base + row, hit
         ordered_request = dict(request, order_by=[{"field": "_score", "desc": True}])
         ordered_first = call(
             "POST", "/tables/lake_text/query", dict(ordered_request, limit=1)

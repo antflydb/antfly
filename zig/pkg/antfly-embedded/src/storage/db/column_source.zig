@@ -100,6 +100,65 @@ pub const Page = struct {
     }
 };
 
+/// Compact projected wire values. Scalar strings borrow the retained column
+/// page; numbers and complex JSON are canonicalized once. Temporary projection
+/// trees are reset after each preparation and never survive into transport I/O.
+pub const Prepared = struct {
+    const Value = union(enum) {
+        string: []const u8,
+        raw: []const u8,
+        fn length(self: @This()) !usize {
+            return switch (self) {
+                .string => |v| stringLength(v),
+                .raw => |v| v.len,
+            };
+        }
+        pub fn jsonStringify(self: @This(), w: *std.json.Stringify) std.json.Stringify.Error!void {
+            switch (self) {
+                .string => |v| try w.write(v),
+                .raw => |v| {
+                    try w.beginWriteRaw();
+                    try w.writer.writeAll(v);
+                    w.endWriteRaw();
+                },
+            }
+        }
+        fn prepare(a: A, value: std.json.Value, borrow_string: bool) !@This() {
+            if (borrow_string and value == .string and std.unicode.utf8ValidateSlice(value.string)) return .{ .string = value.string };
+            return .{ .raw = try std.json.Stringify.valueAlloc(a, value, .{ .emit_null_optional_fields = false }) };
+        }
+    };
+    const Field = struct { name: []const u8, value: Value };
+    fields: []const Field,
+    encoded_len: usize,
+    fn stringLength(bytes: []const u8) !usize {
+        var length = try std.math.add(usize, bytes.len, 2);
+        for (bytes) |byte| length = try std.math.add(usize, length, switch (byte) {
+            '"', '\\', 8, 12, '\n', '\r', '\t' => @as(usize, 1),
+            0...7, 11, 14...31 => @as(usize, 5),
+            else => @as(usize, 0),
+        });
+        return length;
+    }
+    fn init(fields: []const Field) !Prepared {
+        var length: usize = 2;
+        for (fields, 0..) |field, i| {
+            length = try std.math.add(usize, length, try stringLength(field.name));
+            length = try std.math.add(usize, length, 1 + @as(usize, @intFromBool(i != 0)));
+            length = try std.math.add(usize, length, try field.value.length());
+        }
+        return .{ .fields = fields, .encoded_len = length };
+    }
+    pub fn jsonStringify(self: Prepared, w: *std.json.Stringify) std.json.Stringify.Error!void {
+        try w.beginObject();
+        for (self.fields) |field| {
+            try w.objectField(field.name);
+            try w.write(field.value);
+        }
+        try w.endObject();
+    }
+};
+
 pub const Row = struct {
     page: *Page,
     index: usize,
@@ -215,6 +274,36 @@ pub const Row = struct {
         };
         try w.endObject();
     }
+    pub fn prepare(self: Row, a: A, scratch: *std.heap.ArenaAllocator, options: anytype) !Prepared {
+        _ = scratch.reset(.retain_capacity);
+        const sa = scratch.allocator();
+        var fields: std.ArrayList(Prepared.Field) = .empty;
+        const simple = for (options.fields) |field| {
+            if (std.mem.indexOfScalar(u8, field, '.') != null) break false;
+        } else true;
+        if (!simple) {
+            const source = try self.value(scratch);
+            var view = try projection.projectLookupView(sa, source, options);
+            stripInternal(&view);
+            var it = view.object.iterator();
+            while (it.next()) |entry| try fields.append(a, .{ .name = try a.dupe(u8, entry.key_ptr.*), .value = try Prepared.Value.prepare(a, entry.value_ptr.*, false) });
+        } else {
+            const includes = for (options.fields) |field| {
+                if (field.len == 0 or field[0] != '-') break true;
+            } else false;
+            if (includes) {
+                for (options.fields, 0..) |field, ordinal| for (self.page.columns) |column| {
+                    if (!std.mem.eql(u8, field, "*") and !std.mem.eql(u8, field, column.name)) continue;
+                    if (firstInclude(options.fields, column.name) != ordinal or excluded(options.fields, column.name) or internal(column.name)) continue;
+                    try fields.append(a, .{ .name = column.name, .value = try Prepared.Value.prepare(a, try self.cell(sa, column), column.values != .json) });
+                };
+            } else if (options.fields.len != 0 or options.include_all_fields) for (self.page.columns) |column| {
+                if (internal(column.name) or excluded(options.fields, column.name)) continue;
+                try fields.append(a, .{ .name = column.name, .value = try Prepared.Value.prepare(a, try self.cell(sa, column), column.values != .json) });
+            };
+        }
+        return Prepared.init(fields.items);
+    }
     fn firstInclude(fields: []const []const u8, name: []const u8) ?usize {
         for (fields, 0..) |field, index| {
             if (field.len != 0 and field[0] == '-') continue;
@@ -324,4 +413,40 @@ test "external lake column clones into another allocator outlive the original re
     defer scratch.deinit();
     const value = try copied.value(&scratch);
     try std.testing.expectEqualStrings("survives request closure", value.object.get("body").?.string);
+}
+
+fn preparedProjectionScenario(a: A) !void {
+    const refs = [_]rows.RowRef{.{ .relational_key = "row" }};
+    const columns = [_]rows.ColumnVector{
+        .{ .name = "escaped\nkey", .values = .{ .bytes = &.{"a\x00\x01\x08\x0b\x0c\n\r\t\\\"é😀"} } },
+        .{ .name = "amount", .values = .{ .i64 = &.{9007199254740993} } },
+        .{ .name = "nested", .values = .{ .json = &.{"{\"visible\":\"escaped\\nvalue\",\"private\":0,\"array\":[null,true,1.5]}"} } },
+        .{ .name = "nullable", .values = .{ .bool = &.{false} }, .nulls = .{ .bytes = &.{1} } },
+    };
+    const page = try Page.copy(a, .{ .snapshot = .{ .table_id = "test", .snapshot_id = "one" }, .row_refs = &refs, .columns = &columns }, &.{0});
+    defer page.release();
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    const source: Row = .{ .page = page, .index = 0 };
+    const Options = @import("types.zig").LookupOptions;
+    for ([_]Options{ .{}, .{ .fields = &.{"*"} }, .{ .fields = &.{ "nested.*", "-nested.private", "amount" } }, .{ .fields = &.{ "escaped\nkey", "escaped\nkey", "nullable" } }, .{ .fields = &.{"-amount"} } }) |options| {
+        var preparation = std.heap.ArenaAllocator.init(a);
+        defer preparation.deinit();
+        const prepared = try source.prepare(preparation.allocator(), &scratch, options);
+        // Transient parsing/projection state must not be borrowed by the plan.
+        _ = scratch.reset(.free_all);
+        const encoded = try std.json.Stringify.valueAlloc(a, prepared, .{});
+        defer a.free(encoded);
+        try std.testing.expectEqual(encoded.len, prepared.encoded_len);
+        var buffer: [4096]u8 = undefined;
+        var output: std.Io.Writer = .fixed(&buffer);
+        var w: std.json.Stringify = .{ .writer = &output };
+        try source.write(&scratch, options, &w);
+        try std.testing.expectEqualStrings(output.buffered(), encoded);
+    }
+}
+
+test "external lake prepared projection has exact escaped length and survives scratch reset and OOM" {
+    try preparedProjectionScenario(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, preparedProjectionScenario, .{});
 }
