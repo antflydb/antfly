@@ -21,7 +21,10 @@ zig/CAPI.md "Inference" and antfly.h).
 from __future__ import annotations
 
 import glob
+import json
 import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -106,6 +109,57 @@ def test_embed_missing_model_raises_not_found(tmp_path: Path) -> None:
         with pytest.raises(errors.NotFoundError) as exc_info:
             inf.embed({"model": "nonexistent/does-not-exist", "input": "hello"})
         assert "MODEL_NOT_FOUND" in str(exc_info.value)
+
+
+def test_decide_errors_and_closed_handle(tmp_path: Path) -> None:
+    inf = antfly_embedded.Inference.open(models_dir=tmp_path)
+    try:
+        with pytest.raises(errors.InvalidArgumentError, match="INVALID_REQUEST"):
+            inf.decide({})
+        with pytest.raises(errors.NotFoundError, match="MODEL_NOT_FOUND"):
+            inf.decide(
+                {
+                    "model": "no/such-model",
+                    "state": "refund",
+                    "questions": {"refund": {"type": "noul", "instructions": "Refund?"}},
+                }
+            )
+    finally:
+        inf.close()
+    with pytest.raises(errors.InvalidArgumentError):
+        inf.decide({})
+
+
+def test_decide_real_runtime_returns_all_answer_types_and_raw_json(tmp_path: Path) -> None:
+    script = Path(__file__).resolve().parents[4] / "scripts/testing/create_decision_fixture.py"
+    model = subprocess.check_output([sys.executable, str(script), str(tmp_path)], text=True).strip()
+    request = {
+        "model": model,
+        "state": "Refund the duplicate charge.",
+        "questions": {
+            "route": {
+                "type": "choice",
+                "instructions": "Which team?",
+                "criteria": {"billing": "Charges", "support": "Product"},
+            },
+            "urgency": {"type": "score", "instructions": "How urgent?", "criteria": ["Routine", "Soon", "Immediate"]},
+            "refund": {"type": "noul", "instructions": "Refund requested?"},
+        },
+    }
+    with antfly_embedded.Inference.open(models_dir=tmp_path) as inf:
+        result = inf.decide(request)
+        assert result["model"] == model
+        assert result["answers"]["route"]["choice"] == "billing"
+        assert result["answers"]["route"]["probabilities"] == {"billing": 0.5, "support": 0.5}
+        assert result["answers"]["urgency"]["score"] == pytest.approx(1.0)
+        assert result["answers"]["urgency"]["legend"] == {"0": "Routine", "1": "Soon", "2": "Immediate"}
+        assert sum(result["answers"]["urgency"]["probabilities"].values()) == pytest.approx(1.0)
+        assert result["answers"]["refund"]["noul"] == pytest.approx(0.5)
+        assert result["usage"]["input_tokens"] > 0
+        assert result["usage"]["output_tokens"] == 0
+        raw = inf.decide(json.dumps(request), raw=True)
+        assert isinstance(raw, bytes)
+        assert json.loads(raw) == result
 
 
 def test_pull_missing_model_field_raises_invalid_argument(tmp_path: Path) -> None:

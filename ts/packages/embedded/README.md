@@ -181,8 +181,11 @@ try {
 }
 ```
 
+For decision question types and examples, see the
+[typed decision guide](../../../docs/guides/decisions.md).
+
 - **Calls**: `embed`, `rerank`, `chunk`, `generate`, `generateBatch`,
-  `rewrite`, `extract`, `read` (OCR), `transcribe`, `listModels` -- each with
+  `rewrite`, `decide`, `extract`, `read` (OCR), `transcribe`, `listModels` -- each with
   a bare form (parsed JSON) and a `...Raw` form (raw `Buffer`), following the
   same convention as `Database`. Binary inputs (images, audio) go inline in
   the request JSON, as base64 or `data:` URIs. Responses are always

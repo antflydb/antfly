@@ -109,10 +109,14 @@ handlers:
 | `antfly_inference_generate_json` | `POST /generate` |
 | `antfly_inference_generate_batch_json` | `POST /generate/batch` |
 | `antfly_inference_rewrite_json` | `POST /rewrite` |
+| `antfly_inference_decide_json` | `POST /decide` |
 | `antfly_inference_extract_json` | `POST /extract` |
 | `antfly_inference_read_json` | `POST /read` (OCR) |
 | `antfly_inference_transcribe_json` | `POST /transcribe` |
 | `antfly_inference_list_models_json` | `GET /models` |
+
+For decision question types, answer semantics, and SQL providers, see the
+[typed decision guide](../docs/guides/decisions.md).
 
 - Images and audio go inline in the JSON, as base64 or `data:` URIs.
 - The `_json` calls return complete responses. To stream,
