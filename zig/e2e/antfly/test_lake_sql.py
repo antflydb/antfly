@@ -707,6 +707,38 @@ def test_inline_aggregate_catalog_exceeds_legacy_declaration_limit(tmp_path):
                         break
                 else:
                     pytest.fail(f"Missing authenticated contribution page: {page}")
+            def contribution_tree(ref):
+                digest = bytes(ref["digest"]).hex()
+                for candidate in (server.root / "artifacts").rglob(digest):
+                    if candidate.is_file():
+                        payload = candidate.read_bytes()[-ref["bytes"]:]
+                        if hashlib.sha256(payload).hexdigest() == digest:
+                            break
+                else:
+                    pytest.fail(f"Missing authenticated contribution tree page: {ref}")
+                assert payload[:8] == b"AFGPT003"
+                assert payload[8] == ref["height"]
+                count = int.from_bytes(payload[12:16], "little")
+                offset = 56
+                for _ in range(count):
+                    key_len = int.from_bytes(payload[offset:offset + 4], "little")
+                    value_len = int.from_bytes(payload[offset + 4:offset + 8], "little")
+                    offset += 8
+                    key = payload[offset:offset + key_len]
+                    offset += key_len
+                    value = payload[offset:offset + value_len]
+                    offset += value_len
+                    if ref["height"]:
+                        assert len(value) == 61
+                        contribution_tree({"digest": list(value[:32]), "attempt": list(value[45:61]),
+                                           "bytes": int.from_bytes(value[32:36], "little"),
+                                           "height": value[36], "records": int.from_bytes(value[37:45], "little")})
+                    else:
+                        assert len(key) == 32
+                        records.append(json.loads(value))
+                assert offset == len(payload)
+            if document.get("contribution_index"):
+                contribution_tree(document["contribution_index"])
             return {item["artifact"]["artifact_id"] for item in records}
 
         directory_found = False
@@ -1068,7 +1100,11 @@ def test_native_remote_incremental_generations_keep_public_identity_and_file_art
                                      "include_columns": ["body"]}]},
             "indexes": {"body_text": {"type": "full_text", "field": "body"},
                         "sparse_native": {"type": "embeddings", "external": True, "sparse": True},
-                        "dense_native": {"type": "embeddings", "external": True, "dimension": 2}}})
+                        "dense_native": {"type": "embeddings", "external": True, "dimension": 2},
+                        "group_stats": {"type": "algebraic", "derive_from_schema": True,
+                            "aggregates": [{"name": "rows", "op": "count", "group_by": ["amount"]},
+                                           *[{"name": op, "op": op, "measure": "amount", "group_by": ["amount"]}
+                                             for op in ("sum", "min", "max")]]}}})
 
         def wait_ready():
             deadline = time.monotonic() + 90
@@ -1112,6 +1148,9 @@ def test_native_remote_incremental_generations_keep_public_identity_and_file_art
             assert {hit["_id"] for hit in results[0]["hits"]["hits"]} == {hit["_id"] for hit in results[1]["hits"]["hits"]} == {hit["_id"] for hit in results[2]["hits"]["hits"]}
             ordered = call("POST", "/sql", {"statement": "SELECT amount, body FROM incremental ORDER BY amount LIMIT 20"})
             assert ordered["rows"] == [[str(amount), "needle"] for amount in sorted(expected)], ordered
+            grouped = call("POST", "/sql", {"statement": "SELECT amount, COUNT(*), SUM(amount), MIN(amount), MAX(amount) FROM incremental GROUP BY amount ORDER BY amount"})
+            assert grouped["rows"] == [[str(amount), "1", str(amount), str(amount), str(amount)]
+                                       for amount in sorted(expected)], grouped
             public_id = results[0]["hits"]["hits"][0]["_id"]
             for request in (text_request, dense_request, sparse_request):
                 filtered = call("POST", "/tables/incremental/query", dict(request,

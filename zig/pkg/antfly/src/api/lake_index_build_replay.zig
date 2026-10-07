@@ -70,6 +70,9 @@ pub fn columnsForBuild(a: A, out: A, table: local.common_topology_records.TableR
 /// Union changed native files so delta builders share only the necessary input.
 /// Unknown/legacy producer formats conservatively request a complete replay.
 pub fn changedFiles(a: A, out: A, provider: *Provider, store: @import("../serverless/artifacts/store.zig").ArtifactStore, declarations: []const local.serverless_segment_sidecar_manifest.DeclaredArtifact, contributions: []const local.metadata_lake_index_catalog.FileContribution, cancellation: Cancellation) !?[]const bool {
+    return changedFilesIndexed(a, out, provider, store, declarations, contributions, cancellation, null);
+}
+pub fn changedFilesIndexed(a: A, out: A, provider: *Provider, store: @import("../serverless/artifacts/store.zig").ArtifactStore, declarations: []const local.serverless_segment_sidecar_manifest.DeclaredArtifact, contributions: []const local.metadata_lake_index_catalog.FileContribution, cancellation: Cancellation, index: ?*@import("lake_index_contributions.zig").Index) !?[]const bool {
     const state = @import("lake_index_native_state.zig");
     const needed = try out.alloc(bool, provider.source.inventory.files.len);
     @memset(needed, false);
@@ -89,7 +92,16 @@ pub fn changedFiles(a: A, out: A, provider: *Provider, store: @import("../server
             const recipe = try @import("lake_index_aggregate_artifact.zig").loadRecipe(ca, store, declaration.artifact, cancellation);
             if (!aggregate.incrementalRecipe(recipe) or provider.source.inventory.deleted_row_groups.len != 0 or (if (provider.source.scanner.iceberg_delete_plan) |plan| plan.files.len != 0 else false)) return null;
             const fingerprint = recipe.fingerprint();
-            for (file_keys, needed) |key, *required| required.* = required.* or !old.contains(aggregate.contributionKey(key, fingerprint, declaration.name));
+            for (file_keys, needed) |key, *required| {
+                const lookup_key = aggregate.contributionKey(key, fingerprint, declaration.name);
+                if (!required.* and !old.contains(lookup_key)) {
+                    required.* = if (index) |lookup| missing: {
+                        var scratch = std.heap.ArenaAllocator.init(a);
+                        defer scratch.deinit();
+                        break :missing (try lookup.lookup(scratch.allocator(), lookup_key)) == null;
+                    } else true;
+                }
+            }
             continue;
         }
         const previous: []const state.File = switch (declaration.artifact.kind) {

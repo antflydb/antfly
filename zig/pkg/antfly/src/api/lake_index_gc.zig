@@ -86,6 +86,7 @@ pub const Collector = struct {
                 const document = try directories.loadDocument(sa, self.store, .{ .kind = .external_base_source, .artifact_id = directory.artifact_id, .checksum = directory.checksum, .byte_len = directory.byte_len }, self.cancellation(), null);
                 hydrated.declarations = document.declarations;
                 hydrated.file_contributions = document.file_contributions;
+                if (document.contribution_index) |root| try self.markContributionIndex(sa, root);
                 for (document.contribution_pages) |page| {
                     _ = try self.mark(.{ .artifact_id = page.artifact_id, .checksum = page.checksum, .byte_len = page.byte_len });
                     try stores.chargeReadBudget(&self.remaining_reads, page.byte_len);
@@ -173,6 +174,29 @@ pub const Collector = struct {
         if (!std.mem.eql(u8, &domain, &scope.domain)) return error.InvalidNativeLakeGcReference;
         return root;
     }
+    fn markContributionIndex(self: *Collector, a: A, root: @import("../serverless/graph_segment/page_tree.zig").Ref) anyerror!void {
+        const page_store = @import("../serverless/graph_segment/page_store.zig");
+        const domain = @import("lake_index_publication.zig").uploadDomainWithNamespace(self.table, self.identity, self.namespace);
+        const id = try page_store.PageStore.identity(domain, root);
+        if (!try self.mark(.{ .artifact_id = &id, .checksum = &std.fmt.bytesToHex(&root.digest, .lower), .byte_len = root.bytes })) return;
+        var writes: u64 = 0;
+        var pages: page_store.PageStore = .{ .domain = domain, .artifacts = &self.store, .cancellation = self.cancellation(), .remaining_read_bytes = &self.remaining_reads, .remaining_write_bytes = &writes };
+        const Visitor = struct {
+            collector: *Collector,
+            a: A,
+            pub fn child(v: *@This(), ref: @import("../serverless/graph_segment/page_tree.zig").Ref) !void {
+                try v.collector.markContributionIndex(v.a, ref);
+            }
+            pub fn record(v: *@This(), key: []const u8, bytes: []const u8) !void {
+                const value = try std.json.parseFromSliceLeaky(local.metadata_lake_index_catalog.FileContribution, v.a, bytes, .{ .allocate = .alloc_always });
+                try @import("lake_index_contributions.zig").validate(value);
+                if (!std.mem.eql(u8, key, &@import("lake_index_contributions.zig").identity(value))) return error.InvalidLakeIndexCatalog;
+                try v.collector.markArtifact(v.a, value.artifact);
+            }
+        };
+        var visitor: Visitor = .{ .collector = self, .a = a };
+        try @import("../serverless/graph_segment/page_tree.zig").walkPage(a, pages.store(), root, &visitor);
+    }
     pub fn markArtifact(self: *Collector, a: A, ref: local.serverless_manifest_artifact_ref.ArtifactRef) !void {
         const root_chunk: artifacts.ChunkRef = .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len };
         const fresh = if (self.progress) |progress| try progress.expand(root_chunk, @tagName(ref.kind)) else try self.mark(root_chunk);
@@ -180,6 +204,13 @@ pub const Collector = struct {
         switch (ref.kind) {
             .algebraic_segment => {
                 if (!artifacts.supportsMetadataVersion(ref.metadata_version)) return error.InvalidNativeLakeGcReference;
+                if (ref.metadata_version == 3) {
+                    try stores.chargeReadBudget(&self.remaining_reads, ref.byte_len *| 3);
+                    for (try artifacts.partitionChildren(a, self.store, ref, self.cancellation())) |child| {
+                        if (self.progress) |progress| try progress.enqueue(.{ .artifact = child }) else try self.markArtifact(a, child);
+                    }
+                    return;
+                }
                 try stores.chargeReadBudget(&self.remaining_reads, ref.byte_len *| 2);
                 for (try artifacts.descendantsAlloc(a, self.store, ref, self.cancellation())) |child| _ = try self.mark(child);
             },
@@ -301,7 +332,11 @@ test "external lake native GC retains shared aggregate blocks and durable reader
     const group = try local.sql_operators.Grouped.create(a, &.{spec}, .{ .groups = 1, .bytes = 1024 * 1024 });
     defer group.deinit();
     try group.add(&.{}, &.{local.sql_scalar.Datum.fromJson(.{ .integer = 9007199254740993 })});
-    const root = try artifacts.publish(a, ca, &store, "sum", group, recipe, .none);
+    const flat_root = try artifacts.publish(a, ca, &store, "sum", group, recipe, .none);
+    var partition: std.ArrayList(artifacts.Partition) = .empty;
+    try partition.append(ca, .{ .bucket = 0, .artifact = flat_root, .groups = 1 });
+    const partitioned = try artifacts.publishPartitionRoots(a, ca, &store, &.{"sum"}, recipe, &.{partition}, .none);
+    const root = partitioned[0];
     // A distinct root over the same cohort demonstrates both sharing and an
     // old reader's sole reference to an otherwise obsolete logical root.
     const old_group = try local.sql_operators.Grouped.create(a, &.{spec}, .{ .groups = 1, .bytes = 1024 * 1024 });
@@ -345,7 +380,10 @@ test "external lake native GC retains shared aggregate blocks and durable reader
     var sparse_upload = try store.put(sparse_bytes);
     defer sparse_upload.deinit(a);
     const sparse_ref: local.serverless_manifest_artifact_ref.ArtifactRef = .{ .name = "sparse", .kind = .sparse_segment, .metadata_version = @import("lake_index_native_sparse.zig").metadata_version, .artifact_id = sparse_upload.artifact_id, .checksum = sparse_upload.checksum, .byte_len = sparse_upload.byte_len };
-    const directory_one = try @import("lake_index_directory.zig").publishWithContributions(ca, &store, &.{ .{ .name = "sum", .binding = binding, .artifact = root }, .{ .name = "old_sum", .binding = binding, .artifact = old_root }, .{ .name = row_root.name, .binding = row_binding, .artifact = row_root }, .{ .name = "text", .binding = text_binding, .artifact = text_ref }, .{ .name = "sparse", .binding = sparse_binding, .artifact = sparse_ref } }, &.{.{ .file = @splat(1), .recipe = recipe.fingerprint(), .name = "sum", .artifact = root }}, .none);
+    var contribution_index: @import("lake_index_contributions.zig").Index = undefined;
+    try contribution_index.init(a, store, null, .none);
+    defer contribution_index.deinit();
+    const directory_one = try @import("lake_index_directory.zig").publishIndexed(ca, &store, &.{ .{ .name = "sum", .binding = binding, .artifact = root }, .{ .name = "old_sum", .binding = binding, .artifact = old_root }, .{ .name = row_root.name, .binding = row_binding, .artifact = row_root }, .{ .name = "text", .binding = text_binding, .artifact = text_ref }, .{ .name = "sparse", .binding = sparse_binding, .artifact = sparse_ref } }, &.{.{ .file = @splat(1), .recipe = recipe.fingerprint(), .name = "sum", .artifact = root }}, &contribution_index, .none);
     var orphan = try store.put("abandoned build artifact");
     defer orphan.deinit(a);
     var second_orphan = try store.put("another abandoned build artifact");

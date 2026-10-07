@@ -32,7 +32,7 @@ pub const Job = union(enum) {
     artifact: Ref,
     contribution_page: Ref,
     chunk: artifacts.ChunkRef,
-    page: struct { ref: tree.Ref, ordered_rows: bool },
+    page: struct { ref: tree.Ref, ordered_rows: bool, contributions: bool = false },
 };
 pub const Progress = struct {
     collector: *gc.Collector,
@@ -107,6 +107,7 @@ pub const Progress = struct {
                     const document = try @import("lake_index_directory.zig").loadDocument(a, collector.store, .{ .kind = .external_base_source, .artifact_id = directory.artifact_id, .checksum = directory.checksum, .byte_len = directory.byte_len }, collector.cancellation(), null);
                     hydrated.declarations = document.declarations;
                     hydrated.file_contributions = document.file_contributions;
+                    if (document.contribution_index) |root| try self.enqueue(.{ .page = .{ .ref = root, .ordered_rows = false, .contributions = true } });
                     for (document.contribution_pages) |page| try self.enqueue(.{ .contribution_page = page });
                 }
                 for (hydrated.declarations) |declaration| try self.enqueue(.{ .artifact = declaration.artifact });
@@ -114,22 +115,30 @@ pub const Progress = struct {
             },
             .page => |job_page| {
                 const page = job_page.ref;
-                if (!try self.expand(.{ .artifact_id = &try page_store.PageStore.identity(self.value.domain, page), .checksum = &std.fmt.bytesToHex(&page.digest, .lower), .byte_len = page.bytes }, if (job_page.ordered_rows) "ordered-page" else "page")) return;
+                if (!try self.expand(.{ .artifact_id = &try page_store.PageStore.identity(self.value.domain, page), .checksum = &std.fmt.bytesToHex(&page.digest, .lower), .byte_len = page.bytes }, if (job_page.contributions) "contribution-index" else if (job_page.ordered_rows) "ordered-page" else "page")) return;
                 var write_bytes: u64 = 0;
                 var pages: page_store.PageStore = .{ .domain = self.value.domain, .artifacts = &collector.store, .cancellation = collector.cancellation(), .remaining_read_bytes = &collector.remaining_reads, .remaining_write_bytes = &write_bytes };
                 const Visitor = struct {
                     progress: *Progress,
                     ordered: bool,
+                    contributions: bool,
                     a: A,
                     pub fn child(visitor: *@This(), ref: tree.Ref) !void {
-                        try visitor.progress.enqueue(.{ .page = .{ .ref = ref, .ordered_rows = visitor.ordered } });
+                        try visitor.progress.enqueue(.{ .page = .{ .ref = ref, .ordered_rows = visitor.ordered, .contributions = visitor.contributions } });
                     }
-                    pub fn record(visitor: *@This(), _: []const u8, bytes: []const u8) !void {
+                    pub fn record(visitor: *@This(), key: []const u8, bytes: []const u8) !void {
+                        if (visitor.contributions) {
+                            const value = try std.json.parseFromSliceLeaky(local.metadata_lake_index_catalog.FileContribution, visitor.a, bytes, .{ .allocate = .alloc_always });
+                            try @import("lake_index_contributions.zig").validate(value);
+                            if (!std.mem.eql(u8, key, &@import("lake_index_contributions.zig").identity(value))) return error.InvalidLakeIndexCatalog;
+                            try visitor.progress.enqueue(.{ .artifact = value.artifact });
+                            return;
+                        }
                         if (!visitor.ordered) return;
                         if (try @import("lake_index_ordered_rows.zig").coverReference(visitor.a, visitor.progress.value.domain, bytes)) |cover| try visitor.progress.enqueue(.{ .chunk = cover.block });
                     }
                 };
-                var visitor: Visitor = .{ .progress = self, .ordered = job_page.ordered_rows, .a = a };
+                var visitor: Visitor = .{ .progress = self, .ordered = job_page.ordered_rows, .contributions = job_page.contributions, .a = a };
                 try tree.walkPage(a, pages.store(), page, &visitor);
             },
         }
@@ -243,7 +252,7 @@ pub fn run(collector: *gc.Collector, state: lifecycle.State) !gc.Result {
     };
     var visitor: Visitor = .{ .progress = &progress };
     var paused = false;
-    collector.store.visitScopedUploads(domain, .{ .ptr = &visitor, .visit = Visitor.visit, .checkpoint = Visitor.saveContinuation, .continuation = progress.value.enumeration, .after_suffix = progress.value.sweep_after, .fencing_floor = collector.upload_floor, .fencing_cutoff = collector.upload_cutoff, .exclude_attempt = progress.value.attempt, .max_entries = @max(1, @min(256, collector.options.max_deleted)) }, collector.cancellation()) catch |err| {
+    collector.store.visitScopedUploads(domain, .{ .ptr = &visitor, .visit = Visitor.visit, .checkpoint = Visitor.saveContinuation, .continuation = progress.value.enumeration, .cleanup_staging = true, .after_suffix = progress.value.sweep_after, .fencing_floor = collector.upload_floor, .fencing_cutoff = collector.upload_cutoff, .exclude_attempt = progress.value.attempt, .max_entries = @max(1, @min(256, collector.options.max_deleted)) }, collector.cancellation()) catch |err| {
         if (err != error.ArtifactEnumerationPaused) return err;
         paused = true;
     };
@@ -276,8 +285,12 @@ pub fn run(collector: *gc.Collector, state: lifecycle.State) !gc.Result {
         try collector.authority.apply(collector.table, .{ .checkpoint_collection = .{ .token = collector.token, .previous = progress.previous, .progress = next, .now_ms = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms } });
         return collector.result;
     }
-    try collector.store.cleanupRetiredScopedTemporaryRange(domain, collector.upload_floor, collector.upload_cutoff, collector.cancellation());
     try collector.authority.apply(collector.table, .{ .finish_collection = .{ .token = collector.token, .now_ms = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms } });
+    // Legacy nonce staging predates journal-discoverable pending-v2 files.
+    // Its advisory migration cleanup must never gate collection completion.
+    collector.store.cleanupRetiredScopedTemporaryRange(domain, collector.upload_floor, collector.upload_cutoff, collector.cancellation()) catch |err| {
+        std.log.warn("completed lake GC legacy staging cleanup deferred: {t}", .{err});
+    };
     // The metadata receipt is durable before private checkpoint reclamation.
     // Interrupted cleanup leaves ordinary below-cutoff orphans for the next GC.
     const Cleanup = struct {

@@ -112,6 +112,8 @@ pub const ScopedUploadVisitor = struct {
     /// Backend-owned durable continuation. Callers persist it only after all
     /// delivered entries have been processed. Lexical providers may ignore it.
     continuation: ?[]const u8 = null,
+    /// Remove deterministic local staging files while visiting fenced records.
+    cleanup_staging: bool = false,
     checkpoint: ?*const fn (*anyopaque, []const u8) anyerror!void = null,
     after_suffix: ?[]const u8 = null,
     fencing_floor: u64 = 0,

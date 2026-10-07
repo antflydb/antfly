@@ -94,6 +94,7 @@ pub const Stream = struct {
     ordered_next: ?usize = null,
     ordered_end: usize = 0,
     borrowed_plan: bool = false,
+    hydration_plan: ?@import("lake_decoded_cache.zig").Lease = null,
     partition_index: usize = 0,
     partition_count: usize = 1,
     discovered: ?parquet.DiscoveredObjectRangeRowGroupPlan = null,
@@ -372,6 +373,12 @@ pub const Stream = struct {
             self.alloc.free(self.file_logical_names);
             self.alloc.free(self.file_predicates);
         }
+        if (self.hydration_plan) |lease| {
+            // Delete offsets are fresh request state, never cached metadata.
+            self.alloc.free(self.position_starts);
+            lease.release();
+            self.hydration_plan = null;
+        }
         self.position_starts = &.{};
         self.borrowed_plan = false;
         self.discovered = null;
@@ -586,6 +593,64 @@ pub const Stream = struct {
                 self.source.pinned_files[index] = true;
             }
         }
+        // Candidate hydration windows share immutable projected file readers.
+        // Fresh version pinning above and delete preparation below remain
+        // request-owned; cached plans contain only fully owned metadata.
+        if (self.selection != null and self.source.scanner.shared_reader != null) {
+            const reader = self.source.scanner.shared_reader.?;
+            const file = self.source.fileAt(index);
+            const interpretation = try std.json.Stringify.valueAlloc(self.alloc, .{ .version = "hydration-file-plan-v1", .file = file.file_id, .format = self.source.inventory.format, .source = self.source.inventory.source_id, .source_uri = self.source.inventory.source_uri, .snapshot = self.source.inventory.snapshot_id, .schema = self.source.inventory.schema_fingerprint, .columns = self.columns, .contract = self.schema_contract, .predicates = self.predicates, .limits = self.limits }, .{});
+            defer self.alloc.free(interpretation);
+            const key = try reader.objectKey(self.alloc, .{ .object = try @import("lake_range_io.zig").objectRefForExternalFileUri(file), .range = .{ .offset = 0, .len = file.byte_len }, .purpose = .parquet_footer }, interpretation);
+            var loader = struct {
+                stream: *Stream,
+                index: usize,
+                fn clone(a: Allocator, value: anytype) !@TypeOf(value) {
+                    const bytes = try std.json.Stringify.valueAlloc(a, value, .{});
+                    defer a.free(bytes);
+                    return std.json.parseFromSliceLeaky(@TypeOf(value), a, bytes, .{ .allocate = .alloc_always });
+                }
+                fn load(raw: *anyopaque, item: *@import("lake_decoded_cache.zig").Item) !void {
+                    const self_loader: *@This() = @ptrCast(@alignCast(raw));
+                    const a = item.arena.allocator();
+                    var worker = self_loader.stream.*;
+                    worker.alloc = a;
+                    worker.columns = try clone(a, worker.columns);
+                    worker.schema_contract = try clone(a, worker.schema_contract);
+                    worker.predicates = try clone(a, worker.predicates);
+                    worker.discovered = null;
+                    worker.file_columns = &.{};
+                    worker.file_logical_names = &.{};
+                    worker.file_predicates = &.{};
+                    try worker.loadPhysicalFile(self_loader.index);
+                    const plan = try a.create(HydrationPlan);
+                    plan.* = .{ .discovered = worker.discovered, .columns = worker.file_columns, .logical_names = worker.file_logical_names, .predicates = worker.file_predicates };
+                    item.payload = .{ .extension = plan };
+                }
+            }{ .stream = self, .index = index };
+            var load_context = self.context;
+            load_context.io = reader.context.io;
+            const lease = try reader.cache.decoded.acquire(key, 64 * 1024 * 1024, load_context, .{ .ptr = &loader, .load = @TypeOf(loader).load });
+            self.hydration_plan = lease;
+            self.borrowed_plan = true;
+            const plan: *const HydrationPlan = @ptrCast(@alignCast(lease.item.payload.extension));
+            self.discovered = plan.discovered;
+            self.file_columns = plan.columns;
+            self.file_logical_names = plan.logical_names;
+            self.file_predicates = plan.predicates;
+        } else try self.loadPhysicalFile(index);
+        if (self.discovered == null) return;
+        self.stats.files_opened += 1;
+        try self.prepareDeletes();
+        try self.bindPositions();
+    }
+    const HydrationPlan = struct {
+        discovered: ?parquet.DiscoveredObjectRangeRowGroupPlan,
+        columns: []const []const u8,
+        logical_names: []const []const u8,
+        predicates: []const Predicate,
+    };
+    fn loadPhysicalFile(self: *Stream, index: usize) !void {
         var file_entry = self.source.fileAt(index);
         var inventory = self.source.inventory;
         inventory.files = @as(*[1]@TypeOf(file_entry), @ptrCast(&file_entry));
@@ -672,14 +737,11 @@ pub const Stream = struct {
             else
                 try parquet.discoverSupportedI64ObjectRangeRowGroupsFromFootersAlloc(self.alloc, self.source.scanner.reader(), inventory, self.columns, 64 * 1024);
         }
-        self.stats.files_opened += 1;
         std.mem.sort(parquet.ObjectRangeRowGroupInput, self.discovered.?.row_group_plan.row_groups, {}, struct {
             fn less(_: void, a: parquet.ObjectRangeRowGroupInput, b: parquet.ObjectRangeRowGroupInput) bool {
                 return a.row_group_ordinal < b.row_group_ordinal;
             }
         }.less);
-        try self.prepareDeletes();
-        try self.bindPositions();
     }
     pub fn prepareDeletes(self: *Stream) !void {
         try self.context.ensureActive();

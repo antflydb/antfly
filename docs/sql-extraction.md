@@ -3513,3 +3513,8 @@ delta replay, exact radix reduction trees, protocol-25 paged contribution record
 and independently completing GC audit censuses. The regression tests enforce
 unchanged-file read rejection during mixed-index appends and aggregate append/
 removal, subtree reference reuse, immutable manifest retention and split lifetime.
+
+Native lake refinements use reader/topology protocol 26 for keyed contribution
+pages and group-key-partitioned aggregate roots. The source, recipe, lease,
+spilling, GC, and compatibility contracts are documented in
+[Remote table serving](../zig/REMOTE_TABLE_SERVING.md#keyed-contribution-state-grouped-partitions-and-cold-load-admission).

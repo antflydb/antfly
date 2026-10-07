@@ -124,7 +124,7 @@ fn selectVerified(a: A, table: sql.Table, source: *local.serverless_query_lake_s
             state.value.published.?.file_contributions = document.file_contributions;
             try state.value.published.?.validate();
         }
-    } else try @import("lake_index_directory.zig").hydrate(state.arena.allocator(), artifacts, &state.value.published.?, normalized, cached);
+    } else try @import("lake_index_directory.zig").hydrateLazy(state.arena.allocator(), artifacts, &state.value.published.?, normalized, cached);
     return .{ .state = state, .delete_objects = pinned.delete_objects, .inventory_lease = inventory_lease, .directory_lease = directory_lease };
 }
 

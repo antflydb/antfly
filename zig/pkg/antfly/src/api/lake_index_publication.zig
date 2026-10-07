@@ -100,7 +100,7 @@ pub fn buildWithLease(a: A, artifact_store: *stores.ArtifactStore, table: record
     var reusable_directory = true;
     if (current.value.published) |*previous| {
         if (std.meta.eql(previous.namespace, current.value.namespace) and std.mem.eql(u8, &previous.signature.credentials, &signature.credentials) and std.mem.eql(u8, &previous.signature.store, &signature.store)) {
-            @import("lake_index_directory.zig").hydrate(current.arena.allocator(), scoped, previous, cancellation, null) catch |err| switch (err) {
+            @import("lake_index_directory.zig").hydrateLazy(current.arena.allocator(), scoped, previous, cancellation, null) catch |err| switch (err) {
                 error.FileNotFound, error.NotFound, error.ArtifactIntegrityMismatch => reusable_directory = false,
                 else => return err,
             };
@@ -122,12 +122,17 @@ pub fn buildWithLease(a: A, artifact_store: *stores.ArtifactStore, table: record
     defer native_arena.deinit();
     const na = native_arena.allocator();
     const previous_contributions = if (current.value.published) |previous| if (reusable_directory and std.meta.eql(previous.namespace, current.value.namespace) and std.mem.eql(u8, &previous.signature.credentials, &signature.credentials) and std.mem.eql(u8, &previous.signature.store, &signature.store)) previous.file_contributions else &.{} else &.{};
+    const contributions_api = @import("lake_index_contributions.zig");
+    var contribution_index: contributions_api.Index = undefined;
+    const previous_root = if (current.value.published) |previous| if (reusable_directory and std.meta.eql(previous.namespace, current.value.namespace) and std.mem.eql(u8, &previous.signature.credentials, &signature.credentials) and std.mem.eql(u8, &previous.signature.store, &signature.store)) if (previous.contribution_index) |bytes| try std.json.parseFromSliceLeaky(@import("../serverless/graph_segment/page_tree.zig").Ref, na, bytes, .{}) else null else null else null;
+    try contribution_index.init(a, scoped, previous_root, cancellation);
+    defer contribution_index.deinit();
     const replay_api = @import("lake_index_build_replay.zig");
     const replay_columns = try replay_api.columnsForBuild(a, na, table, &provider, base_source);
     var replay = replay_api.Replay.init(a, &provider, replay_columns);
     defer replay.deinit();
     if (current.value.published) |previous| if (candidates.len != 0 and std.mem.eql(u8, &previous.signature.desired, &signature.desired)) {
-        replay.only_files = try replay_api.changedFiles(a, na, &provider, scoped, candidates, previous_contributions, cancellation);
+        replay.only_files = try replay_api.changedFilesIndexed(a, na, &provider, scoped, candidates, previous_contributions, cancellation, &contribution_index);
     };
     if (replay_columns.len != 0) provider.replay = &replay;
     var legacy_indexes = try std.json.parseFromSliceLeaky(std.json.Value, na, table.indexes_json, .{ .allocate = .alloc_always });
@@ -141,7 +146,7 @@ pub fn buildWithLease(a: A, artifact_store: *stores.ArtifactStore, table: record
     const legacy_json = try std.json.Stringify.valueAlloc(na, legacy_indexes, .{});
     var manifest = try rebuild.reconcileResolvedExternalSourceSidecarsWithRuntimeAlloc(a, &scoped, provider.provider(), base_source, source.inventory, .{ .table_name = table.name, .schema_json = table.schema_json, .read_schema_json = table.read_schema_json, .indexes_json = legacy_json }, reusable, cancellation, .{ .published_generation = attempt.generation, .edge_generation = attempt.generation, .computed_at_ms = started }, .{}, scope);
     defer manifest.deinit(a);
-    const native = try @import("lake_index_native_aggregates.zig").buildIncremental(a, na, table, source, &scoped, &provider, cancellation, reusable, previous_contributions);
+    const native = try @import("lake_index_native_aggregates.zig").buildIndexed(a, na, table, source, &scoped, &provider, cancellation, reusable, previous_contributions, &contribution_index);
     const native_declarations = native.declarations;
     const ordered = try @import("lake_index_native_rows.zig").buildIncremental(a, na, table, source, &scoped, &provider, cancellation, reusable, candidates);
     const text = try @import("lake_index_native_text.zig").buildIncremental(a, na, table, source, base_source, &scoped, &provider, cancellation, reusable, candidates);
@@ -158,7 +163,7 @@ pub fn buildWithLease(a: A, artifact_store: *stores.ArtifactStore, table: record
     const verified = try coverage.pin(source, context);
     if (!std.meta.eql(pinned, verified)) return error.ExternalLakeIndexSourceChanged;
     try context.ensureActive();
-    const directory = try @import("lake_index_directory.zig").publishWithContributions(a, &scoped, declarations, native.contributions, cancellation);
+    const directory = try @import("lake_index_directory.zig").publishIndexed(a, &scoped, declarations, native.contributions, &contribution_index, cancellation);
     defer a.free(directory.artifact_id);
     defer a.free(directory.checksum);
     try context.ensureActive();

@@ -35,17 +35,35 @@ pub fn acquire(comptime T: type, cached: artifacts.CachedRead, store: stores.Art
     hash.update(&length);
     var key: [32]u8 = undefined;
     hash.final(&key);
-    if (cached.cache.decoded.lookup(key)) |lease| return .{ .lease = lease, .value = @ptrCast(@alignCast(lease.item.payload.extension)) };
-    const lease = try cached.cache.decoded.create(64 * 1024 * 1024);
-    errdefer lease.release();
-    const a = lease.item.arena.allocator();
-    const value = try a.create(T);
-    value.* = try load(a, store, ref, cancellation, cached);
-    try cached.context.ensureActive();
-    try cancellation.check();
-    lease.item.payload = .{ .extension = value };
-    cached.cache.decoded.publish(key, lease);
-    return .{ .lease = lease, .value = value };
+    var loader = struct {
+        store: stores.ArtifactStore,
+        ref: local.serverless_manifest_artifact_ref.ArtifactRef,
+        cancellation: @import("antfly_cancellation").CancellationToken,
+        cached: artifacts.CachedRead,
+        fn decode(raw: *anyopaque, item: *local.serverless_query_lake_decoded_cache.Item) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const a = item.arena.allocator();
+            const value = try a.create(T);
+            value.* = try load(a, self.store, self.ref, self.cancellation, self.cached);
+            item.payload = .{ .extension = value };
+        }
+    }{ .store = store, .ref = ref, .cancellation = cancellation, .cached = cached };
+    // Both API cancellation and the serving deadline remain active while
+    // waiting for another decoder or global decode memory admission.
+    const Check = struct {
+        token: @import("antfly_cancellation").CancellationToken,
+        parent: local.serverless_query_lake_read_context.Context,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.token.check();
+            try self.parent.ensureActive();
+        }
+    };
+    var check: Check = .{ .token = cancellation, .parent = cached.context };
+    var context = cached.context;
+    context.checkpoint = .{ .ptr = &check, .check = Check.check };
+    const lease = try cached.cache.decoded.acquire(key, 64 * 1024 * 1024, context, .{ .ptr = &loader, .load = @TypeOf(loader).decode });
+    return .{ .lease = lease, .value = @ptrCast(@alignCast(lease.item.payload.extension)) };
 }
 
 test "external lake decoded metadata reuses owned values while fencing scope version and deadlines" {

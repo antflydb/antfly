@@ -149,7 +149,18 @@ pub const FsStore = struct {
                 var journal = try self.uploadJournal(directory_io.io(), attempt, scope.?, checksum, cancellation);
                 journal.close(directory_io.io());
             }
-            try writeFileAtomicallyWithCancellation(path, contents, cancellation);
+            if (scope) |value| {
+                // The journal is durable before staging. A per-content lock
+                // permits one deterministic staging name, discoverable by the
+                // ordinary bounded journal sweep even after a process crash.
+                const lock_path = try std.fs.path.join(self.alloc, &.{ self.inventory_root, &std.fmt.bytesToHex(&value.domain, .lower), &std.fmt.bytesToHex(&value.attempt, .lower), checksum });
+                defer self.alloc.free(lock_path);
+                const lock = try std.Io.Dir.cwd().createFile(directory_io.io(), lock_path, .{ .truncate = false });
+                defer lock.close(directory_io.io());
+                try lock.lock(directory_io.io(), .exclusive);
+                defer lock.unlock(directory_io.io());
+                try writeFileAtomicallyAt(path, contents, cancellation, "pending-v2");
+            } else try writeFileAtomicallyWithCancellation(path, contents, cancellation);
         }
 
         return .{
@@ -469,6 +480,17 @@ pub const FsStore = struct {
                 if (try journal.readPositionalAll(io, suffix[33..97], offset) != 64) return error.InvalidArtifactUploadInventory;
                 if (@import("builtin").is_test) _ = self.journal_records_read.fetchAdd(1, .monotonic);
                 try artifact_store.validateSha256Checksum(suffix[33..97]);
+                if (visitor.cleanup_staging) {
+                    // The caller's persisted cutoff excludes active uploaders.
+                    if (visitor.fencing_cutoff == null) return error.InvalidArtifactUploadScope;
+                    var staging: [75]u8 = undefined;
+                    @memcpy(staging[0..64], suffix[33..97]);
+                    @memcpy(staging[64..], ".pending-v2");
+                    attempt.deleteFile(io, &staging) catch |err| switch (err) {
+                        error.FileNotFound => {},
+                        else => return err,
+                    };
+                }
                 // Backfill entries and interrupted uploads may already be gone.
                 if (attempt.access(io, suffix[33..97], .{})) |_| {
                     try artifact_store.visitScopedSuffix(domain, &suffix, visitor);
@@ -867,14 +889,25 @@ fn writeFileAtomically(path: []const u8, contents: []const u8) !void {
 }
 
 fn writeFileAtomicallyWithCancellation(path: []const u8, contents: []const u8, cancellation: CancellationToken) !void {
+    var io_impl = threadedIo();
+    defer io_impl.deinit();
+    var nonce: [16]u8 = undefined;
+    io_impl.io().random(&nonce);
+    const suffix = try std.fmt.allocPrint(std.heap.page_allocator, "tmp-{s}", .{std.fmt.bytesToHex(&nonce, .lower)});
+    defer std.heap.page_allocator.free(suffix);
+    return writeFileAtomicallyAt(path, contents, cancellation, suffix);
+}
+fn writeFileAtomicallyAt(path: []const u8, contents: []const u8, cancellation: CancellationToken, suffix: []const u8) !void {
     try cancellation.check();
     var io_impl = threadedIo();
     defer io_impl.deinit();
     const io = io_impl.io();
-    var nonce: [16]u8 = undefined;
-    io.random(&nonce);
-    const tmp_path = try std.fmt.allocPrint(std.heap.page_allocator, "{s}.tmp-{s}", .{ path, std.fmt.bytesToHex(&nonce, .lower) });
+    const tmp_path = try std.fmt.allocPrint(std.heap.page_allocator, "{s}.{s}", .{ path, suffix });
     defer std.heap.page_allocator.free(tmp_path);
+    if (std.mem.eql(u8, suffix, "pending-v2")) std.Io.Dir.cwd().deleteFile(io, tmp_path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
     var owns_temp = false;
     errdefer if (owns_temp) {
         std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
@@ -1265,6 +1298,11 @@ test "external lake filesystem journal resumes across restart with linear record
         for (0..73) |index| {
             var bytes: [32]u8 = undefined;
             var ref = try initial_store.putScoped(scope, try std.fmt.bufPrint(&bytes, "payload-{d}", .{index}), .none);
+            const payload = try pathForArtifactIdAlloc(a, std.mem.span(path), ref.artifact_id);
+            defer a.free(payload);
+            const staging = try std.fmt.allocPrint(a, "{s}.pending-v2", .{payload});
+            defer a.free(staging);
+            try writeFileAtomically(staging, "abandoned upload");
             ref.deinit(a);
         }
         try std.testing.expectEqual(@as(usize, 1), initial.journal_backfills.load(.monotonic));
@@ -1275,6 +1313,12 @@ test "external lake filesystem journal resumes across restart with linear record
         continuation: ?[]u8 = null,
         fn visit(raw: *anyopaque, _: artifact_store.UploadScope, id: []const u8) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
+            const backend: *FsStore = @ptrCast(@alignCast(self.store.ptr));
+            const payload = try pathForArtifactIdAlloc(std.testing.allocator, backend.root_dir, id);
+            defer std.testing.allocator.free(payload);
+            const staging = try std.fmt.allocPrint(std.testing.allocator, "{s}.pending-v2", .{payload});
+            defer std.testing.allocator.free(staging);
+            try std.testing.expect(!fileExists(staging));
             try self.store.delete(id);
             self.count += 1;
         }
@@ -1296,7 +1340,7 @@ test "external lake filesystem journal resumes across restart with linear record
         var store = reopened.artifactStore();
         var visitor: Visitor = .{ .store = &store };
         var paused = false;
-        store.visitScopedUploads(scope.domain, .{ .ptr = &visitor, .visit = Visitor.visit, .checkpoint = Visitor.checkpoint, .continuation = token, .max_entries = 7 }, .none) catch |err| {
+        store.visitScopedUploads(scope.domain, .{ .ptr = &visitor, .visit = Visitor.visit, .checkpoint = Visitor.checkpoint, .continuation = token, .cleanup_staging = true, .fencing_cutoff = 2, .max_entries = 7 }, .none) catch |err| {
             if (err != error.ArtifactEnumerationPaused) return err;
             paused = true;
         };

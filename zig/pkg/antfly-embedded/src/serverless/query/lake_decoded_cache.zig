@@ -24,6 +24,7 @@ pub const Payload = union(enum) {
     extension: *anyopaque,
     snapshot: @import("lake_iceberg_snapshot.zig").SnapshotWithDeletePlan,
     prepared: *@import("lake_prepared_deletes.zig").Prepared,
+    page_directory: @import("lake_parquet_metadata.zig").PageDirectory,
     footer: @import("lake_parquet_metadata.zig").ParsedFooter,
     dictionary: @import("lake_parquet_page.zig").Dictionary,
     columns: []const @import("../../storage/rowsource/types.zig").ColumnVector,
@@ -46,6 +47,7 @@ pub const Item = struct {
     fn destroy(self: *Item, cache: *Cache) void {
         const parent = self.dependency;
         const a = self.budget.backing;
+        if (self.payload == .page_directory) self.payload.page_directory.deinit();
         if (self.payload == .prepared) self.payload.prepared.destroy(self.budget.allocator());
         if (self.payload == .snapshot) self.payload.snapshot.deinit(self.budget.allocator());
         self.file_by_id.deinit(self.budget.allocator());
@@ -81,6 +83,95 @@ pub const Cache = struct {
     bytes: usize = 0,
     tick: u64 = 0,
     hits: u64 = 0,
+    flights: std.AutoHashMapUnmanaged([32]u8, *Flight) = .empty,
+    loading_bytes: usize = 0,
+    max_loading_bytes: usize = 64 * 1024 * 1024,
+    const Flight = struct {
+        refs: usize = 1,
+        done: std.Io.Event = .unset,
+        finished: std.atomic.Value(bool) = .init(false),
+        result: ?Lease = null,
+        failure: ?anyerror = null,
+    };
+    pub const Loader = struct { ptr: *anyopaque, load: *const fn (*anyopaque, *Item) anyerror!void };
+    /// One immutable value per concurrent cold key, including values that
+    /// cannot be admitted to residency. Every waiter owns its cancellation.
+    /// Reservations bound active decode work independently of resident bytes.
+    pub fn acquire(self: *Cache, key: [32]u8, limit: usize, context: @import("lake_read_context.zig").Context, loader: Loader) !Lease {
+        if (limit > self.max_loading_bytes) return error.SqlMemoryLimitExceeded;
+        while (true) {
+            try context.ensureActive();
+            if (self.lookup(key)) |lease| return lease;
+            self.lock();
+            if (self.flights.get(key)) |flight| {
+                flight.refs += 1;
+                self.mutex.unlock();
+                defer self.releaseFlight(flight);
+                const io = context.io orelse return error.SqlMemoryLimitExceeded;
+                while (!flight.finished.load(.acquire)) {
+                    try context.ensureActive();
+                    flight.done.waitTimeout(io, .{ .duration = .{ .clock = .awake, .raw = .fromMilliseconds(10) } }) catch |err| switch (err) {
+                        error.Timeout => continue,
+                        else => return err,
+                    };
+                }
+                try context.ensureActive();
+                if (flight.result) |lease| return lease.retain();
+                const failure = flight.failure.?;
+                // A canceled leader is not authority to cancel another reader.
+                if (failure == error.Canceled or failure == error.DeadlineExceeded) continue;
+                return failure;
+            }
+            if (limit > self.max_loading_bytes -| self.loading_bytes or self.flights.count() >= 512) {
+                self.mutex.unlock();
+                const io = context.io orelse return error.SqlMemoryLimitExceeded;
+                try io.sleep(.fromMilliseconds(10), .awake);
+                continue;
+            }
+            const flight = self.a.create(Flight) catch |err| {
+                self.mutex.unlock();
+                return err;
+            };
+            flight.* = .{};
+            self.flights.put(self.a, key, flight) catch |err| {
+                self.a.destroy(flight);
+                self.mutex.unlock();
+                return err;
+            };
+            self.loading_bytes += limit;
+            self.mutex.unlock();
+            defer self.releaseFlight(flight);
+            const result = self.loadValue(key, limit, context, loader);
+            self.lock();
+            _ = self.flights.remove(key);
+            self.loading_bytes -= limit;
+            if (result) |lease| flight.result = lease else |err| flight.failure = err;
+            // Publication and event synchronization make payloads visible;
+            // the flight pins even an uncached result until the final waiter.
+            flight.finished.store(true, .release);
+            if (context.io) |io| flight.done.set(io);
+            self.mutex.unlock();
+            if (result) |lease| return lease.retain() else |err| return err;
+        }
+    }
+    fn loadValue(self: *Cache, key: [32]u8, limit: usize, context: @import("lake_read_context.zig").Context, loader: Loader) !Lease {
+        if (self.lookup(key)) |lease| return lease;
+        const lease = try self.create(limit);
+        errdefer lease.release();
+        try loader.load(loader.ptr, lease.item);
+        try context.ensureActive();
+        self.publish(key, lease);
+        return lease;
+    }
+    fn releaseFlight(self: *Cache, flight: *Flight) void {
+        self.lock();
+        defer self.mutex.unlock();
+        flight.refs -= 1;
+        if (flight.refs == 0) {
+            if (flight.result) |lease| self.releaseLocked(lease.item);
+            self.a.destroy(flight);
+        }
+    }
     fn lock(self: *Cache) void {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
     }
@@ -109,6 +200,8 @@ pub const Cache = struct {
             removed.value.destroy(self);
         }
         self.entries.deinit(self.a);
+        std.debug.assert(self.flights.count() == 0);
+        self.flights.deinit(self.a);
     }
     pub fn lookup(self: *Cache, key: [32]u8) ?Lease {
         self.lock();
@@ -209,4 +302,58 @@ test "external lake page dependencies pin a single dictionary across eviction" {
     cache.publish(@splat(3), replacement);
     replacement.release();
     try std.testing.expect(cache.entries.count() <= 2);
+}
+
+test "external lake decoded cold loads share uncached results and independently cancel waiters" {
+    const io = std.testing.io;
+    const Worker = struct {
+        cache: *Cache,
+        entered: std.Io.Event = .unset,
+        gate: std.Io.Event = .unset,
+        calls: std.atomic.Value(usize) = .init(0),
+        cancel: std.atomic.Value(bool) = .init(false),
+        fn load(raw: *anyopaque, item: *Item) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            _ = self.calls.fetchAdd(1, .monotonic);
+            self.entered.set(std.testing.io);
+            try self.gate.wait(std.testing.io);
+            const value = try item.arena.allocator().create(u64);
+            value.* = 42;
+            item.payload = .{ .extension = value };
+        }
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.cancel.load(.acquire)) return error.DeadlineExceeded;
+        }
+        fn run(self: *@This(), cancelable: bool) anyerror!Lease {
+            return self.cache.acquire(@splat(7), 1024, .{ .io = std.testing.io, .checkpoint = if (cancelable) .{ .ptr = self, .check = check } else null }, .{ .ptr = self, .load = load });
+        }
+    };
+    var cache: Cache = .{ .a = std.testing.allocator, .max_entries = 0 };
+    defer cache.deinit();
+    var worker: Worker = .{ .cache = &cache };
+    var leader = try io.concurrent(Worker.run, .{ &worker, false });
+    defer worker.gate.set(io);
+    try worker.entered.wait(io);
+    var waiter = try io.concurrent(Worker.run, .{ &worker, false });
+    var canceled = try io.concurrent(Worker.run, .{ &worker, true });
+    while (true) {
+        cache.lock();
+        const ready = cache.flights.get(@splat(7)).?.refs == 3;
+        cache.mutex.unlock();
+        if (ready) break;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    worker.cancel.store(true, .release);
+    try std.testing.expectError(error.DeadlineExceeded, canceled.await(io));
+    worker.gate.set(io);
+    const first = try leader.await(io);
+    defer first.release();
+    const second = try waiter.await(io);
+    defer second.release();
+    try std.testing.expect(first.item == second.item);
+    try std.testing.expectEqual(@as(usize, 1), worker.calls.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), cache.loading_bytes);
+    try std.testing.expectEqual(@as(usize, 0), cache.flights.count());
+    try std.testing.expect(!first.item.cached);
 }

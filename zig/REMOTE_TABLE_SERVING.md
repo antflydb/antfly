@@ -632,3 +632,59 @@ count; reduction payload work scales with changed tree paths and group sizes.
 Dry-run GC completes its census independently of the destructive deletion budget.
 It does not hold the scheduler on the same table merely because eligible objects
 exceed `max_deleted`. Destructive collections retain their durable continuation.
+
+### Keyed contribution state, grouped partitions, and cold-load admission
+
+Reader/topology protocol 26 admits `native-lake-index-directory-v3` and
+`native-sql-aggregate-v3`. Readers retain compatibility with protocols 24/25
+and aggregate versions 1/2. Coordinated metadata admission prevents publishing
+these directories while an older metadata voter is still active.
+
+A v3 directory authenticates a native immutable page-tree root keyed by the
+file/reduction identity, exact recipe, and materialization name. Builders look
+up inherited contributions lazily, using a hash-indexed build-local page cache
+bounded to 4096 pages and 128 MiB. Publication compares the complete current
+live key set and applies only changed/deleted records to the prior tree. It
+retains unchanged pages and removes obsolete contributions, rather than
+retaining an ever-growing history. Planning still visits the live file/key set;
+it does not promise constant-time snapshot refresh. Serving reads only the
+small declaration directory. Durable GC checkpoints contribution-tree pages
+and their aggregate references as ordinary authenticated frontier jobs.
+
+Exact incremental grouped reducers partition keys by their semantic hash into
+64 immutable ranges. Each file contribution and reduction root authenticates
+its range directory. Missing ranges are inherited without reading their state;
+unchanged child-range pairs reuse their previous exact aggregate artifact.
+Only affected ranges are reduced and republished. SUM/COUNT, booleans, and
+supported MIN/MAX preserve the existing exact state laws and disk spilling;
+removing a file recomposes surviving contributions, without assuming MIN/MAX
+have inverses. Floating-point grouping/reduction, DISTINCT, and delete plans
+retain their conservative paths. This reduces high-cardinality rewrite work
+when a delta touches few ranges; broad or skewed deltas can still touch every
+range. Partition readers validate recipe/slot provenance, range uniqueness,
+counts, and authenticated child references before exposing their state.
+
+Non-covering index hydration shares fully owned projected file-reader plans,
+immutable footer metadata, parsed Parquet
+page directories, dictionaries, and decoded vectors across candidate windows.
+Page-directory keys include object versions, column interpretation, row count,
+and allocation policy. Projected file plans also bind the source snapshot,
+schema, selected columns, and physical predicates; delete preparation and
+position offsets remain fresh request state. Once the dictionary prefix has been consumed, indexed
+page seeks use binary search rather than walking every preceding page. Index
+order is still restored after gathering physical candidates, and delete and
+residual checks remain mandatory.
+
+Decoded metadata and parsed page-directory misses use one in-flight owner per
+immutable key. Waiters retain their own deadlines/cancellation and share the
+result even when it cannot enter resident cache. Active decodes reserve from a
+separate 64 MiB admission budget; resident cache saturation cannot silently
+create unbounded parallel decoding. A canceled leader permits another live
+reader to retry, and an in-flight result stays pinned until every waiter leaves.
+
+Filesystem scoped uploads append their content identity before creating a
+`.pending-v2` staging file. A per-content interprocess lock serializes that
+staging name. Fenced journal sweep batches remove staging alongside payload
+census, using the same durable continuation and collection cutoff. Legacy
+nonce staging cleanup and private checkpoint reclamation run after the durable
+completion receipt; they cannot prevent a completed collection from advancing.

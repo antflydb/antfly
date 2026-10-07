@@ -1532,3 +1532,36 @@ test "lake SQL shared immutable plans retain sparse file versions and canonical 
     try std.testing.expect(lake.source.inventory.files[1].etag.len != 0);
     try std.testing.expectEqual(@as(usize, 0), manifest.files[1].etag.len);
 }
+
+test "lake SQL candidate windows share owned projected reader plans after cursor teardown" {
+    const a = std.testing.allocator;
+    var lake: TestLake = .{ .memory = TestLake.storage.MemoryObjectStorage.init(a) };
+    try lake.populate(a, 1, &.{ 10, 20, 30, 40 });
+    defer lake.deinit(a);
+    var cache = @import("../serverless/query/lake_serving_cache.zig").Cache.init(a);
+    defer cache.deinit();
+    try lake.source.attachCache(&cache, lake.table.external_base_source.?.binding, .{ .io = std.testing.io });
+    const ref: @import("../storage/rowsource/types.zig").RowRef = .{ .external = .{ .source_id = lake.source.inventory.source_id, .snapshot_id = lake.source.inventory.snapshot_id, .file_id = lake.source.inventory.files[0].file_id, .row_group_ordinal = 0, .row_ordinal = 3 } };
+    var previous: ?*anyopaque = null;
+    for (0..3) |iteration| {
+        // The request name is freed before the next window. Cached physical
+        // mappings must own their bytes and retain no earlier cursor storage.
+        const name = try a.dupe(u8, "amount");
+        defer a.free(name);
+        const before = lake.meter.reads;
+        const cursor = try openPinned(a, lake.table, .{ .fields = &.{name}, .row_refs = &.{ref}, .conditions = &.{.{ .column = name, .op = .gte, .value = .{ .integer = 30 } }}, .limit = 1 }, .{}, &lake.source);
+        defer cursor.close(cursor.ptr);
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const page = try cursor.next_columns.?(cursor.ptr, arena.allocator(), 1);
+        try std.testing.expectEqual(@as(usize, 1), page.selection.len);
+        try std.testing.expectEqual(@as(i64, 40), (try page.cell(arena.allocator(), 0, "amount")).value.integer);
+        const owner: *Owner = @ptrCast(@alignCast(cursor.ptr));
+        const plan = owner.stream.hydration_plan.?.item.payload.extension;
+        if (iteration != 0) {
+            try std.testing.expect(plan == previous.?);
+            try std.testing.expectEqual(before, lake.meter.reads);
+        }
+        previous = plan;
+    }
+}
