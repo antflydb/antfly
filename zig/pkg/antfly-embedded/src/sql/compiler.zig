@@ -879,7 +879,7 @@ const Parser = struct {
             },
             else => return err,
         };
-        if (self.pos < self.tokens.len and self.tokens[self.pos].kind != .semicolon and !self.tokens[self.pos].isKeyword(.order) and !self.tokens[self.pos].isKeyword(.limit) and !self.tokens[self.pos].isKeyword(.offset) and !self.tokens[self.pos].isKeyword(.returning)) {
+        if (self.pos < self.tokens.len and self.tokens[self.pos].kind != .semicolon and !self.tokens[self.pos].isKeyword(.order) and !self.tokens[self.pos].isKeyword(.limit) and !self.tokens[self.pos].isKeyword(.offset) and !self.tokens[self.pos].isKeyword(.fetch) and !self.tokens[self.pos].isKeyword(.returning)) {
             self.pos = start;
             const expression = try self.scalar(0, 0);
             try self.checkScalarDepth(expression, 0);
@@ -897,8 +897,31 @@ const Parser = struct {
         var result = try self.setTail(first, 1, 0);
         result.order_by = try self.selectOrder();
         try @import("window_names.zig").resolveOrder(self.alloc, result, self.limits.max_depth);
-        result.limit = if (self.keyword(.limit)) try self.rowBound() else null;
-        result.offset = if (self.keyword(.offset)) try self.rowBound() else null;
+        // PostgreSQL admits either pagination-clause order. Normalize FETCH
+        // into the same bound as LIMIT, retaining explicit NULL/ALL as an
+        // unbounded request rather than a configured-result truncation.
+        var has_limit = false;
+        var has_offset = false;
+        while (true) {
+            if (self.keyword(.limit)) {
+                if (has_limit) return self.fail(error.InvalidSqlSyntax, "duplicate row limit");
+                has_limit = true;
+                result.limit = if (self.keyword(.all)) .null else try self.rowBound();
+            } else if (self.keyword(.offset)) {
+                if (has_offset) return self.fail(error.InvalidSqlSyntax, "duplicate row offset");
+                has_offset = true;
+                result.offset = try self.rowBound();
+                if (!self.keyword(.row)) _ = self.keyword(.rows);
+            } else if (self.keyword(.fetch)) {
+                if (has_limit) return self.fail(error.InvalidSqlSyntax, "duplicate row limit");
+                has_limit = true;
+                if (!self.keyword(.first)) try self.expectKeyword(.next);
+                result.limit = if (self.pos < self.tokens.len and (self.tokens[self.pos].isKeyword(.row) or self.tokens[self.pos].isKeyword(.rows))) .{ .integer = 1 } else try self.rowBound();
+                if (!self.keyword(.row)) try self.expectKeyword(.rows);
+                if (self.keyword(.with)) return self.fail(error.UnsupportedSqlShape, "FETCH WITH TIES requires peer-aware result admission");
+                try self.expectKeyword(.only);
+            } else break;
+        }
         if (result.columns.len == 1 and result.group_by.len == 0 and result.having == null and result.order_by.len == 0) {
             if (result.columns[0].expression) |expression| if (expression.* == .call and expression.call.window == null and expression.call.star and !expression.call.distinct and expression.call.filter == null and std.mem.eql(u8, expression.call.name, "count")) {
                 result.count_all = true;
@@ -2413,6 +2436,23 @@ test "compiler keeps typed parameters and boolean precedence" {
     try std.testing.expect(select.predicate.?.disjunction.right.conjunction.right.* == .negation);
     try std.testing.expect(select.order_by[0].descending);
     try std.testing.expectEqual(@as(u32, 2), select.limit.?.parameter);
+}
+
+test "compiler pagination normalizes bounds and rejects duplicate or incomplete clauses" {
+    var compiled = try compile(std.testing.allocator, "SELECT 1 OFFSET $1 ROWS FETCH NEXT $2 ROWS ONLY", .{});
+    defer compiled.deinit();
+    try std.testing.expectEqual(@as(u32, 1), compiled.statement.select.offset.?.parameter);
+    try std.testing.expectEqual(@as(u32, 2), compiled.statement.select.limit.?.parameter);
+    for ([_][]const u8{
+        "SELECT 1 FETCH",
+        "SELECT 1 FETCH NEXT",
+        "SELECT 1 FETCH NEXT ROW",
+        "SELECT 1 LIMIT 1 LIMIT 2",
+        "SELECT 1 OFFSET 1 OFFSET 2",
+        "SELECT 1 LIMIT ALL FETCH FIRST ROW ONLY",
+        "SELECT 1 FETCH FIRST ROW ONLY LIMIT 1",
+    }) |sql| try std.testing.expectError(error.InvalidSqlSyntax, compile(std.testing.allocator, sql, .{}));
+    try std.testing.expectError(error.UnsupportedSqlShape, compile(std.testing.allocator, "SELECT 1 ORDER BY 1 FETCH FIRST ROW WITH TIES", .{}));
 }
 
 test "compiler rejects unsupported clauses and additional statements atomically" {

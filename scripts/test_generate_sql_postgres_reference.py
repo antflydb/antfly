@@ -516,8 +516,8 @@ class PostgresReferenceTest(unittest.TestCase):
                 / "zig/pkg/antfly-embedded/src/sql/fixtures/sql_conditional_subquery_reference.json"
             ).read_text()
         )
-        self.assertEqual(49, len(fixture["entries"]))
-        self.assertEqual(18, len(fixture["errors"]))
+        self.assertEqual(56, len(fixture["entries"]))
+        self.assertEqual(20, len(fixture["errors"]))
         for case in fixture["entries"]:
             with self.subTest(sql=case["sql"]):
                 self.assertEqual(
@@ -537,6 +537,7 @@ class PostgresReferenceTest(unittest.TestCase):
         for sql, code in (
             ("SELECT 1 LIMIT $1", "2201W"),
             ("SELECT 1 OFFSET $1", "2201X"),
+            ("SELECT 1 FETCH NEXT $1 ROWS ONLY", "2201W"),
             ("SELECT i.x FROM (SELECT 1 AS x) i LIMIT $1", "2201W"),
             ("SELECT i.x FROM (SELECT 1 AS x) i OFFSET $1", "2201X"),
             ("SELECT (SELECT i.x FROM (SELECT 1 AS x) i LIMIT $1)", "2201W"),

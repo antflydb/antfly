@@ -13414,9 +13414,9 @@ test "httpx SQL executes one relational page with exact integer parameters" {
         var campaign_handler = AntflyApiHandler{ .api_server = &campaign_server };
         const ids = try a.alloc([]const u8, profile.value.entries.len);
         for (profile.value.entries, ids) |entry, *id| id.* = entry.id;
-        // These source-owned array contracts must not silently disappear when
+        // These source-owned pagination/array contracts must not silently disappear when
         // regenerating the campaign or discovering other unsupported shapes.
-        for ([_][]const u8{ "sql-0220", "sql-0221", "sql-0222", "sql-0284", "sql-0302", "sql-1226", "sql-1227", "sql-1340" }) |required| {
+        for ([_][]const u8{ "sql-0205", "sql-0206", "sql-0207", "sql-0220", "sql-0221", "sql-0222", "sql-0284", "sql-0302", "sql-1226", "sql-1227", "sql-1340" }) |required| {
             var found = false;
             for (ids) |id| if (std.mem.eql(u8, id, required)) {
                 found = true;

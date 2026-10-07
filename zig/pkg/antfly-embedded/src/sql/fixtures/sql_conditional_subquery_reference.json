@@ -49,7 +49,14 @@
     {"sql": "SELECT 1 LIMIT NULL", "rows": [1]},
     {"sql": "SELECT o.x FROM (SELECT 1 AS x UNION ALL SELECT 2) o ORDER BY o.x LIMIT NULL OFFSET NULL", "rows": [1,2]},
     {"sql": "SELECT (SELECT i.x FROM (SELECT 1 AS x UNION ALL SELECT 2) i ORDER BY i.x LIMIT 1 OFFSET NULL)", "rows": [1]},
-    {"sql": "SELECT (SELECT i.x FROM (SELECT 1 AS x) i LIMIT NULL)", "rows": [1]}
+    {"sql": "SELECT (SELECT i.x FROM (SELECT 1 AS x) i LIMIT NULL)", "rows": [1]},
+    {"sql": "SELECT 1 FETCH FIRST ROW ONLY", "rows": [1]},
+    {"sql": "SELECT 1 FETCH NEXT 1 ROW ONLY", "rows": [1]},
+    {"sql": "SELECT i.x FROM (SELECT 1 AS x UNION ALL SELECT 2) i ORDER BY i.x OFFSET 1 ROWS FETCH NEXT 1 ROW ONLY", "rows": [2]},
+    {"sql": "SELECT i.x FROM (SELECT 1 AS x UNION ALL SELECT 2) i ORDER BY i.x FETCH FIRST 1 ROWS ONLY OFFSET 1 ROW", "rows": [2]},
+    {"sql": "SELECT i.x FROM (SELECT 1 AS x UNION ALL SELECT 2) i ORDER BY i.x OFFSET 1 LIMIT ALL", "rows": [2]},
+    {"sql": "SELECT 1 FETCH NEXT NULL ROWS ONLY", "rows": [1]},
+    {"sql": "SELECT 1 WHERE FALSE FETCH FIRST ROW ONLY", "rows": []}
   ],
   "errors": [
     {"sql": "SELECT CASE WHEN TRUE THEN (SELECT 1 UNION ALL SELECT 2) ELSE 7 END", "code": "21000"},
@@ -69,6 +76,8 @@
     {"sql": "SELECT i.x FROM (SELECT 1 AS x) i LIMIT -1", "code": "2201W"},
     {"sql": "SELECT i.x FROM (SELECT 1 AS x) i OFFSET -1", "code": "2201X"},
     {"sql": "SELECT COUNT(*) FROM (SELECT 1 AS x) i LIMIT -1", "code": "2201W"},
-    {"sql": "SELECT ROW_NUMBER() OVER () FROM (SELECT 1 AS x) i OFFSET -1", "code": "2201X"}
+    {"sql": "SELECT ROW_NUMBER() OVER () FROM (SELECT 1 AS x) i OFFSET -1", "code": "2201X"},
+    {"sql": "SELECT 1 FETCH FIRST -1 ROWS ONLY", "code": "2201W"},
+    {"sql": "SELECT 1 OFFSET -1 ROWS FETCH NEXT ROW ONLY", "code": "2201X"}
   ]
 }

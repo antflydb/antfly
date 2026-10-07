@@ -51,6 +51,8 @@ test "SQL masked Apply preserves PostgreSQL conditional subquery demand and NULL
         };
         defer result.deinit();
         try std.testing.expectEqual(entry.rows.len, result.output.rows.len);
+        try std.testing.expectEqual(@as(usize, 1), result.output.columns.len);
+        if (entry.rows.len == 0) continue;
         for (result.output.rows, result.output.sql_nulls.?, entry.rows) |row, nulls, want| {
             try std.testing.expectEqual(@as(usize, 1), row.len);
             try std.testing.expectEqual(want == .null, nulls[0]);
@@ -78,6 +80,7 @@ test "SQL row bounds validate negative parameters at execution in their own doma
     for ([_]struct { sql: []const u8, code: []const u8 }{
         .{ .sql = "SELECT 1 LIMIT $1", .code = "2201W" },
         .{ .sql = "SELECT 1 OFFSET $1", .code = "2201X" },
+        .{ .sql = "SELECT 1 FETCH NEXT $1 ROWS ONLY", .code = "2201W" },
         .{ .sql = "SELECT i.x FROM (SELECT 1 AS x) i LIMIT $1", .code = "2201W" },
         .{ .sql = "SELECT i.x FROM (SELECT 1 AS x) i OFFSET $1", .code = "2201X" },
         .{ .sql = "SELECT (SELECT i.x FROM (SELECT 1 AS x) i LIMIT $1)", .code = "2201W" },
@@ -104,6 +107,8 @@ test "SQL scalar cardinality NULL limits retain unbounded result admission" {
     for ([_]struct { sql: []const u8, parameters: []const std.json.Value = &.{} }{
         .{ .sql = "SELECT x FROM (SELECT 1 AS x UNION ALL SELECT 2) o LIMIT NULL" },
         .{ .sql = "SELECT x FROM (SELECT 1 AS x UNION ALL SELECT 2) o LIMIT $1", .parameters = &.{.null} },
+        .{ .sql = "SELECT x FROM (SELECT 1 AS x UNION ALL SELECT 2) o LIMIT ALL" },
+        .{ .sql = "SELECT x FROM (SELECT 1 AS x UNION ALL SELECT 2) o FETCH NEXT NULL ROWS ONLY" },
     }) |case| {
         var compiled = try compiler.compile(std.testing.allocator, case.sql, .{});
         defer compiled.deinit();

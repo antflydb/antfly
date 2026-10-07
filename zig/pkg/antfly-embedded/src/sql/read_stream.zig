@@ -197,6 +197,28 @@ test "SQL pull stream pipelines aliased nested CTEs without eager source materia
     try std.testing.expectEqual(@as(usize, 9), seen);
 }
 
+test "SQL pull stream normalizes parameterized FETCH without extra source work" {
+    var compiled = try compiler.compile(std.testing.allocator, "SELECT n FROM docs OFFSET $1 ROWS FETCH NEXT $2 ROWS ONLY", .{});
+    defer compiled.deinit();
+    var fixture: Fixture = .{};
+    const stream = (try Stream.open(std.testing.allocator, fixture.backend(), &compiled, &.{ .{ .integer = 2 }, .{ .integer = 3 } }, .{ .page_rows = 2 })).?;
+    defer stream.close();
+    var seen: usize = 0;
+    while (true) {
+        var page = try stream.next(2);
+        defer page.deinit();
+        for (page.output.rows) |row| {
+            try std.testing.expectEqual(@as(i64, @intCast(seen + 2)), row[0].integer);
+            seen += 1;
+        }
+        if (page.exhausted) break;
+    }
+    try std.testing.expectEqual(@as(usize, 3), seen);
+    try std.testing.expectEqual(@as(usize, 5), fixture.offset);
+    try std.testing.expectEqual(@as(usize, 1), fixture.opened);
+    try std.testing.expectEqual(@as(usize, 1), fixture.closed);
+}
+
 test "SQL pull stream validates row bound domains before opening a cursor" {
     for ([_]struct { sql: []const u8, parameters: []const Json = &.{}, failure: anyerror }{
         .{ .sql = "SELECT n FROM docs LIMIT -1", .failure = error.SqlNegativeLimit },
@@ -204,6 +226,7 @@ test "SQL pull stream validates row bound domains before opening a cursor" {
         .{ .sql = "SELECT n FROM docs LIMIT $1", .parameters = &.{.{ .integer = -1 }}, .failure = error.SqlNegativeLimit },
         .{ .sql = "SELECT n FROM docs OFFSET $1", .parameters = &.{.{ .integer = -1 }}, .failure = error.SqlNegativeOffset },
         .{ .sql = "SELECT n FROM docs LIMIT 0 OFFSET -1", .failure = error.SqlNegativeOffset },
+        .{ .sql = "SELECT n FROM docs FETCH FIRST $1 ROWS ONLY", .parameters = &.{.{ .integer = -1 }}, .failure = error.SqlNegativeLimit },
     }) |case| {
         var fixture: Fixture = .{ .count = 0 };
         var compiled = try compiler.compile(std.testing.allocator, case.sql, .{});

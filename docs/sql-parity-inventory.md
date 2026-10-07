@@ -205,8 +205,8 @@ original entry remains identifiable by its canonical hash (sorted JSON keys,
 compact separators, UTF-8 without ASCII escaping).
 
 The matching `sql_parity_dispositions.json` must account for every ID exactly once.
-The current branch records 352 implemented, 136 rejected and 70 superseded
-cases, with 1,028 still unresolved. The earlier batches add 77 exact compiler
+The current branch records 355 implemented, 136 rejected and 70 superseded
+cases, with 1,025 still unresolved. The earlier batches add 77 exact compiler
 rejection contracts, 115 mounted native reads, twelve native UPDATE/DELETE
 contracts and six independently referenced mutations
 contracts; they do not claim complete SQL
@@ -219,16 +219,25 @@ positive contracts. Native execution checks full persisted state as well as
 public results. Five recorded gates verify mounted execution, both PostgreSQL
 references, oracle safety/ordering contracts and pipeline allocation-fault
 regressions. This is a validated batch, not completion of either entire campaign;
-getting below 800 now requires at least 229 additional resolved dispositions.
+getting below 800 now requires at least 226 additional resolved dispositions.
 
 Eight further original cases (`sql-0220`–`sql-0222`, `sql-0284`, `sql-0302`,
 `sql-1226`, `sql-1227` and `sql-1340`) now execute typed array predicates through
 reads, aggregate FILTER and a left join. The PostgreSQL read campaign contains
-68 exact contracts, with peer-frontier checks for the new non-unique aggregate
+71 exact contracts, with peer-frontier checks for the new non-unique aggregate
 and timestamp ordering. The separate LATERAL campaign now activates `sql-1363`
 through correlated derived-table binding and a parameterized apply operator with
 per-parent ORDER/LIMIT and left-null-extension semantics; scalar pattern support
 alone would not activate that relation shape.
+
+Three original pagination contracts (`sql-0205`–`sql-0207`) now execute unchanged
+through mounted HTTP over native typed storage. PostgreSQL verifies all labels,
+types, rows and SQL NULL flags; complete peer frontiers permit only unspecified
+equal-timestamp order. LIMIT ALL and NULL remain unbounded, NULL OFFSET is zero,
+and OFFSET ROWS/FETCH FIRST or NEXT ROWS ONLY normalize to the same bounded
+execution plan. Parameterized cursor coverage reads exactly five source rows
+for offset two and limit three from a 10,000-row input. Omitted FETCH counts mean
+one; arbitrary bound expressions and FETCH WITH TIES remain unimplemented.
 
 Six additional read contracts exercise PostgreSQL text slicing and replacement
 through the native endpoint. The text oracle independently verifies 54 UTF-8,
@@ -411,7 +420,7 @@ Conditional scalar reads now use compiler-generated masked Apply producers.
 CASE, COALESCE and boolean short-circuit operators retain SQL NULL truth rules,
 and a producer is not opened until its branch is demanded. Prerequisite values
 are materialized once; binding and authorization still cover every branch.
-The shared PostgreSQL/native fixture checks 49 result contracts and eighteen error
+The shared PostgreSQL/native fixture checks 56 result contracts and twenty error
 contracts, including demanded cardinality failures and invalid names in dead
 branches. Mutation tests additionally verify that an unused RETURNING producer
 reads no source rows, a demanded failure publishes no mutations, and unused

@@ -51,6 +51,8 @@ ROW_LIMIT = 4096
 # expose the entire eligible peer frontier, so LIMIT cannot make PostgreSQL's
 # arbitrary tie selection into a false requirement for the native engine.
 ORDER_OBSERVERS = {
+    "sql-0205": "SELECT id, created_at AS order_key FROM usage_records ORDER BY created_at DESC OFFSET 2",
+    "sql-0206": "SELECT id, created_at AS order_key FROM usage_records ORDER BY created_at DESC",
     "sql-0233": "SELECT id, ceil(least(amount,quantity,100)) AS order_key FROM usage_records WHERE floor(round(abs(amount-quantity))) > $1 ORDER BY order_key",
     "sql-0238": "SELECT greatest(amount,quantity,0) AS max_amount, least(amount,quantity,100) AS min_amount, least(amount,quantity,100) AS order_key FROM usage_records WHERE greatest(amount,quantity,0) > $1 ORDER BY order_key",
     "sql-0239": "SELECT id, octet_length(status) AS status_bytes, character_length(status) AS order_key FROM usage_records WHERE char_length(status) > $1 ORDER BY order_key DESC",

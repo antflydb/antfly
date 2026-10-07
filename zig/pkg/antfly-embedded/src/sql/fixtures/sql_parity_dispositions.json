@@ -1725,18 +1725,30 @@
     },
     {
       "id": "sql-0205",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original LIMIT ALL/OFFSET query executes through mounted HTTP over native typed storage. PostgreSQL verifies every result, label, type and SQL NULL flag; complete ordered peer groups permit only unspecified equal-timestamp order. ALL retains unbounded result admission rather than truncating to the configured result quota.",
+      "evidence": [
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL executes one relational page with exact integer parameters", "gate": "sql-mounted-read-shapes"},
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL executes one relational page with exact integer parameters", "gate": "sql-postgres-read-reference"}
+      ]
     },
     {
       "id": "sql-0206",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original nullable-pagination query executes through mounted HTTP over native typed storage. PostgreSQL verifies all rows, labels, types and SQL NULL flags, allowing only equal-timestamp peer permutations. NULL LIMIT is unbounded and NULL OFFSET is zero; native quota regressions reject overflow rather than silently truncating an unbounded result.",
+      "evidence": [
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL executes one relational page with exact integer parameters", "gate": "sql-mounted-read-shapes"},
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL executes one relational page with exact integer parameters", "gate": "sql-postgres-read-reference"}
+      ]
     },
     {
       "id": "sql-0207",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original OFFSET ROWS/FETCH NEXT ROWS ONLY query executes through mounted HTTP over native typed storage. PostgreSQL verifies the complete ordered three-row result, labels, types and SQL NULL flags after skipping two rows. FETCH normalizes to the existing bounded execution plan; a parameterized cursor regression proves exactly five input rows are read for offset two and limit three.",
+      "evidence": [
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL executes one relational page with exact integer parameters", "gate": "sql-mounted-read-shapes"},
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL executes one relational page with exact integer parameters", "gate": "sql-postgres-read-reference"}
+      ]
     },
     {
       "id": "sql-0208",
