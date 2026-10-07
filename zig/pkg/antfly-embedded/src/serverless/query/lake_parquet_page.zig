@@ -79,6 +79,7 @@ pub const Header = struct {
     compressed_page_size: u32,
     value_count: u32,
     encoding: Encoding,
+    definition_encoding: Encoding = .rle,
     definition_level_bytes: usize = 0,
     repetition_level_bytes: usize = 0,
     data_payload_offset: usize = 0,
@@ -117,6 +118,23 @@ pub const Header = struct {
         if (self.uncompressed_page_size > max_uncompressed_page_bytes) return error.ParquetPageTooLarge;
     }
 };
+
+/// Flat nullable V1 pages prefix the RLE definition stream with its byte length.
+/// Normalize the decompressed framing once; value kernels share V2 level logic.
+const FlatOptionalPage = struct { header: Header, payload: []const u8 };
+fn flatOptionalPage(original: Header, payload: []const u8) !FlatOptionalPage {
+    if (original.page_type != .data_page) return .{ .header = original, .payload = payload };
+    if (original.definition_encoding != .rle) return error.UnsupportedParquetPage;
+    if (payload.len < 4) return error.InvalidParquetPage;
+    const length = std.mem.readInt(u32, payload[0..4], .little);
+    if (length == 0 or length > payload.len - 4) return error.InvalidParquetPage;
+    var header = original;
+    header.page_type = .data_page_v2;
+    header.definition_level_bytes = length;
+    header.repetition_level_bytes = 0;
+    header.data_payload_offset = length;
+    return .{ .header = header, .payload = payload[4..] };
+}
 
 pub const ParsedHeader = struct {
     header: Header,
@@ -581,10 +599,13 @@ pub fn decodeDictionaryF64DataPageAlloc(
 
 pub fn decodeOptionalDictionaryI64V2HybridLevelsAlloc(
     alloc: Allocator,
-    header: Header,
+    original_header: Header,
     dictionary: []const i64,
-    page_payload: []const u8,
+    original_payload: []const u8,
 ) !NullableI64Values {
+    const flat = try flatOptionalPage(original_header, original_payload);
+    const header = flat.header;
+    const page_payload = flat.payload;
     try header.validateDictionaryRequired();
     if (header.page_type != .data_page_v2) return error.UnsupportedParquetPage;
     if (header.repetition_level_bytes != 0) return error.UnsupportedParquetPage;
@@ -641,10 +662,13 @@ pub fn decodeOptionalDictionaryI64V2HybridLevelsAlloc(
 
 pub fn decodeOptionalDictionaryF64V2HybridLevelsAlloc(
     alloc: Allocator,
-    header: Header,
+    original_header: Header,
     dictionary: []const f64,
-    page_payload: []const u8,
+    original_payload: []const u8,
 ) !NullableF64Values {
+    const flat = try flatOptionalPage(original_header, original_payload);
+    const header = flat.header;
+    const page_payload = flat.payload;
     try header.validateDictionaryRequired();
     if (header.page_type != .data_page_v2) return error.UnsupportedParquetPage;
     if (header.repetition_level_bytes != 0) return error.UnsupportedParquetPage;
@@ -1202,9 +1226,12 @@ pub fn decodeOptionalPlainI64V2ByteLevelsAlloc(
 
 pub fn decodeOptionalPlainI64V2HybridLevelsAlloc(
     alloc: Allocator,
-    header: Header,
-    page_payload: []const u8,
+    original_header: Header,
+    original_payload: []const u8,
 ) !NullableI64Values {
+    const flat = try flatOptionalPage(original_header, original_payload);
+    const header = flat.header;
+    const page_payload = flat.payload;
     try header.validatePlainRequired();
     if (header.page_type != .data_page_v2) return error.UnsupportedParquetPage;
     if (header.repetition_level_bytes != 0) return error.UnsupportedParquetPage;
@@ -1247,9 +1274,12 @@ pub fn decodeOptionalPlainI64V2HybridLevelsAlloc(
 
 pub fn decodeOptionalPlainInt96TimestampNsV2HybridLevelsAlloc(
     alloc: Allocator,
-    header: Header,
-    page_payload: []const u8,
+    original_header: Header,
+    original_payload: []const u8,
 ) !NullableI64Values {
+    const flat = try flatOptionalPage(original_header, original_payload);
+    const header = flat.header;
+    const page_payload = flat.payload;
     try header.validatePlainRequired();
     if (header.page_type != .data_page_v2) return error.UnsupportedParquetPage;
     if (header.repetition_level_bytes != 0) return error.UnsupportedParquetPage;
@@ -1292,9 +1322,12 @@ pub fn decodeOptionalPlainInt96TimestampNsV2HybridLevelsAlloc(
 
 pub fn decodeOptionalPlainF64V2HybridLevelsAlloc(
     alloc: Allocator,
-    header: Header,
-    page_payload: []const u8,
+    original_header: Header,
+    original_payload: []const u8,
 ) !NullableF64Values {
+    const flat = try flatOptionalPage(original_header, original_payload);
+    const header = flat.header;
+    const page_payload = flat.payload;
     try header.validatePlainRequired();
     if (header.page_type != .data_page_v2) return error.UnsupportedParquetPage;
     if (header.repetition_level_bytes != 0) return error.UnsupportedParquetPage;
@@ -1338,9 +1371,12 @@ pub fn decodeOptionalPlainF64V2HybridLevelsAlloc(
 
 pub fn decodeOptionalPlainI32V2HybridLevelsAsI64Alloc(
     alloc: Allocator,
-    header: Header,
-    page_payload: []const u8,
+    original_header: Header,
+    original_payload: []const u8,
 ) !NullableI64Values {
+    const flat = try flatOptionalPage(original_header, original_payload);
+    const header = flat.header;
+    const page_payload = flat.payload;
     try header.validatePlainRequired();
     if (header.page_type != .data_page_v2) return error.UnsupportedParquetPage;
     if (header.repetition_level_bytes != 0) return error.UnsupportedParquetPage;
@@ -1515,9 +1551,12 @@ pub fn scanOptionalPlainI32AsI64ColumnChunkAlloc(
 
 pub fn decodeOptionalPlainF32V2HybridLevelsAsF64Alloc(
     alloc: Allocator,
-    header: Header,
-    page_payload: []const u8,
+    original_header: Header,
+    original_payload: []const u8,
 ) !NullableF64Values {
+    const flat = try flatOptionalPage(original_header, original_payload);
+    const header = flat.header;
+    const page_payload = flat.payload;
     try header.validatePlainRequired();
     if (header.page_type != .data_page_v2) return error.UnsupportedParquetPage;
     if (header.repetition_level_bytes != 0) return error.UnsupportedParquetPage;
@@ -1561,9 +1600,12 @@ pub fn decodeOptionalPlainF32V2HybridLevelsAsF64Alloc(
 
 pub fn decodeOptionalPlainBoolV2HybridLevelsAlloc(
     alloc: Allocator,
-    header: Header,
-    page_payload: []const u8,
+    original_header: Header,
+    original_payload: []const u8,
 ) !NullableBoolValues {
+    const flat = try flatOptionalPage(original_header, original_payload);
+    const header = flat.header;
+    const page_payload = flat.payload;
     try header.validatePlainRequired();
     if (header.page_type != .data_page_v2) return error.UnsupportedParquetPage;
     if (header.repetition_level_bytes != 0) return error.UnsupportedParquetPage;
@@ -1892,9 +1934,12 @@ pub fn decodePlainByteArraysAlloc(alloc: Allocator, header: Header, page_payload
 
 pub fn decodeOptionalPlainByteArraysV2HybridLevelsAlloc(
     alloc: Allocator,
-    header: Header,
-    page_payload: []const u8,
+    original_header: Header,
+    original_payload: []const u8,
 ) !NullableByteArrayValues {
+    const flat = try flatOptionalPage(original_header, original_payload);
+    const header = flat.header;
+    const page_payload = flat.payload;
     try header.validatePlainRequired();
     if (header.page_type != .data_page_v2) return error.UnsupportedParquetPage;
     if (header.repetition_level_bytes != 0) return error.UnsupportedParquetPage;
@@ -2072,10 +2117,13 @@ pub fn decodePlainFixedLenByteArraysAlloc(
 
 pub fn decodeOptionalPlainFixedLenByteArraysV2HybridLevelsAlloc(
     alloc: Allocator,
-    header: Header,
-    page_payload: []const u8,
+    original_header: Header,
+    original_payload: []const u8,
     type_length: usize,
 ) !NullableByteArrayValues {
+    const flat = try flatOptionalPage(original_header, original_payload);
+    const header = flat.header;
+    const page_payload = flat.payload;
     try header.validatePlainRequired();
     if (type_length == 0) return error.InvalidParquetPage;
     if (header.page_type != .data_page_v2) return error.UnsupportedParquetPage;
@@ -2141,10 +2189,14 @@ pub fn decodePlainFixedLenByteArrayDictionaryPageAlloc(
 
 /// Decode dictionary IDs without expanding/copying a byte payload per row.
 /// A page owns its dictionary so decoded-cache eviction cannot borrow a cursor.
-pub fn decodeByteDictionaryVectorAlloc(a: Allocator, header: Header, dictionary: []const []const u8, payload: []const u8, optional: bool) !struct { values: @import("../../storage/rowsource/types.zig").DictionaryBytes, nulls: []u8 } {
-    return decodeByteDictionaryVector(a, header, dictionary, payload, optional, false);
-}
-pub fn decodeByteDictionaryVector(a: Allocator, header: Header, dictionary: []const []const u8, payload: []const u8, optional: bool, borrow: bool) !struct { values: @import("../../storage/rowsource/types.zig").DictionaryBytes, nulls: []u8 } {
+pub fn decodeDictionaryIndices(a: Allocator, original_header: Header, dictionary_len: usize, original_payload: []const u8, optional: bool) !struct {
+    indices: []u32,
+    nulls: []u8,
+} {
+    const flat = if (optional) try flatOptionalPage(original_header, original_payload) else FlatOptionalPage{ .header = original_header, .payload = original_payload };
+    const header = flat.header;
+    const payload = flat.payload;
+
     try header.validateDictionaryRequired();
     const count: usize = header.value_count;
     if (header.data_payload_offset > payload.len) return error.InvalidParquetPage;
@@ -2170,11 +2222,23 @@ pub fn decodeByteDictionaryVector(a: Allocator, header: Header, dictionary: []co
         if (optional) nulls[row] = @intFromBool(is_null);
         id.* = 0;
         if (!is_null) {
-            if (decoded[next] >= dictionary.len) return error.InvalidParquetPage;
+            if (decoded[next] >= dictionary_len) return error.InvalidParquetPage;
             id.* = @intCast(decoded[next]);
             next += 1;
         }
     }
+    return .{ .indices = indices, .nulls = nulls };
+}
+
+pub fn decodeByteDictionaryVectorAlloc(a: Allocator, header: Header, dictionary: []const []const u8, payload: []const u8, optional: bool) !struct { values: @import("../../storage/rowsource/types.zig").DictionaryBytes, nulls: []u8 } {
+    return decodeByteDictionaryVector(a, header, dictionary, payload, optional, false);
+}
+pub fn decodeByteDictionaryVector(a: Allocator, header: Header, dictionary: []const []const u8, payload: []const u8, optional: bool, borrow: bool) !struct { values: @import("../../storage/rowsource/types.zig").DictionaryBytes, nulls: []u8 } {
+    const decoded = try decodeDictionaryIndices(a, header, dictionary.len, payload, optional);
+    const indices = decoded.indices;
+    const nulls = decoded.nulls;
+    errdefer a.free(indices);
+    errdefer if (optional) a.free(nulls);
     if (borrow) return .{ .values = .{ .values = dictionary, .indices = indices }, .nulls = nulls };
     const values = try a.alloc([]const u8, dictionary.len);
     errdefer a.free(values);
@@ -2220,10 +2284,13 @@ pub fn decodeDictionaryByteArrayDataPageAlloc(
 
 pub fn decodeOptionalDictionaryByteArrayDataPageAlloc(
     alloc: Allocator,
-    header: Header,
+    original_header: Header,
     dictionary: []const []const u8,
-    page_payload: []const u8,
+    original_payload: []const u8,
 ) !NullableByteArrayValues {
+    const flat = try flatOptionalPage(original_header, original_payload);
+    const header = flat.header;
+    const page_payload = flat.payload;
     try header.validateDictionaryRequired();
     if (header.page_type != .data_page_v2) return error.UnsupportedParquetPage;
     if (header.repetition_level_bytes != 0) return error.UnsupportedParquetPage;
@@ -2744,6 +2811,7 @@ fn parseHeaderStruct(reader: *Reader) !Header {
         .compressed_page_size = compressed_page_size orelse return error.InvalidParquetPage,
         .value_count = page_header.value_count,
         .encoding = page_header.encoding,
+        .definition_encoding = page_header.definition_encoding,
         .definition_level_bytes = page_header.definition_level_bytes,
         .repetition_level_bytes = page_header.repetition_level_bytes,
         .data_payload_offset = page_header.data_payload_offset,
@@ -2754,6 +2822,7 @@ fn parseHeaderStruct(reader: *Reader) !Header {
 const DataPageHeader = struct {
     value_count: u32,
     encoding: Encoding,
+    definition_encoding: Encoding = .rle,
     definition_level_bytes: usize = 0,
     repetition_level_bytes: usize = 0,
     data_payload_offset: usize = 0,
@@ -2764,16 +2833,19 @@ fn parseDataPageHeader(reader: *Reader) !DataPageHeader {
     var previous_field_id: i16 = 0;
     var value_count: ?u32 = null;
     var encoding: ?Encoding = null;
+    var definition_encoding: Encoding = .rle;
     while (try reader.readFieldHeader(&previous_field_id)) |field| {
         switch (field.id) {
             1 => value_count = try reader.readRequiredU32(field.type),
             2 => encoding = try encodingFromInt(try reader.readRequiredI32(field.type)),
+            3 => definition_encoding = try encodingFromInt(try reader.readRequiredI32(field.type)),
             else => try reader.skip(field.type),
         }
     }
     return .{
         .value_count = value_count orelse return error.InvalidParquetPage,
         .encoding = encoding orelse return error.InvalidParquetPage,
+        .definition_encoding = definition_encoding,
     };
 }
 
@@ -4202,3 +4274,21 @@ pub const Dictionary = union(enum) {
         return @field(value.*, @tagName(tag));
     }
 };
+
+test "external lake nullable V1 framing preserves nulls and rejects truncated levels" {
+    const a = std.testing.allocator;
+    const header: Header = .{ .page_type = .data_page, .uncompressed_page_size = 26, .compressed_page_size = 26, .value_count = 3, .encoding = .plain };
+    var payload: [26]u8 = undefined;
+    std.mem.writeInt(u32, payload[0..4], 6, .little);
+    @memcpy(payload[4..10], &[_]u8{ 2, 1, 2, 0, 2, 1 });
+    std.mem.writeInt(i64, payload[10..18], 7, .little);
+    std.mem.writeInt(i64, payload[18..26], 9, .little);
+    const decoded = try decodeOptionalPlainI64V2HybridLevelsAlloc(a, header, &payload);
+    defer a.free(decoded.values);
+    defer a.free(decoded.nulls);
+    try std.testing.expectEqualSlices(i64, &.{ 7, 0, 9 }, decoded.values);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 1, 0 }, decoded.nulls);
+    try std.testing.expectError(error.InvalidParquetPage, decodeOptionalPlainI64V2HybridLevelsAlloc(a, header, payload[0..3]));
+    std.mem.writeInt(u32, payload[0..4], 99, .little);
+    try std.testing.expectError(error.InvalidParquetPage, decodeOptionalPlainI64V2HybridLevelsAlloc(a, header, &payload));
+}

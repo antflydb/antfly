@@ -1733,6 +1733,7 @@ fn builderKindForDesired(want: DesiredArtifact) !BuilderKind {
         .graph => .graph,
         .algebraic => error.AmbiguousLakeRebuildBuilder,
         .graph_metric => error.MissingLakeRebuildBuildSpec,
+        .ordered_rows => error.MissingLakeRebuildBuildSpec,
     };
 }
 
@@ -1745,6 +1746,7 @@ fn buildSpecForDesiredAlloc(alloc: Allocator, want: DesiredArtifact) !BuildSpec 
         .graph => .{ .graph = .{ .graph_column = try alloc.dupe(u8, try defaultBoundColumn(want.binding, 0)) } },
         .algebraic => error.MissingLakeRebuildBuildSpec,
         .graph_metric => error.MissingLakeRebuildBuildSpec,
+        .ordered_rows => error.MissingLakeRebuildBuildSpec,
     };
 }
 

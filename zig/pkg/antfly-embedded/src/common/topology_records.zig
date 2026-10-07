@@ -22,6 +22,9 @@ const std = @import("std");
 pub const TableRecord = struct {
     /// Internal metadata lifecycle intent; never accepted as public schema.
     relational_retirement_json: []const u8 = "",
+    /// Native, CAS-published generations over authorized external lake sources.
+    /// Internal control-plane state; never a user-supplied index configuration.
+    lake_index_catalog_json: []const u8 = "",
     storage: @import("table_storage.zig").Settings = .{},
     storage_migration: ?@import("vector_migration.zig").Admission = null,
     table_id: u64,
@@ -36,6 +39,17 @@ pub const TableRecord = struct {
     restore_location: []const u8 = "",
     desired_replica_count: u16 = 3,
     min_ranges: u32 = 1,
+
+    pub fn jsonStringify(self: TableRecord, jw: anytype) !void {
+        try jw.beginObject();
+        inline for (@typeInfo(TableRecord).@"struct".field_names) |field_name| {
+            if (!std.mem.eql(u8, field_name, "lake_index_catalog_json") or self.lake_index_catalog_json.len != 0) {
+                try jw.objectField(field_name);
+                try jw.write(@field(self, field_name));
+            }
+        }
+        try jw.endObject();
+    }
 
     /// Default legacy tables retain their exact durable record bytes. Storage
     /// ownership or an admitted migration requires the versioned extension.

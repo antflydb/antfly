@@ -67,7 +67,11 @@ pub const Plan = struct {
     /// Coalesce is lazy, so an unselected expression cannot raise an error.
     pub fn evaluate(self: *const Plan, alloc: Allocator, values: []const Value) !Value {
         var budget: usize = max_allocated_bytes;
-        return self.evaluateNode(alloc, .{ .values = values }, @intCast(self.nodes.len - 1), &budget);
+        return self.evaluateWithBudget(alloc, values, &budget);
+    }
+
+    pub fn evaluateWithBudget(self: *const Plan, alloc: Allocator, values: []const Value, budget: *usize) !Value {
+        return self.evaluateNode(alloc, .{ .values = values }, @intCast(self.nodes.len - 1), budget);
     }
 
     pub fn evaluateJson(self: *const Plan, alloc: Allocator, document: std.json.Value) !Value {
@@ -352,6 +356,7 @@ const Compiler = struct {
                 self.frame(@tagName(node.kind));
                 self.literal_bytes += switch (node.literal) {
                     .string, .blob => |bytes| bytes.len,
+                    .datetime => 16,
                     else => 8,
                 };
                 if (self.literal_bytes > max_allocated_bytes) return error.RelationalExpressionBudgetExceeded;
@@ -366,8 +371,9 @@ const Compiler = struct {
                         self.hash.update(&bytes);
                     },
                     .datetime => |datetime| {
-                        std.mem.writeInt(u64, &bytes, datetime, .little);
-                        self.hash.update(&bytes);
+                        var signed: [16]u8 = undefined;
+                        std.mem.writeInt(i128, &signed, datetime, .little);
+                        self.hash.update(&signed);
                     },
                     .number => |number| {
                         std.mem.writeInt(u64, &bytes, @bitCast(number), .little);

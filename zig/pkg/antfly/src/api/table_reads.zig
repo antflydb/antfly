@@ -15292,7 +15292,7 @@ fn collectHostedAggregationBackgroundTextStats(
     return try mergeDistributedBackgroundTextStats(alloc, shard_stats[0..initialized]);
 }
 
-fn applyQueryPostProcessing(
+pub fn applyQueryPostProcessing(
     alloc: std.mem.Allocator,
     req: db_mod.types.SearchRequest,
     result: *db_mod.types.SearchResult,

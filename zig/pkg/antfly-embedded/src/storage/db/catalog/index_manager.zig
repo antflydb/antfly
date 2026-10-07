@@ -9451,6 +9451,9 @@ pub const IndexManager = struct {
                 switch (seg.data) {
                     .mmap, .artifact => stats.text_mmap_segment_bytes +|= bytes,
                     .heap => stats.text_heap_segment_bytes +|= bytes,
+                    .owned_view => |view| {
+                        if (view.file_backed) stats.text_mmap_segment_bytes +|= bytes else stats.text_heap_segment_bytes +|= bytes;
+                    },
                     .native => {
                         stats.text_native_segment_bytes +|= bytes;
                         const navigation = seg.reader.nativeNavigationBytes();

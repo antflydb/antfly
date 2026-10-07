@@ -30,9 +30,11 @@ const fst = @import("antfly_fst");
 const bloom = @import("bloom");
 const platform_time = @import("antfly_platform").time;
 
-// ============================================================================
+// =====================================================================}
+
 // Wire format versions
-// ============================================================================
+// =====================================================================}
+
 //
 //   v11: v10 postings + fixed-prefix blocked term dictionary
 //   v12: v11 + bit-packed position deltas
@@ -372,9 +374,10 @@ fn writeCurrentHeader(
     dst[29..33].* = @bitCast(@as(u32, norms_len));
 }
 
-// ============================================================================
+// =====================================================================}
+
 // Varint helpers (LEB128)
-// ============================================================================
+// =====================================================================}
 
 fn writeVarintU32(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), value: u32) !void {
     var v = value;
@@ -843,9 +846,10 @@ fn readVarintU64(data: []const u8, cursor: *usize) !u64 {
     return error.Truncated;
 }
 
-// ============================================================================
+// =====================================================================}
+
 // Index builder (write path)
-// ============================================================================
+// =====================================================================}
 
 /// Builds an inverted text index from documents.
 ///
@@ -2211,12 +2215,20 @@ const PostingAccumulator = struct {
     }
 };
 
-// ============================================================================
+// =====================================================================}
+
 // Index reader (query path)
-// ============================================================================
+// =====================================================================}
 
 /// Reads the origin/main v23 format and the current production format.
+pub const PostingsLoader = struct {
+    ptr: *anyopaque,
+    context: ?*anyopaque = null,
+    base: usize = 0,
+    ensure: *const fn (*anyopaque, ?*anyopaque, usize) anyerror!void,
+};
 pub const InvertedIndexReader = struct {
+    postings_loader: ?PostingsLoader = null,
     alloc: Allocator,
     data: []const u8,
     doc_count: u32,
@@ -2398,6 +2410,12 @@ pub const InvertedIndexReader = struct {
     /// Consults the per-segment term bloom filter before walking the FST
     /// when present, so absent-term lookups skip the FST traversal entirely.
     pub fn lookup(self: *const InvertedIndexReader, term: []const u8) ?LookupResult {
+        std.debug.assert(self.postings_loader == null);
+        return self.lookupChecked(term) catch unreachable;
+    }
+    /// Remote readers propagate I/O and request-authority failures rather
+    /// than turning them into an absent term.
+    pub fn lookupChecked(self: *const InvertedIndexReader, term: []const u8) !?LookupResult {
         if (self.term_bloom) |filter| {
             const h = termBloomHashes(term);
             if (!filter.maybeContainsHashes(h.h1, h.h2)) return null;
@@ -2413,7 +2431,7 @@ pub const InvertedIndexReader = struct {
             } };
         }
 
-        return .{ .postings = self.readPostings(dict_value) };
+        return .{ .postings = try self.readPostingsChecked(dict_value) };
     }
 
     /// Iterate all terms in the dictionary using the block-ceiling FST iterator.
@@ -2486,6 +2504,10 @@ pub const InvertedIndexReader = struct {
         return lookupBlockedTerm(self.alloc, self.dict_blocks, block_offset, term);
     }
 
+    fn readPostingsChecked(self: *const InvertedIndexReader, offset: u64) !TermPostings {
+        if (self.postings_loader) |loader| try loader.ensure(loader.ptr, loader.context, loader.base + self.postings_offset + @as(usize, @intCast(offset)));
+        return self.readPostings(offset);
+    }
     fn readPostings(self: *const InvertedIndexReader, offset: u64) TermPostings {
         // Dictionary values are deliberately u64. A force-merged full-text
         // section can exceed 4 GiB even though document IDs remain u32; do not
@@ -2715,7 +2737,7 @@ pub const TermIterator = struct {
                     .norm_bits = self.reader.normForDoc(@intCast(fstValDecode1Hit(value).doc_num)),
                 } }
             else
-                .{ .postings = self.reader.readPostings(value) };
+                .{ .postings = try self.reader.readPostingsChecked(value) };
 
             return .{ .term = self.current_key.items, .result = result };
         }
@@ -4059,6 +4081,18 @@ pub const PostingsIterator = struct {
             try self.payload_buffer.ensureTotalCapacityPrecise(self.alloc, meta.doc_ctrl_len);
             self.payload_buffer.items.len = meta.doc_ctrl_len;
             try view.readInto(payload_offset, self.payload_buffer.items);
+            // Warm only the next document chunk. Streamed layouts interleave
+            // positions; never assume the bytes after this chunk are documents.
+            if (view.source == .ranges and view.source.ranges.prefetch != null and index + 1 < self.chunk_meta_count) lookahead: {
+                const next_meta = self.chunkMeta(index + 1) catch break :lookahead;
+                const next_offset: u64 = if (self.hasStreamedRecords()) blk2: {
+                    const record = self.streamedRecord(index + 1) catch break :lookahead;
+                    break :blk2 std.mem.readInt(u64, record[8..16], .little);
+                } else next_meta.doc_ctrl_off;
+                if (next_offset <= view.length and next_meta.doc_ctrl_len <= view.length - next_offset)
+                    view.source.prefetch(view.offset + next_offset, next_meta.doc_ctrl_len);
+            }
+
             break :blk self.payload_buffer.items;
         } else self.payload_data[@intCast(payload_offset)..][0..meta.doc_ctrl_len];
         var payload_cursor: usize = 0;
@@ -4947,9 +4981,10 @@ pub const PostingsIterator = struct {
     }
 };
 
-// ============================================================================
+// =====================================================================}
+
 // BM25 Scoring
-// ============================================================================
+// =====================================================================}
 
 pub const BM25Config = struct {
     k1: f32 = 1.2,
@@ -5253,9 +5288,10 @@ fn rebuildShiftedBlockMax(
     return out;
 }
 
-// ============================================================================
+// =====================================================================}
+
 // 1-Hit Encoding
-// ============================================================================
+// =====================================================================}
 
 /// Mask for the encoding type in FST values (bits 63-62).
 pub const fst_val_encoding_mask: u64 = 0xc000000000000000;
@@ -5286,9 +5322,10 @@ pub fn fstValIs1Hit(v: u64) bool {
     return (v & fst_val_encoding_mask) == fst_val_encoding_1hit;
 }
 
-// ============================================================================
+// =====================================================================}
+
 // freqHasLocs Encoding
-// ============================================================================
+// =====================================================================}
 
 /// Encode frequency and hasLocs flag into a single value.
 /// Format: (freq << 1) | hasLocsBit
@@ -5304,9 +5341,10 @@ pub fn decodeFreqHasLocs(v: u64) struct { freq: u64, has_locs: bool } {
     };
 }
 
-// ============================================================================
+// =====================================================================}
+
 // Configuration
-// ============================================================================
+// =====================================================================}
 
 const PostingsLayout = enum {
     /// Branch-only v27 writer retained solely to construct compatibility and
@@ -5360,9 +5398,10 @@ pub fn productionIndexConfig() IndexConfig {
     return config;
 }
 
-// ============================================================================
+// =====================================================================}
+
 // Segment merger
-// ============================================================================
+// =====================================================================}
 
 /// Merge multiple inverted index sections into one.
 /// Input: slice of serialized section bytes.
@@ -6613,9 +6652,10 @@ fn finishStreamingSectionProfile(
     if (profile) |p| p.final_assembly_ns +|= platform_time.monotonicNs() - assembly_start;
 }
 
-// ============================================================================
+// =====================================================================}
+
 // Tests
-// ============================================================================
+// =====================================================================}
 
 test "build and query inverted index" {
     const alloc = std.testing.allocator;
@@ -8903,7 +8943,7 @@ pub const ScopedInvertedIndexReader = struct {
         const context = try allocator.create(Context);
         context.* = .{ .allocator = allocator, .view = backing, .options = options, .navigation = std.heap.ArenaAllocator.init(allocator), .dictionary = @import("../segment_source.zig").Scratch.init(allocator, options.dictionary_retained_bytes) };
         errdefer context.destroy();
-        const source = @import("../segment_source.zig").Source{ .ranges = .{ .ptr = context, .length = backing.length, .read_into = Context.read, .close = Context.closeBorrow } };
+        const source = @import("../segment_source.zig").Source{ .ranges = .{ .ptr = context, .length = backing.length, .read_into = Context.read, .close = Context.closeBorrow, .prefetch = if (backing.source == .ranges and backing.source.ranges.prefetch != null) Context.prefetch else null } };
         context.cache = try @import("../segment_source.zig").BlockCache.init(allocator, source, options.cache_bytes);
         context.native = try RangeInvertedIndexReader.init(allocator, try @import("../segment_source.zig").View.init(context.cache.?.borrowedSource(), 0, view.length), options.dictionary_block_bytes);
         return .{ .context = context, .doc_count = context.native.doc_count, .total_field_len = context.native.total_field_len, .chunk_size = context.native.chunk_size, .version = context.native.version };
@@ -8939,7 +8979,7 @@ pub const ScopedInvertedIndexReader = struct {
     }
 
     pub fn lookup(self: *const ScopedInvertedIndexReader, term: []const u8) !?LookupResult {
-        if (self.contiguous) |reader| return reader.lookup(term);
+        if (self.contiguous) |reader| return reader.lookupChecked(term);
         const context = self.context.?;
         if (context.over_budget) return error.SegmentReadBudgetExceeded;
         const value = (try context.native.lookupValue(term, &context.dictionary)) orelse return null;
@@ -8949,7 +8989,7 @@ pub const ScopedInvertedIndexReader = struct {
     /// Frequency queries need only the dictionary address and first posting
     /// varint. Do not allocate norms, impact tables or posting navigation.
     pub fn docFrequency(self: *const ScopedInvertedIndexReader, term: []const u8) !?u32 {
-        if (self.contiguous) |reader| return if (reader.lookup(term)) |value| value.docFreq() else null;
+        if (self.contiguous) |reader| return if (try reader.lookupChecked(term)) |value| value.docFreq() else null;
         const context = self.context.?;
         const value = (try context.native.lookupValue(term, &context.dictionary)) orelse return null;
         if (fstValIs1Hit(value)) {
@@ -9241,6 +9281,11 @@ pub const ScopedInvertedIndexReader = struct {
         fn read(ptr: *anyopaque, offset: u64, output: []u8) !void {
             const self: *Context = @ptrCast(@alignCast(ptr));
             try self.view.readInto(offset, output);
+        }
+
+        fn prefetch(ptr: *anyopaque, offset: u64, length: u64) void {
+            const self: *Context = @ptrCast(@alignCast(ptr));
+            self.view.source.prefetch(self.view.offset + offset, length);
         }
 
         fn closeBorrow(_: *anyopaque) void {}
@@ -9867,4 +9912,44 @@ test "streamed positions preserve decoded prefix across packed crossover" {
             try std.testing.checkAllAllocationFailures(a, Harness.run, .{ @as([]const ?TermIterator.Entry, &entries), @as([]const []const u32, &maps) });
         }
     }
+}
+
+test "native scoped postings preserve prefetch through caches and translate section offsets" {
+    const a = std.testing.allocator;
+    var builder = InvertedIndexBuilder.init(a, .{});
+    defer builder.deinit();
+    for (0..2048) |doc| try builder.addDocument(@intCast(doc), &.{.{ .term = "common", .freq = 1 }});
+    const bytes = try builder.build();
+    defer a.free(bytes);
+    const prefix = 137;
+    const backing = try a.alloc(u8, prefix + bytes.len);
+    defer a.free(backing);
+    @memset(backing[0..prefix], 0);
+    @memcpy(backing[prefix..], bytes);
+    const State = struct {
+        bytes: []const u8,
+        hints: usize = 0,
+        fn read(raw: *anyopaque, offset: u64, out: []u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            @memcpy(out, self.bytes[@intCast(offset)..][0..out.len]);
+        }
+        fn prefetch(raw: *anyopaque, offset: u64, length: u64) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(offset >= prefix and offset + length <= self.bytes.len);
+            self.hints += 1;
+        }
+        fn close(_: *anyopaque) void {}
+    };
+    var state: State = .{ .bytes = backing };
+    const sources = @import("../segment_source.zig");
+    const source: sources.Source = .{ .ranges = .{ .ptr = &state, .length = backing.len, .read_into = State.read, .close = State.close, .prefetch = State.prefetch } };
+    var concurrent = try sources.ConcurrentBlockCache.init(a, source, 64 * 1024);
+    defer concurrent.deinit();
+    var scoped = try ScopedInvertedIndexReader.initRanges(a, try sources.View.init(concurrent.borrowedSource(), prefix, bytes.len), .{});
+    defer scoped.deinit();
+    const lookup = (try scoped.lookup("common")).?;
+    var iterator = try lookup.iterator(a);
+    defer iterator.deinit();
+    _ = try iterator.next();
+    try std.testing.expect(state.hints != 0);
 }

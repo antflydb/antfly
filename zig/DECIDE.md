@@ -38,10 +38,12 @@ instance with `decider: "support-decider"`; its configuration identifies the
 implementation with `provider: "antfly"`. Named configurations centralize
 credentials, endpoint policy, rate limits, and model settings.
 
-The initial implementation supports exactly two providers: `antfly` (Antfly
-inference) and `jev`. Both are required for the initial query-function release.
-OpenAI Decisions is in private preview and is deferred; its endpoint and schema
-are outside the initial design and implementation scope.
+The implementation supports `antfly` (Antfly inference), `jev`, and `openai`
+(OpenAI Decisions). OpenAI uses the published `/v1/decisions` contract and
+generated wire types from the vendored official OpenAPI spec. Its adapter maps
+Boolean `noul` questions to predicates and preserves Antfly’s choice and expected
+ordinal score semantics. Refusals fail evaluation through `InvalidDecisionOutput`.
+See [FUNCTIONS.md](FUNCTIONS.md) for configuration and endpoint defaults.
 
 ```text
 DecisionProvider:
@@ -96,9 +98,9 @@ traversal-time inference requires a separate frontier/work-budget contract.
 ### Query integration sequence
 
 1. Shared function descriptors and expression binding.
-2. Antfly and Jev provider adapters and bounded `DecisionEval` execution.
+2. Antfly, Jev, and OpenAI provider adapters and bounded `DecisionEval` execution.
 3. Candidate-stage JSON DSL and SQL projection/filtering.
-4. Full-match analytics using the same Antfly and Jev adapters.
+4. Full-match analytics using the same Antfly, Jev, and OpenAI adapters.
 5. Graph-match expressions and versioned materialized enrichment.
 
 Validate global candidate windows, row/batch alignment, reuse, NULLs, SQL Boolean

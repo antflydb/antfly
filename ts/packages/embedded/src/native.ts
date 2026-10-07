@@ -349,6 +349,7 @@ export interface NativeLibrary {
   >;
   inferenceGenerateBatchJson: KoffiFunc<(handle: unknown, request: object, out: object) => number>;
   inferenceRewriteJson: KoffiFunc<(handle: unknown, request: object, out: object) => number>;
+  inferenceDecideJson: KoffiFunc<(handle: unknown, request: object, out: object) => number>;
   inferenceExtractJson: KoffiFunc<(handle: unknown, request: object, out: object) => number>;
   inferenceReadJson: KoffiFunc<(handle: unknown, request: object, out: object) => number>;
   inferenceTranscribeJson: KoffiFunc<(handle: unknown, request: object, out: object) => number>;
@@ -696,6 +697,11 @@ function buildNative(): NativeLibrary {
       PAntflyBufferOut,
     ]),
     inferenceRewriteJson: f("antfly_inference_rewrite_json", "uint32_t", [
+      PAntflyInference,
+      AntflySlice,
+      PAntflyBufferOut,
+    ]),
+    inferenceDecideJson: f("antfly_inference_decide_json", "uint32_t", [
       PAntflyInference,
       AntflySlice,
       PAntflyBufferOut,

@@ -1474,7 +1474,7 @@ jobs:
           fi
           uv run --project e2e/antfly pytest --collect-only -q -p zig_e2e_shard \
             --antfly-ci-plan-output "${RUNNER_TEMP}/e2e-plan/plan.json" \
-            -m "not objectstore_integration and not standalone_integration and not real_model and not postgres_integration and not slow" e2e/antfly
+            -m "not objectstore_integration and not standalone_integration and not real_model and not postgres_integration and not iceberg_integration and not slow" e2e/antfly
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: antfly-e2e-plan-${{ github.run_id }}
@@ -2126,6 +2126,7 @@ jobs:
         if: matrix.suite == 'antfly'
         working-directory: zig
         env:
+          ANTFLY_E2E_FULL_LAKE: "1"
           ANTFLY_BIN: ./zig-out/bin/antfly
           ANTFLY_E2E_PRESERVE_ROOT_ON_FAILURE: "1"
           ANTFLY_E2E_NATIVE_STACKS: "1"

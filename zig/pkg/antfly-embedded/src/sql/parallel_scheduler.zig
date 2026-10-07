@@ -69,6 +69,17 @@ pub const Scheduler = struct {
     fn lock(self: *Scheduler) void {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
     }
+    /// Advisory fan-out; submit still arbitrates races with other statements.
+    /// One caller lane needs no lease. Every concurrent lane has a useful
+    /// minimum workspace and shares the operator's total memory allowance.
+    pub fn fanout(self: *Scheduler, work: usize, budget: usize, minimum: usize) usize {
+        self.lock();
+        defer self.mutex.unlock();
+        if (work == 0 or minimum == 0) return 1;
+        const slots = @min(8, self.max_workers -| self.workers);
+        const memory = @min(budget, self.max_bytes -| self.bytes) / minimum;
+        return @max(1, @min(work, @min(slots, memory)));
+    }
     fn acquire(self: *Scheduler, bytes: usize) bool {
         self.lock();
         defer self.mutex.unlock();
@@ -102,7 +113,10 @@ pub const Scheduler = struct {
         admission.* = .{ .scheduler = self, .bytes = bytes };
         const Worker = struct {
             fn run(control: *Admission, arguments: @TypeOf(args)) Result {
-                defer control.release();
+                defer {
+                    control.release();
+                    control.completed.store(true, .release);
+                }
                 return @call(.auto, function, arguments);
             }
         };
@@ -126,6 +140,7 @@ const Admission = struct {
     scheduler: *Scheduler,
     bytes: usize,
     released: std.atomic.Value(bool) = .init(false),
+    completed: std.atomic.Value(bool) = .init(false),
     fn release(self: *Admission) void {
         if (!self.released.swap(true, .acq_rel)) self.scheduler.release(self.bytes);
     }
@@ -143,6 +158,11 @@ pub fn Task(comptime Result: type) type {
                 self.transient = null;
             } else self.scheduler.release(self.bytes);
             self.future = null;
+        }
+        /// Completion is independent of joining and execution admission.
+        /// Only transient tasks expose this nonblocking readiness contract.
+        pub fn isComplete(self: *const @This()) bool {
+            return if (self.transient) |admission| admission.completed.load(.acquire) else self.future == null;
         }
         pub fn await(self: *@This(), io: std.Io) Result {
             defer self.release();
@@ -202,4 +222,15 @@ test "SQL completed speculative work releases admission before owner joins" {
     try second.await(std.testing.io);
     try first.await(std.testing.io);
     try std.testing.expectEqual(@as(usize, 0), scheduler.bytes);
+}
+
+test "SQL adaptive fanout respects useful work, occupied leases and workspace" {
+    var scheduler: Scheduler = .{ .max_workers = 8, .max_bytes = 1024 };
+    try std.testing.expectEqual(@as(usize, 8), scheduler.fanout(16, 1024, 128));
+    try std.testing.expectEqual(@as(usize, 3), scheduler.fanout(3, 1024, 128));
+    try std.testing.expectEqual(@as(usize, 2), scheduler.fanout(16, 256, 128));
+    try std.testing.expect(scheduler.acquire(896));
+    try std.testing.expectEqual(@as(usize, 1), scheduler.fanout(16, 1024, 128));
+    scheduler.release(896);
+    try std.testing.expectEqual(@as(usize, 8), scheduler.fanout(16, 1024, 128));
 }

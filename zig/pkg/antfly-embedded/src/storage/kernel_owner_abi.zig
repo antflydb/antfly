@@ -575,6 +575,8 @@ pub const MetadataProjectionKind = enum(u32) {
     migrate_standalone_restore_jobs = 60,
     restore_staging_authority_allowed = 61,
     merge_transition = 62,
+    lake_index_lifecycle = 66,
+    lake_index_lifecycle_work = 67,
     /// Opaque binary AFSC bytes (empty = absent), unlike JSON projections.
     secret_collection = 42,
 };
