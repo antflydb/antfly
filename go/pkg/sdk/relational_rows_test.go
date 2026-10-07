@@ -44,6 +44,30 @@ import (
 
 type relationalHTTPDoer func(*http.Request) (*http.Response, error)
 
+func TestRelationalNumericAssignmentCastBuiltinIdentity(t *testing.T) {
+	var expression RelationalScalarExpression
+	if err := json.Unmarshal([]byte(`{"op":"cast","type":"integer","sql_type":"int16","args":[{"op":"literal","type":"integer","sql_type":"int32","value":32768}]}`), &expression); err != nil {
+		t.Fatal(err)
+	}
+	if !expression.Op.Valid() || expression.Op != oapi.RelationalExpressionOpCast || expression.SqlType != oapi.SQLBuiltinTypeInt16 {
+		t.Fatalf("lost numeric cast identity: %+v", expression)
+	}
+	if len(expression.Args) != 1 || expression.Args[0].SqlType != oapi.SQLBuiltinTypeInt32 {
+		t.Fatalf("lost recursive source domain: %+v", expression.Args)
+	}
+	encoded, err := json.Marshal(expression)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var restored RelationalScalarExpression
+	if err := json.Unmarshal(encoded, &restored); err != nil {
+		t.Fatal(err)
+	}
+	if restored.SqlType != expression.SqlType || restored.Args[0].SqlType != expression.Args[0].SqlType {
+		t.Fatalf("numeric identities changed after transport: %s", encoded)
+	}
+}
+
 func (fn relationalHTTPDoer) Do(req *http.Request) (*http.Response, error) { return fn(req) }
 
 func TestRelationalRowQueryPreservesExactInteger(t *testing.T) {

@@ -784,6 +784,7 @@ pub const RelationalExpressionOp = enum {
     @"and",
     @"or",
     not,
+    cast,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
@@ -811,6 +812,7 @@ pub const RelationalExpressionOp = enum {
             .@"and" => "and",
             .@"or" => "or",
             .not => "not",
+            .cast => "cast",
         };
         try jw.write(s);
     }
@@ -845,6 +847,7 @@ pub const RelationalExpressionOp = enum {
             .{ "and", .@"and" },
             .{ "or", .@"or" },
             .{ "not", .not },
+            .{ "cast", .cast },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
@@ -1267,10 +1270,12 @@ pub const RelationalIndexPredicate = struct {
     }
 };
 
-/// Immutable typed scalar expression, limited to 128 nodes and 16 levels. A literal requires type; omitted value means typed null. A column requires column; other operations require args. Unknown or irrelevant fields are rejected. Arithmetic operands have the same integer or number type. Integer division truncates toward zero. Overflow and division by zero reject the write. Arithmetic and string operations propagate null. ASCII case operations leave non-ASCII bytes unchanged. No volatile functions are accepted. Allocated results are bounded to 1 MiB each. Allocations and byte-comparison operand work share a 4 MiB evaluation budget per row and expression set. An integer literal may use a decimal string for exact int64 transport; blob uses base64 and datetime uses the normal relational datetime representation. Comparisons require operands of the same type and return boolean or SQL UNKNOWN (null); is_distinct and is_not_distinct always return a boolean. Unary is_null and is_not_null test presence/null. AND and OR evaluate left to right with SQL three-valued short-circuit semantics; NOT preserves UNKNOWN. CHECK accepts TRUE and UNKNOWN, rejecting FALSE.
+/// Immutable typed scalar expression, limited to 128 nodes and 16 levels. A literal requires type; omitted value means typed null. A column requires column; other operations require args. Unknown or irrelevant fields are rejected. Arithmetic operands have the same integer or number type. Integer division truncates toward zero. Overflow and division by zero reject the write. Arithmetic and string operations propagate null. ASCII case operations leave non-ASCII bytes unchanged. No volatile functions are accepted. Allocated results are bounded to 1 MiB each. Allocations and byte-comparison operand work share a 4 MiB evaluation budget per row and expression set. An integer literal may use a decimal string for exact int64 transport; blob uses base64 and datetime uses the normal relational datetime representation. Comparisons require operands of the same type and return boolean or SQL UNKNOWN (null); is_distinct and is_not_distinct always return a boolean. Unary is_null and is_not_null test presence/null. AND and OR evaluate left to right with SQL three-valued short-circuit semantics; NOT preserves UNKNOWN. CHECK accepts TRUE and UNKNOWN, rejecting FALSE. Numeric literals and arithmetic operations may specify sql_type to retain PostgreSQL builtin overflow and float4 rounding semantics. Without it, integer and number operations retain int64 and float64 semantics. Numeric cast requires type and sql_type, takes one numeric argument, and performs a checked conversion when evaluated (not when the schema is compiled). Floating-to-integer casts round ties to even. Only int16/int32/int64/float32/float64 identities are accepted here.
 pub const RelationalScalarExpression = struct {
     op: RelationalExpressionOp,
     type: ?RelationalExpressionType = null,
+    /// Numeric builtin result identity; accepted only on numeric literals, arithmetic, negate, and cast. Requires schema capability version 18.
+    sql_type: ?SQLBuiltinType = null,
     /// Typed literal value, including null.
     value: ?std.json.Value = null,
     column: ?[]const u8 = null,
@@ -1282,6 +1287,7 @@ pub const RelationalScalarExpression = struct {
     pub const openApiFieldMetadata = .{
         .{ "op", "op", false },
         .{ "type", "type", true },
+        .{ "sql_type", "sql_type", true },
         .{ "value", "value", true },
         .{ "column", "column", true },
         .{ "collation", "collation", true },
@@ -1302,6 +1308,10 @@ pub const RelationalScalarExpression = struct {
         try jw.write(self.op);
         if (self.type) |value| {
             try jw.objectField("type");
+            try jw.write(value);
+        }
+        if (self.sql_type) |value| {
+            try jw.objectField("sql_type");
             try jw.write(value);
         }
         if (self.value) |value| {

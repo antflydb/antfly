@@ -27269,6 +27269,7 @@ components:
         - and
         - or
         - not
+        - cast
     RelationalExpressionType:
       type: string
       enum:
@@ -27278,6 +27279,30 @@ components:
         - datetime
         - integer
         - number
+    SQLBuiltinType:
+      type: string
+      description: >
+        Exact PostgreSQL builtin identity for a relational root scalar column
+
+        or the element identity of a `sql_array` column.
+
+        Set the JSON Schema property's `x-antfly-sql-type` annotation to one of
+
+        these values. The underlying property type must match. SQL array storage
+
+        is not implied by this annotation. Existing unannotated schemas retain
+
+        their original domains.
+      enum:
+        - text
+        - int16
+        - int32
+        - int64
+        - float32
+        - float64
+        - boolean
+        - uuid
+        - jsonb
     RelationalScalarExpression:
       type: object
       additionalProperties: false
@@ -27319,11 +27344,29 @@ components:
         evaluate left to right with SQL three-valued short-circuit semantics;
 
         NOT preserves UNKNOWN. CHECK accepts TRUE and UNKNOWN, rejecting FALSE.
+
+        Numeric literals and arithmetic operations may specify sql_type to
+
+        retain PostgreSQL builtin overflow and float4 rounding semantics.
+
+        Without it, integer and number operations retain int64 and float64
+
+        semantics. Numeric cast requires type and sql_type, takes one numeric
+
+        argument, and performs a checked conversion when evaluated (not when
+
+        the schema is compiled). Floating-to-integer casts round ties to even.
+
+        Only int16/int32/int64/float32/float64 identities are accepted here.
       properties:
         op:
           $ref: '#/components/schemas/RelationalExpressionOp'
         type:
           $ref: '#/components/schemas/RelationalExpressionType'
+        sql_type:
+          $ref: '#/components/schemas/SQLBuiltinType'
+          description: Numeric builtin result identity; accepted only on numeric literals, arithmetic,
+            negate, and cast. Requires schema capability version 18.
         value:
           description: Typed literal value, including null.
         column:
@@ -28092,30 +28135,6 @@ components:
             text title can expose a sortable keyword subfield.
           additionalProperties:
             $ref: '#/components/schemas/DocumentSubfieldMapping'
-    SQLBuiltinType:
-      type: string
-      description: >
-        Exact PostgreSQL builtin identity for a relational root scalar column
-
-        or the element identity of a `sql_array` column.
-
-        Set the JSON Schema property's `x-antfly-sql-type` annotation to one of
-
-        these values. The underlying property type must match. SQL array storage
-
-        is not implied by this annotation. Existing unannotated schemas retain
-
-        their original domains.
-      enum:
-        - text
-        - int16
-        - int32
-        - int64
-        - float32
-        - float64
-        - boolean
-        - uuid
-        - jsonb
     SQLArrayColumnSchema:
       type: object
       additionalProperties: true

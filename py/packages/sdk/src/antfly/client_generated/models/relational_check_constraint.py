@@ -50,6 +50,13 @@ class RelationalCheckConstraint:
                 boolean. Unary is_null and is_not_null test presence/null. AND and OR
                 evaluate left to right with SQL three-valued short-circuit semantics;
                 NOT preserves UNKNOWN. CHECK accepts TRUE and UNKNOWN, rejecting FALSE.
+                Numeric literals and arithmetic operations may specify sql_type to
+                retain PostgreSQL builtin overflow and float4 rounding semantics.
+                Without it, integer and number operations retain int64 and float64
+                semantics. Numeric cast requires type and sql_type, takes one numeric
+                argument, and performs a checked conversion when evaluated (not when
+                the schema is compiled). Floating-to-integer casts round ties to even.
+                Only int16/int32/int64/float32/float64 identities are accepted here.
     """
 
     name: str

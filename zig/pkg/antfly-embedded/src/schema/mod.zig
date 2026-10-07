@@ -762,6 +762,41 @@ pub const documentDateTimeToNs = impl.documentDateTimeToNs;
 pub const documentIntegerToI64 = impl.documentIntegerToI64;
 pub const documentNumberToF64 = impl.documentNumberToF64;
 
+fn typedNumericJson(expression: std.json.Value, depth: usize) bool {
+    if (depth > 16 or expression != .object) return false;
+    if (expression.object.contains("sql_type")) return true;
+    if (expression.object.get("op")) |op| if (op == .string and std.mem.eql(u8, op.string, "cast")) return true;
+    if (expression.object.get("args")) |args| if (args == .array) for (args.array.items) |arg| {
+        if (typedNumericJson(arg, depth + 1)) return true;
+    };
+    return false;
+}
+
+fn typedNumericWire(expression: anytype, depth: usize) bool {
+    if (depth > 16) return false;
+    if (expression.sql_type != null or expression.op == .cast) return true;
+    if (expression.args) |args| for (args) |arg| if (typedNumericWire(arg, depth + 1)) return true;
+    return false;
+}
+
+fn requiresTypedExpressions(schema: ParsedTableSchema) bool {
+    if (schema.checks) |checks| for (checks.value) |check| if (check.expression) |expression| {
+        if (typedNumericWire(expression, 0)) return true;
+    };
+    if (schema.relational_indexes) |indexes| for (indexes.value) |index| {
+        for (index.keys) |key| if (key.expression) |expression| if (typedNumericWire(expression, 0)) return true;
+    };
+    if (schema.unique_constraints) |constraints| for (constraints.value) |constraint| if (constraint.keys) |keys| {
+        for (keys) |key| if (key.expression) |expression| if (typedNumericWire(expression, 0)) return true;
+    };
+    for ([_]?std.json.Parsed(std.json.Value){ schema.column_defaults, schema.generated_columns }) |definitions| if (definitions) |declarations| {
+        if (declarations.value == .array) for (declarations.value.array.items) |entry| {
+            if (entry == .object) if (entry.object.get("expression")) |expression| if (typedNumericJson(expression, 0)) return true;
+        };
+    };
+    return false;
+}
+
 pub fn deriveRuntimeTableSchema(alloc: std.mem.Allocator, schema: ParsedTableSchema) !storage_schema.TableSchema {
     const exact_fields = try deriveRuntimeExactDocumentFields(alloc, schema);
     errdefer freeRuntimeExactFields(alloc, exact_fields);
@@ -845,6 +880,7 @@ pub fn deriveRuntimeTableSchema(alloc: std.mem.Allocator, schema: ParsedTableSch
         .ttl_field = ttl_field,
         .enforce_types = schema.enforce_types,
         .requires_public_schema = schema.storage_mode == .relational,
+        .requires_typed_expressions = requiresTypedExpressions(schema),
         .storage_mode = switch (schema.storage_mode) {
             .document => .document,
             .relational => .relational,

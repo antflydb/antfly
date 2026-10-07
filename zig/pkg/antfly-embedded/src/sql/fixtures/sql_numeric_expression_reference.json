@@ -1,0 +1,22 @@
+{
+  "reference": "PostgreSQL finite builtin numeric expression domains; same expressions execute through the query binder and durable native expression VM",
+  "entries": [
+    {"sql":"n+n","expected":2},
+    {"sql":"n+n","n":30000,"error":"22003"},
+    {"sql":"i+1","i":2147483647,"error":"22003"},
+    {"sql":"-n","n":-32768,"error":"22003"},
+    {"sql":"n/CAST(-1 AS smallint)","n":-32768,"error":"22003"},
+    {"sql":"n / -1","n":-32768,"expected":32768},
+    {"sql":"COALESCE(n,n)+n","n":30000,"error":"22003"},
+    {"sql":"CAST(i AS smallint)","i":32768,"error":"22003"},
+    {"sql":"CAST(d AS smallint)","d":2.5,"expected":2},
+    {"sql":"CAST(d AS smallint)","d":3.5,"expected":4},
+    {"sql":"CAST(d AS smallint)","d":-2.5,"expected":-2},
+    {"sql":"CAST(d AS smallint)","d":32767.5,"error":"22003"},
+    {"sql":"(f+CAST(1 AS real))-f","expected":0.0},
+    {"sql":"CAST(b AS real)","expected":9007199254740992.0},
+    {"sql":"CAST(CAST(d AS real) AS double precision)","d":0.1,"expected":0.10000000149011612},
+    {"sql":"false AND n+n>0","n":30000,"expected":false},
+    {"sql":"1/(i-i)","error":"22012"}
+  ]
+}

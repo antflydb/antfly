@@ -20,6 +20,8 @@ from .aggregation_request import AggregationRequest
 from .aggregation_request_sub_aggregations import AggregationRequestSubAggregations
 from .aggregation_result import AggregationResult
 from .aggregation_type import AggregationType
+from .algebraic_aggregate_config import AlgebraicAggregateConfig
+from .algebraic_aggregate_config_op import AlgebraicAggregateConfigOp
 from .algebraic_aggregation_join import AlgebraicAggregationJoin
 from .algebraic_aggregation_join_kind import AlgebraicAggregationJoinKind
 from .algebraic_index_config import AlgebraicIndexConfig
@@ -309,6 +311,7 @@ from .external_lake_snapshot_selector_mode import ExternalLakeSnapshotSelectorMo
 from .external_lake_table_source import ExternalLakeTableSource
 from .external_lake_table_source_format import ExternalLakeTableSourceFormat
 from .external_lake_table_source_kind import ExternalLakeTableSourceKind
+from .external_lake_table_source_object_mutability import ExternalLakeTableSourceObjectMutability
 from .external_lake_table_source_write_policy import ExternalLakeTableSourceWritePolicy
 from .extraction_attribute_group import ExtractionAttributeGroup
 from .extraction_attribute_label import ExtractionAttributeLabel
@@ -1449,6 +1452,8 @@ __all__ = (
     "AggregationRequestSubAggregations",
     "AggregationResult",
     "AggregationType",
+    "AlgebraicAggregateConfig",
+    "AlgebraicAggregateConfigOp",
     "AlgebraicAggregationJoin",
     "AlgebraicAggregationJoinKind",
     "AlgebraicIndexConfig",
@@ -1736,6 +1741,7 @@ __all__ = (
     "ExternalLakeTableSource",
     "ExternalLakeTableSourceFormat",
     "ExternalLakeTableSourceKind",
+    "ExternalLakeTableSourceObjectMutability",
     "ExternalLakeTableSourceWritePolicy",
     "ExtractionAttributeGroup",
     "ExtractionAttributeLabel",

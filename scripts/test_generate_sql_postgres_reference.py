@@ -86,6 +86,41 @@ class PostgresReferenceTest(unittest.TestCase):
                     self.db.execute("SELECT " + case["expression"]).fetchone()[0],
                 )
 
+    def test_durable_numeric_expression_builtin_domains(self):
+        import json
+        import psycopg
+
+        fixture = json.loads(
+            (FIXTURES / "sql_numeric_expression_reference.json").read_text()
+        )
+        for entry in fixture["entries"]:
+            with self.subTest(
+                sql=entry["sql"], n=entry.get("n"), i=entry.get("i"), d=entry.get("d")
+            ):
+                with self.db.transaction(force_rollback=True):
+                    self.db.execute(
+                        "CREATE TABLE numeric_probe(n smallint,i integer,b bigint,f real,d double precision)"
+                    )
+                    self.db.execute(
+                        "INSERT INTO numeric_probe VALUES (%s,%s,9007199254740993,16777216,%s)",
+                        (entry.get("n", 1), entry.get("i", 1), entry.get("d", 2.5)),
+                    )
+                    if "error" in entry:
+                        with self.assertRaises(psycopg.Error) as error:
+                            with self.db.transaction():
+                                self.db.execute(
+                                    "SELECT " + entry["sql"] + " FROM numeric_probe"
+                                ).fetchall()
+                        self.assertEqual(entry["error"], error.exception.sqlstate)
+                    else:
+                        # float4 text is shortest-roundtrip for float4, not for
+                        # Python's float64. Compare the actual binary value.
+                        with self.db.cursor(binary=True) as cursor:
+                            cursor.execute(
+                                "SELECT " + entry["sql"] + " FROM numeric_probe"
+                            )
+                            self.assertEqual(entry["expected"], cursor.fetchone()[0])
+
     def test_nullable_catalog_check_index_and_precise_default_contract(self):
         import psycopg
 
@@ -115,14 +150,14 @@ class PostgresReferenceTest(unittest.TestCase):
                             self.db.execute(
                                 "INSERT INTO items VALUES (%s,%s,NULL)", (n, label)
                             )
-            # PostgreSQL retains the assignment cast and raises at use; the
-            # current native literal-default VM instead rejects at DDL bind.
+            # Assignment casts are retained and raise only when the default
+            # is used, not while publishing the schema.
             self.db.execute("ALTER TABLE items ALTER COLUMN n SET DEFAULT 32768")
             with self.assertRaises(psycopg.errors.NumericValueOutOfRange):
                 with self.db.transaction():
                     self.db.execute("INSERT INTO items(label) VALUES ('READY')")
             self.db.execute("ALTER TABLE items ALTER COLUMN n SET DEFAULT 7")
-            # The durable native expression VM must not silently widen this.
+            # The durable native expression VM must retain this narrow domain.
             self.db.execute("INSERT INTO items VALUES (32767,'READY',NULL)")
             with self.assertRaises(psycopg.errors.NumericValueOutOfRange):
                 with self.db.transaction():

@@ -141,6 +141,7 @@ pub const Catalog = struct {
             if (self.schema_format_version < 17) for (schema.relational_columns) |column| {
                 if (column.column_type == .sql_array) return error.UnsupportedTableCapabilityVersion;
             };
+            if (self.schema_format_version < 18 and schema.requires_typed_expressions) return error.UnsupportedTableCapabilityVersion;
             return;
         }
         if (self.storage_mode != .document or self.active_schema_version != 0)
@@ -155,6 +156,14 @@ pub fn load(alloc: std.mem.Allocator, store: anytype) !?Catalog {
     };
     defer alloc.free(raw);
     return try Catalog.decode(raw);
+}
+
+test "relational index system SQL catalog fences typed expression capability without precise columns" {
+    const table: schema_mod.TableSchema = .{ .version = 1, .storage_mode = .relational, .requires_public_schema = true, .requires_typed_expressions = true, .relational_columns = &.{.{ .name = "n", .path = "n", .column_type = .integer }} };
+    var catalog: Catalog = .{ .schema_format_version = 17, .mode_initialized = true, .storage_mode = .relational, .active_schema_version = 1 };
+    try std.testing.expectError(error.UnsupportedTableCapabilityVersion, catalog.validateForSchema(table));
+    catalog.schema_format_version = schema_mod.storage_format_version;
+    try catalog.validateForSchema(table);
 }
 
 test "relational index system SQL catalog admits deployed schemas but fences precise type capabilities" {

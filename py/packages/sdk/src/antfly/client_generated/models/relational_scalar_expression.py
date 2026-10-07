@@ -7,6 +7,7 @@ from attrs import define as _attrs_define
 
 from ..models.relational_expression_op import RelationalExpressionOp
 from ..models.relational_expression_type import RelationalExpressionType
+from ..models.sql_builtin_type import SQLBuiltinType
 from ..types import UNSET, Unset
 
 T = TypeVar("T", bound="RelationalScalarExpression")
@@ -32,10 +33,23 @@ class RelationalScalarExpression:
     boolean. Unary is_null and is_not_null test presence/null. AND and OR
     evaluate left to right with SQL three-valued short-circuit semantics;
     NOT preserves UNKNOWN. CHECK accepts TRUE and UNKNOWN, rejecting FALSE.
+    Numeric literals and arithmetic operations may specify sql_type to
+    retain PostgreSQL builtin overflow and float4 rounding semantics.
+    Without it, integer and number operations retain int64 and float64
+    semantics. Numeric cast requires type and sql_type, takes one numeric
+    argument, and performs a checked conversion when evaluated (not when
+    the schema is compiled). Floating-to-integer casts round ties to even.
+    Only int16/int32/int64/float32/float64 identities are accepted here.
 
         Attributes:
             op (RelationalExpressionOp):
             type_ (RelationalExpressionType | Unset):
+            sql_type (SQLBuiltinType | Unset): Exact PostgreSQL builtin identity for a relational root scalar column
+                or the element identity of a `sql_array` column.
+                Set the JSON Schema property's `x-antfly-sql-type` annotation to one of
+                these values. The underlying property type must match. SQL array storage
+                is not implied by this annotation. Existing unannotated schemas retain
+                their original domains.
             value (Any | Unset): Typed literal value, including null.
             column (str | Unset):
             collation (str | Unset): Optional binary or ASCII case-insensitive collation for binary string comparison
@@ -45,6 +59,7 @@ class RelationalScalarExpression:
 
     op: RelationalExpressionOp
     type_: RelationalExpressionType | Unset = UNSET
+    sql_type: SQLBuiltinType | Unset = UNSET
     value: Any | Unset = UNSET
     column: str | Unset = UNSET
     collation: str | Unset = UNSET
@@ -56,6 +71,10 @@ class RelationalScalarExpression:
         type_: str | Unset = UNSET
         if not isinstance(self.type_, Unset):
             type_ = self.type_.value
+
+        sql_type: str | Unset = UNSET
+        if not isinstance(self.sql_type, Unset):
+            sql_type = self.sql_type.value
 
         value = self.value
 
@@ -79,6 +98,8 @@ class RelationalScalarExpression:
         )
         if type_ is not UNSET:
             field_dict["type"] = type_
+        if sql_type is not UNSET:
+            field_dict["sql_type"] = sql_type
         if value is not UNSET:
             field_dict["value"] = value
         if column is not UNSET:
@@ -102,6 +123,13 @@ class RelationalScalarExpression:
         else:
             type_ = RelationalExpressionType(_type_)
 
+        _sql_type = d.pop("sql_type", UNSET)
+        sql_type: SQLBuiltinType | Unset
+        if isinstance(_sql_type, Unset):
+            sql_type = UNSET
+        else:
+            sql_type = SQLBuiltinType(_sql_type)
+
         value = d.pop("value", UNSET)
 
         column = d.pop("column", UNSET)
@@ -120,6 +148,7 @@ class RelationalScalarExpression:
         relational_scalar_expression = cls(
             op=op,
             type_=type_,
+            sql_type=sql_type,
             value=value,
             column=column,
             collation=collation,

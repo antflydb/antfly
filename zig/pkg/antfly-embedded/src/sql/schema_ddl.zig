@@ -232,8 +232,8 @@ pub fn apply(alloc: std.mem.Allocator, schema: *Value, ddl: ast.CatalogDdl) !boo
                     const column = try @import("schema_columns.zig").column(column_name, property);
                     const element = column.element_type;
                     const column_type = column.type;
-                    const literal = try @import("ddl_runtime.zig").bindDefault(alloc, change.set_default.value, column_type, element);
-                    replacement = try value(alloc, .{ .column = column_name, .expression = .{ .op = "literal", .type = if (column_type == .uuid) "string" else @tagName(column_type), .value = literal } });
+                    const expression = try @import("ddl_runtime.zig").defaultExpression(alloc, change.set_default.value, column_type, element);
+                    replacement = try value(alloc, .{ .column = column_name, .expression = expression });
                 }
                 const defaults = try list(schema, alloc, "column_defaults");
                 if (replacement != null) try defaults.ensureUnusedCapacity(1);

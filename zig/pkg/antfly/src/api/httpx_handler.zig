@@ -13498,11 +13498,62 @@ test "httpx SQL catalog expressions preserve nullable typed schemas through nati
     var nullable = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"n\":null,\"label\":\"READY\"}", .{});
     try validator.prepareValue(a, alloc, &nullable);
     try std.testing.expect(nullable.object.get("n").? == .null);
-    // A later invalid default cannot replace the admitted one.
+    // Numeric assignment casts are admitted durably; overflow occurs only
+    // when the default is used, exactly as in PostgreSQL.
     var overflow = try sources.sql_compiler.compile(a, "ALTER TABLE items ALTER COLUMN n SET DEFAULT 32768", .{});
     defer overflow.deinit();
-    try std.testing.expectError(error.SqlNumericOutOfRange, sources.sql_schema_ddl.apply(a, &schema, overflow.statement.catalog_ddl));
-    try std.testing.expectEqualStrings(bytes, try std.json.Stringify.valueAlloc(a, schema, .{}));
+    try std.testing.expect(try sources.sql_schema_ddl.apply(a, &schema, overflow.statement.catalog_ddl));
+    var deferred = try sources.schema_mod.CompiledTableValidator.init(alloc, try std.json.Stringify.valueAlloc(a, schema, .{}));
+    defer deferred.deinit(alloc);
+    var missing = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"label\":\"READY\"}", .{});
+    try std.testing.expectError(error.RelationalExpressionOverflow, deferred.prepareValue(a, alloc, &missing));
+    var explicit = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"n\":1,\"label\":\"READY\"}", .{});
+    try deferred.prepareValue(a, alloc, &explicit);
+}
+
+test "httpx SQL numeric expression schemas preserve deferred defaults atomic writes and restore" {
+    const alloc = std.testing.allocator;
+    const sources = @import("antfly_local_sources");
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var compiled = try sources.sql_compiler.compile(a, "CREATE TABLE items (n smallint DEFAULT 32768, f real DEFAULT 0.1, CONSTRAINT sum_positive CHECK (n+n>0))", .{});
+    defer compiled.deinit();
+    const schema = try sources.sql_ddl_runtime.createSchemaAlloc(a, compiled.statement.create_table);
+    var directory = try sources.common_test_directory.TestDirectory.init("sql-numeric-expressions");
+    defer directory.cleanup();
+    var target = try sources.common_test_directory.TestDirectory.init("sql-numeric-expressions-restore");
+    defer target.cleanup();
+    var archive: std.ArrayListUnmanaged(u8) = .empty;
+    defer archive.deinit(alloc);
+    {
+        var db = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false, .primary_backend = .{ .lsm = .{} } });
+        defer db.close();
+        try db.setSchemaJson(alloc, schema);
+        try std.testing.expect(db.core.schema.?.requires_typed_expressions);
+        try std.testing.expectError(error.RelationalExpressionOverflow, db.batch(.{ .writes = &.{ .{ .key = "not-committed", .value = "{\"n\":1}" }, .{ .key = "bad-default", .value = "{}" } } }));
+        try std.testing.expect((try db.get(alloc, "not-committed")) == null);
+        try db.batch(.{ .writes = &.{.{ .key = "kept", .value = "{\"n\":1}" }} });
+        try std.testing.expectError(error.RelationalExpressionOverflow, db.batch(.{ .writes = &.{ .{ .key = "not-committed", .value = "{\"n\":2}" }, .{ .key = "bad-check", .value = "{\"n\":30000}" } } }));
+        try std.testing.expect((try db.get(alloc, "not-committed")) == null);
+        try sources.storage_portable_backup.exportPortable(alloc, db.core.store, &archive);
+    }
+    var reopened = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false, .primary_backend = .{ .lsm = .{} } });
+    defer reopened.close();
+    var restored = try db_mod.DB.open(alloc, target.path(), .{ .start_optional_runtimes = false, .start_index_workers = false, .primary_backend = .{ .lsm = .{} } });
+    defer restored.close();
+    try restored.importPortableIntoEmpty(alloc, archive.items, sources.storage_db_doc_identity.default_namespace);
+    for ([_]*db_mod.DB{ &reopened, &restored }) |db| {
+        try std.testing.expect(db.core.schema.?.requires_typed_expressions);
+        try std.testing.expectEqual(sources.storage_schema.storage_format_version, db.core.table_catalog.schema_format_version);
+        const bytes = (try db.get(alloc, "kept")).?;
+        defer alloc.free(bytes);
+        const row = try std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{});
+        try std.testing.expectEqual(@as(i64, 1), row.object.get("n").?.integer);
+        try std.testing.expectEqual(@as(f64, @as(f32, 0.1)), row.object.get("f").?.float);
+        try std.testing.expectError(error.RelationalExpressionOverflow, db.batch(.{ .writes = &.{.{ .key = "bad-default", .value = "{}" }} }));
+        try std.testing.expectError(error.RelationalExpressionOverflow, db.batch(.{ .writes = &.{.{ .key = "bad-check", .value = "{\"n\":30000}" }} }));
+    }
 }
 
 test "httpx SQL PostgreSQL mutations capture native source relations and complete storage" {

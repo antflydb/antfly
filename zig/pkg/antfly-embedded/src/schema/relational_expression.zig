@@ -22,12 +22,14 @@ const codec = @import("../storage/db/algebraic/relational_row_codec.zig");
 pub const Value = @import("../storage/db/relational_index_keys.zig").Value;
 pub const Kind = schema.RelationalColumnType;
 const Allocator = std.mem.Allocator;
+const Numeric = @import("../common/sql_builtin_type.zig").Type;
+const casts = @import("../sql/builtin_cast.zig");
 pub const max_nodes = 128;
 pub const max_depth = 16;
 pub const max_output_bytes = 1024 * 1024;
 pub const max_allocated_bytes = 4 * max_output_bytes;
 
-const Op = enum { literal, column, add, subtract, multiply, divide, negate, concat, coalesce, lower_ascii, upper_ascii, eq, ne, gt, gte, lt, lte, is_null, is_not_null, is_distinct, is_not_distinct, @"and", @"or", not };
+const Op = enum { literal, column, add, subtract, multiply, divide, negate, concat, coalesce, lower_ascii, upper_ascii, eq, ne, gt, gte, lt, lte, is_null, is_not_null, is_distinct, is_not_distinct, @"and", @"or", not, cast };
 const Node = struct {
     op: Op,
     kind: Kind,
@@ -36,6 +38,7 @@ const Node = struct {
     column_name: []const u8 = "",
     fold_ascii: bool = false,
     literal: Value = .null,
+    sql_type: ?Numeric = null,
 };
 
 pub const Plan = struct {
@@ -197,9 +200,10 @@ pub const Plan = struct {
         const a = operands[0];
         switch (node.op) {
             .not => return .{ .boolean = !a.boolean },
+            .cast => return numericCast(a, node.sql_type.?),
             .negate => return switch (a) {
-                .integer => |v| .{ .integer = std.math.sub(i64, 0, v) catch return error.RelationalExpressionOverflow },
-                .number => |v| finite(-v),
+                .integer => |v| numericCast(.{ .integer = std.math.sub(i64, 0, v) catch return error.RelationalExpressionOverflow }, node.sql_type orelse .int64),
+                .number => |v| numericCast(.{ .number = -v }, node.sql_type orelse .float64),
                 else => unreachable,
             },
             .add, .subtract, .multiply, .divide => {
@@ -216,16 +220,24 @@ pub const Plan = struct {
                         },
                         else => unreachable,
                     } catch return error.RelationalExpressionOverflow;
-                    return .{ .integer = result };
+                    return numericCast(.{ .integer = result }, node.sql_type orelse .int64);
                 }
                 if (node.op == .divide and b.number == 0) return error.RelationalExpressionDivisionByZero;
-                return finite(switch (node.op) {
+                const result = switch (node.op) {
                     .add => a.number + b.number,
                     .subtract => a.number - b.number,
                     .multiply => a.number * b.number,
                     .divide => a.number / b.number,
                     else => unreachable,
-                });
+                };
+                if (node.sql_type == .float32) {
+                    // A float4 operation rounds its result once, independently
+                    // of subsequent promotion to a wider expression domain.
+                    const rounded = try numericCast(.{ .number = result }, .float32);
+                    if (rounded.number == 0 and a.number != 0 and b.number != 0 and (node.op == .multiply or node.op == .divide)) return error.RelationalExpressionOverflow;
+                    return rounded;
+                }
+                return finite(result);
             },
             .concat => {
                 var size: usize = 0;
@@ -247,6 +259,26 @@ pub const Plan = struct {
         }
     }
 };
+
+fn numericCast(value: Value, target: Numeric) !Value {
+    if (value == .null) return .null;
+    if (casts.integral(target)) return .{ .integer = switch (value) {
+        .integer => |v| casts.checkedInteger(v, target) catch return error.RelationalExpressionOverflow,
+        .number => |v| casts.floatingInteger(v, target) catch return error.RelationalExpressionOverflow,
+        else => return error.InvalidRelationalExpressionInput,
+    } };
+    const raw: std.json.Value = switch (value) {
+        .integer => |v| .{ .integer = v },
+        .number => |v| .{ .float = v },
+        else => return error.InvalidRelationalExpressionInput,
+    };
+    return if (target == .float32)
+        .{ .number = casts.floatValue(f32, raw) catch return error.RelationalExpressionOverflow }
+    else if (target == .float64)
+        finite(casts.floatValue(f64, raw) catch return error.RelationalExpressionOverflow)
+    else
+        error.InvalidRelationalExpressionType;
+}
 
 fn allocateOutput(alloc: Allocator, size: usize, budget: *usize) ![]u8 {
     if (size > max_output_bytes or size > budget.*) return error.RelationalExpressionBudgetExceeded;
@@ -320,8 +352,10 @@ const Compiler = struct {
             const name = field.key_ptr.*;
             if (std.mem.eql(u8, name, "op")) continue;
             const allowed = switch (op) {
-                .literal => std.mem.eql(u8, name, "type") or std.mem.eql(u8, name, "value"),
+                .literal => std.mem.eql(u8, name, "type") or std.mem.eql(u8, name, "value") or std.mem.eql(u8, name, "sql_type"),
                 .column => std.mem.eql(u8, name, "column"),
+                .cast => std.mem.eql(u8, name, "args") or std.mem.eql(u8, name, "type") or std.mem.eql(u8, name, "sql_type"),
+                .add, .subtract, .multiply, .divide, .negate => std.mem.eql(u8, name, "args") or std.mem.eql(u8, name, "sql_type"),
                 else => std.mem.eql(u8, name, "args") or (isComparison(op) and std.mem.eql(u8, name, "collation")),
             };
             if (!allowed) return error.InvalidRelationalExpression;
@@ -389,6 +423,7 @@ const Compiler = struct {
                     if (std.mem.eql(u8, column.name, name.string)) break @intCast(ordinal);
                 } else return error.RelationalIndexColumnNotFound;
                 node.kind = self.table.relational_columns[node.ordinal].column_type;
+                node.sql_type = self.table.relational_columns[node.ordinal].sql_element_type;
                 switch (node.kind) {
                     .string, .blob, .boolean, .datetime, .integer, .number => {},
                     else => return error.InvalidRelationalExpressionType,
@@ -406,7 +441,7 @@ const Compiler = struct {
                 if (args != .array) return error.InvalidRelationalExpression;
                 const length = args.array.items.len;
                 const valid = switch (op) {
-                    .negate, .lower_ascii, .upper_ascii, .not, .is_null, .is_not_null => length == 1,
+                    .negate, .lower_ascii, .upper_ascii, .not, .is_null, .is_not_null, .cast => length == 1,
                     .concat, .coalesce, .@"and", .@"or" => length >= 2 and length <= 32,
                     else => length == 2,
                 };
@@ -428,9 +463,24 @@ const Compiler = struct {
                     node.kind = .boolean;
                 }
                 switch (op) {
+                    .cast => {
+                        if (node.kind != .integer and node.kind != .number) return error.InvalidRelationalExpressionType;
+                        const kind = input.object.get("type") orelse return error.InvalidRelationalExpression;
+                        if (kind != .string) return error.InvalidRelationalExpression;
+                        node.kind = std.meta.stringToEnum(Kind, kind.string) orelse return error.InvalidRelationalExpressionType;
+                        if (input.object.get("sql_type") == null) return error.InvalidRelationalExpression;
+                    },
                     .add, .subtract, .multiply, .divide, .negate => if (node.kind != .integer and node.kind != .number) return error.InvalidRelationalExpressionType,
                     .concat, .lower_ascii, .upper_ascii => if (node.kind != .string) return error.InvalidRelationalExpressionType,
-                    .coalesce => {},
+                    .coalesce => {
+                        if (node.kind == .integer or node.kind == .number) {
+                            const identity = numericIdentity(self.nodes.items[children[0]]);
+                            const same = for (children[1..]) |child| {
+                                if (numericIdentity(self.nodes.items[child]) != identity) break false;
+                            } else true;
+                            if (same) node.sql_type = identity;
+                        }
+                    },
                     .@"and", .@"or", .not => if (node.kind != .boolean) return error.InvalidRelationalExpressionType,
                     .is_null, .is_not_null => node.kind = .boolean,
                     .eq, .ne, .gt, .gte, .lt, .lte, .is_distinct, .is_not_distinct => {},
@@ -438,11 +488,72 @@ const Compiler = struct {
                 }
             },
         }
+        if (input.object.get("sql_type")) |identity| {
+            if (identity != .string) return error.InvalidRelationalExpressionType;
+            const typed = std.meta.stringToEnum(Numeric, identity.string) orelse return error.InvalidRelationalExpressionType;
+            if ((node.kind != .integer or !casts.integral(typed)) and (node.kind != .number or !casts.floating(typed))) return error.InvalidRelationalExpressionType;
+            node.sql_type = typed;
+            if (op == .literal) node.literal = numericCast(node.literal, typed) catch return error.InvalidRelationalExpressionType;
+            // Do not change fingerprints of historical unannotated programs.
+            // Typed operations/casts have a distinct, immutable semantic key.
+            self.frame("SQL numeric expression identity v1");
+            self.frame(@tagName(typed));
+            if (op == .add or op == .subtract or op == .multiply or op == .divide or op == .negate) {
+                for (node.children) |child| if (numericIdentity(self.nodes.items[child]) != typed) return error.InvalidRelationalExpressionType;
+            }
+        }
         const index: u16 = @intCast(self.nodes.items.len);
         try self.nodes.append(self.alloc, node);
         return index;
     }
 };
+
+fn numericIdentity(node: Node) Numeric {
+    return node.sql_type orelse if (node.kind == .integer) .int64 else .float64;
+}
+
+test "relational declarations SQL numeric programs retain narrow domains and checked casts" {
+    const alloc = std.testing.allocator;
+    const ast = @import("../sql/ast.zig");
+    const columns = [_]@import("../sql/scalar.zig").Column{
+        .{ .name = "n", .type = .integer, .element_type = .int16 },
+        .{ .name = "i", .type = .integer, .element_type = .int32 },
+        .{ .name = "b", .type = .integer, .element_type = .int64 },
+        .{ .name = "f", .type = .number, .element_type = .float32 },
+        .{ .name = "d", .type = .number, .element_type = .float64 },
+    };
+    const table: schema.TableSchema = .{ .storage_mode = .relational, .relational_columns = &.{
+        .{ .name = "n", .path = "n", .column_type = .integer, .sql_element_type = .int16 },
+        .{ .name = "i", .path = "i", .column_type = .integer, .sql_element_type = .int32 },
+        .{ .name = "b", .path = "b", .column_type = .integer, .sql_element_type = .int64 },
+        .{ .name = "f", .path = "f", .column_type = .number, .sql_element_type = .float32 },
+        .{ .name = "d", .path = "d", .column_type = .number, .sql_element_type = .float64 },
+    } };
+    const Case = struct { sql: []const u8, n: i64 = 1, i: i64 = 1, d: f64 = 2.5, expected: std.json.Value = .null, @"error": ?[]const u8 = null };
+    const fixture = try std.json.parseFromSlice(struct { reference: []const u8, entries: []const Case }, alloc, @embedFile("../sql/fixtures/sql_numeric_expression_reference.json"), .{});
+    defer fixture.deinit();
+    for (fixture.value.entries) |case| {
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var compiled = try @import("../sql/compiler.zig").compileScalar(a, case.sql, .{});
+        defer compiled.deinit();
+        const lowered = try @import("../sql/schema_expression.zig").lowerColumns(a, &columns, compiled.expression, null);
+        const expected: Kind = switch (lowered.type) {
+            ast.ColumnType.integer => .integer,
+            .number => .number,
+            .boolean => .boolean,
+            else => unreachable,
+        };
+        var plan = try Plan.init(alloc, table, lowered.expression, expected);
+        defer plan.deinit();
+        const cells = [_]Value{ .{ .integer = case.n }, .{ .integer = case.i }, .{ .integer = 9007199254740993 }, .{ .number = 16777216 }, .{ .number = case.d } };
+        if (case.@"error") |state| {
+            const failure = if (std.mem.eql(u8, state, "22003")) error.RelationalExpressionOverflow else if (std.mem.eql(u8, state, "22012")) error.RelationalExpressionDivisionByZero else return error.TestUnexpectedSqlstate;
+            try std.testing.expectError(failure, plan.evaluate(alloc, &cells));
+        } else try std.testing.expect(valuesEqual(try checks.valueFromJson(a, expected, case.expected, true), try plan.evaluate(alloc, &cells)));
+    }
+}
 
 /// Immutable schema-owned defaults and generated-column dependency graph.
 /// Defaults cannot reference columns. Generated columns execute in dependency
@@ -639,7 +750,6 @@ pub const Set = struct {
     fn normalizeBinding(self: *const Set, alloc: Allocator, ordinal: usize, value: Value) !Value {
         if (value == .null) return value;
         const kind = self.table.relational_columns[ordinal].sql_element_type orelse return value;
-        const casts = @import("../sql/builtin_cast.zig");
         return switch (kind) {
             .int16, .int32, .int64 => .{ .integer = casts.checkedInteger(value.integer, kind) catch return error.InvalidRelationalExpressionInput },
             .float32 => .{ .number = casts.floatValue(f32, .{ .float = value.number }) catch return error.InvalidRelationalExpressionInput },

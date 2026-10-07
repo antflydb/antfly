@@ -21808,6 +21808,11 @@ components:
                   - required:
                       - foreign_sources
       properties:
+        remote_snapshot:
+          type: string
+          description: Opaque remote index snapshot token returned by a previous query. Required when
+            replaying search_after or search_before against an external table; a changed publication returns
+            409.
         evaluate:
           $ref: '#/components/schemas/QueryEvaluation'
         table_target:
@@ -23791,6 +23796,10 @@ components:
         - took
         - status
       properties:
+        remote_snapshot:
+          type: string
+          description: Opaque remote publication and schema fence to echo with ordered pagination. This
+            token does not grant access or retain the publication.
         evaluation:
           type: object
           additionalProperties: true
@@ -27185,16 +27194,54 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/GraphResolverConfig'
+    AlgebraicAggregateConfig:
+      type: object
+      additionalProperties: false
+      required:
+        - name
+        - op
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 128
+        op:
+          type: string
+          enum:
+            - count
+            - sum
+            - avg
+            - min
+            - max
+        group_by:
+          type: array
+          maxItems: 32
+          uniqueItems: true
+          items:
+            type: string
+            minLength: 1
+        measure:
+          type: string
+          minLength: 1
+          description: Required except for count. Omitted count means COUNT(*); a supplied column means
+            COUNT(column), excluding SQL NULL values.
     AlgebraicIndexConfig:
       type: object
-      description: Schema-derived algebraic sidecar configuration. Public requests may opt into schema
-        derivation, while materializations remain engine-owned.
+      description: Schema-derived algebraic index capabilities with optional declarative aggregate recipes.
+        Physical materialization state remains engine-owned.
       properties:
         derive_from_schema:
           x-go-type-skip-optional-pointer: true
           type: boolean
-          description: When true, derive the algebraic capability sidecar from the table schema. Internal
-            fields and materialization definitions are not public API.
+          description: When true, derive typed fields and capabilities from the table schema. Physical
+            fields, laws, joins and state remain engine-owned.
+        aggregates:
+          type: array
+          maxItems: 64
+          description: Desired exact aggregate recipes over schema column names. Eligible SQL automatically
+            reuses complete, snapshot-bound materializations; unsupported SQL shapes retain scanning.
+          items:
+            $ref: '#/components/schemas/AlgebraicAggregateConfig'
     RelationalExpressionOp:
       type: string
       enum:
@@ -27222,6 +27269,7 @@ components:
         - and
         - or
         - not
+        - cast
     RelationalExpressionType:
       type: string
       enum:
@@ -27231,6 +27279,30 @@ components:
         - datetime
         - integer
         - number
+    SQLBuiltinType:
+      type: string
+      description: >
+        Exact PostgreSQL builtin identity for a relational root scalar column
+
+        or the element identity of a `sql_array` column.
+
+        Set the JSON Schema property's `x-antfly-sql-type` annotation to one of
+
+        these values. The underlying property type must match. SQL array storage
+
+        is not implied by this annotation. Existing unannotated schemas retain
+
+        their original domains.
+      enum:
+        - text
+        - int16
+        - int32
+        - int64
+        - float32
+        - float64
+        - boolean
+        - uuid
+        - jsonb
     RelationalScalarExpression:
       type: object
       additionalProperties: false
@@ -27272,11 +27344,29 @@ components:
         evaluate left to right with SQL three-valued short-circuit semantics;
 
         NOT preserves UNKNOWN. CHECK accepts TRUE and UNKNOWN, rejecting FALSE.
+
+        Numeric literals and arithmetic operations may specify sql_type to
+
+        retain PostgreSQL builtin overflow and float4 rounding semantics.
+
+        Without it, integer and number operations retain int64 and float64
+
+        semantics. Numeric cast requires type and sql_type, takes one numeric
+
+        argument, and performs a checked conversion when evaluated (not when
+
+        the schema is compiled). Floating-to-integer casts round ties to even.
+
+        Only int16/int32/int64/float32/float64 identities are accepted here.
       properties:
         op:
           $ref: '#/components/schemas/RelationalExpressionOp'
         type:
           $ref: '#/components/schemas/RelationalExpressionType'
+        sql_type:
+          $ref: '#/components/schemas/SQLBuiltinType'
+          description: Numeric builtin result identity; accepted only on numeric literals, arithmetic,
+            negate, and cast. Requires schema capability version 18.
         value:
           description: Typed literal value, including null.
         column:
@@ -27659,6 +27749,15 @@ components:
           enum:
             - read_only
           default: read_only
+        object_mutability:
+          type: string
+          enum:
+            - mutable
+            - immutable
+          default: mutable
+          description: Set immutable only when data files are never replaced at an existing URI. Allows
+            authenticated provider-version proofs from retained index generations to be reused for unchanged
+            data files. Metadata and delete files are still verified.
         credentials:
           $ref: '#/components/schemas/ExternalLakeCredentialRef'
         snapshot:
@@ -28036,30 +28135,6 @@ components:
             text title can expose a sortable keyword subfield.
           additionalProperties:
             $ref: '#/components/schemas/DocumentSubfieldMapping'
-    SQLBuiltinType:
-      type: string
-      description: >
-        Exact PostgreSQL builtin identity for a relational root scalar column
-
-        or the element identity of a `sql_array` column.
-
-        Set the JSON Schema property's `x-antfly-sql-type` annotation to one of
-
-        these values. The underlying property type must match. SQL array storage
-
-        is not implied by this annotation. Existing unannotated schemas retain
-
-        their original domains.
-      enum:
-        - text
-        - int16
-        - int32
-        - int64
-        - float32
-        - float64
-        - boolean
-        - uuid
-        - jsonb
     SQLArrayColumnSchema:
       type: object
       additionalProperties: true

@@ -10218,6 +10218,8 @@ export interface components {
             } | string[];
         };
         QueryRequest: {
+            /** @description Opaque remote index snapshot token returned by a previous query. Required when replaying search_after or search_before against an external table; a changed publication returns 409. */
+            remote_snapshot?: string;
             evaluate?: components["schemas"]["QueryEvaluation"];
             table_target?: components["schemas"]["CatalogTableTarget"];
             /**
@@ -11509,6 +11511,8 @@ export interface components {
         };
         /** @description Fields shared by canonical and stateful query result envelopes. */
         QueryResultBase: {
+            /** @description Opaque remote publication and schema fence to echo with ordered pagination. This token does not grant access or retain the publication. */
+            remote_snapshot?: string;
             /** @description Function evaluation scope, population, usage, and scoped aggregations. */
             evaluation?: {
                 [key: string]: unknown;
@@ -13676,15 +13680,35 @@ export interface components {
             algebraic_planning?: components["schemas"]["GraphAlgebraicPlanningConfig"];
             resolvers?: components["schemas"]["GraphResolverConfig"][];
         };
-        /** @description Schema-derived algebraic sidecar configuration. Public requests may opt into schema derivation, while materializations remain engine-owned. */
+        AlgebraicAggregateConfig: {
+            name: string;
+            /** @enum {string} */
+            op: "count" | "sum" | "avg" | "min" | "max";
+            group_by?: string[];
+            /** @description Required except for count. Omitted count means COUNT(*); a supplied column means COUNT(column), excluding SQL NULL values. */
+            measure?: string;
+        };
+        /** @description Schema-derived algebraic index capabilities with optional declarative aggregate recipes. Physical materialization state remains engine-owned. */
         AlgebraicIndexConfig: {
-            /** @description When true, derive the algebraic capability sidecar from the table schema. Internal fields and materialization definitions are not public API. */
+            /** @description When true, derive typed fields and capabilities from the table schema. Physical fields, laws, joins and state remain engine-owned. */
             derive_from_schema?: boolean;
+            /** @description Desired exact aggregate recipes over schema column names. Eligible SQL automatically reuses complete, snapshot-bound materializations; unsupported SQL shapes retain scanning. */
+            aggregates?: components["schemas"]["AlgebraicAggregateConfig"][];
         };
         /** @enum {string} */
-        RelationalExpressionOp: "literal" | "column" | "add" | "subtract" | "multiply" | "divide" | "negate" | "concat" | "coalesce" | "lower_ascii" | "upper_ascii" | "eq" | "ne" | "gt" | "gte" | "lt" | "lte" | "is_null" | "is_not_null" | "is_distinct" | "is_not_distinct" | "and" | "or" | "not";
+        RelationalExpressionOp: "literal" | "column" | "add" | "subtract" | "multiply" | "divide" | "negate" | "concat" | "coalesce" | "lower_ascii" | "upper_ascii" | "eq" | "ne" | "gt" | "gte" | "lt" | "lte" | "is_null" | "is_not_null" | "is_distinct" | "is_not_distinct" | "and" | "or" | "not" | "cast";
         /** @enum {string} */
         RelationalExpressionType: "string" | "blob" | "boolean" | "datetime" | "integer" | "number";
+        /**
+         * @description Exact PostgreSQL builtin identity for a relational root scalar column
+         *     or the element identity of a `sql_array` column.
+         *     Set the JSON Schema property's `x-antfly-sql-type` annotation to one of
+         *     these values. The underlying property type must match. SQL array storage
+         *     is not implied by this annotation. Existing unannotated schemas retain
+         *     their original domains.
+         * @enum {string}
+         */
+        SQLBuiltinType: "text" | "int16" | "int32" | "int64" | "float32" | "float64" | "boolean" | "uuid" | "jsonb";
         /**
          * @description Immutable typed scalar expression, limited to 128 nodes and 16 levels.
          *     A literal requires type; omitted value means typed null. A column
@@ -13704,10 +13728,19 @@ export interface components {
          *     boolean. Unary is_null and is_not_null test presence/null. AND and OR
          *     evaluate left to right with SQL three-valued short-circuit semantics;
          *     NOT preserves UNKNOWN. CHECK accepts TRUE and UNKNOWN, rejecting FALSE.
+         *     Numeric literals and arithmetic operations may specify sql_type to
+         *     retain PostgreSQL builtin overflow and float4 rounding semantics.
+         *     Without it, integer and number operations retain int64 and float64
+         *     semantics. Numeric cast requires type and sql_type, takes one numeric
+         *     argument, and performs a checked conversion when evaluated (not when
+         *     the schema is compiled). Floating-to-integer casts round ties to even.
+         *     Only int16/int32/int64/float32/float64 identities are accepted here.
          */
         RelationalScalarExpression: {
             op: components["schemas"]["RelationalExpressionOp"];
             type?: components["schemas"]["RelationalExpressionType"];
+            /** @description Numeric builtin result identity; accepted only on numeric literals, arithmetic, negate, and cast. Requires schema capability version 18. */
+            sql_type?: components["schemas"]["SQLBuiltinType"];
             /** @description Typed literal value, including null. */
             value?: unknown;
             column?: string;
@@ -13919,6 +13952,12 @@ export interface components {
              * @enum {string}
              */
             write_policy?: "read_only";
+            /**
+             * @description Set immutable only when data files are never replaced at an existing URI. Allows authenticated provider-version proofs from retained index generations to be reused for unchanged data files. Metadata and delete files are still verified.
+             * @default mutable
+             * @enum {string}
+             */
+            object_mutability?: "mutable" | "immutable";
             credentials?: components["schemas"]["ExternalLakeCredentialRef"];
             snapshot?: components["schemas"]["ExternalLakeSnapshotSelector"];
         };
@@ -14110,16 +14149,6 @@ export interface components {
                 [key: string]: components["schemas"]["DocumentSubfieldMapping"];
             };
         };
-        /**
-         * @description Exact PostgreSQL builtin identity for a relational root scalar column
-         *     or the element identity of a `sql_array` column.
-         *     Set the JSON Schema property's `x-antfly-sql-type` annotation to one of
-         *     these values. The underlying property type must match. SQL array storage
-         *     is not implied by this annotation. Existing unannotated schemas retain
-         *     their original domains.
-         * @enum {string}
-         */
-        SQLBuiltinType: "text" | "int16" | "int32" | "int64" | "float32" | "float64" | "boolean" | "uuid" | "jsonb";
         /**
          * @description JSON Schema property declaration for one typed SQL-array column in a
          *     relational table. Use it as a root property of DocumentSchema.schema.

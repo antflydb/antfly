@@ -4369,13 +4369,16 @@ scalar check or expression key from binding. Native schema admission tests
 exercise checks, a partial expression index, exact smallint defaults, SQL NULL,
 and a cold bigint array with non-default bounds and NULL elements.
 
-This does not give the durable expression VM query-VM capabilities it lacks.
-Array-dependent expressions, narrow integer arithmetic and float4 arithmetic
-must not lower into JSON-null placeholders or int64/float64 operations with
-different overflow/rounding semantics. Those operations remain an explicit
-architecture gap. PostgreSQL also accepts a numeric default requiring an
-out-of-range assignment cast at DDL time, then raises when the default is used;
-the current native literal-default model instead range-checks during DDL
-binding. The PostgreSQL oracle records that distinction. Deferred typed
-assignment-cast plans need implementation before claiming parity for those
-defaults. No original-case dispositions are changed by these regressions.
+Durable numeric programs retain builtin widths on literals, arithmetic and
+checked casts, including explicit operand promotions. Narrow integer overflow
+and float4 rounding therefore survive schema persistence rather than silently
+using int64/float64 semantics. Numeric defaults retain assignment-cast plans:
+an out-of-range integer default is accepted at DDL time and raises when used,
+without preventing an explicit valid value from being written. These programs
+require schema capability 18, including after reopen and portable restoration.
+Shared numeric fixtures compare native evaluation with PostgreSQL, using binary
+float4 results to avoid shortest-text conversion artifacts.
+
+Array-dependent durable expressions, exact decimal assignment semantics,
+temporal operations and special floating-point domains remain architecture
+gaps. No original-case dispositions are changed by these component regressions.

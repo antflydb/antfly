@@ -47,16 +47,10 @@ pub fn lowerColumns(alloc: std.mem.Allocator, columns: []const scalar.Column, ex
     const values = try alloc.alloc(Json, program.instructions.len);
     for (program.instructions, values) |instruction, *out| {
         const kind = instruction.type.kind orelse return error.SqlTypeMismatch;
-        // The durable expression VM currently has int64/float64 arithmetic,
-        // not the query VM's narrower builtin overflow/rounding contracts.
-        // Keep shape discovery complete without silently lowering a different
-        // operation or manufacturing JSON-null placeholders for typed arrays.
+        // Arrays still need a native expression value domain. Numeric builtin
+        // widths, however, travel with each operation rather than disappearing
+        // into its coarse physical integer/number result kind.
         if (kind == .array) return error.UnsupportedSqlShape;
-        if (instruction.operation == .binary or instruction.operation == .unary) {
-            const identity = instruction.type.element_type;
-            if ((kind == .integer and identity != null and identity != .int64) or
-                (kind == .number and identity == .float32)) return error.UnsupportedSqlShape;
-        }
         out.* = switch (instruction.operation) {
             .literal => |literal| try json(alloc, .{ .op = "literal", .type = if (kind == .uuid) "string" else @tagName(kind), .value = literal }),
             .column => |ordinal| try json(alloc, .{ .op = "column", .column = columns[ordinal].name }),
@@ -78,7 +72,25 @@ pub fn lowerColumns(alloc: std.mem.Allocator, columns: []const scalar.Column, ex
                     .add, .subtract, .multiply, .divide, .concat, .eq, .lt, .lte, .gt, .gte, .@"and", .@"or", .is_distinct, .is_not_distinct => @tagName(part.op),
                     else => return error.UnsupportedSqlShape,
                 };
-                break :blk try json(alloc, .{ .op = op, .args = &[_]Json{ values[part.left], values[part.right] } });
+                var left = values[part.left];
+                var right = values[part.right];
+                switch (part.op) {
+                    .add, .subtract, .multiply, .divide => {
+                        // The query VM promotes operands at execution time. A
+                        // durable program must record that promotion explicitly.
+                        const identity: @import("array_value.zig").ElementType = instruction.type.element_type orelse if (kind == .integer) .int64 else .float64;
+                        const indexes = [_]usize{ part.left, part.right };
+                        const operands = [_]*Json{ &left, &right };
+                        for (indexes, operands) |index, operand| {
+                            const source = program.instructions[index].type;
+                            const source_identity: @import("array_value.zig").ElementType = source.element_type orelse if (source.kind == .integer) .int64 else .float64;
+                            if (source.kind != kind or source_identity != identity)
+                                operand.* = try json(alloc, .{ .op = "cast", .type = @tagName(kind), .sql_type = @tagName(identity), .args = &[_]Json{operand.*} });
+                        }
+                    },
+                    else => {},
+                }
+                break :blk try json(alloc, .{ .op = op, .args = &[_]Json{ left, right } });
             },
             .call => |part| blk: {
                 const op: []const u8 = switch (part.function) {
@@ -93,16 +105,27 @@ pub fn lowerColumns(alloc: std.mem.Allocator, columns: []const scalar.Column, ex
             },
             .cast => |part| blk: {
                 const source = program.instructions[part.operand].type;
-                if (source.kind != part.type) return error.UnsupportedSqlShape;
-                if (source.element_type != part.element_type) {
-                    const from = source.element_type orelse return error.UnsupportedSqlShape;
-                    const to = part.element_type orelse return error.UnsupportedSqlShape;
-                    const casts = @import("builtin_cast.zig");
-                    if (!casts.integral(from) or !casts.integral(to) or try casts.commonNumeric(from, to) != to) return error.UnsupportedSqlShape;
+                if ((source.kind == .integer or source.kind == .number) and (part.type == .integer or part.type == .number)) {
+                    const target_type: @import("array_value.zig").ElementType = part.element_type orelse if (part.type == .integer) .int64 else .float64;
+                    break :blk try json(alloc, .{ .op = "cast", .type = @tagName(part.type), .sql_type = @tagName(target_type), .args = &[_]Json{values[part.operand]} });
                 }
+                if (source.kind != part.type) return error.UnsupportedSqlShape;
+                if (source.element_type != part.element_type) return error.UnsupportedSqlShape;
                 break :blk values[part.operand];
             },
             .case_when, .in_list => return error.UnsupportedSqlShape,
+        };
+        const typed_numeric = switch (instruction.operation) {
+            .literal => kind == .integer or kind == .number,
+            .binary => |part| switch (part.op) {
+                .add, .subtract, .multiply, .divide => true,
+                else => false,
+            },
+            .unary => |part| part.op == .negative,
+            else => false,
+        };
+        if (typed_numeric) if (instruction.type.element_type) |identity| {
+            try out.object.put(alloc, "sql_type", .{ .string = @tagName(identity) });
         };
     }
     return .{ .expression = values[program.root], .type = program.output_type.kind orelse return error.SqlTypeMismatch };
@@ -153,13 +176,14 @@ test "SQL schema expressions bind nullable catalog shapes and cold typed arrays"
     defer index.deinit();
     const key = try lowerTyped(a, schema, index.expression, null);
     try std.testing.expectEqual(ast.ColumnType.string, key.type);
-    // Binding may discover every declared type, but may not erase an array
-    // dependency or narrow arithmetic into the native int64-only VM.
-    for ([_][]const u8{ "n + n > 0", "cold IS NULL", "CAST(n AS smallint) + CAST(n AS smallint) > 0" }) |sql| {
-        var unsupported = try @import("compiler.zig").compileScalar(a, sql, .{});
-        defer unsupported.deinit();
-        try std.testing.expectError(error.UnsupportedSqlShape, lower(a, schema, unsupported.expression, .boolean));
+    for ([_][]const u8{ "n + n > 0", "CAST(n AS smallint) + CAST(n AS smallint) > 0", "+n > 0", "n > -1" }) |sql| {
+        var numeric = try @import("compiler.zig").compileScalar(a, sql, .{});
+        defer numeric.deinit();
+        _ = try lower(a, schema, numeric.expression, .boolean);
     }
+    var array = try @import("compiler.zig").compileScalar(a, "cold IS NULL", .{});
+    defer array.deinit();
+    try std.testing.expectError(error.UnsupportedSqlShape, lower(a, schema, array.expression, .boolean));
 }
 
 test "SQL schema expression catalog decoding rejects malformed and conflicting metadata" {

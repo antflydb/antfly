@@ -267,6 +267,9 @@ pub const TableSchema = struct {
     /// Runtime-only embedders have no public constraints to restore. A schema
     /// derived from the public API must never silently lose those constraints.
     requires_public_schema: bool = false,
+    /// Typed numeric/cast expression semantics require capability 18 even if
+    /// the table's physical columns use only older coarse scalar layouts.
+    requires_typed_expressions: bool = false,
     exact_fields: []const ExactField = &.{},
     dynamic_templates: []const DynamicTemplate = &.{},
     declared_fields: []const DeclaredField = &.{},
@@ -289,7 +292,7 @@ const schema_version_prefix = "\x00\x00__metadata__:schema_v";
 /// Current durable runtime-schema format. Catalog compatibility checks use the
 /// same exported constant so a writer can never silently drift from the format
 /// it advertises in transactional table metadata.
-pub const storage_format_version: u32 = 17;
+pub const storage_format_version: u32 = 18;
 
 /// Serialize a TableSchema to bytes. Caller owns the returned slice.
 pub fn serializeSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
@@ -379,6 +382,7 @@ fn serializeSchemaFormat(alloc: Allocator, schema: TableSchema, format_version: 
     if (format_version < 17) for (schema.relational_columns) |column| {
         if (column.column_type == .sql_array) return error.UnsupportedVersion;
     };
+    if (format_version < 18 and schema.requires_typed_expressions) return error.UnsupportedVersion;
 
     var buf = std.ArrayListUnmanaged(u8).empty;
     errdefer buf.deinit(alloc);
@@ -510,6 +514,7 @@ fn serializeSchemaFormat(alloc: Allocator, schema: TableSchema, format_version: 
         }
     } else if (schema.external_base_source != null) return error.UnsupportedVersion;
 
+    if (format_version >= 18) try buf.append(alloc, @intFromBool(schema.requires_typed_expressions));
     return buf.toOwnedSlice(alloc);
 }
 
@@ -1050,6 +1055,7 @@ fn deserializeSchemaOwned(alloc: Allocator, data: []const u8) !TableSchema {
         .enforce_types = enforce_types,
         .storage_mode = storage_mode,
         .requires_public_schema = requires_public_schema,
+        .requires_typed_expressions = if (fmt_version >= 18) data[pos] == 1 else false,
         .exact_fields = exact_fields,
         .dynamic_templates = templates,
         .declared_fields = declared_fields,
@@ -1276,10 +1282,12 @@ fn validateSerializedSchema(data: []const u8) !void {
         if (try cursor.readU8() > 1) return error.InvalidSchema;
         if (data[cursor.pos - 1] == 1) try cursor.readStr();
     }
+    if (format_version >= 18) try cursor.readBool();
     try cursor.finish();
 }
 
 fn validateRelationalSchema(alloc: Allocator, schema: TableSchema) !void {
+    if (schema.requires_typed_expressions and (schema.storage_mode != .relational or !schema.requires_public_schema)) return error.InvalidSchema;
     for (schema.relational_columns) |column| if (column.column_type == .sql_array) {
         if (schema.storage_mode != .relational or column.sql_element_type == null or column.is_json or column.json_kind != .none)
             return error.InvalidSchema;
@@ -2857,6 +2865,23 @@ test "relational index system SQL array schemas require precise elements and for
     const loaded = try deserializeSchema(alloc, previous);
     defer freeSchema(alloc, loaded);
     try std.testing.expect(try schemasEqual(alloc, scalar, loaded));
+}
+
+test "relational index system SQL typed expression capability survives strict schema encoding" {
+    const alloc = std.testing.allocator;
+    const typed: TableSchema = .{ .storage_mode = .relational, .requires_public_schema = true, .requires_typed_expressions = true, .relational_columns = &.{.{ .name = "n", .path = "n", .column_type = .integer }} };
+    try std.testing.expectError(error.UnsupportedVersion, serializeSchemaFormat(alloc, typed, 17));
+    const bytes = try serializeSchema(alloc, typed);
+    defer alloc.free(bytes);
+    const decoded = try deserializeSchema(alloc, bytes);
+    defer freeSchema(alloc, decoded);
+    try std.testing.expect(decoded.requires_typed_expressions);
+    try std.testing.expect(try schemasEqual(alloc, typed, decoded));
+    try std.testing.expectError(error.InvalidFormat, deserializeSchema(alloc, bytes[0 .. bytes.len - 1]));
+    const malformed = try alloc.dupe(u8, bytes);
+    defer alloc.free(malformed);
+    malformed[malformed.len - 1] = 2;
+    try std.testing.expectError(error.InvalidSchema, deserializeSchema(alloc, malformed));
 }
 
 test "relational index system SQL schema rejects incompatible descriptors and malformed bytes" {

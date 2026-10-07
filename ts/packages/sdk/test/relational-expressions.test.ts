@@ -2,6 +2,19 @@ import { describe, expect, it } from "vitest";
 import type { RelationalColumnExpression, RelationalIndexPredicate } from "../src/index.js";
 
 describe("generated relational expression and predicate contracts", () => {
+  it("retains builtin identities on deferred numeric assignment casts", () => {
+    const generated: RelationalColumnExpression = {
+      column: "n",
+      expression: {
+        op: "cast",
+        type: "integer",
+        sql_type: "int16",
+        args: [{ op: "literal", type: "integer", sql_type: "int32", value: 32768 }],
+      },
+    };
+    expect(JSON.parse(JSON.stringify(generated))).toEqual(generated);
+  });
+
   it("keeps exact literals and explicit null through recursive wire values", () => {
     const generated: RelationalColumnExpression = {
       column: "total",

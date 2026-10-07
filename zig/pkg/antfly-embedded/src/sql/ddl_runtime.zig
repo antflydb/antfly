@@ -120,9 +120,8 @@ pub fn createSchemaAlloc(alloc: std.mem.Allocator, create: ast.CreateTable) anye
         if (!nullable) try required.append(a, column.name);
         if (column.default_value) |value| {
             if (value == .parameter) return error.InvalidSqlParameters;
-            const literal = try bindDefault(a, value, column.type, column.element_type);
-            if (literal == .null and !nullable) return error.SqlNotNullViolation;
-            try defaults.append(a, try std.json.parseFromSliceLeaky(std.json.Value, a, try std.json.Stringify.valueAlloc(a, .{ .column = column.name, .expression = .{ .op = "literal", .type = if (column.type == .uuid) "string" else @tagName(column.type), .value = literal } }, .{}), .{ .parse_numbers = false }));
+            const expression = try defaultExpression(a, value, column.type, column.element_type);
+            try defaults.append(a, try std.json.parseFromSliceLeaky(std.json.Value, a, try std.json.Stringify.valueAlloc(a, .{ .column = column.name, .expression = expression }, .{}), .{ .parse_numbers = false }));
         }
     }
     const base = try std.json.Stringify.valueAlloc(a, .{
@@ -146,6 +145,27 @@ pub fn bindDefault(alloc: std.mem.Allocator, value: ast.Value, kind: ast.ColumnT
     const describe = @import("describe.zig");
     const literal = try describe.bindLiteral(alloc, value, kind);
     return (try describe.coerceDatum(alloc, .{ .value = literal, .sql_null = literal == .null }, kind, element)).value;
+}
+
+/// PostgreSQL retains assignment casts on numeric defaults. Their overflow is
+/// an INSERT/UPDATE DEFAULT failure, not a schema-publication failure. Keep
+/// the source literal separate from its target domain in the durable plan.
+pub fn defaultExpression(alloc: std.mem.Allocator, value: ast.Value, kind: ast.ColumnType, element: ?@import("array_value.zig").ElementType) !std.json.Value {
+    const numeric = (kind == .integer and value == .integer) or (kind == .number and (value == .integer or value == .number));
+    if (numeric) {
+        const source: ast.ColumnType = if (value == .integer) .integer else .number;
+        const source_type: @import("array_value.zig").ElementType = if (value == .integer) (if (std.math.cast(i32, value.integer) != null) .int32 else .int64) else .float64;
+        const literal: std.json.Value = if (value == .integer) .{ .integer = value.integer } else .{ .float = value.number };
+        const target_type: @import("array_value.zig").ElementType = element orelse if (kind == .integer) .int64 else .float64;
+        return std.json.parseFromSliceLeaky(std.json.Value, alloc, try std.json.Stringify.valueAlloc(alloc, .{
+            .op = "cast",
+            .type = @tagName(kind),
+            .sql_type = @tagName(target_type),
+            .args = &.{.{ .op = "literal", .type = @tagName(source), .sql_type = @tagName(source_type), .value = literal }},
+        }, .{}), .{ .parse_numbers = false });
+    }
+    const literal = try bindDefault(alloc, value, kind, element);
+    return std.json.parseFromSliceLeaky(std.json.Value, alloc, try std.json.Stringify.valueAlloc(alloc, .{ .op = "literal", .type = if (kind == .uuid) "string" else @tagName(kind), .value = literal }, .{}), .{ .parse_numbers = false });
 }
 
 test "SQL TRUNCATE lowers complete table set and honest durable admission receipt" {
@@ -179,11 +199,11 @@ test "SQL DDL lowers exact defaults nullability and native relational types" {
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, bytes, .{ .parse_numbers = false });
     defer parsed.deinit();
     try std.testing.expect(parsed.value.object.get("version") == null);
-    try std.testing.expectEqualStrings("9007199254740993", parsed.value.object.get("column_defaults").?.array.items[0].object.get("expression").?.object.get("value").?.number_string);
+    try std.testing.expectEqualStrings("9007199254740993", parsed.value.object.get("column_defaults").?.array.items[0].object.get("expression").?.object.get("args").?.array.items[0].object.get("value").?.number_string);
     try std.testing.expectEqualStrings("id", parsed.value.object.get("document_schemas").?.object.get("row").?.object.get("schema").?.object.get("required").?.array.items[0].string);
 }
 
-test "SQL precise scalar DDL publishes generated identities and enforces CREATE ALTER defaults" {
+test "SQL precise scalar DDL preserves CREATE ALTER default assignment casts" {
     const alloc = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -195,17 +215,17 @@ test "SQL precise scalar DDL publishes generated identities and enforces CREATE 
     try std.testing.expectEqualStrings("int16", properties.get("n").?.object.get("x-antfly-sql-type").?.string);
     try std.testing.expectEqualStrings("float32", properties.get("f").?.object.get("x-antfly-sql-type").?.string);
     const defaults = schema.object.get("column_defaults").?.array.items;
-    try std.testing.expectEqual(@as(f64, @as(f32, 0.1)), defaults[1].object.get("expression").?.object.get("value").?.float);
+    try std.testing.expectEqualStrings("float32", defaults[1].object.get("expression").?.object.get("sql_type").?.string);
+    try std.testing.expectEqual(@as(f64, 0.1), defaults[1].object.get("expression").?.object.get("args").?.array.items[0].object.get("value").?.float);
     for ([_][]const u8{ "CREATE TABLE bad (n smallint DEFAULT 32768)", "CREATE TABLE bad (n integer DEFAULT 2147483648)" }) |sql| {
         var bad = try @import("compiler.zig").compile(a, sql, .{});
         defer bad.deinit();
-        try std.testing.expectError(error.SqlNumericOutOfRange, createSchemaAlloc(a, bad.statement.create_table));
+        _ = try createSchemaAlloc(a, bad.statement.create_table);
     }
     var alter = try @import("compiler.zig").compile(a, "ALTER TABLE widths ALTER COLUMN n SET DEFAULT 32768", .{});
     defer alter.deinit();
-    const before = try std.json.Stringify.valueAlloc(a, schema, .{});
-    try std.testing.expectError(error.SqlNumericOutOfRange, @import("schema_ddl.zig").apply(a, &schema, alter.statement.catalog_ddl));
-    try std.testing.expectEqualStrings(before, try std.json.Stringify.valueAlloc(a, schema, .{}));
+    try std.testing.expect(try @import("schema_ddl.zig").apply(a, &schema, alter.statement.catalog_ddl));
+    try std.testing.expectEqualStrings("int16", schema.object.get("column_defaults").?.array.items[2].object.get("expression").?.object.get("sql_type").?.string);
 }
 
 test "SQL ALTER DEFAULT uses explicit builtin identity with nullable union schemas" {
@@ -219,11 +239,13 @@ test "SQL ALTER DEFAULT uses explicit builtin identity with nullable union schem
     defer valid.deinit();
     try std.testing.expect(try @import("schema_ddl.zig").apply(alloc, &schema, valid.statement.catalog_ddl));
     try std.testing.expectEqualStrings("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11", schema.object.get("column_defaults").?.array.items[0].object.get("expression").?.object.get("value").?.string);
-    var invalid = try @import("compiler.zig").compile(alloc, "ALTER TABLE widths ALTER COLUMN n SET DEFAULT 32768", .{});
-    defer invalid.deinit();
-    const before = try std.json.Stringify.valueAlloc(alloc, schema, .{});
-    try std.testing.expectError(error.SqlNumericOutOfRange, @import("schema_ddl.zig").apply(alloc, &schema, invalid.statement.catalog_ddl));
-    try std.testing.expectEqualStrings(before, try std.json.Stringify.valueAlloc(alloc, schema, .{}));
+    var numeric = try @import("compiler.zig").compile(alloc, "ALTER TABLE widths ALTER COLUMN n SET DEFAULT 32768", .{});
+    defer numeric.deinit();
+    try std.testing.expect(try @import("schema_ddl.zig").apply(alloc, &schema, numeric.statement.catalog_ddl));
+    const assignment = schema.object.get("column_defaults").?.array.items[1].object.get("expression").?;
+    try std.testing.expectEqualStrings("cast", assignment.object.get("op").?.string);
+    try std.testing.expectEqualStrings("int16", assignment.object.get("sql_type").?.string);
+    try std.testing.expectEqualStrings("32768", assignment.object.get("args").?.array.items[0].object.get("value").?.number_string);
 }
 
 test "SQL array DDL refuses schema publication before typed storage admission" {
