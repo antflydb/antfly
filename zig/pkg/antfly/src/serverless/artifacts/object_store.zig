@@ -1069,8 +1069,8 @@ test "serverless objectstore-backed artifact initialization cleans up every allo
             defer impl.deinit();
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.borrowed, .{});
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.owned, .{file_uri});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Runner.borrowed, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Runner.owned, .{file_uri});
 }
 
 var test_nonce: std.atomic.Value(u64) = .init(0);

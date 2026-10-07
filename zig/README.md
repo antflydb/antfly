@@ -159,6 +159,19 @@ needed. From the repository root, use `make zig-test` or `make zig-unit-test`.
 Use `-Dtest-filter="pattern"` for compile-time selection; arguments after `--`
 are forwarded to the selected executable or runtime test runner.
 
+Linux unit CI uses `-Dunit-test-cache-release=true` to release each completed
+test artifact after every selected test run and inventory reader has exited.
+This retains Debug checks and symbols while bounding retained disk usage by
+live consumers. Use it only with the combined `zig build unit-test` invocation and a private
+cache named `zig-local`. This option requires a disposable compiler cache; retire its
+outputs and manifests together before any subsequent build invocation. Local
+unit builds keep their reusable cache by default. `tools/report_test_cache.py`
+reports retained objects, archives, and executables after the unit phase.
+
+Use `antfly_platform.allocator.checkAllAllocationFailures` for allocation-failure
+enumeration. It retains leak and OOM checking while disabling backing-allocator
+remaps, which can otherwise make allocation counts vary between iterations.
+
 Native API and model fixtures use `integration_test.zig` or
 `*_integration_test.zig`: they exercise mounted services or model pipelines
 in-process through Zig test targets. Model benchmark programs use `_bench.zig`,

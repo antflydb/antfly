@@ -239,5 +239,5 @@ test "GLiNER2.5 model adapter layout rejects invalid nonlinears resources and cl
     try std.testing.expectError(error.BoundaryPeftTargetNotResolved, init(a, .small, .{ .rank = 2, .targets = &.{"missing"} }, .{}));
     try std.testing.expectError(error.BoundaryPeftLimitExceeded, init(a, .small, .{ .rank = 2 }, .{ .max_adapters = 1 }));
     try std.testing.expectError(error.BoundaryPeftLimitExceeded, init(a, .small, .{ .rank = 2 }, .{ .max_adapter_bytes = 1 }));
-    try std.testing.checkAllAllocationFailures(a, allocationCheck, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, allocationCheck, .{});
 }

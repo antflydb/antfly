@@ -581,6 +581,7 @@ jobs:
           tools/test_run_bounded_zig_build.py
           tools/test_fixture_workspace.py
           tools/test_prune_completed_test_cache.py
+          tools/test_test_cache_lifetime.py
           tools/test_analyze_zig_import_graph.py
           tools/test_audit_storage_test_shards.py
           tools/test_audit_test_selection.py
@@ -992,6 +993,7 @@ jobs:
           tools/test_run_bounded_zig_build.py
           tools/test_fixture_workspace.py
           tools/test_prune_completed_test_cache.py
+          tools/test_test_cache_lifetime.py
           tools/test_analyze_zig_import_graph.py
           tools/test_audit_storage_test_shards.py
           tools/test_audit_test_selection.py

@@ -852,7 +852,7 @@ test "diarization frees every copy when an allocation fails" {
             long_transcription.freeSegments(allocator, labelled);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
 }
 
 /// A session standing in for the speaker model: every window embeds to the

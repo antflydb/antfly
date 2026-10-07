@@ -179,7 +179,7 @@ test "serverless enrichment stage cursor codec releases allocations at every fai
             try std.testing.expect(value.eql(decoded));
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Exercise.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Exercise.run, .{});
 }
 
 pub const ProgressStore = struct {

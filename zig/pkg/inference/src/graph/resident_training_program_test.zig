@@ -288,7 +288,7 @@ test "resident program Metal allocation cancellation and external frame failures
     defer cb.free(source);
     const binding = program_mod.Binding{ .node_id = input, .value = source };
     const before = metal_tensor.memoryStatsSnapshot();
-    try std.testing.checkAllAllocationFailures(a, executionAllocationCheck, .{ device.backend, &program, binding });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, executionAllocationCheck, .{ device.backend, &program, binding });
     const Cancel = struct {
         calls: usize = 0,
         at: usize,
