@@ -3999,3 +3999,32 @@ binary array fixtures. The debug trusted-projection fixture performs 10,000
 lookups in approximately 3.7 ms for 4,096 cells and 3.6 ms for 65,536 cells,
 materializing no cell vector. These are local code-path measurements, not an
 end-to-end distributed latency guarantee.
+
+### Parsed SQL-array admission boundary
+
+The envelope validator is shared by owned and borrowed decoding and by
+allocation-free validation of an already parsed API value. It reports the same
+work and wire-byte admission as materialization, without constructing flat cell
+or dimension buffers. Admission results are accounting, not transferable trust
+tokens: each consumer still validates its current input.
+
+In-place normalization validates the complete envelope before changing any
+cell, then rounds finite float4 values in the existing DOM. Integer decimal
+strings, dimensions, lower bounds, SQL NULL flags, JSONB values and nonfinite
+float spellings remain unchanged. Preservation mode rejects float4 values that
+would round; both failed admission and a late invalid cell leave the input
+unchanged. This is the reusable boundary needed for public schema preparation
+to make extraction and physical storage agree without extra vectors or JSON
+parsing. Public schema/DDL and SQL scan/mutation activation remain unfinished;
+this change does not reclassify any original parity case.
+
+The local debug admission benchmark takes approximately 7 ms for four passes
+over 4,096 cells and 126 ms for four passes over 65,536 cells, with no retained
+cell vector or allocation in validation. Maximum-cardinality measurement uses
+an explicit 8 MiB work budget; the default 1 MiB work limit still rejects this
+larger envelope. Cardinality, bytes and work remain independent safeguards.
+
+Verification: 409 embedded and 175 hosted SQL tests, seven targeted native
+array/reopen/restore tests, 101 PostgreSQL oracle tests and 20 inventory verifier
+tests. The original inventory remains 365 implemented, 136 rejected,
+73 superseded and 1,012 unresolved.

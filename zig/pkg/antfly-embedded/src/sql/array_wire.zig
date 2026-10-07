@@ -26,6 +26,15 @@ const A = std.mem.Allocator;
 const Json = std.json.Value;
 pub const Options = struct { values: arrays.Limits = .{}, wire_bytes: usize = 8 * 1024 * 1024 };
 pub const Decoded = struct { value: arrays.Value, work: usize, wire_bytes: usize };
+pub const Admission = struct { work: usize, wire_bytes: usize };
+
+const Inspection = struct {
+    dimensions: [6]arrays.Dimension,
+    rank: usize,
+    values: []const Json,
+    nulls: []const Json,
+    admission: Admission,
+};
 
 const View = struct {
     value: arrays.Value,
@@ -192,7 +201,40 @@ pub fn decodeBorrowed(a: A, kind: arrays.ElementType, input: Json, options: Opti
     return .{ .value = (try decodeCells(false, a, kind, input, options)).value, .allocator = a };
 }
 
-fn decodeCells(comptime own_payloads: bool, a: A, kind: arrays.ElementType, input: Json, options: Options) !Decoded {
+/// Validate an existing parsed envelope without allocating cell vectors or
+/// retaining payloads. The reported work belongs to the caller's invocation
+/// budget; successful admission is not a transferable trust token.
+pub fn validate(kind: arrays.ElementType, input: Json, options: Options) !Admission {
+    return (try inspect(kind, input, options)).admission;
+}
+
+/// Normalize the parsed API representation before extraction, hashing, or row
+/// encoding. The envelope remains lossless: integer strings, SQL NULL flags,
+/// bounds, JSONB nulls and nonfinite float spellings are never rewritten.
+/// Numeric float cells acquire their bound binary width. A preservation check
+/// rejects float4 values which would round again, as required when verifying
+/// restored logical values.
+/// All admission and preservation checks precede the first mutation.
+pub fn normalize(kind: arrays.ElementType, input: *Json, preserve: bool, options: Options) !Admission {
+    const inspected = try inspect(kind, input.*, options);
+    if (!casts.floating(kind)) return inspected.admission;
+    if (preserve and kind == .float32) for (inspected.values, inspected.nulls) |raw, flag| {
+        if (flag.bool or raw == .string) continue;
+        const original = try casts.floatValue(f64, raw);
+        const canonical = (try readElement(kind, raw, false)).value.float;
+        if (original != canonical and !(std.math.isNan(original) and std.math.isNan(canonical))) return error.InvalidSqlArrayShape;
+    };
+    if (!preserve) {
+        const values = input.object.getPtr("values").?.array.items;
+        for (values, inspected.nulls) |*raw, flag| {
+            if (flag.bool or raw.* == .string) continue;
+            raw.* = (try readElement(kind, raw.*, false)).value;
+        }
+    }
+    return inspected.admission;
+}
+
+fn inspect(kind: arrays.ElementType, input: Json, options: Options) !Inspection {
     if (input != .object or input.object.count() != 3) return error.InvalidSqlArrayShape;
     const axes = try arrayField(input.object, "dimensions");
     const values = try arrayField(input.object, "values");
@@ -233,14 +275,25 @@ fn decodeCells(comptime own_payloads: bool, a: A, kind: arrays.ElementType, inpu
     try std.json.Stringify.value(input, .{}, &wire_size.writer);
     if (wire_size.count > options.wire_bytes or wire_size.count > work.remaining / 2) return error.SqlProgramLimitExceeded;
     try work.consume(@as(usize, @intCast(wire_size.count)) * 2);
-    const cells = try a.alloc(arrays.Element, values.len);
+    return .{
+        .dimensions = dimensions,
+        .rank = axes.len,
+        .values = values,
+        .nulls = nulls,
+        .admission = .{ .work = options.values.work - work.remaining, .wire_bytes = @intCast(wire_size.count) },
+    };
+}
+
+fn decodeCells(comptime own_payloads: bool, a: A, kind: arrays.ElementType, input: Json, options: Options) !Decoded {
+    const inspected = try inspect(kind, input, options);
+    const cells = try a.alloc(arrays.Element, inspected.values.len);
     errdefer if (!own_payloads) a.free(cells);
-    for (values, nulls, cells) |raw, flag, *cell| {
+    for (inspected.values, inspected.nulls, cells) |raw, flag, *cell| {
         const decoded = try readElement(kind, raw, flag.bool);
         cell.* = if (own_payloads) try operators.cloneDatum(a, decoded) else decoded;
     }
-    const owned_dimensions = try a.dupe(arrays.Dimension, dimensions[0..axes.len]);
-    return .{ .value = .{ .element_type = kind, .dimensions = owned_dimensions, .elements = cells }, .work = options.values.work - work.remaining, .wire_bytes = @intCast(wire_size.count) };
+    const owned_dimensions = try a.dupe(arrays.Dimension, inspected.dimensions[0..inspected.rank]);
+    return .{ .value = .{ .element_type = kind, .dimensions = owned_dimensions, .elements = cells }, .work = inspected.admission.work, .wire_bytes = inspected.admission.wire_bytes };
 }
 
 /// Stable quota owner, including arena capacity and failure cleanup.
@@ -296,6 +349,16 @@ test "SQL array envelope matches PostgreSQL binary values without losing bounds 
         defer parsed.deinit();
         var decoded = try decode(a, entry.element_type, parsed.value, .{});
         defer decoded.deinit();
+        const admission = try validate(entry.element_type, parsed.value, .{});
+        const exact_budget = try validate(entry.element_type, parsed.value, .{ .values = .{ .work = admission.work }, .wire_bytes = admission.wire_bytes });
+        try std.testing.expectEqual(admission, exact_budget);
+        try std.testing.expectError(error.SqlProgramLimitExceeded, validate(entry.element_type, parsed.value, .{ .values = .{ .work = admission.work - 1 } }));
+        try std.testing.expectError(error.SqlProgramLimitExceeded, validate(entry.element_type, parsed.value, .{ .wire_bytes = admission.wire_bytes - 1 }));
+        var arena_view = std.heap.ArenaAllocator.init(a);
+        defer arena_view.deinit();
+        const measured = try decodeLeakyMeasured(arena_view.allocator(), entry.element_type, parsed.value, .{});
+        try std.testing.expectEqual(admission.work, measured.work);
+        try std.testing.expectEqual(admission.wire_bytes, measured.wire_bytes);
         var binary = std.Io.Writer.Allocating.init(a);
         defer binary.deinit();
         try @import("array_binary.zig").encode(decoded.value, &binary.writer, .{});
@@ -314,6 +377,13 @@ test "SQL array envelope matches PostgreSQL binary values without losing bounds 
         const json = try std.json.Stringify.valueAlloc(a, materialized, .{});
         defer a.free(json);
         try std.testing.expectEqualStrings(encoded.written(), json);
+        var normalized = parsed.value;
+        _ = try normalize(entry.element_type, &normalized, true, .{});
+        _ = try normalize(entry.element_type, &normalized, false, .{});
+        var canonical = try decodeBorrowed(a, entry.element_type, normalized, .{});
+        defer canonical.deinit();
+        var comparison_work: arrays.Budget = .{};
+        try std.testing.expectEqual(std.math.Order.eq, try original.value.compare(canonical.value, &comparison_work));
     }
 }
 
@@ -328,6 +398,7 @@ test "SQL array envelope rejects malformed or over-budget inputs before allocati
         const parsed = try std.json.parseFromSlice(Json, a, input, .{});
         defer parsed.deinit();
         var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+        try std.testing.expectError(error.InvalidSqlArrayShape, validate(.int64, parsed.value, .{}));
         try std.testing.expectError(error.InvalidSqlArrayShape, decodeLeaky(failing.allocator(), .int64, parsed.value, .{}));
         try std.testing.expectEqual(@as(usize, 0), failing.allocations);
     }
@@ -395,6 +466,7 @@ test "SQL array envelope enforces element domains and admission before payload o
         const parsed = try std.json.parseFromSlice(Json, a, input, .{});
         defer parsed.deinit();
         var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+        try std.testing.expectError(case.err, validate(case.kind, parsed.value, .{}));
         try std.testing.expectError(case.err, decodeLeaky(failing.allocator(), case.kind, parsed.value, .{}));
         try std.testing.expectEqual(@as(usize, 0), failing.allocations);
     }
@@ -404,6 +476,62 @@ test "SQL array envelope enforces element domains and admission before payload o
     try std.testing.expectError(error.SqlProgramLimitExceeded, decodeLeaky(failing.allocator(), .int64, input.value, .{ .values = .{ .bytes = 0 } }));
     try std.testing.expectError(error.SqlProgramLimitExceeded, decodeLeaky(failing.allocator(), .int64, input.value, .{ .wire_bytes = 1 }));
     try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+}
+
+test "SQL array parsed normalization is atomic and preserves shape and NULL provenance" {
+    const a = std.testing.allocator;
+    const parsed = try std.json.parseFromSlice(Json, a,
+        \\{"dimensions":[{"length":7,"lower_bound":-3}],"values":[16777217,0.1,-0.0,"NaN","Infinity","-Infinity",null],"sql_nulls":[false,false,false,false,false,false,true]}
+    , .{ .parse_numbers = false });
+    defer parsed.deinit();
+    var input = parsed.value;
+    const before = try std.json.Stringify.valueAlloc(a, input, .{});
+    defer a.free(before);
+    try std.testing.expectError(error.InvalidSqlArrayShape, normalize(.float32, &input, true, .{}));
+    try std.testing.expectError(error.SqlProgramLimitExceeded, normalize(.float32, &input, false, .{ .wire_bytes = 1 }));
+    const unchanged = try std.json.Stringify.valueAlloc(a, input, .{});
+    defer a.free(unchanged);
+    try std.testing.expectEqualStrings(before, unchanged);
+    const admission = try normalize(.float32, &input, false, .{});
+    try std.testing.expect(admission.work > 0);
+    const values = input.object.get("values").?.array.items;
+    try std.testing.expectEqual(@as(f64, 16777216), values[0].float);
+    try std.testing.expectEqual(@as(f64, @as(f32, 0.1)), values[1].float);
+    try std.testing.expect(std.math.signbit(values[2].float));
+    try std.testing.expectEqualStrings("NaN", values[3].string);
+    try std.testing.expectEqualStrings("Infinity", values[4].string);
+    try std.testing.expectEqualStrings("-Infinity", values[5].string);
+    try std.testing.expect(values[6] == .null);
+    try std.testing.expect(input.object.get("sql_nulls").?.array.items[6].bool);
+    try std.testing.expectEqualStrings("-3", input.object.get("dimensions").?.array.items[0].object.get("lower_bound").?.number_string);
+    _ = try normalize(.float32, &input, true, .{});
+    const canonical = try std.json.Stringify.valueAlloc(a, input, .{});
+    defer a.free(canonical);
+    _ = try normalize(.float32, &input, false, .{});
+    const again = try std.json.Stringify.valueAlloc(a, input, .{});
+    defer a.free(again);
+    try std.testing.expectEqualStrings(canonical, again);
+}
+
+test "SQL array parsed normalization does not mutate earlier cells on a late domain failure" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        \\{"dimensions":[{"length":2,"lower_bound":1}],"values":[16777217,"invalid"],"sql_nulls":[false,false]}
+        ,
+        \\{"dimensions":[{"length":2,"lower_bound":1}],"values":[16777217,1],"sql_nulls":[false,true]}
+        ,
+        \\{"dimensions":[{"length":2,"lower_bound":1}],"values":[16777217,1e100],"sql_nulls":[false,false]}
+    }) |text| {
+        const parsed = try std.json.parseFromSlice(Json, a, text, .{ .parse_numbers = false });
+        defer parsed.deinit();
+        var input = parsed.value;
+        const before = try std.json.Stringify.valueAlloc(a, input, .{});
+        defer a.free(before);
+        if (normalize(.float32, &input, false, .{})) |_| return error.ExpectedDomainFailure else |_| {}
+        const after = try std.json.Stringify.valueAlloc(a, input, .{});
+        defer a.free(after);
+        try std.testing.expectEqualStrings(before, after);
+    }
 }
 
 test "SQL array envelope streaming benchmark retains no per-cell serialization buffers" {
@@ -417,4 +545,25 @@ test "SQL array envelope streaming benchmark retains no per-cell serialization b
     const start = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
     for (0..16) |_| try encode(value, &writer.writer, .{});
     std.debug.print("SQL array envelope stream: cells={} bytes={} elapsed_ns={} encode_allocations=0\n", .{ count * 16, writer.count, std.Io.Clock.now(.awake, std.testing.io).nanoseconds - start });
+}
+
+test "SQL array parsed admission benchmark retains no cell vectors at maximum cardinality" {
+    const a = std.testing.allocator;
+    // Cardinality, bytes and work are independent admission limits. Explicit
+    // benchmark headroom measures the largest shape without loosening defaults.
+    const options: Options = .{ .values = .{ .work = 8 * 1024 * 1024 } };
+    for ([_]usize{ 4096, 65536 }) |count| {
+        var owner: std.heap.ArenaAllocator = .init(a);
+        defer owner.deinit();
+        const alloc = owner.allocator();
+        const cells = try alloc.alloc(arrays.Element, count);
+        for (cells, 0..) |*cell, index| cell.* = if (index % 16 == 0) .{} else arrays.Element.json(.{ .integer = @intCast(index) });
+        const value = try arrays.Value.init(.int64, &.{.{ .length = @intCast(count), .lower = -7 }}, cells, .{});
+        const input = try toJsonLeaky(alloc, value, options);
+        if (count == 65536) try std.testing.expectError(error.SqlProgramLimitExceeded, validate(.int64, input, .{}));
+        const start = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
+        var total_work: usize = 0;
+        for (0..4) |_| total_work += (try validate(.int64, input, options)).work;
+        std.debug.print("SQL array parsed admission: cells={} passes=4 elapsed_ns={} work={} materialized_cells=0 allocations=0\n", .{ count, std.Io.Clock.now(.awake, std.testing.io).nanoseconds - start, total_work });
+    }
 }
