@@ -16,6 +16,37 @@
 const std = @import("std");
 const Type = @import("backend.zig").Type;
 const Column = @import("backend.zig").Column;
+const Parameter = @import("backend.zig").Parameter;
+
+pub fn parameterOid(descriptor: Parameter) !u32 {
+    try @import("antfly_local_sources").sql_scalar.validateParameterType(descriptor);
+    if (descriptor.kind == .array) return (descriptor.element_type orelse return error.UnsupportedParameterType).arrayOid();
+    if (descriptor.element_type) |element| return element.oid();
+    return if (descriptor.kind) |kind| switch (kind) {
+        inline else => |tag| oid(@field(Type, @tagName(tag))),
+    } else 0;
+}
+
+pub fn parameterFromOid(value: u32) !Parameter {
+    const kind = try fromOid(value);
+    const Element = @import("antfly_local_sources").sql_array_value.ElementType;
+    const element: ?Element = switch (value) {
+        16, 1000 => .boolean,
+        21, 1005 => .int16,
+        23, 1007 => .int32,
+        20, 1016 => .int64,
+        700, 1021 => .float32,
+        701, 1022 => .float64,
+        25, 1043, 1009 => .text,
+        2950, 2951 => .uuid,
+        3802, 3807 => .jsonb,
+        else => null,
+    };
+    return .{ .kind = switch (kind) {
+        .unknown => null,
+        inline else => |tag| @field(@import("antfly_local_sources").sql_ast.ColumnType, @tagName(tag)),
+    }, .element_type = element };
+}
 
 pub fn oid(kind: Type) !u32 {
     return switch (kind) {
@@ -68,6 +99,7 @@ pub fn fromOid(value: u32) !Type {
         1184 => .datetime,
         114, 3802 => .json,
         2950 => .uuid,
+        1000, 1005, 1007, 1016, 1021, 1022, 1009, 2951, 3807 => .array,
         else => error.UnsupportedParameterType,
     };
 }
@@ -84,6 +116,13 @@ pub fn typeSize(kind: Type) i16 {
 pub fn decode(alloc: std.mem.Allocator, param_oid: u32, format: u16, bytes: []const u8) !std.json.Value {
     const kind = try fromOid(param_oid);
     if (format > 1) return error.UnsupportedParameterFormat;
+    if (kind == .array) {
+        const sources = @import("antfly_local_sources");
+        const element = (try parameterFromOid(param_oid)).element_type orelse return error.UnsupportedParameterType;
+        var decoded = if (format == 0) try sources.sql_array_text.decode(alloc, element, bytes, .{}) else try sources.sql_array_binary.decode(alloc, element, bytes, .{});
+        defer decoded.deinit();
+        return sources.sql_array_wire.toJsonLeaky(alloc, decoded.value, .{});
+    }
     if (format == 0) {
         if (!std.unicode.utf8ValidateSlice(bytes) or std.mem.indexOfScalar(u8, bytes, 0) != null) return error.InvalidParameter;
         return switch (kind) {
@@ -437,10 +476,18 @@ test "pgwire array columns retain element OIDs and lossless text and binary payl
         const envelope = try sources.sql_array_wire.toJsonLeaky(owner.allocator(), value.value, .{});
         const column: Column = .{ .name = "items", .type = .array, .element_type = case.kind };
         try std.testing.expectEqual(case.oid, try columnOid(column));
+        try std.testing.expectEqual(case.oid, try parameterOid(try parameterFromOid(case.oid)));
         for ([_]u16{ 0, 1 }) |format| {
             var expected: std.Io.Writer.Allocating = .init(a);
             defer expected.deinit();
             if (format == 0) try sources.sql_array_text.encode(value.value, &expected.writer, .{}) else try sources.sql_array_binary.encode(value.value, &expected.writer, .{});
+            const parameter = try decode(owner.allocator(), case.oid, format, expected.written());
+            var parameter_view = try sources.sql_array_wire.decode(a, case.kind, parameter, .{});
+            defer parameter_view.deinit();
+            var parameter_wire: std.Io.Writer.Allocating = .init(a);
+            defer parameter_wire.deinit();
+            if (format == 0) try sources.sql_array_text.encode(parameter_view.value, &parameter_wire.writer, .{}) else try sources.sql_array_binary.encode(parameter_view.value, &parameter_wire.writer, .{});
+            try std.testing.expectEqualSlices(u8, expected.written(), parameter_wire.written());
             var actual: std.Io.Writer.Allocating = .init(a);
             defer actual.deinit();
             try encodeColumnInto(a, &actual.writer, column, format, envelope, 8 * 1024 * 1024);
@@ -454,5 +501,5 @@ test "pgwire array columns retain element OIDs and lossless text and binary payl
     }
     try std.testing.expectError(error.UnsupportedParameterType, oid(.array));
     try std.testing.expectError(error.InvalidResult, columnOid(.{ .name = "missing", .type = .array }));
-    try std.testing.expectError(error.UnsupportedParameterType, fromOid(1016));
+    try std.testing.expectEqual(Type.array, try fromOid(1016));
 }

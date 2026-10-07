@@ -189,12 +189,13 @@ preparation layer; a 10,000-iteration composed-program test uses zero scratch
 allocation. The statement-wide integration below now uses this preparation layer.
 
 Statement-wide runtime binding now adopts the precise frame contract. PostgreSQL
-wire and public prepared-statement parameter metadata still need precise element
-descriptors before array input activation. Native datetime text inputs normalize to UTC, while
+wire retains precise parameter descriptors; public HTTP prepared-statement
+metadata still needs element descriptors before array input activation there.
+Native datetime text inputs normalize to UTC, while
 datetime binary parameters remain guarded until their codec is bound.
 Public array results now retain element identity, bounds and SQL NULL flags
 through generated HTTP descriptors and PostgreSQL text/binary result delivery.
-Prepared-statement array parameters, catalog storage and overloads converting
+HTTP prepared-statement array parameters, catalog storage and overloads converting
 whole arrays to text/JSON remain explicit activation gaps. Default decimal
 constructors still need an exact NUMERIC array representation; direct narrowing
 or text casts of these constructors remain guarded (explicit real/double casts
@@ -285,9 +286,23 @@ element descriptors rather than JSON placeholders. PostgreSQL oracle checks
 cover source-order inference, parameter widths, numeric function result types
 and array default promotion; allocation-fault tests cover nested plans and cursor
 ownership. A 10,000-iteration shared-program regression performs no evaluation
-scratch allocation. Prepared-statement/session and wire parameter metadata,
+scratch allocation. HTTP prepared-statement parameter metadata,
 physical array storage and exact NUMERIC arrays remain activation gaps. No original
 inventory dispositions change on the strength of these supplemental contracts.
+
+PostgreSQL wire Parse now carries precise input descriptors, preserving int2/int4/
+int8, real/double widths and supported array element OIDs. ParameterDescription
+uses inferred descriptors instead of substituting bigint for every integer.
+Bind accepts text or binary arrays through the existing bounded typed codecs;
+portals own descriptor metadata independently of the prepared statement. Execute,
+stream opening and subsequent cursor requests carry the same contract into native
+binding and frame preparation. SQL PREPARE shares these descriptors, including
+array declarations, and EXECUTE evaluates typed array arguments without JSON
+shape inference. NUMERIC, json, varchar and timestamp array declarations remain
+guarded where their exact codecs/identities are absent. Oracle tests independently
+verify the nine supported builtin array OIDs; wire tests cover inferred and
+declared input, both formats, SQL NULL, and prepared-owner retirement. These
+boundary contracts do not change the original case counts.
 
 Statement-invariant relation caches now use bounded replay storage rather than
 retaining an allocation per source row without a local spill boundary. Small

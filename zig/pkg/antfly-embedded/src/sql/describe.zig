@@ -202,6 +202,7 @@ pub fn bindInternal(allocator: std.mem.Allocator, backend: catalog.Backend, comp
     if (statement_backend.parameter_invocation == null and compiled.parameter_count != 0) {
         const invocation = try @import("parameter_binding.zig").Invocation.initLeaky(allocator, compiled.parameter_count);
         invocation.fallbacks = backend.parameter_fallback_types;
+        try invocation.mergeInferred(backend.parameter_descriptor_hints);
         statement_backend.parameter_invocation = invocation;
     }
     if (statement_backend.parameter_invocation) |invocation| try invocation.mergeCoarse(explicit_parameter_types);

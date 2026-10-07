@@ -1276,6 +1276,42 @@ class PostgresReferenceTest(unittest.TestCase):
                 finally:
                     self.db.execute("DEALLOCATE ALL")
 
+    def test_wire_parameter_descriptors_preserve_declared_and_inferred_array_oids(self):
+        for sql_type, oid in (
+            ("boolean", 1000),
+            ("smallint", 1005),
+            ("integer", 1007),
+            ("bigint", 1016),
+            ("real", 1021),
+            ("double precision", 1022),
+            ("text", 1009),
+            ("uuid", 2951),
+            ("jsonb", 3807),
+        ):
+            for declared in (False, True):
+                with self.subTest(sql_type=sql_type, declared=declared):
+                    types = f"({sql_type}[])" if declared else ""
+                    self.db.execute(
+                        f"PREPARE wire_array {types} AS SELECT cardinality($1::{sql_type}[])"
+                    )
+                    actual = self.db.execute(
+                        "SELECT parameter_types[1]::oid FROM pg_prepared_statements "
+                        "WHERE name='wire_array'"
+                    ).fetchone()[0]
+                    self.assertEqual(oid, actual)
+                    self.db.execute("DEALLOCATE wire_array", prepare=False)
+        self.db.execute(
+            "PREPARE wire_array(bigint[]) AS SELECT $1 a,cardinality($1),array_lower($1,1)"
+        )
+        row = self.db.execute(
+            "EXECUTE wire_array('[-1:0]={9007199254740993,NULL}')"
+        ).fetchone()
+        self.assertEqual(([9007199254740993, None], 2, -1), row)
+        self.assertEqual(
+            (None, None, None), self.db.execute("EXECUTE wire_array(NULL)").fetchone()
+        )
+        self.db.execute("DEALLOCATE wire_array", prepare=False)
+
     def test_prepared_parameter_inference_retains_builtin_widths(self):
         for expression, oids in (
             ("$1::smallint", [21]),

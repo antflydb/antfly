@@ -14373,6 +14373,46 @@ test "httpx SQL executes one relational page with exact integer parameters" {
                 try std.testing.expectEqual(std.math.Order.eq, try expected.value.compare(decoded.value, &work));
             }
         }
+        // Exercise the real authenticated adapter, not only a protocol mock:
+        // inferred/declared element identity must survive describe, execution
+        // and the pull cursor path after text/binary wire decoding.
+        for ([_]bool{ false, true }) |declared| for ([_]u16{ 0, 1 }) |format| {
+            var array_arena: std.heap.ArenaAllocator = .init(alloc);
+            defer array_arena.deinit();
+            const array_alloc = array_arena.allocator();
+            const sources = @import("antfly_local_sources");
+            const wire_values = @import("../pgwire/values.zig");
+            var source_array = try sources.sql_array_text.decode(alloc, .int64, "[-1:1]={9007199254740993,NULL,2}", .{});
+            defer source_array.deinit();
+            var encoded: std.Io.Writer.Allocating = .init(alloc);
+            defer encoded.deinit();
+            if (format == 0) try sources.sql_array_text.encode(source_array.value, &encoded.writer, .{}) else try sources.sql_array_binary.encode(source_array.value, &encoded.writer, .{});
+            var array_request = request;
+            array_request.statement = "SELECT $1::bigint[] a,cardinality($1) n FROM usage_records LIMIT 1";
+            array_request.parameter_types = if (declared) &.{.array} else &.{};
+            array_request.parameter_descriptors = if (declared) &.{.{ .kind = .array, .element_type = .int64 }} else &.{};
+            const description = try wire_backend.vtable.describe(wire_backend.context, array_alloc, credential, array_request);
+            try std.testing.expectEqual(@as(usize, 1), description.parameter_descriptors.len);
+            try std.testing.expectEqual(@as(u32, 1016), try wire_values.parameterOid(description.parameter_descriptors[0]));
+            array_request.parameter_types = description.parameter_types;
+            array_request.parameter_descriptors = description.parameter_descriptors;
+            array_request.parameters = &.{try wire_values.decode(array_alloc, 1016, format, encoded.written())};
+            var result = try wire_backend.vtable.execute(wire_backend.context, array_alloc, credential, array_request);
+            defer result.deinit();
+            try std.testing.expectEqual(@as(usize, 1), result.rows.len);
+            var actual = try sources.sql_array_wire.decode(alloc, .int64, result.rows[0][0], .{});
+            defer actual.deinit();
+            var work: sources.sql_array_value.Budget = .{};
+            try std.testing.expectEqual(std.math.Order.eq, try source_array.value.compare(actual.value, &work));
+            const stream = (try wire_backend.vtable.open_stream.?(wire_backend.context, array_alloc, credential, array_request)).?;
+            defer stream.close(stream.context);
+            var page = try stream.next(stream.context, array_alloc, array_request, 1);
+            defer page.result.deinit();
+            try std.testing.expectEqual(@as(usize, 1), page.result.rows.len);
+            var streamed = try sources.sql_array_wire.decode(alloc, .int64, page.result.rows[0][0], .{});
+            defer streamed.deinit();
+            try std.testing.expectEqual(std.math.Order.eq, try source_array.value.compare(streamed.value, &work));
+        };
         {
             const stream = (try wire_backend.vtable.open_stream.?(wire_backend.context, alloc, credential, request)) orelse return error.ExpectedReadStream;
             defer stream.close(stream.context);

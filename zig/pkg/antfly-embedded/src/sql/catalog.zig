@@ -334,6 +334,9 @@ pub const Backend = struct {
     /// Request-owned transport types fill only unconstrained parameters after
     /// SQL inference. They never replace explicit or schema-derived types.
     parameter_fallback_types: []const ?ast.ColumnType = &.{},
+    /// Authoritative Parse-time descriptors, including primitive widths and
+    /// array element identity. Unlike fallbacks these constrain SQL binding.
+    parameter_descriptor_hints: []const @import("scalar.zig").Type = &.{},
     /// Shared precise parameter constraints and execution frame for this
     /// statement, including its lowered/derived/mutation child plans.
     parameter_invocation: ?*@import("parameter_binding.zig").Invocation = null,

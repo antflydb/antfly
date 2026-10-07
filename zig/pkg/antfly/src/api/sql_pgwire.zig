@@ -175,9 +175,9 @@ pub const Adapter = struct {
         if (expressions.len != request.parameter_types.len) return error.InvalidSqlParameters;
         const scalar = @import("antfly_local_sources").sql_scalar;
         const result = try alloc.alloc(std.json.Value, expressions.len);
-        for (expressions, request.parameter_types, result) |expression, kind, *value| {
+        if (request.parameter_descriptors.len != 0 and request.parameter_descriptors.len != expressions.len) return error.InvalidSqlParameters;
+        for (expressions, request.parameter_types, result, 0..) |expression, kind, *value, index| {
             try request.check();
-            if (kind == .array) return error.UnsupportedParameterType;
             var compiled = try compiler.compileScalar(alloc, expression, .{});
             defer compiled.deinit();
             if (compiled.parameter_count != 0) return error.InvalidSqlParameters;
@@ -187,10 +187,13 @@ pub const Adapter = struct {
             };
             // Empty binding environment forbids table reads/correlated names;
             // the scalar compiler rejects subqueries and statement commands.
-            var program = try scalar.bindExpected(alloc, compiled.expression, &.{}, &.{}, expected, .{});
+            const descriptor: ?scalar.Type = if (request.parameter_descriptors.len != 0) request.parameter_descriptors[index] else if (expected) |type_| .{ .kind = type_ } else null;
+            var program = try scalar.bindTypedExpectedWithSettings(alloc, compiled.expression, &.{}, &.{}, descriptor, .{}, null);
             defer program.deinit();
             const evaluated = try program.evaluate(alloc, &.{}, &.{}, .{});
-            value.* = if (kind == .json and !evaluated.sql_null)
+            value.* = if (evaluated.array) |array|
+                try @import("antfly_local_sources").sql_array_wire.toJsonLeaky(alloc, array.*, .{})
+            else if (kind == .json and !evaluated.sql_null)
                 .{ .string = try std.json.Stringify.valueAlloc(alloc, evaluated.value, .{}) }
             else
                 try native.clone(alloc, evaluated.value);
@@ -374,6 +377,7 @@ const OwnedRead = struct {
         self.guarded = .{ .native = self.native_adapter.backend(), .authority = &self.authority, .revision = &self.native_adapter.revision, .expected_guard = self.authority.request.binding_guard };
         const parameters = try normalizeParameters(arena, request.parameters, request.parameter_types);
         var stream_backend = self.guarded.backend();
+        stream_backend.parameter_descriptor_hints = request.parameter_descriptors;
         if (plan.compiled().uses_current_setting) stream_backend.setting_capture = self.native_adapter.settingCapture();
         // Stream.open captures the owner view once; loadSettings validates the
         // prepared epoch on that same snapshot before binding or reading rows.
@@ -780,6 +784,7 @@ const Job = struct {
                 inline else => |tag| @field(ast.ColumnType, @tagName(tag)),
             };
             var describe_backend = guarded.backend();
+            describe_backend.parameter_descriptor_hints = self.request.parameter_descriptors;
             if (compiled.uses_current_setting) describe_backend.setting_capture = native_adapter.settingCapture();
             var description = try describe_sql.describe(self.alloc, describe_backend, compiled, hints);
             defer description.deinit();
@@ -790,13 +795,16 @@ const Job = struct {
             self.description = .{
                 .columns = columns,
                 .parameter_types = parameter_types,
+                .parameter_descriptors = try self.alloc.dupe(wire.Parameter, description.binding.parameter_descriptors),
                 .binding_guard = try statementBindingGuard(self.alloc, native_adapter.revision, description.binding),
                 .setting_epoch = if (description.settings) |view| view.epoch else null,
             };
             return;
         }
         const parameters = try normalizeParameters(self.alloc, self.request.parameters, self.request.parameter_types);
-        var result = native_adapter.execute(self.alloc, compiled, parameters, .{ .result_rows = self.request.limit }, guarded.backend()) catch |err| {
+        var execution_backend = guarded.backend();
+        execution_backend.parameter_descriptor_hints = self.request.parameter_descriptors;
+        var result = native_adapter.execute(self.alloc, compiled, parameters, .{ .result_rows = self.request.limit }, execution_backend) catch |err| {
             if (self.request.diagnostics) |diagnostic| diagnostic.transaction_status = @fromBackingInt(@backingInt(native_adapter.transaction_status));
             if (err == error.SqlMutationOutcomeUnknown or err == error.SqlTransactionOutcomeUnknown or err == error.SessionLeaseLost) if (self.request.diagnostics) |diagnostic|
                 diagnostic.set("40003", "transaction outcome is unknown; do not replay this statement", native_adapter.outcome_transaction_id, false);
@@ -861,6 +869,15 @@ test "SQL pgwire execute arguments use bounded scalar semantics without table ac
     try std.testing.expectEqualStrings("\"text\"", json_values[1].string);
     const null_values = try Adapter.evaluateScalarParameters(arena.allocator(), json_request, &.{ "NULL", "NULL::json" });
     try std.testing.expect(null_values[0] == .null and null_values[1] == .null);
+    var array_request = request;
+    array_request.parameter_types = &.{ .array, .integer };
+    array_request.parameter_descriptors = &.{ .{ .kind = .array, .element_type = .int64 }, .{ .kind = .integer, .element_type = .int32 } };
+    const array_values = try Adapter.evaluateScalarParameters(arena.allocator(), array_request, &.{ "'[-1:1]={9007199254740993,NULL,2}'::bigint[]", "42" });
+    var decoded = try @import("antfly_local_sources").sql_array_wire.decode(std.testing.allocator, .int64, array_values[0], .{});
+    defer decoded.deinit();
+    try std.testing.expectEqual(@as(i32, -1), decoded.value.dimensions[0].lower);
+    try std.testing.expectEqual(@as(i64, 9007199254740993), decoded.value.elements[0].value.integer);
+    try std.testing.expect(decoded.value.elements[1].sql_null);
     canceled.store(true, .release);
     try std.testing.expectError(error.QueryCanceled, Adapter.evaluateScalarParameters(arena.allocator(), request, &.{ "1", "'x'" }));
 }
