@@ -104,16 +104,17 @@ def test_real_iceberg_snapshots_schema_ids_partitions_deletes_and_restart(tmp_pa
         NestedField(3, "region", StringType(), required=False),
     ), partition_spec=PartitionSpec(PartitionField(
         source_id=3, field_id=1000, transform=IdentityTransform(), name="region")))
-    table.append(pa.table({"id": pa.array([1, 2, 3], type=pa.int64()),
-                           "label": ["one", "two", None], "region": ["west", "east", "west"]}))
+    table.append(pa.table({"id": pa.array([1, 2, 3, 6], type=pa.int64()),
+                           "label": ["one", "two", None, "six"], "region": ["west", "east", "west", "east"]}))
     first_snapshot = table.current_snapshot().snapshot_id
     # Old files still contain the physical name label and stable field ID 2.
     with table.update_schema() as update:
         update.rename_column("label", "title")
     table.append(pa.table({"id": pa.array([4, 5], type=pa.int64()),
                            "title": ["four", "five"], "region": ["east", "west"]}))
+    # A second east row forces a real copy-on-write file rewrite.
     table.delete("id = 2")
-    assert sorted(row["id"] for row in table.scan().to_arrow().to_pylist()) == [1, 3, 4, 5]
+    assert sorted(row["id"] for row in table.scan().to_arrow().to_pylist()) == [1, 3, 4, 5, 6]
     root = tmp_path / "lake"
     _export_table(table, root)
     binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
@@ -142,7 +143,7 @@ def test_real_iceberg_snapshots_schema_ids_partitions_deletes_and_restart(tmp_pa
             response = requests.post(server.api_url + "/sql", json={"statement": "SELECT COUNT(*) FROM ice_events"},
                                      auth=("admin", AUTH_BOOTSTRAP_PASSWORD), timeout=60)
             if response.ok:
-                assert response.json()["rows"] == [["4"]]
+                assert response.json()["rows"] == [["5"]]
                 break
             assert response.status_code in (404, 409, 503), response.text + server.debug_logs()
             assert time.monotonic() < deadline, response.text + server.debug_logs()
@@ -151,12 +152,12 @@ def test_real_iceberg_snapshots_schema_ids_partitions_deletes_and_restart(tmp_pa
         for cold in (False, True):
             if cold:
                 server.restart()
-            assert sql("SELECT id, title FROM ice_events ORDER BY id") == [["1", "one"], ["3", None], ["4", "four"], ["5", "five"]]
+            assert sql("SELECT id, title FROM ice_events ORDER BY id") == [["1", "one"], ["3", None], ["4", "four"], ["5", "five"], ["6", "six"]]
             assert sql("SELECT COUNT(*), SUM(id) FROM ice_events WHERE region = 'west'") == [["3", "9"]]
-            assert sql("SELECT id, label FROM ice_pinned ORDER BY id") == [["1", "one"], ["2", "two"], ["3", None]]
+            assert sql("SELECT id, label FROM ice_pinned ORDER BY id") == [["1", "one"], ["2", "two"], ["3", None], ["6", "six"]]
             with psycopg.connect(host="127.0.0.1", port=server.pgwire_port, user="admin",
-                                 password=AUTH_BOOTSTRAP_PASSWORD, dbname="antfly", autocommit=True) as connection:
-                assert connection.execute("SELECT id, title FROM ice_events WHERE region = 'east'").fetchall() == [(4, "four")]
+                                 password=AUTH_BOOTSTRAP_PASSWORD, dbname="default", autocommit=True) as connection:
+                assert connection.execute("SELECT id, title FROM ice_events WHERE region = 'east' ORDER BY id").fetchall() == [(4, "four"), (6, "six")]
         failed = False
     finally:
         server.stop(test_failed=failed)

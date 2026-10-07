@@ -309,6 +309,10 @@ test "external lake native text seeks a common term without reading its position
     owner.query_scoped = true;
     Owner.seal(owner);
     try std.testing.expect(owner.fallback == null);
+    var fork = try writer.forkImmutable();
+    defer fork.deinit();
+    try fork.replaceSegmentsManyData(&.{1}, &.{});
+    try std.testing.expectEqual(@as(u32, 0), fork.snapshot().liveDocCount());
     var authorized: Read = .{ .store = store, .cache = null, .context = .{ .io = std.testing.io }, .cancellation = .none };
     const bound = try writer.acquireSnapshotWithReadContext(&authorized);
     defer bound.release();

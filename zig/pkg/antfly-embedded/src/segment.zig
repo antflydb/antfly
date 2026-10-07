@@ -727,7 +727,9 @@ pub const SegmentReader = struct {
         }
     };
 
+    pub const InvertedFieldStats = struct { doc_count: u32, total_field_len: u64 };
     pub const FieldInfo = struct {
+        inverted_stats: ?InvertedFieldStats = null,
         name: []const u8,
         sections: []SectionInfo,
     };
@@ -765,6 +767,11 @@ pub const SegmentReader = struct {
             out.* = .{ .name = field.name, .sections = field.sections };
             initialized += 1;
             for (out.sections) |*section| {
+                if (section.section_type == .inverted_text and section.length != 0) {
+                    const view = try @import("segment_source.zig").View.init(native.range.source, section.offset, section.length);
+                    const stats = try inverted.RangeInvertedIndexReader.init(alloc, view, 1024 * 1024);
+                    out.inverted_stats = .{ .doc_count = stats.doc_count, .total_field_len = stats.total_field_len };
+                }
                 switch (section.section_type) {
                     .inverted_text, .typed_doc_values, .doc_ordinals, .vector, .columnar_stored => continue,
                     else => {},
@@ -1156,13 +1163,11 @@ pub const SegmentReader = struct {
 
     /// Collection statistics preserve lazy payload checksum validation. Native
     /// admission reads only field descriptors, as the mapped path does.
-    pub fn invertedFieldStats(self: *const SegmentReader, field: []const u8) !?struct { doc_count: u32, total_field_len: u64 } {
-        if (self.native) |native| {
-            const section = native.range.findSection(field, .inverted_text) orelse return null;
-            if (section.length == 0) return null;
-            const view = try @import("segment_source.zig").View.init(self.source(), section.offset, section.length);
-            const reader = try inverted.RangeInvertedIndexReader.init(self.alloc, view, 1024 * 1024);
-            return .{ .doc_count = reader.doc_count, .total_field_len = reader.total_field_len };
+    pub fn invertedFieldStats(self: *const SegmentReader, field: []const u8) !?InvertedFieldStats {
+        if (self.native != null) {
+            // Immutable admission metadata survives cache capability sealing.
+            for (self.fields) |info| if (std.mem.eql(u8, info.name, field)) return info.inverted_stats;
+            return null;
         }
         for (self.fields) |info| if (std.mem.eql(u8, info.name, field)) {
             for (info.sections) |section| if (section.section_type == .inverted_text) {

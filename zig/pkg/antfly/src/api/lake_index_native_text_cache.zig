@@ -386,6 +386,12 @@ const Entry = struct {
         try self.writer.?.shareImmutableSegments(shared.items);
         if (removed.items.len != 0 or replacements.len != 0) try self.writer.?.replaceSegmentsManyData(removed.items, replacements);
         loaded = 0; // writer owns every replacement after atomic publication
+        for (replacements) |replacement| {
+            if (replacement.data == .native and replacement.data.native == .ranges) {
+                const range = replacement.data.native.ranges;
+                if (range.seal_read_context) |seal| seal(range.ptr);
+            }
+        }
         const ordered_ids = try self.allocator.alloc(u64, root.segments.len);
         defer self.allocator.free(ordered_ids);
         for (root.segments, ordered_ids) |segment, *id| id.* = self.segments.get(segment.artifact_id).?.id;

@@ -3639,3 +3639,58 @@ test "snapshot frequency cache allocation failures preserve successful reads" {
         try std.testing.expectEqual(@as(usize, 0), snapshot.term_doc_freq_cache_key_bytes);
     }
 }
+
+fn boundNativeSnapshotScenario(a: Allocator) !void {
+    const bytes = try buildTestSegmentWithIds(std.testing.allocator, &.{.{ .id = "one", .terms = &.{.{ .term = "common", .freq = 2, .norm = 2 }} }});
+    defer std.testing.allocator.free(bytes);
+    const State = struct {
+        const Self = @This();
+        bytes: []const u8,
+        closed: bool = false,
+        fn read(raw: *anyopaque, offset: u64, out: []u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            @memcpy(out, self.bytes[@intCast(offset)..][0..out.len]);
+        }
+        fn close(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.closed = true;
+        }
+        const Query = struct {
+            a: Allocator,
+            state: *Self,
+            fn read(raw: *anyopaque, offset: u64, out: []u8) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                if (self.state.closed) return error.TestReadAfterClose;
+                try Self.read(self.state, offset, out);
+            }
+            fn close(raw: *anyopaque) void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.a.destroy(self);
+            }
+        };
+        fn bind(raw: *anyopaque, alloc: Allocator, _: *anyopaque) !SegmentSource {
+            const bound_state: *@This() = @ptrCast(@alignCast(raw));
+            const query = try alloc.create(Query);
+            query.* = .{ .a = alloc, .state = bound_state };
+            return .{ .ranges = .{ .ptr = query, .length = bound_state.bytes.len, .read_into = Query.read, .close = Query.close } };
+        }
+    };
+    var state: State = .{ .bytes = bytes };
+    var writer = try IndexWriter.init(a);
+    var writer_open = true;
+    defer if (writer_open) writer.deinit();
+    try writer.addSegmentWithIdData(1, .fromNative(.{ .ranges = .{ .ptr = &state, .length = bytes.len, .read_into = State.read, .close = State.close, .bind_read_context = State.bind } }));
+    const bound = try writer.acquireSnapshotWithReadContext(&state);
+    defer bound.release();
+    writer.deinit();
+    writer_open = false;
+    try std.testing.expect(!state.closed);
+    var footer: [4]u8 = undefined;
+    try bound.segments[0].query_source.?.readInto(bytes.len - 4, &footer);
+    try std.testing.expectEqualSlices(u8, bytes[bytes.len - 4 ..], &footer);
+}
+
+test "external lake query-bound native snapshots retain their source and unwind every allocation failure" {
+    try boundNativeSnapshotScenario(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, boundNativeSnapshotScenario, .{});
+}
