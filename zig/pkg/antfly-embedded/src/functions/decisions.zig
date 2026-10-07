@@ -17,12 +17,12 @@
 //! to the supplied allocator (normally a bounded request arena).
 const std = @import("std");
 pub const Json = std.json.Value;
-pub const Provider = enum { antfly, jev };
+pub const Provider = enum { antfly, jev, openai };
 pub const Kind = enum { choice, score, noul };
 pub const Function = enum { ai_decide, ai_choice, ai_score, ai_probability };
 pub const Capabilities = struct { max_questions: usize = 64, max_choices: usize = 64, max_levels: usize, max_input_bytes: usize = 1024 * 1024, full_distribution: bool = true };
 pub fn capabilities(provider: Provider) Capabilities {
-    return .{ .max_levels = if (provider == .jev) 10 else 64 };
+    return .{ .max_levels = if (provider == .antfly) 64 else 10 };
 }
 pub const RateLimit = struct {
     pacing: ?enum { token_bucket, completion } = null,
@@ -42,7 +42,7 @@ pub const DeciderConfig = struct {
     rate_limit: ?RateLimit = null,
     pub fn validate(self: @This()) !void {
         if (self.max_rows == 0 or self.max_input_tokens == 0 or self.batch_size == 0 or self.batch_size > 256) return error.InvalidDeciderConfig;
-        if (self.provider == .antfly and std.mem.trim(u8, self.model, " \r\n\t").len == 0) return error.InvalidDeciderConfig;
+        if (self.provider != .jev and std.mem.trim(u8, self.model, " \r\n\t").len == 0) return error.InvalidDeciderConfig;
         if (std.mem.indexOfAny(u8, self.url, "\r\n") != null) return error.InvalidDeciderConfig;
         if (self.rate_limit) |policy| {
             inline for (.{ policy.requests_per_minute, policy.burst, policy.tokens_per_minute, policy.max_concurrency }) |value| if (value) |v| if (v == 0) return error.InvalidDeciderConfig;
@@ -53,7 +53,11 @@ pub const DeciderConfig = struct {
         return if (self.model.len != 0) self.model else "jev-latest";
     }
     pub fn baseUrl(self: @This()) []const u8 {
-        return if (self.url.len != 0) self.url else if (self.provider == .jev) "https://api.typesafe.ai" else "http://127.0.0.1:8082";
+        return if (self.url.len != 0) self.url else switch (self.provider) {
+            .antfly => "http://127.0.0.1:8082",
+            .jev => "https://api.typesafe.ai",
+            .openai => "https://api.openai.com/v1",
+        };
     }
     pub fn clone(self: @This(), a: std.mem.Allocator) !@This() {
         var result = self;
@@ -311,4 +315,22 @@ test "decision provider limits and score normalization preserve ordinal semantic
     var priority = answers.object.getPtr("priority").?;
     try priority.object.put(a, "probabilities", jsonObject());
     try std.testing.expectError(error.InvalidDecisionOutput, normalizeResponse(a, questions, malformed));
+}
+
+test "decision provider OpenAI configuration and score limits" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const json = try std.json.parseFromSliceLeaky(Json, a, "{\"provider\":\"openai\",\"model\":\"gpt-6-luna\",\"rate_limit\":{\"max_concurrency\":2}}", .{});
+    const cfg = try parseConfig(a, json);
+    try std.testing.expectEqual(Provider.openai, cfg.provider);
+    try std.testing.expectEqualStrings("gpt-6-luna", cfg.modelName());
+    try std.testing.expectEqualStrings("https://api.openai.com/v1", cfg.baseUrl());
+    try std.testing.expectEqual(@as(?u32, 2), cfg.rate_limit.?.max_concurrency);
+    try std.testing.expectError(error.InvalidDeciderConfig, (DeciderConfig{ .provider = .openai }).validate());
+    try std.testing.expectError(error.InvalidDeciderConfig, (DeciderConfig{ .provider = .openai, .model = " \t " }).validate());
+    const levels = try std.json.parseFromSliceLeaky(Json, a, "[\"0\",\"1\",\"2\",\"3\",\"4\",\"5\",\"6\",\"7\",\"8\",\"9\",\"10\"]", .{});
+    const questions = try questionsFor(a, .ai_score, &.{ .{ .string = "context" }, .{ .string = "Risk?" }, levels, .{ .string = "openai" } });
+    try std.testing.expectError(error.DecisionLimitExceeded, validateQuestions(questions, capabilities(.openai)));
+    try validateQuestions(questions, capabilities(.antfly));
 }
