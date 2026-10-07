@@ -948,3 +948,15 @@ zero exit status. The [read-index receipt](qualification/workload-pooling/receip
 preserves the exact artifact hash, commands and complete logs. Live stalled
 quorum/apply transport, native owner-lock execution and complete corrected
 production/API qualification remain separate requirements.
+
+
+Linux routed-read/retained-owner verification passes all 119 selected tests,
+including both registry lifetime contracts and the borrowed-wait poison checks.
+Three exact artifacts also pass under two CPUs and 2 GiB without extra swap,
+with required test counts/names, matching artifact hashes, zero exit statuses
+and no skips/leaks. The [read-index receipt](qualification/workload-pooling/receipts/2026-10-07/read-index-waits/README.md)
+preserves the full logs. Compiler estimate overruns remain visible; corrected
+26 GiB storage and 21 GiB routed-implementation reservations were attempted in
+the isolated build snapshot, but Zig correctly declined the 26 GiB step against
+the Docker VM's 23.43 GiB available budget. That attempted graph is not a passing
+production qualification. Native preparation/API work is verified separately.

@@ -71,3 +71,26 @@ this evidence; the compiler reservation correction is recorded separately.
 This proves the owner-lock failure schedules, not a complete stalled quorum or
 apply schedule with live peer transport. Native execution of the new owner-lock
 fixture and the full corrected CLI/API graph remain separate gates.
+
+Routed-read/retained-owner Linux qualification passes 14 local implementation,
+22 physical implementation and 83 consumer tests (119 total), with all 84 build
+steps reported succeeded. Both retained-owner lifetime contracts run, including
+nonnull poison wait callbacks on immediate and delayed snapshot opens: the
+physical opener sees no borrowed request callback. Complete logs retain compiler
+reservation overruns for storage (21,815,246,848 bytes against 20 GiB) and the
+routed implementation tests (17,479,122,944 bytes against 8 GiB). This run does
+not establish passing those compiler reservations.
+
+All three exact artifacts then pass again with two CPUs, 2 GiB memory and no
+extra swap or compiler. The verifier checks artifact hashes, all 119 tests and
+both lifetime fixture names, and each artifact has an explicit zero exit status.
+No tests skip or leak.
+
+The corrected build snapshot reserves 26 GiB for the measured storage profile
+and 21 GiB for native GNU ARM64 ReleaseSafe routed-read implementation tests;
+both include more than 25% measured headroom. Its graph parses but Zig refuses
+to admit the 26 GiB storage step against this Docker VM's 25,159,036,928-byte
+available-memory budget. The adjacent insufficient-VM log is negative evidence,
+not a passing corrected-graph receipt. The two corrected build-source hashes
+pin that attempted graph. Whole corrected CLI/API graph qualification remains
+required on an environment that can admit the declared compile reservation.
