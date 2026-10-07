@@ -644,7 +644,7 @@ pub const Stream = struct {
             const names = try arena.alloc([]const u8, needed.count());
             var iterator = needed.keyIterator();
             for (names) |*name| name.* = iterator.next().?.*;
-            const row_goal: ?u64 = if (statement.limit != null and statement.predicate == null) (try self.context.count(statement.offset, 0)) +| (try self.context.count(statement.limit, 0)) else null;
+            const row_goal: ?u64 = if (statement.limit != null and predicates.complete) (try self.context.count(statement.offset, 0)) +| (try self.context.count(statement.limit, 0)) else null;
             const request: catalog.Scan = .{ .row_goal = row_goal, .fields = names, .order = requested_order, .conditions = predicates.terms.items, .primary_key = predicates.primary_key, .limit = limits.page_rows };
             if (backend.vtable.open_scan) |open_scan| {
                 const candidate = try open_scan(backend.ptr, self.budget.allocator(), table, request);
@@ -740,7 +740,7 @@ pub const Stream = struct {
         self.failed = false;
         self.exhausted = predicates.empty or self.remaining == 0;
         self.cursor = preferred;
-        self.request = .{ .row_goal = if (statement.limit != null and statement.predicate == null) self.skip +| self.remaining else null, .order = requested_order, .fields = needed.items, .primary_order = binding.primary_order, .primary_key = predicates.primary_key, .conditions = predicates.terms.items, .limit = limits.page_rows };
+        self.request = .{ .row_goal = if (statement.limit != null and predicates.complete) self.skip +| self.remaining else null, .order = requested_order, .fields = needed.items, .primary_order = binding.primary_order, .primary_key = predicates.primary_key, .conditions = predicates.terms.items, .limit = limits.page_rows };
         errdefer if (self.stream_manager) |manager| {
             manager.deinit();
             self.budget.allocator().destroy(manager);

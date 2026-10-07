@@ -341,77 +341,12 @@ pub const Replay = struct {
                 ref.* = .{ .external = .{ .source_id = inventory.source_id, .snapshot_id = inventory.snapshot_id, .file_id = inventory.files[file].file_id, .row_group_ordinal = std.math.cast(u32, (try block.keyCell(index, 1)).value.integer) orelse return error.InvalidSqlSpill, .row_ordinal = @bitCast((try block.keyCell(index, 2)).value.integer) } };
             }
             const columns = try a.alloc(rows.ColumnVector, self.columns.len);
-            const physical = try block.batch(a, false);
             for (self.columns, columns) |name, *column| {
                 const ordinal = for (self.owner.columns, 0..) |candidate, index| {
                     if (std.mem.eql(u8, candidate, name)) break index;
                 } else return error.RowSourceColumnKindMismatch;
-                const nulls = try a.alloc(u8, block.count());
-                for (nulls, 0..) |*flag, index| flag.* = @intFromBool((try block.cell(index, ordinal)).sql_null);
-                const kind = self.owner.kinds[ordinal];
-                // Reuse compact dictionary IDs through every build consumer.
-                // JSON has a distinct logical domain and remains plain bytes.
-                if (kind == .i64 or kind == .f64 or kind == .bytes) {
-                    if (try physical.dictionaryColumn(a, ordinal)) |dictionary| {
-                        const encoded = dictionary.dictionary;
-                        const values: rows.ColumnValues = switch (kind) {
-                            .i64 => blk: {
-                                const entries = try a.alloc(i64, encoded.values.len);
-                                for (entries, encoded.values) |*entry, datum| entry.* = if (datum.sql_null or datum.value == .null) 0 else datum.value.integer;
-                                break :blk .{ .dictionary_i64 = .{ .values = entries, .indices = encoded.indices } };
-                            },
-                            .f64 => blk: {
-                                const entries = try a.alloc(f64, encoded.values.len);
-                                for (entries, encoded.values) |*entry, datum| entry.* = if (datum.sql_null or datum.value == .null) 0 else datum.value.float;
-                                break :blk .{ .dictionary_f64 = .{ .values = entries, .indices = encoded.indices } };
-                            },
-                            .bytes => blk: {
-                                const entries = try a.alloc([]const u8, encoded.values.len);
-                                for (entries, encoded.values) |*entry, datum| entry.* = if (datum.sql_null or datum.value == .null) "" else datum.value.string;
-                                break :blk .{ .dictionary_bytes = .{ .values = entries, .indices = encoded.indices } };
-                            },
-                            else => unreachable,
-                        };
-                        column.* = .{ .name = name, .values = values, .nulls = .{ .bytes = nulls } };
-                        continue;
-                    }
-                }
-                const values: rows.ColumnValues = switch (kind) {
-                    .i64 => blk: {
-                        const v = try a.alloc(i64, block.count());
-                        for (v, 0..) |*value, index| {
-                            const cell = try block.cell(index, ordinal);
-                            value.* = if (cell.sql_null) 0 else cell.value.integer;
-                        }
-                        break :blk .{ .i64 = v };
-                    },
-                    .f64 => blk: {
-                        const v = try a.alloc(f64, block.count());
-                        for (v, 0..) |*value, index| {
-                            const cell = try block.cell(index, ordinal);
-                            value.* = if (cell.sql_null) 0 else cell.value.float;
-                        }
-                        break :blk .{ .f64 = v };
-                    },
-                    .bool => blk: {
-                        const v = try a.alloc(bool, block.count());
-                        for (v, 0..) |*value, index| {
-                            const cell = try block.cell(index, ordinal);
-                            value.* = if (cell.sql_null) false else cell.value.bool;
-                        }
-                        break :blk .{ .bool = v };
-                    },
-                    .bytes, .json => blk: {
-                        const v = try a.alloc([]const u8, block.count());
-                        for (v, 0..) |*value, index| {
-                            const cell = try block.cell(index, ordinal);
-                            value.* = if (cell.sql_null) "" else cell.value.string;
-                        }
-                        break :blk if (kind == .json) .{ .json = v } else .{ .bytes = v };
-                    },
-                    else => return error.UnsupportedExternalLakeIndex,
-                };
-                column.* = .{ .name = name, .values = values, .nulls = .{ .bytes = nulls } };
+                column.* = try block.columnVector(a, ordinal, self.owner.kinds[ordinal]);
+                column.name = name;
             }
             return .{ .snapshot = .{ .table_id = inventory.source_id, .snapshot_id = inventory.snapshot_id }, .row_refs = refs, .columns = columns };
         }

@@ -689,6 +689,7 @@ pub const SegmentReader = struct {
 
     const Native = struct {
         range: RangeSegmentReader,
+        borrowed_navigation: bool = false,
         stored_metadata: [21]u8 = @splat(0),
         identity_mutex: std.atomic.Mutex = .unlocked,
         metadata_cache: ?@import("segment_source.zig").ConcurrentBlockCache = null,
@@ -789,6 +790,32 @@ pub const SegmentReader = struct {
         errdefer alloc.free(validations);
         try input_source.readInto(input_source.len() - 24, &index_bytes);
         return .{ .alloc = alloc, .data = &.{}, .native = native, .stored_offset = native.range.stored_offset, .stored_length = native.range.stored_length, .stored_metadata_length = native.range.stored_metadata_length, .stored_block_validations = validations, .index_offset = std.mem.readInt(u64, &index_bytes, .big), .doc_count = native.range.doc_count, .num_fields = @intCast(fields.len), .fields = fields };
+    }
+
+    /// The enclosing snapshot pins this reader's physical segment. Reuse its
+    /// admitted navigation without rereading metadata under every query. Only
+    /// query-local cache state and the capability-bound source are allocated.
+    pub fn bindSource(self: *const SegmentReader, alloc: Allocator, input_source: SegmentSource) !SegmentReader {
+        const base = self.native orelse return error.InvalidSegment;
+        if (input_source.len() != base.range.source.len()) return error.InvalidSegment;
+        const native = try alloc.create(Native);
+        errdefer alloc.destroy(native);
+        native.* = .{ .range = base.range, .borrowed_navigation = true, .stored_metadata = base.stored_metadata };
+        native.range.alloc = alloc;
+        native.range.owns_source = false;
+        native.range.owns_fields = false;
+        native.range.paged_source = null;
+        native.range.source = input_source;
+        if (base.range.paged_source) |paged| {
+            native.range.paged_source = try paged.bind(alloc, input_source);
+            native.range.source = native.range.paged_source.?.source();
+        }
+        errdefer native.range.deinit();
+        native.metadata_cache = try @import("segment_source.zig").ConcurrentBlockCache.init(alloc, native.range.source, 256 * 1024);
+        var bound = self.*;
+        bound.alloc = alloc;
+        bound.native = native;
+        return bound;
     }
 
     pub fn nativeNavigationBytes(self: *const SegmentReader) usize {
@@ -996,11 +1023,13 @@ pub const SegmentReader = struct {
 
     pub fn deinit(self: *SegmentReader) void {
         if (self.native) |native| {
-            for (self.fields) |field| for (field.sections) |section| {
-                if (section.cached_navigation) |bytes| self.alloc.free(bytes);
-            };
-            self.alloc.free(self.fields);
-            self.alloc.free(self.stored_block_validations.?);
+            if (!native.borrowed_navigation) {
+                for (self.fields) |field| for (field.sections) |section| {
+                    if (section.cached_navigation) |bytes| self.alloc.free(bytes);
+                };
+                self.alloc.free(self.fields);
+                self.alloc.free(self.stored_block_validations.?);
+            }
             var pages = native.identity_pages.valueIterator();
             while (pages.next()) |bytes| self.alloc.free(bytes.*);
             native.identity_pages.deinit(self.alloc);
@@ -5497,6 +5526,7 @@ pub const RangeSegmentReader = struct {
     id_bytes_length: u64,
     paged_source: ?*integrity.PagedSource = null,
     owns_source: bool = true,
+    owns_fields: bool = true,
 
     pub const Field = struct { name: []u8, sections: []SegmentReader.SectionInfo };
     pub const Options = struct {
@@ -5625,11 +5655,13 @@ pub const RangeSegmentReader = struct {
     }
 
     pub fn deinit(self: *RangeSegmentReader) void {
-        for (self.fields) |field| {
-            self.alloc.free(field.name);
-            self.alloc.free(field.sections);
+        if (self.owns_fields) {
+            for (self.fields) |field| {
+                self.alloc.free(field.name);
+                self.alloc.free(field.sections);
+            }
+            self.alloc.free(self.fields);
         }
-        self.alloc.free(self.fields);
         // Cache registrations borrow the source's accounting owner. Release
         // them before the final source lease can destroy that owner.
         var owned_source = if (self.paged_source) |paged| paged.original else self.source;

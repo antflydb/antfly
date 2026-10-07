@@ -585,7 +585,8 @@ fn openWithPolicy(a: A, server: *server_api.ApiHttpServer, table: catalog.Table,
                 }
             }
         }
-        cost.* = estimatedAccessCost(candidates, owner.covered, order_satisfied, request.row_goal, physical_bytes, row_groups);
+        const goal = if (rangeEnforcesConditions(definition, request, equal_count)) request.row_goal else null;
+        cost.* = estimatedAccessCost(candidates, owner.covered, order_satisfied, goal, physical_bytes, row_groups);
         const scan_cost = (source_rows +| (physical_bytes / 1024)) *| @as(u64, if (order_satisfied) 2 else 1);
         if (cost.* > scan_cost and candidates != 0) return null;
     }
@@ -647,6 +648,29 @@ fn accessCost(candidates: u64, covered: bool, ordered_access: bool) u64 {
     return (row_cost +| 32) / @as(u64, if (ordered_access) 2 else 1);
 }
 
+// chooseAccess emits an equality prefix plus at most one lower/upper bound
+// on its next key. Only that shape can consume OFFSET+LIMIT candidates without
+// assuming selectivity for a residual, covered column or overwritten bound.
+fn rangeEnforcesConditions(index: local.storage_relational_index.RelationalIndexDefinition, request: catalog.Scan, equal_count: usize) bool {
+    for (request.conditions, 0..) |condition, ordinal| {
+        const key = for (index.keys, 0..) |candidate, position| {
+            if (candidate.expression_json == null and candidate.collation == null and std.mem.eql(u8, candidate.column, condition.column)) break position;
+        } else return false;
+        const lower = condition.op == .gt or condition.op == .gte;
+        const upper = condition.op == .lt or condition.op == .lte;
+        if (condition.op == .eq) {
+            if (key >= equal_count) return false;
+        } else if ((!lower and !upper) or key != equal_count) return false;
+        for (request.conditions[0..ordinal]) |previous| {
+            if (!std.mem.eql(u8, previous.column, condition.column)) continue;
+            const previous_lower = previous.op == .gt or previous.op == .gte;
+            const previous_upper = previous.op == .lt or previous.op == .lte;
+            if (condition.op == .eq or (lower and previous_lower) or (upper and previous_upper)) return false;
+        }
+    }
+    return true;
+}
+
 fn estimatedAccessCost(candidates: u64, covered: bool, ordered_access: bool, row_goal: ?u64, projected_bytes: u64, row_groups: u64) u64 {
     const consumed = if (ordered_access) if (row_goal) |goal| @min(candidates, goal) else candidates else candidates;
     var cost = accessCost(consumed, covered, ordered_access);
@@ -670,4 +694,14 @@ test "external lake access cost favors selective and covering ranges" {
     try std.testing.expect(accessCost(900, false, false) > 1000);
     try std.testing.expect(accessCost(900, true, false) < 1000);
     try std.testing.expect(accessCost(900, true, true) < accessCost(900, true, false));
+}
+
+test "external lake filtered row goals require every predicate to be enforced by tuple bounds" {
+    const index: local.storage_relational_index.RelationalIndexDefinition = .{ .name = "tenant_ts", .owner_kind = .table, .owner_name = "tenant_ts", .access_method = .ordered_tuple, .keys = &.{ .{ .column = "tenant" }, .{ .column = "ts" } } };
+    var request: catalog.Scan = .{ .fields = &.{"ts"}, .limit = 256, .row_goal = 3, .conditions = &.{ .{ .column = "tenant", .op = .eq, .value = .{ .string = "a" } }, .{ .column = "ts", .op = .gte, .value = .{ .integer = 1 } }, .{ .column = "ts", .op = .lt, .value = .{ .integer = 10 } } } };
+    try std.testing.expect(rangeEnforcesConditions(index, request, 1));
+    request.conditions = &.{ .{ .column = "tenant", .op = .eq, .value = .{ .string = "a" } }, .{ .column = "covered_residual", .op = .eq, .value = .{ .integer = 1 } } };
+    try std.testing.expect(!rangeEnforcesConditions(index, request, 1));
+    request.conditions = &.{ .{ .column = "tenant", .op = .eq, .value = .{ .string = "a" } }, .{ .column = "ts", .op = .gte, .value = .{ .integer = 1 } }, .{ .column = "ts", .op = .gt, .value = .{ .integer = 5 } } };
+    try std.testing.expect(!rangeEnforcesConditions(index, request, 1));
 }

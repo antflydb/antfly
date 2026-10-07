@@ -157,8 +157,9 @@ const Owner = struct {
             const metadata = containing(self.directory.metadata, offset);
             const block = if (metadata == null) containing(self.directory.blocks, offset) else null;
             const piece = if (metadata) |index| self.directory.metadata[index] else if (block) |index| self.directory.blocks[index] else return error.InvalidNativeLakeTextCorpus;
-            const data = try artifacts.readArtifact(self.a, capability.store, piece.ref, capability.cancellation, capability.cache);
-            defer self.a.free(data);
+            var lease = try artifacts.readArtifactLease(self.a, capability.store, piece.ref, capability.cancellation, capability.cache);
+            defer lease.deinit();
+            const data = lease.bytes();
             try capability.check();
             const within = offset - piece.offset;
             const take = @min(out.len - done, data.len - within);
@@ -233,8 +234,8 @@ test "external lake seekable text loads touched postings and keeps exact scoring
     var loaded_count: usize = 0;
     for (owner.loaded) |loaded| loaded_count += @intFromBool(loaded);
     try std.testing.expect(loaded_count != 0);
-    // A cache entry must use the current query's store capability, and a
-    // failed flight must remain retryable by a later authorized reader.
+    // Bound readers use the current query's store capability. A failed read
+    // must leave shared navigation reusable by a later authorized query.
     var retry_writer = try local.index.IndexWriter.init(a);
     defer retry_writer.deinit();
     try retry_writer.addSegmentWithIdData(1, try load(a, .{ .store = store, .cache = null, .context = .{}, .cancellation = .none }, ref));
@@ -249,8 +250,14 @@ test "external lake seekable text loads touched postings and keeps exact scoring
     var denied = store;
     denied.vtable = &vtable;
     var failed: Read = .{ .store = denied, .cache = null, .context = .{}, .cancellation = .none };
-    try std.testing.expectError(error.TestRemoteUnavailable, retry_writer.acquireSnapshotWithReadContext(&failed));
-    const retried = try retry_writer.snapshot().search(a, "body", &.{"alpha"}, 10);
+    const denied_snapshot = try retry_writer.acquireSnapshotWithReadContext(&failed);
+    defer denied_snapshot.release();
+    var denied_bytes: [4]u8 = undefined;
+    try std.testing.expectError(error.TestRemoteUnavailable, denied_snapshot.segments[0].query_source.?.readInto(0, &denied_bytes));
+    var authorized: Read = .{ .store = store, .cache = null, .context = .{}, .cancellation = .none };
+    const authorized_snapshot = try retry_writer.acquireSnapshotWithReadContext(&authorized);
+    defer authorized_snapshot.release();
+    const retried = try authorized_snapshot.search(a, "body", &.{"alpha"}, 10);
     defer a.free(retried.hits);
     try std.testing.expectEqual(@as(u32, 2), retried.total_count);
     // A fresh query's context must supersede the builder's context, even if

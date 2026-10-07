@@ -178,16 +178,19 @@ pub const Cache = struct {
         return std.fmt.allocPrint(a, "{s}:purpose=sidecar_payload", .{std.fmt.bytesToHex(hash.finalResult(), .lower)});
     }
     pub const ImmutableLease = union(enum) {
+        shared: ranges.RangeLease,
         heap: struct { alloc: Allocator, bytes: []u8 },
         mapped: parquet.PersistentObjectRangeCache.MappedEntry,
         pub fn bytes(self: ImmutableLease) []const u8 {
             return switch (self) {
+                .shared => |value| value.bytes,
                 .heap => |value| value.bytes,
                 .mapped => |value| value.bytes,
             };
         }
         pub fn deinit(self: *ImmutableLease) void {
             switch (self.*) {
+                .shared => |value| value.release(),
                 .heap => |value| value.alloc.free(value.bytes),
                 .mapped => |*value| value.deinit(),
             }
@@ -207,6 +210,30 @@ pub const Cache = struct {
         };
         return .{ .heap = .{ .alloc = a, .bytes = try self.readImmutableKeyAlloc(a, key, length, digest, context, loader) } };
     }
+    /// Small immutable ranges prefer a pinned RAM entry. No payload allocation
+    /// or copy occurs on a hit; pinned entries remain charged and unevictable.
+    /// Large contiguous segment callers retain readImmutableLease's disk-first
+    /// policy so they can discard clean mapped pages under memory pressure.
+    pub fn readImmutableBlockLease(self: *Cache, a: Allocator, scope: [32]u8, identity: []const u8, length: usize, digest: [32]u8, context: Context, loader: ImmutableLoader) !ImmutableLease {
+        try context.ensureActive();
+        const key = try immutableKey(a, scope, identity, length, digest);
+        defer a.free(key);
+        if (self.pin(key)) |pinned| {
+            errdefer pinned.release();
+            try context.ensureActive();
+            return .{ .shared = pinned };
+        }
+        var lease = try self.readImmutableLease(a, scope, identity, length, digest, context, loader);
+        errdefer lease.deinit();
+        if (lease == .heap) if (self.pin(key)) |pinned| {
+            errdefer pinned.release();
+            try context.ensureActive();
+            lease.deinit();
+            return .{ .shared = pinned };
+        };
+        return lease;
+    }
+
     fn readImmutableKeyAlloc(self: *Cache, a: Allocator, key: []const u8, length: usize, digest: [32]u8, context: Context, loader: ImmutableLoader) ![]u8 {
         if (try self.lookup(a, key)) |bytes| {
             errdefer a.free(bytes);
@@ -903,4 +930,33 @@ test "external lake disk cache initialization failure preserves source reads" {
     defer lease.release();
     try std.testing.expectEqualStrings("data", lease.bytes);
     try std.testing.expectEqual(@as(u64, 1), cache.snapshot().provider_reads);
+}
+
+test "external lake immutable block leases borrow RAM and pin bytes through eviction pressure" {
+    const a = std.testing.allocator;
+    var cache = Cache.init(a);
+    defer cache.deinit();
+    cache.max_entries = 1;
+    const Provider = struct {
+        calls: usize = 0,
+        fn load(raw: *anyopaque, alloc: Allocator) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return alloc.dupe(u8, "immutable block");
+        }
+    };
+    var provider: Provider = .{};
+    const loader: Cache.ImmutableLoader = .{ .ptr = &provider, .load = Provider.load };
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("immutable block", &digest, .{});
+    var first = try cache.readImmutableBlockLease(a, @splat(1), "block", 15, digest, .{}, loader);
+    defer first.deinit();
+    var second = try cache.readImmutableBlockLease(a, @splat(1), "block", 15, digest, .{}, loader);
+    defer second.deinit();
+    try std.testing.expect(first == .shared and second == .shared);
+    try std.testing.expect(first.bytes().ptr == second.bytes().ptr);
+    try cache.store("eviction pressure", "other bytes");
+    try std.testing.expectEqualStrings("immutable block", first.bytes());
+    try std.testing.expectEqual(@as(usize, 1), provider.calls);
+    try std.testing.expectError(error.DeadlineExceeded, cache.readImmutableBlockLease(a, @splat(1), "block", 15, digest, .{ .deadline_ns = 0 }, loader));
 }

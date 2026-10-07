@@ -626,6 +626,16 @@ pub const SegmentEntry = struct {
         _ = self.shared.active_mapped_readers.fetchSub(1, .acq_rel);
     }
 
+    /// Composition shares physical immutable state, never another execution's
+    /// capability or its private decoder/cache allocations.
+    fn physical(self: SegmentEntry) SegmentEntry {
+        var result = self;
+        if (self.query_base_reader) |base| result.reader = base;
+        result.query_base_reader = null;
+        result.query_source = null;
+        return result;
+    }
+
     fn retain(self: *const SegmentEntry) void {
         _ = @atomicRmw(u32, &self.shared.ref_count, .Add, 1, .monotonic);
     }
@@ -1690,7 +1700,7 @@ pub const IndexWriter = struct {
                 if (range.bind_read_context) |bind| {
                     var source = try bind(range.ptr, self.alloc, context);
                     errdefer source.close();
-                    const reader = try segment_mod.SegmentReader.initSource(self.alloc, source);
+                    const reader = try segment.reader.bindSource(self.alloc, source);
                     segment.query_base_reader = segment.reader;
                     segment.query_source = source;
                     segment.reader = reader;
@@ -1719,7 +1729,7 @@ pub const IndexWriter = struct {
         for (sources, segments[old.segments.len..]) |source, *target| {
             if (source.snapshot.alloc.ptr != self.alloc.ptr or source.snapshot.alloc.vtable != self.alloc.vtable) return error.InvalidSegment;
             if (source.ordinal >= source.snapshot.segments.len) return error.InvalidSegment;
-            const segment = source.snapshot.segments[source.ordinal];
+            const segment = source.snapshot.segments[source.ordinal].physical();
             if (segment.shared.deleted_count.load(.acquire) != 0) return error.InvalidSegment;
             target.* = segment;
             target.id = source.target_id;
@@ -3647,8 +3657,10 @@ fn boundNativeSnapshotScenario(a: Allocator) !void {
         const Self = @This();
         bytes: []const u8,
         closed: bool = false,
+        reads: usize = 0,
         fn read(raw: *anyopaque, offset: u64, out: []u8) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
+            self.reads += 1;
             @memcpy(out, self.bytes[@intCast(offset)..][0..out.len]);
         }
         fn close(raw: *anyopaque) void {
@@ -3680,13 +3692,25 @@ fn boundNativeSnapshotScenario(a: Allocator) !void {
     var writer_open = true;
     defer if (writer_open) writer.deinit();
     try writer.addSegmentWithIdData(1, .fromNative(.{ .ranges = .{ .ptr = &state, .length = bytes.len, .read_into = State.read, .close = State.close, .bind_read_context = State.bind } }));
+    const admission_reads = state.reads;
     const bound = try writer.acquireSnapshotWithReadContext(&state);
-    defer bound.release();
+    var bound_open = true;
+    defer if (bound_open) bound.release();
+    try std.testing.expectEqual(admission_reads, state.reads);
+    try std.testing.expect(bound.segments[0].reader.fields.ptr == writer.snapshot().segments[0].reader.fields.ptr);
+    var composed = try IndexWriter.init(a);
+    defer composed.deinit();
+    try composed.shareImmutableSegments(&.{.{ .snapshot = bound, .ordinal = 0, .target_id = 2 }});
+    try std.testing.expect(composed.snapshot().segments[0].query_source == null);
+    const rebound = try composed.acquireSnapshotWithReadContext(&state);
+    defer rebound.release();
     writer.deinit();
     writer_open = false;
+    bound.release();
+    bound_open = false;
     try std.testing.expect(!state.closed);
     var footer: [4]u8 = undefined;
-    try bound.segments[0].query_source.?.readInto(bytes.len - 4, &footer);
+    try rebound.segments[0].query_source.?.readInto(bytes.len - 4, &footer);
     try std.testing.expectEqualSlices(u8, bytes[bytes.len - 4 ..], &footer);
 }
 

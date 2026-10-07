@@ -31,6 +31,25 @@ pub fn readArtifact(a: A, store: stores.ArtifactStore, ref: ChunkRef, cancellati
     if (cached) |cache| return cache.cache.readImmutableAlloc(a, cache.scope, ref.artifact_id, std.math.cast(usize, ref.byte_len) orelse return error.ArtifactTooLarge, try stores.sha256DigestFromChecksum(ref.checksum), cache.context, .{ .ptr = &loader, .load = @TypeOf(loader).load });
     return @TypeOf(loader).load(&loader, a);
 }
+/// Borrow a verified bounded block until the caller has copied/decoded its
+/// requested range. Current authority is checked even when payloads are warm.
+pub fn readArtifactLease(a: A, store: stores.ArtifactStore, ref: ChunkRef, cancellation: Cancellation, cached: ?CachedRead) !local.serverless_query_lake_serving_cache.Cache.ImmutableLease {
+    const Loader = struct {
+        store: stores.ArtifactStore,
+        ref: ChunkRef,
+        cancellation: Cancellation,
+        fn load(raw: *anyopaque, alloc: A) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return self.store.getVerifiedAllocWithCancellationUsingAllocator(alloc, self.ref.artifact_id, self.ref.byte_len, self.ref.checksum, self.cancellation);
+        }
+    };
+    var loader: Loader = .{ .store = store, .ref = ref, .cancellation = cancellation };
+    try stores.validateSha256ArtifactIdentity(ref.artifact_id, ref.checksum);
+    try cancellation.check();
+    if (cached) |cache| return cache.cache.readImmutableBlockLease(a, cache.scope, ref.artifact_id, std.math.cast(usize, ref.byte_len) orelse return error.ArtifactTooLarge, try stores.sha256DigestFromChecksum(ref.checksum), cache.context, .{ .ptr = &loader, .load = Loader.load });
+    return .{ .heap = .{ .alloc = a, .bytes = try Loader.load(&loader, a) } };
+}
+
 pub const metadata_version: u16 = 2;
 pub fn supportsMetadataVersion(version: u16) bool {
     return version == 1 or version == metadata_version or version == 3;

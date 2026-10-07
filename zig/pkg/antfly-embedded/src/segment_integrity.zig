@@ -51,6 +51,7 @@ pub const PagedSource = struct {
     original: source_mod.Source,
     directory: Directory,
     validations: []std.atomic.Value(u8),
+    owns_validations: bool = true,
     mutex: std.atomic.Mutex = .unlocked,
     io_mutex: std.atomic.Mutex = .unlocked,
     buffer: []u8 = &.{},
@@ -66,11 +67,18 @@ pub const PagedSource = struct {
         self.* = .{ .allocator = allocator, .original = original, .directory = directory, .validations = states };
         return self;
     }
+    /// Borrow authenticated page states from an immutable, externally pinned
+    /// reader. Payload caches and authority remain private to this facade.
+    pub fn bind(self: *const PagedSource, allocator: Allocator, original: source_mod.Source) !*PagedSource {
+        const bound = try allocator.create(PagedSource);
+        bound.* = .{ .allocator = allocator, .original = original, .directory = self.directory, .validations = self.validations, .owns_validations = false };
+        return bound;
+    }
     // Closing the facade source and freeing decoder metadata are separate:
     // SegmentReader borrows its caller's source; standalone range readers own it.
     pub fn deinit(self: *PagedSource) void {
         const allocator = self.allocator;
-        allocator.free(self.validations);
+        if (self.owns_validations) allocator.free(self.validations);
         if (self.budget) |*budget| budget.reservation.manager.unregisterReclaimer(self.reclaimer);
         self.bufferAllocator().free(self.buffer);
         if (self.budget) |*budget| budget.deinit();

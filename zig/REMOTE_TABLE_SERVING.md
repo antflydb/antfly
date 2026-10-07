@@ -740,9 +740,17 @@ WAND seeks fetch only the document chunks they visit, and position records are
 read when phrase consumers request them. A block checksum may bring neighboring
 bytes into cache, so the minimum read unit remains 64 KiB. Each query binds its
 current store capability, deadline, cancellation and reader lease to a private
-native reader. The shared corpus drops opening-request authority after admission.
-Immutable artifact caching shares verified blocks across queries without sharing
-capabilities. GC traverses all range references and still understands retained
+native reader. Query binding borrows the already admitted field navigation,
+collection statistics, and atomic page-validation states; it performs no metadata
+reads. The physical segment pin outlives every borrowed view, while identity and
+decoder caches remain query-local. Immutable composition normalizes query-bound
+entries to their physical base reader, so it never copies query ownership or
+retains another execution's authority. The shared corpus drops opening-request
+authority after admission. Bounded artifact reads pin verified RAM blocks or disk
+mappings instead of allocating and copying an entire block for each small read.
+Pinned RAM remains charged and cannot be evicted until released; current deadline,
+cancellation and reader-lease checks still run on warm hits. Large contiguous
+segment leases keep their disk-first policy for clean-page reclamation. GC traverses all range references and still understands retained
 version 1–3 roots. Reader/topology protocol 30 triggers automatic republication of
 older corpora during rolling upgrades.
 
@@ -750,16 +758,24 @@ Automatic ordered-index access enumerates eligible definitions, proves partial
 predicates and covering columns, and counts ranges using authenticated B+tree
 subtree counts. Costing includes projected compressed column bytes and a
 conservative estimate of touched row groups. An explicit SQL OFFSET + LIMIT is an
-advisory row goal when no residual predicate exists and the index proves the full
-ordering. It never limits scan pages or changes residual semantics. Unknown
-residual selectivity costs the entire candidate range. Actual page clustering
+advisory row goal when the index proves the full ordering and every filter is
+represented by its equality prefix and next-key lower/upper bounds. SQL binding
+marks disjunctions, scalar predicates and other unbound residuals as incomplete.
+Covered-column residuals and duplicate bounds with uncertain selectivity retain
+full-range costing. The goal never limits scan pages or changes residual semantics.
+Unknown residual selectivity costs the entire candidate range. Actual page clustering
 statistics remain a possible future refinement; explicit index requests retain
 their required semantics.
 
 Build replay writes bounded columnar spill blocks directly from native vectors,
 without an intermediate row matrix or decimal coordinate strings. Consumer
 cursors retain compact spill blocks and preserve numeric/string dictionary IDs
-while borrowing payloads until the next batch. Independent per-file cursors seek
+while borrowing payloads until the next batch. The spill codec exports typed
+columns directly: strings and string dictionaries borrow decoded buffers, numeric
+wire values decode into typed arrays, nulls come directly from packed flags, and
+only dictionary IDs require widening for native scan consumers. It does not build
+intermediate Datum dictionaries. Legacy scalar records retain the same typed
+fallback and reject incompatible logical types. Independent per-file cursors seek
 to physical record boundaries and share the same bounded spill owner.
 
 The `iceberg_integration` E2E uses PyIceberg commits and PyArrow Parquet files,

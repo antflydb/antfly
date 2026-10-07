@@ -879,8 +879,21 @@ def test_native_remote_ordered_index_exact_bounds_and_restart(tmp_path, covering
             with connection.cursor() as cursor:
                 cursor.execute(f"SELECT amount, COUNT(*) FROM lake_ordered WHERE amount = {base + 17} GROUP BY amount")
                 assert cursor.fetchall() == [(base + 17, 12)]
+        def check_filtered_limits():
+            # OFFSET crosses an indexed value boundary; covered-column
+            # residuals must still run before LIMIT on either access path.
+            bounds = f"amount >= {base + 17} AND amount < {base + 19}"
+            assert call("POST", "/sql", {"statement":
+                f"SELECT amount FROM lake_ordered WHERE {bounds} ORDER BY amount LIMIT 3 OFFSET 11"
+            })["rows"] == [[str(base + 17)], [str(base + 18)], [str(base + 18)]]
+            assert call("POST", "/sql", {"statement":
+                f"SELECT amount FROM lake_ordered WHERE {bounds} AND label = 'row-82' ORDER BY amount LIMIT 1"
+            })["rows"] == [[str(base + 17)]]
+
+        check_filtered_limits()
         previous_cursor = collected[0]["cursor"]
         server.restart()
+        check_filtered_limits()
         body["after"] = previous_cursor
         resumed = call("POST", "/tables/lake_ordered/rows/query", body, lines=True)
         assert resumed and resumed[0]["_id"] == collected[1]["_id"]
