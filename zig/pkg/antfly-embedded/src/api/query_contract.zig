@@ -3726,7 +3726,7 @@ fn toOpenApiHit(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest, hit: 
         ._index_scores = try indexScoresJsonValue(alloc, hit.index_scores),
         ._sort = if (hit.sort_values.len > 0) hit.sort_values else null,
         ._source = if (hit.source_value) |value|
-            (if (req.include_stored) try takeOpenApiObjectMap(alloc, try projectPublicSourceValue(alloc, value, .{
+            (if (req.include_stored) try takeOpenApiObjectMap(alloc, try projectPublicSourceView(alloc, value, .{
                 .fields = req.fields,
                 .include_all_fields = req.include_all_fields,
             })) else null)
@@ -4372,9 +4372,17 @@ fn parseInternalGroupedUnitRevisionEnvelopeValue(
     return try db_mod.types.cloneJsonValue(alloc, value);
 }
 
-fn projectPublicSourceValue(alloc: std.mem.Allocator, source: std.json.Value, options: db_mod.types.LookupOptions) !std.json.Value {
-    var value = try document_query.projectLookupValue(alloc, source, options);
-    hierarchy_navigation.stripPublicInternalFieldsValue(alloc, &value);
+fn projectPublicSourceView(alloc: std.mem.Allocator, source: std.json.Value, options: db_mod.types.LookupOptions) !std.json.Value {
+    if (source != .object) return error.InvalidRemoteResponse;
+    var value = try document_query.projectLookupView(alloc, source, options);
+    errdefer document_query.deinitProjectionView(alloc, &value);
+    if (value == .object) for ([_][]const u8{ hierarchy_navigation.unit_fingerprint_field, hierarchy_navigation.grouped_unit_revision_envelope_field }) |field| {
+        if (value.object.fetchOrderedRemove(field)) |removed| {
+            alloc.free(removed.key);
+            var child = removed.value;
+            document_query.deinitProjectionView(alloc, &child);
+        }
+    };
     return value;
 }
 

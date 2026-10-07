@@ -923,6 +923,9 @@ pub const IndexSnapshot = struct {
     // rebuilds/reopens, consider a sidecar keyed by segment/snapshot identity
     // instead of re-walking dictionaries/postings.
     term_doc_freq_cache_mu: std.atomic.Mutex,
+    // Bounded singleflight stripes. Warm hits avoid these; cold readers of
+    // the same term batch reuse the first reader's exact, generation-bound result.
+    term_doc_freq_flights: [32]std.atomic.Mutex = @splat(.unlocked),
     term_doc_freq_cache: TermDocFreqCache,
     term_doc_freq_cache_eviction_cursor: u32 = 0,
     term_doc_freq_cache_key_bytes: usize = 0,
@@ -1099,13 +1102,10 @@ pub const IndexSnapshot = struct {
         else
             try alloc.alloc(u32, terms.len);
         defer if (terms.len > term_doc_freq_stack.len) alloc.free(term_doc_freqs);
-        for (terms, 0..) |term, i| {
-            term_doc_freqs[i] = if (override) |stats|
-                stats.termDocFreq(term) orelse try self.termDocFreq(alloc, field, term)
-            else if (self.segments.len > 1)
-                try self.termDocFreq(alloc, field, term)
-            else
-                0;
+        if (override == null and self.segments.len > 1) {
+            try self.termDocFreqs(alloc, field, terms, term_doc_freqs);
+        } else for (terms, 0..) |term, i| {
+            term_doc_freqs[i] = if (override) |stats| stats.termDocFreq(term) orelse try self.termDocFreq(alloc, field, term) else 0;
         }
 
         var collector = scorer_mod.TopKCollector.init(alloc, k);
@@ -1393,39 +1393,126 @@ pub const IndexSnapshot = struct {
         return total;
     }
 
-    pub fn termDocFreq(self: *const IndexSnapshot, alloc: Allocator, field: []const u8, term: []const u8) !u32 {
-        if (self.liveDocCount() == 0) return 0;
+    fn checkScoringReadContext(self: *const IndexSnapshot) !void {
+        for (self.segments) |segment| if (segment.query_source) |source| if (source == .ranges) {
+            if (source.ranges.check_read_context) |check| try check(source.ranges.ptr);
+        };
+    }
+    fn cachedTermDocFreq(self: *const IndexSnapshot, field: []const u8, term: []const u8) ?u32 {
         const mutable = self.scoringCache();
-        const adapted = TermDocFreqAdapted{ .field = field, .term = term };
-        const adapted_ctx = TermDocFreqAdaptedCtx{};
         const cache_mu = &mutable.term_doc_freq_cache_mu;
         while (!cache_mu.tryLock()) spinOrYield();
-        if (mutable.term_doc_freq_cache.getAdapted(adapted, adapted_ctx)) |cached| {
-            mutable.term_doc_freq_cache_hits += 1;
-            cache_mu.unlock();
-            return cached;
+        defer cache_mu.unlock();
+        return mutable.term_doc_freq_cache.getAdapted(TermDocFreqAdapted{ .field = field, .term = term }, TermDocFreqAdaptedCtx{});
+    }
+    pub fn termDocFreq(self: *const IndexSnapshot, alloc: Allocator, field: []const u8, term: []const u8) !u32 {
+        var result: [1]u32 = undefined;
+        try self.termDocFreqs(alloc, field, &.{term}, &result);
+        return result[0];
+    }
+    /// One dictionary reader per segment for all cold terms. Required work
+    /// shares global admission and runs inline if no worker lane is available.
+    pub fn termDocFreqs(self: *const IndexSnapshot, alloc: Allocator, field: []const u8, terms: []const []const u8, output: []u32) !void {
+        if (terms.len != output.len) return error.InvalidArgument;
+        try self.checkScoringReadContext();
+        @memset(output, 0);
+        if (terms.len == 0 or self.liveDocCount() == 0) return;
+        const mutable = self.scoringCache();
+        var missing_stack: [16]bool = undefined;
+        const missing = if (terms.len <= missing_stack.len) missing_stack[0..terms.len] else try alloc.alloc(bool, terms.len);
+        defer if (terms.len > missing_stack.len) alloc.free(missing);
+        var cold = false;
+        for (terms, output, missing) |term, *value, *miss| {
+            const cached = self.cachedTermDocFreq(field, term);
+            miss.* = cached == null;
+            value.* = cached orelse 0;
+            cold = cold or miss.*;
+            while (!mutable.term_doc_freq_cache_mu.tryLock()) spinOrYield();
+            if (miss.*) mutable.term_doc_freq_cache_misses += 1 else mutable.term_doc_freq_cache_hits += 1;
+            mutable.term_doc_freq_cache_mu.unlock();
         }
-        mutable.term_doc_freq_cache_misses += 1;
-        cache_mu.unlock();
-
-        var total: u32 = 0;
-        for (self.segments) |*seg| {
-            var inv_reader = (try seg.reader.invertedIndexScoped(alloc, field)) orelse continue;
-            defer inv_reader.deinit();
-            total +|= (try inv_reader.docFrequency(term)) orelse continue;
+        if (!cold) return;
+        var flight_hash = std.hash.Wyhash.init(std.hash.Wyhash.hash(0, field));
+        for (terms) |term| {
+            flight_hash.update(std.mem.asBytes(&term.len));
+            flight_hash.update(term);
         }
-
+        const stripe = flight_hash.final() % mutable.term_doc_freq_flights.len;
+        const flight = &mutable.term_doc_freq_flights[stripe];
+        while (!flight.tryLock()) {
+            try self.checkScoringReadContext();
+            spinOrYield();
+        }
+        defer flight.unlock();
+        cold = false;
+        for (terms, output, missing) |term, *value, *miss| if (miss.*) {
+            if (self.cachedTermDocFreq(field, term)) |cached| {
+                value.* = cached;
+                miss.* = false;
+            } else cold = true;
+        };
+        if (!cold) return;
+        const scheduler = @import("sql/parallel_scheduler.zig");
+        const Worker = struct {
+            fn run(snapshot_ref: *const IndexSnapshot, a: Allocator, name: []const u8, needles: []const []const u8, mask: []const bool, counts: []u32, lane: usize, lanes: usize) anyerror!void {
+                @memset(counts, 0);
+                var ordinal = lane;
+                while (ordinal < snapshot_ref.segments.len) : (ordinal += lanes) {
+                    const segment = &snapshot_ref.segments[ordinal];
+                    if (segment.query_source) |source| if (source == .ranges) {
+                        if (source.ranges.check_read_context) |check| try check(source.ranges.ptr);
+                    };
+                    var reader = (try segment.reader.invertedIndexScoped(a, name)) orelse continue;
+                    defer reader.deinit();
+                    for (needles, mask, counts) |term, miss, *count| if (miss) {
+                        count.* +|= (try reader.docFrequency(term)) orelse 0;
+                    };
+                }
+            }
+        };
+        var io: ?std.Io = null;
+        for (self.segments) |segment| if (segment.query_source) |source| if (source == .ranges) {
+            io = source.ranges.read_io;
+            if (io != null) break;
+        };
+        const lanes: usize = if (io != null) @min(4, @max(1, self.segments.len)) else 1;
+        var counts_stack: [64]u32 = undefined;
+        const counts = if (terms.len * lanes <= counts_stack.len) counts_stack[0 .. terms.len * lanes] else try alloc.alloc(u32, terms.len * lanes);
+        defer if (terms.len * lanes > counts_stack.len) alloc.free(counts);
+        var locked: scheduler.LockedAllocator = .{ .backing = alloc };
+        var tasks: [4]?scheduler.Task(anyerror!void) = @splat(null);
+        defer if (io) |runtime| for (&tasks) |*slot| if (slot.*) |*task| if (task.future != null) {
+            task.cancel(runtime) catch {};
+        };
+        for (1..lanes) |lane| {
+            const args = .{ self, locked.allocator(), field, terms, missing, counts[lane * terms.len ..][0..terms.len], lane, lanes };
+            tasks[lane] = scheduler.global().submit(io.?, 512 * 1024, Worker.run, args);
+            if (tasks[lane] == null) try @call(.auto, Worker.run, args);
+        }
+        try Worker.run(self, locked.allocator(), field, terms, missing, counts[0..terms.len], 0, lanes);
+        if (io) |runtime| for (&tasks) |*slot| if (slot.*) |*task| {
+            try task.await(runtime);
+        };
+        try self.checkScoringReadContext();
+        for (terms, output, missing, 0..) |term, *value, miss, index| if (miss) {
+            for (0..lanes) |lane| value.* +|= counts[lane * terms.len + index];
+            self.cacheTermDocFreq(field, term, value.*);
+        };
+    }
+    fn cacheTermDocFreq(self: *const IndexSnapshot, field: []const u8, term: []const u8, total: u32) void {
+        const mutable = self.scoringCache();
+        const cache_mu = &mutable.term_doc_freq_cache_mu;
         while (!cache_mu.tryLock()) spinOrYield();
         defer cache_mu.unlock();
-        if (mutable.term_doc_freq_cache.getAdapted(adapted, adapted_ctx)) |cached| return cached;
-        const key_bytes = std.math.add(usize, field.len, term.len) catch return total;
-        if (key_bytes > max_term_doc_freq_cache_key_bytes) return total;
+        if (mutable.term_doc_freq_cache.getAdapted(TermDocFreqAdapted{ .field = field, .term = term }, TermDocFreqAdaptedCtx{}) != null) return;
+        const key_bytes = std.math.add(usize, field.len, term.len) catch return;
+        if (key_bytes > max_term_doc_freq_cache_key_bytes) return;
         // Cache admission is optional. Memory pressure must not turn an
         // otherwise successful exact frequency read into a query failure.
-        const storage = mutable.alloc.alloc(u8, key_bytes) catch return total;
+        const storage = mutable.alloc.alloc(u8, key_bytes) catch return;
         mutable.term_doc_freq_cache.ensureUnusedCapacity(mutable.alloc, 1) catch {
             mutable.alloc.free(storage);
-            return total;
+            return;
         };
         while (mutable.term_doc_freq_cache.count() >= max_term_doc_freq_cache_entries or
             mutable.term_doc_freq_cache_key_bytes > max_term_doc_freq_cache_key_bytes - key_bytes)
@@ -1449,7 +1536,7 @@ pub const IndexSnapshot = struct {
         @memcpy(storage[field.len..], term);
         mutable.term_doc_freq_cache.putAssumeCapacity(.{ .storage = storage, .field_len = @intCast(field.len) }, total);
         mutable.term_doc_freq_cache_key_bytes += key_bytes;
-        return total;
+        return;
     }
 
     pub fn textAvgDocLen(self: *const IndexSnapshot, field: []const u8) f32 {
@@ -3763,4 +3850,68 @@ test "external lake query scoring caches share only the exact immutable generati
     try std.testing.expect(changed.scoringCache() != owner);
     try std.testing.expectEqual(@as(u32, 2), try changed.termDocFreq(a, "body", "common"));
     try std.testing.expectEqual(@as(u32, 1), try first.termDocFreq(a, "body", "common"));
+}
+
+test "external lake scoring batches mixed warm cold duplicate and absent terms exactly" {
+    const a = std.testing.allocator;
+    const bytes = try buildTestSegmentWithIds(a, &.{
+        .{ .id = "one", .terms = &.{ .{ .term = "alpha", .freq = 1, .norm = 2 }, .{ .term = "beta", .freq = 1, .norm = 2 } } },
+        .{ .id = "two", .terms = &.{.{ .term = "alpha", .freq = 1, .norm = 1 }} },
+    });
+    defer a.free(bytes);
+    var writer = try IndexWriter.init(a);
+    defer writer.deinit();
+    try writer.addSegment(bytes);
+    try writer.addSegment(bytes);
+    const snapshot_ref = writer.snapshot();
+    try std.testing.expectEqual(@as(u32, 4), try snapshot_ref.termDocFreq(a, "body", "alpha"));
+    var counts: [4]u32 = undefined;
+    try snapshot_ref.termDocFreqs(a, "body", &.{ "alpha", "beta", "absent", "beta" }, &counts);
+    try std.testing.expectEqualSlices(u32, &.{ 4, 2, 0, 2 }, &counts);
+    try snapshot_ref.termDocFreqs(a, "body", &.{ "alpha", "beta", "absent", "beta" }, &counts);
+    try std.testing.expectEqualSlices(u32, &.{ 4, 2, 0, 2 }, &counts);
+}
+
+test "external lake scoring parallel lanes join before releasing query authority" {
+    const a = std.testing.allocator;
+    const bytes = try buildTestSegmentWithIds(a, &.{.{ .id = "one", .terms = &.{ .{ .term = "alpha", .freq = 1, .norm = 2 }, .{ .term = "beta", .freq = 1, .norm = 2 } } }});
+    defer a.free(bytes);
+    const State = struct {
+        bytes: []const u8,
+        canceled: std.atomic.Value(bool) = .init(false),
+        reads: std.atomic.Value(usize) = .init(0),
+        fn read(raw: *anyopaque, offset: u64, output: []u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            _ = self.reads.fetchAdd(1, .monotonic);
+            @memcpy(output, self.bytes[@intCast(offset)..][0..output.len]);
+        }
+        fn close(_: *anyopaque) void {}
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.canceled.load(.acquire)) return error.Canceled;
+        }
+        fn bind(raw: *anyopaque, _: Allocator, _: *anyopaque) !SegmentSource {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return .{ .ranges = .{ .ptr = self, .length = self.bytes.len, .read_into = read, .close = close, .read_io = std.testing.io, .check_read_context = check } };
+        }
+    };
+    var state: State = .{ .bytes = bytes };
+    var writer = try IndexWriter.init(a);
+    defer writer.deinit();
+    for (0..4) |id| try writer.addSegmentWithIdData(id + 1, .fromNative(.{ .ranges = .{ .ptr = &state, .length = bytes.len, .read_into = State.read, .close = State.close, .bind_read_context = State.bind } }));
+    const bound = try writer.acquireSnapshotWithReadContext(&state);
+    defer bound.release();
+    var counts: [2]u32 = undefined;
+    try bound.termDocFreqs(a, "body", &.{ "alpha", "beta" }, &counts);
+    try std.testing.expectEqualSlices(u32, &.{ 4, 4 }, &counts);
+    const reads = state.reads.load(.acquire);
+    try bound.termDocFreqs(a, "body", &.{ "alpha", "beta" }, &counts);
+    try std.testing.expectEqual(reads, state.reads.load(.acquire));
+    state.canceled.store(true, .release);
+    try std.testing.expectError(error.Canceled, bound.termDocFreqs(a, "body", &.{ "alpha", "beta" }, &counts));
+    const scheduler = @import("sql/parallel_scheduler.zig").global();
+    while (!scheduler.mutex.tryLock()) spinOrYield();
+    defer scheduler.mutex.unlock();
+    try std.testing.expectEqual(@as(usize, 0), scheduler.workers);
+    try std.testing.expectEqual(@as(usize, 0), scheduler.bytes);
 }

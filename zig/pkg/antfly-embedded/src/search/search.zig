@@ -908,8 +908,11 @@ fn executeScoredPhraseFilter(
 
     const scoring_doc_count = snap.scoringDocCount();
     var phrase_idf_sum: f32 = 0;
-    for (phrase_filter.terms) |term| {
-        const df = try snap.termDocFreq(alloc, phrase_filter.field, term);
+    var frequency_stack: [16]u32 = undefined;
+    const frequencies = if (phrase_filter.terms.len <= frequency_stack.len) frequency_stack[0..phrase_filter.terms.len] else try alloc.alloc(u32, phrase_filter.terms.len);
+    defer if (phrase_filter.terms.len > frequency_stack.len) alloc.free(frequencies);
+    try snap.termDocFreqs(alloc, phrase_filter.field, phrase_filter.terms, frequencies);
+    for (frequencies) |df| {
         if (df == 0) return .{ .alloc = alloc, .hits = try alloc.alloc(ScoredHit, 0), .total_hits = 0 };
         phrase_idf_sum += inverted.bm25Idf(scoring_doc_count, df);
     }
@@ -1764,12 +1767,17 @@ fn initFastTermStates(
     };
     const scoring_doc_count = snap.scoringDocCount();
 
-    for (terms) |term| {
+    const names = try alloc.alloc([]const u8, terms.len);
+    defer alloc.free(names);
+    const frequencies = try alloc.alloc(u32, terms.len);
+    defer alloc.free(frequencies);
+    for (terms, names) |term, *name| name.* = term.term;
+    try snap.termDocFreqs(alloc, field, names, frequencies);
+    for (terms, frequencies) |term, df| {
         const lookup_result = (try inv_reader.lookup(term.term)) orelse {
             if (require_all_terms) return null;
             continue;
         };
-        const df = try snap.termDocFreq(alloc, field, term.term);
         if (df == 0) {
             if (require_all_terms) return null;
             continue;
