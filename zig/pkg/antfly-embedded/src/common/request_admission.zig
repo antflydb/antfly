@@ -26,6 +26,8 @@ pub const PrometheusClass = enum {
 
 /// Shared operation owner. Legacy calls remain fail-fast; contextual query
 /// calls can opt into fixed, bounded waiting.
+pub const runnable_scheduler = @import("runnable_scheduler.zig");
+
 pub const bounded_admission = @import("bounded_admission.zig");
 pub const RequestAdmission = bounded_admission.Controller;
 
@@ -158,4 +160,8 @@ test "request admission metrics use the shared admission namespace" {
     try std.testing.expect(std.mem.indexOf(u8, rendered, "antfly_admission_write_rejected_requests_total 2\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "antfly_admission_inference_capacity_requests 8\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "antfly_admission_inference_rejected_requests_total 4\n") != null);
+}
+
+test {
+    _ = runnable_scheduler;
 }

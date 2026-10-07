@@ -1,0 +1,80 @@
+# Runnable workload scheduling
+
+Status: scheduler core implemented and tested; production HTTP/pgwire integration,
+cooperative query quanta, remote-attempt accounting, qualification and default
+selection remain required. The whole delivery goal remains safe sharing across
+many connections by default, with fairness and bounded waiting, while preserving
+session semantics, correctness, durability and control progress under overload.
+
+## Ownership and transitions
+
+Operation admission, runnable permits, retained memory and durable completion are
+independent owners. An operation stays admitted and retains its memory charges
+while it relinquishes runnable permits for resource or output waiting. A scheduler
+entry is caller-owned, stays at one address, and outlives notifications and all
+workers that reference it. It registers exactly once and retires through finish.
+
+| From | Transition | Runnable ownership | Outstanding ownership |
+| --- | --- | --- | --- |
+| Fresh | Submit | Grant or bounded queue | Reserve count and metadata bytes |
+| Queued | Grant | Acquire configured slot demand | Preserve |
+| Running | Yield | Release, requeue, reacquire | Preserve |
+| Running | Resource/output block | Release | Preserve |
+| Blocked | Unblock | Queue or grant | Preserve; no new reservation |
+| Any registered state | Finish/cancel/expired wait | Release if held | Release once |
+| Queued/blocked | Shutdown | Stop and notify owner | Retain until owner joins and finishes |
+| Running | Shutdown | Owner joins; no forced resource revocation | Retain until finish |
+
+The entry bound includes queued, running and blocked operations. This ensures a
+resuming operation does not need an unreserved queue allocation. Metadata bytes
+are a caller-declared outstanding bound, not a total-process memory measurement.
+Backing heaps, retained pages, thread stacks and backend allocations keep their
+existing resource owners. Entry options preserve the original clock, deadline
+and cancellation token across yields and waits. Queue time starts at enqueue,
+not when the caller first waits. A grant racing an expired queue cannot authorize
+execution: wait rechecks expiry and returns every reservation.
+
+## Dispatch policy
+
+Query, write, inference and background classes use deficit round robin. Weights
+allocate runnable slot service, and a job's declared slot demand consumes credit.
+Empty classes do not accumulate credit. Slots and outstanding operations are
+finite. Control slots are reserved within the total slot envelope and are not
+lent to ordinary work. Identifying protected controls remains an authenticated,
+grammar-verified responsibility of the adapter, not a label clients can select.
+
+Small jobs can backfill behind a head whose demand cannot fit. Every such grant
+increments the blocked head's bypass count. At the configured bound, the oldest
+blocked head becomes a barrier: ordinary work drains until that head can run.
+Control work remains independent. A large job must fit its class's total capacity
+or submission rejects it atomically. This protects against an unfulfillable
+barrier and starvation from a continuing stream of smaller jobs.
+
+The core schedules explicit declared slot demand. Real execution cost estimates,
+time/work-based quantum enforcement, expensive-query demotion and per-tenant
+weights are subsequent integration work; the current tests do not prove those.
+
+## Integration order and completion requirements
+
+1. Own a scheduler on the execution node and validate its opt-in canonical
+   configuration. Preserve fixed operation admission and a rollback path.
+2. Bind both HTTP and pgwire read execution to that owner. Introduce bounded
+   checkpoint quanta in scans/operators, and release runnable ownership around
+   real backend waits and slow output without moving retained-state ownership.
+3. Verify mixed inexpensive/expensive reads, slow consumers, cancellation,
+   suspension, restart and protected controls through real protocol fixtures.
+4. Extend scheduling to writes, inference, background work and fan-out. Track
+   remote attempts and uncertain results at their execution owner. An accepted
+   durable decision keeps its completion obligations when its foreground entry
+   stops; do not add suspension points that can strand accepted writes.
+5. Run declared main/fixed/scheduler qualification sweeps and resource-exhaustion
+   schedules. Derive and publish automatic sizing and bounded-wait defaults only
+   from that complete behavior. Adaptive tuning follows reliable fixed telemetry.
+
+`common/runnable_scheduler.zig` implements the state machine without heap
+allocation. Its tests cover weighted busy classes, bounded large-job backfill,
+protected slots, blocked ownership, resumption at full outstanding bounds,
+yielding, grant/cancel and grant/expiry races, real queue timeouts, invalid
+policies/demands, and shutdown accounting. It is exported by request admission
+and included in the pooling test selection. These tests establish core policy
+and ownership, not protocol integration or default qualification.

@@ -715,3 +715,22 @@ tasks per peer, without importing candidate SQL admission or allocation policy.
 The [merge verification receipt](qualification/workload-pooling/receipts/2026-10-06/main-ac2d-pgwire/README.md)
 records the regression and baseline patch. Historical failed matrices remain
 failed; this merge has no new full production performance receipts.
+
+
+### Runnable scheduler implementation
+
+The [runnable scheduler contract](WORKLOAD_RUNNABLE_SCHEDULING.md) records separate
+operation, execution, retained-memory and durable-completion ownership. The core
+now implements weighted slot service, bounded backfill with a starvation barrier,
+reserved control slots, and explicit yield/resource/output-block transitions.
+Outstanding reservations persist while blocked, so a resumption never needs a
+new queue reservation. Deadline and cancellation options survive every transition.
+It is exported through request admission and selected by the pooling target.
+Production protocol integration, cooperative execution quanta, distributed
+attempt accounting, qualification and automatic defaults remain incomplete.
+
+Ten named scheduler fixtures plus the exported module's import fixture pass on
+macOS and pinned Nix glibc GNU Linux ReleaseSafe. The shutdown/block race was
+corrected before final verification. The [core receipt](qualification/workload-pooling/receipts/2026-10-06/runnable-core/README.md)
+preserves source hashes and complete outputs. The expanded whole API pooling
+target has not yet been executed for this scheduler change.

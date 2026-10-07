@@ -1,0 +1,17 @@
+{
+  "base_revision": "a2c132eabb921edfa9ec8c9d26553b786bcd2293",
+  "source_sha256": {
+    "zig/pkg/antfly-embedded/src/common/runnable_scheduler.zig": "74a5e6882d0df96db81474235f4d440e05d45cde5bb8acccee732a47ddc413f8",
+    "zig/pkg/antfly-embedded/src/common/request_admission.zig": "0253df710032d76a55cc9ffaabdf24748ecb38c3b6a6a797e133e6f49a131778",
+    "zig/pkg/antfly/build/api_tests.zig": "524e39889d499f9c9e5145878bd6bcc78378c1b24deb7827082d0384845b4127",
+    "zig/WORKLOAD_RUNNABLE_SCHEDULING.md": "294f97fd913f6cd15f19b0de28bdaf90e17a69f7a9e022902efa5edb0630cc7c"
+  },
+  "scope": "Runnable scheduler core; production protocol integration remains incomplete",
+  "production_enabled": false,
+  "repository_pooling_target_executed": false,
+  "native_named_scheduler_tests": 10,
+  "native_total_tests": 11,
+  "linux_named_scheduler_tests": 10,
+  "linux_total_tests": 11,
+  "linux_toolchain": "Pinned Nix glibc Zig 0.17.0"
+}

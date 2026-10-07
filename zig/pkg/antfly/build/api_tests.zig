@@ -68,6 +68,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const run_lib_usermgr_tests = options.run_lib_usermgr_tests;
     const pooling_filters = [_][]const u8{
         "bounded admission",
+        "runnable scheduler",
         "workload envelope",
         "workload deadline",
         "config workload envelope",
