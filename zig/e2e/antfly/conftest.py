@@ -154,7 +154,7 @@ CLIPCLAP_MODEL = "antflydb/clipclap"
 CLIPCLAP_GGUF_FILES = (
     "clipclap-clip.Q4_K.gguf",
     "clipclap-clap.Q4_K.gguf",
-    "termite_variants.json",
+    "antfly_inference_variants.json",
 )
 ALLOW_REAL_MODEL_DOWNLOAD_ENV = "ANTFLY_E2E_ALLOW_REAL_MODEL_DOWNLOAD"
 FAILURE_LOG_TAIL_LIMIT = 20_000
