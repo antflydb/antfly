@@ -1720,6 +1720,76 @@ class PostgresReferenceTest(unittest.TestCase):
             ).fetchall()
             self.assertEqual([(n, n * 10) for n in range(1, 129)], rows)
 
+    def test_row_assignment_expands_schema_bound_width_before_execution(self):
+        import psycopg
+
+        with self.db.transaction(force_rollback=True):
+            self.db.execute("CREATE TABLE target(n bigint,cold text)")
+            self.db.execute("CREATE TABLE source(id text,delta bigint)")
+            self.db.execute("INSERT INTO target VALUES(1,'old'),(2,'old')")
+            self.db.execute("INSERT INTO source VALUES('a',10),('b',20)")
+            for sql, expected in (
+                (
+                    "UPDATE target SET (n,cold)=(SELECT * FROM (SELECT delta,'new' AS label FROM source ORDER BY delta DESC LIMIT 1) s) RETURNING n,cold",
+                    [(20, "new")] * 2,
+                ),
+                (
+                    "UPDATE target SET (n,cold)=(SELECT s.* FROM (SELECT delta,'new' AS label FROM source ORDER BY delta DESC LIMIT 1) s) RETURNING n,cold",
+                    [(20, "new")] * 2,
+                ),
+                (
+                    "UPDATE target SET (n,cold)=(SELECT s.*,'new' FROM (SELECT delta FROM source ORDER BY delta DESC LIMIT 1) s) RETURNING n,cold",
+                    [(20, "new")] * 2,
+                ),
+                (
+                    "WITH s AS (SELECT delta,'new' AS label FROM source ORDER BY delta DESC LIMIT 1) UPDATE target SET (n,cold)=(SELECT * FROM s) RETURNING n,cold",
+                    [(20, "new")] * 2,
+                ),
+                (
+                    "UPDATE target SET (n,cold)=(SELECT * FROM (SELECT delta,'new' AS label FROM source WHERE false) s) RETURNING n,cold",
+                    [(None, None)] * 2,
+                ),
+                (
+                    "UPDATE target SET (n)=(SELECT count(*) FROM source),cold='new' RETURNING n,cold",
+                    [(2, "new")] * 2,
+                ),
+            ):
+                with self.subTest(sql=sql), self.db.transaction(force_rollback=True):
+                    self.assertEqual(expected, self.db.execute(sql).fetchall())
+            for sql, code in (
+                (
+                    "UPDATE target SET (n,cold)=(SELECT * FROM (SELECT delta FROM source) s)",
+                    "42601",
+                ),
+                (
+                    "UPDATE target SET (n,cold)=(SELECT * FROM (SELECT delta,'new' AS label,id FROM source) s)",
+                    "42601",
+                ),
+                (
+                    "UPDATE target SET (n,cold)=(SELECT s.*,'extra' FROM (SELECT delta,'new' AS label FROM source) s)",
+                    "42601",
+                ),
+                (
+                    "UPDATE target SET (n,cold)=(SELECT * FROM (SELECT delta FROM source WHERE false) s)",
+                    "42601",
+                ),
+                (
+                    "UPDATE target SET (n,cold)=(SELECT * FROM (SELECT delta,'new' AS label FROM source) s)",
+                    "21000",
+                ),
+            ):
+                with self.subTest(sql=sql):
+                    with (
+                        self.assertRaises(psycopg.Error) as error,
+                        self.db.transaction(force_rollback=True),
+                    ):
+                        self.db.execute(sql)
+                    self.assertEqual(code, error.exception.sqlstate)
+                self.assertEqual(
+                    [(1, "old"), (2, "old")],
+                    self.db.execute("SELECT n,cold FROM target ORDER BY n").fetchall(),
+                )
+
     def test_original_set_campaign_preserves_duplicate_and_null_witnesses(self):
         import json
         from collections import Counter

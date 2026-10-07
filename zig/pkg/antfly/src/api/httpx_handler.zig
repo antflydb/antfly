@@ -14696,6 +14696,47 @@ test "httpx SQL executes one relational page with exact integer parameters" {
             try std.testing.expect(result.value.rows[0][1] == .string);
             try std.testing.expectEqualStrings("3", result.value.rows[0][1].string);
         }
+        {
+            // A row-valued wildcard binds against the captured source layout,
+            // then publishes one native image. Width/cardinality errors must
+            // leave that image untouched, including sparse nullable fields.
+            for ([_]struct { sql: []const u8, code: ?[]const u8 = null }{
+                .{ .sql = "UPDATE usage_records SET (quantity,status)=(SELECT s.* FROM (SELECT quantity+1 AS q,'reviewed' AS s FROM usage_records WHERE id='u2') s) WHERE id='u2' RETURNING status,quantity" },
+                .{ .sql = "UPDATE usage_records SET (quantity,status)=(SELECT * FROM (SELECT quantity FROM usage_records WHERE false) s) WHERE id='u2'", .code = "42601" },
+                .{ .sql = "UPDATE usage_records SET (quantity,status)=(SELECT * FROM (SELECT quantity,status FROM usage_records) s) WHERE id='u2'", .code = "21000" },
+            }) |case| {
+                const body = try std.json.Stringify.valueAlloc(alloc, .{ .statement = case.sql }, .{});
+                defer alloc.free(body);
+                var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
+                defer request.deinit();
+                request.body = body;
+                var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+                defer ctx.deinit();
+                var response = try text_handler.executeSQL(&ctx);
+                defer response.deinit();
+                try std.testing.expectEqual(@as(u16, if (case.code == null) 200 else 400), response.status.code);
+                if (case.code) |code| {
+                    const diagnostic = try std.json.parseFromSlice(sql_wire.SQLDiagnostic, alloc, response.body.?, .{});
+                    defer diagnostic.deinit();
+                    try std.testing.expectEqualStrings(code, diagnostic.value.code);
+                } else {
+                    const result = try std.json.parseFromSlice(sql_wire.SQLResponse, alloc, response.body.?, .{});
+                    defer result.deinit();
+                    try std.testing.expectEqual(@as(i64, 1), result.value.rows_affected);
+                    try std.testing.expectEqual(@as(usize, 1), result.value.rows.len);
+                    try std.testing.expectEqualStrings("reviewed", result.value.rows[0][0].string);
+                    try std.testing.expectEqualStrings("4", result.value.rows[0][1].string);
+                }
+                var stored = (try text_db.lookup(alloc, "b", .{})).?;
+                defer stored.deinit(alloc);
+                const raw = try std.json.parseFromSlice(std.json.Value, alloc, stored.json, .{});
+                defer raw.deinit();
+                try std.testing.expectEqual(@as(i64, 4), raw.value.object.get("quantity").?.integer);
+                try std.testing.expectEqualStrings("reviewed", raw.value.object.get("status").?.string);
+                try std.testing.expect(!raw.value.object.contains("created_at_ns"));
+            }
+            try text_db.batch(.{ .writes = &.{.{ .key = "b", .value = "{\"id\":\"u2\",\"status\":\"reset\",\"quantity\":3}" }}, .timestamp_ns = 44 });
+        }
         for ([_]struct { body: []const u8, expected_id: ?[]const u8 }{
             .{ .body = "{\"statement\":\"INSERT INTO usage_records (id,status,quantity) VALUES ('u_default',DEFAULT,7) RETURNING id,status\"}", .expected_id = "u_default" },
             .{ .body = "{\"statement\":\"INSERT INTO usage_records DEFAULT VALUES RETURNING _id,status\"}", .expected_id = null },

@@ -1061,6 +1061,7 @@ const Builder = struct {
         var lowered = if (prepared) |entry| entry.lowered else try self.lower(child, query.*);
         if (self.shape_only) {
             const expressions = try self.constrainSelect(child, lowered);
+            if (query.required_output_columns) |width| if (expressions.len != width) return error.InvalidSqlSyntax;
             if (names.len != 0 and names.len != expressions.len) return error.InvalidSqlParameters;
             const columns = try self.alloc.alloc(Column, expressions.len);
             for (columns, expressions, 0..) |*column, expression_, index| {
@@ -1100,6 +1101,7 @@ const Builder = struct {
         for (bound.parameter_types, self.parameters) |hint, *parameter| if (hint != null) {
             parameter.* = hint;
         };
+        if (query.required_output_columns) |width| if (bound.columns.len != width) return error.InvalidSqlSyntax;
         if (names.len != 0 and names.len != bound.columns.len) return error.InvalidSqlParameters;
         const columns = try self.alloc.alloc(Column, bound.columns.len);
         for (bound.columns, columns, 0..) |column, *out, index| {

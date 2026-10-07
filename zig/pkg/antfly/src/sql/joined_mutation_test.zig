@@ -248,6 +248,7 @@ test "SQL joined mutations retain arrays through coercion scratch retirement and
     for ([_]bool{ false, true }) |document| for ([_]struct { sql: []const u8, first: i64, lower: i32, parameters: []const std.json.Value = &.{}, whole_null: bool = false }{
         .{ .sql = "UPDATE target t SET n=t.n+s.delta,cold='new' FROM source s WHERE t._id=s.id RETURNING t.a,t.j", .first = 9007199254740993, .lower = -1 },
         .{ .sql = "UPDATE target t SET a=s.a,cold='new' FROM source s WHERE t._id=s.id RETURNING t.a,t.j", .first = 3, .lower = 3 },
+        .{ .sql = "UPDATE target SET (a,cold)=(SELECT s.* FROM (SELECT '[-1:1]={9007199254740993,NULL,2}'::bigint[] AS a,'new' AS label FROM source WHERE id='a') s) RETURNING a,j", .first = 9007199254740993, .lower = -1 },
         .{ .sql = "UPDATE target t SET a='[-1:1]={9007199254740993,NULL,2}',cold='new' FROM source s WHERE t._id=s.id RETURNING t.a,t.j", .first = 9007199254740993, .lower = -1 },
         .{ .sql = "UPDATE target t SET a=$1,cold='new' FROM source s WHERE t._id=s.id RETURNING t.a,t.j", .first = 9223372036854775807, .lower = 5, .parameters = &.{.{ .string = "[5:6]={9223372036854775807,NULL}" }} },
         .{ .sql = "UPDATE target t SET a=ARRAY[1::smallint,NULL],cold='new' FROM source s WHERE t._id=s.id RETURNING t.a,t.j", .first = 1, .lower = 1 },
@@ -1091,6 +1092,10 @@ test "SQL row subquery assigns positional values after bounded ordered source" {
     for ([_][]const u8{
         "UPDATE target SET (n,cold)=(SELECT delta AS amount,'new' AS label FROM source ORDER BY amount DESC LIMIT 1) RETURNING n,cold",
         "WITH s AS (SELECT delta FROM source) UPDATE target SET (n,cold)=(SELECT delta,'new' FROM s ORDER BY delta DESC LIMIT 1) RETURNING n,cold",
+        "UPDATE target SET (n,cold)=(SELECT * FROM (SELECT delta,'new' AS label FROM source ORDER BY delta DESC LIMIT 1) s) RETURNING n,cold",
+        "UPDATE target SET (n,cold)=(SELECT s.* FROM (SELECT delta,'new' AS label FROM source ORDER BY delta DESC LIMIT 1) s) RETURNING n,cold",
+        "UPDATE target SET (n,cold)=(SELECT s.*,'new' FROM (SELECT delta FROM source ORDER BY delta DESC LIMIT 1) s) RETURNING n,cold",
+        "WITH s AS (SELECT delta,'new' AS label FROM source ORDER BY delta DESC LIMIT 1) UPDATE target SET (n,cold)=(SELECT * FROM s) RETURNING n,cold",
         "WITH \"$update_row_source_0\" AS (SELECT delta FROM source) UPDATE target SET (n,cold)=(SELECT delta,'new' FROM \"$update_row_source_0\" ORDER BY delta DESC LIMIT 1) RETURNING n,cold",
     }) |sql| {
         var backend: Backend = .{};
@@ -1107,6 +1112,37 @@ test "SQL row subquery assigns positional values after bounded ordered source" {
     }
 }
 
+test "SQL row subquery schema bound width fails before capture or mutation" {
+    for ([_][]const u8{
+        "UPDATE target SET (n,cold)=(SELECT * FROM (SELECT delta FROM source) s)",
+        "UPDATE target SET (n,cold)=(SELECT * FROM (SELECT delta,'new' AS label,id FROM source) s)",
+        "UPDATE target SET (n,cold)=(SELECT s.*,'extra' FROM (SELECT delta,'new' AS label FROM source) s)",
+        "UPDATE target SET (n,cold)=(SELECT * FROM (SELECT delta FROM source WHERE false) s)",
+    }) |sql| {
+        var backend: Backend = .{};
+        var compiled = try compiler.compile(std.testing.allocator, sql, .{});
+        defer compiled.deinit();
+        try std.testing.expectError(error.InvalidSqlSyntax, runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{}));
+        try std.testing.expectEqual(@as(usize, 0), backend.captures);
+        try std.testing.expectEqual(@as(usize, 0), backend.commits);
+    }
+}
+
+test "SQL row subquery count star has one output rather than zero projections" {
+    var backend: Backend = .{};
+    var compiled = try compiler.compile(std.testing.allocator, "UPDATE target SET (n)=(SELECT COUNT(*) FROM source),cold='new' RETURNING n,cold", .{});
+    defer compiled.deinit();
+    var result = try runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{});
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u64, 2), result.output.rows_affected);
+    for (result.output.rows) |row| {
+        try std.testing.expectEqualStrings("2", row[0].string);
+        try std.testing.expectEqualStrings("new", row[1].string);
+    }
+    try std.testing.expectEqual(@as(usize, 1), backend.captures);
+    try std.testing.expectEqual(@as(usize, 1), backend.commits);
+}
+
 test "SQL row subquery cannot escape its independent derived source" {
     var backend: Backend = .{};
     var compiled = try compiler.compile(std.testing.allocator, "UPDATE target SET (n,cold)=(SELECT delta,'new' FROM source WHERE source.id=target._id)", .{});
@@ -1114,6 +1150,56 @@ test "SQL row subquery cannot escape its independent derived source" {
     try std.testing.expectError(error.UndefinedColumn, runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{}));
     try std.testing.expectEqual(@as(usize, 0), backend.captures);
     try std.testing.expectEqual(@as(usize, 0), backend.commits);
+}
+
+test "SQL row subquery expanded width releases every allocation on failure" {
+    const Faults = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var backend: Backend = .{};
+            defer std.debug.assert(backend.captures == backend.closes);
+            var compiled = try compiler.compile(a, "UPDATE target SET (n,cold)=(SELECT * FROM (SELECT delta,'new' AS label FROM source ORDER BY delta DESC LIMIT 1) s) RETURNING n,cold", .{});
+            defer compiled.deinit();
+            var result = try runtime.execute(a, backend.backend(), &compiled, &.{}, .{});
+            defer result.deinit();
+            try std.testing.expectEqual(@as(u64, 2), result.output.rows_affected);
+            try std.testing.expectEqual(@as(usize, 1), backend.commits);
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Faults.run, .{});
+}
+
+test "SQL row subquery empty expanded source assigns SQL NULL to every target" {
+    const Empty = struct {
+        fn mutate(raw: *anyopaque, _: std.mem.Allocator, _: catalog.Table, mutations: []const catalog.Mutation) !catalog.MutationOutcome {
+            const self: *Backend = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(self.captures, self.closes);
+            try std.testing.expectEqual(@as(usize, 2), mutations.len);
+            for (mutations) |mutation| {
+                try std.testing.expect(mutation.row.?.object.get("n").? == .null);
+                try std.testing.expect(mutation.row.?.object.get("cold").? == .null);
+                try std.testing.expectEqual(std.math.maxInt(u64) - 1, mutation.expected_version);
+                try std.testing.expectEqualSlices(u8, &@as([32]u8, @splat(9)), &mutation.expected_content_digest.?);
+            }
+            self.commits += 1;
+            return .committed;
+        }
+    };
+    var backend: Backend = .{};
+    var iface = backend.backend();
+    var vtable = iface.vtable.*;
+    vtable.mutate = Empty.mutate;
+    vtable.mutate_prepared = Empty.mutate;
+    iface.vtable = &vtable;
+    var compiled = try compiler.compile(std.testing.allocator, "UPDATE target SET (n,cold)=(SELECT * FROM (SELECT delta,'new' AS label FROM source WHERE false) s) RETURNING n,cold", .{});
+    defer compiled.deinit();
+    var result = try runtime.execute(std.testing.allocator, iface, &compiled, &.{}, .{});
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u64, 2), result.output.rows_affected);
+    for (result.output.rows, result.output.sql_nulls.?) |row, flags| for (row, flags) |cell, is_null| {
+        try std.testing.expect(cell == .null and is_null);
+    };
+    try std.testing.expectEqual(@as(usize, 1), backend.captures);
+    try std.testing.expectEqual(@as(usize, 1), backend.commits);
 }
 
 test "SQL mutation membership subquery scales by captured rows" {
@@ -1153,6 +1239,7 @@ test "SQL mutation scalar subquery rejects multiple rows before commit" {
         "UPDATE target SET n=(SELECT delta FROM source WHERE source.id=target._id),cold='new'",
         "UPDATE target SET (n,cold)=ROW((SELECT delta FROM source WHERE source.id=target._id),'new')",
         "UPDATE target SET (n,cold)=(SELECT delta,'new' FROM source)",
+        "UPDATE target SET (n,cold)=(SELECT * FROM (SELECT delta,'new' AS label FROM source) s)",
     }) |sql| {
         var backend: Backend = .{ .duplicates = true };
         var compiled = try compiler.compile(std.testing.allocator, sql, .{});

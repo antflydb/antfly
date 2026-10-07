@@ -1209,6 +1209,25 @@ from current SQL extraction is not repaired by naming this inventory check a ful
 
 ## Concrete remaining reviews
 
+Row-valued UPDATE subqueries now retain an exact compiler-owned output-width
+contract until the pinned source layout expands wildcards. Both shape inference
+and executable derived binding enforce that contract before capture; an empty
+source cannot conceal a column mismatch. Qualified wildcards and mixed
+wildcard/scalar projections retain positional assignment, source ordering,
+one captured read set and one mutation commit. COUNT(*) has one output despite
+its compact AST representation. Independent PostgreSQL tests verify complete
+postimages, `42601` width diagnostics, `21000` cardinality diagnostics and
+unchanged storage after errors. Native tests additionally cover whole-row
+SQL NULL assignment on an empty source, allocation-fault cleanup, and exact
+typed-array lower bounds/NULL elements/64-bit payloads. A mounted HTTP
+regression verifies a committed wildcard row update, both error SQLSTATEs,
+direct native postimages after each error, and sparse nullable-field retention.
+This closes the
+schema-bound width gap, not correlated row-source execution: the existing
+independent materialized-source guard remains until a shared multi-output
+Apply producer can retain per-target demand and cardinality safely. No original
+inventory case receives completion credit from these component regressions.
+
 - TRUNCATE: `sql-0160` through `sql-0165` and `sql-1101` are mapped to
   the durable empty-generation barrier. Exact original SQL forms are compiled
   and admitted by the API fixture; the real staged-owner driver tests empty

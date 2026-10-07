@@ -113,6 +113,9 @@ pub const Select = struct {
     ctes: []const Cte = &.{},
     /// Empty means all visible columns. count_all is mutually exclusive.
     columns: []const Projection = &.{},
+    /// Compiler-owned row-assignment boundary. Wildcards are checked only
+    /// after expansion against the pinned source layout, before any capture.
+    required_output_columns: ?usize = null,
     count_all: bool = false,
     count_alias: ?[]const u8 = null,
     predicate: ?*const Predicate = null,

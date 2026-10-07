@@ -399,9 +399,13 @@ const Parser = struct {
             try self.rowSubqueryWidth(set.right.*, width);
             return;
         }
-        // A wildcard's width depends on the catalog. Keep this parser-owned
-        // expansion explicit so no assignment can silently discard a column.
-        if (query.count_all or query.columns.len != width)
+        // Wildcards have a schema-bound width. Preserve an exact output
+        // contract for the binder instead of guessing from AST item count.
+        if (!query.count_all) {
+            if (query.columns.len == 0) return;
+            for (query.columns) |projection| if (projection.wildcard) return;
+        }
+        if ((if (query.count_all) @as(usize, 1) else query.columns.len) != width)
             return self.fail(error.InvalidSqlSyntax, "row subquery column count differs from assignment targets");
     }
 
@@ -415,6 +419,7 @@ const Parser = struct {
         const query = try self.alloc.create(ast.Select);
         query.* = nested.select;
         try self.rowSubqueryWidth(query.*, targets.len);
+        query.required_output_columns = targets.len;
         const names = try self.alloc.alloc([]const u8, targets.len);
         for (names, 0..) |*output_name, index| output_name.* = try std.fmt.allocPrint(self.alloc, "$row_{d}", .{index});
         // A NUL-prefixed name cannot be spelled by SQL identifiers and thus
@@ -2512,6 +2517,17 @@ test "compiler UPDATE row assignments flatten simultaneous typed expressions" {
     for (queried.statement.update.assignments) |assignment| {
         try std.testing.expect(assignment.expression.?.* == .call);
         try std.testing.expectEqualStrings("$scalar", assignment.expression.?.call.name);
+    }
+    for ([_][]const u8{
+        "UPDATE rows SET (quantity,status)=(SELECT * FROM source)",
+        "UPDATE rows SET (quantity,status)=(SELECT source.* FROM source)",
+        "UPDATE rows SET (quantity,status)=(SELECT source.*,'copied' FROM source)",
+        "UPDATE rows SET (quantity)=(SELECT COUNT(*) FROM source)",
+    }) |sql| {
+        var deferred = try compile(std.testing.allocator, sql, .{});
+        defer deferred.deinit();
+        const mutation = deferred.statement.update;
+        try std.testing.expectEqual(@as(?usize, mutation.assignments.len), mutation.ctes[0].query.required_output_columns);
     }
     try std.testing.expectError(error.InvalidSqlSyntax, compile(std.testing.allocator, "UPDATE rows SET (quantity, status) = (SELECT n FROM source)", .{}));
     try std.testing.expectError(error.InvalidSqlSyntax, compile(std.testing.allocator, "UPDATE rows SET (quantity, status) = (SELECT n, status, id FROM source)", .{}));
