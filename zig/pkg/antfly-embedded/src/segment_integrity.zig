@@ -159,6 +159,10 @@ pub const PagedSource = struct {
             @memcpy(out, bytes[within..][0..out.len]);
             return;
         }
+        // Checksum-capable providers already own their range/cache policy.
+        // Authenticate with fixed worker scratch instead of retaining another
+        // 64 KiB payload slab for every facade over that same provider.
+        if (self.original.ranges.checksum != null) return self.authenticateRange(index, offset, length, within, out);
         // Invalidate before touching bytes: failed/partial reads cannot expose
         // the old cache entry. Publish only after authentication completes.
         @import("antfly_platform").sync.lockYielding(&self.mutex);
@@ -171,17 +175,7 @@ pub const PagedSource = struct {
                 // Mandatory authentication uses fixed worker scratch when
                 // the optional shared cache is full. No uncharged heap page
                 // survives pressure or scales with open reader count.
-                var scratch: [8192]u8 = undefined;
-                const actual = try self.original.checksum(offset, length, &scratch);
-                var expected: [4]u8 = undefined;
-                try self.original.readInto(self.directory.offset + @as(u64, index) * 4, &expected);
-                if (actual != std.mem.readInt(u32, &expected, .big)) {
-                    state.store(2, .release);
-                    return error.CrcMismatch;
-                }
-                state.store(1, .release);
-                try self.original.readInto(offset + within, out);
-                return;
+                return self.authenticateRange(index, offset, length, within, out);
             };
             @import("antfly_platform").sync.lockYielding(&self.mutex);
             self.buffer = buffer;
@@ -200,6 +194,19 @@ pub const PagedSource = struct {
         self.cached_page = index;
         @memcpy(out, self.buffer[within..][0..out.len]);
     }
+    fn authenticateRange(self: *PagedSource, index: usize, offset: u64, length: usize, within: usize, out: []u8) !void {
+        var scratch: [8192]u8 = undefined;
+        const actual = try self.original.checksum(offset, length, &scratch);
+        var expected: [4]u8 = undefined;
+        try self.original.readInto(self.directory.offset + @as(u64, index) * 4, &expected);
+        const state = &self.validations[index];
+        if (actual != std.mem.readInt(u32, &expected, .big)) {
+            state.store(2, .release);
+            return error.CrcMismatch;
+        }
+        state.store(1, .release);
+        try self.original.readInto(offset + within, out);
+    }
     fn read(ptr: *anyopaque, offset: u64, out: []u8) !void {
         const self: *PagedSource = @ptrCast(@alignCast(ptr));
         var copied: usize = 0;
@@ -214,3 +221,55 @@ pub const PagedSource = struct {
         }
     }
 };
+
+test "segment.provider checksums avoid duplicate page slabs and fail closed" {
+    const a = std.testing.allocator;
+    const bytes = try a.alloc(u8, page_size + 4);
+    defer a.free(bytes);
+    @memset(bytes[0..page_size], 7);
+    std.mem.writeInt(u32, bytes[page_size..][0..4], Crc32.hash(bytes[0..page_size]), .big);
+    const Backend = struct {
+        bytes: []u8,
+        checksums: usize = 0,
+        fail: bool = false,
+        fn read(raw: *anyopaque, offset: u64, out: []u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            @memcpy(out, self.bytes[@intCast(offset)..][0..out.len]);
+        }
+        fn checksum(raw: *anyopaque, offset: u64, length: u64) !u32 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.checksums += 1;
+            if (self.fail) return error.TestIoFailure;
+            return Crc32.hash(self.bytes[@intCast(offset)..][0..@intCast(length)]);
+        }
+        fn close(_: *anyopaque) void {}
+    };
+    var backend = Backend{ .bytes = bytes, .fail = true };
+    const original = source_mod.Source{ .ranges = .{ .ptr = &backend, .length = bytes.len, .read_into = Backend.read, .checksum = Backend.checksum, .close = Backend.close } };
+    var budget = @import("storage/lite/test_allocator.zig").BudgetAllocator{ .backing = a, .limit = 4096 };
+    const directory = Directory{ .offset = page_size, .length = 4, .checksum = Crc32.hash(bytes[page_size..]) };
+    const paged = try PagedSource.init(budget.allocator(), original, directory);
+    var alive = true;
+    defer if (alive) paged.deinit();
+    var out: [8]u8 = undefined;
+    try std.testing.expectError(error.TestIoFailure, paged.source().readInto(3, &out));
+    backend.fail = false;
+    try paged.source().readInto(3, &out);
+    try std.testing.expectEqualSlices(u8, bytes[3..11], &out);
+    try std.testing.expectEqual(@as(usize, 2), backend.checksums);
+    try paged.source().readInto(123, &out);
+    try std.testing.expectEqual(@as(usize, 2), backend.checksums);
+    try std.testing.expectEqual(@as(usize, 0), paged.retainedBytes());
+    paged.deinit();
+    alive = false;
+    try std.testing.expectEqual(@as(usize, 0), budget.live);
+    const corrupt = try PagedSource.init(budget.allocator(), original, directory);
+    defer corrupt.deinit();
+    bytes[7] ^= 1;
+    try std.testing.expectError(error.CrcMismatch, corrupt.source().readInto(3, &out));
+    bytes[7] ^= 1;
+    const calls = backend.checksums;
+    try std.testing.expectError(error.CrcMismatch, corrupt.source().readInto(3, &out));
+    try std.testing.expectEqual(calls, backend.checksums);
+    try std.testing.expectEqual(@as(usize, 0), corrupt.retainedBytes());
+}
