@@ -1180,6 +1180,25 @@ Worker-process transfer, other backend teams, complete memory accounting and
 full production/default qualification are still required. The adapter is not
 installed by production yet.
 
+### Local inference parent phase (2026-10-07, final native API gate passed)
+
+SQL decision calls now propagate a checked borrowed execution descriptor through
+RequestContext and provider bridge ABI v29. The local host transfers the same
+operation to inference, installs its native CPU scope, and restores the parent
+through original deadline and read-fence checks. Failed return discards owned
+JSON/numeric responses. Borrowed invocations use a non-fan-out executor so task
+pipelines cannot migrate CPU work off the admitted worker. Native and Nix/glibc
+Linux focused host tests pass; the earlier full native API gate passed 87 tests
+before the executor addition. The [parent phase receipt](qualification/workload-pooling/receipts/2026-10-07/local-inference-parent-phase/README.md)
+records the evidence. The final combined native API gate also passes all 50
+steps and 87 tests, with no skips/failures/leaks and exit 0, after a verified
+interrupted run and unchanged-source rerun. Source hashes match the completed
+gate. This ABI v29 gate does not qualify the separate worker-protocol candidate. At this historical ABI v29 source, subprocess
+borrowed calls required protocol handoff and failed before transfer; the ABI v30
+worker delivery below provides that handoff.
+Independent broker admission, fused waiting, broader backend teams and full
+production/default qualification remain required; defaults are disabled.
+
 ### Worker CPU budget handoff (2026-10-07, focused gates passed)
 
 Provider ABI v30/private worker protocol v6 now carry CPU demand while the
@@ -1188,11 +1207,11 @@ worker validates demand before payload preparation and installs its own native
 scope and non-fan-out executor. Conflicting/out-of-range demand and worker
 relays fail closed. All seven focused host/wire tests pass on native macOS and
 Nix/glibc Linux; [worker budget receipts](qualification/workload-pooling/receipts/2026-10-07/worker-cpu-budget-handoff/README.md)
-pin source and output. Actual subprocess and production dispatcher/archive
-qualification are still pending, along with whole API/default overload gates.
+pin source and output. Production archive and real subprocess probes now pass
+on both platforms, as recorded below. Whole API/default overload gates remain required.
 The separate local-parent ABI v29 gate does not qualify these worker bytes.
 
-### Native production worker handoff (2026-10-07, GNU production gates pending)
+### Production worker handoff (2026-10-07, native and GNU probes passed)
 
 The complete production inference archive and exported C probe pass all 23
 native build steps. The probe covers provider-tail rejection, demand validation,
@@ -1203,7 +1222,7 @@ parent ownership is restored and reaping clears resource-owner references.
 [Native production receipts](qualification/workload-pooling/receipts/2026-10-07/production-worker-native/README.md)
 pin source, commands and logs. These malformed-provider probes verify plumbing,
 not model team peaks or overload fairness. Corresponding Nix/glibc production
-gates are in progress; ABI v30 full API and combined startup/default gates
+gates also pass all 23 steps; ABI v30 full API and combined startup/default gates
 remain required. Defaults are still disabled.
 
 The ABI30 production archive and subprocess probes now pass on both native macOS and pinned Nix/glibc aarch64-linux-gnu. The GNU run validates all seven recorded source hashes and retains its exit-0 result and full log beside the native production-worker receipts. Numerical model execution and combined overload/default qualification remain pending.
