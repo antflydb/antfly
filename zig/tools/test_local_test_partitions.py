@@ -119,6 +119,17 @@ pub fn build(b: *std.Build) void {
     }
     run.addPassthruArgs();
     b.step("test", "Run both owners").dependOn(&run.step);
+    if (b.option(bool, "owner-audit", "Audit a split source owner") orelse false) {
+        const inventory = b.addRunArtifact(tests);
+        inventory.addArg("--list-tests");
+        const audit = b.addSystemCommand(&.{"python3"});
+        audit.addFileArg(b.path("tools/audit_test_selection.py"));
+        audit.addArg("--inventory");
+        audit.addFileArg(inventory.captureStdErr(.{}));
+        audit.addArg("--");
+        audit.addPassthruArgs();
+        run.step.dependOn(&audit.step);
+    }
     owner.finalize(b);
     if (b.option(bool, "aggregate", "Apply aggregate exclusions") orelse false)
         _ = @import("pkg/antfly/build/unit_test_ownership.zig").applyWithSourceOwners(b, &b.top_level_steps.get("test").?.step, @import("build_support/antfly/test_partitions.zig").consumerFor);
@@ -169,6 +180,17 @@ pub fn build(b: *std.Build) void {
         output = self.build(build_options=options)
         self.assertEqual(output.count("local owned..."), 1, output)
         self.assertEqual(output.count("server owned..."), 1, output)
+        output = self.build(
+            "--test-filter", "missing", build_options=options, succeeds=False
+        )
+        self.assertIn("test filter matched no declared tests", output)
+
+    def test_existing_owner_audit_keeps_local_inventory_before_runtime_args(self):
+        options = ("-Downer-audit=true",)
+        for name in ("local owned", "server owned"):
+            with self.subTest(owner=name):
+                output = self.build("--test-filter", name, build_options=options)
+                self.assertIn(name + "...", output)
         output = self.build(
             "--test-filter", "missing", build_options=options, succeeds=False
         )

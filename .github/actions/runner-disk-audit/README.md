@@ -15,3 +15,15 @@ of treating peak usage as this job's own footprint. The result is an observed
 sample, not an upper bound on a short-lived spike between samples. Jobs with
 no cache PVC still report scratch headroom, which is required before moving
 more jobs to the PVC-free `arc-antfly-heavy-runtime` profile.
+
+The base and full x86 unit jobs keep their disposable `zig-local` caches and
+reusable global dependencies on the cache PVC. Runner temp counts toward the
+pod's 10 GiB ephemeral-storage limit; its reported filesystem capacity does
+not establish the pod's storage budget. A failing run filled the measured
+49 GiB PVC, but filesystem usage alone does not identify the size of compiler
+outputs versus other cache contents. Completed phases retire local outputs
+and manifests together before starting the next phase, and the full job also
+removes its local cache on exit. Measure peak usage with this cleanup before
+increasing storage or splitting the unit suite. Do not delete individual
+executables while leaving live manifests, or remove a phase cache while one
+of its builds, tests, or inventory consumers is still running.
