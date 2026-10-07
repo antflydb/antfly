@@ -360,8 +360,8 @@ pub const JsonApiClient = struct {
         defer alloc.free(base);
         const url = try std.fmt.allocPrint(alloc, "{s}&ifGenerationMatch={s}", .{ base, generation });
         defer alloc.free(url);
-        var response = try self.performWithResponseLimit(.POST, url, &.{}, body, content_type, 64 * 1024);
-        defer response.deinit(self.alloc);
+        var response = try self.performWithResponseLimitAndCancellationAlloc(alloc, .POST, url, &.{}, body, content_type, 64 * 1024, null);
+        defer response.deinit(alloc);
         return switch (response.status) {
             200, 201 => {},
             304, 412 => error.PreconditionFailed,
@@ -389,7 +389,8 @@ pub const JsonApiClient = struct {
         defer headers.deinit(alloc);
         try appendConditionalHeaders(alloc, &headers, opts.if_match_etag, opts.if_none_match);
 
-        var response = try self.performWithResponseLimitAndCancellation(
+        var response = try self.performWithResponseLimitAndCancellationAlloc(
+            alloc,
             .POST,
             url,
             headers.items,
@@ -435,7 +436,8 @@ pub const JsonApiClient = struct {
         };
         const metadata_payload = try uploadMetadataPayloadAlloc(alloc, content_type, checksum);
         defer alloc.free(metadata_payload);
-        var initiated = try self.performWithResponseLimitAndCancellation(
+        var initiated = try self.performWithResponseLimitAndCancellationAlloc(
+            alloc,
             .POST,
             initiate_url,
             &initiate_headers,
@@ -466,7 +468,8 @@ pub const JsonApiClient = struct {
         const content_range = try std.fmt.allocPrint(alloc, "bytes 0-{d}/{d}", .{ body.len - 1, body.len });
         defer alloc.free(content_range);
         const upload_headers = [_]HeaderPair{.{ "Content-Range", content_range }};
-        var response = try self.performWithResponseLimitAndCancellation(
+        var response = try self.performWithResponseLimitAndCancellationAlloc(
+            alloc,
             .PUT,
             session_url,
             &upload_headers,
@@ -538,7 +541,8 @@ pub const JsonApiClient = struct {
         if (opts.checksum_sha256_hex) |checksum| try validateSha256Hex(checksum);
         const metadata_payload = try uploadMetadataPayloadAlloc(alloc, upload_type, opts.checksum_sha256_hex);
         defer alloc.free(metadata_payload);
-        var initiated = try self.performWithResponseLimitAndCancellation(
+        var initiated = try self.performWithResponseLimitAndCancellationAlloc(
+            alloc,
             .POST,
             initiate_url,
             &initiate_headers,
@@ -578,7 +582,8 @@ pub const JsonApiClient = struct {
             const content_range = try std.fmt.allocPrint(alloc, "bytes {d}-{d}/{d}", .{ offset, last, stat.size });
             defer alloc.free(content_range);
             const headers = [_]HeaderPair{.{ "Content-Range", content_range }};
-            var response = try self.performWithResponseLimitAndCancellation(
+            var response = try self.performWithResponseLimitAndCancellationAlloc(
+                alloc,
                 .PUT,
                 session_url,
                 &headers,
@@ -679,7 +684,8 @@ pub const JsonApiClient = struct {
             }
         }
 
-        var response = try self.performWithResponseLimitAndCancellation(
+        var response = try self.performWithResponseLimitAndCancellationAlloc(
+            alloc,
             .GET,
             url,
             headers.items,
@@ -758,7 +764,7 @@ pub const JsonApiClient = struct {
         const url = try objectMetadataUrlWithGenerationAlloc(alloc, self.cfg, bucket, key, generation);
         defer alloc.free(url);
 
-        var response = try self.performWithResponseLimitAndCancellation(.GET, url, &.{}, null, null, null, cancellation);
+        var response = try self.performWithResponseLimitAndCancellationAlloc(alloc, .GET, url, &.{}, null, null, null, cancellation);
         defer response.deinit(alloc);
 
         switch (response.status) {
@@ -799,7 +805,8 @@ pub const JsonApiClient = struct {
         const url = try objectListUrlAlloc(alloc, self.cfg, bucket, opts);
         defer alloc.free(url);
 
-        var response = try self.performWithResponseLimitAndCancellation(
+        var response = try self.performWithResponseLimitAndCancellationAlloc(
+            alloc,
             .GET,
             url,
             &.{},
@@ -865,18 +872,32 @@ pub const JsonApiClient = struct {
         max_response_size: ?usize,
         cancellation: ?types.CancellationToken,
     ) !TransportResponse {
+        return self.performWithResponseLimitAndCancellationAlloc(self.alloc, method, url, headers, body, content_type, max_response_size, cancellation);
+    }
+
+    fn performWithResponseLimitAndCancellationAlloc(
+        self: *JsonApiClient,
+        alloc: Allocator,
+        method: HttpMethod,
+        url: []const u8,
+        headers: []const HeaderPair,
+        body: ?[]const u8,
+        content_type: ?[]const u8,
+        max_response_size: ?usize,
+        cancellation: ?types.CancellationToken,
+    ) !TransportResponse {
         if (cancellation) |token| try token.check();
         var merged = std.ArrayListUnmanaged(HeaderPair).empty;
-        defer merged.deinit(self.alloc);
-        try merged.appendSlice(self.alloc, headers);
+        defer merged.deinit(alloc);
+        try merged.appendSlice(alloc, headers);
 
-        const auth_value = try self.cfg.auth.authorizationValueAlloc(self.alloc);
-        defer if (auth_value) |value| self.alloc.free(value);
-        if (auth_value) |value| try merged.append(self.alloc, .{ "Authorization", value });
+        const auth_value = try self.cfg.auth.authorizationValueAlloc(alloc);
+        defer if (auth_value) |value| alloc.free(value);
+        if (auth_value) |value| try merged.append(alloc, .{ "Authorization", value });
 
         return try self.request_fn(
             self.request_ctx,
-            self.alloc,
+            alloc,
             method,
             url,
             merged.items,
@@ -1654,9 +1675,17 @@ test "gcs local grpc reference path can be discovered when present" {
 }
 
 test "json api client pins media reads to the generation returned by metadata" {
-    const alloc = std.testing.allocator;
+    try testGenerationPinnedReads(std.testing.allocator, std.testing.allocator);
+}
+
+test "json api reads use the operation allocator when the client allocator differs" {
+    try testGenerationPinnedReads(std.heap.page_allocator, std.testing.allocator);
+}
+
+fn testGenerationPinnedReads(alloc: Allocator, client_alloc: Allocator) !void {
     const State = struct {
         calls: usize = 0,
+        request_allocator: Allocator,
 
         fn request(
             ptr: ?*anyopaque,
@@ -1673,6 +1702,7 @@ test "json api client pins media reads to the generation returned by metadata" {
             _ = content_type;
             const self: *@This() = @ptrCast(@alignCast(ptr.?));
             defer self.calls += 1;
+            try std.testing.expect(request_alloc.vtable == self.request_allocator.vtable);
 
             switch (self.calls) {
                 0 => {
@@ -1716,12 +1746,13 @@ test "json api client pins media reads to the generation returned by metadata" {
         }
     };
 
-    const cfg = try jsonApiClientConfigWithBearerTokenAlloc(alloc, "token-123", null);
-    var state = State{};
-    var json_client = JsonApiClient.initWithRequestFn(alloc, cfg, &state, State.request);
+    const cfg = try jsonApiClientConfigWithBearerTokenAlloc(client_alloc, "token-123", null);
+    var state = State{ .request_allocator = alloc };
+    var json_client = JsonApiClient.initWithRequestFn(client_alloc, cfg, &state, State.request);
 
     var client = json_client.client();
     defer client.deinit();
+    client.allocator = alloc;
 
     var result = try client.getObject("bucket", "folder/doc.txt", .{
         .range = .{ .offset = 2, .length = 4 },
