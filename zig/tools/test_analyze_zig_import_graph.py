@@ -1,4 +1,18 @@
 #!/usr/bin/env python3
+# Copyright 2026 Antfly, Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 import importlib.util
 import io
@@ -456,9 +470,7 @@ class ImportGraphTest(unittest.TestCase):
         self.assertEqual(0.5, stats["shared_fraction_of_smaller_graph"])
 
     def test_aggregate_overlap_counts_duplicate_instances_and_groups(self):
-        storage = self.write(
-            "zig/pkg/antfly-embedded/src/local/storage/db.zig", "one\ntwo\n"
-        )
+        storage = self.write("zig/pkg/antfly-embedded/src/storage/db.zig", "one\ntwo\n")
         httpx = self.write("zig/lib/httpx/src/httpx.zig", "one\n")
         unique = self.write("zig/pkg/antfly/src/unique.zig", "one\n")
         reports = [
@@ -486,10 +498,10 @@ class ImportGraphTest(unittest.TestCase):
         groups = {row["name"]: row for row in stats["groups"]}
         self.assertEqual(
             2,
-            groups["zig/pkg/antfly-embedded/src/local/storage"]["duplicate_instances"],
+            groups["zig/pkg/antfly-embedded/src/storage"]["duplicate_instances"],
         )
         self.assertEqual(
-            4, groups["zig/pkg/antfly-embedded/src/local/storage"]["duplicate_lines"]
+            4, groups["zig/pkg/antfly-embedded/src/storage"]["duplicate_lines"]
         )
         self.assertEqual(1, groups["zig/lib/httpx"]["duplicate_instances"])
 

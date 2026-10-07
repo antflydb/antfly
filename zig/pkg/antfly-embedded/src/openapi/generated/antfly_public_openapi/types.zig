@@ -2041,6 +2041,90 @@ pub const CdcConnection = struct {
     }
 };
 
+pub const ChatGPTAccount = struct {
+    connection_id: []const u8,
+    email: []const u8,
+    label: []const u8,
+    connected: bool,
+    plan_enabled: bool,
+};
+
+pub const ChatGPTAccounts = struct {
+    accounts: []const ChatGPTAccount,
+};
+
+pub const ChatGPTAuthorize = struct {
+    connection_id: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "connection_id", "connection_id", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.connection_id) |value| {
+            try jw.objectField("connection_id");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const ChatGPTBegin = struct {
+    attempt_id: []const u8,
+    authorization_url: []const u8,
+    expires_at: i64,
+};
+
+pub const ChatGPTDisconnect = struct {
+    revocation_confirmed: bool,
+};
+
+pub const ChatGPTOutcome = struct {
+    status: []const u8,
+    connection_id: ?[]const u8 = null,
+    @"error": ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "status", "status", false },
+        .{ "connection_id", "connection_id", true },
+        .{ "error", "error", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("status");
+        try jw.write(self.status);
+        if (self.connection_id) |value| {
+            try jw.objectField("connection_id");
+            try jw.write(value);
+        }
+        if (self.@"error") |value| {
+            try jw.objectField("error");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 /// Native cluster backups pin a common transaction cut across a dependency-complete table set. Restart-stable LSM seals are journaled before releasing write fences; artifact upload uses those immutable seals without holding the write pause. Native cohorts support at most 4096 tables and 4096 ranges and require the filesystem-managed LSM backend. Portable backups do not support coordinated UNIQUE/FK constraints or promise a common cross-table transaction cut.
 pub const ClusterBackupRequest = struct {
     /// Unique identifier for this backup. Used to reference the backup for restore operations. Choose a meaningful name that includes date/version information.
@@ -2632,6 +2716,7 @@ pub const ClusterStatus = struct {
     auth_enabled: ?bool = null,
     /// Runtime deployment topology
     deployment_mode: ?[]const u8 = null,
+    connectors: ?ConnectorCapabilities = null,
     index_capabilities: ?IndexRuntimeCapabilities = null,
     secret_store: ?SecretStoreStatus = null,
     runtime_config: ?RuntimeConfigStatus = null,
@@ -2643,6 +2728,7 @@ pub const ClusterStatus = struct {
         .{ "message", "message", true },
         .{ "auth_enabled", "auth_enabled", true },
         .{ "deployment_mode", "deployment_mode", true },
+        .{ "connectors", "connectors", true },
         .{ "index_capabilities", "index_capabilities", true },
         .{ "secret_store", "secret_store", true },
         .{ "runtime_config", "runtime_config", true },
@@ -2671,6 +2757,10 @@ pub const ClusterStatus = struct {
         }
         if (self.deployment_mode) |value| {
             try jw.objectField("deployment_mode");
+            try jw.write(value);
+        }
+        if (self.connectors) |value| {
+            try jw.objectField("connectors");
             try jw.write(value);
         }
         if (self.index_capabilities) |value| {
@@ -2701,6 +2791,7 @@ pub const ClusterTopology = struct {
     auth_enabled: ?bool = null,
     /// Runtime deployment topology
     deployment_mode: ?[]const u8 = null,
+    connectors: ?ConnectorCapabilities = null,
     index_capabilities: ?IndexRuntimeCapabilities = null,
     secret_store: ?SecretStoreStatus = null,
     runtime_config: ?RuntimeConfigStatus = null,
@@ -2713,6 +2804,7 @@ pub const ClusterTopology = struct {
         .{ "message", "message", true },
         .{ "auth_enabled", "auth_enabled", true },
         .{ "deployment_mode", "deployment_mode", true },
+        .{ "connectors", "connectors", true },
         .{ "index_capabilities", "index_capabilities", true },
         .{ "secret_store", "secret_store", true },
         .{ "runtime_config", "runtime_config", true },
@@ -2742,6 +2834,10 @@ pub const ClusterTopology = struct {
         }
         if (self.deployment_mode) |value| {
             try jw.objectField("deployment_mode");
+            try jw.write(value);
+        }
+        if (self.connectors) |value| {
+            try jw.objectField("connectors");
             try jw.write(value);
         }
         if (self.index_capabilities) |value| {
@@ -3028,6 +3124,11 @@ pub const ConnectionStatus = enum {
 
 pub const ConnectionsResponse = struct {
     connections: []const Connection,
+};
+
+/// Effective integration availability for this deployment; independent of login providers and individual grants.
+pub const ConnectorCapabilities = struct {
+    chatgpt: std.json.Value,
 };
 
 /// Request to create a new API key.
@@ -4581,6 +4682,8 @@ pub const ForeignSource = struct {
 
 /// A stateful global query. The target table is required on this route.
 pub const GlobalStatefulQueryRequest = struct {
+    /// Opaque remote index snapshot token returned by a previous query. Required when replaying search_after or search_before against an external table; a changed publication returns 409.
+    remote_snapshot: ?[]const u8 = null,
     evaluate: ?QueryEvaluation = null,
     table_target: ?CatalogTableTarget = null,
     /// Literal table name in default.public. Global queries require exactly one of table or table_target.
@@ -4659,6 +4762,7 @@ pub const GlobalStatefulQueryRequest = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "remote_snapshot", "remote_snapshot", true },
         .{ "evaluate", "evaluate", true },
         .{ "table_target", "table_target", true },
         .{ "table", "table", false },
@@ -4711,6 +4815,10 @@ pub const GlobalStatefulQueryRequest = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.remote_snapshot) |value| {
+            try jw.objectField("remote_snapshot");
+            try jw.write(value);
+        }
         if (self.evaluate) |value| {
             try jw.objectField("evaluate");
             try jw.write(value);
@@ -8199,6 +8307,8 @@ pub const QueryProfile = struct {
 };
 
 pub const QueryRequest = struct {
+    /// Opaque remote index snapshot token returned by a previous query. Required when replaying search_after or search_before against an external table; a changed publication returns 409.
+    remote_snapshot: ?[]const u8 = null,
     evaluate: ?QueryEvaluation = null,
     table_target: ?CatalogTableTarget = null,
     /// Literal table name in default.public. Global queries require exactly one of table or table_target.
@@ -8273,6 +8383,7 @@ pub const QueryRequest = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "remote_snapshot", "remote_snapshot", true },
         .{ "evaluate", "evaluate", true },
         .{ "table_target", "table_target", true },
         .{ "table", "table", true },
@@ -8323,6 +8434,10 @@ pub const QueryRequest = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.remote_snapshot) |value| {
+            try jw.objectField("remote_snapshot");
+            try jw.write(value);
+        }
         if (self.evaluate) |value| {
             try jw.objectField("evaluate");
             try jw.write(value);
@@ -8526,6 +8641,8 @@ pub const QueryResponses = struct {
 
 /// Result of a canonical query operation.
 pub const QueryResult = struct {
+    /// Opaque remote publication and schema fence to echo with ordered pagination. This token does not grant access or retain the publication.
+    remote_snapshot: ?[]const u8 = null,
     /// Function evaluation scope, population, usage, and scoped aggregations.
     evaluation: ?std.json.ArrayHashMap(std.json.Value) = null,
     hits: ?QueryHits = null,
@@ -8549,6 +8666,7 @@ pub const QueryResult = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "remote_snapshot", "remote_snapshot", true },
         .{ "evaluation", "evaluation", true },
         .{ "hits", "hits", true },
         .{ "aggregations", "aggregations", true },
@@ -8572,6 +8690,10 @@ pub const QueryResult = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.remote_snapshot) |value| {
+            try jw.objectField("remote_snapshot");
+            try jw.write(value);
+        }
         if (self.evaluation) |value| {
             try jw.objectField("evaluation");
             try jw.write(value);
@@ -8621,6 +8743,8 @@ pub const QueryResult = struct {
 
 /// Fields shared by canonical and stateful query result envelopes.
 pub const QueryResultBase = struct {
+    /// Opaque remote publication and schema fence to echo with ordered pagination. This token does not grant access or retain the publication.
+    remote_snapshot: ?[]const u8 = null,
     /// Function evaluation scope, population, usage, and scoped aggregations.
     evaluation: ?std.json.ArrayHashMap(std.json.Value) = null,
     hits: ?QueryHits = null,
@@ -8643,6 +8767,7 @@ pub const QueryResultBase = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "remote_snapshot", "remote_snapshot", true },
         .{ "evaluation", "evaluation", true },
         .{ "hits", "hits", true },
         .{ "aggregations", "aggregations", true },
@@ -8665,6 +8790,10 @@ pub const QueryResultBase = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.remote_snapshot) |value| {
+            try jw.objectField("remote_snapshot");
+            try jw.write(value);
+        }
         if (self.evaluation) |value| {
             try jw.objectField("evaluation");
             try jw.write(value);
@@ -14104,6 +14233,8 @@ pub const SqlSettingValue = std.json.Value;
 
 /// Stateful Antfly query request. Canonical clients use graph_queries; deprecated graph_searches is retained only at the stateful public transport boundary for the v0.2 transition window.
 pub const StatefulQueryRequest = struct {
+    /// Opaque remote index snapshot token returned by a previous query. Required when replaying search_after or search_before against an external table; a changed publication returns 409.
+    remote_snapshot: ?[]const u8 = null,
     evaluate: ?QueryEvaluation = null,
     table_target: ?CatalogTableTarget = null,
     /// Literal table name in default.public. Global queries require exactly one of table or table_target.
@@ -14182,6 +14313,7 @@ pub const StatefulQueryRequest = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "remote_snapshot", "remote_snapshot", true },
         .{ "evaluate", "evaluate", true },
         .{ "table_target", "table_target", true },
         .{ "table", "table", true },
@@ -14234,6 +14366,10 @@ pub const StatefulQueryRequest = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.remote_snapshot) |value| {
+            try jw.objectField("remote_snapshot");
+            try jw.write(value);
+        }
         if (self.evaluate) |value| {
             try jw.objectField("evaluate");
             try jw.write(value);
@@ -14445,6 +14581,8 @@ pub const StatefulQueryResponses = struct {
 
 /// Result emitted by the stateful compatibility transport.
 pub const StatefulQueryResult = struct {
+    /// Opaque remote publication and schema fence to echo with ordered pagination. This token does not grant access or retain the publication.
+    remote_snapshot: ?[]const u8 = null,
     /// Function evaluation scope, population, usage, and scoped aggregations.
     evaluation: ?std.json.ArrayHashMap(std.json.Value) = null,
     hits: ?QueryHits = null,
@@ -14468,6 +14606,7 @@ pub const StatefulQueryResult = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "remote_snapshot", "remote_snapshot", true },
         .{ "evaluation", "evaluation", true },
         .{ "hits", "hits", true },
         .{ "aggregations", "aggregations", true },
@@ -14491,6 +14630,10 @@ pub const StatefulQueryResult = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.remote_snapshot) |value| {
+            try jw.objectField("remote_snapshot");
+            try jw.write(value);
+        }
         if (self.evaluation) |value| {
             try jw.objectField("evaluation");
             try jw.write(value);

@@ -4,6 +4,7 @@ from enum import StrEnum
 class GeneratorProvider(StrEnum):
     ANTFLY = "antfly"
     APPLE = "apple"
+    CHATGPT = "chatgpt"
     GEMINI = "gemini"
     OLLAMA = "ollama"
     OPENAI = "openai"

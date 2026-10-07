@@ -1,5 +1,18 @@
 # Copyright 2026 Antfly, Inc.
 # SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Test measurement accounting without invoking a compiler."""
 
 import importlib.util
@@ -23,8 +36,20 @@ SPEC.loader.exec_module(measurement)
 
 
 class LiteralSourceOwnership(unittest.TestCase):
+    def test_control_catalog_is_current_and_has_no_physical_imports(self):
+        local = measurement.ZIG_ROOT / "pkg/antfly-embedded/src"
+        catalog = local / "source_catalog_control.zig"
+        self.assertEqual(catalog.read_text(), measurement.control_catalog_contents())
+        for relative in ("storage/db/db.zig", "storage/query.zig", "storage/write.zig"):
+            with self.subTest(source=relative):
+                self.assertIsNone(
+                    measurement.literal_import_path(catalog, local / relative)
+                )
+
     def test_control_roots_have_no_physical_implementation_import_path(self):
         source = measurement.ZIG_ROOT / "pkg/antfly/src"
+        physical_db = measurement.ZIG_ROOT / "pkg/antfly-embedded/src/storage/db/db.zig"
+        self.assertTrue(physical_db.is_file())
         roots = [
             *(
                 f"runtime_{unit}_root.zig"
@@ -48,18 +73,25 @@ class LiteralSourceOwnership(unittest.TestCase):
             with self.subTest(root=name):
                 root = source / name
                 self.assertTrue(root.is_file(), name)
-                path = measurement.literal_import_path(
-                    root, source / "storage/db/db.zig"
-                )
+                path = measurement.literal_import_path(root, physical_db)
                 self.assertIsNone(path, path)
                 if (
                     name.startswith("runtime_")
                     and name != "runtime_distributed_root.zig"
                 ):
-                    path = measurement.literal_import_path(
-                        root, source / "api/table_writes.zig"
-                    )
-                    self.assertIsNone(path, path)
+                    for coordination in ("api/table_reads.zig", "api/table_writes.zig"):
+                        path = measurement.literal_import_path(
+                            root, source / coordination
+                        )
+                        self.assertIsNone(path, path)
+
+    def test_shared_query_transforms_do_not_import_coordination(self):
+        source = measurement.ZIG_ROOT / "pkg/antfly/src"
+        root = source / "api/query_post_processing.zig"
+        for coordination in ("api/table_reads.zig", "api/table_writes.zig"):
+            with self.subTest(source=coordination):
+                path = measurement.literal_import_path(root, source / coordination)
+                self.assertIsNone(path, path)
 
     def test_imports_in_inactive_test_bodies_are_cache_dependencies(self):
         with tempfile.TemporaryDirectory() as directory:

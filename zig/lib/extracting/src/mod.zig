@@ -1,4 +1,5 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -546,10 +547,10 @@ const HttpExtractorState = struct {
             .cancellation = self.cancellation,
         });
         defer resp.deinit();
-        if (!resp.ok()) return if (responseCapabilityStale(resp))
-            error.InferenceCapabilitiesStale
-        else
-            error.ExtractionRequestFailed;
+        if (!resp.ok()) {
+            logHttpFailure(alloc, self.cfg, resp);
+            return extractionHttpStatusError(resp.status.code, responseCapabilityStale(resp));
+        }
         const payload = resp.body orelse return error.EmptyExtractionResponse;
         // Only pin the response to a specific schema_version when the
         // caller actually asked for one -- either this request explicitly
@@ -578,6 +579,108 @@ const HttpExtractorState = struct {
         return .{ .allocator = alloc, .json = canonical };
     }
 };
+
+/// Keep HTTP rejection identities actionable in durable enrichment failures.
+/// Only temporary HTTP failures retry; a stale capability lease has its own
+/// refresh/retry protocol and must not become a permanent source failure.
+fn extractionHttpStatusError(status: u16, capability_stale: bool) anyerror {
+    if (status == 409 and capability_stale) return error.InferenceCapabilitiesStale;
+    return switch (status) {
+        400, 422 => error.ExtractionInvalidRequest,
+        401 => error.ExtractionUnauthorized,
+        403 => error.ExtractionForbidden,
+        404 => error.ExtractionNotFound,
+        413 => error.ExtractionRequestTooLarge,
+        429 => error.ExtractionRateLimited,
+        408, 409, 425, 500...599 => error.ExtractionTransientFailure,
+        else => error.ExtractionRequestRejected,
+    };
+}
+
+const HttpFailureDetails = struct {
+    code: []const u8 = "",
+    message: []const u8 = "",
+    hint: []const u8 = "",
+
+    fn fromJson(value: std.json.Value) HttpFailureDetails {
+        if (value != .object) return .{};
+        const fields = if (value.object.get("error")) |err|
+            if (err == .object) err else value
+        else
+            value;
+        return .{
+            .code = boundedDiagnostic(stringField(fields, "code") orelse stringField(fields, "error") orelse ""),
+            .message = boundedDiagnostic(stringField(fields, "message") orelse ""),
+            .hint = boundedDiagnostic(stringField(fields, "hint") orelse ""),
+        };
+    }
+};
+
+fn boundedDiagnostic(value: []const u8) []const u8 {
+    return value[0..@min(value.len, 512)];
+}
+
+fn logHttpFailure(alloc: Allocator, cfg: Config, response: httpx.Response) void {
+    var details: HttpFailureDetails = .{};
+    var parsed: ?std.json.Parsed(std.json.Value) = null;
+    defer if (parsed) |*value| value.deinit();
+    // Never dump an arbitrary response body: it can contain input documents,
+    // credentials, HTML, or excessive provider output. Keep only known error
+    // envelope fields, with bounded parsing and JSON-escaped log values.
+    if (response.body) |body| {
+        if (body.len <= 16 * 1024) {
+            parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch null;
+            if (parsed) |value| details = HttpFailureDetails.fromJson(value.value);
+        }
+    }
+    std.log.warn("extraction HTTP failure provider={s} model={f} status={d} code={f} message={f} hint={f}", .{
+        @tagName(cfg.provider),          std.json.fmt(boundedDiagnostic(cfg.model), .{}), response.status.code,
+        std.json.fmt(details.code, .{}), std.json.fmt(details.message, .{}),              std.json.fmt(details.hint, .{}),
+    });
+}
+
+test "extracting distinguishes permanent HTTP rejections from temporary failures" {
+    const cases = .{
+        .{ @as(u16, 400), error.ExtractionInvalidRequest },
+        .{ @as(u16, 401), error.ExtractionUnauthorized },
+        .{ @as(u16, 403), error.ExtractionForbidden },
+        .{ @as(u16, 404), error.ExtractionNotFound },
+        .{ @as(u16, 413), error.ExtractionRequestTooLarge },
+        .{ @as(u16, 422), error.ExtractionInvalidRequest },
+        .{ @as(u16, 408), error.ExtractionTransientFailure },
+        .{ @as(u16, 409), error.ExtractionTransientFailure },
+        .{ @as(u16, 425), error.ExtractionTransientFailure },
+        .{ @as(u16, 429), error.ExtractionRateLimited },
+        .{ @as(u16, 500), error.ExtractionTransientFailure },
+        .{ @as(u16, 503), error.ExtractionTransientFailure },
+        .{ @as(u16, 405), error.ExtractionRequestRejected },
+    };
+    inline for (cases) |case| try std.testing.expectEqual(case[1], extractionHttpStatusError(case[0], false));
+    try std.testing.expectEqual(error.InferenceCapabilitiesStale, extractionHttpStatusError(409, true));
+    try std.testing.expectEqual(error.ExtractionNotFound, extractionHttpStatusError(404, true));
+}
+
+test "extracting retains bounded error details from provider envelopes" {
+    const alloc = std.testing.allocator;
+    var antfly = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"error":"MODEL_NOT_FOUND","message":"model not found","hint":"pull the registered model"}
+    , .{});
+    defer antfly.deinit();
+    const details = HttpFailureDetails.fromJson(antfly.value);
+    try std.testing.expectEqualStrings("MODEL_NOT_FOUND", details.code);
+    try std.testing.expectEqualStrings("model not found", details.message);
+    try std.testing.expectEqualStrings("pull the registered model", details.hint);
+    var nested = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"error":{"code":"invalid_api_key","message":"invalid credentials"},"inputs":"do not log this"}
+    , .{});
+    defer nested.deinit();
+    try std.testing.expectEqualStrings("invalid_api_key", HttpFailureDetails.fromJson(nested.value).code);
+    try std.testing.expectEqualStrings("invalid credentials", HttpFailureDetails.fromJson(nested.value).message);
+    try std.testing.expectEqualStrings("", HttpFailureDetails.fromJson(.null).message);
+    var large: [1024]u8 = undefined;
+    @memset(&large, 'a');
+    try std.testing.expectEqual(@as(usize, 512), boundedDiagnostic(&large).len);
+}
 
 fn responseCapabilityStale(response: httpx.Response) bool {
     if (response.status.code != 409) return false;
@@ -1008,7 +1111,11 @@ fn exerciseCanonicalResponse(a: Allocator) !void {
 
 test "extracting response envelope ownership and exact extension numbers survive allocation failure" {
     try exerciseCanonicalResponse(std.testing.allocator);
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, exerciseCanonicalResponse, .{});
+    // Arena resize success depends on heap placement. Disable best-effort
+    // resizing so every injected run traverses the same allocation sequence,
+    // while the normal run above still exercises the production allocator.
+    var no_resize = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(no_resize.allocator(), exerciseCanonicalResponse, .{});
 }
 
 test "extracting response envelope bounds nesting before allocating" {
@@ -1077,7 +1184,7 @@ test "extracting antfly provider posts canonical extract request" {
     const io = io_impl.io();
 
     var server = try httpx.TestServer.start(alloc, io, &.{
-        .{ .method = .POST, .path = "/extract", .assert_request = expectExtractRequest, .respond = .{
+        .{ .method = .POST, .path = "/ai/v1/extract", .assert_request = expectExtractRequest, .respond = .{
             .body = "{\"object\":\"extraction\",\"model\":\"gliner\",\"data\":[{\"entities\":[{\"label\":\"person\",\"text\":\"Ada\"}]}]}",
         } },
     });
@@ -1116,6 +1223,48 @@ test "extracting antfly provider posts canonical extract request" {
     if (run_err) |err| return err;
     defer result.?.deinit();
     try std.testing.expect(std.mem.indexOf(u8, result.?.json, "\"object\":\"extraction\"") != null);
+}
+
+test "extracting HTTP provider preserves rejection and transient failure identities" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    const cases = .{
+        .{ @as(u16, 404), error.ExtractionNotFound },
+        .{ @as(u16, 429), error.ExtractionRateLimited },
+        .{ @as(u16, 503), error.ExtractionTransientFailure },
+    };
+    inline for (cases) |case| {
+        var server = try httpx.TestServer.start(alloc, io, &.{
+            .{ .method = .POST, .path = "/ai/v1/extract", .respond = .{
+                .status = case[0],
+                .body = "{\"error\":\"TEST_FAILURE\",\"message\":\"fixture failure\"}",
+            } },
+        });
+        defer server.deinit();
+        var client = httpx.Client.initWithConfig(alloc, io, .{ .keep_alive = false });
+        defer client.deinit();
+        var result: ?Response = null;
+        defer if (result) |*response| response.deinit();
+        var run_err: ?anyerror = null;
+        var group = std.Io.Group.init;
+        const Fiber = struct {
+            fn run(a: Allocator, http: *httpx.Client, url: []const u8, out: *?Response, err_out: *?anyerror) std.Io.Cancelable!void {
+                out.* = extractWithConfig(a, http, .{ .provider = .antfly, .model = "missing", .url = url }, .{
+                    .inputs = &.{.{ .content_json = "\"Ada\"" }},
+                }) catch |err| {
+                    err_out.* = err;
+                    return;
+                };
+            }
+        };
+        try group.concurrent(io, Fiber.run, .{ alloc, &client, server.baseUrl(), &result, &run_err });
+        try server.handleOne();
+        try group.await(io);
+        try std.testing.expect(result == null);
+        try std.testing.expect(run_err.? == case[1]);
+    }
 }
 
 fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *const [bytes.len * repetitions:0]u8 {

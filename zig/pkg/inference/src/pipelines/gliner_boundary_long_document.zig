@@ -1,5 +1,17 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Explicit, versioned long-document extension. Planning never truncates text.
 //! Merge inputs must contain every planned window, including empty outputs.
@@ -1487,7 +1499,7 @@ test "gliner boundary long document records preserve whole alternatives and solv
             try std.testing.expectEqual(@as(usize, 2), selected.selected.len);
         }
     };
-    try std.testing.checkAllAllocationFailures(a, Check.run, .{ exclusive_plan, &exclusive, &exclusive_windows });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Check.run, .{ exclusive_plan, &exclusive, &exclusive_windows });
     var missing = right;
     missing[0].record.fields = &.{ .{ .name = "name", .dtype = .str, .values = &.{testValue("B", 2, 3, 0.9)} }, .{ .name = "value", .dtype = .str, .values = &.{} } };
     try std.testing.expectError(error.LongDocumentRequiredRecordFieldMissing, mergeRecords(a, document, &compiled, &.{ windows[0], .{ .identity = try document.identity(1), .records = &missing } }, .{}));
@@ -1548,7 +1560,7 @@ test "gliner boundary long document allocation failures cancellation and recover
             return error.Cancelled;
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
     var options = testOptions();
     options.control = .{ .check_fn = Check.cancel };
     try std.testing.expectError(error.Cancelled, plan(std.testing.allocator, "A B C D E", @as([32]u8, @splat(0)), options));
@@ -1612,7 +1624,7 @@ test "gliner boundary long document legacy fields merge globally with Unicode an
             try std.testing.expectEqual(@as(usize, 5), result.output_values);
         }
     };
-    try std.testing.checkAllAllocationFailures(a, Check.run, .{ document, &compiled, &windows, options });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Check.run, .{ document, &compiled, &windows, options });
 }
 
 test "gliner boundary long document occurrence identity preserves local multiplicity and latent source seeds" {

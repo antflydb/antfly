@@ -1,4 +1,5 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Elastic-2.0
 //
 // Licensed under the Elastic License 2.0 (ELv2); you may not use this file
 // except in compliance with the Elastic License 2.0. You may obtain a copy of
@@ -8359,7 +8360,7 @@ test "serverless graph metric qualified scatter is allocation-failure safe" {
             defer alloc.free(scattered);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
 
 fn graphMetricDependenciesNeeded(query: graph_query_mod.GraphQuery) bool {
@@ -15102,7 +15103,7 @@ test "serverless graph HTTP result copies are allocation-failure safe" {
             defer freeGraphTraversalNode(a, copy);
         }
     };
-    try std.testing.checkAllAllocationFailures(alloc, AllocationRunner.run, .{node});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, AllocationRunner.run, .{node});
 }
 
 var test_nonce: std.atomic.Value(u64) = .init(0);

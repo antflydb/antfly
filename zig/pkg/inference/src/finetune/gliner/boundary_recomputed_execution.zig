@@ -1,5 +1,17 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Join the independently differentiated head and encoder regions in the
 //! original graph's optimizer namespace. Inputs remain borrowed and immutable;
@@ -446,7 +458,7 @@ test "boundary recomputed execution merges canonical shared parameters and prese
 test "boundary recomputed execution numerical ownership unwinds every allocation failure" {
     var tiny = try Tiny.init(std.testing.allocator);
     defer tiny.deinit();
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, exerciseMerge, .{&tiny});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, exerciseMerge, .{&tiny});
 }
 
 test "boundary recomputed execution admission counts pending shared sums and native operand copies" {

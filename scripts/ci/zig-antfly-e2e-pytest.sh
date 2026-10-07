@@ -1,17 +1,18 @@
 #!/usr/bin/env bash
 # Copyright 2026 Antfly, Inc.
+# SPDX-License-Identifier: Apache-2.0
 #
-# Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-# except in compliance with the Elastic License 2.0. You may obtain a copy of
-# the Elastic License 2.0 at
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
 #
-#     https://www.antfly.io/licensing/ELv2-license
+#     http://www.apache.org/licenses/LICENSE-2.0
 #
-# Unless required by applicable law or agreed to in writing, software distributed
-# under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-# Elastic License 2.0 for the specific language governing permissions and
-# limitations.
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 set -euo pipefail
 
@@ -50,14 +51,18 @@ if [[ -n "${ANTFLY_E2E_REPORT_DIR:-}" ]]; then
   mkdir -p "$ANTFLY_E2E_REPORT_DIR"
   report_args+=("--junitxml=$ANTFLY_E2E_REPORT_DIR/junit.xml")
 fi
+uv_extras=()
+if [[ "${ANTFLY_E2E_FULL_LAKE:-}" == "1" ]]; then
+  uv_extras+=(--extra lake --extra iceberg)
+fi
 cd "$repo_root/zig"
 if (( workers > 1 )); then
   # Isolation groups preserve shared fixture lifecycles; independent tests are
   # scheduled longest-first without exceeding the Antfly process budget.
   # Keep test identities visible even if the job is cancelled before pytest's
   # final summary; quiet progress dots hide the failing or stalled scenario.
-  exec uv run --project e2e/antfly pytest -v --tb=short --continue-on-collection-errors "${report_args[@]}" \
+  exec uv run --project e2e/antfly "${uv_extras[@]}" pytest -v --tb=short --continue-on-collection-errors "${report_args[@]}" \
     -n "$workers" --dist=loadgroup --e2e-process-slots "$process_slots" "$@"
 fi
 
-exec uv run --project e2e/antfly pytest -v --tb=short --continue-on-collection-errors "${report_args[@]}" "$@"
+exec uv run --project e2e/antfly "${uv_extras[@]}" pytest -v --tb=short --continue-on-collection-errors "${report_args[@]}" "$@"

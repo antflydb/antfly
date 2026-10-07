@@ -1,4 +1,5 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16424,7 +16425,7 @@ test "compiled parameter acquisitions release reservations and lazy pins indepen
 test "compiled parameter acquisitions unwind allocation failures" {
     inline for (.{ false, true }) |lazy| {
         inline for (.{ false, true }) |on_demand| {
-            try std.testing.checkAllAllocationFailures(std.testing.allocator, testCompiledParameterWeightOwnership, .{ lazy, on_demand });
+            try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, testCompiledParameterWeightOwnership, .{ lazy, on_demand });
         }
     }
 }

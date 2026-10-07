@@ -297,6 +297,7 @@ pub const Config = struct {
     backup: ?BackupConfig = null,
     secrets: ?SecretsConfig = null,
     storage: ?StorageConfig = null,
+    lake_cache: ?LakeCacheConfig = null,
     transaction_sessions: ?TransactionSessionConfig = null,
     /// DEPRECATED: use hot_standby
     ha: ?HotStandbyConfig = null,
@@ -305,6 +306,8 @@ pub const Config = struct {
     inference: ?antfly_inference_config_openapi.RuntimeConfig = null,
     tls: ?TLSInfo = null,
     remote_content: ?antfly_scraping_openapi.RemoteContentConfig = null,
+    /// Deployment policy for integrations, separate from named connections and login providers.
+    connectors: ?std.json.Value = null,
     /// Public connection resources keyed by stable connection ID. These are the external systems Antfly can use for inference, external IO, CDC, backups, indexing, agents, and related workflows.
     connections: ?std.json.ArrayHashMap(ConnectionConfig) = null,
     /// Named speech-to-text provider configurations. Define named STT providers that can be referenced by templates and API calls. The first provider defined becomes the default when no provider name is specified. **Example:** ```json { "speech_to_text": { "antfly-whisper": { "provider": "antfly", "api_url": "http://localhost:8080", "model": "openai/whisper-base" }, "openai-whisper": { "provider": "openai", "model": "whisper-1" } } } ``` Then in templates: `{{transcribeAudio url="..." provider="whisper-local"}}`
@@ -360,6 +363,7 @@ pub const Config = struct {
         .{ "backup", "backup", true },
         .{ "secrets", "secrets", true },
         .{ "storage", "storage", true },
+        .{ "lake_cache", "lake_cache", true },
         .{ "transaction_sessions", "transaction_sessions", true },
         .{ "ha", "ha", true },
         .{ "hot_standby", "hot_standby", true },
@@ -367,6 +371,7 @@ pub const Config = struct {
         .{ "inference", "inference", false },
         .{ "tls", "tls", true },
         .{ "remote_content", "remote_content", false },
+        .{ "connectors", "connectors", true },
         .{ "connections", "connections", true },
         .{ "speech_to_text", "speech_to_text", true },
         .{ "cors", "cors", false },
@@ -447,6 +452,10 @@ pub const Config = struct {
             try jw.objectField("storage");
             try jw.write(value);
         }
+        if (self.lake_cache) |value| {
+            try jw.objectField("lake_cache");
+            try jw.write(value);
+        }
         if (self.transaction_sessions) |value| {
             try jw.objectField("transaction_sessions");
             try jw.write(value);
@@ -480,6 +489,10 @@ pub const Config = struct {
         } else if (jw.options.emit_null_optional_fields) {
             try jw.objectField("remote_content");
             try jw.write(@as(?u8, null));
+        }
+        if (self.connectors) |value| {
+            try jw.objectField("connectors");
+            try jw.write(value);
         }
         if (self.connections) |value| {
             try jw.objectField("connections");
@@ -684,9 +697,9 @@ pub const ConnectionKind = enum {
 
 pub const DeciderConfig = struct {
     provider: []const u8,
-    /// Required for Antfly; Jev defaults to jev-latest.
+    /// Required for Antfly and OpenAI; Jev defaults to jev-latest.
     model: ?[]const u8 = null,
-    /// Provider base URL; endpoint path is selected by provider.
+    /// Provider base URL; endpoint path is selected by provider. OpenAI defaults to https://api.openai.com/v1 and appends /decisions.
     url: ?[]const u8 = null,
     /// API key or secret reference. Defaults to the provider environment variable.
     api_key: ?[]const u8 = null,
@@ -1667,6 +1680,77 @@ pub const InferenceConnectionVariant = struct {
     }
 };
 
+/// Disposable node-local cache for versioned Parquet and Iceberg reads.
+pub const LakeCacheConfig = struct {
+    enabled: ?bool = null,
+    /// Defaults to cache/lake-ranges beneath local storage, or the Lite file directory.
+    root: ?[]const u8 = null,
+    max_memory_bytes: ?i64 = null,
+    max_disk_bytes: ?i64 = null,
+    max_entries: ?i64 = null,
+    max_write_queue_bytes: ?i64 = null,
+    max_write_queue_entries: ?i64 = null,
+    /// Metadata/sidecar reservation, capped at one quarter of disk capacity; zero disables it.
+    protected_bytes: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "enabled", "enabled", true },
+        .{ "root", "root", true },
+        .{ "max_memory_bytes", "max_memory_bytes", true },
+        .{ "max_disk_bytes", "max_disk_bytes", true },
+        .{ "max_entries", "max_entries", true },
+        .{ "max_write_queue_bytes", "max_write_queue_bytes", true },
+        .{ "max_write_queue_entries", "max_write_queue_entries", true },
+        .{ "protected_bytes", "protected_bytes", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.enabled) |value| {
+            try jw.objectField("enabled");
+            try jw.write(value);
+        }
+        if (self.root) |value| {
+            try jw.objectField("root");
+            try jw.write(value);
+        }
+        if (self.max_memory_bytes) |value| {
+            try jw.objectField("max_memory_bytes");
+            try jw.write(value);
+        }
+        if (self.max_disk_bytes) |value| {
+            try jw.objectField("max_disk_bytes");
+            try jw.write(value);
+        }
+        if (self.max_entries) |value| {
+            try jw.objectField("max_entries");
+            try jw.write(value);
+        }
+        if (self.max_write_queue_bytes) |value| {
+            try jw.objectField("max_write_queue_bytes");
+            try jw.write(value);
+        }
+        if (self.max_write_queue_entries) |value| {
+            try jw.objectField("max_write_queue_entries");
+            try jw.write(value);
+        }
+        if (self.protected_bytes) |value| {
+            try jw.objectField("protected_bytes");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 pub const LiteStorageConfig = struct {
     /// Path to the single writable Antfly Lite database file.
     path: []const u8,
@@ -2240,6 +2324,8 @@ pub const SecretsConfig = struct {
 
 /// Tagged storage-engine configuration. Engine is required and exactly the matching engine member must be present.
 pub const StorageConfig = struct {
+    /// Shared Antfly-owned artifact storage, independent of the primary storage engine. Native remote-table index generations use this location. Connection and bucket are required when configured; the connection must have storage.primary capability. Distributed serving requires shared storage. Standalone deployments may use the local storage directory when this location is absent.
+    artifacts: ?std.json.Value = null,
     engine: StorageEngine,
     lite: ?LiteStorageConfig = null,
     object: ?ObjectStorageConfig = null,
@@ -2247,6 +2333,7 @@ pub const StorageConfig = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "artifacts", "artifacts", true },
         .{ "engine", "engine", true },
         .{ "lite", "lite", true },
         .{ "object", "object", true },
@@ -2263,6 +2350,10 @@ pub const StorageConfig = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.artifacts) |value| {
+            try jw.objectField("artifacts");
+            try jw.write(value);
+        }
         try jw.objectField("engine");
         try jw.write(self.engine);
         if (self.lite) |value| {

@@ -1,0 +1,5223 @@
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+const graph_mod = @import("../../graph/graph.zig");
+const traversal_mod = @import("../../graph/traversal.zig");
+const paths_mod = @import("../../graph/paths.zig");
+const graph_query_mod = @import("../../graph/query.zig");
+const graph_node_identity = @import("../../graph/node_identity.zig");
+const fusion_mod = @import("../../search/fusion.zig");
+const distributed_stats_mod = @import("../../search/distributed_stats.zig");
+const docstore_mod = @import("../docstore.zig");
+const shard_mod = @import("../shard.zig");
+const transactions_mod = @import("../transactions.zig");
+const reranking_mod = @import("antfly_reranking");
+const doc_identity_mod = @import("doc_identity.zig");
+const enrichment_neighbor_context = @import("enrichment/neighbor_context.zig");
+const graph_edge_types = @import("graph_edge_types.zig");
+const resource_manager_mod = @import("../resource_manager.zig");
+const index_repair_status = @import("../../common/index_repair_status.zig");
+const dense_native_storage_phase = @import("../../common/dense_native_storage_phase.zig");
+const document_content_hash = @import("document_content_hash.zig");
+pub const CancellationToken = @import("antfly_cancellation").CancellationToken;
+pub const IndexRepairStatus = index_repair_status.IndexRepairStatus;
+pub const DenseNativeStoragePhase = dense_native_storage_phase.DenseNativeStoragePhase;
+pub const DocumentContentHash = document_content_hash.Digest;
+
+pub const GeoPoint = struct {
+    lon: f64,
+    lat: f64,
+};
+
+pub const GeoShapeRelation = enum {
+    intersects,
+    within,
+    contains,
+};
+
+pub const SyncLevel = enum {
+    propose,
+    write,
+    full_text,
+    enrichments,
+    full_index,
+};
+
+pub fn parsePublicSyncLevelText(text: []const u8) ?SyncLevel {
+    if (std.mem.eql(u8, text, "propose")) return .propose;
+    if (std.mem.eql(u8, text, "write")) return .write;
+    if (std.mem.eql(u8, text, "full_text")) return .full_text;
+    if (std.mem.eql(u8, text, "enrichments")) return .enrichments;
+    if (std.mem.eql(u8, text, "full_index")) return .full_index;
+    return null;
+}
+
+pub fn parsePublicSyncLevelJson(value: std.json.Value) ?SyncLevel {
+    return switch (value) {
+        .string => |text| parsePublicSyncLevelText(text),
+        else => null,
+    };
+}
+
+pub fn publicSyncLevelText(level: SyncLevel) []const u8 {
+    return switch (level) {
+        .propose => "propose",
+        .write => "write",
+        .full_text => "full_text",
+        .enrichments => "enrichments",
+        .full_index => "full_index",
+    };
+}
+
+test "public sync level text accepts full_index and rejects removed aknn alias" {
+    try std.testing.expect(parsePublicSyncLevelText("aknn") == null);
+    try std.testing.expectEqual(SyncLevel.full_index, parsePublicSyncLevelText("full_index").?);
+    try std.testing.expectEqualStrings("full_index", publicSyncLevelText(.full_index));
+}
+
+pub const BatchWrite = struct {
+    key: []const u8,
+    value: []const u8,
+    /// Top-level JSON-typed fields whose null datum is JSON null, not SQL NULL.
+    /// Validated against the pinned relational schema before preparation.
+    json_null_fields: []const []const u8 = &.{},
+};
+
+pub fn cloneJsonNullFields(alloc: std.mem.Allocator, fields: []const []const u8) ![]const []const u8 {
+    if (fields.len == 0) return &.{};
+    const copy = try alloc.alloc([]const u8, fields.len);
+    errdefer alloc.free(copy);
+    var initialized: usize = 0;
+    errdefer for (copy[0..initialized]) |name| alloc.free(name);
+    for (fields, copy) |name, *out| {
+        out.* = try alloc.dupe(u8, name);
+        initialized += 1;
+    }
+    return copy;
+}
+
+pub const TransformOpType = enum {
+    set,
+    set_on_insert,
+    unset,
+    inc,
+    push,
+    pull,
+    add_to_set,
+    pop,
+    mul,
+    min,
+    max,
+    current_date,
+    rename,
+};
+
+/// Canonical public wire spelling for document transform operations. Keep the
+/// representation beside the value contract so routing/serialization code
+/// does not need to import the physical transform executor.
+pub fn transformOpText(op: TransformOpType) []const u8 {
+    return switch (op) {
+        .set => "$set",
+        .set_on_insert => "$setOnInsert",
+        .unset => "$unset",
+        .inc => "$inc",
+        .push => "$push",
+        .pull => "$pull",
+        .add_to_set => "$addToSet",
+        .pop => "$pop",
+        .mul => "$mul",
+        .min => "$min",
+        .max => "$max",
+        .current_date => "$currentDate",
+        .rename => "$rename",
+    };
+}
+
+pub const TransformOp = struct {
+    op: TransformOpType,
+    path: []const u8,
+    value_json: ?[]const u8 = null,
+};
+
+pub const DocumentTransform = struct {
+    key: []const u8,
+    operations: []const TransformOp = &.{},
+    upsert: bool = false,
+};
+
+pub const SplitReplicationCheckpoint = struct {
+    pub const Kind = enum {
+        destination_begin,
+        destination_complete,
+        source_ack,
+    };
+
+    kind: Kind,
+    transition_id: u64,
+    attempt_epoch: u64,
+    source_group_id: u64,
+    destination_group_id: u64,
+    range_start: []const u8 = "",
+    range_end: []const u8 = "",
+    delta_sequence: u64,
+};
+
+/// Identity inherited by an unpublished split destination. Every replicated
+/// destination batch carries this context so all replicas create the physical
+/// DB with the same namespace before the destination range is catalog-visible.
+pub const SplitReplicationContext = struct {
+    pub const Operation = enum {
+        bootstrap_chunk,
+        delta,
+        checkpoint,
+    };
+
+    transition_id: u64,
+    attempt_epoch: u64,
+    source_group_id: u64,
+    destination_group_id: u64,
+    identity_namespace: doc_identity_mod.Namespace,
+    /// Present only while streaming a baseline bootstrap. Catch-up deltas use
+    /// null and are fenced by the completed destination marker.
+    bootstrap_sequence: ?u64 = null,
+    operation: Operation = .bootstrap_chunk,
+    /// Source split-delta sequence. Zero for bootstrap chunks.
+    sequence: u64 = 0,
+    /// Exact destination watermark that must precede this delta. Source
+    /// watermarks are Raft indexes and may be sparse when intervening entries
+    /// do not mutate the split range. Null preserves the legacy consecutive-
+    /// sequence contract for already persisted requests.
+    previous_sequence: ?u64 = null,
+};
+
+pub const SplitTransitionMutation = struct {
+    pub const Kind = enum {
+        prepare,
+        start,
+        finalize,
+        rollback,
+    };
+
+    kind: Kind,
+    transition_id: u64,
+    attempt_epoch: u64,
+    destination_group_id: u64,
+    split_key: []const u8 = "",
+};
+
+/// Private donor-side merge lifecycle mutation. The command is ordered with
+/// ordinary data writes in the donor Raft log. A finalized donor is a durable
+/// write fence; rollback permits a later transition to start.
+pub const MergeSourceTransitionMutation = struct {
+    pub const Kind = enum {
+        prepare,
+        finalize,
+        rollback,
+    };
+
+    kind: Kind,
+    transition_id: u64,
+    receiver_group_id: u64,
+};
+
+/// Receiver-persisted fencing identity for one copy, ordered by the donor's
+/// elected Raft term and then its per-process attempt sequence.
+pub const MergeCopyAttempt = @import("relational_integrity_handoff_contract.zig").MergeCopyAttempt;
+
+/// Replay identity for receiver-side merge copy batches. Unlike an ordinary
+/// write, these entries must reopen the already-provisioned receiver from its
+/// local manifest even while metadata publication is synchronously waiting on
+/// the merge. Carrying the identity in every command keeps follower and
+/// restart replay independent of the catalog.
+pub const MergeReplicationContext = struct {
+    transition_id: u64,
+    donor_group_id: u64,
+    receiver_group_id: u64,
+    identity_namespace: doc_identity_mod.Namespace,
+    copy_attempt: MergeCopyAttempt = .{},
+};
+
+/// Private receiver-side data-Raft checkpoint for a range merge. Document
+/// transfer batches are ordinary replicated writes; this record makes the
+/// structural phase, receiver range, and donor watermark durable on every
+/// receiver replica in the same log order.
+pub const MergeReplicationCheckpoint = struct {
+    pub const Kind = enum {
+        accept,
+        begin_copy,
+        bootstrap_complete,
+        finalize,
+        rollback,
+    };
+
+    kind: Kind,
+    transition_id: u64,
+    donor_group_id: u64,
+    receiver_group_id: u64,
+    receiver_base_start: []const u8,
+    receiver_base_end: []const u8,
+    merged_start: []const u8,
+    merged_end: []const u8,
+    bootstrap_applied_index: u64 = 0,
+    copy_attempt: MergeCopyAttempt = .{},
+    allow_doc_identity_reassignment: bool = false,
+    receiver_identity_reassignment_namespace: ?doc_identity_mod.Namespace = null,
+    /// Opt-in immutable source binding for atomic, resumable receiver pages.
+    /// Installed by begin_copy or artifact/integrity-aware acceptance;
+    /// ordinary checkpoint payloads stay empty.
+    page_source: ?@import("merge_page_contract.zig").Source = null,
+    page_receiver_namespace: ?doc_identity_mod.Namespace = null,
+    /// Exact source layouts installed once with the protocol-15 copy receipt.
+    page_source_catalogs: ?@import("artifact_inventory.zig").Catalogs = null,
+};
+
+/// Private data-Raft command used by the distributed transaction protocol.
+/// Every value that can affect durable state is carried in the command so
+/// replay is deterministic on followers and after restart.
+pub const TransactionMutation = union(enum) {
+    begin: struct {
+        txn_id: TxnId,
+        begin_timestamp: u64,
+        created_at_ns: u64,
+        topology_epoch: u64,
+        /// Long-lived, externally addressable transaction sessions retain a
+        /// terminal decision for their full retry window. Anonymous commits
+        /// use the shorter ordinary recovery retention.
+        retain_terminal: bool = false,
+        participants: []const []const u8,
+    },
+    prepare: struct {
+        txn_id: TxnId,
+        topology_epoch: u64,
+    },
+    resolve: struct {
+        txn_id: TxnId,
+        status: TxnStatus,
+        commit_version: u64,
+    },
+    /// Coordinator-side acknowledgement that one participant has durably
+    /// learned the terminal decision. This must be ordered by coordinator
+    /// Raft rather than written by a replica-local recovery worker.
+    acknowledge: struct {
+        txn_id: TxnId,
+        participant: []const u8,
+    },
+    /// A bounded coordinator acknowledgement set, replicated atomically after
+    /// each member has independently proved terminal resolution.
+    acknowledge_many: struct {
+        txn_id: TxnId,
+        participants: []const []const u8,
+    },
+    /// Deterministic coordinator/participant metadata cleanup. The cutoff is
+    /// carried in the command so every replica evaluates the same predicate.
+    cleanup: struct {
+        txn_id: TxnId,
+        cutoff_timestamp: u64,
+        retained_cutoff_timestamp: u64,
+    },
+};
+
+pub const BatchRequest = struct {
+    /// Trusted ingress attaches a signed write principal and the admission
+    /// instant after authenticating the live request. Replicas verify against
+    /// that committed instant so delayed Raft replay is deterministic.
+    /// Public batch JSON never accepts these fields.
+    row_policy_principal_proof: []const u8 = "",
+    row_policy_database: []const u8 = "",
+    row_policy_admitted_at_seconds: i64 = 0,
+    /// Exact metadata read-index snapshot fetched and validated by the owner
+    /// leader before proposal. Followers consume these committed bytes locally;
+    /// they must never perform metadata IO from deterministic Raft apply.
+    row_policy_install_bundle: []const u8 = "",
+    range_guards: []const @import("../range_protection.zig").Proof = &.{},
+    /// Internal replicated capability activation. Never accepted by public JSON.
+    activate_range_tracking: bool = false,
+    /// Internal schema epoch fence shared by document and relational writes.
+    /// Never accepted from public batch JSON.
+    schema_version: ?u32 = null,
+    /// Private, replicated source-retention lifecycle. Never accepted by public JSON.
+    online_source: ?@import("online_source_contract.zig").Command = null,
+    /// Ordered complete artifact catalog; accepted only by private Raft ingress.
+    artifact_catalog: ?@import("artifact_inventory.zig").Command = null,
+    /// Exact producer result; only authenticated owner-leader Raft ingress.
+    artifact_publication: ?@import("artifact_publication.zig").Command = null,
+    /// Bounded authenticated upload stages for a large ordered publication.
+    /// Only the owner leader proposes these private controls.
+    artifact_publication_transport: ?@import("artifact_publication_transport.zig").Request = null,
+    /// Private replicated hidden-owner lifecycle; public JSON cannot set it.
+    restore_staging: ?@import("restore_staging_contract.zig").Control = null,
+    restore_staging_scope: ?[32]u8 = null,
+    /// Private metadata lookup identity, authenticated together with the scope.
+    restore_staging_plan_id: ?[16]u8 = null,
+    /// Authenticated owner lifecycle control; never populated by public JSON.
+    relational_topology: ?@import("relational_integrity_topology_contract.zig").Command = null,
+    /// Bounded, exact-CAS inverse-reference cleanup after generation retirement.
+    /// Only the current owner leader may propose this private Raft command.
+    relational_generation_gc: ?@import("relational_integrity_generation_retirement.zig").GcCommand = null,
+    /// Metadata-authorized policy generation identifier. The Raft payload
+    /// never contains caller-supplied policy expressions or role claims.
+    row_policy_publication: ?@import("../../system_catalog/policies.zig").InstallRequest = null,
+    relational_schema_version: ?u32 = null,
+    /// Internal coordinator evidence; never populated from public request JSON.
+    relational_integrity_generation_set: ?[32]u8 = null,
+    /// Authenticated administrative repair, still subject to integrity checks.
+    relational_repair: bool = false,
+    writes: []const BatchWrite = &.{},
+    deletes: []const []const u8 = &.{},
+    transforms: []const DocumentTransform = &.{},
+    /// Private owner-leader maintenance: one bounded durable endpoint page.
+    graph_endpoint_cleanup: bool = false,
+    /// Exact leader-selected effects; replicas must never replan this page.
+    graph_endpoint_cleanup_planned: bool = false,
+    graph_endpoint_cleanup_guards: []const @import("../graph_cleanup_contract.zig").Guard = &.{},
+    graph_writes: []const GraphEdgeWrite = &.{},
+    graph_deletes: []const GraphEdgeDelete = &.{},
+    predicates: []const TransactionVersionPredicate = &.{},
+    /// Internal transaction-only effects; never accepted from public batch JSON.
+    integrity: []const TransactionIntegrityOperation = &.{},
+    integrity_commands: []const @import("relational_integrity_contract.zig").Command = &.{},
+    relational_activation: ?@import("relational_integrity_activation_contract.zig").Command = null,
+    relational_retirement: ?@import("relational_integrity_retirement_contract.zig").Command = null,
+    relational_index_maintenance: ?@import("relational_index_maintenance_contract.zig").Command = null,
+    timestamp_ns: u64 = 0,
+    sync_level: SyncLevel = .write,
+    /// Internal single-participant transaction contract. Transform expansion
+    /// still runs under the DB apply lock, but the batch is rejected before
+    /// mutation if it would emit graph projection deltas that the distributed
+    /// transaction intent format cannot represent.
+    reject_graph_transform_projections: bool = false,
+    /// Internal data-Raft transition state. Public batch parsing never sets it.
+    split_checkpoint: ?SplitReplicationCheckpoint = null,
+    /// Internal identity context for writes to an unpublished split destination.
+    split_replication: ?SplitReplicationContext = null,
+    /// Internal source lifecycle mutation. It must be ordered with data writes.
+    split_transition: ?SplitTransitionMutation = null,
+    /// Internal merge-donor lifecycle mutation. It must be ordered with data
+    /// writes so finalize creates an exact replicated source fence.
+    merge_source_transition: ?MergeSourceTransitionMutation = null,
+    /// Internal receiver merge lifecycle. Public batch parsing never sets it.
+    merge_checkpoint: ?MergeReplicationCheckpoint = null,
+    /// Internal identity context for receiver-side merge copy and rollback
+    /// batches. Public batch parsing never sets it.
+    merge_replication: ?MergeReplicationContext = null,
+    /// Separate effect-bearing command; never combined with a checkpoint.
+    merge_page: ?@import("merge_page_contract.zig").Command = null,
+    /// Private ordered receiver-local certification of one imported proof.
+    /// Public batch JSON never accepts this control.
+    merge_proof_adoption: ?@import("merge_proof_adoption.zig").Command = null,
+    /// Authoritative document-scoped store rows, not original write inputs.
+    /// Ordered after primary copy and before the receiver completion checkpoint.
+    merge_artifacts: []const BatchWrite = &.{},
+    /// Internal 2PC phase. Public batch parsing never accepts this field.
+    transaction: ?TransactionMutation = null,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        inline for (comptime std.meta.fieldNames(@This())) |reflected_name| {
+            try jw.objectField(reflected_name);
+            if (comptime std.mem.eql(u8, reflected_name, "relational_integrity_generation_set") or std.mem.eql(u8, reflected_name, "restore_staging_scope") or std.mem.eql(u8, reflected_name, "restore_staging_plan_id")) {
+                if (@field(self, reflected_name)) |digest| {
+                    try jw.beginArray();
+                    for (digest) |byte| try jw.write(byte);
+                    try jw.endArray();
+                } else try jw.write(null);
+            } else if (comptime std.mem.eql(u8, reflected_name, "merge_page")) {
+                // The same bounded chunk encoding crosses HTTP, native replay
+                // and projection storage; never expand payload bytes to nodes.
+                try jw.write(self.merge_page);
+            } else if (comptime std.mem.eql(u8, reflected_name, "split_checkpoint") or
+                std.mem.eql(u8, reflected_name, "split_transition") or
+                std.mem.eql(u8, reflected_name, "merge_checkpoint") or
+                std.mem.eql(u8, reflected_name, "merge_artifacts"))
+            {
+                // Lifecycle ranges and physical artifacts are opaque bytes,
+                // including when replayed through the native HA envelope.
+                try @import("relational_integrity_json.zig").write(@field(self, reflected_name), jw);
+            } else if (comptime std.mem.eql(u8, reflected_name, "writes") or std.mem.eql(u8, reflected_name, "deletes")) {
+                // Final transaction effects can contain binary private keys
+                // and values in live HA as well as staged restore. Preserve
+                // those bytes without expanding ordinary JSON primary rows.
+                try jw.beginArray();
+                for (@field(self, reflected_name)) |item| {
+                    const key = if (comptime std.mem.eql(u8, reflected_name, "writes")) item.key else item;
+                    if (std.mem.startsWith(u8, key, "\x00\x00__metadata__:"))
+                        try @import("relational_integrity_json.zig").write(item, jw)
+                    else
+                        try jw.write(item);
+                }
+                try jw.endArray();
+            } else try jw.write(@field(self, reflected_name));
+        }
+        try jw.endObject();
+    }
+};
+
+pub fn validateMergeArtifacts(req: BatchRequest) !void {
+    if (req.merge_artifacts.len == 0) return;
+    if (req.graph_endpoint_cleanup) return validateGraphEndpointCleanupCommand(req);
+    if (req.merge_replication == null or req.merge_checkpoint != null or
+        req.split_checkpoint != null or req.split_replication != null or
+        req.split_transition != null or req.merge_source_transition != null or
+        req.writes.len != 0 or req.deletes.len != 0 or req.transaction != null or
+        req.transforms.len != 0 or req.predicates.len != 0 or
+        req.graph_writes.len != 0 or req.graph_deletes.len != 0)
+        return error.InvalidBatchRequest;
+    const keys = @import("../internal_keys.zig");
+    for (req.merge_artifacts) |row| {
+        if (!keys.isGraphEdgeArtifactKey(row.key) and !keys.isEmbeddingArtifactKey(row.key) and
+            !keys.isDerivedEmbeddingArtifactKey(row.key) and !keys.isAssetArtifactKey(row.key) and
+            !keys.isGraphRetirementKey(row.key) and !keys.isGraphGlobalEdgeContenderKey(row.key) and
+            !keys.isGraphEdgeTtlLifetimeKey(row.key) and !keys.isGraphEdgeTtlTombstoneKey(row.key))
+            return error.InvalidBatchRequest;
+        if (keys.isGraphRetirementKey(row.key)) _ = @import("../graph_cleanup_contract.zig").retirementGeneration(row.value) catch return error.InvalidBatchRequest;
+    }
+}
+
+pub const GraphEdgeWrite = graph_edge_types.GraphEdgeWrite;
+pub const GraphEdgeDelete = graph_edge_types.GraphEdgeDelete;
+
+pub const IndexKind = enum {
+    full_text,
+    dense_vector,
+    sparse_vector,
+    graph,
+    algebraic,
+};
+
+pub const IndexPublicationPolicy = enum {
+    progressive,
+    atomic,
+};
+
+pub fn indexPublicationPolicy(alloc: Allocator, cfg: IndexConfig) !IndexPublicationPolicy {
+    if (cfg.kind != .dense_vector and cfg.kind != .sparse_vector) return .atomic;
+    const Parsed = struct {
+        publication_policy: ?IndexPublicationPolicy = null,
+    };
+    var parsed = try std.json.parseFromSlice(Parsed, alloc, cfg.config_json, .{
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+    return parsed.value.publication_policy orelse .progressive;
+}
+
+test "embeddings publication policy defaults progressive and preserves atomic" {
+    const progressive = IndexConfig{
+        .name = "progressive",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3}",
+    };
+    try std.testing.expectEqual(IndexPublicationPolicy.progressive, try indexPublicationPolicy(std.testing.allocator, progressive));
+
+    var atomic = progressive;
+    atomic.config_json = "{\"field\":\"embedding\",\"dims\":3,\"publication_policy\":\"atomic\"}";
+    try std.testing.expectEqual(IndexPublicationPolicy.atomic, try indexPublicationPolicy(std.testing.allocator, atomic));
+}
+
+pub const IndexConfig = struct {
+    name: []const u8,
+    kind: IndexKind,
+    config_json: []const u8,
+    coverage_generation: u64 = 0,
+    // Internal semantic identity, validated and computed once when the config
+    // enters the catalog. It is derived metadata and is not serialized.
+    coverage_config_fingerprint: ?u64 = null,
+
+    pub fn clone(alloc: Allocator, cfg: IndexConfig) !IndexConfig {
+        const name = try alloc.dupe(u8, cfg.name);
+        errdefer alloc.free(name);
+        return .{
+            .name = name,
+            .kind = cfg.kind,
+            .config_json = try alloc.dupe(u8, cfg.config_json),
+            .coverage_generation = cfg.coverage_generation,
+            .coverage_config_fingerprint = cfg.coverage_config_fingerprint,
+        };
+    }
+
+    pub fn deinit(self: *IndexConfig, alloc: Allocator) void {
+        alloc.free(self.name);
+        alloc.free(self.config_json);
+        self.* = undefined;
+    }
+};
+
+pub const PublicIndexConfig = struct {
+    name: []const u8,
+    kind: IndexKind,
+    config_json: []const u8,
+};
+
+pub fn publicIndexConfigsAlloc(alloc: Allocator, configs: []const IndexConfig) ![]PublicIndexConfig {
+    const public_configs = try alloc.alloc(PublicIndexConfig, configs.len);
+    for (configs, 0..) |cfg, i| {
+        public_configs[i] = .{
+            .name = cfg.name,
+            .kind = cfg.kind,
+            .config_json = cfg.config_json,
+        };
+    }
+    return public_configs;
+}
+
+pub fn indexConfigHash(cfg: IndexConfig) u64 {
+    var hasher = std.hash.Wyhash.init(0x41504a4346470001);
+    hashLengthPrefixedBytes(&hasher, cfg.name);
+    hashLengthPrefixedBytes(&hasher, @tagName(cfg.kind));
+    hashLengthPrefixedBytes(&hasher, cfg.config_json);
+    return hasher.final();
+}
+
+fn hashLengthPrefixedBytes(hasher: *std.hash.Wyhash, bytes: []const u8) void {
+    var len_buf: [8]u8 = undefined;
+    std.mem.writeInt(u64, &len_buf, bytes.len, .little);
+    hasher.update(&len_buf);
+    hasher.update(bytes);
+}
+
+pub fn freeIndexConfigs(alloc: Allocator, configs: []IndexConfig) void {
+    for (configs) |*cfg| cfg.deinit(alloc);
+    if (configs.len > 0) alloc.free(configs);
+}
+
+pub const EnrichmentKind = enum {
+    chunk,
+    asset,
+    embedding,
+};
+
+pub const ArtifactKind = enum {
+    chunk,
+    asset,
+    embedding,
+};
+
+pub const ArtifactSourceRef = struct {
+    kind: ArtifactKind,
+    name: []u8,
+    chunk_id: ?u32 = null,
+    unit_id: ?[]u8 = null,
+
+    pub fn clone(self: ArtifactSourceRef, alloc: Allocator) !ArtifactSourceRef {
+        const name = try alloc.dupe(u8, self.name);
+        errdefer alloc.free(name);
+        return .{
+            .kind = self.kind,
+            .name = name,
+            .chunk_id = self.chunk_id,
+            .unit_id = if (self.unit_id) |unit_id| try alloc.dupe(u8, unit_id) else null,
+        };
+    }
+
+    pub fn deinit(self: *ArtifactSourceRef, alloc: Allocator) void {
+        alloc.free(self.name);
+        if (self.unit_id) |unit_id| alloc.free(unit_id);
+        self.* = undefined;
+    }
+};
+
+pub const ArtifactRef = struct {
+    document_id: []u8,
+    name: []u8,
+    kind: ArtifactKind,
+    chunk_id: ?u32 = null,
+    unit_id: ?[]u8 = null,
+    source: ?ArtifactSourceRef = null,
+
+    pub fn clone(self: ArtifactRef, alloc: Allocator) !ArtifactRef {
+        const document_id = try alloc.dupe(u8, self.document_id);
+        errdefer alloc.free(document_id);
+        const name = try alloc.dupe(u8, self.name);
+        errdefer alloc.free(name);
+        const unit_id = if (self.unit_id) |id| try alloc.dupe(u8, id) else null;
+        errdefer if (unit_id) |id| alloc.free(id);
+        return .{
+            .document_id = document_id,
+            .name = name,
+            .kind = self.kind,
+            .chunk_id = self.chunk_id,
+            .unit_id = unit_id,
+            .source = if (self.source) |source| try source.clone(alloc) else null,
+        };
+    }
+
+    pub fn deinit(self: *ArtifactRef, alloc: Allocator) void {
+        alloc.free(self.document_id);
+        alloc.free(self.name);
+        if (self.unit_id) |unit_id| alloc.free(unit_id);
+        if (self.source) |*source| source.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+pub const EnrichmentConfig = struct {
+    name: []const u8,
+    kind: EnrichmentKind,
+    field: []const u8 = "",
+    template: []const u8 = "",
+    source_artifact_name: []const u8 = "",
+    embedding_input: @import("enrichment/enrichment_types.zig").EmbeddingInput = .text,
+    expected_dims: u32 = 0,
+    vector_space: []const u8 = "",
+    chunk_size: u32 = 0,
+    chunk_overlap: u32 = 0,
+    chunker_json: []const u8 = "",
+    full_text_index: bool = false,
+    content_type: []const u8 = "",
+    producer_json: []const u8 = "",
+    neighbor_context: ?EnrichmentNeighborContextConfig = null,
+    execution: ?EnrichmentExecutionConfig = null,
+
+    pub fn clone(alloc: Allocator, cfg: EnrichmentConfig) !EnrichmentConfig {
+        return .{
+            .name = try alloc.dupe(u8, cfg.name),
+            .kind = cfg.kind,
+            .field = if (cfg.field.len > 0) try alloc.dupe(u8, cfg.field) else "",
+            .template = if (cfg.template.len > 0) try alloc.dupe(u8, cfg.template) else "",
+            .source_artifact_name = if (cfg.source_artifact_name.len > 0) try alloc.dupe(u8, cfg.source_artifact_name) else "",
+            .embedding_input = cfg.embedding_input,
+            .expected_dims = cfg.expected_dims,
+            .vector_space = if (cfg.vector_space.len > 0) try alloc.dupe(u8, cfg.vector_space) else "",
+            .chunk_size = cfg.chunk_size,
+            .chunk_overlap = cfg.chunk_overlap,
+            .chunker_json = if (cfg.chunker_json.len > 0) try alloc.dupe(u8, cfg.chunker_json) else "",
+            .full_text_index = cfg.full_text_index,
+            .content_type = if (cfg.content_type.len > 0) try alloc.dupe(u8, cfg.content_type) else "",
+            .producer_json = if (cfg.producer_json.len > 0) try alloc.dupe(u8, cfg.producer_json) else "",
+            .neighbor_context = if (cfg.neighbor_context) |context| try EnrichmentNeighborContextConfig.clone(alloc, context) else null,
+            .execution = cfg.execution,
+        };
+    }
+
+    pub fn deinit(self: *EnrichmentConfig, alloc: Allocator) void {
+        alloc.free(self.name);
+        if (self.field.len > 0) alloc.free(self.field);
+        if (self.template.len > 0) alloc.free(self.template);
+        if (self.source_artifact_name.len > 0) alloc.free(self.source_artifact_name);
+        if (self.vector_space.len > 0) alloc.free(self.vector_space);
+        if (self.chunker_json.len > 0) alloc.free(self.chunker_json);
+        if (self.content_type.len > 0) alloc.free(self.content_type);
+        if (self.producer_json.len > 0) alloc.free(self.producer_json);
+        if (self.neighbor_context) |*context| context.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+/// Bounded same-shard graph adjacency sampled into an asset producer's
+/// rendered input. Only valid on asset enrichments whose producer consumes
+/// rendered text; bounds and the graph index reference are enforced at
+/// admission while a missing runtime state fails open with empty neighbors.
+pub const EnrichmentNeighborContextConfig = struct {
+    graph_index: []const u8 = "",
+    edge_types: []const []const u8 = &.{},
+    direction: enrichment_neighbor_context.Direction = .both,
+    limit: u32 = enrichment_neighbor_context.default_limit,
+
+    pub fn clone(alloc: Allocator, cfg: EnrichmentNeighborContextConfig) !EnrichmentNeighborContextConfig {
+        const graph_index = if (cfg.graph_index.len > 0) try alloc.dupe(u8, cfg.graph_index) else "";
+        errdefer if (graph_index.len > 0) alloc.free(graph_index);
+        const edge_types = try alloc.alloc([]const u8, cfg.edge_types.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (edge_types[0..initialized]) |edge_type| alloc.free(edge_type);
+            alloc.free(edge_types);
+        }
+        for (cfg.edge_types, 0..) |edge_type, i| {
+            edge_types[i] = try alloc.dupe(u8, edge_type);
+            initialized += 1;
+        }
+        return .{
+            .graph_index = graph_index,
+            .edge_types = edge_types,
+            .direction = cfg.direction,
+            .limit = cfg.limit,
+        };
+    }
+
+    pub fn deinit(self: *EnrichmentNeighborContextConfig, alloc: Allocator) void {
+        if (self.graph_index.len > 0) alloc.free(self.graph_index);
+        for (self.edge_types) |edge_type| alloc.free(edge_type);
+        if (self.edge_types.len > 0) alloc.free(self.edge_types);
+        self.* = undefined;
+    }
+};
+
+pub const EnrichmentExecutionConfig = struct {
+    batch_items: ?u32 = null,
+    batch_bytes: ?u64 = null,
+    max_document_pages: ?u32 = null,
+};
+
+pub fn enrichmentConfigHash(cfg: EnrichmentConfig) u64 {
+    var hasher = std.hash.Wyhash.init(0x41454a4346470001);
+    hashLengthPrefixedBytes(&hasher, cfg.name);
+    hashLengthPrefixedBytes(&hasher, @tagName(cfg.kind));
+    hashLengthPrefixedBytes(&hasher, cfg.field);
+    hashLengthPrefixedBytes(&hasher, cfg.template);
+    hashLengthPrefixedBytes(&hasher, cfg.source_artifact_name);
+    hashU32(&hasher, cfg.expected_dims);
+    hashLengthPrefixedBytes(&hasher, cfg.vector_space);
+    hashU32(&hasher, cfg.chunk_size);
+    hashU32(&hasher, cfg.chunk_overlap);
+    hashLengthPrefixedBytes(&hasher, cfg.chunker_json);
+    hashBool(&hasher, cfg.full_text_index);
+    hashLengthPrefixedBytes(&hasher, cfg.content_type);
+    hashLengthPrefixedBytes(&hasher, cfg.producer_json);
+    if (cfg.neighbor_context) |context| {
+        hashLengthPrefixedBytes(&hasher, context.graph_index);
+        for (context.edge_types) |edge_type| hashLengthPrefixedBytes(&hasher, edge_type);
+        hashLengthPrefixedBytes(&hasher, @tagName(context.direction));
+        hashU32(&hasher, context.limit);
+    }
+    return hasher.final();
+}
+
+fn hashU32(hasher: *std.hash.Wyhash, value: u32) void {
+    var buf: [4]u8 = undefined;
+    std.mem.writeInt(u32, &buf, value, .little);
+    hasher.update(&buf);
+}
+
+fn hashBool(hasher: *std.hash.Wyhash, value: bool) void {
+    hasher.update(if (value) "\x01" else "\x00");
+}
+
+pub fn freeEnrichmentConfigs(alloc: Allocator, configs: []EnrichmentConfig) void {
+    for (configs) |*cfg| cfg.deinit(alloc);
+    if (configs.len > 0) alloc.free(configs);
+}
+
+pub const EnrichmentDenseEmbeddingWrite = struct {
+    index_name: []u8,
+    doc_key: []u8,
+    artifact_id: ?[]u8 = null,
+    artifact_ref: ?ArtifactRef = null,
+    vector: []f32,
+
+    pub fn deinit(self: *EnrichmentDenseEmbeddingWrite, alloc: Allocator) void {
+        alloc.free(self.index_name);
+        alloc.free(self.doc_key);
+        if (self.artifact_id) |artifact_id| alloc.free(artifact_id);
+        if (self.artifact_ref) |*artifact_ref| artifact_ref.deinit(alloc);
+        alloc.free(self.vector);
+        self.* = undefined;
+    }
+};
+
+pub const EnrichmentSparseEmbeddingWrite = struct {
+    index_name: []u8,
+    doc_key: []u8,
+    indices: []u32,
+    values: []f32,
+
+    pub fn deinit(self: *EnrichmentSparseEmbeddingWrite, alloc: Allocator) void {
+        alloc.free(self.index_name);
+        alloc.free(self.doc_key);
+        alloc.free(self.indices);
+        alloc.free(self.values);
+        self.* = undefined;
+    }
+};
+
+pub const EnrichmentDocumentWrite = struct {
+    key: []u8,
+    value: []u8,
+    target_index_names: [][]u8 = &.{},
+
+    pub fn deinit(self: *EnrichmentDocumentWrite, alloc: Allocator) void {
+        alloc.free(self.key);
+        alloc.free(self.value);
+        for (self.target_index_names) |name| alloc.free(name);
+        if (self.target_index_names.len > 0) alloc.free(self.target_index_names);
+        self.* = undefined;
+    }
+};
+
+pub const ExtractEnrichmentsResult = struct {
+    cleaned_writes: []BatchWrite = &.{},
+    dense_embeddings: []EnrichmentDenseEmbeddingWrite = &.{},
+    sparse_embeddings: []EnrichmentSparseEmbeddingWrite = &.{},
+    graph_writes: []GraphEdgeWrite = &.{},
+
+    pub fn deinit(self: *ExtractEnrichmentsResult, alloc: Allocator) void {
+        for (self.cleaned_writes) |write| {
+            alloc.free(@constCast(write.key));
+            alloc.free(@constCast(write.value));
+        }
+        if (self.cleaned_writes.len > 0) alloc.free(self.cleaned_writes);
+
+        for (self.dense_embeddings) |*embedding| embedding.deinit(alloc);
+        if (self.dense_embeddings.len > 0) alloc.free(self.dense_embeddings);
+
+        for (self.sparse_embeddings) |*embedding| embedding.deinit(alloc);
+        if (self.sparse_embeddings.len > 0) alloc.free(self.sparse_embeddings);
+
+        for (self.graph_writes) |*write| write.deinit(alloc);
+        if (self.graph_writes.len > 0) alloc.free(self.graph_writes);
+
+        self.* = undefined;
+    }
+};
+
+pub const ComputeEnrichmentsResult = struct {
+    artifact_writes: []ArtifactWrite = &.{},
+    documents: []EnrichmentDocumentWrite = &.{},
+    dense_embeddings: []EnrichmentDenseEmbeddingWrite = &.{},
+    failed_keys: [][]u8 = &.{},
+
+    pub fn deinit(self: *ComputeEnrichmentsResult, alloc: Allocator) void {
+        for (self.artifact_writes) |*write| write.deinit(alloc);
+        if (self.artifact_writes.len > 0) alloc.free(self.artifact_writes);
+
+        for (self.documents) |*doc| doc.deinit(alloc);
+        if (self.documents.len > 0) alloc.free(self.documents);
+
+        for (self.dense_embeddings) |*embedding| embedding.deinit(alloc);
+        if (self.dense_embeddings.len > 0) alloc.free(self.dense_embeddings);
+
+        for (self.failed_keys) |key| alloc.free(key);
+        if (self.failed_keys.len > 0) alloc.free(self.failed_keys);
+
+        self.* = undefined;
+    }
+};
+
+pub const ArtifactWrite = struct {
+    id: []u8,
+    value: []u8,
+    artifact_ref: ArtifactRef,
+
+    pub fn deinit(self: *ArtifactWrite, alloc: Allocator) void {
+        alloc.free(self.id);
+        alloc.free(self.value);
+        self.artifact_ref.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+pub const ArtifactRecord = ArtifactWrite;
+
+pub const DocumentArtifactChildRange = struct {
+    range_id: []u8,
+    range_kind: []u8,
+    artifact_name: []u8,
+    split_boundary: []u8,
+    placement: []u8,
+    owner_group_id: ?u64 = null,
+    placement_generation: ?u64 = null,
+    route_status: ?[]u8 = null,
+    split_eligible: ?bool = null,
+    start_key: []u8,
+    end_key_exclusive: []u8,
+    last_key: []u8,
+    child_count: usize = 0,
+    text_bytes: ?usize = null,
+
+    pub fn deinit(self: *DocumentArtifactChildRange, alloc: Allocator) void {
+        alloc.free(self.range_id);
+        alloc.free(self.range_kind);
+        alloc.free(self.artifact_name);
+        alloc.free(self.split_boundary);
+        alloc.free(self.placement);
+        if (self.route_status) |value| alloc.free(value);
+        alloc.free(self.start_key);
+        alloc.free(self.end_key_exclusive);
+        alloc.free(self.last_key);
+        self.* = undefined;
+    }
+};
+
+pub const DocumentArtifactChildRangePlacementUpdate = struct {
+    range_id: []const u8,
+    placement: []const u8,
+    owner_group_id: ?u64 = null,
+    placement_generation: ?u64 = null,
+    route_status: ?[]const u8 = null,
+    split_eligible: ?bool = null,
+};
+
+pub const DocumentArtifactManifest = struct {
+    document_id: []u8,
+    artifact_name: []u8,
+    artifact_id: []u8,
+    manifest_json: []u8,
+    state_json: ?[]u8 = null,
+    manifest_version: u64 = 0,
+    generation: u64 = 0,
+    source_url: []u8 = "",
+    source_fingerprint: []u8 = "",
+    content_type: []u8 = "",
+    route_type: []u8 = "",
+    unsupported_reason: ?[]u8 = null,
+    unit_count: usize = 0,
+    chunk_count: usize = 0,
+    ocr_attempted_count: usize = 0,
+    ocr_selected_count: usize = 0,
+    ocr_retained_embedded_count: usize = 0,
+    ocr_failed_count: usize = 0,
+    ocr_failed_page_numbers: []i64 = &.{},
+    ocr_failed_pages_truncated: bool = false,
+    child_ranges: []DocumentArtifactChildRange = &.{},
+    child_range_count: usize = 0,
+    merge_status: []u8 = "",
+    merge_from_generation: u64 = 0,
+    merge_to_generation: u64 = 0,
+    merge_operation_granularity: []u8 = "",
+    merge_operation_count: usize = 0,
+    last_error_code: ?[]u8 = null,
+    last_error_message: ?[]u8 = null,
+
+    pub fn deinit(self: *DocumentArtifactManifest, alloc: Allocator) void {
+        alloc.free(self.document_id);
+        alloc.free(self.artifact_name);
+        alloc.free(self.artifact_id);
+        alloc.free(self.manifest_json);
+        if (self.state_json) |state_json| alloc.free(state_json);
+        if (self.source_url.len > 0) alloc.free(self.source_url);
+        if (self.source_fingerprint.len > 0) alloc.free(self.source_fingerprint);
+        if (self.content_type.len > 0) alloc.free(self.content_type);
+        if (self.route_type.len > 0) alloc.free(self.route_type);
+        if (self.unsupported_reason) |unsupported_reason| alloc.free(unsupported_reason);
+        if (self.ocr_failed_page_numbers.len > 0) alloc.free(self.ocr_failed_page_numbers);
+        for (self.child_ranges) |*child_range| child_range.deinit(alloc);
+        if (self.child_ranges.len > 0) alloc.free(self.child_ranges);
+        if (self.merge_status.len > 0) alloc.free(self.merge_status);
+        if (self.merge_operation_granularity.len > 0) alloc.free(self.merge_operation_granularity);
+        if (self.last_error_code) |value| alloc.free(value);
+        if (self.last_error_message) |value| alloc.free(value);
+        self.* = undefined;
+    }
+};
+
+pub const DocumentArtifactManifestList = struct {
+    document_id: []u8,
+    artifacts: []DocumentArtifactManifest,
+
+    pub fn deinit(self: *DocumentArtifactManifestList, alloc: Allocator) void {
+        alloc.free(self.document_id);
+        for (self.artifacts) |*artifact| artifact.deinit(alloc);
+        alloc.free(self.artifacts);
+        self.* = undefined;
+    }
+};
+
+pub const TextBoolQuery = struct {
+    must: []const TextQuery = &.{},
+    should: []const TextQuery = &.{},
+    must_not: []const TextQuery = &.{},
+    min_should: u32 = 0,
+    /// Distinguishes an explicitly optional pure-`should` query from the
+    /// conventional pure disjunction whose implicit minimum is one.
+    pure_should_optional: bool = false,
+    boost: f32 = 1.0,
+};
+
+pub const TextMultiMatchField = struct {
+    field: []const u8,
+    boost: f32 = 1.0,
+};
+
+pub const TextQuery = union(enum) {
+    match_none: void,
+    match_all: void,
+    phrase: struct {
+        field: []const u8,
+        terms: []const []const u8,
+        max_edits: u8 = 0,
+        auto_fuzzy: bool = false,
+        boost: f32 = 1.0,
+    },
+    multi_phrase: struct {
+        field: []const u8,
+        terms: []const []const []const u8,
+        max_edits: u8 = 0,
+        auto_fuzzy: bool = false,
+        boost: f32 = 1.0,
+    },
+    term: struct {
+        field: []const u8,
+        term: []const u8,
+        boost: f32 = 1.0,
+    },
+    match: struct {
+        field: []const u8,
+        text: []const u8,
+        analyzer: ?[]const u8 = null,
+        boost: f32 = 1.0,
+    },
+    multi_match_bool_prefix: struct {
+        query: []const u8,
+        fields: []const TextMultiMatchField,
+        boost: f32 = 1.0,
+    },
+    match_phrase: struct {
+        field: []const u8,
+        text: []const u8,
+        analyzer: ?[]const u8 = null,
+        max_edits: u8 = 0,
+        auto_fuzzy: bool = false,
+        boost: f32 = 1.0,
+    },
+    fuzzy: struct {
+        field: []const u8,
+        term: []const u8,
+        max_edits: u8 = 1,
+        prefix_len: u8 = 0,
+        auto_fuzzy: bool = false,
+        boost: f32 = 1.0,
+    },
+    numeric_range: struct {
+        field: []const u8,
+        min: ?f64 = null,
+        max: ?f64 = null,
+        inclusive_min: bool = true,
+        inclusive_max: bool = false,
+        boost: f32 = 1.0,
+    },
+    date_range: struct {
+        field: []const u8,
+        start_ns: ?u64 = null,
+        end_ns: ?u64 = null,
+        inclusive_start: bool = true,
+        inclusive_end: bool = false,
+        boost: f32 = 1.0,
+    },
+    doc_id: struct {
+        ids: []const []const u8,
+        boost: f32 = 1.0,
+    },
+    bool_field: struct {
+        field: []const u8,
+        value: bool,
+        boost: f32 = 1.0,
+    },
+    geo_distance: struct {
+        field: []const u8,
+        lon: f64,
+        lat: f64,
+        radius_meters: f64,
+        boost: f32 = 1.0,
+    },
+    geo_bbox: struct {
+        field: []const u8,
+        min_lat: f64,
+        min_lon: f64,
+        max_lat: f64,
+        max_lon: f64,
+        boost: f32 = 1.0,
+    },
+    prefix: struct {
+        field: []const u8,
+        prefix: []const u8,
+        boost: f32 = 1.0,
+    },
+    wildcard: struct {
+        field: []const u8,
+        pattern: []const u8,
+        boost: f32 = 1.0,
+    },
+    regexp: struct {
+        field: []const u8,
+        pattern: []const u8,
+        boost: f32 = 1.0,
+    },
+    term_range: struct {
+        field: []const u8,
+        min: ?[]const u8 = null,
+        max: ?[]const u8 = null,
+        inclusive_min: bool = true,
+        inclusive_max: bool = false,
+        boost: f32 = 1.0,
+    },
+    ip_range: struct {
+        field: []const u8,
+        cidr: []const u8,
+        boost: f32 = 1.0,
+    },
+    geo_shape: struct {
+        field: []const u8,
+        relation: GeoShapeRelation = .intersects,
+        polygons: []const []const GeoPoint,
+        boost: f32 = 1.0,
+    },
+    bool_query: TextBoolQuery,
+
+    pub fn deinit(self: *TextQuery, alloc: Allocator) void {
+        switch (self.*) {
+            .match_none, .match_all => {},
+            .phrase => |phrase| {
+                alloc.free(phrase.field);
+                for (phrase.terms) |term| alloc.free(term);
+                if (phrase.terms.len > 0) alloc.free(phrase.terms);
+            },
+            .multi_phrase => |multi| {
+                alloc.free(multi.field);
+                for (multi.terms) |group| {
+                    for (group) |term| alloc.free(term);
+                    if (group.len > 0) alloc.free(group);
+                }
+                if (multi.terms.len > 0) alloc.free(multi.terms);
+            },
+            .term => |term| {
+                alloc.free(term.field);
+                alloc.free(term.term);
+            },
+            .match => |match| {
+                alloc.free(match.field);
+                alloc.free(match.text);
+                if (match.analyzer) |analyzer| alloc.free(analyzer);
+            },
+            .multi_match_bool_prefix => |multi_match| {
+                alloc.free(multi_match.query);
+                for (multi_match.fields) |field| alloc.free(field.field);
+                if (multi_match.fields.len > 0) alloc.free(multi_match.fields);
+            },
+            .match_phrase => |phrase| {
+                alloc.free(phrase.field);
+                alloc.free(phrase.text);
+                if (phrase.analyzer) |analyzer| alloc.free(analyzer);
+            },
+            .fuzzy => |fuzzy| {
+                alloc.free(fuzzy.field);
+                alloc.free(fuzzy.term);
+            },
+            .numeric_range => |range| alloc.free(range.field),
+            .date_range => |range| alloc.free(range.field),
+            .geo_distance => |range| alloc.free(range.field),
+            .geo_bbox => |range| alloc.free(range.field),
+            .doc_id => |doc_id| {
+                for (doc_id.ids) |id| alloc.free(id);
+                if (doc_id.ids.len > 0) alloc.free(doc_id.ids);
+            },
+            .bool_field => |field| alloc.free(field.field),
+            .prefix => |prefix| {
+                alloc.free(prefix.field);
+                alloc.free(prefix.prefix);
+            },
+            .wildcard => |wildcard| {
+                alloc.free(wildcard.field);
+                alloc.free(wildcard.pattern);
+            },
+            .regexp => |regexp| {
+                alloc.free(regexp.field);
+                alloc.free(regexp.pattern);
+            },
+            .term_range => |range| {
+                alloc.free(range.field);
+                if (range.min) |min| alloc.free(min);
+                if (range.max) |max| alloc.free(max);
+            },
+            .ip_range => |range| {
+                alloc.free(range.field);
+                alloc.free(range.cidr);
+            },
+            .geo_shape => |shape| {
+                alloc.free(shape.field);
+                for (shape.polygons) |polygon| {
+                    if (polygon.len > 0) alloc.free(polygon);
+                }
+                if (shape.polygons.len > 0) alloc.free(shape.polygons);
+            },
+            .bool_query => |bool_query| {
+                for (bool_query.must) |*query| {
+                    var owned = query.*;
+                    owned.deinit(alloc);
+                }
+                if (bool_query.must.len > 0) alloc.free(bool_query.must);
+                for (bool_query.should) |*query| {
+                    var owned = query.*;
+                    owned.deinit(alloc);
+                }
+                if (bool_query.should.len > 0) alloc.free(bool_query.should);
+                for (bool_query.must_not) |*query| {
+                    var owned = query.*;
+                    owned.deinit(alloc);
+                }
+                if (bool_query.must_not.len > 0) alloc.free(bool_query.must_not);
+            },
+        }
+        self.* = undefined;
+    }
+};
+
+pub const DenseKnnQuery = struct {
+    vector: []const f32,
+    k: u32 = 10,
+};
+
+pub const SparseKnnQuery = struct {
+    indices: []const u32,
+    values: []const f32,
+    k: u32 = 10,
+};
+
+pub const Query = union(enum) {
+    match_none: void,
+    match_all: void,
+    phrase: struct {
+        field: []const u8,
+        terms: []const []const u8,
+        max_edits: u8 = 0,
+        auto_fuzzy: bool = false,
+        boost: f32 = 1.0,
+    },
+    multi_phrase: struct {
+        field: []const u8,
+        terms: []const []const []const u8,
+        max_edits: u8 = 0,
+        auto_fuzzy: bool = false,
+        boost: f32 = 1.0,
+    },
+    term: struct {
+        field: []const u8,
+        term: []const u8,
+        boost: f32 = 1.0,
+    },
+    match: struct {
+        field: []const u8,
+        text: []const u8,
+        analyzer: ?[]const u8 = null,
+        boost: f32 = 1.0,
+    },
+    match_phrase: struct {
+        field: []const u8,
+        text: []const u8,
+        analyzer: ?[]const u8 = null,
+        max_edits: u8 = 0,
+        auto_fuzzy: bool = false,
+        boost: f32 = 1.0,
+    },
+    fuzzy: struct {
+        field: []const u8,
+        term: []const u8,
+        max_edits: u8 = 1,
+        prefix_len: u8 = 0,
+        auto_fuzzy: bool = false,
+        boost: f32 = 1.0,
+    },
+    numeric_range: struct {
+        field: []const u8,
+        min: ?f64 = null,
+        max: ?f64 = null,
+        inclusive_min: bool = true,
+        inclusive_max: bool = false,
+        boost: f32 = 1.0,
+    },
+    date_range: struct {
+        field: []const u8,
+        start_ns: ?u64 = null,
+        end_ns: ?u64 = null,
+        inclusive_start: bool = true,
+        inclusive_end: bool = false,
+        boost: f32 = 1.0,
+    },
+    doc_id: struct {
+        ids: []const []const u8,
+        boost: f32 = 1.0,
+    },
+    bool_field: struct {
+        field: []const u8,
+        value: bool,
+        boost: f32 = 1.0,
+    },
+    geo_distance: struct {
+        field: []const u8,
+        lon: f64,
+        lat: f64,
+        radius_meters: f64,
+        boost: f32 = 1.0,
+    },
+    geo_bbox: struct {
+        field: []const u8,
+        min_lat: f64,
+        min_lon: f64,
+        max_lat: f64,
+        max_lon: f64,
+        boost: f32 = 1.0,
+    },
+    prefix: struct {
+        field: []const u8,
+        prefix: []const u8,
+        boost: f32 = 1.0,
+    },
+    wildcard: struct {
+        field: []const u8,
+        pattern: []const u8,
+        boost: f32 = 1.0,
+    },
+    regexp: struct {
+        field: []const u8,
+        pattern: []const u8,
+        boost: f32 = 1.0,
+    },
+    term_range: struct {
+        field: []const u8,
+        min: ?[]const u8 = null,
+        max: ?[]const u8 = null,
+        inclusive_min: bool = true,
+        inclusive_max: bool = false,
+        boost: f32 = 1.0,
+    },
+    ip_range: struct {
+        field: []const u8,
+        cidr: []const u8,
+        boost: f32 = 1.0,
+    },
+    geo_shape: struct {
+        field: []const u8,
+        relation: GeoShapeRelation = .intersects,
+        polygons: []const []const GeoPoint,
+        boost: f32 = 1.0,
+    },
+    dense_knn: DenseKnnQuery,
+    sparse_knn: SparseKnnQuery,
+    graph: graph_query_mod.GraphQuery,
+};
+
+pub const LookupOptions = struct {
+    row_policy_principal_proof: []const u8 = "",
+    row_policy_database: []const u8 = "",
+    /// Private metadata-coordinator probe. Public HTTP lookup parsing must
+    /// never populate this field; it exposes no row data.
+    row_policy_receipt: ?struct {
+        generation: u64,
+        phase: @import("../../system_catalog/policies.zig").Publication.Phase,
+    } = null,
+    /// Private optimistic observation: captures version and SHA256 of the
+    /// exact primary bytes from one snapshot, regardless of JSON projection.
+    include_primary_digest: bool = false,
+    restore_staging_scope: ?[32]u8 = null,
+    restore_staging_plan_id: ?[16]u8 = null,
+    /// Authenticated group-local control read; never accepted by public lookup parsing.
+    relational_integrity_catalog: bool = false,
+    relational_integrity_action: bool = false,
+    relational_integrity_jobs_json: []const u8 = "",
+    relational_activation_json: []const u8 = "",
+    relational_index_status_json: []const u8 = "",
+    relational_topology_json: []const u8 = "",
+    /// Local FK source-control capability. Never parsed from HTTP or encoded
+    /// on the lookup wire; only the authenticated owner receiver sets it.
+    fk_generation_source_control: bool = false,
+    /// Set only by the local read wrapper after its strict Raft read-index
+    /// barrier, before entering structural read admission. Not on any wire.
+    fk_generation_source_read_index_certified: bool = false,
+    /// The published handoff receipt's read-index was completed by the local
+    /// read wrapper before it entered structural admission. This proof is
+    /// never parsed or serialized on either HTTP or storage-kernel wires.
+    generation_handoff_install_read_index_certified: bool = false,
+    fields: []const []const u8 = &.{},
+    include_all_fields: bool = true,
+    /// Internal, absolute monotonic deadline used by routed lookups. It is not
+    /// part of the public lookup projection contract and is never serialized.
+    execution_deadline_ns: ?u64 = null,
+    execution_io: ?@import("antfly_runtime_abi").io_abi.Borrow = null,
+    /// Borrowed request cancellation source. Callers must keep it alive for
+    /// the synchronous lookup call.
+    cancellation: ?CancellationToken = null,
+
+    pub fn executionNowNs(self: LookupOptions) u64 {
+        const borrow = self.execution_io orelse return @import("antfly_platform").time.monotonicNs();
+        var receiver = borrow.receive() catch @panic("incompatible lookup clock ABI");
+        return @intCast(@max(0, std.Io.Clock.now(.awake, receiver.io()).nanoseconds));
+    }
+};
+
+pub const LookupResult = struct {
+    json: []u8,
+    version: ?u64 = null,
+    expected_content_digest: ?[32]u8 = null,
+
+    pub fn deinit(self: *LookupResult, alloc: Allocator) void {
+        alloc.free(self.json);
+        self.* = undefined;
+    }
+};
+
+pub const ColumnarScanStats = struct {
+    scan_plans_built: u64 = 0,
+    scan_plan_hits: u64 = 0,
+    selection_reused_rows: u64 = 0,
+    primary_predicate_rows: u64 = 0,
+    late_materialized_rows: u64 = 0,
+    late_materialized_bytes: u64 = 0,
+    column_view_bytes: u64 = 0,
+    logical_slots_initialized: u64 = 0,
+    decoded_cache_hits: u64 = 0,
+    decoded_cache_misses: u64 = 0,
+    decoded_cache_admissions: u64 = 0,
+    decoded_cache_evictions: u64 = 0,
+    decoded_cache_bypasses: u64 = 0,
+    decoded_cache_peak_bytes: u64 = 0,
+    overlay_tombstones_skipped: u64 = 0,
+    cell_slots_initialized: u64 = 0,
+    cell_cache_hits: u64 = 0,
+    payload_pages_read: u64 = 0,
+    primary_owners_examined: u64 = 0,
+    used: bool = false,
+    blocks_read: u64 = 0,
+    blocks_pruned: u64 = 0,
+    columns_read: u64 = 0,
+    encoded_bytes_read: u64 = 0,
+    metadata_bytes_read: u64 = 0,
+    column_metadata_reads: u64 = 0,
+    overlay_rows_read: u64 = 0,
+    dense_delta_scans: u64 = 0,
+    costed_dirty_records: u64 = 0,
+    estimated_overlay_bytes: u64 = 0,
+    estimated_primary_bytes: u64 = 0,
+    uncovered_ranges_read: u64 = 0,
+    payload_bytes_read: u64 = 0,
+    rows_selected: u64 = 0,
+    values_materialized: u64 = 0,
+    dirty_ranges_read: u64 = 0,
+    primary_rows_read: u64 = 0,
+};
+
+/// Borrowed typed request for native callers. Encoded only at an archive or
+/// network boundary; fields and JSON operands must outlive the synchronous scan.
+pub const RelationalRowQuery = struct {
+    pub const Bound = struct { values: []const std.json.Value, inclusive: bool = true };
+    pub const Condition = struct {
+        column: []const u8,
+        op: @import("../relational_index.zig").RelationalCheckOp,
+        value: ?std.json.Value = null,
+        collation: ?[]const u8 = null,
+    };
+    /// Retained typed readers bound bytes as well as rows. Transported with
+    /// the query so every owner uses the same requested page envelope.
+    page_bytes: usize = 16 * 1024 * 1024,
+    fields: []const []const u8,
+    index: ?[]const u8 = null,
+    /// Let the storage reader choose a READY covering/key index from the
+    /// pinned catalog snapshot. This is deliberately a hint: no usable index
+    /// is a correct primary-key fallback.
+    auto_index: bool = false,
+    after: ?[]const u8 = null,
+    lower: ?Bound = null,
+    upper: ?Bound = null,
+    conditions: []const Condition = &.{},
+    schema_version: ?u32 = null,
+};
+
+pub const ScanOptions = struct {
+    /// Retain the full document only for a version-fenced SQL mutation.
+    sql_document_preimage: bool = false,
+    /// Collect durable logical range guards only for explicitly guarded SQL.
+    include_range_proofs: bool = false,
+    relational_query: ?RelationalRowQuery = null,
+    /// Schema-bound typed row query carried by the routed scan transport. It
+    /// is never interpreted as a search DSL or permitted to replace RLS filters.
+    relational_query_json: []const u8 = "",
+    /// Opaque authenticated principal proof for one policy epoch. External
+    /// callers cannot assert roles directly; the native owner verifies it.
+    row_policy_principal_proof: []const u8 = "",
+    row_policy_database: []const u8 = "",
+    /// Internal differential-testing and benchmark baseline; never serialized.
+    disable_columnar_scan: bool = false,
+    /// Internal request-local decoded payload reuse budget. Includes retained
+    /// payload allocations and cache metadata; excludes active block workspace.
+    /// Zero disables cross-block reuse. Never serialized on the wire.
+    columnar_decoded_cache_bytes: usize = 1024 * 1024,
+    /// Optional request-local instrumentation; never part of the wire format.
+    columnar_stats: ?*ColumnarScanStats = null,
+    inclusive_from: bool = false,
+    exclusive_to: bool = false,
+    include_documents: bool = false,
+    limit: u32 = 0,
+    fields: []const []const u8 = &.{},
+    include_all_fields: bool = true,
+    filter_query_json: []const u8 = "",
+    /// Internal-only response mode used by linear merge. Public scans leave
+    /// this false and retain their existing NDJSON shape.
+    include_content_hashes: bool = false,
+    /// Internal request lifetime controls. These are deliberately omitted from
+    /// the scan wire body: each transport hop derives its own remaining budget
+    /// and borrows the caller's cancellation source only for the synchronous
+    /// scan lifetime.
+    execution_deadline_ns: ?u64 = null,
+    cancellation: ?CancellationToken = null,
+
+    pub fn isRelational(self: ScanOptions) bool {
+        return self.relational_query != null or self.relational_query_json.len != 0;
+    }
+};
+
+pub const ScanDocument = struct {
+    id: []u8,
+    json: []u8,
+
+    pub fn deinit(self: *ScanDocument, alloc: Allocator) void {
+        alloc.free(self.id);
+        alloc.free(self.json);
+        self.* = undefined;
+    }
+};
+
+pub const ScanHash = struct {
+    id: []u8,
+    hash: u64,
+    content_hash: ?DocumentContentHash = null,
+    relational_schema_version: ?u32 = null,
+    relational_cursor: ?[]u8 = null,
+    json_null_fields: []const []const u8 = &.{},
+
+    pub fn deinit(self: *ScanHash, alloc: Allocator) void {
+        alloc.free(self.id);
+        if (self.relational_cursor) |cursor| alloc.free(cursor);
+        for (self.json_null_fields) |field| alloc.free(field);
+        alloc.free(self.json_null_fields);
+        self.* = undefined;
+    }
+};
+
+/// One row yielded by a snapshot-consistent scan. Slices are borrowed for the
+/// duration of the callback; consumers that retain them must copy them.
+pub const ScanVisitEntry = struct {
+    id: []const u8,
+    hash: u64,
+    content_hash: ?DocumentContentHash = null,
+    relational_schema_version: ?u32 = null,
+    relational_cursor: ?[]const u8 = null,
+    json_null_fields: []const []const u8 = &.{},
+    document_json: ?[]const u8 = null,
+};
+
+pub const ScanVisitor = struct {
+    context: ?*anyopaque,
+    visit: *const fn (context: ?*anyopaque, entry: ScanVisitEntry) anyerror!void,
+};
+
+pub const ScanResult = struct {
+    hashes: []ScanHash = &.{},
+    documents: []ScanDocument = &.{},
+
+    pub fn deinit(self: *ScanResult, alloc: Allocator) void {
+        for (self.hashes) |*entry| entry.deinit(alloc);
+        if (self.hashes.len > 0) alloc.free(self.hashes);
+        for (self.documents) |*doc| doc.deinit(alloc);
+        if (self.documents.len > 0) alloc.free(self.documents);
+        self.* = undefined;
+    }
+};
+
+pub const DocumentArtifactReprocessShardResume = struct {
+    group_id: ?u64 = null,
+    next_key: []const u8,
+    limit: u32 = 0,
+};
+
+pub const DocumentArtifactTableReprocessRequest = struct {
+    from_key: []const u8 = "",
+    to_key: []const u8 = "",
+    limit: u32 = 100,
+    shard_cursors: []const DocumentArtifactReprocessShardResume = &.{},
+};
+
+pub const DocumentArtifactReprocessFailure = struct {
+    key: []u8,
+    error_code: []u8,
+
+    pub fn deinit(self: *DocumentArtifactReprocessFailure, alloc: Allocator) void {
+        alloc.free(self.key);
+        alloc.free(self.error_code);
+        self.* = undefined;
+    }
+};
+
+pub const DocumentArtifactReprocessShardCursor = struct {
+    group_id: ?u64 = null,
+    next_key: []u8,
+    scanned: usize = 0,
+    reprocessed: usize = 0,
+    skipped: usize = 0,
+    failed: usize = 0,
+    limit: u32 = 0,
+
+    pub fn deinit(self: *DocumentArtifactReprocessShardCursor, alloc: Allocator) void {
+        alloc.free(self.next_key);
+        self.* = undefined;
+    }
+};
+
+pub const DocumentArtifactTableReprocessResult = struct {
+    scanned: usize = 0,
+    reprocessed: usize = 0,
+    skipped: usize = 0,
+    failed: usize = 0,
+    limit: u32 = 0,
+    next_key: ?[]u8 = null,
+    failures: []DocumentArtifactReprocessFailure = &.{},
+    shard_cursors: []DocumentArtifactReprocessShardCursor = &.{},
+
+    pub fn deinit(self: *DocumentArtifactTableReprocessResult, alloc: Allocator) void {
+        if (self.next_key) |value| alloc.free(value);
+        for (self.failures) |*failure| failure.deinit(alloc);
+        if (self.failures.len > 0) alloc.free(self.failures);
+        for (self.shard_cursors) |*cursor| cursor.deinit(alloc);
+        if (self.shard_cursors.len > 0) alloc.free(self.shard_cursors);
+        self.* = undefined;
+    }
+};
+
+pub const TxnId = transactions_mod.TxnId;
+pub const TxnStatus = transactions_mod.TxnStatus;
+pub const TxnRecoveryStats = transactions_mod.RecoveryStats;
+pub const ByteRange = @import("../byte_range.zig").ByteRange;
+pub const SplitPhase = shard_mod.SplitPhase;
+pub const GraphEdge = graph_mod.Edge;
+pub const GraphEdgeDirection = graph_mod.EdgeDirection;
+pub const GraphTraversalRules = traversal_mod.TraversalRules;
+pub const GraphTraversalResult = traversal_mod.TraversalResult;
+pub const GraphPathWeightMode = paths_mod.PathWeightMode;
+pub const GraphPath = paths_mod.Path;
+
+pub const TransactionWrite = struct {
+    key: []const u8,
+    value: []const u8,
+    json_null_fields: []const []const u8 = &.{},
+};
+
+pub const TransactionVersionPredicate = struct {
+    key: []const u8,
+    expected_version: u64,
+    /// Internal observation guard. TTL timestamps need not change on updates.
+    /// SHA-256 binds the exact primary row read before planning FK actions.
+    expected_content_digest: ?[32]u8 = null,
+    /// A server-authored INSERT identity constraint, rather than an observed read.
+    unique_absence: bool = false,
+};
+
+/// Server-compiled integrity effects. The logical routing key is separate from
+/// the protected physical key: routing a metadata prefix would concentrate all
+/// claims on the first shard. Public mutation parsers must never populate this
+/// envelope directly. Participants validate its namespace before admission.
+pub const TransactionIntegrityOperation = @import("relational_integrity_contract.zig").Operation;
+
+pub const TransactionIntentRequest = struct {
+    row_policy_principal_proof: []const u8 = "",
+    row_policy_database: []const u8 = "",
+    row_policy_admitted_at_seconds: i64 = 0,
+    range_guards: []const @import("../range_protection.zig").Proof = &.{},
+    schema_version: ?u32 = null,
+    relational_index_maintenance: ?@import("relational_index_maintenance_contract.zig").Command = null,
+    restore_staging_scope: ?[32]u8 = null,
+    restore_staging_plan_id: ?[16]u8 = null,
+    relational_activation: ?@import("relational_integrity_activation_contract.zig").Command = null,
+    relational_retirement: ?@import("relational_integrity_retirement_contract.zig").Command = null,
+    relational_schema_version: ?u32 = null,
+    relational_integrity_generation_set: ?[32]u8 = null,
+    relational_repair: bool = false,
+    writes: []const TransactionWrite = &.{},
+    deletes: []const []const u8 = &.{},
+    transforms: []const DocumentTransform = &.{},
+    predicates: []const TransactionVersionPredicate = &.{},
+    integrity: []const TransactionIntegrityOperation = &.{},
+    integrity_commands: []const @import("relational_integrity_contract.zig").Command = &.{},
+};
+
+pub const SplitState = struct {
+    phase: SplitPhase,
+    split_key: []u8,
+    new_shard_id: u64,
+    started_at: u64,
+    original_range_end: []u8,
+
+    pub fn deinit(self: *SplitState, alloc: Allocator) void {
+        alloc.free(self.split_key);
+        alloc.free(self.original_range_end);
+        self.* = undefined;
+    }
+};
+
+pub fn freeSplitState(alloc: Allocator, state: ?SplitState) void {
+    if (state) |owned| {
+        var mutable = owned;
+        mutable.deinit(alloc);
+    }
+}
+
+pub const SplitDeltaEntry = struct {
+    sequence: u64,
+    timestamp: u64,
+    writes: []BatchWrite,
+    deletes: [][]u8,
+
+    pub fn deinit(self: *SplitDeltaEntry, alloc: Allocator) void {
+        for (self.writes) |write| {
+            alloc.free(@constCast(write.key));
+            alloc.free(@constCast(write.value));
+        }
+        if (self.writes.len > 0) alloc.free(self.writes);
+        for (self.deletes) |key| alloc.free(key);
+        if (self.deletes.len > 0) alloc.free(self.deletes);
+        self.* = undefined;
+    }
+};
+
+pub fn freeSplitDeltaEntries(alloc: Allocator, entries: []SplitDeltaEntry) void {
+    for (entries) |*entry| entry.deinit(alloc);
+    if (entries.len > 0) alloc.free(entries);
+}
+
+pub fn freeParticipantIds(alloc: Allocator, items: [][]u8) void {
+    transactions_mod.freeParticipantList(alloc, items);
+}
+
+pub const ExecutionContext = struct {
+    io: ?std.Io = null,
+    max_parallelism: ?usize = null,
+};
+
+/// API transport metadata retained alongside the canonical graph execution
+/// plan. Compatibility is deliberately represented only at this wire boundary;
+/// graph executors continue to consume `NamedGraphQuery` exclusively.
+pub const GraphQueryWireDialect = enum { canonical, legacy };
+
+pub const GraphQueryTransport = struct {
+    dialect: GraphQueryWireDialect,
+    /// Owned, normalized JSON object containing only the admitted named graph
+    /// operations. It is safe to embed directly after a JSON field name.
+    operations_json: []const u8,
+    /// Borrowed identity of the immutable canonical operation slice produced by
+    /// public admission. Derived requests may retain the complete admitted plan
+    /// or clear it, but replacing the operations requires re-admission. This
+    /// pointer is compared by identity only and is never dereferenced.
+    admitted_operations_ptr: *const anyopaque,
+    admitted_operations_len: usize,
+
+    pub fn matchesOperations(self: GraphQueryTransport, operations: []const NamedGraphQuery) bool {
+        return self.admitted_operations_len == operations.len and
+            self.admitted_operations_ptr == @as(*const anyopaque, @ptrCast(operations.ptr));
+    }
+
+    pub fn deinit(self: *GraphQueryTransport, alloc: Allocator) void {
+        alloc.free(@constCast(self.operations_json));
+        self.* = undefined;
+    }
+};
+
+pub const SearchRequest = struct {
+    pub fn hasHitEvaluation(self: @This()) bool {
+        return self.evaluation_limit > 0 and !self.evaluation_graph;
+    }
+
+    evaluation_json: []const u8 = "",
+    evaluation_limit: u32 = 0,
+    evaluation_matches: bool = false,
+    /// Graph evaluation owns a separate collection window; base hit paging is unchanged.
+    evaluation_graph: bool = false,
+    /// Set only after catalog schema/index preparation; never populated by public JSON.
+    prepared_read_table_id: u64 = 0,
+    /// Request-owned routing map parallel to filter_doc_ids; never serialized.
+    document_lookup_groups: []const u64 = &.{},
+    /// Borrowed coordinator label; routing and storage continue using immutable identities.
+    response_table_name: ?[]const u8 = null,
+    /// Borrowed physical name of the queried table, set by the API read
+    /// source together with `graph_index_complete_snapshot`. Graph executors
+    /// canonicalize a `target_table` tag naming this table to the local
+    /// (null) identity, mirroring the distributed coordinator's
+    /// canonicalGraphNodeTable, so a self-table tag never stops expansion or
+    /// splits node identity. Never populated by public JSON.
+    graph_owning_table: []const u8 = "",
+    /// True when the executing snapshot holds the graph index's COMPLETE
+    /// row set: the table has exactly one group and the query was admitted
+    /// for local (non-coordinated) graph execution. Local graph executors
+    /// may then expand THROUGH cross-table tagged nodes — entity-sourced
+    /// edges are document-owned rows in this same index, so the walk is a
+    /// same-snapshot single-index read (the embedded DBCore entry points'
+    /// justification). Never populated by public JSON.
+    graph_index_complete_snapshot: bool = false,
+    /// Trusted coordinator-selected wall time for graph contribution TTL.
+    /// Zero asks a standalone local executor to capture the time itself.
+    graph_ttl_now_ns: u64 = 0,
+    query: Query = .{ .match_all = {} },
+    index_name: ?[]const u8 = null,
+    primary_text_index_name: ?[]const u8 = null,
+    remote_snapshot: ?[]const u8 = null,
+    aggregations_json: []const u8 = "",
+    count_only: bool = false,
+    profile: bool = false,
+    full_text: ?TextQuery = null,
+    /// Text-native positive filter. Unlike `full_text`, this constrains every
+    /// retrieval source without contributing a score.
+    filter_text: ?TextQuery = null,
+    /// Text-native negative filter. Matches are removed from every retrieval
+    /// source without contributing a score.
+    exclusion_text: ?TextQuery = null,
+    filter_query_json: []const u8 = "",
+    exclusion_query_json: []const u8 = "",
+    /// Trusted request-local row authorization predicate. Public request
+    /// parsing never populates this field. The HTTP authorization boundary
+    /// records it separately from retrieval filters so canonical graph MATCH
+    /// can enumerate the complete authorized source relation without
+    /// inheriting unrelated retrieval shaping. It is never serialized to a
+    /// shard; ordinary retrieval still receives the conjoined predicate in
+    /// `filter_query_json`.
+    authorization_filter_query_json: []const u8 = "",
+    full_text_queries: []const NamedFullTextQuery = &.{},
+    doc_filter_bindings: []const NamedDocFilterBinding = &.{},
+    dense: ?DenseKnnQuery = null,
+    sparse: ?SparseKnnQuery = null,
+    dense_queries: []const NamedDenseQuery = &.{},
+    sparse_queries: []const NamedSparseQuery = &.{},
+    graph_queries: []const NamedGraphQuery = &.{},
+    graph_metric_queries: []const NamedGraphMetricQuery = &.{},
+    graph_metric_rerank: ?GraphMetricRerank = null,
+    /// Trusted operator-owned graph admission ceilings. Public request parsing
+    /// never reads these from JSON, and shard transport must not serialize them.
+    graph_execution_limits: @import("../../graph/work_budget.zig").Limits = .{},
+    /// Internal synchronous observer for physical adjacency work. A shard
+    /// expansion RPC uses it to report rows hidden by graph TTL to its
+    /// coordinator. It is never serialized or retained beyond search().
+    graph_physical_scan_observation: ?*usize = null,
+    /// Owned, validated API wire sidecar. Execution never inspects it; it is
+    /// retained only for allocation-light owner proxying and response shaping.
+    graph_query_transport: ?GraphQueryTransport = null,
+    merge_config: ?MergeConfig = null,
+    reranker: ?reranking_mod.Config = null,
+    reranker_query_text: []const u8 = "",
+    pruner: ?fusion_mod.Pruner = null,
+    expand_strategy: ?graph_query_mod.ExpandStrategy = null,
+    return_mode: ReturnMode = .parent,
+    max_chunks_per_parent: u32 = 0,
+    hierarchy_include_source: bool = false,
+    hierarchy_include_unit: bool = false,
+    hierarchy_omit_implicit_source_ancestor_document: bool = false,
+    hierarchy_match_fields: []const []const u8 = &.{},
+    hierarchy_match_include_all_fields: bool = true,
+    hierarchy_grouped_matches: bool = false,
+    hierarchy_group_level: HierarchyGroupLevel = .source,
+    hierarchy_children: ?HierarchyChildrenRequest = null,
+    /// Internal distributed-planning control. Parent-owned navigation and
+    /// globally merged unit groups may return identity-only hits for payloads
+    /// routed elsewhere; direct callers fail closed when payload is absent.
+    defer_hierarchy_child_hydration: bool = false,
+    hierarchy_source_fields: []const []const u8 = &.{},
+    hierarchy_source_include_all_fields: bool = true,
+    hierarchy_unit_fields: []const []const u8 = &.{},
+    hierarchy_unit_include_all_fields: bool = true,
+    fields: []const []const u8 = &.{},
+    /// Highlighting options; null leaves `_highlights` out of every hit.
+    highlight: ?HighlightRequest = null,
+    order_by: []const SortField = &.{},
+    search_after: []const std.json.Value = &.{},
+    search_before: []const std.json.Value = &.{},
+    include_all_fields: bool = true,
+    defer_stored_projection: bool = false,
+    limit: u32 = 10,
+    offset: u32 = 0,
+    include_stored: bool = true,
+    search_effort: ?f32 = null,
+    filter_prefix: []const u8 = "",
+    distance_over: ?f32 = null,
+    distance_under: ?f32 = null,
+    filter_ids: []const u64 = &.{},
+    exclude_ids: []const u64 = &.{},
+    filter_doc_ids: []const []const u8 = &.{},
+    filter_doc_ids_positive: bool = false,
+    exclude_doc_ids: []const []const u8 = &.{},
+    // Internal execution hook. Public callers should use raw document IDs,
+    // filter JSON, or named bindings instead of constructing this pointer.
+    resolved_doc_filter: ?*const anyopaque = null,
+    // Internal text-index execution hook. This is request-local state used to
+    // avoid converting text-native doc nums through shard ordinals and back.
+    resolved_text_doc_filter: ?*const anyopaque = null,
+    resolved_doc_filter_owned: bool = false,
+    resolved_doc_filter_wire_context: ?ResolvedDocFilterWireContext = null,
+    /// Request-local authorization hook used only by the distributed graph
+    /// coordinator when an edge names a document in another table. The hook is
+    /// never serialized to a shard worker; it resolves the target table to a
+    /// trusted internal row predicate before owner-routed admission.
+    graph_table_read_authorizer: ?GraphTableReadAuthorizer = null,
+    identity_read_generation: ?u64 = null,
+    execution_deadline_ns: ?u64 = null,
+    /// Borrowed listener lifecycle signal. It is request-local and must never
+    /// be retained by asynchronous work after query execution returns.
+    cancellation: ?CancellationToken = null,
+    require_algebraic_filter_resolution: bool = false,
+    distributed_text_stats: []const distributed_stats_mod.TextFieldStats = &.{},
+
+    /// Remove both representations of the admitted graph plan. Keeping this
+    /// operation centralized prevents derived requests from retaining proxy
+    /// wire state after graph execution has been disabled.
+    pub fn clearGraphQueries(self: *SearchRequest) void {
+        self.graph_queries = &.{};
+        self.graph_query_transport = null;
+    }
+};
+
+pub const max_canonical_hierarchy_groups: u32 = 100;
+pub const max_canonical_hierarchy_matches_per_group: u32 = 100;
+pub const max_canonical_hierarchy_total_matches: u32 = 1000;
+
+// Every SearchRequest field must be deliberately classified for child
+// traversal. The compile-time audit prevents newly added retrieval controls
+// from becoming silently accepted no-ops at this storage boundary.
+const hierarchy_children_validated_fields = [_][]const u8{
+    "return_mode",
+    "hierarchy_grouped_matches",
+    "hierarchy_children",
+    "fields",
+    "order_by",
+    "search_after",
+    "include_all_fields",
+    "limit",
+    "offset",
+    "include_stored",
+};
+
+const hierarchy_children_supported_internal_fields = [_][]const u8{
+    "response_table_name",
+    "prepared_read_table_id",
+    "document_lookup_groups",
+    "filter_query_json",
+    "exclusion_query_json",
+    "authorization_filter_query_json",
+    "defer_hierarchy_child_hydration",
+    "defer_stored_projection",
+    "filter_doc_ids",
+    "filter_doc_ids_positive",
+    "exclude_doc_ids",
+    "resolved_doc_filter",
+    "resolved_doc_filter_owned",
+    "resolved_doc_filter_wire_context",
+    "identity_read_generation",
+    "execution_deadline_ns",
+    "cancellation",
+    "graph_execution_limits",
+    "graph_physical_scan_observation",
+    "graph_owning_table",
+    "graph_index_complete_snapshot",
+    "graph_ttl_now_ns",
+};
+
+const hierarchy_children_rejected_fields = [_][]const u8{
+    "evaluation_json",
+    "evaluation_limit",
+    "evaluation_matches",
+    "evaluation_graph",
+    "query",
+    "index_name",
+    "primary_text_index_name",
+    "remote_snapshot",
+    "aggregations_json",
+    "count_only",
+    "profile",
+    "full_text",
+    "filter_text",
+    "exclusion_text",
+    "full_text_queries",
+    "doc_filter_bindings",
+    "dense",
+    "sparse",
+    "dense_queries",
+    "sparse_queries",
+    "graph_queries",
+    "graph_metric_queries",
+    "graph_metric_rerank",
+    "graph_query_transport",
+    "merge_config",
+    "reranker",
+    "reranker_query_text",
+    "pruner",
+    "expand_strategy",
+    "max_chunks_per_parent",
+    "hierarchy_include_source",
+    "hierarchy_include_unit",
+    "hierarchy_omit_implicit_source_ancestor_document",
+    "hierarchy_match_fields",
+    "hierarchy_match_include_all_fields",
+    "hierarchy_group_level",
+    "hierarchy_source_fields",
+    "hierarchy_source_include_all_fields",
+    "hierarchy_unit_fields",
+    "hierarchy_unit_include_all_fields",
+    "search_before",
+    "highlight",
+    "search_effort",
+    "filter_prefix",
+    "distance_over",
+    "distance_under",
+    "filter_ids",
+    "exclude_ids",
+    "resolved_text_doc_filter",
+    "graph_table_read_authorizer",
+    "require_algebraic_filter_resolution",
+    "distributed_text_stats",
+};
+
+fn auditHierarchyChildrenSearchRequestFields() void {
+    @setEvalBranchQuota(10_000);
+    inline for (comptime std.meta.fieldNames(SearchRequest)) |reflected_name| {
+        comptime var classifications: usize = 0;
+        inline for (hierarchy_children_validated_fields) |name| {
+            if (std.mem.eql(u8, reflected_name, name)) classifications += 1;
+        }
+        inline for (hierarchy_children_supported_internal_fields) |name| {
+            if (std.mem.eql(u8, reflected_name, name)) classifications += 1;
+        }
+        inline for (hierarchy_children_rejected_fields) |name| {
+            if (std.mem.eql(u8, reflected_name, name)) classifications += 1;
+        }
+        if (classifications != 1) {
+            @compileError("SearchRequest field must have exactly one hierarchy-children policy: " ++ reflected_name);
+        }
+    }
+}
+
+/// Validate the fully normalized storage contract for sequential hierarchy
+/// traversal. Public parsers enforce the same shape, but typed and internal
+/// callers also cross this boundary and must never be able to trigger unchecked
+/// cursor indexing or accidentally request unbounded materialization.
+pub fn canonicalHierarchyChildrenRequestIsValid(req: SearchRequest) bool {
+    @setEvalBranchQuota(100_000);
+    comptime auditHierarchyChildrenSearchRequestFields();
+    const children = req.hierarchy_children orelse return true;
+    if (children.parent_id.len == 0 or children.parent_level != .source or children.level != .unit) return false;
+    if (req.return_mode != .unit or req.hierarchy_grouped_matches or req.max_chunks_per_parent != 0) return false;
+    // Traversal is deliberately not a retrieval operation. Reject every
+    // scoring, ranking, or transform control at this final typed boundary so
+    // embedded callers and worker envelopes cannot receive plausible-looking
+    // results for options that navigation would otherwise ignore. Internal
+    // authorization constraints and lifecycle controls remain supported.
+    const defaults = SearchRequest{};
+    inline for (hierarchy_children_rejected_fields) |field_name| {
+        if (!std.meta.eql(@field(req, field_name), @field(defaults, field_name))) return false;
+    }
+    if (req.limit == 0 or req.limit > max_canonical_hierarchy_groups) return false;
+    if (req.offset != 0 or req.count_only or req.aggregations_json.len > 0) return false;
+    if (req.search_before.len > 0 or req.include_all_fields) return false;
+    if (req.order_by.len != 2 or
+        !std.mem.eql(u8, req.order_by[0].field, "_hierarchy.position") or
+        req.order_by[0].desc or
+        !std.mem.eql(u8, req.order_by[1].field, "_id") or
+        req.order_by[1].desc)
+    {
+        return false;
+    }
+    if (req.search_after.len == 0) return true;
+    return req.search_after.len == 2 and
+        req.search_after[0] == .string and
+        req.search_after[1] == .string;
+}
+
+pub fn canonicalHierarchyExecutionWithinBudget(req: SearchRequest) bool {
+    if (!canonicalHierarchyChildrenRequestIsValid(req)) return false;
+    if (!req.hierarchy_grouped_matches) return true;
+    if (req.limit == 0 or req.limit > max_canonical_hierarchy_groups) return false;
+    if (req.max_chunks_per_parent == 0 or
+        req.max_chunks_per_parent > max_canonical_hierarchy_matches_per_group)
+    {
+        return false;
+    }
+    return @as(u64, req.limit) * @as(u64, req.max_chunks_per_parent) <=
+        max_canonical_hierarchy_total_matches;
+}
+
+/// Return the first phase of a canonical grouped hierarchy query. Distributed
+/// coordinators use this request on every shard, merge the global group page,
+/// and only then issue one bounded expansion for those selected groups.
+pub fn canonicalGroupedMatchSelectionRequest(req: SearchRequest) SearchRequest {
+    if (!req.hierarchy_grouped_matches or
+        (req.return_mode != .parent_with_chunks and req.return_mode != .unit_with_chunks) or
+        req.max_chunks_per_parent == 0)
+    {
+        return req;
+    }
+    var selection = req;
+    selection.return_mode = switch (req.hierarchy_group_level) {
+        .source => .parent,
+        .unit => .unit,
+    };
+    selection.max_chunks_per_parent = 0;
+    selection.hierarchy_grouped_matches = false;
+    return selection;
+}
+
+/// Build a bounded grouped-match request. `parent_filter` may contain one
+/// source for local expansion or the complete globally selected page for a
+/// distributed batch expansion.
+pub fn canonicalGroupedMatchExpansionRequest(
+    req: SearchRequest,
+    parent_filter: []const []const u8,
+) SearchRequest {
+    var match_req = req;
+    match_req.offset = 0;
+    match_req.limit = @intCast(parent_filter.len);
+    // Top-level cursors page source groups. They must never be applied to the
+    // independently ranked descendants within the selected groups.
+    match_req.search_after = &.{};
+    match_req.search_before = &.{};
+    match_req.filter_doc_ids = parent_filter;
+    match_req.filter_doc_ids_positive = true;
+    match_req.clearGraphQueries();
+    match_req.expand_strategy = null;
+    match_req.aggregations_json = "";
+    match_req.count_only = false;
+    match_req.profile = false;
+    return match_req;
+}
+
+/// Build the exact per-source descendant query used by a storage shard after
+/// its source groups have been selected.
+pub fn canonicalGroupedMatchDescendantRequest(
+    req: SearchRequest,
+    parent_filter: []const []const u8,
+) SearchRequest {
+    var match_req = canonicalGroupedMatchExpansionRequest(req, parent_filter);
+    match_req.return_mode = .chunk;
+    match_req.max_chunks_per_parent = 0;
+    match_req.hierarchy_grouped_matches = false;
+    match_req.limit = req.max_chunks_per_parent;
+    match_req.fields = req.hierarchy_match_fields;
+    match_req.include_all_fields = req.hierarchy_match_include_all_fields;
+    match_req.include_stored = match_req.include_all_fields or
+        match_req.fields.len > 0 or
+        match_req.reranker != null;
+    return match_req;
+}
+
+pub const GraphTableReadAuthorization = struct {
+    allowed: bool,
+    /// Binding alone does not require a document-existence or predicate read.
+    requires_document_admission: bool = true,
+    /// Owned physical routing name; authorization remains against the logical target.
+    physical_table_name: ?[]u8 = null,
+    /// Owned by this value when non-null.
+    filter_query_json: ?[]u8 = null,
+
+    pub fn deinit(self: *GraphTableReadAuthorization, alloc: std.mem.Allocator) void {
+        if (self.physical_table_name) |value| alloc.free(value);
+        if (self.filter_query_json) |value| alloc.free(value);
+        self.* = undefined;
+    }
+};
+
+pub const GraphTableReadAuthorizer = struct {
+    ctx: ?*const anyopaque,
+    authorize_table: *const fn (
+        ctx: ?*const anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+    ) anyerror!GraphTableReadAuthorization,
+
+    pub fn authorize(
+        self: GraphTableReadAuthorizer,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+    ) !GraphTableReadAuthorization {
+        return try self.authorize_table(self.ctx, alloc, table_name);
+    }
+};
+
+pub const SortField = struct {
+    field: []const u8,
+    desc: bool = false,
+};
+
+pub const ResolvedDocFilterWireContext = struct {
+    namespace: doc_identity_mod.Namespace,
+    identity_read_generation: u64,
+};
+
+pub const NamedDocFilterBinding = struct {
+    name: []const u8,
+    filter_query_json: []const u8,
+};
+
+pub const NamedGraphInputSet = struct {
+    name: []const u8,
+    hit_ids: []const []const u8 = &.{},
+    total_hits: u32 = 0,
+};
+
+pub const ReturnMode = enum {
+    parent,
+    /// Compatibility spelling for raw chunk/member results.
+    chunk,
+    parent_with_chunks,
+    unit,
+    unit_with_chunks,
+    /// Return each indexed source member without hierarchy grouping. This is
+    /// the precise name for raw results from heterogeneous artifact unions.
+    /// Appended to preserve the numeric ABI of the established modes.
+    member,
+};
+
+pub const HierarchyGroupLevel = enum {
+    source,
+    unit,
+};
+
+pub const HierarchyChildrenRequest = struct {
+    parent_id: []const u8,
+    parent_level: HierarchyGroupLevel = .source,
+    level: HierarchyGroupLevel = .unit,
+};
+
+pub const NamedGraphQuery = struct {
+    name: []const u8,
+    query: graph_query_mod.GraphQuery,
+};
+
+pub const GraphMetricFreshness = enum {
+    published,
+    fresh,
+};
+
+pub const GraphMetricQuery = struct {
+    index_name: []const u8,
+    metric_name: []const u8,
+    top_k: u32 = 10,
+    freshness: GraphMetricFreshness = .published,
+    /// Query-seeded personalized PageRank: teleport mass restricted to these
+    /// node keys. The ranking is computed at query time from the current edge
+    /// snapshot, so seeds require freshness=fresh; published generations are
+    /// global-only. Seed keys absent from the graph are skipped, not errors.
+    seed_nodes: []const []const u8 = &.{},
+    /// Damping override for personalized reads. Null keeps the metric's
+    /// configured damping. Only valid together with seed_nodes.
+    damping: ?f64 = null,
+};
+
+pub const NamedGraphMetricQuery = struct {
+    name: []const u8,
+    query: GraphMetricQuery,
+};
+
+pub const GraphMetricRerank = struct {
+    index_name: []const u8,
+    metric_name: []const u8,
+    freshness: GraphMetricFreshness = .published,
+    candidate_count: ?u32 = null,
+    base_weight: f64 = 1.0,
+    weight: f64 = 1.0,
+    missing_score: f64 = 0.0,
+    /// Query-seeded personalized PageRank blend: metric feature scores are
+    /// computed at query time with teleport mass restricted to these node
+    /// keys. Requires freshness=fresh; published generations are global-only.
+    seed_nodes: []const []const u8 = &.{},
+    /// Damping override for personalized blends. Only valid with seed_nodes.
+    damping: ?f64 = null,
+};
+
+pub const graph_metric_rerank_max_candidates: u32 = 10_000;
+pub const graph_metric_rerank_default_oversample: u32 = 4;
+
+pub fn graphMetricRerankCandidateCount(rerank: GraphMetricRerank, offset: u32, limit: u32) u32 {
+    if (rerank.candidate_count) |count| return count;
+    const page_boundary = offset +| limit;
+    const adaptive = offset +| (limit *| graph_metric_rerank_default_oversample);
+    return @min(graph_metric_rerank_max_candidates, @max(page_boundary, adaptive));
+}
+
+pub fn validateGraphMetricRerankWindow(rerank: GraphMetricRerank, offset: u32, limit: u32) !void {
+    const page_boundary = offset +| limit;
+    if (page_boundary > graph_metric_rerank_max_candidates) return error.QueryCandidateBudgetExceeded;
+    if (rerank.candidate_count) |count| {
+        if (count == 0 or count > graph_metric_rerank_max_candidates or count < page_boundary)
+            return error.InvalidQueryRequest;
+    }
+}
+
+pub const NamedFullTextQuery = struct {
+    name: []const u8,
+    index_name: []const u8,
+    query: TextQuery,
+};
+
+pub const NamedDenseQuery = struct {
+    name: []const u8,
+    index_name: []const u8,
+    query: DenseKnnQuery,
+};
+
+pub const NamedSparseQuery = struct {
+    name: []const u8,
+    index_name: []const u8,
+    query: SparseKnnQuery,
+};
+
+pub const MergeConfig = struct {
+    strategy: fusion_mod.FusionStrategy = .rrf,
+    rank_constant: f64 = 60.0,
+    window_size: u32 = 0,
+    weights: []const fusion_mod.NamedWeight = &.{},
+};
+
+/// Request-side highlighting options. See `QueryHighlight` in the public
+/// spec; fragments are computed on the node that owns the stored documents.
+pub const HighlightRequest = struct {
+    /// Source fields to highlight. Empty means every root field the full-text
+    /// query references.
+    fields: []const []const u8 = &.{},
+    fragment_size: u32 = 150,
+    max_fragments: u32 = 3,
+};
+
+pub const HighlightSpan = struct {
+    start: u32,
+    end: u32,
+};
+
+pub const HighlightFragment = struct {
+    text: []u8,
+    offset: u32,
+    /// Array index for one array; flattened value ordinal for paths through multiple arrays.
+    item: ?u32 = null,
+    spans: []HighlightSpan,
+};
+
+pub const HighlightedField = struct {
+    field: []u8,
+    fragments: []HighlightFragment,
+};
+
+pub fn freeHighlightFragment(alloc: Allocator, fragment: *HighlightFragment) void {
+    alloc.free(fragment.text);
+    if (fragment.spans.len > 0) alloc.free(fragment.spans);
+    fragment.* = undefined;
+}
+
+pub fn freeHighlightedField(alloc: Allocator, field: *HighlightedField) void {
+    alloc.free(field.field);
+    for (field.fragments) |*fragment| freeHighlightFragment(alloc, fragment);
+    if (field.fragments.len > 0) alloc.free(field.fragments);
+    field.* = undefined;
+}
+
+pub fn freeHighlights(alloc: Allocator, items: []HighlightedField) void {
+    for (items) |*item| freeHighlightedField(alloc, item);
+    if (items.len > 0) alloc.free(items);
+}
+
+pub fn cloneHighlights(alloc: Allocator, items: []const HighlightedField) ![]HighlightedField {
+    if (items.len == 0) return &.{};
+    const cloned = try alloc.alloc(HighlightedField, items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (cloned[0..initialized]) |*field| freeHighlightedField(alloc, field);
+        alloc.free(cloned);
+    }
+    for (items, 0..) |item, i| {
+        const field = try alloc.dupe(u8, item.field);
+        errdefer alloc.free(field);
+        const fragments = try alloc.alloc(HighlightFragment, item.fragments.len);
+        var fragments_initialized: usize = 0;
+        errdefer {
+            for (fragments[0..fragments_initialized]) |*fragment| freeHighlightFragment(alloc, fragment);
+            alloc.free(fragments);
+        }
+        for (item.fragments, 0..) |fragment, j| {
+            const text = try alloc.dupe(u8, fragment.text);
+            errdefer alloc.free(text);
+            fragments[j] = .{
+                .text = text,
+                .offset = fragment.offset,
+                .item = fragment.item,
+                .spans = try alloc.dupe(HighlightSpan, fragment.spans),
+            };
+            fragments_initialized += 1;
+        }
+        cloned[i] = .{ .field = field, .fragments = fragments };
+        initialized += 1;
+    }
+    return cloned;
+}
+
+pub const GraphMetricRerankScoreDetails = struct {
+    index_name: []u8,
+    metric_name: []u8,
+    base_score: f64 = 0.0,
+    base_weight: f64 = 1.0,
+    metric_score: ?f64 = null,
+    metric_score_used: f64 = 0.0,
+    metric_weight: f64 = 1.0,
+    missing_score_used: bool = false,
+    final_score: f64 = 0.0,
+    published_generation: u64 = 0,
+
+    pub fn clone(self: GraphMetricRerankScoreDetails, alloc: Allocator) !GraphMetricRerankScoreDetails {
+        const index_name = try alloc.dupe(u8, self.index_name);
+        errdefer alloc.free(index_name);
+        const metric_name = try alloc.dupe(u8, self.metric_name);
+        errdefer alloc.free(metric_name);
+        return .{
+            .index_name = index_name,
+            .metric_name = metric_name,
+            .base_score = self.base_score,
+            .base_weight = self.base_weight,
+            .metric_score = self.metric_score,
+            .metric_score_used = self.metric_score_used,
+            .metric_weight = self.metric_weight,
+            .missing_score_used = self.missing_score_used,
+            .final_score = self.final_score,
+            .published_generation = self.published_generation,
+        };
+    }
+
+    pub fn deinit(self: *GraphMetricRerankScoreDetails, alloc: Allocator) void {
+        alloc.free(self.index_name);
+        alloc.free(self.metric_name);
+        self.* = undefined;
+    }
+};
+
+pub const SearchHit = struct {
+    computed_json: ?[]u8 = null,
+    id: []u8,
+    /// Internal graph-hydration namespace. Null means the query's source
+    /// table. This is not serialized as part of the public search-hit shape.
+    source_table: ?[]u8 = null,
+    doc_ordinal: ?u32 = null,
+    native_text_doc_id: ?u32 = null,
+    /// Higher-is-better relevance score used by every public query path.
+    score: ?f32 = null,
+    score_details: ?GraphMetricRerankScoreDetails = null,
+    /// Metric-native dense-vector distance. Lower values are better. This is
+    /// retained separately so score ordering never depends on the metric.
+    distance: ?f32 = null,
+    index_scores: []fusion_mod.IndexScore = &.{},
+    sort_values: []std.json.Value = &.{},
+    stored_data: ?[]u8 = null,
+    /// Owned typed source for providers that hydrate after source-dependent
+    /// ranking/filtering. Highlighting and public projection consume this
+    /// directly; encoding happens once at the response boundary. Providers
+    /// populate either this or stored_data, never both.
+    source_value: ?std.json.Value = null,
+    ancestor_source_data: ?[]u8 = null,
+    ancestor_unit_data: ?[]u8 = null,
+    artifact_ref: ?ArtifactRef = null,
+    chunk_hits: []ChunkHit = &.{},
+    /// Highlighted fragments keyed by source field, present only when the
+    /// request asked for highlighting and the hit carried stored source.
+    highlights: []HighlightedField = &.{},
+
+    pub fn clone(self: SearchHit, alloc: Allocator) !SearchHit {
+        var cloned = SearchHit{ .id = try alloc.dupe(u8, self.id) };
+        errdefer {
+            alloc.free(cloned.id);
+            if (cloned.computed_json) |data| alloc.free(data);
+            if (cloned.source_table) |table| alloc.free(table);
+            if (cloned.score_details) |*details| details.deinit(alloc);
+            freeIndexScores(alloc, cloned.index_scores);
+            freeJsonValues(alloc, cloned.sort_values);
+            if (cloned.stored_data) |data| alloc.free(data);
+            if (cloned.source_value) |*value| deinitJsonValue(alloc, value);
+            if (cloned.ancestor_source_data) |data| alloc.free(data);
+            if (cloned.ancestor_unit_data) |data| alloc.free(data);
+            if (cloned.artifact_ref) |*artifact_ref| artifact_ref.deinit(alloc);
+            freeHighlights(alloc, cloned.highlights);
+        }
+        cloned.computed_json = if (self.computed_json) |data| try alloc.dupe(u8, data) else null;
+        cloned.source_table = if (self.source_table) |table| try alloc.dupe(u8, table) else null;
+        cloned.doc_ordinal = self.doc_ordinal;
+        cloned.native_text_doc_id = self.native_text_doc_id;
+        cloned.score = self.score;
+        cloned.score_details = if (self.score_details) |details| try details.clone(alloc) else null;
+        cloned.distance = self.distance;
+        cloned.index_scores = try cloneIndexScores(alloc, self.index_scores);
+        cloned.sort_values = try cloneJsonValues(alloc, self.sort_values);
+        cloned.stored_data = if (self.stored_data) |data| try alloc.dupe(u8, data) else null;
+        cloned.source_value = if (self.source_value) |value| try cloneJsonValue(alloc, value) else null;
+        cloned.ancestor_source_data = if (self.ancestor_source_data) |data| try alloc.dupe(u8, data) else null;
+        cloned.ancestor_unit_data = if (self.ancestor_unit_data) |data| try alloc.dupe(u8, data) else null;
+        cloned.artifact_ref = if (self.artifact_ref) |artifact_ref| try artifact_ref.clone(alloc) else null;
+        cloned.highlights = try cloneHighlights(alloc, self.highlights);
+
+        if (self.chunk_hits.len == 0) return cloned;
+
+        const chunk_hits = try alloc.alloc(ChunkHit, self.chunk_hits.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (chunk_hits[0..initialized]) |*chunk| chunk.deinit(alloc);
+            alloc.free(chunk_hits);
+        }
+        for (self.chunk_hits, 0..) |chunk, i| {
+            chunk_hits[i] = try chunk.clone(alloc);
+            initialized += 1;
+        }
+        cloned.chunk_hits = chunk_hits;
+        return cloned;
+    }
+
+    pub fn deinit(self: *SearchHit, alloc: Allocator) void {
+        alloc.free(self.id);
+        if (self.computed_json) |data| alloc.free(data);
+        if (self.source_table) |table| alloc.free(table);
+        if (self.score_details) |*details| details.deinit(alloc);
+        freeIndexScores(alloc, self.index_scores);
+        freeJsonValues(alloc, self.sort_values);
+        if (self.stored_data) |data| alloc.free(data);
+        if (self.source_value) |*value| deinitJsonValue(alloc, value);
+        if (self.ancestor_source_data) |data| alloc.free(data);
+        if (self.ancestor_unit_data) |data| alloc.free(data);
+        if (self.artifact_ref) |*artifact_ref| artifact_ref.deinit(alloc);
+        for (self.chunk_hits) |*chunk| chunk.deinit(alloc);
+        if (self.chunk_hits.len > 0) alloc.free(self.chunk_hits);
+        freeHighlights(alloc, self.highlights);
+        self.* = undefined;
+    }
+};
+
+pub fn cloneOwnedByteSlices(alloc: Allocator, values: []const []const u8) ![]const []u8 {
+    if (values.len == 0) return &.{};
+    const cloned = try alloc.alloc([]u8, values.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (cloned[0..initialized]) |value| alloc.free(value);
+        alloc.free(cloned);
+    }
+    for (values, 0..) |value, i| {
+        cloned[i] = try alloc.dupe(u8, value);
+        initialized += 1;
+    }
+    return cloned;
+}
+
+pub fn freeOwnedByteSlices(alloc: Allocator, values: []const []u8) void {
+    for (values) |value| alloc.free(value);
+    if (values.len > 0) alloc.free(values);
+}
+
+pub fn cloneJsonValue(alloc: Allocator, value: std.json.Value) !std.json.Value {
+    return switch (value) {
+        .null, .bool, .integer, .float => value,
+        .number_string => |text| .{ .number_string = try alloc.dupe(u8, text) },
+        .string => |text| .{ .string = try alloc.dupe(u8, text) },
+        .array => |arr| blk: {
+            var cloned = std.json.Array.init(alloc);
+            errdefer {
+                for (cloned.items) |*item| deinitJsonValue(alloc, item);
+                cloned.deinit();
+            }
+            for (arr.items) |item| {
+                var cloned_item = try cloneJsonValue(alloc, item);
+                errdefer deinitJsonValue(alloc, &cloned_item);
+                try cloned.append(cloned_item);
+            }
+            break :blk .{ .array = cloned };
+        },
+        .object => |obj| blk: {
+            var cloned = std.json.ObjectMap.empty;
+            errdefer {
+                var it = cloned.iterator();
+                while (it.next()) |entry| {
+                    alloc.free(@constCast(entry.key_ptr.*));
+                    deinitJsonValue(alloc, entry.value_ptr);
+                }
+                cloned.deinit(alloc);
+            }
+            var it = obj.iterator();
+            while (it.next()) |entry| {
+                const key = try alloc.dupe(u8, entry.key_ptr.*);
+                errdefer alloc.free(key);
+                var cloned_value = try cloneJsonValue(alloc, entry.value_ptr.*);
+                errdefer deinitJsonValue(alloc, &cloned_value);
+                try cloned.put(alloc, key, cloned_value);
+            }
+            break :blk .{ .object = cloned };
+        },
+    };
+}
+
+pub fn deinitJsonValue(alloc: Allocator, value: *std.json.Value) void {
+    switch (value.*) {
+        .string, .number_string => |text| alloc.free(text),
+        .array => |*arr| {
+            for (arr.items) |*item| deinitJsonValue(alloc, item);
+            arr.deinit();
+        },
+        .object => |*obj| {
+            var it = obj.iterator();
+            while (it.next()) |entry| {
+                alloc.free(@constCast(entry.key_ptr.*));
+                deinitJsonValue(alloc, entry.value_ptr);
+            }
+            obj.deinit(alloc);
+        },
+        else => {},
+    }
+    value.* = .null;
+}
+
+pub fn cloneJsonValues(alloc: Allocator, values: []const std.json.Value) ![]std.json.Value {
+    if (values.len == 0) return &.{};
+    const cloned = try alloc.alloc(std.json.Value, values.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (cloned[0..initialized]) |*value| deinitJsonValue(alloc, value);
+        alloc.free(cloned);
+    }
+    for (values, 0..) |value, i| {
+        cloned[i] = try cloneJsonValue(alloc, value);
+        initialized += 1;
+    }
+    return cloned;
+}
+
+pub fn freeJsonValues(alloc: Allocator, values: []std.json.Value) void {
+    for (values) |*value| deinitJsonValue(alloc, value);
+    if (values.len > 0) alloc.free(values);
+}
+
+pub fn cloneIndexScores(alloc: Allocator, scores: []const fusion_mod.IndexScore) ![]fusion_mod.IndexScore {
+    if (scores.len == 0) return &.{};
+    const cloned = try alloc.alloc(fusion_mod.IndexScore, scores.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (cloned[0..initialized]) |score| alloc.free(score.index_name);
+        alloc.free(cloned);
+    }
+    for (scores, 0..) |score, i| {
+        cloned[i] = .{
+            .index_name = try alloc.dupe(u8, score.index_name),
+            .score = score.score,
+        };
+        initialized += 1;
+    }
+    return cloned;
+}
+
+pub fn freeIndexScores(alloc: Allocator, scores: []fusion_mod.IndexScore) void {
+    for (scores) |score| alloc.free(score.index_name);
+    if (scores.len > 0) alloc.free(scores);
+}
+
+pub const ChunkHit = struct {
+    id: []u8,
+    score: ?f32 = null,
+    distance: ?f32 = null,
+    stored_data: ?[]u8 = null,
+    ancestor_source_data: ?[]u8 = null,
+    ancestor_unit_data: ?[]u8 = null,
+    artifact_ref: ?ArtifactRef = null,
+
+    pub fn clone(self: ChunkHit, alloc: Allocator) !ChunkHit {
+        var cloned: ChunkHit = .{ .id = try alloc.dupe(u8, self.id) };
+        errdefer cloned.deinit(alloc);
+        cloned.score = self.score;
+        cloned.distance = self.distance;
+        cloned.stored_data = if (self.stored_data) |data| try alloc.dupe(u8, data) else null;
+        cloned.ancestor_source_data = if (self.ancestor_source_data) |data| try alloc.dupe(u8, data) else null;
+        cloned.ancestor_unit_data = if (self.ancestor_unit_data) |data| try alloc.dupe(u8, data) else null;
+        cloned.artifact_ref = if (self.artifact_ref) |artifact_ref| try artifact_ref.clone(alloc) else null;
+        return cloned;
+    }
+
+    pub fn deinit(self: *ChunkHit, alloc: Allocator) void {
+        alloc.free(self.id);
+        if (self.stored_data) |data| alloc.free(data);
+        if (self.ancestor_source_data) |data| alloc.free(data);
+        if (self.ancestor_unit_data) |data| alloc.free(data);
+        if (self.artifact_ref) |*artifact_ref| artifact_ref.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+pub const TotalHitsRelation = enum {
+    exact,
+    gte,
+};
+
+pub const SortProfileField = struct {
+    bytes: [256]u8 = undefined,
+    len: u16 = 0,
+
+    pub fn init(value: []const u8) SortProfileField {
+        var out = SortProfileField{};
+        out.set(value);
+        return out;
+    }
+
+    pub fn set(self: *SortProfileField, value: []const u8) void {
+        const value_len = @min(value.len, self.bytes.len);
+        if (value_len > 0) @memcpy(self.bytes[0..value_len], value[0..value_len]);
+        self.len = @intCast(value_len);
+    }
+
+    pub fn slice(self: *const SortProfileField) []const u8 {
+        return self.bytes[0..self.len];
+    }
+};
+
+pub const SortProfile = struct {
+    plan: []const u8 = "",
+    exactness: []const u8 = "",
+    source: []const u8 = "",
+    candidate_source: []const u8 = "none",
+    cursor_support: []const u8 = "",
+    source_load: []const u8 = "",
+    distributed_behavior: []const u8 = "",
+    selection_reason: []const u8 = "",
+    require_native: bool = false,
+    native_loader: bool = false,
+    sort_lifecycle_state: []const u8 = "",
+    native_filter_mode: []const u8 = "none",
+    native_filter_candidate_count: u64 = 0,
+    native_filter_exclusion_count: u64 = 0,
+    selective_filter_doc_values_preferred: bool = false,
+    cost_model_live_docs: u64 = 0,
+    cost_model_candidate_count: u64 = 0,
+    cost_model_selective_limit: u64 = 0,
+    native_doc_values_coverage: []const u8 = "",
+    index_sort_coverage: []const u8 = "",
+    index_sort_match: bool = false,
+    sorted_segment_executor_available: bool = false,
+    sorted_segment_bounds_available: bool = false,
+    sorted_segment_scanned_count: u64 = 0,
+    sorted_segment_scan_budget: u64 = 0,
+    candidate_count: u64 = 0,
+    cursor_rejected_count: u64 = 0,
+    admitted_count: u64 = 0,
+    replaced_count: u64 = 0,
+    discarded_count: u64 = 0,
+    selected_count: u64 = 0,
+    decorate_us: u64 = 0,
+    native_doc_value_load_us: u64 = 0,
+    native_doc_value_hit_count: u64 = 0,
+    native_doc_value_miss_count: u64 = 0,
+    stored_json_load_us: u64 = 0,
+    stored_json_load_count: u64 = 0,
+    projected_source_load_us: u64 = 0,
+    projected_source_load_count: u64 = 0,
+    final_sort_us: u64 = 0,
+    total_us: u64 = 0,
+    window_capacity: usize = 0,
+    window_len: usize = 0,
+    collector_heap_peak: usize = 0,
+    distributed_shard_count: usize = 0,
+    distributed_shard_window: usize = 0,
+    budget_rejection_reason: []const u8 = "",
+    sort_rejection_reason: []const u8 = "",
+    sort_rejection_detail: []const u8 = "",
+    sort_rejection_field: SortProfileField = .{},
+};
+
+pub const ShardIdentityReadGeneration = struct {
+    group_id: u64,
+    generation: u64,
+};
+
+pub const SearchResult = struct {
+    alloc: Allocator,
+    hits: []SearchHit,
+    total_hits: u32,
+    total_hits_relation: TotalHitsRelation = .exact,
+    identity_read_generation: ?u64 = null,
+    /// Snapshot vector for a distributed result. Shard generations are
+    /// independent, so a multi-shard replay must use these tokens rather than
+    /// relying on `identity_read_generation` being globally common.
+    shard_identity_read_generations: []ShardIdentityReadGeneration = &.{},
+    sort_profile: ?SortProfile = null,
+    /// Decoded profiles own their strings here. Native profiles borrow static
+    /// labels; both representations follow the SearchResult's move lifetime.
+    sort_profile_storage: ?[]u8 = null,
+    graph_results: []GraphSearchResult = &.{},
+    graph_metric_results: []GraphMetricResult = &.{},
+    graph_metric_rerank_status: ?GraphMetricStatus = null,
+
+    /// Clone all profile strings in one allocation. Reflection keeps future
+    /// string fields in the ownership contract without a second field list.
+    pub fn setOwnedSortProfile(self: *SearchResult, profile: SortProfile) !void {
+        var length: usize = 0;
+        inline for (@typeInfo(SortProfile).@"struct".field_names, @typeInfo(SortProfile).@"struct".field_types) |reflected_name, field_type| {
+            if (field_type == []const u8) length = try std.math.add(usize, length, @field(profile, reflected_name).len);
+        }
+        const storage = try self.alloc.alloc(u8, length);
+        var owned = profile;
+        var offset: usize = 0;
+        inline for (@typeInfo(SortProfile).@"struct".field_names, @typeInfo(SortProfile).@"struct".field_types) |reflected_name, field_type| {
+            if (field_type == []const u8) {
+                const value = @field(profile, reflected_name);
+                @memcpy(storage[offset..][0..value.len], value);
+                @field(owned, reflected_name) = storage[offset..][0..value.len];
+                offset += value.len;
+            }
+        }
+        if (self.sort_profile_storage) |previous| self.alloc.free(previous);
+        self.sort_profile_storage = storage;
+        self.sort_profile = owned;
+    }
+
+    pub fn deinit(self: *SearchResult) void {
+        if (self.sort_profile_storage) |storage| self.alloc.free(storage);
+        for (self.hits) |*hit| hit.deinit(self.alloc);
+        if (self.hits.len > 0) self.alloc.free(self.hits);
+        for (self.graph_results) |*graph_result| graph_result.deinit(self.alloc);
+        if (self.graph_results.len > 0) self.alloc.free(self.graph_results);
+        for (self.graph_metric_results) |*metric_result| metric_result.deinit(self.alloc);
+        if (self.graph_metric_results.len > 0) self.alloc.free(self.graph_metric_results);
+        if (self.graph_metric_rerank_status) |*status| status.deinit(self.alloc);
+        if (self.shard_identity_read_generations.len > 0) self.alloc.free(self.shard_identity_read_generations);
+        self.* = undefined;
+    }
+};
+
+pub const GraphMetricScore = struct {
+    node: []u8,
+    score: f64,
+
+    pub fn deinit(self: *GraphMetricScore, alloc: Allocator) void {
+        alloc.free(self.node);
+        self.* = undefined;
+    }
+};
+
+pub const GraphMetricResult = struct {
+    name: []u8,
+    index_name: []u8,
+    metric_name: []u8,
+    scores: []GraphMetricScore,
+    status: GraphMetricStatus,
+
+    pub fn deinit(self: *GraphMetricResult, alloc: Allocator) void {
+        alloc.free(self.name);
+        alloc.free(self.index_name);
+        alloc.free(self.metric_name);
+        for (self.scores) |*score| score.deinit(alloc);
+        if (self.scores.len > 0) alloc.free(self.scores);
+        self.status.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+pub const GraphSearchResult = struct {
+    name: []u8,
+    nodes: []graph_query_mod.GraphResultNode = &.{},
+    metric_values_slab: []graph_query_mod.GraphMetricValue = &.{},
+    metric_value_names: [][]u8 = &.{},
+    paths: []GraphPath = &.{},
+    matches: []GraphPatternMatch = &.{},
+    aggregates: []GraphAggregateResult = &.{},
+    hits: []SearchHit,
+    total_hits: u32,
+    metric_status: []GraphMetricStatus = &.{},
+    truncated: bool = false,
+
+    /// Borrowed dependency view: inference collection must not enlarge the
+    /// graph relation seen by subsequent named operations. Only the slice
+    /// containers belong to scratch; never deinit this view as an owned result.
+    pub fn dependencyView(self: GraphSearchResult, scratch: Allocator, limit: ?u32, source_table: []const u8) !GraphSearchResult {
+        const maximum = limit orelse return self;
+        if (self.matches.len <= maximum) return self;
+        var view = self;
+        view.matches = self.matches[0..maximum];
+        view.truncated = true;
+        var hits: std.ArrayList(SearchHit) = .empty;
+        for (self.hits) |hit| {
+            var included = false;
+            for (view.matches) |match| for (match.bindings) |binding| {
+                if (std.mem.eql(u8, hit.id, binding.node.key) and std.mem.eql(u8, hit.source_table orelse source_table, binding.node.table orelse source_table)) included = true;
+            };
+            if (included) try hits.append(scratch, hit);
+        }
+        view.hits = hits.items;
+        return view;
+    }
+
+    /// Detach request-scoped retained-state release hooks at the result
+    /// ownership boundary. The request budget remains consumptively charged,
+    /// while result deinit continues to own and free the allocations.
+    pub fn consumeRetainedState(self: *GraphSearchResult) void {
+        for (self.paths) |*path| path.consumeRetainedState();
+    }
+
+    pub fn deinit(self: *GraphSearchResult, alloc: Allocator) void {
+        alloc.free(self.name);
+        for (self.nodes) |*node| node.deinit(alloc);
+        if (self.nodes.len > 0) alloc.free(self.nodes);
+        if (self.metric_values_slab.len > 0) alloc.free(self.metric_values_slab);
+        for (self.metric_value_names) |name| alloc.free(name);
+        if (self.metric_value_names.len > 0) alloc.free(self.metric_value_names);
+        for (self.paths) |path| paths_mod.freePath(alloc, path);
+        if (self.paths.len > 0) alloc.free(self.paths);
+        for (self.matches) |*match| match.deinit(alloc);
+        if (self.matches.len > 0) alloc.free(self.matches);
+        for (self.aggregates) |*aggregate| aggregate.deinit(alloc);
+        if (self.aggregates.len > 0) alloc.free(self.aggregates);
+        for (self.hits) |*hit| hit.deinit(alloc);
+        if (self.hits.len > 0) alloc.free(self.hits);
+        freeGraphMetricStatuses(alloc, self.metric_status);
+        self.* = undefined;
+    }
+};
+
+pub const GraphMetricStatus = struct {
+    name: []u8,
+    state: graph_mod.GraphIndex.GraphMetricState = .not_ready,
+    phase: graph_mod.GraphIndex.GraphMetricBuildPhase = .idle,
+    edge_filter: graph_mod.GraphMetricEdgeFilter = .{},
+    metadata_version: u32 = 0,
+    config_fingerprint: u64 = 0,
+    maintenance_paused: bool = false,
+    build_queued: bool = false,
+    published_generation: u64 = 0,
+    edge_generation: u64 = 0,
+    target_edge_generation: u64 = 0,
+    queued_generation: u64 = 0,
+    building_generation: u64 = 0,
+    build_job_id: u64 = 0,
+    build_started_at_ms: u64 = 0,
+    build_iteration: u32 = 0,
+    build_lease_expires_at_ms: u64 = 0,
+    build_worker_id: []const u8 = "",
+    build_cursor: []const u8 = "",
+    build_completed_units: u64 = 0,
+    build_total_units: u64 = 0,
+    build_pages: []GraphMetricBuildPageStatus = &.{},
+    build_pages_truncated: bool = false,
+    retry_count: u64 = 0,
+    last_error: []const u8 = "",
+    progress: f64 = 0.0,
+    converged: bool = false,
+    iterations_completed: u32 = 0,
+    delta: f64 = 0.0,
+    computed_at_ms: u64 = 0,
+    last_event: ?graph_mod.GraphIndex.GraphMetricEvent = null,
+    recent_events: []graph_mod.GraphIndex.GraphMetricEvent = &.{},
+
+    pub fn cloneAlloc(self: GraphMetricStatus, alloc: Allocator) !GraphMetricStatus {
+        var out = self;
+        out.name = try alloc.dupe(u8, self.name);
+        out.edge_filter = .{};
+        out.build_worker_id = "";
+        out.build_cursor = "";
+        out.build_pages = &.{};
+        out.last_error = "";
+        out.recent_events = &.{};
+        errdefer out.deinit(alloc);
+        out.edge_filter = try self.edge_filter.cloneAlloc(alloc);
+        out.build_worker_id = try alloc.dupe(u8, self.build_worker_id);
+        out.build_cursor = try alloc.dupe(u8, self.build_cursor);
+        out.last_error = try alloc.dupe(u8, self.last_error);
+        out.recent_events = try alloc.dupe(graph_mod.GraphIndex.GraphMetricEvent, self.recent_events);
+        out.build_pages = try cloneGraphMetricBuildPageStatuses(alloc, self.build_pages);
+        return out;
+    }
+
+    pub fn deinit(self: *GraphMetricStatus, alloc: Allocator) void {
+        alloc.free(self.name);
+        self.edge_filter.deinit(alloc);
+        if (self.build_worker_id.len > 0) alloc.free(self.build_worker_id);
+        if (self.build_cursor.len > 0) alloc.free(self.build_cursor);
+        for (self.build_pages) |*page| page.deinit(alloc);
+        if (self.build_pages.len > 0) alloc.free(self.build_pages);
+        if (self.last_error.len > 0) alloc.free(self.last_error);
+        if (self.recent_events.len > 0) alloc.free(self.recent_events);
+        self.* = undefined;
+    }
+};
+
+pub const GraphMetricBuildPageStatus = struct {
+    phase: graph_mod.GraphIndex.GraphMetricBuildPhase = .idle,
+    iteration: u32 = 0,
+    page_id: u64 = 0,
+    state: graph_mod.GraphIndex.GraphMetricBuildPageState = .pending,
+    range_kind: graph_mod.GraphIndex.GraphMetricBuildPageRangeKind = .full,
+    worker_id: []const u8 = "",
+    lease_expires_at_ms: u64 = 0,
+    attempt: u64 = 0,
+    cursor: []const u8 = "",
+    completed_units: u64 = 0,
+    total_units: u64 = 0,
+    last_error: []const u8 = "",
+
+    pub fn deinit(self: *GraphMetricBuildPageStatus, alloc: Allocator) void {
+        if (self.worker_id.len > 0) alloc.free(self.worker_id);
+        if (self.cursor.len > 0) alloc.free(self.cursor);
+        if (self.last_error.len > 0) alloc.free(self.last_error);
+        self.* = undefined;
+    }
+};
+
+pub fn freeGraphMetricStatuses(alloc: Allocator, statuses: []GraphMetricStatus) void {
+    for (statuses) |*status| status.deinit(alloc);
+    if (statuses.len > 0) alloc.free(statuses);
+}
+
+pub fn cloneGraphMetricStatuses(alloc: Allocator, statuses: []const GraphMetricStatus) ![]GraphMetricStatus {
+    const out = try alloc.alloc(GraphMetricStatus, statuses.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |*status| status.deinit(alloc);
+        alloc.free(out);
+    }
+    for (statuses, 0..) |status, i| {
+        out[i] = try status.cloneAlloc(alloc);
+        initialized += 1;
+    }
+    return out;
+}
+
+pub fn cloneGraphMetricBuildPageStatuses(alloc: Allocator, source: []const GraphMetricBuildPageStatus) ![]GraphMetricBuildPageStatus {
+    const out = try alloc.alloc(GraphMetricBuildPageStatus, source.len);
+    for (out) |*page| page.* = .{};
+    errdefer {
+        for (out) |*page| page.deinit(alloc);
+        alloc.free(out);
+    }
+    for (source, out) |original, *page| {
+        page.* = original;
+        page.worker_id = "";
+        page.cursor = "";
+        page.last_error = "";
+        page.worker_id = try alloc.dupe(u8, original.worker_id);
+        page.cursor = try alloc.dupe(u8, original.cursor);
+        page.last_error = try alloc.dupe(u8, original.last_error);
+    }
+    return out;
+}
+pub const GraphAggregateResult = struct {
+    name: []u8,
+    value: u128,
+    exact: bool = true,
+    /// Exact shard-merge payload for count(distinct alias). This is internal
+    /// execution data and is never exposed by the public response contract.
+    distinct_values: []graph_node_identity.Ref = &.{},
+    /// Duplicate named aggregates may share one immutable merge payload inside
+    /// a result. Exactly one aggregate owns that allocation.
+    distinct_values_owned: bool = true,
+
+    pub fn deinit(self: *GraphAggregateResult, alloc: Allocator) void {
+        alloc.free(self.name);
+        if (self.distinct_values_owned) {
+            for (self.distinct_values) |value| {
+                if (value.table) |table| alloc.free(table);
+                alloc.free(value.key);
+            }
+            if (self.distinct_values.len > 0) alloc.free(self.distinct_values);
+        }
+        self.* = undefined;
+    }
+};
+
+pub const GraphPatternBinding = struct {
+    alias: []u8,
+    node: graph_query_mod.GraphResultNode,
+
+    pub fn deinit(self: *GraphPatternBinding, alloc: Allocator) void {
+        alloc.free(self.alias);
+        self.node.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+pub const GraphPatternMatch = struct {
+    computed_json: ?[]u8 = null,
+    bindings: []GraphPatternBinding,
+    path: []graph_query_mod.PathEdgeInfo,
+    null_aliases: [][]u8 = &.{},
+
+    pub fn deinit(self: *GraphPatternMatch, alloc: Allocator) void {
+        if (self.computed_json) |bytes| alloc.free(bytes);
+        for (self.bindings) |*binding| binding.deinit(alloc);
+        if (self.bindings.len > 0) alloc.free(self.bindings);
+        for (self.path) |edge| {
+            alloc.free(edge.source);
+            alloc.free(edge.target);
+            alloc.free(edge.edge_type);
+            if (edge.metadata.len > 0) alloc.free(edge.metadata);
+        }
+        if (self.path.len > 0) alloc.free(self.path);
+        for (self.null_aliases) |alias| alloc.free(alias);
+        if (self.null_aliases.len > 0) alloc.free(self.null_aliases);
+        self.* = undefined;
+    }
+};
+
+pub const TTLCleanupStats = struct {
+    enabled: bool = false,
+    lease_owned: bool = false,
+    has_lease: bool = false,
+    acquisition_count: u64 = 0,
+    runs: u64 = 0,
+    scanned_timestamps: u64 = 0,
+    deleted_docs: u64 = 0,
+    scanned_graph_candidates: u64 = 0,
+    expired_graph_sources: u64 = 0,
+    expired_graph_artifacts: u64 = 0,
+    last_run_ns: u64 = 0,
+    error_count: u64 = 0,
+    lease_acquire_failures: u64 = 0,
+    lost_leases: u64 = 0,
+    last_acquired_ms: u64 = 0,
+};
+
+pub fn InlineStatusText(comptime capacity: usize) type {
+    return struct {
+        bytes: [capacity]u8 = @as([capacity]u8, @splat(0)),
+        len: u16 = 0,
+
+        pub fn init(value: []const u8) @This() {
+            var result: @This() = .{};
+            const copy_len = @min(value.len, capacity);
+            @memcpy(result.bytes[0..copy_len], value[0..copy_len]);
+            result.len = @intCast(copy_len);
+            return result;
+        }
+
+        pub fn slice(self: *const @This()) []const u8 {
+            return self.bytes[0..self.len];
+        }
+
+        pub fn jsonStringify(self: @This(), jw: anytype) !void {
+            try jw.write(self.slice());
+        }
+
+        pub fn jsonParse(alloc: Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+            const value = try std.json.innerParse([]const u8, alloc, source, options);
+            if (value.len > capacity) return error.Overflow;
+            return init(value);
+        }
+    };
+}
+
+pub const EnrichmentActiveModel = InlineStatusText(256);
+pub const EnrichmentActiveBackend = InlineStatusText(32);
+
+pub const EnrichmentStats = struct {
+    enabled: bool = false,
+    lease_owned: bool = true,
+    has_lease: bool = false,
+    acquisition_count: u64 = 0,
+    lease_acquire_failures: u64 = 0,
+    lost_leases: u64 = 0,
+    last_acquired_ms: u64 = 0,
+    target_sequence: u64 = 0,
+    applied_sequence: u64 = 0,
+    projection_checkpoint_status: []const u8 = "clean",
+    projection_checkpoint_applied_sequence: u64 = 0,
+    projection_checkpoint_generation: u64 = 0,
+    projection_checkpoint_config_hash: u64 = 0,
+    projection_checkpoint_identity_consistent: bool = true,
+    checkpoint_replay_tail_sequence_count: u64 = 0,
+    processed_requests: u64 = 0,
+    error_count: u64 = 0,
+    retryable_error_count: u64 = 0,
+    /// Durable count of requests parked with a terminal (non-retryable)
+    /// disposition plus fatal worker failures — despite the name, this is
+    /// NOT only worker deaths. A terminally parked request never returns to
+    /// pending; per-document terminal state lives in the derived-coverage
+    /// counters (DBIndexStats.coverage_terminal_failed_count) and the
+    /// artifact repair ledger.
+    fatal_error_count: u64 = 0,
+    consecutive_retry_count: u32 = 0,
+    next_retry_at_ms: u64 = 0,
+    retrying: bool = false,
+    worker_failed: bool = false,
+    worker_started: bool = false,
+    stalled: bool = false,
+    stall_reason: []const u8 = "",
+    active_phase: []const u8 = "idle",
+    active_model: EnrichmentActiveModel = .{},
+    active_backend: EnrichmentActiveBackend = .{},
+    active_deadline_ms: u64 = 0,
+    last_progress_ms: u64 = 0,
+    active_progress_completed: u64 = 0,
+    active_progress_total: u64 = 0,
+    inference_timeout_count: u64 = 0,
+    inference_cancel_count: u64 = 0,
+    skip_by_hash_count: u64 = 0,
+    skipped_source_count: u64 = 0,
+    codec_decode_failures: u64 = 0,
+    embed_batches_started: u64 = 0,
+    embed_batches_completed: u64 = 0,
+    embed_items_started: u64 = 0,
+    embed_items_completed: u64 = 0,
+    active_embed_batch_items: u64 = 0,
+    active_embed_batch_bytes: u64 = 0,
+    active_embed_batch_max_bytes: u64 = 0,
+    active_embed_batch_started_ms: u64 = 0,
+    last_embed_batch_items: u64 = 0,
+    last_embed_batch_bytes: u64 = 0,
+    last_embed_batch_max_bytes: u64 = 0,
+    last_embed_batch_completed_ms: u64 = 0,
+    last_embed_batch_ns: u64 = 0,
+    total_embed_ns: u64 = 0,
+    dense_artifact_bytes_written: u64 = 0,
+    sparse_artifact_bytes_written: u64 = 0,
+    chunk_artifact_bytes_written: u64 = 0,
+    artifact_bytes_written: u64 = 0,
+};
+
+/// Volatile, incarnation-scoped work counters for one embeddings index. These
+/// counters never participate in readiness; they let status clients explain
+/// active generation between durable publication checkpoints. `epoch` changes
+/// whenever the owning enrichment runtime is recreated.
+pub const EmbeddingActivityPhase = enum {
+    idle,
+    preparing,
+    embedding,
+    publishing,
+    waiting_retry,
+};
+
+/// Owner activity is emitted every 30 seconds while idle. Retain two missed
+/// heartbeats plus scheduling jitter so a contended best-effort status read
+/// does not turn a live worker into `unavailable`.
+pub const embedding_activity_retention_ms: u64 = 90 * std.time.ms_per_s;
+
+pub const EmbeddingActivityStats = struct {
+    epoch: u64 = 0,
+    // Monotonic within `epoch` and incremented for every phase/counter change.
+    // This orders volatile samples independently from durable status snapshots.
+    sample_sequence: u64 = 0,
+    // Internal incarnation fence. API encoders omit internal fence fields.
+    index_generation: u64 = 0,
+    // Internal ownership fence. A failed supervised provider batch records
+    // its exact failure identity here; only the worker supervisor may promote
+    // that candidate to the public `retrying` state.
+    retry_fingerprint: u64 = 0,
+    // Exact, component-owned in-flight scopes. These are local aggregation
+    // inputs, not public counters: clients see only `effectivePhase()`.
+    active_preparations: u64 = 0,
+    active_publications: u64 = 0,
+    // A status received from another runtime is already an owner-derived
+    // observation. Local owners leave this null and expose their exact scopes;
+    // transport adapters set it so counters cannot reinterpret that phase.
+    reported_phase: ?EmbeddingActivityPhase = null,
+    chunks_created: u64 = 0,
+    embedding_batches_completed: u64 = 0,
+    embeddings_computed: u64 = 0,
+    active_batch_size: u64 = 0,
+    retrying: bool = false,
+    last_progress_at_ms: u64 = 0,
+    pub fn effectivePhase(self: @This()) EmbeddingActivityPhase {
+        if (self.reported_phase) |phase| return phase;
+        if (self.retrying) return .waiting_retry;
+        if (self.active_batch_size != 0) return .embedding;
+        if (self.active_publications != 0) return .publishing;
+        if (self.active_preparations != 0) return .preparing;
+        return .idle;
+    }
+};
+
+pub const ReplayStageStats = struct {
+    enabled: bool = false,
+    target_sequence: u64 = 0,
+    applied_sequence: u64 = 0,
+    catch_up_required: bool = false,
+    blocked: bool = false,
+    blocked_reason: []const u8 = "",
+    error_count: u64 = 0,
+};
+
+pub const ResolverReplayDiagnostic = struct {
+    name: []const u8 = "",
+    table: []const u8 = "",
+    source_artifact: []const u8 = "",
+    resolution_artifact: []const u8 = "",
+};
+
+pub const ResolverReplayDiagnostics = struct {
+    resolver_count: u64 = 0,
+    resolution_runtime_present: bool = false,
+    resolution_worker_started: bool = false,
+    promotion_runtime_present: bool = false,
+    promotion_worker_started: bool = false,
+    resolvers: []const ResolverReplayDiagnostic = &.{},
+};
+
+pub const TransactionRecoveryStats = struct {
+    enabled: bool = false,
+    lease_owned: bool = false,
+    has_lease: bool = false,
+    acquisition_count: u64 = 0,
+    lease_acquire_failures: u64 = 0,
+    lost_leases: u64 = 0,
+    last_acquired_ms: u64 = 0,
+    runs: u64 = 0,
+    scanned_records: u64 = 0,
+    auto_aborted: u64 = 0,
+    resolved_finalized: u64 = 0,
+    cleaned_records: u64 = 0,
+    kept_recent_pending: u64 = 0,
+    deferred_unresolved: u64 = 0,
+    notification_attempts: u64 = 0,
+    notification_successes: u64 = 0,
+    notification_failures: u64 = 0,
+    last_run_ns: u64 = 0,
+    error_count: u64 = 0,
+};
+
+// Error identifiers cross the storage ABI and survive allocation-free cache merges.
+// Keep their bytes in the value, as for enrichment model/backend diagnostics.
+// JSON decoding rejects identifiers exceeding the wire bound.
+pub const RuntimeErrorName = InlineStatusText(256);
+
+pub const TextMergeStats = struct {
+    enabled: bool = false,
+    active_indexes: u64 = 0,
+    active_segments: u64 = 0,
+    max_active_segments_per_index: u64 = 0,
+    pending_indexes: u64 = 0,
+    pending_segments: u64 = 0,
+    pending_bytes: u64 = 0,
+    pending_heap_bytes: u64 = 0,
+    pending_mmap_bytes: u64 = 0,
+    in_flight_merges: u64 = 0,
+    in_flight_segments: u64 = 0,
+    completed_merges: u64 = 0,
+    skipped_stale_merges: u64 = 0,
+    failed_merges: u64 = 0,
+    merge_input_segments_total: u64 = 0,
+    merge_input_bytes_total: u64 = 0,
+    merge_output_segments_total: u64 = 0,
+    merge_output_bytes_total: u64 = 0,
+    merge_elapsed_ns_total: u64 = 0,
+    merge_peak_task_alloc_bytes: u64 = 0,
+    last_merge_input_segments: u64 = 0,
+    last_merge_input_bytes: u64 = 0,
+    last_merge_output_segments: u64 = 0,
+    last_merge_output_bytes: u64 = 0,
+    last_merge_elapsed_ns: u64 = 0,
+    last_merge_peak_task_alloc_bytes: u64 = 0,
+    quarantined_merges: u64 = 0,
+    quarantined_segments: u64 = 0,
+    last_merge_error: RuntimeErrorName = .{},
+    retry_after_ns: u64 = 0,
+    deferred_for_pressure: u64 = 0,
+    forced_drains: u64 = 0,
+    backpressure_events: u64 = 0,
+    backpressure_ns: u64 = 0,
+    backpressure_timeouts: u64 = 0,
+    backpressure_failures: u64 = 0,
+    max_pending_segments: u64 = 0,
+    max_pending_bytes: u64 = 0,
+};
+
+pub const GraphMetricRuntimeRole = enum {
+    combined,
+    coordinator,
+    worker,
+    worker_pool,
+};
+
+pub const GraphMetricRuntimeStats = struct {
+    enabled: bool = false,
+    role: ?GraphMetricRuntimeRole = null,
+    runtime_id_hash: u64 = 0,
+    owner_id_hash: u64 = 0,
+    lease_key_hash: u64 = 0,
+    worker_id_hash: u64 = 0,
+    worker_count: u64 = 0,
+    lease_owned: bool = false,
+    has_lease: bool = false,
+    acquisition_count: u64 = 0,
+    takeover_count: u64 = 0,
+    lease_acquire_failures: u64 = 0,
+    lost_leases: u64 = 0,
+    last_acquired_ms: u64 = 0,
+    lease_expires_at_ms: u64 = 0,
+    lease_renew_after_ms: u64 = 0,
+    renewal_count: u64 = 0,
+    started: bool = false,
+    shutdown: bool = false,
+    notified: bool = false,
+    ticks_started: u64 = 0,
+    ticks_completed: u64 = 0,
+    durable_progress_ticks: u64 = 0,
+    idle_ticks: u64 = 0,
+    error_ticks: u64 = 0,
+    last_error_name: ?RuntimeErrorName = null,
+    total_metrics_scanned: u64 = 0,
+    total_active_builds: u64 = 0,
+    total_builds_started: u64 = 0,
+    total_worker_steps: u64 = 0,
+    total_coordinator_steps: u64 = 0,
+    total_retired_input_records: u64 = 0,
+    total_pages_claimed: u64 = 0,
+    total_pages_completed: u64 = 0,
+    total_phases_advanced: u64 = 0,
+    total_published: u64 = 0,
+    total_failed_builds: u64 = 0,
+    last_metrics_scanned: u64 = 0,
+    last_active_builds: u64 = 0,
+    last_builds_started: u64 = 0,
+    last_worker_steps: u64 = 0,
+    last_coordinator_steps: u64 = 0,
+    last_retired_input_records: u64 = 0,
+    last_pages_claimed: u64 = 0,
+    last_pages_completed: u64 = 0,
+    last_phases_advanced: u64 = 0,
+    last_published: u64 = 0,
+    last_failed_builds: u64 = 0,
+    last_budget_exhausted: bool = false,
+
+    pub fn hasRuntimeFacts(self: @This()) bool {
+        return self.enabled or
+            self.role != null or
+            self.runtime_id_hash != 0 or
+            self.owner_id_hash != 0 or
+            self.lease_key_hash != 0 or
+            self.worker_id_hash != 0 or
+            self.worker_count != 0 or
+            self.lease_owned or
+            self.has_lease or
+            self.acquisition_count != 0 or
+            self.takeover_count != 0 or
+            self.lease_acquire_failures != 0 or
+            self.lost_leases != 0 or
+            self.last_acquired_ms != 0 or
+            self.lease_expires_at_ms != 0 or
+            self.lease_renew_after_ms != 0 or
+            self.renewal_count != 0 or
+            self.started or
+            self.shutdown or
+            self.notified or
+            self.ticks_started != 0 or
+            self.ticks_completed != 0 or
+            self.durable_progress_ticks != 0 or
+            self.idle_ticks != 0 or
+            self.error_ticks != 0 or
+            self.last_error_name != null or
+            self.total_metrics_scanned != 0 or
+            self.total_active_builds != 0 or
+            self.total_builds_started != 0 or
+            self.total_worker_steps != 0 or
+            self.total_coordinator_steps != 0 or
+            self.total_retired_input_records != 0 or
+            self.total_pages_claimed != 0 or
+            self.total_pages_completed != 0 or
+            self.total_phases_advanced != 0 or
+            self.total_published != 0 or
+            self.total_failed_builds != 0 or
+            self.last_metrics_scanned != 0 or
+            self.last_active_builds != 0 or
+            self.last_builds_started != 0 or
+            self.last_worker_steps != 0 or
+            self.last_coordinator_steps != 0 or
+            self.last_retired_input_records != 0 or
+            self.last_pages_claimed != 0 or
+            self.last_pages_completed != 0 or
+            self.last_phases_advanced != 0 or
+            self.last_published != 0 or
+            self.last_failed_builds != 0 or
+            self.last_budget_exhausted;
+    }
+};
+
+pub fn accumulateTextMergeStats(dst: *TextMergeStats, src: TextMergeStats) void {
+    dst.enabled = dst.enabled or src.enabled;
+    dst.active_indexes +|= src.active_indexes;
+    dst.active_segments +|= src.active_segments;
+    dst.max_active_segments_per_index = @max(dst.max_active_segments_per_index, src.max_active_segments_per_index);
+    dst.pending_indexes +|= src.pending_indexes;
+    dst.pending_segments +|= src.pending_segments;
+    dst.pending_bytes +|= src.pending_bytes;
+    dst.pending_heap_bytes +|= src.pending_heap_bytes;
+    dst.pending_mmap_bytes +|= src.pending_mmap_bytes;
+    dst.in_flight_merges +|= src.in_flight_merges;
+    dst.in_flight_segments +|= src.in_flight_segments;
+    dst.completed_merges +|= src.completed_merges;
+    dst.skipped_stale_merges +|= src.skipped_stale_merges;
+    dst.failed_merges +|= src.failed_merges;
+    dst.merge_input_segments_total +|= src.merge_input_segments_total;
+    dst.merge_input_bytes_total +|= src.merge_input_bytes_total;
+    dst.merge_output_segments_total +|= src.merge_output_segments_total;
+    dst.merge_output_bytes_total +|= src.merge_output_bytes_total;
+    dst.merge_elapsed_ns_total +|= src.merge_elapsed_ns_total;
+    dst.merge_peak_task_alloc_bytes = @max(dst.merge_peak_task_alloc_bytes, src.merge_peak_task_alloc_bytes);
+    dst.last_merge_input_segments = @max(dst.last_merge_input_segments, src.last_merge_input_segments);
+    dst.last_merge_input_bytes = @max(dst.last_merge_input_bytes, src.last_merge_input_bytes);
+    dst.last_merge_output_segments = @max(dst.last_merge_output_segments, src.last_merge_output_segments);
+    dst.last_merge_output_bytes = @max(dst.last_merge_output_bytes, src.last_merge_output_bytes);
+    dst.last_merge_elapsed_ns = @max(dst.last_merge_elapsed_ns, src.last_merge_elapsed_ns);
+    dst.last_merge_peak_task_alloc_bytes = @max(dst.last_merge_peak_task_alloc_bytes, src.last_merge_peak_task_alloc_bytes);
+    dst.quarantined_merges +|= src.quarantined_merges;
+    dst.quarantined_segments +|= src.quarantined_segments;
+    if (src.last_merge_error.len != 0) dst.last_merge_error = src.last_merge_error;
+    dst.retry_after_ns = @max(dst.retry_after_ns, src.retry_after_ns);
+    dst.deferred_for_pressure +|= src.deferred_for_pressure;
+    dst.forced_drains +|= src.forced_drains;
+    dst.backpressure_events +|= src.backpressure_events;
+    dst.backpressure_ns +|= src.backpressure_ns;
+    dst.backpressure_timeouts +|= src.backpressure_timeouts;
+    dst.backpressure_failures +|= src.backpressure_failures;
+    dst.max_pending_segments = @max(dst.max_pending_segments, src.max_pending_segments);
+    dst.max_pending_bytes = @max(dst.max_pending_bytes, src.max_pending_bytes);
+}
+
+pub const DocIdentityStats = struct {
+    namespace_table_id: u64 = 0,
+    namespace_shard_id: u64 = 0,
+    namespace_range_id: u64 = 0,
+    next_ordinal: u32 = 1,
+    allocated_ordinals: u64 = 0,
+    ordinal_capacity_remaining: u64 = 0,
+    ordinal_capacity_exhausted: bool = false,
+    rebuild_required: bool = false,
+    state_rows: u64 = 0,
+    live_ordinals: u64 = 0,
+    tombstone_ordinals: u64 = 0,
+    visibility_chunk_size: u32 = 0,
+    visibility_chunks: u64 = 0,
+    visibility_deleted_ordinals: u64 = 0,
+    visibility_mask_bytes: u64 = 0,
+    visibility_repair_count: u64 = 0,
+    min_created_generation: u64 = 0,
+    max_created_generation: u64 = 0,
+    min_deleted_generation: u64 = 0,
+    max_deleted_generation: u64 = 0,
+    scanned_primary_docs: u64 = 0,
+    primary_docs_missing_ordinals: u64 = 0,
+    primary_docs_missing_identity_state: u64 = 0,
+    primary_docs_with_tombstone_ordinals: u64 = 0,
+    complete: bool = false,
+};
+
+pub const DocSetPlanningStats = struct {
+    resolved_set_count: u64 = 0,
+    all_set_count: u64 = 0,
+    none_set_count: u64 = 0,
+    doc_key_list_count: u64 = 0,
+    ordinal_list_count: u64 = 0,
+    ordinal_bitmap_count: u64 = 0,
+    doc_key_list_docs: u64 = 0,
+    ordinal_list_docs: u64 = 0,
+    ordinal_bitmap_docs: u64 = 0,
+    missing_ordinal_coverage_count: u64 = 0,
+    bitmap_promotion_count: u64 = 0,
+    unsupported_filter_shape_count: u64 = 0,
+    stale_identity_generation_rejection_count: u64 = 0,
+};
+
+pub const VisibilityStats = struct {
+    cache_entries: u64 = 0,
+    cache_hits_total: u64 = 0,
+    cache_misses_total: u64 = 0,
+    mask_build_ns_total: u64 = 0,
+    mask_builds_total: u64 = 0,
+    full_scan_fallbacks_total: u64 = 0,
+    overflow_total: u64 = 0,
+};
+
+pub const ColumnarMaintenanceStats = struct {
+    /// Typed source rows reused by clean coverage coalescing (no AROW reads).
+    covered_rows_read: u64 = 0,
+    cell_slots_examined: u64 = 0,
+    payloads_reused: u64 = 0,
+    payload_bytes_written: u64 = 0,
+    payload_encoding_bytes: u64 = 0,
+    payload_slices_repacked: u64 = 0,
+    /// Authoritative rows decoded during bootstrap/dirty range preparation.
+    primary_rows_read: u64 = 0,
+    admission_root_reads: u64 = 0,
+    admission_dirty_probes: u64 = 0,
+    owners_examined: u64 = 0,
+    scheduler_candidates: u64 = 0,
+    scheduler_commits: u64 = 0,
+    waiting_until_ns: u64 = 0,
+    ranges_deferred: u64 = 0,
+    bootstrap_quanta: u64 = 0,
+    bytes_written: u64 = 0,
+    pending: bool = false,
+    backing_off: bool = false,
+    /// Age since this process observed pending work, not the row's write time.
+    pending_age_ns: u64 = 0,
+    passes: u64 = 0,
+    ranges_compacted: u64 = 0,
+    blocks_written: u64 = 0,
+    rows_written: u64 = 0,
+    ranges_merged: u64 = 0,
+    dirty_markers_cleared: u64 = 0,
+    gc_records_deleted: u64 = 0,
+    failures: u64 = 0,
+    last_pass_ns: u64 = 0,
+};
+
+pub const DBStats = struct {
+    columnar_maintenance: ColumnarMaintenanceStats = .{},
+    /// Process-local identity of the resident DB owner that sampled this
+    /// status. Cache merge logic uses it only with an exact table root and
+    /// index incarnation; it is not part of the public status contract.
+    runtime_owner_id: u64 = 0,
+    /// Process-local fingerprint of physical LSM/WAL publications. Runtime
+    /// status uses it only to invalidate cached directory-byte observations.
+    storage_change_token: u64 = 0,
+    /// Canonical live primary-document cardinality from durable identity metadata.
+    /// Unlike doc_count, this is independent of derived index fan-out.
+    source_doc_count: u64 = 0,
+    /// Active immutable schema epoch and durable table-catalog state.
+    schema_epoch: u32 = 0,
+    row_format_version: u32 = 0,
+    table_catalog_generation: u64 = 0,
+    schema_index_state: []const u8 = "none",
+    doc_count: u64 = 0,
+    index_count: u32 = 0,
+    /// False when operational stats skipped index inventory under apply-lock contention.
+    indexes_available: bool = true,
+    indexes: []DBIndexStats = &.{},
+    repair_degraded: bool = false,
+    repair_issue_count: u64 = 0,
+    repair_summary_ready: bool = true,
+    repair_issue_count_estimated: bool = false,
+    doc_identity: DocIdentityStats = .{},
+    doc_set_planning: DocSetPlanningStats = .{},
+    visibility: VisibilityStats = .{},
+    enrichment: EnrichmentStats = .{},
+    resolution: ReplayStageStats = .{},
+    promotion: ReplayStageStats = .{},
+    resolver_replay: ResolverReplayDiagnostics = .{},
+    ttl_cleanup: TTLCleanupStats = .{},
+    transaction_recovery: TransactionRecoveryStats = .{},
+    text_merge: TextMergeStats = .{},
+    graph_metric_runtime: GraphMetricRuntimeStats = .{},
+    term_doc_freq_cache_hits: u64 = 0,
+    term_doc_freq_cache_misses: u64 = 0,
+    async_indexing: AsyncIndexingStats = .{},
+};
+
+pub const ArtifactRepairKind = enum {
+    embedding,
+    asset,
+    chunk,
+    graph,
+    full_text,
+    algebraic,
+};
+
+pub const RepairTarget = enum {
+    artifact,
+    index,
+};
+
+pub const IndexRepairControl = enum {
+    pause_automatic,
+    resume_automatic,
+    cancel_current_attempt,
+};
+
+pub const ArtifactRepairReason = enum {
+    missing_artifact,
+    corrupt_artifact,
+    unreadable_artifact,
+    enrichment_failed,
+    resource_limit_exceeded,
+};
+
+/// Policy-independent coverage health shared by status and repair reporting.
+/// A source is settled once it has any terminal outcome; settled failures are
+/// degraded, never pending and never healthy completion.
+pub const DerivedCoverageHealth = struct {
+    settled: u64,
+    pending: ?u64,
+    counters_valid: bool,
+    all_sources_terminal: bool,
+    degraded: bool,
+};
+
+pub const DerivedCoveragePolicy = enum {
+    strict,
+    partial,
+    best_effort,
+};
+
+/// One authoritative interpretation of durable derived-coverage counters.
+/// Status endpoints and repair completion must use the same policy semantics:
+/// a settled source that the policy does not cover is degraded debt, not a
+/// healthy repair merely because the worker has no pending input.
+pub const DerivedCoverageAssessment = struct {
+    covered: u64,
+    health: DerivedCoverageHealth,
+    complete: bool,
+    healthy: bool,
+    degraded: bool,
+};
+
+pub fn evaluateDerivedCoverageHealth(
+    source_total: u64,
+    produced: u64,
+    skipped: u64,
+    terminal_failed: u64,
+    observation_complete: bool,
+    replay_current: bool,
+) DerivedCoverageHealth {
+    const produced_and_skipped = std.math.add(u64, produced, skipped) catch return .{
+        .settled = 0,
+        .pending = null,
+        .counters_valid = false,
+        .all_sources_terminal = false,
+        .degraded = false,
+    };
+    const settled = std.math.add(u64, produced_and_skipped, terminal_failed) catch return .{
+        .settled = 0,
+        .pending = null,
+        .counters_valid = false,
+        .all_sources_terminal = false,
+        .degraded = false,
+    };
+    const counters_valid = settled <= source_total;
+    const all_sources_terminal = counters_valid and settled == source_total;
+    return .{
+        .settled = settled,
+        .pending = if (observation_complete and counters_valid) source_total - settled else null,
+        .counters_valid = counters_valid,
+        .all_sources_terminal = all_sources_terminal,
+        .degraded = observation_complete and replay_current and all_sources_terminal and terminal_failed > 0,
+    };
+}
+
+pub fn evaluateDerivedCoverageAssessment(
+    policy: DerivedCoveragePolicy,
+    source_total: u64,
+    produced: u64,
+    skipped: u64,
+    terminal_failed: u64,
+    observation_complete: bool,
+    replay_current: bool,
+) DerivedCoverageAssessment {
+    const covered = switch (policy) {
+        .strict => produced,
+        .partial => std.math.add(u64, produced, skipped) catch std.math.maxInt(u64),
+        .best_effort => blk: {
+            const produced_and_skipped = std.math.add(u64, produced, skipped) catch break :blk std.math.maxInt(u64);
+            break :blk std.math.add(u64, produced_and_skipped, terminal_failed) catch std.math.maxInt(u64);
+        },
+    };
+    const health = evaluateDerivedCoverageHealth(
+        source_total,
+        produced,
+        skipped,
+        terminal_failed,
+        observation_complete,
+        replay_current,
+    );
+    const complete = observation_complete and replay_current and health.counters_valid and
+        health.all_sources_terminal and covered == source_total;
+    return .{
+        .covered = covered,
+        .health = health,
+        .complete = complete,
+        .healthy = complete and terminal_failed == 0,
+        .degraded = observation_complete and replay_current and health.all_sources_terminal and
+            (terminal_failed > 0 or covered != source_total),
+    };
+}
+
+test "derived coverage assessment honors completion policy" {
+    const strict = evaluateDerivedCoverageAssessment(.strict, 2, 1, 1, 0, true, true);
+    try std.testing.expect(!strict.complete);
+    try std.testing.expect(strict.degraded);
+
+    const partial = evaluateDerivedCoverageAssessment(.partial, 2, 1, 1, 0, true, true);
+    try std.testing.expect(partial.complete);
+    try std.testing.expect(partial.healthy);
+    try std.testing.expect(!partial.degraded);
+
+    const best_effort = evaluateDerivedCoverageAssessment(.best_effort, 2, 1, 0, 1, true, true);
+    try std.testing.expect(best_effort.complete);
+    try std.testing.expect(!best_effort.healthy);
+    try std.testing.expect(best_effort.degraded);
+}
+
+pub const ArtifactRepairIssue = struct {
+    artifact_kind: ArtifactRepairKind = .embedding,
+    index_name: []const u8 = "",
+    doc_key: []const u8 = "",
+    parent_doc_key: []const u8 = "",
+    unit_id: []const u8 = "",
+    /// Canonical artifact stream configured on the affected index. This is
+    /// deliberately distinct from `source_artifact_name` (the producer input)
+    /// and `artifact_name` (the unreadable derived value).
+    index_source_artifact_name: []const u8 = "",
+    source_artifact_name: []const u8 = "",
+    artifact_name: []const u8 = "",
+    artifact_key: []const u8 = "",
+    chunk_id: ?u32 = null,
+    repairable: bool = true,
+    unsupported_reason: []const u8 = "",
+    sequence: u64 = 0,
+    reason: ArtifactRepairReason = .missing_artifact,
+    /// Number of source-generation attempts made before the request was
+    /// parked. Kept separate from repair attempts for operational clarity.
+    generation_attempts: u64 = 0,
+    generation_error: []const u8 = "",
+    attempts: u64 = 0,
+    first_seen_ns: u64 = 0,
+    last_seen_ns: u64 = 0,
+    last_error: []const u8 = "",
+
+    pub fn deinit(self: *ArtifactRepairIssue, alloc: Allocator) void {
+        if (self.index_name.len > 0) alloc.free(@constCast(self.index_name));
+        if (self.doc_key.len > 0) alloc.free(@constCast(self.doc_key));
+        if (self.parent_doc_key.len > 0) alloc.free(@constCast(self.parent_doc_key));
+        if (self.unit_id.len > 0) alloc.free(@constCast(self.unit_id));
+        if (self.index_source_artifact_name.len > 0) alloc.free(@constCast(self.index_source_artifact_name));
+        if (self.source_artifact_name.len > 0) alloc.free(@constCast(self.source_artifact_name));
+        if (self.artifact_name.len > 0) alloc.free(@constCast(self.artifact_name));
+        if (self.artifact_key.len > 0) alloc.free(@constCast(self.artifact_key));
+        if (self.unsupported_reason.len > 0) alloc.free(@constCast(self.unsupported_reason));
+        if (self.generation_error.len > 0) alloc.free(@constCast(self.generation_error));
+        if (self.last_error.len > 0) alloc.free(@constCast(self.last_error));
+        self.* = undefined;
+    }
+};
+
+pub fn freeArtifactRepairIssues(alloc: Allocator, issues: []ArtifactRepairIssue) void {
+    for (issues) |*issue| issue.deinit(alloc);
+    if (issues.len > 0) alloc.free(issues);
+}
+
+pub const ArtifactRepairListRequest = struct {
+    target: RepairTarget = .artifact,
+    artifact_kind: ?ArtifactRepairKind = null,
+    index_name: ?[]const u8 = null,
+    limit: u32 = 50,
+    cursor: ?[]const u8 = null,
+};
+
+pub const ArtifactRepairListResult = struct {
+    issues: []ArtifactRepairIssue = &.{},
+    limit: u32 = 0,
+    scanned: u64 = 0,
+    groups_scanned: u64 = 0,
+    next_cursor: ?[]u8 = null,
+    has_more: bool = false,
+
+    pub fn deinit(self: *ArtifactRepairListResult, alloc: Allocator) void {
+        freeArtifactRepairIssues(alloc, self.issues);
+        if (self.next_cursor) |value| alloc.free(value);
+        self.* = undefined;
+    }
+};
+
+pub const ArtifactRepairRunRequest = struct {
+    target: RepairTarget = .artifact,
+    artifact_kind: ?ArtifactRepairKind = null,
+    index_name: ?[]const u8 = null,
+    limit: u32 = 100,
+    cursor: ?[]const u8 = null,
+    force: bool = false,
+    control: ?IndexRepairControl = null,
+    /// Optional compare-and-set fence for operator controls. When supplied,
+    /// the control applies only to the currently durable repair generation.
+    repair_id: ?u128 = null,
+    repair_job_id: ?u64 = null,
+    repair_attempt_id: ?u64 = null,
+    repair_job_created_at_ms: ?u64 = null,
+    repair_cancel_base_uri: ?[]const u8 = null,
+};
+
+pub const RepairCancelCheck = struct {
+    ptr: *anyopaque,
+    is_requested: *const fn (ptr: *anyopaque) bool,
+
+    pub fn requested(self: RepairCancelCheck) bool {
+        return self.is_requested(self.ptr);
+    }
+};
+
+/// Stable adapter from restore/request cancellation to the repair subsystem's
+/// cooperative callback. The adapter must remain alive while the returned
+/// check is borrowed by a repair quantum.
+pub const RepairCancellation = struct {
+    token: CancellationToken,
+
+    fn requested(ptr: *anyopaque) bool {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return self.token.isCancelled();
+    }
+
+    pub fn check(self: *@This()) RepairCancelCheck {
+        return .{ .ptr = self, .is_requested = requested };
+    }
+};
+
+/// Cooperative scheduler preemption checked only at durable reconstruction
+/// boundaries. Unlike cancellation, yielding is a successful partial pass: the
+/// candidate remains reopenable and its scan cursor is persisted before the
+/// BackendRuntime owner releases the node repair slot.
+pub const RepairYieldCheck = struct {
+    ptr: *anyopaque,
+    is_requested: *const fn (ptr: *anyopaque) bool,
+
+    pub fn requested(self: @This()) bool {
+        return self.is_requested(self.ptr);
+    }
+};
+
+pub const RepairActivationCheck = struct {
+    ptr: *anyopaque,
+    is_current_owner: *const fn (ptr: *anyopaque) anyerror!bool,
+
+    pub fn current(self: RepairActivationCheck) !bool {
+        return try self.is_current_owner(self.ptr);
+    }
+};
+
+pub const RepairCapacityObservation = resource_manager_mod.CapacityObservation;
+
+/// Storage-owned capacity probe. Implementations identify the actual
+/// volume/quota domain and synchronously refresh its capacity observation.
+/// The callback must be cheap enough to run at repair window boundaries.
+pub const RepairCapacitySource = resource_manager_mod.CapacitySource;
+
+pub const RepairCapacityCheck = struct {
+    ptr: *anyopaque,
+    reconcile: *const fn (ptr: *anyopaque, candidate_bytes: u64) anyerror!void,
+    revalidate: *const fn (ptr: *anyopaque) anyerror!void,
+    bind_candidate_root: ?*const fn (ptr: *anyopaque, candidate_root: []const u8) anyerror!void = null,
+
+    pub fn current(self: @This(), candidate_bytes: u64) !void {
+        return try self.reconcile(self.ptr, candidate_bytes);
+    }
+
+    /// Re-check the live capacity domain before another bounded build batch.
+    /// Implementations keep the successful path O(1), but may reconcile exact
+    /// candidate usage before returning an otherwise-conservative denial.
+    pub fn boundary(self: @This()) !void {
+        return try self.revalidate(self.ptr);
+    }
+
+    /// Binds the exact shadow-generation root whose materialized bytes consume
+    /// this reservation. The path is borrowed for the synchronous repair run.
+    pub fn bindCandidateRoot(self: @This(), candidate_root: []const u8) !void {
+        if (self.bind_candidate_root) |bind| try bind(self.ptr, candidate_root);
+    }
+};
+
+pub const ArtifactRepairRunOptions = struct {
+    /// Absolute local catalog-admission deadline in the source routing clock.
+    /// Background admission must not consume the quantum waiting for metadata.
+    admission_deadline_ns: ?u64 = null,
+    /// Restrict a local schema-migration quantum to its exact index. Unrelated
+    /// durable repairs retain their existing scheduler and ownership policy.
+    target_index_name: ?[]const u8 = null,
+    cancel_check: ?RepairCancelCheck = null,
+    /// Internal BackendRuntime scheduling policy. This is deliberately not an
+    /// API/index setting and is observed only after a bounded candidate batch
+    /// can be made durable and restart-reopenable.
+    yield_check: ?RepairYieldCheck = null,
+    /// Revalidated immediately before a replacement pointer is activated.
+    /// Long-running reconstruction may outlive leadership or placement.
+    activation_check: ?RepairActivationCheck = null,
+    /// Durable ownership claim captured by the node scheduler. Zero means the
+    /// caller has no stronger epoch than the DB's replica/root identity (the
+    /// standalone and operator-driven case). Managed repair passes the current
+    /// Raft term, or the visible root generation when no term source exists.
+    owner_epoch: u64 = 0,
+    /// Internal bounded-activation policy. These are node scheduling values,
+    /// not index configuration or public API controls.
+    max_activation_gap_sequences: u64 = 200,
+    max_convergence_rounds: u32 = 32,
+    max_activation_pause_ms: u64 = 250,
+    /// Internal node scheduler estimate persisted into the durable repair
+    /// intent before candidate construction. These fields are not API data.
+    estimated_candidate_bytes: u64 = 0,
+    planned_disk_bytes: u64 = 0,
+    /// ResourceManager capacity domain and observation source. These are
+    /// backend/runtime integration data, never public index configuration.
+    /// The direct observation is a fallback for callers without a live probe.
+    capacity_domain_id: u128 = 0,
+    capacity_observation: RepairCapacityObservation = .{},
+    capacity_source: ?RepairCapacitySource = null,
+    /// Installed by the durable owner after admission. Shadow construction
+    /// invokes it only at bounded publication/window boundaries.
+    capacity_check: ?RepairCapacityCheck = null,
+    /// Managed operator requests persist/enqueue intent work and return
+    /// immediately. Standalone callers leave this false and advance through
+    /// the same state machine synchronously.
+    defer_durable_index_repair_execution: bool = false,
+
+    pub fn cancelled(self: ArtifactRepairRunOptions) bool {
+        if (self.cancel_check) |check| return check.requested();
+        return false;
+    }
+};
+
+/// Authoritative owner wake decision. A tagged state prevents `0` from
+/// ambiguously meaning both "run now" and "nothing runnable" at scheduler
+/// boundaries while remaining available to the control-only compiler unit.
+pub const IndexRepairWake = union(enum) {
+    immediate,
+    at_realtime_ms: u64,
+    parked,
+    empty,
+
+    pub fn retryAtMs(self: @This()) u64 {
+        return switch (self) {
+            .at_realtime_ms => |deadline| deadline,
+            .immediate, .parked, .empty => 0,
+        };
+    }
+};
+
+/// Exact ordered mutation receipt persisted atomically with primary effects.
+pub const OrderedApplyReceipt = struct {
+    term: u64,
+    index: u64,
+};
+
+pub const ArtifactRepairResult = struct {
+    scanned: u64 = 0,
+    groups_scanned: u64 = 0,
+    reprocessed: u64 = 0,
+    repaired: u64 = 0,
+    missing_source_docs: u64 = 0,
+    failed: u64 = 0,
+    unsupported: u64 = 0,
+    unresolved: u64 = 0,
+    in_progress: u64 = 0,
+    indexes_rebuilt: u64 = 0,
+    /// Selected indexes that were degraded when this repair pass began.
+    indexes_degraded_before: u64 = 0,
+    /// Selected indexes that remain degraded when this repair pass returns.
+    indexes_degraded_after: u64 = 0,
+    controls_applied: u64 = 0,
+    limit: u32 = 0,
+    next_cursor: ?[]u8 = null,
+    has_more: bool = false,
+    debt_remaining: bool = false,
+
+    pub fn deinit(self: *ArtifactRepairResult, alloc: Allocator) void {
+        if (self.next_cursor) |value| alloc.free(value);
+        self.* = undefined;
+    }
+};
+
+pub const EmbeddingArtifactRepairReason = enum {
+    missing_embedding_artifact,
+    corrupt_embedding_artifact,
+};
+
+pub const EmbeddingArtifactRepairIssue = struct {
+    artifact_kind: ArtifactRepairKind = .embedding,
+    index_name: []const u8 = "",
+    doc_key: []const u8 = "",
+    parent_doc_key: []const u8 = "",
+    unit_id: []const u8 = "",
+    source_artifact_name: []const u8 = "",
+    artifact_name: []const u8 = "",
+    artifact_key: []const u8 = "",
+    chunk_id: ?u32 = null,
+    repairable: bool = true,
+    unsupported_reason: []const u8 = "",
+    sequence: u64 = 0,
+    reason: EmbeddingArtifactRepairReason = .missing_embedding_artifact,
+    generation_attempts: u64 = 0,
+    generation_error: []const u8 = "",
+    attempts: u64 = 0,
+    first_seen_ns: u64 = 0,
+    last_seen_ns: u64 = 0,
+    last_error: []const u8 = "",
+
+    pub fn deinit(self: *EmbeddingArtifactRepairIssue, alloc: Allocator) void {
+        if (self.index_name.len > 0) alloc.free(@constCast(self.index_name));
+        if (self.doc_key.len > 0) alloc.free(@constCast(self.doc_key));
+        if (self.parent_doc_key.len > 0) alloc.free(@constCast(self.parent_doc_key));
+        if (self.unit_id.len > 0) alloc.free(@constCast(self.unit_id));
+        if (self.source_artifact_name.len > 0) alloc.free(@constCast(self.source_artifact_name));
+        if (self.artifact_name.len > 0) alloc.free(@constCast(self.artifact_name));
+        if (self.artifact_key.len > 0) alloc.free(@constCast(self.artifact_key));
+        if (self.unsupported_reason.len > 0) alloc.free(@constCast(self.unsupported_reason));
+        if (self.generation_error.len > 0) alloc.free(@constCast(self.generation_error));
+        if (self.last_error.len > 0) alloc.free(@constCast(self.last_error));
+        self.* = undefined;
+    }
+};
+pub const EmbeddingArtifactRepairResult = ArtifactRepairResult;
+
+pub fn embeddingArtifactRepairReasonFromArtifact(reason: ArtifactRepairReason) EmbeddingArtifactRepairReason {
+    return switch (reason) {
+        .missing_artifact => .missing_embedding_artifact,
+        .corrupt_artifact, .unreadable_artifact, .enrichment_failed, .resource_limit_exceeded => .corrupt_embedding_artifact,
+    };
+}
+
+pub fn embeddingArtifactRepairIssueFromArtifactAlloc(alloc: Allocator, issue: ArtifactRepairIssue) !EmbeddingArtifactRepairIssue {
+    var out = EmbeddingArtifactRepairIssue{
+        .artifact_kind = issue.artifact_kind,
+        .chunk_id = issue.chunk_id,
+        .repairable = issue.repairable,
+        .sequence = issue.sequence,
+        .reason = embeddingArtifactRepairReasonFromArtifact(issue.reason),
+        .generation_attempts = issue.generation_attempts,
+        .attempts = issue.attempts,
+        .first_seen_ns = issue.first_seen_ns,
+        .last_seen_ns = issue.last_seen_ns,
+    };
+    errdefer out.deinit(alloc);
+    out.index_name = try alloc.dupe(u8, issue.index_name);
+    out.doc_key = try alloc.dupe(u8, issue.doc_key);
+    out.parent_doc_key = try alloc.dupe(u8, issue.parent_doc_key);
+    out.unit_id = try alloc.dupe(u8, issue.unit_id);
+    out.source_artifact_name = try alloc.dupe(u8, issue.source_artifact_name);
+    out.artifact_name = try alloc.dupe(u8, issue.artifact_name);
+    out.artifact_key = try alloc.dupe(u8, issue.artifact_key);
+    out.unsupported_reason = try alloc.dupe(u8, issue.unsupported_reason);
+    out.generation_error = try alloc.dupe(u8, issue.generation_error);
+    out.last_error = try alloc.dupe(u8, issue.last_error);
+    return out;
+}
+
+pub fn freeEmbeddingArtifactRepairIssues(alloc: Allocator, issues: []EmbeddingArtifactRepairIssue) void {
+    for (issues) |*issue| issue.deinit(alloc);
+    if (issues.len > 0) alloc.free(issues);
+}
+
+pub const AlgebraicCandidateStatus = struct {
+    recommendation: []const u8,
+    materialization_id: []const u8,
+    lifecycle: []const u8,
+    decision: []const u8,
+    observation_count: u64 = 0,
+    estimated_scan_rows_saved: u64 = 0,
+    estimated_write_cost: u64 = 0,
+    estimated_tensor_rows: u64 = 0,
+    estimated_storage_bytes: u64 = 0,
+    estimated_write_amplification: u64 = 0,
+    score: i128 = 0,
+    idle_miss_count: u64 = 0,
+    generation: u64 = 0,
+};
+
+pub const AlgebraicCandidateDecisionStatus = struct {
+    recommendation: []const u8,
+    materialization_id: []const u8,
+    lifecycle: []const u8,
+    previous_decision: []const u8,
+    decision: []const u8,
+    observation_count: u64 = 0,
+    estimated_scan_rows_saved: u64 = 0,
+    estimated_write_cost: u64 = 0,
+    score: i128 = 0,
+    score_delta: i128 = 0,
+    idle_miss_count: u64 = 0,
+    generation: u64 = 0,
+};
+
+pub const AlgebraicProgressStatus = struct {
+    recommendation: []const u8,
+    materialization_id: []const u8,
+    lifecycle: []const u8,
+    target_sequence: u64 = 0,
+    applied_sequence: u64 = 0,
+    rows_processed: u64 = 0,
+    target_rows: u64 = 0,
+};
+
+/// Source-specific replay watermarks for an artifact-backed index. The
+/// published watermark is the index's durable applied cursor: it proves that
+/// every configured source has been processed through that revision. The
+/// target is maintained transactionally per artifact stream by the writer.
+pub const IndexSourceReplayStatus = struct {
+    artifact_name: []const u8,
+    published_sequence: u64 = 0,
+    target_sequence: u64 = 0,
+    /// A terminal request failure isolated to this configured artifact stream.
+    /// Global worker/index failures remain index-level readiness facts.
+    failed: bool = false,
+    /// Durable repair debt scoped to this source. Runtime failure maps may add
+    /// diagnostics, but never replace this authoritative count.
+    repair_issue_count: u64 = 0,
+    /// False while the bounded repair-ledger summary is rebuilding. Readiness
+    /// must remain pending until absence of source-local debt is proven.
+    repair_summary_ready: bool = true,
+    /// Verified producer dependency closure, independent of replay progress.
+    producer_complete: bool = true,
+    // Internal distributed-status proof; not part of the public contract.
+    observation_count: u64 = 1,
+};
+
+/// Internal durable lifecycle class. This is carried with shard observations
+/// so API projection can distinguish ordinary materialization from recovery
+/// without interpreting repair trigger strings.
+pub const IndexLifecycleWorkClass = enum {
+    none,
+    initial_build,
+    repair,
+};
+
+pub const DBIndexStats = struct {
+    name: []const u8,
+    kind: IndexKind,
+    // Status-plane overlay used to fence one catalog target while retaining
+    // authoritative observations for unaffected sibling indexes. This is an
+    // internal observation fact and is not serialized in the public API.
+    runtime_observation_stale: bool = false,
+    // A cache merge may retain serviceability for one exact derived-index
+    // incarnation while its already-open runtime publishes catch-up status.
+    // This proof never originates in persisted DB stats and is cleared by a
+    // fresh observation, a root change, or an incarnation change.
+    runtime_observation_serviceable: bool = false,
+    // The status cache proved that this index is an untouched sibling of one
+    // exact in-place catalog target. Unlike generic derived-incarnation
+    // continuity, this proof can retain authority across table-level opening
+    // metadata and applies to every index kind. It is never persisted.
+    runtime_observation_targeted_sibling: bool = false,
+    // Cache-local convergence authority for this exact index incarnation.
+    // Ordinary target advances clear only the affected identities; an
+    // unknown-scope advance is represented by the enclosing table metadata.
+    // This is deliberately independent of serving authority and is never
+    // persisted or exposed as a separate public field.
+    runtime_target_observation_complete: bool = true,
+    // Replay witnesses belonging to retained serving/coverage payloads, not a
+    // newer progress overlay. Live owners issue these with publication stamps;
+    // incomplete/status-only observations may leave them unknown. Neither
+    // metadata relabeling nor cloning may manufacture a witness.
+    runtime_serving_applied_sequence: ?u64 = null,
+    runtime_coverage_applied_sequence: ?u64 = null,
+    // Durable source frontier sampled with these coverage counters under the
+    // owner's apply lock. Artifact replay can lag while a provider is working;
+    // observing pending source work must not require producing that artifact.
+    // This witness follows the coverage payload, never a progress overlay.
+    runtime_coverage_source_sequence: ?u64 = null,
+    // Owner-issued local payload authority. Null means unknown, not revision
+    // zero. These are never synthesized by metadata overlays or serialized.
+    serving_publication: ?@import("publication.zig").Stamp = null,
+    coverage_publication: ?@import("publication.zig").Stamp = null,
+    // Error name recorded when the index's persisted artifacts failed to
+    // load (e.g. "UnsupportedVersion"); null for healthy indexes.
+    load_error: ?[]const u8 = null,
+    doc_count: u64 = 0,
+    term_count: u64 = 0,
+    edge_count: u64 = 0,
+    node_count: u64 = 0,
+    graph_counts_pending: bool = false,
+    root_node: u64 = 0,
+    // Exact physical artifact cardinality owned by this index incarnation.
+    // Unlike source coverage, this remains correct for chunked projections
+    // where one source document can publish multiple searchable vectors.
+    publication_target_count: u64 = 0,
+    publication_target_ready: bool = false,
+    // Authoritative O(1) projection of the resident search-admission gate for
+    // this exact dense incarnation. Zero members is still a valid snapshot.
+    serving_snapshot_ready: bool = false,
+    // Dense storage's process-local immutable serving revision. Zero is
+    // unavailable, not a comparable revision for another index kind. Generic
+    // owner-observation ordering uses serving_publication instead.
+    serving_snapshot_revision: u64 = 0,
+    // Process-local owner of the immutable serving snapshot above. This is
+    // index-scoped because targeted structural observations can retain a
+    // sibling's serving payload while the enclosing DBStats comes from a
+    // different temporary DB owner.
+    serving_snapshot_owner_id: u64 = 0,
+    coverage_produced_count: u64 = 0,
+    coverage_skipped_count: u64 = 0,
+    coverage_terminal_failed_count: u64 = 0,
+    // True when this pass directly observed the owner or retains its last
+    // unexpired exact-incarnation sample. False is unavailable, not idle.
+    // This controls local projection only.
+    embedding_activity_observed: bool = false,
+    // True only for a direct owner sample accepted during this status pass.
+    // Wire adapters use this bit so locally retained activity cannot refresh
+    // the next hop's TTL indefinitely. This is not part of the public API.
+    embedding_activity_sample_fresh: bool = false,
+    embedding_activity: EmbeddingActivityStats = .{},
+    // Stable across shard-local marker generations for the same stored config.
+    coverage_config_hash: u64 = 0,
+    coverage_summary_ready: bool = true,
+    // Internal identity used while collecting stats. These fields are not part
+    // of the public status contract.
+    coverage_generation: u64 = 0,
+    coverage_identity_ready: bool = false,
+    backfill_active: bool = false,
+    backfill_progress: f64 = 0.0,
+    /// The HBC/posting generation is visible, but its native exact-vector
+    /// projection has not reached the same source sequence. This is separate
+    /// from generic backfill because public coverage normalization may clear
+    /// stale replay activity once external artifacts are complete.
+    dense_vector_projection_pending: bool = false,
+    /// Durable native-storage rollout state. Authority is published only after
+    /// both the HBC generation and its shared exact-vector projection validate
+    /// at one source boundary; mixed-shard aggregation reports the least
+    /// advanced observed phase.
+    dense_native_storage_phase: DenseNativeStoragePhase = .legacy,
+    enrichment_failed: bool = false,
+    repair_degraded: bool = false,
+    repair_issue_count: u64 = 0,
+    repair_summary_ready: bool = true,
+    repair_issue_count_estimated: bool = false,
+    repair_scan_issue_count: u64 = 0,
+    index_repair_id: ?u128 = null,
+    index_lifecycle_work_class: IndexLifecycleWorkClass = .none,
+    index_repair_trigger: []const u8 = "none",
+    index_repair_phase: []const u8 = "none",
+    index_repair_automation: []const u8 = "none",
+    index_repair_attempts: u32 = 0,
+    index_repair_started_at_ms: u64 = 0,
+    index_repair_updated_at_ms: u64 = 0,
+    index_repair_build_floor_sequence: u64 = 0,
+    index_repair_applied_sequence: u64 = 0,
+    index_repair_target_sequence: u64 = 0,
+    index_repair_next_retry_at_ms: u64 = 0,
+    index_repair_last_error: ?[]const u8 = null,
+    index_repair_wait_reason: []const u8 = "none",
+    // Compact lifecycle used when DBIndexStats crosses process boundaries.
+    // The full local durable diagnostics remain authoritative when present.
+    index_repair_status: ?IndexRepairStatus = null,
+    // Separate from lifecycle because a terminal scheduler checkpoint can be
+    // retryable while paused/irrecoverable states require operator action.
+    index_repair_action_required: bool = false,
+    // Internal proof that the active managed-admission generation is safe to
+    // query. Under progressive publication it may still have incomplete source
+    // coverage; repair intent remains authoritative until full convergence.
+    index_repair_active_generation_serviceable: bool = false,
+    projection_checkpoint_status: []const u8 = "clean",
+    projection_checkpoint_applied_sequence: u64 = 0,
+    projection_checkpoint_generation: u64 = 0,
+    projection_checkpoint_config_hash: u64 = 0,
+    // Internal physical publication certificate. A reopened index must not
+    // report a serving snapshot when its loaded cardinality differs.
+    projection_checkpoint_published_count: ?u64 = null,
+    replay_applied_sequence: u64 = 0,
+    replay_target_sequence: u64 = 0,
+    source_replay: []IndexSourceReplayStatus = &.{},
+    checkpoint_replay_tail_sequence_count: u64 = 0,
+    replay_catch_up_required: bool = false,
+    catch_up_active: bool = false,
+    catch_up_phase: DenseCatchUpStats.Phase = .idle,
+    catch_up_applied_sequence: u64 = 0,
+    catch_up_target_sequence: u64 = 0,
+    text_merge: TextMergeStats = .{},
+    hbc_cache: HbcCacheStats = .{},
+    hbc_posting: HbcPostingStats = .{},
+    algebraic_parse_error_count: u64 = 0,
+    algebraic_last_error_doc_key: ?[]const u8 = null,
+    algebraic_last_error_reason: ?[]const u8 = null,
+    algebraic_schema_version: u32 = 0,
+    algebraic_capability_fingerprint: ?[]const u8 = null,
+    algebraic_capability_lifecycle_status: ?[]const u8 = null,
+    algebraic_capability_change_added_fields: u32 = 0,
+    algebraic_capability_change_removed_fields: u32 = 0,
+    algebraic_capability_change_changed_type_fields: u32 = 0,
+    algebraic_skipped_dynamic_fields: u32 = 0,
+    algebraic_skipped_complex_fields: u32 = 0,
+    algebraic_skipped_unbounded_fields: u32 = 0,
+    algebraic_minmax_cache_hits: u64 = 0,
+    algebraic_minmax_cache_misses: u64 = 0,
+    algebraic_minmax_support_scans: u64 = 0,
+    algebraic_planner_selected: u64 = 0,
+    algebraic_planner_fallback_count: u64 = 0,
+    algebraic_planner_last_decision: ?[]const u8 = null,
+    algebraic_planner_last_fallback_reason: ?[]const u8 = null,
+    algebraic_planner_last_estimated_scan_rows: ?u64 = null,
+    algebraic_planner_last_estimated_result_buckets: ?u64 = null,
+    algebraic_planner_lifecycle_ready: bool = true,
+    algebraic_planner_lifecycle_blocking_reason: ?[]const u8 = null,
+    algebraic_dictionary_registry_claimed_count: u64 = 0,
+    algebraic_dictionary_registry_already_owned_count: u64 = 0,
+    algebraic_dictionary_registry_owned_by_other_count: u64 = 0,
+    algebraic_dictionary_registry_ready_hit_count: u64 = 0,
+    algebraic_dictionary_registry_ready_miss_count: u64 = 0,
+    algebraic_distributed_partial_validation_proven_count: u64 = 0,
+    algebraic_distributed_partial_validation_rejected_count: u64 = 0,
+    algebraic_distributed_partial_rows_exported_count: u64 = 0,
+    algebraic_vector_filter_attempt_count: u64 = 0,
+    algebraic_vector_filter_resolved_count: u64 = 0,
+    algebraic_vector_filter_unsupported_count: u64 = 0,
+    algebraic_vector_filter_fail_closed_count: u64 = 0,
+    algebraic_vector_filter_include_doc_id_count: u64 = 0,
+    algebraic_vector_filter_exclude_doc_id_count: u64 = 0,
+    algebraic_graph_traversal_attempt_count: u64 = 0,
+    algebraic_graph_traversal_proven_count: u64 = 0,
+    algebraic_graph_traversal_rejected_count: u64 = 0,
+    algebraic_graph_traversal_fallback_count: u64 = 0,
+    algebraic_graph_traversal_result_node_count: u64 = 0,
+    graph_metric_status: []GraphMetricStatus = &.{},
+    algebraic_observed_query_shape_count: u64 = 0,
+    algebraic_recommendation_count: u64 = 0,
+    algebraic_adaptive_candidate_count: u64 = 0,
+    algebraic_adaptive_progress_count: u64 = 0,
+    algebraic_adaptive_backfilling_count: u64 = 0,
+    algebraic_adaptive_ready_count: u64 = 0,
+    algebraic_adaptive_stale_count: u64 = 0,
+    algebraic_adaptive_dematerialize_recommended_count: u64 = 0,
+    algebraic_adaptive_decision_history_count: u64 = 0,
+    algebraic_adaptive_policy_drift_count: u64 = 0,
+    algebraic_last_observed_query_shape: ?[]const u8 = null,
+    algebraic_last_recommended_materialization: ?[]const u8 = null,
+    algebraic_top_candidate: ?AlgebraicCandidateStatus = null,
+    algebraic_active_progress: ?AlgebraicProgressStatus = null,
+    algebraic_candidates: []const AlgebraicCandidateStatus = &.{},
+    algebraic_candidate_decision_history: []const AlgebraicCandidateDecisionStatus = &.{},
+    algebraic_progress: []const AlgebraicProgressStatus = &.{},
+};
+
+/// Read-only physical layout of a full-text index snapshot. This is an
+/// internal diagnostics/benchmark surface: callers must not use segment IDs or
+/// positions as durable document identity.
+pub const TextSegmentLayoutStats = struct {
+    segment_id: u64,
+    doc_count: u32,
+    live_doc_count: u32,
+    deleted_count: u32,
+    bytes: u64,
+    file_backed: bool,
+};
+
+pub const TextMergePolicyStats = struct {
+    max_segments_per_tier: u32,
+    max_merge_at_once: u32,
+    max_segment_size: u64,
+    floor_segment_size: u64,
+    skew_weight: f64,
+    size_weight: f64,
+    delete_reclaim_weight: f64,
+};
+
+pub const TextIndexLayoutStats = struct {
+    global_doc_count: u32,
+    total_bytes: u64,
+    segments: []TextSegmentLayoutStats,
+    merge_policy: TextMergePolicyStats,
+    merge_stats: TextMergeStats,
+
+    pub fn deinit(self: *TextIndexLayoutStats, alloc: Allocator) void {
+        if (self.segments.len > 0) alloc.free(self.segments);
+        self.* = undefined;
+    }
+};
+
+pub const TextKernelHit = struct {
+    /// Stable, one-based native document ordinal. Benchmark adapters may
+    /// normalize this to their declared external ordinal base.
+    doc_ordinal: u32,
+    score: f32,
+};
+
+pub const TextBM25Config = struct {
+    k1: f32 = 1.2,
+    b: f32 = 0.75,
+};
+
+pub const TextKernelSearchOptions = struct {
+    limit: u32 = 10,
+    bm25: TextBM25Config = .{},
+    collect_diagnostics: bool = false,
+};
+
+pub const TextKernelDiagnostics = struct {
+    segments_considered: u64 = 0,
+    segments_searched: u64 = 0,
+    segments_pruned: u64 = 0,
+    postings_iterators_opened: u64 = 0,
+    wand_next_in_score: u64 = 0,
+    wand_next_in_advance: u64 = 0,
+    wand_pivots_scored: u64 = 0,
+    wand_pivots_advanced: u64 = 0,
+    wand_chunks_skipped: u64 = 0,
+    boolean_candidates_scored: u64 = 0,
+    boolean_chunks_skipped: u64 = 0,
+    phrase_candidates_verified: u64 = 0,
+    phrase_position_records_decoded: u64 = 0,
+    phrase_matches_scored: u64 = 0,
+};
+
+pub const TextKernelResult = struct {
+    hits: []TextKernelHit,
+    total_hits: u32,
+    total_hits_relation: TotalHitsRelation,
+    diagnostics: TextKernelDiagnostics = .{},
+
+    pub fn deinit(self: *TextKernelResult, alloc: Allocator) void {
+        if (self.hits.len > 0) alloc.free(self.hits);
+        self.* = undefined;
+    }
+};
+
+pub const AlgebraicMaterializationState = struct {
+    index_name: []u8,
+    recommendation: []u8,
+    lifecycle: []u8,
+    observation_count: u64 = 0,
+
+    pub fn deinit(self: *AlgebraicMaterializationState, alloc: Allocator) void {
+        alloc.free(self.index_name);
+        alloc.free(self.recommendation);
+        alloc.free(self.lifecycle);
+        self.* = undefined;
+    }
+};
+
+pub fn freeAlgebraicMaterializationStates(alloc: Allocator, states: []AlgebraicMaterializationState) void {
+    for (states) |*state| state.deinit(alloc);
+    if (states.len > 0) alloc.free(states);
+}
+
+pub const AlgebraicQueryObservation = struct {
+    index_name: []u8,
+    shape: []u8,
+    count: u64 = 0,
+    reason: []u8,
+    recommendation: ?[]u8 = null,
+    lifecycle: []u8,
+
+    pub fn deinit(self: *AlgebraicQueryObservation, alloc: Allocator) void {
+        alloc.free(self.index_name);
+        alloc.free(self.shape);
+        alloc.free(self.reason);
+        if (self.recommendation) |value| alloc.free(value);
+        alloc.free(self.lifecycle);
+        self.* = undefined;
+    }
+};
+
+pub fn freeAlgebraicQueryObservations(alloc: Allocator, observations: []AlgebraicQueryObservation) void {
+    for (observations) |*observation| observation.deinit(alloc);
+    if (observations.len > 0) alloc.free(observations);
+}
+
+pub const AlgebraicAdaptiveCandidate = struct {
+    index_name: []u8,
+    recommendation: []u8,
+    materialization_id: []u8,
+    lifecycle: []u8,
+    observation_count: u64 = 0,
+    estimated_scan_rows_saved: u64 = 0,
+    estimated_write_cost: u64 = 0,
+    estimated_doc_rows: u64 = 0,
+    estimated_bucket_cardinality: u64 = 0,
+    estimated_tensor_rows: u64 = 0,
+    estimated_storage_bytes: u64 = 0,
+    estimated_write_amplification: u64 = 0,
+    score: i128 = 0,
+    decision: []u8,
+    idle_miss_count: u64 = 0,
+    generation: u64 = 0,
+
+    pub fn deinit(self: *AlgebraicAdaptiveCandidate, alloc: Allocator) void {
+        alloc.free(self.index_name);
+        alloc.free(self.recommendation);
+        alloc.free(self.materialization_id);
+        alloc.free(self.lifecycle);
+        alloc.free(self.decision);
+        self.* = undefined;
+    }
+};
+
+pub fn freeAlgebraicAdaptiveCandidates(alloc: Allocator, candidates: []AlgebraicAdaptiveCandidate) void {
+    for (candidates) |*candidate| candidate.deinit(alloc);
+    if (candidates.len > 0) alloc.free(candidates);
+}
+
+pub const AlgebraicAdaptiveProgress = struct {
+    index_name: []u8,
+    recommendation: []u8,
+    materialization_id: []u8,
+    lifecycle: []u8,
+    target_sequence: u64 = 0,
+    applied_sequence: u64 = 0,
+    rows_processed: u64 = 0,
+    target_rows: u64 = 0,
+
+    pub fn deinit(self: *AlgebraicAdaptiveProgress, alloc: Allocator) void {
+        alloc.free(self.index_name);
+        alloc.free(self.recommendation);
+        alloc.free(self.materialization_id);
+        alloc.free(self.lifecycle);
+        self.* = undefined;
+    }
+};
+
+pub fn freeAlgebraicAdaptiveProgress(alloc: Allocator, progress: []AlgebraicAdaptiveProgress) void {
+    for (progress) |*item| item.deinit(alloc);
+    if (progress.len > 0) alloc.free(progress);
+}
+
+pub const HbcPostingStats = struct {
+    /// False only after a clean bounded sweep at the current mutation epoch.
+    /// Defaults conservatively when a runtime observation is unavailable.
+    refresh_pending: bool = true,
+    scanned_nodes: u64 = 0,
+    scanned_postings: u64 = 0,
+    dirty_postings: u64 = 0,
+    centroid_dirty_postings: u64 = 0,
+    payload_dirty_postings: u64 = 0,
+    max_centroid_version_lag: u64 = 0,
+    max_payload_version_lag: u64 = 0,
+    max_mutation_version: u64 = 0,
+    skipped_missing: u64 = 0,
+    maintenance_scanned_nodes: u64 = 0,
+    maintenance_scanned_postings: u64 = 0,
+    maintenance_dirty_postings: u64 = 0,
+    maintenance_repaired_postings: u64 = 0,
+    maintenance_centroid_refreshed: u64 = 0,
+    maintenance_payload_refreshed: u64 = 0,
+    maintenance_ancestor_refresh_roots: u64 = 0,
+    maintenance_split_postings: u64 = 0,
+    maintenance_merged_postings: u64 = 0,
+    maintenance_boundary_reassigned_vectors: u64 = 0,
+    lazy_centroid_deferrals: u64 = 0,
+    lazy_payload_deferrals: u64 = 0,
+    lazy_ancestor_deferrals: u64 = 0,
+};
+
+pub const HbcCacheKindStats = struct {
+    used_bytes: u64 = 0,
+    peak_bytes: u64 = 0,
+    hits: u64 = 0,
+    misses: u64 = 0,
+    insertions: u64 = 0,
+    replacements: u64 = 0,
+    sampled_admissions: u64 = 0,
+    admission_skips: u64 = 0,
+    evictions: u64 = 0,
+};
+
+pub const HbcCacheStats = struct {
+    total_bytes: u64 = 0,
+    accounted_bytes: u64 = 0,
+    pinned_bytes: u64 = 0,
+    node: HbcCacheKindStats = .{},
+    quantized: HbcCacheKindStats = .{},
+    vector: HbcCacheKindStats = .{},
+    metadata: HbcCacheKindStats = .{},
+};
+
+pub const DBMutexStats = struct {
+    lock_calls: u64 = 0,
+    contended_calls: u64 = 0,
+    max_waiters: u64 = 0,
+    spin_loops: u64 = 0,
+    yield_loops: u64 = 0,
+    sleep_loops: u64 = 0,
+    wait_ns: u64 = 0,
+    max_wait_ns: u64 = 0,
+    hold_ns: u64 = 0,
+    max_hold_ns: u64 = 0,
+};
+
+pub const AppliedSequenceStats = struct {
+    note_calls: u64 = 0,
+    forced_flush_calls: u64 = 0,
+    skipped_flush_calls: u64 = 0,
+    flush_calls: u64 = 0,
+    flushed_indexes: u64 = 0,
+    sync_ns: u64 = 0,
+    posting_publish_ns: u64 = 0,
+    projection_metadata_ns: u64 = 0,
+    checkpoint_file_ns: u64 = 0,
+    status_snapshot_ns: u64 = 0,
+    save_ns: u64 = 0,
+    flush_ns: u64 = 0,
+    max_flush_ns: u64 = 0,
+};
+
+pub const DenseCatchUpStats = struct {
+    pub const Phase = enum(u8) {
+        idle = 0,
+        replay = 1,
+        bulk_finish = 2,
+        bulk_split = 3,
+        bulk_publish = 4,
+        applied_sequence_flush = 5,
+    };
+
+    begin_calls: u64 = 0,
+    finish_calls: u64 = 0,
+    abort_calls: u64 = 0,
+    active: bool = false,
+    phase: Phase = .idle,
+    current_sequence: u64 = 0,
+    current_target_sequence: u64 = 0,
+    current_scanned_entries: u64 = 0,
+    current_applied_entries: u64 = 0,
+    replay_scan_batches: u64 = 0,
+    replay_hint_filter_skips: u64 = 0,
+    progress_updates: u64 = 0,
+    bulk_finish_windows: u64 = 0,
+    bulk_finish_split_steps: u64 = 0,
+    bulk_finish_deferred_leaf_splits: u64 = 0,
+    bulk_finish_current_window: u64 = 0,
+    bulk_finish_current_window_split_steps: u64 = 0,
+    bulk_finish_current_window_ns: u64 = 0,
+    bulk_finish_max_window_ns: u64 = 0,
+    finish_ns: u64 = 0,
+    max_finish_ns: u64 = 0,
+    finalize_ns: u64 = 0,
+    max_finalize_ns: u64 = 0,
+    maintenance_calls: u64 = 0,
+    maintenance_steps: u64 = 0,
+    maintenance_ns: u64 = 0,
+    max_maintenance_ns: u64 = 0,
+    manifest_writes: u64 = 0,
+    manifest_ns: u64 = 0,
+    write_pressure_compactions: u64 = 0,
+    write_pressure_ns: u64 = 0,
+};
+
+pub const StartupCatchUpPhase = enum(u8) {
+    idle = 0,
+    opening_db = 1,
+    artifact_rebuild = 2,
+    startup_catch_up = 3,
+};
+
+pub const StartupCatchUpStats = struct {
+    active: bool = false,
+    phase: StartupCatchUpPhase = .idle,
+    wal_retention_known: bool = false,
+    wal_retained_segments: u64 = 0,
+    wal_retained_bytes: u64 = 0,
+    wal_checkpoint_oldest_retained_segment: u64 = 0,
+    wal_checkpoint_covered_through_segment: u64 = 0,
+    wal_checkpoint_current_segment: u64 = 0,
+    wal_checkpoint_lag_segments: u64 = 0,
+    wal_replay_retained_segments: u64 = 0,
+    wal_replay_retained_bytes: u64 = 0,
+    wal_replay_current_segment: u64 = 0,
+    configured_indexes: u32 = 0,
+    configured_dense_indexes: u32 = 0,
+    configured_sparse_indexes: u32 = 0,
+    configured_full_text_indexes: u32 = 0,
+    configured_graph_indexes: u32 = 0,
+    opened_indexes: u32 = 0,
+    db_open_ns: u64 = 0,
+    load_indexes_ns: u64 = 0,
+    lsm_open_stores: u64 = 0,
+    lsm_open_completed: u64 = 0,
+    lsm_open_failed: u64 = 0,
+    lsm_open_total_ns: u64 = 0,
+    lsm_open_initializing_storage_ns: u64 = 0,
+    lsm_open_recovered_temp_cleanup_ns: u64 = 0,
+    lsm_open_manifest_ns: u64 = 0,
+    lsm_open_ensuring_dirs_ns: u64 = 0,
+    lsm_open_wal_replay_ns: u64 = 0,
+    lsm_open_mounting_runs_ns: u64 = 0,
+    lsm_open_loaded_runs: u64 = 0,
+    lsm_open_obsolete_paths: u64 = 0,
+    lsm_open_mutable_entries_after_replay: u64 = 0,
+    lsm_open_immutable_memtables_after_replay: u64 = 0,
+    lsm_open_recovered_temp_files_deleted: u64 = 0,
+    lsm_open_recovered_temp_bytes_deleted: u64 = 0,
+    wal_replay_records: u64 = 0,
+    wal_replay_entries: u64 = 0,
+    wal_replay_bytes: u64 = 0,
+    wal_replay_ns: u64 = 0,
+    wal_replay_truncated_tail_bytes: u64 = 0,
+};
+
+pub const AsyncIndexingStats = struct {
+    apply_mutex: DBMutexStats = .{},
+    applied_sequence_mutex: DBMutexStats = .{},
+    dense_finish_mutex: DBMutexStats = .{},
+    applied_sequence: AppliedSequenceStats = .{},
+    startup: StartupCatchUpStats = .{},
+    dense_catch_up: DenseCatchUpStats = .{},
+    dense_projection_finalizing: bool = false,
+    bulk_coalescing: BulkCoalescingStats = .{},
+    derived_workers: DerivedWorkerStats = .{},
+};
+
+pub const DerivedWorkerStats = struct {
+    workers: u64 = 0,
+    workers_with_replay_debt: u64 = 0,
+    max_replay_lag_sequences: u64 = 0,
+    recoverable_retries: u64 = 0,
+    writer_locked_retries: u64 = 0,
+    resource_budget_retries: u64 = 0,
+    replay_document_not_visible_retries: u64 = 0,
+    artifact_repair_required_retries: u64 = 0,
+    not_found_retries: u64 = 0,
+    /// Documents given up on by bounded replay-document-not-visible
+    /// escalation, summed across every index (see
+    /// ResourceManager.replayDocumentNotVisibleSkippedTotalAll).
+    replay_document_not_visible_skipped_total: u64 = 0,
+};
+
+pub const BulkCoalescingStats = struct {
+    active_session: bool = false,
+    staged_keys: u64 = 0,
+    stage_batches: u64 = 0,
+    stage_writes: u64 = 0,
+    stage_deletes: u64 = 0,
+    stage_transforms: u64 = 0,
+    flush_calls: u64 = 0,
+    flushed_keys: u64 = 0,
+};
+
+pub fn accumulateDbMutexStats(dst: *DBMutexStats, src: DBMutexStats) void {
+    dst.lock_calls += src.lock_calls;
+    dst.contended_calls += src.contended_calls;
+    dst.max_waiters = @max(dst.max_waiters, src.max_waiters);
+    dst.spin_loops += src.spin_loops;
+    dst.yield_loops += src.yield_loops;
+    dst.sleep_loops += src.sleep_loops;
+    dst.wait_ns += src.wait_ns;
+    dst.max_wait_ns = @max(dst.max_wait_ns, src.max_wait_ns);
+    dst.hold_ns += src.hold_ns;
+    dst.max_hold_ns = @max(dst.max_hold_ns, src.max_hold_ns);
+}
+
+pub fn accumulateAppliedSequenceStats(dst: *AppliedSequenceStats, src: AppliedSequenceStats) void {
+    dst.note_calls += src.note_calls;
+    dst.forced_flush_calls += src.forced_flush_calls;
+    dst.skipped_flush_calls += src.skipped_flush_calls;
+    dst.flush_calls += src.flush_calls;
+    dst.flushed_indexes += src.flushed_indexes;
+    dst.sync_ns += src.sync_ns;
+    dst.posting_publish_ns += src.posting_publish_ns;
+    dst.projection_metadata_ns += src.projection_metadata_ns;
+    dst.checkpoint_file_ns += src.checkpoint_file_ns;
+    dst.status_snapshot_ns += src.status_snapshot_ns;
+    dst.save_ns += src.save_ns;
+    dst.flush_ns += src.flush_ns;
+    dst.max_flush_ns = @max(dst.max_flush_ns, src.max_flush_ns);
+}
+
+pub fn accumulateDenseCatchUpStats(dst: *DenseCatchUpStats, src: DenseCatchUpStats) void {
+    dst.begin_calls += src.begin_calls;
+    dst.finish_calls += src.finish_calls;
+    dst.abort_calls += src.abort_calls;
+    dst.active = dst.active or src.active;
+    if (@backingInt(src.phase) > @backingInt(dst.phase)) dst.phase = src.phase;
+    dst.current_sequence = @max(dst.current_sequence, src.current_sequence);
+    dst.current_target_sequence = @max(dst.current_target_sequence, src.current_target_sequence);
+    dst.current_scanned_entries += src.current_scanned_entries;
+    dst.current_applied_entries += src.current_applied_entries;
+    dst.replay_scan_batches += src.replay_scan_batches;
+    dst.replay_hint_filter_skips += src.replay_hint_filter_skips;
+    dst.progress_updates += src.progress_updates;
+    dst.bulk_finish_windows += src.bulk_finish_windows;
+    dst.bulk_finish_split_steps += src.bulk_finish_split_steps;
+    dst.bulk_finish_deferred_leaf_splits = @max(dst.bulk_finish_deferred_leaf_splits, src.bulk_finish_deferred_leaf_splits);
+    dst.bulk_finish_current_window = @max(dst.bulk_finish_current_window, src.bulk_finish_current_window);
+    dst.bulk_finish_current_window_split_steps = @max(dst.bulk_finish_current_window_split_steps, src.bulk_finish_current_window_split_steps);
+    dst.bulk_finish_current_window_ns = @max(dst.bulk_finish_current_window_ns, src.bulk_finish_current_window_ns);
+    dst.bulk_finish_max_window_ns = @max(dst.bulk_finish_max_window_ns, src.bulk_finish_max_window_ns);
+    dst.finish_ns += src.finish_ns;
+    dst.max_finish_ns = @max(dst.max_finish_ns, src.max_finish_ns);
+    dst.finalize_ns += src.finalize_ns;
+    dst.max_finalize_ns = @max(dst.max_finalize_ns, src.max_finalize_ns);
+    dst.maintenance_calls += src.maintenance_calls;
+    dst.maintenance_steps += src.maintenance_steps;
+    dst.maintenance_ns += src.maintenance_ns;
+    dst.max_maintenance_ns = @max(dst.max_maintenance_ns, src.max_maintenance_ns);
+    dst.manifest_writes += src.manifest_writes;
+    dst.manifest_ns += src.manifest_ns;
+    dst.write_pressure_compactions += src.write_pressure_compactions;
+    dst.write_pressure_ns += src.write_pressure_ns;
+}
+
+pub fn accumulateStartupCatchUpStats(dst: *StartupCatchUpStats, src: StartupCatchUpStats) void {
+    dst.active = dst.active or src.active;
+    if (@backingInt(src.phase) > @backingInt(dst.phase)) dst.phase = src.phase;
+    dst.wal_retention_known = dst.wal_retention_known or src.wal_retention_known;
+    dst.wal_retained_segments += src.wal_retained_segments;
+    dst.wal_retained_bytes += src.wal_retained_bytes;
+    dst.wal_checkpoint_oldest_retained_segment = minNonZeroU64(dst.wal_checkpoint_oldest_retained_segment, src.wal_checkpoint_oldest_retained_segment);
+    dst.wal_checkpoint_covered_through_segment = @max(dst.wal_checkpoint_covered_through_segment, src.wal_checkpoint_covered_through_segment);
+    dst.wal_checkpoint_current_segment = @max(dst.wal_checkpoint_current_segment, src.wal_checkpoint_current_segment);
+    dst.wal_checkpoint_lag_segments += src.wal_checkpoint_lag_segments;
+    dst.wal_replay_retained_segments += src.wal_replay_retained_segments;
+    dst.wal_replay_retained_bytes += src.wal_replay_retained_bytes;
+    dst.wal_replay_current_segment = @max(dst.wal_replay_current_segment, src.wal_replay_current_segment);
+    dst.configured_indexes = @max(dst.configured_indexes, src.configured_indexes);
+    dst.configured_dense_indexes = @max(dst.configured_dense_indexes, src.configured_dense_indexes);
+    dst.configured_sparse_indexes = @max(dst.configured_sparse_indexes, src.configured_sparse_indexes);
+    dst.configured_full_text_indexes = @max(dst.configured_full_text_indexes, src.configured_full_text_indexes);
+    dst.configured_graph_indexes = @max(dst.configured_graph_indexes, src.configured_graph_indexes);
+    dst.opened_indexes = @max(dst.opened_indexes, src.opened_indexes);
+    dst.db_open_ns = @max(dst.db_open_ns, src.db_open_ns);
+    dst.load_indexes_ns = @max(dst.load_indexes_ns, src.load_indexes_ns);
+    dst.lsm_open_stores += src.lsm_open_stores;
+    dst.lsm_open_completed += src.lsm_open_completed;
+    dst.lsm_open_failed += src.lsm_open_failed;
+    dst.lsm_open_total_ns += src.lsm_open_total_ns;
+    dst.lsm_open_initializing_storage_ns += src.lsm_open_initializing_storage_ns;
+    dst.lsm_open_recovered_temp_cleanup_ns += src.lsm_open_recovered_temp_cleanup_ns;
+    dst.lsm_open_manifest_ns += src.lsm_open_manifest_ns;
+    dst.lsm_open_ensuring_dirs_ns += src.lsm_open_ensuring_dirs_ns;
+    dst.lsm_open_wal_replay_ns += src.lsm_open_wal_replay_ns;
+    dst.lsm_open_mounting_runs_ns += src.lsm_open_mounting_runs_ns;
+    dst.lsm_open_loaded_runs += src.lsm_open_loaded_runs;
+    dst.lsm_open_obsolete_paths += src.lsm_open_obsolete_paths;
+    dst.lsm_open_mutable_entries_after_replay += src.lsm_open_mutable_entries_after_replay;
+    dst.lsm_open_immutable_memtables_after_replay += src.lsm_open_immutable_memtables_after_replay;
+    dst.lsm_open_recovered_temp_files_deleted += src.lsm_open_recovered_temp_files_deleted;
+    dst.lsm_open_recovered_temp_bytes_deleted += src.lsm_open_recovered_temp_bytes_deleted;
+    dst.wal_replay_records += src.wal_replay_records;
+    dst.wal_replay_entries += src.wal_replay_entries;
+    dst.wal_replay_bytes += src.wal_replay_bytes;
+    dst.wal_replay_ns += src.wal_replay_ns;
+    dst.wal_replay_truncated_tail_bytes += src.wal_replay_truncated_tail_bytes;
+}
+
+fn minNonZeroU64(lhs: u64, rhs: u64) u64 {
+    if (lhs == 0) return rhs;
+    if (rhs == 0) return lhs;
+    return @min(lhs, rhs);
+}
+
+pub fn accumulateAsyncIndexingStats(dst: *AsyncIndexingStats, src: AsyncIndexingStats) void {
+    accumulateDbMutexStats(&dst.apply_mutex, src.apply_mutex);
+    accumulateDbMutexStats(&dst.applied_sequence_mutex, src.applied_sequence_mutex);
+    accumulateDbMutexStats(&dst.dense_finish_mutex, src.dense_finish_mutex);
+    accumulateAppliedSequenceStats(&dst.applied_sequence, src.applied_sequence);
+    accumulateStartupCatchUpStats(&dst.startup, src.startup);
+    accumulateDenseCatchUpStats(&dst.dense_catch_up, src.dense_catch_up);
+    dst.dense_projection_finalizing = dst.dense_projection_finalizing or src.dense_projection_finalizing;
+    dst.bulk_coalescing.active_session = dst.bulk_coalescing.active_session or src.bulk_coalescing.active_session;
+    dst.bulk_coalescing.staged_keys = @max(dst.bulk_coalescing.staged_keys, src.bulk_coalescing.staged_keys);
+    dst.bulk_coalescing.stage_batches += src.bulk_coalescing.stage_batches;
+    dst.bulk_coalescing.stage_writes += src.bulk_coalescing.stage_writes;
+    dst.bulk_coalescing.stage_deletes += src.bulk_coalescing.stage_deletes;
+    dst.bulk_coalescing.stage_transforms += src.bulk_coalescing.stage_transforms;
+    dst.bulk_coalescing.flush_calls += src.bulk_coalescing.flush_calls;
+    dst.bulk_coalescing.flushed_keys += src.bulk_coalescing.flushed_keys;
+    dst.derived_workers.workers += src.derived_workers.workers;
+    dst.derived_workers.workers_with_replay_debt += src.derived_workers.workers_with_replay_debt;
+    dst.derived_workers.max_replay_lag_sequences = @max(dst.derived_workers.max_replay_lag_sequences, src.derived_workers.max_replay_lag_sequences);
+    dst.derived_workers.recoverable_retries += src.derived_workers.recoverable_retries;
+    dst.derived_workers.writer_locked_retries += src.derived_workers.writer_locked_retries;
+    dst.derived_workers.resource_budget_retries += src.derived_workers.resource_budget_retries;
+    dst.derived_workers.replay_document_not_visible_retries += src.derived_workers.replay_document_not_visible_retries;
+    dst.derived_workers.artifact_repair_required_retries += src.derived_workers.artifact_repair_required_retries;
+    dst.derived_workers.not_found_retries += src.derived_workers.not_found_retries;
+    dst.derived_workers.replay_document_not_visible_skipped_total += src.derived_workers.replay_document_not_visible_skipped_total;
+}
+
+pub fn freeResolverReplayDiagnostics(alloc: Allocator, stats: ResolverReplayDiagnostics) void {
+    for (stats.resolvers) |resolver| {
+        alloc.free(resolver.name);
+        alloc.free(resolver.table);
+        alloc.free(resolver.source_artifact);
+        alloc.free(resolver.resolution_artifact);
+    }
+    if (stats.resolvers.len > 0) alloc.free(stats.resolvers);
+}
+
+pub fn freeDBIndexStatsItem(alloc: Allocator, item: DBIndexStats) void {
+    freeGraphMetricStatuses(alloc, item.graph_metric_status);
+    alloc.free(item.name);
+    for (item.source_replay) |source| alloc.free(source.artifact_name);
+    if (item.source_replay.len > 0) alloc.free(item.source_replay);
+    if (item.load_error) |value| alloc.free(value);
+    if (item.index_repair_last_error) |value| alloc.free(value);
+    if (item.algebraic_last_error_doc_key) |value| alloc.free(value);
+    if (item.algebraic_last_error_reason) |value| alloc.free(value);
+    if (item.algebraic_capability_fingerprint) |value| alloc.free(value);
+    if (item.algebraic_capability_lifecycle_status) |value| alloc.free(value);
+    if (item.algebraic_planner_last_decision) |value| alloc.free(value);
+    if (item.algebraic_planner_last_fallback_reason) |value| alloc.free(value);
+    if (item.algebraic_planner_lifecycle_blocking_reason) |value| alloc.free(value);
+    if (item.algebraic_last_observed_query_shape) |value| alloc.free(value);
+    if (item.algebraic_last_recommended_materialization) |value| alloc.free(value);
+    if (item.algebraic_top_candidate) |candidate| {
+        alloc.free(candidate.recommendation);
+        alloc.free(candidate.materialization_id);
+        alloc.free(candidate.lifecycle);
+        alloc.free(candidate.decision);
+    }
+    if (item.algebraic_active_progress) |progress| {
+        alloc.free(progress.recommendation);
+        alloc.free(progress.materialization_id);
+        alloc.free(progress.lifecycle);
+    }
+    for (item.algebraic_candidates) |candidate| {
+        alloc.free(candidate.recommendation);
+        alloc.free(candidate.materialization_id);
+        alloc.free(candidate.lifecycle);
+        alloc.free(candidate.decision);
+    }
+    if (item.algebraic_candidates.len > 0) alloc.free(item.algebraic_candidates);
+    for (item.algebraic_candidate_decision_history) |entry| {
+        alloc.free(entry.recommendation);
+        alloc.free(entry.materialization_id);
+        alloc.free(entry.lifecycle);
+        alloc.free(entry.previous_decision);
+        alloc.free(entry.decision);
+    }
+    if (item.algebraic_candidate_decision_history.len > 0) alloc.free(item.algebraic_candidate_decision_history);
+    for (item.algebraic_progress) |progress| {
+        alloc.free(progress.recommendation);
+        alloc.free(progress.materialization_id);
+        alloc.free(progress.lifecycle);
+    }
+    if (item.algebraic_progress.len > 0) alloc.free(item.algebraic_progress);
+}
+
+pub fn freeDBStats(alloc: Allocator, stats: DBStats) void {
+    freeResolverReplayDiagnostics(alloc, stats.resolver_replay);
+    for (stats.indexes) |item| freeDBIndexStatsItem(alloc, item);
+    if (stats.indexes.len > 0) alloc.free(stats.indexes);
+}
+
+pub const NativePublicationResult = struct {
+    published: usize = 0,
+    /// No attempt was made because another owner holds an admission lane.
+    /// This is neither completed work nor evidence of zero progress.
+    busy: bool = false,
+    deferred: bool = false,
+};
+test "graph metric index stats cleanup owns nested status payloads" {
+    const alloc = std.testing.allocator;
+    var item: DBIndexStats = .{ .name = try alloc.dupe(u8, "graph_idx"), .kind = .graph };
+    defer freeDBIndexStatsItem(alloc, item);
+    const statuses = blk: {
+        const owned = try alloc.alloc(GraphMetricStatus, 1);
+        errdefer alloc.free(owned);
+        owned[0] = .{ .name = try alloc.dupe(u8, "pagerank") };
+        break :blk owned;
+    };
+    item.graph_metric_status = statuses;
+    statuses[0].build_worker_id = try alloc.dupe(u8, "worker");
+    statuses[0].build_cursor = try alloc.dupe(u8, "cursor");
+    statuses[0].last_error = try alloc.dupe(u8, "diagnostic");
+    statuses[0].build_pages = try alloc.alloc(GraphMetricBuildPageStatus, 1);
+    statuses[0].build_pages[0] = .{};
+    statuses[0].build_pages[0].cursor = try alloc.dupe(u8, "page-cursor");
+}
+
+/// Exact durable identity affected by a source-target advance. Names are
+/// borrowed for the synchronous callback. An empty slice with
+/// `target_scope_known = false` means the producer could not prove scope and
+/// consumers must conservatively fence the whole group.
+pub const IndexTargetVisibility = struct {
+    pub const ServingSetEffect = enum {
+        /// This commit may add or replace members, but cannot remove a
+        /// previously searchable member from this exact incarnation.
+        additive_only,
+        /// This commit contains a delete, overwrite, or another mutation
+        /// whose authoritative projection may have lower cardinality.
+        may_reduce,
+    };
+
+    index_name: []const u8,
+    kind: IndexKind,
+    incarnation: u64,
+    config_hash: u64,
+    serving_set_effect: ServingSetEffect = .may_reduce,
+};
+
+/// New relationship keys and durable endpoint retirements require peers that
+/// understand their complete identities before any primary rows are applied.
+pub fn requiresGraphRelationshipProtocol(req: BatchRequest) bool {
+    const keys = @import("../internal_keys.zig");
+    // Document writes can embed relationship IDs or derive graph effects from
+    // the local catalog. Gate their complete apply contract before extraction.
+    // Deletes generate exact retirements during apply even when the input
+    // contains only legacy tuples or document keys. Classify those effects
+    // before proposal; inspecting only already-materialized rows is too late.
+    if (req.writes.len != 0 or req.graph_endpoint_cleanup or req.deletes.len != 0 or req.graph_deletes.len != 0 or req.transforms.len != 0 or req.merge_page != null) return true;
+    if (req.transaction) |control| {
+        if (control == .resolve and control.resolve.status == .committed) return true;
+        // Field-derived inline edges depend on the local graph catalog, so
+        // even ordinary document values can acquire durable endpoint guards.
+        if (control == .prepare and req.writes.len != 0) return true;
+    }
+    for (req.graph_writes) |write| if (write.edge_id.len != 0 or write.owner_document.len != 0) return true;
+    for (req.graph_deletes) |delete| if (delete.edge_id.len != 0 or delete.owner_document.len != 0) return true;
+    for (req.merge_artifacts) |row| if (keys.isGraphRetirementKey(row.key) or keys.graphArtifactHasRelationshipId(row.key)) return true;
+    for (req.writes) |row| if (keys.isGraphRetirementKey(row.key) or keys.graphArtifactHasRelationshipId(row.key)) return true;
+    return false;
+}
+
+/// Shared binary-safe planner response and ordered maintenance request.
+/// Missing afterimages decode as an empty page for historical planners.
+pub const GraphEndpointCleanupStatus = struct {
+    pending: bool = false,
+    guards: []const @import("../graph_cleanup_contract.zig").Guard = &.{},
+    graph_deletes: []const GraphEdgeDelete = &.{},
+    deletes: []const []const u8 = &.{},
+    merge_artifacts: []const BatchWrite = &.{},
+
+    pub fn request(self: @This()) BatchRequest {
+        return .{
+            .graph_endpoint_cleanup = true,
+            .graph_endpoint_cleanup_planned = true,
+            .graph_endpoint_cleanup_guards = self.guards,
+            .graph_deletes = self.graph_deletes,
+            .deletes = self.deletes,
+            .merge_artifacts = self.merge_artifacts,
+            .sync_level = .write,
+        };
+    }
+};
+
+/// Cleanup is a private, effect-bearing command, never a flag that can be
+/// attached to a public mutation or a lifecycle control.
+pub fn validateGraphEndpointCleanupCommand(req: BatchRequest) !void {
+    for (req.graph_writes) |write| try @import("../../graph/mutation_identity.zig").validate(write.edge_id, write.owner_document, write.owner);
+    for (req.graph_deletes) |delete| try @import("../../graph/mutation_identity.zig").validate(delete.edge_id, delete.owner_document, delete.owner);
+    if (!req.graph_endpoint_cleanup) {
+        if (req.graph_endpoint_cleanup_planned or req.graph_endpoint_cleanup_guards.len != 0) return error.InvalidBatchRequest;
+        return;
+    }
+    if (req.graph_endpoint_cleanup_planned) try validatePlannedGraphEndpointCleanup(req);
+    const defaults = BatchRequest{};
+    inline for (@typeInfo(BatchRequest).@"struct".field_names, @typeInfo(BatchRequest).@"struct".field_types) |field_name, field_type| {
+        if (comptime !std.mem.eql(u8, field_name, "graph_endpoint_cleanup") and !std.mem.eql(u8, field_name, "graph_endpoint_cleanup_planned") and !std.mem.eql(u8, field_name, "timestamp_ns") and !std.mem.eql(u8, field_name, "sync_level")) {
+            if (comptime std.mem.eql(u8, field_name, "deletes") or std.mem.eql(u8, field_name, "graph_deletes") or std.mem.eql(u8, field_name, "graph_endpoint_cleanup_guards") or std.mem.eql(u8, field_name, "merge_artifacts")) {
+                if (!req.graph_endpoint_cleanup_planned and @field(req, field_name).len != 0) return error.InvalidBatchRequest;
+            } else {
+                const value = @field(req, field_name);
+                if (comptime @typeInfo(field_type) == .pointer and @typeInfo(field_type).pointer.size == .slice) {
+                    if (value.len != 0) return error.InvalidBatchRequest;
+                } else if (!std.meta.eql(value, @field(defaults, field_name))) return error.InvalidBatchRequest;
+            }
+        }
+    }
+}
+
+/// Planned pages can only remove inline edges and this maintenance queue.
+/// In particular, the constraint exemption never admits a document deletion.
+fn validatePlannedGraphEndpointCleanup(req: BatchRequest) !void {
+    const keys = @import("../internal_keys.zig");
+    const contract = @import("../graph_cleanup_contract.zig");
+    if (req.graph_deletes.len + req.deletes.len + req.merge_artifacts.len > 256 or req.graph_endpoint_cleanup_guards.len > 256) return error.InvalidBatchRequest;
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    for (req.graph_endpoint_cleanup_guards, 0..) |guard, i| {
+        if (guard.kind == .owner_replay and guard.generation == 0) return error.InvalidBatchRequest;
+        for (req.graph_endpoint_cleanup_guards[0..i]) |prior| if (guard.kind == prior.kind and std.mem.eql(u8, guard.endpoint, prior.endpoint)) return error.InvalidBatchRequest;
+    }
+    for (req.deletes) |key| {
+        var covered = false;
+        for (req.graph_endpoint_cleanup_guards) |guard| {
+            covered = if (guard.kind == .endpoint) contract.matchesKey(key, guard.endpoint) else contract.matchesOwnerJobKey(key, guard.endpoint) or (keys.isGraphRetirementKey(key) and try contract.ownedBy(alloc, key, guard.endpoint));
+            if (covered) break;
+        }
+        if (!covered) return error.InvalidBatchRequest;
+    }
+    for (req.graph_deletes) |edge| {
+        if (edge.owner_document.len != 0 or edge.index_name.len == 0 or edge.source.len == 0 or edge.target.len == 0) return error.InvalidBatchRequest;
+        var covered = false;
+        for (req.graph_endpoint_cleanup_guards) |guard| if (guard.kind == .endpoint and std.mem.eql(u8, guard.endpoint, edge.target)) {
+            covered = true;
+            break;
+        };
+        if (!covered) return error.InvalidBatchRequest;
+    }
+    for (req.merge_artifacts) |row| {
+        if (row.json_null_fields.len != 0) return error.InvalidBatchRequest;
+        var covered = false;
+        for (req.graph_endpoint_cleanup_guards) |guard| {
+            if (guard.kind != .owner_replay) continue;
+            if (contract.matchesOwnerJobKey(row.key, guard.endpoint)) {
+                const next = try contract.decodeOwnerJob(row.key, row.value);
+                if (next.generation != guard.generation) return error.InvalidBatchRequest;
+                covered = true;
+            } else covered = contract.isReplayInput(row.key) and try contract.ownedBy(alloc, row.key, guard.endpoint);
+            if (covered) break;
+        }
+        if (!covered) return error.InvalidBatchRequest;
+    }
+}
+
+test "graph relationship protocol gates document effects before extraction" {
+    for ([_][]const u8{
+        "{\"_edges\":{\"g\":{\"R\":[{\"target\":\"b\",\"edge_id\":\"one\"},{\"target\":\"b\",\"edge_id\":\"two\"}]}}}",
+        "{\"links\":[\"b\"]}",
+        "{}",
+    }) |document| try std.testing.expect(requiresGraphRelationshipProtocol(.{ .writes = &.{.{ .key = "a", .value = document }} }));
+    try std.testing.expect(!requiresGraphRelationshipProtocol(.{}));
+}

@@ -1,5 +1,17 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Ownership and rejection checks for the strict resident attention path.
 //! Numerical source-oracle comparisons live in the independent source test.
@@ -116,9 +128,9 @@ test "deberta training Metal owned metadata views and attention release all allo
     const inputs = try Inputs.init(&cb, &host);
     defer inputs.deinit(&cb);
     const before = tensor.memoryStatsSnapshot();
-    try std.testing.checkAllAllocationFailures(a, checkedView, .{device.backend.provider_impl.raw_decode_runtime.?});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, checkedView, .{device.backend.provider_impl.raw_decode_runtime.?});
     try sameLive(before);
-    try std.testing.checkAllAllocationFailures(a, allocationCheck, .{ device.backend, inputs });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, allocationCheck, .{ device.backend, inputs });
     try sameLive(before);
     const result = try inputs.backward(&cb);
     cb.free(result);

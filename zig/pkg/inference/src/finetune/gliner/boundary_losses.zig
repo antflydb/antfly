@@ -1,5 +1,17 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! GLiNER2.5 boundary training losses and explicit logit gradients.
 //! Formulas and reductions follow pinned upstream commit 3c913c7369301133d3b7699252074c4303ada50e.
@@ -1087,7 +1099,7 @@ fn allocationLifecycle(a: Allocator) !void {
     defer consistency.deinit();
 }
 test "boundary training all kernels release allocations on every failure" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, allocationLifecycle, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, allocationLifecycle, .{});
 }
 
 test "CUDA boundary Poisson count backward rounds the rate before subtracting the target" {

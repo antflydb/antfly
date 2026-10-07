@@ -1,4 +1,5 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -550,7 +551,7 @@ test "transcription response survives an allocation failure at any step" {
             transcribing_api.deinitResponse(allocator, &response);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
 }
 
 test "transcription response carries every speaker it labelled" {
@@ -21126,7 +21127,7 @@ test "gliner boundary v2 enum work retry releases every failed allocation" {
             defer a.free(bytes);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{&fixture});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Check.run, .{&fixture});
 }
 
 fn rebelSchemaFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {
@@ -26949,7 +26950,7 @@ test "Qwen3-VL encoded read results own page identities and report serial execut
             try std.testing.expectEqual(@as(usize, 0), batch.execution.fallback_items);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
 }
 
 test "read admission units scale with image batch and decode length" {
@@ -31504,7 +31505,7 @@ test "Antfly inference numeric HTTP response ownership is allocation failure saf
             try std.testing.expectEqual(@as(f32, 0.75), view.value(1));
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
 
 fn buildEmbedDenseResponse(

@@ -1,5 +1,18 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 const std = @import("std");
 const options = @import("build_options");
 const ml = @import("ml").graph;
@@ -275,7 +288,7 @@ test "resident program Metal allocation cancellation and external frame failures
     defer cb.free(source);
     const binding = program_mod.Binding{ .node_id = input, .value = source };
     const before = metal_tensor.memoryStatsSnapshot();
-    try std.testing.checkAllAllocationFailures(a, executionAllocationCheck, .{ device.backend, &program, binding });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, executionAllocationCheck, .{ device.backend, &program, binding });
     const Cancel = struct {
         calls: usize = 0,
         at: usize,

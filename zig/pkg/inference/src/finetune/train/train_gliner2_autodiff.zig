@@ -1,4 +1,5 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -4566,7 +4567,7 @@ test "classifier head setup is failure-atomic" {
             try initClassifierHeadInNativeStore(allocator, &weight_store, 42, 16, 4);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
 
 fn fillRectIdentity(data: []f32, out_dim: usize, in_dim: usize) void {

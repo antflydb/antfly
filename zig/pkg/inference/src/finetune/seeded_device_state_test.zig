@@ -1,5 +1,17 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 const std = @import("std");
 const state = @import("seeded_device_state.zig");
@@ -300,7 +312,7 @@ fn initializeAllocationFailures(a: Allocator) !void {
     try expectHost(&owner);
 }
 test "seeded device state initialization remains atomic at every allocation failure" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, initializeAllocationFailures, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, initializeAllocationFailures, .{});
 }
 
 test "seeded device state readback validates epoch and recovers uncertified mirrors in place" {

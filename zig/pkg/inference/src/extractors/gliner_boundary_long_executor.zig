@@ -1,5 +1,17 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Admitted serial windows followed by document-global task decisions. Model
 //! tensors die after each window; only bounded scalar evidence survives.
@@ -1007,7 +1019,7 @@ fn exerciseFakeMerge(a: Allocator, mode: FakeMergeMode) !void {
 
 test "gliner boundary long executor fake windows preserve global decisions ownership and atomic limits" {
     for ([_]FakeMergeMode{ .success, .output_limit, .cancelled, .exhausted }) |mode| try exerciseFakeMerge(std.testing.allocator, mode);
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, exerciseFakeMerge, .{FakeMergeMode.success});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, exerciseFakeMerge, .{FakeMergeMode.success});
 }
 
 // The current Zig arena can reject a larger speculative resize then try a

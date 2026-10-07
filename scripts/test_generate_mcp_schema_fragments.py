@@ -1,4 +1,5 @@
 # Copyright 2026 Antfly, Inc.
+# SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -183,6 +184,7 @@ class McpSchemaFragmentTests(unittest.TestCase):
             ("analyses", {"pca": True}),
             ("highlight", {}),
             ("evaluate", {"compute": {"x": {"literal": 1}}}),
+            ("remote_snapshot", "a" * 64),
             ("limit", 101),
             ("search_after", ["position-only"]),
             ("order_by", [{"field": "_hierarchy.position", "desc": True}]),

@@ -1,5 +1,17 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Canonical extraction schema compiler. Owns every string, slice and AST node;
 //! no parsed JSON or request buffer must outlive CompiledSchema. This module
@@ -865,7 +877,7 @@ test "extraction classification top_k rejection releases all nested allocations"
         "{\"classifications\":[{\"name\":\"t\",\"labels\":[\"a\",\"b\"],\"mode\":\"multi\",\"min_labels\":2,\"max_labels\":2,\"top_k\":1}]}",
         "{\"entities\":[\"person\"],\"entity_attributes\":{\"status\":{\"labels\":[\"active\",\"former\"]}},\"classifications\":[{\"name\":\"ordinary\",\"labels\":[\"a\",\"b\"],\"label_definitions\":{\"a\":{\"description\":\"First label\"}},\"examples\":[[\"Example\",\"a\"]],\"top_k\":2},{\"name\":\"structured\",\"labels\":[\"x\",\"y\"],\"ordered\":false}]}",
         "{\"classifications\":[{\"name\":\"t\",\"labels\":[\"a\",\"b\"],\"top_k\":1}],\"classification_constraints\":[{\"type\":\"LabelRef\",\"task\":\"t\",\"label\":\"a\"}]}",
-    }) |json| try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{json});
+    }) |json| try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Check.run, .{json});
 }
 
 test "extraction JointIE validates typed endpoints and remains distinct" {
@@ -909,5 +921,5 @@ test "extraction compiler owns nested allocations on every failure" {
             try std.testing.expectEqual(@as(usize, 1), compiled.schema.entity_attributes.len);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
 }

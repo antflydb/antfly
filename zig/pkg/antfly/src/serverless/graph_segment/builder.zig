@@ -1,4 +1,5 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Elastic-2.0
 //
 // Licensed under the Elastic License 2.0 (ELv2); you may not use this file
 // except in compliance with the Elastic License 2.0. You may obtain a copy of
@@ -292,7 +293,7 @@ test "serverless ordinal graph builder packs skewed duplicate and qualified adja
 }
 
 test "serverless ordinal graph builder allocation failure is recoverable by destruction" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, struct {
         fn run(alloc: Allocator) !void {
             var builder = Builder{ .alloc = alloc };
             defer builder.deinit();

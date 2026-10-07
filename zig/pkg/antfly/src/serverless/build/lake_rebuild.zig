@@ -1,4 +1,5 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Elastic-2.0
 //
 // Licensed under the Elastic License 2.0 (ELv2); you may not use this file
 // except in compliance with the Elastic License 2.0. You may obtain a copy of
@@ -1732,6 +1733,7 @@ fn builderKindForDesired(want: DesiredArtifact) !BuilderKind {
         .graph => .graph,
         .algebraic => error.AmbiguousLakeRebuildBuilder,
         .graph_metric => error.MissingLakeRebuildBuildSpec,
+        .ordered_rows => error.MissingLakeRebuildBuildSpec,
     };
 }
 
@@ -1744,6 +1746,7 @@ fn buildSpecForDesiredAlloc(alloc: Allocator, want: DesiredArtifact) !BuildSpec 
         .graph => .{ .graph = .{ .graph_column = try alloc.dupe(u8, try defaultBoundColumn(want.binding, 0)) } },
         .algebraic => error.MissingLakeRebuildBuildSpec,
         .graph_metric => error.MissingLakeRebuildBuildSpec,
+        .ordered_rows => error.MissingLakeRebuildBuildSpec,
     };
 }
 
@@ -3005,7 +3008,7 @@ test "serverless lake graph aliases bootstrap one projection without replay on i
                 try std.testing.expect(completed[1]);
             }
         };
-        try std.testing.checkAllAllocationFailures(a, Failures.run, .{ plan.operations, first });
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Failures.run, .{ plan.operations, first });
     }
 }
 

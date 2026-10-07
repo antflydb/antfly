@@ -1,5 +1,17 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! One admitted native training job. Each invocation owns a new output
 //! directory; resume reads the durable optimizer checkpoint into a fresh owner.
@@ -572,7 +584,7 @@ fn exerciseReceipt(a: Allocator) !void {
 
 test "boundary training job receipts publish atomically without replacement and clean allocation failures" {
     try exerciseReceipt(std.testing.allocator);
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, exerciseReceipt, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, exerciseReceipt, .{});
 }
 
 fn admissionTestConfig() Config {
@@ -747,7 +759,7 @@ fn exerciseConfigSnapshot(a: Allocator) !void {
 
 test "boundary training job config snapshot binds consumed bytes and cleans allocation failures" {
     try exerciseConfigSnapshot(std.testing.allocator);
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, exerciseConfigSnapshot, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, exerciseConfigSnapshot, .{});
 }
 
 test "boundary training job dataset open preserves declared and backing allocation errors before model loading" {

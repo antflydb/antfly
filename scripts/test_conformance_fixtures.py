@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # Copyright 2026 Antfly, Inc.
+# SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -35,9 +36,13 @@ class ConformanceFixturesTest(unittest.TestCase):
         cls.cache_args = [
             "--cache-dir",
             os.environ.get("ZIG_LOCAL_CACHE_DIR", "/tmp/zig-local-cache"),
-            "--global-cache-dir",
-            os.environ.get("ZIG_GLOBAL_CACHE_DIR", "/tmp/zig-global-cache"),
         ]
+        cls.cache_env = {
+            **os.environ,
+            "ZIG_GLOBAL_CACHE_DIR": os.environ.get(
+                "ZIG_GLOBAL_CACHE_DIR", "/tmp/zig-global-cache"
+            ),
+        }
         subprocess.run(
             [
                 "zig",
@@ -47,6 +52,7 @@ class ConformanceFixturesTest(unittest.TestCase):
                 *cls.cache_args,
             ],
             cwd=ZIG_ROOT,
+            env=cls.cache_env,
             check=True,
         )
 
@@ -79,7 +85,7 @@ class ConformanceFixturesTest(unittest.TestCase):
         )
         stub.chmod(0o755)
         self.env = {
-            **os.environ,
+            **self.cache_env,
             "PATH": str(self.root) + os.pathsep + os.environ["PATH"],
             "GIT_LOG": str(self.log),
             "FIXTURE_SEED": str(self.seed),

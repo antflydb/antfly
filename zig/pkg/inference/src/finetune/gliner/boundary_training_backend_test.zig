@@ -1,5 +1,17 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 const std = @import("std");
 const backend = @import("boundary_training_backend.zig");
@@ -113,7 +125,7 @@ fn cpuExercise(a: Allocator) !void {
 
 test "boundary training backend preserves native strict math source lifetime and empty frozen leases" {
     try cpuExercise(std.testing.allocator);
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, cpuExercise, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, cpuExercise, .{});
 }
 
 const Cancel = struct {
@@ -204,7 +216,7 @@ test "boundary training backend Metal validates bindings and recovers cancellati
     var g = try graph(a);
     defer g.deinit();
     const baseline = owner.metadata.live;
-    try std.testing.checkAllAllocationFailures(a, bindAllocation, .{ owner, &g });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, bindAllocation, .{ owner, &g });
     try std.testing.expectEqual(@as(usize, 0), owner.active_bindings);
     try std.testing.expectEqual(baseline, owner.metadata.live);
     var probe = Cancel{ .at = std.math.maxInt(usize) };

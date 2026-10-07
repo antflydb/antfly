@@ -1,0 +1,65 @@
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Volatile generation handshake. Durable markers and structural/apply fences
+//! belong to the caller; only successful passes acknowledge captured demand.
+const std = @import("std");
+const AtomicU64 = @import("antfly_platform").atomic.Value(u64);
+pub const Owner = struct {
+    requested: AtomicU64 = .init(0),
+    completed: AtomicU64 = .init(0),
+    mutex: std.atomic.Mutex = .unlocked,
+    pub const Port = struct { ptr: *anyopaque, pass: *const fn (*anyopaque, std.mem.Allocator) anyerror!void };
+    pub fn request(self: *Owner) void {
+        _ = self.requested.fetchAdd(1, .release);
+    }
+    pub fn pending(self: *const Owner) bool {
+        return self.completed.load(.acquire) != self.requested.load(.acquire);
+    }
+    pub fn drain(self: *Owner, alloc: std.mem.Allocator, port: Port) !void {
+        while (!self.mutex.tryLock()) @import("antfly_platform").time.yieldNow();
+        defer self.mutex.unlock();
+        while (true) {
+            const target = self.requested.load(.acquire);
+            if (self.completed.load(.acquire) == target) return;
+            try port.pass(port.ptr, alloc);
+            self.completed.store(target, .release);
+        }
+    }
+};
+test "managed admission retains raced demand and failed passes" {
+    const F = struct {
+        owner: Owner = .{},
+        calls: usize = 0,
+        fail: bool = true,
+        fn pass(ptr: *anyopaque, _: std.mem.Allocator) !void {
+            const f: *@This() = @ptrCast(@alignCast(ptr));
+            f.calls += 1;
+            if (f.fail) return error.InjectedFailure;
+            if (f.calls == 2) f.owner.request();
+        }
+    };
+    var f: F = .{};
+    const port: Owner.Port = .{ .ptr = &f, .pass = F.pass };
+    f.owner.request();
+    try std.testing.expectError(error.InjectedFailure, f.owner.drain(std.testing.allocator, port));
+    try std.testing.expect(f.owner.pending());
+    f.fail = false;
+    try f.owner.drain(std.testing.allocator, port);
+    try std.testing.expectEqual(@as(usize, 3), f.calls);
+    try std.testing.expect(!f.owner.pending());
+    try f.owner.drain(std.testing.allocator, port);
+    try std.testing.expectEqual(@as(usize, 3), f.calls);
+}

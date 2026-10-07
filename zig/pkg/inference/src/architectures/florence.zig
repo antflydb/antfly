@@ -1,4 +1,5 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -516,7 +517,7 @@ fn compactPreallocatedDecoderIncrementalCacheInPlace(
 
 test "Florence compaction publishes active shapes and preserves borrowed backing through repeated EOS" {
     try testCompactedCrossViews(std.testing.allocator);
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, testCompactedCrossViews, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, testCompactedCrossViews, .{});
 }
 
 fn testCompactedCrossViews(allocator: std.mem.Allocator) !void {

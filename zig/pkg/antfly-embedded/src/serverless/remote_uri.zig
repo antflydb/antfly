@@ -1,0 +1,145 @@
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+
+pub const RemoteUri = union(enum) {
+    file: []u8,
+    gcs: BucketPath,
+    s3: BucketPath,
+};
+
+pub const BucketPath = struct {
+    bucket: []u8,
+    prefix: []u8,
+
+    pub fn deinit(self: *BucketPath, alloc: Allocator) void {
+        alloc.free(self.bucket);
+        alloc.free(self.prefix);
+        self.* = undefined;
+    }
+};
+
+pub fn parseAlloc(alloc: Allocator, uri: []const u8) !RemoteUri {
+    if (std.mem.startsWith(u8, uri, "file://")) {
+        return .{ .file = try filePathFromUriAlloc(alloc, uri) };
+    }
+    if (std.mem.startsWith(u8, uri, "gs://")) {
+        return .{ .gcs = try bucketPathFromGsUriAlloc(alloc, uri) };
+    }
+    if (std.mem.startsWith(u8, uri, "s3://")) {
+        return .{ .s3 = try bucketPathFromS3UriAlloc(alloc, uri) };
+    }
+    return error.UnsupportedRemoteUri;
+}
+
+pub fn filePathFromUriAlloc(alloc: Allocator, uri: []const u8) ![]u8 {
+    const prefix = "file://";
+    if (!std.mem.startsWith(u8, uri, prefix)) return error.UnsupportedRemoteUri;
+    if (uri.len == prefix.len) return error.InvalidRemoteUri;
+    return try alloc.dupe(u8, uri[prefix.len..]);
+}
+
+pub fn bucketPathFromGsUriAlloc(alloc: Allocator, uri: []const u8) !BucketPath {
+    return try bucketPathFromSchemeAlloc(alloc, uri, "gs://");
+}
+
+pub fn bucketPathFromS3UriAlloc(alloc: Allocator, uri: []const u8) !BucketPath {
+    return try bucketPathFromSchemeAlloc(alloc, uri, "s3://");
+}
+
+fn bucketPathFromSchemeAlloc(alloc: Allocator, uri: []const u8, prefix: []const u8) !BucketPath {
+    if (!std.mem.startsWith(u8, uri, prefix)) return error.UnsupportedRemoteUri;
+    const rest = uri[prefix.len..];
+    if (rest.len == 0) return error.InvalidRemoteUri;
+
+    const slash = std.mem.indexOfScalar(u8, rest, '/');
+    const bucket = if (slash) |idx| rest[0..idx] else rest;
+    if (bucket.len == 0) return error.InvalidRemoteUri;
+    const object_prefix = if (slash) |idx|
+        trimRightSlash(trimLeftSlash(rest[idx + 1 ..]))
+    else
+        "";
+
+    return .{
+        .bucket = try alloc.dupe(u8, bucket),
+        .prefix = try alloc.dupe(u8, object_prefix),
+    };
+}
+
+test "remote uri parses file scheme" {
+    const alloc = std.testing.allocator;
+    const path = try filePathFromUriAlloc(alloc, "file:///tmp/antfly");
+    defer alloc.free(path);
+    try std.testing.expectEqualStrings("/tmp/antfly", path);
+}
+
+test "remote uri parses gs scheme" {
+    const alloc = std.testing.allocator;
+    var bucket_path = try bucketPathFromGsUriAlloc(alloc, "gs://serverless-bucket/manifests/prod");
+    defer bucket_path.deinit(alloc);
+    try std.testing.expectEqualStrings("serverless-bucket", bucket_path.bucket);
+    try std.testing.expectEqualStrings("manifests/prod", bucket_path.prefix);
+}
+
+test "remote uri parses s3 scheme" {
+    const alloc = std.testing.allocator;
+    var bucket_path = try bucketPathFromS3UriAlloc(alloc, "s3://serverless-bucket/manifests/prod");
+    defer bucket_path.deinit(alloc);
+    try std.testing.expectEqualStrings("serverless-bucket", bucket_path.bucket);
+    try std.testing.expectEqualStrings("manifests/prod", bucket_path.prefix);
+}
+
+test "remote uri canonicalizes object prefix separators" {
+    const alloc = std.testing.allocator;
+    inline for (&.{
+        .{ "s3://bucket/prefix", "prefix" },
+        .{ "s3://bucket/prefix/", "prefix" },
+        .{ "s3://bucket/", "" },
+        .{ "s3://bucket/prefix//nested/", "prefix//nested" },
+    }) |case| {
+        var bucket_path = try bucketPathFromS3UriAlloc(alloc, case[0]);
+        defer bucket_path.deinit(alloc);
+        try std.testing.expectEqualStrings("bucket", bucket_path.bucket);
+        try std.testing.expectEqualStrings(case[1], bucket_path.prefix);
+    }
+
+    var gcs_bucket_path = try bucketPathFromGsUriAlloc(alloc, "gs://bucket/prefix/");
+    defer gcs_bucket_path.deinit(alloc);
+    try std.testing.expectEqualStrings("prefix", gcs_bucket_path.prefix);
+}
+
+test "remote uri parse alloc returns tagged result" {
+    const alloc = std.testing.allocator;
+    var parsed = try parseAlloc(alloc, "gs://bucket/path");
+    switch (parsed) {
+        .file => |value| alloc.free(value),
+        .gcs => |*value| value.deinit(alloc),
+        .s3 => |*value| value.deinit(alloc),
+    }
+}
+
+fn trimLeftSlash(value: []const u8) []const u8 {
+    var idx: usize = 0;
+    while (idx < value.len and value[idx] == '/') : (idx += 1) {}
+    return value[idx..];
+}
+
+fn trimRightSlash(value: []const u8) []const u8 {
+    var end = value.len;
+    while (end > 0 and value[end - 1] == '/') : (end -= 1) {}
+    return value[0..end];
+}

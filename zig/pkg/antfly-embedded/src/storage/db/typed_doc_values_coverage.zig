@@ -1,0 +1,41 @@
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+const std = @import("std");
+const index_mod = @import("../../index.zig");
+
+pub const Status = index_mod.TypedDocValuesCoverageStatus;
+
+pub fn statusName(status: Status) []const u8 {
+    return switch (status) {
+        .covered => "covered",
+        .missing_doc_values_section => "missing_doc_values_section",
+        .malformed_doc_values_section => "malformed_doc_values_section",
+        .doc_values_kind_mismatch => "doc_values_kind_mismatch",
+        .sparse_live_doc_values => "sparse_live_doc_values",
+        .invalid_doc_value_doc_id => "invalid_doc_value_doc_id",
+        .duplicate_doc_value_doc_id => "duplicate_doc_value_doc_id",
+    };
+}
+
+test "typed doc values coverage status names are stable" {
+    try std.testing.expectEqualStrings("covered", statusName(.covered));
+    try std.testing.expectEqualStrings("missing_doc_values_section", statusName(.missing_doc_values_section));
+    try std.testing.expectEqualStrings("malformed_doc_values_section", statusName(.malformed_doc_values_section));
+    try std.testing.expectEqualStrings("doc_values_kind_mismatch", statusName(.doc_values_kind_mismatch));
+    try std.testing.expectEqualStrings("sparse_live_doc_values", statusName(.sparse_live_doc_values));
+    try std.testing.expectEqualStrings("invalid_doc_value_doc_id", statusName(.invalid_doc_value_doc_id));
+    try std.testing.expectEqualStrings("duplicate_doc_value_doc_id", statusName(.duplicate_doc_value_doc_id));
+}

@@ -1,4 +1,5 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -9111,7 +9112,7 @@ fn testAcquiredWeightHandle(allocator: std.mem.Allocator) !void {
 
 test "CUDA acquired weight handles have independent metadata and borrowed storage" {
     try testAcquiredWeightHandle(std.testing.allocator);
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, testAcquiredWeightHandle, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, testAcquiredWeightHandle, .{});
 }
 
 fn prefetchWeightHint(ctx: *anyopaque, name: []const u8, hint: u32) void {

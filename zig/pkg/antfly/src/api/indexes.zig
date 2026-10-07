@@ -1,4 +1,5 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Elastic-2.0
 //
 // Licensed under the Elastic License 2.0 (ELv2); you may not use this file
 // except in compliance with the Elastic License 2.0. You may obtain a copy of
@@ -702,6 +703,104 @@ pub fn encodeIndexList(
     }
     try out.append(alloc, ']');
     return try out.toOwnedSlice(alloc);
+}
+
+/// Remote readiness is catalog owned. Empty native shard indexes cannot prove
+/// external coverage. Queryability is supplied only by a serving proof.
+pub fn encodeLakeIndexResource(alloc: std.mem.Allocator, table: metadata_table_manager.TableRecord, index_name: []const u8, config: std.json.Value, queryable: bool) ![]u8 {
+    const lake = @import("antfly_local_sources").metadata_lake_index_catalog;
+    var state = try lake.parse(alloc, table.lake_index_catalog_json);
+    defer state.deinit();
+    const desired = lake.desiredFingerprint(table);
+    const failure = if (state.value.failure) |value| if (std.mem.eql(u8, &value.desired, &desired)) value else null else null;
+    const published: ?u64 = if (state.value.published) |value| published: {
+        if (!std.mem.eql(u8, &value.signature.desired, &desired)) break :published null;
+        if (value.directory != null) break :published value.generation;
+        const algebraic = if (config == .object) if (config.object.get("type")) |kind| kind == .string and std.mem.eql(u8, kind.string, "algebraic") else false else false;
+        if (!algebraic) for (value.declarations) |declaration| {
+            if (std.mem.eql(u8, declaration.name, index_name)) break :published value.generation;
+        };
+        if (config == .object) if (config.object.get("materializations")) |mats| {
+            if (mats == .array and mats.array.items.len != 0) {
+                for (mats.array.items) |mat| {
+                    if (mat != .object) break :published null;
+                    const name = mat.object.get("name") orelse break :published null;
+                    if (name != .string) break :published null;
+                    const found = for (value.declarations) |declaration| {
+                        if (declaration.artifact.kind == .algebraic_segment and try @import("lake_index_names.zig").matches(alloc, declaration.name, index_name, name.string, declaration.artifact.metadata_version)) break true;
+                    } else false;
+                    if (!found) break :published null;
+                }
+                break :published value.generation;
+            }
+        };
+        break :published null;
+    } else null;
+    const serving_ready = queryable and published != null;
+    const readiness: indexes_openapi.IndexReadinessStatus = .{
+        .state = if (serving_ready) .ready else if (failure != null) .failed else .pending,
+        .queryable = serving_ready,
+        .complete = serving_ready,
+        .target_revision = if (state.value.generation > 0) state.value.generation else null,
+        .published_revision = published,
+        .pending_reasons = if (serving_ready) &.{} else if (failure != null) &.{.load_failure} else &.{.publication},
+    };
+    const status = try std.json.Stringify.valueAlloc(alloc, .{
+        .index_type = indexTypeName(inferIndexType(index_name, config) orelse return error.InvalidTableIndexMetadata),
+        .readiness = readiness,
+        .target_revision = readiness.target_revision,
+        .published_revision = published,
+        .@"error" = if (failure) |value| @as(?[]const u8, value.reason) else null,
+    }, .{ .emit_null_optional_fields = false });
+    defer alloc.free(status);
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(alloc);
+    try out.appendSlice(alloc, "{\"config\":");
+    try appendIndexConfig(alloc, &out, index_name, config);
+    try out.appendSlice(alloc, ",\"status\":");
+    try out.appendSlice(alloc, status);
+    try out.appendSlice(alloc, ",\"shard_status\":[]}");
+    return out.toOwnedSlice(alloc);
+}
+
+pub fn encodeLakeIndexList(alloc: std.mem.Allocator, table: metadata_table_manager.TableRecord) ![]u8 {
+    return encodeLakeIndexListWithProof(alloc, table, &.{});
+}
+pub fn encodeLakeIndexListWithProof(alloc: std.mem.Allocator, table: metadata_table_manager.TableRecord, queryable_names: []const []const u8) ![]u8 {
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var configs = try std.json.parseFromSliceLeaky(std.json.Value, a, indexesJsonSource(table.indexes_json), .{});
+    if (configs != .object) return error.InvalidTableIndexMetadata;
+    if (table.schema_json.len != 0) {
+        var schema = try @import("antfly_local_sources").schema_mod.parseValidatedTableSchema(a, table.schema_json);
+        defer schema.deinit(a);
+        var columns: @import("relational_expression_contract.zig").ColumnTypes = .{ .alloc = a, .source = .{ .parsed = &schema } };
+        defer columns.deinit();
+        if (schema.relational_indexes) |definitions| for (definitions.value) |definition| {
+            if (configs.object.contains(definition.name)) return error.InvalidTableIndexMetadata;
+            const json = try @import("relational_index_mutation.zig").configForDefinition(a, definition, &columns);
+            try configs.object.put(a, definition.name, try std.json.parseFromSliceLeaky(std.json.Value, a, json, .{}));
+        };
+    }
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(alloc);
+    try out.append(alloc, '[');
+    var it = configs.object.iterator();
+    var first = true;
+    while (it.next()) |entry| {
+        if (isReservedIndexMetadataEntry(entry.key_ptr.*)) continue;
+        const queryable = for (queryable_names) |name| {
+            if (std.mem.eql(u8, name, entry.key_ptr.*)) break true;
+        } else false;
+        const resource = try encodeLakeIndexResource(alloc, table, entry.key_ptr.*, entry.value_ptr.*, queryable);
+        defer alloc.free(resource);
+        if (!first) try out.append(alloc, ',');
+        first = false;
+        try out.appendSlice(alloc, resource);
+    }
+    try out.append(alloc, ']');
+    return out.toOwnedSlice(alloc);
 }
 
 pub fn encodeSingleIndex(
@@ -2064,6 +2163,7 @@ fn accumulateSourceReplayStatus(aggregate: *AggregatedIndexStatus, source: db_mo
         existing.failed = existing.failed or source.failed;
         existing.repair_issue_count +|= source.repair_issue_count;
         existing.repair_summary_ready = existing.repair_summary_ready and source.repair_summary_ready;
+        existing.producer_complete = existing.producer_complete and source.producer_complete;
         existing.observation_count +|= source.observation_count;
         return;
     }
@@ -3980,75 +4080,8 @@ fn appendSingleIndexRuntimeStatusWithGraphMetricRuntime(
         try out.appendSlice(alloc, ",\"degraded\":");
         try out.appendSlice(alloc, if (coverage.degraded) "true" else "false");
         try out.append(alloc, '}');
-    } else if ((index_type == .graph or index_type == .full_text) and
-        @hasField(@TypeOf(item), "coverage_identity_ready") and item.coverage_identity_ready and
-        @hasField(@TypeOf(item), "coverage_summary_ready"))
-    {
-        // Artifact-fed graph and full-text projections record the same
-        // durable per-document generation outcomes as embeddings indexes
-        // (the autoschema knowledge graph in particular). Without this block
-        // a corpus of terminally failed extractions reported NOTHING on the
-        // consuming index: settled failures looked like invisible pending
-        // work. The shape matches the embeddings `coverage` object so
-        // consumers read one contract; embeddings-only publication and
-        // activity fields are simply absent.
-        const skipped_count = if (@hasField(@TypeOf(item), "coverage_skipped_count")) item.coverage_skipped_count else 0;
-        const terminal_failed_count = if (@hasField(@TypeOf(item), "coverage_terminal_failed_count")) item.coverage_terminal_failed_count else 0;
-        const produced_count = if (@hasField(@TypeOf(item), "coverage_produced_count")) item.coverage_produced_count else 0;
-        const counters_valid = coverageCountersValid(table_doc_count, produced_count, skipped_count, terminal_failed_count);
-        const replay_current = coverageReplayCurrent(replay_applied_sequence, replay_target_sequence, replay_catch_up_required);
-        const observation_complete = coverage_runtime_present and item.coverage_summary_ready and counters_valid;
-        const coverage = evaluateCoverage(
-            .strict,
-            table_doc_count,
-            produced_count,
-            skipped_count,
-            terminal_failed_count,
-            observation_complete,
-            replay_current,
-        );
-        try out.appendSlice(alloc, ",\"coverage\":{");
-        try appendJsonString(alloc, out, "policy");
-        try out.append(alloc, ':');
-        try appendJsonString(alloc, out, "strict");
-        try out.appendSlice(alloc, ",\"observation_complete\":");
-        try out.appendSlice(alloc, if (observation_complete) "true" else "false");
-        try out.appendSlice(alloc, ",\"config_fingerprint\":");
-        try appendCoverageFingerprint(alloc, out, coverage_config_hash);
-        try out.appendSlice(alloc, ",\"summary_ready\":");
-        try out.appendSlice(alloc, if (item.coverage_summary_ready) "true" else "false");
-        try out.appendSlice(alloc, ",\"source_total\":");
-        try appendIntValue(alloc, out, table_doc_count);
-        try out.appendSlice(alloc, ",\"produced\":");
-        try appendIntValue(alloc, out, produced_count);
-        try out.appendSlice(alloc, ",\"skipped\":");
-        try appendIntValue(alloc, out, skipped_count);
-        try out.appendSlice(alloc, ",\"terminal_failed\":");
-        try appendIntValue(alloc, out, terminal_failed_count);
-        try out.appendSlice(alloc, ",\"covered\":");
-        try appendIntValue(alloc, out, coverage.covered);
-        try out.appendSlice(alloc, ",\"settled\":");
-        try appendIntValue(alloc, out, coverage.settled);
-        try out.appendSlice(alloc, ",\"uncovered\":");
-        if (coverage.uncovered) |uncovered| {
-            try appendIntValue(alloc, out, uncovered);
-        } else {
-            try out.appendSlice(alloc, "null");
-        }
-        try out.appendSlice(alloc, ",\"pending\":");
-        if (coverage.pending) |pending| {
-            try appendIntValue(alloc, out, pending);
-        } else {
-            try out.appendSlice(alloc, "null");
-        }
-        try out.appendSlice(alloc, ",\"complete\":");
-        try out.appendSlice(alloc, if (coverage.complete) "true" else "false");
-        try out.appendSlice(alloc, ",\"healthy\":");
-        try out.appendSlice(alloc, if (coverage.healthy) "true" else "false");
-        try out.appendSlice(alloc, ",\"degraded\":");
-        try out.appendSlice(alloc, if (coverage.degraded) "true" else "false");
-        try out.append(alloc, '}');
     }
+
     if (index_type == .graph) {
         try out.appendSlice(alloc, ",\"algebraic_graph\":{\"traversal\":{\"attempted\":");
         try appendIntValue(alloc, out, item.algebraic_graph_traversal_attempt_count);
@@ -4420,7 +4453,7 @@ fn indexSourcesComplete(
     if (sources.len == 0) return true;
     if (!observation_fresh or !topology_complete) return false;
     for (sources) |source| {
-        if (source.failed or !source.repair_summary_ready or source.observation_count < expected_observation_count or
+        if (source.failed or !source.producer_complete or !source.repair_summary_ready or source.observation_count < expected_observation_count or
             source.published_sequence < source.target_sequence) return false;
     }
     return true;
@@ -4442,7 +4475,7 @@ fn appendIndexSourceReadinessStatuses(
         const replay_pending = source.published_sequence < source.target_sequence;
         const source_observation_complete = source.observation_count >= expected_observation_count;
         const source_failed = index_failed or source.failed;
-        const pending = !source_failed and (!source.repair_summary_ready or !observation_fresh or !topology_complete or !source_observation_complete or replay_pending);
+        const pending = !source_failed and (!source.producer_complete or !source.repair_summary_ready or !observation_fresh or !topology_complete or !source_observation_complete or replay_pending);
         const state = if (source_failed) "failed" else if (pending) "pending" else "ready";
         try out.appendSlice(alloc, "{\"artifact\":");
         try appendJsonString(alloc, out, source.artifact_name);
@@ -4481,7 +4514,7 @@ fn appendIndexSourceReadinessStatuses(
             try appendJsonString(alloc, out, "source_observation_incomplete");
             emitted = true;
         }
-        if (replay_pending) {
+        if (replay_pending or !source.producer_complete) {
             if (emitted) try out.append(alloc, ',');
             try appendJsonString(alloc, out, "publication");
         }
@@ -7463,6 +7496,22 @@ fn consumerTests() type {
             );
         }
 
+        test "source readiness waits for producers before their first publication" {
+            var out = std.ArrayListUnmanaged(u8).empty;
+            defer out.deinit(std.testing.allocator);
+            const sources = [_]db_mod.types.IndexSourceReplayStatus{
+                .{ .artifact_name = "text", .published_sequence = 41, .target_sequence = 41 },
+                .{ .artifact_name = "relations", .published_sequence = 41, .target_sequence = 41, .producer_complete = false },
+            };
+            try std.testing.expect(!indexSourcesComplete(&sources, true, true, 1));
+            try std.testing.expect(indexSourcesComplete(sources[0..1], true, true, 1));
+            try appendIndexSourceReadinessStatuses(std.testing.allocator, &out, &sources, true, true, false, 1);
+            try std.testing.expectEqualStrings(
+                ",\"sources\":[{\"artifact\":\"text\",\"state\":\"ready\",\"complete\":true,\"pending_reasons\":[]},{\"artifact\":\"relations\",\"state\":\"pending\",\"complete\":false,\"pending_reasons\":[\"publication\"]}]",
+                out.items,
+            );
+        }
+
         test "source readiness isolates terminal enrichment failures" {
             var out = std.ArrayListUnmanaged(u8).empty;
             defer out.deinit(std.testing.allocator);
@@ -8799,6 +8848,38 @@ fn consumerTests() type {
             try std.testing.expect(aggregate.replay_catch_up_required);
             try std.testing.expect(aggregate.backfill_active);
             try std.testing.expectEqual(@as(f64, 0.0), aggregate.backfill_progress);
+        }
+
+        test "derived coverage artifact projections use source readiness without vector counters" {
+            const alloc = std.testing.allocator;
+            var sources = [_]db_mod.types.IndexSourceReplayStatus{.{ .artifact_name = "asset", .published_sequence = 2, .target_sequence = 2 }};
+            for ([_]ApiIndexType{ .full_text, .graph }) |kind| {
+                var item: db_mod.types.DBIndexStats = .{
+                    .name = "artifact_index",
+                    .kind = if (kind == .graph) .graph else .full_text,
+                    .coverage_generation = 42,
+                    .coverage_config_hash = 99,
+                    .coverage_identity_ready = true,
+                    .replay_applied_sequence = 2,
+                    .replay_target_sequence = 2,
+                    .source_replay = &sources,
+                };
+                for (0..3) |scenario| {
+                    sources[0].failed = scenario == 1;
+                    if (scenario == 2) item.source_replay = &.{};
+                    var out = std.ArrayListUnmanaged(u8).empty;
+                    defer out.deinit(alloc);
+                    try appendSingleIndexRuntimeStatus(alloc, &out, kind, item, 2, .strict, false, 42, 99, .{}, null, null, null, .{}, .{ .source = .live_writer_publish, .freshness = .fresh }, true);
+                    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, out.items, .{});
+                    defer parsed.deinit();
+                    try std.testing.expect(parsed.value.object.get("coverage") == null);
+                    if (scenario != 2) {
+                        const source = parsed.value.object.get("readiness").?.object.get("sources").?.array.items[0].object;
+                        try std.testing.expectEqualStrings(if (scenario == 1) "failed" else "ready", source.get("state").?.string);
+                        try std.testing.expectEqual(scenario == 0, source.get("complete").?.bool);
+                    }
+                }
+            }
         }
 
         test "derived coverage ready full text status reports complete progress" {

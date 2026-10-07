@@ -1,4 +1,5 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Elastic-2.0
 //
 // Licensed under the Elastic License 2.0 (ELv2); you may not use this file
 // except in compliance with the Elastic License 2.0. You may obtain a copy of
@@ -1633,6 +1634,16 @@ pub fn metadataApplyStoreProjection(
         .backup_cohort => blk: {
             const value = handle.store.getBackupCohort(alloc, request.group_id, request.arg0) catch |err| break :blk storageOwnerStatusFromError(err);
             defer if (value) |bytes| alloc.free(bytes);
+            break :blk metadataProjectionJson(alloc, out_json, value);
+        },
+        .lake_index_lifecycle => blk: {
+            const value = handle.store.getLakeIndexLifecycle(alloc, request.group_id, request.arg0) catch |err| break :blk storageOwnerStatusFromError(err);
+            defer alloc.free(value);
+            break :blk metadataProjectionJson(alloc, out_json, value);
+        },
+        .lake_index_lifecycle_work => blk: {
+            const value = handle.store.lakeIndexLifecycleWork(alloc, request.group_id, if (request.arg1 != 0) request.arg0 else null) catch |err| break :blk storageOwnerStatusFromError(err);
+            defer alloc.free(value);
             break :blk metadataProjectionJson(alloc, out_json, value);
         },
         .backup_cohort_progress => blk: {

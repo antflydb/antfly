@@ -954,7 +954,7 @@ than exposing partial metadata. The buffered codec remains an export/oracle path
 
 > **Relocated:** The dated validation narrative and local ReleaseFast
 > measurements (163 lines) that previously lived here are preserved verbatim
-> in [work-log/completed/lsm-version-publication/validation-2026-09.md](../../work-log/completed/lsm-version-publication/validation-2026-09.md).
+> in [docs/design/lsm-version-publication/history/validation-2026-09.md](lsm-version-publication/history/validation-2026-09.md).
 
 Reproduce from `zig/` with:
 

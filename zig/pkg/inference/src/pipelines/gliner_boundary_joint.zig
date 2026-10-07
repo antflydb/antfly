@@ -1,5 +1,17 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! JointIE scoring adapter for Fastino 3c913c7. Relation proposals reuse the
 //! shared pool, while every typed endpoint is force-scored by the separate
@@ -643,7 +655,7 @@ test "gliner joint adapter releases every allocation on finalization failures" {
             try std.testing.expectEqual(@as(usize, 3), output.nodes.len);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{compiled.schema.joint_ie.?});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Check.run, .{compiled.schema.joint_ie.?});
 }
 
 test "gliner joint adapter uses pinned Unicode 15 Python repr for stable edge ties" {

@@ -1,4 +1,5 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Elastic-2.0
 //
 // Licensed under the Elastic License 2.0 (ELv2); you may not use this file
 // except in compliance with the Elastic License 2.0. You may obtain a copy of
@@ -615,7 +616,8 @@ fn runtimeIndexSourceReplayEqual(
         if (!std.mem.eql(u8, left.artifact_name, right.artifact_name) or
             left.published_sequence != right.published_sequence or
             left.target_sequence != right.target_sequence or
-            left.failed != right.failed) return false;
+            left.failed != right.failed or
+            left.producer_complete != right.producer_complete) return false;
     }
     return true;
 }

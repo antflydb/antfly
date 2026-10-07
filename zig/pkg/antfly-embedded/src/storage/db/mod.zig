@@ -1,0 +1,272 @@
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+const std = @import("std");
+const builtin = @import("builtin");
+pub const coordinated_ttl = @import("../coordinated_ttl.zig");
+const query_search = @import("query/search_exec.zig");
+const distributed_stats = @import("../../search/distributed_stats.zig");
+const planning_adapter = @import("planning_adapter.zig");
+const planning_bindings = @import("planning_bindings.zig");
+const planning_collectors = @import("planning_collectors.zig");
+const planning_stats = @import("planning_stats.zig");
+const doc_identity_mod = @import("doc_identity.zig");
+const query_graph = @import("query/graph_exec.zig");
+const query_result_shape = @import("query/result_shape.zig");
+
+pub const types = @import("types.zig");
+pub const ArtifactPublicationDispatcher = @import("artifact_publication.zig").Dispatcher;
+pub const merge_state = @import("merge_state.zig");
+pub const docstore = @import("../docstore.zig");
+pub const lease = @import("lease.zig");
+pub const ownership = @import("ownership.zig");
+pub const generation_lifecycle = @import("generation_lifecycle.zig");
+pub const native_backup = @import("native_backup.zig");
+pub const logical_snapshot_manifest_file_name = @import("core.zig").logical_snapshot_manifest_file_name;
+pub const apply_state = @import("derived/apply_state.zig");
+pub const embedder = @import("enrichment/embedder.zig");
+pub const enrichment_artifact_codec = @import("enrichment/artifact_codec.zig");
+pub const enrichment_catalog = @import("catalog/enrichment_catalog.zig");
+pub const enrichment_types = @import("enrichment/enrichment_types.zig");
+pub const enrichment_lease = @import("enrichment/enrichment_lease.zig");
+pub const enrichment_state = @import("enrichment/enrichment_state.zig");
+pub const enrichment_runtime = @import("enrichment/enrichment_runtime.zig");
+pub const enrichment_worker = @import("enrichment/enrichment_worker.zig");
+pub const chunker = if (builtin.os.tag == .freestanding)
+    @import("enrichment/chunker_stub.zig")
+else
+    @import("enrichment/chunker.zig");
+pub const enrichment_utf8_text = @import("enrichment/utf8_text.zig");
+pub const derived_types = @import("derived/derived_types.zig");
+pub const derived_worker = @import("derived/derived_worker.zig");
+pub const derived_executor = @import("derived/derived_executor.zig");
+pub const derived_backlog_tracker = @import("derived/backlog_tracker.zig");
+pub const replay_stream = @import("derived/replay_stream.zig");
+pub const replay_source = @import("derived/replay_source.zig");
+pub const runtime_backend = @import("../runtime_backend.zig");
+pub const background_runtime = @import("../background_runtime.zig");
+pub const io_threaded_runtime = @import("derived/io_threaded_runtime.zig");
+pub const ttl_runtime = @import("maintenance/ttl_runtime.zig");
+pub const transaction_runtime = @import("maintenance/transaction_runtime.zig");
+pub const graph_metric_runtime = @import("maintenance/graph_metric_runtime.zig");
+pub const document_query = @import("document_query.zig");
+pub const query_projection = @import("query/projection.zig");
+pub const document_mapper = @import("document_mapper.zig");
+pub const relational_store = @import("relational_store.zig");
+pub const DocIdentityNamespace = doc_identity_mod.Namespace;
+pub const doc_filter_wire = @import("doc_filter_wire.zig");
+pub const artifact_ids = @import("artifact_ids.zig");
+pub const internal_keys = @import("../internal_keys.zig");
+pub const transform = @import("transform.zig");
+pub const aggregations = @import("aggregations.zig");
+pub const algebraic = @import("algebraic/mod.zig");
+pub const backfill_state = @import("backfill_state.zig");
+pub const apply_rw_lock = @import("apply_rw_lock.zig");
+pub const ChangeJournal = @import("derived/change_journal.zig").Journal;
+pub const DerivedLog = @import("derived/derived_log.zig").DerivedLog;
+pub const IndexManager = @import("catalog/index_manager.zig").IndexManager;
+pub const setBenchmarkTextMergePolicyOverride = @import("catalog/index_manager.zig").setBenchmarkTextMergePolicyOverride;
+pub const TextMemoryAttributionStats = @import("catalog/index_manager.zig").TextMemoryAttributionStats;
+pub const DenseSplitHandoff = @import("catalog/index_manager.zig").DenseSplitHandoff;
+pub const TextSplitHandoff = @import("catalog/index_manager.zig").TextSplitHandoff;
+pub const SparseSplitHandoff = @import("catalog/index_manager.zig").SparseSplitHandoff;
+pub const ResolverConfig = @import("catalog/index_manager.zig").ResolverConfig;
+const resolution_runtime = @import("resolution_runtime.zig");
+pub const CandidateSource = resolution_runtime.CandidateSource;
+pub const PendingReview = resolution_runtime.PendingReview;
+pub const freePendingReviews = resolution_runtime.freePendingReviews;
+pub const promotion_runtime = @import("promotion_runtime.zig");
+pub const EntitySink = promotion_runtime.EntitySink;
+pub const EntityUpsert = promotion_runtime.EntityUpsert;
+pub const PromotionOwner = promotion_runtime.PromotionOwner;
+pub const DB = @import("antfly_source_root").antfly_sources.physical_db.DB;
+pub const SearchWithDenseProfileResult = @import("antfly_source_root").antfly_sources.physical_db.SearchWithDenseProfileResult;
+pub const OrderedApplyReceipt = @import("antfly_source_root").antfly_sources.physical_db.OrderedApplyReceipt;
+pub const LsmOwnerKind = DB.LsmOwnerKind;
+pub const LsmOwnerStats = DB.LsmOwnerStats;
+pub const documentExtractionStoredUnitFingerprintAlloc = @import("antfly_source_root").antfly_sources.physical_db.documentExtractionStoredUnitFingerprintAlloc;
+pub const DocumentArtifactChildRangeApplyBatch = @import("antfly_source_root").antfly_sources.physical_db.DocumentArtifactChildRangeApplyBatch;
+pub const DocumentArtifactChildRangeDispatch = @import("antfly_source_root").antfly_sources.physical_db.DocumentArtifactChildRangeDispatch;
+pub const DocumentArtifactChildRangeDispatcher = @import("antfly_source_root").antfly_sources.physical_db.DocumentArtifactChildRangeDispatcher;
+pub const CommittedBatchEffectsObserver = @import("antfly_source_root").antfly_sources.physical_db.CommittedBatchEffectsObserver;
+pub const OpenOptions = @import("antfly_source_root").antfly_sources.physical_db.OpenOptions;
+pub const DenseNativeMigrationPolicySource = @import("antfly_source_root").antfly_sources.physical_db.DenseNativeMigrationPolicySource;
+pub const NativeRestoreOpenPlan = @import("antfly_source_root").antfly_sources.physical_db.NativeRestoreOpenPlan;
+pub const OpenMode = @import("antfly_source_root").antfly_sources.physical_db.OpenMode;
+pub const ReplicationAsyncEffectMirror = @import("antfly_source_root").antfly_sources.physical_db.ReplicationAsyncEffectMirror;
+pub const ReplicationAsyncBatchMirror = @import("antfly_source_root").antfly_sources.physical_db.ReplicationAsyncBatchMirror;
+pub const ReplicationAsyncMetadataMirror = @import("antfly_source_root").antfly_sources.physical_db.ReplicationAsyncMetadataMirror;
+pub const MutationBarrier = @import("antfly_source_root").antfly_sources.physical_db.MutationBarrier;
+
+pub const ReplicationWriteGate = @import("antfly_source_root").antfly_sources.physical_db.ReplicationWriteGate;
+pub const SchemaBeforeIndexLoad = @import("antfly_source_root").antfly_sources.physical_db.SchemaBeforeIndexLoad;
+pub const ReplicationRecordView = @import("replication_record.zig").RecordView;
+pub const ReplayProgress = @import("antfly_source_root").antfly_sources.physical_db.ReplayProgress;
+pub const QueryVisibilityHook = @import("antfly_source_root").antfly_sources.physical_db.QueryVisibilityHook;
+pub const QueryVisibilityChange = @import("antfly_source_root").antfly_sources.physical_db.QueryVisibilityChange;
+pub const QueryVisibilityEvent = @import("antfly_source_root").antfly_sources.physical_db.QueryVisibilityEvent;
+pub const IndexRepairVisibility = @import("antfly_source_root").antfly_sources.physical_db.IndexRepairVisibility;
+pub const IndexRepairAdmission = @import("antfly_source_root").antfly_sources.physical_db.IndexRepairAdmission;
+pub const DerivedReplayDebtStatus = @import("antfly_source_root").antfly_sources.physical_db.DerivedReplayDebtStatus;
+pub const BatchProfile = @import("antfly_source_root").antfly_sources.physical_db.BatchProfile;
+pub const RuntimePreflight = query_search.RuntimePreflight;
+pub const RuntimePreflightSummary = query_search.RuntimePreflightSummary;
+pub const SortRejectionDiagnostic = query_search.SortRejectionDiagnostic;
+pub const PlanningStatsSummary = planning_stats.PlanningStatsSummary;
+pub const PlanningStatsProvider = planning_stats.PlanningStatsProvider;
+pub const PlanningStatsCollector = planning_stats.PlanningStatsCollector;
+pub const planningAdapter = planning_adapter;
+pub const validatePlanningBindings = planning_bindings.validateSearchRequestBindings;
+pub const planningCollectors = planning_collectors;
+pub const query_metrics = @import("query_metrics.zig");
+pub const TextIndexEstimate = query_search.TextIndexEstimate;
+pub const EmbeddingIndexEstimate = query_search.EmbeddingIndexEstimate;
+pub const GraphIndexEstimate = query_search.GraphIndexEstimate;
+pub const TextFieldStats = distributed_stats.TextFieldStats;
+pub const TermDocFreq = distributed_stats.TermDocFreq;
+
+pub fn preflightRuntimeAlloc(alloc: std.mem.Allocator, runtime: RuntimePreflight) !RuntimePreflightSummary {
+    return try @import("runtime_preflight.zig").preflightRuntimeAlloc(alloc, .{
+        .has_full_text_results = runtime.has_full_text_results,
+        .embedding_result_names = runtime.embedding_result_names,
+        .graph_queries = runtime.graph_queries,
+    });
+}
+
+pub fn preflightSearchRequestAlloc(alloc: std.mem.Allocator, req: types.SearchRequest) !RuntimePreflightSummary {
+    return try @import("runtime_preflight.zig").preflightSearchRequestAlloc(alloc, req);
+}
+
+pub fn deriveRuntimePreflightEstimates(summary: *RuntimePreflightSummary) void {
+    query_search.deriveEstimateFields(summary);
+}
+
+pub fn searchRequestHasScoreBearingTextSource(req: types.SearchRequest) bool {
+    return query_search.searchRequestHasScoreBearingTextSource(req);
+}
+
+pub fn searchRequestHasScoreBearingVectorSource(req: types.SearchRequest) bool {
+    return query_search.searchRequestHasScoreBearingVectorSource(req);
+}
+
+pub fn searchRequestHasScoreBearingSource(req: types.SearchRequest) bool {
+    return query_search.searchRequestHasScoreBearingSource(req);
+}
+
+pub fn validateStructuredFilterValueAlloc(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+) !void {
+    return @import("query/structured_filter_validation.zig").validateStructuredFilterValueAlloc(alloc, value);
+}
+
+pub fn requestHasVectorScoreOrderOnly(req: types.SearchRequest) bool {
+    return query_search.requestHasVectorScoreOrderOnly(req);
+}
+
+pub fn resetLastSortRejectionDiagnostic() void {
+    query_search.resetLastSortRejectionDiagnostic();
+}
+
+pub fn takeLastSortRejectionDiagnostic() ?SortRejectionDiagnostic {
+    return query_search.takeLastSortRejectionDiagnostic();
+}
+
+pub fn peekLastSortRejectionDiagnostic() ?SortRejectionDiagnostic {
+    return query_search.peekLastSortRejectionDiagnostic();
+}
+
+pub fn recordSortRejectionDiagnostic(field: []const u8, reason: []const u8, detail: []const u8) void {
+    query_search.recordSortRejectionDiagnostic(field, reason, detail);
+}
+
+pub const testing = if (builtin.is_test) struct {
+    pub fn recordSortRejectionDiagnostic(field: []const u8, reason: []const u8, detail: []const u8) void {
+        query_search.recordSortRejectionDiagnosticForTesting(field, reason, detail);
+    }
+} else struct {};
+
+test {
+    _ = @import("artifact_publication_transport.zig");
+    _ = @import("artifact_publication_transport_codec.zig");
+    _ = @import("root_signing_identity.zig");
+    _ = types;
+    _ = merge_state;
+    _ = docstore;
+    _ = lease;
+    _ = ownership;
+    _ = apply_state;
+    _ = embedder;
+    _ = enrichment_artifact_codec;
+    _ = enrichment_catalog;
+    _ = enrichment_types;
+    _ = enrichment_lease;
+    _ = enrichment_state;
+    _ = enrichment_runtime;
+    _ = enrichment_worker;
+    _ = chunker;
+    _ = derived_types;
+    _ = derived_worker;
+    _ = derived_executor;
+    _ = derived_backlog_tracker;
+    _ = replay_stream;
+    _ = replay_source;
+    _ = runtime_backend;
+    _ = background_runtime;
+    _ = io_threaded_runtime;
+    _ = ttl_runtime;
+    _ = transaction_runtime;
+    _ = document_query;
+    _ = query_projection;
+    _ = document_mapper;
+    _ = DocIdentityNamespace;
+    _ = doc_filter_wire;
+    _ = artifact_ids;
+    _ = internal_keys;
+    _ = transform;
+    _ = aggregations;
+    _ = algebraic;
+    _ = backfill_state;
+    _ = apply_rw_lock;
+    _ = ChangeJournal;
+    _ = DerivedLog;
+    _ = IndexManager;
+    _ = DenseSplitHandoff;
+    _ = TextSplitHandoff;
+    _ = SparseSplitHandoff;
+    _ = DB;
+    _ = OpenOptions;
+    _ = OpenMode;
+    _ = QueryVisibilityHook;
+    _ = DerivedReplayDebtStatus;
+    _ = BatchProfile;
+    _ = RuntimePreflight;
+    _ = RuntimePreflightSummary;
+    _ = SortRejectionDiagnostic;
+    _ = PlanningStatsSummary;
+    _ = PlanningStatsProvider;
+    _ = PlanningStatsCollector;
+    _ = planningAdapter;
+    _ = validatePlanningBindings;
+    _ = planningCollectors;
+    _ = query_metrics;
+    _ = query_graph;
+    _ = query_result_shape;
+    _ = TextIndexEstimate;
+    _ = EmbeddingIndexEstimate;
+    _ = GraphIndexEstimate;
+    _ = TextFieldStats;
+    _ = TermDocFreq;
+}

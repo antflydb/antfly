@@ -1,4 +1,19 @@
 #!/usr/bin/env python3
+# Copyright 2026 Antfly, Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Report potential, analyzed, and emitted reachability in Antfly's Zig graph.
 
 The source graph follows literal relative ``@import("*.zig")`` edges. It makes
@@ -582,11 +597,8 @@ def source_group(path: Path, repo_root: Path = REPO_ROOT) -> str:
     parts = path.relative_to(repo_root).parts
     if parts[:4] == ("zig", "pkg", "antfly", "src") and len(parts) > 4:
         return f"zig/pkg/antfly/src/{parts[4]}"
-    if (
-        parts[:5] == ("zig", "pkg", "antfly-embedded", "src", "local")
-        and len(parts) > 5
-    ):
-        return f"zig/pkg/antfly-embedded/src/local/{parts[5]}"
+    if parts[:4] == ("zig", "pkg", "antfly-embedded", "src") and len(parts) > 4:
+        return f"zig/pkg/antfly-embedded/src/{parts[4]}"
     if parts[:2] == ("zig", "lib") and len(parts) > 2:
         return f"zig/lib/{parts[2]}"
     if parts[:2] == ("zig", "pkg") and len(parts) > 2:

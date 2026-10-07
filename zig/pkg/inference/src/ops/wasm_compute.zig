@@ -1,4 +1,5 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -5618,8 +5619,8 @@ fn exerciseActivationDotAllocationFailures(allocator: std.mem.Allocator, use_gpu
 }
 
 test "wasm_compute: activation dot allocation failures preserve operands and metadata ownership" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, exerciseActivationDotAllocationFailures, .{false});
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, exerciseActivationDotAllocationFailures, .{true});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, exerciseActivationDotAllocationFailures, .{false});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, exerciseActivationDotAllocationFailures, .{true});
 }
 
 fn erfApprox(x: f32) f32 {

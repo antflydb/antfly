@@ -1,4 +1,19 @@
 #!/usr/bin/env python3
+# Copyright 2026 Antfly, Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Audit original SQL extraction cases; inventory integrity is distinct from release readiness."""
 
 import argparse
@@ -11,7 +26,7 @@ from collections import Counter
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-FIXTURES = ROOT / "zig/pkg/antfly-embedded/src/local/sql/fixtures"
+FIXTURES = ROOT / "zig/pkg/antfly-embedded/src/sql/fixtures"
 INVENTORY_HASH = "c203a4dcf0094b75e1d3764e90beebddaf844a9ce604543c0a4dbc0ffe8ae173"
 SOURCE_HASH = "52b61411fa93be84b523c109eb6f79ea9e2f8a83d4e3639a831f4b8a697892c6"
 SOURCE_COMMIT = "79644dfa1605e8da0f486d021d1c1393577d6265"

@@ -1,6 +1,19 @@
 #!/usr/bin/env python3
 # Copyright 2026 Antfly, Inc.
 # SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Release disposable Zig test link inputs between sequential CI build phases.
 
 Call only when no build or test using this job-local cache is running. Keep
@@ -59,6 +72,16 @@ def prune(cache: Path, min_bytes: int = 64 * 1024 * 1024) -> int:
     return removed
 
 
+def validate_phase_cache(cache: Path) -> Path:
+    """Normalize lexical components without accepting redirected cache paths."""
+    normalized = Path(os.path.abspath(cache))
+    if normalized.name != "zig-local" or cache.resolve() != normalized:
+        raise ValueError("phase release requires a real job-owned zig-local directory")
+    if normalized.exists() and not normalized.is_dir():
+        raise ValueError("phase cache must be a directory")
+    return normalized
+
+
 def release_completed_phase(cache: Path) -> None:
     """Release a quiescent CI phase's complete, private compiler cache.
 
@@ -68,9 +91,7 @@ def release_completed_phase(cache: Path) -> None:
     Global dependency caches and installed zig-out artifacts are outside this
     directory and remain available to subsequent phases.
     """
-    cache = cache.absolute()
-    if cache.name != "zig-local" or cache.resolve() != cache:
-        raise ValueError("phase release requires a real job-owned zig-local directory")
+    cache = validate_phase_cache(cache)
     if cache.exists():
         shutil.rmtree(cache)
     cache.mkdir(parents=True)
@@ -79,9 +100,13 @@ def release_completed_phase(cache: Path) -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("cache", type=Path)
-    parser.add_argument("--release-phase", action="store_true")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--release-phase", action="store_true")
+    mode.add_argument("--validate-phase", action="store_true")
     args = parser.parse_args()
-    if args.release_phase:
+    if args.validate_phase:
+        print(validate_phase_cache(args.cache))
+    elif args.release_phase:
         release_completed_phase(args.cache)
         print("Released completed phase compiler cache")
     else:

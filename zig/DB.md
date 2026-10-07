@@ -1671,8 +1671,8 @@ implementation strategy:
 
 The first backend-neutral code pieces are in:
 
-- [pkg/antfly-embedded/src/local/storage/backend_types.zig](pkg/antfly-embedded/src/local/storage/backend_types.zig)
-- [pkg/antfly-embedded/src/local/storage/backend_adapter.zig](pkg/antfly-embedded/src/local/storage/backend_adapter.zig)
+- [pkg/antfly-embedded/src/storage/backend_types.zig](pkg/antfly-embedded/src/storage/backend_types.zig)
+- [pkg/antfly-embedded/src/storage/backend_adapter.zig](pkg/antfly-embedded/src/storage/backend_adapter.zig)
 
 Those model:
 
@@ -1722,7 +1722,7 @@ Principles:
 
 A binary dense request/response codec lives in the Zig C API, exposed as a
 dense wire entrypoint from
-[pkg/antfly-embedded/src/local/capi/db.zig](pkg/antfly-embedded/src/local/capi/db.zig)
+[pkg/antfly-embedded/src/capi/db.zig](pkg/antfly-embedded/src/capi/db.zig)
 (`antfly_db_search_dense_wire`), with a matching Go-side codec in the zigdb
 bridge. The narrowed dense path routes through the binary wire first, with the
 JSON path kept as fallback. Local dense search no longer marshals JSON on the
@@ -1922,7 +1922,7 @@ the hot data plane, port the local control plane, port remaining local
 features). Neither `ZigCoreDB` nor `StoreDB` appears anywhere in the current
 Go tree — only in this document and a historical TLA+ spec — so this section
 cannot be confirmed as either shipped or still the live target architecture.
-The closest living analog is `go/pkg/lite`, which has a typed `Batch`
+The closest living analog is `go/pkg/embedded`, which has a typed `Batch`
 and binary `DenseSearchWire`/`TextMatchWire`/etc. wire types consuming the
 `antfly_db_search_*_wire` C API (see [Hot-Path Search
 Wire](#hot-path-search-wire) above), but it is a single-node embedded DB with

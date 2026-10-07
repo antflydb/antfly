@@ -1,4 +1,5 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Elastic-2.0
 //
 // Licensed under the Elastic License 2.0 (ELv2); you may not use this file
 // except in compliance with the Elastic License 2.0. You may obtain a copy of
@@ -1085,6 +1086,8 @@ const LocalStandaloneMetadata = struct {
                 .free_routing_snapshot = catalogFreeRoutingSnapshot,
                 .create_table = createTable,
                 .replace_table_definition = replaceTableDefinition,
+                .get_lake_index_lifecycle = if (durable) getLakeIndexLifecycle else null,
+                .mutate_lake_index_lifecycle = if (durable) mutateLakeIndexLifecycle else null,
                 .publish_vector_migration_table = publishVectorMigrationTable,
                 .begin_vector_migration_command = beginVectorMigrationCommand,
                 .end_vector_migration_command = endVectorMigrationCommand,
@@ -1266,6 +1269,35 @@ const LocalStandaloneMetadata = struct {
         // owner and rehydrates durable attempts before enabling dispatch.
         try server.prepareRestoreLeadership(term);
         self.prepared_restore_term = term;
+    }
+
+    fn getLakeIndexLifecycle(ptr: *anyopaque, alloc: std.mem.Allocator, table_id: u64, request: LifecycleRequest) ![]u8 {
+        try request.ensureActive();
+        const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        return (self.lifecycle_store orelse return error.UnsupportedOperation).getLakeIndexLifecycle(alloc, group_ids.main_metadata_group_id, table_id);
+    }
+
+    fn mutateLakeIndexLifecycle(ptr: *anyopaque, table_id: u64, revision: u64, mutation: @import("../metadata/lake_index_lifecycle.zig").Mutation, request: LifecycleRequest) !void {
+        try request.ensureActive();
+        const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
+        if (!self.coordinated_lifecycle_allowed) return error.CoordinatedStandaloneHAMetadataRequired;
+        var locked = try self.lockMutation();
+        defer locked.deinit();
+        const store = self.lifecycle_store orelse return error.UnsupportedOperation;
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const lifecycle = @import("../metadata/lake_index_lifecycle.zig");
+        const before = try lifecycle.parse(a, try store.getLakeIndexLifecycle(a, group_ids.main_metadata_group_id, table_id));
+        if (before.revision != revision) return error.CatalogGenerationChanged;
+        _ = try lifecycle.encode(a, try mutation.apply(a, before));
+        try store.applyStandaloneCommand(group_ids.main_metadata_group_id, .{ .mutate_lake_index_lifecycle = .{ .table_id = table_id, .expected_revision = revision, .mutation = mutation } });
+        self.epoch = @max(1, try store.standaloneRevision());
+        self.durable_revision = self.epoch;
+        const observed = try lifecycle.parse(a, try store.getLakeIndexLifecycle(a, group_ids.main_metadata_group_id, table_id));
+        if (observed.revision <= revision or !mutation.observed(observed)) return error.MetadataMutationOutcomeUnknown;
     }
 
     fn getBackupCohort(ptr: *anyopaque, alloc: std.mem.Allocator, id: u64, request: LifecycleRequest) !?[]u8 {
@@ -2418,6 +2450,19 @@ const LocalStandaloneMetadata = struct {
     fn systemCatalogAdmitted(ptr: *anyopaque, alloc: std.mem.Allocator, context: antfly.public_api.operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
         const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
         try context.ensureActive();
+        if (call == .lake_index_lifecycle_read) return getLakeIndexLifecycle(ptr, alloc, call.lake_index_lifecycle_read, context);
+        if (call == .lake_index_lifecycle_work) {
+            try context.ensureActive();
+            lockAtomic(&self.mutex);
+            defer self.mutex.unlock();
+            return (self.lifecycle_store orelse return error.UnsupportedOperation).lakeIndexLifecycleWork(alloc, group_ids.main_metadata_group_id, call.lake_index_lifecycle_work);
+        }
+        if (call == .lake_index_lifecycle_mutate) {
+            if (!context.setting_admin) return error.Forbidden;
+            const write = call.lake_index_lifecycle_mutate;
+            try mutateLakeIndexLifecycle(ptr, write.table_id, write.expected_revision, write.mutation, context);
+            return alloc.dupe(u8, "{}");
+        }
         if (call == .mutate or call == .setting_mutate or call == .policy_definition_mutate or
             call == .policy_publication_begin or call == .policy_publication_mutate or
             call == .fk_initial_create_begin or call == .fk_initial_create_mutate) if (self.hot_standby_catalog_server) |server|
@@ -2449,6 +2494,7 @@ const LocalStandaloneMetadata = struct {
             return std.json.Stringify.valueAlloc(alloc, capture.value, .{});
         }
         switch (call) {
+            .lake_index_lifecycle_read, .lake_index_lifecycle_work, .lake_index_lifecycle_mutate => unreachable,
             .fk_initial_retirement_page,
             .fk_initial_retirement_signed_page,
             .fk_initial_retirement_ack,
@@ -5127,6 +5173,20 @@ pub fn runFromIterator(
     if (hot_standby_lease_watchdog) |*watchdog| watchdog.bindOwnedProcessBootID();
     defer if (hot_standby_lease_watchdog) |*watchdog| watchdog.deinit(alloc);
 
+    // Personal OAuth credentials stay outside replicated metadata. Enable only
+    // loopback standalone; multi-user/distributed serving needs its own boundary.
+    const chatgpt_manager = @import("antfly_local_sources").chatgpt_manager;
+    const chatgpt_root = try std.fs.path.join(alloc, &.{ resolved.auth_store_root_dir, "chatgpt" });
+    defer alloc.free(chatgpt_root);
+    var chatgpt: ?chatgpt_manager.Manager = if ((if (loaded_config) |cfg| cfg.connectors.allowsLocalChatGPT() else true) and (std.mem.eql(u8, public_listener.bind_host, "127.0.0.1") or std.mem.eql(u8, public_listener.bind_host, "::1") or std.mem.eql(u8, public_listener.bind_host, "localhost"))) try chatgpt_manager.Manager.init(alloc, setup_io.io(), chatgpt_root) else null;
+    defer if (chatgpt) |*manager| manager.deinit();
+    if (chatgpt) |*connections| if (user_manager) |*users| {
+        users.personal_grant_revoker = .{ .ptr = connections, .revoke_fn = chatgpt_manager.Manager.revokeDeletedUser };
+    };
+    defer if (user_manager) |*users| {
+        users.personal_grant_revoker = null;
+    };
+
     // Initialize DataServer without starting its listener — the unified
     // httpx.Server will serve the public API instead.
     var data_server = antfly.data.runtime.DataServer.initFromLocalMetadataSources(alloc, .{
@@ -5150,6 +5210,7 @@ pub fn runFromIterator(
             .hot_standby_remote_apply_mutations_enabled = hotStandbyRemoteApplyMutationsEnabled(hot_standby_sync_policy.policy),
             .hot_standby_catalog_create_enabled = hot_standby_role_requested and cli.hot_standby_table_id == 0 and cli.hot_standby_shard_id == 0,
             .auth_enabled = auth_enabled,
+            .chatgpt = if (chatgpt) |*manager| manager else null,
             .experimental = cli.experimental,
             .mcp_max_tool_result_bytes = if (loaded_config) |*cfg| cfg.mcp.max_tool_result_bytes else antfly.common.config.default_mcp_max_tool_result_bytes,
             .pgwire = if (loaded_config) |*cfg| cfg.pgwire else null,
@@ -5183,6 +5244,7 @@ pub fn runFromIterator(
             .inference_api_key = if (loaded_config) |*cfg| if (cfg.inference.api_key) |value| value else null else null,
             .extension_package_store_dir = resolved.extension_package_store_dir,
             .node_config = if (loaded_config) |*cfg| cfg else null,
+            .native_lake_artifact_base_dir = data_dir,
             .user_manager = if (user_manager) |*manager| manager else null,
             .session_store = if (lite_session_store) |*store| store else if (native_sessions) |*store| store else null,
             .restore_job_store = if (local_metadata.lifecycle_store == null) restore_job_store else null,

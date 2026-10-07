@@ -1,8 +1,9 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Elastic-2.0
 //
 // Licensed under the Elastic License 2.0 (ELv2); you may not use this file
 // except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the License at
+// the Elastic License 2.0 at
 //
 //     https://www.antfly.io/licensing/ELv2-license
 //
@@ -33,6 +34,8 @@ pub const Kind = enum {
 /// or provider-specific representations.
 pub const CreatedObjectShape = enum {
     unrestricted,
+    algebraic_aggregates,
+    algebraic_aggregate,
     provider,
     enrichments,
     enrichment,
@@ -123,7 +126,7 @@ pub fn isAllowedConfigField(kind: Kind, field: []const u8) bool {
             std.mem.eql(u8, field, "artifact") or
             std.mem.eql(u8, field, "algebraic_planning") or
             std.mem.eql(u8, field, "resolvers"),
-        .algebraic => std.mem.eql(u8, field, "derive_from_schema"),
+        .algebraic => std.mem.eql(u8, field, "derive_from_schema") or std.mem.eql(u8, field, "aggregates"),
         .relational => std.mem.eql(u8, field, "keys") or std.mem.eql(u8, field, "include_columns") or std.mem.eql(u8, field, "where"),
     };
 }
@@ -161,6 +164,7 @@ pub fn isAllowedCreatedProviderField(field: []const u8) bool {
 }
 
 pub fn createdObjectShapeForRootField(kind: Kind, field: []const u8) CreatedObjectShape {
+    if (kind == .algebraic and std.mem.eql(u8, field, "aggregates")) return .algebraic_aggregates;
     if (kind == .relational and std.mem.eql(u8, field, "keys")) return .relational_keys;
     if (kind == .relational and std.mem.eql(u8, field, "where")) return .relational_predicates;
     if (std.mem.eql(u8, field, "enrichments")) return .enrichments;
@@ -199,6 +203,7 @@ pub fn createdObjectShapeForRootField(kind: Kind, field: []const u8) CreatedObje
 
 pub fn createdObjectShapeForArrayItem(parent: CreatedObjectShape) CreatedObjectShape {
     return switch (parent) {
+        .algebraic_aggregates => .algebraic_aggregate,
         .enrichments => .enrichment,
         .artifact_sources => .artifact_source,
         .full_text_sources => .full_text_source,
@@ -216,6 +221,7 @@ pub fn createdObjectShapeForArrayItem(parent: CreatedObjectShape) CreatedObjectS
 
 pub fn createdValueMatchesShape(shape: CreatedObjectShape, value: std.json.Value) bool {
     return switch (shape) {
+        .algebraic_aggregates => value == .array and value.array.items.len <= 64,
         .unrestricted => true,
         .enrichments, .artifact_sources, .full_text_sources, .graph_sources, .edge_types, .graph_resolvers, .graph_scorer_comparisons, .graph_scorer_levels => value == .array,
         .relational_keys => value == .array and value.array.items.len > 0 and value.array.items.len <= 32,
@@ -239,6 +245,8 @@ fn createdObjectHasRequiredFields(shape: CreatedObjectShape, object: std.json.Ob
         }
     }
     const required_fields: []const []const u8 = switch (shape) {
+        .algebraic_aggregates => &.{},
+        .algebraic_aggregate => &.{ "name", "op" },
         .provider, .chunker => &.{"provider"},
         .enrichment => &.{ "name", "kind" },
         .artifact_source => &.{"artifact"},
@@ -318,6 +326,8 @@ pub fn createdObjectShapeForChild(parent: CreatedObjectShape, field: []const u8)
 
 pub fn isAllowedCreatedObjectField(shape: CreatedObjectShape, field: []const u8) bool {
     return switch (shape) {
+        .algebraic_aggregates => false,
+        .algebraic_aggregate => std.mem.eql(u8, field, "name") or std.mem.eql(u8, field, "op") or std.mem.eql(u8, field, "group_by") or std.mem.eql(u8, field, "measure"),
         .relational_keys, .relational_predicates, .relational_expression_args => false,
         .relational_key => std.mem.eql(u8, field, "column") or std.mem.eql(u8, field, "expression") or std.mem.eql(u8, field, "result_type") or std.mem.eql(u8, field, "direction") or std.mem.eql(u8, field, "nulls") or std.mem.eql(u8, field, "collation"),
         .relational_expression => std.mem.eql(u8, field, "op") or std.mem.eql(u8, field, "type") or std.mem.eql(u8, field, "column") or std.mem.eql(u8, field, "value") or std.mem.eql(u8, field, "args") or std.mem.eql(u8, field, "collation"),
@@ -406,7 +416,10 @@ pub fn rootFieldValueMatches(kind: Kind, field: []const u8, value: std.json.Valu
             value == .object
         else
             isString(value),
-        .algebraic => isBool(value),
+        .algebraic => if (std.mem.eql(u8, field, "aggregates")) blk: {
+            @import("antfly_local_sources").api_local_tables.validatePublicAggregateRecipes(value) catch break :blk false;
+            break :blk true;
+        } else isBool(value),
         .relational => if (std.mem.eql(u8, field, "include_columns")) includesValid(value) else if (std.mem.eql(u8, field, "where")) createdValueMatchesShape(.relational_predicates, value) else createdValueMatchesShape(.relational_keys, value),
     };
 }
@@ -421,6 +434,8 @@ fn includesValid(value: std.json.Value) bool {
 /// object. `full_text_index` is the sole intentionally dynamic subtree.
 pub fn createdFieldValueMatches(shape: CreatedObjectShape, field: []const u8, value: std.json.Value) bool {
     return switch (shape) {
+        .algebraic_aggregates => false,
+        .algebraic_aggregate => if (std.mem.eql(u8, field, "group_by")) isNonEmptyStringArray(value) and value.array.items.len <= 32 else isNonEmptyString(value),
         .relational_keys, .relational_predicates, .relational_expression_args => false,
         .relational_expression => blk: {
             if (std.mem.eql(u8, field, "value")) break :blk value != .array and value != .object;

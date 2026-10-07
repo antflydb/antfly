@@ -1,4 +1,5 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Elastic-2.0
 //
 // Licensed under the Elastic License 2.0 (ELv2); you may not use this file
 // except in compliance with the Elastic License 2.0. You may obtain a copy of
@@ -438,9 +439,9 @@ test "search source target policy releases allocation failures and invalid dista
     };
     const indexes = "{\"vec\":{\"type\":\"embeddings\",\"distance_metric\":\"cosine\"},\"sparse\":{\"type\":\"embeddings\",\"sparse\":true}}";
     for ([_]IndexDefaults{ .managed_defaults, .explicit_only }) |defaults| {
-        try std.testing.checkAllAllocationFailures(std.testing.allocator, Exercise.run, .{ defaults, indexes });
-        try std.testing.checkAllAllocationFailures(std.testing.allocator, Exercise.run, .{ defaults, "{}" });
-        try std.testing.checkAllAllocationFailures(std.testing.allocator, Exercise.run, .{ defaults, "{\"full_text_index_v0\":{\"type\":\"full_text\"},\"body_search\":{\"type\":\"full_text\",\"field\":\"body\"}}" });
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Exercise.run, .{ defaults, indexes });
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Exercise.run, .{ defaults, "{}" });
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Exercise.run, .{ defaults, "{\"full_text_index_v0\":{\"type\":\"full_text\"},\"body_search\":{\"type\":\"full_text\",\"field\":\"body\"}}" });
         try std.testing.expectError(error.InvalidTableIndexMetadata, Exercise.run(std.testing.allocator, defaults, "{\"vec\":{\"type\":\"embeddings\",\"distance_metric\":\"bad\"}}"));
     }
 }

@@ -1,4 +1,5 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Elastic-2.0
 //
 // Licensed under the Elastic License 2.0 (ELv2); you may not use this file
 // except in compliance with the Elastic License 2.0. You may obtain a copy of
@@ -499,7 +500,7 @@ test "serverless compactor document entry views borrow payloads and only own the
             try std.testing.expectEqual(source[0].body.ptr, view[0].body.ptr);
         }
     };
-    try std.testing.checkAllAllocationFailures(a, Run.run, .{&docs});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Run.run, .{&docs});
 }
 
 fn allocDocumentEntries(

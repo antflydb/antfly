@@ -1,4 +1,5 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -1842,7 +1843,7 @@ test "shallow discovery cleans up every allocation failure" {
             }
         }
     };
-    try std.testing.checkAllAllocationFailures(allocator, Runner.run, .{models_dir});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(allocator, Runner.run, .{models_dir});
 }
 
 test "model discovery rejects incomplete or invalid managed downloads" {

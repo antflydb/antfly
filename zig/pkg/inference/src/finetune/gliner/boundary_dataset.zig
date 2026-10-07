@@ -1,5 +1,17 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Versioned, named, explicit-offset JSONL training data. A bounded owned
 //! snapshot binds the bytes actually consumed to resume identity. Schemas are
@@ -513,7 +525,7 @@ test "boundary training dataset resolves named mixed tasks and keeps exact occur
 }
 
 test "boundary training dataset allocation failures release snapshots schemas samples and split indexes" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, exerciseDataset, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, exerciseDataset, .{});
 }
 
 test "boundary training dataset rejects invalid rows duplicates version schema omissions and byte boundaries" {

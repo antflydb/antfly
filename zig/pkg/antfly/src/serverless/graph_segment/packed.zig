@@ -1,4 +1,5 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Elastic-2.0
 //
 // Licensed under the Elastic License 2.0 (ELv2); you may not use this file
 // except in compliance with the Elastic License 2.0. You may obtain a copy of
@@ -845,7 +846,7 @@ test "serverless packed graph ownership and ordinal validation are failure safe"
             try std.testing.expectEqualStrings("b", decoded.adjacencies[0].out_edges[0].neighbor_id);
         }
     };
-    try std.testing.checkAllAllocationFailures(alloc, Runner.run, .{segment});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Runner.run, .{segment});
     const payload = try encodeAlloc(alloc, segment);
     defer alloc.free(payload);
     for (0..payload.len) |len| {

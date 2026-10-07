@@ -1,4 +1,5 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -1270,5 +1271,5 @@ test "reader capability probe distinguishes unsupported metadata and preserves a
             try std.testing.expectEqual(ReaderKind.encoder_decoder, support.supported);
         }
     };
-    try std.testing.checkAllAllocationFailures(allocator, Check.run, .{model_dir});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(allocator, Check.run, .{model_dir});
 }

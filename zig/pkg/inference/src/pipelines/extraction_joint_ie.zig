@@ -1,5 +1,17 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Bounded, deterministic joint entity/relation selection. Candidate utilities
 //! are calibrated by the caller; presentation probabilities never substitute
@@ -1188,7 +1200,7 @@ test "joint fastino profile owns body token keys and bounded failure cleanup" {
             try std.testing.expectEqual(@as(usize, 1), result.edges.len);
         }
     };
-    try std.testing.checkAllAllocationFailures(a, Check.run, .{compiled.schema.joint_ie.?});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Check.run, .{compiled.schema.joint_ie.?});
     const nodes = [_]Node{ testNode(200, 1), testNode(1000, 1) };
     const spans = [_]SourceSpan{ .{ .start = 2, .end = 3 }, .{ .start = 10, .end = 11 } };
     const edges = [_]Edge{.{ .relation_type = 0, .head = 0, .tail = 1, .utility = 1, .probability = 0.75, .slot = 10, .hypothesis = 0 }};
@@ -1418,5 +1430,5 @@ test "joint decoder allocation failures release results and scratch" {
             try std.testing.expect(result.valid());
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{compiled.schema.joint_ie.?});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Check.run, .{compiled.schema.joint_ie.?});
 }

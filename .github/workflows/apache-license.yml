@@ -1,0 +1,28 @@
+name: Apache license boundary
+
+on:
+  pull_request:
+  merge_group:
+    types: [checks_requested]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  boundary:
+    name: Apache license boundary
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check repository licenses and Apache dependency boundary
+        run: |
+          python3 scripts/license_headers.py --check
+          python3 scripts/check_apache_boundary.py
+          python3 -m unittest discover -s scripts -p test_check_apache_boundary.py
+          python3 -m unittest discover -s scripts -p test_license_headers.py
+          python3 -m unittest discover -s scripts -p test_qualification_provenance.py
+          python3 -m unittest discover -s scripts -p test_asset_licenses.py

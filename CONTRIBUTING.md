@@ -7,7 +7,7 @@ zig/pkg/antfly/      Antfly server, CLI, storage, Raft, and embedded runtime
 zig/pkg/inference/   Local inference runtime
 zig/e2e/             Zig runtime end-to-end suites
 go/pkg/
-  lite/              Go binding for embedded Antfly Lite
+  embedded/          Go binding for local databases and inference
   sdk/               Go SDK
   docsaf/            Content ingestion (filesystem, web crawl, git, S3)
   evalaf/            LLM/RAG evaluation framework
@@ -17,16 +17,16 @@ go/pkg/
   proxy/             Antfly and Inference proxy packages
 ts/
   packages/sdk/      TypeScript SDK (@antfly/sdk)
-  packages/lite/     TypeScript Antfly Lite binding (@antfly/lite)
+  packages/embedded/    TypeScript embedded binding (@antfly/embedded)
   packages/components/  React component library (@antfly/components)
   apps/antfarm/      Web dashboard (React + Vite)
 py/packages/sdk/     Python SDK
-py/packages/lite/    Python Antfly Lite binding (antfly-lite)
+py/packages/embedded/  Python embedded binding (antfly-embedded)
 rs/
-  crates/pgaf/       PostgreSQL extension (Rust/pgrx)
-  crates/sdk/        Generated Rust SDK (shared types with pgaf)
-  crates/lite/       Rust Antfly Lite binding (antfly-lite)
-  crates/lite-sys/   Raw libantfly C ABI declarations (antfly-lite-sys)
+  crates/postgres/      PostgreSQL extension (antfly-postgres, Rust/pgrx)
+  crates/sdk/           Generated Rust SDK (shared types with antfly-postgres)
+  crates/embedded/      Rust embedded binding (antfly-embedded)
+  crates/embedded-sys/  Raw libantfly C ABI declarations (antfly-embedded-sys)
 configs/             Example configuration files
 devops/              Kubernetes manifests (minikube, etc.)
 scripts/             Build and utility scripts
@@ -106,7 +106,7 @@ The repository contains multiple independent Go modules (no `go.work`). Each mus
 
 | Module | Directory |
 |--------|-----------|
-| Antfly Lite binding | `go/pkg/lite/` |
+| Antfly embedded binding | `go/pkg/embedded/` |
 | Go SDK | `go/pkg/sdk/` |
 | Operator | `go/pkg/operator/` |
 | Proxies (Antfly gateway, inference) | `go/pkg/proxy/` |
@@ -167,11 +167,11 @@ cd ts && pnpm run lint
 cd py && uv sync && uv run pytest
 ```
 
-### Rust (pgaf)
+### Rust (antfly-postgres)
 
 ```bash
-cd rs/crates/pgaf && make test       # Unit tests
-cd rs/crates/pgaf && make test-e2e   # E2E (requires running Antfly server)
+cd rs/crates/postgres && make test       # Unit tests
+cd rs/crates/postgres && make test-e2e   # E2E (requires running Antfly server)
 ```
 
 ## Code Generation
@@ -218,4 +218,20 @@ See [RELEASE.md](RELEASE.md) for the Zig release pipeline.
 
 ## License
 
-Core Antfly code is licensed under [Elastic License 2.0 (ELv2)](LICENSE). The SDKs, shared libraries, inference runtime, TypeScript, Python, and Rust packages are Apache 2.0 — check individual LICENSE files.
+Antfly is a mixed-license repository. The embedded engine, Lite CLI, native library, inference runtime, and language bindings are Apache-2.0; the database server and orchestration remain ELv2. See [LICENSING.md](LICENSING.md) for the per-tree and per-file boundary before contributing.
+
+## Contribution rights and inbound licenses
+
+By submitting a contribution, you confirm that you have the right to submit it
+under the applicable inbound licenses below. Contributions containing third-party
+material must retain its original notices and comply with its license.
+`Signed-off-by` trailers are optional.
+
+The inbound license for a first-party Apache-2.0 file is Apache-2.0. For a
+first-party ELv2 file, contributors submit their copyrightable changes under
+ELv2 **and** grant Antfly, Inc. permission to distribute those changes under
+Apache-2.0 if the file or an extracted shared component later moves to the
+Apache boundary. The file's current outbound license remains ELv2 until its
+license notice and the boundary map are changed. By submitting a contribution,
+you confirm that you have the right to make these grants. This policy applies
+prospectively; it does not supply rights for earlier contributions.

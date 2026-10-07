@@ -1,5 +1,17 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Internal GLiNER2.5 CPU task orchestration. Encoder states and every route
 //! come from one prepared batch. Results own their strings and coordinates;
@@ -1794,7 +1806,7 @@ test "gliner boundary classification presentation shares temperature fallback pr
             try std.testing.expectEqual(@as(usize, 3), output.output_values);
         }
     };
-    try std.testing.checkAllAllocationFailures(a, Check.run, .{ &ordinary, &raw });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Check.run, .{ &ordinary, &raw });
 }
 
 test "gliner boundary classification top_k preserves ordinary and structured presentation" {
@@ -1822,7 +1834,7 @@ test "gliner boundary classification top_k preserves ordinary and structured pre
             try std.testing.expectEqualStrings("right", output.classifications[2].labels[1].label);
         }
     };
-    try std.testing.checkAllAllocationFailures(a, Ordinary.run, .{ &ordinary, &ordinary_raw });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Ordinary.run, .{ &ordinary, &ordinary_raw });
 
     // Omitting top_k lets the whole collection use declared cardinalities.
     var mixed = try schema_mod.compile(a,
@@ -1843,7 +1855,7 @@ test "gliner boundary classification top_k preserves ordinary and structured pre
             try std.testing.expectEqualStrings("y", output.classifications[1].labels[1].label);
         }
     };
-    try std.testing.checkAllAllocationFailures(a, Structured.run, .{ &mixed, &mixed_raw });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Structured.run, .{ &mixed, &mixed_raw });
 
     // Independent callers cannot bypass compilation and silently discard a
     // non-default top_k. Reject before the first presentation allocation.

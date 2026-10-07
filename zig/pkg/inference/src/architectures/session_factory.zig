@@ -1,4 +1,5 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -6187,7 +6188,7 @@ test "legacy GLiNER encoder sidecar bounds regular input and recovers after allo
             try std.testing.expect(cfg.use_exact_gelu);
         }
     };
-    try std.testing.checkAllAllocationFailures(allocator, Check.run, .{model_dir});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(allocator, Check.run, .{model_dir});
     try Check.run(allocator, model_dir);
 }
 

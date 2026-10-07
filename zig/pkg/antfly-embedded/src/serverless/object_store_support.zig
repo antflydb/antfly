@@ -1,0 +1,456 @@
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+const std = @import("std");
+const object_storage = @import("../storage/object_storage.zig");
+const aws = @import("antfly_credentials").aws;
+const google_auth = @import("antfly_google").auth;
+const remote_uri = @import("remote_uri.zig");
+
+const Allocator = std.mem.Allocator;
+const AwsCredentialContext = @import("aws_credential_context.zig").AwsCredentialContext;
+
+pub const S3Options = struct {
+    endpoint: ?[]const u8 = null,
+    region: ?[]const u8 = null,
+    access_key_id: ?[]const u8 = null,
+    secret_access_key: ?[]const u8 = null,
+    session_token: ?[]const u8 = null,
+    credential_source: aws.CredentialSource = .default,
+    use_ssl: bool = true,
+    addressing_style: object_storage.S3.AddressingStyle = .path,
+    create_bucket: bool = false,
+};
+
+pub const GcsCredentialSource = enum { default, bearer_token, service_account };
+
+pub const GcsOptions = struct {
+    endpoint: ?[]const u8 = null,
+    upload_endpoint: ?[]const u8 = null,
+    project_id: ?[]const u8 = null,
+    credential_source: GcsCredentialSource = .default,
+    bearer_token: ?[]const u8 = null,
+    service_account_json: ?[]const u8 = null,
+    credentials_path: ?[]const u8 = null,
+    scope: ?[]const u8 = null,
+    create_bucket: bool = false,
+};
+
+pub fn s3ConfigAlloc(alloc: Allocator, options: ?S3Options) !object_storage.S3.Config {
+    const opts = options orelse S3Options{};
+    return try object_storage.S3.fromEnvAlloc(
+        alloc,
+        opts.endpoint,
+        opts.use_ssl,
+        opts.access_key_id,
+        opts.secret_access_key,
+        opts.session_token,
+        opts.region,
+        opts.addressing_style,
+    );
+}
+
+pub fn gcsConfigAlloc(alloc: Allocator, maybe_options: ?GcsOptions) !object_storage.Gcs.JsonApiConfig {
+    const options = maybe_options orelse GcsOptions{};
+    var cfg = switch (options.credential_source) {
+        .default => try object_storage.Gcs.jsonApiClientConfigFromEnvWithScopeAlloc(alloc, options.scope),
+        .bearer_token => try object_storage.Gcs.jsonApiClientConfigWithBearerTokenAlloc(
+            alloc,
+            options.bearer_token orelse return error.MissingGcsBearerToken,
+            options.project_id,
+        ),
+        .service_account => blk: {
+            var service_account = if (options.service_account_json) |raw|
+                try google_auth.parseServiceAccountJsonAlloc(alloc, raw)
+            else if (options.credentials_path) |path|
+                try google_auth.serviceAccountFromFileAlloc(alloc, path)
+            else
+                return error.MissingServiceAccount;
+            var service_account_owned = true;
+            errdefer if (service_account_owned) service_account.deinit(alloc);
+            const discovered_project = service_account.project_id;
+            var auth_cfg = try google_auth.configFromServiceAccountAlloc(
+                alloc,
+                service_account,
+                options.scope orelse google_auth.default_scope,
+            );
+            service_account_owned = false;
+            var auth_cfg_owned = true;
+            errdefer if (auth_cfg_owned) auth_cfg.deinit(alloc);
+            const source = try alloc.create(google_auth.CachedTokenSource);
+            errdefer alloc.destroy(source);
+            source.* = try google_auth.CachedTokenSource.init(alloc, auth_cfg);
+            auth_cfg_owned = false;
+            var source_owned = true;
+            errdefer if (source_owned) {
+                source.deinit();
+                alloc.destroy(source);
+            };
+            var result = try object_storage.Gcs.jsonApiClientConfigAlloc(alloc);
+            errdefer result.deinit(alloc);
+            result.auth = .{ .google_token_source = source };
+            source_owned = false;
+            if (options.project_id orelse discovered_project) |project_id| {
+                result.project_id = try alloc.dupe(u8, project_id);
+            }
+            break :blk result;
+        },
+    };
+    errdefer cfg.deinit(alloc);
+    if (options.endpoint) |endpoint| {
+        alloc.free(cfg.endpoint);
+        cfg.endpoint = try alloc.dupe(u8, endpoint);
+    }
+    if (options.upload_endpoint) |upload_endpoint| {
+        alloc.free(cfg.upload_endpoint);
+        cfg.upload_endpoint = try alloc.dupe(u8, upload_endpoint);
+    }
+    if (options.project_id) |project_id| {
+        if (cfg.project_id) |owned| alloc.free(owned);
+        cfg.project_id = try alloc.dupe(u8, project_id);
+    }
+    return cfg;
+}
+
+pub const OpenedObjectStore = struct {
+    alloc: Allocator,
+    client: object_storage.ObjectStorage,
+    fs_client: ?*object_storage.FilesystemObjectStorage = null,
+    gcs_client: ?*object_storage.Gcs.JsonApiClient = null,
+    s3_client: ?*object_storage.S3.Client = null,
+    owns_client: bool = true,
+    credential_context: ?*AwsCredentialContext = null,
+    credential_io: ?*std.Io.Threaded = null,
+    bucket: []u8,
+    prefix: []u8,
+
+    pub const OpenOptions = struct {
+        ensure_bucket: bool = true,
+    };
+
+    pub fn initRemoteUri(alloc: Allocator, uri: []const u8, file_bucket: []const u8) !OpenedObjectStore {
+        return try initRemoteUriWithS3AndOpenOptions(alloc, uri, file_bucket, null, .{});
+    }
+
+    pub fn initRemoteUriWithOptions(
+        alloc: Allocator,
+        uri: []const u8,
+        file_bucket: []const u8,
+        options: OpenOptions,
+    ) !OpenedObjectStore {
+        return try initRemoteUriWithS3AndOpenOptions(alloc, uri, file_bucket, null, options);
+    }
+
+    /// Opens an existing S3 namespace without creating a missing bucket. This
+    /// is the only safe constructor for destructive cleanup: a missing bucket
+    /// must be observed as an error, not manufactured into an empty success.
+    pub fn initExistingS3RemoteUri(alloc: Allocator, uri: []const u8) !OpenedObjectStore {
+        var value = try remote_uri.bucketPathFromS3UriAlloc(alloc, uri);
+        defer value.deinit(alloc);
+        return try initExistingS3UriWithOptions(alloc, value.bucket, value.prefix, null);
+    }
+
+    pub fn initRemoteUriWithS3Options(
+        alloc: Allocator,
+        uri: []const u8,
+        file_bucket: []const u8,
+        s3_options: ?S3Options,
+    ) !OpenedObjectStore {
+        return try initRemoteUriWithS3AndOpenOptions(alloc, uri, file_bucket, s3_options, .{});
+    }
+
+    pub fn initRemoteUriWithS3AndOpenOptions(
+        alloc: Allocator,
+        uri: []const u8,
+        file_bucket: []const u8,
+        s3_options: ?S3Options,
+        open_options: OpenOptions,
+    ) !OpenedObjectStore {
+        var parsed = try remote_uri.parseAlloc(alloc, uri);
+        defer switch (parsed) {
+            .file => |value| alloc.free(value),
+            .gcs => |*value| value.deinit(alloc),
+            .s3 => |*value| value.deinit(alloc),
+        };
+
+        return switch (parsed) {
+            .file => |path| blk: {
+                const file_uri = try std.fmt.allocPrint(alloc, "file://{s}", .{path});
+                defer alloc.free(file_uri);
+                break :blk try initFileUriWithOptions(alloc, file_uri, file_bucket, open_options);
+            },
+            .gcs => |value| try initGcsUriWithOptions(alloc, value.bucket, value.prefix, open_options),
+            .s3 => |value| try initS3UriWithS3AndOpenOptions(alloc, value.bucket, value.prefix, s3_options, open_options),
+        };
+    }
+
+    pub fn initFileUri(alloc: Allocator, uri: []const u8, bucket: []const u8) !OpenedObjectStore {
+        return try initFileUriWithOptions(alloc, uri, bucket, .{});
+    }
+
+    pub fn initFileUriWithOptions(
+        alloc: Allocator,
+        uri: []const u8,
+        bucket: []const u8,
+        options: OpenOptions,
+    ) !OpenedObjectStore {
+        const path = try remote_uri.filePathFromUriAlloc(alloc, uri);
+        defer alloc.free(path);
+        const fs = try alloc.create(object_storage.FilesystemObjectStorage);
+        errdefer alloc.destroy(fs);
+        fs.* = try object_storage.FilesystemObjectStorage.init(alloc, path);
+
+        var owned_client = fs.client();
+        if (options.ensure_bucket and !(try owned_client.bucketExists(bucket))) try owned_client.makeBucket(bucket);
+        return .{
+            .alloc = alloc,
+            .client = owned_client,
+            .fs_client = fs,
+            .bucket = try alloc.dupe(u8, bucket),
+            .prefix = try alloc.dupe(u8, ""),
+        };
+    }
+
+    pub fn initGcsUri(alloc: Allocator, bucket: []const u8, prefix: []const u8) !OpenedObjectStore {
+        return try initGcsUriWithOptions(alloc, bucket, prefix, .{});
+    }
+
+    pub fn initGcsUriWithOptions(
+        alloc: Allocator,
+        bucket: []const u8,
+        prefix: []const u8,
+        options: OpenOptions,
+    ) !OpenedObjectStore {
+        return try initGcsUriWithBearerTokenAndOptions(alloc, bucket, prefix, null, options);
+    }
+
+    pub fn initGcsUriWithBearerTokenAndOptions(
+        alloc: Allocator,
+        bucket: []const u8,
+        prefix: []const u8,
+        bearer_token: ?[]const u8,
+        options: OpenOptions,
+    ) !OpenedObjectStore {
+        const gcs = try alloc.create(object_storage.Gcs.JsonApiClient);
+        errdefer alloc.destroy(gcs);
+        var cfg = if (bearer_token) |token|
+            try object_storage.Gcs.jsonApiClientConfigWithBearerTokenAlloc(alloc, token, null)
+        else
+            try object_storage.Gcs.jsonApiClientConfigFromEnvAlloc(alloc);
+        errdefer cfg.deinit(alloc);
+        gcs.* = try object_storage.Gcs.JsonApiClient.init(alloc, cfg);
+
+        var owned_client = gcs.client();
+        if (options.ensure_bucket and !(try owned_client.bucketExists(bucket))) try owned_client.makeBucket(bucket);
+        return .{
+            .alloc = alloc,
+            .client = owned_client,
+            .gcs_client = gcs,
+            .bucket = try alloc.dupe(u8, bucket),
+            .prefix = try alloc.dupe(u8, prefix),
+        };
+    }
+
+    pub fn initS3Uri(alloc: Allocator, bucket: []const u8, prefix: []const u8) !OpenedObjectStore {
+        return try initS3UriWithS3AndOpenOptions(alloc, bucket, prefix, null, .{});
+    }
+
+    pub fn initS3UriWithOptions(
+        alloc: Allocator,
+        bucket: []const u8,
+        prefix: []const u8,
+        options: ?S3Options,
+    ) !OpenedObjectStore {
+        return try initS3UriWithS3AndOpenOptions(alloc, bucket, prefix, options, .{});
+    }
+
+    fn initExistingS3UriWithOptions(
+        alloc: Allocator,
+        bucket: []const u8,
+        prefix: []const u8,
+        options: ?S3Options,
+    ) !OpenedObjectStore {
+        return try initS3UriWithS3AndOpenOptions(alloc, bucket, prefix, options, .{ .ensure_bucket = false });
+    }
+
+    pub fn initS3UriWithOpenOptions(
+        alloc: Allocator,
+        bucket: []const u8,
+        prefix: []const u8,
+        options: OpenOptions,
+    ) !OpenedObjectStore {
+        return try initS3UriWithS3AndOpenOptions(alloc, bucket, prefix, null, options);
+    }
+
+    pub const S3Overrides = struct {
+        endpoint: ?[]const u8 = null,
+        use_ssl: bool = true,
+        access_key_id: ?[]const u8 = null,
+        secret_access_key: ?[]const u8 = null,
+        session_token: ?[]const u8 = null,
+        region: ?[]const u8 = null,
+        addressing_style: object_storage.S3.AddressingStyle = .path,
+    };
+
+    pub fn initS3UriWithOverrides(alloc: Allocator, bucket: []const u8, prefix: []const u8, overrides: S3Overrides) !OpenedObjectStore {
+        return try initS3UriWithOverridesAndOptions(alloc, bucket, prefix, overrides, .{});
+    }
+
+    pub fn initS3UriWithOverridesAndOptions(
+        alloc: Allocator,
+        bucket: []const u8,
+        prefix: []const u8,
+        overrides: S3Overrides,
+        options: OpenOptions,
+    ) !OpenedObjectStore {
+        return try initS3UriWithS3AndOpenOptions(alloc, bucket, prefix, .{
+            .endpoint = overrides.endpoint,
+            .region = overrides.region,
+            .access_key_id = overrides.access_key_id,
+            .secret_access_key = overrides.secret_access_key,
+            .session_token = overrides.session_token,
+            .use_ssl = overrides.use_ssl,
+            .addressing_style = overrides.addressing_style,
+        }, options);
+    }
+
+    pub fn initS3UriWithS3AndOpenOptions(
+        alloc: Allocator,
+        bucket: []const u8,
+        prefix: []const u8,
+        s3_options: ?S3Options,
+        open_options: OpenOptions,
+    ) !OpenedObjectStore {
+        const s3 = try alloc.create(object_storage.S3.Client);
+        errdefer alloc.destroy(s3);
+        const options = s3_options orelse S3Options{};
+        if ((options.access_key_id == null) != (options.secret_access_key == null)) return error.IncompleteStaticCredentials;
+        const dynamic = options.access_key_id == null;
+        var config_options = options;
+        if (dynamic) {
+            config_options.access_key_id = "dynamic-provider";
+            config_options.secret_access_key = "dynamic-provider";
+        }
+        var cfg = try s3ConfigAlloc(alloc, config_options);
+        var cfg_owned = true;
+        errdefer if (cfg_owned) cfg.deinit(alloc);
+        var credential_io: ?*std.Io.Threaded = null;
+        errdefer if (credential_io) |io| {
+            io.deinit();
+            alloc.destroy(io);
+        };
+        var credential_context: ?*AwsCredentialContext = null;
+        errdefer if (credential_context) |context| {
+            context.deinit();
+            alloc.destroy(context);
+        };
+        if (dynamic) {
+            const io = try alloc.create(std.Io.Threaded);
+            io.* = @import("antfly_runtime_fs").threaded_io_limits.initServerlessObjectStore(alloc);
+            credential_io = io;
+            const context = try alloc.create(AwsCredentialContext);
+            errdefer alloc.destroy(context);
+            context.* = try AwsCredentialContext.init(alloc, cfg.credentials.region, options.credential_source, io.io());
+            credential_context = context;
+            cfg.io = io.io();
+            cfg.credential_provider = context.provider();
+        }
+        s3.* = try object_storage.S3.Client.init(alloc, cfg);
+        cfg_owned = false;
+        var owned_client = s3.client();
+        errdefer owned_client.deinit();
+        if (open_options.ensure_bucket and !(try owned_client.bucketExists(bucket))) try owned_client.makeBucket(bucket);
+        const owned_bucket = try alloc.dupe(u8, bucket);
+        errdefer alloc.free(owned_bucket);
+        return .{
+            .alloc = alloc,
+            .client = owned_client,
+            .s3_client = s3,
+            .bucket = owned_bucket,
+            .prefix = try alloc.dupe(u8, prefix),
+            .credential_context = credential_context,
+            .credential_io = credential_io,
+        };
+    }
+
+    pub fn initWithClient(alloc: Allocator, client: object_storage.ObjectStorage, bucket: []const u8, prefix: []const u8) !OpenedObjectStore {
+        return try initWithClientOptions(alloc, client, bucket, prefix, .{});
+    }
+
+    pub fn initWithClientOptions(
+        alloc: Allocator,
+        client: object_storage.ObjectStorage,
+        bucket: []const u8,
+        prefix: []const u8,
+        options: OpenOptions,
+    ) !OpenedObjectStore {
+        var owned_client = client;
+        if (options.ensure_bucket and !(try owned_client.bucketExists(bucket))) try owned_client.makeBucket(bucket);
+        return .{
+            .alloc = alloc,
+            .client = owned_client,
+            .owns_client = false,
+            .bucket = try alloc.dupe(u8, bucket),
+            .prefix = try alloc.dupe(u8, prefix),
+        };
+    }
+
+    pub fn initWithExistingClient(alloc: Allocator, client: object_storage.ObjectStorage, bucket: []const u8, prefix: []const u8) !OpenedObjectStore {
+        const owned_bucket = try alloc.dupe(u8, bucket);
+        errdefer alloc.free(owned_bucket);
+        return .{
+            .alloc = alloc,
+            .client = client,
+            .owns_client = false,
+            .bucket = owned_bucket,
+            .prefix = try alloc.dupe(u8, prefix),
+        };
+    }
+
+    pub fn deinit(self: *OpenedObjectStore) void {
+        if (self.owns_client) self.client.deinit();
+        if (self.credential_context) |context| {
+            context.deinit();
+            self.alloc.destroy(context);
+        }
+        if (self.credential_io) |io| {
+            io.deinit();
+            self.alloc.destroy(io);
+        }
+        if (self.fs_client) |fs| self.alloc.destroy(fs);
+        if (self.gcs_client) |gcs| self.alloc.destroy(gcs);
+        if (self.s3_client) |s3| self.alloc.destroy(s3);
+        self.alloc.free(self.bucket);
+        self.alloc.free(self.prefix);
+        self.* = undefined;
+    }
+};
+
+test "storage.hot_standby cleanup object store does not create a missing bucket while opening deletion authority" {
+    const alloc = std.testing.allocator;
+    var memory = object_storage.MemoryObjectStorage.init(alloc);
+    defer memory.deinit();
+    var client = memory.client();
+    try std.testing.expect(!(try client.bucketExists("missing-ha-bucket")));
+
+    var opened = try OpenedObjectStore.initWithExistingClient(
+        alloc,
+        client,
+        "missing-ha-bucket",
+        "instances/instance-a/ha-seeds/",
+    );
+    defer opened.deinit();
+    try std.testing.expect(!(try client.bucketExists("missing-ha-bucket")));
+}

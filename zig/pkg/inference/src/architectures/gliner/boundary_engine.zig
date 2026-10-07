@@ -1,5 +1,17 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Native encoder and structural state routing for GLiNER2.5. This module is
 //! an internal inference building block; runtime advertisement remains gated
@@ -651,7 +663,7 @@ test "gliner boundary engine routed states clean up every allocation failure" {
             defer result.deinit();
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{ &config, &prepared, &states });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Check.run, .{ &config, &prepared, &states });
 }
 
 test "gliner boundary engine eager encoder host allocation cleanup on padded batch" {
@@ -712,7 +724,7 @@ test "gliner boundary engine eager encoder host allocation cleanup on padded bat
     };
     // Backend tensors use their stable allocator; inject each architecture/
     // routing host failure, including the padding-mask and relative-ID paths.
-    try std.testing.checkAllAllocationFailures(a, Check.run, .{ &cb, &config, &prepared });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Check.run, .{ &cb, &config, &prepared });
 }
 
 test "gliner boundary engine Python parity pinned small checkpoint CPU encoder and routing" {

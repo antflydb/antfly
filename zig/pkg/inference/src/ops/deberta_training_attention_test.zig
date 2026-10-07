@@ -1,5 +1,17 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Independent scalar and finite-difference checks for the replay-tiled CPU
 //! primitive. Pinned Python fixtures are a separate numerical qualification.
@@ -338,7 +350,7 @@ test "replay DeBERTa training attention owned OOM cancellation exact scratch and
             defer allocator.free(gradient);
         }
     };
-    try std.testing.checkAllAllocationFailures(a, Exercise.run, .{ fixture, options });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Exercise.run, .{ fixture, options });
     const Cancel = struct {
         checks: usize = 0,
         stop: usize,
@@ -428,7 +440,7 @@ test "replay DeBERTa training attention native hooks retain physical i32 and vie
     const a = std.testing.allocator;
     var fixture = try Fixture.init(a, 5, 0.125);
     defer fixture.deinit();
-    try std.testing.checkAllAllocationFailures(a, backendCase, .{fixture});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, backendCase, .{fixture});
 }
 
 test "replay DeBERTa training attention native hooks reject unsupported types and absent profile" {

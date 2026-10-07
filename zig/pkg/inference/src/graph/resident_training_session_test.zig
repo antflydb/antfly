@@ -1,5 +1,18 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 const std = @import("std");
 const options = @import("build_options");
 const ml = @import("ml").graph;
@@ -76,7 +89,7 @@ fn constructionCheck(a: Allocator, profile: usize) !void {
 }
 
 test "resident session direct and stage construction release every allocation failure" {
-    for (0..3) |profile| try std.testing.checkAllAllocationFailures(std.testing.allocator, constructionCheck, .{profile});
+    for (0..3) |profile| try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, constructionCheck, .{profile});
 }
 
 test "resident session explicit backend profile and combined retained admission reject before execution" {

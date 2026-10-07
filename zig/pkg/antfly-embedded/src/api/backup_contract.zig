@@ -1,0 +1,350 @@
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Data-only backup/restore contract shared across compiled runtime units.
+//! Remote-store implementations and backup algorithms stay in backups.zig.
+
+const std = @import("std");
+const CancellationToken = @import("antfly_cancellation").CancellationToken;
+const platform_time = @import("antfly_platform").time;
+
+pub const format_version: u32 = 2;
+
+pub fn validateArtifactRelativePath(path: []const u8) !void {
+    if (path.len == 0 or path.len > 4096 or std.fs.path.isAbsolute(path) or std.mem.indexOfScalar(u8, path, '\\') != null or std.mem.indexOfScalar(u8, path, 0) != null) {
+        return error.InvalidBackupArtifactPath;
+    }
+    var components = std.mem.splitScalar(u8, path, '/');
+    while (components.next()) |component| {
+        if (component.len == 0 or std.mem.eql(u8, component, ".") or std.mem.eql(u8, component, "..")) return error.InvalidBackupArtifactPath;
+    }
+}
+pub const backup_fence_metadata_group_id_header = "X-Antfly-Backup-Metadata-Group-Id";
+pub const backup_fence_metadata_incarnation_header = "X-Antfly-Backup-Metadata-Incarnation";
+pub const backup_fence_table_id_header = "X-Antfly-Backup-Table-Id";
+pub const backup_fence_definition_header = "X-Antfly-Backup-Definition-SHA256";
+pub const backup_fence_topology_count_header = "X-Antfly-Backup-Topology-Count";
+pub const backup_fence_topology_header = "X-Antfly-Backup-Topology-SHA256";
+pub const backup_cohort_fence_header = "X-Antfly-Backup-Cohort-Fence";
+pub const backup_pin_control_header = "X-Antfly-Backup-Pin-Control";
+pub const backup_sealed_handle_header = "X-Antfly-Backup-Sealed-Handle";
+pub const SealedHandle = @import("../metadata/backup_cohort.zig").SealReceipt;
+
+pub fn sealedHandleForGroup(handles: []const SealedHandle, group_id: u64) !?SealedHandle {
+    if (handles.len == 0) return null;
+    for (handles) |handle| if (handle.handle.fence.owner_group_id == group_id) return handle;
+    return error.InvalidBackupFence;
+}
+
+pub fn parseBackupCohortFenceHeader(value: ?[]const u8) !?@import("../storage/db/relational_integrity_topology_contract.zig").Fence {
+    const raw = value orelse return null;
+    const Fence = @import("../storage/db/relational_integrity_topology_contract.zig").Fence;
+    const Encoded = @typeInfo(@typeInfo(@TypeOf(Fence.encode)).@"fn".return_type.?).error_union.payload;
+    var bytes: Encoded = undefined;
+    if (raw.len != bytes.len * 2) return error.InvalidBackupFence;
+    _ = std.fmt.hexToBytes(&bytes, raw) catch return error.InvalidBackupFence;
+    const fence = Fence.decode(&bytes) catch return error.InvalidBackupFence;
+    if (fence.role != .backup_snapshot) return error.InvalidBackupFence;
+    return fence;
+}
+pub const backup_writer_not_after_header = "X-Antfly-Backup-Writer-Not-After-Unix-Ns";
+/// Relative storage-owner execution budget. The coordinator retains a small
+/// response reserve and never sends its process-local monotonic timestamp.
+pub const backup_remaining_ms_header = "X-Antfly-Backup-Remaining-Ms";
+pub const backup_server_response_reserve_ms: u32 = 250;
+pub const max_backup_server_budget_ms: u32 = 24 * 60 * 60 * 1_000;
+pub const backup_outcome_header = "X-Antfly-Backup-Outcome";
+pub const backup_outcome_stopped_v1 = "stopped-v1";
+pub const catalog_changed_message = "table changed during backup admission";
+pub const backup_outcome_ambiguous_message = "backup outcome is ambiguous; inspect the backup id before retrying";
+
+pub const BackupFormat = enum {
+    native,
+    portable,
+};
+
+pub const ArtifactIntegrityMode = enum {
+    declared,
+    derive_after_materialization,
+};
+
+/// Compact, allocation-free catalog identity carried with backup execution.
+/// Storage owners must validate it after acquiring their structural-operation
+/// guard so a drop/recreate or schema/topology change cannot pair artifacts
+/// from one table incarnation with metadata from another.
+pub const TableBackupFence = struct {
+    metadata_group_id: u64,
+    /// Canonical 128-bit metadata-cluster identity encoded as lowercase hex.
+    /// All zeroes represent a legacy snapshot that did not expose incarnation.
+    metadata_incarnation: [32]u8,
+    table_id: u64,
+    definition_digest: [std.crypto.hash.sha2.Sha256.digest_length]u8,
+    topology_range_count: u64,
+    topology_digest: [std.crypto.hash.sha2.Sha256.digest_length]u8,
+    /// Current coordinators bound how long a forwarded request may wait before
+    /// its storage owner adopts the pre-created writer lease. Null identifies
+    /// a legacy delivery that requires a permanent cleanup tombstone.
+    writer_not_after_unix_ns: ?u64 = null,
+
+    pub fn hasMetadataIdentity(self: @This()) bool {
+        return self.metadata_group_id != 0 and
+            !std.mem.allEqual(u8, &self.metadata_incarnation, 0);
+    }
+
+    /// Checks an observed fence against this expected fence. Legacy expected
+    /// fences intentionally omit metadata identity for one rolling-upgrade
+    /// window. A current expected fence never accepts an observation that
+    /// cannot prove the same metadata-cluster incarnation.
+    pub fn matches(expected: @This(), observed: @This()) bool {
+        const metadata_identity_matches = !expected.hasMetadataIdentity() or
+            (observed.hasMetadataIdentity() and
+                expected.metadata_group_id == observed.metadata_group_id and
+                std.crypto.timing_safe.eql(@TypeOf(expected.metadata_incarnation), expected.metadata_incarnation, observed.metadata_incarnation));
+        return metadata_identity_matches and expected.table_id == observed.table_id and
+            expected.topology_range_count == observed.topology_range_count and
+            std.crypto.timing_safe.eql(@TypeOf(expected.definition_digest), expected.definition_digest, observed.definition_digest) and
+            std.crypto.timing_safe.eql(@TypeOf(expected.topology_digest), expected.topology_digest, observed.topology_digest);
+    }
+};
+
+fn hashDefinitionField(hasher: *std.crypto.hash.sha2.Sha256, value: []const u8) void {
+    var encoded_len: [8]u8 = undefined;
+    std.mem.writeInt(u64, &encoded_len, @intCast(value.len), .big);
+    hasher.update(&encoded_len);
+    hasher.update(value);
+}
+
+pub fn tableDefinitionDigest(
+    table_id: u64,
+    name: []const u8,
+    description: []const u8,
+    schema_json: []const u8,
+    read_schema_json: []const u8,
+    indexes_json: []const u8,
+    replication_sources_json: []const u8,
+) [std.crypto.hash.sha2.Sha256.digest_length]u8 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    var encoded_table_id: [8]u8 = undefined;
+    std.mem.writeInt(u64, &encoded_table_id, table_id, .big);
+    hasher.update(&encoded_table_id);
+    hashDefinitionField(&hasher, name);
+    hashDefinitionField(&hasher, description);
+    hashDefinitionField(&hasher, schema_json);
+    hashDefinitionField(&hasher, read_schema_json);
+    hashDefinitionField(&hasher, indexes_json);
+    hashDefinitionField(&hasher, replication_sources_json);
+    return hasher.finalResult();
+}
+
+pub const SourceGenerationAdmissionSummaryEntry = @import("../storage/portable_backup.zig").SourceGenerationAdmissionSummaryEntry;
+
+pub const ShardSnapshot = struct {
+    group_id: u64,
+    /// Logical range identity is distinct from the physical Raft group after
+    /// split/merge operations. Zero is the legacy encoding for `group_id`.
+    range_id: u64 = 0,
+    doc_identity_shard_id: u64 = 0,
+    doc_identity_range_id: u64 = 0,
+    split_attempt_epoch: u64 = 0,
+    start_key: []const u8,
+    end_key: ?[]const u8 = null,
+    snapshot_path: []const u8,
+    artifact_size_bytes: u64 = 0,
+    artifact_sha256: []const u8 = "",
+    /// Authenticates the per-file native generation inventory independently
+    /// from the whole-tree transport identity. This permits selective repair
+    /// only when the authoritative inventory itself is unchanged.
+    native_manifest_size_bytes: u64 = 0,
+    native_manifest_sha256: []const u8 = "",
+    /// Exact sealed source-owner evidence for this physical range. Different
+    /// parent ranges can have different accepted scopes and revisions.
+    accepted_generation_summary: []const SourceGenerationAdmissionSummaryEntry = &.{},
+    accepted_generation_summary_digest: ?[32]u8 = null,
+
+    pub fn deinit(self: ShardSnapshot, alloc: std.mem.Allocator) void {
+        alloc.free(@constCast(self.start_key));
+        if (self.end_key) |value| alloc.free(@constCast(value));
+        alloc.free(@constCast(self.snapshot_path));
+        if (self.artifact_sha256.len > 0) alloc.free(@constCast(self.artifact_sha256));
+        if (self.native_manifest_sha256.len > 0) alloc.free(@constCast(self.native_manifest_sha256));
+        for (self.accepted_generation_summary) |entry| {
+            alloc.free(@constCast(entry.child_table_name));
+            alloc.free(@constCast(entry.constraint_name));
+        }
+        if (self.accepted_generation_summary.len != 0) alloc.free(@constCast(self.accepted_generation_summary));
+    }
+};
+
+pub const TableBackupManifest = struct {
+    pub const AcceptedGeneration = SourceGenerationAdmissionSummaryEntry;
+    format_version: u32 = format_version,
+    format: BackupFormat,
+    artifact_integrity_mode: ArtifactIntegrityMode = .declared,
+    backup_id: []const u8,
+    table_name: []const u8,
+    table_id: u64 = 0,
+    description: []const u8,
+    schema_json: []const u8,
+    read_schema_json: []const u8,
+    indexes_json: []const u8,
+    replication_sources_json: []const u8,
+    shards: []const ShardSnapshot,
+
+    pub fn deinit(self: *TableBackupManifest, alloc: std.mem.Allocator) void {
+        alloc.free(@constCast(self.backup_id));
+        alloc.free(@constCast(self.table_name));
+        alloc.free(@constCast(self.description));
+        alloc.free(@constCast(self.schema_json));
+        alloc.free(@constCast(self.read_schema_json));
+        alloc.free(@constCast(self.indexes_json));
+        alloc.free(@constCast(self.replication_sources_json));
+        for (self.shards) |shard| shard.deinit(alloc);
+        alloc.free(@constCast(self.shards));
+        self.* = undefined;
+    }
+};
+
+pub const RestorePublicationHook = struct {
+    ptr: *anyopaque,
+    publish_definition: *const fn (ptr: *anyopaque) anyerror!void,
+    rollback_definition: *const fn (ptr: *anyopaque) anyerror!void,
+
+    pub fn publish(self: @This()) !void {
+        try self.publish_definition(self.ptr);
+    }
+
+    pub fn rollback(self: @This()) !void {
+        try self.rollback_definition(self.ptr);
+    }
+};
+
+pub const TableBackupPlan = struct {
+    backup_root: []const u8,
+    backup_id: []const u8,
+    format: BackupFormat = .native,
+    io: ?std.Io = null,
+    fence: ?TableBackupFence = null,
+    /// Internal storage-owner dispatch may pin capture to one exact Raft
+    /// group. Public/coordinator callers leave this null and resolve the full
+    /// fenced table topology before fan-out.
+    target_group_id: ?u64 = null,
+    /// Private common-cut authorization. It is checked under the native
+    /// snapshot lock, not merely observed by the distributed coordinator.
+    relational_cohort_fence: ?@import("../storage/db/relational_integrity_topology_contract.zig").Fence = null,
+    sealed_handles: []const SealedHandle = &.{},
+    /// Borrowed cooperative cancellation for capture, hashing, and local
+    /// materialization. Durable publication still reports ambiguity according
+    /// to the backup protocol once its commit point has been crossed.
+    cancellation: CancellationToken = .none,
+    /// Absolute monotonic operation deadline shared by catalog resolution,
+    /// storage capture, hashing, and publication. Null is retained for direct
+    /// embedded callers; production coordinators always provide a deadline.
+    deadline_ns: ?u64 = null,
+
+    pub fn ensureActive(self: @This()) !void {
+        if (self.sealed_handles.len != 0 and self.relational_cohort_fence != null) return error.InvalidBackupRequest;
+        if (self.relational_cohort_fence) |cohort| {
+            if (self.format != .native or cohort.role != .backup_snapshot or
+                (self.target_group_id != null and self.target_group_id.? != cohort.owner_group_id))
+                return error.InvalidBackupRequest;
+        }
+        try self.cancellation.check();
+        if (self.deadline_ns) |deadline_ns|
+            if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
+    }
+};
+
+/// Borrowed control plane for one table-backup operation. The monotonic
+/// deadline prevents a lost peer from retaining a writer reservation forever;
+/// cancellation lets bounded fanout stop admitting siblings after a failure.
+pub const BackupOperationControl = struct {
+    deadline_ns: u64,
+    cancellation: CancellationToken = .none,
+    sealed_handles: []const SealedHandle = &.{},
+    capture_node_id: ?u64 = null,
+    owner_local_only: bool = false,
+
+    pub fn ensureActive(self: @This()) !void {
+        try self.cancellation.check();
+        if (platform_time.monotonicNs() >= self.deadline_ns) return error.Timeout;
+    }
+
+    pub fn isCancelled(self: @This()) bool {
+        return self.cancellation.isCancelled() or platform_time.monotonicNs() >= self.deadline_ns;
+    }
+
+    pub fn token(self: *const @This()) CancellationToken {
+        return .{
+            .ptr = self,
+            .is_cancelled_fn = struct {
+                fn call(raw: *const anyopaque) bool {
+                    const control: *const BackupOperationControl = @ptrCast(@alignCast(raw));
+                    return control.isCancelled();
+                }
+            }.call,
+        };
+    }
+
+    pub fn remainingTimeoutMs(self: @This()) !u32 {
+        try self.cancellation.check();
+        const now_ns = platform_time.monotonicNs();
+        if (now_ns >= self.deadline_ns) return error.Timeout;
+        const remaining_ns = self.deadline_ns - now_ns;
+        const rounded_ms = std.math.divCeil(u64, remaining_ns, std.time.ns_per_ms) catch 1;
+        return @intCast(@max(@as(u64, 1), @min(rounded_ms, @as(u64, std.math.maxInt(u32)))));
+    }
+
+    /// Object-store transports expose cancellation as one portable error even
+    /// when the callback fired because this control's deadline elapsed. Recover
+    /// the operator-facing cause after the synchronous operation has drained.
+    pub fn normalizeInterruption(self: @This(), err: anyerror) anyerror {
+        if (err != error.Canceled and err != error.Cancelled) return err;
+        if (self.cancellation.isCancelled()) return error.Canceled;
+        if (platform_time.monotonicNs() >= self.deadline_ns) return error.Timeout;
+        return err;
+    }
+};
+
+pub const TableRestorePlan = struct {
+    backup_root: []const u8,
+    manifest: *const TableBackupManifest,
+    artifact_backup_id: []const u8,
+    source_location: []const u8,
+    reconcile_only: bool = false,
+    replace_existing: bool = false,
+    publication_hook: ?RestorePublicationHook = null,
+    io: ?std.Io = null,
+    /// Cooperative cancellation for long-running staged repair. The token's
+    /// semantic callback is safe across compiled runtime boundaries and is
+    /// borrowed only for the synchronous restore callback.
+    cancellation: CancellationToken = .none,
+    progress_context: ?*anyopaque = null,
+    progress_fn: ?*const fn (?*anyopaque, @import("../common/restore_progress.zig").Progress) void = null,
+};
+
+test "backup operation control preserves cancellation and deadline causes" {
+    const elapsed_deadline = BackupOperationControl{
+        .deadline_ns = platform_time.monotonicNs(),
+    };
+    try std.testing.expectEqual(error.Timeout, elapsed_deadline.normalizeInterruption(error.Canceled));
+
+    var cancellation = std.atomic.Value(bool).init(true);
+    const explicitly_cancelled = BackupOperationControl{
+        .deadline_ns = std.math.maxInt(u64),
+        .cancellation = CancellationToken.fromAtomic(&cancellation),
+    };
+    try std.testing.expectEqual(error.Canceled, explicitly_cancelled.normalizeInterruption(error.Cancelled));
+    try std.testing.expectEqual(error.Unexpected, explicitly_cancelled.normalizeInterruption(error.Unexpected));
+}

@@ -841,7 +841,7 @@ CUDA meets its minimal-usefulness bar:
 > **Relocated:** The dated L4 TurboQuant validation status and measurement
 > tables that previously lived here (32 lines, checked 2026-06-21) are
 > preserved verbatim in
-> [work-log/completed/inference/cuda-turboquant-l4-validation.md](../../../work-log/completed/inference/cuda/turboquant-l4.md).
+> [docs/design/inference/history/cuda/turboquant-l4.md](../../../docs/design/inference/history/cuda/turboquant-l4.md).
 > Durable decisions from it are in Gemma4 And TurboQuant KV Status in this
 > document.
 

@@ -1,5 +1,11 @@
 # Local database source separation
 
+The structural extraction and physical separation are merged into main. License
+preservation notes below describe those refactor PRs; #893 applies the Apache
+transition. Current ownership and licensing are documented in
+[embedded source ownership](../design/embedded-source-ownership.md) and
+[LICENSING.md](../../LICENSING.md).
+
 This refactor targets main before the Lite/inference licensing and release PR
 (#893). Existing source licenses remain unchanged; moved files keep their
 original headers. License-header tooling records ELv2 files that moved into
@@ -18,7 +24,7 @@ behavior changes belong to #893.
   shared generated types live in embedded. Authored schemas stay in
   `specs/openapi`, with the generator importing shared type modules.
 - Local DB, API helpers, catalog/index reconciliation and portable lake execution
-  live under `zig/pkg/antfly-embedded/src/local`. Native embedded lake querying
+  live under `zig/pkg/antfly-embedded/src`. Native embedded lake querying
   includes Parquet/Iceberg readers and shared SQL cursors; server credential
   resolution and distributed publication are adapters. Server replica catalogs,
   provisioning DTOs and coordination remain with `zig/pkg/antfly`.
@@ -227,7 +233,7 @@ classification to the full embedded source closure.
 ## Physical separation
 
 The DB and its complete local dependency closure now live under
-`zig/pkg/antfly-embedded/src/local`. The logical `storage/db/` paths above refer
+`zig/pkg/antfly-embedded/src`. The logical `storage/db/` paths above refer
 to that owner. The execution resources, mutation families, retained reads, and
 maintenance owners extracted in #969 move together with their local consumers.
 Server upload recovery scheduling, TTL routing, query visibility routing,

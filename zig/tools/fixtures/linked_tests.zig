@@ -1,5 +1,18 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 const std = @import("std");
 const linked = @import("pkg/antfly/build/linked_tests.zig");
 pub fn build(b: *std.Build) void {
@@ -7,7 +20,7 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     const filters = @import("build_test_filters.zig").select(b.allocator, buildArguments(b) orelse &.{}, &.{"fixture"});
     const error_logs = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly-embedded/src/local/test_error_logs.zig"),
+        .root_source_file = b.path("pkg/antfly-embedded/src/test_error_logs.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -32,7 +45,7 @@ pub fn build(b: *std.Build) void {
         .name = "fixture-consumer",
         .root_module = consumer_module,
         .filters = filters,
-        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     consumer.executable.root_module.linkLibrary(provider);
     const implementation = b.addTest(.{
@@ -44,7 +57,7 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
         }),
         .filters = filters,
-        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     implementation.root_module.addImport("antfly_test_error_logs", error_logs);
     const compile_step = b.step("compile", "Compile and link without foreign execution");
@@ -62,7 +75,7 @@ pub fn build(b: *std.Build) void {
                     .target = target,
                     .optimize = optimize,
                 }),
-                .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
+                .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
             }),
             .filters = &.{"owned"},
         };

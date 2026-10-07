@@ -1,4 +1,5 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Elastic-2.0
 //
 // Licensed under the Elastic License 2.0 (ELv2); you may not use this file
 // except in compliance with the Elastic License 2.0. You may obtain a copy of
@@ -144,7 +145,7 @@ pub fn planAlloc(alloc: Allocator, maybe_current: ?manifests.Manifest, plan: pub
     defer actions.deinit(alloc);
     for (current.artifacts) |ref| {
         const keep = switch (ref.kind) {
-            .external_base_source, .graph_metric_segment => false,
+            .external_base_source, .graph_metric_segment, .ordered_row_index => false,
             .text_segment, .sparse_segment, .vector_segment, .graph_segment, .algebraic_segment => blk: {
                 const decision = decisions.find(ref.name) orelse break :blk false;
                 if (ref.kind == .vector_segment and current.stats.policy.vector_distance_metric != plan.policy.vector_distance_metric) break :blk false;

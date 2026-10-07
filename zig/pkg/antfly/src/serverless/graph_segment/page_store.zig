@@ -1,4 +1,5 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Elastic-2.0
 //
 // Licensed under the Elastic License 2.0 (ELv2); you may not use this file
 // except in compliance with the Elastic License 2.0. You may obtain a copy of
@@ -523,5 +524,5 @@ test "serverless paged public adjacency reader preserves query-local identities 
 }
 
 test "serverless paged public adjacency reader cleans every allocation failure" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, exercisePageReader, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, exercisePageReader, .{});
 }

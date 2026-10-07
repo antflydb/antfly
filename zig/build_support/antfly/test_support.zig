@@ -1,16 +1,17 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 const std = @import("std");
 const build_test_filters = @import("../../build_test_filters.zig");
@@ -69,13 +70,13 @@ pub const Imports = struct {
         module.addImport("antfly_vectorindex", imports.vectorindex);
         module.addImport("vopr", self.vopr);
         imports.storage_boundary.configureProfile(module, true, true, .owner);
-        @import("../../pkg/antfly-embedded/build/snowball.zig").addSnowballModule(b, module);
+        @import("../embedded/snowball.zig").addSnowballModule(b, module);
     }
 
     /// Tests and simulation tools explicitly own VOPR and LMDB dependencies.
     pub fn configure(self: Imports, b: *std.Build, module: *std.Build.Module, include_lmdb_c: bool, link_libc: bool) void {
         self.runtime.configure(b, module, link_libc);
-        @import("../../pkg/antfly-embedded/build/storage.zig").configureLmdb(b, module, self.lmdb_engine, include_lmdb_c);
+        @import("../embedded/storage.zig").configureLmdb(b, module, self.lmdb_engine, include_lmdb_c);
         module.addImport("vopr", self.vopr);
     }
 };
@@ -137,7 +138,7 @@ pub fn chainLabeledFilteredTests(
         .root_module = root_module,
         .filters = filters,
         .test_runner = .{
-            .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"),
+            .path = b.path("pkg/antfly-embedded/src/test_runner.zig"),
             .mode = .simple,
         },
     });
@@ -297,7 +298,7 @@ pub fn addAntflyTestRunArtifact(
     tests: *std.Build.Step.Compile,
 ) *std.Build.Step.Run {
     if (tests.test_runner == null) {
-        const runner_path = b.path("pkg/antfly-embedded/src/local/test_runner.zig");
+        const runner_path = b.path("pkg/antfly-embedded/src/test_runner.zig");
         tests.test_runner = .{ .path = runner_path, .mode = .simple };
         runner_path.addStepDependencies(&tests.step);
     }

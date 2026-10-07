@@ -1,4 +1,5 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Elastic-2.0
 //
 // Licensed under the Elastic License 2.0 (ELv2); you may not use this file
 // except in compliance with the Elastic License 2.0. You may obtain a copy of
@@ -266,6 +267,12 @@ pub const RaftApplyStore = struct {
 
     pub fn getBackupCohort(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, job_id: u64) !?[]u8 {
         return self.projectionWithAllocator(?[]u8, alloc, .{ .kind = .backup_cohort, .group_id = group_id, .arg0 = job_id });
+    }
+    pub fn getLakeIndexLifecycle(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, table_id: u64) ![]u8 {
+        return self.projectionWithAllocator([]u8, alloc, .{ .kind = .lake_index_lifecycle, .group_id = group_id, .arg0 = table_id });
+    }
+    pub fn lakeIndexLifecycleWork(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, after: ?u64) ![]u8 {
+        return self.projectionWithAllocator([]u8, alloc, .{ .kind = .lake_index_lifecycle_work, .group_id = group_id, .arg0 = after orelse 0, .arg1 = @intFromBool(after != null) });
     }
     pub fn getBackupCohortProgress(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, job_id: u64) !?[]u8 {
         return self.projectionWithAllocator(?[]u8, alloc, .{ .kind = .backup_cohort_progress, .group_id = group_id, .arg0 = job_id });

@@ -1,4 +1,5 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Elastic-2.0
 //
 // Licensed under the Elastic License 2.0 (ELv2); you may not use this file
 // except in compliance with the Elastic License 2.0. You may obtain a copy of
@@ -368,7 +369,7 @@ test "serverless graph streaming plans own borrowed replacements and unwind ever
             try std.testing.expect(!try containsNode(alloc, memory.store(), root, "z"));
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Exercise.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Exercise.run, .{});
     var memory = tree.testing.MemoryStore{ .alloc = std.testing.allocator };
     defer memory.deinit();
     var duplicate: Source = .{ .duplicate = true };
@@ -583,5 +584,5 @@ fn allocationExercise(alloc: Allocator) !void {
 }
 
 test "serverless paged graph planning allocation failure preserves all ownership" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, allocationExercise, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, allocationExercise, .{});
 }

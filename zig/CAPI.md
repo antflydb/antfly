@@ -109,10 +109,14 @@ handlers:
 | `antfly_inference_generate_json` | `POST /generate` |
 | `antfly_inference_generate_batch_json` | `POST /generate/batch` |
 | `antfly_inference_rewrite_json` | `POST /rewrite` |
+| `antfly_inference_decide_json` | `POST /decide` |
 | `antfly_inference_extract_json` | `POST /extract` |
 | `antfly_inference_read_json` | `POST /read` (OCR) |
 | `antfly_inference_transcribe_json` | `POST /transcribe` |
 | `antfly_inference_list_models_json` | `GET /models` |
+
+For decision question types, answer semantics, and SQL providers, see the
+[typed decision guide](../docs/guides/decisions.md).
 
 - Images and audio go inline in the JSON, as base64 or `data:` URIs.
 - The `_json` calls return complete responses. To stream,
@@ -258,7 +262,7 @@ and Rust `std` threads to 2 MiB. How each binding meets the minimum:
 |---|---|
 | Go | cgo calls run on OS threads that inherit the 8 MiB main-thread stack |
 | Python | CPython threads use 8 MiB (Linux) or 16 MiB (macOS) |
-| Rust | caller's responsibility; spawn threads with `antfly_lite::MIN_THREAD_STACK_SIZE` |
+| Rust | caller's responsibility; spawn threads with `antfly_embedded::MIN_THREAD_STACK_SIZE` |
 | TypeScript | configures koffi's call stacks to 8 MiB before loading the library |
 | C | size threads with `pthread_attr_setstacksize(&attr, ANTFLY_MIN_THREAD_STACK_SIZE)` |
 
@@ -299,4 +303,4 @@ C ABI changes should have coverage for:
 - Binding smoke tests that compile against the installed public header.
 - Every new export that takes a handle must enter through `enterHandle` with
   the right access class, and a binding test should run it concurrently with
-  writes (see `go/pkg/lite/concurrency_cgo_test.go`).
+  writes (see `go/pkg/embedded/concurrency_cgo_test.go`).

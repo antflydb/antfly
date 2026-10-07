@@ -1,4 +1,5 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Elastic-2.0
 //
 // Licensed under the Elastic License 2.0 (ELv2); you may not use this file
 // except in compliance with the Elastic License 2.0. You may obtain a copy of
@@ -190,7 +191,7 @@ test "serverless document facts point reads authenticate bodies and materialize 
             defer materializer.freeDocuments(alloc, owned);
         }
     };
-    try std.testing.checkAllAllocationFailures(a, Failures.run, .{&session});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Failures.run, .{&session});
     session.manifest.wal_end_lsn = 8;
     try std.testing.expectError(error.DocumentFactsSourceChanged, Reader.create(a, &session, &reads));
 }

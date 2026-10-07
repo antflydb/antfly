@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # Copyright 2026 Antfly, Inc.
+# SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -7,10 +8,11 @@
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
 #
-# Unless required by applicable law or agreed to in writing, software distributed
-# under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
-# CONDITIONS OF ANY KIND, either express or implied. See the License for the
-# specific language governing permissions and limitations under the License.
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """Generate allocation-free graph identifier policy implementations.
 
@@ -27,12 +29,11 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from license_headers import apply_header, group_for, read_header
 
 ROOT = Path(__file__).resolve().parent.parent
 POLICY_PATH = ROOT / "specs/graph_identifier_policy.json"
-ZIG_PATH = (
-    ROOT / "zig/pkg/antfly-embedded/src/local/graph/identifier_policy_generated.zig"
-)
+ZIG_PATH = ROOT / "zig/pkg/antfly-embedded/src/graph/identifier_policy_generated.zig"
 GO_PATH = ROOT / "go/pkg/sdk/graph_identifier_policy_generated.go"
 PYTHON_PATH = ROOT / "py/packages/sdk/src/antfly/graph_identifier_policy_generated.py"
 TYPESCRIPT_PATH = ROOT / "ts/packages/sdk/src/graph-identifier-policy.generated.ts"
@@ -172,6 +173,7 @@ def render_zig(policy: dict[str, Any], ranges: list[tuple[int, int]]) -> str:
         for case in policy["conformance_cases"]
     )
     return f"""// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Elastic-2.0
 //
 // Licensed under the Elastic License 2.0 (ELv2); you may not use this file
 // except in compliance with the Elastic License 2.0. You may obtain a copy of
@@ -268,6 +270,7 @@ def render_go(policy: dict[str, Any], ranges: list[tuple[int, int]]) -> str:
         for case in policy["conformance_cases"]
     )
     return f"""// Copyright 2026 The Antfly Contributors
+// SPDX-License-Identifier: Apache-2.0
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -381,6 +384,7 @@ def render_python(policy: dict[str, Any], ranges: list[tuple[int, int]]) -> str:
         for case in policy["conformance_cases"]
     )
     return f'''# Copyright 2026 Antfly, Inc.
+# SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -451,6 +455,7 @@ def render_typescript(policy: dict[str, Any], ranges: list[tuple[int, int]]) -> 
         for case in policy["conformance_cases"]
     )
     return f"""// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -559,6 +564,7 @@ def render_rust(policy: dict[str, Any], ranges: list[tuple[int, int]]) -> str:
         for case in policy["conformance_cases"]
     )
     return f"""// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -698,6 +704,9 @@ components:
 
 
 def write_or_check(path: Path, content: str, check: bool) -> bool:
+    group = group_for(path.relative_to(ROOT).as_posix(), "all")
+    if group and path.suffix != ".yaml":
+        content = apply_header(content, path, read_header(group))
     content = content.rstrip() + "\n"
     if check:
         if not path.exists() or path.read_text(encoding="utf-8") != content:

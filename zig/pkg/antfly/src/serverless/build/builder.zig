@@ -1,4 +1,5 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Elastic-2.0
 //
 // Licensed under the Elastic License 2.0 (ELv2); you may not use this file
 // except in compliance with the Elastic License 2.0. You may obtain a copy of
@@ -2933,7 +2934,7 @@ test "serverless builder graph impact admits scratch input and cancellation and 
             try std.testing.expect(!try graphProjectionChangedForMutationsAlloc(alloc, "docs", old, new, wal, null, .{}));
         }
     };
-    try std.testing.checkAllAllocationFailures(a, Check.run, .{ &before, &after, &mutations });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Check.run, .{ &before, &after, &mutations });
 }
 
 fn findMaterializedDocument(
@@ -5192,7 +5193,7 @@ fn freeParsedGraphEdges(alloc: Allocator, edges: []ParsedGraphEdge) void {
 }
 
 test "serverless graph builder parser propagates allocation failure without losing edges" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, struct {
         fn run(alloc: Allocator) !void {
             const edges = try parseGraphEdgesAlloc(alloc, "{\"graph_edges\":[{\"target\":\"b\",\"edge_type\":\"link\",\"target_table\":\"other\"}]}");
             defer freeParsedGraphEdges(alloc, edges);
@@ -5217,7 +5218,7 @@ test "serverless graph builder admits input scratch identities and output before
     }) |limits| {
         try std.testing.expectError(error.LakeSidecarBuildBudgetExceeded, buildGraphSegmentWithLimitsAlloc(a, "docs", &docs, true, null, limits));
     }
-    try std.testing.checkAllAllocationFailures(a, struct {
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, struct {
         fn run(alloc: Allocator, input: []const query_mod.QueryMaterializedDocument) !void {
             const built = try buildGraphSegmentWithLimitsAlloc(alloc, "docs", input, true, null, .{});
             defer if (built.payload) |payload| alloc.free(payload);
@@ -6607,7 +6608,7 @@ test "serverless builder prediction admits allocations and reuses unchanged text
             defer prediction.deinit(failing);
         }
     };
-    try std.testing.checkAllAllocationFailures(alloc, PredictionCheck.run, .{ &builder, prediction_plan });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, PredictionCheck.run, .{ &builder, prediction_plan });
 
     var second_result = try builder.publishNamespace("docs");
     defer second_result.deinit(alloc);

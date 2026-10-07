@@ -1,5 +1,18 @@
 # Copyright 2026 Antfly, Inc.
 # SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Local/server test collection must retain selection and type identity."""
 
 import shutil
@@ -19,9 +32,9 @@ class LocalTestPartitions(unittest.TestCase):
         for relative in (
             "build_support/antfly/test_partitions.zig",
             "build_support/antfly/source_paths.zig",
-            "pkg/antfly-embedded/build/source_owner.zig",
-            "pkg/antfly-embedded/src/local/test_runner.zig",
-            "pkg/antfly-embedded/src/local/test_error_logs.zig",
+            "build_support/embedded/source_owner.zig",
+            "pkg/antfly-embedded/src/test_runner.zig",
+            "pkg/antfly-embedded/src/test_error_logs.zig",
             "tools/audit_test_selection.py",
             "tools/run_test_partitions.py",
             "pkg/antfly/build/unit_test_ownership.zig",
@@ -40,7 +53,7 @@ pub fn configureTestRun(run: *std.Build.Step.Run) void {
 """,
         )
         self.write(
-            "pkg/antfly-embedded/src/local/source_catalog.zig",
+            "pkg/antfly-embedded/src/source_catalog.zig",
             """pub const local = @import("local.zig");
 comptime {
     for (@import("antfly_local_test_sources").names) |name| _ = @field(@This(), name);
@@ -48,7 +61,7 @@ comptime {
 """,
         )
         self.write(
-            "pkg/antfly-embedded/src/local/local.zig",
+            "pkg/antfly-embedded/src/local.zig",
             """const std = @import("std");
 pub const Token = struct { value: u32 };
 test "local owned" {
@@ -77,7 +90,7 @@ test "server owned" { try std.testing.expectEqual(@as(u32, 7), accept(.{ .value 
         self.write(
             "build.zig",
             """const std = @import("std");
-const owner = @import("pkg/antfly-embedded/build/source_owner.zig");
+const owner = @import("build_support/embedded/source_owner.zig");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const root = b.createModule(.{
@@ -89,12 +102,12 @@ pub fn build(b: *std.Build) void {
     options.addOption(u32, "value", 42);
     root.addOptions("options", options);
     root.addImport("antfly_test_error_logs", b.createModule(.{
-        .root_source_file = b.path("pkg/antfly-embedded/src/local/test_error_logs.zig"),
+        .root_source_file = b.path("pkg/antfly-embedded/src/test_error_logs.zig"),
         .target = target, .optimize = .debug,
     }));
     const tests = b.addTest(.{
         .name = "fixture", .root_module = root,
-        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     const wrapped = b.option(bool, "wrapper", "Use the partition wrapper") orelse false;
     const run = if (wrapped) b.addSystemCommand(&.{"python3"}) else b.addRunArtifact(tests);
@@ -106,6 +119,17 @@ pub fn build(b: *std.Build) void {
     }
     run.addPassthruArgs();
     b.step("test", "Run both owners").dependOn(&run.step);
+    if (b.option(bool, "owner-audit", "Audit a split source owner") orelse false) {
+        const inventory = b.addRunArtifact(tests);
+        inventory.addArg("--list-tests");
+        const audit = b.addSystemCommand(&.{"python3"});
+        audit.addFileArg(b.path("tools/audit_test_selection.py"));
+        audit.addArg("--inventory");
+        audit.addFileArg(inventory.captureStdErr(.{}));
+        audit.addArg("--");
+        audit.addPassthruArgs();
+        run.step.dependOn(&audit.step);
+    }
     owner.finalize(b);
     if (b.option(bool, "aggregate", "Apply aggregate exclusions") orelse false)
         _ = @import("pkg/antfly/build/unit_test_ownership.zig").applyWithSourceOwners(b, &b.top_level_steps.get("test").?.step, @import("build_support/antfly/test_partitions.zig").consumerFor);
@@ -161,26 +185,37 @@ pub fn build(b: *std.Build) void {
         )
         self.assertIn("test filter matched no declared tests", output)
 
+    def test_existing_owner_audit_keeps_local_inventory_before_runtime_args(self):
+        options = ("-Downer-audit=true",)
+        for name in ("local owned", "server owned"):
+            with self.subTest(owner=name):
+                output = self.build("--test-filter", name, build_options=options)
+                self.assertIn(name + "...", output)
+        output = self.build(
+            "--test-filter", "missing", build_options=options, succeeds=False
+        )
+        self.assertIn("test filter matched no declared tests", output)
+
     def test_aggregate_cloning_retains_local_owner_exclusions(self):
         output = self.build(build_options=("-Daggregate=true",))
         self.assertIn("server owned...", output)
         self.assertNotIn("local owned...", output)
 
     def test_control_profile_ignores_inactive_physical_imports(self):
-        catalog = self.root / "pkg/antfly-embedded/src/local/source_catalog.zig"
+        catalog = self.root / "pkg/antfly-embedded/src/source_catalog.zig"
         catalog.write_text(
             catalog.read_text()
             + '\n pub const physical = @import("physical.zig");\n'
             + 'pub const storage_db_generation_lifecycle = @import("lifecycle.zig");\n'
         )
         self.write(
-            "pkg/antfly-embedded/src/local/physical.zig",
+            "pkg/antfly-embedded/src/physical.zig",
             """const DB = @import("antfly_source_root").antfly_sources.physical_db.DB;
 test "physical owned" { _ = DB; }
 """,
         )
         self.write(
-            "pkg/antfly-embedded/src/local/lifecycle.zig",
+            "pkg/antfly-embedded/src/lifecycle.zig",
             'test "physical lifecycle owned" {}\n',
         )
         fixture = self.root / "pkg/antfly/src/fixture.zig"
@@ -196,6 +231,12 @@ test {
 """
         )
         build = self.root / "build.zig"
+        self.write(
+            "pkg/antfly-embedded/src/source_catalog_control.zig",
+            catalog.read_text().replace(
+                ' pub const physical = @import("physical.zig");', ""
+            ),
+        )
         build.write_text(
             build.read_text().replace(
                 "    owner.attach(root);",

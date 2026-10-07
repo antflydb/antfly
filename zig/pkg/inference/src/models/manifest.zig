@@ -1,4 +1,5 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -6625,7 +6626,7 @@ test "direct managed gguf loading cleans up every allocation failure" {
             defer manifest.deinit();
         }
     };
-    try std.testing.checkAllAllocationFailures(allocator, Runner.run, .{model_path});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(allocator, Runner.run, .{model_path});
 }
 
 test "gguf discovery resolves unknown filesystem entry kinds" {
@@ -7376,9 +7377,9 @@ test "optional bundle variants preserve failures and clean up partially resolved
             try std.testing.expectEqual(complete, man.isClipclapGgufBundle());
         }
     };
-    try std.testing.checkAllAllocationFailures(allocator, Check.run, .{ model_dir, false });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(allocator, Check.run, .{ model_dir, false });
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "clap.gguf", .data = "clap" });
-    try std.testing.checkAllAllocationFailures(allocator, Check.run, .{ model_dir, true });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(allocator, Check.run, .{ model_dir, true });
     var manifest = ModelManifest{ .allocator = allocator };
     defer manifest.deinit();
     try std.testing.expectError(error.InvalidInferenceBundle, parseInferenceVariantsJson(&manifest, allocator, model_dir, "{\"family\":\"clipclap_variants/v1\",\"variants\":[{\"target\":\"gguf\",\"clip\":\"clip.gguf\"}]}"));

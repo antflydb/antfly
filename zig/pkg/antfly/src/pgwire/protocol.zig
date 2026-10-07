@@ -1,4 +1,5 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Elastic-2.0
 //
 // Licensed under the Elastic License 2.0 (ELv2); you may not use this file
 // except in compliance with the Elastic License 2.0. You may obtain a copy of
@@ -400,7 +401,8 @@ pub const Session = struct {
         // Do not turn a cancellation arriving after a mutation committed into
         // a misleading safe-abort response; the backend owns that boundary.
         if (result.continuation != null) return error.UnsupportedContinuation;
-        if (result.rows.len > self.limits.result_rows or result.columns.len > self.limits.columns) return error.ProgramLimitExceeded;
+        if (result.rowCount() > self.limits.result_rows or result.columns.len > self.limits.columns) return error.ProgramLimitExceeded;
+        if (result.cells) |cells| if (cells.width != result.columns.len or result.rows.len != 0 or result.sql_nulls != null) return error.InvalidResult;
         for (result.rows) |row| if (row.len != result.columns.len) return error.InvalidResult;
         const session = if (result.session_id) |id| try self.alloc.dupe(u8, id) else null;
         if (self.session_id) |old| self.alloc.free(old);
@@ -670,7 +672,7 @@ pub const Session = struct {
                     defer result.deinit();
                     if (result.columns.len > 0) try self.rowDescription(result.columns, &.{});
                     if (result.sql_nulls) |flags| if (flags.len != result.rows.len) return error.InvalidResult;
-                    try self.dataRows(result.columns, &.{}, result.rows, result.sql_nulls);
+                    try self.dataResult(result, &.{});
                     try self.complete(result);
                     self.finishDiscardAll();
                 }
@@ -834,11 +836,11 @@ pub const Session = struct {
                     self.mutation_ack_pending = true;
                     self.diagnostic.transaction_id = result.transaction_id;
                 }
-                const count = if (requested == 0) result.rows.len - portal.offset else @min(@as(usize, @intCast(requested)), result.rows.len - portal.offset);
+                const count = if (requested == 0) result.rowCount() - portal.offset else @min(@as(usize, @intCast(requested)), result.rowCount() - portal.offset);
                 if (result.sql_nulls) |flags| if (flags.len != result.rows.len) return error.InvalidResult;
-                try self.dataRows(result.columns, portal.formats, result.rows[portal.offset..][0..count], if (result.sql_nulls) |flags| flags[portal.offset..][0..count] else null);
+                try self.dataResult(try result.view(portal.offset, count), portal.formats);
                 portal.offset += count;
-                if (portal.offset < result.rows.len) try self.message('s', "") else try self.complete(result);
+                if (portal.offset < result.rowCount()) try self.message('s', "") else try self.complete(result);
                 if (result.ddl_receipt_json != null and std.mem.eql(u8, result.command_tag, "DDL PENDING")) {
                     self.skip_until_sync = true;
                     return;
@@ -928,7 +930,7 @@ pub const Session = struct {
                 defer result.deinit();
                 if (result.columns.len > 0) try self.rowDescription(result.columns, &.{});
                 if (result.sql_nulls) |flags| if (flags.len != result.rows.len) return error.InvalidResult;
-                try self.dataRows(result.columns, &.{}, result.rows, result.sql_nulls);
+                try self.dataResult(result, &.{});
                 try self.complete(result);
                 return true;
             },
@@ -1008,7 +1010,7 @@ pub const Session = struct {
                 result.session_id == null;
             if (!columnsEqual(description.columns, result.columns) or !std.mem.startsWith(u8, result.command_tag, "SELECT") or
                 result.mutation_outcome != null or result.ddl_receipt_json != null or result.continuation != null or
-                result.transaction_status != self.status or !same_session or result.rows.len > self.limits.result_rows) return error.InvalidResult;
+                result.transaction_status != self.status or !same_session or result.rowCount() > self.limits.result_rows) return error.InvalidResult;
             spool.?.append(result, self.limits.cursor_rows) catch |err| return if (err == error.OutOfMemory) error.ProgramLimitExceeded else err;
         }
         const owned_statement = try arena.allocator().dupe(u8, statement);
@@ -1077,12 +1079,12 @@ pub const Session = struct {
                     return err;
                 };
                 defer page.result.deinit();
-                if (page.result.mutation_outcome != null or page.result.continuation != null or page.result.session_id != null or page.result.rows.len > wanted or !columnsEqual(cursor.description.columns, page.result.columns)) return error.InvalidResult;
-                if (page.result.rows.len == 0 and !page.exhausted) return error.InvalidResult;
-                if (page.result.sql_nulls) |flags| if (flags.len != page.result.rows.len) return error.InvalidResult;
-                if (!fetch.move) try self.dataRows(page.result.columns, &.{}, page.result.rows, page.result.sql_nulls);
-                cursor.fetched += page.result.rows.len;
-                remaining -= page.result.rows.len;
+                if (page.result.mutation_outcome != null or page.result.continuation != null or page.result.session_id != null or page.result.rowCount() > wanted or !columnsEqual(cursor.description.columns, page.result.columns)) return error.InvalidResult;
+                if (page.result.rowCount() == 0 and !page.exhausted) return error.InvalidResult;
+                if (page.result.sql_nulls) |flags| if (flags.len != page.result.rowCount()) return error.InvalidResult;
+                if (!fetch.move) try self.dataResult(page.result, &.{});
+                cursor.fetched += page.result.rowCount();
+                remaining -= page.result.rowCount();
                 cursor.exhausted = page.exhausted;
                 try self.writer.flush();
             }
@@ -1127,8 +1129,8 @@ pub const Session = struct {
                 const wanted: u32 = @intCast(@min(through - spool.rows.items.len, @min(self.limits.result_rows, 256)));
                 var page = try stream.next(stream.context, arena.allocator(), req, wanted);
                 defer page.result.deinit();
-                if (page.result.mutation_outcome != null or page.result.continuation != null or page.result.session_id != null or page.result.rows.len > wanted or !columnsEqual(cursor.description.columns, page.result.columns)) return error.InvalidResult;
-                if (page.result.rows.len == 0 and !page.exhausted) return error.InvalidResult;
+                if (page.result.mutation_outcome != null or page.result.continuation != null or page.result.session_id != null or page.result.rowCount() > wanted or !columnsEqual(cursor.description.columns, page.result.columns)) return error.InvalidResult;
+                if (page.result.rowCount() == 0 and !page.exhausted) return error.InvalidResult;
                 spool.append(page.result, self.limits.cursor_rows) catch |err| return if (err == error.OutOfMemory) error.ProgramLimitExceeded else err;
                 cursor.exhausted = page.exhausted;
             }
@@ -1302,14 +1304,14 @@ pub const Session = struct {
             var page = try stream.next(stream.context, arena.allocator(), req, wanted);
             defer page.result.deinit();
             const result = page.result;
-            if (result.rows.len > wanted or !columnsEqual(portal.description.columns, result.columns) or
+            if (result.rowCount() > wanted or !columnsEqual(portal.description.columns, result.columns) or
                 result.mutation_outcome != null or result.continuation != null or result.session_id != null)
                 return error.InvalidResult;
-            if (!page.exhausted and result.rows.len == 0) return error.InvalidResult;
-            if (result.sql_nulls) |flags| if (flags.len != result.rows.len) return error.InvalidResult;
-            try self.dataRows(result.columns, portal.formats, result.rows, result.sql_nulls);
-            remaining -= result.rows.len;
-            portal.offset += result.rows.len;
+            if (!page.exhausted and result.rowCount() == 0) return error.InvalidResult;
+            if (result.sql_nulls) |flags| if (flags.len != result.rowCount()) return error.InvalidResult;
+            try self.dataResult(result, portal.formats);
+            remaining -= result.rowCount();
+            portal.offset += result.rowCount();
             portal.stream_complete = page.exhausted;
             // Flush every bounded page. Slow clients exert backpressure before
             // another storage page is read, rather than buffering the result.
@@ -1473,6 +1475,36 @@ pub const Session = struct {
         }
         if (bytes.written().len > self.limits.frame_bytes -| 4) return error.ProgramLimitExceeded;
     }
+    fn dataResult(self: *Session, result: backend.Result, formats: []const u16) !void {
+        const cells = result.cells orelse return self.dataRows(result.columns, formats, result.rows, result.sql_nulls);
+        if (cells.width != result.columns.len or result.rows.len != 0 or result.sql_nulls != null) return error.InvalidResult;
+        var bytes = std.Io.Writer.Allocating.init(self.alloc);
+        defer bytes.deinit();
+        var scratch = std.heap.ArenaAllocator.init(self.alloc);
+        defer scratch.deinit();
+        for (0..cells.count) |row| {
+            _ = scratch.reset(.retain_capacity);
+            bytes.writer.end = 0;
+            try bytes.writer.writeInt(u16, @intCast(result.columns.len), .big);
+            for (result.columns, 0..) |column, index| {
+                const value = try result.cell(scratch.allocator(), row, index);
+                if (value.sql_null) {
+                    if (value.value != .null) return error.InvalidResult;
+                    try bytes.writer.writeInt(i32, -1, .big);
+                    continue;
+                }
+                const position = bytes.written().len;
+                try bytes.writer.writeInt(i32, 0, .big);
+                try values.encodeInto(scratch.allocator(), &bytes.writer, column.type, formatAt(formats, index), value.value);
+                const length = bytes.written().len - position - 4;
+                if (length > self.limits.frame_bytes -| 4 or length > std.math.maxInt(i32)) return error.ProgramLimitExceeded;
+                std.mem.writeInt(i32, bytes.writer.buffer[position..][0..4], @intCast(length), .big);
+            }
+            if (bytes.written().len > self.limits.frame_bytes -| 4) return error.ProgramLimitExceeded;
+            try self.message('D', bytes.written());
+        }
+    }
+
     fn dataRows(self: *Session, columns: []const backend.Column, formats: []const u16, rows: []const []const std.json.Value, flags: ?[]const []const bool) !void {
         if (flags) |bits| if (bits.len != rows.len) return error.InvalidResult;
         var bytes = std.Io.Writer.Allocating.init(self.alloc);

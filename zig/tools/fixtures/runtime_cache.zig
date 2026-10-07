@@ -1,16 +1,17 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Run the real root composition, assert transitive ownership contracts, then
 //! replace only expensive runtime bodies. External modules, options, generated
@@ -187,7 +188,7 @@ pub fn build(b: *std.Build) void {
             artifact.root_module.import_table.get("inference_server").?,
         );
         if (unit == .distributed) artifact.root_module.addImport("cache_lite_capabilities", b.createModule(.{
-            .root_source_file = b.path("pkg/antfly-embedded/src/local/storage/lite/capabilities.zig"),
+            .root_source_file = b.path("pkg/antfly-embedded/src/storage/lite/capabilities.zig"),
             .target = artifact.root_module.resolved_target,
             .optimize = artifact.root_module.optimize,
             .imports = &.{.{ .name = "antfly_lite_options", .module = artifact.root_module.import_table.get("antfly_lite_options").? }},

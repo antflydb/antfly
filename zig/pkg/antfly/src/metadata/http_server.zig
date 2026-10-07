@@ -1,4 +1,5 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Elastic-2.0
 //
 // Licensed under the Elastic License 2.0 (ELv2); you may not use this file
 // except in compliance with the Elastic License 2.0. You may obtain a copy of
@@ -4189,6 +4190,7 @@ const ParsedRuntimeIndexSourceReplayStatus = struct {
     published_sequence: ?u64 = null,
     target_sequence: ?u64 = null,
     failed: ?bool = null,
+    producer_complete: ?bool = null,
 };
 
 const ParsedRuntimeGroupStatus = struct {
@@ -4608,6 +4610,7 @@ fn cloneParsedRuntimeIndexStatus(
             .published_sequence = source.published_sequence orelse 0,
             .target_sequence = source.target_sequence orelse 0,
             .failed = source.failed orelse false,
+            .producer_complete = source.producer_complete orelse false,
         };
         source_count += 1;
     }

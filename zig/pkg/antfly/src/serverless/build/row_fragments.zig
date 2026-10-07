@@ -1,4 +1,5 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Elastic-2.0
 //
 // Licensed under the Elastic License 2.0 (ELv2); you may not use this file
 // except in compliance with the Elastic License 2.0. You may obtain a copy of
@@ -105,8 +106,8 @@ fn fragmentColumnKind(kind: rowsource.ColumnKind) !row_fragment.ColumnKind {
     return switch (kind) {
         .bytes, .dictionary_bytes => .bytes,
         .json => .json,
-        .i64 => .i64,
-        .f64 => .f64,
+        .i64, .dictionary_i64 => .i64,
+        .f64, .dictionary_f64 => .f64,
         .bool => .bool,
         .vector_f32 => .vector_f32,
     };
@@ -117,6 +118,8 @@ fn cellFromColumnValue(values: rowsource.ColumnValues, idx: usize) !row_fragment
         .bytes => |items| .{ .bytes = @constCast(items[idx]) },
         .dictionary_bytes => |items| .{ .bytes = @constCast(items.at(idx)) },
         .json => |items| .{ .json = @constCast(items[idx]) },
+        .dictionary_i64 => |items| .{ .i64 = items.at(idx) },
+        .dictionary_f64 => |items| .{ .f64 = items.at(idx) },
         .i64 => |items| .{ .i64 = items[idx] },
         .f64 => |items| .{ .f64 = items[idx] },
         .bool => |items| .{ .bool = items[idx] },

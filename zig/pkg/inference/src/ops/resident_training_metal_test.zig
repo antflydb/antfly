@@ -1,5 +1,18 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 const std = @import("std");
 const build_options = @import("build_options");
 const ops = @import("ops.zig");
@@ -235,7 +248,7 @@ test "resident training Metal allocation failures release every strict tensor" {
     var fixture = try Fixture.init(std.testing.allocator);
     defer fixture.deinit();
     const before = metal_tensor.memoryStatsSnapshot();
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, allocationCheck, .{fixture.backend});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, allocationCheck, .{fixture.backend});
     const after = metal_tensor.memoryStatsSnapshot();
     try std.testing.expectEqual(before.device_owned_live_bytes, after.device_owned_live_bytes);
     try std.testing.expectEqual(before.host_mirror_download_bytes, after.host_mirror_download_bytes);

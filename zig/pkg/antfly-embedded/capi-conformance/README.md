@@ -9,10 +9,10 @@ Runners:
 
 | Runner | Location | Command |
 |---|---|---|
-| Reference (raw C ABI via `antfly.h`) | `zig/pkg/antfly-embedded/src/local/capi/conformance_runner.zig` | `zig build capi-conformance` |
-| Go | `go/pkg/lite/conformance_cgo_test.go` | `go test -tags libantfly -run Conformance` |
-| Python | `py/packages/lite/tests/test_conformance.py` | `uv run pytest tests/test_conformance.py` |
-| Rust | `rs/crates/lite/tests/conformance.rs` | `cargo test -p antfly-lite --features libantfly --test conformance` |
+| Reference (raw C ABI via `antfly.h`) | `zig/pkg/antfly-embedded/src/capi/conformance_runner.zig` | `zig build capi-conformance` |
+| Go | `go/pkg/embedded/conformance_cgo_test.go` | `go test -tags libantfly -run Conformance` |
+| Python | `py/packages/embedded/tests/test_conformance.py` | `uv run pytest tests/test_conformance.py` |
+| Rust | `rs/crates/embedded/tests/conformance.rs` | `cargo test -p antfly-embedded --features libantfly --test conformance` |
 
 `zig build lite-test` runs all of them. A new C ABI behavior that bindings
 should agree on belongs here as a case, not only in one binding's tests.

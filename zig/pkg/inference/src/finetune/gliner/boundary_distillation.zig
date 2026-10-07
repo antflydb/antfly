@@ -1,5 +1,17 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Feature distillation for Antenna students: regress the student's routed
 //! states (after its GLiNER neck) onto a teacher encoder's final states at the
@@ -15,7 +27,7 @@
 //! averaged separately and summed, so the few markers are not drowned by the
 //! words. This is the recipe that took a raw ModernBERT trunk past the
 //! collapse that task labels alone cause
-//! (work-log/completed/inference/antenna/2026-09-25-pilot.md).
+//! (docs/design/inference/history/antenna/2026-09-25-pilot.md).
 const std = @import("std");
 const processor = @import("../../pipelines/gliner_boundary_processor.zig");
 const Control = @import("../../execution_control.zig").InferenceExecutionControl;

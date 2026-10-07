@@ -1,5 +1,17 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Elastic-2.0
+//
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
+//
+//     https://www.antfly.io/licensing/ELv2-license
+//
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
 
 const std = @import("std");
 
@@ -21,7 +33,7 @@ pub fn add(b: *std.Build, options: std.Build.TestOptions) Artifact {
     var object_options = options;
     object_options.emit_object = true;
     object_options.test_runner = options.test_runner orelse .{
-        .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"),
+        .path = b.path("pkg/antfly-embedded/src/test_runner.zig"),
         .mode = .simple,
     };
     const module = b.createModule(.{
@@ -136,7 +148,7 @@ fn splitNativeSources(
     }
     for (original.import_table.keys(), original.import_table.values()) |key, dependency|
         copy.addImport(key, splitNativeSources(b, dependency, final, name, clones));
-    @import("../../antfly-embedded/build/source_owner.zig").adopt(copy);
+    @import("../../../build_support/embedded/source_owner.zig").adopt(copy);
     return copy;
 }
 

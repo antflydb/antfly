@@ -1,4 +1,5 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Elastic-2.0
 //
 // Licensed under the Elastic License 2.0 (ELv2); you may not use this file
 // except in compliance with the Elastic License 2.0. You may obtain a copy of
@@ -858,6 +859,10 @@ const AgentQueryRunner = struct {
 /// Request-scoped generation for native agents. Every model round is a
 /// cancellation and deadline boundary.
 const AgentGenerationRunner = struct {
+    chatgpt: ?*@import("antfly_local_sources").chatgpt_manager.Manager = null,
+    personal_owner: ?[]const u8 = null,
+    chatgpt_pin: ?@import("antfly_local_sources").chatgpt_manager.Pin = null,
+    chatgpt_failure: generating_runtime.ChatGPTFailure = .{},
     antfly_provider: ?managed_embedder.AntflyProvider,
     secret_store: ?*common_secrets.FileStore,
     io: std.Io,
@@ -878,11 +883,18 @@ const AgentGenerationRunner = struct {
         messages: []const generating_runtime.ChatMessage,
     ) !generating_runtime.GenerateResult {
         const runner: *@This() = @ptrCast(@alignCast(ptr));
+        for (chain) |link| if (link.generator.provider == .chatgpt) {
+            const manager = runner.chatgpt orelse return error.ChatGPTDisabled;
+            const owner = runner.personal_owner orelse return error.ChatGPTInteractiveOnly;
+            const id = link.generator.connection_id orelse return error.InvalidGeneratorConfig;
+            if (runner.chatgpt_pin == null) runner.chatgpt_pin = try manager.pinWithContext(owner, id, runner.request_context);
+            try runner.chatgpt_pin.?.check(id);
+        };
         // Each model round is a cancellation and deadline boundary.
         try runner.request_context.check();
         var client = httpx.Client.initWithConfig(a, runner.io, .{ .keep_alive = false });
         defer client.deinit();
-        return try generating_runtime.executeChainWithOptions(a, &client, chain, .{ .antfly_provider = runner.antfly_provider, .secret_store = runner.secret_store, .inference_api_key = runner.inference_api_key, .request_context = runner.request_context }, messages);
+        return try generating_runtime.executeChainWithOptions(a, &client, chain, .{ .chatgpt = runner.chatgpt, .chatgpt_failure = &runner.chatgpt_failure, .chatgpt_pin = runner.chatgpt_pin, .personal_owner = runner.personal_owner, .antfly_provider = runner.antfly_provider, .secret_store = runner.secret_store, .inference_api_key = runner.inference_api_key, .request_context = runner.request_context }, messages);
     }
 };
 
@@ -4001,6 +4013,89 @@ pub const AntflyApiHandler = struct {
         return ctx.openApiJson(topology);
     }
 
+    fn personalOwner(self: *AntflyApiHandler, ctx: *httpx.Context, identity: ?AuthenticatedIdentity) ![]const u8 {
+        if (!self.api_server.connectorCapabilities().chatgpt.enabled) return error.ChatGPTDisabled;
+        if (ctx.header("sec-fetch-site")) |site| if (!std.mem.eql(u8, site, "same-origin") and !std.mem.eql(u8, site, "none")) return error.Forbidden;
+        const host = ctx.header("host") orelse return error.Forbidden;
+        if (!(std.mem.startsWith(u8, host, "127.0.0.1:") or std.mem.startsWith(u8, host, "localhost:") or std.mem.startsWith(u8, host, "[::1]:"))) return error.Forbidden;
+        if (ctx.header("origin")) |origin| {
+            const expected = try std.fmt.allocPrint(ctx.allocator, "http://{s}", .{host});
+            defer ctx.allocator.free(expected);
+            if (!std.mem.eql(u8, expected, origin)) return error.Forbidden;
+        }
+        if (identity) |authenticated| {
+            if (authenticated.is_internal_service or !std.mem.startsWith(u8, authenticated.credential_principal, "basic:")) return error.Forbidden;
+            return @import("antfly_local_sources").chatgpt_manager.userOwner(ctx.allocator, authenticated.user_instance_id orelse return error.Forbidden);
+        }
+        return ctx.allocator.dupe(u8, "local:");
+    }
+    pub fn authorizeChatGPT(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        var identity: ?AuthenticatedIdentity = null;
+        defer if (identity) |*id| id.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &identity)) |response| return response;
+        const owner = self.personalOwner(ctx, identity) catch |err| return if (err == error.ChatGPTDisabled) chatGPTFailure(ctx, err) else jsonErrorResponse(ctx, 403, "Personal connections require a trusted local runtime.");
+        defer ctx.allocator.free(owner);
+        const body = (try ctx.body()) orelse "{}";
+        var parsed = std.json.parseFromSlice(struct { connection_id: ?[]const u8 = null }, ctx.allocator, body, .{}) catch return jsonErrorResponse(ctx, 400, "Invalid connection request.");
+        defer parsed.deinit();
+        const result = self.api_server.cfg.chatgpt.?.begin(ctx.allocator, owner, parsed.value.connection_id) catch |err| return chatGPTFailure(ctx, err);
+        defer ctx.allocator.free(result.attempt_id);
+        defer ctx.allocator.free(result.authorization_url);
+        return ctx.json(result);
+    }
+    pub fn getChatGPTAttempt(self: *AntflyApiHandler, ctx: *httpx.Context, attempt_id: []const u8) !httpx.Response {
+        var identity: ?AuthenticatedIdentity = null;
+        defer if (identity) |*id| id.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &identity)) |response| return response;
+        const owner = self.personalOwner(ctx, identity) catch |err| return if (err == error.ChatGPTDisabled) chatGPTFailure(ctx, err) else jsonErrorResponse(ctx, 403, "Personal connections unavailable.");
+        defer ctx.allocator.free(owner);
+        const outcome = self.api_server.cfg.chatgpt.?.outcome(ctx.allocator, owner, attempt_id) catch |err| return chatGPTFailure(ctx, err);
+        defer if (outcome.connection_id) |id| ctx.allocator.free(id);
+        return ctx.openApiJson(outcome);
+    }
+    pub fn listChatGPTAccounts(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        var identity: ?AuthenticatedIdentity = null;
+        defer if (identity) |*id| id.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &identity)) |response| return response;
+        const owner = self.personalOwner(ctx, identity) catch |err| return if (err == error.ChatGPTDisabled) chatGPTFailure(ctx, err) else jsonErrorResponse(ctx, 403, "Personal connections unavailable.");
+        defer ctx.allocator.free(owner);
+        const accounts = self.api_server.cfg.chatgpt.?.summaries(ctx.allocator, owner) catch |err| return chatGPTFailure(ctx, err);
+        defer {
+            for (accounts) |account| {
+                ctx.allocator.free(account.connection_id);
+                ctx.allocator.free(account.email);
+                ctx.allocator.free(account.label);
+            }
+            ctx.allocator.free(accounts);
+        }
+        return ctx.json(.{ .accounts = accounts });
+    }
+    pub fn listChatGPTModels(self: *AntflyApiHandler, ctx: *httpx.Context, connection_id: []const u8) !httpx.Response {
+        var identity: ?AuthenticatedIdentity = null;
+        defer if (identity) |*id| id.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &identity)) |response| return response;
+        const owner = self.personalOwner(ctx, identity) catch |err| return if (err == error.ChatGPTDisabled) chatGPTFailure(ctx, err) else jsonErrorResponse(ctx, 403, "Personal connections unavailable.");
+        defer ctx.allocator.free(owner);
+        const body = self.api_server.cfg.chatgpt.?.models(ctx.allocator, owner, connection_id) catch |err| return chatGPTFailure(ctx, err);
+        defer ctx.allocator.free(body);
+        return jsonResponse(ctx, 200, body);
+    }
+    pub fn disconnectChatGPT(self: *AntflyApiHandler, ctx: *httpx.Context, connection_id: []const u8) !httpx.Response {
+        var identity: ?AuthenticatedIdentity = null;
+        defer if (identity) |*id| id.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &identity)) |response| return response;
+        const owner = self.personalOwner(ctx, identity) catch |err| return if (err == error.ChatGPTDisabled) chatGPTFailure(ctx, err) else jsonErrorResponse(ctx, 403, "Personal connections unavailable.");
+        defer ctx.allocator.free(owner);
+        const confirmed = self.api_server.cfg.chatgpt.?.disconnect(owner, connection_id) catch |err| return chatGPTFailure(ctx, err);
+        return ctx.json(.{ .revocation_confirmed = confirmed });
+    }
+    fn chatGPTStatus(err: anyerror) u16 {
+        return if (err == error.NotFound) 404 else if (err == error.CapacityExhausted or err == error.ChatGPTUsageLimitExceeded) 429 else if (err == error.ChatGPTDisabled or err == error.ChatGPTReconnectRequired or err == error.ChatGPTPlanDisabled or err == error.ChatGPTNotEligible or err == error.ChatGPTInteractiveOnly) 403 else if (err == error.ChatGPTUnsupportedCapability or err == error.ChatGPTBillingFallbackForbidden or err == error.ChatGPTUnsupportedRateLimit) 400 else 503;
+    }
+    fn chatGPTFailure(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+        return ctx.status(chatGPTStatus(err)).json(.{ .error_code = @errorName(err) });
+    }
+
     pub fn listConnections(self: *AntflyApiHandler, ctx: *httpx.Context, params: metadata_server_openapi.server.ListConnectionsParams) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
@@ -5432,6 +5527,7 @@ pub const AntflyApiHandler = struct {
         cache: *sql_plan_cache.Cache,
         done: std.Io.Event = .unset,
         result: ?sql_runtime.Result = null,
+        encoded_read: ?[]const u8 = null,
         failure: ?anyerror = null,
         diagnostic: sql_compiler.Diagnostic = .{},
         diagnostic_message_buffer: [256]u8 = undefined,
@@ -5445,6 +5541,81 @@ pub const AntflyApiHandler = struct {
         prepared_response_budget: SQLMemoryBudget = .{ .backing = std.heap.page_allocator, .limit = 16 << 20 },
         connection_owned: ?@import("sql_connections.zig").Owned = null,
         connection_session_hex: [32]u8 = undefined,
+
+        fn deliverRead(raw: *anyopaque, alloc: std.mem.Allocator, stream: *@import("antfly_local_sources").sql_read_stream.Stream) anyerror!sql_runtime.Result {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return self.encodeRead(alloc, stream) catch |err| return if (self.prepared_response_budget.exhausted) error.SqlProgramLimitExceeded else err;
+        }
+        fn encodeRead(self: *@This(), alloc: std.mem.Allocator, stream: *@import("antfly_local_sources").sql_read_stream.Stream) !sql_runtime.Result {
+            const a = self.prepared_response_budget.allocator();
+            var writer: std.Io.Writer.Allocating = .init(a);
+            defer writer.deinit();
+            // Keep NULL flags in one bit per cell; encode rows directly from
+            // leased columns and release each page before pulling the next.
+            var nulls: std.ArrayList(u8) = .empty;
+            defer nulls.deinit(a);
+            var cells: usize = 0;
+            var rows: usize = 0;
+            const columns = stream.context.binding.columns;
+            try writer.writer.writeAll("{\"columns\":");
+            try std.json.Stringify.value(columns, .{}, &writer.writer);
+            try writer.writer.writeAll(",\"rows\":[");
+            while (true) {
+                var page = try stream.nextBatch(256);
+                defer page.deinit();
+                if (page.values.len() > self.limit -| rows) return error.SqlProgramLimitExceeded;
+                for (0..page.values.len()) |row| {
+                    if (rows != 0) try writer.writer.writeByte(',');
+                    try writer.writer.writeByte('[');
+                    for (columns, 0..) |_, column| {
+                        if (column != 0) try writer.writer.writeByte(',');
+                        const value = try page.values.cell(page.arena.allocator(), row, column);
+                        if (cells % 8 == 0) try nulls.append(a, 0);
+                        if (value.sql_null) nulls.items[cells / 8] |= @as(u8, 1) << @intCast(cells % 8);
+                        cells += 1;
+                        if (value.sql_null) {
+                            try writer.writer.writeAll("null");
+                        } else if (value.patterns) |patterns| {
+                            try writer.writer.writeByte('[');
+                            var offset: u64 = 0;
+                            var first = true;
+                            while (try patterns.next(patterns.ptr, page.arena.allocator(), &offset)) |pattern| {
+                                try self.adapter.context.ensureActive();
+                                if (!first) try writer.writer.writeByte(',');
+                                first = false;
+                                try std.json.Stringify.value(pattern.value, .{}, &writer.writer);
+                            }
+                            try writer.writer.writeByte(']');
+                        } else if (value.value == .integer) {
+                            var buffer: [20]u8 = undefined;
+                            const exact = try std.fmt.bufPrint(&buffer, "{d}", .{value.value.integer});
+                            try std.json.Stringify.value(exact, .{}, &writer.writer);
+                        } else try std.json.Stringify.value(value.value, .{}, &writer.writer);
+                    }
+                    try writer.writer.writeByte(']');
+                    rows += 1;
+                }
+                if (page.exhausted) break;
+            }
+            try writer.writer.writeAll("],\"sql_nulls\":[");
+            for (0..rows) |row| {
+                if (row != 0) try writer.writer.writeByte(',');
+                try writer.writer.writeByte('[');
+                for (0..columns.len) |column| {
+                    if (column != 0) try writer.writer.writeByte(',');
+                    const index = row * columns.len + column;
+                    const flag = nulls.items[index / 8] & (@as(u8, 1) << @intCast(index % 8)) != 0;
+                    try writer.writer.writeAll(if (flag) "true" else "false");
+                }
+                try writer.writer.writeByte(']');
+            }
+            try writer.writer.writeAll("],\"rows_affected\":0,\"command_tag\":\"SELECT\",\"transaction_status\":\"idle\"}");
+            try self.adapter.context.ensureActive();
+            var result = try sql_runtime.Result.empty(alloc, "SELECT");
+            errdefer result.deinit();
+            self.encoded_read = try writer.toOwnedSlice();
+            return result;
+        }
 
         fn run(self: *@This()) void {
             // Wake on the executor that owns the request waiter, not the
@@ -5634,6 +5805,7 @@ pub const AntflyApiHandler = struct {
             defer execution.release();
             self.preparation.release();
             self.execution_entered = true;
+            self.adapter.read_delivery = .{ .ptr = self, .deliver = deliverRead };
             self.result = self.adapter.execute(std.heap.page_allocator, compiled, self.parameters, .{ .result_rows = self.limit }, null) catch |err| {
                 self.failure = err;
                 return;
@@ -5850,6 +6022,10 @@ pub const AntflyApiHandler = struct {
         }
         var result = job.result.?;
         defer result.deinit();
+        if (job.encoded_read) |encoded| {
+            defer job.prepared_response_budget.allocator().free(encoded);
+            return jsonResponse(ctx, 200, encoded);
+        }
         const columns = ctx.allocator.alloc(sql_wire.SQLColumn, result.output.columns.len) catch |err| {
             if (job.is_write) return ctx.status(409).json(sql_wire.SQLDiagnostic{ .code = "40003", .message = "mutation completed but its acknowledgement could not be encoded; do not replay the statement", .retryable = false, .transaction_id = if (job.adapter.outcome_transaction_id) |*id| id else null });
             return err;
@@ -6043,7 +6219,11 @@ pub const AntflyApiHandler = struct {
 
         const RetrievalQueryRunner = AgentQueryRunner;
         const RetrievalGenerationRunner = AgentGenerationRunner;
+        const personal_owner = self.personalOwner(ctx, authenticated_identity) catch null;
+        defer if (personal_owner) |owner| ctx.allocator.free(owner);
         var generation_runner = RetrievalGenerationRunner{
+            .chatgpt = if (self.api_server.connectorCapabilities().chatgpt.enabled) self.api_server.cfg.chatgpt else null,
+            .personal_owner = personal_owner,
             .antfly_provider = self.api_server.antfly_provider,
             .secret_store = self.api_server.cfg.secret_store,
             .io = self.api_server.inferenceIo(),
@@ -6065,10 +6245,15 @@ pub const AntflyApiHandler = struct {
                 // transport/cancellation failures must close the connection,
                 // never attempt to send a second HTTP response.
                 if (sink.failed or ctx.isCancellationRequested()) return err;
-                try sink.emitError();
+                if (std.mem.startsWith(u8, @errorName(err), "ChatGPT")) {
+                    const json = try std.json.Stringify.valueAlloc(ctx.allocator, .{ .@"error" = @errorName(err), .manage_usage_url = "https://chatgpt.com/settings/usage", .upstream = generation_runner.chatgpt_failure.summary() }, .{});
+                    defer ctx.allocator.free(json);
+                    try RetrievalSseSink.emitJson(&sink, ctx.allocator, "error", json);
+                } else try sink.emitError();
                 try sink.close();
                 return ctx.response.build();
             }
+            if (std.mem.startsWith(u8, @errorName(err), "ChatGPT")) return ctx.status(chatGPTStatus(err)).json(.{ .error_code = @errorName(err), .upstream = generation_runner.chatgpt_failure.summary() });
             return switch (err) {
                 error.TreeRootSetTooLarge => {
                     _ = ctx.status(422);
@@ -6239,7 +6424,11 @@ pub const AntflyApiHandler = struct {
         }) catch |err| {
             if (sink.writer != null) {
                 if (sink.failed or ctx.isCancellationRequested()) return err;
-                try sink.emitError();
+                if (std.mem.startsWith(u8, @errorName(err), "ChatGPT")) {
+                    const json = try std.json.Stringify.valueAlloc(ctx.allocator, .{ .@"error" = @errorName(err), .manage_usage_url = "https://chatgpt.com/settings/usage", .upstream = runners.generation.chatgpt_failure.summary() }, .{});
+                    defer ctx.allocator.free(json);
+                    try RetrievalSseSink.emitJson(&sink, ctx.allocator, "error", json);
+                } else try sink.emitError();
                 try sink.close();
                 return ctx.response.build();
             }
@@ -6991,7 +7180,7 @@ pub const AntflyApiHandler = struct {
                 .inference_api_key = self.api_server.cfg.inference_api_key,
             },
         ) catch |err| switch (err) {
-            error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest => {
+            error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest, error.ChatGPTInteractiveOnly => {
                 _ = ctx.status(400);
                 return ctx.text("unsupported table index configuration");
             },
@@ -7037,7 +7226,7 @@ pub const AntflyApiHandler = struct {
                 _ = ctx.status(503);
                 return ctx.text("table index validation probe unavailable");
             },
-            error.InvalidCreateTableRequest => {
+            error.InvalidCreateTableRequest, error.ChatGPTInteractiveOnly => {
                 _ = ctx.status(400);
                 return ctx.text("unsupported table index configuration");
             },
@@ -7119,6 +7308,10 @@ pub const AntflyApiHandler = struct {
             self.api_server.preparePartialWitnessSchema(alloc, decoded_table_name, fk_schema, "", operationContext(ctx, authenticated_identity)) catch |err| return witnessDDLError(ctx, err);
         if (create_req.schema_json) |old| alloc.free(old);
         create_req.schema_json = supported_schema;
+        const derived_indexes_json = tables_api.expandSchemaDerivedAlgebraicIndexesAlloc(alloc, decoded_table_name, create_req.indexes_json orelse tables_api.default_indexes_json, supported_schema) catch return jsonErrorResponse(ctx, 400, "invalid schema-derived index configuration");
+        if (create_req.indexes_json) |old| alloc.free(old);
+        create_req.indexes_json = derived_indexes_json;
+        @import("antfly_local_sources").api_local_tables.validateLakeIndexCapacity(alloc, supported_schema, derived_indexes_json) catch return jsonErrorResponse(ctx, 400, "lake index declaration limit exceeded");
         if (has_initial_fk) {
             const request_context = operationContext(ctx, authenticated_identity);
             var plan_arena = std.heap.ArenaAllocator.init(alloc);
@@ -7936,14 +8129,20 @@ pub const AntflyApiHandler = struct {
         const request = operationContext(ctx, authenticated_identity);
         if (relational) if (binding.logical) |logical| {
             var lake_adapter: @import("sql_execution.zig").Adapter = .{ .server = self.api_server, .identity = &authenticated_identity, .context = request };
-            const lake_result = @import("lake_table_reads.zig").query(alloc, &lake_adapter, try system_catalog.Target.parse(logical), binding.table_id orelse return error.CatalogGenerationChanged, scan_req) catch |err| return switch (err) {
-                error.Forbidden => jsonErrorResponse(ctx, 403, "forbidden"),
-                error.TableNotFound => jsonErrorResponse(ctx, 404, "not found"),
-                error.CatalogGenerationChanged, error.ExternalLakeSnapshotMismatch => jsonErrorResponse(ctx, 409, "external table snapshot changed"),
-                error.InvalidQueryRequest, error.InvalidSqlDateTime, error.SqlTypeMismatch, error.UndefinedColumn, error.SqlUnknownColumn, error.RowPolicyUnsupported, error.UnsupportedRowsQuery, error.UnsupportedSqlExecution => jsonErrorResponse(ctx, 400, "external table does not support this read"),
-                error.Canceled, error.Cancelled => error.Canceled,
-                error.Timeout, error.DeadlineExceeded => jsonErrorResponse(ctx, 504, "request deadline exceeded"),
-                else => jsonErrorResponse(ctx, 503, "external table read unavailable"),
+            const lake_result = @import("lake_table_reads.zig").query(alloc, &lake_adapter, try system_catalog.Target.parse(logical), binding.table_id orelse return error.CatalogGenerationChanged, scan_req) catch |err| {
+                std.log.warn("external lake rows read failed table={s} err={s}", .{ decoded_table_name, @errorName(err) });
+                return switch (err) {
+                    error.Forbidden => jsonErrorResponse(ctx, 403, "forbidden"),
+                    error.TableNotFound => jsonErrorResponse(ctx, 404, "not found"),
+                    error.ExternalLakeRowIndexNotFound => jsonErrorResponse(ctx, 404, "relational index not found"),
+                    error.ExternalLakePartialIndexNotImplied => jsonErrorResponse(ctx, 400, "query conditions must imply the partial index predicate"),
+                    error.ExternalLakeIndexNotPublished, error.ExternalLakeRowIndexNotPublished => jsonErrorResponse(ctx, 503, "relational index publication is not ready"),
+                    error.CatalogGenerationChanged, error.ExternalLakeSnapshotMismatch, error.PreparedGenerationChanged, error.ExternalLakeIndexDefinitionChanged, error.ExternalLakeIndexCredentialsChanged, error.ExternalLakeIndexStoreChanged, error.ExternalLakeIndexSourceChanged => jsonErrorResponse(ctx, 409, "external table snapshot or index publication changed"),
+                    error.InvalidRelationalRowsRequest, error.InvalidRelationalIndexBound, error.InvalidQueryRequest, error.InvalidSqlDateTime, error.SqlTypeMismatch, error.UndefinedColumn, error.SqlUnknownColumn, error.RowPolicyUnsupported, error.UnsupportedRowsQuery, error.UnsupportedSqlExecution => jsonErrorResponse(ctx, 400, "external table does not support this read"),
+                    error.Canceled, error.Cancelled => error.Canceled,
+                    error.Timeout, error.DeadlineExceeded => jsonErrorResponse(ctx, 504, "request deadline exceeded"),
+                    else => jsonErrorResponse(ctx, 503, "external table read unavailable"),
+                };
             };
             if (lake_result) |ndjson| {
                 defer alloc.free(ndjson);
@@ -13800,9 +13999,10 @@ test "httpx SQL executes one relational page with exact integer parameters" {
             while (true) {
                 var page = try stream.next(stream.context, alloc, request, 2);
                 defer page.result.deinit();
-                for (page.result.rows) |row| {
+                for (0..page.result.rowCount()) |row_index| {
+                    const cell = try page.result.cell(alloc, row_index, 0);
                     try std.testing.expect(offset < expected.len);
-                    try std.testing.expectEqual(try std.fmt.parseInt(i64, expected[offset], 10), row[0].integer);
+                    try std.testing.expectEqual(try std.fmt.parseInt(i64, expected[offset], 10), cell.value.integer);
                     offset += 1;
                 }
                 if (page.exhausted) break;
@@ -15381,6 +15581,79 @@ test "httpx antfly cluster restore preserves backup location validation" {
         "{\"error\":\"unsupported backup location\"}",
         resp.body.?,
     );
+}
+
+test "httpx antfly ChatGPT connector policy rejects management before touching credentials" {
+    const a = std.testing.allocator;
+    var config = try common_config.Config.parseFromSlice(a, "{\"connectors\":{\"chatgpt\":{\"enabled\":false}}}");
+    defer config.deinit();
+    var source = AuthStatusSource{};
+    // A deliberately invalid manager proves the operator policy takes priority
+    // even if another bootstrap accidentally supplies a manager pointer.
+    var api = ApiHttpServer.init(a, .{ .node_config = &config, .chatgpt = @ptrFromInt(16) }, source.iface(), null, null);
+    defer api.deinit();
+    try std.testing.expect(!api.connectorCapabilities().chatgpt.enabled);
+    var server: HttpxE2eServer = undefined;
+    try server.init(a, &api);
+    defer server.deinit();
+    const base = try server.baseUrl(a);
+    defer a.free(base);
+    var client_io = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer client_io.deinit();
+    var client = httpx.Client.initWithConfig(a, client_io.io(), .{ .keep_alive = false });
+    defer client.deinit();
+    for ([_][]const u8{ "/db/v1/connections/chatgpt/accounts", "/db/v1/connections/chatgpt/attempts/one", "/db/v1/connections/one/chatgpt/models", "/db/v1/connections/chatgpt/authorize", "/db/v1/connections/one/chatgpt/disconnect" }, 0..) |path, index| {
+        const url = try std.fmt.allocPrint(a, "{s}{s}", .{ base, path });
+        defer a.free(url);
+        var response = try requestWithRetry(&client, client_io.io(), if (index < 3) .GET else .POST, url, if (index < 3) null else "{}", null, 20);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 403), response.status.code);
+        try std.testing.expect(std.mem.indexOf(u8, response.body.?, "ChatGPTDisabled") != null);
+    }
+    const url = try std.fmt.allocPrint(a, "{s}/db/v1/status", .{base});
+    defer a.free(url);
+    var response = try requestWithRetry(&client, client_io.io(), .GET, url, null, null, 20);
+    defer response.deinit();
+    var status = try std.json.parseFromSlice(std.json.Value, a, response.body.?, .{});
+    defer status.deinit();
+    const capability = status.value.object.get("connectors").?.object.get("chatgpt").?.object;
+    try std.testing.expect(!capability.get("enabled").?.bool);
+    try std.testing.expectEqualStrings("operator_disabled", capability.get("reason").?.string);
+}
+
+test "httpx antfly ChatGPT connector policy pending login matches generated client" {
+    const a = std.testing.allocator;
+    var io = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io.io(), ".", a);
+    defer a.free(root);
+    var manager = try @import("antfly_local_sources").chatgpt_manager.Manager.init(a, io.io(), root);
+    defer manager.deinit();
+    var source = AuthStatusSource{};
+    var api = ApiHttpServer.init(a, .{ .chatgpt = &manager }, source.iface(), null, null);
+    defer api.deinit();
+    var server: HttpxE2eServer = undefined;
+    try server.init(a, &api);
+    defer server.deinit();
+    const base = try server.baseUrl(a);
+    defer a.free(base);
+    var client = httpx.Client.initWithConfig(a, io.io(), .{ .keep_alive = false });
+    defer client.deinit();
+    const begin = try manager.begin(a, "local:", null);
+    defer a.free(begin.attempt_id);
+    defer a.free(begin.authorization_url);
+    const url = try std.fmt.allocPrint(a, "{s}/db/v1/connections/chatgpt/attempts/{s}", .{ base, begin.attempt_id });
+    defer a.free(url);
+    var response = try requestWithRetry(&client, io.io(), .GET, url, null, null, 20);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), response.status.code);
+    var parsed = try std.json.parseFromSlice(@import("antfly_client_openapi").types.ChatGPTOutcome, a, response.body.?, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("pending", parsed.value.status);
+    try std.testing.expect(parsed.value.connection_id == null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "connection_id") == null);
 }
 
 fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *const [bytes.len * repetitions:0]u8 {

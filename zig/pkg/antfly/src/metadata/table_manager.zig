@@ -1,4 +1,5 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Elastic-2.0
 //
 // Licensed under the Elastic License 2.0 (ELv2); you may not use this file
 // except in compliance with the Elastic License 2.0. You may obtain a copy of
@@ -51,6 +52,7 @@ pub fn tableDefinitionsEqual(lhs: TableDefinition, rhs: TableDefinition) bool {
         std.mem.eql(u8, lhs.schema_json, rhs.schema_json) and
         std.mem.eql(u8, lhs.read_schema_json, rhs.read_schema_json) and
         std.mem.eql(u8, lhs.relational_retirement_json, rhs.relational_retirement_json) and
+        std.mem.eql(u8, lhs.lake_index_catalog_json, rhs.lake_index_catalog_json) and
         std.mem.eql(u8, lhs.indexes_json, rhs.indexes_json) and
         std.mem.eql(u8, lhs.replication_sources_json, rhs.replication_sources_json) and
         std.mem.eql(u8, lhs.placement_role, rhs.placement_role) and
@@ -93,6 +95,10 @@ pub fn tableDefinitionFingerprint(table: TableDefinition) TableDefinitionFingerp
     hashTableDefinitionPart(&hasher, table.schema_json);
     hashTableDefinitionPart(&hasher, table.read_schema_json);
     if (table.relational_retirement_json.len != 0) hashTableDefinitionPart(&hasher, table.relational_retirement_json);
+    if (table.lake_index_catalog_json.len != 0) {
+        hashTableDefinitionPart(&hasher, "lake-index-catalog-v1");
+        hashTableDefinitionPart(&hasher, table.lake_index_catalog_json);
+    }
     hashTableDefinitionPart(&hasher, table.indexes_json);
     hashTableDefinitionPart(&hasher, table.replication_sources_json);
     hashTableDefinitionPart(&hasher, table.placement_role);
@@ -1211,6 +1217,7 @@ pub const RuntimeIndexSourceReplayStatusReport = struct {
     published_sequence: u64 = 0,
     target_sequence: u64 = 0,
     failed: bool = false,
+    producer_complete: bool = false,
 };
 
 pub const max_schema_progress_batch = 64;
@@ -2713,6 +2720,7 @@ pub fn cloneRuntimeIndexStatusReport(alloc: std.mem.Allocator, record: RuntimeIn
             .published_sequence = source.published_sequence,
             .target_sequence = source.target_sequence,
             .failed = source.failed,
+            .producer_complete = source.producer_complete,
         };
         source_count += 1;
     }

@@ -910,12 +910,12 @@ export const MultipleLanguageModels = () => {
       (import.meta as { env?: Record<string, string> }).env?.VITE_OPENAI_API_KEY || "your-api-key",
   };
 
-  const claudeSummarizer: GeneratorConfig = {
-    provider: "openai" as "openai" | "ollama", // anthropic not yet supported in type
-    model: "claude-3-sonnet-20240229",
-    api_key:
-      (import.meta as { env?: Record<string, string> }).env?.VITE_ANTHROPIC_API_KEY ||
-      "your-api-key",
+  const ollamaSummarizer: GeneratorConfig = {
+    provider: "ollama",
+    model: "llama3.2",
+    url:
+      (import.meta as { env?: Record<string, string> }).env?.VITE_OLLAMA_URL ||
+      "http://localhost:11434",
   };
 
   return (
@@ -933,8 +933,8 @@ export const MultipleLanguageModels = () => {
           <AnswerResults id="rag-gpt4" searchBoxId="question" generator={gpt4Summarizer} />
         </div>
         <div>
-          <h3>Claude Response</h3>
-          <AnswerResults id="rag-claude" searchBoxId="question" generator={claudeSummarizer} />
+          <h3>Ollama Response</h3>
+          <AnswerResults id="rag-ollama" searchBoxId="question" generator={ollamaSummarizer} />
         </div>
       </div>
     </Antfly>

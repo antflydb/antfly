@@ -1,4 +1,5 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Elastic-2.0
 //
 // Licensed under the Elastic License 2.0 (ELv2); you may not use this file
 // except in compliance with the Elastic License 2.0. You may obtain a copy of
@@ -14,7 +15,7 @@
 
 const public_table_http = @import("api/public_table_http.zig");
 
-test {
+test "public table HTTP module compiles" {
     _ = public_table_http;
     _ = @import("api/relational_rows.zig");
     _ = @import("api/tables.zig");

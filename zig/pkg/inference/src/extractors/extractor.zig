@@ -1,4 +1,5 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -1429,7 +1430,7 @@ test "reader selection state cleans up every allocation failure" {
             defer snapshot.deinit();
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
 
 test "reader path resolution cleans up every allocation failure" {
@@ -1464,7 +1465,7 @@ test "reader path resolution cleans up every allocation failure" {
             defer allocator.free(path);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
 
 test "reader selection singleflights same keys while independent stripes discover concurrently" {

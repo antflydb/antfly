@@ -1,4 +1,5 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -468,11 +469,12 @@ fn renderParsedPageRgbaNativeWithAllocators(
         try reader.prepareOcrRenderRunsAlloc(reader_alloc, render_runs.image_runs, render_runs.pattern_runs, parsed.cancellationProbe());
     }
     scalePageRenderRuns(&render_runs, scale);
-    alignPageBoxToPixelGrid(&render_runs.page_box);
+    // The integer raster plan is authoritative. Scaling negative/fractional
+    // origins can turn an exact extent into N + epsilon; another ceil would
+    // allocate an extra pixel and disagree with the adaptive render metadata.
+    render_runs.page_box.max_x = render_runs.page_box.min_x + preflight_width;
+    render_runs.page_box.max_y = render_runs.page_box.min_y + preflight_height;
     const page_box = render_runs.page_box;
-    const page_width = @max(1.0, page_box.max_x - page_box.min_x);
-    const page_height = @max(1.0, page_box.max_y - page_box.min_y);
-    if (page_width * page_height > @as(f64, @floatFromInt(max_pixels))) return error.RenderedPageTooLarge;
     const runs = render_runs.text_runs;
     const image_runs = render_runs.image_runs;
     const shading_runs = render_runs.shading_runs;
@@ -490,7 +492,7 @@ fn renderParsedPageRgbaNativeWithAllocators(
     // individual arrays here is both redundant and subtly less complete: it
     // ignores paint phase and cannot establish cross-kind ordering.
     try parsed.checkCancellation();
-    const raw = try render.renderPageContentRgbaInBoxRotatedWithAllocatorsCancelable(scratch_alloc, output_alloc, page_box, plain_runs.items, image_runs, shading_runs, pattern_runs, shape_runs, rotation, parsed.cancellationProbe());
+    const raw = try render.renderPageContentRgbaInBoxRotatedWithGeometryAllocatorsCancelable(scratch_alloc, output_alloc, page_box, plain_runs.items, image_runs, shading_runs, pattern_runs, shape_runs, rotation, parsed.cancellationProbe(), .{ .width = @intFromFloat(preflight_width), .height = @intFromFloat(preflight_height) });
     errdefer output_alloc.free(raw.rgba);
     try parsed.checkCancellation();
     return raw;
@@ -2824,8 +2826,12 @@ test "PDF render pattern cloning is allocation-failure safe" {
 }
 
 fn buildRotatedTestPdfAlloc(alloc: Allocator, rotation: i32) ![]u8 {
+    return buildBoxTestPdfAlloc(alloc, rotation, "0 0 20 30");
+}
+
+fn buildBoxTestPdfAlloc(alloc: Allocator, rotation: i32, box: []const u8) ![]u8 {
     const content = "0 0 10 10 re f\n";
-    const pages_object = try std.fmt.allocPrint(alloc, "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 20 30] /Rotate {d} >>\nendobj\n", .{rotation});
+    const pages_object = try std.fmt.allocPrint(alloc, "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [{s}] /Rotate {d} >>\nendobj\n", .{ box, rotation });
     defer alloc.free(pages_object);
     const content_object = try std.fmt.allocPrint(alloc, "4 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n", .{ content.len, content });
     defer alloc.free(content_object);
@@ -5865,4 +5871,19 @@ test "native page renderer preserves a raster scanned-table fixture for OCR" {
         if (page.rgba[i] < 128 and page.rgba[i + 1] < 128 and page.rgba[i + 2] < 128) dark_pixels += 1;
     }
     try std.testing.expect(dark_pixels > 500);
+}
+
+test "adaptive raster preserves planned dimensions for negative fractional origins" {
+    const alloc = std.testing.allocator;
+    for ([_]i32{ 0, 90, 180, 270 }) |rotation| {
+        const fixture = try buildBoxTestPdfAlloc(alloc, rotation, "-344.62 -303.88 447.38 309.12");
+        defer alloc.free(fixture);
+        var parsed = try reader.Reader.init(alloc, fixture);
+        defer parsed.deinit();
+        const planned = try planParsedPageRenderGeometry(&parsed, .{ .page_number = 1, .requested_dpi = 150, .max_pixels = 40_000_000, .max_dimension = 10_000 });
+        var raster = try renderParsedPageRasterAdaptiveWithProfileAlloc(alloc, &parsed, 1, 150, 40_000_000, 10_000, .ocr);
+        defer raster.deinit(alloc);
+        try std.testing.expectEqual(planned.width, raster.width);
+        try std.testing.expectEqual(planned.height, raster.height);
+    }
 }

@@ -17,7 +17,7 @@ transitions, and observations byte-for-byte before a history counts as proof.
 See Conformance Status below for what "integrated" does and does not claim,
 and the Completion-Claim Audit for the residual boundaries of each family.
 
-> **Relocated:** The versioned status narrative (v9-v53, 539 lines) that previously lived here is preserved verbatim in [work-log/completed/vopr/status-history.md](../work-log/completed/vopr/status-history.md). Durable decisions from it are in Conformance Status and the Completion-Claim Audit below.
+> **Relocated:** The versioned status narrative (v9-v53, 539 lines) that previously lived here is preserved verbatim in [docs/design/vopr/history/status-history.md](../docs/design/vopr/history/status-history.md). Durable decisions from it are in Conformance Status and the Completion-Claim Audit below.
 
 Scope: Zig Antfly simulation, VOPR, modeled-storage, and deterministic chaos
 testing. This is the living design and operating policy. Historical phase
@@ -150,7 +150,7 @@ split retains them on the parent rather than the child, and physical split
 assigns new LSM L0 run IDs oldest-first so older data cannot outrank newer
 writes.
 
-> **Relocated:** The dated 2026-09-07 metadata planning fix narrative that previously lived here is preserved verbatim in [work-log/completed/vopr/follow-ups-2026-09.md](../work-log/completed/vopr/follow-ups-2026-09.md).
+> **Relocated:** The dated 2026-09-07 metadata planning fix narrative that previously lived here is preserved verbatim in [docs/design/vopr/history/follow-ups-2026-09.md](../docs/design/vopr/history/follow-ups-2026-09.md).
 
 | Capability | Implementation evidence | Verification |
 | --- | --- | --- |
@@ -1219,7 +1219,7 @@ VOPR has caught real defects across these classes:
   units, internal handlers, or clients disagreed on wire encoding or
   error-domain translation for the same logical value.
 
-> **Relocated:** The full dated defects ledger (1,162 lines) that previously lived here is preserved verbatim in [work-log/completed/vopr/defects-found.md](../work-log/completed/vopr/defects-found.md).
+> **Relocated:** The full dated defects ledger (1,162 lines) that previously lived here is preserved verbatim in [docs/design/vopr/history/defects-found.md](../docs/design/vopr/history/defects-found.md).
 
 ## CLI
 
@@ -1632,7 +1632,7 @@ python3 ../scripts/ci/zig_vopr_soak.py --binary zig-out/bin/vopr merge \
   --inputs /tmp/new-vopr-run --output /tmp/merged-vopr-corpus
 ```
 
-> **Relocated:** The soak-investigation defect narrative that previously lived here is preserved verbatim in [work-log/completed/vopr/follow-ups-2026-09.md](../work-log/completed/vopr/follow-ups-2026-09.md). Durable invariants from it are in the Raft and Metadata and Distributed Data sections above.
+> **Relocated:** The soak-investigation defect narrative that previously lived here is preserved verbatim in [docs/design/vopr/history/follow-ups-2026-09.md](../docs/design/vopr/history/follow-ups-2026-09.md). Durable invariants from it are in the Raft and Metadata and Distributed Data sections above.
 
 ### Integration and legacy storage tests
 
@@ -1691,7 +1691,7 @@ scenarios and operational tooling rather than missing foundational
 infrastructure. They are not a second numbered phase plan and are not
 dependencies of the already implemented domain suites.
 
-> **Relocated:** The nine dated Follow-up subsections (2026-09-06/07, 617 lines) that previously lived here are preserved verbatim in [work-log/completed/vopr/follow-ups-2026-09.md](../work-log/completed/vopr/follow-ups-2026-09.md).
+> **Relocated:** The nine dated Follow-up subsections (2026-09-06/07, 617 lines) that previously lived here are preserved verbatim in [docs/design/vopr/history/follow-ups-2026-09.md](../docs/design/vopr/history/follow-ups-2026-09.md).
 
 ### Current Answer: Coverage, Parity, and Completeness
 
@@ -1724,7 +1724,7 @@ claim, not footnotes to it.
 
 ### Verification Audit and Meaning of "Finished"
 
-> **Relocated:** The dated 2026-08-26 verification-audit narrative that previously lived here is preserved verbatim in [work-log/completed/vopr/status-history.md](../work-log/completed/vopr/status-history.md).
+> **Relocated:** The dated 2026-08-26 verification-audit narrative that previously lived here is preserved verbatim in [docs/design/vopr/history/status-history.md](../docs/design/vopr/history/status-history.md).
 
 The production-owned gate is intentionally tiered by deterministic work, not
 by a weaker oracle. `production-cluster-vopr-smoke-test` runs v11 exact replay
@@ -1807,7 +1807,7 @@ canonical wire records structurally and renders only a first mismatch, so the
 deep gate no longer retains two complete JSONL artifacts merely to prove
 equality.
 
-> **Relocated:** The dated checkpoint-recap narrative that previously lived here is preserved verbatim in [work-log/completed/vopr/status-history.md](../work-log/completed/vopr/status-history.md).
+> **Relocated:** The dated checkpoint-recap narrative that previously lived here is preserved verbatim in [docs/design/vopr/history/status-history.md](../docs/design/vopr/history/status-history.md).
 
 Completion labels in the tables below use the three-level scale defined
 under Conformance Status. A row may narrow an **Integrated** claim with a
@@ -1846,7 +1846,7 @@ extension beyond the named green seams. A changed tree must rerun the
 named gate before carrying the claim forward; documentation is not evidence. A
 broader sentence must not erase those boundaries.
 
-> **Relocated:** The dated v13-v18 defect-and-repair narrative that previously lived here is preserved verbatim in [work-log/completed/vopr/status-history.md](../work-log/completed/vopr/status-history.md).
+> **Relocated:** The dated v13-v18 defect-and-repair narrative that previously lived here is preserved verbatim in [docs/design/vopr/history/status-history.md](../docs/design/vopr/history/status-history.md).
 
 standby, per-group Raft, LSM/WAL/LMDB/persistent/index-manager/DB-split, metadata
 distributed data, the deployment-shaped full cluster, and the newer P0/P1/P2
@@ -2594,7 +2594,7 @@ Wait for a real product or toolchain requirement before adding:
 ### Ongoing Roadmap
 
 > **Relocated:** The version-by-version roadmap narrative that previously lived here (445 lines) is
-> preserved verbatim in [work-log/completed/vopr/status-history.md](../work-log/completed/vopr/status-history.md#ongoing-roadmap-narrative-relocated-from-vopr-md).
+> preserved verbatim in [docs/design/vopr/history/status-history.md](../docs/design/vopr/history/status-history.md#ongoing-roadmap-narrative-relocated-from-vopr-md).
 > Durable decisions from it are folded into the compact roadmap below. The former "shortest current
 > summary" and "detailed backlog" lists narrated the same seams in the same order, so they are merged
 > into one list here.
@@ -2769,7 +2769,7 @@ in-process distributed VOPR is integrated across metadata, transactions, Raft,
 standby, the data plane, distributed graph fanout, and a deployment-shaped
 full-cluster campaign; separate-address-space orchestration is not.
 
-> **Relocated:** The dated v11-v18 completion recap that previously lived here is preserved verbatim in [work-log/completed/vopr/status-history.md](../work-log/completed/vopr/status-history.md).
+> **Relocated:** The dated v11-v18 completion recap that previously lived here is preserved verbatim in [docs/design/vopr/history/status-history.md](../docs/design/vopr/history/status-history.md).
 
 Compiler-guided coverage and provider-specific datagram campaigns remain
 conditional on stable instrumentation and real consumers. New product services

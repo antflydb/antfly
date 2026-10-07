@@ -1,4 +1,5 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -144,6 +145,12 @@ pub fn addWasm(ctx: Context, wasm_jinja_mod: *std.Build.Module, wasm_platform_mo
 
     const wasm_step = ctx.step("wasm", "Build WASM module for browser inference");
     wasm_step.dependOn(&wasm_install.step);
+    wasm_step.dependOn(ctx.install_apache_licenses(
+        b,
+        b.path(b.pathJoin(&.{ ctx.paths.shared_lib_root, ".." })),
+        "antfly-inference-wasm",
+        "share/licenses/antfly-inference-wasm",
+    ));
     if (!is_wasm64) {
         const wasm_compat_install = b.addInstallFile(wasm_lib.getEmittedBin(), "antfly-inference.wasm");
         wasm_step.dependOn(&wasm_compat_install.step);

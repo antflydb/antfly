@@ -1,5 +1,18 @@
 // Copyright 2026 Antfly, Inc.
-// Licensed under the Elastic License 2.0 (ELv2).
+// SPDX-License-Identifier: Elastic-2.0
+//
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
+//
+//     https://www.antfly.io/licensing/ELv2-license
+//
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
+
 //! Schema-independent immutable plans only: authorization, catalog resolution,
 //! parameter values and bound plans MUST remain request-local. The allocator
 //! must support concurrent calls; the owner and allocator outlive all leases.
@@ -301,8 +314,20 @@ test "SQL plan cache failures preserve diagnostics and reclaim all admission" {
 }
 
 test "SQL plan cache bounds actual live allocation through byte-driven eviction" {
-    var backing: Budget = .{ .backing = std.testing.allocator, .limit = 8192 };
-    var cache = Cache.init(backing.allocator(), .{ .max_entries = 8, .max_bytes = 8192, .max_compile_bytes = 4096 });
+    // Compiler arena growth varies with optimization and Zig's layouts. Measure
+    // one representative plan, then constrain the cache to fewer plans than its
+    // entry limit rather than assuming that compilation fits in 4 KiB.
+    var compile_budget: Budget = .{ .backing = std.testing.allocator, .limit = 1024 * 1024 };
+    var probe = try compiler.compile(compile_budget.allocator(), "SELECT _id,name,age FROM t WHERE age>29", .{});
+    const retained_bytes = compile_budget.live;
+    // Leave room for arena growth when its backing allocator is another
+    // admission budget rather than the testing allocator used by this probe.
+    const compile_bytes = 2 * std.math.ceilPowerOfTwoAssert(usize, compile_budget.peak);
+    probe.deinit();
+    try std.testing.expectEqual(@as(usize, 0), compile_budget.live);
+    const cache_bytes = compile_bytes + @sizeOf(Entry) + 2 * (retained_bytes + @sizeOf(Entry)) + 16 * @sizeOf(?*Entry);
+    var backing: Budget = .{ .backing = std.testing.allocator, .limit = cache_bytes };
+    var cache = Cache.init(backing.allocator(), .{ .max_entries = 8, .max_bytes = cache_bytes, .max_compile_bytes = compile_bytes });
     defer cache.deinit(std.testing.io);
     var diagnostic: compiler.Diagnostic = .{};
     for (0..30) |i| {
@@ -313,6 +338,7 @@ test "SQL plan cache bounds actual live allocation through byte-driven eviction"
         try std.testing.expectEqual(backing.live, cache.stats(std.testing.io).bytes);
     }
     try std.testing.expect(cache.stats(std.testing.io).evictions > 0);
+    try std.testing.expect(cache.stats(std.testing.io).entries < cache.config.max_entries);
     try std.testing.expect(backing.peak <= cache.config.max_bytes);
     try std.testing.expect(!backing.exhausted);
 }

@@ -17,7 +17,7 @@ the design this implements.
 > **Relocated:** The dated implementation log (September 2026) documenting the
 > experiments, qualification rounds, and the final pre-refinement 1M repeat
 > qualification that led to this design is preserved verbatim in
-> [work-log/completed/vector-store/experiments-2026-09.md](../work-log/completed/vector-store/experiments-2026-09.md).
+> [docs/design/vector-store/history/experiments-2026-09.md](../docs/design/vector-store/history/experiments-2026-09.md).
 > Durable decisions from it are folded into the Objective, Ownership, Table
 > setting, and Reads/updates/deletion sections below.
 
@@ -470,14 +470,14 @@ depend on an unretained file in the old shard.
 
 The branch already contains relevant machinery:
 
-- [vector_block_store.zig](pkg/antfly-embedded/src/local/storage/vector_block_store.zig):
+- [vector_block_store.zig](pkg/antfly-embedded/src/storage/vector_block_store.zig):
   table-level exact-vector blocks, committed WAL batches, `CURRENT`
   publication, and retained readers.
-- [vector_wal_view.zig](pkg/antfly-embedded/src/local/storage/vector_wal_view.zig): vector WAL
+- [vector_wal_view.zig](pkg/antfly-embedded/src/storage/vector_wal_view.zig): vector WAL
   read/version machinery.
 - [vector_block_manifest.zig](lib/vectorindex/src/vector_block_manifest.zig):
   vector generation metadata and coverage.
-- [artifact_codec.zig](pkg/antfly-embedded/src/local/storage/db/enrichment/artifact_codec.zig):
+- [artifact_codec.zig](pkg/antfly-embedded/src/storage/db/enrichment/artifact_codec.zig):
   existing embedding artifact representation and source metadata.
 - [VECTORDBBENCH_FINDINGS.md](VECTORDBBENCH_FINDINGS.md): measured primary-store
   costs, shared exact-vector experiments, and current qualification limits.

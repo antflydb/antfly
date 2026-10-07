@@ -1,5 +1,17 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Portable final snapshots from an immutable original source and one locked
 //! optimizer epoch. The caller holds its training-owner busy lock until return.
@@ -872,8 +884,8 @@ test "boundary training export bounds cancellation and all allocation failures r
     var cancel = CancelStaged{ .directory = temporary.dir };
     try std.testing.expectError(error.Cancelled, exportView(a, io, test_adapter.source, output, snapshot, .{}, .{ .ptr = &cancel, .check_fn = CancelStaged.call }));
     try std.testing.expect(cancel.saw_stage);
-    try std.testing.checkAllAllocationFailures(a, estimateAllocationFailures, .{ test_adapter.source, snapshot });
-    try std.testing.checkAllAllocationFailures(a, exportAllocationFailures, .{ test_adapter.source, snapshot, output });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, estimateAllocationFailures, .{ test_adapter.source, snapshot });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, exportAllocationFailures, .{ test_adapter.source, snapshot, output });
     var iterator = temporary.dir.iterate();
     try std.testing.expect((try iterator.next(io)) == null);
 }

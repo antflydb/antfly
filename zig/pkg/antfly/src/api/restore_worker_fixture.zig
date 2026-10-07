@@ -1,4 +1,5 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Elastic-2.0
 //
 // Licensed under the Elastic License 2.0 (ELv2); you may not use this file
 // except in compliance with the Elastic License 2.0. You may obtain a copy of
@@ -893,7 +894,7 @@ pub fn runWithPolicy(comptime Driver: type, invalid_child: bool, override: ?http
     var benchmark_allocator: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
     defer if (policy.benchmark_rows > 1) {
         const allocator_status = benchmark_allocator.deinit();
-        std.debug.assert(allocator_status == .ok);
+        std.debug.assert(allocator_status == 0);
     };
     const alloc = if (policy.benchmark_rows > 1) benchmark_allocator.allocator() else std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(alloc);

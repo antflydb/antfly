@@ -278,8 +278,6 @@ export type {
   GraphCountAggregate,
   GraphDocumentFilter,
   GraphEdgeWeightRange,
-  GraphRelationshipFilter,
-  GraphRelationshipPropertyPredicate,
   GraphExactResultStats,
   GraphIdentityNodeSelector,
   GraphIndexConfig,
@@ -320,6 +318,8 @@ export type {
   GraphQuery,
   GraphQueryParams,
   GraphQueryType,
+  GraphRelationshipFilter,
+  GraphRelationshipPropertyPredicate,
   GraphResult,
   GraphResultBinding,
   GraphResultNode,
@@ -504,10 +504,13 @@ export {
 import { Client } from "./sdk.js";
 export default Client;
 
+export { ChatGPTConnectionError } from "./client.js";
 export * from "./models.js";
-
 export type {
   CatalogTablespaceBindingRequest,
+  ChatGPTAccount,
+  ChatGPTBegin,
+  ChatGPTOutcome,
   CreateTablespaceRequest,
   DatabaseCatalogRecord,
   NamespaceCatalogRecord,

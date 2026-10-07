@@ -1,0 +1,207 @@
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! An owned dependency certificate. Callers own its selected handles until
+//! cleanup completes; this object pins every epoch used by its cursors.
+//! advanceLocked performs ONE bounded off-lock slice, including scratch GC.
+const std = @import("std");
+const work_budget = @import("work_budget.zig");
+const Directory = @import("run_directory.zig").Directory;
+const Job = @import("dependency_job.zig").Job;
+const runtime = @import("runtime.zig");
+const Reservation = @import("../resource_manager.zig").Reservation;
+
+pub const Validation = struct {
+    directory: *Directory,
+    latest: ?*Directory = null,
+    changes: ?Directory.ChangeCursor = null,
+    job: Job,
+    phase: enum { identities, cleanup, certificate } = .identities,
+    reservation: ?Reservation = null,
+    slices: usize = 0,
+    rebases: usize = 0,
+    yield_between_slices: bool = false,
+    pub const Result = enum { pending, valid, invalid };
+
+    pub fn init(backend: anytype, plan: anytype) !Validation {
+        var reservation: ?Reservation = null;
+        errdefer if (reservation) |*lease| lease.release();
+        if (backend.options.resource_manager) |manager| reservation = try manager.reserve(.lsm_table_builder_working_set, @sizeOf(Validation) + 8192 + plan.input_handles.?.len * 128);
+        const directory = try (try backend.planningDirectory()).fork(backend.allocator);
+        return .{ .directory = directory, .job = .init(directory, plan), .reservation = reservation };
+    }
+
+    pub fn advanceLocked(self: *Validation, backend: anytype) !Result {
+        return self.advanceBudgetedLocked(backend, 2048, std.math.maxInt(u64));
+    }
+
+    pub fn advanceBudgetedLocked(self: *Validation, backend: anytype, credits: usize, deadline: anytype) !Result {
+        if (!self.job.valid) return .invalid;
+        if (backend.manifestCoordinationIo()) |io| try io.checkCancel();
+        if (self.phase == .certificate and self.changes == null) {
+            const current = try backend.planningDirectory();
+            if (current.tree.root == self.directory.tree.root) return .valid;
+            self.latest = try current.fork(backend.allocator);
+            self.changes = .init(self.directory, self.latest.?);
+            self.rebases += 1;
+        }
+        backend.retainReaderKind(.compaction);
+        defer backend.releaseReaderKind(.compaction);
+        runtime.unlockBackend(@TypeOf(backend.*), backend, true);
+        // Unlocking may itself run bounded reclamation. Give this job its
+        // own quantum afterwards; continuous retirement must not consume
+        // every validation turn before the first identity can be visited.
+        const advanced = self.step(backend.allocator, credits, work_budget.capped(deadline, backend.manifestCoordinationIo(), 2 * std.time.ns_per_ms));
+        // Maintenance hands control back to its scheduler after this call.
+        // A synchronous drain must explicitly yield through std.Io instead
+        // of monopolizing a cooperative executor across successive slices.
+        const yielded = if (self.yield_between_slices)
+            if (backend.manifestCoordinationIo()) |io| io.sleep(.fromNanoseconds(1), .awake) else @as(anyerror!void, {})
+        else
+            @as(anyerror!void, {});
+        _ = runtime.lockBackend(@TypeOf(backend.*), backend);
+        self.slices += 1;
+        try advanced;
+        try yielded;
+        if (!self.job.valid) return .invalid;
+        if (self.changes) |*changes| if (changes.done()) {
+            backend.retireCheckpointDirectory(self.directory);
+            self.directory = self.latest.?;
+            self.latest = null;
+            self.changes = null;
+        };
+        if (self.phase == .certificate and self.changes == null and
+            (try backend.planningDirectory()).tree.root == self.directory.tree.root) return .valid;
+        return .pending;
+    }
+
+    fn step(self: *Validation, allocator: std.mem.Allocator, credits_arg: usize, deadline: anytype) !void {
+        var credits = credits_arg;
+        switch (self.phase) {
+            .identities => {
+                if (try self.job.step(allocator, credits, deadline)) self.phase = .cleanup;
+            },
+            .cleanup => {
+                // Preserve result ranks while reclaiming membership scratch.
+                const indices = self.job.indices;
+                self.job.indices = null;
+                defer self.job.indices = indices;
+                while (credits != 0 and work_budget.before(deadline)) {
+                    var quantum: usize = @min(credits, 64);
+                    const before = quantum;
+                    const done = self.job.deinitStep(allocator, &quantum);
+                    credits -= before - quantum;
+                    if (done) {
+                        self.phase = .certificate;
+                        self.shrinkCompletedScratchCredit(if (indices) |ranks| ranks.len * @sizeOf(usize) else 0);
+                        break;
+                    }
+                }
+            },
+            .certificate => if (self.changes) |*changes| {
+                while (credits != 0 and work_budget.before(deadline) and !changes.done()) {
+                    if (changes.next(&credits)) |change| {
+                        if (!self.job.acceptChange(change)) return;
+                    } else break;
+                }
+            },
+        }
+    }
+
+    pub fn cleanupStep(self: *Validation, allocator: std.mem.Allocator, credits: *usize) bool {
+        return self.job.deinitStep(allocator, credits);
+    }
+
+    fn shrinkCompletedScratchCredit(self: *Validation, rank_bytes: usize) void {
+        // Membership scratch is gone in the certificate phase. Only epoch/
+        // cursor headers and any still-owned result ranks need admission.
+        const retained = @sizeOf(Validation) + 8192 + rank_bytes;
+        if (self.reservation) |*lease| lease.shrink(lease.bytes -| retained);
+    }
+
+    pub fn takeIndices(self: *Validation) []usize {
+        std.debug.assert(self.phase == .certificate and self.job.valid);
+        const indices = self.job.indices.?;
+        self.job.indices = null;
+        self.shrinkCompletedScratchCredit(0);
+        return indices;
+    }
+
+    /// Maintenance calls this only after sliced cleanup. Synchronous callers
+    /// explicitly drain the same cleanup before releasing their stack owner.
+    pub fn deinit(self: *Validation, backend: anytype) void {
+        self.job.deinit(backend.allocator);
+        if (self.latest) |directory| backend.retireCheckpointDirectory(directory);
+        backend.retireCheckpointDirectory(self.directory);
+        if (self.reservation) |*lease| lease.release();
+    }
+};
+
+test "dependency validation uses the borrowed clock for every phase" {
+    const Backend = @import("../lsm_backend.zig").Backend;
+    const Clock = struct {
+        var epoch: i96 = 0;
+        fn now(_: ?*anyopaque, _: std.Io.Clock) std.Io.Timestamp {
+            return .fromNanoseconds(epoch);
+        }
+    };
+    Clock.epoch = 0;
+    var vtable = std.testing.io.vtable.*;
+    vtable.now = Clock.now;
+    var io = std.testing.io;
+    io.vtable = &vtable;
+    const allocator = std.testing.allocator;
+    var backend = Backend.init(allocator, .{ .wal_enabled = false, .read_runtime = .{ .io = io } });
+    defer backend.close();
+    try std.testing.expect(backend.mu.tryLock());
+    defer backend.mu.unlock();
+    for (1..3) |id| try backend.runs.append(allocator, .{
+        .id = id,
+        .level = 0,
+        .size_bytes = 1,
+        .path = null,
+        .smallest_namespace_name = null,
+        .smallest_key = @constCast("a"),
+        .largest_namespace_name = null,
+        .largest_key = @constCast("a"),
+        .entry_count = 1,
+        .bloom_filter = null,
+        .state = .{},
+        .owns_metadata = false,
+    });
+    const directory = try backend.planningDirectory();
+    const handles = [_]Directory.Handle{ directory.at(0), directory.at(1) };
+    const plan = @import("compaction.zig").CompactionPlan{
+        .source_level = 0,
+        .source_start = 0,
+        .source_len = handles.len,
+        .target_start = handles.len,
+        .target_len = 0,
+        .output_level = 1,
+        .input_handles = &handles,
+    };
+    var validation = try Validation.init(&backend, plan);
+    defer validation.deinit(&backend);
+    _ = try validation.advanceBudgetedLocked(&backend, 1, 10);
+    try std.testing.expectEqual(@as(usize, 1), validation.job.index);
+    Clock.epoch = 10;
+    _ = try validation.advanceBudgetedLocked(&backend, 1, 10);
+    try std.testing.expectEqual(@as(usize, 1), validation.job.index);
+    for (0..32) |_| {
+        if (try validation.advanceBudgetedLocked(&backend, 1, 20) == .valid) break;
+    }
+    try std.testing.expectEqual(Validation.Result.valid, try validation.advanceBudgetedLocked(&backend, 1, 20));
+    try std.testing.expectEqual(handles.len, validation.job.index);
+}

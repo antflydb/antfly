@@ -1,4 +1,5 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Elastic-2.0
 //
 // Licensed under the Elastic License 2.0 (ELv2); you may not use this file
 // except in compliance with the Elastic License 2.0. You may obtain a copy of
@@ -252,7 +253,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_module = data_runtime_test_mod,
         .filters = selectTestFilters(b, &lib_data_runtime_default_filters),
         .test_runner = .{
-            .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"),
+            .path = b.path("pkg/antfly-embedded/src/test_runner.zig"),
             .mode = .simple,
         },
         // The broad macOS ReleaseFast runtime root has measured at 12.12 GiB.
@@ -264,7 +265,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .name = "data-runtime-implementation-tests",
         .root_module = options.data_implementation_module,
         .filters = lib_data_runtime_tests.object.filters,
-        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
         .max_rss = lib_data_runtime_tests.object.step.max_rss,
     });
     const run_lib_data_runtime_tests = @import("linked_tests.zig").runPair(b, lib_data_runtime_tests, implementation_tests);
@@ -274,7 +275,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .name = "data-private-initial-owner-predicate-tests",
         .root_module = options.data_implementation_module,
         .filters = &.{"ordinary unpublished placement does not require a private initial FK owner snapshot"},
-        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-data-private-initial-owner-predicate-test", "Verify hidden initial-FK owner preflight excludes ordinary unpublished placements")
         .dependOn(&addFilteredTestRunArtifact(b, private_initial_owner_predicate_tests).step);
@@ -410,7 +411,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             lib_data_storage_runtime_filters,
         ),
         .test_runner = .{
-            .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"),
+            .path = b.path("pkg/antfly-embedded/src/test_runner.zig"),
             .mode = .simple,
         },
     });

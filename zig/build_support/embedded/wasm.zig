@@ -1,0 +1,531 @@
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! The browser runtime owns one target/profile and never receives native modules.
+const std = @import("std");
+const storage_build = @import("storage.zig");
+const platform_build = @import("antfly_platform");
+const image_build = @import("../../lib/image/build_support.zig");
+const pdf_build = @import("../../lib/pdf/build_support.zig");
+const tokenizer_build = @import("../../lib/tokenizer/build_support.zig");
+const codegen = @import("../openapi.zig");
+const configureBrowserModule = @import("embedded.zig").configureBrowserModule;
+const addSnowballModule = @import("snowball.zig").addSnowballModule;
+
+pub const Result = struct {
+    artifact: *std.Build.Step.Compile,
+    install: []const *std.Build.Step,
+    smoke: *std.Build.Step.Run,
+};
+
+pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result {
+    // ReleaseSafe avoids LLVM inference miscompilation and V8's local-variable
+    // limit for unoptimized database batch functions.
+    const optimize: std.lang.Optimize = .safe;
+    const strip = b.option(bool, "wasm-strip", "Strip embedded WASM debug information") orelse false;
+    const wasm_target = b.resolveTargetQuery(.{
+        .cpu_arch = .wasm32,
+        .os_tag = .freestanding,
+        .cpu_features_add = std.Target.wasm.featureSet(&.{ .atomics, .bulk_memory, .simd128 }),
+    });
+    const build_options = storage_build.makeRootBuildOptions(b, false, false, false, false, false);
+    const json_mod = b.createModule(.{ .root_source_file = b.path("lib/json/src/mod.zig"), .target = wasm_target, .optimize = optimize });
+    const httpx_mod = b.createModule(.{ .root_source_file = b.path("lib/httpx/src/httpx.zig"), .target = wasm_target, .optimize = optimize });
+    httpx_mod.addImport("antfly-json", json_mod);
+    const api = codegen.createCommittedModules(b, .{
+        .root = b.path("pkg/antfly-embedded/src/openapi/generated"),
+        .client_root = b.path("pkg/antfly-client/src/openapi/generated"),
+        .server_root = b.path("pkg/antfly-server-api/src/openapi/generated"),
+        .target = wasm_target,
+        .optimize = optimize,
+        .json = json_mod,
+        .httpx = httpx_mod,
+    });
+    const wasm_protobuf_mod = b.dependency("protobuf", .{ .target = wasm_target, .optimize = optimize }).module("protobuf");
+    const wasm_handlebars_mod = b.dependency("handlebars", .{ .target = wasm_target, .optimize = optimize }).module("handlebars");
+    const wasm_platform_mod = platform_build.createModule(b, .{
+        .root_source_file = b.path("lib/platform/src/root.zig"),
+        .filesystem_capacity_source_file = b.path("lib/platform/src/filesystem_capacity.c"),
+        .target = wasm_target,
+        .optimize = optimize,
+        .link_libc = false,
+    });
+    const wasm_credentials_mod = b.createModule(.{
+        .root_source_file = b.path("lib/credentials/src/root.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+    });
+    const wasm_objectstore_mod = b.createModule(.{
+        .root_source_file = b.path("lib/objectstore/src/root.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+    });
+    const wasm_google_mod = b.createModule(.{
+        .root_source_file = b.path("lib/google/src/root.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+    });
+    const wasm_vector_mod = b.createModule(.{
+        .root_source_file = b.path("lib/vector/src/mod.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+    });
+    const wasm_hash_mod = b.createModule(.{
+        .root_source_file = b.path("lib/hash/src/mod.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+    });
+    const wasm_vectorindex_mod = b.createModule(.{
+        .root_source_file = b.path("lib/vectorindex/src/mod.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+    });
+    const wasm_bloom_mod = b.createModule(.{
+        .root_source_file = b.path("lib/bloom/src/mod.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+    });
+    const wasm_image_mod = image_build.createModule(b, b.path("lib/image"), wasm_target, optimize, wasm_hash_mod);
+    const wasm_pdf_standard_fonts_mod = @import("../antfly/fonts.zig").create(b, wasm_target, optimize);
+    const wasm_font_mod = b.createModule(.{
+        .root_source_file = b.path("lib/font/src/mod.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+    });
+    const wasm_pdf_mod = pdf_build.createModule(b, b.path("lib/pdf"), wasm_target, optimize, wasm_image_mod, wasm_hash_mod, wasm_font_mod, wasm_pdf_standard_fonts_mod, wasm_platform_mod);
+    const wasm_sentencepiece_proto_mod = tokenizer_build.createSentencePieceProtoModule(b, sentencepiece_proto_source, wasm_protobuf_mod);
+    wasm_google_mod.addImport("httpx", httpx_mod);
+    wasm_google_mod.addImport("antfly_credentials", wasm_credentials_mod);
+    wasm_google_mod.addImport("antfly_platform", wasm_platform_mod);
+    wasm_objectstore_mod.addImport("httpx", httpx_mod);
+    wasm_objectstore_mod.addImport("antfly_platform", wasm_platform_mod);
+    wasm_objectstore_mod.addImport("antfly_google", wasm_google_mod);
+    wasm_vector_mod.addImport("protobuf", wasm_protobuf_mod);
+    wasm_vectorindex_mod.addImport("antfly_vector", wasm_vector_mod);
+    wasm_vectorindex_mod.addImport("antfly_platform", wasm_platform_mod);
+    wasm_vectorindex_mod.addImport("antfly_hash", wasm_hash_mod);
+    const fst_mod = b.createModule(.{ .root_source_file = b.path("lib/fst/src/mod.zig"), .target = wasm_target, .optimize = optimize });
+    const regex_mod = b.createModule(.{ .root_source_file = b.path("lib/regex/src/mod.zig"), .target = wasm_target, .optimize = optimize });
+    regex_mod.addImport("antfly_fst", fst_mod);
+    regex_mod.addImport("antfly_platform", wasm_platform_mod);
+    const chunking_mod = b.createModule(.{ .root_source_file = b.path("lib/chunking/src/mod.zig"), .target = wasm_target, .optimize = optimize });
+    chunking_mod.addImport("antfly-json", json_mod);
+    chunking_mod.addImport("antfly_chunking_api_openapi", api.chunking_api);
+    chunking_mod.addImport("antfly_chunking_openapi", api.chunking);
+    const reranking_mod = b.createModule(.{ .root_source_file = b.path("lib/reranking/src/mod.zig"), .target = wasm_target, .optimize = optimize });
+    reranking_mod.addImport("antfly-json", json_mod);
+    reranking_mod.addImport("antfly_reranking_openapi", api.reranking);
+    const embedded_wasm_deps = .{
+        build_options,
+        storage_build.createLiteOptions(b, false),
+        json_mod,
+        api.public,
+        api.query,
+        api.indexes,
+        api.sort,
+        api.metadata,
+        api.schema,
+        reranking_mod,
+        wasm_objectstore_mod,
+        httpx_mod,
+        wasm_platform_mod,
+        chunking_mod,
+        wasm_bloom_mod,
+        wasm_vector_mod,
+        wasm_vectorindex_mod,
+        wasm_hash_mod,
+        fst_mod,
+        regex_mod,
+        wasm_image_mod,
+        wasm_font_mod,
+        wasm_pdf_mod,
+        wasm_handlebars_mod,
+    };
+
+    // SQL catalog filters share coercion and compiler contracts even when
+    // the browser does not execute a native SQL cursor. Keep this dependency
+    // in the browser profile rather than borrowing the native module.
+    const wasm_sql_parser_mod = b.createModule(.{
+        .root_source_file = b.path("lib/sql/root.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+    });
+    const embedded_support_wasm_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/embedded_root.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+    });
+    const wasm_storage_boundary = @import("storage_boundary.zig").create(b, wasm_target, optimize);
+    @call(.auto, configureBrowserModule, .{ b, wasm_storage_boundary, embedded_support_wasm_mod } ++ embedded_wasm_deps ++ .{addSnowballModule});
+    embedded_support_wasm_mod.addImport("sql_parser", wasm_sql_parser_mod);
+    const wasm_cancellation_mod = b.createModule(.{
+        .root_source_file = b.path("lib/runtime/src/cancellation.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+    });
+    embedded_support_wasm_mod.addImport("antfly_cancellation", wasm_cancellation_mod);
+    wasm_credentials_mod.addImport("antfly_cancellation", wasm_cancellation_mod);
+    wasm_credentials_mod.addImport("antfly_platform", wasm_platform_mod);
+    const wasm_cache_budget_mod = b.createModule(.{
+        .root_source_file = b.path("lib/runtime/src/cache_budget.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+    });
+    wasm_cache_budget_mod.addImport("antfly_platform", wasm_platform_mod);
+    embedded_support_wasm_mod.addImport("antfly_cache_budget", wasm_cache_budget_mod);
+    const wasm_runtime_abi_mod = b.createModule(.{
+        .root_source_file = b.path("lib/runtime/src/root.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+    });
+    wasm_runtime_abi_mod.addImport("httpx", httpx_mod);
+    wasm_runtime_abi_mod.addImport("antfly_platform", wasm_platform_mod);
+    embedded_support_wasm_mod.addImport("antfly_runtime_abi", wasm_runtime_abi_mod);
+    const wasm_runtime_fs_mod = b.createModule(.{
+        .root_source_file = b.path("lib/runtime/src/fs.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+    });
+    wasm_runtime_fs_mod.addImport("antfly_platform", wasm_platform_mod);
+    embedded_support_wasm_mod.addImport("antfly_runtime_fs", wasm_runtime_fs_mod);
+    embedded_support_wasm_mod.addImport("antfly_public_limits", b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/api/public_limits.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+    }));
+    embedded_support_wasm_mod.addImport("antfly_template_content", b.createModule(.{
+        .root_source_file = b.path("lib/template/src/content_part.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+    }));
+    embedded_support_wasm_mod.addImport("antfly_sparse_embedding", b.createModule(.{
+        .root_source_file = b.path("pkg/inference/src/host/sparse_embedding.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+    }));
+    const wasm_matcher_mod = b.createModule(.{
+        .root_source_file = b.path("lib/matcher/src/mod.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+    });
+    const wasm_resolver_mod = b.createModule(.{
+        .root_source_file = b.path("lib/resolver/src/mod.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+    });
+    wasm_resolver_mod.addImport("antfly_matcher", wasm_matcher_mod);
+    embedded_support_wasm_mod.addImport("antfly_resolver", wasm_resolver_mod);
+    embedded_support_wasm_mod.addImport("antfly_matcher", wasm_matcher_mod);
+    const wasm_data_uri_mod = b.createModule(.{
+        .root_source_file = b.path("lib/scraping/src/data_uri.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+    });
+    embedded_support_wasm_mod.addImport("antfly_data_uri", wasm_data_uri_mod);
+    const inference_work_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/inference/src/host/work.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+    });
+    inference_work_mod.addImport("antfly_data_uri", wasm_data_uri_mod);
+    inference_work_mod.addImport("antfly_image", wasm_image_mod);
+    embedded_support_wasm_mod.addImport("antfly_inference_work", inference_work_mod);
+    const inference_remote_capabilities_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/inference/remote_capabilities.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+    });
+    inference_remote_capabilities_mod.addImport("antfly_platform", wasm_platform_mod);
+    inference_remote_capabilities_mod.addImport("httpx", httpx_mod);
+    inference_remote_capabilities_mod.addImport("antfly_inference_work", inference_work_mod);
+    inference_remote_capabilities_mod.addImport("antfly_cancellation", wasm_cancellation_mod);
+    embedded_support_wasm_mod.addImport("antfly_inference_remote_capabilities", inference_remote_capabilities_mod);
+    const inference_execution_control_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/inference/src/host/execution_control.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+    });
+    inference_execution_control_mod.addImport("antfly_platform", wasm_platform_mod);
+    inference_execution_control_mod.addImport("antfly_cancellation", wasm_cancellation_mod);
+    const inference_execution_context_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/inference/execution_context.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+    });
+    inference_execution_context_mod.addImport("antfly_platform", wasm_platform_mod);
+    inference_execution_context_mod.addImport("httpx", httpx_mod);
+    inference_execution_context_mod.addImport("antfly_inference_remote_capabilities", inference_remote_capabilities_mod);
+    inference_execution_context_mod.addImport("antfly_cancellation", wasm_cancellation_mod);
+    inference_execution_context_mod.addImport("antfly_inference_execution_control", inference_execution_control_mod);
+    embedded_support_wasm_mod.addImport("antfly_inference_execution_context", inference_execution_context_mod);
+    embedded_support_wasm_mod.addImport("antfly_reader_config", b.createModule(.{
+        .root_source_file = b.path("lib/readers/src/config.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+    }));
+
+    const embedded_wasm_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/engine/root.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+    });
+    embedded_wasm_mod.addImport("embedded_support", embedded_support_wasm_mod);
+
+    const embedded_db_wasm_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/engine/db.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+    });
+    embedded_db_wasm_mod.addImport("embedded_support", embedded_support_wasm_mod);
+
+    const embedded_api_wasm_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/engine/api.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+    });
+    embedded_api_wasm_mod.addImport("embedded_support", embedded_support_wasm_mod);
+    embedded_api_wasm_mod.addImport("embedded_db_surface", embedded_db_wasm_mod);
+    embedded_wasm_mod.addImport("embedded_db_surface", embedded_db_wasm_mod);
+    embedded_wasm_mod.addImport("embedded_api_surface", embedded_api_wasm_mod);
+
+    const antfly_embedded_db_pkg_wasm_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/db.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+    });
+    antfly_embedded_db_pkg_wasm_mod.addImport("embedded_db_surface", embedded_db_wasm_mod);
+
+    const antfly_embedded_api_pkg_wasm_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/api.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+    });
+    antfly_embedded_api_pkg_wasm_mod.addImport("embedded_api_surface", embedded_api_wasm_mod);
+
+    const antfly_embedded_pkg_wasm_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/root.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+    });
+    antfly_embedded_pkg_wasm_mod.addImport("embedded_surface", embedded_wasm_mod);
+
+    // --- Inference WASM modules for unified antfly.wasm ---
+    const inference_wasm_build_options = b.addOptions();
+    inference_wasm_build_options.addOption(bool, "enable_onnx", false);
+    inference_wasm_build_options.addOption(bool, "enable_pjrt", false);
+    inference_wasm_build_options.addOption(bool, "enable_cuda", false);
+    inference_wasm_build_options.addOption([]const u8, "cuda_artifacts", "portable");
+    inference_wasm_build_options.addOption(bool, "enable_metal", false);
+    inference_wasm_build_options.addOption(bool, "enable_native", false);
+    inference_wasm_build_options.addOption(bool, "enable_system_blas", false);
+    inference_wasm_build_options.addOption(bool, "enable_wasm", true);
+    inference_wasm_build_options.addOption(bool, "enable_webgpu", true);
+    inference_wasm_build_options.addOption(bool, "link_libc", false);
+    inference_wasm_build_options.addOption(bool, "skip_openapi", false);
+    inference_wasm_build_options.addOption([]const u8, "wasm_memory_model", "wasm32");
+    const inference_wasm_build_options_mod = inference_wasm_build_options.createModule();
+
+    const wasm_inference_jinja_mod = b.createModule(.{
+        .root_source_file = b.path("lib/jinja/src/jinja.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+        .single_threaded = true,
+    });
+    const wasm_inference_tokenizer_mod = b.createModule(.{
+        .root_source_file = b.path("lib/tokenizer/src/tokenizer.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+    });
+    wasm_inference_tokenizer_mod.addImport("sentencepiece_proto", wasm_sentencepiece_proto_mod);
+    wasm_inference_tokenizer_mod.addImport("antfly_platform", wasm_platform_mod);
+    const wasm_inference_hf_tokenizer_mod = b.createModule(.{
+        .root_source_file = b.path("lib/tokenizer/src/hf_root.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+    });
+    wasm_inference_hf_tokenizer_mod.addImport("inference_tokenizer", wasm_inference_tokenizer_mod);
+    wasm_inference_hf_tokenizer_mod.addImport("antfly_platform", wasm_platform_mod);
+    const wasm_inference_linalg_mod = b.createModule(.{
+        .root_source_file = b.path("lib/linalg/src/mod.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+    });
+    const wasm_inference_ml_mod = b.createModule(.{
+        .root_source_file = b.path("lib/ml/src/root.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+        .single_threaded = true,
+    });
+    wasm_inference_ml_mod.addImport("antfly_platform", wasm_platform_mod);
+    const wasm_onnx = @import("onnx_graph").support.create(b, .{
+        .root = b.path("lib/onnx"),
+        .target = wasm_target,
+        .optimize = optimize,
+        .single_threaded = true,
+        .protobuf = wasm_protobuf_mod,
+        .ml = wasm_inference_ml_mod,
+    });
+    const wasm_inference_audio_mod = b.createModule(.{
+        .root_source_file = b.path("lib/audio/src/mod.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+    });
+    const inference_wasm_inference_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/inference/src/wasm_entry.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+    });
+    inference_wasm_inference_mod.addImport("build_options", inference_wasm_build_options_mod);
+    inference_wasm_inference_mod.addImport("inference_audio", wasm_inference_audio_mod);
+    inference_wasm_inference_mod.addImport("inference_linalg", wasm_inference_linalg_mod);
+    inference_wasm_inference_mod.addImport("inference_tokenizer", wasm_inference_tokenizer_mod);
+    inference_wasm_inference_mod.addImport("inference_hf_tokenizer", wasm_inference_hf_tokenizer_mod);
+    inference_wasm_inference_mod.addImport("antfly_image", wasm_image_mod);
+    inference_wasm_inference_mod.addImport("antfly_platform", wasm_platform_mod);
+    inference_wasm_inference_mod.addImport("jinja", wasm_inference_jinja_mod);
+    inference_wasm_inference_mod.addImport("ml", wasm_inference_ml_mod);
+    inference_wasm_inference_mod.addImport("onnx_graph", wasm_onnx.graph);
+    inference_wasm_inference_mod.addImport("onnx_data", wasm_onnx.data);
+
+    const antfly_wasm_mod = b.createModule(.{
+        .root_source_file = b.path("examples/antfly_wasm.zig"),
+        .strip = strip,
+        .target = wasm_target,
+        .optimize = optimize,
+    });
+    antfly_wasm_mod.addImport("antfly_embedded_db", antfly_embedded_db_pkg_wasm_mod);
+    antfly_wasm_mod.addImport("antfly_embedded_api", antfly_embedded_api_pkg_wasm_mod);
+    antfly_wasm_mod.addImport("inference_runtime", inference_wasm_inference_mod);
+
+    const wasm_boundary = @import("embedded_boundary.zig").add(b, antfly_wasm_mod);
+    b.step("embedded-wasm-module-boundary-check", "Resolve the browser engine and inference module boundary").dependOn(&wasm_boundary.step);
+
+    antfly_wasm_mod.single_threaded = true;
+    const antfly_wasm = b.addExecutable(.{
+        .name = "antfly_wasm",
+        .root_module = antfly_wasm_mod,
+        // Cold ReleaseSafe LLVM codegen measured 18.45 GB. Reserve 20 GiB
+        // with headroom so full-suite admission does not overlap it with
+        // the large native engine archives beyond the build memory budget.
+        .max_rss = 20 * 1024 * 1024 * 1024,
+    });
+    antfly_wasm.entry = .disabled;
+    antfly_wasm.rdynamic = true;
+    antfly_wasm.export_memory = true;
+    const install_antfly_wasm = b.addInstallArtifact(antfly_wasm, .{
+        .dest_dir = .{ .override = .prefix },
+        .dest_sub_path = "antfly-wasm/antfly.wasm",
+    });
+    const install_antfly_wasm_smoke_run = b.addInstallFile(
+        b.path("pkg/antfly-embedded/wasm_smoke_run.mjs"),
+        "antfly-wasm/run.mjs",
+    );
+    const install_antfly_wasm_client = b.addInstallFile(
+        b.path("pkg/antfly-embedded/wasm_client.mjs"),
+        "antfly-wasm/antfly_embedded_wasm_client.mjs",
+    );
+    const install_antfly_wasm_browser = b.addInstallFile(
+        b.path("pkg/antfly-embedded/wasm_smoke_browser.mjs"),
+        "antfly-wasm/browser.mjs",
+    );
+    const install_antfly_wasm_index = b.addInstallFile(
+        b.path("pkg/antfly-embedded/wasm_smoke_index.html"),
+        "antfly-wasm/index.html",
+    );
+    const install_antfly_wasm_readme = b.addInstallFile(
+        b.path("pkg/antfly-embedded/WASM.md"),
+        "antfly-wasm/README.md",
+    );
+
+    const install_antfly_wasm_webgpu_ops = b.addInstallFile(
+        b.path("pkg/antfly-embedded/webgpu_ops.mjs"),
+        "antfly-wasm/webgpu_ops.mjs",
+    );
+    const shader_names = [_][]const u8{
+        "attention",            "causal_attention",     "cross_attention",
+        "gqa_cached_attention", "gqa_causal_attention", "layer_norm",
+        "matmul",               "matmul_transb",        "matmul_transb_q4_0",
+        "matmul_transb_q4_1",   "matmul_transb_q5_0",   "matmul_transb_q5_1",
+        "matmul_transb_q8_0",   "matmul_transb_q8_1",   "matmul_transb_iq4_nl",
+        "matmul_transb_iq4_xs", "matmul_transb_q2_k",   "matmul_transb_q3_k",
+        "matmul_transb_q4_k",   "matmul_transb_q5_k",   "matmul_transb_q6_k",
+        "matmul_transb_q8_k",   "rms_norm",
+    };
+    var install_shader_steps: [shader_names.len]*std.Build.Step = undefined;
+    for (shader_names, 0..) |name, i| {
+        const install_shader = b.addInstallFile(
+            b.path(b.fmt("pkg/antfly-embedded/shaders/{s}.wgsl", .{name})),
+            b.fmt("antfly-wasm/shaders/{s}.wgsl", .{name}),
+        );
+        install_shader_steps[i] = &install_shader.step;
+    }
+
+    const atomic_fixture = b.addExecutable(.{
+        .name = "platform-atomic-wasm-fixture",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("lib/platform/tests/atomic_wasm_fixture.zig"),
+            .target = wasm_target,
+            .optimize = optimize,
+            .single_threaded = true,
+            .imports = &.{ .{ .name = "platform_time", .module = b.createModule(.{
+                .root_source_file = b.path("lib/platform/src/time.zig"),
+                .target = wasm_target,
+                .optimize = optimize,
+            }) }, .{ .name = "platform_entropy", .module = b.createModule(.{
+                .root_source_file = b.path("lib/platform/src/entropy.zig"),
+                .target = wasm_target,
+                .optimize = optimize,
+            }) }, .{ .name = "vector", .module = b.createModule(.{
+                .root_source_file = b.path("lib/vector/src/vector.zig"),
+                .target = wasm_target,
+                .optimize = optimize,
+            }) }, .{ .name = "platform_atomic", .module = b.createModule(.{
+                .root_source_file = b.path("lib/platform/src/atomic.zig"),
+                .target = wasm_target,
+                .optimize = optimize,
+                .single_threaded = true,
+            }) } },
+        }),
+    });
+    atomic_fixture.entry = .disabled;
+    atomic_fixture.rdynamic = true;
+    atomic_fixture.export_memory = true;
+    const run_atomic_fixture = b.addSystemCommand(&.{"node"});
+    run_atomic_fixture.addFileArg2(b.path("lib/platform/tests/atomic_wasm_test.mjs"), .{ .make_absolute = true });
+    run_atomic_fixture.addFileArg2(atomic_fixture.getEmittedBin(), .{ .make_absolute = true });
+
+    const run_antfly_wasm_smoke = b.addSystemCommand(&.{
+        "node",
+    });
+    run_antfly_wasm_smoke.addFileArg2(b.graph.path(.install_prefix, "antfly-wasm/run.mjs"), .{ .make_absolute = true });
+    run_antfly_wasm_smoke.step.dependOn(&run_atomic_fixture.step);
+    return .{
+        .artifact = antfly_wasm,
+        .install = std.mem.concat(b.allocator, *std.Build.Step, &.{
+            &.{
+                @import("../../lib/product_licenses/build.zig").installApache(b, b.path(".."), "antfly-wasm", "antfly-wasm"),
+                &install_antfly_wasm.step,
+                &install_antfly_wasm_smoke_run.step,
+                &install_antfly_wasm_client.step,
+                &install_antfly_wasm_browser.step,
+                &install_antfly_wasm_index.step,
+                &install_antfly_wasm_readme.step,
+                &install_antfly_wasm_webgpu_ops.step,
+            },
+            &install_shader_steps,
+        }) catch @panic("OOM"),
+        .smoke = run_antfly_wasm_smoke,
+    };
+}

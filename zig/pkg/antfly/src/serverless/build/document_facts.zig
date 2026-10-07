@@ -1,4 +1,5 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Elastic-2.0
 //
 // Licensed under the Elastic License 2.0 (ELv2); you may not use this file
 // except in compliance with the Elastic License 2.0. You may obtain a copy of
@@ -599,7 +600,7 @@ test "serverless document facts allocation failures preserve source and release 
             try std.testing.expect((try lookup(alloc, store, updated, "a")) == null);
         }
     };
-    try std.testing.checkAllAllocationFailures(a, Exercise.run, .{ memory.store(), source });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Exercise.run, .{ memory.store(), source });
 }
 
 test "serverless document facts pending cursors reject wrong-stage future-source and forged ordering entries" {

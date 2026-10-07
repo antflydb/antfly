@@ -1,4 +1,5 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Elastic-2.0
 //
 // Licensed under the Elastic License 2.0 (ELv2); you may not use this file
 // except in compliance with the Elastic License 2.0. You may obtain a copy of
@@ -6,10 +7,10 @@
 //
 //     https://www.antfly.io/licensing/ELv2-license
 //
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the Elastic License 2.0 is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See
-// the Elastic License 2.0 for the specific language governing permissions and
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
 //! Minimal, storage-independent graph metric configuration parsing for the
@@ -227,7 +228,7 @@ test "serverless graph metric configs are deterministic and honor disabled metri
             defer freeIndexSpecs(alloc, parsed_specs);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, AllocationRunner.run, .{
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, AllocationRunner.run, .{
         "{\"graph\":{\"type\":\"graph\",\"metrics\":{\"rank\":{\"kind\":\"pagerank\",\"edge_filter\":{\"types\":[\"cites\",\"mentions\"]}}}}}",
     });
 }

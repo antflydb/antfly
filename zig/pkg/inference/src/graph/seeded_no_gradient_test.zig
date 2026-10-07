@@ -1,5 +1,18 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 const std = @import("std");
 const ml = @import("ml").graph;
 const seeded = @import("seeded_training.zig");
@@ -57,7 +70,7 @@ test "seeded no-gradient sessions are opt in and preserve strict parameter valid
     for ([_]seeded.Execution{ .native, .resident_metal }) |execution| {
         try std.testing.expectError(error.DisconnectedGradientParameter, seeded.Session.init(std.testing.allocator, &graph.graph, &.{graph.seed}, &.{graph.dormant}, .{ .execution = execution }));
         try std.testing.expectError(error.DisconnectedGradientParameter, seeded.Session.init(std.testing.allocator, &graph.graph, &.{graph.seed}, &.{graph.dormant}, .{ .execution = execution, .allow_no_gradients = true, .gradient = .{ .require_all_gradients = true } }));
-        try std.testing.checkAllAllocationFailures(std.testing.allocator, construction, .{execution});
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, construction, .{execution});
     }
 }
 
@@ -145,7 +158,7 @@ fn cpu(a: Allocator) !void {
 }
 
 test "seeded no-gradient CPU direct and staged tapes consume ownership on success cancellation identity failure and OOM" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, cpu, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, cpu, .{});
 }
 
 test "seeded no-gradient Metal direct and staged tapes preserve resident ownership and finite cotangent checks" {
