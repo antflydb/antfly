@@ -174,6 +174,10 @@ fn openImmutableSource(ptr: *anyopaque, allocator: Allocator, path: []const u8) 
             const state: *@This() = @ptrCast(@alignCast(ptr_));
             try state.snapshot.readIndexValueInto(state.value, offset, out);
         }
+        fn authenticate(ptr_: *anyopaque, offset: u64, length: u64, within: usize, out: []u8, expected: ?u32) !void {
+            const state: *@This() = @ptrCast(@alignCast(ptr_));
+            return state.snapshot.readAuthenticatedIndexValue(state.value, offset, length, within, out, expected);
+        }
         fn checksum(ptr_: *anyopaque, offset: u64, length: u64) !u32 {
             const state: *@This() = @ptrCast(@alignCast(ptr_));
             return state.snapshot.checksumIndexValue(state.value, offset, length);
@@ -192,7 +196,7 @@ fn openImmutableSource(ptr: *anyopaque, allocator: Allocator, path: []const u8) 
     errdefer snapshot.abort();
     const value = try snapshot.openIndexValue(allocator, path);
     state.* = .{ .allocator = allocator, .snapshot = snapshot, .value = value };
-    return .{ .ranges = .{ .ptr = state, .length = value.length, .read_into = State.read, .close = State.close, .checksum = State.checksum } };
+    return .{ .ranges = .{ .ptr = state, .length = value.length, .read_into = State.read, .close = State.close, .checksum = State.checksum, .read_authenticated = State.authenticate } };
 }
 
 // Long-lived sources own their I/O lifetime and lease only immutable roots.

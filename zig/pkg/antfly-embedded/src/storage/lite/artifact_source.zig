@@ -225,13 +225,13 @@ pub const Registry = struct {
             .marker_path = marker_path,
             .marker = marker,
         };
-        state.cache = try @import("../../segment_source.zig").ConcurrentBlockCache.init(a, .{ .ranges = .{ .ptr = state, .length = state.value.length, .read_into = State.readUncached, .checksum = State.checksum, .close = State.closeUncached, .resource_manager = owner.resource_manager } }, 160 * 1024);
+        state.cache = try @import("../../segment_source.zig").ConcurrentBlockCache.init(a, .{ .ranges = .{ .ptr = state, .length = state.value.length, .read_into = State.readUncached, .checksum = State.checksum, .visit_range = State.visit, .close = State.closeUncached, .resource_manager = owner.resource_manager } }, 160 * 1024);
         self.mutex.lockUncancelable(runtime);
         state.next = self.first;
         self.first = state;
         _ = self.references.fetchAdd(1, .monotonic);
         self.mutex.unlock(runtime);
-        return .{ .ranges = .{ .ptr = state, .length = state.value.length, .read_into = State.read, .checksum = State.checksum, .close = State.close, .retained_bytes = State.retainedBytes, .resource_manager = owner.resource_manager } };
+        return .{ .ranges = .{ .ptr = state, .length = state.value.length, .read_into = State.read, .checksum = State.checksum, .read_authenticated = State.authenticate, .close = State.close, .retained_bytes = State.retainedBytes, .resource_manager = owner.resource_manager } };
     }
 };
 
@@ -289,6 +289,16 @@ const State = struct {
     fn retainedBytes(ptr: *anyopaque) usize {
         const self: *State = @ptrCast(@alignCast(ptr));
         return self.cache.?.retainedBytes();
+    }
+
+    fn visit(ptr: *anyopaque, offset: u64, length: u64, context: *anyopaque, visitor: *const fn (*anyopaque, u64, []const u8) anyerror!void) !void {
+        const self: *State = @ptrCast(@alignCast(ptr));
+        return self.reader.visitIndexValue(self.value, offset, length, self.checkpoint, context, visitor);
+    }
+
+    fn authenticate(ptr: *anyopaque, offset: u64, length: u64, within: usize, out: []u8, expected: ?u32) !void {
+        const self: *State = @ptrCast(@alignCast(ptr));
+        return self.cache.?.readAuthenticated(offset, length, within, out, expected);
     }
 
     fn checksum(ptr: *anyopaque, offset: u64, length: u64) !u32 {

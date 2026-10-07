@@ -3155,6 +3155,7 @@ fn writeMergedStoredFields(alloc: Allocator, sink: *SegmentSink, inputs: []const
     var identity_scratch = SegmentReadScratch.init(alloc, 64 * 1024);
     defer identity_scratch.deinit();
     const id_bytes_start = sink.len();
+    var copy_locations: [stored_fields_block_doc_target]SegmentReader.V4StoredDocLocation = undefined;
     for (inputs) |input| {
         for (0..input.reader.doc_count) |doc_id_usize| {
             const doc_id: u32 = @intCast(doc_id_usize);
@@ -3186,12 +3187,12 @@ fn writeMergedStoredFields(alloc: Allocator, sink: *SegmentSink, inputs: []const
 
             // Flush a partial prefix before an intact source block, so one
             // damaged block does not force every subsequent block to decode.
-            if (try copyableStoredBlockDocs(input, doc_id)) |copied_docs| {
+            if (try copyableStoredBlockDocsWithMetadata(input, doc_id, &copy_locations)) |copied_docs| {
                 if (chunk.items.len != 0) {
                     try flushMergedStoredBlock(alloc, sink, &chunk, block_offsets_start, block_checksums_start, data_start, block_idx);
                     block_idx += 1;
                 }
-                const copied = (try copyMergedStoredBlockIfPossible(sink, input, doc_id, block_idx, &table, block_offsets_start, block_checksums_start, data_start)) orelse return error.InvalidSegment;
+                const copied = try copyMergedStoredBlock(sink, input, copy_locations[0..copied_docs], block_idx, &table, block_offsets_start, block_checksums_start, data_start);
                 if (copied != copied_docs) return error.InvalidSegment;
                 doc_id_usize += copied_docs;
                 block_idx += 1;
@@ -3226,7 +3227,11 @@ fn writeMergedStoredFields(alloc: Allocator, sink: *SegmentSink, inputs: []const
 }
 
 fn copyableSortedStoredBlockDocs(inputs: []const MergeInput, records: SortedRecords, position: usize, ref: MergeDocRef) !?u32 {
-    const count = (try copyableStoredBlockDocs(inputs[ref.input_idx], ref.doc_id)) orelse return null;
+    return copyableSortedStoredBlockDocsWithMetadata(inputs, records, position, ref, null);
+}
+
+fn copyableSortedStoredBlockDocsWithMetadata(inputs: []const MergeInput, records: SortedRecords, position: usize, ref: MergeDocRef, locations: ?[]SegmentReader.V4StoredDocLocation) !?u32 {
+    const count = (try copyableStoredBlockDocsWithMetadata(inputs[ref.input_idx], ref.doc_id, locations)) orelse return null;
     if (count > records.len - position) return null;
     var buffer: [64]SortedMergeDoc = undefined;
     var offset: usize = 0;
@@ -3297,16 +3302,17 @@ fn writeMergedStoredFieldsInOrderWithReuse(
     var stored_cursor = SegmentReader.StoredDocBlockCache.init(alloc, 1024 * 1024);
     defer stored_cursor.deinit();
 
+    var copy_locations: [stored_fields_block_doc_target]SegmentReader.V4StoredDocLocation = undefined;
     var record_iterator_2 = records.iterator();
     while (try record_iterator_2.next()) |record| {
         if (reuse_blocks) {
-            if (try copyableSortedStoredBlockDocs(inputs, records, record_iterator_2.position - 1, record.ref)) |count| {
+            if (try copyableSortedStoredBlockDocsWithMetadata(inputs, records, record_iterator_2.position - 1, record.ref, &copy_locations)) |count| {
                 if (chunk.items.len != 0) {
                     try flushMergedStoredBlock(alloc, sink, &chunk, block_offsets_start, block_checksums_start, data_start, block_idx);
                     block_idx += 1;
                 }
                 docs_in_block = 0;
-                const copied = (try copyMergedStoredBlockIfPossible(sink, inputs[record.ref.input_idx], record.ref.doc_id, block_idx, &table, block_offsets_start, block_checksums_start, data_start)) orelse return error.InvalidSegment;
+                const copied = try copyMergedStoredBlock(sink, inputs[record.ref.input_idx], copy_locations[0..count], block_idx, &table, block_offsets_start, block_checksums_start, data_start);
                 if (copied != count) return error.InvalidSegment;
                 record_iterator_2.position += count - 1;
                 record_iterator_2.used = 0;
@@ -3441,11 +3447,25 @@ fn copyMergedStoredBlockIfPossible(
     block_checksums_start: usize,
     data_start: usize,
 ) !?u32 {
-    const copied_docs = (try copyableStoredBlockDocs(input, start_doc_id)) orelse return null;
-    const reader = input.reader;
-    const first = (try reader.storedLocationMetadata(start_doc_id)) orelse return null;
+    var locations: [stored_fields_block_doc_target]SegmentReader.V4StoredDocLocation = undefined;
+    const count = (try copyableStoredBlockDocsWithMetadata(input, start_doc_id, &locations)) orelse return null;
+    return try copyMergedStoredBlock(sink, input, locations[0..count], out_block_idx, table, block_offsets_start, block_checksums_start, data_start);
+}
 
-    if (first.block_start > first.block_end or first.block_end > reader.source().len()) return null;
+fn copyMergedStoredBlock(
+    sink: *SegmentSink,
+    input: MergeInput,
+    locations: []const SegmentReader.V4StoredDocLocation,
+    out_block_idx: u32,
+    table: *StoredTableOutput,
+    block_offsets_start: usize,
+    block_checksums_start: usize,
+    data_start: usize,
+) !u32 {
+    const reader = input.reader;
+    const first = locations[0];
+
+    if (first.block_start > first.block_end or first.block_end > reader.source().len()) return error.InvalidSegment;
 
     const block_checksum = if (reader.native != null) blk: {
         var scratch: [8192]u8 = undefined;
@@ -3477,16 +3497,18 @@ fn copyMergedStoredBlockIfPossible(
     const block_end_offset: u64 = @intCast(sink.len() - data_start);
     try sink.writeAt(block_offsets_start + @as(usize, out_block_idx) * 8, &@as([8]u8, @bitCast(@as(u64, block_end_offset))));
 
-    var i: u32 = 0;
-    while (i < copied_docs) : (i += 1) {
-        const loc = (try reader.storedLocationMetadata(start_doc_id + i)) orelse return null;
+    for (locations) |loc| {
         try table.append(sink, loc.id_length, out_block_idx, @intCast(loc.doc_offset), loc.raw_len);
     }
 
-    return copied_docs;
+    return @intCast(locations.len);
 }
 
 fn copyableStoredBlockDocs(input: MergeInput, start_doc_id: u32) !?u32 {
+    return copyableStoredBlockDocsWithMetadata(input, start_doc_id, null);
+}
+
+fn copyableStoredBlockDocsWithMetadata(input: MergeInput, start_doc_id: u32, locations: ?[]SegmentReader.V4StoredDocLocation) !?u32 {
     const reader = input.reader;
     if (reader.storedMetadata()[0] != stored_fields_version_block_compressed) return null;
     const first = (try reader.storedLocationMetadata(start_doc_id)) orelse return null;
@@ -3500,6 +3522,8 @@ fn copyableStoredBlockDocs(input: MergeInput, start_doc_id: u32) !?u32 {
         if (loc.block_idx != first.block_idx) break;
         if (input.isDeleted(doc_id)) return null;
         if (loc.block_start != first.block_start or loc.block_end != first.block_end) return null;
+        if (count >= stored_fields_block_doc_target) return null;
+        if (locations) |out| out[count] = loc;
         count += 1;
         raw_bytes +|= 4 +| @as(usize, loc.raw_len);
     }
@@ -9140,4 +9164,126 @@ test "stored block eligibility is local to deletions and preserves live order" {
             }
         }
     }
+}
+
+test "fused authentication shares native cached reads without duplicate slabs" {
+    const a = std.testing.allocator;
+    const native = @import("storage/lite/native.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/review-crc.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    var file = try native.NativeFile.createWithIo(a, std.testing.io, path, .{ .no_sync = true });
+    defer file.close();
+    const payload = try a.alloc(u8, integrity.page_size * 2 + 8);
+    defer a.free(payload);
+    @memset(payload[0 .. integrity.page_size * 2], 7);
+    for (0..2) |i| std.mem.writeInt(u32, payload[integrity.page_size * 2 + i * 4 ..][0..4], Crc32.hash(payload[i * integrity.page_size ..][0..integrity.page_size]), .big);
+    try file.putIndexCatalogRecord("/segment", payload);
+    file.page_cache_enabled.store(false, .monotonic);
+    const checkpoint = file.activeCheckpoint();
+    var value = try file.openIndexValue(a, "/segment", checkpoint);
+    defer value.deinit(a);
+    const Backend = struct {
+        file: *native.NativeFile,
+        value: native.NativeFile.IndexValue,
+        checkpoint: native.CheckpointSlot,
+        fn read(raw: *anyopaque, offset: u64, out: []u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.file.readIndexValueInto(self.value, offset, out, self.checkpoint);
+        }
+        fn checksum(raw: *anyopaque, offset: u64, length: u64) !u32 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return self.file.checksumIndexValue(self.value, offset, length, self.checkpoint);
+        }
+        fn visit(raw: *anyopaque, offset: u64, length: u64, context: *anyopaque, visitor: *const fn (*anyopaque, u64, []const u8) anyerror!void) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return self.file.visitIndexValue(self.value, offset, length, self.checkpoint, context, visitor);
+        }
+        fn close(_: *anyopaque) void {}
+    };
+    var state = Backend{ .file = &file, .value = value, .checkpoint = checkpoint };
+    const backing = SegmentSource{ .ranges = .{ .ptr = &state, .length = payload.len, .read_into = Backend.read, .checksum = Backend.checksum, .visit_range = Backend.visit, .close = Backend.close } };
+    const directory = integrity.Directory{ .offset = integrity.page_size * 2, .length = 8, .checksum = Crc32.hash(payload[integrity.page_size * 2 ..]) };
+    const output = try a.alloc(u8, integrity.page_size);
+    defer a.free(output);
+    for ([_]usize{ 8, integrity.page_size }) |length| {
+        var baseline_reads: u64 = 0;
+        for ([_]bool{ false, true }) |shortcut| {
+            var cache = try @import("segment_source.zig").ConcurrentBlockCache.init(a, backing, 160 * 1024);
+            defer cache.deinit();
+            var source = cache.borrowedSource();
+            if (!shortcut) source.ranges.read_authenticated = null;
+            const paged = try integrity.PagedSource.init(a, source, directory);
+            defer paged.deinit();
+            const before = file.test_page_reads.load(.monotonic);
+            try paged.source().readInto(0, output[0..length]);
+            try std.testing.expectEqualSlices(u8, payload[0..length], output[0..length]);
+            const cold = file.test_page_reads.load(.monotonic) - before;
+            const warm_start = file.test_page_reads.load(.monotonic);
+            try paged.source().readInto(0, output[0..length]);
+            const warm = file.test_page_reads.load(.monotonic) - warm_start;
+            std.debug.print("LITE_FUSED_COUNTS length={d} shortcut={any} cold={d} warm={d} baseline={d}\n", .{ length, shortcut, cold, warm, baseline_reads });
+            if (shortcut) {
+                try std.testing.expect(cold <= baseline_reads);
+                try std.testing.expectEqual(@as(usize, 0), paged.retainedBytes());
+            } else baseline_reads = cold;
+            try std.testing.expectEqual(@as(u64, 0), warm);
+            std.debug.print("LITE_FUSED_CRC shortcut={any} length={d} cold_native_pages={d} warm_native_pages={d} auth_retained={d} provider_retained={d}\n", .{ shortcut, length, cold, warm, paged.retainedBytes(), cache.retainedBytes() });
+        }
+    }
+}
+
+test "authenticated cache stream covers partial blocks and preserves cache fill ownership" {
+    const a = std.testing.allocator;
+    const sources = @import("segment_source.zig");
+    const Backend = struct {
+        bytes: [100000]u8 = undefined,
+        reads: usize = 0,
+        last_fill: ?[*]u8 = null,
+        fail: bool = false,
+        fn read(raw: *anyopaque, offset: u64, out: []u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.reads += 1;
+            self.last_fill = out.ptr;
+            @memcpy(out, self.bytes[@intCast(offset)..][0..out.len]);
+            if (self.fail) return error.TestReadFailure;
+        }
+        fn visit(raw: *anyopaque, offset: u64, length: u64, context: *anyopaque, consume: *const fn (*anyopaque, u64, []const u8) anyerror!void) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            var position: u64 = 0;
+            while (position < length) {
+                const take: usize = @intCast(@min(777, length - position));
+                try consume(context, position, self.bytes[@intCast(offset + position)..][0..take]);
+                position += take;
+            }
+        }
+        fn close(_: *anyopaque) void {}
+    };
+    var state = Backend{};
+    for (&state.bytes, 0..) |*byte, i| byte.* = @truncate(i);
+    const source = sources.Source{ .ranges = .{ .ptr = &state, .length = state.bytes.len, .read_into = Backend.read, .visit_range = Backend.visit, .close = Backend.close } };
+    var cache = try sources.ConcurrentBlockCache.init(a, source, 64 * 1024);
+    defer cache.deinit();
+    // First exercise the hot-fill slab transfer and failed-fill preservation.
+    var point: [8]u8 = undefined;
+    try cache.readInto(0, &point);
+    try std.testing.expectEqual(state.last_fill.?, cache.cache.slots[0].bytes.ptr);
+    state.fail = true;
+    try std.testing.expectError(error.TestReadFailure, cache.readInto(cache.cache.block_size, &point));
+    state.fail = false;
+    try cache.readInto(0, &point);
+    try std.testing.expectEqualSlices(u8, state.bytes[0..8], &point);
+    const out = try a.alloc(u8, 17001);
+    defer a.free(out);
+    const crc = Crc32.hash(state.bytes[3000..27000]);
+    try cache.readAuthenticated(3000, 24000, 499, out, crc);
+    try std.testing.expectEqualSlices(u8, state.bytes[3499..20500], out);
+    try std.testing.expectError(error.CrcMismatch, cache.readAuthenticated(3000, 24000, 499, out, crc ^ 1));
+    // A partially primed tail must not expose bytes beyond valid_len.
+    const reads = state.reads;
+    try cache.readInto(29000, &point);
+    try std.testing.expect(state.reads > reads);
+    try std.testing.expectEqualSlices(u8, state.bytes[29000..29008], &point);
+    try std.testing.expect(cache.retainedBytes() <= 64 * 1024);
 }

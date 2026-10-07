@@ -4364,6 +4364,51 @@ pub const NativeFile = struct {
         return crc.final();
     }
 
+    /// One forward traversal for cache fills, checksumming, and range delivery.
+    pub fn visitIndexValue(self: *NativeFile, value: IndexValue, offset: u64, length: u64, checkpoint: CheckpointSlot, context: *anyopaque, visit: *const fn (*anyopaque, u64, []const u8) anyerror!void) !void {
+        if (offset > value.length or length > value.length - offset) return error.EndOfStream;
+        if (length == 0) return;
+        if (value.root == 0) return visit(context, 0, value.inline_bytes[@intCast(offset)..][0..@intCast(length)]);
+        var cursor = try ValueChunkCursor.initAtCheckpoint(self, value.root, value.length, checkpoint);
+        defer cursor.deinit();
+        cursor.skip = @intCast(offset);
+        var position: u64 = 0;
+        while (position < length) {
+            const chunk = (try cursor.next(null)) orelse return error.InvalidNativeValueChain;
+            const take: usize = @intCast(@min(chunk.len, length - position));
+            try visit(context, position, chunk[0..take]);
+            position += take;
+        }
+    }
+
+    /// Authenticate and deliver a logical subrange in one forward traversal.
+    /// Output is private scratch until the expected CRC has been checked.
+    pub fn readAuthenticatedIndexValue(self: *NativeFile, value: IndexValue, offset: u64, length: u64, within: usize, out: []u8, expected: ?u32, checkpoint: CheckpointSlot) !void {
+        if (offset > value.length or length > value.length - offset or within > length or out.len > length - within) return error.EndOfStream;
+        if (expected == null) return self.readIndexValueInto(value, offset + within, out, checkpoint);
+        if (value.root == 0) {
+            const bytes = value.inline_bytes[@intCast(offset)..][0..@intCast(length)];
+            if (Crc32.hash(bytes) != expected.?) return error.CrcMismatch;
+            @memcpy(out, bytes[within..][0..out.len]);
+            return;
+        }
+        var cursor = try ValueChunkCursor.initAtCheckpoint(self, value.root, value.length, checkpoint);
+        defer cursor.deinit();
+        cursor.skip = @intCast(offset);
+        var position: u64 = 0;
+        var crc = Crc32.init();
+        while (position < length) {
+            const chunk = (try cursor.next(null)) orelse return error.InvalidNativeValueChain;
+            const take: usize = @intCast(@min(chunk.len, length - position));
+            crc.update(chunk[0..take]);
+            const begin = @max(position, within);
+            const end = @min(position + take, @as(u64, within) + out.len);
+            if (begin < end) @memcpy(out[@intCast(begin - within)..][0..@intCast(end - begin)], chunk[@intCast(begin - position)..][0..@intCast(end - begin)]);
+            position += take;
+        }
+        if (crc.final() != expected.?) return error.CrcMismatch;
+    }
+
     /// Export a pinned artifact with bounded scratch and one forward page
     /// traversal. The destination remains private until its caller publishes.
     pub fn copyIndexValueTo(self: *NativeFile, value: IndexValue, destination: std.Io.File, checkpoint: CheckpointSlot) !void {

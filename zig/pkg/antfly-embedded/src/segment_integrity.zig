@@ -139,14 +139,14 @@ pub const PagedSource = struct {
         if (state.load(.acquire) == 2) return error.CrcMismatch;
         if (self.copyCached(index, within, out)) return;
         const offset = @as(u64, index) * page_size;
-        if (state.load(.acquire) == 1) return self.original.readInto(offset + within, out);
+        if (state.load(.acquire) == 1) return self.readVerified(offset, @intCast(@min(page_size, self.directory.offset - offset)), within, out);
         // One cold validator owns the bounded page buffer. Verified reads and
         // cache hits never wait for backend I/O on this separate owner lock.
         @import("antfly_platform").sync.lockYielding(&self.io_mutex);
         defer self.io_mutex.unlock();
         if (state.load(.acquire) == 2) return error.CrcMismatch;
         if (self.copyCached(index, within, out)) return;
-        if (state.load(.acquire) == 1) return self.original.readInto(offset + within, out);
+        if (state.load(.acquire) == 1) return self.readVerified(offset, @intCast(@min(page_size, self.directory.offset - offset)), within, out);
         const length: usize = @intCast(@min(page_size, self.directory.offset - offset));
         if (self.original == .contiguous) {
             const bytes = self.original.contiguous[@intCast(offset)..][0..length];
@@ -159,10 +159,19 @@ pub const PagedSource = struct {
             @memcpy(out, bytes[within..][0..out.len]);
             return;
         }
-        // Checksum-capable providers already own their range/cache policy.
-        // Authenticate with fixed worker scratch instead of retaining another
-        // 64 KiB payload slab for every facade over that same provider.
-        if (self.original.ranges.checksum != null) return self.authenticateRange(index, offset, length, within, out);
+        // Only an explicit fused capability guarantees authentication and
+        // delivery share the provider's cache/traversal. A checksum callback
+        // alone may bypass that cache and duplicate cold and warm reads.
+        if (self.original.ranges.read_authenticated) |read_authenticated| {
+            var expected: [4]u8 = undefined;
+            try self.original.readInto(self.directory.offset + @as(u64, index) * 4, &expected);
+            read_authenticated(self.original.ranges.ptr, offset, length, within, out, std.mem.readInt(u32, &expected, .big)) catch |err| {
+                if (err == error.CrcMismatch) state.store(2, .release);
+                return err;
+            };
+            state.store(1, .release);
+            return;
+        }
         // Invalidate before touching bytes: failed/partial reads cannot expose
         // the old cache entry. Publish only after authentication completes.
         @import("antfly_platform").sync.lockYielding(&self.mutex);
@@ -194,6 +203,12 @@ pub const PagedSource = struct {
         self.cached_page = index;
         @memcpy(out, self.buffer[within..][0..out.len]);
     }
+    fn readVerified(self: *PagedSource, offset: u64, length: usize, within: usize, out: []u8) !void {
+        if (self.original == .ranges) if (self.original.ranges.read_authenticated) |read_authenticated| {
+            return read_authenticated(self.original.ranges.ptr, offset, length, within, out, null);
+        };
+        return self.original.readInto(offset + within, out);
+    }
     fn authenticateRange(self: *PagedSource, index: usize, offset: u64, length: usize, within: usize, out: []u8) !void {
         var scratch: [8192]u8 = undefined;
         const actual = try self.original.checksum(offset, length, &scratch);
@@ -222,7 +237,7 @@ pub const PagedSource = struct {
     }
 };
 
-test "segment.provider checksums avoid duplicate page slabs and fail closed" {
+test "segment.fused provider authentication avoids duplicate slabs and fails closed" {
     const a = std.testing.allocator;
     const bytes = try a.alloc(u8, page_size + 4);
     defer a.free(bytes);
@@ -242,10 +257,14 @@ test "segment.provider checksums avoid duplicate page slabs and fail closed" {
             if (self.fail) return error.TestIoFailure;
             return Crc32.hash(self.bytes[@intCast(offset)..][0..@intCast(length)]);
         }
+        fn authenticate(raw: *anyopaque, offset: u64, length: u64, within: usize, out: []u8, expected: ?u32) !void {
+            if (expected) |crc| if (try checksum(raw, offset, length) != crc) return error.CrcMismatch;
+            return read(raw, offset + within, out);
+        }
         fn close(_: *anyopaque) void {}
     };
     var backend = Backend{ .bytes = bytes, .fail = true };
-    const original = source_mod.Source{ .ranges = .{ .ptr = &backend, .length = bytes.len, .read_into = Backend.read, .checksum = Backend.checksum, .close = Backend.close } };
+    const original = source_mod.Source{ .ranges = .{ .ptr = &backend, .length = bytes.len, .read_into = Backend.read, .checksum = Backend.checksum, .read_authenticated = Backend.authenticate, .close = Backend.close } };
     var budget = @import("storage/lite/test_allocator.zig").BudgetAllocator{ .backing = a, .limit = 4096 };
     const directory = Directory{ .offset = page_size, .length = 4, .checksum = Crc32.hash(bytes[page_size..]) };
     const paged = try PagedSource.init(budget.allocator(), original, directory);
