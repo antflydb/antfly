@@ -31,19 +31,43 @@ const Backend = struct {
             if (self.offset == self.owner.row_count) return .{ .rows = &.{} };
             const count = @min(limit, self.owner.row_count - self.offset);
             const rows = try alloc.alloc(catalog.Row, count);
+            const local = @import("antfly_local_sources");
+            const target = self.request.table.id == 1;
+            const array_value: std.json.Value = if (self.owner.arrays) blk: {
+                const decoded = try local.sql_array_text.decodeLeaky(alloc, if (target) .int64 else .int16, if (target) "[-1:1]={9007199254740993,NULL,2}" else "[3:4]={3,NULL}", .{});
+                break :blk try local.sql_array_wire.toJsonLeaky(alloc, decoded.value, .{});
+            } else .null;
+            const json_value: std.json.Value = if (self.owner.arrays) blk: {
+                const decoded = try local.sql_array_text.decodeLeaky(alloc, .jsonb, "{\"null\",NULL}", .{});
+                break :blk try local.sql_array_wire.toJsonLeaky(alloc, decoded.value, .{});
+            } else .null;
+            const projection = if (self.owner.arrays) try local.sql_document_row.Projection.init(alloc, self.request.table, self.request.request.fields) else null;
+            defer if (projection) |p| p.deinit(alloc);
+            const layout = if (projection) |p| try p.pageLayout(alloc) else null;
             for (rows, self.offset..) |*row, i| {
-                const target = self.request.table.id == 1;
                 const id = if (target or !self.owner.duplicates) (if (i == 0) "a" else if (i == 1) "b" else try std.fmt.allocPrint(alloc, "row{d}", .{i})) else "a";
                 var values: std.json.ObjectMap = .empty;
                 const fields = self.request.request.fields;
                 for (fields) |field| {
+                    if (self.owner.arrays and std.mem.eql(u8, field, "missing")) continue;
+                    if (self.owner.arrays and (std.mem.eql(u8, field, "a") or std.mem.eql(u8, field, "j"))) {
+                        try values.put(alloc, field, if (std.mem.eql(u8, field, "a")) array_value else json_value);
+                        continue;
+                    }
                     const value: std.json.Value = if (std.mem.eql(u8, field, "n")) .{ .integer = @intCast(i + 1) } else if (std.mem.eql(u8, field, "delta")) .{ .integer = @intCast((i + 1) * 10) } else if (std.mem.eql(u8, field, "id")) .{ .string = id } else if (std.mem.eql(u8, field, "cold")) .{ .string = "old" } else .null;
                     try values.put(alloc, field, value);
                 }
-                const flags = try alloc.alloc(bool, fields.len);
+                const flags = try alloc.alloc(bool, values.count());
                 @memset(flags, false); // payload JSON null is not SQL NULL.
                 row.* = .{ .id = id, .version = std.math.maxInt(u64) - 1, .expected_content_digest = if (self.request.request.include_primary_digest) @splat(9) else null, .value = .{ .object = values }, .sql_nulls = flags };
                 if (self.request.request.include_document) row.document = try std.json.parseFromSliceLeaky(std.json.Value, alloc, "{\"n\":1,\"payload\":null,\"cold\":\"old\",\"undeclared\":42}", .{});
+                if (projection) |p| {
+                    if (row.document) |*document| {
+                        try document.object.put(alloc, "a", array_value);
+                        try document.object.put(alloc, "j", json_value);
+                    }
+                    row.* = try p.adaptBorrowed(alloc, layout, row.*);
+                }
             }
             self.offset += count;
             self.owner.rows_read += count;
@@ -52,6 +76,10 @@ const Backend = struct {
     };
     duplicates: bool = false,
     document: bool = false,
+    arrays: bool = false,
+    array_first: i64 = 3,
+    array_lower: i32 = 3,
+    array_null: bool = false,
     default_mode: bool = false,
     default_prepare_failure: bool = false,
     generated_mode: bool = false,
@@ -74,11 +102,18 @@ const Backend = struct {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         if (std.mem.eql(u8, name.table, "target")) {
             try std.testing.expect(action == .read_write);
+            if (self.arrays) return .{ .id = 1, .physical_name = "target", .schema_version = 1, .storage_mode = if (self.document) .document else .relational, .columns = &.{
+                .{ .name = "n", .path = "n", .type = .integer },                       .{ .name = "payload", .path = "payload", .type = .json },              .{ .name = "cold", .path = "cold", .type = .string },
+                .{ .name = "a", .path = "a", .type = .array, .element_type = .int64 }, .{ .name = "j", .path = "j", .type = .array, .element_type = .jsonb }, .{ .name = "missing", .path = "missing", .type = .string },
+            } };
             if (self.generated_mode) return .{ .id = 1, .physical_name = "target", .schema_version = 1, .storage_mode = if (self.document) .document else .relational, .columns = &.{ .{ .name = "n", .path = "n", .type = .integer }, .{ .name = "payload", .path = "payload", .type = .json }, .{ .name = "cold", .path = "cold", .type = .string }, .{ .name = "g", .path = "g", .type = .integer, .generated = true } } };
             return .{ .id = 1, .physical_name = "target", .schema_version = 1, .storage_mode = if (self.document) .document else .relational, .columns = &.{ .{ .name = "n", .path = "n", .type = .integer }, .{ .name = "payload", .path = "payload", .type = .json }, .{ .name = "cold", .path = "cold", .type = .string } } };
         }
         try std.testing.expectEqual(catalog.Action.read, action);
         if (self.deny_source) return error.Forbidden;
+        if (self.arrays) return .{ .id = 2, .physical_name = "source", .schema_version = 1, .columns = &.{
+            .{ .name = "id", .path = "id", .type = .string }, .{ .name = "delta", .path = "delta", .type = .integer }, .{ .name = "a", .path = "a", .type = .array, .element_type = .int16 },
+        } };
         if (self.cold_width != 0) {
             const columns = try alloc.alloc(catalog.Column, self.cold_width + 2);
             columns[0] = .{ .name = "id", .path = "id", .type = .string };
@@ -102,7 +137,7 @@ const Backend = struct {
             cursor.* = .{ .ptr = state, .next = Cursor.next, .close = undefined };
             if (scan_.table.id == 1 and !self.returning_mode) {
                 try std.testing.expect(scan_.request.include_primary_digest);
-                for (scan_.request.fields) |field| try std.testing.expect(!std.mem.eql(u8, field, "cold"));
+                if (!self.arrays) for (scan_.request.fields) |field| try std.testing.expect(!std.mem.eql(u8, field, "cold"));
             }
         }
         return .{ .ptr = self, .cursors = self.cursors[0..scans.len], .close = close };
@@ -137,7 +172,7 @@ const Backend = struct {
         }
         return normalized;
     }
-    fn mutate(ptr: *anyopaque, _: std.mem.Allocator, _: catalog.Table, mutations: []const catalog.Mutation) !catalog.MutationOutcome {
+    fn mutate(ptr: *anyopaque, alloc: std.mem.Allocator, _: catalog.Table, mutations: []const catalog.Mutation) !catalog.MutationOutcome {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         try std.testing.expectEqual(@as(usize, 1), self.closes);
         self.commits += 1;
@@ -152,6 +187,19 @@ const Backend = struct {
                 try std.testing.expectEqualSlices(u8, &@as([32]u8, @splat(9)), &mutation.expected_content_digest.?);
             }
             if (mutation.row) |row| {
+                if (self.arrays) {
+                    const wire = @import("antfly_local_sources").sql_array_wire;
+                    try std.testing.expect(!row.object.contains("missing"));
+                    for (mutation.json_null_fields) |field| try std.testing.expect(!std.mem.eql(u8, field, "a") and !std.mem.eql(u8, field, "j"));
+                    if (self.array_null) try std.testing.expect(row.object.get("a").? == .null) else {
+                        const decoded = try wire.decodeBorrowed(alloc, .int64, row.object.get("a").?, .{});
+                        try std.testing.expectEqual(self.array_lower, decoded.value.dimensions[0].lower);
+                        try std.testing.expectEqual(self.array_first, decoded.value.elements[0].value.integer);
+                        try std.testing.expect(decoded.value.elements[1].sql_null);
+                    }
+                    const json = try wire.decodeBorrowed(alloc, .jsonb, row.object.get("j").?, .{});
+                    try std.testing.expect(!json.value.elements[0].sql_null and json.value.elements[1].sql_null);
+                }
                 try std.testing.expectEqualStrings(if (self.default_mode) "default" else "new", row.object.get("cold").?.string);
                 if (self.generated_mode) try std.testing.expectEqual(row.object.get("n").?.integer * 2, row.object.get("g").?.integer);
                 try std.testing.expect(row.object.get("payload").? == .null);
@@ -168,6 +216,89 @@ const Backend = struct {
         return a.dupe(u8, "fresh");
     }
 };
+
+test "SQL joined mutations retain arrays through coercion scratch retirement and typed DELETE RETURNING" {
+    const local = @import("antfly_local_sources");
+    for ([_]bool{ false, true }) |document| for ([_]struct { sql: []const u8, first: i64, lower: i32, parameters: []const std.json.Value = &.{}, whole_null: bool = false }{
+        .{ .sql = "UPDATE target t SET n=t.n+s.delta,cold='new' FROM source s WHERE t._id=s.id RETURNING t.a,t.j", .first = 9007199254740993, .lower = -1 },
+        .{ .sql = "UPDATE target t SET a=s.a,cold='new' FROM source s WHERE t._id=s.id RETURNING t.a,t.j", .first = 3, .lower = 3 },
+        .{ .sql = "UPDATE target t SET a='[-1:1]={9007199254740993,NULL,2}',cold='new' FROM source s WHERE t._id=s.id RETURNING t.a,t.j", .first = 9007199254740993, .lower = -1 },
+        .{ .sql = "UPDATE target t SET a=$1,cold='new' FROM source s WHERE t._id=s.id RETURNING t.a,t.j", .first = 9223372036854775807, .lower = 5, .parameters = &.{.{ .string = "[5:6]={9223372036854775807,NULL}" }} },
+        .{ .sql = "UPDATE target t SET a=ARRAY[1::smallint,NULL],cold='new' FROM source s WHERE t._id=s.id RETURNING t.a,t.j", .first = 1, .lower = 1 },
+        .{ .sql = "UPDATE target t SET a=NULL,cold='new' FROM source s WHERE t._id=s.id RETURNING t.a,t.j", .first = 0, .lower = 0, .whole_null = true },
+        .{ .sql = "DELETE FROM target t USING source s WHERE t._id=s.id RETURNING t.a,t.j", .first = 9007199254740993, .lower = -1 },
+    }) |case| {
+        var backend: Backend = .{ .document = document, .arrays = true, .array_first = case.first, .array_lower = case.lower, .array_null = case.whole_null };
+        var compiled = try compiler.compile(std.testing.allocator, case.sql, .{});
+        defer compiled.deinit();
+        var result = try runtime.execute(std.testing.allocator, backend.backend(), &compiled, case.parameters, .{ .page_rows = 1 });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), backend.captures);
+        try std.testing.expectEqual(@as(usize, 4), backend.rows_read);
+        try std.testing.expectEqual(@as(usize, 1), backend.commits);
+        try std.testing.expectEqual(@as(usize, 2), result.output.rows.len);
+        try std.testing.expectEqual(@as(u64, 2), result.output.rows_affected);
+        for (result.output.rows, result.output.sql_nulls.?) |row, flags| {
+            if (case.whole_null) {
+                try std.testing.expect(row[0] == .null and flags[0]);
+            } else {
+                var array = try local.sql_array_wire.decode(std.testing.allocator, .int64, row[0], .{});
+                defer array.deinit();
+                try std.testing.expectEqual(case.lower, array.value.dimensions[0].lower);
+                try std.testing.expectEqual(case.first, array.value.elements[0].value.integer);
+                try std.testing.expect(array.value.elements[1].sql_null);
+            }
+            var json = try local.sql_array_wire.decode(std.testing.allocator, .jsonb, row[1], .{});
+            defer json.deinit();
+            try std.testing.expect(json.value.elements[0].value == .null);
+            try std.testing.expect(!json.value.elements[0].sql_null and json.value.elements[1].sql_null);
+        }
+    };
+}
+
+test "SQL joined RETURNING resolves ambiguous names before any source capture or write" {
+    for ([_][]const u8{
+        "UPDATE target t SET a=s.a,cold='new' FROM source s WHERE t._id=s.id RETURNING a",
+        "UPDATE target t SET a=s.a,cold='new' FROM source s WHERE t._id=s.id RETURNING coalesce(a,NULL)",
+        "DELETE FROM target t USING source s WHERE t._id=s.id RETURNING a",
+    }) |sql| {
+        var backend: Backend = .{ .arrays = true };
+        var compiled = try compiler.compile(std.testing.allocator, sql, .{});
+        defer compiled.deinit();
+        try std.testing.expectError(error.AmbiguousSqlColumn, runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{}));
+        try std.testing.expectEqual(@as(usize, 0), backend.captures);
+        try std.testing.expectEqual(@as(usize, 0), backend.commits);
+    }
+}
+
+test "SQL joined array assignments reject explicit-only coercions before source capture" {
+    for ([_]struct { sql: []const u8, failure: anyerror }{
+        .{ .sql = "UPDATE target t SET a=ARRAY['1'],cold='new' FROM source s WHERE t._id=s.id RETURNING t.a", .failure = error.SqlAssignmentTypeMismatch },
+        .{ .sql = "UPDATE target t SET a='{1,2}'::text,cold='new' FROM source s WHERE t._id=s.id RETURNING t.a", .failure = error.SqlAssignmentTypeMismatch },
+        .{ .sql = "UPDATE target t SET a=ARRAY[],cold='new' FROM source s WHERE t._id=s.id RETURNING t.a", .failure = error.UnknownSqlArrayType },
+    }) |case| {
+        var backend: Backend = .{ .arrays = true };
+        var compiled = try compiler.compile(std.testing.allocator, case.sql, .{});
+        defer compiled.deinit();
+        try std.testing.expectError(case.failure, runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{}));
+        try std.testing.expectEqual(@as(usize, 0), backend.captures);
+        try std.testing.expectEqual(@as(usize, 0), backend.commits);
+    }
+}
+
+test "SQL joined array mutations unwind every allocation failure before writer admission" {
+    const Scenario = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var backend: Backend = .{ .arrays = true };
+            var compiled = try compiler.compile(a, "UPDATE target t SET a=s.a,cold='new' FROM source s WHERE t._id=s.id RETURNING t.a,t.j", .{});
+            defer compiled.deinit();
+            var result = try runtime.execute(a, backend.backend(), &compiled, &.{}, .{ .page_rows = 1 });
+            defer result.deinit();
+            try std.testing.expectEqual(@as(usize, 1), backend.commits);
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Scenario.run, .{});
+}
 
 test "SQL UPDATE DEFAULT omits the old cell for native preparation" {
     for ([_]bool{ false, true }) |document| {

@@ -237,9 +237,17 @@ PostgreSQL observers and exhaustive allocation-failure/page-retirement checks
 cover these contracts. Standalone conflict subqueries retain the existing
 capability rejection until atomic range-read protection is activated. Nested
 CASE/COALESCE conflict subqueries still require owner-masked Apply activation;
-they are not hoisted into eager INSERT-source evaluation. SQL DDL,
-joined/MERGE typed-array paths and ordered/constraint index keys still need
-end-to-end activation gates.
+they are not hoisted into eager INSERT-source evaluation. Joined UPDATE/DELETE
+now drain a bounded lossless source cursor and close it before writer admission.
+Array assignment domains cross the shared source inference boundary; UPDATE
+uses the common owned storage encoder, and DELETE RETURNING retains complete
+typed preimages with shared name metadata. Per-row scratch can retire without
+invalidating mutation keys, nested document members, bounds or JSONB null flags.
+Presence metadata is indexed once per row instead of rescanned per output cell.
+RETURNING ambiguity is checked against the already-authorized join scope; this
+does not activate FROM/USING source-value RETURNING, which still needs captured
+source-image execution. SQL DDL, MERGE typed-array paths and ordered/constraint
+index keys still need end-to-end activation gates.
 Original case dispositions remain unchanged.
 
 Source commit: `79644dfa1605e8da0f486d021d1c1393577d6265`.

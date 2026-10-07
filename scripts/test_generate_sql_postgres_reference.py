@@ -176,6 +176,89 @@ class PostgresReferenceTest(unittest.TestCase):
                     self.assertEqual([None, None], json_array["values"])
                     self.assertEqual([False, True], json_array["sql_nulls"])
 
+    def test_joined_array_mutations_preserve_domains_bounds_and_returning_scope(self):
+        import psycopg
+
+        with self.db.transaction(force_rollback=True):
+            self.db.execute(
+                "CREATE TEMP TABLE target(_id text PRIMARY KEY,n bigint,cold text,a bigint[],j jsonb[]);"
+                "CREATE TEMP TABLE source(id text,a smallint[],delta bigint)"
+            )
+            self.db.execute(
+                "INSERT INTO target SELECT id,1,'old','[-1:1]={9007199254740993,NULL,2}',ARRAY['null'::jsonb,NULL] FROM (VALUES ('a'),('b')) v(id);"
+                "INSERT INTO source SELECT _id,'[3:4]={3,NULL}',10 FROM target"
+            )
+            for sql, first, lower in (
+                (
+                    "UPDATE target t SET n=t.n+s.delta,cold='new' FROM source s WHERE t._id=s.id RETURNING t.a,t.j",
+                    9007199254740993,
+                    -1,
+                ),
+                (
+                    "UPDATE target t SET a=s.a,cold='new' FROM source s WHERE t._id=s.id RETURNING t.a,t.j",
+                    3,
+                    3,
+                ),
+                (
+                    "UPDATE target t SET a='[-1:1]={9007199254740993,NULL,2}',cold='new' FROM source s WHERE t._id=s.id RETURNING t.a,t.j",
+                    9007199254740993,
+                    -1,
+                ),
+                (
+                    "UPDATE target t SET a=$1,cold='new' FROM source s WHERE t._id=s.id RETURNING t.a,t.j",
+                    9223372036854775807,
+                    5,
+                ),
+                (
+                    "UPDATE target t SET a=ARRAY[1::smallint,NULL],cold='new' FROM source s WHERE t._id=s.id RETURNING t.a,t.j",
+                    1,
+                    1,
+                ),
+                (
+                    "UPDATE target t SET a=NULL,cold='new' FROM source s WHERE t._id=s.id RETURNING t.a,t.j",
+                    None,
+                    None,
+                ),
+                (
+                    "DELETE FROM target t USING source s WHERE t._id=s.id RETURNING t.a,t.j",
+                    9007199254740993,
+                    -1,
+                ),
+            ):
+                with self.subTest(sql=sql), self.db.transaction(force_rollback=True):
+                    observer = sql + ",array_lower(t.a,1),t.j[1] IS NULL,t.j[2] IS NULL"
+                    if "$1" in sql:
+                        self.db.execute("PREPARE antfly_joined_array AS " + observer)
+                        try:
+                            rows = self.db.execute(
+                                "EXECUTE antfly_joined_array('[5:6]={9223372036854775807,NULL}')"
+                            ).fetchall()
+                        finally:
+                            self.db.execute("DEALLOCATE antfly_joined_array")
+                    else:
+                        rows = self.db.execute(observer).fetchall()
+                    self.assertEqual(2, len(rows))
+                    for row in rows:
+                        if first is None:
+                            self.assertIsNone(row[0])
+                        else:
+                            self.assertEqual(first, row[0][0])
+                            self.assertIsNone(row[0][1])
+                        self.assertEqual((lower, False, True), row[2:])
+            for sql, state in (
+                ("UPDATE target t SET a=s.a FROM source s RETURNING a", "42702"),
+                ("DELETE FROM target t USING source s RETURNING a", "42702"),
+                (
+                    "UPDATE target t SET a=ARRAY['1'] FROM source s RETURNING t.a",
+                    "42804",
+                ),
+                ("UPDATE target t SET a=ARRAY[] FROM source s RETURNING t.a", "42P18"),
+            ):
+                with self.subTest(sql=sql), self.db.transaction(force_rollback=True):
+                    with self.assertRaises(psycopg.Error) as error:
+                        self.db.execute("EXPLAIN " + sql)
+                    self.assertEqual(state, error.exception.sqlstate)
+
     def test_array_conflict_mutations_preserve_typed_preimages_and_excluded(self):
         with self.db.transaction(force_rollback=True):
             self.db.execute(
