@@ -178,6 +178,8 @@ pub const Relation = union(enum) {
         /// Compiler-only left-domain demand. A masked LEFT LATERAL producer
         /// is not opened or evaluated for an undemanded row.
         demand: ?*const Scalar = null,
+        /// Compiler-owned NULL-aware membership, not a SQL join condition.
+        membership: ?struct { probes: []const *const Scalar, correlations: usize, alias: []const u8 } = null,
     },
 };
 pub const JoinKind = enum { inner, left, right, full, cross };

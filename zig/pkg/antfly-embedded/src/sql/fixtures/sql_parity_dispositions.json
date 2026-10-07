@@ -2,6 +2,16 @@
   "ledger_format": 1,
   "inventory_sha256": "c203a4dcf0094b75e1d3764e90beebddaf844a9ce604543c0a4dbc0ffe8ae173",
   "gates": {
+    "sql-postgres-correlated-mutations": {
+      "command": ["zig", "build", "public-api-parity-test", "--cache-dir", ".zig-cache/sql-parity-evidence", "-Dtest-filter=httpx SQL PostgreSQL mutations capture native source relations and complete storage"],
+      "cwd": "zig",
+      "timeout_seconds": 600
+    },
+    "sql-postgres-correlated-reference": {
+      "command": ["uv", "run", "--no-project", "--with", "psycopg[binary]==3.3.6", "python", "scripts/generate_sql_postgres_reference.py", "correlated_mutation", "--check", "zig/pkg/antfly-embedded/src/sql/fixtures/sql_correlated_mutation_postgres_reference.json"],
+      "cwd": ".",
+      "timeout_seconds": 120
+    },
     "sql-lateral-original-public": {
       "command": ["zig", "build", "public-api-parity-test", "--cache-dir", ".zig-cache/sql-parity-evidence", "-Dtest-filter=httpx SQL LATERAL original campaign"],
       "cwd": "zig",
@@ -5995,18 +6005,30 @@
     },
     {
       "id": "sql-0600",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL executes through mounted HTTP against native typed storage with one captured read set per statement. Independently reproduced PostgreSQL results verify affected counts and complete persisted state of all source/target tables, including duplicate and SQL NULL witnesses. Logical keys are unchanged; distributed constraint-owner activation is not claimed.",
+      "evidence": [
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL PostgreSQL mutations capture native source relations and complete storage", "gate": "sql-postgres-correlated-mutations"},
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL PostgreSQL mutations capture native source relations and complete storage", "gate": "sql-postgres-correlated-reference"}
+      ]
     },
     {
       "id": "sql-0601",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL executes through mounted HTTP against native typed storage with one captured read set per statement. Independently reproduced PostgreSQL results verify affected counts and complete persisted state of all source/target tables, including duplicate and SQL NULL witnesses. Logical keys are unchanged; distributed constraint-owner activation is not claimed.",
+      "evidence": [
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL PostgreSQL mutations capture native source relations and complete storage", "gate": "sql-postgres-correlated-mutations"},
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL PostgreSQL mutations capture native source relations and complete storage", "gate": "sql-postgres-correlated-reference"}
+      ]
     },
     {
       "id": "sql-0602",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL executes through mounted HTTP against native typed storage with one captured read set per statement. Independently reproduced PostgreSQL results verify affected counts and complete persisted state of all source/target tables, including duplicate and SQL NULL witnesses. Logical keys are unchanged; distributed constraint-owner activation is not claimed.",
+      "evidence": [
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL PostgreSQL mutations capture native source relations and complete storage", "gate": "sql-postgres-correlated-mutations"},
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL PostgreSQL mutations capture native source relations and complete storage", "gate": "sql-postgres-correlated-reference"}
+      ]
     },
     {
       "id": "sql-0603",
@@ -6079,18 +6101,30 @@
     },
     {
       "id": "sql-0610",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL executes through mounted HTTP against native typed storage with one captured read set per statement. Independently reproduced PostgreSQL results verify affected counts and complete persisted state of all source/target tables, including duplicate and SQL NULL witnesses. Logical keys are unchanged; distributed constraint-owner activation is not claimed.",
+      "evidence": [
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL PostgreSQL mutations capture native source relations and complete storage", "gate": "sql-postgres-correlated-mutations"},
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL PostgreSQL mutations capture native source relations and complete storage", "gate": "sql-postgres-correlated-reference"}
+      ]
     },
     {
       "id": "sql-0611",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL executes through mounted HTTP against native typed storage with one captured read set per statement. Independently reproduced PostgreSQL results verify affected counts and complete persisted state of all source/target tables, including duplicate and SQL NULL witnesses. Logical keys are unchanged; distributed constraint-owner activation is not claimed.",
+      "evidence": [
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL PostgreSQL mutations capture native source relations and complete storage", "gate": "sql-postgres-correlated-mutations"},
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL PostgreSQL mutations capture native source relations and complete storage", "gate": "sql-postgres-correlated-reference"}
+      ]
     },
     {
       "id": "sql-0612",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL executes through mounted HTTP against native typed storage with one captured read set per statement. Independently reproduced PostgreSQL results verify affected counts and complete persisted state of all source/target tables, including duplicate and SQL NULL witnesses. Logical keys are unchanged; distributed constraint-owner activation is not claimed.",
+      "evidence": [
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL PostgreSQL mutations capture native source relations and complete storage", "gate": "sql-postgres-correlated-mutations"},
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL PostgreSQL mutations capture native source relations and complete storage", "gate": "sql-postgres-correlated-reference"}
+      ]
     },
     {
       "id": "sql-0613",

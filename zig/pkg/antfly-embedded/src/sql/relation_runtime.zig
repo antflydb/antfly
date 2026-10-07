@@ -81,6 +81,71 @@ const SetTestBackend = struct {
     }
 };
 
+test "SQL row membership executes captured typed relations with NULL-aware truth and query boundaries" {
+    const Case = struct { sql: []const u8, rows: []const u8 };
+    const Fixture = struct {
+        fn run(a: Allocator) !void {
+            for ([_]Case{
+                .{ .sql = "SELECT (1,2) IN (SELECT 1,2), (1,2) NOT IN (SELECT 1,2)", .rows = "[[true,false]]" },
+                .{ .sql = "SELECT (NULL,1) IN (SELECT 2,2), (NULL,1) IN (SELECT 2,1)", .rows = "[[false,null]]" },
+                .{ .sql = "SELECT (NULL,NULL) IN (SELECT 1,2 WHERE false), (NULL,NULL) NOT IN (SELECT 1,2 WHERE false)", .rows = "[[false,true]]" },
+                .{ .sql = "SELECT (1,2) IN (SELECT a,b FROM (VALUES(1,2),(1,2),(NULL,2)) s(a,b))", .rows = "[[true]]" },
+                .{ .sql = "SELECT (1,2) IN (SELECT a,b FROM (VALUES(1,2),(1,3)) s(a,b) ORDER BY b DESC LIMIT 1)", .rows = "[[false]]" },
+                .{ .sql = "SELECT (1,2) IN (SELECT a,count(*) FROM (VALUES(1),(1)) s(a) GROUP BY a)", .rows = "[[true]]" },
+                .{ .sql = "SELECT (ARRAY[1,NULL]::int8[],1) IN (SELECT ARRAY[1,NULL]::int8[],1)", .rows = "[[true]]" },
+                .{ .sql = "SELECT ROW(1) IN (SELECT 1), ROW(1,2) IN (SELECT 1,2)", .rows = "[[true,true]]" },
+                .{ .sql = "SELECT ('null'::jsonb,1) IN (SELECT 'null'::jsonb,1), (NULL::jsonb,1) IN (SELECT 'null'::jsonb,1)", .rows = "[[true,null]]" },
+                .{ .sql = "SELECT CASE WHEN false THEN (1,2) IN (SELECT 1/0,2) ELSE false END", .rows = "[[false]]" },
+                .{ .sql = "SELECT CASE WHEN t.k THEN (t.a,t.b) IN (SELECT a,b FROM (VALUES(1,2),(1,NULL)) s(a,b)) ELSE false END FROM (VALUES(1,2,true),(1,3,true)) t(a,b,k)", .rows = "[[true],[null]]" },
+                .{ .sql = "SELECT (t.a,t.b) IN (SELECT s.a,s.b FROM (VALUES(1,2,7),(1,NULL,8),(1,2,NULL)) s(a,b,k) WHERE s.k=t.k) FROM (VALUES(1,2,7),(1,2,8),(1,2,NULL)) t(a,b,k)", .rows = "[[true],[null],[false]]" },
+                .{ .sql = "SELECT (t.a,t.b) IN (SELECT 1/s.x,2 FROM (VALUES(1,7),(0,8)) s(x,k) WHERE s.k=t.k) FROM (VALUES(1,2,7)) t(a,b,k)", .rows = "[[true]]" },
+                .{ .sql = "SELECT (t.a,t.b) IN (SELECT s.a,s.b FROM (VALUES(1,2,7),(1,3,7)) s(a,b,k) WHERE s.k=t.k ORDER BY b DESC LIMIT 1) FROM (VALUES(1,2,7),(1,3,7)) t(a,b,k)", .rows = "[[false],[true]]" },
+            }) |case| {
+                var backend: SetTestBackend = .{};
+                var compiled = try @import("compiler.zig").compile(a, case.sql, .{});
+                defer compiled.deinit();
+                var result = try @import("runtime.zig").execute(a, backend.backend(), &compiled, &.{}, .{});
+                defer result.deinit();
+                const rows = try std.json.Stringify.valueAlloc(a, result.output.rows, .{});
+                defer a.free(rows);
+                try std.testing.expectEqualStrings(case.rows, rows);
+                for (result.output.columns) |column| try std.testing.expectEqual(@import("ast.zig").ColumnType.boolean, column.type);
+            }
+        }
+    };
+    try Fixture.run(std.testing.allocator);
+}
+
+test "SQL row membership retained Apply builds unwind every allocation failure" {
+    const Fixture = struct {
+        fn run(a: Allocator) !void {
+            var backend: SetTestBackend = .{};
+            var compiled = try @import("compiler.zig").compile(a, "SELECT CASE WHEN t.k THEN (t.a,t.b) IN (SELECT a,b FROM (VALUES(1,2),(1,NULL)) s(a,b)) ELSE false END FROM (VALUES(1,2,true),(1,3,true)) t(a,b,k)", .{});
+            defer compiled.deinit();
+            var result = try @import("runtime.zig").execute(a, backend.backend(), &compiled, &.{}, .{});
+            defer result.deinit();
+            try std.testing.expectEqual(@as(usize, 2), result.output.rows.len);
+            try std.testing.expect(result.output.rows[0][0].bool);
+            try std.testing.expect(result.output.sql_nulls.?[1][0]);
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
+test "SQL row membership rejects unequal arity and incompatible operator signatures before opening sources" {
+    for ([_]struct { sql: []const u8, err: anyerror }{
+        .{ .sql = "SELECT (1,2) IN (SELECT 1)", .err = error.InvalidSqlSyntax },
+        .{ .sql = "SELECT (1,2) IN (SELECT 1,2,3)", .err = error.InvalidSqlSyntax },
+        .{ .sql = "SELECT (ARRAY[1]::int2[],1) IN (SELECT ARRAY[1]::int8[],1)", .err = error.SqlUndefinedOperator },
+        .{ .sql = "SELECT (1,2) IN (SELECT true,2)", .err = error.SqlUndefinedOperator },
+    }) |case| {
+        var backend: SetTestBackend = .{};
+        var compiled = try @import("compiler.zig").compile(std.testing.allocator, case.sql, .{});
+        defer compiled.deinit();
+        try std.testing.expectError(case.err, @import("runtime.zig").execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{}));
+    }
+}
+
 test "SQL typed array rows survive scalar join and grouped relation adapters" {
     const Fixture = struct {
         const State = struct {
@@ -480,6 +545,7 @@ fn Engine(comptime Context: type) type {
         cache_arena: std.heap.ArenaAllocator,
         static_rows: std.AutoHashMapUnmanaged(*const binding.Node, *Replay) = .empty,
         static_hashes: std.AutoHashMapUnmanaged(*const binding.Node, *operators.HashJoin) = .empty,
+        static_memberships: std.AutoHashMapUnmanaged(*const binding.Node, *operators.TupleMembership) = .empty,
         recursions: [32]?*Worklist = @splat(null),
         recursion_scopes: [32]?usize = @splat(null),
         outer_values: [32]?[]const Datum = @splat(null),
@@ -499,6 +565,8 @@ fn Engine(comptime Context: type) type {
             for (0..self.recursions.len) |id| self.closeRecursion(id);
             var hashes = self.static_hashes.valueIterator();
             while (hashes.next()) |join| join.*.deinit();
+            var memberships = self.static_memberships.valueIterator();
+            while (memberships.next()) |index| index.*.deinit();
             var rows = self.static_rows.valueIterator();
             while (rows.next()) |replay| replay.*.deinit();
             self.cache_arena.deinit();
@@ -642,6 +710,8 @@ fn Engine(comptime Context: type) type {
             eof: bool = false,
             emitted: bool = false,
             hash_join: ?*operators.HashJoin = null,
+            membership_index: ?*operators.TupleMembership = null,
+            borrowed_membership: bool = false,
             partition_join: ?*@import("partition_join.zig").Join = null,
             probe: ?operators.HashJoin.Probe = null,
             probe_arena: std.heap.ArenaAllocator,
@@ -702,7 +772,7 @@ fn Engine(comptime Context: type) type {
                     .join => |join| {
                         // Always probe the delta and build the invariant side.
                         // Keep output ordinals in the original SQL FROM order.
-                        self.flipped_join = if (apply_mode and outerMask(node) != 0) outerMask(join.left) == 0 and outerMask(join.right) != 0 else if (recursive_id) |id| !dependsOn(join.left, id) and dependsOn(join.right, id) else engine.preferLeftBuild(join.left, join.right);
+                        self.flipped_join = if (join.membership != null) false else if (apply_mode and outerMask(node) != 0) outerMask(join.left) == 0 and outerMask(join.right) != 0 else if (recursive_id) |id| !dependsOn(join.left, id) and dependsOn(join.right, id) else engine.preferLeftBuild(join.left, join.right);
                         self.left = try createContext(engine, if (self.flipped_join) join.right else join.left, recursive_id, apply_mode);
                         self.right = try createContext(engine, if (self.flipped_join) join.left else join.right, recursive_id, apply_mode);
                     },
@@ -728,6 +798,7 @@ fn Engine(comptime Context: type) type {
                 if (self.partition_join) |join| join.close();
                 if (self.scan_filter) |filter| filter.close();
                 if (!self.borrowed_hash) if (self.hash_join) |join| join.deinit();
+                if (!self.borrowed_membership) if (self.membership_index) |index| index.deinit();
                 self.probe_arena.deinit();
                 self.arena.deinit();
                 self.scratch.deinit();
@@ -1420,7 +1491,56 @@ fn Engine(comptime Context: type) type {
                 }
                 self.scan_filter = try @import("dynamic_filter.zig").Filter.create(self.engine.context.alloc, columns, self.engine.context.limits.retained_bytes / 32);
             }
+            fn membershipCheckpoint(raw: *anyopaque) !void {
+                const engine: *Self = @ptrCast(@alignCast(raw));
+                try engine.checkpoint();
+            }
+            fn nextMembership(self: *Iterator, alloc: Allocator, join: @FieldType(@FieldType(binding.Node, "operation"), "join")) anyerror!?[]const Datum {
+                const correlations = join.membership.?.correlations;
+                const shared = (self.recursive_id != null or self.apply_mode) and outerMask(join.right) == 0 and (self.recursive_id == null or !dependsOn(join.right, self.recursive_id.?));
+                if (self.membership_index == null and shared) if (self.engine.static_memberships.get(self.node)) |index| {
+                    self.membership_index = index;
+                    self.borrowed_membership = true;
+                };
+                if (self.membership_index == null) {
+                    self.membership_index = try operators.TupleMembership.create(self.engine.context.alloc, join.right_keys.len, .{ .rows = self.engine.context.limits.scan_rows, .bytes = self.engine.context.limits.retained_bytes, .work = self.engine.context.limits.scan_rows *| 64 }, .{ .ptr = self.engine, .call = membershipCheckpoint });
+                    while (true) {
+                        try self.engine.checkpoint();
+                        _ = self.scratch.reset(.retain_capacity);
+                        const a = self.scratch.allocator();
+                        const row = try self.right.?.next(a) orelse break;
+                        const keys_ = try self.keys(a, join.right_keys, row);
+                        const null_correlation = for (keys_[0..correlations]) |key| {
+                            if (key.sql_null) break true;
+                        } else false;
+                        if (!null_correlation) try self.membership_index.?.add(keys_);
+                    }
+                    try self.membership_index.?.seal();
+                    self.right.?.deinit();
+                    self.right = null;
+                    if (shared) {
+                        try self.engine.static_memberships.put(self.engine.cache_arena.allocator(), self.node, self.membership_index.?);
+                        self.borrowed_membership = true;
+                    }
+                }
+                const row = try self.left.?.next(alloc) orelse return null;
+                _ = self.scratch.reset(.retain_capacity);
+                const keys_ = try self.keys(self.scratch.allocator(), join.left_keys, row);
+                const null_correlation = for (keys_[0..correlations]) |key| {
+                    if (key.sql_null) break true;
+                } else false;
+                const truth = if (null_correlation) .no else try self.membership_index.?.probe(keys_);
+                const output = try alloc.alloc(Datum, row.len + 1);
+                @memcpy(output[0..row.len], row);
+                output[row.len] = switch (truth) {
+                    .yes => Datum.json(.{ .bool = true }),
+                    .no => Datum.json(.{ .bool = false }),
+                    .unknown => .{},
+                };
+                return output;
+            }
             fn nextJoin(self: *Iterator, alloc: Allocator, join: @FieldType(@FieldType(binding.Node, "operation"), "join")) anyerror!?[]const Datum {
+                if (join.membership != null) return self.nextMembership(alloc, join);
                 const kind = if (self.flipped_join) switch (join.kind) {
                     .right => .left,
                     .left => .right,

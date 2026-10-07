@@ -661,6 +661,7 @@ const Builder = struct {
     /// A plain semi/anti join is insufficient: an unmatched NOT IN must still
     /// become UNKNOWN when the correlated inner set contains SQL NULL.
     fn membership(self: *Builder, expression: *const ast.Scalar) anyerror!*const ast.Scalar {
+        if (expression.call.args.len == 1 and expression.call.args[0].* == .call and std.mem.eql(u8, expression.call.args[0].call.name, "$row")) return self.tupleMembership(expression);
         const original = try self.valueQuery(expression.call.subquery.?, true);
         if (expression.call.args.len != 1 or original.columns.len != 1 or original.count_all) return error.InvalidSqlParameters;
         if (original.set_operation != null or original.ctes.len != 0 or original.order_by.len != 0 or original.limit != null or original.offset != null or original.group_by.len != 0 or original.having != null or @import("aggregate_binding.zig").accepts(original.*) or @import("window_binding.zig").accepts(original.*)) return error.UnsupportedSqlShape;
@@ -724,6 +725,89 @@ const Builder = struct {
         branches[2] = .{ .condition = try self.scalar(.{ .binary = .{ .op = .@"or", .left = try self.scalar(.{ .unary = .{ .op = .is_null, .operand = operand } }), .right = try self.scalar(.{ .binary = .{ .op = .gt, .left = total, .right = nonnull } }) } }), .value = try self.scalar(.{ .cast = .{ .type = .boolean, .operand = try self.scalar(.{ .literal = .null }) } }) };
         return self.scalar(.{ .case_when = .{ .branches = branches, .otherwise = try self.scalar(.{ .literal = .{ .boolean = false } }) } });
     }
+    fn tupleMembership(self: *Builder, expression: *const ast.Scalar) anyerror!*const ast.Scalar {
+        const original = expression.call.subquery.?;
+        const operands = expression.call.args[0].call.args;
+        if (operands.len == 0 or operands.len > 256) return error.InvalidSqlSyntax;
+        var local: Names = .empty;
+        if (original.source) |source| try aliases(self.alloc, source, &local) else if (original.table) |table| try local.put(self.alloc, table.table, {});
+        var keys: std.ArrayList(Key) = .empty;
+        // Non-keyed correlated query boundaries need an Apply-owned producer;
+        // never strip their sort/page/group domain while hoisting a build.
+        const residual = if (original.predicate) |predicate| self.extract(try self.predicateScalar(predicate), local, &keys, null) catch |err| switch (err) {
+            error.UnsupportedSqlShape => return self.tupleProducer(original, operands),
+            else => return err,
+        } else null;
+        for (original.columns) |column| if (!column.wildcard) {
+            const value = column.expression orelse try self.scalar(.{ .column = column.field });
+            if (self.referencesOuter(value, local) or (keys.items.len != 0 and value.* != .column and value.* != .literal)) return self.tupleProducer(original, operands);
+        };
+        if (keys.items.len != 0 and scalarBoundary(original.*)) return self.tupleProducer(original, operands);
+        if (keys.items.len + operands.len > 256) return error.SqlProgramLimitExceeded;
+        const alias = try std.fmt.allocPrint(self.alloc, "$membership_{d}", .{self.serial});
+        self.serial += 1;
+        if (self.serial > 64 or self.outer.contains(alias)) return error.SqlProgramLimitExceeded;
+        try self.outer.put(self.alloc, alias, {});
+        const probes = try self.alloc.alloc(*const ast.Scalar, keys.items.len + operands.len);
+        var query = original.*;
+        if (keys.items.len != 0) {
+            const columns = try self.alloc.alloc(ast.Projection, keys.items.len + original.columns.len);
+            for (keys.items, columns[0..keys.items.len], probes[0..keys.items.len]) |key, *column, *probe| {
+                column.* = .{ .expression = key.inner };
+                probe.* = try self.rewrite(key.outer);
+            }
+            @memcpy(columns[keys.items.len..], original.columns);
+            query.columns = columns;
+            query.predicate = if (residual) |value| blk: {
+                const predicate = try self.alloc.create(ast.Predicate);
+                predicate.* = .{ .scalar = value };
+                break :blk predicate;
+            } else null;
+        }
+        for (operands, probes[keys.items.len..]) |operand, *probe| probe.* = try self.rewrite(operand);
+        const owned = try self.alloc.create(ast.Select);
+        owned.* = query;
+        self.source = try self.relation(.{ .join = .{
+            .kind = .left,
+            .left = self.source,
+            .right = try self.relation(.{ .derived = .{ .query = owned, .alias = alias, .hidden = true } }),
+            .membership = .{ .probes = probes, .correlations = keys.items.len, .alias = alias },
+        } });
+        return self.field(alias, "$value");
+    }
+
+    /// Preserve complex correlated query boundaries and demand. Summarize the
+    /// child's actual output rows, not rows eliminated by its WHERE/sort/page
+    /// operators. A row equality is a three-valued conjunction; separate true
+    /// and unknown witnesses distinguish an empty/false set from NULL evidence.
+    fn tupleProducer(self: *Builder, original: *const ast.Select, operands: []const *const ast.Scalar) anyerror!*const ast.Scalar {
+        const alias = try std.fmt.allocPrint(self.alloc, "$tuple_demand_{d}", .{self.serial});
+        self.serial += 1;
+        if (self.serial > 64 or self.outer.contains(alias)) return error.SqlProgramLimitExceeded;
+        try self.outer.put(self.alloc, alias, {});
+        const names = try self.alloc.alloc([]const u8, operands.len);
+        var comparison: ?*const ast.Scalar = null;
+        for (operands, names, 0..) |operand, *name, index| {
+            name.* = try std.fmt.allocPrint(self.alloc, "$value_{d}", .{index});
+            const value = try self.prerequisite(try self.rewrite(operand), null);
+            const equal = try self.scalar(.{ .binary = .{ .op = .eq, .left = value, .right = try self.field("$tuple_input", name.*) } });
+            comparison = if (comparison) |prior| try self.scalar(.{ .binary = .{ .op = .@"and", .left = prior, .right = equal } }) else equal;
+        }
+        const yes = try self.call("bool_or", &.{comparison.?});
+        const unknown = try self.call("bool_or", &.{try self.testValue(.is_null, comparison.?)});
+        const truth = try self.scalar(.{ .case_when = .{
+            .branches = try self.alloc.dupe(ast.Scalar.Branch, &.{
+                .{ .condition = try self.testValue(.is_true, yes), .value = try self.scalar(.{ .literal = .{ .boolean = true } }) },
+                .{ .condition = try self.testValue(.is_true, unknown), .value = try self.scalar(.{ .cast = .{ .type = .boolean, .operand = try self.scalar(.{ .literal = .null }) } }) },
+            }),
+            .otherwise = try self.scalar(.{ .literal = .{ .boolean = false } }),
+        } });
+        const query = try self.alloc.create(ast.Select);
+        query.* = .{ .source = try self.relation(.{ .derived = .{ .query = original, .alias = "$tuple_input", .columns = names } }), .columns = try self.alloc.dupe(ast.Projection, &.{.{ .alias = "$value", .expression = truth }}) };
+        self.source = try self.relation(.{ .join = .{ .kind = .left, .left = self.source, .right = try self.relation(.{ .derived = .{ .query = query, .alias = alias, .hidden = true, .lateral = true } }) } });
+        return self.field(alias, "$value");
+    }
+
     fn rewrite(self: *Builder, input: *const ast.Scalar) anyerror!*const ast.Scalar {
         return self.rewriteDemand(input, null);
     }

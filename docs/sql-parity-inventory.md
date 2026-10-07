@@ -217,8 +217,8 @@ original entry remains identifiable by its canonical hash (sorted JSON keys,
 compact separators, UTF-8 without ASCII escaping).
 
 The matching `sql_parity_dispositions.json` must account for every ID exactly once.
-The current branch records 359 implemented, 136 rejected and 73 superseded
-cases, with 1,018 still unresolved. The earlier batches add 77 exact compiler
+The current branch records 365 implemented, 136 rejected and 73 superseded
+cases, with 1,012 still unresolved. The earlier batches add 77 exact compiler
 rejection contracts, 115 mounted native reads, twelve native UPDATE/DELETE
 contracts and six independently referenced mutations
 contracts; they do not claim complete SQL
@@ -231,7 +231,14 @@ positive contracts. Native execution checks full persisted state as well as
 public results. Five recorded gates verify mounted execution, both PostgreSQL
 references, oracle safety/ordering contracts and pipeline allocation-fault
 regressions. This is a validated batch, not completion of either entire campaign;
-getting below 800 now requires at least 225 additional resolved dispositions.
+getting below 800 now requires at least 213 additional resolved dispositions.
+
+Six exact correlated and tuple-membership UPDATE/DELETE originals
+(`sql-0600`–`sql-0602`, `sql-0610`–`sql-0612`) now execute against native typed
+storage through mounted HTTP. Independent PostgreSQL results check affected
+counts and complete persisted state of all three tables, with duplicate and
+SQL NULL witnesses. Logical keys remain unchanged; these contracts do not
+claim distributed constraint-owner activation.
 
 Eight further original cases (`sql-0220`–`sql-0222`, `sql-0284`, `sql-0302`,
 `sql-1226`, `sql-1227` and `sql-1340`) now execute typed array predicates through

@@ -153,8 +153,8 @@ fn relationPlan(alloc: Allocator, bound: *const relation.Bound, node: *const rel
         },
         .join => |join| blk: {
             const source: Plan = .{
-                .node_type = if (join.left_keys.len != 0 and join.right_keys.len != 0) "Hash Join" else "Join",
-                .join_kind = @tagName(join.kind),
+                .node_type = if (join.membership != null) "Null-aware Membership" else if (join.left_keys.len != 0 and join.right_keys.len != 0) "Hash Join" else "Join",
+                .join_kind = if (join.membership != null) "membership" else @tagName(join.kind),
                 .plans = try alloc.dupe(Plan, &.{ try relationPlan(alloc, bound, join.left, verbose, depth + 1, remaining), try relationPlan(alloc, bound, join.right, verbose, depth + 1, remaining) }),
             };
             var functions: std.ArrayList([]const u8) = .empty;

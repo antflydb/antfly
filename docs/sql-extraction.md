@@ -3690,11 +3690,11 @@ HTTP over native typed storage and the independently reproduced PostgreSQL
 golden. All 77 pre-existing read contracts remain unchanged; the selected read
 golden contains 78 contracts. Golden extension requires a checked baseline and
 fails on existing drift, unknown/duplicate IDs or PostgreSQL rejection.
-The inventory records 359 implemented, 136 rejected, 73 superseded and 1,018
+The inventory records 365 implemented, 136 rejected, 73 superseded and 1,012
 unresolved cases. General array regressions do not create additional original
 case credit, and native stored-array columns remain unfinished.
 
-### NULL-aware tuple membership execution kernel (integration pending)
+### NULL-aware tuple membership in captured relational execution
 
 `sql/tuple_membership.zig`, exported through the relational operators, provides
 the retained lookup kernel for row-valued `IN` and `NOT IN`. Ordinary equality
@@ -3711,8 +3711,10 @@ visit only compatible prefixes using a fixed stack bounded by the admitted
 JSON key serialization and exponential precomputed NULL-mask tables. Duplicate
 right tuples share their complete path. Array keys preserve dimensions, lower
 bounds, exact integer values and element NULL flags; JSONB null is a non-NULL
-SQL value. The future binder must establish common typed comparison domains
-before building or probing the index, as it does for ordinary hash joins.
+SQL value. The binder establishes per-position common comparison domains and
+checks exact arity before opening sources. Array equality requires identical
+element types, unlike numeric array promotion in UNION/VALUES; incompatible
+operator signatures produce PostgreSQL's undefined-operator diagnostic.
 
 Input-row, retained-byte and cumulative-work admission and cooperative
 checkpoints bound build and ambiguous searches. A failed build poisons the
@@ -3722,13 +3724,36 @@ exercise complete cleanup, and deterministic work tests bound 4,096 exact
 two-column probes independently of machine timing. PostgreSQL independently
 reproduces 1,740 IN/NOT IN truth pairs over 110 right-hand multisets, including
 all one/two-column NULL combinations, duplicates, empty sources and selected
-three-column sources. No original-case disposition credit is claimed here.
+three-column sources. Kernel tests alone do not create original-case credit.
 
-Still required before public activation: parse row constructors in membership
-contexts; bind per-position common types and exact arity errors; lower to a
-statement-owned captured membership relation rather than a scalar JSON value;
-share correlated build partitions and invariant source work; integrate spill
-and admission with the relation iterator; and verify unchanged original reads
-and mutations through mounted HTTP/pgwire and complete persisted-state checks.
-Scalar membership's existing grouped fast path remains unchanged until that
-adapter is ready. In particular, `sql-0602` and `sql-0612` remain unresolved.
+Parenthesized and explicit ROW constructors now lower in membership contexts
+to a compiler-owned relational operator, not a serialized JSON scalar. Cold
+scan projections retain both build and probe keys. Equality-correlated keys
+prefix the retained lookup; NULL correlation keys select an empty inner domain,
+not the wildcard NULL semantics of tuple comparison. Invariant builds can be
+shared across Apply/recursive iterations. Complex correlated projections and
+sort/page/group boundaries instead preserve the original child query inside a
+demanded LATERAL producer. Separate true and unknown witnesses summarize its
+actual output without evaluating expressions in eliminated correlation groups.
+Masked branches keep their existing demand and lexical outer-frame bindings.
+Scalar membership's existing grouped fast path remains unchanged.
+
+Six original correlated and tuple-membership mutations (`sql-0600`–`sql-0602`,
+`sql-0610`–`sql-0612`) execute unchanged through mounted HTTP. Independent
+PostgreSQL golden results verify affected counts and complete persisted state
+of all source/target tables, with duplicate and SQL NULL witnesses. Each
+statement captures one native read set; logical keys are unchanged and no
+distributed constraint-owner activation is inferred from these fixtures.
+
+Fourteen complete native query contracts are independently checked against
+PostgreSQL, including query boundaries, masked evaluation, array/JSONB keys,
+and correlated NULL witnesses. An allocation-failure campaign exercises the
+retained Apply build lifecycle. EXPLAIN identifies NULL-aware membership rather
+than calling it an ordinary hash join.
+
+Remaining architecture includes spill-backed membership, finer-grained
+correlation dependency pruning and partition reuse, broader row/composite
+expressions, consistent arity diagnostics through complex derived projections,
+and broader mounted read/pgwire coverage. Retained-byte, row and work admission
+currently fail closed; this is not an unbounded fallback or a claim that the
+entire distributed SQL architecture is complete.

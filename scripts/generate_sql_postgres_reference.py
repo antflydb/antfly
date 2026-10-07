@@ -791,7 +791,10 @@ def document_reference(db, cases, schemas):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("campaign", choices=["read", "document", "lateral", "mutation"])
+    parser.add_argument(
+        "campaign",
+        choices=["read", "document", "lateral", "mutation", "correlated_mutation"],
+    )
     parser.add_argument(
         "--check",
         type=Path,
@@ -826,12 +829,14 @@ def main():
     ]
     cases = [case for case in inventory if case["id"] in set(requested)]
     with postgres() as db:
-        if args.campaign in {"read", "lateral", "mutation"}:
+        if args.campaign in {"read", "lateral", "mutation", "correlated_mutation"}:
             profile = json.loads(
                 (FIXTURES / f"sql_{args.campaign}_campaign_profile.json").read_text()
             )
             result = (
-                mutation_reference if args.campaign == "mutation" else read_reference
+                mutation_reference
+                if args.campaign in {"mutation", "correlated_mutation"}
+                else read_reference
             )(db, cases, profile)
         else:
             result = document_reference(

@@ -110,7 +110,7 @@ pub const Node = struct {
         recursive: struct { id: usize, seed: *const Node, step: *const Node, all: bool },
         materialized_ref: *const Node,
         scan: struct { index: usize, source_columns: []const []const u8 },
-        join: struct { kind: ast.JoinKind, left: *const Node, right: *const Node, condition: ?scalar.Program, left_keys: []const scalar.Program, right_keys: []const scalar.Program, correlation: bool = false },
+        join: struct { kind: ast.JoinKind, left: *const Node, right: *const Node, condition: ?scalar.Program, left_keys: []const scalar.Program, right_keys: []const scalar.Program, correlation: bool = false, membership: ?struct { correlations: usize } = null },
         apply: struct { id: usize, kind: ast.JoinKind, left: *const Node, right: *const Node, condition: ?scalar.Program, demand: ?scalar.Program = null },
         query: struct { source: *const Node, statement: ast.Select, binding: describe.BoundStatement, preserve_scope: bool = false, constant_refs: []const ConstantRef = &.{} },
         set: struct { kind: ast.SetKind, all: bool, left: *const Node, right: *const Node },
@@ -832,6 +832,9 @@ const Builder = struct {
     fn querySource(self: *Builder, statement: ast.Select, scope: []const ast.Cte, depth: usize) anyerror!*const Node {
         const source = try self.querySourceBody(statement, scope, depth);
         if (statement.selection_staged) return source;
+        return self.withOuter(source);
+    }
+    fn withOuter(self: *Builder, source: *const Node) anyerror!*const Node {
         const nearest = self.outer_scope orelse return source;
         var outer: ?*const Node = null;
         var frame: ?*const OuterScope = nearest;
@@ -840,6 +843,13 @@ const Builder = struct {
             frame = current.parent;
             level += 1;
         }) {
+            // A compiler-owned membership probe binds before its enclosing
+            // SELECT programs. Do not attach the same lexical frame again
+            // when that SELECT subsequently completes source construction.
+            const present = for (source.columns) |column| {
+                if (column.outer_frame == current.id and column.outer_level != 0) break true;
+            } else false;
+            if (present or current.columns.len == 0) continue;
             const columns = try self.alloc.dupe(Column, current.columns);
             for (columns, 0..) |*column, ordinal| {
                 column.outer_level = level;
@@ -849,7 +859,7 @@ const Builder = struct {
             const reference = try self.node(columns, .{ .outer_ref = current.id });
             outer = if (outer) |left| try self.joinNode(left, reference, .cross, null, null) else reference;
         }
-        const result = try self.joinNode(outer.?, source, .cross, null, null);
+        const result = try self.joinNode(outer orelse return source, source, .cross, null, null);
         // Keep the binding domain intact until WHERE has been lowered. Its
         // correlation keys then become a reusable hash build, not a Cartesian
         // scan followed by a residual predicate for every parent.
@@ -1236,6 +1246,10 @@ const Builder = struct {
                     }
                     break :right source;
                 } else try self.relation(join.right, scope, depth + 1);
+                if (join.membership) |membership| {
+                    if (join.kind != .left or join.condition != null or join.demand != null or lateral) return error.InvalidSqlBackendResponse;
+                    break :blk try self.membershipNode(left, right, membership.probes, membership.correlations, membership.alias);
+                }
                 for (left.columns) |a| for (right.columns) |b| if (std.mem.eql(u8, a.qualifier, b.qualifier)) return error.AmbiguousSqlColumn;
                 const columns = try self.joinColumns(left, right, join.kind);
                 const expression_ = if (join.condition) |condition| try self.expression(columns, condition, &.{}) else null;
@@ -1268,6 +1282,43 @@ const Builder = struct {
             column.nullable = true;
         };
         return columns;
+    }
+
+    fn membershipNode(self: *Builder, input: *const Node, right: *const Node, probes: []const *const ast.Scalar, correlations: usize, alias: []const u8) !*const Node {
+        const left = try self.withOuter(input);
+        if (probes.len != right.columns.len or probes.len <= correlations or probes.len > 256) return error.InvalidSqlSyntax;
+        const columns = try self.alloc.alloc(Column, left.columns.len + 1);
+        @memcpy(columns[0..left.columns.len], left.columns);
+        columns[left.columns.len] = .{ .name = "$value", .internal = try self.internal(), .qualifier = alias, .type = .boolean, .nullable = true, .visible = false };
+        const left_programs = try self.alloc.alloc(scalar.Program, if (self.shape_only) 0 else probes.len);
+        const right_programs = try self.alloc.alloc(scalar.Program, if (self.shape_only) 0 else probes.len);
+        const left_types = try self.scalarColumns(left.columns);
+        const right_types = try self.scalarColumns(right.columns);
+        for (probes, right.columns, 0..) |probe, right_column, index| {
+            const left_expression = try self.expression(left.columns, probe, &.{});
+            const right_expression = try self.scalarNode(.{ .column = right_column.internal });
+            if (self.shape_only) {
+                const comparison = try self.scalarNode(.{ .binary = .{ .op = .eq, .left = try self.inferenceExpression(left_expression, left.columns), .right = right_column.origin orelse return error.InvalidSqlBackendResponse } });
+                try self.constraints.append(self.alloc, .{ .expression = comparison, .expected = .boolean });
+                continue;
+            }
+            var common = try self.setType(left_expression, left_types);
+            // Equality's polymorphic anyarray signature requires one exact
+            // element type. Unlike UNION/VALUES, it does not promote int2[]
+            // to int8[] or float[] merely because their cells are numeric.
+            if (common.kind == .array and right_column.type == .array and !right_column.untyped_null and common.element_type != right_column.element_type) return error.SqlUndefinedOperator;
+            mergeInferredType(&common, if (right_column.untyped_null) .{} else .{ .kind = right_column.type, .element_type = right_column.element_type, .nullable = right_column.nullable }) catch |err| return switch (err) {
+                error.SqlTypeMismatch, error.SqlCannotCoerce => error.SqlUndefinedOperator,
+                else => err,
+            };
+            common = resolveUnknown(common);
+            const l = try self.scalarNode(.{ .cast = .{ .operand = left_expression, .type = common.kind.?, .element_type = common.element_type } });
+            const r = try self.scalarNode(.{ .cast = .{ .operand = right_expression, .type = common.kind.?, .element_type = common.element_type } });
+            left_programs[index] = try scalar.bindWithSettings(self.alloc, l, left_types, self.parameters, .{ .invocation = self.backend.parameter_invocation }, self.backend.settings_view);
+            right_programs[index] = try scalar.bindWithSettings(self.alloc, r, right_types, self.parameters, .{ .invocation = self.backend.parameter_invocation }, self.backend.settings_view);
+        }
+        if (self.shape_only) columns[left.columns.len].origin = try self.scalarNode(.{ .cast = .{ .type = .boolean, .operand = try self.scalarNode(.{ .literal = .null }) } });
+        return self.node(columns, if (self.shape_only) .singleton else .{ .join = .{ .kind = .left, .left = left, .right = right, .condition = null, .left_keys = left_programs, .right_keys = right_programs, .membership = .{ .correlations = correlations } } });
     }
 
     fn joinNode(self: *Builder, left: *const Node, right: *const Node, kind: ast.JoinKind, expression_: ?*const ast.Scalar, apply_id: ?usize) !*const Node {
@@ -1460,6 +1511,8 @@ fn projectScans(builder: *Builder, node: *const Node, needed: *std.StringHashMap
         },
         .join => |join| {
             if (join.condition) |program| for (program.required_columns) |ordinal| try needed.put(builder.alloc, node.columns[ordinal].internal, {});
+            for (join.left_keys) |program| for (program.required_columns) |ordinal| try needed.put(builder.alloc, join.left.columns[ordinal].internal, {});
+            for (join.right_keys) |program| for (program.required_columns) |ordinal| try needed.put(builder.alloc, join.right.columns[ordinal].internal, {});
             try projectScans(builder, join.left, needed);
             try projectScans(builder, join.right, needed);
         },

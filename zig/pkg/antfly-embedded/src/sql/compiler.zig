@@ -461,7 +461,19 @@ const Parser = struct {
                 query.* = nested.select;
                 try self.singleColumnSubquery(query.*);
                 left = try self.scalarNode(.{ .call = .{ .name = "$scalar", .args = &.{}, .subquery = query } });
-            } else left = try self.scalar(depth + 1, 0);
+            } else {
+                left = try self.scalar(depth + 1, 0);
+                if (self.take(.comma)) {
+                    var fields: std.ArrayList(*const ast.Scalar) = .empty;
+                    try fields.append(self.alloc, left);
+                    while (true) {
+                        if (fields.items.len == 256) return self.fail(error.SqlLimitExceeded, "row expression exceeds column limit");
+                        try fields.append(self.alloc, try self.scalar(depth + 1, 0));
+                        if (!self.take(.comma)) break;
+                    }
+                    left = try self.scalarNode(.{ .call = .{ .name = "$row", .args = try fields.toOwnedSlice(self.alloc) } });
+                }
+            }
             try self.expect(.rparen);
         } else if (self.keyword(.cast)) {
             try self.expect(.lparen);
@@ -563,7 +575,10 @@ const Parser = struct {
                 try self.expect(.rparen);
             }
             const window_spec = if (self.keyword(.over)) try self.window(depth + 1) else null;
-            left = try self.scalarNode(.{ .call = .{ .name = name_value, .args = try args.toOwnedSlice(self.alloc), .star = star, .distinct = distinct, .filter = filter, .window = window_spec, .within_group = within_group } });
+            const row = !function.owned and std.mem.eql(u8, name_value, "row");
+            if (row and (distinct or star or filter != null or window_spec != null or within_group != null)) return self.fail(error.InvalidSqlSyntax, "ROW constructor does not accept aggregate modifiers");
+            if (row and args.items.len > 256) return self.fail(error.SqlLimitExceeded, "row expression exceeds column limit");
+            left = try self.scalarNode(.{ .call = .{ .name = if (row) "$row" else name_value, .args = try args.toOwnedSlice(self.alloc), .star = star, .distinct = distinct, .filter = filter, .window = window_spec, .within_group = within_group } });
         } else if (self.peek(.identifier) and !self.tokens[self.pos].isKeyword(.null) and !self.tokens[self.pos].isKeyword(.true) and !self.tokens[self.pos].isKeyword(.false)) {
             left = try self.scalarNode(.{ .column = try self.field() });
         } else left = try self.scalarNode(.{ .literal = try self.value() });
@@ -589,7 +604,8 @@ const Parser = struct {
                         const nested = try self.statement();
                         if (nested != .select) return self.fail(error.InvalidSqlSyntax, "subquery requires SELECT");
                         query.* = nested.select;
-                        try self.singleColumnSubquery(query.*);
+                        const tuple = left.* == .call and std.mem.eql(u8, left.call.name, "$row");
+                        if (!tuple) try self.singleColumnSubquery(query.*);
                         self.relation_depth -= 1;
                         try self.expect(.rparen);
                         left = try self.scalarNode(.{ .call = .{ .name = "$in_subquery", .args = try self.alloc.dupe(*const ast.Scalar, &.{left}), .subquery = query } });
