@@ -29,7 +29,7 @@ pub const Budget = json_order.Budget;
 /// Text uses the binary/C collation. Other collations require a bound codec.
 pub const ElementType = @import("../common/sql_builtin_type.zig").Type;
 
-pub const Dimension = struct { length: u32, lower: i32 = 1 };
+pub const Dimension = @import("../common/sql_array_layout.zig").Dimension;
 pub const Limits = struct { elements: usize = 65536, bytes: usize = 8 * 1024 * 1024, work: usize = 1_048_576 };
 pub const Comparison = enum {
     eq,

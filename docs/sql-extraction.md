@@ -3926,3 +3926,35 @@ change the number of fault points between trials; every growth allocation remain
 faulted and leak-checked. These are shared architecture contracts, not new
 original-case credits: 365 implemented, 136 rejected, 73 superseded and 1,012
 unresolved remain the authoritative inventory.
+
+### Compact schema-bound array codec groundwork
+
+A borrowed, allocation-free directory now addresses flat typed array payloads
+using schema-owned element identity, dimensions/lower bounds, a NULL bitmap and
+fixed-width slots or variable-width offsets. NULL-heavy primitive arrays use
+non-NULL slots with rank checkpoints every 64 cells; lookup remains constant
+time. Header-only shape projection reads O(rank) metadata from already
+authenticated rows. Untrusted publication requires full structural and canonical
+validation, including bounded semantic JSONB checks; shape projection alone is
+not a restore gate.
+
+Primitive preparation allocates nothing and encoding makes one exact output
+allocation. JSONB canonicalizes each element once during preparation; strict
+validation reuses bounded scratch storage and rejects, rather than repairs,
+noncanonical input. Allocation-failure tests also exposed and fixed the shared
+JSON memory writer's `WriteFailed` mapping: buffer exhaustion now propagates as
+`OutOfMemory`, allowing quota and injected-failure handling to remain accurate.
+
+Tests cover eleven PostgreSQL binary fixtures across all nine element types,
+multidimensional/nondefault bounds, SQL NULL versus JSONB null, exact bigint and
+floating-point representations, 135 dense/compact boundary cohorts, malformed
+directories, truncated frames, budgets and exhaustive allocation failures. A
+4,096-cell fixture with one eighth NULL occupies 4,372 bytes for boolean, 7,956
+for int16 and 29,460 for int64, versus PostgreSQL wire sizes of 19,988, 23,572 and
+45,076 bytes respectively. These are codec byte/allocation measurements, not an
+end-to-end storage latency claim.
+
+This codec is not yet a published native column format. Native schema capability
+activation, row preparation/materialization, semantic hashing, index semantics
+and restore integration remain required before stored-array DDL can be enabled.
+No original SQL case receives new implementation credit from this groundwork.

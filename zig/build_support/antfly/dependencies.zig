@@ -336,7 +336,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     // transitive tests require different owner roots. Select the SQL and
     // row-policy contract namespaces at compile time, while allowing explicit
     // caller filters.
-    const sql_tests = b.addTest(.{ .root_module = sql_test_mod, .filters = selectTestFilters(b, &.{ "sql.", "system_catalog.policies" }) });
+    const sql_tests = b.addTest(.{ .root_module = sql_test_mod, .filters = selectTestFilters(b, &.{ "sql.", "common.sql_array_layout", "system_catalog.policies" }) });
     const run_sql_tests = b.addRunArtifact(sql_tests);
     // The native SQL contract corpus is larger than the parser-only owner but
     // remains below the full database compilation and integration test roots.

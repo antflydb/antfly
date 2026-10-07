@@ -28,6 +28,7 @@ test {
     _ = @import("antfly_local_sources").sql_replay_rows;
     _ = @import("antfly_local_sources").sql_array_value;
     _ = @import("antfly_local_sources").sql_array_binary;
+    _ = @import("antfly_local_sources").sql_array_storage;
     _ = @import("antfly_local_sources").sql_array_wire;
     _ = @import("antfly_local_sources").sql_decision_eval;
     _ = @import("antfly_local_sources").sql_describe;

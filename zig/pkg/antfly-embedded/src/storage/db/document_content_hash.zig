@@ -308,7 +308,12 @@ fn hashCanonicalJsonBytes(hasher: *std.crypto.hash.Blake3, encoded: []const u8) 
 pub fn canonicalJsonValueAlloc(alloc: std.mem.Allocator, value: std.json.Value) ![]u8 {
     var writer: std.Io.Writer.Allocating = .init(alloc);
     errdefer writer.deinit();
-    try writeCanonicalJsonValue(alloc, &writer.writer, value);
+    // This writer only targets an allocating memory buffer, never external IO.
+    // Preserve allocation-failure semantics for callers' quota/fault handling.
+    writeCanonicalJsonValue(alloc, &writer.writer, value) catch |err| return switch (err) {
+        error.WriteFailed => error.OutOfMemory,
+        else => err,
+    };
     return try writer.toOwnedSlice();
 }
 
