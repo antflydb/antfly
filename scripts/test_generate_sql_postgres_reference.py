@@ -505,6 +505,25 @@ class PostgresReferenceTest(unittest.TestCase):
                     self.db.execute(invalid["sql"])
             self.assertEqual("42703", error.exception.sqlstate)
 
+    def test_jsonb_concatenation_reference(self):
+        import json
+        from pathlib import Path
+
+        fixture = json.loads(
+            (
+                Path(__file__).resolve().parents[1]
+                / "zig/pkg/antfly-embedded/src/sql/fixtures/sql_json_concat_reference.json"
+            ).read_text()
+        )
+        self.assertEqual(20, len(fixture["entries"]))
+        for case in fixture["entries"]:
+            with self.subTest(sql=case["sql"]):
+                value, sql_null = self.db.execute(
+                    "SELECT v,v IS NULL FROM (SELECT " + case["sql"] + " AS v) q"
+                ).fetchone()
+                self.assertEqual(case["value"], value)
+                self.assertEqual(case.get("sql_null", False), sql_null)
+
     def test_json_and_typed_array_containment_reference(self):
         import json
         from pathlib import Path

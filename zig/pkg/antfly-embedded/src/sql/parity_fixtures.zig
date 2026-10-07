@@ -19,6 +19,7 @@ pub const read_rows = @embedFile("fixtures/sql_read_reference_rows.json");
 pub const read_reference = @embedFile("fixtures/sql_read_reference.json");
 pub const mutation_campaign = @embedFile("fixtures/sql_mutation_campaign.json");
 pub const mutation_reference = @embedFile("fixtures/sql_mutation_reference.json");
+pub const mutation_postgres_reference = @embedFile("fixtures/sql_mutation_postgres_reference.json");
 pub const document_campaign = @embedFile("fixtures/sql_document_campaign.json");
 pub const document_reference = @embedFile("fixtures/sql_document_reference.json");
 pub const read_campaign_reference = @embedFile("fixtures/sql_read_campaign_reference.json");

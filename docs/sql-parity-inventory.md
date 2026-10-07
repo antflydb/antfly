@@ -352,6 +352,24 @@ partial/expression indexes and CHECK/FK owners still require their own profiles.
 Neither a PostgreSQL golden nor discovery alone changes an original disposition;
 the complete native endpoint, storage and owner contracts remain required.
 
+JSONB concatenation now uses the shared typed scalar pipeline: object merges
+are shallow with right-hand key precedence, while other operands become a
+single concatenated array. SQL NULL remains distinct from JSON null. Only the
+outer container is allocated; nested immutable values and keys retain their
+evaluation lifetime without serialization or deep copying. Allocation admission
+covers actual container capacity, including the object-map index, and work
+admission covers copied slots and hashed key bytes. Twenty independent
+PostgreSQL contracts and allocation-fault tests cover this overload.
+
+The PostgreSQL native mutation runner resets and reads back every fixture table,
+compares complete RETURNING labels/types/SQL NULL provenance and affected rows,
+and verifies complete stored values independently of SQL projections. The
+initial endpoint case is `sql-1500`, which changes only a non-key JSONB column.
+It does not activate the PostgreSQL profile's logical primary-key owner in
+native storage. Key-changing, conflict and joined cases therefore still need
+their matching constraint-owner and routed-read fixtures; no original
+disposition credit is granted by this initial integration.
+
 ```sh
 uv run --no-project --with 'psycopg[binary]==3.3.6' python scripts/generate_sql_postgres_reference.py mutation --check zig/pkg/antfly-embedded/src/sql/fixtures/sql_mutation_postgres_reference.json
 ```

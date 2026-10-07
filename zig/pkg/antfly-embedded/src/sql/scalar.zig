@@ -354,6 +354,27 @@ fn arrayOperator(left: Type, right: Type) !void {
     if (left.kind == .array and right.kind == .array and left.element_type != right.element_type) return error.SqlUndefinedOperator;
 }
 
+test "SQL JSONB concatenation matches PostgreSQL typed scalar contracts" {
+    const fixture = try std.json.parseFromSlice(struct {
+        reference: []const u8,
+        entries: []const struct { sql: []const u8, value: Json, sql_null: bool = false },
+    }, std.testing.allocator, @embedFile("fixtures/sql_json_concat_reference.json"), .{});
+    defer fixture.deinit();
+    try std.testing.expectEqual(@as(usize, 20), fixture.value.entries.len);
+    for (fixture.value.entries) |entry| {
+        var compiled = try @import("compiler.zig").compileScalar(std.testing.allocator, entry.sql, .{});
+        defer compiled.deinit();
+        var program = try bind(std.testing.allocator, compiled.expression, &.{}, &.{}, .{});
+        defer program.deinit();
+        try std.testing.expectEqual(ast.ColumnType.json, program.output_type.kind.?);
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const result = try program.evaluate(arena.allocator(), &.{}, &.{}, .{});
+        try std.testing.expectEqual(entry.sql_null, result.sql_null);
+        try std.testing.expectEqual(std.math.Order.eq, try compare(result.value, entry.value));
+    }
+}
+
 test "SQL JSON and typed array containment match PostgreSQL scalar contracts" {
     const fixture = try std.json.parseFromSlice(struct {
         reference: []const u8,
@@ -929,7 +950,11 @@ const Binder = struct {
                         if (merged.kind == .number and (left.element_type == .float32 or right.element_type == .float32) and !(left.element_type == .float32 and right.element_type == .float32)) result_type.element_type = .float64;
                         break :blk result_type;
                     },
-                    .concat, .like, .ilike => if (merged.kind != null and merged.kind != .string) return error.SqlTypeMismatch,
+                    .concat => {
+                        if (merged.kind != null and merged.kind != .string and merged.kind != .json) return error.SqlTypeMismatch;
+                        break :blk .{ .kind = merged.kind orelse .string, .nullable = merged.nullable };
+                    },
+                    .like, .ilike => if (merged.kind != null and merged.kind != .string) return error.SqlTypeMismatch,
                     .@"and", .@"or" => if (merged.kind != null and merged.kind != .boolean) return error.SqlTypeMismatch,
                     else => {},
                 }
@@ -1182,7 +1207,8 @@ const Binder = struct {
                 const merged = try common(try self.infer(binary.left, depth + 1), try self.infer(binary.right, depth + 1));
                 const operand_kind: ?ast.ColumnType = switch (binary.op) {
                     .@"and", .@"or" => .boolean,
-                    .concat, .like, .ilike => .string,
+                    .concat => merged.kind orelse .string,
+                    .like, .ilike => .string,
                     .add, .subtract, .multiply, .divide, .modulo => merged.kind orelse expected,
                     else => merged.kind,
                 };
@@ -1429,6 +1455,17 @@ const Evaluator = struct {
                 if (binary.op == .json_get) break :blk Datum.json(value);
                 if (value == .null) break :blk .{};
                 break :blk Datum.json(.{ .string = if (value == .string) value.string else try self.jsonText(value) });
+            } else if (binary.op == .concat and instruction.type.kind == .json) blk: {
+                const left = try self.runDatum(binary.left, depth + 1);
+                const right = try self.runDatum(binary.right, depth + 1);
+                if (left.sql_null or right.sql_null) break :blk .{};
+                if (left.array != null or right.array != null) return error.SqlTypeMismatch;
+                var work: @import("json_order.zig").Budget = .{ .remaining = self.limits.steps -| self.steps };
+                const before = work.remaining;
+                const joined = try @import("json_concat.zig").concat(self.alloc, left.value, right.value, self.limits.output_bytes -| self.bytes, &work);
+                self.steps += before - work.remaining;
+                try self.charge(joined.allocated_bytes);
+                break :blk Datum.json(joined.value);
             } else if (binary.op == .eq or binary.op == .neq or binary.op == .lt or binary.op == .lte or binary.op == .gt or binary.op == .gte or binary.op == .is_distinct or binary.op == .is_not_distinct) blk: {
                 const left = try self.runDatum(binary.left, depth + 1);
                 const right = try self.runDatum(binary.right, depth + 1);

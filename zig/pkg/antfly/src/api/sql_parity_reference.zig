@@ -318,6 +318,137 @@ pub const MutationReference = struct {
     entries: []const struct { id: []const u8, columns: []const []const u8, rows: []const []const Json, affected: i64, final: []const []const Json },
 };
 
+pub const PostgresMutationReference = struct {
+    pub const Seed = struct { key: []const u8, value: Json };
+    pub const Table = struct { name: []const u8, schema: Json, rows: []const Seed };
+    pub const Rows = struct {
+        columns: []const []const u8,
+        column_oids: []const u32,
+        rows: []const []const Json,
+        sql_nulls: []const []const bool,
+    };
+    profile: struct { schema: Json, rows: []const Seed, additional_tables: []const Table },
+    entries: []const struct {
+        id: []const u8,
+        command_tag: []const u8,
+        affected: i64,
+        columns: []const []const u8,
+        column_oids: []const u32,
+        rows: []const []const Json,
+        sql_nulls: []const []const bool,
+        final_tables: std.json.ArrayHashMap(Rows),
+    },
+};
+
+/// Exact-source native execution plus complete, independent storage read-back
+/// of every fixture table. Selection is explicit and fail-closed, never a
+/// discovery skip. Constraint-owner activation is a separate fixture contract;
+/// callers must not credit key-changing cases using unconstrained native DBs.
+pub fn runPostgresMutations(alloc: std.mem.Allocator, handler: anytype, tables: anytype, reference: PostgresMutationReference, ids: []const []const u8) !void {
+    var corpus = try fixtures.Corpus.init(alloc);
+    defer corpus.deinit();
+    const BatchWrite = @import("antfly_local_sources").storage_db_types.BatchWrite;
+    try std.testing.expectEqual(reference.profile.additional_tables.len + 1, tables.len);
+    for (ids, 0..) |id, ordinal| {
+        const expected = for (reference.entries) |entry| {
+            if (std.mem.eql(u8, id, entry.id)) break entry;
+        } else return error.MissingPostgresMutationReference;
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        try std.testing.expectEqual(tables.len, expected.final_tables.map.count());
+        for (tables, 0..) |table, table_index| {
+            for (tables[0..table_index]) |prior| try std.testing.expect(!std.mem.eql(u8, table.name, prior.name));
+            const seeds = if (std.mem.eql(u8, table.name, "usage_records")) reference.profile.rows else for (reference.profile.additional_tables) |profile| {
+                if (std.mem.eql(u8, profile.name, table.name)) break profile.rows;
+            } else return error.MissingPostgresMutationTable;
+            var previous = try table.db.scan(a, "", "", .{ .include_documents = true, .limit = 4097 });
+            defer previous.deinit(a);
+            try std.testing.expect(previous.documents.len <= 4096);
+            const deletes = try a.alloc([]const u8, previous.documents.len);
+            for (previous.documents, deletes) |document, *key| key.* = document.id;
+            if (deletes.len != 0) try table.db.batch(.{ .deletes = deletes, .timestamp_ns = @as(u64, @intCast(ordinal * 2 + 1000)) });
+            const writes = try a.alloc(BatchWrite, seeds.len);
+            for (seeds, writes) |seed, *write| write.* = .{ .key = seed.key, .value = try std.json.Stringify.valueAlloc(a, seed.value, .{}) };
+            try table.db.batch(.{ .writes = writes, .timestamp_ns = @as(u64, @intCast(ordinal * 2 + 1001)) });
+        }
+        const response = try execute(a, handler, try corpus.get(id));
+        defer response.deinit();
+        const result = response.value;
+        try std.testing.expectEqualStrings(expected.command_tag, result.command_tag);
+        try std.testing.expectEqual(expected.affected, result.rows_affected);
+        try std.testing.expectEqual(expected.columns.len, result.columns.len);
+        try std.testing.expectEqual(expected.columns.len, expected.column_oids.len);
+        for (result.columns, expected.columns, expected.column_oids) |column, name, oid| {
+            try std.testing.expectEqualStrings(name, column.name);
+            try std.testing.expect(postgresTypeMatches(column.type, oid));
+        }
+        try std.testing.expectEqual(expected.rows.len, result.rows.len);
+        try std.testing.expectEqual(expected.rows.len, expected.sql_nulls.len);
+        const used = try a.alloc(bool, expected.rows.len);
+        @memset(used, false);
+        for (result.rows, 0..) |row, index| {
+            const flags = result.sql_nulls orelse return error.MissingSqlNullProvenance;
+            try std.testing.expectEqual(result.rows.len, flags.len);
+            var matched = false;
+            for (expected.rows, expected.sql_nulls, 0..) |want, nulls, target| {
+                if (used[target] or !try rowMatchesWithNulls(a, result.columns, row, flags[index], want, nulls)) continue;
+                used[target] = true;
+                matched = true;
+                break;
+            }
+            try std.testing.expect(matched);
+        }
+        for (tables) |table| {
+            const final = expected.final_tables.map.get(table.name) orelse return error.MissingPostgresMutationTable;
+            try std.testing.expectEqual(final.columns.len, final.column_oids.len);
+            try std.testing.expectEqual(final.rows.len, final.sql_nulls.len);
+            var stored = try table.db.scan(a, "", "", .{ .include_documents = true, .limit = 4097 });
+            defer stored.deinit(a);
+            try std.testing.expectEqual(final.rows.len, stored.documents.len);
+            try std.testing.expectEqual(stored.documents.len, stored.hashes.len);
+            const storage_used = try a.alloc(bool, final.rows.len);
+            @memset(storage_used, false);
+            for (stored.documents, stored.hashes) |document, hash| {
+                try std.testing.expectEqualStrings(document.id, hash.id);
+                const parsed = try std.json.parseFromSlice(Json, a, document.json, .{});
+                defer parsed.deinit();
+                try std.testing.expect(parsed.value == .object);
+                for (parsed.value.object.keys()) |key| {
+                    var known = false;
+                    for (final.columns) |column| if (std.mem.eql(u8, key, column)) {
+                        known = true;
+                        break;
+                    };
+                    try std.testing.expect(known);
+                }
+                var matched = false;
+                for (final.rows, final.sql_nulls, 0..) |want, nulls, target| {
+                    if (storage_used[target]) continue;
+                    try std.testing.expectEqual(final.columns.len, want.len);
+                    try std.testing.expectEqual(want.len, nulls.len);
+                    var equal = true;
+                    for (final.columns, want, nulls) |column, cell, sql_null| {
+                        const value = parsed.value.object.get(column) orelse .null;
+                        var json_null = false;
+                        for (hash.json_null_fields) |name| if (std.mem.eql(u8, name, column)) {
+                            json_null = true;
+                            break;
+                        };
+                        equal = equal and equivalent(value, cell) and sql_null == (value == .null and !json_null);
+                    }
+                    if (!equal) continue;
+                    storage_used[target] = true;
+                    matched = true;
+                    break;
+                }
+                if (!matched) std.debug.print("POSTGRES MUTATION STORAGE {s}/{s}: {s}\n", .{ id, table.name, document.json });
+                try std.testing.expect(matched);
+            }
+        }
+    }
+}
+
 /// Complete physical read-back is independent of SQL projection/binding. Each
 /// case has a bounded arena and resets every physical key, including generated
 /// INSERT identities, so outcomes cannot depend on the previous case.

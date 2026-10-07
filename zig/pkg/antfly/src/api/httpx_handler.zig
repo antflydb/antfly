@@ -14246,6 +14246,38 @@ test "httpx SQL executes one relational page with exact integer parameters" {
         // Exact source cases: sql-0571, sql-0572, sql-0606, sql-0607,
         // sql-1488, sql-1493. Golden regeneration is an independent gate.
         try parity.runMutationReference(alloc, &mutation_handler, &mutation_db, reference.value);
+        // sql-1500 changes only a non-key JSONB column. The native logical
+        // identity/constraint-owner profiles are not activated by this test.
+        // Independently verify every table's complete PostgreSQL post-state.
+        const postgres = try std.json.parseFromSlice(parity.PostgresMutationReference, alloc, @import("antfly_local_sources").sql_parity_fixtures.mutation_postgres_reference, .{ .ignore_unknown_fields = true });
+        defer postgres.deinit();
+        const postgres_schema = try std.json.Stringify.valueAlloc(alloc, postgres.value.profile.schema, .{});
+        defer alloc.free(postgres_schema);
+        try std.testing.expectEqualStrings(mutation_schema, postgres_schema);
+        var archived_directory = try @import("antfly_local_sources").common_test_directory.TestDirectory.init("antfly-httpx-sql-mutation-archived");
+        defer archived_directory.cleanup();
+        var archived_db = try db_mod.DB.open(alloc, archived_directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+        defer archived_db.close();
+        var source_directory = try @import("antfly_local_sources").common_test_directory.TestDirectory.init("antfly-httpx-sql-mutation-source");
+        defer source_directory.cleanup();
+        var source_db = try db_mod.DB.open(alloc, source_directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+        defer source_db.close();
+        try std.testing.expectEqual(@as(usize, 2), postgres.value.profile.additional_tables.len);
+        try std.testing.expectEqualStrings("archived_records", postgres.value.profile.additional_tables[0].name);
+        try std.testing.expectEqualStrings("source_records", postgres.value.profile.additional_tables[1].name);
+        const archived_schema = try std.json.Stringify.valueAlloc(alloc, postgres.value.profile.additional_tables[0].schema, .{});
+        defer alloc.free(archived_schema);
+        const source_schema = try std.json.Stringify.valueAlloc(alloc, postgres.value.profile.additional_tables[1].schema, .{});
+        defer alloc.free(source_schema);
+        try archived_db.setSchemaJson(alloc, archived_schema);
+        try source_db.setSchemaJson(alloc, source_schema);
+        const MutationTable = struct { name: []const u8, db: *db_mod.DB };
+        const tables = [_]MutationTable{
+            .{ .name = "usage_records", .db = &mutation_db },
+            .{ .name = "archived_records", .db = &archived_db },
+            .{ .name = "source_records", .db = &source_db },
+        };
+        try parity.runPostgresMutations(alloc, &mutation_handler, &tables, postgres.value, &.{"sql-1500"});
     }
     {
         // sql-0048/sql-0050 storage half: the cursor's blocking ORDER BY query
