@@ -186,7 +186,7 @@ fn findArtifact(
 fn isLakeArtifact(kind: artifact_ref.ArtifactKind) bool {
     return switch (kind) {
         .row_fragment, .row_fragment_stats, .algebraic_segment, .external_base_source => true,
-        .text_segment, .vector_segment, .sparse_segment, .graph_segment, .graph_metric_segment => true,
+        .text_segment, .vector_segment, .sparse_segment, .graph_segment, .graph_metric_segment, .ordered_row_index => true,
         .doc_values, .stored_fields, .mutation_segment, .document_segment, .document_facts => false,
     };
 }

@@ -86,7 +86,7 @@ pub fn classifyArtifact(kind: artifact_ref.ArtifactKind) CacheClass {
         .row_fragment_stats => .row_fragment_stats,
         .algebraic_segment => .algebraic_segment,
         .external_base_source => .external_metadata,
-        .text_segment, .vector_segment, .sparse_segment, .graph_segment, .graph_metric_segment => .search_sidecar,
+        .text_segment, .vector_segment, .sparse_segment, .graph_segment, .graph_metric_segment, .ordered_row_index => .search_sidecar,
         .doc_values, .stored_fields, .mutation_segment, .document_segment, .document_facts => .other,
     };
 }
