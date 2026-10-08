@@ -320,3 +320,13 @@ Nix/glibc full production archive/provider gates, with all 27 exact source hashe
 verified; see [production pair](receipts/2026-10-07/output-wait-production-pair/README.md).
 This predates the later ownership/cleanup/cause fixes and runnable ABI 2; it does
 not qualify the current revision or default enablement. Current gates remain queued.
+
+
+Checked runnable ABI 3 bounds transport cleanup to one retained operation and
+half the shared control byte reserve, including actual capsule metadata. Tiny
+policies keep their sole control operation for health. The gate remains owned
+through parked/stopped cleanup until finish; failed starts unwind it. Native and
+pinned Nix/glibc ABI and real-owner gates pass; see
+[cleanup subquota receipts](receipts/2026-10-07/cleanup-subquota/README.md).
+Transport callback wiring outside connection locks and full production/default
+qualification remain required.

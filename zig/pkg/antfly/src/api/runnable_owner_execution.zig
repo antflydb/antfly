@@ -12,6 +12,7 @@ pub const State = struct {
     owner_alloc: std.mem.Allocator,
     owner: runnable.NodeOwner,
     native_now_ns: *const fn () u64,
+    cleanup_in_use: std.atomic.Value(bool) = .init(false),
 
     pub fn port(self: *State) abi.Owner {
         return .{ .context = &self.owner, .retain = retain, .release = release, .start = start, .checkpoint = checkpoint, .park = park, .enter = enter, .finish = finish };
@@ -24,6 +25,7 @@ const Capsule = struct {
     clock_io: ?runtime.io_abi.Receiver,
     cancellation: runtime.http_abi.CancellationView,
     execution: runnable.Execution = .{},
+    cleanup: bool = false,
 
     fn cancelled(raw: *const anyopaque) bool {
         const self: *const Capsule = @ptrCast(@alignCast(raw));
@@ -54,6 +56,16 @@ fn startChecked(raw: *anyopaque, options: *const abi.Start) !void {
     const owner = state(raw);
     try owner.owner.retain();
     errdefer owner.owner.release();
+    const cleanup = options.cleanup != 0;
+    if (cleanup) {
+        const config = owner.owner.scheduler.config;
+        // One cleanup root may retain at most half the control byte reserve.
+        // Small policies with only one control operation reserve it for health.
+        if (@min(@as(usize, 4), config.max_operations / 2) < 2) return error.ResourceTemporarilyUnavailable;
+        if (options.retained_bytes +| @sizeOf(Capsule) > config.control_bytes / 2) return error.SchedulerFull;
+        if (owner.cleanup_in_use.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) return error.ResourceTemporarilyUnavailable;
+    }
+    errdefer if (cleanup) owner.cleanup_in_use.store(false, .release);
     const value = try owner.owner_alloc.create(Capsule);
     errdefer owner.owner_alloc.destroy(value);
     value.* = .{
@@ -61,8 +73,14 @@ fn startChecked(raw: *anyopaque, options: *const abi.Start) !void {
         .io = try options.io.receive(),
         .clock_io = if (options.clock_io) |borrow| try borrow.receive() else null,
         .cancellation = options.cancellation,
+        .cleanup = cleanup,
     };
     errdefer value.execution.finish();
+    if (cleanup) {
+        const clock = if (value.clock_io) |*borrow| borrow.io() else value.io.io();
+        const now: u64 = if (options.native_deadline != 0) owner.native_now_ns() else @intCast(@max(0, std.Io.Clock.now(.awake, clock).nanoseconds));
+        if (options.deadline_ns > now +| (250 * std.time.ns_per_ms)) return error.InvalidArgument;
+    }
     try value.execution.startWithSlots(&owner.owner.scheduler, .{
         .io = value.io.io(),
         .clock_io = if (value.clock_io) |*clock| clock.io() else null,
@@ -95,7 +113,9 @@ fn finish(raw: *anyopaque) callconv(.c) void {
     const value = capsule(raw);
     const owner = value.state;
     value.execution.finish();
+    const cleanup = value.cleanup;
     owner.owner_alloc.destroy(value);
+    if (cleanup) owner.cleanup_in_use.store(false, .release);
     owner.owner.release();
 }
 
@@ -310,4 +330,126 @@ test "runnable execution port forwards fail-fast control admission without publi
     first = null;
     try std.testing.expectEqual(@as(usize, 0), owner.owner.borrowers);
     try owner.owner.tryDeinit();
+}
+
+fn cleanupOptions(borrow: *const runtime.native_abi.IoBorrow, handle: *?*anyopaque, bytes: u64) abi.Start {
+    return .{ .io = borrow, .class = @backingInt(abi.Class.control), .cleanup = 1, .allow_wait = 0, .has_deadline = 1, .native_deadline = 1, .deadline_ns = 100 * std.time.ns_per_ms, .retained_bytes = bytes, .out_handle = handle };
+}
+
+test "runnable execution cleanup subquota preserves health headroom with all ordinary operations retained" {
+    TestClock.now_ns = 0;
+    var owner: State = .{ .owner_alloc = std.testing.allocator, .owner = try runnable.NodeOwner.init(.{ .slots = 3, .max_operations = 8 }), .native_now_ns = TestClock.now };
+    defer owner.owner.tryDeinit() catch @panic("owner leaked");
+    const port = owner.port();
+    const io = std.testing.io;
+    const borrow = runtime.native_abi.IoBorrow.init(&io);
+    var ordinary: [4]?*anyopaque = @splat(null);
+    defer for (ordinary) |handle| if (handle) |value| port.finish(value);
+    for (&ordinary) |*handle| {
+        try std.testing.expect(port.start(port.context, &.{ .io = &borrow, .class = @backingInt(abi.Class.query), .slots = 2, .retained_bytes = 17, .out_handle = handle }).isOk());
+        try std.testing.expect(port.park(handle.*.?, @backingInt(abi.Wait.output)).isOk());
+    }
+    var cleanup: ?*anyopaque = null;
+    defer if (cleanup) |handle| port.finish(handle);
+    try std.testing.expect(port.start(port.context, &cleanupOptions(&borrow, &cleanup, 31)).isOk());
+    try std.testing.expect(port.park(cleanup.?, @backingInt(abi.Wait.output)).isOk());
+    const retained = owner.owner.scheduler.stats();
+    var denied: ?*anyopaque = null;
+    try std.testing.expectEqual(error.ResourceTemporarilyUnavailable, runtime.error_abi.errorFromStatus(port.start(port.context, &cleanupOptions(&borrow, &denied, 31))));
+    try std.testing.expect(denied == null);
+    try std.testing.expectEqual(retained.operations, owner.owner.scheduler.stats().operations);
+    try std.testing.expectEqual(retained.retained_bytes, owner.owner.scheduler.stats().retained_bytes);
+    var health: [3]?*anyopaque = @splat(null);
+    defer for (health) |handle| if (handle) |value| port.finish(value);
+    for (&health) |*handle| {
+        try std.testing.expect(port.start(port.context, &.{ .io = &borrow, .class = @backingInt(abi.Class.control), .allow_wait = 0, .retained_bytes = 11, .out_handle = handle }).isOk());
+        try std.testing.expectEqual(@as(usize, 1), owner.owner.scheduler.stats().control_slots);
+        try std.testing.expect(port.park(handle.*.?, @backingInt(abi.Wait.output)).isOk());
+    }
+    try std.testing.expectEqual(@as(usize, 8), owner.owner.scheduler.stats().operations);
+    try std.testing.expectEqual(@as(usize, 4), owner.owner.scheduler.stats().control_operations);
+    for (&health) |*handle| {
+        port.finish(handle.*.?);
+        handle.* = null;
+    }
+    port.finish(cleanup.?);
+    cleanup = null;
+    try std.testing.expect(!owner.cleanup_in_use.load(.acquire));
+    for (&ordinary) |*handle| {
+        port.finish(handle.*.?);
+        handle.* = null;
+    }
+    try std.testing.expectEqual(@as(usize, 0), owner.owner.scheduler.stats().operations);
+    try std.testing.expectEqual(@as(u64, 0), owner.owner.scheduler.stats().retained_bytes);
+    try std.testing.expectEqual(@as(usize, 0), owner.owner.borrowers);
+}
+
+test "runnable execution cleanup rejects oversized unbounded and failed allocations without consuming its subquota" {
+    TestClock.now_ns = 0;
+    var owner: State = .{ .owner_alloc = std.testing.allocator, .owner = try runnable.NodeOwner.init(.{ .slots = 3, .max_operations = 8 }), .native_now_ns = TestClock.now };
+    defer owner.owner.tryDeinit() catch @panic("owner leaked");
+    const port = owner.port();
+    const io = std.testing.io;
+    const borrow = runtime.native_abi.IoBorrow.init(&io);
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(error.SchedulerFull, runtime.error_abi.errorFromStatus(port.start(port.context, &cleanupOptions(&borrow, &handle, owner.owner.scheduler.config.control_bytes / 2))));
+    var options = cleanupOptions(&borrow, &handle, 31);
+    options.deadline_ns = 251 * std.time.ns_per_ms;
+    try std.testing.expectEqual(error.InvalidArgument, runtime.error_abi.errorFromStatus(port.start(port.context, &options)));
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    owner.owner_alloc = failing.allocator();
+    try std.testing.expectEqual(error.OutOfMemory, runtime.error_abi.errorFromStatus(port.start(port.context, &cleanupOptions(&borrow, &handle, 31))));
+    try std.testing.expect(failing.has_induced_failure);
+    owner.owner_alloc = std.testing.allocator;
+    try std.testing.expect(handle == null);
+    try std.testing.expect(!owner.cleanup_in_use.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), owner.owner.borrowers);
+    try std.testing.expectEqual(@as(usize, 0), owner.owner.scheduler.stats().operations);
+    try std.testing.expect(port.start(port.context, &cleanupOptions(&borrow, &handle, 31)).isOk());
+    port.finish(handle.?);
+    try std.testing.expect(!owner.cleanup_in_use.load(.acquire));
+    var small: State = .{ .owner_alloc = std.testing.allocator, .owner = try runnable.NodeOwner.init(.{ .slots = 3, .max_operations = 2 }), .native_now_ns = TestClock.now };
+    defer small.owner.tryDeinit() catch @panic("small owner leaked");
+    const small_port = small.port();
+    handle = null;
+    try std.testing.expectEqual(error.ResourceTemporarilyUnavailable, runtime.error_abi.errorFromStatus(small_port.start(small_port.context, &cleanupOptions(&borrow, &handle, 31))));
+    try std.testing.expect(!small.cleanup_in_use.load(.acquire));
+    try std.testing.expect(small_port.start(small_port.context, &.{ .io = &borrow, .class = @backingInt(abi.Class.control), .allow_wait = 0, .out_handle = &handle }).isOk());
+    small_port.finish(handle.?);
+}
+
+test "runnable execution cleanup keeps its gate and bytes through denied reentry until owning finish" {
+    TestClock.now_ns = 0;
+    defer TestClock.now_ns = 0;
+    var owner: State = .{ .owner_alloc = std.testing.allocator, .owner = try runnable.NodeOwner.init(.{ .slots = 3, .max_operations = 8 }), .native_now_ns = TestClock.now };
+    defer owner.owner.tryDeinit() catch @panic("owner leaked");
+    const port = owner.port();
+    const io = std.testing.io;
+    const borrow = runtime.native_abi.IoBorrow.init(&io);
+    var handle: ?*anyopaque = null;
+    defer if (handle) |value| port.finish(value);
+    try std.testing.expect(port.start(port.context, &cleanupOptions(&borrow, &handle, 31)).isOk());
+    try std.testing.expect(port.park(handle.?, @backingInt(abi.Wait.output)).isOk());
+    const retained = owner.owner.scheduler.stats().retained_bytes;
+    TestClock.now_ns = 100 * std.time.ns_per_ms;
+    try std.testing.expectEqual(error.DeadlineExceeded, runtime.error_abi.errorFromStatus(port.enter(handle.?, @backingInt(abi.Class.control))));
+    TestClock.now_ns = 0;
+    try std.testing.expectEqual(error.DeadlineExceeded, runtime.error_abi.errorFromStatus(port.checkpoint(handle.?)));
+    try std.testing.expect(owner.cleanup_in_use.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), owner.owner.scheduler.stats().operations);
+    try std.testing.expectEqual(retained, owner.owner.scheduler.stats().retained_bytes);
+    var denied: ?*anyopaque = null;
+    try std.testing.expectEqual(error.ResourceTemporarilyUnavailable, runtime.error_abi.errorFromStatus(port.start(port.context, &cleanupOptions(&borrow, &denied, 31))));
+    try std.testing.expect(denied == null);
+    var health: ?*anyopaque = null;
+    try std.testing.expect(port.start(port.context, &.{ .io = &borrow, .class = @backingInt(abi.Class.control), .allow_wait = 0, .out_handle = &health }).isOk());
+    port.finish(health.?);
+    port.finish(handle.?);
+    handle = null;
+    try std.testing.expect(!owner.cleanup_in_use.load(.acquire));
+    try std.testing.expect(port.start(port.context, &cleanupOptions(&borrow, &handle, 31)).isOk());
+    port.finish(handle.?);
+    handle = null;
+    try std.testing.expectEqual(@as(usize, 0), owner.owner.scheduler.stats().operations);
+    try std.testing.expectEqual(@as(u64, 0), owner.owner.scheduler.stats().retained_bytes);
 }

@@ -1,0 +1,15 @@
+{
+  "state": "terminal",
+  "exit_code": 0,
+  "source_sha256": {
+    "zig/lib/runtime/src/runtime_runnable_abi.zig": "0d855ad877f21298aa61f9935ad9b6460517e6090fb8f3433f54e373268b1008",
+    "zig/lib/runtime/src/runtime_native_abi.zig": "c3e1a1ee797683f342cfa1b2de5fcb512df20bc5540da9ada4985fe4825bdd9f",
+    "zig/lib/runtime/src/runtime_io_abi.zig": "90fd2d0b7366ef0d63a9591651f515a29737e5eb860f8c0149a89aea50dacec6",
+    "zig/lib/runtime/src/runtime_http_abi.zig": "bc6638c7aed404600d3cbcd0f94aead0fa6b825acc201f9a8740f8786895ae7a",
+    "zig/lib/runtime/src/runtime_error_abi.zig": "29c895d245253f03acf1f6491393c27efc260ad9a60280729c1b02c397609b65"
+  },
+  "hash_capture": "after completion; matches Linux launch hashes",
+  "summary": "35/35 tests passed",
+  "zig": "/Users/ajroetker/bin/zig-0.17.0/zig",
+  "log": "abi-native.log"
+}
