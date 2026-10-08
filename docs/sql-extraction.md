@@ -4810,3 +4810,37 @@ gates. sql-1252 gains stronger PostgreSQL coverage without duplicate credit.
 The ledger is 448 implemented / 136 rejected / 73 superseded / 929 unresolved.
 This increment does not claim exact NUMERIC aggregate support, arbitrary SQL
 aliases in HAVING, or completion of the remaining aggregate domains.
+
+The shared exact NUMERIC foundation now owns canonical base-10000 limbs,
+separating numeric identity from display scale without floating-point
+intermediates. Parsing, formatting, comparison, canonical hashing, addition,
+subtraction, multiplication, rounding and truncation share bounded work,
+allocation admission and cancellation. Precision/scale coercion rounds before
+checking overflow and supports negative scales and scales exceeding precision.
+Exact int2/int4/int8 casts accept asymmetric signed minima and round ties away
+from zero; special-value cast errors retain PostgreSQL's SQLSTATE contract.
+
+A reproducible disposable PostgreSQL 18 oracle checks 312 cases, including
+values beyond binary64 precision, radix input, scale retention, non-finite
+values, coercion carry overflow and integer boundaries. Six additional live
+boundary summaries check the full unconstrained digit/scale domain without
+checking huge rendered strings into the fixture. Seven native tests include
+exhaustive allocation failures, cancellation at every observed checkpoint,
+sticky admission failures and clean retries. The focused SQL test gate imports
+the same kernel through the local/control source catalogs. The complete kernel
+test source also compile-checks for wasm32-wasi; this is not runtime evidence
+for that target. Capacity/work arithmetic uses widened integers before bounds
+checks so admission cannot overflow on 32-bit hosts.
+
+The debug-build multiplication microbenchmark allocates one output buffer;
+64/256/1024 decimal-digit inputs consume 289/4225/66049 work units respectively.
+The observed 1024-digit run took approximately 0.53 ms locally, excluding input
+parsing. This is not an end-to-end SQL benchmark; dense multiplication remains
+quadratic and explicitly work-bounded.
+
+This is a shared-kernel foundation, not activation of the NUMERIC SQL type.
+Division/remainder, exact literal binding, generated public type identity,
+typed-row/index encoding, wire/spill support and aggregate integration remain
+unfinished. No original parity cases are credited for kernel-only evidence:
+the ledger remains 448 implemented / 136 rejected / 73 superseded /
+929 unresolved.
