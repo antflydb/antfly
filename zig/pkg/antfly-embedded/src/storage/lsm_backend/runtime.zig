@@ -2622,6 +2622,34 @@ fn readManySortedPointFromSnapshot(
     values: []?[]const u8,
     backend_locked: bool,
 ) !BatchCursorReadResult {
+    // Legacy/non-directory readers still charge transient index metadata.
+    const resources = @import("../resource_manager.zig");
+    var budget: ?resources.BudgetedAllocator = if (backend.options.resource_manager) |manager| resources.BudgetedAllocator.init(manager, .lsm_in_memory_state, runtimeScratchAllocator(allocator), 1) else null;
+    defer if (budget) |*admitted| admitted.deinit();
+    if (budget) |*admitted| admitted.credit_quantum = 4096;
+    const scratch = if (budget) |*admitted| admitted.allocator() else runtimeScratchAllocator(allocator);
+    return readManySortedPointFromSnapshotWithScratch(backend, mutable, immutable_memtables, runs, l0_groups, levels, allocator, held_blocks, held_values, namespace, keys, values, backend_locked, scratch) catch |err| {
+        if (budget) |*admitted| if (admitted.denied()) return error.ResourceBudgetExceeded;
+        return err;
+    };
+}
+
+fn readManySortedPointFromSnapshotWithScratch(
+    backend: anytype,
+    mutable: anytype,
+    immutable_memtables: []const *const State,
+    runs: []Run,
+    l0_groups: []const RunGroup,
+    levels: []const RunLevel,
+    allocator: Allocator,
+    held_blocks: ?*std.ArrayListUnmanaged(BlockPin),
+    held_values: *std.ArrayListUnmanaged([]u8),
+    namespace: backend_types.Namespace,
+    keys: []const []const u8,
+    values: []?[]const u8,
+    backend_locked: bool,
+    scratch: Allocator,
+) !BatchCursorReadResult {
     @memset(values, null);
     if (try readManySortedPointFromSnapshotAsync(
         backend,
@@ -2642,7 +2670,7 @@ fn readManySortedPointFromSnapshot(
     var local_held_blocks = std.ArrayListUnmanaged(BlockPin).empty;
     defer if (held_blocks == null) releaseHeldBlocks(&local_held_blocks, backend.allocator);
     const block_handles = held_blocks orelse &local_held_blocks;
-    var batch_indexes = RunBatchIndexHandles{ .allocator = runtimeScratchAllocator(allocator) };
+    var batch_indexes = RunBatchIndexHandles{ .allocator = scratch };
     defer batch_indexes.deinit();
 
     var result: BatchCursorReadResult = .{};
@@ -2718,32 +2746,29 @@ const RunBatchIndexState = struct {
 const RunBatchIndexHandles = struct {
     allocator: Allocator,
     items: std.ArrayListUnmanaged(RunBatchIndexState) = .empty,
+    by_run: std.AutoHashMapUnmanaged(usize, usize) = .empty,
 
     pub fn deinit(self: *@This()) void {
         for (self.items.items) |*item| item.deinit();
         self.items.deinit(self.allocator);
+        self.by_run.deinit(self.allocator);
         self.* = undefined;
     }
 
     fn tableIndex(self: *@This(), backend: anytype, run: *Run, run_index: usize) !*const lsm_table_file.TableIndex {
-        for (self.items.items) |*item| {
-            if (item.run_index == run_index) return item.handle.runTableIndex();
-        }
-        var handle = try loadRunTableIndexHandle(backend, run);
-        errdefer handle.release();
-        try self.items.append(self.allocator, .{
-            .run_index = run_index,
-            .handle = handle,
-        });
-        return self.items.items[self.items.items.len - 1].handle.runTableIndex();
+        return (try self.state(backend, run, run_index)).handle.runTableIndex();
     }
 
     fn state(self: *@This(), backend: anytype, run: *Run, run_index: usize) !*RunBatchIndexState {
-        _ = try self.tableIndex(backend, run, run_index);
-        for (self.items.items) |*item| {
-            if (item.run_index == run_index) return item;
-        }
-        unreachable;
+        if (self.by_run.get(run_index)) |i| return &self.items.items[i];
+        try self.items.ensureUnusedCapacity(self.allocator, 1);
+        try self.by_run.ensureUnusedCapacity(self.allocator, 1);
+        var handle = try loadRunTableIndexHandle(backend, run);
+        errdefer handle.release();
+        const i = self.items.items.len;
+        self.items.appendAssumeCapacity(.{ .run_index = run_index, .handle = handle });
+        self.by_run.putAssumeCapacityNoClobber(run_index, i);
+        return &self.items.items[i];
     }
 
     fn transferBlocks(self: *@This(), allocator: Allocator, held_blocks: *std.ArrayListUnmanaged(BlockPin)) !void {
@@ -2766,12 +2791,40 @@ fn readManySortedByRunFromSnapshot(
     values: []?[]const u8,
     backend_locked: bool,
 ) !BatchCursorReadResult {
+    // Legacy/non-directory readers still charge transient index metadata.
+    const resources = @import("../resource_manager.zig");
+    var budget: ?resources.BudgetedAllocator = if (backend.options.resource_manager) |manager| resources.BudgetedAllocator.init(manager, .lsm_in_memory_state, runtimeScratchAllocator(allocator), 1) else null;
+    defer if (budget) |*admitted| admitted.deinit();
+    if (budget) |*admitted| admitted.credit_quantum = 4096;
+    const scratch = if (budget) |*admitted| admitted.allocator() else runtimeScratchAllocator(allocator);
+    return readManySortedByRunFromSnapshotWithScratch(backend, mutable, immutable_memtables, runs, l0_groups, levels, allocator, held_blocks, held_values, namespace, keys, values, backend_locked, scratch) catch |err| {
+        if (budget) |*admitted| if (admitted.denied()) return error.ResourceBudgetExceeded;
+        return err;
+    };
+}
+
+fn readManySortedByRunFromSnapshotWithScratch(
+    backend: anytype,
+    mutable: anytype,
+    immutable_memtables: []const *const State,
+    runs: []Run,
+    l0_groups: []const RunGroup,
+    levels: []const RunLevel,
+    allocator: Allocator,
+    held_blocks: ?*std.ArrayListUnmanaged(BlockPin),
+    held_values: *std.ArrayListUnmanaged([]u8),
+    namespace: backend_types.Namespace,
+    keys: []const []const u8,
+    values: []?[]const u8,
+    backend_locked: bool,
+    scratch: Allocator,
+) !BatchCursorReadResult {
     @memset(values, null);
     var local_held_blocks = std.ArrayListUnmanaged(BlockPin).empty;
     defer if (held_blocks == null) releaseHeldBlocks(&local_held_blocks, backend.allocator);
     const block_handles = held_blocks orelse &local_held_blocks;
 
-    var batch_indexes = RunBatchIndexHandles{ .allocator = runtimeScratchAllocator(allocator) };
+    var batch_indexes = RunBatchIndexHandles{ .allocator = scratch };
     defer batch_indexes.deinit();
 
     var result: BatchCursorReadResult = .{};
@@ -4572,7 +4625,7 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
         bulk_index: BulkAppendIndex = .{},
         prefix_index: WriterPrefixIndex = .{},
         cursor_overlay: ?State = null,
-        cursor_base_mutable: ?State = null,
+        cursor_base_mutable: ?MutableReadSnapshot = null,
         cursor_immutable_memtables: []const *const State = &.{},
         cursor_read_view: ?RunReadView = null,
         cursor_runs: []Run = &.{},
@@ -5074,6 +5127,10 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
 
         fn ensureCursorSnapshot(self: *@This()) !void {
             if (self.cursor_overlay != null) return;
+            try self.drainBulkAppendsToMutable();
+            try self.mutable.enableOrdered(self.allocator);
+            var overlay = try self.mutable.snapshot(self.allocator);
+            errdefer overlay.deinit(self.allocator);
             const locked = lockBackend(BackendType, self.backend);
             defer unlockBackend(BackendType, self.backend, locked);
 
@@ -5088,14 +5145,8 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
                 self.cursor_reader_retained = false;
             };
 
-            var overlay: State = .{};
-            errdefer overlay.deinit(self.allocator);
-            try state_mod.applyState(&overlay, self.allocator, &self.mutable);
-            try state_mod.applyState(&overlay, self.allocator, &self.bulk_appends);
-
-            var base_mutable: State = .{};
-            errdefer base_mutable.deinit(self.allocator);
-            try state_mod.applyState(&base_mutable, self.allocator, &self.backend.mutable);
+            const base_mutable = try snapshotReadMutable(BackendType, self.backend, .current_scan);
+            errdefer base_mutable.release(self.backend);
 
             const backend_immutable = if (@hasDecl(BackendType, "snapshotImmutableMemtables"))
                 try self.backend.snapshotImmutableMemtables()
@@ -5119,7 +5170,7 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
 
             self.cursor_overlay = overlay;
             self.cursor_base_mutable = base_mutable;
-            immutable[0] = &self.cursor_base_mutable.?;
+            immutable[0] = base_mutable.state;
             backend_immutable_pins_transferred = true;
             self.cursor_immutable_memtables = immutable;
             self.cursor_read_view = read_view;
@@ -5139,8 +5190,8 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
                 state.deinit(self.allocator);
                 self.cursor_overlay = null;
             }
-            if (self.cursor_base_mutable) |*state| {
-                state.deinit(self.allocator);
+            if (self.cursor_base_mutable) |snapshot| {
+                snapshot.release(self.backend);
                 self.cursor_base_mutable = null;
             }
             if (self.cursor_immutable_memtables.len > 0) {
@@ -5588,8 +5639,8 @@ fn readManySortedDirectoryCandidates(
     defer deinitRunGroups(scratch, groups);
     const levels = try buildLowerLevels(scratch, runs);
     defer scratch.free(levels);
-    if (sorted_by_run) return readManySortedByRunFromSnapshot(backend, mutable, immutable_memtables, runs, groups, levels, allocator, held_blocks, held_values, namespace, keys, values, backend_locked);
-    return readManySortedPointFromSnapshot(backend, mutable, immutable_memtables, runs, groups, levels, allocator, held_blocks, held_values, namespace, keys, values, backend_locked);
+    if (sorted_by_run) return readManySortedByRunFromSnapshotWithScratch(backend, mutable, immutable_memtables, runs, groups, levels, allocator, held_blocks, held_values, namespace, keys, values, backend_locked, scratch);
+    return readManySortedPointFromSnapshotWithScratch(backend, mutable, immutable_memtables, runs, groups, levels, allocator, held_blocks, held_values, namespace, keys, values, backend_locked, scratch);
 }
 
 fn retainSourcePointValue(backend: anytype, allocator: Allocator, held: *std.ArrayListUnmanaged([]u8), namespace: backend_types.Namespace, value: []const u8) ![]const u8 {
@@ -6369,58 +6420,107 @@ fn tryReadPointRunCandidatesAsync(
     return .miss;
 }
 
-const BatchAsyncPointKey = struct {
-    candidate_start: usize = 0,
-    candidate_len: usize = 0,
-    next_candidate: usize = 0,
+// Candidate traversal is local to an in-flight slot, not materialized for
+// every key/run pair. Memory is bounded by max_point_async_stack_reads.
+const BatchPointCandidates = struct {
+    l0_indices: []const usize = &.{},
+    next_l0: usize = 0,
+    next_level: usize = 0,
     read_hint: ?BorrowedReadHint = null,
+
+    fn init(groups: []const RunGroup, namespace: backend_types.Namespace, key: []const u8) @This() {
+        return .{ .l0_indices = if (findRunGroupIndex(groups, namespace, key)) |i| groups[i].run_indices else &.{} };
+    }
+
+    fn next(self: *@This(), runs: []const Run, levels: []const RunLevel, namespace: backend_types.Namespace, key: []const u8) ?PointRunCandidate {
+        while (self.next_l0 < self.l0_indices.len) {
+            const i = self.l0_indices[self.next_l0];
+            self.next_l0 += 1;
+            if (runMayContain(runs[i], namespace, key)) return .{ .run_index = i };
+        }
+        while (self.next_level < levels.len) {
+            const level = levels[self.next_level];
+            self.next_level += 1;
+            if (findRunIndexInLevel(runs, level, namespace, key)) |i| return .{ .run_index = i };
+        }
+        return null;
+    }
 };
 
 const BatchAsyncPointSlot = struct {
     active: bool = false,
     key_index: usize = 0,
+    candidates: BatchPointCandidates = .{},
     read: AsyncPointBlockRead = undefined,
 };
 
 fn startBatchAsyncPointSlot(
     backend: anytype,
     runs: []Run,
-    candidates: []const PointRunCandidate,
-    key_states: []BatchAsyncPointKey,
+    levels: []const RunLevel,
     keys: []const []const u8,
     namespace: backend_types.Namespace,
-    key_index: usize,
     slot: *BatchAsyncPointSlot,
     issued_count: *usize,
 ) !bool {
-    const state = &key_states[key_index];
-    if (state.next_candidate >= state.candidate_len) return false;
-    const candidate = candidates[state.candidate_start + state.next_candidate];
-    state.next_candidate += 1;
-
+    const candidate = slot.candidates.next(runs, levels, namespace, keys[slot.key_index]) orelse return false;
     backend.recordRunProbe();
     recordPointRunPrecheck(backend);
-    const prepared = (try prepareAsyncPointBlockRead(
-        backend,
-        runs,
-        candidate,
-        namespace,
-        keys[key_index],
-    )) orelse return error.RunStateUnavailable;
+    const prepared = (try prepareAsyncPointBlockRead(backend, runs, candidate, namespace, keys[slot.key_index])) orelse return error.RunStateUnavailable;
     if (prepared.status != .known_miss) recordPointRunPrecheckSurvivor(backend);
     if (prepared.status == .future) issued_count.* += 1;
-    slot.* = .{
-        .active = true,
-        .key_index = key_index,
-        .read = prepared,
-    };
+    slot.read = prepared;
+    slot.active = true;
     return true;
 }
 
-/// Overlap independent sparse point reads while preserving the exact LSM
-/// precedence order within each key. This is deliberately a bounded pipeline:
-/// only one candidate per key is in flight, so a newer tombstone or value is
-/// always resolved before an older run can decide that key.
+fn fillBatchAsyncPointSlot(
+    backend: anytype,
+    mutable: anytype,
+    immutable_memtables: []const *const State,
+    runs: []Run,
+    groups: []const RunGroup,
+    levels: []const RunLevel,
+    allocator: Allocator,
+    held_values: *std.ArrayListUnmanaged([]u8),
+    namespace: backend_types.Namespace,
+    keys: []const []const u8,
+    values: []?[]const u8,
+    lifetime: PointResultLifetime,
+    next_key: *usize,
+    result: *BatchCursorReadResult,
+    slot: *BatchAsyncPointSlot,
+    issued_count: *usize,
+) !bool {
+    while (next_key.* < keys.len) {
+        const i = next_key.*;
+        next_key.* += 1;
+        const key = keys[i];
+        const entry = found: {
+            if (mutable.findIndex(namespace, key)) |index| break :found mutable.entryAt(index);
+            for (immutable_memtables) |state| if (state.findIndex(namespace, key)) |index| break :found state.entryAt(index);
+            break :found null;
+        };
+        if (entry) |present| {
+            if (present.tombstone) {
+                result.misses += 1;
+            } else {
+                values[i] = try (if (namespace.own_source_point_results) PointResultLifetime.transaction_owned else lifetime).retain(backend, allocator, held_values, held_values.items.len, present.value);
+                backend.recordMutableHit();
+                result.hits += 1;
+            }
+            continue;
+        }
+        slot.key_index = i;
+        slot.candidates = BatchPointCandidates.init(groups, namespace, key);
+        if (try startBatchAsyncPointSlot(backend, runs, levels, keys, namespace, slot, issued_count)) return true;
+        result.misses += 1;
+    }
+    return false;
+}
+
+/// Overlap independent sparse point reads in a fixed-size pipeline. One
+/// candidate per key is in flight, preserving tombstone/value precedence.
 fn readManySortedPointFromSnapshotAsync(
     backend: anytype,
     mutable: anytype,
@@ -6441,115 +6541,30 @@ fn readManySortedPointFromSnapshotAsync(
     defer releasePointAsyncBatchLease(backend, async_lease);
     const configured_limit = async_lease.limit;
     if (configured_limit < 2) return null;
-    // Decide eligibility before touching output slots or read telemetry. A
-    // legacy in-memory run uses a different borrowing lifetime and falls back
-    // to the established scalar batch path as one complete operation.
-    for (runs) |run| {
-        if (run.path == null or run.state != null) return null;
-    }
+    for (runs) |run| if (run.path == null or run.state != null) return null;
     backend.recordPointGets(keys.len);
-
-    const scratch_allocator = runtimeScratchAllocator(allocator);
-    const key_states = try scratch_allocator.alloc(BatchAsyncPointKey, keys.len);
-    defer scratch_allocator.free(key_states);
-    @memset(key_states, .{});
-    const resolved = try scratch_allocator.alloc(bool, keys.len);
-    defer scratch_allocator.free(resolved);
-    @memset(resolved, false);
-
-    var result: BatchCursorReadResult = .{};
-    for (keys, 0..) |key, key_index| {
-        if (mutable.findIndex(namespace, key)) |entry_index| {
-            const entry = mutable.entryAt(entry_index);
-            resolved[key_index] = true;
-            if (entry.tombstone) {
-                result.misses += 1;
-            } else {
-                values[key_index] = try (if (namespace.own_source_point_results) PointResultLifetime.transaction_owned else result_lifetime).retain(backend, allocator, held_values, held_values.items.len, entry.value);
-                result.hits += 1;
-                backend.recordMutableHit();
-            }
-            continue;
-        }
-        for (immutable_memtables) |state| {
-            const entry_index = state.findIndex(namespace, key) orelse continue;
-            const entry = state.entryAt(entry_index);
-            resolved[key_index] = true;
-            if (entry.tombstone) {
-                result.misses += 1;
-            } else {
-                values[key_index] = try (if (namespace.own_source_point_results) PointResultLifetime.transaction_owned else result_lifetime).retain(backend, allocator, held_values, held_values.items.len, entry.value);
-                result.hits += 1;
-                backend.recordMutableHit();
-            }
-            break;
-        }
-    }
-
-    var candidates = std.ArrayListUnmanaged(PointRunCandidate).empty;
-    defer candidates.deinit(scratch_allocator);
-    for (keys, 0..) |key, key_index| {
-        if (resolved[key_index]) continue;
-        const candidate_start = candidates.items.len;
-        if (findRunGroupIndex(l0_groups, namespace, key)) |group_index| {
-            for (l0_groups[group_index].run_indices) |run_index| {
-                if (runMayContain(runs[run_index], namespace, key)) {
-                    try candidates.append(scratch_allocator, .{ .run_index = run_index });
-                }
-            }
-        }
-        for (levels) |level| {
-            const run_index = findRunIndexInLevel(runs, level, namespace, key) orelse continue;
-            try candidates.append(scratch_allocator, .{ .run_index = run_index });
-        }
-        const candidate_len = candidates.items.len - candidate_start;
-        key_states[key_index] = .{
-            .candidate_start = candidate_start,
-            .candidate_len = candidate_len,
-        };
-        if (candidate_len == 0) {
-            resolved[key_index] = true;
-            result.misses += 1;
-        }
-    }
 
     var slots: [max_point_async_stack_reads]BatchAsyncPointSlot = undefined;
     for (slots[0..configured_limit]) |*slot| slot.* = .{};
-    defer for (slots[0..configured_limit]) |*slot| {
-        if (slot.active) slot.read.release();
-    };
-
+    defer for (slots[0..configured_limit]) |*slot| if (slot.active) slot.read.release();
+    var result: BatchCursorReadResult = .{};
     var issued_count: usize = 0;
     var next_key: usize = 0;
     var active_slots: usize = 0;
     for (slots[0..configured_limit]) |*slot| {
-        while (next_key < keys.len and resolved[next_key]) : (next_key += 1) {}
-        if (next_key == keys.len) break;
-        if (!try startBatchAsyncPointSlot(backend, runs, candidates.items, key_states, keys, namespace, next_key, slot, &issued_count)) return error.RunStateUnavailable;
-        next_key += 1;
+        if (!try fillBatchAsyncPointSlot(backend, mutable, immutable_memtables, runs, l0_groups, levels, allocator, held_values, namespace, keys, values, result_lifetime, &next_key, &result, slot, &issued_count)) break;
         active_slots += 1;
     }
-
     var cursor: usize = 0;
     while (active_slots > 0) {
         const slot = &slots[cursor];
         cursor = (cursor + 1) % configured_limit;
         if (!slot.active) continue;
-
         const key_index = slot.key_index;
         const deciding_run_index = slot.read.candidate.run_index;
-        const lookup = try consumeAsyncPointRead(
-            backend,
-            &slot.read,
-            &key_states[key_index].read_hint,
-            held_values,
-            allocator,
-            namespace,
-            keys[key_index],
-        );
+        const lookup = try consumeAsyncPointRead(backend, &slot.read, &slot.candidates.read_hint, held_values, allocator, namespace, keys[key_index]);
         slot.read.release();
         slot.active = false;
-
         var key_decided = false;
         if (lookup) |decision| switch (decision) {
             .hit => |value| {
@@ -6564,21 +6579,9 @@ fn readManySortedPointFromSnapshotAsync(
             },
             .miss => {},
         };
-
-        if (!key_decided and key_states[key_index].next_candidate < key_states[key_index].candidate_len) {
-            _ = try startBatchAsyncPointSlot(backend, runs, candidates.items, key_states, keys, namespace, key_index, slot, &issued_count);
-            continue;
-        }
+        if (!key_decided and try startBatchAsyncPointSlot(backend, runs, levels, keys, namespace, slot, &issued_count)) continue;
         if (!key_decided) result.misses += 1;
-        resolved[key_index] = true;
-
-        while (next_key < keys.len and resolved[next_key]) : (next_key += 1) {}
-        if (next_key < keys.len) {
-            if (!try startBatchAsyncPointSlot(backend, runs, candidates.items, key_states, keys, namespace, next_key, slot, &issued_count)) return error.RunStateUnavailable;
-            next_key += 1;
-        } else {
-            active_slots -= 1;
-        }
+        if (!try fillBatchAsyncPointSlot(backend, mutable, immutable_memtables, runs, l0_groups, levels, allocator, held_values, namespace, keys, values, result_lifetime, &next_key, &result, slot, &issued_count)) active_slots -= 1;
     }
     backend.recordPointRunAsyncBatch(issued_count);
     return result;
@@ -7410,13 +7413,14 @@ fn localDecodeWorkingBytes(window: lsm_table_file.EntryDataWindow) !usize {
 fn localDecodeWorkingBytesFor(window: lsm_table_file.EntryDataWindow, point: bool) !usize {
     // Uncompressed input becomes the output allocation directly. Snappy only
     // needs its encoded input in scratch. Full prefix decoding reconstructs
-    // keys in the output; point decoding still uses restart/key buffers.
+    // keys in the output; point decoding borrows restart keys and reconstructs one key in place.
+    // Keep eightfold logical headroom for that growing arena-backed key.
     // Prefix+Snappy reserves the output plus fourfold arena headroom for the
     // validated intermediate prefix payload (at most twice the logical size).
     const logical_factor: usize = switch (window.compression) {
         .none, .snappy => 1,
-        .prefix => if (point) 24 else 1,
-        .prefix_snappy => if (point) 24 else 9,
+        .prefix => if (point) 9 else 1,
+        .prefix_snappy => if (point) 17 else 9,
     };
     const physical_factor: usize = if (window.compression == .none) 0 else 4;
     const logical = std.math.mul(usize, window.len, logical_factor) catch return error.InvalidTableFile;
@@ -8111,7 +8115,7 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
         bulk_index: BulkAppendIndex = .{},
         prefix_index: WriterPrefixIndex = .{},
         cursor_overlay: ?State = null,
-        cursor_base_mutable: ?State = null,
+        cursor_base_mutable: ?MutableReadSnapshot = null,
         cursor_read_view: ?RunReadView = null,
         cursor_immutable_memtables: []const *const State = &.{},
         cursor_runs: []Run = &.{},
@@ -8558,6 +8562,10 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
 
         fn ensureCursorSnapshot(self: *@This()) !void {
             if (self.cursor_overlay != null) return;
+            try self.drainBulkAppendsToMutable();
+            try self.mutable.enableOrdered(self.allocator);
+            var overlay = try self.mutable.snapshot(self.allocator);
+            errdefer overlay.deinit(self.allocator);
             const locked = lockBackend(BackendType, self.backend);
             defer unlockBackend(BackendType, self.backend, locked);
 
@@ -8572,13 +8580,8 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
                 self.cursor_reader_retained = false;
             };
 
-            var overlay = try self.mutable.clone(self.allocator);
-            errdefer overlay.deinit(self.allocator);
-            try state_mod.applyState(&overlay, self.allocator, &self.bulk_appends);
-
-            var base_mutable: State = .{};
-            errdefer base_mutable.deinit(self.allocator);
-            try state_mod.applyState(&base_mutable, self.allocator, &self.backend.mutable);
+            const base_mutable = try snapshotReadMutable(BackendType, self.backend, .current_scan);
+            errdefer base_mutable.release(self.backend);
 
             const backend_immutable = if (@hasDecl(BackendType, "snapshotImmutableMemtables"))
                 try self.backend.snapshotImmutableMemtables()
@@ -8602,7 +8605,7 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
 
             self.cursor_overlay = overlay;
             self.cursor_base_mutable = base_mutable;
-            immutable[0] = &self.cursor_base_mutable.?;
+            immutable[0] = base_mutable.state;
             backend_immutable_pins_transferred = true;
             self.cursor_immutable_memtables = immutable;
             self.cursor_read_view = read_view;
@@ -8622,8 +8625,8 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
                 state.deinit(self.allocator);
                 self.cursor_overlay = null;
             }
-            if (self.cursor_base_mutable) |*state| {
-                state.deinit(self.allocator);
+            if (self.cursor_base_mutable) |snapshot| {
+                snapshot.release(self.backend);
                 self.cursor_base_mutable = null;
             }
             if (self.cursor_immutable_memtables.len > 0) {
@@ -9434,12 +9437,12 @@ test "lsm cold optimization full prefix admission is separate from point scratch
     };
     const full = try localDecodeWorkingBytes(window);
     const point = try localDecodeWorkingBytesFor(window, true);
-    try std.testing.expectEqual(23 * @as(usize, window.len), point - full);
+    try std.testing.expectEqual(8 * @as(usize, window.len), point - full);
     var snappy_window = window;
     snappy_window.compression = .prefix_snappy;
     const snappy_full = try localDecodeWorkingBytes(snappy_window);
     const snappy_point = try localDecodeWorkingBytesFor(snappy_window, true);
-    try std.testing.expectEqual(15 * @as(usize, window.len), snappy_point - snappy_full);
+    try std.testing.expectEqual(8 * @as(usize, window.len), snappy_point - snappy_full);
     std.debug.print("prefix admission: logical=524288 physical=65536 full={d} point={d} prefix_snappy_full={d}\n", .{ full, point, snappy_full });
 }
 
@@ -9480,4 +9483,131 @@ test "lsm cold optimization mixed batch owns immutable values before releasing i
     try probe.getManySorted(&.{ "a", "missing" }, &values);
     try std.testing.expectEqualStrings("new", values[0].?);
     try std.testing.expectEqualStrings(&original, saved);
+}
+
+test "lsm remaining wins writer cursors pin base and promoted overlay roots" {
+    const B = @import("../lsm_backend.zig").Backend;
+    const Budget = @import("../lite/test_allocator.zig").BudgetAllocator;
+    var count = Budget{ .backing = std.testing.allocator };
+    const a = count.allocator();
+    var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+    var backend = try B.open(a, "/writer-root-pins", .{ .storage = storage.storage(), .flush_threshold = 100000 });
+    defer backend.close();
+    {
+        var write = try NamespaceWriteTxn(B).open(&backend);
+        errdefer write.abort();
+        for (0..8192) |i| {
+            var key: [8]u8 = undefined;
+            std.mem.writeInt(u64, &key, i, .big);
+            try write.put(.{ .name = "docs" }, &key, "value");
+        }
+        try write.commit();
+    }
+    var write = try BoundWriteTxn(B).open(&backend, .{ .name = "docs" });
+    defer write.abort();
+    try write.put("overlay", "value");
+    try write.ensureCursorSnapshot();
+    try std.testing.expect(write.mutable.ordered_enabled);
+    try std.testing.expect(write.cursor_overlay.?.ordered_root == write.mutable.ordered.root);
+    try std.testing.expect(write.cursor_base_mutable.?.state.ordered_root == backend.mutable.ordered.root);
+    var copied: State = .{};
+    defer copied.deinit(a);
+    const old_live = count.live;
+    count.peak = old_live;
+    try state_mod.applyState(&copied, a, &backend.mutable);
+    const copy_extra = count.peak - old_live;
+    copied.deinit(a);
+    write.invalidateCursorSnapshot();
+    const warm_live = count.live;
+    count.peak = warm_live;
+    const calls = count.alloc_calls;
+    for (0..100) |_| {
+        try write.ensureCursorSnapshot();
+        write.invalidateCursorSnapshot();
+    }
+    const pin_extra = count.peak - warm_live;
+    try std.testing.expect(pin_extra < 4096);
+    try std.testing.expect(copy_extra > 8192 * @sizeOf(state_mod.OwnedEntry));
+    std.debug.print("writer cursor base: entries=8192 clone_peak={d} root_pin_peak={d} warm_allocations_per_capture={d}\n", .{ copy_extra, pin_extra, (count.alloc_calls - calls) / 100 });
+    // Namespace writers use the same design, including drained bulk overlays.
+    var ns_write = try NamespaceWriteTxn(B).openWithOptions(&backend, .{ .mode = .bulk_ingest });
+    defer ns_write.abort();
+    try ns_write.appendPut(.{ .name = "graph" }, "edge", "v");
+    try ns_write.ensureCursorSnapshot();
+    try std.testing.expect(ns_write.mutable.ordered_enabled);
+    try std.testing.expect(ns_write.cursor_overlay.?.ordered_root == ns_write.mutable.ordered.root);
+    try std.testing.expectEqualStrings("v", try ns_write.cursor_overlay.?.get(.{ .name = "graph" }, "edge"));
+    var cursor = try ns_write.openCursor(.{ .name = "graph" });
+    defer cursor.close();
+    try std.testing.expectEqualStrings("v", (try cursor.seekAtOrAfter("edge")).?.value);
+}
+
+test "lsm remaining wins async candidate cursor preserves precedence without pair storage" {
+    const a = std.testing.allocator;
+    var runs: [1024]Run = undefined;
+    var indices: [1024]usize = undefined;
+    for (&runs, &indices, 0..) |*run, *index, i| {
+        run.* = .{ .id = i + 1, .level = 0, .size_bytes = 0, .entry_count = 1, .smallest_key = @constCast("a"), .largest_key = @constCast("z"), .smallest_namespace_name = null, .largest_namespace_name = null, .bloom_filter = null, .path = null, .state = null };
+        index.* = i;
+    }
+    const groups = try buildL0RunGroups(a, &runs);
+    defer deinitRunGroups(a, groups);
+    var candidates = BatchPointCandidates.init(groups, .{}, "m");
+    for (0..1024) |i| try std.testing.expectEqual(i, candidates.next(&runs, &.{}, .{}, "m").?.run_index);
+    try std.testing.expect(candidates.next(&runs, &.{}, .{}, "m") == null);
+    std.debug.print("async candidate planning: overlapping_runs=1024 heap_allocations=0 per_slot_bytes={d}\n", .{@sizeOf(BatchPointCandidates)});
+}
+
+test "lsm remaining wins run handle lookup scales and unwinds allocation failures" {
+    const B = @import("../lsm_backend.zig").Backend;
+    const a = std.testing.allocator;
+    var storage = storage_io.MemoryStorage.init(a);
+    defer storage.deinit();
+    var cache = cache_mod.Cache.init(a, 1024 * 1024);
+    defer cache.deinit();
+    var backend = try B.open(a, "/run-handle-map", .{ .storage = storage.storage(), .cache = &cache, .flush_threshold = 1 });
+    defer backend.close();
+    {
+        var write = try NamespaceWriteTxn(B).open(&backend);
+        errdefer write.abort();
+        try write.put(.{}, "a", "value");
+        try write.commit();
+    }
+    while (try backend.runMaintenanceStep()) {}
+    const source_run = run_store.at(&backend, 0);
+    // One cached physical index can stand in for many independently indexed
+    // handles. The ownership path is real; only the batch-local IDs differ.
+    var warm = try loadRunTableIndexHandle(&backend, source_run);
+    defer warm.release();
+    const Fixture = struct {
+        fn run(alloc: Allocator, b: *B, r: *Run) !void {
+            var indexes = RunBatchIndexHandles{ .allocator = alloc };
+            defer indexes.deinit();
+            for (0..8) |i| _ = try indexes.state(b, r, i);
+            for (0..8) |i| try std.testing.expectEqual(i, (try indexes.state(b, r, i)).run_index);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Fixture.run, .{ &backend, source_run });
+    const Budget = @import("../lite/test_allocator.zig").BudgetAllocator;
+    var backing = Budget{ .backing = a };
+    var indexes = RunBatchIndexHandles{ .allocator = backing.allocator() };
+    defer indexes.deinit();
+    for (0..1024) |i| _ = try indexes.state(&backend, source_run, i);
+    const calls = backing.alloc_calls;
+    const start = platform_time.monotonicNs();
+    for (0..32) |_| for (0..1024) |i| try std.testing.expectEqual(i, (try indexes.state(&backend, source_run, i)).run_index);
+    const indexed_ns = platform_time.monotonicNs() - start;
+    try std.testing.expectEqual(calls, backing.alloc_calls);
+    var comparisons: usize = 0;
+    const old_start = platform_time.monotonicNs();
+    for (0..32) |_| for (0..1024) |i| {
+        for (indexes.items.items) |item| {
+            comparisons += 1;
+            if (item.run_index == i) break;
+        }
+    };
+    const linear_ns = platform_time.monotonicNs() - old_start;
+    try std.testing.expectEqual(@as(usize, 32 * 1024 * 1025 / 2), comparisons);
+    std.debug.print("run handle lookup: runs=1024 lookups=32768 linear_comparisons={d} linear_ns={d} indexed_ns={d} warm_allocations=0\n", .{ comparisons, linear_ns, indexed_ns });
 }

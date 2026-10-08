@@ -64,16 +64,56 @@
       "physical_bytes": 65536,
       "before_admission_bytes": 12910680,
       "after_admission_bytes": 852056,
-      "point_admission_bytes": 12910680
+      "point_admission_bytes": 5046360
     },
     "full_prefix_snappy_decoder_admission": {
       "logical_bytes": 524288,
       "physical_bytes": 65536,
       "before_admission_bytes": 12910680,
       "after_admission_bytes": 5046360,
-      "point_admission_bytes": 12910680
+      "point_admission_bytes": 9240664
+    },
+    "writer_cursor_base_capture": {
+      "entries": 8192,
+      "before_peak_extra_heap_bytes": 1104527,
+      "after_peak_extra_heap_bytes": 8,
+      "after_warm_allocations_per_capture": 1,
+      "scope": "Base and overlay are warmed; first overlay promotion remains O(N log N), ordinary point-only writers retain the flat hash path."
+    },
+    "run_handle_index_lookup": {
+      "handles": 1024,
+      "lookups": 32768,
+      "before_linear_comparisons": 16793600,
+      "before_elapsed_ns": 226258000,
+      "after_elapsed_ns": 5881000,
+      "after_warm_allocations": 0,
+      "scope": "Two Debug timing samples for isolated handle lookup, not query throughput. Both paths use a real cached table index.",
+      "samples": [
+        {
+          "linear_elapsed_ns": 226258000,
+          "indexed_elapsed_ns": 5881000
+        },
+        {
+          "linear_elapsed_ns": 133312000,
+          "indexed_elapsed_ns": 5773000
+        }
+      ]
+    },
+    "prefix_point_decode_long_keys": {
+      "entries": 40,
+      "key_bytes": 4096,
+      "after_key_scratch_allocations": 1,
+      "after_key_scratch_peak_bytes": 6272,
+      "after_key_scratch_copied_previous_key_bytes": 0
+    },
+    "async_candidate_planning": {
+      "overlapping_runs": 1024,
+      "after_heap_allocations": 0,
+      "after_bytes_per_slot": 88,
+      "scope": "Candidate state only; fixed in-flight slots replace per-key state, resolution flags, and materialized key/run pairs. Payload IO and cache handles retain their existing costs."
     }
   },
-  "scope": "Deterministic allocation, directory traversal, and admission fixtures, not query throughput or a 2 GiB soak. Caller-owned mutable values, captured read-layout allocations, async scheduler metadata, and run-index handle arrays remain necessary or unreused and are excluded from metadata-array counts. Planning scratch retention remains resource charged.",
-  "followup_comparison_commit": "cc48e4652c375181f3cfc2d7a540a75cf38848c5"
+  "scope": "Deterministic allocation, directory traversal, admission, and isolated Debug timing fixtures, not query throughput or a 2 GiB soak. Caller-owned mutable values, captured read-layout pointer arrays, payload IO/cache ownership, and first-use overlay promotion still have costs. Directory planning and index metadata reuse bounded resource-charged arenas; async candidate metadata has fixed stack storage.",
+  "followup_comparison_commit": "cc48e4652c375181f3cfc2d7a540a75cf38848c5",
+  "remaining_wins_comparison_commit": "6c2674dce1c6a498d047a1231cf7f847ae173c1a"
 }

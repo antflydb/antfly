@@ -2105,48 +2105,52 @@ fn parsePrefixBlockPayload(payload: []const u8) !PrefixBlockView {
     };
 }
 
-fn readPrefixBlockEntry(
+// Reconstruct keys in place: the shared prefix is already in the buffer.
+// Growing the allocation preserves it; only the encoded suffix is appended.
+fn readPrefixBlockEntryInPlace(
     allocator: std.mem.Allocator,
     encoded_entries: []const u8,
     cursor: *usize,
-    previous_key: []const u8,
-    current_key: *std.ArrayListUnmanaged(u8),
+    key: *std.ArrayListUnmanaged(u8),
+    max_key_bytes: usize,
 ) !Entry {
     const tombstone = switch (try readByte(encoded_entries, cursor)) {
         0 => false,
         1 => true,
         else => return error.InvalidTableFile,
     };
-    const namespace_len: usize = @intCast(try readU32(encoded_entries, cursor));
-    const shared_key_len: usize = @intCast(try readU32(encoded_entries, cursor));
-    const unshared_key_len: usize = @intCast(try readU32(encoded_entries, cursor));
-    const value_len: usize = @intCast(try readU32(encoded_entries, cursor));
-    if (shared_key_len > previous_key.len) return error.InvalidTableFile;
-    const namespace_name = try readSlice(encoded_entries, cursor, namespace_len);
-    const unshared_key = try readSlice(encoded_entries, cursor, unshared_key_len);
+    const namespace_len: usize = try readU32(encoded_entries, cursor);
+    const shared_len: usize = try readU32(encoded_entries, cursor);
+    const suffix_len: usize = try readU32(encoded_entries, cursor);
+    const value_len: usize = try readU32(encoded_entries, cursor);
+    if (shared_len > key.items.len) return error.InvalidTableFile;
+    const key_len = std.math.add(usize, shared_len, suffix_len) catch return error.InvalidTableFile;
+    if (key_len > max_key_bytes or key_len > std.math.maxInt(u32)) return error.InvalidTableFile;
+    const namespace = try readSlice(encoded_entries, cursor, namespace_len);
+    const suffix = try readSlice(encoded_entries, cursor, suffix_len);
     const value = try readSlice(encoded_entries, cursor, value_len);
-
-    current_key.clearRetainingCapacity();
-    const key_len = std.math.add(usize, shared_key_len, unshared_key.len) catch return error.InvalidTableFile;
-    try current_key.ensureTotalCapacity(allocator, key_len);
-    current_key.appendSliceAssumeCapacity(previous_key[0..shared_key_len]);
-    current_key.appendSliceAssumeCapacity(unshared_key);
-    return .{
-        .namespace_name = if (namespace_len > 0) namespace_name else null,
-        .key = current_key.items,
-        .value = value,
-        .tombstone = tombstone,
-    };
+    try key.ensureTotalCapacity(allocator, key_len);
+    key.items.len = shared_len;
+    key.appendSliceAssumeCapacity(suffix);
+    return .{ .namespace_name = if (namespace_len > 0) namespace else null, .key = key.items, .value = value, .tombstone = tombstone };
 }
 
-fn prefixRestartEntry(
-    allocator: std.mem.Allocator,
-    view: PrefixBlockView,
-    restart_index: usize,
-    scratch: *std.ArrayListUnmanaged(u8),
-) !Entry {
+/// Restart keys have no shared prefix and can borrow the encoded payload.
+fn prefixRestartEntry(view: PrefixBlockView, restart_index: usize) !Entry {
     var cursor = try view.restartOffset(restart_index);
-    return try readPrefixBlockEntry(allocator, view.encoded_entries, &cursor, &.{}, scratch);
+    const tombstone = switch (try readByte(view.encoded_entries, &cursor)) {
+        0 => false,
+        1 => true,
+        else => return error.InvalidTableFile,
+    };
+    const namespace_len: usize = try readU32(view.encoded_entries, &cursor);
+    if (try readU32(view.encoded_entries, &cursor) != 0) return error.InvalidTableFile;
+    const key_len: usize = try readU32(view.encoded_entries, &cursor);
+    const value_len: usize = try readU32(view.encoded_entries, &cursor);
+    const namespace = try readSlice(view.encoded_entries, &cursor, namespace_len);
+    const key = try readSlice(view.encoded_entries, &cursor, key_len);
+    const value = try readSlice(view.encoded_entries, &cursor, value_len);
+    return .{ .namespace_name = if (namespace_len > 0) namespace else null, .key = key, .value = value, .tombstone = tombstone };
 }
 
 fn findExactEntryInPrefixPayloadAlloc(
@@ -2161,13 +2165,11 @@ fn findExactEntryInPrefixPayloadAlloc(
     const view = try parsePrefixBlockPayload(payload);
     if (view.entry_count == 0) return null;
 
-    var restart_key = std.ArrayListUnmanaged(u8).empty;
-    defer restart_key.deinit(scratch);
     var lo: usize = 0;
     var hi: usize = view.restart_count;
     while (lo < hi) {
         const mid = lo + (hi - lo) / 2;
-        const entry = try prefixRestartEntry(scratch, view, mid, &restart_key);
+        const entry = try prefixRestartEntry(view, mid);
         if (compareEntryTo(entry, namespace_name, key) != .gt) {
             lo = mid + 1;
         } else {
@@ -2182,13 +2184,11 @@ fn findExactEntryInPrefixPayloadAlloc(
     else
         view.encoded_entries.len;
 
-    var previous_key = std.ArrayListUnmanaged(u8).empty;
-    defer previous_key.deinit(scratch);
     var current_key = std.ArrayListUnmanaged(u8).empty;
     defer current_key.deinit(scratch);
     var entry_index = first_entry_index + restart_index * view.restart_interval;
     while (entries_cursor < end_cursor and entry_index < first_entry_index + view.entry_count) : (entry_index += 1) {
-        const entry = try readPrefixBlockEntry(scratch, view.encoded_entries, &entries_cursor, previous_key.items, &current_key);
+        const entry = try readPrefixBlockEntryInPlace(scratch, view.encoded_entries, &entries_cursor, &current_key, max_result_bytes);
         const order = compareEntryTo(entry, namespace_name, key);
         if (order == .eq) {
             const size = try tableEntryEncodedLen(entry);
@@ -2206,10 +2206,6 @@ fn findExactEntryInPrefixPayloadAlloc(
             };
         }
         if (order == .gt) return null;
-
-        previous_key.clearRetainingCapacity();
-        try previous_key.ensureTotalCapacity(scratch, entry.key.len);
-        previous_key.appendSliceAssumeCapacity(entry.key);
     }
     if (entries_cursor != end_cursor) return error.InvalidTableFile;
     return null;
@@ -3954,4 +3950,54 @@ test "table file prefix snappy expansion bound allows worst restart overhead" {
         for (decoded[i * 13 + 1 .. (i + 1) * 13]) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
     }
     try std.testing.expectError(error.InvalidTableFile, validatePrefixDecodedSize(encoded, 1));
+}
+
+test "table file prefix point lookup borrows restart keys and reconstructs in place" {
+    const a = std.testing.allocator;
+    const Budget = @import("../lite/test_allocator.zig").BudgetAllocator;
+    var raw = std.ArrayListUnmanaged(u8).empty;
+    defer raw.deinit(a);
+    var key: [4096]u8 = @splat('k');
+    for (0..40) |i| {
+        key[key.len - 1] = @intCast(i * 2);
+        try appendEntryBytesToList(a, &raw, .{ .namespace_name = "docs", .key = &key, .value = if (i % 3 == 0) "" else "value", .tombstone = i % 3 == 0 });
+    }
+    const payload = try encodePrefixCompressedBlockAlloc(a, raw.items);
+    defer a.free(payload);
+    const view = try parsePrefixBlockPayload(payload);
+    try std.testing.expectEqual(@as(usize, 4096), (try prefixRestartEntry(view, 1)).key.len);
+    for (0..40) |i| {
+        key[key.len - 1] = @intCast(i * 2);
+        var scratch = Budget{ .backing = a };
+        const located = (try findExactEntryInPrefixPayloadAlloc(a, scratch.allocator(), raw.items.len, payload, 0, "docs", &key)).?;
+        defer a.free(located.bytes);
+        try std.testing.expectEqual(i, located.index);
+        try std.testing.expectEqualSlices(u8, &key, located.entry.key);
+        try std.testing.expectEqual(i % 3 == 0, located.entry.tombstone);
+        try std.testing.expectEqualStrings(if (i % 3 == 0) "" else "value", located.entry.value);
+        try std.testing.expectEqual(@as(usize, 1), scratch.alloc_calls);
+        try std.testing.expectEqual(@as(usize, 0), scratch.live);
+        if (i == 15) std.debug.print("prefix point: key_bytes=4096 scratch_allocations={d} scratch_peak={d}\n", .{ scratch.alloc_calls, scratch.peak });
+        key[key.len - 1] += 1;
+        try std.testing.expect((try findExactEntryInPrefixPayloadAlloc(a, scratch.allocator(), raw.items.len, payload, 0, "docs", &key)) == null);
+    }
+    // Key truncation and regrowth must retain only the current shared prefix.
+    var encoded = std.ArrayListUnmanaged(u8).empty;
+    defer encoded.deinit(a);
+    for ([_][]const u8{ "abcdef", "abcq", "abcqrstuvwxyz" }, 0..) |suffix, i| {
+        try encoded.append(a, 0);
+        try appendU32(a, &encoded, 0);
+        const shared: usize = if (i == 0) 0 else 3;
+        try appendU32(a, &encoded, @intCast(shared));
+        try appendU32(a, &encoded, @intCast(suffix.len - shared));
+        try appendU32(a, &encoded, 0);
+        try encoded.appendSlice(a, suffix[shared..]);
+    }
+    var buffer = std.ArrayListUnmanaged(u8).empty;
+    defer buffer.deinit(a);
+    var offset: usize = 0;
+    for ([_][]const u8{ "abcdef", "abcq", "abcqrstuvwxyz" }) |expected| {
+        const entry = try readPrefixBlockEntryInPlace(a, encoded.items, &offset, &buffer, 64);
+        try std.testing.expectEqualStrings(expected, entry.key);
+    }
 }

@@ -540,6 +540,22 @@ pub const ActiveMemTable = struct {
         return out;
     }
 
+    /// Promote a write overlay only when it first needs ordered cursors.
+    /// Build the new root before publication; allocation failure leaves the
+    /// insertion-ordered hash table and its shared entries untouched.
+    pub fn enableOrdered(self: *ActiveMemTable, allocator: Allocator) !void {
+        if (self.ordered_enabled) return;
+        var ordered: ActiveMemTable = .{};
+        errdefer ordered.deinit(allocator);
+        for (self.entries.items) |entry| {
+            var retained = try cloneEntry(allocator, entry);
+            errdefer retained.deinit(allocator);
+            try ordered.upsertMove(allocator, retained);
+        }
+        std.mem.swap(ActiveMemTable, self, &ordered);
+        ordered.deinit(allocator);
+    }
+
     /// Snapshot just the ordered index; shared entry bytes are immutable for
     /// this epoch. Overwrites replace only the affected entry, and retired
     /// values are released with the last reader instead of a whole arena.
@@ -1668,4 +1684,29 @@ test "EntryIndex stores unique hashes inline and preserves collision lookup" {
     try std.testing.expectEqual(@as(?usize, 0), index.find(entries.items, forced_hash, .{}, "alpha"));
     try std.testing.expectEqual(@as(?usize, 1), index.find(entries.items, forced_hash, .{}, "beta"));
     try std.testing.expectEqual(@as(?usize, null), index.find(entries.items, forced_hash, .{}, "missing"));
+}
+
+test "writer overlay promotion preserves flat state on every allocation failure" {
+    const Fixture = struct {
+        fn run(a: Allocator) !void {
+            var live: ActiveMemTable = .{ .ordered_enabled = false };
+            defer live.deinit(a);
+            try live.upsert(a, .{ .name = "docs" }, "b", "old", false);
+            try live.upsert(a, .{ .name = "graph" }, "a", "edge", false);
+            try live.upsert(a, .{ .name = "docs" }, "a", "", true);
+            live.enableOrdered(a) catch |err| {
+                try std.testing.expect(!live.ordered_enabled);
+                try std.testing.expectEqual(@as(usize, 3), live.entryCount());
+                try std.testing.expectEqualStrings("old", try live.get(.{ .name = "docs" }, "b"));
+                return err;
+            };
+            var pinned = try live.snapshot(a);
+            defer pinned.deinit(a);
+            try live.upsert(a, .{ .name = "docs" }, "b", "new", false);
+            try std.testing.expectEqualStrings("old", try pinned.get(.{ .name = "docs" }, "b"));
+            try std.testing.expectEqualStrings("new", try live.get(.{ .name = "docs" }, "b"));
+            try std.testing.expectError(error.NotFound, pinned.get(.{ .name = "docs" }, "a"));
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
 }

@@ -58,7 +58,7 @@ pub const ProbeScratch = struct {
         budget: ?resources.BudgetedAllocator,
         arena: std.heap.ArenaAllocator,
         pub fn finish(self: *Planner) void {
-            _ = self.arena.reset(.{ .retain_with_limit = retained_bytes });
+            if (!self.arena.reset(.{ .retain_with_limit = retained_bytes })) _ = self.arena.reset(.free_all);
             // Idle scratch must retain only its live charge, not the budget's
             // amortized spare credit (which can otherwise be 1 MiB per reader).
             if (self.budget) |*budget| _ = budget.releaseUnusedCredit();
@@ -180,4 +180,24 @@ test "lsm probe planning scratch unwinds every allocation failure" {
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
+test "lsm probe planning scratch frees oversized arena when reset allocation fails" {
+    const allocators = @import("../lite/test_allocator.zig");
+    var backing = allocators.BudgetAllocator{ .backing = std.testing.allocator };
+    var no_resize = allocators.NoResizeAllocator{ .backing = backing.allocator() };
+    var manager = resources.ResourceManager.init(.{});
+    defer manager.deinit(std.testing.allocator);
+    var scratch: ProbeScratch = .{};
+    defer scratch.deinit(std.testing.allocator);
+    const planner = try scratch.planning(std.testing.allocator, no_resize.allocator(), &manager);
+    _ = try planner.arena.allocator().alloc(u8, 1024 * 1024);
+    backing.limit = backing.live; // Neither shrinking nor replacement can succeed.
+    planner.finish();
+    try std.testing.expectEqual(@as(usize, 0), backing.live);
+    try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lsm_in_memory_state).used_bytes);
+    backing.limit = std.math.maxInt(usize);
+    _ = try planner.arena.allocator().alloc(u8, 4096);
+    planner.finish();
+    try std.testing.expect(backing.live <= ProbeScratch.Planner.retained_bytes + 128);
 }
