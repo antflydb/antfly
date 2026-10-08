@@ -7,6 +7,11 @@ const arities: Record<RelationalExpressionOp, readonly [number, number]> = {
   subtract: [2, 2],
   multiply: [2, 2],
   divide: [2, 2],
+  modulo: [2, 2],
+  cast: [1, 1],
+  case_when: [3, 31],
+  in_list: [2, 32],
+  not_in_list: [2, 32],
   negate: [1, 1],
   concat: [2, 32],
   coalesce: [2, 32],
@@ -27,6 +32,9 @@ const arities: Record<RelationalExpressionOp, readonly [number, number]> = {
   not: [1, 1],
 };
 const operations = new Set(Object.keys(arities));
+const numericOperations = new Set(["add", "subtract", "multiply", "divide", "modulo", "negate"]);
+const integerIdentities = new Set(["int16", "int32", "int64"]);
+const floatIdentities = new Set(["float32", "float64"]);
 const comparisons = new Set([
   "eq",
   "ne",
@@ -74,15 +82,31 @@ export function validateRelationalExpression(
     const op = node.op as RelationalExpressionOp;
     const allowed = new Set(
       op === "literal"
-        ? ["op", "type", "value"]
+        ? ["op", "type", "value", "sql_type"]
         : op === "column"
           ? ["op", "column"]
-          : comparisons.has(op)
-            ? ["op", "args", "collation"]
-            : ["op", "args"]
+          : op === "cast"
+            ? ["op", "type", "sql_type", "args"]
+            : numericOperations.has(op)
+              ? ["op", "args", "sql_type"]
+              : comparisons.has(op)
+                ? ["op", "args", "collation"]
+                : ["op", "args"]
     );
     for (const key of Object.keys(node))
       if (!allowed.has(key)) throw new TypeError(`${location}.${key} is not valid for ${op}`);
+    if (node.sql_type !== undefined) {
+      const integer = typeof node.sql_type === "string" && integerIdentities.has(node.sql_type);
+      const floating = typeof node.sql_type === "string" && floatIdentities.has(node.sql_type);
+      if (
+        (!integer && !floating) ||
+        ((op === "literal" || op === "cast") &&
+          !((node.type === "integer" && integer) || (node.type === "number" && floating)))
+      )
+        throw new TypeError(`${location}.sql_type must match a supported numeric builtin identity`);
+    }
+    if (op === "cast" && node.sql_type === undefined)
+      throw new TypeError(`${location}.sql_type is required for a numeric cast`);
     if (op === "literal") {
       if (!isRelationalExpressionType(node.type))
         throw new TypeError(`${location}.type is required for a literal`);
@@ -138,6 +162,8 @@ export function validateRelationalExpression(
       throw new TypeError(
         `${location}.args must contain ${min === max ? min : `${min}–${max}`} expressions`
       );
+    if (op === "case_when" && node.args.length % 2 !== 1)
+      throw new TypeError(`${location}.args requires condition/result pairs and a fallback`);
     node.args.forEach((child, index) => {
       visit(child, `${location}.args[${index}]`, depth + 1);
     });
