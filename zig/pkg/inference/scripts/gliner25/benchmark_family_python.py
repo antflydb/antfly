@@ -1,4 +1,19 @@
 #!/usr/bin/env python3
+# Copyright 2026 Antfly, Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Benchmark pinned upstream GLiNER2.5 family artifacts on CPU or MPS.
 
 The clock covers schema construction/compilation, preprocessing, encoder and
@@ -7,6 +22,7 @@ prepared-token validation, result validation, and report serialization are
 outside the clock. MPS is synchronized immediately before and after each timed
 call and PyTorch CPU operator fallback is forbidden.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -50,7 +66,9 @@ MAX_WORDS = 4096
 PREFLIGHT_MAX_WORDS = 128
 MAX_ENCODED_TOKENS = 512
 SHORT_HOLDOUT = TESTDATA / "decide_1b_short_holdout.json"
-SHORT_HOLDOUT_SHA256 = "e429219899d3e3d470113f06756c9e807a286a6ba65cc210fd90b5c628628cff"
+SHORT_HOLDOUT_SHA256 = (
+    "e429219899d3e3d470113f06756c9e807a286a6ba65cc210fd90b5c628628cff"
+)
 OUTPUT_TOLERANCE = 5e-4
 RAW_LOGIT_TOLERANCE = 2e-3
 MPS_FALLBACK_WARNING = (
@@ -126,7 +144,9 @@ def git(source: Path, *args: str) -> str:
         env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"},
     )
     if result.returncode:
-        raise BenchmarkError(f"cannot verify upstream checkout: {result.stderr.strip()}")
+        raise BenchmarkError(
+            f"cannot verify upstream checkout: {result.stderr.strip()}"
+        )
     return result.stdout.strip()
 
 
@@ -139,7 +159,9 @@ def verify_source(source: Path, contract: dict[str, Any]) -> dict[str, str]:
     expected = contract["upstream_python"]
     commit = git(source, "rev-parse", "HEAD")
     if commit != expected["revision"]:
-        raise BenchmarkError(f"upstream commit {commit} != pinned {expected['revision']}")
+        raise BenchmarkError(
+            f"upstream commit {commit} != pinned {expected['revision']}"
+        )
     if git(source, "status", "--porcelain=v1", "--untracked-files=all"):
         raise BenchmarkError("upstream checkout is dirty")
     if git(source, "ls-files", "--others", "--ignored", "--exclude-standard"):
@@ -157,7 +179,9 @@ def runtime_identity(contract: dict[str, Any]) -> dict[str, Any]:
         },
         "absent_packages": expected.get("absent_packages", []),
     }
-    present = [name for name in actual["absent_packages"] if importlib.util.find_spec(name)]
+    present = [
+        name for name in actual["absent_packages"] if importlib.util.find_spec(name)
+    ]
     if present:
         raise BenchmarkError(f"oracle runtime requires absent packages: {present!r}")
     if not family._same_json(actual, expected):
@@ -189,12 +213,14 @@ def install_inference_peft_shim() -> dict[str, Any]:
 
     peft.PeftModel = InactivePeftModel
     layer.LoraLayer = InactiveLoraLayer
-    sys.modules.update({
-        "peft": peft,
-        "peft.tuners": tuners,
-        "peft.tuners.lora": lora,
-        "peft.tuners.lora.layer": layer,
-    })
+    sys.modules.update(
+        {
+            "peft": peft,
+            "peft.tuners": tuners,
+            "peft.tuners.lora": lora,
+            "peft.tuners.lora.layer": layer,
+        }
+    )
     return {
         "name": "inference_only_peft_type_import_shim",
         "reason": "pinned GLiNER2 ExtractorCollator eagerly imports trainer-only PEFT types",
@@ -215,7 +241,9 @@ def jsonable(value: Any) -> Any:
     raise BenchmarkError(f"cannot serialize oracle value {type(value).__name__}")
 
 
-def encoded_evidence(model: Any, text: str, schema: Any, *, boundary: bool) -> dict[str, Any]:
+def encoded_evidence(
+    model: Any, text: str, schema: Any, *, boundary: bool
+) -> dict[str, Any]:
     words = list(model.processor.word_splitter(text, lower=False))
     if len(words) > PREFLIGHT_MAX_WORDS:
         raise BenchmarkError(f"request exceeds {PREFLIGHT_MAX_WORDS} words")
@@ -245,20 +273,30 @@ def canonical_labels(value: Any) -> list[dict[str, Any]]:
     if value is None:
         return []
     if isinstance(value, dict) and "value" in value:
-        chosen = value["value"] if isinstance(value["value"], list) else [value["value"]]
+        chosen = (
+            value["value"] if isinstance(value["value"], list) else [value["value"]]
+        )
         probabilities = value.get("probabilities", {})
         return [
-            {"label": label, "confidence": probabilities.get(label, value.get("confidence"))}
+            {
+                "label": label,
+                "confidence": probabilities.get(label, value.get("confidence")),
+            }
             for label in chosen
         ]
     items = value if isinstance(value, list) else [value]
     return [
-        {"label": item.get("label", item.get("value")), "confidence": item["confidence"]}
+        {
+            "label": item.get("label", item.get("value")),
+            "confidence": item["confidence"],
+        }
         for item in items
     ]
 
 
-def canonical_values(value: Any, attributes: tuple[str, ...] = ()) -> list[dict[str, Any]]:
+def canonical_values(
+    value: Any, attributes: tuple[str, ...] = ()
+) -> list[dict[str, Any]]:
     if value is None:
         return []
     items = value if isinstance(value, list) else [value]
@@ -291,18 +329,22 @@ def canonical_expected(
         "relations": [],
     }
     for entity in native_schema.get("entities", []):
-        expected["entities"].append({
-            "name": entity,
-            "values": canonical_values(
-                output.get("entities", {}).get(entity),
-                tuple(native_schema.get("entity_attributes", {})),
-            ),
-        })
+        expected["entities"].append(
+            {
+                "name": entity,
+                "values": canonical_values(
+                    output.get("entities", {}).get(entity),
+                    tuple(native_schema.get("entity_attributes", {})),
+                ),
+            }
+        )
     for task in native_schema.get("classifications", []):
-        expected["classifications"].append({
-            "name": task["name"],
-            "labels": canonical_labels(output.get(task["name"])),
-        })
+        expected["classifications"].append(
+            {
+                "name": task["name"],
+                "labels": canonical_labels(output.get(task["name"])),
+            }
+        )
     for name, structure in native_schema.get("structures", {}).items():
         instances = [
             {
@@ -319,12 +361,14 @@ def canonical_expected(
         for edge in edges:
             head = canonical_values(edge["head"])[0]
             tail = canonical_values(edge["tail"])[0]
-            expected["relations"].append({
-                "name": relation,
-                "head": head,
-                "tail": tail,
-                "confidence": edge.get("confidence", edge["head"]["confidence"]),
-            })
+            expected["relations"].append(
+                {
+                    "name": relation,
+                    "head": head,
+                    "tail": tail,
+                    "confidence": edge.get("confidence", edge["head"]["confidence"]),
+                }
+            )
     return expected
 
 
@@ -332,7 +376,9 @@ def normalized(name: str) -> str:
     return re.sub(r"[-_.]+", "-", name).lower()
 
 
-def verify_record_tree(runtime_dir: Path, expected_tree_sha256: str | None) -> dict[str, Any]:
+def verify_record_tree(
+    runtime_dir: Path, expected_tree_sha256: str | None
+) -> dict[str, Any]:
     """Verify every isolated-runtime file against wheel RECORD identities."""
     runtime_dir = runtime_dir.resolve()
     listed: set[Path] = set()
@@ -355,11 +401,17 @@ def verify_record_tree(runtime_dir: Path, expected_tree_sha256: str | None) -> d
                         raise BenchmarkError("wheel RECORD self-row must be unhashed")
                     continue
                 if not row[1].startswith("sha256=") or not row[2].isdigit():
-                    raise BenchmarkError(f"wheel RECORD identity is incomplete: {row[0]}")
+                    raise BenchmarkError(
+                        f"wheel RECORD identity is incomplete: {row[0]}"
+                    )
                 if path.stat().st_size != int(row[2]):
                     raise BenchmarkError(f"wheel RECORD size differs: {row[0]}")
-                encoded = base64.urlsafe_b64encode(bytes.fromhex(sha256(path))).decode().rstrip("=")
-                if encoded != row[1][len("sha256="):]:
+                encoded = (
+                    base64.urlsafe_b64encode(bytes.fromhex(sha256(path)))
+                    .decode()
+                    .rstrip("=")
+                )
+                if encoded != row[1][len("sha256=") :]:
                     raise BenchmarkError(f"wheel RECORD hash differs: {row[0]}")
     actual = {path.resolve() for path in runtime_dir.rglob("*") if path.is_file()}
     if actual != listed:
@@ -391,21 +443,26 @@ def verify_runtime_dir(runtime_dir: Path, contract: dict[str, Any]) -> dict[str,
         normalized(dist.metadata["Name"]): dist.version
         for dist in importlib.metadata.distributions(path=[str(runtime_dir)])
     }
-    wanted = {normalized(name): version for name, version in expected["isolated_packages"].items()}
+    wanted = {
+        normalized(name): version
+        for name, version in expected["isolated_packages"].items()
+    }
     if actual != wanted:
         raise BenchmarkError(
             f"isolated runtime inventory differs: actual={actual!r} expected={wanted!r}"
         )
     info = runtime_dir / "transformers-5.17.0.dist-info"
     distribution = expected["transformers_distribution"]
-    for name, key in (("METADATA", "installed_metadata_sha256"), ("RECORD", "installed_record_sha256")):
+    for name, key in (
+        ("METADATA", "installed_metadata_sha256"),
+        ("RECORD", "installed_record_sha256"),
+    ):
         path = info / name
         if not path.is_file() or sha256(path) != distribution[key]:
             raise BenchmarkError(f"isolated Transformers {name} identity differs")
     tree = verify_record_tree(runtime_dir, expected["runtime_tree_sha256"])
     external = {
-        name: importlib.metadata.version(name)
-        for name in expected["external_packages"]
+        name: importlib.metadata.version(name) for name in expected["external_packages"]
     }
     if external != expected["external_packages"]:
         raise BenchmarkError(f"external runtime differs: actual={external!r}")
@@ -431,10 +488,14 @@ def tensor_sha256(tensor: Any) -> str:
     return hashlib.sha256(struct.pack(f"<{len(values)}f", *values)).hexdigest()
 
 
-def verify_rope(model_dir: Path, contract: dict[str, Any], encoder: Any | None = None) -> dict[str, Any]:
+def verify_rope(
+    model_dir: Path, contract: dict[str, Any], encoder: Any | None = None
+) -> dict[str, Any]:
     import torch
     from transformers import AutoConfig
-    from transformers.models.modernbert.modeling_modernbert import ModernBertRotaryEmbedding
+    from transformers.models.modernbert.modeling_modernbert import (
+        ModernBertRotaryEmbedding,
+    )
 
     spec = contract["oracle_runtime_decide_1b"]["rope_contract"]
     config = AutoConfig.from_pretrained(
@@ -445,13 +506,19 @@ def verify_rope(model_dir: Path, contract: dict[str, Any], encoder: Any | None =
         for layer_type in spec["layer_types"]
     }
     if config.rope_parameters != expected_params:
-        raise BenchmarkError(f"ModernBERT rope_parameters differ: {config.rope_parameters!r}")
+        raise BenchmarkError(
+            f"ModernBERT rope_parameters differ: {config.rope_parameters!r}"
+        )
     if config.hidden_size // config.num_attention_heads != spec["head_dim"]:
         raise BenchmarkError("ModernBERT head dimension differs")
-    rotary = ModernBertRotaryEmbedding(config) if encoder is None else encoder.rotary_emb
+    rotary = (
+        ModernBertRotaryEmbedding(config) if encoder is None else encoder.rotary_emb
+    )
     expected = 1.0 / (
         spec["rope_theta"]
-        ** (torch.arange(0, spec["head_dim"], 2, dtype=torch.float32) / spec["head_dim"])
+        ** (
+            torch.arange(0, spec["head_dim"], 2, dtype=torch.float32) / spec["head_dim"]
+        )
     )
     layers: dict[str, Any] = {}
     for layer_type in spec["layer_types"]:
@@ -512,7 +579,9 @@ def percentile95(values: list[int]) -> int:
 
 
 def summary(values: list[int]) -> dict[str, Any]:
-    if len(values) != SAMPLES or any(type(value) is not int or value <= 0 for value in values):
+    if len(values) != SAMPLES or any(
+        type(value) is not int or value <= 0 for value in values
+    ):
         raise BenchmarkError("invalid timing sample inventory")
     return {
         "samples_ns": values,
@@ -549,11 +618,17 @@ def timed(torch: Any, device: str, call: Callable[[], Any]) -> tuple[Any, int]:
             result = call()
             synchronize(torch, device)
         except (NotImplementedError, Warning) as exc:
-            raise UnsupportedBenchmark(f"{device} operation is unsupported: {exc}") from exc
+            raise UnsupportedBenchmark(
+                f"{device} operation is unsupported: {exc}"
+            ) from exc
         except RuntimeError as exc:
             message = str(exc).lower()
-            if device == "mps" and any(word in message for word in ("mps", "metal", "not implemented")):
-                raise UnsupportedBenchmark(f"MPS execution is unsupported: {exc}") from exc
+            if device == "mps" and any(
+                word in message for word in ("mps", "metal", "not implemented")
+            ):
+                raise UnsupportedBenchmark(
+                    f"MPS execution is unsupported: {exc}"
+                ) from exc
             raise
         elapsed = time.perf_counter_ns() - started
     if elapsed <= 0:
@@ -578,10 +653,16 @@ def compare(
         for index, (left, right) in enumerate(zip(expected, actual, strict=True)):
             compare(left, right, f"{path}[{index}]", tolerance)
     elif isinstance(expected, float):
-        if isinstance(actual, bool) or not isinstance(actual, (int, float)) or not math.isfinite(actual):
+        if (
+            isinstance(actual, bool)
+            or not isinstance(actual, (int, float))
+            or not math.isfinite(actual)
+        ):
             raise BenchmarkError(f"{path}: expected finite number")
         if abs(expected - actual) > tolerance:
-            raise BenchmarkError(f"{path}: numeric value differs: {expected!r} != {actual!r}")
+            raise BenchmarkError(
+                f"{path}: numeric value differs: {expected!r} != {actual!r}"
+            )
     elif type(expected) is not type(actual) or expected != actual:
         raise BenchmarkError(f"{path}: value differs: {expected!r} != {actual!r}")
 
@@ -594,8 +675,12 @@ def verify_model_device(model: Any, torch: Any, device: str) -> dict[str, int]:
     ):
         for name, tensor in inventory:
             if str(tensor.device).split(":", 1)[0] != device:
-                raise BenchmarkError(f"{kind} {name} is on {tensor.device}, expected {device}")
-            if tensor.is_complex() or (tensor.is_floating_point() and tensor.dtype != torch.float32):
+                raise BenchmarkError(
+                    f"{kind} {name} is on {tensor.device}, expected {device}"
+                )
+            if tensor.is_complex() or (
+                tensor.is_floating_point() and tensor.dtype != torch.float32
+            ):
                 raise BenchmarkError(f"{kind} {name} has an unsupported dtype")
             if kind == "parameter":
                 if not tensor.is_floating_point():
@@ -606,14 +691,22 @@ def verify_model_device(model: Any, torch: Any, device: str) -> dict[str, int]:
                 buffers += 1
     if parameters == 0:
         raise BenchmarkError("model exposes no parameters")
-    return {"parameters": parameters, "parameter_elements": elements, "buffers": buffers}
+    return {
+        "parameters": parameters,
+        "parameter_elements": elements,
+        "buffers": buffers,
+    }
 
 
-def load_capture(profile: str, task: str) -> tuple[Path, dict[str, Any], list[dict[str, Any]]]:
+def load_capture(
+    profile: str, task: str
+) -> tuple[Path, dict[str, Any], list[dict[str, Any]]]:
     try:
         filename, pin, member, ids = CAPTURES[(profile, task)]
     except KeyError as exc:
-        raise UnsupportedBenchmark(f"{profile} does not support the {task} benchmark") from exc
+        raise UnsupportedBenchmark(
+            f"{profile} does not support the {task} benchmark"
+        ) from exc
     path = TESTDATA / filename
     if sha256(path) != pin:
         raise BenchmarkError(f"pinned capture differs: {path}")
@@ -656,7 +749,9 @@ def ordered_decide_schema(row: dict[str, Any]) -> dict[str, Any]:
     classification = row.get("native_classification")
     evidence = classification.get("tasks") if isinstance(classification, dict) else None
     if not isinstance(source, dict) or not isinstance(evidence, list):
-        raise BenchmarkError(f"{row.get('id')}: classification schema evidence is absent")
+        raise BenchmarkError(
+            f"{row.get('id')}: classification schema evidence is absent"
+        )
     if any(not isinstance(task, dict) for task in evidence):
         raise BenchmarkError(f"{row.get('id')}: classification task evidence differs")
     task_names = [task.get("name") for task in evidence]
@@ -666,7 +761,9 @@ def ordered_decide_schema(row: dict[str, Any]) -> dict[str, Any]:
         name = task_evidence["name"]
         source_task = tasks[name]
         if not isinstance(source_task, dict):
-            raise BenchmarkError(f"{row.get('id')}.tasks.{name}: task must be an object")
+            raise BenchmarkError(
+                f"{row.get('id')}.tasks.{name}: task must be an object"
+            )
         task = dict(source_task)
         task["labels"] = ordered_mapping(
             source_task.get("labels"),
@@ -679,7 +776,9 @@ def ordered_decide_schema(row: dict[str, Any]) -> dict[str, Any]:
     return schema
 
 
-def prepare_extract(model: Any, row: dict[str, Any]) -> tuple[Callable[[], Any], Callable[[Any], None]]:
+def prepare_extract(
+    model: Any, row: dict[str, Any]
+) -> tuple[Callable[[], Any], Callable[[Any], None]]:
     from gliner2 import Schema
 
     schema = Schema.from_dict(ordered_extract_schema(row))
@@ -699,25 +798,33 @@ def prepare_extract(model: Any, row: dict[str, Any]) -> tuple[Callable[[], Any],
         )
 
     def validate(output: Any) -> None:
-        canonical = canonical_expected(
-            row, row["native_schema"], jsonable(output)
-        )
+        canonical = canonical_expected(row, row["native_schema"], jsonable(output))
         compare(row["native_expected"], canonical)
 
     return execute, validate
 
 
-def prepare_decide(model: Any, row: dict[str, Any]) -> tuple[Callable[[], Any], Callable[[Any], None]]:
-    from gliner2.classification import Classifier, ClassificationConfig, ClassificationSchema
+def prepare_decide(
+    model: Any, row: dict[str, Any]
+) -> tuple[Callable[[], Any], Callable[[Any], None]]:
+    from gliner2.classification import (
+        Classifier,
+        ClassificationConfig,
+        ClassificationSchema,
+    )
 
-    initial = Classifier(model).compile_schema(ClassificationSchema.from_dict(ordered_decide_schema(row)))
+    initial = Classifier(model).compile_schema(
+        ClassificationSchema.from_dict(ordered_decide_schema(row))
+    )
     encoded = encoded_evidence(model, row["text"], initial, boundary=False)
     if encoded["input_ids"] != row["encoded"]["input_ids"]:
         raise BenchmarkError(f"{row['id']}: prepared token IDs differ")
 
     def execute() -> tuple[Any, Any, list[str]]:
         classifier = Classifier(model)
-        compiled = classifier.compile_schema(ClassificationSchema.from_dict(ordered_decide_schema(row)))
+        compiled = classifier.compile_schema(
+            ClassificationSchema.from_dict(ordered_decide_schema(row))
+        )
         config = ClassificationConfig(
             on_infeasible="raise", max_len=MAX_WORDS, include_confidence=True
         )
@@ -743,7 +850,9 @@ def prepare_decide(model: Any, row: dict[str, Any]) -> tuple[Callable[[], Any], 
         selected = {name: list(decoded.selected(name)) for name in order}
         compare(row["selected"], selected, f"{row['id']}.selected")
         probabilities = {
-            name: {label: scores.probability(name, label) for label in scores.tasks[name]}
+            name: {
+                label: scores.probability(name, label) for label in scores.tasks[name]
+            }
             for name in order
         }
         compare(row["probabilities"], probabilities, f"{row['id']}.probabilities")
@@ -751,7 +860,14 @@ def prepare_decide(model: Any, row: dict[str, Any]) -> tuple[Callable[[], Any], 
     return execute, validate
 
 
-def benchmark_case(torch: Any, device: str, row: dict[str, Any], prepare: Callable[[dict[str, Any]], tuple[Callable[[], Any], Callable[[Any], None]]]) -> dict[str, Any]:
+def benchmark_case(
+    torch: Any,
+    device: str,
+    row: dict[str, Any],
+    prepare: Callable[
+        [dict[str, Any]], tuple[Callable[[], Any], Callable[[Any], None]]
+    ],
+) -> dict[str, Any]:
     execute, validate = prepare(row)
     for _ in range(WARMUPS):
         output, _ = timed(torch, device, execute)
@@ -773,7 +889,9 @@ def benchmark_case(torch: Any, device: str, row: dict[str, Any], prepare: Callab
 
 def select_prepare(
     task: str,
-    extract: Callable[[dict[str, Any]], tuple[Callable[[], Any], Callable[[Any], None]]],
+    extract: Callable[
+        [dict[str, Any]], tuple[Callable[[], Any], Callable[[Any], None]]
+    ],
     decide: Callable[[dict[str, Any]], tuple[Callable[[], Any], Callable[[Any], None]]],
 ) -> Callable[[dict[str, Any]], tuple[Callable[[], Any], Callable[[Any], None]]]:
     if task == "extract":
@@ -792,7 +910,14 @@ def atomic_write(path: Path, report: dict[str, Any]) -> None:
     temporary = Path(temporary_name)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
-            json.dump(report, stream, ensure_ascii=False, allow_nan=False, sort_keys=True, indent=2)
+            json.dump(
+                report,
+                stream,
+                ensure_ascii=False,
+                allow_nan=False,
+                sort_keys=True,
+                indent=2,
+            )
             stream.write("\n")
         temporary.replace(path)
     except BaseException:
@@ -816,12 +941,17 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
     source = verify_source(args.upstream, contract)
     model_before = family.verify_model(
-        args.profile, args.model_dir, contract_path=args.contract, verify_model_sha256=True
+        args.profile,
+        args.model_dir,
+        contract_path=args.contract,
+        verify_model_sha256=True,
     )
     if holdout is not None and holdout.get("model") != model_before:
         raise BenchmarkError("short holdout model identity differs")
     if capture.get("model") != model_before:
-        raise BenchmarkError("capture model identity differs from the selected artifact")
+        raise BenchmarkError(
+            "capture model identity differs from the selected artifact"
+        )
 
     runtime: dict[str, Any]
     if args.profile == "decide_1b":
@@ -841,7 +971,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         raise BenchmarkError(f"unexpected GLiNER2 version: {gliner2.__version__}")
     expected_transformers = "5.17.0" if args.profile == "decide_1b" else "4.55.4"
     if transformers.__version__ != expected_transformers:
-        raise BenchmarkError(f"unexpected Transformers version: {transformers.__version__}")
+        raise BenchmarkError(
+            f"unexpected Transformers version: {transformers.__version__}"
+        )
     # Match the frozen capture order: Transformers must inspect the real
     # environment before the serving-only PEFT type shim is installed. Span
     # Decide-1B does not need or install this boundary-training import shim.
@@ -858,12 +990,17 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     torch.manual_seed(0)
 
     with reject_mps_fallback(args.device):
-        model = AutoExtractor.from_pretrained(
-            str(args.model_dir.resolve()),
-            local_files_only=True,
-            map_location="cpu",
-            use_flashdeberta=False,
-        ).float().eval().to(args.device)
+        model = (
+            AutoExtractor.from_pretrained(
+                str(args.model_dir.resolve()),
+                local_files_only=True,
+                map_location="cpu",
+                use_flashdeberta=False,
+            )
+            .float()
+            .eval()
+            .to(args.device)
+        )
     expected_architecture = "span" if args.profile == "decide_1b" else "boundary"
     if getattr(model, "architecture", None) != expected_architecture:
         raise BenchmarkError("loaded model architecture differs")
@@ -884,7 +1021,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     synchronize(torch, args.device)
 
     model_after = family.verify_model(
-        args.profile, args.model_dir, contract_path=args.contract, verify_model_sha256=True
+        args.profile,
+        args.model_dir,
+        contract_path=args.contract,
+        verify_model_sha256=True,
     )
     if model_after != model_before:
         raise BenchmarkError("model artifact changed during benchmark")
@@ -903,7 +1043,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         and getattr(module, "__file__", None)
     }
     checkout = args.upstream.resolve()
-    if not imports or any(not Path(path).is_relative_to(checkout) for path in imports.values()):
+    if not imports or any(
+        not Path(path).is_relative_to(checkout) for path in imports.values()
+    ):
         raise BenchmarkError("GLiNER2 imported outside the pinned checkout")
     mps_memory = None
     if args.device == "mps":
@@ -929,7 +1071,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "Antfly Node handler measurements include additional routing and serialization",
         ],
         "model": model_before,
-        "source": {**source, "package_version": gliner2.__version__, "imports": imports},
+        "source": {
+            **source,
+            "package_version": gliner2.__version__,
+            "imports": imports,
+        },
         "runtime": {
             **runtime,
             "python": platform.python_version(),
@@ -960,13 +1106,19 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--profile", required=True, choices=("multi_v1", "multi_decide", "decide_1b"))
+    parser.add_argument(
+        "--profile", required=True, choices=("multi_v1", "multi_decide", "decide_1b")
+    )
     parser.add_argument("--device", required=True, choices=("cpu", "mps"))
     parser.add_argument("--task", required=True, choices=("extract", "decide"))
     parser.add_argument("--model-dir", required=True, type=Path)
     parser.add_argument("--upstream", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
-    parser.add_argument("--short-holdout", action="store_true", help="include the four frozen short-request holdouts")
+    parser.add_argument(
+        "--short-holdout",
+        action="store_true",
+        help="include the four frozen short-request holdouts",
+    )
     parser.add_argument("--threads", type=int, default=THREADS)
     parser.add_argument("--contract", type=Path, default=CONTRACT)
     parser.add_argument("--runtime-contract", type=Path, default=RUNTIME_CONTRACT_1B)
@@ -989,19 +1141,38 @@ def main() -> int:
     try:
         args = parse_args()
         report = run(args)
-        print(json.dumps({
-            "status": "ok",
-            "profile": report["profile"],
-            "device": report["device"],
-            "task": report["task"],
-            "output": str(args.output.expanduser().absolute()),
-        }, sort_keys=True, allow_nan=False))
+        print(
+            json.dumps(
+                {
+                    "status": "ok",
+                    "profile": report["profile"],
+                    "device": report["device"],
+                    "task": report["task"],
+                    "output": str(args.output.expanduser().absolute()),
+                },
+                sort_keys=True,
+                allow_nan=False,
+            )
+        )
         return 0
     except UnsupportedBenchmark as exc:
-        print(json.dumps({"status": "unsupported", "error": str(exc)}, sort_keys=True), file=sys.stderr)
+        print(
+            json.dumps({"status": "unsupported", "error": str(exc)}, sort_keys=True),
+            file=sys.stderr,
+        )
         return 2
     except (BenchmarkError, OSError, ValueError, KeyError) as exc:
-        print(json.dumps({"status": "error", "error_type": type(exc).__name__, "error": str(exc)}, sort_keys=True), file=sys.stderr)
+        print(
+            json.dumps(
+                {
+                    "status": "error",
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                },
+                sort_keys=True,
+            ),
+            file=sys.stderr,
+        )
         return 1
 
 
