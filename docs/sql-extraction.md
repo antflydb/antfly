@@ -5514,3 +5514,44 @@ tests, and 30 schema-expression tests, without failures or leaks. The 70-case
 PostgreSQL fixture, inventory integrity, Zig formatting, whitespace, and
 control-catalog consistency checks pass. The broad durable-runtime limitation
 documented above is not superseded by these focused gates.
+
+### Exact NUMERIC schema validation and durable publication barrier
+
+The immutable constraint plans now belong to parsed schema properties and are
+released with their schema epoch, including failed compilation. Recursive row
+validation uses one bounded exact execution owner, parses each NUMERIC cell once
+across compositions, and restores the active value scope between properties.
+Bounds, const, enum and multipleOf run against the typed logical value rather
+than f64 or reparsed JSON. Composition type checks distinguish integral NUMERIC
+from fractional/special NUMERIC, and never reinterpret a special numeric as a
+string. anyOf/oneOf/not/conditional probes preserve allocation, work and
+cancellation failures instead of treating them as a nonmatching branch.
+
+The 70 PostgreSQL constraint contracts now exercise the actual field validator
+as well as the immutable component. Independent source destruction, exhaustive
+allocation failures, exact tiny-decimal composition, sticky cancellation, and a
+parse-once work-accounting regression cover the validator boundary. Exact
+definition positivity also validates unused definitions without allowing f64
+underflow to reject a positive multipleOf or conceal a negative one.
+
+Runtime schema format 22 records a separate exact-NUMERIC-validation capability.
+Physical NUMERIC codecs (20) and schema VM programs (21) do not imply support
+for public scalar constraint semantics. Full and reduced runtime layouts derive
+the new capability from scalar NUMERIC columns. Serialization rejects downgrade
+to 21, strict decoding checks the new boolean and tail framing, and transactional
+catalog binding rejects a reader/catalog that lacks this capability. The flag
+requires a relational public schema with a scalar NUMERIC column; internal
+NUMERIC layouts without public validation retain their older semantics.
+
+Public scalar and expression enums remain guarded. Generated contracts,
+ingress lexeme preservation, complete indexing admission, and end-to-end SQL
+mutation/reopen/backup-restore validation still need activation work before
+public NUMERIC can be declared complete. Existing document and physical-float
+rules remain unchanged, and no original parity dispositions are reclassified.
+
+Validation passes: 587 local SQL tests (three existing skips), 226 server SQL
+tests, 35 schema-expression tests and 177 native relational-owner tests,
+without failures or leaks. The 70-case PostgreSQL oracle, inventory integrity,
+Zig formatting, whitespace and control-catalog consistency checks pass. The
+previously documented broad durable-runtime compiler/ownership limitation
+remains separate and is not claimed fixed by these gates.

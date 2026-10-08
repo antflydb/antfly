@@ -847,6 +847,45 @@ fn requiresExactNumericExpressions(schema: ParsedTableSchema) bool {
     return false;
 }
 
+fn requiresExactNumericValidation(schema: ParsedTableSchema) bool {
+    if (schema.storage_mode != .relational) return false;
+    for (schema.document_schemas) |document| for (document.properties) |property| {
+        if (runtimeRelationalColumnType(property) == .numeric) return true;
+    };
+    return false;
+}
+
+test "relational declarations scalar NUMERIC validation advertises its own durable reader capability" {
+    const a = std.testing.allocator;
+    var parsed = try impl.parseSchema(a,
+        \\{"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"n":{"type":"number"}},"additionalProperties":false}}}}
+    );
+    defer parsed.deinit(a);
+    // Exercise derivation independently of the still-guarded public scalar
+    // enum. This does not claim that public schema activation is complete.
+    parsed.document_schemas[0].properties[0].sql_type = .numeric;
+    const runtime = try deriveRuntimeTableSchema(a, parsed);
+    defer storage_schema.freeSchema(a, runtime);
+    const reduced = try deriveRelationalCheckLayout(a, parsed);
+    defer storage_schema.freeSchema(a, reduced);
+    try std.testing.expect(runtime.requires_exact_numeric_validation);
+    try std.testing.expect(reduced.requires_exact_numeric_validation);
+    try std.testing.expect(!runtime.requires_exact_numeric_expressions);
+    try std.testing.expectEqual(storage_schema.RelationalColumnType.numeric, runtime.relational_columns[0].column_type);
+    const bytes = try storage_schema.serializeSchema(a, runtime);
+    defer a.free(bytes);
+    const restored = try storage_schema.deserializeSchema(a, bytes);
+    defer storage_schema.freeSchema(a, restored);
+    try std.testing.expect(restored.requires_exact_numeric_validation);
+
+    var property = parsed.document_schemas[0].properties[0];
+    property.field_type = "sql_array";
+    try std.testing.expectEqual(storage_schema.RelationalColumnType.sql_array, runtimeRelationalColumnType(property).?);
+    property.field_type = "number";
+    property.sql_type = .float64;
+    try std.testing.expectEqual(storage_schema.RelationalColumnType.number, runtimeRelationalColumnType(property).?);
+}
+
 pub fn deriveRuntimeTableSchema(alloc: std.mem.Allocator, schema: ParsedTableSchema) !storage_schema.TableSchema {
     const exact_fields = try deriveRuntimeExactDocumentFields(alloc, schema);
     errdefer freeRuntimeExactFields(alloc, exact_fields);
@@ -933,6 +972,7 @@ pub fn deriveRuntimeTableSchema(alloc: std.mem.Allocator, schema: ParsedTableSch
         .requires_typed_expressions = requiresTypedExpressions(schema, false),
         .requires_predicate_expressions = requiresTypedExpressions(schema, true),
         .requires_exact_numeric_expressions = requiresExactNumericExpressions(schema),
+        .requires_exact_numeric_validation = requiresExactNumericValidation(schema),
         .storage_mode = switch (schema.storage_mode) {
             .document => .document,
             .relational => .relational,
@@ -958,6 +998,7 @@ pub fn deriveRelationalCheckLayout(alloc: std.mem.Allocator, schema: ParsedTable
         .requires_typed_expressions = requiresTypedExpressions(schema, false),
         .requires_predicate_expressions = requiresTypedExpressions(schema, true),
         .requires_exact_numeric_expressions = requiresExactNumericExpressions(schema),
+        .requires_exact_numeric_validation = requiresExactNumericValidation(schema),
         .relational_columns = try deriveRuntimeRelationalColumns(alloc, schema),
     };
 }
@@ -1022,6 +1063,7 @@ pub fn runtimeRelationalColumnType(property: impl.DocumentProperty) ?storage_sch
     if (documentPropertyUsesJsonEncoding(property)) return .json;
     if (property.field_type) |field_type| {
         if (std.mem.eql(u8, field_type, "sql_array")) return .sql_array;
+        if (property.sql_type == .numeric) return .numeric;
         if (std.mem.eql(u8, field_type, "embedding")) return .dense_vector;
         if (std.mem.eql(u8, field_type, "keyword") or
             std.mem.eql(u8, field_type, "link") or

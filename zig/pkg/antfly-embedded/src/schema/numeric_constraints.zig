@@ -43,11 +43,19 @@ pub const Execution = struct {
     }
 
     pub fn validateJson(self: *Execution, plan: *const Plan, value: Json) !void {
-        // Do not let a quota/cancellation failure become a later valid row.
+        return self.validate(plan, try self.prepareJson(value));
+    }
+
+    /// Borrowed until the next prepare or deinit. Composition predicates can
+    /// share one parsed row value without resetting sticky work admission.
+    pub fn prepareJson(self: *Execution, value: Json) !exact.Value {
         try self.context.charge(0);
-        defer _ = self.arena.reset(.retain_capacity);
-        const parsed = storage.fromJson(&self.context, value) catch |err| return self.failure(err);
-        plan.validate(&self.context, parsed.value) catch |err| return self.failure(err);
+        _ = self.arena.reset(.retain_capacity);
+        return (storage.fromJson(&self.context, value) catch |err| return self.failure(err)).value;
+    }
+
+    pub fn validate(self: *Execution, plan: *const Plan, value: exact.Value) !void {
+        plan.validate(&self.context, value) catch |err| return self.failure(err);
     }
 
     fn failure(self: *Execution, err: anyerror) anyerror {
