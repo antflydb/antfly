@@ -63,9 +63,9 @@
   },
   "limits": [
     "Local Debug build, 10000-row smoke check against GCS, not a production benchmark.",
-    "Initial query follows publication and is not a guaranteed cold-cache measurement.",
-    "First query after restart still takes 15\u201320 seconds; persistent range-cache files were not observed.",
-    "Flat structured filters scan projected columns and collect up to 100000 matching IDs; full-archive filtering needs indexed predicate evaluation.",
+    "Historical first-query measurements followed publication. New cold runs started with no disk cache; SQL count still precedes text search.",
+    "Empty-cache search still pays required remote metadata, posting and hydration I/O: 7.6–10.2 seconds locally in the new runs.",
+    "The example declares only a full-text index, so its metadata filters use a projected-column scan. Full-archive filtering requires declared relational indexes.",
     "Staging bucket expires all objects after eight days."
   ],
   "unordered_filter_regression": {
@@ -74,5 +74,66 @@
     "unordered_filter_ms": 480.61,
     "warm_search_ms": 522.3,
     "after_restart_ms": 15515.21
+  },
+  "cold_start_and_cancellation_fixes": {
+    "runtime_base_commit": "6b92267b7d",
+    "source": "gs://colony-import-sources-antfly-dev-01/hn-poc/20261007/archive",
+    "row_count": 10000,
+    "cache_setup": "Copied catalog only, no cache directory before server startup. The harness SQL count precedes the first text search.",
+    "main_upgrade_baseline": {
+      "first_search_ms": 16523.45,
+      "warm_search_ms": 368.89,
+      "after_restart_ms": 18125.06,
+      "persisted_cache_files": 0
+    },
+    "runs": [
+      {
+        "first_search_ms": 7603.29,
+        "warm_search_ms": 399.94,
+        "after_restart_ms": 418.03,
+        "unordered_filter_ms": 379.73,
+        "ready_seconds": 11.81,
+        "verified": [
+          "remote_bm25",
+          "projected_highlights",
+          "snapshot_pagination",
+          "restart_scores",
+          "restart_pagination",
+          "exact_filter"
+        ]
+      },
+      {
+        "first_search_ms": 10164.46,
+        "warm_search_ms": 378.79,
+        "after_restart_ms": 432.21,
+        "unordered_filter_ms": 405.06,
+        "ready_seconds": 0.79,
+        "verified": [
+          "remote_bm25",
+          "projected_highlights",
+          "snapshot_pagination",
+          "restart_scores",
+          "restart_pagination",
+          "exact_filter"
+        ]
+      }
+    ],
+    "persisted_cache_files": 82,
+    "persisted_cache_bytes": 5133368,
+    "verification": {
+      "lake_tests_passed": 695,
+      "pgwire_clock_regressions_passed": 1,
+      "previous_pgwire_cancellations_passed": 6,
+      "lake_sql_e2e_passed": 20
+    },
+    "changes": [
+      "Native-clock cache capacity admission permits writes and restart reuse.",
+      "Range-backed index admission defers dictionary diagnostics.",
+      "Bounded parallel reader admission transfers prepared readers without reopening.",
+      "Required inverted metadata reads use bounded overlapping prefetch.",
+      "Complete immutable artifacts use one bounded GET with length and SHA-256 verification.",
+      "Pgwire normalizes Io deadlines before native owner boundaries.",
+      "Catalog reader protocols 24 through 33 remain readable for reconciliation."
+    ]
   }
 }

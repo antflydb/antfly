@@ -168,6 +168,7 @@ comptime {
     _ = @import("antfly_local_sources").storage_db_catalog_index_manager;
     _ = @import("antfly_local_sources").storage_db_catalog_resolver_catalog;
     _ = @import("antfly_local_sources").storage_db_column_read_cache;
+    _ = @import("antfly_local_sources").storage_db_column_source;
     _ = @import("antfly_local_sources").storage_db_column_scan_plan;
     _ = @import("antfly_local_sources").storage_db_config;
     _ = @import("antfly_local_sources").storage_db_db;
@@ -218,6 +219,7 @@ comptime {
     _ = @import("antfly_local_sources").storage_db_lease;
     _ = @import("antfly_local_sources").storage_db_maintenance_graph_metric_runtime;
     _ = @import("antfly_local_sources").storage_db_maintenance_sparse_compaction_runtime;
+    _ = @import("antfly_local_sources").storage_db_maintenance_text_merge_runtime;
     _ = @import("antfly_local_sources").storage_db_maintenance_transaction_runtime;
     _ = @import("antfly_local_sources").storage_db_maintenance_ttl_runtime;
     _ = @import("antfly_local_sources").storage_db_merge_contract;
@@ -265,6 +267,7 @@ comptime {
     _ = @import("antfly_local_sources").storage_db_resolution_runtime;
     _ = @import("antfly_local_sources").storage_db_root_identity;
     _ = @import("antfly_local_sources").storage_db_snapshot_admission;
+    _ = @import("antfly_local_sources").storage_db_snapshot_staging;
     _ = @import("antfly_local_sources").storage_db_template_remote_stub;
     _ = @import("antfly_local_sources").storage_db_template_stub;
     _ = @import("antfly_local_sources").storage_db_text_memory_stats;
@@ -340,6 +343,7 @@ comptime {
     _ = @import("antfly_local_sources").storage_lite_connection;
     _ = @import("antfly_local_sources").storage_lite_docstore;
     _ = @import("antfly_local_sources").storage_lite_index_storage;
+    _ = @import("antfly_local_sources").storage_lite_artifact_source;
     _ = @import("antfly_local_sources").storage_lite_mod;
     _ = @import("antfly_local_sources").storage_lite_native;
     _ = @import("antfly_local_sources").storage_lite_paths;
@@ -444,6 +448,7 @@ comptime {
     _ = @import("memory_budget.zig");
     _ = @import("antfly_local_sources").storage_test_allocator;
     _ = @import("antfly_local_sources").storage_db_artifact_producer_readiness;
+    _ = @import("antfly_local_sources").storage_db_artifact_reprocess_intent;
     _ = @import("antfly_local_sources").storage_db_artifact_producer_provenance;
     _ = @import("antfly_local_sources").storage_db_artifact_producer_retry;
     _ = @import("antfly_local_sources").storage_db_artifact_producer_validation;

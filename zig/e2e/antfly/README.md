@@ -204,6 +204,32 @@ export GOOGLE_CLOUD_PROJECT=my-project
 
 When these envs are absent, the remote backup tests skip cleanly.
 
+## Extension Runtime Qualification
+
+The default extension tests check package lifecycle and routes. Set
+`ANTFLY_WASMTIME_LIB` to enable real component invocation and host-call checks.
+Use the full Wasmtime C API library (`libwasmtime.dylib` on macOS or
+`libwasmtime.so` on Linux) at the version pinned by the
+[CI setup](../../../.github/workflows/zig-tests.yml). The minimal C API build
+omits required component symbols.
+
+Build the [MemoryAF package](../../../extensions/memoryaf/README.md) before
+setting this variable. From the repository root:
+
+```bash
+rustup target add wasm32-wasip2
+cargo build --locked --manifest-path extensions/memoryaf/Cargo.toml --release --target wasm32-wasip2
+cd zig
+ANTFLY_WASMTIME_LIB=/absolute/path/to/libwasmtime.dylib \
+  ANTFLY_BIN=/absolute/path/to/antfly \
+  uv run --project e2e/antfly pytest e2e/antfly/test_extensions.py -q
+```
+
+The artifact must exist at
+`extensions/memoryaf/target/wasm32-wasip2/release/memoryaf_extension.wasm`.
+A configured library with a missing artifact causes runtime invocation failures;
+installing Wasmtime alone does not prepare the package.
+
 ## Artifact Full-Text Scale Qualification
 
 `test_artifacts.py` includes an opt-in qualification that generates more than

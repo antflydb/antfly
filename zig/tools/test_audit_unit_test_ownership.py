@@ -38,7 +38,7 @@ audit, inventory, protocol_inventory = (
 class OwnershipTests(unittest.TestCase):
     def test_partitioned_inventory_counts_each_named_execution(self):
         names = inventory(
-            "[db-core-category] TEST\tstorage.db.test.a\nTEST\troot.test_0\n[db-core-complement] TEST\tstorage.db.test.b\n"
+            "[db-core-category] TEST\tstorage.db.test.a\nTEST\troot.test_0\nTEST\troot.test_1\n[db-core-complement] TEST\tstorage.db.test.b\n"
         )
         self.assertEqual(names, ["storage.db.test.a", "storage.db.test.b"])
 

@@ -345,7 +345,7 @@ class SplitAuthServer:
 
 @pytest.fixture
 def auth_api():
-    binary = resolve_binary_path(str(DEFAULT_ANTFLY_BIN))
+    binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
     if not Path(binary).exists():
         pytest.skip(f"antfly binary not found: {binary}")
     if Path(binary).name != "antfly":
@@ -361,7 +361,7 @@ def auth_api():
 
 @pytest.fixture
 def stateful_auth_api():
-    binary = resolve_binary_path(str(DEFAULT_ANTFLY_BIN))
+    binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
     if not Path(binary).exists():
         pytest.skip(f"antfly binary not found: {binary}")
     if Path(binary).name != "antfly":

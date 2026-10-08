@@ -8216,6 +8216,47 @@ test "native integrity authenticates without retaining payload when aggregate ca
     try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lite_native_page_cache).used_bytes);
 }
 
+test "native integrity falls back to bounded scratch when the caller allocator denies optional payload" {
+    const a = std.testing.allocator;
+    const resources = @import("storage/resource_manager.zig");
+    const Backend = struct {
+        bytes: []const u8,
+        fn read(raw: *anyopaque, offset: u64, out: []u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            @memcpy(out, self.bytes[@intCast(offset)..][0..out.len]);
+        }
+        fn close(_: *anyopaque) void {}
+    };
+    const bytes = try a.alloc(u8, 2 * integrity.page_size + 8);
+    defer a.free(bytes);
+    @memset(bytes, 17);
+    for (0..2) |i| std.mem.writeInt(u32, bytes[2 * integrity.page_size + i * 4 ..][0..4], Crc32.hash(bytes[i * integrity.page_size ..][0..integrity.page_size]), .big);
+    var backend = Backend{ .bytes = bytes };
+    for (0..3) |admission| {
+        var denied_identity_bytes: [0]u8 = .{};
+        var denied_identity = std.heap.FixedBufferAllocator.init(&denied_identity_bytes);
+        var manager = resources.ResourceManager.init(.{ .identity_allocator = if (admission == 2) denied_identity.allocator() else a });
+        defer manager.deinit(a);
+        var caller_scratch: [4096]u8 = undefined;
+        var caller = std.heap.FixedBufferAllocator.init(&caller_scratch);
+        const original: SegmentSource = .{ .ranges = .{ .ptr = &backend, .length = bytes.len, .read_into = Backend.read, .close = Backend.close, .resource_manager = if (admission != 0) &manager else null } };
+        const paged = try integrity.PagedSource.init(caller.allocator(), original, .{ .offset = 2 * integrity.page_size, .length = 8, .checksum = Crc32.hash(bytes[2 * integrity.page_size ..]) });
+        defer paged.deinit();
+        const source = paged.source();
+        var out: [16]u8 = undefined;
+        try source.readInto(0, &out);
+        try std.testing.expectEqualSlices(u8, bytes[0..16], &out);
+        try std.testing.expectEqual(@as(usize, 0), paged.retainedBytes());
+        try std.testing.expectEqual(@as(u8, 1), paged.validations[0].load(.acquire));
+        try source.readInto(32, &out);
+        bytes[integrity.page_size] ^= 1;
+        try std.testing.expectError(error.CrcMismatch, source.readInto(integrity.page_size, &out));
+        bytes[integrity.page_size] ^= 1;
+        try std.testing.expectError(error.CrcMismatch, source.readInto(integrity.page_size, &out));
+        try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lite_native_page_cache).used_bytes);
+    }
+}
+
 test "scoped native identity scans retain no stable segment ID pages" {
     const a = std.testing.allocator;
     var writer = SegmentWriter.init(a);

@@ -177,10 +177,11 @@ pub const PagedSource = struct {
         @import("antfly_platform").sync.lockYielding(&self.mutex);
         self.cached_page = null;
         self.mutex.unlock();
-        try self.ensureBudget();
+        self.ensureBudget() catch return self.authenticateRange(index, offset, length, within, out);
         if (self.buffer.len == 0) {
-            const buffer = self.bufferAllocator().alloc(u8, @intCast(@min(page_size, self.directory.offset))) catch |err| {
-                if (self.budget == null or !self.budget.?.budget_denied) return err;
+            const buffer = self.bufferAllocator().alloc(u8, @intCast(@min(page_size, self.directory.offset))) catch {
+                // The caller allocator may also impose a hard limit. This
+                // buffer is optional regardless of who denied admission.
                 // Mandatory authentication uses fixed worker scratch when
                 // the optional shared cache is full. No uncharged heap page
                 // survives pressure or scales with open reader count.

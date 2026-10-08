@@ -3367,6 +3367,13 @@ const NativeBufferedAtomicWriteSink = struct {
         return Crc32.hash(self.out.items[offset..][0..range_len]);
     }
 
+    fn deleteStagingFile(self: *NativeBufferedAtomicWriteSink) void {
+        const io = self.state.threaded.io();
+        const previous = io.swapCancelProtection(.blocked);
+        defer _ = io.swapCancelProtection(previous);
+        deleteFilePathWithIo(io, self.tmp_path) catch {};
+    }
+
     fn finish(ptr: *anyopaque) !void {
         const self: *NativeBufferedAtomicWriteSink = @ptrCast(@alignCast(ptr));
         defer self.deinit();
@@ -3374,19 +3381,19 @@ const NativeBufferedAtomicWriteSink = struct {
         const io = self.state.threaded.io();
         self.state.invalidatePath(self.tmp_path);
         writeFileAbsoluteWithIo(io, self.tmp_path, self.out.items) catch |err| {
-            deleteFilePathWithIo(io, self.tmp_path) catch {};
+            self.deleteStagingFile();
             self.state.invalidatePath(self.tmp_path);
             return err;
         };
         syncFileContentsPathWithIo(io, self.tmp_path) catch |err| {
-            deleteFilePathWithIo(io, self.tmp_path) catch {};
+            self.deleteStagingFile();
             self.state.invalidatePath(self.tmp_path);
             return err;
         };
         self.state.invalidateRename(self.tmp_path, self.final_path);
         defer self.state.invalidateRename(self.tmp_path, self.final_path);
         renamePathWithIo(io, self.tmp_path, self.final_path) catch |err| {
-            deleteFilePathWithIo(io, self.tmp_path) catch {};
+            self.deleteStagingFile();
             return err;
         };
         try syncParentPathWithIo(io, self.final_path);
@@ -3395,7 +3402,7 @@ const NativeBufferedAtomicWriteSink = struct {
     fn abort(ptr: *anyopaque) void {
         const self: *NativeBufferedAtomicWriteSink = @ptrCast(@alignCast(ptr));
         self.state.invalidatePath(self.tmp_path);
-        deleteFilePathWithIo(self.state.threaded.io(), self.tmp_path) catch {};
+        self.deleteStagingFile();
         self.state.invalidatePath(self.tmp_path);
         self.deinit();
     }
@@ -5499,4 +5506,47 @@ test "native buffered atomic write sink retains invalidation state past storage 
     const written = try verifier.storage().readFileAlloc(std.testing.allocator, path, 64);
     defer std.testing.allocator.free(written);
     try std.testing.expectEqualStrings("buffered lease", written);
+}
+
+test "native buffered atomic cleanup removes staging and restores cancellation" {
+    if (!supports_native_storage) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var native_storage = try NativeStorage.init(a, .threaded);
+    defer native_storage.deinit();
+    const io = native_storage.state.threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/published", .{tmp.sub_path});
+    defer a.free(path);
+    try tmp.dir.writeFile(io, .{ .sub_path = "published", .data = "retained" });
+    var sink = try NativeBufferedAtomicWriteSink.create(a, path, native_storage.state);
+    var active = true;
+    defer if (active) sink.abort();
+    const writer: *NativeBufferedAtomicWriteSink = @ptrCast(@alignCast(sink.ptr));
+    const staging = try a.dupe(u8, writer.tmp_path);
+    defer a.free(staging);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = staging, .data = "partial" });
+    const State = struct {
+        started: std.Io.Event = .unset,
+        gate: std.Io.Event = .unset,
+        restored: bool = false,
+        fn run(i: std.Io, self: *@This(), output: *AtomicWriteSink) void {
+            self.started.set(i);
+            self.gate.wait(i) catch i.recancel();
+            output.abort();
+            i.checkCancel() catch |err| {
+                self.restored = err == error.Canceled;
+            };
+        }
+    };
+    var state: State = .{};
+    var task = try io.concurrent(State.run, .{ io, &state, &sink });
+    active = false;
+    state.started.waitUncancelable(io);
+    task.cancel(io);
+    try std.testing.expect(state.restored);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, staging, .{}));
+    const retained = try tmp.dir.readFileAlloc(io, "published", a, .limited(32));
+    defer a.free(retained);
+    try std.testing.expectEqualStrings("retained", retained);
 }

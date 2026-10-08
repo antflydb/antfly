@@ -905,11 +905,19 @@ def test_standalone_drop_tables_with_pending_embedded_embeddings(
                 latest_index_statuses[table_name] = detail
                 status = detail.get("status", {})
                 coverage = status.get("coverage", {})
-                replay_applied = int(status.get("replay_applied_sequence", 0))
-                replay_target = int(status.get("replay_target_sequence", 0))
+                # Distributed status may leave replay watermarks null while
+                # owner observations converge. Unknown coverage is not zero;
+                # compare watermarks only when both have been reported.
+                replay_applied = status.get("replay_applied_sequence")
+                replay_target = status.get("replay_target_sequence")
+                replay_pending = (
+                    replay_applied is not None
+                    and replay_target is not None
+                    and int(replay_applied) < int(replay_target)
+                )
                 if (
-                    int(coverage.get("pending", 0)) > 0
-                    or replay_applied < replay_target
+                    int(coverage.get("pending") or 0) > 0
+                    or replay_pending
                     or status.get("catch_up_active") is True
                     or status.get("backfill_active") is True
                 ):

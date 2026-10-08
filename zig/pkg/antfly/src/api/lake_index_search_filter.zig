@@ -76,7 +76,7 @@ pub fn resolve(a: A, table: local.sql_catalog.Table, source: *local.serverless_q
     req.exclusion_query_json = "";
 }
 
-fn dependencies(a: A, table: local.sql_catalog.Table, filter: graph.CompiledPatternFilter, fields: *std.ArrayList([]const u8)) !bool {
+pub fn dependencies(a: A, table: local.sql_catalog.Table, filter: graph.CompiledPatternFilter, fields: *std.ArrayList([]const u8)) !bool {
     switch (filter) {
         .match_all, .match_none, .doc_id => {},
         .conjuncts, .disjuncts => |items| for (items) |item| {

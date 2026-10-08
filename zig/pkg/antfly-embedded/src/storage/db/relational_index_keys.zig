@@ -410,7 +410,11 @@ pub const TuplePlan = struct {
                     if (escaped != ~marker) return error.InvalidRelationalIndexKey;
                 }
             } else {
-                const width: usize = if (key.column_type == .boolean) 1 else 8;
+                const width: usize = switch (key.column_type) {
+                    .boolean => 1,
+                    .datetime => 16,
+                    else => 8,
+                };
                 if (width > bytes.len - pos) return error.InvalidRelationalIndexKey;
                 pos += width;
             }

@@ -2460,7 +2460,13 @@ pub const VacuumImage = struct {
     report: VacuumReport,
 
     pub fn deinit(self: *VacuumImage) void {
-        deleteFilePath(self.prepared.runtimeIo(), self.prepared.path) catch {};
+        {
+            const io = self.prepared.runtimeIo();
+            const previous = io.swapCancelProtection(.blocked);
+            defer _ = io.swapCancelProtection(previous);
+            deleteFilePath(io, self.prepared.path) catch {};
+        }
+        // Restore protection before close can release an owned I/O runtime.
         self.prepared.close();
         self.* = undefined;
     }
@@ -10495,6 +10501,44 @@ test "lite native stable snapshot holds output writer lock before staging" {
     try std.testing.expectError(error.WouldBlock, copyStableSnapshot(allocator, source_path, snapshot_path, false));
     try std.testing.expect(!pathExists(std.testing.io, snapshot_path));
     try std.testing.expect(!pathExists(std.testing.io, tmp_path));
+}
+
+test "lite vacuum image cleanup removes prepared file despite pending cancellation" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/vacuum-cleanup.aflite", .{tmp.sub_path});
+    defer alloc.free(path);
+    var pool = std.Io.Threaded.init(alloc, .{ .concurrent_limit = .limited(4) });
+    defer pool.deinit();
+    const io = pool.io();
+    var file = try NativeFile.createWithIo(alloc, io, path, .{ .no_sync = true });
+    defer file.close();
+    try file.putDocument("doc", "retained");
+    var image = try file.prepareVacuum(null);
+    var image_owned = true;
+    defer if (image_owned) image.deinit();
+    const prepared_path = try alloc.dupe(u8, image.prepared.path);
+    defer alloc.free(prepared_path);
+    const State = struct {
+        started: std.Io.Event = .unset,
+        release: std.Io.Event = .unset,
+        fn run(i: std.Io, self: *@This(), prepared: *VacuumImage) void {
+            self.started.set(i);
+            // Re-arm the gate's cancellation before exercising cleanup.
+            self.release.wait(i) catch i.recancel();
+            prepared.deinit();
+        }
+    };
+    var state: State = .{};
+    var child = try io.concurrent(State.run, .{ io, &state, &image });
+    image_owned = false; // The child owns cleanup after successful dispatch.
+    state.started.waitUncancelable(io);
+    child.cancel(io);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, prepared_path, .{}));
+    const value = (try file.getDocumentAlloc(alloc, "doc")).?;
+    defer alloc.free(value);
+    try std.testing.expectEqualStrings("retained", value);
 }
 
 test "lite native vacuum rewrites live catalog and document records" {

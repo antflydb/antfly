@@ -74,6 +74,25 @@ fn assertGraphEdgesRetired(alloc: std.mem.Allocator, io: std.Io, transport: http
     try awaitGraphTarget(alloc, io, transport, headers, base, false);
 }
 
+fn awaitDocumentAbsent(alloc: std.mem.Allocator, io: std.Io, transport: http.RequestExecutor, headers: []const http.RequestHeader, base: []const u8, path: []const u8) !void {
+    // Catalog publication does not imply a cold owner's read route is ready.
+    // Require an authoritative 404; temporary availability never proves absence.
+    const deadline = platform.time.monotonicNs() +| 30 * std.time.ns_per_s;
+    while (platform.time.monotonicNs() < deadline) {
+        var response = try request(alloc, transport, headers, base, path, .GET, null);
+        defer response.deinit(alloc);
+        switch (response.status) {
+            404 => return,
+            409, 503, 504 => try io.sleep(.fromMilliseconds(20), .awake),
+            else => {
+                std.debug.print("graph truncate absence status={} body={s}\n", .{ response.status, response.body });
+                return error.GraphTruncateDocumentNotAbsent;
+            },
+        }
+    }
+    return error.GraphTruncateDocumentAbsenceTimeout;
+}
+
 fn readPausedGraphSeal(alloc: std.mem.Allocator, io: std.Io, metadata: *metadata_runtime.Server, data: *data_runtime.DataServer, receipt: http.HttpResponse, drivers: []const *raft.ManagedProgressDriver) !@import("antfly_local_sources").storage_db_graph_retirement_seal.Receipt {
     const seal = @import("antfly_local_sources").storage_db_graph_retirement_seal;
     var accepted = try std.json.parseFromSlice(std.json.Value, alloc, receipt.body, .{});
@@ -598,9 +617,7 @@ fn mountedGraphTruncate(faults: bool) !void {
     }
     const new_id = try awaitGraphTruncate(alloc, io, transport, &admin_headers, metadata_uri, &metadata, &.{old_id}, truncate);
     try awaitIndex(alloc, io, transport, &headers, base);
-    var old_document = try request(alloc, transport, &headers, base, "/db/v1/tables/docs/documents/doc-a", .GET, null);
-    defer old_document.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 404), old_document.status);
+    try awaitDocumentAbsent(alloc, io, transport, &headers, base, "/db/v1/tables/docs/documents/doc-a");
     if (faults) {
         try assertHandoffInstallSurvivesRestart(alloc, io, &metadata, truncate, &.{ &meta_raft, &meta_control, &data_raft, &data_control });
         try std.testing.expectEqual(new_id, try awaitTableId(alloc, io, transport, &headers, base, null, null));
@@ -633,9 +650,7 @@ fn mountedGraphTruncate(faults: bool) !void {
     defer alloc.free(restarted_base);
     _ = try awaitTableId(alloc, io, transport, &headers, restarted_base, new_id, null);
     try awaitIndex(alloc, io, transport, &headers, restarted_base);
-    var after_restart = try request(alloc, transport, &headers, restarted_base, "/db/v1/tables/docs/documents/doc-a", .GET, null);
-    defer after_restart.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 404), after_restart.status);
+    try awaitDocumentAbsent(alloc, io, transport, &headers, restarted_base, "/db/v1/tables/docs/documents/doc-a");
     try assertGraphEdgesRetired(alloc, io, transport, &headers, restarted_base);
 
     // Exercise the same graph barrier as part of a dependency-closed FK
@@ -675,15 +690,9 @@ fn mountedGraphTruncate(faults: bool) !void {
     const after_cascade_child_id = try awaitNamedTableId(alloc, io, transport, &headers, restarted_base, "children", null, old_child_id);
     if (after_cascade_child_id == old_child_id) return error.GraphCascadeChildNotReplaced;
     try awaitIndex(alloc, io, transport, &headers, restarted_base);
-    var deleted_parent = try request(alloc, transport, &headers, restarted_base, "/db/v1/tables/docs/documents/doc-b", .GET, null);
-    defer deleted_parent.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 404), deleted_parent.status);
-    var deleted_child = try request(alloc, transport, &headers, restarted_base, "/db/v1/tables/children/documents/child-b", .GET, null);
-    defer deleted_child.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 404), deleted_child.status);
-    var deleted_post_fk_child = try request(alloc, transport, &headers, restarted_base, "/db/v1/tables/children/documents/child-c", .GET, null);
-    defer deleted_post_fk_child.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 404), deleted_post_fk_child.status);
+    try awaitDocumentAbsent(alloc, io, transport, &headers, restarted_base, "/db/v1/tables/docs/documents/doc-b");
+    try awaitDocumentAbsent(alloc, io, transport, &headers, restarted_base, "/db/v1/tables/children/documents/child-b");
+    try awaitDocumentAbsent(alloc, io, transport, &headers, restarted_base, "/db/v1/tables/children/documents/child-c");
     try std.testing.expect(after_cascade_id != new_id);
     try assertHandoffInstallSurvivesRestart(alloc, io, &metadata, cascade, &.{ &meta_raft, &meta_control, &data_raft, &data_control });
 

@@ -732,16 +732,16 @@ census, using the same durable continuation and collection cutoff. Legacy
 nonce staging cleanup and private checkpoint reclamation run after the durable
 completion receipt; they cannot prevent a completed collection from advancing.
 
-Native text corpus version 5 publishes 1 MiB immutable packs containing
-independently authenticated 256 KiB ranges across the native segment. Readers use the shared native range codecs, retaining bounded
+Native text corpus version 6 publishes 1 MiB immutable packs containing
+independently authenticated 64 KiB ranges across the native segment. Readers use the shared native range codecs, retaining bounded
 navigation and decoder scratch instead of allocating and zeroing a segment-sized
 heap buffer. Term-frequency probes read dictionary addresses and posting headers;
 Required WAND reads fetch the document chunks they visit, while bounded lookahead
 may warm subsequent chunks. Scoped field views and both block-cache adapters
 forward advisory hints, translating section-relative offsets at the field boundary. Position records are decoded when phrase consumers
 request them. A block checksum may bring neighboring
-bytes into cache, so the minimum read unit is 256 KiB for new publications
-(64 KiB for legacy directories). Each query binds its
+bytes into cache, so the minimum read unit is 64 KiB for new publications
+(256 KiB for version 3 packed directories). Each query binds its
 current store capability, deadline, cancellation and reader lease to a private
 native reader. Query binding borrows the already admitted field navigation,
 collection statistics, and atomic page-validation states; it performs no metadata
@@ -754,8 +754,8 @@ mappings instead of allocating and copying an entire block for each small read.
 Pinned RAM remains charged and cannot be evicted until released; current deadline,
 cancellation and reader-lease checks still run on warm hits. Large contiguous
 segment leases keep their disk-first policy for clean-page reclamation. GC retains physical pack references rather than synthetic range cache identities,
-and still understands retained version 1–4 roots and unpacked directories.
-Reader/topology protocol 31 triggers automatic republication of
+and still understands retained version 1–5 roots and unpacked directories.
+Reader/topology protocol 32 triggers automatic republication of
 older corpora during rolling upgrades.
 
 Native text readers hint the next document chunk using its authenticated native
@@ -866,33 +866,42 @@ active leases are retired; active query mappings remain pinned. Cache shutdown
 flushes the worker before destroying the table borrowed by this hook.
 
 Source-independent remote retrieval, including named text/vector fusion, now
-hydrates the final hit page into owned typed source values. Physical hydration
-still batches 256 identities and applies the same snapshot/delete/lease checks;
+hydrates the final hit page into shared immutable selected column pages. Physical hydration
+returns bounded 4,096-row pages and applies the same snapshot/delete/lease checks;
 key lookup uses a batch map rather than repeatedly scanning all requested keys.
-Shared highlighting borrows the typed source and public field projection
-operates on values directly. The public response is the first JSON encoding of
+Shared highlighting borrows one source row at a time and public field projection
+operates directly on vectors for flat patterns. The public response is the first JSON encoding of
 the document. Typed sources participate in hit cloning, release, and retained
 memory accounting. Source omitted from the response may still be retained for
 highlighting, without leaking dependency fields into `_source`.
 
 An explicit shared dependency contract keeps encoded hydration for evaluation,
-reranking, hierarchy, document-bound filters, and other source-dependent
+reranking, hierarchy, document-bound bindings, and other source-dependent
 operators. Ordinary native identity/score ordering can use typed delivery;
-field sorting and cursor continuations retain their established execution path.
+field sorting retains its established execution path. Score/identity cursor
+continuations use final projected column hydration after the snapshot-fenced
+collector has applied their boundary.
 This preserves response projection, exact integers, source omission, and
 highlight behavior while removing document encode/parse cycles from the common
 retrieval path.
 
 
-Packed text directory version 3 authenticates each range checksum, length and pack
+Packed text directory version 4 authenticates each range checksum, length and pack
 location through the corpus root. The provider returns only that range; the reader
 checks its exact length and SHA-256 before admitting it to the immutable RAM/disk
 cache. It never authenticates a sparse read by downloading the whole pack. Cache
 keys identify verified range contents within the publication scope, while GC marks
-the actual pack objects. A 1 MiB sequential read uses four range requests instead
-of sixteen, and publication uploads one pack instead of sixteen small objects.
-The tradeoff is up to 256 KiB transferred for a single uncached byte. This is a
-request-count improvement, not a claim of a measured wall-clock speedup.
+the actual pack objects. Adjacent required and speculative ranges in the same
+pack share a lazy bounded provider read. Up to four pack groups can warm in
+parallel under shared worker/byte admission; each worker owns at most one pack.
+A 1 MiB sequential read uses one range request instead of sixteen, while
+publication uploads one pack instead of sixteen small objects. A single cold byte
+fetches at most 64 KiB. Legacy directories retain their original geometry.
+Each unit is checked before cache admission; a warm read does not fetch a pack.
+Provider counters record physical coalesced requests and transferred bytes,
+rather than counting each logical cache fill as a separate GET.
+Denied cache admission serves required reads from the same bounded request.
+This is a request-count improvement, not a claim of a measured wall-clock speedup.
 
 Cold scoring gathers all requested term frequencies with one dictionary reader
 per segment. Up to four disjoint segment lanes share process scheduler admission;
@@ -909,10 +918,212 @@ query-bound page caches. Optional slabs participate in pressure reclamation and
 cache admission denial falls back to required uncached reads. Resource accounting
 outlives bound readers; current query authority remains separate from that owner.
 
-Final eligible search pages hydrate from selected Parquet column vectors directly,
-without constructing and cloning an intermediate JSON row. One owned result tree
-retains the values across subsequent cursor pulls. Public projection owns its
-containers but borrows immutable string and number lexemes from that result until
-response serialization completes. Nested inclusion/exclusion and highlighting
-retain the same behavior, and the view never mutates the source. This removes
-redundant payload copies; public JSON encoding and final response limits remain.
+Final eligible search pages retain selected Parquet vectors through response
+serialization, without constructing an owned JSON tree per hit. Reference-counted
+immutable pages gather only selected slots and retain shared dictionary entries
+once. Producers can also grant an immutable column-owner lease. Dense selections
+retain decoded scalar vectors and dictionary payloads directly, copying only
+column descriptors, names and selection ordinals. Hydration pulls up to 4,096
+selected rows per decoded batch, so transport chunk size cannot make a dense
+batch appear sparse. Individual hits share that page through 16 KiB wire writes.
+Sparse selections, unavailable
+ownership capabilities, and owners above the 4 MiB retention ceiling gather
+compact independent slots. Retained cache owners survive cursor pulls, closure,
+and eviction, including their dictionary dependencies. Hit cloning within the same allocator retains a page lease; a clone into
+a different allocator gathers an independent row so it can outlive the original
+request arena. Deinitialization releases the owned lease. Cursor
+advancement and closure cannot invalidate a result. Scalar sources and flat include/exclude projections write directly
+from vectors into the generated public response envelope. Complex projections and
+JSON columns reuse scratch bounded to one hit, including with an arena backing
+allocator; highlighting likewise borrows one
+row at a time, including fields excluded from the public projection. Internal hit
+codecs serialize source values rather than owner pointers. Exact integers, source
+omission, nested inclusion/exclusion, and internal-field stripping retain their
+existing behavior. Internal callers retain owned responses; eligible public calls use the prepared streaming delivery described below.
+
+Boolean conjunctions check local required-term lookups before requesting global
+scoring frequencies, retaining successful navigation for iterator construction.
+An impossible conjunction therefore performs no corpus-wide scoring reads.
+
+
+Physical text reads use pack-scoped in-flight coordination separate from unit
+cache admission. A leader probes verified RAM/mapped/disk residency and reads
+only contiguous cold runs; fifteen warm units plus one cold unit transfer only
+64 KiB. Concurrent leaders for different units can share the verified physical
+result even when RAM admission is denied. Flights carry immutable interval
+coverage: readers join containing or partially overlapping intervals, while disjoint
+intervals proceed independently under the same shared loader/byte admission.
+A partial join completes before the reader registers its own flight. Its loader
+pins the completed immutable inputs and fetches only uncovered cold runs, without
+waiting on another flight while owning one. Composed payload dependencies survive
+producer closure and denied residency; independently authenticated unit errors
+remain isolated. Physical results carry
+verified bytes or an error per unit. A corrupt unit in a broad speculative read
+cannot fail a required reader of a healthy unit, and a failed provider run cannot
+discard successes from other runs. Readers recheck residency before a missing-unit
+fallback GET. Flight payloads are temporary leases,
+with no second resident copy of a pack. The physical loader authenticates each
+unit once and carries its digest proof with a retained slice owner. Cache admission
+copies a unit once into independently evictable RAM residency; denied admission
+returns the original physical slice without copying or hashing again. Each
+consumer checks its own current authority. Waiting readers use their own
+cancellation/deadline; a canceled leader does not cancel another reader.
+Planners never join unit flights while owning a physical flight, avoiding
+cycles between overlapping unit and pack leaders.
+
+Required multi-pack reads use at most four lanes through the shared scheduler.
+Each lane owns bounded scratch and a disjoint output slice; saturation runs
+required work inline. All lanes join on success, failure, or cancellation before
+query capabilities and output storage can be released. Speculative hints keep
+their separate transient admission and may yield under pressure. A required
+cache hit reaps only completed speculation: it does not wait for unrelated units
+in an overlapping pack. Quiesce still cancels and joins all remaining tasks.
+
+Final hydration builds one physical row selection for small ranked results,
+including duplicate identity consumers. Above 65,536 identities, a 512 KiB native
+external sort orders canonical physical identities, preserving original result
+positions. Bounded windows of at most 65,536 references then visit files/groups/rows
+in physical order and scatter results back into rank order. The selector window
+is not a public result or pre-pagination residual-candidate limit; duplicate
+consumers remain independent, including across window boundaries. Score/identity pagination retains this
+path, with the same snapshot fence and sort tuple semantics. Native-proven filters
+can rank identities without final-source hydration; unresolved predicates retain
+the existing complete-source callback and fail-closed authorization behavior.
+Temporary predicate sources are released before final projected column hydration,
+so predicate/highlight dependencies never broaden the public projection.
+A pinned cursor per physical window visits selected
+files/row groups in physical order and returns bounded pages; an identity map
+scatters each page into rank order. Crossing a 256-hit boundary no longer reopens
+a cursor or revisits the same physical group solely because of rank batching.
+
+Eligible single public remote searches deliver the existing JSON envelope
+through a synchronous transport sink. A prepared wire plan encodes metadata
+once and compiles projected source descriptors before committing headers. Scalar
+strings borrow immutable column pages; numbers and complex JSON fragments are
+canonicalized once. Exact JSON escaping and punctuation lengths enforce the
+caller's response-size ceiling before transport starts. Transient JSON/projection
+trees are discarded after each source is prepared, including escaped strings.
+
+The plan emits its ordered metadata/source segments through a 16 KiB writer with
+transport backpressure, without replaying envelope serialization or projection.
+Small plans retain compact descriptors and borrow scalar strings. Public delivery
+uses a 4 MiB preparation threshold; exceeding either planned metadata/fragment
+storage or uniquely pinned source-page bytes switches to a private spill file.
+Per-hit preparation scratch is discarded after its validated fragment is appended.
+Previously prepared segments are serialized once before their arena is released.
+The existing temporary-file manager supplies cancellation, shared I/O scheduling,
+private permissions, immediate unlinking, cleanup on failure and a 1 GiB disk quota
+(or the caller response ceiling, when smaller). The complete file is flushed and
+its exact length checked before headers commit. Exhausting delivery resource
+limits returns HTTP 413 before commitment. Spilled public delivery consumes source
+leases as their fragments are prepared, so a slow client does not pin decoded
+source pages. Replay uses a 16 KiB buffer and observes cancellation/backpressure.
+Reusable sink callers opt into source consumption explicitly. Ranking metadata
+and the hydration result still obey candidate/result admission; this is bounded
+wire preparation, not a constant-memory query/result cursor. The query and
+publication reader lease remain alive through the last write; unspilled plans
+also retain their selected column pages through that boundary. A disconnect or
+error after commitment terminates the stream rather than retrying execution or
+sending a second response. Internal/group callers, composed dispatch consumers,
+and NDJSON multi-query retain buffered delivery. Existing row/candidate limits
+and caller response ceilings still apply. No wall-clock speedup is claimed.
+
+The `x-antfly-response-streaming` OpenAPI operation flag exports optional
+transport streaming for global, table, and namespace query routes through the
+kernel manifest. It leaves the ordinary typed JSON response schema unchanged.
+Adapters with no streaming transport use buffered delivery; internal group
+queries do not inherit the public route capability. Route-policy and manifest
+contracts exercise this boundary, and the real Parquet E2E checks chunked HTTP
+framing as well as the decoded response.
+
+
+Remote text metadata predicates use published relational tuple indexes. Exact
+scalar `term` and bounded `range` predicates seek the same authenticated trees
+as SQL. Conjunctions can use composite bounds or intersect separate indexes;
+disjunctions require every branch to be exact. An indexed conjunct may narrow
+a residual predicate, but an exclusion never discards rows using a superset.
+Unsupported expressions retain the shared exact residual evaluator.
+
+The consumer builds a Roaring bitmap in the pinned text snapshot's document
+number space. Both selective and broad predicates seek the tuple bounds in an immutable
+compressed row-set tree. Contiguous per-tuple/file/group physical blocks encode
+as extents; scattered selections encode as Roaring sets. Broad categorical
+predicates consume blocks rather than one forward record per matching row.
+Initial publication aggregates the sorted tuple stream; incremental publication
+replaces only changed-file blocks through bounded spill and copy-on-write pages.
+The forward/reverse trees remain available for SQL seeks and file replacement;
+predicate evaluation does not scan the unrelated physical reverse tree. Native text metadata version 8
+publishes a delete-aware physical-row ordinal directory per file. Contiguous
+2^20-row blocks need only an ordinal base and extent; blocks with holes use an
+authenticated Roaring bitmap and rank. Group identifiers and the high bits of
+64-bit row coordinates select blocks without truncation. Mapping an index result
+needs neither formatted private IDs nor binary/sequential stored-ID decoding.
+The bitmap is applied before top-k and exact counts, preserving corpus statistics.
+Text metadata version 8 and ordered-row metadata version 5 rebuild automatically
+under reader/topology protocol 33. Existing publication and spill quotas still
+apply; this change does not claim a measured 50-million-row build capacity.
+
+Planning consumes the shared compiled predicate IR. Shorthand terms, field/path
+aliases, range aliases and boolean structure have one grammar. Standard numeric
+ranges compare integers exactly, including mixed integer/float bounds, using the
+same scalar order as SQL. A planner uses a tuple index only when its order proves
+the shared predicate: RFC3339 ranges over string columns retain chronological
+fallback evaluation, and integer bounds that cannot be represented exactly in a
+floating-point index remain residual. Explicit datetime columns also retain the
+shared evaluator until their unit/normalization contract is proven compatible.
+
+Dense, sparse and mixed retrieval use compressed physical-row predicate sets,
+without the legacy 100,000 matching-ID limit. Dense leaf admission reuses batched
+native metadata reads before scoring; scalar/rerank paths enforce the same
+membership callback and propagate errors. Sparse postings point-seek existing
+native reverse identities and cache accepted/rejected doc numbers in compressed
+bitmaps across terms. Membership is enforced before top-k, including when a lower
+scoring eligible row would otherwise fall outside an unfiltered candidate page.
+Candidate scoring still follows each native index's search/effort semantics.
+
+Native field sorting can use the shared doc-value top-N heap for remote text.
+It iterates compressed membership instead of materializing all candidate doc
+numbers and projects public IDs before tie breaking or cursor comparison. Only
+the selected page loads source. Public scores are evaluated for that page against
+the original query and complete corpus statistics. A producer's private-ID sorted
+segment attestation does not imply public-ID order; such plans use the native
+comparator heap. This path requires complete native doc-value coverage.
+
+Corpus construction assembles bounded projection batches (65,536 documents,
+8 MiB source bytes or 24 MiB arena capacity, whichever comes first), then uses the
+shared 8 MiB segment/32 MiB build-budget splitter. Resetting the projection arena
+releases its capacity before the next batch. The old 1,024-document flush and
+512 MiB total encoded-output limit no longer bound a corpus. Immutable per-file
+manifests keep segment and ordinal references out of the bounded root; unchanged
+files reuse their segments and ordinal maps. Manifest metadata, segment sizes,
+snapshot doc-number capacity, cache admission and cancellation remain bounded.
+GC follows manifests, ordinal hole bitmaps and native segment directories for
+both current publications and retained reader roots, with durable continuation.
+
+Public consumed delivery can hydrate 64 ranked hits at a time, grouping physical
+reads inside each window, attach highlights from hidden dependencies and append
+validated fragments directly to the private response spool. Source leases and
+highlight payloads are released after each fragment. A complete hydrated source
+array is no longer retained before spooling. Validation, exact length accounting
+and resource failures still precede headers; replay retains the publication lease
+and observes backpressure. Internal reusable results remain eager. Ranking/result
+metadata is still admitted separately; this is not an unbounded result cursor.
+
+When a scalar predicate has no published index, the same consumer can use a
+bounded typed SQL scan. It pushes conditions into Iceberg partition, Parquet
+row-group and page pruning, then merges physical selections into the native
+bitmap. Indexed conjuncts take precedence over scanning an unindexed conjunct;
+the remaining expression is evaluated only on the narrowed text candidates.
+Eligible match-all counts use per-segment bitmap cardinalities and do not
+allocate candidate hits for the whole matching population. Other query shapes
+retain their existing candidate and response resource budgets.
+
+Background native publication and native runtime/text cache heaps use the platform process allocator beneath their existing working-set and resource-manager budgets. Bulk sparse/dense and ordered builders retain ordinary small heap entries; using the page allocator here would create a mapping per entry and amplify resident memory and teardown costs. Budget admission and cancellation remain enforced by the build owner.
+
+Text artifact collection reads the authenticated root directory without expanding
+its file manifests. Each file manifest is a separate durable frontier job; GC
+charges that manifest against the collection read budget before issuing storage
+I/O, then queues its segment directories and row-hole children. Checkpoints can
+therefore advance between files without materializing the corpus-wide serving
+metadata. Serving and collection share file-manifest identity, scope, and child
+validation. Inline retained root formats continue using their existing walkers.

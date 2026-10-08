@@ -159,18 +159,21 @@ const HttpxTransport = struct {
             owned.deinit();
             alloc.destroy(owned);
         };
+        var client_config: httpx.ClientConfig = if (request_timeout_ms) |timeout_ms| .{
+            .timeouts = .{
+                .connect_ms = timeout_ms,
+                .read_ms = timeout_ms,
+                .write_ms = timeout_ms,
+                .request_ms = timeout_ms,
+            },
+        } else .{};
+        // Small immutable objects still need room for provider error envelopes
+        // so HTTP status mapping preserves missing, denied and transient errors.
+        client_config.max_error_response_size = 4096;
         return .{
             .alloc = alloc,
             .io_impl = io_impl,
-            .client = if (request_timeout_ms) |timeout_ms|
-                httpx.Client.initWithConfig(alloc, shared_io orelse io_impl.?.io(), .{ .timeouts = .{
-                    .connect_ms = timeout_ms,
-                    .read_ms = timeout_ms,
-                    .write_ms = timeout_ms,
-                    .request_ms = timeout_ms,
-                } })
-            else
-                httpx.Client.init(alloc, shared_io orelse io_impl.?.io()),
+            .client = httpx.Client.initWithConfig(alloc, shared_io orelse io_impl.?.io(), client_config),
         };
     }
 
@@ -1671,6 +1674,41 @@ test "gcs local grpc reference path can be discovered when present" {
     defer if (path) |value| alloc.free(value);
     if (path) |value| {
         try std.testing.expect(std.mem.endsWith(u8, value, "googleapis/storage/v2/storage.pb.go"));
+    }
+}
+
+test "json api bounded HTTP reads preserve provider errors and success ceilings" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const Case = struct { status: u16, bytes: usize, expected: anyerror };
+    for ([_]Case{
+        .{ .status = 404, .bytes = 352, .expected = error.FileNotFound },
+        .{ .status = 403, .bytes = 352, .expected = error.AccessDenied },
+        .{ .status = 503, .bytes = 352, .expected = error.RemoteUnavailable },
+        .{ .status = 404, .bytes = 4097, .expected = error.ResponseTooLarge },
+        .{ .status = 200, .bytes = 2, .expected = error.ResponseTooLarge },
+    }) |case| {
+        const payload = @as([4097]u8, @splat('e'));
+        var server = try httpx.testing_mod.TestServer.start(a, io, &.{.{
+            .path = "/storage/v1/b/bucket/o/small",
+            .respond = .{ .status = case.status, .body = payload[0..case.bytes] },
+        }});
+        defer server.deinit();
+        var json_client = try JsonApiClient.init(a, .{
+            .endpoint = try std.fmt.allocPrint(a, "{s}/storage/v1", .{server.baseUrl()}),
+            .upload_endpoint = try std.fmt.allocPrint(a, "{s}/upload/storage/v1", .{server.baseUrl()}),
+            .io = io,
+        });
+        var client = json_client.client();
+        defer client.deinit();
+        json_client.owned_httpx.?.client.config.retry_policy.max_retries = 0;
+        var serving = try io.concurrent(httpx.testing_mod.TestServer.handleOne, .{&server});
+        defer _ = serving.cancel(io) catch {};
+        try std.testing.expectError(case.expected, client.getObject("bucket", "small", .{
+            .skip_metadata_probe = true,
+            .max_response_bytes = 1,
+        }));
+        try serving.await(io);
     }
 }
 
