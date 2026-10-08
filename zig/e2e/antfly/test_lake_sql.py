@@ -1398,6 +1398,65 @@ def test_native_remote_text_corpus_scores_filters_and_restart(tmp_path):
         ordered_first = call(
             "POST", "/tables/lake_text/query", dict(ordered_request, limit=1)
         )
+        # Structured filters resolve against the pinned lake before ranking.
+        # They may reference a field omitted from both the text index and source.
+        filtered_request = dict(
+            ordered_request,
+            fields=["label"],
+            filter_query={"term": {"path": "/amount", "value": base + 17}},
+        )
+        ordered_filtered = call("POST", "/tables/lake_text/query", filtered_request)
+        assert [
+            hit["_source"]["label"] for hit in ordered_filtered["hits"]["hits"]
+        ] == ["row-17"]
+        assert ordered_filtered["hits"]["total"] == {"value": 1, "relation": "exact"}
+        assert all(
+            set(hit["_source"]) == {"label"} for hit in ordered_filtered["hits"]["hits"]
+        )
+        empty_filtered = call(
+            "POST",
+            "/tables/lake_text/query",
+            dict(
+                filtered_request,
+                filter_query={"term": {"path": "/amount", "value": base - 1}},
+            ),
+        )
+        assert empty_filtered["hits"]["hits"] == []
+        excluded = call(
+            "POST",
+            "/tables/lake_text/query",
+            dict(
+                ordered_request,
+                exclusion_query={"term": {"path": "/amount", "value": base + 17}},
+            ),
+        )
+        assert [hit["_id"] for hit in excluded["hits"]["hits"]] == [
+            hit["_id"] for hit in hits if hit["_source"]["label"] != "row-17"
+        ]
+        subset = dict(
+            ordered_request,
+            filter_query={
+                "disjuncts": [
+                    {"term": {"path": "/amount", "value": base + 17}},
+                    {"term": {"path": "/amount", "value": base + 18}},
+                ]
+            },
+        )
+        subset_hits = call("POST", "/tables/lake_text/query", subset)["hits"]["hits"]
+        subset_page = call("POST", "/tables/lake_text/query", dict(subset, limit=1))
+        subset_next = call(
+            "POST",
+            "/tables/lake_text/query",
+            dict(
+                subset,
+                limit=1,
+                search_after=subset_page["hits"]["hits"][0]["_sort"],
+                remote_snapshot=subset_page["remote_snapshot"],
+            ),
+        )
+        assert [hit["_id"] for hit in subset_next["hits"]["hits"]] == [
+            subset_hits[1]["_id"]
+        ]
         snapshot_token = ordered_first["remote_snapshot"]
         assert len(snapshot_token) == 64, ordered_first
         sort_tuple = ordered_first["hits"]["hits"][0]["_sort"]
