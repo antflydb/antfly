@@ -533,6 +533,15 @@ reuse authenticated ranges across restarts. Cache availability is optional:
 missing local paths, ownership contention, startup failures and resource pressure
 must not become source authority or query readiness failures.
 
+A failed disk-tier initialization is retried opportunistically by a later
+request after a one-minute backoff. No request sleeps during backoff, and a
+successful owner is published exactly once with acquire/release synchronization
+for readers already serving from RAM/source. Initialization attempt/failure
+counters expose repeated recovery failures; a successful retry clears the
+current unavailability reason. This permits recovery from temporary owner-lock
+contention without requiring another server restart. It does not repair invalid
+configuration or guarantee a hit for data read while persistence was unavailable.
+
 The data-server metrics expose `antfly_lake_cache_disk_ready`, initialization
 failure reasons, disk/mapping hits, provider reads/bytes, asynchronous write
 errors, queue depth and policy/queue/memory/capacity/allocation/closing drops.
