@@ -22,6 +22,10 @@ pub const SharedBytes = struct {
     allocator: std.mem.Allocator,
     refs: platform.atomic.Value(usize) = .init(1),
     bytes: []u8,
+    /// Assigned before publication; credit follows the payload, not cache membership.
+    reservation: ?@import("../resource_manager.zig").Reservation = null,
+    cache_admitted: bool = false,
+    result_pins_allowed: bool = true,
 
     pub fn create(allocator: std.mem.Allocator, bytes: []u8) !*SharedBytes {
         const self = try allocator.create(SharedBytes);
@@ -36,7 +40,9 @@ pub const SharedBytes = struct {
         if (self.refs.fetchSub(1, .acq_rel) == 1) {
             const allocator = self.allocator;
             allocator.free(self.bytes);
+            var reservation = self.reservation;
             allocator.destroy(self);
+            if (reservation) |*credit| credit.release();
         }
     }
 };
