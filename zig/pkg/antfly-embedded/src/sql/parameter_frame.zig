@@ -356,6 +356,23 @@ test "SQL JSON array allocator references survive program and codec owner moves"
     try std.testing.expectEqual(@as(?arrays.ElementType, .jsonb), frame.descriptors[0].element_type);
 }
 
+test "SQL datetime parameters preserve signed epoch instants across JSON and text ingress" {
+    const Run = struct {
+        fn run(a: A) !void {
+            for ([_][]const u8{ "1969-12-31T23:59:59.999Z", "1970-01-01T00:59:59.999+01:00" }) |input| {
+                var json = try Frame.prepareJson(a, &.{.{ .kind = .datetime }}, &.{.{ .string = input }}, .{});
+                defer json.deinit();
+                var text_frame = try Frame.prepare(a, &.{.{ .kind = .datetime }}, &.{.{ .text = input }}, .{});
+                defer text_frame.deinit();
+                try std.testing.expectEqualStrings("1969-12-31T23:59:59.999000000Z", json.values[0].value.string);
+                try std.testing.expectEqualStrings(json.values[0].value.string, text_frame.values[0].value.string);
+            }
+        }
+    };
+    try Run.run(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Run.run, .{});
+}
+
 pub const Frame = struct {
     arena: *std.heap.ArenaAllocator,
     budget: *MemoryBudget,
@@ -446,8 +463,8 @@ fn decodeInput(a: A, descriptor: scalar.Type, input: Input, limits: Limits, work
         if (!std.unicode.utf8ValidateSlice(raw) or std.mem.indexOfScalar(u8, raw, 0) != null) return error.SqlInvalidTextEncoding;
         try work.consume(raw.len);
         const datetime = @import("../datetime.zig");
-        const ns = datetime.parseDateTimeToNs(raw) orelse return error.SqlInvalidDateTime;
-        return scalar.Datum.json(.{ .string = try datetime.formatDateTimeNsAlloc(a, ns) });
+        const ns = datetime.parseDateTimeToSignedNs(raw) orelse return error.SqlInvalidDateTime;
+        return scalar.Datum.json(.{ .string = try datetime.formatDateTimeSignedNsAlloc(a, ns) });
     }
     const kind = try scalar.parameterElementType(descriptor);
     if (descriptor.kind == .array) {
