@@ -354,7 +354,7 @@ fn accountArtifact(accounting: *ArtifactAccounting, artifact: artifact_ref.Artif
         .row_fragment_stats => accounting.row_fragment_stats_count += 1,
         .algebraic_segment => accounting.algebraic_segment_count += 1,
         .external_base_source => accounting.external_metadata_count += 1,
-        .text_segment, .vector_segment, .sparse_segment, .graph_segment, .graph_metric_segment => accounting.search_sidecar_count += 1,
+        .text_segment, .vector_segment, .sparse_segment, .graph_segment, .graph_metric_segment, .ordered_row_index => accounting.search_sidecar_count += 1,
         .doc_values, .stored_fields, .mutation_segment, .document_segment, .document_facts => {},
     }
 }
@@ -526,6 +526,13 @@ fn chooseCacheClass(
             else => .row_fragment_data,
         },
     };
+}
+
+test "lake explain counts ordered indexes as sidecars" {
+    var accounting: ArtifactAccounting = .{};
+    try accountArtifact(&accounting, .{ .kind = .ordered_row_index, .artifact_id = "ordered", .byte_len = 40, .checksum = "len:40" });
+    try std.testing.expectEqual(@as(u32, 1), accounting.search_sidecar_count);
+    try std.testing.expectEqual(@as(u64, 40), accounting.manifest_accounted_bytes);
 }
 
 test "lake explain accounts for Antfly row fragments and stats" {

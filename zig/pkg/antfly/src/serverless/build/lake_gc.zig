@@ -186,7 +186,7 @@ fn findArtifact(
 fn isLakeArtifact(kind: artifact_ref.ArtifactKind) bool {
     return switch (kind) {
         .row_fragment, .row_fragment_stats, .algebraic_segment, .external_base_source => true,
-        .text_segment, .vector_segment, .sparse_segment, .graph_segment, .graph_metric_segment => true,
+        .text_segment, .vector_segment, .sparse_segment, .graph_segment, .graph_metric_segment, .ordered_row_index => true,
         .doc_values, .stored_fields, .mutation_segment, .document_segment, .document_facts => false,
     };
 }
@@ -267,6 +267,7 @@ test "lake gc retains external metadata referenced by live snapshots" {
         .{ .kind = .external_base_source, .artifact_id = "files-new", .byte_len = 1000, .checksum = "len:1000" },
         .{ .kind = .external_base_source, .artifact_id = "deletes-new", .byte_len = 200, .checksum = "len:200" },
         .{ .kind = .text_segment, .artifact_id = "text-new", .byte_len = 50, .checksum = "len:50" },
+        .{ .kind = .ordered_row_index, .artifact_id = "ordered-new", .byte_len = 30, .checksum = "len:30" },
     };
     const snapshots = [_]Snapshot{.{
         .snapshot_id = "iceberg-2",
@@ -285,6 +286,8 @@ test "lake gc retains external metadata referenced by live snapshots" {
         .{ .kind = .external_base_source, .artifact_id = "files-new", .byte_len = 1000 },
         .{ .kind = .external_base_source, .artifact_id = "deletes-new", .byte_len = 200 },
         .{ .kind = .text_segment, .artifact_id = "text-new", .byte_len = 50 },
+        .{ .kind = .ordered_row_index, .artifact_id = "ordered-new", .byte_len = 30 },
+        .{ .kind = .ordered_row_index, .artifact_id = "ordered-old", .byte_len = 25 },
     };
 
     var plan = try planAlloc(alloc, &snapshots, &candidates);
@@ -294,8 +297,10 @@ test "lake gc retains external metadata referenced by live snapshots" {
     try std.testing.expect(plan.isRetained("files-new"));
     try std.testing.expect(plan.isRetained("deletes-new"));
     try std.testing.expect(plan.isRetained("text-new"));
-    try std.testing.expectEqual(@as(u64, 1250), plan.retained_bytes);
-    try std.testing.expectEqual(@as(u64, 900), plan.collectible_bytes);
+    try std.testing.expect(plan.isRetained("ordered-new"));
+    try std.testing.expect(plan.isCollectible("ordered-old"));
+    try std.testing.expectEqual(@as(u64, 1280), plan.retained_bytes);
+    try std.testing.expectEqual(@as(u64, 925), plan.collectible_bytes);
 }
 
 test "lake gc fails closed when live snapshot references missing metadata" {

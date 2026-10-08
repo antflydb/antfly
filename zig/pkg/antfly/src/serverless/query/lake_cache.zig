@@ -86,7 +86,7 @@ pub fn classifyArtifact(kind: artifact_ref.ArtifactKind) CacheClass {
         .row_fragment_stats => .row_fragment_stats,
         .algebraic_segment => .algebraic_segment,
         .external_base_source => .external_metadata,
-        .text_segment, .vector_segment, .sparse_segment, .graph_segment, .graph_metric_segment => .search_sidecar,
+        .text_segment, .vector_segment, .sparse_segment, .graph_segment, .graph_metric_segment, .ordered_row_index => .search_sidecar,
         .doc_values, .stored_fields, .mutation_segment, .document_segment, .document_facts => .other,
     };
 }
@@ -139,6 +139,15 @@ test "lake cache accounting separates pinned metadata from payload bytes" {
     try std.testing.expectEqual(@as(u64, 60), accounting.pinned_bytes);
     try std.testing.expectEqual(@as(u64, 140), accounting.payload_bytes);
     try std.testing.expectEqual(@as(u64, 200), accounting.total_bytes);
+}
+
+test "lake cache ordered indexes charge the evictable sidecar payload budget" {
+    const accounting = try accountArtifacts(&.{.{ .kind = .ordered_row_index, .artifact_id = "ordered", .byte_len = 40, .checksum = "len:40" }}, .{ .max_payload_bytes = 39 });
+    try std.testing.expectEqual(@as(u64, 40), accounting.search_sidecar_bytes);
+    try std.testing.expectEqual(@as(u64, 40), accounting.payload_bytes);
+    try std.testing.expectEqual(@as(u64, 40), accounting.total_bytes);
+    try std.testing.expectEqual(@as(u64, 0), accounting.pinned_bytes);
+    try std.testing.expect(accounting.over_payload_budget);
 }
 
 test "lake cache accounting reports budget pressure by lane" {
