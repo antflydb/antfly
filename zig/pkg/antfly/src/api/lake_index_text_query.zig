@@ -55,6 +55,7 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, table: local.common_to
     const options: @import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions = .{ .node_config = server.cfg.node_config, .secret_store = server.cfg.secret_store };
     var source = try local.serverless_query_lake_serving.ServingSource.openCached(a, .{ .storage_mode = .relational, .external_base_source = schema }, options.lakeOptions(), context, &server.lake_read_cache);
     defer source.deinit();
+    try source.attachCache(&server.lake_read_cache, schema.binding, context);
     var store = try Store.openNative(a, server.cfg.node_config, server.cfg.secret_store, true, server.cfg.deployment_mode, server.cfg.native_lake_artifact_base_dir);
     defer store.deinit();
     var arena = std.heap.ArenaAllocator.init(a);
@@ -88,6 +89,7 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, table: local.common_to
     owner.private_digests = metadata.private_digests;
     var effective = req;
     effective.cancellation = .{ .ptr = &owner, .is_cancelled_fn = Execution.canceled };
+    try @import("lake_index_search_filter.zig").resolve(ca, sql_table, &source, request, &effective);
     owner.hydration_fields = try owner.planHydration(effective);
     owner.typed_delivery = canDeliverTypedSource(effective);
     var execution_req = effective;
