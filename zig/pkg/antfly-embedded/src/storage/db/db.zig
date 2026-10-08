@@ -656,6 +656,9 @@ pub const OpenOptions = struct {
     transaction_recovery: transaction_runtime_mod.Config = .{},
     text_merge: text_merge_runtime_mod.Config = .{},
     sparse_compaction: sparse_compaction_runtime_mod.Config = .{},
+    /// Automatically consume configured metrics and durable refresh/rebuild
+    /// requests on active writable owners. Existing background-worker gates
+    /// also apply. The worker and its lease start lazily when metrics exist.
     graph_metric_maintenance: graph_metric_runtime_mod.Config = .{},
     graph_metric_idle_maintenance: GraphMetricIdleMaintenanceMode = .auto,
     graph_metric_idle_planned_options: index_manager_mod.IndexManager.GraphMetricPlannedMaintenanceOptions = .{},
@@ -5620,7 +5623,11 @@ pub const DB = struct {
     }
 
     fn initOptionalGraphMetricRuntime(self: *DB, cfg: graph_metric_runtime_mod.Config) !void {
-        if (!self.start_index_workers or !cfg.enabled) return;
+        if (comptime builtin.os.tag == .freestanding) return;
+        if (!self.start_index_workers) return;
+        // Manual backends with only filesystem authority cannot own a
+        // background worker. Their caller drives maintenance explicitly.
+        if (self.backend_runtime.io() == null) return;
         const resources = self.core.asyncResources();
         self.graph_metric_owner = try @TypeOf(self.graph_metric_owner).create(self.runtime_alloc, .{
             self.runtime_alloc,
@@ -5628,10 +5635,11 @@ pub const DB = struct {
             resources.index_manager,
             resources.apply_mutex,
             self.backend_runtime,
-            cfg,
+            cfg.forDbOwner(),
         });
         const runtime = self.graph_metric_owner.runtime.?;
         self.graph_metric_runtime = runtime;
+        resources.index_manager.graph_metric_notify = .{ .ptr = runtime, .notify = graph_metric_runtime_mod.GraphMetricRuntime.notifyOpaque };
     }
 
     fn initOptionalRuntimes(self: *DB, opts: *OpenOptions) !void {
@@ -5687,6 +5695,7 @@ pub const DB = struct {
         self.graph_cleanup_owner.stopping.store(true, .release);
         if (self.enrichment_runtime) |runtime| runtime.beginTeardown();
         if (self.transaction_runtime) |runtime| runtime.beginTeardown();
+        if (self.graph_metric_runtime) |runtime| runtime.beginTeardown();
     }
 
     pub fn ensureTransactionRecoveryRuntime(self: *DB, cfg: transaction_runtime_mod.Config) !void {
@@ -5842,6 +5851,7 @@ pub const DB = struct {
         self.async_context.sparse_compaction_runtime = null;
         self.sparse_compaction_owner.deinit(self.runtime_alloc);
         self.sparse_compaction_runtime = null;
+        self.core.index_manager.graph_metric_notify = null;
         self.graph_metric_owner.deinit(self.runtime_alloc);
         self.graph_metric_runtime = null;
         if (executor_ready and self.open_mode.allowsIndexWorkers()) {
@@ -30493,7 +30503,6 @@ pub const DB = struct {
             resources.apply_mutex,
             self.backend_runtime,
             .{
-                .enabled = true,
                 .start_background_loop = false,
                 .role = parsed.value.role,
                 .runtime_id = parsed.value.runtime_id,

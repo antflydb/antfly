@@ -169,7 +169,7 @@ test "db graph runtime replicated split fences topology before receipt and retir
     const request = types.BatchRequest{ .split_transition = .{ .kind = .finalize, .transition_id = 1, .attempt_epoch = 1, .destination_group_id = 2, .split_key = "m" } };
     var epoch: u64 = undefined;
     {
-        var db = try DB.open(a, std.mem.span(path), .{});
+        var db = try DB.open(a, std.mem.span(path), .{ .graph_metric_maintenance = .{ .start_background_loop = false } });
         defer db.close();
         try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{\"metrics\":{\"degree\":{\"enabled\":true,\"kind\":\"degree\"}}}" });
         try db.batch(.{ .graph_writes = &.{
@@ -198,7 +198,8 @@ test "db graph runtime replicated split fences topology before receipt and retir
     {
         // Reopen reconciles authoritative ownership before resuming cleanup.
         // The receipt and logical visibility do not depend on that drain.
-        var db = try DB.open(a, std.mem.span(path), .{});
+        // This fixture drives metric publication explicitly.
+        var db = try DB.open(a, std.mem.span(path), .{ .graph_metric_maintenance = .{ .start_background_loop = false } });
         defer db.close();
         try @import("antfly_server_test_sources").local_test_sources.storage_server_db_adapter.applyOrdered(&db, request, .{ .term = 1, .index = 1 });
         try std.testing.expectEqualStrings("m", db.getRange().end);
@@ -220,7 +221,7 @@ test "db graph runtime replicated split fences topology before receipt and retir
         try @import("antfly_server_test_sources").local_test_sources.storage_server_db_adapter.applyOrdered(&db, request, .{ .term = 1, .index = 1 });
         try std.testing.expectEqual(epoch, index.edge_generation);
     }
-    var reopened = try DB.open(a, std.mem.span(path), .{});
+    var reopened = try DB.open(a, std.mem.span(path), .{ .graph_metric_maintenance = .{ .start_background_loop = false } });
     defer reopened.close();
     try std.testing.expectEqualStrings("m", reopened.getRange().end);
     try @import("antfly_server_test_sources").local_test_sources.storage_server_db_adapter.applyOrdered(&reopened, request, .{ .term = 1, .index = 1 });

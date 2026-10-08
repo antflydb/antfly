@@ -1438,6 +1438,12 @@ pub const IndexManager = struct {
     retired_lsm_owner_labels_collapsed: [2]u64 = .{ 0, 0 },
     sparse_indexes: std.ArrayListUnmanaged(SparseIndex),
     graph_indexes: std.ArrayListUnmanaged(GraphIndex),
+    /// The DB-owned lazy metric runtime is notified only after a graph metric
+    /// configuration is installed. The callback must not take catalog_mutex.
+    graph_metric_notify: ?struct {
+        ptr: *anyopaque,
+        notify: *const fn (*anyopaque) void,
+    } = null,
     graph_ownership_cleanup_cursor: usize = 0,
     /// Lock-free cursors give bounded scheduler sweeps stable round-robin
     /// fairness while the catalog shared lock keeps the indexed slices stable.
@@ -17579,6 +17585,20 @@ pub const IndexManager = struct {
         return self.graph_indexes.items.len > 0;
     }
 
+    pub fn hasConfiguredGraphMetrics(self: *IndexManager) bool {
+        self.catalog_mutex.lockShared();
+        defer self.catalog_mutex.unlockShared();
+        for (self.graph_indexes.items) |entry| {
+            if (entry.metric_configs.len != 0) return true;
+        }
+        return false;
+    }
+
+    fn notifyGraphMetricConfiguration(self: *IndexManager, configured: bool) void {
+        if (!configured) return;
+        if (self.graph_metric_notify) |hook| hook.notify(hook.ptr);
+    }
+
     pub fn graphRetirementAdmissionOpen(self: *const IndexManager) bool {
         if (self.graph_retirement_closed.load(.acquire)) return false;
         if (self.primary_store) |store| if (store.graphEndpointCleanupBlocksReads() catch true) return false;
@@ -20811,6 +20831,7 @@ pub const IndexManager = struct {
             .graph => |entry| {
                 self.waitForGraphMetricSchedulePins();
                 try self.graph_indexes.append(self.alloc, entry);
+                self.notifyGraphMetricConfiguration(entry.metric_configs.len != 0);
             },
             .algebraic => |entry| try self.algebraic_indexes.append(self.alloc, entry),
         }
@@ -23364,7 +23385,10 @@ pub const IndexManager = struct {
                 self.dense_indexes.appendAssumeCapacity(index);
             },
             .sparse_vector => |index| self.sparse_indexes.appendAssumeCapacity(index),
-            .graph => |index| self.graph_indexes.appendAssumeCapacity(index),
+            .graph => |index| {
+                self.graph_indexes.appendAssumeCapacity(index);
+                self.notifyGraphMetricConfiguration(index.metric_configs.len != 0);
+            },
             .algebraic => |index| self.algebraic_indexes.appendAssumeCapacity(index),
         }
         entry.* = undefined;
