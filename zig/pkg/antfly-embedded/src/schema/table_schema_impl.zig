@@ -1034,18 +1034,23 @@ fn restoreFieldIsDefault(value: anytype, default: @TypeOf(value)) bool {
 
 fn physicalLayoutDischargesProperty(property: DocumentProperty) bool {
     const kind = property.field_type orelse return false;
+    const sql_array = std.mem.eql(u8, kind, "sql_array");
+    if (sql_array and property.sql_type == null) return false;
     const physical_scalar = std.mem.eql(u8, kind, "string") or std.mem.eql(u8, kind, "keyword") or
         std.mem.eql(u8, kind, "text") or std.mem.eql(u8, kind, "link") or
         std.mem.eql(u8, kind, "html") or std.mem.eql(u8, kind, "search_as_you_type") or
         std.mem.eql(u8, kind, "substring") or
         std.mem.eql(u8, kind, "boolean") or std.mem.eql(u8, kind, "integer") or
-        std.mem.eql(u8, kind, "number") or std.mem.eql(u8, kind, "numeric");
+        std.mem.eql(u8, kind, "number") or std.mem.eql(u8, kind, "numeric") or sql_array;
     if (!physical_scalar) return false;
     if (property.integer_only and !std.mem.eql(u8, kind, "integer")) return false;
     const defaults = DocumentProperty{ .name = "" };
     inline for (comptime std.meta.fieldNames(DocumentProperty)) |reflected_name| {
         if (comptime !std.mem.eql(u8, reflected_name, "name") and
             !std.mem.eql(u8, reflected_name, "field_type") and
+            // Strict physical validation already checks the pinned scalar or
+            // array SQL domain. It must precede this residual validation plan.
+            !std.mem.eql(u8, reflected_name, "sql_type") and
             !std.mem.eql(u8, reflected_name, "integer_only") and
             !std.mem.eql(u8, reflected_name, "allows_null"))
         {
@@ -1063,10 +1068,28 @@ pub fn validateRelationalRestoreProperty(
     compiled: *const CompiledValidationPlan,
     json_literal_null: bool,
 ) !void {
+    const expressions = @import("relational_expression.zig");
+    var budget: usize = expressions.max_allocated_bytes;
+    var execution = expressions.Execution.init(alloc, &budget);
+    return validateRelationalRestorePropertyWithExecution(&execution, schema, property_index, value, compiled, json_literal_null);
+}
+
+pub fn validateRelationalRestorePropertyWithExecution(
+    execution: *@import("relational_expression.zig").Execution,
+    schema: TableSchema,
+    property_index: usize,
+    value: *const std.json.Value,
+    compiled: *const CompiledValidationPlan,
+    json_literal_null: bool,
+) !void {
+    try execution.charge(1);
+    var scratch: @import("relational_expression.zig").ExecutionScratch = undefined;
+    scratch.init(execution);
+    defer scratch.deinit();
     const pointers = [_]*const std.json.Value{value};
-    var context = RuntimeValidationContext{ .alloc = alloc, .compiled = compiled, .require_physical_encoding = true, .json_null_values = if (json_literal_null) &pointers else &.{} };
+    var context = RuntimeValidationContext{ .alloc = execution.alloc, .compiled = compiled, .preparation_execution = execution, .require_physical_encoding = true, .json_null_values = if (json_literal_null) &pointers else &.{} };
     defer context.deinit();
-    try validateDocumentFieldValueWithContext(&context, schema.document_schemas[0].properties[property_index], value, schema.enforce_types);
+    validateDocumentFieldValueWithContext(&context, schema.document_schemas[0].properties[property_index], value, schema.enforce_types) catch |err| return scratch.failure(err);
 }
 
 pub fn validateDocumentValueWithPlan(

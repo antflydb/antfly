@@ -2140,15 +2140,27 @@ pub const Set = struct {
     /// The caller has already verified physical canonical bytes and checksum.
     /// Unrelated JSON, vector and blob payloads are never materialized.
     pub fn verifyRow(self: *const Set, alloc: Allocator, row: anytype) !void {
+        var budget: usize = max_allocated_bytes;
+        var execution = Execution.init(alloc, &budget);
+        return self.verifyRowWithExecution(&execution, row);
+    }
+
+    pub fn verifyRowWithExecution(self: *const Set, execution: *Execution, row: anytype) !void {
+        try execution.charge(0);
+        var scratch: ExecutionScratch = undefined;
+        scratch.init(execution);
+        defer scratch.deinit();
+        self.verifyRowInner(execution, row) catch |err| return scratch.failure(err);
+    }
+
+    fn verifyRowInner(self: *const Set, execution: *Execution, row: anytype) !void {
         const has_generated = for (self.bindings) |binding| {
             if (binding.generated) break true;
         } else false;
         if (!has_generated) return;
-        var scratch = std.heap.ArenaAllocator.init(alloc);
-        defer scratch.deinit();
-        const arena = scratch.allocator();
-        const values = try arena.alloc(Value, self.table.relational_columns.len);
-        const present = try arena.alloc(bool, values.len);
+        try execution.charge(self.table.relational_columns.len);
+        const values = try execution.alloc.alloc(Value, self.table.relational_columns.len);
+        const present = try execution.alloc.alloc(bool, values.len);
         @memset(values, .null);
         @memset(present, false);
         for (self.table.relational_columns, self.read_columns, 0..) |column, read, ordinal| {
@@ -2171,9 +2183,7 @@ pub const Set = struct {
                 else => return error.InvalidRelationalGeneratedValue,
             };
         }
-        var budget: usize = max_allocated_bytes;
-        var execution = Execution.init(arena, &budget);
-        try self.verifyValues(&execution, values, present);
+        try self.verifyValues(execution, values, present);
     }
 
     fn verifyValues(self: *const Set, execution: *Execution, values: []const Value, present: []const bool) !void {
@@ -2889,6 +2899,118 @@ test "relational declarations omitted scalar literal value is typed NULL for gen
     defer right.deinit();
     try std.testing.expectEqual(Value.null, try left.evaluate(alloc, &.{}));
     try std.testing.expectEqualSlices(u8, &left.fingerprint, &right.fingerprint);
+}
+
+test "relational declarations physical restore discharges unconstrained SQL domains without materialization" {
+    const a = std.testing.allocator;
+    const public_schema = @import("mod.zig");
+    var validator = try public_schema.CompiledTableValidator.init(a,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"t":{"type":"string","x-antfly-sql-type":"text"},"i":{"type":"integer","x-antfly-sql-type":"int16"},"f":{"type":"number","x-antfly-sql-type":"float32"},"n":{"type":"number","x-antfly-sql-type":"numeric"},"a":{"type":"sql_array","x-antfly-sql-type":"numeric"}},"additionalProperties":false}}}}
+    );
+    defer validator.deinit(a);
+    try std.testing.expect(!validator.restore.full_root);
+    try std.testing.expectEqual(@as(usize, 0), validator.restore.properties.len);
+    const table = try public_schema.deriveRuntimeTableSchema(a, validator.schema);
+    defer schema.freeSchema(a, table);
+    var layout = try codec.PhysicalLayout.init(a, table);
+    defer layout.deinit();
+    var context: exact.Context = .{ .alloc = a };
+    var parsed = try exact.parse(&context, "1.25");
+    defer parsed.deinit();
+    const arrays = @import("../sql/array_value.zig");
+    const elements = [_]arrays.Element{ arrays.Element.typedNumeric(&parsed.value), .{} };
+    const array = try arrays.Value.init(.numeric, &.{.{ .length = 2, .lower = -3 }}, &elements, .{});
+    const payload = try @import("../sql/array_storage.zig").encodeAlloc(a, array, .{});
+    defer a.free(payload);
+    const ordinal = layout.ordinalForName(table.relational_columns, "a").?;
+    const cell: codec.Cell = .{ .ordinal = @intCast(ordinal), .path = "a", .value_type = .bytes_val, .sql_array_element_type = .numeric, .value = .{ .bytes_val = payload } };
+    const bytes = try codec.serializeOrdinal(a, table.version, table.relational_columns, &.{cell}, @splat(0));
+    defer a.free(bytes);
+    try codec.validateOrdinalWithLayout(bytes, table, &layout);
+    const row = try codec.ordinalRowView(bytes, table, &layout);
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    var budget: usize = 0;
+    var execution = Execution.init(failing.allocator(), &budget);
+    try validator.validateRelationalRestoreFieldsWithExecution(&execution, row);
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+    var constrained = try public_schema.CompiledTableValidator.init(a,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"n":{"type":"number","x-antfly-sql-type":"numeric","minimum":1},"t":{"type":"string","x-antfly-sql-type":"text","maxLength":10}},"additionalProperties":false}}}}
+    );
+    defer constrained.deinit(a);
+    try std.testing.expectEqual(@as(usize, 2), constrained.restore.properties.len);
+}
+
+test "relational declarations physical restore shares generated CHECK and field constraint admission" {
+    const Run = struct {
+        fn run(alloc: Allocator) !void {
+            var validator = try @import("mod.zig").CompiledTableValidator.init(alloc,
+                \\{"version":1,"storage_mode":"relational","default_type":"row","generated_columns":[{"column":"g","expression":{"op":"add","args":[{"op":"column","column":"n"},{"op":"literal","type":"numeric","value":"1"}]}}],"checks":[{"name":"positive","column":"n","op":"gte","value":0}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"n":{"type":"number","x-antfly-sql-type":"numeric","minimum":1,"multipleOf":0.25},"g":{"type":"number","x-antfly-sql-type":"numeric"},"payload":{"type":"blob"}},"additionalProperties":false}}}}
+            );
+            defer validator.deinit(alloc);
+            try std.testing.expect(!validator.restore.full_root);
+            const table = validator.execution.expressions.?.table;
+            var layout = try codec.PhysicalLayout.init(alloc, table);
+            defer layout.deinit();
+            const n = layout.ordinalForName(table.relational_columns, "n").?;
+            const g = layout.ordinalForName(table.relational_columns, "g").?;
+            const number = try @import("../sql/numeric_storage.zig").encodeJsonAlloc(alloc, .{ .string = "1.25" });
+            defer alloc.free(number);
+            const generated = try @import("../sql/numeric_storage.zig").encodeJsonAlloc(alloc, .{ .string = "2.25" });
+            defer alloc.free(generated);
+            var cells: [2]codec.Cell = .{
+                .{ .ordinal = @intCast(n), .path = "n", .value_type = .bytes_val, .is_numeric = true, .value = .{ .bytes_val = number } },
+                .{ .ordinal = @intCast(g), .path = "g", .value_type = .bytes_val, .is_numeric = true, .value = .{ .bytes_val = generated } },
+            };
+            if (n > g) std.mem.swap(codec.Cell, &cells[0], &cells[1]);
+            const bytes = try codec.serializeOrdinal(alloc, table.version, table.relational_columns, &cells, @splat(0));
+            defer alloc.free(bytes);
+            const row = try codec.ordinalRowView(bytes, table, &layout);
+            var budget: usize = max_allocated_bytes;
+            var execution = Execution.init(alloc, &budget);
+            try validator.validateRelationalRestoreFieldsWithExecution(&execution, row);
+            const used = 8 * 1024 * 1024 - execution.numeric.remaining;
+            try std.testing.expect(used > 1 and budget < max_allocated_bytes);
+            try std.testing.expectEqual(alloc.ptr, execution.alloc.ptr);
+            try std.testing.expectEqual(alloc.vtable, execution.alloc.vtable);
+            budget = max_allocated_bytes;
+            execution = Execution.init(alloc, &budget);
+            execution.numeric.remaining = used - 1;
+            const limited = validator.validateRelationalRestoreFieldsWithExecution(&execution, row);
+            if (limited) |_| return error.TestExpectedError else |err| {
+                if (err == error.OutOfMemory) return err;
+                try std.testing.expectEqual(error.RelationalExpressionBudgetExceeded, err);
+            }
+            execution.numeric.remaining = 8 * 1024 * 1024;
+            try std.testing.expectError(error.RelationalExpressionBudgetExceeded, validator.validateRelationalRestoreFieldsWithExecution(&execution, row));
+            budget = 1;
+            execution = Execution.init(alloc, &budget);
+            try std.testing.expectError(error.RelationalExpressionBudgetExceeded, validator.validateRelationalRestoreFieldsWithExecution(&execution, row));
+            const Cancel = struct {
+                fn poll(_: ?*anyopaque) anyerror!void {
+                    return error.Canceled;
+                }
+            };
+            budget = max_allocated_bytes;
+            execution = Execution.init(alloc, &budget);
+            execution.numeric.checkpoint = Cancel.poll;
+            try std.testing.expectError(error.Canceled, validator.validateRelationalRestoreFieldsWithExecution(&execution, row));
+            execution.numeric.checkpoint = null;
+            try std.testing.expectError(error.Canceled, validator.validateRelationalRestoreFieldsWithExecution(&execution, row));
+            // Still reject physically canonical but logically forged output.
+            const generated_index: usize = if (n > g) 0 else 1;
+            cells[generated_index].value.bytes_val = number;
+            const forged = try codec.serializeOrdinal(alloc, table.version, table.relational_columns, &cells, @splat(0));
+            defer alloc.free(forged);
+            const rejected = validator.validateRelationalRestoreFields(alloc, try codec.ordinalRowView(forged, table, &layout));
+            if (rejected) |_| return error.TestExpectedError else |err| {
+                if (err == error.OutOfMemory) return err;
+                try std.testing.expectEqual(error.InvalidRelationalGeneratedValue, err);
+            }
+        }
+    };
+    try Run.run(std.testing.allocator);
+    var stable = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(stable.allocator(), Run.run, .{});
 }
 
 test "relational declarations cold generated verification reads dependency cells only and rejects forged output" {

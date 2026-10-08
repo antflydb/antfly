@@ -6043,3 +6043,51 @@ without failures or leaks. The final borrowed-comparison classification fix is
 covered by the 58-test focused rerun and a fresh complete SQL rerun. Inventory,
 control-catalog, formatting and whitespace checks pass. Changes are committed
 locally only; the unrelated HTTP discovery edit is excluded.
+
+### Shared admission through physical restore validation
+
+Selected-field physical restore now carries one execution identity through
+ordinal generated-value verification, expression/legacy CHECKs and recursive
+field constraints. Existing convenience entry points create one row allowance;
+new shared entry points let the caller retain prior work and cancellation.
+Generated verification bounds its vectors and unpublished results before
+allocation, while continuing to read only dependency cells. Field materialization
+charges selected byte payload traversal and uses bounded, per-field scratch;
+the following field borrows the remaining allowance, not a fresh quota.
+Standalone property validation also uses bounded scratch. Every scope restores
+the caller's allocators and reconciles peak capacity with existing logical
+charges, without counting the same nested allocation twice.
+
+A real AROW regression spans exact NUMERIC generated arithmetic, a legacy
+CHECK, minimum/multipleOf constraints and physical field materialization. It
+measures combined work and rejects a one-unit-short allowance, preserving the
+failure after counters are refilled. Tiny byte admission, sticky cancellation,
+allocator restoration and all allocation failures are exercised. Physically
+canonical but logically forged generated output remains rejected; restore does
+not default, round or repair stored values. The existing dependency-only cold
+reader regression remains in place.
+
+Residual planning also recognizes the pinned scalar/SQL-array domain checks
+already discharged by strict canonical physical validation. Unconstrained SQL
+columns no longer require a second decode into JSON merely because they carry
+SQL type identity. This avoids decoded-envelope amplification for wide arrays
+and preserves room for actual residual predicates. A canonical non-null NUMERIC
+array with a signed lower bound and SQL NULL exercises the zero-allocation
+path with zero remaining allocation allowance. Separate minimum and maximum
+length properties remain selected, so this does not discard residual schema
+constraints. JSON/JSONB and other non-scalar domains stay conservative. Physical
+validation and public-schema/layout binding remain prerequisites, not optional
+consequences of this optimization.
+
+This integrates semantic physical-restore validation, not lower-level physical
+codec/hash traversal or all recursive non-NUMERIC validator work accounting.
+Those paths still need shared kernel admission. Public NUMERIC column modifier
+activation and decoupling legacy CHECK domains from persistent key limits also
+remain unfinished. No original inventory disposition is changed.
+
+Final-source validation passes 60 focused schema-expression tests, 601 local
+SQL tests (three existing skips), 226 server SQL tests, 186 native relational
+index tests and their server integration test, with no failures or leaks.
+Inventory remains 448 implemented, 136 rejected, 73 superseded and 929
+unresolved. Control-catalog, formatting and whitespace checks pass. Changes
+are committed locally only; the unrelated HTTP discovery edit is preserved.

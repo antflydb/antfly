@@ -191,17 +191,30 @@ pub const CompiledTableValidator = struct {
     /// layout. Its binding to this public schema must be verified before any
     /// validated rows are published (archive finish checks staged restores).
     pub fn validateRelationalRestoreFields(self: *const CompiledTableValidator, alloc: std.mem.Allocator, row: anytype) !void {
+        const expressions = @import("relational_expression.zig");
+        var budget: usize = expressions.max_allocated_bytes;
+        var execution = expressions.Execution.init(alloc, &budget);
+        return self.validateRelationalRestoreFieldsWithExecution(&execution, row);
+    }
+
+    pub fn validateRelationalRestoreFieldsWithExecution(self: *const CompiledTableValidator, execution: *@import("relational_expression.zig").Execution, row: anytype) !void {
         std.debug.assert(!self.restore.full_root);
-        if (self.execution.expressions) |expressions| try expressions.verifyRow(alloc, row);
-        if (self.execution.checks) |checks| if (try checks.firstViolationRow(alloc, row) != null) return error.RelationalCheckViolation;
+        try execution.charge(0);
+        if (self.execution.expressions) |expressions| try expressions.verifyRowWithExecution(execution, row);
+        if (self.execution.checks) |checks| if (try checks.firstViolationRowWithExecution(execution, row) != null) return error.RelationalCheckViolation;
         for (self.restore.properties) |index| {
+            try execution.charge(1);
             const property = self.schema.document_schemas[0].properties[index];
             const ordinal = row.ordinalForName(property.name) orelse return error.InvalidBatchRequest;
             const cell = (try row.findCell(ordinal)) orelse continue;
-            var arena = std.heap.ArenaAllocator.init(alloc);
-            defer arena.deinit();
-            const value = try row.materializeCellAlloc(arena.allocator(), cell);
-            try impl.validateRelationalRestoreProperty(alloc, self.schema, index, &value, &self.execution, !cell.is_null and cell.is_json and value == .null);
+            // Only selected fields are materialized. Account for their input
+            // traversal and bound decoded ownership before entering validators.
+            if (!cell.is_null and cell.value_type == .bytes_val) try execution.charge(cell.value.bytes_val.len);
+            var scratch: @import("relational_expression.zig").ExecutionScratch = undefined;
+            scratch.init(execution);
+            defer scratch.deinit();
+            const value = row.materializeCellAlloc(execution.alloc, cell) catch |err| return scratch.failure(err);
+            impl.validateRelationalRestorePropertyWithExecution(execution, self.schema, index, &value, &self.execution, !cell.is_null and cell.is_json and value == .null) catch |err| return scratch.failure(err);
         }
     }
 };
