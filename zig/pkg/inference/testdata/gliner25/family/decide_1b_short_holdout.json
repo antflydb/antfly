@@ -1,0 +1,762 @@
+{
+  "format_version": 1,
+  "model": {
+    "architecture": "span",
+    "compatibility": {
+      "gliner25_boundary_converter": false,
+      "reason": "The checkpoint uses the span markerV0/count_lstm stack and a ModernBERT encoder; it is not a GLiNER2.5 boundary bundle."
+    },
+    "encoder_family": "modernbert",
+    "model_sha256": "02c567d791aed26550d300064c7f0c0094fd65291503c65969b45b30786e33b3",
+    "model_size_bytes": 4755208228,
+    "parameter_count": 1188796693,
+    "profile": "decide_1b",
+    "qualification": false,
+    "repo": "fastino/GLiNER2.5-Decide-1B",
+    "revision": "688cd7ba8917a0855ad3ce929cba5a9998932e79",
+    "sidecars": {
+      "config.json": {
+        "sha256": "d2732928820b95649bc87f051345b2394fff87fc28c01f945610f943d6f402b2",
+        "size_bytes": 464
+      },
+      "encoder_config/config.json": {
+        "sha256": "c2cc4c15c7504b9e15651f2a32dff82b84fa9a99060a3218671a930da0a9b50d",
+        "size_bytes": 2160
+      },
+      "tokenizer.json": {
+        "sha256": "ddb379b6a4679ee16646bf0b726de9ec538d7c80ea9d4d4e33b069f19c9e1efb",
+        "size_bytes": 3585055
+      },
+      "tokenizer_config.json": {
+        "sha256": "8bb8d094c7cde84942866ef98fb5b24f7387245573a7f707c8349729484c27b3",
+        "size_bytes": 559
+      }
+    },
+    "status": "verified",
+    "tensor_count": 199,
+    "tensor_header_sha256": "449e7c096746bf06825e71d40d215de142f5f404f560c601a0d9bafc1bca0bae"
+  },
+  "public_decide_requests": [
+    {
+      "decide_expected": {
+        "answers": {
+          "refund": {
+            "choice": "refund",
+            "probabilities": {
+              "keep": 0.4798549113163683,
+              "refund": 0.5201450886836316
+            },
+            "type": "choice"
+          }
+        },
+        "model": "fastino/GLiNER2.5-Decide-1B"
+      },
+      "decide_request_json": "{\"model\":\"fastino/GLiNER2.5-Decide-1B\",\"state\":\"The package arrived damaged.\",\"questions\":{\"refund\":{\"type\":\"choice\",\"instructions\":\"Choose the action.\",\"criteria\":{\"refund\":\"Refund the order\",\"keep\":\"Keep the order\"}}}}",
+      "encoded": {
+        "attention_mask": [
+          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+          1, 1, 1
+        ],
+        "end_mappings": [3, 11, 19, 27, 28],
+        "input_ids": [
+          9, 50370, 709, 1504, 27, 28890, 253, 2250, 15, 209, 50377, 23005, 27, 7567, 1504, 253, 1340, 209, 50377, 1978,
+          27, 16600, 253, 1340, 9, 50374, 709, 1504, 50374, 19773, 10, 10, 50369, 783, 10708, 274, 30487, 11747, 2961,
+          15
+        ],
+        "schema_tokens": [
+          [
+            "(",
+            "[P]",
+            "refund: Choose the action. [DESCRIPTION] refund: Refund the order [DESCRIPTION] keep: Keep the order",
+            "(",
+            "[L]",
+            "refund",
+            "[L]",
+            "keep",
+            ")",
+            ")"
+          ]
+        ],
+        "start_mappings": [0, 4, 12, 20, 27],
+        "text_tokens": [
+          "the",
+          "package",
+          "arrived",
+          "damaged",
+          "."
+        ]
+      },
+      "id": "binary_short",
+      "native_classification": {
+        "input_ids": [
+          9, 50370, 709, 1504, 27, 28890, 253, 2250, 15, 209, 50377, 23005, 27, 7567, 1504, 253, 1340, 209, 50377, 1978,
+          27, 16600, 253, 1340, 9, 50374, 709, 1504, 50374, 19773, 10, 10, 50369, 783, 10708, 274, 30487, 11747, 2961,
+          15
+        ],
+        "tasks": [
+          {
+            "labels": [
+              "refund",
+              "keep"
+            ],
+            "name": "refund",
+            "raw_logits": [-0.08197160065174103, -0.16259559988975525]
+          }
+        ]
+      },
+      "native_schema_json": "{\"classifications\":[{\"name\":\"refund\",\"prompt\":\"Choose the action.\",\"top_k\":2,\"labels\":[\"refund\",\"keep\"],\"label_definitions\":{\"refund\":{\"description\":\"Refund the order\"},\"keep\":{\"description\":\"Keep the order\"}}}]}",
+      "probabilities": {
+        "refund": {
+          "keep": 0.4798549113163683,
+          "refund": 0.5201450886836316
+        }
+      },
+      "schema": {
+        "tasks": {
+          "refund": {
+            "instruction": "Choose the action.",
+            "labels": {
+              "keep": "Keep the order",
+              "refund": "Refund the order"
+            },
+            "max_labels": 1,
+            "min_labels": 1
+          }
+        }
+      },
+      "selected": {
+        "refund": [
+          "refund"
+        ]
+      },
+      "text": "The package arrived damaged."
+    },
+    {
+      "decide_expected": {
+        "answers": {
+          "action": {
+            "choice": "reset",
+            "probabilities": {
+              "cancel": 0.08456813466454835,
+              "refund": 0.07239770109165528,
+              "reset": 0.779125462968518,
+              "ship": 0.0639087012752783
+            },
+            "type": "choice"
+          }
+        },
+        "model": "fastino/GLiNER2.5-Decide-1B"
+      },
+      "decide_request_json": "{\"model\":\"fastino/GLiNER2.5-Decide-1B\",\"state\":\"My account is locked after several incorrect passwords. I still have access to my email.\",\"questions\":{\"action\":{\"type\":\"choice\",\"instructions\":\"Choose the action that resolves this support request.\",\"criteria\":{\"reset\":\"Reset the account password\",\"refund\":\"Refund a payment\",\"cancel\":\"Cancel the subscription\",\"ship\":\"Ship a replacement item\"}}}}",
+      "encoded": {
+        "attention_mask": [
+          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+          1, 1, 1, 1, 1
+        ],
+        "end_mappings": [2, 10, 13, 20, 26, 34, 44, 54, 55, 57, 63, 68, 75, 78, 81, 87, 88],
+        "input_ids": [
+          9, 50370, 1913, 27, 28890, 253, 2250, 326, 501, 14503, 436, 1329, 2748, 15, 209, 50377, 14932, 27, 41126, 253,
+          2395, 9868, 209, 50377, 23005, 27, 7567, 1504, 247, 7830, 209, 50377, 14002, 27, 330, 18721, 253, 21729, 209,
+          50377, 6215, 27, 30196, 247, 5407, 5382, 9, 50374, 19511, 50374, 709, 1504, 50374, 35899, 50374, 5363, 10, 10,
+          50369, 2577, 15793, 261, 30730, 6438, 43249, 1763, 263, 6471, 5858, 12113, 15, 74, 23350, 9802, 10773, 936,
+          2577, 12812, 15
+        ],
+        "schema_tokens": [
+          [
+            "(",
+            "[P]",
+            "action: Choose the action that resolves this support request. [DESCRIPTION] reset: Reset the account password [DESCRIPTION] refund: Refund a payment [DESCRIPTION] cancel: Cancel the subscription [DESCRIPTION] ship: Ship a replacement item",
+            "(",
+            "[L]",
+            "reset",
+            "[L]",
+            "refund",
+            "[L]",
+            "cancel",
+            "[L]",
+            "ship",
+            ")",
+            ")"
+          ]
+        ],
+        "start_mappings": [0, 3, 11, 14, 21, 27, 35, 45, 54, 56, 58, 64, 69, 76, 79, 82, 87],
+        "text_tokens": [
+          "my",
+          "account",
+          "is",
+          "locked",
+          "after",
+          "several",
+          "incorrect",
+          "passwords",
+          ".",
+          "i",
+          "still",
+          "have",
+          "access",
+          "to",
+          "my",
+          "email",
+          "."
+        ]
+      },
+      "id": "described_four_labels",
+      "native_classification": {
+        "input_ids": [
+          9, 50370, 1913, 27, 28890, 253, 2250, 326, 501, 14503, 436, 1329, 2748, 15, 209, 50377, 14932, 27, 41126, 253,
+          2395, 9868, 209, 50377, 23005, 27, 7567, 1504, 247, 7830, 209, 50377, 14002, 27, 330, 18721, 253, 21729, 209,
+          50377, 6215, 27, 30196, 247, 5407, 5382, 9, 50374, 19511, 50374, 709, 1504, 50374, 35899, 50374, 5363, 10, 10,
+          50369, 2577, 15793, 261, 30730, 6438, 43249, 1763, 263, 6471, 5858, 12113, 15, 74, 23350, 9802, 10773, 936,
+          2577, 12812, 15
+        ],
+        "tasks": [
+          {
+            "labels": [
+              "reset",
+              "refund",
+              "cancel",
+              "ship"
+            ],
+            "name": "action",
+            "raw_logits": [0.6374183893203735, -1.7385791540145874, -1.5831961631774902, -1.8632981777191162]
+          }
+        ]
+      },
+      "native_schema_json": "{\"classifications\":[{\"name\":\"action\",\"prompt\":\"Choose the action that resolves this support request.\",\"top_k\":4,\"labels\":[\"reset\",\"refund\",\"cancel\",\"ship\"],\"label_definitions\":{\"reset\":{\"description\":\"Reset the account password\"},\"refund\":{\"description\":\"Refund a payment\"},\"cancel\":{\"description\":\"Cancel the subscription\"},\"ship\":{\"description\":\"Ship a replacement item\"}}}]}",
+      "probabilities": {
+        "action": {
+          "cancel": 0.08456813466454835,
+          "refund": 0.07239770109165528,
+          "reset": 0.779125462968518,
+          "ship": 0.0639087012752783
+        }
+      },
+      "schema": {
+        "tasks": {
+          "action": {
+            "instruction": "Choose the action that resolves this support request.",
+            "labels": {
+              "cancel": "Cancel the subscription",
+              "refund": "Refund a payment",
+              "reset": "Reset the account password",
+              "ship": "Ship a replacement item"
+            },
+            "max_labels": 1,
+            "min_labels": 1
+          }
+        }
+      },
+      "selected": {
+        "action": [
+          "reset"
+        ]
+      },
+      "text": "My account is locked after several incorrect passwords. I still have access to my email."
+    },
+    {
+      "decide_expected": {
+        "answers": {
+          "page": {
+            "noul": 0.2191821578746568,
+            "type": "noul"
+          },
+          "severity": {
+            "legend": {
+              "0": "No impact",
+              "1": "Small impact",
+              "2": "Major impact"
+            },
+            "probabilities": {
+              "0": 0.4387709715409824,
+              "1": 0.3507472885781483,
+              "2": 0.21048173988086938
+            },
+            "score": 0.771710768339887,
+            "type": "score"
+          }
+        },
+        "model": "fastino/GLiNER2.5-Decide-1B"
+      },
+      "decide_request_json": "{\"model\":\"fastino/GLiNER2.5-Decide-1B\",\"state\":\"A single internal dashboard is unavailable. Customer requests still succeed and the team has a workaround.\",\"questions\":{\"severity\":{\"type\":\"score\",\"instructions\":\"Rate the impact of this incident.\",\"criteria\":[\"No impact\",\"Small impact\",\"Major impact\"]},\"page\":{\"type\":\"noul\",\"instructions\":\"Is immediate on-call escalation necessary?\"}}}",
+      "encoded": {
+        "attention_mask": [
+          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1
+        ],
+        "end_mappings": [1, 8, 17, 27, 30, 42, 43, 52, 61, 67, 75, 79, 83, 88, 92, 94, 105, 106],
+        "input_ids": [
+          9, 50370, 26219, 414, 27, 28606, 253, 3486, 273, 436, 7119, 15, 209, 50377, 470, 27, 1621, 3486, 209, 50377,
+          337, 27, 15023, 3486, 209, 50377, 374, 27, 11432, 3486, 9, 50374, 17, 50374, 18, 50374, 19, 10, 10, 50368, 9,
+          50370, 6377, 27, 1680, 8993, 327, 14, 4065, 20092, 318, 3309, 32, 209, 50377, 3221, 27, 16708, 209, 50377,
+          2032, 27, 11793, 9, 50374, 7750, 50374, 5672, 10, 10, 50369, 66, 20199, 11577, 27207, 4697, 261, 328, 15735,
+          15, 34590, 45983, 23350, 47924, 2638, 395, 783, 22035, 7110, 66, 1601, 16576, 15
+        ],
+        "schema_tokens": [
+          [
+            "(",
+            "[P]",
+            "severity: Rate the impact of this incident. [DESCRIPTION] 0: No impact [DESCRIPTION] 1: Small impact [DESCRIPTION] 2: Major impact",
+            "(",
+            "[L]",
+            "0",
+            "[L]",
+            "1",
+            "[L]",
+            "2",
+            ")",
+            ")"
+          ],
+          [
+            "(",
+            "[P]",
+            "page: Is immediate on-call escalation necessary? [DESCRIPTION] false: False [DESCRIPTION] true: True",
+            "(",
+            "[L]",
+            "false",
+            "[L]",
+            "true",
+            ")",
+            ")"
+          ]
+        ],
+        "start_mappings": [0, 2, 9, 18, 28, 31, 42, 44, 53, 62, 68, 76, 80, 84, 89, 93, 95, 105],
+        "text_tokens": [
+          "a",
+          "single",
+          "internal",
+          "dashboard",
+          "is",
+          "unavailable",
+          ".",
+          "customer",
+          "requests",
+          "still",
+          "succeed",
+          "and",
+          "the",
+          "team",
+          "has",
+          "a",
+          "workaround",
+          "."
+        ]
+      },
+      "id": "score_and_noul",
+      "native_classification": {
+        "input_ids": [
+          9, 50370, 26219, 414, 27, 28606, 253, 3486, 273, 436, 7119, 15, 209, 50377, 470, 27, 1621, 3486, 209, 50377,
+          337, 27, 15023, 3486, 209, 50377, 374, 27, 11432, 3486, 9, 50374, 17, 50374, 18, 50374, 19, 10, 10, 50368, 9,
+          50370, 6377, 27, 1680, 8993, 327, 14, 4065, 20092, 318, 3309, 32, 209, 50377, 3221, 27, 16708, 209, 50377,
+          2032, 27, 11793, 9, 50374, 7750, 50374, 5672, 10, 10, 50369, 66, 20199, 11577, 27207, 4697, 261, 328, 15735,
+          15, 34590, 45983, 23350, 47924, 2638, 395, 783, 22035, 7110, 66, 1601, 16576, 15
+        ],
+        "tasks": [
+          {
+            "labels": [
+              "0",
+              "1",
+              "2"
+            ],
+            "name": "severity",
+            "raw_logits": [-0.5489766001701355, -0.77288818359375, -1.283555269241333]
+          },
+          {
+            "labels": [
+              "false",
+              "true"
+            ],
+            "name": "page",
+            "raw_logits": [0.47178131341934204, -0.7986574172973633]
+          }
+        ]
+      },
+      "native_schema_json": "{\"classifications\":[{\"name\":\"severity\",\"prompt\":\"Rate the impact of this incident.\",\"top_k\":3,\"labels\":[\"0\",\"1\",\"2\"],\"label_definitions\":{\"0\":{\"description\":\"No impact\"},\"1\":{\"description\":\"Small impact\"},\"2\":{\"description\":\"Major impact\"}}},{\"name\":\"page\",\"prompt\":\"Is immediate on-call escalation necessary?\",\"top_k\":2,\"labels\":[\"false\",\"true\"],\"label_definitions\":{\"false\":{\"description\":\"False\"},\"true\":{\"description\":\"True\"}}}]}",
+      "probabilities": {
+        "page": {
+          "false": 0.7808178421253431,
+          "true": 0.2191821578746568
+        },
+        "severity": {
+          "0": 0.4387709715409824,
+          "1": 0.3507472885781483,
+          "2": 0.21048173988086938
+        }
+      },
+      "schema": {
+        "tasks": {
+          "page": {
+            "instruction": "Is immediate on-call escalation necessary?",
+            "labels": {
+              "false": "False",
+              "true": "True"
+            },
+            "max_labels": 1,
+            "min_labels": 1
+          },
+          "severity": {
+            "instruction": "Rate the impact of this incident.",
+            "labels": {
+              "0": "No impact",
+              "1": "Small impact",
+              "2": "Major impact"
+            },
+            "max_labels": 1,
+            "min_labels": 1,
+            "ordered": true
+          }
+        }
+      },
+      "selected": {
+        "page": [
+          "false"
+        ],
+        "severity": [
+          "0"
+        ]
+      },
+      "text": "A single internal dashboard is unavailable. Customer requests still succeed and the team has a workaround."
+    },
+    {
+      "decide_expected": {
+        "answers": {
+          "action": {
+            "choice": "rollback",
+            "probabilities": {
+              "retry": 0.1351267568811651,
+              "rollback": 0.672502068445642,
+              "wait": 0.1923711746731929
+            },
+            "type": "choice"
+          },
+          "page": {
+            "noul": 0.8332393976331489,
+            "type": "noul"
+          },
+          "severity": {
+            "legend": {
+              "0": "Low",
+              "1": "Moderate",
+              "2": "High",
+              "3": "Critical"
+            },
+            "probabilities": {
+              "0": 0.2190493731910276,
+              "1": 0.22681517336831628,
+              "2": 0.2640723294547154,
+              "3": 0.2900631239859407
+            },
+            "score": 1.6251492042355693,
+            "type": "score"
+          }
+        },
+        "model": "fastino/GLiNER2.5-Decide-1B"
+      },
+      "decide_request_json": "{\"model\":\"fastino/GLiNER2.5-Decide-1B\",\"state\":\"The deployment failed twice and customers cannot sign in. The previous release was healthy. The database remains intact, rollback has been tested, and the engineer is available. Support has received multiple reports from customers in different regions.\",\"questions\":{\"action\":{\"type\":\"choice\",\"instructions\":\"Choose the safest immediate action.\",\"criteria\":{\"rollback\":\"Restore the previous release\",\"retry\":\"Retry this release\",\"wait\":\"Wait for more evidence\"}},\"severity\":{\"type\":\"score\",\"instructions\":\"Rate the incident impact.\",\"criteria\":[\"Low\",\"Moderate\",\"High\",\"Critical\"]},\"page\":{\"type\":\"noul\",\"instructions\":\"Should the on-call engineer respond now?\"}}}",
+      "encoded": {
+        "attention_mask": [
+          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1
+        ],
+        "end_mappings": [
+          3, 14, 21, 27, 31, 41, 48, 53, 56, 57, 61, 70, 78, 82, 90, 91, 95, 104, 112, 119, 120, 129, 133, 138, 145, 146,
+          150, 154, 163, 166, 176, 177, 185, 189, 198, 207, 215, 220, 230, 233, 243, 251, 252
+        ],
+        "input_ids": [
+          9, 50370, 1913, 27, 28890, 253, 4389, 383, 8993, 2250, 15, 209, 50377, 4533, 2135, 27, 11726, 410, 253, 2045,
+          3727, 209, 50377, 47327, 27, 416, 5704, 436, 3727, 209, 50377, 3343, 27, 21050, 323, 625, 1941, 9, 50374, 1811,
+          2135, 50374, 1221, 610, 50374, 14061, 10, 10, 50368, 9, 50370, 26219, 414, 27, 28606, 253, 7119, 3486, 15, 209,
+          50377, 470, 27, 11578, 209, 50377, 337, 27, 4559, 5034, 209, 50377, 374, 27, 4855, 209, 50377, 495, 27, 34448,
+          9, 50374, 17, 50374, 18, 50374, 19, 50374, 20, 10, 10, 50368, 9, 50370, 6377, 27, 14482, 253, 327, 14, 4065,
+          16518, 3794, 1024, 32, 209, 50377, 3221, 27, 16708, 209, 50377, 2032, 27, 11793, 9, 50374, 7750, 50374, 5672,
+          10, 10, 50369, 783, 615, 27378, 27337, 7553, 547, 395, 13994, 398, 32824, 9188, 249, 15, 783, 35065, 16690,
+          4238, 27952, 15, 783, 25522, 2013, 1550, 565, 514, 13, 1811, 2135, 7110, 20394, 41694, 13, 395, 783, 15179,
+          254, 261, 15735, 15, 13821, 7110, 35413, 34263, 41071, 4064, 13994, 398, 249, 19623, 47539, 15
+        ],
+        "schema_tokens": [
+          [
+            "(",
+            "[P]",
+            "action: Choose the safest immediate action. [DESCRIPTION] rollback: Restore the previous release [DESCRIPTION] retry: Retry this release [DESCRIPTION] wait: Wait for more evidence",
+            "(",
+            "[L]",
+            "rollback",
+            "[L]",
+            "retry",
+            "[L]",
+            "wait",
+            ")",
+            ")"
+          ],
+          [
+            "(",
+            "[P]",
+            "severity: Rate the incident impact. [DESCRIPTION] 0: Low [DESCRIPTION] 1: Moderate [DESCRIPTION] 2: High [DESCRIPTION] 3: Critical",
+            "(",
+            "[L]",
+            "0",
+            "[L]",
+            "1",
+            "[L]",
+            "2",
+            "[L]",
+            "3",
+            ")",
+            ")"
+          ],
+          [
+            "(",
+            "[P]",
+            "page: Should the on-call engineer respond now? [DESCRIPTION] false: False [DESCRIPTION] true: True",
+            "(",
+            "[L]",
+            "false",
+            "[L]",
+            "true",
+            ")",
+            ")"
+          ]
+        ],
+        "start_mappings": [
+          0, 4, 15, 22, 28, 32, 42, 49, 54, 56, 58, 62, 71, 79, 83, 90, 92, 96, 105, 113, 119, 121, 130, 134, 139, 145,
+          147, 151, 155, 164, 167, 176, 178, 186, 190, 199, 208, 216, 221, 231, 234, 244, 251
+        ],
+        "text_tokens": [
+          "the",
+          "deployment",
+          "failed",
+          "twice",
+          "and",
+          "customers",
+          "cannot",
+          "sign",
+          "in",
+          ".",
+          "the",
+          "previous",
+          "release",
+          "was",
+          "healthy",
+          ".",
+          "the",
+          "database",
+          "remains",
+          "intact",
+          ",",
+          "rollback",
+          "has",
+          "been",
+          "tested",
+          ",",
+          "and",
+          "the",
+          "engineer",
+          "is",
+          "available",
+          ".",
+          "support",
+          "has",
+          "received",
+          "multiple",
+          "reports",
+          "from",
+          "customers",
+          "in",
+          "different",
+          "regions",
+          "."
+        ]
+      },
+      "id": "mixed_longer",
+      "native_classification": {
+        "input_ids": [
+          9, 50370, 1913, 27, 28890, 253, 4389, 383, 8993, 2250, 15, 209, 50377, 4533, 2135, 27, 11726, 410, 253, 2045,
+          3727, 209, 50377, 47327, 27, 416, 5704, 436, 3727, 209, 50377, 3343, 27, 21050, 323, 625, 1941, 9, 50374, 1811,
+          2135, 50374, 1221, 610, 50374, 14061, 10, 10, 50368, 9, 50370, 26219, 414, 27, 28606, 253, 7119, 3486, 15, 209,
+          50377, 470, 27, 11578, 209, 50377, 337, 27, 4559, 5034, 209, 50377, 374, 27, 4855, 209, 50377, 495, 27, 34448,
+          9, 50374, 17, 50374, 18, 50374, 19, 50374, 20, 10, 10, 50368, 9, 50370, 6377, 27, 14482, 253, 327, 14, 4065,
+          16518, 3794, 1024, 32, 209, 50377, 3221, 27, 16708, 209, 50377, 2032, 27, 11793, 9, 50374, 7750, 50374, 5672,
+          10, 10, 50369, 783, 615, 27378, 27337, 7553, 547, 395, 13994, 398, 32824, 9188, 249, 15, 783, 35065, 16690,
+          4238, 27952, 15, 783, 25522, 2013, 1550, 565, 514, 13, 1811, 2135, 7110, 20394, 41694, 13, 395, 783, 15179,
+          254, 261, 15735, 15, 13821, 7110, 35413, 34263, 41071, 4064, 13994, 398, 249, 19623, 47539, 15
+        ],
+        "tasks": [
+          {
+            "labels": [
+              "rollback",
+              "retry",
+              "wait"
+            ],
+            "name": "action",
+            "raw_logits": [0.3483457863330841, -1.256446123123169, -0.9032326936721802]
+          },
+          {
+            "labels": [
+              "0",
+              "1",
+              "2",
+              "3"
+            ],
+            "name": "severity",
+            "raw_logits": [-1.5509973764419556, -1.5161590576171875, -1.3640714883804321, -1.2701959609985352]
+          },
+          {
+            "labels": [
+              "false",
+              "true"
+            ],
+            "name": "page",
+            "raw_logits": [-1.021315336227417, 0.587446391582489]
+          }
+        ]
+      },
+      "native_schema_json": "{\"classifications\":[{\"name\":\"action\",\"prompt\":\"Choose the safest immediate action.\",\"top_k\":3,\"labels\":[\"rollback\",\"retry\",\"wait\"],\"label_definitions\":{\"rollback\":{\"description\":\"Restore the previous release\"},\"retry\":{\"description\":\"Retry this release\"},\"wait\":{\"description\":\"Wait for more evidence\"}}},{\"name\":\"severity\",\"prompt\":\"Rate the incident impact.\",\"top_k\":4,\"labels\":[\"0\",\"1\",\"2\",\"3\"],\"label_definitions\":{\"0\":{\"description\":\"Low\"},\"1\":{\"description\":\"Moderate\"},\"2\":{\"description\":\"High\"},\"3\":{\"description\":\"Critical\"}}},{\"name\":\"page\",\"prompt\":\"Should the on-call engineer respond now?\",\"top_k\":2,\"labels\":[\"false\",\"true\"],\"label_definitions\":{\"false\":{\"description\":\"False\"},\"true\":{\"description\":\"True\"}}}]}",
+      "probabilities": {
+        "action": {
+          "retry": 0.1351267568811651,
+          "rollback": 0.672502068445642,
+          "wait": 0.1923711746731929
+        },
+        "page": {
+          "false": 0.166760602366851,
+          "true": 0.8332393976331489
+        },
+        "severity": {
+          "0": 0.2190493731910276,
+          "1": 0.22681517336831628,
+          "2": 0.2640723294547154,
+          "3": 0.2900631239859407
+        }
+      },
+      "schema": {
+        "tasks": {
+          "action": {
+            "instruction": "Choose the safest immediate action.",
+            "labels": {
+              "retry": "Retry this release",
+              "rollback": "Restore the previous release",
+              "wait": "Wait for more evidence"
+            },
+            "max_labels": 1,
+            "min_labels": 1
+          },
+          "page": {
+            "instruction": "Should the on-call engineer respond now?",
+            "labels": {
+              "false": "False",
+              "true": "True"
+            },
+            "max_labels": 1,
+            "min_labels": 1
+          },
+          "severity": {
+            "instruction": "Rate the incident impact.",
+            "labels": {
+              "0": "Low",
+              "1": "Moderate",
+              "2": "High",
+              "3": "Critical"
+            },
+            "max_labels": 1,
+            "min_labels": 1,
+            "ordered": true
+          }
+        }
+      },
+      "selected": {
+        "action": [
+          "rollback"
+        ],
+        "page": [
+          "true"
+        ],
+        "severity": [
+          "3"
+        ]
+      },
+      "text": "The deployment failed twice and customers cannot sign in. The previous release was healthy. The database remains intact, rollback has been tested, and the engineer is available. Support has received multiple reports from customers in different regions."
+    }
+  ],
+  "requests": [],
+  "rope": {
+    "head_dim": 64,
+    "layers": {
+      "full_attention": {
+        "first": 1.0,
+        "inv_freq_count": 32,
+        "inv_freq_sha256_f32le": "adb41194debe8e6c185d47754f68cc2dd59960a03cb4ccbc71acd14b860c4604",
+        "last": 9.088847036764491e-06,
+        "rope_theta": 160000.0
+      },
+      "sliding_attention": {
+        "first": 1.0,
+        "inv_freq_count": 32,
+        "inv_freq_sha256_f32le": "adb41194debe8e6c185d47754f68cc2dd59960a03cb4ccbc71acd14b860c4604",
+        "last": 9.088847036764491e-06,
+        "rope_theta": 160000.0
+      }
+    }
+  },
+  "runtime": {
+    "external_packages": {
+      "pydantic": "2.12.3",
+      "torch": "2.9.1"
+    },
+    "isolated_packages": {
+      "annotated-doc": "0.0.5",
+      "anyio": "4.15.1",
+      "certifi": "2026.7.22",
+      "click": "8.5.0",
+      "filelock": "4.0.12",
+      "fsspec": "2026.9.0",
+      "h11": "0.16.0",
+      "hf-xet": "1.6.0",
+      "httpcore": "1.0.9",
+      "httpx": "0.28.1",
+      "huggingface-hub": "1.33.0",
+      "idna": "3.20",
+      "markdown-it-py": "4.2.0",
+      "mdurl": "0.1.2",
+      "numpy": "2.5.3",
+      "packaging": "26.3",
+      "pygments": "2.21.0",
+      "pyyaml": "6.0.3",
+      "regex": "2026.9.29",
+      "rich": "15.0.0",
+      "safetensors": "0.8.0",
+      "shellingham": "1.5.4",
+      "tokenizers": "0.23.2",
+      "tqdm": "4.70.1",
+      "transformers": "5.17.0",
+      "typer": "0.27.3",
+      "typing-extensions": "4.16.0"
+    },
+    "python": "3.12.3",
+    "runtime_dir": "/Users/timkaye/Documents/af/antfly/.benchmark-results/gliner25-resume-2026-10-07/assets/runtime-pinned",
+    "transformers_distribution": {
+      "filename": "transformers-5.17.0-py3-none-any.whl",
+      "installed_metadata_sha256": "cd295c5ad2c605e3c04456740df174e6a1bf5418eb2563788dc2163253f6d882",
+      "installed_record_sha256": "9abc15801d4bf3c6d5962bc03df670ae577967be4e5ac995c082c6255023910c",
+      "sha256": "78ec1ce21579b38dfb83950a0658cd119f87212a2fcfdff478096ce9d6c03801",
+      "size_bytes": 12295140,
+      "source_repo": "https://github.com/huggingface/transformers",
+      "source_revision": "856157a2f3e9594954310df18fdccc31ffddebe9"
+    },
+    "unicode": "15.0.0",
+    "verified_tree": {
+      "files": 4908,
+      "record_files": 27,
+      "tree_sha256": "6259dc40ff96d6bb7afaf079345be8e36bc3c3fd77194b9a88a6c635ba0f6969"
+    }
+  },
+  "scope": "Frozen short holdouts; CPU FP32 pinned upstream oracle; not semantic accuracy qualification",
+  "source": {
+    "checkout": "/Users/timkaye/Documents/af/antfly/.benchmark-results/gliner25-resume-2026-10-07/assets/upstream",
+    "repo": "https://github.com/fastino-ai/GLiNER2",
+    "revision": "55656fbfa01d3d4a77485e1a1eeeaf682990ccdf"
+  }
+}
