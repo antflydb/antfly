@@ -1093,12 +1093,12 @@ pub const Context = struct {
         pub fn sendTrailers(self: *H2StreamWriter, trailers: []const hpack.HeaderEntry) !void {
             if (self.closed) return error.StreamClosed;
             self.closed = true;
-            try self.control.lock(&self.h2.write_mutex, self.io);
-            defer self.h2.write_mutex.unlock(self.io);
             if (self.control.active()) {
                 var writer = @import("../net/socket.zig").ControlledWriter{ .socket = self.sock, .control = self.control };
-                return self.h2.sendHeaders(&writer, self.stream_id, trailers, true);
+                return self.h2.sendHeadersControlled(&writer, self.stream_id, trailers, true, self.control);
             }
+            try self.control.lock(&self.h2.write_mutex, self.io);
+            defer self.h2.write_mutex.unlock(self.io);
             try self.h2.sendHeaders(self.sock, self.stream_id, trailers, true);
         }
     };
@@ -1124,12 +1124,17 @@ pub const Context = struct {
         );
         defer self.allocator.free(h2_headers);
 
-        try control.lock(&h2.write_mutex, self.io);
-        defer h2.write_mutex.unlock(self.io);
         if (control.active()) {
             var writer = @import("../net/socket.zig").ControlledWriter{ .socket = sock, .control = control };
-            try h2.sendHeaders(&writer, self.h2_stream_id, h2_headers, false);
-        } else try h2.sendHeaders(sock, self.h2_stream_id, h2_headers, false);
+            errdefer if (writer.headers_committed) {
+                self.h2_stream_sent = true;
+            };
+            try h2.sendHeadersControlled(&writer, self.h2_stream_id, h2_headers, false, control);
+        } else {
+            try control.lock(&h2.write_mutex, self.io);
+            defer h2.write_mutex.unlock(self.io);
+            try h2.sendHeaders(sock, self.h2_stream_id, h2_headers, false);
+        }
 
         self.h2_stream_sent = true;
         return .{ .h2 = h2, .sock = sock, .stream_id = self.h2_stream_id, .io = self.io, .control = control };
@@ -3393,7 +3398,7 @@ pub const Server = struct {
                     cancelH2Stream(h2, sock, stream_id);
                     return;
                 };
-                if (!ctx.h2_stream_sent) try self.sendH2ErrorLocked(h2, sock, stream_id, status);
+                try self.sendH2HandlerFailure(h2, sock, stream_id, ctx.h2_stream_sent, status);
                 return;
             };
         }
@@ -3419,7 +3424,7 @@ pub const Server = struct {
                     cancelH2Stream(h2, sock, stream_id);
                     return;
                 };
-                if (!ctx.h2_stream_sent) try self.sendH2ErrorLocked(h2, sock, stream_id, status);
+                try self.sendH2HandlerFailure(h2, sock, stream_id, ctx.h2_stream_sent, status);
                 return;
             };
         } else {
@@ -3433,7 +3438,7 @@ pub const Server = struct {
                         cancelH2Stream(h2, sock, stream_id);
                         return;
                     };
-                    if (!ctx.h2_stream_sent) try self.sendH2ErrorLocked(h2, sock, stream_id, status);
+                    try self.sendH2HandlerFailure(h2, sock, stream_id, ctx.h2_stream_sent, status);
                     return;
                 };
             } else if (self.global_handler) |global_handler| {
@@ -3442,7 +3447,7 @@ pub const Server = struct {
                         cancelH2Stream(h2, sock, stream_id);
                         return;
                     };
-                    if (!ctx.h2_stream_sent) try self.sendH2ErrorLocked(h2, sock, stream_id, status);
+                    try self.sendH2HandlerFailure(h2, sock, stream_id, ctx.h2_stream_sent, status);
                     return;
                 };
             } else {
@@ -3501,6 +3506,14 @@ pub const Server = struct {
                 return err;
             };
         }
+    }
+
+    fn sendH2HandlerFailure(self: *Self, h2: *H2Connection, sock: *Socket, stream_id: u31, started: bool, code: u16) !void {
+        if (started) {
+            // A second status HEADERS block cannot replace published headers.
+            // Reset late mapped failures just like unmapped handler failures.
+            cancelH2Stream(h2, sock, stream_id);
+        } else try self.sendH2ErrorLocked(h2, sock, stream_id, code);
     }
 
     /// Sends the same safe JSON error envelope used by HTTP/1.
@@ -7308,4 +7321,77 @@ test "HTTP controlled streaming rejects expired headers and retains controls on 
     try std.testing.expectEqual(@as(usize, 1), sink.starts);
     try std.testing.expectEqual(@as(usize, 1), sink.writes);
     try std.testing.expectEqual(@as(usize, 0), sink.closes);
+}
+
+test "HTTP controlled H2 published headers survive denied reentry and late failure resets only the stream" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const Ownership = struct {
+        h2: *H2Connection,
+        parked: bool = false,
+        fn check(_: ?*anyopaque) @import("../net/socket.zig").WriteControl.Error!void {}
+        fn begin(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try std.testing.expect(!self.parked);
+            self.parked = true;
+        }
+        fn end(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try std.testing.expect(self.parked);
+            try std.testing.expect(self.h2.write_mutex.tryLock());
+            self.h2.write_mutex.unlock(self.h2.io);
+            self.parked = false;
+            return error.Timeout;
+        }
+        fn readAll(socket: *Socket, bytes: []u8) !void {
+            var offset: usize = 0;
+            while (offset < bytes.len) {
+                const count = try socket.recv(bytes[offset..]);
+                if (count == 0) return error.EndOfStream;
+                offset += count;
+            }
+        }
+    };
+    var listener = try @import("../net/socket.zig").TcpListener.init(.{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } }, io);
+    defer listener.deinit();
+    var sender = try Socket.connect(listener.getLocalAddress(), io);
+    defer sender.close();
+    sender.enableNativeTimeouts();
+    var peer = try listener.accept();
+    defer peer.socket.close();
+    peer.socket.enableNativeTimeouts();
+    try peer.socket.setRecvTimeout(500);
+    var h2 = H2Connection.initServer(alloc, io);
+    defer h2.deinit();
+    const stream = try h2.stream_manager.getOrCreateStream(1);
+    stream.state = .open;
+    var request = try Request.init(alloc, .GET, "/stream");
+    defer request.deinit();
+    var context = Context.init(alloc, io, &request);
+    defer context.deinit();
+    context.h2 = &h2;
+    context.h2_sock = &sender;
+    context.h2_stream_id = 1;
+    var ownership = Ownership{ .h2 = &h2 };
+    try std.testing.expectError(error.Timeout, context.streamH2Controlled(200, &.{}, .{ .ptr = &ownership, .check_fn = Ownership.check, .wait_begin_fn = Ownership.begin, .wait_end_fn = Ownership.end }));
+    try std.testing.expect(context.h2_stream_sent);
+    try std.testing.expect(!ownership.parked);
+    var server = Server.init(alloc, io);
+    defer server.deinit();
+    try server.sendH2HandlerFailure(&h2, &sender, 1, context.h2_stream_sent, 408);
+    var header: [9]u8 = undefined;
+    try Ownership.readAll(&peer.socket, &header);
+    try std.testing.expectEqual(@as(u8, 1), header[3]);
+    const length = (@as(usize, header[0]) << 16) | (@as(usize, header[1]) << 8) | header[2];
+    var payload: [4096]u8 = undefined;
+    try std.testing.expect(length <= payload.len);
+    try Ownership.readAll(&peer.socket, payload[0..length]);
+    try Ownership.readAll(&peer.socket, &header);
+    try std.testing.expectEqual(@as(u8, 3), header[3]);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 4 }, header[0..3]);
+    try Ownership.readAll(&peer.socket, payload[0..4]);
+    try std.testing.expectEqual(@as(u32, 8), std.mem.readInt(u32, payload[0..4], .big));
+    try std.testing.expectEqual(.closed, stream.state);
+    try peer.socket.setRecvTimeout(25);
+    try std.testing.expectError(error.Timeout, peer.socket.recv(payload[0..1]));
 }

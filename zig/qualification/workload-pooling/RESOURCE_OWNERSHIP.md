@@ -249,3 +249,12 @@ those hooks. Both platform library gates pass; see
 [wait ownership receipts](receipts/2026-10-07/output-wait-ownership/README.md).
 The hooks still require checked archive integration with actual owner capsules;
 whole-callback parking has not yet been removed in production.
+
+
+Controlled HTTP/2 now finishes its atomic frame/header block and releases the
+connection mutex before weighted execution reentry. Published headers remain
+marked on failed resume; late mapped failures reset the started stream. Native
+and pinned Nix/glibc library and supplemental real-owner/TCP gates pass; see
+[HTTP/2 unlock/reentry receipts](receipts/2026-10-07/h2-unlock-reentry/README.md).
+The supplemental ABI 33 production worker integration remains unqualified by
+these focused gates and queued for full archive checks.

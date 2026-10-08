@@ -385,52 +385,26 @@ pub const H2Connection = struct {
     /// this method blocks (yields the fiber) when the send window is exhausted,
     /// waiting for WINDOW_UPDATE frames from the peer.
     ///
-    /// **Caller must hold `write_mutex`**. The mutex is temporarily released
-    /// while waiting for window space so the receive loop can process frames.
+    /// This controlled variant acquires its own write mutex. Callers must not
+    /// hold it. Weighted reentry happens after atomic frame completion unlocks.
     /// Owns the write lock only while inspecting state and transmitting a
     /// frame. Credit and lock waits retain the stream's original controls.
     pub fn writeDataBlockingControlled(self: *Self, writer: anytype, stream_id: u31, data: []const u8, end_stream: bool, control: WriteControl) !void {
         var offset: usize = 0;
         var stall_deadline: ?Io.Timeout = null;
         if (data.len == 0) {
-            try control.lock(&self.write_mutex, self.io);
-            defer self.write_mutex.unlock(self.io);
-            const stream = self.stream_manager.getStream(stream_id) orelse return error.InvalidStreamId;
-            if (stream.responseWriteError(self.is_server)) |err| return err;
-            if (end_stream) {
-                try self.writeFrame(writer, .data, FLAG_END_STREAM, stream_id, &.{});
-                stream.sendEndStream();
-            }
+            beginConnectionWrite(writer);
+            const result = self.writeControlledDataFrame(writer, stream_id, data, end_stream, control, &offset);
+            try finishConnectionWrite(writer);
+            _ = try result;
             return;
         }
         while (offset < data.len) {
             try control.check();
-            const stalled = blk: {
-                try control.lock(&self.write_mutex, self.io);
-                defer self.write_mutex.unlock(self.io);
-                const stream = self.stream_manager.getStream(stream_id) orelse return error.InvalidStreamId;
-                if (stream.responseWriteError(self.is_server)) |err| return err;
-                const sw: usize = if (stream.send_window > 0) @intCast(stream.send_window) else 0;
-                const cw: usize = if (self.stream_manager.connection_send_window > 0) @intCast(self.stream_manager.connection_send_window) else 0;
-                const count = @min(data.len - offset, @min(@min(sw, cw), self.peer_settings.max_frame_size));
-                if (count == 0) {
-                    // WINDOW_UPDATE takes this same lock before signaling.
-                    self.send_window_event.reset();
-                    break :blk true;
-                }
-                const amount: i32 = @intCast(count);
-                try stream.updateSendWindow(-amount);
-                try self.stream_manager.updateConnectionSendWindow(-amount);
-                const last = offset + count == data.len;
-                self.writeFrame(writer, .data, if (last and end_stream) FLAG_END_STREAM else 0, stream_id, data[offset..][0..count]) catch |err| {
-                    stream.updateSendWindow(amount) catch {};
-                    self.stream_manager.updateConnectionSendWindow(amount) catch {};
-                    return err;
-                };
-                offset += count;
-                if (last and end_stream) stream.sendEndStream();
-                break :blk false;
-            };
+            beginConnectionWrite(writer);
+            const result = self.writeControlledDataFrame(writer, stream_id, data, end_stream, control, &offset);
+            try finishConnectionWrite(writer);
+            const stalled = try result;
             if (!stalled) {
                 stall_deadline = null;
                 continue;
@@ -445,6 +419,66 @@ pub const H2Connection = struct {
             ms = (try control.timeout(ms)).?;
             try control.withWait(waitForCreditTick, .{ &self.send_window_event, self.io, ms });
         }
+    }
+
+    fn beginConnectionWrite(writer: anytype) void {
+        const Writer = switch (@typeInfo(@TypeOf(writer))) {
+            .pointer => |pointer| pointer.child,
+            else => @TypeOf(writer),
+        };
+        if (@hasDecl(Writer, "beginConnectionWrite")) writer.beginConnectionWrite();
+    }
+    fn finishConnectionWrite(writer: anytype) !void {
+        const Writer = switch (@typeInfo(@TypeOf(writer))) {
+            .pointer => |pointer| pointer.child,
+            else => @TypeOf(writer),
+        };
+        if (@hasDecl(Writer, "finishConnectionWrite")) try writer.finishConnectionWrite();
+    }
+
+    fn writeControlledDataFrame(self: *Self, writer: anytype, stream_id: u31, data: []const u8, end_stream: bool, control: WriteControl, offset: *usize) !bool {
+        try control.lock(&self.write_mutex, self.io);
+        defer self.write_mutex.unlock(self.io);
+        const stream = self.stream_manager.getStream(stream_id) orelse return error.InvalidStreamId;
+        if (stream.responseWriteError(self.is_server)) |err| return err;
+        if (data.len == 0) {
+            if (end_stream) {
+                try self.writeFrame(writer, .data, FLAG_END_STREAM, stream_id, &.{});
+                stream.sendEndStream();
+            }
+            return false;
+        }
+        const sw: usize = if (stream.send_window > 0) @intCast(stream.send_window) else 0;
+        const cw: usize = if (self.stream_manager.connection_send_window > 0) @intCast(self.stream_manager.connection_send_window) else 0;
+        const count = @min(data.len - offset.*, @min(@min(sw, cw), self.peer_settings.max_frame_size));
+        if (count == 0) {
+            self.send_window_event.reset();
+            return true;
+        }
+        const amount: i32 = @intCast(count);
+        try stream.updateSendWindow(-amount);
+        try self.stream_manager.updateConnectionSendWindow(-amount);
+        const last = offset.* + count == data.len;
+        self.writeFrame(writer, .data, if (last and end_stream) FLAG_END_STREAM else 0, stream_id, data[offset.*..][0..count]) catch |err| {
+            stream.updateSendWindow(amount) catch {};
+            self.stream_manager.updateConnectionSendWindow(amount) catch {};
+            return err;
+        };
+        offset.* += count;
+        if (last and end_stream) stream.sendEndStream();
+        return false;
+    }
+
+    pub fn sendHeadersControlled(self: *Self, writer: anytype, stream_id: u31, headers: []const hpack.HeaderEntry, end_stream: bool, control: WriteControl) !void {
+        beginConnectionWrite(writer);
+        const result = self.sendHeadersControlledLocked(writer, stream_id, headers, end_stream, control);
+        try finishConnectionWrite(writer);
+        try result;
+    }
+    fn sendHeadersControlledLocked(self: *Self, writer: anytype, stream_id: u31, headers: []const hpack.HeaderEntry, end_stream: bool, control: WriteControl) !void {
+        try control.lock(&self.write_mutex, self.io);
+        defer self.write_mutex.unlock(self.io);
+        try self.sendHeaders(writer, stream_id, headers, end_stream);
     }
 
     fn waitForCreditTick(event: *Io.Event, io: Io, ms: u64) !void {
@@ -3791,4 +3825,53 @@ test "H2 controlled credit waits release CPU and restore it before frame seriali
     try std.testing.expect(stream.end_stream_sent);
     try std.testing.expectEqual(@as(usize, 16), state.bytes.items.len);
     try std.testing.expectEqualStrings("payload", state.bytes.items[9..]);
+}
+
+test "H2 controlled header block remains atomic and unlocks before denied reentry" {
+    const Writer = struct {
+        connection: *H2Connection,
+        active: bool = false,
+        writes: usize = 0,
+        bytes: std.ArrayListUnmanaged(u8) = .empty,
+        pub fn beginConnectionWrite(self: *@This()) void {
+            std.debug.assert(!self.active);
+            self.active = true;
+        }
+        pub fn finishConnectionWrite(self: *@This()) !void {
+            try std.testing.expect(self.active);
+            try std.testing.expect(self.writes >= 4);
+            try std.testing.expect(self.connection.write_mutex.tryLock());
+            self.connection.write_mutex.unlock(self.connection.io);
+            self.active = false;
+            return error.Denied;
+        }
+        pub fn writeAll(self: *@This(), bytes: []const u8) !void {
+            try std.testing.expect(self.active);
+            self.writes += 1;
+            try self.bytes.appendSlice(std.testing.allocator, bytes);
+        }
+    };
+    var connection = H2Connection.initServer(std.testing.allocator, std.testing.io);
+    defer connection.deinit();
+    const stream = try connection.stream_manager.getOrCreateStream(1);
+    stream.state = .open;
+    const value = try std.testing.allocator.alloc(u8, 64 * 1024);
+    defer std.testing.allocator.free(value);
+    @memset(value, 'a');
+    var writer = Writer{ .connection = &connection };
+    defer writer.bytes.deinit(std.testing.allocator);
+    try std.testing.expectError(error.Denied, connection.sendHeadersControlled(&writer, 1, &.{.{ .name = "x-large", .value = value }}, false, .{}));
+    try std.testing.expect(!writer.active);
+    var offset: usize = 0;
+    var frames: usize = 0;
+    while (offset < writer.bytes.items.len) {
+        const header = writer.bytes.items[offset..][0..9];
+        const length = (@as(usize, header[0]) << 16) | (@as(usize, header[1]) << 8) | header[2];
+        try std.testing.expectEqual(@as(u8, if (frames == 0) 1 else 9), header[3]);
+        offset += 9 + length;
+        try std.testing.expectEqual(offset == writer.bytes.items.len, header[4] & H2Connection.FLAG_END_HEADERS != 0);
+        frames += 1;
+    }
+    try std.testing.expect(frames >= 2);
+    try std.testing.expectEqual(writer.bytes.items.len, offset);
 }

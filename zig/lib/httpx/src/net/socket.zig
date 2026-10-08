@@ -27,12 +27,29 @@ pub const ControlledWriter = struct {
     header_block: bool = false,
     header_dispatched: bool = false,
     encoder_dirty: bool = false,
+    headers_committed: bool = false,
+    connection_wait: ?WriteControl.DeferredWait = null,
+
+    /// Connection owners keep an atomic frame/header block locked through IO,
+    /// then release that lock before weighted execution reentry can wait.
+    pub fn beginConnectionWrite(self: *@This()) void {
+        std.debug.assert(self.connection_wait == null);
+        self.connection_wait = .{ .control = self.control };
+        self.control = self.connection_wait.?.view();
+    }
+    pub fn finishConnectionWrite(self: *@This()) !void {
+        var wait = self.connection_wait.?;
+        self.control = wait.control;
+        self.connection_wait = null;
+        try wait.finish();
+    }
     fn retire(self: *@This()) void {
         const previous = self.socket.io.swapCancelProtection(.blocked);
         defer _ = self.socket.io.swapCancelProtection(previous);
         self.socket.shutdown();
     }
     pub fn beginEncoding(self: *@This()) !void {
+        self.headers_committed = false;
         try self.control.check();
         self.encoder_dirty = true;
     }
@@ -50,6 +67,7 @@ pub const ControlledWriter = struct {
         self.header_dispatched = false;
     }
     pub fn finishHeaderBlock(self: *@This()) void {
+        self.headers_committed = true;
         self.header_block = false;
         self.header_dispatched = false;
         self.encoder_dirty = false;
@@ -81,6 +99,37 @@ pub const WriteControl = struct {
     /// execution grant. Formatting between waits retains runnable capacity.
     wait_begin_fn: ?*const fn (?*anyopaque) anyerror!void = null,
     wait_end_fn: ?*const fn (?*anyopaque) anyerror!void = null,
+
+    pub const DeferredWait = struct {
+        control: WriteControl,
+        parked: bool = false,
+        fn check(raw: ?*anyopaque) Error!void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try self.control.check();
+        }
+        fn remaining(raw: ?*anyopaque) Error!?u64 {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.control.remaining_ms_fn) |callback| return callback(self.control.ptr);
+            return null;
+        }
+        fn begin(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.parked) return;
+            try self.control.wait_begin_fn.?(self.control.ptr);
+            self.parked = true;
+        }
+        fn end(_: ?*anyopaque) !void {}
+        pub fn view(self: *@This()) WriteControl {
+            if (self.control.wait_begin_fn == null or self.control.wait_end_fn == null) return self.control;
+            return .{ .ptr = self, .check_fn = @This().check, .remaining_ms_fn = @This().remaining, .wait_begin_fn = @This().begin, .wait_end_fn = @This().end };
+        }
+        pub fn finish(self: *@This()) !void {
+            if (!self.parked) return;
+            self.parked = false;
+            try self.control.wait_end_fn.?(self.control.ptr);
+            try self.control.check();
+        }
+    };
 
     pub fn withWait(self: WriteControl, comptime function: anytype, args: anytype) anyerror!@typeInfo(@TypeOf(@call(.auto, function, args))).error_union.payload {
         try self.check();
