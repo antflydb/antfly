@@ -168,6 +168,7 @@ export type SQLBuiltinType = components["schemas"]["SQLBuiltinType"];
 export type SQLArrayElementType = components["schemas"]["SQLArrayElementType"];
 export type SQLArrayValue = components["schemas"]["SQLArrayValue"];
 export type SQLColumn = components["schemas"]["SQLColumn"];
+export type SQLNumericModifier = components["schemas"]["SQLNumericModifier"];
 export type SQLColumnType = components["schemas"]["SQLColumnType"];
 export type SQLDiagnostic = components["schemas"]["SQLDiagnostic"];
 export type SQLMutationOutcome = components["schemas"]["SQLMutationOutcome"];

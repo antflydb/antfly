@@ -331,7 +331,7 @@ pub fn bindWithInvocation(alloc: Allocator, table: ?catalog.Table, statement: as
     builder.inference = true;
     const source_columns = if (table) |definition| blk: {
         const result = try alloc.alloc(scalar.Column, definition.columns.len + 1);
-        for (definition.columns, result[0..definition.columns.len]) |column, *out| out.* = .{ .name = column.name, .type = column.type, .element_type = column.element_type, .nullable = column.nullable };
+        for (definition.columns, result[0..definition.columns.len]) |column, *out| out.* = .{ .name = column.name, .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .nullable = column.nullable };
         result[definition.columns.len] = .{ .name = "_id", .type = .string, .nullable = false };
         break :blk result;
     } else &.{};
@@ -362,11 +362,12 @@ pub fn bindWithInvocation(alloc: Allocator, table: ?catalog.Table, statement: as
     for (columns[0..grouped_width], 0..) |*column, index| column.* = .{ .name = try std.fmt.allocPrint(alloc, "$grouped_{d}", .{index}), .type = .string };
     for (builder.constants, columns[grouped_width..], 0..) |name, *column, index| {
         const definition = try (table orelse return error.InvalidSqlBackendResponse).column(name);
-        column.* = .{ .name = try std.fmt.allocPrint(alloc, "$constant_{d}", .{index}), .type = definition.type, .element_type = definition.element_type, .nullable = definition.nullable };
+        column.* = .{ .name = try std.fmt.allocPrint(alloc, "$constant_{d}", .{index}), .type = definition.type, .element_type = definition.element_type, .numeric_modifier = definition.numeric_modifier, .nullable = definition.nullable };
     }
     for (columns[0..groups.len], input.projections[0..groups.len]) |*column, program| {
         column.type = program.?.output_type.kind orelse .string;
         column.element_type = program.?.output_type.element_type;
+        column.numeric_modifier = program.?.output_type.numeric_modifier;
     }
     const specs = try alloc.alloc(operators.AggregateSpec, builder.aggregates.items.len);
     for (builder.aggregates.items, builder.inputs.items, specs, columns[groups.len..grouped_width]) |node, index, *spec, *column| {

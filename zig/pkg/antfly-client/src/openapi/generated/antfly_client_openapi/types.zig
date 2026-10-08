@@ -36950,12 +36950,15 @@ pub const SQLColumn = struct {
     type: SQLColumnType,
     /// Required for array columns and exact NUMERIC number columns. Identifies scalar widths when supplied. The descriptor applies even to NULL or empty arrays.
     element_type: ?SQLArrayElementType = null,
+    /// Present only for constrained NUMERIC scalar or array results. Prepared result metadata is stable before execution-time constant folding.
+    numeric_modifier: ?SQLNumericModifier = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "name", "name", false },
         .{ "type", "type", false },
         .{ "element_type", "element_type", true },
+        .{ "numeric_modifier", "numeric_modifier", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -36974,6 +36977,10 @@ pub const SQLColumn = struct {
         try jw.write(self.type);
         if (self.element_type) |value| {
             try jw.objectField("element_type");
+            try jw.write(value);
+        }
+        if (self.numeric_modifier) |value| {
+            try jw.objectField("numeric_modifier");
             try jw.write(value);
         }
         try jw.endObject();
@@ -37252,6 +37259,12 @@ pub const SQLMutationOutcome = enum {
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
+};
+
+/// PostgreSQL NUMERIC precision and signed scale. For arrays this describes every element, not dimensions. Absent means unconstrained NUMERIC.
+pub const SQLNumericModifier = struct {
+    precision: i64,
+    scale: i64,
 };
 
 /// Immutable positional input contract. Element identity also preserves primitive widths; array inputs require it. Unknown slots have no SQL constraint.

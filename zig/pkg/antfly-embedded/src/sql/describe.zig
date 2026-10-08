@@ -43,11 +43,15 @@ pub const Column = struct {
     name: []const u8,
     type: ast.ColumnType,
     element_type: ?@import("array_value.zig").ElementType = null,
+    numeric_modifier: ?@import("../common/sql_builtin_type.zig").NumericModifier = null,
     /// NULL without a concrete SQL type can adopt an assignment/set context.
     /// It must not be confused with a typed string expression that is NULL.
     untyped_null: bool = false,
 
     pub fn jsonStringify(self: Column, writer: anytype) !void {
+        if (self.numeric_modifier) |modifier| {
+            return writer.write(.{ .name = self.name, .type = self.type, .element_type = self.element_type, .numeric_modifier = modifier });
+        }
         if (self.type == .array or self.element_type == .numeric) {
             try writer.write(.{ .name = self.name, .type = self.type, .element_type = self.element_type });
         } else try writer.write(.{ .name = self.name, .type = self.type });
@@ -206,7 +210,7 @@ fn typedValuesSource(allocator: std.mem.Allocator, source: *const ast.Select, in
         const column = try table.column(name);
         if (column.type == .array and original == .string) {
             const cast = try allocator.create(ast.Scalar);
-            cast.* = .{ .cast = .{ .operand = expression, .type = .array, .element_type = column.element_type orelse return error.SqlAssignmentTypeMismatch } };
+            cast.* = .{ .cast = .{ .operand = expression, .type = .array, .element_type = column.element_type orelse return error.SqlAssignmentTypeMismatch, .numeric_modifier = column.numeric_modifier } };
             projection.expression = cast;
             continue;
         }
@@ -363,7 +367,7 @@ fn bindImpl(allocator: std.mem.Allocator, backend: catalog.Backend, compiled: *c
         const window = try allocator.create(@import("window_binding.zig").Bound);
         window.* = try @import("window_binding.zig").bind(allocator, backend, compiled, explicit_parameter_types);
         const columns = try allocator.alloc(Column, window.outputs.len);
-        for (columns, window.names, window.outputs) |*column, name, program| column.* = .{ .name = name, .type = internalKind(program.output_type.kind), .element_type = program.output_type.element_type, .untyped_null = program.output_type.kind == null };
+        for (columns, window.names, window.outputs) |*column, name, program| column.* = .{ .name = name, .type = internalKind(program.output_type.kind), .element_type = program.output_type.element_type, .numeric_modifier = program.output_type.numeric_modifier, .untyped_null = program.output_type.kind == null };
         return .{ .table = window.input.table, .action = .read, .columns = columns, .parameter_types = window.input.parameter_types, .json_literals = .empty, .window = window };
     }
     if (compiled.statement == .select and @import("aggregate_binding.zig").accepts(compiled.statement.select)) {
@@ -375,7 +379,7 @@ fn bindImpl(allocator: std.mem.Allocator, backend: catalog.Backend, compiled: *c
         const aggregate = try allocator.create(@import("aggregate_binding.zig").Bound);
         aggregate.* = try @import("aggregate_binding.zig").bindWithInvocation(allocator, table, compiled.statement.select, parameters, backend.settings_view, backend.parameter_invocation);
         const columns = try allocator.alloc(Column, aggregate.outputs.len);
-        for (columns, aggregate.names, aggregate.outputs) |*column, name, program| column.* = .{ .name = name, .type = internalKind(program.output_type.kind), .element_type = program.output_type.element_type, .untyped_null = program.output_type.kind == null };
+        for (columns, aggregate.names, aggregate.outputs) |*column, name, program| column.* = .{ .name = name, .type = internalKind(program.output_type.kind), .element_type = program.output_type.element_type, .numeric_modifier = program.output_type.numeric_modifier, .untyped_null = program.output_type.kind == null };
         var json_literals: std.StringHashMapUnmanaged(Json) = .empty;
         if (table) |definition| {
             const contexts = try allocator.alloc(?ast.ColumnType, parameters.len);
@@ -512,7 +516,7 @@ fn bindImpl(allocator: std.mem.Allocator, backend: catalog.Backend, compiled: *c
                 const expression = projection.expression orelse continue;
                 if (expression.* != .literal or expression.literal != .string) continue;
                 const cast = try allocator.create(ast.Scalar);
-                cast.* = .{ .cast = .{ .operand = expression, .type = .array, .element_type = column.element_type orelse return error.SqlAssignmentTypeMismatch } };
+                cast.* = .{ .cast = .{ .operand = expression, .type = .array, .element_type = column.element_type orelse return error.SqlAssignmentTypeMismatch, .numeric_modifier = column.numeric_modifier } };
                 projection.expression = cast;
             }
             source_query.columns = projections;
@@ -534,13 +538,13 @@ fn bindImpl(allocator: std.mem.Allocator, backend: catalog.Backend, compiled: *c
         for (insertion.columns, expected[0..insertion.columns.len], expected_types[0..insertion.columns.len]) |name, *kind, *descriptor| {
             const column = try table.column(name);
             kind.* = column.type;
-            descriptor.* = .{ .kind = column.type, .element_type = column.element_type };
+            descriptor.* = .{ .kind = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier };
         }
         if (capture_count != 0) for (insertion.conflict.?.assignments) |assignment| if (assignment.capture_ordinal) |ordinal| {
             for (ordinal..ordinal + assignment.capture_span) |capture_index| {
                 const column = try table.column(assignment.field);
                 expected[insertion.columns.len + capture_index] = column.type;
-                expected_types[insertion.columns.len + capture_index] = .{ .kind = column.type, .element_type = column.element_type };
+                expected_types[insertion.columns.len + capture_index] = .{ .kind = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier };
             }
         };
         try @import("relation_binding.zig").inferExpectedTypes(allocator, backend, source_query, parameters, expected_types);
@@ -561,7 +565,7 @@ fn bindImpl(allocator: std.mem.Allocator, backend: catalog.Backend, compiled: *c
         const capture_types = try allocator.alloc(@import("scalar.zig").Type, clause.capture_count);
         if (clause.capture_count != 0) {
             const source = result.insert_source orelse return error.InvalidSqlBackendResponse;
-            for (source.columns[compiled.statement.insert.columns.len..], capture_types) |column, *descriptor| descriptor.* = .{ .kind = column.type, .element_type = column.element_type };
+            for (source.columns[compiled.statement.insert.columns.len..], capture_types) |column, *descriptor| descriptor.* = .{ .kind = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier };
         }
         result.conflict = try @import("conflict.zig").bind(allocator, backend, table, projection_name, target_aliased, clause, parameters, capture_types);
     };
@@ -628,7 +632,7 @@ fn bindConstantSelect(alloc: std.mem.Allocator, compiled: *const compiler.Compil
         columns[0] = .{ .name = try alloc.dupe(u8, statement.count_alias orelse "count"), .type = .integer };
     } else for (statement.columns, scalars.projections, columns) |projection, program, *column| {
         const expression = program orelse return error.UndefinedColumn;
-        column.* = .{ .name = try alloc.dupe(u8, projection.alias orelse "?column?"), .type = internalKind(expression.output_type.kind), .element_type = expression.output_type.element_type, .untyped_null = expression.output_type.kind == null };
+        column.* = .{ .name = try alloc.dupe(u8, projection.alias orelse "?column?"), .type = internalKind(expression.output_type.kind), .element_type = expression.output_type.element_type, .numeric_modifier = expression.output_type.numeric_modifier, .untyped_null = expression.output_type.kind == null };
     }
     // Ordering a singleton changes nothing, but names must still resolve.
     for (statement.order_by) |order| {
@@ -750,7 +754,7 @@ const Context = struct {
         if (statement.columns.len == 0) {
             if (self.table.columns.len > 256) return error.SqlProgramLimitExceeded;
             const columns = try self.allocator.alloc(Column, self.table.columns.len);
-            for (self.table.columns, columns) |column, *output| output.* = .{ .name = try self.allocator.dupe(u8, column.name), .type = internalKind(column.type), .element_type = column.element_type };
+            for (self.table.columns, columns) |column, *output| output.* = .{ .name = try self.allocator.dupe(u8, column.name), .type = internalKind(column.type), .element_type = column.element_type, .numeric_modifier = column.numeric_modifier };
             return columns;
         }
         const columns = try self.allocator.alloc(Column, statement.columns.len);
@@ -759,7 +763,7 @@ const Context = struct {
         for (statement.columns, columns, 0..) |projection, *output, index| {
             if (projection.expression != null) {
                 const program = self.scalars.projections[index] orelse return error.InvalidSqlBackendResponse;
-                output.* = .{ .name = try self.allocator.dupe(u8, projection.alias orelse "?column?"), .type = internalKind(program.output_type.kind), .element_type = program.output_type.element_type, .untyped_null = program.output_type.kind == null };
+                output.* = .{ .name = try self.allocator.dupe(u8, projection.alias orelse "?column?"), .type = internalKind(program.output_type.kind), .element_type = program.output_type.element_type, .numeric_modifier = program.output_type.numeric_modifier, .untyped_null = program.output_type.kind == null };
                 continue;
             }
             const column = try self.table.column(projection.field);
@@ -767,7 +771,7 @@ const Context = struct {
                 _ = try native_fields.getOrPut(self.allocator, column.path);
                 if (native_fields.count() > 256 and !statement.internal_projection) return error.SqlProgramLimitExceeded;
             }
-            output.* = .{ .name = try self.allocator.dupe(u8, projection.alias orelse column.name), .type = internalKind(column.type), .element_type = column.element_type };
+            output.* = .{ .name = try self.allocator.dupe(u8, projection.alias orelse column.name), .type = internalKind(column.type), .element_type = column.element_type, .numeric_modifier = column.numeric_modifier };
         }
         return columns;
     }
@@ -1055,6 +1059,34 @@ test "SQL describe owns ordered aliases and complete sparse parameter metadata w
     try std.testing.expectEqual(@as(u64, 7), result.binding.table.?.id);
     try std.testing.expectEqual(@as(u32, 9), result.binding.table.?.schema_version);
     try std.testing.expectEqualStrings("table:immutable", result.binding.table.?.physical_name);
+}
+
+test "SQL NUMERIC result modifiers survive derived CTE VALUES and set binding" {
+    const a = std.testing.allocator;
+    const Entry = struct { sql: []const u8, oid: u32, modifier: i32 };
+    const fixture = try std.json.parseFromSlice(struct { queries: []const Entry }, a, @embedFile("fixtures/sql_numeric_typmod_reference.json"), .{ .ignore_unknown_fields = true });
+    defer fixture.deinit();
+    for (fixture.value.queries) |case| {
+        errdefer std.debug.print("NUMERIC descriptor: {s}\n", .{case.sql});
+        var fake: FakeBackend = .{};
+        var compiled = try compiler.compile(a, case.sql, .{});
+        defer compiled.deinit();
+        var result = try describe(a, fake.backend(), &compiled, &.{});
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), result.binding.columns.len);
+        const column = result.binding.columns[0];
+        try std.testing.expectEqual(case.oid, column.element_type.?.oid());
+        try std.testing.expectEqual(@as(i32, case.modifier), if (column.numeric_modifier) |modifier| try modifier.postgres() else @as(i32, -1));
+        const json = try std.json.Stringify.valueAlloc(a, column, .{});
+        defer a.free(json);
+        const public = try std.json.parseFromSlice(Json, a, json, .{});
+        defer public.deinit();
+        if (column.numeric_modifier) |modifier| {
+            const encoded = public.value.object.get("numeric_modifier").?.object;
+            try std.testing.expectEqual(@as(i64, modifier.precision), encoded.get("precision").?.integer);
+            try std.testing.expectEqual(@as(i64, modifier.scale), encoded.get("scale").?.integer);
+        } else try std.testing.expect(public.value.object.get("numeric_modifier") == null);
+    }
 }
 
 test "SQL describe INSERT and UPDATE authorize and infer without writes or reads" {

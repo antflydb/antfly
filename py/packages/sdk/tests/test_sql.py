@@ -58,6 +58,15 @@ def test_array_column_schema_exports_explicit_element_identity_and_transport_con
         SQLArrayColumnSchema.from_dict({"type": "array", "x-antfly-sql-type": "int64"})
 
 
+def test_numeric_scalar_and_array_result_modifiers_round_trip():
+    for kind in ("number", "array"):
+        source = {"name": "n", "type": kind, "element_type": "numeric", "numeric_modifier": {"precision": 2, "scale": -3}}
+        column = SQLColumn.from_dict(source)
+        assert column.numeric_modifier.precision == 2
+        assert column.numeric_modifier.scale == -3
+        assert column.to_dict() == source
+
+
 def test_array_result_models_preserve_exact_values_dimensions_and_null_flags():
     column = SQLColumn.from_dict({"name": "items", "type": "array", "element_type": "int64"})
     assert column.element_type is SQLArrayElementType.INT64

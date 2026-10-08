@@ -5,13 +5,15 @@
       "sql": "CAST(12.345 AS numeric(4,2))",
       "oid": 1700,
       "typmod": 262150,
-      "expected": "12.35"
+      "expected": "12.35",
+      "prepared_typmod": 262150
     },
     {
       "sql": "CAST(-12.345 AS numeric(4,2))",
       "oid": 1700,
       "typmod": 262150,
-      "expected": "-12.35"
+      "expected": "-12.35",
+      "prepared_typmod": 262150
     },
     {
       "sql": "CAST(99.995 AS numeric(4,2))",
@@ -21,7 +23,8 @@
       "sql": "CAST(.00994 AS numeric(2,4))",
       "oid": 1700,
       "typmod": 131080,
-      "expected": "0.0099"
+      "expected": "0.0099",
+      "prepared_typmod": 131080
     },
     {
       "sql": "CAST(.00995 AS numeric(2,4))",
@@ -31,13 +34,15 @@
       "sql": "CAST(0 AS numeric(2,4))",
       "oid": 1700,
       "typmod": 131080,
-      "expected": "0.0000"
+      "expected": "0.0000",
+      "prepared_typmod": 131080
     },
     {
       "sql": "CAST(99499 AS numeric(2,-3))",
       "oid": 1700,
       "typmod": 133121,
-      "expected": "99000"
+      "expected": "99000",
+      "prepared_typmod": 133121
     },
     {
       "sql": "CAST(99500 AS numeric(2,-3))",
@@ -51,7 +56,8 @@
       "sql": "CAST('NaN' AS numeric(1,0))",
       "oid": 1700,
       "typmod": 65540,
-      "expected": "NaN"
+      "expected": "NaN",
+      "prepared_typmod": 65540
     },
     {
       "sql": "CAST('Infinity' AS numeric(10,2))",
@@ -65,7 +71,8 @@
       "sql": "CAST(NULL AS numeric(4,2))",
       "oid": 1700,
       "typmod": 262150,
-      "expected": null
+      "expected": null,
+      "prepared_typmod": 262150
     },
     {
       "sql": "CAST('bad' AS numeric(4,2))",
@@ -75,7 +82,8 @@
       "sql": "CAST(12.5 AS decimal(4))",
       "oid": 1700,
       "typmod": 262148,
-      "expected": "13"
+      "expected": "13",
+      "prepared_typmod": 262148
     },
     {
       "sql": "CAST(12.345 AS numeric(+4,+2))",
@@ -85,85 +93,99 @@
       "sql": "CAST(1234 AS numeric(4,-2))",
       "oid": 1700,
       "typmod": 264194,
-      "expected": "1200"
+      "expected": "1200",
+      "prepared_typmod": 264194
     },
     {
       "sql": "CAST(CAST(1.245 AS numeric(4,2)) AS numeric(3,1))",
       "oid": 1700,
       "typmod": 196613,
-      "expected": "1.3"
+      "expected": "1.3",
+      "prepared_typmod": 196613
     },
     {
       "sql": "CAST(1.245 AS numeric(3,1))",
       "oid": 1700,
       "typmod": 196613,
-      "expected": "1.2"
+      "expected": "1.2",
+      "prepared_typmod": 196613
     },
     {
       "sql": "CAST(CAST(1.245 AS numeric(4,2)) AS numeric)",
       "oid": 1700,
       "typmod": -1,
-      "expected": "1.25"
+      "expected": "1.25",
+      "prepared_typmod": -1
     },
     {
       "sql": "+(1.245::numeric(4,2))",
       "oid": 1700,
       "typmod": -1,
-      "expected": "1.25"
+      "expected": "1.25",
+      "prepared_typmod": -1
     },
     {
       "sql": "-(1.245::numeric(4,2))",
       "oid": 1700,
       "typmod": -1,
-      "expected": "-1.25"
+      "expected": "-1.25",
+      "prepared_typmod": -1
     },
     {
       "sql": "1.245::numeric(4,2)+2.345::numeric(4,2)",
       "oid": 1700,
       "typmod": -1,
-      "expected": "3.60"
+      "expected": "3.60",
+      "prepared_typmod": -1
     },
     {
       "sql": "CASE WHEN true THEN 1.245::numeric(4,2) ELSE 2.345::numeric(4,2) END",
       "oid": 1700,
       "typmod": 262150,
-      "expected": "1.25"
+      "expected": "1.25",
+      "prepared_typmod": 262150
     },
     {
       "sql": "CASE WHEN true THEN 1.245::numeric(4,2) ELSE 2.345::numeric(5,2) END",
       "oid": 1700,
       "typmod": 262150,
-      "expected": "1.25"
+      "expected": "1.25",
+      "prepared_typmod": -1
     },
     {
       "sql": "COALESCE(NULL::numeric(4,2),1.245::numeric(4,2))",
       "oid": 1700,
       "typmod": 262150,
-      "expected": "1.25"
+      "expected": "1.25",
+      "prepared_typmod": 262150
     },
     {
       "sql": "COALESCE(NULL::numeric(4,2),1.245::numeric(5,2))",
       "oid": 1700,
       "typmod": 327686,
-      "expected": "1.25"
+      "expected": "1.25",
+      "prepared_typmod": -1
     },
     {
       "sql": "CAST(CAST(1.2345 AS real) AS numeric(4,2))",
       "oid": 1700,
       "typmod": 262150,
-      "expected": "1.23"
+      "expected": "1.23",
+      "prepared_typmod": 262150
     },
     {
       "sql": "CAST(ARRAY[12.345,NULL,-12.345] AS numeric(4,2)[])",
       "oid": 1231,
       "typmod": 262150,
-      "expected": "{12.35,NULL,-12.35}"
+      "expected": "{12.35,NULL,-12.35}",
+      "prepared_typmod": 262150
     },
     {
       "sql": "CAST('[-2:0]={12.345,NULL,-12.345}' AS numeric(4,2)[])",
       "oid": 1231,
       "typmod": 262150,
-      "expected": "[-2:0]={12.35,NULL,-12.35}"
+      "expected": "[-2:0]={12.35,NULL,-12.35}",
+      "prepared_typmod": 262150
     },
     {
       "sql": "CAST(ARRAY[12.345,99.995] AS numeric(4,2)[])",
@@ -173,13 +195,15 @@
       "sql": "CAST(NULL AS numeric(4,2)[])",
       "oid": 1231,
       "typmod": 262150,
-      "expected": null
+      "expected": null,
+      "prepared_typmod": 262150
     },
     {
       "sql": "CAST('{}' AS numeric(4,2)[])",
       "oid": 1231,
       "typmod": 262150,
-      "expected": "{}"
+      "expected": "{}",
+      "prepared_typmod": 262150
     },
     {
       "sql": "CAST(1 AS numeric(0))",
@@ -225,19 +249,154 @@
       "sql": "CAST(1 AS numeric(1_0,2))",
       "oid": 1700,
       "typmod": 655366,
-      "expected": "1.00"
+      "expected": "1.00",
+      "prepared_typmod": 655366
     },
     {
       "sql": "CASE WHEN false THEN 99.995::numeric(4,2) ELSE 0::numeric(4,2) END",
       "oid": 1700,
       "typmod": 262150,
-      "expected": "0.00"
+      "expected": "0.00",
+      "prepared_typmod": 262150
     },
     {
       "sql": "CASE WHEN true THEN ARRAY[1.245]::numeric(4,2)[] ELSE ARRAY[99.995]::numeric(4,2)[] END",
       "oid": 1231,
       "typmod": 262150,
-      "expected": "{1.25}"
+      "expected": "{1.25}",
+      "prepared_typmod": 262150
+    },
+    {
+      "sql": "GREATEST(1.245::numeric(4,2),2.345::numeric(4,2))",
+      "oid": 1700,
+      "typmod": 262150,
+      "expected": "2.35",
+      "prepared_typmod": 262150
+    },
+    {
+      "sql": "GREATEST(1.245::numeric(4,2),2.345::numeric(5,2))",
+      "oid": 1700,
+      "typmod": -1,
+      "expected": "2.35",
+      "prepared_typmod": -1
+    },
+    {
+      "sql": "NULLIF(1.245::numeric(4,2),2.345::numeric(5,2))",
+      "oid": 1700,
+      "typmod": 262150,
+      "expected": "1.25",
+      "prepared_typmod": 262150
+    },
+    {
+      "sql": "CASE WHEN true THEN 1.245::numeric(4,2) END",
+      "oid": 1700,
+      "typmod": 262150,
+      "expected": "1.25",
+      "prepared_typmod": -1
+    },
+    {
+      "sql": "COALESCE(NULL,1.245::numeric(4,2))",
+      "oid": 1700,
+      "typmod": 262150,
+      "expected": "1.25",
+      "prepared_typmod": -1
+    },
+    {
+      "sql": "ARRAY[1.245::numeric(4,2),2.345::numeric(4,2)]",
+      "oid": 1231,
+      "typmod": 262150,
+      "expected": "{1.25,2.35}",
+      "prepared_typmod": 262150
+    },
+    {
+      "sql": "ARRAY[1.245::numeric(4,2),2.345::numeric(5,2)]",
+      "oid": 1231,
+      "typmod": -1,
+      "expected": "{1.25,2.35}",
+      "prepared_typmod": -1
+    },
+    {
+      "sql": "ARRAY[1.245::numeric(4,2),NULL]",
+      "oid": 1231,
+      "typmod": -1,
+      "expected": "{1.25,NULL}",
+      "prepared_typmod": -1
+    },
+    {
+      "sql": "abs(1.245::numeric(4,2))",
+      "oid": 1700,
+      "typmod": -1,
+      "expected": "1.25",
+      "prepared_typmod": -1
+    },
+    {
+      "sql": "round(1.245::numeric(4,2))",
+      "oid": 1700,
+      "typmod": -1,
+      "expected": "1",
+      "prepared_typmod": -1
+    }
+  ],
+  "queries": [
+    {
+      "sql": "SELECT 1.245::numeric(4,2) AS n",
+      "oid": 1700,
+      "modifier": 262150
+    },
+    {
+      "sql": "SELECT n FROM (SELECT 1.245::numeric(4,2) AS n) t",
+      "oid": 1700,
+      "modifier": 262150
+    },
+    {
+      "sql": "WITH q AS (SELECT 1.245::numeric(4,2) AS n) SELECT n FROM q",
+      "oid": 1700,
+      "modifier": 262150
+    },
+    {
+      "sql": "SELECT n FROM (VALUES (1.245::numeric(4,2)),(2.345::numeric(4,2))) v(n)",
+      "oid": 1700,
+      "modifier": 262150
+    },
+    {
+      "sql": "SELECT n FROM (VALUES (NULL),(2.345::numeric(4,2))) v(n)",
+      "oid": 1700,
+      "modifier": -1
+    },
+    {
+      "sql": "SELECT 1.245::numeric(4,2) AS n UNION ALL SELECT 2.345::numeric(4,2)",
+      "oid": 1700,
+      "modifier": 262150
+    },
+    {
+      "sql": "SELECT 1.245::numeric(4,2) AS n UNION ALL SELECT 2.345::numeric(5,2)",
+      "oid": 1700,
+      "modifier": -1
+    },
+    {
+      "sql": "SELECT NULL AS n UNION ALL SELECT 2.345::numeric(4,2)",
+      "oid": 1700,
+      "modifier": -1
+    },
+    {
+      "sql": "SELECT MIN(1.245::numeric(4,2)) FROM things",
+      "oid": 1700,
+      "modifier": -1
+    },
+    {
+      "sql": "SELECT 1.245::numeric(4,2) AS n FROM things GROUP BY age",
+      "oid": 1700,
+      "modifier": 262150
+    },
+    {
+      "sql": "SELECT NULLIF(1.245::numeric(4,2),2.345::double precision)",
+      "oid": 701,
+      "modifier": -1
+    },
+    {
+      "sql": "SELECT NULLIF(1.245::double precision,2.345::numeric(4,2))",
+      "oid": 701,
+      "modifier": -1
     }
   ]
 }

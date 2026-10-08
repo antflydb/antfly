@@ -43,6 +43,23 @@ func TestPreparedSQLParameterContractsRetainElementIdentity(t *testing.T) {
 	}
 }
 
+func TestSQLNumericResultModifierRoundTrip(t *testing.T) {
+	for _, kind := range []SQLColumnType{"number", "array"} {
+		column := SQLColumn{Name: "n", Type: kind, ElementType: "numeric", NumericModifier: SQLNumericModifier{Precision: 2, Scale: -3}}
+		encoded, err := json.Marshal(column)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var decoded SQLColumn
+		if err := json.Unmarshal(encoded, &decoded); err != nil {
+			t.Fatal(err)
+		}
+		if decoded.NumericModifier != column.NumericModifier {
+			t.Fatalf("lost NUMERIC modifier: %#v", decoded)
+		}
+	}
+}
+
 func TestArrayColumnSchemaPreservesExplicitIdentityAndEnvelopeConstraints(t *testing.T) {
 	for _, kind := range []SQLArrayElementType{"int64", "numeric"} {
 		column := SQLArrayColumnSchema{Type: "sql_array", XAntflySqlType: kind, Nullable: true}

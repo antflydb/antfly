@@ -50,6 +50,7 @@ type (
 	SQLParameterDescriptor      = oapi.SQLParameterDescriptor
 	SQLResponse                 = oapi.SQLResponse
 	SQLColumn                   = oapi.SQLColumn
+	SQLNumericModifier          = oapi.SQLNumericModifier
 	SQLColumnType               = oapi.SQLColumnType
 	SQLDiagnostic               = oapi.SQLDiagnostic
 	SQLMutationOutcome          = oapi.SQLMutationOutcome

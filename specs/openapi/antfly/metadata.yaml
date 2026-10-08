@@ -1370,6 +1370,9 @@ components:
         element_type:
           $ref: "#/components/schemas/SQLArrayElementType"
           description: Required for array columns and exact NUMERIC number columns. Identifies scalar widths when supplied. The descriptor applies even to NULL or empty arrays.
+        numeric_modifier:
+          $ref: "schema.yaml#/components/schemas/SQLNumericModifier"
+          description: Present only for constrained NUMERIC scalar or array results. Prepared result metadata is stable before execution-time constant folding.
     SQLPrepareRequest:
       type: object
       additionalProperties: false

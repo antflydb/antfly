@@ -1217,7 +1217,7 @@ pub const Stream = struct {
                 const projection_: *@This() = @ptrCast(@alignCast(raw));
                 const source = projection_.projections[ordinal] orelse blk: {
                     const column = projection_.stream.context.binding.columns[ordinal];
-                    const definition = [_]@import("scalar.zig").Column{.{ .name = projection_.stream.fields[ordinal], .type = column.type, .element_type = column.element_type }};
+                    const definition = [_]@import("scalar.zig").Column{.{ .name = projection_.stream.fields[ordinal], .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier }};
                     const direct: @import("execution_batch.zig").Batch = .{ .columns = .{ .page = projection_.page, .definitions = &definition } };
                     break :blk (direct.dictionaryColumn(alloc, 0) catch |err| {
                         if (err == error.OutOfMemory) return err;

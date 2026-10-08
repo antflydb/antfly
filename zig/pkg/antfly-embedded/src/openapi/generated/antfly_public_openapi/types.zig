@@ -12834,6 +12834,8 @@ pub const SQLColumn = struct {
     type: SQLColumnType,
     /// Required for array columns and exact NUMERIC number columns. Identifies scalar widths when supplied. The descriptor applies even to NULL or empty arrays.
     element_type: ?SQLArrayElementType = null,
+    /// Present only for constrained NUMERIC scalar or array results. Prepared result metadata is stable before execution-time constant folding.
+    numeric_modifier: ?antfly_schema_openapi.SQLNumericModifier = null,
 };
 
 /// Logical SQL result type. Integer values and numbers with element_type numeric are decimal strings to preserve exact precision in every client.

@@ -61,6 +61,33 @@ def cases():
         "CAST(1 AS numeric(1_0,2))",
         "CASE WHEN false THEN 99.995::numeric(4,2) ELSE 0::numeric(4,2) END",
         "CASE WHEN true THEN ARRAY[1.245]::numeric(4,2)[] ELSE ARRAY[99.995]::numeric(4,2)[] END",
+        "GREATEST(1.245::numeric(4,2),2.345::numeric(4,2))",
+        "GREATEST(1.245::numeric(4,2),2.345::numeric(5,2))",
+        "NULLIF(1.245::numeric(4,2),2.345::numeric(5,2))",
+        "CASE WHEN true THEN 1.245::numeric(4,2) END",
+        "COALESCE(NULL,1.245::numeric(4,2))",
+        "ARRAY[1.245::numeric(4,2),2.345::numeric(4,2)]",
+        "ARRAY[1.245::numeric(4,2),2.345::numeric(5,2)]",
+        "ARRAY[1.245::numeric(4,2),NULL]",
+        "abs(1.245::numeric(4,2))",
+        "round(1.245::numeric(4,2))",
+    )
+
+
+def queries():
+    return (
+        "SELECT 1.245::numeric(4,2) AS n",
+        "SELECT n FROM (SELECT 1.245::numeric(4,2) AS n) t",
+        "WITH q AS (SELECT 1.245::numeric(4,2) AS n) SELECT n FROM q",
+        "SELECT n FROM (VALUES (1.245::numeric(4,2)),(2.345::numeric(4,2))) v(n)",
+        "SELECT n FROM (VALUES (NULL),(2.345::numeric(4,2))) v(n)",
+        "SELECT 1.245::numeric(4,2) AS n UNION ALL SELECT 2.345::numeric(4,2)",
+        "SELECT 1.245::numeric(4,2) AS n UNION ALL SELECT 2.345::numeric(5,2)",
+        "SELECT NULL AS n UNION ALL SELECT 2.345::numeric(4,2)",
+        "SELECT MIN(1.245::numeric(4,2)) FROM things",
+        "SELECT 1.245::numeric(4,2) AS n FROM things GROUP BY age",
+        "SELECT NULLIF(1.245::numeric(4,2),2.345::double precision)",
+        "SELECT NULLIF(1.245::double precision,2.345::numeric(4,2))",
     )
 
 
@@ -70,7 +97,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--generate", action="store_true")
     args = parser.parse_args()
-    output = {"reference": "PostgreSQL 18 NUMERIC type modifiers", "entries": []}
+    output = {"reference": "PostgreSQL 18 NUMERIC type modifiers", "entries": [], "queries": []}
     with postgres() as db:
         for sql in cases():
             entry = {"sql": sql}
@@ -79,15 +106,33 @@ def main():
                 entry["oid"] = cursor.pgresult.ftype(0)
                 entry["typmod"] = cursor.pgresult.fmod(0)
                 entry["expected"] = db.execute(f"SELECT ({sql})::text").fetchone()[0]
+                prepared = db.pgconn.prepare(b"numeric_modifier_oracle", f"SELECT ({sql})".encode())
+                if prepared.status != psycopg.pq.ExecStatus.COMMAND_OK:
+                    raise ValueError(prepared.error_message.decode())
+                descriptor = db.pgconn.describe_prepared(b"numeric_modifier_oracle")
+                if descriptor.status != psycopg.pq.ExecStatus.COMMAND_OK:
+                    raise ValueError(descriptor.error_message.decode())
+                entry["prepared_typmod"] = descriptor.fmod(0)
+                db.execute("DEALLOCATE numeric_modifier_oracle")
             except psycopg.Error as error:
                 entry["error"] = error.sqlstate
             output["entries"].append(entry)
+        db.execute("CREATE TEMP TABLE things (age bigint)")
+        for sql in queries():
+            prepared = db.pgconn.prepare(b"numeric_modifier_oracle", sql.encode())
+            if prepared.status != psycopg.pq.ExecStatus.COMMAND_OK:
+                raise ValueError(prepared.error_message.decode())
+            descriptor = db.pgconn.describe_prepared(b"numeric_modifier_oracle")
+            if descriptor.status != psycopg.pq.ExecStatus.COMMAND_OK:
+                raise ValueError(descriptor.error_message.decode())
+            output["queries"].append({"sql": sql, "oid": descriptor.ftype(0), "modifier": descriptor.fmod(0)})
+            db.execute("DEALLOCATE numeric_modifier_oracle")
     if args.generate:
         print(json.dumps(output, indent=2))
     else:
         if output != json.loads(FIXTURE.read_text()):
             raise ValueError("PostgreSQL NUMERIC type-modifier oracle drift")
-        print(f"Verified {len(output['entries'])} PostgreSQL NUMERIC type modifiers")
+        print(f"Verified {len(output['entries'])} PostgreSQL NUMERIC type modifiers and {len(output['queries'])} query descriptors")
 
 
 if __name__ == "__main__":

@@ -461,6 +461,7 @@ export type {
   SQLArrayValue,
   SQLBuiltinType,
   SQLColumn,
+  SQLNumericModifier,
   SQLColumnType,
   SQLConnectionOpenRequest,
   SQLConnectionResponse,

@@ -45,7 +45,7 @@ pub fn bind(a: std.mem.Allocator, backend: catalog.Backend, scope: []const relat
     for (expressions, projections, programs, columns) |expression, projection, *program, *column| {
         program.* = try scalar.bindWithSettings(a, expression, slots, parameters, .{ .invocation = backend.parameter_invocation }, backend.settings_view);
         const field = if (std.mem.lastIndexOfScalar(u8, projection.field, 0)) |index| projection.field[index + 1 ..] else projection.field;
-        column.* = .{ .name = projection.alias orelse if (projection.expression == null) field else "?column?", .type = program.output_type.kind orelse .string, .element_type = program.output_type.element_type, .untyped_null = program.output_type.kind == null };
+        column.* = .{ .name = projection.alias orelse if (projection.expression == null) field else "?column?", .type = program.output_type.kind orelse .string, .element_type = program.output_type.element_type, .numeric_modifier = program.output_type.numeric_modifier, .untyped_null = program.output_type.kind == null };
     }
     return .{ .columns = columns, .programs = programs };
 }

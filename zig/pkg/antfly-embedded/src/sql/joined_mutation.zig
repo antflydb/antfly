@@ -184,7 +184,7 @@ pub fn bind(alloc: Allocator, backend: catalog.Backend, table: catalog.Table, co
             continue;
         }
         if (!deleting and table.storage_mode == .document and expression == null) continue;
-        const required: scalar.Type = .{ .kind = field.type, .element_type = field.element_type };
+        const required: scalar.Type = .{ .kind = field.type, .element_type = field.element_type, .numeric_modifier = field.numeric_modifier };
         try projections.append(alloc, .{ .expression = if (expression) |assigned| try scalar.assignmentExpression(alloc, assigned, required) else try column(alloc, alias, field.name) });
         try expected.append(alloc, required);
         try fields.append(alloc, field);
@@ -239,7 +239,7 @@ pub fn bind(alloc: Allocator, backend: catalog.Backend, table: catalog.Table, co
         {
             scope = relation.root.columns;
             const slots = try alloc.alloc(scalar.Column, scope.len);
-            for (scope, slots) |field, *slot| slot.* = .{ .name = field.internal, .type = field.type, .element_type = field.element_type };
+            for (scope, slots) |field, *slot| slot.* = .{ .name = field.internal, .type = field.type, .element_type = field.element_type, .numeric_modifier = field.numeric_modifier };
             const authorized_scope = scope;
             var required = try alloc.alloc(bool, scope.len);
             @memset(required, false);

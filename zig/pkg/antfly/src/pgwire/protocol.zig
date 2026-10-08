@@ -1467,7 +1467,7 @@ pub const Session = struct {
             try bytes.writer.writeInt(u16, 0, .big);
             try bytes.writer.writeInt(u32, try values.columnOid(column), .big);
             try bytes.writer.writeInt(i16, values.columnTypeSize(column), .big);
-            try bytes.writer.writeInt(i32, -1, .big);
+            try bytes.writer.writeInt(i32, try values.columnModifier(column), .big);
             try bytes.writer.writeInt(u16, formatAt(formats, index), .big);
         }
         try self.message('T', bytes.written());
@@ -1581,7 +1581,7 @@ fn cloneColumns(alloc: std.mem.Allocator, columns: []const backend.Column) ![]co
 }
 fn columnsEqual(a: []const backend.Column, b: []const backend.Column) bool {
     if (a.len != b.len) return false;
-    for (a, b) |left, right| if (left.type != right.type or left.element_type != right.element_type or !std.mem.eql(u8, left.name, right.name)) return false;
+    for (a, b) |left, right| if (left.type != right.type or left.element_type != right.element_type or !@import("antfly_local_sources").sql_scalar.NumericModifier.eql(left.numeric_modifier, right.numeric_modifier) or !std.mem.eql(u8, left.name, right.name)) return false;
     return true;
 }
 
@@ -1594,6 +1594,16 @@ test "pgwire result shape fences array element identity across prepared and curs
     try std.testing.expect(!columnsEqual(&int4, &int8));
     try std.testing.expect(!columnsEqual(&int4, &missing));
     try std.testing.expect(!columnsEqual(&int4, &json));
+}
+
+test "pgwire NUMERIC result identity fences precision scale and unconstrained results" {
+    const scalar = [_]backend.Column{.{ .name = "n", .type = .number, .element_type = .numeric, .numeric_modifier = .{ .precision = 4, .scale = 2 } }};
+    var changed = scalar;
+    changed[0].numeric_modifier.?.scale = 1;
+    try std.testing.expect(columnsEqual(&scalar, &scalar));
+    try std.testing.expect(!columnsEqual(&scalar, &changed));
+    changed[0].numeric_modifier = null;
+    try std.testing.expect(!columnsEqual(&scalar, &changed));
 }
 
 test "pgwire typed parameter failures retain actionable PostgreSQL SQLSTATEs" {

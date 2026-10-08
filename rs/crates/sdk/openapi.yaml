@@ -12074,8 +12074,8 @@ components:
           type: boolean
     SQLColumnType:
       type: string
-      description: Logical SQL result type. Integer values are decimal strings to preserve exact precision
-        in every client.
+      description: Logical SQL result type. Integer values and numbers with element_type numeric are decimal
+        strings to preserve exact precision in every client.
       enum:
         - string
         - uuid
@@ -12088,8 +12088,8 @@ components:
         - unknown
     SQLArrayElementType:
       type: string
-      description: Bound SQL array element type, including numeric widths. Never inferred from JSON value
-        shape.
+      description: Bound SQL scalar or array-element identity, including numeric widths and exact NUMERIC.
+        Never inferred from JSON value shape.
       enum:
         - text
         - int16
@@ -12100,6 +12100,7 @@ components:
         - boolean
         - uuid
         - jsonb
+        - numeric
     SQLArrayDimension:
       type: object
       additionalProperties: false
@@ -12129,7 +12130,11 @@ components:
 
         lengths. Empty arrays have no dimensions and no elements. Integer
 
-        elements are canonical decimal strings. Floating elements are JSON
+        elements are canonical decimal strings. Exact numeric elements are
+
+        decimal strings preserving display scale, or NaN, Infinity and -Infinity.
+
+        Floating elements are JSON
 
         numbers, or the strings NaN, Infinity and -Infinity. Element null flags
 
@@ -12168,8 +12173,12 @@ components:
           $ref: '#/components/schemas/SQLColumnType'
         element_type:
           $ref: '#/components/schemas/SQLArrayElementType'
-          description: Required for array columns; absent for other result types. The descriptor applies
-            even to NULL or empty arrays.
+          description: Required for array columns and exact NUMERIC number columns. Identifies scalar
+            widths when supplied. The descriptor applies even to NULL or empty arrays.
+        numeric_modifier:
+          $ref: '#/components/schemas/SQLNumericModifier'
+          description: Present only for constrained NUMERIC scalar or array results. Prepared result metadata
+            is stable before execution-time constant folding.
     SQLPrepareRequest:
       type: object
       additionalProperties: false
@@ -24973,6 +24982,23 @@ components:
             are applied as additional narrowing.
       required:
         - name
+    SQLNumericModifier:
+      type: object
+      additionalProperties: false
+      required:
+        - precision
+        - scale
+      description: PostgreSQL NUMERIC precision and signed scale. For arrays this describes every element,
+        not dimensions. Absent means unconstrained NUMERIC.
+      properties:
+        precision:
+          type: integer
+          minimum: 1
+          maximum: 1000
+        scale:
+          type: integer
+          minimum: -1000
+          maximum: 1000
     RerankerProvider:
       type: string
       enum:
@@ -27285,12 +27311,13 @@ components:
         - datetime
         - integer
         - number
+        - numeric
     SQLBuiltinType:
       type: string
       description: >
-        Exact PostgreSQL builtin identity for a relational root scalar column
+        Exact PostgreSQL builtin identity for a relational root scalar column.
 
-        or the element identity of a `sql_array` column.
+        SQL array columns use SQLArrayElementType for their element identity.
 
         Set the JSON Schema property's `x-antfly-sql-type` annotation to one of
 
@@ -27299,6 +27326,18 @@ components:
         is not implied by this annotation. Existing unannotated schemas retain
 
         their original domains.
+
+        The numeric identity uses an underlying number property and exact
+
+        PostgreSQL NUMERIC semantics, never binary float. Submit finite values
+
+        as JSON numeric lexemes or decimal strings; special values use strings
+
+        NaN, Infinity and -Infinity. Const/enum finite numeric members must be
+
+        JSON numbers, not strings. Bounds and multipleOf are exact decimals.
+
+        Public scalar NUMERIC schemas require reader capability version 22.
       enum:
         - text
         - int16
@@ -27309,6 +27348,7 @@ components:
         - boolean
         - uuid
         - jsonb
+        - numeric
     RelationalScalarExpression:
       type: object
       additionalProperties: false
@@ -27363,7 +27403,17 @@ components:
 
         the schema is compiled). Floating-to-integer casts round ties to even.
 
-        Only int16/int32/int64/float32/float64 identities are accepted here.
+        The numeric expression type uses exact PostgreSQL NUMERIC values and
+
+        may specify sql_type numeric. Its literals accept decimal strings or
+
+        exact JSON numeric lexemes, including string-valued special values.
+
+        Exact NUMERIC programs require reader capability version 21 even when
+
+        their result is boolean or integer. Float/integer assignment casts keep
+
+        their declared PostgreSQL rounding and overflow semantics.
 
         case_when takes alternating boolean conditions and result expressions,
 
@@ -27379,7 +27429,7 @@ components:
 
         operation requires schema capability version 18.
 
-        modulo takes two same-domain integer operands and returns the signed
+        modulo takes two same-domain integer or NUMERIC operands and returns the signed
 
         remainder (minInt modulo -1 is zero); a zero divisor rejects the write.
 
@@ -28205,7 +28255,7 @@ components:
           enum:
             - sql_array
         x-antfly-sql-type:
-          $ref: '#/components/schemas/SQLBuiltinType'
+          $ref: '#/components/schemas/SQLArrayElementType'
         nullable:
           type: boolean
           default: false

@@ -501,6 +501,52 @@ test "pgwire array row descriptions and data frames preserve binary text empty a
     }
 }
 
+test "pgwire NUMERIC row descriptions preserve scalar array and negative scale modifiers" {
+    const a = std.testing.allocator;
+    const columns = [_]backend.Column{
+        .{ .name = "n", .type = .number, .element_type = .numeric, .numeric_modifier = .{ .precision = 4, .scale = 2 } },
+        .{ .name = "items", .type = .array, .element_type = .numeric, .numeric_modifier = .{ .precision = 2, .scale = -3 } },
+    };
+    for ([_]bool{ true, false }) |simple| {
+        var input: std.Io.Writer.Allocating = .init(a);
+        defer input.deinit();
+        try startup(&input.writer);
+        if (simple) try frame(&input.writer, 'Q', "SELECT n, items\x00") else {
+            try parse(&input.writer, "q", "SELECT n, items", false);
+            try bind(&input.writer, "p", "q", null);
+            try frame(&input.writer, 'D', "Pp\x00");
+            try execute(&input.writer, "p", 0);
+            try frame(&input.writer, 'S', "");
+        }
+        try frame(&input.writer, 'X', "");
+        var mock: Mock = .{ .result_override = .{ .columns = &columns, .rows = &.{&.{ .null, .null }}, .sql_nulls = &.{&.{ true, true }}, .command_tag = "SELECT 1" } };
+        var output = try run(&mock, input.written(), .{});
+        defer output.deinit();
+        var messages: protocol.Cursor = .{ .bytes = output.written() };
+        var descriptions: usize = 0;
+        while (messages.offset < messages.bytes.len) {
+            const tag = try messages.int(u8);
+            const length = try messages.int(u32);
+            var payload: protocol.Cursor = .{ .bytes = try messages.take(length - 4) };
+            if (tag == 'E') return error.UnexpectedNumericProtocolError;
+            if (tag != 'T') continue;
+            descriptions += 1;
+            try std.testing.expectEqual(@as(u16, 2), try payload.int(u16));
+            for (columns, [_]u32{ 1700, 1231 }, [_]i32{ 262150, 133121 }) |column, oid, modifier| {
+                try std.testing.expectEqualStrings(column.name, try payload.string());
+                _ = try payload.take(6);
+                try std.testing.expectEqual(oid, try payload.int(u32));
+                try std.testing.expectEqual(@as(i16, -1), try payload.int(i16));
+                try std.testing.expectEqual(modifier, try payload.int(i32));
+                _ = try payload.int(u16);
+            }
+            try std.testing.expectEqual(payload.bytes.len, payload.offset);
+        }
+        try std.testing.expectEqual(@as(usize, 1), descriptions);
+    }
+    try std.testing.expectError(error.InvalidResult, @import("values.zig").columnModifier(.{ .name = "bad", .type = .string, .numeric_modifier = .{ .precision = 4, .scale = 2 } }));
+}
+
 test "pgwire frame admission reserves later headers and rejects wide rows before publication" {
     const a = std.testing.allocator;
     const sources = @import("antfly_local_sources");

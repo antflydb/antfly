@@ -24,6 +24,7 @@ pub const Column = struct {
     path: []const u8,
     type: ast.ColumnType,
     element_type: ?@import("array_value.zig").ElementType = null,
+    numeric_modifier: ?@import("../common/sql_builtin_type.zig").NumericModifier = null,
     nullable: bool = true,
     /// Native stored generated columns are readable but never SQL assignable.
     generated: bool = false,

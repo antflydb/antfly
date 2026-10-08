@@ -1562,6 +1562,12 @@ pub const SQLBuiltinType = enum {
     }
 };
 
+/// PostgreSQL NUMERIC precision and signed scale. For arrays this describes every element, not dimensions. Absent means unconstrained NUMERIC.
+pub const SQLNumericModifier = struct {
+    precision: i64,
+    scale: i64,
+};
+
 /// Schema definition for a table with multiple document types
 pub const TableSchema = struct {
     /// Backend-managed schema generation used for migrations. Omit it from create and update requests.

@@ -73,6 +73,21 @@ components:
         Public scalar NUMERIC schemas require reader capability version 22.
       enum: [text, int16, int32, int64, float32, float64, boolean, uuid, jsonb, numeric]
 
+    SQLNumericModifier:
+      type: object
+      additionalProperties: false
+      required: [precision, scale]
+      description: PostgreSQL NUMERIC precision and signed scale. For arrays this describes every element, not dimensions. Absent means unconstrained NUMERIC.
+      properties:
+        precision:
+          type: integer
+          minimum: 1
+          maximum: 1000
+        scale:
+          type: integer
+          minimum: -1000
+          maximum: 1000
+
     SQLArrayElementType:
       type: string
       description: Bound SQL scalar or array-element identity, including numeric widths and exact NUMERIC. Never inferred from JSON value shape.

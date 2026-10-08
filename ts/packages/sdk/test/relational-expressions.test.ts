@@ -14,6 +14,10 @@ describe("relational expression structural admission", () => {
     { op: "modulo", sql_type: "int32", args: [integer, integer] },
     { op: "in_list", args: [integer, integer] },
     { op: "not_in_list", args: [integer, integer] },
+    { op: "literal", type: "numeric", value: "9007199254740993.125" },
+    { op: "literal", type: "numeric", sql_type: "numeric", value: "NaN" },
+    { op: "cast", type: "numeric", sql_type: "numeric", args: [integer] },
+    { op: "add", sql_type: "numeric", args: [integer, integer] },
   ])("accepts server-supported $op expressions", (expression) => {
     expect(() => validate(expression)).not.toThrow();
   });
@@ -27,10 +31,22 @@ describe("relational expression structural admission", () => {
     { op: "in_list", args: [integer] },
     { op: "not_in_list", args: Array(33).fill(integer) },
     { ...integer, sql_type: "uuid" },
-    { op: "add", sql_type: "numeric", args: [integer, integer] },
+    { op: "literal", type: "number", sql_type: "numeric", value: 1 },
+    { op: "literal", type: "numeric", sql_type: "float64", value: "1" },
     { op: "coalesce", sql_type: "int32", args: [integer, integer] },
   ])("rejects malformed $op contracts before transport", (expression) => {
     expect(() => validate(expression)).toThrow(TypeError);
+  });
+
+  it("charges exact numeric literal bytes across the full expression budget", () => {
+    const budget = { nodes: 0, literalBytes: 4 * 1024 * 1024 - 2 };
+    expect(() =>
+      validateRelationalExpression(
+        { op: "literal", type: "numeric", value: "1.25" },
+        "expression",
+        budget
+      )
+    ).toThrow(/literal budget/);
   });
 });
 

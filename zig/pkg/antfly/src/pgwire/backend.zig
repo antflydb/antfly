@@ -24,6 +24,7 @@ pub const Column = struct {
     name: []const u8,
     type: Type,
     element_type: ?@import("antfly_local_sources").sql_array_value.ElementType = null,
+    numeric_modifier: ?@import("antfly_local_sources").sql_scalar.NumericModifier = null,
 };
 pub const TransactionStatus = enum(u8) { idle = 'I', in_transaction = 'T', failed = 'E' };
 

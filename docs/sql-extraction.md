@@ -5683,3 +5683,42 @@ allocator and reuse the same owned result; this is an allocation/work contract,
 not an end-to-end latency benchmark. The independent 46-case PostgreSQL oracle,
 inventory integrity, control-catalog consistency, formatting and whitespace
 checks pass without changing original case dispositions.
+
+### NUMERIC result identity across SQL, public clients and pgwire
+
+Result descriptors now carry an optional immutable precision/signed-scale pair
+for scalar NUMERIC and NUMERIC array elements. Catalog, scalar, aggregate,
+window, derived-table, CTE, VALUES, set, mutation and RETURNING bindings preserve
+that identity. PostgreSQL common-type rules retain a modifier only when every
+contributing expression has the same modifier; unknown NULL arms, arithmetic,
+unconstrained casts and ordinary numeric function outputs remove it. NULLIF
+preserves its first operand's modifier only when comparison coercion has not
+changed the result to a floating-point domain.
+
+The public OpenAPI contract owns SQLNumericModifier, with generated Go, Python,
+TypeScript and Zig descriptors. Pgwire emits PostgreSQL's modifier encoding for
+scalar and array RowDescription fields and fences prepared/cursor result identity
+when precision, scale or modifier presence changes. No per-row schema lookup or
+heap owner is added: the descriptor contains two bounded integer values.
+
+The independent disposable PostgreSQL 18 oracle now verifies 56 scalar cases
+and 12 query descriptors, including prepared versus optimized result metadata,
+negative scales, mixed NULL arms, derived scopes and mixed floating-point NULLIF.
+Public client round trips and simple/extended wire-frame tests cover the new
+contract. This completes result metadata, not durable modifier activation:
+DDL columns and schema-expression publication remain guarded until assignment,
+storage/restore validation and reader-capability fencing can enforce modifiers.
+The original parity dispositions remain unchanged at 929 unresolved cases.
+
+TypeScript's structural expression validator also admits the already activated
+exact NUMERIC literal/cast/arithmetic contract, retains incompatible-domain
+rejection, and charges decimal-string bytes against the shared literal budget.
+The SDK typecheck and 61 SQL/expression tests pass; Python's 36 SQL tests, Go's
+focused SQL transport/descriptor tests and generated-client consistency pass.
+
+Final validation: `zig build sql-test pgwire-test check-openapi` passes 595 local
+SQL tests (three existing skips), 226 server SQL tests and the wire/OpenAPI gates.
+The focused API owner executes the generated NUMERIC descriptor regression.
+The full TypeScript SDK suite passes 433 tests with one skip. Inventory integrity,
+control-catalog consistency, Rust-spec synchronization, formatting and whitespace
+checks pass. No original unsupported cases were reclassified by these checks.

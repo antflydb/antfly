@@ -68,8 +68,8 @@ pub fn bind(alloc: std.mem.Allocator, backend: catalog.Backend, table: catalog.T
     const columns = try alloc.alloc(scalar.Column, count * 3 + clause.capture_count);
     for (0..count) |i| {
         const column = if (i == table.columns.len) try table.column("_id") else table.columns[i];
-        columns[i] = .{ .name = column.name, .type = column.type, .element_type = column.element_type, .nullable = column.nullable };
-        columns[count + i] = .{ .name = try std.fmt.allocPrint(alloc, "{s}\x00{s}", .{ name.table, column.name }), .type = column.type, .element_type = column.element_type, .nullable = column.nullable };
+        columns[i] = .{ .name = column.name, .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .nullable = column.nullable };
+        columns[count + i] = .{ .name = try std.fmt.allocPrint(alloc, "{s}\x00{s}", .{ name.table, column.name }), .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .nullable = column.nullable };
         if (!aliased) {
             const scope = table.scope orelse if (name.namespace) |namespace| catalog.Table.Scope{ .database = name.database orelse "", .namespace = namespace, .name = name.table, .revision = 0 } else null;
             if (scope) |logical| {
@@ -79,10 +79,10 @@ pub fn bind(alloc: std.mem.Allocator, backend: catalog.Backend, table: catalog.T
                 columns[count + i].aliases = aliases;
             }
         }
-        columns[count * 2 + i] = .{ .name = try std.fmt.allocPrint(alloc, "excluded\x00{s}", .{column.name}), .type = column.type, .element_type = column.element_type, .nullable = column.nullable };
+        columns[count * 2 + i] = .{ .name = try std.fmt.allocPrint(alloc, "excluded\x00{s}", .{column.name}), .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .nullable = column.nullable };
     }
     for (columns[count * 3 ..], capture_types, 0..) |*column, descriptor, ordinal| {
-        column.* = .{ .name = try std.fmt.allocPrint(alloc, "$conflict_capture_{d}", .{ordinal}), .type = descriptor.kind orelse return error.InvalidSqlBackendResponse, .element_type = descriptor.element_type, .nullable = true };
+        column.* = .{ .name = try std.fmt.allocPrint(alloc, "$conflict_capture_{d}", .{ordinal}), .type = descriptor.kind orelse return error.InvalidSqlBackendResponse, .element_type = descriptor.element_type, .numeric_modifier = descriptor.numeric_modifier, .nullable = true };
     }
     var pass: usize = 0;
     const column_assignments = try alloc.alloc(?usize, table.columns.len);
@@ -109,7 +109,7 @@ pub fn bind(alloc: std.mem.Allocator, backend: catalog.Backend, table: catalog.T
                 if (ordinal + assignment.capture_span > clause.capture_count) return error.InvalidSqlBackendResponse;
                 if (assignment.capture_expression == null) continue;
             }
-            const expected: scalar.Type = .{ .kind = column.type, .element_type = column.element_type };
+            const expected: scalar.Type = .{ .kind = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier };
             const root = try scalar.assignmentExpression(alloc, assignment.capture_expression orelse expression, expected);
             changed = (if (backend.parameter_invocation) |owner|
                 try owner.infer(alloc, root, columns, parameters, expected, .{ .assignment = true })
@@ -147,7 +147,7 @@ pub fn bind(alloc: std.mem.Allocator, backend: catalog.Backend, table: catalog.T
             program.* = null;
         } else {
             const column = try table.column(assignment.field);
-            const expected: scalar.Type = .{ .kind = column.type, .element_type = column.element_type };
+            const expected: scalar.Type = .{ .kind = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier };
             const root = try scalar.assignmentExpression(alloc, assignment.capture_expression orelse assignment.expression.?, expected);
             program.* = if (backend.parameter_invocation) |owner|
                 try scalar.bindTypedExpectedWithSettings(alloc, root, columns, owner.descriptors, expected, .{ .invocation = owner, .assignment = true }, backend.settings_view)

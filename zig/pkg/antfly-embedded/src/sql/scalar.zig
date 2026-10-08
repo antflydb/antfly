@@ -93,12 +93,14 @@ pub const NumericJsonText = struct {
 const arrays = @import("array_value.zig");
 const builtin_cast = @import("builtin_cast.zig");
 const regex_functions = @import("regex_functions.zig");
+pub const NumericModifier = @import("../common/sql_builtin_type.zig").NumericModifier;
 pub const Type = struct { kind: ?ast.ColumnType = null, nullable: bool = true, element_type: ?arrays.ElementType = null, numeric_modifier: ?@import("../common/sql_builtin_type.zig").NumericModifier = null };
 pub const Column = struct {
     name: []const u8,
     type: ast.ColumnType,
     nullable: bool = true,
     element_type: ?arrays.ElementType = null,
+    numeric_modifier: ?@import("../common/sql_builtin_type.zig").NumericModifier = null,
     /// Authorized alternate spellings share one cell/dependency ordinal.
     /// They are binding metadata, never additional physical row values.
     aliases: []const []const u8 = &.{},
@@ -410,6 +412,10 @@ pub fn inferTypedParametersExpected(alloc: Allocator, expression: *const ast.Sca
 }
 
 pub fn validateParameterType(descriptor: Type) !void {
+    if (descriptor.numeric_modifier) |modifier| {
+        if ((descriptor.kind != .number and descriptor.kind != .array) or descriptor.element_type != .numeric) return error.InvalidSqlParameters;
+        modifier.validate() catch return error.InvalidSqlParameters;
+    }
     if (descriptor.kind == null) {
         if (descriptor.element_type != null) return error.InvalidSqlParameters;
         return;
@@ -787,8 +793,8 @@ test "SQL predicate modifiers use bounded zero-allocation parameter evaluation a
 
 test "SQL NUMERIC modifiers match PostgreSQL rounding overflow arrays and lazy execution" {
     const a = std.testing.allocator;
-    const Entry = struct { sql: []const u8, expected: ?[]const u8 = null, @"error": ?[]const u8 = null, oid: ?u32 = null, typmod: ?i32 = null };
-    const fixture = try std.json.parseFromSlice(struct { reference: []const u8, entries: []const Entry }, a, @embedFile("fixtures/sql_numeric_typmod_reference.json"), .{});
+    const Entry = struct { sql: []const u8, expected: ?[]const u8 = null, @"error": ?[]const u8 = null, oid: ?u32 = null, typmod: ?i32 = null, prepared_typmod: ?i32 = null };
+    const fixture = try std.json.parseFromSlice(struct { reference: []const u8, entries: []const Entry, queries: Json = .null }, a, @embedFile("fixtures/sql_numeric_typmod_reference.json"), .{});
     defer fixture.deinit();
     for (fixture.value.entries) |entry| {
         errdefer std.debug.print("NUMERIC modifier fixture: {s}\n", .{entry.sql});
@@ -810,6 +816,7 @@ test "SQL NUMERIC modifiers match PostgreSQL rounding overflow arrays and lazy e
         };
         try std.testing.expect(entry.@"error" == null);
         try std.testing.expectEqual(arrays.ElementType.numeric, program.output_type.element_type.?);
+        try std.testing.expectEqual(entry.prepared_typmod.?, if (program.output_type.numeric_modifier) |m| try m.postgres() else @as(i32, -1));
         try std.testing.expectEqual(@as(u32, if (program.output_type.kind == .array) 1231 else 1700), entry.oid.?);
         if (compiled.expression.* == .cast) {
             const modifier = program.output_type.numeric_modifier;
@@ -1741,6 +1748,15 @@ const Binder = struct {
     allow_unresolved: bool = false,
     settings: ?*const setting_catalog.View = null,
 
+    fn commonModifier(self: *Binder, args: []const *const ast.Scalar, depth: usize) !?@import("../common/sql_builtin_type.zig").NumericModifier {
+        if (args.len == 0) return null;
+        const first = (try self.infer(args[0], depth + 1)).numeric_modifier orelse return null;
+        for (args[1..]) |arg| {
+            if (!@import("../common/sql_builtin_type.zig").NumericModifier.eql(first, (try self.infer(arg, depth + 1)).numeric_modifier)) return null;
+        }
+        return first;
+    }
+
     /// PostgreSQL anycompatiblearray/anycompatible resolution is distinct
     /// from the exact anyarray identity used by equality operators. Unknown
     /// literal strings adopt the known domain; typed text never does so.
@@ -1808,8 +1824,12 @@ const Binder = struct {
             } else literalType(value),
             .column => |name| blk: {
                 const column = self.columns[self.names.get(name) orelse return error.UnknownColumn];
+                if (column.numeric_modifier) |modifier| {
+                    if ((column.type != .number and column.type != .array) or column.element_type != .numeric) return error.InvalidSqlProgram;
+                    try modifier.validate();
+                }
                 if (column.type == .array and column.element_type == null) return error.InvalidSqlProgram;
-                break :blk .{ .kind = column.type, .nullable = column.nullable, .element_type = column.element_type orelse (if (column.type == .integer) arrays.ElementType.int64 else if (column.type == .number) arrays.ElementType.float64 else null) };
+                break :blk .{ .kind = column.type, .nullable = column.nullable, .element_type = column.element_type orelse (if (column.type == .integer) arrays.ElementType.int64 else if (column.type == .number) arrays.ElementType.float64 else null), .numeric_modifier = column.numeric_modifier };
             },
             .cast => |cast| blk: {
                 if (cast.type == .array and cast.element_type == null) return error.InvalidSqlProgram;
@@ -1844,7 +1864,9 @@ const Binder = struct {
                 switch (unary.op) {
                     .positive, .negative => {
                         if (input.kind != null and !numeric(input.kind)) return error.SqlTypeMismatch;
-                        break :blk input;
+                        var output = input;
+                        output.numeric_modifier = null;
+                        break :blk output;
                     },
                     .not, .is_true, .is_not_true, .is_false, .is_not_false, .is_unknown, .is_not_unknown => if (input.kind != null and input.kind != .boolean) return error.SqlTypeMismatch,
                     else => {},
@@ -1944,7 +1966,7 @@ const Binder = struct {
                         element = common(element, actual) catch |err| return if (err == error.SqlTypeMismatch) (if (element.kind == .array and actual.kind == .array) error.SqlCannotCoerce else error.SqlArrayConstructorTypeMismatch) else err;
                     }
                     if (element.kind == null and unknown_text) element.kind = .string;
-                    if (element.kind == .array) break :blk .{ .kind = .array, .nullable = false, .element_type = element.element_type };
+                    if (element.kind == .array) break :blk .{ .kind = .array, .nullable = false, .element_type = element.element_type, .numeric_modifier = try self.commonModifier(call.args, depth) };
                     var kind = try arrayElementType(element.kind orelse .string);
                     if (element.kind == .number and element.element_type != null) kind = element.element_type.?;
                     if (element.kind == .integer) {
@@ -1957,7 +1979,7 @@ const Binder = struct {
                             if (width == .int64 or (width == .int32 and kind == .int16)) kind = width;
                         }
                     }
-                    break :blk .{ .kind = .array, .nullable = false, .element_type = kind };
+                    break :blk .{ .kind = .array, .nullable = false, .element_type = kind, .numeric_modifier = try self.commonModifier(call.args, depth) };
                 }
                 if (function == .@"$array_quantified" or function == .cardinality or function == .array_ndims or function == .array_length or function == .array_lower or function == .array_upper) {
                     const array_index: usize = if (function == .@"$array_quantified") 1 else 0;
@@ -2118,16 +2140,27 @@ const Binder = struct {
                     .date_trunc, .to_timestamp => .datetime,
                     .coalesce, .nullif, .greatest, .least, .abs, .ceil, .floor, .round, .trunc, .sign, .mod, .@"$single" => merged.kind,
                     else => .string,
+                }, .numeric_modifier = switch (function) {
+                    .coalesce, .greatest, .least => try self.commonModifier(call.args, depth),
+                    .nullif, .@"$single" => if (merged.element_type == .numeric)
+                        (try self.infer(call.args[0], depth + 1)).numeric_modifier
+                    else
+                        null,
+                    else => null,
                 }, .nullable = function != .concat and function != .jsonb_build_object };
             },
             .case_when => |case| blk: {
                 var merged: Type = if (case.otherwise) |other| try self.infer(other, depth + 1) else .{};
+                var modifier = merged.numeric_modifier;
                 for (case.branches) |branch| {
                     const condition = try self.infer(branch.condition, depth + 1);
                     if (condition.kind != null and condition.kind != .boolean) return error.SqlTypeMismatch;
-                    merged = try common(merged, try self.infer(branch.value, depth + 1));
+                    const actual = try self.infer(branch.value, depth + 1);
+                    if (!@import("../common/sql_builtin_type.zig").NumericModifier.eql(modifier, actual.numeric_modifier)) modifier = null;
+                    merged = try common(merged, actual);
                 }
                 if (merged.kind == null) merged.kind = .string;
+                merged.numeric_modifier = modifier;
                 break :blk merged;
             },
             .in_list => |list| blk: {

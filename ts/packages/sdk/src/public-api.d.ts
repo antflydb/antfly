@@ -4523,6 +4523,8 @@ export interface components {
             type: components["schemas"]["SQLColumnType"];
             /** @description Required for array columns and exact NUMERIC number columns. Identifies scalar widths when supplied. The descriptor applies even to NULL or empty arrays. */
             element_type?: components["schemas"]["SQLArrayElementType"];
+            /** @description Present only for constrained NUMERIC scalar or array results. Prepared result metadata is stable before execution-time constant folding. */
+            numeric_modifier?: components["schemas"]["SQLNumericModifier"];
         };
         SQLPrepareRequest: {
             statement: string;
@@ -12309,6 +12311,11 @@ export interface components {
             row_filter?: {
                 [key: string]: unknown;
             } | null;
+        };
+        /** @description PostgreSQL NUMERIC precision and signed scale. For arrays this describes every element, not dimensions. Absent means unconstrained NUMERIC. */
+        SQLNumericModifier: {
+            precision: number;
+            scale: number;
         };
         /**
          * @description The reranking provider to use.

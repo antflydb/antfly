@@ -52,6 +52,7 @@ const types: Record<RelationalExpressionType, true> = {
   datetime: true,
   integer: true,
   number: true,
+  numeric: true,
 };
 const typeNames = new Set(Object.keys(types));
 
@@ -98,10 +99,15 @@ export function validateRelationalExpression(
     if (node.sql_type !== undefined) {
       const integer = typeof node.sql_type === "string" && integerIdentities.has(node.sql_type);
       const floating = typeof node.sql_type === "string" && floatIdentities.has(node.sql_type);
+      const exact = node.sql_type === "numeric";
       if (
-        (!integer && !floating) ||
+        (!integer && !floating && !exact) ||
         ((op === "literal" || op === "cast") &&
-          !((node.type === "integer" && integer) || (node.type === "number" && floating)))
+          !(
+            (node.type === "integer" && integer) ||
+            (node.type === "number" && floating) ||
+            (node.type === "numeric" && exact)
+          ))
       )
         throw new TypeError(`${location}.sql_type must match a supported numeric builtin identity`);
     }
@@ -137,7 +143,7 @@ export function validateRelationalExpression(
         } else {
           if (node.value.length > maxBytes)
             throw new TypeError(`${location}.value exceeds the literal budget`);
-          if (node.type === "string") literalBytes = new TextEncoder().encode(node.value).length;
+          literalBytes = new TextEncoder().encode(node.value).length;
         }
         if (literalBytes > maxBytes)
           throw new TypeError(`${location}.value exceeds the literal budget`);

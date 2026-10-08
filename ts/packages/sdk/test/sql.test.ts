@@ -14,16 +14,40 @@
 
 import { afterEach, describe, expect, expectTypeOf, it, vi } from "vitest";
 import { AntflyClient, SQLExecutionError } from "../src/client.js";
-import type { RelationalScalarExpression, SQLBuiltinType, SQLArrayColumnSchema, SQLArrayElementType } from "../src/index.js";
-import type { SQLPreparedResponse } from "../src/types.js";
+import type {
+  RelationalScalarExpression,
+  SQLBuiltinType,
+  SQLArrayColumnSchema,
+  SQLArrayElementType,
+} from "../src/index.js";
+import type { SQLPreparedResponse, SQLColumn, SQLNumericModifier } from "../src/index.js";
+
+it("exports generated NUMERIC scalar and array result modifiers", () => {
+  const modifier: SQLNumericModifier = { precision: 2, scale: -3 };
+  for (const type of ["number", "array"] as const) {
+    const column: SQLColumn = {
+      name: "n",
+      type,
+      element_type: "numeric",
+      numeric_modifier: modifier,
+    };
+    expect(JSON.parse(JSON.stringify(column)).numeric_modifier).toEqual(modifier);
+  }
+});
 
 it("exports exact NUMERIC schema and expression identities without rounding literal text", () => {
   const kind: SQLBuiltinType = "numeric";
   const expression: RelationalScalarExpression = {
-    op: "literal", type: "numeric", sql_type: kind, value: "9007199254740993.2500",
+    op: "literal",
+    type: "numeric",
+    sql_type: kind,
+    value: "9007199254740993.2500",
   };
   expect(JSON.parse(JSON.stringify(expression))).toEqual({
-    op: "literal", type: "numeric", sql_type: "numeric", value: "9007199254740993.2500",
+    op: "literal",
+    type: "numeric",
+    sql_type: "numeric",
+    value: "9007199254740993.2500",
   });
 });
 

@@ -68,6 +68,12 @@ pub fn columnOid(column: Column) !u32 {
     return oid(column.type);
 }
 
+pub fn columnModifier(column: Column) !i32 {
+    const modifier = column.numeric_modifier orelse return -1;
+    if ((column.type != .number and column.type != .array) or column.element_type != .numeric) return error.InvalidResult;
+    return modifier.postgres() catch return error.InvalidResult;
+}
+
 pub fn columnTypeSize(column: Column) i16 {
     return if (column.element_type == .numeric) -1 else typeSize(column.type);
 }

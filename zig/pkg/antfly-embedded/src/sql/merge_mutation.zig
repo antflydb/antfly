@@ -561,7 +561,7 @@ fn bindArms(alloc: Allocator, backend: catalog.Backend, target: catalog.Table, s
     if (relation.statement.columns.len != input.columns.len) return error.InvalidSqlBackendResponse;
     const columns = try alloc.alloc(scalar.Column, input.columns.len);
     for (relation.statement.columns, input.columns, columns, 0..) |projection, output, *column, index| {
-        column.* = .{ .name = if (projection.field.len != 0) projection.field else try std.fmt.allocPrint(alloc, "\x00merge_null_{d}", .{index}), .type = output.type, .element_type = output.element_type };
+        column.* = .{ .name = if (projection.field.len != 0) projection.field else try std.fmt.allocPrint(alloc, "\x00merge_null_{d}", .{index}), .type = output.type, .element_type = output.element_type, .numeric_modifier = output.numeric_modifier };
     }
     const unbound = try alloc.alloc(UnboundArm, statement.arms.len);
     for (statement.arms, unbound) |arm, *out| {
@@ -577,7 +577,7 @@ fn bindArms(alloc: Allocator, backend: catalog.Backend, target: catalog.Table, s
                         break :literal node;
                     };
                     const field = try target.column(assignment.field);
-                    value.* = .{ .column = field, .value = if (expression) |node| try scalar.assignmentExpression(alloc, try relation_binding.lowerBoundExpression(alloc, relation.root.columns, node), .{ .kind = field.type, .element_type = field.element_type }) else null };
+                    value.* = .{ .column = field, .value = if (expression) |node| try scalar.assignmentExpression(alloc, try relation_binding.lowerBoundExpression(alloc, relation.root.columns, node), .{ .kind = field.type, .element_type = field.element_type, .numeric_modifier = field.numeric_modifier }) else null };
                 }
                 break :blk .{ .update = values };
             },
@@ -585,7 +585,7 @@ fn bindArms(alloc: Allocator, backend: catalog.Backend, target: catalog.Table, s
                 const values = try alloc.alloc(Expression, insert.values.len);
                 for (insert.columns, insert.values, values) |name, expression, *value| {
                     const field = try target.column(name);
-                    value.* = .{ .column = field, .value = if (expression) |node| try scalar.assignmentExpression(alloc, try relation_binding.lowerBoundExpression(alloc, relation.root.columns, node), .{ .kind = field.type, .element_type = field.element_type }) else null };
+                    value.* = .{ .column = field, .value = if (expression) |node| try scalar.assignmentExpression(alloc, try relation_binding.lowerBoundExpression(alloc, relation.root.columns, node), .{ .kind = field.type, .element_type = field.element_type, .numeric_modifier = field.numeric_modifier }) else null };
                 }
                 break :blk .{ .insert = values };
             },
@@ -609,7 +609,7 @@ fn bindArms(alloc: Allocator, backend: catalog.Backend, target: catalog.Table, s
                 .delete, .nothing => &.{},
             };
             for (values) |value| if (value.value) |expression| {
-                const expected: scalar.Type = .{ .kind = value.column.type, .element_type = value.column.element_type };
+                const expected: scalar.Type = .{ .kind = value.column.type, .element_type = value.column.element_type, .numeric_modifier = value.column.numeric_modifier };
                 changed = (if (backend.parameter_invocation) |owner|
                     try owner.infer(alloc, expression, columns, parameters, expected, .{ .assignment = true })
                 else if (value.column.type == .array and parameters.len == 0)
@@ -630,7 +630,7 @@ fn bindArms(alloc: Allocator, backend: catalog.Backend, target: catalog.Table, s
                 for (values, assignments) |value, *assignment| assignment.* = .{
                     .column = value.column,
                     .program = if (value.value) |expression| bound_program: {
-                        const expected: scalar.Type = .{ .kind = value.column.type, .element_type = value.column.element_type };
+                        const expected: scalar.Type = .{ .kind = value.column.type, .element_type = value.column.element_type, .numeric_modifier = value.column.numeric_modifier };
                         break :bound_program if (backend.parameter_invocation) |owner|
                             try scalar.bindTypedExpectedWithSettings(alloc, expression, columns, owner.descriptors, expected, .{ .invocation = owner, .assignment = true }, backend.settings_view)
                         else if (value.column.type == .array and parameters.len == 0)
@@ -653,7 +653,7 @@ fn bindReturning(alloc: Allocator, backend: catalog.Backend, statement: ast.Merg
     const requested = statement.returning orelse return error.InvalidSqlBackendResponse;
     const scalar_columns = try alloc.alloc(scalar.Column, input.columns.len);
     for (relation.statement.columns, input.columns, scalar_columns, 0..) |projection, column, *out, index| {
-        out.* = .{ .name = if (projection.field.len != 0) projection.field else try std.fmt.allocPrint(alloc, "\x00merge_null_{d}", .{index}), .type = column.type, .element_type = column.element_type };
+        out.* = .{ .name = if (projection.field.len != 0) projection.field else try std.fmt.allocPrint(alloc, "\x00merge_null_{d}", .{index}), .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier };
     }
     return @import("mutation_returning.zig").bind(alloc, backend, relation.root.columns, scalar_columns, requested, statement.alias orelse statement.table.table, parameters);
 }
@@ -1113,7 +1113,7 @@ fn appendCandidate(alloc: Allocator, bound: Candidates, plan: PointPlan, source_
     };
     if (target) |row| for (plan.target_fields, values, bound.input.columns) |field, *value, column| if (field) |name| {
         const cell = try joined_mutation.cell(alloc, row, name);
-        value.* = try @import("document_row.zig").declaredCell(alloc, .{ .name = name, .path = name, .type = column.type, .element_type = column.element_type }, cell);
+        value.* = try @import("document_row.zig").declaredCell(alloc, .{ .name = name, .path = name, .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier }, cell);
     };
     try Capture.append(capture, values);
 }

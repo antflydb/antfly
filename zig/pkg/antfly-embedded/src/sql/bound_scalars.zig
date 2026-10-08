@@ -387,7 +387,7 @@ fn bindDescriptorsWithInvocation(alloc: Allocator, table: ?catalog.Table, statem
         else => false,
     };
     const columns = try alloc.alloc(scalar.Column, table_columns.len + @intFromBool(table != null));
-    for (table_columns, columns[0..table_columns.len]) |column, *out| out.* = .{ .name = column.name, .type = column.type, .element_type = column.element_type, .nullable = column.nullable, .aliases = if (qualified_names) try table.?.columnAliases(alloc, column.name) else &.{} };
+    for (table_columns, columns[0..table_columns.len]) |column, *out| out.* = .{ .name = column.name, .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .nullable = column.nullable, .aliases = if (qualified_names) try table.?.columnAliases(alloc, column.name) else &.{} };
     if (table != null) columns[table_columns.len] = .{ .name = "_id", .type = .string, .nullable = false, .aliases = if (qualified_names) try table.?.columnAliases(alloc, "_id") else &.{} };
     var builder: Builder = .{ .alloc = alloc, .table = table, .columns = columns, .parameters = parameters, .settings = settings, .fallbacks = fallbacks, .typed_parameters = typed_parameters, .invocation = invocation };
     var out: Bound = .{ .columns = columns, .typed_parameters = typed_parameters, .invocation = invocation };
@@ -641,11 +641,11 @@ const Builder = struct {
 
     fn assignmentNode(self: *Builder, expression: ?*const ast.Scalar, literal: ast.Value, column: catalog.Column) !*const ast.Scalar {
         const node_ = expression orelse try self.node(.{ .literal = literal });
-        return scalar.assignmentExpression(self.alloc, node_, .{ .kind = column.type, .element_type = column.element_type });
+        return scalar.assignmentExpression(self.alloc, node_, .{ .kind = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier });
     }
 
     fn inferAssignment(self: *Builder, expression: *const ast.Scalar, column: catalog.Column) !bool {
-        var expected: scalar.Type = .{ .kind = column.type, .element_type = column.element_type };
+        var expected: scalar.Type = .{ .kind = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier };
         if (self.typed_parameters and expected.kind != .datetime and expected.element_type == null) expected.element_type = try scalar.parameterElementType(expected);
         if (self.typed_parameters and expression.* == .literal and expression.literal == .parameter) {
             const index = expression.literal.parameter;
@@ -658,7 +658,7 @@ const Builder = struct {
     }
 
     fn assignmentProgram(self: *Builder, expression: *const ast.Scalar, column: catalog.Column) !scalar.Program {
-        const program_ = try self.programType(expression, .{ .kind = column.type, .element_type = column.element_type }, true);
+        const program_ = try self.programType(expression, .{ .kind = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier }, true);
         if (program_.output_type.kind != null and program_.output_type.kind != column.type and !(program_.output_type.kind == .integer and column.type == .number)) return error.SqlAssignmentTypeMismatch;
         return program_;
     }

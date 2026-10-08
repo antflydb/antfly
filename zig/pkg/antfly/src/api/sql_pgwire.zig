@@ -33,6 +33,18 @@ const io_abi = @import("antfly_runtime_abi").io_abi;
 const Mac = std.crypto.auth.hmac.sha2.HmacSha256;
 const credential_domain = "antfly.pgwire.password-session.v1";
 
+test "SQL NUMERIC public result descriptors parse through generated OpenAPI contracts" {
+    const a = std.testing.allocator;
+    for ([_]ast.ColumnType{ .number, .array }) |kind| {
+        const encoded = try std.json.Stringify.valueAlloc(a, describe_sql.Column{ .name = "n", .type = kind, .element_type = .numeric, .numeric_modifier = .{ .precision = 2, .scale = -3 } }, .{});
+        defer a.free(encoded);
+        const parsed = try std.json.parseFromSlice(@import("antfly_metadata_openapi").SQLColumn, a, encoded, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(@as(i64, 2), parsed.value.numeric_modifier.?.precision);
+        try std.testing.expectEqual(@as(i64, -3), parsed.value.numeric_modifier.?.scale);
+    }
+}
+
 /// Stable API-owned callback and listener storage. Shutdown joins all native
 /// work before releasing the adapter, user manager, or backend runtime.
 pub const Listener = struct {
@@ -444,7 +456,7 @@ const OwnedRead = struct {
         }
         self.policies = policies;
         const columns = try arena.alloc(wire.Column, self.stream.context.binding.columns.len);
-        for (columns, self.stream.context.binding.columns) |*out, column| out.* = .{ .name = try arena.dupe(u8, column.name), .type = try wireType(column.type), .element_type = column.element_type };
+        for (columns, self.stream.context.binding.columns) |*out, column| out.* = .{ .name = try arena.dupe(u8, column.name), .type = try wireType(column.type), .element_type = column.element_type, .numeric_modifier = column.numeric_modifier };
         self.columns = columns;
         self.plan = plan;
         self.admission = admission;
@@ -834,7 +846,7 @@ const Job = struct {
             var description = try describe_sql.describe(self.alloc, describe_backend, compiled, hints);
             defer description.deinit();
             const columns = try self.alloc.alloc(wire.Column, description.binding.columns.len);
-            for (columns, description.binding.columns) |*out, column| out.* = .{ .name = try self.alloc.dupe(u8, column.name), .type = try wireType(column.type), .element_type = column.element_type };
+            for (columns, description.binding.columns) |*out, column| out.* = .{ .name = try self.alloc.dupe(u8, column.name), .type = try wireType(column.type), .element_type = column.element_type, .numeric_modifier = column.numeric_modifier };
             const parameter_types = try self.alloc.alloc(wire.Type, description.binding.parameter_types.len);
             for (parameter_types, description.binding.parameter_types) |*out, kind| out.* = if (kind) |value| try wireType(value) else .unknown;
             self.description = .{
@@ -878,7 +890,7 @@ const Job = struct {
             }
         };
         const columns = try self.alloc.alloc(wire.Column, result.output.columns.len);
-        for (columns, result.output.columns) |*out, column| out.* = .{ .name = column.name, .type = try wireType(column.type), .element_type = column.element_type };
+        for (columns, result.output.columns) |*out, column| out.* = .{ .name = column.name, .type = try wireType(column.type), .element_type = column.element_type, .numeric_modifier = column.numeric_modifier };
         self.result = .{
             .columns = columns,
             .rows = result.output.rows,
