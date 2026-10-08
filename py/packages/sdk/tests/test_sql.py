@@ -23,12 +23,12 @@ import pytest
 from antfly import (
     AntflyClient,
     AntflyException,
+    RelationalScalarExpression,
     SQLArrayColumnSchema,
     SQLArrayColumnSchemaType,
     SQLArrayElementType,
     SQLArrayValue,
     SQLBuiltinType,
-    RelationalScalarExpression,
     SQLColumn,
     SQLExecutionError,
     SQLPreparedExecutionRequest,
@@ -70,6 +70,18 @@ def test_numeric_scalar_and_array_result_modifiers_round_trip():
         assert column.numeric_modifier.precision == 2
         assert column.numeric_modifier.scale == -3
         assert column.to_dict() == source
+
+
+@pytest.mark.parametrize("modifier", [None, {"precision": 2, "scale": -3}, {"precision": 2, "scale": 4}])
+def test_numeric_array_schema_preserves_optional_modifier(modifier):
+    source = {"type": "sql_array", "x-antfly-sql-type": "numeric"}
+    if modifier is not None:
+        source["x-antfly-sql-numeric-modifier"] = modifier
+    column = SQLArrayColumnSchema.from_dict(source)
+    assert column.to_dict() == source
+    if modifier is not None:
+        assert column.x_antfly_sql_numeric_modifier.precision == modifier["precision"]
+        assert column.x_antfly_sql_numeric_modifier.scale == modifier["scale"]
 
 
 def test_array_result_models_preserve_exact_values_dimensions_and_null_flags():

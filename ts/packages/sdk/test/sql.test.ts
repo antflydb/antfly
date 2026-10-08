@@ -70,6 +70,21 @@ it.each([
   });
 });
 
+it.each([
+  undefined,
+  { precision: 2, scale: -3 },
+  { precision: 2, scale: 4 },
+])("preserves optional NUMERIC array modifier %j", (modifier) => {
+  const schema: SQLArrayColumnSchema = {
+    type: "sql_array",
+    "x-antfly-sql-type": "numeric",
+    "x-antfly-sql-numeric-modifier": modifier,
+  };
+  const encoded = JSON.parse(JSON.stringify(schema));
+  expect(encoded["x-antfly-sql-numeric-modifier"]).toEqual(modifier);
+  expect(Object.hasOwn(encoded, "x-antfly-sql-numeric-modifier")).toBe(modifier !== undefined);
+});
+
 afterEach(() => vi.unstubAllGlobals());
 
 it("preserves exact NUMERIC decimal text, display scale, SQL NULL and specials", async () => {

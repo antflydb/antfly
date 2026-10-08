@@ -67,7 +67,7 @@ pub fn lowerTyped(alloc: std.mem.Allocator, schema: Json, expression: *const ast
     var columns = std.ArrayList(scalar.Column).empty;
     for (properties.object.keys(), properties.object.values()) |name, property| {
         const column = try @import("schema_columns.zig").column(name, property);
-        try columns.append(alloc, .{ .name = name, .type = column.type, .element_type = column.element_type });
+        try columns.append(alloc, .{ .name = name, .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier });
     }
     return lowerColumns(alloc, columns.items, expression, expected);
 }

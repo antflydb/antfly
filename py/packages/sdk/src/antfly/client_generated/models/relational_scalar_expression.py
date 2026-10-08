@@ -83,6 +83,12 @@ class RelationalScalarExpression:
                 NaN, Infinity and -Infinity. Const/enum finite numeric members must be
                 JSON numbers, not strings. Bounds and multipleOf are exact decimals.
                 Public scalar NUMERIC schemas require reader capability version 22.
+                To constrain a NUMERIC scalar or SQL-array column, set the root
+                property's `x-antfly-sql-numeric-modifier` annotation to an object with
+                precision (1..1000) and signed scale (-1000..1000). The annotation
+                requires numeric identity and reader capability version 23. Assignment
+                rounds before constraints, indexes and generated dependents; overflow
+                rejects the write. Restore verifies stored values without rounding.
             numeric_modifier (SQLNumericModifier | Unset): PostgreSQL NUMERIC precision and signed scale. For arrays this
                 describes every element, not dimensions. Absent means unconstrained NUMERIC.
             value (Any | Unset): Typed literal value, including null.

@@ -113,6 +113,38 @@ func TestRelationalConditionalExpressionContract(t *testing.T) {
 	}
 }
 
+func TestRelationalNumericArrayModifierRoundTrip(t *testing.T) {
+	for _, modifier := range []string{"", `,"x-antfly-sql-numeric-modifier":{"precision":2,"scale":-3}`} {
+		source := `{"type":"sql_array","x-antfly-sql-type":"numeric"` + modifier + `}`
+		var column oapi.SQLArrayColumnSchema
+		if err := json.Unmarshal([]byte(source), &column); err != nil {
+			t.Fatal(err)
+		}
+		if (column.XAntflySqlNumericModifier == nil) != (modifier == "") {
+			t.Fatalf("lost optional modifier: %+v", column)
+		}
+		encoded, err := json.Marshal(column)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(encoded, &fields); err != nil {
+			t.Fatal(err)
+		}
+		_, present := fields["x-antfly-sql-numeric-modifier"]
+		if present != (modifier != "") {
+			t.Fatalf("changed modifier presence: %s", encoded)
+		}
+		var restored oapi.SQLArrayColumnSchema
+		if err := json.Unmarshal(encoded, &restored); err != nil {
+			t.Fatal(err)
+		}
+		if modifier != "" && (restored.XAntflySqlNumericModifier.Precision != 2 || restored.XAntflySqlNumericModifier.Scale != -3) {
+			t.Fatalf("changed modifier: %s", encoded)
+		}
+	}
+}
+
 func TestRelationalNumericCastModifierRoundTrip(t *testing.T) {
 	source := `{"op":"cast","type":"numeric","sql_type":"numeric","numeric_modifier":{"precision":2,"scale":-3},"args":[{"op":"literal","type":"numeric","value":"1.245"}]}`
 	var expression RelationalScalarExpression

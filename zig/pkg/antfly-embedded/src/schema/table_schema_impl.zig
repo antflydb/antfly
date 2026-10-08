@@ -261,6 +261,7 @@ pub const DocumentProperty = struct {
     integer_only: bool = false,
     format: ?[]const u8 = null,
     sql_type: ?@import("../common/sql_builtin_type.zig").Type = null,
+    numeric_modifier: ?@import("../common/sql_builtin_type.zig").NumericModifier = null,
     allows_null: bool = false,
     const_value: ?[]const u8 = null,
     minimum: ?f64 = null,
@@ -495,7 +496,7 @@ const SchemaContext = struct {
 /// Slice identities remain stable when schema/property structs are copied.
 pub const CompiledValidationPlan = struct {
     const PropertyMap = std.StringHashMapUnmanaged(usize);
-    const SqlColumn = struct { name: []const u8, kind: @import("../common/sql_builtin_type.zig").Type, generated: bool, defaulted: bool, is_array: bool };
+    const SqlColumn = struct { name: []const u8, kind: @import("../common/sql_builtin_type.zig").Type, generated: bool, defaulted: bool, is_array: bool, numeric_modifier: ?@import("../common/sql_builtin_type.zig").NumericModifier = null };
     const Normalization = enum { base, derived, all };
     /// Borrowed immutable epoch identity, stable across owner struct moves.
     schema_documents: []const DocumentSchema = &.{},
@@ -528,7 +529,7 @@ pub const CompiledValidationPlan = struct {
                     };
                     break :defaulted false;
                 };
-                try sql_columns.append(alloc, .{ .name = property.name, .kind = @import("../common/sql_builtin_type.zig").Type.fromWire(kind), .generated = generated, .defaulted = defaulted, .is_array = propertyIsSqlArray(property) });
+                try sql_columns.append(alloc, .{ .name = property.name, .kind = @import("../common/sql_builtin_type.zig").Type.fromWire(kind), .generated = generated, .defaulted = defaulted, .is_array = propertyIsSqlArray(property), .numeric_modifier = property.numeric_modifier });
             };
         };
         plan.sql_columns = try sql_columns.toOwnedSlice(alloc);
@@ -579,7 +580,7 @@ pub const CompiledValidationPlan = struct {
             if (column.is_array) {
                 if (column.kind == .numeric) {
                     // Unconstrained API values are validated, not rewritten.
-                    @import("relational_expression.zig").normalizeNumericArrayJson(execution, cell, null, true) catch |err| switch (err) {
+                    @import("relational_expression.zig").normalizeNumericArrayJson(execution, cell, column.numeric_modifier, preserve or column.numeric_modifier == null) catch |err| switch (err) {
                         error.OutOfMemory, error.Canceled, error.RelationalExpressionBudgetExceeded => return err,
                         else => return error.InvalidBatchRequest,
                     };
@@ -622,8 +623,12 @@ pub const CompiledValidationPlan = struct {
                 },
                 .boolean => if (cell.* != .bool) return error.InvalidBatchRequest,
                 .jsonb => {},
-                // Exact API lexemes are admitted by the recursive validator.
-                .numeric => {},
+                .numeric => if (column.numeric_modifier) |modifier| {
+                    cell.* = @import("relational_expression.zig").normalizeNumericJson(execution, cell.*, modifier, preserve) catch |err| switch (err) {
+                        error.OutOfMemory, error.Canceled, error.RelationalExpressionBudgetExceeded => return err,
+                        else => return error.InvalidBatchRequest,
+                    };
+                },
             }
         }
     }
@@ -1051,6 +1056,7 @@ fn physicalLayoutDischargesProperty(property: DocumentProperty) bool {
             // Strict physical validation already checks the pinned scalar or
             // array SQL domain. It must precede this residual validation plan.
             !std.mem.eql(u8, reflected_name, "sql_type") and
+            !std.mem.eql(u8, reflected_name, "numeric_modifier") and
             !std.mem.eql(u8, reflected_name, "integer_only") and
             !std.mem.eql(u8, reflected_name, "allows_null"))
         {
@@ -1490,7 +1496,7 @@ fn validateDocumentSchemaDefinitionWithContext(context: SchemaContext, value: st
 
 fn validateDocumentSchemaKeywords(context: SchemaContext, object: std.json.ObjectMap) anyerror!void {
     // SQL identities belong to root column properties, never the row object.
-    if (object.contains("x-antfly-sql-type")) return error.InvalidSchemaUpdateRequest;
+    if (object.contains("x-antfly-sql-type") or object.contains("x-antfly-sql-numeric-modifier")) return error.InvalidSchemaUpdateRequest;
     if (object.get("type")) |schema_type| {
         if (schema_type != .null) _ = try validateTypeSpecDefinition(schema_type, true);
     }
@@ -2956,6 +2962,7 @@ fn validateParsedRelationalSchema(schema: TableSchema) !void {
     for (document_schema.properties) |property| {
         var descendants = property;
         descendants.sql_type = null;
+        descendants.numeric_modifier = null;
         if (propertyContainsSqlType(descendants)) return error.InvalidSchemaUpdateRequest;
         if (!isRelationalStorageProperty(property) or !relationalPhysicalConstraintsAreExact(property)) {
             return error.InvalidSchemaUpdateRequest;
@@ -3543,6 +3550,10 @@ fn parseAnonymousPropertyKeywords(alloc: std.mem.Allocator, context: SchemaConte
         break :blk kind;
     } else null;
     if (field_type) |physical| if (std.mem.eql(u8, physical, "sql_array") and sql_type == null) return error.InvalidSchemaUpdateRequest;
+    const numeric_modifier = if (object.get("x-antfly-sql-numeric-modifier")) |value| blk: {
+        if (sql_type != .numeric) return error.InvalidSchemaUpdateRequest;
+        break :blk @import("../sql/numeric_storage.zig").modifierFromJson(value) catch return error.InvalidSchemaUpdateRequest;
+    } else null;
     const format = if (object.get("format")) |format_value|
         switch (format_value) {
             .string => |format_string| try alloc.dupe(u8, format_string),
@@ -3980,6 +3991,7 @@ fn parseAnonymousPropertyKeywords(alloc: std.mem.Allocator, context: SchemaConte
         .integer_only = type_spec.integer_only,
         .format = format,
         .sql_type = sql_type,
+        .numeric_modifier = numeric_modifier,
         .allows_null = allows_null,
         .const_value = const_value,
         .minimum = minimum,

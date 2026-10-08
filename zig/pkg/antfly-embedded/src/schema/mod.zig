@@ -884,6 +884,9 @@ fn requiresExactNumericExpressions(schema: ParsedTableSchema) bool {
 }
 
 fn requiresNumericModifiers(schema: ParsedTableSchema) bool {
+    for (schema.document_schemas) |document| for (document.properties) |property| {
+        if (property.numeric_modifier != null) return true;
+    };
     return requiresNumericExpressionCapability(schema, .modifiers);
 }
 
@@ -1149,6 +1152,7 @@ fn deriveRuntimeRelationalColumns(
                 .is_json = uses_json,
                 .json_kind = runtimeRelationalJsonKind(property),
                 .sql_element_type = if (property.sql_type) |kind| @import("../common/sql_builtin_type.zig").Type.fromWire(kind) else null,
+                .numeric_modifier = property.numeric_modifier,
             });
             name = null;
             path = null;

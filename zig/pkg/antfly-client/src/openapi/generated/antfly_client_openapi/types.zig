@@ -36801,6 +36801,8 @@ pub const RuntimeDecl = struct {
 pub const SQLArrayColumnSchema = struct {
     type: []const u8,
     x_antfly_sql_type: SQLArrayElementType,
+    /// Accepted only with numeric element identity. Applies assignment coercion to each non-NULL element while preserving dimensions and lower bounds. Requires reader capability version 23.
+    x_antfly_sql_numeric_modifier: ?SQLNumericModifier = null,
     nullable: ?bool = null,
     description: ?[]const u8 = null,
 
@@ -36808,6 +36810,7 @@ pub const SQLArrayColumnSchema = struct {
     pub const openApiFieldMetadata = .{
         .{ "type", "type", false },
         .{ "x-antfly-sql-type", "x_antfly_sql_type", false },
+        .{ "x-antfly-sql-numeric-modifier", "x_antfly_sql_numeric_modifier", true },
         .{ "nullable", "nullable", true },
         .{ "description", "description", true },
     };
@@ -36826,6 +36829,10 @@ pub const SQLArrayColumnSchema = struct {
         try jw.write(self.type);
         try jw.objectField("x-antfly-sql-type");
         try jw.write(self.x_antfly_sql_type);
+        if (self.x_antfly_sql_numeric_modifier) |value| {
+            try jw.objectField("x-antfly-sql-numeric-modifier");
+            try jw.write(value);
+        }
         if (self.nullable) |value| {
             try jw.objectField("nullable");
             try jw.write(value);
@@ -36901,7 +36908,7 @@ pub const SQLArrayValue = struct {
     sql_nulls: []const bool,
 };
 
-/// Exact PostgreSQL builtin identity for a relational root scalar column. SQL array columns use SQLArrayElementType for their element identity. Set the JSON Schema property's `x-antfly-sql-type` annotation to one of these values. The underlying property type must match. SQL array storage is not implied by this annotation. Existing unannotated schemas retain their original domains. The numeric identity uses an underlying number property and exact PostgreSQL NUMERIC semantics, never binary float. Submit finite values as JSON numeric lexemes or decimal strings; special values use strings NaN, Infinity and -Infinity. Const/enum finite numeric members must be JSON numbers, not strings. Bounds and multipleOf are exact decimals. Public scalar NUMERIC schemas require reader capability version 22.
+/// Exact PostgreSQL builtin identity for a relational root scalar column. SQL array columns use SQLArrayElementType for their element identity. Set the JSON Schema property's `x-antfly-sql-type` annotation to one of these values. The underlying property type must match. SQL array storage is not implied by this annotation. Existing unannotated schemas retain their original domains. The numeric identity uses an underlying number property and exact PostgreSQL NUMERIC semantics, never binary float. Submit finite values as JSON numeric lexemes or decimal strings; special values use strings NaN, Infinity and -Infinity. Const/enum finite numeric members must be JSON numbers, not strings. Bounds and multipleOf are exact decimals. Public scalar NUMERIC schemas require reader capability version 22. To constrain a NUMERIC scalar or SQL-array column, set the root property's `x-antfly-sql-numeric-modifier` annotation to an object with precision (1..1000) and signed scale (-1000..1000). The annotation requires numeric identity and reader capability version 23. Assignment rounds before constraints, indexes and generated dependents; overflow rejects the write. Restore verifies stored values without rounding.
 pub const SQLBuiltinType = enum {
     text,
     int16,

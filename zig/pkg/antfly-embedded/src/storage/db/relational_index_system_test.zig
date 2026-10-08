@@ -138,6 +138,69 @@ test "relational index system SQL typed arrays survive LSM reopen and portable r
     }
 }
 
+test "relational index system public NUMERIC modifiers normalize before indexing and survive LSM restore" {
+    const TestDirectory = @import("../../common/test_directory.zig").TestDirectory;
+    var directory = try TestDirectory.init("numeric-modifier-lsm");
+    defer directory.cleanup();
+    var target_directory = try TestDirectory.init("numeric-modifier-lsm-restore");
+    defer target_directory.cleanup();
+    const options: db_mod.OpenOptions = .{ .start_optional_runtimes = false, .start_index_workers = false, .primary_backend = .{ .lsm = .{} } };
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","relational_indexes":[{"name":"by_n","keys":[{"column":"n"}]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"n":{"type":"number","x-antfly-sql-type":"numeric","x-antfly-sql-numeric-modifier":{"precision":4,"scale":2}},"a":{"type":"sql_array","x-antfly-sql-type":"numeric","x-antfly-sql-numeric-modifier":{"precision":4,"scale":2}}},"additionalProperties":false}}}}
+    ;
+    const json =
+        \\{"n":1.245,"a":{"dimensions":[{"length":2,"lower_bound":-7}],"values":["1.245",null],"sql_nulls":[false,true]}}
+    ;
+    var archive: std.ArrayListUnmanaged(u8) = .empty;
+    defer archive.deinit(alloc);
+    {
+        var db = try db_mod.DB.open(alloc, directory.path(), options);
+        defer db.close();
+        try db.setSchemaJson(alloc, schema_json);
+        try db.batch(.{ .writes = &.{.{ .key = "row", .value = json }} });
+        try std.testing.expectError(error.InvalidBatchRequest, db.batch(.{ .writes = &.{ .{ .key = "not-committed", .value = json }, .{ .key = "invalid", .value = "{\"n\":99.995}" } } }));
+        try std.testing.expect((try db.get(alloc, "not-committed")) == null);
+        var changed = try std.json.parseFromSlice(std.json.Value, alloc, schema_json, .{});
+        defer changed.deinit();
+        changed.value.object.getPtr("version").?.* = .{ .integer = 2 };
+        changed.value.object.getPtr("document_schemas").?.object.getPtr("row").?.object.getPtr("schema").?.object.getPtr("properties").?.object.getPtr("n").?.object.getPtr("x-antfly-sql-numeric-modifier").?.object.getPtr("scale").?.* = .{ .integer = 1 };
+        const reinterpreted = try std.json.Stringify.valueAlloc(alloc, changed.value, .{});
+        defer alloc.free(reinterpreted);
+        try std.testing.expectError(error.InvalidSchemaUpdateRequest, db.setSchemaJson(alloc, reinterpreted));
+        try @import("../portable_backup.zig").exportPortable(alloc, db.core.store, &archive);
+    }
+    var reopened = try db_mod.DB.open(alloc, directory.path(), options);
+    defer reopened.close();
+    var restored = try db_mod.DB.open(alloc, target_directory.path(), options);
+    defer restored.close();
+    try restored.importPortableIntoEmpty(alloc, archive.items, @import("doc_identity.zig").default_namespace);
+    for ([_]*db_mod.DB{ &reopened, &restored }) |db| {
+        try std.testing.expect(db.core.schema.?.requires_numeric_modifiers);
+        const row = (try db.get(alloc, "row")).?;
+        defer alloc.free(row);
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, row, .{ .parse_numbers = false });
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings("1.25", parsed.value.object.get("n").?.number_string);
+        const array = parsed.value.object.get("a").?.object;
+        try std.testing.expectEqualStrings("1.25", array.get("values").?.array.items[0].string);
+        try std.testing.expect(array.get("sql_nulls").?.array.items[1].bool);
+        _ = try readyIndex(db, "by_n");
+        const bound = try @import("../../sql/numeric_storage.zig").encodeJsonAlloc(alloc, .{ .string = "1.25" });
+        defer alloc.free(bound);
+        var reader = try db.beginRelationalRows(alloc, .{
+            .index = "by_n",
+            .fields = &.{"n"},
+            .lower = .{ .values = &.{.{ .numeric = bound }} },
+            .upper = .{ .values = &.{.{ .numeric = bound }} },
+        });
+        defer reader.deinit();
+        var page = try reader.nextPage(alloc, std.testing.io, .{ .rows = 10, .records = 100 });
+        defer page.deinit();
+        try std.testing.expectEqual(@as(usize, 1), page.rows.len);
+        try std.testing.expectEqualStrings("row", page.rows[0].key);
+    }
+}
+
 test "relational index system NUMERIC public array schema survives LSM reopen and portable restore" {
     const TestDirectory = @import("../../common/test_directory.zig").TestDirectory;
     var directory = try TestDirectory.init("numeric-public-array");

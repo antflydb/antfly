@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
@@ -9,6 +9,10 @@ from attrs import field as _attrs_field
 from ..models.sql_array_column_schema_type import SQLArrayColumnSchemaType
 from ..models.sql_array_element_type import SQLArrayElementType
 from ..types import UNSET, Unset
+
+if TYPE_CHECKING:
+    from ..models.sql_numeric_modifier import SQLNumericModifier
+
 
 T = TypeVar("T", bound="SQLArrayColumnSchema")
 
@@ -32,12 +36,15 @@ class SQLArrayColumnSchema:
             type_ (SQLArrayColumnSchemaType):
             x_antfly_sql_type (SQLArrayElementType): Bound SQL scalar or array-element identity, including numeric widths
                 and exact NUMERIC. Never inferred from JSON value shape.
+            x_antfly_sql_numeric_modifier (SQLNumericModifier | Unset): PostgreSQL NUMERIC precision and signed scale. For
+                arrays this describes every element, not dimensions. Absent means unconstrained NUMERIC.
             nullable (bool | Unset):  Default: False.
             description (str | Unset):
     """
 
     type_: SQLArrayColumnSchemaType
     x_antfly_sql_type: SQLArrayElementType
+    x_antfly_sql_numeric_modifier: SQLNumericModifier | Unset = UNSET
     nullable: bool | Unset = False
     description: str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
@@ -46,6 +53,10 @@ class SQLArrayColumnSchema:
         type_ = self.type_.value
 
         x_antfly_sql_type = self.x_antfly_sql_type.value
+
+        x_antfly_sql_numeric_modifier: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.x_antfly_sql_numeric_modifier, Unset):
+            x_antfly_sql_numeric_modifier = self.x_antfly_sql_numeric_modifier.to_dict()
 
         nullable = self.nullable
 
@@ -59,6 +70,8 @@ class SQLArrayColumnSchema:
                 "x-antfly-sql-type": x_antfly_sql_type,
             }
         )
+        if x_antfly_sql_numeric_modifier is not UNSET:
+            field_dict["x-antfly-sql-numeric-modifier"] = x_antfly_sql_numeric_modifier
         if nullable is not UNSET:
             field_dict["nullable"] = nullable
         if description is not UNSET:
@@ -68,10 +81,19 @@ class SQLArrayColumnSchema:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.sql_numeric_modifier import SQLNumericModifier
+
         d = dict(src_dict)
         type_ = SQLArrayColumnSchemaType(d.pop("type"))
 
         x_antfly_sql_type = SQLArrayElementType(d.pop("x-antfly-sql-type"))
+
+        _x_antfly_sql_numeric_modifier = d.pop("x-antfly-sql-numeric-modifier", UNSET)
+        x_antfly_sql_numeric_modifier: SQLNumericModifier | Unset
+        if isinstance(_x_antfly_sql_numeric_modifier, Unset):
+            x_antfly_sql_numeric_modifier = UNSET
+        else:
+            x_antfly_sql_numeric_modifier = SQLNumericModifier.from_dict(_x_antfly_sql_numeric_modifier)
 
         nullable = d.pop("nullable", UNSET)
 
@@ -80,6 +102,7 @@ class SQLArrayColumnSchema:
         sql_array_column_schema = cls(
             type_=type_,
             x_antfly_sql_type=x_antfly_sql_type,
+            x_antfly_sql_numeric_modifier=x_antfly_sql_numeric_modifier,
             nullable=nullable,
             description=description,
         )

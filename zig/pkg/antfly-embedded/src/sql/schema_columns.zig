@@ -60,7 +60,11 @@ pub fn column(name: []const u8, property: Json) !catalog.Column {
     else if (std.mem.eql(u8, wire, "numeric") or std.mem.eql(u8, wire, "number")) .number else if (std.mem.eql(u8, wire, "object") or std.mem.eql(u8, wire, "array") or std.mem.eql(u8, wire, "json")) .json else std.meta.stringToEnum(ast.ColumnType, wire) orelse return error.UnsupportedSqlShape;
     if (kind == .array and identity == null) return error.InvalidSqlBackendResponse;
     if (identity) |builtin| if (kind != .array and kind != scalarType(builtin)) return error.InvalidSqlBackendResponse;
-    return .{ .name = name, .path = name, .type = kind, .element_type = identity };
+    const modifier = if (property.object.get("x-antfly-sql-numeric-modifier")) |value| blk: {
+        if (identity != .numeric or (kind != .number and kind != .array)) return error.InvalidSqlBackendResponse;
+        break :blk @import("numeric_storage.zig").modifierFromJson(value) catch return error.InvalidSqlBackendResponse;
+    } else null;
+    return .{ .name = name, .path = name, .type = kind, .element_type = identity, .numeric_modifier = modifier };
 }
 
 fn scalarType(kind: Builtin) ast.ColumnType {

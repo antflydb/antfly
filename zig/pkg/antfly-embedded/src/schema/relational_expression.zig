@@ -2901,6 +2901,94 @@ test "relational declarations omitted scalar literal value is typed NULL for gen
     try std.testing.expectEqualSlices(u8, &left.fingerprint, &right.fingerprint);
 }
 
+test "relational declarations public NUMERIC annotation validates scope and constrained arrays" {
+    const a = std.testing.allocator;
+    const public_schema = @import("mod.zig");
+    for ([_][]const u8{
+        "{\"type\":\"number\",\"x-antfly-sql-numeric-modifier\":{\"precision\":4,\"scale\":2}}",
+        "{\"type\":\"integer\",\"x-antfly-sql-type\":\"integer\",\"x-antfly-sql-numeric-modifier\":{\"precision\":4,\"scale\":2}}",
+        "{\"type\":\"string\",\"x-antfly-sql-numeric-modifier\":{\"precision\":4,\"scale\":2}}",
+        "{\"type\":\"object\",\"properties\":{\"nested\":{\"type\":\"number\",\"x-antfly-sql-type\":\"numeric\",\"x-antfly-sql-numeric-modifier\":{\"precision\":4,\"scale\":2}}}}",
+    }) |property| {
+        const json = try std.fmt.allocPrint(a, "{{\"storage_mode\":\"relational\",\"default_type\":\"row\",\"document_schemas\":{{\"row\":{{\"schema\":{{\"type\":\"object\",\"properties\":{{\"n\":{s}}},\"additionalProperties\":false}}}}}}}}", .{property});
+        defer a.free(json);
+        try std.testing.expectError(error.InvalidSchemaUpdateRequest, public_schema.CompiledTableValidator.init(a, json));
+    }
+    for ([_][]const u8{
+        "{\"precision\":0,\"scale\":2}",
+        "{\"precision\":4,\"scale\":1001}",
+        "{\"precision\":\"4\",\"scale\":2}",
+        "{\"precision\":4}",
+        "{\"precision\":4,\"scale\":2,\"unknown\":0}",
+        "null",
+    }) |modifier| {
+        const json = try std.fmt.allocPrint(a, "{{\"storage_mode\":\"relational\",\"default_type\":\"row\",\"document_schemas\":{{\"row\":{{\"schema\":{{\"type\":\"object\",\"properties\":{{\"n\":{{\"type\":\"number\",\"x-antfly-sql-type\":\"numeric\",\"x-antfly-sql-numeric-modifier\":{s}}}}},\"additionalProperties\":false}}}}}}}}", .{modifier});
+        defer a.free(json);
+        try std.testing.expectError(error.InvalidSchemaUpdateRequest, public_schema.CompiledTableValidator.init(a, json));
+    }
+    var validator = try public_schema.CompiledTableValidator.init(a,
+        \\{"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"a":{"type":"sql_array","x-antfly-sql-type":"numeric","x-antfly-sql-numeric-modifier":{"precision":4,"scale":2}}},"additionalProperties":false}}}}
+    );
+    defer validator.deinit(a);
+    var document = try std.json.parseFromSlice(std.json.Value, a,
+        \\{"a":{"dimensions":[{"length":3,"lower_bound":-7}],"values":["1.245","NaN",null],"sql_nulls":[false,false,true]}}
+    , .{});
+    defer document.deinit();
+    try std.testing.expectError(error.InvalidBatchRequest, validator.validateValue(a, &document.value));
+    try validator.prepareValue(document.arena.allocator(), a, &document.value);
+    try std.testing.expectEqualStrings("1.25", document.value.object.get("a").?.object.get("values").?.array.items[0].string);
+    try std.testing.expectEqual(@as(i64, -7), document.value.object.get("a").?.object.get("dimensions").?.array.items[0].object.get("lower_bound").?.integer);
+    try validator.validateValue(a, &document.value);
+    const runtime = try public_schema.deriveRuntimeTableSchema(a, validator.schema);
+    defer schema.freeSchema(a, runtime);
+    try std.testing.expect(runtime.requires_numeric_modifiers);
+    try std.testing.expectEqual(@as(u16, 4), runtime.relational_columns[0].numeric_modifier.?.precision);
+    try std.testing.expectEqual(@as(usize, 0), validator.restore.properties.len);
+}
+
+test "relational declarations public NUMERIC modifiers preserve PostgreSQL assignment ordering and epochs" {
+    const a = std.testing.allocator;
+    const Entry = struct { use_default: bool = false, input: ?[]const u8 = null, expected: ?[]const ?[]const u8 = null, @"error": ?[]const u8 = null };
+    const fixture = try std.json.parseFromSlice(struct { entries: []const Entry }, a, @embedFile("../sql/fixtures/sql_numeric_assignment_reference.json"), .{ .ignore_unknown_fields = true });
+    defer fixture.deinit();
+    const Run = struct {
+        fn run(alloc: Allocator, cases: []const Entry) !void {
+            const public_schema = @import("mod.zig");
+            var validator = try public_schema.CompiledTableValidator.init(alloc,
+                \\{"version":1,"storage_mode":"relational","default_type":"row","column_defaults":[{"column":"base","expression":{"op":"literal","type":"numeric","value":"1.245"}}],"generated_columns":[{"column":"narrow","expression":{"op":"column","column":"base"}},{"column":"total","expression":{"op":"add","args":[{"op":"column","column":"base"},{"op":"column","column":"narrow"}]}}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"base":{"type":["number","null"],"x-antfly-sql-type":"numeric","x-antfly-sql-numeric-modifier":{"precision":4,"scale":2}},"narrow":{"type":["number","null"],"x-antfly-sql-type":"numeric","x-antfly-sql-numeric-modifier":{"precision":3,"scale":1}},"total":{"type":["number","null"],"x-antfly-sql-type":"numeric","x-antfly-sql-numeric-modifier":{"precision":5,"scale":2}}},"additionalProperties":false}}}}
+            );
+            defer validator.deinit(alloc);
+            const runtime = try public_schema.deriveRuntimeTableSchema(alloc, validator.schema);
+            defer schema.freeSchema(alloc, runtime);
+            try std.testing.expect(runtime.requires_numeric_modifiers);
+            const old_catalog: @import("../storage/db/table_catalog.zig").Catalog = .{ .mode_initialized = true, .storage_mode = .relational, .active_schema_version = runtime.version, .schema_format_version = 22 };
+            try std.testing.expectError(error.UnsupportedTableCapabilityVersion, old_catalog.validateForSchema(runtime));
+            for (cases) |entry| {
+                var document = try std.json.parseFromSlice(std.json.Value, alloc, "{}", .{});
+                defer document.deinit();
+                if (!entry.use_default) try document.value.object.put(document.arena.allocator(), "base", if (entry.input) |text| .{ .string = text } else .null);
+                const result = validator.prepareValue(document.arena.allocator(), alloc, &document.value);
+                if (entry.@"error" != null) {
+                    if (result) |_| return error.TestExpectedError else |err| {
+                        if (err == error.OutOfMemory) return err;
+                        try std.testing.expect(err == error.InvalidBatchRequest or err == error.RelationalExpressionOverflow);
+                    }
+                    continue;
+                }
+                try result;
+                for ([_][]const u8{ "base", "narrow", "total" }, entry.expected.?) |name, expected| {
+                    const value = document.value.object.get(name).?;
+                    if (expected) |text| try std.testing.expectEqualStrings(text, if (value == .number_string) value.number_string else value.string) else try std.testing.expectEqual(std.json.Value.null, value);
+                }
+                try validator.validateValue(alloc, &document.value);
+            }
+        }
+    };
+    try Run.run(a, fixture.value.entries);
+    var stable = std.testing.FailingAllocator.init(a, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(stable.allocator(), Run.run, .{fixture.value.entries});
+}
+
 test "relational declarations physical restore discharges unconstrained SQL domains without materialization" {
     const a = std.testing.allocator;
     const public_schema = @import("mod.zig");

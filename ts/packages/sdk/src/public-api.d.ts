@@ -13721,6 +13721,12 @@ export interface components {
          *     NaN, Infinity and -Infinity. Const/enum finite numeric members must be
          *     JSON numbers, not strings. Bounds and multipleOf are exact decimals.
          *     Public scalar NUMERIC schemas require reader capability version 22.
+         *     To constrain a NUMERIC scalar or SQL-array column, set the root
+         *     property's `x-antfly-sql-numeric-modifier` annotation to an object with
+         *     precision (1..1000) and signed scale (-1000..1000). The annotation
+         *     requires numeric identity and reader capability version 23. Assignment
+         *     rounds before constraints, indexes and generated dependents; overflow
+         *     rejects the write. Restore verifies stored values without rounding.
          * @enum {string}
          */
         SQLBuiltinType: "text" | "int16" | "int32" | "int64" | "float32" | "float64" | "boolean" | "uuid" | "jsonb" | "numeric";
@@ -14207,6 +14213,8 @@ export interface components {
             /** @enum {string} */
             type: "sql_array";
             "x-antfly-sql-type": components["schemas"]["SQLArrayElementType"];
+            /** @description Accepted only with numeric element identity. Applies assignment coercion to each non-NULL element while preserving dimensions and lower bounds. Requires reader capability version 23. */
+            "x-antfly-sql-numeric-modifier"?: components["schemas"]["SQLNumericModifier"];
             /** @default false */
             nullable?: boolean;
             description?: string;

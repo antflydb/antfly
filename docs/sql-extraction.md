@@ -6091,3 +6091,45 @@ index tests and their server integration test, with no failures or leaks.
 Inventory remains 448 implemented, 136 rejected, 73 superseded and 929
 unresolved. Control-catalog, formatting and whitespace checks pass. Changes
 are committed locally only; the unrelated HTTP discovery edit is preserved.
+
+### Public NUMERIC precision and signed-scale column activation
+
+Relational root-column schemas now accept the shared
+`x-antfly-sql-numeric-modifier` annotation for scalar NUMERIC and NUMERIC SQL
+arrays. Strict parsing rejects malformed modifiers, non-NUMERIC identities and
+nested SQL column declarations. The annotation flows through compiled validation,
+immutable runtime layouts, SQL catalog descriptors and schema expression binding.
+SQL scalar CREATE/ADD COLUMN declarations publish the same annotation instead of
+silently dropping precision/scale or rejecting the supported scalar shape.
+
+Assignment coercion uses the existing request-owned bounded NUMERIC execution
+context before constraints, indexing and dependent generated expressions. Arrays
+retain dimensions, signed lower bounds and SQL NULL flags. Capability version 23
+is required even when no default, generated expression or index mentions the
+column. Physical restore remains strict: it verifies constrained stored values,
+never rounds or repairs them. Residual validation does not rematerialize domains
+already discharged by the pinned physical layout.
+
+Public OpenAPI and generated Go, Python, TypeScript and Zig contracts reuse
+SQLNumericModifier. The array declaration modifier is genuinely optional: Go's
+additional-properties serializer must not emit an invalid zero-valued modifier
+for existing unconstrained declarations. Omission and signed-scale round-trip
+regressions cover that boundary in Go, Python and TypeScript.
+
+PostgreSQL independently verifies all 11 assignment/default/generated-value
+fixtures used by the public-schema regression. The native LSM regression covers
+overflow batch atomicity, populated-column reinterpretation rejection, index
+lookup after reopen and portable restoration. This is public column activation,
+not completion of SQL-array DDL, low-level physical codec/hash shared admission,
+or legacy CHECK comparison decoupling from persistent key limits. Original
+inventory classifications remain unchanged: 929 cases are still unresolved.
+
+Final-source validation passes 62 schema-expression tests, 601 local SQL tests
+(three existing skips), 226 server SQL tests, 187 native relational-index tests
+and the server integration test, without failures or leaks. Go SQL/round-trip
+tests, 42 Python SQL tests, 81 focused TypeScript tests, TypeScript type-checking
+and 17 Rust SDK tests pass. Generated Python/Zig drift checks, OpenAPI checks,
+control-catalog integrity, inventory integrity and formatting checks pass.
+The large generated Go diff is the embedded compressed OpenAPI payload changing,
+not hand-written query code. Changes are committed locally only; the unrelated
+HTTP discovery edit is preserved.
