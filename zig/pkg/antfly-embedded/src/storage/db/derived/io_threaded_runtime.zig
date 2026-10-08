@@ -262,6 +262,8 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
     workers: std.ArrayListUnmanaged(*Worker) = .empty,
     shutdown: bool = false,
     last_error_name: ?[]const u8 = null,
+    // Claims exclude duplicate cleanup; completion alone releases backlog credit.
+    last_claimed_truncate_sequence: u64 = 0,
     last_truncated_sequence: u64 = 0,
     force_catch_up_sequence: u64 = 0,
     last_notified_sequence: u64 = 0,
@@ -373,7 +375,9 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
 
     fn signalWorkers(self: *DerivedRuntime, io: Io) void {
         self.cond.broadcast(io);
-        if (self.scheduler) |scheduler| for (self.workers.items) |worker| scheduler.wake(worker);
+        if (self.scheduler) |scheduler| for (self.workers.items) |worker| {
+            if (worker.last_error_name == null) scheduler.wake(worker);
+        };
     }
 
     pub fn deinit(self: *DerivedRuntime) void {
@@ -747,22 +751,36 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
                     try wait.check();
                     continue;
                 }
+                if (self.truncates_in_flight != 0) {
+                    self.mutex.unlock(io);
+                    io.sleep(Io.Duration.fromMilliseconds(1), .awake) catch {};
+                    self.mutex.lockUncancelable(io);
+                    try wait.check();
+                    continue;
+                }
                 const truncate_sequence = truncate: {
                     const min_persisted = self.computeMinPersistedLocked();
-                    if (min_persisted > self.last_truncated_sequence) {
-                        self.last_truncated_sequence = min_persisted;
+                    if (min_persisted > self.last_claimed_truncate_sequence) {
+                        self.last_claimed_truncate_sequence = min_persisted;
                         break :truncate min_persisted;
                     }
                     break :truncate 0;
                 };
                 if (truncate_sequence > 0) {
+                    self.truncates_in_flight += 1;
                     self.mutex.unlock(io);
-                    self.truncate_fn(self.ctx, truncate_sequence) catch |err| {
+                    truncateWithVisibilityWait(self, truncate_sequence, wait, io) catch |err| {
                         self.mutex.lockUncancelable(io);
+                        self.truncates_in_flight -= 1;
+                        self.last_claimed_truncate_sequence = self.last_truncated_sequence;
+                        self.signalWorkers(io);
                         return err;
                     };
                     self.mutex.lockUncancelable(io);
+                    self.last_truncated_sequence = @max(self.last_truncated_sequence, truncate_sequence);
                     self.backlog.releaseThrough(truncate_sequence);
+                    self.truncates_in_flight -= 1;
+                    self.cond.broadcast(io);
                 }
                 return;
             }
@@ -852,22 +870,36 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
                     try wait.check();
                     continue;
                 }
+                if (self.truncates_in_flight != 0) {
+                    self.mutex.unlock(io);
+                    io.sleep(Io.Duration.fromMilliseconds(1), .awake) catch {};
+                    self.mutex.lockUncancelable(io);
+                    try wait.check();
+                    continue;
+                }
                 const truncate_sequence = truncate: {
                     const min_persisted = self.computeMinPersistedLocked();
-                    if (min_persisted > self.last_truncated_sequence) {
-                        self.last_truncated_sequence = min_persisted;
+                    if (min_persisted > self.last_claimed_truncate_sequence) {
+                        self.last_claimed_truncate_sequence = min_persisted;
                         break :truncate min_persisted;
                     }
                     break :truncate 0;
                 };
                 if (truncate_sequence > 0) {
+                    self.truncates_in_flight += 1;
                     self.mutex.unlock(io);
-                    self.truncate_fn(self.ctx, truncate_sequence) catch |err| {
+                    truncateWithVisibilityWait(self, truncate_sequence, wait, io) catch |err| {
                         self.mutex.lockUncancelable(io);
+                        self.truncates_in_flight -= 1;
+                        self.last_claimed_truncate_sequence = self.last_truncated_sequence;
+                        self.signalWorkers(io);
                         return err;
                     };
                     self.mutex.lockUncancelable(io);
+                    self.last_truncated_sequence = @max(self.last_truncated_sequence, truncate_sequence);
                     self.backlog.releaseThrough(truncate_sequence);
+                    self.truncates_in_flight -= 1;
+                    self.cond.broadcast(io);
                 }
                 return;
             }
@@ -953,7 +985,7 @@ fn workerMain(worker: *Worker) void {
     // registration and survives yields; no physical thread is pinned at idle.
     for (0..1) |_| {
         runtime.mutex.lockUncancelable(io);
-        const retry_remaining = worker.retry_not_before_ns -| platform_time.monotonicNs();
+        const retry_remaining = if (worker.retry_not_before_ns == 0) 0 else worker.retry_not_before_ns -| platform_time.monotonicNs();
         if (!runtime.shutdown and !worker.stop and !worker.paused and runtime.last_error_name == null and worker.last_error_name == null and retry_remaining > 0) {
             // Foreground notifications may wake a delayed registration. Preserve
             // its retry deadline instead of letting hot writers defeat backoff.
@@ -962,7 +994,9 @@ fn workerMain(worker: *Worker) void {
             return;
         }
         if (!runtime.shutdown and !worker.stop and !worker.paused and runtime.last_error_name == null and worker.last_error_name == null and worker.target_sequence <= worker.applied_sequence) {
-            if (worker.applied_sequence > worker.persisted_sequence) {
+            if (worker.applied_sequence > worker.persisted_sequence or
+                (runtime.truncates_in_flight == 0 and runtime.computeMinPersistedLocked() > runtime.last_claimed_truncate_sequence))
+            {
                 const sequence = worker.applied_sequence;
                 runtime.mutex.unlock(io);
                 const persisted = persistIdleAppliedSequence(runtime, worker, sequence, io) catch |err| {
@@ -1187,10 +1221,10 @@ fn workerMain(worker: *Worker) void {
         if (persisted and caught_up_sequence > worker.persisted_sequence) {
             worker.persisted_sequence = caught_up_sequence;
         }
-        if (worker.persisted_sequence > runtime.last_truncated_sequence) {
+        if (runtime.truncates_in_flight == 0 and worker.persisted_sequence > runtime.last_claimed_truncate_sequence) {
             const min_persisted = runtime.computeMinPersistedLocked();
-            if (min_persisted > runtime.last_truncated_sequence) {
-                runtime.last_truncated_sequence = min_persisted;
+            if (min_persisted > runtime.last_claimed_truncate_sequence) {
+                runtime.last_claimed_truncate_sequence = min_persisted;
                 truncate_sequence = min_persisted;
             }
         }
@@ -1212,6 +1246,7 @@ fn workerMain(worker: *Worker) void {
             truncateWithRecoverableRetry(runtime, worker, truncate_sequence, io) catch |err| {
                 runtime.mutex.lockUncancelable(io);
                 runtime.truncates_in_flight -= 1;
+                runtime.last_claimed_truncate_sequence = runtime.last_truncated_sequence;
                 runtime.cond.broadcast(io);
                 runtime.mutex.unlock(io);
                 if (err == error.WorkerStopping) return;
@@ -1219,6 +1254,7 @@ fn workerMain(worker: *Worker) void {
                 return;
             };
             runtime.mutex.lockUncancelable(io);
+            runtime.last_truncated_sequence = @max(runtime.last_truncated_sequence, truncate_sequence);
             runtime.backlog.releaseThrough(truncate_sequence);
             runtime.truncates_in_flight -= 1;
             runtime.cond.broadcast(io);
@@ -1236,10 +1272,10 @@ fn persistIdleAppliedSequence(runtime: *DerivedRuntime, worker: *Worker, sequenc
     if (persisted and sequence > worker.persisted_sequence) {
         worker.persisted_sequence = sequence;
     }
-    if (worker.persisted_sequence > runtime.last_truncated_sequence) {
+    if (runtime.truncates_in_flight == 0 and worker.persisted_sequence > runtime.last_claimed_truncate_sequence) {
         const min_persisted = runtime.computeMinPersistedLocked();
-        if (min_persisted > runtime.last_truncated_sequence) {
-            runtime.last_truncated_sequence = min_persisted;
+        if (min_persisted > runtime.last_claimed_truncate_sequence) {
+            runtime.last_claimed_truncate_sequence = min_persisted;
             truncate_sequence = min_persisted;
         }
     }
@@ -1254,11 +1290,13 @@ fn persistIdleAppliedSequence(runtime: *DerivedRuntime, worker: *Worker, sequenc
         truncateWithRecoverableRetry(runtime, worker, truncate_sequence, io) catch |err| {
             runtime.mutex.lockUncancelable(io);
             runtime.truncates_in_flight -= 1;
+            runtime.last_claimed_truncate_sequence = runtime.last_truncated_sequence;
             runtime.cond.broadcast(io);
             runtime.mutex.unlock(io);
             return err;
         };
         runtime.mutex.lockUncancelable(io);
+        runtime.last_truncated_sequence = @max(runtime.last_truncated_sequence, truncate_sequence);
         runtime.backlog.releaseThrough(truncate_sequence);
         runtime.truncates_in_flight -= 1;
         runtime.cond.broadcast(io);
@@ -1267,16 +1305,31 @@ fn persistIdleAppliedSequence(runtime: *DerivedRuntime, worker: *Worker, sequenc
     return persisted;
 }
 
+fn truncateWithVisibilityWait(runtime: *DerivedRuntime, sequence: u64, wait: runtime_types.VisibilityWait, io: Io) !void {
+    var backoff = catch_up_policy.RecoverableRetryBackoff{};
+    while (true) {
+        try wait.check();
+        runtime.truncate_fn(runtime.ctx, sequence) catch |err| {
+            if (!catch_up_policy.isRecoverableAdmissionError(err)) return err;
+            const delay = catch_up_policy.recordRecoverableRetry(&runtime.recoverable_retry_counters, runtime.backlog.resource_manager, &backoff, err);
+            try wait.check();
+            io.sleep(Io.Duration.fromNanoseconds(@intCast(delay)), .awake) catch {};
+            continue;
+        };
+        return;
+    }
+}
+
 fn truncateWithRecoverableRetry(runtime: *DerivedRuntime, worker: *Worker, sequence: u64, io: Io) !void {
     while (true) {
         runtime.mutex.lockUncancelable(io);
-        // Pausing drains this publication too. Canceling an already-claimed
-        // truncation would strand its backlog credit behind last_truncated_sequence.
+        // Pause drains active cleanup. Shutdown returns its claim to the
+        // completion watermark; the caller retains credit until success.
         const stopping = runtime.shutdown or worker.stop or runtime.last_error_name != null or worker.last_error_name != null;
         runtime.mutex.unlock(io);
         if (stopping) return error.WorkerStopping;
         runtime.truncate_fn(runtime.ctx, sequence) catch |err| {
-            if (err == error.WriterLocked) {
+            if (catch_up_policy.isRecoverableAdmissionError(err)) {
                 sleepAfterRecoverableCatchUpError(worker, err, io);
                 continue;
             }
@@ -2600,4 +2653,110 @@ test "issue1015 foreground notifications cannot defeat worker contention backoff
     for (0..100) |_| try std.testing.expect((workerStep(&worker) orelse 0) > 0);
     try std.testing.expectEqual(@as(u64, 0), capture.apply_calls.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 0), capture.begin_calls.load(.monotonic));
+}
+
+test "issue1015 truncation contention recovers credit and failed claims remain retryable" {
+    const alloc = std.testing.allocator;
+    const Probe = struct {
+        failure: anyerror,
+        calls: usize = 0,
+        fn persist(_: *anyopaque, _: []const u8, _: u64, _: bool) !bool {
+            return true;
+        }
+        fn truncate(ptr: *anyopaque, _: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            if (self.calls == 1) return self.failure;
+        }
+    };
+    for ([_]anyerror{ error.WouldBlock, error.FileBusy, error.InvalidData }) |failure| {
+        var manager = resource_manager_mod.ResourceManager.init(.{});
+        defer manager.deinit(alloc);
+        var probe = Probe{ .failure = failure };
+        var runtime = try DerivedRuntime.init(alloc, undefined, &probe, testThreadedRuntimeApply, Probe.persist, Probe.truncate, null, null, null, null, &manager);
+        defer runtime.deinit();
+        const worker = try alloc.create(Worker);
+        worker.* = .{ .runtime = &runtime, .name = try alloc.dupe(u8, "cleanup"), .kind = .{ .name = "cleanup", .kind = .graph }, .applied_sequence = 10, .persisted_sequence = 0, .target_sequence = 10 };
+        try runtime.workers.append(alloc, worker);
+        try runtime.trackBacklogBytes(10, 64);
+        const retained = runtime.backlog.retained_bytes;
+        try std.testing.expect(retained >= 64);
+        const io = runtime.ioContext();
+        if (failure == error.InvalidData) {
+            try std.testing.expectError(failure, persistIdleAppliedSequence(&runtime, worker, 10, io));
+            try std.testing.expectEqual(@as(u64, 0), runtime.last_truncated_sequence);
+            try std.testing.expectEqual(@as(u64, 0), runtime.last_claimed_truncate_sequence);
+            try std.testing.expectEqual(retained, runtime.backlog.retained_bytes);
+        }
+        try std.testing.expect(try persistIdleAppliedSequence(&runtime, worker, 10, io));
+        try std.testing.expectEqual(@as(usize, 2), probe.calls);
+        try std.testing.expectEqual(@as(u64, 10), runtime.last_truncated_sequence);
+        try std.testing.expectEqual(@as(u64, 0), runtime.backlog.retained_bytes);
+        try runtime.failIfUnhealthy();
+    }
+}
+
+test "issue1015 failed registrations stay parked during primary notifications" {
+    const alloc = std.testing.allocator;
+    var capture = TestThreadedRuntimeCapture{};
+    var runtime = try DerivedRuntime.init(alloc, undefined, &capture, testThreadedRuntimeApply, testThreadedRuntimePersist, testThreadedRuntimeTruncate, null, null, null, null, null);
+    defer runtime.deinit();
+    const io = runtime.ioContext();
+    runtime.scheduler = try Scheduler.create(alloc, io, 8);
+    runtime.owns_scheduler = true;
+    const worker = try alloc.create(Worker);
+    worker.* = .{ .runtime = &runtime, .name = try alloc.dupe(u8, "failed"), .kind = .{ .name = "failed", .kind = .full_text }, .applied_sequence = 1, .persisted_sequence = 1, .target_sequence = 1, .last_error_name = "InvalidData" };
+    try runtime.workers.append(alloc, worker);
+    worker.future = try runtime.scheduler.?.registerClass(.derived, worker, workerStep);
+    const deadline = platform_time.monotonicNs() + 5 * std.time.ns_per_s;
+    while (true) {
+        const stats = runtime.scheduler.?.snapshot();
+        if (stats.dispatches == 1 and stats.active == 0) break;
+        if (platform_time.monotonicNs() >= deadline) return error.TestUnexpectedResult;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    for (2..100) |sequence| runtime.notifySequence(sequence);
+    try io.sleep(.fromMilliseconds(20), .awake);
+    try std.testing.expectEqual(@as(u64, 1), runtime.scheduler.?.snapshot().dispatches);
+    try std.testing.expectEqual(@as(u64, 0), capture.apply_calls.load(.monotonic));
+}
+
+test "issue1015 visibility truncation timeouts release claims and retain cleanup credit" {
+    const alloc = std.testing.allocator;
+    const Probe = struct {
+        fail: bool = true,
+        fn persist(_: *anyopaque, _: []const u8, _: u64, _: bool) !bool {
+            return true;
+        }
+        fn truncate(ptr: *anyopaque, _: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.fail) return error.WouldBlock;
+        }
+    };
+    for ([_]bool{ false, true }) |selected| {
+        var manager = resource_manager_mod.ResourceManager.init(.{});
+        defer manager.deinit(alloc);
+        var probe = Probe{};
+        var runtime = try DerivedRuntime.init(alloc, undefined, &probe, testThreadedRuntimeApply, Probe.persist, Probe.truncate, null, null, null, null, &manager);
+        defer runtime.deinit();
+        const worker = try alloc.create(Worker);
+        worker.* = .{ .runtime = &runtime, .name = try alloc.dupe(u8, "cleanup"), .kind = .{ .name = "cleanup", .kind = .graph }, .applied_sequence = 10, .persisted_sequence = 10, .target_sequence = 10 };
+        try runtime.workers.append(alloc, worker);
+        try runtime.trackBacklogBytes(10, 64);
+        const retained = runtime.backlog.retained_bytes;
+        const wait = runtime_types.VisibilityWait{ .deadline_ns = platform_time.monotonicNs() + 2 * std.time.ns_per_ms };
+        if (selected) {
+            try std.testing.expectError(error.EnrichmentWaitTimeout, runtime.waitForIndexesWithVisibilityWait(10, &.{"cleanup"}, wait));
+        } else {
+            try std.testing.expectError(error.EnrichmentWaitTimeout, runtime.waitForAllWithVisibilityWait(10, wait));
+        }
+        try std.testing.expectEqual(@as(usize, 0), runtime.truncates_in_flight);
+        try std.testing.expectEqual(@as(u64, 0), runtime.last_claimed_truncate_sequence);
+        try std.testing.expectEqual(@as(u64, 0), runtime.last_truncated_sequence);
+        try std.testing.expectEqual(retained, runtime.backlog.retained_bytes);
+        probe.fail = false;
+        if (selected) try runtime.waitForIndexes(10, &.{"cleanup"}) else try runtime.waitForAll(10);
+        try std.testing.expectEqual(@as(u64, 10), runtime.last_truncated_sequence);
+        try std.testing.expectEqual(@as(u64, 0), runtime.backlog.retained_bytes);
+    }
 }
