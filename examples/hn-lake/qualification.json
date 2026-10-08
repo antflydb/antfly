@@ -67,5 +67,12 @@
     "First query after restart still takes 15\u201320 seconds; persistent range-cache files were not observed.",
     "Flat structured filters scan projected columns and collect up to 100000 matching IDs; full-archive filtering needs indexed predicate evaluation.",
     "Staging bucket expires all objects after eight days."
-  ]
+  ],
+  "unordered_filter_regression": {
+    "source": "gs://colony-import-sources-antfly-dev-01/hn-poc/20261007/archive",
+    "status": "passed",
+    "unordered_filter_ms": 480.61,
+    "warm_search_ms": 522.3,
+    "after_restart_ms": 15515.21
+  }
 }

@@ -1410,6 +1410,12 @@ def test_native_remote_text_corpus_scores_filters_and_restart(tmp_path):
             hit["_source"]["label"] for hit in ordered_filtered["hits"]["hits"]
         ] == ["row-17"]
         assert ordered_filtered["hits"]["total"] == {"value": 1, "relation": "exact"}
+        unordered_request = dict(filtered_request)
+        unordered_request.pop("order_by")
+        unordered_filtered = call("POST", "/tables/lake_text/query", unordered_request)
+        assert [hit["_id"] for hit in unordered_filtered["hits"]["hits"]] == [
+            hit["_id"] for hit in ordered_filtered["hits"]["hits"]
+        ]
         assert all(
             set(hit["_source"]) == {"label"} for hit in ordered_filtered["hits"]["hits"]
         )

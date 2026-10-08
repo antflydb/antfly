@@ -1,4 +1,19 @@
 #!/usr/bin/env python3
+# Copyright 2026 Antfly, Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Verify a historical HN Parquet partition using a local Antfly and GCS.
 
 Credentials are captured from gcloud into the child environment, never written
@@ -276,6 +291,20 @@ def main():
             assert (
                 filtered_sort_rejection is None and exact_filter_status == "passed"
             ), (filtered_sort_rejection, exact_filter_status)
+        unordered_filter_ms = None
+        if filtered_sort_rejection is None:
+            unordered_query = dict(filtered_query)
+            unordered_query.pop("order_by", None)
+            unordered_started = time.monotonic()
+            unordered = call(
+                "POST", "/tables/hn_archive_poc/query", unordered_query, timeout=15
+            )
+            unordered_filter_ms = round(
+                (time.monotonic() - unordered_started) * 1000, 2
+            )
+            assert [h["_source"]["hn_id"] for h in unordered["hits"]["hits"]] == [
+                selected
+            ]
         stop()
         start()
         reopened, restart_ms = timed_query(query)
@@ -303,6 +332,7 @@ def main():
             "first_response": first,
             "filtered_score_sort_rejection": filtered_sort_rejection,
             "exact_filter_status": exact_filter_status,
+            "unordered_filter_ms": unordered_filter_ms,
             "verified": [
                 "remote_bm25",
                 "projected_highlights",

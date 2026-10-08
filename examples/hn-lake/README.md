@@ -76,6 +76,9 @@ publication, so it is not a guaranteed cold-cache measurement. Readiness timing
 on an existing publication is not index-build timing. These results do not
 establish full-archive capacity or concurrent production latency.
 
+A separate raw-export check also passed the previously timed-out unordered
+HN-ID filter in 481 ms.
+
 Flat structured predicates now scan only their required columns against the
 pinned, delete-aware lake snapshot and resolve IDs before ranking/pagination.
 This preserves exact integer comparisons and works when predicate fields are
