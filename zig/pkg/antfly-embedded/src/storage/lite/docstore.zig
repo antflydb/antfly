@@ -2921,6 +2921,10 @@ pub const Txn = struct {
         return (try self.readFile()).checksumIndexValue(value, offset, length, self.checkpoint);
     }
 
+    pub fn readAuthenticatedIndexValue(self: *Txn, value: native.NativeFile.IndexValue, offset: u64, length: u64, within: usize, out: []u8, expected: ?u32) !void {
+        return (try self.readFile()).readAuthenticatedIndexValue(value, offset, length, within, out, expected, self.checkpoint);
+    }
+
     pub fn copyIndexValueTo(self: *Txn, value: native.NativeFile.IndexValue, destination: std.Io.File) !void {
         return (try self.readFile()).copyIndexValueTo(value, destination, self.checkpoint);
     }

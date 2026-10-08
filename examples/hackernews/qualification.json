@@ -1,0 +1,78 @@
+{
+  "date": "2026-10-07",
+  "runtime_base_commit": "a8e37828b3",
+  "allocator_pr": "https://github.com/antflydb/antfly/pull/1009",
+  "baseline": {
+    "project": "antfly-dev-01",
+    "source": "gs://colony-import-sources-antfly-dev-01/hn-poc/20261007-normalized/archive",
+    "artifacts": "gs://colony-import-sources-antfly-dev-01/hn-poc/20261007-normalized/indexes",
+    "row_count": 10000,
+    "ready_seconds": 0.92,
+    "first_search_ms": 26430.33,
+    "warm_search_ms": 17797.31,
+    "after_restart_ms": 27515.64,
+    "filtered_score_sort_rejection": "filter_not_queryable",
+    "exact_filter_status": "unordered_filter_timeout_15s",
+    "verified": [
+      "remote_bm25",
+      "projected_highlights",
+      "snapshot_pagination",
+      "restart_scores",
+      "restart_pagination"
+    ]
+  },
+  "normalized_with_fixes": {
+    "project": "antfly-dev-01",
+    "source": "gs://colony-import-sources-antfly-dev-01/hn-poc/20261007-normalized/archive",
+    "artifacts": "gs://colony-import-sources-antfly-dev-01/hn-poc/20261007-normalized/indexes",
+    "row_count": 10000,
+    "ready_seconds": 0.95,
+    "first_search_ms": 22340.69,
+    "warm_search_ms": 467.83,
+    "after_restart_ms": 19993.94,
+    "filtered_score_sort_rejection": null,
+    "exact_filter_status": "passed",
+    "verified": [
+      "remote_bm25",
+      "projected_highlights",
+      "snapshot_pagination",
+      "restart_scores",
+      "restart_pagination",
+      "exact_filter"
+    ]
+  },
+  "raw_bigquery_with_fixes": {
+    "project": "antfly-dev-01",
+    "source": "gs://colony-import-sources-antfly-dev-01/hn-poc/20261007/archive",
+    "artifacts": "gs://colony-import-sources-antfly-dev-01/hn-poc/20261007/indexes",
+    "row_count": 10000,
+    "ready_seconds": 1.13,
+    "first_search_ms": 13665.02,
+    "warm_search_ms": 451.53,
+    "after_restart_ms": 15291.86,
+    "filtered_score_sort_rejection": null,
+    "exact_filter_status": "passed",
+    "verified": [
+      "remote_bm25",
+      "projected_highlights",
+      "snapshot_pagination",
+      "restart_scores",
+      "restart_pagination",
+      "exact_filter"
+    ]
+  },
+  "limits": [
+    "Local Debug build, 10000-row smoke check against GCS, not a production benchmark.",
+    "Initial query follows publication and is not a guaranteed cold-cache measurement.",
+    "First query after restart still takes 15\u201320 seconds; persistent range-cache files were not observed.",
+    "Flat structured filters scan projected columns and collect up to 100000 matching IDs; full-archive filtering needs indexed predicate evaluation.",
+    "Staging bucket expires all objects after eight days."
+  ],
+  "unordered_filter_regression": {
+    "source": "gs://colony-import-sources-antfly-dev-01/hn-poc/20261007/archive",
+    "status": "passed",
+    "unordered_filter_ms": 480.61,
+    "warm_search_ms": 522.3,
+    "after_restart_ms": 15515.21
+  }
+}

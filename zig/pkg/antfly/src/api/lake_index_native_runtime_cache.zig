@@ -30,14 +30,14 @@ pub const Cache = struct {
     mutex: std.atomic.Mutex = .unlocked,
     entries: [64]?*Entry = @splat(null),
     tick: u64 = 0,
-    heap: local.sql_memory_budget = .{ .backing = std.heap.page_allocator, .limit = 512 * 1024 * 1024 },
+    heap: local.sql_memory_budget = .{ .backing = @import("antfly_platform").allocator.processAllocator(std.heap.smp_allocator), .limit = 512 * 1024 * 1024 },
     managed: ?local.storage_resource_manager.BudgetedAllocator = null,
     closing: bool = false,
     pub fn attach(self: *Cache, manager: *local.storage_resource_manager.ResourceManager) void {
         @import("antfly_platform").sync.lockYielding(&self.mutex);
         defer self.mutex.unlock();
         if (self.managed != null) return;
-        self.managed = local.storage_resource_manager.BudgetedAllocator.init(manager, .dense_search_working_set, std.heap.page_allocator, 1);
+        self.managed = local.storage_resource_manager.BudgetedAllocator.init(manager, .dense_search_working_set, @import("antfly_platform").allocator.processAllocator(std.heap.smp_allocator), 1);
         self.heap.backing = self.managed.?.allocator();
     }
     pub fn acquire(self: *Cache, server: *server_api.ApiHttpServer, declaration: local.serverless_segment_sidecar_manifest.DeclaredArtifact, domain: [32]u8, scope: [32]u8, context: Context) !*Entry {

@@ -88,7 +88,9 @@ pub const Header = struct {
     pub fn validatePlainDictionary(self: Header) !void {
         try self.validateResourceLimits();
         if (self.page_type != .dictionary_page) return error.UnsupportedParquetPage;
-        if (self.encoding != .plain) return error.UnsupportedParquetPage;
+        // Older Arrow writers (including BigQuery exports) label the plain
+        // dictionary payload with the deprecated PLAIN_DICTIONARY enum.
+        if (self.encoding != .plain and self.encoding != .plain_dictionary) return error.UnsupportedParquetPage;
     }
 
     pub fn validatePlainRequired(self: Header) !void {
@@ -4291,4 +4293,18 @@ test "external lake nullable V1 framing preserves nulls and rejects truncated le
     try std.testing.expectError(error.InvalidParquetPage, decodeOptionalPlainI64V2HybridLevelsAlloc(a, header, payload[0..3]));
     std.mem.writeInt(u32, payload[0..4], 99, .little);
     try std.testing.expectError(error.InvalidParquetPage, decodeOptionalPlainI64V2HybridLevelsAlloc(a, header, &payload));
+}
+
+test "parquet legacy PLAIN_DICTIONARY dictionary pages decode plain values" {
+    const a = std.testing.allocator;
+    const header: Header = .{ .page_type = .dictionary_page, .uncompressed_page_size = 8, .compressed_page_size = 8, .value_count = 1, .encoding = .plain_dictionary };
+    const integers = try decodePlainI64DictionaryPageAlloc(a, header, &.{ 42, 0, 0, 0, 0, 0, 0, 0 });
+    defer a.free(integers);
+    try std.testing.expectEqualSlices(i64, &.{42}, integers);
+    const strings = try decodePlainByteArrayDictionaryPageAlloc(a, header, &.{ 4, 0, 0, 0, 't', 'e', 's', 't' });
+    defer freePlainByteArrays(a, strings);
+    try std.testing.expectEqualStrings("test", strings[0]);
+    var invalid = header;
+    invalid.encoding = .rle_dictionary;
+    try std.testing.expectError(error.UnsupportedParquetPage, invalid.validatePlainDictionary());
 }

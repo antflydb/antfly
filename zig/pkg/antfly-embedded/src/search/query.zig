@@ -1728,12 +1728,21 @@ pub const DocIdFilter = struct {
 /// Global numeric document filter: matches documents by snapshot-global doc ID.
 pub const DocNumFilter = struct {
     doc_nums: []const u32,
+    bitmap: ?*const roaring.RoaringBitmap = null,
 
     pub fn executeWithOffset(self: DocNumFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry, doc_offset: u32) FilterError!roaring.RoaringBitmap {
         var result = roaring.RoaringBitmap.init(alloc);
         errdefer result.deinit();
 
         const upper = doc_offset + seg.reader.doc_count;
+        if (self.bitmap) |bitmap| {
+            var it = bitmap.iterator();
+            it.seek(doc_offset);
+            while (it.next()) |doc_num| {
+                if (doc_num >= upper) break;
+                if (doc_num >= doc_offset) try result.add(doc_num - doc_offset);
+            }
+        }
         for (self.doc_nums) |doc_num| {
             if (doc_num < doc_offset or doc_num >= upper) continue;
             try result.add(doc_num - doc_offset);

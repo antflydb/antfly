@@ -6112,13 +6112,21 @@ pub const AntflyApiHandler = struct {
             return ctx.text("invalid query request");
         };
         defer parsed_table.deinit();
-        var resp = try self.api_server.handleAdmittedPublicTableQueryWithContentTypeCancellation(
+        var delivery: QueryDelivery = .{ .ctx = ctx };
+        var resp = try self.api_server.handleAdmittedPublicTableQueryWithDelivery(
             parsed_table.table_name,
             body_data,
             ctx.header("content-type"),
             authenticated_identity,
             &cancellation,
+            delivery.sink(),
         );
+        if (delivery.writer) |*writer| {
+            defer resp.deinit(self.api_server.alloc);
+            if (resp.status != 200) return error.QueryDeliveryFailed;
+            try writer.close();
+            return ctx.response.build();
+        }
         return respondOwnedContextualResponse(ctx, &resp, self.api_server.alloc);
     }
 
@@ -7600,6 +7608,23 @@ pub const AntflyApiHandler = struct {
         return ctx.text("");
     }
 
+    const QueryDelivery = struct {
+        ctx: *httpx.Context,
+        writer: ?httpx.Context.StreamWriter = null,
+        fn sink(self: *@This()) ?@import("antfly_local_sources").api_query_response.Delivery {
+            if (self.ctx.stream_delegate == null and self.ctx.h1_sock == null and self.ctx.h2 == null) return null;
+            return .{ .ptr = self, .start_fn = start, .write_fn = write };
+        }
+        fn start(raw: *anyopaque, _: usize) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.writer = try self.ctx.streamResponseWithContentType(200, "application/json");
+        }
+        fn write(raw: *anyopaque, bytes: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.writer.?.write(bytes);
+        }
+    };
+
     pub fn queryTable(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
@@ -7626,7 +7651,15 @@ pub const AntflyApiHandler = struct {
         };
         defer ctx.allocator.free(logical);
         var cancellation = requestCancellation(ctx);
-        var resp = try self.api_server.handleAdmittedPublicTableQueryWithContentTypeCancellation(logical, body_data, ctx.header("content-type"), authenticated_identity, &cancellation);
+        var delivery: QueryDelivery = .{ .ctx = ctx };
+        var resp = self.api_server.handleAdmittedPublicTableQueryWithDelivery(logical, body_data, ctx.header("content-type"), authenticated_identity, &cancellation, delivery.sink()) catch |err| return err;
+        if (delivery.writer) |*writer| {
+            defer resp.deinit(self.api_server.alloc);
+            // A post-commit error closes the stream; never send a second status.
+            if (resp.status != 200) return error.QueryDeliveryFailed;
+            try writer.close();
+            return ctx.response.build();
+        }
         return respondOwnedContextualResponse(ctx, &resp, self.api_server.alloc);
     }
 
@@ -15699,4 +15732,43 @@ fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *con
         break :blk repeated;
     };
     return &result;
+}
+
+test "httpx lake query delivery requires a transport and forwards delegated JSON writes" {
+    const a = std.testing.allocator;
+    var request = try httpx.Request.init(a, .POST, "http://localhost/db/v1/tables/docs/query");
+    defer request.deinit();
+    var ctx = httpx.Context.init(a, std.testing.io, &request);
+    defer ctx.deinit();
+    var delivery: AntflyApiHandler.QueryDelivery = .{ .ctx = &ctx };
+    try std.testing.expect(delivery.sink() == null);
+    const State = struct {
+        started: bool = false,
+        written: bool = false,
+        closed: bool = false,
+        fn start(raw: ?*anyopaque, status: u16, content_type: []const u8, _: *const httpx.Headers) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try std.testing.expectEqual(@as(u16, 200), status);
+            try std.testing.expectEqualStrings("application/json", content_type);
+            self.started = true;
+        }
+        fn write(raw: ?*anyopaque, bytes: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try std.testing.expect(self.started and !self.closed);
+            try std.testing.expectEqualStrings("{}", bytes);
+            self.written = true;
+        }
+        fn close(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try std.testing.expect(self.written);
+            self.closed = true;
+        }
+    };
+    var state: State = .{};
+    ctx.stream_delegate = .{ .ptr = &state, .start = State.start, .write = State.write, .close = State.close };
+    const sink = delivery.sink().?;
+    try sink.start_fn(sink.ptr, 2);
+    try sink.write_fn(sink.ptr, "{}");
+    try delivery.writer.?.close();
+    try std.testing.expect(state.closed);
 }

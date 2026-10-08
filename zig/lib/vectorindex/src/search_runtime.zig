@@ -595,7 +595,7 @@ pub fn requestHasExtraFilters(
     req: search_types.SearchRequest,
     filter_state: *const search_types.RequestFilterState,
 ) bool {
-    return req.filter_prefix.len > 0 or
+    return req.key_predicate != null or req.filter_prefix.len > 0 or
         req.distance_over != null or
         req.distance_under != null or
         !filter_state.isTrivial();
