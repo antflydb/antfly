@@ -1607,6 +1607,140 @@ fn valuesEqual(a: Value, b: Value) !bool {
     };
 }
 
+/// Compile and execute a row-independent program without another evaluator or
+/// type-promotion implementation. Compilation, evaluation and output share one
+/// caller-owned work/byte budget. All temporary plan storage dies on return.
+pub fn foldConstantJson(execution: *Execution, expression: std.json.Value) !std.json.Value {
+    return foldConstantJsonImpl(execution, expression) catch |err| {
+        const failure = executionFailure(err);
+        if (failure == error.RelationalExpressionBudgetExceeded) execution.numeric.failure = error.SqlProgramLimitExceeded;
+        return failure;
+    };
+}
+
+fn foldConstantJsonImpl(execution: *Execution, expression: std.json.Value) !std.json.Value {
+    try execution.numeric.charge(1);
+    var memory: @import("../sql/memory_budget.zig") = .{ .backing = execution.alloc, .limit = execution.bytes.* };
+    var arena = std.heap.ArenaAllocator.init(memory.allocator());
+    defer arena.deinit();
+    const plan: Plan = compile: {
+        var compile_bytes = execution.bytes.*;
+        var compilation = execution.*;
+        compilation.alloc = arena.allocator();
+        compilation.bytes = &compile_bytes;
+        compilation.numeric.alloc = compilation.alloc;
+        defer {
+            const numeric_alloc = execution.numeric.alloc;
+            execution.numeric = compilation.numeric;
+            execution.numeric.alloc = numeric_alloc;
+            // Charge real arena capacity, including failed compilation. This
+            // is monotonic even when an outer arena cannot reclaim frees.
+            execution.bytes.* -|= memory.peak;
+        }
+        var compiler: Compiler = .{ .alloc = compilation.alloc, .table = .{ .storage_mode = .relational }, .execution = &compilation };
+        compiler.hash.update("antfly immutable scalar expression v1");
+        const root = compiler.compile(expression, 0) catch |err| {
+            if (err == error.OutOfMemory and memory.isExhausted()) return error.RelationalExpressionBudgetExceeded;
+            return err;
+        };
+        try compilation.numeric.charge(compiler.visited);
+        // The empty binding environment rejects even a column in a lazy arm.
+        std.debug.assert(compiler.dependencies.items.len == 0);
+        var fingerprint: [32]u8 = undefined;
+        compiler.hash.final(&fingerprint);
+        break :compile .{ .arena = arena, .nodes = compiler.nodes.items, .dependencies = &.{}, .fingerprint = fingerprint, .result_kind = compiler.nodes.items[root].kind, .literal_bytes = compiler.literal_bytes };
+    };
+    const result = try plan.evaluateWithExecution(execution, &.{});
+    return boundedValueToJson(execution, result);
+}
+
+test "relational declarations constant folding owns output and shares sticky admission" {
+    const a = std.testing.allocator;
+    var literal = try std.json.parseFromSlice(std.json.Value, a,
+        \\{"op":"literal","type":"string","value":"survives compilation"}
+    , .{});
+    var bytes: usize = max_allocated_bytes;
+    var execution = Execution.init(a, &bytes);
+    const output = try foldConstantJson(&execution, literal.value);
+    defer a.free(output.string);
+    literal.deinit();
+    try std.testing.expectEqualStrings("survives compilation", output.string);
+    try std.testing.expect(bytes < max_allocated_bytes);
+
+    var numeric = try std.json.parseFromSlice(std.json.Value, a,
+        \\{"op":"cast","type":"integer","sql_type":"int64","args":[{"op":"literal","type":"numeric","value":"9007199254740993.5"}]}
+    , .{});
+    defer numeric.deinit();
+    const Run = struct {
+        fn run(alloc: Allocator, expression: std.json.Value) !void {
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            var remaining: usize = max_allocated_bytes;
+            var scope = Execution.init(arena.allocator(), &remaining);
+            const before = scope.numeric.remaining;
+            for (0..2) |_| {
+                const value = try foldConstantJson(&scope, expression);
+                try std.testing.expectEqual(@as(i64, 9007199254740994), value.integer);
+            }
+            const decimal = try foldConstantJson(&scope, expression.object.get("args").?.array.items[0]);
+            try std.testing.expectEqualStrings("9007199254740993.5", decimal.number_string);
+            const text = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(),
+                \\{"op":"concat","args":[{"op":"literal","type":"string","value":"left"},{"op":"literal","type":"string","value":"right"}]}
+            , .{});
+            const joined = try foldConstantJson(&scope, text);
+            try std.testing.expectEqualStrings("leftright", joined.string);
+            try std.testing.expect(scope.numeric.remaining < before);
+            scope.numeric.remaining = 0;
+            try std.testing.expectError(error.RelationalExpressionBudgetExceeded, foldConstantJson(&scope, expression));
+            scope.numeric.remaining = before;
+            try std.testing.expectError(error.RelationalExpressionBudgetExceeded, foldConstantJson(&scope, expression));
+        }
+    };
+    try Run.run(a, numeric.value);
+    var stable = std.testing.FailingAllocator.init(a, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(stable.allocator(), Run.run, .{numeric.value});
+
+    var tiny: usize = 1;
+    var limited = Execution.init(a, &tiny);
+    try std.testing.expectError(error.RelationalExpressionBudgetExceeded, foldConstantJson(&limited, numeric.value));
+    tiny = max_allocated_bytes;
+    try std.testing.expectError(error.RelationalExpressionBudgetExceeded, foldConstantJson(&limited, numeric.value));
+
+    const Poll = struct {
+        fn canceled(_: ?*anyopaque) anyerror!void {
+            return error.Canceled;
+        }
+    };
+    var canceled = Execution.init(a, &tiny);
+    canceled.numeric.checkpoint = Poll.canceled;
+    try std.testing.expectError(error.Canceled, foldConstantJson(&canceled, numeric.value));
+    canceled.numeric.checkpoint = null;
+    try std.testing.expectError(error.Canceled, foldConstantJson(&canceled, numeric.value));
+}
+
+fn boundedValueToJson(execution: *Execution, value: Value) !std.json.Value {
+    return switch (value) {
+        .numeric => |bytes| numericJsonOutput(execution, bytes),
+        .string => |bytes| blk: {
+            const output = try allocateOutput(execution.alloc, bytes.len, execution.bytes);
+            @memcpy(output, bytes);
+            break :blk .{ .string = output };
+        },
+        .blob => |bytes| blk: {
+            const output = try allocateOutput(execution.alloc, std.base64.standard.Encoder.calcSize(bytes.len), execution.bytes);
+            break :blk .{ .string = std.base64.standard.Encoder.encode(output, bytes) };
+        },
+        .datetime => |datetime| blk: {
+            var buffer: [40]u8 = undefined;
+            const text = try std.fmt.bufPrint(&buffer, "{d}", .{datetime});
+            const output = try allocateOutput(execution.alloc, text.len, execution.bytes);
+            @memcpy(output, text);
+            break :blk .{ .number_string = output };
+        },
+        else => valueToJson(execution.alloc, value),
+    };
+}
+
 fn valueToJson(alloc: Allocator, value: Value) !std.json.Value {
     return switch (value) {
         .null => .null,

@@ -179,6 +179,15 @@ pub fn lowerColumns(alloc: std.mem.Allocator, columns: []const scalar.Column, ex
             },
             .cast => |part| blk: {
                 const source = program.instructions[part.operand].type;
+                // NULL retains its explicit target domain without invoking an
+                // input function or borrowing the unknown literal's identity.
+                if (nullLiteral(program.instructions[part.operand])) {
+                    var result = try json(alloc, .{ .op = "literal", .type = nativeType(part.type, part.element_type), .value = @as(?u8, null) });
+                    if (part.type == .integer or part.type == .number) if (part.element_type) |identity| {
+                        try result.object.put(alloc, "sql_type", .{ .string = @tagName(identity) });
+                    };
+                    break :blk result;
+                }
                 if ((source.kind == .integer or source.kind == .number) and (part.type == .integer or part.type == .number)) {
                     const target_type: @import("array_value.zig").ElementType = part.element_type orelse if (part.type == .integer) .int64 else .float64;
                     break :blk try json(alloc, .{ .op = "cast", .type = nativeType(part.type, target_type), .sql_type = @tagName(target_type), .args = &[_]Json{values[part.operand]} });
@@ -315,16 +324,25 @@ fn rejectGeneratedReferences(schema: Json, name: []const u8, expression: *const 
 
 pub fn lowerIndexPredicate(alloc: std.mem.Allocator, schema: Json, expression: *const ast.Scalar) ![]const Json {
     const native = try lower(alloc, schema, expression, .boolean);
+    const expressions = @import("../schema/relational_expression.zig");
+    var memory: @import("memory_budget.zig") = .{ .backing = alloc, .limit = expressions.max_allocated_bytes };
+    var arena = std.heap.ArenaAllocator.init(memory.allocator());
+    defer arena.deinit();
+    var bytes: usize = expressions.max_allocated_bytes;
+    var execution = expressions.Execution.init(arena.allocator(), &bytes);
     var predicates = std.ArrayList(Json).empty;
-    try collectPredicates(alloc, native, &predicates);
+    collectPredicates(alloc, native, &predicates, &execution) catch |err| {
+        if (err == error.OutOfMemory and memory.isExhausted()) return error.SqlProgramLimitExceeded;
+        return err;
+    };
     return predicates.toOwnedSlice(alloc);
 }
 
-fn collectPredicates(alloc: std.mem.Allocator, expression: Json, predicates: *std.ArrayList(Json)) anyerror!void {
+fn collectPredicates(alloc: std.mem.Allocator, expression: Json, predicates: *std.ArrayList(Json), execution: *@import("../schema/relational_expression.zig").Execution) anyerror!void {
     const op = expression.object.get("op").?.string;
     const args = expression.object.get("args") orelse return error.UnsupportedSqlShape;
     if (std.mem.eql(u8, op, "and")) {
-        for (args.array.items) |arg| try collectPredicates(alloc, arg, predicates);
+        for (args.array.items) |arg| try collectPredicates(alloc, arg, predicates, execution);
         return;
     }
     if (predicates.items.len >= 256 or args.array.items.len == 0) return error.SqlLimitExceeded;
@@ -338,42 +356,11 @@ fn collectPredicates(alloc: std.mem.Allocator, expression: Json, predicates: *st
         if (std.mem.eql(u8, op, candidate)) break true;
     } else false;
     if (!allowed or args.array.items.len != 2) return error.UnsupportedSqlShape;
-    const literal = try predicateLiteral(args.array.items[1]);
+    const literal = @import("../schema/relational_expression.zig").foldConstantJson(execution, args.array.items[1]) catch |err| {
+        if (err == error.RelationalIndexColumnNotFound) return error.UnsupportedSqlShape;
+        return err;
+    };
     try predicates.append(alloc, try json(alloc, .{ .column = column.string, .op = op, .value = literal }));
-}
-
-/// Fold only admitted numeric casts of a literal, never a row-dependent
-/// expression. Predicate values keep their comparison domain after lowering.
-fn predicateLiteral(expression: Json) anyerror!Json {
-    const op = expression.object.get("op").?.string;
-    if (std.mem.eql(u8, op, "literal")) return expression.object.get("value") orelse .null;
-    if (!std.mem.eql(u8, op, "cast")) return error.UnsupportedSqlShape;
-    const args = expression.object.get("args").?.array.items;
-    if (args.len != 1) return error.UnsupportedSqlShape;
-    const source_type = args[0].object.get("type") orelse return error.UnsupportedSqlShape;
-    // Identity casts keep an exact decimal lexeme. Other NUMERIC literal
-    // casts still require bounded folding, never a binary-float shortcut.
-    if (std.mem.eql(u8, source_type.string, "numeric")) {
-        const target = expression.object.get("sql_type") orelse return error.UnsupportedSqlShape;
-        if (std.mem.eql(u8, target.string, "numeric")) return predicateLiteral(args[0]);
-        return error.UnsupportedSqlShape;
-    }
-    const value = try predicateLiteral(args[0]);
-    if (value == .null) return .null;
-    const target = expression.object.get("sql_type").?.string;
-    const casts = @import("builtin_cast.zig");
-    if (std.mem.eql(u8, target, "float32")) return .{ .float = try casts.floatValue(f32, value) };
-    if (std.mem.eql(u8, target, "float64")) return .{ .float = try casts.floatValue(f64, value) };
-    const identity = std.meta.stringToEnum(@import("array_value.zig").ElementType, target) orelse return error.UnsupportedSqlShape;
-    if (!casts.integral(identity)) return error.UnsupportedSqlShape;
-    if (std.mem.eql(u8, source_type.string, "number"))
-        return .{ .integer = try casts.floatingInteger(try casts.floatValue(f64, value), identity) };
-    return .{ .integer = switch (value) {
-        .integer => |v| try casts.checkedInteger(v, identity),
-        .float => |v| try casts.floatingInteger(v, identity),
-        .number_string => |v| try casts.integerText(v, identity),
-        else => return error.UnsupportedSqlShape,
-    } };
 }
 
 test "SQL schema expressions bind nullable catalog shapes and cold typed arrays" {
@@ -420,6 +407,77 @@ test "SQL schema comparison lowering preserves simple partial index literals" {
         try std.testing.expectEqual(@as(usize, 1), predicates.len);
         try std.testing.expectEqualStrings("gt", predicates[0].object.get("op").?.string);
         try std.testing.expectEqual(@as(f64, 1), try @import("builtin_cast.zig").floatValue(f64, predicates[0].object.get("value").?));
+    }
+}
+
+test "SQL schema partial index constant bounds match PostgreSQL domains and errors" {
+    const a = std.testing.allocator;
+    const Case = struct { identity: []const u8, sql: []const u8, expected: ?[]const u8 = null, @"error": ?[]const u8 = null };
+    var fixture = try std.json.parseFromSlice(struct { reference: []const u8, entries: []const Case }, a, @embedFile("fixtures/sql_partial_bound_reference.json"), .{});
+    defer fixture.deinit();
+    for (fixture.value.entries) |case| {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const owned = arena.allocator();
+        const identity = std.meta.stringToEnum(@import("array_value.zig").ElementType, case.identity).?;
+        const physical: []const u8 = switch (identity) {
+            .numeric, .float32, .float64 => "number",
+            .int16, .int32, .int64 => "integer",
+            .text => "string",
+            .boolean => "boolean",
+            else => unreachable,
+        };
+        const schema = try json(owned, .{ .storage_mode = "relational", .default_type = "row", .document_schemas = .{ .row = .{ .schema = .{ .properties = .{ .n = .{ .type = physical, .@"x-antfly-sql-type" = case.identity } } } } } });
+        const sql = try std.fmt.allocPrint(owned, "n > ({s})", .{case.sql});
+        var compiled = try @import("compiler.zig").compileScalar(owned, sql, .{});
+        defer compiled.deinit();
+        const predicates = lowerIndexPredicate(owned, schema, compiled.expression) catch |err| {
+            if (case.@"error") |expected| {
+                try std.testing.expectEqualStrings(expected, @import("errors.zig").describe(err).code);
+                continue;
+            }
+            std.debug.print("Partial bound failed: {s}: {s}\n", .{ sql, @errorName(err) });
+            return err;
+        };
+        if (case.@"error") |expected| {
+            std.debug.print("Partial bound expected {s}: {s}\n", .{ expected, sql });
+            return error.TestExpectedError;
+        }
+        try std.testing.expectEqual(@as(usize, 1), predicates.len);
+        const value = predicates[0].object.get("value").?;
+        const expected = case.expected orelse {
+            try std.testing.expect(value == .null);
+            continue;
+        };
+        switch (identity) {
+            .float32 => try std.testing.expectEqual(try std.fmt.parseFloat(f32, expected), try @import("builtin_cast.zig").floatValue(f32, value)),
+            .float64 => try std.testing.expectEqual(try std.fmt.parseFloat(f64, expected), try @import("builtin_cast.zig").floatValue(f64, value)),
+            .boolean => try std.testing.expectEqual(std.mem.eql(u8, expected, "true"), value.bool),
+            .numeric => try std.testing.expectEqualStrings(expected, if (value == .string) value.string else value.number_string),
+            .text => try std.testing.expectEqualStrings(expected, value.string),
+            .int16, .int32, .int64 => try std.testing.expectEqualStrings(expected, value.number_string),
+            else => unreachable,
+        }
+    }
+}
+
+test "SQL schema partial bounds never fold columns or erase comparison promotions" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const schema = try std.json.parseFromSliceLeaky(Json, a,
+        \\{"default_type":"row","document_schemas":{"row":{"schema":{"properties":{"n":{"type":"number","x-antfly-sql-type":"numeric"}}}}}}
+    , .{});
+    for ([_][]const u8{
+        "n > n+1",
+        "n > CASE WHEN true THEN 1.0 ELSE n END",
+        "CAST(n AS double precision)>1.0",
+        "n > CAST(1 AS real)",
+        "n > 1.0 OR n < 2.0",
+    }) |sql| {
+        var compiled = try @import("compiler.zig").compileScalar(a, sql, .{});
+        defer compiled.deinit();
+        try std.testing.expectError(error.UnsupportedSqlShape, lowerIndexPredicate(a, schema, compiled.expression));
     }
 }
 

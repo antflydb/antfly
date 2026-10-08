@@ -77,7 +77,7 @@ test "relational index system SQL NUMERIC defaults CHECK and covering expression
     var create = try compiler.compile(a, "CREATE TABLE amounts (n numeric DEFAULT 9007199254740993.2500, g numeric GENERATED ALWAYS AS (n+0.0001) STORED, CHECK (n>=9007199254740993.25))", .{});
     defer create.deinit();
     var schema = try std.json.parseFromSliceLeaky(std.json.Value, a, try @import("../../sql/ddl_runtime.zig").createSchemaAlloc(a, create.statement.create_table), .{ .parse_numbers = false });
-    var index = try compiler.compile(a, "CREATE INDEX by_total ON amounts ((n+0.0001)) INCLUDE (g,n) WHERE n>=CAST(9007199254740993.25 AS numeric)", .{});
+    var index = try compiler.compile(a, "CREATE INDEX by_total ON amounts ((n+0.0001)) INCLUDE (g,n) WHERE n>=CAST(CAST(9007199254740992.5 AS bigint) AS numeric)+0.25", .{});
     defer index.deinit();
     try std.testing.expect(try @import("../../sql/schema_ddl.zig").apply(a, &schema, index.statement.catalog_ddl));
     const json = try std.json.Stringify.valueAlloc(a, schema, .{});

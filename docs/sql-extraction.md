@@ -5603,3 +5603,44 @@ storage/index/reopen/restore regressions pass without failures or leaks. The
 TypeScript SQL tests (36), focused Go SDK tests, generated contracts, inventory
 integrity, formatting, whitespace and control-catalog consistency are checked.
 The broad durable-runtime compiler/ownership limitation remains separate.
+
+### Bounded exact constant bounds for partial relational indexes
+
+Partial-index DDL now evaluates row-independent bounds through the same native
+schema-expression compiler and evaluator used by CHECK/default/generated
+programs. The previous cast-only literal interpreter is removed. Admitted
+constants include exact NUMERIC arithmetic, nested casts, conditional/coalesce
+expressions, and the VM's scalar text/boolean vocabulary. Explicit typed NULL
+casts retain their target domain instead of inheriting the unknown input type.
+
+One folding scope spans all bounds of a predicate. It limits actual temporary
+arena capacity, charges compilation and evaluation work, owns returned scalar
+bytes, and preserves sticky quota/cancellation failure. Temporary compiled
+plans never escape; only folded values enter the published predicate. This is
+DDL preparation, not another per-row or per-query interpretation step. It is
+not yet general shared admission for every SQL reducer and schema operation.
+The native folding owner supports an injected cancellation checkpoint; the DDL
+entry point currently supplies work/byte admission but does not yet forward a
+request-wide checkpoint. That transport remains part of the shared-admission
+work rather than being claimed complete by the component cancellation test.
+
+The empty compilation environment rejects column references even in lazy arms.
+Comparison promotions on the indexed column are not erased to manufacture a
+sargable predicate. OR/row-dependent/unsupported-expression cases retain their
+guards; broader implication and functional-index matching remain separate work.
+No storage-format change or weakening of the partial-index proof is required.
+
+A disposable PostgreSQL 18 oracle verifies 44 bounds across exact NUMERIC,
+integer widths, real/double, text, boolean, NULL, special values and SQLSTATEs.
+The schema VM has allocation-fault, owned-output, cumulative work, byte-admission
+and cancellation regressions. The LSM covering-index/reopen/portable-restore
+regression now builds its partial bound from nested numeric/integer casts and
+arithmetic, still requiring zero primary lookups and an explicit query proof.
+Original parity dispositions are unchanged; these infrastructure contracts do
+not reclassify original cases without mounted source-owned execution evidence.
+
+Validation: 589 local SQL tests (three skips), 226 server SQL tests and the full
+schema-expression owner (38 local and five server tests), and 179 native
+relational-owner tests pass without failures or leaks. The independent 44-case
+PostgreSQL oracle, inventory integrity,
+formatting, whitespace and control-catalog consistency checks pass.
