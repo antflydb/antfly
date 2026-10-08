@@ -337,7 +337,10 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     // row-policy contract namespaces at compile time, while allowing explicit
     // caller filters.
     const sql_tests = b.addTest(.{ .root_module = sql_test_mod, .filters = selectTestFilters(b, &.{ "sql.", "common.sql_array_layout", "system_catalog.policies" }) });
-    const run_sql_tests = b.addRunArtifact(sql_tests);
+    // Use the same exact-filter runner as extracted SQL owners. Besides
+    // consistent failure/leak attribution, this keeps compile-only anonymous
+    // reachability anchors out of runtime selection.
+    const run_sql_tests = addFilteredTestRunArtifact(b, sql_tests);
     // The native SQL contract corpus is larger than the parser-only owner but
     // remains below the full database compilation and integration test roots.
     sql_tests.step.max_rss = 3072 * 1024 * 1024;

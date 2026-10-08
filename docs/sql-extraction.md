@@ -4495,4 +4495,34 @@ Its server binary independently passed all 213 tests. The build invocation still
 fails its declared 384 MiB process RSS bound, reporting about 1.04 GB; the
 statement admission tests do not establish a bound on the entire test process.
 This remains a validation-gate issue, not a green full-build result, and the
-process limit has not been raised to hide it.
+process limit has not been raised to hide it. The follow-up below addresses
+the diagnostic allocation lifetime behind this observation.
+
+### SQL diagnostic memory ownership
+
+The SQL server owner now uses the same exact-filter runner as extracted source
+owners. Anonymous reachability anchors remain compiled rather than treated as
+runtime behavior evidence. The complete SQL build passes 509 local-owner tests
+and 212 server-owner tests, with three existing opt-in benchmark skips.
+
+Zig 0.17's default debug allocator is a process-lifetime arena. SafeAllocator
+and allocation-failure enumeration capture many stacks; temporary DWARF unwind
+VM buffers are freed by the unwinder but retained by that arena. The shared
+test runner now supplies an independent reclaiming debug allocator: libc when
+linked, otherwise the native concurrent allocator or the platform's
+single-thread/WASM fallback. Persistent symbol caches remain process-owned;
+temporary unwind buffers can be reused. Debug allocation never borrows the
+test allocator, whose teardown itself can emit diagnostics. Stack traces,
+allocation-failure enumeration and leak checks remain enabled.
+
+A matched local debug run of the unchanged exhaustive grouped-output fault
+test reduced maximum RSS from 115,916,800 to 9,748,480 bytes (about 92%).
+Elapsed time was approximately 13.5 seconds for both runs, so this is a memory
+ownership improvement, not an end-to-end latency claim. Runner regressions
+verify that the override is active, repeated stack capture produces frames,
+and assertion/leak failures still fail with source diagnostics. Original SQL
+inventory dispositions remain unchanged by this infrastructure fix.
+The complete 212-test server shard subsequently passed with maximum RSS of
+17,252,352 bytes (about 16.5 MiB), below the unchanged 384 MiB build estimate;
+its local debug runtime was approximately 123 seconds. All twelve shared
+runner selection/progress/diagnostic regressions pass as well.
