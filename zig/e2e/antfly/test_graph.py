@@ -492,6 +492,25 @@ def test_stateful_graph_metrics_publish_without_maintenance_configuration(
             },
         },
     )
+    if refresh == "background":
+
+        def empty_published():
+            response = stateful_api._request(
+                "POST",
+                f"/tables/{table}/query",
+                {"limit": 0, "graph_metric": {"index": "graph_idx", "metric": "rank"}},
+            )
+            if response.status_code == 503:
+                return False
+            result = stateful_api._check(response)["responses"][0][
+                "graph_metric_results"
+            ]["rank"]
+            assert result["scores"] == []
+            assert result["status"]["published_generation"] == 0
+            return result["status"]["state"] == "fresh"
+
+        assert wait_until(empty_published, timeout_s=30.0, interval_s=0.1)
+
     stateful_api.batch_write(
         table,
         inserts={
@@ -514,6 +533,8 @@ def test_stateful_graph_metrics_publish_without_maintenance_configuration(
         assert not_ready.json()["retryable"] is True
         stateful_api.post(f"{action_path}:refresh", {})
 
+    observed = {}
+
     def published(after_publication=0):
         response = stateful_api._request(
             "POST",
@@ -523,6 +544,7 @@ def test_stateful_graph_metrics_publish_without_maintenance_configuration(
                 "graph_metric": {"index": "graph_idx", "metric": "rank", "top_k": 10},
             },
         )
+        observed["query"] = response.text
         # Publication is asynchronous; the first generation may not exist yet.
         if response.status_code in (404, 409, 503):
             return None
@@ -541,7 +563,11 @@ def test_stateful_graph_metrics_publish_without_maintenance_configuration(
         return result if len(result["scores"]) == 2 else None
 
     result = wait_until(published, timeout_s=30.0, interval_s=0.1)
-    assert result is not None, stateful_api.debug_logs()
+    assert result is not None, (
+        f"{observed}\n"
+        f"{stateful_api.get(f'/tables/{table}/indexes/graph_idx')}\n"
+        f"{stateful_api.debug_logs()}"
+    )
     assert {row["node"] for row in result["scores"]} == {"a", "b"}
     expected_score = 2.0 if kind == "degree" else 0.5
     for row in result["scores"]:

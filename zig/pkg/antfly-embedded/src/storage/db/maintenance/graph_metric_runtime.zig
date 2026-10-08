@@ -3330,6 +3330,22 @@ test "db graph metric runtime background default starts automatically and drains
         .config_json = "{\"metrics\":{\"degree\":{\"enabled\":true,\"kind\":\"degree\",\"refresh\":\"background\",\"edge_filter\":{\"types\":[\"cites\"]}}}}",
     });
 
+    // Publish the empty snapshot first: its edge generation is zero while
+    // its private score namespace is nonzero. The first write must stale it.
+    var empty_published = false;
+    for (0..700) |_| {
+        yieldToBackground(&db);
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        var status = try graph_entry.index.graphMetricStatus("degree");
+        defer status.deinit(alloc);
+        if (status.state == .fresh and status.published_generation != 0) {
+            try std.testing.expectEqual(@as(u64, 0), status.published_edge_generation);
+            empty_published = true;
+            break;
+        }
+    }
+    try std.testing.expect(empty_published);
+
     try db.batch(.{
         .writes = &.{
             .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },

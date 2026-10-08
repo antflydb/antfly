@@ -1867,7 +1867,7 @@ pub fn cloneGraphMetricStatusesFromGraph(
             .config_fingerprint = status.config_fingerprint,
             .maintenance_paused = status.maintenance_paused,
             .build_queued = status.build_queued,
-            .published_generation = if (status.published_edge_generation != 0) status.published_edge_generation else status.published_generation,
+            .published_generation = status.published_edge_generation,
             .edge_generation = status.edge_generation,
             .target_edge_generation = status.target_edge_generation,
             .queued_generation = status.queued_generation,
