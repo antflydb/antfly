@@ -6904,3 +6904,65 @@ comptime {
 }
 
 pub const antfly_sources = @import("../source_owner_storage.zig");
+
+test "issue1015 concurrent Lite handles sustain primary writes and full-text catch-up" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("issue1015-many-lite-handles");
+    defer directory.cleanup();
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, directory.path());
+    const Worker = struct {
+        path: [:0]u8,
+        ordinal: usize,
+        start: *std.atomic.Value(bool),
+        failure: ?anyerror = null,
+        fn run(self: *@This()) void {
+            while (!self.start.load(.acquire)) std.atomic.spinLoopHint();
+            self.exercise() catch |err| {
+                self.failure = err;
+            };
+        }
+        fn exercise(self: *@This()) !void {
+            var handle: ?*anyopaque = null;
+            try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_create(self.path, &handle));
+            defer antfly_db_close(handle);
+            for (0..200) |i| {
+                var request_buffer: [256]u8 = undefined;
+                const request = try std.fmt.bufPrint(&request_buffer, "{{\"inserts\":{{\"k:{d}:{d}\":{{\"search_text\":\"raft snapshot number {d}\"}}}},\"sync_level\":\"write\"}}", .{ self.ordinal, i, i });
+                var output: capi.Buffer = .{};
+                defer antfly_buffer_free(&output);
+                try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_batch_json(handle, .{ .ptr = request.ptr, .len = request.len }, &output));
+                if (i % 50 == 0) {
+                    const query = "{\"full_text_search\":{\"match\":{\"field\":\"search_text\",\"text\":\"raft\"}},\"limit\":5}";
+                    var hits: capi.Buffer = .{};
+                    defer antfly_buffer_free(&hits);
+                    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_search_json(handle, .{ .ptr = query.ptr, .len = query.len }, &hits));
+                }
+            }
+            // Primary availability alone is insufficient: every secondary must
+            // catch up too, so degradation cannot hide a dead derived worker.
+            try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_run_until_idle(handle));
+        }
+    };
+    var start = std.atomic.Value(bool).init(false);
+    var workers: [32]Worker = undefined;
+    var threads: [32]std.Thread = undefined;
+    var spawned: usize = 0;
+    defer {
+        start.store(true, .release);
+        for (threads[0..spawned]) |thread| thread.join();
+        for (workers[0..spawned]) |worker| alloc.free(worker.path);
+    }
+    for (&workers, &threads, 0..) |*worker, *thread, ordinal| {
+        const path = try std.fmt.allocPrintSentinel(alloc, "{s}/db-{d}.aflite", .{ directory.path(), ordinal }, 0);
+        errdefer alloc.free(path);
+        worker.* = .{ .path = path, .ordinal = ordinal, .start = &start };
+        thread.* = try std.Thread.spawn(.{ .stack_size = 8 * 1024 * 1024 }, Worker.run, .{worker});
+        spawned += 1;
+    }
+    start.store(true, .release);
+    for (threads[0..spawned]) |thread| thread.join();
+    const joined = spawned;
+    spawned = 0;
+    defer for (workers[0..joined]) |worker| alloc.free(worker.path);
+    for (workers[0..joined]) |worker| if (worker.failure) |err| return err;
+}

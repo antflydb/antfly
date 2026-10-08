@@ -49,8 +49,8 @@ pub enum Error {
     /// The operation requires a capability that is not supported by this
     /// platform or filesystem. Retrying unchanged will not succeed.
     Unsupported,
-    /// A bounded drain (e.g. `run_until_idle`) made no forward progress for
-    /// its configured stall window and gave up.
+    /// Derived work stalled or a derived worker failed. Inspect pending-work
+    /// diagnostics and repair or reopen the database.
     Stalled,
     /// The caller cancelled the call by returning `false` from its progress
     /// or stream callback (e.g. [`crate::Inference::pull`]'s progress
@@ -143,8 +143,8 @@ impl Error {
                  or filesystem"
             }
             Error::Stalled => {
-                "a bounded drain made no forward progress for its configured stall window and \
-                 gave up"
+                "derived work stalled or failed; inspect pending-work diagnostics and \
+                 repair or reopen the database"
             }
             Error::Cancelled => "the caller cancelled the operation",
             Error::Internal => "an internal error occurred",
