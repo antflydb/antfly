@@ -331,8 +331,11 @@ const SegmentFileStore = struct {
         var writer = try self.storage.beginAtomicWrite(self.allocator, path);
         var active = true;
         defer if (active) writer.abort();
+        if (writer.vtable.finish_source != null or writer.vtable.finish_mapped != null) writer.setCacheIntent(.cold_sequential);
         try writer.appendSlice(bytes);
         active = false;
+        if (writer.vtable.finish_source) |finish_source| return .fromNative(try finish_source(writer.ptr));
+        if (writer.vtable.finish_mapped) |finish_mapped| return .fromMappedArtifact(try finish_mapped(writer.ptr));
         writer.finish() catch |err| {
             // The atomic writer preserves the previously published segment on
             // failure and the caller receives the error for retry/rollback.
@@ -341,6 +344,7 @@ const SegmentFileStore = struct {
             return err;
         };
 
+        if (self.storage.vtable.map_immutable_artifact) |map| return .fromMappedArtifact(try map(self.storage.ptr, self.allocator, path));
         return .fromOwnedHeap(try self.allocator.dupe(u8, bytes));
     }
 
@@ -763,6 +767,11 @@ const AtomicSegmentSink = struct {
         try self.writer.writeAt(offset, bytes);
     }
 
+    fn residentBytes(ptr: *anyopaque) usize {
+        const self: *AtomicSegmentSink = @ptrCast(@alignCast(ptr));
+        return self.append_buffer.capacity;
+    }
+
     fn crc32Prefix(ptr: *anyopaque, len_prefix: usize) !u32 {
         const self: *AtomicSegmentSink = @ptrCast(@alignCast(ptr));
         try self.flush();
@@ -784,6 +793,7 @@ const atomic_segment_sink_vtable = segment_mod.SegmentSink.VTable{
     .write_at = AtomicSegmentSink.writeAt,
     .crc32_prefix = AtomicSegmentSink.crc32Prefix,
     .crc32_range = AtomicSegmentSink.crc32Range,
+    .resident_bytes = AtomicSegmentSink.residentBytes,
 };
 
 fn walCommitBackendForOptions(backend: CommitBackend) wal_mod.CommitBackend {
@@ -1110,7 +1120,7 @@ pub const PersistentIndex = struct {
             var txn = try index.beginWriteMainTxn();
             errdefer txn.abort();
             for (self.segments.items) |segment| {
-                var range = try extractSegmentKeyRange(index.alloc, segment.data.bytes());
+                var range = try extractSegmentDataKeyRange(index.alloc, segment.data);
                 defer range.deinit(index.alloc);
                 const key = std.mem.toBytes(std.mem.nativeToBig(u64, segment.id));
                 if (index.segment_files == null) try txn.put(.segments, &key, segment.data.bytes());
@@ -1151,9 +1161,14 @@ pub const PersistentIndex = struct {
 
     pub const SegmentSinkBuildFn = *const fn (*anyopaque, *segment_mod.SegmentSink) anyerror!void;
 
+    pub fn privateScratchDirectory(self: *const PersistentIndex, fallback: []const u8) ?[]const u8 {
+        if (self.segment_files) |store| return store.storage.privateScratchDirectory(fallback);
+        return fallback;
+    }
+
     pub fn supportsFileBackedSegmentArtifacts(self: *const PersistentIndex) bool {
         const store = self.segment_files orelse return false;
-        return store.storage_owner != null;
+        return store.storage_owner != null or store.storage.vtable.open_leased_immutable_source != null or store.storage.vtable.map_immutable_artifact != null;
     }
 
     pub fn attachResourceManager(self: *PersistentIndex, manager: *resource_manager_mod.ResourceManager) void {
@@ -1530,6 +1545,29 @@ pub const PersistentIndex = struct {
                             });
                         }
                     }
+                    if (store.storage.vtable.open_leased_immutable_source != null) {
+                        const source = store.storage.openLeasedImmutableSource(alloc, segment_path) catch |err| switch (err) {
+                            error.FileNotFound => {
+                                try stale_active_ids.append(alloc, seg_id);
+                                continue;
+                            },
+                            else => return err,
+                        };
+                        break :blk index_mod.SegmentData.fromNative(source);
+                    }
+                    if (store.storage.vtable.map_immutable_artifact != null) {
+                        const artifact = store.storage.mapImmutableArtifact(alloc, segment_path) catch |err| switch (err) {
+                            error.FileNotFound => {
+                                try stale_active_ids.append(alloc, seg_id);
+                                continue;
+                            },
+                            // Read-only filesystems still support the existing
+                            // heap-backed reader when no private view is possible.
+                            error.MappedArtifactUnavailable => null,
+                            else => return err,
+                        };
+                        if (artifact) |view| break :blk index_mod.SegmentData.fromMappedArtifact(view);
+                    }
                     const loaded = store.storage.readFileAlloc(alloc, segment_path, std.math.maxInt(usize)) catch |err| switch (err) {
                         error.FileNotFound => {
                             try stale_active_ids.append(alloc, seg_id);
@@ -1646,6 +1684,9 @@ pub const PersistentIndex = struct {
         self.lockStorage();
         self.writer.deinit();
         self.flushCompletedRetirementMarkersLocked();
+        if (self.retired_segment_file_deleter) |deleter| {
+            if (deleter.native_storage_lease == null) deleter.disarm();
+        }
         self.wal.close();
         self.main_store.deinit();
         self.main_store_owner.close(self.alloc);
@@ -1952,7 +1993,7 @@ pub const PersistentIndex = struct {
                 const target = try std.fmt.allocPrint(alloc, "{s}/{d}.seg", .{ destination_root, segment.id });
                 defer alloc.free(target);
                 try std.Io.Dir.hardLink(.cwd(), source, .cwd(), target, io, .{});
-                total = std.math.add(u64, total, @intCast(segment.data.bytes().len)) catch return error.FileTooBig;
+                total = std.math.add(u64, total, @intCast(segment.data.len())) catch return error.FileTooBig;
             }
             try fs_paths.syncDirPortable(io, destination_root);
             return total;
@@ -1991,15 +2032,26 @@ pub const PersistentIndex = struct {
                 defer file.close(io);
                 var writer_buffer: [16 * 1024]u8 = undefined;
                 var writer = file.writer(io, &writer_buffer);
-                try writer.interface.writeAll(segment.data.bytes());
+                var hash = native_artifact_sink.Sha256.init(.{});
+                var read_buffer: [64 * 1024]u8 = undefined;
+                var offset: u64 = 0;
+                const source = segment.data.source();
+                while (offset < source.len()) {
+                    try cancellation.check();
+                    const bytes = read_buffer[0..@intCast(@min(read_buffer.len, source.len() - offset))];
+                    try source.readInto(offset, bytes);
+                    try writer.interface.writeAll(bytes);
+                    if (sink != null) hash.update(bytes);
+                    offset += bytes.len;
+                }
                 try writer.end();
                 try file.sync(io);
                 if (sink) |active| {
                     var digest: [native_artifact_sink.Sha256.digest_length]u8 = undefined;
-                    native_artifact_sink.Sha256.hash(segment.data.bytes(), &digest, .{});
-                    try active.record(destination, @intCast(segment.data.bytes().len), digest);
+                    hash.final(&digest);
+                    try active.record(destination, @intCast(segment.data.len()), digest);
                 }
-                total = std.math.add(u64, total, @intCast(segment.data.bytes().len)) catch
+                total = std.math.add(u64, total, @intCast(segment.data.len())) catch
                     return error.FileTooBig;
             }
             try fs_paths.syncDirPortable(io, destination_root);
@@ -2132,7 +2184,7 @@ pub const PersistentIndex = struct {
 
         // 4. Persist metadata.
         const persist_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
-        try self.persistSegment(seg_id, segment_data.?.bytes(), lsn);
+        try self.persistSegment(seg_id, owned orelse segment_data.?.bytes(), lsn);
         if (profile_enabled) persist_ns = platform_time.monotonicNs() - persist_start_ns;
 
         // 5. Every fallible snapshot allocation was staged before catalog
@@ -2178,14 +2230,15 @@ pub const PersistentIndex = struct {
     /// Build and publish one segment directly into the persistent segment
     /// artifact when native segment files are available.
     ///
-    /// Memory-only and synthetic storage backends fall back to the heap-backed
-    /// `indexSegmentOwned` path because they cannot mmap the final segment file.
+    /// Backends with owned native files map the final artifact. Lite transfers
+    /// an independent staging-inode lease. Providers without either capability
+    /// fall back to heap-backed `indexSegmentOwned`.
     pub fn indexSegmentFromSinkBuilder(
         self: *PersistentIndex,
         ctx: *anyopaque,
         build_fn: SegmentSinkBuildFn,
     ) !usize {
-        if (builtin.os.tag == .freestanding or self.segment_files == null or self.segment_files.?.storage_owner == null) {
+        if (builtin.os.tag == .freestanding or !self.supportsFileBackedSegmentArtifacts()) {
             var sink_impl = segment_mod.MemorySegmentSink.init(self.alloc);
             errdefer sink_impl.deinit();
             var sink = sink_impl.sink();
@@ -2215,19 +2268,25 @@ pub const PersistentIndex = struct {
         errdefer if (rollback_segment) self.deleteSegmentFile(seg_id);
 
         const store = &self.segment_files.?;
-        const storage_owner = store.storage_owner.?;
-        var publication_admission = try NativeSegmentPublicationAdmission.init(storage_owner);
-        defer publication_admission.deinit();
+        var publication_admission: ?NativeSegmentPublicationAdmission = if (store.storage_owner) |owner|
+            try NativeSegmentPublicationAdmission.init(owner)
+        else
+            null;
+        defer if (publication_admission) |*admission| admission.deinit();
         const path = try store.pathAlloc(seg_id);
         defer store.allocator.free(path);
 
         const materialize_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
         const begin_write_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
-        var writer = try publication_admission.beginAtomicWrite(self.alloc, path);
+        var writer = if (publication_admission) |*admission|
+            try admission.beginAtomicWrite(self.alloc, path)
+        else
+            try store.storage.beginAtomicWrite(self.alloc, path);
         if (profile_enabled) begin_write_ns = platform_time.monotonicNs() - begin_write_start_ns;
         var writer_active = true;
         errdefer if (writer_active) writer.abort();
 
+        if (writer.vtable.finish_source != null or writer.vtable.finish_mapped != null) writer.setCacheIntent(.cold_sequential);
         var sink_adapter = AtomicSegmentSink.init(self.alloc, &writer);
         defer sink_adapter.deinit();
         var sink = sink_adapter.sink();
@@ -2239,15 +2298,23 @@ pub const PersistentIndex = struct {
 
         writer_active = false;
         const finish_write_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
-        try writer.finish();
+        const finished_source = if (writer.vtable.finish_source) |finish_source| try finish_source(writer.ptr) else null;
+        const finished_mapping = if (finished_source != null) null else if (writer.vtable.finish_mapped) |finish_mapped| try finish_mapped(writer.ptr) else blk: {
+            try writer.finish();
+            break :blk null;
+        };
         if (profile_enabled) finish_write_ns = platform_time.monotonicNs() - finish_write_start_ns;
         if (profile_enabled) materialize_ns = platform_time.monotonicNs() - materialize_start_ns;
 
         const map_segment_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
-        var segment_data: ?index_mod.SegmentData = .fromMapped(publication_admission.mapFile(path) catch |err| {
-            if (builtin.os.tag != .freestanding) std.log.err("text segment map failed: {s}", .{@errorName(err)});
-            return err;
-        });
+        var segment_data: ?index_mod.SegmentData = if (finished_source) |source|
+            .fromNative(source)
+        else if (finished_mapping) |artifact|
+            .fromMappedArtifact(artifact)
+        else if (publication_admission) |*admission|
+            .fromMapped(try admission.mapFile(path))
+        else
+            .fromMappedArtifact(try store.storage.vtable.map_immutable_artifact.?(store.storage.ptr, self.alloc, path));
         segment_data.?.madviseAccessPattern();
         if (profile_enabled) map_segment_ns = platform_time.monotonicNs() - map_segment_start_ns;
         errdefer {
@@ -2255,7 +2322,7 @@ pub const PersistentIndex = struct {
         }
 
         const key_range_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
-        var key_range = extractSegmentKeyRange(self.alloc, segment_data.?.bytes()) catch |err| {
+        var key_range = extractSegmentDataKeyRange(self.alloc, segment_data.?) catch |err| {
             if (builtin.os.tag != .freestanding) std.log.err("text segment key-range scan failed: {s}", .{@errorName(err)});
             return err;
         };
@@ -2832,14 +2899,29 @@ pub const PersistentIndex = struct {
         segment_indices: []const usize,
         deleted_docs: ?[]const ?roaring.RoaringBitmap,
     ) ![]PreparedMergeSegment {
+        return self.prepareMergedSegmentToFileWithSourceMap(work_alloc, staging_alloc, snap, segment_indices, deleted_docs, null);
+    }
+
+    pub fn prepareMergedSegmentToFileWithSourceMap(
+        self: *PersistentIndex,
+        work_alloc: Allocator,
+        staging_alloc: Allocator,
+        snap: *const index_mod.IndexSnapshot,
+        segment_indices: []const usize,
+        deleted_docs: ?[]const ?roaring.RoaringBitmap,
+        source_map: ?*segment_mod.MergeSourceMap,
+    ) ![]PreparedMergeSegment {
         if (segment_indices.len == 0) return error.NoSegments;
         if (deleted_docs) |frozen| {
             if (frozen.len != segment_indices.len) return error.InvalidDeletionSnapshot;
         }
         const store = &(self.segment_files orelse return error.Unsupported);
-        const storage_owner = store.storage_owner orelse return error.Unsupported;
-        var publication_admission = try NativeSegmentPublicationAdmission.init(storage_owner);
-        defer publication_admission.deinit();
+        if (!self.supportsFileBackedSegmentArtifacts()) return error.Unsupported;
+        var publication_admission: ?NativeSegmentPublicationAdmission = if (store.storage_owner) |owner|
+            try NativeSegmentPublicationAdmission.init(owner)
+        else
+            null;
+        defer if (publication_admission) |*admission| admission.deinit();
 
         const new_seg_id = self.reserveSegmentId();
         errdefer self.deleteSegmentFile(new_seg_id);
@@ -2871,25 +2953,46 @@ pub const PersistentIndex = struct {
         const path = try store.pathAlloc(new_seg_id);
         defer store.allocator.free(path);
 
-        var writer = try publication_admission.beginAtomicWrite(work_alloc, path);
+        var writer = if (publication_admission) |*admission|
+            try admission.beginAtomicWrite(work_alloc, path)
+        else
+            try store.storage.beginAtomicWrite(work_alloc, path);
         var writer_active = true;
         errdefer if (writer_active) writer.abort();
 
+        if (writer.vtable.finish_source != null or writer.vtable.finish_mapped != null) writer.setCacheIntent(.cold_sequential);
         var sink_adapter = AtomicSegmentSink.init(work_alloc, &writer);
         defer sink_adapter.deinit();
         var sink = sink_adapter.sink();
         try segment_mod.writeMergedSegmentToSinkWithOptions(work_alloc, &sink, inputs, .{
             .index_sort = index_sort,
+            .source_map = source_map,
+            .scratch = if (self.io) |runtime| if (self.privateScratchDirectory(store.root_dir)) |directory| .{ .io = runtime, .directory = directory, .resource_manager = self.writer.resource_manager } else null else null,
+        });
+        if (source_map) |map| try map.finishOutput(blk: {
+            var live: u32 = 0;
+            for (inputs) |input| {
+                live += input.reader.doc_count - if (input.deleted) |deleted| @as(u32, @intCast(deleted.cardinality())) else @as(u32, 0);
+            }
+            break :blk live;
         });
         try sink_adapter.flush();
 
         writer_active = false;
-        try writer.finish();
-
-        var data: ?index_mod.SegmentData = .fromMapped(try publication_admission.mapFile(path));
+        var data: ?index_mod.SegmentData = if (writer.vtable.finish_source) |finish_source|
+            .fromNative(try finish_source(writer.ptr))
+        else if (writer.vtable.finish_mapped) |finish_mapped|
+            .fromMappedArtifact(try finish_mapped(writer.ptr))
+        else blk: {
+            try writer.finish();
+            break :blk if (publication_admission) |*admission|
+                .fromMapped(try admission.mapFile(path))
+            else
+                .fromMappedArtifact(try store.storage.vtable.map_immutable_artifact.?(store.storage.ptr, self.alloc, path));
+        };
         errdefer if (data) |*segment_data| segment_data.deinit(self.alloc);
 
-        var key_range = try extractSegmentKeyRange(staging_alloc, data.?.bytes());
+        var key_range = try extractSegmentDataKeyRange(staging_alloc, data.?);
         errdefer key_range.deinit(staging_alloc);
         key_range.seg_id = new_seg_id;
 
@@ -3558,6 +3661,45 @@ pub const PersistentIndex = struct {
                             const segment_path = try store.pathAlloc(seg_id);
                             defer self.alloc.free(segment_path);
 
+                            if (store.storage.vtable.open_immutable_source != null) {
+                                var source = store.storage.openImmutableSource(alloc, segment_path) catch |source_err| switch (source_err) {
+                                    error.FileNotFound => return error.NotFound,
+                                    else => return source_err,
+                                };
+                                var owns_source = true;
+                                defer if (owns_source) source.close();
+                                if (try segment_mod.RangeSegmentReader.supports(source)) {
+                                    var reader = try segment_mod.RangeSegmentReader.init(alloc, source, .{ .key_range_only = true });
+                                    owns_source = false;
+                                    defer reader.deinit();
+                                    if (try reader.docKeyRangeOwned(alloc, std.math.maxInt(usize))) |range| {
+                                        return .{ .seg_id = seg_id, .min_doc_key = range.min_key, .max_doc_key = range.max_key };
+                                    }
+                                    var min_key: ?[]u8 = null;
+                                    errdefer if (min_key) |key| alloc.free(key);
+                                    var max_key: ?[]u8 = null;
+                                    errdefer if (max_key) |key| alloc.free(key);
+                                    var scope = try segment_mod.RangeSegmentReader.ReadScope.init(alloc, &reader, 256 * 1024);
+                                    defer scope.deinit();
+                                    for (0..reader.doc_count) |doc| {
+                                        const id = (try scope.storedDocIdOwned(alloc, @intCast(doc), std.math.maxInt(usize))) orelse continue;
+                                        defer alloc.free(id);
+                                        if (min_key == null or std.mem.order(u8, id, min_key.?) == .lt) {
+                                            const next = try alloc.dupe(u8, id);
+                                            if (min_key) |key| alloc.free(key);
+                                            min_key = next;
+                                        }
+                                        if (max_key == null or std.mem.order(u8, id, max_key.?) == .gt) {
+                                            const next = try alloc.dupe(u8, id);
+                                            if (max_key) |key| alloc.free(key);
+                                            max_key = next;
+                                        }
+                                    }
+                                    if (min_key == null or max_key == null) return error.EmptySegment;
+                                    return .{ .seg_id = seg_id, .min_doc_key = min_key.?, .max_doc_key = max_key.? };
+                                }
+                            }
+
                             const file_bytes = store.storage.readFileAlloc(
                                 alloc,
                                 segment_path,
@@ -3644,7 +3786,11 @@ fn isStaleActiveSegmentDataError(err: anyerror) bool {
 }
 
 fn extractSegmentKeyRange(alloc: Allocator, segment_bytes: []const u8) !SegmentKeyRange {
-    var reader = try segment_mod.SegmentReader.init(alloc, segment_bytes);
+    return extractSegmentDataKeyRange(alloc, .{ .heap = @constCast(segment_bytes) });
+}
+
+fn extractSegmentDataKeyRange(alloc: Allocator, data: index_mod.SegmentData) !SegmentKeyRange {
+    var reader = try data.initReader(alloc);
     defer reader.deinit();
 
     if (reader.doc_count == 0) return error.EmptySegment;
@@ -3666,8 +3812,11 @@ fn extractSegmentKeyRange(alloc: Allocator, segment_bytes: []const u8) !SegmentK
     var max_key: ?[]u8 = null;
     errdefer if (max_key) |key| alloc.free(key);
 
+    var identity_scratch = segment_mod.SegmentReadScratch.init(alloc, 64 * 1024);
+    defer identity_scratch.deinit();
     for (0..reader.doc_count) |doc_idx| {
-        const stored = (try reader.storedDoc(@intCast(doc_idx))) orelse continue;
+        identity_scratch.reset();
+        const stored = .{ .id = (try reader.storedIdScoped(identity_scratch.allocator(), @intCast(doc_idx))) orelse continue };
         if (min_key == null or std.mem.order(u8, stored.id, min_key.?) == .lt) {
             if (min_key) |key| alloc.free(key);
             min_key = try alloc.dupe(u8, stored.id);
@@ -6241,4 +6390,357 @@ test "persistent rebuild page publication scaling benchmark" {
             std.debug.print("rebuild_page_bench docs={} atomic={} publication_ns={} segments={}\n", .{ count, atomic_page, elapsed_ns, count / 256 });
         }
     }
+}
+
+test "lite persistent mapped publication merge recovery and retained snapshot ownership" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const lite_docs = @import("lite/docstore.zig");
+    const lite_indexes = @import("lite/index_storage.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/persistent-mapped.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    var docs = try lite_docs.Store.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io });
+    var docs_closed = false;
+    defer if (!docs_closed) docs.close();
+    var storage = lite_indexes.Store.init(a, &docs);
+    const opts = PersistentIndexOptions{
+        .path = "/lite-text",
+        .io = std.testing.io,
+        .main_lsm_storage = storage.storage(),
+        .wal_storage = storage.storage(),
+        .main_no_sync = true,
+        .wal_no_sync = true,
+    };
+    var index = try PersistentIndex.open(a, opts);
+    var index_closed = false;
+    defer if (!index_closed) index.close();
+    const first = try buildSimpleSegment(a, "doc:a", "alpha");
+    defer a.free(first);
+    const second = try buildSimpleSegment(a, "doc:b", "beta");
+    defer a.free(second);
+    const Builder = struct {
+        bytes: []const u8,
+        fn build(ptr: *anyopaque, sink: *segment_mod.SegmentSink) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try sink.appendSlice(self.bytes);
+        }
+    };
+    var builder = Builder{ .bytes = first };
+    _ = try index.indexSegmentFromSinkBuilder(&builder, Builder.build);
+    try index.indexSegment(second);
+    try std.testing.expect(index.supportsFileBackedSegmentArtifacts());
+    const pinned = index.acquireSnapshot();
+    defer pinned.release();
+    try std.testing.expectEqual(@as(usize, 2), pinned.segments.len);
+    for (pinned.segments) |segment| try std.testing.expect(segment.data == .native);
+    const old_ids = [_]u64{ pinned.segments[0].id, pinned.segments[1].id };
+    const prepared = try index.prepareMergedSegmentToFile(pinned, &.{ 0, 1 });
+    try std.testing.expect(prepared[0].data == .native);
+    try std.testing.expect(try index.replaceSegmentsIfActiveManyPrepared(&old_ids, prepared));
+    try std.testing.expectEqual(@as(usize, 1), index.snapshot().segments.len);
+    try std.testing.expectEqual(@as(usize, 1), try persistentSearchHitCount(a, index.snapshot(), "alpha"));
+    try std.testing.expectEqual(@as(usize, 1), try persistentSearchHitCount(a, index.snapshot(), "beta"));
+    try index.syncMain(true);
+    index.close();
+    index_closed = true;
+    // Reopen retains native ranges without a private file or full payload copy.
+    index = try PersistentIndex.open(a, opts);
+    index_closed = false;
+    for (index.snapshot().segments) |segment| try std.testing.expect(segment.data == .native);
+    try std.testing.expectEqual(@as(usize, 1), try persistentSearchHitCount(a, index.snapshot(), "alpha"));
+    try std.testing.expectEqual(@as(usize, 1), try persistentSearchHitCount(a, index.snapshot(), "beta"));
+    index.close();
+    index_closed = true;
+    docs.close();
+    docs_closed = true;
+    // Export also uses the pinned native roots after both owners close.
+    const export_root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/native-export", .{tmp.sub_path});
+    defer a.free(export_root);
+    const checkpoint = PersistentIndex.NativeSegmentCheckpoint{ .snapshot = pinned, .source_root = "/unused-native-path" };
+    const exported_bytes = try checkpoint.materialize(a, std.testing.io, export_root, CancellationToken.none);
+    try std.testing.expectEqual(@as(u64, first.len + second.len), exported_bytes);
+    for (pinned.segments, 0..) |segment, i| {
+        const exported_path = try std.fmt.allocPrint(a, "{s}/{d}.seg", .{ export_root, segment.id });
+        defer a.free(exported_path);
+        const contents = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, exported_path, a, .limited(1024 * 1024));
+        defer a.free(contents);
+        try std.testing.expectEqualSlices(u8, if (i == 0) first else second, contents);
+    }
+    // The old snapshot's exact artifact leases survive both owner closures.
+    try std.testing.expectEqual(@as(usize, 1), try persistentSearchHitCount(a, pinned, "alpha"));
+    try std.testing.expectEqual(@as(usize, 1), try persistentSearchHitCount(a, pinned, "beta"));
+}
+
+test "lite persistent mapped read only fallback preserves unwritable directory queries" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const lite_docs = @import("lite/docstore.zig");
+    const lite_indexes = @import("lite/index_storage.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/readonly-persistent.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    {
+        var docs = try lite_docs.Store.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io });
+        defer docs.close();
+        var storage = lite_indexes.Store.init(a, &docs);
+        var index = try PersistentIndex.open(a, .{ .path = "/text", .io = std.testing.io, .main_lsm_storage = storage.storage(), .wal_storage = storage.storage(), .main_no_sync = true, .wal_no_sync = true });
+        defer index.close();
+        const bytes = try buildSimpleSegment(a, "doc:a", "alpha");
+        defer a.free(bytes);
+        try index.indexSegment(bytes);
+        try index.syncMain(true);
+    }
+    var docs = try lite_docs.Store.openWithOptions(a, path, .{ .read_only = true, .io = std.testing.io });
+    defer docs.close();
+    var storage = lite_indexes.Store.init(a, &docs);
+    try tmp.dir.setPermissions(std.testing.io, .fromMode(0o555));
+    defer tmp.dir.setPermissions(std.testing.io, .fromMode(0o700)) catch {};
+    var index = try PersistentIndex.open(a, .{ .path = "/text", .io = std.testing.io, .read_only = true, .main_lsm_storage = storage.storage(), .wal_storage = storage.storage(), .main_no_sync = true, .wal_no_sync = true });
+    defer index.close();
+    try std.testing.expect(index.snapshot().segments[0].data == .native);
+    try std.testing.expectEqual(@as(usize, 1), try persistentSearchHitCount(a, index.snapshot(), "alpha"));
+    try std.testing.expectEqual(@as(u64, 0), (try docs.reclamationStatus()).artifact_file_bytes);
+}
+
+test "lite persistent mapped range repair streams oversized navigation and keys" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const lite_docs = @import("lite/docstore.zig");
+    const lite_indexes = @import("lite/index_storage.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/repair-mapped.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    var docs = try lite_docs.Store.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io, .reclamation = .{ .enabled = false } });
+    defer docs.close();
+    var storage = lite_indexes.Store.init(a, &docs);
+    var index = try PersistentIndex.open(a, .{ .path = "/text", .io = std.testing.io, .main_lsm_storage = storage.storage(), .wal_storage = storage.storage(), .main_no_sync = true, .wal_no_sync = true });
+    defer index.close();
+    var writer = segment_mod.SegmentWriter.init(a);
+    defer writer.deinit();
+    try writer.addStoredDoc("id", "body");
+    const name = try a.alloc(u8, 60000);
+    defer a.free(name);
+    @memset(name, 'f');
+    for (0..18) |i| {
+        name[0] = @intCast(i + 1);
+        _ = try writer.addField(name);
+    }
+    const min_key = try a.alloc(u8, 600000);
+    defer a.free(min_key);
+    const max_key = try a.alloc(u8, 600000);
+    defer a.free(max_key);
+    @memset(min_key, 'a');
+    @memset(max_key, 'z');
+    try writer.addDocKeyRange(min_key, max_key);
+    const bytes = try writer.build();
+    defer a.free(bytes);
+    try index.indexSegment(bytes);
+    const id = index.snapshot().segments[0].id;
+    {
+        var txn = try index.beginWriteMainTxn();
+        errdefer txn.abort();
+        const range_key = segmentRangeMetaKey(id);
+        try txn.delete(.meta, &range_key);
+        try txn.commit();
+    }
+    var txn = try index.beginReadMainTxn();
+    defer txn.abort();
+    var budget = @import("lite/test_allocator.zig").BudgetAllocator{ .backing = a, .limit = min_key.len + max_key.len + 1024 + 64 * 1024 };
+    var range = try index.loadSegmentRange(&txn, budget.allocator(), id);
+    defer range.deinit(budget.allocator());
+    try std.testing.expectEqualSlices(u8, min_key, range.min_doc_key);
+    try std.testing.expectEqualSlices(u8, max_key, range.max_doc_key);
+    try std.testing.expectEqual(min_key.len + max_key.len, budget.live);
+    try std.testing.expect(budget.peak <= budget.limit);
+}
+
+test "lite persistent mapped fifty thousand sorted documents stream postings and reopen" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const lite_docs = @import("lite/docstore.zig");
+    const lite_indexes = @import("lite/index_storage.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/large-merge.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    var docs = try lite_docs.Store.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io });
+    defer docs.close();
+    var storage = lite_indexes.Store.init(a, &docs);
+    const options = PersistentIndexOptions{ .path = "/text", .io = std.testing.io, .main_lsm_storage = storage.storage(), .wal_storage = storage.storage(), .main_no_sync = true, .wal_no_sync = true };
+    var index = try PersistentIndex.open(a, options);
+    var open = true;
+    defer if (open) index.close();
+    const Harness = struct {
+        fn build(alloc: Allocator, parity: u32) ![]u8 {
+            var segment = segment_mod.SegmentWriter.init(alloc);
+            defer segment.deinit();
+            var inverted = inverted_mod.InvertedIndexBuilder.init(alloc, .{});
+            defer inverted.deinit();
+            const typed = @import("../section/typed_doc_values.zig");
+            var values = typed.TypedDocValuesWriter.init(alloc, .u64_val, 1024);
+            defer values.deinit();
+            for (0..25_000) |doc| {
+                const rank = doc * 2 + parity;
+                var key: [32]u8 = undefined;
+                try segment.addStoredDoc(try std.fmt.bufPrint(&key, "doc-{d:0>5}", .{rank}), "");
+                try inverted.addDocument(@intCast(doc), &.{.{ .term = "common", .freq = 3, .positions = &.{ 0, 2, 5 } }});
+                try values.add(@intCast(doc), .{ .u64_val = rank });
+            }
+            const text = try inverted.build();
+            defer alloc.free(text);
+            const column = try values.build();
+            defer alloc.free(column);
+            try segment.addSection(try segment.addField("body"), .inverted_text, text);
+            try segment.addSection(try segment.addField("rank"), .typed_doc_values, column);
+            try segment.addIndexSortMetadata(&.{.{ .field = "rank", .desc = false }});
+            return segment.build();
+        }
+        fn verify(alloc: Allocator, snapshot: *index_mod.IndexSnapshot) !void {
+            try std.testing.expectEqual(@as(usize, 1), snapshot.segments.len);
+            const segment = &snapshot.segments[0];
+            try std.testing.expect(segment.data == .native);
+            try std.testing.expectEqual(@as(u32, 50_000), segment.reader.doc_count);
+            try std.testing.expectEqual(@as(usize, 50_000), try persistentSearchHitCount(alloc, snapshot, "common"));
+            var reads = segment_mod.TypedReadScope.init(alloc);
+            defer reads.deinit();
+            const values = (try reads.get(&segment.reader, "rank")).?;
+            for ([_]u32{ 0, 1, 127, 128, 2048, 49_999 }) |doc| {
+                try std.testing.expectEqual(@as(u64, doc), (try values.getU64(doc)).?);
+                var key: [32]u8 = undefined;
+                try std.testing.expectEqualStrings(try std.fmt.bufPrint(&key, "doc-{d:0>5}", .{doc}), (try segment.reader.storedDoc(doc)).?.id);
+            }
+            var text = (try segment.reader.invertedIndexScoped(alloc, "body")).?;
+            defer text.deinit();
+            var result = (try text.lookup("common")).?;
+            var postings = try result.iterator(alloc);
+            defer postings.deinit();
+            for ([_]u32{ 0, 128, 2048, 49_999 }) |doc| {
+                const hit = (try postings.advanceToWithPositions(doc)).?;
+                try std.testing.expectEqual(doc, hit.doc_id);
+                try std.testing.expectEqualSlices(u32, &.{ 0, 2, 5 }, hit.positions);
+            }
+        }
+    };
+    for (0..2) |parity| {
+        const bytes = try Harness.build(a, @intCast(parity));
+        defer a.free(bytes);
+        try index.indexSegment(bytes);
+    }
+    const pinned = index.acquireSnapshot();
+    defer pinned.release();
+    const ids = [_]u64{ pinned.segments[0].id, pinned.segments[1].id };
+    const clock = @import("antfly_platform").time;
+    const started = clock.monotonicNs();
+    const prepared = try index.prepareMergedSegmentToFile(pinned, &.{ 0, 1 });
+    const elapsed = clock.monotonicNs() - started;
+    try std.testing.expect(try index.replaceSegmentsIfActiveManyPrepared(&ids, prepared));
+    try Harness.verify(a, index.snapshot());
+    try index.syncMain(true);
+    index.close();
+    open = false;
+    index = try PersistentIndex.open(a, options);
+    open = true;
+    try Harness.verify(a, index.snapshot());
+    try std.testing.expectEqual(@as(usize, 50_000), try persistentSearchHitCount(a, pinned, "common"));
+    std.debug.print("LITE_NATIVE_SORTED_MERGE documents=50000 elapsed_ns={d} reopen=ok pinned_snapshot=ok\n", .{elapsed});
+}
+
+test "lite persistent mapped initial streamed typed flush aborts and reopens atomically" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const introducer = @import("../introducer.zig");
+    const analysis = @import("../search/analysis.zig");
+    const lite_docs = @import("lite/docstore.zig");
+    const lite_indexes = @import("lite/index_storage.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/initial-stream.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    var docs = try lite_docs.Store.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io });
+    defer docs.close();
+    var storage = lite_indexes.Store.init(a, &docs);
+    const opts = PersistentIndexOptions{ .path = "/lite-text", .io = std.testing.io, .main_lsm_storage = storage.storage(), .wal_storage = storage.storage(), .main_no_sync = true, .wal_no_sync = true };
+    var index = try PersistentIndex.open(a, opts);
+    var open = true;
+    defer if (open) index.close();
+    const Builder = struct {
+        allocator: Allocator,
+        fail: bool = false,
+        fn build(ptr: *anyopaque, output: *segment_mod.SegmentSink) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const FailureSink = struct {
+                inner: *segment_mod.SegmentSink,
+                fn owner(p: *anyopaque) *@This() {
+                    return @ptrCast(@alignCast(p));
+                }
+                fn len(p: *anyopaque) usize {
+                    return owner(p).inner.len();
+                }
+                fn append(p: *anyopaque, bytes: []const u8) !void {
+                    if (owner(p).inner.len() > 100) return error.InjectedStreamWriteFailure;
+                    try owner(p).inner.appendSlice(bytes);
+                }
+                fn byte(p: *anyopaque, value: u8) !void {
+                    try append(p, &.{value});
+                }
+                fn repeat(p: *anyopaque, value: u8, count: usize) !void {
+                    try owner(p).inner.appendNTimes(value, count);
+                }
+                fn patch(p: *anyopaque, offset: usize, bytes: []const u8) !void {
+                    try owner(p).inner.writeAt(offset, bytes);
+                }
+                fn prefix(p: *anyopaque, count: usize) !u32 {
+                    return owner(p).inner.crc32Prefix(count);
+                }
+                fn range(p: *anyopaque, offset: usize, count: usize) !u32 {
+                    return owner(p).inner.crc32Range(offset, count);
+                }
+                const vtable = segment_mod.SegmentSink.VTable{ .len = len, .append_slice = append, .append_byte = byte, .append_ntimes = repeat, .write_at = patch, .crc32_prefix = prefix, .crc32_range = range };
+            };
+            var failing = FailureSink{ .inner = output };
+            var failing_sink = segment_mod.SegmentSink{ .ptr = &failing, .vtable = &FailureSink.vtable };
+            try introducer.writeSegmentFromTextWithAnalysisOptions(self.allocator, &.{
+                .{ .id = "b", .stored_data = "body b", .text_fields = &.{}, .typed_fields = &.{
+                    .{ .field_name = "rank", .value_type = .u64_val, .value = .{ .u64_val = 2 } },
+                    .{ .field_name = "label", .value_type = .bytes_val, .value = .{ .bytes_val = "second" } },
+                } },
+                .{ .id = "a", .stored_data = "body a", .text_fields = &.{}, .typed_fields = &.{
+                    .{ .field_name = "rank", .value_type = .u64_val, .value = .{ .u64_val = 1 } },
+                } },
+            }, &analysis.default_analyzer, .{}, .{ .index_sort = &.{.{ .field = "rank", .desc = false }} }, if (self.fail) &failing_sink else output);
+        }
+    };
+    var builder = Builder{ .allocator = a, .fail = true };
+    try std.testing.expectError(error.InjectedStreamWriteFailure, index.indexSegmentFromSinkBuilder(&builder, Builder.build));
+    try std.testing.expectEqual(@as(u32, 0), index.snapshot().liveDocCount());
+    builder.fail = false;
+    _ = try index.indexSegmentFromSinkBuilder(&builder, Builder.build);
+    try std.testing.expectEqual(@as(u32, 2), index.snapshot().liveDocCount());
+    try std.testing.expect(index.snapshot().segments[0].data == .native);
+    try index.syncMain(true);
+    index.close();
+    open = false;
+    index = try PersistentIndex.open(a, opts);
+    open = true;
+    const reader = &index.snapshot().segments[0].reader;
+    try std.testing.expectEqual(@as(u32, 2), reader.doc_count);
+    var cursor = segment_mod.SegmentReader.StoredDocCursor.init(a);
+    defer cursor.deinit();
+    const first = (try cursor.get(reader, 0)).?;
+    try std.testing.expectEqualStrings("a", first.id);
+    try std.testing.expectEqualStrings("body a", first.data);
+    var rank = (try reader.typedDocValuesScoped(a, "rank")).?;
+    defer rank.deinit();
+    try std.testing.expectEqual(@as(?u64, 1), try rank.getU64(0));
+    try std.testing.expectEqual(@as(?u64, 2), try rank.getU64(1));
+    var labels = (try reader.typedDocValuesScoped(a, "label")).?;
+    defer labels.deinit();
+    try std.testing.expect((try labels.getBytesAlloc(0)) == null);
+    const label = (try labels.getBytesAlloc(1)).?;
+    defer a.free(label);
+    try std.testing.expectEqualStrings("second", label);
 }

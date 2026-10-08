@@ -441,6 +441,9 @@ comptime {
     _ = @import("antfly_local_sources").storage_db_artifact_producer_dispatch;
     _ = @import("antfly_local_sources").storage_db_artifact_producer_input;
     _ = @import("antfly_local_sources").storage_db_artifact_producer_obligations;
+    _ = @import("memory_budget.zig");
+    _ = @import("antfly_local_sources").storage_test_allocator;
+    _ = @import("antfly_local_sources").storage_db_artifact_producer_readiness;
     _ = @import("antfly_local_sources").storage_db_artifact_producer_provenance;
     _ = @import("antfly_local_sources").storage_db_artifact_producer_retry;
     _ = @import("antfly_local_sources").storage_db_artifact_producer_validation;

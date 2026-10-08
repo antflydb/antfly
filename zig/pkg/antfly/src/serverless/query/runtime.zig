@@ -1488,7 +1488,7 @@ test "serverless query runtime metrics remain valid across every allocation fail
             }
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
 
 test "serverless query session validates content addresses and declared range bounds" {

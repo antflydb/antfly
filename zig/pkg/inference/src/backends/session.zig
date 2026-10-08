@@ -1675,7 +1675,7 @@ test "session output admission row compaction rolls back allocation and capacity
             try std.testing.expectEqual(@as(usize, 24), controller.snapshot().hostTotalBytes());
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Source.check, .{ false, false });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Source.check, .{ false, false });
     try Source.check(std.testing.allocator, true, false);
     try Source.check(std.testing.allocator, false, true);
 }
@@ -1782,6 +1782,6 @@ test "session output admission has one owner on every allocation failure" {
             try std.testing.expect(controller.snapshot().host_scratch_bytes > 0);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{@as(?InferenceExecutionControl, null)});
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{@as(?InferenceExecutionControl, .{})});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{@as(?InferenceExecutionControl, null)});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{@as(?InferenceExecutionControl, .{})});
 }

@@ -13,7 +13,7 @@ components:
       properties:
         provider:
           type: string
-          enum: [antfly, jev]
+          enum: [antfly, jev, openai]
         decision_method:
           type: string
           enum: [typed, embedding_similarity]
@@ -21,7 +21,7 @@ components:
           description: Explicit result contract. embedding_similarity is available with Antfly EmbeddingGemma 2 choices; rejects score and noul requests and returns cosine scores with nullable choice.
         model:
           type: string
-          description: Required for Antfly; Jev defaults to jev-latest.
+          description: Required for Antfly and OpenAI; Jev defaults to jev-latest.
         model_identity:
           type: string
           pattern: '^[0-9a-f]{64}$'
@@ -53,7 +53,7 @@ components:
               maximum: 2
         url:
           type: string
-          description: Provider base URL; endpoint path is selected by provider.
+          description: Provider base URL; endpoint path is selected by provider. OpenAI defaults to https://api.openai.com/v1 and appends /decisions.
         api_key:
           type: string
           description: API key or secret reference. Defaults to the provider environment variable.
@@ -224,6 +224,8 @@ components:
           $ref: "#/components/schemas/SecretsConfig"
         storage:
           $ref: "#/components/schemas/StorageConfig"
+        lake_cache:
+          $ref: "#/components/schemas/LakeCacheConfig"
         transaction_sessions:
           $ref: "#/components/schemas/TransactionSessionConfig"
         ha:
@@ -1520,6 +1522,50 @@ components:
         prefix:
           type: string
 
+    LakeCacheConfig:
+      type: object
+      additionalProperties: false
+      description: Disposable node-local cache for versioned Parquet and Iceberg reads.
+      properties:
+        enabled:
+          type: boolean
+          default: true
+        root:
+          type: string
+          minLength: 1
+          description: Defaults to cache/lake-ranges beneath local storage, or the Lite file directory.
+        max_memory_bytes:
+          type: integer
+          format: int64
+          minimum: 1
+          default: 67108864
+        max_disk_bytes:
+          type: integer
+          format: int64
+          minimum: 1
+          default: 10737418240
+        max_entries:
+          type: integer
+          format: int64
+          minimum: 1
+          default: 16384
+        max_write_queue_bytes:
+          type: integer
+          format: int64
+          minimum: 1
+          default: 33554432
+        max_write_queue_entries:
+          type: integer
+          format: int64
+          minimum: 1
+          default: 16
+        protected_bytes:
+          type: integer
+          format: int64
+          minimum: 0
+          default: 268435456
+          description: Metadata/sidecar reservation, capped at one quarter of disk capacity; zero disables it.
+
     StorageConfig:
       type: object
       additionalProperties: false
@@ -1559,6 +1605,16 @@ components:
               - required: [lite]
               - required: [local]
       properties:
+        artifacts:
+          allOf:
+            - $ref: "#/components/schemas/ObjectStorageLocation"
+          description: >-
+            Shared Antfly-owned artifact storage, independent of the primary
+            storage engine. Native remote-table index generations use this
+            location. Connection and bucket are required when configured;
+            the connection must have storage.primary capability. Distributed
+            serving requires shared storage. Standalone deployments may use
+            the local storage directory when this location is absent.
         engine:
           $ref: "#/components/schemas/StorageEngine"
         lite:

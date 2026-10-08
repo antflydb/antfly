@@ -143,6 +143,20 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     test_imports.configure(b, antfly_test_mod, true, true);
     antfly_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
+    const producer_readiness_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/producer_readiness_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, producer_readiness_test_mod, true, true);
+    producer_readiness_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
+    const producer_readiness_tests = b.addTest(.{
+        .root_module = producer_readiness_test_mod,
+        .filters = &.{ "producer readiness", "source readiness waits", "producer completion uses" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-producer-readiness-test", "Run durable producer completion, source readiness and metadata transport regressions")
+        .dependOn(&addFilteredTestRunArtifact(b, producer_readiness_tests).step);
     const apple_provider_tests = b.addTest(.{
         .root_module = antfly_test_mod,
         .filters = &.{ "apple OCR", "document extraction Apple", "Apple generation", "Apple transcription", "Apple native" },
@@ -283,6 +297,11 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     const system_catalog_store_step = b.step("antfly-system-catalog-store-test", "Run catalog report persistence, snapshot, drain, and migration regressions");
     system_catalog_store_step.dependOn(&b.addRunArtifact(system_catalog_store_tests).step);
+    const lake_catalog_step = b.step("antfly-lake-index-catalog-test", "Run durable native lake index generation framing and decoder admission contracts");
+    for ([_]*std.Build.Module{ metadata_unit_baseline_mods[8], metadata_unit_baseline_mods[1] }) |module| {
+        const tests = b.addTest(.{ .root_module = module, .filters = &.{"metadata.lake index"} });
+        lake_catalog_step.dependOn(&b.addRunArtifact(tests).step);
+    }
     const system_catalog_projection_tests = b.addTest(.{
         .root_module = metadata_unit_baseline_mods[1],
         .filters = &.{ "catalog projection", "catalog retained WAL replay", "system catalog forwarding retains" },
@@ -1123,7 +1142,6 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "restore runtime store persists checkpoints and requeues interrupted work",
         "restore job store rejects oversized request state",
         "restore filesystem scope containment handles filesystem roots and component boundaries",
-        ".test_0",
         "module compiles",
         "internal join maps resource and ownership failures to unavailable",
         "postgres libpq global permits are atomic and bounded",
@@ -1995,7 +2013,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     lite_native_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
     const lite_native_tests = b.addTest(.{
         .root_module = lite_native_test_mod,
-        .filters = &.{"storage.lite."},
+        .filters = selectTestFilters(b, &.{"storage.lite."}),
         .test_runner = .{
             .path = b.path("pkg/antfly-embedded/src/test_runner.zig"),
             .mode = .simple,
@@ -2004,6 +2022,19 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const run_lite_native_tests = addFilteredTestRunArtifact(b, lite_native_tests);
     const lite_native_test_step = b.step("lite-native-test", "Run Lite native backend tests");
     lite_native_test_step.dependOn(&run_lite_native_tests.step);
+    const lite_reader_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/lite_reader_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, lite_reader_test_mod, true, true);
+    const lite_reader_tests = b.addTest(.{
+        .root_module = lite_reader_test_mod,
+        .filters = &.{ "search.search.", "search.query.", "index.", "merger.", "segment.", "section.inverted.", "section.typed_doc_values.", "section.doc_values.", "section.vector_section." },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("lite-bounded-reader-test", "Verify segment scratch reuse and stored search result ownership")
+        .dependOn(&addFilteredTestRunArtifact(b, lite_reader_tests).step);
     const lite_storage_tests = b.addTest(.{
         .root_module = lite_native_test_mod,
         .filters = &.{"storage.lite."},
@@ -5208,6 +5239,18 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const persistent_rebuild_run = addFilteredTestRunArtifact(b, persistent_rebuild_tests);
     b.step("persistent-rebuild-page-test", "Run atomic rebuild page regressions and optional scaling benchmark").dependOn(&persistent_rebuild_run.step);
 
+    const lite_persistent_artifact_tests = b.addTest(.{
+        .root_module = persistent_test_mod,
+        .filters = &.{
+            "lite persistent mapped",
+            "persistent index snapshots use mapped segment files",
+            "persistent index sink builder",
+        },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("lite-persistent-artifact-test", "Verify streaming Lite segment publication, merge, recovery and snapshot ownership")
+        .dependOn(&b.addRunArtifact(lite_persistent_artifact_tests).step);
+
     const persistent_unit_tests = b.addTest(.{
         .root_module = persistent_test_mod,
         .filters = &.{"storage.persistent."},
@@ -5735,6 +5778,50 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("replay-document-integration-test", "Verify replay consumers across text, algebraic, graph and document bodies")
         .dependOn(&b.addRunArtifact(replay_document_integration_tests).step);
 
+    const lite_query_reader_tests = b.addTest(.{
+        .root_module = db_test_mod,
+        .filters = &.{
+            "query reader reuse",
+            "native text stats fallback",
+            "native text doc values",
+            "native sort",
+            "native numeric sort",
+            "native datetime sort",
+            "text doc values sort",
+            "text field sort",
+            "match_all native",
+            "schema keyword doc values",
+            "schema numeric",
+            "schema boolean doc values",
+            "schema link doc values",
+            "required native sort",
+        },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("lite-query-reader-test", "Verify native query reader reuse, exact sorting, and filtered text statistics")
+        .dependOn(&addFilteredTestRunArtifact(b, lite_query_reader_tests).step);
+
+    const lite_merge_publication_runtime_tests = b.addTest(.{
+        .root_module = db_test_mod,
+        .filters = &.{ "db text merge descriptor admission failures retry without quarantine", "db text merge shutdown cancels a worker blocked on descriptor admission" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("lite-merge-publication-runtime-test", "Verify incremental merge publication handoff and shutdown")
+        .dependOn(&addFilteredTestRunArtifact(b, lite_merge_publication_runtime_tests).step);
+
+    const bounded_read_integration_tests = b.addTest(.{
+        .root_module = db_test_mod,
+        .filters = &.{
+            "relational columnar dirty scans",
+            "relational columnar shared pages",
+            "relational columnar merge frontier",
+            "lite bounded reader integration",
+        },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("bounded-read-integration-test", "Verify scoped row reads and bounded scratch through relational scans")
+        .dependOn(&addFilteredTestRunArtifact(b, bounded_read_integration_tests).step);
+
     const lake_storage_tests = b.addTest(.{ .root_module = db_test_mod, .filters = &.{"db external lake"}, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
     b.step("lake-storage-test", "Run native owner lake read-only and restart contracts").dependOn(&addFilteredTestRunArtifact(b, lake_storage_tests).step);
     const db_test_step = b.step("antfly-storage-db-test", "Run storage/db owner tests using the shared unit artifacts");
@@ -6163,6 +6250,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.artifact_producer_dispatch.",
             "storage.db.artifact_producer_input.",
             "storage.db.artifact_producer_obligations.",
+            "storage.db.artifact_producer_readiness.",
+            "storage.memory_budget.",
+            "storage.test_allocator.",
             "storage.db.artifact_producer_provenance.",
             "storage.db.artifact_producer_retry.",
             "storage.db.artifact_producer_validation.",
@@ -6803,7 +6893,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "metadata.table_workflow.",
             "metadata.transition_state.",
             "metadata.relational_topology_admission.",
-            "metadata.transition_actions.",
+            "transition actions module compiles",
             "metadata.transition_controller.",
             "metadata.transition_driver.",
             "metadata.online_merge.",

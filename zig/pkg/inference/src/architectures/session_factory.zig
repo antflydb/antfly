@@ -6210,7 +6210,7 @@ test "legacy GLiNER encoder sidecar bounds regular input and recovers after allo
             try std.testing.expect(cfg.use_exact_gelu);
         }
     };
-    try std.testing.checkAllAllocationFailures(allocator, Check.run, .{model_dir});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(allocator, Check.run, .{model_dir});
     try Check.run(allocator, model_dir);
 }
 

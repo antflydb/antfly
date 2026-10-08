@@ -126,18 +126,27 @@ pub const RangeRead = struct {
 
     pub fn cacheKeyAlloc(self: RangeRead, alloc: Allocator) ![]u8 {
         try self.validate();
+        // Provider-controlled strings are length-prefixed so delimiters
+        // cannot alias identities. Purpose comes first for trusted lane policy.
         return std.fmt.allocPrint(
             alloc,
-            "lake-range:v1:{s}/{s}:etag={s}:version={s}:offset={d}:len={d}:purpose={s}:codec={s}:column={s}",
+            "lake-range:v2:purpose={s}:bucket={d}:{s}:key={d}:{s}:etag={d}:{s}:version={d}:{s}:object_len={d}:offset={d}:len={d}:codec={d}:{s}:column={d}:{s}",
             .{
+                @tagName(self.purpose),
+                self.object.bucket.len,
                 self.object.bucket,
+                self.object.key.len,
                 self.object.key,
+                self.object.version.etag.len,
                 self.object.version.etag,
+                self.object.version.version_id.len,
                 self.object.version.version_id,
+                self.object.byte_len,
                 self.range.offset,
                 self.range.len,
-                @tagName(self.purpose),
+                self.compression_codec.len,
                 self.compression_codec,
+                self.decoded_column_id.len,
                 self.decoded_column_id,
             },
         );
@@ -366,7 +375,7 @@ test "lake range planner creates tail footer reads with versioned cache keys" {
 
     const key = try read.cacheKeyAlloc(alloc);
     defer alloc.free(key);
-    try std.testing.expect(std.mem.indexOf(u8, key, "etag=etag-1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, key, "etag=6:etag-1") != null);
     try std.testing.expect(std.mem.indexOf(u8, key, "offset=983040") != null);
     try std.testing.expect(std.mem.indexOf(u8, key, "purpose=parquet_footer") != null);
 }
@@ -453,7 +462,7 @@ test "lake range planner creates Iceberg metadata and manifest reads" {
     const key = try manifest_list_read.cacheKeyAlloc(alloc);
     defer alloc.free(key);
     try std.testing.expect(std.mem.indexOf(u8, key, "purpose=iceberg_metadata") != null);
-    try std.testing.expect(std.mem.indexOf(u8, key, "version=iceberg-metadata:v1:snapshot=snapshot-12") != null);
+    try std.testing.expect(std.mem.indexOf(u8, key, "iceberg-metadata:v1:snapshot=snapshot-12") != null);
 
     const data_manifest_read = try planIcebergManifestRead(manifest_list_object, .data);
     try std.testing.expectEqual(RangePurpose.iceberg_metadata, data_manifest_read.purpose);
@@ -548,8 +557,8 @@ test "lake range planner validates cache lanes and decoded column keys" {
     try std.testing.expectEqual(CacheLane.decoded_column, decoded.cacheLane());
     const key = try decoded.cacheKeyAlloc(alloc);
     defer alloc.free(key);
-    try std.testing.expect(std.mem.indexOf(u8, key, "version=v1") != null);
-    try std.testing.expect(std.mem.indexOf(u8, key, "column=amount") != null);
+    try std.testing.expect(std.mem.indexOf(u8, key, "version=2:v1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, key, "column=6:amount") != null);
 
     const invalid = RangeRead{
         .object = object,
@@ -633,3 +642,21 @@ pub const RangeLease = struct {
         }
     }
 };
+
+test "lake range keys distinguish delimiter-bearing object identities" {
+    const a = std.testing.allocator;
+    const first: RangeRead = .{ .object = .{ .bucket = "bucket", .key = "x:etag=y", .byte_len = 8, .version = .{ .etag = "z" } }, .range = .{ .offset = 0, .len = 4 }, .purpose = .parquet_column_chunk };
+    var second = first;
+    second.object.key = "x";
+    second.object.version.etag = "y:etag=z";
+    const first_key = try first.cacheKeyAlloc(a);
+    defer a.free(first_key);
+    const second_key = try second.cacheKeyAlloc(a);
+    defer a.free(second_key);
+    try std.testing.expect(!std.mem.eql(u8, first_key, second_key));
+    var resized = first;
+    resized.object.byte_len = 9;
+    const resized_key = try resized.cacheKeyAlloc(a);
+    defer a.free(resized_key);
+    try std.testing.expect(!std.mem.eql(u8, first_key, resized_key));
+}

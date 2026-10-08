@@ -366,7 +366,7 @@ test "boundary merge job strict versioned config and exact snapshot ownership" {
     var parsed = try parse(a, json);
     defer parsed.deinit();
     try std.testing.expectEqual(testConfig().expected_source, parsed.value.expected_source);
-    try std.testing.checkAllAllocationFailures(a, parseAllocationFailures, .{json});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, parseAllocationFailures, .{json});
     const invalid_numbers = [_][]const u8{ "-1", "1.5", "\"2\"", "true", "18446744073709551616" };
     for (invalid_numbers) |number| {
         const invalid = try std.fmt.allocPrint(a, "{{\"version\":{s}{s}", .{ number, json["{\"version\":1".len..] });
@@ -470,7 +470,7 @@ test "boundary merge job bounded setup owner recovers declared and backing OOM w
     const a = std.testing.allocator;
     const bytes = try std.json.Stringify.valueAlloc(a, testConfig(), .{});
     defer a.free(bytes);
-    try std.testing.checkAllAllocationFailures(a, snapshotAllocationFailures, .{bytes});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, snapshotAllocationFailures, .{bytes});
     try std.testing.expectError(error.BoundaryMergeJobConfigLimitExceeded, parseSnapshotBounded(a, bytes, @sizeOf(ConfigOwner) + 128));
     var snapshot = try parseSnapshot(a, bytes);
     defer snapshot.deinit();

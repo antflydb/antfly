@@ -242,6 +242,10 @@ pub const PersistentObjectRangeCachePolicy = struct {
     max_write_queue_entries: usize = 64,
     max_cache_key_bytes: usize = 64 * 1024,
     durability: PersistentObjectRangeCacheDurability = .cache_only,
+    /// Reserve up to this much disk for metadata/sidecars, capped at a quarter
+    /// of total capacity. Broad scans can use free space but cannot displace
+    /// the protected working set; zero disables the reservation.
+    protected_bytes: usize = 256 * 1024 * 1024,
 
     pub fn validate(self: PersistentObjectRangeCachePolicy) !void {
         if (self.max_total_bytes == 0 or self.max_entries == 0 or
@@ -258,6 +262,7 @@ pub const PersistentObjectRangeCacheStats = struct {
     read_misses: usize = 0,
     read_errors: usize = 0,
     stored_bytes: usize = 0,
+    protected_stored_bytes: usize = 0,
     entries: usize = 0,
     evicted_bytes: usize = 0,
     evicted_entries: usize = 0,
@@ -279,6 +284,10 @@ pub const PersistentObjectRangeCacheEnqueueResult = enum {
 };
 
 pub const PersistentObjectRangeCacheResources = struct {
+    /// Called without the disk-cache mutex when eviction is blocked by pins.
+    /// Release one idle consumer lease and return true only on progress.
+    /// The callback owner must outlive the write worker.
+    reclaim_idle: ?struct { ptr: *anyopaque, reclaim_one: *const fn (*anyopaque) bool } = null,
     /// Optional node-wide memory and storage envelope. The manager must
     /// outlive the cache. Queue memory is charged to
     /// `lake_range_cache_queue`; if the manager has a CapacitySource, each
@@ -334,7 +343,9 @@ pub const PersistentObjectRangeCache = struct {
             .policy = policy,
             .io = io,
             .resource_manager = resources.resource_manager,
+            .reclaim_idle = resources.reclaim_idle,
         };
+        errdefer if (state.owner_lock) |file| file.close(io);
         try state.initializeInventory();
         errdefer state.deinitInventory();
         state.worker = try io.concurrent(persistentObjectRangeWorkerMain, .{state});
@@ -352,6 +363,7 @@ pub const PersistentObjectRangeCache = struct {
         state.deinitInventory();
         state.pending.deinit(state.alloc);
         state.queue.deinit(state.alloc);
+        if (state.owner_lock) |file| file.close(io);
         state.alloc.free(state.root_dir);
         const internal_alloc = state.alloc;
         internal_alloc.destroy(state);
@@ -432,6 +444,81 @@ pub const PersistentObjectRangeCache = struct {
         return self.state.enqueueWrite(cache_key, bytes);
     }
 
+    /// An authenticated, pinned cache mapping. The cache must outlive every
+    /// lease; immutable native snapshots release leases before cache shutdown.
+    pub const MappedEntry = struct {
+        state: *PersistentObjectRangeCacheState,
+        entry: *PersistentObjectRangeCacheEntry,
+        mapping: []align(std.heap.page_size_min) u8,
+        bytes: []const u8,
+        pub fn adviseRandom(self: *const MappedEntry) void {
+            self.advise(.random);
+        }
+        pub fn discardCleanPages(self: *const MappedEntry) void {
+            self.advise(.discard);
+        }
+        fn advise(self: *const MappedEntry, mode: enum { random, discard }) void {
+            switch (@import("builtin").os.tag) {
+                .linux, .macos => std.posix.madvise(self.mapping.ptr, self.mapping.len, if (mode == .random) std.c.MADV.RANDOM else std.c.MADV.DONTNEED) catch {},
+                else => {},
+            }
+        }
+        pub fn deinit(self: *MappedEntry) void {
+            if (comptime @import("builtin").os.tag != .freestanding and @import("builtin").os.tag != .wasi and @import("builtin").os.tag != .windows) std.posix.munmap(self.mapping);
+            self.state.releaseEntry(self.entry, true);
+            self.* = undefined;
+        }
+    };
+    pub fn readMapped(self: *PersistentObjectRangeCache, alloc: Allocator, cache_key: []const u8, expected_len: usize, expected_digest: [32]u8, context: @import("lake_read_context.zig").Context) !?MappedEntry {
+        if (comptime @import("builtin").os.tag == .freestanding or @import("builtin").os.tag == .wasi or @import("builtin").os.tag == .windows) return null;
+        try context.ensureActive();
+        if (expected_len > range_io.max_physical_range_read_bytes) return error.InvalidLakeRangeRead;
+        const state = self.state;
+        if (cache_key.len > state.policy.max_cache_key_bytes) return null;
+        const path = try self.cachePathAlloc(alloc, cache_key);
+        defer alloc.free(path);
+        const entry = state.pinEntry(std.fs.path.basename(path)) orelse return null;
+        var retained = false;
+        var valid = true;
+        defer if (!retained) state.releaseEntry(entry, valid);
+        const header_len = std.math.add(usize, persistent_object_range_cache_magic.len + 4 + 32, cache_key.len) catch return error.InvalidLakeRangeRead;
+        const exact_len = std.math.add(usize, header_len, expected_len) catch return error.InvalidLakeRangeRead;
+        const file = std.Io.Dir.cwd().openFile(state.io, path, .{}) catch {
+            valid = false;
+            return null;
+        };
+        defer file.close(state.io);
+        if (try file.length(state.io) != exact_len) {
+            valid = false;
+            return null;
+        }
+        const mapping = std.posix.mmap(null, exact_len, .{ .READ = true }, .{ .TYPE = .SHARED }, file.handle, 0) catch return null;
+        defer if (!retained) std.posix.munmap(mapping);
+        const magic_len = persistent_object_range_cache_magic.len;
+        const key_end = magic_len + 4 + cache_key.len;
+        const payload = mapping[header_len..];
+        if (!std.mem.eql(u8, mapping[0..magic_len], persistent_object_range_cache_magic) or std.mem.readInt(u32, mapping[magic_len..][0..4], .little) != cache_key.len or !std.mem.eql(u8, mapping[magic_len + 4 .. key_end], cache_key) or !std.mem.eql(u8, mapping[key_end..header_len], &expected_digest)) {
+            valid = false;
+            return null;
+        }
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        var offset: usize = 0;
+        while (offset < payload.len) {
+            try context.ensureActive();
+            const end = @min(offset + 256 * 1024, payload.len);
+            hash.update(payload[offset..end]);
+            offset = end;
+        }
+        if (!std.mem.eql(u8, &hash.finalResult(), &expected_digest)) {
+            valid = false;
+            return null;
+        }
+        try context.ensureActive();
+        retained = true;
+        state.recordReadHit();
+        return .{ .state = state, .entry = entry, .mapping = mapping, .bytes = payload };
+    }
+
     fn cachePathAlloc(self: *const PersistentObjectRangeCache, alloc: Allocator, cache_key: []const u8) ![]u8 {
         const filename = try objectRangeCacheKeyDigestHexAlloc(alloc, cache_key);
         defer alloc.free(filename);
@@ -443,6 +530,7 @@ const PersistentObjectRangeCacheEntry = struct {
     filename: []u8,
     disk_bytes: usize,
     modified_ns: i128,
+    protected: bool = false,
     pin_count: usize = 0,
     removing: bool = false,
     lru_node: std.DoublyLinkedList.Node = .{},
@@ -467,6 +555,9 @@ fn persistentObjectRangeEntryAgeOrder(
     lhs: *PersistentObjectRangeCacheEntry,
     rhs: *PersistentObjectRangeCacheEntry,
 ) std.math.Order {
+    // Inventory retention uses the same ordinary-before-protected preference
+    // as live eviction. Keep the discovery heap bounded by the entry ceiling.
+    if (lhs.protected != rhs.protected) return if (lhs.protected) .gt else .lt;
     const modified_order = std.math.order(lhs.modified_ns, rhs.modified_ns);
     if (modified_order != .eq) return modified_order;
     if (std.mem.eql(u8, lhs.filename, rhs.filename)) return .eq;
@@ -479,6 +570,7 @@ const PersistentObjectRangeCacheState = struct {
     policy: PersistentObjectRangeCachePolicy,
     io: std.Io,
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
+    reclaim_idle: @FieldType(PersistentObjectRangeCacheResources, "reclaim_idle") = null,
     mutex: std.Io.Mutex = .init,
     condition: std.Io.Condition = .init,
     worker: ?std.Io.Future(void) = null,
@@ -488,18 +580,43 @@ const PersistentObjectRangeCacheState = struct {
     pending: std.StringHashMapUnmanaged(void) = .empty,
     pending_bytes: usize = 0,
     pending_count: usize = 0,
+    owner_lock: ?std.Io.File = null,
     entries: std.StringHashMapUnmanaged(*PersistentObjectRangeCacheEntry) = .empty,
     lru: std.DoublyLinkedList = .{},
     stats: PersistentObjectRangeCacheStats = .{},
 
     fn initializeInventory(self: *PersistentObjectRangeCacheState) !void {
         const io = self.io;
-        try fs_paths.createDirPathPortable(io, self.root_dir);
+        // Create a private leaf without changing permissions on an existing
+        // configured directory (which can belong to other local tooling).
+        const leaf = std.mem.trimEnd(u8, self.root_dir, "/\\");
+        if (leaf.len == 0) return error.BadPathName;
+        try fs_paths.createDirPathPortable(io, std.fs.path.dirname(leaf) orelse ".");
+        if (std.fs.path.isAbsolute(leaf)) {
+            std.Io.Dir.createDirAbsolute(io, leaf, @fromBackingInt(@intCast(0o700))) catch |err| switch (err) {
+                error.PathAlreadyExists => {},
+                else => return err,
+            };
+        } else {
+            std.Io.Dir.cwd().createDir(io, leaf, @fromBackingInt(@intCast(0o700))) catch |err| switch (err) {
+                error.PathAlreadyExists => {},
+                else => return err,
+            };
+        }
         var dir = if (std.fs.path.isAbsolute(self.root_dir))
             try std.Io.Dir.openDirAbsolute(io, self.root_dir, .{ .iterate = true })
         else
             try std.Io.Dir.cwd().openDir(io, self.root_dir, .{ .iterate = true });
         defer dir.close(io);
+        // Coordinate inventory cleanup/eviction across API owners/processes.
+        // Contention disables the optional serving tier instead of blocking a
+        // request or mutating another owner's pinned entries.
+        self.owner_lock = try dir.createFile(io, "OWNER.lock", .{
+            .truncate = false,
+            .lock = .exclusive,
+            .lock_nonblocking = true,
+            .permissions = @fromBackingInt(@intCast(0o600)),
+        });
 
         var discovered = std.PriorityQueue(
             *PersistentObjectRangeCacheEntry,
@@ -564,6 +681,7 @@ const PersistentObjectRangeCacheState = struct {
                 .filename = filename,
                 .disk_bytes = disk_bytes,
                 .modified_ns = stat.mtime.toNanoseconds(),
+                .protected = persistentCachedKeyProtected(io, self.alloc, dir, filename, self.policy.max_cache_key_bytes) catch false,
             };
             discovered.push(self.alloc, owned) catch |err| {
                 self.freeEntry(owned);
@@ -595,23 +713,14 @@ const PersistentObjectRangeCacheState = struct {
             try self.entries.put(self.alloc, entry.filename, entry);
             self.lru.append(&entry.lru_node);
             self.stats.stored_bytes +|= entry.disk_bytes;
+            if (entry.protected) self.stats.protected_stored_bytes +|= entry.disk_bytes;
             self.stats.entries +|= 1;
             registered += 1;
         }
         while (self.stats.stored_bytes > self.policy.max_total_bytes or self.stats.entries > self.policy.max_entries) {
-            const victim_node = self.lru.first orelse break;
-            const victim: *PersistentObjectRangeCacheEntry = @alignCast(@fieldParentPtr("lru_node", victim_node));
-            dir.deleteFile(io, victim.filename) catch |err| switch (err) {
-                error.FileNotFound => {},
-                else => return err,
-            };
-            _ = self.entries.remove(victim.filename);
-            self.lru.remove(victim_node);
-            decrementSaturating(&self.stats.stored_bytes, victim.disk_bytes);
-            decrementSaturating(&self.stats.entries, 1);
-            self.stats.evicted_bytes +|= victim.disk_bytes;
-            self.stats.evicted_entries += 1;
-            self.freeEntry(victim);
+            // Recovery may evict protected entries if they alone exceed the
+            // new ceiling, but ordinary ranges must be removed first.
+            if (!self.evictOne(true)) return error.PersistentObjectRangeCacheRecoveryFailed;
         }
     }
 
@@ -824,6 +933,7 @@ const PersistentObjectRangeCacheState = struct {
         _ = self.entries.remove(entry.filename);
         self.lru.remove(&entry.lru_node);
         decrementSaturating(&self.stats.stored_bytes, entry.disk_bytes);
+        if (entry.protected) decrementSaturating(&self.stats.protected_stored_bytes, entry.disk_bytes);
         decrementSaturating(&self.stats.entries, 1);
         if (corrupt) self.stats.corrupt_entries_removed += 1;
         self.condition.broadcast(io);
@@ -831,37 +941,48 @@ const PersistentObjectRangeCacheState = struct {
         self.freeEntry(entry);
     }
 
-    fn evictOne(self: *PersistentObjectRangeCacheState) bool {
+    fn evictOne(self: *PersistentObjectRangeCacheState, incoming_protected: bool) bool {
         const io = self.io;
         self.mutex.lockUncancelable(io);
-        var node = self.lru.first;
-        const victim = while (node) |candidate_node| : (node = candidate_node.next) {
-            const candidate: *PersistentObjectRangeCacheEntry = @alignCast(@fieldParentPtr("lru_node", candidate_node));
-            if (candidate.pin_count == 0 and !candidate.removing) {
-                candidate.removing = true;
-                break candidate;
+        // Prefer ordinary ranges regardless of insertion order. The reserved
+        // pool protects hot footers/indexes against one-off broad scans.
+        const reservation = @min(self.policy.protected_bytes, self.policy.max_total_bytes / 4);
+        var victim: ?*PersistentObjectRangeCacheEntry = null;
+        for (0..2) |pass| {
+            var node = self.lru.first;
+            while (node) |candidate_node| : (node = candidate_node.next) {
+                const candidate: *PersistentObjectRangeCacheEntry = @alignCast(@fieldParentPtr("lru_node", candidate_node));
+                if (candidate.pin_count != 0 or candidate.removing) continue;
+                if (pass == 0 and candidate.protected) continue;
+                if (candidate.protected and !incoming_protected and self.stats.protected_stored_bytes <= reservation) continue;
+                victim = candidate;
+                break;
             }
-        } else {
+            if (victim != null) break;
+        }
+        const selected = victim orelse {
             self.mutex.unlock(io);
             return false;
         };
+        selected.removing = true;
         self.mutex.unlock(io);
 
-        const deleted = self.deleteCacheFile(victim.filename) catch false;
+        const deleted = self.deleteCacheFile(selected.filename) catch false;
         self.mutex.lockUncancelable(io);
         if (!deleted) {
-            victim.removing = false;
+            selected.removing = false;
             self.mutex.unlock(io);
             return false;
         }
-        _ = self.entries.remove(victim.filename);
-        self.lru.remove(&victim.lru_node);
-        decrementSaturating(&self.stats.stored_bytes, victim.disk_bytes);
+        _ = self.entries.remove(selected.filename);
+        self.lru.remove(&selected.lru_node);
+        decrementSaturating(&self.stats.stored_bytes, selected.disk_bytes);
+        if (selected.protected) decrementSaturating(&self.stats.protected_stored_bytes, selected.disk_bytes);
         decrementSaturating(&self.stats.entries, 1);
-        self.stats.evicted_bytes += victim.disk_bytes;
+        self.stats.evicted_bytes += selected.disk_bytes;
         self.stats.evicted_entries += 1;
         self.mutex.unlock(io);
-        self.freeEntry(victim);
+        self.freeEntry(selected);
         return true;
     }
 
@@ -874,10 +995,13 @@ const PersistentObjectRangeCacheState = struct {
             disk_bytes <= self.policy.max_total_bytes - self.stats.stored_bytes;
     }
 
-    fn makeCapacityFor(self: *PersistentObjectRangeCacheState, disk_bytes: usize) bool {
+    fn makeCapacityFor(self: *PersistentObjectRangeCacheState, disk_bytes: usize, protected: bool) bool {
         if (disk_bytes > self.policy.max_total_bytes) return false;
         while (!self.hasCapacityFor(disk_bytes)) {
-            if (!self.evictOne()) return false;
+            if (!self.evictOne(protected)) {
+                const reclaim = self.reclaim_idle orelse return false;
+                if (!reclaim.reclaim_one(reclaim.ptr)) return false;
+            }
         }
         return true;
     }
@@ -919,7 +1043,7 @@ const PersistentObjectRangeCacheState = struct {
             return .already_present;
         }
         self.mutex.unlock(io);
-        if (!self.makeCapacityFor(task.disk_bytes)) return .capacity_unavailable;
+        if (!self.makeCapacityFor(task.disk_bytes, cacheKeyProtected(task.cache_key))) return .capacity_unavailable;
         var capacity_reservation = self.reserveWriteCapacity(task.disk_bytes) catch |err| switch (err) {
             error.PersistentObjectRangeCacheCapacityUnavailable => return .capacity_unavailable,
             else => return err,
@@ -936,6 +1060,7 @@ const PersistentObjectRangeCacheState = struct {
             .filename = owned_filename,
             .disk_bytes = task.disk_bytes,
             .modified_ns = 0,
+            .protected = cacheKeyProtected(task.cache_key),
         };
         self.mutex.lockUncancelable(io);
         self.entries.ensureUnusedCapacity(self.alloc, 1) catch |err| {
@@ -956,6 +1081,7 @@ const PersistentObjectRangeCacheState = struct {
         self.entries.putAssumeCapacityNoClobber(entry.filename, entry);
         self.lru.append(&entry.lru_node);
         self.stats.stored_bytes +|= entry.disk_bytes;
+        if (entry.protected) self.stats.protected_stored_bytes +|= entry.disk_bytes;
         self.stats.entries +|= 1;
         self.mutex.unlock(io);
         return .written;
@@ -1409,9 +1535,9 @@ fn persistentObjectRangeWriteFilePartsAtomicallyWithIo(
         std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
     {
         var file = if (std.fs.path.isAbsolute(tmp_path))
-            try std.Io.Dir.createFileAbsolute(io, tmp_path, .{ .truncate = true })
+            try std.Io.Dir.createFileAbsolute(io, tmp_path, .{ .truncate = true, .exclusive = true, .permissions = @fromBackingInt(@intCast(0o600)) })
         else
-            try std.Io.Dir.cwd().createFile(io, tmp_path, .{ .truncate = true });
+            try std.Io.Dir.cwd().createFile(io, tmp_path, .{ .truncate = true, .exclusive = true, .permissions = @fromBackingInt(@intCast(0o600)) });
         defer file.close(io);
         var buf: [4096]u8 = undefined;
         var writer = file.writer(io, &buf);
@@ -1437,7 +1563,7 @@ fn decrementSaturating(value: *usize, amount: usize) void {
     value.* = if (value.* >= amount) value.* - amount else 0;
 }
 
-fn cacheLaneFromObjectRangeCacheKey(cache_key: []const u8) ?range_io.CacheLane {
+pub fn cacheLaneFromObjectRangeCacheKey(cache_key: []const u8) ?range_io.CacheLane {
     const marker = ":purpose=";
     const marker_index = std.mem.indexOf(u8, cache_key, marker) orelse return null;
     const purpose_start = marker_index + marker.len;
@@ -1539,6 +1665,8 @@ const DecodedColumn = union(enum) {
     bytes: [][]u8,
     dictionary_bytes: rowsource.DictionaryBytes,
     borrowed_dictionary_bytes: rowsource.DictionaryBytes,
+    dictionary_i64: rowsource.DictionaryNumeric(i64),
+    dictionary_f64: rowsource.DictionaryNumeric(f64),
 
     pub fn deinit(self: *DecodedColumn, alloc: Allocator) void {
         switch (self.*) {
@@ -1548,10 +1676,24 @@ const DecodedColumn = union(enum) {
             .bytes => |values| parquet_page.freePlainByteArrays(alloc, values),
             .dictionary_bytes => |values| values.deinit(alloc),
             .borrowed_dictionary_bytes => |values| alloc.free(values.indices),
+            inline .dictionary_i64, .dictionary_f64 => |values| values.deinit(alloc),
         }
         self.* = undefined;
     }
 };
+
+fn numericDictionaryColumn(comptime T: type, alloc: Allocator, input: ColumnChunkInput, compression: parquet_page.CompressionCodec, optional: bool, borrow: bool) !struct { column: DecodedColumn, nulls: []u8 } {
+    const dictionary = (try parquet_page.Dictionary.values(if (T == i64) .i64 else .f64, input.dictionary)).?;
+    const parsed = try parquet_page.parsePageHeader(input.bytes);
+    const payload = try parquet_page.decodePagePayloadAlloc(alloc, parsed.header, compression, input.bytes[parsed.header_len..]);
+    defer payload.deinit(alloc);
+    const decoded = try parquet_page.decodeDictionaryIndices(alloc, parsed.header, dictionary.len, payload.bytes, optional);
+    errdefer alloc.free(decoded.indices);
+    errdefer if (decoded.nulls.len != 0) alloc.free(decoded.nulls);
+    const values = if (borrow) dictionary else try alloc.dupe(T, dictionary);
+    const result: rowsource.DictionaryNumeric(T) = .{ .values = values, .indices = decoded.indices, .owned = !borrow };
+    return .{ .column = if (T == i64) .{ .dictionary_i64 = result } else .{ .dictionary_f64 = result }, .nulls = decoded.nulls };
+}
 
 pub const RowGroupSource = struct {
     inventory: external_source.Inventory,
@@ -1988,14 +2130,26 @@ fn buildPlainI64RowGroupBatchAlloc(
                     decoded = undefined;
                 },
                 .dictionary_required => {
-                    decoded_columns[idx] = .{ .i64 = try parquet_page.scanDictionaryI64ColumnChunkAllocCached(alloc, input.bytes, compression, try parquet_page.Dictionary.values(.i64, input.dictionary)) };
-                    null_bitmaps[idx] = &.{};
+                    if (limits.preserve_dictionary and input.dictionary != null) {
+                        const decoded = try numericDictionaryColumn(i64, alloc, input, compression, false, limits.borrow_dictionary);
+                        decoded_columns[idx] = decoded.column;
+                        null_bitmaps[idx] = decoded.nulls;
+                    } else {
+                        decoded_columns[idx] = .{ .i64 = try parquet_page.scanDictionaryI64ColumnChunkAllocCached(alloc, input.bytes, compression, try parquet_page.Dictionary.values(.i64, input.dictionary)) };
+                        null_bitmaps[idx] = &.{};
+                    }
                 },
                 .dictionary_optional => {
-                    var decoded = try parquet_page.scanOptionalDictionaryI64ColumnChunkAllocCached(alloc, input.bytes, compression, try parquet_page.Dictionary.values(.i64, input.dictionary));
-                    decoded_columns[idx] = .{ .i64 = decoded.values };
-                    null_bitmaps[idx] = decoded.nulls;
-                    decoded = undefined;
+                    if (limits.preserve_dictionary and input.dictionary != null) {
+                        const decoded = try numericDictionaryColumn(i64, alloc, input, compression, true, limits.borrow_dictionary);
+                        decoded_columns[idx] = decoded.column;
+                        null_bitmaps[idx] = decoded.nulls;
+                    } else {
+                        var decoded = try parquet_page.scanOptionalDictionaryI64ColumnChunkAllocCached(alloc, input.bytes, compression, try parquet_page.Dictionary.values(.i64, input.dictionary));
+                        decoded_columns[idx] = .{ .i64 = decoded.values };
+                        null_bitmaps[idx] = decoded.nulls;
+                        decoded = undefined;
+                    }
                 },
                 .int96_timestamp_required => {
                     decoded_columns[idx] = .{ .i64 = try parquet_page.scanPlainInt96TimestampNsColumnChunkAlloc(alloc, input.bytes, compression) };
@@ -2050,14 +2204,26 @@ fn buildPlainI64RowGroupBatchAlloc(
                     decoded = undefined;
                 },
                 .dictionary_required => {
-                    decoded_columns[idx] = .{ .i64 = try parquet_page.scanDictionaryI32AsI64ColumnChunkAllocCached(alloc, input.bytes, compression, try parquet_page.Dictionary.values(.i64, input.dictionary)) };
-                    null_bitmaps[idx] = &.{};
+                    if (limits.preserve_dictionary and input.dictionary != null) {
+                        const decoded = try numericDictionaryColumn(i64, alloc, input, compression, false, limits.borrow_dictionary);
+                        decoded_columns[idx] = decoded.column;
+                        null_bitmaps[idx] = decoded.nulls;
+                    } else {
+                        decoded_columns[idx] = .{ .i64 = try parquet_page.scanDictionaryI32AsI64ColumnChunkAllocCached(alloc, input.bytes, compression, try parquet_page.Dictionary.values(.i64, input.dictionary)) };
+                        null_bitmaps[idx] = &.{};
+                    }
                 },
                 .dictionary_optional => {
-                    var decoded = try parquet_page.scanOptionalDictionaryI32AsI64ColumnChunkAllocCached(alloc, input.bytes, compression, try parquet_page.Dictionary.values(.i64, input.dictionary));
-                    decoded_columns[idx] = .{ .i64 = decoded.values };
-                    null_bitmaps[idx] = decoded.nulls;
-                    decoded = undefined;
+                    if (limits.preserve_dictionary and input.dictionary != null) {
+                        const decoded = try numericDictionaryColumn(i64, alloc, input, compression, true, limits.borrow_dictionary);
+                        decoded_columns[idx] = decoded.column;
+                        null_bitmaps[idx] = decoded.nulls;
+                    } else {
+                        var decoded = try parquet_page.scanOptionalDictionaryI32AsI64ColumnChunkAllocCached(alloc, input.bytes, compression, try parquet_page.Dictionary.values(.i64, input.dictionary));
+                        decoded_columns[idx] = .{ .i64 = decoded.values };
+                        null_bitmaps[idx] = decoded.nulls;
+                        decoded = undefined;
+                    }
                 },
             },
             .f64 => |f64_mode| switch (f64_mode) {
@@ -2072,14 +2238,26 @@ fn buildPlainI64RowGroupBatchAlloc(
                     decoded = undefined;
                 },
                 .dictionary_required => {
-                    decoded_columns[idx] = .{ .f64 = try parquet_page.scanDictionaryF64ColumnChunkAllocCached(alloc, input.bytes, compression, try parquet_page.Dictionary.values(.f64, input.dictionary)) };
-                    null_bitmaps[idx] = &.{};
+                    if (limits.preserve_dictionary and input.dictionary != null) {
+                        const decoded = try numericDictionaryColumn(f64, alloc, input, compression, false, limits.borrow_dictionary);
+                        decoded_columns[idx] = decoded.column;
+                        null_bitmaps[idx] = decoded.nulls;
+                    } else {
+                        decoded_columns[idx] = .{ .f64 = try parquet_page.scanDictionaryF64ColumnChunkAllocCached(alloc, input.bytes, compression, try parquet_page.Dictionary.values(.f64, input.dictionary)) };
+                        null_bitmaps[idx] = &.{};
+                    }
                 },
                 .dictionary_optional => {
-                    var decoded = try parquet_page.scanOptionalDictionaryF64ColumnChunkAllocCached(alloc, input.bytes, compression, try parquet_page.Dictionary.values(.f64, input.dictionary));
-                    decoded_columns[idx] = .{ .f64 = decoded.values };
-                    null_bitmaps[idx] = decoded.nulls;
-                    decoded = undefined;
+                    if (limits.preserve_dictionary and input.dictionary != null) {
+                        const decoded = try numericDictionaryColumn(f64, alloc, input, compression, true, limits.borrow_dictionary);
+                        decoded_columns[idx] = decoded.column;
+                        null_bitmaps[idx] = decoded.nulls;
+                    } else {
+                        var decoded = try parquet_page.scanOptionalDictionaryF64ColumnChunkAllocCached(alloc, input.bytes, compression, try parquet_page.Dictionary.values(.f64, input.dictionary));
+                        decoded_columns[idx] = .{ .f64 = decoded.values };
+                        null_bitmaps[idx] = decoded.nulls;
+                        decoded = undefined;
+                    }
                 },
                 .float_required => {
                     decoded_columns[idx] = .{ .f64 = try parquet_page.scanPlainF32AsF64ColumnChunkAlloc(alloc, input.bytes, compression) };
@@ -2196,6 +2374,14 @@ fn buildPlainI64RowGroupBatchAlloc(
                     .values = .{ .bool = values },
                     .nulls = .{ .bytes = null_bitmaps[idx] },
                 };
+            },
+            .dictionary_i64 => |values| blk: {
+                if (values.indices.len != row_count) return error.ParquetRowGroupRowCountMismatch;
+                break :blk .{ .name = column_names[idx], .values = .{ .dictionary_i64 = values }, .nulls = .{ .bytes = null_bitmaps[idx] } };
+            },
+            .dictionary_f64 => |values| blk: {
+                if (values.indices.len != row_count) return error.ParquetRowGroupRowCountMismatch;
+                break :blk .{ .name = column_names[idx], .values = .{ .dictionary_f64 = values }, .nulls = .{ .bytes = null_bitmaps[idx] } };
             },
             .dictionary_bytes, .borrowed_dictionary_bytes => |values| blk: {
                 if (values.indices.len != row_count) return error.ParquetRowGroupRowCountMismatch;
@@ -9508,10 +9694,10 @@ test "parquet page cursor reuses decoded dictionaries aligns nullable columns an
         if (position == 0) try std.testing.expectEqual(amount_page_len + optional_page_len, reader.prefetch_bytes);
         for (0..batch.rowCount()) |index| {
             try std.testing.expectEqual(@as(u64, position), batch.row_refs[index].external.row_ordinal);
-            try std.testing.expectEqual(@as(i64, if (position % 3 == 0) 10 else 20), batch.columns[0].values.i64[index]);
+            try std.testing.expectEqual(@as(i64, if (position % 3 == 0) 10 else 20), try batch.columns[0].integerAt(index));
             try std.testing.expectEqualStrings(if ((position / 8) % 2 == 0) "alpha" else "beta", batch.columns[1].values.dictionary_bytes.at(index));
             try std.testing.expectEqual(position % 3 == 1, batch.columns[2].nulls.bytes[index] != 0);
-            if (position % 3 != 1) try std.testing.expectEqual(@as(i64, if (position % 3 == 0) 10 else 20), batch.columns[2].values.i64[index]);
+            if (position % 3 != 1) try std.testing.expectEqual(@as(i64, if (position % 3 == 0) 10 else 20), try batch.columns[2].integerAt(index));
             position += 1;
         }
     }
@@ -9519,6 +9705,16 @@ test "parquet page cursor reuses decoded dictionaries aligns nullable columns an
     try std.testing.expectEqual(@as(usize, 3), cursor.dictionary_decodes);
     try std.testing.expectEqual(@as(usize, 19), cursor.pages_decoded);
     try std.testing.expect(cache.snapshot().hits >= 19);
+
+    // Without decoded-cache publication, the cursor itself owns the dictionary
+    // and pages borrow it instead of duplicating all entries for each page.
+    var uncached = try @import("lake_parquet_cursor.zig").Cursor.init(a, reader.reader(), inventory, "data", 0, &.{ "amount", "tenant", "optional" }, .{});
+    defer uncached.deinit();
+    const first = (try uncached.next()).?;
+    const amount_dictionary = @intFromPtr(first.columns[0].values.dictionary_i64.values.ptr);
+    try std.testing.expectEqual(amount_dictionary, @intFromPtr(uncached.columns[0].dictionary.?.i64.ptr));
+    const second = (try uncached.next()).?;
+    try std.testing.expectEqual(amount_dictionary, @intFromPtr(second.columns[0].values.dictionary_i64.values.ptr));
 }
 
 /// Benchmark fixture helpers are excluded from production builds.
@@ -9643,5 +9839,124 @@ test "external lake speculative page prefetch defers errors and preserves reques
         try std.testing.expectEqual(@as(i64, 1), batch.columns[0].values.i64[0]);
         try std.testing.expectEqual(@as(usize, 1), cursor.pages_decoded);
         try std.testing.expectError(if (mode == .provider) error.ProviderUnavailable else error.ParquetPageTooLarge, cursor.next());
+    }
+}
+
+fn cacheKeyProtected(key: []const u8) bool {
+    const lane = cacheLaneFromObjectRangeCacheKey(key) orelse return false;
+    return lane == .metadata or lane == .serving_sidecar;
+}
+
+/// Recover only bounded key provenance for eviction priority. Payload
+/// integrity is still verified by readAlloc before bytes can serve a query.
+fn persistentCachedKeyProtected(io: std.Io, a: Allocator, dir: std.Io.Dir, filename: []const u8, maximum: usize) !bool {
+    var file = try dir.openFile(io, filename, .{});
+    defer file.close(io);
+    var prefix: [persistent_object_range_cache_magic.len + 4]u8 = undefined;
+    if (try file.readPositionalAll(io, &prefix, 0) != prefix.len) return false;
+    if (!std.mem.eql(u8, prefix[0..persistent_object_range_cache_magic.len], persistent_object_range_cache_magic)) return false;
+    const length = std.mem.readInt(u32, prefix[persistent_object_range_cache_magic.len..][0..4], .little);
+    if (length > maximum) return false;
+    const key = try a.alloc(u8, length);
+    defer a.free(key);
+    if (try file.readPositionalAll(io, key, prefix.len) != length) return false;
+    const digest = try objectRangeCacheKeyDigestHexAlloc(a, key);
+    defer a.free(digest);
+    if (!std.mem.eql(u8, digest, filename)) return false;
+    return cacheKeyProtected(key);
+}
+
+test "lake persistent cache protects metadata through scan pressure and restart" {
+    const a = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(a, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/protected-cache", .{tmp.sub_path});
+    defer a.free(root);
+    const policy: PersistentObjectRangeCachePolicy = .{ .max_entries = 2, .max_total_bytes = 8192 };
+    const footer = "lake-range:v2:purpose=parquet_footer:identity=metadata";
+    {
+        var disk = try PersistentObjectRangeCache.initWithPolicy(io, root, policy);
+        defer disk.deinit();
+        try std.testing.expectEqual(PersistentObjectRangeCacheEnqueueResult.enqueued, disk.enqueueWrite(footer, "meta"));
+        disk.flush();
+        _ = disk.enqueueWrite("scan-1", "data");
+        disk.flush();
+        _ = disk.enqueueWrite("scan-2", "more");
+        disk.flush();
+        const bytes = (try disk.readAlloc(a, footer, 4)).?;
+        defer a.free(bytes);
+        try std.testing.expectEqualStrings("meta", bytes);
+        try std.testing.expect((try disk.readAlloc(a, "scan-1", 4)) == null);
+        try std.testing.expect(disk.statsSnapshot().protected_stored_bytes > 0);
+    }
+    {
+        var disk = try PersistentObjectRangeCache.initWithPolicy(io, root, policy);
+        defer disk.deinit();
+        try std.testing.expect(disk.statsSnapshot().protected_stored_bytes > 0);
+        _ = disk.enqueueWrite("scan-3", "next");
+        disk.flush();
+        const bytes = (try disk.readAlloc(a, footer, 4)).?;
+        defer a.free(bytes);
+        try std.testing.expectEqualStrings("meta", bytes);
+        try std.testing.expectEqual(@as(usize, 2), disk.statsSnapshot().entries);
+    }
+}
+
+test "lake persistent cache holds one root owner until shutdown" {
+    const a = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(a, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/owned-cache", .{tmp.sub_path});
+    defer a.free(root);
+    {
+        var owner = try PersistentObjectRangeCache.init(io, root);
+        defer owner.deinit();
+        try std.testing.expectError(error.WouldBlock, PersistentObjectRangeCache.init(io, root));
+        _ = owner.enqueueWrite("key", "bytes");
+    }
+    var successor = try PersistentObjectRangeCache.init(io, root);
+    defer successor.deinit();
+    const bytes = (try successor.readAlloc(a, "key", 5)).?;
+    defer a.free(bytes);
+    try std.testing.expectEqualStrings("bytes", bytes);
+}
+
+test "lake persistent cache recovery preserves priority when capacity shrinks" {
+    const a = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const footer = "lake-range:v2:purpose=parquet_footer:identity=older-footer";
+    for ([_]bool{ false, true }) |entries| {
+        const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/shrink-{s}", .{ tmp.sub_path, if (entries) "entries" else "bytes" });
+        defer a.free(root);
+        var policy: PersistentObjectRangeCachePolicy = .{ .max_entries = 4, .max_total_bytes = 8192 };
+        {
+            var disk = try PersistentObjectRangeCache.initWithPolicy(io, root, policy);
+            defer disk.deinit();
+            _ = disk.enqueueWrite(footer, "meta");
+            disk.flush();
+            _ = disk.enqueueWrite("newer-scan-1", "data");
+            disk.flush();
+            _ = disk.enqueueWrite("newer-scan-2", "more");
+            disk.flush();
+        }
+        if (entries) policy.max_entries = 1 else policy.max_total_bytes = 180;
+        var disk = try PersistentObjectRangeCache.initWithPolicy(io, root, policy);
+        defer disk.deinit();
+        const bytes = (try disk.readAlloc(a, footer, 4)).?;
+        defer a.free(bytes);
+        try std.testing.expectEqualStrings("meta", bytes);
+        try std.testing.expect(disk.statsSnapshot().stored_bytes <= policy.max_total_bytes);
+        try std.testing.expect(disk.statsSnapshot().entries <= policy.max_entries);
+        if (entries) try std.testing.expect((try disk.readAlloc(a, "newer-scan-2", 4)) == null);
     }
 }

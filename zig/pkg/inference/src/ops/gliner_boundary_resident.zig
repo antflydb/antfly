@@ -869,7 +869,7 @@ fn testAllocationFailures(a: std.mem.Allocator) !void {
 }
 
 test "gliner boundary resident allocation failures release every owned tensor and metadata" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{});
 }
 
 test "gliner boundary resident model estimate includes constants and bounded upload staging" {
@@ -1018,7 +1018,7 @@ fn testWorkspaceAllocationFailures(a: std.mem.Allocator) !void {
 }
 
 test "gliner boundary resident workspace allocation failures preserve leases and old storage" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, testWorkspaceAllocationFailures, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, testWorkspaceAllocationFailures, .{});
 }
 
 test "gliner boundary resident workspace cancellation keeps permit with caller" {

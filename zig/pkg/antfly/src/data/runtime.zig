@@ -25967,6 +25967,8 @@ const RemoteMetadataSource = struct {
                 .create_table = remoteCreateTable,
                 .replace_table_definition = remoteReplaceTableDefinition,
                 .replace_table_definition_stamped = remoteReplaceTableDefinitionStamped,
+                .get_lake_index_lifecycle = remoteGetLakeIndexLifecycle,
+                .mutate_lake_index_lifecycle = remoteMutateLakeIndexLifecycle,
                 .restore_table = remoteRestoreTable,
                 .drop_table = remoteDropTable,
                 .drop_table_exact = remoteDropTableExact,
@@ -27699,6 +27701,19 @@ const RemoteMetadataSource = struct {
         return input.isMutation();
     }
 
+    fn remoteGetLakeIndexLifecycle(ptr: *anyopaque, a: std.mem.Allocator, table_id: u64, request: antfly.public_api.operation.RequestContext) ![]u8 {
+        return remoteSystemCatalog(ptr, a, request, .{ .lake_index_lifecycle_read = table_id });
+    }
+    fn remoteMutateLakeIndexLifecycle(ptr: *anyopaque, table_id: u64, revision: u64, mutation: @import("../metadata/lake_index_lifecycle.zig").Mutation, request: antfly.public_api.operation.RequestContext) !void {
+        var context = request;
+        // This callback is a private service capability, selected only after
+        // the API has authorized the external table read.
+        context.setting_admin = true;
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        _ = try remoteSystemCatalog(ptr, arena.allocator(), context, .{ .lake_index_lifecycle_mutate = .{ .table_id = table_id, .expected_revision = revision, .mutation = mutation } });
+    }
+
     fn remoteSystemCatalog(ptr: *anyopaque, alloc: std.mem.Allocator, request: antfly.public_api.operation.RequestContext, input: @import("../system_catalog/server_call.zig").Call) ![]u8 {
         const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
         try request.ensureActive();
@@ -27706,7 +27721,7 @@ const RemoteMetadataSource = struct {
         if (!isSystemCatalogMutation(input)) return self.readSystemCatalog(alloc, request, input);
         // Even ambiguous writes may have committed new topology. Invalidate
         // cached snapshots without automatically replaying the mutation.
-        defer self.invalidateCache();
+        defer if (input != .lake_index_lifecycle_mutate) self.invalidateCache();
         return self.withMetadataMutationApiClient([]u8, struct {
             fn call(
                 _: *RemoteMetadataSource,
@@ -28938,6 +28953,7 @@ fn runtimeIndexStatusReportFromLocalIndex(
             .published_sequence = source.published_sequence,
             .target_sequence = source.target_sequence,
             .failed = source.failed,
+            .producer_complete = source.producer_complete,
         };
         source_count += 1;
     }

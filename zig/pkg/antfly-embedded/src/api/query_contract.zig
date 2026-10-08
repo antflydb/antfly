@@ -448,6 +448,8 @@ pub const QueryResponseMeta = struct {
 
     evaluation_json: ?[]u8 = null,
     took_ms: i64 = 0,
+    /// Borrowed execution fence; response encoding copies it before return.
+    remote_snapshot: ?[]const u8 = null,
     shard_count: u32 = 1,
     merged: bool = false,
     reranker: ?RerankerProfile = null,
@@ -2224,6 +2226,10 @@ fn applyCommonSearchRequestOptions(
 
     if (request.offset) |offset| req.offset = @intCast(offset);
     if (request.count) |count| req.count_only = count;
+    if (request.remote_snapshot) |snapshot| {
+        if (snapshot.len != 64) return error.InvalidQueryRequest;
+        req.remote_snapshot = try alloc.dupe(u8, snapshot);
+    }
     const has_result_page_options =
         request.order_by != null or
         request.search_after != null or
@@ -3656,6 +3662,7 @@ pub fn encodeQueryResponses(
                 .took = meta.took_ms,
                 .status = 200,
                 .table = req.response_table_name orelse table_name,
+                .remote_snapshot = meta.remote_snapshot,
             };
             break :blk try std.json.Stringify.valueAlloc(
                 alloc,
@@ -3687,6 +3694,7 @@ pub fn encodeQueryResponses(
                 .took = meta.took_ms,
                 .status = 200,
                 .table = req.response_table_name orelse table_name,
+                .remote_snapshot = meta.remote_snapshot,
             };
             break :blk try std.json.Stringify.valueAlloc(
                 alloc,
@@ -3717,7 +3725,12 @@ fn toOpenApiHit(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest, hit: 
         ._distance = if (hit.distance) |distance| finiteScoreOrZero(distance) else null,
         ._index_scores = try indexScoresJsonValue(alloc, hit.index_scores),
         ._sort = if (hit.sort_values.len > 0) hit.sort_values else null,
-        ._source = if (hit.stored_data) |stored_data|
+        ._source = if (hit.source_value) |value|
+            (if (req.include_stored) try takeOpenApiObjectMap(alloc, try projectPublicSourceView(alloc, value, .{
+                .fields = req.fields,
+                .include_all_fields = req.include_all_fields,
+            })) else null)
+        else if (hit.stored_data) |stored_data|
             try takeOpenApiObjectMap(alloc, if (req.defer_hierarchy_child_hydration and req.hierarchy_group_level == .unit)
                 // Deferred unit grouping uses `_source` as a private shard-to-
                 // coordinator revision envelope. Projecting it by public unit
@@ -4357,6 +4370,20 @@ fn parseInternalGroupedUnitRevisionEnvelopeValue(
         return error.InvalidDocumentExtractionState;
     if (revision != .string or revision.string.len == 0) return error.InvalidDocumentExtractionState;
     return try db_mod.types.cloneJsonValue(alloc, value);
+}
+
+fn projectPublicSourceView(alloc: std.mem.Allocator, source: std.json.Value, options: db_mod.types.LookupOptions) !std.json.Value {
+    if (source != .object) return error.InvalidRemoteResponse;
+    var value = try document_query.projectLookupView(alloc, source, options);
+    errdefer document_query.deinitProjectionView(alloc, &value);
+    if (value == .object) for ([_][]const u8{ hierarchy_navigation.unit_fingerprint_field, hierarchy_navigation.grouped_unit_revision_envelope_field }) |field| {
+        if (value.object.fetchOrderedRemove(field)) |removed| {
+            alloc.free(removed.key);
+            var child = removed.value;
+            document_query.deinitProjectionView(alloc, &child);
+        }
+    };
+    return value;
 }
 
 fn projectPublicStoredSourceValue(
@@ -10406,6 +10433,7 @@ fn appendUniqueOwnedString(
 fn freeSearchRequest(alloc: std.mem.Allocator, req: *db_mod.types.SearchRequest) void {
     if (req.index_name) |index_name| alloc.free(index_name);
     if (req.primary_text_index_name) |index_name| alloc.free(index_name);
+    if (req.remote_snapshot) |snapshot| alloc.free(snapshot);
     if (req.evaluation_json.len > 0) alloc.free(req.evaluation_json);
     if (req.aggregations_json.len > 0) alloc.free(req.aggregations_json);
     if (req.filter_prefix.len > 0) alloc.free(req.filter_prefix);
@@ -18452,4 +18480,43 @@ fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *con
         break :blk repeated;
     };
     return &result;
+}
+
+fn typedLakeSourceScenario(a: std.mem.Allocator) !void {
+    var parsed = try std.json.parseFromSlice(std.json.Value, a,
+        \\{"body":"a needle in the source","amount":9007199254740993,"nested":{"visible":"yes","private":"omit"},"_hierarchy_unit_revision_token":"internal"}
+    , .{});
+    defer parsed.deinit();
+    var hit: db_mod.types.SearchHit = .{ .id = try a.dupe(u8, "doc") };
+    defer hit.deinit(a);
+    hit.source_value = try db_mod.types.cloneJsonValue(a, parsed.value);
+    var cloned = try hit.clone(a);
+    defer cloned.deinit(a);
+    const search_exec = @import("../storage/db/query/search_exec.zig");
+    const queries = [_]search_exec.HighlightQuery{.{ .query = .{ .match = .{ .field = "body", .text = "needle" } }, .text_analysis = .{}, .runtime_schema = null }};
+    try search_exec.attachHighlightsWithIndexQueries(a, .{ .fields = &.{"body"} }, &queries, @as(*[1]db_mod.types.SearchHit, @ptrCast(&cloned)), null);
+    try std.testing.expectEqual(@as(usize, 1), cloned.highlights.len);
+    try std.testing.expect(cloned.stored_data == null);
+    try std.testing.expectEqual(@as(i64, 9007199254740993), cloned.source_value.?.object.get("amount").?.integer);
+    var hits = [_]db_mod.types.SearchHit{cloned};
+    const result: db_mod.types.SearchResult = .{ .alloc = a, .hits = &hits, .total_hits = 1 };
+    for ([_]bool{ true, false }) |include| {
+        var response = try encodeQueryResponses(a, "docs", .{ .include_stored = include, .fields = &.{ "amount", "nested.*", "-nested.private" }, .include_all_fields = false, .defer_stored_projection = true }, .{}, result);
+        defer response.deinit(a);
+        var encoded = try std.json.parseFromSlice(std.json.Value, a, response.json, .{});
+        defer encoded.deinit();
+        const returned = encoded.value.object.get("responses").?.array.items[0].object.get("hits").?.object.get("hits").?.array.items[0].object;
+        if (include) {
+            const source = returned.get("_source").?.object;
+            try std.testing.expectEqual(@as(i64, 9007199254740993), source.get("amount").?.integer);
+            try std.testing.expect(source.get("body") == null);
+            try std.testing.expect(source.get("nested").?.object.get("private") == null);
+        } else try std.testing.expect(returned.get("_source") == null);
+        try std.testing.expect(returned.get("_highlights") != null);
+    }
+}
+
+test "external lake typed source preserves ownership highlights exact values and public projection" {
+    try typedLakeSourceScenario(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, typedLakeSourceScenario, .{});
 }

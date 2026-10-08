@@ -189,7 +189,9 @@ pub const Manager = struct {
         const path = try std.fs.path.join(alloc, &.{ root, "accounts.json" });
         errdefer alloc.free(path);
         try paths.createDirPathPortable(io, root);
-        var dir = try std.Io.Dir.cwd().openDir(io, root, .{});
+        // Permissions require a normal descriptor: Linux O_PATH handles cannot
+        // be passed to fchmod. Zig uses O_PATH when iteration is disabled.
+        var dir = try std.Io.Dir.cwd().openDir(io, root, .{ .iterate = true });
         defer dir.close(io);
         if (@import("builtin").os.tag != .windows) try dir.setPermissions(io, @fromBackingInt(0o700));
         const lock_path = try std.fs.path.join(alloc, &.{ root, "session.lock" });
@@ -951,6 +953,8 @@ test "chatgpt manager persists host identity and partitions personal registratio
     try std.testing.expectEqualStrings("client-a", saved.value.accounts[0].client_id);
     try std.testing.expectEqualStrings("", saved.value.accounts[0].access_token);
     if (@import("builtin").os.tag != .windows) {
+        const directory = try std.Io.Dir.cwd().statFile(io, root, .{});
+        try std.testing.expectEqual(@as(u32, 0o700), @as(u32, @intCast(directory.permissions.toMode())) & 0o777);
         const stat = try std.Io.Dir.cwd().statFile(io, reopened.path, .{});
         try std.testing.expectEqual(@as(u32, 0), @as(u32, @intCast(stat.permissions.toMode())) & 0o077);
     }

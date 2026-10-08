@@ -3666,7 +3666,7 @@ test "audio layer inputs survive allocation failures without leaks or double fre
     const valid_mask = [_]bool{ true, true, false };
     const per_dim_row = [_]f32{ 0.1, -0.2, 0.3, 0.4, -0.5, 0.6, 0.7, 0.8 };
     const per_dim = [_][]const f32{ &per_dim_row, &per_dim_row, &per_dim_row };
-    try std.testing.checkAllAllocationFailures(
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(
         std.testing.allocator,
         initAudioLayerInputsUnderAllocationFaults,
         .{ cfg, @as([]const bool, &valid_mask), @as([]const []const f32, &per_dim) },

@@ -382,7 +382,7 @@ fn allocationCheck(a: Allocator) !void {
 }
 
 test "resident program compilation plans liveness captures and cleans every allocation failure" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, allocationCheck, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, allocationCheck, .{});
 }
 
 test "resident program compilation rejects unsupported integer conversions instructions and resource limits" {

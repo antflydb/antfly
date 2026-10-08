@@ -1847,6 +1847,7 @@ pub const SearchRequest = struct {
     query: Query = .{ .match_all = {} },
     index_name: ?[]const u8 = null,
     primary_text_index_name: ?[]const u8 = null,
+    remote_snapshot: ?[]const u8 = null,
     aggregations_json: []const u8 = "",
     count_only: bool = false,
     profile: bool = false,
@@ -2012,6 +2013,7 @@ const hierarchy_children_rejected_fields = [_][]const u8{
     "query",
     "index_name",
     "primary_text_index_name",
+    "remote_snapshot",
     "aggregations_json",
     "count_only",
     "profile",
@@ -2492,6 +2494,11 @@ pub const SearchHit = struct {
     index_scores: []fusion_mod.IndexScore = &.{},
     sort_values: []std.json.Value = &.{},
     stored_data: ?[]u8 = null,
+    /// Owned typed source for providers that hydrate after source-dependent
+    /// ranking/filtering. Highlighting and public projection consume this
+    /// directly; encoding happens once at the response boundary. Providers
+    /// populate either this or stored_data, never both.
+    source_value: ?std.json.Value = null,
     ancestor_source_data: ?[]u8 = null,
     ancestor_unit_data: ?[]u8 = null,
     artifact_ref: ?ArtifactRef = null,
@@ -2510,6 +2517,7 @@ pub const SearchHit = struct {
             freeIndexScores(alloc, cloned.index_scores);
             freeJsonValues(alloc, cloned.sort_values);
             if (cloned.stored_data) |data| alloc.free(data);
+            if (cloned.source_value) |*value| deinitJsonValue(alloc, value);
             if (cloned.ancestor_source_data) |data| alloc.free(data);
             if (cloned.ancestor_unit_data) |data| alloc.free(data);
             if (cloned.artifact_ref) |*artifact_ref| artifact_ref.deinit(alloc);
@@ -2525,6 +2533,7 @@ pub const SearchHit = struct {
         cloned.index_scores = try cloneIndexScores(alloc, self.index_scores);
         cloned.sort_values = try cloneJsonValues(alloc, self.sort_values);
         cloned.stored_data = if (self.stored_data) |data| try alloc.dupe(u8, data) else null;
+        cloned.source_value = if (self.source_value) |value| try cloneJsonValue(alloc, value) else null;
         cloned.ancestor_source_data = if (self.ancestor_source_data) |data| try alloc.dupe(u8, data) else null;
         cloned.ancestor_unit_data = if (self.ancestor_unit_data) |data| try alloc.dupe(u8, data) else null;
         cloned.artifact_ref = if (self.artifact_ref) |artifact_ref| try artifact_ref.clone(alloc) else null;
@@ -2554,6 +2563,7 @@ pub const SearchHit = struct {
         freeIndexScores(alloc, self.index_scores);
         freeJsonValues(alloc, self.sort_values);
         if (self.stored_data) |data| alloc.free(data);
+        if (self.source_value) |*value| deinitJsonValue(alloc, value);
         if (self.ancestor_source_data) |data| alloc.free(data);
         if (self.ancestor_unit_data) |data| alloc.free(data);
         if (self.artifact_ref) |*artifact_ref| artifact_ref.deinit(alloc);
@@ -4219,6 +4229,8 @@ pub const IndexSourceReplayStatus = struct {
     /// False while the bounded repair-ledger summary is rebuilding. Readiness
     /// must remain pending until absence of source-local debt is proven.
     repair_summary_ready: bool = true,
+    /// Verified producer dependency closure, independent of replay progress.
+    producer_complete: bool = true,
     // Internal distributed-status proof; not part of the public contract.
     observation_count: u64 = 1,
 };

@@ -4682,6 +4682,8 @@ pub const ForeignSource = struct {
 
 /// A stateful global query. The target table is required on this route.
 pub const GlobalStatefulQueryRequest = struct {
+    /// Opaque remote index snapshot token returned by a previous query. Required when replaying search_after or search_before against an external table; a changed publication returns 409.
+    remote_snapshot: ?[]const u8 = null,
     evaluate: ?QueryEvaluation = null,
     table_target: ?CatalogTableTarget = null,
     /// Literal table name in default.public. Global queries require exactly one of table or table_target.
@@ -4760,6 +4762,7 @@ pub const GlobalStatefulQueryRequest = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "remote_snapshot", "remote_snapshot", true },
         .{ "evaluate", "evaluate", true },
         .{ "table_target", "table_target", true },
         .{ "table", "table", false },
@@ -4812,6 +4815,10 @@ pub const GlobalStatefulQueryRequest = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.remote_snapshot) |value| {
+            try jw.objectField("remote_snapshot");
+            try jw.write(value);
+        }
         if (self.evaluate) |value| {
             try jw.objectField("evaluate");
             try jw.write(value);
@@ -8300,6 +8307,8 @@ pub const QueryProfile = struct {
 };
 
 pub const QueryRequest = struct {
+    /// Opaque remote index snapshot token returned by a previous query. Required when replaying search_after or search_before against an external table; a changed publication returns 409.
+    remote_snapshot: ?[]const u8 = null,
     evaluate: ?QueryEvaluation = null,
     table_target: ?CatalogTableTarget = null,
     /// Literal table name in default.public. Global queries require exactly one of table or table_target.
@@ -8374,6 +8383,7 @@ pub const QueryRequest = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "remote_snapshot", "remote_snapshot", true },
         .{ "evaluate", "evaluate", true },
         .{ "table_target", "table_target", true },
         .{ "table", "table", true },
@@ -8424,6 +8434,10 @@ pub const QueryRequest = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.remote_snapshot) |value| {
+            try jw.objectField("remote_snapshot");
+            try jw.write(value);
+        }
         if (self.evaluate) |value| {
             try jw.objectField("evaluate");
             try jw.write(value);
@@ -8627,6 +8641,8 @@ pub const QueryResponses = struct {
 
 /// Result of a canonical query operation.
 pub const QueryResult = struct {
+    /// Opaque remote publication and schema fence to echo with ordered pagination. This token does not grant access or retain the publication.
+    remote_snapshot: ?[]const u8 = null,
     /// Function evaluation scope, population, usage, and scoped aggregations.
     evaluation: ?std.json.ArrayHashMap(std.json.Value) = null,
     hits: ?QueryHits = null,
@@ -8650,6 +8666,7 @@ pub const QueryResult = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "remote_snapshot", "remote_snapshot", true },
         .{ "evaluation", "evaluation", true },
         .{ "hits", "hits", true },
         .{ "aggregations", "aggregations", true },
@@ -8673,6 +8690,10 @@ pub const QueryResult = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.remote_snapshot) |value| {
+            try jw.objectField("remote_snapshot");
+            try jw.write(value);
+        }
         if (self.evaluation) |value| {
             try jw.objectField("evaluation");
             try jw.write(value);
@@ -8722,6 +8743,8 @@ pub const QueryResult = struct {
 
 /// Fields shared by canonical and stateful query result envelopes.
 pub const QueryResultBase = struct {
+    /// Opaque remote publication and schema fence to echo with ordered pagination. This token does not grant access or retain the publication.
+    remote_snapshot: ?[]const u8 = null,
     /// Function evaluation scope, population, usage, and scoped aggregations.
     evaluation: ?std.json.ArrayHashMap(std.json.Value) = null,
     hits: ?QueryHits = null,
@@ -8744,6 +8767,7 @@ pub const QueryResultBase = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "remote_snapshot", "remote_snapshot", true },
         .{ "evaluation", "evaluation", true },
         .{ "hits", "hits", true },
         .{ "aggregations", "aggregations", true },
@@ -8766,6 +8790,10 @@ pub const QueryResultBase = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.remote_snapshot) |value| {
+            try jw.objectField("remote_snapshot");
+            try jw.write(value);
+        }
         if (self.evaluation) |value| {
             try jw.objectField("evaluation");
             try jw.write(value);
@@ -14205,6 +14233,8 @@ pub const SqlSettingValue = std.json.Value;
 
 /// Stateful Antfly query request. Canonical clients use graph_queries; deprecated graph_searches is retained only at the stateful public transport boundary for the v0.2 transition window.
 pub const StatefulQueryRequest = struct {
+    /// Opaque remote index snapshot token returned by a previous query. Required when replaying search_after or search_before against an external table; a changed publication returns 409.
+    remote_snapshot: ?[]const u8 = null,
     evaluate: ?QueryEvaluation = null,
     table_target: ?CatalogTableTarget = null,
     /// Literal table name in default.public. Global queries require exactly one of table or table_target.
@@ -14283,6 +14313,7 @@ pub const StatefulQueryRequest = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "remote_snapshot", "remote_snapshot", true },
         .{ "evaluate", "evaluate", true },
         .{ "table_target", "table_target", true },
         .{ "table", "table", true },
@@ -14335,6 +14366,10 @@ pub const StatefulQueryRequest = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.remote_snapshot) |value| {
+            try jw.objectField("remote_snapshot");
+            try jw.write(value);
+        }
         if (self.evaluate) |value| {
             try jw.objectField("evaluate");
             try jw.write(value);
@@ -14546,6 +14581,8 @@ pub const StatefulQueryResponses = struct {
 
 /// Result emitted by the stateful compatibility transport.
 pub const StatefulQueryResult = struct {
+    /// Opaque remote publication and schema fence to echo with ordered pagination. This token does not grant access or retain the publication.
+    remote_snapshot: ?[]const u8 = null,
     /// Function evaluation scope, population, usage, and scoped aggregations.
     evaluation: ?std.json.ArrayHashMap(std.json.Value) = null,
     hits: ?QueryHits = null,
@@ -14569,6 +14606,7 @@ pub const StatefulQueryResult = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "remote_snapshot", "remote_snapshot", true },
         .{ "evaluation", "evaluation", true },
         .{ "hits", "hits", true },
         .{ "aggregations", "aggregations", true },
@@ -14592,6 +14630,10 @@ pub const StatefulQueryResult = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.remote_snapshot) |value| {
+            try jw.objectField("remote_snapshot");
+            try jw.write(value);
+        }
         if (self.evaluation) |value| {
             try jw.objectField("evaluation");
             try jw.write(value);

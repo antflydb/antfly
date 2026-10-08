@@ -226,7 +226,7 @@ test "gliner boundary long relations rebase Unicode before global repeated menti
             return error.Cancelled;
         }
     };
-    try std.testing.checkAllAllocationFailures(a, Check.run, .{ document, &compiled, windows });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Check.run, .{ document, &compiled, windows });
     try std.testing.expectError(error.Cancelled, merge(a, document, &compiled, windows, .{ .merge = .{ .control = .{ .check_fn = Check.cancel } } }));
     const original = second[0];
     second[0].head.text = "B";

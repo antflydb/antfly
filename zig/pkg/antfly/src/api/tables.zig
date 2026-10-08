@@ -150,6 +150,7 @@ fn normalizeRawCreateTableIndexesAlloc(
     alloc: std.mem.Allocator,
     value: std.json.Value,
     comptime preserve_canonical_default: bool,
+    external_source: bool,
 ) ![]u8 {
     if (value != .object) return error.InvalidCreateTableRequest;
     // Trusted, normalized catalogs may explicitly omit search indexes.
@@ -157,7 +158,9 @@ fn normalizeRawCreateTableIndexesAlloc(
 
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);
-    if (preserve_canonical_default) {
+    if (external_source) {
+        try out.appendSlice(alloc, "{}");
+    } else if (preserve_canonical_default) {
         if (value.object.get(default_full_text_index_name)) |canonical_default| {
             const encoded = try stringifyJsonValue(alloc, canonical_default);
             defer alloc.free(encoded);
@@ -193,9 +196,8 @@ fn normalizeRawCreateTableIndexesAlloc(
                 // by metadata. Accept the canonical entry on that second hop,
                 // but never let its reserved name select another index kind.
                 if (!is_full_text) return error.InvalidCreateTableRequest;
-                continue;
-            }
-            if (std.mem.startsWith(u8, name, "full_text_index")) return error.InvalidCreateTableRequest;
+                if (!external_source) continue;
+            } else if (std.mem.startsWith(u8, name, "full_text_index")) return error.InvalidCreateTableRequest;
             // `default` is the released compatibility alias for the canonical
             // system index. Other named full-text indexes are caller-owned and
             // must survive create-table normalization like every other kind.
@@ -213,7 +215,7 @@ fn normalizeRawCreateTableIndexesAlloc(
         // the object again. This preserves type-specific fields that generated
         // OpenAPI structs may not yet understand.
         out.items.len -= 1;
-        try out.append(alloc, ',');
+        if (out.items.len > 1) try out.append(alloc, ',');
         try appendJsonString(alloc, &out, name);
         try out.append(alloc, ':');
         const encoded = try stringifyJsonValue(alloc, config);
@@ -1171,6 +1173,14 @@ fn parseCreateTableRequestWithOptions(alloc: std.mem.Allocator, body: []const u8
             else => return error.InvalidCreateTableRequest,
         };
     }
+    const external_source = if (exact_schema.value.schema) |schema| external: {
+        if (schema != .object) break :external false;
+        const source = schema.object.get("base_source") orelse break :external false;
+        if (source != .object) break :external false;
+        const kind = source.object.get("kind") orelse break :external false;
+        break :external kind == .string and std.mem.eql(u8, kind.string, "external");
+    } else false;
+    const implicit_indexes = if (external_source) "{}" else default_indexes_json;
     if (root.get("indexes")) |value| {
         if (value != .null) {
             try validateIndexesValue(value, allow_private_index_fields);
@@ -1178,12 +1188,13 @@ fn parseCreateTableRequestWithOptions(alloc: std.mem.Allocator, body: []const u8
                 alloc,
                 value,
                 allow_private_index_fields,
+                external_source,
             );
             defer alloc.free(normalized_indexes_json);
             req.indexes_json = try coverage_policy_mod.withMissingIncarnationsAlloc(alloc, normalized_indexes_json);
-        } else req.indexes_json = try coverage_policy_mod.withMissingIncarnationsAlloc(alloc, default_indexes_json);
+        } else req.indexes_json = try coverage_policy_mod.withMissingIncarnationsAlloc(alloc, implicit_indexes);
     } else {
-        req.indexes_json = try coverage_policy_mod.withMissingIncarnationsAlloc(alloc, default_indexes_json);
+        req.indexes_json = try coverage_policy_mod.withMissingIncarnationsAlloc(alloc, implicit_indexes);
     }
     if (exact_schema.value.schema) |value| {
         if (value != .null) {
@@ -1263,6 +1274,7 @@ fn validatePublicAlgebraicIndexValue(value: std.json.Value) !void {
     const derive_value = value.object.get("derive_from_schema") orelse return error.InvalidCreateTableRequest;
     if (derive_value != .bool or !derive_value.bool) return error.InvalidCreateTableRequest;
 
+    if (value.object.get("aggregates")) |recipes| try @import("antfly_local_sources").api_local_tables.validatePublicAggregateRecipes(recipes);
     var it = value.object.iterator();
     while (it.next()) |entry| {
         if (isAlgebraicInternalConfigField(entry.key_ptr.*)) return error.InvalidCreateTableRequest;
@@ -1313,6 +1325,7 @@ fn isAlgebraicIndexValue(value: std.json.Value) bool {
 /// the schema and must survive a regeneration.
 fn isAlgebraicUserTunableField(field: []const u8) bool {
     const tunable = [_][]const u8{
+        "aggregates",
         "adaptive",
         "pathfact_policy",
         "max_result_buckets",
@@ -1356,6 +1369,11 @@ fn regenerateAlgebraicIndexValueAlloc(
             try alloc.dupe(u8, entry.key_ptr.*),
             try cloneJsonValueAlloc(alloc, entry.value_ptr.*),
         );
+    }
+
+    if (source.object.get("aggregates")) |recipes| {
+        try @import("antfly_local_sources").api_local_tables.validatePublicAggregateRecipes(recipes);
+        try derived.object.put(alloc, "materializations", try cloneJsonValueAlloc(alloc, recipes));
     }
 
     var source_config = try std.json.parseFromValue(algebraic_mod.index.Config, alloc, source, .{
@@ -5195,6 +5213,27 @@ test "create table rejects caller-managed schema versions" {
     try std.testing.expect(coverage_policy_mod.incarnation(default_index) != null);
 }
 
+test "external lake create table preserves opt-in indexes across metadata normalization" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "parquet", "iceberg" }) |format| {
+        for ([_][]const u8{ "", ",\"indexes\":{}", ",\"indexes\":{\"label_text\":{\"type\":\"full_text\",\"field\":\"label\"}}" }) |indexes| {
+            const body = try std.fmt.allocPrint(a, "{{\"schema\":{{\"storage_mode\":\"relational\",\"base_source\":{{\"kind\":\"external\",\"table_id\":\"lake\",\"format\":\"{s}\",\"uri\":\"file:///lake\"}}}}{s}}}", .{ format, indexes });
+            defer a.free(body);
+            var request = try parseCreateTableRequest(a, body);
+            defer request.deinit(a);
+            var parsed = try std.json.parseFromSlice(std.json.Value, a, request.indexes_json.?, .{});
+            defer parsed.deinit();
+            try std.testing.expect(!parsed.value.object.contains(default_full_text_index_name));
+            try std.testing.expectEqual(@as(usize, if (std.mem.indexOf(u8, indexes, "label_text") != null) 1 else 0), parsed.value.object.count());
+            const encoded = try encodeStoredCreateTableRequestAlloc(a, request);
+            defer a.free(encoded);
+            var stored = try parseStoredCreateTableRequest(a, encoded);
+            defer stored.deinit(a);
+            try std.testing.expectEqualStrings(request.indexes_json.?, stored.indexes_json.?);
+        }
+    }
+}
+
 test "create table raw parser merges default full text with quickstart embedding index" {
     var parsed = try parseCreateTableRequest(std.testing.allocator,
         \\{
@@ -6338,7 +6377,7 @@ test "system catalog schema cache releases partial compilation on allocation fai
             _ = try leases.get(&table);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
 }
 
 test "system catalog wide schema cache retained budget" {
@@ -6501,4 +6540,28 @@ test "relational declarations metadata generated update admission precedes catal
     try std.testing.expectError(error.GeneratedColumnRewriteRequired, tables.applySchemaUpdateRecord(alloc, &table, removed));
     const plain: manager.TableRecord = .{ .table_id = 7, .name = "rows", .schema_json = removed, .indexes_json = "{}" };
     try std.testing.expectError(error.GeneratedColumnRewriteRequired, tables.applySchemaUpdateRecord(alloc, &plain, json));
+}
+
+test "external lake public aggregate recipes expand through schema derivation" {
+    const a = std.testing.allocator;
+    const schema =
+        \\{"version":1,"default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"amount":{"type":"integer"},"label":{"type":"string"}},"additionalProperties":false}}}}
+    ;
+    const request =
+        \\{"type":"algebraic","derive_from_schema":true,"aggregates":[{"name":"total","op":"sum","measure":"amount"},{"name":"rows","op":"count","group_by":["label"]}]}
+    ;
+    try validatePublicAlgebraicIndexJson(a, request);
+    const expanded = try expandSchemaDerivedAlgebraicIndexAlloc(a, "lake", request, schema);
+    defer a.free(expanded);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, expanded, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 2), parsed.value.object.get("materializations").?.array.items.len);
+    try std.testing.expectEqualStrings("amount", parsed.value.object.get("materializations").?.array.items[0].object.get("measure").?.string);
+    const invalid = [_][]const u8{
+        "{\"type\":\"algebraic\",\"derive_from_schema\":true,\"aggregates\":[{\"name\":\"n\",\"op\":\"sum\"}]}",
+        "{\"type\":\"algebraic\",\"derive_from_schema\":true,\"aggregates\":[{\"name\":\"n\",\"op\":\"count\",\"law\":\"custom\"}]}",
+        "{\"type\":\"algebraic\",\"derive_from_schema\":true,\"aggregates\":[{\"name\":\"n\",\"op\":\"count\",\"group_by\":[\"label\",\"label\"]}]}",
+        "{\"type\":\"algebraic\",\"derive_from_schema\":true,\"aggregates\":[{\"name\":\"n\",\"op\":\"count\"},{\"name\":\"n\",\"op\":\"count\"}]}",
+    };
+    for (invalid) |body| try std.testing.expectError(error.InvalidCreateTableRequest, validatePublicAlgebraicIndexJson(a, body));
 }

@@ -23,6 +23,7 @@ pub const BudgetAllocator = struct {
     backing: Allocator,
     live: usize = 0,
     peak: usize = 0,
+    alloc_calls: usize = 0,
     limit: usize = std.math.maxInt(usize),
     cancel: ?*maintenance.CancelToken = null,
     cancel_after: usize = std.math.maxInt(usize),
@@ -43,6 +44,7 @@ pub const BudgetAllocator = struct {
         } else self.cancel_after -= 1;
         if (len > self.limit -| self.live) return null;
         const result = self.backing.rawAlloc(len, alignment, ra) orelse return null;
+        self.alloc_calls += 1;
         self.account(0, len);
         return result;
     }
@@ -67,5 +69,29 @@ pub const BudgetAllocator = struct {
         const self: *@This() = @ptrCast(@alignCast(ctx));
         self.backing.rawFree(buf, alignment, ra);
         self.account(buf.len, 0);
+    }
+};
+
+/// Make allocation-failure inventories independent of the backing allocator's
+/// ability to grow or remap a particular address in place.
+pub const NoResizeAllocator = struct {
+    backing: Allocator,
+
+    pub fn allocator(self: *@This()) Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        return self.backing.rawAlloc(len, alignment, ra);
+    }
+    fn resize(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) bool {
+        return false;
+    }
+    fn remap(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) ?[*]u8 {
+        return null;
+    }
+    fn free(ctx: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ra: usize) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.backing.rawFree(bytes, alignment, ra);
     }
 };

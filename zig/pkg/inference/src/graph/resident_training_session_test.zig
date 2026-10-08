@@ -89,7 +89,7 @@ fn constructionCheck(a: Allocator, profile: usize) !void {
 }
 
 test "resident session direct and stage construction release every allocation failure" {
-    for (0..3) |profile| try std.testing.checkAllAllocationFailures(std.testing.allocator, constructionCheck, .{profile});
+    for (0..3) |profile| try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, constructionCheck, .{profile});
 }
 
 test "resident session explicit backend profile and combined retained admission reject before execution" {

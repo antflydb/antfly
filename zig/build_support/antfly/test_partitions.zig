@@ -423,6 +423,16 @@ pub fn add(b: *std.Build) void {
                         const extra = inventory(b, local, inv);
                         run.addArg(previous.?);
                         run.addFileArg(extra.captureStdErr(.{}));
+                        // Audit controls precede the runtime passthrough separator.
+                        // addFileArg also records the inventory dependency.
+                        const path_arg = run.argv.pop().?;
+                        const flag_arg = run.argv.pop().?;
+                        var insert: usize = 0;
+                        while (insert < run.argv.items.len) : (insert += 1) {
+                            const current = run.argv.items[insert];
+                            if (current == .bytes and std.mem.eql(u8, current.bytes, "--")) break;
+                        }
+                        run.argv.insertSlice(b.allocator, insert, &.{ flag_arg, path_arg }) catch @panic("OOM");
                     }
                 }
             }

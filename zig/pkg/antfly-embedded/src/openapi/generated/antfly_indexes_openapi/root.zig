@@ -3,6 +3,7 @@
 
 pub const types = @import("types.zig");
 
+pub const AlgebraicAggregateConfig = types.AlgebraicAggregateConfig;
 pub const AlgebraicIndexConfig = types.AlgebraicIndexConfig;
 pub const AlgebraicIndexStats = types.AlgebraicIndexStats;
 pub const AntflyType = types.AntflyType;

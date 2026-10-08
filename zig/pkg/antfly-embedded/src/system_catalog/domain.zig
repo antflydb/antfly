@@ -33,21 +33,33 @@ pub const QueryDefinition = struct {
     schema_json: []const u8,
     read_schema_json: []const u8,
     indexes_json: []const u8,
+    lake_index_catalog_json: []const u8 = "",
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        if (self.lake_index_catalog_json.len != 0) {
+            try jw.write(.{ .table_id = self.table_id, .schema_json = self.schema_json, .read_schema_json = self.read_schema_json, .indexes_json = self.indexes_json, .lake_index_catalog_json = self.lake_index_catalog_json });
+        } else {
+            try jw.write(.{ .table_id = self.table_id, .schema_json = self.schema_json, .read_schema_json = self.read_schema_json, .indexes_json = self.indexes_json });
+        }
+    }
 
     pub fn fromTable(table: anytype) @This() {
-        return .{ .table_id = table.table_id, .schema_json = table.schema_json, .read_schema_json = table.read_schema_json, .indexes_json = table.indexes_json };
+        return .{ .table_id = table.table_id, .schema_json = table.schema_json, .read_schema_json = table.read_schema_json, .indexes_json = table.indexes_json, .lake_index_catalog_json = table.lake_index_catalog_json };
     }
     pub fn clone(self: @This(), alloc: std.mem.Allocator) !@This() {
         const schema = try alloc.dupe(u8, self.schema_json);
         errdefer alloc.free(schema);
         const read_schema = try alloc.dupe(u8, self.read_schema_json);
         errdefer alloc.free(read_schema);
-        return .{ .table_id = self.table_id, .schema_json = schema, .read_schema_json = read_schema, .indexes_json = try alloc.dupe(u8, self.indexes_json) };
+        const indexes = try alloc.dupe(u8, self.indexes_json);
+        errdefer alloc.free(indexes);
+        return .{ .table_id = self.table_id, .schema_json = schema, .read_schema_json = read_schema, .indexes_json = indexes, .lake_index_catalog_json = try alloc.dupe(u8, self.lake_index_catalog_json) };
     }
     pub fn deinit(self: @This(), alloc: std.mem.Allocator) void {
         alloc.free(self.schema_json);
         alloc.free(self.read_schema_json);
         alloc.free(self.indexes_json);
+        alloc.free(self.lake_index_catalog_json);
     }
 };
 

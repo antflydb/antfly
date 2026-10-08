@@ -312,7 +312,7 @@ fn initializeAllocationFailures(a: Allocator) !void {
     try expectHost(&owner);
 }
 test "seeded device state initialization remains atomic at every allocation failure" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, initializeAllocationFailures, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, initializeAllocationFailures, .{});
 }
 
 test "seeded device state readback validates epoch and recovers uncertified mirrors in place" {

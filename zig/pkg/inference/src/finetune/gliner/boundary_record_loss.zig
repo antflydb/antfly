@@ -480,7 +480,7 @@ fn allocationLifecycle(a: Allocator, group: Group) !void {
 test "boundary training record loss owns gradients and releases allocation failures" {
     var owner = try testOwner(std.testing.allocator);
     defer owner.deinit();
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, allocationLifecycle, .{owner.group()});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, allocationLifecycle, .{owner.group()});
 }
 
 test "boundary training record loss requires complete immutable matching and finite inputs" {
@@ -560,5 +560,5 @@ fn backendAllocationLifecycle(a: Allocator, group: Group) !void {
 test "boundary training record backend releases scalar list and object staging on allocation failure" {
     var owner = try testOwner(std.testing.allocator);
     defer owner.deinit();
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, backendAllocationLifecycle, .{owner.group()});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, backendAllocationLifecycle, .{owner.group()});
 }

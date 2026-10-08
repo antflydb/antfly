@@ -36,6 +36,14 @@ pub const Index = struct {
 };
 
 pub const Table = struct {
+    pub const ExternalIndexes = struct {
+        /// Fresh query-definition metadata, allocated for this execution. A
+        /// schema/prepared-plan cache must never retain a publication pointer.
+        catalog_json: []const u8,
+        indexes_json: []const u8,
+        schema_json: []const u8 = "",
+        desired: [32]u8,
+    };
     pub const Scope = struct {
         database: []const u8,
         namespace: []const u8,
@@ -48,6 +56,7 @@ pub const Table = struct {
     storage_mode: enum { relational, document } = .relational,
     /// External bindings are read-only and pinned by the serving cursor.
     external_base_source: ?@import("../serverless/external_source/schema_binding.zig").OwnedExternalTableBinding = null,
+    external_indexes: ?ExternalIndexes = null,
     columns: []const Column,
     indexes: []const Index = &.{},
     /// Request-owned logical authority. Never use a mutable adapter's last
@@ -71,10 +80,24 @@ pub const Condition = struct {
     value: std.json.Value = .null,
 };
 pub const Scan = struct {
+    pub const Order = struct { column: []const u8, descending: bool = false, nulls_first: bool = false };
     pub const IndexEquality = struct {
         name: []const u8,
         values: []const std.json.Value,
     };
+    pub const IndexRange = struct {
+        pub const Bound = struct { values: []const std.json.Value, inclusive: bool = true };
+        name: []const u8,
+        lower: ?Bound = null,
+        upper: ?Bound = null,
+        after: ?[]const u8 = null,
+    };
+    /// A request, never proof. Providers explicitly attest the entire order.
+    order: []const Order = &.{},
+    /// Advisory SQL OFFSET + LIMIT for costing only. Never a scan stop bound.
+    /// Absent when residual selectivity is unknown. Page size remains limit.
+    row_goal: ?u64 = null,
+    index_range: ?IndexRange = null,
     fields: []const []const u8,
     /// Mutation-only full document preimage; ordinary reads remain projected.
     include_document: bool = false,
@@ -84,6 +107,10 @@ pub const Scan = struct {
     /// Exact physical identity, not a schema predicate. Point pages exhaust
     /// after their matching row (or absence), without a continuation probe.
     primary_key: ?[]const u8 = null,
+    /// Snapshot-bound remote candidates. null means a full scan; an empty
+    /// slice means no rows. Consumers retain ranking separately from physical
+    /// hydration order. The lake cursor owns and validates the selection.
+    row_refs: ?[]const @import("../storage/rowsource/types.zig").RowRef = null,
     /// Require a READY schema-bound index. Unlike auto_index this must fail
     /// closed; the coordinated owner read returns one exact-span proof.
     index_equality: ?IndexEquality = null,
@@ -97,6 +124,7 @@ pub const Row = struct {
     id: []const u8,
     version: u64,
     value: std.json.Value,
+    index_cursor: ?[]const u8 = null,
     /// Digest of the exact primary bytes in this snapshot. Timestamps alone
     /// are not a version fence when a custom TTL field is unchanged.
     expected_content_digest: ?[32]u8 = null,
@@ -140,17 +168,39 @@ pub const Page = struct {
 /// until the cursor's next pull or close; consumers retain only their results.
 /// SQL names are literal, and null bitmaps distinguish SQL NULL from JSON null.
 pub const ColumnPage = struct {
-    batch: @import("../storage/rowsource/types.zig").ColumnBatch,
+    batch: @import("../storage/rowsource/types.zig").ColumnBatch = .{ .snapshot = .{ .table_id = "sql-relation", .snapshot_id = "statement" }, .row_refs = &.{}, .columns = &.{} },
+    /// Borrowed operator columns, preserving JSON and retained typed storage.
+    /// The pointer avoids embedding mutually recursive Batch/ColumnPage values.
+    native: ?struct { values: *const @import("execution_batch.zig").Batch, names: []const []const u8 } = null,
     selection: []const usize,
     after: ?[]const u8 = null,
+    pub fn validate(self: ColumnPage) !void {
+        if (self.native) |native| {
+            if (native.values.len() != 0 and native.names.len != native.values.width()) return error.InvalidSqlBackendResponse;
+            for (self.selection) |index| if (index >= native.values.len()) return error.InvalidSqlBackendResponse;
+        } else {
+            try self.batch.validate();
+            for (self.selection) |index| if (index >= self.batch.rowCount()) return error.InvalidSqlBackendResponse;
+        }
+    }
     pub fn cell(self: ColumnPage, alloc: std.mem.Allocator, row: usize, name: []const u8) !Row.Cell {
         if (row >= self.selection.len) return error.InvalidSqlBackendResponse;
         const index = self.selection[row];
+        if (self.native) |native| {
+            if (index >= native.values.len() or native.names.len != native.values.width()) return error.InvalidSqlBackendResponse;
+            for (native.names, 0..) |column, ordinal| if (std.mem.eql(u8, column, name)) {
+                const value = try native.values.cell(alloc, index, ordinal);
+                return .{ .value = value.value, .sql_null = value.sql_null, .patterns = value.patterns };
+            };
+            return .{ .value = .null, .sql_null = true };
+        }
         if (index >= self.batch.rowCount()) return error.InvalidSqlBackendResponse;
         if (std.mem.eql(u8, name, "_id")) return .{ .value = .{ .string = try @import("../storage/rowsource/identity.zig").allocId(alloc, self.batch.row_refs[index]) }, .sql_null = false };
         const column = self.batch.findColumn(name) orelse return .{ .value = .null, .sql_null = true };
         if (column.nulls.isNull(index)) return .{ .value = .null, .sql_null = true };
         const value: std.json.Value = switch (column.values) {
+            .dictionary_i64 => |values| .{ .integer = values.at(index) },
+            .dictionary_f64 => |values| .{ .float = values.at(index) },
             .i64 => |values| .{ .integer = values[index] },
             .f64 => |values| .{ .float = values[index] },
             .bool => |values| .{ .bool = values[index] },
@@ -166,6 +216,8 @@ pub const ColumnPage = struct {
 /// Owned statement read view. Opening pins data, not just routing metadata.
 /// Page values belong to the next() allocator; the cursor lives until close().
 pub const Cursor = struct {
+    /// True only when this cursor preserves every requested Scan.order key.
+    order_satisfied: bool = false,
     /// Snapshot-local optimizer estimates; absent means unknown, never zero.
     estimated_rows: ?u64 = null,
     estimated_bytes: ?u64 = null,
@@ -182,6 +234,9 @@ pub const Cursor = struct {
     split_scan: ?*const fn (*anyopaque, std.mem.Allocator, usize) anyerror!?[]Cursor = null,
     /// Ordered, disjoint ranges whose concatenation preserves source order.
     split_ordered: ?*const fn (*anyopaque, std.mem.Allocator, usize) anyerror!?[]Cursor = null,
+    /// Provider estimate of retained metadata per ordered child. Planning
+    /// limits fan-out before cloning a large immutable inventory.
+    ordered_split_bytes: usize = 0,
     /// Exact snapshot count; null means the retained cursor must be scanned.
     /// Providers may use metadata only after accounting for filters/deletes.
     count_rows: ?*const fn (*anyopaque) anyerror!?u64 = null,
@@ -251,6 +306,16 @@ pub const DdlReceipt = struct {
 };
 pub const DdlOutcome = struct { mutation_outcome: ?MutationOutcome = .committed, receipt: ?DdlReceipt = null };
 
+/// Complete, authorized aggregate states for one pinned table and recipe.
+/// Keys and AGS1 cells borrow the supplied page allocator until the next pull.
+/// A provider must return null before opening if it cannot prove equivalence;
+/// errors after selection abort execution rather than mixing source snapshots.
+pub const AggregatePartialCursor = struct {
+    ptr: *anyopaque,
+    next: *const fn (*anyopaque, std.mem.Allocator, u32) anyerror!?[]const @import("operators.zig").GroupResult,
+    close: *const fn (*anyopaque) void,
+};
+
 pub const Backend = struct {
     execution_io: ?std.Io = null,
     spill_manager: ?*@import("spill.zig").Manager = null,
@@ -297,7 +362,14 @@ pub const Backend = struct {
         scan: *const fn (*anyopaque, std.mem.Allocator, Table, Scan) anyerror!Page,
         /// null means this provider cannot retain a statement snapshot. Never
         /// substitute a collection of independently refreshed shard pages.
+        /// Allows order negotiation before rows are pulled. Ordinary backends
+        /// need not open speculative scans merely to decline an ordering.
+        supports_scan_order: bool = false,
         open_scan: ?*const fn (*anyopaque, std.mem.Allocator, Table, Scan) anyerror!?Cursor = null,
+        /// Fresh authority/source/coverage proofs belong to the provider. The
+        /// SQL engine binds a strict recipe and retains projection, HAVING,
+        /// ordering, limits and exact native reducer semantics.
+        aggregate_partials: ?*const fn (*anyopaque, std.mem.Allocator, Table, @import("aggregate_materialization.zig").Recipe) anyerror!?AggregatePartialCursor = null,
         open_statement: ?*const fn (*anyopaque, std.mem.Allocator, []const StatementScan) anyerror!StatementRead = null,
         // The mutation allocator is a call-scoped arena. Providers must copy
         // any data retained after return into their own durable/session owner.
@@ -336,4 +408,22 @@ test "SQL row cells distinguish absent SQL NULL and JSON null and reject invalid
     try std.testing.expectError(error.InvalidSqlBackendResponse, row.cell("j"));
     row.sql_nulls = &.{ false, true, true };
     try std.testing.expectError(error.InvalidSqlBackendResponse, row.cell("i"));
+}
+
+test "SQL native column pages preserve selection JSON null and validate schema width" {
+    const Datum = @import("scalar.zig").Datum;
+    const values = [_]Datum{ Datum.json(.{ .integer = 9007199254740993 }), .{}, Datum.json(.null) };
+    const vectors = [_][]const Datum{&values};
+    const batch: @import("execution_batch.zig").Batch = .{ .vectors = .{ .values = &vectors, .count = 3 } };
+    var page: ColumnPage = .{ .native = .{ .values = &batch, .names = &.{"literal.name"} }, .selection = &.{ 2, 0, 1 } };
+    try page.validate();
+    const json_null = try page.cell(std.testing.allocator, 0, "literal.name");
+    try std.testing.expect(!json_null.sql_null and json_null.value == .null);
+    try std.testing.expectEqual(@as(i64, 9007199254740993), (try page.cell(std.testing.allocator, 1, "literal.name")).value.integer);
+    try std.testing.expect((try page.cell(std.testing.allocator, 2, "literal.name")).sql_null);
+    page.selection = &.{3};
+    try std.testing.expectError(error.InvalidSqlBackendResponse, page.validate());
+    page.selection = &.{0};
+    page.native.?.names = &.{};
+    try std.testing.expectError(error.InvalidSqlBackendResponse, page.validate());
 }

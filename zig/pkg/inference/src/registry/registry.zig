@@ -1844,7 +1844,7 @@ test "shallow discovery cleans up every allocation failure" {
             }
         }
     };
-    try std.testing.checkAllAllocationFailures(allocator, Runner.run, .{models_dir});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(allocator, Runner.run, .{models_dir});
 }
 
 test "model discovery rejects incomplete or invalid managed downloads" {
