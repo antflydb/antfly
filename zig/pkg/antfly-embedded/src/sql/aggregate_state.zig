@@ -28,6 +28,7 @@ pub const Column = struct {
         counts: std.ArrayList(u64),
         integers: std.ArrayList(Integer),
         numbers: std.ArrayList(Number),
+        exact: std.ArrayList(@import("numeric_aggregate.zig").Reducer),
         booleans: std.ArrayList(Boolean),
         bytes: std.ArrayList(Bytes),
         dynamic: std.ArrayList(operators.Aggregate),
@@ -35,7 +36,7 @@ pub const Column = struct {
     spec: operators.AggregateSpec,
     values: Values,
     pub fn init(spec: operators.AggregateSpec) Column {
-        return .{ .spec = spec, .values = if (spec.distinct or spec.kind == .pattern_set) .{ .dynamic = .empty } else switch (spec.kind) {
+        return .{ .spec = spec, .values = if (spec.distinct or spec.kind == .pattern_set) .{ .dynamic = .empty } else if (spec.input_element == .numeric and (spec.kind == .sum or spec.kind == .avg)) .{ .exact = .empty } else switch (spec.kind) {
             .count => .{ .counts = .empty },
             .sum => if (spec.input_type == .integer) .{ .integers = .empty } else .{ .numbers = .empty },
             .avg => .{ .numbers = .empty },
@@ -54,6 +55,7 @@ pub const Column = struct {
         switch (self.values) {
             .bytes => |values| for (values.items) |value| if (value.value) |bytes| a.free(bytes),
             .dynamic => |values| for (values.items) |*state| state.deinit(),
+            .exact => |values| for (values.items) |*state| state.deinit(),
             else => {},
         }
         switch (self.values) {
@@ -66,10 +68,11 @@ pub const Column = struct {
             .counts => |*values| try values.append(a, 0),
             .integers => |*values| try values.append(a, .{}),
             .numbers => |*values| try values.append(a, .{}),
+            .exact => |*values| try values.append(a, .{ .alloc = a }),
             .booleans => |*values| try values.append(a, .{ .value = self.spec.kind == .bool_and }),
             .bytes => |*values| try values.append(a, .{}),
             .dynamic => |*values| {
-                var state = try operators.Aggregate.init(a, self.spec.kind, self.spec.input_type);
+                var state = try operators.Aggregate.initTyped(a, self.spec.kind, self.spec.input_type, self.spec.input_element);
                 errdefer state.deinit();
                 state.distinct = self.spec.distinct;
                 try values.append(a, state);
@@ -77,10 +80,17 @@ pub const Column = struct {
         }
     }
     pub fn snapshot(self: *const Column, a: A, index: usize) !operators.Aggregate {
-        var state: operators.Aggregate = .{ .alloc = a, .kind = self.spec.kind, .input_type = self.spec.input_type, .boolean = self.spec.kind == .bool_and };
+        var state: operators.Aggregate = .{ .alloc = a, .kind = self.spec.kind, .input_type = self.spec.input_type, .input_element = self.spec.input_element, .boolean = self.spec.kind == .bool_and };
         var selected: ?Datum = null;
         switch (self.values) {
             .counts => |v| state.count = v.items[index],
+            .exact => |v| {
+                const reducer = try a.create(@import("numeric_aggregate.zig").Reducer);
+                errdefer a.destroy(reducer);
+                reducer.* = try v.items[index].clone(a);
+                state.numeric = reducer;
+                state.count = reducer.state.count;
+            },
             .integers => |v| {
                 state.count = v.items[index].count;
                 state.integer_sum = v.items[index].sum;
@@ -125,7 +135,7 @@ pub const Column = struct {
                 v.items[index].mean = state.mean;
             },
             .booleans => |*v| v.items[index] = .{ .count = state.count, .value = state.boolean },
-            .bytes, .dynamic => unreachable,
+            .bytes, .dynamic, .exact => unreachable,
         }
     }
     fn promote(self: *Column, a: A) !void {
@@ -142,9 +152,22 @@ pub const Column = struct {
         self.clear(a);
         self.values = .{ .dynamic = states };
     }
+    pub fn numericGrowth(self: *const Column, index: ?usize, weight: i32, length: usize) usize {
+        var state: @import("numeric_aggregate.zig").State = .{};
+        if (index) |slot| switch (self.values) {
+            .exact => |values| state = values.items[slot].state,
+            .dynamic => |values| if (values.items[slot].numeric) |reducer| {
+                state = reducer.state;
+            },
+            else => return 0,
+        };
+        return state.growthBytes(weight, length);
+    }
+
     pub fn update(self: *Column, a: A, index: usize, value: Datum) !void {
         if (self.values == .dynamic) return self.values.dynamic.items[index].update(value);
         if (value.sql_null) return;
+        if (self.values == .exact) return self.values.exact.items[index].add((value.numeric orelse return error.SqlTypeMismatch).*);
         if (self.spec.kind == .min or self.spec.kind == .max) {
             const compatible = switch (self.values) {
                 .integers => value.value == .integer,
@@ -272,12 +295,17 @@ pub const Column = struct {
         }
     }
     pub fn mergeExact(self: *Column, a: A, index: usize, state: operators.Aggregate) !void {
-        if (state.kind != self.spec.kind or state.input_type != self.spec.input_type or state.distinct != self.spec.distinct) return error.InvalidSqlBackendResponse;
+        if (state.kind != self.spec.kind or state.input_type != self.spec.input_type or state.input_element != self.spec.input_element or state.distinct != self.spec.distinct) return error.InvalidSqlBackendResponse;
+        if (self.values == .exact) {
+            const reducer = state.numeric orelse return error.InvalidSqlBackendResponse;
+            if (reducer.state.count != state.count) return error.InvalidSqlBackendResponse;
+            return self.values.exact.items[index].merge(reducer.state);
+        }
         if (self.values == .dynamic) return @import("aggregate_partial.zig").merge(&self.values.dynamic.items[index], state);
         if (self.spec.kind == .min or self.spec.kind == .max) {
             if (state.count == 0) return;
             const prior = switch (self.values) {
-                .counts, .dynamic => unreachable,
+                .counts, .dynamic, .exact => unreachable,
                 inline else => |values| values.items[index].count,
             };
             const total = std.math.add(u64, prior, state.count) catch return error.SqlNumericOutOfRange;
@@ -285,6 +313,7 @@ pub const Column = struct {
             try self.update(a, index, state.selected.?.row.values[0]);
             switch (self.values) {
                 .counts => unreachable,
+                .exact => unreachable,
                 .dynamic => |*values| values.items[index].count = total,
                 inline else => |*values| values.items[index].count = total,
             }
@@ -319,6 +348,7 @@ pub const Column = struct {
         }
     }
     pub fn finish(self: *const Column, index: usize) !Datum {
+        if (self.values == .exact) return if (try self.values.exact.items[index].finish(self.spec.kind == .avg)) |value| Datum.typedNumeric(value) else .{};
         if (self.values == .dynamic) return self.values.dynamic.items[index].finish();
         if (self.spec.kind == .min or self.spec.kind == .max) return switch (self.values) {
             .integers => |v| if (v.items[index].count == 0) .{} else Datum.json(.{ .integer = v.items[index].selected }),

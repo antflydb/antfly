@@ -472,7 +472,7 @@ pub const DdlReceipt = struct {
 pub const DdlOutcome = struct { mutation_outcome: ?MutationOutcome = .committed, receipt: ?DdlReceipt = null };
 
 /// Complete, authorized aggregate states for one pinned table and recipe.
-/// Keys and AGS1 cells borrow the supplied page allocator until the next pull.
+/// Keys and versioned aggregate cells borrow the supplied page allocator until the next pull.
 /// A provider must return null before opening if it cannot prove equivalence;
 /// errors after selection abort execution rather than mixing source snapshots.
 pub const AggregatePartialCursor = struct {

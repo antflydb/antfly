@@ -4977,3 +4977,58 @@ broader numeric functions and native vector lanes need follow-through. No
 original inventory case is credited by these infrastructure tests alone.
 The ledger remains 448 implemented / 136 rejected / 73 superseded / 929
 unresolved, with all 1,586 original source cases intact.
+
+### 2026-10-08: exact NUMERIC SUM/AVG and shared partial reduction
+
+SUM and AVG now use dedicated flat grouped lanes backed by signed i128
+base-10000 buckets. Updates defer carries until finalization and allocate only
+when their exponent span grows. The bucket bound is 9999 times the non-special
+row count; it fits i128 for every legal i64 count. Display scale and NaN and
+signed-infinity counts remain separate from finite coefficients. AVG divides
+the widened sum before enforcing the public result range, so a partial sum
+that would overflow as a final SUM can still cancel or produce a valid AVG.
+Final results have an owned stable header and are invalidated after mutation.
+
+The shared aggregate checkpoint is version 2 and binds the exact input element
+identity as well as aggregate kind, coarse type and DISTINCT mode. NUMERIC
+checkpoints retain bounded signed buckets rather than prematurely finalizing a
+decimal sum. Decode validates the entire canonical record before allocating
+buckets; decoded state and DISTINCT members never borrow transport bytes.
+Spill and worker merges share this codec. Final spilled DISTINCT reducers send
+decoded members through the external deduplicator rather than adding a partial
+total or retaining a second unbounded membership table.
+
+Exact NUMERIC SUM/AVG states are eligible for pinned scan workers and hash-spill
+partition reducers; compensated floating reductions retain their ordered path.
+Admission accounts for the complete replacement bucket allocation and the gap
+between existing and incoming exponents, including row, worker and checkpoint
+handoffs. NUMERIC batch admission currently uses ordered per-row updates to
+prove each successive span change before mutation; dedicated flat storage and
+allocation-free fixed-span updates remain active. A future vector admission
+pass must model combined per-group spans, not merely add input limb sizes.
+
+A live PostgreSQL 18 oracle confirms grouped sums 2996.20/2998.20 and averages
+1498.1000000000000000/1499.1000000000000000 for the 2,000-row spill fixture.
+Serial and spilled outputs agree, including DISTINCT and exact display scale.
+Checkpoint tests cover incomplete records, signature mismatches, decoded
+ownership, cached-result invalidation and exhaustive allocation failures.
+Kernel tests cover cancellation/quota state preservation, special values and
+overflowing sums with representable averages.
+
+The local Debug microbenchmark reduces 10,000 copies of 1.2300 in about
+0.6 ms with zero hot allocations and 176 bytes of bucket capacity; repeated
+immutable kernel addition takes about 499 ms and 10,000 allocations with the
+testing allocator. This measures accumulator allocation/carry overhead, not a
+production query speedup or a controlled release benchmark.
+
+Validation: `zig build sql-test pgwire-test check-openapi lake-integration-test`
+passes with 567 local SQL tests (three skips), 226 server SQL tests and 161 lake
+integration tests, with no failures or leaks. The pgwire/OpenAPI gates and
+format/whitespace checks pass. The 46 focused NUMERIC tests pass separately.
+
+Native scalar NUMERIC row/index/catalog descriptors, default decimal literals,
+typmod grammar, broader numeric functions, mixed-domain join normalization and
+native numeric vector kernels remain incomplete. Unsupported native scalar
+NUMERIC descriptors fail closed instead of being stored as floating point.
+This infrastructure work does not by itself credit any original inventory case;
+the original ledger counts and provenance remain unchanged.

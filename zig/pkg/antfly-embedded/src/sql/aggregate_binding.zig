@@ -369,7 +369,8 @@ pub fn bindWithInvocation(alloc: Allocator, table: ?catalog.Table, statement: as
             if (typed != .integer and typed != .number) return error.UndefinedSqlFunction;
         };
         try operators.Aggregate.validate(kind, input_type);
-        spec.* = .{ .kind = kind, .input_type = input_type, .distinct = node.call.distinct };
+        const input_element = if (index) |slot| input.projections[slot].?.output_type.element_type else null;
+        spec.* = .{ .kind = kind, .input_type = input_type, .input_element = input_element, .distinct = node.call.distinct };
         column.type = switch (kind) {
             .count => .integer,
             .avg => .number,
@@ -380,6 +381,7 @@ pub fn bindWithInvocation(alloc: Allocator, table: ?catalog.Table, statement: as
         // Extrema retain the complete input domain, not just its coarse
         // number/array tag. Exact decimals must not become float results.
         if (column.type == .array or kind == .min or kind == .max) column.element_type = if (index) |slot| input.projections[slot].?.output_type.element_type else null;
+        if ((kind == .sum or kind == .avg) and input_element == .numeric) column.element_type = .numeric;
         if (node.call.within_group != null) {
             column.type = if (orderedKind(node.call.name).? == .continuous) .number else input_type orelse .string;
             column.element_type = if (index) |slot| input.projections[slot].?.output_type.element_type else null;

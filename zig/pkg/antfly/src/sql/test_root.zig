@@ -31,6 +31,7 @@ test {
     _ = @import("antfly_local_sources").sql_numeric_value;
     _ = @import("antfly_local_sources").sql_numeric_binary;
     _ = @import("antfly_local_sources").sql_numeric_key;
+    _ = @import("antfly_local_sources").sql_numeric_aggregate;
     _ = @import("antfly_local_sources").sql_array_binary;
     _ = @import("antfly_local_sources").sql_array_storage;
     _ = @import("antfly_local_sources").sql_array_wire;

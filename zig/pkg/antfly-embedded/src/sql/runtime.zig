@@ -1672,6 +1672,30 @@ test "SQL NUMERIC set projections preserve exact cells across mapped batches" {
     try std.testing.expectEqual(@import("array_value.zig").ElementType.numeric, result.output.columns[0].element_type.?);
 }
 
+test "SQL NUMERIC SUM AVG execute grouped distinct empty and special reductions" {
+    const a = std.testing.allocator;
+    const cases = [_]struct { sql: []const u8, rows: []const [2]?[]const u8, count: usize = 4 }{
+        .{ .sql = "SELECT SUM('1.20'::numeric + _id::numeric), AVG('1.20'::numeric + _id::numeric) FROM things", .rows = &.{.{ "10.80", "2.7000000000000000" }} },
+        .{ .sql = "SELECT SUM('1.20'::numeric + _id::numeric), AVG('1.20'::numeric + _id::numeric) FROM things GROUP BY _id::bigint % 2 ORDER BY _id::bigint % 2", .rows = &.{ .{ "4.40", "2.2000000000000000" }, .{ "6.40", "3.2000000000000000" } } },
+        .{ .sql = "SELECT SUM(DISTINCT '1.20'::numeric), AVG(DISTINCT '1.20'::numeric) FROM things", .rows = &.{.{ "1.20", "1.20000000000000000000" }} },
+        .{ .sql = "SELECT SUM(NULL::numeric), AVG(NULL::numeric) FROM things", .rows = &.{.{ null, null }} },
+        .{ .sql = "SELECT SUM('1.20'::numeric), AVG('1.20'::numeric) FROM things", .rows = &.{.{ null, null }}, .count = 0 },
+        .{ .sql = "SELECT SUM('Infinity'::numeric), AVG('Infinity'::numeric) FROM things", .rows = &.{.{ "Infinity", "Infinity" }} },
+    };
+    for (cases) |case| {
+        var fixture: TestBackend = .{ .row_count = case.count };
+        var compiled = try compiler.compile(a, case.sql, .{});
+        defer compiled.deinit();
+        var result = try execute(a, fixture.iface(), &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(case.rows.len, result.output.rows.len);
+        for (case.rows, result.output.rows) |expected, actual| for (expected, actual) |text, cell| {
+            if (text) |value| try std.testing.expectEqualStrings(value, cell.string) else try std.testing.expect(cell == .null);
+        };
+        for (result.output.columns) |column| try std.testing.expectEqual(@import("array_value.zig").ElementType.numeric, column.element_type.?);
+    }
+}
+
 test "SQL NUMERIC grouped extrema preserve exact values and result identity" {
     const a = std.testing.allocator;
     for ([_][]const u8{
@@ -3803,6 +3827,33 @@ test "SQL runtime executes spilled order group distinct and join under a small s
             try std.testing.expectEqualStrings(case.first, result.output.rows[0][1].string);
             try std.testing.expectEqualStrings("1", result.output.rows[0][2].string);
         }
+    }
+}
+
+test "SQL NUMERIC aggregates spill grouped partials with PostgreSQL scale and DISTINCT" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |distinct| {
+        const sql = if (distinct)
+            "SELECT CAST(_id AS BIGINT) % 1000 AS k, SUM(DISTINCT '0.10'::NUMERIC + _id::NUMERIC), AVG(DISTINCT '0.10'::NUMERIC + _id::NUMERIC) FROM things GROUP BY CAST(_id AS BIGINT) % 1000 ORDER BY k LIMIT 2 OFFSET 998"
+        else
+            "SELECT CAST(_id AS BIGINT) % 1000 AS k, SUM('0.10'::NUMERIC + _id::NUMERIC), AVG('0.10'::NUMERIC + _id::NUMERIC) FROM things GROUP BY CAST(_id AS BIGINT) % 1000 ORDER BY k LIMIT 2 OFFSET 998";
+        var compiled = try compiler.compile(a, sql, .{});
+        defer compiled.deinit();
+        var fixture: TestBackend = .{ .row_count = 2000 };
+        var native = try execute(a, fixture.iface(), &compiled, &.{}, .{ .retained_bytes = 8 * 1024 * 1024 });
+        defer native.deinit();
+        var backend = fixture.iface();
+        backend.execution_io = std.testing.io;
+        var quota: MemoryBudget = .{ .backing = std.heap.page_allocator, .limit = 1024 * 1024 };
+        defer std.debug.assert(quota.live == 0);
+        var spilled = try execute(quota.allocator(), backend, &compiled, &.{}, .{ .retained_bytes = 256 * 1024, .page_rows = 16 });
+        defer spilled.deinit();
+        try std.testing.expectEqualDeep(native.output.rows, spilled.output.rows);
+        try std.testing.expectEqualDeep(native.output.sql_nulls, spilled.output.sql_nulls);
+        try std.testing.expectEqualStrings("2996.20", spilled.output.rows[0][1].string);
+        try std.testing.expectEqualStrings("1498.1000000000000000", spilled.output.rows[0][2].string);
+        try std.testing.expectEqualStrings("2998.20", spilled.output.rows[1][1].string);
+        try std.testing.expectEqualStrings("1499.1000000000000000", spilled.output.rows[1][2].string);
     }
 }
 
