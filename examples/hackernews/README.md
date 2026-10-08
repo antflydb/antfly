@@ -44,10 +44,15 @@ python3 examples/hackernews/poc.py \
   --require-filters
 ```
 
-Use a fresh local state directory when changing sources. The checker starts a
+Use a fresh local state directory when changing sources, artifact namespaces or
+index declarations. The checker starts a
 loopback-only process, creates `hn_archive_poc`, waits for publication, checks
 10,000 SQL rows, ranked search, projected highlights, snapshot pagination, exact
 HN-ID filtering with score ordering, and score/cursor stability after restart.
+It declares relational indexes on `hn_id`, `created_at`, `item_type`, `author`,
+and `points`. Type/author equality, date/points ranges and their conjunction are
+checked against residual evaluation, then checked again after restart. Repeated
+and four concurrent highlighted searches are also validated.
 It stops the process and writes `report.json` into the state directory.
 
 The checker obtains a short-lived token from the current gcloud identity and
@@ -56,7 +61,10 @@ passes it only through the child environment. Configuration contains
 smoke check; a service needs its own credential flow. Source and artifact
 connections have separate prefix allowlists and capabilities (`lake_read` and
 `storage.primary`). Existing human IAM grants are used. Index artifacts are in
-`<prefix>/indexes`; catalog state and the configured 1 GiB cache are local.
+`<prefix>/indexes` by default; use `--artifact-prefix` to isolate another run
+without copying the source. Catalog state and the configured 1 GiB cache are local.
+Use `--text-only` for the projected-scan baseline and `--cold-cache` to stop after
+publication/count, remove only that state's cache, and start before measuring.
 
 ## October 7 results
 
@@ -95,15 +103,87 @@ HN-ID filter in 481 ms.
 
 Tables with declared relational indexes evaluate supported structured predicates
 against indexed physical candidates before ranking, including match sets above
-100,000 rows. This example currently declares only its full-text index: its
-flat structured predicates scan projected columns against the pinned,
-delete-aware lake snapshot and collect up to 100,000 matching IDs. Full-archive
-qualification needs relational indexes on the HN metadata fields and larger
-partitions. Nested paths retain the existing residual-filter path.
+100,000 rows. The default example now declares the five HN metadata indexes. With
+`--text-only`, flat structured predicates scan projected columns against the
+pinned, delete-aware lake snapshot and collect up to 100,000 matching IDs.
+Full-archive qualification still needs larger partitions. Nested paths retain
+the existing residual-filter path.
+
+## Same-region qualification
+
+Build the current main standalone binary for Linux, then use the existing dev
+cluster in `us-central1`, matching the source bucket:
+
+```sh
+cd zig
+zig build antfly -Dtarget=x86_64-linux-musl -Doptimize=fast -Dmetal=false -j2
+cd ..
+python3 examples/hackernews/regional.py \
+  --binary zig/zig-out/bin/antfly \
+  --revision "$(git rev-parse HEAD)" \
+  --run-prefix hn-poc/NEW-UNIQUE-RUN \
+  --output /private/tmp/hackernews-regional-NEW-UNIQUE-RUN
+```
+
+This creates one temporary pod in the existing `default` namespace, with two
+CPUs, 8 GiB memory, and no mounted service-account token. It copies the executable
+and harness into ephemeral storage, benchmarks text-only and metadata-indexed
+tables on the same worker, and deletes only its own pod afterward. A 45-minute
+pod deadline bounds a disconnected run. It creates no service or persistent
+volume and changes no shared workloads, bucket policy, or IAM.
+
+The runner streams a fresh short-lived token through encrypted `kubectl exec`
+stdin into the harness; it is kept only in memory and the Antfly child environment.
+The pod manifest, configuration and reports contain no token. This is test
+credential handling; a durable service needs a dedicated workload identity.
+
+Each mode runs two empty-cache cycles, five warm searches per cycle, four
+concurrent searches, metadata filter/reference comparisons, and restart checks.
+`regional.json` records the source revision, binary SHA-256, resolved container
+image, node, admitted resources and raw per-cycle reports. Linux profiles record
+Antfly CPU time and pod network byte deltas for serial queries. These include
+TLS/DNS and background/control traffic; concurrent intervals overlap and are
+not per-query byte counts. Results qualify the 10k sample only. Earlier local
+Debug timings use a different platform and optimization level.
+
+### October 8 results
+
+[regional-qualification.json](regional-qualification.json) records two runs per
+mode on one `us-central1` worker, using main `d2e9138f3f` and a Linux `fast` build.
+All five metadata indexes published, with exact filter totals/ranked pages
+matching residual evaluation before and after restart. HN IDs and scores also
+matched across both table modes and cycles. The temporary pod was deleted.
+
+| 10,000-row raw export | Empty-cache highlighted search | Warm median | After restart | Four concurrent searches |
+|---|---:|---:|---:|---:|
+| Text only | 4.37–4.94 s | 152–161 ms | 283–340 ms | 167–214 ms |
+| Text + five metadata indexes | 3.86–4.17 s | 151–152 ms | 199–234 ms | 142–179 ms |
+
+First publication took 5.5 seconds for text only and 48.8 seconds with the five
+metadata indexes. Later cycles reused publication. Individual indexed metadata
+filters took 213–241 ms warm; their conjunction took 753 ms. The text-only
+projected scans took 141–159 ms on this small cached sample. These indexes
+provide scalable predicate evaluation; the 10k check does not demonstrate a
+filtering latency win. Compound predicates currently incur repeated index setup.
+
+Cold searches received 5.7–7.4 MB and used 0.65–1.06 seconds of aggregate CPU.
+Their reported execution time was 1.2–1.7 seconds, leaving 2.6–3.2 seconds outside
+that timer. Warm searches received about 18.5 KB; retrieval/ranking/hydration
+took only 4–9 ms of a roughly 150 ms HTTP request. These counters, together with
+the current query path, suggest source/publication preparation and repeated
+remote validation are the next latency targets. They do not identify individual
+GCS requests. Index setup should share the authorized store and pinned snapshot
+within a request; reusable clients and validation caches must preserve credential,
+source-version and cancellation boundaries.
+
+Cache directories were removed before process startup for each cold cycle.
+One indexed cycle had one background-created file before its first query.
+Post-restart reads reused the persisted cache and received 33–97 KB for text
+only and about 38 KB with metadata indexes, rather than downloading megabytes.
 
 ## Remaining deployment work
 
-- Measure remaining cold remote I/O in the deployment region and under concurrency.
+- Reduce source/publication preparation and repeated predicate setup, preserving snapshot and cancellation guarantees.
 - Qualify larger partitions against build/corpus limits and indexed filtering.
 - Define durable buckets and service identities through Colony's infra workflow.
 - Stream backfills, resolve parent stories, and reconcile edits/deletions.
