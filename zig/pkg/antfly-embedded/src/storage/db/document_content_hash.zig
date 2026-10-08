@@ -267,6 +267,11 @@ fn hashRelationalCellCanonical(
         return;
     }
     switch (column.column_type) {
+        .numeric => {
+            hasher.update("N");
+            const view = try @import("../../common/sql_numeric_layout.zig").View.openAuthenticated(cell.value.bytes_val, .{});
+            view.updateLogicalHash(hasher);
+        },
         .sql_array => {
             const kind = column.sql_element_type orelse return error.InvalidBatchRequest;
             const view = try @import("../../common/sql_array_layout.zig").View.openAuthenticated(kind, cell.value.bytes_val, .{});
@@ -623,6 +628,14 @@ fn hashRelationalColumnValue(
             defer alloc.free(bytes);
             const view = try @import("../../common/sql_array_layout.zig").View.open(kind, bytes, .{});
             view.updateLogicalHash(hasher);
+        },
+        .numeric => {
+            const numeric = @import("../../sql/numeric_value.zig");
+            var ctx: numeric.Context = .{ .alloc = alloc };
+            var parsed = try @import("../../sql/numeric_storage.zig").fromJson(&ctx, value);
+            defer parsed.deinit();
+            hasher.update("N");
+            try numeric.hash(&ctx, parsed.value, hasher);
         },
         .string, .blob, .geoshape => switch (value) {
             .string => |text| {

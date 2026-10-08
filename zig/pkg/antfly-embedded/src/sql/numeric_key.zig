@@ -178,7 +178,9 @@ test "SQL exact NUMERIC index keys match independently ranked PostgreSQL values"
     var ctx: Context = .{ .alloc = arena.allocator(), .remaining = 128 * 1024 * 1024 };
     const keys = try ctx.alloc.alloc([]const u8, fixture.value.entries.len);
     const descending_keys = try ctx.alloc.alloc([]u8, fixture.value.entries.len);
-    for (fixture.value.entries, keys, descending_keys) |entry, *key, *descending| {
+    const View = @import("../common/sql_numeric_layout.zig").View;
+    const views = try ctx.alloc.alloc(View, fixture.value.entries.len);
+    for (fixture.value.entries, keys, descending_keys, views) |entry, *key, *descending, *view| {
         var value = try numeric.parse(&ctx, entry.input);
         defer value.deinit();
         key.* = try encodeAlloc(&ctx, value.value);
@@ -187,7 +189,7 @@ test "SQL exact NUMERIC index keys match independently ranked PostgreSQL values"
         const canonical = try encodeAlloc(&ctx, restored.value);
         try std.testing.expectEqualSlices(u8, key.*, canonical);
         const wire = try @import("numeric_binary.zig").encodeAlloc(&ctx, value.value);
-        defer ctx.alloc.free(wire);
+        view.* = try View.open(wire, .{});
         descending.* = try ctx.alloc.alloc(u8, key.len);
         var writer: std.Io.Writer = .fixed(descending.*);
         var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
@@ -195,8 +197,9 @@ test "SQL exact NUMERIC index keys match independently ranked PostgreSQL values"
         try encodeStored(&borrowed, wire, &writer, true);
         try std.testing.expectEqual(@as(usize, 0), failing.alloc_index);
     }
-    for (fixture.value.entries, keys, descending_keys) |left, left_key, left_desc| for (fixture.value.entries, keys, descending_keys) |right, right_key, right_desc| {
+    for (fixture.value.entries, keys, descending_keys, views) |left, left_key, left_desc, left_view| for (fixture.value.entries, keys, descending_keys, views) |right, right_key, right_desc, right_view| {
         const expected = std.math.order(left.rank, right.rank);
+        try std.testing.expectEqual(expected, try left_view.order(right_view, &ctx));
         try std.testing.expectEqual(expected, std.mem.order(u8, left_key, right_key));
         try std.testing.expectEqual(expected, std.mem.order(u8, right_desc, left_desc));
         if (expected != .eq) {

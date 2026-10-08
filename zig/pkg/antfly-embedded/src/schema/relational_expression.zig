@@ -190,7 +190,7 @@ pub const Plan = struct {
                 };
                 if (bytes > budget.* / 2) return error.RelationalExpressionBudgetExceeded;
                 budget.* -= bytes * 2;
-                if (valueOrder(probe, candidate, false) == .eq) return .{ .boolean = node.op == .in_list };
+                if (try valueOrder(probe, candidate, false) == .eq) return .{ .boolean = node.op == .in_list };
             }
             return if (unknown) .null else .{ .boolean = node.op == .not_in_list };
         }
@@ -212,7 +212,7 @@ pub const Plan = struct {
             };
             if (compared_bytes > budget.* / 2) return error.RelationalExpressionBudgetExceeded;
             budget.* -= compared_bytes * 2;
-            const order = valueOrder(left, right, node.fold_ascii);
+            const order = try valueOrder(left, right, node.fold_ascii);
             return .{ .boolean = switch (node.op) {
                 .eq, .is_not_distinct => order == .eq,
                 .ne, .is_distinct => order != .eq,
@@ -329,7 +329,7 @@ fn isComparison(op: Op) bool {
     };
 }
 
-fn valueOrder(a: Value, b: Value, fold_ascii: bool) std.math.Order {
+fn valueOrder(a: Value, b: Value, fold_ascii: bool) !std.math.Order {
     return switch (a) {
         .null => unreachable,
         .string => |left| blk: {
@@ -341,6 +341,14 @@ fn valueOrder(a: Value, b: Value, fold_ascii: bool) std.math.Order {
             break :blk std.math.order(left.len, b.string.len);
         },
         .blob => |value| std.mem.order(u8, value, b.blob),
+        .numeric => |bytes| blk: {
+            const numeric = @import("../sql/numeric_value.zig");
+            const View = @import("../common/sql_numeric_layout.zig").View;
+            var budget: numeric.Context = .{ .alloc = std.heap.page_allocator };
+            const left = try View.openWithBudget(bytes, .{}, &budget);
+            const right = try View.openWithBudget(b.numeric, .{}, &budget);
+            break :blk try left.order(right, &budget);
+        },
         .boolean => |value| std.math.order(@intFromBool(value), @intFromBool(b.boolean)),
         .integer => |value| std.math.order(value, b.integer),
         .number => |value| std.math.order(value, b.number),
@@ -434,7 +442,7 @@ const Compiler = struct {
                 var bytes: [8]u8 = undefined;
                 switch (node.literal) {
                     .null => {},
-                    .string, .blob => |value_bytes| self.frame(value_bytes),
+                    .string, .blob, .numeric => |value_bytes| self.frame(value_bytes),
                     .boolean => |boolean| self.hash.update(&.{@intFromBool(boolean)}),
                     .integer => |integer| {
                         std.mem.writeInt(i64, &bytes, integer, .little);
@@ -606,10 +614,10 @@ test "relational declarations SQL numeric programs retain narrow domains and che
             try std.testing.expectError(if (std.mem.eql(u8, state, "22003")) error.SqlNumericOutOfRange else error.SqlDivisionByZero, query.evaluate(a, &inputs, &.{}, .{}));
         } else {
             const wanted = try checks.valueFromJson(a, expected, case.expected, true);
-            try std.testing.expect(valuesEqual(wanted, try plan.evaluate(alloc, &cells)));
+            try std.testing.expect(try valuesEqual(wanted, try plan.evaluate(alloc, &cells)));
             const actual = try query.evaluate(a, &inputs, &.{}, .{});
             try std.testing.expectEqual(case.expected == .null, actual.sql_null);
-            try std.testing.expect(valuesEqual(wanted, try checks.valueFromJson(a, expected, actual.value, true)));
+            try std.testing.expect(try valuesEqual(wanted, try checks.valueFromJson(a, expected, actual.value, true)));
         }
     }
 }
@@ -898,7 +906,7 @@ pub const Set = struct {
             if (!binding.generated) continue;
             if (!present[binding.ordinal]) return error.InvalidRelationalGeneratedValue;
             const expected = try self.normalizeBinding(alloc, binding.ordinal, try binding.plan.evaluateNode(alloc, .{ .values = values }, @intCast(binding.plan.nodes.len - 1), &budget));
-            if (!valuesEqual(expected, values[binding.ordinal])) return error.InvalidRelationalGeneratedValue;
+            if (!try valuesEqual(expected, values[binding.ordinal])) return error.InvalidRelationalGeneratedValue;
         }
     }
 
@@ -937,12 +945,13 @@ pub const Set = struct {
     }
 };
 
-fn valuesEqual(a: Value, b: Value) bool {
+fn valuesEqual(a: Value, b: Value) !bool {
     if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
     return switch (a) {
         .null => true,
         .string => |bytes| std.mem.eql(u8, bytes, b.string),
         .blob => |bytes| std.mem.eql(u8, bytes, b.blob),
+        .numeric => try valueOrder(a, b, false) == .eq,
         .integer => |value| value == b.integer,
         .number => |value| value == b.number,
         .boolean => |value| value == b.boolean,
@@ -960,6 +969,7 @@ fn valueToJson(alloc: Allocator, value: Value) !std.json.Value {
         },
         .integer => |integer| .{ .integer = integer },
         .number => |number| .{ .float = number },
+        .numeric => |bytes| @import("../sql/numeric_storage.zig").jsonValueAlloc(alloc, bytes),
         .boolean => |boolean| .{ .bool = boolean },
         .datetime => |datetime| .{ .number_string = try std.fmt.allocPrint(alloc, "{d}", .{datetime}) },
     };

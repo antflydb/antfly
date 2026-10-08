@@ -33,6 +33,7 @@ pub const RelationalIndexPredicate = types.RelationalIndexPredicate;
 pub const RelationalScalarExpression = types.RelationalScalarExpression;
 pub const RelationalUniqueConstraint = types.RelationalUniqueConstraint;
 pub const SQLArrayColumnSchema = types.SQLArrayColumnSchema;
+pub const SQLArrayElementType = types.SQLArrayElementType;
 pub const SQLBuiltinType = types.SQLBuiltinType;
 pub const TableSchema = types.TableSchema;
 pub const TableStorageMode = types.TableStorageMode;

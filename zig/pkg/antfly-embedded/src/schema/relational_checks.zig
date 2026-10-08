@@ -32,6 +32,7 @@ pub fn valueFromJson(alloc: Allocator, kind: schema.RelationalColumnType, value:
         else
             impl.documentIntegerToI64(value) orelse return error.InvalidBatchRequest },
         .number => .{ .number = impl.documentNumberToF64(value) orelse return error.InvalidBatchRequest },
+        .numeric => .{ .numeric = try @import("../sql/numeric_storage.zig").encodeJsonAlloc(alloc, value) },
         .boolean => if (value == .bool) .{ .boolean = value.bool } else error.InvalidBatchRequest,
         .datetime => .{ .datetime = signedDateTime(value) orelse return error.InvalidBatchRequest },
         .blob => blk: {

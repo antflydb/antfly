@@ -44,21 +44,23 @@ func TestPreparedSQLParameterContractsRetainElementIdentity(t *testing.T) {
 }
 
 func TestArrayColumnSchemaPreservesExplicitIdentityAndEnvelopeConstraints(t *testing.T) {
-	column := SQLArrayColumnSchema{Type: "sql_array", XAntflySqlType: "int64", Nullable: true}
-	column.Set("properties", map[string]any{"values": map[string]any{"minItems": 2}})
-	encoded, err := json.Marshal(column)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var decoded SQLArrayColumnSchema
-	if err := json.Unmarshal(encoded, &decoded); err != nil {
-		t.Fatal(err)
-	}
-	if decoded.Type != "sql_array" || decoded.XAntflySqlType != "int64" || !decoded.Nullable {
-		t.Fatalf("lost array column identity: %+v", decoded)
-	}
-	if _, found := decoded.Get("properties"); !found {
-		t.Fatal("lost envelope constraints")
+	for _, kind := range []SQLArrayElementType{"int64", "numeric"} {
+		column := SQLArrayColumnSchema{Type: "sql_array", XAntflySqlType: kind, Nullable: true}
+		column.Set("properties", map[string]any{"values": map[string]any{"minItems": 2}})
+		encoded, err := json.Marshal(column)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var decoded SQLArrayColumnSchema
+		if err := json.Unmarshal(encoded, &decoded); err != nil {
+			t.Fatal(err)
+		}
+		if decoded.Type != "sql_array" || decoded.XAntflySqlType != kind || !decoded.Nullable {
+			t.Fatalf("lost array column identity: %+v", decoded)
+		}
+		if _, found := decoded.Get("properties"); !found {
+			t.Fatal("lost envelope constraints")
+		}
 	}
 }
 

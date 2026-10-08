@@ -14,20 +14,23 @@
 
 import { afterEach, describe, expect, expectTypeOf, it, vi } from "vitest";
 import { AntflyClient, SQLExecutionError } from "../src/client.js";
-import type { SQLArrayColumnSchema, SQLBuiltinType } from "../src/index.js";
+import type { SQLArrayColumnSchema, SQLArrayElementType } from "../src/index.js";
 import type { SQLPreparedResponse } from "../src/types.js";
 
-it("exports an explicit typed array column schema without losing envelope constraints", () => {
-  expectTypeOf<SQLArrayColumnSchema["x-antfly-sql-type"]>().toEqualTypeOf<SQLBuiltinType>();
+it.each([
+  "int64",
+  "numeric",
+] as const)("exports a typed %s array column schema without losing envelope constraints", (kind) => {
+  expectTypeOf<SQLArrayColumnSchema["x-antfly-sql-type"]>().toEqualTypeOf<SQLArrayElementType>();
   const schema: SQLArrayColumnSchema = {
     type: "sql_array",
-    "x-antfly-sql-type": "int64",
+    "x-antfly-sql-type": kind,
     nullable: true,
     properties: { values: { minItems: 2 } },
   };
   expect(JSON.parse(JSON.stringify(schema))).toEqual({
     type: "sql_array",
-    "x-antfly-sql-type": "int64",
+    "x-antfly-sql-type": kind,
     nullable: true,
     properties: { values: { minItems: 2 } },
   });

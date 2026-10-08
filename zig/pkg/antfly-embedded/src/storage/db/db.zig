@@ -63741,6 +63741,46 @@ test "relational columnar delete waves coalesce adjacent underfilled ranges" {
     try std.testing.expect(db.relational_column_maintenance.covered_rows_read.load(.monotonic) > 0);
 }
 
+test "relational index system NUMERIC cold column projections preserve precision scale and logical hashes" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.initFast("numeric-columns");
+    defer directory.cleanup();
+    const backend: PrimaryBackend = .{ .lsm = .{ .flush_threshold = 1 } };
+    var db = try DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .primary_backend = backend });
+    defer db.close();
+    const columns = [_]schema_mod.RelationalColumn{
+        .{ .name = "n", .path = "n", .column_type = .numeric, .sql_element_type = .numeric, .allows_null = true },
+    };
+    try db.setSchema(.{ .version = 1, .storage_mode = .relational, .relational_columns = &columns });
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var writes: [32]types.BatchWrite = undefined;
+    const documents = [_][]const u8{
+        "{\"n\":123456789012345678901234567890.00001}",
+        "{\"n\":1.2000}",
+        "{\"n\":\"NaN\"}",
+        "{\"n\":null}",
+    };
+    for (&writes, 0..) |*write, i| write.* = .{ .key = try std.fmt.allocPrint(scratch, "k{d:0>4}", .{i}), .value = documents[i % documents.len] };
+    try db.batch(.{ .writes = &writes });
+    const options: types.ScanOptions = .{ .include_documents = true, .include_all_fields = false, .fields = &.{"n"}, .include_content_hashes = true };
+    var before = try db.scan(alloc, "", "", options);
+    defer before.deinit(alloc);
+    try drainTestRelationalMaintenance(&db);
+    db.close();
+    db = try DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .primary_backend = backend });
+    var stats: types.ColumnarScanStats = .{};
+    var projected_options = options;
+    projected_options.columnar_stats = &stats;
+    var after = try db.scan(alloc, "", "", projected_options);
+    defer after.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, writes.len), after.documents.len);
+    try std.testing.expectEqualDeep(before.documents, after.documents);
+    try std.testing.expectEqualDeep(before.hashes, after.hashes);
+    try std.testing.expectEqual(@as(u64, 0), stats.primary_rows_read);
+}
+
 test "relational columnar clean coalescing preserves typed cells without primary reads" {
     // Preserve leak checks; allocation backtraces are opt-in for diagnostics.
     var allocator_state: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });

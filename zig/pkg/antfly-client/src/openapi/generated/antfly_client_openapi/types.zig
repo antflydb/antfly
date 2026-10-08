@@ -36790,7 +36790,7 @@ pub const RuntimeDecl = struct {
 /// JSON Schema property declaration for one typed SQL-array column in a relational table. Use it as a root property of DocumentSchema.schema. The element identity is mandatory; a JSON Schema `array` remains a JSON column and is never inferred to be a SQL array. Column values use the lossless SQLArrayValue envelope: dimensions with lower bounds, flat row-major values and explicit SQL NULL flags. Integer elements are decimal strings, even when small. JSONB null and SQL NULL are distinct. Float elements acquire their declared width before validation and storage. Outer null represents a SQL NULL array when nullable is true. Additional JSON Schema constraints apply to this envelope, not to PostgreSQL array subscripts. SQL array index keys and SQL DDL activation are not implied by accepting this storage schema.
 pub const SQLArrayColumnSchema = struct {
     type: []const u8,
-    x_antfly_sql_type: SQLBuiltinType,
+    x_antfly_sql_type: SQLArrayElementType,
     nullable: ?bool = null,
     description: ?[]const u8 = null,
 
@@ -36891,7 +36891,7 @@ pub const SQLArrayValue = struct {
     sql_nulls: []const bool,
 };
 
-/// Exact PostgreSQL builtin identity for a relational root scalar column or the element identity of a `sql_array` column. Set the JSON Schema property's `x-antfly-sql-type` annotation to one of these values. The underlying property type must match. SQL array storage is not implied by this annotation. Existing unannotated schemas retain their original domains.
+/// Exact PostgreSQL builtin identity for a relational root scalar column. SQL array columns use SQLArrayElementType for their element identity. Set the JSON Schema property's `x-antfly-sql-type` annotation to one of these values. The underlying property type must match. SQL array storage is not implied by this annotation. Existing unannotated schemas retain their original domains.
 pub const SQLBuiltinType = enum {
     text,
     int16,

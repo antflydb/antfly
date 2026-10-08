@@ -12818,55 +12818,7 @@ pub const SQLArrayDimension = struct {
     lower_bound: i64,
 };
 
-/// Bound SQL scalar or array-element identity, including numeric widths and exact NUMERIC. Never inferred from JSON value shape.
-pub const SQLArrayElementType = enum {
-    text,
-    int16,
-    int32,
-    int64,
-    float32,
-    float64,
-    boolean,
-    uuid,
-    jsonb,
-    numeric,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .text => "text",
-            .int16 => "int16",
-            .int32 => "int32",
-            .int64 => "int64",
-            .float32 => "float32",
-            .float64 => "float64",
-            .boolean => "boolean",
-            .uuid => "uuid",
-            .jsonb => "jsonb",
-            .numeric => "numeric",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "text", .text },
-            .{ "int16", .int16 },
-            .{ "int32", .int32 },
-            .{ "int64", .int64 },
-            .{ "float32", .float32 },
-            .{ "float64", .float64 },
-            .{ "boolean", .boolean },
-            .{ "uuid", .uuid },
-            .{ "jsonb", .jsonb },
-            .{ "numeric", .numeric },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
+pub const SQLArrayElementType = antfly_schema_openapi.SQLArrayElementType;
 
 /// Non-NULL SQL array result. Elements are flat, row-major values using the column's element_type. Their count equals the product of dimension lengths. Empty arrays have no dimensions and no elements. Integer elements are canonical decimal strings. Exact numeric elements are decimal strings preserving display scale, or NaN, Infinity and -Infinity. Floating elements are JSON numbers, or the strings NaN, Infinity and -Infinity. Element null flags distinguish SQL NULL from the JSON literal null in jsonb arrays. A NULL array is an outer null result cell, not an empty array or this envelope.
 pub const SQLArrayValue = struct {
@@ -12882,34 +12834,6 @@ pub const SQLColumn = struct {
     type: SQLColumnType,
     /// Required for array columns and exact NUMERIC number columns. Identifies scalar widths when supplied. The descriptor applies even to NULL or empty arrays.
     element_type: ?SQLArrayElementType = null,
-
-    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
-    pub const openApiFieldMetadata = .{
-        .{ "name", "name", false },
-        .{ "type", "type", false },
-        .{ "element_type", "element_type", true },
-    };
-
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        try jw.beginObject();
-        try jw.objectField("name");
-        try jw.write(self.name);
-        try jw.objectField("type");
-        try jw.write(self.type);
-        if (self.element_type) |value| {
-            try jw.objectField("element_type");
-            try jw.write(value);
-        }
-        try jw.endObject();
-    }
 };
 
 /// Logical SQL result type. Integer values and numbers with element_type numeric are decimal strings to preserve exact precision in every client.
@@ -13191,34 +13115,6 @@ pub const SQLParameterDescriptor = struct {
     type: SQLColumnType,
     element_type: ?SQLArrayElementType = null,
     nullable: bool,
-
-    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
-    pub const openApiFieldMetadata = .{
-        .{ "type", "type", false },
-        .{ "element_type", "element_type", true },
-        .{ "nullable", "nullable", false },
-    };
-
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        try jw.beginObject();
-        try jw.objectField("type");
-        try jw.write(self.type);
-        if (self.element_type) |value| {
-            try jw.objectField("element_type");
-            try jw.write(value);
-        }
-        try jw.objectField("nullable");
-        try jw.write(self.nullable);
-        try jw.endObject();
-    }
 };
 
 pub const SQLPrepareRequest = struct {

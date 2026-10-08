@@ -3266,6 +3266,9 @@ pub const CompiledPatternFilter = union(enum) {
             const value = cell orelse return self.matches(alloc, &.{});
             if (self == .exists) return true;
             if (value.is_null) return self.matches(alloc, &.{.null});
+            // Exact NUMERIC requires a typed predicate kernel. Do not compare
+            // canonical binary as text or silently round it through f64.
+            if (value.is_numeric) return error.UnsupportedSqlExecution;
             if (value.is_dense_vector and (self == .term or self == .terms)) {
                 const bytes = value.value.bytes_val;
                 if (bytes.len % 4 != 0) return error.InvalidData;

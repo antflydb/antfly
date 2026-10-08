@@ -27293,9 +27293,9 @@ components:
     SQLBuiltinType:
       type: string
       description: >
-        Exact PostgreSQL builtin identity for a relational root scalar column
+        Exact PostgreSQL builtin identity for a relational root scalar column.
 
-        or the element identity of a `sql_array` column.
+        SQL array columns use SQLArrayElementType for their element identity.
 
         Set the JSON Schema property's `x-antfly-sql-type` annotation to one of
 
@@ -28210,7 +28210,7 @@ components:
           enum:
             - sql_array
         x-antfly-sql-type:
-          $ref: '#/components/schemas/SQLBuiltinType'
+          $ref: '#/components/schemas/SQLArrayElementType'
         nullable:
           type: boolean
           default: false

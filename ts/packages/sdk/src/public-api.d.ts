@@ -13702,8 +13702,8 @@ export interface components {
         /** @enum {string} */
         RelationalExpressionType: "string" | "blob" | "boolean" | "datetime" | "integer" | "number";
         /**
-         * @description Exact PostgreSQL builtin identity for a relational root scalar column
-         *     or the element identity of a `sql_array` column.
+         * @description Exact PostgreSQL builtin identity for a relational root scalar column.
+         *     SQL array columns use SQLArrayElementType for their element identity.
          *     Set the JSON Schema property's `x-antfly-sql-type` annotation to one of
          *     these values. The underlying property type must match. SQL array storage
          *     is not implied by this annotation. Existing unannotated schemas retain
@@ -14182,7 +14182,7 @@ export interface components {
         SQLArrayColumnSchema: {
             /** @enum {string} */
             type: "sql_array";
-            "x-antfly-sql-type": components["schemas"]["SQLBuiltinType"];
+            "x-antfly-sql-type": components["schemas"]["SQLArrayElementType"];
             /** @default false */
             nullable?: boolean;
             description?: string;

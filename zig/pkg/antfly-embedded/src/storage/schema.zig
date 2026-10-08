@@ -228,6 +228,9 @@ pub const RelationalColumnType = enum(u8) {
     /// Schema-bound flat SQL array; sql_element_type is mandatory. This is
     /// neither a JSON list nor an embedding vector.
     sql_array = 10,
+    /// Exact canonical PostgreSQL NUMERIC payload, not the legacy f64 number
+    /// cell or the heterogeneous typed-doc-value numeric_val union.
+    numeric = 11,
 };
 
 pub const RelationalJsonKind = enum(u8) {
@@ -294,7 +297,7 @@ const schema_version_prefix = "\x00\x00__metadata__:schema_v";
 /// Current durable runtime-schema format. Catalog compatibility checks use the
 /// same exported constant so a writer can never silently drift from the format
 /// it advertises in transactional table metadata.
-pub const storage_format_version: u32 = 19;
+pub const storage_format_version: u32 = 20;
 
 /// Serialize a TableSchema to bytes. Caller owns the returned slice.
 pub fn serializeSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
@@ -386,6 +389,9 @@ fn serializeSchemaFormat(alloc: Allocator, schema: TableSchema, format_version: 
     };
     if (format_version < 18 and schema.requires_typed_expressions) return error.UnsupportedVersion;
     if (format_version < 19 and schema.requires_predicate_expressions) return error.UnsupportedVersion;
+    if (format_version < 20) for (schema.relational_columns) |column| {
+        if (column.column_type == .numeric or column.sql_element_type == .numeric) return error.UnsupportedVersion;
+    };
 
     var buf = std.ArrayListUnmanaged(u8).empty;
     errdefer buf.deinit(alloc);
@@ -997,6 +1003,7 @@ fn deserializeSchemaOwned(alloc: Allocator, data: []const u8) !TableSchema {
                 8 => .json,
                 9 => .dense_vector,
                 10 => if (fmt_version >= 17) .sql_array else return error.UnsupportedVersion,
+                11 => if (fmt_version >= 20) .numeric else return error.UnsupportedVersion,
                 else => return error.InvalidSchema,
             };
             pos += 1;
@@ -1276,11 +1283,16 @@ fn validateSerializedSchema(data: []const u8) !void {
             const column_tag = try cursor.readU8();
             if (column_tag >= std.meta.fieldNames(RelationalColumnType).len) return error.InvalidSchema;
             if (column_tag == @backingInt(RelationalColumnType.sql_array) and format_version < 17) return error.UnsupportedVersion;
+            if (column_tag == @backingInt(RelationalColumnType.numeric) and format_version < 20) return error.UnsupportedVersion;
             try cursor.readBool();
             try cursor.readBool();
             try cursor.readBool();
             if ((try cursor.readU8()) >= std.meta.fieldNames(RelationalJsonKind).len) return error.InvalidSchema;
-            if (format_version >= 16 and (try cursor.readU8()) > std.meta.fieldNames(@import("../common/sql_builtin_type.zig").Type).len) return error.InvalidSchema;
+            if (format_version >= 16) {
+                const sql_tag = try cursor.readU8();
+                if (sql_tag > std.meta.fieldNames(@import("../common/sql_builtin_type.zig").Type).len) return error.InvalidSchema;
+                if (sql_tag == @backingInt(@import("../common/sql_builtin_type.zig").Type.numeric) + 1 and format_version < 20) return error.UnsupportedVersion;
+            }
         }
     }
     if (format_version >= 15) {
@@ -1293,6 +1305,10 @@ fn validateSerializedSchema(data: []const u8) !void {
 }
 
 fn validateRelationalSchema(alloc: Allocator, schema: TableSchema) !void {
+    for (schema.relational_columns) |column| if (column.column_type == .numeric) {
+        if (schema.storage_mode != .relational or column.sql_element_type != .numeric or column.is_json or column.json_kind != .none)
+            return error.InvalidSchema;
+    };
     if (schema.requires_typed_expressions and (schema.storage_mode != .relational or !schema.requires_public_schema)) return error.InvalidSchema;
     if (schema.requires_predicate_expressions and (schema.storage_mode != .relational or !schema.requires_public_schema)) return error.InvalidSchema;
     for (schema.relational_columns) |column| if (column.column_type == .sql_array) {
@@ -1307,9 +1323,7 @@ fn validateRelationalSchema(alloc: Allocator, schema: TableSchema) !void {
             .float32, .float64 => .number,
             .boolean => .boolean,
             .jsonb => .json,
-            // Exact scalar NUMERIC needs its own physical row contract; it
-            // must not be admitted as a lossy floating-point number column.
-            .numeric => return error.InvalidSchema,
+            .numeric => .numeric,
         };
         if (column.column_type != physical) return error.InvalidSchema;
     };
@@ -2805,7 +2819,8 @@ test "relational index system SQL schema identities survive durable round trips 
             .column_type = switch (kind) {
                 .text, .uuid => .string,
                 .int16, .int32, .int64 => .integer,
-                .float32, .float64, .numeric => .number,
+                .float32, .float64 => .number,
+                .numeric => .numeric,
                 .boolean => .boolean,
                 .jsonb => .json,
             },
@@ -2814,12 +2829,6 @@ test "relational index system SQL schema identities survive durable round trips 
             .sql_element_type = kind,
         };
         const table: TableSchema = .{ .version = 7, .storage_mode = .relational, .relational_columns = &.{column} };
-        if (kind == .numeric) {
-            // Exact scalar NUMERIC is not a native f64 column. Keep this
-            // fail-closed until the native row/index/VM domain is implemented.
-            try std.testing.expectError(error.InvalidSchema, serializeSchema(alloc, table));
-            continue;
-        }
         const bytes = try serializeSchema(alloc, table);
         defer alloc.free(bytes);
         const decoded = try deserializeSchema(alloc, bytes);
@@ -2829,6 +2838,19 @@ test "relational index system SQL schema identities survive durable round trips 
         const canonical = try serializeSchema(alloc, decoded);
         defer alloc.free(canonical);
         try std.testing.expectEqualSlices(u8, bytes, canonical);
+        if (kind == .numeric) {
+            var wrong = column;
+            wrong.column_type = .number;
+            var invalid = table;
+            invalid.relational_columns = &.{wrong};
+            try std.testing.expectError(error.InvalidSchema, serializeSchema(alloc, invalid));
+            wrong = column;
+            wrong.sql_element_type = null;
+            invalid.relational_columns = &.{wrong};
+            try std.testing.expectError(error.InvalidSchema, serializeSchema(alloc, invalid));
+            try std.testing.expectError(error.UnsupportedVersion, serializeSchemaFormat(alloc, table, 19));
+            continue;
+        }
         var untyped_column = column;
         untyped_column.sql_element_type = null;
         const untyped: TableSchema = .{ .version = 7, .storage_mode = .relational, .relational_columns = &.{untyped_column} };

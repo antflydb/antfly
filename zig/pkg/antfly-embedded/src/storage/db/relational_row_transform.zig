@@ -295,6 +295,7 @@ fn scalarValue(kind: schema.RelationalColumnType, cell: codec.Cell) !expressions
         .blob => .{ .blob = cell.value.bytes_val },
         .integer => .{ .integer = cell.value.i64_val },
         .number => .{ .number = cell.value.f64_val },
+        .numeric => .{ .numeric = cell.value.bytes_val },
         .boolean => .{ .boolean = cell.value.bool_val },
         .datetime => .{ .datetime = cell.value.u64_val },
         else => error.InvalidRelationalExpressionInput,
@@ -303,16 +304,16 @@ fn scalarValue(kind: schema.RelationalColumnType, cell: codec.Cell) !expressions
 
 fn scalarCell(column: schema.RelationalColumn, ordinal: u32, value: expressions.Value) !codec.Cell {
     const value_type: @import("../../section/typed_doc_values.zig").ValueType = switch (column.column_type) {
-        .string, .blob => .bytes_val,
+        .string, .blob, .numeric => .bytes_val,
         .integer => .i64_val,
         .number => .f64_val,
         .boolean => .bool_val,
         .datetime => .u64_val,
         else => return error.InvalidRelationalExpressionInput,
     };
-    return .{ .ordinal = ordinal, .path = column.path, .value_type = value_type, .is_null = value == .null, .value = switch (value) {
+    return .{ .ordinal = ordinal, .path = column.path, .value_type = value_type, .is_numeric = column.column_type == .numeric, .is_null = value == .null, .value = switch (value) {
         .null => .{ .bytes_val = "" },
-        .string, .blob => |bytes| .{ .bytes_val = bytes },
+        .string, .blob, .numeric => |bytes| .{ .bytes_val = bytes },
         .integer => |integer| .{ .i64_val = integer },
         .number => |number| .{ .f64_val = number },
         .boolean => |boolean| .{ .bool_val = boolean },

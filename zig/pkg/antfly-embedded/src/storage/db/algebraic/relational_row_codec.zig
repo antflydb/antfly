@@ -86,6 +86,9 @@ pub const Cell = struct {
     /// The byte payload is a canonical sequence of little-endian f32 values
     /// which reconstructs as a JSON number array rather than a JSON string.
     is_dense_vector: bool = false,
+    /// Exact NUMERIC bytes, identified by the pinned layout rather than an
+    /// on-row per-cell type tag. Never interpret these bytes as JSON or f64.
+    is_numeric: bool = false,
     /// Element identity is supplied by the pinned immutable layout, not read
     /// from an untrusted payload or inferred from JSON shape.
     sql_array_element_type: ?@import("../../../common/sql_builtin_type.zig").Type = null,
@@ -338,6 +341,7 @@ fn serializeOrdinalInternal(
             cell.value_type != columnValueType(column.column_type) or
             cell.is_json != column.is_json or
             cell.is_dense_vector != (column.column_type == .dense_vector) or
+            cell.is_numeric != (column.column_type == .numeric) or
             cell.sql_array_element_type != (if (column.column_type == .sql_array) column.sql_element_type else null))
             return error.InvalidRelationalRow;
         if (validate_json_cells) try validateCell(alloc, cell);
@@ -860,6 +864,7 @@ fn jsonValueFromCellAlloc(
             const decoded = try @import("../../../sql/array_storage.zig").decodeLeaky(alloc, kind, cell.value.bytes_val, .{});
             break :blk try @import("../../../sql/array_wire.zig").toJsonLeaky(alloc, decoded.value, .{});
         },
+        .numeric => try @import("../../../sql/numeric_storage.zig").jsonValueAlloc(alloc, cell.value.bytes_val),
         .datetime => if (cell.value.u64_val <= std.math.maxInt(i64))
             .{ .integer = @intCast(cell.value.u64_val) }
         else
@@ -1726,6 +1731,7 @@ fn ordinalCellFromPayloadWithValidation(
         .value_type = value_type,
         .is_json = column.is_json,
         .is_dense_vector = column.column_type == .dense_vector,
+        .is_numeric = column.column_type == .numeric,
         .sql_array_element_type = if (column.column_type == .sql_array) column.sql_element_type else null,
         .is_null = is_null,
         .value = typed_value,
@@ -1740,6 +1746,8 @@ fn ordinalCellFromPayloadWithValidation(
     if (!is_null and value_type == .bytes_val) {
         if (column.column_type == .sql_array) {
             _ = try @import("../../../sql/array_storage.zig").validateCanonical(std.heap.page_allocator, column.sql_element_type orelse return error.InvalidRelationalRow, cell.value.bytes_val, .{});
+        } else if (column.column_type == .numeric) {
+            _ = try @import("../../../common/sql_numeric_layout.zig").View.open(cell.value.bytes_val, .{});
         } else if (column.column_type == .dense_vector) {
             try validateDenseVectorBytes(cell.value.bytes_val);
         } else if (column.is_json) {
@@ -1961,13 +1969,13 @@ fn columnValueType(column_type: runtime_schema.RelationalColumnType) typed_dv.Va
         .number => .f64_val,
         .boolean => .bool_val,
         .geopoint => .geo_point,
-        .string, .blob, .geoshape, .json, .dense_vector, .sql_array => .bytes_val,
+        .string, .blob, .geoshape, .json, .dense_vector, .sql_array, .numeric => .bytes_val,
     };
 }
 
 fn isVariableColumn(column: runtime_schema.RelationalColumn) bool {
     return switch (column.column_type) {
-        .string, .blob, .geoshape, .json, .dense_vector, .sql_array => true,
+        .string, .blob, .geoshape, .json, .dense_vector, .sql_array, .numeric => true,
         .datetime, .integer, .number, .boolean, .geopoint => false,
     };
 }
@@ -1977,7 +1985,7 @@ fn fixedColumnWidth(column: runtime_schema.RelationalColumn) usize {
         .datetime, .integer, .number => 8,
         .boolean => 1,
         .geopoint => 16,
-        .string, .blob, .geoshape, .json, .dense_vector, .sql_array => 0,
+        .string, .blob, .geoshape, .json, .dense_vector, .sql_array, .numeric => 0,
     };
 }
 
@@ -2019,6 +2027,7 @@ fn serializedLenAdd(current: usize, additional: usize) !usize {
 }
 
 fn cellValueMatchesType(cell: Cell) bool {
+    if (cell.is_numeric and (cell.value_type != .bytes_val or cell.is_json or cell.is_dense_vector or cell.sql_array_element_type != null)) return false;
     if (cell.is_json and cell.value_type != .bytes_val) return false;
     if (cell.is_null) return true;
     const matches = switch (cell.value_type) {
@@ -2050,6 +2059,12 @@ fn cellValueIsSerializable(cell: Cell) bool {
 /// restore/read validation. A trusted physical checksum does not authorize a
 /// value outside its immutable declared SQL domain.
 fn validateSqlCell(column: runtime_schema.RelationalColumn, cell: Cell) !void {
+    if (cell.is_numeric != (column.column_type == .numeric)) return error.InvalidRelationalRow;
+    if (column.column_type == .numeric) {
+        if (column.sql_element_type != .numeric or !cellValueMatchesType(cell)) return error.InvalidRelationalRow;
+        if (!cell.is_null) _ = try @import("../../../common/sql_numeric_layout.zig").View.openAuthenticated(cell.value.bytes_val, .{});
+        return;
+    }
     if (column.column_type == .sql_array) {
         const kind = column.sql_element_type orelse return error.InvalidRelationalRow;
         if (cell.sql_array_element_type != kind or cell.is_json or cell.is_dense_vector or cell.value_type != .bytes_val)
@@ -2086,7 +2101,7 @@ fn validateSqlCell(column: runtime_schema.RelationalColumn, cell: Cell) !void {
         },
         .boolean => if (cell.value != .bool_val) return error.InvalidRelationalRow,
         .jsonb => if (cell.value != .bytes_val or !cell.is_json) return error.InvalidRelationalRow,
-        .numeric => return error.InvalidRelationalRow,
+        .numeric => return error.InvalidRelationalRow, // Requires the dedicated physical cell above.
     }
 }
 
@@ -2116,6 +2131,30 @@ test "relational index system SQL array restore checks canonical JSONB beyond va
     var wrong_element = cell;
     wrong_element.sql_array_element_type = .int32;
     try std.testing.expectError(error.InvalidRelationalRow, serializePreparedOrdinal(alloc, 1, &.{column}, &.{wrong_element}, @splat(0)));
+}
+
+test "relational index system NUMERIC scalar restore rejects malformed coefficients despite valid row checksums" {
+    const a = std.testing.allocator;
+    const column: runtime_schema.RelationalColumn = .{ .name = "n", .path = "n", .column_type = .numeric, .sql_element_type = .numeric };
+    const table: runtime_schema.TableSchema = .{ .version = 1, .storage_mode = .relational, .relational_columns = &.{column} };
+    var layout = try PhysicalLayout.init(a, table);
+    defer layout.deinit();
+    const malformed = [_][]const u8{
+        &.{ 0, 1, 0, 0, 0, 0, 0, 0, 0x27, 0x10 }, // Digit 10000.
+        &.{ 0, 1, 0, 0, 0, 0, 0, 0, 0, 0 }, // Untrimmed zero.
+        &.{ 0, 0, 0, 0, 0x40, 0, 0, 0 }, // Negative zero.
+        &.{ 0, 0, 0, 0, 0xd0, 0, 0, 0 }, // Noncanonical infinity scale.
+    };
+    for (malformed) |payload| {
+        const cell: Cell = .{ .ordinal = 0, .path = "n", .value_type = .bytes_val, .is_numeric = true, .value = .{ .bytes_val = payload } };
+        try std.testing.expectError(error.InvalidSqlBinaryRepresentation, serializeOrdinal(a, 1, &.{column}, &.{cell}, @splat(0)));
+        const row = try serializePreparedOrdinalWithLayout(a, 1, &.{column}, &.{cell}, @splat(0), &layout);
+        defer a.free(row);
+        _ = try ordinalRowViewTrusted(row, table, &layout);
+        try std.testing.expectError(error.InvalidSqlBinaryRepresentation, validateOrdinalWithLayout(row, table, &layout));
+        var cells: [1]?Cell = undefined;
+        try std.testing.expectError(error.InvalidSqlBinaryRepresentation, collectOrdinalCellsWithLayout(row, table, &layout, &cells));
+    }
 }
 
 test "relational index system NUMERIC array restore rejects malformed coefficients despite valid row checksums" {
@@ -2248,7 +2287,9 @@ fn validateCell(alloc: Allocator, cell: Cell) !void {
         !cellValueMatchesType(cell) or
         !cellValueIsSerializable(cell)) return error.InvalidRelationalRow;
     if (!cell.is_null and cell.value == .bytes_val) {
-        if (cell.sql_array_element_type) |kind| {
+        if (cell.is_numeric) {
+            _ = try @import("../../../common/sql_numeric_layout.zig").View.open(cell.value.bytes_val, .{});
+        } else if (cell.sql_array_element_type) |kind| {
             if (cell.is_json or cell.is_dense_vector) return error.InvalidRelationalRow;
             _ = try @import("../../../sql/array_storage.zig").validateCanonical(alloc, kind, cell.value.bytes_val, .{});
         } else if (cell.is_dense_vector) {
@@ -2378,7 +2419,11 @@ fn appendValidatedCellValue(
         .bool_val => try out.appendSlice(alloc, if (cell.value.bool_val) "true" else "false"),
         .geo_point => try appendFmt(alloc, out, "{{\"lat\":{d},\"lon\":{d}}}", .{ cell.value.geo_point.lat, cell.value.geo_point.lon }),
         .bytes_val => {
-            if (cell.sql_array_element_type) |kind| {
+            if (cell.is_numeric) {
+                var value = try @import("../../../sql/numeric_storage.zig").jsonValueAlloc(alloc, cell.value.bytes_val);
+                defer @import("../types.zig").deinitJsonValue(alloc, &value);
+                if (value == .number_string) try out.appendSlice(alloc, value.number_string) else try appendJsonString(alloc, out, value.string);
+            } else if (cell.sql_array_element_type) |kind| {
                 var decoded = try @import("../../../sql/array_storage.zig").decode(alloc, kind, cell.value.bytes_val, .{});
                 defer decoded.deinit();
                 const envelope = try @import("../../../sql/array_wire.zig").encodeAlloc(alloc, decoded.value, .{});

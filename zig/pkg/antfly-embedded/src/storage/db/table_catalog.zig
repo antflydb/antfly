@@ -143,6 +143,9 @@ pub const Catalog = struct {
             };
             if (self.schema_format_version < 18 and schema.requires_typed_expressions) return error.UnsupportedTableCapabilityVersion;
             if (self.schema_format_version < 19 and schema.requires_predicate_expressions) return error.UnsupportedTableCapabilityVersion;
+            if (self.schema_format_version < 20) for (schema.relational_columns) |column| {
+                if (column.column_type == .numeric or column.sql_element_type == .numeric) return error.UnsupportedTableCapabilityVersion;
+            };
             return;
         }
         if (self.storage_mode != .document or self.active_schema_version != 0)
@@ -207,6 +210,15 @@ test "relational index system SQL array catalog capabilities cannot be downgrade
 }
 
 test "table catalog has a stable canonical representation" {
+    for ([_]schema_mod.RelationalColumnType{ .numeric, .sql_array }) |kind| {
+        const table: schema_mod.TableSchema = .{ .version = 1, .storage_mode = .relational, .relational_columns = &.{.{ .name = "n", .path = "n", .column_type = kind, .sql_element_type = .numeric }} };
+        var catalog: Catalog = .{ .mode_initialized = true, .storage_mode = .relational, .active_schema_version = 1 };
+        try catalog.validateForSchema(table);
+        for (16..20) |version| {
+            catalog.schema_format_version = @intCast(version);
+            try std.testing.expectError(error.UnsupportedTableCapabilityVersion, catalog.validateForSchema(table));
+        }
+    }
     const expected = Catalog{
         .mode_initialized = true,
         .storage_mode = .relational,

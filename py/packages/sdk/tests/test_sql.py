@@ -37,16 +37,17 @@ from antfly import (
 )
 
 
-def test_array_column_schema_exports_explicit_element_identity_and_transport_constraints():
+@pytest.mark.parametrize("kind", list(SQLArrayElementType))
+def test_array_column_schema_exports_explicit_element_identity_and_transport_constraints(kind):
     schema = SQLArrayColumnSchema(
         type_=SQLArrayColumnSchemaType.SQL_ARRAY,
-        x_antfly_sql_type=SQLBuiltinType.INT64,
+        x_antfly_sql_type=kind,
         nullable=True,
     )
     schema.additional_properties["properties"] = {"values": {"minItems": 2}}
     expected = {
         "type": "sql_array",
-        "x-antfly-sql-type": "int64",
+        "x-antfly-sql-type": kind.value,
         "nullable": True,
         "properties": {"values": {"minItems": 2}},
     }

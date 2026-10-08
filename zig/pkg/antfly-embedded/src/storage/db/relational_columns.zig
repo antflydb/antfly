@@ -2487,7 +2487,7 @@ const Block = struct {
             .number => .f64_val,
             .boolean => .bool_val,
             .geopoint => .geo_point,
-            .string, .blob, .geoshape, .json, .dense_vector, .sql_array => .bytes_val,
+            .string, .blob, .geoshape, .json, .dense_vector, .sql_array, .numeric => .bytes_val,
         };
     }
 
@@ -2499,7 +2499,7 @@ const Block = struct {
             if (column_view.bitmaps.len != 0) for (values, 0..) |*value, i| {
                 if (column_view.bitmaps[null_bytes + i / 8] & (@as(u8, 1) << @intCast(i % 8)) != 0) {
                     const col = self.table.relational_columns[ordinal];
-                    value.* = .{ .ordinal = ordinal, .path = col.path, .value_type = self.valueType(ordinal), .is_json = col.is_json, .is_dense_vector = col.column_type == .dense_vector, .sql_array_element_type = if (col.column_type == .sql_array) col.sql_element_type else null, .is_null = true, .value = undefined };
+                    value.* = .{ .ordinal = ordinal, .path = col.path, .value_type = self.valueType(ordinal), .is_json = col.is_json, .is_dense_vector = col.column_type == .dense_vector, .is_numeric = col.column_type == .numeric, .sql_array_element_type = if (col.column_type == .sql_array) col.sql_element_type else null, .is_null = true, .value = undefined };
                 }
             };
             column_view.cells = values;
@@ -2645,7 +2645,7 @@ const Block = struct {
             if (source >= decoded.values.len) continue;
             const cell_value = decoded.values[source] orelse continue;
             if (values[row] != null or !column_view.present(row)) return error.InvalidColumnSegment;
-            values[row] = .{ .ordinal = ordinal, .path = col.path, .value_type = decoded.value_type, .is_json = col.is_json, .is_dense_vector = col.column_type == .dense_vector, .sql_array_element_type = if (col.column_type == .sql_array) col.sql_element_type else null, .value = cell_value };
+            values[row] = .{ .ordinal = ordinal, .path = col.path, .value_type = decoded.value_type, .is_json = col.is_json, .is_dense_vector = col.column_type == .dense_vector, .is_numeric = col.column_type == .numeric, .sql_array_element_type = if (col.column_type == .sql_array) col.sql_element_type else null, .value = cell_value };
         }
         for (first..end) |i| if ((values[i] != null) != column_view.present(i)) return error.InvalidColumnSegment;
         column_view.loaded_pages.set(page);

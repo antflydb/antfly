@@ -58,8 +58,8 @@ class RelationalScalarExpression:
         Attributes:
             op (RelationalExpressionOp):
             type_ (RelationalExpressionType | Unset):
-            sql_type (SQLBuiltinType | Unset): Exact PostgreSQL builtin identity for a relational root scalar column
-                or the element identity of a `sql_array` column.
+            sql_type (SQLBuiltinType | Unset): Exact PostgreSQL builtin identity for a relational root scalar column.
+                SQL array columns use SQLArrayElementType for their element identity.
                 Set the JSON Schema property's `x-antfly-sql-type` annotation to one of
                 these values. The underlying property type must match. SQL array storage
                 is not implied by this annotation. Existing unannotated schemas retain

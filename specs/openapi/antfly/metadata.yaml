@@ -1312,9 +1312,7 @@ components:
       description: Logical SQL result type. Integer values and numbers with element_type numeric are decimal strings to preserve exact precision in every client.
       enum: [string, uuid, integer, number, boolean, datetime, json, array, unknown]
     SQLArrayElementType:
-      type: string
-      description: Bound SQL scalar or array-element identity, including numeric widths and exact NUMERIC. Never inferred from JSON value shape.
-      enum: [text, int16, int32, int64, float32, float64, boolean, uuid, jsonb, numeric]
+      $ref: "schema.yaml#/components/schemas/SQLArrayElementType"
     SQLArrayDimension:
       type: object
       additionalProperties: false

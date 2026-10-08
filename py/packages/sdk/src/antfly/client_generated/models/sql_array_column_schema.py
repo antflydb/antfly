@@ -7,7 +7,7 @@ from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
 from ..models.sql_array_column_schema_type import SQLArrayColumnSchemaType
-from ..models.sql_builtin_type import SQLBuiltinType
+from ..models.sql_array_element_type import SQLArrayElementType
 from ..types import UNSET, Unset
 
 T = TypeVar("T", bound="SQLArrayColumnSchema")
@@ -30,18 +30,14 @@ class SQLArrayColumnSchema:
 
         Attributes:
             type_ (SQLArrayColumnSchemaType):
-            x_antfly_sql_type (SQLBuiltinType): Exact PostgreSQL builtin identity for a relational root scalar column
-                or the element identity of a `sql_array` column.
-                Set the JSON Schema property's `x-antfly-sql-type` annotation to one of
-                these values. The underlying property type must match. SQL array storage
-                is not implied by this annotation. Existing unannotated schemas retain
-                their original domains.
+            x_antfly_sql_type (SQLArrayElementType): Bound SQL scalar or array-element identity, including numeric widths
+                and exact NUMERIC. Never inferred from JSON value shape.
             nullable (bool | Unset):  Default: False.
             description (str | Unset):
     """
 
     type_: SQLArrayColumnSchemaType
-    x_antfly_sql_type: SQLBuiltinType
+    x_antfly_sql_type: SQLArrayElementType
     nullable: bool | Unset = False
     description: str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
@@ -75,7 +71,7 @@ class SQLArrayColumnSchema:
         d = dict(src_dict)
         type_ = SQLArrayColumnSchemaType(d.pop("type"))
 
-        x_antfly_sql_type = SQLBuiltinType(d.pop("x-antfly-sql-type"))
+        x_antfly_sql_type = SQLArrayElementType(d.pop("x-antfly-sql-type"))
 
         nullable = d.pop("nullable", UNSET)
 

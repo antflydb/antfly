@@ -138,6 +138,50 @@ test "relational index system SQL typed arrays survive LSM reopen and portable r
     }
 }
 
+test "relational index system NUMERIC public array schema survives LSM reopen and portable restore" {
+    const TestDirectory = @import("../../common/test_directory.zig").TestDirectory;
+    var directory = try TestDirectory.init("numeric-public-array");
+    defer directory.cleanup();
+    var target_directory = try TestDirectory.init("numeric-public-array-restore");
+    defer target_directory.cleanup();
+    var archive: std.ArrayListUnmanaged(u8) = .empty;
+    defer archive.deinit(alloc);
+    {
+        var db = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+        defer db.close();
+        try db.setSchemaJson(alloc,
+            \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"n":{"type":"sql_array","x-antfly-sql-type":"numeric","nullable":true}},"additionalProperties":false}}}}
+        );
+        try db.batch(.{ .writes = &.{.{ .key = "row", .value =
+            \\{"n":{"dimensions":[{"length":3,"lower_bound":-7}],"values":["9007199254740993.1200","NaN",null],"sql_nulls":[false,false,true]}}
+        }} });
+        try @import("../portable_backup.zig").exportPortable(alloc, db.core.store, &archive);
+    }
+    var reopened = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+    defer reopened.close();
+    var restored = try db_mod.DB.open(alloc, target_directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+    defer restored.close();
+    try restored.importPortableIntoEmpty(alloc, archive.items, @import("doc_identity.zig").default_namespace);
+    for ([_]*db_mod.DB{ &reopened, &restored }) |db| {
+        try std.testing.expectEqual(@import("../schema.zig").storage_format_version, db.core.table_catalog.schema_format_version);
+        try std.testing.expectEqual(@import("../../common/sql_builtin_type.zig").Type.numeric, db.core.schema.?.relational_columns[0].sql_element_type.?);
+        const bytes = (try db.get(alloc, "row")).?;
+        defer alloc.free(bytes);
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
+        defer parsed.deinit();
+        var array = try @import("../../sql/array_wire.zig").decode(alloc, .numeric, parsed.value.object.get("n").?, .{});
+        defer array.deinit();
+        try std.testing.expectEqual(@as(i32, -7), array.value.dimensions[0].lower);
+        try std.testing.expectEqual(@as(u16, 4), array.value.elements[0].numeric.?.scale);
+        try std.testing.expectEqual(@import("../../sql/numeric_value.zig").Kind.nan, array.value.elements[1].numeric.?.kind);
+        try std.testing.expect(array.value.elements[2].sql_null);
+        var context: @import("../../sql/numeric_value.zig").Context = .{ .alloc = alloc };
+        const text = try @import("../../sql/numeric_value.zig").format(&context, array.value.elements[0].numeric.?.*);
+        defer alloc.free(text);
+        try std.testing.expectEqualStrings("9007199254740993.1200", text);
+    }
+}
+
 test "relational index system SQL public scalar schema survives LSM reopen and rejects domain reinterpretation" {
     const json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"n":{"type":"integer","x-antfly-sql-type":"int16"},"f":{"type":"number","x-antfly-sql-type":"float32"}},"additionalProperties":false}}}}

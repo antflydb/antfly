@@ -83,6 +83,42 @@ pub const View = struct {
         return view;
     }
 
+    /// Compare canonical pinned views without materializing coefficients.
+    /// PostgreSQL orders NaN above infinity and treats equal NaNs as equal.
+    pub fn order(self: View, other: View, budget: anytype) !std.math.Order {
+        try budget.charge(1);
+        const Rank = struct {
+            fn rank(kind: Kind) u8 {
+                return switch (kind) {
+                    .negative_infinity => 0,
+                    .finite => 1,
+                    .positive_infinity => 2,
+                    .nan => 3,
+                };
+            }
+        };
+        const kinds = std.math.order(Rank.rank(self.kind), Rank.rank(other.kind));
+        if (kinds != .eq or self.kind != .finite) return kinds;
+        if (self.negative != other.negative) return if (self.negative) .lt else .gt;
+        var magnitude = std.math.order(self.count, other.count);
+        if (self.count != 0 and other.count != 0) {
+            magnitude = std.math.order(self.weight, other.weight);
+            if (magnitude == .eq) {
+                for (0..@min(self.count, other.count)) |i| {
+                    try budget.charge(1);
+                    magnitude = std.math.order(self.group(i), other.group(i));
+                    if (magnitude != .eq) break;
+                }
+                if (magnitude == .eq) magnitude = std.math.order(self.count, other.count);
+            }
+        }
+        return if (!self.negative) magnitude else switch (magnitude) {
+            .lt => .gt,
+            .eq => .eq,
+            .gt => .lt,
+        };
+    }
+
     /// Same identity bytes as the immutable logical NUMERIC kernel. Scale is
     /// presentation, not equality; coefficient bytes are already big endian.
     pub fn updateLogicalHash(self: View, hasher: anytype) void {

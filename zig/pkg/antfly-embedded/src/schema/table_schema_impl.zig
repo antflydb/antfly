@@ -260,7 +260,7 @@ pub const DocumentProperty = struct {
     antfly_index: ?bool = null,
     integer_only: bool = false,
     format: ?[]const u8 = null,
-    sql_type: ?relational_wire.SQLBuiltinType = null,
+    sql_type: ?@import("../common/sql_builtin_type.zig").Type = null,
     allows_null: bool = false,
     const_value: ?[]const u8 = null,
     minimum: ?f64 = null,
@@ -3185,16 +3185,23 @@ fn parseAnonymousPropertyKeywords(alloc: std.mem.Allocator, context: SchemaConte
         ParsedTypeSpec{};
     const field_type = type_spec.field_type;
     errdefer if (field_type) |owned| alloc.free(owned);
-    const sql_type: ?relational_wire.SQLBuiltinType = if (object.get("x-antfly-sql-type")) |value| blk: {
+    const sql_type: ?@import("../common/sql_builtin_type.zig").Type = if (object.get("x-antfly-sql-type")) |value| blk: {
         if (value != .string) return error.InvalidSchemaUpdateRequest;
-        const kind = std.meta.stringToEnum(relational_wire.SQLBuiltinType, value.string) orelse return error.InvalidSchemaUpdateRequest;
         const physical = field_type orelse return error.InvalidSchemaUpdateRequest;
+        const Type = @import("../common/sql_builtin_type.zig").Type;
+        // Public array element identities are a separate generated contract:
+        // their numeric domain does not imply scalar schema activation.
+        const kind = if (std.mem.eql(u8, physical, "sql_array"))
+            Type.fromWire(std.meta.stringToEnum(relational_wire.SQLArrayElementType, value.string) orelse return error.InvalidSchemaUpdateRequest)
+        else
+            Type.fromWire(std.meta.stringToEnum(relational_wire.SQLBuiltinType, value.string) orelse return error.InvalidSchemaUpdateRequest);
         const matches = std.mem.eql(u8, physical, "sql_array") or switch (kind) {
             .text, .uuid => std.mem.eql(u8, physical, "string") or std.mem.eql(u8, physical, "keyword") or std.mem.eql(u8, physical, "text"),
             .int16, .int32, .int64 => type_spec.integer_only or std.mem.eql(u8, physical, "integer"),
             .float32, .float64 => !type_spec.integer_only and (std.mem.eql(u8, physical, "numeric") or std.mem.eql(u8, physical, "number")),
             .boolean => std.mem.eql(u8, physical, "boolean"),
             .jsonb => std.mem.eql(u8, physical, "json"),
+            .numeric => false,
         };
         if (!matches) return error.InvalidSchemaUpdateRequest;
         break :blk kind;

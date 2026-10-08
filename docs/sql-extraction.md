@@ -5273,3 +5273,61 @@ PostgreSQL 18 also re-verifies 893 arithmetic contracts, 65 binary senders and
 47 receivers. Formatting, whitespace and original inventory integrity checks
 pass; dispositions remain 448 implemented, 136 rejected, 73 superseded and
 929 unresolved.
+
+### Native exact NUMERIC scalar storage and ordered tuples
+
+Native relational rows now have a distinct `numeric` physical column type bound
+to the immutable SQL NUMERIC descriptor. Canonical PostgreSQL binary payloads
+remain variable-width ordinal cells, not f64 or per-cell JSON. Schema/catalog
+capability 20 gates both scalar NUMERIC and NUMERIC array descriptors; older
+capabilities cannot silently adopt them. Unannotated native/document `number`
+fields retain their established floating-point semantics.
+
+Prepared rows consume original JSON number lexemes or explicit decimal strings
+without an intermediate f64. Canonical row encoding retains display scale and
+special values, while semantic hashes use typed logical identity independently
+of scale. Trusted projections borrow canonical binary; strict restore validates
+all coefficients even when outer AROW framing/checksums are valid. Explicit
+SQL NULL and absent cells retain their existing distinct presence metadata.
+
+Composite native index keys use the shared borrowed NUMERIC ordered-key boundary
+for row cells and typed bounds. They preserve ASC/DESC and default NULL placement,
+delimit document suffixes, and roll back partial tuple output on invalid input.
+The native tuple fixture compares all pairs of 235 PostgreSQL dense ranks in
+both directions and checks row-built keys against typed bounds. Reserved output
+capacity permits tuple construction without allocating coefficient buffers.
+The borrowed comparison kernel is also checked against those independent ranks.
+Datetime tuple-prefix parsing now consumes its complete 128-bit physical field.
+
+Native preparation matches all 65 PostgreSQL sender payloads byte for byte and
+round-trips through logical JSON and restore. Allocation-fault tests cover wide
+decimals, specials, NULL and absent values. A cold LSM column projection fixture
+retains exact precision, scale and logical hashes across maintenance/reopen with
+zero primary-row reads. PostgreSQL 18 independently re-verifies 893 arithmetic
+contracts, 65 senders/47 receivers and 235 ordering ranks.
+
+This does not yet activate public native SQL NUMERIC columns. Remaining work
+includes generated public schema/API types and normalization, exact typed SQL
+read/mutation binding, precision/scale declarations, schema-expression arithmetic
+and casts under a shared request work budget, and exact native predicate kernels.
+Generic document predicates reject NUMERIC cells rather than comparing binary
+as text or rounding through f64. Inventory dispositions are unchanged: the new
+physical boundary alone is not evidence that those public SQL cases are complete.
+
+Public NUMERIC arrays now use the canonical generated SQLArrayElementType in
+their schema annotation, rather than the narrower scalar SQLBuiltinType enum.
+The definition lives in the schema specification and metadata aliases it, keeping
+the generated Zig dependency direction acyclic. Python, TypeScript and Go SDK
+contracts retain the NUMERIC identity. Native public schema publication, cold
+LSM reopen and portable restore retain exact coefficients, scale, dimensions,
+NaN and SQL NULL for those arrays.
+
+Validation passes the full SQL, pgwire, OpenAPI and native relational-index gates:
+583 local SQL tests (three existing skips), 226 server SQL tests, 171 native local
+contracts and one server contract. The additional public NUMERIC-array
+reopen/restore contract passes separately. The lake integration gate passes
+79 local and 85 server contracts, including datetime tuple-prefix delimiting.
+SDK SQL gates pass 34 Python and 35 TypeScript tests; TypeScript typechecking
+and all Go SDK package tests also pass. The pinned package-manager test launcher
+remained live without starting Vitest; the same pinned Node runtime ran the
+installed Vitest entrypoint directly. No parity dispositions changed.
