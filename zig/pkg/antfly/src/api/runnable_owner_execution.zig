@@ -15,7 +15,7 @@ pub const State = struct {
     cleanup_in_use: std.atomic.Value(bool) = .init(false),
 
     pub fn port(self: *State) abi.Owner {
-        return .{ .context = &self.owner, .retain = retain, .release = release, .start = start, .checkpoint = checkpoint, .park = park, .enter = enter, .finish = finish, .resize_team = resizeTeam };
+        return .{ .context = &self.owner, .retain = retain, .release = release, .start = start, .checkpoint = checkpoint, .park = park, .enter = enter, .finish = finish, .resize_team = resizeTeam, .reserve_completion = reserveCompletion, .activate_completion = activateCompletion };
     }
 };
 
@@ -26,6 +26,10 @@ const Capsule = struct {
     cancellation: runtime.http_abi.CancellationView,
     execution: runnable.Execution = .{},
     cleanup: bool = false,
+    // Foreign Receiver.io() may point back into the receiver. Keep these at
+    // stable capsule addresses until every consumer is joined and finish runs.
+    completion_io: ?runtime.io_abi.Receiver = null,
+    completion_clock_io: ?runtime.io_abi.Receiver = null,
 
     fn cancelled(raw: *const anyopaque) bool {
         const self: *const Capsule = @ptrCast(@alignCast(raw));
@@ -94,6 +98,38 @@ fn startChecked(raw: *anyopaque, options: *const abi.Start) !void {
 }
 fn checkpoint(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {
     capsule(raw).execution.checkpoint() catch |err| return runtime.error_abi.statusFromError(err);
+    return .ok;
+}
+fn reserveCompletion(raw: *anyopaque, options: *const abi.Completion) callconv(.c) runtime.error_abi.Status {
+    reserveCompletionChecked(raw, options) catch |err| return runtime.error_abi.statusFromError(err);
+    return .ok;
+}
+fn reserveCompletionChecked(raw: *anyopaque, options: *const abi.Completion) !void {
+    try options.validate();
+    const value = capsule(raw);
+    if (value.cleanup) return error.UnsupportedOperation;
+    // Never replace an executor already retained by the execution.
+    if (value.completion_io != null) return error.InvalidRunnableTransition;
+    const io = try options.io.receive();
+    const clock_io = if (options.clock_io) |borrow| try borrow.receive() else null;
+    value.completion_io = io;
+    value.completion_clock_io = clock_io;
+    errdefer {
+        value.completion_io = null;
+        value.completion_clock_io = null;
+    }
+    try value.execution.reserveCompletion(.{
+        .io = value.completion_io.?.io(),
+        .clock_io = if (value.completion_clock_io) |*clock| clock.io() else null,
+        .native_now_ns = if (options.native_deadline != 0) value.state.native_now_ns else null,
+        .deadline_ns = options.deadline_ns,
+        .allow_wait = true,
+    });
+}
+fn activateCompletion(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {
+    const value = capsule(raw);
+    if (value.cleanup) return runtime.error_abi.statusFromError(error.UnsupportedOperation);
+    value.execution.activateCompletion() catch |err| return runtime.error_abi.statusFromError(err);
     return .ok;
 }
 fn resizeTeam(raw: *anyopaque, slots: usize) callconv(.c) runtime.error_abi.Status {
@@ -604,4 +640,75 @@ test "runnable execution fanout team admission rejects unsupported and excessive
     try std.testing.expectEqual(@as(usize, 1), owner.owner.scheduler.stats().operations);
     try std.testing.expectEqual(retained, owner.owner.scheduler.stats().retained_bytes);
     team.finish();
+}
+
+test "runnable execution completion ABI retains one capsule through foreground cancellation and close" {
+    TestClock.now_ns = 0;
+    defer TestClock.now_ns = 0;
+    var owner: State = .{ .owner_alloc = std.testing.allocator, .owner = try runnable.NodeOwner.init(.{ .slots = 3, .max_operations = 8 }), .native_now_ns = TestClock.now };
+    defer owner.owner.deinit();
+    const port = owner.port();
+    const io = std.testing.io;
+    const borrow = runtime.native_abi.IoBorrow.init(&io);
+    const Cancel = struct {
+        fn requested(raw: ?*const anyopaque) callconv(.c) u8 {
+            return @intFromBool(@as(*const bool, @ptrCast(@alignCast(raw.?))).*);
+        }
+    };
+    var cancelled = false;
+    var handle: ?*anyopaque = null;
+    try std.testing.expect(port.start(port.context, &.{ .io = &borrow, .class = @backingInt(abi.Class.write), .has_deadline = 1, .native_deadline = 1, .deadline_ns = 10, .retained_bytes = 64, .cancellation = .{ .context = &cancelled, .is_cancelled = Cancel.requested }, .out_handle = &handle }).isOk());
+    defer port.finish(handle.?);
+    const retained = owner.owner.scheduler.stats().retained_bytes;
+    const child = try abi.Borrowed.fromOwner(port, handle.?, 1, .write);
+    try child.reserveCompletion(&.{ .io = &borrow, .native_deadline = 1, .deadline_ns = 100 });
+    try std.testing.expectError(error.InvalidRunnableTransition, child.reserveCompletion(&.{ .io = &borrow, .native_deadline = 1, .deadline_ns = 200 }));
+    try port.activateCompletion(handle.?);
+    try std.testing.expectError(error.InvalidRunnableTransition, child.activateCompletion());
+    cancelled = true;
+    TestClock.now_ns = 11;
+    try std.testing.expect(port.park(handle.?, @backingInt(abi.Wait.resource)).isOk());
+    var health: ?*anyopaque = null;
+    try std.testing.expect(port.start(port.context, &.{ .io = &borrow, .class = @backingInt(abi.Class.control), .allow_wait = 0, .out_handle = &health }).isOk());
+    port.finish(health.?);
+    owner.owner.close();
+    try std.testing.expect(port.enter(handle.?, @backingInt(abi.Class.write)).isOk());
+    try std.testing.expect(port.checkpoint(handle.?).isOk());
+    try std.testing.expectEqual(@as(usize, 1), owner.owner.scheduler.stats().operations);
+    try std.testing.expectEqual(retained, owner.owner.scheduler.stats().retained_bytes);
+    try std.testing.expect(port.park(handle.?, @backingInt(abi.Wait.resource)).isOk());
+    TestClock.now_ns = 101;
+    try std.testing.expectEqual(error.DeadlineExceeded, runtime.error_abi.errorFromStatus(port.enter(handle.?, @backingInt(abi.Class.write))));
+    try std.testing.expectEqual(@as(usize, 1), owner.owner.scheduler.stats().operations);
+    try std.testing.expectEqual(retained, owner.owner.scheduler.stats().retained_bytes);
+    try std.testing.expectEqual(@as(usize, 0), owner.owner.scheduler.stats().runnable_slots);
+}
+
+test "runnable execution completion ABI checks foreground fences and denies cleanup authority" {
+    const io = std.testing.io;
+    const borrow = runtime.native_abi.IoBorrow.init(&io);
+    for (0..3) |scenario| {
+        TestClock.now_ns = 0;
+        defer TestClock.now_ns = 0;
+        var owner: State = .{ .owner_alloc = std.testing.allocator, .owner = try runnable.NodeOwner.init(.{ .slots = 3, .max_operations = 8 }), .native_now_ns = TestClock.now };
+        defer owner.owner.deinit();
+        const port = owner.port();
+        var handle: ?*anyopaque = null;
+        const cleanup = scenario == 2;
+        try std.testing.expect(port.start(port.context, &.{ .io = &borrow, .class = @backingInt(if (cleanup) abi.Class.control else abi.Class.write), .has_deadline = 1, .native_deadline = 1, .deadline_ns = 10, .cleanup = @intFromBool(cleanup), .allow_wait = @intFromBool(!cleanup), .out_handle = &handle }).isOk());
+        defer port.finish(handle.?);
+        if (cleanup) {
+            try std.testing.expectError(error.UnsupportedOperation, port.reserveCompletion(handle.?, &.{ .io = &borrow, .native_deadline = 1, .deadline_ns = 100 }));
+            try std.testing.expectError(error.UnsupportedOperation, port.activateCompletion(handle.?));
+        } else if (scenario == 0) {
+            TestClock.now_ns = 11;
+            try std.testing.expectError(error.DeadlineExceeded, port.reserveCompletion(handle.?, &.{ .io = &borrow, .native_deadline = 1, .deadline_ns = 100 }));
+            try std.testing.expect(capsule(handle.?).completion_io == null);
+        } else {
+            try port.reserveCompletion(handle.?, &.{ .io = &borrow, .native_deadline = 1, .deadline_ns = 100 });
+            TestClock.now_ns = 11;
+            try std.testing.expectError(error.DeadlineExceeded, port.activateCompletion(handle.?));
+        }
+        try std.testing.expectEqual(@as(usize, 1), owner.owner.scheduler.stats().operations);
+    }
 }

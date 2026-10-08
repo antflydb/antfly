@@ -437,3 +437,17 @@ cleanup after completion cancellation before storage work. This proves task/root
 lifetime mechanics, not physical durability or node-wide thread bounds. No
 production consumer activates completion; checked exposure, pre-acceptance task
 reservation, physical WAL/Raft waits and durable recovery transfer remain required.
+
+
+Runnable ABI 5 now exposes checked optional completion reservation/activation.
+The API owner keeps completion Io/clock receivers at stable capsule addresses;
+original fences govern handoff, cleanup roots cannot claim completion authority,
+and no fresh admission is granted. The 38 direct ABI/runtime contracts and 28
+executed owner/worker/cleanup contracts pass on native and pinned Nix/glibc.
+Four SQL-team contracts also execute on Linux; the native SQL target is cached. See
+[completion capability receipts](receipts/2026-10-08/completion-capability/README.md).
+Independent foreign Io dispatch/full archive coverage remains pending. Production
+pre-acceptance task/resource reservation, storage wait integration, ambiguous
+outcome joins and authoritative recovery transfer remain unimplemented. No
+production consumer activates completion; write suspension/default enablement
+remain withheld.

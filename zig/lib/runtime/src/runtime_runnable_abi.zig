@@ -9,7 +9,7 @@ const native = @import("runtime_native_abi.zig");
 const errors = @import("runtime_error_abi.zig");
 const http = @import("runtime_http_abi.zig");
 
-pub const abi_version: u32 = 4;
+pub const abi_version: u32 = 5;
 pub const Class = enum(c_int) { query, write, inference, background, control };
 pub const Wait = enum(c_int) { resource, output };
 
@@ -43,6 +43,27 @@ pub const Start = extern struct {
     }
 };
 
+/// Trusted completion executor, borrowed through the owning finish. Its finite
+/// deadline is independent of foreground cancellation. Reserve before any
+/// potentially durable acceptance; activate only after the owner has arranged
+/// task and resource lifetime through completion or authoritative transfer.
+pub const Completion = extern struct {
+    version: u32 = abi_version,
+    struct_size: u32 = @sizeOf(@This()),
+    io: *const native.IoBorrow,
+    clock_io: ?*const native.IoBorrow = null,
+    deadline_ns: u64,
+    native_deadline: u8 = 0,
+    reserved: [7]u8 = @splat(0),
+
+    pub fn validate(self: *const Completion) !void {
+        // Inspect the prefix before accessing fields from a foreign layout.
+        if (self.version != abi_version or self.struct_size != @sizeOf(Completion)) return error.UnsupportedVersion;
+        if (self.native_deadline > 1 or !std.mem.allEqual(u8, &self.reserved, 0)) return error.InvalidArgument;
+        if (self.native_deadline != 0 and self.clock_io != null) return error.InvalidArgument;
+    }
+};
+
 pub const Owner = extern struct {
     version: u32 = abi_version,
     struct_size: u32 = @sizeOf(@This()),
@@ -57,6 +78,23 @@ pub const Owner = extern struct {
     /// Optional dynamic CPU team capability. All prior children must join
     /// before resizing. Absent support fails explicitly without new admission.
     resize_team: ?*const fn (*anyopaque, usize) callconv(.c) errors.Status = null,
+    reserve_completion: ?*const fn (*anyopaque, *const Completion) callconv(.c) errors.Status = null,
+    activate_completion: ?*const fn (*anyopaque) callconv(.c) errors.Status = null,
+
+    pub fn reserveCompletion(self: Owner, handle: *anyopaque, options: *const Completion) !void {
+        if (!self.valid()) return error.UnsupportedVersion;
+        try options.validate();
+        const callback = self.reserve_completion orelse return error.UnsupportedOperation;
+        const status = callback(handle, options);
+        if (!status.isOk()) return errors.errorFromStatus(status);
+    }
+
+    pub fn activateCompletion(self: Owner, handle: *anyopaque) !void {
+        if (!self.valid()) return error.UnsupportedVersion;
+        const callback = self.activate_completion orelse return error.UnsupportedOperation;
+        const status = callback(handle);
+        if (!status.isOk()) return errors.errorFromStatus(status);
+    }
 
     pub fn resizeTeam(self: Owner, handle: *anyopaque, slots: usize) !void {
         if (!self.valid()) return error.UnsupportedVersion;
@@ -114,6 +152,23 @@ pub const Borrowed = extern struct {
     /// before exposing child output to the parent phase.
     enter: *const fn (*anyopaque, c_int) callconv(.c) errors.Status,
     resize_team: ?*const fn (*anyopaque, usize) callconv(.c) errors.Status = null,
+    reserve_completion: ?*const fn (*anyopaque, *const Completion) callconv(.c) errors.Status = null,
+    activate_completion: ?*const fn (*anyopaque) callconv(.c) errors.Status = null,
+
+    pub fn reserveCompletion(self: Borrowed, options: *const Completion) !void {
+        try self.validate();
+        try options.validate();
+        const callback = self.reserve_completion orelse return error.UnsupportedOperation;
+        const status = callback(self.context, options);
+        if (!status.isOk()) return errors.errorFromStatus(status);
+    }
+
+    pub fn activateCompletion(self: Borrowed) !void {
+        try self.validate();
+        const callback = self.activate_completion orelse return error.UnsupportedOperation;
+        const status = callback(self.context);
+        if (!status.isOk()) return errors.errorFromStatus(status);
+    }
 
     /// Update this snapshot only after the parent has admitted the new team.
     /// Quiesce every prior borrower first; copies do not track later resizing.
@@ -149,6 +204,8 @@ pub const Borrowed = extern struct {
             .park = owner.park,
             .enter = owner.enter,
             .resize_team = owner.resize_team,
+            .reserve_completion = owner.reserve_completion,
+            .activate_completion = owner.activate_completion,
         };
         try borrow.validate();
         return borrow;
@@ -378,4 +435,61 @@ test "runnable team ABI foreign readers reject header-only legacy and truncated 
     borrow_header.struct_size = @sizeOf(Header);
     try std.testing.expectError(error.UnsupportedVersion, Borrowed.read(borrow));
     try std.testing.expectError(error.UnsupportedVersion, Transfer.initFrom(borrow, .inference));
+}
+
+test "completion ABI rejects old prefixes and malformed options before callbacks" {
+    const Fake = struct {
+        calls: usize = 0,
+        fn check(_: *anyopaque) callconv(.c) errors.Status {
+            return .ok;
+        }
+        fn transition(_: *anyopaque, _: c_int) callconv(.c) errors.Status {
+            return .ok;
+        }
+        fn reserve(raw: *anyopaque, _: *const Completion) callconv(.c) errors.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return errors.statusFromError(error.DeadlineExceeded);
+        }
+        fn activate(raw: *anyopaque) callconv(.c) errors.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return errors.statusFromError(error.Canceled);
+        }
+    };
+    var fake: Fake = .{};
+    var borrowed: Borrowed = .{ .context = &fake, .cpu_slots = 1, .parent_class = @backingInt(Class.write), .checkpoint = Fake.check, .park = Fake.transition, .enter = Fake.transition };
+    var options: Completion = .{ .io = @ptrFromInt(8), .deadline_ns = 10 };
+    try std.testing.expectError(error.UnsupportedOperation, borrowed.reserveCompletion(&options));
+    try std.testing.expectError(error.UnsupportedOperation, borrowed.activateCompletion());
+    borrowed.reserve_completion = Fake.reserve;
+    borrowed.activate_completion = Fake.activate;
+    options.version = 4;
+    try std.testing.expectError(error.UnsupportedVersion, borrowed.reserveCompletion(&options));
+    options.version = abi_version;
+    options.struct_size -= 1;
+    try std.testing.expectError(error.UnsupportedVersion, borrowed.reserveCompletion(&options));
+    options.struct_size = @sizeOf(Completion);
+    options.native_deadline = 2;
+    try std.testing.expectError(error.InvalidArgument, borrowed.reserveCompletion(&options));
+    options.native_deadline = 1;
+    options.clock_io = @ptrFromInt(8);
+    try std.testing.expectError(error.InvalidArgument, borrowed.reserveCompletion(&options));
+    options.clock_io = null;
+    options.reserved[0] = 1;
+    try std.testing.expectError(error.InvalidArgument, borrowed.reserveCompletion(&options));
+    options.reserved = @splat(0);
+    borrowed.version = 4;
+    try std.testing.expectError(error.UnsupportedVersion, borrowed.reserveCompletion(&options));
+    try std.testing.expectError(error.UnsupportedVersion, borrowed.activateCompletion());
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    borrowed.version = abi_version;
+    try std.testing.expectError(error.DeadlineExceeded, borrowed.reserveCompletion(&options));
+    try std.testing.expectError(error.Canceled, borrowed.activateCompletion());
+    try std.testing.expectEqual(@as(usize, 2), fake.calls);
+    const Prefix = extern struct { version: u32, struct_size: u32 };
+    var old: Prefix align(@alignOf(Owner)) = .{ .version = 4, .struct_size = @sizeOf(Prefix) };
+    try std.testing.expectError(error.UnsupportedVersion, Owner.read(@ptrCast(&old)));
+    try std.testing.expectError(error.UnsupportedVersion, Borrowed.read(@ptrCast(&old)));
+    try std.testing.expectError(error.UnsupportedVersion, (@as(*const Completion, @ptrCast(&old))).validate());
 }
