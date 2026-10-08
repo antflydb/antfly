@@ -109,6 +109,23 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("antfly-inference-owner-handoff-test", "Run real shared-owner inference handoff and model-lock control progress contracts")
         .dependOn(&b.addRunArtifact(inference_owner_tests).step);
+    const http_cleanup_root = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/api/runnable_http_cleanup_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    http_cleanup_root.addImport("antfly_runtime_abi", antfly_imports.runtime_abi);
+    http_cleanup_root.addImport("httpx", antfly_imports.httpx);
+    http_cleanup_root.addImport("antfly_local_sources", inference_owner_sources);
+    const http_cleanup_tests = b.addTest(.{
+        .name = "http-cleanup-owner-tests",
+        .root_module = http_cleanup_root,
+        .filters = &.{"runnable HTTP cleanup"},
+        .max_rss = 2 * 1024 * 1024 * 1024,
+    });
+    b.step("antfly-http-cleanup-owner-test", "Run actual listener output through shared protected cleanup ownership")
+        .dependOn(&b.addRunArtifact(http_cleanup_tests).step);
     const worker_owner_rpc = b.createModule(.{
         .root_source_file = b.path("pkg/inference/src/host/worker_rpc.zig"),
         .target = target,

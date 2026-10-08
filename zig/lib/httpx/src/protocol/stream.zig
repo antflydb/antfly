@@ -254,6 +254,8 @@ pub const StreamManager = struct {
     is_client: bool = true,
 
     /// Connection-level send window.
+    /// Peer INITIAL_WINDOW_SIZE applies to future streams as well as live ones.
+    initial_send_window: i32 = 65535,
     connection_send_window: i32 = 65535,
     /// Connection-level receive window.
     connection_recv_window: i32 = 65535,
@@ -317,6 +319,7 @@ pub const StreamManager = struct {
 
         const stream = try self.allocator.create(Stream);
         stream.* = Stream.init(id);
+        stream.send_window = self.initial_send_window;
         stream.state = .open;
         errdefer self.allocator.destroy(stream);
         try self.streams.put(self.allocator, id, stream);
@@ -363,6 +366,7 @@ pub const StreamManager = struct {
 
         const stream = try self.allocator.create(Stream);
         stream.* = Stream.init(id);
+        stream.send_window = self.initial_send_window;
         errdefer self.allocator.destroy(stream);
         try self.streams.put(self.allocator, id, stream);
         return stream;
@@ -399,6 +403,7 @@ pub const StreamManager = struct {
     pub fn applyInitialWindowSizeChange(self: *Self, io: Io, old_size: u32, new_size: u32) !void {
         if (new_size > std.math.maxInt(i32) or old_size > std.math.maxInt(i32)) return error.FlowControlError;
         const delta = @as(i32, @intCast(new_size)) - @as(i32, @intCast(old_size));
+        self.initial_send_window = @intCast(new_size);
         var it = self.streams.iterator();
         while (it.next()) |entry| {
             const s = entry.value_ptr.*;

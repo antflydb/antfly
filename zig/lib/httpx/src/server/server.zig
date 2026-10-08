@@ -136,6 +136,16 @@ pub const ConnectionExecution = enum {
     serial,
 };
 
+/// Listener-owned execution capability for bounded transport cleanup. The
+/// listener joins every writer before retiring the borrowed callback context.
+pub const CleanupExecution = struct {
+    context: *anyopaque,
+    start: *const fn (*anyopaque, Io, u64, u64) anyerror!*anyopaque,
+    park: *const fn (*anyopaque, *anyopaque) anyerror!void,
+    enter: *const fn (*anyopaque, *anyopaque) anyerror!void,
+    finish: *const fn (*anyopaque, *anyopaque) void,
+};
+
 /// Server configuration.
 pub const ServerConfig = struct {
     host: []const u8 = "127.0.0.1",
@@ -151,6 +161,8 @@ pub const ServerConfig = struct {
     body_read_timeout_ms: u64 = 120_000,
     /// Per-write socket timeout for response delivery. Zero disables it.
     response_write_timeout_ms: u64 = 30_000,
+    /// Independent, fail-fast protected execution for errors and terminal resets.
+    cleanup_execution: ?CleanupExecution = null,
     keep_alive_timeout_ms: u64 = 60_000,
     max_connections: u32 = 1000,
     /// Aggregate handler tasks reserved from `HttpRuntime`. Zero uses
@@ -2183,13 +2195,25 @@ pub const Server = struct {
     }
 
     fn cancelH2Stream(h2: *H2Connection, sock: *Socket, stream_id: u31) void {
+        cancelH2StreamWithExecution(null, h2, sock, stream_id);
+    }
+
+    fn cancelH2StreamWithExecution(execution: ?CleanupExecution, h2: *H2Connection, sock: *Socket, stream_id: u31) void {
         // Reset is fixed-size transport cleanup, independent of the expired
         // foreground request. Do not let a contended frame lock or stalled
         // peer turn cancellation into an unbounded wait.
         const previous = h2.io.swapCancelProtection(.blocked);
         defer _ = h2.io.swapCancelProtection(previous);
         var budget = CleanupBudget{ .io = h2.io, .deadline_ms = deadlineAfter(h2.io, 250) };
+        budget.start(execution) catch {
+            sock.shutdown();
+            return;
+        };
+        defer budget.deinit();
         const control = budget.view();
+        var writer = @import("../net/socket.zig").ControlledWriter{ .socket = sock, .control = control };
+        writer.beginConnectionWrite();
+        defer writer.finishConnectionWrite() catch sock.shutdown();
         control.lock(&h2.write_mutex, h2.io) catch {
             sock.shutdown();
             return;
@@ -2198,7 +2222,6 @@ pub const Server = struct {
         const stream = h2.stream_manager.getStream(stream_id) orelse return;
         if (stream.state == .idle or stream.state == .closed) return;
         stream.reset();
-        var writer = @import("../net/socket.zig").ControlledWriter{ .socket = sock, .control = control };
         h2.sendRstStream(&writer, stream_id, .cancel) catch {
             // Even a rejected first write leaves the peer without a terminal
             // stream signal. Wake the connection owner and retire this socket.
@@ -2209,6 +2232,25 @@ pub const Server = struct {
     const CleanupBudget = struct {
         io: Io,
         deadline_ms: i64,
+        execution: ?CleanupExecution = null,
+        handle: ?*anyopaque = null,
+        fn start(self: *@This(), execution: ?CleanupExecution) !void {
+            const owner = execution orelse return;
+            self.execution = owner;
+            self.handle = try owner.start(owner.context, self.io, @as(u64, @intCast(@max(0, self.deadline_ms))) *| std.time.ns_per_ms, 4096);
+        }
+        fn deinit(self: *@This()) void {
+            if (self.handle) |handle| self.execution.?.finish(self.execution.?.context, handle);
+            self.handle = null;
+        }
+        fn park(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try self.execution.?.park(self.execution.?.context, self.handle.?);
+        }
+        fn enter(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try self.execution.?.enter(self.execution.?.context, self.handle.?);
+        }
         fn check(raw: ?*anyopaque) @import("../net/socket.zig").WriteControl.Error!void {
             const self: *@This() = @ptrCast(@alignCast(raw.?));
             if (milliTimestamp(self.io) >= self.deadline_ms) return error.Timeout;
@@ -2219,7 +2261,7 @@ pub const Server = struct {
             return @intCast(@max(0, self.deadline_ms - milliTimestamp(self.io)));
         }
         fn view(self: *@This()) @import("../net/socket.zig").WriteControl {
-            return .{ .ptr = self, .check_fn = check, .remaining_ms_fn = remaining };
+            return .{ .ptr = self, .check_fn = check, .remaining_ms_fn = remaining, .wait_begin_fn = if (self.handle != null) park else null, .wait_end_fn = if (self.handle != null) enter else null };
         }
     };
 
@@ -2230,6 +2272,11 @@ pub const Server = struct {
             // socket recreates the overload log storm this server is meant to
             // contain and obscures actionable listener failures.
             error.Timeout,
+            error.DeadlineExceeded,
+            error.RunnableWaitTimeout,
+            error.ResourceTemporarilyUnavailable,
+            error.SchedulerFull,
+            error.SchedulerClosed,
             error.Canceled,
             error.EndOfStream,
             error.ConnectionResetByPeer,
@@ -3435,7 +3482,7 @@ pub const Server = struct {
         for (self.pre_route_hooks.items) |hook| {
             hook(&ctx) catch |err| {
                 const status = self.routeErrorResponseStatus(err) orelse {
-                    cancelH2Stream(h2, sock, stream_id);
+                    cancelH2StreamWithExecution(self.config.cleanup_execution, h2, sock, stream_id);
                     return;
                 };
                 try self.sendH2HandlerFailure(h2, sock, stream_id, ctx.h2_stream_sent, status);
@@ -3461,7 +3508,7 @@ pub const Server = struct {
         if (route_result) |r| {
             response = self.executeMiddleware(&ctx, r.handler) catch |err| {
                 const status = self.routeErrorResponseStatus(err) orelse {
-                    cancelH2Stream(h2, sock, stream_id);
+                    cancelH2StreamWithExecution(self.config.cleanup_execution, h2, sock, stream_id);
                     return;
                 };
                 try self.sendH2HandlerFailure(h2, sock, stream_id, ctx.h2_stream_sent, status);
@@ -3475,7 +3522,7 @@ pub const Server = struct {
             if (allow_count > 0) {
                 response = self.executeMiddleware(&ctx, Handler.bind(self, automaticMethodResponse)) catch |err| {
                     const status = self.routeErrorResponseStatus(err) orelse {
-                        cancelH2Stream(h2, sock, stream_id);
+                        cancelH2StreamWithExecution(self.config.cleanup_execution, h2, sock, stream_id);
                         return;
                     };
                     try self.sendH2HandlerFailure(h2, sock, stream_id, ctx.h2_stream_sent, status);
@@ -3484,7 +3531,7 @@ pub const Server = struct {
             } else if (self.global_handler) |global_handler| {
                 response = self.executeMiddleware(&ctx, global_handler) catch |err| {
                     const status = self.routeErrorResponseStatus(err) orelse {
-                        cancelH2Stream(h2, sock, stream_id);
+                        cancelH2StreamWithExecution(self.config.cleanup_execution, h2, sock, stream_id);
                         return;
                     };
                     try self.sendH2HandlerFailure(h2, sock, stream_id, ctx.h2_stream_sent, status);
@@ -3552,7 +3599,7 @@ pub const Server = struct {
         if (started) {
             // A second status HEADERS block cannot replace published headers.
             // Reset late mapped failures just like unmapped handler failures.
-            cancelH2Stream(h2, sock, stream_id);
+            cancelH2StreamWithExecution(self.config.cleanup_execution, h2, sock, stream_id);
         } else try self.sendH2ErrorLocked(h2, sock, stream_id, code);
     }
 
@@ -3580,11 +3627,15 @@ pub const Server = struct {
     /// Handler errors own an independent total cleanup deadline across header
     /// encoding, contended locks, flow credit and physical socket writes.
     fn sendH2ErrorLocked(self: *Self, h2: *H2Connection, socket: *Socket, stream_id: u31, code: u16) !void {
-        _ = self;
         const previous = h2.io.swapCancelProtection(.blocked);
         defer _ = h2.io.swapCancelProtection(previous);
-        errdefer socket.shutdown();
         var budget = CleanupBudget{ .io = h2.io, .deadline_ms = deadlineAfter(h2.io, 250) };
+        budget.start(self.config.cleanup_execution) catch |err| {
+            socket.shutdown();
+            return err;
+        };
+        defer budget.deinit();
+        errdefer socket.shutdown();
         const control = budget.view();
         var writer = @import("../net/socket.zig").ControlledWriter{ .socket = socket, .control = control };
         var status_buf: [3]u8 = undefined;
@@ -3597,13 +3648,10 @@ pub const Server = struct {
     /// Receive-pump rejection already owns the connection lock. Deliver the
     /// small error immediately when credit permits; otherwise reset just this
     /// stream. Both response and unread-request reset share one cleanup budget.
-    fn sendH2ErrorInPump(self: *Self, h2: *H2Connection, socket: *Socket, stream_id: u31, code: u16) void {
-        const previous = h2.io.swapCancelProtection(.blocked);
-        defer _ = h2.io.swapCancelProtection(previous);
-        var budget = CleanupBudget{ .io = h2.io, .deadline_ms = deadlineAfter(h2.io, 250) };
-        var writer = @import("../net/socket.zig").ControlledWriter{ .socket = socket, .control = budget.view() };
+    fn sendH2ErrorInPump(self: *Self, h2: *H2Connection, writer: *@import("../net/socket.zig").ControlledWriter, stream_id: u31, code: u16) void {
+        const socket = writer.socket;
         var reset = false;
-        self.sendH2Error(h2, &writer, stream_id, code) catch |err| {
+        self.sendH2Error(h2, writer, stream_id, code) catch |err| {
             if (err == error.FlowControlError) {
                 reset = true;
             } else {
@@ -3614,8 +3662,31 @@ pub const Server = struct {
         const stream = h2.stream_manager.getStream(stream_id) orelse return;
         if (reset or !stream.end_stream_received) {
             stream.reset();
-            h2.sendRstStream(&writer, stream_id, if (code == 429) .enhance_your_calm else .cancel) catch socket.shutdown();
+            h2.sendRstStream(writer, stream_id, if (code == 429) .enhance_your_calm else .cancel) catch socket.shutdown();
         }
+    }
+
+    fn rejectH2StreamBeforeClaim(self: *Self, h2: *H2Connection, socket: *Socket, stream_id: u31, code: u16) void {
+        const previous = h2.io.swapCancelProtection(.blocked);
+        defer _ = h2.io.swapCancelProtection(previous);
+        var budget = CleanupBudget{ .io = h2.io, .deadline_ms = deadlineAfter(h2.io, 250) };
+        budget.start(self.config.cleanup_execution) catch {
+            socket.shutdown();
+            return;
+        };
+        defer budget.deinit();
+        var writer = @import("../net/socket.zig").ControlledWriter{ .socket = socket, .control = budget.view() };
+        writer.beginConnectionWrite();
+        defer writer.finishConnectionWrite() catch socket.shutdown();
+        budget.view().lock(&h2.write_mutex, h2.io) catch {
+            socket.shutdown();
+            return;
+        };
+        defer h2.write_mutex.unlock(h2.io);
+        const stream = h2.stream_manager.getStream(stream_id) orelse return;
+        if (stream.data_event != null) return;
+        self.sendH2ErrorInPump(h2, &writer, stream_id, code);
+        h2.stream_manager.removeStream(stream_id);
     }
 
     /// StreamManager stores Stream allocations separately from its hash map.
@@ -3633,7 +3704,8 @@ pub const Server = struct {
     /// admission, reset, removal, and data_event publication share its mutex.
     fn claimH2StreamForHandler(self: *Self, h2: *H2Connection, sock: *Socket, stream_id: u31, data_event: *Io.Event) bool {
         h2.write_mutex.lockUncancelable(h2.io);
-        defer h2.write_mutex.unlock(h2.io);
+        var locked = true;
+        defer if (locked) h2.write_mutex.unlock(h2.io);
 
         const stream = h2.stream_manager.getStream(stream_id) orelse return false;
         if (!stream.got_headers or stream.data_event != null) return false;
@@ -3643,7 +3715,10 @@ pub const Server = struct {
             // Preserve the application-visible overload response instead of
             // silently removing the stream.
             if (h2BodyAdmissionErrorStatus(err)) |status| {
-                self.sendH2ErrorInPump(h2, sock, stream_id, status);
+                h2.write_mutex.unlock(h2.io);
+                locked = false;
+                self.rejectH2StreamBeforeClaim(h2, sock, stream_id, status);
+                return false;
             }
             h2.stream_manager.removeStream(stream_id);
             return false;
@@ -3696,8 +3771,9 @@ pub const Server = struct {
                         stream.max_data_size = limit;
                         if (stream.content_length) |content_length| {
                             if (content_length > limit) {
-                                self.sendH2ErrorInPump(h2, sock, stream_id, 413);
-                                h2.stream_manager.removeStream(stream_id);
+                                h2.write_mutex.unlock(h2.io);
+                                locked = false;
+                                self.rejectH2StreamBeforeClaim(h2, sock, stream_id, 413);
                                 return false;
                             }
                         }
@@ -3815,8 +3891,13 @@ pub const Server = struct {
     fn sendError(self: *Self, socket: *Socket, code: u16) !void {
         const previous = socket.io.swapCancelProtection(.blocked);
         defer _ = socket.io.swapCancelProtection(previous);
-        errdefer socket.shutdown();
         var budget = CleanupBudget{ .io = socket.io, .deadline_ms = deadlineAfter(socket.io, 250) };
+        budget.start(self.config.cleanup_execution) catch |err| {
+            socket.shutdown();
+            return err;
+        };
+        defer budget.deinit();
+        errdefer socket.shutdown();
         // A rejection must not need an application heap allocation to explain
         // that its application memory or execution capacity is exhausted.
         var storage: [2048]u8 = undefined;
@@ -7572,15 +7653,23 @@ const H2ResetBackpressureTest = struct {
         try std.posix.setsockopt(sender.handle, std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, std.mem.asBytes(&socket_buffer));
         try std.posix.setsockopt(peer.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, std.mem.asBytes(&socket_buffer));
         sender.enableNativeTimeouts();
-        try sender.setSendTimeout(5);
+        try sender.setSendTimeout(100);
         var payload: [64 * 1024]u8 = @splat('x');
         var stalled = false;
+        var bulk_stalled_ticks: usize = 0;
+        const prefill_deadline = deadlineAfter(io, 10_000);
         for (0..1024) |_| {
-            _ = sender.send(&payload) catch |err| {
+            if (milliTimestamp(io) >= prefill_deadline) return error.FixtureFillBudgetExceeded;
+            const count = sender.send(&payload) catch |err| {
                 if (err != error.Timeout) return err;
-                stalled = true;
-                break;
+                bulk_stalled_ticks += 1;
+                if (bulk_stalled_ticks >= 5) {
+                    stalled = true;
+                    break;
+                }
+                continue;
             };
+            if (count > 0) bulk_stalled_ticks = 0;
         }
         if (!stalled) return error.LargeWriteDidNotStall;
         // Large writes and even a complete reset-sized write can stall while
@@ -7591,7 +7680,8 @@ const H2ResetBackpressureTest = struct {
         var small_sent: usize = 0;
         var empty_sends: usize = 0;
         var stalled_ticks: usize = 0;
-        for (0..1024 * 1024) |_| {
+        for (0..8 * 1024 * 1024) |attempt| {
+            if (attempt % 4096 == 0 and milliTimestamp(io) >= prefill_deadline) return error.FixtureFillBudgetExceeded;
             const count = sender.send(payload[0..1]) catch |err| {
                 if (err != error.Timeout) return err;
                 stalled_ticks += 1;
@@ -7859,9 +7949,13 @@ test "HTTP controlled H2 pump error with no credit resets only its stream withou
     rejected.send_window = 0;
     const sibling = try h2.stream_manager.getOrCreateStream(3);
     sibling.state = .open;
+    var budget = Server.CleanupBudget{ .io = io, .deadline_ms = deadlineAfter(io, 250) };
+    var writer = @import("../net/socket.zig").ControlledWriter{ .socket = &sender, .control = budget.view() };
+    writer.beginConnectionWrite();
     h2.write_mutex.lockUncancelable(io);
-    server.sendH2ErrorInPump(&h2, &sender, 1, 429);
+    server.sendH2ErrorInPump(&h2, &writer, 1, 429);
     h2.write_mutex.unlock(io);
+    try writer.finishConnectionWrite();
     try std.testing.expectEqual(.closed, rejected.state);
     try std.testing.expectEqual(.open, sibling.state);
     try server.sendH2ErrorLocked(&h2, &sender, 3, 503);
@@ -7949,4 +8043,137 @@ test "HTTP controlled H1 error cleanup survives actual task cancellation" {
 
 test "HTTP controlled H2 error cleanup survives actual task cancellation" {
     try ErrorCleanupCancellationTest.run(true);
+}
+
+const OwnedCleanupTest = struct {
+    const Mode = enum { h1, h2_handler, h2_pump, h2_reset, denied_start, denied_resume };
+    const Probe = struct {
+        connection: *H2Connection,
+        socket: *Socket,
+        mode: Mode,
+        starts: usize = 0,
+        parks: usize = 0,
+        enters: usize = 0,
+        finishes: usize = 0,
+        retained: bool = false,
+        running: bool = false,
+        invalid_finish: bool = false,
+        retired_before_finish: bool = false,
+        fn view(self: *@This()) CleanupExecution {
+            return .{ .context = self, .start = start, .park = park, .enter = enter, .finish = finish };
+        }
+        fn start(raw: *anyopaque, io: Io, deadline: u64, bytes: u64) !*anyopaque {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.starts += 1;
+            if (!self.connection.write_mutex.tryLock()) return error.AdmissionHeldConnectionMutex;
+            self.connection.write_mutex.unlock(io);
+            const now: u64 = @intCast(@max(0, Io.Clock.now(.awake, io).nanoseconds));
+            try std.testing.expect(deadline > now and deadline <= now + 250 * std.time.ns_per_ms);
+            try std.testing.expect(bytes >= 2048 and bytes <= 32768);
+            if (self.mode == .denied_start) return error.ResourceTemporarilyUnavailable;
+            self.retained = true;
+            self.running = true;
+            return raw;
+        }
+        fn park(raw: *anyopaque, handle: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(raw == handle and self.retained and self.running);
+            self.parks += 1;
+            self.running = false;
+        }
+        fn enter(raw: *anyopaque, handle: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(raw == handle and self.retained and !self.running);
+            if (!self.connection.write_mutex.tryLock()) return error.ResumeHeldConnectionMutex;
+            self.connection.write_mutex.unlock(self.connection.io);
+            self.enters += 1;
+            if (self.mode == .denied_resume) return error.CleanupDenied;
+            self.running = true;
+        }
+        fn finish(raw: *anyopaque, handle: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.invalid_finish = raw != handle or !self.retained;
+            if (self.mode == .denied_resume) {
+                _ = self.socket.send("unowned") catch blk: {
+                    self.retired_before_finish = true;
+                    break :blk @as(usize, 0);
+                };
+            }
+            self.finishes += 1;
+            self.retained = false;
+            self.running = false;
+        }
+    };
+    fn run(mode: Mode) !void {
+        const io = std.testing.io;
+        var listener = try TcpListener.init(.{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } }, io);
+        defer listener.deinit();
+        var sender = try Socket.connect(listener.getLocalAddress(), io);
+        defer sender.close();
+        var peer = try listener.accept();
+        defer peer.socket.close();
+        peer.socket.enableNativeTimeouts();
+        try peer.socket.setRecvTimeout(500);
+        var h2 = H2Connection.initServer(std.testing.allocator, io);
+        defer h2.deinit();
+        const stream = try h2.stream_manager.getOrCreateStream(1);
+        stream.state = .open;
+        var probe = Probe{ .connection = &h2, .socket = &sender, .mode = mode };
+        var server = Server.init(std.testing.allocator, io);
+        defer server.deinit();
+        server.config.cleanup_execution = probe.view();
+        switch (mode) {
+            .h1 => try server.sendError(&sender, 503),
+            .h2_handler => try server.sendH2ErrorLocked(&h2, &sender, 1, 503),
+            .h2_pump => {
+                stream.got_headers = true;
+                stream.completed = true;
+                stream.stream_error = error.BodyCapacityExceeded;
+                var data_event: Io.Event = .unset;
+                try std.testing.expect(!server.claimH2StreamForHandler(&h2, &sender, 1, &data_event));
+                try std.testing.expect(h2.stream_manager.getStream(1) == null);
+            },
+            .h2_reset => Server.cancelH2StreamWithExecution(probe.view(), &h2, &sender, 1),
+            .denied_start => try std.testing.expectError(error.ResourceTemporarilyUnavailable, server.sendError(&sender, 503)),
+            .denied_resume => try std.testing.expectError(error.CleanupDenied, server.sendH2ErrorLocked(&h2, &sender, 1, 503)),
+        }
+        try std.testing.expectEqual(@as(usize, 1), probe.starts);
+        try std.testing.expect(!probe.retained and !probe.running and !probe.invalid_finish);
+        if (mode == .denied_start) {
+            try std.testing.expectEqual(@as(usize, 0), probe.finishes);
+            try std.testing.expectEqual(@as(usize, 0), probe.parks);
+        } else {
+            try std.testing.expectEqual(@as(usize, 1), probe.finishes);
+            try std.testing.expect(probe.parks > 0 and probe.parks == probe.enters);
+        }
+        if (mode == .denied_resume) try std.testing.expect(probe.retired_before_finish);
+        if (mode != .denied_start and mode != .denied_resume) try sender.shutdownWrite();
+        var bytes: [2048]u8 = undefined;
+        var used: usize = 0;
+        while (used < bytes.len) {
+            const count = try peer.socket.recv(bytes[used..]);
+            if (count == 0) break;
+            used += count;
+        }
+        try std.testing.expect(used < bytes.len);
+        if (mode == .denied_start) try std.testing.expectEqual(@as(usize, 0), used) else try std.testing.expect(used > 0);
+        if (mode == .h1) try std.testing.expect(mem.endsWith(u8, bytes[0..used], routeErrorBody(503)));
+        if (mode == .h2_handler) try std.testing.expect(mem.endsWith(u8, bytes[0..used], routeErrorBody(503)));
+        if (mode == .h2_reset) {
+            try std.testing.expectEqual(@as(usize, 13), used);
+            try std.testing.expectEqual(@as(u8, 3), bytes[3]);
+        }
+    }
+};
+
+test "HTTP controlled owned error cleanup acquires and resumes outside H2 locks through H1 handler pump and reset paths" {
+    for ([_]OwnedCleanupTest.Mode{ .h1, .h2_handler, .h2_pump, .h2_reset }) |mode| try OwnedCleanupTest.run(mode);
+}
+
+test "HTTP controlled owned error cleanup admission denial emits no response and retires the socket" {
+    try OwnedCleanupTest.run(.denied_start);
+}
+
+test "HTTP controlled owned error cleanup retires denied resume before releasing its retained owner" {
+    try OwnedCleanupTest.run(.denied_resume);
 }

@@ -330,3 +330,15 @@ pinned Nix/glibc ABI and real-owner gates pass; see
 [cleanup subquota receipts](receipts/2026-10-07/cleanup-subquota/README.md).
 Transport callback wiring outside connection locks and full production/default
 qualification remain required.
+
+
+Initial error responses and late resets now borrow independent shared protected
+cleanup execution before formatting/connection locks. Physical waits park CPU;
+reentry follows frame unlock, and failed output retires the socket before owning
+finish. Real public H1/H2 listeners exercise the actual checked owner under full
+ordinary CPU demand, with health and H2 PING progress during zero-credit waits.
+New H2 streams now honor peer initial send windows. Native and pinned Nix/glibc
+transport and real-owner gates pass; see
+[owned HTTP cleanup receipts](receipts/2026-10-07/owned-http-cleanup/README.md).
+Full production wiring remains supplemental. Other pump/control paths, accepted
+durable completion, quarantine, whole-node/default proof remain required.

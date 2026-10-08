@@ -453,3 +453,34 @@ test "runnable execution cleanup keeps its gate and bytes through denied reentry
     try std.testing.expectEqual(@as(usize, 0), owner.owner.scheduler.stats().operations);
     try std.testing.expectEqual(@as(u64, 0), owner.owner.scheduler.stats().retained_bytes);
 }
+
+test "runnable execution HTTP cleanup callbacks borrow the real shared owner until writer finish" {
+    var owner: State = .{ .owner_alloc = std.testing.allocator, .owner = try runnable.NodeOwner.init(.{ .slots = 3, .max_operations = 8 }), .native_now_ns = TestClock.now };
+    defer owner.owner.tryDeinit() catch @panic("owner leaked");
+    const port = owner.port();
+    var adapter = try runtime.http_cleanup.Owner.init(port);
+    defer adapter.deinit();
+    try std.testing.expectEqual(@as(usize, 1), owner.owner.borrowers);
+    const io = std.testing.io;
+    const borrow = runtime.native_abi.IoBorrow.init(&io);
+    var ordinary: ?*anyopaque = null;
+    try std.testing.expect(port.start(port.context, &.{ .io = &borrow, .class = @backingInt(abi.Class.query), .slots = 2, .out_handle = &ordinary }).isOk());
+    defer port.finish(ordinary.?);
+    const view = adapter.view();
+    const deadline: u64 = @intCast(@max(0, std.Io.Clock.now(.awake, io).nanoseconds) + 249 * std.time.ns_per_ms);
+    const handle = try view.start(view.context, io, deadline, 4096);
+    defer view.finish(view.context, handle);
+    try std.testing.expect(owner.cleanup_in_use.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 3), owner.owner.scheduler.stats().runnable_slots);
+    const retained = owner.owner.scheduler.stats().retained_bytes;
+    try view.park(view.context, handle);
+    try std.testing.expectEqual(@as(usize, 2), owner.owner.scheduler.stats().runnable_slots);
+    try std.testing.expectEqual(retained, owner.owner.scheduler.stats().retained_bytes);
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, view.start(view.context, io, deadline, 4096));
+    var health: ?*anyopaque = null;
+    try std.testing.expect(port.start(port.context, &.{ .io = &borrow, .class = @backingInt(abi.Class.control), .allow_wait = 0, .out_handle = &health }).isOk());
+    port.finish(health.?);
+    try view.enter(view.context, handle);
+    try std.testing.expectEqual(@as(usize, 3), owner.owner.scheduler.stats().runnable_slots);
+    try std.testing.expectEqual(retained, owner.owner.scheduler.stats().retained_bytes);
+}

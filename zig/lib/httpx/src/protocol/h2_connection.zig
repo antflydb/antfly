@@ -3879,3 +3879,34 @@ test "H2 controlled header block remains atomic and unlocks before denied reentr
     try std.testing.expect(frames >= 2);
     try std.testing.expectEqual(writer.bytes.items.len, offset);
 }
+
+test "H2 controlled peer initial window applies to future incoming and locally created streams" {
+    var server = H2Connection.initServer(std.testing.allocator, std.testing.io);
+    defer server.deinit();
+    var settings = http.Http2ConnectionSettings{};
+    settings.initial_window_size = 0;
+    var buffer: [36]u8 = undefined;
+    try server.applyPeerSettings(http.encodeSettingsPayloadBuf(settings, &buffer));
+    const incoming = try server.stream_manager.getOrCreateStream(1);
+    try incoming.open();
+    try std.testing.expectEqual(@as(i32, 0), incoming.send_window);
+    var wire = std.ArrayListUnmanaged(u8).empty;
+    defer wire.deinit(std.testing.allocator);
+    try std.testing.expectError(error.FlowControlError, server.writeData(testWriter(&wire, std.testing.allocator), 1, "blocked", true));
+    try std.testing.expectEqual(@as(usize, 0), wire.items.len);
+    try incoming.updateSendWindow(5);
+    try server.writeData(testWriter(&wire, std.testing.allocator), 1, "ready", true);
+    try std.testing.expect(incoming.end_stream_sent);
+    var client = H2Connection.initClient(std.testing.allocator, std.testing.io);
+    defer client.deinit();
+    settings.initial_window_size = 7;
+    try client.applyPeerSettings(http.encodeSettingsPayloadBuf(settings, &buffer));
+    const first = try client.stream_manager.createStream();
+    try std.testing.expectEqual(@as(i32, 7), first.send_window);
+    try first.updateSendWindow(-3);
+    settings.initial_window_size = 0;
+    try client.applyPeerSettings(http.encodeSettingsPayloadBuf(settings, &buffer));
+    try std.testing.expectEqual(@as(i32, -3), first.send_window);
+    const next = try client.stream_manager.createStream();
+    try std.testing.expectEqual(@as(i32, 0), next.send_window);
+}

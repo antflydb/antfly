@@ -20,6 +20,7 @@ pub const io_abi = @import("runtime_io_abi.zig");
 pub const runnable_abi = @import("runtime_runnable_abi.zig");
 pub const RunnableStats = @import("runtime_workload_abi.zig").RunnableStats;
 pub const http_bridge = @import("runtime_http_bridge.zig");
+pub const http_cleanup = @import("runtime_http_cleanup.zig");
 
 pub const mutation_barrier = @import("mutation_barrier.zig");
 
