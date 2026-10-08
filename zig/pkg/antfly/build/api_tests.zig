@@ -93,6 +93,27 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .target = target,
         .optimize = optimize,
     }));
+    const completion_task_root = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/api/runnable_completion_task_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    completion_task_root.addImport("antfly_runtime_abi", antfly_imports.runtime_abi);
+    completion_task_root.addImport("antfly_local_sources", inference_owner_sources);
+    completion_task_root.addImport("antfly_request_allocation_budget", b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/common/allocation_budget.zig"),
+        .target = target,
+        .optimize = optimize,
+    }));
+    const completion_task_tests = b.addTest(.{
+        .name = "completion-task-tests",
+        .root_module = completion_task_root,
+        .filters = &.{"completion task"},
+        .max_rss = 2 * 1024 * 1024 * 1024,
+    });
+    b.step("antfly-completion-task-test", "Verify preauthorized joined completion tasks")
+        .dependOn(&b.addRunArtifact(completion_task_tests).step);
     const sql_write_team_root = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/api/runnable_write_team_test_root.zig"),
         .target = target,

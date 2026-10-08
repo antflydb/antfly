@@ -451,3 +451,16 @@ pre-acceptance task/resource reservation, storage wait integration, ambiguous
 outcome joins and authoritative recovery transfer remain unimplemented. No
 production consumer activates completion; write suspension/default enablement
 remain withheld.
+
+
+Preauthorized completion tasks now reserve bounded metadata and actual concurrent
+capacity behind a closed gate before work can begin. Activation releases the gate,
+and a protected foreground join prevents actual cancellation from propagating
+into the accepted task. A preserved negative regression reproduces lost callback
+work without that protection. All 34 task/SQL-team/owner/worker/cleanup contracts
+execute and pass on native and pinned Nix/glibc; see
+[completion task receipts](receipts/2026-10-08/completion-task/README.md).
+The caller retains its original root/resources through joined deinit. SQL seal
+and physical participant acceptance are not wired to this primitive yet. Executor
+internal allocation accounting, physical wait fences and authoritative recovery
+transfer remain required; no production completion activation or default enablement.
