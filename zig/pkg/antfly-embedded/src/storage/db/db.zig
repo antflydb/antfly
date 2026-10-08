@@ -22023,7 +22023,9 @@ pub const DB = struct {
             // staged rewrite path, not ordinary metadata publication.
             if (current_schema.storage_mode == .relational) for (current_schema.relational_columns) |previous| {
                 for (next_schema.relational_columns) |next| {
-                    if (std.mem.eql(u8, previous.path, next.path) and previous.sql_element_type != next.sql_element_type)
+                    if (std.mem.eql(u8, previous.path, next.path) and
+                        (previous.sql_element_type != next.sql_element_type or
+                            !@import("../../common/sql_builtin_type.zig").NumericModifier.eql(previous.numeric_modifier, next.numeric_modifier)))
                         return error.InvalidSchemaUpdateRequest;
                 }
             };

@@ -251,6 +251,7 @@ pub const RelationalColumn = struct {
     /// Exact SQL builtin identity, independent of the coarse physical cell.
     /// Null means no SQL declaration; never infer a width from stored values.
     sql_element_type: ?@import("../common/sql_builtin_type.zig").Type = null,
+    numeric_modifier: ?@import("../common/sql_builtin_type.zig").NumericModifier = null,
 };
 
 pub const IndexSortField = struct {
@@ -281,6 +282,8 @@ pub const TableSchema = struct {
     /// Public scalar NUMERIC validation is distinct from the older binary
     /// codec and VM capabilities: exact schema bounds/enum/domain admission.
     requires_exact_numeric_validation: bool = false,
+    /// Modifier enforcement can also occur inside integer-valued expressions.
+    requires_numeric_modifiers: bool = false,
     exact_fields: []const ExactField = &.{},
     dynamic_templates: []const DynamicTemplate = &.{},
     declared_fields: []const DeclaredField = &.{},
@@ -303,7 +306,7 @@ const schema_version_prefix = "\x00\x00__metadata__:schema_v";
 /// Current durable runtime-schema format. Catalog compatibility checks use the
 /// same exported constant so a writer can never silently drift from the format
 /// it advertises in transactional table metadata.
-pub const storage_format_version: u32 = 22;
+pub const storage_format_version: u32 = 23;
 
 /// Serialize a TableSchema to bytes. Caller owns the returned slice.
 pub fn serializeSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
@@ -355,6 +358,11 @@ pub fn serializeTextProjectionSchema(alloc: Allocator, schema: TableSchema) ![]u
     projection_schema.storage_mode = .document;
     projection_schema.external_base_source = null;
     projection_schema.relational_columns = &.{};
+    projection_schema.requires_typed_expressions = false;
+    projection_schema.requires_predicate_expressions = false;
+    projection_schema.requires_exact_numeric_expressions = false;
+    projection_schema.requires_exact_numeric_validation = false;
+    projection_schema.requires_numeric_modifiers = false;
     const projection_documents = try alloc.dupe(FullTextDocument, schema.full_text_documents);
     defer alloc.free(projection_documents);
     for (projection_documents) |*doc| {
@@ -397,6 +405,7 @@ fn serializeSchemaFormat(alloc: Allocator, schema: TableSchema, format_version: 
     if (format_version < 19 and schema.requires_predicate_expressions) return error.UnsupportedVersion;
     if (format_version < 21 and schema.requires_exact_numeric_expressions) return error.UnsupportedVersion;
     if (format_version < 22 and schema.requires_exact_numeric_validation) return error.UnsupportedVersion;
+    if (format_version < 23 and schema.requires_numeric_modifiers) return error.UnsupportedVersion;
     if (format_version < 20) for (schema.relational_columns) |column| {
         if (column.column_type == .numeric or column.sql_element_type == .numeric) return error.UnsupportedVersion;
     };
@@ -519,6 +528,15 @@ fn serializeSchemaFormat(alloc: Allocator, schema: TableSchema, format_version: 
             try buf.append(alloc, if (column.is_json) 1 else 0);
             try buf.append(alloc, @backingInt(column.json_kind));
             if (format_version >= 16) try buf.append(alloc, if (column.sql_element_type) |kind| @backingInt(kind) + 1 else 0);
+            if (format_version >= 23) {
+                try buf.append(alloc, @intFromBool(column.numeric_modifier != null));
+                if (column.numeric_modifier) |modifier| {
+                    var bytes: [4]u8 = undefined;
+                    std.mem.writeInt(u16, bytes[0..2], modifier.precision, .little);
+                    std.mem.writeInt(i16, bytes[2..4], modifier.scale, .little);
+                    try buf.appendSlice(alloc, &bytes);
+                }
+            }
         }
     }
 
@@ -535,6 +553,7 @@ fn serializeSchemaFormat(alloc: Allocator, schema: TableSchema, format_version: 
     if (format_version >= 19) try buf.append(alloc, @intFromBool(schema.requires_predicate_expressions));
     if (format_version >= 21) try buf.append(alloc, @intFromBool(schema.requires_exact_numeric_expressions));
     if (format_version >= 22) try buf.append(alloc, @intFromBool(schema.requires_exact_numeric_validation));
+    if (format_version >= 23) try buf.append(alloc, @intFromBool(schema.requires_numeric_modifiers));
     return buf.toOwnedSlice(alloc);
 }
 
@@ -1036,6 +1055,17 @@ fn deserializeSchemaOwned(alloc: Allocator, data: []const u8) !TableSchema {
                 pos += 1;
                 break :sql_type if (tag == 0) null else @fromBackingInt(@intCast(tag - 1));
             } else null;
+            const numeric_modifier: ?@import("../common/sql_builtin_type.zig").NumericModifier = if (fmt_version >= 23) modifier: {
+                const present = data[pos] == 1;
+                pos += 1;
+                if (!present) break :modifier null;
+                const constraint: @import("../common/sql_builtin_type.zig").NumericModifier = .{
+                    .precision = std.mem.readInt(u16, data[pos..][0..2], .little),
+                    .scale = std.mem.readInt(i16, data[pos + 2 ..][0..2], .little),
+                };
+                pos += 4;
+                break :modifier constraint;
+            } else null;
             column.* = .{
                 .name = name.?,
                 .path = path.?,
@@ -1045,6 +1075,7 @@ fn deserializeSchemaOwned(alloc: Allocator, data: []const u8) !TableSchema {
                 .is_json = is_json,
                 .json_kind = json_kind,
                 .sql_element_type = sql_element_type,
+                .numeric_modifier = numeric_modifier,
             };
             columns_initialized += 1;
             name = null;
@@ -1080,6 +1111,7 @@ fn deserializeSchemaOwned(alloc: Allocator, data: []const u8) !TableSchema {
         .requires_predicate_expressions = if (fmt_version >= 19) data[pos + 1] == 1 else false,
         .requires_exact_numeric_expressions = if (fmt_version >= 21) data[pos + 2] == 1 else false,
         .requires_exact_numeric_validation = if (fmt_version >= 22) data[pos + 3] == 1 else false,
+        .requires_numeric_modifiers = if (fmt_version >= 23) data[pos + 4] == 1 else false,
         .exact_fields = exact_fields,
         .dynamic_templates = templates,
         .declared_fields = declared_fields,
@@ -1288,7 +1320,7 @@ fn validateSerializedSchema(data: []const u8) !void {
         }
         try cursor.readBool(); // immutable public-validation provenance
         const column_count = try cursor.readU32();
-        try cursor.ensureCount(column_count, if (format_version >= 16) 14 else 13);
+        try cursor.ensureCount(column_count, if (format_version >= 23) 15 else if (format_version >= 16) 14 else 13);
         for (0..column_count) |_| {
             try cursor.readStr();
             try cursor.readStr();
@@ -1305,6 +1337,19 @@ fn validateSerializedSchema(data: []const u8) !void {
                 if (sql_tag > std.meta.fieldNames(@import("../common/sql_builtin_type.zig").Type).len) return error.InvalidSchema;
                 if (sql_tag == @backingInt(@import("../common/sql_builtin_type.zig").Type.numeric) + 1 and format_version < 20) return error.UnsupportedVersion;
             }
+            if (format_version >= 23) {
+                const present = try cursor.readU8();
+                if (present > 1) return error.InvalidSchema;
+                if (present == 1) {
+                    try cursor.ensure(4);
+                    const modifier: @import("../common/sql_builtin_type.zig").NumericModifier = .{
+                        .precision = std.mem.readInt(u16, data[cursor.pos..][0..2], .little),
+                        .scale = std.mem.readInt(i16, data[cursor.pos + 2 ..][0..2], .little),
+                    };
+                    modifier.validate() catch return error.InvalidSchema;
+                    cursor.pos += 4;
+                }
+            }
         }
     }
     if (format_version >= 15) {
@@ -1315,10 +1360,18 @@ fn validateSerializedSchema(data: []const u8) !void {
     if (format_version >= 19) try cursor.readBool();
     if (format_version >= 21) try cursor.readBool();
     if (format_version >= 22) try cursor.readBool();
+    if (format_version >= 23) try cursor.readBool();
     try cursor.finish();
 }
 
 fn validateRelationalSchema(alloc: Allocator, schema: TableSchema) !void {
+    if (schema.requires_numeric_modifiers and (schema.storage_mode != .relational or !schema.requires_public_schema))
+        return error.InvalidSchema;
+    for (schema.relational_columns) |column| if (column.numeric_modifier) |modifier| {
+        if (!schema.requires_numeric_modifiers or column.sql_element_type != .numeric or
+            (column.column_type != .numeric and column.column_type != .sql_array)) return error.InvalidSchema;
+        modifier.validate() catch return error.InvalidSchema;
+    };
     for (schema.relational_columns) |column| if (column.column_type == .numeric) {
         if (schema.storage_mode != .relational or column.sql_element_type != .numeric or column.is_json or column.json_kind != .none)
             return error.InvalidSchema;
@@ -2961,6 +3014,55 @@ test "relational index system exact NUMERIC programs fence readers without NUMER
     defer a.free(malformed);
     malformed[malformed.len - 1] = 2;
     try std.testing.expectError(error.InvalidSchema, deserializeSchema(a, malformed));
+}
+
+test "relational index system NUMERIC modifiers survive immutable schemas and reject older or corrupt layouts" {
+    const a = std.testing.allocator;
+    var current: TableSchema = .{
+        .storage_mode = .relational,
+        .requires_public_schema = true,
+        .requires_numeric_modifiers = true,
+        .relational_columns = &.{
+            .{ .name = "n", .path = "n", .column_type = .numeric, .sql_element_type = .numeric, .numeric_modifier = .{ .precision = 321, .scale = -123 } },
+            .{ .name = "a", .path = "a", .column_type = .sql_array, .sql_element_type = .numeric, .numeric_modifier = .{ .precision = 2, .scale = 4 } },
+        },
+    };
+    try std.testing.expectError(error.UnsupportedVersion, serializeSchemaFormat(a, current, 22));
+    const bytes = try serializeSchema(a, current);
+    defer a.free(bytes);
+    const decoded = try deserializeSchema(a, bytes);
+    defer freeSchema(a, decoded);
+    try std.testing.expect(try schemasEqual(a, current, decoded));
+    try std.testing.expectEqual(@as(i16, -123), decoded.relational_columns[0].numeric_modifier.?.scale);
+    try std.testing.expectEqual(@as(u16, 2), decoded.relational_columns[1].numeric_modifier.?.precision);
+    for (0..bytes.len) |length| {
+        const truncated = deserializeSchema(a, bytes[0..length]) catch continue;
+        freeSchema(a, truncated);
+        return error.TestUnexpectedResult;
+    }
+    const corrupt = try a.dupe(u8, bytes);
+    defer a.free(corrupt);
+    const offset = std.mem.indexOf(u8, corrupt, &.{ 1, 65, 1, 133, 255 }).?;
+    corrupt[offset + 1] = 0;
+    corrupt[offset + 2] = 0;
+    var none = std.heap.FixedBufferAllocator.init(&.{});
+    try std.testing.expectError(error.InvalidSchema, deserializeSchema(none.allocator(), corrupt));
+    @memcpy(corrupt, bytes);
+    corrupt[offset] = 2;
+    try std.testing.expectError(error.InvalidSchema, deserializeSchema(none.allocator(), corrupt));
+    @memcpy(corrupt, bytes);
+    corrupt[corrupt.len - 1] = 0;
+    try std.testing.expectError(error.InvalidSchema, deserializeSchema(a, corrupt));
+    current.requires_numeric_modifiers = false;
+    try std.testing.expectError(error.InvalidSchema, serializeSchema(a, current));
+    const plain_projection = try serializeTextProjectionSchema(a, current);
+    defer a.free(plain_projection);
+    current.requires_numeric_modifiers = true;
+    current.requires_exact_numeric_expressions = true;
+    current.requires_typed_expressions = true;
+    const typed_projection = try serializeTextProjectionSchema(a, current);
+    defer a.free(typed_projection);
+    try std.testing.expectEqualSlices(u8, plain_projection, typed_projection);
 }
 
 test "relational index system exact NUMERIC validation fences older readers and strict framing" {

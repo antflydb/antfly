@@ -4367,7 +4367,8 @@ fn buildRelationalRowValueFromParsedInternal(
                 break :blk typed_dv.TypedValue{ .bytes_val = encoded };
             } else if (column.column_type == .numeric) blk: {
                 if (column.sql_element_type != .numeric) return error.InvalidBatchRequest;
-                const encoded = try @import("../../sql/numeric_storage.zig").encodeJsonAlloc(output_alloc, found);
+                var context: @import("../../sql/numeric_value.zig").Context = .{ .alloc = output_alloc };
+                const encoded = try @import("../../sql/numeric_storage.zig").encodeJsonWithModifier(&context, found, column.numeric_modifier);
                 errdefer output_alloc.free(encoded);
                 try owned_buffers.append(output_alloc, encoded);
                 break :blk typed_dv.TypedValue{ .bytes_val = encoded };
@@ -6625,6 +6626,31 @@ test "relational index system NUMERIC scalar preparation matches PostgreSQL bina
         try restored.finalizeMetadata(0);
         try std.testing.expectEqualSlices(u8, prepared.packed_row, restored.packed_row);
     }
+}
+
+test "relational index system NUMERIC modifiers round before row hash and strict restore admission" {
+    const a = std.testing.allocator;
+    const table: runtime_schema.TableSchema = .{ .version = 1, .storage_mode = .relational, .requires_public_schema = true, .requires_numeric_modifiers = true, .relational_columns = &.{.{ .name = "n", .path = "n", .column_type = .numeric, .sql_element_type = .numeric, .numeric_modifier = .{ .precision = 4, .scale = 2 } }} };
+    var layout = try relational_row_codec.PhysicalLayout.init(a, table);
+    defer layout.deinit();
+    const Run = struct {
+        fn run(alloc: Allocator, schema: runtime_schema.TableSchema, physical: *const relational_row_codec.PhysicalLayout) !void {
+            var row = try PreparedRelationalWrite.init(alloc, "row", "{\"n\":12.345}", null, schema, physical);
+            defer row.deinit(alloc);
+            try row.finalizeMetadata(0);
+            try relational_row_codec.validateOrdinalWithLayout(row.packed_row, schema, physical);
+            const digest = try document_content_hash.hashRelationalParsedValue(alloc, row.parsedValue(), schema);
+            try std.testing.expectEqualSlices(u8, &row.semantic_hash, &digest);
+            const cell = (try relational_row_codec.findCellByOrdinalWithLayout(row.packed_row, schema, physical, 0)).?;
+            const numeric = @import("../../sql/numeric_storage.zig");
+            const value = try numeric.jsonValueAlloc(alloc, cell.value.bytes_val);
+            defer alloc.free(value.number_string);
+            try std.testing.expectEqualStrings("12.35", value.number_string);
+        }
+    };
+    try Run.run(a, table, &layout);
+    try std.testing.checkAllAllocationFailures(a, Run.run, .{ table, &layout });
+    try std.testing.expectError(error.InvalidSqlNumber, PreparedRelationalWrite.init(a, "row", "{\"n\":99.995}", null, table, &layout));
 }
 
 test "relational index system NUMERIC scalar rows hash logical identity and unwind preparation faults" {

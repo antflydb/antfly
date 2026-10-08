@@ -5747,3 +5747,25 @@ schema annotation and DDL publication, assignment/default/generated enforcement,
 schema-VM modifier instructions, restore integration and capability fencing must
 all use this boundary before the publication guards can be removed. The original
 parity dispositions remain unchanged.
+
+### Immutable NUMERIC modifier layouts and strict native row admission
+
+Durable schema format 23 retains precision and signed scale for scalar and array
+NUMERIC columns, with a separate capability flag covering future modifier-bearing
+expression programs even when their output columns are not NUMERIC. Older readers
+are fenced; truncated, invalid or unfenced layouts are rejected before allocation.
+Ordinary schema updates and historical row projections cannot reinterpret a column
+under a different modifier. Cover fingerprints include modifier identity without
+changing logical NUMERIC equality keys or prohibiting cross-modifier foreign keys.
+
+Native row admission checks constrained scalar values and every non-NULL array
+element. Untrusted array offsets are validated before element access; authenticated
+projections retain their bounded shape-only path. Scalar write encoding and semantic
+hashing apply the same assignment coercion. Full-text projection witnesses exclude
+SQL-only reader capability flags, preserving their independent physical identity.
+
+Validation passes 184 native relational-index tests, one server integration test,
+598 local SQL tests (three existing skips), and 226 server SQL tests without failures
+or leaks. Inventory integrity remains 929 unresolved. Public modifier activation
+is still guarded: normalized postimages, defaults/generated evaluation order,
+array assignment, public annotation, and schema-VM casts remain to be completed.

@@ -635,7 +635,11 @@ fn hashRelationalColumnValue(
             var parsed = try @import("../../sql/numeric_storage.zig").fromJson(&ctx, value);
             defer parsed.deinit();
             hasher.update("N");
-            try numeric.hash(&ctx, parsed.value, hasher);
+            if (column.numeric_modifier) |modifier| {
+                var constrained = try numeric.applyTypeModifier(&ctx, parsed.value, modifier);
+                defer constrained.deinit();
+                try numeric.hash(&ctx, constrained.value, hasher);
+            } else try numeric.hash(&ctx, parsed.value, hasher);
         },
         .string, .blob, .geoshape => switch (value) {
             .string => |text| {

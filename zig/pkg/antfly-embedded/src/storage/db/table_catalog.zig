@@ -145,6 +145,7 @@ pub const Catalog = struct {
             if (self.schema_format_version < 19 and schema.requires_predicate_expressions) return error.UnsupportedTableCapabilityVersion;
             if (self.schema_format_version < 21 and schema.requires_exact_numeric_expressions) return error.UnsupportedTableCapabilityVersion;
             if (self.schema_format_version < 22 and schema.requires_exact_numeric_validation) return error.UnsupportedTableCapabilityVersion;
+            if (self.schema_format_version < 23 and schema.requires_numeric_modifiers) return error.UnsupportedTableCapabilityVersion;
             if (self.schema_format_version < 20) for (schema.relational_columns) |column| {
                 if (column.column_type == .numeric or column.sql_element_type == .numeric) return error.UnsupportedTableCapabilityVersion;
             };
@@ -175,6 +176,16 @@ test "relational index system SQL catalog fences typed expression capability wit
 test "relational index system catalog fences exact NUMERIC programs with integral results" {
     const table: schema_mod.TableSchema = .{ .version = 1, .storage_mode = .relational, .requires_public_schema = true, .requires_exact_numeric_expressions = true };
     var catalog: Catalog = .{ .schema_format_version = 20, .mode_initialized = true, .storage_mode = .relational, .active_schema_version = 1 };
+    try std.testing.expectError(error.UnsupportedTableCapabilityVersion, catalog.validateForSchema(table));
+    catalog.schema_format_version = schema_mod.storage_format_version;
+    try catalog.validateForSchema(table);
+    const restored = try Catalog.decode(&catalog.encode());
+    try restored.validateForSchema(table);
+}
+
+test "relational index system catalog fences NUMERIC modifiers even on integer expression outputs" {
+    const table: schema_mod.TableSchema = .{ .version = 1, .storage_mode = .relational, .requires_public_schema = true, .requires_numeric_modifiers = true, .relational_columns = &.{.{ .name = "n", .path = "n", .column_type = .integer }} };
+    var catalog: Catalog = .{ .schema_format_version = 22, .mode_initialized = true, .storage_mode = .relational, .active_schema_version = 1 };
     try std.testing.expectError(error.UnsupportedTableCapabilityVersion, catalog.validateForSchema(table));
     catalog.schema_format_version = schema_mod.storage_format_version;
     try catalog.validateForSchema(table);

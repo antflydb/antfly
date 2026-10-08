@@ -194,6 +194,7 @@ fn derive(entry: *Entry, json: []const u8) !void {
         .nullable = !column.required or column.allows_null,
         .generated = generated.contains(column.name),
         .element_type = column.sql_element_type,
+        .numeric_modifier = column.numeric_modifier,
         .type = @import("antfly_local_sources").sql_document_row.relationalType(parsed, column.name, switch (column.column_type) {
             .string => .string,
             .integer => .integer,

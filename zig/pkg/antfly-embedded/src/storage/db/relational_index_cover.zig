@@ -89,6 +89,21 @@ pub const Plan = struct {
             hash.update("antfly:index-cover:sql-types:v1\x00");
             for (columns) |column| hash.update(&.{if (column.sql_element_type) |kind| @backingInt(kind) + 1 else 0});
         }
+        const has_modifiers = for (columns) |column| {
+            if (column.numeric_modifier != null) break true;
+        } else false;
+        if (has_modifiers) {
+            hash.update("antfly:index-cover:numeric-modifiers:v1\x00");
+            for (columns) |column| {
+                hash.update(&.{@intFromBool(column.numeric_modifier != null)});
+                if (column.numeric_modifier) |modifier| {
+                    var bytes: [4]u8 = undefined;
+                    std.mem.writeInt(u16, bytes[0..2], modifier.precision, .little);
+                    std.mem.writeInt(i16, bytes[2..4], modifier.scale, .little);
+                    hash.update(&bytes);
+                }
+            }
+        }
         const layout = try codec.PhysicalLayout.init(alloc, .{ .version = 1, .storage_mode = .relational, .relational_columns = columns });
         var fingerprint: [32]u8 = undefined;
         hash.final(&fingerprint);
@@ -118,7 +133,9 @@ pub const Plan = struct {
             ordinal.* = layout.ordinalForName(source_table.relational_columns, column.name);
             if (ordinal.*) |bound| {
                 const source_column = source_table.relational_columns[bound];
-                if (source_column.column_type != column.column_type or source_column.json_kind != column.json_kind or source_column.sql_element_type != column.sql_element_type or !std.mem.eql(u8, source_column.path, column.path)) return error.RelationalIndexColumnTypeMismatch;
+                if (source_column.column_type != column.column_type or source_column.json_kind != column.json_kind or source_column.sql_element_type != column.sql_element_type or
+                    !@import("../../common/sql_builtin_type.zig").NumericModifier.eql(source_column.numeric_modifier, column.numeric_modifier) or
+                    !std.mem.eql(u8, source_column.path, column.path)) return error.RelationalIndexColumnTypeMismatch;
             } else if (column.required) return error.RelationalIndexColumnNotFound;
         }
         return .{ .alloc = alloc, .layout = layout, .ordinals = ordinals, .fingerprint = self.fingerprint };
@@ -174,6 +191,32 @@ pub const Plan = struct {
         return std.mem.readInt(u32, encoded[36..40], .little);
     }
 };
+
+test "relational index system NUMERIC modifiers fence cover payloads without changing logical keys" {
+    const a = std.testing.allocator;
+    var columns = [_]schema.RelationalColumn{
+        .{ .name = "k", .path = "k", .column_type = .integer },
+        .{ .name = "n", .path = "n", .column_type = .numeric, .sql_element_type = .numeric, .numeric_modifier = .{ .precision = 4, .scale = 2 } },
+    };
+    const table: schema.TableSchema = .{ .version = 1, .storage_mode = .relational, .relational_columns = &columns };
+    var layout = try codec.PhysicalLayout.init(a, table);
+    defer layout.deinit();
+    var first = try Plan.init(a, table, &layout, &.{.{ .column = "k" }}, &.{"n"});
+    defer first.deinit();
+    columns[1].numeric_modifier.?.scale = 1;
+    var second = try Plan.init(a, table, &layout, &.{.{ .column = "k" }}, &.{"n"});
+    defer second.deinit();
+    try std.testing.expect(!std.mem.eql(u8, &first.fingerprint, &second.fingerprint));
+    try std.testing.expectError(error.RelationalIndexColumnTypeMismatch, first.projectSource(a, table, &layout));
+    var source = try second.projectSource(a, table, &layout);
+    defer source.deinit();
+    const TuplePlan = @import("relational_index_keys.zig").TuplePlan;
+    var first_key = try TuplePlan.init(a, first.table(), &first.layout, &.{.{ .column = "n" }});
+    defer first_key.deinit();
+    var second_key = try TuplePlan.init(a, second.table(), &second.layout, &.{.{ .column = "n" }});
+    defer second_key.deinit();
+    try std.testing.expect(first_key.sameEqualityKey(0, second_key, 0));
+}
 
 test "relational index system SQL cover identity and source binding retain precise types" {
     const alloc = std.testing.allocator;

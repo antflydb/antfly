@@ -108,6 +108,13 @@ pub const View = struct {
             return error.InvalidSqlBinaryRepresentation;
     }
 
+    /// For bounded native row admission after canonical payload validation.
+    /// Query/execution owners should use verifyModifier with their own budget.
+    pub fn verifyStoredModifier(self: View, modifier: @import("sql_builtin_type.zig").NumericModifier) !void {
+        var budget: NoBudget = .{};
+        return self.verifyModifier(modifier, &budget);
+    }
+
     /// Compare canonical pinned views without materializing coefficients.
     /// PostgreSQL orders NaN above infinity and treats equal NaNs as equal.
     pub fn order(self: View, other: View, budget: anytype) !std.math.Order {
