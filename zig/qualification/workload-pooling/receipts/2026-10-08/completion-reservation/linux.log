@@ -1,0 +1,39 @@
+1/38 runnable_scheduler.test.runnable scheduler weighted execution retains CPU demand across waits and class changes...OK
+2/38 runnable_scheduler.test.runnable scheduler node owner outlives independent borrowers and executions...OK
+3/38 runnable_scheduler.test.runnable scheduler preserves blocked ownership and protected capacity...OK
+4/38 runnable_scheduler.test.runnable scheduler bounds backfill and grants a large operation...OK
+5/38 runnable_scheduler.test.runnable scheduler weighted sharing charges slots across busy classes...OK
+6/38 runnable_scheduler.test.runnable scheduler cancellation after grant returns every reservation...OK
+7/38 runnable_scheduler.test.runnable scheduler deadline and shutdown retire blocked and queued owners...OK
+8/38 runnable_scheduler.test.runnable scheduler yield hands execution to another operation...OK
+9/38 runnable_scheduler.test.runnable scheduler queue bound starts at enqueue including grant race...OK
+10/38 runnable_scheduler.test.runnable scheduler real queue timeout releases count and bytes...OK
+11/38 runnable_scheduler.test.runnable scheduler rejects invalid policy and oversized demand atomically...OK
+12/38 runnable_scheduler.test.runnable scheduler shutdown racing a new block cannot strand an owner...OK
+13/38 runnable_scheduler.test.runnable scheduler execution quanta preserve deadline and parked ownership...OK
+14/38 runnable_scheduler.test.runnable scheduler checkpoint work budget and disabled execution...OK
+15/38 runnable_scheduler.test.runnable scheduler reserves control metadata at full ordinary outstanding limits...OK
+16/38 runnable_scheduler.test.runnable scheduler denied reentry retains borrowed reservations until owning finish...OK
+17/38 runnable_scheduler.test.runnable scheduler canceled yielded capsule retains ownership while peer computes...OK
+18/38 runnable_scheduler.test.runnable fail-fast initial control admission never waits or leaks a reservation...OK
+19/38 runnable_scheduler.test.runnable fail-fast acquisition retains fair bounded published reentry...OK
+20/38 runnable_scheduler.test.runnable scheduler running write retains completion ownership through cancellation and shutdown...OK
+21/38 runnable_scheduler.test.runnable scheduler team growth releases old CPU while preserving fair retained ownership...OK
+22/38 runnable_scheduler.test.runnable execution team reservations preserve original fencing and denied reentry ownership...OK
+23/38 runnable_scheduler.test.runnable scheduler team rejection and shutdown preserve existing running grant...OK
+24/38 runnable_scheduler.test.runnable execution team shrink does not reuse an expired prior queue wait...OK
+25/38 runnable_scheduler.test.runnable execution completion reservation survives foreground cancellation and close...OK
+26/38 runnable_scheduler.test.runnable scheduler completion queued before close retains fair bounded ownership...OK
+27/38 runnable_scheduler.test.runnable execution completion requires prior bounded independent authorization...OK
+28/38 runnable_scheduler.test.runnable execution expired completion retains consumers until joined finish...OK
+29/38 runnable_scheduler.test.runnable scheduler closing foreground releases CPU to retained completion before finish...OK
+30/38 bounded_admission.test.bounded admission contextual leases measure ownership once under both policies...OK
+31/38 bounded_admission.test.bounded admission FIFO grant cancellation and close transfer one owner...OK
+32/38 bounded_admission.test.bounded admission rejects count bytes oversized and invalid policies...OK
+33/38 bounded_admission.test.bounded admission wait ceiling and expired fast path never execute...OK
+34/38 bounded_admission.test.bounded admission native queue leaves completion capacity and drains a burst...OK
+35/38 bounded_admission.test.bounded admission queued external cancellation retires without execution...OK
+36/38 bounded_admission.test.bounded admission unsupported executor remains fail fast without enqueue...OK
+37/38 bounded_admission.test.bounded admission live shrink preserves grants and retires newest waiters...OK
+38/38 bounded_admission.test.bounded admission suspension and terminal drain reconcile caller ownership...OK
+All 38 tests passed.

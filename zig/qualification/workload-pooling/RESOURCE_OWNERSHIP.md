@@ -410,3 +410,17 @@ SQL HTTP/pgwire call sites remain supplemental. The proposal narrows team creati
 to mutations/COMMIT and repairs scheduled legacy API constructors which formerly
 had no bounded request owner. The real constructor regression and production
 archive/coordinator gates remain pending. Whole-node/default proof is incomplete.
+
+
+The scheduler now reserves/activates an independent bounded completion phase
+before possible durable acceptance on an already retained write/control root.
+Active completion retains its CPU partition and operation/bytes through waits,
+foreground cancellation and admission close; denied completion reentry retains
+stopped ownership until consumer joins/transfer and owning finish. Native and
+pinned Nix/glibc pass 38 scheduler/admission and 30 real-owner/SQL/worker/cleanup
+contracts per platform; see
+[completion reservation receipts](receipts/2026-10-08/completion-reservation/README.md).
+No production consumer activates it yet. Independent completion task/Io ownership,
+pre-seal/participant acceptance wiring, checked ABI exposure, physical WAL/Raft
+waits and authoritative durable recovery transfer still require implementation
+and qualification. Write suspension remains withheld; pooling stays disabled.

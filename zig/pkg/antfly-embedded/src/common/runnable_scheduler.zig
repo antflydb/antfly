@@ -60,6 +60,10 @@ pub const Entry = struct {
     queued_since_ns: u64 = 0,
     waited: bool = false,
     reserved_control: bool = false,
+    /// Preauthorized before possible durable acceptance. These callbacks and
+    /// their independent completion Io must remain valid through all joins.
+    completion_options: ?admission.Options = null,
+    completion_active: bool = false,
 };
 
 const Queue = struct { head: ?*Entry = null, tail: ?*Entry = null };
@@ -177,7 +181,8 @@ pub const Scheduler = struct {
         return null;
     }
     fn dispatch(self: *Scheduler) void {
-        if (self.closed) return;
+        // Close removes ordinary queued entries, but preauthorized active
+        // completion retains the same bounded queues and capacity partition.
         while (self.queues[4].head) |e| {
             if (e.slots > self.config.control_slots - self.used[4]) break;
             self.grant(e);
@@ -300,6 +305,7 @@ pub const Scheduler = struct {
             const s = e.state;
             const failure = e.failure;
             const closed = self.closed;
+            const completing = e.completion_active;
             const waited = e.waited;
             self.mutex.unlock();
             if (!still_owned) return error.InvalidRunnableTransition;
@@ -307,14 +313,14 @@ pub const Scheduler = struct {
                 self.failWait(e, error.RunnableWaitTimeout, retain);
                 return error.RunnableWaitTimeout;
             }
-            if (s == .running and !closed) {
+            if (s == .running and (!closed or completing)) {
                 options.check() catch |err| {
                     self.failWait(e, err, retain);
                     return err;
                 };
                 return;
             }
-            if (closed) {
+            if (closed and !completing) {
                 self.failWait(e, error.SchedulerClosed, retain);
                 return error.SchedulerClosed;
             }
@@ -349,9 +355,10 @@ pub const Scheduler = struct {
         e.bypasses = 0;
         self.sequence +|= 1;
         e.sequence = self.sequence;
-        if (self.closed) {
+        if (self.closed and !e.completion_active) {
             e.state = .stopped;
             e.failure = error.SchedulerClosed;
+            self.dispatch();
             return error.SchedulerClosed;
         }
         self.enqueue(e, now);
@@ -368,9 +375,9 @@ pub const Scheduler = struct {
         if (e.scheduler != self or e.state != .running) return error.InvalidRunnableTransition;
         const capacity = if (e.class == .control) self.config.control_slots else self.config.slots - self.config.control_slots;
         if (slots == 0 or slots > capacity) return error.InvalidRunnableDemand;
-        // Live accepted work remains charged when admission closes. Resizing
-        // cannot manufacture an independently valid completion capability.
-        if (self.closed) return error.SchedulerClosed;
+        // Only a separately reserved/activated completion phase may resize
+        // after close. Other live work keeps its existing grant until finish.
+        if (self.closed and !e.completion_active) return error.SchedulerClosed;
         if (slots <= e.slots) {
             self.used[@backingInt(e.class)] -= e.slots - slots;
             e.slots = slots;
@@ -395,10 +402,11 @@ pub const Scheduler = struct {
         if (e.scheduler != self or e.state != .running or
             (reason != .resource_blocked and reason != .output_blocked)) return error.InvalidRunnableTransition;
         self.used[@backingInt(e.class)] -= e.slots;
-        if (self.closed) {
+        if (self.closed and !e.completion_active) {
             e.state = .stopped;
             e.failure = error.SchedulerClosed;
             e.ready.set(e.options.io);
+            self.dispatch();
             return error.SchedulerClosed;
         }
         e.state = reason;
@@ -410,7 +418,7 @@ pub const Scheduler = struct {
         self.lock();
         defer self.mutex.unlock();
         if (e.scheduler != self) return error.InvalidRunnableTransition;
-        if (self.closed) return error.SchedulerClosed;
+        if (self.closed and !e.completion_active) return error.SchedulerClosed;
         if (e.state != .resource_blocked and e.state != .output_blocked) return error.InvalidRunnableTransition;
         if (e.state == .resource_blocked) self.metrics.resource_blocked -= 1 else self.metrics.output_blocked -= 1;
         e.bypasses = 0;
@@ -426,11 +434,52 @@ pub const Scheduler = struct {
         self.lock();
         defer self.mutex.unlock();
         if (e.scheduler != self) return error.InvalidRunnableTransition;
-        if (self.closed) return error.SchedulerClosed;
+        if (self.closed and !e.completion_active) return error.SchedulerClosed;
         if (e.state != .resource_blocked and e.state != .output_blocked) return error.InvalidRunnableTransition;
+        // Completion cannot promote itself into another capacity partition.
+        if (e.completion_active and class != e.class) return error.InvalidRunnableTransition;
         const capacity = if (class == .control) self.config.control_slots else self.config.slots - self.config.control_slots;
         if (e.slots > capacity) return error.InvalidRunnableDemand;
         e.class = class;
+    }
+
+    /// Reserve completion ownership while the original foreground execution
+    /// is still running, before any potentially durable proposal. This uses
+    /// the already bounded entry, operation and byte reservation, not a new
+    /// foreground or control admission. It does not prove a storage decision.
+    pub fn reserveCompletion(self: *Scheduler, e: *Entry, completion: admission.Options) !void {
+        if (completion.deadline_ns == null or completion.cancellation != null or !completion.allow_wait)
+            return error.InvalidArgument;
+        try e.options.check();
+        try completion.check();
+        self.lock();
+        defer self.mutex.unlock();
+        if (e.scheduler != self or e.state != .running or
+            (e.class != .write and e.class != .control) or
+            e.completion_options != null or e.completion_active) return error.InvalidRunnableTransition;
+        if (self.closed) return error.SchedulerClosed;
+        if (completion.retained_bytes > e.bytes) return error.InvalidRunnableDemand;
+        var options = completion;
+        options.retained_bytes = e.bytes;
+        e.completion_options = options;
+    }
+
+    /// Enter the independent completion phase before possible durable
+    /// acceptance. The caller now owns all joins or an authoritative durable
+    /// transfer on every exit, including an ambiguous storage outcome.
+    pub fn activateCompletion(self: *Scheduler, e: *Entry) !void {
+        try e.options.check();
+        const completion = e.completion_options orelse return error.InvalidRunnableTransition;
+        try completion.check();
+        self.lock();
+        defer self.mutex.unlock();
+        if (e.scheduler != self or e.state != .running or e.completion_active) return error.InvalidRunnableTransition;
+        if (self.closed) return error.SchedulerClosed;
+        const options = e.completion_options orelse return error.InvalidRunnableTransition;
+        e.options = options;
+        e.completion_active = true;
+        // No queue time from the foreground phase governs this retained grant.
+        e.waited = false;
     }
 
     pub fn finish(self: *Scheduler, e: *Entry) void {
@@ -457,6 +506,8 @@ pub const Scheduler = struct {
         }
         e.state = .finished;
         e.scheduler = null;
+        e.completion_options = null;
+        e.completion_active = false;
         self.dispatch();
     }
     pub fn close(self: *Scheduler) void {
@@ -465,6 +516,7 @@ pub const Scheduler = struct {
         self.closed = true;
         var next = self.entries;
         while (next) |e| : (next = e.all_next) {
+            if (e.completion_active) continue;
             switch (e.state) {
                 .queued => self.unlink(e),
                 .resource_blocked => self.metrics.resource_blocked -= 1,
@@ -476,6 +528,7 @@ pub const Scheduler = struct {
             e.failure = error.SchedulerClosed;
             e.ready.set(e.options.io);
         }
+        self.dispatch();
     }
     pub fn stats(self: *Scheduler) Stats {
         self.lock();
@@ -608,6 +661,28 @@ pub const Execution = struct {
         try owner.waitRetained(e);
         self.resume_generation +%= 1;
         self.quantum_start_ns = e.options.now();
+        self.checkpoints = 0;
+    }
+    /// The independent Io/deadline and all retained resources must be owned
+    /// through joined completion. Foreground cancellation is deliberately not
+    /// copied into this capability. This is local trusted authority only.
+    pub fn reserveCompletion(self: *Execution, completion: admission.Options) !void {
+        const e = if (self.entry) |*entry| entry else return error.ExecutionWaitUnsupported;
+        const owner = try schedulerFor(e, true);
+        try e.options.check();
+        try owner.reserveCompletion(e, completion);
+    }
+    pub fn activateCompletion(self: *Execution) !void {
+        const e = if (self.entry) |*entry| entry else return error.ExecutionWaitUnsupported;
+        const owner = try schedulerFor(e, true);
+        // Activation must precede acceptance and may not escape a foreground
+        // fence which has already failed. Afterwards only completion fences
+        // govern the still-retained root.
+        try e.options.check();
+        const options = e.completion_options orelse return error.InvalidRunnableTransition;
+        try options.check();
+        try owner.activateCompletion(e);
+        self.quantum_start_ns = options.now();
         self.checkpoints = 0;
     }
     pub fn finish(self: *Execution) void {
@@ -1301,4 +1376,187 @@ test "runnable execution team shrink does not reuse an expired prior queue wait"
     try std.testing.expectEqual(State.running, scheduler.state(&execution.entry.?));
     try std.testing.expectEqual(@as(usize, 1), scheduler.stats().runnable_slots);
     try std.testing.expectEqual(@as(u64, 13), scheduler.stats().retained_bytes);
+}
+
+test "runnable execution completion reservation survives foreground cancellation and close" {
+    const Clock = struct {
+        var now_ns: u64 = 0;
+        fn now() u64 {
+            return now_ns;
+        }
+    };
+    const Cancel = struct {
+        fn requested(raw: *const anyopaque) bool {
+            return @as(*const std.atomic.Value(bool), @ptrCast(@alignCast(raw))).load(.acquire);
+        }
+    };
+    Clock.now_ns = 0;
+    var canceled = std.atomic.Value(bool).init(false);
+    var owner = try Scheduler.init(.{ .slots = 4, .control_slots = 1, .checkpoint_budget = 1 });
+    var execution: Execution = .{};
+    defer execution.finish();
+    try execution.startWithSlots(&owner, .{ .io = std.testing.io, .retained_bytes = 256, .deadline_ns = 5, .native_now_ns = Clock.now, .cancellation = .{ .ptr = &canceled, .requested = Cancel.requested } }, .write, 3);
+    try execution.reserveCompletion(.{ .io = std.testing.io, .deadline_ns = 100, .native_now_ns = Clock.now });
+    try execution.activateCompletion();
+    canceled.store(true, .release);
+    Clock.now_ns = 10;
+    try execution.park(.resource_blocked);
+    try std.testing.expectEqual(@as(usize, 0), owner.stats().runnable_slots);
+    try std.testing.expectEqual(@as(usize, 1), owner.stats().resource_blocked);
+    try std.testing.expectEqual(@as(usize, 1), owner.stats().operations);
+    try std.testing.expectEqual(@as(u64, 256), owner.stats().retained_bytes);
+    var health: Execution = .{};
+    defer health.finish();
+    try health.start(&owner, .{ .io = std.testing.io }, .control);
+    health.finish();
+    owner.close();
+    try std.testing.expectEqual(State.resource_blocked, execution.entry.?.state);
+    try execution.enter(.write);
+    try execution.checkpoint();
+    try std.testing.expectEqual(@as(usize, 3), owner.stats().runnable_slots);
+    try execution.park(.output_blocked);
+    try execution.enter(.write);
+    try execution.resizeTeam(2);
+    try std.testing.expectEqual(@as(usize, 2), owner.stats().runnable_slots);
+    var fresh: Execution = .{};
+    defer fresh.finish();
+    try std.testing.expectError(error.SchedulerClosed, fresh.start(&owner, .{ .io = std.testing.io }, .write));
+    execution.finish();
+    try std.testing.expectEqual(@as(usize, 0), owner.stats().operations);
+    try std.testing.expectEqual(@as(u64, 0), owner.stats().retained_bytes);
+    try std.testing.expectEqual(@as(usize, 0), owner.stats().runnable_slots);
+}
+
+test "runnable scheduler completion queued before close retains fair bounded ownership" {
+    var owner = try Scheduler.init(.{ .slots = 4, .control_slots = 1 });
+    var completion: Execution = .{};
+    defer completion.finish();
+    try completion.startWithSlots(&owner, .{ .io = std.testing.io, .retained_bytes = 17 }, .write, 3);
+    const deadline = completion.entry.?.options.now() + 10 * std.time.ns_per_s;
+    try completion.reserveCompletion(.{ .io = std.testing.io, .deadline_ns = deadline });
+    try completion.activateCompletion();
+    try completion.park(.resource_blocked);
+    var blocker = testEntry(.query, 3, 11);
+    defer owner.finish(&blocker);
+    try owner.submit(&blocker);
+    try owner.unblock(&completion.entry.?);
+    try std.testing.expectEqual(State.queued, completion.entry.?.state);
+    var unaccepted = testEntry(.write, 1, 5);
+    defer owner.finish(&unaccepted);
+    try owner.submit(&unaccepted);
+    owner.close();
+    try std.testing.expectEqual(State.queued, completion.entry.?.state);
+    try std.testing.expectEqual(State.stopped, unaccepted.state);
+    try std.testing.expectEqual(@as(usize, 3), owner.stats().operations);
+    try std.testing.expectEqual(@as(u64, 33), owner.stats().retained_bytes);
+    owner.finish(&blocker);
+    try owner.waitRetained(&completion.entry.?);
+    try std.testing.expectEqual(State.running, completion.entry.?.state);
+    try std.testing.expectEqual(@as(usize, 3), owner.stats().runnable_slots);
+    owner.finish(&unaccepted);
+    completion.finish();
+    try std.testing.expectEqual(@as(usize, 0), owner.stats().operations);
+}
+
+test "runnable execution completion requires prior bounded independent authorization" {
+    const Cancel = struct {
+        fn requested(raw: *const anyopaque) bool {
+            return @as(*const std.atomic.Value(bool), @ptrCast(@alignCast(raw))).load(.acquire);
+        }
+    };
+    var flag = std.atomic.Value(bool).init(false);
+    var owner = try Scheduler.init(.{ .slots = 4, .control_slots = 1 });
+    var execution: Execution = .{};
+    defer execution.finish();
+    try std.testing.expectError(error.ExecutionWaitUnsupported, execution.reserveCompletion(.{ .io = std.testing.io }));
+    try execution.start(&owner, .{ .io = std.testing.io, .retained_bytes = 32, .cancellation = .{ .ptr = &flag, .requested = Cancel.requested } }, .write);
+    const deadline = execution.entry.?.options.now() + 10 * std.time.ns_per_s;
+    try std.testing.expectError(error.InvalidRunnableTransition, execution.activateCompletion());
+    try std.testing.expectError(error.InvalidArgument, execution.reserveCompletion(.{ .io = std.testing.io }));
+    try std.testing.expectError(error.InvalidArgument, execution.reserveCompletion(.{ .io = std.testing.io, .deadline_ns = deadline, .allow_wait = false }));
+    try std.testing.expectError(error.InvalidArgument, execution.reserveCompletion(.{ .io = std.testing.io, .deadline_ns = deadline, .cancellation = .{ .ptr = &flag, .requested = Cancel.requested } }));
+    try std.testing.expectError(error.InvalidRunnableDemand, execution.reserveCompletion(.{ .io = std.testing.io, .deadline_ns = deadline, .retained_bytes = 33 }));
+    try std.testing.expect(execution.entry.?.completion_options == null);
+    try execution.reserveCompletion(.{ .io = std.testing.io, .deadline_ns = deadline });
+    try std.testing.expectError(error.InvalidRunnableTransition, execution.reserveCompletion(.{ .io = std.testing.io, .deadline_ns = deadline }));
+    flag.store(true, .release);
+    try std.testing.expectError(error.Canceled, execution.activateCompletion());
+    try std.testing.expect(!execution.entry.?.completion_active);
+    try std.testing.expectEqual(@as(usize, 1), owner.stats().runnable_slots);
+    flag.store(false, .release);
+    owner.close();
+    try std.testing.expectError(error.SchedulerClosed, execution.activateCompletion());
+    try std.testing.expect(!execution.entry.?.completion_active);
+    execution.finish();
+    var reader_owner = try Scheduler.init(.{});
+    try execution.start(&reader_owner, .{ .io = std.testing.io }, .query);
+    try std.testing.expectError(error.InvalidRunnableTransition, execution.reserveCompletion(.{ .io = std.testing.io, .deadline_ns = deadline }));
+}
+
+test "runnable execution expired completion retains consumers until joined finish" {
+    const Clock = struct {
+        var now_ns: u64 = 0;
+        fn now() u64 {
+            return now_ns;
+        }
+    };
+    Clock.now_ns = 0;
+    var owner = try Scheduler.init(.{ .slots = 3, .control_slots = 1 });
+    var execution: Execution = .{};
+    defer execution.finish();
+    try execution.startWithSlots(&owner, .{ .io = std.testing.io, .retained_bytes = 64, .native_now_ns = Clock.now }, .write, 2);
+    try execution.reserveCompletion(.{ .io = std.testing.io, .deadline_ns = 100, .native_now_ns = Clock.now });
+    try execution.activateCompletion();
+    try std.testing.expectError(error.InvalidRunnableTransition, execution.activateCompletion());
+    try execution.park(.resource_blocked);
+    try std.testing.expectError(error.InvalidRunnableTransition, execution.enter(.control));
+    try std.testing.expectEqual(State.resource_blocked, execution.entry.?.state);
+    Clock.now_ns = 100;
+    try std.testing.expectError(error.DeadlineExceeded, execution.enter(.write));
+    try std.testing.expectEqual(State.stopped, execution.entry.?.state);
+    try std.testing.expectEqual(@as(usize, 1), owner.stats().operations);
+    try std.testing.expectEqual(@as(u64, 64), owner.stats().retained_bytes);
+    try std.testing.expectEqual(@as(usize, 0), owner.stats().runnable_slots);
+    Clock.now_ns = 0;
+    try std.testing.expectError(error.DeadlineExceeded, execution.checkpoint());
+    try std.testing.expectError(error.DeadlineExceeded, execution.park(.resource_blocked));
+    owner.close();
+    execution.finish();
+    try std.testing.expectEqual(@as(usize, 0), owner.stats().operations);
+    try std.testing.expectEqual(@as(u64, 0), owner.stats().retained_bytes);
+}
+
+test "runnable scheduler closing foreground releases CPU to retained completion before finish" {
+    for ([_]bool{ false, true }) |park| {
+        var owner = try Scheduler.init(.{ .slots = 4, .control_slots = 1, .checkpoint_budget = 1 });
+        var completion: Execution = .{};
+        defer completion.finish();
+        try completion.startWithSlots(&owner, .{ .io = std.testing.io, .retained_bytes = 17 }, .write, 3);
+        const deadline = completion.entry.?.options.now() + 10 * std.time.ns_per_s;
+        try completion.reserveCompletion(.{ .io = std.testing.io, .deadline_ns = deadline });
+        try completion.activateCompletion();
+        try completion.park(.resource_blocked);
+        var foreground: Execution = .{};
+        defer foreground.finish();
+        try foreground.startWithSlots(&owner, .{ .io = std.testing.io, .retained_bytes = 11 }, .query, 3);
+        try owner.unblock(&completion.entry.?);
+        try std.testing.expectEqual(State.queued, completion.entry.?.state);
+        owner.close();
+        if (park) {
+            try std.testing.expectError(error.SchedulerClosed, foreground.park(.resource_blocked));
+        } else {
+            try std.testing.expectError(error.SchedulerClosed, foreground.checkpoint());
+        }
+        // The stopped foreground still owns consumers and retained bytes.
+        // Its released CPU must dispatch completion before those joins finish.
+        try std.testing.expectEqual(State.stopped, foreground.entry.?.state);
+        try std.testing.expectEqual(State.running, completion.entry.?.state);
+        try owner.waitRetained(&completion.entry.?);
+        try std.testing.expectEqual(@as(usize, 2), owner.stats().operations);
+        try std.testing.expectEqual(@as(u64, 28), owner.stats().retained_bytes);
+        try std.testing.expectEqual(@as(usize, 3), owner.stats().runnable_slots);
+        foreground.finish();
+        completion.finish();
+        try std.testing.expectEqual(@as(usize, 0), owner.stats().operations);
+    }
 }
