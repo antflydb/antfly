@@ -8,7 +8,7 @@ const projector = @import("../architectures/gemma4_projector.zig");
 const Session = @import("../backends/session.zig").Session;
 const Tokenizer = @import("inference_tokenizer").Tokenizer;
 const Control = @import("../execution_control.zig").InferenceExecutionControl;
-const scoring = @import("../extractors/embedding_decisions.zig");
+const scoring = @import("antfly_decisions").scoring;
 pub const Part = union(enum) { text: []const u8, image: []const u8, audio: []const u8 };
 pub const Group = struct { title: ?[]const u8 = null, content: []const Part };
 pub const Options = struct { task_type: []const u8 = "RETRIEVAL_DOCUMENT", dimensions: usize = 768 };

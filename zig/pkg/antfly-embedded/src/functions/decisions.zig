@@ -16,9 +16,10 @@
 //! Provider-neutral typed decisions. All values returned by this module belong
 //! to the supplied allocator (normally a bounded request arena).
 const std = @import("std");
+const contract = @import("antfly_decisions");
 pub const Json = std.json.Value;
 pub const Provider = enum { antfly, jev, openai };
-pub const Kind = enum { choice, score, noul };
+pub const Kind = enum { choice, multi_choice, score, noul };
 pub const Function = enum { ai_decide, ai_choice, ai_score, ai_probability };
 pub const Capabilities = struct { max_questions: usize = 64, max_choices: usize = 64, max_levels: usize, max_input_bytes: usize = 1024 * 1024, full_distribution: bool = true, embedding_similarity: bool = false };
 pub fn capabilities(provider: Provider) Capabilities {
@@ -124,7 +125,25 @@ pub const DeciderConfig = struct {
     }
 };
 pub fn wireRequest(a: std.mem.Allocator, cfg: DeciderConfig, input: []const u8, questions: Json) ![]u8 {
-    return std.json.Stringify.valueAlloc(a, .{ .model = cfg.modelName(), .model_identity = cfg.model_identity, .embedding_options = cfg.embedding_options, .state = input, .questions = questions }, .{ .emit_null_optional_fields = false });
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const temporary = arena.allocator();
+    if (cfg.provider == .jev) {
+        // Public score labels are response metadata, not Jev input fields.
+        var upstream = jsonObject();
+        const original = try object(questions);
+        for (original.keys(), original.values()) |name, raw| {
+            var question = jsonObject();
+            const fields = try object(raw);
+            for (fields.keys(), fields.values()) |key, value| {
+                if (!std.mem.eql(u8, key, "level_labels")) try put(temporary, &question, key, value);
+            }
+            try put(temporary, &upstream, name, question);
+        }
+        return std.json.Stringify.valueAlloc(a, .{ .model = cfg.modelName(), .state = input, .questions = upstream }, .{});
+    }
+    const options: ?Json = if (cfg.embedding_options) |configured| try std.json.parseFromSliceLeaky(Json, temporary, try std.json.Stringify.valueAlloc(temporary, configured, .{ .emit_null_optional_fields = false }), .{}) else null;
+    return contract.requestJson(a, cfg.modelName(), input, questions, options, cfg.model_identity);
 }
 pub fn parseConfig(a: std.mem.Allocator, v: Json) !DeciderConfig {
     const bytes = try std.json.Stringify.valueAlloc(a, v, .{});
@@ -172,14 +191,14 @@ pub fn validateQuestions(questions: Json, caps: Capabilities) !void {
         schema_bytes +|= (try text(.{ .string = entry.key_ptr.* })).len;
         const q = try object(entry.value_ptr.*);
         var keys = q.iterator();
-        while (keys.next()) |key| if (!std.mem.eql(u8, key.key_ptr.*, "type") and !std.mem.eql(u8, key.key_ptr.*, "instructions") and !std.mem.eql(u8, key.key_ptr.*, "criteria")) return error.InvalidDecisionSpecification;
+        while (keys.next()) |key| if (!std.mem.eql(u8, key.key_ptr.*, "type") and !std.mem.eql(u8, key.key_ptr.*, "instructions") and !std.mem.eql(u8, key.key_ptr.*, "criteria") and !std.mem.eql(u8, key.key_ptr.*, "level_labels") and !(caps.embedding_similarity and (std.mem.eql(u8, key.key_ptr.*, "embedding_options") or std.mem.eql(u8, key.key_ptr.*, "similarity_thresholds")))) return error.InvalidDecisionSpecification;
         const kind = std.meta.stringToEnum(Kind, try text(q.get("type") orelse return error.InvalidDecisionSpecification)) orelse return error.InvalidDecisionSpecification;
-        if (caps.embedding_similarity and kind != .choice) return error.UnsupportedDecisionKind;
+        if ((caps.embedding_similarity and kind != .choice and kind != .multi_choice) or (!caps.embedding_similarity and kind == .multi_choice)) return error.UnsupportedDecisionKind;
         schema_bytes +|= (try text(q.get("instructions") orelse return error.InvalidDecisionSpecification)).len;
         const criteria = q.get("criteria");
         switch (kind) {
             .noul => if (criteria != null) return error.InvalidDecisionSpecification,
-            .choice => {
+            .choice, .multi_choice => {
                 const options = try object(criteria orelse return error.InvalidDecisionSpecification);
                 if (options.count() < 2 or options.count() > caps.max_choices) return error.DecisionLimitExceeded;
                 var options_it = options.iterator();
@@ -215,11 +234,14 @@ fn parseSpecificationJson(a: std.mem.Allocator, bytes: []const u8) !Json {
         else => return error.InvalidDecisionSpecification,
     };
 }
+pub fn publicQuestions(a: std.mem.Allocator, questions: Json) !Json {
+    return contract.internalQuestions(a, questions) catch |err| return if (err == error.OutOfMemory) err else error.InvalidDecisionSpecification;
+}
 pub fn questionsFor(a: std.mem.Allocator, function: Function, args: []const Json) !Json {
     if (args.len != descriptor(@tagName(function)).?.argument_count) return error.InvalidDecisionSpecification;
     if (function == .ai_decide) {
-        if (args[1] == .string) return parseSpecificationJson(a, args[1].string);
-        return args[1];
+        const public = if (args[1] == .string) try parseSpecificationJson(a, args[1].string) else args[1];
+        return publicQuestions(a, public);
     }
     var question = jsonObject();
     const kind: Kind = switch (function) {
@@ -237,15 +259,21 @@ pub fn questionsFor(a: std.mem.Allocator, function: Function, args: []const Json
 }
 pub fn selectResult(function: Function, response: Json) !Json {
     if (function == .ai_decide) return response;
-    const answers = try object((try object(response)).get("answers") orelse return error.InvalidDecisionOutput);
-    const answer = try object(answers.get("answer") orelse return error.InvalidDecisionOutput);
-    return answer.get(switch (function) {
-        .ai_choice => "choice",
-        .ai_score => "score",
-        .ai_probability => "noul",
-        else => unreachable,
-    }) orelse error.InvalidDecisionOutput;
+    const answers = (try object(response)).get("answers") orelse return error.InvalidDecisionOutput;
+    if (answers != .array) return error.InvalidDecisionOutput;
+    for (answers.array.items) |entry| {
+        const answer = try object(entry);
+        const name = answer.get("name") orelse return error.InvalidDecisionOutput;
+        if (name == .string and std.mem.eql(u8, name.string, "answer")) return answer.get(switch (function) {
+            .ai_choice => "choice",
+            .ai_score => "score",
+            .ai_probability => "probability",
+            else => unreachable,
+        }) orelse error.InvalidDecisionOutput;
+    }
+    return error.InvalidDecisionOutput;
 }
+
 fn number(v: Json) !f64 {
     const n: f64 = switch (v) {
         .integer => @floatFromInt(v.integer),
@@ -269,6 +297,10 @@ pub fn normalizeResponse(a: std.mem.Allocator, questions: Json, source: Json) !J
 // The allowed result contract is supplied by trusted decider configuration;
 // a provider's response cannot opt itself into accepting uncalibrated scores.
 pub fn normalizeResponseWithCapabilities(a: std.mem.Allocator, questions: Json, source: Json, caps: Capabilities) !Json {
+    const private = try contract.internalResponse(a, source);
+    return contract.publicResponse(a, try normalizeLegacy(a, questions, private, caps));
+}
+fn normalizeLegacy(a: std.mem.Allocator, questions: Json, source: Json, caps: Capabilities) !Json {
     const bytes = try std.json.Stringify.valueAlloc(a, source, .{});
     defer a.free(bytes);
     const response = try std.json.parseFromSliceLeaky(Json, a, bytes, .{ .allocate = .alloc_always });
@@ -291,8 +323,12 @@ pub fn normalizeResponseWithCapabilities(a: std.mem.Allocator, questions: Json, 
         const actual_kind = answer.object.get("type") orelse return error.InvalidDecisionOutput;
         if (actual_kind != .string or !std.mem.eql(u8, actual_kind.string, @tagName(kind))) return error.InvalidDecisionOutput;
         if (answer.object.get("decision_method")) |method| {
-            if (method != .string or !std.mem.eql(u8, method.string, "embedding_similarity") or !caps.embedding_similarity or kind != .choice) return error.InvalidDecisionOutput;
-            if (answer.object.contains("confidence") or answer.object.contains("probabilities")) return error.InvalidDecisionOutput;
+            if (method != .string or !std.mem.eql(u8, method.string, "embedding_similarity") or !caps.embedding_similarity or (kind != .choice and kind != .multi_choice)) return error.InvalidDecisionOutput;
+            inline for (.{ "confidence", "confidence_method", "act_probability", "probabilities", "noul", "probability" }) |field|
+                if (answer.object.contains(field)) return error.InvalidDecisionOutput;
+            const prototype_hash = text(answer.object.get("prototype_set_hash") orelse return error.InvalidDecisionOutput) catch return error.InvalidDecisionOutput;
+            if (prototype_hash.len != 64) return error.InvalidDecisionOutput;
+            for (prototype_hash) |c| if (!std.ascii.isDigit(c) and (c < 'a' or c > 'f')) return error.InvalidDecisionOutput;
             const similarities = try object(answer.object.get("similarities") orelse return error.InvalidDecisionOutput);
             const criteria = spec.get("criteria").?.object;
             if (similarities.count() != criteria.count()) return error.InvalidDecisionOutput;
@@ -307,6 +343,41 @@ pub fn normalizeResponseWithCapabilities(a: std.mem.Allocator, questions: Json, 
                     best = score;
                     best_label = label;
                 } else second = @max(second, score);
+            }
+            const metric = try text(answer.object.get("similarity_metric") orelse return error.InvalidDecisionOutput);
+            if (!std.mem.eql(u8, metric, "cosine")) return error.InvalidDecisionOutput;
+            if (kind == .multi_choice) {
+                const thresholds = try object(answer.object.get("similarity_thresholds") orelse return error.InvalidDecisionOutput);
+                if (thresholds.count() != criteria.count()) return error.InvalidDecisionOutput;
+                const selected = answer.object.get("choices") orelse return error.InvalidDecisionOutput;
+                if (selected != .array) return error.InvalidDecisionOutput;
+                var expected_count: usize = 0;
+                var expected_margin: f64 = std.math.inf(f64);
+                for (criteria.keys()) |label| {
+                    const score = try number(similarities.get(label).?);
+                    const threshold = try number(thresholds.get(label) orelse return error.InvalidDecisionOutput);
+                    if (threshold < -1 or threshold > 1) return error.InvalidDecisionOutput;
+                    if (spec.get("similarity_thresholds")) |requested| {
+                        const expected_threshold = try number(if (requested == .object) requested.object.get(label) orelse return error.InvalidDecisionOutput else requested);
+                        if (@abs(threshold - expected_threshold) > 1e-6) return error.InvalidDecisionOutput;
+                    }
+                    expected_margin = @min(expected_margin, @abs(score - threshold));
+                    if (score >= threshold) expected_count += 1;
+                }
+                for (selected.array.items, 0..) |value, index| {
+                    const label = try text(value);
+                    const score = try number(similarities.get(label) orelse return error.InvalidDecisionOutput);
+                    if (score < try number(thresholds.get(label).?)) return error.InvalidDecisionOutput;
+                    for (selected.array.items[0..index]) |other| if (std.mem.eql(u8, label, try text(other))) return error.InvalidDecisionOutput;
+                }
+                const margin = try number(answer.object.get("margin") orelse return error.InvalidDecisionOutput);
+                if (@abs(margin - expected_margin) > 1e-6) return error.InvalidDecisionOutput;
+                const status = try text(answer.object.get("status") orelse return error.InvalidDecisionOutput);
+                if (std.mem.eql(u8, status, "abstained")) {
+                    if (selected.array.items.len != 0 or !std.mem.eql(u8, try text(answer.object.get("abstention_reason") orelse return error.InvalidDecisionOutput), "min_margin")) return error.InvalidDecisionOutput;
+                } else if (!std.mem.eql(u8, status, if (expected_count == 0) "empty" else "selected") or selected.array.items.len != expected_count) return error.InvalidDecisionOutput;
+                try put(a, &normalized, q.key_ptr.*, answer);
+                continue;
             }
             const margin = try number(answer.object.get("margin") orelse return error.InvalidDecisionOutput);
             if (@abs(margin - (best - second)) > 1e-6) return error.InvalidDecisionOutput;
@@ -325,6 +396,11 @@ pub fn normalizeResponseWithCapabilities(a: std.mem.Allocator, questions: Json, 
         }
         if (caps.embedding_similarity) return error.InvalidDecisionOutput;
         if (answer.object.get("confidence")) |confidence| _ = try probability(confidence);
+        if (answer.object.get("confidence_method")) |method| {
+            const name = try text(method);
+            if (!std.mem.eql(u8, name, "normalized_inverse_entropy") and !std.mem.eql(u8, name, "max_probability")) return error.InvalidDecisionOutput;
+        }
+        if (answer.object.get("act_probability")) |act| _ = try probability(act);
         if (kind == .noul) {
             _ = try probability(answer.object.get("noul") orelse return error.InvalidDecisionOutput);
         } else {
@@ -341,18 +417,22 @@ pub fn normalizeResponseWithCapabilities(a: std.mem.Allocator, questions: Json, 
             var best: f64 = -1;
             var best_label: []const u8 = "";
             var legend = jsonObject();
+            var entropy: f64 = 0;
             for (0..count) |i| {
                 const key = if (kind == .choice) criteria.object.keys()[i] else try std.fmt.allocPrint(a, "{d}", .{i});
                 const p = try probability(dist.get(key) orelse return error.InvalidDecisionOutput);
                 total += p;
+                if (p > 0) entropy -= p * @log(p);
                 expected += @as(f64, @floatFromInt(i)) * p;
                 if (p > best) {
                     best = p;
                     best_label = key;
                 }
-                if (kind == .score) try put(a, &legend, key, criteria.array.items[i]);
+                if (kind == .score) try put(a, &legend, key, if (spec.get("level_labels")) |labels| labels.array.items[i] else criteria.array.items[i]);
             }
             if (@abs(total - 1) > 0.01 or total <= 0) return error.InvalidDecisionOutput;
+            if (!answer.object.contains("confidence")) try put(a, &answer, "confidence", .{ .float = std.math.clamp(1 - entropy / @log(@as(f64, @floatFromInt(count))), 0, 1) });
+            if (!answer.object.contains("confidence_method")) try put(a, &answer, "confidence_method", .{ .string = "normalized_inverse_entropy" });
             if (kind == .choice) try put(a, &answer, "choice", .{ .string = best_label }) else {
                 try put(a, &answer, "score", .{ .float = expected / total });
                 try put(a, &answer, "legend", legend);
@@ -365,42 +445,52 @@ pub fn normalizeResponseWithCapabilities(a: std.mem.Allocator, questions: Json, 
     return result;
 }
 
-test "embeddinggemma2 scored decisions require configured capability and preserve SQL null" {
+test "decision provider embeddinggemma2 scored decisions require configured capability and preserve SQL null" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
     const questions = try std.json.parseFromSliceLeaky(Json, a, "{\"answer\":{\"type\":\"choice\",\"instructions\":\"Route\",\"criteria\":{\"a\":\"Account\",\"b\":\"Billing\"}}}", .{});
-    const response = try std.json.parseFromSliceLeaky(Json, a, "{\"model\":\"embeddinggemma2\",\"answers\":{\"answer\":{\"type\":\"choice\",\"choice\":null,\"decision_method\":\"embedding_similarity\",\"similarities\":{\"a\":0.3,\"b\":0.3},\"margin\":0,\"status\":\"abstained\",\"abstention_reason\":\"tie\"}},\"usage\":{\"input_tokens\":2,\"output_tokens\":0}}", .{});
+    const response = try std.json.parseFromSliceLeaky(Json, a, "{\"model\":\"embeddinggemma2\",\"answers\":{\"answer\":{\"type\":\"choice\",\"choice\":null,\"decision_method\":\"embedding_similarity\",\"similarity_metric\":\"cosine\",\"similarities\":{\"a\":0.3,\"b\":0.3},\"margin\":0,\"status\":\"abstained\",\"abstention_reason\":\"tie\"}},\"usage\":{\"input_tokens\":2,\"output_tokens\":0}}", .{});
     try std.testing.expectError(error.InvalidDecisionOutput, normalizeResponse(a, questions, response));
     const caps = (DeciderConfig{ .provider = .antfly, .model = "embeddinggemma2", .decision_method = .embedding_similarity }).resolvedCapabilities();
     try validateQuestions(questions, caps);
+    try std.testing.expectError(error.InvalidDecisionOutput, normalizeResponseWithCapabilities(a, questions, response, caps));
+    const answer = response.object.getPtr("answers").?.object.getPtr("answer").?;
+    const prototype_hash: [64]u8 = @splat('a');
+    try put(a, answer, "prototype_set_hash", .{ .string = &prototype_hash });
     const normalized = try normalizeResponseWithCapabilities(a, questions, response, caps);
     try std.testing.expect((try selectResult(.ai_choice, normalized)) == .null);
-    const answer = response.object.getPtr("answers").?.object.getPtr("answer").?;
+    try std.testing.expectEqualStrings(&prototype_hash, normalized.object.get("answers").?.array.items[0].object.get("prototype_set_hash").?.string);
+    try put(a, answer, "prototype_set_hash", .{ .string = "invalid" });
+    try std.testing.expectError(error.InvalidDecisionOutput, normalizeResponseWithCapabilities(a, questions, response, caps));
+    try put(a, answer, "prototype_set_hash", .{ .string = &prototype_hash });
     try put(a, answer, "confidence", .{ .float = 0.9 });
     try std.testing.expectError(error.InvalidDecisionOutput, normalizeResponseWithCapabilities(a, questions, response, caps));
     try std.testing.expectError(error.InvalidDeciderConfig, (DeciderConfig{ .provider = .jev, .decision_method = .embedding_similarity }).validate());
 }
 
-test "embeddinggemma2 SQL configuration owns calibration and renders the pinned request" {
+test "decision provider embeddinggemma2 SQL configuration owns calibration and renders the pinned request" {
     const a = std.testing.allocator;
     const identity: [64]u8 = @splat('a');
     const cfg = DeciderConfig{ .provider = .antfly, .decision_method = .embedding_similarity, .model = "embeddinggemma2", .model_identity = &identity, .embedding_options = .{ .dimensions = 128, .calibration_id = "routing_v1" } };
     try cfg.validate();
     var copy = try cfg.clone(a);
     defer copy.deinit(a);
-    const body = try wireRequest(a, copy, "Reset my password", jsonObject());
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const questions = try std.json.parseFromSliceLeaky(Json, arena.allocator(), "{\"route\":{\"type\":\"choice\",\"instructions\":\"Route\",\"criteria\":{\"a\":\"Account\",\"b\":\"Billing\"}}}", .{});
+    const body = try wireRequest(a, copy, "Reset my password", questions);
     defer a.free(body);
     const parsed = try std.json.parseFromSlice(Json, a, body, .{});
     defer parsed.deinit();
     try std.testing.expectEqualStrings(&identity, parsed.value.object.get("model_identity").?.string);
-    try std.testing.expectEqualStrings("routing_v1", parsed.value.object.get("embedding_options").?.object.get("calibration_id").?.string);
+    try std.testing.expectEqualStrings("routing_v1", parsed.value.object.get("questions").?.array.items[0].object.get("embedding_options").?.object.get("calibration_id").?.string);
     var invalid = cfg;
     invalid.embedding_options.?.min_margin = 0.1;
     try std.testing.expectError(error.InvalidDeciderConfig, invalid.validate());
 }
 
-test "embeddinggemma2 provider wrapper retains the trusted similarity contract" {
+test "decision provider embeddinggemma2 provider wrapper retains the trusted similarity contract" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -418,7 +508,7 @@ test "embeddinggemma2 provider wrapper retains the trusted similarity contract" 
         }
     };
     const questions = try std.json.parseFromSliceLeaky(Json, a, "{\"answer\":{\"type\":\"choice\",\"instructions\":\"Route\",\"criteria\":{\"a\":\"Account\",\"b\":\"Billing\"}}}", .{});
-    var mock = Mock{ .response = try std.json.parseFromSliceLeaky(Json, a, "{\"model\":\"embeddinggemma2\",\"answers\":{\"answer\":{\"type\":\"choice\",\"decision_method\":\"embedding_similarity\",\"choice\":null,\"status\":\"abstained\",\"abstention_reason\":\"tie\",\"similarities\":{\"a\":0.3,\"b\":0.3},\"margin\":0}},\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}", .{}) };
+    var mock = Mock{ .response = try std.json.parseFromSliceLeaky(Json, a, "{\"model\":\"embeddinggemma2\",\"answers\":{\"answer\":{\"type\":\"choice\",\"decision_method\":\"embedding_similarity\",\"similarity_metric\":\"cosine\",\"prototype_set_hash\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"choice\":null,\"status\":\"abstained\",\"abstention_reason\":\"tie\",\"similarities\":{\"a\":0.3,\"b\":0.3},\"margin\":0}},\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}", .{}) };
     const provider = DecisionProvider{ .ptr = &mock, .validate_fn = Mock.validate, .evaluate_batch_fn = Mock.evaluate, .capabilities_fn = Mock.caps };
     const rows = try provider.evaluateBatch(a, &.{.{ .decider = "routing", .questions = questions, .input = "Reset password" }});
     try std.testing.expect((try selectResult(.ai_choice, rows[0])) == .null);
@@ -470,11 +560,17 @@ test "decision provider limits and score normalization preserve ordinal semantic
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
+    const public = try std.json.parseFromSliceLeaky(Json, a,
+        \\[{"name":"priority","type":"score","instructions":"Urgency","levels":[{"label":"low"},{"label":"high"}]}]
+    , .{});
+    const labeled = try publicQuestions(a, public);
+    const upstream = try std.json.parseFromSliceLeaky(Json, a, try wireRequest(a, .{ .provider = .jev }, "text", labeled), .{});
+    try std.testing.expect(!upstream.object.get("questions").?.object.get("priority").?.object.contains("level_labels"));
     const questions = try std.json.parseFromSliceLeaky(Json, a, "{\"priority\":{\"type\":\"score\",\"instructions\":\"Urgency\",\"criteria\":[\"Low\",\"High\"]}}", .{});
     try validateQuestions(questions, capabilities(.jev));
     const response = try std.json.parseFromSliceLeaky(Json, a, "{\"model\":\"jev-test\",\"answers\":{\"priority\":{\"type\":\"score\",\"score\":99,\"probabilities\":{\"0\":0.2,\"1\":0.8}}},\"usage\":{\"input_tokens\":2,\"output_tokens\":0}}", .{});
     const normalized = try normalizeResponse(a, questions, response);
-    try std.testing.expectApproxEqAbs(@as(f64, 0.8), normalized.object.get("answers").?.object.get("priority").?.object.get("score").?.float, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.8), normalized.object.get("answers").?.array.items[0].object.get("score").?.float, 0.0001);
     var malformed = response;
     var answers = malformed.object.getPtr("answers").?;
     var priority = answers.object.getPtr("priority").?;
@@ -498,4 +594,35 @@ test "decision provider OpenAI configuration and score limits" {
     const questions = try questionsFor(a, .ai_score, &.{ .{ .string = "context" }, .{ .string = "Risk?" }, levels, .{ .string = "openai" } });
     try std.testing.expectError(error.DecisionLimitExceeded, validateQuestions(questions, capabilities(.openai)));
     try validateQuestions(questions, capabilities(.antfly));
+}
+
+test "decision provider named arrays isolate calibration and validate empty multi choice" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const public = try std.json.parseFromSliceLeaky(Json, a,
+        \\[{"name":"route","type":"choice","instructions":"Route","choices":[{"value":"a"},{"value":"b"}],"embedding_options":{"calibration_id":"routing_v1"}},{"name":"tags","type":"multi_choice","instructions":"Tags","choices":[{"value":"a"},{"value":"b"}],"similarity_thresholds":0.5}]
+    , .{});
+    const questions = try publicQuestions(a, public);
+    const cfg: DeciderConfig = .{ .provider = .antfly, .model = "embeddinggemma2", .decision_method = .embedding_similarity, .embedding_options = .{ .dimensions = 128, .calibration_id = "default_policy" } };
+    try validateQuestions(questions, cfg.resolvedCapabilities());
+    const request = try std.json.parseFromSliceLeaky(Json, a, try wireRequest(a, cfg, "input", questions), .{});
+    const wire = request.object.get("questions").?.array.items;
+    try std.testing.expectEqualStrings("routing_v1", wire[0].object.get("embedding_options").?.object.get("calibration_id").?.string);
+    try std.testing.expect(!wire[1].object.contains("embedding_options"));
+    try std.testing.expect(!request.object.get("embedding_options").?.object.contains("calibration_id"));
+    try std.testing.expect(!request.object.contains("state"));
+    try std.testing.expectError(error.InvalidDecisionSpecification, validateQuestions(questions, capabilities(.openai)));
+    var multi = jsonObject();
+    try put(a, &multi, "tags", questions.object.get("tags").?);
+    const response = try std.json.parseFromSliceLeaky(Json, a,
+        \\{"model":"embeddinggemma2","answers":[{"name":"tags","type":"multi_choice","decision_method":"embedding_similarity","similarity_metric":"cosine","prototype_set_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","choices":[],"similarities":[{"value":"a","similarity":0.2},{"value":"b","similarity":0.1}],"similarity_thresholds":{"a":0.5,"b":0.5},"margin":0.3,"status":"empty"}],"usage":{"input_tokens":2,"output_tokens":0}}
+    , .{});
+    const normalized = try normalizeResponseWithCapabilities(a, multi, response, cfg.resolvedCapabilities());
+    try std.testing.expectEqualStrings("empty", normalized.object.get("answers").?.array.items[0].object.get("status").?.string);
+    try std.testing.expectEqual(@as(usize, 0), normalized.object.get("answers").?.array.items[0].object.get("choices").?.array.items.len);
+    var changed = response;
+    const answer = &changed.object.getPtr("answers").?.array.items[0];
+    try put(a, answer, "choices", try std.json.parseFromSliceLeaky(Json, a, "[\"a\"]", .{}));
+    try std.testing.expectError(error.InvalidDecisionOutput, normalizeResponseWithCapabilities(a, multi, changed, cfg.resolvedCapabilities()));
 }

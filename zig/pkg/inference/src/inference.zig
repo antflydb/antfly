@@ -50,7 +50,7 @@ pub const io = @import("io/io.zig");
 pub const codecs = @import("codecs/codecs.zig");
 pub const compiled_artifact = @import("compiled_artifact.zig");
 pub const graph = @import("graph/root.zig");
-pub const embedding_decisions = @import("extractors/embedding_decisions.zig");
+pub const embedding_decisions = @import("antfly_decisions").scoring;
 pub const embedding_gemma2_pipeline = @import("pipelines/embedding_gemma2.zig");
 pub const architectures = struct {
     pub const embedding_gemma2 = @import("architectures/embedding_gemma2.zig");
@@ -93,6 +93,7 @@ pub const native_export_safetensors = @import("native_export_safetensors.zig");
 pub const native_run_artifact = @import("native_run_artifact.zig");
 pub const native_embed = @import("native_embed.zig");
 pub const native_decide = @import("native_decide.zig");
+pub const decision_api = @import("antfly_decisions");
 pub const native_classify = @import("native_classify.zig");
 pub const native_rerank = @import("native_rerank.zig");
 pub const native_transcribe = @import("native_transcribe.zig");
@@ -369,6 +370,7 @@ test "raw CUDA attention differential surface reports output drift" {
 test "embeddinggemma2 declarations compile" {
     std.testing.refAllDecls(architectures.embedding_gemma2);
     std.testing.refAllDecls(embedding_decisions);
+    std.testing.refAllDecls(decision_api);
     std.testing.refAllDecls(embedding_gemma2_pipeline);
     _ = @import("architectures/embedding_gemma2_media_weights.zig");
     _ = server;

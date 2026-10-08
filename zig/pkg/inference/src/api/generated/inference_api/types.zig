@@ -3,6 +3,7 @@
 
 const std = @import("std");
 const antfly_chunking_api_openapi = @import("antfly_chunking_api_openapi");
+const antfly_decision_openapi = @import("antfly_decision_openapi");
 const antfly_generating_openapi = @import("antfly_generating_openapi");
 
 /// Load-time residency policy for the qualified Gemma 4 26B-A4B Q4_0 Metal or CUDA runtime. On qualified SM89 CUDA, auto resolves to resident and fails closed unless its envelope fits.
@@ -789,233 +790,13 @@ pub const Credentials = struct {
     }
 };
 
-pub const DecideAnswer = struct {
-    prototype_set_hash: ?[]const u8 = null,
-    calibration_id: ?[]const u8 = null,
-    type: []const u8,
-    /// Selected option, or null when a similarity decision abstains.
-    choice: OpenApiOptionalNullable([]const u8) = .absent,
-    decision_method: ?[]const u8 = null,
-    similarities: ?std.json.ArrayHashMap(f64) = null,
-    margin: ?f64 = null,
-    status: ?[]const u8 = null,
-    abstention_reason: ?[]const u8 = null,
-    score: ?f64 = null,
-    noul: ?f64 = null,
-    legend: ?std.json.ArrayHashMap([]const u8) = null,
-    probabilities: ?std.json.ArrayHashMap(f64) = null,
+pub const DecideAnswer = antfly_decision_openapi.DecideAnswer;
 
-    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
-    pub const openApiFieldMetadata = .{
-        .{ "prototype_set_hash", "prototype_set_hash", true },
-        .{ "calibration_id", "calibration_id", true },
-        .{ "type", "type", false },
-        .{ "choice", "choice", false },
-        .{ "decision_method", "decision_method", true },
-        .{ "similarities", "similarities", true },
-        .{ "margin", "margin", true },
-        .{ "status", "status", true },
-        .{ "abstention_reason", "abstention_reason", true },
-        .{ "score", "score", true },
-        .{ "noul", "noul", true },
-        .{ "legend", "legend", true },
-        .{ "probabilities", "probabilities", true },
-    };
+pub const DecideQuestion = antfly_decision_openapi.DecideQuestion;
 
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
-    }
+pub const DecideRequest = antfly_decision_openapi.DecideRequest;
 
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        try jw.beginObject();
-        if (self.prototype_set_hash) |value| {
-            try jw.objectField("prototype_set_hash");
-            try jw.write(value);
-        }
-        if (self.calibration_id) |value| {
-            try jw.objectField("calibration_id");
-            try jw.write(value);
-        }
-        try jw.objectField("type");
-        try jw.write(self.type);
-        switch (self.choice) {
-            .absent => {},
-            .null_value => {
-                try jw.objectField("choice");
-                try jw.write(@as(?u8, null));
-            },
-            .value => |value| {
-                try jw.objectField("choice");
-                try jw.write(value);
-            },
-        }
-        if (self.decision_method) |value| {
-            try jw.objectField("decision_method");
-            try jw.write(value);
-        }
-        if (self.similarities) |value| {
-            try jw.objectField("similarities");
-            try jw.write(value);
-        }
-        if (self.margin) |value| {
-            try jw.objectField("margin");
-            try jw.write(value);
-        }
-        if (self.status) |value| {
-            try jw.objectField("status");
-            try jw.write(value);
-        }
-        if (self.abstention_reason) |value| {
-            try jw.objectField("abstention_reason");
-            try jw.write(value);
-        }
-        if (self.score) |value| {
-            try jw.objectField("score");
-            try jw.write(value);
-        }
-        if (self.noul) |value| {
-            try jw.objectField("noul");
-            try jw.write(value);
-        }
-        if (self.legend) |value| {
-            try jw.objectField("legend");
-            try jw.write(value);
-        }
-        if (self.probabilities) |value| {
-            try jw.objectField("probabilities");
-            try jw.write(value);
-        }
-        try jw.endObject();
-    }
-};
-
-pub const DecideQuestion = struct {
-    type: []const u8,
-    instructions: []const u8,
-    /// Choice uses option IDs mapped to descriptions; score uses ordered descriptions; noul omits criteria.
-    criteria: ?std.json.Value = null,
-
-    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
-    pub const openApiFieldMetadata = .{
-        .{ "type", "type", false },
-        .{ "instructions", "instructions", false },
-        .{ "criteria", "criteria", true },
-    };
-
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        try jw.beginObject();
-        try jw.objectField("type");
-        try jw.write(self.type);
-        try jw.objectField("instructions");
-        try jw.write(self.instructions);
-        if (self.criteria) |value| {
-            try jw.objectField("criteria");
-            try jw.write(value);
-        }
-        try jw.endObject();
-    }
-};
-
-pub const DecideRequest = struct {
-    model: []const u8,
-    /// Pin the exact EmbeddingGemma 2 assets and embedding recipe.
-    model_identity: ?[]const u8 = null,
-    state: []const u8,
-    embedding_options: ?EmbeddingDecisionOptions = null,
-    questions: std.json.ArrayHashMap(DecideQuestion),
-
-    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
-    pub const openApiFieldMetadata = .{
-        .{ "model", "model", false },
-        .{ "model_identity", "model_identity", true },
-        .{ "state", "state", false },
-        .{ "embedding_options", "embedding_options", true },
-        .{ "questions", "questions", false },
-    };
-
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        try jw.beginObject();
-        try jw.objectField("model");
-        try jw.write(self.model);
-        if (self.model_identity) |value| {
-            try jw.objectField("model_identity");
-            try jw.write(value);
-        }
-        try jw.objectField("state");
-        try jw.write(self.state);
-        if (self.embedding_options) |value| {
-            try jw.objectField("embedding_options");
-            try jw.write(value);
-        }
-        try jw.objectField("questions");
-        try jw.write(self.questions);
-        try jw.endObject();
-    }
-};
-
-pub const DecideResponse = struct {
-    model_identity: ?[]const u8 = null,
-    renderer_version: ?[]const u8 = null,
-    model: []const u8,
-    answers: std.json.ArrayHashMap(DecideAnswer),
-    usage: std.json.Value,
-
-    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
-    pub const openApiFieldMetadata = .{
-        .{ "model_identity", "model_identity", true },
-        .{ "renderer_version", "renderer_version", true },
-        .{ "model", "model", false },
-        .{ "answers", "answers", false },
-        .{ "usage", "usage", false },
-    };
-
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        try jw.beginObject();
-        if (self.model_identity) |value| {
-            try jw.objectField("model_identity");
-            try jw.write(value);
-        }
-        if (self.renderer_version) |value| {
-            try jw.objectField("renderer_version");
-            try jw.write(value);
-        }
-        try jw.objectField("model");
-        try jw.write(self.model);
-        try jw.objectField("answers");
-        try jw.write(self.answers);
-        try jw.objectField("usage");
-        try jw.write(self.usage);
-        try jw.endObject();
-    }
-};
+pub const DecideResponse = antfly_decision_openapi.DecideResponse;
 
 pub const DictateRequest = struct {
     /// Transcriber model from models_dir/transcribers/.
@@ -1759,88 +1540,7 @@ pub const EmbeddingBatchSummary = struct {
     failed: i64,
 };
 
-/// Embedding similarity categories only. The normalized centroid of examples replaces the description prototype; examples use the input renderer. Trained decision models reject this form.
-pub const EmbeddingDecisionCategory = struct {
-    description: ?[]const u8 = null,
-    examples: []const []const u8,
-
-    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
-    pub const openApiFieldMetadata = .{
-        .{ "description", "description", true },
-        .{ "examples", "examples", false },
-    };
-
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        try jw.beginObject();
-        if (self.description) |value| {
-            try jw.objectField("description");
-            try jw.write(value);
-        }
-        try jw.objectField("examples");
-        try jw.write(self.examples);
-        try jw.endObject();
-    }
-};
-
-/// EmbeddingGemma 2 similarity decisions only. Other models reject these options. Uncalibrated results contain cosine scores and never probabilities.
-pub const EmbeddingDecisionOptions = struct {
-    /// Qualified fitted raw thresholds in model/calibrations/{id}.json. Bound to the exact asset identity, task, renderer, dimensions and category prototypes; mutually exclusive with manual thresholds. Does not produce probabilities.
-    calibration_id: ?[]const u8 = null,
-    task_type: ?[]const u8 = null,
-    dimensions: ?i64 = null,
-    min_similarity: ?f64 = null,
-    min_margin: ?f64 = null,
-
-    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
-    pub const openApiFieldMetadata = .{
-        .{ "calibration_id", "calibration_id", true },
-        .{ "task_type", "task_type", true },
-        .{ "dimensions", "dimensions", true },
-        .{ "min_similarity", "min_similarity", true },
-        .{ "min_margin", "min_margin", true },
-    };
-
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        try jw.beginObject();
-        if (self.calibration_id) |value| {
-            try jw.objectField("calibration_id");
-            try jw.write(value);
-        }
-        if (self.task_type) |value| {
-            try jw.objectField("task_type");
-            try jw.write(value);
-        }
-        if (self.dimensions) |value| {
-            try jw.objectField("dimensions");
-            try jw.write(value);
-        }
-        if (self.min_similarity) |value| {
-            try jw.objectField("min_similarity");
-            try jw.write(value);
-        }
-        if (self.min_margin) |value| {
-            try jw.objectField("min_margin");
-            try jw.write(value);
-        }
-        try jw.endObject();
-    }
-};
+pub const EmbeddingDecisionOptions = antfly_decision_openapi.EmbeddingDecisionOptions;
 
 /// EmbeddingGemma 2 ordered text, image and audio parts producing one joint vector. Video is unsupported. The expanded sequence including all media soft tokens must fit 8192 tokens.
 pub const EmbeddingGroup = struct {
@@ -3293,7 +2993,7 @@ pub const ModelsResponse = struct {
     embedders: std.json.ArrayHashMap(ModelInfo),
     /// Available extractor models (models with 'extraction' capability)
     extractors: std.json.ArrayHashMap(ModelInfo),
-    /// Models declaring the decide task and typed_decisions capability
+    /// Models declaring the decide task and either typed_decisions or embedding_similarity capability
     deciders: std.json.ArrayHashMap(ModelInfo),
     /// Available generator/LLM models from models_dir/generators/
     generators: std.json.ArrayHashMap(ModelInfo),

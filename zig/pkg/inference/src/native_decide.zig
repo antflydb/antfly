@@ -8,7 +8,7 @@ const backend_choice = @import("native_backend_choice.zig");
 
 pub fn main(a: std.mem.Allocator, io: std.Io, args: []const []const u8, extract: bool) !void {
     if (args.len < 3 or !std.mem.eql(u8, args[1], "--request")) {
-        std.debug.print("usage: antfly inference {s} <models-dir> --request <json-file> [--backend native|metal|auto]\n", .{if (extract) "extract" else "decide"});
+        std.debug.print("usage: antfly inference {s} <models-dir> --request <json-file> [--backend native|metal|auto]\n", .{if (extract) "extract" else "decisions"});
         return error.InvalidArguments;
     }
     var backend: backend_choice.Choice = .auto;

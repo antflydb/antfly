@@ -697,13 +697,13 @@ pub const ConnectionKind = enum {
 
 pub const DeciderConfig = struct {
     provider: []const u8,
-    /// Explicit result contract. embedding_similarity is available with Antfly EmbeddingGemma 2 choices; rejects score and noul requests and returns cosine scores with nullable choice.
+    /// Explicit result contract. embedding_similarity is available with Antfly EmbeddingGemma 2 choice and multi_choice questions; rejects score and predicate requests and returns raw cosine similarities.
     decision_method: ?[]const u8 = null,
     /// Required for Antfly and OpenAI; Jev defaults to jev-latest.
     model: ?[]const u8 = null,
     /// Pin the exact EmbeddingGemma 2 assets and recipe. Requires embedding_similarity.
     model_identity: ?[]const u8 = null,
-    /// EmbeddingGemma 2 similarity decisions only. Other models reject these options. Uncalibrated results contain cosine scores and never probabilities.
+    /// EmbeddingGemma 2 geometry and acceptance defaults. Acceptance is serialized onto each question and can be overridden per question. Other models reject these options. Raw cosine similarities never represent probabilities.
     embedding_options: ?std.json.Value = null,
     /// Provider base URL; endpoint path is selected by provider. OpenAI defaults to https://api.openai.com/v1 and appends /decisions.
     url: ?[]const u8 = null,

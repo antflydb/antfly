@@ -3,7 +3,6 @@
 
 pub const types = @import("types.zig");
 
-pub const EmbeddingExtractionDecision = types.EmbeddingExtractionDecision;
 pub const ExtractionAttributeGroup = types.ExtractionAttributeGroup;
 pub const ExtractionAttributeLabel = types.ExtractionAttributeLabel;
 pub const ExtractionAttributeSelection = types.ExtractionAttributeSelection;
@@ -11,6 +10,7 @@ pub const ExtractionClassification = types.ExtractionClassification;
 pub const ExtractionClassificationConstraint = types.ExtractionClassificationConstraint;
 pub const ExtractionClassificationExample = types.ExtractionClassificationExample;
 pub const ExtractionClassificationSchema = types.ExtractionClassificationSchema;
+pub const ExtractionClassificationThreshold = types.ExtractionClassificationThreshold;
 pub const ExtractionConfig = types.ExtractionConfig;
 pub const ExtractionConstraintAnd = types.ExtractionConstraintAnd;
 pub const ExtractionConstraintAnyOtherSelected = types.ExtractionConstraintAnyOtherSelected;
@@ -27,8 +27,6 @@ pub const ExtractionConstraintMaxLevel = types.ExtractionConstraintMaxLevel;
 pub const ExtractionConstraintMinLevel = types.ExtractionConstraintMinLevel;
 pub const ExtractionConstraintNot = types.ExtractionConstraintNot;
 pub const ExtractionConstraintOr = types.ExtractionConstraintOr;
-pub const ExtractionDecision = types.ExtractionDecision;
-pub const ExtractionDecisionProbability = types.ExtractionDecisionProbability;
 pub const ExtractionDecoderOptions = types.ExtractionDecoderOptions;
 pub const ExtractionEntity = types.ExtractionEntity;
 pub const ExtractionEntityDefinition = types.ExtractionEntityDefinition;
@@ -50,7 +48,6 @@ pub const ExtractionJointOptions = types.ExtractionJointOptions;
 pub const ExtractionJointRelation = types.ExtractionJointRelation;
 pub const ExtractionJointSchema = types.ExtractionJointSchema;
 pub const ExtractionLabelDefinition = types.ExtractionLabelDefinition;
-pub const ExtractionLabelProbability = types.ExtractionLabelProbability;
 pub const ExtractionLongDocumentMetadata = types.ExtractionLongDocumentMetadata;
 pub const ExtractionLongDocumentOptions = types.ExtractionLongDocumentOptions;
 pub const ExtractionObject = types.ExtractionObject;
@@ -74,4 +71,3 @@ pub const ExtractionSolverStatus = types.ExtractionSolverStatus;
 pub const ExtractionStructureField = types.ExtractionStructureField;
 pub const ExtractionStructureSchema = types.ExtractionStructureSchema;
 pub const ExtractionToken = types.ExtractionToken;
-pub const TrainedExtractionDecision = types.TrainedExtractionDecision;

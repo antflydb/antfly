@@ -10,7 +10,6 @@ from ..models.extraction_offset_unit import ExtractionOffsetUnit
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
-    from ..models.embedding_extraction_decision import EmbeddingExtractionDecision
     from ..models.extraction_classification import ExtractionClassification
     from ..models.extraction_entity import ExtractionEntity
     from ..models.extraction_long_document_metadata import ExtractionLongDocumentMetadata
@@ -18,7 +17,6 @@ if TYPE_CHECKING:
     from ..models.extraction_object_structures import ExtractionObjectStructures
     from ..models.extraction_relation import ExtractionRelation
     from ..models.extraction_solver_diagnostics import ExtractionSolverDiagnostics
-    from ..models.trained_extraction_decision import TrainedExtractionDecision
 
 
 T = TypeVar("T", bound="ExtractionObject")
@@ -28,8 +26,6 @@ T = TypeVar("T", bound="ExtractionObject")
 class ExtractionObject:
     """
     Attributes:
-        decisions (list[EmbeddingExtractionDecision | TrainedExtractionDecision] | Unset): Typed decision results from
-            capable extractors, alongside compatible per-label classifications.
         id (str | Unset):
         offset_unit (ExtractionOffsetUnit | Unset): Half-open offsets into the immutable caller text. Version 2 defaults
             to utf8_bytes. No normalization, lowercasing or synthetic suffix is included in these coordinates.
@@ -44,7 +40,6 @@ class ExtractionObject:
         long_document (ExtractionLongDocumentMetadata | Unset):
     """
 
-    decisions: list[EmbeddingExtractionDecision | TrainedExtractionDecision] | Unset = UNSET
     id: str | Unset = UNSET
     offset_unit: ExtractionOffsetUnit | Unset = UNSET
     entities: list[ExtractionEntity] | Unset = UNSET
@@ -57,20 +52,6 @@ class ExtractionObject:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        from ..models.trained_extraction_decision import TrainedExtractionDecision
-
-        decisions: list[dict[str, Any]] | Unset = UNSET
-        if not isinstance(self.decisions, Unset):
-            decisions = []
-            for decisions_item_data in self.decisions:
-                decisions_item: dict[str, Any]
-                if isinstance(decisions_item_data, TrainedExtractionDecision):
-                    decisions_item = decisions_item_data.to_dict()
-                else:
-                    decisions_item = decisions_item_data.to_dict()
-
-                decisions.append(decisions_item)
-
         id = self.id
 
         offset_unit: str | Unset = UNSET
@@ -117,8 +98,6 @@ class ExtractionObject:
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update({})
-        if decisions is not UNSET:
-            field_dict["decisions"] = decisions
         if id is not UNSET:
             field_dict["id"] = id
         if offset_unit is not UNSET:
@@ -142,7 +121,6 @@ class ExtractionObject:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.embedding_extraction_decision import EmbeddingExtractionDecision
         from ..models.extraction_classification import ExtractionClassification
         from ..models.extraction_entity import ExtractionEntity
         from ..models.extraction_long_document_metadata import ExtractionLongDocumentMetadata
@@ -150,34 +128,8 @@ class ExtractionObject:
         from ..models.extraction_object_structures import ExtractionObjectStructures
         from ..models.extraction_relation import ExtractionRelation
         from ..models.extraction_solver_diagnostics import ExtractionSolverDiagnostics
-        from ..models.trained_extraction_decision import TrainedExtractionDecision
 
         d = dict(src_dict)
-        _decisions = d.pop("decisions", UNSET)
-        decisions: list[EmbeddingExtractionDecision | TrainedExtractionDecision] | Unset = UNSET
-        if _decisions is not UNSET:
-            decisions = []
-            for decisions_item_data in _decisions:
-
-                def _parse_decisions_item(data: object) -> EmbeddingExtractionDecision | TrainedExtractionDecision:
-                    try:
-                        if not isinstance(data, dict):
-                            raise TypeError()
-                        componentsschemas_extraction_decision_type_0 = TrainedExtractionDecision.from_dict(data)
-
-                        return componentsschemas_extraction_decision_type_0
-                    except (TypeError, ValueError, AttributeError, KeyError):
-                        pass
-                    if not isinstance(data, dict):
-                        raise TypeError()
-                    componentsschemas_extraction_decision_type_1 = EmbeddingExtractionDecision.from_dict(data)
-
-                    return componentsschemas_extraction_decision_type_1
-
-                decisions_item = _parse_decisions_item(decisions_item_data)
-
-                decisions.append(decisions_item)
-
         id = d.pop("id", UNSET)
 
         _offset_unit = d.pop("offset_unit", UNSET)
@@ -243,7 +195,6 @@ class ExtractionObject:
             long_document = ExtractionLongDocumentMetadata.from_dict(_long_document)
 
         extraction_object = cls(
-            decisions=decisions,
             id=id,
             offset_unit=offset_unit,
             entities=entities,

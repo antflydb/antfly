@@ -291,30 +291,23 @@ def test_extraction_v2_explicit_empty_id_is_not_anonymous_and_legacy_is_unchange
     assert client.extract(identified_request()).to_dict() == legacy
 
 
-def test_laya_decision_roundtrip_preserves_boolean_zero_probability():
-    decision = {
+def test_decisions_preserve_zero_predicate_and_action_probability():
+    answer = {
         "name": "needed",
-        "type": "boolean",
-        "label": "false",
-        "probabilities": [{"label": "false", "probability": 1}, {"label": "true", "probability": 0}],
+        "type": "predicate",
+        "decision_method": "typed",
+        "probability": 0,
         "confidence": 1,
         "confidence_method": "max_probability",
         "act_probability": 0,
-        "true_probability": 0,
     }
-    payload = extraction_envelope(data=[{"decisions": [decision]}])
+    payload = {"model": "laya", "answers": [answer], "usage": {"input_tokens": 2, "output_tokens": 0}}
     request = {
-        "model": "m",
-        "schema": {
-            "classifications": [
-                {"name": "needed", "mode": "boolean", "instruction": "Need search?", "labels": ["false", "true"]}
-            ]
-        },
-        "inputs": [{"content": "hello"}],
+        "model": "laya",
+        "input": "hello",
+        "questions": [{"name": "needed", "type": "predicate", "instructions": "Need search?"}],
     }
-    response = client_with_transport(lambda _: httpx.Response(200, json=payload)).extract_v2(request)
-    decisions = response.data[0].decisions
-    assert not isinstance(decisions, Unset)
-    assert len(decisions) == 1
-    assert decisions[0].true_probability == 0
-    assert decisions[0].to_dict() == decision
+    response = client_with_transport(lambda _: httpx.Response(200, json=payload)).decide(request)
+    assert response.answers[0].probability == 0
+    assert response.answers[0].act_probability == 0
+    assert response.to_dict() == payload

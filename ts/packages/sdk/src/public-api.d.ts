@@ -4080,7 +4080,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/ai/v1/decide": {
+    "/ai/v1/decisions": {
         parameters: {
             query?: never;
             header?: never;
@@ -4089,7 +4089,10 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Answer named choice, ordinal score, and Boolean questions */
+        /**
+         * Answer named decision questions
+         * @description Execute one text input or an Antfly batch. Embedding similarity supports choice and multi_choice; trained decision models support choice, score and predicate. Answer variants distinguish trained probabilities from raw cosine similarities.
+         */
         post: operations["decide"];
         delete?: never;
         options?: never;
@@ -10171,9 +10174,10 @@ export interface components {
             call?: "ai_decide" | "ai_choice" | "ai_score" | "ai_probability";
             input?: components["schemas"]["QueryExpression"];
             decider?: string;
+            /** @description Named decision question array using choice choices, score levels, or predicate instructions. */
             questions?: {
                 [key: string]: unknown;
-            };
+            }[];
             statement?: string;
             instructions?: string;
             /** @description Choice ID map or ordered score level array. */
@@ -10182,6 +10186,8 @@ export interface components {
             } | string[];
         };
         QueryRequest: {
+            /** @description Opaque remote index snapshot token returned by a previous query. Required when replaying search_after or search_before against an external table; a changed publication returns 409. */
+            remote_snapshot?: string;
             evaluate?: components["schemas"]["QueryEvaluation"];
             table_target?: components["schemas"]["CatalogTableTarget"];
             /**
@@ -11473,6 +11479,8 @@ export interface components {
         };
         /** @description Fields shared by canonical and stateful query result envelopes. */
         QueryResultBase: {
+            /** @description Opaque remote publication and schema fence to echo with ordered pagination. This token does not grant access or retain the publication. */
+            remote_snapshot?: string;
             /** @description Function evaluation scope, population, usage, and scoped aggregations. */
             evaluation?: {
                 [key: string]: unknown;
@@ -13642,10 +13650,20 @@ export interface components {
             algebraic_planning?: components["schemas"]["GraphAlgebraicPlanningConfig"];
             resolvers?: components["schemas"]["GraphResolverConfig"][];
         };
-        /** @description Schema-derived algebraic sidecar configuration. Public requests may opt into schema derivation, while materializations remain engine-owned. */
+        AlgebraicAggregateConfig: {
+            name: string;
+            /** @enum {string} */
+            op: "count" | "sum" | "avg" | "min" | "max";
+            group_by?: string[];
+            /** @description Required except for count. Omitted count means COUNT(*); a supplied column means COUNT(column), excluding SQL NULL values. */
+            measure?: string;
+        };
+        /** @description Schema-derived algebraic index capabilities with optional declarative aggregate recipes. Physical materialization state remains engine-owned. */
         AlgebraicIndexConfig: {
-            /** @description When true, derive the algebraic capability sidecar from the table schema. Internal fields and materialization definitions are not public API. */
+            /** @description When true, derive typed fields and capabilities from the table schema. Physical fields, laws, joins and state remain engine-owned. */
             derive_from_schema?: boolean;
+            /** @description Desired exact aggregate recipes over schema column names. Eligible SQL automatically reuses complete, snapshot-bound materializations; unsupported SQL shapes retain scanning. */
+            aggregates?: components["schemas"]["AlgebraicAggregateConfig"][];
         };
         /** @enum {string} */
         RelationalExpressionOp: "literal" | "column" | "add" | "subtract" | "multiply" | "divide" | "negate" | "concat" | "coalesce" | "lower_ascii" | "upper_ascii" | "eq" | "ne" | "gt" | "gte" | "lt" | "lte" | "is_null" | "is_not_null" | "is_distinct" | "is_not_distinct" | "and" | "or" | "not";
@@ -13885,6 +13903,12 @@ export interface components {
              * @enum {string}
              */
             write_policy?: "read_only";
+            /**
+             * @description Set immutable only when data files are never replaced at an existing URI. Allows authenticated provider-version proofs from retained index generations to be reused for unchanged data files. Metadata and delete files are still verified.
+             * @default mutable
+             * @enum {string}
+             */
+            object_mutability?: "mutable" | "immutable";
             credentials?: components["schemas"]["ExternalLakeCredentialRef"];
             snapshot?: components["schemas"]["ExternalLakeSnapshotSelector"];
         };
@@ -18752,86 +18776,24 @@ export interface components {
             /** @description List of input modalities this model accepts, such as `text`, `image`, or `audio` */
             inputs?: string[];
         };
-        /** @description EmbeddingGemma 2 similarity decisions only. Other models reject these options. Uncalibrated results contain cosine scores and never probabilities. */
-        InferenceEmbeddingDecisionOptions: {
-            /** @description Qualified fitted raw thresholds in model/calibrations/{id}.json. Bound to the exact asset identity, task, renderer, dimensions and category prototypes; mutually exclusive with manual thresholds. Does not produce probabilities. */
-            calibration_id?: string;
-            /**
-             * @default CLUSTERING
-             * @enum {string}
-             */
-            task_type?: "CLUSTERING" | "CLASSIFICATION";
-            /**
-             * @default 768
-             * @enum {integer}
-             */
-            dimensions?: 768 | 512 | 256 | 128;
-            min_similarity?: number;
-            min_margin?: number;
-        };
+        /** @description Supply exactly one of input (single text) or inputs (Antfly batch extension). Question names must be unique. Single text and named question arrays follow OpenAI Decisions conventions; local models support text input and string choice values. Request bodies are bounded at 16 MiB. */
         InferenceDecideRequest: {
             model: string;
             /** @description Pin the exact EmbeddingGemma 2 assets and embedding recipe. */
             model_identity?: string;
-            state: string;
-            embedding_options?: components["schemas"]["InferenceEmbeddingDecisionOptions"];
-            questions: {
-                [key: string]: components["schemas"]["InferenceDecideQuestion"];
-            };
+            input?: string;
+            inputs?: components["schemas"]["DecisionInput"][];
+            questions: components["schemas"]["InferenceDecideQuestion"][];
+            embedding_options?: components["schemas"]["EmbeddingDecisionOptions"];
         };
-        InferenceDecideQuestion: {
-            /** @enum {string} */
-            type: "choice" | "score" | "noul";
-            instructions: string;
-            /** @description Choice uses option IDs mapped to descriptions; score uses ordered descriptions; noul omits criteria. */
-            criteria?: {
-                [key: string]: string | components["schemas"]["InferenceEmbeddingDecisionCategory"];
-            } | string[];
-        };
-        /** @description Embedding similarity categories only. The normalized centroid of examples replaces the description prototype; examples use the input renderer. Trained decision models reject this form. */
-        InferenceEmbeddingDecisionCategory: {
-            description?: string;
-            examples: string[];
-        };
+        /** @description Single-input responses have answers. Batch responses have data in input order, with one named answer array per input and aggregate usage. */
         InferenceDecideResponse: {
+            model: string;
             model_identity?: string;
             renderer_version?: string;
-            model: string;
-            answers: {
-                [key: string]: components["schemas"]["InferenceDecideAnswer"];
-            };
-            usage: {
-                /** @description Encoded prompt tokens consumed by the executor, including repeated state text for split GLiNER tasks. */
-                input_tokens: number;
-                /** @description Zero for classifier executors, which emit no generated tokens. */
-                output_tokens: number;
-            };
-        };
-        InferenceDecideAnswer: {
-            prototype_set_hash?: string;
-            calibration_id?: string;
-            /** @enum {string} */
-            type: "choice" | "score" | "noul";
-            /** @description Selected option, or null when a similarity decision abstains. */
-            choice?: string | null;
-            /** @enum {string} */
-            decision_method?: "embedding_similarity";
-            similarities?: {
-                [key: string]: number;
-            };
-            margin?: number;
-            /** @enum {string} */
-            status?: "selected" | "abstained";
-            /** @enum {string} */
-            abstention_reason?: "tie" | "min_similarity" | "min_margin";
-            score?: number;
-            noul?: number;
-            legend?: {
-                [key: string]: string;
-            };
-            probabilities?: {
-                [key: string]: number;
-            };
+            answers?: components["schemas"]["InferenceDecideAnswer"][];
+            data?: components["schemas"]["DecisionBatchItem"][];
+            usage: components["schemas"]["DecisionUsage"];
         };
         InferenceModelsResponse: {
             /**
@@ -18865,7 +18827,7 @@ export interface components {
             extractors: {
                 [key: string]: components["schemas"]["InferenceModelInfo"];
             };
-            /** @description Models declaring the decide task and typed_decisions capability */
+            /** @description Models declaring the decide task and either typed_decisions or embedding_similarity capability */
             deciders: {
                 [key: string]: components["schemas"]["InferenceModelInfo"];
             };
@@ -19964,7 +19926,7 @@ export interface components {
          * Format: double
          * @description Finite centered-logit decisions require a threshold strictly between zero and one.
          */
-        ExtractionDecisionProbability: number;
+        ExtractionClassificationThreshold: number;
         ExtractionClassificationExample: {
             input: string;
             label: string;
@@ -19976,15 +19938,14 @@ export interface components {
             multi_label?: boolean;
             /** @description Version 1 NLI hypothesis template with {} as the label placeholder; the server uses "This example is {}." when omitted. Version 2 GLiNER boundary extraction rejects an explicit hypothesis_template; use prompt/instruction and label_definitions for model conditioning. */
             hypothesis_template?: string;
-            /** @description Maximum labels for ordinary single-label classification; the server uses 1 when omitted. Version 2 constrained or ordinal selection uses min_labels/max_labels. Advanced set-selection options or cross-task constraints on any classification in the collection reject every explicit top_k in that collection, including 1. Omit top_k when using these options. */
+            /** @description Maximum labels for ordinary single-label classification; the server uses 1 when omitted. Version 2 constrained classification uses min_labels/max_labels. Advanced set-selection options or cross-task constraints on any classification in the collection reject every explicit top_k in that collection, including 1. Omit top_k when using these options. */
             top_k?: number;
             /**
-             * @description Version 2 classification mode. Ordinal labels are ordered from lowest to highest.
-             *     Typed-decision extractors support boolean with labels ["false", "true"] in that order.
+             * @description Version 2 ordinary classification mode. Standalone ordinal scores use the decision API.
              *     Each model rejects modes it does not support.
              * @enum {string}
              */
-            mode?: "single" | "multi" | "ordinal" | "boolean";
+            mode?: "single" | "multi";
             label_definitions?: {
                 [key: string]: components["schemas"]["ExtractionLabelDefinition"];
             };
@@ -19992,7 +19953,7 @@ export interface components {
             /** @description Version 2 maximum selected labels. Explicit null means no maximum; omission preserves mode defaults. */
             max_labels?: number | null;
             ordered?: boolean;
-            threshold?: components["schemas"]["ExtractionDecisionProbability"];
+            threshold?: components["schemas"]["ExtractionClassificationThreshold"];
             candidate_threshold?: components["schemas"]["ExtractionProbability"];
             /** @enum {string} */
             activation?: "auto" | "sigmoid" | "softmax";
@@ -20005,10 +19966,6 @@ export interface components {
             /** @description Alias of prompt. */
             instruction?: string;
             examples?: components["schemas"]["ExtractionClassificationExample"][];
-            /** @description Embedding similarity multi-label classification requires explicit raw cosine thresholds or a qualified fitted calibration_id. Values are not probabilities. */
-            similarity_thresholds?: number | {
-                [key: string]: number;
-            };
         };
         ExtractionRegexValidator: {
             /** @enum {string} */
@@ -20215,7 +20172,7 @@ export interface components {
         ExtractionClassificationConstraint: components["schemas"]["ExtractionConstraintLabelRef"] | components["schemas"]["ExtractionConstraintAnySelected"] | components["schemas"]["ExtractionConstraintAnyOtherSelected"] | components["schemas"]["ExtractionConstraintIsDefault"] | components["schemas"]["ExtractionConstraintCardinality"] | components["schemas"]["ExtractionConstraintMinLevel"] | components["schemas"]["ExtractionConstraintMaxLevel"] | components["schemas"]["ExtractionConstraintAtLevel"] | components["schemas"]["ExtractionConstraintNot"] | components["schemas"]["ExtractionConstraintAnd"] | components["schemas"]["ExtractionConstraintOr"] | components["schemas"]["ExtractionConstraintExactlyOneOf"] | components["schemas"]["ExtractionConstraintImplies"] | components["schemas"]["ExtractionConstraintIff"] | components["schemas"]["ExtractionConstraintExcludes"];
         ExtractionJointEntity: {
             description?: string;
-            threshold?: components["schemas"]["ExtractionDecisionProbability"];
+            threshold?: components["schemas"]["ExtractionClassificationThreshold"];
             candidate_threshold?: components["schemas"]["ExtractionProbability"];
             max_candidates?: number;
             allow_nested?: boolean;
@@ -20225,7 +20182,7 @@ export interface components {
             tail: string[];
             /** @description Retained declarative metadata; model conditioning follows the pinned JointIE compiler. */
             description?: string;
-            threshold?: components["schemas"]["ExtractionDecisionProbability"];
+            threshold?: components["schemas"]["ExtractionClassificationThreshold"];
             candidate_threshold?: components["schemas"]["ExtractionProbability"];
             /** @default true */
             directed?: boolean;
@@ -20449,23 +20406,6 @@ export interface components {
             track_provenance?: boolean;
         };
         ExtractionOptions: {
-            /** @description Options for embedding similarity classifiers. Trained classifiers reject this field. */
-            embedding?: {
-                /** @description Qualified fitted thresholds in model/calibrations/{id}.json, bound to exact model, renderer, task, dimensions, labels and prototypes. Mutually exclusive with manual thresholds. Does not enable probabilities. */
-                calibration_id?: string;
-                /**
-                 * @default CLUSTERING
-                 * @enum {string}
-                 */
-                task_type?: "CLUSTERING" | "CLASSIFICATION";
-                /**
-                 * @default 768
-                 * @enum {integer}
-                 */
-                dimensions?: 768 | 512 | 256 | 128;
-                min_similarity?: number;
-                min_margin?: number;
-            };
             /** Format: float */
             threshold?: number;
             flat_ner?: boolean;
@@ -20510,61 +20450,6 @@ export interface components {
             schema: components["schemas"]["ExtractionSchema"];
             options?: components["schemas"]["ExtractionOptions"];
         };
-        ExtractionLabelProbability: {
-            label: string;
-            /** Format: float */
-            probability: number;
-        };
-        /** @description Version 2 typed classification decision. Probabilities follow request label order; ordinal levels are zero-based. */
-        TrainedExtractionDecision: {
-            name: string;
-            /** @enum {string} */
-            type: "choice" | "score" | "boolean";
-            /** @description Highest-probability label. This is distinct from the expected ordinal value. */
-            label: string;
-            probabilities: components["schemas"]["ExtractionLabelProbability"][];
-            /** Format: float */
-            confidence: number;
-            /**
-             * @description Entropy confidence is not the probability that the selected label is correct.
-             * @enum {string}
-             */
-            confidence_method: "normalized_inverse_entropy" | "max_probability";
-            /**
-             * Format: float
-             * @description Score decisions only; sum of zero-based level index times probability.
-             */
-            expected_value?: number;
-            /**
-             * Format: float
-             * @description Boolean decisions only; probability of the true label.
-             */
-            true_probability?: number;
-            /**
-             * Format: float
-             * @description Auxiliary model estimate for acting, from models with an action head (Laya). Does not authorize or execute a tool call.
-             */
-            act_probability?: number;
-        };
-        /** @description Embedding classification results report raw cosine similarities and no confidence or probabilities. */
-        EmbeddingExtractionDecision: {
-            prototype_set_hash?: string;
-            calibration_id?: string;
-            name: string;
-            /** @enum {string} */
-            mode: "single" | "multi";
-            /** @enum {string} */
-            decision_method: "embedding_similarity";
-            labels: string[];
-            similarities: {
-                [key: string]: number;
-            };
-            /** @enum {string} */
-            status: "selected" | "abstained";
-            margin?: number;
-            abstention_reason?: string;
-        };
-        ExtractionDecision: components["schemas"]["TrainedExtractionDecision"] | components["schemas"]["EmbeddingExtractionDecision"];
         ExtractionAttributeLabel: {
             label: string;
             confidence: components["schemas"]["ExtractionProbability"];
@@ -20612,10 +20497,6 @@ export interface components {
             label: string;
             /** Format: float */
             score?: number;
-            /** @description Raw cosine similarity for embedding classifiers; not a probability. */
-            similarity?: number;
-        } & {
-            [key: string]: unknown;
         };
         ExtractionRecordMetadata: {
             score?: components["schemas"]["ExtractionProbability"];
@@ -20655,8 +20536,6 @@ export interface components {
             solver_optimality_scope: "retained_candidate_graph";
         };
         ExtractionObject: {
-            /** @description Typed decision results from capable extractors, alongside compatible per-label classifications. */
-            decisions?: components["schemas"]["ExtractionDecision"][];
             id?: string;
             offset_unit?: components["schemas"]["ExtractionOffsetUnit"];
             entities?: components["schemas"]["ExtractionEntity"][];
@@ -20726,6 +20605,200 @@ export interface components {
             threshold?: number;
             text?: components["schemas"]["TextChunkOptions"];
             audio?: components["schemas"]["InferenceAudioChunkConfig"];
+        };
+        DecisionInput: {
+            id?: string;
+            input: string;
+        };
+        /** @description Local decision models use string choice identifiers. Embedding category examples replace the description with their normalized centroid; trained models reject examples. */
+        DecisionChoice: {
+            value: string;
+            description?: string;
+            examples?: string[];
+        };
+        /** @description Question-specific acceptance policy for embedding similarity. Trained decision models reject it. */
+        EmbeddingDecisionAcceptance: {
+            /** @description Public API identifier for a server-side fitted threshold artifact at model/calibrations/{id}.json. The server verifies qualification and the exact asset identity, prompt profile, dimensions, renderer and this question's label/prototype set. Mutually exclusive with manual thresholds; never produces probabilities. */
+            calibration_id?: string;
+            /** @description For a single choice, abstain when the highest cosine similarity is below this value. It is a similarity threshold, not an accuracy or probability estimate. */
+            min_similarity?: number;
+            /** @description For a single choice, require this gap between the highest and second-highest cosine similarities. For multi_choice, require every score to be at least this distance from its own selection threshold; otherwise abstain. */
+            min_margin?: number;
+        };
+        ChoiceDecisionQuestion: {
+            /** @enum {string} */
+            type: "choice";
+            name: string;
+            instructions: string;
+            choices: components["schemas"]["DecisionChoice"][];
+            embedding_options?: components["schemas"]["EmbeddingDecisionAcceptance"];
+        };
+        /** @description Antfly multi-label extension for embedding similarity; selected, empty and abstained are distinct results. */
+        MultiChoiceDecisionQuestion: {
+            /** @enum {string} */
+            type: "multi_choice";
+            name: string;
+            instructions: string;
+            choices: components["schemas"]["DecisionChoice"][];
+            embedding_options?: components["schemas"]["EmbeddingDecisionAcceptance"];
+            /** @description Required raw cosine cutoff for every choice, either one common cutoff or a complete choice-to-cutoff map. Alternatively supply a qualified question-specific calibration_id. Mutually exclusive with calibration_id. Scores equal to their cutoff are selected. */
+            similarity_thresholds?: number | {
+                [key: string]: number;
+            };
+        };
+        /** @description Ordered score level, from lowest to highest. Results assign zero-based numeric values to these levels. */
+        DecisionLevel: {
+            label: string;
+            description?: string;
+        };
+        ScoreDecisionQuestion: {
+            /** @enum {string} */
+            type: "score";
+            name: string;
+            instructions: string;
+            levels: components["schemas"]["DecisionLevel"][];
+        };
+        /** @description Estimate whether the condition in instructions holds for the input. The trained answer reports probability in [0,1]. */
+        PredicateDecisionQuestion: {
+            /** @enum {string} */
+            type: "predicate";
+            name: string;
+            instructions: string;
+        };
+        InferenceDecideQuestion: components["schemas"]["ChoiceDecisionQuestion"] | components["schemas"]["MultiChoiceDecisionQuestion"] | components["schemas"]["ScoreDecisionQuestion"] | components["schemas"]["PredicateDecisionQuestion"];
+        /** @description Request-wide embedding geometry defaults. Acceptance thresholds and calibration belong to individual questions. */
+        EmbeddingDecisionOptions: {
+            /**
+             * @description Prompt profile for the decision input and category prototypes. The embedding endpoint also accepts task_type; decision routing restricts it to these two profiles.
+             * @default CLUSTERING
+             * @enum {string}
+             */
+            task_type?: "CLUSTERING" | "CLASSIFICATION";
+            /**
+             * @description Truncate and renormalize embeddings to this dimension before cosine scoring.
+             * @default 768
+             * @enum {integer}
+             */
+            dimensions?: 768 | 512 | 256 | 128;
+        };
+        DecisionChoiceProbability: {
+            value: string;
+            probability: number;
+        };
+        TrainedChoiceAnswer: {
+            name: string;
+            /** @enum {string} */
+            type: "choice";
+            /** @enum {string} */
+            decision_method: "typed";
+            /** @description Model diagnostic; entropy confidence is not the probability that the chosen label is correct. */
+            confidence: number;
+            /** @enum {string} */
+            confidence_method: "normalized_inverse_entropy" | "max_probability";
+            /** @description Applicable action-head diagnostic. It does not authorize or execute an action. */
+            act_probability?: number;
+            choice: string;
+            probabilities: components["schemas"]["DecisionChoiceProbability"][];
+        };
+        DecisionLevelProbability: {
+            label: string;
+            value: number;
+            probability: number;
+        };
+        TrainedScoreAnswer: {
+            name: string;
+            /** @enum {string} */
+            type: "score";
+            /** @enum {string} */
+            decision_method: "typed";
+            /** @description Model diagnostic; entropy confidence is not the probability that the chosen label is correct. */
+            confidence: number;
+            /** @enum {string} */
+            confidence_method: "normalized_inverse_entropy" | "max_probability";
+            /** @description Applicable action-head diagnostic. It does not authorize or execute an action. */
+            act_probability?: number;
+            score: number;
+            probabilities: components["schemas"]["DecisionLevelProbability"][];
+        };
+        TrainedPredicateAnswer: {
+            name: string;
+            /** @enum {string} */
+            type: "predicate";
+            /** @enum {string} */
+            decision_method: "typed";
+            /** @description Model diagnostic; entropy confidence is not the probability that the chosen label is correct. */
+            confidence?: number;
+            /** @enum {string} */
+            confidence_method?: "normalized_inverse_entropy" | "max_probability";
+            /** @description Applicable action-head diagnostic. It does not authorize or execute an action. */
+            act_probability?: number;
+            /** @description The model-estimated probability that the condition in instructions holds. */
+            probability: number;
+        };
+        DecisionSimilarity: {
+            value: string;
+            similarity: number;
+        };
+        /** @description Raw cosine scores are neither probabilities nor confidence. Empty means no label met its threshold; abstained means the requested margin could not be established. */
+        EmbeddingChoiceAnswer: {
+            name: string;
+            /** @enum {string} */
+            type: "choice";
+            /** @enum {string} */
+            decision_method: "embedding_similarity";
+            /**
+             * @description Cosine is fixed for this embedding recipe and its threshold artifacts. Index distance settings are independent.
+             * @enum {string}
+             */
+            similarity_metric: "cosine";
+            similarities: components["schemas"]["DecisionSimilarity"][];
+            margin: number;
+            /** @enum {string} */
+            status: "selected" | "abstained";
+            prototype_set_hash: string;
+            calibration_id?: string;
+            /** @enum {string} */
+            abstention_reason?: "tie" | "min_similarity" | "min_margin";
+            /** @description Selected identifier, or null on abstention. */
+            choice: string | null;
+        };
+        /** @description Raw cosine scores are neither probabilities nor confidence. Empty means no label met its threshold; abstained means the requested margin could not be established. */
+        EmbeddingMultiChoiceAnswer: {
+            name: string;
+            /** @enum {string} */
+            type: "multi_choice";
+            /** @enum {string} */
+            decision_method: "embedding_similarity";
+            /**
+             * @description Cosine is fixed for this embedding recipe and its threshold artifacts. Index distance settings are independent.
+             * @enum {string}
+             */
+            similarity_metric: "cosine";
+            similarities: components["schemas"]["DecisionSimilarity"][];
+            margin: number;
+            /** @enum {string} */
+            status: "selected" | "empty" | "abstained";
+            prototype_set_hash: string;
+            calibration_id?: string;
+            /** @enum {string} */
+            abstention_reason?: "tie" | "min_similarity" | "min_margin";
+            choices: string[];
+            /** @description Effective cosine selection threshold for every choice, including fitted calibration thresholds. */
+            similarity_thresholds: {
+                [key: string]: number;
+            };
+        };
+        InferenceDecideAnswer: components["schemas"]["TrainedChoiceAnswer"] | components["schemas"]["TrainedScoreAnswer"] | components["schemas"]["TrainedPredicateAnswer"] | components["schemas"]["EmbeddingChoiceAnswer"] | components["schemas"]["EmbeddingMultiChoiceAnswer"];
+        DecisionBatchItem: {
+            input_index: number;
+            id?: string;
+            answers: components["schemas"]["InferenceDecideAnswer"][];
+        };
+        DecisionUsage: {
+            /** @description Encoded tokens including repeated input text for split model tasks. */
+            input_tokens: number;
+            /** @description Zero for classifiers, which generate no tokens. */
+            output_tokens: number;
         };
     };
     responses: {
@@ -29078,7 +29151,7 @@ export interface operations {
             };
         };
         responses: {
-            /** @description Decision distributions and derived answers */
+            /** @description Named decision answers, diagnostics and aggregate token usage */
             200: {
                 headers: {
                     [name: string]: unknown;

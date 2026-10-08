@@ -4,7 +4,7 @@
 //! before execution, never evicted, and single-flight for an identical key.
 const std = @import("std");
 const Control = @import("../execution_control.zig").InferenceExecutionControl;
-const scoring = @import("embedding_decisions.zig");
+const scoring = @import("antfly_decisions").scoring;
 pub const capacity = 256;
 pub const admitted_bytes = 1024 * 1024;
 

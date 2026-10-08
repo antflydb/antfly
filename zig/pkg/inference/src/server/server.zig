@@ -55,7 +55,7 @@ const extraction_v2 = @import("../extractors/extraction_v2.zig");
 const boundary_executor = @import("../extractors/gliner_boundary_executor.zig");
 const decision_executor = @import("../extractors/gliner_decision_executor.zig");
 const span_v2_executor = @import("../extractors/gliner_span_v2_executor.zig");
-const decide_mod = @import("../extractors/decide.zig");
+const decide_mod = @import("antfly_decisions").legacy;
 const BoundedRequestAllocator = @import("../runtime/bounded_allocator.zig").BoundedAllocator;
 const image_pipeline = @import("../pipelines/image.zig");
 const sparse_embedding_mod = @import("../pipelines/sparse_embedding.zig");
@@ -8821,7 +8821,7 @@ pub const Node = struct {
         // The inner call drains managed backend, model, allocator and admission
         // owners before returning, so this trace includes their teardown.
         defer trace.finish(trace_error);
-        return self.extractV2Observed(allocator, input, admission_owner, supplied_control, failure, response_limit, trace.observer()) catch |err| {
+        return self.extractV2Observed(allocator, input, admission_owner, supplied_control, failure, response_limit, trace.observer(), std.mem.eql(u8, metric_task, "decide")) catch |err| {
             trace_error = err;
             // The shared admission helper already records QueueFull globally.
             if (err != error.QueueFull) self.metrics.incError();
@@ -8838,6 +8838,7 @@ pub const Node = struct {
         failure: *extraction_v2.FailureContext,
         response_limit: ?usize,
         observer: metrics_mod.extraction.observation.Observer,
+        decision_execution: bool,
     ) !extracting_api.Response {
         const control: ?InferenceExecutionControl = self.extractionExecutionControl(supplied_control);
         if (control) |active| try active.check();
@@ -8879,7 +8880,7 @@ pub const Node = struct {
         var allocation_failure = ExtractionAllocationFailure{};
         const scratch = allocation_failure.allocator(&bounded);
         defer std.debug.assert(bounded.live == 0);
-        const json = self.extractV2InMemory(scratch, request_json, control, failure, response_limit, observer, &budget, working_bytes, &allocation_failure) catch |err|
+        const json = self.extractV2InMemory(scratch, request_json, control, failure, response_limit, observer, &budget, working_bytes, &allocation_failure, decision_execution) catch |err|
             return allocation_failure.translate(err);
         defer scratch.free(json);
         observer.emit(.{ .phase = .teardown });
@@ -8937,91 +8938,12 @@ pub const Node = struct {
         var listing = try manifest_mod.loadListingFromDir(scratch, path);
         defer listing.deinit();
         if (listing.embedding_style != .embedding_gemma2) return null;
-        const classification = @import("../extractors/embedding_classification.zig");
-        const scoring = @import("../extractors/embedding_decisions.zig");
-        var arena = std.heap.ArenaAllocator.init(scratch);
-        defer arena.deinit();
-        const a = arena.allocator();
-        failure.* = .{ .stage = "schema" };
-        const request = try classification.parse(a, parsed.value);
-        const contract = try resolvedInferenceExecutorContract(self, "extract", &listing);
-        var max_labels: usize = 0;
-        const texts = try a.alloc([]const u8, request.items.len);
-        for (request.items, texts) |item, *text| text.* = request.tasks[item.first].text;
-        for (request.tasks) |task| max_labels = @max(max_labels, task.question.labels.len);
-        try validateTextExecutorInvocation(contract, texts.len, texts, 0, 0, max_labels, request.schema_bytes);
-        const effective = self.extractionExecutionControl(control);
-        try effective.check();
-        failure.* = .{ .stage = "model" };
-        var handle = try self.model_manager.acquireFromDirWithControl(path, effective);
-        defer handle.release();
-        const loaded = handle.get();
-        var data: std.array_list.Managed(std.json.Value) = .init(a);
-        const calibration = @import("../extractors/embedding_calibration.zig");
-        const policies = try a.alloc(calibration.Policy, request.tasks.len);
-        for (request.tasks, policies) |task, *policy| policy.* = try calibration.load(a, io, path, &loaded.embedding_identity.?, task.question, request.options, @tagName(task.mode));
-        var input_tokens: usize = 0;
-        for (request.items) |item| {
-            var classifications: std.array_list.Managed(std.json.Value) = .init(a);
-            var decisions: std.array_list.Managed(std.json.Value) = .init(a);
-            for (request.tasks[item.first..][0..item.count], 0..) |original, task_index| {
-                var task = original;
-                const policy = policies[item.first + task_index];
-                if (policy.thresholds) |thresholds| task.thresholds = thresholds;
-                const scores = try self.embeddingSimilarityScores(a, io, loaded, task.text, task.question, request.options, effective, &input_tokens);
-                const indices = try classification.selected(a, task, scores, policy.options);
-                var similarities: std.json.ObjectMap = .empty;
-                for (task.question.labels, scores) |label, score| try similarities.put(a, label, .{ .float = score });
-                var labels: std.array_list.Managed(std.json.Value) = .init(a);
-                for (indices) |index| {
-                    try labels.append(.{ .string = task.question.labels[index] });
-                    var result: std.json.ObjectMap = .empty;
-                    try result.put(a, "name", .{ .string = task.question.name });
-                    try result.put(a, "label", .{ .string = task.question.labels[index] });
-                    try result.put(a, "similarity", .{ .float = scores[index] });
-                    try classifications.append(.{ .object = result });
-                }
-                var decision: std.json.ObjectMap = .empty;
-                try decision.put(a, "name", .{ .string = task.question.name });
-                try decision.put(a, "mode", .{ .string = @tagName(task.mode) });
-                try decision.put(a, "decision_method", .{ .string = "embedding_similarity" });
-                const prototype_hash = try @import("../extractors/embedding_prototypes.zig").prototypeSetHash(a, task.question, request.options, @tagName(task.mode));
-                try decision.put(a, "prototype_set_hash", .{ .string = try a.dupe(u8, &prototype_hash) });
-                if (request.options.calibration_id) |id| try decision.put(a, "calibration_id", .{ .string = id });
-                try decision.put(a, "labels", .{ .array = labels });
-                try decision.put(a, "similarities", .{ .object = similarities });
-                try decision.put(a, "status", .{ .string = if (indices.len != 0) "selected" else "abstained" });
-                if (task.mode == .single) {
-                    const selection = try scoring.select(scores, policy.options);
-                    try decision.put(a, "margin", .{ .float = selection.margin });
-                    if (selection.reason) |reason| try decision.put(a, "abstention_reason", .{ .string = reason });
-                } else if (indices.len == 0) try decision.put(a, "abstention_reason", .{ .string = "no_unambiguous_labels" });
-                try decisions.append(.{ .object = decision });
-            }
-            var output: std.json.ObjectMap = .empty;
-            if (item.id) |id| try output.put(a, "id", .{ .string = id });
-            try output.put(a, "classifications", .{ .array = classifications });
-            try output.put(a, "decisions", .{ .array = decisions });
-            try data.append(.{ .object = output });
-        }
-        var root: std.json.ObjectMap = .empty;
-        try root.put(a, "object", .{ .string = "extraction" });
-        try root.put(a, "model", .{ .string = request.model });
-        try root.put(a, "schema_version", .{ .integer = 2 });
-        try root.put(a, "data", .{ .array = data });
-        var usage: std.json.ObjectMap = .empty;
-        try usage.put(a, "input_tokens", .{ .integer = @intCast(input_tokens) });
-        try usage.put(a, "output_tokens", .{ .integer = 0 });
-        try root.put(a, "usage", .{ .object = usage });
-        try root.put(a, "renderer_version", .{ .string = scoring.renderer_version });
-        try root.put(a, "model_identity", .{ .string = &loaded.embedding_identity.? });
-        const json = try std.json.Stringify.valueAlloc(a, std.json.Value{ .object = root }, .{});
-        if (json.len > @min(64 * 1024 * 1024, response_limit orelse 64 * 1024 * 1024)) return error.ExtractionResponseLimitExceeded;
-        try effective.check();
-        return try scratch.dupe(u8, json);
+        _ = control;
+        _ = response_limit;
+        return error.UnsupportedExtractionModel;
     }
 
-    fn tryExtractLayaV2(self: *Node, scratch: std.mem.Allocator, request_json: []const u8, control: ?InferenceExecutionControl, response_limit: ?usize, failure: *extraction_v2.FailureContext) !?[]u8 {
+    fn tryExtractLayaV2(self: *Node, scratch: std.mem.Allocator, request_json: []const u8, control: ?InferenceExecutionControl, response_limit: ?usize, failure: *extraction_v2.FailureContext, decision_execution: bool) !?[]u8 {
         try extraction_v2.scanJsonEnvelope(request_json, .{});
         const parsed = try std.json.parseFromSlice(std.json.Value, scratch, request_json, .{ .duplicate_field_behavior = .@"error" });
         defer parsed.deinit();
@@ -9049,12 +8971,13 @@ pub const Node = struct {
         var listing = try manifest_mod.loadListingFromDir(scratch, path);
         defer listing.deinit();
         if (!listing.laya_declared) return null;
+        if (!decision_execution) return error.UnsupportedExtractionModel;
         const laya = @import("../extractors/laya.zig");
         var arena = std.heap.ArenaAllocator.init(scratch);
         defer arena.deinit();
         const allocator = arena.allocator();
         const request = try laya.parse(allocator, parsed.value);
-        const contract = try resolvedInferenceExecutorContractFromDir(self, allocator, path, "extract");
+        const contract = try resolvedInferenceExecutorContractFromDir(self, allocator, path, "decide");
         try validateLayaExecutorInvocation(allocator, contract, request);
         const effective = control orelse InferenceExecutionControl{};
         try effective.check();
@@ -9083,10 +9006,16 @@ pub const Node = struct {
         budget: *runtime.tier.memory.RunBudget,
         working_bytes: usize,
         allocation_failure: *ExtractionAllocationFailure,
+        decision_execution: bool,
     ) ![]u8 {
-        // Each architecture retains its own schema validation and qualification.
+        if (!decision_execution) {
+            const envelope = try std.json.parseFromSlice(std.json.Value, scratch, request_json, .{ .duplicate_field_behavior = .@"error" });
+            defer envelope.deinit();
+            try @import("antfly_decisions").validateExtractionBoundary(envelope.value);
+        }
+        // Model-specific typed adapters are private to the decision executor.
         if (try self.tryExtractEmbeddingGemma2V2(scratch, request_json, control, response_limit, failure, observer)) |json| return json;
-        if (try self.tryExtractLayaV2(scratch, request_json, control, response_limit, failure)) |json| return json;
+        if (try self.tryExtractLayaV2(scratch, request_json, control, response_limit, failure, decision_execution)) |json| return json;
         const regex = @import("../pipelines/extraction_regex.zig");
         var validators = regex.Context.init(scratch, .{
             .compile_options = .{ .control = control },
@@ -19060,6 +18989,13 @@ pub const Node = struct {
             break :blk attachment_envelope.?.metadata;
         } else (try ctx.body()) orelse
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
+        {
+            var public_envelope = std.json.parseFromSlice(std.json.Value, ctx.allocator, request_json, .{ .duplicate_field_behavior = .@"error" }) catch
+                return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "body must be a valid extraction request" });
+            defer public_envelope.deinit();
+            @import("antfly_decisions").validateExtractionBoundary(public_envelope.value) catch
+                return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "standalone decisions use /decisions" });
+        }
         // A native GLiNER extraction model
         // is only ever executed through the schema_version:2 path
         // (extractV2InMemory -> boundary_executor); the pre-boundary legacy
@@ -19371,7 +19307,9 @@ pub const Node = struct {
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
         const a = arena.allocator();
-        const request = try decide_mod.parse(a, request_json);
+        const decision_api = @import("antfly_decisions");
+        const public_request = try decision_api.parse(a, request_json);
+        const request = public_request.inner;
         var owned_io: ?std.Io.Threaded = null;
         defer if (owned_io) |*io_impl| io_impl.deinit();
         const io = self.inferenceIo(a, null, &owned_io);
@@ -19381,32 +19319,34 @@ pub const Node = struct {
         };
         var manifest = try manifest_mod.loadListingFromDir(a, path);
         defer manifest.deinit();
-        if (manifest.embedding_style == .embedding_gemma2) return self.decideEmbeddingSimilarity(allocator, a, path, request, control);
-        if (request.embedding_options != null or request.model_identity != null) return error.UnsupportedDecideModel;
+        if (manifest.embedding_style == .embedding_gemma2) return self.decideEmbeddingSimilarity(allocator, a, path, public_request, control);
+        if (request.model_identity != null) return error.UnsupportedDecideModel;
+        for (public_request.policies) |policy| if (policy.embedding_configured or policy.kind == .multi_choice) return error.UnsupportedDecideModel;
         for (request.questions) |question| for (question.examples) |examples| if (examples.len != 0) return error.UnsupportedDecideModel;
         if (!manifest.hasCapability("typed_decisions")) return error.UnsupportedDecideModel;
         const gliner = manifest.gliner_architecture == .span and manifest.gliner_span_declared;
         if (!gliner and !manifest.laya_declared) return error.UnsupportedDecideModel;
-        const extraction_input = try decide_mod.extractionInput(a, request, gliner);
+        const extraction_input = try decision_api.extractionInput(a, public_request, gliner);
         const contract = try resolvedInferenceExecutorContract(self, "decide", &manifest);
         var max_labels: usize = 0;
         for (request.questions) |question| max_labels = @max(max_labels, question.labels.len);
-        try validateTextExecutorInvocation(contract, 1, &.{request.state}, 0, 0, max_labels, extraction_input.schema_bytes);
+        const texts = try a.alloc([]const u8, public_request.items.len);
+        for (public_request.items, texts) |item, *text| text.* = item.input;
+        try validateTextExecutorInvocation(contract, texts.len, texts, 0, 0, max_labels, extraction_input.schema_bytes);
         var failure = extraction_v2.FailureContext{};
         var extraction = try self.extractV2WithAdmission(a, .{ .json = extraction_input.json }, owner, control, &failure, null, "decide");
         defer extraction.deinit();
-        const response_json = try decide_mod.responseJson(a, request, extraction.json, gliner);
+        const response_json = try decision_api.trainedResponse(a, public_request, extraction.json, gliner);
         return allocator.dupe(u8, response_json);
     }
 
-    fn decideEmbeddingSimilarity(self: *Node, allocator: std.mem.Allocator, a: std.mem.Allocator, path: []const u8, request: decide_mod.Request, control: ?InferenceExecutionControl) ![]u8 {
-        const scoring = @import("../extractors/embedding_decisions.zig");
-        const options = request.embedding_options orelse scoring.Options{};
-        // Validate every question before loading a model or encoding anything.
+    fn decideEmbeddingSimilarity(self: *Node, allocator: std.mem.Allocator, a: std.mem.Allocator, path: []const u8, public_request: @import("antfly_decisions").Request, control: ?InferenceExecutionControl) ![]u8 {
+        const scoring = @import("antfly_decisions").scoring;
+        const request = public_request.inner;
         var text_count: usize = 0;
-        for (request.questions) |question| {
-            if (question.kind != .choice) return error.UnsupportedEmbeddingDecisionKind;
-            text_count = std.math.add(usize, text_count, 1) catch return error.DecideRequestLimitExceeded;
+        for (request.questions, public_request.policies) |question, policy| {
+            if (policy.kind != .choice and policy.kind != .multi_choice) return error.UnsupportedEmbeddingDecisionKind;
+            text_count = std.math.add(usize, text_count, public_request.items.len) catch return error.DecideRequestLimitExceeded;
             for (question.labels, 0..) |_, label_index| {
                 const examples = if (question.examples.len == 0) &.{} else question.examples[label_index];
                 text_count = std.math.add(usize, text_count, @max(examples.len, 1)) catch return error.DecideRequestLimitExceeded;
@@ -19428,40 +19368,78 @@ pub const Node = struct {
         if (request.model_identity) |expected| if (!std.mem.eql(u8, expected, &loaded.embedding_identity.?)) return error.EmbeddingIdentityMismatch;
         var max_labels: usize = 0;
         for (request.questions) |question| max_labels = @max(max_labels, question.labels.len);
-        try validateTextExecutorInvocation(contract, 1, &.{request.state}, 0, 0, max_labels, 0);
-        var input_tokens: usize = 0;
-        var answers: std.json.ObjectMap = .empty;
+        const texts = try a.alloc([]const u8, public_request.items.len);
+        for (public_request.items, texts) |item, *text| text.* = item.input;
+        try validateTextExecutorInvocation(contract, texts.len, texts, 0, 0, max_labels, 0);
         const calibration = @import("../extractors/embedding_calibration.zig");
         const policies = try a.alloc(calibration.Policy, request.questions.len);
-        for (request.questions, policies) |question, *policy| policy.* = try calibration.load(a, io, path, &loaded.embedding_identity.?, question, options, "single");
-        for (request.questions, policies) |question, policy| {
-            const scores = try self.embeddingSimilarityScores(a, io, loaded, request.state, question, options, effective, &input_tokens);
-            var similarities: std.json.ObjectMap = .empty;
-            for (question.labels, scores) |label, score| try similarities.put(a, label, .{ .float = score });
-            const selection = try scoring.select(scores, policy.options);
-            var answer: std.json.ObjectMap = .empty;
-            try answer.put(a, "type", .{ .string = "choice" });
-            try answer.put(a, "choice", if (selection.selected) |i| .{ .string = question.labels[i] } else .null);
-            try answer.put(a, "decision_method", .{ .string = "embedding_similarity" });
-            const prototype_hash = try @import("../extractors/embedding_prototypes.zig").prototypeSetHash(a, question, options, "single");
-            try answer.put(a, "prototype_set_hash", .{ .string = try a.dupe(u8, &prototype_hash) });
-            if (options.calibration_id) |id| try answer.put(a, "calibration_id", .{ .string = id });
-            try answer.put(a, "similarities", .{ .object = similarities });
-            try answer.put(a, "margin", .{ .float = selection.margin });
-            try answer.put(a, "status", .{ .string = if (selection.selected != null) "selected" else "abstained" });
-            if (selection.reason) |reason| try answer.put(a, "abstention_reason", .{ .string = reason });
-            try answers.put(a, question.name, .{ .object = answer });
+        for (request.questions, public_request.policies, policies) |question, acceptance, *policy| {
+            policy.* = try calibration.load(a, io, path, &loaded.embedding_identity.?, question, acceptance.options, if (acceptance.kind == .multi_choice) "multi" else "single");
+        }
+        var input_tokens: usize = 0;
+        var rows: std.array_list.Managed(std.json.Value) = .init(a);
+        var single_answers: std.json.Value = undefined;
+        for (public_request.items, 0..) |item, input_index| {
+            try effective.check();
+            var answers: std.array_list.Managed(std.json.Value) = .init(a);
+            for (request.questions, public_request.policies, policies) |question, acceptance, policy| {
+                const scores = try self.embeddingSimilarityScores(a, io, loaded, item.input, question, acceptance.options, effective, &input_tokens);
+                var similarities: std.array_list.Managed(std.json.Value) = .init(a);
+                for (question.labels, scores) |label, score| {
+                    var similarity: std.json.ObjectMap = .empty;
+                    try similarity.put(a, "value", .{ .string = label });
+                    try similarity.put(a, "similarity", .{ .float = score });
+                    try similarities.append(.{ .object = similarity });
+                }
+                var answer: std.json.ObjectMap = .empty;
+                try answer.put(a, "name", .{ .string = question.name });
+                try answer.put(a, "type", .{ .string = @tagName(acceptance.kind) });
+                try answer.put(a, "decision_method", .{ .string = "embedding_similarity" });
+                try answer.put(a, "similarity_metric", .{ .string = "cosine" });
+                const mode = if (acceptance.kind == .multi_choice) "multi" else "single";
+                const prototype_hash = try @import("../extractors/embedding_prototypes.zig").prototypeSetHash(a, question, acceptance.options, mode);
+                try answer.put(a, "prototype_set_hash", .{ .string = try a.dupe(u8, &prototype_hash) });
+                if (acceptance.options.calibration_id) |id| try answer.put(a, "calibration_id", .{ .string = id });
+                try answer.put(a, "similarities", .{ .array = similarities });
+                if (acceptance.kind == .choice) {
+                    const selection = try scoring.select(scores, policy.options);
+                    try answer.put(a, "choice", if (selection.selected) |i| .{ .string = question.labels[i] } else .null);
+                    try answer.put(a, "margin", .{ .float = selection.margin });
+                    try answer.put(a, "status", .{ .string = if (selection.selected != null) "selected" else "abstained" });
+                    if (selection.reason) |reason| try answer.put(a, "abstention_reason", .{ .string = reason });
+                } else {
+                    const thresholds = policy.thresholds orelse acceptance.thresholds orelse return error.EmbeddingMultiLabelThresholdRequired;
+                    const selection = try scoring.selectMulti(a, scores, thresholds, policy.options.min_margin);
+                    var choices: std.array_list.Managed(std.json.Value) = .init(a);
+                    for (selection.indices) |index| try choices.append(.{ .string = question.labels[index] });
+                    var threshold_map = std.json.ObjectMap{};
+                    for (question.labels, thresholds) |label, threshold| try threshold_map.put(a, label, .{ .float = threshold });
+                    try answer.put(a, "similarity_thresholds", .{ .object = threshold_map });
+                    try answer.put(a, "choices", .{ .array = choices });
+                    try answer.put(a, "margin", .{ .float = selection.margin });
+                    try answer.put(a, "status", .{ .string = selection.status });
+                    if (selection.reason) |reason| try answer.put(a, "abstention_reason", .{ .string = reason });
+                }
+                try answers.append(.{ .object = answer });
+            }
+            single_answers = .{ .array = answers };
+            var row: std.json.ObjectMap = .empty;
+            try row.put(a, "input_index", .{ .integer = @intCast(input_index) });
+            if (item.id) |id| try row.put(a, "id", .{ .string = id });
+            try row.put(a, "answers", single_answers);
+            try rows.append(.{ .object = row });
         }
         var usage: std.json.ObjectMap = .empty;
         try usage.put(a, "input_tokens", .{ .integer = @intCast(input_tokens) });
         try usage.put(a, "output_tokens", .{ .integer = 0 });
         var root: std.json.ObjectMap = .empty;
         try root.put(a, "model", .{ .string = request.model });
-        try root.put(a, "answers", .{ .object = answers });
+        try root.put(a, if (public_request.batched) "data" else "answers", if (public_request.batched) .{ .array = rows } else single_answers);
         try root.put(a, "usage", .{ .object = usage });
         try root.put(a, "renderer_version", .{ .string = scoring.renderer_version });
         if (loaded.embedding_identity) |*identity| try root.put(a, "model_identity", .{ .string = identity });
         try loaded.verifyEmbeddingIdentity();
+        try effective.check();
         return std.json.Stringify.valueAlloc(allocator, std.json.Value{ .object = root }, .{});
     }
 
@@ -19490,8 +19468,8 @@ pub const Node = struct {
         return vectors;
     }
 
-    fn embeddingSimilarityScores(self: *Node, a: std.mem.Allocator, io: std.Io, loaded: *model_manager_mod.LoadedModel, state: []const u8, question: decide_mod.Question, options: @import("../extractors/embedding_decisions.zig").Options, control: InferenceExecutionControl, input_tokens: *usize) ![]f64 {
-        const scoring = @import("../extractors/embedding_decisions.zig");
+    fn embeddingSimilarityScores(self: *Node, a: std.mem.Allocator, io: std.Io, loaded: *model_manager_mod.LoadedModel, state: []const u8, question: decide_mod.Question, options: @import("antfly_decisions").scoring.Options, control: InferenceExecutionControl, input_tokens: *usize) ![]f64 {
+        const scoring = @import("antfly_decisions").scoring;
         const prototypes = @import("../extractors/embedding_prototypes.zig");
         const limits = self.config.generation_budget_overrides.apply(self.defaultGenerationLimits(.cpu));
         const cache = try loaded.getEmbeddingPrototypeCache(limits, control);
@@ -19670,7 +19648,7 @@ pub const Node = struct {
             error.EmbeddingIdentityMismatch => ctx.status(409).json(.{ .@"error" = "MODEL_IDENTITY_MISMATCH", .message = @errorName(err) }),
             error.InvalidEmbeddingCalibration, error.EmbeddingCalibrationMismatch, error.UnqualifiedEmbeddingCalibration => ctx.status(400).json(.{ .@"error" = "INVALID_CALIBRATION", .message = @errorName(err) }),
             error.DecideRequestLimitExceeded => ctx.status(413).json(.{ .@"error" = "REQUEST_TOO_LARGE", .message = @errorName(err) }),
-            error.InvalidDecideRequest, error.UnsupportedEmbeddingDecisionKind => ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = @errorName(err) }),
+            error.InvalidDecideRequest, error.UnsupportedEmbeddingDecisionKind, error.EmbeddingMultiLabelThresholdRequired => ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = @errorName(err) }),
             error.ModelNotFound => ctx.status(404).json(.{ .@"error" = "MODEL_NOT_FOUND", .message = @errorName(err) }),
             error.InvalidModelIdentifier,
             error.ModelOutsideModelsDir,
@@ -22396,10 +22374,11 @@ fn taskMatchesModelListing(
     // every other unsupported model is.
     if (std.mem.eql(u8, gliner_model_type, "gliner2.5") and !gliner_boundary_model.runtime_available) return false;
     if (std.mem.eql(u8, task, "deciders")) {
-        if (!model_caps.hasCapability(capabilities, "typed_decisions")) return false;
+        if (!model_caps.hasCapability(capabilities, "typed_decisions") and !model_caps.hasCapability(capabilities, "embedding_similarity")) return false;
         for (tasks) |candidate| if (std.mem.eql(u8, candidate, "decide")) return true;
         return false;
     }
+    if (std.mem.eql(u8, task, "extractors") and (model_caps.hasCapability(capabilities, "embedding_similarity") or (model_caps.hasCapability(capabilities, "typed_decisions") and gliner_model_type.len == 0))) return false;
     // Classification is a public extraction capability. Keep `classifier` as
     // an internal pipeline kind without publishing a parallel API/catalog task.
     if (std.mem.eql(u8, task, "classifiers")) return false;
@@ -22468,7 +22447,8 @@ fn manifestMatchesModelListingTask(
     manifest: *const manifest_mod.ModelManifest,
 ) bool {
     if (std.mem.eql(u8, task, "readers") and isQwen3VlReadModel(manifest)) return true;
-    if (std.mem.eql(u8, task, "deciders") and
+    if (std.mem.eql(u8, task, "extractors") and (manifest.laya_declared or manifest.embedding_style == .embedding_gemma2)) return false;
+    if (std.mem.eql(u8, task, "deciders") and manifest.embedding_style != .embedding_gemma2 and
         !manifest.laya_declared and
         !(manifest.gliner_architecture == .span and manifest.gliner_span_declared)) return false;
     return taskMatchesModelListing(
@@ -23385,7 +23365,8 @@ pub fn resolvedTaskMaxItems(resolved_task: []const u8) usize {
     else if (std.mem.eql(u8, resolved_task, "embed"))
         64
     else if (std.mem.eql(u8, resolved_task, "rewrite") or
-        std.mem.eql(u8, resolved_task, "extract"))
+        std.mem.eql(u8, resolved_task, "extract") or
+        std.mem.eql(u8, resolved_task, "decide"))
         max_serial_family_batch_items
     else
         1;
@@ -24368,7 +24349,7 @@ fn inferenceHttpRouteAdmission(comptime method: []const u8, comptime path: []con
             std.mem.eql(u8, path, "/transcription/sessions/:session_id/stream") or
             std.mem.eql(u8, path, "/embed") or
             std.mem.eql(u8, path, "/embeddings") or
-            std.mem.eql(u8, path, "/decide") or
+            std.mem.eql(u8, path, "/decisions") or
             std.mem.eql(u8, path, "/extract") or
             std.mem.eql(u8, path, "/generate") or
             std.mem.eql(u8, path, "/generate/batch") or
@@ -29158,7 +29139,7 @@ test "decide maps model resolution errors to client responses" {
         .{ error.InvalidDecideOutput, 500, "INFERENCE_FAILED" },
     };
     for (cases) |case| {
-        var request = try httpx.Request.init(std.testing.allocator, .POST, "/ai/v1/decide");
+        var request = try httpx.Request.init(std.testing.allocator, .POST, "/ai/v1/decisions");
         defer request.deinit();
         var ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
         defer ctx.deinit();
@@ -34908,7 +34889,28 @@ test "boundary qualification model listings withhold every unqualified gliner2.5
     try std.testing.expect(taskMatchesModelListing("extractors", "extractor", "gliner2", &.{"extract"}, &.{"labels"}, true));
 }
 
-test "laya extraction v2 serves typed decisions over HTTP and embedded calls" {
+test "decisions public rejects extraction aliases before legacy HTTP dispatch" {
+    const a = std.testing.allocator;
+    var node = try Node.init(a, .{});
+    defer node.deinit();
+    for ([_][]const u8{
+        "{\"model\":\"absent\",\"inputs\":[{\"content\":\"x\"}],\"schema\":{\"classifications\":[{\"name\":\"q\",\"labels\":[\"a\",\"b\"]}]},\"options\":{\"embedding\":{}}}",
+        "{\"model\":\"absent\",\"inputs\":[{\"content\":\"x\"}],\"schema\":{\"classifications\":[{\"name\":\"q\",\"labels\":[\"a\",\"b\"],\"similarity_thresholds\":0.5}]}}",
+        "{\"model\":\"absent\",\"inputs\":[{\"content\":\"x\"}],\"schema\":{\"classifications\":[{\"name\":\"q\",\"mode\":\"boolean\",\"labels\":[\"a\",\"b\"]}]}}",
+    }) |body| {
+        var request = try httpx.Request.init(a, .POST, "/extract");
+        defer request.deinit();
+        request.body = body;
+        var ctx = httpx.Context.init(a, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try node.extractJSON(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 400), response.status.code);
+        try std.testing.expect(std.mem.indexOf(u8, response.body.?, "standalone decisions") != null);
+    }
+}
+
+test "laya decisions public API serves typed answers over HTTP and embedded calls" {
     const root = platform.env.getenv("ANTFLY_LAYA_QUALIFICATION") orelse platform.env.getenv("ANTFLY_LAYA_REFERENCE") orelse return error.SkipZigTest;
     const a = std.testing.allocator;
     // Real FP32 fixtures and the 192-question batch need explicit qualification
@@ -34921,10 +34923,10 @@ test "laya extraction v2 serves typed decisions over HTTP and embedded calls" {
     node.session_manager.required_backend = backend;
     node.model_manager.session_manager.required_backend = backend;
     const body =
-        \\{"model":"model","schema_version":2,"inputs":[{"content":"please find the document"}],"schema":{"classifications":[{"name":"tool","mode":"single","instruction":"which tool is needed?","labels":["search","fetch","none"]},{"name":"urgency","mode":"ordinal","instruction":"urgency?","labels":["low","medium","high"]},{"name":"needed","mode":"boolean","instruction":"is search needed?","labels":["false","true"]}]}}
+        \\{"model":"model","input":"please find the document","questions":[{"name":"tool","type":"choice","instructions":"which tool is needed?","choices":[{"value":"search"},{"value":"fetch"},{"value":"none"}]},{"name":"urgency","type":"score","instructions":"urgency?","levels":[{"label":"low"},{"label":"medium"},{"label":"high"}]},{"name":"needed","type":"predicate","instructions":"is search needed?"}]}
     ;
-    var direct = try node.extractV2DirectJsonWithControl(a, body, null);
-    defer direct.deinit();
+    const direct = try node.decideDirectJsonWithControl(a, body, null);
+    defer a.free(direct);
     if (backend == .metal and @import("../ops/laya_metal.zig").enabled()) {
         const model_path = try std.fs.path.join(a, &.{ root, "model" });
         defer a.free(model_path);
@@ -34949,88 +34951,58 @@ test "laya extraction v2 serves typed decisions over HTTP and embedded calls" {
         denied.session_manager.preferred_backends = &.{ .metal, .native };
         denied.model_manager.session_manager.preferred_backends = &.{ .metal, .native };
         const before = @import("../backends/metal_tensor.zig").memoryStatsSnapshot().device_owned_buffers_created;
-        try std.testing.expectError(error.ResourceLimitExceeded, denied.extractV2DirectJsonWithControl(a, body, null));
+        try std.testing.expectError(error.ResourceLimitExceeded, denied.decideDirectJsonWithControl(a, body, null));
         try std.testing.expectEqual(before, @import("../backends/metal_tensor.zig").memoryStatsSnapshot().device_owned_buffers_created);
         try std.testing.expectEqual(@as(usize, 0), denied.inference_admission.inFlightUnits());
     }
-    const parsed = try std.json.parseFromSlice(std.json.Value, a, direct.json, .{});
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, direct, .{});
     defer parsed.deinit();
-    const item = parsed.value.object.get("data").?.array.items[0].object;
-    try std.testing.expect(!item.contains("id"));
-    const decisions = item.get("decisions").?.array.items;
+    const decisions = parsed.value.object.get("answers").?.array.items;
     try std.testing.expectEqual(@as(usize, 3), decisions.len);
     try std.testing.expectEqualStrings("normalized_inverse_entropy", decisions[0].object.get("confidence_method").?.string);
-    try std.testing.expect(decisions[1].object.contains("expected_value"));
-    try std.testing.expect(decisions[2].object.contains("true_probability"));
-    var request = try httpx.Request.init(a, .POST, "/ai/v1/extract");
+    try std.testing.expect(decisions[1].object.contains("score"));
+    try std.testing.expect(decisions[2].object.contains("probability"));
+    var request = try httpx.Request.init(a, .POST, "/ai/v1/decisions");
     defer request.deinit();
     request.body = body;
     var ctx = httpx.Context.init(a, std.testing.io, &request);
     defer ctx.deinit();
-    var response = try node.extractJSON(&ctx);
+    var response = try node.decide(&ctx);
     defer response.deinit();
     try std.testing.expectEqual(@as(u16, 200), response.status.code);
-    try std.testing.expectEqualStrings(direct.json, response.body.?);
+    try std.testing.expectEqualStrings(direct, response.body.?);
     try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
     // 64 public inputs expand into 192 questions, exceeding the executor's
     // 128-input ceiling only if questions are incorrectly counted as inputs.
-    const repeated_inputs = @as([64]struct { content: []const u8 }, @splat(.{ .content = "please find the document" }));
+    const repeated_inputs = @as([64]struct { input: []const u8 }, @splat(.{ .input = "please find the document" }));
     const original_request = try std.json.parseFromSlice(std.json.Value, a, body, .{});
     defer original_request.deinit();
-    const expanded_body = try std.json.Stringify.valueAlloc(a, .{ .model = "model", .schema_version = 2, .inputs = repeated_inputs, .schema = original_request.value.object.get("schema").? }, .{});
+    const expanded_body = try std.json.Stringify.valueAlloc(a, .{ .model = "model", .inputs = repeated_inputs, .questions = original_request.value.object.get("questions").? }, .{});
     defer a.free(expanded_body);
-    var expanded_result = try node.extractV2DirectJsonWithControl(a, expanded_body, null);
-    defer expanded_result.deinit();
-    const expanded_parsed = try std.json.parseFromSlice(std.json.Value, a, expanded_result.json, .{});
+    const expanded_result = try node.decideDirectJsonWithControl(a, expanded_body, null);
+    defer a.free(expanded_result);
+    const expanded_parsed = try std.json.parseFromSlice(std.json.Value, a, expanded_result, .{});
     defer expanded_parsed.deinit();
     const expanded_items = expanded_parsed.value.object.get("data").?.array.items;
     try std.testing.expectEqual(@as(usize, 64), expanded_items.len);
     for (expanded_items) |expanded_item| {
-        const expanded_decisions = expanded_item.object.get("decisions").?.array.items;
+        const expanded_decisions = expanded_item.object.get("answers").?.array.items;
         try std.testing.expectEqual(decisions.len, expanded_decisions.len);
         for (decisions, expanded_decisions) |expected, actual| {
-            try std.testing.expectEqualStrings(expected.object.get("name").?.string, actual.object.get("name").?.string);
-            try std.testing.expectEqualStrings(expected.object.get("label").?.string, actual.object.get("label").?.string);
+            const expected_json = try std.json.Stringify.valueAlloc(a, expected, .{});
+            defer a.free(expected_json);
+            const actual_json = try std.json.Stringify.valueAlloc(a, actual, .{});
+            defer a.free(actual_json);
+            try std.testing.expectEqualStrings(expected_json, actual_json);
         }
     }
     try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
-    const invalid = try std.mem.replaceOwned(u8, a, body, "\"mode\":\"boolean\"", "\"mode\":\"multi\"");
+    const invalid = try std.mem.replaceOwned(u8, a, body, "\"type\":\"predicate\"", "\"type\":\"noul\"");
     defer a.free(invalid);
-    try std.testing.expectError(error.UnsupportedExtractionFeature, node.extractV2DirectJsonWithControl(a, invalid, null));
+    try std.testing.expectError(error.InvalidDecideRequest, node.decideDirectJsonWithControl(a, invalid, null));
     try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
-    const shared_schema = "{\"classifications\":[{\"name\":\"tool\",\"instruction\":\"which tool is needed?\",\"labels\":[\"search\",\"fetch\",\"none\"]}]}";
-    const input_rows = [_][]const u8{
-        "{\"id\":\"first\",\"content\":\"please find the document\"}",
-        "{\"id\":\"second\",\"content\":\"urgent\",\"schema\":{\"classifications\":[{\"name\":\"needed\",\"mode\":\"boolean\",\"instruction\":\"is search needed?\",\"labels\":[\"false\",\"true\"]}]}}",
-        "{\"id\":\"third\",\"content\":\"hello world\"}",
-    };
-    const batch_body = try std.fmt.allocPrint(a, "{{\"model\":\"model\",\"schema_version\":2,\"schema\":{s},\"inputs\":[{s},{s},{s}]}}", .{ shared_schema, input_rows[0], input_rows[1], input_rows[2] });
-    defer a.free(batch_body);
-    var batch_result = try node.extractV2DirectJsonWithControl(a, batch_body, null);
-    defer batch_result.deinit();
-    const BatchResponse = struct { data: []const struct { id: []const u8, decisions: []const struct { name: []const u8, label: []const u8, probabilities: []const struct { probability: f32 } } } };
-    const batch_parsed = try std.json.parseFromSlice(BatchResponse, a, batch_result.json, .{ .ignore_unknown_fields = true });
-    defer batch_parsed.deinit();
-    try std.testing.expectEqual(input_rows.len, batch_parsed.value.data.len);
-    for (input_rows, batch_parsed.value.data) |input, actual| {
-        const single_body = try std.fmt.allocPrint(a, "{{\"model\":\"model\",\"schema_version\":2,\"schema\":{s},\"inputs\":[{s}]}}", .{ shared_schema, input });
-        defer a.free(single_body);
-        var single = try node.extractV2DirectJsonWithControl(a, single_body, null);
-        defer single.deinit();
-        const single_parsed = try std.json.parseFromSlice(BatchResponse, a, single.json, .{ .ignore_unknown_fields = true });
-        defer single_parsed.deinit();
-        const expected = single_parsed.value.data[0];
-        try std.testing.expectEqualStrings(expected.id, actual.id);
-        try std.testing.expectEqual(expected.decisions.len, actual.decisions.len);
-        for (expected.decisions, actual.decisions) |want, got| {
-            try std.testing.expectEqualStrings(want.name, got.name);
-            try std.testing.expectEqualStrings(want.label, got.label);
-            for (want.probabilities, got.probabilities) |p, q| try std.testing.expectApproxEqAbs(p.probability, q.probability, 5e-4);
-        }
-    }
-    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
-    try std.testing.expect(taskMatchesModelListing("extractors", "classifier", "", &.{"extract"}, &.{"typed_decisions"}, false));
-    try std.testing.expect(!taskMatchesModelListing("classifiers", "classifier", "", &.{"extract"}, &.{"typed_decisions"}, false));
+    const extraction = "{\"model\":\"model\",\"schema_version\":2,\"inputs\":[{\"content\":\"x\"}],\"schema\":{\"classifications\":[{\"name\":\"tool\",\"labels\":[\"a\",\"b\"]}]}}";
+    try std.testing.expectError(error.UnsupportedExtractionModel, node.extractV2DirectJsonWithControl(a, extraction, null));
 }
 
 test "Decide extraction v2 serves classifications through HTTP handler" {
@@ -35118,9 +35090,9 @@ test "embeddinggemma2 managed text tokenizer and HTTP choice abstention" {
     const expected = reference.value.object.get("embeddings").?.array.items[0].array.items;
     try std.testing.expectEqual(@as(usize, 768), vectors[0].len);
     for (vectors[0], expected) |actual, want| try std.testing.expectApproxEqAbs(want.float, @as(f64, actual), @as(f64, if (backend == .metal) 1e-3 else 1e-4));
-    const body = try std.fmt.allocPrint(a, "{{\"model\":\"{s}\",\"state\":\"Reset my password\",\"questions\":{{\"route\":{{\"type\":\"choice\",\"instructions\":\"Route the request\",\"criteria\":{{\"account\":\"Account access\",\"duplicate\":\"Account access\"}}}}}}}}", .{std.fs.path.basename(model)});
+    const body = try std.fmt.allocPrint(a, "{{\"model\":\"{s}\",\"questions\":[{{\"name\":\"route\",\"type\":\"choice\",\"instructions\":\"Route the request\",\"choices\":[{{\"value\":\"account\",\"description\":\"Account access\"}},{{\"value\":\"duplicate\",\"description\":\"Account access\"}}]}}],\"input\":\"Reset my password\"}}", .{std.fs.path.basename(model)});
     defer a.free(body);
-    var request = try httpx.Request.init(a, .POST, "/ai/v1/decide");
+    var request = try httpx.Request.init(a, .POST, "/ai/v1/decisions");
     defer request.deinit();
     request.body = body;
     var ctx = httpx.Context.init(a, std.testing.io, &request);
@@ -35131,7 +35103,7 @@ test "embeddinggemma2 managed text tokenizer and HTTP choice abstention" {
     try std.testing.expectEqual(@as(u16, 200), response.status.code);
     const parsed = try std.json.parseFromSlice(std.json.Value, a, response.body.?, .{});
     defer parsed.deinit();
-    const answer = parsed.value.object.get("answers").?.object.get("route").?.object;
+    const answer = parsed.value.object.get("answers").?.array.items[0].object;
     try std.testing.expect(answer.get("choice").? == .null);
     try std.testing.expectEqualStrings("abstained", answer.get("status").?.string);
     try std.testing.expect(!answer.contains("probabilities") and !answer.contains("confidence"));
@@ -35139,7 +35111,7 @@ test "embeddinggemma2 managed text tokenizer and HTTP choice abstention" {
 
     // Identical descriptions and examples should reuse one model-owned
     // prototype; descriptions never alter an example-defined category.
-    const examples_body = try std.fmt.allocPrint(a, "{{\"model\":\"{s}\",\"state\":\"Reset my password\",\"questions\":{{\"route\":{{\"type\":\"choice\",\"instructions\":\"Route the request\",\"criteria\":{{\"a\":{{\"description\":\"ignored A\",\"examples\":[\"Password reset\",\"Cannot log in\"]}},\"b\":{{\"description\":\"ignored B\",\"examples\":[\"Password reset\",\"Cannot log in\"]}}}}}}}}}}", .{std.fs.path.basename(model)});
+    const examples_body = try std.fmt.allocPrint(a, "{{\"model\":\"{s}\",\"questions\":[{{\"name\":\"route\",\"type\":\"choice\",\"instructions\":\"Route the request\",\"choices\":[{{\"value\":\"a\",\"description\":\"ignored A\",\"examples\":[\"Password reset\",\"Cannot log in\"]}},{{\"value\":\"b\",\"description\":\"ignored B\",\"examples\":[\"Password reset\",\"Cannot log in\"]}}]}}],\"input\":\"Reset my password\"}}", .{std.fs.path.basename(model)});
     defer a.free(examples_body);
     const repetitions = if (platform.env.getenv("ANTFLY_EMBEDDINGGEMMA2_SOAK")) |raw| try std.fmt.parseInt(usize, raw, 10) else 2;
     if (repetitions < 2 or repetitions > 1000) return error.InvalidSoakCount;
@@ -35149,7 +35121,7 @@ test "embeddinggemma2 managed text tokenizer and HTTP choice abstention" {
         defer a.free(result);
         const value = try std.json.parseFromSlice(std.json.Value, a, result, .{});
         defer value.deinit();
-        const row = value.value.object.get("answers").?.object.get("route").?.object;
+        const row = value.value.object.get("answers").?.array.items[0].object;
         try std.testing.expect(row.get("choice").? == .null);
         try std.testing.expectEqualStrings("tie", row.get("abstention_reason").?.string);
         try std.testing.expectEqual(@as(usize, 64), row.get("prototype_set_hash").?.string.len);
@@ -35162,22 +35134,26 @@ test "embeddinggemma2 managed text tokenizer and HTTP choice abstention" {
     try std.testing.expectEqual(@as(usize, 2), cache.builds);
     try std.testing.expect(cache.hits >= repetitions);
     std.debug.print("embeddinggemma2 decision soak repetitions={d} prototype_builds={d} hits={d}\n", .{ repetitions, cache.builds, cache.hits });
-    const mismatch_body = try std.fmt.allocPrint(a, "{{\"model\":\"{s}\",\"model_identity\":\"{s}\",\"state\":\"Reset my password\",\"questions\":{{\"route\":{{\"type\":\"choice\",\"instructions\":\"Route\",\"criteria\":{{\"a\":\"A\",\"b\":\"B\"}}}}}}}}", .{ std.fs.path.basename(model), z17RepeatString("a", 64) });
+    const mismatch_body = try std.fmt.allocPrint(a, "{{\"model\":\"{s}\",\"model_identity\":\"{s}\",\"questions\":[{{\"name\":\"route\",\"type\":\"choice\",\"instructions\":\"Route\",\"choices\":[{{\"value\":\"a\",\"description\":\"A\"}},{{\"value\":\"b\",\"description\":\"B\"}}]}}],\"input\":\"Reset my password\"}}", .{ std.fs.path.basename(model), z17RepeatString("a", 64) });
     defer a.free(mismatch_body);
     try std.testing.expectError(error.EmbeddingIdentityMismatch, node.decideDirectJsonWithControl(a, mismatch_body, null));
     try std.testing.expectEqual(@as(usize, 2), cache.builds);
-    const extraction_body = try std.fmt.allocPrint(a, "{{\"model\":\"{s}\",\"schema_version\":2,\"inputs\":[{{\"id\":\"first\",\"content\":\"Reset my password\"}}],\"schema\":{{\"classifications\":[{{\"name\":\"tags\",\"prompt\":\"Route the request\",\"mode\":\"multi\",\"labels\":[\"a\",\"b\"],\"label_definitions\":{{\"a\":{{\"description\":\"Account access\"}},\"b\":{{\"description\":\"Account access\"}}}},\"similarity_thresholds\":-1}}]}}}}", .{std.fs.path.basename(model)});
-    defer a.free(extraction_body);
-    var extraction = try node.extractV2DirectJsonWithControl(a, extraction_body, null);
-    defer extraction.deinit();
-    const classified = try std.json.parseFromSlice(std.json.Value, a, extraction.json, .{});
+    const multi_body = try std.fmt.allocPrint(a, "{{\"model\":\"{s}\",\"inputs\":[{{\"id\":\"first\",\"input\":\"Reset my password\"}},{{\"id\":\"second\",\"input\":\"Pay my invoice\"}}],\"questions\":[{{\"name\":\"tags\",\"type\":\"multi_choice\",\"instructions\":\"Route the request\",\"choices\":[{{\"value\":\"a\",\"description\":\"Account access\"}},{{\"value\":\"b\",\"description\":\"Account access\"}}],\"similarity_thresholds\":-1}}]}}", .{std.fs.path.basename(model)});
+    defer a.free(multi_body);
+    const multi_response = try node.decideDirectJsonWithControl(a, multi_body, null);
+    defer a.free(multi_response);
+    const classified = try std.json.parseFromSlice(std.json.Value, a, multi_response, .{});
     defer classified.deinit();
-    const item = classified.value.object.get("data").?.array.items[0].object;
-    try std.testing.expectEqualStrings("first", item.get("id").?.string);
-    try std.testing.expectEqual(@as(usize, 2), item.get("classifications").?.array.items.len);
-    const decision = item.get("decisions").?.array.items[0].object;
-    try std.testing.expectEqualStrings("embedding_similarity", decision.get("decision_method").?.string);
-    try std.testing.expect(!decision.contains("probabilities") and !decision.contains("confidence"));
+    const items = classified.value.object.get("data").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), items.len);
+    for (items, 0..) |item, index| {
+        try std.testing.expectEqual(@as(i64, @intCast(index)), item.object.get("input_index").?.integer);
+        const decision = item.object.get("answers").?.array.items[0].object;
+        try std.testing.expectEqual(@as(usize, 2), decision.get("choices").?.array.items.len);
+        try std.testing.expectEqualStrings("selected", decision.get("status").?.string);
+        try std.testing.expectEqualStrings("cosine", decision.get("similarity_metric").?.string);
+        try std.testing.expect(!decision.contains("probabilities") and !decision.contains("confidence"));
+    }
 
     // One vector per ordered group, stable partial indexes, title rendering,
     // and normalized Matryoshka truncation through the actual HTTP handler.
@@ -35251,7 +35227,7 @@ test "embeddinggemma2 ordered media matches official F32 oracle" {
             dest.* = @floatCast(value.float);
             max_abs = @max(max_abs, @abs(value.float - actual));
         }
-        const cos = try @import("../extractors/embedding_decisions.zig").cosine(result.vector, &expected, 768);
+        const cos = try @import("antfly_decisions").scoring.cosine(result.vector, &expected, 768);
         std.debug.print("embeddinggemma2 media={s} metal={} cosine={d:.9} max_abs={d:.9}\n", .{ reference.object.get("name").?.string, metal, cos, max_abs });
         try std.testing.expect(cos >= @as(f64, if (metal) 0.9999 else 0.99999));
         try std.testing.expect(max_abs <= @as(f64, if (metal) 1e-3 else 1e-4));

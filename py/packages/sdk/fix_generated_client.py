@@ -99,26 +99,6 @@ def fix_generated_client(root: Path) -> None:
         "            return cast(")
     updates[path] = source
 
-    # Preserve historical generated Python imports for the trained contract
-    # while ExtractionDecision in OpenAPI becomes a union.
-    init_path = root / "models/__init__.py"
-    if init_path.exists():
-        aliases = {
-            "ExtractionDecision": ("extraction_decision", "TrainedExtractionDecision", "trained_extraction_decision"),
-            "ExtractionDecisionType": ("extraction_decision_type", "TrainedExtractionDecisionType", "trained_extraction_decision_type"),
-            "ExtractionDecisionConfidenceMethod": ("extraction_decision_confidence_method", "TrainedExtractionDecisionConfidenceMethod", "trained_extraction_decision_confidence_method"),
-        }
-        init_source = init_path.read_text(encoding="utf-8")
-        exports = []
-        alias_imports = []
-        for alias, (module, original, target) in aliases.items():
-            updates[root / f"models/{module}.py"] = f"from .{target} import {original} as {alias}\n\n__all__ = ({alias!r},)\n"
-            alias_imports.append(f"from .{module} import {alias}\n")
-            exports.append(alias)
-        header_end = init_source.index("\n\n") + 2
-        init_source = init_source[:header_end] + "".join(alias_imports) + init_source[header_end:]
-        updates[init_path] = init_source + f"\n__all__ += {tuple(exports)!r}\n"
-
     for path, source in updates.items():
         path.write_text(source, encoding="utf-8")
 

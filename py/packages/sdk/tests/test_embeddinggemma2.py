@@ -1,39 +1,61 @@
 """SDK compatibility for raw similarity decisions and ordered embedding groups."""
 
-from antfly.client_generated.models.embedding_extraction_decision import EmbeddingExtractionDecision
-from antfly.client_generated.models.extraction_object import ExtractionObject
-from antfly.client_generated.models.inference_decide_answer import InferenceDecideAnswer
+from antfly.client_generated.models.embedding_choice_answer import EmbeddingChoiceAnswer
+from antfly.client_generated.models.embedding_multi_choice_answer import EmbeddingMultiChoiceAnswer
+from antfly.client_generated.models.inference_decide_response import InferenceDecideResponse
 from antfly.client_generated.models.inference_embed_request import InferenceEmbedRequest
 from antfly.client_generated.models.inference_embedding_group import InferenceEmbeddingGroup
-from antfly.client_generated.models.trained_extraction_decision import TrainedExtractionDecision
 
 
 def test_abstained_choice_round_trips_without_probabilities():
-    raw = {"type": "choice", "choice": None, "decision_method": "embedding_similarity",
-           "similarities": {"account": 0.2, "billing": 0.2}, "margin": 0,
-           "status": "abstained", "abstention_reason": "tie", "prototype_set_hash": "a" * 64}
-    assert InferenceDecideAnswer.from_dict(raw).to_dict() == raw
+    answer = {
+        "name": "route",
+        "type": "choice",
+        "choice": None,
+        "decision_method": "embedding_similarity",
+        "similarity_metric": "cosine",
+        "similarities": [{"value": "account", "similarity": 0.2}, {"value": "billing", "similarity": 0.2}],
+        "margin": 0,
+        "status": "abstained",
+        "abstention_reason": "tie",
+        "prototype_set_hash": "a" * 64,
+    }
+    raw = {"model": "embeddinggemma2", "answers": [answer], "usage": {"input_tokens": 2, "output_tokens": 0}}
+    parsed = InferenceDecideResponse.from_dict(raw)
+    assert isinstance(parsed.answers[0], EmbeddingChoiceAnswer)
+    assert parsed.to_dict() == raw
 
 
-def test_extraction_preserves_both_decision_contracts():
-    similarity = {"name": "tags", "mode": "multi", "decision_method": "embedding_similarity",
-                  "labels": ["account"], "similarities": {"account": 0.7, "billing": 0.1}, "status": "selected"}
-    trained = {"name": "route", "type": "choice", "label": "account", "probabilities": [],
-               "confidence": 0.9, "confidence_method": "max_probability"}
-    value = ExtractionObject.from_dict({"decisions": [similarity, trained]})
-    assert isinstance(value.decisions[0], EmbeddingExtractionDecision)
-    assert isinstance(value.decisions[1], TrainedExtractionDecision)
-    assert value.to_dict() == {"decisions": [similarity, trained]}
+def test_batch_empty_multi_choice_is_distinct_from_abstention():
+    answer = {
+        "name": "tags",
+        "type": "multi_choice",
+        "choices": [],
+        "decision_method": "embedding_similarity",
+        "similarity_metric": "cosine",
+        "similarities": [{"value": "a", "similarity": 0.2}, {"value": "b", "similarity": 0.1}],
+        "similarity_thresholds": {"a": 0.5, "b": 0.5},
+        "margin": 0.3,
+        "status": "empty",
+        "prototype_set_hash": "a" * 64,
+    }
+    raw = {
+        "model": "embeddinggemma2",
+        "data": [{"input_index": 0, "id": "first", "answers": [answer]}],
+        "usage": {"input_tokens": 2, "output_tokens": 0},
+    }
+    parsed = InferenceDecideResponse.from_dict(raw)
+    assert isinstance(parsed.data[0].answers[0], EmbeddingMultiChoiceAnswer)
+    assert parsed.to_dict() == raw
 
 
 def test_grouped_input_keeps_order_title_dimensions_and_identity():
-    raw = {"model": "embeddinggemma2", "model_identity": "a" * 64, "dimensions": 128,
-           "input": [{"title": "Access", "content": [{"type": "text", "text": "Reset password"}]}]}
+    raw = {
+        "model": "embeddinggemma2",
+        "model_identity": "a" * 64,
+        "dimensions": 128,
+        "input": [{"title": "Access", "content": [{"type": "text", "text": "Reset password"}]}],
+    }
     value = InferenceEmbedRequest.from_dict(raw)
     assert isinstance(value.input_[0], InferenceEmbeddingGroup)
     assert value.to_dict() == raw
-
-
-def test_historical_trained_model_imports_remain_compatible():
-    from antfly.client_generated.models.extraction_decision import ExtractionDecision
-    assert ExtractionDecision is TrainedExtractionDecision

@@ -5586,25 +5586,17 @@ fn makeMetalHostedComputeBackend(
     if (!build_options.enable_metal) return error.MetalNotEnabled;
     const compute = try allocator.create(MetalCompute);
     errdefer allocator.destroy(compute);
-    compute.* = if (self.io) |io_handle|
-        try MetalCompute.initWithIoAndKernelJitScopeAndLoadContext(
-            allocator,
-            gpuBackendData(self),
-            run_budget,
-            io_handle,
-            self.kernel_jit_config,
-            self.metal_jit_scope,
-            self.kernel_jit_load_context,
-        )
-    else
-        try MetalCompute.initWithKernelJitScopeAndLoadContext(
-            allocator,
-            gpuBackendData(self),
-            run_budget,
-            self.kernel_jit_config,
-            self.metal_jit_scope,
-            self.kernel_jit_load_context,
-        );
+    try compute.initInPlaceWithKernelJitOptions(
+        allocator,
+        gpuBackendData(self),
+        run_budget,
+        self.io,
+        .{
+            .config = self.kernel_jit_config,
+            .scope = self.metal_jit_scope,
+            .load_context = self.kernel_jit_load_context,
+        },
+    );
     compute.require_f32_linears = self.arch_config == .embedding_gemma2;
     // The shared provider belongs to this model, and init holds its execution
     // lease. Configure encoder normalization before any device work is queued.

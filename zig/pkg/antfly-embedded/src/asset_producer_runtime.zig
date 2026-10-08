@@ -5046,43 +5046,6 @@ fn validateExtractionEndpoint(alloc: Allocator, item: std.json.Value, endpoint: 
     }
 }
 
-fn validateEmbeddingExtractionDecision(raw: std.json.Value) !void {
-    try extractionStringChoice(raw, "decision_method", &.{"embedding_similarity"});
-    try extractionStringChoice(raw, "mode", &.{ "single", "multi" });
-    try extractionStringChoice(raw, "status", &.{ "selected", "abstained" });
-    for ([_][]const u8{ "label", "type", "score", "probabilities", "confidence", "confidence_method", "expected_value", "act_probability", "true_probability" }) |key|
-        if (raw.object.contains(key)) return error.InvalidExtractorResponse;
-    const labels = raw.object.get("labels") orelse return error.InvalidExtractorResponse;
-    const similarities = raw.object.get("similarities") orelse return error.InvalidExtractorResponse;
-    if (labels != .array or labels.array.items.len > 64 or similarities != .object or similarities.object.count() < 1 or similarities.object.count() > 64)
-        return error.InvalidExtractorResponse;
-    const selected = std.mem.eql(u8, try extractionString(raw, "status"), "selected");
-    if (selected != (labels.array.items.len > 0) or (std.mem.eql(u8, try extractionString(raw, "mode"), "single") and labels.array.items.len > 1))
-        return error.InvalidExtractorResponse;
-    var scores = similarities.object.iterator();
-    while (scores.next()) |entry| {
-        if (entry.key_ptr.len == 0 or !std.unicode.utf8ValidateSlice(entry.key_ptr.*)) return error.InvalidExtractorResponse;
-        const score = try extractionNumber(entry.value_ptr.*, false);
-        if (score < -1 or score > 1) return error.InvalidExtractorResponse;
-    }
-    for (labels.array.items, 0..) |label, index| {
-        if (label != .string or !similarities.object.contains(label.string)) return error.InvalidExtractorResponse;
-        for (labels.array.items[0..index]) |previous| if (std.mem.eql(u8, previous.string, label.string)) return error.InvalidExtractorResponse;
-    }
-    if (raw.object.get("margin")) |value| if (value != .null) {
-        const margin = try extractionNumber(value, false);
-        if (margin < 0 or margin > 2) return error.InvalidExtractorResponse;
-    };
-    if (raw.object.get("prototype_set_hash")) |value| if (value != .null) {
-        if (value != .string or value.string.len != 64) return error.InvalidExtractorResponse;
-        for (value.string) |c| if (!std.ascii.isHex(c)) return error.InvalidExtractorResponse;
-    };
-    if (raw.object.get("calibration_id")) |value| if (value != .null) {
-        if (value != .string or value.string.len == 0 or value.string.len > 64) return error.InvalidExtractorResponse;
-        for (value.string) |c| if (!std.ascii.isAlphanumeric(c) and c != '_' and c != '-') return error.InvalidExtractorResponse;
-    };
-}
-
 fn validateExtractionResult(alloc: Allocator, item: std.json.Value, typed: extraction_api.ExtractionObject, v2: bool) !void {
     // Generated DTOs establish object/array/string structure, but JSON's
     // generic scalar parser can coerce numeric strings and overflow f32.
@@ -5113,34 +5076,9 @@ fn validateExtractionResult(alloc: Allocator, item: std.json.Value, typed: extra
         _ = try extractionString(raw, "label");
         try extractionOptionalNumber(raw, "score", false);
         if (classification.score) |score| if (!std.math.isFinite(score)) return error.InvalidExtractorResponse;
-        if (raw.object.get("similarity")) |value| if (value != .null) {
-            const similarity = try extractionNumber(value, false);
-            if (similarity < -1 or similarity > 1 or classification.score != null) return error.InvalidExtractorResponse;
-        };
+        if (raw.object.contains("similarity")) return error.InvalidExtractorResponse;
     };
-    if (typed.decisions) |decisions| for (item.object.get("decisions").?.array.items, decisions) |raw, decision| {
-        if (!v2) return error.InvalidExtractorResponse;
-        _ = try extractionString(raw, "name");
-        if (decision == .embedding_extraction_decision) {
-            try validateEmbeddingExtractionDecision(raw);
-            continue;
-        }
-        _ = try extractionString(raw, "label");
-        try extractionStringChoice(raw, "type", &.{ "choice", "score", "boolean" });
-        try extractionStringChoice(raw, "confidence_method", &.{ "normalized_inverse_entropy", "max_probability" });
-        _ = try extractionNumber(raw.object.get("confidence") orelse return error.InvalidExtractorResponse, true);
-        // Only models with an action head (Laya) report one.
-        try extractionOptionalNumber(raw, "act_probability", true);
-        try extractionOptionalNumber(raw, "true_probability", true);
-        if (raw.object.get("expected_value")) |value| if (try extractionNumber(value, false) < 0) return error.InvalidExtractorResponse;
-        if (decision.trained_extraction_decision.expected_value) |value| if (!std.math.isFinite(value)) return error.InvalidExtractorResponse;
-        const probabilities = raw.object.get("probabilities") orelse return error.InvalidExtractorResponse;
-        if (probabilities != .array or probabilities.array.items.len < 2) return error.InvalidExtractorResponse;
-        for (probabilities.array.items) |probability| {
-            _ = try extractionString(probability, "label");
-            _ = try extractionNumber(probability.object.get("probability") orelse return error.InvalidExtractorResponse, true);
-        }
-    };
+    if (item.object.contains("decisions")) return error.InvalidExtractorResponse;
     if (typed.relations) |relations| for (item.object.get("relations").?.array.items, relations) |raw, relation| {
         _ = try extractionString(raw, "type");
         try extractionOptionalNumber(raw, "score", false);
@@ -7936,62 +7874,30 @@ test "asset producer runtime never batches an extractor that advertises max_item
     try std.testing.expectEqual(@as(usize, 1), local.max_inputs_seen);
 }
 
-test "decision functions laya enrichment preserves typed decisions and rejects invalid probabilities" {
+test "decision functions extraction rejects removed decision outputs and preserves ordinary classification" {
     const a = std.testing.allocator;
-    const payload =
-        \\{"object":"extraction","model":"laya","schema_version":2,"data":[{"classifications":[{"name":"tool","label":"search","score":0.75}],"decisions":[{"name":"tool","type":"choice","label":"search","probabilities":[{"label":"search","probability":0.75},{"label":"none","probability":0.25}],"confidence":0.1887,"confidence_method":"normalized_inverse_entropy","act_probability":0.8}]}]}
-    ;
-    const expected = extracting.ResponseExpectation{ .model = "laya", .item_count = 1, .schema_version = 2 };
-    const result = try extractionResultJsonAlloc(a, payload, expected, null, false);
+    const expected = extracting.ResponseExpectation{ .model = "m", .item_count = 1, .schema_version = 2 };
+    const ordinary = "{\"object\":\"extraction\",\"model\":\"m\",\"schema_version\":2,\"data\":[{\"classifications\":[{\"name\":\"route\",\"label\":\"account\",\"score\":0.7}]}]}";
+    const result = try extractionResultJsonAlloc(a, ordinary, expected, null, false);
     defer a.free(result);
-    try std.testing.expect(std.mem.indexOf(u8, result, "\"decisions\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, "\"probability\":0.75") != null);
-    const invalid = try std.mem.replaceOwned(u8, a, payload, "\"probability\":0.75", "\"probability\":1.5");
-    defer a.free(invalid);
-    try std.testing.expectError(error.InvalidExtractorResponse, extractionResultJsonAlloc(a, invalid, expected, null, false));
-    // OpenDecider-format models have no action head and omit act_probability.
-    const no_action = try std.mem.replaceOwned(u8, a, payload, ",\"act_probability\":0.8", "");
-    defer a.free(no_action);
-    const without = try extractionResultJsonAlloc(a, no_action, expected, null, false);
-    defer a.free(without);
-    try std.testing.expect(std.mem.indexOf(u8, without, "act_probability") == null);
-}
-
-test "decision functions enrichment preserves embedding similarity and rejects mixed semantics" {
-    const a = std.testing.allocator;
-    const payload =
-        \\{"object":"extraction","model":"embeddinggemma2","schema_version":2,"data":[{"classifications":[{"name":"route","label":"account","similarity":0.7}],"decisions":[{"name":"route","mode":"single","decision_method":"embedding_similarity","status":"selected","labels":["account"],"similarities":{"account":0.7,"other":-0.1},"margin":0.8}]}]}
-    ;
-    const expected = extracting.ResponseExpectation{ .model = "embeddinggemma2", .item_count = 1, .schema_version = 2 };
-    const result = try extractionResultJsonAlloc(a, payload, expected, null, false);
-    defer a.free(result);
-    try std.testing.expect(std.mem.indexOf(u8, result, "embedding_similarity") != null);
-    for ([_]struct { []const u8, []const u8 }{
-        .{ "\"account\":0.7", "\"account\":1.1" },
-        .{ "\"account\":0.7", "\"account\":1e999" },
-        .{ "\"similarity\":0.7", "\"similarity\":0.7,\"score\":0.9" },
-        .{ "\"margin\":0.8", "\"margin\":0.8,\"confidence\":0.9" },
-        .{ "\"labels\":[\"account\"]", "\"labels\":[\"unknown\"]" },
-        .{ "\"status\":\"selected\"", "\"status\":\"abstained\"" },
-    }) |change| {
-        const invalid = try std.mem.replaceOwned(u8, a, payload, change[0], change[1]);
-        defer a.free(invalid);
-        try std.testing.expectError(error.InvalidExtractorResponse, extractionResultJsonAlloc(a, invalid, expected, null, false));
-    }
+    for ([_][]const u8{
+        "{\"object\":\"extraction\",\"model\":\"m\",\"schema_version\":2,\"data\":[{\"decisions\":[]}]}",
+        "{\"object\":\"extraction\",\"model\":\"m\",\"schema_version\":2,\"data\":[{\"classifications\":[{\"name\":\"route\",\"label\":\"account\",\"similarity\":0.7}]}]}",
+    }) |invalid| try std.testing.expectError(error.InvalidExtractorResponse, extractionResultJsonAlloc(a, invalid, expected, null, false));
 }
 
 test "decision functions materialized enrichment records version model and source provenance" {
     const a = std.testing.allocator;
     const Fake = struct {
         fn decide(_: *anyopaque, alloc: Allocator, _: []const u8, _: ?RequestContext) ![]u8 {
-            return alloc.dupe(u8, "{\"model\":\"resolved-model\",\"answers\":{\"refund\":{\"type\":\"noul\",\"noul\":0.9}},\"usage\":{\"input_tokens\":2,\"output_tokens\":0}}");
+            return alloc.dupe(u8, "{\"model\":\"resolved-model\",\"answers\":[{\"name\":\"refund\",\"type\":\"predicate\",\"decision_method\":\"typed\",\"probability\":0.9}],\"usage\":{\"input_tokens\":2,\"output_tokens\":0}}");
         }
     };
     var client = httpx.Client.initWithConfig(a, std.testing.io, .{});
     defer client.deinit();
     var runtime = Runtime.initWithOptions(a, &client, .{ .antfly_provider = .{ .ptr = undefined, .embed_dense_texts = undefined, .embed_sparse_texts = undefined, .decide_json = Fake.decide } });
     defer runtime.deinit();
-    const specification = "{\"version\":\"v1\",\"decider\":{\"provider\":\"antfly\",\"model\":\"mock\"},\"questions\":{\"refund\":{\"type\":\"noul\",\"instructions\":\"Refund?\"}}}";
+    const specification = "{\"version\":\"v1\",\"decider\":{\"provider\":\"antfly\",\"model\":\"mock\"},\"questions\":[{\"name\":\"refund\",\"type\":\"predicate\",\"instructions\":\"Refund?\"}]}";
     for ([_]?[]const u8{ null, "[{\"type\":\"text\",\"text\":\"refund\"}]", "[{\"type\":\"text\",\"text\":\"ref\"},{\"type\":\"text\",\"text\":\"und\"}]" }) |parts| {
         const output = try runtime.producer().produce(a, .{ .producer_type = .decision, .config_json = specification, .source_text = "refund", .source_parts_json = parts });
         a.free(output);

@@ -1244,13 +1244,29 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         io: ?std.Io,
         kernel_jit_options: metal_runtime.MetalJitOptions,
     ) !MetalCompute {
+        var compute: MetalCompute = undefined;
+        try compute.initInPlaceWithKernelJitOptions(allocator, data, run_budget, io, kernel_jit_options);
+        return compute;
+    }
+
+    /// Initialize directly in the caller's allocation. Embedded callers may
+    /// have small foreign-language stacks, so do not pass the large context
+    /// through several value-returning initialization frames.
+    pub fn initInPlaceWithKernelJitOptions(
+        self: *MetalCompute,
+        allocator: std.mem.Allocator,
+        data: *WeightStore,
+        run_budget: ?*@import("../runtime/root.zig").tier.memory.RunBudget,
+        io: ?std.Io,
+        kernel_jit_options: metal_runtime.MetalJitOptions,
+    ) !void {
         _ = run_budget;
         try kernel_jit_options.config.validate();
         if (io == null and !builtin.is_test and comptime false) {
             const provider_impl = try std.heap.c_allocator.create(MetalNativeProvider);
             errdefer std.heap.c_allocator.destroy(provider_impl);
             provider_impl.* = try MetalNativeProvider.createWithKernelJitOptions(kernel_jit_options);
-            var compute: MetalCompute = .{
+            self.* = .{
                 .allocator = allocator,
                 .data = data,
                 .provider = if (false) null else {},
@@ -1258,8 +1274,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 .owned_native_provider = true,
                 .io = io,
             };
-            compute.captureRuntimeFrameBaselines();
-            return compute;
+            self.captureRuntimeFrameBaselines();
+            return;
         }
         const lock_io = try lockSharedMetalData(data, io);
         errdefer unlockSharedMetalData(data, lock_io);
@@ -1272,7 +1288,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         };
         if (provider_impl.jit_mode != kernel_jit_options.config.mode or
             !provider_impl.jit_scope.eql(kernel_jit_options.scope)) return error.MetalKernelJitConfigConflict;
-        var compute: MetalCompute = .{
+        self.* = .{
             .allocator = allocator,
             .data = data,
             .provider = if (false) null else {},
@@ -1281,8 +1297,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .shared_provider_lease_io = lock_io,
             .io = io,
         };
-        compute.captureRuntimeFrameBaselines();
-        return compute;
+        self.captureRuntimeFrameBaselines();
     }
 
     /// Create a compute context on the store's shared native provider

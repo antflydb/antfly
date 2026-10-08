@@ -491,7 +491,7 @@ pub const ModelManifest = struct {
     }
 
     pub fn hasCapability(self: *const ModelManifest, cap: []const u8) bool {
-        if (self.embedding_style == .embedding_gemma2 and (std.mem.eql(u8, cap, "embedding_similarity") or std.mem.eql(u8, cap, "typed_decisions"))) return true;
+        if (self.embedding_style == .embedding_gemma2 and std.mem.eql(u8, cap, "embedding_similarity")) return true;
 
         if (!self.hasSupportedGlinerRuntime()) return false;
         for (self.capabilities) |c| {
@@ -1693,9 +1693,16 @@ fn applyImplicitModelTypeHints(manifest: *ModelManifest, model_dir_path: []const
         manifest.model_type_origin = .config;
         if (manifest.inputs.len == 0) try setManifestInputs(manifest.allocator, manifest, &.{"text"});
         for (manifest.inputs) |input| if (!std.mem.eql(u8, input, "text") and !std.mem.eql(u8, input, "image") and !std.mem.eql(u8, input, "audio")) return error.InvalidModelManifest;
-        try appendManifestStrings(manifest.allocator, &manifest.tasks, &.{ "embed", "decide", "extract" });
-        try appendManifestStrings(manifest.allocator, &manifest.capabilities, &.{ "embedding_similarity", "typed_decisions", "classification" });
+        try removeManifestStrings(manifest.allocator, &manifest.tasks, &.{ "extract", "classify" });
+        try removeManifestStrings(manifest.allocator, &manifest.capabilities, &.{ "typed_decisions", "classification", "extraction" });
+        try appendManifestStrings(manifest.allocator, &manifest.tasks, &.{ "embed", "decide" });
+        try appendManifestStrings(manifest.allocator, &manifest.capabilities, &.{"embedding_similarity"});
         return;
+    }
+    if (manifest.laya_declared and manifest.hasCapability("typed_decisions")) {
+        try removeManifestStrings(manifest.allocator, &manifest.tasks, &.{ "extract", "classify" });
+        try removeManifestStrings(manifest.allocator, &manifest.capabilities, &.{ "classification", "extraction" });
+        try appendManifestStrings(manifest.allocator, &manifest.tasks, &.{"decide"});
     }
     if (inferGlinerModelType(manifest, model_dir_path)) |gliner_type| {
         if (manifest.gliner_model_type.len > 0 and !std.mem.eql(u8, manifest.gliner_model_type, gliner_type)) {
@@ -3623,6 +3630,31 @@ fn setManifestInputs(allocator: std.mem.Allocator, manifest: *ModelManifest, inp
     manifest.inputs = owned;
 }
 
+fn removeManifestStrings(allocator: std.mem.Allocator, field: *[][]const u8, removals: []const []const u8) !void {
+    var count: usize = 0;
+    for (field.*) |existing| {
+        for (removals) |removal| {
+            if (std.mem.eql(u8, existing, removal)) break;
+        } else count += 1;
+    }
+    if (count == field.len) return;
+    const next = try allocator.alloc([]const u8, count);
+    var index: usize = 0;
+    for (field.*) |existing| {
+        for (removals) |removal| {
+            if (std.mem.eql(u8, existing, removal)) {
+                allocator.free(existing);
+                break;
+            }
+        } else {
+            next[index] = existing;
+            index += 1;
+        }
+    }
+    allocator.free(field.*);
+    field.* = next;
+}
+
 fn appendManifestStrings(allocator: std.mem.Allocator, field: *[][]const u8, additions: []const []const u8) !void {
     for (additions) |addition| {
         for (field.*) |existing| {
@@ -4300,6 +4332,34 @@ test "parseModelManifestJson parses inputs array" {
     try std.testing.expect(manifest.hasInput("image"));
     try std.testing.expectEqual(Sparse3DOutputLayout.seq_batch, manifest.sparse_3d_output_layout.?);
     try std.testing.expectEqual(ModelTypeOrigin.manifest, manifest.model_type_origin);
+}
+
+test "decisions public discovery removes stale extraction roles from standalone deciders" {
+    const a = std.testing.allocator;
+    var laya = ModelManifest{ .allocator = a };
+    defer laya.deinit();
+    try parseModelManifestJson(&laya, a,
+        \\{"type":"classifier","tasks":["extract","classify"],"capabilities":["classification","typed_decisions"],"inputs":["text"]}
+    );
+    laya.laya_declared = true;
+    try applyImplicitModelTypeHints(&laya, "/models/local/laya");
+    try std.testing.expect(laya.hasTask("decide"));
+    try std.testing.expect(!laya.hasTask("extract") and !laya.hasTask("classify"));
+    try std.testing.expect(laya.hasCapability("typed_decisions") and !laya.hasCapability("classification"));
+
+    var embedding = ModelManifest{ .allocator = a };
+    defer embedding.deinit();
+    try parseModelManifestJson(&embedding, a,
+        \\{"type":"embedder","tasks":["extract","decide"],"capabilities":["classification","typed_decisions"],"inputs":["text"]}
+    );
+    embedding.config_model_arch = try a.dupe(u8, "embedding_gemma2");
+    embedding.embedding_style = .embedding_gemma2;
+    embedding.pooling = .mean;
+    embedding.normalize = true;
+    try applyImplicitModelTypeHints(&embedding, "/models/local/embeddinggemma2");
+    try std.testing.expect(embedding.hasTask("embed") and embedding.hasTask("decide"));
+    try std.testing.expect(!embedding.hasTask("extract"));
+    try std.testing.expect(embedding.hasCapability("embedding_similarity") and !embedding.hasCapability("typed_decisions"));
 }
 
 test "explicit GLiNER label-marker decision head is extraction-v2 classification only" {

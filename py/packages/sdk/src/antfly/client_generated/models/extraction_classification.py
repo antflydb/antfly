@@ -18,13 +18,11 @@ class ExtractionClassification:
         name (str):
         label (str):
         score (float | Unset):
-        similarity (float | Unset): Raw cosine similarity for embedding classifiers; not a probability.
     """
 
     name: str
     label: str
     score: float | Unset = UNSET
-    similarity: float | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -33,8 +31,6 @@ class ExtractionClassification:
         label = self.label
 
         score = self.score
-
-        similarity = self.similarity
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
@@ -46,8 +42,6 @@ class ExtractionClassification:
         )
         if score is not UNSET:
             field_dict["score"] = score
-        if similarity is not UNSET:
-            field_dict["similarity"] = similarity
 
         return field_dict
 
@@ -60,13 +54,10 @@ class ExtractionClassification:
 
         score = d.pop("score", UNSET)
 
-        similarity = d.pop("similarity", UNSET)
-
         extraction_classification = cls(
             name=name,
             label=label,
             score=score,
-            similarity=similarity,
         )
 
         extraction_classification.additional_properties = d

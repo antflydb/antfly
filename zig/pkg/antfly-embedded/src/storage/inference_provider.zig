@@ -46,7 +46,7 @@ pub fn isInteractiveGeneratePath(path: []const u8) bool {
     for ([_][]const u8{ inference_bridge.ai_api_prefix, inference_bridge.public_api_prefix }) |prefix| {
         if (!std.mem.startsWith(u8, path, prefix)) continue;
         const suffix = path[prefix.len..];
-        if (std.mem.eql(u8, suffix, "/decide") or
+        if (std.mem.eql(u8, suffix, "/decisions") or
             std.mem.eql(u8, suffix, "/generate") or
             std.mem.eql(u8, suffix, "/generate/batch") or
             std.mem.eql(u8, suffix, "/chat/completions")) return true;
@@ -1293,7 +1293,7 @@ pub fn inferenceProviderDecideJson(
         .abi_version = inference_connection_abi.abi_version,
         .target_context = &target,
         .allocator = &abi_alloc,
-        .operation = .init("decide"),
+        .operation = .init("decisions"),
         .body = .init(body),
         .deadline_ns = if (request) |context| context.deadline_ns orelse 0 else platform_time.monotonicNs() +| 5 * std.time.ns_per_min,
         .cancellation = .{ .context = &request, .is_cancelled = struct {

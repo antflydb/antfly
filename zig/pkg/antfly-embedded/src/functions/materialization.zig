@@ -22,10 +22,11 @@ pub const Specification = struct {
     questions: d.Json,
 };
 pub fn parse(a: std.mem.Allocator, bytes: []const u8) !std.json.Parsed(Specification) {
-    const parsed = try std.json.parseFromSlice(Specification, a, bytes, .{ .allocate = .alloc_always });
+    var parsed = try std.json.parseFromSlice(Specification, a, bytes, .{ .allocate = .alloc_always });
     errdefer parsed.deinit();
     _ = try d.text(.{ .string = parsed.value.version });
     try parsed.value.decider.validate();
+    parsed.value.questions = try d.publicQuestions(parsed.arena.allocator(), parsed.value.questions);
     try d.validateQuestions(parsed.value.questions, parsed.value.decider.resolvedCapabilities());
     return parsed;
 }

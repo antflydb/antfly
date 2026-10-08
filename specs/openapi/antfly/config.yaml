@@ -18,7 +18,7 @@ components:
           type: string
           enum: [typed, embedding_similarity]
           default: typed
-          description: Explicit result contract. embedding_similarity is available with Antfly EmbeddingGemma 2 choices; rejects score and noul requests and returns cosine scores with nullable choice.
+          description: Explicit result contract. embedding_similarity is available with Antfly EmbeddingGemma 2 choice and multi_choice questions; rejects score and predicate requests and returns raw cosine similarities.
         model:
           type: string
           description: Required for Antfly and OpenAI; Jev defaults to jev-latest.
@@ -29,7 +29,7 @@ components:
         embedding_options:
           type: object
           additionalProperties: false
-          description: EmbeddingGemma 2 similarity decisions only. Other models reject these options. Uncalibrated results contain cosine scores and never probabilities.
+          description: EmbeddingGemma 2 geometry and acceptance defaults. Acceptance is serialized onto each question and can be overridden per question. Other models reject these options. Raw cosine similarities never represent probabilities.
           properties:
             calibration_id:
               type: string

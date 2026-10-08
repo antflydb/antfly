@@ -1118,10 +1118,15 @@ paths:
                 $ref: '#/components/schemas/Error'
         '503':
           $ref: '#/components/responses/TransientCapacity'
-  /decide:
+  /decisions:
     post:
-      summary: Answer named choice, ordinal score, and Boolean questions
       operationId: decide
+      summary: Answer named decision questions
+      description: Execute one text input or an Antfly batch. Embedding similarity supports choice and multi_choice;
+        trained decision models support choice, score and predicate. Answer variants distinguish trained
+        probabilities from raw cosine similarities.
+      tags:
+      - Inference
       requestBody:
         required: true
         content:
@@ -1130,7 +1135,7 @@ paths:
               $ref: '#/components/schemas/DecideRequest'
       responses:
         '200':
-          description: Decision distributions and derived answers
+          description: Named decision answers, diagnostics and aggregate token usage
           content:
             application/json:
               schema:
@@ -1155,6 +1160,7 @@ paths:
                 $ref: '#/components/schemas/Error'
         '503':
           $ref: '#/components/responses/TransientCapacity'
+
   /extract:
     post:
       summary: Extract entities, relations, classifications, and structures
@@ -3062,170 +3068,15 @@ components:
             type: string
           description: List of input modalities this model accepts, such as `text`, `image`, or `audio`
     EmbeddingDecisionOptions:
-      type: object
-      additionalProperties: false
-      description: EmbeddingGemma 2 similarity decisions only. Other models reject these options. Uncalibrated results contain cosine scores and never probabilities.
-      properties:
-        calibration_id:
-          type: string
-          pattern: '^[A-Za-z0-9_-]{1,64}$'
-          description: Qualified fitted raw thresholds in model/calibrations/{id}.json. Bound to the exact asset identity, task, renderer, dimensions and category prototypes; mutually exclusive with manual thresholds. Does not produce probabilities.
-        task_type:
-          type: string
-          enum: [CLUSTERING, CLASSIFICATION]
-          default: CLUSTERING
-        dimensions:
-          type: integer
-          enum: [768, 512, 256, 128]
-          default: 768
-        min_similarity:
-          type: number
-          minimum: -1
-          maximum: 1
-        min_margin:
-          type: number
-          minimum: 0
-          maximum: 2
+      $ref: '../ai/decision.yaml#/components/schemas/EmbeddingDecisionOptions'
     DecideRequest:
-      type: object
-      additionalProperties: false
-      required: [model, state, questions]
-      properties:
-        model:
-          type: string
-          minLength: 1
-        model_identity:
-          type: string
-          pattern: '^[0-9a-f]{64}$'
-          description: Pin the exact EmbeddingGemma 2 assets and embedding recipe.
-        state:
-          type: string
-          minLength: 1
-          maxLength: 1048576
-        embedding_options:
-          $ref: '#/components/schemas/EmbeddingDecisionOptions'
-        questions:
-          type: object
-          minProperties: 1
-          maxProperties: 64
-          additionalProperties:
-            $ref: '#/components/schemas/DecideQuestion'
+      $ref: '../ai/decision.yaml#/components/schemas/DecideRequest'
     DecideQuestion:
-      type: object
-      additionalProperties: false
-      required: [type, instructions]
-      properties:
-        type:
-          type: string
-          enum: [choice, score, noul]
-        instructions:
-          type: string
-          minLength: 1
-        criteria:
-          description: Choice uses option IDs mapped to descriptions; score uses ordered descriptions; noul omits criteria.
-          oneOf:
-            - type: object
-              minProperties: 2
-              maxProperties: 64
-              additionalProperties:
-                oneOf:
-                  - type: string
-                  - $ref: '#/components/schemas/EmbeddingDecisionCategory'
-            - type: array
-              minItems: 2
-              maxItems: 64
-              items:
-                type: string
-    EmbeddingDecisionCategory:
-      type: object
-      additionalProperties: false
-      required: [examples]
-      description: Embedding similarity categories only. The normalized centroid of examples replaces the description prototype; examples use the input renderer. Trained decision models reject this form.
-      properties:
-        description:
-          type: string
-          minLength: 1
-        examples:
-          type: array
-          minItems: 1
-          maxItems: 32
-          items:
-            type: string
-            minLength: 1
+      $ref: '../ai/decision.yaml#/components/schemas/DecideQuestion'
     DecideResponse:
-      type: object
-      required: [model, answers, usage]
-      properties:
-        model_identity:
-          type: string
-        renderer_version:
-          type: string
-        model:
-          type: string
-        answers:
-          type: object
-          additionalProperties:
-            $ref: '#/components/schemas/DecideAnswer'
-        usage:
-          type: object
-          required: [input_tokens, output_tokens]
-          properties:
-            input_tokens:
-              type: integer
-              description: Encoded prompt tokens consumed by the executor, including repeated state text for split GLiNER tasks.
-            output_tokens:
-              type: integer
-              description: Zero for classifier executors, which emit no generated tokens.
+      $ref: '../ai/decision.yaml#/components/schemas/DecideResponse'
     DecideAnswer:
-      type: object
-      required: [type]
-      properties:
-        prototype_set_hash:
-          type: string
-        calibration_id:
-          type: string
-        type:
-          type: string
-          enum: [choice, score, noul]
-        choice:
-          type: string
-          nullable: true
-          description: Selected option, or null when a similarity decision abstains.
-        decision_method:
-          type: string
-          enum: [embedding_similarity]
-        similarities:
-          type: object
-          additionalProperties:
-            type: number
-            minimum: -1
-            maximum: 1
-        margin:
-          type: number
-          minimum: 0
-          maximum: 2
-        status:
-          type: string
-          enum: [selected, abstained]
-        abstention_reason:
-          type: string
-          enum: [tie, min_similarity, min_margin]
-        score:
-          type: number
-        noul:
-          type: number
-          minimum: 0
-          maximum: 1
-        legend:
-          type: object
-          additionalProperties:
-            type: string
-        probabilities:
-          type: object
-          additionalProperties:
-            type: number
-            minimum: 0
-            maximum: 1
+      $ref: '../ai/decision.yaml#/components/schemas/DecideAnswer'
     ModelsResponse:
       type: object
       required:
@@ -3284,7 +3135,7 @@ components:
           type: object
           additionalProperties:
             $ref: '#/components/schemas/ModelInfo'
-          description: Models declaring the decide task and typed_decisions capability
+          description: Models declaring the decide task and either typed_decisions or embedding_similarity capability
         generators:
           type: object
           additionalProperties:

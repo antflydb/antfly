@@ -515,10 +515,10 @@ pub const Client = struct {
         return ApiResponse(types.InferenceChunkResponse).fromResponse(self.allocator, &resp);
     }
 
-    /// Answer named choice, ordinal score, and Boolean questions
-    /// POST /ai/v1/decide
+    /// Answer named decision questions
+    /// POST /ai/v1/decisions
     pub fn decide(self: *@This(), body: types.InferenceDecideRequest) !ApiResponse(types.InferenceDecideResponse) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/ai/v1/decide", .{self.base_url});
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/ai/v1/decisions", .{self.base_url});
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
         defer self.allocator.free(json_body);

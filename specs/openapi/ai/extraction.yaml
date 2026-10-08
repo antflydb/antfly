@@ -127,7 +127,7 @@ components:
           type: integer
           minimum: 1
           description: Maximum labels for ordinary single-label classification; the server uses 1 when omitted.
-            Version 2 constrained or ordinal selection uses min_labels/max_labels. Advanced set-selection options
+            Version 2 constrained classification uses min_labels/max_labels. Advanced set-selection options
             or cross-task constraints on any classification in the collection reject every explicit top_k in that
             collection, including 1. Omit top_k when using these options.
         mode:
@@ -135,11 +135,8 @@ components:
           enum:
           - single
           - multi
-          - ordinal
-          - boolean
           description: |
-            Version 2 classification mode. Ordinal labels are ordered from lowest to highest.
-            Typed-decision extractors support boolean with labels ["false", "true"] in that order.
+            Version 2 ordinary classification mode. Standalone ordinal scores use the decision API.
             Each model rejects modes it does not support.
           x-go-type-skip-optional-pointer: false
         label_definitions:
@@ -166,7 +163,7 @@ components:
           x-go-type-skip-optional-pointer: false
         threshold:
           allOf:
-          - $ref: '#/components/schemas/ExtractionDecisionProbability'
+          - $ref: '#/components/schemas/ExtractionClassificationThreshold'
           x-go-type-skip-optional-pointer: false
         candidate_threshold:
           allOf:
@@ -203,17 +200,6 @@ components:
           items:
             $ref: '#/components/schemas/ExtractionClassificationExample'
           x-go-type-skip-optional-pointer: false
-        similarity_thresholds:
-          description: Embedding similarity multi-label classification requires explicit raw cosine thresholds or a qualified fitted calibration_id. Values are not probabilities.
-          oneOf:
-          - type: number
-            minimum: -1
-            maximum: 1
-          - type: object
-            additionalProperties:
-              type: number
-              minimum: -1
-              maximum: 1
     ExtractionStructureField:
       oneOf:
       - type: string
@@ -399,31 +385,6 @@ components:
     ExtractionOptions:
       type: object
       properties:
-        embedding:
-          type: object
-          additionalProperties: false
-          description: Options for embedding similarity classifiers. Trained classifiers reject this field.
-          properties:
-            calibration_id:
-              type: string
-              pattern: '^[A-Za-z0-9_-]{1,64}$'
-              description: Qualified fitted thresholds in model/calibrations/{id}.json, bound to exact model, renderer, task, dimensions, labels and prototypes. Mutually exclusive with manual thresholds. Does not enable probabilities.
-            task_type:
-              type: string
-              enum: [CLUSTERING, CLASSIFICATION]
-              default: CLUSTERING
-            dimensions:
-              type: integer
-              enum: [768, 512, 256, 128]
-              default: 768
-            min_similarity:
-              type: number
-              minimum: -1
-              maximum: 1
-            min_margin:
-              type: number
-              minimum: 0
-              maximum: 2
         threshold:
           type: number
           format: float
@@ -584,117 +545,9 @@ components:
         score:
           type: number
           format: float
-        similarity:
-          type: number
-          minimum: -1
-          maximum: 1
-          description: Raw cosine similarity for embedding classifiers; not a probability.
-      additionalProperties: true
-    ExtractionLabelProbability:
-      type: object
-      required: [label, probability]
-      properties:
-        label:
-          type: string
-        probability:
-          type: number
-          format: float
-          minimum: 0
-          maximum: 1
-    ExtractionDecision:
-      oneOf:
-      - $ref: '#/components/schemas/TrainedExtractionDecision'
-      - $ref: '#/components/schemas/EmbeddingExtractionDecision'
-    EmbeddingExtractionDecision:
-      type: object
-      required: [name, mode, decision_method, labels, similarities, status]
-      properties:
-        prototype_set_hash:
-          type: string
-        calibration_id:
-          type: string
-        name:
-          type: string
-        mode:
-          type: string
-          enum: [single, multi]
-        decision_method:
-          type: string
-          enum: [embedding_similarity]
-        labels:
-          type: array
-          items:
-            type: string
-        similarities:
-          type: object
-          additionalProperties:
-            type: number
-            minimum: -1
-            maximum: 1
-        status:
-          type: string
-          enum: [selected, abstained]
-        margin:
-          type: number
-          minimum: 0
-          maximum: 2
-        abstention_reason:
-          type: string
-      description: Embedding classification results report raw cosine similarities and no confidence or probabilities.
-    TrainedExtractionDecision:
-      type: object
-      description: Version 2 typed classification decision. Probabilities follow request label order; ordinal levels are zero-based.
-      required: [name, type, label, probabilities, confidence, confidence_method]
-      properties:
-        name:
-          type: string
-        type:
-          type: string
-          enum: [choice, score, boolean]
-        label:
-          type: string
-          description: Highest-probability label. This is distinct from the expected ordinal value.
-        probabilities:
-          type: array
-          items:
-            $ref: '#/components/schemas/ExtractionLabelProbability'
-        confidence:
-          type: number
-          format: float
-          minimum: 0
-          maximum: 1
-        confidence_method:
-          type: string
-          enum: [normalized_inverse_entropy, max_probability]
-          description: Entropy confidence is not the probability that the selected label is correct.
-        expected_value:
-          type: number
-          format: float
-          description: Score decisions only; sum of zero-based level index times probability.
-          minimum: 0
-          x-go-type-skip-optional-pointer: false
-        true_probability:
-          type: number
-          format: float
-          minimum: 0
-          maximum: 1
-          description: Boolean decisions only; probability of the true label.
-          x-go-type-skip-optional-pointer: false
-        act_probability:
-          type: number
-          format: float
-          minimum: 0
-          maximum: 1
-          description: Auxiliary model estimate for acting, from models with an action head (Laya). Does not authorize or execute a tool call.
-          x-go-type-skip-optional-pointer: false
     ExtractionObject:
       type: object
       properties:
-        decisions:
-          type: array
-          description: Typed decision results from capable extractors, alongside compatible per-label classifications.
-          items:
-            $ref: '#/components/schemas/ExtractionDecision'
         id:
           type: string
         offset_unit:
@@ -773,7 +626,7 @@ components:
       minimum: 0
       maximum: 1
       x-go-type-skip-optional-pointer: false
-    ExtractionDecisionProbability:
+    ExtractionClassificationThreshold:
       type: number
       format: double
       minimum: 0
@@ -1067,7 +920,7 @@ components:
           x-go-type-skip-optional-pointer: false
         threshold:
           allOf:
-          - $ref: '#/components/schemas/ExtractionDecisionProbability'
+          - $ref: '#/components/schemas/ExtractionClassificationThreshold'
           x-go-type-skip-optional-pointer: false
         candidate_threshold:
           allOf:
@@ -1106,7 +959,7 @@ components:
           x-go-type-skip-optional-pointer: false
         threshold:
           allOf:
-          - $ref: '#/components/schemas/ExtractionDecisionProbability'
+          - $ref: '#/components/schemas/ExtractionClassificationThreshold'
           x-go-type-skip-optional-pointer: false
         candidate_threshold:
           allOf:

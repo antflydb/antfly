@@ -12,7 +12,7 @@ The initial supported checkpoint is revision
 `914f7f89142e33e77833254d9c9b90c3cef7303b`. Acquire its original weights and sidecars:
 
 ```sh
-python3 zig/pkg/inference/tools/embeddinggemma2_reference.py acquire models/embedders/embeddinggemma2
+python3 zig/pkg/inference/tools/embeddinggemma2/reference.py acquire models/embedders/embeddinggemma2
 ```
 
 The acquisition tool verifies the resolved revision and LFS weight digest, keeps
@@ -87,32 +87,49 @@ antfly-inference embed models/embedders/embeddinggemma2 --backend metal \
   --text 'Reset a forgotten password.' --image reset.png
 antfly-inference embed models/embedders/embeddinggemma2 --backend native \
   --task-type RETRIEVAL_QUERY --text 'How do I regain access?'
-antfly-inference decide models --request decision.json --backend metal
-antfly-inference extract models --request classification.json --backend native
+antfly-inference decisions models --request decision.json --backend metal
+antfly-inference decisions models --request multi-choice.json --backend native
 ```
 
 ## Choice decisions
 
-`/ai/v1/decide` accepts text state and choice questions. These are similarity routes,
-with `decision_method: "embedding_similarity"`, raw cosine scores, top-two
-margin, status and a nullable choice. Score, ordinal, Boolean and `noul` questions
-are rejected. Responses contain neither probabilities nor confidence.
+`/ai/v1/decisions` accepts text `input` and named question arrays. EmbeddingGemma 2
+supports `choice` and `multi_choice`, with `decision_method: "embedding_similarity"`
+and `similarity_metric: "cosine"`. Answers contain raw cosine similarities, an
+acceptance margin and a status. These scores do not represent probabilities or
+confidence. Use trained deciders for `score` and `predicate` questions.
 
 ```json
 {
   "model": "embeddinggemma2",
-  "state": "I forgot my password.",
-  "embedding_options": {"dimensions": 256, "min_similarity": 0.35, "min_margin": 0.08},
-  "questions": {
-    "route": {
+  "embedding_options": {
+    "dimensions": 256
+  },
+  "questions": [
+    {
+      "name": "route",
       "type": "choice",
       "instructions": "Route the request to the responsible support team.",
-      "criteria": {
-        "account": {"examples": ["Reset my password", "I cannot log in"]},
-        "billing": "Payments, invoices and unexpected charges"
+      "choices": [
+        {
+          "value": "account",
+          "examples": [
+            "Reset my password",
+            "I cannot log in"
+          ]
+        },
+        {
+          "value": "billing",
+          "description": "Payments, invoices and unexpected charges"
+        }
+      ],
+      "embedding_options": {
+        "min_similarity": 0.35,
+        "min_margin": 0.08
       }
     }
-  }
+  ],
+  "input": "I forgot my password."
 }
 ```
 
@@ -135,17 +152,28 @@ reuse. Concurrent identical requests share one fill. Cancellation of a waiting
 request preserves the owner's fill; failed owners release the reservation.
 Request handles keep the owning model generation alive.
 
-## Single and multi-label extraction
+## Multi-choice decisions and batches
 
-`/ai/v1/extract` with `schema_version: 2` accepts text classification tasks in `single`
-or `multi` mode. Each task supports label definitions and examples. Multi-label
-mode requires explicit `similarity_thresholds` (one raw threshold or a complete
-label-to-threshold map), or a qualified calibration artifact. Selected labels
-carry `similarity`; each task also returns its complete raw-score decision.
-Single mode returns one label or abstains; multi mode can return an empty set.
-Unsupported entity/span, relation, ordinal and Boolean schemas are rejected.
-Trained extraction responses retain their original probability contract; the
-OpenAPI extraction decision union distinguishes the two response forms.
+Use `type: "multi_choice"` with the same `choices` definitions. Each question
+requires `similarity_thresholds`: a raw cosine threshold or a complete value-to-
+threshold map, or its own qualified `embedding_options.calibration_id`. The
+answer includes `choices`, all `similarities`, effective `similarity_thresholds`,
+`margin` and `status`. `selected` means at least one value was accepted; `empty`
+means every score was below its threshold and is a valid result; `abstained`
+means the requested boundary margin failed and the selected set is withheld.
+For multi-choice, `min_margin` measures the nearest distance to any threshold.
+
+Request-wide `embedding_options` supplies only `task_type` and `dimensions`.
+Acceptance options belong on each question, so routing and tagging can use
+independent calibration artifacts. The endpoint fixes cosine as its metric;
+changing metrics would invalidate existing fitted thresholds and margins.
+
+For a batch, replace `input` with `inputs: [{"id": "a", "input": "..."}, ...]`.
+The shared questions apply to every input. The response has `data` rows with
+`input_index`, optional `id` and named `answers`, plus aggregate `usage`.
+EmbeddingGemma 2 standalone decisions are served exclusively by `/decisions`.
+Ordinary extraction classification remains available for compatible extractors.
+See [the decisions guide](decisions.md) for the complete contract.
 
 For SQL, configure the decider with `provider: "antfly"`,
 `decision_method: "embedding_similarity"`, the model name, and optional
@@ -167,7 +195,7 @@ not provide this generation guarantee.
 
 ## Fitted raw thresholds and qualification
 
-`embedding_options.calibration_id` loads
+Each question's `embedding_options.calibration_id` loads
 `<model-dir>/calibrations/<id>.json`. It is mutually exclusive with manual
 thresholds, and binds to the exact asset identity, renderer, task, dimensions,
 mode, ordered labels and prototype set. Runtime validation rejects unqualified,
@@ -194,7 +222,7 @@ Collect real application scores and truth labels with disjoint `fit`,
 ```
 
 ```sh
-python3 zig/pkg/inference/tools/embeddinggemma2_calibrate.py scores.json \
+python3 zig/pkg/inference/tools/embeddinggemma2/calibrate.py scores.json \
   models/embedders/embeddinggemma2/calibrations/support_v1.json \
   --precision 0.9 --minimum-coverage 0.2
 ```
@@ -227,7 +255,7 @@ calibration artifact is supplied by this change.
 Run the socket-level contract campaign against the current supervised server:
 
 ```sh
-python3 zig/pkg/inference/tools/embeddinggemma2_qualify.py \
+python3 zig/pkg/inference/tools/embeddinggemma2/qualify.py \
   --url http://127.0.0.1:8090/ai/v1 --model embeddinggemma2 \
   --oracle artifacts/oracle.json --media-oracle artifacts/media-oracle.json \
   --iterations 32 --concurrency 4 --output artifacts/live-qualification.json
@@ -349,7 +377,7 @@ and a source manifest mapping repository-relative files to SHA-256 digests:
 cd zig/pkg/inference
 zig build build-embeddinggemma2-bench -Dmetal=true -Doptimize=ReleaseFast -j1
 cd ../../..
-python3 zig/pkg/inference/tools/embeddinggemma2_encoder_campaign.py \
+python3 zig/pkg/inference/tools/embeddinggemma2/encoder_campaign.py \
   --model-dir <model-dir> --suite suite.json \
   --baseline <archived-encoder-binary> \
   --candidate zig/pkg/inference/zig-out/bin/antfly-embeddinggemma2-bench \
@@ -376,7 +404,7 @@ These diagnostic timings do not set the performance gate.
 
 ## Compact PyTorch comparison
 
-`tools/embeddinggemma2_compare.py` compares the same pinned F32 checkpoint with
+`tools/embeddinggemma2/compare.py` compares the same pinned F32 checkpoint with
 official PyTorch CPU and MPS execution. Eight edge cases cover a short document,
 a short retrieval query, exact 128/512/8192-token documents, image, audio and an
 ordered text/audio/image group. Four additional documents and three queries
@@ -389,11 +417,11 @@ Prepare the suite once, then run each backend in a separate process:
 ```sh
 export PYTHONPATH=<pinned-python-dependencies>
 export VECLIB_MAXIMUM_THREADS=4 OMP_NUM_THREADS=4
-python3 zig/pkg/inference/tools/embeddinggemma2_compare.py --backend prepare \
+python3 zig/pkg/inference/tools/embeddinggemma2/compare.py --backend prepare \
   --model-dir <model-dir> --artifacts-dir <oracle-and-media-dir> --output suite.json
-python3 zig/pkg/inference/tools/embeddinggemma2_compare.py --backend mps \
+python3 zig/pkg/inference/tools/embeddinggemma2/compare.py --backend mps \
   --model-dir <model-dir> --suite suite.json --output pytorch-mps.json
-python3 zig/pkg/inference/tools/embeddinggemma2_compare.py --backend metal \
+python3 zig/pkg/inference/tools/embeddinggemma2/compare.py --backend metal \
   --model-dir <model-dir> --suite suite.json --reference pytorch-mps.json \
   --binary zig/pkg/inference/zig-out/bin/antfly-inference --output metal.json
 ```

@@ -16,7 +16,7 @@
 pub const types = @import("types.zig");
 pub const extractor = @import("extractor.zig");
 pub const extraction_v2 = @import("extraction_v2.zig");
-pub const decide = @import("decide.zig");
+pub const decide = @import("antfly_decisions").legacy;
 pub const gliner_boundary_executor = @import("gliner_boundary_executor.zig");
 pub const gliner_span_v2_executor = @import("gliner_span_v2_executor.zig");
 pub const gliner_boundary_long_executor = @import("gliner_boundary_long_executor.zig");

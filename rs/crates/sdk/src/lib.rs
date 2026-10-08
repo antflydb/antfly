@@ -691,6 +691,7 @@ pub fn antfly_embedder(model: impl Into<String>) -> types::IndexEmbedderConfig {
     types::IndexEmbedderConfig::AntflyEmbedderConfig(types::AntflyEmbedderConfig {
         api_url: None,
         model: model.into(),
+        model_identity: None,
         provider: types::AntflyEmbedderConfigProvider::Antfly,
         retrieval: None,
     })
@@ -767,6 +768,7 @@ impl Default for types::CreateGraphIndexRequest {
 impl Default for types::CreateAlgebraicIndexRequest {
     fn default() -> Self {
         Self {
+            aggregates: Vec::new(),
             derive_from_schema: None,
             description: None,
             enrichments: Vec::new(),

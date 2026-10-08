@@ -424,7 +424,7 @@ func TestInferenceDecideErrors(t *testing.T) {
 	defer inf.Close()
 	for _, tc := range []struct{ request, code string }{
 		{`{}`, "INVALID_REQUEST"},
-		{`{"model":"no/such-model","state":"Refund requested","questions":{"refund":{"type":"noul","instructions":"Does this ask for a refund?"}}}`, "MODEL_NOT_FOUND"},
+		{`{"model":"no/such-model","input":"Refund requested","questions":[{"name":"refund","type":"predicate","instructions":"Does this ask for a refund?"}]}`, "MODEL_NOT_FOUND"},
 	} {
 		_, err := inf.Decide([]byte(tc.request))
 		var infErr *InferenceError

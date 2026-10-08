@@ -15,7 +15,6 @@ if TYPE_CHECKING:
     from ..models.extraction_decoder_options import ExtractionDecoderOptions
     from ..models.extraction_joint_options import ExtractionJointOptions
     from ..models.extraction_long_document_options import ExtractionLongDocumentOptions
-    from ..models.extraction_options_embedding import ExtractionOptionsEmbedding
     from ..models.extraction_reader_options import ExtractionReaderOptions
     from ..models.extraction_resolver_options import ExtractionResolverOptions
 
@@ -27,8 +26,6 @@ T = TypeVar("T", bound="ExtractionOptions")
 class ExtractionOptions:
     """
     Attributes:
-        embedding (ExtractionOptionsEmbedding | Unset): Options for embedding similarity classifiers. Trained
-            classifiers reject this field.
         threshold (float | Unset):
         flat_ner (bool | Unset):
         include_confidence (bool | Unset):
@@ -54,7 +51,6 @@ class ExtractionOptions:
         resolver (ExtractionResolverOptions | Unset): Optional cross-input entity and relation deduplication.
     """
 
-    embedding: ExtractionOptionsEmbedding | Unset = UNSET
     threshold: float | Unset = UNSET
     flat_ner: bool | Unset = UNSET
     include_confidence: bool | Unset = UNSET
@@ -70,10 +66,6 @@ class ExtractionOptions:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        embedding: dict[str, Any] | Unset = UNSET
-        if not isinstance(self.embedding, Unset):
-            embedding = self.embedding.to_dict()
-
         threshold = self.threshold
 
         flat_ner = self.flat_ner
@@ -117,8 +109,6 @@ class ExtractionOptions:
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update({})
-        if embedding is not UNSET:
-            field_dict["embedding"] = embedding
         if threshold is not UNSET:
             field_dict["threshold"] = threshold
         if flat_ner is not UNSET:
@@ -151,18 +141,10 @@ class ExtractionOptions:
         from ..models.extraction_decoder_options import ExtractionDecoderOptions
         from ..models.extraction_joint_options import ExtractionJointOptions
         from ..models.extraction_long_document_options import ExtractionLongDocumentOptions
-        from ..models.extraction_options_embedding import ExtractionOptionsEmbedding
         from ..models.extraction_reader_options import ExtractionReaderOptions
         from ..models.extraction_resolver_options import ExtractionResolverOptions
 
         d = dict(src_dict)
-        _embedding = d.pop("embedding", UNSET)
-        embedding: ExtractionOptionsEmbedding | Unset
-        if isinstance(_embedding, Unset):
-            embedding = UNSET
-        else:
-            embedding = ExtractionOptionsEmbedding.from_dict(_embedding)
-
         threshold = d.pop("threshold", UNSET)
 
         flat_ner = d.pop("flat_ner", UNSET)
@@ -228,7 +210,6 @@ class ExtractionOptions:
             resolver = ExtractionResolverOptions.from_dict(_resolver)
 
         extraction_options = cls(
-            embedding=embedding,
             threshold=threshold,
             flat_ner=flat_ner,
             include_confidence=include_confidence,

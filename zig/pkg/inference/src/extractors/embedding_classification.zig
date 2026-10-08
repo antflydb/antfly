@@ -4,8 +4,8 @@
 //! ordinal decisions, generated entities and trained heads are separate APIs.
 const std = @import("std");
 const v2 = @import("extraction_v2.zig");
-const decide = @import("decide.zig");
-const scoring = @import("embedding_decisions.zig");
+const decide = @import("antfly_decisions").legacy;
+const scoring = @import("antfly_decisions").scoring;
 const V = std.json.Value;
 const O = std.json.ObjectMap;
 pub const Mode = enum { single, multi };

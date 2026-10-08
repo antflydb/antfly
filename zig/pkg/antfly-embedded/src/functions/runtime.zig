@@ -117,7 +117,7 @@ pub const Runtime = struct {
             const body = try requestBody(a, cfg, self.request);
             const base = if (cfg.provider == .antfly and cfg.url.len == 0) self.runtime.antfly_url orelse cfg.baseUrl() else cfg.baseUrl();
             const url = try std.fmt.allocPrint(a, "{s}{s}", .{ std.mem.trimEnd(u8, base, "/"), switch (cfg.provider) {
-                .antfly => "/decide",
+                .antfly => "/decisions",
                 .jev => "/v1/systemone",
                 .openai => "/decisions",
             } });
@@ -185,6 +185,11 @@ pub const Runtime = struct {
             };
             const bytes = response.body orelse return error.InvalidDecisionOutput;
             const parsed = try parseResponse(a, bytes);
+            if (cfg.provider == .antfly) {
+                const root = try decisions.object(parsed);
+                const answers = root.get("answers") orelse return error.InvalidDecisionOutput;
+                if (answers != .array) return error.InvalidDecisionOutput;
+            }
             return if (cfg.provider == .openai) openai.response(a, self.request.questions, parsed) else parsed;
         }
     };
@@ -267,19 +272,23 @@ test "decision functions Antfly and Jev HTTP adapters preserve payload credentia
     const Check = struct {
         fn request(req: httpx.testing_mod.RequestInfo) !void {
             try std.testing.expectEqualStrings("Bearer decision-test", req.header("Authorization") orelse return error.TestUnexpectedResult);
-            if (std.mem.eql(u8, req.path, "/decide")) try std.testing.expectEqualStrings("docs", req.header(execution.source_table_header) orelse return error.TestUnexpectedResult) else try std.testing.expect(req.header(execution.source_table_header) == null);
+            if (std.mem.eql(u8, req.path, "/decisions")) try std.testing.expectEqualStrings("docs", req.header(execution.source_table_header) orelse return error.TestUnexpectedResult) else try std.testing.expect(req.header(execution.source_table_header) == null);
             const parsed = try std.json.parseFromSlice(decisions.Json, std.testing.allocator, req.body, .{});
             defer parsed.deinit();
-            try std.testing.expectEqualStrings("refund", parsed.value.object.get("state").?.string);
+            try std.testing.expectEqualStrings("refund", parsed.value.object.get(if (std.mem.eql(u8, req.path, "/decisions")) "input" else "state").?.string);
             try std.testing.expectEqualStrings("test-model", parsed.value.object.get("model").?.string);
-            try decisions.validateQuestions(parsed.value.object.get("questions").?, decisions.capabilities(.jev));
+            const questions = parsed.value.object.get("questions").?;
+            if (questions == .array) {
+                try std.testing.expectEqualStrings("predicate", questions.array.items[0].object.get("type").?.string);
+            } else try decisions.validateQuestions(questions, decisions.capabilities(.jev));
         }
     };
-    const response = "{\"model\":\"test-model\",\"answers\":{\"answer\":{\"type\":\"noul\",\"noul\":0.9}},\"usage\":{\"input_tokens\":2,\"output_tokens\":0}}";
+    const response = "{\"model\":\"test-model\",\"answers\":[{\"name\":\"answer\",\"type\":\"predicate\",\"decision_method\":\"typed\",\"probability\":0.9}],\"usage\":{\"input_tokens\":2,\"output_tokens\":0}}";
+    const jev_response = "{\"model\":\"test-model\",\"answers\":{\"answer\":{\"type\":\"noul\",\"noul\":0.9}},\"usage\":{\"input_tokens\":2,\"output_tokens\":0}}";
     var server = try httpx.TestServer.start(a, io, &.{
-        .{ .method = .POST, .path = "/decide", .max_uses = 1, .assert_request = Check.request, .respond = .{ .body = response } },
-        .{ .method = .POST, .path = "/v1/systemone", .max_uses = 1, .assert_request = Check.request, .respond = .{ .body = response } },
-        .{ .method = .POST, .path = "/decide", .respond = .{ .body = "{\"model\":\"test-model\",\"answers\":{},\"usage\":{\"input_tokens\":2,\"output_tokens\":0}}" } },
+        .{ .method = .POST, .path = "/decisions", .max_uses = 1, .assert_request = Check.request, .respond = .{ .body = response } },
+        .{ .method = .POST, .path = "/v1/systemone", .max_uses = 1, .assert_request = Check.request, .respond = .{ .body = jev_response } },
+        .{ .method = .POST, .path = "/decisions", .respond = .{ .body = "{\"model\":\"test-model\",\"answers\":{},\"usage\":{\"input_tokens\":2,\"output_tokens\":0}}" } },
         .{ .method = .POST, .path = "/v1/systemone", .respond = .{ .status = 429, .body = "rate limited" } },
     });
     defer server.deinit();
@@ -349,7 +358,7 @@ test "decision functions HTTP ceiling rejects oversized advertised bodies before
     defer a.free(oversized);
     @memset(oversized, 'x');
     var server = try httpx.TestServer.start(a, io, &.{
-        .{ .method = .POST, .path = "/decide", .max_uses = 1, .respond = .{ .body = oversized, .truncate_body_at = 0 } },
+        .{ .method = .POST, .path = "/decisions", .max_uses = 1, .respond = .{ .body = oversized, .truncate_body_at = 0 } },
         .{ .method = .POST, .path = "/v1/systemone", .max_uses = 1, .respond = .{ .body = oversized, .truncate_body_at = 0 } },
         .{ .method = .POST, .path = "/decisions", .max_uses = 1, .respond = .{ .body = oversized, .truncate_body_at = 0 } },
     });
@@ -398,16 +407,16 @@ test "decision functions EmbeddingGemma 2 HTTP preserves identity calibration an
             const root = parsed.value.object;
             try std.testing.expectEqualStrings("embeddinggemma2", root.get("model").?.string);
             try std.testing.expectEqualStrings(identity, root.get("model_identity").?.string);
-            try std.testing.expectEqualStrings("reset password", root.get("state").?.string);
+            try std.testing.expectEqualStrings("reset password", root.get("input").?.string);
             const options = root.get("embedding_options").?.object;
             try std.testing.expectEqual(@as(i64, 128), options.get("dimensions").?.integer);
-            try std.testing.expectEqualStrings("routing_v1", options.get("calibration_id").?.string);
-            try decisions.validateQuestions(root.get("questions").?, (decisions.DeciderConfig{ .provider = .antfly, .decision_method = .embedding_similarity }).resolvedCapabilities());
+            try std.testing.expectEqualStrings("routing_v1", root.get("questions").?.array.items[0].object.get("embedding_options").?.object.get("calibration_id").?.string);
+            try std.testing.expectEqualStrings("choice", root.get("questions").?.array.items[0].object.get("type").?.string);
         }
     };
-    const response = "{\"model\":\"embeddinggemma2\",\"model_identity\":\"" ++ Check.identity ++ "\",\"answers\":{\"answer\":{\"type\":\"choice\",\"choice\":\"account\",\"decision_method\":\"embedding_similarity\",\"similarities\":{\"account\":0.8,\"billing\":0.1},\"margin\":0.7,\"status\":\"selected\"}},\"usage\":{\"input_tokens\":2,\"output_tokens\":0}}";
+    const response = "{\"model\":\"embeddinggemma2\",\"model_identity\":\"" ++ Check.identity ++ "\",\"answers\":[{\"name\":\"answer\",\"type\":\"choice\",\"choice\":\"account\",\"decision_method\":\"embedding_similarity\",\"similarity_metric\":\"cosine\",\"prototype_set_hash\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"similarities\":[{\"value\":\"account\",\"similarity\":0.8},{\"value\":\"billing\",\"similarity\":0.1}],\"margin\":0.7,\"status\":\"selected\"}],\"usage\":{\"input_tokens\":2,\"output_tokens\":0}}";
     var server = try httpx.TestServer.start(a, io, &.{
-        .{ .method = .POST, .path = "/decide", .max_uses = 1, .assert_request = Check.request, .respond = .{ .body = response } },
+        .{ .method = .POST, .path = "/decisions", .max_uses = 1, .assert_request = Check.request, .respond = .{ .body = response } },
     });
     defer server.deinit();
     var client = httpx.Client.initWithConfig(a, io, .{ .keep_alive = false });

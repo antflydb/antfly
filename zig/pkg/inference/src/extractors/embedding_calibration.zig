@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Fitted raw cosine thresholds. No probability or confidence transformation.
 const std = @import("std");
-const scoring = @import("embedding_decisions.zig");
+const scoring = @import("antfly_decisions").scoring;
 const prototypes = @import("embedding_prototypes.zig");
 const file = @import("../util/c_file.zig");
 const receipt = @import("../registry/managed_receipt.zig");
@@ -117,7 +117,7 @@ pub fn load(a: std.mem.Allocator, io: std.Io, directory: []const u8, identity: [
 }
 
 test "embeddinggemma2 unqualified calibration cannot supply thresholds" {
-    const question = @import("decide.zig").Question{ .name = "route", .kind = .choice, .instructions = "route", .labels = &.{ "a", "b" }, .descriptions = &.{ "A", "B" } };
+    const question = @import("antfly_decisions").legacy.Question{ .name = "route", .kind = .choice, .instructions = "route", .labels = &.{ "a", "b" }, .descriptions = &.{ "A", "B" } };
     const raw = try std.json.parseFromSlice(V, std.testing.allocator, "{\"version\":1,\"method\":\"heldout-abstention-v1\",\"qualified\":false}", .{});
     defer raw.deinit();
     try std.testing.expectError(error.UnqualifiedEmbeddingCalibration, parse(std.testing.allocator, raw.value, "identity", question, .{}, "single"));
@@ -125,7 +125,7 @@ test "embeddinggemma2 unqualified calibration cannot supply thresholds" {
 
 test "embeddinggemma2 calibration binds prototypes and independently checks heldout metrics" {
     const a = std.testing.allocator;
-    const question = @import("decide.zig").Question{ .name = "route", .kind = .choice, .instructions = "route", .labels = &.{ "a", "b" }, .descriptions = &.{ "A", "B" } };
+    const question = @import("antfly_decisions").legacy.Question{ .name = "route", .kind = .choice, .instructions = "route", .labels = &.{ "a", "b" }, .descriptions = &.{ "A", "B" } };
     const identity: [64]u8 = @splat('a');
     const fit_hash: [64]u8 = @splat('b');
     const val_hash: [64]u8 = @splat('c');

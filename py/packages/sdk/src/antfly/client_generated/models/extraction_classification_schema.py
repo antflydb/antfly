@@ -15,9 +15,6 @@ if TYPE_CHECKING:
     from ..models.extraction_classification_schema_label_definitions import (
         ExtractionClassificationSchemaLabelDefinitions,
     )
-    from ..models.extraction_classification_schema_similarity_thresholds_type_1 import (
-        ExtractionClassificationSchemaSimilarityThresholdsType1,
-    )
 
 
 T = TypeVar("T", bound="ExtractionClassificationSchema")
@@ -36,12 +33,11 @@ class ExtractionClassificationSchema:
             server uses "This example is {}." when omitted. Version 2 GLiNER boundary extraction rejects an explicit
             hypothesis_template; use prompt/instruction and label_definitions for model conditioning.
         top_k (int | Unset): Maximum labels for ordinary single-label classification; the server uses 1 when omitted.
-            Version 2 constrained or ordinal selection uses min_labels/max_labels. Advanced set-selection options or cross-
-            task constraints on any classification in the collection reject every explicit top_k in that collection,
-            including 1. Omit top_k when using these options.
-        mode (ExtractionClassificationSchemaMode | Unset): Version 2 classification mode. Ordinal labels are ordered
-            from lowest to highest.
-            Typed-decision extractors support boolean with labels ["false", "true"] in that order.
+            Version 2 constrained classification uses min_labels/max_labels. Advanced set-selection options or cross-task
+            constraints on any classification in the collection reject every explicit top_k in that collection, including 1.
+            Omit top_k when using these options.
+        mode (ExtractionClassificationSchemaMode | Unset): Version 2 ordinary classification mode. Standalone ordinal
+            scores use the decision API.
             Each model rejects modes it does not support.
         label_definitions (ExtractionClassificationSchemaLabelDefinitions | Unset):
         min_labels (int | Unset):
@@ -56,9 +52,6 @@ class ExtractionClassificationSchema:
         prompt (str | Unset): Version 2 model-facing task instruction. Mutually exclusive with instruction.
         instruction (str | Unset): Alias of prompt.
         examples (list[ExtractionClassificationExampleType0 | list[str]] | Unset):
-        similarity_thresholds (ExtractionClassificationSchemaSimilarityThresholdsType1 | float | Unset): Embedding
-            similarity multi-label classification requires explicit raw cosine thresholds or a qualified fitted
-            calibration_id. Values are not probabilities.
     """
 
     name: str
@@ -79,14 +72,10 @@ class ExtractionClassificationSchema:
     prompt: str | Unset = UNSET
     instruction: str | Unset = UNSET
     examples: list[ExtractionClassificationExampleType0 | list[str]] | Unset = UNSET
-    similarity_thresholds: ExtractionClassificationSchemaSimilarityThresholdsType1 | float | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         from ..models.extraction_classification_example_type_0 import ExtractionClassificationExampleType0
-        from ..models.extraction_classification_schema_similarity_thresholds_type_1 import (
-            ExtractionClassificationSchemaSimilarityThresholdsType1,
-        )
 
         name = self.name
 
@@ -144,14 +133,6 @@ class ExtractionClassificationSchema:
 
                 examples.append(examples_item)
 
-        similarity_thresholds: dict[str, Any] | float | Unset
-        if isinstance(self.similarity_thresholds, Unset):
-            similarity_thresholds = UNSET
-        elif isinstance(self.similarity_thresholds, ExtractionClassificationSchemaSimilarityThresholdsType1):
-            similarity_thresholds = self.similarity_thresholds.to_dict()
-        else:
-            similarity_thresholds = self.similarity_thresholds
-
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -192,8 +173,6 @@ class ExtractionClassificationSchema:
             field_dict["instruction"] = instruction
         if examples is not UNSET:
             field_dict["examples"] = examples
-        if similarity_thresholds is not UNSET:
-            field_dict["similarity_thresholds"] = similarity_thresholds
 
         return field_dict
 
@@ -202,9 +181,6 @@ class ExtractionClassificationSchema:
         from ..models.extraction_classification_example_type_0 import ExtractionClassificationExampleType0
         from ..models.extraction_classification_schema_label_definitions import (
             ExtractionClassificationSchemaLabelDefinitions,
-        )
-        from ..models.extraction_classification_schema_similarity_thresholds_type_1 import (
-            ExtractionClassificationSchemaSimilarityThresholdsType1,
         )
 
         d = dict(src_dict)
@@ -291,23 +267,6 @@ class ExtractionClassificationSchema:
 
                 examples.append(examples_item)
 
-        def _parse_similarity_thresholds(
-            data: object,
-        ) -> ExtractionClassificationSchemaSimilarityThresholdsType1 | float | Unset:
-            if isinstance(data, Unset):
-                return data
-            try:
-                if not isinstance(data, dict):
-                    raise TypeError()
-                similarity_thresholds_type_1 = ExtractionClassificationSchemaSimilarityThresholdsType1.from_dict(data)
-
-                return similarity_thresholds_type_1
-            except (TypeError, ValueError, AttributeError, KeyError):
-                pass
-            return cast(ExtractionClassificationSchemaSimilarityThresholdsType1 | float | Unset, data)
-
-        similarity_thresholds = _parse_similarity_thresholds(d.pop("similarity_thresholds", UNSET))
-
         extraction_classification_schema = cls(
             name=name,
             labels=labels,
@@ -327,7 +286,6 @@ class ExtractionClassificationSchema:
             prompt=prompt,
             instruction=instruction,
             examples=examples,
-            similarity_thresholds=similarity_thresholds,
         )
 
         extraction_classification_schema.additional_properties = d
