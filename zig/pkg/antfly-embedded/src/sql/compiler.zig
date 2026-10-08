@@ -36,6 +36,8 @@ pub const Error = std.mem.Allocator.Error || error{
     InvalidSqlParameter,
     InvalidSqlNumber,
     DuplicateSqlColumn,
+    SqlInvalidUnicodeEscape,
+    SqlInvalidTextEncoding,
 };
 
 /// Immutable and schema independent: safely share a compiled statement between
@@ -82,7 +84,7 @@ pub fn compileScalar(allocator: std.mem.Allocator, sql: []const u8, limits: Limi
     };
     const tokens = switch (lexed) {
         .tokens => |value| value,
-        .diagnostic => return error.InvalidSqlSyntax,
+        .diagnostic => |failure| return lexicalError(failure.kind),
     };
     var diagnostic: Diagnostic = .{};
     var parser: Parser = .{ .alloc = arena.allocator(), .tokens = tokens.items, .source = sql, .limits = limits, .diagnostic = &diagnostic };
@@ -117,7 +119,7 @@ pub fn compileDiagnostic(allocator: std.mem.Allocator, sql: []const u8, limits: 
         .tokens => |tokens| tokens,
         .diagnostic => |failure| {
             diagnostic.* = .{ .start = failure.source_start, .end = failure.source_end, .message = failure.message() };
-            return error.InvalidSqlSyntax;
+            return lexicalError(failure.kind);
         },
     };
     if (tokens.items.len > limits.max_tokens) return error.SqlLimitExceeded;
@@ -126,6 +128,28 @@ pub fn compileDiagnostic(allocator: std.mem.Allocator, sql: []const u8, limits: 
     _ = parser.take(.semicolon);
     if (parser.pos != tokens.items.len) return parser.fail(error.UnsupportedSqlShape, "unexpected trailing SQL; only one supported statement is allowed");
     return .{ .arena = arena, .statement = statement, .parameter_count = parser.parameter_count, .uses_current_setting = parser.uses_current_setting };
+}
+
+fn lexicalError(kind: lexer.LexErrorKind) Error {
+    return switch (kind) {
+        .invalid_escape_sequence => error.SqlInvalidUnicodeEscape,
+        .invalid_string_encoding => error.SqlInvalidTextEncoding,
+        else => error.InvalidSqlSyntax,
+    };
+}
+
+test "SQL escape string diagnostics retain PostgreSQL SQLSTATEs" {
+    const a = std.testing.allocator;
+    try std.testing.expectError(error.SqlInvalidUnicodeEscape, compileScalar(a, "E'\\u12'", .{}));
+    try std.testing.expectError(error.SqlInvalidTextEncoding, compileScalar(a, "E'\\xFF'", .{}));
+    try std.testing.expectError(error.InvalidSqlSyntax, compileScalar(a, "E'\\u0000'", .{}));
+    try std.testing.expectError(error.InvalidSqlSyntax, compileScalar(a, "E'a' 'b'", .{}));
+    try std.testing.expectError(error.InvalidSqlSyntax, compileScalar(a, "E'a'\nE'b'", .{}));
+    try std.testing.expectError(error.InvalidSqlSyntax, compileScalar(a, "E'a'\n/* comment */'b'", .{}));
+    var diagnostic: Diagnostic = .{};
+    try std.testing.expectError(error.SqlInvalidUnicodeEscape, compileDiagnostic(a, "SELECT E'\\u12'", .{}, &diagnostic));
+    try std.testing.expect(diagnostic.start >= 7);
+    try std.testing.expect(diagnostic.end <= 14);
 }
 
 test "setting authority capture follows parsed calls, not SQL text" {

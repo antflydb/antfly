@@ -4703,3 +4703,21 @@ backend module is wired through native SQL/storage owners and browser imports,
 without changing the search-index matcher. Public scalar binding and the actual
 statement/cursor session-owner integration remain unfinished, so the corpus
 ledger is still 432 implemented / 136 rejected / 73 superseded / 945 unresolved.
+
+### PostgreSQL escape-string lexical contracts
+
+The shared SQL lexer now decodes explicit `E'...'` literals once during
+preparation, including byte escapes, Unicode scalar values and surrogate pairs.
+Ordinary strings retain standard-conforming backslashes. Newline continuation
+retains the first literal's escape mode and permits whitespace/line comments,
+not block comments. Source spans include the full spelling; token quotas apply
+before decoding, and continuation trivia still validates UTF-8.
+
+A disposable PostgreSQL 18 oracle supplies 38 values and SQLSTATE contracts.
+Malformed Unicode escapes, invalid codepoints and invalid decoded UTF-8/zero
+bytes retain distinct 22025/42601/22021 diagnostics through SQL compilation.
+The complete standalone lexer gate passes 22 tests, including allocation faults.
+This unblocks the capture-replacement expression in the unchanged 48-case
+in-progress scalar regex oracle. Statement/cursor session ownership and mounted
+original-case postimages remain required before claiming public regex completion
+or changing the authoritative corpus ledger.

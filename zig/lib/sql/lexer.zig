@@ -37,6 +37,9 @@ pub const LexErrorKind = enum {
     invalid_operator,
     invalid_utf8,
     invalid_character,
+    invalid_escape_sequence,
+    invalid_unicode_escape,
+    invalid_string_encoding,
 
     pub fn message(self: @This()) []const u8 {
         return switch (self) {
@@ -50,6 +53,9 @@ pub const LexErrorKind = enum {
             .invalid_operator => "invalid or incomplete SQL operator",
             .invalid_utf8 => "invalid UTF-8 in SQL input",
             .invalid_character => "invalid character in SQL input",
+            .invalid_escape_sequence => "Unicode escape requires four or eight hexadecimal digits",
+            .invalid_unicode_escape => "invalid Unicode codepoint or surrogate pair",
+            .invalid_string_encoding => "string literal contains invalid UTF-8 or a zero byte",
         };
     }
 };
@@ -140,7 +146,8 @@ fn tokenizeImpl(alloc: std.mem.Allocator, sql: []const u8, diagnostic: *LexDiagn
             continue;
         }
         if (tokens.items.len >= max_tokens) return error.SqlTokenLimitExceeded;
-        if (std.ascii.isAlphabetic(ch) or ch == '_' or ch >= 0x80) {
+        const escape_string = (ch == 'e' or ch == 'E') and i + 1 < sql.len and sql[i + 1] == '\'';
+        if (!escape_string and (std.ascii.isAlphabetic(ch) or ch == '_' or ch >= 0x80)) {
             const start = i;
             i += if (ch >= 0x80) try utf8SequenceWidthAt(sql, i, diagnostic) else 1;
             while (i < sql.len) {
@@ -200,11 +207,11 @@ fn tokenizeImpl(alloc: std.mem.Allocator, sql: []const u8, diagnostic: *LexDiagn
             owned_transferred = true;
             continue;
         }
-        if (ch == '\'') {
+        if (ch == '\'' or escape_string) {
             const source_start = i;
             var out = std.ArrayListUnmanaged(u8).empty;
             errdefer out.deinit(alloc);
-            i += 1;
+            i += if (escape_string) @as(usize, 2) else 1;
             while (i < sql.len) {
                 if (sql[i] == '\'') {
                     if (i + 1 < sql.len and sql[i + 1] == '\'') {
@@ -212,7 +219,17 @@ fn tokenizeImpl(alloc: std.mem.Allocator, sql: []const u8, diagnostic: *LexDiagn
                         i += 2;
                         continue;
                     }
+                    // SQL continuation requires a newline in whitespace or a
+                    // line comment. Block comments are not continuation trivia.
+                    if (try stringContinuation(sql, i + 1, diagnostic)) |next| {
+                        i = next + 1;
+                        continue;
+                    }
                     break;
+                }
+                if (escape_string and sql[i] == '\\') {
+                    try appendStringEscape(alloc, &out, sql, &i, diagnostic);
+                    continue;
                 }
                 if (sql[i] >= 0x80) {
                     const width = try utf8SequenceWidthAt(sql, i, diagnostic);
@@ -224,6 +241,8 @@ fn tokenizeImpl(alloc: std.mem.Allocator, sql: []const u8, diagnostic: *LexDiagn
                 }
             }
             if (i >= sql.len) return lexError(diagnostic, .unterminated_string_literal, source_start, sql.len);
+            if (!std.unicode.utf8ValidateSlice(out.items) or std.mem.indexOfScalar(u8, out.items, 0) != null)
+                return lexError(diagnostic, .invalid_string_encoding, source_start, i + 1);
             const owned = try out.toOwnedSlice(alloc);
             var owned_transferred = false;
             errdefer if (!owned_transferred) alloc.free(owned);
@@ -425,6 +444,154 @@ fn tokenizeImpl(alloc: std.mem.Allocator, sql: []const u8, diagnostic: *LexDiagn
 fn estimateTokenCapacity(sql: []const u8) usize {
     if (sql.len == 0) return 0;
     return @min(eager_token_capacity_limit, @min(sql.len, sql.len / 4 + 8));
+}
+
+fn stringContinuation(sql: []const u8, start: usize, diagnostic: *LexDiagnostic) !?usize {
+    var pos = start;
+    var newline = false;
+    while (pos < sql.len) {
+        if (std.ascii.isWhitespace(sql[pos])) {
+            newline = newline or sql[pos] == '\n' or sql[pos] == '\r';
+            pos += 1;
+        } else if (sql[pos] == '-' and pos + 1 < sql.len and sql[pos + 1] == '-') {
+            pos += 2;
+            while (pos < sql.len and sql[pos] != '\n' and sql[pos] != '\r')
+                pos += if (sql[pos] >= 0x80) try utf8SequenceWidthAt(sql, pos, diagnostic) else 1;
+        } else break;
+    }
+    return if (newline and pos < sql.len and sql[pos] == '\'') pos else null;
+}
+
+fn hexDigit(byte: u8) ?u4 {
+    return switch (byte) {
+        '0'...'9' => @intCast(byte - '0'),
+        'a'...'f' => @intCast(byte - 'a' + 10),
+        'A'...'F' => @intCast(byte - 'A' + 10),
+        else => null,
+    };
+}
+
+fn unicodeEscape(sql: []const u8, pos: *usize, diagnostic: *LexDiagnostic) !u32 {
+    const start = pos.*;
+    std.debug.assert(sql[start] == '\\');
+    const digits: usize = if (sql[start + 1] == 'u') 4 else 8;
+    pos.* += 2;
+    var value: u32 = 0;
+    for (0..digits) |_| {
+        if (pos.* >= sql.len) return lexError(diagnostic, .invalid_escape_sequence, start, sql.len);
+        const digit = hexDigit(sql[pos.*]) orelse return lexError(diagnostic, .invalid_escape_sequence, start, pos.* + 1);
+        value = (value << 4) | digit;
+        pos.* += 1;
+    }
+    return value;
+}
+
+/// Decodes into the token's single owned buffer. Escapes never increase its
+/// size beyond input bytes. Validate byte escapes together at literal end so
+/// independently escaped bytes may form one valid UTF-8 character.
+fn appendStringEscape(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), sql: []const u8, pos: *usize, diagnostic: *LexDiagnostic) !void {
+    const start = pos.*;
+    if (start + 1 >= sql.len) return lexError(diagnostic, .unterminated_string_literal, start, sql.len);
+    const ch = sql[start + 1];
+    if (ch == 'u' or ch == 'U') {
+        var value = try unicodeEscape(sql, pos, diagnostic);
+        if (value >= 0xd800 and value <= 0xdbff) {
+            if (pos.* + 1 >= sql.len or sql[pos.*] != '\\' or (sql[pos.* + 1] != 'u' and sql[pos.* + 1] != 'U'))
+                return lexError(diagnostic, .invalid_unicode_escape, start, pos.*);
+            const tail = try unicodeEscape(sql, pos, diagnostic);
+            if (tail < 0xdc00 or tail > 0xdfff) return lexError(diagnostic, .invalid_unicode_escape, start, pos.*);
+            value = 0x10000 + ((value - 0xd800) << 10) + tail - 0xdc00;
+        }
+        if (value == 0 or value > 0x10ffff or (value >= 0xd800 and value <= 0xdfff))
+            return lexError(diagnostic, .invalid_unicode_escape, start, pos.*);
+        var buffer: [4]u8 = undefined;
+        const width = std.unicode.utf8Encode(@intCast(value), &buffer) catch unreachable;
+        try out.appendSlice(alloc, buffer[0..width]);
+        return;
+    }
+    pos.* += 2;
+    if (ch >= '0' and ch <= '7') {
+        var value: u16 = ch - '0';
+        var digits: usize = 1;
+        while (digits < 3 and pos.* < sql.len and sql[pos.*] >= '0' and sql[pos.*] <= '7') : (digits += 1) {
+            value = value * 8 + sql[pos.*] - '0';
+            pos.* += 1;
+        }
+        try out.append(alloc, @truncate(value));
+    } else if (ch == 'x' and pos.* < sql.len and hexDigit(sql[pos.*]) != null) {
+        var value: u8 = hexDigit(sql[pos.*]).?;
+        pos.* += 1;
+        if (pos.* < sql.len) if (hexDigit(sql[pos.*])) |digit| {
+            value = value * 16 + digit;
+            pos.* += 1;
+        };
+        try out.append(alloc, value);
+    } else if (ch >= 0x80) {
+        const width = try utf8SequenceWidthAt(sql, start + 1, diagnostic);
+        try out.appendSlice(alloc, sql[start + 1 .. start + 1 + width]);
+        pos.* = start + 1 + width;
+    } else try out.append(alloc, switch (ch) {
+        'b' => 8,
+        'f' => 12,
+        'n' => '\n',
+        'r' => '\r',
+        't' => '\t',
+        else => ch,
+    });
+}
+
+test "PostgreSQL escape strings preserve oracle values and lexical failures" {
+    const Golden = struct { format: u32, entries: []const struct { id: []const u8, expression: []const u8, value: ?[]const u8, sqlstate: ?[]const u8 } };
+    const a = std.testing.allocator;
+    const golden = try std.json.parseFromSlice(Golden, a, @embedFile("testdata/escape-postgres.json"), .{});
+    defer golden.deinit();
+    try std.testing.expectEqual(@as(u32, 1), golden.value.format);
+    for (golden.value.entries) |case| {
+        errdefer std.debug.print("PostgreSQL lexical fixture {s}: {s}\n", .{ case.id, case.expression });
+        switch (try tokenizeDiagnosticAlloc(a, case.expression)) {
+            .tokens => |value| {
+                var tokens = value;
+                defer freeTokens(a, &tokens);
+                if (case.sqlstate) |state| {
+                    // These lexical tokens are individually valid, but not a
+                    // single literal expression (e.g. space-only adjacency).
+                    try std.testing.expectEqualStrings("42601", state);
+                    try std.testing.expect(tokens.items.len != 1);
+                } else {
+                    try std.testing.expectEqual(@as(usize, 1), tokens.items.len);
+                    try std.testing.expectEqual(TokenKind.string, tokens.items[0].kind);
+                    try std.testing.expectEqualStrings(case.value.?, tokens.items[0].text);
+                    try std.testing.expectEqual(@as(usize, 0), tokens.items[0].source_start);
+                    try std.testing.expectEqual(case.expression.len, tokens.items[0].source_end);
+                }
+            },
+            .diagnostic => |failure| {
+                const state = switch (failure.kind) {
+                    .invalid_escape_sequence => "22025",
+                    .invalid_string_encoding => "22021",
+                    else => "42601",
+                };
+                try std.testing.expectEqualStrings(case.sqlstate orelse return error.UnexpectedLexicalFailure, state);
+                try std.testing.expect(failure.source_start <= failure.source_end);
+                try std.testing.expect(failure.source_end <= case.expression.len);
+            },
+        }
+    }
+}
+
+fn escapeStringAllocationCase(a: std.mem.Allocator) !void {
+    var tokens = try tokenizeAlloc(a, "E'a\\n\\xC3\\xA9\\uD83D\\uDE00'\n'\\t' \"quoted\" E'last'");
+    defer freeTokens(a, &tokens);
+    try std.testing.expectEqualStrings("a\né😀\t", tokens.items[0].text);
+    try std.testing.expectEqual(@as(usize, 3), tokens.items.len);
+}
+
+test "PostgreSQL escape string ownership unwinds allocation failures" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, escapeStringAllocationCase, .{});
+    try std.testing.expectError(error.SqlTokenLimitExceeded, tokenizeBoundedDiagnosticAlloc(std.testing.allocator, "SELECT E'\\uZZZZ'", 1));
+    // Continuation trivia must not bypass the usual comment UTF-8 validator.
+    const invalid = try tokenizeDiagnosticAlloc(std.testing.allocator, "E'a' -- \xff\n'b'");
+    try std.testing.expectEqual(LexErrorKind.invalid_utf8, invalid.diagnostic.kind);
 }
 
 test "bounded lexer rejects before decoding excess token and allows trailing trivia" {
