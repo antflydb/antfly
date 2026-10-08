@@ -11544,7 +11544,7 @@ pub fn searchTextQuery(
     defer if (indexed_include) |*predicate| predicate.bitmap.deinit();
     var indexed_exclude: ?IndexedTextPredicate = null;
     defer if (indexed_exclude) |*predicate| predicate.bitmap.deinit();
-    if (!suppress_native_resolved_doc_filter and effective_req.order_by.len == 0) {
+    if (!suppress_native_resolved_doc_filter) {
         if (executor.resolve_indexed_filter) |resolve| {
             if (effective_req.filter_query_json.len != 0) indexed_include = try resolve(executor.ctx, alloc, snapshot, effective_req.filter_query_json);
             if (effective_req.exclusion_query_json.len != 0) indexed_exclude = try resolve(executor.ctx, alloc, snapshot, effective_req.exclusion_query_json);
@@ -11670,7 +11670,8 @@ pub fn searchTextQuery(
         native_constraints.positive_filter,
         effective_req.identity_read_generation,
     );
-    const full_candidate_limit = effectiveTextCandidateLimit(snapshot.liveDocCount(), native_constraints);
+    var full_candidate_limit = effectiveTextCandidateLimit(snapshot.liveDocCount(), native_constraints);
+    if (indexed_include) |predicate| full_candidate_limit = @min(full_candidate_limit, boundedU32(predicate.bitmap.cardinality()));
     const requires_field_sort = effective_req.order_by.len > 0;
     const search_query = try textSearchQueryWithNativeDocIdsAlloc(arena_alloc, base_search_query, native_constraints, effective_req.count_only);
     if (executor.native_count_visibility_exact and effective_req.count_only and !unresolved_stored_filters and

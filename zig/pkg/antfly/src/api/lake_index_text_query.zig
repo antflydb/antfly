@@ -92,7 +92,13 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, table: local.common_to
     owner.private_digests = metadata.private_digests;
     var effective = req;
     effective.cancellation = .{ .ptr = &owner, .is_cancelled_fn = Execution.canceled };
-    try @import("lake_index_search_filter.zig").resolve(ca, sql_table, &source, request, &effective);
+    // Vector-only and mixed vector requests retain their existing identity
+    // resolver. Native text predicates resolve inside their pinned ordinal space.
+    const has_text = for (owner.declarations) |declaration| {
+        if (declaration.artifact.kind == .text_segment) break true;
+    } else false;
+    if (!has_text or effective.dense != null or effective.sparse != null or effective.dense_queries.len != 0 or effective.sparse_queries.len != 0)
+        try @import("lake_index_search_filter.zig").resolve(ca, sql_table, &source, request, &effective);
     owner.hydration_fields = try owner.planHydration(effective);
     owner.typed_delivery = canDeliverTypedSource(effective);
     var execution_req = effective;

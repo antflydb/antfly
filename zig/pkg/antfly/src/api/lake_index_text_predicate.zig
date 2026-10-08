@@ -122,13 +122,15 @@ pub const Resolver = struct {
         if (input.object.get("conjuncts")) |children| {
             if (try self.resolveChildren(a, children, true, depth)) |result| return result;
         }
-        if (input.object.get("disjuncts")) |children| return self.resolveChildren(a, children, false, depth);
+        if (input.object.get("disjuncts")) |children| {
+            if (try self.resolveChildren(a, children, false, depth)) |result| return result;
+        }
         if (input.object.get("bool")) |boolean| {
             if (boolean != .object) return null;
             var conjuncts: std.array_list.Managed(std.json.Value) = .init(arena.allocator());
             var fields = boolean.object.iterator();
             while (fields.next()) |entry| {
-                if (!std.mem.eql(u8, entry.key_ptr.*, "must") and !std.mem.eql(u8, entry.key_ptr.*, "filter")) return null;
+                if (!std.mem.eql(u8, entry.key_ptr.*, "must") and !std.mem.eql(u8, entry.key_ptr.*, "filter")) return if (allow_scan) self.scanExpression(a, input) else null;
                 if (entry.value_ptr.* != .array) return null;
                 try conjuncts.appendSlice(entry.value_ptr.array.items);
             }
@@ -137,7 +139,7 @@ pub const Resolver = struct {
         if (allow_scan and scalar_conditions) {
             if (try self.index(a, conditions.items, true)) |bitmap| return .{ .bitmap = bitmap };
         }
-        return null;
+        return if (allow_scan) self.scanExpression(a, input) else null;
     }
     fn resolveChildren(self: Resolver, a: A, input: std.json.Value, conjunction: bool, depth: usize) !?Result {
         if (input != .array or input.array.items.len == 0) return null;
@@ -188,24 +190,74 @@ pub const Resolver = struct {
             _ = window.reset(.retain_capacity);
             const refs = if (broad) try predicate.nextPhysical(window.allocator(), 1024) else try predicate.next(window.allocator(), 1024);
             if (refs.len == 0) break;
-            for (refs) |ref| {
-                if (ref != .external) return error.InvalidNativeLakeRowIndex;
-                const row = ref.external;
-                const digest = self.private_digests.get(row.file_id) orelse return error.ExternalLakeSnapshotMismatch;
-                var buffer: [96]u8 = undefined;
-                const key = try std.fmt.bufPrint(&buffer, "lake2:{s}:{x:0>8}:{x:0>16}", .{ digest, row.row_group_ordinal, row.row_ordinal });
-                const doc = if (broad) blk: {
-                    if (!positions.contains(row.file_id)) {
-                        const owned_file = try a.dupe(u8, row.file_id);
-                        errdefer a.free(owned_file);
-                        try positions.put(a, owned_file, 0);
-                    }
-                    break :blk try self.identities.findForward(&scratch, self.snapshot, positions.getPtr(row.file_id).?, row.file_id, key);
-                } else try self.identities.find(&scratch, self.snapshot, row.file_id, key);
-                if (doc) |number| try result.add(number);
-            }
+            for (refs) |ref| try self.addMatch(a, &result, &scratch, &positions, broad, ref);
         }
         return result;
+    }
+    fn addMatch(self: Resolver, a: A, result: *Bitmap, scratch: *std.heap.ArenaAllocator, positions: *std.StringHashMapUnmanaged(u32), broad: bool, ref: local.storage_rowsource_types.RowRef) !void {
+        if (ref != .external) return error.InvalidNativeLakeRowIndex;
+        const row = ref.external;
+        if (!std.mem.eql(u8, row.source_id, self.source.inventory.source_id) or !std.mem.eql(u8, row.snapshot_id, self.source.inventory.snapshot_id)) return error.ExternalLakeSnapshotMismatch;
+        const digest = self.private_digests.get(row.file_id) orelse return error.ExternalLakeSnapshotMismatch;
+        var buffer: [96]u8 = undefined;
+        const key = try std.fmt.bufPrint(&buffer, "lake2:{s}:{x:0>8}:{x:0>16}", .{ digest, row.row_group_ordinal, row.row_ordinal });
+        const doc = if (broad) blk: {
+            if (!positions.contains(row.file_id)) {
+                const owned_file = try a.dupe(u8, row.file_id);
+                errdefer a.free(owned_file);
+                try positions.put(a, owned_file, 0);
+            }
+            break :blk try self.identities.findForward(scratch, self.snapshot, positions.getPtr(row.file_id).?, row.file_id, key);
+        } else try self.identities.find(scratch, self.snapshot, row.file_id, key);
+        if (doc) |number| try result.add(number);
+    }
+    fn scanExpression(self: Resolver, a: A, input: std.json.Value) !?Result {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const ca = arena.allocator();
+        const json = try std.json.Stringify.valueAlloc(ca, input, .{});
+        var filter = try local.storage_db_query_graph_exec.PreparedPatternFilter.init(a, json);
+        defer filter.deinit();
+        var fields: std.ArrayList([]const u8) = .empty;
+        if (!try @import("lake_index_search_filter.zig").dependencies(ca, self.table, filter.compiled, &fields)) return null;
+        const cursor = try local.sql_lake_cursor.openPinned(a, self.table, .{ .fields = fields.items, .limit = 1024 }, self.context, self.source);
+        defer cursor.close(cursor.ptr);
+        var result = Bitmap.init(a);
+        errdefer result.deinit();
+        var scratch = std.heap.ArenaAllocator.init(a);
+        defer scratch.deinit();
+        var row_arena = std.heap.ArenaAllocator.init(a);
+        defer row_arena.deinit();
+        var page_arena = std.heap.ArenaAllocator.init(a);
+        defer page_arena.deinit();
+        var positions: std.StringHashMapUnmanaged(u32) = .empty;
+        defer {
+            var keys = positions.keyIterator();
+            while (keys.next()) |key| a.free(key.*);
+            positions.deinit(a);
+        }
+        while (true) {
+            try self.context.ensureActive();
+            _ = page_arena.reset(.retain_capacity);
+            const page = try cursor.next_columns.?(cursor.ptr, page_arena.allocator(), 1024);
+            try page.validate();
+            if (page.native != null) return error.InvalidSqlBackendResponse;
+            for (page.selection, 0..) |position, row| {
+                _ = row_arena.reset(.retain_capacity);
+                const ra = row_arena.allocator();
+                const ref = page.batch.row_refs[position];
+                const id = try local.storage_rowsource_identity.allocId(ra, ref);
+                var doc: std.json.Value = .{ .object = .empty };
+                try doc.object.put(ra, "_id", .{ .string = id });
+                for (page.batch.columns) |col| {
+                    const cell = try page.cell(ra, row, col.name);
+                    try doc.object.put(ra, col.name, cell.value);
+                }
+                if (try filter.matchesJson(ra, id, doc)) try self.addMatch(a, &result, &scratch, &positions, true, ref);
+            }
+            if (page.after == null) break;
+        }
+        return .{ .bitmap = result };
     }
 };
 

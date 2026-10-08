@@ -1052,14 +1052,15 @@ ID list proportional to matching rows. The bitmap is applied before top-k
 ranking, preserves global BM25 statistics, and also constrains exact counts.
 Final result hydration keeps existing snapshot/delete checks and file/row-group
 selection. Native text metadata version 7 attests identity order; older text
-publications require rebuilding. This optimization currently covers text search
-without field sorting; vector and sorted queries retain their existing filters.
-
+publications require rebuilding. This optimization covers native text search,
+including filtered field sorting; vector-only and mixed vector queries retain
+their existing identity resolver.
 
 When a scalar predicate has no published index, the same consumer can use a
 bounded typed SQL scan. It pushes conditions into Iceberg partition, Parquet
 row-group and page pruning, then merges physical selections into the native
 bitmap. Indexed conjuncts take precedence over scanning an unindexed conjunct;
 the remaining expression is evaluated only on the narrowed text candidates.
-Fully native counts use per-segment bitmap cardinalities and do not allocate
-candidate hits for the whole matching population.
+Eligible match-all counts use per-segment bitmap cardinalities and do not
+allocate candidate hits for the whole matching population. Other query shapes
+retain their existing candidate and response resource budgets.
