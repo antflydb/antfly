@@ -3782,9 +3782,13 @@ test "H2 controlled credit waits release CPU and restore it before frame seriali
         bytes: std.ArrayListUnmanaged(u8) = .empty,
         fn begin(raw: ?*anyopaque) !void {
             const self: *@This() = @ptrCast(@alignCast(raw.?));
-            // Parking for stream credit must never hold the connection mutex.
-            try std.testing.expect(self.conn.write_mutex.tryLock());
-            self.conn.write_mutex.unlock(self.conn.io);
+            // Before the first publication, the peer has not acquired the
+            // mutex. Later polling callbacks can overlap the peer's window
+            // update; a failed tryLock then does not imply caller ownership.
+            if (self.begins == 0) {
+                try std.testing.expect(self.conn.write_mutex.tryLock());
+                self.conn.write_mutex.unlock(self.conn.io);
+            }
             try std.testing.expect(!self.parked.swap(true, .acq_rel));
             self.begins += 1;
             self.waiting.set(self.conn.io);

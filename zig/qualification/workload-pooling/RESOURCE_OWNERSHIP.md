@@ -258,3 +258,12 @@ and pinned Nix/glibc library and supplemental real-owner/TCP gates pass; see
 [HTTP/2 unlock/reentry receipts](receipts/2026-10-07/h2-unlock-reentry/README.md).
 The supplemental ABI 33 production worker integration remains unqualified by
 these focused gates and queued for full archive checks.
+
+
+HTTP/2 cancellation reset now has a separate 250ms transport-cleanup budget for
+connection mutex acquisition and its fixed frame. Cleanup protects against task
+cancellation, retires the socket if it cannot safely reset, and avoids unlocked
+stream mutation on mutex denial. Native and pinned Nix/glibc GNU HTTP gates pass;
+see [bounded reset receipts](receipts/2026-10-07/h2-reset-cleanup/README.md).
+This is fixed-size transport housekeeping, not an independently admitted control
+CPU root. Production integration and full default-enablement gates remain pending.

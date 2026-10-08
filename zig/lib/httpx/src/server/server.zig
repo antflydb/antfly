@@ -2175,13 +2175,45 @@ pub const Server = struct {
     }
 
     fn cancelH2Stream(h2: *H2Connection, sock: *Socket, stream_id: u31) void {
-        h2.write_mutex.lockUncancelable(h2.io);
+        // Reset is fixed-size transport cleanup, independent of the expired
+        // foreground request. Do not let a contended frame lock or stalled
+        // peer turn cancellation into an unbounded wait.
+        const previous = h2.io.swapCancelProtection(.blocked);
+        defer _ = h2.io.swapCancelProtection(previous);
+        var budget = H2ResetBudget{ .io = h2.io, .deadline_ms = deadlineAfter(h2.io, 250) };
+        const control = budget.view();
+        control.lock(&h2.write_mutex, h2.io) catch {
+            sock.shutdown();
+            return;
+        };
         defer h2.write_mutex.unlock(h2.io);
         const stream = h2.stream_manager.getStream(stream_id) orelse return;
         if (stream.state == .idle or stream.state == .closed) return;
-        h2.sendRstStream(sock, stream_id, .cancel) catch {};
         stream.reset();
+        var writer = @import("../net/socket.zig").ControlledWriter{ .socket = sock, .control = control };
+        h2.sendRstStream(&writer, stream_id, .cancel) catch {
+            // Even a rejected first write leaves the peer without a terminal
+            // stream signal. Wake the connection owner and retire this socket.
+            sock.shutdown();
+        };
     }
+
+    const H2ResetBudget = struct {
+        io: Io,
+        deadline_ms: i64,
+        fn check(raw: ?*anyopaque) @import("../net/socket.zig").WriteControl.Error!void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (milliTimestamp(self.io) >= self.deadline_ms) return error.Timeout;
+        }
+        fn remaining(raw: ?*anyopaque) @import("../net/socket.zig").WriteControl.Error!?u64 {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try check(raw);
+            return @intCast(@max(0, self.deadline_ms - milliTimestamp(self.io)));
+        }
+        fn view(self: *@This()) @import("../net/socket.zig").WriteControl {
+            return .{ .ptr = self, .check_fn = check, .remaining_ms_fn = remaining };
+        }
+    };
 
     fn logConnectionError(err: anyerror) void {
         switch (err) {
@@ -7394,4 +7426,157 @@ test "HTTP controlled H2 published headers survive denied reentry and late failu
     try std.testing.expectEqual(.closed, stream.state);
     try peer.socket.setRecvTimeout(25);
     try std.testing.expectError(error.Timeout, peer.socket.recv(payload[0..1]));
+}
+
+test "HTTP controlled H2 reset cleanup bounds a contended connection mutex" {
+    const io = std.testing.io;
+    var listener = try @import("../net/socket.zig").TcpListener.init(.{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } }, io);
+    defer listener.deinit();
+    var sender = try Socket.connect(listener.getLocalAddress(), io);
+    defer sender.close();
+    var peer = try listener.accept();
+    defer peer.socket.close();
+    peer.socket.enableNativeTimeouts();
+    try peer.socket.setRecvTimeout(500);
+    var h2 = H2Connection.initServer(std.testing.allocator, io);
+    defer h2.deinit();
+    const stream = try h2.stream_manager.getOrCreateStream(1);
+    stream.state = .open;
+    h2.write_mutex.lockUncancelable(io);
+    const started = milliTimestamp(io);
+    Server.cancelH2Stream(&h2, &sender, 1);
+    const elapsed = milliTimestamp(io) - started;
+    h2.write_mutex.unlock(io);
+    try std.testing.expect(elapsed >= 200 and elapsed < 1500);
+    // A cleanup that cannot inspect the stream under its mutex must not mutate
+    // it unsafely. Closing the socket wakes the actual connection owner.
+    try std.testing.expectEqual(.open, stream.state);
+    var bytes: [1]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 0), try peer.socket.recv(&bytes));
+}
+
+test "HTTP controlled H2 reset cleanup survives actual task cancellation" {
+    const io = std.testing.io;
+    var listener = try @import("../net/socket.zig").TcpListener.init(.{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } }, io);
+    defer listener.deinit();
+    var sender = try Socket.connect(listener.getLocalAddress(), io);
+    defer sender.close();
+    sender.enableNativeTimeouts();
+    var peer = try listener.accept();
+    defer peer.socket.close();
+    peer.socket.enableNativeTimeouts();
+    try peer.socket.setRecvTimeout(500);
+    var h2 = H2Connection.initServer(std.testing.allocator, io);
+    defer h2.deinit();
+    const stream = try h2.stream_manager.getOrCreateStream(1);
+    stream.state = .open;
+    var ready: Io.Event = .unset;
+    var task = try io.concurrent(struct {
+        fn run(value: *H2Connection, socket: *Socket, started: *Io.Event) !void {
+            started.set(value.io);
+            value.io.sleep(.fromSeconds(60), .awake) catch |err| {
+                if (err != error.Canceled) return err;
+                value.io.recancel();
+                Server.cancelH2Stream(value, socket, 1);
+                return error.Canceled;
+            };
+            return error.FixtureWasNotCanceled;
+        }
+    }.run, .{ &h2, &sender, &ready });
+    defer task.cancel(io) catch {};
+    try ready.wait(io);
+    try std.testing.expectError(error.Canceled, task.cancel(io));
+    try std.testing.expectEqual(.closed, stream.state);
+    var frame: [13]u8 = undefined;
+    var offset: usize = 0;
+    while (offset < frame.len) {
+        const count = try peer.socket.recv(frame[offset..]);
+        if (count == 0) return error.EndOfStream;
+        offset += count;
+    }
+    try std.testing.expectEqual(@as(u8, 3), frame[3]);
+    try std.testing.expectEqual(@as(u32, 8), std.mem.readInt(u32, frame[9..13], .big));
+}
+
+const H2ResetBackpressureTest = struct {
+    fn run(comptime fallback: bool) !void {
+        if (fallback and @import("builtin").os.tag != .linux) return error.SkipZigTest;
+        var lane = Io.Threaded.init(std.testing.allocator, .{ .async_limit = .nothing, .concurrent_limit = .limited(4) });
+        defer lane.deinit();
+        const io = lane.io();
+        var listener = try @import("../net/socket.zig").TcpListener.init(.{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } }, io);
+        defer listener.deinit();
+        // Set the inherited receive window before the handshake; changing an
+        // accepted socket cannot retract the already-advertised TCP window.
+        const socket_buffer: u32 = 4096;
+        try std.posix.setsockopt(listener.server.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, std.mem.asBytes(&socket_buffer));
+        var sender = try Socket.connect(listener.getLocalAddress(), io);
+        defer sender.close();
+        var peer = try listener.accept();
+        defer peer.socket.close();
+        try std.posix.setsockopt(sender.handle, std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, std.mem.asBytes(&socket_buffer));
+        try std.posix.setsockopt(peer.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, std.mem.asBytes(&socket_buffer));
+        sender.enableNativeTimeouts();
+        try sender.setSendTimeout(5);
+        var payload: [64 * 1024]u8 = @splat('x');
+        var stalled = false;
+        for (0..1024) |_| {
+            _ = sender.send(&payload) catch |err| {
+                if (err != error.Timeout) return err;
+                stalled = true;
+                break;
+            };
+        }
+        if (!stalled) return error.LargeWriteDidNotStall;
+        // Large writes and even a complete reset-sized write can stall while
+        // smaller frame fragments still fit. Exhaust single-byte writes with
+        // bounded socket buffers before testing reset cleanup.
+        try sender.setSendTimeout(100);
+        stalled = false;
+        var small_sent: usize = 0;
+        var empty_sends: usize = 0;
+        for (0..1024 * 1024) |_| {
+            const count = sender.send(payload[0..1]) catch |err| {
+                if (err != error.Timeout) return err;
+                stalled = true;
+                break;
+            };
+            small_sent += count;
+            if (count == 0) empty_sends += 1;
+        }
+        std.debug.print("RESET_PREFILL bytes={d} empty_sends={d} stalled={}\n", .{ small_sent, empty_sends, stalled });
+        if (!stalled) return error.SingleByteWriteDidNotStall;
+        try sender.setSendTimeout(0);
+        if (fallback) sender.native_timeouts = false;
+        var h2 = H2Connection.initServer(std.testing.allocator, io);
+        defer h2.deinit();
+        const stream = try h2.stream_manager.getOrCreateStream(1);
+        stream.state = .open;
+        const started = milliTimestamp(io);
+        Server.cancelH2Stream(&h2, &sender, 1);
+        const elapsed = milliTimestamp(io) - started;
+        std.debug.print("RESET_BACKPRESSURE fallback={} elapsed_ms={d}\n", .{ fallback, elapsed });
+        try std.testing.expect(elapsed >= 200 and elapsed < 1500);
+        try std.testing.expectEqual(.closed, stream.state);
+        try std.testing.expect(h2.write_mutex.tryLock());
+        h2.write_mutex.unlock(io);
+        peer.socket.enableNativeTimeouts();
+        try peer.socket.setRecvTimeout(1000);
+        var drained: usize = 0;
+        while (true) {
+            const count = try peer.socket.recv(&payload);
+            if (count == 0) break;
+            drained += count;
+            if (drained > 64 * 1024 * 1024) return error.FixtureDrainExceeded;
+        }
+        try std.testing.expect(drained > 0);
+    }
+};
+
+test "HTTP controlled H2 reset cleanup bounds a stalled native peer" {
+    try H2ResetBackpressureTest.run(false);
+}
+
+test "HTTP controlled H2 reset cleanup bounds a stalled fallback peer with zero async allowance" {
+    try H2ResetBackpressureTest.run(true);
 }
