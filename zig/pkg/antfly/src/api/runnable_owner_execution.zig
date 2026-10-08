@@ -15,7 +15,7 @@ pub const State = struct {
     cleanup_in_use: std.atomic.Value(bool) = .init(false),
 
     pub fn port(self: *State) abi.Owner {
-        return .{ .context = &self.owner, .retain = retain, .release = release, .start = start, .checkpoint = checkpoint, .park = park, .enter = enter, .finish = finish };
+        return .{ .context = &self.owner, .retain = retain, .release = release, .start = start, .checkpoint = checkpoint, .park = park, .enter = enter, .finish = finish, .resize_team = resizeTeam };
     }
 };
 
@@ -94,6 +94,14 @@ fn startChecked(raw: *anyopaque, options: *const abi.Start) !void {
 }
 fn checkpoint(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {
     capsule(raw).execution.checkpoint() catch |err| return runtime.error_abi.statusFromError(err);
+    return .ok;
+}
+fn resizeTeam(raw: *anyopaque, slots: usize) callconv(.c) runtime.error_abi.Status {
+    const value = capsule(raw);
+    // Cleanup's independent subquota is deliberately single-slot even when
+    // the shared policy has multiple reserved control slots.
+    if (value.cleanup and slots != 1) return runtime.error_abi.statusFromError(error.InvalidRunnableDemand);
+    value.execution.resizeTeam(slots) catch |err| return runtime.error_abi.statusFromError(err);
     return .ok;
 }
 fn park(raw: *anyopaque, reason: c_int) callconv(.c) runtime.error_abi.Status {
@@ -482,5 +490,52 @@ test "runnable execution HTTP cleanup callbacks borrow the real shared owner unt
     port.finish(health.?);
     try view.enter(view.context, handle);
     try std.testing.expectEqual(@as(usize, 3), owner.owner.scheduler.stats().runnable_slots);
+    try std.testing.expectEqual(retained, owner.owner.scheduler.stats().retained_bytes);
+}
+
+test "runnable execution checked team resize retains the same capsule and memory owner" {
+    var owner: State = .{ .owner_alloc = std.testing.allocator, .owner = try runnable.NodeOwner.init(.{ .slots = 5, .max_operations = 8 }), .native_now_ns = TestClock.now };
+    defer owner.owner.tryDeinit() catch @panic("owner leaked");
+    const port = owner.port();
+    const io = std.testing.io;
+    const borrow = runtime.native_abi.IoBorrow.init(&io);
+    var handle: ?*anyopaque = null;
+    try std.testing.expect(port.start(port.context, &.{ .io = &borrow, .class = @backingInt(abi.Class.write), .allow_wait = 0, .retained_bytes = 47, .out_handle = &handle }).isOk());
+    defer port.finish(handle.?);
+    const retained = owner.owner.scheduler.stats().retained_bytes;
+    var loan = try abi.Borrowed.fromOwner(port, handle.?, 1, .write);
+    try loan.resizeTeam(4);
+    try std.testing.expectEqual(@as(usize, 4), loan.cpu_slots);
+    try std.testing.expectEqual(@as(usize, 4), owner.owner.scheduler.stats().runnable_slots);
+    try std.testing.expectEqual(@as(usize, 1), owner.owner.scheduler.stats().operations);
+    try std.testing.expectEqual(@as(usize, 1), owner.owner.borrowers);
+    try std.testing.expectEqual(retained, owner.owner.scheduler.stats().retained_bytes);
+    try std.testing.expectError(error.InvalidRunnableDemand, loan.resizeTeam(5));
+    try std.testing.expectEqual(@as(usize, 4), loan.cpu_slots);
+    try loan.resizeTeam(1);
+    try std.testing.expectEqual(@as(usize, 1), owner.owner.scheduler.stats().runnable_slots);
+    var health: ?*anyopaque = null;
+    try std.testing.expect(port.start(port.context, &.{ .io = &borrow, .class = @backingInt(abi.Class.control), .out_handle = &health }).isOk());
+    port.finish(health.?);
+    owner.owner.close();
+    try std.testing.expectError(error.SchedulerClosed, loan.resizeTeam(3));
+    try std.testing.expectEqual(@as(usize, 1), loan.cpu_slots);
+    try std.testing.expectEqual(@as(usize, 1), owner.owner.scheduler.stats().runnable_slots);
+    try std.testing.expectEqual(retained, owner.owner.scheduler.stats().retained_bytes);
+}
+
+test "runnable execution checked team resize cannot expand protected cleanup" {
+    var owner: State = .{ .owner_alloc = std.testing.allocator, .owner = try runnable.NodeOwner.init(.{ .slots = 5, .control_slots = 2, .max_operations = 8 }), .native_now_ns = TestClock.now };
+    defer owner.owner.tryDeinit() catch @panic("owner leaked");
+    const port = owner.port();
+    const io = std.testing.io;
+    const borrow = runtime.native_abi.IoBorrow.init(&io);
+    var handle: ?*anyopaque = null;
+    try std.testing.expect(port.start(port.context, &cleanupOptions(&borrow, &handle, 31)).isOk());
+    defer port.finish(handle.?);
+    const retained = owner.owner.scheduler.stats().retained_bytes;
+    try std.testing.expectError(error.InvalidRunnableDemand, port.resizeTeam(handle.?, 2));
+    try std.testing.expect(owner.cleanup_in_use.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), owner.owner.scheduler.stats().runnable_slots);
     try std.testing.expectEqual(retained, owner.owner.scheduler.stats().retained_bytes);
 }

@@ -9,7 +9,7 @@ const native = @import("runtime_native_abi.zig");
 const errors = @import("runtime_error_abi.zig");
 const http = @import("runtime_http_abi.zig");
 
-pub const abi_version: u32 = 3;
+pub const abi_version: u32 = 4;
 pub const Class = enum(c_int) { query, write, inference, background, control };
 pub const Wait = enum(c_int) { resource, output };
 
@@ -54,6 +54,23 @@ pub const Owner = extern struct {
     park: *const fn (*anyopaque, c_int) callconv(.c) errors.Status,
     enter: *const fn (*anyopaque, c_int) callconv(.c) errors.Status,
     finish: *const fn (*anyopaque) callconv(.c) void,
+    /// Optional dynamic CPU team capability. All prior children must join
+    /// before resizing. Absent support fails explicitly without new admission.
+    resize_team: ?*const fn (*anyopaque, usize) callconv(.c) errors.Status = null,
+
+    pub fn resizeTeam(self: Owner, handle: *anyopaque, slots: usize) !void {
+        if (!self.valid()) return error.UnsupportedVersion;
+        if (slots == 0) return error.InvalidRunnableDemand;
+        const resize = self.resize_team orelse return error.UnsupportedOperation;
+        const status = resize(handle, slots);
+        if (!status.isOk()) return errors.errorFromStatus(status);
+    }
+
+    /// Check the foreign prefix before copying any appended callbacks.
+    pub fn read(raw: *const Owner) !Owner {
+        if (raw.version != abi_version or raw.struct_size < @sizeOf(Owner)) return error.UnsupportedVersion;
+        return raw.*;
+    }
 
     pub fn valid(self: Owner) bool {
         return self.version == abi_version and self.struct_size >= @sizeOf(Owner);
@@ -64,6 +81,10 @@ pub const Owner = extern struct {
 /// releasing this lease; independently started capsules hold their own leases.
 pub const Lease = struct {
     owner: Owner,
+
+    pub fn initFrom(raw: *const Owner) !Lease {
+        return init(try Owner.read(raw));
+    }
 
     pub fn init(owner: Owner) !Lease {
         if (!owner.valid()) return error.UnsupportedVersion;
@@ -92,6 +113,25 @@ pub const Borrowed = extern struct {
     /// The parent implementation validates its mandatory resumption fences
     /// before exposing child output to the parent phase.
     enter: *const fn (*anyopaque, c_int) callconv(.c) errors.Status,
+    resize_team: ?*const fn (*anyopaque, usize) callconv(.c) errors.Status = null,
+
+    /// Update this snapshot only after the parent has admitted the new team.
+    /// Quiesce every prior borrower first; copies do not track later resizing.
+    pub fn resizeTeam(self: *Borrowed, slots: usize) !void {
+        try self.validate();
+        if (slots == 0) return error.InvalidRunnableDemand;
+        const resize = self.resize_team orelse return error.UnsupportedOperation;
+        const status = resize(self.context, slots);
+        if (!status.isOk()) return errors.errorFromStatus(status);
+        self.cpu_slots = slots;
+    }
+
+    pub fn read(raw: *const Borrowed) !Borrowed {
+        if (raw.version != abi_version or raw.struct_size != @sizeOf(Borrowed)) return error.UnsupportedVersion;
+        const value = raw.*;
+        try value.validate();
+        return value;
+    }
 
     pub fn validate(self: Borrowed) !void {
         if (self.version != abi_version or self.struct_size != @sizeOf(Borrowed)) return error.UnsupportedVersion;
@@ -108,6 +148,7 @@ pub const Borrowed = extern struct {
             .checkpoint = owner.checkpoint,
             .park = owner.park,
             .enter = owner.enter,
+            .resize_team = owner.resize_team,
         };
         try borrow.validate();
         return borrow;
@@ -120,6 +161,10 @@ pub const Borrowed = extern struct {
 pub const Transfer = struct {
     borrow: Borrowed,
     active: bool = true,
+
+    pub fn initFrom(raw: *const Borrowed, class: Class) !Transfer {
+        return init(try Borrowed.read(raw), class);
+    }
 
     pub fn init(borrow: Borrowed, class: Class) !Transfer {
         try borrow.validate();
@@ -238,4 +283,62 @@ test "runnable cleanup ABI requires a bounded independent single-slot control ro
     start.reserved[0] = 1;
     try std.testing.expectError(error.InvalidArgument, start.validate());
     try std.testing.expect(handle == null);
+}
+
+test "runnable team ABI rejects legacy and malformed demand before callbacks and preserves failed snapshots" {
+    const Fake = struct {
+        calls: usize = 0,
+        deny: bool = false,
+        fn resize(raw: *anyopaque, slots: usize) callconv(.c) errors.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (self.deny) return errors.statusFromError(error.ResourceTemporarilyUnavailable);
+            std.debug.assert(slots > 0);
+            return .ok;
+        }
+        fn check(_: *anyopaque) callconv(.c) errors.Status {
+            return .ok;
+        }
+        fn transition(_: *anyopaque, _: c_int) callconv(.c) errors.Status {
+            return .ok;
+        }
+    };
+    var fake: Fake = .{};
+    var loan: Borrowed = .{ .context = &fake, .cpu_slots = 1, .parent_class = @backingInt(Class.write), .checkpoint = Fake.check, .park = Fake.transition, .enter = Fake.transition, .resize_team = Fake.resize };
+    loan.version = 3;
+    try std.testing.expectError(error.UnsupportedVersion, loan.resizeTeam(2));
+    loan.version = abi_version;
+    loan.struct_size -= 1;
+    try std.testing.expectError(error.UnsupportedVersion, loan.resizeTeam(2));
+    loan.struct_size = @sizeOf(Borrowed);
+    try std.testing.expectError(error.InvalidRunnableDemand, loan.resizeTeam(0));
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    try loan.resizeTeam(2);
+    try std.testing.expectEqual(@as(usize, 2), loan.cpu_slots);
+    fake.deny = true;
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, loan.resizeTeam(3));
+    try std.testing.expectEqual(@as(usize, 2), loan.cpu_slots);
+    loan.resize_team = null;
+    try std.testing.expectError(error.UnsupportedOperation, loan.resizeTeam(1));
+    try std.testing.expectEqual(@as(usize, 2), fake.calls);
+}
+
+test "runnable team ABI foreign readers reject header-only legacy and truncated values" {
+    const Header = extern struct { version: u32, struct_size: u32 };
+    var owner_header: Header align(@alignOf(Owner)) = .{ .version = 3, .struct_size = @sizeOf(Owner) - @sizeOf(usize) };
+    const owner: *const Owner = @ptrCast(&owner_header);
+    try std.testing.expectError(error.UnsupportedVersion, Owner.read(owner));
+    try std.testing.expectError(error.UnsupportedVersion, Lease.initFrom(owner));
+    owner_header.version = abi_version;
+    owner_header.struct_size = @sizeOf(Header);
+    try std.testing.expectError(error.UnsupportedVersion, Owner.read(owner));
+    try std.testing.expectError(error.UnsupportedVersion, Lease.initFrom(owner));
+    var borrow_header: Header align(@alignOf(Borrowed)) = .{ .version = 3, .struct_size = @sizeOf(Borrowed) - @sizeOf(usize) };
+    const borrow: *const Borrowed = @ptrCast(&borrow_header);
+    try std.testing.expectError(error.UnsupportedVersion, Borrowed.read(borrow));
+    try std.testing.expectError(error.UnsupportedVersion, Transfer.initFrom(borrow, .inference));
+    borrow_header.version = abi_version;
+    borrow_header.struct_size = @sizeOf(Header);
+    try std.testing.expectError(error.UnsupportedVersion, Borrowed.read(borrow));
+    try std.testing.expectError(error.UnsupportedVersion, Transfer.initFrom(borrow, .inference));
 }

@@ -363,3 +363,14 @@ admission contracts, including stale queue-timeout regression evidence; see
 [CPU team reservation receipts](receipts/2026-10-07/runnable-team-reservation/README.md).
 Checked ABI exposure, actual transaction/numerical child integration and child
 heap accounting are still required. This is not accepted completion authority.
+
+
+Checked runnable ABI 4 exposes optional CPU team resizing on the existing API
+capsule, with no new operation/byte/lease admission and single-slot cleanup
+enforcement. Header-first foreign readers reject old/truncated layouts before
+copying callback tails. Native and pinned Nix/glibc ABI and real-owner/listener/
+worker gates pass; see
+[checked CPU team receipts](receipts/2026-10-07/runnable-team-abi/README.md).
+The two production inference call-site updates remain supplemental pending full
+archive qualification. SQL fenced adapters and actual transaction/numerical
+children still require integration; accepted completion authority is separate.
