@@ -126,3 +126,76 @@ test "SQL write team rejects absent read and wider control roots" {
     try execution.startWithSlots(&owner, .{ .io = std.testing.io }, .control, 2);
     try std.testing.expectError(error.InvalidRunnableDemand, writes.init(&execution, memory.allocator()));
 }
+
+test "SQL write team local completion bridge retains stable ownership and original fences" {
+    const io = std.testing.io;
+    const io_borrow = runtime.native_abi.IoBorrow.init(&io);
+    for ([_]bool{ false, true }) |control| {
+        Clock.current = 0;
+        var owner = try scheduler.Scheduler.init(.{ .slots = 5, .control_slots = 2, .max_operations = 8 });
+        var memory: allocation.Shared = .{ .child = std.heap.smp_allocator, .limit = 16384 };
+        var flag = std.atomic.Value(bool).init(false);
+        var execution: scheduler.Execution = .{};
+        try execution.start(&owner, .{ .io = io, .native_now_ns = Clock.now, .deadline_ns = 10, .cancellation = .{ .ptr = &flag, .requested = canceled }, .retained_bytes = 256 }, if (control) .control else .write);
+        defer execution.finish();
+        // The bridge stays in this scope through the owning finish.
+        var bridge = try writes.Completion.init(&execution, memory.allocator());
+        var team = try bridge.team();
+        try std.testing.expectError(error.ExecutionWaitUnsupported, checked(team.borrow.checkpoint(team.borrow.context)));
+        try team.reserve(8);
+        defer team.finish();
+        try std.testing.expectEqual(@as(usize, if (control) 1 else 3), team.borrow.cpu_slots);
+        try team.borrow.reserveCompletion(&.{ .io = &io_borrow, .native_deadline = 1, .deadline_ns = 100 });
+        const receiver = &bridge.io.?;
+        try std.testing.expectError(error.InvalidRunnableTransition, team.borrow.reserveCompletion(&.{ .io = &io_borrow, .native_deadline = 1, .deadline_ns = 200 }));
+        try std.testing.expect(receiver == &bridge.io.?);
+        try std.testing.expectError(error.ExecutionWaitUnsupported, checked(team.borrow.park(team.borrow.context, @backingInt(runtime.runnable_abi.Wait.resource))));
+        try team.borrow.activateCompletion();
+        flag.store(true, .release);
+        Clock.current = 11;
+        try checked(team.borrow.park(team.borrow.context, @backingInt(runtime.runnable_abi.Wait.resource)));
+        var health: scheduler.Execution = .{};
+        defer health.finish();
+        try health.start(&owner, .{ .io = io }, .control);
+        health.finish();
+        owner.close();
+        try checked(team.borrow.enter(team.borrow.context, team.borrow.parent_class));
+        try checked(team.borrow.checkpoint(team.borrow.context));
+        if (control) try std.testing.expectError(error.InvalidRunnableDemand, team.borrow.resizeTeam(2));
+        try std.testing.expectEqual(@as(usize, 1), owner.stats().operations);
+        try std.testing.expectEqual(@as(u64, 256), owner.stats().retained_bytes);
+        try checked(team.borrow.park(team.borrow.context, @backingInt(runtime.runnable_abi.Wait.resource)));
+        Clock.current = 101;
+        try std.testing.expectError(error.DeadlineExceeded, checked(team.borrow.enter(team.borrow.context, team.borrow.parent_class)));
+        try std.testing.expectEqual(@as(usize, 1), owner.stats().operations);
+        try std.testing.expectEqual(@as(u64, 256), owner.stats().retained_bytes);
+        try std.testing.expectEqual(@as(usize, 0), owner.stats().runnable_slots);
+        execution.finish();
+        try std.testing.expectEqual(@as(usize, 0), owner.stats().operations);
+    }
+}
+
+test "SQL write team local completion bridge clears failed reservations and rejects missing native clocks" {
+    const io = std.testing.io;
+    const io_borrow = runtime.native_abi.IoBorrow.init(&io);
+    var owner = try scheduler.Scheduler.init(.{ .slots = 3 });
+    var memory: allocation.Shared = .{ .child = std.heap.smp_allocator, .limit = 16384 };
+    var execution: scheduler.Execution = .{};
+    defer execution.finish();
+    Clock.current = 0;
+    try execution.start(&owner, .{ .io = io }, .write);
+    var bridge = try writes.Completion.init(&execution, memory.allocator());
+    var team = try bridge.team();
+    try std.testing.expectError(error.InvalidArgument, team.borrow.reserveCompletion(&.{ .io = &io_borrow, .native_deadline = 1, .deadline_ns = 100 }));
+    try std.testing.expect(bridge.io == null);
+    execution.finish();
+    try execution.start(&owner, .{ .io = io, .native_now_ns = Clock.now, .deadline_ns = 10 }, .write);
+    Clock.current = 11;
+    try std.testing.expectError(error.DeadlineExceeded, team.borrow.reserveCompletion(&.{ .io = &io_borrow, .native_deadline = 1, .deadline_ns = 100 }));
+    try std.testing.expect(bridge.io == null and bridge.clock_io == null);
+    Clock.current = 0;
+    try team.borrow.reserveCompletion(&.{ .io = &io_borrow, .native_deadline = 1, .deadline_ns = 100 });
+    owner.close();
+    try std.testing.expectError(error.SchedulerClosed, team.borrow.activateCompletion());
+    try std.testing.expectEqual(@as(usize, 1), owner.stats().operations);
+}

@@ -464,3 +464,15 @@ The caller retains its original root/resources through joined deinit. SQL seal
 and physical participant acceptance are not wired to this primitive yet. Executor
 internal allocation accounting, physical wait fences and authoritative recovery
 transfer remain required; no production completion activation or default enablement.
+
+
+A stable local SQL completion bridge now connects existing write/control
+Executions to completion reservation/activation callbacks. It retains Io/clock
+receivers through owning finish and rejects suspension until activation. All 37
+SQL-team/task/owner/worker/cleanup contracts execute and pass on native and pinned
+Nix/glibc; see
+[local completion bridge receipts](receipts/2026-10-08/local-completion-bridge/README.md).
+HTTP/pgwire bridge construction and SQL-adapter forwarding remain supplemental
+pending full API/archive proof. SQL sealing/participant acceptance has not moved
+to the completion task. Finite physical storage waits, recovery transfer and
+whole-node/default qualification remain incomplete; no production activation.

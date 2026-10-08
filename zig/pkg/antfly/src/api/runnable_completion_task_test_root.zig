@@ -146,3 +146,68 @@ test "completion task foreground cancellation joins independent accepted work th
     try std.testing.expectEqual(@as(usize, 0), owner.owner.scheduler.stats().operations);
     try std.testing.expectEqual(@as(u64, 0), owner.owner.scheduler.stats().retained_bytes);
 }
+
+test "completion task uses local SQL write and protected commit bridge without new admission" {
+    const writes = @import("runnable_write_team.zig");
+    const Fixture = struct {
+        owner: *scheduler.Scheduler,
+        execution: *scheduler.Execution,
+        flag: *std.atomic.Value(bool),
+        calls: usize = 0,
+        fn canceled(raw: *const anyopaque) bool {
+            return @as(*const std.atomic.Value(bool), @ptrCast(@alignCast(raw))).load(.acquire);
+        }
+        fn complete(raw: *anyopaque, borrow: runtime.runnable_abi.Borrowed, io: std.Io) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.flag.store(true, .release);
+            Clock.current.store(11, .release);
+            try checked(borrow.park(borrow.context, @backingInt(runtime.runnable_abi.Wait.resource)));
+            var health: scheduler.Execution = .{};
+            defer health.finish();
+            try health.start(self.owner, .{ .io = io }, .control);
+            health.finish();
+            self.owner.close();
+            try checked(borrow.enter(borrow.context, borrow.parent_class));
+            try checked(borrow.checkpoint(borrow.context));
+            try io.checkCancel();
+            try std.testing.expectEqual(@as(usize, 1), self.owner.stats().operations);
+            try std.testing.expectEqual(@as(u64, 256), self.owner.stats().retained_bytes);
+            try std.testing.expect(self.execution.entry.?.completion_active);
+            self.calls += 1;
+        }
+    };
+    for ([_]bool{ false, true }) |control| {
+        var threaded = std.Io.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .limited(1) });
+        defer threaded.deinit();
+        const io = threaded.io();
+        const io_borrow = runtime.native_abi.IoBorrow.init(&io);
+        Clock.current.store(0, .release);
+        var owner = try scheduler.Scheduler.init(.{ .slots = 5, .control_slots = 2, .max_operations = 8 });
+        var memory: allocation.Shared = .{ .child = std.heap.smp_allocator, .limit = 16384 };
+        var flag = std.atomic.Value(bool).init(false);
+        var execution: scheduler.Execution = .{};
+        defer execution.finish();
+        try execution.start(&owner, .{ .io = io, .native_now_ns = Clock.now, .deadline_ns = 10, .cancellation = .{ .ptr = &flag, .requested = Fixture.canceled }, .retained_bytes = 256 }, if (control) .control else .write);
+        var bridge = try writes.Completion.init(&execution, memory.allocator());
+        var team = try bridge.team();
+        try team.reserve(8);
+        defer team.finish();
+        var fixture: Fixture = .{ .owner = &owner, .execution = &execution, .flag = &flag };
+        var task = try completion.Task.reserve(memory.allocator(), io, team.borrow, &.{ .io = &io_borrow, .native_deadline = 1, .deadline_ns = 100 }, &fixture, Fixture.complete);
+        var task_live = true;
+        defer if (task_live) task.deinit();
+        flag.store(true, .release);
+        try std.testing.expectError(error.Canceled, task.runAndJoin());
+        try std.testing.expectEqual(@as(usize, 0), fixture.calls);
+        flag.store(false, .release);
+        try task.runAndJoin();
+        try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+        try std.testing.expectEqual(@as(usize, if (control) 1 else 3), owner.stats().runnable_slots);
+        task.deinit();
+        task_live = false;
+        // Retire only after the actual task and allocator consumers joined.
+        execution.finish();
+        try std.testing.expectEqual(@as(usize, 0), memory.stats().used_bytes);
+        try std.testing.expectEqual(@as(usize, 0), owner.stats().operations);
+    }
+}

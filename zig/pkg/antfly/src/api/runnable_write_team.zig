@@ -8,6 +8,10 @@ const runtime = @import("antfly_runtime_abi");
 const scheduler = @import("antfly_local_sources").common_request_admission.runnable_scheduler;
 
 pub fn init(execution: *scheduler.Execution, allocator: std.mem.Allocator) !runtime.runnable_abi.Team {
+    return initTeam(execution, allocator);
+}
+
+fn initTeam(execution: *scheduler.Execution, allocator: std.mem.Allocator) !runtime.runnable_abi.Team {
     const entry = execution.entry orelse return error.InvalidRunnableTransition;
     const owner = entry.scheduler orelse return error.InvalidRunnableTransition;
     if (entry.state != .running or (entry.class != .write and entry.class != .control)) return error.InvalidRunnableTransition;
@@ -45,3 +49,93 @@ fn resize(raw: *anyopaque, slots: usize) callconv(.c) runtime.error_abi.Status {
     execution.resizeTeam(slots) catch |err| return runtime.error_abi.statusFromError(err);
     return .ok;
 }
+
+/// Stable ingress-owned bridge for a local write/control Execution. Construct
+/// before borrowing team(), and retain this address through the execution's
+/// owning finish. All children must be quiescent before whole-team transitions.
+/// Reservation alone grants no suspension; only activated completion does.
+pub const Completion = struct {
+    execution: *scheduler.Execution,
+    allocator: std.mem.Allocator,
+    io: ?runtime.io_abi.Receiver = null,
+    clock_io: ?runtime.io_abi.Receiver = null,
+
+    pub fn init(execution: *scheduler.Execution, allocator: std.mem.Allocator) !Completion {
+        _ = try initTeam(execution, allocator);
+        return .{ .execution = execution, .allocator = allocator };
+    }
+
+    pub fn team(self: *Completion) !runtime.runnable_abi.Team {
+        var value = try initTeam(self.execution, self.allocator);
+        value.borrow.context = self;
+        value.borrow.resize_team = resizeTeam;
+        value.borrow.reserve_completion = reserve;
+        value.borrow.activate_completion = activate;
+        value.borrow.checkpoint = check;
+        value.borrow.park = park;
+        value.borrow.enter = enter;
+        return value;
+    }
+
+    fn from(raw: *anyopaque) *Completion {
+        return @ptrCast(@alignCast(raw));
+    }
+    fn active(self: *Completion) !void {
+        const entry = self.execution.entry orelse return error.InvalidRunnableTransition;
+        if (!entry.completion_active) return error.ExecutionWaitUnsupported;
+    }
+    fn reserve(raw: *anyopaque, options: *const runtime.runnable_abi.Completion) callconv(.c) runtime.error_abi.Status {
+        reserveChecked(from(raw), options) catch |err| return runtime.error_abi.statusFromError(err);
+        return .ok;
+    }
+    fn reserveChecked(self: *Completion, options: *const runtime.runnable_abi.Completion) !void {
+        try options.validate();
+        if (self.io != null) return error.InvalidRunnableTransition;
+        const entry = self.execution.entry orelse return error.InvalidRunnableTransition;
+        const native_clock = if (options.native_deadline != 0) entry.options.native_now_ns orelse return error.InvalidArgument else null;
+        const io = try options.io.receive();
+        const clock_io = if (options.clock_io) |borrow| try borrow.receive() else null;
+        self.io = io;
+        self.clock_io = clock_io;
+        errdefer {
+            self.io = null;
+            self.clock_io = null;
+        }
+        try self.execution.reserveCompletion(.{
+            .io = self.io.?.io(),
+            .clock_io = if (self.clock_io) |*clock| clock.io() else null,
+            .native_now_ns = native_clock,
+            .deadline_ns = options.deadline_ns,
+        });
+    }
+    fn activate(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {
+        from(raw).execution.activateCompletion() catch |err| return runtime.error_abi.statusFromError(err);
+        return .ok;
+    }
+    fn resizeTeam(raw: *anyopaque, slots: usize) callconv(.c) runtime.error_abi.Status {
+        return resize(from(raw).execution, slots);
+    }
+    fn check(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {
+        const self = from(raw);
+        self.active() catch |err| return runtime.error_abi.statusFromError(err);
+        self.execution.checkpoint() catch |err| return runtime.error_abi.statusFromError(err);
+        return .ok;
+    }
+    fn park(raw: *anyopaque, reason: c_int) callconv(.c) runtime.error_abi.Status {
+        const self = from(raw);
+        self.active() catch |err| return runtime.error_abi.statusFromError(err);
+        const wait = std.enums.fromInt(runtime.runnable_abi.Wait, reason) orelse return runtime.error_abi.statusFromError(error.InvalidArgument);
+        self.execution.park(switch (wait) {
+            .resource => .resource_blocked,
+            .output => .output_blocked,
+        }) catch |err| return runtime.error_abi.statusFromError(err);
+        return .ok;
+    }
+    fn enter(raw: *anyopaque, next: c_int) callconv(.c) runtime.error_abi.Status {
+        const self = from(raw);
+        self.active() catch |err| return runtime.error_abi.statusFromError(err);
+        const class = std.enums.fromInt(scheduler.Class, next) orelse return runtime.error_abi.statusFromError(error.InvalidArgument);
+        self.execution.enter(class) catch |err| return runtime.error_abi.statusFromError(err);
+        return .ok;
+    }
+};
