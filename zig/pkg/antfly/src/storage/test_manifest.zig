@@ -168,6 +168,7 @@ comptime {
     _ = @import("antfly_local_sources").storage_db_catalog_index_manager;
     _ = @import("antfly_local_sources").storage_db_catalog_resolver_catalog;
     _ = @import("antfly_local_sources").storage_db_column_read_cache;
+    _ = @import("antfly_local_sources").storage_db_column_source;
     _ = @import("antfly_local_sources").storage_db_column_scan_plan;
     _ = @import("antfly_local_sources").storage_db_config;
     _ = @import("antfly_local_sources").storage_db_db;
@@ -342,6 +343,7 @@ comptime {
     _ = @import("antfly_local_sources").storage_lite_connection;
     _ = @import("antfly_local_sources").storage_lite_docstore;
     _ = @import("antfly_local_sources").storage_lite_index_storage;
+    _ = @import("antfly_local_sources").storage_lite_artifact_source;
     _ = @import("antfly_local_sources").storage_lite_mod;
     _ = @import("antfly_local_sources").storage_lite_native;
     _ = @import("antfly_local_sources").storage_lite_paths;

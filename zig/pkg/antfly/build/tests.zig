@@ -6345,6 +6345,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
             "storage.db.column_read_cache.",
             "storage.db.column_scan_plan.",
+            "storage.db.column_source.",
             "storage.db.db.",
             "storage.db.dense_exact.",
             "storage.db.doc_filter_wire.",
