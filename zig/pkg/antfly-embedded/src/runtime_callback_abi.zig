@@ -25,6 +25,30 @@ const std = @import("std");
 const error_abi = @import("antfly_runtime_abi").error_abi;
 const native_abi = @import("antfly_runtime_abi").native_abi;
 
+test "boundary dispatcher preserves graph metric readiness across runtime units" {
+    const VTable = struct {
+        query: *const fn (*const anyerror) anyerror!u64,
+    };
+    const TestBoundary = Boundary(VTable);
+    const Callbacks = struct {
+        fn query(err: *const anyerror) anyerror!u64 {
+            return err.*;
+        }
+
+        fn foreignDispatch(
+            contract: *const native_abi.CallContract,
+            callback: *const anyopaque,
+            args: *const anyopaque,
+            output: ?*anyopaque,
+        ) callconv(.c) error_abi.Status {
+            return TestBoundary.local_dispatch(contract, callback, args, output);
+        }
+    };
+    for ([_]anyerror{ error.MetricNotReady, error.MetricStale }) |err| {
+        try std.testing.expectError(err, TestBoundary.call("query", &Callbacks.foreignDispatch, &Callbacks.query, .{&err}));
+    }
+}
+
 pub const CallbackDispatch = *const fn (
     contract: *const native_abi.CallContract,
     callback: *const anyopaque,
