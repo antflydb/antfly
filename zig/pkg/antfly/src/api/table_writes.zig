@@ -54389,13 +54389,17 @@ fn implementationTests() type {
             // forever after restart.
             // Admission is nonblocking and native publication may still hold the
             // apply lock. Wait for the exact owner observation, rather than requiring
-            // the first opportunistic sample to win a scheduling race.
+            // the first opportunistic sample to win a scheduling race. Observing
+            // the target alone does not prove that asynchronous replay converged.
             const observation_deadline_ns = platform_time.monotonicNs() + 15 * std.time.ns_per_s;
             while (platform_time.monotonicNs() < observation_deadline_ns) {
                 _ = source.overlayCachedManagedRuntimeStatusBestEffort("docs", 7001, cached.db);
                 var observed = (try source.source().localRuntimeStatuses(alloc, "docs")).?;
+                const index_status = observed.items[0].stats.indexes[0];
                 const complete = observed.items[0].metadata.target_observation_complete and
-                    observed.items[0].stats.indexes[0].replay_target_sequence == 2;
+                    index_status.replay_target_sequence == 2 and
+                    index_status.replay_applied_sequence == 2 and
+                    !index_status.replay_catch_up_required;
                 observed.deinit(alloc);
                 if (complete) break;
                 try std.testing.io.sleep(.fromMilliseconds(1), .awake);
