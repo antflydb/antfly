@@ -23,16 +23,15 @@ credentials (Workload Identity in GKE); no service-account keys are required.
 
 import argparse
 from contextlib import contextmanager
-from datetime import datetime, timezone
 import fcntl
 import json
 from pathlib import Path
-import sqlite3
 import time
 from urllib.parse import unquote, urlsplit
 from urllib.request import urlopen
 
-from normalize import plain
+from lite_state import State
+from lite_catalog import HackernewsCatalog
 
 
 @contextmanager
@@ -41,234 +40,6 @@ def writer_lock(state):
     with (state / "writer.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         yield
-
-
-class State:
-    def __init__(self, path):
-        self.db = sqlite3.connect(path)
-        self.db.execute("PRAGMA journal_mode=WAL")
-        self.db.execute("PRAGMA synchronous=FULL")
-        self.db.executescript("""
-            CREATE TABLE IF NOT EXISTS items (
-                id INTEGER PRIMARY KEY, parent INTEGER, root INTEGER,
-                month TEXT NOT NULL, payload TEXT NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS items_parent ON items(parent);
-            CREATE INDEX IF NOT EXISTS items_month ON items(month);
-            CREATE INDEX IF NOT EXISTS items_root ON items(root);
-            CREATE TABLE IF NOT EXISTS dirty (month TEXT PRIMARY KEY);
-            CREATE TABLE IF NOT EXISTS checkpoints (key TEXT PRIMARY KEY, value TEXT);
-            CREATE TABLE IF NOT EXISTS pending (
-                id INTEGER PRIMARY KEY, retry_at REAL NOT NULL DEFAULT 0
-            );
-        """)
-
-    def get(self, key, default="0"):
-        row = self.db.execute(
-            "SELECT value FROM checkpoints WHERE key=?", (key,)
-        ).fetchone()
-        return row[0] if row else default
-
-    def set(self, key, value):
-        self.db.execute(
-            "INSERT OR REPLACE INTO checkpoints VALUES (?, ?)", (key, str(value))
-        )
-
-    def put(self, item):
-        item = dict(item)
-        if "type" in item or "item_type" in item:
-            # Complete API/export records also clear moderation flags when a
-            # previously dead/deleted item becomes live again.
-            item.setdefault("dead", False)
-            item.setdefault("deleted", False)
-        item_id = int(item.get("id", item.get("hn_id")))
-        old = self.db.execute(
-            "SELECT payload, month, parent FROM items WHERE id=?", (item_id,)
-        ).fetchone()
-        # Firebase deletions may only contain id/deleted. Retain partition and
-        # ancestry, but remove the row from the next published live snapshot.
-        if old:
-            prior = json.loads(old[0])
-            prior.update(item)
-            item = prior
-        item["id"] = item_id
-        created = int(item.get("time", item.get("created_at", 0)) or 0)
-        month = datetime.fromtimestamp(created, timezone.utc).strftime("%Y-%m")
-        parent = int(item.get("parent", item.get("parent_id", 0)) or 0)
-        kind = item.get("type", item.get("item_type"))
-        root = item_id if kind in ("story", "job", "poll") else None
-        payload = json.dumps(item, sort_keys=True, separators=(",", ":"))
-        if old and old[0] == payload:
-            return
-        if old and old[2] != parent:
-            # Parent reassignment is unusual; invalidate descendants rather
-            # than retaining an incorrect story root.
-            self.db.execute("UPDATE items SET root=NULL WHERE parent<>0")
-            self.db.execute(
-                "INSERT OR IGNORE INTO dirty SELECT DISTINCT month FROM items"
-            )
-        self.db.execute(
-            "INSERT OR REPLACE INTO items VALUES (?, ?, ?, ?, ?)",
-            (item_id, parent, root, month, payload),
-        )
-        for value in {month, old[1] if old else month}:
-            self.db.execute("INSERT OR IGNORE INTO dirty VALUES (?)", (value,))
-
-    def resolve_roots(self):
-        # Disk indexes and SQL joins avoid loading the ancestry graph into RAM.
-        # Cycles/missing ancestors remain NULL rather than inventing a root.
-        while True:
-            self.db.execute("""INSERT OR IGNORE INTO dirty SELECT DISTINCT child.month
-                FROM items child JOIN items parent ON child.parent=parent.id
-                WHERE child.root IS NULL AND parent.root IS NOT NULL""")
-            changed = self.db.execute("""UPDATE items SET root=(
-                SELECT parent.root FROM items parent WHERE parent.id=items.parent
-            ) WHERE root IS NULL AND EXISTS (
-                SELECT 1 FROM items parent WHERE parent.id=items.parent AND parent.root IS NOT NULL
-            )""").rowcount
-            if not changed:
-                break
-
-    def missing_parents(self, limit):
-        return [
-            row[0]
-            for row in self.db.execute(
-                """SELECT DISTINCT child.parent
-            FROM items child LEFT JOIN items parent ON parent.id=child.parent
-            WHERE child.root IS NULL AND child.parent>0 AND parent.id IS NULL LIMIT ?""",
-                (limit,),
-            )
-        ]
-
-    def queue(self, ids):
-        self.db.executemany(
-            "INSERT OR IGNORE INTO pending(id) VALUES (?)", ((int(i),) for i in ids)
-        )
-
-    def poll(self, fetch, batch_size=1000, parent_limit=1000):
-        if not self.get("maxitem", ""):
-            raise RuntimeError("backfill first to establish the new-item watermark")
-        newest = int(fetch("maxitem"))
-        updates = fetch("updates").get("items", [])
-        with self.db:
-            # Persist work before advancing cursors. Null/error responses stay
-            # in the retry queue even after the new-ID cursor passes them.
-            cursor = int(self.get("maxitem"))
-            stop = min(newest, cursor + batch_size)
-            self.queue(range(cursor + 1, stop + 1))
-            self.set("maxitem", stop)
-            self.queue(updates)
-            sweep = int(self.get("sweep"))
-            ids = [
-                r[0]
-                for r in self.db.execute(
-                    "SELECT id FROM items WHERE id>? ORDER BY id LIMIT ?",
-                    (sweep, batch_size),
-                )
-            ]
-            self.queue(ids)
-            self.set("sweep", ids[-1] if ids else 0)
-            self.queue(self.missing_parents(parent_limit))
-        done = 0
-        todo = self.db.execute(
-            "SELECT id FROM pending WHERE retry_at<=? ORDER BY retry_at,id LIMIT ?",
-            (time.time(), batch_size),
-        ).fetchall()
-        for (item_id,) in todo:
-            try:
-                item = fetch(f"item/{item_id}")
-                if item is None or int(item.get("id", -1)) != item_id:
-                    raise ValueError("item unavailable or mismatched ID")
-            except (OSError, ValueError):
-                with self.db:
-                    self.db.execute(
-                        "UPDATE pending SET retry_at=? WHERE id=?",
-                        (time.time() + 60, item_id),
-                    )
-                continue
-            with self.db:
-                self.put(item)
-                self.db.execute("DELETE FROM pending WHERE id=?", (item_id,))
-            done += 1
-        with self.db:
-            self.resolve_roots()
-        return done
-
-    def backfill(self, filenames, batch_size=4096):
-        import pyarrow.parquet as pq
-
-        for filename in filenames:
-            # Content-addressed source identity survives renames/replays; no
-            # mutable offset into a rewritten input file can skip rows.
-            import hashlib
-
-            digest = hashlib.sha256()
-            with Path(filename).open("rb") as source:
-                for chunk in iter(lambda: source.read(1024 * 1024), b""):
-                    digest.update(chunk)
-            key = "backfill:" + digest.hexdigest()
-            completed = int(self.get(key))
-            offset = 0
-            for batch in pq.ParquetFile(filename).iter_batches(batch_size=batch_size):
-                rows = batch.to_pylist()
-                end = offset + len(rows)
-                if end > completed:
-                    with self.db:
-                        for item in rows[max(0, completed - offset) :]:
-                            self.put(item)
-                        self.set(key, end)
-                offset = end
-        with self.db:
-            self.resolve_roots()
-            maximum = self.db.execute(
-                "SELECT COALESCE(MAX(id),0) FROM items"
-            ).fetchone()[0]
-            self.set("maxitem", max(int(self.get("maxitem")), maximum))
-
-    def batches(self, months, schema, batch_size=4096):
-        import pyarrow as pa
-
-        placeholders = ",".join("?" for _ in months)
-        cursor = self.db.execute(
-            f"SELECT payload,root,month FROM items WHERE month IN ({placeholders}) ORDER BY month,id",
-            months,
-        )
-        while rows := cursor.fetchmany(batch_size):
-            records = []
-            for payload, root, month in rows:
-                row = json.loads(payload)
-                kind = row.get("type", row.get("item_type"))
-                if (
-                    row.get("deleted")
-                    or row.get("dead")
-                    or kind not in ("story", "comment")
-                ):
-                    continue
-                title = plain(row.get("title", ""))
-                text = row.get("text", row.get("text_html", "")) or ""
-                url = row.get("url", "") or ""
-                records.append(
-                    dict(
-                        hn_id=row["id"],
-                        title=title,
-                        url=url,
-                        text_html=text,
-                        body="\n".join(filter(None, (title, plain(text)))),
-                        author=row.get("by", row.get("author", "")) or "",
-                        points=int(row.get("score", row.get("points", 0)) or 0),
-                        created_at=int(row.get("time", row.get("created_at", 0)) or 0),
-                        item_type=kind,
-                        parent_id=int(row.get("parent", row.get("parent_id", 0)) or 0),
-                        comment_count=int(
-                            row.get("descendants", row.get("comment_count", 0)) or 0
-                        ),
-                        domain=urlsplit(url).hostname or "",
-                        root_story_id=root,
-                        created_month=month,
-                    )
-                )
-            if records:
-                yield pa.RecordBatch.from_pylist(records, schema=schema)
 
 
 def arrow_schema():
@@ -392,13 +163,10 @@ def publish(state, directory, warehouse, project=None):
     import pyarrow as pa
     import pyarrow.parquet as pq
     import uuid
-    from pyiceberg.catalog.sql import SqlCatalog
     from pyiceberg.expressions import In
     from pyiceberg.io.pyarrow import schema_to_pyarrow
 
-    catalog = SqlCatalog(
-        "hn", uri=f"sqlite:///{directory / 'catalog.sqlite'}", warehouse=warehouse
-    )
+    catalog = HackernewsCatalog(state, warehouse)
     catalog.create_namespace_if_not_exists("hackernews")
     schema = arrow_schema()
     table = catalog.create_table_if_not_exists(
@@ -418,9 +186,7 @@ def publish(state, directory, warehouse, project=None):
             raise RuntimeError("pending publication belongs to a different warehouse")
         months = journal["months"]
     else:
-        months = [
-            r[0] for r in state.db.execute("SELECT month FROM dirty ORDER BY month")
-        ]
+        months = state.dirty_months()
         if not months:
             return None
         _, generation = publisher.read("metadata/version-hint.text")
@@ -457,13 +223,14 @@ def publish(state, directory, warehouse, project=None):
         }
         # Persist publication intent BEFORE creating the immutable alias. This
         # makes failed/lost pointer writes replayable without metadata collisions.
-        with state.db:
+        with state.transaction():
             state.set("publication", json.dumps(journal))
     with table.io.new_input(journal["metadata_uri"]).open() as source:
         metadata = source.read()
     version = publisher.commit(metadata, journal["expected"])
-    with state.db:
-        state.db.executemany("DELETE FROM dirty WHERE month=?", ((m,) for m in months))
+    with state.transaction():
+        for month in months:
+            state.db.delete("dirty:" + month)
         state.set("published_version", version)
         state.set("publication", "")
     return {
@@ -476,7 +243,7 @@ def publish(state, directory, warehouse, project=None):
 
 
 def backup_state(state, directory, backup_root, warehouse, project=None):
-    """Stream consistent SQLite backups, then CAS a manifest; no credentials."""
+    """Upload one stable Lite snapshot, then CAS a manifest; no credentials."""
     import hashlib
     import shutil
     import tempfile
@@ -496,19 +263,9 @@ def backup_state(state, directory, backup_root, warehouse, project=None):
         "files": {},
     }
     with tempfile.TemporaryDirectory(dir=directory, prefix="backup-") as temporary:
-        for name in ("items.sqlite", "catalog.sqlite"):
+        for name in ("ingestion.aflite",):
             path = Path(temporary) / name
-            connection = (
-                state.db
-                if name == "items.sqlite"
-                else sqlite3.connect(directory / name)
-            )
-            try:
-                with sqlite3.connect(path) as target:
-                    connection.backup(target)
-            finally:
-                if connection is not state.db:
-                    connection.close()
+            state.db.native.copy_stable_snapshot(str(path))
             digest = hashlib.sha256()
             with path.open("rb") as source:
                 for chunk in iter(lambda: source.read(1024 * 1024), b""):
@@ -539,7 +296,7 @@ def restore_state(directory, backup_root, warehouse, project=None):
     import shutil
     import tempfile
 
-    if any((directory / name).exists() for name in ("items.sqlite", "catalog.sqlite")):
+    if any((directory / name).exists() for name in ("ingestion.aflite",)):
         raise RuntimeError("restore requires an empty state directory")
     store = Publisher(backup_root, project)
     body, _ = store.read("latest.json")
@@ -548,13 +305,17 @@ def restore_state(directory, backup_root, warehouse, project=None):
     manifest = json.loads(body)
     if manifest["warehouse"] != warehouse:
         raise RuntimeError("checkpoint warehouse mismatch")
-    pointer, _ = Publisher(warehouse, project).read("metadata/version-hint.text")
-    if (pointer or b"").decode() != manifest["source_pointer"]:
+    pointer, pointer_generation = Publisher(warehouse, project).read(
+        "metadata/version-hint.text"
+    )
+    if (pointer or b"").decode() != manifest[
+        "source_pointer"
+    ] or pointer_generation != manifest["source_generation"]:
         raise RuntimeError(
             "archive advanced after this checkpoint; reconcile before restoring"
         )
     with tempfile.TemporaryDirectory(dir=directory, prefix="restore-") as temporary:
-        for name in ("items.sqlite", "catalog.sqlite"):
+        for name in ("ingestion.aflite",):
             entry = manifest["files"][name]
             if entry["key"] != f"checkpoints/{manifest['checkpoint']}/{name}":
                 raise RuntimeError("invalid checkpoint object path")
@@ -574,10 +335,11 @@ def restore_state(directory, backup_root, warehouse, project=None):
                 or digest.hexdigest() != entry["sha256"]
             ):
                 raise RuntimeError("checkpoint checksum mismatch")
-            with sqlite3.connect(path) as database:
-                if database.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
-                    raise RuntimeError("invalid SQLite checkpoint")
-        for name in ("items.sqlite", "catalog.sqlite"):
+            import antfly_embedded
+
+            if not antfly_embedded.check_file(path)["valid"]:
+                raise RuntimeError("invalid Lite checkpoint")
+        for name in ("ingestion.aflite",):
             os.replace(Path(temporary) / name, directory / name)
     return manifest
 
@@ -636,7 +398,7 @@ def main():
                 )
             )
             return
-        state = State(args.state / "items.sqlite")
+        state = State(args.state / "ingestion.aflite")
         try:
             if state.get("publication", ""):
                 publish(state, args.state, args.warehouse, args.project)
@@ -654,9 +416,15 @@ def main():
                 )
                 return
             if args.command == "run":
+                next_publication = 0.0
                 while True:
                     done = state.poll(firebase, args.batch_size)
-                    result = publish(state, args.state, args.warehouse, args.project)
+                    result = None
+                    if time.monotonic() >= next_publication:
+                        result = publish(
+                            state, args.state, args.warehouse, args.project
+                        )
+                        next_publication = time.monotonic() + args.publish_interval
                     print(
                         json.dumps({"fetched": done, "publication": result}), flush=True
                     )

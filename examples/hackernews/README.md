@@ -257,8 +257,18 @@ budget does not change the existing 15-second unordered-filter regression budget
 
 ## Durable historical ingestion
 
-Use a dedicated Iceberg warehouse and a persistent state volume. The ingestor
-uses SQLite WAL with full synchronous commits, streams Parquet input batches,
+Antfly serves search from GCS Parquet/Iceberg data and its own indexes. The
+Python example ingestor uses Antfly Lite: one `ingestion.aflite` file holds the
+item map, retry queues, ancestry key ranges, progress checkpoints, and PyIceberg
+writer catalog. The embedded `antfly-embedded` Python binding drives native synced
+batches and bounded key scans. There is no SQLite database or SQL catalog.
+The Lite writer runs outside the public search request path and needs a
+persistent volume plus stable-snapshot backups.
+
+Build `zig build capi` and set `ANTFLY_LIBRARY` to the built shared library
+when running from this source checkout. Published embedded platform wheels bundle
+the library. Use a dedicated Iceberg warehouse and a persistent state volume. The ingestor
+uses synced atomic Lite batches, streams Parquet input batches,
 deduplicates by HN ID, checkpoints source content hashes and offsets, and retains
 retry work before advancing its API cursor. Export full records (including
 `dead` and `deleted`) for a durable backfill; the qualification SQL intentionally
@@ -288,7 +298,10 @@ failed/lost pointer writes. Attach Antfly to the **warehouse directory**, with
 `format: iceberg`, to follow commits; an explicit metadata-file attachment pins
 that one metadata file. Existing native index reconciliation detects a changed
 snapshot and publishes matching sidecars; queries cannot reuse a mismatched
-publication. Files are immutable, but the warehouse's commit pointer changes.
+publication. Declare `object_mutability: immutable` for this writer's data objects: each
+Parquet file has a new immutable URI, so Antfly can reuse authenticated data-file
+version proofs while it still reads the fresh Iceberg commit pointer. The pointer
+changes; existing data files do not.
 
 Archive publication defaults to hourly, separately from one-minute API polling.
 This initial implementation replaces changed months and retains old snapshot
@@ -297,7 +310,7 @@ historical tier; a high-frequency whole-archive service needs file-level upserts
 compaction and a reviewed retention policy. Recent native-table ingestion and
 the public UI remain separate work. No automatic snapshot deletion is included.
 
-The SQLite item map **and** catalog must share a persistent state volume owned by
+The single Lite state file must live on a persistent volume owned by
 one writer. Take a streamed, consistent off-volume checkpoint after publication:
 
 ```sh
@@ -307,7 +320,7 @@ uv run --project examples/hackernews python examples/hackernews/ingest.py \
 ```
 
 `restore` uses the same arguments and requires an empty state directory. It
-checks file digests/SQLite integrity and refuses an older checkpoint if the
+checks file digests/Lite integrity and refuses an older checkpoint if the
 archive has advanced: reconcile the current catalog and source state before
 recovery in that case. Backups are explicit, not automatically scheduled.
 Native serving requires Parquet Iceberg field IDs; the writer emits those IDs

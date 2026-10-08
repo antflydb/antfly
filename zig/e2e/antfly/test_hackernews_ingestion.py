@@ -21,7 +21,6 @@ pytestmark = [pytest.mark.iceberg_integration, pytest.mark.fresh_antfly_process]
 
 
 def test_hackernews_streaming_snapshots_roots_deletions_and_restart(tmp_path):
-    from pyiceberg.catalog.sql import SqlCatalog
 
     sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "examples/hackernews"))
     try:
@@ -31,8 +30,8 @@ def test_hackernews_streaming_snapshots_roots_deletions_and_restart(tmp_path):
     directory = tmp_path / "state"
     directory.mkdir()
     warehouse = (tmp_path / "warehouse").as_uri()
-    state = ingest.State(directory / "items.sqlite")
-    with state.db:
+    state = ingest.State(directory / "ingestion.aflite")
+    with state.transaction():
         state.put(
             {"id": 1, "type": "story", "time": 1704067200, "title": "database story"}
         )
@@ -45,11 +44,9 @@ def test_hackernews_streaming_snapshots_roots_deletions_and_restart(tmp_path):
                 "text": "database comment",
             }
         )
-        state.resolve_roots()
+    state.resolve_roots()
     ingest.publish(state, directory, warehouse)
-    catalog = SqlCatalog(
-        "hn", uri=f"sqlite:///{directory / 'catalog.sqlite'}", warehouse=warehouse
-    )
+    catalog = ingest.HackernewsCatalog(state, warehouse)
     source = tmp_path / "objects"
     _export_table(catalog.load_table("hackernews.items"), source)
     binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
@@ -67,7 +64,17 @@ def test_hackernews_streaming_snapshots_roots_deletions_and_restart(tmp_path):
             )
 
         def call(method, path, body=None):
-            response = request(method, path, body)
+            deadline = time.monotonic() + 30
+            while True:
+                response = request(method, path, body)
+                if not (
+                    response.status_code == 409
+                    and response.json().get("error")
+                    == "catalog changed during query binding"
+                ):
+                    break
+                assert time.monotonic() < deadline, response.text + server.debug_logs()
+                time.sleep(0.1)
             assert response.ok, response.text + server.debug_logs()
             value = response.json()
             return value["responses"][0] if "responses" in value else value
@@ -83,6 +90,7 @@ def test_hackernews_streaming_snapshots_roots_deletions_and_restart(tmp_path):
                         "kind": "external",
                         "table_id": "hn",
                         "format": "iceberg",
+                        "object_mutability": "immutable",
                         "uri": source.as_uri(),
                     },
                 },
@@ -111,7 +119,7 @@ def test_hackernews_streaming_snapshots_roots_deletions_and_restart(tmp_path):
             )
 
         assert rows(call("POST", "/tables/hn/query", query)) == [(1, 1), (2, 1)]
-        with state.db:
+        with state.transaction():
             state.put({"id": 2, "deleted": True})
             state.put(
                 {
@@ -122,7 +130,7 @@ def test_hackernews_streaming_snapshots_roots_deletions_and_restart(tmp_path):
                     "text": "database replacement",
                 }
             )
-            state.resolve_roots()
+        state.resolve_roots()
         ingest.publish(state, directory, warehouse)
         _export_table(catalog.load_table("hackernews.items"), source)
         count = call(
