@@ -47,6 +47,8 @@ pub const BootstrapConfig = struct {
     pub const S3Options = object_store_support.S3Options;
     pub const GcsOptions = object_store_support.GcsOptions;
 
+    /// Borrowed capability-authorized client for tables hosted by a native process.
+    native_location: ?struct { client: objectstore.Client, bucket: []const u8, prefix: []const u8 } = null,
     artifacts_uri: []const u8,
     manifests_uri: []const u8,
     wal_uri: []const u8,
@@ -426,7 +428,11 @@ pub const OwnedStack = struct {
         defer if (artifacts_target) |*target| target.deinit(alloc);
         var artifacts_gcs_target = try gcsTargetAlloc(alloc, cfg.artifacts_uri);
         defer if (artifacts_gcs_target) |*target| target.deinit(alloc);
-        self.artifacts_impl = if (artifacts_target) |target| blk: {
+        self.artifacts_impl = if (cfg.native_location) |location| blk: {
+            const prefix = try std.fmt.allocPrint(alloc, "{s}/artifacts", .{location.prefix});
+            defer alloc.free(prefix);
+            break :blk try artifacts_object_store.ObjectStore.initWithClient(alloc, location.client, location.bucket, prefix);
+        } else if (artifacts_target) |target| blk: {
             const client = try self.s3_client_pool.getOrCreate(cfg.s3_options[0]);
             try ensureConfiguredBucket(client, target.bucket, shouldCreateBucket(cfg.s3_options[0]));
             break :blk try artifacts_object_store.ObjectStore.initWithClient(alloc, client, target.bucket, target.prefix);
@@ -442,7 +448,11 @@ pub const OwnedStack = struct {
         defer if (manifests_target) |*target| target.deinit(alloc);
         var manifests_gcs_target = try gcsTargetAlloc(alloc, cfg.manifests_uri);
         defer if (manifests_gcs_target) |*target| target.deinit(alloc);
-        self.manifests_impl = if (manifests_target) |target| blk: {
+        self.manifests_impl = if (cfg.native_location) |location| blk: {
+            const prefix = try std.fmt.allocPrint(alloc, "{s}/manifests", .{location.prefix});
+            defer alloc.free(prefix);
+            break :blk try manifest_object_store.ObjectStore.initWithClient(alloc, location.client, location.bucket, prefix);
+        } else if (manifests_target) |target| blk: {
             const client = try self.s3_client_pool.getOrCreate(cfg.s3_options[1]);
             try ensureConfiguredBucket(client, target.bucket, shouldCreateBucket(cfg.s3_options[1]));
             break :blk try manifest_object_store.ObjectStore.initWithClient(alloc, client, target.bucket, target.prefix);
@@ -459,7 +469,11 @@ pub const OwnedStack = struct {
         defer if (wal_target) |*target| target.deinit(alloc);
         var wal_gcs_target = try gcsTargetAlloc(alloc, cfg.wal_uri);
         defer if (wal_gcs_target) |*target| target.deinit(alloc);
-        self.wal_impl = if (wal_target) |target| blk: {
+        self.wal_impl = if (cfg.native_location) |location| blk: {
+            const prefix = try std.fmt.allocPrint(alloc, "{s}/wal", .{location.prefix});
+            defer alloc.free(prefix);
+            break :blk try wal_object_store.ObjectStore.initWithClient(alloc, location.client, location.bucket, prefix);
+        } else if (wal_target) |target| blk: {
             const client = try self.s3_client_pool.getOrCreate(cfg.s3_options[2]);
             try ensureConfiguredBucket(client, target.bucket, shouldCreateBucket(cfg.s3_options[2]));
             break :blk try wal_object_store.ObjectStore.initWithClient(alloc, client, target.bucket, target.prefix);
@@ -475,7 +489,11 @@ pub const OwnedStack = struct {
         defer if (progress_target) |*target| target.deinit(alloc);
         var progress_gcs_target = try gcsTargetAlloc(alloc, cfg.progress_uri);
         defer if (progress_gcs_target) |*target| target.deinit(alloc);
-        self.progress_impl = if (progress_target) |target| blk: {
+        self.progress_impl = if (cfg.native_location) |location| blk: {
+            const prefix = try std.fmt.allocPrint(alloc, "{s}/progress", .{location.prefix});
+            defer alloc.free(prefix);
+            break :blk try progress_object_store.ObjectProgressStore.initWithClient(alloc, location.client, location.bucket, prefix);
+        } else if (progress_target) |target| blk: {
             const client = try self.s3_client_pool.getOrCreate(cfg.s3_options[3]);
             try ensureConfiguredBucket(client, target.bucket, shouldCreateBucket(cfg.s3_options[3]));
             break :blk try progress_object_store.ObjectProgressStore.initWithClient(alloc, client, target.bucket, target.prefix);
@@ -498,7 +516,11 @@ pub const OwnedStack = struct {
         defer if (catalog_target) |*target| target.deinit(alloc);
         var catalog_gcs_target = try gcsTargetAlloc(alloc, cfg.catalog_uri);
         defer if (catalog_gcs_target) |*target| target.deinit(alloc);
-        self.catalog_impl = if (catalog_target) |target| blk: {
+        self.catalog_impl = if (cfg.native_location) |location| blk: {
+            const prefix = try std.fmt.allocPrint(alloc, "{s}/catalog", .{location.prefix});
+            defer alloc.free(prefix);
+            break :blk try catalog_object_store.ObjectStore.initWithClient(alloc, location.client, location.bucket, prefix);
+        } else if (catalog_target) |target| blk: {
             const client = try self.s3_client_pool.getOrCreate(cfg.s3_options[4]);
             try ensureConfiguredBucket(client, target.bucket, shouldCreateBucket(cfg.s3_options[4]));
             break :blk try catalog_object_store.ObjectStore.initWithClient(alloc, client, target.bucket, target.prefix);
@@ -716,6 +738,7 @@ pub fn validateConfig(alloc: Allocator, cfg: BootstrapConfig) !void {
         if (cfg.query_cache_payload_max_bytes > cfg.query_cache_max_bytes) return error.QueryCachePayloadExceedsBudget;
     }
 
+    if (cfg.native_location != null) return;
     for ([_][]const u8{
         cfg.artifacts_uri,
         cfg.manifests_uri,

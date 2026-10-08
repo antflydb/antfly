@@ -1076,6 +1076,7 @@ const LocalStandaloneMetadata = struct {
                 .status = status,
                 .system_catalog = systemCatalog,
                 .supports_query_definitions = true,
+                .supports_object_tables = true,
                 .acquire_join_planning = acquireJoinPlanning,
                 .admin_snapshot = catalogAdminSnapshot,
                 .cached_admin_snapshot = cachedAdminSnapshot,
@@ -2848,7 +2849,7 @@ const LocalStandaloneMetadata = struct {
                     const namespace = try state.namespaceFor(command.database, command.namespace);
                     const explicit = if (command.tablespace) |n| (state.find(.tablespace, 0, n) orelse return error.TablespaceNotFound).id else 0;
                     const policy = if (try state.effectiveTablespace(namespace, explicit)) |space| space.placement_policy else system_catalog.PlacementPolicy{};
-                    if (req.num_shards == null) req.num_shards = policy.min_ranges;
+                    if ((req.storage orelse antfly.common.table_storage.Settings{}).engine == .local and req.num_shards == null) req.num_shards = policy.min_ranges;
                     table = try self.deriveCreatedTableRecord(name, req);
                     if (policy.placement_role) |role| table.?.placement_role = role;
                     // Standalone owns one local replica; policy metadata remains
@@ -2887,8 +2888,8 @@ const LocalStandaloneMetadata = struct {
                     const namespace = try state.namespaceFor(command.database, command.namespace);
                     const policy = if (try state.effectiveTablespace(namespace, delta.upserts[0].tablespace_id)) |space| space.placement_policy else system_catalog.PlacementPolicy{};
                     current.placement_role = policy.placement_role orelse "data";
-                    current.min_ranges = policy.min_ranges orelse 1;
-                    if (self.storage_engine == .lite and current.min_ranges != 1) return error.InvalidCreateTableRequest;
+                    current.min_ranges = if (current.storage.engine == .object) 0 else policy.min_ranges orelse 1;
+                    if (self.storage_engine == .lite and current.storage.engine == .local and current.min_ranges != 1) return error.InvalidCreateTableRequest;
                     try mutation.upsertTable(self, current);
                 }
                 try mutation.applyCatalog(self, delta);
@@ -2912,12 +2913,19 @@ const LocalStandaloneMetadata = struct {
                 if (!std.mem.eql(u8, sources, "[]")) return error.HACatalogReplicationSourcesUnsupported;
             }
         }
-        const replicated = !self.vector_source_storage_allowed or
+        const replicated = (!self.vector_source_storage_allowed and (req.storage orelse antfly.common.table_storage.Settings{}).engine == .local) or
             (if (req.replication_sources_json) |sources| !std.mem.eql(u8, sources, "[]") else false);
+        try (req.storage orelse antfly.common.table_storage.Settings{}).validateCreate(req.num_shards, replicated);
+        try antfly.public_api.tables.validateObjectCreateDefinition(self.alloc, req);
         var resolved_req = req;
         resolved_req.storage = try antfly.common.table_storage.Settings.resolveStandaloneCreate(req.storage, req.num_shards orelse 1, replicated, self.storage_engine != .local);
         var table = try deriveStandaloneTableRecord(self.storage_engine, table_name, resolved_req);
-        if (self.lifecycle_store) |store| table.table_id = try store.resolveTableCreateIdentity(group_ids.main_metadata_group_id, table.table_id);
+        if (self.lifecycle_store) |store| {
+            table.table_id = try store.resolveTableCreateIdentity(group_ids.main_metadata_group_id, table.table_id);
+        }
+        // Range-less standalone mutations do not advance data topology fences.
+        // The epoch commits with the table row and survives catalog reopen.
+        if (table.storage.engine == .object) table.object_storage_generation = std.math.add(u64, self.epoch, 1) catch return error.ObjectTableGenerationExhausted;
         return table;
     }
 
@@ -2969,7 +2977,7 @@ const LocalStandaloneMetadata = struct {
         var parsed = try std.json.parseFromSlice(CatalogCreate, self.alloc, record.payload, .{ .allocate = .alloc_always });
         defer parsed.deinit();
         const value = parsed.value;
-        if ((value.schema_version != 3 and value.schema_version != 4) or value.ranges.len == 0 or
+        if ((value.schema_version != 3 and value.schema_version != 4) or (value.ranges.len == 0 and value.table.storage.engine != .object) or
             (value.schema_version == 3 and value.binding != null)) return error.InvalidHACatalogRecord;
         if (value.binding) |binding| {
             if (binding.delta.removes.len != 0 or binding.delta.upserts.len != 1) return error.InvalidHACatalogRecord;
@@ -3188,7 +3196,7 @@ const LocalStandaloneMetadata = struct {
             alloc.free(ranges);
         }
         if (self.storage_engine == .lite and ranges.len != 1) return error.InvalidBackupRequest;
-        table.desired_replica_count = 1;
+        table.desired_replica_count = if (table.storage.engine == .object) 0 else 1;
 
         var locked = try self.lockMutation();
         defer locked.deinit();
@@ -4398,6 +4406,7 @@ fn deriveStandaloneTableRecord(
 ) !antfly.metadata.TableRecord {
     var resolved_req = req;
     const replicated = if (req.replication_sources_json) |sources| !std.mem.eql(u8, sources, "[]") else false;
+    try (req.storage orelse antfly.common.table_storage.Settings{}).validateCreate(req.num_shards, replicated);
     resolved_req.storage = try antfly.common.table_storage.Settings.resolveStandaloneCreate(req.storage, req.num_shards orelse 1, replicated, storage_engine != .local);
     if (storage_engine == .lite and (req.num_shards orelse 1) != 1) {
         return error.InvalidCreateTableRequest;
@@ -4405,7 +4414,7 @@ fn deriveStandaloneTableRecord(
     var table = antfly.public_api.tables.deriveTableRecord(table_name, resolved_req);
     // A standalone process owns the only replica regardless of whether its
     // local persistence is directory-backed or Lite single-file storage.
-    table.desired_replica_count = 1;
+    table.desired_replica_count = if (table.storage.engine == .object) 0 else 1;
     return table;
 }
 
@@ -14637,4 +14646,40 @@ test "system catalog offline migration publishes rows and fences server startup"
     defer reopened.deinit();
     try std.testing.expectEqual(.vector_store, reopened.findTableByNameLocked("docs").?.storage.dense_embeddings);
     try std.testing.expect(reopened.system_catalog_state.?.index.find(.database, 0, "preserved") != null);
+}
+
+test "standalone table storage defaults persist for object tables across reopen and recreate" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/catalog.json", .{tmp.sub_path});
+    defer a.free(path);
+    var backend = try antfly.db.background_runtime.BackendRuntimeHandle.init(a, .{});
+    defer backend.deinit();
+    var previous_generation: u64 = 0;
+    var previous_table_id: u64 = 0;
+    {
+        var metadata = try LocalStandaloneMetadata.init(a, 1, 1, "http://127.0.0.1:8080", ".", path, backend.ptr(), null, .local);
+        defer metadata.deinit();
+        try LocalStandaloneMetadata.createTable(&metadata, a, "objects", .{ .storage = .{ .engine = .object } });
+        const table = metadata.manager.findTableByName("objects").?;
+        try std.testing.expectEqual(@as(u32, 0), table.min_ranges);
+        try std.testing.expectEqual(@as(u16, 0), table.desired_replica_count);
+        try std.testing.expectEqual(@as(usize, 0), metadata.manager.ranges.count());
+        previous_generation = table.object_storage_generation;
+        previous_table_id = table.table_id;
+        try std.testing.expectError(error.ObjectTablePlacementUnsupported, LocalStandaloneMetadata.createTable(&metadata, a, "invalid", .{ .storage = .{ .engine = .object }, .num_shards = 1 }));
+    }
+    {
+        var metadata = try LocalStandaloneMetadata.init(a, 1, 1, "http://127.0.0.1:8080", ".", path, backend.ptr(), null, .local);
+        defer metadata.deinit();
+        try std.testing.expectEqual(.object, metadata.manager.findTableByName("objects").?.storage.engine);
+        try std.testing.expectEqual(previous_generation, metadata.manager.findTableByName("objects").?.object_storage_generation);
+        var dropped = try LocalStandaloneMetadata.dropTableExact(&metadata, a, "objects");
+        defer dropped.deinit(a);
+        try LocalStandaloneMetadata.createTable(&metadata, a, "objects", .{ .storage = .{ .engine = .object } });
+        const recreated = metadata.manager.findTableByName("objects").?;
+        try std.testing.expect(recreated.table_id != previous_table_id or recreated.object_storage_generation != previous_generation);
+        try std.testing.expectEqual(@as(usize, 0), metadata.manager.ranges.count());
+    }
 }
