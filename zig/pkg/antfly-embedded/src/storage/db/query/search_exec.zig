@@ -137,7 +137,16 @@ pub const IndexedTextPredicate = struct {
     exact: bool = true,
 };
 
+/// A provider-proven stream ordered by every requested key except the final
+/// public ID tie breaker. The collector must finish the boundary tie group.
+pub const OrderedTextCandidates = struct {
+    ptr: *anyopaque,
+    next: *const fn (*anyopaque) anyerror!?u32,
+    close: *const fn (*anyopaque) void,
+};
+
 pub const SearchTextQueryExecutor = struct {
+    open_ordered_candidates: ?*const fn (?*anyopaque, Allocator, types.SearchRequest, *const index_mod.IndexSnapshot) anyerror!?OrderedTextCandidates = null,
     /// Provider attests that its pinned snapshot already enforces primary row
     /// visibility. Fully native counts can skip per-hit postprocessing.
     native_count_visibility_exact: bool = false,
@@ -11295,12 +11304,25 @@ fn sortAndPageTextDocValueCandidatesAlloc(
         .require_native = plan.require_native,
         .load = loadTextDocValueSortValue,
     };
+    const ordered = if (bitmap != null and effective_req.limit > 0 and executor.native_count_visibility_exact and executor.is_expired_key == null and effective_req.search_after.len == 0 and effective_req.search_before.len == 0)
+        if (executor.open_ordered_candidates) |open| try open(executor.ctx, alloc, effective_req, snapshot) else null
+    else
+        null;
+    defer if (ordered) |stream| stream.close(stream.ptr);
+    if (ordered != null) observeSortCandidateSource(if (collect_sort_profile) &profile else null, "ordered_lake_index");
     var visible_candidate_count: usize = 0;
     var iterator = if (bitmap) |set| set.iterator() else null;
     var position: usize = 0;
     while (true) {
         const i = position;
-        const doc_num = if (iterator) |*it| it.next() orelse break else if (position < doc_nums.len) doc_nums[position] else break;
+        const doc_num = if (ordered) |stream|
+            try stream.next(stream.ptr) orelse break
+        else if (iterator) |*it| it.next() orelse break else if (position < doc_nums.len) doc_nums[position] else break;
+        if (ordered != null and !bitmap.?.contains(doc_num)) {
+            if (position % 1024 == 0) try checkSearchRequestDeadline(effective_req);
+            position += 1;
+            continue;
+        }
         position += 1;
         if (i % 1024 == 0) try checkSearchRequestDeadline(effective_req);
         identity_scratch.reset();
@@ -11332,6 +11354,15 @@ fn sortAndPageTextDocValueCandidatesAlloc(
         errdefer if (decorated_owned) decorated.deinit(alloc);
         if (collect_sort_profile) profile.decorate_ns += platform_time.monotonicNs() - decorate_start_ns;
 
+        if (ordered != null and window_len == window_capacity) {
+            var primary_order = effective_req;
+            primary_order.order_by = effective_req.order_by[0 .. effective_req.order_by.len - 1];
+            if (compareDecoratedSortHits(primary_order, decorated, window[0]) == .gt) {
+                decorated.deinit(alloc);
+                decorated_owned = false;
+                break;
+            }
+        }
         const allowed_by_cursor = try decoratedHitAllowedByCursor(effective_req, plan, decorated);
         if (effective_req.limit == 0 and !allowed_by_cursor) visible_candidate_count -= 1;
         admitDecoratedSortHitIntoWindow(
@@ -11347,6 +11378,7 @@ fn sortAndPageTextDocValueCandidatesAlloc(
         decorated_owned = false;
     }
 
+    if (ordered != null) visible_candidate_count = bitmap.?.cardinality();
     try checkSearchRequestDeadline(effective_req);
     const final_sort_start_ns = if (collect_sort_profile) platform_time.monotonicNs() else 0;
     std.sort.pdq(DecoratedSortHit, window[0..window_len], effective_req, decoratedLessThan);
@@ -15473,7 +15505,7 @@ pub fn searchSparse(
             .exclude_doc_ids = native_constraints.exclude_doc_ids,
             .filter_doc_nums = native_constraints.filter_doc_nums,
             .exclude_doc_nums = native_constraints.exclude_doc_nums,
-            .key_predicate = if (req.native_key_predicate) |predicate| .{ .ptr = predicate.ptr, .allows = predicate.allows } else null,
+            .key_predicate = if (req.native_key_predicate) |predicate| .{ .ptr = predicate.ptr, .allows = predicate.allows, .select_ordinals = predicate.select_ordinals } else null,
             .cancellation = req.cancellation,
         });
         defer sparse_mod.SparseIndex.freeResults(alloc, raw_hits);

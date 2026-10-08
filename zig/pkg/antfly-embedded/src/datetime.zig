@@ -70,6 +70,17 @@ pub fn truncate(ns: u64, field: Unit) ?u64 {
     };
 }
 
+/// Exact temporal operands shared by lake indexes and standard range filters.
+/// Numeric operands are nanoseconds; strings must be RFC3339 instants.
+pub fn rangeNanoseconds(value: std.json.Value) ?i128 {
+    return switch (value) {
+        .integer => |number| number,
+        .number_string => |text| std.fmt.parseInt(i128, text, 10) catch null,
+        .string => |text| parseRfc3339ToSignedNs(text),
+        else => null,
+    };
+}
+
 pub fn parseDateTimeToNs(text: []const u8) ?u64 {
     return parseRfc3339ToNs(text) orelse parseDateToNs(text);
 }

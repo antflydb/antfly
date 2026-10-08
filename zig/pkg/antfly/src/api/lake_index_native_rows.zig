@@ -97,7 +97,9 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
     const orders = [_]local.sql_operators.Order{.{}};
     var first: usize = 0;
     while (first < definitions.len) {
-        const end = @min(first + 32, definitions.len);
+        // Reserve four retained runs per fused sort plus pending/merge files
+        // within the shared 64-file manager, without enlarging its budget.
+        const end = @min(first + 8, definitions.len);
         defer first = end;
         var entries: std.ArrayList(Entry) = .empty;
         defer {
@@ -176,6 +178,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
                 digest.* = @splat(0);
             };
             try entries.append(a, .{ .tuple = tuple, .predicate = predicate, .binding = binding, .name = name, .cover = cover, .sort = spill.Sort.init(a, &manager, &orders, 512 * 1024), .changed = changed, .slots = slots, .delta = .{ .previous = prior, .keep = keep, .files = slot_names.items, .fingerprints = slot_hashes.items } });
+            entries.items[entries.items.len - 1].sort.run_limit = 4;
         }
         if (entries.items.len == 0) continue;
         var names: std.ArrayList([]const u8) = .empty;

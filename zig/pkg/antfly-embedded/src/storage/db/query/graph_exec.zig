@@ -4519,6 +4519,24 @@ fn jsonValueMatchesStandardRange(value: std.json.Value, lower: ?PatternJsonRange
         }
         return false;
     }
+    // Temporal strings and typed nanosecond columns share one signed order.
+    // Ordinary numeric predicates retain scalar comparison; wide integer
+    // timestamp representations use the same signed order as temporal strings.
+    const temporal_bounds = (if (lower) |bound| bound.value == .string and jsonTemporalNsFromValue(bound.value) != null else false) or
+        (if (upper) |bound| bound.value == .string and jsonTemporalNsFromValue(bound.value) != null else false);
+    const wide_integer_bounds = (if (lower) |bound| bound.value == .number_string and jsonTemporalNsFromValue(bound.value) != null else false) or
+        (if (upper) |bound| bound.value == .number_string and jsonTemporalNsFromValue(bound.value) != null else false);
+    if (temporal_bounds or wide_integer_bounds or ((value == .string or value == .number_string) and jsonTemporalNsFromValue(value) != null)) {
+        if (jsonTemporalNsFromValue(value)) |candidate| {
+            const min = if (lower) |bound| jsonTemporalNsFromValue(bound.value) else null;
+            const max = if (upper) |bound| jsonTemporalNsFromValue(bound.value) else null;
+            if ((lower == null or min != null) and (upper == null or max != null)) {
+                if (min) |ns| if (candidate < ns or (candidate == ns and !lower.?.inclusive)) return false;
+                if (max) |ns| if (candidate > ns or (candidate == ns and !upper.?.inclusive)) return false;
+                return true;
+            }
+        }
+    }
     if (value == .integer or value == .float) {
         // Keep integers exact, including mixed integer/float comparisons.
         // This is the same scalar order used by relational predicate indexes.
@@ -4843,6 +4861,10 @@ fn jsonU64FromValue(value: std.json.Value) !u64 {
         .number_string => |text| std.fmt.parseInt(u64, text, 10) catch error.InvalidArgument,
         else => error.InvalidArgument,
     };
+}
+
+pub fn jsonTemporalNsFromValue(value: std.json.Value) ?i128 {
+    return @import("../../../datetime.zig").rangeNanoseconds(value);
 }
 
 pub fn jsonDateNsFromValue(value: std.json.Value) !u64 {
@@ -7861,4 +7883,33 @@ test "external lake shared standard range preserves exact integer order above 2^
     var doc: std.json.Value = .{ .object = .empty };
     try doc.object.put(ca, "amount", .{ .float = 9007199254740992.0 });
     try std.testing.expect(!try filter.matches(ca, "doc", doc));
+}
+
+test "external lake shared temporal ranges compare signed nanoseconds and offset strings" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const parsed = try std.json.parseFromSlice(std.json.Value, a,
+        \\{"range":{"ts":{"gte":"1969-12-31T23:59:59.999999999Z","lt":"1970-01-01T01:00:00.000000001+01:00"}}}
+    , .{});
+    const filter = try compilePatternFilter(a, parsed.value);
+    for ([_]std.json.Value{ .{ .integer = -1 }, .{ .integer = 0 }, .{ .string = "1970-01-01T01:00:00+01:00" } }) |value| {
+        var doc: std.json.Value = .{ .object = .empty };
+        try doc.object.put(a, "ts", value);
+        try std.testing.expect(try filter.matches(a, "doc", doc));
+    }
+    for ([_]std.json.Value{ .{ .integer = -2 }, .{ .integer = 1 }, .null }) |value| {
+        var doc: std.json.Value = .{ .object = .empty };
+        try doc.object.put(a, "ts", value);
+        try std.testing.expect(!try filter.matches(a, "doc", doc));
+    }
+}
+
+test "external lake temporal numeric ranges preserve timestamps beyond i64" {
+    const lower: PatternJsonRangeBound = .{ .value = .{ .integer = std.math.minInt(i64) }, .inclusive = true };
+    const upper: PatternJsonRangeBound = .{ .value = .{ .number_string = "9223372036854775809" }, .inclusive = false };
+    try std.testing.expect(try jsonValueMatchesStandardRange(.{ .number_string = "9223372036854775808" }, lower, upper));
+    try std.testing.expect(try jsonValueMatchesStandardRange(.{ .integer = 0 }, lower, upper));
+    try std.testing.expect(!try jsonValueMatchesStandardRange(.{ .number_string = "9223372036854775809" }, lower, upper));
+    try std.testing.expect(!try jsonValueMatchesStandardRange(.{ .number_string = "-9223372036854775809" }, lower, upper));
 }

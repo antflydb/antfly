@@ -63,7 +63,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         if (wanted.kind != .sparse_segment) continue;
         try provider.context.ensureActive();
         var binding = wanted.binding;
-        binding.index_config_hash = try std.fmt.allocPrint(ca, "native-sparse-checkpoint-v2:{s}", .{binding.index_config_hash});
+        binding.index_config_hash = try std.fmt.allocPrint(ca, "native-sparse-checkpoint-v3:{s}", .{binding.index_config_hash});
         const public_config = try std.json.Stringify.valueAlloc(ca, configs.object.get(wanted.name) orelse return error.InvalidTableIndexMetadata, .{});
         const recipe = state.recipe(table, public_config);
         const prior = for (reusable) |declaration| {

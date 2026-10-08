@@ -165,9 +165,34 @@ const Execution = struct {
     fn vectorRequest(self: *Execution, req: types.SearchRequest) types.SearchRequest {
         var result = req;
         if (self.vector_include != null or self.vector_exclude != null) {
-            result.native_key_predicate = .{ .ptr = self, .allows = allowsVectorKey };
+            result.native_key_predicate = .{ .ptr = self, .allows = allowsVectorKey, .select_ordinals = selectSparseOrdinals };
             result.filter_query_json = "";
             result.exclusion_query_json = "";
+        }
+        return result;
+    }
+    fn selectSparseOrdinals(raw: *anyopaque, a: A, lookup_ctx: *anyopaque, lookup: *const fn (*anyopaque, []const u8) anyerror!?u32) !?local.encoding_roaring.RoaringBitmap {
+        const self: *Execution = @ptrCast(@alignCast(raw));
+        const include = if (self.vector_include) |*set| set else return null;
+        var result = local.encoding_roaring.RoaringBitmap.init(a);
+        errdefer result.deinit();
+        var files = include.files.iterator();
+        while (files.next()) |file| {
+            const digest = self.private_digests.get(file.key_ptr.*) orelse return error.ExternalLakeSnapshotMismatch;
+            var blocks = file.value_ptr.iterator();
+            while (blocks.next()) |block| {
+                var rows = block.value_ptr.iterator();
+                var visited: usize = 0;
+                while (rows.next()) |low| {
+                    if (visited % 256 == 0) try self.context.ensureActive();
+                    visited += 1;
+                    const row = (@as(u64, block.key_ptr.high) << 32) | low;
+                    if (self.vector_exclude) |*exclude| if (exclude.contains(file.key_ptr.*, block.key_ptr.group, row)) continue;
+                    var key: [96]u8 = undefined;
+                    const bytes = try std.fmt.bufPrint(&key, "lake2:{s}:{x:0>8}:{x:0>16}", .{ digest, block.key_ptr.group, row });
+                    if (try lookup(lookup_ctx, bytes)) |num| try result.add(num);
+                }
+            }
         }
         return result;
     }
@@ -407,8 +432,86 @@ const Execution = struct {
         const resolver: @import("lake_index_text_predicate.zig").Resolver = .{ .server = self.server, .table = self.table, .source = self.source, .context = self.request, .identities = identities, .store = self.store.artifactStore(), .store_identity = self.store.identity, .read_context = self.context };
         return resolver.resolve(a, json);
     }
+    const Ordered = struct {
+        a: A,
+        execution: *Execution,
+        cursor: local.sql_catalog.Cursor,
+        orders: []local.sql_catalog.Scan.Order,
+        identities: @import("lake_index_text_predicate.zig").Identities,
+        page: ?local.sql_catalog.Page = null,
+        position: usize = 0,
+        lookup: std.heap.ArenaAllocator,
+        bitmaps: std.StringHashMapUnmanaged(local.encoding_roaring.RoaringBitmap) = .empty,
+        fn close(raw: *anyopaque) void {
+            const self: *Ordered = @ptrCast(@alignCast(raw));
+            if (self.page) |page| page.deinit();
+            self.cursor.close(self.cursor.ptr);
+            self.lookup.deinit();
+            self.a.free(self.orders);
+            self.a.destroy(self);
+        }
+        fn next(raw: *anyopaque) !?u32 {
+            const self: *Ordered = @ptrCast(@alignCast(raw));
+            while (true) {
+                try self.execution.context.ensureActive();
+                if (self.page == null or self.position == self.page.?.rows.len) {
+                    if (self.page) |page| {
+                        const finished = page.after == null;
+                        page.deinit();
+                        self.page = null;
+                        if (finished) return null;
+                    }
+                    self.page = try self.cursor.next(self.cursor.ptr, self.a, 256);
+                    self.position = 0;
+                    if (self.page.?.rows.len == 0) return null;
+                }
+                const key = self.page.?.rows[self.position].id;
+                self.position += 1;
+                const coordinate = try @import("lake_index_native_state.zig").coordinates(key);
+                const execution = self.execution;
+                const file = execution.files.get(key[6..70]) orelse return error.ExternalLakeSnapshotMismatch;
+                const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &execution.server.lake_read_cache, .scope = execution.store.identity, .context = execution.context };
+                if (try self.identities.ordinal(self.lookup.allocator(), &self.bitmaps, execution.store.artifactStore(), cached, .{ .external = .{
+                    .source_id = execution.source.inventory.source_id,
+                    .snapshot_id = execution.source.inventory.snapshot_id,
+                    .file_id = file,
+                    .row_group_ordinal = coordinate.group,
+                    .row_ordinal = coordinate.row,
+                } })) |number| return number;
+            }
+        }
+    };
+    fn openOrderedTextCandidates(raw: ?*anyopaque, a: A, req: types.SearchRequest, snapshot: *const local.index.IndexSnapshot) !?search.OrderedTextCandidates {
+        const self = from(raw);
+        if (req.order_by.len < 2 or !std.mem.eql(u8, req.order_by[req.order_by.len - 1].field, "_id")) return null;
+        const identities = self.text_identities.get(@intFromPtr(snapshot)) orelse return null;
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const orders = try arena.allocator().alloc(local.sql_catalog.Scan.Order, req.order_by.len - 1);
+        for (orders, req.order_by[0..orders.len]) |*order, field| {
+            const column = for (self.table.columns) |column| {
+                if (std.mem.eql(u8, column.name, field.field)) break column;
+            } else return null;
+            // Native date values and signed SQL timestamps have distinct domains.
+            if (column.type == .datetime) return null;
+            order.* = .{ .column = field.field, .descending = field.desc, .nulls_first = !field.desc };
+        }
+        const owned_orders = try a.dupe(local.sql_catalog.Scan.Order, orders);
+        var keep_orders = false;
+        defer if (!keep_orders) a.free(owned_orders);
+        const cursor = (try @import("lake_index_sql_rows.zig").tryOpenAuto(a, self.server, self.table, .{ .fields = &.{}, .order = owned_orders, .limit = 256 }, self.request, self.source)) orelse return null;
+        errdefer cursor.close(cursor.ptr);
+        if (!cursor.order_satisfied) {
+            cursor.close(cursor.ptr);
+            return null;
+        }
+        const owner = try a.create(Ordered);
+        owner.* = .{ .a = a, .execution = self, .cursor = cursor, .orders = owned_orders, .identities = identities, .lookup = .init(a) };
+        keep_orders = true;
+        return .{ .ptr = owner, .next = Ordered.next, .close = Ordered.close };
+    }
     fn searchText(raw: ?*anyopaque, a: A, req: types.SearchRequest, text: types.TextQuery) !types.SearchResult {
-        return search.searchTextQuery(a, req, text, .{ .ctx = raw, .exact_doc_id_filters = true, .acquire_text_source = acquire, .resolve_indexed_filter = resolveIndexedFilter, .native_count_visibility_exact = true, .project_key = publicKey, .native_key = nativeKey, .filter_candidate_presence = true, .text_index_entry = noLocal, .text_index_is_chunk_backed = chunkBacked, .search_match_all = matchAll, .project_stored_search = project, .load_stored = loadOne, .load_projected_documents = loadProjected, .postprocess = postprocess });
+        return search.searchTextQuery(a, req, text, .{ .ctx = raw, .exact_doc_id_filters = true, .acquire_text_source = acquire, .resolve_indexed_filter = resolveIndexedFilter, .open_ordered_candidates = openOrderedTextCandidates, .native_count_visibility_exact = true, .project_key = publicKey, .native_key = nativeKey, .filter_candidate_presence = true, .text_index_entry = noLocal, .text_index_is_chunk_backed = chunkBacked, .search_match_all = matchAll, .project_stored_search = project, .load_stored = loadOne, .load_projected_documents = loadProjected, .postprocess = postprocess });
     }
     fn dispatchText(raw: ?*anyopaque, a: A, req: types.SearchRequest) !types.SearchResult {
         return search.searchText(a, req, .{ .ctx = raw, .func = searchText });

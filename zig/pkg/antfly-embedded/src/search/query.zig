@@ -1736,12 +1736,9 @@ pub const DocNumFilter = struct {
 
         const upper = doc_offset + seg.reader.doc_count;
         if (self.bitmap) |bitmap| {
-            var it = bitmap.iterator();
-            it.seek(doc_offset);
-            while (it.next()) |doc_num| {
-                if (doc_num >= upper) break;
-                if (doc_num >= doc_offset) try result.add(doc_num - doc_offset);
-            }
+            result.deinit();
+            result = roaring.RoaringBitmap.init(alloc);
+            result = try bitmap.sliceRebased(alloc, doc_offset, upper);
         }
         for (self.doc_nums) |doc_num| {
             if (doc_num < doc_offset or doc_num >= upper) continue;
@@ -1879,10 +1876,10 @@ pub fn countFilterIntersection(
 
         const next_offset = std.math.add(u32, doc_offset, seg.reader.doc_count) catch
             return error.CountOverflow;
-        var shifted = try local.addOffset(doc_offset);
-        defer shifted.deinit();
-        shifted.andWith(global_docs);
-        total = std.math.add(usize, total, shifted.cardinality()) catch return error.CountOverflow;
+        var selected = try global_docs.sliceRebased(alloc, doc_offset, next_offset);
+        defer selected.deinit();
+        local.andWith(&selected);
+        total = std.math.add(usize, total, local.cardinality()) catch return error.CountOverflow;
         doc_offset = next_offset;
     }
     return total;
@@ -1902,6 +1899,16 @@ pub fn countFilter(
     var total: usize = 0;
     var doc_offset: u32 = 0;
     for (snap.segments) |*seg| {
+        const next_offset = std.math.add(u32, doc_offset, seg.reader.doc_count) catch return error.CountOverflow;
+        if (filter == .doc_num and filter.doc_num.bitmap != null and filter.doc_num.doc_nums.len == 0) {
+            seg.shared.lockDeletionShared();
+            defer seg.shared.unlockDeletionShared();
+            if (seg.shared.deleted == null) {
+                total = std.math.add(usize, total, filter.doc_num.bitmap.?.rangeCardinality(doc_offset, next_offset)) catch return error.CountOverflow;
+                doc_offset = next_offset;
+                continue;
+            }
+        }
         var bm = try filter.executeWithOffset(alloc, seg, doc_offset);
         defer bm.deinit();
 

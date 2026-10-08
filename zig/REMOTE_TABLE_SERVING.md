@@ -1128,7 +1128,8 @@ therefore advance between files without materializing the corpus-wide serving
 metadata. Serving and collection share file-manifest identity, scope, and child
 validation. Inline retained root formats continue using their existing walkers.
 
-The remaining native execution work is scoped in
-[Native lake performance follow-up](NATIVE_LAKE_PERFORMANCE_FOLLOWUP.md), including
-sparse ordinal intersection, narrowed residuals, ordered top-N, bulk bitmap
-counts, and normalized temporal predicates with differential and E2E checks.
+Native execution now includes sparse ordinal intersection, narrowed vector
+residuals, compatible ordered-index top-N, bulk bitmap counts, and normalized
+temporal predicates. [Native lake performance follow-up](NATIVE_LAKE_PERFORMANCE_FOLLOWUP.md)
+describes their contracts, differential and E2E validation, fallback shapes,
+and remaining large-archive measurements.

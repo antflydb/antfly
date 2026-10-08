@@ -483,19 +483,20 @@ fn searchConditionsCompatible(runtime: local.storage_schema.TableSchema, conditi
             if (std.mem.eql(u8, column.name, condition.column)) break column.column_type;
         } else return false;
         const compatible = switch (kind) {
-            .string => condition.value == .string and (condition.op == .eq or blk: {
-                // The shared standard-range evaluator interprets RFC3339
-                // bounds chronologically; a lexical tuple index cannot prove it.
-                _ = local.storage_db_query_graph_exec.jsonDateNsFromValue(condition.value) catch break :blk true;
-                break :blk false;
-            }),
+            // RFC3339 ranges use signed chronological order, including dates
+            // before the epoch; lexical string indexes cannot prove that order.
+            .string => condition.value == .string and (condition.op == .eq or
+                local.storage_db_query_graph_exec.jsonTemporalNsFromValue(condition.value) == null),
             .integer => condition.value == .integer,
             .number => condition.value == .float or (condition.value == .integer and blk: {
                 const rounded: f64 = @floatFromInt(condition.value.integer);
                 break :blk (@as(i128, @intFromFloat(rounded)) == condition.value.integer);
             }),
             .boolean => condition.value == .bool,
-            .datetime => false,
+            .datetime => if (condition.op == .eq)
+                condition.value == .integer
+            else
+                local.storage_db_query_graph_exec.jsonTemporalNsFromValue(condition.value) != null,
             else => false,
         };
         if (!compatible) return false;
@@ -911,4 +912,20 @@ test "external lake covering batch preserves dictionary identity across reordere
         try std.testing.expectEqual(std.meta.activeTag(expected.value), std.meta.activeTag(actual.value));
         if (expected.value == .string) try std.testing.expectEqualStrings(expected.value.string, actual.value.string);
     }
+}
+
+test "external lake temporal index admission rejects lexical pre-epoch bounds" {
+    const columns = [_]local.storage_schema.RelationalColumn{
+        .{ .name = "text", .path = "/text", .column_type = .string },
+        .{ .name = "ts", .path = "/ts", .column_type = .datetime },
+    };
+    const schema: local.storage_schema.TableSchema = .{ .relational_columns = &columns };
+    for ([_][]const u8{ "1969-12-31T23:59:59.999999999Z", "1970-01-01T01:00:00+01:00" }) |bound| {
+        try std.testing.expect(!searchConditionsCompatible(schema, &.{.{ .column = "text", .op = .gte, .value = .{ .string = bound } }}));
+        try std.testing.expect(searchConditionsCompatible(schema, &.{.{ .column = "ts", .op = .gte, .value = .{ .string = bound } }}));
+        try std.testing.expect(searchConditionsCompatible(schema, &.{.{ .column = "text", .op = .eq, .value = .{ .string = bound } }}));
+        try std.testing.expect(!searchConditionsCompatible(schema, &.{.{ .column = "ts", .op = .eq, .value = .{ .string = bound } }}));
+    }
+    try std.testing.expect(searchConditionsCompatible(schema, &.{.{ .column = "text", .op = .gte, .value = .{ .string = "plain" } }}));
+    try std.testing.expect(!searchConditionsCompatible(schema, &.{.{ .column = "ts", .op = .gte, .value = .{ .string = "malformed" } }}));
 }

@@ -2380,20 +2380,25 @@ def test_native_remote_indexed_metadata_predicates_above_id_list_limit(tmp_path)
     objects.mkdir(parents=True)
     count = 100003
     input_file = tmp_path / "predicates.parquet"
-    pq.write_table(pa.table({
+    data_table = pa.table({
         "body": ["common"] * count,
         "sparse_native": ['{"1":1}'] * count,
         "amount": range(count),
+        "sort_rank": [0, 1] + list(range(2, count - 1)) + [0],
         "big_integer": [9007199254740992, 9007199254740993] + [9007199254740994] * (count - 2),
+        "event_time": pa.array([0, 1] + [2] * (count - 2), type=pa.timestamp("ns", tz="UTC")),
         "time_text": ["2026-01-01T01:00:00+01:00", "2026-01-01T00:30:00Z"] + ["2026-01-01T00:00:00Z"] * (count - 2),
         "category": ["story", "story"] + ["comment"] * (count - 2),
         "label": ["other"] * (count - 1) + ["kept"],
-    }), input_file, row_group_size=4096, compression="snappy", write_page_index=True)
-    payload = input_file.read_bytes()
-    (objects / "part.parquet").write_bytes(
-        b"AFOBJ001" + struct.pack("<QI", len(payload), 0)
-        + hashlib.sha256(payload).hexdigest().encode() + payload
-    )
+    })
+    for name, offset, length in (("a", 0, count // 2), ("b", count // 2, count - count // 2)):
+        pq.write_table(data_table.slice(offset, length), input_file, row_group_size=4096,
+            compression="snappy", write_page_index=True)
+        payload = input_file.read_bytes()
+        (objects / f"{name}.parquet").write_bytes(
+            b"AFOBJ001" + struct.pack("<QI", len(payload), 0)
+            + hashlib.sha256(payload).hexdigest().encode() + payload
+        )
     server = StandaloneAntflyServer(binary, "127.0.0.1", 0)
     failed = True
     try:
@@ -2406,17 +2411,33 @@ def test_native_remote_indexed_metadata_predicates_above_id_list_limit(tmp_path)
 
         call("POST", "/tables/indexed_predicates", {
             "num_shards": 1,
-            "schema": {"storage_mode": "relational", "base_source": {
+            "schema": {"storage_mode": "relational", "default_type": "doc",
+                "document_schemas": {"doc": {"schema": {"type": "object", "additionalProperties": False,
+                    "properties": {
+                        "body": {"type": "string", "x-antfly-field": {"type": "text"}},
+                        "amount": {"type": "integer", "x-antfly-field": {"type": "number", "sortable": True}},
+                        "sort_rank": {"type": "integer", "x-antfly-field": {"type": "number", "sortable": True}},
+                        "big_integer": {"type": "integer"},
+                        "event_time": {"type": "datetime"},
+                        "time_text": {"type": "string"},
+                        "category": {"type": "string"},
+                        "label": {"type": "string"},
+                        "sparse_native": {"type": "string"},
+                    },
+                }}}, "base_source": {
                 "kind": "external", "table_id": "indexed-predicates",
                 "format": "parquet", "uri": root.as_uri(),
             }, "relational_indexes": [
-                {"name": "amount_idx", "keys": [{"column": "amount"}]},
+                {"name": "amount_idx", "keys": [{"column": "amount", "nulls": "first"}]},
+                {"name": "amount_desc_idx", "keys": [{"column": "amount", "direction": "desc", "nulls": "last"}]},
+                {"name": "event_time_idx", "keys": [{"column": "event_time"}]},
                 {"name": "big_integer_idx", "keys": [{"column": "big_integer"}]},
                 {"name": "time_text_idx", "keys": [{"column": "time_text"}]},
                 {"name": "category_idx", "keys": [{"column": "category"}]},
+                {"name": "rank_idx", "keys": [{"column": "sort_rank", "nulls": "first"}]},
             ]},
             "indexes": {
-                "body_text": {"type": "full_text", "field": "body"},
+                "body_text": {"type": "full_text"},
                 "sparse_native": {"type": "embeddings", "external": True, "sparse": True},
             },
         })
@@ -2481,6 +2502,38 @@ def test_native_remote_indexed_metadata_predicates_above_id_list_limit(tmp_path)
             "filter_query": {"term": {"field": "amount", "value": count - 1}},
         })
         assert [h["_source"]["amount"] for h in sparse_point["hits"]["hits"]] == [count - 1], sparse_point
+        sparse_residual = call("POST", "/tables/indexed_predicates/query", {
+            "embeddings": {"sparse_native": {"indices": [1], "values": [1]}},
+            "indexes": ["sparse_native"], "fields": ["amount"], "limit": 3,
+            "filter_query": {"conjuncts": [point, {"prefix": {"path": "/label", "value": "ke"}}]},
+        })
+        assert [h["_source"]["amount"] for h in sparse_residual["hits"]["hits"]] == [count - 1], sparse_residual
+        rejected_residual = call("POST", "/tables/indexed_predicates/query", {
+            "embeddings": {"sparse_native": {"indices": [1], "values": [1]}},
+            "indexes": ["sparse_native"], "fields": ["amount"], "limit": 3,
+            "filter_query": {"conjuncts": [point, {"prefix": {"path": "/label", "value": "no"}}]},
+        })
+        assert rejected_residual["hits"]["hits"] == [], rejected_residual
+        for descending, expected in ((False, list(range(7, 10))), (True, list(range(count - 8, count - 11, -1)))):
+            ordered = query({"match_all": {}}, order_by=[{"field": "amount", "desc": descending}],
+                offset=7, limit=3, profile=True)
+            assert [h["_source"]["amount"] for h in ordered["hits"]["hits"]] == expected, ordered
+            assert ordered["hits"]["total"] == {"value": count, "relation": "exact"}, ordered
+            profile = ordered["profile"]["sort"]
+            assert profile["candidate_source"] == "ordered_lake_index", profile
+            assert profile["candidate_count"] <= 11, profile
+        tied = query({"match_all": {}}, order_by=[{"field": "sort_rank"}], limit=1, profile=True)
+        zeros = query({"term": {"field": "amount", "value": 0}})["hits"]["hits"] + query(point)["hits"]["hits"]
+        assert [h["_source"]["amount"] for h in tied["hits"]["hits"]] == [sorted(zeros, key=lambda h: h["_id"])[0]["_source"]["amount"]], tied
+        assert tied["profile"]["sort"]["candidate_source"] == "ordered_lake_index", tied
+        assert tied["profile"]["sort"]["candidate_count"] <= 4, tied
+        signed_temporal = {"range": {"event_time": {
+            "gte": "1970-01-01T00:00:00Z",
+            "lt": "1970-01-01T01:00:00.000000002+01:00",
+        }}}
+        for predicate in (signed_temporal, {"bool": {"should": [signed_temporal, {"match_all": {}}], "minimum_should_match": 2}}):
+            dated = query(predicate, count=True, fields=[], limit=0)
+            assert dated["hits"]["total"] == {"value": 2, "relation": "exact"}, dated
         failed = False
     finally:
         server.stop(test_failed=failed)

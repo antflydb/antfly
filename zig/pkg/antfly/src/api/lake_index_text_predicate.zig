@@ -101,7 +101,7 @@ pub const Identities = struct {
             },
         }
     }
-    fn ordinal(self: Identities, a: A, cache: *std.StringHashMapUnmanaged(Bitmap), store: @import("../serverless/artifacts/store.zig").ArtifactStore, cached: @import("lake_index_aggregate_artifact.zig").CachedRead, row: local.storage_rowsource_types.RowRef) !?u32 {
+    pub fn ordinal(self: Identities, a: A, cache: *std.StringHashMapUnmanaged(Bitmap), store: @import("../serverless/artifacts/store.zig").ArtifactStore, cached: @import("lake_index_aggregate_artifact.zig").CachedRead, row: local.storage_rowsource_types.RowRef) !?u32 {
         if (row != .external) return error.InvalidNativeLakeRowIndex;
         const ref = row.external;
         const span = self.files.get(ref.file_id) orelse return error.ExternalLakeSnapshotMismatch;
@@ -146,8 +146,8 @@ fn PredicateResolver(comptime Set: type) type {
             if (Set == PhysicalSet) if (result) |resolved| {
                 if (!resolved.exact) {
                     var partial = resolved;
-                    partial.bitmap.deinit();
-                    return self.scanExpression(a, compiled);
+                    defer partial.bitmap.deinit();
+                    return self.scanSelected(a, compiled, &partial.bitmap);
                 }
             };
             return result;
@@ -266,10 +266,47 @@ fn PredicateResolver(comptime Set: type) type {
             const ca = arena.allocator();
             var fields: std.ArrayList([]const u8) = .empty;
             if (!try @import("lake_index_search_filter.zig").dependencies(ca, self.table, input, &fields)) return null;
-            const cursor = try local.sql_lake_cursor.openPinned(a, self.table, .{ .fields = fields.items, .limit = 1024 }, self.context, self.source);
-            defer cursor.close(cursor.ptr);
             var result = Set.init(a);
             errdefer result.deinit();
+            try self.scanInto(a, input, fields.items, null, &result);
+            return .{ .bitmap = result };
+        }
+        fn scanSelected(self: Self, a: A, input: Compiled, selected: *const PhysicalSet) !?PredicateResult {
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            var fields: std.ArrayList([]const u8) = .empty;
+            if (!try @import("lake_index_search_filter.zig").dependencies(arena.allocator(), self.table, input, &fields)) return null;
+            var result = Set.init(a);
+            errdefer result.deinit();
+            var refs: [1024]local.storage_rowsource_types.RowRef = undefined;
+            var files = selected.files.iterator();
+            while (files.next()) |file| {
+                var blocks = file.value_ptr.iterator();
+                while (blocks.next()) |block| {
+                    var it = block.value_ptr.iterator();
+                    while (true) {
+                        try self.context.ensureActive();
+                        var count: usize = 0;
+                        while (count < refs.len) : (count += 1) {
+                            const row = it.next() orelse break;
+                            refs[count] = .{ .external = .{
+                                .source_id = self.source.inventory.source_id,
+                                .snapshot_id = self.source.inventory.snapshot_id,
+                                .file_id = file.key_ptr.*,
+                                .row_group_ordinal = block.key_ptr.group,
+                                .row_ordinal = (@as(u64, block.key_ptr.high) << 32) | row,
+                            } };
+                        }
+                        if (count == 0) break;
+                        try self.scanInto(a, input, fields.items, refs[0..count], &result);
+                    }
+                }
+            }
+            return .{ .bitmap = result };
+        }
+        fn scanInto(self: Self, a: A, input: Compiled, fields: []const []const u8, refs: ?[]const local.storage_rowsource_types.RowRef, result: *Set) !void {
+            const cursor = try local.sql_lake_cursor.openPinned(a, self.table, .{ .fields = fields, .row_refs = refs, .limit = 1024 }, self.context, self.source);
+            defer cursor.close(cursor.ptr);
             var row_arena = std.heap.ArenaAllocator.init(a);
             defer row_arena.deinit();
             var page_arena = std.heap.ArenaAllocator.init(a);
@@ -294,11 +331,10 @@ fn PredicateResolver(comptime Set: type) type {
                         const cell = try page.cell(ra, row, col.name);
                         try doc.object.put(ra, col.name, cell.value);
                     }
-                    if (try input.matches(ra, id, doc)) try self.addMatch(lookup.allocator(), &result, &bitmap_cache, ref);
+                    if (try input.matches(ra, id, doc)) try self.addMatch(lookup.allocator(), result, &bitmap_cache, ref);
                 }
                 if (page.after == null) break;
             }
-            return .{ .bitmap = result };
         }
     };
 }

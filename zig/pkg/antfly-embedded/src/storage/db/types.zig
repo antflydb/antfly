@@ -1937,7 +1937,11 @@ pub const SearchRequest = struct {
     // avoid converting text-native doc nums through shard ordinals and back.
     resolved_text_doc_filter: ?*const anyopaque = null,
     /// Request-local native metadata membership, never serialized to workers.
-    native_key_predicate: ?struct { ptr: *anyopaque, allows: *const fn (*anyopaque, []const u8) anyerror!bool } = null,
+    native_key_predicate: ?struct {
+        ptr: *anyopaque,
+        allows: *const fn (*anyopaque, []const u8) anyerror!bool,
+        select_ordinals: ?*const fn (*anyopaque, Allocator, *anyopaque, *const fn (*anyopaque, []const u8) anyerror!?u32) anyerror!?@import("../../encoding/roaring.zig").RoaringBitmap = null,
+    } = null,
     resolved_doc_filter_owned: bool = false,
     resolved_doc_filter_wire_context: ?ResolvedDocFilterWireContext = null,
     /// Request-local authorization hook used only by the distributed graph
