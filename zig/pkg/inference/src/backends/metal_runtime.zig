@@ -8231,6 +8231,174 @@ pub fn decoderRuntimeDotGeneral2DManyF32DeviceInto(
     return rc == 0;
 }
 
+/// Strict GLiNER boundary projection using a generation-owned packed FP32
+/// `[3H,H]` weight. Every transient output is caller-provided and already
+/// admitted; the runtime neither allocates nor caches model storage here.
+pub fn decoderRuntimeGlinerBoundaryPackedQkvDeviceInto(
+    self: anytype,
+    input: MetalTensor,
+    packed_weight: MetalTensor,
+    biases: [3]MetalTensor,
+    scratch: MetalTensor,
+    outputs: [3]MetalTensor,
+    rows: usize,
+    hidden: usize,
+) !bool {
+    const runtime = self.raw_decode_runtime orelse return false;
+    if (termite_metal_decode_runtime_ready(runtime) == 0 or !hasActiveFrame(runtime)) return false;
+    if (rows == 0 or hidden == 0 or rows > std.math.maxInt(i32) or hidden > std.math.maxInt(i32)) return false;
+    const output_elements = try std.math.mul(usize, rows, hidden);
+    if (!input.isDevice() or input.elemCount() != try std.math.mul(usize, rows, hidden) or
+        !packed_weight.isDevice() or packed_weight.elemCount() != try std.math.mul(usize, try std.math.mul(usize, 3, hidden), hidden) or
+        !scratch.isDevice() or scratch.elemCount() != try std.math.mul(usize, 3, output_elements)) return false;
+    for (biases, outputs) |bias, output| {
+        if (!bias.isDevice() or bias.elemCount() != hidden or !output.isDevice() or output.elemCount() != output_elements) return false;
+    }
+    const rc = termite_metal_decode_runtime_gliner_boundary_packed_qkv_device(
+        runtime,
+        input.deviceHandle(),
+        input.deviceByteOffset(),
+        packed_weight.deviceHandle(),
+        packed_weight.deviceByteOffset(),
+        biases[0].deviceHandle(),
+        biases[0].deviceByteOffset(),
+        biases[1].deviceHandle(),
+        biases[1].deviceByteOffset(),
+        biases[2].deviceHandle(),
+        biases[2].deviceByteOffset(),
+        rows,
+        hidden,
+        scratch.deviceHandle(),
+        scratch.deviceByteOffset(),
+        outputs[0].deviceHandle(),
+        outputs[0].deviceByteOffset(),
+        outputs[1].deviceHandle(),
+        outputs[1].deviceByteOffset(),
+        outputs[2].deviceHandle(),
+        outputs[2].deviceByteOffset(),
+    );
+    return rc == 0;
+}
+
+extern fn termite_metal_decode_runtime_gliner_boundary_packed_qkv_device(
+    runtime: ?*anyopaque,
+    input: ?*anyopaque,
+    input_offset: usize,
+    packed_weight: ?*anyopaque,
+    packed_weight_offset: usize,
+    q_bias: ?*anyopaque,
+    q_bias_offset: usize,
+    k_bias: ?*anyopaque,
+    k_bias_offset: usize,
+    v_bias: ?*anyopaque,
+    v_bias_offset: usize,
+    rows: usize,
+    hidden: usize,
+    scratch: ?*anyopaque,
+    scratch_offset: usize,
+    q_output: ?*anyopaque,
+    q_output_offset: usize,
+    k_output: ?*anyopaque,
+    k_output_offset: usize,
+    v_output: ?*anyopaque,
+    v_output_offset: usize,
+) c_int;
+
+pub fn decoderRuntimeGlinerBoundaryFusedFfnAvailable(runtime: ?*RawMetalDecodeRuntime) bool {
+    return termite_metal_decode_runtime_gliner_boundary_fused_ffn_ready(runtime) != 0;
+}
+
+extern fn termite_metal_decode_runtime_gliner_boundary_fused_ffn_ready(runtime: ?*RawMetalDecodeRuntime) c_int;
+
+extern fn termite_metal_gliner_boundary_fused_ffn_availability_test(base_ready: c_int, gelu_ready: c_int, norm_ready: c_int, norm_width: usize, norm_max_threads: usize) c_int;
+
+test "strict GLiNER fused FFN availability fails closed before reservation" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    try std.testing.expectEqual(@as(c_int, 1), termite_metal_gliner_boundary_fused_ffn_availability_test(1, 1, 1, 32, 32));
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_gliner_boundary_fused_ffn_availability_test(0, 1, 1, 32, 32));
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_gliner_boundary_fused_ffn_availability_test(1, 0, 1, 32, 32));
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_gliner_boundary_fused_ffn_availability_test(1, 1, 0, 32, 32));
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_gliner_boundary_fused_ffn_availability_test(1, 1, 1, 16, 32));
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_gliner_boundary_fused_ffn_availability_test(1, 1, 1, 64, 64));
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_gliner_boundary_fused_ffn_availability_test(1, 1, 1, 32, 31));
+}
+
+pub fn decoderRuntimeGlinerBoundaryFusedFfnDeviceInto(self: anytype, request: anytype) !bool {
+    const runtime = self.raw_decode_runtime orelse return false;
+    if (!decoderRuntimeGlinerBoundaryFusedFfnAvailable(runtime) or !hasActiveFrame(runtime)) return false;
+    if (request.rows == 0 or request.hidden == 0 or request.intermediate < request.hidden or
+        request.rows > std.math.maxInt(i32) or request.hidden > std.math.maxInt(i32) or request.intermediate > std.math.maxInt(i32) or
+        !std.math.isFinite(request.eps) or request.eps <= 0) return false;
+    const hidden_elements = try std.math.mul(usize, request.rows, request.hidden);
+    const intermediate_elements = try std.math.mul(usize, request.rows, request.intermediate);
+    inline for (.{ request.input, request.residual, request.first_weight, request.first_bias, request.second_weight, request.second_bias, request.norm_weight, request.norm_bias, request.first_product, request.second_product, request.output }) |tensor|
+        if (!tensor.isDevice() or tensor.dtype != .f32) return false;
+    if (request.input.elemCount() != hidden_elements or request.residual.elemCount() != hidden_elements or
+        request.first_weight.elemCount() != try std.math.mul(usize, request.intermediate, request.hidden) or request.first_bias.elemCount() != request.intermediate or
+        request.second_weight.elemCount() != try std.math.mul(usize, request.hidden, request.intermediate) or request.second_bias.elemCount() != request.hidden or
+        request.norm_weight.elemCount() != request.hidden or request.norm_bias.elemCount() != request.hidden or
+        request.first_product.elemCount() != intermediate_elements or request.second_product.elemCount() != hidden_elements or request.output.elemCount() != hidden_elements) return false;
+    return termite_metal_decode_runtime_gliner_boundary_fused_ffn_device(
+        runtime,
+        request.input.deviceHandle(),
+        request.input.deviceByteOffset(),
+        request.residual.deviceHandle(),
+        request.residual.deviceByteOffset(),
+        request.first_weight.deviceHandle(),
+        request.first_weight.deviceByteOffset(),
+        request.first_bias.deviceHandle(),
+        request.first_bias.deviceByteOffset(),
+        request.second_weight.deviceHandle(),
+        request.second_weight.deviceByteOffset(),
+        request.second_bias.deviceHandle(),
+        request.second_bias.deviceByteOffset(),
+        request.norm_weight.deviceHandle(),
+        request.norm_weight.deviceByteOffset(),
+        request.norm_bias.deviceHandle(),
+        request.norm_bias.deviceByteOffset(),
+        request.first_product.deviceHandle(),
+        request.first_product.deviceByteOffset(),
+        request.second_product.deviceHandle(),
+        request.second_product.deviceByteOffset(),
+        request.output.deviceHandle(),
+        request.output.deviceByteOffset(),
+        request.rows,
+        request.hidden,
+        request.intermediate,
+        request.eps,
+    ) == 0;
+}
+
+extern fn termite_metal_decode_runtime_gliner_boundary_fused_ffn_device(
+    runtime: ?*anyopaque,
+    input: ?*anyopaque,
+    input_offset: usize,
+    residual: ?*anyopaque,
+    residual_offset: usize,
+    first_weight: ?*anyopaque,
+    first_weight_offset: usize,
+    first_bias: ?*anyopaque,
+    first_bias_offset: usize,
+    second_weight: ?*anyopaque,
+    second_weight_offset: usize,
+    second_bias: ?*anyopaque,
+    second_bias_offset: usize,
+    norm_weight: ?*anyopaque,
+    norm_weight_offset: usize,
+    norm_bias: ?*anyopaque,
+    norm_bias_offset: usize,
+    first_product: ?*anyopaque,
+    first_product_offset: usize,
+    second_product: ?*anyopaque,
+    second_product_offset: usize,
+    output: ?*anyopaque,
+    output_offset: usize,
+    rows: usize,
+    hidden: usize,
+    intermediate: usize,
+    eps: f32,
+) c_int;
+
 pub fn decoderRuntimeDotGeneralRank1F32Device(
     self: anytype,
     lhs: MetalTensor,
@@ -8534,7 +8702,13 @@ pub fn decoderRuntimeScatterAddAxis0F32Device(
 ) !?MetalTensor {
     const runtime = self.raw_decode_runtime orelse return null;
     if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
-    if (!values.isDevice() or !indices.isDevice()) return null;
+    if (!values.isDevice() or !indices.isDevice() or values.dtype != .f32) return null;
+    const index_type: u32 = switch (indices.dtype) {
+        .f32 => 0,
+        .i32 => 1,
+        .i64 => 2,
+        else => return null,
+    };
     if (out_rows == 0 or value_rows == 0 or dim == 0) return null;
     if (value_rows > std.math.maxInt(usize) / dim or out_rows > std.math.maxInt(usize) / dim) return null;
     if (values.elemCount() != value_rows * dim or indices.elemCount() < value_rows) return null;
@@ -8547,6 +8721,7 @@ pub fn decoderRuntimeScatterAddAxis0F32Device(
         values.deviceByteOffset(),
         indices.deviceHandle(),
         indices.deviceByteOffset(),
+        index_type,
         out_rows,
         value_rows,
         dim,
@@ -21650,6 +21825,7 @@ pub extern fn termite_metal_decode_runtime_scatter_add_axis0_f32_device(
     values_offset: usize,
     indices_handle: ?*anyopaque,
     indices_offset: usize,
+    index_type: u32,
     out_rows: usize,
     value_rows: usize,
     dim: usize,
@@ -41873,6 +42049,240 @@ fn testDeviceTensorFromSlice(runtime: *RawMetalDecodeRuntime, data: []const f32,
     );
     if (rc != 0) return error.MetalBufferUploadFailed;
     return tensor;
+}
+
+fn testBoundaryFfnKernel(
+    provider: anytype,
+    kind: ops.gliner_boundary_device.Kind,
+    rows: usize,
+    hidden: usize,
+    scalar: f32,
+    inputs: [ops.gliner_boundary_device.max_inputs]?MetalTensor,
+) !MetalTensor {
+    var request = ops.gliner_boundary_device.Kernel{ .kind = kind };
+    switch (kind) {
+        .gelu, .add => request.dims[0] = @intCast(try std.math.mul(usize, rows, hidden)),
+        else => {
+            request.dims[0] = @intCast(rows);
+            request.dims[1] = @intCast(hidden);
+        },
+    }
+    request.scalars[0] = scalar;
+    return (try decoderRuntimeGlinerBoundaryDevice(provider, std.testing.allocator, request, inputs)) orelse
+        error.UnsupportedGlinerBoundaryDevice;
+}
+
+fn testBoundaryFfnReference(
+    provider: anytype,
+    input: MetalTensor,
+    residual: MetalTensor,
+    first_weight: MetalTensor,
+    first_bias: MetalTensor,
+    second_weight: MetalTensor,
+    second_bias: MetalTensor,
+    norm_weight: MetalTensor,
+    norm_bias: MetalTensor,
+    rows: usize,
+    hidden: usize,
+    eps: f32,
+) !MetalTensor {
+    var first_product = (try decoderRuntimeDotGeneral2DF32Device(provider, input, first_weight, rows, hidden, hidden, 1)) orelse
+        return error.UnsupportedGlinerBoundaryDevice;
+    defer first_product.deinit();
+    var inputs: [ops.gliner_boundary_device.max_inputs]?MetalTensor = @splat(null);
+    inputs[0] = first_product;
+    inputs[1] = first_bias;
+    var first_biased = try testBoundaryFfnKernel(provider, .bias, rows, hidden, 0, inputs);
+    defer first_biased.deinit();
+    inputs = @splat(null);
+    inputs[0] = first_biased;
+    var activated = try testBoundaryFfnKernel(provider, .gelu, rows, hidden, 0, inputs);
+    defer activated.deinit();
+    var second_product = (try decoderRuntimeDotGeneral2DF32Device(provider, activated, second_weight, rows, hidden, hidden, 1)) orelse
+        return error.UnsupportedGlinerBoundaryDevice;
+    defer second_product.deinit();
+    inputs = @splat(null);
+    inputs[0] = second_product;
+    inputs[1] = second_bias;
+    var second_biased = try testBoundaryFfnKernel(provider, .bias, rows, hidden, 0, inputs);
+    defer second_biased.deinit();
+    inputs = @splat(null);
+    inputs[0] = second_biased;
+    inputs[1] = residual;
+    var summed = try testBoundaryFfnKernel(provider, .add, rows, hidden, 0, inputs);
+    defer summed.deinit();
+    inputs = @splat(null);
+    inputs[0] = summed;
+    inputs[1] = norm_weight;
+    inputs[2] = norm_bias;
+    return testBoundaryFfnKernel(provider, .norm, rows, hidden, eps, inputs);
+}
+
+fn expectBoundaryFfnParity(expected: []const f32, actual: []const f32) !void {
+    try std.testing.expectEqual(expected.len, actual.len);
+    for (expected, actual) |want, got| {
+        if (std.math.isNan(want)) {
+            try std.testing.expect(std.math.isNan(got));
+        } else if (std.math.isInf(want)) {
+            try std.testing.expect(std.math.isInf(got));
+            try std.testing.expectEqual(want < 0, got < 0);
+        } else {
+            try std.testing.expectApproxEqAbs(want, got, 5e-4);
+        }
+    }
+}
+
+test "strict GLiNER boundary fused FFN matches scalar GELU and centered LayerNorm" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!metalDeviceAvailable()) return error.SkipZigTest;
+
+    const metal_native_provider = @import("metal_native_provider.zig");
+    var provider = try metal_native_provider.MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
+    const hidden: usize = 768;
+    const eps: f32 = 1e-7;
+    const matrix_elements = hidden * hidden;
+    const identity = try std.testing.allocator.alloc(f32, matrix_elements);
+    defer std.testing.allocator.free(identity);
+    @memset(identity, 0);
+    for (0..hidden) |i| identity[i * hidden + i] = 1;
+    const first_bias_values = try std.testing.allocator.alloc(f32, hidden);
+    defer std.testing.allocator.free(first_bias_values);
+    const second_bias_values = try std.testing.allocator.alloc(f32, hidden);
+    defer std.testing.allocator.free(second_bias_values);
+    const norm_weight_values = try std.testing.allocator.alloc(f32, hidden);
+    defer std.testing.allocator.free(norm_weight_values);
+    const norm_bias_values = try std.testing.allocator.alloc(f32, hidden);
+    defer std.testing.allocator.free(norm_bias_values);
+    for (0..hidden) |i| {
+        first_bias_values[i] = @as(f32, @floatFromInt(@as(i32, @intCast(i % 11)) - 5)) * 0.0002;
+        second_bias_values[i] = @as(f32, @floatFromInt(@as(i32, @intCast(i % 7)) - 3)) * 0.0003;
+        norm_weight_values[i] = 0.75 + @as(f32, @floatFromInt(i % 9)) * 0.03125;
+        norm_bias_values[i] = @as(f32, @floatFromInt(@as(i32, @intCast(i % 13)) - 6)) * 0.01;
+    }
+    var first_weight = try testDeviceTensorFromSlice(runtime, identity, &.{ @intCast(hidden), @intCast(hidden) });
+    defer first_weight.deinit();
+    var second_weight = try testDeviceTensorFromSlice(runtime, identity, &.{ @intCast(hidden), @intCast(hidden) });
+    defer second_weight.deinit();
+    var first_bias = try testDeviceTensorFromSlice(runtime, first_bias_values, &.{@intCast(hidden)});
+    defer first_bias.deinit();
+    var second_bias = try testDeviceTensorFromSlice(runtime, second_bias_values, &.{@intCast(hidden)});
+    defer second_bias.deinit();
+    var norm_weight = try testDeviceTensorFromSlice(runtime, norm_weight_values, &.{@intCast(hidden)});
+    defer norm_weight.deinit();
+    var norm_bias = try testDeviceTensorFromSlice(runtime, norm_bias_values, &.{@intCast(hidden)});
+    defer norm_bias.deinit();
+
+    for ([_]usize{ 1, 2 }) |rows| {
+        const elements = rows * hidden;
+        const input_values = try std.testing.allocator.alloc(f32, elements);
+        defer std.testing.allocator.free(input_values);
+        const residual_values = try std.testing.allocator.alloc(f32, elements);
+        defer std.testing.allocator.free(residual_values);
+        for (input_values, residual_values, 0..) |*input_value, *residual_value, i| {
+            input_value.* = 12.0 + @as(f32, @floatFromInt(@as(i32, @intCast(i % 7)) - 3)) * 0.0009765625;
+            residual_value.* = 4096.0 + @as(f32, @floatFromInt(@as(i32, @intCast(i % 5)) - 2)) * 0.0009765625;
+        }
+        input_values[0] = -10;
+        input_values[1] = 10;
+        input_values[2] = -100;
+        input_values[3] = 100;
+        var input = try testDeviceTensorFromSlice(runtime, input_values, &.{ @intCast(rows), @intCast(hidden) });
+        defer input.deinit();
+        var residual = try testDeviceTensorFromSlice(runtime, residual_values, &.{ @intCast(rows), @intCast(hidden) });
+        defer residual.deinit();
+        var reference = try testBoundaryFfnReference(&provider, input, residual, first_weight, first_bias, second_weight, second_bias, norm_weight, norm_bias, rows, hidden, eps);
+        defer reference.deinit();
+
+        var first_product = try MetalTensor.deviceAllocate(runtime, elements * @sizeOf(f32), .private, &.{ @intCast(rows), @intCast(hidden) });
+        defer first_product.deinit();
+        var second_product = try MetalTensor.deviceAllocate(runtime, elements * @sizeOf(f32), .private, &.{ @intCast(rows), @intCast(hidden) });
+        defer second_product.deinit();
+        var output = try MetalTensor.deviceAllocate(runtime, elements * @sizeOf(f32), .private, &.{ @intCast(rows), @intCast(hidden) });
+        defer output.deinit();
+        try beginFrame(runtime);
+        var frame_active = true;
+        defer if (frame_active) cancelFrame(runtime) catch {};
+        try std.testing.expect(try decoderRuntimeGlinerBoundaryFusedFfnDeviceInto(&provider, .{
+            .input = input,
+            .residual = residual,
+            .first_weight = first_weight,
+            .first_bias = first_bias,
+            .second_weight = second_weight,
+            .second_bias = second_bias,
+            .norm_weight = norm_weight,
+            .norm_bias = norm_bias,
+            .first_product = first_product,
+            .second_product = second_product,
+            .output = output,
+            .rows = rows,
+            .hidden = hidden,
+            .intermediate = hidden,
+            .eps = eps,
+        }));
+        try submitFrame(runtime);
+        try waitFrame(runtime);
+        frame_active = false;
+        var reference_mut = reference;
+        var output_mut = output;
+        try expectBoundaryFfnParity(try tensorHostSlice(&reference_mut), try tensorHostSlice(&output_mut));
+    }
+
+    const special_input_values = try std.testing.allocator.alloc(f32, hidden);
+    defer std.testing.allocator.free(special_input_values);
+    const special_residual_values = try std.testing.allocator.alloc(f32, hidden);
+    defer std.testing.allocator.free(special_residual_values);
+    const special_bias_values = try std.testing.allocator.dupe(f32, first_bias_values);
+    defer std.testing.allocator.free(special_bias_values);
+    @memset(special_input_values, 0.25);
+    @memset(special_residual_values, 1.0);
+    special_bias_values[0] = std.math.nan(f32);
+    special_bias_values[1] = std.math.inf(f32);
+    special_bias_values[2] = -std.math.inf(f32);
+    var special_input = try testDeviceTensorFromSlice(runtime, special_input_values, &.{ 1, @intCast(hidden) });
+    defer special_input.deinit();
+    var special_residual = try testDeviceTensorFromSlice(runtime, special_residual_values, &.{ 1, @intCast(hidden) });
+    defer special_residual.deinit();
+    var special_bias = try testDeviceTensorFromSlice(runtime, special_bias_values, &.{@intCast(hidden)});
+    defer special_bias.deinit();
+    var special_reference = try testBoundaryFfnReference(&provider, special_input, special_residual, first_weight, special_bias, second_weight, second_bias, norm_weight, norm_bias, 1, hidden, eps);
+    defer special_reference.deinit();
+    var first_product = try MetalTensor.deviceAllocate(runtime, hidden * @sizeOf(f32), .private, &.{ 1, @intCast(hidden) });
+    defer first_product.deinit();
+    var second_product = try MetalTensor.deviceAllocate(runtime, hidden * @sizeOf(f32), .private, &.{ 1, @intCast(hidden) });
+    defer second_product.deinit();
+    var output = try MetalTensor.deviceAllocate(runtime, hidden * @sizeOf(f32), .private, &.{ 1, @intCast(hidden) });
+    defer output.deinit();
+    try beginFrame(runtime);
+    var frame_active = true;
+    defer if (frame_active) cancelFrame(runtime) catch {};
+    try std.testing.expect(try decoderRuntimeGlinerBoundaryFusedFfnDeviceInto(&provider, .{
+        .input = special_input,
+        .residual = special_residual,
+        .first_weight = first_weight,
+        .first_bias = special_bias,
+        .second_weight = second_weight,
+        .second_bias = second_bias,
+        .norm_weight = norm_weight,
+        .norm_bias = norm_bias,
+        .first_product = first_product,
+        .second_product = second_product,
+        .output = output,
+        .rows = 1,
+        .hidden = hidden,
+        .intermediate = hidden,
+        .eps = eps,
+    }));
+    try submitFrame(runtime);
+    try waitFrame(runtime);
+    frame_active = false;
+    var special_reference_mut = special_reference;
+    var output_mut = output;
+    const special_expected = try tensorHostSlice(&special_reference_mut);
+    const special_actual = try tensorHostSlice(&output_mut);
+    try expectBoundaryFfnParity(special_expected, special_actual);
+    for (special_actual) |value| try std.testing.expect(!std.math.isFinite(value));
 }
 
 test "A4B Metal device route selection returns compact top-k ids and normalized weights" {

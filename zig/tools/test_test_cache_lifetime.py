@@ -47,10 +47,13 @@ class CacheLifetime(unittest.TestCase):
             self.assertGreater(release_module.release(cache, [output, output]), 0)
             self.assertFalse(output.exists())
 
-    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux ELF lifetime policy")
+    @unittest.skipUnless(
+        sys.platform.startswith("linux") or sys.platform == "darwin",
+        "Unix cache lifetime policy",
+    )
     def test_shared_compiler_output_survives_late_inventory_and_is_released(self):
         with tempfile.TemporaryDirectory() as root:
-            root = Path(root)
+            root = Path(root).resolve()
             for relative in (
                 "build_support/antfly/test_cache_lifetime.zig",
                 "build_support/antfly/source_paths.zig",

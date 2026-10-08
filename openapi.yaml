@@ -3849,6 +3849,7 @@ paths:
 
         ```
       operationId: globalQuery
+      x-antfly-response-streaming: true
       requestBody:
         required: true
         content:
@@ -4666,6 +4667,7 @@ paths:
       tags:
         - query_operations
       operationId: queryTable
+      x-antfly-response-streaming: true
       requestBody:
         required: true
         content:
@@ -7686,6 +7688,7 @@ paths:
       tags:
         - query_operations
       operationId: queryNamespaceTable
+      x-antfly-response-streaming: true
       requestBody:
         required: true
         content:

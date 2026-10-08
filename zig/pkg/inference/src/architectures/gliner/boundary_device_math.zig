@@ -16,6 +16,7 @@
 //! Request-owned strict resident FP32 math shared by the boundary encoder and
 //! learned task heads. Transfers use caller-allocated storage, never mirrors.
 const std = @import("std");
+const platform = @import("antfly_platform");
 const compute = @import("../../ops/ops.zig");
 const device = compute.gliner_boundary_device;
 const Control = @import("../../execution_control.zig").InferenceExecutionControl;
@@ -52,6 +53,29 @@ pub const Stats = struct {
     proposal_download_calls: usize = 0,
     result_download_calls: usize = 0,
     device_dispatches: usize = 0,
+    /// Opt-in request profiling. These remain zero unless
+    /// TERMITE_METAL_TRACE_GLINER_STAGES is enabled for optimized Metal.
+    embedding_host_nanos: u64 = 0,
+    encoder_layers_host_nanos: u64 = 0,
+    routing_host_nanos: u64 = 0,
+    dispatch_host_nanos: u64 = 0,
+    scope_finish_host_nanos: u64 = 0,
+    download_host_nanos: u64 = 0,
+    download_transfer_nanos: u64 = 0,
+    scope_submissions: u64 = 0,
+    scope_wait_nanos: u64 = 0,
+    scope_gpu_nanos: u64 = 0,
+    scope_readback_drains: u64 = 0,
+    scope_workspace_drains: u64 = 0,
+};
+
+pub const TraceRole = enum { head, encoder };
+
+const Trace = struct {
+    enabled: bool = false,
+    layer_stages: bool = false,
+    role: TraceRole = .head,
+    scope_start: device.ScopeStats = .{},
 };
 
 fn count(values: []const usize) !usize {
@@ -83,8 +107,11 @@ pub const Context = struct {
     current_bytes: usize = 0,
     resident_weights: bool = false,
     scoped_commands: bool = false,
+    packed_qkv_enabled: bool = false,
+    fused_ffn_enabled: bool = false,
     scope_generation: ?u64 = null,
     scope_start_dispatches: u64 = 0,
+    trace: Trace = .{},
     const max_segment_dispatches: usize = 64;
 
     pub fn create(allocator: std.mem.Allocator, cb: *const compute.ComputeBackend, limits: Limits, control: ?Control) !*Context {
@@ -105,6 +132,28 @@ pub const Context = struct {
         var it = self.weights.keyIterator();
         while (it.next()) |key| self.allocator.free(key.*);
         self.weights.deinit(self.allocator);
+        if (self.trace.enabled) {
+            std.debug.print(
+                "metal_gliner_boundary_profile role={s} embedding_host_ms={d:.3} encoder_layers_host_ms={d:.3} routing_host_ms={d:.3} dispatch_host_ms={d:.3} scope_finish_host_ms={d:.3} download_host_ms={d:.3} download_transfer_ms={d:.3} dispatches={d} downloads={d} submissions={d} scope_wait_ms={d:.3} scope_gpu_ms={d:.3} readback_drains={d} workspace_drains={d}\n",
+                .{
+                    @tagName(self.trace.role),
+                    @as(f64, @floatFromInt(self.stats.embedding_host_nanos)) / 1.0e6,
+                    @as(f64, @floatFromInt(self.stats.encoder_layers_host_nanos)) / 1.0e6,
+                    @as(f64, @floatFromInt(self.stats.routing_host_nanos)) / 1.0e6,
+                    @as(f64, @floatFromInt(self.stats.dispatch_host_nanos)) / 1.0e6,
+                    @as(f64, @floatFromInt(self.stats.scope_finish_host_nanos)) / 1.0e6,
+                    @as(f64, @floatFromInt(self.stats.download_host_nanos)) / 1.0e6,
+                    @as(f64, @floatFromInt(self.stats.download_transfer_nanos)) / 1.0e6,
+                    self.stats.device_dispatches,
+                    self.stats.proposal_download_calls + self.stats.result_download_calls,
+                    self.stats.scope_submissions,
+                    @as(f64, @floatFromInt(self.stats.scope_wait_nanos)) / 1.0e6,
+                    @as(f64, @floatFromInt(self.stats.scope_gpu_nanos)) / 1.0e6,
+                    self.stats.scope_readback_drains,
+                    self.stats.scope_workspace_drains,
+                },
+            );
+        }
         self.allocator.destroy(self);
     }
 
@@ -124,22 +173,96 @@ pub const Context = struct {
     pub fn configure(self: *Context, policy: ExecutionPolicy) void {
         self.resident_weights = policy == .optimized_v2;
         self.scoped_commands = policy == .optimized_v2;
+        // Diagnostic-only same-binary baseline. Packed resident storage stays
+        // admitted and allocated so toggling this cannot change ownership.
+        self.packed_qkv_enabled = policy == .optimized_v2 and self.cb.kind() == .metal and
+            !platform.env.getenvBool("TERMITE_METAL_DISABLE_GLINER_BOUNDARY_PACKED_QKV");
+        self.fused_ffn_enabled = policy == .optimized_v2 and self.cb.kind() == .metal and
+            !platform.env.getenvBool("TERMITE_METAL_DISABLE_GLINER_BOUNDARY_FUSED_FFN");
+        if (policy == .optimized_v2 and self.cb.kind() == .metal and
+            (platform.env.getenvBool("TERMITE_METAL_TRACE_GLINER_STAGES") or
+                platform.env.getenvBool("TERMITE_METAL_TRACE_GLINER_LAYER_STAGES")))
+        {
+            self.trace.enabled = true;
+            self.trace.layer_stages = platform.env.getenvBool("TERMITE_METAL_TRACE_GLINER_LAYER_STAGES");
+        }
+    }
+
+    pub fn setTraceRole(self: *Context, role: TraceRole) void {
+        self.trace.role = role;
+    }
+
+    pub fn traceNow(self: *const Context) u64 {
+        return if (self.trace.enabled) platform.time.monotonicNs() else 0;
+    }
+
+    pub fn traceStage(self: *Context, comptime stage: enum { embedding, encoder_layers, routing }, started_ns: u64) void {
+        if (!self.trace.enabled or started_ns == 0) return;
+        const elapsed = platform.time.monotonicNs() -| started_ns;
+        switch (stage) {
+            .embedding => self.stats.embedding_host_nanos +|= elapsed,
+            .encoder_layers => self.stats.encoder_layers_host_nanos +|= elapsed,
+            .routing => self.stats.routing_host_nanos +|= elapsed,
+        }
+    }
+
+    /// Diagnostic-only fence for attributing one encoder layer's GPU work.
+    /// Enabling TERMITE_METAL_TRACE_GLINER_LAYER_STAGES deliberately changes
+    /// command-buffer cadence; its output is localization evidence, never a
+    /// production latency measurement.
+    pub fn traceLayerStage(
+        self: *Context,
+        layer: usize,
+        comptime stage: enum { qkv, attention, output, ffn },
+        started_ns: u64,
+        started_dispatches: usize,
+    ) !void {
+        if (!self.trace.layer_stages) return;
+        const before = self.stats;
+        try self.finishSegment();
+        const elapsed = platform.time.monotonicNs() -| started_ns;
+        std.debug.print(
+            "metal_gliner_boundary_layer_profile altered_cadence=true layer={d} stage={s} host_ms={d:.3} submissions={d} wait_ms={d:.3} gpu_ms={d:.3} dispatches={d}\n",
+            .{
+                layer,
+                @tagName(stage),
+                @as(f64, @floatFromInt(elapsed)) / 1.0e6,
+                self.stats.scope_submissions -| before.scope_submissions,
+                @as(f64, @floatFromInt(self.stats.scope_wait_nanos -| before.scope_wait_nanos)) / 1.0e6,
+                @as(f64, @floatFromInt(self.stats.scope_gpu_nanos -| before.scope_gpu_nanos)) / 1.0e6,
+                self.stats.device_dispatches -| started_dispatches,
+            },
+        );
     }
 
     pub fn finishSegment(self: *Context) !void {
+        const started_ns = self.traceNow();
         if (self.scope_generation) |generation| {
-            _ = try self.cb.glinerBoundaryScope(&.{ .finish = .{ .generation = generation } });
+            const scope = try self.cb.glinerBoundaryScope(&.{ .finish = .{ .generation = generation } });
+            self.updateTraceScope(scope);
             self.scope_generation = null;
         }
+        if (started_ns != 0) self.stats.scope_finish_host_nanos +|= platform.time.monotonicNs() -| started_ns;
         try self.check();
     }
 
-    fn ensureSegment(self: *Context) !void {
+    fn updateTraceScope(self: *Context, scope: device.ScopeStats) void {
+        if (!self.trace.enabled) return;
+        self.stats.scope_submissions +|= scope.submissions -| self.trace.scope_start.submissions;
+        self.stats.scope_wait_nanos +|= scope.wait_nanos -| self.trace.scope_start.wait_nanos;
+        self.stats.scope_gpu_nanos +|= scope.gpu_nanos -| self.trace.scope_start.gpu_nanos;
+        self.stats.scope_readback_drains +|= scope.readback_drains -| self.trace.scope_start.readback_drains;
+        self.stats.scope_workspace_drains +|= scope.workspace_drains -| self.trace.scope_start.workspace_drains;
+    }
+
+    fn ensureSegmentForDispatches(self: *Context, additional_dispatches: usize) !void {
         if (!self.scoped_commands) return;
+        if (!segmentCanFitDispatches(0, additional_dispatches)) return error.ResourceLimitExceeded;
         var snapshot = try self.cb.glinerBoundaryScope(&.snapshot);
         if (self.scope_generation) |generation| {
             if (snapshot.active and snapshot.generation != generation) return error.GlinerBoundaryExternalFrame;
-            if (!snapshot.active or snapshot.dispatches - self.scope_start_dispatches >= max_segment_dispatches) {
+            const used_dispatches = snapshot.dispatches - self.scope_start_dispatches;
+            if (!snapshot.active or !segmentCanFitDispatches(used_dispatches, additional_dispatches)) {
                 try self.finishSegment();
                 snapshot = try self.cb.glinerBoundaryScope(&.snapshot);
             }
@@ -152,7 +275,17 @@ pub const Context = struct {
             } });
             self.scope_generation = scope.generation;
             self.scope_start_dispatches = scope.dispatches;
+            if (self.trace.enabled) self.trace.scope_start = scope;
         }
+    }
+
+    fn segmentCanFitDispatches(used_dispatches: u64, additional_dispatches: usize) bool {
+        if (additional_dispatches == 0 or additional_dispatches > max_segment_dispatches) return false;
+        return used_dispatches <= @as(u64, @intCast(max_segment_dispatches - additional_dispatches));
+    }
+
+    fn ensureSegment(self: *Context) !void {
+        return self.ensureSegmentForDispatches(1);
     }
 
     pub fn reserve(self: *Context, additional: usize) !void {
@@ -185,7 +318,9 @@ pub const Context = struct {
         };
         try self.reserve(try std.math.add(usize, allocation_bytes, staging_bytes));
         try self.ensureSegment();
+        const dispatch_started_ns = self.traceNow();
         const output = try self.cb.glinerBoundaryDevice(&request);
+        if (dispatch_started_ns != 0) self.stats.dispatch_host_nanos +|= platform.time.monotonicNs() -| dispatch_started_ns;
         errdefer self.cb.free(output);
         try self.check();
         try self.entries.append(self.allocator, .{ .tensor = output, .bytes = allocation_bytes });
@@ -286,6 +421,102 @@ pub const Context = struct {
         return self.execute(.{ .linear = .{ .input = input, .weight = w, .bias = b, .rows = rows, .in_dim = in_dim, .out_dim = out_dim } }, elements);
     }
 
+    /// One strict FP32 packed projection for an optimized resident DeBERTa
+    /// layer. Unsupported backends and every reference/reduced route decline
+    /// before allocating or dispatching so the caller can use three linears.
+    pub fn linearQkv(self: *Context, input: CT, rows: usize, hidden: usize, layer: usize) !?device.PackedQkvResult {
+        if (!self.packed_qkv_enabled or !self.resident_weights or self.encoder_precision != .f32 or self.cb.kind() != .metal or
+            self.cb.vtable.glinerBoundaryPackedQkv == null) return null;
+        if (layer > std.math.maxInt(u32)) return error.InvalidBoundaryDeviceShape;
+        var names: [3][192]u8 = undefined;
+        const projections = [_][]const u8{ "query_proj", "key_proj", "value_proj" };
+        var biases: [3]CT = undefined;
+        for (projections, 0..) |projection, index| {
+            biases[index] = try self.weight(
+                try std.fmt.bufPrint(&names[index], "encoder.layer.{d}.attention.self.{s}.bias", .{ layer, projection }),
+                &.{@intCast(hidden)},
+            );
+        }
+        const packed_weight = try self.derived(.{ .packed_qkv_weight = @intCast(layer) }, &.{ @intCast(try std.math.mul(usize, 3, hidden)), @intCast(hidden) });
+        const elements = try count(&.{ rows, hidden });
+        const output_bytes = try bytes(elements);
+        const total_output_bytes = try std.math.mul(usize, output_bytes, 3);
+        // Packed product and three final outputs coexist; the product itself
+        // belongs to the separately admitted model workspace.
+        try self.reserve(try std.math.mul(usize, total_output_bytes, 2));
+        try self.entries.ensureUnusedCapacity(self.allocator, 3);
+        try self.ensureSegmentForDispatches(3);
+        const dispatch_started_ns = self.traceNow();
+        const result = try self.cb.glinerBoundaryPackedQkv(&.{
+            .input = input,
+            .packed_weight = packed_weight,
+            .biases = biases,
+            .rows = rows,
+            .hidden = hidden,
+        });
+        if (dispatch_started_ns != 0) self.stats.dispatch_host_nanos +|= platform.time.monotonicNs() -| dispatch_started_ns;
+        errdefer {
+            self.cb.free(result.query);
+            self.cb.free(result.key);
+            self.cb.free(result.value);
+        }
+        try self.check();
+        self.entries.appendAssumeCapacity(.{ .tensor = result.query, .bytes = output_bytes });
+        self.entries.appendAssumeCapacity(.{ .tensor = result.key, .bytes = output_bytes });
+        self.entries.appendAssumeCapacity(.{ .tensor = result.value, .bytes = output_bytes });
+        self.current_bytes += total_output_bytes;
+        // Preserve the logical operation budget and diagnostics of three
+        // independent projections even though Metal encodes one GEMM.
+        self.stats.device_dispatches += 3;
+        return result;
+    }
+
+    /// Optional strict FP32 Metal FFN. Its two GEMM products remain in the
+    /// admitted encoder arena and only the normalized hidden state escapes.
+    pub fn fusedFfn(self: *Context, input: CT, residual: CT, rows: usize, hidden: usize, intermediate: usize, layer: usize, eps: f32) !?CT {
+        if (!self.fused_ffn_enabled or !self.resident_weights or self.encoder_precision != .f32 or self.cb.kind() != .metal or
+            !self.cb.glinerBoundaryFusedFfnAvailable()) return null;
+        if (layer > std.math.maxInt(u32) or !std.math.isFinite(eps) or eps <= 0) return error.InvalidBoundaryDeviceShape;
+        var names: [6][192]u8 = undefined;
+        const first_weight = try self.weight(try std.fmt.bufPrint(&names[0], "encoder.layer.{d}.intermediate.dense.weight", .{layer}), &.{ @intCast(intermediate), @intCast(hidden) });
+        const first_bias = try self.weight(try std.fmt.bufPrint(&names[1], "encoder.layer.{d}.intermediate.dense.bias", .{layer}), &.{@intCast(intermediate)});
+        const second_weight = try self.weight(try std.fmt.bufPrint(&names[2], "encoder.layer.{d}.output.dense.weight", .{layer}), &.{ @intCast(hidden), @intCast(intermediate) });
+        const second_bias = try self.weight(try std.fmt.bufPrint(&names[3], "encoder.layer.{d}.output.dense.bias", .{layer}), &.{@intCast(hidden)});
+        const norm_weight = try self.weight(try std.fmt.bufPrint(&names[4], "encoder.layer.{d}.output.LayerNorm.weight", .{layer}), &.{@intCast(hidden)});
+        const norm_bias = try self.weight(try std.fmt.bufPrint(&names[5], "encoder.layer.{d}.output.LayerNorm.bias", .{layer}), &.{@intCast(hidden)});
+        const intermediate_elements = try count(&.{ rows, intermediate });
+        const hidden_elements = try count(&.{ rows, hidden });
+        const output_bytes = try bytes(hidden_elements);
+        const products_bytes = try bytes(try std.math.add(usize, intermediate_elements, hidden_elements));
+        // Both arena products coexist until the epilogue, alongside one final
+        // owned output. The arena itself is admitted separately by the model.
+        try self.reserve(try std.math.add(usize, products_bytes, output_bytes));
+        try self.entries.ensureUnusedCapacity(self.allocator, 1);
+        try self.ensureSegmentForDispatches(5);
+        const dispatch_started_ns = self.traceNow();
+        const output = try self.cb.glinerBoundaryFusedFfn(&.{
+            .input = input,
+            .residual = residual,
+            .first_weight = first_weight,
+            .first_bias = first_bias,
+            .second_weight = second_weight,
+            .second_bias = second_bias,
+            .norm_weight = norm_weight,
+            .norm_bias = norm_bias,
+            .rows = rows,
+            .hidden = hidden,
+            .intermediate = intermediate,
+            .eps = eps,
+        });
+        if (dispatch_started_ns != 0) self.stats.dispatch_host_nanos +|= platform.time.monotonicNs() -| dispatch_started_ns;
+        errdefer self.cb.free(output);
+        try self.check();
+        self.entries.appendAssumeCapacity(.{ .tensor = output, .bytes = output_bytes });
+        self.current_bytes += output_bytes;
+        self.stats.device_dispatches += 5;
+        return output;
+    }
+
     fn encoderMatrix(self: *Context, name: []const u8, rows: usize, columns: usize, linear_slot: bool) !CT {
         if (self.weights.get(name)) |tensor| return tensor;
         if (self.encoder_precision == .f32) return error.InvalidBoundaryDeviceState;
@@ -321,6 +552,20 @@ pub const Context = struct {
         return self.kernel(.norm, &.{ rows, width }, &.{ input, w, b }, eps);
     }
 
+    pub fn addNormEps(self: *Context, input: CT, residual: CT, rows: usize, width: usize, prefix: []const u8, eps: f32) !CT {
+        if (self.resident_weights and self.encoder_precision == .f32 and self.cb.kind() == .metal and
+            !platform.env.getenvBool("TERMITE_METAL_DISABLE_GLINER_ADD_NORM"))
+        {
+            var name: [256]u8 = undefined;
+            const w = try self.weight(try std.fmt.bufPrint(&name, "{s}.weight", .{prefix}), &.{@intCast(width)});
+            const b = try self.weight(try std.fmt.bufPrint(&name, "{s}.bias", .{prefix}), &.{@intCast(width)});
+            return self.kernel(.add_norm_centered, &.{ rows, width, 0 }, &.{ input, residual, w, b }, eps);
+        }
+        const sum = try self.kernel(.add, &.{rows * width}, &.{ input, residual }, 0);
+        defer self.drop(sum);
+        return self.normEps(sum, rows, width, prefix, eps);
+    }
+
     fn validateDownload(self: *Context, tensor: CT, elements: usize, proposal: bool) !usize {
         try self.check();
         const nbytes = try bytes(elements);
@@ -338,9 +583,12 @@ pub const Context = struct {
     }
 
     pub fn downloadInto(self: *Context, tensor: CT, output: []f32, proposal: bool) !void {
+        const download_started_ns = self.traceNow();
         try self.finishSegment();
         const nbytes = try self.validateDownload(tensor, output.len, proposal);
+        const transfer_started_ns = self.traceNow();
         try self.cb.glinerBoundaryDownload(tensor, output);
+        if (transfer_started_ns != 0) self.stats.download_transfer_nanos +|= platform.time.monotonicNs() -| transfer_started_ns;
         if (proposal) {
             self.stats.proposal_download_bytes += nbytes;
             self.stats.proposal_download_calls += 1;
@@ -350,6 +598,7 @@ pub const Context = struct {
         }
         for (output) |v| if (!std.math.isFinite(v)) return error.NonFiniteBoundaryScore;
         try self.check();
+        if (download_started_ns != 0) self.stats.download_host_nanos +|= platform.time.monotonicNs() -| download_started_ns;
     }
 
     pub fn downloadTo(self: *Context, allocator: std.mem.Allocator, tensor: CT, elements: usize, proposal: bool) ![]f32 {
@@ -364,3 +613,14 @@ pub const Context = struct {
         return self.downloadTo(self.allocator, tensor, elements, proposal);
     }
 };
+
+test "gliner boundary packed QKV fences before crossing the logical dispatch limit" {
+    try std.testing.expect(Context.segmentCanFitDispatches(61, 3));
+    try std.testing.expect(!Context.segmentCanFitDispatches(62, 3));
+    try std.testing.expect(Context.segmentCanFitDispatches(59, 5));
+    try std.testing.expect(!Context.segmentCanFitDispatches(60, 5));
+    try std.testing.expect(Context.segmentCanFitDispatches(63, 1));
+    try std.testing.expect(!Context.segmentCanFitDispatches(64, 1));
+    try std.testing.expect(!Context.segmentCanFitDispatches(0, 0));
+    try std.testing.expect(!Context.segmentCanFitDispatches(0, 65));
+}

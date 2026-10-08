@@ -21630,6 +21630,12 @@ test "metadata http service linearizable reads leave elections to the cadence dr
     try std.testing.expectEqual(before_read, svc.raft.host.http_host.host.runtime_host.virtualTimeMs());
     try svc.upsertTable(.{ .table_id = 99, .name = "cadence_contract" });
     try svc.runRaftProgressOnly();
+    // The topology decoder gate requires the cluster incarnation normally
+    // established by the lifecycle driver. Initialize it through progress-only
+    // work here so the test keeps ownership of election cadence explicit.
+    _ = try svc.ensureMetadataIncarnation();
+    try svc.runRaftProgressOnly();
+    try std.testing.expect(try svc.metadataIncarnation() != null);
     try svc.removeTable(99);
     try std.testing.expectEqual(before_read, svc.raft.host.http_host.host.runtime_host.virtualTimeMs());
     try advanceCdcLeaseRaft(&svc);

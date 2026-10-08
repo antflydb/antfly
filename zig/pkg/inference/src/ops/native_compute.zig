@@ -4925,6 +4925,7 @@ pub const vtable_impl = ComputeBackend.VTable{
     .rmsNormConsumeInput = &rmsNormConsumeInputOp,
     .gelu = &geluOp,
     .geluExact = &geluExactOp,
+    .packedGegluExact = &packedGegluExactOp,
     .geluNew = &geluNewOp,
     .relu = &reluOp,
     .silu = &siluOp,
@@ -6846,6 +6847,49 @@ fn geluExactOp(ctx: *anyopaque, input: CT) anyerror!CT {
     const result = try self.makeOwnedBuf(output);
     errdefer freeTensor(self, result);
     return propagateLogicalShapeLike(self, result, input);
+}
+
+/// Consume the two halves of each Wi row without materializing gate, value,
+/// and activated-gate tensors. Keep the established exact-erf implementation.
+fn packedGegluExactOp(ctx: *anyopaque, input: CT, rows: usize, width: usize) anyerror!?CT {
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    if (rows == 0 or width == 0) return null;
+    const count = try std.math.mul(usize, rows, width);
+    const source = try getDataChecked(input);
+    if (source.len != try std.math.mul(usize, count, 2)) return null;
+    var raw_output: ?[]f32 = try self.allocator.alloc(f32, count);
+    errdefer if (raw_output) |raw| self.allocator.free(raw);
+    const output = raw_output.?;
+    for (0..rows) |row| {
+        const gate = output[row * width ..][0..width];
+        @memcpy(gate, source[row * width * 2 ..][0..width]);
+        activations_mod.geluExact(gate);
+        for (gate, source[row * width * 2 + width ..][0..width]) |*x, value| x.* *= value;
+    }
+    const result = try self.makeBuf(output, true);
+    raw_output = null;
+    errdefer freeTensor(self, result);
+    return self.withLogicalShape(result, &.{ @intCast(rows), @intCast(width) });
+}
+
+test "native packed GeGLU releases output on every allocation failure" {
+    const Check = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var store = WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+            defer store.deinitOwned();
+            var compute = NativeCompute.init(a, &store, null);
+            defer compute.deinit();
+            const cb = compute.computeBackend();
+            const values = [_]f32{ -2, -1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
+            const input = try cb.fromFloat32Shape(&values, &.{ 3, 4 });
+            defer cb.free(input);
+            const output = (try cb.packedGegluExact(input, 3, 2)).?;
+            defer cb.free(output);
+            try std.testing.expectEqualSlices(i64, &.{ 3, 2 }, tensorStoredShape(output).?);
+            try std.testing.expectEqualSlices(f32, &values, try getDataChecked(input));
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
 }
 
 fn geluNewOp(ctx: *anyopaque, input: CT) anyerror!CT {
@@ -37235,9 +37279,10 @@ pub fn mropeCore(
     const chunks_per_token = total_chunks / token_count;
     if (chunks_per_token == 0) return error.InvalidRoPEInput;
 
-    for (0..total_chunks) |chunk| {
-        const token = chunk / chunks_per_token;
-        const base = chunk * head_dim;
+    // Heads of one token share every rotary phase. Evaluate pow/sin/cos once
+    // per token/pair, preserving the arithmetic and supporting exact in-place
+    // aliasing: each pair reads and writes its own two disjoint components.
+    for (0..token_count) |token| {
         for (0..rotary_pairs) |pair| {
             const axis: usize = if (pair % 3 == 1 and pair < @as(usize, sections[1]) * 3)
                 1
@@ -37251,10 +37296,13 @@ pub fn mropeCore(
             const angle = @as(f32, @floatFromInt(position)) * freq_scale * frequency;
             const cosine = @cos(angle);
             const sine = @sin(angle);
-            const left = input[base + pair];
-            const right = input[base + rotary_pairs + pair];
-            output[base + pair] = left * cosine - right * sine;
-            output[base + rotary_pairs + pair] = left * sine + right * cosine;
+            for (0..chunks_per_token) |head| {
+                const base = (token * chunks_per_token + head) * head_dim;
+                const left = input[base + pair];
+                const right = input[base + rotary_pairs + pair];
+                output[base + pair] = left * cosine - right * sine;
+                output[base + rotary_pairs + pair] = left * sine + right * cosine;
+            }
         }
     }
 }
@@ -41056,18 +41104,23 @@ fn segmentAttentionOp(ctx: *anyopaque, q: CT, k: CT, v: CT, request: *const ops.
     const q_values = try getDataChecked(q);
     const k_values = try getDataChecked(k);
     const v_values = try getDataChecked(v);
+    const short = if (!self.cache_embeddinggemma2_bf16_weights and !platform.env.getenvBool("ANTFLY_INFERENCE_DISABLE_SHORT_SEGMENT_ATTENTION"))
+        try @import("short_segment_attention.zig").execute(self.allocator, self.io, q_values, k_values, v_values, request)
+    else
+        null;
     // The immutable weight-cache grant identifies EmbeddingGemma2 sessions.
     // Wider tiles amortize BLAS calls for moderate inputs and global heads;
     // long 256-dimensional sliding heads keep their narrower work ranges.
     const wide = self.cache_embeddinggemma2_bf16_weights and request.queries >= 256 and
         (request.queries <= 512 or request.head_dim == 512);
-    const out = if (wide and request.keys > 512)
+    const out = short orelse if (wide and request.keys > 512)
         try segmentAttentionForSession(native.EmbeddingGemma2SegmentAttentionGemm(1024), self, q_values, k_values, v_values, request)
     else if (wide)
         try segmentAttentionForSession(native.EmbeddingGemma2SegmentAttentionGemm(512), self, q_values, k_values, v_values, request)
     else
         try segmentAttentionForSession(native.SegmentAttentionGemm, self, q_values, k_values, v_values, request);
     const result = try self.makeOwnedBuf(out);
+    errdefer freeTensor(self, result);
     return try self.withLogicalShape(result, &.{ @intCast(request.queries), @intCast(request.num_heads * request.head_dim) });
 }
 
@@ -47594,6 +47647,29 @@ test "ropePerItem leaves padded positions unchanged" {
         if (@abs(original[3 * head_dim + i] - output[3 * head_dim + i]) > 1e-6) any_differ = true;
     }
     try std.testing.expect(any_differ);
+}
+
+test "M-RoPE shared head phases preserve independent heads and in-place aliasing" {
+    const tokens = 3;
+    const heads = 4;
+    const dim = 64;
+    var input: [tokens * heads * dim]f32 = undefined;
+    for (&input, 0..) |*x, i| x.* = @sin(@as(f32, @floatFromInt(i)) * 0.17);
+    const positions = [_]u32{ 0, 17, 198, 9, 2, 101, 3, 99, 5 };
+    for ([_][3]u32{ .{ 32, 0, 0 }, .{ 16, 8, 8 } }) |sections| {
+        var actual: [input.len]f32 = undefined;
+        try mropeCore(&actual, &input, tokens, dim, 160000, 0.75, &positions, sections);
+        for (0..heads) |head| {
+            var single_input: [tokens * dim]f32 = undefined;
+            for (0..tokens) |token| @memcpy(single_input[token * dim ..][0..dim], input[(token * heads + head) * dim ..][0..dim]);
+            var single_output: [single_input.len]f32 = undefined;
+            try mropeCore(&single_output, &single_input, tokens, dim, 160000, 0.75, &positions, sections);
+            for (0..tokens) |token| try std.testing.expectEqualSlices(f32, single_output[token * dim ..][0..dim], actual[(token * heads + head) * dim ..][0..dim]);
+        }
+        var aliased = input;
+        try mropeCore(&aliased, &aliased, tokens, dim, 160000, 0.75, &positions, sections);
+        try std.testing.expectEqualSlices(f32, &actual, &aliased);
+    }
 }
 
 test "Qwen3-VL interleaved M-RoPE selects temporal height and width lanes" {

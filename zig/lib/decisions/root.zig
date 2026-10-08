@@ -377,9 +377,9 @@ pub fn parse(a: A, bytes: []const u8) !Request {
     return .{ .inner = try legacy.parse(a, serialized), .items = items, .policies = policies, .batched = batched };
 }
 
-pub fn extractionInput(a: A, request: Request, gliner: bool) !legacy.ExtractionInput {
-    const lowered = try legacy.extractionInput(a, request.inner, gliner);
-    const value = try std.json.parseFromSliceLeaky(V, a, lowered.json, .{});
+pub fn extractionValue(a: A, request: Request, contract: legacy.ExecutionContract) !legacy.ExtractionValue {
+    const lowered = try legacy.extractionValue(a, request.inner, contract);
+    const value = lowered.value;
     var inputs: std.array_list.Managed(V) = .init(a);
     for (request.items) |item| {
         var fields = std.json.ObjectMap{};
@@ -389,11 +389,11 @@ pub fn extractionInput(a: A, request: Request, gliner: bool) !legacy.ExtractionI
     }
     var root = value.object;
     try root.put(a, "inputs", .{ .array = inputs });
-    return .{ .json = try std.json.Stringify.valueAlloc(a, V{ .object = root }, .{}), .schema_bytes = lowered.schema_bytes };
+    return .{ .value = .{ .object = root }, .schema_bytes = lowered.schema_bytes };
 }
 
 /// Preserve trained diagnostics while presenting the public answer arrays.
-pub fn trainedResponse(a: A, request: Request, bytes: []const u8, gliner: bool) ![]u8 {
+pub fn trainedResponse(a: A, request: Request, bytes: []const u8, contract: legacy.ExecutionContract) ![]u8 {
     const raw = try std.json.parseFromSliceLeaky(V, a, bytes, .{});
     if (raw != .object) return error.InvalidDecideOutput;
     const data = raw.object.get("data") orelse return error.InvalidDecideOutput;
@@ -405,37 +405,10 @@ pub fn trainedResponse(a: A, request: Request, bytes: []const u8, gliner: bool) 
         var one = std.json.ObjectMap{};
         try one.put(a, "data", try array(a, &.{row}));
         try one.put(a, "usage", raw.object.get("usage") orelse return error.InvalidDecideOutput);
-        const old_json = try legacy.responseJson(a, request.forItem(index), try std.json.Stringify.valueAlloc(a, V{ .object = one }, .{}), gliner);
+        const old_json = try legacy.responseJson(a, request.forItem(index), try std.json.Stringify.valueAlloc(a, V{ .object = one }, .{}), contract);
         const old = try std.json.parseFromSliceLeaky(V, a, old_json, .{});
         usage = old.object.get("usage").?;
-        var answers: std.array_list.Managed(V) = .init(a);
-        for (request.inner.questions, request.policies) |question, policy| {
-            const original = old.object.get("answers").?.object.get(question.name).?.object;
-            var answer = std.json.ObjectMap{};
-            for (original.keys(), original.values()) |key, v| {
-                if (std.mem.eql(u8, key, "type") or std.mem.eql(u8, key, "noul") or std.mem.eql(u8, key, "probabilities") or std.mem.eql(u8, key, "legend")) continue;
-                try answer.put(a, key, v);
-            }
-            try answer.put(a, "name", str(question.name));
-            try answer.put(a, "type", str(@tagName(policy.kind)));
-            try answer.put(a, "decision_method", str("typed"));
-            if (policy.kind == .predicate) {
-                try answer.put(a, "probability", original.get("noul").?);
-            } else {
-                var probabilities: std.array_list.Managed(V) = .init(a);
-                const distribution = original.get("probabilities").?.object;
-                for (question.labels, 0..) |label, i| {
-                    var probability = std.json.ObjectMap{};
-                    try probability.put(a, "probability", distribution.get(label).?);
-                    try probability.put(a, "value", if (policy.kind == .score) .{ .integer = @intCast(i) } else str(label));
-                    if (policy.kind == .score) try probability.put(a, "label", str(policy.level_labels[i]));
-                    try probabilities.append(.{ .object = probability });
-                }
-                try answer.put(a, "probabilities", .{ .array = probabilities });
-            }
-            try answers.append(.{ .object = answer });
-        }
-        single_answers = .{ .array = answers };
+        single_answers = try trainedAnswers(a, request, old);
         var result = std.json.ObjectMap{};
         try result.put(a, "input_index", .{ .integer = @intCast(index) });
         if (request.items[index].id) |id| try result.put(a, "id", str(id));
@@ -447,6 +420,85 @@ pub fn trainedResponse(a: A, request: Request, bytes: []const u8, gliner: bool) 
     try root.put(a, "usage", usage);
     try root.put(a, if (request.batched) "data" else "answers", if (request.batched) .{ .array = rows } else single_answers);
     return std.json.Stringify.valueAlloc(a, V{ .object = root }, .{});
+}
+
+fn trainedAnswers(a: A, request: Request, old: V) !V {
+    var answers: std.array_list.Managed(V) = .init(a);
+    for (request.inner.questions, request.policies) |question, policy| {
+        const original = old.object.get("answers").?.object.get(question.name).?.object;
+        var answer = std.json.ObjectMap{};
+        for (original.keys(), original.values()) |key, v| {
+            if (std.mem.eql(u8, key, "type") or std.mem.eql(u8, key, "noul") or std.mem.eql(u8, key, "probabilities") or std.mem.eql(u8, key, "legend")) continue;
+            try answer.put(a, key, v);
+        }
+        try answer.put(a, "name", str(question.name));
+        try answer.put(a, "type", str(@tagName(policy.kind)));
+        try answer.put(a, "decision_method", str("typed"));
+        if (policy.kind == .predicate) {
+            try answer.put(a, "probability", original.get("noul").?);
+        } else {
+            var probabilities: std.array_list.Managed(V) = .init(a);
+            const distribution = original.get("probabilities").?.object;
+            for (question.labels, 0..) |label, i| {
+                var probability = std.json.ObjectMap{};
+                try probability.put(a, "probability", distribution.get(label).?);
+                try probability.put(a, "value", if (policy.kind == .score) .{ .integer = @intCast(i) } else str(label));
+                if (policy.kind == .score) try probability.put(a, "label", str(policy.level_labels[i]));
+                try probabilities.append(.{ .object = probability });
+            }
+            try answer.put(a, "probabilities", .{ .array = probabilities });
+        }
+        try answers.append(.{ .object = answer });
+    }
+    return .{ .array = answers };
+}
+
+pub fn trainedClassifications(a: A, request: Request, classifications: anytype, prompt_tokens: usize) ![]u8 {
+    if (request.items.len != 1) return error.InvalidDecideOutput;
+    const old = try legacy.responseClassificationsValue(a, request.forItem(0), classifications, prompt_tokens);
+    const answers = try trainedAnswers(a, request, old);
+    var root = std.json.ObjectMap{};
+    try root.put(a, "model", str(request.inner.model));
+    try root.put(a, "usage", old.object.get("usage").?);
+    if (request.batched) {
+        var row = std.json.ObjectMap{};
+        try row.put(a, "input_index", .{ .integer = 0 });
+        if (request.items[0].id) |id| try row.put(a, "id", str(id));
+        try row.put(a, "answers", answers);
+        try root.put(a, "data", try array(a, &.{.{ .object = row }}));
+    } else try root.put(a, "answers", answers);
+    return std.json.Stringify.valueAlloc(a, V{ .object = root }, .{});
+}
+
+test "decisions typed span presenter preserves public score labels predicate and single item batch" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const Label = struct { label: []const u8, confidence: f32 };
+    const Classification = struct { name: []const u8, labels: []const Label };
+    const classifications: []const Classification = &.{
+        .{ .name = "risk", .labels = &.{ .{ .label = "1", .confidence = 0.8 }, .{ .label = "0", .confidence = 0.2 } } },
+        .{ .name = "act", .labels = &.{ .{ .label = "false", .confidence = 0.1 }, .{ .label = "true", .confidence = 0.9 } } },
+    };
+    var request = try parse(a,
+        \\{"model":"span","inputs":[{"id":"first","input":"one"}],"questions":[{"name":"risk","type":"score","instructions":"Risk?","levels":[{"label":"safe","description":"Low risk"},{"label":"unsafe","description":"High risk"}]},{"name":"act","type":"predicate","instructions":"Act?"}]}
+    );
+    for ([_]bool{ true, false }) |batched| {
+        request.batched = batched;
+        const value = try std.json.parseFromSliceLeaky(V, a, try trainedClassifications(a, request, classifications, 10), .{});
+        const answers = if (batched) blk: {
+            try std.testing.expect(!value.object.contains("answers"));
+            const row = value.object.get("data").?.array.items[0].object;
+            try std.testing.expectEqualStrings("first", row.get("id").?.string);
+            try std.testing.expectEqual(@as(i64, 0), row.get("input_index").?.integer);
+            break :blk row.get("answers").?.array.items;
+        } else value.object.get("answers").?.array.items;
+        try std.testing.expectEqualStrings("safe", answers[0].object.get("probabilities").?.array.items[0].object.get("label").?.string);
+        try std.testing.expectEqualStrings("typed", answers[0].object.get("decision_method").?.string);
+        try std.testing.expectEqualStrings("predicate", answers[1].object.get("type").?.string);
+        try std.testing.expectApproxEqAbs(@as(f64, 0.9), answers[1].object.get("probability").?.float, 1e-6);
+        try std.testing.expectEqual(@as(i64, 10), value.object.get("usage").?.object.get("input_tokens").?.integer);
+    }
 }
 
 test "decisions public contract isolates per-question acceptance and preserves batches" {
@@ -478,7 +530,7 @@ test "decisions public trained batches preserve diagnostics labels and aggregate
     );
     const response = try trainedResponse(a, request,
         \\{"data":[{"decisions":[{"name":"risk","probabilities":[{"label":"0","probability":0.2},{"label":"1","probability":0.8}],"confidence":0.4,"confidence_method":"normalized_inverse_entropy","act_probability":0.9},{"name":"act","probabilities":[{"label":"false","probability":0.1},{"label":"true","probability":0.9}],"confidence":0.9,"confidence_method":"max_probability","act_probability":0.8}]},{"decisions":[{"name":"risk","probabilities":[{"label":"0","probability":0.7},{"label":"1","probability":0.3}],"confidence":0.1,"confidence_method":"normalized_inverse_entropy"},{"name":"act","probabilities":[{"label":"false","probability":0.8},{"label":"true","probability":0.2}],"confidence":0.8,"confidence_method":"max_probability"}]}],"usage":{"prompt_tokens":30,"completion_tokens":0}}
-    , false);
+    , .laya);
     const value = try std.json.parseFromSliceLeaky(V, a, response, .{});
     try std.testing.expect(!value.object.contains("answers"));
     try std.testing.expectEqual(@as(i64, 30), value.object.get("usage").?.object.get("input_tokens").?.integer);

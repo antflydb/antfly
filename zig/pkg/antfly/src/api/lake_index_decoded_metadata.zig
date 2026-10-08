@@ -28,9 +28,7 @@ pub fn Owned(comptime T: type) type {
         }
     };
 }
-pub fn acquire(comptime T: type, cached: artifacts.CachedRead, store: stores.ArtifactStore, ref: local.serverless_manifest_artifact_ref.ArtifactRef, cancellation: @import("antfly_cancellation").CancellationToken, comptime load: anytype) !Owned(T) {
-    try cached.context.ensureActive();
-    try cancellation.check();
+fn cacheKey(comptime T: type, cached: artifacts.CachedRead, ref: local.serverless_manifest_artifact_ref.ArtifactRef) ![32]u8 {
     try stores.validateSha256ArtifactIdentity(ref.artifact_id, ref.checksum);
     var hash = std.crypto.hash.Blake3.init(.{});
     hash.update("antfly.native-decoded-metadata.v1");
@@ -48,6 +46,21 @@ pub fn acquire(comptime T: type, cached: artifacts.CachedRead, store: stores.Art
     hash.update(&length);
     var key: [32]u8 = undefined;
     hash.final(&key);
+    return key;
+}
+
+/// A planning hint only. Serving still acquires a validated, scope-fenced lease.
+pub fn resident(comptime T: type, cached: artifacts.CachedRead, ref: local.serverless_manifest_artifact_ref.ArtifactRef) !bool {
+    try cached.context.ensureActive();
+    const lease = cached.cache.decoded.lookup(try cacheKey(T, cached, ref)) orelse return false;
+    lease.release();
+    return true;
+}
+
+pub fn acquire(comptime T: type, cached: artifacts.CachedRead, store: stores.ArtifactStore, ref: local.serverless_manifest_artifact_ref.ArtifactRef, cancellation: @import("antfly_cancellation").CancellationToken, comptime load: anytype) !Owned(T) {
+    try cached.context.ensureActive();
+    try cancellation.check();
+    const key = try cacheKey(T, cached, ref);
     var loader = struct {
         store: stores.ArtifactStore,
         ref: local.serverless_manifest_artifact_ref.ArtifactRef,
@@ -98,7 +111,9 @@ test "external lake decoded metadata reuses owned values while fencing scope ver
     const id = try scope.artifactId(&checksum);
     var ref: local.serverless_manifest_artifact_ref.ArtifactRef = .{ .kind = .external_base_source, .artifact_id = &id, .checksum = &checksum, .byte_len = 8 };
     var cached: artifacts.CachedRead = .{ .cache = &cache, .scope = @splat(1), .context = .{} };
+    try std.testing.expect(!try resident(Value, cached, ref));
     const first = try acquire(Value, cached, undefined, ref, .none, Loader.load);
+    try std.testing.expect(try resident(Value, cached, ref));
     const second = try acquire(Value, cached, undefined, ref, .none, Loader.load);
     try std.testing.expect(first.value == second.value);
     first.release();
@@ -106,11 +121,14 @@ test "external lake decoded metadata reuses owned values while fencing scope ver
     second.release();
     try std.testing.expectEqual(@as(usize, 1), Loader.calls);
     cached.context.deadline_ns = 1;
+    try std.testing.expectError(error.DeadlineExceeded, resident(Value, cached, ref));
     try std.testing.expectError(error.DeadlineExceeded, acquire(Value, cached, undefined, ref, .none, Loader.load));
     cached.context = .{};
     cached.scope = @splat(2);
+    try std.testing.expect(!try resident(Value, cached, ref));
     (try acquire(Value, cached, undefined, ref, .none, Loader.load)).release();
     ref.metadata_version += 1;
+    try std.testing.expect(!try resident(Value, cached, ref));
     (try acquire(Value, cached, undefined, ref, .none, Loader.load)).release();
     try std.testing.expectEqual(@as(usize, 3), Loader.calls);
 }

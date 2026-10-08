@@ -30,6 +30,7 @@ const backends = @import("../backends/backends.zig");
 const model_caps = @import("../models/capabilities.zig");
 const manifest_mod = @import("../models/manifest.zig");
 const model_compatibility = @import("../models/compatibility.zig");
+const gliner_decide_qualification = @import("../models/gliner_decide_qualification.zig");
 const managed_receipt = @import("../registry/managed_receipt.zig");
 const safetensors_mod = @import("../models/safetensors.zig");
 const c_file = @import("../util/c_file.zig");
@@ -3018,7 +3019,12 @@ pub const LoadedModel = struct {
             .execution_lock = self.targetInferenceExecutionMutex(),
             .config = .{
                 .max_width = self.manifest.gliner_max_width,
-                .max_length = self.manifest.max_position_embeddings,
+                .max_length = if (self.manifest.gliner_architecture == .span and
+                    self.manifest.gliner_span_encoder_family == .modern_bert and
+                    self.session.backend() == .cuda)
+                    @min(self.manifest.max_position_embeddings, 512)
+                else
+                    self.manifest.max_position_embeddings,
                 .threshold = self.manifest.gliner_threshold,
                 .flat_ner = self.manifest.gliner_flat_ner,
                 .default_labels = self.manifest.gliner_default_labels,
@@ -4245,6 +4251,29 @@ pub const ModelManager = struct {
         self: *const ModelManager,
     ) *runtime.tier.memory.AdmissionController {
         return &self.resource_domain.?.admission;
+    }
+
+    /// Exact admission ownership held by the live Hugging Face tokenizer
+    /// caches. Cache growth is charged in independent quantum leases owned by
+    /// ResourceDomain records, rather than by LoadedModel.tokenizer_resource_lease.
+    /// Callers that reconcile an idle domain must include both sources.
+    pub fn tokenizerCacheAdmissionAmounts(
+        self: *const ModelManager,
+    ) !runtime.tier.memory.AdmissionAmounts {
+        const domain = self.resource_domain orelse return .{};
+        var total: runtime.tier.memory.AdmissionAmounts = .{};
+        for (&domain.tokenizer_cache_budget_shards) |*shard| {
+            spinLock(&shard.mutex);
+            {
+                defer shard.mutex.unlock();
+                var records = shard.records.valueIterator();
+                while (records.next()) |record_ptr| {
+                    for (record_ptr.*.credits.items) |credit|
+                        total = try total.merge(credit.amounts);
+                }
+            }
+        }
+        return total;
     }
 
     fn tokenizerCacheBudgetShard(
@@ -7298,6 +7327,7 @@ pub const ModelManager = struct {
         // Load tokenizer
         var hf_tok: ?*hf_tokenizer.HfTokenizer = null;
         var sp_tok: ?*sentencepiece.Processor = null;
+        var gliner_span_tokenizer_digest: ?gliner_decide_qualification.Digest = null;
 
         const tokenizer_type = blk: {
             if (shouldPreferSentencePieceOverride(man, model_dir, self.allocator)) {
@@ -7338,6 +7368,18 @@ pub const ModelManager = struct {
                     // separate pathname check leaves a replacement window.
                     try man.verifyBoundarySidecar("tokenizer.json", bytes);
                     break :blk try hf_tokenizer.HfTokenizer.loadFromBytesWithOptions(self.allocator, bytes, .{ .strict_unigram_normalizer = true });
+                } else if (man.gliner_architecture == .span and man.gliner_span_declared) blk: {
+                    const path = man.tokenizer_json_path orelse return error.NoTokenizerFound;
+                    const bytes = try c_file.readFileMax(self.allocator, path, 32 * 1024 * 1024);
+                    defer self.allocator.free(bytes);
+                    const digest = gliner_decide_qualification.Digest.of(bytes);
+                    if (man.gliner_span_tokenizer_digest) |expected| {
+                        if (digest.size_bytes != expected.size_bytes or !std.mem.eql(u8, &digest.sha256, &expected.sha256))
+                            return error.GlinerDecisionArtifactMismatch;
+                    } else return error.MissingGlinerDecisionIdentity;
+                    const tokenizer = try hf_tokenizer.HfTokenizer.loadFromBytes(self.allocator, bytes);
+                    gliner_span_tokenizer_digest = digest;
+                    break :blk tokenizer;
                 } else try loadHuggingFaceTokenizerFromManifest(self.allocator, &man);
                 try hf_tok.?.configureBpeCache(self.tokenizer_cache_config);
                 try hf_tok.?.configureParallelBpe(
@@ -7379,6 +7421,8 @@ pub const ModelManager = struct {
             const identity = try session_factory.getGlinerBoundaryIdentity(session);
             try identity.verifySidecars(try man.boundarySidecarDigests());
         }
+        if (gliner_span_tokenizer_digest) |digest|
+            try session_factory.sealGlinerDecisionTokenizerDigest(session, digest);
 
         var whisper_prompt_cache: ?whisper_prompt.PromptCache = if (session_factory.getWhisperConfig(session) != null)
             try whisper_prompt.PromptCache.init(

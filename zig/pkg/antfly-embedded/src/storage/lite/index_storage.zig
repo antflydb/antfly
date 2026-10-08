@@ -35,6 +35,12 @@ const StorageIo = storage_io.Storage;
 const SegmentSource = @import("../../segment_source.zig").Source;
 const MappedArtifact = @import("../../segment_source.zig").MappedArtifact;
 
+// Root leases use file descriptors and lock markers, independently of mmap.
+const supports_native_artifact_leases = switch (builtin.os.tag) {
+    .linux, .macos, .freebsd, .netbsd, .openbsd, .dragonfly => true,
+    else => false,
+};
+
 const supports_mapped_artifacts = switch (builtin.os.tag) {
     .linux, .macos, .freebsd, .netbsd, .openbsd, .dragonfly => true,
     else => false,
@@ -52,7 +58,7 @@ pub const Store = struct {
         .read_file_range_alloc = readFileRangeAlloc,
         .open_immutable_source = openImmutableSource,
         // Root leases require hosted file descriptors and lock markers.
-        .open_leased_immutable_source = if (supports_mapped_artifacts) openLeasedImmutableSource else null,
+        .open_leased_immutable_source = if (supports_native_artifact_leases) openLeasedImmutableSource else null,
         .map_immutable_artifact = if (supports_mapped_artifacts) mapImmutableArtifact else null,
         .file_size = fileSize,
         .read_file_trailer_alloc = readFileTrailerAlloc,
@@ -105,8 +111,8 @@ fn lockStore(store: *docstore.Store) void {
 }
 
 fn pinSnapshot(store: *docstore.Store) !docstore.Txn {
-    // The generation lock fences replacement; this pin additionally fences
-    // in-place reuse for the entire metadata/value read or cursor traversal.
+    // Admission pins the inode across replacement, then the reader frontier
+    // fences in-place reuse for the full metadata/value read or traversal.
     return store.beginRead();
 }
 
@@ -134,27 +140,23 @@ fn validateIndexPath(self: *const Store, path: []const u8) !void {
 fn readFileAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, max_bytes: usize) ![]u8 {
     const self: *Store = @ptrCast(@alignCast(ptr));
     try validateIndexPath(self, path);
-    const io = self.docs.file.runtime();
-    self.docs.generation_lock.lockSharedUncancelable(io);
-    defer self.docs.generation_lock.unlockShared(io);
     var snapshot = try pinSnapshot(self.docs);
     defer snapshot.abort();
     const checkpoint = snapshot.checkpoint;
+    const file = try snapshot.readFile();
 
-    return (try self.docs.file.getIndexCatalogRecordLimitedAtCheckpointAlloc(allocator, path, max_bytes, checkpoint)) orelse error.FileNotFound;
+    return (try file.getIndexCatalogRecordLimitedAtCheckpointAlloc(allocator, path, max_bytes, checkpoint)) orelse error.FileNotFound;
 }
 
 fn readFileRangeAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, offset: u64, len: usize) ![]u8 {
     const self: *Store = @ptrCast(@alignCast(ptr));
     try validateIndexPath(self, path);
-    const io = self.docs.file.runtime();
-    self.docs.generation_lock.lockSharedUncancelable(io);
-    defer self.docs.generation_lock.unlockShared(io);
     var snapshot = try pinSnapshot(self.docs);
     defer snapshot.abort();
     const checkpoint = snapshot.checkpoint;
+    const file = try snapshot.readFile();
 
-    return (try self.docs.file.getIndexCatalogRecordRangeAtCheckpointAlloc(allocator, path, offset, len, checkpoint)) orelse return error.FileNotFound;
+    return (try file.getIndexCatalogRecordRangeAtCheckpointAlloc(allocator, path, offset, len, checkpoint)) orelse return error.FileNotFound;
 }
 
 // This handle pins the inode AND checkpoint for its entire lifetime, rather
@@ -174,6 +176,10 @@ fn openImmutableSource(ptr: *anyopaque, allocator: Allocator, path: []const u8) 
             const state: *@This() = @ptrCast(@alignCast(ptr_));
             try state.snapshot.readIndexValueInto(state.value, offset, out);
         }
+        fn authenticate(ptr_: *anyopaque, offset: u64, length: u64, within: usize, out: []u8, expected: ?u32) !void {
+            const state: *@This() = @ptrCast(@alignCast(ptr_));
+            return state.snapshot.readAuthenticatedIndexValue(state.value, offset, length, within, out, expected);
+        }
         fn checksum(ptr_: *anyopaque, offset: u64, length: u64) !u32 {
             const state: *@This() = @ptrCast(@alignCast(ptr_));
             return state.snapshot.checksumIndexValue(state.value, offset, length);
@@ -192,7 +198,7 @@ fn openImmutableSource(ptr: *anyopaque, allocator: Allocator, path: []const u8) 
     errdefer snapshot.abort();
     const value = try snapshot.openIndexValue(allocator, path);
     state.* = .{ .allocator = allocator, .snapshot = snapshot, .value = value };
-    return .{ .ranges = .{ .ptr = state, .length = value.length, .read_into = State.read, .close = State.close, .checksum = State.checksum } };
+    return .{ .ranges = .{ .ptr = state, .length = value.length, .read_into = State.read, .close = State.close, .checksum = State.checksum, .read_authenticated = State.authenticate } };
 }
 
 // Long-lived sources own their I/O lifetime and lease only immutable roots.
@@ -248,31 +254,27 @@ fn mapImmutableArtifact(ptr: *anyopaque, allocator: Allocator, path: []const u8)
 fn fileSize(ptr: *anyopaque, path: []const u8) !u64 {
     const self: *Store = @ptrCast(@alignCast(ptr));
     try validateIndexPath(self, path);
-    const io = self.docs.file.runtime();
-    self.docs.generation_lock.lockSharedUncancelable(io);
-    defer self.docs.generation_lock.unlockShared(io);
     var snapshot = try pinSnapshot(self.docs);
     defer snapshot.abort();
     const checkpoint = snapshot.checkpoint;
+    const file = try snapshot.readFile();
 
-    const size = (try self.docs.file.getIndexCatalogRecordSizeAtCheckpoint(path, checkpoint)) orelse return error.FileNotFound;
+    const size = (try file.getIndexCatalogRecordSizeAtCheckpoint(path, checkpoint)) orelse return error.FileNotFound;
     return @intCast(size);
 }
 
 fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) !storage_io.FileTrailer {
     const self: *Store = @ptrCast(@alignCast(ptr));
     try validateIndexPath(self, path);
-    const io = self.docs.file.runtime();
-    self.docs.generation_lock.lockSharedUncancelable(io);
-    defer self.docs.generation_lock.unlockShared(io);
     var snapshot = try pinSnapshot(self.docs);
     defer snapshot.abort();
     const checkpoint = snapshot.checkpoint;
+    const file = try snapshot.readFile();
 
-    const size = (try self.docs.file.getIndexCatalogRecordSizeAtCheckpoint(path, checkpoint)) orelse return error.FileNotFound;
+    const size = (try file.getIndexCatalogRecordSizeAtCheckpoint(path, checkpoint)) orelse return error.FileNotFound;
     if (size < len) return error.EndOfStream;
     return .{
-        .bytes = (try self.docs.file.getIndexCatalogRecordRangeAtCheckpointAlloc(allocator, path, @intCast(size - len), len, checkpoint)) orelse return error.FileNotFound,
+        .bytes = (try file.getIndexCatalogRecordRangeAtCheckpointAlloc(allocator, path, @intCast(size - len), len, checkpoint)) orelse return error.FileNotFound,
         .file_size = size,
     };
 }
@@ -416,12 +418,10 @@ fn listFileNamesAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8) !
     const self: *Store = @ptrCast(@alignCast(ptr));
     const directory = if (std.mem.eql(u8, path, "/")) path else std.mem.trimEnd(u8, path, "/");
     try validateIndexPath(self, directory);
-    const io = self.docs.file.runtime();
-    self.docs.generation_lock.lockSharedUncancelable(io);
-    defer self.docs.generation_lock.unlockShared(io);
     var snapshot = try pinSnapshot(self.docs);
     defer snapshot.abort();
     const checkpoint = snapshot.checkpoint;
+    const file = try snapshot.readFile();
     const prefix = if (std.mem.eql(u8, directory, "/"))
         try allocator.dupe(u8, "/")
     else
@@ -432,9 +432,9 @@ fn listFileNamesAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8) !
     // make a raw descendant key an immediate file. Preserve those keys through
     // the general prefix cursor rather than skipping their byte ranges.
     var cursor = if (self.namespace_prefix.len != 0)
-        try self.docs.file.indexCatalogDirectoryCursor(checkpoint, prefix)
+        try file.indexCatalogDirectoryCursor(checkpoint, prefix)
     else
-        try self.docs.file.indexCatalogCursor(checkpoint, prefix);
+        try file.indexCatalogCursor(checkpoint, prefix);
     defer cursor.deinit();
     var names = std.ArrayListUnmanaged([]u8).empty;
     errdefer {
@@ -442,7 +442,7 @@ fn listFileNamesAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8) !
         names.deinit(allocator);
     }
     while (try cursor.next()) |record| {
-        defer self.docs.file.allocator.free(record.key);
+        defer file.allocator.free(record.key);
         const parent = std.fs.path.dirname(record.key) orelse continue;
         if (!std.mem.eql(u8, parent, directory)) continue;
         const name = try allocator.dupe(u8, std.fs.path.basename(record.key));
@@ -516,7 +516,7 @@ const NativeAtomicWriteSink = struct {
         .crc32_prefix = crc32Prefix,
         .crc32_range = crc32Range,
         .finish = finish,
-        .finish_source = if (supports_mapped_artifacts) finishSource else null,
+        .finish_source = if (supports_native_artifact_leases) finishSource else null,
         .finish_mapped = if (supports_mapped_artifacts) finishMapped else null,
         .abort = abort,
         .set_cache_intent = setCacheIntent,
@@ -533,6 +533,10 @@ const NativeAtomicWriteSink = struct {
         const io = self.storage.docs.file.runtime();
         if (self.file) |file| file.close(io);
         if (self.tmp_path) |path| {
+            // A staging path can remain if its initial unlink failed.
+            // Abort and failed publication must remove it even if canceled.
+            const previous = io.swapCancelProtection(.blocked);
+            defer _ = io.swapCancelProtection(previous);
             std.Io.Dir.cwd().deleteFile(io, path) catch {};
             self.allocator.free(path);
         }
@@ -1047,6 +1051,66 @@ test "lite native index storage aborts atomic writes without publishing partial 
     }
 }
 
+test "lite native staged abort removes staging despite pending cancellation" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp, "canceled-staging.aflite");
+    defer alloc.free(path);
+    var pool = std.Io.Threaded.init(alloc, .{ .concurrent_limit = .limited(4) });
+    defer pool.deinit();
+    const io = pool.io();
+    var docs = try docstore.Store.createWithOptions(alloc, path, .{ .no_sync = true, .io = io });
+    defer docs.close();
+    var indexes = Store.init(alloc, &docs);
+    try indexes.storage().writeFileAbsolute("/published", "retained");
+    const State = struct {
+        started: std.Io.Event = .unset,
+        release: std.Io.Event = .unset,
+        failure: ?anyerror = null,
+        fn run(i: std.Io, self: *@This(), storage: StorageIo) void {
+            self.write(i, storage) catch |err| {
+                self.failure = err;
+                self.started.set(i);
+            };
+        }
+        fn write(self: *@This(), i: std.Io, storage: StorageIo) !void {
+            var sink = try storage.beginAtomicWrite(std.testing.allocator, "/block");
+            defer sink.abort();
+            const chunk: [64 * 1024]u8 = @splat('x');
+            try sink.appendSlice(&chunk); // Force a physical staging file.
+            const native_sink: *NativeAtomicWriteSink = @ptrCast(@alignCast(sink.ptr));
+            if (native_sink.tmp_path == null) {
+                // Model a failed initial unlink on POSIX, retaining a named
+                // staging inode so this exercises deletion on every host.
+                const retained_path = try std.fs.path.join(std.testing.allocator, &.{ std.fs.path.dirname(native_sink.storage.docs.file.path).?, ".aflite-write-canceled-regression" });
+                errdefer std.testing.allocator.free(retained_path);
+                const retained_file = try std.Io.Dir.cwd().createFile(i, retained_path, .{ .read = true, .exclusive = true });
+                if (native_sink.file) |file| file.close(i);
+                native_sink.file = retained_file;
+                native_sink.tmp_path = retained_path;
+            }
+            self.started.set(i);
+            // Re-arm the cancellation delivered by the gate so it is
+            // deterministically pending when the deferred abort starts.
+            self.release.wait(i) catch i.recancel();
+        }
+    };
+    var state: State = .{};
+    var child = try io.concurrent(State.run, .{ io, &state, indexes.storage() });
+    state.started.waitUncancelable(io);
+    child.cancel(io);
+    if (state.failure) |err| return err;
+    var iter = tmp.dir.iterate();
+    while (try iter.next(io)) |entry| {
+        try std.testing.expect(!std.mem.startsWith(u8, entry.name, ".aflite-write-"));
+    }
+    try std.testing.expectError(error.FileNotFound, indexes.storage().fileSize("/block"));
+    const retained = try indexes.storage().readFileAlloc(alloc, "/published", 32);
+    defer alloc.free(retained);
+    try std.testing.expectEqualStrings("retained", retained);
+}
+
 test "lite native index storage read-only open rejects mutations" {
     const allocator = std.testing.allocator;
 
@@ -1378,6 +1442,10 @@ test "lite native cold atomic writes preserve hot pages with bounded cache admis
     {
         var docs = try docstore.Store.createWithOptions(alloc, path, .{ .no_sync = true, .io = std.testing.io });
         defer docs.close();
+        // Cache admission assertions need one stable file generation. Automatic
+        // vacuum can replace the file and reclaim its cache during inspection;
+        // concurrent maintenance is covered by the dedicated vacuum tests.
+        docs.maintenance_start_suppressed = true;
         docs.file.page_cache.limit_bytes = 256 * 1024;
         var indexes = Store.init(alloc, &docs);
         const storage = indexes.storage();
@@ -2127,7 +2195,7 @@ test "lite artifact leases transfer retired inode accounting between readers" {
     try std.testing.expect((try cursor.next()) == null);
 }
 
-test "lite artifact leases bounded range scope reduces native identity reads" {
+test "lite artifact leases bounded range scope reduces source identity reads" {
     const a = std.testing.allocator;
     const segment = @import("../../segment.zig");
     var tmp = std.testing.tmpDir(.{});
@@ -2155,26 +2223,45 @@ test "lite artifact leases bounded range scope reduces native identity reads" {
     var reader = try segment.RangeSegmentReader.init(a, source, .{});
     source_open = false;
     defer reader.deinit();
+    // Native artifact and integrity caches may already eliminate physical
+    // reads. Measure calls to that source separately from actual disk reads.
+    const Counting = struct {
+        original: segment.SegmentSource,
+        calls: usize = 0,
+        fn read(ptr: *anyopaque, offset: u64, out_bytes: []u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try self.original.readInto(offset, out_bytes);
+        }
+        fn close(_: *anyopaque) void {}
+    };
+    var counting = Counting{ .original = reader.source };
+    reader.source = .{ .ranges = .{ .ptr = &counting, .length = counting.original.len(), .read_into = Counting.read, .close = Counting.close } };
+    defer reader.source = counting.original;
     const registry = docs.artifact_registry.?;
-    var before = registry.testPageReads();
+    const native_before = registry.testPageReads();
     for (0..count) |doc| {
         const id = (try reader.storedDocIdOwned(a, @intCast(doc), 32)).?;
         a.free(id);
     }
-    const baseline = registry.testPageReads() - before;
+    const baseline = counting.calls;
+    const native_uncached = registry.testPageReads() - native_before;
+    counting.calls = 0;
     var scope = try segment.RangeSegmentReader.ReadScope.init(a, &reader, 256 * 1024);
     defer scope.deinit();
-    before = registry.testPageReads();
+    const native_scoped_before = registry.testPageReads();
     for (0..count) |doc| {
         const id = (try scope.storedDocIdOwned(a, @intCast(doc), 32)).?;
         defer a.free(id);
         var expected: [32]u8 = undefined;
         try std.testing.expectEqualStrings(try std.fmt.bufPrint(&expected, "article-{d:0>6}", .{doc}), id);
     }
-    const cached = registry.testPageReads() - before;
+    const cached = counting.calls;
+    const native_cached = registry.testPageReads() - native_scoped_before;
+    try std.testing.expect(baseline >= count);
     try std.testing.expect(cached < baseline / 16);
     try std.testing.expect(scope.cache.retainedBytes() <= 256 * 1024);
-    std.debug.print("LITE_RANGE_SCOPE documents={d} uncached_native_page_reads={d} cached_native_page_reads={d} cache_bytes={d}\n", .{ count, baseline, cached, scope.cache.retainedBytes() });
+    std.debug.print("LITE_RANGE_SCOPE documents={d} uncached_provider_calls={d} cached_provider_calls={d} uncached_native_page_reads={d} cached_native_page_reads={d} cache_bytes={d}\n", .{ count, baseline, cached, native_uncached, native_cached, scope.cache.retainedBytes() });
 }
 
 test "lite artifact leases orphan service advances past live markers with bounded work" {
@@ -2216,4 +2303,228 @@ test "lite artifact leases orphan service advances past live markers with bounde
     try std.testing.expectEqual(@as(usize, 64), try artifact.cleanupOrphans(&docs.file, &sweep));
     try std.testing.expectEqual(@as(usize, 1), try artifact.cleanupOrphans(&docs.file, &sweep));
     try std.testing.expect((try docs.checkWithCancel(null)).valid);
+}
+
+test "lite lsm artifact sources reuse navigation without checkpoint pins and survive vacuum" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "lsm-source-leases.aflite");
+    defer a.free(path);
+    var docs = try docstore.Store.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io, .reclamation = .{ .enabled = false } });
+    defer docs.close();
+    docs.maintenance_start_suppressed = true;
+    var indexes = Store.init(a, &docs);
+    const storage = indexes.storage();
+    var backend = @import("../lsm_backend.zig").Backend.init(a, .{ .storage = storage });
+    defer backend.close();
+    try storage.writeFileAbsolute("/runs/one", "immutable run payload");
+    const before = docs.file.activeCheckpoint().commit_sequence;
+    for (0..128) |i| {
+        const bytes = try backend.readRunRangeAlloc(a, "/runs/one", 0, 9);
+        defer a.free(bytes);
+        try std.testing.expectEqualStrings("immutable", bytes);
+        if (i > 0) try std.testing.expectEqual(before + 1, docs.file.activeCheckpoint().commit_sequence);
+    }
+    try std.testing.expectEqual(@as(usize, 1), backend.run_sources.items.len);
+    try std.testing.expectEqual(@as(u64, 0), (try docs.reclamationStatus()).retained_readers);
+    const old_use = backend.retainCachedRunSource("/runs/one").?;
+    var old_use_open = true;
+    defer if (old_use_open) old_use.release();
+    try storage.writeFileAbsolute("/runs/one", "replacement run");
+    _ = try docs.vacuum();
+    const old = try backend.readRunRangeAlloc(a, "/runs/one", 0, 9);
+    defer a.free(old);
+    try std.testing.expectEqualStrings("immutable", old);
+    old_use.release();
+    old_use_open = false;
+    const reopened = try backend.readRunRangeAlloc(a, "/runs/one", 0, 11);
+    defer a.free(reopened);
+    try std.testing.expectEqualStrings("replacement", reopened);
+    var pinned: [24]?*@import("../lsm_backend/source_lease.zig").Lease = @splat(null);
+    defer for (&pinned) |*lease| if (lease.*) |owned| {
+        owned.release();
+    };
+    for (0..24) |i| {
+        var buf: [64]u8 = undefined;
+        const key = try std.fmt.bufPrint(&buf, "/runs/{d}", .{i});
+        try storage.writeFileAbsolute(key, "run");
+        const bytes = try backend.readRunRangeAlloc(a, key, 0, 3);
+        a.free(bytes);
+        pinned[i] = backend.retainCachedRunSource(key).?;
+    }
+    const sequence = docs.file.activeCheckpoint().commit_sequence;
+    for (0..4) |_| for (0..24) |i| {
+        var buf: [64]u8 = undefined;
+        const key = try std.fmt.bufPrint(&buf, "/runs/{d}", .{i});
+        const bytes = try backend.readRunRangeAlloc(a, key, 0, 3);
+        a.free(bytes);
+    };
+    try std.testing.expectEqual(sequence, docs.file.activeCheckpoint().commit_sequence);
+    for (&pinned) |*lease| {
+        lease.*.?.release();
+        lease.* = null;
+    }
+    backend.trimRunSources();
+    try std.testing.expect(backend.run_sources.items.len <= 16);
+    try std.testing.expectEqual(@as(u64, 0), (try docs.reclamationStatus()).retired_file_bytes);
+}
+
+test "lite lsm merge cursor retains active run sources and trims idle leases on close" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "lsm-cursor-leases.aflite");
+    defer a.free(path);
+    var docs = try docstore.Store.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io, .reclamation = .{ .enabled = false } });
+    defer docs.close();
+    docs.maintenance_start_suppressed = true;
+    var indexes = Store.init(a, &docs);
+    const Backend = @import("../lsm_backend.zig").Backend;
+    const options = @import("../lsm_backend.zig").Options{ .storage = indexes.storage(), .flush_threshold = 1, .compact_threshold_runs = 100, .l0_overlap_compact_threshold_runs = 100, .l0_hard_limit_runs = 100, .table_block_compression = .none };
+    {
+        var backend = try Backend.open(a, "/cursor-runs", options);
+        defer backend.close();
+        var runtime = try backend.runtimeStore(a, .{ .name = "docs" });
+        defer runtime.deinit();
+        for (0..24) |i| {
+            var first: [32]u8 = undefined;
+            var last: [32]u8 = undefined;
+            var txn = try runtime.beginWrite();
+            errdefer txn.abort();
+            try txn.put(try std.fmt.bufPrint(&first, "a{d:0>2}", .{i}), "first");
+            try txn.put(try std.fmt.bufPrint(&last, "z{d:0>2}", .{i}), "last");
+            try txn.commit();
+        }
+    }
+    var backend = try Backend.open(a, "/cursor-runs", options);
+    defer backend.close();
+    var runtime = try backend.runtimeStore(a, .{ .name = "docs" });
+    defer runtime.deinit();
+    var read = try runtime.beginRead();
+    defer read.abort();
+    var cursor = try read.openCursor();
+    var cursor_open = true;
+    defer if (cursor_open) cursor.close();
+    _ = (try cursor.first()).?;
+    try std.testing.expect(backend.run_sources.items.len > 16);
+    var count: usize = 1;
+    while (try cursor.next()) |_| count += 1;
+    try std.testing.expectEqual(@as(usize, 48), count);
+    cursor.close();
+    cursor_open = false;
+    try std.testing.expect(backend.run_sources.items.len <= 16);
+    try std.testing.expectEqualStrings("first", try read.get("a00"));
+}
+
+test "lite lsm idle run source releases retired inode during vacuum" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "review-idle.aflite");
+    defer a.free(path);
+    var docs = try docstore.Store.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io, .reclamation = .{ .enabled = false } });
+    defer docs.close();
+    docs.maintenance_start_suppressed = true;
+    var indexes = Store.init(a, &docs);
+    const storage = indexes.storage();
+    var backend = @import("../lsm_backend.zig").Backend.init(a, .{ .storage = storage });
+    defer backend.close();
+    try storage.writeFileAbsolute("/runs/idle", "unchanged immutable run");
+    const bytes = try backend.readRunRangeAlloc(a, "/runs/idle", 0, 9);
+    a.free(bytes);
+    _ = try docs.vacuum();
+    const status = try docs.reclamationStatus();
+    try std.testing.expectEqual(@as(u64, 0), status.retained_readers);
+    try std.testing.expectEqual(@as(usize, 1), backend.run_sources.items.len);
+    try std.testing.expectEqual(@as(u64, 0), status.retired_file_bytes);
+    try std.testing.expectEqual(@as(u64, 0), docs.artifact_registry.?.testPageReads());
+    const reopened = try backend.readRunRangeAlloc(a, "/runs/idle", 0, 9);
+    defer a.free(reopened);
+    try std.testing.expectEqualStrings("unchanged", reopened);
+    try std.testing.expectEqual(@as(usize, 1), backend.run_sources.items.len);
+}
+
+test "lite lsm concurrent cold reads share one source open" {
+    const Hook = struct {
+        fn read(backend: *@import("../lsm_backend.zig").Backend) anyerror!void {
+            const bytes = try backend.readRunRangeAlloc(std.testing.allocator, "/runs/cold", 0, 9);
+            defer std.testing.allocator.free(bytes);
+            try std.testing.expectEqualStrings("immutable", bytes);
+        }
+    };
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "lsm-cold-flight.aflite");
+    defer a.free(path);
+    var docs = try docstore.Store.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io, .reclamation = .{ .enabled = false } });
+    defer docs.close();
+    docs.maintenance_start_suppressed = true;
+    var indexes = Store.init(a, &docs);
+    try indexes.storage().writeFileAbsolute("/runs/cold", "immutable run");
+    const before = docs.file.activeCheckpoint().commit_sequence;
+    var backend = @import("../lsm_backend.zig").Backend.init(a, .{ .storage = indexes.storage() });
+    defer backend.close();
+    var readers: [16]std.Io.Future(anyerror!void) = undefined;
+    var started: usize = 0;
+    lockStore(&docs);
+    var locked = true;
+    defer {
+        if (locked) docs.mutex.unlock();
+        for (readers[0..started]) |*reader| reader.await(std.testing.io) catch {};
+    }
+    for (&readers) |*reader| {
+        reader.* = try std.testing.io.concurrent(Hook.read, .{&backend});
+        started += 1;
+    }
+    const deadline = std.Io.Clock.awake.now(std.testing.io).addDuration(.fromSeconds(5));
+    while (true) {
+        platform_sync.lockYielding(&backend.run_source_mutex);
+        const joined = backend.run_source_opens.items.len == 1 and backend.run_source_opens.items[0].refs == readers.len;
+        backend.run_source_mutex.unlock();
+        if (joined) break;
+        if (std.Io.Clock.awake.now(std.testing.io).nanoseconds > deadline.nanoseconds) return error.Timeout;
+        try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+    }
+    docs.mutex.unlock();
+    locked = false;
+    for (&readers) |*reader| try reader.await(std.testing.io);
+    try std.testing.expectEqual(before + 1, docs.file.activeCheckpoint().commit_sequence);
+    try std.testing.expectEqual(@as(usize, 1), backend.run_sources.items.len);
+    try std.testing.expectEqual(@as(usize, 0), backend.run_source_opens.items.len);
+}
+
+test "lite atomic publication returns owned immutable source without requiring mapping" {
+    if (!supports_native_artifact_leases) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "published-source.aflite");
+    defer a.free(path);
+    var docs = try docstore.Store.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io, .reclamation = .{ .enabled = false } });
+    var docs_open = true;
+    defer if (docs_open) docs.close();
+    var store = Store.init(a, &docs);
+    var storage = store.storage();
+    var source_only_storage = storage.vtable.*;
+    source_only_storage.map_immutable_artifact = null;
+    storage.vtable = &source_only_storage;
+    var writer = try storage.beginAtomicWrite(a, "/published");
+    var active = true;
+    defer if (active) writer.abort();
+    try writer.appendSlice("original");
+    try std.testing.expect(writer.vtable.finish_source != null);
+    var source_only_writer = writer.vtable.*;
+    source_only_writer.finish_mapped = null;
+    writer.vtable = &source_only_writer;
+    active = false;
+    var source = try writer.vtable.finish_source.?(writer.ptr);
+    defer source.close();
+    try storage.writeFileAbsolute("/published", "replacement");
+    docs.close();
+    docs_open = false;
+    var bytes: [8]u8 = undefined;
+    try source.readInto(0, &bytes);
+    try std.testing.expectEqualStrings("original", &bytes);
 }

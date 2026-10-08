@@ -1136,6 +1136,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     for ([_][]const u8{ "lib-test", "antfly-unit-test", "inference-test", "inference-finetune-test", "unit-test-inventory" }) |name|
         unit_gate.dependOn(&b.top_level_steps.get(name).?.step);
     @import("build_support/antfly/test_cache_lifetime.zig").add(b, unit_gate);
+    if (strip) @import("pkg/antfly/build/runtime.zig").stripBuildGraph(b);
     return .{ .runtime = runtime, .inference = inference_graph, .wasm = wasm.artifact, .inference_steps = inference_steps };
 }
 
