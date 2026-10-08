@@ -1,10 +1,26 @@
 #!/usr/bin/env python3
+# Copyright 2026 Antfly, Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Verify a local GLiNER2.5 release against a pinned architecture contract.
 
 The default check reads only JSON and the safetensors header.  Pass
 ``--verify-model-sha256`` when a release/promotion job must also stream and
 hash the complete weights file.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -85,7 +101,9 @@ def safetensors_header(path: Path) -> tuple[dict[str, Any], bytes, int]:
                 raise ContractError(f"{path}: truncated safetensors length")
             length = struct.unpack("<Q", prefix)[0]
             if not 2 <= length <= MAX_HEADER_BYTES or 8 + length > size:
-                raise ContractError(f"{path}: invalid safetensors header length {length}")
+                raise ContractError(
+                    f"{path}: invalid safetensors header length {length}"
+                )
             raw = source.read(length)
     except OSError as exc:
         raise ContractError(f"could not read {path}: {exc}") from exc
@@ -130,14 +148,14 @@ def _same_json(actual: Any, expected: Any) -> bool:
     return actual == expected
 
 
-def _require_fields(actual: dict[str, Any], expected: dict[str, Any], name: str) -> None:
+def _require_fields(
+    actual: dict[str, Any], expected: dict[str, Any], name: str
+) -> None:
     for key, value in expected.items():
         if key not in actual:
             raise ContractError(f"{name}.{key} is missing")
         if not _same_json(actual[key], value):
-            raise ContractError(
-                f"{name}.{key}={actual[key]!r}, expected {value!r}"
-            )
+            raise ContractError(f"{name}.{key}={actual[key]!r}, expected {value!r}")
 
 
 def verify_model(
@@ -152,7 +170,9 @@ def verify_model(
         raise ContractError("unsupported family contract version")
     models = _require_mapping(contract.get("models"), "contract.models")
     if profile not in models:
-        raise ContractError(f"unknown profile {profile!r}; choose one of {sorted(models)}")
+        raise ContractError(
+            f"unknown profile {profile!r}; choose one of {sorted(models)}"
+        )
     expected = _require_mapping(models[profile], f"contract.models.{profile}")
 
     directory = directory.expanduser().resolve()

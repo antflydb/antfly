@@ -3786,7 +3786,7 @@ test "large typed inputs split and reclaim production scratch between rows" {
 
 test "bounded postings runs preserve sorted sparse fields and reduce production heap" {
     const a = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     const directory = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
     defer a.free(directory);
@@ -3885,7 +3885,7 @@ test "bounded postings runs preserve sorted sparse fields and reduce production 
 
 test "postings run allocation failures abort every private owner including fan in merge" {
     const a = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     const directory = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
     defer a.free(directory);
@@ -3925,7 +3925,7 @@ test "construction budget rejects actual allocations and translates admission fa
 
 test "postings spool carries two merge levels with one file and bounded readers" {
     const a = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     const directory = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
     defer a.free(directory);

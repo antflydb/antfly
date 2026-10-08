@@ -342,7 +342,7 @@ test "ordered artifact inventory reconstruction orders bounded pages and resumes
                         defer received.deinit();
                     }
                 };
-                try std.testing.checkAllAllocationFailures(alloc, AllocationHarness.run, .{ db.core.store, db.root_incarnation, request, plan.plan() });
+                try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, AllocationHarness.run, .{ db.core.store, db.root_incarnation, request, plan.plan() });
             }
             // Receiver verification uses the sender's observed count, not its
             // deadline: different machine speeds cannot select different cuts.
@@ -431,7 +431,7 @@ test "ordered artifact inventory reconstruction orders bounded pages and resumes
                         defer result.deinit();
                     }
                 };
-                if (unit_pages == 0) try std.testing.checkAllAllocationFailures(alloc, AllocationCheck.run, .{ &txn, db.root_incarnation, command, plan.plan() });
+                if (unit_pages == 0) try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, AllocationCheck.run, .{ &txn, db.root_incarnation, command, plan.plan() });
             }
             try @import("antfly_server_test_sources").local_test_sources.storage_server_db_adapter.applyOrdered(&db, .{ .artifact_publication = command }, .{ .term = 1, .index = index });
             index += 1;
