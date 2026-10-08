@@ -241,3 +241,11 @@ classes on both platforms; see [bridge receipts](receipts/2026-10-07/controlled-
 Standalone production wiring still needs archive qualification. Parking a whole
 output callback leaves formatter CPU uncharged; physical IO-only parking remains
 required before enabling pooling by default.
+
+
+Optional caller-thread output wait hooks now bracket socket writes, contended
+lock sleeps and HTTP/2 credit waits. Formatter CPU between waits remains outside
+those hooks. Both platform library gates pass; see
+[wait ownership receipts](receipts/2026-10-07/output-wait-ownership/README.md).
+The hooks still require checked archive integration with actual owner capsules;
+whole-callback parking has not yet been removed in production.

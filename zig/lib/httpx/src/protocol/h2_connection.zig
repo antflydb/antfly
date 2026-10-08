@@ -443,11 +443,17 @@ pub const H2Connection = struct {
                 ms = @min(ms, @as(u64, @intCast(@divTrunc(ns + std.time.ns_per_ms - 1, std.time.ns_per_ms))));
             }
             ms = (try control.timeout(ms)).?;
-            self.send_window_event.waitTimeout(self.io, .{ .duration = .{ .raw = .fromMilliseconds(@intCast(ms)), .clock = .awake } }) catch |err| switch (err) {
-                error.Timeout => {},
-                else => return err,
-            };
+            try control.withWait(waitForCreditTick, .{ &self.send_window_event, self.io, ms });
         }
+    }
+
+    fn waitForCreditTick(event: *Io.Event, io: Io, ms: u64) !void {
+        event.waitTimeout(io, .{ .duration = .{ .raw = .fromMilliseconds(@intCast(ms)), .clock = .awake } }) catch |err| switch (err) {
+            // Only the IO polling tick is transient. A timeout returned by
+            // weighted reentry must escape without attempting another wait.
+            error.Timeout => {},
+            else => return err,
+        };
     }
 
     pub fn writeDataBlocking(self: *Self, writer: anytype, stream_id: u31, data: []const u8, end_stream: bool) !void {
@@ -3730,4 +3736,59 @@ test "H2 controlled available credit sends valid DATA and END_STREAM" {
     try std.testing.expectEqualStrings("payload", wire.items[9..]);
     try std.testing.expectEqual(@as(u8, H2Connection.FLAG_END_STREAM), wire.items[4]);
     try std.testing.expect(stream.end_stream_sent);
+}
+
+test "H2 controlled credit waits release CPU and restore it before frame serialization" {
+    const State = struct {
+        conn: *H2Connection,
+        parked: std.atomic.Value(bool) = .init(false),
+        waiting: Io.Event = .unset,
+        begins: usize = 0,
+        ends: usize = 0,
+        bytes: std.ArrayListUnmanaged(u8) = .empty,
+        fn begin(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            // Parking for stream credit must never hold the connection mutex.
+            try std.testing.expect(self.conn.write_mutex.tryLock());
+            self.conn.write_mutex.unlock(self.conn.io);
+            try std.testing.expect(!self.parked.swap(true, .acq_rel));
+            self.begins += 1;
+            self.waiting.set(self.conn.io);
+        }
+        fn end(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try std.testing.expect(self.parked.swap(false, .acq_rel));
+            self.ends += 1;
+        }
+        fn run(self: *@This()) !void {
+            try self.conn.writeDataBlockingControlled(self, 1, "payload", true, .{ .ptr = self, .wait_begin_fn = begin, .wait_end_fn = end });
+        }
+        pub fn writeAll(self: *@This(), bytes: []const u8) !void {
+            // Header/DATA serialization runs only after the weighted resume.
+            try std.testing.expect(!self.parked.load(.acquire));
+            try self.bytes.appendSlice(std.testing.allocator, bytes);
+        }
+    };
+    const io = std.testing.io;
+    var connection = H2Connection.initServer(std.testing.allocator, io);
+    defer connection.deinit();
+    const stream = try connection.stream_manager.getOrCreateStream(1);
+    stream.state = .open;
+    stream.send_window = 0;
+    var state = State{ .conn = &connection };
+    defer state.bytes.deinit(std.testing.allocator);
+    var task = try io.concurrent(State.run, .{&state});
+    defer task.cancel(io) catch {};
+    try state.waiting.wait(io);
+    connection.write_mutex.lockUncancelable(io);
+    stream.send_window = 100;
+    connection.send_window_event.set(io);
+    connection.write_mutex.unlock(io);
+    try task.await(io);
+    try std.testing.expect(state.begins > 0);
+    try std.testing.expectEqual(state.begins, state.ends);
+    try std.testing.expect(!state.parked.load(.acquire));
+    try std.testing.expect(stream.end_stream_sent);
+    try std.testing.expectEqual(@as(usize, 16), state.bytes.items.len);
+    try std.testing.expectEqualStrings("payload", state.bytes.items[9..]);
 }

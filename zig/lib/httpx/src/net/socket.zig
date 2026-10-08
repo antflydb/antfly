@@ -75,6 +75,35 @@ pub const WriteControl = struct {
     ptr: ?*anyopaque = null,
     check_fn: ?*const fn (?*anyopaque) Error!void = null,
     remaining_ms_fn: ?*const fn (?*anyopaque) Error!?u64 = null,
+    /// Paired ownership transitions run only on the calling task. Original
+    /// fence callbacks above may also run on a timeout monitor. Keeping the
+    /// interfaces separate prevents a monitor from releasing another task's
+    /// execution grant. Formatting between waits retains runnable capacity.
+    wait_begin_fn: ?*const fn (?*anyopaque) anyerror!void = null,
+    wait_end_fn: ?*const fn (?*anyopaque) anyerror!void = null,
+
+    pub fn withWait(self: WriteControl, comptime function: anytype, args: anytype) anyerror!@typeInfo(@TypeOf(@call(.auto, function, args))).error_union.payload {
+        try self.check();
+        const begin = self.wait_begin_fn orelse {
+            if (self.wait_end_fn != null) return error.InvalidOutputWait;
+            return @call(.auto, function, args);
+        };
+        const end = self.wait_end_fn orelse return error.InvalidOutputWait;
+        try begin(self.ptr);
+        const result = blk: {
+            self.check() catch |err| break :blk @as(anyerror!@typeInfo(@TypeOf(@call(.auto, function, args))).error_union.payload, err);
+            break :blk @call(.auto, function, args);
+        };
+        // Even failed IO must return or reject the loan before the caller
+        // performs cleanup. A rejected resume prevents further formatter CPU.
+        try end(self.ptr);
+        try self.check();
+        return result;
+    }
+
+    fn sleep(io: Io, ms: u64) !void {
+        try io.sleep(.fromMilliseconds(@intCast(ms)), .awake);
+    }
 
     pub fn active(self: WriteControl) bool {
         return self.check_fn != null or self.remaining_ms_fn != null;
@@ -84,11 +113,11 @@ pub const WriteControl = struct {
         if (self.remaining_ms_fn) |remaining| if (try remaining(self.ptr)) |ms| if (ms == 0) return error.Timeout;
     }
     pub fn lock(self: WriteControl, mutex: *Io.Mutex, io: Io) !void {
-        if (!self.active()) return mutex.lockUncancelable(io);
+        if (!self.active() and self.wait_begin_fn == null and self.wait_end_fn == null) return mutex.lockUncancelable(io);
         while (!mutex.tryLock()) {
             try self.check();
             const ms = (try self.timeout(10)).?;
-            try io.sleep(.fromMilliseconds(@intCast(ms)), .awake);
+            try self.withWait(sleep, .{ io, ms });
         }
         errdefer mutex.unlock(io);
         try self.check();
@@ -364,6 +393,12 @@ pub const Socket = struct {
     }
 
     pub fn sendControlled(self: *Self, data: []const u8, control: WriteControl) !usize {
+        // Keep ownership transition failures outside native timeout retries:
+        // failed weighted reentry must never dispatch another socket write.
+        return control.withWait(Socket.sendControlledInner, .{ self, data, control });
+    }
+
+    fn sendControlledInner(self: *Self, data: []const u8, control: WriteControl) !usize {
         // A per-stream budget must not become a later sibling's native socket
         // timeout. H2 callers serialize writes with the connection write mutex.
         defer if (control.active() and self.native_timeouts and !is_windows)
@@ -2299,4 +2334,57 @@ test "Socket controlled uncertain output retires after actual fallback task canc
         if (try accepted.socket.recv(&bytes) == 0) return;
     }
     return error.FixtureRetirementNotObserved;
+}
+
+test "Socket output wait ownership restores CPU before formatting and rejects failed resumes" {
+    const State = struct {
+        mode: enum { success, io_failure, begin_failure, end_failure, canceled_after_park },
+        parked: bool = false,
+        begins: usize = 0,
+        ends: usize = 0,
+        operations: usize = 0,
+        fn check(raw: ?*anyopaque) WriteControl.Error!void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.mode == .canceled_after_park and self.parked) return error.Canceled;
+        }
+        fn begin(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try std.testing.expect(!self.parked);
+            self.begins += 1;
+            if (self.mode == .begin_failure) return error.Denied;
+            self.parked = true;
+        }
+        fn end(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try std.testing.expect(self.parked);
+            self.ends += 1;
+            if (self.mode == .end_failure) return error.Denied;
+            self.parked = false;
+        }
+        fn operation(self: *@This()) !usize {
+            try std.testing.expect(self.parked);
+            self.operations += 1;
+            if (self.mode == .io_failure) return error.EndOfStream;
+            return 7;
+        }
+    };
+    for ([_]@FieldType(State, "mode"){ .success, .io_failure, .begin_failure, .end_failure, .canceled_after_park }) |mode| {
+        var state = State{ .mode = mode };
+        const control = WriteControl{ .ptr = &state, .check_fn = State.check, .wait_begin_fn = State.begin, .wait_end_fn = State.end };
+        const result = control.withWait(State.operation, .{&state});
+        switch (mode) {
+            .success => try std.testing.expectEqual(@as(usize, 7), try result),
+            .io_failure => try std.testing.expectError(error.EndOfStream, result),
+            .begin_failure, .end_failure => try std.testing.expectError(error.Denied, result),
+            .canceled_after_park => try std.testing.expectError(error.Canceled, result),
+        }
+        try std.testing.expectEqual(@as(usize, 1), state.begins);
+        try std.testing.expectEqual(@as(usize, if (mode == .begin_failure) 0 else 1), state.ends);
+        try std.testing.expectEqual(@as(usize, if (mode == .begin_failure or mode == .canceled_after_park) 0 else 1), state.operations);
+        try std.testing.expectEqual(mode == .end_failure, state.parked);
+    }
+    var state = State{ .mode = .success };
+    const incomplete = WriteControl{ .ptr = &state, .wait_begin_fn = State.begin };
+    try std.testing.expectError(error.InvalidOutputWait, incomplete.withWait(State.operation, .{&state}));
+    try std.testing.expectEqual(@as(usize, 0), state.begins);
 }
