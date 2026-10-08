@@ -5480,3 +5480,37 @@ tests and 27 schema-expression tests, with no failures or leaks. The independent
 62-case PostgreSQL oracle, inventory integrity, Zig formatting, whitespace and
 control-catalog consistency checks pass. These gates do not supersede the broad
 durable-runtime compiler/ownership failure documented above.
+
+### Immutable exact NUMERIC constraint compilation
+
+The next public-NUMERIC prerequisite is an immutable constraint plan, rather
+than converting minimum/maximum/exclusive bounds and multipleOf through f64.
+The new internal component owns exact literals in a stable-address, 4 MiB
+schema arena. Const and enum compare logical numeric values; enum candidates
+are compiled into collision-checked hash buckets, deduplicating equivalent
+scales without reparsing JSON during row checks. Finite JSON strings remain
+strings, not numeric enum members. PostgreSQL's NUMERIC ordering governs
+special values.
+
+A request-owned execution arena reuses bounded scratch across rows, while
+preserving sticky work, cancellation and quota failures. Exact remainder checks
+use the same numeric kernel. Immutable borrowed bounds/enum comparisons need
+no allocations. Repeated tiny-decimal remainder checks retain constant scratch
+capacity, and a 10,000-probe comparison regression uses an allocator that rejects
+all allocations. Exhaustive allocation failures cover plan compilation, source
+JSON destruction, row parsing, and exact remainder evaluation.
+
+The independent disposable PostgreSQL 18 oracle verifies 70 constraint
+predicates, including precision above 2^53, bounds outside binary-float range,
+scale-equivalent values, special values, and nonnumeric const/enum members.
+This component is deliberately not advertised as public NUMERIC activation:
+wiring it into schema epochs, composition/type validation, a durable reader
+capability, generated public contracts, and end-to-end storage/restore tests
+remains required. Existing document/physical-float constraints are unchanged.
+No original parity cases are reclassified for this prerequisite.
+
+Validation passes: 587 local SQL tests (three existing skips), 226 server SQL
+tests, and 30 schema-expression tests, without failures or leaks. The 70-case
+PostgreSQL fixture, inventory integrity, Zig formatting, whitespace, and
+control-catalog consistency checks pass. The broad durable-runtime limitation
+documented above is not superseded by these focused gates.

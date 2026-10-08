@@ -761,6 +761,117 @@ fn numericIdentity(node: Node) Numeric {
     return node.sql_type orelse if (node.kind == .integer) .int64 else if (node.kind == .numeric) .numeric else .float64;
 }
 
+test "relational declarations exact NUMERIC constraints own literals and bound repeated row scratch" {
+    const constraints = @import("numeric_constraints.zig");
+    const a = std.testing.allocator;
+    const Run = struct {
+        fn run(alloc: Allocator) !void {
+            const plan = blk: {
+                var json = try std.json.parseFromSlice(std.json.Value, alloc, "{\"minimum\":9007199254740993.25,\"exclusiveMaximum\":9007199254740993.26,\"multipleOf\":0.0001,\"enum\":[9007199254740993.2500,9007199254740993.25,\"9007199254740993.25\"]}", .{ .parse_numbers = false });
+                defer json.deinit();
+                break :blk (try constraints.Plan.create(alloc, json.value.object)).?;
+            };
+            defer plan.deinit();
+            try std.testing.expectEqual(@as(usize, 1), plan.enumeration.count());
+            var execution: constraints.Execution = undefined;
+            execution.init(alloc);
+            defer execution.deinit();
+            try execution.validateJson(plan, .{ .number_string = "9007199254740993.250000" });
+            execution.validateJson(plan, .{ .number_string = "9007199254740993.2499" }) catch |err| {
+                if (err == error.OutOfMemory) return err;
+                try std.testing.expectEqual(error.InvalidBatchRequest, err);
+                return;
+            };
+            return error.TestExpectedError;
+        }
+    };
+    try Run.run(a);
+    try std.testing.checkAllAllocationFailures(a, Run.run, .{});
+
+    var json = try std.json.parseFromSlice(std.json.Value, a, "{\"minimum\":1e-1000,\"maximum\":1e1000,\"multipleOf\":1e-1000}", .{ .parse_numbers = false });
+    defer json.deinit();
+    const plan = (try constraints.Plan.create(a, json.value.object)).?;
+    defer plan.deinit();
+    var execution: constraints.Execution = undefined;
+    execution.init(a);
+    defer execution.deinit();
+    try execution.validateJson(plan, .{ .number_string = "1e-999" });
+    const peak = execution.memory.peak;
+    for (0..100) |_| try execution.validateJson(plan, .{ .number_string = "1e-999" });
+    try std.testing.expectEqual(peak, execution.memory.peak);
+    try std.testing.expectError(error.InvalidBatchRequest, execution.validateJson(plan, .{ .number_string = "1e-1001" }));
+    execution.context.remaining = 0;
+    try std.testing.expectError(error.SqlProgramLimitExceeded, execution.validateJson(plan, .{ .integer = 1 }));
+    execution.context.remaining = 10000;
+    try std.testing.expectError(error.SqlProgramLimitExceeded, execution.validateJson(plan, .{ .integer = 1 }));
+}
+
+test "relational declarations exact NUMERIC constraint predicates match PostgreSQL" {
+    const constraints = @import("numeric_constraints.zig");
+    const a = std.testing.allocator;
+    const Case = struct { schema: []const u8, value: []const u8, expected: bool };
+    const Fixture = struct { reference: []const u8, entries: []const Case };
+    var fixture = try std.json.parseFromSlice(Fixture, a, @embedFile("../sql/fixtures/sql_numeric_constraints_reference.json"), .{});
+    defer fixture.deinit();
+    for (fixture.value.entries) |case| {
+        var definition = try std.json.parseFromSlice(std.json.Value, a, case.schema, .{ .parse_numbers = false });
+        defer definition.deinit();
+        const plan = (try constraints.Plan.create(a, definition.value.object)).?;
+        defer plan.deinit();
+        var execution: constraints.Execution = undefined;
+        execution.init(a);
+        defer execution.deinit();
+        execution.validateJson(plan, .{ .number_string = case.value }) catch |err| {
+            if (err != error.InvalidBatchRequest or case.expected) {
+                std.debug.print("NUMERIC constraint: schema={s} value={s} expected={} error={s}\n", .{ case.schema, case.value, case.expected, @errorName(err) });
+                return err;
+            }
+            continue;
+        };
+        try std.testing.expect(case.expected);
+    }
+}
+
+test "relational declarations NUMERIC constraints borrow enum comparisons and preserve cancellation admission" {
+    const constraints = @import("numeric_constraints.zig");
+    const a = std.testing.allocator;
+    var definition = try std.json.parseFromSlice(std.json.Value, a, "{\"minimum\":9007199254740993.25,\"enum\":[9007199254740993.25000,\"NaN\"]}", .{ .parse_numbers = false });
+    defer definition.deinit();
+    const plan = (try constraints.Plan.create(a, definition.value.object)).?;
+    defer plan.deinit();
+    var parse_context: exact.Context = .{ .alloc = a };
+    var parsed = try exact.parse(&parse_context, "9007199254740993.25000000");
+    defer parsed.deinit();
+    var borrowed: exact.Context = .{ .alloc = std.testing.failing_allocator };
+    for (0..10000) |_| try plan.validate(&borrowed, parsed.value);
+
+    var execution: constraints.Execution = undefined;
+    execution.init(a);
+    defer execution.deinit();
+    const Cancel = struct {
+        fn check(_: ?*anyopaque) anyerror!void {
+            return error.Canceled;
+        }
+    };
+    execution.context.checkpoint = Cancel.check;
+    try std.testing.expectError(error.Canceled, execution.validateJson(plan, .{ .integer = 1 }));
+    execution.context.checkpoint = null;
+    try std.testing.expectError(error.Canceled, execution.validateJson(plan, .{ .integer = 1 }));
+
+    var limited: constraints.Execution = undefined;
+    limited.init(a);
+    defer limited.deinit();
+    limited.memory.limit = 0;
+    try std.testing.expectError(error.SqlProgramLimitExceeded, limited.validateJson(plan, .{ .integer = 1 }));
+    limited.memory.limit = constraints.max_bytes;
+    try std.testing.expectError(error.SqlProgramLimitExceeded, limited.validateJson(plan, .{ .integer = 1 }));
+    for ([_][]const u8{ "{\"multipleOf\":0}", "{\"multipleOf\":-0.001}", "{\"minimum\":\"1\"}", "{\"minimum\":1e131072}" }) |invalid| {
+        var json = try std.json.parseFromSlice(std.json.Value, a, invalid, .{ .parse_numbers = false });
+        defer json.deinit();
+        try std.testing.expectError(error.InvalidSchemaUpdateRequest, constraints.Plan.create(a, json.value.object));
+    }
+}
+
 test "relational declarations exact NUMERIC SQL lowering and native programs match PostgreSQL" {
     const a = std.testing.allocator;
     const Case = struct {
