@@ -22,26 +22,7 @@ fn sign(value: Value) u16 {
 
 /// Validate the complete logical representation before exposing output bytes.
 pub fn encodedSize(ctx: *Context, value: Value) !usize {
-    try ctx.charge(1);
-    if (value.kind != .finite) {
-        if (value.negative or value.weight != 0 or value.scale != 0 or value.digits.len != 0) return error.InvalidNumericRepresentation;
-    } else {
-        if (value.scale > numeric.maximum_scale or std.math.cast(i16, value.weight) == null or value.digits.len > std.math.maxInt(u16)) return error.InvalidNumericRepresentation;
-        if (value.digits.len == 0) {
-            if (value.negative or value.weight != 0) return error.InvalidNumericRepresentation;
-        } else {
-            if (value.digits[0] == 0 or value.digits[value.digits.len - 1] == 0) return error.InvalidNumericRepresentation;
-            const low = value.weight - @as(i32, @intCast(value.digits.len)) + 1;
-            const cut = @divFloor(-@as(i32, value.scale), 4);
-            const factors = [_]u16{ 1, 10, 100, 1000 };
-            const factor = factors[@intCast(@mod(-@as(i32, value.scale), 4))];
-            if (low < cut or (low == cut and value.digits[value.digits.len - 1] % factor != 0)) return error.InvalidNumericRepresentation;
-        }
-    }
-    for (value.digits) |digit| {
-        try ctx.charge(1);
-        if (digit >= 10000) return error.InvalidNumericRepresentation;
-    }
+    try numeric.validateCanonical(ctx, value);
     const bytes = 8 + value.digits.len * 2;
     if (bytes > ctx.max_output_bytes) return ctx.limit();
     return bytes;

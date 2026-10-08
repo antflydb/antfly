@@ -188,6 +188,30 @@ pub fn fromGroups(ctx: *Context, source: anytype, weight: i16, scale: u16, negat
     return finish(ctx.alloc, storage, @as(i32, weight) - @as(i32, @intCast(start)), scale, negative);
 }
 
+/// Shared logical admission for physical codecs. Scale is display metadata,
+/// but it may not hide significant digits in an already canonical value.
+pub fn validateCanonical(ctx: *Context, value: Value) !void {
+    try ctx.charge(1);
+    if (value.kind != .finite) {
+        if (value.negative or value.weight != 0 or value.scale != 0 or value.digits.len != 0) return error.InvalidNumericRepresentation;
+        return;
+    }
+    if (value.scale > maximum_scale or std.math.cast(i16, value.weight) == null or value.digits.len > std.math.maxInt(u16)) return error.InvalidNumericRepresentation;
+    if (value.digits.len == 0) {
+        if (value.negative or value.weight != 0) return error.InvalidNumericRepresentation;
+        return;
+    }
+    if (value.digits[0] == 0 or value.digits[value.digits.len - 1] == 0) return error.InvalidNumericRepresentation;
+    const cut = @divFloor(-@as(i32, value.scale), 4);
+    const factor = powers[@intCast(@mod(-@as(i32, value.scale), 4))];
+    const low = value.lowest();
+    if (low < cut or (low == cut and value.digits[value.digits.len - 1] % factor != 0)) return error.InvalidNumericRepresentation;
+    for (value.digits) |digit| {
+        try ctx.charge(1);
+        if (digit >= base) return error.InvalidNumericRepresentation;
+    }
+}
+
 pub fn parse(ctx: *Context, input: []const u8) !Owned {
     try ctx.charge(1);
     if (input.len > ctx.max_input_bytes) return ctx.limit();

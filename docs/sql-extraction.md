@@ -4898,3 +4898,34 @@ NUMERIC parameters, results or columns are activated. Exact literal binding,
 generated type identity, typed storage/index/spill, scalar and aggregate
 execution, and public transport dispatch still require integration. No parity
 ledger credit is taken for kernel/codec-only evidence.
+
+Exact NUMERIC identity keys now encode PostgreSQL total order directly in
+lexicographic byte order. Separate ranks cover negative infinity, negative
+finite values, zero, positive finite values, positive infinity and NaN. Biased
+base-10000 weights and terminated group words order finite values without
+decimal expansion; complemented negative payloads reverse magnitude order.
+Canonical keys omit display scale, so equivalent values share one unique-key
+identity. Components are self-delimiting and prefix-free, allowing multi-column
+keys without a length prefix that would change numeric ordering. SQL NULL and
+the owning index's type/format identity remain responsibilities of its layout.
+
+Decode rejects noncanonical groups, invalid ranks, missing terminators, domain
+overflow and extra bytes before allocating. The shared logical validator is
+also used by the PostgreSQL binary encoder. Prefix decode consumes exactly one
+component, retains no input ownership and recovers the smallest exact scale;
+keys are not a replacement for row values that preserve display metadata.
+
+A fresh PostgreSQL 18 dense-rank oracle supplies 235 independently ordered
+values. Native tests check all 55,225 pairs, equivalent scale spellings,
+composite-key prefix freedom, byte mutations, every observed cancellation
+checkpoint, sticky quotas and exhaustive allocation failures. Streaming encode
+allocates nothing; allocated encode and decode each use one buffer. A dense
+2,048-digit value uses 1,029 key bytes; full-range powers such as 1e131071 and
+1e-16383 retain seven-byte keys and pass within a 64-unit work budget. The debug
+2,048-digit encode/decode microbenchmark took approximately 0.09 ms locally,
+excluding parsing; this is not an end-to-end index performance measurement.
+
+These keys are shared integration infrastructure, not activation of NUMERIC
+indexes or public SQL. Generated type identity, exact literal/scalar binding,
+typed row/transport integration and aggregate execution remain unfinished.
+The parity ledger is unchanged.
