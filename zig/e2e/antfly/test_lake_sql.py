@@ -2623,8 +2623,71 @@ def test_native_remote_indexed_metadata_predicates_above_id_list_limit(tmp_path)
         hits = query(broad)["hits"]["hits"]
         assert len(hits) == 10 and all(h["_source"]["amount"] >= 2 for h in hits)
         counted = query(broad, count=True, fields=[], limit=0)
-        assert counted["hits"]["total"] == {"value": count - 2, "relation": "exact"}, counted
-        residual = query({"conjuncts": [point, {"prefix": {"path": "/label", "value": "ke"}}]})
+        assert counted["hits"]["total"] == {"value": count - 2, "relation": "exact"}, (
+            counted
+        )
+        # A selective amount index can supply candidates while category remains
+        # residual; exact count must not confuse that superset with final matches.
+        selective_and = {
+            "bool": {
+                "filter": [broad, {"range": {"path": "/amount", "gte": count - 3}}]
+            }
+        }
+        impossible_and = {
+            "bool": {"filter": [broad, {"term": {"path": "/amount", "value": 0}}]}
+        }
+        broad_residual = {
+            "conjuncts": [broad, {"prefix": {"path": "/label", "value": "ke"}}]
+        }
+        for predicate, expected in (
+            (selective_and, 3),
+            (impossible_and, 0),
+            (broad_residual, 1),
+        ):
+            result = query(predicate, count=True, fields=[], limit=0)
+            oracle = query(
+                {
+                    "bool": {
+                        "should": [predicate, {"match_all": {}}],
+                        "minimum_should_match": 2,
+                    }
+                },
+                count=True,
+                fields=[],
+                limit=0,
+            )
+            assert (
+                result["hits"]["total"]
+                == oracle["hits"]["total"]
+                == {"value": expected, "relation": "exact"}
+            )
+        for predicate, expected in (
+            (selective_and, count - 3),
+            (impossible_and, count),
+            (broad_residual, count - 1),
+        ):
+            excluded_and = call(
+                "POST",
+                "/tables/indexed_predicates/query",
+                {
+                    "full_text_search": {"term": "common", "field": "body"},
+                    "exclusion_query": predicate,
+                    "count": True,
+                    "fields": [],
+                    "limit": 0,
+                },
+            )
+            assert excluded_and["hits"]["total"] == {
+                "value": expected,
+                "relation": "exact",
+            }
+        kept = query(selective_and)
+        assert {h["_source"]["amount"] for h in kept["hits"]["hits"]} == set(
+            range(count - 3, count)
+        )
+        residual = query(
+            {"conjuncts": [point, {"prefix": {"path": "/label", "value": "ke"}}]}
+        )
         assert [h["_source"]["amount"] for h in residual["hits"]["hits"]] == [count - 1]
         union = query({"disjuncts": [point, {"term": {"path": "/amount", "value": 0}}]})
         assert {h["_source"]["amount"] for h in union["hits"]["hits"]} == {0, count - 1}

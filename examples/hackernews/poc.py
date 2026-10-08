@@ -22,6 +22,10 @@ to configuration, results, or stdout. This does not change cloud IAM or buckets.
 
 import argparse
 import json
+import shutil
+import statistics
+import sys
+from concurrent.futures import ThreadPoolExecutor
 import os
 from pathlib import Path
 import subprocess
@@ -40,14 +44,47 @@ def main():
     parser.add_argument("--port", type=int, default=8877)
     parser.add_argument("--expected-rows", type=int, default=10000)
     parser.add_argument("--require-filters", action="store_true")
+    parser.add_argument(
+        "--artifact-prefix", help="Separate namespace for index artifacts"
+    )
+    parser.add_argument(
+        "--text-only",
+        action="store_true",
+        help="Benchmark projected scans without metadata indexes",
+    )
+    parser.add_argument(
+        "--cold-cache",
+        action="store_true",
+        help="Stop after publication, remove this state's cache, then measure",
+    )
+    parser.add_argument("--repeats", type=int, default=5)
+    parser.add_argument("--concurrency", type=int, default=4)
+    parser.add_argument(
+        "--bearer-stdin",
+        action="store_true",
+        help="Read a short-lived token from stdin instead of gcloud; never persist it",
+    )
     args = parser.parse_args()
+    if args.repeats < 1 or args.concurrency < 1:
+        parser.error("repeats and concurrency must be positive")
+    artifact_prefix = args.artifact_prefix or args.prefix
+    metadata_columns = (
+        []
+        if args.text_only
+        else ["hn_id", "created_at", "item_type", "author", "points"]
+    )
     args.state.mkdir(parents=True, exist_ok=True)
-    token = subprocess.run(
-        ["gcloud", "auth", "print-access-token", "--project", args.project],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
+    if args.bearer_stdin:
+        token = sys.stdin.readline(65537).strip()
+        if not token or len(token) > 65536:
+            raise ValueError("Expected a bounded bearer token on stdin")
+    else:
+        token = subprocess.run(
+            ["gcloud", "auth", "print-access-token", "--project", args.project],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
     env = dict(os.environ, HN_GCS_BEARER=token)
 
     def connection(capability, prefix):
@@ -73,12 +110,14 @@ def main():
             "artifacts": {
                 "connection": "hn-gcs-artifacts",
                 "bucket": args.bucket,
-                "prefix": args.prefix + "/indexes",
+                "prefix": artifact_prefix + "/indexes",
             },
         },
         "connections": {
             "hn-gcs-source": connection("lake_read", args.prefix + "/archive"),
-            "hn-gcs-artifacts": connection("storage.primary", args.prefix + "/indexes"),
+            "hn-gcs-artifacts": connection(
+                "storage.primary", artifact_prefix + "/indexes"
+            ),
         },
         "lake_cache": {"root": str(args.state / "cache"), "max_disk_bytes": 1073741824},
     }
@@ -172,10 +211,43 @@ def main():
             else value
         )
 
-    def timed_query(query):
+    io_profiles = []
+
+    def resource_counters():
+        # Linux counters help separate CPU work from remote transfer. Network
+        # counters cover non-loopback interfaces, including TLS/DNS overhead.
+        if not Path("/proc/net/dev").exists():
+            return None
+        counters = {"network_rx_bytes": 0, "network_tx_bytes": 0}
+        for line in Path("/proc/net/dev").read_text().splitlines()[2:]:
+            name, values = line.split(":", 1)
+            if name.strip() != "lo":
+                fields = values.split()
+                counters["network_rx_bytes"] += int(fields[0])
+                counters["network_tx_bytes"] += int(fields[8])
+        fields = Path(f"/proc/{process.pid}/stat").read_text().rsplit(")", 1)[1].split()
+        counters["cpu_ms"] = (
+            (int(fields[11]) + int(fields[12])) * 1000 / os.sysconf("SC_CLK_TCK")
+        )
+        return counters
+
+    def timed_query(query, phase="search"):
+        before = resource_counters()
         started = time.monotonic()
         result = call("POST", "/tables/hn_archive_poc/query", query)
-        return result, round((time.monotonic() - started) * 1000, 2)
+        elapsed = round((time.monotonic() - started) * 1000, 2)
+        after = resource_counters()
+        if before is not None:
+            io_profiles.append(
+                {
+                    "phase": phase,
+                    "elapsed_ms": elapsed,
+                    "took_ms": result.get("took"),
+                    "filter": query.get("filter_query"),
+                    **{key: round(after[key] - before[key], 2) for key in before},
+                }
+            )
+        return result, elapsed
 
     try:
         start()
@@ -188,6 +260,10 @@ def main():
                     "num_shards": 1,
                     "schema": {
                         "storage_mode": "relational",
+                        "relational_indexes": [
+                            {"name": column + "_idx", "keys": [{"column": column}]}
+                            for column in metadata_columns
+                        ],
                         "base_source": {
                             "kind": "external",
                             "table_id": "hn-archive-poc",
@@ -213,22 +289,39 @@ def main():
                 )
             time.sleep(1)
         ready_seconds = round(time.monotonic() - started, 2)
+        metadata_status = {}
+        for column in metadata_columns:
+            # Relational indexes are published with the pinned lake snapshot.
+            metadata_status[column] = call(
+                "GET", "/tables/hn_archive_poc/indexes/" + column + "_idx"
+            )
+            assert metadata_status[column]["status"]["readiness"]["queryable"], (
+                metadata_status[column]
+            )
         count = call(
             "POST", "/sql", {"statement": "SELECT COUNT(*) FROM hn_archive_poc"}
         )
         assert count["rows"] == [[str(args.expected_rows)]], count
+        if args.cold_cache:
+            stop()
+            if (args.state / "cache").exists():
+                shutil.rmtree(args.state / "cache")
+            start()
+        cache_files_before_search = sum(
+            p.is_file() for p in (args.state / "cache").rglob("*")
+        )
         query = {
             "full_text_search": {"match": "database", "field": "body"},
             "full_text_index": "body_text",
-            "fields": ["hn_id", "title", "item_type"],
+            "fields": ["hn_id", "title", "item_type", "author", "points", "created_at"],
             "highlight": {"fields": ["body"]},
             "limit": 5,
             "order_by": [{"field": "_score", "desc": True}],
         }
-        first, first_ms = timed_query(query)
+        first, first_ms = timed_query(query, "cold")
         if not first["hits"]["hits"]:
             query["full_text_search"]["match"] = "AI"
-            first, first_ms = timed_query(query)
+            first, first_ms = timed_query(query, "cold")
         hits = first["hits"]["hits"]
         assert len(hits) >= 2, "Sample must contain at least two matching rows"
         assert all(hit.get("_highlights", {}).get("body") for hit in hits), (
@@ -250,8 +343,26 @@ def main():
         assert all("body" not in hit["_source"] for hit in hits), (
             "Highlight widened source projection"
         )
-        warm, warm_ms = timed_query(query)
+        warm, warm_ms = timed_query(query, "warm")
         assert [h["_id"] for h in warm["hits"]["hits"]] == [h["_id"] for h in hits]
+        warm_samples = [warm_ms]
+        for _ in range(args.repeats - 1):
+            repeated, elapsed = timed_query(query, "warm")
+            assert [h["_id"] for h in repeated["hits"]["hits"]] == [
+                h["_id"] for h in hits
+            ]
+            warm_samples.append(elapsed)
+        warm_ms = round(statistics.median(warm_samples), 2)
+        with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
+            concurrent_samples = list(
+                pool.map(
+                    lambda _: timed_query(query, "concurrent"), range(args.concurrency)
+                )
+            )
+        for result, _ in concurrent_samples:
+            assert [h["_id"] for h in result["hits"]["hits"]] == [
+                h["_id"] for h in hits
+            ]
         first_page = call("POST", "/tables/hn_archive_poc/query", dict(query, limit=1))
         page_query = dict(
             query,
@@ -305,9 +416,74 @@ def main():
             assert [h["_source"]["hn_id"] for h in unordered["hits"]["hits"]] == [
                 selected
             ]
+        source = hits[0]["_source"]
+        predicates = {
+            "item_type": {"term": {"path": "/item_type", "value": source["item_type"]}},
+            "author": {"term": {"path": "/author", "value": source["author"]}},
+            "points": {"range": {"path": "/points", "gte": source["points"]}},
+            "created_at": {
+                "range": {
+                    "path": "/created_at",
+                    "gte": source["created_at"],
+                    "lt": source["created_at"] + 3600,
+                }
+            },
+        }
+        predicates["combined"] = {"bool": {"filter": list(predicates.values())}}
+
+        def check_predicate(name, row):
+            checks = {
+                "item_type": row["item_type"] == source["item_type"],
+                "author": row["author"] == source["author"],
+                "points": row["points"] >= source["points"],
+                "created_at": source["created_at"]
+                <= row["created_at"]
+                < source["created_at"] + 3600,
+            }
+            return all(checks.values()) if name == "combined" else checks[name]
+
+        filter_results = {}
+        for name, predicate in predicates.items():
+            samples = []
+            filter_request = dict(query, filter_query=predicate)
+            for _ in range(args.repeats):
+                result, elapsed = timed_query(filter_request, "filter." + name)
+                rows = [h["_source"] for h in result["hits"]["hits"]]
+                assert rows and all(check_predicate(name, row) for row in rows), (
+                    name,
+                    rows,
+                )
+                assert selected in [row["hn_id"] for row in rows], (name, rows)
+                samples.append(elapsed)
+            # Force authoritative residual evaluation as an independent correctness oracle.
+            residual_request = dict(
+                filter_request,
+                filter_query={
+                    "bool": {
+                        "should": [predicate, {"match_all": {}}],
+                        "minimum_should_match": 2,
+                    }
+                },
+            )
+            reference = call("POST", "/tables/hn_archive_poc/query", residual_request)
+            assert [(h["_id"], h["_score"]) for h in reference["hits"]["hits"]] == [
+                (h["_id"], h["_score"]) for h in result["hits"]["hits"]
+            ], name
+            assert reference["hits"]["total"] == result["hits"]["total"], name
+            filter_results[name] = {
+                "total": result["hits"]["total"],
+                "samples_ms": samples,
+                "median_ms": round(statistics.median(samples), 2),
+                "predicate": predicate,
+            }
+        no_match = dict(
+            query, filter_query={"range": {"path": "/created_at", "gte": 4102444800}}
+        )
+        empty, _ = timed_query(no_match, "empty_filter")
+        assert not empty["hits"]["hits"], "Out-of-sample date range returned hits"
         stop()
         start()
-        reopened, restart_ms = timed_query(query)
+        reopened, restart_ms = timed_query(query, "restart")
         assert [(h["_id"], h["_score"]) for h in reopened["hits"]["hits"]] == [
             (h["_id"], h["_score"]) for h in hits
         ]
@@ -318,10 +494,39 @@ def main():
         assert [h["_id"] for h in continued["hits"]["hits"]] == [
             h["_id"] for h in hits[1:]
         ]
+        for name, predicate in predicates.items():
+            result, elapsed = timed_query(
+                dict(query, filter_query=predicate), "restart_filter." + name
+            )
+            assert all(
+                check_predicate(name, h["_source"]) for h in result["hits"]["hits"]
+            ), name
+            assert selected in [
+                h["_source"]["hn_id"] for h in result["hits"]["hits"]
+            ], name
+            assert result["hits"]["total"] == filter_results[name]["total"], name
+            filter_results[name]["after_restart_ms"] = elapsed
+        empty, _ = timed_query(no_match, "restart_empty_filter")
+        assert not empty["hits"]["hits"], (
+            "Out-of-sample date range returned hits after restart"
+        )
+        cache_files = [p for p in (args.state / "cache").rglob("*") if p.is_file()]
         report = {
             "project": args.project,
+            "metadata_indexes": metadata_columns,
+            "metadata_indexes_queryable": list(metadata_status),
+            "cold_cache_cleared_after_publication": args.cold_cache,
+            "cache_files_before_search": cache_files_before_search,
+            "warm_samples_ms": warm_samples,
+            "concurrent_search_ms": [elapsed for _, elapsed in concurrent_samples],
+            "concurrency": args.concurrency,
+            "metadata_filters": filter_results,
+            "io_profiles": io_profiles,
+            "io_profile_note": "Linux process CPU and pod-wide non-loopback network counters. Concurrent intervals overlap; not per-query byte attribution. Includes TLS/DNS/control metadata; not a GCS request trace.",
+            "cache_files": len(cache_files),
+            "cache_bytes": sum(p.stat().st_size for p in cache_files),
             "source": f"gs://{args.bucket}/{args.prefix}/archive",
-            "artifacts": f"gs://{args.bucket}/{args.prefix}/indexes",
+            "artifacts": f"gs://{args.bucket}/{artifact_prefix}/indexes",
             "sql_count": count,
             "row_count": args.expected_rows,
             "ready_seconds": ready_seconds,
@@ -339,6 +544,10 @@ def main():
                 "snapshot_pagination",
                 "restart_scores",
                 "restart_pagination",
+                "metadata_filters_match_residual",
+                "metadata_filters_after_restart",
+                "empty_date_filter_before_and_after_restart",
+                "concurrent_search",
             ],
             "note": "Temporary bucket has an eight-day deletion lifecycle. Timings are a 10k-row smoke check, not archive-scale benchmarks.",
         }

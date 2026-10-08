@@ -136,20 +136,29 @@ fn PredicateResolver(comptime Set: type) type {
         store: @import("../serverless/artifacts/store.zig").ArtifactStore,
         store_identity: [32]u8,
         read_context: local.serverless_query_lake_read_context.Context,
+        pinned: ?rows.PredicateContext = null,
+        allow_partial: bool = true,
 
         pub fn resolve(self: Self, a: A, json: []const u8) !?if (Set == Bitmap) Result else PredicateResult {
             var arena = std.heap.ArenaAllocator.init(a);
             defer arena.deinit();
             const parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), json, .{});
             const compiled = try Graph.compilePatternFilter(arena.allocator(), parsed.value);
-            const result = try self.value(a, arena.allocator(), compiled, 0, true);
-            if (Set == PhysicalSet) if (result) |resolved| {
-                if (!resolved.exact) {
+            var result = try self.value(a, arena.allocator(), compiled, 0, true);
+            if (result) |resolved| {
+                const usable = if (Set == Bitmap)
+                    self.allow_partial and resolved.bitmap.cardinality() <= local.storage_db_query_search_exec.lateVisibilityExactCandidateBudget()
+                else
+                    false;
+                if (!resolved.exact and !usable) {
                     var partial = resolved;
                     defer partial.bitmap.deinit();
-                    return self.scanSelected(a, partial.residual orelse compiled, &partial.bitmap);
+                    result = if (Set == PhysicalSet)
+                        try self.scanSelected(a, partial.residual orelse compiled, &partial.bitmap)
+                    else
+                        try self.scanExpression(a, compiled);
                 }
-            };
+            }
             if (Set == Bitmap) return if (result) |resolved| .{ .bitmap = resolved.bitmap, .exact = resolved.exact } else null;
             return result;
         }
@@ -159,6 +168,9 @@ fn PredicateResolver(comptime Set: type) type {
             defer arena.deinit();
             var conditions: std.ArrayList(Condition) = .empty;
             const scalar_conditions = try collectConditions(arena.allocator(), input, &conditions, depth);
+            if (scalar_conditions and allow_scan) {
+                if (try self.planConditions(a, conditions.items)) |result| return result;
+            }
             if (scalar_conditions) {
                 if (try self.index(a, conditions.items, false)) |bitmap| return .{ .bitmap = bitmap };
             }
@@ -229,9 +241,85 @@ fn PredicateResolver(comptime Set: type) type {
             }
             return result;
         }
+        /// Plan exact flat conjunctions as a whole. Candidate predicates stay
+        /// unopened for row iteration until a plan wins; their metadata handles
+        /// are bounded leases and all rejected handles are closed.
+        fn planConditions(self: Self, a: A, conditions: []const Condition) !?PredicateResult {
+            var scan = (try rows.tryOpenPredicateScan(a, self.table, conditions, self.context, self.source)) orelse return null;
+            defer scan.deinit();
+            const Choice = union(enum) { scan, whole, subset: usize, intersection };
+            var choice: Choice = .scan;
+            var best_work = rows.predicateScanWork(self.source, conditions) orelse std.math.maxInt(u64);
+            var whole = try rows.tryOpenPredicateWithContext(a, self.server, self.table, conditions, self.context, self.source, self.pinned);
+            defer if (whole) |*predicate| predicate.deinit();
+            if (whole) |predicate| if (predicate.work < best_work) {
+                choice = .whole;
+                best_work = predicate.work;
+            };
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const ca = arena.allocator();
+            var columns: std.ArrayList([]const u8) = .empty;
+            for (conditions) |condition| {
+                var found = false;
+                for (columns.items) |name| if (std.mem.eql(u8, name, condition.column)) {
+                    found = true;
+                    break;
+                };
+                if (!found) try columns.append(ca, condition.column);
+            }
+            var children: std.ArrayList(rows.Predicate) = .empty;
+            defer for (children.items) |*predicate| predicate.deinit();
+            var intersection_work: u64 = 0;
+            var all_indexed = true;
+            // A one-column range has already been considered as a whole.
+            if (columns.items.len > 1) for (columns.items) |name| {
+                var subset: std.ArrayList(Condition) = .empty;
+                for (conditions) |condition| if (std.mem.eql(u8, name, condition.column)) {
+                    try subset.append(ca, condition);
+                };
+                var predicate = (try rows.tryOpenPredicateWithContext(a, self.server, self.table, subset.items, self.context, self.source, self.pinned)) orelse {
+                    all_indexed = false;
+                    continue;
+                };
+                children.append(ca, predicate) catch |err| {
+                    predicate.deinit();
+                    return err;
+                };
+                const work = predicate.work +| rows.predicateResidualWork(self.source, conditions, predicate.estimatedRows());
+                if ((predicate.estimatedRows() == 0 or (Set == Bitmap and self.allow_partial and predicate.estimatedRows() <= local.storage_db_query_search_exec.lateVisibilityExactCandidateBudget())) and work < best_work) {
+                    choice = .{ .subset = children.items.len - 1 };
+                    best_work = work;
+                }
+                intersection_work +|= predicate.work;
+            };
+            if (columns.items.len > 1 and all_indexed and children.items.len == columns.items.len and intersection_work < best_work) choice = .intersection;
+            return switch (choice) {
+                .scan => .{ .bitmap = try self.consume(a, &scan) },
+                .whole => .{ .bitmap = try self.consume(a, &whole.?) },
+                // A subset is a proven superset only. Keep the entire compiled
+                // predicate residual so ranking/counting evaluate every condition.
+                .subset => |position| .{ .bitmap = try self.consume(a, &children.items[position]), .exact = children.items[position].estimatedRows() == 0 },
+                .intersection => blk: {
+                    var result: ?Set = null;
+                    errdefer if (result) |*bitmap| bitmap.deinit();
+                    for (children.items) |*predicate| {
+                        var next = try self.consume(a, predicate);
+                        if (result) |*bitmap| {
+                            defer next.deinit();
+                            bitmap.andWith(&next);
+                        } else result = next;
+                    }
+                    break :blk .{ .bitmap = result.? };
+                },
+            };
+        }
         fn index(self: Self, a: A, conditions: []const Condition, scan: bool) !?Set {
-            var predicate = (if (scan) try rows.tryOpenPredicateScan(a, self.table, conditions, self.context, self.source) else try rows.tryOpenPredicate(a, self.server, self.table, conditions, self.context, self.source)) orelse return null;
+            var predicate = (if (scan) try rows.tryOpenPredicateScan(a, self.table, conditions, self.context, self.source) else try rows.tryOpenPredicateWithContext(a, self.server, self.table, conditions, self.context, self.source, self.pinned)) orelse return null;
             defer predicate.deinit();
+            return try self.consume(a, &predicate);
+        }
+        fn consume(self: Self, a: A, predicate: *rows.Predicate) !Set {
             var result = Set.init(a);
             errdefer result.deinit();
             var lookup = std.heap.ArenaAllocator.init(a);
