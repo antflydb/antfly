@@ -87,6 +87,29 @@ func TestExecuteSQLPreservesBoundValuesAndResultOrdinals(t *testing.T) {
 	}
 }
 
+func TestExecuteSQLNumericPreservesPrecisionScaleNullsAndSpecials(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"columns":[{"name":"n","type":"number","element_type":"numeric"}],"rows":[["9007199254740993.1200"],["0.0000"],[null],["NaN"],["Infinity"],["-Infinity"]],"rows_affected":0,"command_tag":"SELECT 6"}`)
+	}))
+	defer server.Close()
+	client, err := NewAntflyClient(server.URL, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := client.ExecuteSQL(context.Background(), SQLRequest{Statement: "SELECT n FROM amounts"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Columns) != 1 || result.Columns[0].ElementType != "numeric" || len(result.Rows) != 6 {
+		t.Fatalf("lost exact numeric contract: %#v", result)
+	}
+	for i, expected := range []string{`"9007199254740993.1200"`, `"0.0000"`, `null`, `"NaN"`, `"Infinity"`, `"-Infinity"`} {
+		if len(result.Rows[i]) != 1 || string(result.Rows[i][0]) != expected {
+			t.Fatalf("row %d lost numeric value: %#v", i, result.Rows[i])
+		}
+	}
+}
+
 func TestExecuteSQLRejectsWrongRowWidth(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = io.WriteString(w, `{"columns":[],"rows":[[1]],"rows_affected":0,"command_tag":"SELECT 1"}`)

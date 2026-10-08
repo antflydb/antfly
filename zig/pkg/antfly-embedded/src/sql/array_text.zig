@@ -60,6 +60,11 @@ const QuotedWriter = struct {
 fn writeElement(kind: arrays.ElementType, cell: arrays.Element, writer: *std.Io.Writer) !void {
     if (cell.sql_null) return writer.writeAll("NULL");
     switch (kind) {
+        .numeric => {
+            var none = std.heap.FixedBufferAllocator.init(&.{});
+            var ctx: @import("numeric_value.zig").Context = .{ .alloc = none.allocator() };
+            try @import("numeric_value.zig").write(&ctx, cell.numeric.?.*, writer);
+        },
         .text, .uuid, .jsonb => {
             try writer.writeByte('"');
             var escaped: QuotedWriter = .{ .target = writer };
@@ -250,7 +255,9 @@ const Reader = struct {
 };
 
 fn decodeElement(a: A, kind: arrays.ElementType, text: []const u8, work: *arrays.Budget) !arrays.Element {
+    if (kind == .numeric) return @import("scalar.zig").numericTextLeaky(a, text, work);
     return arrays.Element.json(switch (kind) {
+        .numeric => unreachable,
         .text => .{ .string = try a.dupe(u8, text) },
         .int16, .int32, .int64 => .{ .integer = try builtin_cast.integerText(text, kind) },
         .float32 => .{ .float = try builtin_cast.floatValue(f32, .{ .string = text }) },

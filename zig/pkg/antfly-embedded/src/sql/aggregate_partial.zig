@@ -82,9 +82,9 @@ const Encoder = struct {
     fn datum(self: *Encoder, value: Datum) !void {
         if (value.patterns != null) return error.InvalidSqlSpill;
         if (value.sql_null) return self.raw(&.{0});
-        if (value.array != null) {
-            // Reuse the portable typed-block codec; an array's scalar JSON
-            // placeholder is not its value or its element identity.
+        if (value.array != null or value.numeric != null) {
+            // Reuse the portable typed-block codec; a typed value's scalar
+            // JSON placeholder is not its value or its element identity.
             const encoded = try @import("spill.zig").encodeColumnarBlockAlloc(self.a, &.{.{ .values = &.{value}, .keys = &.{}, .ordinal = 0 }}, 16 << 20);
             defer self.a.free(encoded);
             try self.raw(&.{8});
@@ -157,7 +157,7 @@ const Decoder = struct {
                 const block = try @import("spill.zig").decodeColumnarBlockInArena(self.a, try self.text(), 16 << 20);
                 if (block.count() != 1 or block.values.len != 1 or block.keys.len != 0) return error.InvalidSqlSpill;
                 const value = try block.cell(0, 0);
-                if (value.sql_null or value.array == null) return error.InvalidSqlSpill;
+                if (value.sql_null or (value.array == null and value.numeric == null)) return error.InvalidSqlSpill;
                 break :blk value;
             },
             else => error.InvalidSqlSpill,
@@ -204,7 +204,7 @@ pub fn decode(a: A, value: Datum, spec: operators.AggregateSpec) !operators.Aggr
     if (!selected.sql_null) if (spec.input_type) |type_| {
         const valid = switch (type_) {
             .integer => selected.value == .integer,
-            .number => selected.value == .integer or selected.value == .float,
+            .number => selected.numeric != null or selected.value == .integer or selected.value == .float,
             .boolean => selected.value == .bool,
             .string, .datetime, .uuid => selected.value == .string,
             .json => true,
@@ -245,6 +245,25 @@ pub fn decode(a: A, value: Datum, spec: operators.AggregateSpec) !operators.Aggr
         state.selected = owned;
     } else if ((spec.kind == .min or spec.kind == .max) and count != 0) return error.InvalidSqlSpill;
     return state;
+}
+
+test "SQL NUMERIC aggregate extrema partials retain exact values and display scale" {
+    const a = std.testing.allocator;
+    const exact = @import("numeric_value.zig");
+    var context: exact.Context = .{ .alloc = a };
+    var number = try exact.parse(&context, "9007199254740993.1200");
+    defer number.deinit();
+    var state = try operators.Aggregate.init(a, .min, .number);
+    defer state.deinit();
+    try state.update(Datum.typedNumeric(&number.value));
+    const encoded = try cell(a, state);
+    defer a.free(encoded.value.string);
+    var restored = try decode(a, encoded, .{ .kind = .min, .input_type = .number });
+    defer restored.deinit();
+    const result = try restored.finish();
+    try std.testing.expect(result.numeric != null and !result.sql_null);
+    try std.testing.expectEqual(@as(u16, 4), result.numeric.?.scale);
+    try std.testing.expectEqual(std.math.Order.eq, try @import("scalar.zig").compareDatums(result, Datum.typedNumeric(&number.value)));
 }
 
 /// Merge complete decoded states. DISTINCT uses membership, while ordinary

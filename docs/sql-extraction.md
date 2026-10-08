@@ -4929,3 +4929,51 @@ These keys are shared integration infrastructure, not activation of NUMERIC
 indexes or public SQL. Generated type identity, exact literal/scalar binding,
 typed row/transport integration and aggregate execution remain unfinished.
 The parity ledger is unchanged.
+
+### Exact NUMERIC typed execution and transport integration (2026-10-08)
+
+The shared builtin/array identity now includes NUMERIC with PostgreSQL scalar
+OID 1700 and array OID 1231. OpenAPI and generated Go/Python/TypeScript/Zig
+contracts carry that identity. Public number columns marked `element_type:
+numeric` return decimal strings, preserving precision and display scale; SQL
+NULL remains JSON null, and special values use their PostgreSQL text tokens.
+This does not activate NUMERIC in native relational schema/index descriptors.
+
+Scalar and array frames, retained typed columns, portable spill blocks,
+mapped batches, aggregate extrema partials and result pages retain canonical limbs
+rather than interpreting their JSON-null placeholders. Physical array/spill
+decoders strictly verify canonical binary representations without re-encoding
+into a second buffer; admission errors are not reported as corruption. Exact
+scalar casts and arithmetic use the shared kernel. Constant numeric casts are
+prepared once and can evaluate without scratch allocations. Small sort keys
+encode without allocating; wide values retain the exact comparison fallback.
+Primitive vector kernels explicitly fall back to typed scalar execution.
+
+Float-to-NUMERIC conversion uses PostgreSQL's six/fifteen significant decimal
+digits and ties-to-even rounding, distinct from NUMERIC's ties-away integer
+casts. The bounded IEEE coefficient is expanded exactly before rounding.
+Text/binary streaming output avoids per-cell staging buffers. Mixed
+NUMERIC/real operator and membership coercions use double precision, while
+CASE/COALESCE common domains retain real, matching a fresh PostgreSQL 18 oracle.
+The binder records these conversions explicitly rather than guessing from a
+JSON payload during comparison.
+
+The 38 focused NUMERIC tests cover exact scalar query results and metadata, array
+storage/wire/frame round trips, binary pgwire, JSON/text conversion, immutable
+retention, spill ownership, grouped extrema, UNION ALL, bounded output and
+exhaustive allocation failures. MIN/MAX preserve complete input type identity.
+Python SQL tests pass 25 cases; TypeScript SQL/expression tests pass 52 cases and
+SDK typechecking passes; the full TypeScript SDK has 424 passing tests and one
+skip. All Go SDK packages pass, including a public exact-decimal transport test.
+The SDK expression validator now admits server-defined
+CASE, casts, modulo and membership with matching structural arity and numeric
+identity checks, rather than rejecting valid generated contracts.
+
+Activation is still incomplete: default decimal/scientific and oversized
+integer literals, SQL typmod grammar, exact SUM/AVG accumulators and dedicated
+grouped NUMERIC lanes,
+mixed-domain join-key normalization, native row/index/catalog integration,
+broader numeric functions and native vector lanes need follow-through. No
+original inventory case is credited by these infrastructure tests alone.
+The ledger remains 448 implemented / 136 rejected / 73 superseded / 929
+unresolved, with all 1,586 original source cases intact.

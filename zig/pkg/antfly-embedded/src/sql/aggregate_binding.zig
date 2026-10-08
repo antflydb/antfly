@@ -377,7 +377,9 @@ pub fn bindWithInvocation(alloc: Allocator, table: ?catalog.Table, statement: as
             .pattern_set => .json,
             else => input_type orelse .string,
         };
-        if (column.type == .array) column.element_type = if (index) |slot| input.projections[slot].?.output_type.element_type else null;
+        // Extrema retain the complete input domain, not just its coarse
+        // number/array tag. Exact decimals must not become float results.
+        if (column.type == .array or kind == .min or kind == .max) column.element_type = if (index) |slot| input.projections[slot].?.output_type.element_type else null;
         if (node.call.within_group != null) {
             column.type = if (orderedKind(node.call.name).? == .continuous) .number else input_type orelse .string;
             column.element_type = if (index) |slot| input.projections[slot].?.output_type.element_type else null;

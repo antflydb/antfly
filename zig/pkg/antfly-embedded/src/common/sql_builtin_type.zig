@@ -26,6 +26,7 @@ pub const Type = enum(u8) {
     boolean = 6,
     uuid = 7,
     jsonb = 8,
+    numeric = 9,
 
     /// Public enums are generated from OpenAPI; keep durable tags independent
     /// while checking that every generated identity has a storage counterpart.
@@ -46,6 +47,7 @@ pub const Type = enum(u8) {
             .boolean => 16,
             .uuid => 2950,
             .jsonb => 3802,
+            .numeric => 1700,
         };
     }
 
@@ -60,6 +62,7 @@ pub const Type = enum(u8) {
             .boolean => 1000,
             .uuid => 2951,
             .jsonb => 3807,
+            .numeric => 1231,
         };
     }
 };

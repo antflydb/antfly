@@ -183,6 +183,7 @@ const Column = struct {
     nulls: std.ArrayList(u64) = .empty,
     patterns: std.ArrayList(?*scalar.PatternSet) = .empty,
     arrays: std.ArrayList(?*const @import("array_value.zig").Value) = .empty,
+    numerics: std.ArrayList(?*const @import("numeric_value.zig").Value) = .empty,
     fn deinit(self: *Column, a: A) void {
         switch (self.values) {
             .unknown => {},
@@ -191,6 +192,7 @@ const Column = struct {
         self.nulls.deinit(a);
         self.patterns.deinit(a);
         self.arrays.deinit(a);
+        self.numerics.deinit(a);
     }
     fn isNull(self: Column, row: usize) bool {
         return self.nulls.items[row / 64] & (@as(u64, 1) << @as(u6, @intCast(row % 64))) != 0;
@@ -207,10 +209,10 @@ const Column = struct {
             .decimals => |v| .{ .number_string = v.getText(row) },
             .encoded => |v| v.items[row],
         };
-        return .{ .value = value, .sql_null = false, .patterns = if (self.patterns.items.len == 0) null else self.patterns.items[row], .array = if (self.arrays.items.len == 0) null else self.arrays.items[row] };
+        return .{ .value = value, .sql_null = false, .patterns = if (self.patterns.items.len == 0) null else self.patterns.items[row], .array = if (self.arrays.items.len == 0) null else self.arrays.items[row], .numeric = if (self.numerics.items.len == 0) null else self.numerics.items[row] };
     }
     fn appendDictionary(self: *Column, a: A, owned: A, begin: usize, batch: @import("execution_batch.zig").Batch) !bool {
-        if (batch != .dictionary or self.patterns.items.len != 0) return false;
+        if (batch != .dictionary or self.patterns.items.len != 0 or self.arrays.items.len != 0 or self.numerics.items.len != 0) return false;
         const source = batch.dictionary;
         for (source.indices) |id| if (id >= source.values.len) return error.InvalidSqlBackendResponse;
         const remap = try a.alloc(u32, source.values.len);
@@ -223,7 +225,7 @@ const Column = struct {
         var referenced: usize = 0;
         for (source.values, remap) |value, id| {
             if (id == std.math.maxInt(u32)) continue;
-            if (value.patterns != null) return false;
+            if (value.patterns != null or value.array != null or value.numeric != null) return false;
             if (value.sql_null) continue;
             const actual = std.meta.activeTag(value.value);
             if (actual != .integer and actual != .float and actual != .string and actual != .number_string) return false;
@@ -336,6 +338,13 @@ const Column = struct {
         return true;
     }
     fn append(self: *Column, a: A, owned: A, scratch: A, row: usize, value: Datum) !void {
+        if (self.numerics.items.len != 0 or value.numeric != null) {
+            if (self.numerics.items.len == 0) {
+                try self.numerics.resize(a, row);
+                @memset(self.numerics.items, null);
+            }
+            try self.numerics.append(a, if (value.numeric != null) (try @import("operators.zig").cloneDatum(owned, value)).numeric else null);
+        }
         if (self.arrays.items.len != 0 or value.array != null) {
             if (self.arrays.items.len == 0) {
                 try self.arrays.resize(a, row);
@@ -406,7 +415,7 @@ const Column = struct {
             .booleans => |*v| try v.append(a, !value.sql_null and value.value.bool),
             .strings => |*v| try v.append(a, owned, if (value.sql_null) null else value.value.string),
             .decimals => |*v| try v.append(a, owned, if (value.sql_null) null else value.value.number_string),
-            .encoded => |*v| try v.append(a, if (value.sql_null or value.array != null) .null else (try @import("operators.zig").cloneDatum(owned, value)).value),
+            .encoded => |*v| try v.append(a, if (value.sql_null or value.array != null or value.numeric != null) .null else (try @import("operators.zig").cloneDatum(owned, value)).value),
         }
     }
 };
@@ -432,7 +441,7 @@ pub const Store = struct {
     pub fn dictionaryId(self: *const Store, row_index: usize, column: usize) !?u64 {
         if (row_index >= self.len or column >= self.columns.len) return error.InvalidSqlBackendResponse;
         const stored = self.columns[column];
-        if (stored.patterns.items.len != 0) return null;
+        if (stored.patterns.items.len != 0 or stored.arrays.items.len != 0 or stored.numerics.items.len != 0) return null;
         const id: u32 = switch (stored.values) {
             inline .integers, .numbers => |v| if (v.encoded) v.indices.items[row_index] else return null,
             .strings, .decimals => |v| if (v.flat == null) v.indices.items[row_index] else return null,
@@ -443,7 +452,7 @@ pub const Store = struct {
     pub fn dictionaryBatch(self: *const Store, a: A, column: usize, begin: usize, count: usize) !?@import("execution_batch.zig").Batch {
         if (self.failed or column >= self.columns.len or begin > self.len or count > self.len - begin) return error.InvalidSqlBackendResponse;
         const stored = self.columns[column];
-        if (stored.patterns.items.len != 0) return null;
+        if (stored.patterns.items.len != 0 or stored.arrays.items.len != 0 or stored.numerics.items.len != 0) return null;
         switch (stored.values) {
             inline .integers, .numbers => |v| if (!v.encoded) return null,
             .strings, .decimals => |v| if (v.flat != null) return null,
@@ -579,7 +588,7 @@ pub const Store = struct {
                 if (!null_equal or is_null != value.sql_null) return false;
                 continue;
             }
-            if (value.array != null or (stored.arrays.items.len != 0 and stored.arrays.items[row_index] != null)) {
+            if (value.array != null or value.numeric != null or (stored.arrays.items.len != 0 and stored.arrays.items[row_index] != null) or (stored.numerics.items.len != 0 and stored.numerics.items[row_index] != null)) {
                 if ((try scalar.compareDatums(try stored.cell(a, row_index), value)) != .eq) return false;
                 continue;
             }
@@ -599,6 +608,35 @@ pub const Store = struct {
         return true;
     }
 };
+test "SQL exact NUMERIC retained columns own limbs preserve scale and reject placeholder equality" {
+    const Harness = struct {
+        fn run(a: A) !void {
+            const numeric = @import("numeric_value.zig");
+            var context: numeric.Context = .{ .alloc = a };
+            var original = try numeric.parse(&context, "9007199254740993.1200");
+            defer original.deinit();
+            var store = Store.init(a);
+            defer store.deinit();
+            _ = try store.append(&.{.{}});
+            _ = try store.append(&.{Datum.typedNumeric(&original.value)});
+            _ = try store.append(&.{Datum.json(.null)});
+            _ = try store.append(&.{Datum.json(.{ .integer = 7 })});
+            const retained = try store.cell(a, 1, 0);
+            try std.testing.expect(retained.numeric != null and !retained.sql_null);
+            try std.testing.expect(retained.numeric.?.digits.ptr != original.value.digits.ptr);
+            try std.testing.expectEqual(@as(u16, 4), retained.numeric.?.scale);
+            try std.testing.expect(try store.equal(a, 1, &.{Datum.typedNumeric(&original.value)}, true));
+            try std.testing.expectError(error.SqlTypeMismatch, store.equal(a, 1, &.{Datum.json(.null)}, true));
+            try std.testing.expect((try store.cell(a, 0, 0)).sql_null);
+            try std.testing.expect((try store.cell(a, 2, 0)).numeric == null);
+            try std.testing.expectEqual(@as(i64, 7), (try store.cell(a, 3, 0)).value.integer);
+            try std.testing.expect(try store.dictionaryId(1, 0) == null);
+        }
+    };
+    try Harness.run(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
+}
+
 test "SQL typed array retained columns preserve bounds ownership and type separation under allocation faults" {
     const Harness = struct {
         fn run(a: A) !void {

@@ -13,7 +13,7 @@ const powers = [_]u16{ 1, 10, 100, 1000 };
 pub const maximum_scale = 16383;
 pub const maximum_weight = 32767;
 pub const Kind = enum { finite, nan, positive_infinity, negative_infinity };
-pub const Rounding = enum { half_away, truncate };
+pub const Rounding = enum { half_away, half_even, truncate };
 
 pub const TypeModifier = struct {
     precision: u16,
@@ -387,6 +387,51 @@ fn radixChunk(ctx: *Context, storage: []u16, used: *usize, multiplier: u32, chun
     }
 }
 
+/// Stream exact text with bounded output and no allocation. The logical
+/// validator runs before any bytes are exposed, including special values.
+pub fn write(ctx: *Context, value: Value, writer: *std.Io.Writer) !void {
+    try validateCanonical(ctx, value);
+    const token: ?[]const u8 = switch (value.kind) {
+        .nan => "NaN",
+        .positive_infinity => "Infinity",
+        .negative_infinity => "-Infinity",
+        .finite => null,
+    };
+    if (token) |text| {
+        if (text.len > ctx.max_output_bytes) return ctx.limit();
+        try ctx.charge(text.len);
+        return writer.writeAll(text);
+    }
+    var integral: usize = 1;
+    if (!value.isZero() and value.weight >= 0) {
+        var first = value.digits[0];
+        var width: usize = 1;
+        while (first >= 10) : (width += 1) first /= 10;
+        integral = @as(usize, @intCast(value.weight)) * 4 + width;
+    }
+    const size = integral + @as(usize, value.scale) + @intFromBool(value.scale != 0) + @intFromBool(value.negative);
+    if (size > ctx.max_output_bytes) return ctx.limit();
+    if (value.negative) try writer.writeByte('-');
+    var chunk: [256]u8 = undefined;
+    var at: usize = 0;
+    for (0..integral + value.scale) |i| {
+        try ctx.charge(1);
+        if (i == integral and value.scale != 0) {
+            try writer.writeAll(chunk[0..at]);
+            at = 0;
+            try writer.writeByte('.');
+        }
+        const exponent = @as(i32, @intCast(integral)) - @as(i32, @intCast(i)) - 1;
+        chunk[at] = '0' + value.decimalDigit(exponent);
+        at += 1;
+        if (at == chunk.len) {
+            try writer.writeAll(&chunk);
+            at = 0;
+        }
+    }
+    try writer.writeAll(chunk[0..at]);
+}
+
 pub fn format(ctx: *Context, value: Value) ![]u8 {
     try ctx.charge(1);
     const token: ?[]const u8 = switch (value.kind) {
@@ -551,7 +596,16 @@ pub fn quantize(ctx: *Context, value: Value, requested_scale: i32, mode: Roundin
     }
     const factor: u16 = powers[@intCast(@mod(cut, 4))];
     storage[storage.len - 1] = storage[storage.len - 1] / factor * factor;
-    var carry: u32 = if (mode == .half_away and value.decimalDigit(cut - 1) >= 5) factor else 0;
+    const guard = value.decimalDigit(cut - 1);
+    const guard_unit = @divFloor(cut - 1, 4);
+    const guard_factor = powers[@intCast(@mod(cut - 1, 4))];
+    const sticky = value.lowest() < guard_unit or value.group(guard_unit) % guard_factor != 0;
+    const increment = switch (mode) {
+        .truncate => false,
+        .half_away => guard >= 5,
+        .half_even => guard > 5 or (guard == 5 and (sticky or value.decimalDigit(cut) % 2 != 0)),
+    };
+    var carry: u32 = if (increment) factor else 0;
     var index = storage.len;
     while (carry != 0) {
         try ctx.charge(1);
@@ -561,6 +615,37 @@ pub fn quantize(ctx: *Context, value: Value, requested_scale: i32, mode: Roundin
         carry = total / base;
     }
     return finish(ctx.alloc, storage, high, display, value.negative);
+}
+
+/// PostgreSQL float casts use FLT_DIG/DBL_DIG significant decimal digits,
+/// not the shortest round-trip spelling or NUMERIC's ties-away rounding.
+/// Expand the exact bounded IEEE coefficient, then round ties to even.
+pub fn fromFloat(ctx: *Context, input: f64, real: bool) !Owned {
+    try ctx.charge(1);
+    const number: f64 = if (real) @as(f64, @as(f32, @floatCast(input))) else input;
+    if (real and std.math.isFinite(input) and (std.math.isInf(number) or (input != 0 and number == 0))) return error.SqlNumericOutOfRange;
+    if (std.math.isNan(number)) return special(ctx.alloc, .nan);
+    if (std.math.isInf(number)) return special(ctx.alloc, if (number < 0) .negative_infinity else .positive_infinity);
+    const parts = try @import("../common/json_float_decimal.zig").Parts.init(number);
+    try ctx.charge(parts.work());
+    var coefficient_buffer: [768]u8 = undefined;
+    const coefficient = try std.fmt.bufPrint(&coefficient_buffer, "{d}", .{parts.coefficient()});
+    var text_buffer: [800]u8 = undefined;
+    const text = try std.fmt.bufPrint(&text_buffer, "{s}{s}e{d}", .{ if (parts.negative) "-" else "", coefficient, parts.decimalExponent() });
+    var exact = try parse(ctx, text);
+    defer exact.deinit();
+    const decimal_magnitude = @as(i32, @intCast(coefficient.len)) + parts.decimalExponent() - 1;
+    var rounded = try quantize(ctx, exact.value, (if (real) @as(i32, 6) else 15) - 1 - decimal_magnitude, .half_even);
+    if (rounded.value.isZero()) rounded.value.scale = 0 else {
+        const low = rounded.value.lowest();
+        var scale: i32 = @max(0, -low * 4);
+        if (scale != 0) {
+            var last = rounded.value.digits[rounded.value.digits.len - 1];
+            while (last % 10 == 0) : (last /= 10) scale -= 1;
+        }
+        rounded.value.scale = @intCast(scale);
+    }
+    return rounded;
 }
 
 /// Round before checking precision, including scales greater than precision
@@ -999,6 +1084,42 @@ test "SQL exact NUMERIC range extremes retain compact limbs and bounded output" 
     var ten = try parse(&ctx, "10");
     defer ten.deinit();
     try std.testing.expectError(error.InvalidSqlNumber, multiply(&ctx, huge.value, ten.value));
+}
+
+test "SQL exact NUMERIC float casts use PostgreSQL significant digits and ties even" {
+    const cases = [_]struct { input: f64, double: []const u8, real: []const u8 }{
+        .{ .input = 0.1000000000000005, .double = "0.100000000000001", .real = "0.1" },
+        .{ .input = 100000000000000.5, .double = "100000000000000", .real = "100000000000000" },
+        .{ .input = 100000000000001.5, .double = "100000000000002", .real = "100000000000000" },
+        .{ .input = 0.12345678901234567, .double = "0.123456789012346", .real = "0.123457" },
+        .{ .input = -100000000000000.5, .double = "-100000000000000", .real = "-100000000000000" },
+    };
+    for (cases) |case| for ([_]bool{ false, true }) |real| {
+        var context: Context = .{ .alloc = std.testing.allocator };
+        var number = try fromFloat(&context, case.input, real);
+        defer number.deinit();
+        var none = std.heap.FixedBufferAllocator.init(&.{});
+        var streamed: Context = .{ .alloc = none.allocator() };
+        var buffer: [256]u8 = undefined;
+        var writer: std.Io.Writer = .fixed(&buffer);
+        try write(&streamed, number.value, &writer);
+        try std.testing.expectEqualStrings(if (real) case.real else case.double, writer.buffered());
+    };
+    var context: Context = .{ .alloc = std.testing.allocator };
+    try std.testing.expectError(error.SqlNumericOutOfRange, fromFloat(&context, 1e-300, true));
+}
+
+test "SQL exact NUMERIC streamed output bounds before exposing bytes" {
+    var context: Context = .{ .alloc = std.testing.allocator };
+    var number = try parse(&context, "-9007199254740993.1200");
+    defer number.deinit();
+    var buffer: [64]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    var limited: Context = .{ .alloc = std.testing.allocator, .max_output_bytes = 1 };
+    try std.testing.expectError(error.SqlProgramLimitExceeded, write(&limited, number.value, &writer));
+    try std.testing.expectEqual(@as(usize, 0), writer.end);
+    writer = .fixed(buffer[0..1]);
+    try std.testing.expectError(error.WriteFailed, write(&context, number.value, &writer));
 }
 
 test "SQL exact NUMERIC ownership unwinds every allocation failure" {

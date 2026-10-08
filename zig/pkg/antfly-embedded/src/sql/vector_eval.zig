@@ -503,7 +503,7 @@ fn evaluateInput(a: std.mem.Allocator, program: *const scalar.Program, inputs: a
 }
 pub fn unary(op: @import("ast.zig").Scalar.Unary, value: Datum) !Datum {
     if (op == .is_null or op == .is_not_null or op == .is_unknown or op == .is_not_unknown) return Datum.json(.{ .bool = value.sql_null == (op == .is_null or op == .is_unknown) });
-    if (value.array != null) return error.SqlTypeMismatch;
+    if (value.array != null or value.numeric != null) return error.SqlTypeMismatch;
     if (op == .is_true or op == .is_not_true or op == .is_false or op == .is_not_false) {
         const target = op == .is_true or op == .is_not_true;
         const matches = value.value == .bool and value.value.bool == target;
@@ -534,7 +534,7 @@ pub fn binary(op: Binary, left: Datum, right: Datum) !Datum {
     }
     if (left.sql_null or right.sql_null) return .{};
     if (comparison(op)) return Datum.json(scalar.comparison(op, try scalar.compareDatums(left, right)));
-    if (left.array != null or right.array != null) return error.SqlTypeMismatch;
+    if (left.array != null or right.array != null or left.numeric != null or right.numeric != null) return error.SqlTypeMismatch;
     // Arithmetic shares the scalar overflow/division/finite-number contract.
     // JSON null is a value for comparison, but remains null in arithmetic.
     if (left.value == .null or right.value == .null) return .{};

@@ -31,6 +31,9 @@ pub const PatternSet = struct {
     close: *const fn (*anyopaque) void,
 };
 pub const Datum = struct {
+    /// Exact immutable NUMERIC payload, owned by the pinned value region.
+    /// JSON null is only a placeholder and is never SQL NULL or numeric data.
+    numeric: ?*const @import("numeric_value.zig").Value = null,
     /// A pinned, immutable SQL array. JSON arrays remain in value and never
     /// acquire SQL-array semantics from their payload shape.
     array: ?*const @import("array_value.zig").Value = null,
@@ -46,6 +49,45 @@ pub const Datum = struct {
     }
     pub fn typedArray(value: *const @import("array_value.zig").Value) Datum {
         return .{ .array = value, .sql_null = false };
+    }
+    pub fn typedNumeric(value: *const @import("numeric_value.zig").Value) Datum {
+        return .{ .numeric = value, .sql_null = false };
+    }
+};
+
+/// Leaky constructors retain limbs and their stable view in the caller's
+/// region. Frames/operators own that region; no input bytes remain borrowed.
+pub fn numericTextLeaky(a: Allocator, text: []const u8, work: *arrays.Budget) !Datum {
+    const exact = @import("numeric_value.zig");
+    var ctx: exact.Context = .{ .alloc = a, .remaining = work.remaining };
+    defer work.remaining = @intCast(ctx.remaining);
+    var parsed = try exact.parse(&ctx, text);
+    errdefer parsed.deinit();
+    const value = try a.create(exact.Value);
+    value.* = parsed.value;
+    return Datum.typedNumeric(value);
+}
+pub fn numericBinaryLeaky(a: Allocator, bytes: []const u8, work: *arrays.Budget) !Datum {
+    const exact = @import("numeric_value.zig");
+    var ctx: exact.Context = .{ .alloc = a, .remaining = work.remaining };
+    defer work.remaining = @intCast(ctx.remaining);
+    var parsed = try @import("numeric_binary.zig").decode(&ctx, bytes, .{});
+    errdefer parsed.deinit();
+    const value = try a.create(exact.Value);
+    value.* = parsed.value;
+    return Datum.typedNumeric(value);
+}
+
+pub const NumericJsonText = struct {
+    value: *const @import("numeric_value.zig").Value,
+    pub fn jsonStringify(self: @This(), writer: anytype) std.Io.Writer.Error!void {
+        var none = std.heap.FixedBufferAllocator.init(&.{});
+        var ctx: @import("numeric_value.zig").Context = .{ .alloc = none.allocator() };
+        try writer.beginWriteRaw();
+        try writer.writer.writeByte('"');
+        @import("numeric_value.zig").write(&ctx, self.value.*, writer.writer) catch return error.WriteFailed;
+        try writer.writer.writeByte('"');
+        writer.endWriteRaw();
     }
 };
 const arrays = @import("array_value.zig");
@@ -130,6 +172,7 @@ pub const Program = struct {
     /// Derived execution caches are never part of serialized instructions.
     translations: std.AutoHashMapUnmanaged(u32, *const TextTranslation) = .empty,
     constant_arrays: std.AutoHashMapUnmanaged(u32, *const arrays.Value) = .empty,
+    constant_numerics: std.AutoHashMapUnmanaged(u32, *const @import("numeric_value.zig").Value) = .empty,
     constant_memberships: std.AutoHashMapUnmanaged(u32, *arrays.Membership) = .empty,
 
     fn literalInstruction(self: *const Program, index: u32) bool {
@@ -147,6 +190,11 @@ pub const Program = struct {
 
     fn prepareConstantArrays(self: *Program, a: Allocator) !void {
         for (self.instructions, 0..) |instruction, index| {
+            if (instruction.type.kind == .number and instruction.type.element_type == .numeric and self.literalInstruction(@intCast(index))) {
+                const value = try self.evaluateInstruction(a, @intCast(index), &.{});
+                if (value.numeric) |number| try self.constant_numerics.put(a, @intCast(index), number);
+                continue;
+            }
             if (instruction.type.kind != .array or !self.literalInstruction(@intCast(index))) continue;
             const value = try self.evaluateInstruction(a, @intCast(index), &.{});
             if (value.array) |array| try self.constant_arrays.put(a, @intCast(index), array);
@@ -1054,7 +1102,7 @@ fn arrayScalarType(kind: arrays.ElementType) ast.ColumnType {
         .text => .string,
         .uuid => .uuid,
         .int16, .int32, .int64 => .integer,
-        .float32, .float64 => .number,
+        .float32, .float64, .numeric => .number,
         .boolean => .boolean,
         .jsonb => .json,
     };
@@ -1089,7 +1137,7 @@ fn common(left: Type, right: Type) !Type {
         return .{ .kind = .array, .element_type = element, .nullable = left.nullable or right.nullable };
     }
     const kind = if (left.kind == null) right.kind else if (right.kind == null) left.kind else if (left.kind == right.kind) left.kind else if ((left.kind == .uuid and right.kind == .string) or (left.kind == .string and right.kind == .uuid)) ast.ColumnType.uuid else if (numeric(left.kind) and numeric(right.kind)) ast.ColumnType.number else return error.SqlTypeMismatch;
-    const element: ?arrays.ElementType = if (left.kind == null) right.element_type else if (right.kind == null) left.element_type else if (kind == .integer) (if (left.element_type == null or right.element_type == null or left.element_type == .int64 or right.element_type == .int64) .int64 else if (left.element_type == .int32 or right.element_type == .int32) .int32 else .int16) else if (kind == .number) (if (left.element_type == .float64 or right.element_type == .float64) .float64 else if (left.element_type == .float32 or right.element_type == .float32) .float32 else null) else left.element_type orelse right.element_type;
+    const element: ?arrays.ElementType = if (left.kind == null) right.element_type else if (right.kind == null) left.element_type else if (kind == .integer) (if (left.element_type == null or right.element_type == null or left.element_type == .int64 or right.element_type == .int64) .int64 else if (left.element_type == .int32 or right.element_type == .int32) .int32 else .int16) else if (kind == .number) (if (left.element_type == .float64 or right.element_type == .float64) .float64 else if (left.element_type == .float32 or right.element_type == .float32) .float32 else if (left.element_type == .numeric or right.element_type == .numeric) .numeric else null) else left.element_type orelse right.element_type;
     return .{ .kind = kind, .element_type = element, .nullable = left.nullable or right.nullable };
 }
 
@@ -1956,6 +2004,7 @@ const Binder = struct {
         const empty_constructor = expression.* == .call and std.mem.eql(u8, expression.call.name, "$array") and expression.call.args.len == 0;
         if (depth == 0 and empty_constructor and self.limits.assignment) return error.UnknownSqlArrayType;
         var kind = if (empty_constructor and array_element != null) Type{ .kind = .array, .element_type = array_element, .nullable = false } else try self.infer(expression, depth);
+        if (expected == .number and array_element == .numeric and (kind.kind == .integer or (expression.* == .literal and expression.literal == .string))) kind = .{ .kind = .number, .element_type = .numeric, .nullable = kind.nullable };
         if (expression.* == .literal and expression.literal == .parameter) kind = self.parameters[expression.literal.parameter - 1];
         if (kind.kind == null) kind.kind = expected;
         if (self.typed_parameters and expression.* == .literal and expression.literal == .parameter and self.parameters[expression.literal.parameter - 1].kind == null) kind.element_type = array_element;
@@ -2009,7 +2058,13 @@ const Binder = struct {
             .binary => |binary| blk: {
                 if (try self.arrayConcatenation(binary, depth)) |call| return self.compileArrayContext(call, expected, array_element, depth + 1);
                 if (binary.op == .json_get or binary.op == .json_text) break :blk .{ .binary = .{ .op = binary.op, .left = try self.compile(binary.left, .json, depth + 1), .right = try self.compile(binary.right, .string, depth + 1) } };
-                const merged = try common(try self.infer(binary.left, depth + 1), try self.infer(binary.right, depth + 1));
+                const left_type = try self.infer(binary.left, depth + 1);
+                const right_type = try self.infer(binary.right, depth + 1);
+                var merged = try common(left_type, right_type);
+                // PostgreSQL's mixed NUMERIC/real operators use float8;
+                // CASE/COALESCE and array common types still select real.
+                if (merged.kind == .number and merged.element_type == .float32 and
+                    (left_type.element_type == .numeric or right_type.element_type == .numeric)) merged.element_type = .float64;
                 const operand_kind: ?ast.ColumnType = switch (binary.op) {
                     .@"and", .@"or" => .boolean,
                     .concat => merged.kind orelse .string,
@@ -2173,7 +2228,12 @@ const Binder = struct {
             },
             .in_list => |list| blk: {
                 var merged = try self.infer(list.operand, depth + 1);
-                for (list.values) |item| merged = try common(merged, try self.infer(item, depth + 1));
+                for (list.values) |item| {
+                    const item_type = try self.infer(item, depth + 1);
+                    const numeric_operand = merged.element_type == .numeric or item_type.element_type == .numeric;
+                    merged = try common(merged, item_type);
+                    if (numeric_operand and merged.kind == .number and merged.element_type == .float32) merged.element_type = .float64;
+                }
                 if (merged.kind == .uuid) {
                     if ((try self.infer(list.operand, depth + 1)).kind == .string and !uuidTextOperand(list.operand)) return error.SqlTypeMismatch;
                     for (list.values) |item| if ((try self.infer(item, depth + 1)).kind == .string and !uuidTextOperand(item)) return error.SqlTypeMismatch;
@@ -2186,6 +2246,17 @@ const Binder = struct {
         if (self.instructions.items.len >= self.limits.nodes) return error.SqlProgramLimitExceeded;
         const index: u32 = @intCast(self.instructions.items.len);
         try self.instructions.append(self.alloc, instruction);
+        if (kind.element_type == .numeric and expected == .number and
+            (array_element == .float32 or array_element == .float64))
+        {
+            if (self.instructions.items.len >= self.limits.nodes) return error.SqlProgramLimitExceeded;
+            const promoted: u32 = @intCast(self.instructions.items.len);
+            try self.instructions.append(self.alloc, .{
+                .type = .{ .kind = .number, .element_type = array_element, .nullable = kind.nullable },
+                .operation = .{ .cast = .{ .operand = index, .type = .number, .element_type = array_element } },
+            });
+            return promoted;
+        }
         if (expected == .array and array_element != null and kind.kind == .array and kind.element_type != array_element) {
             if (depth == 0 and self.limits.assignment and !builtin_cast.assignmentAllowed(kind.element_type orelse return error.SqlAssignmentTypeMismatch, array_element.?)) return error.SqlAssignmentTypeMismatch;
             if (self.instructions.items.len >= self.limits.nodes) return error.SqlProgramLimitExceeded;
@@ -2251,7 +2322,7 @@ const Evaluator = struct {
 
     fn run(self: *Evaluator, index: u32, depth: usize) anyerror!Json {
         const result = try self.runDatum(index, depth);
-        if (result.array != null) return error.SqlTypeMismatch;
+        if (result.array != null or result.numeric != null) return error.SqlTypeMismatch;
         return result.value;
     }
 
@@ -2259,6 +2330,7 @@ const Evaluator = struct {
         if (depth >= self.limits.depth or self.steps >= self.limits.steps) return error.SqlProgramLimitExceeded;
         self.steps += 1;
         const instruction = self.program.instructions[index];
+        if (self.program.constant_numerics.get(index)) |number| return Datum.typedNumeric(number);
         var result: Datum = switch (instruction.operation) {
             .parameter => |slot| blk: {
                 if (self.typed_parameters) |parameters| {
@@ -2300,7 +2372,7 @@ const Evaluator = struct {
                     const source = self.program.instructions[cast.operand].type;
                     const source_element = source.element_type orelse (if (source.kind == null or source.kind == .datetime or source.kind == .number) null else try arrayElementType(source.kind.?));
                     if (source_element == .jsonb and datum.value == .null and target != .text and target != .jsonb) break :blk .{};
-                    break :blk Datum.json(try self.castBuiltin(datum.value, source_element, target));
+                    break :blk try self.castDatumBuiltin(datum, source_element, target);
                 }
                 if (cast.type == .string and self.program.instructions[cast.operand].type.kind == .json) break :blk Datum.json(.{ .string = try self.jsonText(datum.value) });
                 if (cast.type == .json and self.program.instructions[cast.operand].type.kind == .json) break :blk datum;
@@ -2311,6 +2383,24 @@ const Evaluator = struct {
             .unary => |unary| if (unary.op == .is_null or unary.op == .is_not_null or unary.op == .is_unknown or unary.op == .is_not_unknown) blk: {
                 const datum = try self.runDatum(unary.operand, depth + 1);
                 break :blk Datum.json(.{ .bool = datum.sql_null == (unary.op == .is_null or unary.op == .is_unknown) });
+            } else if (instruction.type.element_type == .numeric) blk: {
+                const operand = try self.runDatum(unary.operand, depth + 1);
+                if (operand.sql_null) break :blk .{};
+                const exact = try self.castDatumBuiltin(operand, self.program.instructions[unary.operand].type.element_type, .numeric);
+                if (unary.op == .positive) break :blk exact;
+                if (unary.op != .negative) return error.SqlTypeMismatch;
+                const number = try self.alloc.create(@import("numeric_value.zig").Value);
+                number.* = exact.numeric.?.*;
+                switch (number.kind) {
+                    .positive_infinity => number.kind = .negative_infinity,
+                    .negative_infinity => number.kind = .positive_infinity,
+                    .finite => if (!number.isZero()) {
+                        number.negative = !number.negative;
+                    },
+                    .nan => {},
+                }
+                try self.charge(@sizeOf(@import("numeric_value.zig").Value));
+                break :blk Datum.typedNumeric(number);
             } else Datum.fromJson(try self.runLegacy(index, depth)),
             .binary => |binary| if (binary.op == .json_get or binary.op == .json_text) blk: {
                 const left = try self.runDatum(binary.left, depth + 1);
@@ -2328,6 +2418,19 @@ const Evaluator = struct {
                 if (binary.op == .json_get) break :blk Datum.json(value);
                 if (value == .null) break :blk .{};
                 break :blk Datum.json(.{ .string = if (value == .string) value.string else try self.jsonText(value) });
+            } else if (binary.op == .add or binary.op == .subtract or binary.op == .multiply or binary.op == .divide or binary.op == .modulo) blk: {
+                var left = try self.runDatum(binary.left, depth + 1);
+                var right = try self.runDatum(binary.right, depth + 1);
+                if (left.sql_null or right.sql_null) break :blk .{};
+                if (instruction.type.element_type == .numeric) {
+                    left = try self.castDatumBuiltin(left, self.program.instructions[binary.left].type.element_type, .numeric);
+                    right = try self.castDatumBuiltin(right, self.program.instructions[binary.right].type.element_type, .numeric);
+                    break :blk try self.numericArithmetic(binary.op, left, right);
+                }
+                if (left.numeric != null) left = try self.castDatumBuiltin(left, .numeric, instruction.type.element_type orelse .float64);
+                if (right.numeric != null) right = try self.castDatumBuiltin(right, .numeric, instruction.type.element_type orelse .float64);
+                if (left.value == .null or right.value == .null) break :blk .{};
+                break :blk Datum.json(try arithmetic(binary.op, left.value, right.value));
             } else if (binary.op == .concat and instruction.type.kind == .json) blk: {
                 const left = try self.runDatum(binary.left, depth + 1);
                 const right = try self.runDatum(binary.right, depth + 1);
@@ -2522,7 +2625,7 @@ const Evaluator = struct {
                         for (call.args, elements) |arg, *out| {
                             const value = try self.runDatum(arg, depth + 1);
                             if (value.array != null) return error.SqlTypeMismatch;
-                            out.* = if (value.sql_null) .{} else arrays.Element.json(try self.castBuiltin(value.value, self.program.instructions[arg].type.element_type, kind));
+                            out.* = if (value.sql_null) .{} else try self.castDatumBuiltin(value, self.program.instructions[arg].type.element_type, kind);
                         }
                         const dimensions = try self.alloc.alloc(arrays.Dimension, @intFromBool(elements.len != 0));
                         if (elements.len != 0) dimensions[0] = .{ .length = std.math.cast(u32, elements.len) orelse return error.SqlProgramLimitExceeded };
@@ -2608,7 +2711,7 @@ const Evaluator = struct {
                         for (call.args[1..]) |arg| {
                             const datum = try self.runDatum(arg, depth + 1);
                             if (datum.sql_null) continue;
-                            const string = if (self.program.instructions[arg].type.kind == .json) try self.jsonText(datum.value) else try self.formatText(datum.value);
+                            const string = if (self.program.instructions[arg].type.kind == .json) try self.jsonText(datum.value) else try self.formatText(if (datum.numeric != null) try self.numericJson(datum) else datum.value);
                             if (emitted) {
                                 try self.charge(separator.value.string.len);
                                 try output.appendSlice(self.alloc, separator.value.string);
@@ -2621,19 +2724,21 @@ const Evaluator = struct {
                     },
                     .to_jsonb => {
                         // JSON scalar null is a value, unlike a SQL NULL cell.
-                        break :blk try self.runDatum(call.args[0], depth + 1);
+                        const input = try self.runDatum(call.args[0], depth + 1);
+                        break :blk if (input.numeric != null) Datum.json(try self.numericJson(input)) else input;
                     },
                     .jsonb_build_object => {
                         var object: std.json.ObjectMap = .empty;
                         errdefer object.deinit(self.alloc);
                         var i: usize = 0;
                         while (i < call.args.len) : (i += 2) {
-                            const key = try self.runDatum(call.args[i], depth + 1);
+                            var key = try self.runDatum(call.args[i], depth + 1);
+                            if (key.numeric != null) key = Datum.json(try self.numericJson(key));
                             if (key.sql_null or key.value == .null or key.value == .object or key.value == .array) return error.InvalidSqlParameters;
                             const name = try self.formatText(key.value);
                             try self.charge(name.len + @sizeOf(Json) + @sizeOf([]const u8));
                             const value = try self.runDatum(call.args[i + 1], depth + 1);
-                            try object.put(self.alloc, name, if (value.sql_null) .null else value.value);
+                            try object.put(self.alloc, name, if (value.sql_null) .null else if (value.numeric != null) try self.numericJson(value) else value.value);
                         }
                         break :blk Datum.json(.{ .object = object });
                     },
@@ -2691,7 +2796,7 @@ const Evaluator = struct {
                         for (call.args) |arg| {
                             const datum = try self.runDatum(arg, depth + 1);
                             if (datum.sql_null) continue;
-                            const string = if (self.program.instructions[arg].type.kind == .json) try self.jsonText(datum.value) else try self.formatText(datum.value);
+                            const string = if (self.program.instructions[arg].type.kind == .json) try self.jsonText(datum.value) else try self.formatText(if (datum.numeric != null) try self.numericJson(datum) else datum.value);
                             try self.charge(string.len);
                             try output.appendSlice(self.alloc, string);
                         }
@@ -2702,7 +2807,7 @@ const Evaluator = struct {
             },
             else => Datum.fromJson(try self.runLegacy(index, depth)),
         };
-        if (!result.sql_null and instruction.type.kind == .number and result.value == .integer) result.value = try finite(@floatFromInt(result.value.integer));
+        if (!result.sql_null and instruction.type.kind == .number and instruction.type.element_type == .numeric) result = try self.castDatumBuiltin(result, null, .numeric) else if (!result.sql_null and instruction.type.kind == .number and result.value == .integer) result.value = try finite(@floatFromInt(result.value.integer));
         if (!result.sql_null and result.value == .integer) if (instruction.type.element_type) |kind| if (builtin_cast.integral(kind)) {
             _ = try builtin_cast.checkedInteger(result.value.integer, kind);
         };
@@ -2893,7 +2998,7 @@ const Evaluator = struct {
             for (array.elements) |element| {
                 if (self.steps >= self.limits.steps) return error.SqlProgramLimitExceeded;
                 self.steps += 1;
-                cells[at] = if (element.sql_null) .{} else arrays.Element.json(try self.castBuiltin(element.value, array.element_type, kind));
+                cells[at] = if (element.sql_null) .{} else try self.castDatumBuiltin(element, array.element_type, kind);
                 at += 1;
             }
         };
@@ -2920,11 +3025,82 @@ const Evaluator = struct {
         for (source.elements, cells) |element, *cell| {
             if (self.steps >= self.limits.steps) return error.SqlProgramLimitExceeded;
             self.steps += 1;
-            cell.* = if (element.sql_null or (source.element_type == .jsonb and element.value == .null and target != .text and target != .jsonb)) .{} else arrays.Element.json(try self.castBuiltin(element.value, source.element_type, target));
+            cell.* = if (element.sql_null or (source.element_type == .jsonb and element.value == .null and target != .text and target != .jsonb)) .{} else try self.castDatumBuiltin(element, source.element_type, target);
         }
         const value = try self.alloc.create(arrays.Value);
         value.* = try arrays.Value.init(target, source.dimensions, cells, .{});
         return Datum.typedArray(value);
+    }
+
+    fn numericJson(self: *Evaluator, datum: Datum) !Json {
+        const exact = @import("numeric_value.zig");
+        const number = datum.numeric orelse return error.SqlTypeMismatch;
+        var context: exact.Context = .{ .alloc = self.alloc, .remaining = self.limits.steps -| self.steps, .max_output_bytes = self.limits.output_bytes -| self.bytes };
+        const before = context.remaining;
+        defer self.steps += @intCast(before - context.remaining);
+        const text = try exact.format(&context, number.*);
+        try self.charge(text.len);
+        return if (number.kind == .finite) .{ .number_string = text } else .{ .string = text };
+    }
+
+    fn numericArithmetic(self: *Evaluator, operation: ast.Scalar.Binary, left: Datum, right: Datum) !Datum {
+        const exact = @import("numeric_value.zig");
+        var context: exact.Context = .{ .alloc = self.alloc, .remaining = self.limits.steps -| self.steps, .max_output_bytes = self.limits.output_bytes -| self.bytes, .max_groups = (self.limits.output_bytes -| self.bytes) / 2 };
+        const before = context.remaining;
+        defer self.steps += @intCast(before - context.remaining);
+        var result = switch (operation) {
+            .add => try exact.add(&context, left.numeric.?.*, right.numeric.?.*),
+            .subtract => try exact.subtract(&context, left.numeric.?.*, right.numeric.?.*),
+            .multiply => try exact.multiply(&context, left.numeric.?.*, right.numeric.?.*),
+            .divide => try exact.divide(&context, left.numeric.?.*, right.numeric.?.*),
+            .modulo => try exact.remainder(&context, left.numeric.?.*, right.numeric.?.*),
+            else => unreachable,
+        };
+        errdefer result.deinit();
+        try self.charge(@sizeOf(exact.Value) + result.allocation.len * 2);
+        const value = try self.alloc.create(exact.Value);
+        value.* = result.value;
+        return Datum.typedNumeric(value);
+    }
+
+    fn castDatumBuiltin(self: *Evaluator, datum: Datum, source: ?arrays.ElementType, target: arrays.ElementType) !Datum {
+        if (datum.sql_null) return .{};
+        if (datum.numeric != null and target == .numeric) return datum;
+        const exact = @import("numeric_value.zig");
+        var ctx: exact.Context = .{ .alloc = self.alloc, .remaining = self.limits.steps -| self.steps, .max_output_bytes = self.limits.output_bytes -| self.bytes, .max_groups = (self.limits.output_bytes -| self.bytes) / 2 };
+        const before = ctx.remaining;
+        defer self.steps += @intCast(before - ctx.remaining);
+        if (target == .numeric) {
+            var buffer: [20]u8 = undefined;
+            var owned = switch (datum.value) {
+                .integer => |integer| try exact.parse(&ctx, try std.fmt.bufPrint(&buffer, "{d}", .{integer})),
+                .string => |text| if (source == .jsonb) return error.SqlTypeMismatch else try exact.parse(&ctx, text),
+                .number_string => |text| try exact.parse(&ctx, text),
+                .float => |number| try exact.fromFloat(&ctx, number, source == .float32),
+                else => return error.SqlTypeMismatch,
+            };
+            errdefer owned.deinit();
+            try self.charge(@sizeOf(exact.Value) + owned.allocation.len * 2);
+            const value = try self.alloc.create(exact.Value);
+            value.* = owned.value;
+            return Datum.typedNumeric(value);
+        }
+        if (datum.numeric) |number| {
+            if (builtin_cast.integral(target)) return Datum.json(.{ .integer = switch (target) {
+                .int16 => try exact.toInteger(i16, &ctx, number.*),
+                .int32 => try exact.toInteger(i32, &ctx, number.*),
+                else => try exact.toInteger(i64, &ctx, number.*),
+            } });
+            if (target != .text and target != .float32 and target != .float64) return error.SqlCannotCoerce;
+            const text = try exact.format(&ctx, number.*);
+            if (target == .text) {
+                try self.charge(text.len);
+                return Datum.json(.{ .string = text });
+            }
+            defer self.alloc.free(text);
+            return Datum.json(.{ .float = if (target == .float32) try builtin_cast.floatValue(f32, .{ .string = text }) else try builtin_cast.floatValue(f64, .{ .string = text }) });
+        }
+        return Datum.json(try self.castBuiltin(datum.value, source, target));
     }
 
     fn castBuiltin(self: *Evaluator, value: Json, source: ?arrays.ElementType, target: arrays.ElementType) !Json {
@@ -2938,6 +3114,7 @@ const Evaluator = struct {
             if (target == .boolean and value != .bool) return error.SqlTypeMismatch;
         }
         return switch (target) {
+            .numeric => error.SqlTypeMismatch, // Exact values use castDatumBuiltin.
             .int16, .int32, .int64 => .{ .integer = try builtin_cast.checkedInteger(switch (value) {
                 .integer => |integer| integer,
                 .float => |number| blk: {
@@ -3548,6 +3725,12 @@ pub fn semanticHash(value: Json) !u64 {
 /// apply their explicit NULLS FIRST/LAST before calling this helper.
 pub fn compareDatums(left: Datum, right: Datum) anyerror!std.math.Order {
     if (left.sql_null or right.sql_null) return if (left.sql_null == right.sql_null) .eq else if (left.sql_null) .gt else .lt;
+    if (left.numeric) |number| {
+        var none = std.heap.FixedBufferAllocator.init(&.{});
+        var ctx: @import("numeric_value.zig").Context = .{ .alloc = none.allocator() };
+        return @import("numeric_value.zig").order(&ctx, number.*, (right.numeric orelse return error.SqlTypeMismatch).*);
+    }
+    if (right.numeric != null) return error.SqlTypeMismatch;
     if (left.array) |array| {
         var work: json_order.Budget = .{};
         return array.compare((right.array orelse return error.SqlTypeMismatch).*, &work);
@@ -3558,6 +3741,13 @@ pub fn compareDatums(left: Datum, right: Datum) anyerror!std.math.Order {
 
 pub fn semanticHashDatum(value: Datum) anyerror!u64 {
     if (value.sql_null) return 0;
+    if (value.numeric) |number| {
+        var none = std.heap.FixedBufferAllocator.init(&.{});
+        var ctx: @import("numeric_value.zig").Context = .{ .alloc = none.allocator() };
+        var hash = std.hash.Wyhash.init(0);
+        try @import("numeric_value.zig").hash(&ctx, number.*, &hash);
+        return hash.final();
+    }
     if (value.array) |array| {
         var work: json_order.Budget = .{};
         return array.semanticHash(&work);
@@ -3682,6 +3872,83 @@ test "SQL prepared Unicode translation owns literals and avoids per row map allo
     const output = try program.evaluate(exact.allocator(), &.{}, &.{.{ .string = "aé🍎aé🍎" }}, .{});
     try std.testing.expectEqualStrings("xêxê", output.value.string);
     try std.testing.expectEqual(@as(usize, 6), exact.end_index);
+}
+
+test "SQL NUMERIC JSON and text conversions never expose the typed placeholder" {
+    const a = std.testing.allocator;
+    const cases = [_]struct { sql: []const u8, expected: []const u8 }{
+        .{ .sql = "to_jsonb('9007199254740993.1200'::numeric)", .expected = "9007199254740993.1200" },
+        .{ .sql = "jsonb_build_object('n','9007199254740993.1200'::numeric)", .expected = "{\"n\":9007199254740993.1200}" },
+        .{ .sql = "to_jsonb('Infinity'::numeric)", .expected = "\"Infinity\"" },
+        .{ .sql = "concat('n=', '9007199254740993.1200'::numeric)", .expected = "\"n=9007199254740993.1200\"" },
+        .{ .sql = "concat_ws(':','n','9007199254740993.1200'::numeric)", .expected = "\"n:9007199254740993.1200\"" },
+        .{ .sql = "'32767.4'::numeric::smallint", .expected = "32767" },
+    };
+    for (cases) |case| {
+        var compiled = try @import("compiler.zig").compileScalar(a, case.sql, .{});
+        defer compiled.deinit();
+        var program = try bindTyped(a, compiled.expression, &.{}, &.{}, .{});
+        defer program.deinit();
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const output = try program.evaluate(arena.allocator(), &.{}, &.{}, .{});
+        try std.testing.expect(output.numeric == null and !output.sql_null);
+        const encoded = try std.json.Stringify.valueAlloc(arena.allocator(), output.value, .{});
+        try std.testing.expectEqualStrings(case.expected, encoded);
+    }
+}
+
+test "SQL NUMERIC mixed comparisons and common expressions match PostgreSQL promotion" {
+    const Harness = struct {
+        fn run(a: Allocator) !void {
+            const cases = [_]struct { sql: []const u8, expected: bool }{
+                .{ .sql = "'2.0000001'::numeric = '2'::real", .expected = false },
+                .{ .sql = "'9007199254740993'::numeric = '9007199254740992'::double precision", .expected = true },
+                .{ .sql = "'2.0000001'::numeric = 2", .expected = false },
+                .{ .sql = "'2.0000001'::numeric IN ('2'::real)", .expected = false },
+                .{ .sql = "'2.0000001'::numeric IN ('2'::real,'3'::real)", .expected = false },
+                .{ .sql = "CASE WHEN true THEN '2.0000001'::numeric ELSE '2'::real END = '2'::real", .expected = true },
+                .{ .sql = "coalesce('2.0000001'::numeric,'2'::real) = '2'::real", .expected = true },
+            };
+            for (cases) |case| {
+                var compiled = try @import("compiler.zig").compileScalar(a, case.sql, .{});
+                defer compiled.deinit();
+                var program = try bindTyped(a, compiled.expression, &.{}, &.{}, .{});
+                defer program.deinit();
+                var arena = std.heap.ArenaAllocator.init(a);
+                defer arena.deinit();
+                const output = try program.evaluate(arena.allocator(), &.{}, &.{}, .{});
+                try std.testing.expect(!output.sql_null and output.value == .bool);
+                try std.testing.expectEqual(case.expected, output.value.bool);
+            }
+        }
+    };
+    try Harness.run(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
+}
+
+test "SQL NUMERIC scalar operators retain exact values and scale" {
+    const a = std.testing.allocator;
+    const cases = [_]struct { sql: []const u8, expected: []const u8 }{
+        .{ .sql = "'9007199254740993.1200'::numeric + 1", .expected = "9007199254740994.1200" },
+        .{ .sql = "'9007199254740993.1200'::numeric - 1", .expected = "9007199254740992.1200" },
+        .{ .sql = "'1'::numeric / '3'::numeric", .expected = "0.33333333333333333333" },
+        .{ .sql = "'1.20'::numeric * '2.30'::numeric", .expected = "2.7600" },
+        .{ .sql = "'-5.50'::numeric % '2'::numeric", .expected = "-1.50" },
+        .{ .sql = "-'9007199254740993.1200'::numeric", .expected = "-9007199254740993.1200" },
+    };
+    for (cases) |case| {
+        var compiled = try @import("compiler.zig").compileScalar(a, case.sql, .{});
+        defer compiled.deinit();
+        var program = try bindTyped(a, compiled.expression, &.{}, &.{}, .{});
+        defer program.deinit();
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const output = try program.evaluate(arena.allocator(), &.{}, &.{}, .{});
+        try std.testing.expect(!output.sql_null and output.numeric != null);
+        var context: @import("numeric_value.zig").Context = .{ .alloc = arena.allocator() };
+        try std.testing.expectEqualStrings(case.expected, try @import("numeric_value.zig").format(&context, output.numeric.?.*));
+    }
 }
 
 test "SQL scalar bound programs preserve lazy truth exact integers and function semantics" {

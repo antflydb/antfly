@@ -48,7 +48,7 @@ pub const Column = struct {
     untyped_null: bool = false,
 
     pub fn jsonStringify(self: Column, writer: anytype) !void {
-        if (self.type == .array) {
+        if (self.type == .array or self.element_type == .numeric) {
             try writer.write(.{ .name = self.name, .type = self.type, .element_type = self.element_type });
         } else try writer.write(.{ .name = self.name, .type = self.type });
     }
@@ -65,6 +65,9 @@ test "SQL column JSON excludes internal unknown NULL provenance" {
     const array = try std.json.Stringify.valueAlloc(std.testing.allocator, Column{ .name = "items", .type = .array, .element_type = .int32 }, .{});
     defer std.testing.allocator.free(array);
     try std.testing.expectEqualStrings("{\"name\":\"items\",\"type\":\"array\",\"element_type\":\"int32\"}", array);
+    const decimal = try std.json.Stringify.valueAlloc(std.testing.allocator, Column{ .name = "n", .type = .number, .element_type = .numeric }, .{});
+    defer std.testing.allocator.free(decimal);
+    try std.testing.expectEqualStrings("{\"name\":\"n\",\"type\":\"number\",\"element_type\":\"numeric\"}", decimal);
 }
 pub const OrderKey = struct {
     source: union(enum) { output: usize, column: catalog.Column, expression: usize },
@@ -917,6 +920,22 @@ fn bindOrder(alloc: std.mem.Allocator, table: catalog.Table, statement: ast.Sele
 /// Array element descriptors are part of the type, not inferred from values.
 pub fn coerceDatum(alloc: std.mem.Allocator, raw: @import("scalar.zig").Datum, kind: ast.ColumnType, element_type: ?@import("array_value.zig").ElementType) !@import("scalar.zig").Datum {
     if (raw.sql_null and raw.value != .null) return error.SqlTypeMismatch;
+    if (raw.numeric) |value| {
+        if (kind != .number or element_type != .numeric or raw.sql_null or raw.value != .null or raw.array != null or raw.patterns != null) return error.SqlTypeMismatch;
+        var context: @import("numeric_value.zig").Context = .{ .alloc = alloc };
+        try @import("numeric_value.zig").validateCanonical(&context, value.*);
+        return raw;
+    }
+    if (kind == .number and element_type == .numeric and !raw.sql_null) {
+        var work: @import("array_value.zig").Budget = .{};
+        var buffer: [20]u8 = undefined;
+        const text = switch (raw.value) {
+            .string, .number_string => |text| text,
+            .integer => |integer| try std.fmt.bufPrint(&buffer, "{d}", .{integer}),
+            else => return error.SqlTypeMismatch,
+        };
+        return @import("scalar.zig").numericTextLeaky(alloc, text, &work);
+    }
     if (raw.array) |array| {
         if (kind != .array or element_type == null or element_type.? != array.element_type or raw.sql_null or raw.value != .null or raw.patterns != null) return error.SqlTypeMismatch;
         return raw;

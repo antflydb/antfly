@@ -52,7 +52,7 @@ const Vector = struct {
         };
     }
     pub fn set(self: Vector, row: usize, value: Datum) !void {
-        if (value.patterns != null or value.array != null) return error.UnsupportedTypedKernel;
+        if (value.patterns != null or value.array != null or value.numeric != null) return error.UnsupportedTypedKernel;
         self.states[row] = if (value.sql_null) .sql_null else if (value.value == .null) .json_null else .value;
         if (self.states[row] != .value) return;
         switch (self.kind) {
@@ -75,7 +75,7 @@ const Vector = struct {
     }
 };
 fn kind(type_: scalar.Type) ?Kind {
-    if (type_.element_type == .float32) return null; // Exact scalar fallback preserves float4 rounding.
+    if (type_.element_type == .float32 or type_.element_type == .numeric) return null; // Exact scalar fallback preserves float4 rounding and decimal limbs.
     return if (type_.kind) |k| switch (k) {
         .integer => .integer,
         .number => .number,

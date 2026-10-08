@@ -313,12 +313,19 @@ fn resultAdmission(elements: usize, rank_: usize, limits: Limits) !void {
 fn validateElement(kind: ElementType, element: Element, budget: *Budget) !void {
     try budget.consume(1);
     if (element.patterns != null or element.array != null) return error.SqlTypeMismatch;
+    if (element.numeric != null and (kind != .numeric or element.sql_null or element.value != .null)) return error.SqlTypeMismatch;
     if (element.sql_null) {
         if (element.value != .null) return error.InvalidSqlArrayShape;
         return;
     }
     const value = element.value;
     switch (kind) {
+        .numeric => {
+            var none = std.heap.FixedBufferAllocator.init(&.{});
+            var ctx: @import("numeric_value.zig").Context = .{ .alloc = none.allocator(), .remaining = budget.remaining };
+            defer budget.remaining = @intCast(ctx.remaining);
+            try @import("numeric_value.zig").validateCanonical(&ctx, (element.numeric orelse return error.SqlTypeMismatch).*);
+        },
         .text => {
             if (value != .string) return error.SqlTypeMismatch;
             try budget.consume(value.string.len);
@@ -364,6 +371,12 @@ fn compareElement(kind: ElementType, a: Element, b: Element, budget: *Budget) !s
         return std.math.order(a.value.float, b.value.float);
     }
     return switch (kind) {
+        .numeric => blk: {
+            var none = std.heap.FixedBufferAllocator.init(&.{});
+            var ctx: @import("numeric_value.zig").Context = .{ .alloc = none.allocator(), .remaining = budget.remaining };
+            defer budget.remaining = @intCast(ctx.remaining);
+            break :blk try @import("numeric_value.zig").order(&ctx, a.numeric.?.*, b.numeric.?.*);
+        },
         .int16, .int32, .int64 => std.math.order(a.value.integer, b.value.integer),
         .boolean => std.math.order(@intFromBool(a.value.bool), @intFromBool(b.value.bool)),
         .text, .uuid => blk: {
@@ -378,6 +391,14 @@ fn compareElement(kind: ElementType, a: Element, b: Element, budget: *Budget) !s
 fn hashElement(kind: ElementType, element: Element, budget: *Budget) !u64 {
     try budget.consume(1);
     if (element.sql_null) return 0x53514c4e554c4c;
+    if (kind == .numeric) {
+        var none = std.heap.FixedBufferAllocator.init(&.{});
+        var ctx: @import("numeric_value.zig").Context = .{ .alloc = none.allocator(), .remaining = budget.remaining };
+        defer budget.remaining = @intCast(ctx.remaining);
+        var hash = std.hash.Wyhash.init(0);
+        try @import("numeric_value.zig").hash(&ctx, element.numeric.?.*, &hash);
+        return hash.final();
+    }
     if (kind == .int16 or kind == .int32 or kind == .int64) {
         var bytes: [8]u8 = undefined;
         std.mem.writeInt(i64, &bytes, element.value.integer, .little);

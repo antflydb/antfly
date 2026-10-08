@@ -1466,7 +1466,7 @@ pub const Session = struct {
             try bytes.writer.writeInt(u32, 0, .big);
             try bytes.writer.writeInt(u16, 0, .big);
             try bytes.writer.writeInt(u32, try values.columnOid(column), .big);
-            try bytes.writer.writeInt(i16, values.typeSize(column.type), .big);
+            try bytes.writer.writeInt(i16, values.columnTypeSize(column), .big);
             try bytes.writer.writeInt(i32, -1, .big);
             try bytes.writer.writeInt(u16, formatAt(formats, index), .big);
         }

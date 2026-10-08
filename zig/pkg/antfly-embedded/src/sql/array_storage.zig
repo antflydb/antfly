@@ -58,6 +58,14 @@ pub const Prepared = struct {
         }
         if (layout.width(value.element_type) == 0) for (value.elements, 0..) |element, i| {
             if (element.sql_null) continue;
+            if (value.element_type == .numeric) {
+                var none = std.heap.FixedBufferAllocator.init(&.{});
+                var ctx: @import("numeric_value.zig").Context = .{ .alloc = none.allocator(), .max_output_bytes = options.wire_bytes };
+                const length = try @import("numeric_binary.zig").encodedSize(&ctx, element.numeric.?.*);
+                size = std.math.add(usize, size, length) catch return error.SqlProgramLimitExceeded;
+                if (size > options.wire_bytes or size > std.math.maxInt(u32)) return error.SqlProgramLimitExceeded;
+                continue;
+            }
             const payload = if (value.element_type == .text) element.value.string else blk: {
                 const bytes = try canonical_json.canonicalJsonValueAlloc(scratch, element.value);
                 jsonb[i] = bytes;
@@ -101,6 +109,15 @@ pub const Prepared = struct {
             if (width == 0) {
                 std.mem.writeInt(u32, bytes[slots_start + i * 4 ..][0..4], @intCast(payload_at), .little);
                 if (!element.sql_null) {
+                    if (self.value.element_type == .numeric) {
+                        var none = std.heap.FixedBufferAllocator.init(&.{});
+                        var ctx: @import("numeric_value.zig").Context = .{ .alloc = none.allocator(), .max_output_bytes = self.encoded_size };
+                        const length = try @import("numeric_binary.zig").encodedSize(&ctx, element.numeric.?.*);
+                        var writer: std.Io.Writer = .fixed(bytes[payload_start + payload_at ..][0..length]);
+                        try @import("numeric_binary.zig").encode(&ctx, element.numeric.?.*, &writer);
+                        payload_at += length;
+                        continue;
+                    }
                     const payload = if (self.value.element_type == .text) element.value.string else self.jsonb[i].?;
                     @memcpy(bytes[payload_start + payload_at ..][0..payload.len], payload);
                     payload_at += payload.len;
@@ -174,7 +191,18 @@ fn decodeAdmitted(a: A, owner: A, expected: arrays.ElementType, bytes: []const u
             cell.* = .{};
             continue;
         }
+        if (expected == .numeric) {
+            cell.* = try @import("scalar.zig").numericBinaryLeaky(a, raw.bytes, &work);
+            var ctx: @import("numeric_value.zig").Context = .{ .alloc = a, .remaining = work.remaining, .max_output_bytes = options.wire_bytes };
+            defer work.remaining = @intCast(ctx.remaining);
+            @import("numeric_binary.zig").verifyCanonical(&ctx, raw.bytes, cell.numeric.?.*) catch |err| return switch (err) {
+                error.InvalidSqlBinaryRepresentation => error.InvalidSqlArrayStorage,
+                else => err,
+            };
+            continue;
+        }
         cell.* = arrays.Element.json(switch (expected) {
+            .numeric => unreachable,
             .text => .{ .string = try a.dupe(u8, raw.bytes) },
             .int16 => .{ .integer = std.mem.readInt(i16, raw.bytes[0..2], .little) },
             .int32 => .{ .integer = std.mem.readInt(i32, raw.bytes[0..4], .little) },

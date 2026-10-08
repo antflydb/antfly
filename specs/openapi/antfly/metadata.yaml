@@ -1309,12 +1309,12 @@ components:
           type: boolean
     SQLColumnType:
       type: string
-      description: Logical SQL result type. Integer values are decimal strings to preserve exact precision in every client.
+      description: Logical SQL result type. Integer values and numbers with element_type numeric are decimal strings to preserve exact precision in every client.
       enum: [string, uuid, integer, number, boolean, datetime, json, array, unknown]
     SQLArrayElementType:
       type: string
-      description: Bound SQL array element type, including numeric widths. Never inferred from JSON value shape.
-      enum: [text, int16, int32, int64, float32, float64, boolean, uuid, jsonb]
+      description: Bound SQL scalar or array-element identity, including numeric widths and exact NUMERIC. Never inferred from JSON value shape.
+      enum: [text, int16, int32, int64, float32, float64, boolean, uuid, jsonb, numeric]
     SQLArrayDimension:
       type: object
       additionalProperties: false
@@ -1336,7 +1336,9 @@ components:
         Non-NULL SQL array result. Elements are flat, row-major values using the
         column's element_type. Their count equals the product of dimension
         lengths. Empty arrays have no dimensions and no elements. Integer
-        elements are canonical decimal strings. Floating elements are JSON
+        elements are canonical decimal strings. Exact numeric elements are
+        decimal strings preserving display scale, or NaN, Infinity and -Infinity.
+        Floating elements are JSON
         numbers, or the strings NaN, Infinity and -Infinity. Element null flags
         distinguish SQL NULL from the JSON literal null in jsonb arrays. A NULL
         array is an outer null result cell, not an empty array or this envelope.
@@ -1369,7 +1371,7 @@ components:
           $ref: "#/components/schemas/SQLColumnType"
         element_type:
           $ref: "#/components/schemas/SQLArrayElementType"
-          description: Required for array columns; absent for other result types. The descriptor applies even to NULL or empty arrays.
+          description: Required for array columns and exact NUMERIC number columns. Identifies scalar widths when supplied. The descriptor applies even to NULL or empty arrays.
     SQLPrepareRequest:
       type: object
       additionalProperties: false

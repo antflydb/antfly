@@ -17,10 +17,10 @@ class SQLColumn:
     """
     Attributes:
         name (str): Display label. Labels need not be unique; rows use matching ordinal positions.
-        type_ (SQLColumnType): Logical SQL result type. Integer values are decimal strings to preserve exact precision
-            in every client.
-        element_type (SQLArrayElementType | Unset): Bound SQL array element type, including numeric widths. Never
-            inferred from JSON value shape.
+        type_ (SQLColumnType): Logical SQL result type. Integer values and numbers with element_type numeric are decimal
+            strings to preserve exact precision in every client.
+        element_type (SQLArrayElementType | Unset): Bound SQL scalar or array-element identity, including numeric widths
+            and exact NUMERIC. Never inferred from JSON value shape.
     """
 
     name: str

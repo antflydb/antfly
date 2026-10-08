@@ -32,6 +32,11 @@ fn jsonSize(value: std.json.Value) !usize {
 fn elementSize(kind: arrays.ElementType, element: arrays.Element) !usize {
     if (element.sql_null) return 0;
     return switch (kind) {
+        .numeric => blk: {
+            var none = std.heap.FixedBufferAllocator.init(&.{});
+            var ctx: @import("numeric_value.zig").Context = .{ .alloc = none.allocator() };
+            break :blk try @import("numeric_binary.zig").encodedSize(&ctx, element.numeric.?.*);
+        },
         .text => element.value.string.len,
         .int16 => 2,
         .int32, .float32 => 4,
@@ -73,6 +78,11 @@ pub fn encode(value: arrays.Value, writer: *std.Io.Writer, options: Options) !vo
         }
         try writer.writeInt(i32, @intCast(try elementSize(value.element_type, element)), .big);
         switch (value.element_type) {
+            .numeric => {
+                var none = std.heap.FixedBufferAllocator.init(&.{});
+                var ctx: @import("numeric_value.zig").Context = .{ .alloc = none.allocator() };
+                try @import("numeric_binary.zig").encode(&ctx, element.numeric.?.*, writer);
+            },
             .text => try writer.writeAll(element.value.string),
             .int16 => try writer.writeInt(i16, @intCast(element.value.integer), .big),
             .int32 => try writer.writeInt(i32, @intCast(element.value.integer), .big),
@@ -109,6 +119,7 @@ const Reader = struct {
 
 pub fn decodeElementLeaky(a: A, kind: arrays.ElementType, bytes: []const u8, work: *arrays.Budget) !arrays.Element {
     try work.consume(bytes.len);
+    if (kind == .numeric) return @import("scalar.zig").numericBinaryLeaky(a, bytes, work);
     const width: ?usize = switch (kind) {
         .int16 => 2,
         .int32, .float32 => 4,
@@ -119,6 +130,7 @@ pub fn decodeElementLeaky(a: A, kind: arrays.ElementType, bytes: []const u8, wor
     };
     if (width) |expected| if (bytes.len != expected) return error.InvalidSqlBinaryRepresentation;
     return arrays.Element.json(switch (kind) {
+        .numeric => unreachable,
         .text => blk: {
             if (!std.unicode.utf8ValidateSlice(bytes) or std.mem.indexOfScalar(u8, bytes, 0) != null) return error.SqlInvalidTextEncoding;
             break :blk .{ .string = try a.dupe(u8, bytes) };

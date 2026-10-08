@@ -24,6 +24,42 @@ const binary = @import("array_binary.zig");
 const MemoryBudget = @import("memory_budget.zig");
 const A = std.mem.Allocator;
 
+test "SQL exact NUMERIC frames arrays and constant casts retain typed ownership" {
+    const a = std.testing.allocator;
+    const compiler = @import("compiler.zig");
+    const numeric = @import("numeric_value.zig");
+    var compiled = try compiler.compileScalar(a, "'9007199254740993.1200'::numeric", .{});
+    defer compiled.deinit();
+    var program = try scalar.bindTyped(a, compiled.expression, &.{}, &.{}, .{});
+    defer program.deinit();
+    var none = std.heap.FixedBufferAllocator.init(&.{});
+    const constant = try program.evaluate(none.allocator(), &.{}, &.{}, .{});
+    try std.testing.expect(constant.numeric != null and !constant.sql_null);
+    var context: numeric.Context = .{ .alloc = a };
+    const display = try numeric.format(&context, constant.numeric.?.*);
+    defer a.free(display);
+    try std.testing.expectEqualStrings("9007199254740993.1200", display);
+    var frame = try Frame.prepare(a, &.{ .{ .kind = .number, .element_type = .numeric }, .{ .kind = .array, .element_type = .numeric } }, &.{ .{ .text = "9007199254740993.1200" }, .{ .text = "[-1:1]={9007199254740993.1200,NULL,NaN}" } }, .{});
+    defer frame.deinit();
+    try std.testing.expectEqual(std.math.Order.eq, try scalar.compareDatums(constant, frame.values[0]));
+    const array = frame.values[1].array.?;
+    try std.testing.expectEqual(@as(i32, -1), array.dimensions[0].lower);
+    const storage = @import("array_storage.zig");
+    const bytes = try storage.encodeAlloc(a, array.*, .{});
+    defer a.free(bytes);
+    var restored = try storage.decode(a, .numeric, bytes, .{});
+    defer restored.deinit();
+    var work: arrays.Budget = .{};
+    try std.testing.expectEqual(std.math.Order.eq, try array.compare(restored.value, &work));
+    const envelope = try @import("array_wire.zig").encodeAlloc(a, restored.value, .{});
+    defer a.free(envelope);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, envelope, .{});
+    defer parsed.deinit();
+    var wire = try @import("array_wire.zig").decode(a, .numeric, parsed.value, .{});
+    defer wire.deinit();
+    try std.testing.expectEqual(std.math.Order.eq, try array.compare(wire.value, &work));
+}
+
 test "SQL prepared parameter frames own typed arrays and bind shared programs once" {
     const a = std.testing.allocator;
     const compiler = @import("compiler.zig");
@@ -327,7 +363,7 @@ test "SQL prepared binary array frames reuse PostgreSQL codecs and stable JSON o
 fn scalarKind(kind: arrays.ElementType) @import("ast.zig").ColumnType {
     return switch (kind) {
         .int16, .int32, .int64 => .integer,
-        .float32, .float64 => .number,
+        .float32, .float64, .numeric => .number,
         .text => .string,
         .boolean => .boolean,
         .uuid => .uuid,
@@ -453,7 +489,7 @@ fn decodeInput(a: A, descriptor: scalar.Type, input: Input, limits: Limits, work
     if (input == .datum and input.datum.patterns != null) return error.SqlTypeMismatch;
     if (input == .sql_null or (input == .datum and input.datum.sql_null)) {
         if (!descriptor.nullable) return error.InvalidSqlParameters;
-        if (input == .datum and (input.datum.array != null or input.datum.patterns != null or input.datum.value != .null)) return error.SqlTypeMismatch;
+        if (input == .datum and (input.datum.array != null or input.datum.numeric != null or input.datum.patterns != null or input.datum.value != .null)) return error.SqlTypeMismatch;
         return .{};
     }
     if (descriptor.kind == .datetime) {
@@ -500,6 +536,17 @@ fn decodeInput(a: A, descriptor: scalar.Type, input: Input, limits: Limits, work
         .datum => |datum| {
             if (datum.array != null or datum.patterns != null) return error.SqlTypeMismatch;
             var owned = datum;
+            if (kind == .numeric and datum.numeric == null) {
+                var buffer: [20]u8 = undefined;
+                const bytes = switch (datum.value) {
+                    .integer => |integer| try std.fmt.bufPrint(&buffer, "{d}", .{integer}),
+                    .string, .number_string => |bytes| bytes,
+                    else => return error.SqlTypeMismatch,
+                };
+                owned = try text.decodeElementLeaky(a, .numeric, bytes, work);
+                _ = try arrays.Value.initWithBudget(kind, &.{.{ .length = 1 }}, &.{owned}, .{ .bytes = limits.bytes }, work);
+                return owned;
+            }
             // These declared scalar types normalize representation once.
             if (kind == .uuid and datum.value == .string) {
                 owned = try text.decodeElementLeaky(a, .uuid, datum.value.string, work);

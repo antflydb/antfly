@@ -4487,15 +4487,15 @@ export interface components {
             revocation_confirmed: boolean;
         };
         /**
-         * @description Logical SQL result type. Integer values are decimal strings to preserve exact precision in every client.
+         * @description Logical SQL result type. Integer values and numbers with element_type numeric are decimal strings to preserve exact precision in every client.
          * @enum {string}
          */
         SQLColumnType: "string" | "uuid" | "integer" | "number" | "boolean" | "datetime" | "json" | "array" | "unknown";
         /**
-         * @description Bound SQL array element type, including numeric widths. Never inferred from JSON value shape.
+         * @description Bound SQL scalar or array-element identity, including numeric widths and exact NUMERIC. Never inferred from JSON value shape.
          * @enum {string}
          */
-        SQLArrayElementType: "text" | "int16" | "int32" | "int64" | "float32" | "float64" | "boolean" | "uuid" | "jsonb";
+        SQLArrayElementType: "text" | "int16" | "int32" | "int64" | "float32" | "float64" | "boolean" | "uuid" | "jsonb" | "numeric";
         SQLArrayDimension: {
             length: number;
             lower_bound: number;
@@ -4504,7 +4504,9 @@ export interface components {
          * @description Non-NULL SQL array result. Elements are flat, row-major values using the
          *     column's element_type. Their count equals the product of dimension
          *     lengths. Empty arrays have no dimensions and no elements. Integer
-         *     elements are canonical decimal strings. Floating elements are JSON
+         *     elements are canonical decimal strings. Exact numeric elements are
+         *     decimal strings preserving display scale, or NaN, Infinity and -Infinity.
+         *     Floating elements are JSON
          *     numbers, or the strings NaN, Infinity and -Infinity. Element null flags
          *     distinguish SQL NULL from the JSON literal null in jsonb arrays. A NULL
          *     array is an outer null result cell, not an empty array or this envelope.
@@ -4519,7 +4521,7 @@ export interface components {
             /** @description Display label. Labels need not be unique; rows use matching ordinal positions. */
             name: string;
             type: components["schemas"]["SQLColumnType"];
-            /** @description Required for array columns; absent for other result types. The descriptor applies even to NULL or empty arrays. */
+            /** @description Required for array columns and exact NUMERIC number columns. Identifies scalar widths when supplied. The descriptor applies even to NULL or empty arrays. */
             element_type?: components["schemas"]["SQLArrayElementType"];
         };
         SQLPrepareRequest: {

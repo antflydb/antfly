@@ -374,7 +374,8 @@ pub const Context = struct {
     }
 
     /// Preserve the complete typed value until the public result boundary.
-    /// Non-NULL arrays are owned envelopes, never their JSON-null placeholder.
+    /// Arrays are owned envelopes and NUMERIC values are exact decimal text,
+    /// never their JSON-null placeholders.
     pub fn outputDatum(self: Context, datum: Datum, kind: ?ast.ColumnType, element_type: ?@import("array_value.zig").ElementType) !Json {
         if (kind == .array) {
             const checked = try describe.coerceDatum(self.arena, datum, .array, element_type);
@@ -382,6 +383,12 @@ pub const Context = struct {
             return @import("array_wire.zig").toJsonLeaky(self.arena, checked.array.?.*, .{ .values = .{ .bytes = self.limits.retained_bytes }, .wire_bytes = self.limits.retained_bytes });
         }
         if (datum.array != null) return error.SqlTypeMismatch;
+        if (datum.numeric != null or (kind == .number and element_type == .numeric)) {
+            const checked = try describe.coerceDatum(self.arena, datum, kind orelse .number, element_type);
+            if (checked.sql_null) return .null;
+            var context: @import("numeric_value.zig").Context = .{ .alloc = self.arena, .max_output_bytes = self.limits.retained_bytes };
+            return .{ .string = try @import("numeric_value.zig").format(&context, checked.numeric.?.*) };
+        }
         return self.outputCell(datum.value, kind);
     }
 
@@ -1559,6 +1566,10 @@ pub fn encodeStorageDatum(arena: std.mem.Allocator, datum: Datum, column: catalo
         return .null;
     }
     if (checked.array) |array| return @import("array_wire.zig").toJsonLeaky(arena, array.*, .{ .values = .{ .bytes = retained_bytes }, .wire_bytes = retained_bytes });
+    if (checked.numeric) |value| {
+        var context: @import("numeric_value.zig").Context = .{ .alloc = arena, .max_output_bytes = retained_bytes };
+        return .{ .string = try @import("numeric_value.zig").format(&context, value.*) };
+    }
     return clone(arena, checked.value);
 }
 
@@ -1601,6 +1612,86 @@ fn jsonSize(value: Json) usize {
         },
         else => @sizeOf(Json),
     };
+}
+
+fn numericBoundaryScenario(backing: std.mem.Allocator) !void {
+    var arena = std.heap.ArenaAllocator.init(backing);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var fixture: TestBackend = .{};
+    const context: Context = .{ .alloc = backing, .arena = a, .backend = fixture.iface(), .binding = undefined, .parameters = &.{}, .limits = .{} };
+    var exact_context: @import("numeric_value.zig").Context = .{ .alloc = backing };
+    const output, const stored = blk: {
+        var source = try @import("numeric_value.zig").parse(&exact_context, "9007199254740993.1200");
+        defer source.deinit();
+        break :blk .{
+            try context.outputDatum(Datum.typedNumeric(&source.value), .number, .numeric),
+            try encodeStorageDatum(a, Datum.typedNumeric(&source.value), .{ .name = "n", .path = "n", .type = .number, .element_type = .numeric }, 1 << 20),
+        };
+    };
+    try std.testing.expectEqualStrings("9007199254740993.1200", output.string);
+    try std.testing.expectEqualStrings(output.string, stored.string);
+    for ([_]Json{ .{ .string = "9007199254740993.1200" }, .{ .number_string = "9007199254740993.1200" } }) |token| {
+        try std.testing.expectEqualStrings(output.string, (try context.outputDatum(Datum.json(token), .number, .numeric)).string);
+    }
+    try std.testing.expectEqualStrings("9223372036854775807", (try context.outputDatum(Datum.json(.{ .integer = std.math.maxInt(i64) }), .number, .numeric)).string);
+    try std.testing.expect((try context.outputDatum(.{}, .number, .numeric)) == .null);
+    try std.testing.expectError(error.SqlTypeMismatch, context.outputDatum(Datum.json(.{ .float = 1.25 }), .number, .numeric));
+    var limited = context;
+    limited.limits.retained_bytes = 3;
+    try std.testing.expectError(error.SqlProgramLimitExceeded, limited.outputDatum(Datum.json(.{ .string = "12345" }), .number, .numeric));
+}
+
+test "SQL NUMERIC executes exact scalar projections through public result metadata" {
+    const a = std.testing.allocator;
+    var fixture: TestBackend = .{};
+    var compiled = try compiler.compile(a, "SELECT '9007199254740993.1200'::numeric + 1 AS exact, NULL::numeric AS absent, 'Infinity'::numeric AS special", .{});
+    defer compiled.deinit();
+    var result = try execute(a, fixture.iface(), &compiled, &.{}, .{});
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), result.output.rows.len);
+    try std.testing.expectEqualStrings("9007199254740994.1200", result.output.rows[0][0].string);
+    try std.testing.expect(result.output.rows[0][1] == .null);
+    try std.testing.expectEqualStrings("Infinity", result.output.rows[0][2].string);
+    for (result.output.columns) |column| {
+        try std.testing.expectEqual(ast.ColumnType.number, column.type);
+        try std.testing.expectEqual(@import("array_value.zig").ElementType.numeric, column.element_type.?);
+    }
+}
+
+test "SQL NUMERIC set projections preserve exact cells across mapped batches" {
+    const a = std.testing.allocator;
+    var fixture: TestBackend = .{};
+    var compiled = try compiler.compile(a, "SELECT '9007199254740993.1200'::numeric UNION ALL SELECT '9007199254740993.3400'::numeric", .{});
+    defer compiled.deinit();
+    var result = try execute(a, fixture.iface(), &compiled, &.{}, .{});
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 2), result.output.rows.len);
+    try std.testing.expectEqualStrings("9007199254740993.1200", result.output.rows[0][0].string);
+    try std.testing.expectEqualStrings("9007199254740993.3400", result.output.rows[1][0].string);
+    try std.testing.expectEqual(@import("array_value.zig").ElementType.numeric, result.output.columns[0].element_type.?);
+}
+
+test "SQL NUMERIC grouped extrema preserve exact values and result identity" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        "SELECT min('9007199254740993.1200'::numeric + _id::numeric), max('9007199254740993.1200'::numeric + _id::numeric) FROM things",
+        "SELECT min('9007199254740993.1200'::numeric + _id::numeric), max('9007199254740993.1200'::numeric + _id::numeric) FROM things GROUP BY _id::bigint % 1",
+    }) |sql| {
+        var fixture: TestBackend = .{ .row_count = 4 };
+        var compiled = try compiler.compile(a, sql, .{});
+        defer compiled.deinit();
+        var result = try execute(a, fixture.iface(), &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), result.output.rows.len);
+        try std.testing.expectEqualStrings("9007199254740993.1200", result.output.rows[0][0].string);
+        try std.testing.expectEqualStrings("9007199254740996.1200", result.output.rows[0][1].string);
+        for (result.output.columns) |column| try std.testing.expectEqual(@import("array_value.zig").ElementType.numeric, column.element_type.?);
+    }
+}
+
+test "SQL NUMERIC result and mutation boundaries own exact decimals through allocation faults" {
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, numericBoundaryScenario, .{});
 }
 
 test "SQL integer output canonicalizes exact native tokens without changing JSON numbers" {

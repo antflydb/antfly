@@ -67,7 +67,7 @@ fn scalarType(kind: Builtin) ast.ColumnType {
     return switch (kind) {
         .text => .string,
         .int16, .int32, .int64 => .integer,
-        .float32, .float64 => .number,
+        .float32, .float64, .numeric => .number,
         .boolean => .boolean,
         .uuid => .uuid,
         .jsonb => .json,

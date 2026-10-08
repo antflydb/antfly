@@ -27,6 +27,11 @@ const Json = std.json.Value;
 // Fallback plans expose owned wire cells. Re-enter the typed pipeline only
 // through the declared column identity, never through JSON shape inference.
 fn outputCellDatum(a: std.mem.Allocator, value: Json, sql_null: bool, column: describe.Column) !@import("scalar.zig").Datum {
+    if (column.type == .number and column.element_type == .numeric and !sql_null) {
+        if (value != .string) return error.SqlTypeMismatch;
+        var work: @import("array_value.zig").Budget = .{};
+        return @import("scalar.zig").numericTextLeaky(a, value.string, &work);
+    }
     if (column.type != .array or sql_null) return .{ .value = value, .sql_null = sql_null };
     const array = try a.create(@import("array_value.zig").Value);
     array.* = try @import("array_wire.zig").decodeLeaky(a, column.element_type orelse return error.SqlTypeMismatch, value, .{});

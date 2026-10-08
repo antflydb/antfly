@@ -1691,6 +1691,8 @@ const Parser = struct {
             .{ "bool", @import("array_value.zig").ElementType.boolean },
             .{ "boolean", @import("array_value.zig").ElementType.boolean },
             .{ "jsonb", @import("array_value.zig").ElementType.jsonb },
+            .{ "numeric", @import("array_value.zig").ElementType.numeric },
+            .{ "decimal", @import("array_value.zig").ElementType.numeric },
         };
         var element: ?@import("array_value.zig").ElementType = null;
         inline for (pairs) |pair| if (std.ascii.eqlIgnoreCase(name_value, pair[0])) {
@@ -1704,7 +1706,7 @@ const Parser = struct {
                 .text => .string,
                 .uuid => .uuid,
                 .int16, .int32, .int64 => .integer,
-                .float32, .float64 => .number,
+                .float32, .float64, .numeric => .number,
                 .boolean => .boolean,
                 .jsonb => .json,
             }, .element_type = resolved };

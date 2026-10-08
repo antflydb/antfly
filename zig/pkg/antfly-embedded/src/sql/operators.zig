@@ -1422,6 +1422,17 @@ pub const Grouped = struct {
 };
 
 pub fn cloneDatum(alloc: Allocator, value: Datum) anyerror!Datum {
+    if (value.numeric) |number| {
+        if (value.sql_null or value.array != null or value.patterns != null or value.value != .null) return error.SqlTypeMismatch;
+        const exact = @import("numeric_value.zig");
+        var ctx: exact.Context = .{ .alloc = alloc };
+        try exact.validateCanonical(&ctx, number.*);
+        const owned = try alloc.create(exact.Value);
+        errdefer alloc.destroy(owned);
+        owned.* = number.*;
+        owned.digits = try alloc.dupe(u16, number.digits);
+        return Datum.typedNumeric(owned);
+    }
     if (value.array) |array| {
         if (value.sql_null or value.patterns != null or value.value != .null) return error.SqlTypeMismatch;
         const owned = try alloc.create(@import("array_value.zig").Value);
@@ -1458,11 +1469,12 @@ fn cloneJson(alloc: Allocator, value: Json, depth: usize) error{ OutOfMemory, Sq
     };
 }
 pub fn datumBytes(value: Datum) anyerror!usize {
+    if (value.numeric) |number| return @sizeOf(Datum) + @sizeOf(@import("numeric_value.zig").Value) + number.digits.len * 2;
     if (value.array) |array| {
         var bytes: usize = @sizeOf(Datum) + @sizeOf(@import("array_value.zig").Value) + array.dimensions.len * @sizeOf(@import("array_value.zig").Dimension);
         for (array.elements) |element| {
             if (element.array != null) return error.SqlTypeMismatch;
-            bytes +|= try jsonBytes(element.value, 0);
+            bytes +|= try datumBytes(element);
         }
         return bytes;
     }

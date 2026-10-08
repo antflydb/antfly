@@ -18,11 +18,11 @@ class SQLParameterDescriptor:
     Unknown slots have no SQL constraint.
 
         Attributes:
-            type_ (SQLColumnType): Logical SQL result type. Integer values are decimal strings to preserve exact precision
-                in every client.
+            type_ (SQLColumnType): Logical SQL result type. Integer values and numbers with element_type numeric are decimal
+                strings to preserve exact precision in every client.
             nullable (bool):
-            element_type (SQLArrayElementType | Unset): Bound SQL array element type, including numeric widths. Never
-                inferred from JSON value shape.
+            element_type (SQLArrayElementType | Unset): Bound SQL scalar or array-element identity, including numeric widths
+                and exact NUMERIC. Never inferred from JSON value shape.
     """
 
     type_: SQLColumnType

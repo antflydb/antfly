@@ -447,7 +447,20 @@ const Encoder = struct {
         try self.word(values.len);
         for (values) |value| {
             try self.append(&.{@intFromBool(value.sql_null)});
-            if (value.array) |array| {
+            if (value.numeric) |number| {
+                if (value.sql_null or value.array != null or value.patterns != null or value.value != .null) return error.SqlTypeMismatch;
+                const numeric = @import("numeric_value.zig");
+                const binary = @import("numeric_binary.zig");
+                var context: numeric.Context = .{ .alloc = self.a, .max_output_bytes = self.limit };
+                const length = try binary.encodedSize(&context, number.*);
+                try self.append(&.{10});
+                try self.word(length);
+                if (length > self.limit -| self.bytes.items.len) return error.SqlProgramLimitExceeded;
+                const start = self.bytes.items.len;
+                try self.bytes.resize(self.a, start + length);
+                var writer: std.Io.Writer = .fixed(self.bytes.items[start..]);
+                try binary.encode(&context, number.*, &writer);
+            } else if (value.array) |array| {
                 if (value.sql_null or value.patterns != null or value.value != .null) return error.SqlTypeMismatch;
                 const validated = try @import("array_value.zig").Value.init(array.element_type, array.dimensions, array.elements, if (self.manager) |manager| manager.array_limits else .{});
                 if (validated.dimensions.len != array.dimensions.len) return error.InvalidSqlArrayShape;
@@ -527,12 +540,30 @@ const Decoder = struct {
     fn byte(self: *Decoder) !u8 {
         return (try self.take(1))[0];
     }
+    fn numeric(self: *Decoder, flag: u8) !Datum {
+        if (flag != 0 or try self.byte() != 10) return error.InvalidSqlSpill;
+        const bytes = try self.take(try self.count());
+        const exact = @import("numeric_value.zig");
+        const binary = @import("numeric_binary.zig");
+        var context: exact.Context = .{ .alloc = self.a, .max_input_bytes = bytes.len };
+        var owned = try binary.decode(&context, bytes, .{});
+        errdefer owned.deinit();
+        binary.verifyCanonical(&context, bytes, owned.value) catch |err| return switch (err) {
+            error.InvalidSqlBinaryRepresentation => error.InvalidSqlSpill,
+            else => err,
+        };
+        const value = try self.a.create(exact.Value);
+        value.* = owned.value;
+        return Datum.typedNumeric(value);
+    }
     fn cells(self: *Decoder) anyerror![]Datum {
         const values = try self.a.alloc(Datum, try self.count());
         for (values) |*value| {
             const flag = try self.byte();
             if (flag > 1) return error.InvalidSqlSpill;
-            if (self.position < self.bytes.len and self.bytes[self.position] == 9) {
+            if (self.position < self.bytes.len and self.bytes[self.position] == 10) {
+                value.* = try self.numeric(flag);
+            } else if (self.position < self.bytes.len and self.bytes[self.position] == 9) {
                 self.position += 1;
                 if (flag != 0) return error.InvalidSqlSpill;
                 const arrays = @import("array_value.zig");
@@ -552,7 +583,10 @@ const Decoder = struct {
                 for (elements) |*element| {
                     const null_flag = try self.byte();
                     if (null_flag > 1) return error.InvalidSqlSpill;
-                    element.* = .{ .sql_null = null_flag == 1, .value = try self.json(0) };
+                    if (self.position < self.bytes.len and self.bytes[self.position] == 10) {
+                        if (kind != .numeric) return error.InvalidSqlSpill;
+                        element.* = try self.numeric(null_flag);
+                    } else element.* = .{ .sql_null = null_flag == 1, .value = try self.json(0) };
                 }
                 const array = try self.a.create(arrays.Value);
                 array.* = arrays.Value.init(kind, dimensions, elements, if (self.manager) |manager| manager.array_limits else .{}) catch return error.InvalidSqlSpill;
@@ -801,7 +835,7 @@ pub const Sequential = struct {
         }
     }
     fn tag(value: Datum) u8 {
-        if (value.patterns != null or value.array != null) return 255;
+        if (value.patterns != null or value.array != null or value.numeric != null) return 255;
         return switch (value.value) {
             .null => 0,
             .bool => 1,
@@ -856,7 +890,7 @@ pub const Sequential = struct {
             var kind: ?u8 = null;
             for (rows) |row| {
                 const value = (if (keys) row.keys else row.values)[column];
-                if (value.sql_null or (value.value == .null and value.patterns == null and value.array == null)) continue;
+                if (value.sql_null or (value.value == .null and value.patterns == null and value.array == null and value.numeric == null)) continue;
                 const actual = tag(value);
                 kind = if (kind == null or kind.? == actual) actual else 255;
             }
@@ -2821,6 +2855,38 @@ fn retainingInputScenario(a: Allocator) !void {
 test "SQL retaining spill consumers borrow singleton records between compact blocks" {
     try retainingInputScenario(std.testing.allocator);
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, retainingInputScenario, .{});
+}
+
+test "SQL NUMERIC column spills preserve canonical bytes scale arrays and ownership" {
+    const Harness = struct {
+        fn run(a: Allocator) !void {
+            const numeric_value = @import("numeric_value.zig");
+            const arrays = @import("array_value.zig");
+            var context: numeric_value.Context = .{ .alloc = a };
+            var number = try numeric_value.parse(&context, "9007199254740993.1200");
+            defer number.deinit();
+            const datum = Datum.typedNumeric(&number.value);
+            const array = try arrays.Value.init(.numeric, &.{.{ .length = 2, .lower = -1 }}, &.{ datum, .{} }, .{});
+            const rows = [_]Row{.{ .values = &.{ datum, Datum.typedArray(&array) }, .keys = &.{datum}, .ordinal = 17 }};
+            const bytes = try encodeColumnarBlockAlloc(a, &rows, 4096);
+            defer a.free(bytes);
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const block = try decodeColumnarBlockInArena(arena.allocator(), bytes, 4096);
+            const restored = try block.cell(0, 0);
+            try std.testing.expect(restored.numeric != null and !restored.sql_null);
+            try std.testing.expect(restored.numeric.?.digits.ptr != number.value.digits.ptr);
+            try std.testing.expectEqual(@as(u16, 4), restored.numeric.?.scale);
+            try std.testing.expectEqual(std.math.Order.eq, try scalar.compareDatums(restored, datum));
+            try std.testing.expectEqual(std.math.Order.eq, try scalar.compareDatums(try block.keyCell(0, 0), datum));
+            const restored_array = (try block.cell(0, 1)).array.?;
+            var work: arrays.Budget = .{};
+            try std.testing.expectEqual(std.math.Order.eq, try array.compare(restored_array.*, &work));
+            try std.testing.expectError(error.InvalidSqlSpill, decodeColumnarBlockInArena(arena.allocator(), bytes[0 .. bytes.len - 1], 4096));
+        }
+    };
+    try Harness.run(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
 }
 
 test "SQL native immutable column block retains the frozen v1 integer layout" {

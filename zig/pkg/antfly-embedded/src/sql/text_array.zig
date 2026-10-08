@@ -52,6 +52,12 @@ fn writeJoined(a: A, value: *const arrays.Value, delimiter: []const u8, null_tex
                 try writer.writeAll(text);
             },
             .jsonb => try @import("jsonb_text.zig").write(a, cell.value, writer, byte_limit, work, 0),
+            .numeric => {
+                const numeric = @import("numeric_value.zig");
+                var context: numeric.Context = .{ .alloc = a, .remaining = work.remaining, .max_output_bytes = byte_limit };
+                defer work.remaining = context.remaining;
+                try numeric.write(&context, cell.numeric.?.*, writer);
+            },
         }
     }
 }

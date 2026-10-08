@@ -17,7 +17,9 @@ class SQLArrayValue:
     """Non-NULL SQL array result. Elements are flat, row-major values using the
     column's element_type. Their count equals the product of dimension
     lengths. Empty arrays have no dimensions and no elements. Integer
-    elements are canonical decimal strings. Floating elements are JSON
+    elements are canonical decimal strings. Exact numeric elements are
+    decimal strings preserving display scale, or NaN, Infinity and -Infinity.
+    Floating elements are JSON
     numbers, or the strings NaN, Infinity and -Infinity. Element null flags
     distinguish SQL NULL from the JSON literal null in jsonb arrays. A NULL
     array is an outer null result cell, not an empty array or this envelope.

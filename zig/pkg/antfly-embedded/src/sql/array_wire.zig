@@ -50,6 +50,7 @@ const View = struct {
             if (element.sql_null) {
                 try writer.write(null);
             } else switch (self.value.element_type) {
+                .numeric => try writer.write(@import("scalar.zig").NumericJsonText{ .value = element.numeric.? }),
                 .int16, .int32, .int64 => {
                     var buffer: [20]u8 = undefined;
                     try writer.write(std.fmt.bufPrint(&buffer, "{d}", .{element.value.integer}) catch unreachable);
@@ -115,6 +116,10 @@ pub fn toJsonLeaky(a: A, value: arrays.Value, options: Options) !Json {
     for (value.elements, values, nulls) |cell, *out, *flag| {
         flag.* = .{ .bool = cell.sql_null };
         out.* = if (cell.sql_null) .null else switch (value.element_type) {
+            .numeric => numeric: {
+                var ctx: @import("numeric_value.zig").Context = .{ .alloc = a, .max_output_bytes = options.wire_bytes };
+                break :numeric .{ .string = try @import("numeric_value.zig").format(&ctx, cell.numeric.?.*) };
+            },
             .int16, .int32, .int64 => .{ .string = try std.fmt.allocPrint(a, "{d}", .{cell.value.integer}) },
             .float32, .float64 => if (std.math.isFinite(cell.value.float)) cell.value else .{ .string = if (std.math.isNan(cell.value.float)) "NaN" else if (cell.value.float < 0) "-Infinity" else "Infinity" },
             else => (try operators.cloneDatum(a, cell)).value,
@@ -139,6 +144,7 @@ fn readElement(kind: arrays.ElementType, raw: Json, sql_null: bool) !arrays.Elem
         return .{};
     }
     return arrays.Element.json(switch (kind) {
+        .numeric => unreachable, // Prepared directly into the numeric owner.
         .int16, .int32, .int64 => blk: {
             // Decimal strings are mandatory, even for small values. A JSON
             // number may already have lost precision in an upstream client.
@@ -190,7 +196,13 @@ pub fn decodeLeakyMeasured(a: A, kind: arrays.ElementType, input: Json, options:
 pub const Borrowed = struct {
     value: arrays.Value,
     allocator: A,
+    numeric_owner: ?arrays.Owned = null,
     pub fn deinit(self: *Borrowed) void {
+        if (self.numeric_owner) |*owner| {
+            owner.deinit();
+            self.* = undefined;
+            return;
+        }
         self.allocator.free(self.value.dimensions);
         self.allocator.free(self.value.elements);
         self.* = undefined;
@@ -198,6 +210,10 @@ pub const Borrowed = struct {
 };
 
 pub fn decodeBorrowed(a: A, kind: arrays.ElementType, input: Json, options: Options) !Borrowed {
+    if (kind == .numeric) {
+        const owner = try decode(a, kind, input, options);
+        return .{ .value = owner.value, .allocator = a, .numeric_owner = owner };
+    }
     return .{ .value = (try decodeCells(false, a, kind, input, options)).value, .allocator = a };
 }
 
@@ -205,6 +221,15 @@ pub fn decodeBorrowed(a: A, kind: arrays.ElementType, input: Json, options: Opti
 /// retaining payloads. The reported work belongs to the caller's invocation
 /// budget; successful admission is not a transferable trust token.
 pub fn validate(kind: arrays.ElementType, input: Json, options: Options) !Admission {
+    if (kind == .numeric) {
+        // Numeric cells must own decoded limbs. Validate in one bounded,
+        // unpublished region rather than reparsing once per numeric field.
+        var budget: MemoryBudget = .{ .backing = std.heap.page_allocator, .limit = options.values.bytes };
+        var arena = std.heap.ArenaAllocator.init(budget.allocator());
+        defer arena.deinit();
+        const decoded = decodeLeakyMeasured(arena.allocator(), kind, input, options) catch |err| return quotaError(&budget, err);
+        return .{ .work = decoded.work, .wire_bytes = decoded.wire_bytes };
+    }
     return (try inspect(kind, input, options)).admission;
 }
 
@@ -216,6 +241,7 @@ pub fn validate(kind: arrays.ElementType, input: Json, options: Options) !Admiss
 /// restored logical values.
 /// All admission and preservation checks precede the first mutation.
 pub fn normalize(kind: arrays.ElementType, input: *Json, preserve: bool, options: Options) !Admission {
+    if (kind == .numeric) return validate(kind, input.*, options);
     const inspected = try inspect(kind, input.*, options);
     if (!casts.floating(kind)) return inspected.admission;
     if (preserve and kind == .float32) for (inspected.values, inspected.nulls) |raw, flag| {
@@ -260,6 +286,13 @@ fn inspect(kind: arrays.ElementType, input: Json, options: Options) !Inspection 
     if (bytes > options.values.bytes) return error.SqlProgramLimitExceeded;
     for (values, nulls) |raw, flag| {
         if (flag != .bool) return error.InvalidSqlArrayShape;
+        if (kind == .numeric and !flag.bool) {
+            if (raw != .string) return error.SqlTypeMismatch;
+            try work.consume(raw.string.len);
+            bytes = std.math.add(usize, bytes, @sizeOf(arrays.Element) + @sizeOf(@import("numeric_value.zig").Value)) catch return error.SqlProgramLimitExceeded;
+            if (bytes > options.values.bytes) return error.SqlProgramLimitExceeded;
+            continue;
+        }
         if (casts.integral(kind) or casts.floating(kind)) switch (raw) {
             .string, .number_string => |text| try work.consume(text.len),
             else => {},
@@ -288,12 +321,20 @@ fn decodeCells(comptime own_payloads: bool, a: A, kind: arrays.ElementType, inpu
     const inspected = try inspect(kind, input, options);
     const cells = try a.alloc(arrays.Element, inspected.values.len);
     errdefer if (!own_payloads) a.free(cells);
+    var work: arrays.Budget = .{ .remaining = options.values.work - inspected.admission.work };
     for (inspected.values, inspected.nulls, cells) |raw, flag, *cell| {
+        if (kind == .numeric) {
+            if (!own_payloads) return error.UnsupportedSqlShape;
+            cell.* = if (flag.bool) .{} else try @import("scalar.zig").numericTextLeaky(a, raw.string, &work);
+            continue;
+        }
         const decoded = try readElement(kind, raw, flag.bool);
         cell.* = if (own_payloads) try operators.cloneDatum(a, decoded) else decoded;
     }
     const owned_dimensions = try a.dupe(arrays.Dimension, inspected.dimensions[0..inspected.rank]);
-    return .{ .value = .{ .element_type = kind, .dimensions = owned_dimensions, .elements = cells }, .work = inspected.admission.work, .wire_bytes = inspected.admission.wire_bytes };
+    const value: arrays.Value = .{ .element_type = kind, .dimensions = owned_dimensions, .elements = cells };
+    if (kind == .numeric) _ = try arrays.Value.initWithBudget(kind, value.dimensions, value.elements, options.values, &work);
+    return .{ .value = value, .work = options.values.work - work.remaining, .wire_bytes = inspected.admission.wire_bytes };
 }
 
 /// Stable quota owner, including arena capacity and failure cleanup.

@@ -56,6 +56,22 @@ pub fn encodeAlloc(ctx: *Context, value: Value) ![]u8 {
     return bytes;
 }
 
+/// Storage/restore admission is stricter than PostgreSQL parameter input.
+/// Verify bytes directly against an owned logical value, without allocating a
+/// second encoding or repairing noncanonical physical bytes.
+pub fn verifyCanonical(ctx: *Context, bytes: []const u8, value: Value) !void {
+    if (bytes.len != try encodedSize(ctx, value)) return error.InvalidSqlBinaryRepresentation;
+    const scale: u16 = if (value.kind == .positive_infinity or value.kind == .negative_infinity) 32 else value.scale;
+    if (std.mem.readInt(u16, bytes[0..2], .big) != value.digits.len or
+        std.mem.readInt(i16, bytes[2..4], .big) != value.weight or
+        std.mem.readInt(u16, bytes[4..6], .big) != sign(value) or
+        std.mem.readInt(u16, bytes[6..8], .big) != scale) return error.InvalidSqlBinaryRepresentation;
+    for (value.digits, 0..) |digit, i| {
+        try ctx.charge(1);
+        if (std.mem.readInt(u16, bytes[8 + i * 2 ..][0..2], .big) != digit) return error.InvalidSqlBinaryRepresentation;
+    }
+}
+
 const Groups = struct {
     bytes: []const u8,
     pub fn len(self: Groups) usize {
@@ -107,6 +123,24 @@ pub fn decode(ctx: *Context, bytes: []const u8, options: Options) !numeric.Owned
 }
 
 const Expected = struct { binary: []const u8, text: ?[]const u8, text_length: usize, sha256: []const u8 };
+
+test "SQL exact NUMERIC storage rejects normalized receiver bytes without a second encoding" {
+    const a = std.testing.allocator;
+    var context: Context = .{ .alloc = a };
+    const padded = [_]u8{ 0, 3, 0, 1, 0, 0, 0, 4, 0, 0, 0, 1, 0, 0 };
+    var number = try decode(&context, &padded, .{});
+    defer number.deinit();
+    try std.testing.expectError(error.InvalidSqlBinaryRepresentation, verifyCanonical(&context, &padded, number.value));
+    const canonical = try encodeAlloc(&context, number.value);
+    defer a.free(canonical);
+    var none = std.heap.FixedBufferAllocator.init(&.{});
+    var verification: Context = .{ .alloc = none.allocator() };
+    try verifyCanonical(&verification, canonical, number.value);
+    var copy: [10]u8 = undefined;
+    @memcpy(&copy, canonical);
+    copy[9] ^= 1;
+    try std.testing.expectError(error.InvalidSqlBinaryRepresentation, verifyCanonical(&verification, &copy, number.value));
+}
 
 test "SQL exact NUMERIC binary validates before output and preserves admission and writer errors" {
     const a = std.testing.allocator;

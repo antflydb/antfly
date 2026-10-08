@@ -40,6 +40,7 @@ pub fn parameterFromOid(value: u32) !Parameter {
         25, 1043, 1009 => .text,
         2950, 2951 => .uuid,
         3802, 3807 => .jsonb,
+        1700, 1231 => .numeric,
         else => null,
     };
     return .{ .kind = switch (kind) {
@@ -63,7 +64,12 @@ pub fn oid(kind: Type) !u32 {
 
 pub fn columnOid(column: Column) !u32 {
     if (column.type == .array) return (column.element_type orelse return error.InvalidResult).arrayOid();
+    if (column.element_type == .numeric) return 1700;
     return oid(column.type);
+}
+
+pub fn columnTypeSize(column: Column) i16 {
+    return if (column.element_type == .numeric) -1 else typeSize(column.type);
 }
 
 /// Array payloads are validated against the bound descriptor, never inferred
@@ -71,6 +77,15 @@ pub fn columnOid(column: Column) !u32 {
 /// JSONB payloads borrow the live result owner and stream directly to pgwire.
 pub fn encodeColumnInto(a: std.mem.Allocator, writer: *std.Io.Writer, column: Column, format: u16, value: std.json.Value, wire_bytes: usize) !void {
     if (format > 1) return error.UnsupportedResultFormat;
+    if (column.type == .number and column.element_type == .numeric) {
+        if (value != .string) return error.InvalidResult;
+        const sources = @import("antfly_local_sources");
+        var context: sources.sql_numeric_value.Context = .{ .alloc = a, .max_output_bytes = wire_bytes };
+        var number = try sources.sql_numeric_value.parse(&context, value.string);
+        defer number.deinit();
+        if (format == 0) return sources.sql_numeric_value.write(&context, number.value, writer);
+        return sources.sql_numeric_binary.encode(&context, number.value, writer);
+    }
     if (column.type != .array) {
         var size: std.Io.Writer.Discarding = .init(&.{});
         try encodeInto(a, &size.writer, column.type, format, value);
@@ -99,7 +114,7 @@ pub fn fromOid(value: u32) !Type {
         1184 => .datetime,
         114, 3802 => .json,
         2950 => .uuid,
-        1000, 1005, 1007, 1016, 1021, 1022, 1009, 2951, 3807 => .array,
+        1000, 1005, 1007, 1016, 1021, 1022, 1009, 2951, 3807, 1231 => .array,
         else => error.UnsupportedParameterType,
     };
 }
@@ -116,6 +131,13 @@ pub fn typeSize(kind: Type) i16 {
 pub fn decode(alloc: std.mem.Allocator, param_oid: u32, format: u16, bytes: []const u8) !std.json.Value {
     const kind = try fromOid(param_oid);
     if (format > 1) return error.UnsupportedParameterFormat;
+    if (param_oid == 1700) {
+        const sources = @import("antfly_local_sources");
+        var context: sources.sql_numeric_value.Context = .{ .alloc = alloc };
+        var number = if (format == 0) try sources.sql_numeric_value.parse(&context, bytes) else try sources.sql_numeric_binary.decode(&context, bytes, .{});
+        defer number.deinit();
+        return .{ .number_string = try sources.sql_numeric_value.format(&context, number.value) };
+    }
     if (kind == .array) {
         const sources = @import("antfly_local_sources");
         const element = (try parameterFromOid(param_oid)).element_type orelse return error.UnsupportedParameterType;
@@ -371,13 +393,38 @@ pub fn timestampValue(alloc: std.mem.Allocator, nanos: u64) !std.json.Value {
     return .{ .number_string = try std.fmt.allocPrint(alloc, "{d}", .{nanos}) };
 }
 
+test "pgwire NUMERIC preserves scalar array OIDs scale and exact binary payloads" {
+    const a = std.testing.allocator;
+    const sources = @import("antfly_local_sources");
+    var context: sources.sql_numeric_value.Context = .{ .alloc = a };
+    var number = try sources.sql_numeric_value.parse(&context, "9007199254740993.1200");
+    defer number.deinit();
+    const bytes = try sources.sql_numeric_binary.encodeAlloc(&context, number.value);
+    defer a.free(bytes);
+    const column: Column = .{ .name = "n", .type = .number, .element_type = .numeric };
+    try std.testing.expectEqual(@as(u32, 1700), try columnOid(column));
+    try std.testing.expectEqual(@as(i16, -1), columnTypeSize(column));
+    try std.testing.expectEqual(@as(u32, 1231), try parameterOid(try parameterFromOid(1231)));
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const decoded = try decode(arena.allocator(), 1700, 1, bytes);
+    try std.testing.expectEqualStrings("9007199254740993.1200", decoded.number_string);
+    var output: std.Io.Writer.Allocating = .init(a);
+    defer output.deinit();
+    try encodeColumnInto(a, &output.writer, column, 1, .{ .string = decoded.number_string }, 4096);
+    try std.testing.expectEqualSlices(u8, bytes, output.written());
+    output.writer.end = 0;
+    try std.testing.expectError(error.SqlProgramLimitExceeded, encodeColumnInto(a, &output.writer, column, 1, .{ .string = decoded.number_string }, 1));
+    try std.testing.expectEqual(@as(usize, 0), output.written().len);
+}
+
 test "pgwire typed parameters preserve exact integers and reject binary guesses" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
     try std.testing.expectEqual(@as(i64, 9007199254740993), (try decode(alloc, 20, 0, "9007199254740993")).integer);
     try std.testing.expectEqualStrings("9007199254740993.125", (try decode(alloc, 1700, 0, "9007199254740993.125")).number_string);
-    try std.testing.expectError(error.UnsupportedParameterFormat, decode(alloc, 1700, 1, "123"));
+    try std.testing.expectError(error.SqlProtocolViolation, decode(alloc, 1700, 1, "123"));
     try std.testing.expectError(error.InvalidParameter, decode(alloc, 16, 1, &.{2}));
     try std.testing.expectError(error.InvalidParameter, decode(alloc, 20, 0, "1; DROP TABLE x"));
     const encoded = try encode(alloc, .integer, 1, .{ .string = "9007199254740993" });

@@ -34,7 +34,7 @@ pub const Limits = struct { elements: usize = 65536, bytes: usize = 8 * 1024 * 1
 
 pub fn width(kind: Kind) usize {
     return switch (kind) {
-        .text, .jsonb => 0,
+        .text, .jsonb, .numeric => 0,
         .boolean => 1,
         .int16 => 2,
         .int32, .float32 => 4,

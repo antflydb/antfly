@@ -193,7 +193,11 @@ pub const Adapter = struct {
             const evaluated = try program.evaluate(alloc, &.{}, &.{}, .{});
             value.* = if (evaluated.array) |array|
                 try @import("antfly_local_sources").sql_array_wire.toJsonLeaky(alloc, array.*, .{})
-            else if (kind == .json and !evaluated.sql_null)
+            else if (evaluated.numeric) |number| numeric: {
+                const exact = @import("antfly_local_sources").sql_numeric_value;
+                var context: exact.Context = .{ .alloc = alloc };
+                break :numeric .{ .number_string = try exact.format(&context, number.*) };
+            } else if (kind == .json and !evaluated.sql_null)
                 .{ .string = try std.json.Stringify.valueAlloc(alloc, evaluated.value, .{}) }
             else
                 try native.clone(alloc, evaluated.value);
@@ -545,6 +549,13 @@ const OwnedRead = struct {
                 const definition = self.page.columns[column];
                 if (value.sql_null or value.value != .null or value.patterns != null or definition.type != .array or definition.element_type != array.element_type) return error.InvalidSqlBackendResponse;
                 return .{ .value = try @import("antfly_local_sources").sql_array_wire.toJsonLeaky(alloc, array.*, .{}), .sql_null = false };
+            }
+            if (value.numeric) |number| {
+                const definition = self.page.columns[column];
+                if (value.sql_null or value.value != .null or value.patterns != null or definition.type != .number or definition.element_type != .numeric) return error.InvalidSqlBackendResponse;
+                const exact = @import("antfly_local_sources").sql_numeric_value;
+                var context: exact.Context = .{ .alloc = alloc };
+                return .{ .value = .{ .string = try exact.format(&context, number.*) }, .sql_null = false };
             }
             return .{ .value = if (!value.sql_null and self.page.columns[column].type == .datetime) try datetimeResult(alloc, value.value) else value.value, .sql_null = value.sql_null };
         }

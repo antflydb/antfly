@@ -36833,7 +36833,7 @@ pub const SQLArrayDimension = struct {
     lower_bound: i64,
 };
 
-/// Bound SQL array element type, including numeric widths. Never inferred from JSON value shape.
+/// Bound SQL scalar or array-element identity, including numeric widths and exact NUMERIC. Never inferred from JSON value shape.
 pub const SQLArrayElementType = enum {
     text,
     int16,
@@ -36844,6 +36844,7 @@ pub const SQLArrayElementType = enum {
     boolean,
     uuid,
     jsonb,
+    numeric,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
@@ -36856,6 +36857,7 @@ pub const SQLArrayElementType = enum {
             .boolean => "boolean",
             .uuid => "uuid",
             .jsonb => "jsonb",
+            .numeric => "numeric",
         };
         try jw.write(s);
     }
@@ -36875,12 +36877,13 @@ pub const SQLArrayElementType = enum {
             .{ "boolean", .boolean },
             .{ "uuid", .uuid },
             .{ "jsonb", .jsonb },
+            .{ "numeric", .numeric },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
 };
 
-/// Non-NULL SQL array result. Elements are flat, row-major values using the column's element_type. Their count equals the product of dimension lengths. Empty arrays have no dimensions and no elements. Integer elements are canonical decimal strings. Floating elements are JSON numbers, or the strings NaN, Infinity and -Infinity. Element null flags distinguish SQL NULL from the JSON literal null in jsonb arrays. A NULL array is an outer null result cell, not an empty array or this envelope.
+/// Non-NULL SQL array result. Elements are flat, row-major values using the column's element_type. Their count equals the product of dimension lengths. Empty arrays have no dimensions and no elements. Integer elements are canonical decimal strings. Exact numeric elements are decimal strings preserving display scale, or NaN, Infinity and -Infinity. Floating elements are JSON numbers, or the strings NaN, Infinity and -Infinity. Element null flags distinguish SQL NULL from the JSON literal null in jsonb arrays. A NULL array is an outer null result cell, not an empty array or this envelope.
 pub const SQLArrayValue = struct {
     dimensions: []const SQLArrayDimension,
     values: []const std.json.Value,
@@ -36939,7 +36942,7 @@ pub const SQLColumn = struct {
     /// Display label. Labels need not be unique; rows use matching ordinal positions.
     name: []const u8,
     type: SQLColumnType,
-    /// Required for array columns; absent for other result types. The descriptor applies even to NULL or empty arrays.
+    /// Required for array columns and exact NUMERIC number columns. Identifies scalar widths when supplied. The descriptor applies even to NULL or empty arrays.
     element_type: ?SQLArrayElementType = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
@@ -36971,7 +36974,7 @@ pub const SQLColumn = struct {
     }
 };
 
-/// Logical SQL result type. Integer values are decimal strings to preserve exact precision in every client.
+/// Logical SQL result type. Integer values and numbers with element_type numeric are decimal strings to preserve exact precision in every client.
 pub const SQLColumnType = enum {
     string,
     uuid,

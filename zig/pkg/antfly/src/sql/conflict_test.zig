@@ -485,7 +485,14 @@ test "SQL conflict DEFAULT decision masks precede native default preparation" {
 
 test "SQL conflict DEFAULT owns preparation through every allocation failure" {
     const Faults = struct {
-        fn run(a: Allocator) !void {
+        fn run(backing: Allocator) !void {
+            // Optional in-place arena growth varies with backing addresses.
+            // Enumerate every mandatory allocation via allocate/copy, as in
+            // recursive-worklist and prepared-frame ownership fault tests.
+            var vtable = backing.vtable.*;
+            vtable.resize = Allocator.noResize;
+            vtable.remap = Allocator.noRemap;
+            const a: Allocator = .{ .ptr = backing.ptr, .vtable = &vtable };
             var fixture: Fixture = .{};
             var compiled = try compiler.compile(a, "INSERT INTO items(_id,n) VALUES('existing',7) ON CONFLICT(_id) DO UPDATE SET n=DEFAULT,g=DEFAULT RETURNING n,g", .{});
             defer compiled.deinit();

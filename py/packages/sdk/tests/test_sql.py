@@ -181,6 +181,21 @@ def test_sql_bound_parameters_and_exact_integer_results():
     assert request.call_args.kwargs["_max_response_bytes"] == 16 << 20
 
 
+def test_sql_numeric_results_preserve_precision_scale_nulls_and_specials():
+    client = AntflyClient(base_url="http://localhost:8080")
+    result = {
+        "columns": [{"name": "n", "type": "number", "element_type": "numeric"}],
+        "rows": [[value] for value in ["9007199254740993.1200", "0.0000", None, "NaN", "Infinity", "-Infinity"]],
+        "rows_affected": 0,
+        "command_tag": "SELECT 6",
+    }
+    with patch.object(client, "_request", return_value=result):
+        response = client.execute_sql(SQLRequest(statement="SELECT n FROM amounts"))
+    assert response.rows == result["rows"]
+    assert response.columns[0].element_type == SQLArrayElementType.NUMERIC
+    assert response.to_dict() == result
+
+
 def test_sql_rejects_malformed_row_width():
     client = AntflyClient(base_url="http://localhost:8080")
     with patch.object(client, "_request", return_value={"columns": [], "rows": [[1]]}):

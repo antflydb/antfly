@@ -35,6 +35,20 @@ it("exports an explicit typed array column schema without losing envelope constr
 
 afterEach(() => vi.unstubAllGlobals());
 
+it("preserves exact NUMERIC decimal text, display scale, SQL NULL and specials", async () => {
+  const result = {
+    columns: [{ name: "n", type: "number", element_type: "numeric" }],
+    rows: ["9007199254740993.1200", "0.0000", null, "NaN", "Infinity", "-Infinity"].map((value) => [
+      value,
+    ]),
+    rows_affected: 0,
+    command_tag: "SELECT 6",
+  };
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify(result))));
+  const client = new AntflyClient({ baseUrl: "http://localhost:8080" });
+  expect(await client.executeSQL({ statement: "SELECT n FROM amounts" })).toEqual(result);
+});
+
 it("preserves precise prepared SQL array and integer parameter contracts", async () => {
   const prepared: SQLPreparedResponse = {
     prepared_id: "a".repeat(32),
