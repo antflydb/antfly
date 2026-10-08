@@ -2594,6 +2594,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     const run_lake_scaffold_tests = addFilteredTestRunArtifact(b, lake_scaffold_tests);
+    // The query engine owner runs the shared bitmap kernels. Lake-named
+    // regressions must not acquire a second owner through this broad filter.
+    addRuntimeSkipTestFilters(run_lake_scaffold_tests, &.{"encoding.roaring.test."});
     const lake_integration_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/lake_integration_test_root.zig"),
         .target = target,
