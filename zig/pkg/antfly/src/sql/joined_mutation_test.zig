@@ -1160,6 +1160,32 @@ test "SQL sorted wildcard projection pins one catalog identity and evaluates onl
     }
 }
 
+test "SQL window input subqueries share keys and retain qualified input demand" {
+    for ([_]bool{ false, true }) |filtered| {
+        var backend: Backend = .{ .returning_mode = true, .row_count = 128 };
+        var provider: @import("antfly_local_sources").sql_decision_eval.testing.Provider = .{};
+        var iface = backend.backend();
+        iface.decision_provider = provider.provider();
+        const sql = try std.fmt.allocPrint(std.testing.allocator, "SELECT o.delta,row_number() OVER w AS n,rank() OVER w AS r FROM source o {s} WINDOW w AS (PARTITION BY (SELECT ai_probability(o.id,'Window?','local')) ORDER BY o.delta DESC) ORDER BY o.delta DESC LIMIT 2", .{if (filtered) "WHERE o.delta>1260" else ""});
+        defer std.testing.allocator.free(sql);
+        var compiled = try compiler.compile(std.testing.allocator, sql, .{});
+        defer compiled.deinit();
+        var result = try runtime.execute(std.testing.allocator, iface, &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 2), result.output.rows.len);
+        try std.testing.expectEqual(@as(usize, if (filtered) 2 else 128), provider.calls);
+        try std.testing.expectEqual(@as(usize, 128), backend.rows_read);
+        try std.testing.expectEqual(@as(usize, 1), backend.source_resolves);
+        try std.testing.expectEqual(@as(usize, 1), backend.captures);
+        try std.testing.expectEqual(@as(usize, 1), backend.closes);
+        for (result.output.rows, 0..) |row, index| {
+            try std.testing.expectEqual((128 - index) * 10, try std.fmt.parseInt(usize, row[0].string, 10));
+            try std.testing.expectEqual(index + 1, try std.fmt.parseInt(usize, row[1].string, 10));
+            try std.testing.expectEqual(index + 1, try std.fmt.parseInt(usize, row[2].string, 10));
+        }
+    }
+}
+
 test "SQL row subquery assigns positional values after bounded ordered source" {
     for ([_][]const u8{
         "UPDATE target SET (n,cold)=(SELECT delta AS amount,'new' AS label FROM source ORDER BY amount DESC LIMIT 1) RETURNING n,cold",

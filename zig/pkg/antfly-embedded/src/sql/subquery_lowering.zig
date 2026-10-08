@@ -24,6 +24,10 @@ pub fn has(node: *const ast.Scalar) bool {
         .call => |part| blk: {
             if (part.subquery != null) break :blk true;
             for (part.args) |arg| if (has(arg)) break :blk true;
+            if (part.window) |window| {
+                for (window.partition) |value| if (has(value)) break :blk true;
+                for (window.order) |order| if (order.expression) |value| if (has(value)) break :blk true;
+            }
             break :blk if (part.filter) |filter| has(filter) else false;
         },
         .unary => |part| has(part.operand),
@@ -90,6 +94,10 @@ pub fn accepts(statement: ast.Select) bool {
     for (statement.group_by) |value| if (has(value)) return true;
     if (statement.having) |value| if (has(value)) return true;
     for (statement.order_by) |order| if (order.expression) |value| if (has(value)) return true;
+    for (statement.windows) |definition| {
+        for (definition.window.partition) |value| if (has(value)) return true;
+        for (definition.window.order) |order| if (order.expression) |value| if (has(value)) return true;
+    }
     return false;
 }
 const Names = std.StringHashMapUnmanaged(void);
@@ -109,6 +117,8 @@ const Builder = struct {
     source: *const ast.Relation,
     outer: Names = .empty,
     serial: usize = 0,
+    window_demand: ?*const ast.Scalar = null,
+    window_inputs: std.ArrayList(struct { original: *const ast.Scalar, demand: ?*const ast.Scalar, value: *const ast.Scalar }) = .empty,
     row_producers: std.ArrayList(struct { query: *const ast.Select, demand: ?*const ast.Scalar, alias: []const u8 }) = .empty,
     fn scalar(self: *Builder, value: ast.Scalar) !*const ast.Scalar {
         const out = try self.alloc.create(ast.Scalar);
@@ -1034,6 +1044,27 @@ const Builder = struct {
         return false;
     }
 
+    fn windowInput(self: *Builder, input: *const ast.Scalar, demand: ?*const ast.Scalar) anyerror!*const ast.Scalar {
+        if (!has(input)) return input;
+        for (self.window_inputs.items) |prior| if (prior.original == input and prior.demand == demand) return prior.value;
+        const value = try self.prerequisite(try self.rewriteDemand(input, demand), demand);
+        try self.window_inputs.append(self.alloc, .{ .original = input, .demand = demand, .value = value });
+        return value;
+    }
+
+    fn rewriteWindow(self: *Builder, original: ast.Window, demand: ?*const ast.Scalar) anyerror!ast.Window {
+        var window = original;
+        const partitions = try self.alloc.alloc(*const ast.Scalar, original.partition.len);
+        for (original.partition, partitions) |value, *out| out.* = try self.windowInput(value, demand);
+        window.partition = partitions;
+        const orders = try self.alloc.dupe(ast.Order, original.order);
+        for (orders) |*order| if (order.expression) |value| {
+            order.expression = try self.windowInput(value, demand);
+        };
+        window.order = orders;
+        return window;
+    }
+
     fn rewriteDemand(self: *Builder, input: *const ast.Scalar, demand: ?*const ast.Scalar) anyerror!*const ast.Scalar {
         if (!has(input)) return input;
         if (input.* == .call and input.call.subquery != null) {
@@ -1046,12 +1077,13 @@ const Builder = struct {
             .call => |part| blk: {
                 var copy = part;
                 const args = try self.alloc.alloc(*const ast.Scalar, part.args.len);
-                var remaining = demand;
+                const input_demand = if (part.window != null) self.window_demand else demand;
+                var remaining = input_demand;
                 // FILTER belongs to the aggregate's input-row domain. Its
                 // argument producers must remain unopened for rejected rows,
                 // while the filter itself is evaluated once and remains bound.
-                copy.filter = if (part.filter) |filter| try self.prerequisite(try self.rewriteDemand(filter, demand), demand) else null;
-                if (copy.filter) |filter| remaining = try self.mask(demand, try self.testValue(.is_true, filter));
+                copy.filter = if (part.filter) |filter| try self.prerequisite(try self.rewriteDemand(filter, input_demand), input_demand) else null;
+                if (copy.filter) |filter| remaining = try self.mask(input_demand, try self.testValue(.is_true, filter));
                 for (part.args, args, 0..) |arg, *out, i| {
                     out.* = try self.rewriteDemand(arg, remaining);
                     if (std.mem.eql(u8, part.name, "coalesce") and i + 1 < args.len) {
@@ -1060,6 +1092,9 @@ const Builder = struct {
                     }
                 }
                 copy.args = args;
+                // Every WHERE-qualified row needs its partition/sort keys,
+                // even if this aggregate's FILTER rejects its argument.
+                copy.window = if (part.window) |window| try self.rewriteWindow(window, self.window_demand) else null;
                 break :blk .{ .call = copy };
             },
             .unary => |part| .{ .unary = .{ .op = part.op, .operand = try self.rewriteDemand(part.operand, demand) } },
@@ -1212,6 +1247,7 @@ pub fn lower(alloc: Allocator, statement: ast.Select) !ast.Select {
         result.predicate = out;
         if (needs_row_demand) demand = try builder.testValue(.is_true, value);
     }
+    builder.window_demand = demand;
     const columns = try alloc.dupe(ast.Projection, statement.columns);
     var sorted_offset = false;
     if (try selectionOrders(alloc, statement)) |orders| {
@@ -1253,10 +1289,19 @@ pub fn lower(alloc: Allocator, statement: ast.Select) !ast.Select {
         demand = null;
     }
     for (columns) |*column| if (column.expression) |value| {
-        if (column.alias == null and has(value)) column.alias = if (value.* == .call and value.call.subquery != null and std.mem.eql(u8, value.call.name, "$exists")) "exists" else "?column?";
+        if (column.alias == null and has(value)) column.alias = if (value.* == .call and value.call.window != null) value.call.name else if (value.* == .call and value.call.subquery != null and std.mem.eql(u8, value.call.name, "$exists")) "exists" else "?column?";
         column.expression = try builder.rewriteDemand(value, demand);
     };
     result.columns = columns;
+    // Named windows have already been expanded by the compiler. Retain their
+    // input expressions: PostgreSQL can demand subqueries even in an unused
+    // definition. Pointer-owned inputs reuse the expanded call's producer.
+    const definitions = try alloc.alloc(ast.NamedWindow, statement.windows.len);
+    for (statement.windows, definitions) |definition, *out| out.* = .{
+        .name = definition.name,
+        .window = try builder.rewriteWindow(definition.window, builder.window_demand),
+    };
+    result.windows = definitions;
     const groups = try alloc.alloc(*const ast.Scalar, statement.group_by.len);
     for (statement.group_by, groups) |value, *out| out.* = try builder.rewriteDemand(value, demand);
     result.group_by = groups;

@@ -14800,6 +14800,22 @@ test "httpx SQL executes one relational page with exact integer parameters" {
                 }
             }
         }
+        {
+            var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
+            defer request.deinit();
+            request.body = "{\"statement\":\"SELECT q.id,row_number() OVER w,rank() OVER w FROM (SELECT t.id,t.quantity FROM usage_records t WHERE t._id IN ('a','b')) q WINDOW w AS (ORDER BY (SELECT q.quantity) DESC) ORDER BY q.quantity DESC LIMIT 1\"}";
+            var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+            defer ctx.deinit();
+            var response = try text_handler.executeSQL(&ctx);
+            defer response.deinit();
+            try std.testing.expectEqual(@as(u16, 200), response.status.code);
+            const result = try std.json.parseFromSlice(sql_wire.SQLResponse, alloc, response.body.?, .{});
+            defer result.deinit();
+            try std.testing.expectEqual(@as(usize, 1), result.value.rows.len);
+            try std.testing.expectEqualStrings("u2", result.value.rows[0][0].string);
+            try std.testing.expectEqualStrings("1", result.value.rows[0][1].string);
+            try std.testing.expectEqualStrings("1", result.value.rows[0][2].string);
+        }
         for ([_]struct { body: []const u8, expected_id: ?[]const u8 }{
             .{ .body = "{\"statement\":\"INSERT INTO usage_records (id,status,quantity) VALUES ('u_default',DEFAULT,7) RETURNING id,status\"}", .expected_id = "u_default" },
             .{ .body = "{\"statement\":\"INSERT INTO usage_records DEFAULT VALUES RETURNING _id,status\"}", .expected_id = null },

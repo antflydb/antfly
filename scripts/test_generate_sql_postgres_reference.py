@@ -1768,6 +1768,55 @@ class PostgresReferenceTest(unittest.TestCase):
             )
         self.assertEqual("21000", error.exception.sqlstate)
 
+    def test_window_input_subqueries_retain_partition_ordering_and_filter_domains(self):
+        import psycopg
+
+        for sql, expected in (
+            (
+                "SELECT t.x,row_number() OVER (PARTITION BY (SELECT t.x%2) ORDER BY (SELECT t.x) DESC) AS n FROM (SELECT 1 AS x UNION ALL SELECT 2 UNION ALL SELECT 3) t ORDER BY t.x",
+                [(1, 2), (2, 1), (3, 1)],
+            ),
+            (
+                "SELECT t.x,row_number() OVER w AS n FROM (SELECT 1 AS x UNION ALL SELECT 2 UNION ALL SELECT 3) t WINDOW w AS (PARTITION BY (SELECT t.x%2) ORDER BY (SELECT t.x) DESC) ORDER BY t.x",
+                [(1, 2), (2, 1), (3, 1)],
+            ),
+            (
+                "SELECT t.x,SUM(t.x) FILTER (WHERE t.x>1) OVER (ORDER BY (SELECT t.x) ROWS UNBOUNDED PRECEDING) AS n FROM (SELECT 1 AS x UNION ALL SELECT 2 UNION ALL SELECT 3) t ORDER BY t.x",
+                [(1, None), (2, 2), (3, 5)],
+            ),
+            (
+                "SELECT row_number() OVER (ORDER BY CASE WHEN t.x=1 THEN (SELECT t.x) ELSE (SELECT i.y FROM (SELECT 1 AS y UNION ALL SELECT 2) i) END) FROM (SELECT 1 AS x) t",
+                [(1,)],
+            ),
+            (
+                "SELECT COUNT((SELECT i.y FROM (SELECT 1 AS y UNION ALL SELECT 2) i)) FILTER (WHERE false) OVER (ORDER BY (SELECT t.x)) FROM (SELECT 1 AS x) t",
+                [(0,)],
+            ),
+            (
+                "SELECT row_number() OVER (ORDER BY (SELECT i.y FROM (SELECT 1 AS y UNION ALL SELECT 2) i)) FROM (SELECT 1 AS x) t WHERE false",
+                [],
+            ),
+        ):
+            with self.subTest(sql=sql):
+                self.assertEqual(expected, self.db.execute(sql).fetchall())
+        with (
+            self.assertRaises(psycopg.Error) as error,
+            self.db.transaction(force_rollback=True),
+        ):
+            self.db.execute(
+                "SELECT COUNT(*) FILTER (WHERE false) OVER (ORDER BY (SELECT i.y FROM (SELECT 1 AS y UNION ALL SELECT 2) i)) FROM (SELECT 1 AS x) t"
+            )
+        self.assertEqual("21000", error.exception.sqlstate)
+
+        with (
+            self.assertRaises(psycopg.Error) as error,
+            self.db.transaction(force_rollback=True),
+        ):
+            self.db.execute(
+                "SELECT 1 WINDOW unused AS (ORDER BY (SELECT i.y FROM (SELECT 1 AS y UNION ALL SELECT 2) i))"
+            )
+        self.assertEqual("21000", error.exception.sqlstate)
+
     def test_sorted_scalar_callbacks_evaluate_prefix_before_offset(self):
         import psycopg
 

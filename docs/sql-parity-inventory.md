@@ -750,6 +750,19 @@ PostgreSQL callback counters and native provider counters verify prefix demand
 at offsets 0, 1, 130 and 512. Allocation-fault and mounted endpoint checks cover
 successful discarded-tail selection and errors on consumed prefix/sort rows.
 
+Window input subqueries now participate in discovery and typed Apply lowering
+through PARTITION BY and window ORDER BY, including compiler-expanded named
+windows. Window keys use the WHERE-qualified input domain, not an individual
+aggregate FILTER or downstream output demand. Shared expression identities
+own one prerequisite value; two functions using one named window evaluate its
+key once per qualified row. Native provider counters check 128 input rows and
+two WHERE-qualified rows under LIMIT 2, with one catalog resolution and one
+captured read. PostgreSQL independently checks partition/order values, running
+filtered sums, conditional key demand, masked arguments and cardinality errors
+in both sort keys and unused definitions. Native allocation-fault enumeration
+covers shared named-window inputs and labels; the mounted endpoint exercises
+their public execution path.
+
 General grouped/window scalar-subquery output staging and cross-level aggregate
 lifting remain unfinished. These shared execution regressions
 do not independently change the original-case dispositions.

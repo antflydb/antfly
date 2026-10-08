@@ -240,6 +240,49 @@ test "SQL sorted wildcard ordinal staging releases all allocations" {
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Faults.run, .{});
 }
 
+test "SQL window input subqueries retain partition ordering and filter domains" {
+    var backend: Backend = .{};
+    for ([_]struct { sql: []const u8, rows: []const u8 }{
+        .{ .sql = "SELECT t.x,row_number() OVER (PARTITION BY (SELECT t.x%2) ORDER BY (SELECT t.x) DESC) AS n FROM (SELECT 1 AS x UNION ALL SELECT 2 UNION ALL SELECT 3) t ORDER BY t.x", .rows = "[[\"1\",\"2\"],[\"2\",\"1\"],[\"3\",\"1\"]]" },
+        .{ .sql = "SELECT t.x,row_number() OVER w AS n FROM (SELECT 1 AS x UNION ALL SELECT 2 UNION ALL SELECT 3) t WINDOW w AS (PARTITION BY (SELECT t.x%2) ORDER BY (SELECT t.x) DESC) ORDER BY t.x", .rows = "[[\"1\",\"2\"],[\"2\",\"1\"],[\"3\",\"1\"]]" },
+        .{ .sql = "SELECT t.x,SUM(t.x) FILTER (WHERE t.x>1) OVER (ORDER BY (SELECT t.x) ROWS UNBOUNDED PRECEDING) AS n FROM (SELECT 1 AS x UNION ALL SELECT 2 UNION ALL SELECT 3) t ORDER BY t.x", .rows = "[[\"1\",null],[\"2\",\"2\"],[\"3\",\"5\"]]" },
+        .{ .sql = "SELECT row_number() OVER (ORDER BY CASE WHEN t.x=1 THEN (SELECT t.x) ELSE (SELECT i.y FROM (SELECT 1 AS y UNION ALL SELECT 2) i) END) FROM (SELECT 1 AS x) t", .rows = "[[\"1\"]]" },
+        .{ .sql = "SELECT COUNT((SELECT i.y FROM (SELECT 1 AS y UNION ALL SELECT 2) i)) FILTER (WHERE false) OVER (ORDER BY (SELECT t.x)) FROM (SELECT 1 AS x) t", .rows = "[[\"0\"]]" },
+        .{ .sql = "SELECT row_number() OVER (ORDER BY (SELECT i.y FROM (SELECT 1 AS y UNION ALL SELECT 2) i)) FROM (SELECT 1 AS x) t WHERE false", .rows = "[]" },
+    }) |case| {
+        var compiled = try compiler.compile(std.testing.allocator, case.sql, .{});
+        defer compiled.deinit();
+        var result = try runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{});
+        defer result.deinit();
+        const rows = try std.json.Stringify.valueAlloc(std.testing.allocator, result.output.rows, .{});
+        defer std.testing.allocator.free(rows);
+        try std.testing.expectEqualStrings(case.rows, rows);
+    }
+    var filtered = try compiler.compile(std.testing.allocator, "SELECT COUNT(*) FILTER (WHERE false) OVER (ORDER BY (SELECT i.y FROM (SELECT 1 AS y UNION ALL SELECT 2) i)) FROM (SELECT 1 AS x) t", .{});
+    defer filtered.deinit();
+    try std.testing.expectError(error.SqlCardinalityViolation, runtime.execute(std.testing.allocator, backend.backend(), &filtered, &.{}, .{}));
+    var unused = try compiler.compile(std.testing.allocator, "SELECT 1 WINDOW unused AS (ORDER BY (SELECT i.y FROM (SELECT 1 AS y UNION ALL SELECT 2) i))", .{});
+    defer unused.deinit();
+    try std.testing.expectError(error.SqlCardinalityViolation, runtime.execute(std.testing.allocator, backend.backend(), &unused, &.{}, .{}));
+}
+
+test "SQL window input subquery staging releases every allocation" {
+    const Faults = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var backend: Backend = .{};
+            var compiled = try compiler.compile(a, "SELECT t.x,row_number() OVER w,rank() OVER w FROM (SELECT 1 AS x UNION ALL SELECT 2) t WINDOW w AS (ORDER BY (SELECT t.x) DESC) ORDER BY t.x", .{});
+            defer compiled.deinit();
+            var result = try runtime.execute(a, backend.backend(), &compiled, &.{}, .{});
+            defer result.deinit();
+            try std.testing.expectEqual(@as(usize, 2), result.output.rows.len);
+            try std.testing.expectEqualStrings("2", result.output.rows[0][1].string);
+            try std.testing.expectEqualStrings("row_number", result.output.columns[1].name);
+            try std.testing.expectEqualStrings("rank", result.output.columns[2].name);
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Faults.run, .{});
+}
+
 test "SQL row bounds validate negative parameters at execution in their own domain" {
     var backend: Backend = .{};
     for ([_]struct { sql: []const u8, code: []const u8 }{
