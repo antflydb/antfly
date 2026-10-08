@@ -9294,6 +9294,7 @@ pub const Node = struct {
         defer if (owned_io) |*io_impl| io_impl.deinit();
         const io = self.inferenceIo(allocator, null, &owned_io);
 
+        var reader_admission = ExtractionReaderAdmission{ .node = self, .allocator = allocator };
         const extractor_ctx = extractors_mod.Context{
             .allocator = allocator,
             .io = io,
@@ -9301,6 +9302,7 @@ pub const Node = struct {
             .session_manager = &self.session_manager,
             .model_manager = &self.model_manager,
             .reader_resolver = &self.extraction_reader_resolver,
+            .reader_admission = .{ .ptr = &reader_admission, .validate = ExtractionReaderAdmission.validate },
             .gliner_pipeline_factory = .{ .ptr = self, .create = createGlinerPipeline },
             .execution_control = execution_control,
         };
@@ -9311,8 +9313,27 @@ pub const Node = struct {
         defer extractor.deinit(allocator);
         var admission_manifest = try manifest_mod.loadFromDir(allocator, extractor.modelPath());
         defer admission_manifest.deinit();
-        const executor_contract = try resolvedInferenceExecutorContract(self, "extract", &admission_manifest);
-        config.max_input_tokens_per_item = executor_contract.batch.max_input_tokens_per_item;
+        const extraction_contract = try resolvedInferenceExecutorContract(self, "extract", &admission_manifest);
+        config.max_input_tokens_per_item = extraction_contract.batch.max_input_tokens_per_item;
+        var image_manifest: ?manifest_mod.ModelManifest = null;
+        defer if (image_manifest) |*manifest| manifest.deinit();
+        const composed_reader = media_shape.image_count > 0 and extractor == .extractor;
+        if (composed_reader) {
+            const reader_path = try extractor.imageModelPath(extractor_ctx);
+            defer allocator.free(reader_path);
+            image_manifest = try manifest_mod.loadFromDir(allocator, reader_path);
+            // The extractor consumes OCR text, not the original images.
+            try validateInferenceExecutorInvocation(extraction_contract, .{
+                .item_count = request.inputs.len,
+                .schema_bytes = request.schema_json.len,
+                .has_text = true,
+            });
+        }
+        const media_manifest = if (image_manifest) |*manifest| manifest else &admission_manifest;
+        const executor_contract = if (composed_reader)
+            try resolvedInferenceExecutorContract(self, "read", media_manifest)
+        else
+            extraction_contract;
 
         // Fetch and decode request media only after resolver preflight succeeds.
         var parsed_inputs = try parseDirectExtractionInputs(
@@ -9335,7 +9356,7 @@ pub const Node = struct {
                 return error.InferenceEncodedBytesExceeded;
             const physical_mime = image_pipeline.mimeEssenceForEncoded(image_bytes) orelse
                 return error.InvalidInferenceMedia;
-            if (!manifestAcceptsExecutorMime(&admission_manifest, physical_mime))
+            if (!manifestAcceptsExecutorMime(media_manifest, physical_mime))
                 return error.UnsupportedInferenceMimeType;
             const info = image_pipeline.inspectEncodedForInference(image_bytes, null) catch
                 return error.InvalidInferenceMedia;
@@ -9344,7 +9365,7 @@ pub const Node = struct {
         }
         try validateInferenceExecutorInvocation(executor_contract, .{
             .item_count = request.inputs.len,
-            .text_bytes_per_item = std.math.add(
+            .text_bytes_per_item = if (composed_reader) 0 else std.math.add(
                 usize,
                 maxTextBytes(parsed_inputs.texts.items),
                 if (parsed_inputs.prompt) |prompt| prompt.len else 0,
@@ -9353,7 +9374,7 @@ pub const Node = struct {
             .encoded_media_bytes = encoded_media_bytes,
             .decoded_pixels = decoded_pixels,
             .media_parts_per_item = if (parsed_inputs.images.items.len > 0) 1 else 0,
-            .schema_bytes = request.schema_json.len,
+            .schema_bytes = if (composed_reader) 0 else request.schema_json.len,
             .has_text = parsed_inputs.texts.items.len > 0,
             .has_image = parsed_inputs.images.items.len > 0,
         });
@@ -23284,6 +23305,29 @@ fn measureDirectGenerateDecodedPixels(
     }
     return decoded_pixels;
 }
+
+const ExtractionReaderAdmission = struct {
+    node: *Node,
+    allocator: std.mem.Allocator,
+
+    fn validate(ptr: *anyopaque, model_path: []const u8, images: []const []const u8, options: readers_mod.ReadOptions) !void {
+        const self: *ExtractionReaderAdmission = @ptrCast(@alignCast(ptr));
+        var manifest = try manifest_mod.loadFromDir(self.allocator, model_path);
+        defer manifest.deinit();
+        const contract = try resolvedInferenceExecutorContract(self.node, "read", &manifest);
+        var encoded_bytes: usize = 0;
+        for (images) |image| encoded_bytes = std.math.add(usize, encoded_bytes, image.len) catch
+            return error.InferenceEncodedBytesExceeded;
+        try validateInferenceExecutorInvocation(contract, .{
+            .item_count = images.len,
+            .output_tokens_per_item = options.max_tokens orelse 0,
+            .encoded_media_bytes = encoded_bytes,
+            .decoded_pixels = try measureExecutorDecodedImages(&manifest, images),
+            .media_parts_per_item = 1,
+            .has_image = true,
+        });
+    }
+};
 
 const GenerateExecutorContractFailure = struct {
     status: u16,

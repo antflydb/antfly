@@ -83,6 +83,10 @@ pub const Context = struct {
     model_manager: *model_manager_mod.ModelManager,
     execution_control: ?@import("../execution_control.zig").InferenceExecutionControl = null,
     reader_resolver: ?*ReaderResolver = null,
+    reader_admission: ?struct {
+        ptr: *anyopaque,
+        validate: *const fn (*anyopaque, []const u8, []const []const u8, readers_mod.ReadOptions) anyerror!void,
+    } = null,
     gliner_pipeline_factory: ?struct {
         ptr: *anyopaque,
         create: *const fn (*anyopaque, std.mem.Allocator, *model_manager_mod.LoadedModel) @import("../pipelines/gliner.zig").GlinerPipeline,
@@ -394,6 +398,15 @@ pub const Extractor = union(enum) {
         };
     }
 
+    /// The image executor can differ from the downstream text extractor.
+    /// Resolve its cheap manifest surface before fetching request media.
+    pub fn imageModelPath(self: *const Extractor, ctx: Context) ![]const u8 {
+        return switch (self.*) {
+            .extractor => |extractor| resolveReaderModelPathForExtraction(ctx, extractor.model_name),
+            .reader => |reader| ctx.allocator.dupe(u8, reader.model_path),
+        };
+    }
+
     pub fn extractText(
         self: *Extractor,
         ctx: Context,
@@ -586,6 +599,10 @@ fn readTextsWithSelectedReader(
     image_datas: []const []const u8,
     read_options: readers_mod.ReadOptions,
 ) ![][]const u8 {
+    // A fallback candidate must satisfy its own contract, not the manifest
+    // of a previously selected reader or the downstream text model.
+    if (ctx.reader_admission) |admission|
+        try admission.validate(admission.ptr, model_path, image_datas, read_options);
     if (builtin.is_test) {
         if (ctx.reader_text_override) |override| {
             return override.read(ctx.allocator, model_path, image_datas, read_options);
@@ -1196,6 +1213,14 @@ test "one extraction request falls back after a structural reader failure" {
 
         discovery_count: usize = 0,
         read_count: usize = 0,
+        admission_count: usize = 0,
+
+        fn validate(raw: *anyopaque, model_path: []const u8, _: []const []const u8, _: readers_mod.ReadOptions) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(self.read_count, self.admission_count);
+            try std.testing.expectEqualStrings(if (self.admission_count == 0) preferred else fallback, model_path);
+            self.admission_count += 1;
+        }
 
         fn discover(
             raw: *anyopaque,
@@ -1247,6 +1272,7 @@ test "one extraction request falls back after a structural reader failure" {
         .reader_resolver = &resolver,
         .reader_discovery_override = .{ .context = &fake, .discoverFn = FakeReaders.discover },
         .reader_text_override = .{ .context = &fake, .readFn = FakeReaders.read },
+        .reader_admission = .{ .ptr = &fake, .validate = FakeReaders.validate },
     };
 
     const texts = try readTextsForExtraction(ctx, "acme/extractor", &.{"image"}, .{});
@@ -1256,6 +1282,7 @@ test "one extraction request falls back after a structural reader failure" {
     }
     try std.testing.expectEqual(@as(usize, 2), fake.discovery_count);
     try std.testing.expectEqual(@as(usize, 2), fake.read_count);
+    try std.testing.expectEqual(@as(usize, 2), fake.admission_count);
     try std.testing.expectEqualStrings("fallback text", texts[0]);
     try std.testing.expect(resolver.failed_candidates.contains(FakeReaders.preferred));
     try std.testing.expectEqualStrings(FakeReaders.fallback, resolver.entries.get("acme/extractor").?.path.?);

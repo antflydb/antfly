@@ -226,6 +226,7 @@ def _backend_selection_diagnostic(
 
 
 _SERVER_BUDGET_FLAGS = (
+    ("ANTFLY_INFERENCE_PROCESS_MEMORY_BUDGET_MB", "--process-memory-budget-mb"),
     ("ANTFLY_INFERENCE_HOST_BUDGET_MB", "--host-budget-mb"),
     ("ANTFLY_INFERENCE_BACKEND_BUDGET_MB", "--backend-budget-mb"),
     ("ANTFLY_INFERENCE_COMBINED_BUDGET_MB", "--combined-budget-mb"),
