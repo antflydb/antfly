@@ -505,7 +505,8 @@ pub fn tryOpenPredicateWithContext(a: A, server: *server_api.ApiHttpServer, tabl
 
 /// Relative work for vectorized projected decoding/evaluation. Inventory bytes
 /// and rows are upper estimates: no guessed selectivity or LIMIT credit.
-pub fn predicateScanWork(source: *local.serverless_query_lake_serving.ServingSource, conditions: []const catalog.Condition) u64 {
+/// Null means the inventory has not established a row-count estimate.
+pub fn predicateScanWork(source: *local.serverless_query_lake_serving.ServingSource, conditions: []const catalog.Condition) ?u64 {
     var count: u64 = 0;
     for (conditions, 0..) |condition, i| {
         var duplicate = false;
@@ -518,13 +519,14 @@ pub fn predicateScanWork(source: *local.serverless_query_lake_serving.ServingSou
     var rows_count: u64 = 0;
     var bytes: u64 = 0;
     for (source.inventory.files) |file| {
-        rows_count +|= file.row_count;
-        for (file.row_groups) |group| for (group.column_chunks) |chunk| {
-            for (conditions) |condition| if (std.mem.eql(u8, chunk.column_id, condition.column)) {
-                bytes +|= chunk.compressed_len;
-                break;
-            };
-        };
+        var group_rows: u64 = 0;
+        for (file.row_groups) |group| group_rows +|= group.row_count;
+        const file_rows = @max(file.row_count, group_rows);
+        // Prefix discovery deliberately has no footer row count. Zero there
+        // does not prove an empty file, even when no column statistics exist.
+        if (file_rows == 0 and file.row_groups.len == 0 and file.byte_len != 0) return null;
+        rows_count +|= file_rows;
+        bytes +|= predicateProjectedBytes(file, conditions);
     }
     return (rows_count *| count +| 31) / 32 +| (bytes +| 1023) / 1024;
 }
@@ -533,16 +535,38 @@ pub fn predicateResidualWork(source: *local.serverless_query_lake_serving.Servin
     if (candidates == 0) return 0;
     var bytes: u64 = 0;
     var groups: u64 = 0;
-    for (source.inventory.files) |file| for (file.row_groups) |group| {
-        groups +|= 1;
+    for (source.inventory.files) |file| {
+        bytes +|= predicateProjectedBytes(file, conditions);
+        // Without group metadata, gathering even one candidate may read the
+        // whole file. Charge one conservative decode region for that file.
+        groups +|= @max(@as(u64, 1), file.row_groups.len);
+    }
+    // Without clustering evidence, a gather can touch every projected group.
+    const gather = if (groups == 0) 0 else (bytes / groups) *| @min(candidates, groups);
+    return (candidates *| conditions.len +| 31) / 32 +| (gather +| 1023) / 1024;
+}
+
+/// Use projected chunk bytes when complete, otherwise the full file length
+/// as an upper estimate. Missing projection metadata never means free I/O.
+fn predicateProjectedBytes(file: local.serverless_external_source_types.FileEntry, conditions: []const catalog.Condition) u64 {
+    if (conditions.len == 0) return 0;
+    if (file.row_groups.len == 0) return file.byte_len;
+    var bytes: u64 = 0;
+    for (file.row_groups) |group| {
+        for (conditions) |condition| {
+            var found = false;
+            for (group.column_chunks) |chunk| if (std.mem.eql(u8, chunk.column_id, condition.column) and chunk.compressed_len != 0) {
+                found = true;
+                break;
+            };
+            if (!found) return file.byte_len;
+        }
         for (group.column_chunks) |chunk| for (conditions) |condition| if (std.mem.eql(u8, chunk.column_id, condition.column)) {
             bytes +|= chunk.compressed_len;
             break;
         };
-    };
-    // Without clustering evidence, a gather can touch every projected group.
-    const gather = if (groups == 0) 0 else (bytes / groups) *| @min(candidates, groups);
-    return (candidates *| conditions.len +| 31) / 32 +| (gather +| 1023) / 1024;
+    }
+    return bytes;
 }
 
 fn predicateIndexWork(candidates: u64, metadata_bytes: u64, resident_metadata: bool) u64 {
@@ -899,14 +923,24 @@ test "external lake predicate costs prefer selective seeks and broad projected s
     source.inventory = .{ .format = .parquet, .source_id = @constCast("source"), .source_uri = @constCast("file://source"), .snapshot_id = @constCast("snapshot"), .schema_fingerprint = @constCast("schema"), .files = &files };
     const lower: catalog.Condition = .{ .column = "amount", .op = .gte, .value = .{ .integer = 0 } };
     const upper: catalog.Condition = .{ .column = "amount", .op = .lt, .value = .{ .integer = 10000 } };
-    const scan = predicateScanWork(&source, &.{lower});
-    try std.testing.expectEqual(scan, predicateScanWork(&source, &.{ lower, upper }));
+    const scan = predicateScanWork(&source, &.{lower}).?;
+    try std.testing.expectEqual(scan, predicateScanWork(&source, &.{ lower, upper }).?);
     try std.testing.expect(predicateIndexWork(1, 1024, true) < scan);
     try std.testing.expect(predicateIndexWork(10000, 1024, true) > scan);
     try std.testing.expect(predicateIndexWork(1, 1024, false) > predicateIndexWork(1, 1024, true));
     try std.testing.expect(predicateIndexWork(1, 1024 * 1024, false) > scan);
     try std.testing.expectEqual(@as(u64, 0), predicateResidualWork(&source, &.{lower}, 0));
     try std.testing.expect(predicateResidualWork(&source, &.{lower}, 1) < predicateResidualWork(&source, &.{lower}, 10000));
+    // Iceberg inventories can know row counts without chunk statistics.
+    files[0].row_groups = &.{};
+    try std.testing.expect(predicateScanWork(&source, &.{lower}).? > scan);
+    try std.testing.expect(predicateResidualWork(&source, &.{lower}, 1) > 0);
+    // Parquet prefix discovery knows object length, but not its row count.
+    files[0].row_count = 0;
+    try std.testing.expectEqual(@as(?u64, null), predicateScanWork(&source, &.{lower}));
+    // An inventory with no files is genuinely empty, unlike an unread footer.
+    source.inventory.files = &.{};
+    try std.testing.expectEqual(@as(?u64, 0), predicateScanWork(&source, &.{lower}));
 }
 
 test "external lake ordered access plans equality prefixes ranges directions and exact order proofs" {

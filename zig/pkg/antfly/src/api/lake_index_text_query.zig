@@ -151,6 +151,7 @@ const Execution = struct {
     vector_exclude: ?@import("lake_index_physical_set.zig").Set = null,
     typed_delivery: bool = false,
     predicate_exclusion_json: []const u8 = "",
+    predicate_allow_partial: bool = true,
     delivery_request: ?types.SearchRequest = null,
     highlight_pins: std.ArrayList(search.PinnedTextSource) = .empty,
     highlight_queries: ?[]const search.HighlightQuery = null,
@@ -405,7 +406,7 @@ const Execution = struct {
     fn resolveIndexedFilter(raw: ?*anyopaque, a: A, snapshot: *const local.index.IndexSnapshot, json: []const u8) !?search.IndexedTextPredicate {
         const self = from(raw);
         const identities = self.text_identities.get(@intFromPtr(snapshot)) orelse return null;
-        const resolver: @import("lake_index_text_predicate.zig").Resolver = .{ .allow_partial = !std.mem.eql(u8, json, self.predicate_exclusion_json), .server = self.server, .table = self.table, .source = self.source, .context = self.request, .identities = identities, .store = self.store.artifactStore(), .store_identity = self.store.identity, .read_context = self.context, .pinned = .{ .artifacts = self.store.artifactStore(), .store_identity = self.store.identity, .domain = self.domain, .declarations = self.declarations, .read_context = self.context } };
+        const resolver: @import("lake_index_text_predicate.zig").Resolver = .{ .allow_partial = self.predicate_allow_partial and !std.mem.eql(u8, json, self.predicate_exclusion_json), .server = self.server, .table = self.table, .source = self.source, .context = self.request, .identities = identities, .store = self.store.artifactStore(), .store_identity = self.store.identity, .read_context = self.context, .pinned = .{ .artifacts = self.store.artifactStore(), .store_identity = self.store.identity, .domain = self.domain, .declarations = self.declarations, .read_context = self.context } };
         return resolver.resolve(a, json);
     }
     fn searchText(raw: ?*anyopaque, a: A, req: types.SearchRequest, text: types.TextQuery) !types.SearchResult {
@@ -414,8 +415,15 @@ const Execution = struct {
         // exact plan for the exclusion expression; identical include/exclude
         // expressions conservatively share that requirement.
         const previous_exclusion = self.predicate_exclusion_json;
+        const previous_allow_partial = self.predicate_allow_partial;
         self.predicate_exclusion_json = req.exclusion_query_json;
-        defer self.predicate_exclusion_json = previous_exclusion;
+        // Sort and cursor execution require the complete predicate to be
+        // resolved before ranking/page boundaries, including implicit ID sort.
+        self.predicate_allow_partial = req.order_by.len == 0 and req.search_after.len == 0 and req.search_before.len == 0;
+        defer {
+            self.predicate_exclusion_json = previous_exclusion;
+            self.predicate_allow_partial = previous_allow_partial;
+        }
         return search.searchTextQuery(a, req, text, .{ .ctx = raw, .exact_doc_id_filters = true, .acquire_text_source = acquire, .resolve_indexed_filter = resolveIndexedFilter, .native_count_visibility_exact = true, .project_key = publicKey, .native_key = nativeKey, .filter_candidate_presence = true, .text_index_entry = noLocal, .text_index_is_chunk_backed = chunkBacked, .search_match_all = matchAll, .project_stored_search = project, .load_stored = loadOne, .load_projected_documents = loadProjected, .postprocess = postprocess });
     }
     fn dispatchText(raw: ?*anyopaque, a: A, req: types.SearchRequest) !types.SearchResult {

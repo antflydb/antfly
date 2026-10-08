@@ -233,7 +233,7 @@ fn PredicateResolver(comptime Set: type) type {
             defer scan.deinit();
             const Choice = union(enum) { scan, whole, subset: usize, intersection };
             var choice: Choice = .scan;
-            var best_work = rows.predicateScanWork(self.source, conditions);
+            var best_work = rows.predicateScanWork(self.source, conditions) orelse std.math.maxInt(u64);
             var whole = try rows.tryOpenPredicateWithContext(a, self.server, self.table, conditions, self.context, self.source, self.pinned);
             defer if (whole) |*predicate| predicate.deinit();
             if (whole) |predicate| if (predicate.work < best_work) {

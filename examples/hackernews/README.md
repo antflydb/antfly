@@ -106,15 +106,17 @@ the lake planner compares a projected scan, an exact index range, intersections
 of indexes, and a selective index followed by residual evaluation. It estimates
 work from authenticated range cardinalities, projected Parquet bytes/rows, and
 whether index metadata is resident. These are relative work estimates rather
-than calibrated latency predictions. No user hint is required.
+than calibrated latency predictions. No user hint is required. Missing inventory
+row counts remain unknown; missing projected chunk statistics use the full file
+length as an upper estimate.
 
 Index candidates borrow the current query's authorized artifact store and leased
 publication. Losing candidates release their metadata handles without reading
 result rows. A partial candidate set retains the full predicate for exact
 ranking/counts; it is allowed only within the engine's configured exact candidate
-budget. Exclusions and vector filters require exact sets. Broad exact scans and
-indexes support match sets above 100,000 rows; full-archive qualification still
-needs larger partitions. Nested paths retain the existing residual-filter path.
+budget. Sorting, cursor pagination, exclusions, and vector filters require
+exact sets. Broad exact scans and indexes support match sets above 100,000 rows;
+full-archive qualification still needs larger partitions. Nested paths retain the existing residual-filter path.
 
 ## Same-region qualification
 
@@ -204,6 +206,8 @@ each cycle. The table pools those ten samples per filter:
 | Creation-time range | 223 ms | 141 ms |
 | Four-field conjunction | 753 ms | 142 ms |
 
+These timing measurements predate the sorting/pagination and missing-statistics
+review fixes; the recorded binary revision remains the basis for this comparison.
 The conjunction improved about 5.3×; its reported native execution median fell
 from 612 ms to 11 ms. All filter totals and ranked pages matched the residual
 oracle before and after restart. HN IDs and scores were identical across both
