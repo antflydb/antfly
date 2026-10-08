@@ -49,11 +49,11 @@ pub const Config = struct {
     /// DB-owned combined runtimes generate a fresh incarnation identity for
     /// runtime, lease owner, and page worker. Explicit split-role runtimes keep
     /// their caller-supplied identities.
-    automatic_identity: bool = false,
+    automatic_identity: ?bool = null,
     start_background_loop: bool = true,
     role: Role = .combined,
     runtime_id: []const u8 = "",
-    lease_owned: bool = false,
+    lease_owned: ?bool = null,
     /// Process-incarnation identity used to fence the runtime lease. This must
     /// be unique across concurrent processes and process restarts.
     owner_id: []const u8 = "local",
@@ -73,7 +73,21 @@ pub const Config = struct {
         .max_metrics_per_round = 8,
         .max_pages_per_round = 1,
     },
-    clock: platform_clock.Clock = platform_clock.Clock.real(),
+    /// Unspecified clocks inherit the supplied backend's I/O clock.
+    clock: ?platform_clock.Clock = null,
+
+    /// Resolve DB-owned defaults after nested option overrides. Explicit
+    /// identities and split-role configurations retain their caller policy.
+    pub fn forDbOwner(self: Config) Config {
+        var resolved = self;
+        resolved.automatic_identity = self.automatic_identity orelse
+            (self.role == .combined and self.runtime_id.len == 0 and
+                (self.owner_id.len == 0 or std.mem.eql(u8, self.owner_id, "local")) and
+                self.planned_options.worker_ids.len == 0 and
+                std.mem.eql(u8, self.planned_options.worker_id, (index_manager_mod.IndexManager.GraphMetricPlannedMaintenanceOptions{}).worker_id));
+        resolved.lease_owned = self.lease_owned orelse resolved.automatic_identity.?;
+        return resolved;
+    }
 };
 
 pub const Stats = struct {
@@ -332,6 +346,8 @@ pub const GraphMetricRuntime = if (builtin.os.tag == .freestanding) struct {
         return .{ .config = config };
     }
 
+    pub fn beginTeardown(_: *@This()) void {}
+
     pub fn deinit(self: *@This()) void {
         self.* = undefined;
     }
@@ -411,9 +427,10 @@ pub const GraphMetricRuntime = if (builtin.os.tag == .freestanding) struct {
         _ = apply_mutex;
         if (runtime_io == null) return error.MissingBackendRuntimeIo;
         var resolved_config = config;
+        resolved_config.clock = config.clock orelse backend_runtime.clock();
         var owned_identity: ?[]u8 = null;
         errdefer if (owned_identity) |identity| alloc.free(identity);
-        if (config.automatic_identity) {
+        if (config.automatic_identity orelse false) {
             if (config.role != .combined) return error.InvalidGraphMetricRuntimeConfig;
             var nonce: [16]u8 = undefined;
             try @import("antfly_platform").entropy.fill(runtime_io orelse return error.MissingBackendRuntimeIo, &nonce);
@@ -434,7 +451,7 @@ pub const GraphMetricRuntime = if (builtin.os.tag == .freestanding) struct {
             .config = resolved_config,
             .lease_key = lease_key,
             .ownership = try ownership_mod.State.init(alloc, store, lease_key, .{
-                .lease_owned = resolved_config.lease_owned,
+                .lease_owned = resolved_config.lease_owned orelse false,
                 .owner_id = if (resolved_config.owner_id.len != 0) resolved_config.owner_id else resolved_config.runtime_id,
                 .lease_ttl_ms = resolved_config.lease_ttl_ms,
             }),
@@ -442,14 +459,20 @@ pub const GraphMetricRuntime = if (builtin.os.tag == .freestanding) struct {
         };
     }
 
-    fn stopRuntime(self: *GraphMetricRuntime) void {
-        if (self.runtime_io) |io| {
-            self.mutex.lockUncancelable(io);
-            self.shutdown = true;
-            self.notified = true;
-            self.mutex.unlock(io);
-            self.wake_event.set(io);
+    /// Publish shutdown without joining: borrowed schedulers drain futures
+    /// before DB destruction, and cancellation cannot wake a parked worker.
+    pub fn beginTeardown(self: *GraphMetricRuntime) void {
+        const io = self.runtime_io orelse return;
+        self.mutex.lockUncancelable(io);
+        self.shutdown = true;
+        self.notified = true;
+        self.mutex.unlock(io);
+        self.wake_event.set(io);
+    }
 
+    fn stopRuntime(self: *GraphMetricRuntime) void {
+        self.beginTeardown();
+        if (self.runtime_io) |io| {
             if (self.future) |*future| _ = future.await(io);
         }
         self.future = null;
@@ -527,7 +550,7 @@ pub const GraphMetricRuntime = if (builtin.os.tag == .freestanding) struct {
 
     pub fn runOnceDetailed(self: *GraphMetricRuntime) !index_manager_mod.IndexManager.GraphMetricPlannedSchedulerSweepResult {
         self.recordTickStarted();
-        const now_ms = self.config.clock.nowRealtimeMs();
+        const now_ms = self.config.clock.?.nowRealtimeMs();
         if (!self.ensureRuntimeLease(now_ms)) {
             self.recordTickSuccess(.{});
             return .{};
@@ -551,7 +574,7 @@ pub const GraphMetricRuntime = if (builtin.os.tag == .freestanding) struct {
             self.recordTickError(err);
             return err;
         }
-        const now_ms = self.config.clock.nowRealtimeMs();
+        const now_ms = self.config.clock.?.nowRealtimeMs();
         if (!self.ensureRuntimeLease(now_ms)) {
             self.recordTickSuccess(.{});
             return .{};
@@ -579,7 +602,7 @@ pub const GraphMetricRuntime = if (builtin.os.tag == .freestanding) struct {
             self.recordTickError(err);
             return err;
         }
-        const now_ms = self.config.clock.nowRealtimeMs();
+        const now_ms = self.config.clock.?.nowRealtimeMs();
         if (!self.ensureRuntimeLease(now_ms)) {
             self.recordTickSuccess(.{});
             return .{};
@@ -608,7 +631,7 @@ pub const GraphMetricRuntime = if (builtin.os.tag == .freestanding) struct {
             return try self.runWorkerOnce(self.config.planned_options.worker_id);
         }
         self.recordTickStarted();
-        const now_ms = self.config.clock.nowRealtimeMs();
+        const now_ms = self.config.clock.?.nowRealtimeMs();
         if (!self.ensureRuntimeLease(now_ms)) {
             self.recordTickSuccess(.{});
             return .{};
@@ -623,7 +646,7 @@ pub const GraphMetricRuntime = if (builtin.os.tag == .freestanding) struct {
     }
 
     fn runWorkerPoolSweepLocked(self: *GraphMetricRuntime) !index_manager_mod.IndexManager.GraphMetricPlannedSchedulerSweepResult {
-        return try self.runWorkerPoolSweepLockedAt(self.config.clock.nowRealtimeMs());
+        return try self.runWorkerPoolSweepLockedAt(self.config.clock.?.nowRealtimeMs());
     }
 
     fn runWorkerPoolSweepLockedAt(
@@ -776,8 +799,8 @@ pub fn initialStats(config: Config) Stats {
         .owner_id_hash = identityHash(runtimeOwnerId(config)),
         .worker_id_hash = workerIdentityHash(config),
         .worker_count = configuredWorkerCount(config),
-        .lease_owned = config.lease_owned,
-        .has_lease = !config.lease_owned,
+        .lease_owned = config.lease_owned orelse false,
+        .has_lease = !(config.lease_owned orelse false),
     };
 }
 
@@ -876,7 +899,7 @@ pub fn runBoundaryTick(
 
 fn validateConfig(config: Config) !void {
     if (config.lease_ttl_ms == 0) return error.InvalidGraphMetricRuntimeConfig;
-    if (config.lease_owned and
+    if ((config.lease_owned orelse false) and
         (config.owner_id.len == 0 or std.mem.eql(u8, config.owner_id, "local")))
     {
         return error.InvalidGraphMetricRuntimeConfig;
@@ -1265,7 +1288,7 @@ fn waitForWork(runtime: *GraphMetricRuntime) void {
     runtime.wake_event.reset();
     runtime.mutex.unlock(io);
 
-    if (runtime.config.clock.isReal()) {
+    if (runtime.config.clock.?.isReal()) {
         runtime.wake_event.waitTimeout(io, .{ .duration = .{
             .raw = std.Io.Duration.fromMilliseconds(@intCast(remaining_ms)),
             .clock = .awake,
@@ -1302,12 +1325,12 @@ fn sleepMs(runtime: *GraphMetricRuntime, ms: u64) void {
 }
 
 fn runtimeSleepSlice(runtime: *GraphMetricRuntime, ms: u64) void {
-    if (!runtime.config.clock.isReal()) {
-        runtime.config.clock.sleepMs(ms);
+    if (!runtime.config.clock.?.isReal()) {
+        runtime.config.clock.?.sleepMs(ms);
         return;
     }
     const runtime_io = runtime.runtime_io orelse {
-        runtime.config.clock.sleepMs(ms);
+        runtime.config.clock.?.sleepMs(ms);
         return;
     };
     std.Io.Clock.Duration.sleep(.{
@@ -3307,6 +3330,7 @@ test "db graph metric runtime background default starts automatically and drains
 
     var db = try DB.open(alloc, std.mem.span(path), .{
         .ttl_cleanup = .{ .enabled = false },
+        .graph_metric_maintenance = .{ .idle_interval_ms = 100 },
     });
     defer db.close();
     const runtime = db.graph_metric_runtime orelse return error.GraphMetricRuntimeNotInitialized;
@@ -3537,6 +3561,96 @@ test "db graph metric runtime background default publishes pagerank refresh rebu
     }
 }
 
+test "db graph metric runtime background default resolves ownership after option overrides" {
+    const defaults = (Config{}).forDbOwner();
+    const tuned = (Config{
+        .idle_interval_ms = 100,
+        .planned_options = .{ .max_rounds = 2, .max_pages_per_round = 3 },
+    }).forDbOwner();
+    try std.testing.expect(defaults.automatic_identity.? and defaults.lease_owned.?);
+    try std.testing.expect(tuned.automatic_identity.? and tuned.lease_owned.?);
+    try std.testing.expectEqual(@as(u64, 100), tuned.idle_interval_ms);
+    try std.testing.expectEqual(@as(usize, 3), tuned.planned_options.max_pages_per_round);
+    const manual = (Config{ .automatic_identity = false, .lease_owned = false }).forDbOwner();
+    try std.testing.expect(!manual.automatic_identity.? and !manual.lease_owned.?);
+    const unleased = (Config{ .lease_owned = false }).forDbOwner();
+    try std.testing.expect(unleased.automatic_identity.? and !unleased.lease_owned.?);
+    const explicit = (Config{ .runtime_id = "caller-runtime", .owner_id = "caller-owner" }).forDbOwner();
+    try std.testing.expect(!explicit.automatic_identity.?);
+    try std.testing.expectEqualStrings("caller-owner", explicit.owner_id);
+    const split = (Config{ .role = .coordinator, .lease_owned = true, .owner_id = "coordinator-owner" }).forDbOwner();
+    try std.testing.expect(!split.automatic_identity.? and split.lease_owned.?);
+}
+
+test "db graph metric runtime background default inherits borrowed clock and drains parked teardown" {
+    const DB = @import("../mod.zig").DB;
+    const vopr = @import("vopr");
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.fastTempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+    defer db.close();
+    var sim = try vopr.vopr_io.VoprIo.init(.{ .realtime_ns = 123 * std.time.ns_per_ms });
+    defer sim.deinit();
+    var backend = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{
+        .backend = .manual,
+        .borrowed_io = .{ .general = sim.io() },
+    });
+    defer backend.deinit();
+    const resources = db.core.asyncResources();
+    var runtime = try GraphMetricRuntime.init(alloc, resources.store, resources.index_manager, resources.apply_mutex, backend.ptr(), (Config{ .lease_ttl_ms = 1_000 }).forDbOwner());
+    db.graph_metric_runtime = &runtime;
+    defer {
+        runtime.beginTeardown();
+        _ = sim.cancelAndDrainTasksForTeardown(alloc, 100) catch {};
+        runtime.deinit();
+        db.graph_metric_runtime = null;
+    }
+    try std.testing.expectEqual(@as(u64, 123), runtime.config.clock.?.nowRealtimeMs());
+    try std.testing.expect(runtime.ensureRuntimeLease(runtime.config.clock.?.nowRealtimeMs()));
+    var first_lease = (try runtime.ownership.loadLease(alloc)) orelse return error.TestExpectedLease;
+    defer lease_mod.deinitRecord(alloc, &first_lease);
+    try std.testing.expectEqual(@as(u64, 1_123), first_lease.expires_at_ms);
+    try sim.advance(1_000 * std.time.ns_per_ms);
+    try std.testing.expectEqual(@as(u64, 1_123), runtime.config.clock.?.nowRealtimeMs());
+    try std.testing.expect(runtime.ensureRuntimeLease(runtime.config.clock.?.nowRealtimeMs()));
+    var renewed = (try runtime.ownership.loadLease(alloc)) orelse return error.TestExpectedLease;
+    defer lease_mod.deinitRecord(alloc, &renewed);
+    try std.testing.expectEqual(@as(u64, 2_123), renewed.expires_at_ms);
+
+    var manual_clock = platform_clock.ManualClock{};
+    manual_clock.setRealtimeNs(77 * std.time.ns_per_ms);
+    var explicit = try GraphMetricRuntime.init(alloc, resources.store, resources.index_manager, resources.apply_mutex, backend.ptr(), .{ .clock = manual_clock.clock(), .start_background_loop = false });
+    defer explicit.deinit();
+    try std.testing.expectEqual(@as(u64, 77), explicit.config.clock.?.nowRealtimeMs());
+
+    // Wake a worker on an empty catalog and drive it into the uncancelable
+    // park. Teardown must signal it before the borrowed scheduler drains.
+    try runtime.start();
+    runtime.notify();
+    var enabled: vopr.transition.List = .{};
+    defer enabled.deinit(alloc);
+    var sink: vopr.event.Sink = .{};
+    defer sink.deinit(alloc);
+    try sim.scheduler().enumerateReady(&enabled, alloc);
+    try enabled.canonicalize();
+    try std.testing.expect(enabled.items.items.len > 0);
+    try sim.scheduler().executeReady(enabled.items.items[0].id, &sink, alloc);
+    const parked = sim.futureTaskSnapshot(runtime.future.?.any_future.?) orelse return error.TestExpectedWorker;
+    try std.testing.expectEqual(vopr.vopr_io_task.Status.waiting_futex, parked.status);
+    try std.testing.expect(!runtime.stats().has_lease);
+    db.beginTeardown();
+    try std.testing.expect(runtime.stats().shutdown);
+    _ = try sim.cancelAndDrainTasksForTeardown(alloc, 100);
+    try std.testing.expect(sim.scheduler().quiescent());
+    const stopped = sim.futureTaskSnapshot(runtime.future.?.any_future.?) orelse return error.TestExpectedWorker;
+    try std.testing.expectEqual(vopr.vopr_io_task.Status.finished, stopped.status);
+    try sim.ensureNoCapabilityViolation();
+}
+
 test "db graph metric runtime background default respects readonly standby and worker gates" {
     const DB = @import("../mod.zig").DB;
     const OpenOptions = @import("../mod.zig").OpenOptions;
@@ -3557,6 +3671,7 @@ test "db graph metric runtime background default respects readonly standby and w
     };
     var gate_context: u8 = 0;
     for ([_]OpenOptions{
+        .{ .executor = .{ .backend = .manual } },
         .{ .start_index_workers = false },
         .{ .start_optional_runtimes = false },
         .{ .open_mode = .query_readonly },

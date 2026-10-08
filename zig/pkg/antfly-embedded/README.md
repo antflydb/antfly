@@ -72,7 +72,12 @@ Callers that drive graph maintenance themselves can open with
 `.graph_metric_maintenance = .{ .start_background_loop = false }`. The existing
 `start_index_workers`, `start_optional_runtimes`, and
 `start_optional_runtime_workers` controls also apply. Explicit coordinator and
-worker configurations retain their supplied identities and budgets.
+worker configurations retain their supplied identities and budgets. Tuning
+maintenance intervals or budgets preserves automatic identity and lease defaults;
+explicit `automatic_identity = false` and `lease_owned = false` remain available
+for external drivers. Unspecified clocks inherit the backend clock. Borrowed
+scheduler owners must call `DB.beginTeardown()` before draining their tasks,
+then close the database after the drain.
 
 ## Source organization
 
