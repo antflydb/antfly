@@ -519,10 +519,19 @@ pub const Execution = struct {
         self.resume_generation +%= 1;
         self.quantum_start_ns = options.now();
     }
+    fn schedulerFor(e: *Entry, comptime needs_running: bool) !*Scheduler {
+        const owner = e.scheduler orelse return error.InvalidRunnableTransition;
+        owner.lock();
+        defer owner.mutex.unlock();
+        // A denied resume is terminal until owning finish. Later phase or
+        // cleanup checks must preserve that cause, not attempt to resurrect it.
+        if (e.state == .stopped) return e.failure orelse error.InvalidRunnableTransition;
+        if (needs_running and e.state != .running) return error.InvalidRunnableTransition;
+        return owner;
+    }
     pub fn checkpoint(self: *Execution) !void {
         const e = if (self.entry) |*entry| entry else return;
-        const owner = e.scheduler orelse return error.InvalidRunnableTransition;
-        if (owner.state(e) != .running) return error.InvalidRunnableTransition;
+        const owner = try schedulerFor(e, true);
         try e.options.check();
         self.checkpoints +|= 1;
         if (self.checkpoints < owner.config.checkpoint_budget and
@@ -535,12 +544,12 @@ pub const Execution = struct {
     }
     pub fn park(self: *Execution, reason: State) !void {
         const e = if (self.entry) |*entry| entry else return;
-        const owner = e.scheduler orelse return error.InvalidRunnableTransition;
+        const owner = try schedulerFor(e, false);
         try owner.block(e, reason);
     }
     pub fn enter(self: *Execution, class: Class) !void {
         const e = if (self.entry) |*entry| entry else return;
-        const owner = e.scheduler orelse return error.InvalidRunnableTransition;
+        const owner = try schedulerFor(e, false);
         try owner.reclassifyBlocked(e, class);
         try owner.unblock(e);
         try owner.waitRetained(e);
@@ -944,11 +953,12 @@ test "runnable scheduler denied reentry retains borrowed reservations until owni
         try peer.startWithSlots(&scheduler, .{ .io = std.testing.io }, .query, 2);
         if (cause == .canceled) flag.value = true;
         if (cause == .deadline) VirtualClock.value = 11;
-        try std.testing.expectError(switch (cause) {
+        const expected = switch (cause) {
             .canceled => error.Canceled,
             .deadline => error.DeadlineExceeded,
             .wait_timeout => error.RunnableWaitTimeout,
-        }, borrowed.enter(.inference));
+        };
+        try std.testing.expectError(expected, borrowed.enter(.inference));
         const held = scheduler.stats();
         try std.testing.expectEqual(State.stopped, scheduler.state(&borrowed.entry.?));
         try std.testing.expectEqual(@as(usize, 2), held.operations);
@@ -959,6 +969,20 @@ test "runnable scheduler denied reentry retains borrowed reservations until owni
         // outstanding operation reservation for a fresh foreground request.
         var excess = testEntry(.query, 1, 0);
         try std.testing.expectError(error.SchedulerFull, scheduler.submit(&excess));
+        // A subsequently cleared cancellation token or shutdown cannot replace
+        // the first failure or allow a new runnable interval on this capsule.
+        flag.value = false;
+        const generation = borrowed.resume_generation;
+        try std.testing.expectError(expected, borrowed.checkpoint());
+        try std.testing.expectError(expected, borrowed.park(.output_blocked));
+        try std.testing.expectError(expected, borrowed.enter(.control));
+        scheduler.close();
+        try std.testing.expectError(expected, borrowed.checkpoint());
+        try std.testing.expectError(expected, borrowed.park(.resource_blocked));
+        try std.testing.expectError(expected, borrowed.enter(.inference));
+        try std.testing.expectEqual(generation, borrowed.resume_generation);
+        try std.testing.expectEqual(@as(usize, 2), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 17), scheduler.stats().retained_bytes);
         peer.finish();
         try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
         try std.testing.expectEqual(@as(u64, 17), scheduler.stats().retained_bytes);

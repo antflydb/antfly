@@ -277,3 +277,11 @@ scheduler, broker/owner and actual subprocess-to-stalled-TCP gates pass; see
 The supplemental child uses production RPC and actual OS reaping; production
 Worker.Client/model startup, current whole API/archive, stuck-reap quarantine and
 full default-enablement qualification remain required.
+
+
+Stopped published capsules retain their original failure through later checkpoint,
+park and enter attempts, including a cleared cancellation token and subsequent
+shutdown. Their reservations remain held until owning finish. Both scheduler and
+real owner/subprocess gates pass on native and pinned Nix/glibc GNU; see
+[stopped-cause receipts](receipts/2026-10-07/stopped-capsule-causes/README.md).
+Current full API/production qualification and default enablement remain pending.
