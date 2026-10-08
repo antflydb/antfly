@@ -228,3 +228,16 @@ output adapter still need this mechanism connected to their original controls.
 Partial frame transmission needs explicit transport retirement. These socket
 receipts do not qualify those integrations, physical scheduler ownership, or
 pooling defaults.
+
+
+## Original HTTP output controls
+
+Controlled HTTP/1 framing and HTTP/2 encoding, frame, lock and flow-credit waits
+preserve original request fences. Uncertain output retires the connection under
+cancellation protection. The focused library gate passes on native and pinned
+Nix/glibc Linux; see [HTTP output receipts](receipts/2026-10-07/controlled-http-output/README.md).
+The layout-only runtime callbacks retain those controls and terminal status
+classes on both platforms; see [bridge receipts](receipts/2026-10-07/controlled-runtime-http-bridge/README.md).
+Standalone production wiring still needs archive qualification. Parking a whole
+output callback leaves formatter CPU uncharged; physical IO-only parking remains
+required before enabling pooling by default.

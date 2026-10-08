@@ -16,6 +16,7 @@ const std = @import("std");
 const mem = std.mem;
 const Allocator = mem.Allocator;
 const Io = std.Io;
+const WriteControl = @import("../net/socket.zig").WriteControl;
 
 const http = @import("http.zig");
 const stream_mod = @import("stream.zig");
@@ -301,6 +302,8 @@ pub const H2Connection = struct {
     /// Writes a single frame (header + payload).
     pub fn writeFrame(self: *Self, writer: anytype, frame_type: Http2FrameType, flags: u8, stream_id: u31, payload: []const u8) !void {
         _ = self;
+        const Writer = if (@typeInfo(@TypeOf(writer)) == .pointer) std.meta.Child(@TypeOf(writer)) else @TypeOf(writer);
+        if (comptime @hasDecl(Writer, "beginFrame")) writer.beginFrame();
         const hdr = Http2FrameHeader{
             .length = @intCast(payload.len),
             .frame_type = frame_type,
@@ -310,10 +313,18 @@ pub const H2Connection = struct {
         const hdr_bytes = hdr.serialize();
         try writer.writeAll(&hdr_bytes);
         if (payload.len > 0) try writer.writeAll(payload);
+        if (comptime @hasDecl(Writer, "finishFrame")) writer.finishFrame();
     }
 
     /// Sends HEADERS (+ CONTINUATION if needed), splitting at MAX_FRAME_SIZE.
     pub fn writeHeaders(self: *Self, writer: anytype, stream_id: u31, header_block: []const u8, end_stream: bool) !void {
+        const Writer = if (@typeInfo(@TypeOf(writer)) == .pointer) std.meta.Child(@TypeOf(writer)) else @TypeOf(writer);
+        if (comptime @hasDecl(Writer, "beginHeaderBlock")) writer.beginHeaderBlock();
+        try self.writeHeadersInner(writer, stream_id, header_block, end_stream);
+        if (comptime @hasDecl(Writer, "finishHeaderBlock")) writer.finishHeaderBlock();
+    }
+
+    fn writeHeadersInner(self: *Self, writer: anytype, stream_id: u31, header_block: []const u8, end_stream: bool) !void {
         const max_size = self.peer_settings.max_frame_size;
         if (header_block.len <= max_size) {
             var flags: u8 = FLAG_END_HEADERS;
@@ -376,6 +387,69 @@ pub const H2Connection = struct {
     ///
     /// **Caller must hold `write_mutex`**. The mutex is temporarily released
     /// while waiting for window space so the receive loop can process frames.
+    /// Owns the write lock only while inspecting state and transmitting a
+    /// frame. Credit and lock waits retain the stream's original controls.
+    pub fn writeDataBlockingControlled(self: *Self, writer: anytype, stream_id: u31, data: []const u8, end_stream: bool, control: WriteControl) !void {
+        var offset: usize = 0;
+        var stall_deadline: ?Io.Timeout = null;
+        if (data.len == 0) {
+            try control.lock(&self.write_mutex, self.io);
+            defer self.write_mutex.unlock(self.io);
+            const stream = self.stream_manager.getStream(stream_id) orelse return error.InvalidStreamId;
+            if (stream.responseWriteError(self.is_server)) |err| return err;
+            if (end_stream) {
+                try self.writeFrame(writer, .data, FLAG_END_STREAM, stream_id, &.{});
+                stream.sendEndStream();
+            }
+            return;
+        }
+        while (offset < data.len) {
+            try control.check();
+            const stalled = blk: {
+                try control.lock(&self.write_mutex, self.io);
+                defer self.write_mutex.unlock(self.io);
+                const stream = self.stream_manager.getStream(stream_id) orelse return error.InvalidStreamId;
+                if (stream.responseWriteError(self.is_server)) |err| return err;
+                const sw: usize = if (stream.send_window > 0) @intCast(stream.send_window) else 0;
+                const cw: usize = if (self.stream_manager.connection_send_window > 0) @intCast(self.stream_manager.connection_send_window) else 0;
+                const count = @min(data.len - offset, @min(@min(sw, cw), self.peer_settings.max_frame_size));
+                if (count == 0) {
+                    // WINDOW_UPDATE takes this same lock before signaling.
+                    self.send_window_event.reset();
+                    break :blk true;
+                }
+                const amount: i32 = @intCast(count);
+                try stream.updateSendWindow(-amount);
+                try self.stream_manager.updateConnectionSendWindow(-amount);
+                const last = offset + count == data.len;
+                self.writeFrame(writer, .data, if (last and end_stream) FLAG_END_STREAM else 0, stream_id, data[offset..][0..count]) catch |err| {
+                    stream.updateSendWindow(amount) catch {};
+                    self.stream_manager.updateConnectionSendWindow(amount) catch {};
+                    return err;
+                };
+                offset += count;
+                if (last and end_stream) stream.sendEndStream();
+                break :blk false;
+            };
+            if (!stalled) {
+                stall_deadline = null;
+                continue;
+            }
+            if (stall_deadline == null) stall_deadline = self.send_window_timeout.toDeadline(self.io);
+            var ms: u64 = 25;
+            if (stall_deadline.?.toDurationFromNow(self.io)) |duration| {
+                const ns = duration.raw.toNanoseconds();
+                if (ns <= 0) return error.Timeout;
+                ms = @min(ms, @as(u64, @intCast(@divTrunc(ns + std.time.ns_per_ms - 1, std.time.ns_per_ms))));
+            }
+            ms = (try control.timeout(ms)).?;
+            self.send_window_event.waitTimeout(self.io, .{ .duration = .{ .raw = .fromMilliseconds(@intCast(ms)), .clock = .awake } }) catch |err| switch (err) {
+                error.Timeout => {},
+                else => return err,
+            };
+        }
+    }
+
     pub fn writeDataBlocking(self: *Self, writer: anytype, stream_id: u31, data: []const u8, end_stream: bool) !void {
         const max_size = self.peer_settings.max_frame_size;
 
@@ -779,6 +853,9 @@ pub const H2Connection = struct {
             // without changing those established encoder-only call paths.
             if (value.state == .closed and value.cancellation.load(.acquire)) return error.StreamReset;
         }
+        const Writer = if (@typeInfo(@TypeOf(writer)) == .pointer) std.meta.Child(@TypeOf(writer)) else @TypeOf(writer);
+        if (comptime @hasDecl(Writer, "beginEncoding")) try writer.beginEncoding();
+        errdefer if (comptime @hasDecl(Writer, "abortEncoding")) writer.abortEncoding();
         const encoded = try hpack.encodeHeaders(&self.stream_manager.hpack_encode_ctx, h2_headers, self.allocator);
         defer self.allocator.free(encoded);
         try self.writeHeaders(writer, stream_id, encoded, end_stream);
@@ -3545,4 +3622,112 @@ test "H2 error envelopes select their bounded limit before DATA allocation" {
             try std.testing.expectEqual(@as(usize, 0), stream.data_buf.items.len);
         }
     }
+}
+
+const ControlledH2Test = struct {
+    io: Io,
+    deadline_ms: i64,
+    canceled: std.atomic.Value(bool) = .init(false),
+    observed: Io.Event = .unset,
+    fn check(raw: ?*anyopaque) WriteControl.Error!void {
+        const self: *@This() = @ptrCast(@alignCast(raw.?));
+        self.observed.set(self.io);
+        if (self.canceled.load(.acquire)) return error.Canceled;
+        if (@import("../util/common.zig").milliTimestamp(self.io) >= self.deadline_ms) return error.Timeout;
+    }
+    fn remaining(raw: ?*anyopaque) WriteControl.Error!?u64 {
+        const self: *@This() = @ptrCast(@alignCast(raw.?));
+        try check(raw);
+        return @intCast(@max(0, self.deadline_ms - @import("../util/common.zig").milliTimestamp(self.io)));
+    }
+    fn view(self: *@This()) WriteControl {
+        return .{ .ptr = self, .check_fn = check, .remaining_ms_fn = remaining };
+    }
+};
+
+test "H2 controlled flow wait retains original deadline and permits connection control progress" {
+    const io = std.testing.io;
+    var connection = H2Connection.initServer(std.testing.allocator, io);
+    defer connection.deinit();
+    const stream = try connection.stream_manager.getOrCreateStream(1);
+    stream.state = .open;
+    stream.send_window = 0;
+    var wire: std.ArrayListUnmanaged(u8) = .empty;
+    defer wire.deinit(std.testing.allocator);
+    var control = ControlledH2Test{ .io = io, .deadline_ms = @import("../util/common.zig").milliTimestamp(io) + 250 };
+    var call = try io.concurrent(struct {
+        fn run(conn: *H2Connection, bytes: *std.ArrayListUnmanaged(u8), original: *ControlledH2Test) anyerror!void {
+            return conn.writeDataBlockingControlled(testWriter(bytes, std.testing.allocator), 1, "blocked", true, original.view());
+        }
+    }.run, .{ &connection, &wire, &control });
+    defer call.cancel(io) catch {};
+    try control.observed.wait(io);
+    // The connection's own control traffic can acquire the same mutex while
+    // the stream lacks DATA credit. No shared deadline or timeout is changed.
+    try io.sleep(.fromMilliseconds(30), .awake);
+    try std.testing.expect(connection.write_mutex.tryLock());
+    try connection.sendPing(testWriter(&wire, std.testing.allocator), "control!".*);
+    connection.write_mutex.unlock(io);
+    try std.testing.expectError(error.Timeout, call.await(io));
+    try std.testing.expect(!stream.end_stream_sent);
+    try std.testing.expectEqual(@as(i32, 0), stream.send_window);
+    try std.testing.expectEqual(@as(usize, 17), wire.items.len);
+    try std.testing.expect(connection.write_mutex.tryLock());
+    connection.write_mutex.unlock(io);
+}
+
+test "H2 controlled lock wait honors original deadline without emitting a frame" {
+    const io = std.testing.io;
+    var connection = H2Connection.initServer(std.testing.allocator, io);
+    defer connection.deinit();
+    const stream = try connection.stream_manager.getOrCreateStream(1);
+    stream.state = .open;
+    var wire: std.ArrayListUnmanaged(u8) = .empty;
+    defer wire.deinit(std.testing.allocator);
+    var control = ControlledH2Test{ .io = io, .deadline_ms = @import("../util/common.zig").milliTimestamp(io) + 100 };
+    connection.write_mutex.lockUncancelable(io);
+    defer connection.write_mutex.unlock(io);
+    try std.testing.expectError(error.Timeout, connection.writeDataBlockingControlled(testWriter(&wire, std.testing.allocator), 1, "blocked", true, control.view()));
+    try std.testing.expectEqual(@as(usize, 0), wire.items.len);
+    try std.testing.expect(!stream.end_stream_sent);
+}
+
+test "H2 controlled flow wait observes original cancellation without END_STREAM" {
+    const io = std.testing.io;
+    var connection = H2Connection.initServer(std.testing.allocator, io);
+    defer connection.deinit();
+    const stream = try connection.stream_manager.getOrCreateStream(1);
+    stream.state = .open;
+    stream.send_window = 0;
+    var wire: std.ArrayListUnmanaged(u8) = .empty;
+    defer wire.deinit(std.testing.allocator);
+    var control = ControlledH2Test{ .io = io, .deadline_ms = @import("../util/common.zig").milliTimestamp(io) + 1000 };
+    var call = try io.concurrent(struct {
+        fn run(conn: *H2Connection, bytes: *std.ArrayListUnmanaged(u8), original: *ControlledH2Test) anyerror!void {
+            return conn.writeDataBlockingControlled(testWriter(bytes, std.testing.allocator), 1, "blocked", true, original.view());
+        }
+    }.run, .{ &connection, &wire, &control });
+    defer call.cancel(io) catch {};
+    try control.observed.wait(io);
+    control.canceled.store(true, .release);
+    try std.testing.expectError(error.Canceled, call.await(io));
+    try std.testing.expectEqual(@as(usize, 0), wire.items.len);
+    try std.testing.expect(!stream.end_stream_sent);
+    try std.testing.expect(connection.write_mutex.tryLock());
+    connection.write_mutex.unlock(io);
+}
+
+test "H2 controlled available credit sends valid DATA and END_STREAM" {
+    const io = std.testing.io;
+    var connection = H2Connection.initServer(std.testing.allocator, io);
+    defer connection.deinit();
+    const stream = try connection.stream_manager.getOrCreateStream(1);
+    stream.state = .open;
+    var wire: std.ArrayListUnmanaged(u8) = .empty;
+    defer wire.deinit(std.testing.allocator);
+    var control = ControlledH2Test{ .io = io, .deadline_ms = @import("../util/common.zig").milliTimestamp(io) + 1000 };
+    try connection.writeDataBlockingControlled(testWriter(&wire, std.testing.allocator), 1, "payload", true, control.view());
+    try std.testing.expectEqualStrings("payload", wire.items[9..]);
+    try std.testing.expectEqual(@as(u8, H2Connection.FLAG_END_STREAM), wire.items[4]);
+    try std.testing.expect(stream.end_stream_sent);
 }

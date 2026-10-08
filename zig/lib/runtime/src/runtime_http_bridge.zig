@@ -43,6 +43,7 @@ pub const Outbound = struct {
     context: *httpx.Context,
     writer: ?httpx.Context.StreamWriter = null,
     started: bool = false,
+    write_control: httpx.socket.WriteControl = .{},
 
     pub fn cancellation(self: *Outbound) abi.CancellationView {
         return .{
@@ -93,7 +94,7 @@ pub const Outbound = struct {
         for (headers.slice()) |header| {
             self.context.response.headers.append(header.name.slice(), header.value.slice()) catch |err| return callbackStatusAfterIo(self.context, err);
         }
-        self.writer = self.context.streamResponseWithContentType(status, content_type.slice()) catch |err| return callbackStatusAfterIo(self.context, err);
+        self.writer = self.context.streamResponseWithContentTypeControlled(status, content_type.slice(), self.write_control) catch |err| return callbackStatusAfterIo(self.context, err);
         self.started = true;
         return .ok;
     }
@@ -255,6 +256,62 @@ test "runtime HTTP streaming carries policy headers before commitment across bot
         }
     };
     for ([_]usize{ 2, 32 }) |count| try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.check, .{count});
+}
+
+test "outbound original output fences survive linked stream callbacks" {
+    const std = @import("std");
+    const State = struct {
+        failure: ?httpx.socket.WriteControl.Error = null,
+        starts: usize = 0,
+        writes: usize = 0,
+        closes: usize = 0,
+        fn check(raw: ?*anyopaque) httpx.socket.WriteControl.Error!void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.failure) |err| return err;
+        }
+        fn start(raw: ?*anyopaque, _: u16, _: []const u8, _: *const httpx.Headers) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.starts += 1;
+        }
+        fn write(raw: ?*anyopaque, _: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.writes += 1;
+        }
+        fn close(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.closes += 1;
+        }
+    };
+    var request = try httpx.Request.init(std.testing.allocator, .POST, "/stream");
+    defer request.deinit();
+    var outer = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
+    defer outer.deinit();
+    var state = State{ .failure = error.Timeout };
+    outer.stream_delegate = .{ .ptr = &state, .start = State.start, .write = State.write, .close = State.close };
+    var outbound = Outbound{ .context = &outer, .write_control = .{ .ptr = &state, .check_fn = State.check } };
+    var sink = outbound.stream();
+    try std.testing.expectEqual(.timeout, sink.start.?(sink.context, 200, abi.Bytes.init("application/x-ndjson"), .{}));
+    try std.testing.expectEqual(@as(usize, 0), state.starts);
+    // Each terminal case has its own stream: close retires a writer even when
+    // the transport rejects it, so subsequent writes correctly report closed.
+    for ([_]httpx.socket.WriteControl.Error{ error.Timeout, error.Canceled }) |failure| {
+        state.failure = null;
+        outbound = .{ .context = &outer, .write_control = .{ .ptr = &state, .check_fn = State.check } };
+        sink = outbound.stream();
+        var inner = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
+        defer inner.deinit();
+        installInbound(&inner, &.{}, &.{}, &sink);
+        var writer = try inner.streamResponseWithContentType(200, "application/x-ndjson");
+        try writer.write("first\n");
+        const writes = state.writes;
+        state.failure = failure;
+        try std.testing.expectError(failure, writer.write("late\n"));
+        try std.testing.expectError(failure, writer.close());
+        try std.testing.expectEqual(writes, state.writes);
+        try std.testing.expectEqual(@as(usize, 0), state.closes);
+    }
+    try std.testing.expectEqual(@as(usize, 2), state.starts);
+    try std.testing.expectEqual(@as(usize, 2), state.writes);
 }
 
 test "missing linked callbacks leave a normal buffered context" {

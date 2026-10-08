@@ -18,6 +18,55 @@ const common = @import("../util/common.zig");
 
 const is_windows = builtin.os.tag == .windows;
 
+/// A stream-local writer; connection owners retain descriptor lifetime.
+/// Frame hooks distinguish a rejected next frame from uncertain partial output.
+pub const ControlledWriter = struct {
+    socket: *Socket,
+    control: WriteControl,
+    dispatched: bool = false,
+    header_block: bool = false,
+    header_dispatched: bool = false,
+    encoder_dirty: bool = false,
+    fn retire(self: *@This()) void {
+        const previous = self.socket.io.swapCancelProtection(.blocked);
+        defer _ = self.socket.io.swapCancelProtection(previous);
+        self.socket.shutdown();
+    }
+    pub fn beginEncoding(self: *@This()) !void {
+        try self.control.check();
+        self.encoder_dirty = true;
+    }
+    pub fn abortEncoding(self: *@This()) void {
+        if (self.encoder_dirty) self.retire();
+    }
+    pub fn beginFrame(self: *@This()) void {
+        self.dispatched = false;
+    }
+    pub fn finishFrame(self: *@This()) void {
+        self.dispatched = false;
+    }
+    pub fn beginHeaderBlock(self: *@This()) void {
+        self.header_block = true;
+        self.header_dispatched = false;
+    }
+    pub fn finishHeaderBlock(self: *@This()) void {
+        self.header_block = false;
+        self.header_dispatched = false;
+        self.encoder_dirty = false;
+    }
+    pub fn writeAll(self: *@This(), bytes: []const u8) !void {
+        errdefer if (self.dispatched or self.header_dispatched or self.encoder_dirty) self.retire();
+        try self.control.check();
+        if (bytes.len == 0) return;
+        self.dispatched = true;
+        if (self.header_block) self.header_dispatched = true;
+        try self.socket.sendAllControlled(bytes, self.control);
+    }
+    pub fn sendAll(self: *@This(), bytes: []const u8) !void {
+        return self.writeAll(bytes);
+    }
+};
+
 /// Borrowed original request controls for one output operation. Callbacks may
 /// run on the timeout monitor; they must not checkpoint or park a CPU grant.
 /// The remaining timeout must derive from the original absolute deadline.
@@ -33,6 +82,16 @@ pub const WriteControl = struct {
     pub fn check(self: WriteControl) !void {
         if (self.check_fn) |check_fn| try check_fn(self.ptr);
         if (self.remaining_ms_fn) |remaining| if (try remaining(self.ptr)) |ms| if (ms == 0) return error.Timeout;
+    }
+    pub fn lock(self: WriteControl, mutex: *Io.Mutex, io: Io) !void {
+        if (!self.active()) return mutex.lockUncancelable(io);
+        while (!mutex.tryLock()) {
+            try self.check();
+            const ms = (try self.timeout(10)).?;
+            try io.sleep(.fromMilliseconds(@intCast(ms)), .awake);
+        }
+        errdefer mutex.unlock(io);
+        try self.check();
     }
     pub fn timeout(self: WriteControl, configured: ?u64) !?u64 {
         try self.check();
@@ -328,7 +387,10 @@ pub const Socket = struct {
                 // executing Io task being cancelled. Preserve that original
                 // cause before recancel, which is only valid for runtime IO.
                 try control.check();
-                if (err == error.Canceled) self.io.recancel();
+                if (err == error.Canceled) {
+                    self.io.recancel();
+                    return error.Canceled;
+                }
                 try self.checkRequestCancellation();
                 if (err == error.Timeout or err == error.WouldBlock) {
                     try self.checkRequestDeadline();
@@ -2140,4 +2202,101 @@ test "Socket controlled fallback write retains the original deadline with zero a
 }
 test "Socket controlled fallback write observes original cancellation with zero async allowance" {
     try ControlledWriteTest.run(true, true);
+}
+
+test "Socket controlled framing retires uncertainty and preserves a rejected next frame" {
+    if (is_windows) return error.SkipZigTest;
+    const Mode = enum { partial, complete, encoder };
+    const Control = struct {
+        canceled: bool = false,
+        fn check(raw: ?*anyopaque) WriteControl.Error!void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.canceled) return error.Canceled;
+        }
+    };
+    const io = std.testing.io;
+    for (std.enums.values(Mode)) |mode| {
+        var listener = try TcpListener.init(.{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } }, io);
+        defer listener.deinit();
+        var sender = try Socket.connect(listener.getLocalAddress(), io);
+        defer sender.close();
+        sender.enableNativeTimeouts();
+        var accepted = try listener.accept();
+        defer accepted.socket.close();
+        accepted.socket.enableNativeTimeouts();
+        try accepted.socket.setRecvTimeout(25);
+        var control = Control{};
+        var writer = ControlledWriter{ .socket = &sender, .control = .{ .ptr = &control, .check_fn = Control.check } };
+        if (mode == .encoder) {
+            try writer.beginEncoding();
+        } else {
+            writer.beginFrame();
+            try writer.writeAll("hdr");
+            if (mode == .complete) {
+                writer.finishFrame();
+                writer.beginFrame();
+            }
+        }
+        control.canceled = true;
+        try std.testing.expectError(error.Canceled, writer.writeAll("later"));
+        var bytes: [3]u8 = undefined;
+        if (mode != .encoder) {
+            var received: usize = 0;
+            while (received < bytes.len) received += try accepted.socket.recv(bytes[received..]);
+            try std.testing.expectEqualStrings("hdr", &bytes);
+        }
+        if (mode == .complete) {
+            try std.testing.expectError(error.Timeout, accepted.socket.recv(&bytes));
+        } else try std.testing.expectEqual(@as(usize, 0), try accepted.socket.recv(&bytes));
+    }
+}
+
+test "Socket controlled uncertain output retires after actual fallback task cancellation" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var lane = Io.Threaded.init(std.testing.allocator, .{ .async_limit = .nothing, .concurrent_limit = .limited(4) });
+    defer lane.deinit();
+    const io = lane.io();
+    var listener = try TcpListener.init(.{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } }, io);
+    defer listener.deinit();
+    var sender = try Socket.connect(listener.getLocalAddress(), io);
+    defer sender.close();
+    var accepted = try listener.accept();
+    defer accepted.socket.close();
+    const buffer_size: u32 = 4096;
+    try Socket.setSocketOption(sender.handle, posix.SOL.SOCKET, posix.SO.SNDBUF, std.mem.asBytes(&buffer_size));
+    try Socket.setSocketOption(accepted.socket.handle, posix.SOL.SOCKET, posix.SO.RCVBUF, std.mem.asBytes(&buffer_size));
+    sender.enableNativeTimeouts();
+    try sender.setSendTimeout(5);
+    try TimedFallbackTest.fill(sender.handle);
+    try sender.setSendTimeout(0);
+    sender.native_timeouts = false;
+    sender.setRequestDeadline(common.milliTimestamp(io) + 10_000);
+    var original = ControlledWriteTest{ .io = io };
+    var writer = ControlledWriter{ .socket = &sender, .control = original.control() };
+    var started: Io.Event = .unset;
+    var call = try io.concurrent(struct {
+        fn run(sink: *ControlledWriter, ready: *Io.Event, active_io: Io) anyerror!void {
+            sink.beginFrame();
+            ready.set(active_io);
+            var data: [128 * 1024]u8 = @splat(0x61);
+            for (0..1024) |_| try sink.writeAll(&data);
+            return error.FixtureBufferDidNotFill;
+        }
+    }.run, .{ &writer, &started, io });
+    defer call.cancel(io) catch {};
+    try started.wait(io);
+    try io.sleep(.fromMilliseconds(50), .awake);
+    const before = common.milliTimestamp(io);
+    try std.testing.expectError(error.Canceled, call.cancel(io));
+    try std.testing.expect(common.milliTimestamp(io) - before < 1000);
+    // The original application control was never cancelled. This exercises
+    // runtime task cancellation and protected retirement, not the monitor path.
+    try std.testing.expect(!original.canceled.load(.acquire));
+    accepted.socket.enableNativeTimeouts();
+    try accepted.socket.setRecvTimeout(1000);
+    var bytes: [64 * 1024]u8 = undefined;
+    for (0..1024) |_| {
+        if (try accepted.socket.recv(&bytes) == 0) return;
+    }
+    return error.FixtureRetirementNotObserved;
 }

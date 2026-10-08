@@ -1058,12 +1058,17 @@ pub const Context = struct {
         stream_id: u31,
         io: Io,
         closed: bool = false,
+        control: @import("../net/socket.zig").WriteControl = .{},
 
         /// Sends data as DATA frames without END_STREAM.
         /// Blocks if the flow-control window is exhausted, resuming
         /// when WINDOW_UPDATE frames are received from the peer.
         pub fn write(self: *H2StreamWriter, data: []const u8) !void {
             if (self.closed) return error.StreamClosed;
+            if (self.control.active()) {
+                var writer = @import("../net/socket.zig").ControlledWriter{ .socket = self.sock, .control = self.control };
+                return self.h2.writeDataBlockingControlled(&writer, self.stream_id, data, false, self.control);
+            }
             self.h2.write_mutex.lockUncancelable(self.io);
             defer self.h2.write_mutex.unlock(self.io);
             try self.h2.writeDataBlocking(self.sock, self.stream_id, data, false);
@@ -1073,6 +1078,10 @@ pub const Context = struct {
         pub fn close(self: *H2StreamWriter) !void {
             if (self.closed) return;
             self.closed = true;
+            if (self.control.active()) {
+                var writer = @import("../net/socket.zig").ControlledWriter{ .socket = self.sock, .control = self.control };
+                return self.h2.writeDataBlockingControlled(&writer, self.stream_id, &.{}, true, self.control);
+            }
             self.h2.write_mutex.lockUncancelable(self.io);
             defer self.h2.write_mutex.unlock(self.io);
             try self.h2.writeData(self.sock, self.stream_id, &.{}, true);
@@ -1084,8 +1093,12 @@ pub const Context = struct {
         pub fn sendTrailers(self: *H2StreamWriter, trailers: []const hpack.HeaderEntry) !void {
             if (self.closed) return error.StreamClosed;
             self.closed = true;
-            self.h2.write_mutex.lockUncancelable(self.io);
+            try self.control.lock(&self.h2.write_mutex, self.io);
             defer self.h2.write_mutex.unlock(self.io);
+            if (self.control.active()) {
+                var writer = @import("../net/socket.zig").ControlledWriter{ .socket = self.sock, .control = self.control };
+                return self.h2.sendHeaders(&writer, self.stream_id, trailers, true);
+            }
             try self.h2.sendHeaders(self.sock, self.stream_id, trailers, true);
         }
     };
@@ -1094,6 +1107,11 @@ pub const Context = struct {
     /// DATA frames. The handler must call `writer.close()` when done.
     /// Only available for HTTP/2 streams.
     pub fn streamH2(self: *Self, status_code: u16, extra_headers: []const hpack.HeaderEntry) !H2StreamWriter {
+        return self.streamH2Controlled(status_code, extra_headers, .{});
+    }
+
+    pub fn streamH2Controlled(self: *Self, status_code: u16, extra_headers: []const hpack.HeaderEntry, control: @import("../net/socket.zig").WriteControl) !H2StreamWriter {
+        try control.check();
         const h2 = self.h2 orelse return error.NotH2;
         const sock = self.h2_sock orelse return error.NotH2;
 
@@ -1106,12 +1124,15 @@ pub const Context = struct {
         );
         defer self.allocator.free(h2_headers);
 
-        h2.write_mutex.lockUncancelable(self.io);
+        try control.lock(&h2.write_mutex, self.io);
         defer h2.write_mutex.unlock(self.io);
-        try h2.sendHeaders(sock, self.h2_stream_id, h2_headers, false);
+        if (control.active()) {
+            var writer = @import("../net/socket.zig").ControlledWriter{ .socket = sock, .control = control };
+            try h2.sendHeaders(&writer, self.h2_stream_id, h2_headers, false);
+        } else try h2.sendHeaders(sock, self.h2_stream_id, h2_headers, false);
 
         self.h2_stream_sent = true;
-        return .{ .h2 = h2, .sock = sock, .stream_id = self.h2_stream_id, .io = self.io };
+        return .{ .h2 = h2, .sock = sock, .stream_id = self.h2_stream_id, .io = self.io, .control = control };
     }
 
     /// Unified streaming response writer for both HTTP/1.1 and HTTP/2.
@@ -1125,10 +1146,12 @@ pub const Context = struct {
         h2_writer: ?H2StreamWriter,
         delegate: ?StreamDelegate = null,
         closed: bool = false,
+        control: @import("../net/socket.zig").WriteControl = .{},
 
         /// Sends a chunk of data to the client.
         pub fn write(self: *StreamWriter, data: []const u8) !void {
             if (self.closed) return error.StreamClosed;
+            try self.control.check();
             if (data.len == 0) return;
 
             if (self.delegate) |delegate| {
@@ -1136,7 +1159,10 @@ pub const Context = struct {
             } else if (self.h2_writer) |*w| {
                 try w.write(data);
             } else if (self.h1_sock) |sock| {
-                try writeH1Chunk(sock, data);
+                if (self.control.active()) {
+                    var writer = @import("../net/socket.zig").ControlledWriter{ .socket = sock, .control = self.control };
+                    try writeH1Chunk(&writer, data);
+                } else try writeH1Chunk(sock, data);
             } else return error.StreamClosed;
         }
 
@@ -1165,6 +1191,7 @@ pub const Context = struct {
         /// Sends the terminating chunk / END_STREAM.
         pub fn close(self: *StreamWriter) !void {
             if (self.closed) return;
+            try self.control.check();
             self.closed = true;
 
             if (self.delegate) |delegate| {
@@ -1173,7 +1200,10 @@ pub const Context = struct {
                 try w.close();
             } else if (self.h1_sock) |sock| {
                 // Terminating chunk: "0\r\n\r\n"
-                try sock.sendAll("0\r\n\r\n");
+                if (self.control.active()) {
+                    var writer = @import("../net/socket.zig").ControlledWriter{ .socket = sock, .control = self.control };
+                    try writer.writeAll("0\r\n\r\n");
+                } else try sock.sendAll("0\r\n\r\n");
             }
         }
 
@@ -1259,12 +1289,17 @@ pub const Context = struct {
     /// type. This is the general body-streaming primitive; `streamResponse`
     /// remains the SSE convenience wrapper.
     pub fn streamResponseWithContentType(self: *Self, status_code: u16, content_type: []const u8) !StreamWriter {
+        return self.streamResponseWithContentTypeControlled(status_code, content_type, .{});
+    }
+
+    pub fn streamResponseWithContentTypeControlled(self: *Self, status_code: u16, content_type: []const u8, control: @import("../net/socket.zig").WriteControl) !StreamWriter {
+        try control.check();
         if (self.stream_delegate) |delegate| {
             _ = try self.response.header(HeaderName.CONTENT_TYPE, content_type);
             self.response.headers.removeAll(HeaderName.CONTENT_LENGTH);
             self.response.headers.removeAll(HeaderName.TRANSFER_ENCODING);
             try delegate.start(delegate.ptr, status_code, content_type, &self.response.headers);
-            return .{ .h1_sock = null, .h2_writer = null, .delegate = delegate };
+            return .{ .h1_sock = null, .h2_writer = null, .delegate = delegate, .control = control };
         }
         // Middleware has already established response policy (e.g. CORS).
         // Copy it before committing headers, then let the transport own the
@@ -1279,8 +1314,8 @@ pub const Context = struct {
             var extra = std.ArrayListUnmanaged(hpack.HeaderEntry).empty;
             defer extra.deinit(self.allocator);
             try appendH2ResponseHeaders(self.allocator, &extra, &headers);
-            const h2w = try self.streamH2(status_code, extra.items);
-            return .{ .h1_sock = null, .h2_writer = h2w };
+            const h2w = try self.streamH2Controlled(status_code, extra.items, control);
+            return .{ .h1_sock = null, .h2_writer = h2w, .control = control };
         }
 
         // HTTP/1.1 path — send headers with Transfer-Encoding: chunked
@@ -1301,10 +1336,13 @@ pub const Context = struct {
         // Serialize headers only (no body)
         const header_bytes = try serializeToSlice(self.allocator, &resp);
         defer self.allocator.free(header_bytes);
-        try sock.sendAll(header_bytes);
+        if (control.active()) {
+            var writer = @import("../net/socket.zig").ControlledWriter{ .socket = sock, .control = control };
+            try writer.writeAll(header_bytes);
+        } else try sock.sendAll(header_bytes);
 
         self.h1_stream_sent = true;
-        return .{ .h1_sock = sock, .h2_writer = null };
+        return .{ .h1_sock = sock, .h2_writer = null, .control = control };
     }
 };
 
@@ -7224,4 +7262,50 @@ test "protected dispatch H2 payload OOM leaves the connection usable for status"
     while (!control.completed) _ = try peer.processOneFrame(&socket, &socket);
     try std.testing.expectEqualStrings("ready", control.data_buf.items);
     try std.testing.expectEqual(@as(usize, 0), server.body_budget.stats().in_use);
+}
+
+test "HTTP controlled streaming rejects expired headers and retains controls on delegated chunks" {
+    const Control = struct {
+        denied: bool = true,
+        fn check(raw: ?*anyopaque) @import("../net/socket.zig").WriteControl.Error!void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.denied) return error.Timeout;
+        }
+    };
+    const Sink = struct {
+        starts: usize = 0,
+        writes: usize = 0,
+        closes: usize = 0,
+        fn start(raw: ?*anyopaque, _: u16, _: []const u8, _: *const Headers) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.starts += 1;
+        }
+        fn write(raw: ?*anyopaque, _: []const u8) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.writes += 1;
+        }
+        fn close(raw: ?*anyopaque) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.closes += 1;
+        }
+    };
+    var request = try Request.init(std.testing.allocator, .GET, "/stream");
+    defer request.deinit();
+    var context = Context.init(std.testing.allocator, std.testing.io, &request);
+    defer context.deinit();
+    var control = Control{};
+    var sink = Sink{};
+    context.stream_delegate = .{ .ptr = &sink, .start = Sink.start, .write = Sink.write, .close = Sink.close };
+    const view: @import("../net/socket.zig").WriteControl = .{ .ptr = &control, .check_fn = Control.check };
+    try std.testing.expectError(error.Timeout, context.streamResponseWithContentTypeControlled(200, "text/plain", view));
+    try std.testing.expectEqual(@as(usize, 0), sink.starts);
+    control.denied = false;
+    var writer = try context.streamResponseWithContentTypeControlled(200, "text/plain", view);
+    try writer.write("body");
+    control.denied = true;
+    try std.testing.expectError(error.Timeout, writer.write("later"));
+    try std.testing.expectError(error.Timeout, writer.close());
+    try std.testing.expectEqual(@as(usize, 1), sink.starts);
+    try std.testing.expectEqual(@as(usize, 1), sink.writes);
+    try std.testing.expectEqual(@as(usize, 0), sink.closes);
 }
