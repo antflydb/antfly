@@ -370,12 +370,26 @@ test('every expensive worker is gated, pins its checkout, and disables automatic
   }
   for (const file of fs.readdirSync(root)) {
     const text=fs.readFileSync(path.join(root,file),'utf8');
-    if (file!=='pr-ci-controller.yml') assert.doesNotMatch(text,/^  pull_request(?:_target)?:/m,file);
+    // The license boundary is a lightweight, read-only source check. Main
+    // runs it directly on PRs; expensive suites still require admission.
+    if (!['pr-ci-controller.yml', 'apache-license.yml'].includes(file)) {
+      assert.doesNotMatch(text,/^  pull_request(?:_target)?:/m,file);
+    }
     if (file.startsWith('pr-ci')) {
       assert.doesNotMatch(text,/PR_CI_MEMBERS_TOKEN|PR_CI_APPROVERS|create-github-app-token/,file);
       assert.doesNotMatch(text,/secrets: inherit/,file);
     }
   }
+});
+
+test('automatic license checks remain read-only and use the unprivileged PR event', () => {
+  const text=fs.readFileSync(path.resolve(__dirname,'../workflows/apache-license.yml'),'utf8');
+  assert.match(text,/^  pull_request:/m);
+  assert.doesNotMatch(text,/^  pull_request_target:/m);
+  assert.match(text,/^permissions:\n  contents: read\n/m);
+  assert.doesNotMatch(text,/\bwrite\b|secrets\.|secrets: inherit|self-hosted/);
+  assert.match(text,/persist-credentials: false/);
+  assert.match(text,/runs-on: ubuntu-latest/);
 });
 
 test('policy validates the executing workflow even when a release predates the controller', () => {

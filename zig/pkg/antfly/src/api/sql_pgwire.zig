@@ -239,8 +239,7 @@ pub const Adapter = struct {
         const self: *Adapter = @ptrCast(@alignCast(raw));
         const id = @import("distributed_txn.zig").parseTxnIdHex(session_id orelse return) catch return;
         const credential: *Credential = @ptrCast(@alignCast(identity.context));
-        const runtime = self.server.cfg.backend_runtime orelse return;
-        var io = runtime.io() orelse return;
+        const io = http.ApiHttpServer.configuredDurableIo(self.server.cfg) orelse return;
         const network_io = self.server.sharedApiNetworkIo() orelse return;
         const Cleanup = struct {
             server: *http.ApiHttpServer,
@@ -261,20 +260,19 @@ pub const Adapter = struct {
         var job = Cleanup{ .server = self.server, .principal = credential.sessionPrincipal(), .id = id, .completion_io = network_io };
         var future = io.concurrent(Cleanup.run, .{&job}) catch return;
         job.done.waitUncancelable(network_io);
-        _ = future.await(io);
+        @import("protected_future.zig").wait(io, &future);
     }
 
     fn dispatch(self: *Adapter, job: *Job) !void {
         try validateRequest(job.request);
         if (self.server.cfg.user_manager != job.credential.manager) return error.Unauthorized;
-        const runtime = self.server.cfg.backend_runtime orelse return error.SqlWriteCapacityUnavailable;
-        var io = runtime.io() orelse return error.SqlWriteCapacityUnavailable;
+        const io = http.ApiHttpServer.configuredDurableIo(self.server.cfg) orelse return error.SqlWriteCapacityUnavailable;
         var future = io.concurrent(Job.run, .{job}) catch return error.SqlWriteCapacityUnavailable;
         // Keep borrowed request storage alive through a durable decision. The
         // listener sets cancellation/deadline on shutdown, native checkpoints
         // observe it, and this adapter joins rather than abandoning the job.
         job.done.waitUncancelable(job.request.io);
-        _ = future.await(io);
+        @import("protected_future.zig").wait(io, &future);
         if (job.failure) |err| return err;
     }
 };
@@ -552,11 +550,10 @@ const StreamJob = struct {
     fn dispatch(self: *StreamJob) !void {
         try validateRequest(self.request);
         if (self.adapter.server.cfg.user_manager != self.credential.manager) return error.Unauthorized;
-        const backend_runtime = self.adapter.server.cfg.backend_runtime orelse return error.SqlWriteCapacityUnavailable;
-        const io = backend_runtime.io() orelse return error.SqlWriteCapacityUnavailable;
+        const io = http.ApiHttpServer.configuredDurableIo(self.adapter.server.cfg) orelse return error.SqlWriteCapacityUnavailable;
         var future = io.concurrent(run, .{self}) catch return error.SqlWriteCapacityUnavailable;
         self.done.waitUncancelable(self.request.io);
-        _ = future.await(io);
+        @import("protected_future.zig").wait(io, &future);
         if (self.failure) |err| return err;
     }
     fn run(self: *StreamJob) void {
@@ -846,6 +843,52 @@ const Job = struct {
         transferred = true;
     }
 };
+
+test "SQL pgwire dispatch preserves imported executor authority including unavailable views" {
+    const Probe = struct {
+        attempts: usize = 0,
+        fn concurrent(raw: ?*anyopaque, _: usize, _: std.mem.Alignment, _: []const u8, _: std.mem.Alignment, _: *const fn (*const anyopaque, *anyopaque) void) std.Io.ConcurrentError!*std.Io.AnyFuture {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.attempts += 1;
+            return error.ConcurrencyUnavailable;
+        }
+    };
+    var raw_probe: Probe = .{};
+    var imported_probe: Probe = .{};
+    var vtable = std.Io.failing.vtable.*;
+    vtable.concurrent = Probe.concurrent;
+    const raw_io: std.Io = .{ .userdata = &raw_probe, .vtable = &vtable };
+    const imported_io: std.Io = .{ .userdata = &imported_probe, .vtable = &vtable };
+    var runtime = try @import("antfly_local_sources").storage_background_runtime.BackendRuntimeHandle.init(std.testing.allocator, .{
+        .backend = .manual,
+        .borrowed_io = .{ .general = raw_io },
+    });
+    defer runtime.deinit();
+    // Dispatch must reject or schedule before dereferencing either object.
+    var manager: usermgr.UserManager = undefined;
+    var credential: Credential = undefined;
+    credential.manager = &manager;
+    var api: http.ApiHttpServer = undefined;
+    api.cfg = .{ .backend_runtime = runtime.ptr(), .user_manager = &manager, .imported_runtime_io = .{} };
+    var adapter: Adapter = .{ .server = &api };
+    var canceled: std.atomic.Value(bool) = .init(false);
+    const request: wire.Request = .{
+        .statement = "SELECT id FROM docs",
+        .limit = 1,
+        .io = std.testing.io,
+        .deadline = .{ .clock = .awake, .raw = .{ .nanoseconds = std.math.maxInt(i96) } },
+        .cancel_requested = &canceled,
+    };
+    for ([_]?std.Io{ null, imported_io }, 0..) |executor, i| {
+        api.cfg.imported_runtime_io.?.durable = executor;
+        var job: Job = .{ .adapter = &adapter, .alloc = std.testing.allocator, .credential = &credential, .request = request, .kind = .execute };
+        try std.testing.expectError(error.SqlWriteCapacityUnavailable, adapter.dispatch(&job));
+        var stream: StreamJob = .{ .adapter = &adapter, .alloc = std.testing.allocator, .credential = &credential, .request = request };
+        try std.testing.expectError(error.SqlWriteCapacityUnavailable, stream.dispatch());
+        try std.testing.expectEqual(@as(usize, 0), raw_probe.attempts);
+        try std.testing.expectEqual(i * 2, imported_probe.attempts);
+    }
+}
 
 test "SQL pgwire execute arguments use bounded scalar semantics without table access" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);

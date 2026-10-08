@@ -1711,6 +1711,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     lib_bedrock_test_step.dependOn(&run_lib_bedrock_tests.step);
 
     const api_http_runtime_default_filters = [_][]const u8{
+        "caller cancellation does not interrupt protected child work",
+        "httpx SQL dispatch preserves imported executor authority including unavailable views",
+        "SQL pgwire dispatch preserves imported executor authority including unavailable views",
         "ChatGPT connector policy",
         "storage-kernel query request preserves final projection while raw retrieval defers it",
         "api http server executes direct foreign table aggregations through registry",
@@ -6380,6 +6383,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.source_publication_job.",
             "storage.db.mod.",
             "storage.db.native_backup.",
+            "storage.db.snapshot_staging.",
             "storage.db.ownership.",
             "storage.db.planning_stats.",
             "storage.db.planning_bindings.",

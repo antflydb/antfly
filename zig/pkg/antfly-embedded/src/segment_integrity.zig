@@ -164,24 +164,15 @@ pub const PagedSource = struct {
         @import("antfly_platform").sync.lockYielding(&self.mutex);
         self.cached_page = null;
         self.mutex.unlock();
-        try self.ensureBudget();
+        self.ensureBudget() catch return self.readUncached(index, offset, length, within, out);
         if (self.buffer.len == 0) {
-            const buffer = self.bufferAllocator().alloc(u8, @intCast(@min(page_size, self.directory.offset))) catch |err| {
-                if (self.budget == null or !self.budget.?.budget_denied) return err;
+            const buffer = self.bufferAllocator().alloc(u8, @intCast(@min(page_size, self.directory.offset))) catch {
+                // The caller allocator may also impose a hard limit. This
+                // buffer is optional regardless of who denied admission.
                 // Mandatory authentication uses fixed worker scratch when
                 // the optional shared cache is full. No uncharged heap page
                 // survives pressure or scales with open reader count.
-                var scratch: [8192]u8 = undefined;
-                const actual = try self.original.checksum(offset, length, &scratch);
-                var expected: [4]u8 = undefined;
-                try self.original.readInto(self.directory.offset + @as(u64, index) * 4, &expected);
-                if (actual != std.mem.readInt(u32, &expected, .big)) {
-                    state.store(2, .release);
-                    return error.CrcMismatch;
-                }
-                state.store(1, .release);
-                try self.original.readInto(offset + within, out);
-                return;
+                return self.readUncached(index, offset, length, within, out);
             };
             @import("antfly_platform").sync.lockYielding(&self.mutex);
             self.buffer = buffer;
@@ -199,6 +190,20 @@ pub const PagedSource = struct {
         defer self.mutex.unlock();
         self.cached_page = index;
         @memcpy(out, self.buffer[within..][0..out.len]);
+    }
+    fn readUncached(self: *PagedSource, index: usize, offset: u64, length: usize, within: usize, out: []u8) !void {
+        const state = &self.validations[index];
+        var scratch: [8192]u8 = undefined;
+        const actual = try self.original.checksum(offset, length, &scratch);
+        var expected: [4]u8 = undefined;
+        try self.original.readInto(self.directory.offset + @as(u64, index) * 4, &expected);
+        if (actual != std.mem.readInt(u32, &expected, .big)) {
+            state.store(2, .release);
+            return error.CrcMismatch;
+        }
+        state.store(1, .release);
+        try self.original.readInto(offset + within, out);
+        return;
     }
     fn read(ptr: *anyopaque, offset: u64, out: []u8) !void {
         const self: *PagedSource = @ptrCast(@alignCast(ptr));

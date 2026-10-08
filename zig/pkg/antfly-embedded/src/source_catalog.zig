@@ -464,6 +464,7 @@ pub const storage_db_schema_cache_admission = @import("storage/db/schema_cache_a
 pub const storage_db_schema_registry = @import("storage/db/schema_registry.zig");
 pub const storage_db_selected_root = @import("storage/db/selected_root.zig");
 pub const storage_db_snapshot_admission = @import("storage/db/snapshot_admission.zig");
+pub const storage_db_snapshot_staging = @import("storage/db/snapshot_staging.zig");
 pub const storage_db_source_artifact_batch = @import("storage/db/source_artifact_batch.zig");
 pub const storage_db_source_artifact_transfer = @import("storage/db/source_artifact_transfer.zig");
 pub const storage_db_source_pin = @import("storage/db/source_pin.zig");

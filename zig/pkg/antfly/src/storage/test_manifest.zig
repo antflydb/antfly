@@ -266,6 +266,7 @@ comptime {
     _ = @import("antfly_local_sources").storage_db_resolution_runtime;
     _ = @import("antfly_local_sources").storage_db_root_identity;
     _ = @import("antfly_local_sources").storage_db_snapshot_admission;
+    _ = @import("antfly_local_sources").storage_db_snapshot_staging;
     _ = @import("antfly_local_sources").storage_db_template_remote_stub;
     _ = @import("antfly_local_sources").storage_db_template_stub;
     _ = @import("antfly_local_sources").storage_db_text_memory_stats;
