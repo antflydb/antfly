@@ -313,3 +313,10 @@ Nix/glibc scheduler, ABI and real-owner/subprocess gates pass; see
 [fail-fast acquisition receipts](receipts/2026-10-07/fail-fast-runnable-acquisition/README.md).
 Independent transport cleanup wiring and its own bounded count/byte subquota
 must still preserve health/control headroom. Full default-enablement proof is pending.
+
+
+The earlier physical output-wait checkpoint now has terminal native and pinned
+Nix/glibc full production archive/provider gates, with all 27 exact source hashes
+verified; see [production pair](receipts/2026-10-07/output-wait-production-pair/README.md).
+This predates the later ownership/cleanup/cause fixes and runnable ABI 2; it does
+not qualify the current revision or default enablement. Current gates remain queued.
