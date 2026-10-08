@@ -14,7 +14,8 @@
 // limitations under the License.
 
 //! Schema-bound flat SQL array payloads. This module owns no memory and has no
-//! SQL execution or native-store dependencies. All integers are little endian.
+//! SQL execution or native-store dependencies. Framing integers are little
+//! endian; typed payloads retain their own codecs (NUMERIC is PostgreSQL binary).
 //! The enclosing immutable column owns element identity and checksum coverage.
 //!
 //! v1: version:u8, rank:u8, flags:u16, count:u32; rank (length:u32, lower:i32)
@@ -210,6 +211,10 @@ pub const View = struct {
                 },
                 .text => if (!std.unicode.utf8ValidateSlice(raw.bytes) or std.mem.indexOfScalar(u8, raw.bytes, 0) != null) return error.SqlInvalidTextEncoding,
                 .jsonb => if (raw.bytes.len == 0) return error.InvalidSqlArrayStorage,
+                .numeric => _ = @import("sql_numeric_layout.zig").View.open(raw.bytes, .{ .bytes = limits.bytes }) catch |err| return switch (err) {
+                    error.InvalidSqlBinaryRepresentation => error.InvalidSqlArrayStorage,
+                    else => err,
+                },
                 else => {},
             }
         }
@@ -223,8 +228,8 @@ pub const View = struct {
     }
 
     /// Logical identity, deliberately independent of frame version, dense vs
-    /// compact slots, offsets and padding. JSONB bytes must have crossed the
-    /// owning codec's canonical validation gate before hashing.
+    /// compact slots, offsets and padding. JSONB and NUMERIC bytes must have
+    /// crossed their canonical validation gates before hashing.
     pub fn updateLogicalHash(self: View, hasher: *std.crypto.hash.Blake3) void {
         hasher.update("sql-array-logical-v1");
         hasher.update(&.{ @backingInt(self.kind), self.rank });
@@ -241,9 +246,12 @@ pub const View = struct {
             if (raw.sql_null) continue;
             std.mem.writeInt(u64, &number, raw.bytes.len, .little);
             hasher.update(&number);
-            // PostgreSQL equality identifies the two zero signs. Physical
-            // encoding preserves them, while semantic identity does not.
-            if ((self.kind == .float32 and std.mem.readInt(u32, raw.bytes[0..4], .little) & 0x7fffffff == 0) or
+            // NUMERIC display scale and floating zero signs survive physical
+            // encoding, but are not part of PostgreSQL logical equality.
+            if (self.kind == .numeric) {
+                const numeric = @import("sql_numeric_layout.zig").View.openAuthenticated(raw.bytes, .{}) catch unreachable;
+                numeric.updateLogicalHash(hasher);
+            } else if ((self.kind == .float32 and std.mem.readInt(u32, raw.bytes[0..4], .little) & 0x7fffffff == 0) or
                 (self.kind == .float64 and std.mem.readInt(u64, raw.bytes[0..8], .little) & 0x7fffffffffffffff == 0))
             {
                 @memset(&number, 0);

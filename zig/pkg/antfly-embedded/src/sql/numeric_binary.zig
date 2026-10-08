@@ -10,6 +10,33 @@ const Context = numeric.Context;
 const Value = numeric.Value;
 const A = std.mem.Allocator;
 pub const Options = struct { modifier: ?numeric.TypeModifier = null };
+pub const layout = @import("../common/sql_numeric_layout.zig");
+
+/// Own canonical stored coefficients directly. Unlike PostgreSQL receiver
+/// input, this boundary never normalizes padded groups, hidden fractional
+/// digits, negative zero or ignored special-value metadata.
+pub fn decodeCanonical(ctx: *Context, bytes: []const u8) !numeric.Owned {
+    const view = try layout.View.openWithBudget(bytes, .{ .bytes = ctx.max_input_bytes, .groups = ctx.max_groups }, ctx);
+    try ctx.charge(view.count);
+    const digits: []u16 = if (view.count == 0) &.{} else try ctx.alloc.alloc(u16, view.count);
+    errdefer ctx.alloc.free(digits);
+    for (digits, 0..) |*digit, i| {
+        try ctx.charge(1);
+        digit.* = view.group(i);
+    }
+    return .{ .alloc = ctx.alloc, .allocation = digits, .value = .{
+        .kind = switch (view.kind) {
+            .finite => .finite,
+            .nan => .nan,
+            .positive_infinity => .positive_infinity,
+            .negative_infinity => .negative_infinity,
+        },
+        .negative = view.negative,
+        .weight = view.weight,
+        .scale = if (view.kind == .finite) view.scale else 0,
+        .digits = digits,
+    } };
+}
 
 fn sign(value: Value) u16 {
     return switch (value.kind) {
@@ -171,7 +198,15 @@ test "SQL exact NUMERIC binary validates before output and preserves admission a
     ctx = .{ .alloc = failing.allocator() };
     const malformed = [_]u8{ 0, 1, 0, 0, 0, 0, 0, 0, 0x27, 0x10 };
     try std.testing.expectError(error.InvalidSqlBinaryRepresentation, decode(&ctx, &malformed, .{}));
+    try std.testing.expectError(error.InvalidSqlBinaryRepresentation, decodeCanonical(&ctx, &malformed));
     try std.testing.expectEqual(@as(usize, 0), failing.alloc_index);
+    const canonical = [_]u8{ 0, 1, 0, 0, 0, 0, 0, 0, 0, 1 };
+    ctx = .{ .alloc = a, .max_groups = 0 };
+    try std.testing.expectError(error.SqlProgramLimitExceeded, decodeCanonical(&ctx, &canonical));
+    try std.testing.expectError(error.SqlProgramLimitExceeded, ctx.charge(0));
+    ctx = .{ .alloc = a, .remaining = 1 };
+    try std.testing.expectError(error.SqlProgramLimitExceeded, decodeCanonical(&ctx, &canonical));
+    try std.testing.expectError(error.SqlProgramLimitExceeded, ctx.charge(0));
 }
 
 test "SQL exact NUMERIC binary cancellation is sticky at every observed checkpoint" {
@@ -199,6 +234,9 @@ test "SQL exact NUMERIC binary cancellation is sticky at every observed checkpoi
             const encoded = try encodeAlloc(ctx, value.value);
             defer ctx.alloc.free(encoded);
             try std.testing.expectEqualSlices(u8, input, encoded);
+            var canonical = try decodeCanonical(ctx, encoded);
+            defer canonical.deinit();
+            try std.testing.expectEqual(std.math.Order.eq, try numeric.order(ctx, value.value, canonical.value));
             const text = try numeric.format(ctx, value.value);
             defer ctx.alloc.free(text);
         }
@@ -227,7 +265,7 @@ test "SQL exact NUMERIC binary ownership unwinds every allocation failure" {
             defer decoded.deinit();
             const encoded = try encodeAlloc(&ctx, decoded.value);
             defer a.free(encoded);
-            var roundtrip = try decode(&ctx, encoded, .{});
+            var roundtrip = try decodeCanonical(&ctx, encoded);
             defer roundtrip.deinit();
             const text = try numeric.format(&ctx, roundtrip.value);
             defer a.free(text);
@@ -312,6 +350,25 @@ test "SQL exact NUMERIC binary codec matches real PostgreSQL sender and receiver
         try encode(&ctx, value.value, &writer);
         try std.testing.expectEqual(@as(usize, 0), failing.alloc_index);
         try std.testing.expectEqualSlices(u8, expected, writer.buffered());
+        // Storage admission needs no coefficient allocation or normalization.
+        const borrowed = try layout.View.openWithBudget(expected, .{}, &ctx);
+        var logical_hash = std.crypto.hash.Blake3.init(.{});
+        var borrowed_hash = std.crypto.hash.Blake3.init(.{});
+        try numeric.hash(&ctx, value.value, &logical_hash);
+        borrowed.updateLogicalHash(&borrowed_hash);
+        var logical_digest: [32]u8 = undefined;
+        var borrowed_digest: [32]u8 = undefined;
+        logical_hash.final(&logical_digest);
+        borrowed_hash.final(&borrowed_digest);
+        try std.testing.expectEqualSlices(u8, &logical_digest, &borrowed_digest);
+        try std.testing.expectEqual(@as(usize, 0), failing.alloc_index);
+        var counted = std.testing.FailingAllocator.init(a, .{});
+        var stored_ctx: Context = .{ .alloc = counted.allocator() };
+        var stored = try decodeCanonical(&stored_ctx, expected);
+        defer stored.deinit();
+        try std.testing.expectEqual(std.math.Order.eq, try numeric.order(&stored_ctx, value.value, stored.value));
+        try std.testing.expectEqual(value.value.scale, stored.value.scale);
+        try std.testing.expectEqual(@as(usize, @intFromBool(borrowed.count != 0)), counted.alloc_index);
     }
     for (fixture.value.receivers) |entry| {
         var ctx: Context = .{ .alloc = a };
@@ -336,5 +393,38 @@ test "SQL exact NUMERIC binary codec matches real PostgreSQL sender and receiver
         var digest: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(text, &digest, .{});
         try std.testing.expectEqualStrings(entry.expected.?.sha256, &std.fmt.bytesToHex(digest, .lower));
+    }
+}
+
+test "SQL exact NUMERIC borrowed storage admission agrees with receiver canonicalization under byte faults" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "0.00", "-1.2300", "12345678901234567890.0012", "1e131068", "0.00000001", "NaN", "Infinity", "-Infinity" }) |text| {
+        var ctx: Context = .{ .alloc = a };
+        var value = try numeric.parse(&ctx, text);
+        defer value.deinit();
+        const bytes = try encodeAlloc(&ctx, value.value);
+        defer a.free(bytes);
+        for (0..bytes.len) |index| for (0..8) |bit| {
+            bytes[index] ^= @as(u8, 1) << @intCast(bit);
+            defer bytes[index] ^= @as(u8, 1) << @intCast(bit);
+            var receiver_ctx: Context = .{ .alloc = a };
+            const canonical = canonical: {
+                var received = decode(&receiver_ctx, bytes, .{}) catch |err| switch (err) {
+                    error.SqlProtocolViolation, error.InvalidSqlBinaryRepresentation, error.InvalidSqlNumber => break :canonical false,
+                    else => return err,
+                };
+                defer received.deinit();
+                const normalized = try encodeAlloc(&receiver_ctx, received.value);
+                defer a.free(normalized);
+                break :canonical std.mem.eql(u8, bytes, normalized);
+            };
+            var none = std.heap.FixedBufferAllocator.init(&.{});
+            var borrowed_ctx: Context = .{ .alloc = none.allocator() };
+            const accepted = if (layout.View.openWithBudget(bytes, .{}, &borrowed_ctx)) |_| true else |err| rejected: {
+                try std.testing.expectEqual(error.InvalidSqlBinaryRepresentation, err);
+                break :rejected false;
+            };
+            try std.testing.expectEqual(canonical, accepted);
+        };
     }
 }

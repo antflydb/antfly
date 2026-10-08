@@ -5151,3 +5151,48 @@ verifies all 893 oracle contracts; formatting, whitespace and original-case
 integrity checks pass. The inventory remains 448 implemented, 136 rejected,
 73 superseded and 929 unresolved; the family audit identifies DDL (340 open
 contracts) as the largest remaining original-case family.
+
+### Exact NUMERIC native array admission and logical hashing
+
+The common NUMERIC layout boundary now validates borrowed canonical PostgreSQL
+binary payloads without allocating coefficients or depending on SQL execution.
+It rejects malformed groups, padding, negative zero, hidden fractional digits
+and ignored/noncanonical special-value metadata. PostgreSQL parameter input
+continues through its deliberately permissive receiver-normalization boundary;
+restoration never repairs imported bytes into another physical representation.
+
+Native SQL-array publication/restore validates every NUMERIC payload through
+this boundary. Logical array hashes use canonical coefficient identity rather
+than the scale-bearing wire header, so equal values such as 1.2 and 1.20 hash
+equally while retaining distinct physical bytes and display scales. Shape,
+lower bounds, SQL NULL placement and unequal values retain distinct identities.
+Owned canonical decoding copies significant coefficients directly rather than
+normalizing receiver input and then verifying the normalized result.
+
+Evidence covers all 65 independent PostgreSQL sender fixtures, hash equivalence
+with the logical kernel, single-bit mutation agreement with receiver/re-encoding
+canonicalization, zero-allocation borrowed checks, allocation faults, sticky
+work/cancellation failures, checksum-valid malformed AROW rejection and native
+prepared/read/restore hash and byte round trips. A 4,096-element fixture compares
+borrowed validation with full owned decoding; these local microbenchmarks are
+not end-to-end workload latency measurements.
+
+The native schema identity fixture also explicitly proves scalar NUMERIC cannot
+be mislabeled as an f64 column. Native scalar catalog/row/index/expression-VM
+activation, typmods, broader functions and mixed-domain join normalization remain
+unfinished. Original inventory dispositions are unchanged by this prerequisite.
+
+Validation passes `zig build sql-test pgwire-test check-openapi`: 579 local SQL
+tests (three existing skips), 226 server SQL tests, and the pgwire/OpenAPI gates.
+The focused native gate passes 12 array/schema/projection contracts. PostgreSQL
+18 independently re-verifies all 65 binary senders and 47 receivers. Formatting,
+whitespace and original inventory integrity checks pass; dispositions remain
+448 implemented, 136 rejected, 73 superseded and 929 unresolved.
+
+Two single-shot ReleaseFast samples of the 98,836-byte, 4,096-element fixture
+measured borrowed validation at 24–34 microseconds with zero allocations and
+owned decoding at 194–208 microseconds with four backing allocations. These
+measure different tasks, not competing complete query plans. The first compile
+reported a 3.44 GB peak against a 3.22 GB declared RSS claim; a cached rerun and
+both runtime samples pass, but this does not prove cold compilation fits that
+resource claim. The final Debug fixture also passes validation and owned decode.

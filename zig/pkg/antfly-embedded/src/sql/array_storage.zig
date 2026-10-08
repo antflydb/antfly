@@ -192,13 +192,17 @@ fn decodeAdmitted(a: A, owner: A, expected: arrays.ElementType, bytes: []const u
             continue;
         }
         if (expected == .numeric) {
-            cell.* = try @import("scalar.zig").numericBinaryLeaky(a, raw.bytes, &work);
-            var ctx: @import("numeric_value.zig").Context = .{ .alloc = a, .remaining = work.remaining, .max_output_bytes = options.wire_bytes };
+            const numeric = @import("numeric_value.zig");
+            var ctx: numeric.Context = .{ .alloc = a, .remaining = work.remaining, .max_input_bytes = options.wire_bytes, .max_groups = options.values.bytes / 2 };
             defer work.remaining = @intCast(ctx.remaining);
-            @import("numeric_binary.zig").verifyCanonical(&ctx, raw.bytes, cell.numeric.?.*) catch |err| return switch (err) {
+            var parsed = @import("numeric_binary.zig").decodeCanonical(&ctx, raw.bytes) catch |err| return switch (err) {
                 error.InvalidSqlBinaryRepresentation => error.InvalidSqlArrayStorage,
                 else => err,
             };
+            errdefer parsed.deinit();
+            const value = try a.create(numeric.Value);
+            value.* = parsed.value;
+            cell.* = arrays.Element.typedNumeric(value);
             continue;
         }
         cell.* = arrays.Element.json(switch (expected) {
@@ -229,7 +233,7 @@ fn decodeJsonb(a: A, owner: A, bytes: []const u8, work: *arrays.Budget) !std.jso
 }
 
 /// Strict publication/restore check without allocating the flat SQL cell
-/// vector. Primitive arrays stay allocation-free; JSONB reuses one bounded
+/// vector. Primitive and NUMERIC arrays stay allocation-free; JSONB reuses one bounded
 /// region, so peak scratch is proportional to one element, not the whole array.
 pub fn validateCanonical(a: A, expected: arrays.ElementType, bytes: []const u8, options: Options) !layout.View {
     if (bytes.len > options.values.work) return error.SqlProgramLimitExceeded;
@@ -346,7 +350,11 @@ test "SQL flat array dense compact rank directories agree across bitmap and chec
 }
 
 fn rawJsonbFrame(a: A, text: []const u8) ![]u8 {
-    const start = try layout.sectionSize(.jsonb, 1, 1);
+    return rawVariableFrame(a, .jsonb, text);
+}
+
+fn rawVariableFrame(a: A, kind: arrays.ElementType, text: []const u8) ![]u8 {
+    const start = try layout.sectionSize(kind, 1, 1);
     const bytes = try a.alloc(u8, start + text.len);
     @memset(bytes, 0);
     bytes[0] = layout.version;
@@ -383,6 +391,131 @@ test "SQL flat array strict JSONB restore rejects equivalent noncanonical bytes 
     const nested = owned.value.elements[0].value.object.getPtr("a").?;
     try nested.array.append(.{ .integer = 4 });
     try std.testing.expectEqual(@as(usize, 4), nested.array.items.len);
+}
+
+test "SQL flat array NUMERIC restore rejects invalid and normalized payloads without allocating" {
+    const a = std.testing.allocator;
+    const invalid = [_][]const u8{
+        &.{ 0, 1, 0, 0, 0, 0, 0, 0, 0x27, 0x10 }, // digit 10000
+        &.{ 0, 0, 0, 0, 0x40, 0, 0, 0 }, // negative zero
+        &.{ 0, 2, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1 }, // leading zero
+        &.{ 0, 2, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0 }, // trailing zero
+        &.{ 0, 1, 0xff, 0xff, 0, 0, 0, 1, 4, 0xd2 }, // hidden fraction
+        &.{ 0, 0, 0, 0, 0xd0, 0, 0, 0 }, // noncanonical infinity scale
+        &.{ 0, 1, 0, 0, 0xc0, 0, 0, 0, 0, 1 }, // ignored NaN payload
+        &.{ 0, 1, 0, 0, 0, 0, 0, 0, 0 }, // truncated group
+    };
+    var none = std.heap.FixedBufferAllocator.init(&.{});
+    for (invalid) |payload| {
+        const bytes = try rawVariableFrame(a, .numeric, payload);
+        defer a.free(bytes);
+        // Directory/row authentication does not establish numeric canonicality.
+        _ = try layout.View.openAuthenticated(.numeric, bytes, .{});
+        try std.testing.expectError(error.InvalidSqlArrayStorage, layout.View.open(.numeric, bytes, .{}));
+        try std.testing.expectError(error.InvalidSqlArrayStorage, validateCanonical(none.allocator(), .numeric, bytes, .{}));
+        try std.testing.expectError(error.InvalidSqlArrayStorage, decode(a, .numeric, bytes, .{}));
+    }
+}
+
+test "SQL flat array NUMERIC logical hashes ignore display scale and retain shape null and value identity" {
+    const a = std.testing.allocator;
+    const numeric = @import("numeric_value.zig");
+    for ([_][2][]const u8{ .{ "1.20", "1.2" }, .{ "-0.00", "0" }, .{ "10000000000.00", "1e10" }, .{ "NaN", "NaN" }, .{ "Infinity", "Infinity" }, .{ "-Infinity", "-Infinity" } }) |pair| {
+        var ctx: numeric.Context = .{ .alloc = a };
+        var left = try numeric.parse(&ctx, pair[0]);
+        defer left.deinit();
+        var right = try numeric.parse(&ctx, pair[1]);
+        defer right.deinit();
+        const left_cells = [_]arrays.Element{ arrays.Element.typedNumeric(&left.value), .{} };
+        const right_cells = [_]arrays.Element{ arrays.Element.typedNumeric(&right.value), .{} };
+        const l = try arrays.Value.init(.numeric, &.{.{ .length = 2, .lower = -3 }}, &left_cells, .{});
+        const r = try arrays.Value.init(.numeric, &.{.{ .length = 2, .lower = -3 }}, &right_cells, .{});
+        const lb = try encodeAlloc(a, l, .{});
+        defer a.free(lb);
+        const rb = try encodeAlloc(a, r, .{});
+        defer a.free(rb);
+        var none = std.heap.FixedBufferAllocator.init(&.{});
+        const lv = try validateCanonical(none.allocator(), .numeric, lb, .{});
+        const rv = try validateCanonical(none.allocator(), .numeric, rb, .{});
+        var lh = std.crypto.hash.Blake3.init(.{});
+        var rh = std.crypto.hash.Blake3.init(.{});
+        lv.updateLogicalHash(&lh);
+        rv.updateLogicalHash(&rh);
+        var original_hash: [32]u8 = undefined;
+        var equivalent_hash: [32]u8 = undefined;
+        lh.final(&original_hash);
+        rh.final(&equivalent_hash);
+        try std.testing.expectEqualSlices(u8, &original_hash, &equivalent_hash);
+        if (left.value.scale != right.value.scale) try std.testing.expect(!std.mem.eql(u8, lb, rb));
+        var decoded = try decode(a, .numeric, lb, .{});
+        defer decoded.deinit();
+        var work: arrays.Budget = .{};
+        try std.testing.expectEqual(std.math.Order.eq, try decoded.value.compare(r, &work));
+        try std.testing.expectEqual(left.value.scale, decoded.value.elements[0].numeric.?.scale);
+        const again = try encodeAlloc(a, decoded.value, .{});
+        defer a.free(again);
+        try std.testing.expectEqualSlices(u8, lb, again);
+        const variants = [_]struct { lower: i32 = -3, swap: bool = false, text: []const u8 = "1.21" }{
+            .{ .lower = -2 }, .{ .swap = true }, .{},
+        };
+        for (variants) |variant| {
+            var other = try numeric.parse(&ctx, variant.text);
+            defer other.deinit();
+            var cells = left_cells;
+            if (variant.swap) std.mem.swap(arrays.Element, &cells[0], &cells[1]);
+            if (variant.lower == -3 and !variant.swap) cells[0] = arrays.Element.typedNumeric(&other.value);
+            const changed = try arrays.Value.init(.numeric, &.{.{ .length = 2, .lower = variant.lower }}, &cells, .{});
+            const bytes = try encodeAlloc(a, changed, .{});
+            defer a.free(bytes);
+            const view = try layout.View.open(.numeric, bytes, .{});
+            var hash = std.crypto.hash.Blake3.init(.{});
+            view.updateLogicalHash(&hash);
+            var digest: [32]u8 = undefined;
+            hash.final(&digest);
+            try std.testing.expect(!std.mem.eql(u8, &original_hash, &digest));
+        }
+    }
+}
+
+test "SQL flat array NUMERIC borrowed validation is allocation free and ownership survives allocation faults" {
+    const a = std.testing.allocator;
+    const numeric = @import("numeric_value.zig");
+    var ctx: numeric.Context = .{ .alloc = a };
+    var number = try numeric.parse(&ctx, "-12345678901234567890.001200");
+    defer number.deinit();
+    const cells = try a.alloc(arrays.Element, 4096);
+    defer a.free(cells);
+    @memset(cells, arrays.Element.typedNumeric(&number.value));
+    const value = try arrays.Value.init(.numeric, &.{.{ .length = 4096, .lower = -7 }}, cells, .{});
+    const bytes = try encodeAlloc(a, value, .{});
+    defer a.free(bytes);
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    const start = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
+    const borrowed = try validateCanonical(failing.allocator(), .numeric, bytes, .{});
+    try std.testing.expectEqual(@as(usize, 0), failing.alloc_index);
+    try std.testing.expectEqual(@as(usize, 4096), borrowed.count);
+    std.debug.print("SQL NUMERIC array borrowed validation: cells=4096 bytes={} allocations=0 elapsed_ns={}\n", .{ bytes.len, std.Io.Clock.now(.awake, std.testing.io).nanoseconds - start });
+    var counted = std.testing.FailingAllocator.init(a, .{});
+    const decode_start = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
+    var decoded = try decode(counted.allocator(), .numeric, bytes, .{});
+    defer decoded.deinit();
+    const decode_ns = std.Io.Clock.now(.awake, std.testing.io).nanoseconds - decode_start;
+    try std.testing.expectEqual(@as(usize, 4096), decoded.value.elements.len);
+    try std.testing.expectEqual(number.value.scale, decoded.value.elements[4095].numeric.?.scale);
+    std.debug.print("SQL NUMERIC array owned decode: cells=4096 bytes={} backing_allocations={} elapsed_ns={}\n", .{ bytes.len, counted.alloc_index, decode_ns });
+    const Faults = struct {
+        fn run(alloc: A, input: arrays.Value) !void {
+            const encoded = try encodeAlloc(alloc, input, .{});
+            defer alloc.free(encoded);
+            _ = try validateCanonical(alloc, .numeric, encoded, .{});
+            var owned = try decode(alloc, .numeric, encoded, .{});
+            defer owned.deinit();
+            var budget: arrays.Budget = .{};
+            try std.testing.expectEqual(std.math.Order.eq, try input.compare(owned.value, &budget));
+        }
+    };
+    const small = try arrays.Value.init(.numeric, &.{.{ .length = 3, .lower = -7 }}, cells[0..3], .{});
+    try std.testing.checkAllAllocationFailures(a, Faults.run, .{small});
 }
 
 test "SQL flat array rejects truncated corrupt rank directories padding offsets and excessive budgets" {

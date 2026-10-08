@@ -2118,6 +2118,33 @@ test "relational index system SQL array restore checks canonical JSONB beyond va
     try std.testing.expectError(error.InvalidRelationalRow, serializePreparedOrdinal(alloc, 1, &.{column}, &.{wrong_element}, @splat(0)));
 }
 
+test "relational index system NUMERIC array restore rejects malformed coefficients despite valid row checksums" {
+    const a = std.testing.allocator;
+    const column: runtime_schema.RelationalColumn = .{ .name = "a", .path = "a", .column_type = .sql_array, .sql_element_type = .numeric };
+    const table: runtime_schema.TableSchema = .{ .version = 1, .storage_mode = .relational, .relational_columns = &.{column} };
+    var layout = try PhysicalLayout.init(a, table);
+    defer layout.deinit();
+    // The outer array and AROW checksums are valid, but the coefficient 10000
+    // is not a base-10000 digit. The canonical boundary must reject it before
+    // hashing, publication, or a later typed query can observe this row.
+    var frame: [35]u8 = @splat(0);
+    frame[0] = 1;
+    frame[1] = 1;
+    std.mem.writeInt(u32, frame[4..8], 1, .little);
+    std.mem.writeInt(u32, frame[8..12], 1, .little);
+    std.mem.writeInt(i32, frame[12..16], 1, .little);
+    std.mem.writeInt(u32, frame[21..25], 10, .little);
+    @memcpy(frame[25..], &[_]u8{ 0, 1, 0, 0, 0, 0, 0, 0, 0x27, 0x10 });
+    const cell: Cell = .{ .ordinal = 0, .path = "a", .value_type = .bytes_val, .sql_array_element_type = .numeric, .value = .{ .bytes_val = &frame } };
+    try std.testing.expectError(error.InvalidSqlArrayStorage, serializeOrdinal(a, 1, &.{column}, &.{cell}, @splat(0)));
+    const row = try serializePreparedOrdinalWithLayout(a, 1, &.{column}, &.{cell}, @splat(0), &layout);
+    defer a.free(row);
+    _ = try ordinalRowViewTrusted(row, table, &layout);
+    try std.testing.expectError(error.InvalidSqlArrayStorage, validateOrdinalWithLayout(row, table, &layout));
+    var cells: [1]?Cell = undefined;
+    try std.testing.expectError(error.InvalidSqlArrayStorage, collectOrdinalCellsWithLayout(row, table, &layout, &cells));
+}
+
 test "relational index system SQL array trusted projection addresses maximum arrays without materializing cells" {
     const alloc = std.testing.allocator;
     const arrays = @import("../../../sql/array_value.zig");

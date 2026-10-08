@@ -6551,6 +6551,40 @@ test "relational index system SQL array hashes normalize equality without discar
     try std.testing.expect(!std.mem.eql(u8, negative.packed_row, positive.packed_row));
 }
 
+test "relational index system NUMERIC array rows preserve scale while hashing logical identity across restore" {
+    const a = std.testing.allocator;
+    const schema: runtime_schema.TableSchema = .{ .version = 1, .storage_mode = .relational, .relational_columns = &.{.{ .name = "a", .path = "a", .column_type = .sql_array, .sql_element_type = .numeric }} };
+    var layout = try relational_row_codec.PhysicalLayout.init(a, schema);
+    defer layout.deinit();
+    const prefix = "{\"a\":{\"dimensions\":[{\"length\":1,\"lower_bound\":-7}],\"values\":[\"";
+    const suffix = "\"],\"sql_nulls\":[false]}}";
+    const cases = [_][2][]const u8{ .{ "1.20", "1.2" }, .{ "-0.00", "0" }, .{ "10000000000.00", "1e10" } };
+    for (cases) |pair| {
+        const left_json = try std.mem.concat(a, u8, &.{ prefix, pair[0], suffix });
+        defer a.free(left_json);
+        const right_json = try std.mem.concat(a, u8, &.{ prefix, pair[1], suffix });
+        defer a.free(right_json);
+        var left = try PreparedRelationalWrite.init(a, "row", left_json, null, schema, &layout);
+        defer left.deinit(a);
+        var right = try PreparedRelationalWrite.init(a, "row", right_json, null, schema, &layout);
+        defer right.deinit(a);
+        try left.finalizeMetadata(0);
+        try right.finalizeMetadata(0);
+        try std.testing.expectEqualSlices(u8, &left.semantic_hash, &right.semantic_hash);
+        try std.testing.expect(!std.mem.eql(u8, left.packed_row, right.packed_row));
+        try relational_row_codec.validateOrdinalWithLayout(left.packed_row, schema, &layout);
+        const parsed_hash = try document_content_hash.hashRelationalParsedValue(a, left.parsedValue(), schema);
+        try std.testing.expectEqualSlices(u8, &left.semantic_hash, &parsed_hash);
+        const cell = (try relational_row_codec.findCellByOrdinalWithLayout(left.packed_row, schema, &layout, 0)).?;
+        const rendered = try relational_row_codec.reconstructDocumentAlloc(a, &.{cell});
+        defer a.free(rendered);
+        var restored = try PreparedRelationalWrite.init(a, "row", rendered, null, schema, &layout);
+        defer restored.deinit(a);
+        try restored.finalizeMetadata(0);
+        try std.testing.expectEqualSlices(u8, left.packed_row, restored.packed_row);
+    }
+}
+
 test "relational index system SQL float4 preparation hashes and indexes canonical logical values" {
     const alloc = std.testing.allocator;
     const parsed = try schema_api.parseValidatedTableSchema(alloc,

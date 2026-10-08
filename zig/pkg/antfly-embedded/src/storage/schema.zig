@@ -2798,14 +2798,14 @@ test "schema decoder rejects truncated trailing and noncanonical relational data
 test "relational index system SQL schema identities survive durable round trips and bind epoch equality" {
     const alloc = std.testing.allocator;
     const Type = @import("../common/sql_builtin_type.zig").Type;
-    inline for (std.meta.tags(Type)) |kind| {
+    for (std.meta.tags(Type)) |kind| {
         const column: RelationalColumn = .{
             .name = "value",
             .path = "value",
             .column_type = switch (kind) {
                 .text, .uuid => .string,
                 .int16, .int32, .int64 => .integer,
-                .float32, .float64 => .number,
+                .float32, .float64, .numeric => .number,
                 .boolean => .boolean,
                 .jsonb => .json,
             },
@@ -2814,6 +2814,12 @@ test "relational index system SQL schema identities survive durable round trips 
             .sql_element_type = kind,
         };
         const table: TableSchema = .{ .version = 7, .storage_mode = .relational, .relational_columns = &.{column} };
+        if (kind == .numeric) {
+            // Exact scalar NUMERIC is not a native f64 column. Keep this
+            // fail-closed until the native row/index/VM domain is implemented.
+            try std.testing.expectError(error.InvalidSchema, serializeSchema(alloc, table));
+            continue;
+        }
         const bytes = try serializeSchema(alloc, table);
         defer alloc.free(bytes);
         const decoded = try deserializeSchema(alloc, bytes);
