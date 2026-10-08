@@ -1,5 +1,18 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Elastic-2.0
+//
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
+//
+//     https://www.antfly.io/licensing/ELv2-license
+//
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
+
 //! Reader-safe native artifact collection. Publication/retirement authority is
 //! native metadata; object listing is only a census of fenced upload attempts.
 const std = @import("std");
@@ -150,7 +163,10 @@ pub const Collector = struct {
     /// Collection must understand the preceding immutable root format after an
     /// upgrade, while serving and rebuild selection continue to require current metadata.
     fn retainedNativeRoot(self: *Collector, a: A, comptime native: type, ref: local.serverless_manifest_artifact_ref.ArtifactRef) !native.Root {
-        if (ref.metadata_version == native.metadata_version) return native.loadRoot(a, self.store, ref, self.cancellation(), null);
+        if (ref.metadata_version == native.metadata_version) {
+            if (@hasDecl(native, "loadRootDirectory")) return native.loadRootDirectory(a, self.store, ref, self.cancellation(), null);
+            return native.loadRoot(a, self.store, ref, self.cancellation(), null);
+        }
         const supported_old = if (@hasField(native.Root, "seekable")) ref.metadata_version >= 1 and ref.metadata_version < native.metadata_version else if (@hasField(native.Root, "tuple_encoding")) ref.metadata_version >= 2 and ref.metadata_version < native.metadata_version else ref.metadata_version +| 1 == native.metadata_version;
         if (!supported_old) return error.InvalidNativeLakeGcReference;
         const limit = if (@hasDecl(native, "max_root_bytes")) native.max_root_bytes else @import("lake_index_native_files.zig").max_root_bytes;
@@ -202,8 +218,24 @@ pub const Collector = struct {
         if (!fresh) return;
         try stores.chargeReadBudget(&self.remaining_reads, ref.byte_len);
         const directory = try @import("lake_index_seekable_text.zig").loadDirectory(a, .{ .store = self.store, .cache = null, .context = .{}, .cancellation = self.cancellation() }, ref);
-        for (directory.metadata) |piece| _ = try self.mark(piece.ref);
-        for (directory.blocks) |piece| _ = try self.mark(piece.ref);
+        for (directory.metadata) |piece| _ = try self.mark(piece.retainedArtifact());
+        for (directory.blocks) |piece| _ = try self.mark(piece.retainedArtifact());
+    }
+    pub fn markTextManifest(self: *Collector, a: A, ref: artifacts.ChunkRef, seekable: bool) !void {
+        const fresh = if (self.progress) |progress| try progress.expand(ref, "text-manifest") else try self.mark(ref);
+        if (!fresh) return;
+        // Charge before I/O, independently from the serving metadata budget.
+        try stores.chargeReadBudget(&self.remaining_reads, ref.byte_len);
+        const domain = @import("lake_index_publication.zig").uploadDomainWithNamespace(self.table, self.identity, self.namespace);
+        const group = try @import("lake_index_native_text.zig").loadFileManifest(a, self.store, ref, domain, self.cancellation(), null);
+        for (group.rows) |block| {
+            if (block.bitmap) |bitmap| _ = try self.mark(bitmap);
+        }
+        for (group.segments) |segment| {
+            if (seekable) {
+                if (self.progress) |progress| try progress.enqueue(.{ .text_directory = segment }) else try self.markTextDirectory(a, segment);
+            } else _ = try self.mark(segment);
+        }
     }
     pub fn markArtifact(self: *Collector, a: A, ref: local.serverless_manifest_artifact_ref.ArtifactRef) !void {
         const root_chunk: artifacts.ChunkRef = .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len };
@@ -227,6 +259,7 @@ pub const Collector = struct {
                 const root = try self.retainedNativeRoot(a, @import("lake_index_ordered_rows.zig"), ref);
                 try self.markPages(a, root.domain, root.page, true);
                 try self.markPages(a, root.domain, root.reverse, false);
+                try self.markPages(a, root.domain, root.predicates, false);
             },
             // These lake producers publish self-contained segments. New paged
             // formats must register a child-reference walker before GC accepts
@@ -244,6 +277,12 @@ pub const Collector = struct {
                 if (ref.metadata_version >= 1 and ref.metadata_version <= @import("lake_index_native_text.zig").metadata_version) {
                     try stores.chargeReadBudget(&self.remaining_reads, ref.byte_len);
                     const root = try self.retainedNativeRoot(a, @import("lake_index_native_text.zig"), ref);
+                    for (root.manifests) |manifest| {
+                        if (self.progress) |progress| try progress.enqueue(.{ .text_manifest = .{ .ref = manifest, .seekable = root.seekable } }) else try self.markTextManifest(a, manifest, root.seekable);
+                    }
+                    for (root.file_groups) |group| for (group.rows) |block| {
+                        if (block.bitmap) |bitmap| _ = try self.mark(bitmap);
+                    };
                     for (root.segments) |segment| {
                         if (root.seekable) {
                             if (self.progress) |progress| try progress.enqueue(.{ .text_directory = segment }) else try self.markTextDirectory(a, segment);
@@ -376,10 +415,25 @@ test "external lake native GC retains shared aggregate blocks and durable reader
     text_binding.sidecar_kind = .text;
     var text_segment = try store.put("authenticated native text child");
     defer text_segment.deinit(a);
-    const text_root_bytes = try std.json.Stringify.valueAlloc(ca, @import("lake_index_native_text.zig").Root{ .version = 1, .domain = domain, .binding = text_binding, .config_json = "{}", .segments = &.{.{ .artifact_id = text_segment.artifact_id, .checksum = text_segment.checksum, .byte_len = text_segment.byte_len }} }, .{});
+    var holes = local.encoding_roaring.RoaringBitmap.init(a);
+    defer holes.deinit();
+    try holes.add(0);
+    try holes.add(2);
+    const hole_bytes = try holes.toBytes(ca);
+    var hole_upload = try store.put(hole_bytes);
+    defer hole_upload.deinit(a);
+    const text = @import("lake_index_native_text.zig");
+    const manifest_bytes = try std.json.Stringify.valueAlloc(ca, text.FileGroup{
+        .file = .{ .id = "part", .digest = @splat(7) },
+        .segments = &.{.{ .artifact_id = text_segment.artifact_id, .checksum = text_segment.checksum, .byte_len = text_segment.byte_len }},
+        .rows = &.{.{ .group = 0, .high = 0, .base = 0, .count = 2, .lower = 0, .bitmap = .{ .artifact_id = hole_upload.artifact_id, .checksum = hole_upload.checksum, .byte_len = hole_upload.byte_len } }},
+    }, .{});
+    var text_manifest = try store.put(manifest_bytes);
+    defer text_manifest.deinit(a);
+    const text_root_bytes = try std.json.Stringify.valueAlloc(ca, text.Root{ .domain = domain, .binding = text_binding, .config_json = "{}", .manifests = &.{.{ .artifact_id = text_manifest.artifact_id, .checksum = text_manifest.checksum, .byte_len = text_manifest.byte_len }} }, .{});
     var text_upload = try store.put(text_root_bytes);
     defer text_upload.deinit(a);
-    const text_ref: local.serverless_manifest_artifact_ref.ArtifactRef = .{ .name = "text", .kind = .text_segment, .metadata_version = 1, .artifact_id = text_upload.artifact_id, .checksum = text_upload.checksum, .byte_len = text_upload.byte_len };
+    const text_ref: local.serverless_manifest_artifact_ref.ArtifactRef = .{ .name = "text", .kind = .text_segment, .metadata_version = @import("lake_index_native_text.zig").metadata_version, .artifact_id = text_upload.artifact_id, .checksum = text_upload.checksum, .byte_len = text_upload.byte_len };
     var sparse_binding = binding;
     sparse_binding.sidecar_kind = .sparse;
     var sparse_child = try store.put("authenticated native sparse file block");
@@ -477,6 +531,12 @@ test "external lake native GC retains shared aggregate blocks and durable reader
     var second: Collector = .{ .a = a, .table = 4, .authority = authority, .store = store, .identity = identity, .context = .{}, .options = .{ .dry_run = false }, .token = @splat(8) };
     try std.testing.expect((try second.run()).deleted >= 2);
     try std.testing.expectEqual(@as(usize, 1), harness.state.publications.len);
+    const retained_holes = try store.getAlloc(hole_upload.artifact_id);
+    defer a.free(retained_holes);
+    try std.testing.expectEqualSlices(u8, hole_bytes, retained_holes);
+    const retained_manifest = try store.getAlloc(text_manifest.artifact_id);
+    defer a.free(retained_manifest);
+    try std.testing.expectEqualSlices(u8, manifest_bytes, retained_manifest);
     const retained_sparse = try store.getAlloc(sparse_child.artifact_id);
     defer a.free(retained_sparse);
     try std.testing.expectEqualStrings("authenticated native sparse file block", retained_sparse);
@@ -501,4 +561,75 @@ test "external lake native GC retains shared aggregate blocks and durable reader
     const text_bytes = try store.getVerifiedAllocWithCancellation(text_segment.artifact_id, text_segment.byte_len, text_segment.checksum, .none);
     defer a.free(text_bytes);
     try std.testing.expectEqualStrings("authenticated native text child", text_bytes);
+}
+
+test "external lake native GC marks physical text packs instead of range cache identities" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    var directory = try local.common_test_directory.TestDirectory.init("packed-native-text-gc");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    const identity: [32]u8 = @splat(4);
+    const namespace: [32]u8 = @splat(8);
+    const domain = @import("lake_index_publication.zig").uploadDomainWithNamespace(4, identity, namespace);
+    store.upload_scope = try stores.UploadScope.forPublication(domain, 1, std.testing.io);
+    const bytes = try ca.alloc(u8, 1024 * 1024 + 11);
+    @memset(bytes, 7);
+    const seekable = @import("lake_index_seekable_text.zig");
+    const root = try seekable.publish(ca, ca, &store, bytes, .none);
+    var collector: Collector = .{ .a = a, .table = 4, .authority = undefined, .store = store, .identity = identity, .context = .{}, .token = @splat(1), .expires_ms = std.math.maxInt(u64), .authority_deadline = std.math.maxInt(u64), .remaining_reads = 16 * 1024 * 1024, .namespace = namespace };
+    defer {
+        var keys = collector.marked.keyIterator();
+        while (keys.next()) |key| a.free(key.*);
+        collector.marked.deinit(a);
+    }
+    try collector.markTextDirectory(ca, root);
+    const decoded = try seekable.loadDirectory(ca, .{ .store = store, .cache = null, .context = .{}, .cancellation = .none }, root);
+    try std.testing.expectEqual(@as(u32, 3), collector.marked.count());
+    for (decoded.blocks) |piece| {
+        try std.testing.expect(collector.marked.contains(piece.pack.?.artifact_id));
+        if (!std.mem.eql(u8, piece.ref.artifact_id, piece.pack.?.artifact_id)) try std.testing.expect(!collector.marked.contains(piece.ref.artifact_id));
+    }
+}
+
+test "external lake native GC admits text manifest reads before storage access" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    var directory = try local.common_test_directory.TestDirectory.init("text-manifest-gc-budget");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    const identity: [32]u8 = @splat(4);
+    const namespace: [32]u8 = @splat(8);
+    const domain = @import("lake_index_publication.zig").uploadDomainWithNamespace(4, identity, namespace);
+    store.upload_scope = try stores.UploadScope.forPublication(domain, 1, std.testing.io);
+    // Deliberately absent: child I/O would produce FileNotFound instead of
+    // the expected budget rejection. Directory loading must stay shallow.
+    const checksum = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const id = try store.upload_scope.?.artifactId(checksum);
+    const manifest: artifacts.ChunkRef = .{ .artifact_id = &id, .checksum = checksum, .byte_len = 4096 };
+    const text = @import("lake_index_native_text.zig");
+    const binding: local.serverless_segment_source_binding.Binding = .{ .sidecar_kind = .text, .source_kind = .external_parquet, .row_ref_kind = .external, .source_id = "source", .snapshot_id = "snapshot", .schema_fingerprint = "schema", .index_config_hash = "recipe", .column_bindings = &.{"body"} };
+    const encoded = try std.json.Stringify.valueAlloc(ca, text.Root{ .domain = domain, .binding = binding, .config_json = "{}", .manifests = &.{manifest} }, .{});
+    var upload = try store.put(encoded);
+    defer upload.deinit(a);
+    const ref: local.serverless_manifest_artifact_ref.ArtifactRef = .{ .name = "text", .kind = .text_segment, .metadata_version = text.metadata_version, .artifact_id = upload.artifact_id, .checksum = upload.checksum, .byte_len = upload.byte_len };
+    const shallow = try text.loadRootDirectory(ca, store, ref, .none, null);
+    try std.testing.expectEqual(@as(usize, 1), shallow.manifests.len);
+    try std.testing.expectEqual(@as(usize, 0), shallow.file_groups.len);
+    var collector: Collector = .{ .a = a, .table = 4, .authority = undefined, .store = store, .identity = identity, .context = .{}, .token = @splat(1), .expires_ms = std.math.maxInt(u64), .authority_deadline = std.math.maxInt(u64), .remaining_reads = upload.byte_len, .namespace = namespace };
+    defer {
+        var keys = collector.marked.keyIterator();
+        while (keys.next()) |key| a.free(key.*);
+        collector.marked.deinit(a);
+    }
+    try std.testing.expectError(error.ArtifactReadBudgetExceeded, collector.markArtifact(ca, ref));
+    try std.testing.expectEqual(@as(u64, 0), collector.remaining_reads);
 }

@@ -31,6 +31,26 @@ import test_standalone as standalone
 
 
 @pytest.mark.parametrize(
+    "missing",
+    [
+        None,
+        "clipclap-clip.Q4_K.gguf",
+        "clipclap-clap.Q4_K.gguf",
+        "antfly_inference_variants.json",
+    ],
+)
+def test_clipclap_availability_matches_current_model_artifacts(tmp_path, missing):
+    for name in (
+        "clipclap-clip.Q4_K.gguf",
+        "clipclap-clap.Q4_K.gguf",
+        "antfly_inference_variants.json",
+    ):
+        if name != missing:
+            (tmp_path / name).write_bytes(b"fixture")
+    assert e2e_conftest._clipclap_gguf_available(tmp_path) == (missing is None)
+
+
+@pytest.mark.parametrize(
     "failure_phase, preservation, retained",
     [
         ("none", "failure", False),

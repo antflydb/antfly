@@ -285,15 +285,19 @@ pub fn declaresSpanArchitecture(allocator: std.mem.Allocator, bytes: []const u8)
     const head = obj.get("span_head") orelse return false;
     if (head != .object) return false;
     const mode = head.object.get("span_mode") orelse return false;
-    return mode == .string and std.mem.eql(u8, mode.string, "markerV0");
+    if (mode != .string or !std.mem.eql(u8, mode.string, "markerV0")) return false;
+    const counting_layer = obj.get("counting_layer") orelse return false;
+    return counting_layer == .string and std.mem.eql(u8, counting_layer.string, "count_lstm");
 }
 
 test "declared span architecture requires the supported marker contract" {
     const a = std.testing.allocator;
-    const supported = "{\"model_type\":\"extractor\",\"architecture\":\"span\",\"config_version\":3,\"architecture_version\":1,\"span_head\":{\"span_mode\":\"markerV0\"}}";
+    const supported = "{\"model_type\":\"extractor\",\"architecture\":\"span\",\"config_version\":3,\"architecture_version\":1,\"counting_layer\":\"count_lstm\",\"span_head\":{\"span_mode\":\"markerV0\"}}";
     try std.testing.expect(try declaresSpanArchitecture(a, supported));
-    try std.testing.expect(!try declaresSpanArchitecture(a, "{\"model_type\":\"extractor\",\"architecture\":\"span\",\"config_version\":4,\"architecture_version\":1,\"span_head\":{\"span_mode\":\"markerV0\"}}"));
-    try std.testing.expect(!try declaresSpanArchitecture(a, "{\"model_type\":\"extractor\",\"architecture\":\"span\",\"config_version\":3,\"architecture_version\":1,\"span_head\":{\"span_mode\":\"other\"}}"));
+    try std.testing.expect(!try declaresSpanArchitecture(a, "{\"model_type\":\"extractor\",\"architecture\":\"span\",\"config_version\":4,\"architecture_version\":1,\"counting_layer\":\"count_lstm\",\"span_head\":{\"span_mode\":\"markerV0\"}}"));
+    try std.testing.expect(!try declaresSpanArchitecture(a, "{\"model_type\":\"extractor\",\"architecture\":\"span\",\"config_version\":3,\"architecture_version\":1,\"counting_layer\":\"count_lstm\",\"span_head\":{\"span_mode\":\"other\"}}"));
+    try std.testing.expect(!try declaresSpanArchitecture(a, "{\"model_type\":\"extractor\",\"architecture\":\"span\",\"config_version\":3,\"architecture_version\":1,\"counting_layer\":\"count_lstm_v2\",\"span_head\":{\"span_mode\":\"markerV0\"}}"));
+    try std.testing.expect(!try declaresSpanArchitecture(a, "{\"model_type\":\"extractor\",\"architecture\":\"span\",\"config_version\":3,\"architecture_version\":1,\"span_head\":{\"span_mode\":\"markerV0\"}}"));
     try std.testing.expect(!try declaresSpanArchitecture(a, "{\"model_type\":\"extractor\"}"));
     try std.testing.expect(!try declaresSpanArchitecture(a, "not json"));
 }
@@ -334,25 +338,21 @@ pub fn parseConfig(allocator: std.mem.Allocator, bytes: []const u8, encoder_byte
     const version = try requiredU32(obj, "config_version", false);
     const arch_version = try requiredU32(obj, "architecture_version", false);
     if (version != config_version or arch_version != architecture_version) return error.UnsupportedGlinerBoundaryVersion;
-    // A ModernBERT encoder is identified by its own config; `model_name` is
-    // free text for it (upstream saves `max_len: null`, no word limit).
+    // The nested encoder config is the executable contract. `model_name` is
+    // retained as provenance only; aliases and repository renames must not
+    // select a geometry or runtime implementation.
     const modern_encoder = try encoderIsModernBert(allocator, encoder_bytes);
     const unlimited = modern_encoder and if (obj.get("max_len")) |value| value == .null else false;
     const max_len = if (unlimited) 0 else try requiredU32(obj, "max_len", false);
     const model_name = obj.get("model_name") orelse return error.InvalidGlinerBoundaryConfig;
     if (model_name != .string) return error.InvalidGlinerBoundaryConfig;
-    const backbone: Backbone = if (modern_encoder) .modern_bert else blk: {
-        inline for (@typeInfo(Backbone).@"enum".field_names, @typeInfo(Backbone).@"enum".field_values) |_, field_value| {
-            const candidate: Backbone = @fromBackingInt(field_value);
-            if (candidate != .modern_bert and std.mem.eql(u8, model_name.string, candidate.modelName())) break :blk candidate;
-        }
-        return error.UnsupportedGlinerBoundaryEncoder;
-    };
+    const deberta_encoder: ?EncoderConfig = if (modern_encoder) null else try parseEncoderConfig(allocator, encoder_bytes);
+    const backbone: Backbone = if (modern_encoder) .modern_bert else try releasedDebertaBackbone(deberta_encoder.?);
     const head_value = obj.get("boundary_head") orelse return error.InvalidGlinerBoundaryConfig;
     if (head_value != .object) return error.InvalidGlinerBoundaryConfig;
     const head = try parseHeadConfig(head_value.object);
     try head.validate();
-    const encoder = if (modern_encoder) try parseModernBertEncoderConfig(allocator, encoder_bytes) else try parseEncoderConfig(allocator, encoder_bytes, backbone);
+    const encoder = if (modern_encoder) try parseModernBertEncoderConfig(allocator, encoder_bytes) else deberta_encoder.?;
     const neck: Neck = if (obj.get("antenna_neck")) |value| switch (value) {
         .null => .none,
         .string => |name| std.meta.stringToEnum(Neck, name) orelse return error.UnsupportedGlinerBoundaryConfiguration,
@@ -393,7 +393,7 @@ pub fn parseHeadConfig(obj: std.json.ObjectMap) !HeadConfig {
     return head;
 }
 
-fn parseEncoderConfig(allocator: std.mem.Allocator, bytes: []const u8, backbone: Backbone) !EncoderConfig {
+fn parseEncoderConfig(allocator: std.mem.Allocator, bytes: []const u8) !EncoderConfig {
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, bytes, .{}) catch |err| return configError(err);
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidGlinerBoundaryConfig;
@@ -433,13 +433,20 @@ fn parseEncoderConfig(allocator: std.mem.Allocator, bytes: []const u8, backbone:
     if (result.hidden_size % result.num_attention_heads != 0 or result.pad_token_id >= result.vocab_size or
         result.layer_norm_eps <= 0 or result.hidden_dropout_prob >= 1 or result.attention_probs_dropout_prob >= 1)
         return error.InvalidGlinerBoundaryConfig;
-    const expected_hidden: u32 = if (backbone == .small) 384 else 768;
-    const expected_vocab: u32 = if (backbone == .multi) 250112 else 128011;
-    if (result.hidden_size != expected_hidden or result.intermediate_size != expected_hidden * 4 or
-        result.num_attention_heads != expected_hidden / 64 or result.num_hidden_layers != 12 or
-        result.vocab_size != expected_vocab or result.max_position_embeddings != 512 or result.position_buckets != 256)
-        return error.UnsupportedGlinerBoundaryEncoder;
     return result;
+}
+
+fn releasedDebertaBackbone(encoder: EncoderConfig) !Backbone {
+    if (encoder.num_hidden_layers != 12 or encoder.max_position_embeddings != 512 or encoder.position_buckets != 256)
+        return error.UnsupportedGlinerBoundaryEncoder;
+    if (encoder.hidden_size == 384 and encoder.intermediate_size == 1536 and
+        encoder.num_attention_heads == 6 and encoder.vocab_size == 128011)
+        return .small;
+    if (encoder.hidden_size == 768 and encoder.intermediate_size == 3072 and encoder.num_attention_heads == 12) {
+        if (encoder.vocab_size == 128011) return .base;
+        if (encoder.vocab_size == 250112) return .multi;
+    }
+    return error.UnsupportedGlinerBoundaryEncoder;
 }
 
 fn encoderIsModernBert(allocator: std.mem.Allocator, bytes: []const u8) !bool {
@@ -564,6 +571,19 @@ test "gliner boundary parses the three pinned release configurations" {
     }
 }
 
+test "gliner boundary derives released backbone from encoder geometry rather than model name" {
+    const a = std.testing.allocator;
+    const multi_config = try loadFixture(a, .multi, "config.json");
+    defer a.free(multi_config);
+    const multi_encoder = try loadFixture(a, .multi, "encoder_config.json");
+    defer a.free(multi_encoder);
+    const renamed = try std.mem.replaceOwned(u8, a, multi_config, "microsoft/mdeberta-v3-base", "publisher/renamed-multilingual-encoder");
+    defer a.free(renamed);
+    const config = try parseConfig(a, renamed, multi_encoder);
+    try std.testing.expectEqual(Backbone.multi, config.backbone);
+    try std.testing.expectEqual(@as(u32, 250112), config.encoder.vocab_size);
+}
+
 test "gliner boundary rejects malformed values versions and unknown architecture switches" {
     const base_config = try loadFixture(std.testing.allocator, .base, "config.json");
     defer std.testing.allocator.free(base_config);
@@ -620,7 +640,7 @@ test "gliner boundary encoder rejects negative overflowing and incompatible dime
         .{ "\"hidden_size\": 768", "\"hidden_size\": -1", error.InvalidGlinerBoundaryConfig },
         .{ "\"vocab_size\": 128011", "\"vocab_size\": 4294967296", error.InvalidGlinerBoundaryConfig },
         .{ "\"num_attention_heads\": 12", "\"num_attention_heads\": 0", error.InvalidGlinerBoundaryConfig },
-        .{ "\"hidden_size\": 768", "\"hidden_size\": 384", error.UnsupportedGlinerBoundaryEncoder },
+        .{ "\"hidden_size\": 768", "\"hidden_size\": 576", error.UnsupportedGlinerBoundaryEncoder },
         .{ "\"share_att_key\": true", "\"share_att_key\": false", error.UnsupportedGlinerBoundaryEncoder },
         .{ "\"hidden_dropout_prob\": 0.1", "\"hidden_dropout_prob\": 1.0", error.InvalidGlinerBoundaryConfig },
     };

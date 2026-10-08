@@ -44,10 +44,45 @@ pub const Source = union(enum) {
         length: u64,
         read_into: *const fn (*anyopaque, u64, []u8) anyerror!void,
         close: *const fn (*anyopaque) void,
+        /// Advisory bounded lookahead; errors belong to subsequent required reads.
+        prefetch: ?*const fn (*anyopaque, u64, u64) void = null,
         checksum: ?*const fn (*anyopaque, u64, u64) anyerror!u32 = null,
+        /// Authenticate an immutable page and deliver a subrange in one pass.
+        /// Null expected CRC means this page was already authenticated. Output
+        /// is unusable on error; providers must respect the same read authority.
+        read_authenticated: ?*const fn (*anyopaque, u64, u64, usize, []u8, ?u32) anyerror!void = null,
+        /// Visit immutable range bytes in order without restarting navigation.
+        /// Visitor slices are borrowed only for the duration of the callback.
+        visit_range: ?*const fn (*anyopaque, u64, u64, *anyopaque, *const fn (*anyopaque, u64, []const u8) anyerror!void) anyerror!void = null,
         retained_bytes: ?*const fn (*anyopaque) usize = null,
+        /// Bind an independent query capability without changing the shared source.
+        bind_read_context: ?*const fn (*anyopaque, std.mem.Allocator, *anyopaque) anyerror!Source = null,
+        seal_read_context: ?*const fn (*anyopaque) void = null,
+        quiesce_read_context: ?*const fn (*anyopaque) void = null,
         resource_manager: ?*resources.ResourceManager = null,
+        read_io: ?std.Io = null,
+        check_read_context: ?*const fn (*anyopaque) anyerror!void = null,
+        /// Opt-in idle expiry for source caches. A successful acquisition
+        /// protects all source operations until its matching release.
+        acquire_use: ?*const fn (*anyopaque) bool = null,
+        release_use: ?*const fn (*anyopaque) void = null,
+        enable_idle_expiry: ?*const fn (*anyopaque) void = null,
     },
+
+    pub fn acquireUse(self: Source) bool {
+        return if (self == .ranges) if (self.ranges.acquire_use) |acquire| acquire(self.ranges.ptr) else true else true;
+    }
+    pub fn releaseUse(self: Source) void {
+        if (self == .ranges) if (self.ranges.release_use) |release| release(self.ranges.ptr);
+    }
+    pub fn enableIdleExpiry(self: Source) void {
+        if (self == .ranges) if (self.ranges.enable_idle_expiry) |enable| enable(self.ranges.ptr);
+    }
+
+    /// Stop query-owned work before its borrowed capability is released.
+    pub fn quiesceReadContext(self: Source) void {
+        if (self == .ranges) if (self.ranges.quiesce_read_context) |quiesce| quiesce(self.ranges.ptr);
+    }
 
     pub fn resourceManager(self: Source) ?*resources.ResourceManager {
         return switch (self) {
@@ -72,6 +107,11 @@ pub const Source = union(enum) {
             .contiguous => |bytes| @memcpy(out, bytes[@intCast(offset)..][0..out.len]),
             .ranges => |range| try range.read_into(range.ptr, offset, out),
         }
+    }
+
+    pub fn prefetch(self: Source, offset: u64, length: u64) void {
+        if (offset > self.len() or length > self.len() - offset or length == 0) return;
+        if (self == .ranges) if (self.ranges.prefetch) |hint| hint(self.ranges.ptr, offset, length);
     }
 
     pub fn retainedBytes(self: Source) usize {
@@ -216,9 +256,13 @@ pub const BlockCache = struct {
     /// Borrowed adapter for decoders. Closing it does not close the cache or
     /// parent source; the cache must remain at a stable address until use ends.
     pub fn borrowedSource(self: *BlockCache) Source {
-        return .{ .ranges = .{ .ptr = self, .length = self.source.len(), .read_into = readAdapter, .checksum = checksumAdapter, .close = closeAdapter, .resource_manager = self.source.resourceManager() } };
+        return .{ .ranges = .{ .ptr = self, .length = self.source.len(), .read_into = readAdapter, .checksum = checksumAdapter, .close = closeAdapter, .prefetch = if (self.source == .ranges and self.source.ranges.prefetch != null) prefetchAdapter else null, .resource_manager = self.source.resourceManager() } };
     }
 
+    fn prefetchAdapter(ptr: *anyopaque, offset: u64, length: u64) void {
+        const self: *BlockCache = @ptrCast(@alignCast(ptr));
+        self.source.prefetch(offset, length);
+    }
     fn readAdapter(ptr: *anyopaque, offset: u64, out: []u8) !void {
         const self: *BlockCache = @ptrCast(@alignCast(ptr));
         try self.readInto(offset, out);
@@ -338,12 +382,132 @@ pub const ConcurrentBlockCache = struct {
     }
 
     pub fn borrowedSource(self: *ConcurrentBlockCache) Source {
-        return .{ .ranges = .{ .ptr = self, .length = self.cache.source.len(), .read_into = readAdapter, .checksum = checksumAdapter, .close = closeAdapter, .resource_manager = self.cache.source.resourceManager() } };
+        return .{ .ranges = .{ .ptr = self, .length = self.cache.source.len(), .read_into = readAdapter, .checksum = checksumAdapter, .read_authenticated = authenticatedAdapter, .close = closeAdapter, .prefetch = if (self.cache.source == .ranges and self.cache.source.ranges.prefetch != null) prefetchAdapter else null, .resource_manager = self.cache.source.resourceManager() } };
+    }
+    fn prefetchAdapter(ptr: *anyopaque, offset: u64, length: u64) void {
+        const self: *ConcurrentBlockCache = @ptrCast(@alignCast(ptr));
+        self.cache.source.prefetch(offset, length);
     }
     fn readAdapter(ptr: *anyopaque, offset: u64, out: []u8) !void {
         const self: *ConcurrentBlockCache = @ptrCast(@alignCast(ptr));
         try self.readInto(offset, out);
     }
+    fn authenticatedAdapter(ptr: *anyopaque, offset: u64, length: u64, within: usize, out: []u8, expected: ?u32) !void {
+        const self: *ConcurrentBlockCache = @ptrCast(@alignCast(ptr));
+        return self.readAuthenticated(offset, length, within, out, expected);
+    }
+
+    pub fn readAuthenticated(self: *ConcurrentBlockCache, offset: u64, length: u64, within: usize, out: []u8, expected: ?u32) !void {
+        if (offset > self.cache.source.len() or length > self.cache.source.len() - offset or within > length or out.len > length - within) return error.EndOfStream;
+        if (expected == null) return self.readCachedInto(offset + within, out);
+        if (self.cache.source == .ranges) if (self.cache.source.ranges.visit_range) |visit| {
+            @import("antfly_platform").sync.lockYielding(&self.fill_mutex);
+            defer self.fill_mutex.unlock();
+            try self.ensureBudget();
+            if (self.fill.len == 0) {
+                const fill = self.bufferAllocator().alloc(u8, self.cache.block_size) catch |err| blk: {
+                    if (self.budget == null or !self.budget.?.budget_denied) return err;
+                    break :blk self.fill;
+                };
+                @import("antfly_platform").sync.lockYielding(&self.mutex);
+                self.fill = fill;
+                self.mutex.unlock();
+            }
+            var stream = AuthenticationStream{ .cache = self, .offset = offset, .within = within, .out = out };
+            try visit(self.cache.source.ranges.ptr, offset, length, &stream, AuthenticationStream.consume);
+            if (stream.position != length) return error.EndOfStream;
+            if (stream.used != 0) try self.publishFill(stream.block, stream.used);
+            if (stream.crc.final() != expected.?) return error.CrcMismatch;
+            return;
+        };
+        var scratch: [8192]u8 = undefined;
+        var crc = Crc32.init();
+        var position: u64 = 0;
+        while (position < length) {
+            const count: usize = @intCast(@min(scratch.len, length - position));
+            const bytes = scratch[0..count];
+            try self.readCachedInto(offset + position, bytes);
+            crc.update(bytes);
+            const begin = @max(position, within);
+            const end = @min(position + count, @as(u64, within) + out.len);
+            if (begin < end) @memcpy(out[@intCast(begin - within)..][0..@intCast(end - begin)], bytes[@intCast(begin - position)..][0..@intCast(end - begin)]);
+            position += count;
+        }
+        if (crc.final() != expected.?) return error.CrcMismatch;
+    }
+
+    const AuthenticationStream = struct {
+        cache: *ConcurrentBlockCache,
+        offset: u64,
+        within: usize,
+        out: []u8,
+        position: u64 = 0,
+        crc: Crc32 = Crc32.init(),
+        block: u64 = 0,
+        used: usize = 0,
+        fn consume(raw: *anyopaque, relative: u64, bytes: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (relative != self.position) return error.InvalidData;
+            self.crc.update(bytes);
+            const begin = @max(relative, self.within);
+            const end = @min(relative + bytes.len, @as(u64, self.within) + self.out.len);
+            if (begin < end) @memcpy(self.out[@intCast(begin - self.within)..][0..@intCast(end - begin)], bytes[@intCast(begin - relative)..][0..@intCast(end - begin)]);
+            self.position += bytes.len;
+            if (self.cache.fill.len == 0) return;
+            var copied: usize = 0;
+            while (copied < bytes.len) {
+                const absolute = self.offset + relative + copied;
+                const block = absolute - absolute % self.cache.cache.block_size;
+                const within: usize = @intCast(absolute - block);
+                const take = @min(bytes.len - copied, self.cache.cache.block_size - within);
+                if (within == 0) {
+                    self.block = block;
+                    self.used = 0;
+                }
+                // A page can start inside a cache block. Do not publish an
+                // uninitialized prefix outside the authenticated traversal.
+                if (self.block == block and self.used == within) {
+                    @memcpy(self.cache.fill[within..][0..take], bytes[copied..][0..take]);
+                    self.used += take;
+                    if (self.used == self.cache.cache.block_size) {
+                        try self.cache.publishFill(block, self.used);
+                        self.used = 0;
+                    }
+                }
+                copied += take;
+            }
+        }
+    };
+
+    // The caller owns fill_mutex; swapping happens under the hot-cache mutex.
+    fn publishFill(self: *ConcurrentBlockCache, offset: u64, length: usize) !void {
+        @import("antfly_platform").sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
+        var oldest = &self.cache.slots[0];
+        for (&self.cache.slots) |*slot| if (slot.age < oldest.age) {
+            oldest = slot;
+        };
+        for (&self.cache.slots) |*slot| if (slot.valid_len != 0 and slot.offset == offset) {
+            if (slot.valid_len >= length) {
+                self.cache.clock +%= 1;
+                slot.age = self.cache.clock;
+                return;
+            }
+            oldest = slot;
+            break;
+        };
+        if (oldest.bytes.len == 0) oldest.bytes = self.bufferAllocator().alloc(u8, self.cache.block_size) catch |err| {
+            if (self.budget == null or !self.budget.?.budget_denied) return err;
+            return;
+        };
+        std.mem.swap([]u8, &oldest.bytes, &self.fill);
+        self.cache.clock +%= 1;
+        oldest.offset = offset;
+        oldest.valid_len = length;
+        oldest.age = self.cache.clock;
+        self.cache.misses += 1;
+    }
+
     fn checksumAdapter(ptr: *anyopaque, offset: u64, length: u64) !u32 {
         const self: *ConcurrentBlockCache = @ptrCast(@alignCast(ptr));
         var scratch: [8192]u8 = undefined;
@@ -362,7 +526,7 @@ pub const ConcurrentBlockCache = struct {
         defer self.mutex.unlock();
         self.cache.clock +%= 1;
         for (&self.cache.slots) |*slot| {
-            if (slot.valid_len != 0 and slot.offset == offset) {
+            if (slot.valid_len != 0 and slot.offset == offset and within <= slot.valid_len and out.len <= slot.valid_len - within) {
                 slot.age = self.cache.clock;
                 @memcpy(out, slot.bytes[within..][0..out.len]);
                 return true;
@@ -396,12 +560,18 @@ pub const ConcurrentBlockCache = struct {
         for (&self.cache.slots) |*slot| if (slot.age < oldest.age) {
             oldest = slot;
         };
+        for (&self.cache.slots) |*slot| if (slot.valid_len != 0 and slot.offset == offset) {
+            oldest = slot;
+            break;
+        };
         if (oldest.bytes.len == 0) oldest.bytes = self.bufferAllocator().alloc(u8, self.cache.block_size) catch |err| {
             if (self.budget == null or !self.budget.?.budget_denied) return err;
             @memcpy(out, self.fill[within..][0..out.len]);
             return;
         };
-        @memcpy(oldest.bytes[0..length], self.fill[0..length]);
+        // Transfer the filled slab; readers copy only while holding this
+        // mutex, so no borrowed pointer can observe the recycled victim.
+        std.mem.swap([]u8, &oldest.bytes, &self.fill);
         self.cache.clock +%= 1;
         oldest.offset = offset;
         oldest.valid_len = length;
@@ -415,6 +585,10 @@ pub const ConcurrentBlockCache = struct {
         // Large sequential reads already let the backend coalesce pages.
         // Do not split them into fills or evict useful point-read navigation.
         if (out.len / 2 >= self.cache.block_size) return self.cache.source.readInto(offset, out);
+        return self.readCachedInto(offset, out);
+    }
+
+    fn readCachedInto(self: *ConcurrentBlockCache, offset: u64, out: []u8) !void {
         var copied: usize = 0;
         while (copied < out.len) {
             const position = offset + copied;

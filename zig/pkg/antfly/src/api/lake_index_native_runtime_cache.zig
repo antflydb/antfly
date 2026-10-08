@@ -1,5 +1,18 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Elastic-2.0
+//
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
+//
+//     https://www.antfly.io/licensing/ELv2-license
+//
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
+
 //! Bounded reusable native vector runtimes. Each lane is exclusively borrowed
 //! by one execution: mutable scratch and callback contexts never cross requests.
 //! Fresh publication/source/credential proofs are supplied before admission.
@@ -17,14 +30,14 @@ pub const Cache = struct {
     mutex: std.atomic.Mutex = .unlocked,
     entries: [64]?*Entry = @splat(null),
     tick: u64 = 0,
-    heap: local.sql_memory_budget = .{ .backing = std.heap.page_allocator, .limit = 512 * 1024 * 1024 },
+    heap: local.sql_memory_budget = .{ .backing = @import("antfly_platform").allocator.processAllocator(std.heap.smp_allocator), .limit = 512 * 1024 * 1024 },
     managed: ?local.storage_resource_manager.BudgetedAllocator = null,
     closing: bool = false,
     pub fn attach(self: *Cache, manager: *local.storage_resource_manager.ResourceManager) void {
         @import("antfly_platform").sync.lockYielding(&self.mutex);
         defer self.mutex.unlock();
         if (self.managed != null) return;
-        self.managed = local.storage_resource_manager.BudgetedAllocator.init(manager, .dense_search_working_set, std.heap.page_allocator, 1);
+        self.managed = local.storage_resource_manager.BudgetedAllocator.init(manager, .dense_search_working_set, @import("antfly_platform").allocator.processAllocator(std.heap.smp_allocator), 1);
         self.heap.backing = self.managed.?.allocator();
     }
     pub fn acquire(self: *Cache, server: *server_api.ApiHttpServer, declaration: local.serverless_segment_sidecar_manifest.DeclaredArtifact, domain: [32]u8, scope: [32]u8, context: Context) !*Entry {

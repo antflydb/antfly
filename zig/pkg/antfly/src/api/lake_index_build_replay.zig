@@ -1,5 +1,18 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Elastic-2.0
+//
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
+//
+//     https://www.antfly.io/licensing/ELv2-license
+//
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
+
 //! One projected, delete-aware scan feeds independent bounded native builders.
 //! The replay is statement-owned columnar spill, with direct per-file seeks.
 const std = @import("std");
@@ -199,8 +212,11 @@ pub const Replay = struct {
             try cancellation.check();
             try self.provider.context.ensureActive();
             if (batch.rowCount() == 0) continue;
-            for (self.columns, self.kinds) |name, *kind| {
+            const vectors = try self.budget.allocator().alloc(rows.ColumnVector, self.columns.len);
+            defer self.budget.allocator().free(vectors);
+            for (self.columns, self.kinds, vectors) |name, *kind, *vector| {
                 const column = batch.findColumn(name) orelse return error.RowSourceColumnKindMismatch;
+                vector.* = column;
                 const actual = column.kind().logical();
                 if (kinds_bound and kind.* != actual) return error.RowSourceColumnKindMismatch;
                 kind.* = actual;
@@ -208,47 +224,86 @@ pub const Replay = struct {
             kinds_bound = true;
             var page = std.heap.ArenaAllocator.init(self.budget.allocator());
             defer page.deinit();
-            const pa = page.allocator();
-            const values = try pa.alloc(local.sql_scalar.Datum, self.columns.len);
-            for (batch.row_refs, 0..) |ref, row| {
-                const external = switch (ref) {
-                    .external => |external| external,
+            // Bind borrowed source vectors once; the spill codec gathers one
+            // bounded column at a time and chooses its physical dictionary.
+            var capture_batch: CaptureBatch = .{ .vectors = vectors };
+            const values: local.sql_execution_batch.Batch = .{ .reader = .{ .ptr = &capture_batch, .read = CaptureBatch.cell, .read_identity = CaptureBatch.identity, .count = batch.rowCount(), .width = self.columns.len } };
+            var begin: usize = 0;
+            while (begin < batch.rowCount()) {
+                const external = switch (batch.row_refs[begin]) {
+                    .external => |ref| ref,
                     else => return error.SidecarSourceBindingMismatch,
                 };
                 const file = by_id.get(external.file_id) orelse return error.SidecarSourceBindingMismatch;
                 if (active == null or active.? != file) {
                     const position = try self.run.?.replayBoundary();
                     if (active) |previous| self.files[previous].end = position.row;
-                    // Source order visits each file once, even across delete runs.
                     if (self.files[file].end != 0) return error.InvalidSqlSpill;
                     self.files[file].begin = position;
                     active = file;
                 }
-                for (self.columns, values) |name, *value| {
-                    const column = batch.findColumn(name).?;
-                    value.* = .{ .sql_null = column.nulls.isNull(row), .value = if (column.nulls.isNull(row)) .null else switch (column.values) {
-                        .i64 => |v| .{ .integer = v[row] },
-                        .dictionary_i64 => |v| .{ .integer = v.at(row) },
-                        .f64 => |v| .{ .float = v[row] },
-                        .dictionary_f64 => |v| .{ .float = v.at(row) },
-                        .bool => |v| .{ .bool = v[row] },
-                        .bytes, .json => |v| .{ .string = v[row] },
-                        .dictionary_bytes => |v| .{ .string = v.at(row) },
-                        .vector_f32 => return error.UnsupportedExternalLakeIndex,
-                    } };
+                var end = begin;
+                while (end < batch.rowCount() and end - begin < 256) : (end += 1) {
+                    const next = switch (batch.row_refs[end]) {
+                        .external => |ref| ref,
+                        else => return error.SidecarSourceBindingMismatch,
+                    };
+                    if (!std.mem.eql(u8, next.file_id, external.file_id)) break;
                 }
-                const keys = [_]local.sql_scalar.Datum{
-                    .{ .sql_null = false, .value = .{ .integer = @intCast(file) } },
-                    .{ .sql_null = false, .value = .{ .integer = external.row_group_ordinal } },
-                    .{ .sql_null = false, .value = .{ .number_string = try std.fmt.allocPrint(pa, "{d}", .{external.row_ordinal}) } },
-                };
-                _ = try self.run.?.append(.{ .values = values, .keys = &keys, .ordinal = self.run.?.size }, spill.none);
+                _ = page.reset(.retain_capacity);
+                const pa = page.allocator();
+                const selection = try pa.alloc(usize, end - begin);
+                const ordinals = try pa.alloc(u64, selection.len);
+                const file_ids = try pa.alloc(local.sql_scalar.Datum, selection.len);
+                @memset(file_ids, .{ .value = .{ .integer = @intCast(file) }, .sql_null = false });
+                const groups = try pa.alloc(local.sql_scalar.Datum, selection.len);
+                const positions = try pa.alloc(local.sql_scalar.Datum, selection.len);
+                for (selection, ordinals, groups, positions, begin..) |*selected, *ordinal, *group, *position, index| {
+                    const ref = batch.row_refs[index].external;
+                    selected.* = index;
+                    ordinal.* = self.run.?.size + index - begin;
+                    group.* = .{ .value = .{ .integer = ref.row_group_ordinal }, .sql_null = false };
+                    // u64 coordinates retain their bits without decimal formatting.
+                    position.* = .{ .value = .{ .integer = @bitCast(ref.row_ordinal) }, .sql_null = false };
+                }
+                const keys: local.sql_execution_batch.Batch = .{ .vectors = .{ .values = &.{ file_ids, groups, positions }, .count = selection.len } };
+                try self.run.?.appendBatch(try values.select(pa, selection), keys, ordinals);
+                begin = end;
             }
         }
         if (active) |file| self.files[file].end = self.run.?.size;
         try self.run.?.seal();
         self.ready = true;
     }
+    const CaptureBatch = struct {
+        vectors: []const rows.ColumnVector,
+        fn identity(raw: *anyopaque, row: usize, ordinal: usize) !?u64 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const column = self.vectors[ordinal];
+            const ids = switch (column.values) {
+                .dictionary_i64 => |v| v.indices,
+                .dictionary_f64 => |v| v.indices,
+                .dictionary_bytes => |v| v.indices,
+                else => return null,
+            };
+            return if (column.nulls.isNull(row)) 0 else @as(u64, ids[row]) + 2;
+        }
+        fn cell(raw: *anyopaque, _: A, row: usize, ordinal: usize) !local.sql_scalar.Datum {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const column = self.vectors[ordinal];
+            if (column.nulls.isNull(row)) return .{};
+            return .{ .sql_null = false, .value = switch (column.values) {
+                .i64 => |v| .{ .integer = v[row] },
+                .dictionary_i64 => |v| .{ .integer = v.at(row) },
+                .f64 => |v| .{ .float = v[row] },
+                .dictionary_f64 => |v| .{ .float = v.at(row) },
+                .bool => |v| .{ .bool = v[row] },
+                .bytes, .json => |v| .{ .string = v[row] },
+                .dictionary_bytes => |v| .{ .string = v.at(row) },
+                .vector_f32 => return error.UnsupportedExternalLakeIndex,
+            } };
+        }
+    };
     pub fn open(self: *Replay, a: A, binding: Binding, only_file: ?usize, cancellation: Cancellation) !?rows.Source {
         for (binding.column_bindings) |name| {
             const present = for (self.columns) |column| {
@@ -267,6 +322,7 @@ pub const Replay = struct {
         return .{ .kind = binding.source_kind, .ctx = cursor, .next_batch = Cursor.next, .deinit_fn = Cursor.deinit };
     }
     const Cursor = struct {
+        block: ?*spill.Sequential.OwnedBlock = null,
         owner: *Replay,
         reader: spill.Sequential.Reader,
         arena: std.heap.ArenaAllocator,
@@ -274,6 +330,7 @@ pub const Replay = struct {
         cancellation: Cancellation,
         fn deinit(raw: *anyopaque, a: A) void {
             const self: *Cursor = @ptrCast(@alignCast(raw));
+            if (self.block) |block| block.release();
             self.reader.deinit();
             self.arena.deinit();
             a.destroy(self);
@@ -282,48 +339,27 @@ pub const Replay = struct {
             const self: *Cursor = @ptrCast(@alignCast(raw));
             try self.cancellation.check();
             try self.owner.provider.context.ensureActive();
+            if (self.block) |block| block.release();
+            self.block = null;
             _ = self.arena.reset(.retain_capacity);
             const a = self.arena.allocator();
-            const block = try self.reader.next(256) orelse return null;
-            const refs = try a.alloc(rows.RowRef, block.rows.len);
+            const block = try self.reader.nextOwned() orelse return null;
+            self.block = block;
+            const refs = try a.alloc(rows.RowRef, block.count());
             const inventory = self.owner.provider.source.inventory;
-            for (block.rows, refs) |row, *ref| {
-                if (row.keys.len != 3) return error.InvalidSqlSpill;
-                const file = std.math.cast(usize, row.keys[0].value.integer) orelse return error.InvalidSqlSpill;
+            for (refs, 0..) |*ref, index| {
+                if (block.keyWidth() != 3) return error.InvalidSqlSpill;
+                const file = std.math.cast(usize, (try block.keyCell(index, 0)).value.integer) orelse return error.InvalidSqlSpill;
                 if (file >= inventory.files.len) return error.InvalidSqlSpill;
-                ref.* = .{ .external = .{ .source_id = inventory.source_id, .snapshot_id = inventory.snapshot_id, .file_id = inventory.files[file].file_id, .row_group_ordinal = std.math.cast(u32, row.keys[1].value.integer) orelse return error.InvalidSqlSpill, .row_ordinal = try std.fmt.parseInt(u64, row.keys[2].value.number_string, 10) } };
+                ref.* = .{ .external = .{ .source_id = inventory.source_id, .snapshot_id = inventory.snapshot_id, .file_id = inventory.files[file].file_id, .row_group_ordinal = std.math.cast(u32, (try block.keyCell(index, 1)).value.integer) orelse return error.InvalidSqlSpill, .row_ordinal = @bitCast((try block.keyCell(index, 2)).value.integer) } };
             }
             const columns = try a.alloc(rows.ColumnVector, self.columns.len);
             for (self.columns, columns) |name, *column| {
                 const ordinal = for (self.owner.columns, 0..) |candidate, index| {
                     if (std.mem.eql(u8, candidate, name)) break index;
                 } else return error.RowSourceColumnKindMismatch;
-                const nulls = try a.alloc(u8, block.rows.len);
-                for (block.rows, nulls) |row, *flag| flag.* = @intFromBool(row.values[ordinal].sql_null);
-                const values: rows.ColumnValues = switch (self.owner.kinds[ordinal]) {
-                    .i64 => blk: {
-                        const v = try a.alloc(i64, block.rows.len);
-                        for (block.rows, v) |row, *value| value.* = if (row.values[ordinal].sql_null) 0 else row.values[ordinal].value.integer;
-                        break :blk .{ .i64 = v };
-                    },
-                    .f64 => blk: {
-                        const v = try a.alloc(f64, block.rows.len);
-                        for (block.rows, v) |row, *value| value.* = if (row.values[ordinal].sql_null) 0 else row.values[ordinal].value.float;
-                        break :blk .{ .f64 = v };
-                    },
-                    .bool => blk: {
-                        const v = try a.alloc(bool, block.rows.len);
-                        for (block.rows, v) |row, *value| value.* = if (row.values[ordinal].sql_null) false else row.values[ordinal].value.bool;
-                        break :blk .{ .bool = v };
-                    },
-                    .bytes, .json => |kind| blk: {
-                        const v = try a.alloc([]const u8, block.rows.len);
-                        for (block.rows, v) |row, *value| value.* = if (row.values[ordinal].sql_null) "" else row.values[ordinal].value.string;
-                        break :blk if (kind == .json) .{ .json = v } else .{ .bytes = v };
-                    },
-                    else => return error.UnsupportedExternalLakeIndex,
-                };
-                column.* = .{ .name = name, .values = values, .nulls = .{ .bytes = nulls } };
+                column.* = try block.columnVector(a, ordinal, self.owner.kinds[ordinal]);
+                column.name = name;
             }
             return .{ .snapshot = .{ .table_id = inventory.source_id, .snapshot_id = inventory.snapshot_id }, .row_refs = refs, .columns = columns };
         }

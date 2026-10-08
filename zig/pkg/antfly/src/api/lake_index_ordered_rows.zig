@@ -1,5 +1,18 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Elastic-2.0
+//
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
+//
+//     https://www.antfly.io/licensing/ELv2-license
+//
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
+
 //! Native tuple keys in immutable seekable pages. The native publication is
 //! the visibility boundary; neither a cache nor an object-store HEAD is one.
 const std = @import("std");
@@ -13,7 +26,8 @@ const Cancellation = @import("antfly_cancellation").CancellationToken;
 const A = std.mem.Allocator;
 const Ref = local.serverless_manifest_artifact_ref.ArtifactRef;
 const rows = local.storage_rowsource_types;
-pub const metadata_version: u16 = 4;
+pub const metadata_version: u16 = 5;
+pub const predicate_blocks = @import("lake_index_predicate_blocks.zig");
 pub const max_root_bytes = 4 * 1024 * 1024;
 pub const Root = struct {
     version: u16 = metadata_version,
@@ -22,6 +36,7 @@ pub const Root = struct {
     domain: [32]u8,
     page: ?tree.Ref,
     reverse: ?tree.Ref = null,
+    predicates: ?tree.Ref = null,
     source: []const u8,
     snapshot: []const u8,
     files: []const []const u8,
@@ -33,6 +48,7 @@ pub const Root = struct {
         if (self.files.len > 16384) return error.InvalidNativeLakeRowIndex;
         if (self.page) |page| try page.validate();
         if (self.reverse) |page| try page.validate();
+        if (self.predicates) |page| try page.validate();
         if (self.reverse != null and (self.page == null or self.reverse.?.records != self.page.?.records)) return error.InvalidNativeLakeRowIndex;
         var names: std.StringHashMapUnmanaged(void) = .empty;
         defer names.deinit(std.heap.page_allocator);
@@ -65,6 +81,8 @@ pub fn publishIncremental(a: A, result_alloc: A, store: *stores.ArtifactStore, s
     var read_bytes: u64 = 256 * 1024 * 1024;
     var write_bytes: u64 = 512 * 1024 * 1024;
     var pages: page_store.PageStore = .{ .domain = scope.domain, .attempt = scope.attempt, .artifacts = store, .cancellation = cancellation, .remaining_read_bytes = &read_bytes, .remaining_write_bytes = &write_bytes };
+    var predicates = predicate_blocks.Builder.init(a, sort.manager);
+    defer predicates.deinit();
     var reverse_sort = local.sql_spill.Sort.init(a, sort.manager, &.{.{}}, 512 * 1024);
     defer reverse_sort.deinit();
     const Sorted = struct {
@@ -174,7 +192,7 @@ pub fn publishIncremental(a: A, result_alloc: A, store: *stores.ArtifactStore, s
     // Authenticated subtree counts make the cost estimate proportional to
     // changed files, without walking every old row before choosing a strategy.
     const has_delta = if (delta.previous) |previous| blk: {
-        if (previous.reverse == null) break :blk false;
+        if (previous.reverse == null or (previous.page != null and previous.predicates == null)) break :blk false;
         var removed: u64 = 0;
         for (delta.keep, 0..) |keep_file, slot| {
             if (keep_file) continue;
@@ -213,6 +231,7 @@ pub fn publishIncremental(a: A, result_alloc: A, store: *stores.ArtifactStore, s
                     const record = try cursor.next() orelse break;
                     if (record.key.len < 32 or !std.mem.eql(u8, record.key[0..16], record.key[record.key.len - 16 ..]) or record.value.len != 0) return error.InvalidNativeLakeRowIndex;
                     const key = try ba.dupe(u8, record.key);
+                    try predicates.remove(key[16..]);
                     try forward_changes.append(ba, .{ .key = key[16..], .value = null });
                     try reverse_changes.append(ba, .{ .key = key, .value = null });
                     bytes += key.len;
@@ -232,6 +251,7 @@ pub fn publishIncremental(a: A, result_alloc: A, store: *stores.ArtifactStore, s
             var bytes: usize = 0;
             while (forward_changes.items.len < 256 and bytes < 512 * 1024) {
                 const record = try sorted.next() orelse break;
+                try predicates.add(record.key);
                 const key = try ba.dupe(u8, record.key);
                 const value = try ba.dupe(u8, record.value);
                 try forward_changes.append(ba, .{ .key = key, .value = value });
@@ -247,10 +267,12 @@ pub fn publishIncremental(a: A, result_alloc: A, store: *stores.ArtifactStore, s
         const Collect = struct {
             merge: *Merge,
             reverse_sort: *local.sql_spill.Sort,
+            predicates: *predicate_blocks.Builder,
             arena: std.heap.ArenaAllocator,
             ordinal: u64 = 0,
             pub fn next(self: *@This()) !?tree.Cursor.Record {
                 const record = try self.merge.next() orelse return null;
+                try self.predicates.add(record.key);
                 _ = self.arena.reset(.retain_capacity);
                 const key = try std.mem.concat(self.arena.allocator(), u8, &.{ record.key[record.key.len - 16 ..], record.key });
                 try self.reverse_sort.add(.{ .keys = &.{local.sql_scalar.Datum.fromJson(.{ .string = key })}, .values = &.{}, .ordinal = self.ordinal });
@@ -258,7 +280,7 @@ pub fn publishIncremental(a: A, result_alloc: A, store: *stores.ArtifactStore, s
                 return record;
             }
         };
-        var collect: Collect = .{ .merge = &merge, .reverse_sort = &reverse_sort, .arena = .init(a) };
+        var collect: Collect = .{ .merge = &merge, .reverse_sort = &reverse_sort, .predicates = &predicates, .arena = .init(a) };
         defer collect.arena.deinit();
         page = try tree.buildSorted(a, pages.store(), &collect);
         var reverse_sorted: Sorted = .{ .sort = &reverse_sort, .store = store, .scope = scope, .cancellation = cancellation, .write_bytes = &write_bytes, .scratch = .init(a) };
@@ -273,10 +295,11 @@ pub fn publishIncremental(a: A, result_alloc: A, store: *stores.ArtifactStore, s
         var reverse_source: ReverseSource = .{ .sorted = &reverse_sorted };
         reverse = try tree.buildSorted(a, pages.store(), &reverse_source);
     }
+    const predicate_root = try predicates.publish(pages.store(), if (has_delta) delta.previous.?.predicates else null);
     const files = try a.alloc([]const u8, inventory.files.len);
     defer a.free(files);
     for (files, inventory.files) |*file, entry| file.* = entry.file_id;
-    const root: Root = .{ .fingerprint = fingerprint, .domain = scope.domain, .page = page, .reverse = reverse, .source = inventory.source_id, .snapshot = inventory.snapshot_id, .files = if (delta.files.len != 0) delta.files else files, .file_fingerprints = delta.fingerprints, .cover = cover };
+    const root: Root = .{ .fingerprint = fingerprint, .domain = scope.domain, .page = page, .reverse = reverse, .predicates = predicate_root, .source = inventory.source_id, .snapshot = inventory.snapshot_id, .files = if (delta.files.len != 0) delta.files else files, .file_fingerprints = delta.fingerprints, .cover = cover };
     try root.validate();
     const bytes = try std.json.Stringify.valueAlloc(a, root, .{});
     defer a.free(bytes);
@@ -311,6 +334,8 @@ pub fn loadRoot(a: A, store: stores.ArtifactStore, ref: Ref, cancellation: Cance
 /// Caller retains the leased root and store capability through cursor close.
 /// A batch is owned by its caller, including all physical identity strings.
 pub const Reader = struct {
+    physical_cursor: ?tree.Cursor = null,
+    predicate_cursor: ?tree.Cursor = null,
     root: Root,
     pages: page_store.PageStore,
     cursor: ?tree.Cursor = null,
@@ -342,6 +367,43 @@ pub const Reader = struct {
     pub fn deinit(self: *Reader) void {
         if (self.cursor) |*cursor| cursor.deinit();
         self.cursor = null;
+        if (self.physical_cursor) |*cursor| cursor.deinit();
+        self.physical_cursor = null;
+        if (self.predicate_cursor) |*cursor| cursor.deinit();
+        self.predicate_cursor = null;
+    }
+    pub fn nextPredicateBlocks(self: *Reader, a: A, lower: []const u8, upper: ?[]const u8) ![]const predicate_blocks.Block {
+        if (self.exhausted) return &.{};
+        if (self.predicate_cursor == null) self.predicate_cursor = try tree.Cursor.init(self.cursor.?.alloc, self.pages.store(), self.root.predicates, lower, upper);
+        var blocks: std.ArrayList(predicate_blocks.Block) = .empty;
+        while (blocks.items.len < 16) {
+            const record = try self.predicate_cursor.?.next() orelse break;
+            if (record.key.len < 16) return error.InvalidNativeLakeRowIndex;
+            const physical = record.key[record.key.len - 16 ..];
+            const file = std.mem.readInt(u32, physical[0..4], .big);
+            const base = std.mem.readInt(u64, physical[8..16], .big);
+            if (file >= self.root.files.len or base & ((1 << predicate_blocks.shift) - 1) != 0) return error.InvalidNativeLakeRowIndex;
+            try blocks.append(a, .{ .file = self.root.files[file], .group = std.mem.readInt(u32, physical[4..8], .big), .base = base, .selection = try predicate_blocks.decode(a, record.value) });
+        }
+        return blocks.toOwnedSlice(a);
+    }
+    /// Reverse-tree order is physical file/group/row order. Test the stored
+    /// tuple against the exact seek bounds without opening Parquet columns.
+    pub fn nextPhysical(self: *Reader, a: A, max_rows: usize, lower: []const u8, upper: ?[]const u8) ![]const rows.RowRef {
+        if (max_rows == 0 or max_rows > 65536) return error.InvalidNativeLakeRowIndex;
+        if (self.physical_cursor == null) self.physical_cursor = try tree.Cursor.init(self.cursor.?.alloc, self.pages.store(), self.root.reverse orelse return error.InvalidNativeLakeRowIndex, "", null);
+        var refs: std.ArrayList(rows.RowRef) = .empty;
+        errdefer refs.deinit(a);
+        while (refs.items.len < max_rows) {
+            const record = try self.physical_cursor.?.next() orelse break;
+            if (record.key.len < 32) return error.InvalidNativeLakeRowIndex;
+            const key = record.key[16..];
+            if (!std.mem.eql(u8, record.key[0..16], key[key.len - 16 ..])) return error.InvalidNativeLakeRowIndex;
+            if (std.mem.order(u8, key, lower) == .lt) continue;
+            if (upper) |end| if (std.mem.order(u8, key, end) != .lt) continue;
+            try refs.append(a, try self.decode(.{ .key = key, .value = record.key[0..16] }));
+        }
+        return refs.toOwnedSlice(a);
     }
     pub const Entry = struct { key: []const u8, ref: rows.RowRef, cover: ?Cover = null };
     pub const Cover = struct { block: artifacts.ChunkRef, row: u16 };
@@ -438,6 +500,26 @@ test "external lake ordered deltas retain untouched pages and delete only one fi
     for (0..2048) |n| try Make.add(&first, @intCast(n), 0, n);
     const ref = try publish(a, ca, &store, &first, "ordered", @splat(3), inventory, &.{}, .none);
     const root = try loadRoot(ca, store, ref, .none, null);
+    // Physical reverse traversal applies tuple bounds without hydration.
+    var predicate_reader: Reader = undefined;
+    var lower_key: [4]u8 = undefined;
+    var upper_key: [4]u8 = undefined;
+    std.mem.writeInt(u32, &lower_key, 100, .big);
+    std.mem.writeInt(u32, &upper_key, 103, .big);
+    try predicate_reader.init(a, &store, root, @splat(3), &lower_key, &upper_key, .none);
+    defer predicate_reader.deinit();
+    const physical_matches = try predicate_reader.nextPhysical(ca, 1024, &lower_key, &upper_key);
+    try std.testing.expectEqual(@as(usize, 3), physical_matches.len);
+    for (physical_matches, 100..) |row, expected_row| try std.testing.expectEqual(@as(u64, @intCast(expected_row)), row.external.row_ordinal);
+    try std.testing.expectEqual(@as(usize, 0), (try predicate_reader.nextPhysical(ca, 1024, &lower_key, &upper_key)).len);
+    const compressed_matches = try predicate_reader.nextPredicateBlocks(ca, &lower_key, &upper_key);
+    try std.testing.expectEqual(@as(usize, 3), compressed_matches.len);
+    for (compressed_matches, 100..) |block, expected_row| {
+        try std.testing.expectEqual(@as(u64, 0), block.base);
+        try std.testing.expectEqual(@as(u32, @intCast(expected_row)), block.selection.interval.lower);
+        try std.testing.expectEqual(@as(u32, 1), block.selection.interval.count);
+    }
+    try std.testing.expectEqual(@as(usize, 0), (try predicate_reader.nextPredicateBlocks(ca, &lower_key, &upper_key)).len);
     const Pages = struct {
         refs: std.AutoHashMapUnmanaged([32]u8, void) = .empty,
         alloc: A,
@@ -486,6 +568,14 @@ test "external lake ordered deltas retain untouched pages and delete only one fi
     try std.testing.expectEqual(@as(usize, 2), entries.len);
     try std.testing.expectEqualStrings("b", entries[0].ref.external.file_id);
     try std.testing.expectEqualStrings("a", entries[1].ref.external.file_id);
+    var final_predicates: Reader = undefined;
+    try final_predicates.init(a, &store, final, @splat(3), "", null, .none);
+    defer final_predicates.deinit();
+    const final_blocks = try final_predicates.nextPredicateBlocks(ca, "", null);
+    try std.testing.expectEqual(@as(usize, 2), final_blocks.len);
+    try std.testing.expectEqualStrings("b", final_blocks[0].file);
+    try std.testing.expectEqualStrings("a", final_blocks[1].file);
+    for (final_blocks) |block| try std.testing.expectEqual(@as(u32, 1), block.selection.interval.count);
     var original: Reader = undefined;
     try original.init(a, &store, root, @splat(3), "", null, .none);
     defer original.deinit();

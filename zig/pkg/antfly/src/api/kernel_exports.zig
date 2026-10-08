@@ -765,8 +765,16 @@ test "linked API route manifest preserves internal scan response streaming" {
     const table_prefix = routes.internal_groups_prefix ++ ":group_id/tables/:table_name";
     var found_scan = false;
     var found_query = false;
+    var public_queries: usize = 0;
     for (entries.?[0..len]) |entry| {
         if (entry.method != .post) continue;
+        inline for (.{ "/db/v1/query", "/db/v1/tables/:tableName/query", "/db/v1/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/query" }) |path| {
+            if (std.mem.eql(u8, entry.path.slice(), path)) {
+                try std.testing.expectEqual(abi.RequestBodyMode.buffered, entry.request_body);
+                try std.testing.expectEqual(@as(u8, 1), entry.streaming_response);
+                public_queries += 1;
+            }
+        }
         if (std.mem.eql(u8, entry.path.slice(), table_prefix ++ routes.documents_suffix)) {
             try std.testing.expectEqual(abi.RequestBodyMode.buffered, entry.request_body);
             try std.testing.expectEqual(@as(u8, 1), entry.streaming_response);
@@ -779,6 +787,7 @@ test "linked API route manifest preserves internal scan response streaming" {
         }
     }
     try std.testing.expect(found_scan and found_query);
+    try std.testing.expectEqual(@as(usize, 3), public_queries);
 }
 
 test "linked API dispatch preserves kernel-owned ingress policy" {

@@ -94,6 +94,9 @@ pub const Scan = struct {
     };
     /// A request, never proof. Providers explicitly attest the entire order.
     order: []const Order = &.{},
+    /// Advisory SQL OFFSET + LIMIT for costing only. Never a scan stop bound.
+    /// Absent when residual selectivity is unknown. Page size remains limit.
+    row_goal: ?u64 = null,
     index_range: ?IndexRange = null,
     fields: []const []const u8,
     /// Mutation-only full document preimage; ordinary reads remain projected.
@@ -169,6 +172,12 @@ pub const ColumnPage = struct {
     /// Borrowed operator columns, preserving JSON and retained typed storage.
     /// The pointer avoids embedding mutually recursive Batch/ColumnPage values.
     native: ?struct { values: *const @import("execution_batch.zig").Batch, names: []const []const u8 } = null,
+    /// Optional producer capability; call before the next pull. A successful
+    /// lease owns vector payloads, independently of page/cursor allocators.
+    retain_columns: ?struct {
+        ptr: *anyopaque,
+        retain_fn: *const fn (*anyopaque, std.mem.Allocator) anyerror!?@import("../storage/rowsource/types.zig").ColumnOwner,
+    } = null,
     selection: []const usize,
     after: ?[]const u8 = null,
     pub fn validate(self: ColumnPage) !void {

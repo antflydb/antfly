@@ -51,6 +51,7 @@ pub const PagedSource = struct {
     original: source_mod.Source,
     directory: Directory,
     validations: []std.atomic.Value(u8),
+    owns_validations: bool = true,
     mutex: std.atomic.Mutex = .unlocked,
     io_mutex: std.atomic.Mutex = .unlocked,
     buffer: []u8 = &.{},
@@ -66,18 +67,29 @@ pub const PagedSource = struct {
         self.* = .{ .allocator = allocator, .original = original, .directory = directory, .validations = states };
         return self;
     }
+    /// Borrow authenticated page states from an immutable, externally pinned
+    /// reader. Payload caches and authority remain private to this facade.
+    pub fn bind(self: *const PagedSource, allocator: Allocator, original: source_mod.Source) !*PagedSource {
+        const bound = try allocator.create(PagedSource);
+        bound.* = .{ .allocator = allocator, .original = original, .directory = self.directory, .validations = self.validations, .owns_validations = false };
+        return bound;
+    }
     // Closing the facade source and freeing decoder metadata are separate:
     // SegmentReader borrows its caller's source; standalone range readers own it.
     pub fn deinit(self: *PagedSource) void {
         const allocator = self.allocator;
-        allocator.free(self.validations);
+        if (self.owns_validations) allocator.free(self.validations);
         if (self.budget) |*budget| budget.reservation.manager.unregisterReclaimer(self.reclaimer);
         self.bufferAllocator().free(self.buffer);
         if (self.budget) |*budget| budget.deinit();
         allocator.destroy(self);
     }
     pub fn source(self: *PagedSource) source_mod.Source {
-        return .{ .ranges = .{ .ptr = self, .length = self.original.len(), .read_into = read, .close = close, .resource_manager = self.original.resourceManager() } };
+        return .{ .ranges = .{ .ptr = self, .length = self.original.len(), .read_into = read, .close = close, .prefetch = if (self.original == .ranges and self.original.ranges.prefetch != null) prefetch else null, .resource_manager = self.original.resourceManager() } };
+    }
+    fn prefetch(ptr: *anyopaque, offset: u64, length: u64) void {
+        const self: *PagedSource = @ptrCast(@alignCast(ptr));
+        self.original.prefetch(offset, length);
     }
     fn close(ptr: *anyopaque) void {
         const self: *PagedSource = @ptrCast(@alignCast(ptr));
@@ -127,14 +139,14 @@ pub const PagedSource = struct {
         if (state.load(.acquire) == 2) return error.CrcMismatch;
         if (self.copyCached(index, within, out)) return;
         const offset = @as(u64, index) * page_size;
-        if (state.load(.acquire) == 1) return self.original.readInto(offset + within, out);
+        if (state.load(.acquire) == 1) return self.readVerified(offset, @intCast(@min(page_size, self.directory.offset - offset)), within, out);
         // One cold validator owns the bounded page buffer. Verified reads and
         // cache hits never wait for backend I/O on this separate owner lock.
         @import("antfly_platform").sync.lockYielding(&self.io_mutex);
         defer self.io_mutex.unlock();
         if (state.load(.acquire) == 2) return error.CrcMismatch;
         if (self.copyCached(index, within, out)) return;
-        if (state.load(.acquire) == 1) return self.original.readInto(offset + within, out);
+        if (state.load(.acquire) == 1) return self.readVerified(offset, @intCast(@min(page_size, self.directory.offset - offset)), within, out);
         const length: usize = @intCast(@min(page_size, self.directory.offset - offset));
         if (self.original == .contiguous) {
             const bytes = self.original.contiguous[@intCast(offset)..][0..length];
@@ -147,29 +159,33 @@ pub const PagedSource = struct {
             @memcpy(out, bytes[within..][0..out.len]);
             return;
         }
+        // Only an explicit fused capability guarantees authentication and
+        // delivery share the provider's cache/traversal. A checksum callback
+        // alone may bypass that cache and duplicate cold and warm reads.
+        if (self.original.ranges.read_authenticated) |read_authenticated| {
+            var expected: [4]u8 = undefined;
+            try self.original.readInto(self.directory.offset + @as(u64, index) * 4, &expected);
+            read_authenticated(self.original.ranges.ptr, offset, length, within, out, std.mem.readInt(u32, &expected, .big)) catch |err| {
+                if (err == error.CrcMismatch) state.store(2, .release);
+                return err;
+            };
+            state.store(1, .release);
+            return;
+        }
         // Invalidate before touching bytes: failed/partial reads cannot expose
         // the old cache entry. Publish only after authentication completes.
         @import("antfly_platform").sync.lockYielding(&self.mutex);
         self.cached_page = null;
         self.mutex.unlock();
-        try self.ensureBudget();
+        self.ensureBudget() catch return self.authenticateRange(index, offset, length, within, out);
         if (self.buffer.len == 0) {
-            const buffer = self.bufferAllocator().alloc(u8, @intCast(@min(page_size, self.directory.offset))) catch |err| {
-                if (self.budget == null or !self.budget.?.budget_denied) return err;
+            const buffer = self.bufferAllocator().alloc(u8, @intCast(@min(page_size, self.directory.offset))) catch {
+                // The caller allocator may also impose a hard limit. This
+                // buffer is optional regardless of who denied admission.
                 // Mandatory authentication uses fixed worker scratch when
                 // the optional shared cache is full. No uncharged heap page
                 // survives pressure or scales with open reader count.
-                var scratch: [8192]u8 = undefined;
-                const actual = try self.original.checksum(offset, length, &scratch);
-                var expected: [4]u8 = undefined;
-                try self.original.readInto(self.directory.offset + @as(u64, index) * 4, &expected);
-                if (actual != std.mem.readInt(u32, &expected, .big)) {
-                    state.store(2, .release);
-                    return error.CrcMismatch;
-                }
-                state.store(1, .release);
-                try self.original.readInto(offset + within, out);
-                return;
+                return self.authenticateRange(index, offset, length, within, out);
             };
             @import("antfly_platform").sync.lockYielding(&self.mutex);
             self.buffer = buffer;
@@ -188,6 +204,25 @@ pub const PagedSource = struct {
         self.cached_page = index;
         @memcpy(out, self.buffer[within..][0..out.len]);
     }
+    fn readVerified(self: *PagedSource, offset: u64, length: usize, within: usize, out: []u8) !void {
+        if (self.original == .ranges) if (self.original.ranges.read_authenticated) |read_authenticated| {
+            return read_authenticated(self.original.ranges.ptr, offset, length, within, out, null);
+        };
+        return self.original.readInto(offset + within, out);
+    }
+    fn authenticateRange(self: *PagedSource, index: usize, offset: u64, length: usize, within: usize, out: []u8) !void {
+        var scratch: [8192]u8 = undefined;
+        const actual = try self.original.checksum(offset, length, &scratch);
+        var expected: [4]u8 = undefined;
+        try self.original.readInto(self.directory.offset + @as(u64, index) * 4, &expected);
+        const state = &self.validations[index];
+        if (actual != std.mem.readInt(u32, &expected, .big)) {
+            state.store(2, .release);
+            return error.CrcMismatch;
+        }
+        state.store(1, .release);
+        try self.original.readInto(offset + within, out);
+    }
     fn read(ptr: *anyopaque, offset: u64, out: []u8) !void {
         const self: *PagedSource = @ptrCast(@alignCast(ptr));
         var copied: usize = 0;
@@ -202,3 +237,59 @@ pub const PagedSource = struct {
         }
     }
 };
+
+test "segment.fused provider authentication avoids duplicate slabs and fails closed" {
+    const a = std.testing.allocator;
+    const bytes = try a.alloc(u8, page_size + 4);
+    defer a.free(bytes);
+    @memset(bytes[0..page_size], 7);
+    std.mem.writeInt(u32, bytes[page_size..][0..4], Crc32.hash(bytes[0..page_size]), .big);
+    const Backend = struct {
+        bytes: []u8,
+        checksums: usize = 0,
+        fail: bool = false,
+        fn read(raw: *anyopaque, offset: u64, out: []u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            @memcpy(out, self.bytes[@intCast(offset)..][0..out.len]);
+        }
+        fn checksum(raw: *anyopaque, offset: u64, length: u64) !u32 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.checksums += 1;
+            if (self.fail) return error.TestIoFailure;
+            return Crc32.hash(self.bytes[@intCast(offset)..][0..@intCast(length)]);
+        }
+        fn authenticate(raw: *anyopaque, offset: u64, length: u64, within: usize, out: []u8, expected: ?u32) !void {
+            if (expected) |crc| if (try checksum(raw, offset, length) != crc) return error.CrcMismatch;
+            return read(raw, offset + within, out);
+        }
+        fn close(_: *anyopaque) void {}
+    };
+    var backend = Backend{ .bytes = bytes, .fail = true };
+    const original = source_mod.Source{ .ranges = .{ .ptr = &backend, .length = bytes.len, .read_into = Backend.read, .checksum = Backend.checksum, .read_authenticated = Backend.authenticate, .close = Backend.close } };
+    var budget = @import("storage/lite/test_allocator.zig").BudgetAllocator{ .backing = a, .limit = 4096 };
+    const directory = Directory{ .offset = page_size, .length = 4, .checksum = Crc32.hash(bytes[page_size..]) };
+    const paged = try PagedSource.init(budget.allocator(), original, directory);
+    var alive = true;
+    defer if (alive) paged.deinit();
+    var out: [8]u8 = undefined;
+    try std.testing.expectError(error.TestIoFailure, paged.source().readInto(3, &out));
+    backend.fail = false;
+    try paged.source().readInto(3, &out);
+    try std.testing.expectEqualSlices(u8, bytes[3..11], &out);
+    try std.testing.expectEqual(@as(usize, 2), backend.checksums);
+    try paged.source().readInto(123, &out);
+    try std.testing.expectEqual(@as(usize, 2), backend.checksums);
+    try std.testing.expectEqual(@as(usize, 0), paged.retainedBytes());
+    paged.deinit();
+    alive = false;
+    try std.testing.expectEqual(@as(usize, 0), budget.live);
+    const corrupt = try PagedSource.init(budget.allocator(), original, directory);
+    defer corrupt.deinit();
+    bytes[7] ^= 1;
+    try std.testing.expectError(error.CrcMismatch, corrupt.source().readInto(3, &out));
+    bytes[7] ^= 1;
+    const calls = backend.checksums;
+    try std.testing.expectError(error.CrcMismatch, corrupt.source().readInto(3, &out));
+    try std.testing.expectEqual(calls, backend.checksums);
+    try std.testing.expectEqual(@as(usize, 0), corrupt.retainedBytes());
+}

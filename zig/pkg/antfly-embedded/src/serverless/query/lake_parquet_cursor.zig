@@ -83,6 +83,29 @@ pub const Cursor = struct {
         self.a.free(self.columns);
         self.output.deinit();
     }
+    pub fn retainColumns(self: *Cursor, a: A) !?types.ColumnOwner {
+        for (self.columns) |column| if (column.cached == null) return null;
+        const Owner = struct {
+            a: A,
+            leases: []@import("lake_decoded_cache.zig").Lease,
+            fn release(raw: *anyopaque) void {
+                const self_: *@This() = @ptrCast(@alignCast(raw));
+                for (self_.leases) |lease| lease.release();
+                self_.a.free(self_.leases);
+                self_.a.destroy(self_);
+            }
+        };
+        const owner = try a.create(Owner);
+        errdefer a.destroy(owner);
+        owner.* = .{ .a = a, .leases = try a.alloc(@import("lake_decoded_cache.zig").Lease, self.columns.len) };
+        var bytes: usize = 0;
+        for (self.columns, owner.leases) |column, *lease| {
+            lease.* = column.cached.?.retain();
+            bytes +|= lease.item.budget.live;
+            if (lease.item.dependency) |dependency| bytes +|= dependency.budget.live;
+        }
+        return .{ .ptr = owner, .release_fn = Owner.release, .retained_bytes = bytes };
+    }
     fn read(self: *Cursor, offset: u64, len: usize) !ranges.RangeLease {
         return self.reader.readPlannedLease(self.a, .{ .object = try ranges.objectRefForExternalFileUri(self.file), .range = .{ .offset = offset, .len = len }, .purpose = .parquet_column_chunk });
     }

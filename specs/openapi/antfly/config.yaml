@@ -13,13 +13,13 @@ components:
       properties:
         provider:
           type: string
-          enum: [antfly, jev]
+          enum: [antfly, jev, openai]
         model:
           type: string
-          description: Required for Antfly; Jev defaults to jev-latest.
+          description: Required for Antfly and OpenAI; Jev defaults to jev-latest.
         url:
           type: string
-          description: Provider base URL; endpoint path is selected by provider.
+          description: Provider base URL; endpoint path is selected by provider. OpenAI defaults to https://api.openai.com/v1 and appends /decisions.
         api_key:
           type: string
           description: API key or secret reference. Defaults to the provider environment variable.

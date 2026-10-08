@@ -14056,11 +14056,16 @@ pub const ProvisionedTableWriteSource = struct {
                         null,
                         null,
                         status,
-                    ) catch |err| {
-                        std.log.warn(
-                            "compiled owner reconcile status publication failed table={s} group_id={d} err={s}",
-                            .{ table_name, group_id, @errorName(err) },
-                        );
+                    ) catch |err| switch (err) {
+                        error.RuntimeStatusPublicationFenced, error.RuntimeStatusPublicationContended => {
+                            // Durable reconciliation can finish while its own
+                            // lifecycle edge invalidates the sampled epoch.
+                            // Keep progress debt until a fresh observation is
+                            // published; otherwise the scheduler retires the
+                            // only owner that can make readiness visible.
+                            return self.deferredStartupCatchUpResult(table_name, group_id, metadata.advance_index_repairs, busy_result);
+                        },
+                        else => return err,
                     };
                 }
             }
@@ -32949,6 +32954,55 @@ fn consumerTests() type {
             try std.testing.expectEqual(@as(usize, 3), fake.calls);
         }
 
+        test "compiled startup catch-up retains debt after status publication is fenced" {
+            if (comptime !control_only_storage_sources) return error.SkipZigTest;
+            const alloc = std.testing.allocator;
+            const Fake = struct {
+                cache: *runtime_status.TableRuntimeSnapshotCache,
+                invalidate: bool = true,
+                fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) anyerror!?void {
+                    return error.UnexpectedBatch;
+                }
+                fn observe(ptr: *anyopaque, _: std.mem.Allocator, group: u64, table: []const u8, _: ?[]const u8, _: bool, _: db_mod.types.ArtifactRepairRunOptions, _: bool) anyerror!?table_write_source.LocalStructuralReconcileObservation {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    if (self.invalidate) self.cache.invalidateTable(table);
+                    return .{
+                        .result = .{ .state = .complete },
+                        .runtime_status = .{
+                            .group_id = group,
+                            .stats = .{},
+                            .metadata = .{
+                                .lsm_root_generation = table_reads.backend_current_root_generation,
+                                .source = .live_writer_publish,
+                                .freshness = .fresh,
+                            },
+                        },
+                    };
+                }
+            };
+            var cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
+            defer cache.deinit();
+            var fake = Fake{ .cache = &cache };
+            var source = ProvisionedTableWriteSource.init("/tmp/unused-owner-publication-retry", table_catalog.emptyCatalogSource());
+            defer source.deinit();
+            source.runtime_status_cache = &cache;
+            source.local_write_source = .{ .ptr = &fake, .vtable = &.{
+                .batch = Fake.batch,
+                .reconcile_table_group_local_observed = Fake.observe,
+            } };
+            const deferred = try source.catchUpTableGroupBestEffortWithMetadata(alloc, 7001, "docs", .{});
+            try std.testing.expect(deferred.busy and deferred.had_debt);
+            const debt = try source.snapshotDeferredStartupCatchUpGroups(alloc);
+            defer alloc.free(debt);
+            try std.testing.expectEqual(@as(usize, 1), debt.len);
+            fake.invalidate = false;
+            const complete = try source.catchUpTableGroupBestEffortWithMetadata(alloc, 7001, "docs", .{});
+            try std.testing.expect(!complete.busy and !complete.had_debt);
+            const cleared = try source.snapshotDeferredStartupCatchUpGroups(alloc);
+            defer alloc.free(cleared);
+            try std.testing.expectEqual(@as(usize, 0), cleared.len);
+        }
+
         test "compiled structural reconciliation publishes its owner observation and defers absent proof" {
             if (comptime !control_only_storage_sources) return error.SkipZigTest;
             const alloc = std.testing.allocator;
@@ -49341,11 +49395,15 @@ fn implementationTests() type {
             // configuration. Structural reconciliation must update this owner in
             // place; replacing the writer merely hides the lifecycle bug.
             _ = try source.source().batch(alloc, "docs", .{
-                .writes = &.{.{ .key = "seed", .value = "{\"title\":\"no managed field\"}" }},
+                .writes = &.{.{ .key = "seed", .value = "{\"body\":\"seed body\"}" }},
                 .sync_level = .write,
             });
             try std.testing.expect(write_cache.entries.items[0].db.enrichment_runtime == null);
             const resident_db = &write_cache.entries.items[0].db;
+            var repair_clock = @import("antfly_platform").clock.ManualClock{};
+            repair_clock.setRealtimeNs(backend_runtime.ptr().clock().nowRealtimeNs());
+            resident_db.index_repair_clock = repair_clock.clock();
+            defer resident_db.index_repair_clock = null;
 
             const AdmissionBoundary = struct {
                 var observations: usize = 0;
@@ -49392,6 +49450,12 @@ fn implementationTests() type {
                     ProvisionedTableWriteSource.StructuralReconcileGroupOutcome.busy,
                     reconcile_outcome,
                 );
+                // Honor the repair owner's audit wake instead of spinning
+                // before its deadline or sleeping in wall-clock time.
+                const repair = try resident_db.indexRepairIntentSummary(alloc);
+                if (repair.earliest_retry_at_ms > repair_clock.clock().nowRealtimeMs()) {
+                    repair_clock.setRealtimeNs(repair.earliest_retry_at_ms *| std.time.ns_per_ms);
+                }
             }
             try std.testing.expectEqual(
                 ProvisionedTableWriteSource.StructuralReconcileGroupOutcome.complete,
@@ -49402,17 +49466,18 @@ fn implementationTests() type {
             try std.testing.expect(resident_db == &write_cache.entries.items[0].db);
             try std.testing.expect(write_cache.entries.items[0].db.enrichment_runtime != null);
 
+            const requests_before_write = FakeEmbeddingProvider.request_count.load(.monotonic);
             _ = try source.source().batch(alloc, "docs", .{
                 .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"alpha body\"}" }},
                 .sync_level = .write,
             });
 
             var attempts: usize = 0;
-            while (attempts < 100 and FakeEmbeddingProvider.request_count.load(.monotonic) == 0) : (attempts += 1) {
+            while (attempts < 100 and FakeEmbeddingProvider.request_count.load(.monotonic) <= requests_before_write) : (attempts += 1) {
                 sleepNs(50 * std.time.ns_per_ms);
             }
 
-            try std.testing.expect(FakeEmbeddingProvider.request_count.load(.monotonic) > 0);
+            try std.testing.expect(FakeEmbeddingProvider.request_count.load(.monotonic) > requests_before_write);
         }
 
         test "provisioned managed replay tails converge and publish without later traffic" {
@@ -54284,7 +54349,9 @@ fn implementationTests() type {
                 .sync_level = .write,
             });
             try cached.db.runDerivedUntil(cached.db.core.nextDerivedSequence());
-            try std.testing.expect(source.publishManagedRuntimeStatusBestEffort("docs", 7001, cached.db));
+            // Establish the baseline under an owned observation; the contract
+            // below concerns target overlays, not opportunistic admission.
+            try publishRuntimeStatusSnapshotConsistent(&source, alloc, "docs", 7001, cached.db);
 
             _ = try cached.db.batch(.{
                 .writes = &.{.{ .key = "doc:b", .value = "{\"title\":\"beta\",\"embedding\":[2,3]}" }},
@@ -54320,7 +54387,23 @@ fn implementationTests() type {
             // exact owner observation and must be able to discharge the target fence;
             // carrying the cached false bit forward would leave completion unknown
             // forever after restart.
-            try std.testing.expect(source.overlayCachedManagedRuntimeStatusBestEffort("docs", 7001, cached.db));
+            // Admission is nonblocking and native publication may still hold the
+            // apply lock. Wait for the exact owner observation, rather than requiring
+            // the first opportunistic sample to win a scheduling race. Observing
+            // the target alone does not prove that asynchronous replay converged.
+            const observation_deadline_ns = platform_time.monotonicNs() + 15 * std.time.ns_per_s;
+            while (platform_time.monotonicNs() < observation_deadline_ns) {
+                _ = source.overlayCachedManagedRuntimeStatusBestEffort("docs", 7001, cached.db);
+                var observed = (try source.source().localRuntimeStatuses(alloc, "docs")).?;
+                const index_status = observed.items[0].stats.indexes[0];
+                const complete = observed.items[0].metadata.target_observation_complete and
+                    index_status.replay_target_sequence == 2 and
+                    index_status.replay_applied_sequence == 2 and
+                    !index_status.replay_catch_up_required;
+                observed.deinit(alloc);
+                if (complete) break;
+                try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+            }
             {
                 var statuses = (try source.source().localRuntimeStatuses(alloc, "docs")).?;
                 defer statuses.deinit(alloc);
@@ -54329,8 +54412,9 @@ fn implementationTests() type {
                 try std.testing.expectEqual(@as(u64, 2), item.replay_applied_sequence);
                 try std.testing.expect(!item.replay_catch_up_required);
                 // Replay convergence does not complete asynchronous native projection
-                // publication. Any remaining backfill here must be that explicit debt.
-                try std.testing.expectEqual(item.dense_vector_projection_pending, item.backfill_active);
+                // publication. Any remaining backfill must be that explicit debt;
+                // native validation can still be pending after backfill finishes.
+                if (item.backfill_active) try std.testing.expect(item.dense_vector_projection_pending);
                 try std.testing.expect(statuses.items[0].metadata.target_observation_complete);
             }
 
@@ -54345,7 +54429,7 @@ fn implementationTests() type {
 
             // A global replay entry for another managed-index kind must not recreate
             // dense replay debt in the next authoritative owner publication.
-            try std.testing.expect(source.publishManagedRuntimeStatusBestEffort("docs", 7001, cached.db));
+            try publishRuntimeStatusSnapshotConsistent(&source, alloc, "docs", 7001, cached.db);
             var statuses = (try source.source().localRuntimeStatuses(alloc, "docs")).?;
             defer statuses.deinit(alloc);
             try std.testing.expectEqual(@as(u64, 2), statuses.items[0].stats.indexes[0].replay_target_sequence);

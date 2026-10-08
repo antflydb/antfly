@@ -1,5 +1,18 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Elastic-2.0
+//
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
+//
+//     https://www.antfly.io/licensing/ELv2-license
+//
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
+
 //! Leased native row-index consumption. Seek candidates in bounded windows,
 //! hydrate physical vectors, then apply deletes and residuals before delivery.
 const std = @import("std");
@@ -16,10 +29,15 @@ const Owner = struct {
     arena: std.heap.ArenaAllocator,
     source: *local.serverless_query_lake_serving.ServingSource,
     store: Store,
+    owns_store: bool = true,
+    store_identity: [32]u8,
     artifacts: @import("../serverless/artifacts/store.zig").ArtifactStore,
     lease: ?*@import("lake_index_reader_lease.zig").Handle = null,
     reader: ordered.Reader = undefined,
     reader_open: bool = false,
+    predicate_lower: []const u8 = "",
+    predicate_upper: ?[]const u8 = null,
+    predicate_count: u64 = 0,
     metadata: ?@import("lake_index_decoded_metadata.zig").Owned(ordered.Root) = null,
     table: catalog.Table,
     request: catalog.Scan,
@@ -29,6 +47,7 @@ const Owner = struct {
     child_exhausted: bool = false,
     window: std.heap.ArenaAllocator,
     cover_arena: std.heap.ArenaAllocator,
+    cover_lease: ?@import("lake_index_decoded_metadata.zig").Owned(local.sql_spill.ColumnarBlock) = null,
     cover_candidates: []const ordered.Reader.Entry = &.{},
     cover_candidate_offset: usize = 0,
     cursor_header: ?[local.storage_db_relational_row_cursor.identity_len]u8 = null,
@@ -55,9 +74,10 @@ const Owner = struct {
         if (self.lease) |lease| lease.deinit();
         if (self.ordered_store) |*store| store.deinit();
         self.window.deinit();
+        if (self.cover_lease) |owned| owned.release();
         self.cover_arena.deinit();
         self.arena.deinit();
-        self.store.deinit();
+        if (self.owns_store) self.store.deinit();
         self.a.destroy(self);
     }
     fn canceled(raw: *const anyopaque) bool {
@@ -175,6 +195,19 @@ const Owner = struct {
         const covered = self.covered_blocks[row];
         return covered.block.cell(covered.row, column);
     }
+    fn coveredIdentity(raw: *anyopaque, row: usize, column: usize) !?u64 {
+        const self: *Owner = @ptrCast(@alignCast(raw));
+        const covered = self.covered_blocks[row];
+        return covered.block.dictionaryIdentity(covered.row, column, false);
+    }
+    fn coveredDictionary(raw: *anyopaque, a: A, column: usize) !?local.sql_execution_batch.Batch {
+        const self: *Owner = @ptrCast(@alignCast(raw));
+        // Each covering window belongs to exactly one authenticated block.
+        const dictionary = (try self.covered_blocks[0].block.dictionaryColumn(a, column, false)) orelse return null;
+        const indices = try a.alloc(u32, self.covered_blocks.len);
+        for (indices, self.covered_blocks) |*id, covered| id.* = dictionary.dictionary.indices[covered.row];
+        return .{ .dictionary = .{ .values = dictionary.dictionary.values, .indices = indices } };
+    }
     fn nextCovered(self: *Owner, limit: u32) !catalog.ColumnPage {
         if (limit == 0) return error.InvalidRelationalRowsRequest;
         try self.read_context.ensureActive();
@@ -186,6 +219,8 @@ const Owner = struct {
                 self.cover_candidate_offset = 0;
                 if (self.cover_candidates.len == 0) return .{ .selection = &.{} };
             }
+            if (self.cover_lease) |owned| owned.release();
+            self.cover_lease = null;
             _ = self.cover_arena.reset(.retain_capacity);
             const a = self.cover_arena.allocator();
             const begin = self.cover_candidate_offset;
@@ -198,8 +233,14 @@ const Owner = struct {
             self.covered_entries = self.cover_candidates[begin..end];
             self.cover_candidate_offset = end;
             try @import("../serverless/artifacts/store.zig").chargeReadBudget(&self.reader.remaining_reads, cover.block.byte_len);
-            const bytes = try @import("lake_index_aggregate_artifact.zig").readArtifact(a, self.artifacts, cover.block, self.reader.pages.cancellation, self.reader.cached);
-            const block = try local.sql_spill.decodeColumnarBlockInArena(a, bytes, @import("lake_index_aggregate_artifact.zig").max_block_bytes);
+            const block = if (self.reader.cached) |cached| cached_block: {
+                const owned = try @import("lake_index_decoded_metadata.zig").acquireColumnBlock(cached, self.artifacts, cover.block, self.reader.pages.cancellation);
+                self.cover_lease = owned;
+                break :cached_block owned.value.*;
+            } else uncached: {
+                const bytes = try @import("lake_index_aggregate_artifact.zig").readArtifact(a, self.artifacts, cover.block, self.reader.pages.cancellation, null);
+                break :uncached try local.sql_spill.decodeColumnarBlockInArena(a, bytes, @import("lake_index_aggregate_artifact.zig").max_block_bytes);
+            };
             if (block.values.len != self.reader.root.cover.len or block.keys.len != 1) return error.InvalidNativeLakeRowIndex;
             const covered = try a.alloc(@typeInfo(@TypeOf(self.covered_blocks)).pointer.child, self.covered_entries.len);
             for (self.covered_entries, covered) |entry, *position| {
@@ -210,11 +251,37 @@ const Owner = struct {
                 position.* = .{ .block = block, .row = candidate.row };
             }
             self.covered_blocks = covered;
-            self.covered_batch = .{ .reader = .{ .ptr = self, .read = coveredCell, .count = covered.len, .width = self.reader.root.cover.len } };
+            self.covered_batch = .{ .reader = .{ .ptr = self, .read = coveredCell, .read_identity = coveredIdentity, .read_dictionary = coveredDictionary, .count = covered.len, .width = self.reader.root.cover.len } };
             var selected: std.ArrayList(usize) = .empty;
-            for (covered, 0..) |_, row| {
+            const mask = try a.alloc(bool, covered.len);
+            @memset(mask, true);
+            // Evaluate each predicate once per dictionary identity. Surviving
+            // lanes alone participate, preserving short-circuit error behavior.
+            for (self.request.conditions) |condition| {
+                var results: std.AutoHashMapUnmanaged(u64, bool) = .empty;
+                defer results.deinit(a);
+                var column: ?usize = null;
+                for (self.reader.root.cover, 0..) |name, i| if (std.mem.eql(u8, name, condition.column)) {
+                    column = i;
+                    break;
+                };
+                for (mask, 0..) |*keep, row| {
+                    if (!keep.*) continue;
+                    const one: catalog.ColumnPage = .{ .native = .{ .values = &self.covered_batch, .names = self.reader.root.cover }, .selection = &.{row} };
+                    const identity = if (column) |c| try self.covered_batch.dictionaryIdentity(row, c) else null;
+                    if (identity) |id| {
+                        if (results.get(id)) |cached| {
+                            keep.* = cached;
+                            continue;
+                        }
+                    }
+                    keep.* = try local.sql_lake_cursor.matchesColumns(one, a, self.table, &.{condition});
+                    if (identity) |id| try results.put(a, id, keep.*);
+                }
+            }
+            for (mask, 0..) |keep, row| {
+                if (!keep) continue;
                 const one: catalog.ColumnPage = .{ .native = .{ .values = &self.covered_batch, .names = self.reader.root.cover }, .selection = &.{row} };
-                if (!try local.sql_lake_cursor.matchesColumns(one, a, self.table, self.request.conditions)) continue;
                 if (self.dynamic) |filter| {
                     const values = try a.alloc(local.sql_scalar.Datum, filter.columns.len);
                     defer a.free(values);
@@ -347,13 +414,213 @@ const Owner = struct {
     }
 };
 
+/// An exact tuple-bound predicate. Published rows already enforce snapshot deletes.
+/// This handle never opens a Parquet hydration cursor.
+pub const Predicate = struct {
+    cursor: catalog.Cursor,
+    scan: bool = false,
+    work: u64 = 0,
+    pub fn deinit(self: *Predicate) void {
+        self.cursor.close(self.cursor.ptr);
+    }
+    pub fn estimatedRows(self: Predicate) u64 {
+        if (self.scan) return std.math.maxInt(u64);
+        const owner: *Owner = @ptrCast(@alignCast(self.cursor.ptr));
+        return owner.predicate_count;
+    }
+    pub fn hasBlocks(self: Predicate) bool {
+        if (self.scan) return false;
+        const owner: *Owner = @ptrCast(@alignCast(self.cursor.ptr));
+        return owner.reader.root.predicates != null;
+    }
+    pub fn nextBlocks(self: *Predicate, a: A) ![]const ordered.predicate_blocks.Block {
+        const owner: *Owner = @ptrCast(@alignCast(self.cursor.ptr));
+        try owner.read_context.ensureActive();
+        return owner.reader.nextPredicateBlocks(a, owner.predicate_lower, owner.predicate_upper);
+    }
+    pub fn nextPhysical(self: *Predicate, a: A, count: usize) ![]const local.storage_rowsource_types.RowRef {
+        if (self.scan) return self.next(a, count);
+        const owner: *Owner = @ptrCast(@alignCast(self.cursor.ptr));
+        try owner.read_context.ensureActive();
+        return owner.reader.nextPhysical(a, count, owner.predicate_lower, owner.predicate_upper);
+    }
+    pub fn next(self: *Predicate, a: A, count: usize) ![]const local.storage_rowsource_types.RowRef {
+        if (self.scan) while (true) {
+            const page = try self.cursor.next_columns.?(self.cursor.ptr, a, @intCast(count));
+            if (page.native != null) return error.InvalidSqlBackendResponse;
+            if (page.selection.len == 0) {
+                if (page.after == null) return &.{};
+                continue;
+            }
+            const refs = try a.alloc(local.storage_rowsource_types.RowRef, page.selection.len);
+            for (refs, page.selection) |*ref, position| ref.* = page.batch.row_refs[position];
+            return refs;
+        };
+        const owner: *Owner = @ptrCast(@alignCast(self.cursor.ptr));
+        try owner.read_context.ensureActive();
+        return owner.reader.next(a, count);
+    }
+};
+/// Borrowed only for the lifetime of the outer query's publication lease.
+/// Reusing this authorization avoids reopening a client/lease for every conjunct.
+pub const PredicateContext = struct {
+    artifacts: @import("../serverless/artifacts/store.zig").ArtifactStore,
+    store_identity: [32]u8,
+    domain: [32]u8,
+    declarations: []const local.serverless_segment_sidecar_manifest.DeclaredArtifact,
+    read_context: local.serverless_query_lake_read_context.Context,
+};
+
+pub fn tryOpenPredicate(a: A, server: *server_api.ApiHttpServer, table: catalog.Table, conditions: []const catalog.Condition, context: operation.RequestContext, source: *local.serverless_query_lake_serving.ServingSource) !?Predicate {
+    return tryOpenPredicateWithContext(a, server, table, conditions, context, source, null);
+}
+
+pub fn tryOpenPredicateWithContext(a: A, server: *server_api.ApiHttpServer, table: catalog.Table, conditions: []const catalog.Condition, context: operation.RequestContext, source: *local.serverless_query_lake_serving.ServingSource, pinned: ?PredicateContext) !?Predicate {
+    const definitions = table.external_indexes orelse return null;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var parsed = try local.schema_mod.parseValidatedTableSchema(a, definitions.schema_json);
+    defer parsed.deinit(a);
+    const ca = arena.allocator();
+    const indexes = (try parsed.relationalIndexDefinitions(ca)) orelse return null;
+    var best: ?Predicate = null;
+    errdefer if (best) |*predicate| predicate.deinit();
+    for (indexes) |index| {
+        const indexed = (try chooseAccess(ca, &.{index}, .{ .fields = &.{}, .conditions = conditions, .limit = 1024 })) orelse continue;
+        var work: u64 = 0;
+        const opened = openWithContext(a, server, table, indexed, context, source, .automatic, &work, true, pinned) catch |err| switch (err) {
+            error.InvalidBatchRequest => continue,
+            else => return err,
+        };
+        if (opened) |cursor| {
+            var candidate: Predicate = .{ .cursor = cursor, .work = work };
+            if (best == null or work < best.?.work) {
+                if (best) |*previous| previous.deinit();
+                best = candidate;
+            } else candidate.deinit();
+        }
+    }
+    return best;
+}
+
+/// Relative work for vectorized projected decoding/evaluation. Inventory bytes
+/// and rows are upper estimates: no guessed selectivity or LIMIT credit.
+/// Null means the inventory has not established a row-count estimate.
+pub fn predicateScanWork(source: *local.serverless_query_lake_serving.ServingSource, conditions: []const catalog.Condition) ?u64 {
+    var count: u64 = 0;
+    for (conditions, 0..) |condition, i| {
+        var duplicate = false;
+        for (conditions[0..i]) |previous| if (std.mem.eql(u8, previous.column, condition.column)) {
+            duplicate = true;
+            break;
+        };
+        if (!duplicate) count +|= 1;
+    }
+    var rows_count: u64 = 0;
+    var bytes: u64 = 0;
+    for (source.inventory.files) |file| {
+        var group_rows: u64 = 0;
+        for (file.row_groups) |group| group_rows +|= group.row_count;
+        const file_rows = @max(file.row_count, group_rows);
+        // Prefix discovery deliberately has no footer row count. Zero there
+        // does not prove an empty file, even when no column statistics exist.
+        if (file_rows == 0 and file.row_groups.len == 0 and file.byte_len != 0) return null;
+        rows_count +|= file_rows;
+        bytes +|= predicateProjectedBytes(file, conditions);
+    }
+    return (rows_count *| count +| 31) / 32 +| (bytes +| 1023) / 1024;
+}
+
+pub fn predicateResidualWork(source: *local.serverless_query_lake_serving.ServingSource, conditions: []const catalog.Condition, candidates: u64) u64 {
+    if (candidates == 0) return 0;
+    var bytes: u64 = 0;
+    var groups: u64 = 0;
+    for (source.inventory.files) |file| {
+        bytes +|= predicateProjectedBytes(file, conditions);
+        // Without group metadata, gathering even one candidate may read the
+        // whole file. Charge one conservative decode region for that file.
+        groups +|= @max(@as(u64, 1), file.row_groups.len);
+    }
+    // Without clustering evidence, a gather can touch every projected group.
+    const gather = if (groups == 0) 0 else (bytes / groups) *| @min(candidates, groups);
+    return (candidates *| conditions.len +| 31) / 32 +| (gather +| 1023) / 1024;
+}
+
+/// Use projected chunk bytes when complete, otherwise the full file length
+/// as an upper estimate. Missing projection metadata never means free I/O.
+fn predicateProjectedBytes(file: local.serverless_external_source_types.FileEntry, conditions: []const catalog.Condition) u64 {
+    if (conditions.len == 0) return 0;
+    if (file.row_groups.len == 0) return file.byte_len;
+    var bytes: u64 = 0;
+    for (file.row_groups) |group| {
+        for (conditions) |condition| {
+            var found = false;
+            for (group.column_chunks) |chunk| if (std.mem.eql(u8, chunk.column_id, condition.column) and chunk.compressed_len != 0) {
+                found = true;
+                break;
+            };
+            if (!found) return file.byte_len;
+        }
+        for (group.column_chunks) |chunk| for (conditions) |condition| if (std.mem.eql(u8, chunk.column_id, condition.column)) {
+            bytes +|= chunk.compressed_len;
+            break;
+        };
+    }
+    return bytes;
+}
+
+fn predicateIndexWork(candidates: u64, metadata_bytes: u64, resident_metadata: bool) u64 {
+    // Tuple/predicate decoding is less sequential than projected column batches.
+    // Resident metadata needs no provider setup; cold metadata has a fixed seek
+    // charge plus authenticated bytes. These are work estimates, not milliseconds.
+    return (candidates +| 7) / 8 +| (if (resident_metadata) @as(u64, 8) else 64 +| (metadata_bytes +| 1023) / 1024);
+}
+
+fn searchConditionsCompatible(runtime: local.storage_schema.TableSchema, conditions: []const catalog.Condition) bool {
+    for (conditions) |condition| {
+        const kind = for (runtime.relational_columns) |column| {
+            if (std.mem.eql(u8, column.name, condition.column)) break column.column_type;
+        } else return false;
+        const compatible = switch (kind) {
+            .string => condition.value == .string and (condition.op == .eq or blk: {
+                // The shared standard-range evaluator interprets RFC3339
+                // bounds chronologically; a lexical tuple index cannot prove it.
+                _ = local.storage_db_query_graph_exec.jsonDateNsFromValue(condition.value) catch break :blk true;
+                break :blk false;
+            }),
+            .integer => condition.value == .integer,
+            .number => condition.value == .float or (condition.value == .integer and blk: {
+                const rounded: f64 = @floatFromInt(condition.value.integer);
+                break :blk (@as(i128, @intFromFloat(rounded)) == condition.value.integer);
+            }),
+            .boolean => condition.value == .bool,
+            .datetime => false,
+            else => false,
+        };
+        if (!compatible) return false;
+    }
+    return true;
+}
+
+/// Exact typed fallback shares SQL's partition, row-group and page pruning.
+/// It emits bounded physical selections, never an accumulated document-ID list.
+pub fn tryOpenPredicateScan(a: A, table: catalog.Table, conditions: []const catalog.Condition, context: operation.RequestContext, source: *local.serverless_query_lake_serving.ServingSource) !?Predicate {
+    const definitions = table.external_indexes orelse return null;
+    var parsed = try local.schema_mod.parseValidatedTableSchema(a, definitions.schema_json);
+    defer parsed.deinit(a);
+    const runtime = try local.schema_mod.deriveRuntimeTableSchema(a, parsed);
+    defer local.storage_schema.freeSchema(a, runtime);
+    if (!searchConditionsCompatible(runtime, conditions)) return null;
+    return .{ .scan = true, .cursor = try local.sql_lake_cursor.openPinned(a, table, .{ .fields = &.{}, .conditions = conditions, .limit = 1024 }, context, source) };
+}
+
 pub fn openPinned(a: A, server: *server_api.ApiHttpServer, table: catalog.Table, request: catalog.Scan, context: operation.RequestContext, source: *local.serverless_query_lake_serving.ServingSource) !catalog.Cursor {
-    return (try openWithPolicy(a, server, table, request, context, source, .required, null)) orelse error.ExternalLakeIndexUnavailable;
+    return (try openWithPolicy(a, server, table, request, context, source, .required, null, false)) orelse error.ExternalLakeIndexUnavailable;
 }
 
 pub fn tryOpenAuto(a: A, server: *server_api.ApiHttpServer, table: catalog.Table, request: catalog.Scan, context: operation.RequestContext, source: *local.serverless_query_lake_serving.ServingSource) !?catalog.Cursor {
     if (request.index_range != null or request.primary_order or request.row_refs != null or request.primary_key != null) return null;
-    if (request.index_equality != null) return openWithPolicy(a, server, table, request, context, source, .automatic, null);
+    if (request.index_equality != null) return openWithPolicy(a, server, table, request, context, source, .automatic, null, false);
     const definitions = table.external_indexes orelse return null;
     if (definitions.schema_json.len == 0 or server.source.lakeIndexLifecycleAuthority(context) == null) return null;
     var arena = std.heap.ArenaAllocator.init(a);
@@ -370,7 +637,7 @@ pub fn tryOpenAuto(a: A, server: *server_api.ApiHttpServer, table: catalog.Table
     for (indexes) |index| {
         const indexed = (try chooseAccess(ca, &.{index}, request)) orelse continue;
         var cost: u64 = 0;
-        const cursor = (try openWithPolicy(a, server, table, indexed, context, source, .automatic, &cost)) orelse continue;
+        const cursor = (try openWithPolicy(a, server, table, indexed, context, source, .automatic, &cost, false)) orelse continue;
         if (cost < best_cost) {
             if (best) |prior| prior.close(prior.ptr);
             best = cursor;
@@ -436,7 +703,10 @@ fn chooseAccess(a: A, indexes: []const local.storage_relational_index.Relational
     return best;
 }
 
-fn openWithPolicy(a: A, server: *server_api.ApiHttpServer, table: catalog.Table, request: catalog.Scan, context: operation.RequestContext, source: *local.serverless_query_lake_serving.ServingSource, policy: @import("lake_index_selection.zig").Policy, estimated_cost: ?*u64) !?catalog.Cursor {
+fn openWithPolicy(a: A, server: *server_api.ApiHttpServer, table: catalog.Table, request: catalog.Scan, context: operation.RequestContext, source: *local.serverless_query_lake_serving.ServingSource, policy: @import("lake_index_selection.zig").Policy, estimated_cost: ?*u64, identities_only: bool) !?catalog.Cursor {
+    return openWithContext(a, server, table, request, context, source, policy, estimated_cost, identities_only, null);
+}
+fn openWithContext(a: A, server: *server_api.ApiHttpServer, table: catalog.Table, request: catalog.Scan, context: operation.RequestContext, source: *local.serverless_query_lake_serving.ServingSource, policy: @import("lake_index_selection.zig").Policy, estimated_cost: ?*u64, identities_only: bool, pinned: ?PredicateContext) !?catalog.Cursor {
     const index_name = if (request.index_range) |range| range.name else if (request.index_equality) |equality| equality.name else return error.ExternalLakeIndexUnavailable;
     if (request.primary_order or request.row_refs != null) return error.UnsupportedSqlExecution;
     const definitions = table.external_indexes orelse return error.ExternalLakeIndexUnavailable;
@@ -446,32 +716,41 @@ fn openWithPolicy(a: A, server: *server_api.ApiHttpServer, table: catalog.Table,
     var catalog_state = try local.metadata_lake_index_catalog.parse(a, definitions.catalog_json);
     defer catalog_state.deinit();
     const publication = catalog_state.value.published orelse return if (policy == .automatic) null else error.ExternalLakeIndexNotPublished;
-    const store = Store.openNative(a, server.cfg.node_config, server.cfg.secret_store, true, server.cfg.deployment_mode, server.cfg.native_lake_artifact_base_dir) catch |err| {
-        try context.ensureActive();
-        if (policy == .automatic and err != error.OutOfMemory) return null;
-        return err;
-    };
+    var store: Store = undefined;
+    if (pinned) |shared| {
+        try shared.read_context.ensureActive();
+    } else {
+        store = Store.openNative(a, server.cfg.node_config, server.cfg.secret_store, true, server.cfg.deployment_mode, server.cfg.native_lake_artifact_base_dir) catch |err| {
+            try context.ensureActive();
+            if (policy == .automatic and err != error.OutOfMemory) return null;
+            return err;
+        };
+    }
     const owner = a.create(Owner) catch |err| {
-        var cleanup = store;
-        cleanup.deinit();
+        if (pinned == null) store.deinit();
         return err;
     };
-    owner.* = .{ .a = a, .arena = .init(a), .window = .init(a), .cover_arena = .init(a), .source = source, .store = store, .artifacts = undefined, .table = table, .request = request, .context = context, .read_context = read_context };
+    owner.* = .{ .a = a, .arena = .init(a), .window = .init(a), .cover_arena = .init(a), .source = source, .store = store, .owns_store = pinned == null, .store_identity = if (pinned) |shared| shared.store_identity else store.identity, .artifacts = undefined, .table = table, .request = request, .context = context, .read_context = if (pinned) |shared| shared.read_context else read_context };
+    owner.artifacts = if (pinned) |shared| shared.artifacts else owner.store.artifactStore();
     var keep = false;
     defer if (!keep) Owner.close(owner);
     const ca = owner.arena.allocator();
-    owner.lease = server.lake_reader_leases.acquire(server.embedding_provider_runtime.io, authority, table.id, publication.generation, read_context) catch |err| {
-        try context.ensureActive();
-        if (policy == .automatic and err != error.OutOfMemory and err != error.MetadataMutationOutcomeUnknown) return null;
-        return err;
-    };
-    owner.read_context = owner.lease.?.readContext();
-    var selected = (try @import("lake_index_selection.zig").selectCached(ca, table, source, &owner.store, owner.read_context, policy, &server.lake_read_cache)) orelse return null;
-    defer selected.deinit();
+    var selected: ?@import("lake_index_selection.zig").Selected = null;
+    defer if (selected) |*selection| selection.deinit();
+    if (pinned == null) {
+        owner.lease = server.lake_reader_leases.acquire(server.embedding_provider_runtime.io, authority, table.id, publication.generation, read_context) catch |err| {
+            try context.ensureActive();
+            if (policy == .automatic and err != error.OutOfMemory and err != error.MetadataMutationOutcomeUnknown) return null;
+            return err;
+        };
+        owner.read_context = owner.lease.?.readContext();
+        selected = (try @import("lake_index_selection.zig").selectCached(ca, table, source, &owner.store, owner.read_context, policy, &server.lake_read_cache)) orelse return null;
+    }
     var parsed = try local.schema_mod.parseValidatedTableSchema(a, definitions.schema_json);
     defer parsed.deinit(a);
     const runtime = try local.schema_mod.deriveRuntimeTableSchema(a, parsed);
     defer local.storage_schema.freeSchema(a, runtime);
+    if (identities_only and !searchConditionsCompatible(runtime, request.conditions)) return null;
     var layout = try local.storage_db_algebraic_relational_row_codec.PhysicalLayout.init(a, runtime);
     defer layout.deinit();
     const indexes = (try parsed.relationalIndexDefinitions(ca)) orelse return error.ExternalLakeIndexUnavailable;
@@ -519,14 +798,16 @@ fn openWithPolicy(a: A, server: *server_api.ApiHttpServer, table: catalog.Table,
         upper = try prefixSuccessor(ca, lower);
     }
     const name = try native_rows.logicalName(ca, index_name);
-    const declaration = for (selected.publication().declarations) |decl| {
+    const declarations = if (pinned) |shared| shared.declarations else selected.?.publication().declarations;
+    const declaration = for (declarations) |decl| {
         if (decl.artifact.kind == .ordered_row_index and std.mem.eql(u8, decl.name, name)) break decl;
     } else return if (policy == .automatic) null else error.ExternalLakeRowIndexNotPublished;
-    owner.artifacts = owner.store.artifactStore();
     const cancel: operation.CancellationToken = .{ .ptr = owner, .is_cancelled_fn = Owner.canceled };
-    owner.metadata = try @import("lake_index_decoded_metadata.zig").acquire(ordered.Root, .{ .cache = &server.lake_read_cache, .scope = owner.store.identity, .context = owner.read_context }, owner.artifacts, declaration.artifact, cancel, ordered.loadRoot);
+    const resident_metadata = if (identities_only) try @import("lake_index_decoded_metadata.zig").resident(ordered.Root, .{ .cache = &server.lake_read_cache, .scope = owner.store_identity, .context = owner.read_context }, declaration.artifact) else false;
+    owner.metadata = try @import("lake_index_decoded_metadata.zig").acquire(ordered.Root, .{ .cache = &server.lake_read_cache, .scope = owner.store_identity, .context = owner.read_context }, owner.artifacts, declaration.artifact, cancel, ordered.loadRoot);
     const root = owner.metadata.?.value.*;
-    const domain = @import("lake_index_publication.zig").uploadDomainWithNamespace(table.id, owner.store.identity, selected.publication().namespace);
+    if (identities_only and (!std.mem.eql(u8, root.source, source.inventory.source_id) or !std.mem.eql(u8, root.snapshot, source.inventory.snapshot_id))) return error.ExternalLakeSnapshotMismatch;
+    const domain = if (pinned) |shared| shared.domain else @import("lake_index_publication.zig").uploadDomainWithNamespace(table.id, owner.store_identity, selected.?.publication().namespace);
     if (!std.mem.eql(u8, &root.domain, &domain)) return error.InvalidNativeLakeRowIndex;
     const expected = native_rows.fingerprint(tuple, predicate, try native_rows.coverColumns(ca, definition));
     if (request.index_range) |range| {
@@ -550,7 +831,7 @@ fn openWithPolicy(a: A, server: *server_api.ApiHttpServer, table: catalog.Table,
     if (upper) |end| {
         if (std.mem.order(u8, lower, end) != .lt) empty_range = true;
     }
-    try owner.reader.initCached(a, &owner.artifacts, root, expected, lower, upper, cancel, .{ .cache = &server.lake_read_cache, .scope = owner.store.identity, .context = owner.read_context });
+    try owner.reader.initCached(a, &owner.artifacts, root, expected, lower, upper, cancel, .{ .cache = &server.lake_read_cache, .scope = owner.store_identity, .context = owner.read_context });
     if (empty_range) owner.reader.exhausted = true;
     owner.reader_open = true;
     owner.covered = root.cover.len != 0;
@@ -570,15 +851,35 @@ fn openWithPolicy(a: A, server: *server_api.ApiHttpServer, table: catalog.Table,
         equal_count += 1;
     }
     const order_satisfied = request.index_range != null and orderedBy(definition, request, equal_count);
+    if (identities_only and !rangeEnforcesConditions(definition, request, equal_count)) return null;
+    if (identities_only) {
+        owner.predicate_lower = lower;
+        owner.predicate_upper = upper;
+        owner.predicate_count = if (empty_range) 0 else try owner.reader.countRange(ca, lower, upper);
+    }
     if (estimated_cost) |cost| {
-        const candidates = if (empty_range) 0 else try owner.reader.countRange(ca, lower, upper);
-        var source_rows: u64 = 0;
-        for (source.inventory.files) |file| source_rows +|= file.row_count;
-        source_rows = @max(source_rows, if (root.page) |page| page.records else 0);
-        cost.* = accessCost(candidates, owner.covered, order_satisfied);
-        // Broad non-covering ranges prefer sequential physical page decoding.
-        const scan_cost = source_rows *| @as(u64, if (order_satisfied) 2 else 1);
-        if (cost.* > scan_cost and candidates != 0) return null;
+        if (identities_only) {
+            cost.* = predicateIndexWork(owner.predicate_count, declaration.artifact.byte_len, resident_metadata);
+        } else {
+            const candidates = if (empty_range) 0 else try owner.reader.countRange(ca, lower, upper);
+            var source_rows: u64 = 0;
+            for (source.inventory.files) |file| source_rows +|= file.row_count;
+            source_rows = @max(source_rows, if (root.page) |page| page.records else 0);
+            var physical_bytes: u64 = 0;
+            var row_groups: u64 = 0;
+            for (source.inventory.files) |file| {
+                for (file.row_groups) |group| {
+                    row_groups +|= 1;
+                    for (group.column_chunks) |chunk| {
+                        if (covers(request.fields, chunk.column_id)) physical_bytes +|= chunk.compressed_len;
+                    }
+                }
+            }
+            const goal = if (rangeEnforcesConditions(definition, request, equal_count)) request.row_goal else null;
+            cost.* = estimatedAccessCost(candidates, owner.covered, order_satisfied, goal, physical_bytes, row_groups);
+            const scan_cost = (source_rows +| (physical_bytes / 1024)) *| @as(u64, if (order_satisfied) 2 else 1);
+            if (cost.* > scan_cost and candidates != 0) return null;
+        }
     }
     keep = true;
     return .{ .order_satisfied = order_satisfied, .ptr = owner, .next = Owner.next, .next_columns = Owner.nextColumns, .set_dynamic_filter = Owner.setDynamicFilter, .close = Owner.close };
@@ -610,6 +911,38 @@ fn covers(columns: []const []const u8, field: []const u8) bool {
     return false;
 }
 
+test "external lake predicate costs prefer selective seeks and broad projected scans without double counting bounds" {
+    const external = local.serverless_external_source_types;
+    var chunks = [_]external.ColumnChunk{
+        .{ .column_id = @constCast("amount"), .file_offset = 0, .compressed_len = 16384 },
+        .{ .column_id = @constCast("unprojected_payload"), .file_offset = 16384, .compressed_len = 100000000 },
+    };
+    var groups = [_]external.RowGroup{.{ .ordinal = 0, .row_count = 10000, .column_chunks = &chunks }};
+    var files = [_]external.FileEntry{.{ .file_id = @constCast("file"), .object_uri = @constCast("file://file"), .byte_len = 100016384, .row_count = 10000, .row_groups = &groups }};
+    var source: local.serverless_query_lake_serving.ServingSource = undefined;
+    source.inventory = .{ .format = .parquet, .source_id = @constCast("source"), .source_uri = @constCast("file://source"), .snapshot_id = @constCast("snapshot"), .schema_fingerprint = @constCast("schema"), .files = &files };
+    const lower: catalog.Condition = .{ .column = "amount", .op = .gte, .value = .{ .integer = 0 } };
+    const upper: catalog.Condition = .{ .column = "amount", .op = .lt, .value = .{ .integer = 10000 } };
+    const scan = predicateScanWork(&source, &.{lower}).?;
+    try std.testing.expectEqual(scan, predicateScanWork(&source, &.{ lower, upper }).?);
+    try std.testing.expect(predicateIndexWork(1, 1024, true) < scan);
+    try std.testing.expect(predicateIndexWork(10000, 1024, true) > scan);
+    try std.testing.expect(predicateIndexWork(1, 1024, false) > predicateIndexWork(1, 1024, true));
+    try std.testing.expect(predicateIndexWork(1, 1024 * 1024, false) > scan);
+    try std.testing.expectEqual(@as(u64, 0), predicateResidualWork(&source, &.{lower}, 0));
+    try std.testing.expect(predicateResidualWork(&source, &.{lower}, 1) < predicateResidualWork(&source, &.{lower}, 10000));
+    // Iceberg inventories can know row counts without chunk statistics.
+    files[0].row_groups = &.{};
+    try std.testing.expect(predicateScanWork(&source, &.{lower}).? > scan);
+    try std.testing.expect(predicateResidualWork(&source, &.{lower}, 1) > 0);
+    // Parquet prefix discovery knows object length, but not its row count.
+    files[0].row_count = 0;
+    try std.testing.expectEqual(@as(?u64, null), predicateScanWork(&source, &.{lower}));
+    // An inventory with no files is genuinely empty, unlike an unread footer.
+    source.inventory.files = &.{};
+    try std.testing.expectEqual(@as(?u64, 0), predicateScanWork(&source, &.{lower}));
+}
+
 test "external lake ordered access plans equality prefixes ranges directions and exact order proofs" {
     const a = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(a);
@@ -638,9 +971,91 @@ fn accessCost(candidates: u64, covered: bool, ordered_access: bool) u64 {
     return (row_cost +| 32) / @as(u64, if (ordered_access) 2 else 1);
 }
 
+// chooseAccess emits an equality prefix plus at most one lower/upper bound
+// on its next key. Only that shape can consume OFFSET+LIMIT candidates without
+// assuming selectivity for a residual, covered column or overwritten bound.
+fn rangeEnforcesConditions(index: local.storage_relational_index.RelationalIndexDefinition, request: catalog.Scan, equal_count: usize) bool {
+    for (request.conditions, 0..) |condition, ordinal| {
+        const key = for (index.keys, 0..) |candidate, position| {
+            if (candidate.expression_json == null and candidate.collation == null and std.mem.eql(u8, candidate.column, condition.column)) break position;
+        } else return false;
+        const lower = condition.op == .gt or condition.op == .gte;
+        const upper = condition.op == .lt or condition.op == .lte;
+        if (condition.op == .eq) {
+            if (key >= equal_count) return false;
+        } else if ((!lower and !upper) or key != equal_count) return false;
+        for (request.conditions[0..ordinal]) |previous| {
+            if (!std.mem.eql(u8, previous.column, condition.column)) continue;
+            const previous_lower = previous.op == .gt or previous.op == .gte;
+            const previous_upper = previous.op == .lt or previous.op == .lte;
+            if (condition.op == .eq or (lower and previous_lower) or (upper and previous_upper)) return false;
+        }
+    }
+    return true;
+}
+
+fn estimatedAccessCost(candidates: u64, covered: bool, ordered_access: bool, row_goal: ?u64, projected_bytes: u64, row_groups: u64) u64 {
+    const consumed = if (ordered_access) if (row_goal) |goal| @min(candidates, goal) else candidates else candidates;
+    var cost = accessCost(consumed, covered, ordered_access);
+    // Random candidates may touch one decode region each until all groups
+    // are visited. Unknown clustering uses this conservative upper estimate.
+    if (!covered and row_groups != 0) cost +|= ((projected_bytes / row_groups) *| @min(consumed, row_groups)) / 1024;
+    return cost;
+}
+
+test "external lake access costs SQL row goals only under proven order and charges projected locality" {
+    const broad = estimatedAccessCost(100000, false, true, null, 10000000, 1000);
+    const top_one = estimatedAccessCost(100000, false, true, 1, 10000000, 1000);
+    try std.testing.expect(top_one < broad / 100);
+    try std.testing.expectEqual(estimatedAccessCost(100000, false, false, null, 10000000, 1000), estimatedAccessCost(100000, false, false, 1, 10000000, 1000));
+    try std.testing.expect(estimatedAccessCost(10, false, false, null, 10000000, 1) > estimatedAccessCost(10, false, false, null, 10000000, 1000));
+    try std.testing.expectEqual(estimatedAccessCost(10, true, false, null, 10000000, 1), estimatedAccessCost(10, true, false, null, 10000000, 1000));
+}
+
 test "external lake access cost favors selective and covering ranges" {
     try std.testing.expect(accessCost(10, false, false) < 1000);
     try std.testing.expect(accessCost(900, false, false) > 1000);
     try std.testing.expect(accessCost(900, true, false) < 1000);
     try std.testing.expect(accessCost(900, true, true) < accessCost(900, true, false));
+}
+
+test "external lake filtered row goals require every predicate to be enforced by tuple bounds" {
+    const index: local.storage_relational_index.RelationalIndexDefinition = .{ .name = "tenant_ts", .owner_kind = .table, .owner_name = "tenant_ts", .access_method = .ordered_tuple, .keys = &.{ .{ .column = "tenant" }, .{ .column = "ts" } } };
+    var request: catalog.Scan = .{ .fields = &.{"ts"}, .limit = 256, .row_goal = 3, .conditions = &.{ .{ .column = "tenant", .op = .eq, .value = .{ .string = "a" } }, .{ .column = "ts", .op = .gte, .value = .{ .integer = 1 } }, .{ .column = "ts", .op = .lt, .value = .{ .integer = 10 } } } };
+    try std.testing.expect(rangeEnforcesConditions(index, request, 1));
+    request.conditions = &.{ .{ .column = "tenant", .op = .eq, .value = .{ .string = "a" } }, .{ .column = "covered_residual", .op = .eq, .value = .{ .integer = 1 } } };
+    try std.testing.expect(!rangeEnforcesConditions(index, request, 1));
+    request.conditions = &.{ .{ .column = "tenant", .op = .eq, .value = .{ .string = "a" } }, .{ .column = "ts", .op = .gte, .value = .{ .integer = 1 } }, .{ .column = "ts", .op = .gt, .value = .{ .integer = 5 } } };
+    try std.testing.expect(!rangeEnforcesConditions(index, request, 1));
+}
+
+test "external lake covering batch preserves dictionary identity across reordered candidates and null domains" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const Datum = local.sql_scalar.Datum;
+    var cells: [32][1]Datum = undefined;
+    var rows: [32]local.sql_operators.Row = undefined;
+    for (&cells, &rows, 0..) |*cell, *row, i| {
+        cell[0] = if (i == 0) .{} else if (i == 1) Datum.json(.null) else Datum.json(.{ .string = if (i % 2 == 0) "a repeated covering payload" else "another repeated covering payload" });
+        row.* = .{ .values = cell, .keys = &.{}, .ordinal = i };
+    }
+    const bytes = try local.sql_spill.encodeColumnarBlockAlloc(a, &rows, 1024 * 1024);
+    const block = try local.sql_spill.decodeColumnarBlockInArena(a, bytes, 1024 * 1024);
+    const positions = try a.alloc(@typeInfo(@TypeOf(@as(Owner, undefined).covered_blocks)).pointer.child, 5);
+    for (positions, [_]u16{ 31, 0, 1, 3, 2 }) |*position, row| position.* = .{ .block = block, .row = row };
+    var owner: Owner = undefined;
+    owner.covered_blocks = positions;
+    const batch: local.sql_execution_batch.Batch = .{ .reader = .{ .ptr = &owner, .read = Owner.coveredCell, .read_identity = Owner.coveredIdentity, .read_dictionary = Owner.coveredDictionary, .count = positions.len, .width = 1 } };
+    try std.testing.expectEqual(try batch.dictionaryIdentity(0, 0), try batch.dictionaryIdentity(3, 0));
+    try std.testing.expect((try batch.dictionaryIdentity(1, 0)).? != (try batch.dictionaryIdentity(2, 0)).?);
+    const selected = try batch.select(a, &.{ 2, 4, 1, 0 });
+    const dictionary = (try selected.dictionaryColumn(a, 0)).?;
+    for (0..selected.len()) |i| {
+        const expected = try selected.cell(a, i, 0);
+        const actual = try dictionary.cell(a, i, 0);
+        try std.testing.expectEqual(expected.sql_null, actual.sql_null);
+        try std.testing.expectEqual(std.meta.activeTag(expected.value), std.meta.activeTag(actual.value));
+        if (expected.value == .string) try std.testing.expectEqualStrings(expected.value.string, actual.value.string);
+    }
 }

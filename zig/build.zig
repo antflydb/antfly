@@ -250,7 +250,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     const capi_mod = embedded.capi_mod;
     const libantfly_link_mod = embedded.libantfly_link_mod;
     const install_libantfly = embedded.install_libantfly;
-    if (install_apple_bridge) |install| install_libantfly.step.dependOn(&install.step);
+    if (install_apple_bridge) |install| install_libantfly.dependOn(&install.step);
     const install_capi_header = embedded.install_capi_header;
     const run_capi_smoke = embedded.run_capi_smoke;
     const run_capi_conformance = embedded.run_capi_conformance;
@@ -1020,7 +1020,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     const lite_step = b.step("lite", "Build and install the Antfly Lite CLI and libantfly C ABI");
     lite_step.dependOn(&b.top_level_steps.get("licenses-antfly-lite").?.step);
     lite_step.dependOn(&install_lite_main.step);
-    lite_step.dependOn(&install_libantfly.step);
+    lite_step.dependOn(install_libantfly);
     lite_step.dependOn(&install_capi_header.step);
 
     const lite_test_step = b.step("lite-test", "Run Lite backend, CLI, bindings, examples, and C ABI packaging checks");
@@ -1136,6 +1136,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     for ([_][]const u8{ "lib-test", "antfly-unit-test", "inference-test", "inference-finetune-test", "unit-test-inventory" }) |name|
         unit_gate.dependOn(&b.top_level_steps.get(name).?.step);
     @import("build_support/antfly/test_cache_lifetime.zig").add(b, unit_gate);
+    if (strip) @import("pkg/antfly/build/runtime.zig").stripBuildGraph(b);
     return .{ .runtime = runtime, .inference = inference_graph, .wasm = wasm.artifact, .inference_steps = inference_steps };
 }
 

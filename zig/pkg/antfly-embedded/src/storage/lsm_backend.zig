@@ -45,6 +45,9 @@ const resource_manager_mod = @import("resource_manager.zig");
 const platform_time = @import("antfly_platform").time;
 const fs_paths = @import("antfly_runtime_fs").fs_paths;
 const CancellationToken = @import("antfly_cancellation").CancellationToken;
+const SharedBytes = @import("lsm_backend/shared_bytes.zig").SharedBytes;
+const LocalReader = @import("lsm_backend/local_reader.zig").Pool;
+const RunSourceLease = @import("lsm_backend/source_lease.zig").Lease;
 const native_artifact_sink = @import("native_artifact_sink.zig");
 
 comptime {
@@ -452,6 +455,12 @@ pub const Options = struct {
     storage: ?storage_io.Storage = null,
     cache: ?*cache_mod.Cache = null,
     local_block_cache_enabled: bool = true,
+    /// Payload residency, independent of the 64-entry metadata bound. Zero disables retention.
+    local_block_cache_bytes: usize = 2 * 1024 * 1024,
+    /// Large one-value blocks stay on the direct/ephemeral path.
+    local_block_cache_max_block_bytes: usize = 256 * 1024,
+    /// Cold local decoding, including one oversized operation admitted alone.
+    local_decode_working_bytes: usize = 8 * 1024 * 1024,
     max_concurrent_point_block_reads: usize = 16,
     // Share sparse point-read fan-out across concurrent batches. This keeps
     // single-query cold latency low without allowing N public queries to each
@@ -1398,17 +1407,48 @@ pub const Backend = struct {
         }
     };
 
+    const RunSource = struct {
+        path: []u8,
+        lease: *RunSourceLease,
+        access: u64,
+        fn deinit(self: *@This(), a: Allocator) void {
+            a.free(self.path);
+            self.lease.releaseOwner();
+        }
+    };
+    const SourceOpen = struct {
+        path: []u8,
+        epoch: u64,
+        refs: usize = 1,
+        io: ?std.Io,
+        done: std.Io.Event = .unset,
+        completed: std.atomic.Value(bool) = .init(false),
+        result: ?*RunSourceLease = null,
+        failure: ?anyerror = null,
+    };
+    const LocalBlockHeat = struct {
+        valid: bool = false,
+        run_id: u64 = 0,
+        path_hash: u64 = 0,
+        offset: u64 = 0,
+        len: u32 = 0,
+        misses: u8 = 0,
+        promoting: bool = false,
+        cooldown: u8 = 0,
+        access: u64 = 0,
+    };
+
     const CachedRunBlock = struct {
         run_id: u64,
         path: []u8,
         block_offset: u64,
         block_len: u32,
-        bytes: []u8,
+        payload: *SharedBytes,
         last_access: u64,
 
         pub fn deinit(self: *CachedRunBlock, allocator: Allocator) void {
             allocator.free(self.path);
-            allocator.free(self.bytes);
+            self.payload.release();
             self.* = undefined;
         }
     };
@@ -1627,6 +1667,17 @@ pub const Backend = struct {
     run_state_cache: std.ArrayListUnmanaged(CachedRunState) = .empty,
     run_index_cache: std.ArrayListUnmanaged(CachedRunIndex) = .empty,
     run_block_cache: std.ArrayListUnmanaged(CachedRunBlock) = .empty,
+    local_reader: LocalReader = .{},
+    run_block_cache_bytes: usize = 0,
+    local_block_cache_reclaimer: ?u64 = null,
+    local_block_heat: [64]LocalBlockHeat = @splat(.{}),
+    // Independent from the backend lock, which some range-read callers own.
+    run_source_mutex: std.atomic.Mutex = .unlocked,
+    run_sources: std.ArrayListUnmanaged(RunSource) = .empty,
+    run_source_clock: u64 = 0,
+    run_source_epoch: u64 = 0,
+    run_source_opens: std.ArrayListUnmanaged(*SourceOpen) = .empty,
+
     run_table_cache: std.ArrayListUnmanaged(CachedRunTable) = .empty,
     local_cache_access_clock: u64 = 0,
     compaction_stats: CompactionStats = .{},
@@ -1890,6 +1941,7 @@ pub const Backend = struct {
 
     pub fn close(self: *Backend) void {
         self.closing.store(true, .release);
+        self.detachLocalBlockCacheReclaimer();
         self.background_executor.drain();
         self.waitForGenerationReadersToDrain();
         self.releaseTrackedResourceUsage();
@@ -1898,6 +1950,7 @@ pub const Backend = struct {
 
     pub fn abandonAfterCrash(self: *Backend) void {
         self.closing.store(true, .release);
+        self.detachLocalBlockCacheReclaimer();
         self.background_executor.drain();
         self.releaseTrackedResourceUsage();
         recovery_mod.abandon(Backend, self);
@@ -6785,7 +6838,7 @@ pub const Backend = struct {
     }
 
     pub fn localBlockCacheEnabled(self: *const Backend) bool {
-        return self.options.local_block_cache_enabled;
+        return self.options.local_block_cache_enabled and self.options.local_block_cache_bytes != 0;
     }
 
     pub fn recordCursorBlockReuse(self: *Backend) void {
@@ -7083,16 +7136,327 @@ pub const Backend = struct {
         block_offset: u64,
         block_len: u32,
     ) ?[]const u8 {
-        if (!self.options.local_block_cache_enabled) return null;
+        if (!self.localBlockCacheEnabled()) return null;
         for (self.run_block_cache.items) |*cached| {
             if (cached.run_id != run_id or
                 cached.block_offset != block_offset or
                 cached.block_len != block_len or
                 !std.mem.eql(u8, cached.path, path)) continue;
             cached.last_access = self.nextLocalCacheAccess();
-            return cached.bytes;
+            return cached.payload.bytes;
         }
         return null;
+    }
+
+    pub fn retainCachedRunBlock(self: *Backend, path: []const u8, run_id: u64, offset: u64, len: u32) ?*SharedBytes {
+        if (!self.localBlockCacheEnabled()) return null;
+        for (self.run_block_cache.items) |*cached| {
+            if (cached.run_id == run_id and cached.block_offset == offset and cached.block_len == len and std.mem.eql(u8, cached.path, path)) {
+                cached.last_access = self.nextLocalCacheAccess();
+                return cached.payload.retain();
+            }
+        }
+        return null;
+    }
+
+    pub fn localBlockCacheEligible(self: *const Backend, bytes: usize) bool {
+        return self.localBlockCacheEnabled() and bytes <= self.options.local_block_cache_bytes and bytes <= self.options.local_block_cache_max_block_bytes;
+    }
+
+    /// Called under the backend mutex. Fixed metadata records two misses before
+    /// promotion; one promoter owns the attempt and budget denials back off.
+    pub fn beginLocalBlockPromotion(self: *Backend, path: []const u8, run_id: u64, offset: u64, len: u32, decoded_len: usize) bool {
+        if (!self.localBlockCacheEligible(decoded_len)) return false;
+        const path_hash = std.hash.Wyhash.hash(0, path);
+        const access = self.nextLocalCacheAccess();
+        var victim: ?usize = null;
+        for (&self.local_block_heat, 0..) |*heat, i| {
+            if (heat.valid and heat.run_id == run_id and heat.path_hash == path_hash and heat.offset == offset and heat.len == len) {
+                heat.access = access;
+                if (heat.promoting) return false;
+                if (heat.cooldown != 0) {
+                    heat.cooldown -= 1;
+                    return false;
+                }
+                heat.misses +|= 1;
+                if (heat.misses < 2) return false;
+                heat.promoting = true;
+                return true;
+            }
+            if (!heat.promoting and (victim == null or !heat.valid or heat.access < self.local_block_heat[victim.?].access)) victim = i;
+        }
+        const slot = victim orelse return false;
+        self.local_block_heat[slot] = .{ .valid = true, .run_id = run_id, .path_hash = path_hash, .offset = offset, .len = len, .misses = 1, .access = access };
+        return false;
+    }
+
+    pub fn finishLocalBlockPromotion(self: *Backend, path: []const u8, run_id: u64, offset: u64, len: u32, admitted: bool) void {
+        const path_hash = std.hash.Wyhash.hash(0, path);
+        for (&self.local_block_heat) |*heat| {
+            if (!heat.valid or heat.run_id != run_id or heat.path_hash != path_hash or heat.offset != offset or heat.len != len) continue;
+            heat.promoting = false;
+            heat.misses = 0;
+            heat.cooldown = if (admitted) 0 else 64;
+            return;
+        }
+    }
+
+    fn detachLocalBlockCacheReclaimer(self: *Backend) void {
+        // Fence the last admission before taking its registration. Unregister
+        // outside the backend lock so an already selected callback can finish.
+        platform.sync.lockYielding(&self.mu);
+        const identity = self.local_block_cache_reclaimer;
+        self.local_block_cache_reclaimer = null;
+        self.mu.unlock();
+        if (identity) |owned| self.options.resource_manager.?.unregisterReclaimer(owned);
+    }
+
+    fn reclaimLocalBlocks(raw: *anyopaque, target: u64) u64 {
+        const self: *Backend = @ptrCast(@alignCast(raw));
+        // Resource reclamation may originate under a caller's subsystem lock.
+        // Never wait for the backend, and never perform storage I/O here.
+        if (self.closing.load(.acquire) or !self.mu.tryLock()) return 0;
+        defer self.mu.unlock();
+        if (self.closing.load(.acquire)) return 0;
+        var released: u64 = 0;
+        while (released < target and self.run_block_cache.items.len != 0) {
+            released +|= self.evictOldestLocalBlock();
+        }
+        return released;
+    }
+
+    /// Optional cache admission never fails the mandatory read. Only admitted
+    /// payloads gain cache ownership; resource credit follows their last lease.
+    pub fn cacheRunBlockLease(self: *Backend, path: []const u8, run_id: u64, offset: u64, len: u32, payload: *SharedBytes) bool {
+        if (!self.localBlockCacheEligible(payload.bytes.len) or self.closing.load(.acquire) or payload.cache_admitted) return false;
+        for (self.run_block_cache.items) |cached| {
+            if (cached.run_id == run_id and cached.block_offset == offset and cached.block_len == len and std.mem.eql(u8, cached.path, path)) return false;
+        }
+        if (self.options.resource_manager) |manager| {
+            // First read/cache admission occurs at the backend's stable address.
+            if (self.local_block_cache_reclaimer == null) self.local_block_cache_reclaimer = manager.registerReclaimer(.lsm_block_table_cache, self, reclaimLocalBlocks) catch return false;
+        }
+        // Only reclaim when this owner can actually make admission succeed.
+        // An impossible candidate or metadata OOM must preserve useful blocks.
+        if (self.options.resource_manager) |manager| {
+            const required = payload.bytes.len + @sizeOf(SharedBytes);
+            var reclaimable: u64 = 0;
+            for (self.run_block_cache.items) |cached| {
+                if (cached.payload.refs.load(.acquire) == 1) {
+                    if (cached.payload.reservation) |credit| reclaimable +|= credit.reservedBytes();
+                }
+            }
+            const available = if (payload.reservation != null) blk: {
+                // The read payload already owns its host charge. Reclassification
+                // needs destination slice headroom, not another aggregate charge.
+                const stats = manager.sliceStats(.lsm_block_table_cache);
+                break :blk if (stats.hard_limit_bytes == 0) std.math.maxInt(u64) else stats.hard_limit_bytes -| stats.used_bytes;
+            } else manager.availableAdmissionBytes(.lsm_block_table_cache);
+            if (required > available +| reclaimable) return false;
+        }
+        const cached_path = self.allocator.dupe(u8, path) catch return false;
+        var admitted = false;
+        defer if (!admitted) self.allocator.free(cached_path);
+        self.run_block_cache.ensureUnusedCapacity(self.allocator, 1) catch return false;
+        if (self.options.resource_manager) |manager| {
+            const bytes = payload.bytes.len + @sizeOf(SharedBytes);
+            while (true) {
+                if (payload.reservation) |*credit| {
+                    credit.reclassify(.lsm_block_table_cache) catch |err| {
+                        if (err != error.ResourceBudgetExceeded or self.run_block_cache.items.len == 0) return false;
+                        _ = self.evictOldestLocalBlock();
+                        continue;
+                    };
+                } else {
+                    const credit = manager.reserveWithoutReclaim(.lsm_block_table_cache, bytes) catch |err| {
+                        if (err != error.ResourceBudgetExceeded or self.run_block_cache.items.len == 0) return false;
+                        _ = self.evictOldestLocalBlock();
+                        continue;
+                    };
+                    payload.reservation = credit;
+                }
+                break;
+            }
+        }
+        while (self.run_block_cache.items.len >= max_local_cached_run_blocks or self.run_block_cache_bytes > self.options.local_block_cache_bytes - payload.bytes.len) {
+            _ = self.evictOldestLocalBlock();
+        }
+        self.run_block_cache.appendAssumeCapacity(.{ .run_id = run_id, .path = cached_path, .block_offset = offset, .block_len = len, .payload = payload, .last_access = self.nextLocalCacheAccess() });
+        _ = payload.retain();
+        payload.cache_admitted = true;
+        payload.result_pins_allowed = true;
+        self.run_block_cache_bytes += payload.bytes.len;
+        admitted = true;
+        return true;
+    }
+
+    /// Lease exactly the immutable artifact roots, not the whole checkpoint.
+    /// A bounded LRU avoids unbounded catalog leases and descriptor residency.
+    pub fn readRunRangeAlloc(self: *Backend, a: Allocator, path: []const u8, offset: u64, len: usize) ![]u8 {
+        const storage = self.storage.?;
+        if (storage.vtable.open_leased_immutable_source == null) return storage.readFileRangeAlloc(a, path, offset, len);
+        const lease = try self.retainRunSource(path);
+        defer lease.release();
+        const bytes = try a.alloc(u8, len);
+        errdefer a.free(bytes);
+        try lease.source.readInto(offset, bytes);
+        return bytes;
+    }
+
+    fn findRunSourceAssumeLocked(self: *Backend, path: []const u8) ?*RunSourceLease {
+        self.run_source_clock +%= 1;
+        for (self.run_sources.items) |*cached| if (std.mem.eql(u8, cached.path, path)) {
+            cached.access = self.run_source_clock;
+            return cached.lease.retainOwner();
+        };
+        return null;
+    }
+
+    fn releaseSourceOpen(self: *Backend, flight: *SourceOpen) void {
+        platform.sync.lockYielding(&self.run_source_mutex);
+        flight.refs -= 1;
+        const last = flight.refs == 0;
+        self.run_source_mutex.unlock();
+        if (last) {
+            if (flight.result) |lease| lease.release();
+            self.allocator.free(flight.path);
+            self.allocator.destroy(flight);
+        }
+    }
+
+    fn openRunSource(self: *Backend, flight: *SourceOpen) !*RunSourceLease {
+        const lease = try self.allocator.create(RunSourceLease);
+        errdefer self.allocator.destroy(lease);
+        var source = try self.storage.?.openLeasedImmutableSource(self.allocator, flight.path);
+        errdefer source.close();
+        lease.* = .{ .allocator = self.allocator, .source = source };
+        // Protect the initial read before opting into expiry. Retirement can
+        // race source creation, but can never close a successfully acquired use.
+        if (!source.acquireUse()) return error.SourceExpired;
+        errdefer source.releaseUse();
+        lease.refs.store(2, .monotonic); // cache owner + flight's active use
+        source.enableIdleExpiry();
+        const owned_path = try self.allocator.dupe(u8, flight.path);
+        errdefer self.allocator.free(owned_path);
+        platform.sync.lockYielding(&self.run_source_mutex);
+        if (flight.epoch != self.run_source_epoch) {
+            self.run_source_mutex.unlock();
+            self.allocator.free(owned_path);
+            lease.releaseOwner();
+            return lease;
+        }
+        self.run_source_clock +%= 1;
+        self.run_sources.append(self.allocator, .{ .path = owned_path, .lease = lease, .access = self.run_source_clock }) catch |err| {
+            self.run_source_mutex.unlock();
+            return err;
+        };
+        self.run_source_mutex.unlock();
+        self.trimRunSources();
+        return lease;
+    }
+
+    fn retainRunSource(self: *Backend, path: []const u8) !*RunSourceLease {
+        while (true) {
+            platform.sync.lockYielding(&self.run_source_mutex);
+            const cached = self.findRunSourceAssumeLocked(path) orelse break;
+            self.run_source_mutex.unlock();
+            if (cached.activateHeld()) return cached;
+            // Keep metadata alive while removing an expired cache owner. No
+            // provider callbacks or descriptor cleanup run under this lock.
+            platform.sync.lockYielding(&self.run_source_mutex);
+            var expired: ?RunSource = null;
+            for (self.run_sources.items, 0..) |entry, i| if (entry.lease == cached) {
+                expired = self.run_sources.orderedRemove(i);
+                break;
+            };
+            self.run_source_mutex.unlock();
+            if (expired) |*removed| removed.deinit(self.allocator);
+            cached.releaseOwner();
+        }
+        // A miss exits the loop holding the cache lock, so joining/creating
+        // an in-flight open is atomic with the last cache lookup.
+        for (self.run_source_opens.items) |flight| if (std.mem.eql(u8, flight.path, path)) {
+            flight.refs += 1;
+            self.run_source_mutex.unlock();
+            defer self.releaseSourceOpen(flight);
+            if (flight.io) |io| flight.done.waitUncancelable(io) else {
+                while (!flight.completed.load(.acquire)) platform_time.yieldBriefly();
+            }
+            if (flight.failure) |err| return err;
+            return flight.result.?.retain().?;
+        };
+        const flight = self.allocator.create(SourceOpen) catch |err| {
+            self.run_source_mutex.unlock();
+            return err;
+        };
+        const owned_path = self.allocator.dupe(u8, path) catch |err| {
+            self.allocator.destroy(flight);
+            self.run_source_mutex.unlock();
+            return err;
+        };
+        flight.* = .{ .path = owned_path, .epoch = self.run_source_epoch, .io = self.manifestCoordinationIo() };
+        self.run_source_opens.append(self.allocator, flight) catch |err| {
+            self.allocator.free(owned_path);
+            self.allocator.destroy(flight);
+            self.run_source_mutex.unlock();
+            return err;
+        };
+        self.run_source_mutex.unlock();
+        defer self.releaseSourceOpen(flight);
+        const opened = self.openRunSource(flight);
+        platform.sync.lockYielding(&self.run_source_mutex);
+        if (opened) |lease| flight.result = lease else |err| flight.failure = err;
+        for (self.run_source_opens.items, 0..) |pending, i| if (pending == flight) {
+            _ = self.run_source_opens.swapRemove(i);
+            break;
+        };
+        flight.completed.store(true, .release);
+        if (flight.io) |io| flight.done.set(io);
+        self.run_source_mutex.unlock();
+        if (flight.failure) |err| return err;
+        return flight.result.?.retain().?;
+    }
+
+    pub fn retainCachedRunSource(self: *Backend, path: []const u8) ?*RunSourceLease {
+        platform.sync.lockYielding(&self.run_source_mutex);
+        const lease = self.findRunSourceAssumeLocked(path);
+        self.run_source_mutex.unlock();
+        if (lease) |held| {
+            if (held.activateHeld()) return held;
+            held.releaseOwner();
+        }
+        return null;
+    }
+
+    // Active cursors retain one lease per run. Only idle entries compete for
+    // LRU space, avoiding catalog/descriptor thrash in broad merge cursors.
+    pub fn trimRunSources(self: *Backend) void {
+        while (true) {
+            @import("antfly_platform").sync.lockYielding(&self.run_source_mutex);
+            if (self.run_sources.items.len <= 16) {
+                self.run_source_mutex.unlock();
+                return;
+            }
+            var oldest: ?usize = null;
+            for (self.run_sources.items, 0..) |item, i| {
+                if (item.lease.refs.load(.acquire) != 1) continue;
+                if (oldest == null or item.access < self.run_sources.items[oldest.?].access) oldest = i;
+            }
+            if (oldest == null) {
+                self.run_source_mutex.unlock();
+                return;
+            }
+            var removed = self.run_sources.orderedRemove(oldest.?);
+            self.run_source_mutex.unlock();
+            removed.deinit(self.allocator);
+        }
+    }
+
+    pub fn deinitRunSources(self: *Backend) void {
+        for (self.run_sources.items) |*cached| cached.deinit(self.allocator);
+        self.run_sources.deinit(self.allocator);
+        std.debug.assert(self.run_source_opens.items.len == 0);
+        self.run_source_opens.deinit(self.allocator);
     }
 
     pub fn putCachedRunBlock(
@@ -7103,23 +7467,16 @@ pub const Backend = struct {
         block_len: u32,
         block: []u8,
     ) ![]const u8 {
-        if (!self.options.local_block_cache_enabled) {
+        if (!self.localBlockCacheEnabled()) {
             self.allocator.free(block);
             return &.{};
         }
         errdefer self.allocator.free(block);
-        const cached_path = try self.allocator.dupe(u8, path);
-        errdefer self.allocator.free(cached_path);
-        try self.run_block_cache.append(self.allocator, .{
-            .run_id = run_id,
-            .path = cached_path,
-            .block_offset = block_offset,
-            .block_len = block_len,
-            .bytes = block,
-            .last_access = self.nextLocalCacheAccess(),
-        });
-        self.evictCachedRunBlocksToBudget();
-        return self.run_block_cache.items[self.run_block_cache.items.len - 1].bytes;
+        const payload = try SharedBytes.create(self.allocator, block);
+        const admitted = self.cacheRunBlockLease(path, run_id, block_offset, block_len, payload);
+        const result = if (admitted) payload.bytes else &.{};
+        payload.release();
+        return result;
     }
 
     fn drainObsoleteRuns(self: *Backend) void {
@@ -8493,6 +8850,15 @@ pub const Backend = struct {
     }
 
     fn evictLocalCachesForRun(self: *Backend, path: []const u8, run_id: u64) void {
+        @import("antfly_platform").sync.lockYielding(&self.run_source_mutex);
+        self.run_source_epoch +%= 1;
+        var retired_source: ?RunSource = null;
+        for (self.run_sources.items, 0..) |source, i| if (std.mem.eql(u8, source.path, path)) {
+            retired_source = self.run_sources.orderedRemove(i);
+            break;
+        };
+        self.run_source_mutex.unlock();
+        if (retired_source) |*removed| removed.deinit(self.allocator);
         self.evictCachedRunStateForRun(path, run_id);
         self.evictCachedRunIndexForRun(path, run_id);
         self.evictCachedRunBlocksForRun(path, run_id);
@@ -8532,23 +8898,25 @@ pub const Backend = struct {
                 continue;
             }
             var removed = self.run_block_cache.orderedRemove(i);
+            self.run_block_cache_bytes -= removed.payload.bytes.len;
             removed.deinit(self.allocator);
         }
     }
 
-    fn evictCachedRunBlocksToBudget(self: *Backend) void {
-        while (self.run_block_cache.items.len > max_local_cached_run_blocks) {
-            var victim_index: usize = 0;
-            var victim_access = self.run_block_cache.items[0].last_access;
-            for (self.run_block_cache.items[1..], 1..) |cached, i| {
-                if (cached.last_access < victim_access) {
-                    victim_access = cached.last_access;
-                    victim_index = i;
-                }
-            }
-            var victim = self.run_block_cache.orderedRemove(victim_index);
-            victim.deinit(self.allocator);
+    fn evictOldestLocalBlock(self: *Backend) u64 {
+        std.debug.assert(self.run_block_cache.items.len != 0);
+        var victim_index: usize = 0;
+        for (self.run_block_cache.items[1..], 1..) |cached, i| {
+            if (cached.last_access < self.run_block_cache.items[victim_index].last_access) victim_index = i;
         }
+        var victim = self.run_block_cache.orderedRemove(victim_index);
+        self.run_block_cache_bytes -= victim.payload.bytes.len;
+        const released = if (victim.payload.refs.load(.acquire) == 1)
+            (if (victim.payload.reservation) |credit| credit.reservedBytes() else 0)
+        else
+            0;
+        victim.deinit(self.allocator);
+        return released;
     }
 
     fn evictCachedRunTableForRun(self: *Backend, path: []const u8, run_id: u64) void {
@@ -25195,4 +25563,718 @@ fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *con
         break :blk repeated;
     };
     return &result;
+}
+
+test "lsm local decoded block borrowing survives eviction and performs no warm allocation" {
+    const a = std.testing.allocator;
+    var budget = @import("lite/test_allocator.zig").BudgetAllocator{ .backing = a };
+    var backend = Backend.init(budget.allocator(), .{});
+    defer backend.close();
+    const bytes = try backend.allocator.alloc(u8, 32 * 1024);
+    @memset(bytes, 0);
+    @memcpy(bytes[0..4], "data");
+    _ = try backend.putCachedRunBlock("/run", 1, 0, 32768, bytes);
+    const baseline = budget.live;
+    const reference_start = budget.alloc_calls;
+    for (0..4096) |_| {
+        const copy = try backend.allocator.dupe(u8, bytes);
+        backend.allocator.free(copy);
+    }
+    try std.testing.expectEqual(@as(usize, 4096), budget.alloc_calls - reference_start);
+    const calls = budget.alloc_calls;
+    budget.limit = baseline;
+    const pinned = backend.retainCachedRunBlock("/run", 1, 0, 32768).?;
+    defer pinned.release();
+    for (0..4096) |_| {
+        const hit = backend.retainCachedRunBlock("/run", 1, 0, 32768).?;
+        try std.testing.expectEqual(pinned.bytes.ptr, hit.bytes.ptr);
+        hit.release();
+    }
+    try std.testing.expectEqual(baseline, budget.live);
+    try std.testing.expectEqual(calls, budget.alloc_calls);
+    backend.evictCachedRunBlocksForRun("/run", 1);
+    try std.testing.expectEqualStrings("data", pinned.bytes[0..4]);
+    budget.limit = std.math.maxInt(usize);
+    std.debug.print("lite local block probe: 4096 warm hits, reference payload allocation=134217728 bytes/4096 calls, borrowed payload allocation=0 bytes/0 calls\n", .{});
+}
+
+test "lsm local source eviction closes outside warm source lock" {
+    const Hook = struct {
+        var entered: std.Io.Event = .unset;
+        var release: std.Io.Event = .unset;
+        var done: std.Io.Event = .unset;
+        fn read(_: *anyopaque, _: u64, _: []u8) !void {}
+        fn close(_: *anyopaque) void {
+            entered.set(std.testing.io);
+            release.waitUncancelable(std.testing.io);
+        }
+        fn evict(backend: *Backend) void {
+            backend.evictLocalCachesForRun("/old", 1);
+        }
+        fn warm(backend: *Backend) void {
+            defer done.set(std.testing.io);
+            if (backend.retainCachedRunSource("/warm")) |lease| lease.release();
+        }
+    };
+    const a = std.testing.allocator;
+    var backend = Backend.init(a, .{});
+    defer backend.close();
+    var context: u8 = 0;
+    const old = try a.create(RunSourceLease);
+    old.* = .{ .allocator = a, .source = .{ .ranges = .{ .ptr = &context, .length = 0, .read_into = Hook.read, .close = Hook.close } } };
+    try backend.run_sources.append(a, .{ .path = try a.dupe(u8, "/old"), .lease = old, .access = 0 });
+    const warm = try a.create(RunSourceLease);
+    warm.* = .{ .allocator = a, .source = .{ .contiguous = "" } };
+    try backend.run_sources.append(a, .{ .path = try a.dupe(u8, "/warm"), .lease = warm, .access = 1 });
+    Hook.entered.reset();
+    Hook.release.reset();
+    Hook.done.reset();
+    var eviction = try std.testing.io.concurrent(Hook.evict, .{&backend});
+    defer {
+        Hook.release.set(std.testing.io);
+        eviction.await(std.testing.io);
+    }
+    try Hook.entered.waitTimeout(std.testing.io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+    var reader = try std.testing.io.concurrent(Hook.warm, .{&backend});
+    const progress = Hook.done.waitTimeout(std.testing.io, .{ .duration = .{ .raw = .fromMilliseconds(200), .clock = .awake } });
+    Hook.release.set(std.testing.io);
+    reader.await(std.testing.io);
+    eviction.await(std.testing.io);
+    try progress;
+}
+
+test "lsm local point reads allocate only returned value and batch results retain local blocks" {
+    const a = std.testing.allocator;
+    var backing = storage_io.MemoryStorage.init(a);
+    defer backing.deinit();
+    var backend_budget = @import("lite/test_allocator.zig").BudgetAllocator{ .backing = a };
+    var backend = try Backend.open(backend_budget.allocator(), "/local-result-lifetimes", .{ .storage = backing.storage(), .flush_threshold = 1, .table_block_compression = .none });
+    defer backend.close();
+    var runtime = try backend.runtimeStore(a, .{ .name = "docs" });
+    defer runtime.deinit();
+    var write = try runtime.beginWrite();
+    try write.put("key:00", "value");
+    try write.put("key:01", "other");
+    try write.commit();
+    var read = try runtime_mod.BoundReadTxn(Backend).open(&backend, .{ .name = "docs" });
+    defer read.abort();
+    var result_budget = @import("lite/test_allocator.zig").BudgetAllocator{ .backing = a };
+    var point = try read.openReadScope(result_budget.allocator());
+    defer point.close();
+    try std.testing.expectEqualStrings("value", try point.get("key:00"));
+    const calls = backend_budget.alloc_calls;
+    const result_calls = result_budget.alloc_calls;
+    const result_live = result_budget.live;
+    backend_budget.limit = backend_budget.live;
+    defer backend_budget.limit = std.math.maxInt(usize);
+    try std.testing.expectEqualStrings("other", try point.get("key:01"));
+    try std.testing.expectEqual(calls, backend_budget.alloc_calls);
+    try std.testing.expectEqual(result_calls + 1, result_budget.alloc_calls);
+    try std.testing.expectEqual(result_live + 5, result_budget.live);
+    backend_budget.limit = std.math.maxInt(usize);
+    var batch = try read.openReadScope(a);
+    defer batch.close();
+    const keys = [_][]const u8{ "key:00", "key:01" };
+    var values: [2]?[]const u8 = undefined;
+    const copies = backend.read_stats.cursor_value_copies.load(.monotonic);
+    try batch.getManySorted(&keys, &values);
+    try std.testing.expectEqual(@as(usize, 0), batch.held_values.items.len);
+    try std.testing.expectEqual(@as(usize, 1), batch.held_blocks.items.len);
+    try std.testing.expectEqual(copies, backend.read_stats.cursor_value_copies.load(.monotonic));
+    while (backend.run_block_cache.items.len != 0) {
+        const cached = backend.run_block_cache.items[0];
+        backend.evictCachedRunBlocksForRun(cached.path, cached.run_id);
+    }
+    try std.testing.expectEqualStrings("value", values[0].?);
+    try std.testing.expectEqualStrings("other", values[1].?);
+    std.debug.print("lite local result probe: warm point = 1 value allocation/5 bytes, zero backend allocations; batch = 1 block pin/2 values, zero value copies\n", .{});
+}
+
+test "lsm local cold source open releases every partial allocation" {
+    const Fixture = struct {
+        fn open(_: *anyopaque, _: Allocator, _: []const u8) !@import("../segment_source.zig").Source {
+            return .{ .contiguous = "immutable" };
+        }
+        fn run(a: Allocator) !void {
+            var backing = storage_io.MemoryStorage.init(a);
+            defer backing.deinit();
+            var vtable = backing.storage().vtable.*;
+            vtable.open_leased_immutable_source = open;
+            var backend = Backend.init(a, .{ .storage = .{ .ptr = backing.storage().ptr, .vtable = &vtable } });
+            defer backend.close();
+            const bytes = try backend.readRunRangeAlloc(a, "/cold", 0, 9);
+            defer a.free(bytes);
+            try std.testing.expectEqualStrings("immutable", bytes);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
+test "lsm local cold source failure wakes all waiters and allows retry" {
+    const Hook = struct {
+        var entered: std.Io.Event = .unset;
+        var release: std.Io.Event = .unset;
+        var calls: std.atomic.Value(usize) = .init(0);
+        var fail: bool = true;
+        fn open(_: *anyopaque, _: Allocator, _: []const u8) anyerror!@import("../segment_source.zig").Source {
+            _ = calls.fetchAdd(1, .monotonic);
+            entered.set(std.testing.io);
+            release.waitUncancelable(std.testing.io);
+            if (fail) return error.InjectedSourceOpenFailure;
+            return .{ .contiguous = "immutable" };
+        }
+        fn read(backend: *Backend) anyerror!void {
+            try std.testing.expectError(error.InjectedSourceOpenFailure, backend.readRunRangeAlloc(std.testing.allocator, "/cold", 0, 9));
+        }
+    };
+    const a = std.testing.allocator;
+    var backing = storage_io.MemoryStorage.init(a);
+    defer backing.deinit();
+    var vtable = backing.storage().vtable.*;
+    vtable.open_leased_immutable_source = Hook.open;
+    var backend = Backend.init(a, .{ .storage = .{ .ptr = backing.storage().ptr, .vtable = &vtable } });
+    defer backend.close();
+    Hook.entered.reset();
+    Hook.release.reset();
+    Hook.calls.store(0, .monotonic);
+    Hook.fail = true;
+    var readers: [8]std.Io.Future(anyerror!void) = undefined;
+    var started: usize = 0;
+    defer {
+        Hook.release.set(std.testing.io);
+        for (readers[0..started]) |*reader| reader.await(std.testing.io) catch {};
+    }
+    for (&readers) |*reader| {
+        reader.* = try std.testing.io.concurrent(Hook.read, .{&backend});
+        started += 1;
+    }
+    try Hook.entered.waitTimeout(std.testing.io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+    const deadline = std.Io.Clock.awake.now(std.testing.io).addDuration(.fromSeconds(5));
+    while (true) {
+        platform.sync.lockYielding(&backend.run_source_mutex);
+        const joined = backend.run_source_opens.items.len == 1 and backend.run_source_opens.items[0].refs == readers.len;
+        backend.run_source_mutex.unlock();
+        if (joined) break;
+        if (std.Io.Clock.awake.now(std.testing.io).nanoseconds > deadline.nanoseconds) return error.Timeout;
+        try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+    }
+    Hook.release.set(std.testing.io);
+    for (&readers) |*reader| try reader.await(std.testing.io);
+    try std.testing.expectEqual(@as(usize, 1), Hook.calls.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 0), backend.run_source_opens.items.len);
+    Hook.fail = false;
+    const bytes = try backend.readRunRangeAlloc(a, "/cold", 0, 9);
+    defer a.free(bytes);
+    try std.testing.expectEqualStrings("immutable", bytes);
+    try std.testing.expectEqual(@as(usize, 2), Hook.calls.load(.monotonic));
+}
+
+test "lsm local compressed point reads borrow warm decoded blocks" {
+    const cases = [_]struct { value: []const u8, compression: lsm_table_file.BlockCompression }{
+        .{ .value = "other", .compression = .prefix },
+        .{ .value = z17RepeatString("compressible-value:", 128), .compression = .prefix_snappy },
+    };
+    for (cases) |case| {
+        const a = std.testing.allocator;
+        var backing = storage_io.MemoryStorage.init(a);
+        defer backing.deinit();
+        var backend_budget = @import("lite/test_allocator.zig").BudgetAllocator{ .backing = a };
+        var backend = try Backend.open(backend_budget.allocator(), "/local-result-lifetimes", .{ .storage = backing.storage(), .flush_threshold = 1, .table_block_compression = .snappy_adaptive });
+        defer backend.close();
+        var runtime = try backend.runtimeStore(a, .{ .name = "docs" });
+        defer runtime.deinit();
+        var write = try runtime.beginWrite();
+        try write.put("document:long-shared-prefix-for-compression:00", "value");
+        try write.put("document:long-shared-prefix-for-compression:01", case.value);
+        try write.commit();
+        var read = try runtime_mod.BoundReadTxn(Backend).open(&backend, .{ .name = "docs" });
+        defer read.abort();
+        var result_budget = @import("lite/test_allocator.zig").BudgetAllocator{ .backing = a };
+        var point = try read.openReadScope(result_budget.allocator());
+        defer point.close();
+        try std.testing.expectEqualStrings("value", try point.get("document:long-shared-prefix-for-compression:00"));
+        try std.testing.expectEqual(case.compression, backend.run_index_cache.items[0].index.blockWindow(0).compression);
+        // Cold compressed point lookup has not populated the decoded cache.
+        try std.testing.expectEqual(@as(usize, 0), backend.run_block_cache.items.len);
+        var batch = try read.openReadScope(a);
+        defer batch.close();
+        const keys = [_][]const u8{ "document:long-shared-prefix-for-compression:00", "document:long-shared-prefix-for-compression:01" };
+        var values: [2]?[]const u8 = undefined;
+        try batch.getManySorted(&keys, &values);
+        const calls = backend_budget.alloc_calls;
+        const loads = backend.read_stats.table_block_loads.load(.monotonic);
+        backend_budget.limit = backend_budget.live;
+        defer backend_budget.limit = std.math.maxInt(usize);
+        for (0..100) |_| try std.testing.expectEqualStrings(case.value, try point.get("document:long-shared-prefix-for-compression:01"));
+        const extra_calls = backend_budget.alloc_calls - calls;
+        const extra_loads = backend.read_stats.table_block_loads.load(.monotonic) - loads;
+        std.debug.print("lite compressed warm point probe: compression={s}, 100 queries, backend allocations={d}, physical block loads={d}, decoded cache blocks={d}\n", .{ @tagName(case.compression), extra_calls, extra_loads, backend.run_block_cache.items.len });
+        try std.testing.expectEqual(@as(usize, 0), extra_calls);
+        try std.testing.expectEqual(@as(u64, 0), extra_loads);
+    }
+}
+
+test "lsm local hot compressed point reads promote and repeated batches deduplicate pins" {
+    const cases = [_]struct { value: []const u8, compression: lsm_table_file.BlockCompression }{
+        .{ .value = "other", .compression = .prefix },
+        .{ .value = z17RepeatString("compressible-value:", 128), .compression = .prefix_snappy },
+    };
+    for (cases) |case| {
+        const a = std.testing.allocator;
+        var backing = storage_io.MemoryStorage.init(a);
+        defer backing.deinit();
+        var backend_budget = @import("lite/test_allocator.zig").BudgetAllocator{ .backing = a };
+        var backend = try Backend.open(backend_budget.allocator(), "/local-result-lifetimes", .{ .storage = backing.storage(), .flush_threshold = 1, .table_block_compression = .snappy_adaptive });
+        defer backend.close();
+        var runtime = try backend.runtimeStore(a, .{ .name = "docs" });
+        defer runtime.deinit();
+        var write = try runtime.beginWrite();
+        try write.put("document:long-shared-prefix-for-compression:00", "value");
+        try write.put("document:long-shared-prefix-for-compression:01", case.value);
+        try write.commit();
+        var read = try runtime_mod.BoundReadTxn(Backend).open(&backend, .{ .name = "docs" });
+        defer read.abort();
+        var result_budget = @import("lite/test_allocator.zig").BudgetAllocator{ .backing = a };
+        var point = try read.openReadScope(result_budget.allocator());
+        defer point.close();
+        try std.testing.expectEqualStrings("value", try point.get("document:long-shared-prefix-for-compression:00"));
+        try std.testing.expectEqual(case.compression, backend.run_index_cache.items[0].index.blockWindow(0).compression);
+        const pure_calls = backend_budget.alloc_calls;
+        const pure_loads = backend.read_stats.table_block_loads.load(.monotonic);
+        for (0..100) |_| try std.testing.expectEqualStrings(case.value, try point.get("document:long-shared-prefix-for-compression:01"));
+        std.debug.print("lite hot point probe: compression={s}, backend allocations={d}, encoded block loads={d}, decoded blocks={d}\n", .{ @tagName(case.compression), backend_budget.alloc_calls - pure_calls, backend.read_stats.table_block_loads.load(.monotonic) - pure_loads, backend.run_block_cache.items.len });
+        try std.testing.expect(backend_budget.alloc_calls - pure_calls < 20);
+        try std.testing.expectEqual(@as(u64, 1), backend.read_stats.table_block_loads.load(.monotonic) - pure_loads);
+        // Cold compressed point lookup has not populated the decoded cache.
+        try std.testing.expectEqual(@as(usize, 1), backend.run_block_cache.items.len);
+        var batch = try read.openReadScope(a);
+        defer batch.close();
+        const keys = [_][]const u8{ "document:long-shared-prefix-for-compression:00", "document:long-shared-prefix-for-compression:01" };
+        var values: [2]?[]const u8 = undefined;
+        try batch.getManySorted(&keys, &values);
+        const calls = backend_budget.alloc_calls;
+        const loads = backend.read_stats.table_block_loads.load(.monotonic);
+        backend_budget.limit = backend_budget.live;
+        defer backend_budget.limit = std.math.maxInt(usize);
+        for (0..100) |_| try std.testing.expectEqualStrings(case.value, try point.get("document:long-shared-prefix-for-compression:01"));
+        const extra_calls = backend_budget.alloc_calls - calls;
+        const extra_loads = backend.read_stats.table_block_loads.load(.monotonic) - loads;
+        std.debug.print("lite compressed warm point probe: compression={s}, 100 queries, backend allocations={d}, physical block loads={d}, decoded cache blocks={d}\n", .{ @tagName(case.compression), extra_calls, extra_loads, backend.run_block_cache.items.len });
+        try std.testing.expectEqual(@as(usize, 0), extra_calls);
+        try std.testing.expectEqual(@as(u64, 0), extra_loads);
+        backend_budget.limit = std.math.maxInt(usize);
+        for (0..100) |_| try batch.getManySorted(&keys, &values);
+        var distinct_pins: usize = 0;
+        for (batch.held_blocks.items, 0..) |pin, pi| {
+            var seen = false;
+            for (batch.held_blocks.items[0..pi]) |previous| {
+                if (pin == .local and previous == .local and pin.local == previous.local) seen = true;
+            }
+            if (!seen) distinct_pins += 1;
+        }
+        std.debug.print("lite repeated batch probe: compression={s}, pins={d}, distinct pins={d}, owned values={d}\n", .{ @tagName(case.compression), batch.held_blocks.items.len, distinct_pins, batch.held_values.items.len });
+        try std.testing.expectEqual(@as(usize, 1), distinct_pins);
+        try std.testing.expectEqual(@as(usize, 1), batch.held_blocks.items.len);
+        try std.testing.expectEqual(@as(usize, 0), batch.held_values.items.len);
+    }
+}
+
+test "lsm local byte budget evicts cache ownership but charges pinned payload until final release" {
+    const a = std.testing.allocator;
+    var manager = resource_manager_mod.ResourceManager.init(.{});
+    defer manager.deinit(a);
+    var backend = Backend.init(a, .{ .resource_manager = &manager, .local_block_cache_bytes = 64, .local_block_cache_max_block_bytes = 64 });
+    var open = true;
+    defer if (open) backend.close();
+    const first = try a.alloc(u8, 40);
+    @memset(first, 'a');
+    _ = try backend.putCachedRunBlock("/first", 1, 0, 40, first);
+    const pinned = backend.retainCachedRunBlock("/first", 1, 0, 40).?;
+    var pinned_open = true;
+    defer if (pinned_open) pinned.release();
+    const charge = 40 + @sizeOf(SharedBytes);
+    try std.testing.expectEqual(@as(u64, charge), manager.sliceStats(.lsm_block_table_cache).used_bytes);
+    const second = try a.alloc(u8, 40);
+    @memset(second, 'b');
+    _ = try backend.putCachedRunBlock("/second", 2, 0, 40, second);
+    try std.testing.expectEqual(@as(usize, 1), backend.run_block_cache.items.len);
+    try std.testing.expectEqual(@as(usize, 40), backend.run_block_cache_bytes);
+    try std.testing.expectEqual(@as(u64, 2 * charge), manager.sliceStats(.lsm_block_table_cache).used_bytes);
+    try std.testing.expectEqual(@as(u8, 'a'), pinned.bytes[0]);
+    pinned.release();
+    pinned_open = false;
+    try std.testing.expectEqual(@as(u64, charge), manager.sliceStats(.lsm_block_table_cache).used_bytes);
+    // Oversized blocks never acquire residency or a cache resource charge.
+    const oversized = try a.alloc(u8, 65);
+    try std.testing.expectEqual(@as(usize, 0), (try backend.putCachedRunBlock("/large", 3, 0, 65, oversized)).len);
+    try std.testing.expectEqual(@as(usize, 40), backend.run_block_cache_bytes);
+    backend.close();
+    open = false;
+    try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lsm_block_table_cache).used_bytes);
+}
+
+test "lsm local denied cache admission keeps reads valid and backs off promotion" {
+    const a = std.testing.allocator;
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@backingInt(resource_manager_mod.Slice.lsm_block_table_cache)] = .{ .hard_limit_bytes = 1 };
+    var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    defer manager.deinit(a);
+    var backing = storage_io.MemoryStorage.init(a);
+    defer backing.deinit();
+    var backend = try Backend.open(a, "/denied-local-cache", .{ .storage = backing.storage(), .resource_manager = &manager, .flush_threshold = 1 });
+    defer backend.close();
+    var runtime = try backend.runtimeStore(a, .{ .name = "docs" });
+    defer runtime.deinit();
+    var write = try runtime.beginWrite();
+    try write.put("document:long-shared-prefix-for-compression:00", "value");
+    try write.put("document:long-shared-prefix-for-compression:01", "other");
+    try write.commit();
+    var read = try runtime_mod.BoundReadTxn(Backend).open(&backend, .{ .name = "docs" });
+    defer read.abort();
+    var scope = try read.openReadScope(a);
+    defer scope.close();
+    for (0..100) |_| try std.testing.expectEqualStrings("value", try scope.get("document:long-shared-prefix-for-compression:00"));
+    const keys = [_][]const u8{ "document:long-shared-prefix-for-compression:00", "document:long-shared-prefix-for-compression:01" };
+    var values: [2]?[]const u8 = undefined;
+    try scope.getManySorted(&keys, &values);
+    try std.testing.expectEqualStrings("value", values[0].?);
+    try std.testing.expectEqualStrings("other", values[1].?);
+    try std.testing.expectEqual(@as(usize, 0), scope.held_blocks.items.len);
+    try std.testing.expectEqual(@as(usize, 0), backend.run_block_cache.items.len);
+    try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lsm_block_table_cache).used_bytes);
+    try std.testing.expect(!backend.beginLocalBlockPromotion("/cooldown", 100, 0, 40, 40));
+    try std.testing.expect(backend.beginLocalBlockPromotion("/cooldown", 100, 0, 40, 40));
+    try std.testing.expect(!backend.beginLocalBlockPromotion("/cooldown", 100, 0, 40, 40));
+    backend.finishLocalBlockPromotion("/cooldown", 100, 0, 40, false);
+    for (0..65) |_| try std.testing.expect(!backend.beginLocalBlockPromotion("/cooldown", 100, 0, 40, 40));
+    try std.testing.expect(backend.beginLocalBlockPromotion("/cooldown", 100, 0, 40, 40));
+    backend.finishLocalBlockPromotion("/cooldown", 100, 0, 40, true);
+}
+
+test "lsm local bounded cache releases every failed allocation" {
+    const Fixture = struct {
+        fn run(a: Allocator) !void {
+            var backend = Backend.init(a, .{ .local_block_cache_bytes = 64, .local_block_cache_max_block_bytes = 64 });
+            defer backend.close();
+            _ = try backend.putCachedRunBlock("/one", 1, 0, 40, try a.alloc(u8, 40));
+            const pinned = backend.retainCachedRunBlock("/one", 1, 0, 40);
+            defer if (pinned) |payload| payload.release();
+            _ = try backend.putCachedRunBlock("/two", 2, 0, 40, try a.alloc(u8, 40));
+            _ = try backend.putCachedRunBlock("/large", 3, 0, 65, try a.alloc(u8, 65));
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
+test "lsm local cache participates in host reclamation without releasing pinned credit" {
+    const a = std.testing.allocator;
+    var manager = resource_manager_mod.ResourceManager.init(.{ .memory_budget = .{ .hard_limit_bytes = 512 } });
+    defer manager.deinit(a);
+    var backend = Backend.init(a, .{ .resource_manager = &manager });
+    defer backend.close();
+    _ = try backend.putCachedRunBlock("/first", 1, 0, 80, try a.alloc(u8, 80));
+    const pinned = backend.retainCachedRunBlock("/first", 1, 0, 80).?;
+    defer pinned.release();
+    _ = try backend.putCachedRunBlock("/second", 2, 0, 80, try a.alloc(u8, 80));
+    // Holding the backend never deadlocks an arbitrary resource requester.
+    platform.sync.lockYielding(&backend.mu);
+    const no_progress = manager.reclaimForAllocation(.dense_apply_working_set, 300);
+    backend.mu.unlock();
+    try std.testing.expectEqual(@as(u64, 0), no_progress);
+    var foreground = try manager.reserve(.dense_apply_working_set, 300);
+    defer foreground.release();
+    try std.testing.expectEqual(@as(usize, 0), backend.run_block_cache.items.len);
+    try std.testing.expectEqual(@as(usize, 0), backend.run_block_cache_bytes);
+    try std.testing.expectEqual(@as(u64, 80 + @sizeOf(SharedBytes)), manager.sliceStats(.lsm_block_table_cache).used_bytes);
+    try std.testing.expectEqual(@as(usize, 80), pinned.bytes.len);
+}
+
+test "lsm local shutdown fences a pending reclaimer registration" {
+    const Hook = struct {
+        var entered: std.Io.Event = .unset;
+        var release: std.Io.Event = .unset;
+        var once = std.atomic.Value(bool).init(true);
+        fn alloc(_: *anyopaque, n: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+            if (once.swap(false, .acq_rel)) {
+                entered.set(std.testing.io);
+                release.waitUncancelable(std.testing.io);
+            }
+            return std.testing.allocator.rawAlloc(n, alignment, ra);
+        }
+        fn resize(_: *anyopaque, memory: []u8, alignment: std.mem.Alignment, n: usize, ra: usize) bool {
+            return std.testing.allocator.rawResize(memory, alignment, n, ra);
+        }
+        fn remap(_: *anyopaque, memory: []u8, alignment: std.mem.Alignment, n: usize, ra: usize) ?[*]u8 {
+            return std.testing.allocator.rawRemap(memory, alignment, n, ra);
+        }
+        fn free(_: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
+            std.testing.allocator.rawFree(memory, alignment, ra);
+        }
+    };
+    const Worker = struct {
+        backend: *Backend,
+        bytes: []u8,
+        result: anyerror!void = {},
+        fn run(self: *@This()) void {
+            self.result = self.admit();
+        }
+        fn admit(self: *@This()) !void {
+            platform.sync.lockYielding(&self.backend.mu);
+            defer self.backend.mu.unlock();
+            _ = try self.backend.putCachedRunBlock("/late", 1, 0, 40, self.bytes);
+        }
+    };
+    const a = std.testing.allocator;
+    var manager = resource_manager_mod.ResourceManager.init(.{});
+    defer manager.deinit(a);
+    var dummy: u8 = 0;
+    manager.identity_allocator = .{ .ptr = &dummy, .vtable = &.{ .alloc = Hook.alloc, .resize = Hook.resize, .remap = Hook.remap, .free = Hook.free } };
+    var backend = Backend.init(a, .{ .resource_manager = &manager });
+    var open = true;
+    defer if (open) backend.close();
+    var worker = Worker{ .backend = &backend, .bytes = try a.alloc(u8, 40) };
+    Hook.entered.reset();
+    Hook.release.reset();
+    Hook.once.store(true, .release);
+    const admission = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+    var closer: ?std.Thread = null;
+    var joined = false;
+    defer if (!joined) {
+        Hook.release.set(std.testing.io);
+        admission.join();
+        if (closer) |thread| thread.join();
+    };
+    try Hook.entered.waitTimeout(std.testing.io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+    closer = try std.Thread.spawn(.{}, Backend.close, .{&backend});
+    open = false;
+    const deadline = std.Io.Clock.awake.now(std.testing.io).addDuration(.fromSeconds(5));
+    while (!backend.closing.load(.acquire) and std.Io.Clock.awake.now(std.testing.io).nanoseconds < deadline.nanoseconds) {
+        std.testing.io.sleep(.fromMilliseconds(1), .awake) catch {};
+    }
+    const closing = backend.closing.load(.acquire);
+    Hook.release.set(std.testing.io);
+    admission.join();
+    closer.?.join();
+    joined = true;
+    try std.testing.expect(closing);
+    try worker.result;
+    for (manager.reclaimers.items) |slot| try std.testing.expectEqual(@as(u64, 0), slot.identity);
+    try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lsm_block_table_cache).used_bytes);
+}
+
+test "lsm local impossible admission preserves useful cache" {
+    const a = std.testing.allocator;
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@backingInt(resource_manager_mod.Slice.lsm_block_table_cache)] = .{ .hard_limit_bytes = 256 };
+    var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    defer manager.deinit(a);
+    var backend = Backend.init(a, .{ .resource_manager = &manager });
+    defer backend.close();
+    _ = try backend.putCachedRunBlock("/useful", 1, 0, 40, try a.alloc(u8, 40));
+    const rejected = try backend.putCachedRunBlock("/impossible", 2, 0, 257, try a.alloc(u8, 257));
+    try std.testing.expectEqual(@as(usize, 0), rejected.len);
+    try std.testing.expectEqual(@as(usize, 1), backend.run_block_cache.items.len);
+    const useful = backend.retainCachedRunBlock("/useful", 1, 0, 40);
+    try std.testing.expect(useful != null);
+    useful.?.release();
+}
+
+test "lsm local writer batches borrow within owner limits and preserve mutable results" {
+    const a = std.testing.allocator;
+    var backing = storage_io.MemoryStorage.init(a);
+    defer backing.deinit();
+    var budget = @import("lite/test_allocator.zig").BudgetAllocator{ .backing = a };
+    var backend = try Backend.open(budget.allocator(), "/writer-borrow", .{ .storage = backing.storage(), .flush_threshold = 1 });
+    defer backend.close();
+    var runtime = try backend.runtimeStore(a, .{ .name = "docs" });
+    defer runtime.deinit();
+    var initial = try runtime.beginWrite();
+    try initial.put("document:long-shared-prefix-for-compression:00", "value");
+    try initial.put("document:long-shared-prefix-for-compression:01", "other");
+    try initial.commit();
+    const keys = [_][]const u8{ "document:long-shared-prefix-for-compression:00", "document:long-shared-prefix-for-compression:01" };
+    var values: [2]?[]const u8 = undefined;
+    var read = try runtime_mod.BoundReadTxn(Backend).open(&backend, .{ .name = "docs" });
+    defer read.abort();
+    var scope = try read.openReadScope(a);
+    defer scope.close();
+    try scope.getManySorted(&keys, &values);
+    var writer = try runtime_mod.NamespaceWriteTxn(Backend).open(&backend);
+    defer writer.abort();
+    var metadata = @import("lite/test_allocator.zig").BudgetAllocator{ .backing = a };
+    writer.metadata_allocator = metadata.allocator();
+    try writer.getManySorted(.{ .name = "docs" }, &keys, &values);
+    const calls = budget.alloc_calls;
+    const owned = writer.held_values.items.len;
+    const scratch_keys = writer.batch_scratch.keys.items.ptr;
+    for (0..100) |_| {
+        try writer.getManySorted(.{ .name = "docs" }, &keys, &values);
+        try std.testing.expectEqualStrings("value", values[0].?);
+        try std.testing.expectEqualStrings("other", values[1].?);
+    }
+    std.debug.print("lite writer batch probe: 100 batches, backend allocations={d}, owned values={d}, pins={d}\n", .{ budget.alloc_calls - calls, writer.held_values.items.len - owned, writer.held_blocks.items.len });
+    try std.testing.expectEqual(@as(usize, 0), budget.alloc_calls - calls);
+    try std.testing.expectEqual(owned, writer.held_values.items.len);
+    try std.testing.expectEqual(@as(usize, 1), writer.held_blocks.items.len);
+    try std.testing.expect(scratch_keys == writer.batch_scratch.keys.items.ptr);
+    try std.testing.expectEqual(@as(usize, 3), metadata.alloc_calls);
+    const borrowed = values[0].?;
+    const cached = backend.run_block_cache.items[0];
+    backend.evictCachedRunBlocksForRun(cached.path, cached.run_id);
+    try std.testing.expectEqualStrings("value", borrowed);
+    // A current mutable hit must be copied before its captured tip is released.
+    backend.options.flush_threshold = std.math.maxInt(usize);
+    var mutation = try runtime.beginWrite();
+    try mutation.put(keys[0], "new-value");
+    try mutation.commit();
+    try writer.getManySorted(.{ .name = "docs" }, &keys, &values);
+    const mutable_value = values[0].?;
+    try std.testing.expectEqualStrings("new-value", mutable_value);
+    var later = try runtime.beginWrite();
+    try later.put(keys[0], "later-value");
+    try later.commit();
+    try std.testing.expectEqualStrings("new-value", mutable_value);
+}
+
+test "lsm local concurrent cold batches share success and failure decodes" {
+    const Hook = struct {
+        var original: *const storage_io.Storage.VTable = undefined;
+        var offset: u64 = 0;
+        var enabled = false;
+        var fail = false;
+        var entered: std.Io.Event = .unset;
+        var release: std.Io.Event = .unset;
+        fn read(ptr: *anyopaque, a: Allocator, path: []const u8, at: u64, len: usize) anyerror![]u8 {
+            if (enabled and at == offset) {
+                entered.set(std.testing.io);
+                release.waitUncancelable(std.testing.io);
+                if (fail) return error.InjectedDecodeReadFailure;
+            }
+            return original.read_file_range_alloc(ptr, a, path, at, len);
+        }
+        fn worker(backend: *Backend) anyerror!void {
+            var read_tx = try runtime_mod.BoundReadTxn(Backend).open(backend, .{ .name = "docs" });
+            defer read_tx.abort();
+            var scope = try read_tx.openReadScope(std.testing.allocator);
+            defer scope.close();
+            const keys = [_][]const u8{ "document:long-shared-prefix-for-compression:00", "document:long-shared-prefix-for-compression:01" };
+            var values: [2]?[]const u8 = undefined;
+            if (fail) {
+                try std.testing.expectError(error.InjectedDecodeReadFailure, scope.getManySorted(&keys, &values));
+            } else {
+                try scope.getManySorted(&keys, &values);
+                try std.testing.expectEqualStrings("value", values[0].?);
+                try std.testing.expectEqualStrings("other", values[1].?);
+            }
+        }
+    };
+    const a = std.testing.allocator;
+    var backing = storage_io.MemoryStorage.init(a);
+    defer backing.deinit();
+    var vtable = backing.storage().vtable.*;
+    Hook.original = backing.storage().vtable;
+    vtable.read_file_range_alloc = Hook.read;
+    Hook.enabled = false;
+    var backend = try Backend.open(a, "/cold-shared", .{ .storage = .{ .ptr = backing.storage().ptr, .vtable = &vtable }, .flush_threshold = 1 });
+    defer backend.close();
+    var runtime = try backend.runtimeStore(a, .{ .name = "docs" });
+    defer runtime.deinit();
+    var write = try runtime.beginWrite();
+    try write.put("document:long-shared-prefix-for-compression:00", "value");
+    try write.put("document:long-shared-prefix-for-compression:01", "other");
+    try write.commit();
+    const run = backend.runs.at(0);
+    const cached_index = try backend.getCachedRunIndexIndex(run.path.?, run.id);
+    const index = backend.getCachedRunIndexByIndex(cached_index);
+    Hook.offset = @intCast(index.entry_data_start);
+    Hook.enabled = true;
+    defer Hook.enabled = false;
+    for ([_]bool{ true, false }) |fail| {
+        Hook.fail = fail;
+        Hook.entered.reset();
+        Hook.release.reset();
+        const loads = backend.read_stats.table_block_loads.load(.monotonic);
+        const joined = backend.local_reader.joined;
+        var workers: [8]std.Io.Future(anyerror!void) = undefined;
+        var started: usize = 0;
+        var done = false;
+        defer if (!done) {
+            Hook.release.set(std.testing.io);
+            for (workers[0..started]) |*worker| worker.await(std.testing.io) catch {};
+        };
+        workers[0] = try std.testing.io.concurrent(Hook.worker, .{&backend});
+        started = 1;
+        try Hook.entered.waitTimeout(std.testing.io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+        for (1..8) |i| {
+            workers[i] = try std.testing.io.concurrent(Hook.worker, .{&backend});
+            started += 1;
+        }
+        const deadline = std.Io.Clock.awake.now(std.testing.io).addDuration(.fromSeconds(5));
+        var joined_now: usize = 0;
+        while (std.Io.Clock.awake.now(std.testing.io).nanoseconds < deadline.nanoseconds) {
+            @import("antfly_platform").sync.lockYielding(&backend.local_reader.mutex);
+            joined_now = backend.local_reader.joined - joined;
+            backend.local_reader.mutex.unlock();
+            if (joined_now == 7) break;
+            platform_time.yieldBriefly();
+        }
+        Hook.release.set(std.testing.io);
+        var failure: ?anyerror = null;
+        for (&workers) |*worker| worker.await(std.testing.io) catch |err| {
+            if (failure == null) failure = err;
+        };
+        done = true;
+        if (failure) |err| return err;
+        try std.testing.expectEqual(@as(usize, 7), joined_now);
+        const extra = backend.read_stats.table_block_loads.load(.monotonic) - loads;
+        std.debug.print("lite shared cold decode probe: failure={any}, readers=8, joined={d}, encoded loads={d}\n", .{ fail, joined_now, extra });
+        try std.testing.expectEqual(@as(u64, 1), extra);
+        try std.testing.expectEqual(@as(usize, 0), backend.local_reader.active);
+    }
+}
+
+test "lsm local transient reads preserve hot cache and reuse compressed point scratch" {
+    const cases = [_][]const u8{ "other", z17RepeatString("compressible-value:", 128) };
+    for (cases) |value| {
+        const a = std.testing.allocator;
+        var storage = storage_io.MemoryStorage.init(a);
+        defer storage.deinit();
+        var budget = @import("lite/test_allocator.zig").BudgetAllocator{ .backing = a };
+        var backend = try Backend.open(budget.allocator(), "/scan-admission", .{ .storage = storage.storage(), .flush_threshold = 1 });
+        defer backend.close();
+        var runtime = try backend.runtimeStore(a, .{ .name = "scan" });
+        defer runtime.deinit();
+        var write = try runtime.beginWrite();
+        try write.put("document:long-shared-prefix-for-compression:00", "value");
+        try write.put("document:long-shared-prefix-for-compression:01", value);
+        try write.commit();
+        // An unrelated useful payload must not be displaced by this scan.
+        _ = try backend.putCachedRunBlock("/hot", 999, 0, 32, try backend.allocator.alloc(u8, 32));
+        var read = try runtime_mod.BoundReadTxn(Backend).open(&backend, .{ .name = "scan", .block_cache_admission = .transient });
+        defer read.abort();
+        var point = try read.openReadScope(a);
+        defer point.close();
+        try std.testing.expectEqualStrings(value, try point.get("document:long-shared-prefix-for-compression:01"));
+        const calls = budget.alloc_calls;
+        const loads = backend.read_stats.table_block_loads.load(.monotonic);
+        for (0..100) |_| try std.testing.expectEqualStrings(value, try point.get("document:long-shared-prefix-for-compression:01"));
+        const extra = budget.alloc_calls - calls;
+        std.debug.print("lite transient point scratch probe: 100 reads, backend allocations={d}, encoded loads={d}\n", .{ extra, backend.read_stats.table_block_loads.load(.monotonic) - loads });
+        // Only compact owned point entries allocate; encoded input and prefix
+        // reconstruction/snappy intermediates reuse the bounded workspace.
+        try std.testing.expectEqual(@as(usize, 100), extra);
+        const keys = [_][]const u8{ "document:long-shared-prefix-for-compression:00", "document:long-shared-prefix-for-compression:01" };
+        var values: [2]?[]const u8 = undefined;
+        var scan = try read.openReadScope(a);
+        defer scan.close();
+        try scan.getManySorted(&keys, &values);
+        try std.testing.expectEqualStrings("value", values[0].?);
+        try std.testing.expectEqualStrings(value, values[1].?);
+        try std.testing.expectEqual(@as(usize, 1), backend.run_block_cache.items.len);
+        try std.testing.expectEqual(@as(u64, 999), backend.run_block_cache.items[0].run_id);
+        try std.testing.expectEqual(@as(usize, 32), backend.run_block_cache_bytes);
+        for (backend.local_reader.slots) |slot| if (slot.initialized) {
+            try std.testing.expect(slot.cap.live <= LocalReader.retained_bytes_per_workspace + @sizeOf(usize) * 4);
+        };
+    }
 }

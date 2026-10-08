@@ -1207,19 +1207,27 @@ test "relu decomposition" {
     try std.testing.expectEqual(result, b.build().root_id);
 }
 
-test "rank-one size-one operands broadcast along matching unit dimension" {
+test "rank-one size-one operands broadcast as scalars when the target has a unit dimension" {
     const alloc = std.testing.allocator;
     var b = Builder.init(alloc, "unit_broadcast_test");
     defer b.deinit();
 
     const x = try b.parameter(0, Shape.init(.f32, &.{ 1, 1536 }), "x");
     const y = try b.parameter(1, Shape.init(.f32, &.{1}), "row_scale");
-    _ = try b.multiply(x, y);
+    const result = try b.multiply(x, y);
 
-    const broadcast = b.instructions.items[2];
+    const multiply = b.getInst(result);
+    try std.testing.expectEqualStrings("multiply", multiply.opcode);
+    try std.testing.expectEqual(x, multiply.operand_ids[0]);
+    try std.testing.expectEqualSlices(i64, &.{ 1, 1536 }, multiply.shape.dimensions);
+    const broadcast = b.getInst(multiply.operand_ids[1]);
     try std.testing.expectEqualStrings("broadcast", broadcast.opcode);
-    try std.testing.expectEqual(@as(usize, 1), broadcast.dimensions.?.len);
-    try std.testing.expectEqual(@as(i64, 0), broadcast.dimensions.?[0]);
+    try std.testing.expectEqualSlices(i64, &.{ 1, 1536 }, broadcast.shape.dimensions);
+    try std.testing.expectEqual(@as(usize, 0), broadcast.dimensions.?.len);
+    const scalar = b.getInst(broadcast.operand_ids[0]);
+    try std.testing.expectEqualStrings("reshape", scalar.opcode);
+    try std.testing.expectEqual(@as(usize, 0), scalar.shape.dimensions.len);
+    try std.testing.expectEqual(y, scalar.operand_ids[0]);
 }
 
 test "dot with explicit dimension numbers" {

@@ -1,5 +1,18 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Elastic-2.0
+//
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
+//
+//     https://www.antfly.io/licensing/ELv2-license
+//
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
+
 //! Durable bounded mark frontier and live set, stored in native immutable pages.
 //! Metadata CAS binds checkpoints to the exact collection cut. Uploads for the
 //! collector share a private attempt excluded from sweeping until completion.
@@ -33,6 +46,7 @@ pub const Job = union(enum) {
     contribution_page: Ref,
     chunk: artifacts.ChunkRef,
     text_directory: artifacts.ChunkRef,
+    text_manifest: struct { ref: artifacts.ChunkRef, seekable: bool },
     page: struct { ref: tree.Ref, ordered_rows: bool, contributions: bool = false },
 };
 pub const Progress = struct {
@@ -95,6 +109,7 @@ pub const Progress = struct {
             },
             .artifact => |artifact| try collector.markArtifact(a, artifact),
             .text_directory => |ref| try collector.markTextDirectory(a, ref),
+            .text_manifest => |manifest| try collector.markTextManifest(a, manifest.ref, manifest.seekable),
             .contribution_page => |page| {
                 if (!try self.expand(.{ .artifact_id = page.artifact_id, .checksum = page.checksum, .byte_len = page.byte_len }, "contributions")) return;
                 try stores.chargeReadBudget(&collector.remaining_reads, page.byte_len);

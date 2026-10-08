@@ -1867,7 +1867,7 @@ pub fn cloneGraphMetricStatusesFromGraph(
             .config_fingerprint = status.config_fingerprint,
             .maintenance_paused = status.maintenance_paused,
             .build_queued = status.build_queued,
-            .published_generation = if (status.published_edge_generation != 0) status.published_edge_generation else status.published_generation,
+            .published_generation = status.published_edge_generation,
             .edge_generation = status.edge_generation,
             .target_edge_generation = status.target_edge_generation,
             .queued_generation = status.queued_generation,
@@ -3225,6 +3225,12 @@ pub const CompiledPatternFilter = union(enum) {
         geo_bbox: std.json.Value,
         geo_shape: std.json.Value,
 
+        /// Canonical bounds shared by index planners and the row evaluator.
+        pub fn standardBounds(self: FieldPredicate) !?struct { lower: ?PatternJsonRangeBound, upper: ?PatternJsonRangeBound } {
+            if (self != .standard_range) return null;
+            return .{ .lower = try standardPatternRangeLowerBound(self.standard_range), .upper = try standardPatternRangeUpperBound(self.standard_range) };
+        }
+
         /// Conservative zone-map test in the same numeric domain as the row
         /// predicate. Equality is retained at exclusive boundaries so pruning
         /// can never remove a matching row through floating-point rounding.
@@ -3929,6 +3935,16 @@ const PatternFieldString = struct {
 const PatternScalar = struct {
     kind: pathfact_mod.Kind,
     value: []const u8,
+
+    pub fn jsonValue(self: PatternScalar) !std.json.Value {
+        return switch (self.kind) {
+            .string => .{ .string = self.value },
+            .number => if (std.fmt.parseInt(i64, self.value, 10)) |v| .{ .integer = v } else |_| .{ .number_string = self.value },
+            .bool => .{ .bool = std.mem.eql(u8, self.value, "true") },
+            .null => .null,
+            else => error.InvalidArgument,
+        };
+    }
 };
 
 const PatternFieldScalar = struct {
@@ -4504,14 +4520,17 @@ fn jsonValueMatchesStandardRange(value: std.json.Value, lower: ?PatternJsonRange
         return false;
     }
     if (value == .integer or value == .float) {
-        const candidate = try jsonNumberFromValue(value);
-        const min_value = if (lower) |bound| try jsonNumberFromValue(bound.value) else null;
-        const max_value = if (upper) |bound| try jsonNumberFromValue(bound.value) else null;
-        if (min_value) |min| {
-            if (candidate < min or (!(lower.?.inclusive) and candidate == min)) return false;
+        // Keep integers exact, including mixed integer/float comparisons.
+        // This is the same scalar order used by relational predicate indexes.
+        if (lower) |bound| {
+            if (bound.value != .integer and bound.value != .float) return error.InvalidArgument;
+            const order = try @import("../../../sql/scalar.zig").compare(value, bound.value);
+            if (order == .lt or (!bound.inclusive and order == .eq)) return false;
         }
-        if (max_value) |max| {
-            if (candidate > max or (!(upper.?.inclusive) and candidate == max)) return false;
+        if (upper) |bound| {
+            if (bound.value != .integer and bound.value != .float) return error.InvalidArgument;
+            const order = try @import("../../../sql/scalar.zig").compare(value, bound.value);
+            if (order == .gt or (!bound.inclusive and order == .eq)) return false;
         }
         return true;
     }
@@ -4826,7 +4845,7 @@ fn jsonU64FromValue(value: std.json.Value) !u64 {
     };
 }
 
-fn jsonDateNsFromValue(value: std.json.Value) !u64 {
+pub fn jsonDateNsFromValue(value: std.json.Value) !u64 {
     return switch (value) {
         .string => |text| (try parsePatternRfc3339ToNs(text)) orelse error.InvalidArgument,
         .integer, .float, .number_string => try jsonU64FromValue(value),
@@ -7823,4 +7842,23 @@ test "fuseNamedSets member identity separates tables and ignores public id alias
         try std.testing.expectEqualStrings("doc:a", hit.id);
         try std.testing.expectEqual(@as(usize, if (std.mem.eql(u8, hit.source_table.?, "a")) 2 else 1), hit.index_scores.len);
     }
+}
+
+test "external lake shared standard range preserves exact integer order above 2^53 and mixed float boundaries" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    const parsed = try std.json.parseFromSlice(std.json.Value, ca,
+        \\{"range":{"amount":{"gt":9007199254740992}}}
+    , .{});
+    const filter = try compilePatternFilter(ca, parsed.value);
+    for ([_]std.json.Value{ .{ .integer = 9007199254740993 }, .{ .integer = 9007199254740994 } }) |value| {
+        var doc: std.json.Value = .{ .object = .empty };
+        try doc.object.put(ca, "amount", value);
+        try std.testing.expect(try filter.matches(ca, "doc", doc));
+    }
+    var doc: std.json.Value = .{ .object = .empty };
+    try doc.object.put(ca, "amount", .{ .float = 9007199254740992.0 });
+    try std.testing.expect(!try filter.matches(ca, "doc", doc));
 }

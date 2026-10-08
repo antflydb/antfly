@@ -17,6 +17,7 @@
 const std = @import("std");
 const httpx = @import("httpx");
 const decisions = @import("decisions.zig");
+const openai = @import("openai.zig");
 const registry_mod = @import("../common/provider_registry.zig");
 const secrets = @import("../common/secrets.zig");
 const execution = @import("antfly_inference_execution_context");
@@ -47,6 +48,11 @@ fn operationalError(err: anyerror) anyerror {
 fn parseResponse(a: std.mem.Allocator, bytes: []const u8) !decisions.Json {
     if (bytes.len > max_response_bytes) return error.DecisionLimitExceeded;
     return std.json.parseFromSliceLeaky(decisions.Json, a, bytes, .{ .allocate = .alloc_always }) catch |err| return if (err == error.OutOfMemory) err else error.InvalidDecisionOutput;
+}
+
+fn requestBody(a: std.mem.Allocator, cfg: decisions.DeciderConfig, request: decisions.Request) ![]const u8 {
+    if (cfg.provider == .openai) return openai.requestBody(a, cfg.modelName(), request.input, request.questions);
+    return std.json.Stringify.valueAlloc(a, .{ .model = cfg.modelName(), .state = request.input, .questions = request.questions }, .{});
 }
 
 pub const Runtime = struct {
@@ -104,13 +110,21 @@ pub const Runtime = struct {
             try checkpoint(self.runtime);
             const a = self.arena.allocator();
             const cfg = self.cfg;
-            const body = try std.json.Stringify.valueAlloc(a, .{ .model = cfg.modelName(), .state = self.request.input, .questions = self.request.questions }, .{});
+            const body = try requestBody(a, cfg, self.request);
             const base = if (cfg.provider == .antfly and cfg.url.len == 0) self.runtime.antfly_url orelse cfg.baseUrl() else cfg.baseUrl();
-            const url = try std.fmt.allocPrint(a, "{s}{s}", .{ std.mem.trimEnd(u8, base, "/"), if (cfg.provider == .jev) "/v1/systemone" else "/decide" });
-            var key_source = try secrets.SecretValue.initConfigOrEnv(a, cfg.api_key, if (cfg.provider == .jev) "TYPESAFE_API_KEY" else "ANTFLY_INFERENCE_API_KEY");
+            const url = try std.fmt.allocPrint(a, "{s}{s}", .{ std.mem.trimEnd(u8, base, "/"), switch (cfg.provider) {
+                .antfly => "/decide",
+                .jev => "/v1/systemone",
+                .openai => "/decisions",
+            } });
+            var key_source = try secrets.SecretValue.initConfigOrEnv(a, cfg.api_key, switch (cfg.provider) {
+                .antfly => "ANTFLY_INFERENCE_API_KEY",
+                .jev => "TYPESAFE_API_KEY",
+                .openai => "OPENAI_API_KEY",
+            });
             defer key_source.deinit(a);
             var quota = try self.runtime.limits.acquire(.{ .operation = .decision, .endpoint = .{
-                .provider = if (cfg.provider == .jev) .jev else .antfly,
+                .provider = std.meta.stringToEnum(quotas.Provider, @tagName(cfg.provider)).?,
                 .endpoint = base,
                 .model = cfg.modelName(),
                 .credentials = @import("../common/credential_source_identity.zig").fromSecretValue(key_source),
@@ -136,7 +150,7 @@ pub const Runtime = struct {
                 return parseResponse(a, bytes);
             };
             const key = key_source.resolveOwned(a, self.runtime.secret_store) catch |err| return operationalError(err);
-            if (cfg.provider == .jev and key == null) return error.MissingDecisionApiKey;
+            if (cfg.provider != .antfly and key == null) return error.MissingDecisionApiKey;
             var headers: [2][2][]const u8 = undefined;
             var count: usize = 0;
             if (key) |value| {
@@ -166,7 +180,8 @@ pub const Runtime = struct {
                 else => error.DecisionUpstreamFailure,
             };
             const bytes = response.body orelse return error.InvalidDecisionOutput;
-            return parseResponse(a, bytes);
+            const parsed = try parseResponse(a, bytes);
+            return if (cfg.provider == .openai) openai.response(a, self.request.questions, parsed) else parsed;
         }
     };
     fn evaluate(ptr: *anyopaque, a: std.mem.Allocator, requests: []const decisions.Request) ![]const decisions.Json {
@@ -184,7 +199,7 @@ pub const Runtime = struct {
             if (request.input.len > decisions.capabilities(cfg.provider).max_input_bytes) return error.DecisionLimitExceeded;
             // Reserve conservatively before any provider I/O. The same byte-based
             // token estimate is used by the shared provider quota implementation.
-            const body = try std.json.Stringify.valueAlloc(a, .{ .model = cfg.modelName(), .state = request.input, .questions = request.questions }, .{});
+            const body = try requestBody(a, cfg, request);
             defer a.free(body);
             estimated +|= body.len;
             if (estimated > cfg.max_input_tokens) return error.DecisionLimitExceeded;
@@ -327,6 +342,7 @@ test "decision functions HTTP ceiling rejects oversized advertised bodies before
     var server = try httpx.TestServer.start(a, io, &.{
         .{ .method = .POST, .path = "/decide", .max_uses = 1, .respond = .{ .body = oversized, .truncate_body_at = 0 } },
         .{ .method = .POST, .path = "/v1/systemone", .max_uses = 1, .respond = .{ .body = oversized, .truncate_body_at = 0 } },
+        .{ .method = .POST, .path = "/decisions", .max_uses = 1, .respond = .{ .body = oversized, .truncate_body_at = 0 } },
     });
     defer server.deinit();
     var client = httpx.Client.initWithConfig(a, io, .{ .keep_alive = false, .max_response_size = 64 * 1024 * 1024 });
@@ -335,6 +351,7 @@ test "decision functions HTTP ceiling rejects oversized advertised bodies before
     defer registry.deinit();
     try registry.registerDeciderConfig("local", .{ .provider = .antfly, .model = "mock", .url = server.baseUrl() });
     try registry.registerDeciderConfig("remote", .{ .provider = .jev, .api_key = "test", .url = server.baseUrl() });
+    try registry.registerDeciderConfig("openai", .{ .provider = .openai, .model = "mock", .api_key = "test", .url = server.baseUrl() });
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const questions = try decisions.questionsFor(arena.allocator(), .ai_probability, &.{ .{ .string = "refund" }, .{ .string = "Refund?" }, .{ .string = "local" } });
@@ -346,7 +363,7 @@ test "decision functions HTTP ceiling rejects oversized advertised bodies before
             };
         }
     };
-    for ([_][]const u8{ "local", "remote" }) |name| {
+    for ([_][]const u8{ "local", "remote", "openai" }) |name| {
         var runtime: Runtime = .{ .registry = &registry, .http = &client, .io = io };
         var failure: ?anyerror = null;
         var group = std.Io.Group.init;
@@ -357,4 +374,105 @@ test "decision functions HTTP ceiling rejects oversized advertised bodies before
         try std.testing.expectEqual(@as(?anyerror, error.DecisionLimitExceeded), failure);
         try std.testing.expectEqual(@as(u64, 0), runtime.rows);
     }
+}
+
+test "decision functions OpenAI HTTP routing alignment provenance budgets and errors" {
+    const a = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    const Check = struct {
+        fn request(req: httpx.testing_mod.RequestInfo) !void {
+            try std.testing.expectEqualStrings("Bearer openai-test", req.header("Authorization") orelse return error.TestUnexpectedResult);
+            try std.testing.expect(req.header(execution.source_table_header) == null);
+            const parsed = try std.json.parseFromSlice(@import("openai_api").DecisionRequest, std.testing.allocator, req.body, .{});
+            defer parsed.deinit();
+            try std.testing.expectEqualStrings("refund", parsed.value.input.string);
+            try std.testing.expectEqualStrings("configured-model", parsed.value.model);
+            try std.testing.expectEqual(@as(usize, 1), parsed.value.questions.len);
+            const question = parsed.value.questions[0].question_param_predicate;
+            try std.testing.expectEqualStrings("answer", question.name.?);
+            try std.testing.expectEqualStrings("Refund?", question.instructions);
+        }
+    };
+    const usage =
+        \\"usage":{"input_tokens":2,"input_tokens_details":{"cached_tokens":0,"cache_write_tokens":0},"output_tokens":0,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":2}
+    ;
+    const success = "{\"model\":\"resolved-model\",\"answers\":[{\"type\":\"predicate\",\"name\":\"answer\",\"probability\":0.9}]," ++ usage ++ "}";
+    const refusal = "{\"model\":\"resolved-model\",\"answers\":[{\"type\":\"refusal\",\"name\":\"answer\"}]," ++ usage ++ "}";
+    var server = try httpx.TestServer.start(a, io, &.{
+        .{ .method = .POST, .path = "/v1/decisions", .max_uses = 2, .assert_request = Check.request, .respond = .{ .body = success } },
+        .{ .method = .POST, .path = "/v1/decisions", .max_uses = 1, .respond = .{ .body = refusal } },
+        .{ .method = .POST, .path = "/v1/decisions", .max_uses = 1, .respond = .{ .status = 429, .body = "rate limited" } },
+        .{ .method = .POST, .path = "/v1/decisions", .max_uses = 1, .respond = .{ .status = 401, .body = "unauthorized" } },
+        .{ .method = .POST, .path = "/v1/decisions", .max_uses = 1, .respond = .{ .status = 502, .body = "upstream failure" } },
+        .{ .method = .POST, .path = "/v1/decisions", .max_uses = 1, .respond = .{ .body = "{}" } },
+    });
+    defer server.deinit();
+    var client = httpx.Client.initWithConfig(a, io, .{ .keep_alive = false });
+    defer client.deinit();
+    var registry = registry_mod.Registry.init(a);
+    defer registry.deinit();
+    const url = try std.fmt.allocPrint(a, "{s}/v1/", .{server.baseUrl()});
+    defer a.free(url);
+    try registry.registerDeciderConfig("openai", .{ .provider = .openai, .model = "configured-model", .url = url, .api_key = "openai-test", .max_rows = 2, .batch_size = 1 });
+    try registry.registerDeciderConfig("budgeted-openai", .{ .provider = .openai, .model = "configured-model", .url = url, .api_key = "openai-test", .max_input_tokens = 1 });
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const questions = try decisions.questionsFor(alloc, .ai_probability, &.{ .{ .string = "refund" }, .{ .string = "Refund?" }, .{ .string = "openai" } });
+    const Run = struct {
+        fn run(runtime: *Runtime, allocator: std.mem.Allocator, q: decisions.Json, count: usize, failure: *?anyerror) void {
+            const requests = allocator.alloc(decisions.Request, count) catch |err| {
+                failure.* = err;
+                return;
+            };
+            @memset(requests, .{ .input = "refund", .decider = "openai", .questions = q });
+            const results = runtime.provider().withSourceTable("docs").evaluateBatch(allocator, requests) catch |err| {
+                failure.* = err;
+                return;
+            };
+            for (results) |result| {
+                const probability = decisions.selectResult(.ai_probability, result) catch |err| {
+                    failure.* = err;
+                    return;
+                };
+                std.testing.expectApproxEqAbs(@as(f64, 0.9), probability.float, 1e-9) catch |err| {
+                    failure.* = err;
+                    return;
+                };
+            }
+        }
+    };
+    var runtime: Runtime = .{ .registry = &registry, .http = &client, .io = io, .profile_allocator = alloc };
+    var failure: ?anyerror = null;
+    var group = std.Io.Group.init;
+    defer group.cancel(io);
+    try group.concurrent(io, Run.run, .{ &runtime, alloc, questions, 2, &failure });
+    try server.handleOne();
+    try server.handleOne();
+    try group.await(io);
+    if (failure) |err| return err;
+    try std.testing.expectEqual(@as(u64, 2), runtime.rows);
+    try std.testing.expectEqual(@as(u64, 2), runtime.batches);
+    try std.testing.expectEqual(@as(u64, 4), runtime.input_tokens);
+    try std.testing.expectEqual(@as(usize, 1), runtime.provenance.items.len);
+    try std.testing.expectEqual(decisions.Provider.openai, runtime.provenance.items[0].provider);
+    try std.testing.expectEqualStrings("resolved-model", runtime.provenance.items[0].model);
+    try std.testing.expectEqual(@as(u64, 2), runtime.provenance.items[0].rows);
+    try std.testing.expectError(error.DecisionLimitExceeded, runtime.provider().evaluateBatch(alloc, &.{.{ .input = "refund", .decider = "openai", .questions = questions }}));
+    var budgeted: Runtime = .{ .registry = &registry, .http = &client, .io = io };
+    try std.testing.expectError(error.DecisionLimitExceeded, budgeted.provider().evaluateBatch(alloc, &.{.{ .input = "refund", .decider = "budgeted-openai", .questions = questions }}));
+    for ([_]anyerror{ error.InvalidDecisionOutput, error.DecisionRateLimited, error.DecisionUnauthorized, error.DecisionUpstreamFailure, error.InvalidDecisionOutput }) |expected| {
+        var failing: Runtime = .{ .registry = &registry, .http = &client, .io = io };
+        failure = null;
+        try group.concurrent(io, Run.run, .{ &failing, alloc, questions, 1, &failure });
+        try server.handleOne();
+        try group.await(io);
+        try std.testing.expectEqual(@as(?anyerror, expected), failure);
+        try std.testing.expectEqual(@as(u64, 0), failing.rows);
+    }
+    var cancelled = std.atomic.Value(bool).init(true);
+    runtime.context = .{ .io = io, .deadline_ns = null, .cancellation = @import("antfly_cancellation").CancellationToken.fromAtomic(&cancelled) };
+    try std.testing.expectError(error.Cancelled, runtime.provider().evaluateBatch(alloc, &.{.{ .input = "refund", .decider = "openai", .questions = questions }}));
 }
