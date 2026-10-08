@@ -174,6 +174,42 @@ pub fn numericJson(execution: *Execution, input: std.json.Value) !Value {
     return scratch.encode(parsed.value) catch |err| return scratch.failure(err);
 }
 
+/// Bind a parsed, explicitly typed array envelope without a JSON round trip.
+/// Scratch is unpublished; only canonical owned bytes escape to the row owner.
+/// This adapter does not admit array expressions or ordered array keys by itself.
+pub fn arrayJson(
+    execution: *Execution,
+    kind: @import("../sql/array_value.zig").ElementType,
+    input: std.json.Value,
+    modifier: ?exact.TypeModifier,
+) !Value {
+    try execution.charge(0);
+    if (input == .null) return .null;
+    var scratch: NumericScratch = undefined;
+    scratch.init(execution);
+    defer scratch.deinit();
+    const wire = @import("../sql/array_wire.zig");
+    const storage = @import("../sql/array_storage.zig");
+    const limits: @import("../sql/array_value.zig").Limits = .{ .bytes = execution.bytes.* };
+    var decoded = wire.decodeBorrowedWithModifier(scratch.arena.allocator(), kind, input, modifier, .{
+        .context = &execution.numeric,
+        .values = limits,
+        .wire_bytes = execution.numeric.max_output_bytes,
+    }) catch |err| return scratch.failure(err);
+    defer decoded.deinit();
+    var prepared = storage.Prepared.init(scratch.arena.allocator(), decoded.value, .{
+        .context = &execution.numeric,
+        .values = limits,
+        .wire_bytes = execution.numeric.max_output_bytes,
+    }) catch |err| return scratch.failure(err);
+    defer prepared.deinit();
+    if (prepared.encoded_size > execution.bytes.* -| scratch.memory.peak) return execution.limit();
+    const output = allocateOutput(execution.alloc, prepared.encoded_size, execution.bytes) catch |err| return scratch.failure(err);
+    errdefer execution.alloc.free(output);
+    prepared.writeInto(output) catch |err| return scratch.failure(err);
+    return .{ .sql_array = .{ .element_type = kind, .bytes = output } };
+}
+
 /// Assignment and logical restore share exact parsing, work and cancellation.
 /// Preservation validates the target domain without repairing logical values;
 /// the physical row codec separately enforces canonical bytes.
@@ -809,6 +845,84 @@ fn compareValues(execution: *Execution, a: Value, b: Value, fold_ascii: bool) !s
         return @import("../sql/array_comparison.zig").order(try a.sql_array.view(), try b.sql_array.view(), &execution.numeric, execution.bytes.*) catch |err| return scratch.failure(err);
     }
     return valueOrderWithContext(a, b, fold_ascii, &execution.numeric);
+}
+
+test "relational declarations typed array JSON adapter owns canonical PostgreSQL values and unwinds faults" {
+    const a = std.testing.allocator;
+    const arrays = @import("../sql/array_value.zig");
+    const storage = @import("../sql/array_storage.zig");
+    const wire = @import("../sql/array_wire.zig");
+    const Fixture = struct { entries: []const struct { element_type: arrays.ElementType, binary: []const u8 } };
+    var fixture = try std.json.parseFromSlice(Fixture, a, @embedFile("../sql/fixtures/sql_array_binary_reference.json"), .{ .ignore_unknown_fields = true });
+    defer fixture.deinit();
+    const Faults = struct {
+        fn run(alloc: Allocator, kind: arrays.ElementType, input: std.json.Value, expected: []const u8) !void {
+            var allowance: usize = max_allocated_bytes;
+            var execution = Execution.init(alloc, &allowance);
+            const result = arrayJson(&execution, kind, input, null) catch |err| {
+                if (err == error.OutOfMemory) try std.testing.expect(execution.numeric.failure == null);
+                return err;
+            };
+            defer alloc.free(result.sql_array.bytes);
+            try std.testing.expectEqual(kind, result.sql_array.element_type);
+            try std.testing.expectEqualSlices(u8, expected, result.sql_array.bytes);
+            // Retained bytes and arena capacity are separate charges.
+            try std.testing.expect(allowance <= max_allocated_bytes - result.sql_array.bytes.len);
+            if (input.object.get("values").?.array.items.len != 0)
+                try std.testing.expect(allowance < max_allocated_bytes - result.sql_array.bytes.len);
+            try std.testing.expect(execution.numeric.remaining < 8 * 1024 * 1024);
+            try std.testing.expectEqual(alloc.ptr, execution.alloc.ptr);
+            try std.testing.expectEqual(alloc.vtable, execution.numeric.alloc.vtable);
+        }
+    };
+    try std.testing.expectEqual(@as(usize, 11), fixture.value.entries.len);
+    for (fixture.value.entries) |entry| {
+        const pg = try a.alloc(u8, entry.binary.len / 2);
+        defer a.free(pg);
+        _ = try std.fmt.hexToBytes(pg, entry.binary);
+        var original = try @import("../sql/array_binary.zig").decode(a, entry.element_type, pg, .{});
+        defer original.deinit();
+        const expected = try storage.encodeAlloc(a, original.value, .{});
+        defer a.free(expected);
+        var allowance: usize = max_allocated_bytes;
+        var execution = Execution.init(a, &allowance);
+        const result = blk: {
+            var inputs = std.heap.ArenaAllocator.init(a);
+            defer inputs.deinit();
+            const envelope = try wire.toJsonLeaky(inputs.allocator(), original.value, .{});
+            try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Faults.run, .{ entry.element_type, envelope, expected });
+            break :blk try arrayJson(&execution, entry.element_type, envelope, null);
+        };
+        defer a.free(result.sql_array.bytes);
+        try std.testing.expectEqualSlices(u8, expected, result.sql_array.bytes);
+        _ = try storage.validateCanonical(a, entry.element_type, result.sql_array.bytes, .{});
+    }
+}
+
+test "relational declarations typed array JSON adapter preserves sticky cancellation and byte admission" {
+    const a = std.testing.allocator;
+    var input = try std.json.parseFromSlice(std.json.Value, a,
+        \\{"dimensions":[{"length":2,"lower_bound":-7}],"values":["9007199254740993",null],"sql_nulls":[false,true]}
+    , .{});
+    defer input.deinit();
+    var allowance: usize = 1;
+    var execution = Execution.init(a, &allowance);
+    try std.testing.expectError(error.RelationalExpressionBudgetExceeded, arrayJson(&execution, .int64, input.value, null));
+    allowance = max_allocated_bytes;
+    try std.testing.expectError(error.RelationalExpressionBudgetExceeded, arrayJson(&execution, .int64, input.value, null));
+    execution = Execution.init(a, &allowance);
+    const Cancel = struct {
+        fn poll(_: ?*anyopaque) !void {
+            return error.Canceled;
+        }
+    };
+    execution.numeric.checkpoint = Cancel.poll;
+    try std.testing.expectError(error.Canceled, arrayJson(&execution, .int64, input.value, null));
+    execution.numeric.checkpoint = null;
+    execution.numeric.remaining = 8 * 1024 * 1024;
+    try std.testing.expectError(error.Canceled, arrayJson(&execution, .int64, .null, null));
+    execution = Execution.init(a, &allowance);
+    try std.testing.expect((try arrayJson(&execution, .int64, .null, null)) == .null);
 }
 
 test "relational declarations typed row values compare canonical arrays under shared scratch admission" {
@@ -1832,9 +1946,22 @@ test "relational declarations NUMERIC JSON assignments share PostgreSQL scalar a
             const expected = if (std.mem.eql(u8, code, "22023")) error.SqlInvalidParameterValue else error.RelationalExpressionOverflow;
             try std.testing.expectError(expected, normalizeNumericJson(&execution, .{ .string = entry.left }, modifier, false));
             try std.testing.expectError(expected, normalizeNumericArrayJson(&execution, &document.value, modifier, false));
+            try std.testing.expectError(expected, arrayJson(&execution, .numeric, document.value, modifier));
             try std.testing.expectEqual(original.ptr, document.value.object.get("values").?.array.items.ptr);
             continue;
         }
+        const adapted = try arrayJson(&execution, .numeric, document.value, modifier);
+        const adapted_view = try adapted.sql_array.view();
+        try std.testing.expectEqual(@as(u32, 4), adapted_view.count);
+        try std.testing.expectEqual(@as(i32, -3), (try adapted_view.dimension(0)).lower);
+        try std.testing.expectEqual(@as(i32, 7), (try adapted_view.dimension(1)).lower);
+        try std.testing.expect((try adapted_view.cell(1)).sql_null);
+        try std.testing.expect((try adapted_view.cell(3)).sql_null);
+        var read_context: exact.Context = .{ .alloc = alloc };
+        var read_number = try binary.decodeCanonical(&read_context, (try adapted_view.cell(0)).bytes);
+        defer read_number.deinit();
+        const adapted_text = try exact.format(&read_context, read_number.value);
+        try std.testing.expectEqualStrings(entry.expected.?.string, adapted_text);
         const scalar = try normalizeNumericJson(&execution, .{ .string = entry.left }, modifier, false);
         try std.testing.expectEqualStrings(entry.expected.?.string, if (scalar == .number_string) scalar.number_string else scalar.string);
         try normalizeNumericArrayJson(&execution, &document.value, modifier, false);

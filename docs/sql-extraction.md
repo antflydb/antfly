@@ -6365,3 +6365,36 @@ immutable inventory checks pass. This does not activate public array programs:
 their bounded JSON-to-row adapters and compiler/DDL propagation remain pending.
 Shared storage decoding and interruption inside canonical JSONB serialization
 also remain separate work; this change does not claim complete time-slicing.
+
+Integrated storage-source validation passes 615 local and 226 server SQL tests,
+63 local and 5 server schema-expression tests, and 190 local plus 1 server native
+integrity tests: 1,100 passing tests, three existing SQL skips, no failures or
+leaks. The subsequent array-adapter source has its own validation below.
+
+### Bounded typed-array JSON-to-row adaptation
+
+The durable row VM has an explicitly typed array-envelope adapter. It decodes
+the parsed envelope once, prepares canonical storage under the same shared work
+and cancellation identity, and returns owned bytes with their precise element
+kind. It does not stringify and reparse JSON or infer integer/NUMERIC identity.
+NUMERIC modifiers apply before encoding; SQL NULL remains an outer value tag
+and array-cell NULL flags and signed multidimensional bounds are preserved.
+
+Scratch remains unpublished in a quota-bound arena. The final row buffer belongs
+to the caller, and its retained-byte charge is added to actual scratch arena
+capacity, not hidden behind a maximum of the two. All allocator and numeric
+limits are restored on success and failure. Empty arrays can require no scratch;
+nonempty arrays must account for scratch separately from retained output.
+
+Public compilation, binding sites and DDL are not activated by this adapter.
+They still require precise element-type propagation, generated public contracts,
+row transforms and mounted execution evidence. No inventory cases are credited.
+
+Final-source adapter validation passes all 65 local and 5 server schema tests,
+with no failures or leaks. All 11 PostgreSQL binary element fixtures pass
+canonical-byte identity, input-owner destruction and allocation-failure sweeps.
+The 20 existing PostgreSQL NUMERIC modifier cases also run through this adapter,
+checking rounding, overflow, SQL NULL flags and multidimensional bounds. Sticky
+cancellation, byte exhaustion, allocator restoration, control catalog and
+formatting checks pass. The 1,100-test integrated storage result above predates
+this adapter; it is not reported as a full current-source gate.
