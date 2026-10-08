@@ -192,6 +192,9 @@ pub fn fromGroups(ctx: *Context, source: anytype, weight: i16, scale: u16, negat
 /// but it may not hide significant digits in an already canonical value.
 pub fn validateCanonical(ctx: *Context, value: Value) !void {
     try ctx.charge(1);
+    // Canonical borrowed input is still subject to this request's admission
+    // budget, even when no new coefficient allocation is necessary.
+    if (value.digits.len > ctx.max_groups) return ctx.limit();
     if (value.kind != .finite) {
         if (value.negative or value.weight != 0 or value.scale != 0 or value.digits.len != 0) return error.InvalidNumericRepresentation;
         return;
@@ -210,6 +213,21 @@ pub fn validateCanonical(ctx: *Context, value: Value) !void {
         try ctx.charge(1);
         if (digit >= base) return error.InvalidNumericRepresentation;
     }
+}
+
+test "SQL exact NUMERIC canonical admission bounds borrowed coefficients before traversal" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var ctx: Context = .{ .alloc = failing.allocator(), .max_groups = 1, .remaining = 10 };
+    try std.testing.expectError(error.SqlProgramLimitExceeded, validateCanonical(&ctx, .{ .weight = 1, .digits = &.{ 1, 2 } }));
+    try std.testing.expectEqual(@as(u64, 9), ctx.remaining);
+    try std.testing.expectError(error.SqlProgramLimitExceeded, validateCanonical(&ctx, .{}));
+    try std.testing.expectEqual(@as(usize, 0), failing.alloc_index);
+    ctx = .{ .alloc = failing.allocator(), .max_groups = 0 };
+    try validateCanonical(&ctx, .{});
+    try validateCanonical(&ctx, .{ .kind = .nan });
+    try validateCanonical(&ctx, .{ .kind = .positive_infinity });
+    try validateCanonical(&ctx, .{ .kind = .negative_infinity });
+    try std.testing.expectEqual(@as(usize, 0), failing.alloc_index);
 }
 
 pub fn parse(ctx: *Context, input: []const u8) !Owned {

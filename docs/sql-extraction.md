@@ -5226,3 +5226,50 @@ values. An abrupt crash can lose pending cache writes without losing source
 data. Cache eviction, changed object versions or credentials can legitimately
 require new provider reads. These local fixtures do not establish the cause of
 the observed deployment's missing cache files or quantify live GCS latency.
+
+### Shared exact NUMERIC ordered-key boundary
+
+The ordered-key writer and prefix parser now live in a runtime-independent
+common layout. Logical SQL coefficients and canonical stored row bytes use the
+same ordering implementation. A borrowed stored-value adapter validates input
+before output, then streams directly from big-endian coefficients without a
+limb copy or intermediate key allocation. Existing ascending bytes are
+unchanged. Descending encoding complements the complete self-delimiting
+component, including special ranks and terminators. Prefix admission never
+interprets the following tuple component and stops at the coefficient budget.
+
+Review also found canonical logical admission did not independently enforce
+the request's coefficient cap. An old key quota assertion reused an already
+failed context and therefore could not establish that invariant. Canonical
+admission now checks the cap before traversal; fresh-context key/binary tests
+prove rejection before writer output, with sticky failure and no allocation.
+
+Evidence includes all 65 independent PostgreSQL sender payloads, both ordering
+directions, composite suffixes, all 235 independent dense ranks and their
+55,225 pairwise comparisons in each direction, malformed payloads, allocation
+faults and every observed borrowed cancellation checkpoint. PostgreSQL 18
+independently re-verifies all 235 ranks. Inventory dispositions are unchanged.
+
+`zig build sql-numeric-test -Doptimize=ReleaseFast` runs 34 standalone arithmetic,
+binary and key contracts without importing the server/runtime graph. Its test
+compilation used 526 MB in the local run. For 256 canonical-row-to-key conversions
+at 64/256/2,048 decimal digits, borrowed encoding used zero allocations versus
+256 coefficient allocations for owned decoding followed by encoding. Local
+optimized samples were about 1.3–1.8 times faster for the borrowed codec. These
+are codec microbenchmarks, not native-index or complete-query latency claims.
+The earlier broad optimized SQL compilation still reported the pre-existing
+3.44 GB peak against its 3.22 GB claim; the isolated target does not fix that.
+
+Native scalar NUMERIC schema/catalog capability activation, row-cell identity,
+mutation/default/generated/check handling, ordered tuple integration and public
+schema/API generation remain unfinished. Unannotated native numeric fields
+retain their existing f64 meaning; this shared boundary does not activate or
+credit an unsupported exact-NUMERIC schema shape.
+
+Final validation passes `zig build sql-test pgwire-test check-openapi`: 583 local
+SQL tests (three existing skips), 226 server SQL tests and the wire/OpenAPI
+gates. The focused native schema/array/restore gate passes 12 contracts. Live
+PostgreSQL 18 also re-verifies 893 arithmetic contracts, 65 binary senders and
+47 receivers. Formatting, whitespace and original inventory integrity checks
+pass; dispositions remain 448 implemented, 136 rejected, 73 superseded and
+929 unresolved.

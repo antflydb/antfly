@@ -274,6 +274,18 @@ pub fn create(b: *std.Build) ?Artifacts {
     b.step("sql-regex-test", "Run PostgreSQL ARE backend ownership and span contracts").dependOn(&b.addRunArtifact(sql_regex_tests).step);
     b.step("sql-regex-check", "Compile PostgreSQL ARE backend contracts for the selected target").dependOn(&sql_regex_tests.step);
 
+    const numeric_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("pkg/antfly-embedded/src/numeric_test_root.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+        .filters = selectTestFilters(b, &.{}),
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const run_numeric_tests = @import("build_support/antfly/test_support.zig").addFilteredTestRunArtifact(b, numeric_tests);
+    b.step("sql-numeric-test", "Run isolated exact NUMERIC arithmetic row and key contracts").dependOn(&run_numeric_tests.step);
+
     const lib_scraping_tests = b.addTest(.{
         .root_module = scraping_mod,
     });
