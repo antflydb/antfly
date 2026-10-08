@@ -3623,6 +3623,15 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             switch (index_ref.kind) {
                 .full_text => unreachable,
                 .dense_vector => {
+                    // A native publication may certify a newer source tip
+                    // before a lagging journal cursor reaches it. Under the
+                    // per-index apply guard, older windows are already covered
+                    // and must not roll back vectors or open a capture below
+                    // its committed base. Sequence zero remains unversioned.
+                    if (batch.sequence != 0 and ctx.index_manager.densePostingWalAuthoritativeByName(index_ref.name)) {
+                        const covered = ctx.index_manager.denseIndex(index_ref.name).?.index.experimentalPostingDurableAppliedSequence() orelse 0;
+                        if (batch.sequence < covered) return;
+                    }
                     const dense_apply_start_ns = monotonicTimeNs();
                     const dense_finish_options = denseCatchUpFinishOptions();
                     const borrow_source_capture = borrow_active_source_capture;

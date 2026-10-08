@@ -86783,6 +86783,33 @@ test "source vector table rejects delayed enrichment after source update deletio
                 try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"old source\"}" }}, .sync_level = .write });
                 try db.runUntilIdle();
                 try std.testing.expect(provider.changed);
+                if (db.core.index_manager.densePostingWalAuthoritativeByName("dv_v1")) {
+                    const covered = db.core.index_manager.denseIndex("dv_v1").?.index.experimentalPostingDurableAppliedSequence().?;
+                    try std.testing.expect(covered > 1);
+                    // A lagging replay cursor must not delete the newer vector
+                    // authority or append a mutation below its durable base.
+                    try applyDerivedBatchToIndex(&db, .{
+                        .sequence = 1,
+                        .deleted_keys = &.{"doc:a"},
+                    }, .{ .name = "dv_v1", .kind = .dense_vector });
+                    try std.testing.expectEqual(@as(?u64, covered), db.core.index_manager.denseIndex("dv_v1").?.index.experimentalPostingDurableAppliedSequence());
+                    // The worker path borrows the capture owned by this exact
+                    // catch-up session; skipping a stale window must also let
+                    // that session finish without regressing native coverage.
+                    const index_ref: index_manager_mod.ManagedIndexRef = .{ .name = "dv_v1", .kind = .dense_vector };
+                    const token = try beginDerivedCatchUpSessionAsync(db.async_context, index_ref);
+                    var session_active = true;
+                    defer if (session_active) {
+                        _ = finishDerivedCatchUpSessionAsync(db.async_context, index_ref, token, 1, false) catch {};
+                    };
+                    _ = try applyDerivedBatchToIndexAsync(db.async_context, .{
+                        .sequence = 1,
+                        .deleted_keys = &.{"doc:a"},
+                    }, index_ref, token);
+                    _ = try finishDerivedCatchUpSessionAsync(db.async_context, index_ref, token, 1, true);
+                    session_active = false;
+                    try std.testing.expectEqual(@as(?u64, covered), db.core.index_manager.denseIndex("dv_v1").?.index.experimentalPostingDurableAppliedSequence());
+                }
                 const chunk_key = try internal_keys.chunkArtifactKeyAlloc(alloc, "doc:a", "body_chunks_v1", 0);
                 defer alloc.free(chunk_key);
                 const key = if (chunked) try internal_keys.derivedEmbeddingArtifactKeyAlloc(alloc, chunk_key, "body_dense_v1") else try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:a", "body_dense_v1");
