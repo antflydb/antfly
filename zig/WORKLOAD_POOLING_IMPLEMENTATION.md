@@ -1276,3 +1276,14 @@ The owner provider is now a generic factory that uses the production backends' e
 ### Io mutex capacity handoff and worker-client contention (focused mechanism passed)
 
 InferenceExecutionControl.lockIo parks only contended waits, preserves original controls and bytes, reacquires before returning a held lock, and unlocks rejected resumes. All 13 real-owner tests pass on native macOS and pinned Nix/glibc GNU Linux, including weighted resume, cancellation/expiry and query/protected-control progress. Worker Client.invokePayload now uses that helper for startup/replacement mutex contention and retains its grant through active child RPC. [Receipts](qualification/workload-pooling/receipts/2026-10-07/worker-client-mutex-waits/README.md) explicitly distinguish the qualified helper from the uncompiled worker wiring. RPC allows 128 outstanding requests; physical child and payload-offer waits still need an explicit admission handshake. Production/subprocess qualification, broad memory/backend coverage and defaults remain pending.
+
+### Optimized ARM64 VOPR fiber switching (2026-10-08, simulator gates passed)
+
+The broad native transaction run exposed a VOPR crash, reproduced by the existing
+standalone task-stack regression. Both switch directions now use a C call boundary
+and corrected ARM64 assembly register constraints. Stack guards remain active.
+All 167 VOPR tests pass on native macOS and pinned Nix/glibc Linux;
+[receipts](qualification/workload-pooling/receipts/2026-10-08/vopr-fiber-switch/README.md)
+retain original failures, the unsuccessful first wrapper, final assembly and
+source hashes. The new production transaction binary and consolidated API gates
+still need to run; these simulator results do not enable defaults.
