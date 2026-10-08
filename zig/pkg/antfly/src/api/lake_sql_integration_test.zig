@@ -346,6 +346,7 @@ test "lake SQL object table native API binds storage and fails closed on policy 
         definition_reads: usize = 0,
         authoritative_reads: usize = 0,
         local_queries: usize = 0,
+        recreate_on_snapshot: enum { none, table_id, generation, engine } = .none,
         const local_table: metadata.TableRecord = .{
             .table_id = 8,
             .name = "local_docs",
@@ -366,6 +367,13 @@ test "lake SQL object table native API binds storage and fails closed on policy 
             try context.ensureActive();
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.authoritative_reads += 1;
+            switch (self.recreate_on_snapshot) {
+                .none => {},
+                .table_id => self.table[0].table_id += 1,
+                .generation => self.table[0].object_storage_generation += 1,
+                .engine => self.table[0].storage.engine = .local,
+            }
+            self.recreate_on_snapshot = .none;
             return try snapshot(raw);
         }
         fn forbiddenSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
@@ -419,6 +427,29 @@ test "lake SQL object table native API binds storage and fails closed on policy 
     defer query.deinit(a);
     try std.testing.expectEqual(@as(u16, 200), query.status);
     try std.testing.expect(std.mem.indexOf(u8, query.body, "public.docs") != null);
+    const native_before_retrieval = source.local_queries;
+    var retrieval = try server.executeCatalogRetrievalQuery(a, .{}, "docs", "{\"full_text_search\":{\"query\":\"body:alpha\"}}", null);
+    defer retrieval.deinit(a);
+    try std.testing.expect(std.mem.indexOf(u8, retrieval.json, "alpha") != null);
+    try std.testing.expectEqual(native_before_retrieval, source.local_queries);
+
+    // The definition captured by query binding must not switch to another
+    // incarnation at authoritative dispatch, even when the name is unchanged.
+    for ([_]@TypeOf(source.recreate_on_snapshot){ .table_id, .generation, .engine }) |change| {
+        const original = source.table[0];
+        source.recreate_on_snapshot = change;
+        var conflict = try server.handlePublicTableQueryWithContentType("docs", "{\"full_text_search\":{\"query\":\"body:alpha\"}}", null, null);
+        defer conflict.deinit(a);
+        try std.testing.expectEqual(@as(u16, 409), conflict.status);
+        source.table[0] = original;
+        source.recreate_on_snapshot = change;
+        try std.testing.expectError(error.TableGenerationChanged, server.executeCatalogRetrievalQuery(a, .{}, "docs", "{\"full_text_search\":{\"query\":\"body:alpha\"}}", null));
+        source.table[0] = original;
+        source.recreate_on_snapshot = change;
+        try std.testing.expectError(error.TableGenerationChanged, server.tryObjectTableLookup("docs", "a", .stale, null, .{}));
+        source.table[0] = original;
+    }
+    try std.testing.expectEqual(native_before_retrieval, source.local_queries);
     try std.testing.expectEqual(@as(u64, 1), server.object_tables.entries.get(.{ 7, 3 }).?.stack.handler.graph_execution_limits.max_explored_nodes);
     // Both primary and every nested native RHS are rejected before native
     // execution, even when the local left side would return no hits.

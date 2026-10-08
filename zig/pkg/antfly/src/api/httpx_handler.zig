@@ -7676,7 +7676,10 @@ pub const AntflyApiHandler = struct {
         };
         if (try self.acquirePublicOperation(ctx, "batchWrite")) |response| return response;
         defer self.releasePublicOperation("batchWrite");
-        if (try self.api_server.tryObjectTableRequest(decoded_table_name, .post, "batch", body_data, authenticated_identity, operationContext(ctx, authenticated_identity))) |value| {
+        if (self.api_server.tryObjectTableRequest(decoded_table_name, .post, "batch", body_data, authenticated_identity, operationContext(ctx, authenticated_identity)) catch |err| switch (err) {
+            error.TableGenerationChanged => return jsonErrorResponse(ctx, 409, "table incarnation changed; refresh and retry"),
+            else => return err,
+        }) |value| {
             var response = value;
             return respondOwnedContextualResponse(ctx, &response, self.api_server.alloc);
         }
@@ -8415,7 +8418,10 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(400);
             return ctx.text("invalid read consistency");
         };
-        if (try self.api_server.tryObjectTableLookup(decoded_table_name, decoded_key, consistency, authenticated_identity, operationContext(ctx, authenticated_identity))) |value| {
+        if (self.api_server.tryObjectTableLookup(decoded_table_name, decoded_key, consistency, authenticated_identity, operationContext(ctx, authenticated_identity)) catch |err| switch (err) {
+            error.TableGenerationChanged => return jsonErrorResponse(ctx, 409, "table incarnation changed; refresh and retry"),
+            else => return err,
+        }) |value| {
             var response = value;
             if (row_policy_proof != null or lookup_opts.opts.fields.len != 0) {
                 response.deinit(self.api_server.alloc);

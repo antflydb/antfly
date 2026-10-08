@@ -9205,6 +9205,7 @@ pub const ApiHttpServer = struct {
         if (resolver) |cache| if (cache.definitions.get(table_name)) |definition| return .{
             .storage = .{ .engine = definition.storage_engine },
             .table_id = definition.table_id,
+            .object_storage_generation = definition.object_storage_generation,
             .name = table_name,
             .schema_json = definition.schema_json,
             .read_schema_json = definition.read_schema_json,
@@ -9222,7 +9223,7 @@ pub const ApiHttpServer = struct {
             break :blk try system_catalog.QueryDefinition.fromTable(table).clone(alloc);
         };
         if (resolver) |cache| try cache.definitions.put(alloc, try alloc.dupe(u8, table_name), definition);
-        return .{ .storage = .{ .engine = definition.storage_engine }, .table_id = definition.table_id, .name = table_name, .schema_json = definition.schema_json, .read_schema_json = definition.read_schema_json, .indexes_json = definition.indexes_json, .lake_index_catalog_json = definition.lake_index_catalog_json };
+        return .{ .storage = .{ .engine = definition.storage_engine }, .table_id = definition.table_id, .object_storage_generation = definition.object_storage_generation, .name = table_name, .schema_json = definition.schema_json, .read_schema_json = definition.read_schema_json, .indexes_json = definition.indexes_json, .lake_index_catalog_json = definition.lake_index_catalog_json };
     }
 
     pub fn maybeRouteQueryToReadSchema(self: *ApiHttpServer, table_name: []const u8, query_req: *db_mod.types.SearchRequest) !void {
@@ -14180,7 +14181,6 @@ pub const ApiHttpServer = struct {
         borrowed_identity: ?AuthenticatedIdentity,
     ) !query_api.QueryResponse {
         _ = try system_catalog.Target.literal(logical_name);
-        const source = self.table_reads orelse return error.TableNotFound;
         var identity = try cloneCatalogIdentity(self.alloc, borrowed_identity);
         defer if (identity) |*owned| owned.deinit(self.alloc);
         var catalog_arena = std.heap.ArenaAllocator.init(self.alloc);
@@ -14188,6 +14188,23 @@ pub const ApiHttpServer = struct {
         var resolver = CatalogQueryResolver{ .arena = catalog_arena.allocator() };
         var binding = try self.bindCatalogQuery(alloc, context, logical_name, body, &identity, &resolver);
         defer binding.deinit();
+        // Retrieval must use the same bound engine and publication as HTTP
+        // search. Object tables have no native data shards to query.
+        if (try self.tryObjectTableQuery(binding.physical, body, identity, null, binding.label, if (binding.join) |*join| join else null, &resolver, binding.dispatch)) |value| {
+            var response = value;
+            defer response.deinit(self.alloc);
+            if (response.status != 200) return switch (response.status) {
+                400, 422 => error.InvalidRetrievalAgentRequest,
+                403 => error.Forbidden,
+                404 => error.TableNotFound,
+                409 => error.TableGenerationChanged,
+                503 => error.ReadUnavailable,
+                504 => error.DeadlineExceeded,
+                else => error.InternalFailure,
+            };
+            return .{ .json = try alloc.dupe(u8, response.body) };
+        }
+        const source = self.table_reads orelse return error.TableNotFound;
         const row_filter = try resolveEffectiveRowFilterJson(alloc, identity, binding.physical);
         defer if (row_filter) |value| alloc.free(value);
         return self.executePublicTableQueryDispatchWithIdentity(
@@ -20549,6 +20566,12 @@ pub const ApiHttpServer = struct {
     pub const BoundQueryDispatch = struct {
         primary_foreign: bool,
         context: api_operation.RequestContext,
+        incarnation: ?ObjectTableIncarnation = null,
+    };
+
+    pub const ObjectTableIncarnation = struct {
+        table_id: u64,
+        generation: u64,
     };
 
     const BoundCatalogQuery = struct {
@@ -20625,7 +20648,12 @@ pub const ApiHttpServer = struct {
             reference.right_label = try rhs.displayNameAlloc(a);
             reference.right_table = @constCast(table.?.name);
         }
-        return .{ .arena = arena, .physical = physical, .label = label, .join = join, .dispatch = .{ .primary_foreign = primary_foreign, .context = context }, .revision = result.revision };
+        const incarnation: ?ObjectTableIncarnation = if (!primary_foreign) bound: {
+            const definition = result.tables[0].?.query_definition orelse break :bound null;
+            if (definition.storage_engine != .object) break :bound null;
+            break :bound .{ .table_id = definition.table_id, .generation = definition.object_storage_generation };
+        } else null;
+        return .{ .arena = arena, .physical = physical, .label = label, .join = join, .dispatch = .{ .primary_foreign = primary_foreign, .context = context, .incarnation = incarnation }, .revision = result.revision };
     }
 
     /// Select borrowed physical records before collecting per-table status or
@@ -21337,6 +21365,7 @@ pub const ApiHttpServer = struct {
         lookup_consistency: raft_mod.ReadConsistency = .read_index,
         has_join: bool = false,
         resolver: ?*CatalogQueryResolver = null,
+        incarnation: ?ObjectTableIncarnation = null,
     };
 
     pub fn tryObjectTableLookup(self: *ApiHttpServer, table_name: []const u8, key: []const u8, consistency: raft_mod.ReadConsistency, identity: ?AuthenticatedIdentity, context: api_operation.RequestContext) !?contextual_operations.OwnedResponse {
@@ -21355,11 +21384,14 @@ pub const ApiHttpServer = struct {
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         const hint = (try self.queryTableDefinition(if (options.resolver) |resolver| resolver.arena else arena.allocator(), options.resolver, table_name, context)) orelse return null;
+        if (options.incarnation) |expected| {
+            if (hint.storage.engine != .object or hint.table_id != expected.table_id or hint.object_storage_generation != expected.generation) return error.TableGenerationChanged;
+        }
         if (hint.storage.engine != .object) return null;
         var snapshot = (try self.source.linearizableSnapshot(context)) orelse return error.ReadUnavailable;
         defer self.source.freeAdminSnapshot(&snapshot);
-        const table = tables_api.findTableByName(&snapshot, table_name) orelse return null;
-        if (table.storage.engine != .object) return null;
+        const table = tables_api.findTableByName(&snapshot, table_name) orelse return error.TableGenerationChanged;
+        if (table.storage.engine != hint.storage.engine or table.table_id != hint.table_id or table.object_storage_generation != hint.object_storage_generation) return error.TableGenerationChanged;
         var schema = try schema_mod.parseValidatedTableSchema(self.alloc, table.schema_json);
         defer schema.deinit(self.alloc);
         if (schema.external_base_source != null) return null;
@@ -21457,7 +21489,7 @@ pub const ApiHttpServer = struct {
             if (isForeignQueryPrimary(table_name, foreign_sources)) return null;
         }
         const request_context = if (bound_dispatch) |binding| binding.context else api_operation.RequestContext{ .deadline_ns = try query_contract.queryExecutionDeadlineNsFromBody(self.alloc, body), .cancellation = if (cancellation) |value| value.token() else .none };
-        if (try self.tryObjectTableRequestWithOptions(table_name, .post, "query", body, authenticated_identity, request_context, .{ .has_join = bound_join != null, .resolver = catalog_resolver })) |response| {
+        if (try self.tryObjectTableRequestWithOptions(table_name, .post, "query", body, authenticated_identity, request_context, .{ .has_join = bound_join != null, .resolver = catalog_resolver, .incarnation = if (bound_dispatch) |binding| binding.incarnation else null })) |response| {
             var owned = response;
             errdefer owned.deinit(self.alloc);
             if (owned.status == 200) {
@@ -21521,7 +21553,7 @@ pub const ApiHttpServer = struct {
         return switch (err) {
             error.ObjectTableJoinUnsupported => try contextual_operations.textAlloc(self.alloc, 400, "object table joins are not supported"),
             error.Forbidden => try contextual_operations.jsonErrorAlloc(self.alloc, 403, "forbidden"),
-            error.CatalogGenerationChanged => try contextual_operations.jsonErrorAlloc(self.alloc, 409, "catalog changed during query binding"),
+            error.CatalogGenerationChanged, error.TableGenerationChanged => try contextual_operations.jsonErrorAlloc(self.alloc, 409, "catalog changed during query binding"),
             error.InvalidCatalogName => try contextual_operations.jsonErrorAlloc(self.alloc, 400, "invalid table target"),
             error.InvalidQueryRequest => if (db_mod.peekLastSortRejectionDiagnostic() != null)
                 try contextualUnsupportedExactSortResponse(self.alloc)

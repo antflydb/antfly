@@ -144,7 +144,12 @@ bindings must remain table-owned when defaults change.
 The narrow query definition carries the table engine from the same catalog read
 that binds the query. Single-table JSON, table NDJSON, and global multi-query
 requests all dispatch through that binding, authorize each line independently,
-and retain logical table labels in responses. Mixed local/object requests select
+and retain logical table labels in responses. Retrieval/RAG adapters use the same
+object dispatch and published data rather than bypassing it through native shards.
+Query definitions carry the object incarnation generation along with table ID;
+dispatch validates both against the authoritative snapshot. Drop/recreate or an
+engine change during binding returns a catalog conflict, never a result from the
+replacement table. Mixed local/object requests select
 a data path per table. Binding preserves the distinction between a request-local
 foreign alias and a catalog table: foreign primaries go directly to their source
 executor without native engine discovery. Join admission checks every native
