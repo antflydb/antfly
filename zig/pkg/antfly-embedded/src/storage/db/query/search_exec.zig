@@ -11229,22 +11229,23 @@ fn sortAndPageTextDocValueCandidatesAlloc(
 
     const bench_query_profile = shouldLogBenchQueryProfile();
     const collect_sort_profile = bench_query_profile or effective_req.profile;
-    if (effective_req.limit == 0 and bitmap == null) {
+    if (effective_req.limit == 0) {
         const zero_start_ns = if (collect_sort_profile) platform_time.monotonicNs() else 0;
         var profile = SortCollectorProfile{};
         observeSortCandidateSource(if (collect_sort_profile) &profile else null, "text_postings");
         const visible_total = if (activeSortCursor(effective_req).len > 0)
-            try visibleTextDocNumCountAfterCursorAlloc(
+            try visibleTextCandidateCountAfterCursorAlloc(
                 alloc,
                 effective_req,
                 snapshot,
                 doc_nums,
+                bitmap,
                 executor,
                 plan,
                 if (collect_sort_profile) &profile else null,
             )
         else
-            try visibleTextDocNumCount(alloc, effective_req, snapshot, doc_nums, executor);
+            try visibleTextCandidateCount(alloc, effective_req, snapshot, doc_nums, bitmap, executor);
         if (collect_sort_profile and activeSortCursor(effective_req).len == 0) {
             profile.candidate_count = @intCast(visible_total);
         }
@@ -11439,11 +11440,12 @@ fn sortAndPageTextDocValueCandidatesAlloc(
     return out;
 }
 
-fn visibleTextDocNumCountAfterCursorAlloc(
+fn visibleTextCandidateCountAfterCursorAlloc(
     alloc: Allocator,
     req: types.SearchRequest,
     snapshot: *const index_mod.IndexSnapshot,
     doc_nums: []const u32,
+    bitmap: ?*const roaring.RoaringBitmap,
     executor: SearchTextQueryExecutor,
     plan: SortExecutionPlan,
     profile: ?*SortCollectorProfile,
@@ -11459,7 +11461,12 @@ fn visibleTextDocNumCountAfterCursorAlloc(
     };
 
     var visible_count: usize = 0;
-    for (doc_nums, 0..) |doc_num, i| {
+    var iterator = if (bitmap) |set| set.iterator() else null;
+    var position: usize = 0;
+    while (true) {
+        const i = position;
+        const doc_num = if (iterator) |*it| it.next() orelse break else if (position < doc_nums.len) doc_nums[position] else break;
+        position += 1;
         if (i % 1024 == 0) try checkSearchRequestDeadline(req);
         identity_scratch.reset();
         const stored = .{ .id = (try snapshot.storedIdScoped(identity_scratch.allocator(), doc_num)) orelse return error.StoredDocMissing };
@@ -11497,19 +11504,25 @@ fn visibleTextDocNumCountAfterCursorAlloc(
     return visible_count;
 }
 
-fn visibleTextDocNumCount(
+fn visibleTextCandidateCount(
     alloc: Allocator,
     req: types.SearchRequest,
     snapshot: *const index_mod.IndexSnapshot,
     doc_nums: []const u32,
+    bitmap: ?*const roaring.RoaringBitmap,
     executor: SearchTextQueryExecutor,
 ) !usize {
     var identity_scratch = segment_mod.SegmentReadScratch.init(alloc, 64 * 1024);
     defer identity_scratch.deinit();
-    if (executor.is_expired_key == null) return doc_nums.len;
+    if (executor.is_expired_key == null) return if (bitmap) |set| set.cardinality() else doc_nums.len;
 
     var visible_count: usize = 0;
-    for (doc_nums, 0..) |doc_num, i| {
+    var iterator = if (bitmap) |set| set.iterator() else null;
+    var position: usize = 0;
+    while (true) {
+        const i = position;
+        const doc_num = if (iterator) |*it| it.next() orelse break else if (position < doc_nums.len) doc_nums[position] else break;
+        position += 1;
         if (i % 1024 == 0) try checkSearchRequestDeadline(req);
         identity_scratch.reset();
         const stored = .{ .id = (try snapshot.storedIdScoped(identity_scratch.allocator(), doc_num)) orelse return error.StoredDocMissing };
@@ -25745,38 +25758,56 @@ test "text field sort uses exact native doc values filter path without index sor
     try std.testing.expectEqual(@as(usize, 2), profile.window_len);
     try std.testing.expectEqual(@as(usize, 2), profile.collector_heap_peak);
 
-    var zero_limit_result = try searchTextQuery(alloc, .{
-        .index_name = "ft",
-        .order_by = &order_by,
-        .include_stored = false,
-        .profile = true,
-        .limit = 0,
-    }, .{ .term = .{ .field = "body", .term = "alpha" } }, .{
-        .ctx = &harness,
-        .text_index_entry = Harness.textIndexEntry,
-        .text_index_is_chunk_backed = Harness.textIndexIsChunkBacked,
-        .search_match_all = Harness.searchMatchAll,
-        .project_stored_search = Harness.projectStoredSearch,
-        .load_stored = Harness.loadStored,
-        .is_expired_key = Harness.isExpiredKey,
-        .postprocess = Harness.postprocess,
-    });
-    defer zero_limit_result.deinit();
+    // Count-only bitmap queries must retain late visibility and cursor
+    // semantics without allocating a sort window or decorating every hit.
+    const count_cursor = [_]std.json.Value{ .{ .integer = 1 }, .{ .string = "doc:a" } };
+    const count_cases = [_]struct {
+        expired_doc: ?[]const u8,
+        cursor: []const std.json.Value,
+        total: u32,
+        sort_reads: u64,
+    }{
+        .{ .expired_doc = null, .cursor = &.{}, .total = 3, .sort_reads = 0 },
+        .{ .expired_doc = "doc:c", .cursor = &.{}, .total = 2, .sort_reads = 0 },
+        .{ .expired_doc = null, .cursor = &count_cursor, .total = 2, .sort_reads = 3 },
+        .{ .expired_doc = "doc:c", .cursor = &count_cursor, .total = 1, .sort_reads = 2 },
+    };
+    for (count_cases) |case| {
+        var count_harness = Harness{ .text_entry = &text_entry, .expired_doc = case.expired_doc };
+        var zero_limit_result = try searchTextQuery(alloc, .{
+            .index_name = "ft",
+            .order_by = &order_by,
+            .search_after = case.cursor,
+            .include_stored = false,
+            .profile = true,
+            .limit = 0,
+        }, .{ .term = .{ .field = "body", .term = "alpha" } }, .{
+            .ctx = &count_harness,
+            .text_index_entry = Harness.textIndexEntry,
+            .text_index_is_chunk_backed = Harness.textIndexIsChunkBacked,
+            .search_match_all = Harness.searchMatchAll,
+            .project_stored_search = Harness.projectStoredSearch,
+            .load_stored = Harness.loadStored,
+            .is_expired_key = Harness.isExpiredKey,
+            .postprocess = Harness.postprocess,
+        });
+        defer zero_limit_result.deinit();
 
-    try std.testing.expectEqual(@as(usize, 0), zero_limit_result.hits.len);
-    try std.testing.expectEqual(types.TotalHitsRelation.exact, zero_limit_result.total_hits_relation);
-    try std.testing.expectEqual(@as(u32, 3), zero_limit_result.total_hits);
-    const zero_limit_profile = zero_limit_result.sort_profile orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("native_doc_values_top_n", zero_limit_profile.plan);
-    try std.testing.expectEqualStrings("doc_values_collector", zero_limit_profile.source);
-    try std.testing.expectEqualStrings("exact", zero_limit_profile.exactness);
-    try std.testing.expectEqual(@as(u64, 3), zero_limit_profile.candidate_count);
-    try std.testing.expectEqual(@as(u64, 0), zero_limit_profile.selected_count);
-    try std.testing.expectEqual(@as(u64, 0), zero_limit_profile.native_doc_value_hit_count);
-    try std.testing.expectEqual(@as(u64, 0), zero_limit_profile.stored_json_load_count);
-    try std.testing.expectEqual(@as(u64, 0), zero_limit_profile.window_capacity);
-    try std.testing.expectEqual(@as(u64, 0), zero_limit_profile.window_len);
-    try std.testing.expectEqual(@as(usize, 0), harness.postprocess_count);
+        try std.testing.expectEqual(@as(usize, 0), zero_limit_result.hits.len);
+        try std.testing.expectEqual(types.TotalHitsRelation.exact, zero_limit_result.total_hits_relation);
+        try std.testing.expectEqual(case.total, zero_limit_result.total_hits);
+        const zero_limit_profile = zero_limit_result.sort_profile orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("native_doc_values_top_n", zero_limit_profile.plan);
+        try std.testing.expectEqualStrings("doc_values_collector", zero_limit_profile.source);
+        try std.testing.expectEqualStrings("exact", zero_limit_profile.exactness);
+        try std.testing.expectEqual(@as(u64, 0), zero_limit_profile.selected_count);
+        try std.testing.expectEqual(case.sort_reads, zero_limit_profile.native_doc_value_hit_count);
+        try std.testing.expectEqual(@as(u64, 0), zero_limit_profile.stored_json_load_count);
+        try std.testing.expectEqual(@as(u64, 0), zero_limit_profile.window_capacity);
+        try std.testing.expectEqual(@as(u64, 0), zero_limit_profile.window_len);
+        try std.testing.expectEqual(@as(usize, 0), count_harness.postprocess_count);
+        try std.testing.expectEqual(@as(usize, 3), count_harness.expired_checks);
+    }
 
     var transformed_result = try searchTextQuery(alloc, .{
         .index_name = "ft",
@@ -26895,6 +26926,7 @@ test "match_all sorted segment seek uses cursor seek within each segment" {
     var counter = NativeLoadCounter{
         .inner = .{ .snapshot = text_entry.persistent.snapshot() },
     };
+    defer counter.inner.deinit();
     const native_loader = NativeSortValueLoader{
         .ctx = &counter,
         .require_native = true,

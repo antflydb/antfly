@@ -371,31 +371,29 @@ const Entry = struct {
         const replacements = try self.allocator.alloc(local.index.ReplacementSegmentData, additions.items.len);
         defer self.allocator.free(replacements);
         var loaded: usize = 0;
-        defer for (replacements[0..loaded]) |*replacement| replacement.data.deinit(self.allocator);
+        defer for (replacements[0..loaded]) |*replacement| deinitReplacement(replacement, self.allocator);
         var loader: corpus.CachedSegments = .{ .store = store, .cache = cached, .seekable = root.seekable, .query_owned = true, .resource_manager = self.resource_manager };
         var read_bytes: u64 = 512 * 1024 * 1024;
         var position: usize = 0;
         while (position < additions.items.len) {
             const end = @min(position + 4, additions.items.len);
-            var tasks: [4]?local.sql_parallel_scheduler.Task(anyerror!local.index.SegmentData) = @splat(null);
+            var tasks: [4]?local.sql_parallel_scheduler.Task(anyerror!local.index.ReplacementSegmentData) = @splat(null);
             defer for (&tasks) |*task| if (task.*) |*pending| if (pending.future != null) {
-                var data = pending.cancel(io) catch continue;
-                data.deinit(self.allocator);
+                var replacement = pending.cancel(io) catch continue;
+                deinitReplacement(&replacement, self.allocator);
             };
             for (position..end) |ordinal| {
                 const ref = additions.items[ordinal];
                 try cancellation.check();
                 try stores.chargeReadBudget(&read_bytes, ref.byte_len);
-                tasks[ordinal - position] = local.sql_parallel_scheduler.global().submit(io, @intCast(ref.byte_len), loadSegment, .{ &loader, self.allocator, ref, cancellation });
+                tasks[ordinal - position] = local.sql_parallel_scheduler.global().submit(io, @intCast(ref.byte_len), loadSegment, .{ &loader, self.allocator, ref, cancellation, ids.items[ordinal] });
                 if (tasks[ordinal - position] == null) {
-                    const data = try loadSegment(&loader, self.allocator, ref, cancellation);
-                    replacements[loaded] = .{ .id = ids.items[ordinal], .data = data };
+                    replacements[loaded] = try loadSegment(&loader, self.allocator, ref, cancellation, ids.items[ordinal]);
                     loaded += 1;
                 }
             }
             for (position..end) |ordinal| if (tasks[ordinal - position]) |*pending| {
-                const data = try pending.await(io);
-                replacements[loaded] = .{ .id = ids.items[ordinal], .data = data };
+                replacements[loaded] = try pending.await(io);
                 loaded += 1;
             };
             position = end;
@@ -416,9 +414,21 @@ const Entry = struct {
         try self.writer.?.orderImmutableSegments(ordered_ids);
         if (self.resource_manager) |manager| self.writer.?.attachResourceManager(manager);
     }
-    fn loadSegment(loader: *corpus.CachedSegments, a: A, ref: artifacts.ChunkRef, cancellation: Cancellation) anyerror!local.index.SegmentData {
+    fn loadSegment(loader: *corpus.CachedSegments, a: A, ref: artifacts.ChunkRef, cancellation: Cancellation, id: u64) anyerror!local.index.ReplacementSegmentData {
         const mapped = loader.loader();
-        return mapped.load(mapped.ptr, a, ref, cancellation);
+        var data = try mapped.load(mapped.ptr, a, ref, cancellation);
+        errdefer data.deinit(a);
+        // Directory loading alone leaves footer/field metadata I/O until the
+        // writer's serial publication loop. Admit those required reads in the
+        // same bounded jobs, then transfer each reader without reopening it.
+        var reader = try data.initReader(a);
+        errdefer reader.deinit();
+        try cancellation.check();
+        return .{ .id = id, .data = data, .prepared_reader = reader };
+    }
+    fn deinitReplacement(replacement: *local.index.ReplacementSegmentData, a: A) void {
+        if (replacement.prepared_reader) |*reader| reader.deinit();
+        replacement.data.deinit(a);
     }
     fn awaitReady(self: *Entry, io: std.Io, context: Context) !void {
         while (self.state.load(.acquire) == .loading) {

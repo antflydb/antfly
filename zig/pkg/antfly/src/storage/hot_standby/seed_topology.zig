@@ -35,8 +35,8 @@ pub const max_topology_bytes: usize = 64 * 1024 * 1024;
 pub const max_files: usize = 1_000_000;
 pub const max_file_bytes: u64 = 64 * 1024 * 1024 * 1024;
 pub const portable_auth_seed_format_version: u16 = 1;
-pub const auth_users_namespace = "usermgr_users";
-pub const auth_casbin_namespace = "usermgr_casbin";
+pub const auth_users_namespace = @import("../../usermgr/portable_seed_contract.zig").users_namespace;
+pub const auth_casbin_namespace = @import("../../usermgr/portable_seed_contract.zig").casbin_namespace;
 
 pub const PortableAuthSeedEntry = struct {
     namespace: []const u8,
@@ -297,14 +297,7 @@ pub fn validatePortableAuthSeedBody(alloc: Allocator, expected_generation: []con
 }
 
 fn validPortableAuthSeedKey(namespace: []const u8, key: []const u8) bool {
-    if (std.mem.eql(u8, namespace, auth_users_namespace)) {
-        return std.mem.startsWith(u8, key, "userpass:") or
-            std.mem.startsWith(u8, key, "usermeta:") or
-            std.mem.startsWith(u8, key, "apikey:");
-    }
-    return std.mem.startsWith(u8, key, "p::") or
-        std.mem.startsWith(u8, key, "p2::") or
-        std.mem.startsWith(u8, key, "g::");
+    return @import("../../usermgr/portable_seed_contract.zig").validKey(namespace, key);
 }
 
 fn decodeBase64Alloc(alloc: Allocator, raw: []const u8) ![]u8 {

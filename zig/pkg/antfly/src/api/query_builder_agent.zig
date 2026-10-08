@@ -3137,7 +3137,16 @@ fn buildToolQueryBuilder(
     var turns: usize = 0;
     while (consumed < budget and turns < budget) {
         turns += 1;
-        var generated = try runner.executeChain(alloc, chain, history.messages.items);
+        var generated = runner.executeChain(alloc, chain, history.messages.items) catch |err| switch (err) {
+            error.InvalidGeneratedToolArguments => {
+                // This turn produced no executable call. Spend the existing
+                // turn budget on correction, retaining all prior tool results.
+                try steps.append(alloc, .{ .kind = .planning, .name = "repair_tool_arguments", .action = "requested a corrected tool call after malformed model output", .status = .@"error" });
+                try history.append(.user, "The previous model response contained malformed tool arguments. Regenerate the tool call with balanced object and array delimiters and complete argument values. Use only the authorized table fields and the canonical QueryRequest syntax.", null);
+                continue;
+            },
+            else => return err,
+        };
         defer generated.deinit();
         const calls = try history.accept(generated, budget - consumed);
         if (calls.len == 0) {
@@ -3333,6 +3342,54 @@ test "tool query builder inspects context and repairs invalid submission through
     try std.testing.expectEqual(@as(?i64, 4), result.iteration);
     try std.testing.expect(std.mem.indexOf(u8, result.query_request.?.full_text_search.?.bytes, "anatomy") != null);
     try std.testing.expectEqual(metadata_openapi.AgentStatus.completed, result.status);
+}
+
+test "tool query builder malformed model arguments spend a bounded repair turn" {
+    const Fake = struct {
+        calls: usize = 0,
+        malformed_limit: usize,
+        failure: anyerror = error.InvalidGeneratedToolArguments,
+        fn validate(_: *anyopaque, _: std.mem.Allocator, query: metadata_openapi.QueryRequest) !?[]const u8 {
+            try std.testing.expectEqualStrings("articles", query.table.?);
+            return null;
+        }
+        fn run(ptr: *anyopaque, alloc: std.mem.Allocator, _: []const generating.ChainLink, messages: []const generating.ChatMessage) !generating.GenerateResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            if (self.calls > 1) {
+                try std.testing.expectEqual(generating.Role.user, messages[messages.len - 1].role);
+                try std.testing.expect(std.mem.indexOf(u8, messages[messages.len - 1].content.?.text, "malformed tool arguments") != null);
+            }
+            if (self.calls <= self.malformed_limit) return self.failure;
+            const calls = try alloc.alloc(generating.ToolCall, 1);
+            calls[0] = .{ .id = try alloc.dupe(u8, "corrected-call"), .name = try alloc.dupe(u8, "submit_query"), .arguments = try alloc.dupe(u8, "{\"query_request\":{\"full_text_search\":{\"match\":\"anatomy\",\"field\":\"title\"}}}") };
+            return .{ .allocator = alloc, .content = try alloc.dupe(u8, ""), .tool_calls = calls };
+        }
+    };
+    for ([_]usize{ 1, 3 }) |malformed_limit| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        var fake = Fake{ .malformed_limit = malformed_limit };
+        const result = try buildQueryBuilderResponseWithContext(arena.allocator(), .{
+            .intent = "Find anatomy",
+            .table = "articles",
+            .generator = .{ .provider = "antfly", .model = "test" },
+            .max_internal_iterations = 2,
+        }, .{ .schema_fields = &.{"title"}, .runtime_query_request_validator = .{ .ptr = &fake, .vtable = &.{ .validate_query_request = Fake.validate } } }, .{ .ptr = &fake, .vtable = &.{ .execute_chain = Fake.run } });
+        try std.testing.expectEqual(@as(usize, 2), fake.calls);
+        try std.testing.expectEqual(@as(?i64, 2), result.iteration);
+        try std.testing.expectEqual(if (malformed_limit == 1) metadata_openapi.AgentStatus.completed else .incomplete, result.status);
+    }
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var cancelled = Fake{ .malformed_limit = 3, .failure = error.Cancelled };
+    try std.testing.expectError(error.Cancelled, buildQueryBuilderResponseWithContext(arena.allocator(), .{
+        .intent = "Find anatomy",
+        .table = "articles",
+        .generator = .{ .provider = "antfly", .model = "test" },
+        .max_internal_iterations = 2,
+    }, .{ .schema_fields = &.{"title"}, .runtime_query_request_validator = .{ .ptr = &cancelled, .vtable = &.{ .validate_query_request = Fake.validate } } }, .{ .ptr = &cancelled, .vtable = &.{ .execute_chain = Fake.run } }));
+    try std.testing.expectEqual(@as(usize, 1), cancelled.calls);
 }
 
 fn buildQueryBuilderGenerationChain(

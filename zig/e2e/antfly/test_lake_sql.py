@@ -1178,16 +1178,30 @@ def test_native_remote_text_corpus_scores_filters_and_restart(tmp_path):
                 "schema": {
                     "storage_mode": "relational",
                     "default_type": "doc",
-                    "document_schemas": {"doc": {"schema": {
-                        "type": "object", "additionalProperties": False,
-                        "properties": {
-                            "amount": {"type": "integer", "x-antfly-field": {"type": "number", "sortable": True}},
-                            "body": {"type": "string", "x-antfly-field": {"type": "text"}},
-                            "label": {"type": "string"},
-                            "dense_native": {"type": "string"},
-                            "sparse_native": {"type": "string"},
-                        },
-                    }}},
+                    "document_schemas": {
+                        "doc": {
+                            "schema": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "properties": {
+                                    "amount": {
+                                        "type": "integer",
+                                        "x-antfly-field": {
+                                            "type": "number",
+                                            "sortable": True,
+                                        },
+                                    },
+                                    "body": {
+                                        "type": "string",
+                                        "x-antfly-field": {"type": "text"},
+                                    },
+                                    "label": {"type": "string"},
+                                    "dense_native": {"type": "string"},
+                                    "sparse_native": {"type": "string"},
+                                },
+                            }
+                        }
+                    },
                     "base_source": {
                         "kind": "external",
                         "table_id": "text-events",
@@ -1235,18 +1249,48 @@ def test_native_remote_text_corpus_scores_filters_and_restart(tmp_path):
         assert all(hit["_score"] > 0 for hit in hits)
         # Native doc-value top-N uses public IDs/cursors and hydrates only the
         # selected page. Public scores still use the complete BM25 corpus.
-        native_order = dict(request, full_text_index="all_text", fields=["label"],
-            order_by=[{"field": "amount", "desc": True}], profile=True, limit=2)
+        native_order = dict(
+            request,
+            full_text_index="all_text",
+            fields=["label"],
+            order_by=[{"field": "amount", "desc": True}],
+            profile=True,
+            limit=2,
+        )
         ordered = call("POST", "/tables/lake_text/query", native_order)
-        assert [h["_source"]["label"] for h in ordered["hits"]["hits"]] == ["row-2055", "row-129"], ordered
+        assert [h["_source"]["label"] for h in ordered["hits"]["hits"]] == [
+            "row-2055",
+            "row-129",
+        ], ordered
         assert ordered["profile"]["sort"]["plan"] == "native_doc_values_top_n", ordered
-        assert all(h["_id"].startswith("lake1:") for h in ordered["hits"]["hits"]), ordered
-        next_ordered = call("POST", "/tables/lake_text/query", dict(native_order,
-            search_after=ordered["hits"]["hits"][-1]["_sort"], remote_snapshot=ordered["remote_snapshot"]))
-        assert [h["_source"]["label"] for h in next_ordered["hits"]["hits"]] == ["row-18", "row-17"], next_ordered
-        previous_ordered = call("POST", "/tables/lake_text/query", dict(native_order,
-            search_before=next_ordered["hits"]["hits"][0]["_sort"], remote_snapshot=ordered["remote_snapshot"]))
-        assert [h["_id"] for h in previous_ordered["hits"]["hits"]] == [h["_id"] for h in ordered["hits"]["hits"]], previous_ordered
+        assert all(h["_id"].startswith("lake1:") for h in ordered["hits"]["hits"]), (
+            ordered
+        )
+        next_ordered = call(
+            "POST",
+            "/tables/lake_text/query",
+            dict(
+                native_order,
+                search_after=ordered["hits"]["hits"][-1]["_sort"],
+                remote_snapshot=ordered["remote_snapshot"],
+            ),
+        )
+        assert [h["_source"]["label"] for h in next_ordered["hits"]["hits"]] == [
+            "row-18",
+            "row-17",
+        ], next_ordered
+        previous_ordered = call(
+            "POST",
+            "/tables/lake_text/query",
+            dict(
+                native_order,
+                search_before=next_ordered["hits"]["hits"][0]["_sort"],
+                remote_snapshot=ordered["remote_snapshot"],
+            ),
+        )
+        assert [h["_id"] for h in previous_ordered["hits"]["hits"]] == [
+            h["_id"] for h in ordered["hits"]["hits"]
+        ], previous_ordered
         # Highlight from the pinned original document, including fields omitted
         # from the result projection. Returned source must stay projected.
         highlight_request = dict(
@@ -1422,20 +1466,37 @@ def test_native_remote_text_corpus_scores_filters_and_restart(tmp_path):
         # Retained column pages must survive subsequent cursor pulls and
         # hydration batches. Dictionary strings and exact integers stay paired
         # with their hit after more than two 256-row batches have advanced.
-        broad = call("POST", "/tables/lake_text/query", {
-            "full_text_search": {"match": "filler", "field": "body"},
-            "full_text_index": "body_text", "fields": ["label", "amount", "body"],
-            "highlight": {"fields": ["body"]}, "limit": 600})
+        broad = call(
+            "POST",
+            "/tables/lake_text/query",
+            {
+                "full_text_search": {"match": "filler", "field": "body"},
+                "full_text_index": "body_text",
+                "fields": ["label", "amount", "body"],
+                "highlight": {"fields": ["body"]},
+                "limit": 600,
+            },
+        )
         # The native column path must stream the normal JSON envelope. Inspect
         # framing as well as parsed values so a buffered fallback cannot pass.
-        streamed = requests.post(server.api_url + "/tables/lake_text/query", json={
-            "full_text_search": {"match": "filler", "field": "body"},
-            "full_text_index": "body_text", "fields": ["label", "amount", "body"],
-            "highlight": {"fields": ["body"]}, "limit": 600},
-            auth=("admin", AUTH_BOOTSTRAP_PASSWORD), timeout=60, stream=True)
+        streamed = requests.post(
+            server.api_url + "/tables/lake_text/query",
+            json={
+                "full_text_search": {"match": "filler", "field": "body"},
+                "full_text_index": "body_text",
+                "fields": ["label", "amount", "body"],
+                "highlight": {"fields": ["body"]},
+                "limit": 600,
+            },
+            auth=("admin", AUTH_BOOTSTRAP_PASSWORD),
+            timeout=60,
+            stream=True,
+        )
         with streamed:
             assert streamed.ok, streamed.text
-            assert "chunked" in streamed.headers.get("Transfer-Encoding", "").lower(), streamed.headers
+            assert "chunked" in streamed.headers.get("Transfer-Encoding", "").lower(), (
+                streamed.headers
+            )
             chunks = list(streamed.iter_content(chunk_size=4096))
             assert len(chunks) > 1
             delivered = json.loads(b"".join(chunks))["responses"][0]
@@ -1445,18 +1506,29 @@ def test_native_remote_text_corpus_scores_filters_and_restart(tmp_path):
         for hit in broad["hits"]["hits"]:
             source = hit["_source"]
             assert set(source) == {"label", "amount", "body"}, hit
-            assert source["amount"] == base + int(source["label"].removeprefix("row-")), hit
+            assert source["amount"] == base + int(
+                source["label"].removeprefix("row-")
+            ), hit
             assert source["body"] == "filler document", hit
             assert hit["_highlights"]["body"], hit
         # A rare-term disjunction ranks scattered rows before common rows.
         # Physical hydration must scatter bounded pages back into score order.
         ranked = call(
-            "POST", "/tables/lake_text/query",
-            {"full_text_search": {"disjuncts": [
-                {"match": "needle", "field": "body"},
-                {"match": "filler", "field": "body"}]},
-             "full_text_index": "body_text", "fields": ["label", "amount"],
-             "order_by": [{"field": "_score", "desc": True}], "limit": 600})
+            "POST",
+            "/tables/lake_text/query",
+            {
+                "full_text_search": {
+                    "disjuncts": [
+                        {"match": "needle", "field": "body"},
+                        {"match": "filler", "field": "body"},
+                    ]
+                },
+                "full_text_index": "body_text",
+                "fields": ["label", "amount"],
+                "order_by": [{"field": "_score", "desc": True}],
+                "limit": 600,
+            },
+        )
         ranked_hits = ranked["hits"]["hits"]
         assert len(ranked_hits) == 600, ranked
         ranked_ids = [hit["_id"] for hit in ranked_hits]
@@ -1552,26 +1624,63 @@ def test_native_remote_text_corpus_scores_filters_and_restart(tmp_path):
         # Pagination and native/residual filters retain column delivery without
         # exposing predicate/highlight dependency fields in the projection.
         for payload, labels in [
-            (dict(typed_request, order_by=[{"field": "_score", "desc": True}],
-                  search_after=sort_tuple, remote_snapshot=snapshot_token),
-             {hit["_source"]["label"] for hit in ordered_next["hits"]["hits"]}),
-            (dict(typed_request, order_by=[{"field": "_score", "desc": True}],
-                  search_before=ordered_next["hits"]["hits"][0]["_sort"], remote_snapshot=snapshot_token),
-             {ordered_first["hits"]["hits"][0]["_source"]["label"]}),
-            (dict(typed_request, fields=["label"], filter_query={"term": {"path": "/amount", "value": base + 17}}), {"row-17"}),
-            (dict(typed_request, fields=["label"], exclusion_query={"term": {"path": "/amount", "value": base + 17}}), {"row-18", "row-129", "row-2055"}),
+            (
+                dict(
+                    typed_request,
+                    order_by=[{"field": "_score", "desc": True}],
+                    search_after=sort_tuple,
+                    remote_snapshot=snapshot_token,
+                ),
+                {hit["_source"]["label"] for hit in ordered_next["hits"]["hits"]},
+            ),
+            (
+                dict(
+                    typed_request,
+                    order_by=[{"field": "_score", "desc": True}],
+                    search_before=ordered_next["hits"]["hits"][0]["_sort"],
+                    remote_snapshot=snapshot_token,
+                ),
+                {ordered_first["hits"]["hits"][0]["_source"]["label"]},
+            ),
+            (
+                dict(
+                    typed_request,
+                    fields=["label"],
+                    filter_query={"term": {"path": "/amount", "value": base + 17}},
+                ),
+                {"row-17"},
+            ),
+            (
+                dict(
+                    typed_request,
+                    fields=["label"],
+                    exclusion_query={"term": {"path": "/amount", "value": base + 17}},
+                ),
+                {"row-18", "row-129", "row-2055"},
+            ),
         ]:
-            with requests.post(server.api_url + "/tables/lake_text/query", json=payload,
-                               auth=("admin", AUTH_BOOTSTRAP_PASSWORD), timeout=60, stream=True) as response:
+            with requests.post(
+                server.api_url + "/tables/lake_text/query",
+                json=payload,
+                auth=("admin", AUTH_BOOTSTRAP_PASSWORD),
+                timeout=60,
+                stream=True,
+            ) as response:
                 assert response.ok, response.text
-                assert "chunked" in response.headers.get("Transfer-Encoding", "").lower(), response.headers
+                assert (
+                    "chunked" in response.headers.get("Transfer-Encoding", "").lower()
+                ), response.headers
                 page = response.json()["responses"][0]
                 for hit in page["hits"]["hits"]:
                     assert set(hit["_source"]) == set(payload["fields"]), hit
                     assert hit["_highlights"]["body"], hit
                     if "amount" in hit["_source"]:
-                        assert hit["_source"]["amount"] == base + int(hit["_source"]["label"].removeprefix("row-")), hit
-                assert {hit["_source"]["label"] for hit in page["hits"]["hits"]} == labels, page
+                        assert hit["_source"]["amount"] == base + int(
+                            hit["_source"]["label"].removeprefix("row-")
+                        ), hit
+                assert {
+                    hit["_source"]["label"] for hit in page["hits"]["hits"]
+                } == labels, page
         unfenced = requests.post(
             server.api_url + "/tables/lake_text/query",
             json=dict(ordered_request, search_after=sort_tuple),
@@ -1988,11 +2097,14 @@ def test_native_remote_incremental_generations_keep_public_identity_and_file_art
             # logical directory used for incremental artifact reuse assertions.
             for document in roots:
                 if document.get("manifests"):
-                    groups = [manifests[ref["checksum"].removeprefix("sha256:")]
-                              for ref in document["manifests"]]
+                    groups = [
+                        manifests[ref["checksum"].removeprefix("sha256:")]
+                        for ref in document["manifests"]
+                    ]
                     document["file_groups"] = groups
-                    document["segments"] = [segment for group in groups
-                                            for segment in group["segments"]]
+                    document["segments"] = [
+                        segment for group in groups for segment in group["segments"]
+                    ]
             return roots
 
         wait_ready()
@@ -2319,33 +2431,51 @@ def test_native_remote_large_hydration_and_residual_filter(tmp_path):
     input_file = tmp_path / "selection.parquet"
     pq.write_table(
         pa.table({"body": ["common"] * count, "amount": range(count)}),
-        input_file, row_group_size=4096, use_dictionary=True,
-        compression="snappy", write_page_index=True,
+        input_file,
+        row_group_size=4096,
+        use_dictionary=True,
+        compression="snappy",
+        write_page_index=True,
     )
     payload = input_file.read_bytes()
     (objects / "part.parquet").write_bytes(
-        b"AFOBJ001" + struct.pack("<QI", len(payload), 0)
-        + hashlib.sha256(payload).hexdigest().encode() + payload
+        b"AFOBJ001"
+        + struct.pack("<QI", len(payload), 0)
+        + hashlib.sha256(payload).hexdigest().encode()
+        + payload
     )
     server = StandaloneAntflyServer(binary, "127.0.0.1", 0)
     failed = True
     try:
+
         def call(method, path, body=None):
             response = requests.request(
-                method, server.api_url + path, json=body,
-                auth=("admin", AUTH_BOOTSTRAP_PASSWORD), timeout=180,
+                method,
+                server.api_url + path,
+                json=body,
+                auth=("admin", AUTH_BOOTSTRAP_PASSWORD),
+                timeout=180,
             )
             assert response.ok, response.text + server.debug_logs()
             return response.json()
 
-        call("POST", "/tables/large_selection", {
-            "num_shards": 1,
-            "schema": {"storage_mode": "relational", "base_source": {
-                "kind": "external", "table_id": "large-selection",
-                "format": "parquet", "uri": root.as_uri(),
-            }},
-            "indexes": {"body_text": {"type": "full_text", "field": "body"}},
-        })
+        call(
+            "POST",
+            "/tables/large_selection",
+            {
+                "num_shards": 1,
+                "schema": {
+                    "storage_mode": "relational",
+                    "base_source": {
+                        "kind": "external",
+                        "table_id": "large-selection",
+                        "format": "parquet",
+                        "uri": root.as_uri(),
+                    },
+                },
+                "indexes": {"body_text": {"type": "full_text", "field": "body"}},
+            },
+        )
         deadline = time.monotonic() + 180
         while True:
             resource = call("GET", "/tables/large_selection/indexes/body_text")
@@ -2353,7 +2483,11 @@ def test_native_remote_large_hydration_and_residual_filter(tmp_path):
                 break
             assert time.monotonic() < deadline, str(resource) + server.debug_logs()
             time.sleep(0.1)
-        query = {"full_text_search": {"match_all": {}}, "fields": ["amount"], "limit": count}
+        query = {
+            "full_text_search": {"match_all": {}},
+            "fields": ["amount"],
+            "limit": count,
+        }
         result = call("POST", "/tables/large_selection/query", query)["responses"][0]
         hits = result["hits"]["hits"]
         assert len(hits) == count
@@ -2361,10 +2495,18 @@ def test_native_remote_large_hydration_and_residual_filter(tmp_path):
         assert {hit["_source"]["amount"] for hit in hits} == set(range(count))
         # The unindexed numeric field forces complete-source residual filtering
         # over all candidates BEFORE the small final page is selected.
-        filtered = call("POST", "/tables/large_selection/query", dict(
-            query, limit=10, filter_query={"term": {"path": "/amount", "value": count - 1}},
-        ))["responses"][0]
-        assert [hit["_source"]["amount"] for hit in filtered["hits"]["hits"]] == [count - 1]
+        filtered = call(
+            "POST",
+            "/tables/large_selection/query",
+            dict(
+                query,
+                limit=10,
+                filter_query={"term": {"path": "/amount", "value": count - 1}},
+            ),
+        )["responses"][0]
+        assert [hit["_source"]["amount"] for hit in filtered["hits"]["hits"]] == [
+            count - 1
+        ]
         failed = False
     finally:
         server.stop(test_failed=failed)

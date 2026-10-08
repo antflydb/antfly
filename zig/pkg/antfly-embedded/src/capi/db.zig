@@ -2417,6 +2417,7 @@ pub fn openLiteHandleAllocWithRuntime(
         opts.transaction_recovery = .{ .enabled = false };
         opts.text_merge = .{ .enabled = false };
         opts.sparse_compaction = .{ .enabled = false };
+        opts.graph_metric_maintenance = .{ .start_background_loop = false };
     }
     try backend.configureDbOpenOptions(&opts);
 
@@ -2502,6 +2503,7 @@ pub fn dbOpenOptionsFromResolved(resolved: LiteResolvedOpenOptions, lite: bool) 
         opts.transaction_recovery = .{ .enabled = false };
         opts.text_merge = .{ .enabled = false };
         opts.sparse_compaction = .{ .enabled = false };
+        opts.graph_metric_maintenance = .{ .start_background_loop = false };
     }
     return opts;
 }
