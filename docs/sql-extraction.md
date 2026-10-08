@@ -6133,3 +6133,61 @@ control-catalog integrity, inventory integrity and formatting checks pass.
 The large generated Go diff is the embedded compressed OpenAPI payload changing,
 not hand-written query code. Changes are committed locally only; the unrelated
 HTTP discovery edit is preserved.
+
+### Logical CHECK execution without persistent-key amplification
+
+Column/operator CHECK declarations and explicit immutable expressions now compile
+into the same owned typed expression plans. Column binding and collation validation
+remain schema-epoch operations; evaluating a CHECK no longer serializes a row cell
+into an ordered index key. Persistent ordered-key size limits remain unchanged and
+are still enforced by actual index encoding. CHECK logical domains instead use the
+shared row execution work, cancellation and retained-byte admission contract.
+
+The CHECK set no longer has separate comparison/expression runtime variants or
+per-row key scratch. Dependency projection, JSON admission, cold ordinal admission,
+deterministic activation failure handling and plan fingerprints use one path.
+Equivalent named column/operator and explicit-expression declarations bind the same
+typed plan fingerprint. Schema publication records the resulting CHECK coverage;
+no new physical row encoding or index compatibility decoder is introduced.
+
+Borrowed text/blob comparison retains binary chunk scans and ASCII collation while
+charging actual inspected chunks against shared work and polling cancellation at
+most 256 bytes apart. Repeated comparison cannot receive a fresh CPU quota. NUMERIC
+continues using canonical borrowed views and its existing group admission.
+
+AROW blob cells retain API base64 text, while typed operands and literals contain
+decoded bytes. The VM now honors that boundary on JSON and cold rows rather than
+comparing the two representations. Direct leaf comparisons decode bounded chunks
+on the stack without allocating; complete base64 validation continues after an
+early unequal byte or a SQL NULL counterpart. Nested programs and generated-value
+verification use the same admitted decoder. Generated text/blob equality also
+shares cancellable comparison work. Physical blob encoding is unchanged.
+
+Column declarations construct their expression DOM directly instead of serializing
+and reparsing large literals. Shared node/literal admission stops compilation as
+soon as the CHECK set exceeds its limits, with initialized-plan cleanup intact.
+
+A compact independent PostgreSQL fixture covers six assignments with 600 KiB
+zero-filled bytea, text larger than 1 MiB, rejecting values and SQL NULL. Native
+tests consume those cases through both CHECK declaration forms on JSON and AROW
+ordinal rows. Cold checks succeed with every allocation denied, while actual key
+encoding of the escaped blob still reports RelationalIndexKeyTooLarge. Separate
+assertions prove cancellation during a long equal prefix, sticky work exhaustion
+and preserved activation error semantics. The LSM regression covers batch
+atomicity, reopen and portable restore with these wide constrained values.
+Additional tests cover base64 chunk/padding boundaries, malformed suffixes hidden
+behind early mismatches or NULLs, nested blob COALESCE, and rejection of forged
+generated blob values on cold rows.
+
+This removes the legacy column CHECK/key-domain coupling; it does not activate
+array DDL, add a durable array expression domain, finish low-level codec/hash
+shared admission, or widen native query/index predicate domains. The original
+inventory remains 448 implemented, 136 rejected, 73 superseded and 929 unresolved.
+
+Final-source validation passes 60 local and five server schema-expression tests,
+601 local SQL tests (three existing skips), 226 server SQL tests, and 188 local
+plus one server relational-storage tests, without failures or leaks. The six
+independent PostgreSQL assignments, control-catalog compilation, inventory
+integrity, Ruff, Zig formatting and whitespace checks also pass. These gates do
+not establish completion of the remaining parity inventory or the separate
+broad durable-runtime compiler-memory gate.

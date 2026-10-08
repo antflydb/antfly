@@ -138,6 +138,59 @@ test "relational index system SQL typed arrays survive LSM reopen and portable r
     }
 }
 
+test "relational index system wide logical CHECKs survive LSM reopen and portable restore" {
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var directory = try @import("../../common/test_directory.zig").TestDirectory.init("wide-checks-lsm");
+    defer directory.cleanup();
+    var target = try @import("../../common/test_directory.zig").TestDirectory.init("wide-checks-restore");
+    defer target.cleanup();
+    const options: db_mod.OpenOptions = .{ .start_optional_runtimes = false, .start_index_workers = false, .primary_backend = .{ .lsm = .{} } };
+    const payload = try a.alloc(u8, 600 * 1024);
+    @memset(payload, 0);
+    const encoded = try a.alloc(u8, std.base64.standard.Encoder.calcSize(payload.len));
+    _ = std.base64.standard.Encoder.encode(encoded, payload);
+    const text = try a.alloc(u8, 1024 * 1024 + 1);
+    @memset(text, 'x');
+    const schema_json = try std.json.Stringify.valueAlloc(a, .{
+        .version = 1,
+        .storage_mode = "relational",
+        .default_type = "row",
+        .checks = .{
+            .{ .name = "same", .column = "b", .op = "eq", .value = encoded },
+            .{ .name = "text", .column = "s", .op = "gt", .value = "" },
+        },
+        .document_schemas = .{ .row = .{ .schema = .{ .type = "object", .properties = .{ .b = .{ .type = "blob" }, .s = .{ .type = "keyword" } }, .additionalProperties = false } } },
+    }, .{});
+    const valid = try std.json.Stringify.valueAlloc(a, .{ .b = encoded, .s = text }, .{});
+    const invalid = try std.json.Stringify.valueAlloc(a, .{ .b = encoded, .s = "" }, .{});
+    var archive: std.ArrayListUnmanaged(u8) = .empty;
+    defer archive.deinit(alloc);
+    {
+        var db = try db_mod.DB.open(alloc, directory.path(), options);
+        defer db.close();
+        try db.setSchemaJson(alloc, schema_json);
+        try db.batch(.{ .writes = &.{.{ .key = "row", .value = valid }} });
+        try std.testing.expectError(error.RelationalCheckViolation, db.batch(.{ .writes = &.{ .{ .key = "not-committed", .value = valid }, .{ .key = "invalid", .value = invalid } } }));
+        try std.testing.expect((try db.get(alloc, "not-committed")) == null);
+        try @import("../portable_backup.zig").exportPortable(alloc, db.core.store, &archive);
+    }
+    var reopened = try db_mod.DB.open(alloc, directory.path(), options);
+    defer reopened.close();
+    var restored = try db_mod.DB.open(alloc, target.path(), options);
+    defer restored.close();
+    try restored.importPortableIntoEmpty(alloc, archive.items, @import("doc_identity.zig").default_namespace);
+    for ([_]*db_mod.DB{ &reopened, &restored }) |db| {
+        const bytes = (try db.get(alloc, "row")).?;
+        defer alloc.free(bytes);
+        var document = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
+        defer document.deinit();
+        try std.testing.expectEqualStrings(encoded, document.value.object.get("b").?.string);
+        try std.testing.expectEqualStrings(text, document.value.object.get("s").?.string);
+    }
+}
+
 test "relational index system public NUMERIC modifiers normalize before indexing and survive LSM restore" {
     const TestDirectory = @import("../../common/test_directory.zig").TestDirectory;
     var directory = try TestDirectory.init("numeric-modifier-lsm");

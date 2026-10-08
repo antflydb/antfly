@@ -367,6 +367,25 @@ pub const Plan = struct {
 
     const Source = union(enum) { values: []const Value, json: std.json.Value, row: codec.OrdinalRowView, bound_row: codec.OrdinalRowView };
 
+    fn borrowedBlob(self: *const Plan, source: Source, index: u16) !BlobOperand {
+        const node = self.nodes[index];
+        if (node.op == .literal) return BlobOperand.fromValue(node.literal);
+        std.debug.assert(node.op == .column and node.kind == .blob);
+        return switch (source) {
+            .values => |values| if (node.ordinal < values.len) BlobOperand.fromValue(values[node.ordinal]) else error.InvalidRelationalExpressionInput,
+            .json => |json| BlobOperand.fromJson(json.object.get(node.column_name) orelse .null),
+            .row, .bound_row => |row| blk: {
+                const ordinal = if (source == .bound_row) node.ordinal else row.ordinalForName(node.column_name) orelse break :blk .{};
+                if (ordinal >= row.table_schema.relational_columns.len or row.table_schema.relational_columns[ordinal].column_type != .blob) return error.RelationalIndexColumnTypeMismatch;
+                const cell = (try row.findCell(ordinal)) orelse break :blk .{};
+                if (cell.is_null) break :blk .{};
+                // AROW blob cells retain the API's base64 representation.
+                // A typed expression literal/value is already decoded bytes.
+                break :blk try BlobOperand.fromJson(.{ .string = cell.value.bytes_val });
+            },
+        };
+    }
+
     fn evaluateNode(self: *const Plan, execution: *Execution, source: Source, index: u16) anyerror!Value {
         try execution.numeric.charge(1);
         const alloc = execution.alloc;
@@ -378,11 +397,7 @@ pub const Plan = struct {
                 .values => |values| if (node.ordinal < values.len) values[node.ordinal] else return error.InvalidRelationalExpressionInput,
                 .json => |json| blk: {
                     const input = json.object.get(node.column_name) orelse .null;
-                    if (node.kind == .blob and input == .string) {
-                        const size = std.base64.standard.Decoder.calcSizeForSlice(input.string) catch return error.InvalidRelationalExpressionInput;
-                        if (size > budget.*) return error.RelationalExpressionBudgetExceeded;
-                        budget.* -= size;
-                    }
+                    if (node.kind == .blob) break :blk try decodeBlob(execution, try BlobOperand.fromJson(input));
                     break :blk if (node.kind == .numeric) try numericJson(execution, input) else try checks.valueFromJson(alloc, node.kind, input, false);
                 },
                 .row, .bound_row => |row| blk: {
@@ -393,7 +408,7 @@ pub const Plan = struct {
                     if (cell.is_null) break :blk .null;
                     break :blk switch (node.kind) {
                         .string => .{ .string = cell.value.bytes_val },
-                        .blob => .{ .blob = cell.value.bytes_val },
+                        .blob => try decodeBlob(execution, try BlobOperand.fromJson(.{ .string = cell.value.bytes_val })),
                         .integer => .{ .integer = cell.value.i64_val },
                         .number => .{ .number = cell.value.f64_val },
                         .numeric => .{ .numeric = cell.value.bytes_val },
@@ -462,13 +477,17 @@ pub const Plan = struct {
             return if (unknown) .null else .{ .boolean = node.op == .not_in_list };
         }
         if (isComparison(node.op)) {
+            const l = self.nodes[node.children[0]];
+            const r = self.nodes[node.children[1]];
+            if (l.kind == .blob and r.kind == .blob and
+                (l.op == .column or l.op == .literal) and (r.op == .column or r.op == .literal))
+            {
+                try execution.charge(2);
+                return compareBlobs(execution, node.op, try self.borrowedBlob(source, node.children[0]), try self.borrowedBlob(source, node.children[1]));
+            }
             const left = try self.evaluateNode(execution, source, node.children[0]);
             const right = try self.evaluateNode(execution, source, node.children[1]);
-            if (left == .null or right == .null) return switch (node.op) {
-                .is_distinct => .{ .boolean = (left == .null) != (right == .null) },
-                .is_not_distinct => .{ .boolean = (left == .null) == (right == .null) },
-                else => .null,
-            };
+            if (left == .null or right == .null) return comparisonValue(node.op, left == .null, right == .null, .eq);
             // Borrowed values need no allocation, but repeatedly comparing a
             // wide value still consumes CPU. Charge the maximum operand bytes
             // inspected against the same per-row budget as allocated outputs.
@@ -480,15 +499,7 @@ pub const Plan = struct {
             if (compared_bytes > budget.* / 2) return error.RelationalExpressionBudgetExceeded;
             budget.* -= compared_bytes * 2;
             const order = try valueOrderWithContext(left, right, node.fold_ascii, &execution.numeric);
-            return .{ .boolean = switch (node.op) {
-                .eq, .is_not_distinct => order == .eq,
-                .ne, .is_distinct => order != .eq,
-                .gt => order == .gt,
-                .gte => order != .lt,
-                .lt => order == .lt,
-                .lte => order != .gt,
-                else => unreachable,
-            } };
+            return comparisonValue(node.op, false, false, order);
         }
         var operands: [32]Value = undefined;
         for (node.children, 0..) |child, i| {
@@ -661,6 +672,125 @@ fn allocateOutput(alloc: Allocator, size: usize, budget: *usize) ![]u8 {
     return alloc.alloc(u8, size);
 }
 
+fn comparisonValue(op: Op, left_null: bool, right_null: bool, order: std.math.Order) Value {
+    if (left_null or right_null) return switch (op) {
+        .is_distinct => .{ .boolean = left_null != right_null },
+        .is_not_distinct => .{ .boolean = left_null == right_null },
+        else => .null,
+    };
+    return .{ .boolean = switch (op) {
+        .eq, .is_not_distinct => order == .eq,
+        .ne, .is_distinct => order != .eq,
+        .gt => order == .gt,
+        .gte => order != .lt,
+        .lt => order == .lt,
+        .lte => order != .gt,
+        else => unreachable,
+    } };
+}
+
+/// Physical/API blob cells retain base64; typed operands retain decoded bytes.
+/// Borrow that distinction instead of allocating a decoded row for CHECKs.
+const BlobOperand = struct {
+    bytes: []const u8 = &.{},
+    encoded: bool = false,
+    sql_null: bool = true,
+    length: usize = 0,
+
+    fn fromValue(value: Value) !BlobOperand {
+        return switch (value) {
+            .null => .{},
+            .blob => |bytes| .{ .bytes = bytes, .length = bytes.len, .sql_null = false },
+            else => error.InvalidRelationalExpressionInput,
+        };
+    }
+
+    fn fromJson(value: std.json.Value) !BlobOperand {
+        return switch (value) {
+            .null => .{},
+            .string => |bytes| .{
+                .bytes = bytes,
+                .encoded = true,
+                .sql_null = false,
+                .length = std.base64.standard.Decoder.calcSizeForSlice(bytes) catch return error.InvalidRelationalExpressionInput,
+            },
+            else => error.InvalidRelationalExpressionInput,
+        };
+    }
+};
+
+const BlobCursor = struct {
+    operand: BlobOperand,
+    offset: usize = 0,
+    scratch: [192]u8 = undefined,
+
+    fn next(self: *BlobCursor, execution: *Execution) ![]const u8 {
+        if (self.offset == self.operand.bytes.len) return &.{};
+        const end = self.offset + @min(self.operand.bytes.len - self.offset, if (self.operand.encoded) @as(usize, 256) else 192);
+        const input = self.operand.bytes[self.offset..end];
+        try execution.charge(input.len);
+        self.offset = end;
+        if (!self.operand.encoded) return input;
+        const size = std.base64.standard.Decoder.calcSizeForSlice(input) catch return error.InvalidRelationalExpressionInput;
+        // Padding is legal only at the end of the complete value, not a chunk.
+        if (end != self.operand.bytes.len and size != self.scratch.len) return error.InvalidRelationalExpressionInput;
+        std.base64.standard.Decoder.decode(self.scratch[0..size], input) catch return error.InvalidRelationalExpressionInput;
+        return self.scratch[0..size];
+    }
+};
+
+fn compareBlobs(execution: *Execution, op: Op, left: BlobOperand, right: BlobOperand) !Value {
+    if (left.sql_null or right.sql_null) {
+        for ([_]BlobOperand{ left, right }) |operand| {
+            if (!operand.encoded) continue;
+            var cursor: BlobCursor = .{ .operand = operand };
+            while ((try cursor.next(execution)).len != 0) {}
+        }
+        return comparisonValue(op, left.sql_null, right.sql_null, .eq);
+    }
+    const compared = @min(left.length, right.length);
+    if (compared > execution.bytes.* / 2) return execution.limit();
+    execution.bytes.* -= compared * 2;
+    if (!left.encoded and !right.encoded)
+        return comparisonValue(op, false, false, try orderBytes(left.bytes, right.bytes, false, &execution.numeric));
+    var l: BlobCursor = .{ .operand = left };
+    var r: BlobCursor = .{ .operand = right };
+    var order: std.math.Order = .eq;
+    while (true) {
+        const a = try l.next(execution);
+        const b = try r.next(execution);
+        if (a.len == 0 and b.len == 0) break;
+        if (order == .eq) order = std.mem.order(u8, a, b);
+        if (order != .eq) {
+            if (!left.encoded) l.offset = left.bytes.len;
+            if (!right.encoded) r.offset = right.bytes.len;
+        }
+        // Decode the complete operands even after a mismatch: an invalid
+        // base64 suffix must not be hidden by NULL or an early unequal byte.
+    }
+    return comparisonValue(op, left.sql_null, right.sql_null, order);
+}
+
+fn decodeBlob(execution: *Execution, operand: BlobOperand) !Value {
+    if (operand.sql_null) return .null;
+    if (!operand.encoded) return .{ .blob = operand.bytes };
+    if (operand.length > execution.bytes.*) return execution.limit();
+    execution.bytes.* -= operand.length;
+    const output = try execution.alloc.alloc(u8, operand.length);
+    errdefer execution.alloc.free(output);
+    var cursor: BlobCursor = .{ .operand = operand };
+    var offset: usize = 0;
+    while (true) {
+        const bytes = try cursor.next(execution);
+        if (bytes.len == 0) break;
+        if (bytes.len > output.len - offset) return error.InvalidRelationalExpressionInput;
+        @memcpy(output[offset..][0..bytes.len], bytes);
+        offset += bytes.len;
+    }
+    if (offset != output.len) return error.InvalidRelationalExpressionInput;
+    return .{ .blob = output };
+}
+
 fn isComparison(op: Op) bool {
     return switch (op) {
         .eq, .ne, .gt, .gte, .lt, .lte, .is_distinct, .is_not_distinct => true,
@@ -676,15 +806,8 @@ fn valueOrder(a: Value, b: Value, fold_ascii: bool) !std.math.Order {
 fn valueOrderWithContext(a: Value, b: Value, fold_ascii: bool, context: *exact.Context) !std.math.Order {
     return switch (a) {
         .null => unreachable,
-        .string => |left| blk: {
-            if (!fold_ascii) break :blk std.mem.order(u8, left, b.string);
-            for (left[0..@min(left.len, b.string.len)], b.string[0..@min(left.len, b.string.len)]) |x, y| {
-                const order = std.math.order(std.ascii.toLower(x), std.ascii.toLower(y));
-                if (order != .eq) break :blk order;
-            }
-            break :blk std.math.order(left.len, b.string.len);
-        },
-        .blob => |value| std.mem.order(u8, value, b.blob),
+        .string => |left| orderBytes(left, b.string, fold_ascii, context),
+        .blob => |value| orderBytes(value, b.blob, false, context),
         .numeric => |bytes| blk: {
             const View = @import("../common/sql_numeric_layout.zig").View;
             const left = try View.openWithBudget(bytes, .{}, context);
@@ -696,6 +819,68 @@ fn valueOrderWithContext(a: Value, b: Value, fold_ascii: bool, context: *exact.C
         .number => |value| std.math.order(value, b.number),
         .datetime => |value| std.math.order(value, b.datetime),
     };
+}
+
+/// Borrowed comparisons retain vectorized binary scans, with bounded work
+/// between cancellation polls. CPU admission is shared with all row programs;
+/// neither a long prefix nor ASCII collation starts a fresh comparison quota.
+fn orderBytes(left: []const u8, right: []const u8, fold_ascii: bool, context: *exact.Context) !std.math.Order {
+    const count = @min(left.len, right.len);
+    var offset: usize = 0;
+    while (offset < count) {
+        const end = offset + @min(count - offset, 256);
+        try context.charge(end - offset);
+        const order = if (fold_ascii) blk: {
+            for (left[offset..end], right[offset..end]) |x, y| {
+                const compared = std.math.order(std.ascii.toLower(x), std.ascii.toLower(y));
+                if (compared != .eq) break :blk compared;
+            }
+            break :blk std.math.Order.eq;
+        } else std.mem.order(u8, left[offset..end], right[offset..end]);
+        if (order != .eq) return order;
+        offset = end;
+    }
+    return std.math.order(left.len, right.len);
+}
+
+test "relational declarations blob views decode boundaries and validate complete comparisons" {
+    const a = std.testing.allocator;
+    var payload: [769]u8 = undefined;
+    for (&payload, 0..) |*byte, i| byte.* = @truncate(i);
+    var buffer: [1028]u8 = undefined;
+    for ([_]usize{ 0, 1, 2, 3, 191, 192, 193, 384, 385, 769 }) |size| {
+        const encoded = std.base64.standard.Encoder.encode(&buffer, payload[0..size]);
+        const operand = try BlobOperand.fromJson(.{ .string = encoded });
+        var denied = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+        var allowance: usize = max_allocated_bytes;
+        var execution = Execution.init(denied.allocator(), &allowance);
+        const raw = try BlobOperand.fromValue(.{ .blob = payload[0..size] });
+        try std.testing.expect((try compareBlobs(&execution, .eq, operand, raw)).boolean);
+        try std.testing.expect((try compareBlobs(&execution, .eq, operand, operand)).boolean);
+        try std.testing.expect((try compareBlobs(&execution, .eq, operand, .{})) == .null);
+        try std.testing.expect((try compareBlobs(&execution, .is_distinct, operand, .{})).boolean);
+        const short = try BlobOperand.fromValue(.{ .blob = payload[0 .. size / 2] });
+        const expected = std.mem.order(u8, payload[0..size], payload[0 .. size / 2]);
+        try std.testing.expectEqual(expected == .gt, (try compareBlobs(&execution, .gt, operand, short)).boolean);
+        try std.testing.expectEqual(@as(usize, 0), denied.alloc_index);
+        allowance = max_allocated_bytes;
+        execution = Execution.init(a, &allowance);
+        const decoded = try decodeBlob(&execution, operand);
+        defer a.free(decoded.blob);
+        try std.testing.expectEqualSlices(u8, payload[0..size], decoded.blob);
+    }
+    var malformed: [512]u8 = @splat('A');
+    const different = try BlobOperand.fromValue(.{ .blob = &.{255} });
+    for ([_]usize{ 254, 511 }) |position| {
+        malformed[position] = if (position == 254) '=' else '!';
+        const operand = try BlobOperand.fromJson(.{ .string = &malformed });
+        var allowance: usize = max_allocated_bytes;
+        var execution = Execution.init(a, &allowance);
+        try std.testing.expectError(error.InvalidRelationalExpressionInput, compareBlobs(&execution, .ne, operand, different));
+        try std.testing.expectError(error.InvalidRelationalExpressionInput, compareBlobs(&execution, .eq, operand, .{}));
+        try std.testing.expectError(error.InvalidRelationalExpressionInput, decodeBlob(&execution, operand));
+        malformed[position] = 'A';
+    }
 }
 
 fn finite(value: f64) !Value {
@@ -2174,7 +2359,7 @@ pub const Set = struct {
             if (cell.is_null) continue;
             values[ordinal] = switch (column.column_type) {
                 .string => .{ .string = cell.value.bytes_val },
-                .blob => .{ .blob = cell.value.bytes_val },
+                .blob => try decodeBlob(execution, try BlobOperand.fromJson(.{ .string = cell.value.bytes_val })),
                 .integer => .{ .integer = cell.value.i64_val },
                 .number => .{ .number = cell.value.f64_val },
                 .numeric => .{ .numeric = cell.value.bytes_val },
@@ -2198,10 +2383,12 @@ pub const Set = struct {
             if (!present[binding.ordinal]) return error.InvalidRelationalGeneratedValue;
             const expected = try self.normalizeBinding(execution, binding.ordinal, try binding.plan.evaluateWithExecution(execution, values));
             const actual = values[binding.ordinal];
-            const equal = if (expected == .numeric and actual == .numeric)
-                (valueOrderWithContext(expected, actual, false, &execution.numeric) catch |err| return executionFailure(err)) == .eq
+            const equal = if (std.meta.activeTag(expected) != std.meta.activeTag(actual))
+                false
+            else if (expected == .null)
+                true
             else
-                try valuesEqual(expected, actual);
+                (valueOrderWithContext(expected, actual, false, &execution.numeric) catch |err| return executionFailure(err)) == .eq;
             if (!equal) return error.InvalidRelationalGeneratedValue;
         }
     }
@@ -2240,7 +2427,8 @@ pub const Set = struct {
             if (!self.read_columns[ordinal] or (ignore_generated and self.generated_columns[ordinal])) continue;
             if (input) |scalar| switch (column.column_type) {
                 .numeric => value.* = try numericJson(execution, scalar),
-                .string, .blob, .boolean, .datetime, .integer, .number => value.* = try checks.valueFromJson(execution.alloc, column.column_type, scalar, false),
+                .blob => value.* = try decodeBlob(execution, try BlobOperand.fromJson(scalar)),
+                .string, .boolean, .datetime, .integer, .number => value.* = try checks.valueFromJson(execution.alloc, column.column_type, scalar, false),
                 else => {},
             };
         }
@@ -2618,6 +2806,108 @@ fn checkExpressionAllocationFailure(alloc: Allocator) !void {
     const row = try std.json.parseFromSlice(std.json.Value, alloc, "{\"x\":2}", .{});
     defer row.deinit();
     try std.testing.expectEqual(@as(?usize, null), try compiled.checks.?.firstViolationJson(alloc, row.value));
+}
+
+test "relational declarations column CHECKs compare large logical values without persistent key amplification" {
+    const a = std.testing.allocator;
+    const Case = struct { blob: enum { same, other, null }, text: enum { wide, empty, null }, accepted: bool };
+    const reference = try std.json.parseFromSlice(struct { blob_bytes: usize, text_bytes: usize, entries: []const Case }, a, @embedFile("../sql/fixtures/sql_check_domain_reference.json"), .{ .ignore_unknown_fields = true });
+    defer reference.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const owned = arena.allocator();
+    const payload = try owned.alloc(u8, reference.value.blob_bytes);
+    @memset(payload, 0);
+    const encoded_blob = try owned.alloc(u8, std.base64.standard.Encoder.calcSize(payload.len));
+    _ = std.base64.standard.Encoder.encode(encoded_blob, payload);
+    const text = try owned.alloc(u8, reference.value.text_bytes);
+    @memset(text, 'x');
+    const other = try owned.dupe(u8, payload);
+    other[0] = 1;
+    const other_blob = try owned.alloc(u8, encoded_blob.len);
+    _ = std.base64.standard.Encoder.encode(other_blob, other);
+    var identity: ?[32]u8 = null;
+    for ([_]bool{ false, true }) |explicit| {
+        const declaration = if (explicit)
+            try std.json.Stringify.valueAlloc(owned, .{ .name = "same", .expression = .{ .op = "eq", .args = .{ .{ .op = "column", .column = "b" }, .{ .op = "literal", .type = "blob", .value = encoded_blob } } } }, .{})
+        else
+            try std.json.Stringify.valueAlloc(owned, .{ .name = "same", .column = "b", .op = "eq", .value = encoded_blob }, .{});
+        const definition = try std.fmt.allocPrint(owned, "{{\"storage_mode\":\"relational\",\"default_type\":\"row\",\"checks\":[{s},{{\"name\":\"text\",\"column\":\"s\",\"op\":\"gt\",\"value\":\"\"}}],\"document_schemas\":{{\"row\":{{\"schema\":{{\"type\":\"object\",\"properties\":{{\"b\":{{\"type\":\"blob\"}},\"s\":{{\"type\":\"string\"}}}},\"additionalProperties\":false}}}}}}}}", .{declaration});
+        const impl = @import("table_schema_impl.zig");
+        var nullable = try std.json.parseFromSliceLeaky(std.json.Value, owned, definition, .{});
+        const properties = &nullable.object.getPtr("document_schemas").?.object.getPtr("row").?.object.getPtr("schema").?.object.getPtr("properties").?.object;
+        for ([_][]const u8{ "b", "s" }) |name| try properties.getPtr(name).?.object.put(owned, "nullable", .{ .bool = true });
+        var parsed = try impl.parseSchema(a, try std.json.Stringify.valueAlloc(owned, nullable, .{}));
+        defer parsed.deinit(a);
+        var compiled = try impl.CompiledValidationPlan.init(a, parsed);
+        defer compiled.deinit(a);
+        const set = compiled.checks.?;
+        if (identity) |previous| try std.testing.expectEqualSlices(u8, &previous, &set.fingerprint()) else identity = set.fingerprint();
+        var json: std.json.Value = .{ .object = .empty };
+        try json.object.put(owned, "b", .{ .string = encoded_blob });
+        try json.object.put(owned, "s", .{ .string = text });
+        try std.testing.expectEqual(@as(?usize, null), try set.firstViolationJson(a, json));
+        var cells: [2]codec.Cell = undefined;
+        const b = set.layout.ordinalForName(set.table.relational_columns, "b").?;
+        const s = set.layout.ordinalForName(set.table.relational_columns, "s").?;
+        cells[b] = .{ .ordinal = @intCast(b), .path = "b", .value_type = .bytes_val, .value = .{ .bytes_val = encoded_blob } };
+        cells[s] = .{ .ordinal = @intCast(s), .path = "s", .value_type = .bytes_val, .value = .{ .bytes_val = text } };
+        const bytes = try codec.serializeOrdinal(a, set.table.version, set.table.relational_columns, &cells, @splat(0));
+        defer a.free(bytes);
+        const row = try codec.ordinalRowView(bytes, set.table, &set.layout);
+        for (reference.value.entries) |entry| {
+            var document: std.json.Value = .{ .object = .empty };
+            try document.object.put(owned, "b", if (entry.blob == .null) .null else .{ .string = if (entry.blob == .other) other_blob else encoded_blob });
+            try document.object.put(owned, "s", if (entry.text == .null) .null else .{ .string = if (entry.text == .wide) text else "" });
+            const expected: ?usize = if (entry.accepted) null else if (entry.blob == .other) 0 else 1;
+            try std.testing.expectEqual(expected, try set.firstViolationJson(a, document));
+            var projected = cells;
+            projected[b].is_null = entry.blob == .null;
+            projected[b].value = .{ .bytes_val = if (entry.blob == .other) other_blob else encoded_blob };
+            projected[s].is_null = entry.text == .null;
+            projected[s].value = .{ .bytes_val = if (entry.text == .wide) text else "" };
+            const physical = try codec.serializeOrdinal(a, set.table.version, set.table.relational_columns, &projected, @splat(0));
+            defer a.free(physical);
+            const cold = try codec.ordinalRowView(physical, set.table, &set.layout);
+            var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+            try std.testing.expectEqual(expected, try set.firstViolationRow(failing.allocator(), cold));
+            try std.testing.expectEqual(@as(usize, 0), failing.alloc_index);
+        }
+        var denied = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+        var allowance: usize = max_allocated_bytes;
+        var execution = Execution.init(denied.allocator(), &allowance);
+        try std.testing.expectEqual(@as(?usize, null), try set.firstViolationRowWithExecution(&execution, row));
+        try std.testing.expectEqual(@as(usize, 0), denied.alloc_index);
+        try std.testing.expect(allowance < max_allocated_bytes);
+        var tuple = try @import("../storage/db/relational_index_keys.zig").TuplePlan.init(a, set.table, &set.layout, &.{.{ .column = "b" }});
+        defer tuple.deinit();
+        var key = std.ArrayList(u8).empty;
+        defer key.deinit(a);
+        try std.testing.expectError(error.RelationalIndexKeyTooLarge, tuple.appendValues(a, &key, &.{.{ .blob = payload }}));
+        const Cancel = struct {
+            calls: usize = 0,
+            fn poll(raw: ?*anyopaque) anyerror!void {
+                const self: *@This() = @ptrCast(@alignCast(raw.?));
+                self.calls += 1;
+                if (self.calls == 3) return error.Canceled;
+            }
+        };
+        var cancel: Cancel = .{};
+        allowance = max_allocated_bytes;
+        execution = Execution.init(denied.allocator(), &allowance);
+        execution.numeric.checkpoint = Cancel.poll;
+        execution.numeric.ptr = &cancel;
+        try std.testing.expectError(error.Canceled, set.firstFailureRowWithExecution(&execution, row));
+        try std.testing.expectEqual(@as(usize, 3), cancel.calls);
+        execution.numeric.checkpoint = null;
+        try std.testing.expectError(error.Canceled, execution.charge(0));
+        allowance = max_allocated_bytes;
+        execution = Execution.init(denied.allocator(), &allowance);
+        execution.numeric.remaining = 256;
+        try std.testing.expectError(error.RelationalExpressionBudgetExceeded, set.firstFailureRowWithExecution(&execution, row));
+        execution.numeric.remaining = 8 * 1024 * 1024;
+        try std.testing.expectError(error.RelationalExpressionBudgetExceeded, execution.charge(0));
+    }
 }
 
 test "relational declarations mixed CHECKs share JSON and ordinal row quotas with sticky activation failures" {
@@ -3099,6 +3389,44 @@ test "relational declarations physical restore shares generated CHECK and field 
     try Run.run(std.testing.allocator);
     var stable = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
     try std.testing.checkAllAllocationFailures(stable.allocator(), Run.run, .{});
+}
+
+test "relational declarations nested blob programs agree across JSON and cold generated verification" {
+    const a = std.testing.allocator;
+    const impl = @import("table_schema_impl.zig");
+    var parsed = try impl.parseSchema(a,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","generated_columns":[{"column":"g","expression":{"op":"coalesce","args":[{"op":"column","column":"b"},{"op":"literal","type":"blob","value":"eA=="}]}}],"checks":[{"name":"same","expression":{"op":"eq","args":[{"op":"coalesce","args":[{"op":"column","column":"b"},{"op":"literal","type":"blob","value":"eA=="}]},{"op":"column","column":"g"}]}}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"b":{"type":"blob","nullable":true},"g":{"type":"blob"}},"additionalProperties":false}}}}
+    );
+    defer parsed.deinit(a);
+    var compiled = try impl.CompiledValidationPlan.init(a, parsed);
+    defer compiled.deinit(a);
+    const set = compiled.expressions.?;
+    var layout = try codec.PhysicalLayout.init(a, set.table);
+    defer layout.deinit();
+    for ([_][]const u8{ "{\"b\":\"AAEC/w==\"}", "{\"b\":null}", "{}" }) |input| {
+        var document = try std.json.parseFromSlice(std.json.Value, a, input, .{});
+        defer document.deinit();
+        try set.applyJson(document.arena.allocator(), &document.value);
+        try set.verifyJson(a, document.value);
+        try std.testing.expectEqual(@as(?usize, null), try compiled.checks.?.firstViolationJson(a, document.value));
+        var cells: [2]codec.Cell = undefined;
+        for (set.table.relational_columns, &cells, 0..) |column, *cell, ordinal| {
+            const value = document.value.object.get(column.name) orelse .null;
+            cell.* = .{ .ordinal = @intCast(ordinal), .path = column.name, .value_type = .bytes_val, .is_null = value == .null, .value = .{ .bytes_val = if (value == .null) "" else value.string } };
+        }
+        const physical = try codec.serializeOrdinal(a, set.table.version, set.table.relational_columns, &cells, @splat(0));
+        defer a.free(physical);
+        const row = try codec.ordinalRowView(physical, set.table, &layout);
+        try set.verifyRow(a, row);
+        try std.testing.expectEqual(@as(?usize, null), try compiled.checks.?.firstViolationRow(a, row));
+        const g = layout.ordinalForName(set.table.relational_columns, "g").?;
+        cells[g].value.bytes_val = "eQ==";
+        const forged = try codec.serializeOrdinal(a, set.table.version, set.table.relational_columns, &cells, @splat(0));
+        defer a.free(forged);
+        const forged_row = try codec.ordinalRowView(forged, set.table, &layout);
+        try std.testing.expectError(error.InvalidRelationalGeneratedValue, set.verifyRow(a, forged_row));
+        try std.testing.expectEqual(@as(?usize, 0), try compiled.checks.?.firstViolationRow(a, forged_row));
+    }
 }
 
 test "relational declarations cold generated verification reads dependency cells only and rejects forged output" {
