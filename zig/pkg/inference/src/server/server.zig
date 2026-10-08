@@ -9295,7 +9295,7 @@ pub const Node = struct {
         const io = self.inferenceIo(allocator, null, &owned_io);
 
         var reader_admission = ExtractionReaderAdmission{ .node = self, .allocator = allocator };
-        const extractor_ctx = extractors_mod.Context{
+        var extractor_ctx = extractors_mod.Context{
             .allocator = allocator,
             .io = io,
             .models_dir = self.config.models_dir,
@@ -9314,6 +9314,8 @@ pub const Node = struct {
         var admission_manifest = try manifest_mod.loadFromDir(allocator, extractor.modelPath());
         defer admission_manifest.deinit();
         const extraction_contract = try resolvedInferenceExecutorContract(self, "extract", &admission_manifest);
+        var text_admission = ExtractionTextAdmission{ .contract = extraction_contract, .schema_bytes = request.schema_json.len };
+        extractor_ctx.text_admission = .{ .ptr = &text_admission, .validate = ExtractionTextAdmission.validate };
         config.max_input_tokens_per_item = extraction_contract.batch.max_input_tokens_per_item;
         var image_manifest: ?manifest_mod.ModelManifest = null;
         defer if (image_manifest) |*manifest| manifest.deinit();
@@ -9365,7 +9367,7 @@ pub const Node = struct {
         }
         try validateInferenceExecutorInvocation(executor_contract, .{
             .item_count = request.inputs.len,
-            .text_bytes_per_item = if (composed_reader) 0 else std.math.add(
+            .text_bytes_per_item = std.math.add(
                 usize,
                 maxTextBytes(parsed_inputs.texts.items),
                 if (parsed_inputs.prompt) |prompt| prompt.len else 0,
@@ -23306,6 +23308,21 @@ fn measureDirectGenerateDecodedPixels(
     return decoded_pixels;
 }
 
+const ExtractionTextAdmission = struct {
+    contract: ResolvedInferenceExecutorContract,
+    schema_bytes: usize,
+
+    fn validate(ptr: *anyopaque, texts: []const []const u8) !void {
+        const self: *ExtractionTextAdmission = @ptrCast(@alignCast(ptr));
+        try validateInferenceExecutorInvocation(self.contract, .{
+            .item_count = texts.len,
+            .text_bytes_per_item = maxTextBytes(texts),
+            .schema_bytes = self.schema_bytes,
+            .has_text = true,
+        });
+    }
+};
+
 const ExtractionReaderAdmission = struct {
     node: *Node,
     allocator: std.mem.Allocator,
@@ -23320,6 +23337,7 @@ const ExtractionReaderAdmission = struct {
             return error.InferenceEncodedBytesExceeded;
         try validateInferenceExecutorInvocation(contract, .{
             .item_count = images.len,
+            .text_bytes_per_item = if (options.prompt) |prompt| prompt.len else 0,
             .output_tokens_per_item = options.max_tokens orelse 0,
             .encoded_media_bytes = encoded_bytes,
             .decoded_pixels = try measureExecutorDecodedImages(&manifest, images),
@@ -23810,6 +23828,13 @@ test "task-neutral executor contract enforces every resolved resource dimension"
     try std.testing.expectError(error.InferenceCandidateLimitExceeded, validateInferenceExecutorInvocation(contract, .{ .candidates_per_request = 3 }));
     try std.testing.expectError(error.InferenceSchemaBytesExceeded, validateInferenceExecutorInvocation(contract, .{ .schema_bytes = 17 }));
     try std.testing.expectError(error.UnsupportedInferenceModality, validateInferenceExecutorInvocation(contract, .{ .has_audio = true }));
+    var text_contract = contract;
+    text_contract.accepts_image = false;
+    var ocr_admission = ExtractionTextAdmission{ .contract = text_contract, .schema_bytes = 16 };
+    try ExtractionTextAdmission.validate(&ocr_admission, &.{"12345678"});
+    try std.testing.expectError(error.InferenceTextBytesExceeded, ExtractionTextAdmission.validate(&ocr_admission, &.{"123456789"}));
+    ocr_admission.schema_bytes = 17;
+    try std.testing.expectError(error.InferenceSchemaBytesExceeded, ExtractionTextAdmission.validate(&ocr_admission, &.{"OCR"}));
 }
 
 test "generate executor contract error maps unqualified GLiNER boundary runtime to a dedicated response" {

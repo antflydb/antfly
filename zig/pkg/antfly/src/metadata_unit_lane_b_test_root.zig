@@ -69,9 +69,7 @@ pub const antfly_sources = @import("source_owner_physical.zig");
 /// Server fixtures retain this compilation root's source and type identity.
 pub const local_test_sources = if (@import("builtin").is_test) @import("local_test_sources.zig") else struct {};
 
-// Keep the action contract in this lane even when compile filters prune the
-// leaf module's otherwise unreferenced tests.
-test "transition actions module compiles" {
+comptime {
     _ = transition_actions.TransitionAction;
     _ = transition_actions.TransitionDecision;
 }

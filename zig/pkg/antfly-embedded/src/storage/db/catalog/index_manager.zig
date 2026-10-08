@@ -35139,21 +35139,24 @@ const IndexManagerSimRuntime = struct {
     backend_options: db_config.IndexBackendOptions,
     split_active: bool,
 
-    fn init(alloc: Allocator, source_path: [*:0]const u8, dest_path: [*:0]const u8) !IndexManagerSimRuntime {
-        return try initWithOptions(alloc, source_path, dest_path, .{
+    fn init(self: *IndexManagerSimRuntime, alloc: Allocator, source_path: [*:0]const u8, dest_path: [*:0]const u8) !void {
+        try self.initWithOptions(alloc, source_path, dest_path, .{
             .text_main_backend = .lsm,
             .dense_storage_backend = .lsm,
             .graph_reverse_backend = .lsm,
         });
     }
 
+    // Catalog loading binds primary-store handles to these fields. Initialize
+    // in the caller’s final storage so those borrowed addresses never move.
     fn initWithOptions(
+        runtime: *IndexManagerSimRuntime,
         alloc: Allocator,
         source_path: [*:0]const u8,
         dest_path: [*:0]const u8,
         backend_options: db_config.IndexBackendOptions,
-    ) !IndexManagerSimRuntime {
-        var runtime = IndexManagerSimRuntime{
+    ) !void {
+        runtime.* = .{
             .alloc = alloc,
             .source_path = source_path,
             .dest_path = dest_path,
@@ -35197,7 +35200,6 @@ const IndexManagerSimRuntime = struct {
             try runtime.dest_manager.addAllNoBackfill(&runtime.dest_store, &.{indexManagerSimTextConfig()});
         }
         runtime.updateRanges();
-        return runtime;
     }
 
     pub fn deinit(self: *IndexManagerSimRuntime) void {
@@ -35405,7 +35407,7 @@ pub const VoprHarness = struct {
             .graph_reverse_backend = .lsm,
             .graph_lsm_storage = self.modeled_device.storage(),
         };
-        self.runtime = try IndexManagerSimRuntime.initWithOptions(alloc, self.source_path, self.dest_path, self.backend_options);
+        try self.runtime.initWithOptions(alloc, self.source_path, self.dest_path, self.backend_options);
         self.actions = .empty;
         self.recovered = false;
         return self;
@@ -35660,7 +35662,8 @@ fn replayIndexManagerActionsAtPathsWithOptions(
     backend_options: db_config.IndexBackendOptions,
     actions: []const IndexManagerSimAction,
 ) !IndexManagerSimSummary {
-    var runtime = try IndexManagerSimRuntime.initWithOptions(alloc, source_path, dest_path, backend_options);
+    var runtime: IndexManagerSimRuntime = undefined;
+    try runtime.initWithOptions(alloc, source_path, dest_path, backend_options);
     defer runtime.deinit();
 
     for (actions, 0..) |action, step| {
@@ -35998,7 +36001,8 @@ fn replayModeledIndexManagerCrashFixture(
     crash_action: IndexManagerSimAction,
     modeled_device: *storage_sim.ModeledDevice,
 ) !IndexManagerSimCrashOutcome {
-    var runtime = try IndexManagerSimRuntime.initWithOptions(alloc, source_path, dest_path, backend_options);
+    var runtime: IndexManagerSimRuntime = undefined;
+    try runtime.initWithOptions(alloc, source_path, dest_path, backend_options);
     defer runtime.deinit();
 
     for (prelude_actions, 0..) |action, step| {
@@ -36139,7 +36143,8 @@ test "index manager split handoff preserves interleaved write and query summarie
         .graph_lsm_storage = modeled_device.storage(),
     };
 
-    var runtime = try IndexManagerSimRuntime.initWithOptions(alloc, source_path, dest_path, backend_options);
+    var runtime: IndexManagerSimRuntime = undefined;
+    try runtime.initWithOptions(alloc, source_path, dest_path, backend_options);
     defer runtime.deinit();
     for (actions, 0..) |action, step| {
         try runtime.applyReplayAction(action, step);

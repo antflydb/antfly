@@ -306,6 +306,13 @@ pub const rules: []const @import("unit_test_ownership.zig").Rule = &.{
         .selection = "all",
         .skip = &.{
             "common.cancellation.test.",
+            "storage.",
+            "common.bounded_worker_lane.",
+            "common.maintenance_scheduler.",
+            "common.test_directory.",
+            "common.threaded_connect_io.",
+            "sql.parallel_scheduler.",
+            "compiled CHECK",
         },
     },
     .{
@@ -313,6 +320,9 @@ pub const rules: []const @import("unit_test_ownership.zig").Rule = &.{
         .artifact = "test",
         .selection = "lake",
         .skip = &.{
+            "common.config.",
+            "index.",
+            "introducer.",
             // Sidecar terminology does not make engine or segment contracts Lake-owned.
             "segment.test.",
             "sparse.sparse.test.",

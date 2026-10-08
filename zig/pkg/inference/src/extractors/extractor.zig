@@ -87,6 +87,10 @@ pub const Context = struct {
         ptr: *anyopaque,
         validate: *const fn (*anyopaque, []const u8, []const []const u8, readers_mod.ReadOptions) anyerror!void,
     } = null,
+    text_admission: ?struct {
+        ptr: *anyopaque,
+        validate: *const fn (*anyopaque, []const []const u8) anyerror!void,
+    } = null,
     gliner_pipeline_factory: ?struct {
         ptr: *anyopaque,
         create: *const fn (*anyopaque, std.mem.Allocator, *model_manager_mod.LoadedModel) @import("../pipelines/gliner.zig").GlinerPipeline,
@@ -462,6 +466,8 @@ const GlinerExtractor = struct {
         config: extraction_mod.ExtractionConfig,
         texts: []const []const u8,
     ) ![]extraction_mod.ExtractionResult {
+        if (ctx.text_admission) |admission|
+            try admission.validate(admission.ptr, texts);
         var model_handle = if (ctx.execution_control) |control|
             try ctx.model_manager.acquireFromDirWithControl(self.model_path, control)
         else

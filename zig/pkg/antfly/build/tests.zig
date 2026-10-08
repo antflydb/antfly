@@ -1714,7 +1714,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "caller cancellation does not interrupt protected child work",
         "httpx SQL dispatch preserves imported executor authority including unavailable views",
         "SQL pgwire dispatch preserves imported executor authority including unavailable views",
-        "ChatGPT connector policy",
+        "httpx antfly ChatGPT connector policy",
         "storage-kernel query request preserves final projection while raw retrieval defers it",
         "api http server executes direct foreign table aggregations through registry",
         "unconfigured remote catalog authority skips background work without borrowing internal credentials",

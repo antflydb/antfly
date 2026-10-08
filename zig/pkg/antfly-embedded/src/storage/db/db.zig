@@ -41354,23 +41354,12 @@ pub const DB = struct {
             var owned = raw;
             owned.deinit();
         };
-        // Only explicitly ephemeral chunk streams use the embedding row as
-        // their presence authority. Keep the public chunk identity unchanged
-        // so full-text/dense fusion still deduplicates the same member.
+        // The vector’s stored row is its presence authority; public chunk
+        // identity stays unchanged so text/vector fusion merges the same member.
         inline for (.{ self.core.index_manager.denseIndex(req.index_name), self.core.index_manager.sparseIndex(req.index_name) }) |selected| {
             if (selected) |entry| {
-                if (chunk_backed and entry.embedding_names.len == 0) {
-                    if (entry.chunk_name) |chunk_name| {
-                        if (self.core.index_manager.getEnrichment(.chunk, chunk_name)) |cfg| {
-                            if (cfg.source_artifact_name.len == 0 and !cfg.full_text_index and cfg.chunker_json.len > 0 and
-                                !(try chunking_types_mod.parseHasFullTextIndexFromSlice(alloc, cfg.chunker_json)) and
-                                !(try chunking_types_mod.parseStoreChunksFromSlice(alloc, cfg.chunker_json)))
-                            {
-                                presence.ephemeral_embedding_name = entry.embedding_name orelse entry.config.name;
-                            }
-                        }
-                    }
-                }
+                if (chunk_backed and entry.embedding_names.len == 0 and entry.chunk_name != null)
+                    presence.embedding_presence_name = entry.embedding_name orelse entry.config.name;
             }
         }
         preparing = false;
@@ -45906,7 +45895,7 @@ fn loadDocumentTimestampsMany(self: *DB, alloc: Allocator, keys: []const []const
     return timestamps;
 }
 
-fn filterPresentSearchHitsMany(self: *DB, alloc: Allocator, hits: []const types.SearchHit, ephemeral_embedding_name: ?[]const u8) ![]bool {
+fn filterPresentSearchHitsMany(self: *DB, alloc: Allocator, hits: []const types.SearchHit, embedding_presence_name: ?[]const u8) ![]bool {
     const keep = try alloc.alloc(bool, hits.len);
     errdefer alloc.free(keep);
     @memset(keep, true);
@@ -45923,8 +45912,8 @@ fn filterPresentSearchHitsMany(self: *DB, alloc: Allocator, hits: []const types.
         // Named vector members resolve their public hit id to the source
         // document/chunk, which may be shared by several embeddings. The
         // artifact reference retains the member's authoritative stored key.
-        const key = if (ephemeral_embedding_name != null and internal_keys.isChunkArtifactRecordKey(hit.id))
-            try internal_keys.derivedEmbeddingArtifactKeyAlloc(scratch, hit.id, ephemeral_embedding_name.?)
+        const key = if (embedding_presence_name != null and internal_keys.isChunkArtifactRecordKey(hit.id))
+            try internal_keys.derivedEmbeddingArtifactKeyAlloc(scratch, hit.id, embedding_presence_name.?)
         else if (hit.artifact_ref) |artifact_ref|
             try artifact_ids.internalKeyForArtifactRefAlloc(scratch, artifact_ref)
         else
@@ -46073,7 +46062,7 @@ fn filterStoredSearchCandidatesManyCallback(
 
 const VectorSearchPresenceContext = struct {
     db: *DB,
-    ephemeral_embedding_name: ?[]const u8 = null,
+    embedding_presence_name: ?[]const u8 = null,
 };
 
 fn filterVectorSearchCandidatesManyCallback(
@@ -46082,7 +46071,7 @@ fn filterVectorSearchCandidatesManyCallback(
     hits: []const types.SearchHit,
 ) anyerror![]bool {
     const presence: *const VectorSearchPresenceContext = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-    const present = try filterPresentSearchHitsMany(presence.db, alloc, hits, presence.ephemeral_embedding_name);
+    const present = try filterPresentSearchHitsMany(presence.db, alloc, hits, presence.embedding_presence_name);
     errdefer alloc.free(present);
     if (ttlDurationNs(presence.db) == 0) return present;
     const visible = try filterVisibleSearchHitsMany(presence.db, alloc, hits);

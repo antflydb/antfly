@@ -49395,11 +49395,15 @@ fn implementationTests() type {
             // configuration. Structural reconciliation must update this owner in
             // place; replacing the writer merely hides the lifecycle bug.
             _ = try source.source().batch(alloc, "docs", .{
-                .writes = &.{.{ .key = "seed", .value = "{\"title\":\"no managed field\"}" }},
+                .writes = &.{.{ .key = "seed", .value = "{\"body\":\"seed body\"}" }},
                 .sync_level = .write,
             });
             try std.testing.expect(write_cache.entries.items[0].db.enrichment_runtime == null);
             const resident_db = &write_cache.entries.items[0].db;
+            var repair_clock = @import("antfly_platform").clock.ManualClock{};
+            repair_clock.setRealtimeNs(backend_runtime.ptr().clock().nowRealtimeNs());
+            resident_db.index_repair_clock = repair_clock.clock();
+            defer resident_db.index_repair_clock = null;
 
             const AdmissionBoundary = struct {
                 var observations: usize = 0;
@@ -49446,6 +49450,12 @@ fn implementationTests() type {
                     ProvisionedTableWriteSource.StructuralReconcileGroupOutcome.busy,
                     reconcile_outcome,
                 );
+                // Honor the repair owner's audit wake instead of spinning
+                // before its deadline or sleeping in wall-clock time.
+                const repair = try resident_db.indexRepairIntentSummary(alloc);
+                if (repair.earliest_retry_at_ms > repair_clock.clock().nowRealtimeMs()) {
+                    repair_clock.setRealtimeNs(repair.earliest_retry_at_ms *| std.time.ns_per_ms);
+                }
             }
             try std.testing.expectEqual(
                 ProvisionedTableWriteSource.StructuralReconcileGroupOutcome.complete,
@@ -49456,17 +49466,18 @@ fn implementationTests() type {
             try std.testing.expect(resident_db == &write_cache.entries.items[0].db);
             try std.testing.expect(write_cache.entries.items[0].db.enrichment_runtime != null);
 
+            const requests_before_write = FakeEmbeddingProvider.request_count.load(.monotonic);
             _ = try source.source().batch(alloc, "docs", .{
                 .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"alpha body\"}" }},
                 .sync_level = .write,
             });
 
             var attempts: usize = 0;
-            while (attempts < 100 and FakeEmbeddingProvider.request_count.load(.monotonic) == 0) : (attempts += 1) {
+            while (attempts < 100 and FakeEmbeddingProvider.request_count.load(.monotonic) <= requests_before_write) : (attempts += 1) {
                 sleepNs(50 * std.time.ns_per_ms);
             }
 
-            try std.testing.expect(FakeEmbeddingProvider.request_count.load(.monotonic) > 0);
+            try std.testing.expect(FakeEmbeddingProvider.request_count.load(.monotonic) > requests_before_write);
         }
 
         test "provisioned managed replay tails converge and publish without later traffic" {
@@ -54338,7 +54349,9 @@ fn implementationTests() type {
                 .sync_level = .write,
             });
             try cached.db.runDerivedUntil(cached.db.core.nextDerivedSequence());
-            try std.testing.expect(source.publishManagedRuntimeStatusBestEffort("docs", 7001, cached.db));
+            // Establish the baseline under an owned observation; the contract
+            // below concerns target overlays, not opportunistic admission.
+            try publishRuntimeStatusSnapshotConsistent(&source, alloc, "docs", 7001, cached.db);
 
             _ = try cached.db.batch(.{
                 .writes = &.{.{ .key = "doc:b", .value = "{\"title\":\"beta\",\"embedding\":[2,3]}" }},
