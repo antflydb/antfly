@@ -80,6 +80,7 @@ pub fn describe(err: anyerror) Diagnostic {
         error.SqlWrongAggregateKind => .{ .code = "42809", .message = "The aggregate requires a different WITHIN GROUP form.", .hint = "Use WITHIN GROUP for ordered-set aggregates, not ordinary aggregates.", .retryable = false },
         error.UndefinedSqlFunction => .{ .code = "42883", .message = "No function matches the supplied name and argument types.", .hint = "Check the function signature and use explicit casts for compatible argument types.", .retryable = false },
         error.SqlDivisionByZero => .{ .code = "22012", .message = "A numeric expression divides by zero.", .retryable = false },
+        error.SqlInvalidPowerArgument => .{ .code = "2201F", .message = "The numeric function argument is outside its real-valued domain.", .retryable = false },
         error.UnknownSqlParameterType => .{ .code = "42P18", .message = "A parameter type cannot be inferred.", .hint = "Add an explicit cast or provide a parameter type." },
         error.UnknownSqlArrayType => .{ .code = "42P18", .message = "The array element type cannot be inferred.", .hint = "Provide an explicit array element type." },
         error.SqlCannotCoerce => .{ .code = "42846", .message = "The source type cannot be cast to the requested type.", .hint = "Use compatible builtin types or an explicit intermediate conversion." },

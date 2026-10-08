@@ -940,6 +940,81 @@ pub fn divideTruncated(ctx: *Context, left: Value, right: Value) !Owned {
     return divideMode(ctx, left, right, true);
 }
 
+/// Exact square root using integer Newton iteration. Compute one extra decimal
+/// digit before rounding, so truncating the shifted radicand cannot change the
+/// rounding decision. Exponent zeroes stay virtual. Two alternating root buffers
+/// and an iteration arena bound retained scratch independently of iteration count.
+pub fn squareRoot(ctx: *Context, input: Value) !Owned {
+    try ctx.charge(1);
+    if (input.kind == .negative_infinity or input.negative) return error.SqlInvalidPowerArgument;
+    if (input.kind != .finite) return special(ctx.alloc, input.kind);
+    const scale: u16 = @intCast(std.math.clamp(@max(15 - input.weight * 2, input.scale), 0, 1000));
+    if (input.isZero()) return zero(ctx.alloc, scale);
+    const fractional: i32 = @divTrunc(@as(i32, scale) + 4, 4);
+    var radicand = input;
+    radicand.weight += fractional * 2;
+    radicand.scale = 0;
+    if (radicand.weight < 0) return zero(ctx.alloc, scale);
+    radicand.digits = radicand.digits[0..@min(radicand.digits.len, @as(usize, @intCast(radicand.weight)) + 1)];
+    while (radicand.digits.len != 0 and radicand.digits[radicand.digits.len - 1] == 0)
+        radicand.digits = radicand.digits[0 .. radicand.digits.len - 1];
+
+    const weight = @divFloor(radicand.weight, 2);
+    // An integer upper bound from at most two leading groups needs no float
+    // seed, even for values outside the IEEE exponent range.
+    const prefix: u32 = if (@mod(radicand.weight, 2) == 0) radicand.digits[0] else @as(u32, radicand.digits[0]) * base + radicand.group(radicand.weight - 1);
+    var low: u32 = 1;
+    var high: u32 = base;
+    while (low < high) {
+        try ctx.charge(1);
+        const mid = (low + high) / 2;
+        if (mid * mid > prefix) high = mid else low = mid + 1;
+    }
+    if ((low - 1) * (low - 1) == prefix and input.digits.len <= 1 + @as(usize, @intCast(@mod(input.weight, 2)))) {
+        // Exact compact squares stay compact even at the exponent boundary;
+        // do not allocate thousands of virtual zero groups for a one-limb root.
+        const digit = [_]u16{@intCast(low - 1)};
+        const result_weight = weight - fractional;
+        return quantize(ctx, .{ .digits = &digit, .weight = result_weight, .scale = @intCast(@max(0, -result_weight * 4)) }, scale, .half_away);
+    }
+    var current = try ctx.allocate(@intCast(weight + 2));
+    defer ctx.alloc.free(current);
+    var next = try ctx.allocate(current.len);
+    defer ctx.alloc.free(next);
+    current[0] = if (low == base) 1 else @intCast(low);
+    var root: Value = .{ .digits = current[0..1], .weight = weight + @as(i32, @intFromBool(low == base)) };
+    var scratch = std.heap.ArenaAllocator.init(ctx.alloc);
+    defer scratch.deinit();
+    const two: Value = .{ .digits = &.{2} };
+    while (true) {
+        try ctx.charge(1);
+        var iteration = ctx.*;
+        iteration.alloc = scratch.allocator();
+        const before = iteration.remaining;
+        const candidate = step: {
+            defer {
+                ctx.remaining -= before - iteration.remaining;
+                ctx.since_poll = iteration.since_poll;
+                ctx.failure = iteration.failure;
+            }
+            const quotient = try divideTruncated(&iteration, radicand, root);
+            const sum = try add(&iteration, root, quotient.value);
+            break :step try divideTruncated(&iteration, sum.value, two);
+        };
+        if (try order(ctx, candidate.value, root) != .lt) break;
+        if (candidate.value.digits.len > next.len) return ctx.limit();
+        try ctx.charge(candidate.value.digits.len);
+        @memcpy(next[0..candidate.value.digits.len], candidate.value.digits);
+        root = candidate.value;
+        root.digits = next[0..candidate.value.digits.len];
+        std.mem.swap([]u16, &current, &next);
+        _ = scratch.reset(.retain_capacity);
+    }
+    root.weight -= fractional;
+    root.scale = @intCast(fractional * 4);
+    return quantize(ctx, root, scale, .half_away);
+}
+
 fn divideMode(ctx: *Context, left: Value, right: Value, integer: bool) !Owned {
     try ctx.charge(1);
     if (left.kind == .nan or right.kind == .nan) return special(ctx.alloc, .nan);
@@ -980,7 +1055,7 @@ pub fn remainder(ctx: *Context, left: Value, right: Value) !Owned {
 }
 
 const OracleCase = struct {
-    op: enum { parse, add, subtract, multiply, order, round, truncate, typmod, int16, int32, int64, divide, divide_trunc, remainder },
+    op: enum { parse, add, subtract, multiply, order, round, truncate, typmod, int16, int32, int64, divide, divide_trunc, remainder, sqrt },
     left: []const u8,
     right: ?[]const u8 = null,
     precision: u16 = 0,
@@ -1016,6 +1091,7 @@ fn oracleText(ctx: *Context, entry: OracleCase) ![]u8 {
         .divide => try divide(ctx, left.value, right.value),
         .divide_trunc => try divideTruncated(ctx, left.value, right.value),
         .remainder => try remainder(ctx, left.value, right.value),
+        .sqrt => try squareRoot(ctx, left.value),
         .round => try quantize(ctx, left.value, entry.scale, .half_away),
         .truncate => try quantize(ctx, left.value, entry.scale, .truncate),
         .typmod => try applyTypeModifier(ctx, left.value, .{ .precision = entry.precision, .scale = @intCast(entry.scale) }),
@@ -1030,11 +1106,11 @@ test "SQL exact NUMERIC kernel matches independent PostgreSQL oracle" {
     const fixture = try std.json.parseFromSlice(struct { reference: []const u8, entries: []const OracleCase }, a, @embedFile("fixtures/sql_exact_numeric_reference.json"), .{});
     defer fixture.deinit();
     try std.testing.expectEqualStrings("PostgreSQL exact NUMERIC kernel", fixture.value.reference);
-    try std.testing.expectEqual(@as(usize, 799), fixture.value.entries.len);
+    try std.testing.expectEqual(@as(usize, 893), fixture.value.entries.len);
     for (fixture.value.entries) |entry| {
         var ctx: Context = .{ .alloc = a };
         if (entry.@"error") |state| {
-            const expected: anyerror = if (std.mem.eql(u8, state, "22P02")) error.SqlInvalidTextRepresentation else if (std.mem.eql(u8, state, "22003")) error.InvalidSqlNumber else if (std.mem.eql(u8, state, "22023")) error.SqlInvalidParameterValue else if (std.mem.eql(u8, state, "0A000")) error.SqlFeatureNotSupported else if (std.mem.eql(u8, state, "22012")) error.SqlDivisionByZero else return error.UnexpectedNumericOracleError;
+            const expected: anyerror = if (std.mem.eql(u8, state, "22P02")) error.SqlInvalidTextRepresentation else if (std.mem.eql(u8, state, "22003")) error.InvalidSqlNumber else if (std.mem.eql(u8, state, "22023")) error.SqlInvalidParameterValue else if (std.mem.eql(u8, state, "0A000")) error.SqlFeatureNotSupported else if (std.mem.eql(u8, state, "22012")) error.SqlDivisionByZero else if (std.mem.eql(u8, state, "2201F")) error.SqlInvalidPowerArgument else return error.UnexpectedNumericOracleError;
             try std.testing.expectError(expected, oracleText(&ctx, entry));
             continue;
         }
@@ -1171,6 +1247,8 @@ test "SQL exact NUMERIC ownership unwinds every allocation failure" {
             defer sum.deinit();
             var difference = try subtract(&ctx, left.value, right.value);
             defer difference.deinit();
+            var root = try squareRoot(&ctx, right.value);
+            defer root.deinit();
             var quotient = try divide(&ctx, left.value, right.value);
             defer quotient.deinit();
             var integral = try divideTruncated(&ctx, left.value, right.value);
@@ -1220,6 +1298,8 @@ test "SQL exact NUMERIC quota and cancellation failures are sticky and retry saf
             defer left.deinit();
             var product = try multiply(ctx, left.value, left.value);
             defer product.deinit();
+            var root = try squareRoot(ctx, product.value);
+            defer root.deinit();
             var rounded = try quantize(ctx, product.value, -16, .half_away);
             defer rounded.deinit();
             const text = try format(ctx, rounded.value);
@@ -1274,6 +1354,71 @@ test "SQL exact NUMERIC admission limits remain sticky across all operations" {
     try std.testing.expectError(error.SqlProgramLimitExceeded, order(&ctx, .{}, .{}));
     try std.testing.expectError(error.SqlProgramLimitExceeded, divide(&ctx, .{}, .{}));
     try std.testing.expectError(error.SqlProgramLimitExceeded, remainder(&ctx, .{}, .{}));
+    try std.testing.expectError(error.SqlProgramLimitExceeded, squareRoot(&ctx, .{}));
+}
+
+test "SQL exact NUMERIC square root bounds iterative scratch and measures precision scaling" {
+    const a = std.testing.allocator;
+    for ([_]usize{ 64, 256, 1024 }) |digits| {
+        for ([_]bool{ false, true }) |irregular| {
+            const text = try a.alloc(u8, digits);
+            defer a.free(text);
+            @memset(text, '9');
+            if (irregular) for (text, 0..) |*digit, i| {
+                digit.* = @intCast('0' + (i * 37 + 17) % 10);
+            };
+            var ctx: Context = .{ .alloc = a };
+            var input = try parse(&ctx, text);
+            defer input.deinit();
+            var tracked = std.testing.FailingAllocator.init(a, .{});
+            ctx = .{ .alloc = tracked.allocator() };
+            const started = std.Io.Clock.awake.now(std.testing.io).nanoseconds;
+            var result = try squareRoot(&ctx, input.value);
+            defer result.deinit();
+            const elapsed = std.Io.Clock.awake.now(std.testing.io).nanoseconds - started;
+            const allocations = tracked.alloc_index;
+            const work = 8 * 1024 * 1024 - ctx.remaining;
+            // Only the returned coefficient survives; all root and iteration
+            // buffers must already have been released, including on convergence.
+            try std.testing.expectEqual(result.allocation.len * 2, tracked.allocated_bytes - tracked.freed_bytes);
+            var proof: Context = .{ .alloc = a };
+            const one: Value = .{ .digits = &.{1} };
+            const two: Value = .{ .digits = &.{2} };
+            const four: Value = .{ .digits = &.{4} };
+            var doubled = try multiply(&proof, result.value, two);
+            defer doubled.deinit();
+            var lower = try subtract(&proof, doubled.value, one);
+            defer lower.deinit();
+            var upper = try add(&proof, doubled.value, one);
+            defer upper.deinit();
+            var lower_square = try multiply(&proof, lower.value, lower.value);
+            defer lower_square.deinit();
+            var upper_square = try multiply(&proof, upper.value, upper.value);
+            defer upper_square.deinit();
+            var target = try multiply(&proof, input.value, four);
+            defer target.deinit();
+            // Independent exact bracketing proves nearest-integer rounding for
+            // these scale-zero roots; it does not reuse the square-root routine.
+            try std.testing.expect(try order(&proof, target.value, lower_square.value) != .lt);
+            try std.testing.expectEqual(std.math.Order.lt, try order(&proof, target.value, upper_square.value));
+            if (!irregular) {
+                const actual = try format(&proof, result.value);
+                defer a.free(actual);
+                @memset(text, '0');
+                text[0] = '1';
+                try std.testing.expectEqualStrings(text[0 .. digits / 2 + 1], actual);
+            }
+            std.debug.print("NUMERIC sqrt: irregular={} decimal_digits={d} allocations={d} work={d} elapsed_ns={d}\n", .{ irregular, digits, allocations, work, elapsed });
+        }
+    }
+    var ctx: Context = .{ .alloc = a, .max_groups = 1 };
+    try std.testing.expectError(error.SqlProgramLimitExceeded, squareRoot(&ctx, .{ .digits = &.{2} }));
+    try std.testing.expectError(error.SqlProgramLimitExceeded, ctx.charge(0));
+    ctx = .{ .alloc = a, .remaining = 32, .max_groups = 1 };
+    var compact = try squareRoot(&ctx, .{ .digits = &.{1}, .weight = 32766 });
+    defer compact.deinit();
+    try std.testing.expectEqual(@as(i32, 16383), compact.value.weight);
+    try std.testing.expectEqualSlices(u16, &.{1}, compact.value.digits);
 }
 
 test "SQL exact NUMERIC division corrects quotient estimates and addback exactly" {

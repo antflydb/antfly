@@ -1685,6 +1685,12 @@ test "SQL NUMERIC literals preserve PostgreSQL inference precision scale and mix
         .{ .sql = "SELECT trunc(9007199254740993), ceil(1), floor(1::real), sign(-1)", .values = &.{ "9007199254740992", "1", "1", "-1" }, .numeric = false },
         .{ .sql = "SELECT round(2.5::double precision), round(3.5::double precision), round(-2.5::double precision), round(-3.5::double precision)", .values = &.{ "2", "4", "-2", "-4" }, .numeric = false },
         .{ .sql = "SELECT round(2.5), round(3.5), round(-2.5), round(-3.5)", .values = &.{ "3", "4", "-3", "-4" } },
+        .{ .sql = "SELECT sqrt(2.0), sqrt(9007199254740993::numeric), sqrt(0.00), sqrt(1.2345678901234567890123456789)", .values = &.{ "1.414213562373095", "94906265.624251558", "0.000000000000000", "1.1111111061111110993611110582" } },
+        .{ .sql = "SELECT sqrt('Infinity'::numeric), sqrt('NaN'::numeric)", .values = &.{ "Infinity", "NaN" } },
+        .{ .sql = "SELECT sqrt(NULL::numeric)", .values = &.{"null"} },
+        .{ .sql = "SELECT sqrt(NULL)", .values = &.{"null"}, .numeric = false },
+        .{ .sql = "SELECT sqrt(4), sqrt(4::real), sqrt('4')", .values = &.{ "2", "2", "2" }, .numeric = false },
+        .{ .sql = "SELECT CASE WHEN false THEN sqrt(-1.0) ELSE 2.0 END, CASE WHEN true THEN 2.0 ELSE sqrt(-1.0) END, COALESCE(2.0, sqrt(-1.0))", .values = &.{ "2.0", "2.0", "2.0" } },
     };
     for (cases) |case| {
         var fixture: TestBackend = .{ .row_count = 0 };

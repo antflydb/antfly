@@ -200,6 +200,24 @@ def cases():
         for op in ("divide", "divide_trunc", "remainder"):
             result.append({"op": op, "left": left, "right": right})
     result.append({"op": "remainder", "left": "1e131071", "right": "12345"})
+    roots = [
+        "0", "0.00", "1", "2", "4", "9", "10000", "1e-20",
+        "1.2345678901234567890123456789", "9007199254740993",
+        "99999999999999999999999999999999999999",
+        "NaN", "Infinity", "-Infinity", "-1", "-0.0000",
+        "0.00000000000000000000000000000000000001", "1e-16383",
+        "9999", "10001", "99999999", "100000001",
+        "2.25", "0.0025", "123456789.123456789",
+        "1.00000000000000100000000000000025",
+        "1.00000000000000099999999999999999",
+        "1.00000000000000100000000000000026", "1e1000", "1e-1000",
+    ]
+    root_rng = random.Random(20261011)
+    roots.extend(
+        f"{root_rng.randrange(1, 10**200)}e-{root_rng.randrange(801)}"
+        for _ in range(64)
+    )
+    result.extend({"op": "sqrt", "left": text} for text in roots)
     return result
 
 
@@ -207,6 +225,8 @@ def evaluate(db, case):
     op = case["op"]
     if op == "parse":
         sql, args = "SELECT (%s::numeric)::text", (case["left"],)
+    elif op == "sqrt":
+        sql, args = "SELECT sqrt(%s::numeric)::text", (case["left"],)
     elif op in {"add", "subtract", "multiply"}:
         symbol = {"add": "+", "subtract": "-", "multiply": "*"}[op]
         sql = f"SELECT (%s::numeric {symbol} %s::numeric)::text"
@@ -304,7 +324,9 @@ def main():
                 entry["error"] = error.sqlstate
             output["entries"].append(entry)
     if args.generate:
-        print(json.dumps(output, indent=2))
+        print('{\n  "reference": "PostgreSQL exact NUMERIC kernel",\n  "entries": [')
+        print(",\n".join("    " + json.dumps(entry, separators=(",", ":")) for entry in output["entries"]))
+        print("  ]\n}")
     else:
         if output != json.loads(FIXTURE.read_text()):
             raise ValueError("PostgreSQL NUMERIC kernel oracle drift")

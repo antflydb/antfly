@@ -5091,3 +5091,54 @@ passes on the final source, with 573 local SQL tests (three existing skips),
 The 84-test pgwire gate requires permission to bind disposable loopback listeners;
 the restricted sandbox otherwise produces EPERM failures in three listener tests.
 OpenAPI, formatting, whitespace and original-inventory integrity checks pass.
+
+### Exact square roots and shared scalar cancellation
+
+NUMERIC sqrt now uses an exact integer Newton kernel, not double precision.
+The selected PostgreSQL display scale is clamped to 0..1000 with at least
+sixteen significant digits and no less than the input scale before clamping.
+An extra computed decimal digit proves final half-away rounding. Integer/real
+inputs still select the double-precision overload; unknown strings use that
+preferred overload, while typed text, boolean and arrays report 42883.
+Negative inputs report 2201F, including negative infinity. NUMERIC NaN,
+positive infinity, SQL NULL and display scales retain PostgreSQL semantics.
+
+Exponent zeroes remain virtual. Iterations alternate two root buffers and
+reset a reusable scratch arena; no per-iteration scratch survives the call.
+Compact exact squares retain one coefficient group even near the maximum
+exponent. Valid constant roots are statement-owned and need no per-row
+allocation. Domain failures are not eagerly adopted into that cache: lazy
+CASE/COALESCE branches remain lazy, as verified with PostgreSQL.
+
+The scalar evaluator now shares the backend request cancellation/deadline
+callback with ordinary expression execution and all exact numeric contexts,
+not just regex operations. Work and output bounds remain independent, and
+kernel cancellation preserves its sticky failure and clean retry contract.
+
+The independent PostgreSQL oracle now contains 893 contracts, adding 94
+square-root cases without replacing the original 799. Tests cover rounding
+boundaries, exponent extremes, randomized 200-digit inputs, allocation-fault
+unwinding, every observed cancellation checkpoint, output/work rejection,
+clean retry and exact integer bracketing independent of the root algorithm.
+Local Debug measurements cover both all-nines and irregular inputs at 64,
+256 and 1024 decimal digits. The irregular 1024-digit fixture used roughly
+149,000 work units; it is not claimed to fit the default 65,536-step scalar
+budget. These microbenchmarks are not production latency comparisons.
+The focused ReleaseFast run passes both root tests. Its single-shot 1024-digit
+irregular sample took about 274 microseconds with six backing allocations;
+the all-nines sample took about 71 microseconds with four. Allocation counts
+can vary with arena growth and allocator layout. Neither sample establishes
+an end-to-end query speedup or a stable latency bound.
+
+Native scalar catalog/row/index/expression-VM activation, typmods, exact power,
+broader numeric functions, assignment/coercion coverage and mixed-domain join
+keys remain unfinished. No original inventory disposition is changed here.
+
+Final-source validation passes `zig build sql-test pgwire-test check-openapi
+lake-integration-test`: 575 local SQL tests (three existing skips), 226 server
+SQL tests and 161 lake integration tests, with no failures or leaks. The
+pgwire and OpenAPI gates pass as well. The independent PostgreSQL generator
+verifies all 893 oracle contracts; formatting, whitespace and original-case
+integrity checks pass. The inventory remains 448 implemented, 136 rejected,
+73 superseded and 929 unresolved; the family audit identifies DDL (340 open
+contracts) as the largest remaining original-case family.

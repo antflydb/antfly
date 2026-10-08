@@ -117,6 +117,10 @@ pub const EvalLimits = struct {
     pattern_steps: usize = 8 * 1024 * 1024,
     depth: usize = 64,
     output_bytes: usize = 1024 * 1024,
+    /// Request cancellation/deadline control shared by ordinary expressions
+    /// and bounded exact arithmetic, independently of regex-session control.
+    checkpoint: ?*const fn (?*anyopaque) anyerror!void = null,
+    checkpoint_context: ?*anyopaque = null,
     decision_values: ?[]const ?Datum = null,
     decision_demand: ?*?DecisionDemand = null,
     regex_session: ?*regex_functions.Session = null,
@@ -182,7 +186,7 @@ pub const Program = struct {
             .unary => |unary| self.literalInstruction(unary.operand),
             .call => |call| blk: {
                 switch (call.function) {
-                    .@"$array", .string_to_array, .abs, .ceil, .floor, .round, .trunc, .sign, .mod => {},
+                    .@"$array", .string_to_array, .abs, .ceil, .floor, .round, .trunc, .sign, .mod, .sqrt => {},
                     else => break :blk false,
                 }
                 for (call.args) |arg| if (!self.literalInstruction(arg)) break :blk false;
@@ -195,12 +199,21 @@ pub const Program = struct {
     fn prepareConstantArrays(self: *Program, a: Allocator) !void {
         for (self.instructions, 0..) |instruction, index| {
             if (instruction.type.kind == .number and instruction.type.element_type == .numeric and self.literalInstruction(@intCast(index))) {
-                const value = try self.evaluateInstruction(a, @intCast(index), &.{});
+                const value = self.evaluateInstruction(a, @intCast(index), &.{}) catch |err| switch (err) {
+                    // Preparing a pure function is an optimization, not an
+                    // execution demand. Unreachable CASE/COALESCE branches
+                    // must not acquire a square-root domain error here.
+                    error.SqlInvalidPowerArgument => continue,
+                    else => return err,
+                };
                 if (value.numeric) |number| try self.constant_numerics.put(a, @intCast(index), number);
                 continue;
             }
             if (instruction.type.kind != .array or !self.literalInstruction(@intCast(index))) continue;
-            const value = try self.evaluateInstruction(a, @intCast(index), &.{});
+            const value = self.evaluateInstruction(a, @intCast(index), &.{}) catch |err| switch (err) {
+                error.SqlInvalidPowerArgument => continue,
+                else => return err,
+            };
             if (value.array) |array| try self.constant_arrays.put(a, @intCast(index), array);
         }
         for (self.instructions) |instruction| {
@@ -1865,6 +1878,7 @@ const Binder = struct {
                         // lossless array-to-JSON/text conversion, not .value
                         // (which intentionally remains JSON null for arrays).
                         .to_jsonb, .jsonb_build_object, .concat, .concat_ws => return error.UnsupportedSqlShape,
+                        .sqrt => return error.SqlUndefinedFunction,
                         else => return error.SqlTypeMismatch,
                     }
                 };
@@ -1950,11 +1964,16 @@ const Binder = struct {
                     .coalesce, .nullif, .greatest, .least => merged.kind = .string,
                     else => {},
                 };
+                if (function == .sqrt and merged.kind != null and !numeric(merged.kind)) {
+                    const arg = call.args[0];
+                    if (arg.* != .literal or arg.literal != .string) return error.SqlUndefinedFunction;
+                    merged = .{ .kind = .number, .element_type = .float64 };
+                }
                 if (function == .abs or function == .ceil or function == .floor or function == .round or function == .trunc or function == .sign or function == .sqrt or function == .power or function == .mod) {
                     if (merged.kind != null and !numeric(merged.kind)) return error.SqlTypeMismatch;
                 }
                 switch (function) {
-                    .ceil, .floor, .round, .trunc, .sign => if (merged.element_type != .numeric) {
+                    .ceil, .floor, .round, .trunc, .sign, .sqrt => if (merged.element_type != .numeric) {
                         // PostgreSQL has NUMERIC and double-precision overloads,
                         // not integer or real overloads, for these functions.
                         merged.kind = .number;
@@ -1963,7 +1982,8 @@ const Binder = struct {
                     else => {},
                 }
                 break :blk .{ .element_type = switch (function) {
-                    .sqrt, .power, .date_part => .float64,
+                    .power, .date_part => .float64,
+                    .sqrt => merged.element_type,
                     .length, .octet_length, .bit_length, .strpos, .ascii => .int32,
                     .starts_with => .boolean,
                     .to_jsonb, .jsonb_build_object => .jsonb,
@@ -2183,7 +2203,7 @@ const Binder = struct {
                     break :blk .{ .call = .{ .function = function, .args = args } };
                 }
                 if (kind.element_type == .float64) switch (function) {
-                    .ceil, .floor, .round, .trunc, .sign => {
+                    .ceil, .floor, .round, .trunc, .sign, .sqrt => {
                         const coercion = try self.alloc.create(ast.Scalar);
                         coercion.* = .{ .cast = .{ .operand = call.args[0], .type = .number, .element_type = .float64 } };
                         args[0] = try self.compileArrayContext(coercion, .number, .float64, depth + 1);
@@ -2400,6 +2420,7 @@ const Evaluator = struct {
 
     fn runDatum(self: *Evaluator, index: u32, depth: usize) anyerror!Datum {
         if (depth >= self.limits.depth or self.steps >= self.limits.steps) return error.SqlProgramLimitExceeded;
+        if (self.steps % 256 == 0) if (self.limits.checkpoint) |poll| try poll(self.limits.checkpoint_context);
         self.steps += 1;
         const instruction = self.program.instructions[index];
         if (self.program.constant_numerics.get(index)) |number| return Datum.typedNumeric(number);
@@ -2884,7 +2905,7 @@ const Evaluator = struct {
                         }
                         break :blk Datum.json(.{ .string = try output.toOwnedSlice(self.alloc) });
                     },
-                    .abs, .ceil, .floor, .round, .trunc, .sign, .mod => break :blk if (instruction.type.element_type == .numeric) try self.numericFunction(call.function, call.args, depth + 1) else Datum.fromJson(try self.invokeFunction(call.function, call.args, self.program.translations.get(index), depth + 1)),
+                    .abs, .ceil, .floor, .round, .trunc, .sign, .mod, .sqrt => break :blk if (instruction.type.element_type == .numeric) try self.numericFunction(call.function, call.args, depth + 1) else Datum.fromJson(try self.invokeFunction(call.function, call.args, self.program.translations.get(index), depth + 1)),
                     else => break :blk Datum.fromJson(try self.invokeFunction(call.function, call.args, self.program.translations.get(index), depth + 1)),
                 }
             },
@@ -3115,10 +3136,21 @@ const Evaluator = struct {
         return Datum.typedArray(value);
     }
 
+    fn numericContext(self: *Evaluator) @import("numeric_value.zig").Context {
+        return .{
+            .alloc = self.alloc,
+            .remaining = self.limits.steps -| self.steps,
+            .max_output_bytes = self.limits.output_bytes -| self.bytes,
+            .max_groups = (self.limits.output_bytes -| self.bytes) / 2,
+            .checkpoint = self.limits.checkpoint,
+            .ptr = self.limits.checkpoint_context,
+        };
+    }
+
     fn numericJson(self: *Evaluator, datum: Datum) !Json {
         const exact = @import("numeric_value.zig");
         const number = datum.numeric orelse return error.SqlTypeMismatch;
-        var context: exact.Context = .{ .alloc = self.alloc, .remaining = self.limits.steps -| self.steps, .max_output_bytes = self.limits.output_bytes -| self.bytes };
+        var context = self.numericContext();
         const before = context.remaining;
         defer self.steps += @intCast(before - context.remaining);
         const text = try exact.format(&context, number.*);
@@ -3155,10 +3187,10 @@ const Evaluator = struct {
         } else 0;
         // Evaluate both arguments before borrowing the remaining work budget.
         // Nested scale expressions must not receive a second copy of it.
-        var ctx: exact.Context = .{ .alloc = self.alloc, .remaining = self.limits.steps -| self.steps, .max_output_bytes = self.limits.output_bytes -| self.bytes };
+        var ctx = self.numericContext();
         const before = ctx.remaining;
         defer self.steps += @intCast(before - ctx.remaining);
-        var result = try exact.quantize(&ctx, value, scale, if (function == .round) .half_away else .truncate);
+        var result = if (function == .sqrt) try exact.squareRoot(&ctx, value) else try exact.quantize(&ctx, value, scale, if (function == .round) .half_away else .truncate);
         errdefer result.deinit();
         if (function == .ceil or function == .floor) {
             const order = try exact.order(&ctx, value, result.value);
@@ -3195,7 +3227,7 @@ const Evaluator = struct {
                 var right_storage: [5]u16 = undefined;
                 const left = if (needle.numeric) |value| value.* else if (needle.value == .integer) exact.integerView(needle.value.integer, &left_storage) else return error.SqlTypeMismatch;
                 const right = if (element.numeric) |value| value.* else if (element.value == .integer) exact.integerView(element.value.integer, &right_storage) else return error.SqlTypeMismatch;
-                var context: exact.Context = .{ .alloc = self.alloc, .remaining = self.limits.steps -| self.steps };
+                var context = self.numericContext();
                 const before = context.remaining;
                 defer self.steps += @intCast(before - context.remaining);
                 break :logical try exact.order(&context, left, right);
@@ -3208,7 +3240,7 @@ const Evaluator = struct {
 
     fn numericArithmetic(self: *Evaluator, operation: ast.Scalar.Binary, left: Datum, right: Datum) !Datum {
         const exact = @import("numeric_value.zig");
-        var context: exact.Context = .{ .alloc = self.alloc, .remaining = self.limits.steps -| self.steps, .max_output_bytes = self.limits.output_bytes -| self.bytes, .max_groups = (self.limits.output_bytes -| self.bytes) / 2 };
+        var context = self.numericContext();
         const before = context.remaining;
         defer self.steps += @intCast(before - context.remaining);
         var result = switch (operation) {
@@ -3230,7 +3262,7 @@ const Evaluator = struct {
         if (datum.sql_null) return .{};
         if (datum.numeric != null and target == .numeric) return datum;
         const exact = @import("numeric_value.zig");
-        var ctx: exact.Context = .{ .alloc = self.alloc, .remaining = self.limits.steps -| self.steps, .max_output_bytes = self.limits.output_bytes -| self.bytes, .max_groups = (self.limits.output_bytes -| self.bytes) / 2 };
+        var ctx = self.numericContext();
         const before = ctx.remaining;
         defer self.steps += @intCast(before - ctx.remaining);
         if (target == .numeric) {
@@ -3519,8 +3551,9 @@ const Evaluator = struct {
                 else => error.SqlTypeMismatch,
             },
             .sqrt => {
-                const v = try asFloat(first);
-                if (v < 0) return error.SqlNumericOutOfRange;
+                const v = if (first == .float) first.float else try asFloat(first);
+                if (v < 0) return error.SqlInvalidPowerArgument;
+                if (std.math.isNan(v) or std.math.isPositiveInf(v)) return .{ .float = v };
                 return finite(@sqrt(v));
             },
             .power => return finite(std.math.pow(f64, try asFloat(first), try asFloat(values[1]))),
@@ -4122,11 +4155,72 @@ test "SQL NUMERIC scalar operators retain exact values and scale" {
     }
 }
 
+test "SQL NUMERIC square root retains domain diagnostics strict nulls and request cancellation" {
+    const a = std.testing.allocator;
+    const Harness = struct {
+        fn run(sql: []const u8) !void {
+            var compiled = try @import("compiler.zig").compileScalar(std.testing.allocator, sql, .{});
+            defer compiled.deinit();
+            var program = try bind(std.testing.allocator, compiled.expression, &.{}, &.{}, .{});
+            defer program.deinit();
+            var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer arena.deinit();
+            _ = try program.evaluate(arena.allocator(), &.{}, &.{}, .{});
+        }
+    };
+    for ([_]struct { sql: []const u8, err: anyerror, code: []const u8 }{
+        .{ .sql = "sqrt(-1.0)", .err = error.SqlInvalidPowerArgument, .code = "2201F" },
+        .{ .sql = "sqrt('-Infinity'::numeric)", .err = error.SqlInvalidPowerArgument, .code = "2201F" },
+        .{ .sql = "sqrt(-1)", .err = error.SqlInvalidPowerArgument, .code = "2201F" },
+        .{ .sql = "sqrt('1'::text)", .err = error.SqlUndefinedFunction, .code = "42883" },
+        .{ .sql = "sqrt(true)", .err = error.SqlUndefinedFunction, .code = "42883" },
+        .{ .sql = "sqrt(ARRAY[1])", .err = error.SqlUndefinedFunction, .code = "42883" },
+        .{ .sql = "sqrt('bad')", .err = error.SqlInvalidTextRepresentation, .code = "22P02" },
+    }) |case| {
+        try std.testing.expectError(case.err, Harness.run(case.sql));
+        try std.testing.expectEqualStrings(case.code, @import("errors.zig").describe(case.err).code);
+    }
+    for ([_][]const u8{ "sqrt(NULL)", "sqrt(NULL::numeric)" }) |sql| try Harness.run(sql);
+    for ([_][]const u8{
+        "CASE WHEN false THEN ARRAY[sqrt(-1.0)] ELSE ARRAY[2.0] END",
+        "COALESCE(ARRAY[2.0], ARRAY[sqrt(-1.0)])",
+    }) |sql| try Harness.run(sql);
+    var compiled = try @import("compiler.zig").compileScalar(a, "sqrt(n)", .{});
+    defer compiled.deinit();
+    var program = try bind(a, compiled.expression, &.{.{ .name = "n", .type = .number, .element_type = .numeric }}, &.{}, .{});
+    defer program.deinit();
+    const exact = @import("numeric_value.zig");
+    var context: exact.Context = .{ .alloc = a };
+    var number = try exact.parse(&context, "2");
+    defer number.deinit();
+    const Control = struct {
+        calls: usize = 0,
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            if (self.calls == 2) return error.QueryCanceled;
+        }
+    };
+    var control: Control = .{};
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const cells = [_]Datum{Datum.typedNumeric(&number.value)};
+    try std.testing.expectError(error.QueryCanceled, program.evaluate(arena.allocator(), &cells, &.{}, .{ .checkpoint = Control.check, .checkpoint_context = &control }));
+    try std.testing.expectEqual(@as(usize, 2), control.calls);
+    try std.testing.expectError(error.SqlProgramLimitExceeded, program.evaluate(arena.allocator(), &cells, &.{}, .{ .steps = 20 }));
+    try std.testing.expectError(error.SqlProgramLimitExceeded, program.evaluate(arena.allocator(), &cells, &.{}, .{ .output_bytes = 2 }));
+    const result = try program.evaluate(arena.allocator(), &cells, &.{}, .{});
+    const text = try exact.format(&context, result.numeric.?.*);
+    defer a.free(text);
+    try std.testing.expectEqualStrings("1.414213562373095", text);
+}
+
 test "SQL NUMERIC prepared literals rounding and integer array probes require no hot allocation" {
     const a = std.testing.allocator;
     for ([_][]const u8{
         "9007199254740993.1200",
         "round(1.255, 2)",
+        "sqrt(2.0)",
         "abs(-1.2300)",
         "9007199254740993.0 = ANY(ARRAY[9007199254740992,9007199254740993])",
         "-9223372036854775808.0 = ANY(ARRAY[-9223372036854775808])",
