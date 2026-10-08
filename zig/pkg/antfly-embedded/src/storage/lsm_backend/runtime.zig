@@ -1330,11 +1330,22 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
             // budget. Bound retained amplification per result owner, then let
             // the caller copy values. The count cap also bounds this scan.
             if (self.source_blocks[source_index] == .local) {
+                const payload = self.source_blocks[source_index].local;
+                // Unadmitted payloads are transient read scratch under resource
+                // pressure, not an uncharged long-lived result pin.
+                if (!payload.result_pins_allowed) {
+                    if (self.source_result_retention.len != 0) self.source_result_retention[source_index] = .copy;
+                    return false;
+                }
                 const max_bytes: usize = 1024 * 1024;
                 const max_blocks: usize = 64;
                 var bytes: usize = 0;
                 var count: usize = 0;
                 for (held_blocks.items) |pin| if (pin == .local) {
+                    if (pin.local == payload) {
+                        if (self.source_result_retention.len != 0) self.source_result_retention[source_index] = .pinned;
+                        return true;
+                    }
                     bytes +|= pin.local.bytes.len;
                     count += 1;
                 };
@@ -7325,6 +7336,28 @@ fn findExactEntryWithLocalIndex(
     return try findExactEntryWithLocalIndexBlockMeta(backend, run, index, namespace, key);
 }
 
+fn localBlockCacheEligible(backend: anytype, bytes: usize) bool {
+    if (comptime @hasDecl(@TypeOf(backend.*), "localBlockCacheEligible")) return backend.localBlockCacheEligible(bytes);
+    return localBlockCacheEnabled(backend);
+}
+
+fn beginLocalBlockPromotion(backend: anytype, run: *Run, index: *const lsm_table_file.TableIndex, window: lsm_table_file.EntryDataWindow, locked: bool) bool {
+    if (comptime !@hasDecl(@TypeOf(backend.*), "beginLocalBlockPromotion")) return false;
+    if (window.compression != .prefix and window.compression != .prefix_snappy) return false;
+    const path = run.path orelse return false;
+    const held = if (locked) false else lockBackend(@TypeOf(backend.*), backend);
+    defer unlockBackend(@TypeOf(backend.*), backend, held);
+    return backend.beginLocalBlockPromotion(path, run.id, @as(u64, @intCast(index.entry_data_start)) + window.physicalRelativeOffset(), window.physicalLen(), window.len);
+}
+
+fn finishLocalBlockPromotion(backend: anytype, run: *Run, index: *const lsm_table_file.TableIndex, window: lsm_table_file.EntryDataWindow, locked: bool, admitted: bool) void {
+    if (comptime !@hasDecl(@TypeOf(backend.*), "finishLocalBlockPromotion")) return;
+    const path = run.path orelse return;
+    const held = if (locked) false else lockBackend(@TypeOf(backend.*), backend);
+    defer unlockBackend(@TypeOf(backend.*), backend, held);
+    backend.finishLocalBlockPromotion(path, run.id, @as(u64, @intCast(index.entry_data_start)) + window.physicalRelativeOffset(), window.physicalLen(), admitted);
+}
+
 fn retainLocalCachedBlock(backend: anytype, run: *Run, index: *const lsm_table_file.TableIndex, window: lsm_table_file.EntryDataWindow, backend_locked: bool) ?*SharedBytes {
     const path = run.path orelse return null;
     const offset = @as(u64, @intCast(index.entry_data_start)) + window.physicalRelativeOffset();
@@ -7346,6 +7379,7 @@ fn loadLocalBlockLease(backend: anytype, run: *Run, index: *const lsm_table_file
     const bytes = try loadRunTableDecodedBlockWithStats(backend, backend.allocator, path, offset, len, window.compression, window.len, window.checksum);
     errdefer backend.allocator.free(bytes);
     const lease = try SharedBytes.create(backend.allocator, bytes);
+    lease.result_pins_allowed = backend.options.resource_manager == null;
     const locked = if (backend_locked) false else lockBackend(@TypeOf(backend.*), backend);
     defer unlockBackend(@TypeOf(backend.*), backend, locked);
     // A racing reader can populate the cache while decoding. Drop only our
@@ -7354,10 +7388,7 @@ fn loadLocalBlockLease(backend: anytype, run: *Run, index: *const lsm_table_file
         lease.release();
         return winner;
     }
-    backend.cacheRunBlockLease(path, run.id, offset, len, lease) catch |err| {
-        backend.allocator.destroy(lease);
-        return err;
-    };
+    _ = backend.cacheRunBlockLease(path, run.id, offset, len, lease);
     return lease;
 }
 
@@ -7414,7 +7445,7 @@ fn loadOwnedBlockForWindowAlloc(
     {
         const locked = lockBackend(@TypeOf(backend.*), backend);
         defer unlockBackend(@TypeOf(backend.*), backend, locked);
-        if (@hasField(@TypeOf(backend.*), "run_block_cache") and localBlockCacheEnabled(backend)) {
+        if (@hasField(@TypeOf(backend.*), "run_block_cache") and localBlockCacheEnabled(backend) and localBlockCacheEligible(backend, bytes.len)) {
             _ = try backend.putCachedRunBlock(path, run.id, absolute_offset, physical_len, try backend.allocator.dupe(u8, bytes));
         }
     }
@@ -7470,7 +7501,7 @@ fn loadOwnedBlockForWindowAllocMaybeLocked(
         window.checksum,
     );
     errdefer allocator.free(bytes);
-    if (@hasField(@TypeOf(backend.*), "run_block_cache") and localBlockCacheEnabled(backend)) {
+    if (@hasField(@TypeOf(backend.*), "run_block_cache") and localBlockCacheEnabled(backend) and localBlockCacheEligible(backend, bytes.len)) {
         _ = try backend.putCachedRunBlock(path, run.id, absolute_offset, physical_len, try backend.allocator.dupe(u8, bytes));
     }
     return bytes;
@@ -7555,6 +7586,13 @@ fn findExactEntryWithLocalIndexBlockMeta(
         if (retainLocalCachedBlock(backend, run, index, window, false)) |lease| {
             return findExactEntryInBlockLease(lease, index, block_index, namespace, key);
         }
+        if (beginLocalBlockPromotion(backend, run, index, window, false)) {
+            var admitted = false;
+            defer finishLocalBlockPromotion(backend, run, index, window, false, admitted);
+            const lease = try loadLocalBlockLease(backend, run, index, window, false);
+            admitted = lease.cache_admitted;
+            return findExactEntryInBlockLease(lease, index, block_index, namespace, key);
+        }
     }
     if (try findExactEntryInCompressedPrefixBlock(backend, run, index, block_index, namespace, key)) |entry| {
         return entry;
@@ -7605,6 +7643,13 @@ fn findExactEntryWithLocalIndexBlockMetaMaybeLocked(
     // A miss preserves the compact direct-prefix lookup for cold point reads.
     if (localBlockCacheEnabled(backend)) {
         if (retainLocalCachedBlock(backend, run, index, window, true)) |lease| {
+            return findExactEntryInBlockLease(lease, index, block_index, namespace, key);
+        }
+        if (beginLocalBlockPromotion(backend, run, index, window, true)) {
+            var admitted = false;
+            defer finishLocalBlockPromotion(backend, run, index, window, true, admitted);
+            const lease = try loadLocalBlockLease(backend, run, index, window, true);
+            admitted = lease.cache_admitted;
             return findExactEntryInBlockLease(lease, index, block_index, namespace, key);
         }
     }
@@ -9027,7 +9072,11 @@ test "lsm local result block retention bounds bytes and pin metadata" {
     try std.testing.expect(!try cursor.retainCurrentValueForTxn(&held));
     try std.testing.expectEqual(@as(usize, 0), held.items.len);
     blocks[0] = .{ .local = small };
-    for (0..64) |_| try held.append(a, .{ .local = small.retain() });
+    try held.ensureTotalCapacity(a, 64);
+    for (0..64) |_| {
+        const distinct = try SharedBytes.create(a, try a.alloc(u8, 1024));
+        held.appendAssumeCapacity(.{ .local = distinct });
+    }
     try std.testing.expect(!try cursor.retainCurrentValueForTxn(&held));
     try std.testing.expectEqual(@as(usize, 64), held.items.len);
 }

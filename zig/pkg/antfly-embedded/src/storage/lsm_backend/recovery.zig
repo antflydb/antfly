@@ -390,6 +390,7 @@ fn cleanup(comptime BackendType: type, backend: *BackendType, finalize_deferred:
     if (@hasField(BackendType, "run_block_cache")) {
         for (backend.run_block_cache.items) |*cached| cached.deinit(backend.allocator);
         backend.run_block_cache.deinit(backend.allocator);
+        if (@hasField(BackendType, "run_block_cache_bytes")) backend.run_block_cache_bytes = 0;
     }
     if (@hasField(BackendType, "run_table_cache")) {
         for (backend.run_table_cache.items) |*cached| cached.deinit(backend.allocator);

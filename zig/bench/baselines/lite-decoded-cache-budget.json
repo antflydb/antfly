@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "base_commit": "84dfbf5a953443cd89d2ddec477b8cda3ba922ce",
+  "reference_commit": "4cd4e471e7d82d9574e03a4a0f1b350ea1f1c8d7",
+  "platform": "aarch64-macos",
+  "optimization": "Debug",
+  "scope": "Deterministic allocation and lifetime fixtures; not a query-throughput or 2 GiB soak benchmark",
+  "hot_point_reads": {
+    "queries_after_initial_cold_read": 100,
+    "prefix": {
+      "reference_backend_allocator_calls": 500,
+      "updated_backend_allocator_calls": 8
+    },
+    "prefix_snappy": {
+      "reference_backend_allocator_calls": 604,
+      "updated_backend_allocator_calls": 9
+    },
+    "reference_encoded_block_loads": 100,
+    "updated_encoded_block_loads": 1,
+    "updated_retained_decoded_blocks": 1,
+    "subsequent_100_warm_reads_backend_allocator_calls": 0,
+    "subsequent_100_warm_reads_encoded_block_loads": 0
+  },
+  "repeated_batch_results": {
+    "two_key_batches": 101,
+    "reference_retained_pins": 64,
+    "reference_distinct_pinned_blocks": 1,
+    "reference_owned_values": 74,
+    "updated_retained_pins": 1,
+    "updated_distinct_pinned_blocks": 1,
+    "updated_owned_values": 0
+  },
+  "cache_policy": {
+    "default_payload_residency_bytes": 2097152,
+    "default_max_admitted_block_bytes": 262144,
+    "max_cache_entries": 64,
+    "max_result_owner_pinned_bytes": 1048576,
+    "max_result_owner_distinct_pins": 64,
+    "promotion_misses": 2,
+    "denied_promotion_cooldown_misses": 64,
+    "resource_credit_covers_payload_and_shared_header": true,
+    "evicted_pinned_payload_credit_survives_until_final_release": true,
+    "host_pressure_reclaims_unpinned_cache_without_blocking_backend": true,
+    "denied_admission_preserves_read_results": true,
+    "shutdown_fences_pending_reclaimer_registration": true
+  },
+  "notes": [
+    "Allocation counts cover the backend allocator; owned point results still allocate in the caller's result allocator.",
+    "Encoded block loads may hit the provider memory cache; these counts are not physical disk reads.",
+    "Cold decoding and first promotion still allocate. Zero allocation applies to the measured warm backend path.",
+    "Resource accounting follows admitted payloads through eviction and result leases. Unadmitted decoded scratch remains transient, and resource-managed result owners copy its values.",
+    "The on-disk format and public C ABI are unchanged."
+  ]
+}
