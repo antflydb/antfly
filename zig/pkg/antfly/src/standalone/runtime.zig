@@ -2849,7 +2849,7 @@ const LocalStandaloneMetadata = struct {
                     const namespace = try state.namespaceFor(command.database, command.namespace);
                     const explicit = if (command.tablespace) |n| (state.find(.tablespace, 0, n) orelse return error.TablespaceNotFound).id else 0;
                     const policy = if (try state.effectiveTablespace(namespace, explicit)) |space| space.placement_policy else system_catalog.PlacementPolicy{};
-                    if ((req.storage orelse antfly.common.table_storage.Settings{}).engine == .native and req.num_shards == null) req.num_shards = policy.min_ranges;
+                    if ((req.storage orelse antfly.common.table_storage.Settings{}).engine == .local and req.num_shards == null) req.num_shards = policy.min_ranges;
                     table = try self.deriveCreatedTableRecord(name, req);
                     if (policy.placement_role) |role| table.?.placement_role = role;
                     // Standalone owns one local replica; policy metadata remains
@@ -2889,7 +2889,7 @@ const LocalStandaloneMetadata = struct {
                     const policy = if (try state.effectiveTablespace(namespace, delta.upserts[0].tablespace_id)) |space| space.placement_policy else system_catalog.PlacementPolicy{};
                     current.placement_role = policy.placement_role orelse "data";
                     current.min_ranges = if (current.storage.engine == .object) 0 else policy.min_ranges orelse 1;
-                    if (self.storage_engine == .lite and current.storage.engine == .native and current.min_ranges != 1) return error.InvalidCreateTableRequest;
+                    if (self.storage_engine == .lite and current.storage.engine == .local and current.min_ranges != 1) return error.InvalidCreateTableRequest;
                     try mutation.upsertTable(self, current);
                 }
                 try mutation.applyCatalog(self, delta);
@@ -2913,7 +2913,7 @@ const LocalStandaloneMetadata = struct {
                 if (!std.mem.eql(u8, sources, "[]")) return error.HACatalogReplicationSourcesUnsupported;
             }
         }
-        const replicated = (!self.vector_source_storage_allowed and (req.storage orelse antfly.common.table_storage.Settings{}).engine == .native) or
+        const replicated = (!self.vector_source_storage_allowed and (req.storage orelse antfly.common.table_storage.Settings{}).engine == .local) or
             (if (req.replication_sources_json) |sources| !std.mem.eql(u8, sources, "[]") else false);
         try (req.storage orelse antfly.common.table_storage.Settings{}).validateCreate(req.num_shards, replicated);
         try antfly.public_api.tables.validateObjectCreateDefinition(self.alloc, req);

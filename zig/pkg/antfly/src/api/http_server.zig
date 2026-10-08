@@ -9203,6 +9203,7 @@ pub const ApiHttpServer = struct {
 
     fn queryTableDefinition(self: *ApiHttpServer, alloc: std.mem.Allocator, resolver: ?*CatalogQueryResolver, table_name: []const u8, context: api_operation.RequestContext) !?metadata_table_manager.TableRecord {
         if (resolver) |cache| if (cache.definitions.get(table_name)) |definition| return .{
+            .storage = .{ .engine = definition.storage_engine },
             .table_id = definition.table_id,
             .name = table_name,
             .schema_json = definition.schema_json,
@@ -9221,7 +9222,7 @@ pub const ApiHttpServer = struct {
             break :blk try system_catalog.QueryDefinition.fromTable(table).clone(alloc);
         };
         if (resolver) |cache| try cache.definitions.put(alloc, try alloc.dupe(u8, table_name), definition);
-        return .{ .table_id = definition.table_id, .name = table_name, .schema_json = definition.schema_json, .read_schema_json = definition.read_schema_json, .indexes_json = definition.indexes_json, .lake_index_catalog_json = definition.lake_index_catalog_json };
+        return .{ .storage = .{ .engine = definition.storage_engine }, .table_id = definition.table_id, .name = table_name, .schema_json = definition.schema_json, .read_schema_json = definition.read_schema_json, .indexes_json = definition.indexes_json, .lake_index_catalog_json = definition.lake_index_catalog_json };
     }
 
     pub fn maybeRouteQueryToReadSchema(self: *ApiHttpServer, table_name: []const u8, query_req: *db_mod.types.SearchRequest) !void {
@@ -21308,17 +21309,28 @@ pub const ApiHttpServer = struct {
     /// The native catalog is the authority for existence and incarnation. This
     /// adapter exposes only data operations; object catalogs cannot create or
     /// drop native tables or alter their definitions.
+    const ObjectTableRequestOptions = struct {
+        lookup_consistency: raft_mod.ReadConsistency = .read_index,
+        has_join: bool = false,
+        resolver: ?*CatalogQueryResolver = null,
+    };
+
+    pub fn tryObjectTableLookup(self: *ApiHttpServer, table_name: []const u8, key: []const u8, consistency: raft_mod.ReadConsistency, identity: ?AuthenticatedIdentity, context: api_operation.RequestContext) !?contextual_operations.OwnedResponse {
+        return self.tryObjectTableRequestWithOptions(table_name, .get, "lookup", key, identity, context, .{ .lookup_consistency = consistency });
+    }
+
     pub fn tryObjectTableRequest(self: *ApiHttpServer, table_name: []const u8, method: @import("../serverless/api/http_routes.zig").HttpMethod, suffix: []const u8, body: []const u8, identity: ?AuthenticatedIdentity, context: api_operation.RequestContext) !?contextual_operations.OwnedResponse {
+        return self.tryObjectTableRequestWithOptions(table_name, method, suffix, body, identity, context, .{});
+    }
+
+    fn tryObjectTableRequestWithOptions(self: *ApiHttpServer, table_name: []const u8, method: @import("../serverless/api/http_routes.zig").HttpMethod, suffix: []const u8, body: []const u8, identity: ?AuthenticatedIdentity, context: api_operation.RequestContext, options: ObjectTableRequestOptions) !?contextual_operations.OwnedResponse {
         if (!self.source.vtable.supports_object_tables) return null;
-        // Engine selection is immutable. Avoid a new authority read on every
-        // native request; object operations revalidate the incarnation below.
-        if (try self.statusAdminSnapshot()) |value| {
-            var hint = value;
-            defer self.source.freeAdminSnapshot(&hint);
-            if (tables_api.findTableByName(&hint, table_name)) |candidate| {
-                if (candidate.storage.engine != .object) return null;
-            }
-        }
+        // Select the engine from a request-owned, targeted definition. Native
+        // requests never clone the full catalog merely to choose a data path.
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const hint = (try self.queryTableDefinition(if (options.resolver) |resolver| resolver.arena else arena.allocator(), options.resolver, table_name, context)) orelse return null;
+        if (hint.storage.engine != .object) return null;
         var snapshot = (try self.source.linearizableSnapshot(context)) orelse return error.ReadUnavailable;
         defer self.source.freeAdminSnapshot(&snapshot);
         const table = tables_api.findTableByName(&snapshot, table_name) orelse return null;
@@ -21326,6 +21338,10 @@ pub const ApiHttpServer = struct {
         var schema = try schema_mod.parseValidatedTableSchema(self.alloc, table.schema_json);
         defer schema.deinit(self.alloc);
         if (schema.external_base_source != null) return null;
+        if (options.has_join) return try contextual_operations.textAlloc(self.alloc, 400, "object table joins are not supported");
+        if (method == .get and std.mem.eql(u8, suffix, "lookup") and options.lookup_consistency != .stale)
+            return try contextual_operations.textAlloc(self.alloc, 400, "object document lookup supports only consistency=stale (published generations); use sync_level=full_index on writes to wait for publication");
+
         if (identity) |user| if (user.row_filter.len != 0) return try contextual_operations.textAlloc(self.alloc, 409, "object-backed document tables do not support credential row filters");
         // Policy enforcement belongs to native storage owners. Check the
         // durable publication before bypassing those owners for object data.
@@ -21395,12 +21411,12 @@ pub const ApiHttpServer = struct {
         if (isNdjsonContentType(content_type)) {
             return try self.handlePublicTableMultiQueryWithCancellation(table_name, body, authenticated_identity, cancellation, response_label, bound_join);
         }
-        if (try self.tryObjectTableRequest(table_name, .post, "query", body, authenticated_identity, .{ .cancellation = if (cancellation) |value| value.token() else .none })) |response| {
-            if (bound_join != null) {
-                var owned = response;
-                owned.deinit(self.alloc);
-                return contextual_operations.textAlloc(self.alloc, 400, "object table joins are not supported");
-            }
+        if (try self.tryObjectTableQuery(table_name, body, authenticated_identity, cancellation, response_label, bound_join, catalog_resolver)) |response| return response;
+        return try self.handlePublicTableQueryWithCancellation(table_name, body, authenticated_identity, cancellation, response_label, bound_join, catalog_resolver);
+    }
+
+    fn tryObjectTableQuery(self: *ApiHttpServer, table_name: []const u8, body: []const u8, authenticated_identity: ?AuthenticatedIdentity, cancellation: ?*const http_common.RequestCancellation, response_label: ?[]const u8, bound_join: ?*const distributed_join.ParsedSupportedJoinRequest, catalog_resolver: ?*CatalogQueryResolver) !?contextual_operations.OwnedResponse {
+        if (try self.tryObjectTableRequestWithOptions(table_name, .post, "query", body, authenticated_identity, .{ .deadline_ns = try query_contract.queryExecutionDeadlineNsFromBody(self.alloc, body), .cancellation = if (cancellation) |value| value.token() else .none }, .{ .has_join = bound_join != null, .resolver = catalog_resolver })) |response| {
             var owned = response;
             errdefer owned.deinit(self.alloc);
             if (owned.status == 200) {
@@ -21414,7 +21430,7 @@ pub const ApiHttpServer = struct {
             }
             return owned;
         }
-        return try self.handlePublicTableQueryWithCancellation(table_name, body, authenticated_identity, cancellation, response_label, bound_join, catalog_resolver);
+        return null;
     }
 
     fn relabelObjectQueryResult(value: *std.json.Value, label: []const u8) void {
@@ -21720,22 +21736,30 @@ pub const ApiHttpServer = struct {
             const row_filter_json = try resolveEffectiveRowFilterJson(self.alloc, line_identity, table_name);
             defer if (row_filter_json) |value| self.alloc.free(value);
 
-            const source = self.table_reads orelse return try contextual_operations.textAlloc(self.alloc, 404, "not found");
-            db_mod.resetLastSortRejectionDiagnostic();
-            query_request_diagnostics.reset();
             const line_label = response_label orelse binding.label;
-            var query_response = self.executePublicTableQueryDispatchWithReadinessRetry(
-                self.alloc,
-                source,
-                table_name,
-                line,
-                row_filter_json,
-                line_identity,
-                if (cancellation) |value| value.token() else null,
-                line_label,
-                if (binding.join) |*value| value else bound_join,
-                &catalog_resolver,
-            ) catch |err| return try self.publicQueryOperationErrorResponse(table_name, line, err);
+            const line_join = if (binding.join) |*value| value else bound_join;
+            var query_response: query_api.QueryResponse = if (try self.tryObjectTableQuery(table_name, line, line_identity, cancellation, line_label, line_join, &catalog_resolver)) |value| object: {
+                var response = value;
+                if (response.status != 200) return response;
+                defer response.deinit(self.alloc);
+                break :object .{ .json = try self.alloc.dupe(u8, response.body) };
+            } else native: {
+                db_mod.resetLastSortRejectionDiagnostic();
+                query_request_diagnostics.reset();
+                const source = self.table_reads orelse return try contextual_operations.textAlloc(self.alloc, 404, "not found");
+                break :native self.executePublicTableQueryDispatchWithReadinessRetry(
+                    self.alloc,
+                    source,
+                    table_name,
+                    line,
+                    row_filter_json,
+                    line_identity,
+                    if (cancellation) |value| value.token() else null,
+                    line_label,
+                    if (binding.join) |*value| value else bound_join,
+                    &catalog_resolver,
+                ) catch |err| return try self.publicQueryOperationErrorResponse(table_name, line, err);
+            };
             defer query_response.deinit(self.alloc);
             try self.reachQueryResultLifecycle(
                 if (route_table_name == null) "public.global.multi_query" else "public.table.multi_query",

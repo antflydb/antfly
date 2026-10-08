@@ -7,7 +7,7 @@ preset.
 
 ## Independent choices
 
-A table chooses `storage.engine: native | object`. `native` is the compatibility
+A table chooses `storage.engine: local | object`. `local` is the compatibility
 default and uses the hosting process's local/Lite persistence and normal shard
 placement. `object` uses shared durable objects without data Raft replicas.
 `schema.storage_mode` continues to describe document versus relational data;
@@ -139,6 +139,28 @@ object destinations and inherited creation defaults, but this implementation
 does not reinterpret their location metadata as a storage override. Resolved
 bindings must remain table-owned when defaults change.
 
+## Request routing and read consistency
+
+The narrow query definition carries the table engine from the same catalog read
+that binds the query. Single-table JSON, table NDJSON, and global multi-query
+requests all dispatch through that binding, authorize each line independently,
+and retain logical table labels in responses. Mixed local/object requests select
+a data path per table; joins involving owned object tables remain unsupported.
+Point writes and lookups use a targeted definition read to select the engine,
+rather than cloning every table and range in an administrative snapshot. Object
+execution still revalidates the authoritative incarnation and physical binding.
+
+Owned object key lookup requires explicit `consistency=stale` (the legacy
+`read_consistency=stale` spelling is also accepted). It reads the published HEAD;
+a WAL-only acknowledgment does not imply that HEAD contains the write. The
+normal default `read_index` and explicit `leader_lease` return HTTP 400 for owned
+object tables, and invalid consistency values are rejected before execution.
+Clients requiring publication before lookup can write with `sync_level=full_index`
+and then perform a stale lookup. Supporting read-index-equivalent object reads
+will require a WAL visibility fence or an authoritative WAL overlay; metadata
+consensus alone cannot provide that data guarantee. External lake tables retain
+their existing native read contracts.
+
 ## Initial capability boundaries
 
 External read-only Parquet/Iceberg tables keep their existing SQL and sidecar
@@ -158,7 +180,8 @@ those APIs' existing semantics; the preset does not imply native capability pari
 Cover engine parsing and admission, legacy framing, object framing and command
 round trips, decoder gates, zero-range topology, definition/binding immutability,
 and clone/reopen preservation. Exercise native API storage-binding admission and
-policy-authority failure, and an owned-object batch with synchronous index
+policy-authority failure, JSON/NDJSON/global query routing, explicit lookup
+consistency after WAL-only writes, narrow native engine selection, and an owned-object batch with synchronous index
 publication, lookup, search, runtime reopen, and recreation into an empty generation.
 Existing lake API and catalog suites cover source reads and sidecar publication.
 

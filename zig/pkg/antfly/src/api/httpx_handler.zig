@@ -8411,7 +8411,11 @@ pub const AntflyApiHandler = struct {
             lookup_opts.opts.row_policy_principal_proof = row_policy_proof orelse "";
             lookup_opts.opts.row_policy_database = target.database;
         }
-        if (try self.api_server.tryObjectTableRequest(decoded_table_name, .get, "lookup", decoded_key, authenticated_identity, operationContext(ctx, authenticated_identity))) |value| {
+        const consistency = http_server_mod.parseLookupReadConsistency(ctx.request.uri.query orelse "") catch {
+            _ = ctx.status(400);
+            return ctx.text("invalid read consistency");
+        };
+        if (try self.api_server.tryObjectTableLookup(decoded_table_name, decoded_key, consistency, authenticated_identity, operationContext(ctx, authenticated_identity))) |value| {
             var response = value;
             if (row_policy_proof != null or lookup_opts.opts.fields.len != 0) {
                 response.deinit(self.api_server.alloc);
@@ -8419,10 +8423,6 @@ pub const AntflyApiHandler = struct {
             }
             return respondOwnedContextualResponse(ctx, &response, self.api_server.alloc);
         }
-        const consistency = http_server_mod.parseLookupReadConsistency(ctx.request.uri.query orelse "") catch {
-            _ = ctx.status(400);
-            return ctx.text("invalid read consistency");
-        };
 
         var result = (self.api_server.lookupWithReadinessRetry(
             alloc,

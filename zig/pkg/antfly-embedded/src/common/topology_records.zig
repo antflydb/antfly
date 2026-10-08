@@ -58,7 +58,7 @@ pub const TableRecord = struct {
     /// Default legacy tables retain their exact durable record bytes. Storage
     /// ownership or an admitted migration requires the versioned extension.
     pub fn requiresStorageMetadataExtension(self: TableRecord) bool {
-        return self.storage.engine != .native or self.storage.dense_embeddings != .primary_lsm or self.storage_migration != null;
+        return self.storage.engine != .local or self.storage.dense_embeddings != .primary_lsm or self.storage_migration != null;
     }
 
     pub fn migrationState(self: *const TableRecord) TableMigrationState {

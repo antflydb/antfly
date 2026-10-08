@@ -113,7 +113,7 @@ pub fn tableDefinitionFingerprint(table: TableDefinition) TableDefinitionFingerp
             hasher.update(&bytes);
         }
     }
-    if (table.storage.engine != .native) {
+    if (table.storage.engine != .local) {
         hashTableDefinitionPart(&hasher, "object-table-engine-v1");
         var generation: [8]u8 = undefined;
         std.mem.writeInt(u64, &generation, table.object_storage_generation, .little);

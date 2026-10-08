@@ -2,7 +2,7 @@ from enum import StrEnum
 
 
 class TableStorageSettingsEngine(StrEnum):
-    NATIVE = "native"
+    LOCAL = "local"
     OBJECT = "object"
 
     def __str__(self) -> str:

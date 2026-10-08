@@ -16,7 +16,7 @@
 //! Persisted source-artifact ownership, independent of ANN serving options.
 const std = @import("std");
 
-pub const Engine = enum { native, object };
+pub const Engine = enum { local, object };
 
 pub const DenseEmbeddings = enum {
     primary_lsm,
@@ -24,7 +24,7 @@ pub const DenseEmbeddings = enum {
 };
 
 pub const Settings = struct {
-    engine: Engine = .native,
+    engine: Engine = .local,
 
     // Compatibility default for persisted records, not fresh-table admission.
     dense_embeddings: DenseEmbeddings = .primary_lsm,
@@ -32,7 +32,7 @@ pub const Settings = struct {
     pub fn jsonStringify(self: Settings, jw: anytype) !void {
         try jw.beginObject();
         // Keep legacy table JSON stable when the engine is implicit.
-        if (self.engine != .native) {
+        if (self.engine != .local) {
             try jw.objectField("engine");
             try jw.write(self.engine);
         }
@@ -126,7 +126,21 @@ test "table storage settings object engine rejects data shard placement and vect
     try std.testing.expectError(error.ObjectTablePlacementUnsupported, object.validateCreate(null, true));
     try std.testing.expectError(error.InvalidTableStorageSettings, (Settings{ .engine = .object, .dense_embeddings = .vector_store }).validateCreate(null, false));
     const native = try Settings.resolveStandaloneCreate(null, 1, false, false);
-    try std.testing.expectEqual(.native, native.engine);
+    try std.testing.expectEqual(.local, native.engine);
     const explicit = try Settings.resolveStandaloneCreate(object, 1, false, false);
     try std.testing.expectEqual(.primary_lsm, explicit.dense_embeddings);
+}
+
+test "table storage local spelling preserves implicit legacy JSON" {
+    const a = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, "{\"engine\":\"local\"}", .{});
+    defer parsed.deinit();
+    const settings = try Settings.parse(parsed.value);
+    try std.testing.expectEqual(.local, settings.engine);
+    const bytes = try std.json.Stringify.valueAlloc(a, settings, .{});
+    defer a.free(bytes);
+    try std.testing.expectEqualStrings("{\"dense_embeddings\":\"primary_lsm\"}", bytes);
+    var old = try std.json.parseFromSlice(std.json.Value, a, "{\"engine\":\"native\"}", .{});
+    defer old.deinit();
+    try std.testing.expectError(error.InvalidTableStorageSettings, Settings.parse(old.value));
 }

@@ -340,13 +340,33 @@ test "lake SQL object table native API binds storage and fails closed on policy 
         }},
         unavailable: bool = false,
         bindings: usize = 0,
+        definition_reads: usize = 0,
+        authoritative_reads: usize = 0,
+        local_queries: usize = 0,
+        const local_table: metadata.TableRecord = .{
+            .table_id = 8,
+            .name = "local_docs",
+            .schema_json = @import("tables.zig").default_schema_json,
+            .indexes_json = @import("tables.zig").default_indexes_json,
+        };
+        fn localQuery(raw: *anyopaque, alloc: std.mem.Allocator, name: []const u8, _: @import("antfly_local_sources").storage_db_types.SearchRequest, _: @import("../raft/read_gate.zig").ReadConsistency) !?@import("antfly_local_sources").api_query.QueryResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqualStrings("local_docs", name);
+            self.local_queries += 1;
+            return .{ .json = try alloc.dupe(u8, "{\"responses\":[{\"table\":\"local_docs\",\"hits\":[]}]}") };
+        }
         fn snapshot(raw: *anyopaque) !metadata_api.AdminSnapshot {
             const self: *@This() = @ptrCast(@alignCast(raw));
             return .{ .status = .{ .metadata_group_id = 1, .metrics = .{} }, .tables = &self.table, .ranges = &.{}, .stores = &.{}, .placement_intents = &.{}, .split_transitions = &.{}, .merge_transitions = &.{} };
         }
         fn authoritative(raw: *anyopaque, context: operation.RequestContext) !?metadata_api.AdminSnapshot {
             try context.ensureActive();
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.authoritative_reads += 1;
             return try snapshot(raw);
+        }
+        fn forbiddenSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return error.UnexpectedFullCatalogSnapshot;
         }
         fn free(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
         fn replace(raw: *anyopaque, expected: metadata.TableRecord, replacement: metadata.TableRecord) !void {
@@ -358,9 +378,25 @@ test "lake SQL object table native API binds storage and fails closed on policy 
         }
         fn catalog(raw: *anyopaque, alloc: std.mem.Allocator, _: operation.RequestContext, input: @import("../system_catalog/server_call.zig").Call) ![]u8 {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            if (input != .policy_publication_status) return error.UnexpectedCatalogCall;
-            if (self.unavailable) return error.RowPolicyCatalogChanged;
-            return alloc.dupe(u8, "null");
+            return switch (input) {
+                .query_definition => |name| blk: {
+                    self.definition_reads += 1;
+                    break :blk std.json.Stringify.valueAlloc(alloc, domain.QueryDefinition.fromTable(if (std.mem.eql(u8, name, "local_docs")) local_table else self.table[0]), .{});
+                },
+                .resolve => std.json.Stringify.valueAlloc(alloc, domain.ResolvedTable.fromTable(self.table[0]), .{}),
+                .resolve_many => |request| blk: {
+                    const tables = try alloc.alloc(?domain.ResolvedTable, request.targets.len);
+                    defer alloc.free(tables);
+                    for (request.targets, tables) |target, *table| {
+                        const resolved = if (std.mem.eql(u8, target.table, "local_docs")) local_table else self.table[0];
+                        table.* = domain.ResolvedTable.fromTable(resolved);
+                        if (request.include_query_definitions) table.*.?.query_definition = domain.QueryDefinition.fromTable(resolved);
+                    }
+                    break :blk std.json.Stringify.valueAlloc(alloc, domain.ResolvedMany{ .revision = 1, .tables = tables }, .{});
+                },
+                .policy_publication_status => if (self.unavailable) error.RowPolicyCatalogChanged else alloc.dupe(u8, "null"),
+                else => error.UnexpectedCatalogCall,
+            };
         }
     };
     var directory = try @import("antfly_local_sources").common_test_directory.TestDirectory.init("object-native-api");
@@ -368,7 +404,7 @@ test "lake SQL object table native API binds storage and fails closed on policy 
     var backend = try @import("antfly_local_sources").storage_background_runtime.BackendRuntimeHandle.init(a, .{});
     defer backend.deinit();
     var source: Source = .{};
-    var server = server_mod.ApiHttpServer.init(a, .{ .backend_runtime = backend.ptr(), .deployment_mode = .standalone, .native_lake_artifact_base_dir = directory.path() }, .{ .ptr = &source, .vtable = &.{ .status = undefined, .supports_object_tables = true, .admin_snapshot = Source.snapshot, .linearizable_snapshot = Source.authoritative, .free_admin_snapshot = Source.free, .replace_table_definition = Source.replace, .system_catalog = Source.catalog } }, null, null);
+    var server = server_mod.ApiHttpServer.init(a, .{ .backend_runtime = backend.ptr(), .deployment_mode = .standalone, .native_lake_artifact_base_dir = directory.path() }, .{ .ptr = &source, .vtable = &.{ .status = undefined, .supports_object_tables = true, .supports_query_definitions = true, .admin_snapshot = Source.forbiddenSnapshot, .linearizable_snapshot = Source.authoritative, .free_admin_snapshot = Source.free, .replace_table_definition = Source.replace, .system_catalog = Source.catalog } }, .{ .ptr = &source, .vtable = &.{ .lookup = undefined, .scan = undefined, .query = Source.localQuery } }, null);
     defer server.deinit();
     var write = (try server.tryObjectTableRequest("docs", .post, "batch", "{\"inserts\":{\"a\":{\"body\":\"alpha\"}},\"sync_level\":\"full_index\"}", null, .{})).?;
     defer write.deinit(a);
@@ -379,6 +415,55 @@ test "lake SQL object table native API binds storage and fails closed on policy 
     defer query.deinit(a);
     try std.testing.expectEqual(@as(u16, 200), query.status);
     try std.testing.expect(std.mem.indexOf(u8, query.body, "public.docs") != null);
+    const definitions_before = source.definition_reads;
+    for ([_]?[]const u8{ null, "application/x-ndjson" }) |content_type| {
+        var routed = try server.handlePublicTableQueryWithContentType("docs", "{\"full_text_search\":{\"query\":\"body:alpha\"}}", content_type, null);
+        defer routed.deinit(a);
+        try std.testing.expectEqual(@as(u16, 200), routed.status);
+        try std.testing.expect(std.mem.indexOf(u8, routed.body, "alpha") != null);
+    }
+    // Bound queries reuse the definition captured by resolve_many.
+    try std.testing.expectEqual(definitions_before, source.definition_reads);
+    var multi = try server.handlePublicGlobalMultiQuery("{\"table\":\"docs\",\"full_text_search\":{\"query\":\"body:alpha\"}}\n{\"table\":\"docs\",\"full_text_search\":{\"query\":\"body:alpha\"}}", null);
+    defer multi.deinit(a);
+    try std.testing.expectEqual(@as(u16, 200), multi.status);
+    var parsed_multi = try std.json.parseFromSlice(std.json.Value, a, multi.body, .{});
+    defer parsed_multi.deinit();
+    try std.testing.expectEqual(@as(usize, 2), parsed_multi.value.object.get("responses").?.array.items.len);
+    var mixed = try server.handlePublicGlobalMultiQuery("{\"table\":\"docs\",\"full_text_search\":{\"query\":\"body:alpha\"}}\n{\"table\":\"local_docs\",\"full_text_search\":{\"query\":\"body:alpha\"}}", null);
+    defer mixed.deinit(a);
+    try std.testing.expectEqual(@as(u16, 200), mixed.status);
+    try std.testing.expectEqual(@as(usize, 1), source.local_queries);
+    var parsed_mixed = try std.json.parseFromSlice(std.json.Value, a, mixed.body, .{});
+    defer parsed_mixed.deinit();
+    try std.testing.expectEqual(@as(usize, 2), parsed_mixed.value.object.get("responses").?.array.items.len);
+
+    // A WAL-only acknowledgment must never be presented as read-index-safe.
+    var async_write = (try server.tryObjectTableRequest("docs", .post, "batch", "{\"inserts\":{\"a\":{\"body\":\"beta\"}},\"sync_level\":\"write\"}", null, .{})).?;
+    defer async_write.deinit(a);
+    try std.testing.expectEqual(@as(u16, 201), async_write.status);
+    const httpx = @import("httpx");
+    var handler = @import("httpx_handler.zig").AntflyApiHandler{ .api_server = &server };
+    for ([_][]const u8{ "", "?consistency=read_index", "?consistency=leader_lease", "?consistency=garbage", "?read_consistency=garbage", "?consistency=stale" }) |suffix| {
+        const url = try std.fmt.allocPrint(a, "http://127.0.0.1/db/v1/tables/docs/documents/a{s}", .{suffix});
+        defer a.free(url);
+        var request = try httpx.Request.init(a, .GET, url);
+        defer request.deinit();
+        var ctx = httpx.Context.init(a, undefined, &request);
+        defer ctx.deinit();
+        var response = try handler.lookupKey(&ctx, "docs", "a", .{});
+        defer response.deinit();
+        const stale = std.mem.eql(u8, suffix, "?consistency=stale");
+        try std.testing.expectEqual(@as(u16, if (stale) 200 else 400), response.status.code);
+        if (stale) try std.testing.expect(std.mem.indexOf(u8, response.body.?, "alpha") != null);
+    }
+    // Ordinary tables must not need an admin or authoritative snapshot.
+    source.table[0].storage.engine = .local;
+    const authoritative_before = source.authoritative_reads;
+    try std.testing.expect((try server.tryObjectTableRequest("docs", .post, "batch", "{}", null, .{})) == null);
+    try std.testing.expect((try server.tryObjectTableLookup("docs", "a", .read_index, null, .{})) == null);
+    try std.testing.expectEqual(authoritative_before, source.authoritative_reads);
+    source.table[0].storage.engine = .object;
     source.unavailable = true;
     try std.testing.expectError(error.RowPolicyCatalogChanged, server.tryObjectTableRequest("docs", .post, "batch", "{\"inserts\":{\"b\":{\"body\":\"beta\"}}}", null, .{}));
 }

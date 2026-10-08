@@ -19485,6 +19485,7 @@ fn decodeTableProjection(alloc: std.mem.Allocator, encoded: []const u8, mode: en
     errdefer alloc.free(name);
     var fields: [8][]const u8 = undefined;
     var count: usize = 0;
+    var storage: @import("antfly_local_sources").common_table_storage.Settings = .{};
     var lake_index_catalog_json: []const u8 = "";
     while (pos < encoded.len and count < fields.len) : (count += 1) {
         const length = try readInt(encoded, &pos, u32);
@@ -19500,13 +19501,14 @@ fn decodeTableProjection(alloc: std.mem.Allocator, encoded: []const u8, mode: en
             pos += length;
         }
         lake_index_catalog_json = try readLakeIndexCatalogExtension(encoded, &pos);
-        _ = try readTableStorageExtension(encoded, &pos);
+        storage = (try readTableStorageExtension(encoded, &pos)).storage;
     }
     // Legacy, read-schema, and restore-intent records respectively. Borrow all
     // framed fields to validate the encoding, but copy only query-owned data.
     if (count != 5 and count != 6 and count != 8) return error.InvalidMetadataTransitionEncoding;
     return .{ .table_id = table_id, .name = name, .query_definition = if (mode != .identity) try (system_catalog.QueryDefinition{
         .table_id = table_id,
+        .storage_engine = storage.engine,
         .schema_json = fields[1],
         .read_schema_json = if (mode == .schema or count == 5) "" else fields[2],
         .indexes_json = if (mode == .schema) "" else fields[if (count == 5) 2 else 3],
@@ -21585,7 +21587,7 @@ fn readTableStorageExtension(encoded: []const u8, pos: *usize) !BorrowedTableSto
         },
         else => return error.InvalidMetadataTransitionEncoding,
     }
-    if (pos.* != encoded.len or (result.storage.engine == .native and result.storage.dense_embeddings == .primary_lsm and result.migration == null)) return error.InvalidMetadataTransitionEncoding;
+    if (pos.* != encoded.len or (result.storage.engine == .local and result.storage.dense_embeddings == .primary_lsm and result.migration == null)) return error.InvalidMetadataTransitionEncoding;
     if (result.storage.engine == .object and (result.storage.dense_embeddings != .primary_lsm or result.migration != null)) return error.InvalidMetadataTransitionEncoding;
     return result;
 }
@@ -31299,6 +31301,11 @@ test "metadata.lake index object table engine framing preserves empty topology a
     try validateTransitionCommandDataGroupIds(command);
     const wire = try encodeTransitionCommand(a, command);
     defer a.free(wire);
+    const table_bytes = try encodeTableRecord(a, table);
+    defer a.free(table_bytes);
+    const projection = try decodeTableQueryProjection(a, table_bytes, true);
+    defer projection.deinit(a);
+    try std.testing.expectEqual(.object, projection.query_definition.?.storage_engine);
     var roundtrip = (try decodeTransitionCommand(a, wire)).?;
     defer roundtrip.deinit(a);
     try std.testing.expect(metadata_table_manager.tableDefinitionsEqual(table, roundtrip.apply_table_topology.create.table));
@@ -31330,7 +31337,7 @@ test "metadata.lake index object table engine framing preserves empty topology a
         try std.testing.expect(metadata_table_manager.tableDefinitionsEqual(applied, tables[0]));
     }
     var invalid = table;
-    invalid.storage.engine = .native;
+    invalid.storage.engine = .local;
     try std.testing.expectError(error.InvalidTableTopologyMutation, validateTransitionCommandDataGroupIds(.{ .apply_table_topology = .{ .create = .{ .table = invalid, .ranges = &.{}, .expected_transition_generation = 37 } } }));
     invalid = table;
     invalid.object_storage_identity = @splat(8);

@@ -109,7 +109,7 @@ pub fn mutate(svc: anytype, alloc: std.mem.Allocator, context: operation.Request
         if (try fk_publication.schemaHasForeignKeys(a, table.schema_json)) return error.ForeignKeyGenerationPublicationRequired;
         const policy = admission.placement_policy;
         try policy.validate();
-        if (table.storage.engine == .native) {
+        if (table.storage.engine == .local) {
             if (policy.placement_role) |role| table.placement_role = role;
             if (policy.desired_replica_count) |count| table.desired_replica_count = count;
             if (req.num_shards == null) if (policy.min_ranges) |count| {

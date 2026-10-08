@@ -4842,7 +4842,7 @@ pub const DB = struct {
     /// Creation/provisioning-only configuration. Existing persisted authority
     /// cannot be changed, and populated roots require an explicit migration.
     pub fn configureTableStorage(self: *DB, settings: table_storage_mod.Settings) !void {
-        if (settings.engine != .native) return error.ObjectStorageRequiresHostedTable;
+        if (settings.engine != .local) return error.ObjectStorageRequiresHostedTable;
         lockApply(self);
         defer self.core.unlockApply();
         const raw = self.core.store.get(self.alloc, &internal_keys.table_storage_settings_key) catch |err| switch (err) {
