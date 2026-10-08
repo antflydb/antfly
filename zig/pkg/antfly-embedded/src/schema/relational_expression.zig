@@ -159,6 +159,7 @@ const Node = struct {
     fold_ascii: bool = false,
     literal: Value = .null,
     sql_type: ?Numeric = null,
+    numeric_modifier: ?exact.TypeModifier = null,
 };
 
 pub const Plan = struct {
@@ -454,6 +455,8 @@ fn numericOperand(ctx: *exact.Context, value: Value, real: bool) !exact.Value {
 
 fn numericOperation(execution: *Execution, node: Node, operands: []const Value, source: Node) !Value {
     const input = operands[0];
+    if (node.op == .cast and input == .numeric) if (node.numeric_modifier) |modifier|
+        return normalizeNumericBinding(execution, input.numeric, modifier, false);
     if (input == .numeric and (node.op == .negate or (node.op == .cast and node.sql_type == .numeric))) {
         const View = @import("../common/sql_numeric_layout.zig").View;
         const view = try View.openWithBudget(input.numeric, .{}, &execution.numeric);
@@ -481,7 +484,13 @@ fn numericOperationInner(scratch: *NumericScratch, node: Node, operands: []const
     const a = try numericOperand(ctx, operands[0], source.sql_type == .float32);
     if (node.op == .cast) {
         const target = node.sql_type.?;
-        if (target == .numeric) return scratch.encode(a);
+        if (target == .numeric) {
+            if (node.numeric_modifier) |modifier| {
+                const constrained = try exact.applyTypeModifier(ctx, a, modifier);
+                return scratch.encode(constrained.value);
+            }
+            return scratch.encode(a);
+        }
         if (casts.integral(target)) {
             const integer = try exact.toInteger(i64, ctx, a);
             return numericCast(.{ .integer = integer }, target);
@@ -612,7 +621,7 @@ const Compiler = struct {
             const allowed = switch (op) {
                 .literal => std.mem.eql(u8, name, "type") or std.mem.eql(u8, name, "value") or std.mem.eql(u8, name, "sql_type"),
                 .column => std.mem.eql(u8, name, "column"),
-                .cast => std.mem.eql(u8, name, "args") or std.mem.eql(u8, name, "type") or std.mem.eql(u8, name, "sql_type"),
+                .cast => std.mem.eql(u8, name, "args") or std.mem.eql(u8, name, "type") or std.mem.eql(u8, name, "sql_type") or std.mem.eql(u8, name, "numeric_modifier"),
                 .add, .subtract, .multiply, .divide, .modulo, .negate => std.mem.eql(u8, name, "args") or std.mem.eql(u8, name, "sql_type"),
                 else => std.mem.eql(u8, name, "args") or (isComparison(op) and std.mem.eql(u8, name, "collation")),
             };
@@ -778,6 +787,16 @@ const Compiler = struct {
             if (op == .add or op == .subtract or op == .multiply or op == .divide or op == .modulo or op == .negate) {
                 for (node.children) |child| if (numericIdentity(self.nodes.items[child]) != typed) return error.InvalidRelationalExpressionType;
             }
+        }
+        if (input.object.get("numeric_modifier")) |constraint| {
+            if (node.op != .cast or node.kind != .numeric or node.sql_type != .numeric) return error.InvalidRelationalExpressionType;
+            const modifier = @import("../sql/numeric_storage.zig").modifierFromJson(constraint) catch return error.InvalidRelationalExpressionType;
+            node.numeric_modifier = modifier;
+            self.frame("SQL NUMERIC cast modifier v1");
+            var identity: [4]u8 = undefined;
+            std.mem.writeInt(u16, identity[0..2], modifier.precision, .little);
+            std.mem.writeInt(i16, identity[2..4], modifier.scale, .little);
+            self.frame(&identity);
         }
         const index: u16 = @intCast(self.nodes.items.len);
         try self.nodes.append(self.alloc, node);
@@ -972,6 +991,122 @@ test "relational declarations exact NUMERIC SQL lowering and native programs mat
         exercised += 1;
     }
     try std.testing.expectEqual(@as(usize, 537), exercised);
+}
+
+test "relational declarations NUMERIC modifier SQL lowering matches PostgreSQL and retains lazy overflow" {
+    const a = std.testing.allocator;
+    const Case = struct { sql: []const u8, expected: ?[]const u8 = null, @"error": ?[]const u8 = null };
+    const fixture = try std.json.parseFromSlice(struct { entries: []const Case }, a, @embedFile("../sql/fixtures/sql_numeric_typmod_reference.json"), .{ .ignore_unknown_fields = true });
+    defer fixture.deinit();
+    const Run = struct {
+        fn evaluate(alloc: Allocator, sql: []const u8) !std.json.Value {
+            var compiled = try @import("../sql/compiler.zig").compileScalar(alloc, sql, .{});
+            defer compiled.deinit();
+            const lowered = try @import("../sql/schema_expression.zig").lowerColumns(alloc, &.{}, compiled.expression, null);
+            var plan = try Plan.init(alloc, .{ .storage_mode = .relational }, lowered.expression, .numeric);
+            defer plan.deinit();
+            const result = try plan.evaluate(alloc, &.{});
+            if (result == .null) return .null;
+            return @import("../sql/numeric_storage.zig").jsonValueAlloc(alloc, result.numeric);
+        }
+    };
+    var tested: usize = 0;
+    for (fixture.value.entries) |case| {
+        // Arrays and these functions still lack a durable VM value/opcode.
+        // Their SQL runtime coverage is not durable-expression activation.
+        var unsupported = false;
+        for ([_][]const u8{ "ARRAY", "[]", "GREATEST", "NULLIF", "abs(", "round(" }) |token| {
+            if (std.mem.indexOf(u8, case.sql, token) != null) unsupported = true;
+        }
+        if (unsupported) continue;
+        tested += 1;
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const actual = Run.evaluate(arena.allocator(), case.sql) catch |err| {
+            const state = case.@"error" orelse {
+                std.debug.print("Durable NUMERIC modifier failed: {s}: {s}\n", .{ case.sql, @errorName(err) });
+                return err;
+            };
+            try std.testing.expectEqualStrings(state, @import("../sql/errors.zig").describe(err).code);
+            continue;
+        };
+        try std.testing.expect(case.@"error" == null);
+        if (case.expected) |expected| {
+            try std.testing.expectEqualStrings(expected, if (actual == .number_string) actual.number_string else actual.string);
+        } else try std.testing.expect(actual == .null);
+    }
+    try std.testing.expectEqual(@as(usize, 42), tested);
+}
+
+test "relational declarations NUMERIC modifier casts bind fingerprints and reject malformed contracts" {
+    const a = std.testing.allocator;
+    var first: ?[32]u8 = null;
+    for ([_][]const u8{ "{\"precision\":4,\"scale\":2}", "{\"precision\":4,\"scale\":1}" }) |modifier| {
+        const text = try std.fmt.allocPrint(a, "{{\"op\":\"cast\",\"type\":\"numeric\",\"sql_type\":\"numeric\",\"numeric_modifier\":{s},\"args\":[{{\"op\":\"literal\",\"type\":\"numeric\",\"value\":\"1.245\"}}]}}", .{modifier});
+        defer a.free(text);
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, text, .{});
+        defer parsed.deinit();
+        var plan = try Plan.init(a, .{ .storage_mode = .relational }, parsed.value, .numeric);
+        defer plan.deinit();
+        if (first) |fingerprint| try std.testing.expect(!std.mem.eql(u8, &fingerprint, &plan.fingerprint)) else first = plan.fingerprint;
+    }
+    for ([_][]const u8{
+        "{\"op\":\"cast\",\"type\":\"integer\",\"sql_type\":\"int32\",\"numeric_modifier\":{\"precision\":4,\"scale\":2},\"args\":[{\"op\":\"literal\",\"type\":\"numeric\",\"value\":\"1\"}]}",
+        "{\"op\":\"cast\",\"type\":\"numeric\",\"sql_type\":\"numeric\",\"numeric_modifier\":null,\"args\":[{\"op\":\"literal\",\"type\":\"numeric\",\"value\":\"1\"}]}",
+    }) |text| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, text, .{});
+        defer parsed.deinit();
+        try std.testing.expectError(error.InvalidRelationalExpressionType, Plan.init(a, .{ .storage_mode = .relational }, parsed.value, if (parsed.value.object.get("type").?.string[0] == 'i') .integer else .numeric));
+    }
+}
+
+test "relational declarations NUMERIC modifier casts own rounding scratch and reuse constrained bytes" {
+    const a = std.testing.allocator;
+    const Run = struct {
+        fn run(alloc: Allocator) !void {
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            var compiled = try @import("../sql/compiler.zig").compileScalar(alloc, "CAST(CAST(1.245 AS numeric(4,2)) AS numeric(3,1))", .{});
+            defer compiled.deinit();
+            const lowered = try @import("../sql/schema_expression.zig").lowerColumns(arena.allocator(), &.{}, compiled.expression, null);
+            var plan = try Plan.init(alloc, .{ .storage_mode = .relational }, lowered.expression, .numeric);
+            defer plan.deinit();
+            const value = try plan.evaluate(arena.allocator(), &.{});
+            const text = try @import("../sql/numeric_storage.zig").jsonValueAlloc(arena.allocator(), value.numeric);
+            try std.testing.expectEqualStrings("1.3", text.number_string);
+        }
+        fn canceled(_: ?*anyopaque) anyerror!void {
+            return error.Canceled;
+        }
+    };
+    try Run.run(a);
+    var stable = std.testing.FailingAllocator.init(a, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(stable.allocator(), Run.run, .{});
+    var parsed = try std.json.parseFromSlice(std.json.Value, a,
+        \\{"op":"cast","type":"numeric","sql_type":"numeric","numeric_modifier":{"precision":4,"scale":2},"args":[{"op":"literal","type":"numeric","value":"1.25"}]}
+    , .{});
+    defer parsed.deinit();
+    var plan = try Plan.init(a, .{ .storage_mode = .relational }, parsed.value, .numeric);
+    defer plan.deinit();
+    var unavailable = std.heap.FixedBufferAllocator.init(&.{});
+    var bytes: usize = max_allocated_bytes;
+    var execution = Execution.init(unavailable.allocator(), &bytes);
+    const literal = plan.nodes[0].literal.numeric;
+    const started = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
+    for (0..10000) |_| {
+        const value = try plan.evaluateWithExecution(&execution, &.{});
+        try std.testing.expectEqual(literal.ptr, value.numeric.ptr);
+    }
+    std.debug.print("NUMERIC modifier casts: rows=10000 allocated_bytes=0 elapsed_ns={}\n", .{std.Io.Clock.now(.awake, std.testing.io).nanoseconds - started});
+    try std.testing.expectEqual(max_allocated_bytes, bytes);
+    execution.numeric.remaining = 0;
+    try std.testing.expectError(error.RelationalExpressionBudgetExceeded, plan.evaluateWithExecution(&execution, &.{}));
+    try std.testing.expectError(error.RelationalExpressionBudgetExceeded, plan.evaluateWithExecution(&execution, &.{}));
+    execution = Execution.init(unavailable.allocator(), &bytes);
+    execution.numeric.checkpoint = Run.canceled;
+    try std.testing.expectError(error.Canceled, plan.evaluateWithExecution(&execution, &.{}));
+    execution.numeric.checkpoint = null;
+    try std.testing.expectError(error.Canceled, plan.evaluateWithExecution(&execution, &.{}));
 }
 
 test "relational declarations mixed NUMERIC SQL row programs match PostgreSQL" {
@@ -2181,7 +2316,11 @@ fn checkExpressionAllocationFailure(alloc: Allocator) !void {
 }
 
 test "relational declarations CHECK expressions release every allocation failure" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkExpressionAllocationFailure, .{});
+    // Arena remaps depend on surrounding addresses and can change allocation
+    // counts between fault indexes. Exercise the allocating fallback with a
+    // deterministic backing owner instead of intermittently skipping indexes.
+    var stable = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(stable.allocator(), checkExpressionAllocationFailure, .{});
 }
 
 test "relational declarations scalar expressions checked arithmetic lazy null and ordinal independent identity" {

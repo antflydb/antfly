@@ -13755,6 +13755,10 @@ export interface components {
          *     Exact NUMERIC programs require reader capability version 21 even when
          *     their result is boolean or integer. Float/integer assignment casts keep
          *     their declared PostgreSQL rounding and overflow semantics.
+         *     A cast to numeric may specify numeric_modifier for PostgreSQL precision
+         *     and signed-scale coercion. Overflow is checked when the selected cast
+         *     executes; unselected lazy branches do not fail. Modifier-bearing programs
+         *     require reader capability version 23 even with integer/boolean output.
          *     case_when takes alternating boolean conditions and result expressions,
          *     followed by a mandatory fallback result (3 to 31 arguments, at most
          *     15 branches). Conditions are evaluated in order; only the selected
@@ -13775,6 +13779,8 @@ export interface components {
             type?: components["schemas"]["RelationalExpressionType"];
             /** @description Numeric builtin result identity; accepted only on numeric literals, arithmetic, negate, and cast. Requires schema capability version 18. */
             sql_type?: components["schemas"]["SQLBuiltinType"];
+            /** @description Optional precision/signed-scale coercion; accepted only on cast with type numeric and sql_type numeric. Requires reader capability version 23. */
+            numeric_modifier?: components["schemas"]["SQLNumericModifier"];
             /** @description Typed literal value, including null. */
             value?: unknown;
             column?: string;

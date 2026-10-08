@@ -87,7 +87,7 @@ export function validateRelationalExpression(
         : op === "column"
           ? ["op", "column"]
           : op === "cast"
-            ? ["op", "type", "sql_type", "args"]
+            ? ["op", "type", "sql_type", "numeric_modifier", "args"]
             : numericOperations.has(op)
               ? ["op", "args", "sql_type"]
               : comparisons.has(op)
@@ -113,6 +113,36 @@ export function validateRelationalExpression(
     }
     if (op === "cast" && node.sql_type === undefined)
       throw new TypeError(`${location}.sql_type is required for a numeric cast`);
+    if (Object.prototype.hasOwnProperty.call(node, "numeric_modifier")) {
+      const modifier = node.numeric_modifier;
+      if (
+        node.type !== "numeric" ||
+        node.sql_type !== "numeric" ||
+        modifier === null ||
+        typeof modifier !== "object" ||
+        Array.isArray(modifier)
+      )
+        throw new TypeError(
+          `${location}.numeric_modifier requires a NUMERIC cast and precision/scale object`
+        );
+      const fields = modifier as Record<string, unknown>;
+      if (
+        Object.keys(fields).length !== 2 ||
+        !Object.prototype.hasOwnProperty.call(fields, "precision") ||
+        !Object.prototype.hasOwnProperty.call(fields, "scale") ||
+        typeof fields.precision !== "number" ||
+        !Number.isInteger(fields.precision) ||
+        fields.precision < 1 ||
+        fields.precision > 1000 ||
+        typeof fields.scale !== "number" ||
+        !Number.isInteger(fields.scale) ||
+        fields.scale < -1000 ||
+        fields.scale > 1000
+      )
+        throw new TypeError(
+          `${location}.numeric_modifier requires integer precision 1..1000 and scale -1000..1000`
+        );
+    }
     if (op === "literal") {
       if (!isRelationalExpressionType(node.type))
         throw new TypeError(`${location}.type is required for a literal`);

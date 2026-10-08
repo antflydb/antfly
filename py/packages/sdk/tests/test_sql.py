@@ -60,7 +60,12 @@ def test_array_column_schema_exports_explicit_element_identity_and_transport_con
 
 def test_numeric_scalar_and_array_result_modifiers_round_trip():
     for kind in ("number", "array"):
-        source = {"name": "n", "type": kind, "element_type": "numeric", "numeric_modifier": {"precision": 2, "scale": -3}}
+        source = {
+            "name": "n",
+            "type": kind,
+            "element_type": "numeric",
+            "numeric_modifier": {"precision": 2, "scale": -3},
+        }
         column = SQLColumn.from_dict(source)
         assert column.numeric_modifier.precision == 2
         assert column.numeric_modifier.scale == -3
@@ -196,6 +201,21 @@ def test_public_numeric_schema_expression_round_trip_retains_exact_literal_text(
     source = {"op": "literal", "type": "numeric", "sql_type": "numeric", "value": "9007199254740993.2500"}
     expression = RelationalScalarExpression.from_dict(source)
     assert expression.sql_type == SQLBuiltinType.NUMERIC
+    assert expression.to_dict() == source
+
+
+@pytest.mark.parametrize("scale", [-3, 0, 4])
+def test_public_numeric_cast_modifier_round_trip(scale):
+    source = {
+        "op": "cast",
+        "type": "numeric",
+        "sql_type": "numeric",
+        "numeric_modifier": {"precision": 2, "scale": scale},
+        "args": [{"op": "literal", "type": "numeric", "value": "1.245"}],
+    }
+    expression = RelationalScalarExpression.from_dict(source)
+    assert expression.numeric_modifier.precision == 2
+    assert expression.numeric_modifier.scale == scale
     assert expression.to_dict() == source
 
 

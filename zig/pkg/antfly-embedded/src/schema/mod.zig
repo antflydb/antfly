@@ -803,13 +803,17 @@ fn requiresTypedExpressions(schema: ParsedTableSchema, predicate: bool) bool {
     return false;
 }
 
-fn exactNumericExpression(value: std.json.Value, depth: usize) bool {
+const NumericCapability = enum { values, modifiers };
+
+fn numericExpressionJson(value: std.json.Value, depth: usize, capability: NumericCapability) bool {
     if (depth > 16 or value != .object) return false;
-    for ([_][]const u8{ "type", "sql_type" }) |field| if (value.object.get(field)) |kind| {
+    if (capability == .modifiers) {
+        if (value.object.contains("numeric_modifier")) return true;
+    } else for ([_][]const u8{ "type", "sql_type" }) |field| if (value.object.get(field)) |kind| {
         if (kind == .string and std.mem.eql(u8, kind.string, "numeric")) return true;
     };
     if (value.object.get("args")) |args| if (args == .array) for (args.array.items) |arg| {
-        if (exactNumericExpression(arg, depth + 1)) return true;
+        if (numericExpressionJson(arg, depth + 1, capability)) return true;
     };
     return false;
 }
@@ -834,31 +838,71 @@ test "relational declarations exact NUMERIC generated programs publish capabilit
     try std.testing.expectEqual(@as(i64, 9007199254740994), document.value.object.get("n").?.integer);
 }
 
+test "relational declarations NUMERIC cast modifiers publish capability for nonnumeric results" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        "CREATE TABLE t (n bigint DEFAULT CAST(CAST(1.245 AS numeric(4,2)) AS bigint))",
+        "CREATE TABLE t (n bigint GENERATED ALWAYS AS (CAST(CAST(1.245 AS numeric(4,2)) AS bigint)) STORED)",
+        "CREATE TABLE t (n bigint, CHECK (CAST(1.245 AS numeric(4,2)) > 0))",
+    }) |sql| {
+        var compiled = try @import("../sql/compiler.zig").compile(a, sql, .{});
+        defer compiled.deinit();
+        const source = try @import("../sql/ddl_runtime.zig").createSchemaAlloc(a, compiled.statement.create_table);
+        defer a.free(source);
+        var validator = try CompiledTableValidator.init(a, source);
+        defer validator.deinit(a);
+        const runtime = try deriveRuntimeTableSchema(a, validator.schema);
+        defer storage_schema.freeSchema(a, runtime);
+        const checks = try deriveRelationalCheckLayout(a, validator.schema);
+        defer storage_schema.freeSchema(a, checks);
+        try std.testing.expect(runtime.requires_numeric_modifiers);
+        try std.testing.expect(checks.requires_numeric_modifiers);
+        const bytes = try storage_schema.serializeSchema(a, runtime);
+        defer a.free(bytes);
+        const restored = try storage_schema.deserializeSchema(a, bytes);
+        defer storage_schema.freeSchema(a, restored);
+        try std.testing.expect(restored.requires_numeric_modifiers);
+        try std.testing.expect(restored.requires_exact_numeric_expressions);
+    }
+}
+
 fn requiresExactNumericExpressions(schema: ParsedTableSchema) bool {
+    return requiresNumericExpressionCapability(schema, .values);
+}
+
+fn requiresNumericModifiers(schema: ParsedTableSchema) bool {
+    return requiresNumericExpressionCapability(schema, .modifiers);
+}
+
+fn requiresNumericExpressionCapability(schema: ParsedTableSchema, capability: NumericCapability) bool {
     if (schema.checks) |checks| for (checks.value) |check| if (check.expression) |expression| {
-        if (exactNumericWire(expression, 0)) return true;
+        if (numericExpressionWire(expression, 0, capability)) return true;
     };
     if (schema.relational_indexes) |indexes| for (indexes.value) |index| {
-        for (index.keys) |key| if (key.expression) |expression| if (exactNumericWire(expression, 0)) return true;
+        for (index.keys) |key| if (key.expression) |expression| if (numericExpressionWire(expression, 0, capability)) return true;
     };
     if (schema.unique_constraints) |constraints| for (constraints.value) |constraint| if (constraint.keys) |keys| {
-        for (keys) |key| if (key.expression) |expression| if (exactNumericWire(expression, 0)) return true;
+        for (keys) |key| if (key.expression) |expression| if (numericExpressionWire(expression, 0, capability)) return true;
     };
     for ([_]?std.json.Parsed(std.json.Value){ schema.column_defaults, schema.generated_columns }) |definitions| if (definitions) |declarations| {
         if (declarations.value == .array) for (declarations.value.array.items) |entry| {
             if (entry == .object) if (entry.object.get("expression")) |expression| {
-                if (exactNumericExpression(expression, 0)) return true;
+                if (numericExpressionJson(expression, 0, capability)) return true;
             };
         };
     };
     return false;
 }
 
-fn exactNumericWire(expression: anytype, depth: usize) bool {
+fn numericExpressionWire(expression: anytype, depth: usize, capability: NumericCapability) bool {
     if (depth > 16) return false;
-    if (expression.type) |kind| if (std.mem.eql(u8, @tagName(kind), "numeric")) return true;
-    if (expression.sql_type) |kind| if (std.mem.eql(u8, @tagName(kind), "numeric")) return true;
-    if (expression.args) |args| for (args) |arg| if (exactNumericWire(arg, depth + 1)) return true;
+    if (capability == .modifiers) {
+        if (expression.numeric_modifier != null) return true;
+    } else {
+        if (expression.type) |kind| if (std.mem.eql(u8, @tagName(kind), "numeric")) return true;
+        if (expression.sql_type) |kind| if (std.mem.eql(u8, @tagName(kind), "numeric")) return true;
+    }
+    if (expression.args) |args| for (args) |arg| if (numericExpressionWire(arg, depth + 1, capability)) return true;
     return false;
 }
 
@@ -1030,6 +1074,7 @@ pub fn deriveRuntimeTableSchema(alloc: std.mem.Allocator, schema: ParsedTableSch
         .requires_predicate_expressions = requiresTypedExpressions(schema, true),
         .requires_exact_numeric_expressions = requiresExactNumericExpressions(schema),
         .requires_exact_numeric_validation = requiresExactNumericValidation(schema),
+        .requires_numeric_modifiers = requiresNumericModifiers(schema),
         .storage_mode = switch (schema.storage_mode) {
             .document => .document,
             .relational => .relational,
@@ -1056,6 +1101,7 @@ pub fn deriveRelationalCheckLayout(alloc: std.mem.Allocator, schema: ParsedTable
         .requires_predicate_expressions = requiresTypedExpressions(schema, true),
         .requires_exact_numeric_expressions = requiresExactNumericExpressions(schema),
         .requires_exact_numeric_validation = requiresExactNumericValidation(schema),
+        .requires_numeric_modifiers = requiresNumericModifiers(schema),
         .relational_columns = try deriveRuntimeRelationalColumns(alloc, schema),
     };
 }

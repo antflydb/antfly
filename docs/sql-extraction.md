@@ -5863,3 +5863,60 @@ Validation passes the 35 focused cache/reader tests, 164 lake integration tests
 and all 503 lake-native tests without failures or leaks. The composed restart
 test preserves ranking/highlights with zero provider requests and bytes.
 Formatting and whitespace checks pass. No live GCS latency claim is made.
+
+### Durable NUMERIC modifier expressions and generated wire contracts
+
+Durable scalar casts now carry validated NUMERIC precision/signed-scale
+modifiers in the immutable VM node and semantic fingerprint. Assignment uses
+the existing shared execution budget and canonical constrained-byte fast path;
+rounding allocates bounded unpublished scratch only when needed. Overflow is
+reported when a selected cast executes, not while compiling an unselected lazy
+branch. Nested casts retain independent modifiers rather than overwriting the
+inner coercion. NULL propagation is unchanged.
+
+SQL lowering preserves the modifier on numeric, integer/float-to-numeric and
+typed NULL casts. PostgreSQL-valid numeric lexemes such as `.00994` are carried
+as validated exact decimal strings in the public literal contract instead of
+being serialized as invalid raw JSON numbers. This does not round through f64.
+
+Capability derivation traverses defaults, generated columns, CHECKs, index keys
+and UNIQUE keys for modifier-bearing programs. Both full runtime and reduced
+CHECK layouts publish capability 23 even with integer/boolean final results;
+the durable schema round-trip retains the requirement. Existing catalog reader
+fences continue to reject older capability versions.
+
+The OpenAPI expression contract owns the optional modifier, and Zig, Go, Python,
+TypeScript and Rust specification artifacts are regenerated. TypeScript local
+admission rejects wrong targets, missing/extra fields, fractional precision or
+scale, and out-of-range values before transport. SDK round-trips retain signed
+scale and recursive argument ordering.
+
+The durable VM matches all 42 currently lowerable scalar cases from the existing
+56-case PostgreSQL modifier observer, including negative scale, scale greater
+than precision, nested rounding, float4 conversion, errors, NULL and lazy CASE.
+Arrays and broader functions still lacking durable VM support remain guarded;
+their SQL-runtime coverage is not claimed as durable-expression activation.
+The observer also reverified its 12 query descriptors, and the independent
+893-case exact NUMERIC observer reverified successfully.
+
+Native tests cover modifier identity, malformed contracts, every allocation
+failure, sticky work/cancellation and 10,000 zero-allocation constrained cast
+reuses (about 2.3 ms in Debug, not an end-to-end latency benchmark). The existing
+CHECK fault sweep now disables address-dependent arena remaps so every allocation
+failure index is deterministic rather than intermittently missed.
+
+Public column-modifier activation remains guarded pending schema annotations,
+normalization of all mapped postimage fields under a shared preparation budget,
+and integrated reopen/restore publication coverage. Original parity inventory
+dispositions remain 448 implemented, 136 rejected, 73 superseded and 929
+unresolved; this infrastructure change does not inflate case credit.
+
+Final-source validation passes 50 durable-expression tests, 601 local SQL tests
+(three existing skips), 226 server SQL tests, 185 native relational-index tests
+and their server integration owner, without failures or leaks. SDK validation
+passes 450 TypeScript tests (one existing skip), typecheck, 39 Python SQL tests,
+focused Go SQL/relational transport tests, and all 17 Rust SDK unit/integration
+tests. Rust validation also exposed and corrected a stale aggregate-recipe
+default initializer so the current generated API builds. OpenAPI/Python/Rust
+generation checks, control-catalog, inventory, formatting and whitespace checks
+pass. The work is committed locally, not pushed.

@@ -113,6 +113,28 @@ func TestRelationalConditionalExpressionContract(t *testing.T) {
 	}
 }
 
+func TestRelationalNumericCastModifierRoundTrip(t *testing.T) {
+	source := `{"op":"cast","type":"numeric","sql_type":"numeric","numeric_modifier":{"precision":2,"scale":-3},"args":[{"op":"literal","type":"numeric","value":"1.245"}]}`
+	var expression RelationalScalarExpression
+	if err := json.Unmarshal([]byte(source), &expression); err != nil {
+		t.Fatal(err)
+	}
+	if expression.NumericModifier.Precision != 2 || expression.NumericModifier.Scale != -3 {
+		t.Fatalf("lost modifier: %+v", expression)
+	}
+	encoded, err := json.Marshal(expression)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var restored RelationalScalarExpression
+	if err := json.Unmarshal(encoded, &restored); err != nil {
+		t.Fatal(err)
+	}
+	if restored.NumericModifier != expression.NumericModifier || len(restored.Args) != 1 {
+		t.Fatalf("changed modifier: %s", encoded)
+	}
+}
+
 func (fn relationalHTTPDoer) Do(req *http.Request) (*http.Response, error) { return fn(req) }
 
 func TestRelationalRowQueryPreservesExactInteger(t *testing.T) {

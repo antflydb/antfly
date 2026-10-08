@@ -767,6 +767,7 @@ impl Default for types::CreateGraphIndexRequest {
 impl Default for types::CreateAlgebraicIndexRequest {
     fn default() -> Self {
         Self {
+            aggregates: Vec::new(),
             derive_from_schema: None,
             description: None,
             enrichments: Vec::new(),
@@ -801,6 +802,21 @@ impl types::CreateIndexError {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn relational_numeric_cast_modifier_round_trip() {
+        let source = serde_json::json!({
+            "op": "cast", "type": "numeric", "sql_type": "numeric",
+            "numeric_modifier": {"precision": 2, "scale": -3},
+            "args": [{"op": "literal", "type": "numeric", "value": "99499"}]
+        });
+        let expression: super::types::RelationalScalarExpression =
+            serde_json::from_value(source.clone()).unwrap();
+        let restored = serde_json::to_value(expression).unwrap();
+        assert_eq!(restored["numeric_modifier"], source["numeric_modifier"]);
+        assert_eq!(restored["args"][0]["value"], "99499");
+        assert_eq!(restored["args"].as_array().unwrap().len(), 1);
+    }
+
     #[test]
     fn graph_index_default_and_metric_configuration_round_trip() {
         let default = super::types::CreateGraphIndexRequest::default();

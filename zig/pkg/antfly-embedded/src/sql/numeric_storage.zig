@@ -25,6 +25,29 @@ pub fn encodeJsonAlloc(alloc: std.mem.Allocator, value: std.json.Value) ![]u8 {
     return encodeJsonWithModifier(&ctx, value, null);
 }
 
+/// Shared exact JSON contract for schema annotations and durable casts. Both
+/// members are required; unknown fields and lossy integer coercions are refused.
+pub fn modifierFromJson(input: std.json.Value) !numeric.TypeModifier {
+    if (input != .object or input.object.count() != 2) return error.SqlInvalidParameterValue;
+    const Read = struct {
+        fn integer(value: std.json.Value) !i64 {
+            return switch (value) {
+                .integer => value.integer,
+                .number_string => |text| std.fmt.parseInt(i64, text, 10) catch error.SqlInvalidParameterValue,
+                else => error.SqlInvalidParameterValue,
+            };
+        }
+    };
+    const precision = input.object.get("precision") orelse return error.SqlInvalidParameterValue;
+    const scale = input.object.get("scale") orelse return error.SqlInvalidParameterValue;
+    const modifier: numeric.TypeModifier = .{
+        .precision = std.math.cast(u16, try Read.integer(precision)) orelse return error.SqlInvalidParameterValue,
+        .scale = std.math.cast(i16, try Read.integer(scale)) orelse return error.SqlInvalidParameterValue,
+    };
+    try modifier.validate();
+    return modifier;
+}
+
 /// One caller-owned budget covers parsing, assignment rounding and encoding.
 /// Restore must verify the canonical value instead of calling this coercer.
 pub fn encodeJsonWithModifier(ctx: *numeric.Context, value: std.json.Value, modifier: ?numeric.TypeModifier) ![]u8 {
@@ -54,6 +77,25 @@ pub fn jsonValueAlloc(alloc: std.mem.Allocator, bytes: []const u8) !std.json.Val
     defer parsed.deinit();
     const text = try numeric.format(&ctx, parsed.value);
     return if (parsed.value.kind == .finite) .{ .number_string = text } else .{ .string = text };
+}
+
+test "SQL NUMERIC modifier JSON requires exact bounded integer fields" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "{\"precision\":2,\"scale\":-3}", "{\"precision\":2,\"scale\":4}", "{\"precision\":1000,\"scale\":1000}" }) |input| {
+        for ([_]bool{ true, false }) |parse_numbers| {
+            var parsed = try std.json.parseFromSlice(std.json.Value, a, input, .{ .parse_numbers = parse_numbers });
+            defer parsed.deinit();
+            const modifier = try modifierFromJson(parsed.value);
+            try modifier.validate();
+        }
+    }
+    for ([_][]const u8{ "null", "[]", "{}", "{\"precision\":2}", "{\"precision\":0,\"scale\":0}", "{\"precision\":1001,\"scale\":0}", "{\"precision\":2,\"scale\":-1001}", "{\"precision\":2,\"scale\":1001}", "{\"precision\":2.5,\"scale\":1}", "{\"precision\":2,\"scale\":1.0}", "{\"precision\":\"2\",\"scale\":1}", "{\"precision\":2,\"scale\":null}", "{\"precision\":2,\"scale\":1,\"extra\":true}" }) |input| {
+        for ([_]bool{ true, false }) |parse_numbers| {
+            var parsed = try std.json.parseFromSlice(std.json.Value, a, input, .{ .parse_numbers = parse_numbers });
+            defer parsed.deinit();
+            try std.testing.expectError(error.SqlInvalidParameterValue, modifierFromJson(parsed.value));
+        }
+    }
 }
 
 test "SQL NUMERIC modifier storage separates write coercion from strict restore with PostgreSQL oracle" {

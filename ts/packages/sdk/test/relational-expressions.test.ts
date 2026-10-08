@@ -48,9 +48,79 @@ describe("relational expression structural admission", () => {
       )
     ).toThrow(/literal budget/);
   });
+
+  it.each([
+    { precision: 2, scale: -3 },
+    { precision: 2, scale: 4 },
+    { precision: 1000, scale: 1000 },
+  ])("admits PostgreSQL NUMERIC modifier %j", (numeric_modifier) => {
+    expect(() =>
+      validate({
+        op: "cast",
+        type: "numeric",
+        sql_type: "numeric",
+        numeric_modifier,
+        args: [integer],
+      })
+    ).not.toThrow();
+  });
+
+  it.each([
+    null,
+    undefined,
+    {},
+    { precision: 2 },
+    { precision: 0, scale: 0 },
+    { precision: 1001, scale: 0 },
+    { precision: 2, scale: -1001 },
+    { precision: 2, scale: 1001 },
+    { precision: 2.5, scale: 1 },
+    { precision: 2, scale: 1.5 },
+    { precision: "2", scale: 1 },
+    { precision: 2, scale: 1, extra: true },
+  ])("rejects malformed modifier %j", (numeric_modifier) => {
+    expect(() =>
+      validate({
+        op: "cast",
+        type: "numeric",
+        sql_type: "numeric",
+        numeric_modifier,
+        args: [integer],
+      })
+    ).toThrow(TypeError);
+  });
+
+  it("rejects modifiers on non-NUMERIC casts and non-cast nodes", () => {
+    const numeric_modifier = { precision: 4, scale: 2 };
+    expect(() =>
+      validate({
+        op: "cast",
+        type: "integer",
+        sql_type: "int32",
+        numeric_modifier,
+        args: [integer],
+      })
+    ).toThrow(TypeError);
+    expect(() => validate({ ...integer, numeric_modifier })).toThrow(TypeError);
+  });
 });
 
 describe("generated relational expression and predicate contracts", () => {
+  it("retains signed NUMERIC modifiers in generated recursive contracts", () => {
+    const generated: RelationalColumnExpression = {
+      column: "n",
+      expression: {
+        op: "cast",
+        type: "numeric",
+        sql_type: "numeric",
+        numeric_modifier: { precision: 2, scale: -3 },
+        args: [{ op: "literal", type: "numeric", value: "99499" }],
+      },
+    };
+    validateRelationalExpression(generated.expression, "expression", { nodes: 0, literalBytes: 0 });
+    expect(JSON.parse(JSON.stringify(generated))).toEqual(generated);
+  });
+
   it("retains conditional branch order and a typed NULL fallback", () => {
     const generated: RelationalColumnExpression = {
       column: "n",

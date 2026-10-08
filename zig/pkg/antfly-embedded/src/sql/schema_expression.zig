@@ -48,7 +48,12 @@ pub fn numericLiteral(alloc: std.mem.Allocator, value: Json) !Json {
         var parsed = try @import("numeric_storage.zig").fromJson(&context, value);
         defer parsed.deinit();
     }
-    return json(alloc, .{ .op = "literal", .type = "numeric", .sql_type = "numeric", .value = value });
+    // SQL numeric lexemes (for example .00994) are not necessarily JSON
+    // numbers. The public exact-literal contract accepts decimal strings;
+    // transport the validated lexeme without a lossy float conversion or
+    // emitting invalid JSON from number_string.
+    const wire = if (value == .number_string) Json{ .string = value.number_string } else value;
+    return json(alloc, .{ .op = "literal", .type = "numeric", .sql_type = "numeric", .value = wire });
 }
 
 pub fn lower(alloc: std.mem.Allocator, schema: Json, expression: *const ast.Scalar, expected: ?ast.ColumnType) !Json {
@@ -178,31 +183,43 @@ pub fn lowerColumns(alloc: std.mem.Allocator, columns: []const scalar.Column, ex
                 break :blk result;
             },
             .cast => |part| blk: {
-                if (part.numeric_modifier != null) return error.UnsupportedSqlShape;
                 const source = program.instructions[part.operand].type;
-                // NULL retains its explicit target domain without invoking an
-                // input function or borrowing the unknown literal's identity.
-                if (nullLiteral(program.instructions[part.operand])) {
-                    var result = try json(alloc, .{ .op = "literal", .type = nativeType(part.type, part.element_type), .value = @as(?u8, null) });
-                    if (part.type == .integer or part.type == .number) if (part.element_type) |identity| {
-                        try result.object.put(alloc, "sql_type", .{ .string = @tagName(identity) });
-                    };
-                    break :blk result;
+                var lowered: Json = converted: {
+                    // NULL retains its explicit target domain without invoking an
+                    // input function or borrowing the unknown literal's identity.
+                    if (nullLiteral(program.instructions[part.operand])) {
+                        var result = try json(alloc, .{ .op = "literal", .type = nativeType(part.type, part.element_type), .value = @as(?u8, null) });
+                        if (part.type == .integer or part.type == .number) if (part.element_type) |identity| {
+                            try result.object.put(alloc, "sql_type", .{ .string = @tagName(identity) });
+                        };
+                        break :converted result;
+                    }
+                    if ((source.kind == .integer or source.kind == .number) and (part.type == .integer or part.type == .number)) {
+                        const target_type: @import("array_value.zig").ElementType = part.element_type orelse if (part.type == .integer) .int64 else .float64;
+                        break :converted try json(alloc, .{ .op = "cast", .type = nativeType(part.type, target_type), .sql_type = @tagName(target_type), .args = &[_]Json{values[part.operand]} });
+                    }
+                    // Validate unknown input with the exact NUMERIC input function;
+                    // the durable plan owns its compiled coefficient, never f64.
+                    if (part.element_type == .numeric and source.kind == .string and
+                        program.instructions[part.operand].operation == .literal)
+                    {
+                        break :converted try numericLiteral(alloc, program.instructions[part.operand].operation.literal);
+                    }
+                    if (source.kind != part.type) return error.UnsupportedSqlShape;
+                    if (source.element_type != part.element_type) return error.UnsupportedSqlShape;
+                    break :converted values[part.operand];
+                };
+                if (part.numeric_modifier) |modifier| {
+                    if (part.element_type != .numeric or part.type != .number) return error.UnsupportedSqlShape;
+                    // This branch's numeric cast is newly allocated. Attach
+                    // its modifier, never overwrite an operand's inner cast.
+                    if (std.mem.eql(u8, lowered.object.get("op").?.string, "cast")) {
+                        try lowered.object.put(alloc, "numeric_modifier", try json(alloc, modifier));
+                    } else {
+                        lowered = try json(alloc, .{ .op = "cast", .type = "numeric", .sql_type = "numeric", .numeric_modifier = modifier, .args = &[_]Json{lowered} });
+                    }
                 }
-                if ((source.kind == .integer or source.kind == .number) and (part.type == .integer or part.type == .number)) {
-                    const target_type: @import("array_value.zig").ElementType = part.element_type orelse if (part.type == .integer) .int64 else .float64;
-                    break :blk try json(alloc, .{ .op = "cast", .type = nativeType(part.type, target_type), .sql_type = @tagName(target_type), .args = &[_]Json{values[part.operand]} });
-                }
-                // Validate unknown input with the exact NUMERIC input function;
-                // the durable plan owns its compiled coefficient, never f64.
-                if (part.element_type == .numeric and source.kind == .string and
-                    program.instructions[part.operand].operation == .literal)
-                {
-                    break :blk try numericLiteral(alloc, program.instructions[part.operand].operation.literal);
-                }
-                if (source.kind != part.type) return error.UnsupportedSqlShape;
-                if (source.element_type != part.element_type) return error.UnsupportedSqlShape;
-                break :blk values[part.operand];
+                break :blk lowered;
             },
             .case_when => |part| blk: {
                 if (part.branches.len == 0 or part.branches.len > 15) return error.SqlLimitExceeded;
@@ -386,7 +403,12 @@ test "SQL schema expressions bind nullable catalog shapes and cold typed arrays"
     try std.testing.expectEqual(ast.ColumnType.string, key.type);
     var constrained = try @import("compiler.zig").compileScalar(a, "CAST(n AS numeric(4,2)) > 0", .{});
     defer constrained.deinit();
-    try std.testing.expectError(error.UnsupportedSqlShape, lower(a, schema, constrained.expression, .boolean));
+    const constrained_check = try lower(a, schema, constrained.expression, .boolean);
+    const constrained_cast = constrained_check.object.get("args").?.array.items[0];
+    try std.testing.expectEqualStrings("cast", constrained_cast.object.get("op").?.string);
+    const modifier = constrained_cast.object.get("numeric_modifier").?;
+    try std.testing.expectEqualStrings("4", modifier.object.get("precision").?.number_string);
+    try std.testing.expectEqualStrings("2", modifier.object.get("scale").?.number_string);
     for ([_][]const u8{ "n + n > 0", "CAST(n AS smallint) + CAST(n AS smallint) > 0", "+n > 0", "n > -1" }) |sql| {
         var numeric = try @import("compiler.zig").compileScalar(a, sql, .{});
         defer numeric.deinit();

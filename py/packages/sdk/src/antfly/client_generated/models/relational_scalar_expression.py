@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from attrs import define as _attrs_define
 
@@ -9,6 +9,10 @@ from ..models.relational_expression_op import RelationalExpressionOp
 from ..models.relational_expression_type import RelationalExpressionType
 from ..models.sql_builtin_type import SQLBuiltinType
 from ..types import UNSET, Unset
+
+if TYPE_CHECKING:
+    from ..models.sql_numeric_modifier import SQLNumericModifier
+
 
 T = TypeVar("T", bound="RelationalScalarExpression")
 
@@ -45,6 +49,10 @@ class RelationalScalarExpression:
     Exact NUMERIC programs require reader capability version 21 even when
     their result is boolean or integer. Float/integer assignment casts keep
     their declared PostgreSQL rounding and overflow semantics.
+    A cast to numeric may specify numeric_modifier for PostgreSQL precision
+    and signed-scale coercion. Overflow is checked when the selected cast
+    executes; unselected lazy branches do not fail. Modifier-bearing programs
+    require reader capability version 23 even with integer/boolean output.
     case_when takes alternating boolean conditions and result expressions,
     followed by a mandatory fallback result (3 to 31 arguments, at most
     15 branches). Conditions are evaluated in order; only the selected
@@ -75,6 +83,8 @@ class RelationalScalarExpression:
                 NaN, Infinity and -Infinity. Const/enum finite numeric members must be
                 JSON numbers, not strings. Bounds and multipleOf are exact decimals.
                 Public scalar NUMERIC schemas require reader capability version 22.
+            numeric_modifier (SQLNumericModifier | Unset): PostgreSQL NUMERIC precision and signed scale. For arrays this
+                describes every element, not dimensions. Absent means unconstrained NUMERIC.
             value (Any | Unset): Typed literal value, including null.
             column (str | Unset):
             collation (str | Unset): Optional binary or ASCII case-insensitive collation for binary string comparison
@@ -85,6 +95,7 @@ class RelationalScalarExpression:
     op: RelationalExpressionOp
     type_: RelationalExpressionType | Unset = UNSET
     sql_type: SQLBuiltinType | Unset = UNSET
+    numeric_modifier: SQLNumericModifier | Unset = UNSET
     value: Any | Unset = UNSET
     column: str | Unset = UNSET
     collation: str | Unset = UNSET
@@ -100,6 +111,10 @@ class RelationalScalarExpression:
         sql_type: str | Unset = UNSET
         if not isinstance(self.sql_type, Unset):
             sql_type = self.sql_type.value
+
+        numeric_modifier: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.numeric_modifier, Unset):
+            numeric_modifier = self.numeric_modifier.to_dict()
 
         value = self.value
 
@@ -125,6 +140,8 @@ class RelationalScalarExpression:
             field_dict["type"] = type_
         if sql_type is not UNSET:
             field_dict["sql_type"] = sql_type
+        if numeric_modifier is not UNSET:
+            field_dict["numeric_modifier"] = numeric_modifier
         if value is not UNSET:
             field_dict["value"] = value
         if column is not UNSET:
@@ -138,6 +155,8 @@ class RelationalScalarExpression:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.sql_numeric_modifier import SQLNumericModifier
+
         d = dict(src_dict)
         op = RelationalExpressionOp(d.pop("op"))
 
@@ -154,6 +173,13 @@ class RelationalScalarExpression:
             sql_type = UNSET
         else:
             sql_type = SQLBuiltinType(_sql_type)
+
+        _numeric_modifier = d.pop("numeric_modifier", UNSET)
+        numeric_modifier: SQLNumericModifier | Unset
+        if isinstance(_numeric_modifier, Unset):
+            numeric_modifier = UNSET
+        else:
+            numeric_modifier = SQLNumericModifier.from_dict(_numeric_modifier)
 
         value = d.pop("value", UNSET)
 
@@ -174,6 +200,7 @@ class RelationalScalarExpression:
             op=op,
             type_=type_,
             sql_type=sql_type,
+            numeric_modifier=numeric_modifier,
             value=value,
             column=column,
             collation=collation,
