@@ -1,4 +1,4 @@
-# HN lake smoke check in antfly-dev-01
+# Hacker News example
 
 This example runs historical Hacker News search with GCS-backed Parquet and
 Antfly index artifacts using a local standalone process. It uses the existing
@@ -15,7 +15,7 @@ dry-run the SELECT first. On October 7 the public source had 49,949,001 rows and
 ```sh
 bq --project_id=antfly-dev-01 --location=US query \
   --use_legacy_sql=false --maximum_bytes_billed=21474836480 \
-  --label=purpose:hn_lake_poc < examples/hn-lake/export.sql
+  --label=purpose:hn_lake_poc < examples/hackernews/export.sql
 ```
 
 The raw BigQuery export uses standard Snappy Parquet with DataPageV1, dictionary
@@ -37,9 +37,9 @@ Without it, parallel GCS metadata reads can crash because transport responses
 are allocated and freed with different allocators.
 
 ```sh
-python3 examples/hn-lake/poc.py \
+python3 examples/hackernews/poc.py \
   --binary /path/to/antfly \
-  --state /private/tmp/hn-lake-state \
+  --state /private/tmp/hackernews-state \
   --prefix hn-poc/20261007 \
   --require-filters
 ```
