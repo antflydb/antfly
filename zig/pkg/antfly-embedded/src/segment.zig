@@ -9209,6 +9209,8 @@ test "fused authentication shares native cached reads without duplicate slabs" {
     defer a.free(output);
     for ([_]usize{ 8, integrity.page_size }) |length| {
         var baseline_reads: u64 = 0;
+        var baseline_calls: u64 = 0;
+        var baseline_bytes: u64 = 0;
         for ([_]bool{ false, true }) |shortcut| {
             var cache = try @import("segment_source.zig").ConcurrentBlockCache.init(a, backing, 160 * 1024);
             defer cache.deinit();
@@ -9217,19 +9219,35 @@ test "fused authentication shares native cached reads without duplicate slabs" {
             const paged = try integrity.PagedSource.init(a, source, directory);
             defer paged.deinit();
             const before = file.test_page_reads.load(.monotonic);
+            const calls_before = file.test_backing_read_calls.load(.monotonic);
+            const bytes_before = file.test_backing_read_bytes.load(.monotonic);
             try paged.source().readInto(0, output[0..length]);
             try std.testing.expectEqualSlices(u8, payload[0..length], output[0..length]);
             const cold = file.test_page_reads.load(.monotonic) - before;
+            const cold_calls = file.test_backing_read_calls.load(.monotonic) - calls_before;
+            const cold_bytes = file.test_backing_read_bytes.load(.monotonic) - bytes_before;
             const warm_start = file.test_page_reads.load(.monotonic);
+            const warm_calls_start = file.test_backing_read_calls.load(.monotonic);
+            const warm_bytes_start = file.test_backing_read_bytes.load(.monotonic);
             try paged.source().readInto(0, output[0..length]);
             const warm = file.test_page_reads.load(.monotonic) - warm_start;
+            const warm_calls = file.test_backing_read_calls.load(.monotonic) - warm_calls_start;
+            const warm_bytes = file.test_backing_read_bytes.load(.monotonic) - warm_bytes_start;
             std.debug.print("LITE_FUSED_COUNTS length={d} shortcut={any} cold={d} warm={d} baseline={d}\n", .{ length, shortcut, cold, warm, baseline_reads });
             if (shortcut) {
                 try std.testing.expect(cold <= baseline_reads);
+                try std.testing.expect(cold_calls <= baseline_calls);
+                try std.testing.expect(cold_bytes <= baseline_bytes);
                 try std.testing.expectEqual(@as(usize, 0), paged.retainedBytes());
-            } else baseline_reads = cold;
+            } else {
+                baseline_reads = cold;
+                baseline_calls = cold_calls;
+                baseline_bytes = cold_bytes;
+            }
             try std.testing.expectEqual(@as(u64, 0), warm);
-            std.debug.print("LITE_FUSED_CRC shortcut={any} length={d} cold_native_pages={d} warm_native_pages={d} auth_retained={d} provider_retained={d}\n", .{ shortcut, length, cold, warm, paged.retainedBytes(), cache.retainedBytes() });
+            try std.testing.expectEqual(@as(u64, 0), warm_calls);
+            try std.testing.expectEqual(@as(u64, 0), warm_bytes);
+            std.debug.print("LITE_FUSED_CRC shortcut={any} length={d} cold_page_requests={d} warm_page_requests={d} cold_read_calls={d} cold_read_bytes={d} warm_read_calls={d} warm_read_bytes={d} auth_retained={d} provider_retained={d}\n", .{ shortcut, length, cold, warm, cold_calls, cold_bytes, warm_calls, warm_bytes, paged.retainedBytes(), cache.retainedBytes() });
         }
     }
 }

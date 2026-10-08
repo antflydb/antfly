@@ -339,40 +339,41 @@
       65536
     ],
     "old_shortcut_before_fix": {
-      "cold_native_pages": [
+      "cold_page_requests": [
         33,
         41
       ],
-      "warm_native_pages": [
+      "warm_page_requests": [
         0,
         19
       ]
     },
     "plain_provider_baseline": {
-      "cold_native_pages": [
+      "auth_retained_bytes": 65536,
+      "provider_retained_bytes": 65536,
+      "cold_page_requests": [
         22,
         22
       ],
-      "warm_native_pages": [
+      "warm_page_requests": [
         0,
         0
-      ],
-      "auth_retained_bytes": 65536,
-      "provider_retained_bytes": 65536
+      ]
     },
     "fused_provider": {
-      "cold_native_pages": [
+      "auth_retained_bytes": 0,
+      "provider_retained_bytes": 131072,
+      "cold_page_requests": [
         22,
         22
       ],
-      "warm_native_pages": [
+      "warm_page_requests": [
         0,
         0
-      ],
-      "auth_retained_bytes": 0,
-      "provider_retained_bytes": 131072
+      ]
     },
-    "note": "Fused provider uses its existing bounded cache. Retained payload-slab bytes are unchanged at 131072 in this fixture; metadata and object storage are not included in that sum. Eliminating the duplicate authentication slab does not imply an equal reduction in total process memory."
+    "note": "Fused provider uses its existing bounded cache. Retained payload-slab bytes are unchanged at 131072 in this fixture; metadata and object storage are not included in that sum. Eliminating the duplicate authentication slab does not imply an equal reduction in total process memory.",
+    "page_request_counter_semantics": "test_page_reads counts requests before both shared and cursor-local cache lookups. Disabling the shared native page cache does not make these counts backing-file reads. Historical counts below were not measurements of backing-file calls or storage-device reads."
   },
   "position_decode_cap": {
     "fixture": "legacy small range decode respects its configured capacity cap",

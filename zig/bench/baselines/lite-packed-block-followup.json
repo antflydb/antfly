@@ -262,6 +262,6 @@
     "unscoped_native_page_reads": 31,
     "scoped_native_page_reads": 38,
     "scope_cache_bytes": 196608,
-    "note": "Provider caching already bounds physical reads. Scope reduces provider callbacks and locking, while aligned prefetch reads slightly more native pages in this fixture."
+    "note": "Historical native_page_reads fields count page requests before cursor-local cache lookup, not backing-file calls or storage-device reads. Scope reduces provider callbacks and locking; aligned prefetch issues slightly more native page requests in this fixture."
   }
 }
