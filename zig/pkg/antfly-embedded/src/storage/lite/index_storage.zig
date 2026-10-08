@@ -1452,6 +1452,10 @@ test "lite native cold atomic writes preserve hot pages with bounded cache admis
     {
         var docs = try docstore.Store.createWithOptions(alloc, path, .{ .no_sync = true, .io = std.testing.io });
         defer docs.close();
+        // Cache admission assertions need one stable file generation. Automatic
+        // vacuum can replace the file and reclaim its cache during inspection;
+        // concurrent maintenance is covered by the dedicated vacuum tests.
+        docs.maintenance_start_suppressed = true;
         docs.file.page_cache.limit_bytes = 256 * 1024;
         var indexes = Store.init(alloc, &docs);
         const storage = indexes.storage();
