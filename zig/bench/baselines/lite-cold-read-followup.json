@@ -1,0 +1,34 @@
+{
+  "base_commit": "8a8f338623cb8657ec5c995277607a3d597d3795",
+  "environment": {
+    "platform": "aarch64-macos",
+    "optimization": "Debug",
+    "zig": "0.17.0",
+    "storage": "MemoryStorage"
+  },
+  "fixtures": {
+    "cold_uncompressed_512kib": {
+      "logical_bytes": 524288,
+      "before": {
+        "backend_allocations": 2,
+        "peak_extra_heap_bytes": 1310782,
+        "decoder_admission_bytes": 14745688
+      },
+      "after": {
+        "backend_allocations": 1,
+        "peak_extra_heap_bytes": 524288,
+        "decoder_admission_bytes": 589912
+      }
+    },
+    "mixed_mutable_probe_100_warm_batches": {
+      "keys_per_batch": 2,
+      "before_metadata_allocations": 400,
+      "after_metadata_allocations": 0
+    },
+    "mixed_writer_100_warm_batches": {
+      "keys_per_batch": 2,
+      "after_metadata_allocations": 0
+    }
+  },
+  "scope": "Deterministic allocation and admission fixtures, not query throughput or a 2 GiB soak. Caller-owned mutable values and captured read-layout allocations remain necessary and are excluded from metadata-array counts."
+}

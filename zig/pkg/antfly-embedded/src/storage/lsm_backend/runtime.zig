@@ -89,6 +89,7 @@ const VisibleBytes = union(enum) {
 
 const SharedBytes = @import("shared_bytes.zig").SharedBytes;
 const LocalReader = @import("local_reader.zig").Pool;
+const BatchScratch = @import("write_batch_scratch.zig");
 const RunSourceLease = @import("source_lease.zig").Lease;
 
 /// Transaction result pins share the same lifetime contract for both caches.
@@ -3794,6 +3795,8 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
         pub const get_many_sorted_is_atomic = true;
         allocator: Allocator,
         metadata_allocator: Allocator,
+        batch_scratch: BatchScratch.ProbeScratch = .{},
+        borrowed_batch_scratch: ?*BatchScratch.ProbeScratch = null,
         backend: *BackendType,
         namespace: backend_types.Namespace,
         stable_point_view: bool = false,
@@ -3834,6 +3837,7 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
 
         pub fn abort(self: *@This()) void {
             const backend = self.backend;
+            self.batch_scratch.deinit(self.metadata_allocator);
             for (self.held_layouts.items) |*layout| layout.deinitAfterUnlockedRead();
             self.held_layouts.deinit(self.metadata_allocator);
             releaseHeldValues(&self.leased_values, backend.allocator);
@@ -4092,9 +4096,13 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
                 // abort. Copying every hit again here only duplicates large
                 // point-read payloads such as dense-vector artifacts.
             } else {
-                const resolved = try self.metadata_allocator.alloc(bool, keys.len);
-                defer self.metadata_allocator.free(resolved);
-                @memset(resolved, false);
+                var oversized: BatchScratch.ProbeScratch = .{};
+                defer oversized.deinit(self.metadata_allocator);
+                const scratch = if (keys.len <= BatchScratch.Scratch.max_retained_keys)
+                    self.borrowed_batch_scratch orelse &self.batch_scratch
+                else
+                    &oversized;
+                const resolved = try scratch.prepareResolved(self.metadata_allocator, keys.len);
 
                 var unresolved_count: usize = keys.len;
                 var maybe_layout: ?CurrentReadLayout(BackendType) = null;
@@ -4128,12 +4136,10 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
                     // the backend lock is released, as for single-key reads.
                     if (builtin.is_test) if (test_current_point_unlocked_hook) |hook| try hook(self.backend);
 
-                    const unresolved_keys = try self.metadata_allocator.alloc([]const u8, unresolved_count);
-                    defer self.metadata_allocator.free(unresolved_keys);
-                    const unresolved_values = try self.metadata_allocator.alloc(?[]const u8, unresolved_count);
-                    defer self.metadata_allocator.free(unresolved_values);
-                    const unresolved_indexes = try self.metadata_allocator.alloc(usize, unresolved_count);
-                    defer self.metadata_allocator.free(unresolved_indexes);
+                    try scratch.pending.prepare(self.metadata_allocator, unresolved_count);
+                    const unresolved_keys = scratch.pending.keys.items;
+                    const unresolved_values = scratch.pending.values.items;
+                    const unresolved_indexes = scratch.pending.indexes.items;
                     var unresolved_index: usize = 0;
                     for (keys, 0..) |key, i| {
                         if (resolved[i]) continue;
@@ -7405,8 +7411,16 @@ fn retainLocalCachedBlock(backend: anytype, run: *Run, index: *const lsm_table_f
 }
 
 fn localDecodeWorkingBytes(window: lsm_table_file.EntryDataWindow) !usize {
-    const logical = std.math.mul(usize, window.len, 24) catch return error.InvalidTableFile;
-    const physical = std.math.mul(usize, window.physicalLen(), 4) catch return error.InvalidTableFile;
+    // Uncompressed input becomes the output allocation directly. Snappy only
+    // needs its encoded input in scratch. Prefix reconstruction still reserves
+    // room for geometrically grown key buffers and an intermediate payload.
+    const logical_factor: usize = switch (window.compression) {
+        .none, .snappy => 1,
+        .prefix, .prefix_snappy => 24,
+    };
+    const physical_factor: usize = if (window.compression == .none) 0 else 4;
+    const logical = std.math.mul(usize, window.len, logical_factor) catch return error.InvalidTableFile;
+    const physical = std.math.mul(usize, window.physicalLen(), physical_factor) catch return error.InvalidTableFile;
     return std.math.add(usize, std.math.add(usize, logical, physical) catch return error.InvalidTableFile, LocalReader.retained_bytes_per_workspace + @sizeOf(SharedBytes)) catch return error.InvalidTableFile;
 }
 
@@ -7418,6 +7432,14 @@ fn loadDecodedLocalBlock(backend: anytype, allocator: Allocator, path: []const u
     if (comptime @hasField(@TypeOf(backend.*), "local_reader")) {
         var work = try localWorkspace(backend, window);
         defer work.release();
+        if (window.compression == .none) {
+            if (window.physicalLen() != window.len) return error.InvalidTableFile;
+            const payload = try loadRunTableBlockWithStats(backend, allocator, path, offset, window.physicalLen());
+            errdefer allocator.free(payload);
+            if (payload.len != window.len) return error.InvalidTableFile;
+            try lsm_table_file.validateBlockPayload(payload, window.checksum);
+            return payload;
+        }
         const scratch = work.allocator();
         const payload = try loadRunTableBlockWithStats(backend, scratch, path, offset, window.physicalLen());
         return lsm_table_file.decodeBlockPayloadWithScratchAlloc(allocator, scratch, window.compression, payload, window.len, window.checksum);
@@ -8097,7 +8119,8 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
         cursor_levels: []RunLevel = &.{},
         held_blocks: std.ArrayListUnmanaged(BlockPin) = .empty,
         held_values: std.ArrayListUnmanaged([]u8) = .empty,
-        batch_scratch: @import("write_batch_scratch.zig").Scratch = .{},
+        batch_scratch: BatchScratch.Scratch = .{},
+        probe_scratch: BatchScratch.ProbeScratch = .{},
         batch_options: backend_types.BatchOptions = .{},
         cursor_reader_retained: bool = false,
         closed: bool = false,
@@ -8131,6 +8154,7 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
             self.bulk_appends.deinit(self.allocator);
             self.invalidateCursorSnapshot();
             self.batch_scratch.deinit(self.metadata_allocator);
+            self.probe_scratch.deinit(self.metadata_allocator);
             releaseHeldBlocks(&self.held_blocks, self.allocator);
             releaseHeldValues(&self.held_values, self.allocator);
             const locked = lockBackend(BackendType, backend);
@@ -8147,6 +8171,7 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
                 self.bulk_index.deinit(self.allocator);
                 self.prefix_index.deinit(self.allocator);
                 self.batch_scratch.deinit(self.metadata_allocator);
+                self.probe_scratch.deinit(self.metadata_allocator);
             };
             const wire_credit = if (comptime @hasDecl(BackendType, "prepareManifestCredit")) try self.backend.prepareManifestCredit(&self.mutable, &self.bulk_appends) else 0;
             const locked = lockBackend(BackendType, self.backend);
@@ -8469,6 +8494,8 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
             try scratch.prepareValues(self.metadata_allocator, miss_count);
             const miss_values = scratch.values.items[0..miss_count];
             var probe = try BoundProbeTxn(BackendType).open(self.backend, namespace);
+            probe.metadata_allocator = self.metadata_allocator;
+            probe.borrowed_batch_scratch = &self.probe_scratch;
             // Preserve the transaction-wide unique pin budget across probes.
             // All owned probe results use the writer's allocator, so their
             // allocations can transfer directly without a namespace copy.
@@ -9205,4 +9232,159 @@ test "lsm local compressed absence reads once without promotion" {
     try std.testing.expect(absent == null);
     try std.testing.expectEqual(@as(u64, 1), extra);
     try std.testing.expectEqual(@as(usize, 0), backend.run_block_cache.items.len);
+}
+
+test "lsm cold optimization uncompressed allocation measurement" {
+    const B = @import("../lsm_backend.zig").Backend;
+    const Budget = @import("../lite/test_allocator.zig").BudgetAllocator;
+    const a = std.testing.allocator;
+    var storage = storage_io.MemoryStorage.init(a);
+    defer storage.deinit();
+    const payload = try a.alloc(u8, 512 * 1024);
+    defer a.free(payload);
+    @memset(payload, 37);
+    try storage.storage().writeFileAbsolute("/raw-block", payload);
+    var budget = Budget{ .backing = a };
+    var backend = try B.open(budget.allocator(), "/cold-copy-measurement", .{ .storage = storage.storage() });
+    defer backend.close();
+    const window: lsm_table_file.EntryDataWindow = .{ .relative_offset = 0, .len = @intCast(payload.len), .checksum = std.hash.Crc32.hash(payload) };
+    const live = budget.live;
+    const calls = budget.alloc_calls;
+    budget.peak = live;
+    const decoded = try loadDecodedLocalBlock(&backend, budget.allocator(), "/raw-block", 0, window);
+    defer budget.allocator().free(decoded);
+    try std.testing.expectEqualSlices(u8, payload, decoded);
+    std.debug.print("lite cold uncompressed 512KiB: allocations={d}, peak extra={d}, admission={d}\n", .{ budget.alloc_calls - calls, budget.peak - live, try localDecodeWorkingBytes(window) });
+    try std.testing.expectEqual(@as(usize, 1), budget.alloc_calls - calls);
+    try std.testing.expectEqual(payload.len, budget.peak - live);
+    try std.testing.expect((try localDecodeWorkingBytes(window)) < 1024 * 1024);
+    const held = budget.live;
+    var corrupt = window;
+    corrupt.checksum ^= 1;
+    try std.testing.expectError(error.TableBlockChecksumMismatch, loadDecodedLocalBlock(&backend, budget.allocator(), "/raw-block", 0, corrupt));
+    try std.testing.expectEqual(held, budget.live);
+    corrupt = window;
+    corrupt.physical_len = window.len - 1;
+    try std.testing.expectError(error.InvalidTableFile, loadDecodedLocalBlock(&backend, budget.allocator(), "/raw-block", 0, corrupt));
+    budget.limit = budget.live;
+    try std.testing.expectError(error.OutOfMemory, loadDecodedLocalBlock(&backend, budget.allocator(), "/raw-block", 0, window));
+    try std.testing.expectEqual(@as(usize, 0), backend.local_reader.active);
+    budget.limit = std.math.maxInt(usize);
+}
+
+test "lsm cold optimization mutable probe metadata measurement" {
+    const B = @import("../lsm_backend.zig").Backend;
+    const Budget = @import("../lite/test_allocator.zig").BudgetAllocator;
+    const a = std.testing.allocator;
+    var storage = storage_io.MemoryStorage.init(a);
+    defer storage.deinit();
+    var backend = try B.open(a, "/probe-scratch-measurement", .{ .storage = storage.storage(), .flush_threshold = 1 });
+    defer backend.close();
+    var runtime = try backend.runtimeStore(a, .{ .name = "docs" });
+    defer runtime.deinit();
+    var disk = try runtime.beginWrite();
+    try disk.put("document:00", "disk");
+    try disk.commit();
+    backend.options.flush_threshold = std.math.maxInt(usize);
+    var mutable = try runtime.beginWrite();
+    try mutable.put("document:01", "mutable");
+    try mutable.commit();
+    var metadata = Budget{ .backing = a };
+    var probe = try BoundProbeTxn(B).open(&backend, .{ .name = "docs" });
+    probe.metadata_allocator = metadata.allocator();
+    defer probe.abort();
+    const keys = [_][]const u8{ "document:00", "document:01" };
+    var values: [2]?[]const u8 = undefined;
+    try probe.getManySorted(&keys, &values);
+    const calls = metadata.alloc_calls;
+    for (0..100) |_| {
+        try probe.getManySorted(&keys, &values);
+        try std.testing.expectEqualStrings("disk", values[0].?);
+        try std.testing.expectEqualStrings("mutable", values[1].?);
+    }
+    std.debug.print("lite mixed mutable probe: 100 batches, metadata allocations={d}\n", .{metadata.alloc_calls - calls});
+    try std.testing.expectEqual(@as(usize, 0), metadata.alloc_calls - calls);
+    const old_value = values[1].?;
+    var later = try runtime.beginWrite();
+    try later.put("document:01", "replacement");
+    try later.commit();
+    try std.testing.expectEqualStrings("mutable", old_value);
+    try probe.getManySorted(&keys, &values);
+    try std.testing.expectEqualStrings("replacement", values[1].?);
+    const retained = metadata.live;
+    const large_count = BatchScratch.Scratch.max_retained_keys + 1;
+    var missing_keys: [large_count][]const u8 = undefined;
+    var key_storage: [large_count][32]u8 = undefined;
+    var missing_values: [large_count]?[]const u8 = undefined;
+    for (&missing_keys, &key_storage, 0..) |*key, *buffer, i| key.* = try std.fmt.bufPrint(buffer, "missing:{d:0>4}", .{i});
+    try probe.getManySorted(&missing_keys, &missing_values);
+    for (missing_values) |value| try std.testing.expect(value == null);
+    try std.testing.expectEqual(retained, metadata.live);
+    metadata.limit = metadata.live;
+    try std.testing.expectError(error.OutOfMemory, probe.getManySorted(&missing_keys, &missing_values));
+    try std.testing.expectEqual(retained, metadata.live);
+    // Failure and an oversized batch must leave the small workspace reusable.
+    try probe.getManySorted(&keys, &values);
+    try std.testing.expectEqualStrings("replacement", values[1].?);
+    metadata.limit = std.math.maxInt(usize);
+}
+
+test "lsm cold optimization admits four large none and snappy blocks within default gate" {
+    for ([_]lsm_table_file.BlockCompression{ .none, .snappy }) |codec| {
+        const window: lsm_table_file.EntryDataWindow = .{
+            .relative_offset = 0,
+            .len = 512 * 1024,
+            .physical_len = if (codec == .none) 512 * 1024 else 64 * 1024,
+            .compression = codec,
+        };
+        const bytes = try localDecodeWorkingBytes(window);
+        try std.testing.expect(bytes * LocalReader.workspace_count <= 8 * 1024 * 1024);
+        var pool: LocalReader = .{};
+        defer pool.deinit();
+        var work: [LocalReader.workspace_count]LocalReader.Workspace = undefined;
+        var count: usize = 0;
+        defer for (work[0..count]) |*slot| slot.release();
+        for (&work) |*slot| {
+            slot.* = pool.acquire(std.testing.allocator, null, std.testing.io, bytes, 8 * 1024 * 1024, window.len + @sizeOf(SharedBytes));
+            count += 1;
+        }
+        try std.testing.expectEqual(LocalReader.workspace_count, pool.active);
+        try std.testing.expect(pool.active_bytes <= 8 * 1024 * 1024);
+    }
+}
+
+test "lsm cold optimization snappy bounds decode compressible and incompressible large blocks" {
+    const B = @import("../lsm_backend.zig").Backend;
+    const snappy = @import("../../encoding/snappy.zig");
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |random| {
+        var storage = storage_io.MemoryStorage.init(a);
+        defer storage.deinit();
+        var backend = try B.open(a, "/snappy-cold-bounds", .{ .storage = storage.storage() });
+        defer backend.close();
+        const raw = try a.alloc(u8, 512 * 1024);
+        defer a.free(raw);
+        if (random) {
+            var rng = std.Random.DefaultPrng.init(42);
+            rng.random().bytes(raw);
+        } else @memset(raw, 37);
+        const encoded = try snappy.encode(a, raw);
+        defer a.free(encoded);
+        try storage.storage().writeFileAbsolute("/snappy-block", encoded);
+        const window: lsm_table_file.EntryDataWindow = .{
+            .relative_offset = 0,
+            .len = @intCast(raw.len),
+            .physical_len = @intCast(encoded.len),
+            .compression = .snappy,
+            .checksum = std.hash.Crc32.hash(encoded),
+        };
+        const decoded = try loadDecodedLocalBlock(&backend, a, "/snappy-block", 0, window);
+        defer a.free(decoded);
+        try std.testing.expectEqualSlices(u8, raw, decoded);
+        try std.testing.expect((try localDecodeWorkingBytes(window)) < 3 * 1024 * 1024);
+        var corrupt = window;
+        corrupt.len -= 1;
+        try std.testing.expectError(error.InvalidTableFile, loadDecodedLocalBlock(&backend, a, "/snappy-block", 0, corrupt));
+        try std.testing.expectEqual(@as(usize, 0), backend.local_reader.active);
+    }
 }

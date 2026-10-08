@@ -43,6 +43,24 @@ pub const Scratch = struct {
     }
 };
 
+/// Probe compaction uses separate arrays from the writer's input batch. This
+/// storage owns metadata only; returned values keep their existing owners.
+pub const ProbeScratch = struct {
+    resolved: std.ArrayListUnmanaged(bool) = .empty,
+    pending: Scratch = .{},
+    pub fn prepareResolved(self: *ProbeScratch, a: std.mem.Allocator, n: usize) ![]bool {
+        try self.resolved.ensureTotalCapacityPrecise(a, n);
+        self.resolved.items.len = n;
+        @memset(self.resolved.items, false);
+        return self.resolved.items;
+    }
+    pub fn deinit(self: *ProbeScratch, a: std.mem.Allocator) void {
+        self.resolved.deinit(a);
+        self.pending.deinit(a);
+        self.* = .{};
+    }
+};
+
 test "lsm writer batch scratch reuses allocations and unwinds failures" {
     const Fixture = struct {
         fn run(a: std.mem.Allocator) !void {
@@ -57,6 +75,32 @@ test "lsm writer batch scratch reuses allocations and unwinds failures" {
             try std.testing.expect(indexes == scratch.indexes.items.ptr);
             try std.testing.expect(values == scratch.values.items.ptr);
             try scratch.prepare(a, 32);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
+test "lsm probe batch scratch reuses all arrays and unwinds growth failures" {
+    const Fixture = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var scratch: ProbeScratch = .{};
+            defer scratch.deinit(a);
+            _ = try scratch.prepareResolved(a, 16);
+            try scratch.pending.prepare(a, 16);
+            const flags = scratch.resolved.items.ptr;
+            const keys = scratch.pending.keys.items.ptr;
+            const indexes = scratch.pending.indexes.items.ptr;
+            const values = scratch.pending.values.items.ptr;
+            @memset(scratch.resolved.items, true);
+            const resolved = try scratch.prepareResolved(a, 8);
+            try scratch.pending.prepare(a, 8);
+            try std.testing.expect(flags == resolved.ptr);
+            try std.testing.expect(keys == scratch.pending.keys.items.ptr);
+            try std.testing.expect(indexes == scratch.pending.indexes.items.ptr);
+            try std.testing.expect(values == scratch.pending.values.items.ptr);
+            for (resolved) |flag| try std.testing.expect(!flag);
+            _ = try scratch.prepareResolved(a, 32);
+            try scratch.pending.prepare(a, 32);
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});

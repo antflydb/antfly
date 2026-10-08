@@ -26278,3 +26278,37 @@ test "lsm local transient reads preserve hot cache and reuse compressed point sc
         };
     }
 }
+
+test "lsm cold optimization writer reuses mutable probe metadata across short lived probes" {
+    const a = std.testing.allocator;
+    var storage = storage_io.MemoryStorage.init(a);
+    defer storage.deinit();
+    var backend = try Backend.open(a, "/writer-mixed-scratch", .{ .storage = storage.storage(), .flush_threshold = 1 });
+    defer backend.close();
+    var runtime = try backend.runtimeStore(a, .{ .name = "docs" });
+    defer runtime.deinit();
+    var disk = try runtime.beginWrite();
+    try disk.put("document:00", "disk");
+    try disk.commit();
+    backend.options.flush_threshold = std.math.maxInt(usize);
+    var mutable = try runtime.beginWrite();
+    try mutable.put("document:01", "mutable");
+    try mutable.commit();
+    var metadata = @import("lite/test_allocator.zig").BudgetAllocator{ .backing = a };
+    var writer = try runtime_mod.NamespaceWriteTxn(Backend).open(&backend);
+    writer.metadata_allocator = metadata.allocator();
+    defer writer.abort();
+    const keys = [_][]const u8{ "document:00", "document:01" };
+    var values: [2]?[]const u8 = undefined;
+    try writer.getManySorted(.{ .name = "docs" }, &keys, &values);
+    const calls = metadata.alloc_calls;
+    metadata.limit = metadata.live;
+    for (0..100) |_| {
+        try writer.getManySorted(.{ .name = "docs" }, &keys, &values);
+        try std.testing.expectEqualStrings("disk", values[0].?);
+        try std.testing.expectEqualStrings("mutable", values[1].?);
+    }
+    std.debug.print("lite mixed writer: 100 batches, metadata allocations={d}\n", .{metadata.alloc_calls - calls});
+    try std.testing.expectEqual(@as(usize, 0), metadata.alloc_calls - calls);
+    metadata.limit = std.math.maxInt(usize);
+}
