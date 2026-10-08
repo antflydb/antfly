@@ -294,3 +294,13 @@ Native and pinned Nix/glibc helper and HTTP gates pass; see
 [worker output error receipts](receipts/2026-10-07/worker-output-errors/README.md).
 Actual worker integration remains supplemental pending full production/API gates.
 Protected initial error output/control CPU and default enablement remain required.
+
+
+Initial HTTP error responses now share a separate 250ms total cleanup budget
+across locks, credit and socket writes, with task cancellation blocked for that
+bounded attempt. H1 uses a fixed local buffer. H2 handlers release the frame lock
+while waiting for credit; pump rejections reset only the stream on credit denial.
+Native and pinned Nix/glibc pass all server tests and selected transport contracts;
+see [error cleanup receipts](receipts/2026-10-07/error-output-budget/README.md).
+Independent control CPU admission outside frame locks and full production/API,
+whole-node/default qualification remain required.

@@ -2188,7 +2188,7 @@ pub const Server = struct {
         // peer turn cancellation into an unbounded wait.
         const previous = h2.io.swapCancelProtection(.blocked);
         defer _ = h2.io.swapCancelProtection(previous);
-        var budget = H2ResetBudget{ .io = h2.io, .deadline_ms = deadlineAfter(h2.io, 250) };
+        var budget = CleanupBudget{ .io = h2.io, .deadline_ms = deadlineAfter(h2.io, 250) };
         const control = budget.view();
         control.lock(&h2.write_mutex, h2.io) catch {
             sock.shutdown();
@@ -2206,7 +2206,7 @@ pub const Server = struct {
         };
     }
 
-    const H2ResetBudget = struct {
+    const CleanupBudget = struct {
         io: Io,
         deadline_ms: i64,
         fn check(raw: ?*anyopaque) @import("../net/socket.zig").WriteControl.Error!void {
@@ -3556,29 +3556,66 @@ pub const Server = struct {
         } else try self.sendH2ErrorLocked(h2, sock, stream_id, code);
     }
 
-    /// Sends the same safe JSON error envelope used by HTTP/1.
-    fn sendH2Error(self: *Self, h2: *H2Connection, writer: anytype, stream_id: u31, code: u16) !void {
-        const body = routeErrorBody(code);
-        var length_buf: [32]u8 = undefined;
-        const length = try std.fmt.bufPrint(&length_buf, "{d}", .{body.len});
-        var extra = [_]hpack.HeaderEntry{
+    fn errorHeaders(code: u16, status_buf: *[3]u8, length_buf: *[32]u8, headers: *[4]hpack.HeaderEntry) ![]const hpack.HeaderEntry {
+        headers.* = .{
+            .{ .name = ":status", .value = try std.fmt.bufPrint(status_buf, "{d}", .{code}) },
             .{ .name = "content-type", .value = "application/json" },
-            .{ .name = "content-length", .value = length },
+            .{ .name = "content-length", .value = try std.fmt.bufPrint(length_buf, "{d}", .{routeErrorBody(code).len}) },
             .{ .name = "retry-after", .value = "1" },
         };
-        const extra_len: usize = if (code == 429 or code == 503) extra.len else extra.len - 1;
-        var status_buf: [3]u8 = undefined;
-        const h2_headers = try H2Connection.buildResponseHeaders(code, extra[0..extra_len], &status_buf, self.allocator);
-        defer self.allocator.free(h2_headers);
-        try h2.sendHeaders(writer, stream_id, h2_headers, false);
-        try h2.writeDataBlocking(writer, stream_id, body, true);
+        return headers[0..if (code == 429 or code == 503) headers.len else headers.len - 1];
     }
 
-    /// Like `sendH2Error` but acquires the write mutex first.
-    fn sendH2ErrorLocked(self: *Self, h2: *H2Connection, writer: anytype, stream_id: u31, code: u16) !void {
-        h2.write_mutex.lockUncancelable(h2.io);
-        defer h2.write_mutex.unlock(h2.io);
-        try self.sendH2Error(h2, writer, stream_id, code);
+    /// Caller holds the write mutex. Never wait for peer credit here: the
+    /// receive pump must remain able to process other streams and updates.
+    fn sendH2Error(self: *Self, h2: *H2Connection, writer: anytype, stream_id: u31, code: u16) !void {
+        _ = self;
+        var status_buf: [3]u8 = undefined;
+        var length_buf: [32]u8 = undefined;
+        var headers: [4]hpack.HeaderEntry = undefined;
+        try h2.sendHeaders(writer, stream_id, try errorHeaders(code, &status_buf, &length_buf, &headers), false);
+        try h2.writeData(writer, stream_id, routeErrorBody(code), true);
+    }
+
+    /// Handler errors own an independent total cleanup deadline across header
+    /// encoding, contended locks, flow credit and physical socket writes.
+    fn sendH2ErrorLocked(self: *Self, h2: *H2Connection, socket: *Socket, stream_id: u31, code: u16) !void {
+        _ = self;
+        const previous = h2.io.swapCancelProtection(.blocked);
+        defer _ = h2.io.swapCancelProtection(previous);
+        errdefer socket.shutdown();
+        var budget = CleanupBudget{ .io = h2.io, .deadline_ms = deadlineAfter(h2.io, 250) };
+        const control = budget.view();
+        var writer = @import("../net/socket.zig").ControlledWriter{ .socket = socket, .control = control };
+        var status_buf: [3]u8 = undefined;
+        var length_buf: [32]u8 = undefined;
+        var headers: [4]hpack.HeaderEntry = undefined;
+        try h2.sendHeadersControlled(&writer, stream_id, try errorHeaders(code, &status_buf, &length_buf, &headers), false, control);
+        try h2.writeDataBlockingControlled(&writer, stream_id, routeErrorBody(code), true, control);
+    }
+
+    /// Receive-pump rejection already owns the connection lock. Deliver the
+    /// small error immediately when credit permits; otherwise reset just this
+    /// stream. Both response and unread-request reset share one cleanup budget.
+    fn sendH2ErrorInPump(self: *Self, h2: *H2Connection, socket: *Socket, stream_id: u31, code: u16) void {
+        const previous = h2.io.swapCancelProtection(.blocked);
+        defer _ = h2.io.swapCancelProtection(previous);
+        var budget = CleanupBudget{ .io = h2.io, .deadline_ms = deadlineAfter(h2.io, 250) };
+        var writer = @import("../net/socket.zig").ControlledWriter{ .socket = socket, .control = budget.view() };
+        var reset = false;
+        self.sendH2Error(h2, &writer, stream_id, code) catch |err| {
+            if (err == error.FlowControlError) {
+                reset = true;
+            } else {
+                socket.shutdown();
+                return;
+            }
+        };
+        const stream = h2.stream_manager.getStream(stream_id) orelse return;
+        if (reset or !stream.end_stream_received) {
+            stream.reset();
+            h2.sendRstStream(&writer, stream_id, if (code == 429) .enhance_your_calm else .cancel) catch socket.shutdown();
+        }
     }
 
     /// StreamManager stores Stream allocations separately from its hash map.
@@ -3594,7 +3631,7 @@ pub const Server = struct {
     /// Atomically claims a received H2 stream for one handler fiber. The
     /// frame pump and handler cleanup both mutate StreamManager, so map lookup,
     /// admission, reset, removal, and data_event publication share its mutex.
-    fn claimH2StreamForHandler(self: *Self, h2: *H2Connection, sock: anytype, stream_id: u31, data_event: *Io.Event) bool {
+    fn claimH2StreamForHandler(self: *Self, h2: *H2Connection, sock: *Socket, stream_id: u31, data_event: *Io.Event) bool {
         h2.write_mutex.lockUncancelable(h2.io);
         defer h2.write_mutex.unlock(h2.io);
 
@@ -3606,11 +3643,7 @@ pub const Server = struct {
             // Preserve the application-visible overload response instead of
             // silently removing the stream.
             if (h2BodyAdmissionErrorStatus(err)) |status| {
-                self.sendH2Error(h2, sock, stream_id, status) catch {};
-                if (!stream.end_stream_received) {
-                    const reset_code: http.Http2ErrorCode = if (status == 429) .enhance_your_calm else .cancel;
-                    h2.sendRstStream(sock, stream_id, reset_code) catch {};
-                }
+                self.sendH2ErrorInPump(h2, sock, stream_id, status);
             }
             h2.stream_manager.removeStream(stream_id);
             return false;
@@ -3663,8 +3696,7 @@ pub const Server = struct {
                         stream.max_data_size = limit;
                         if (stream.content_length) |content_length| {
                             if (content_length > limit) {
-                                self.sendH2Error(h2, sock, stream_id, 413) catch {};
-                                if (!stream.end_stream_received) h2.sendRstStream(sock, stream_id, .cancel) catch {};
+                                self.sendH2ErrorInPump(h2, sock, stream_id, 413);
                                 h2.stream_manager.removeStream(stream_id);
                                 return false;
                             }
@@ -3781,19 +3813,25 @@ pub const Server = struct {
 
     /// Sends an error response.
     fn sendError(self: *Self, socket: *Socket, code: u16) !void {
-        var resp = Response.init(self.allocator, code);
+        const previous = socket.io.swapCancelProtection(.blocked);
+        defer _ = socket.io.swapCancelProtection(previous);
+        errdefer socket.shutdown();
+        var budget = CleanupBudget{ .io = socket.io, .deadline_ms = deadlineAfter(socket.io, 250) };
+        // A rejection must not need an application heap allocation to explain
+        // that its application memory or execution capacity is exhausted.
+        var storage: [2048]u8 = undefined;
+        var fixed = std.heap.FixedBufferAllocator.init(&storage);
+        const allocator = fixed.allocator();
+        var resp = Response.init(allocator, code);
         defer resp.deinit();
-
         resp.body = routeErrorBody(code);
         try resp.headers.set(HeaderName.CONTENT_TYPE, "application/json");
-        // Every sendError caller terminates the HTTP/1 connection. Make that
-        // lifecycle explicit so clients do not return the socket to a pool.
         try resp.headers.set(HeaderName.CONNECTION, "close");
         if (code == 429 or code == 503) try resp.headers.set("Retry-After", "1");
         try ensureContentLengthHeader(&resp);
         try ensureDateHeader(self.io, &resp);
-
-        try sendBuffered(self.allocator, socket, &resp);
+        const bytes = try serializeToSlice(allocator, &resp);
+        try socket.sendAllControlled(bytes, budget.view());
     }
 
     /// Serializes a response to memory, then sends in a single writeAll call
@@ -4325,26 +4363,34 @@ test "HTTP/2 oversized body before handler claim writes 413" {
     stream.stream_error = error.StreamDataOverflow;
     stream.completed = true;
 
-    var wire = std.ArrayListUnmanaged(u8).empty;
-    defer wire.deinit(allocator);
-    const TestWriter = struct {
-        list: *std.ArrayListUnmanaged(u8),
-        alloc: Allocator,
-        pub fn writeAll(self: @This(), data: []const u8) !void {
-            try self.list.appendSlice(self.alloc, data);
-        }
-    };
-    var writer = TestWriter{ .list = &wire, .alloc = allocator };
+    const io = std.testing.io;
+    var listener = try TcpListener.init(.{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } }, io);
+    defer listener.deinit();
+    var sender = try Socket.connect(listener.getLocalAddress(), io);
+    defer sender.close();
+    var peer = try listener.accept();
+    defer peer.socket.close();
+    peer.socket.enableNativeTimeouts();
+    try peer.socket.setRecvTimeout(500);
     var data_event = Io.Event.unset;
-    try std.testing.expect(!server.claimH2StreamForHandler(&h2, &writer, 1, &data_event));
+    try std.testing.expect(!server.claimH2StreamForHandler(&h2, &sender, 1, &data_event));
     try std.testing.expect(h2.stream_manager.getStream(1) == null);
 
-    try std.testing.expect(wire.items.len >= 18);
-    const headers_len: usize = std.mem.readInt(u24, wire.items[0..3], .big);
-    try std.testing.expectEqual(@backingInt(http.Http2FrameType.headers), wire.items[3]);
+    try sender.shutdownWrite();
+    var bytes: [2048]u8 = undefined;
+    var used: usize = 0;
+    while (used < bytes.len) {
+        const count = try peer.socket.recv(bytes[used..]);
+        if (count == 0) break;
+        used += count;
+    }
+    const wire = bytes[0..used];
+    try std.testing.expect(wire.len >= 18);
+    const headers_len: usize = std.mem.readInt(u24, wire[0..3], .big);
+    try std.testing.expectEqual(@backingInt(http.Http2FrameType.headers), wire[3]);
     var client = H2Connection.initClient(allocator, std.testing.io);
     defer client.deinit();
-    const decoded = try client.decodeFrameHeaders(wire.items[9..][0..headers_len], wire.items[4]);
+    const decoded = try client.decodeFrameHeaders(wire[9..][0..headers_len], wire[4]);
     defer stream_mod.freeDecodedHeaders(allocator, decoded.headers);
     var saw_status = false;
     for (decoded.headers) |header| {
@@ -4353,17 +4399,17 @@ test "HTTP/2 oversized body before handler claim writes 413" {
     try std.testing.expect(saw_status);
 
     const data_offset = 9 + headers_len;
-    const data_len: usize = std.mem.readInt(u24, wire.items[data_offset..][0..3], .big);
-    try std.testing.expectEqual(@backingInt(http.Http2FrameType.data), wire.items[data_offset + 3]);
-    try std.testing.expect(wire.items[data_offset + 4] & H2Connection.FLAG_END_STREAM != 0);
-    try std.testing.expectEqualStrings(routeErrorBody(413), wire.items[data_offset + 9 ..][0..data_len]);
+    const data_len: usize = std.mem.readInt(u24, wire[data_offset..][0..3], .big);
+    try std.testing.expectEqual(@backingInt(http.Http2FrameType.data), wire[data_offset + 3]);
+    try std.testing.expect(wire[data_offset + 4] & H2Connection.FLAG_END_STREAM != 0);
+    try std.testing.expectEqualStrings(routeErrorBody(413), wire[data_offset + 9 ..][0..data_len]);
 
     const reset_offset = data_offset + 9 + data_len;
-    try std.testing.expect(wire.items.len >= reset_offset + 13);
-    try std.testing.expectEqual(@backingInt(http.Http2FrameType.rst_stream), wire.items[reset_offset + 3]);
+    try std.testing.expect(wire.len >= reset_offset + 13);
+    try std.testing.expectEqual(@backingInt(http.Http2FrameType.rst_stream), wire[reset_offset + 3]);
     try std.testing.expectEqual(
         @backingInt(http.Http2ErrorCode.cancel),
-        std.mem.readInt(u32, wire.items[reset_offset + 9 ..][0..4], .big),
+        std.mem.readInt(u32, wire[reset_offset + 9 ..][0..4], .big),
     );
 }
 
@@ -7507,7 +7553,8 @@ test "HTTP controlled H2 reset cleanup survives actual task cancellation" {
 }
 
 const H2ResetBackpressureTest = struct {
-    fn run(comptime fallback: bool) !void {
+    const Mode = enum { reset, h1_error, h2_error };
+    fn run(comptime fallback: bool, comptime mode: Mode) !void {
         if (fallback and @import("builtin").os.tag != .linux) return error.SkipZigTest;
         var lane = Io.Threaded.init(std.testing.allocator, .{ .async_limit = .nothing, .concurrent_limit = .limited(4) });
         defer lane.deinit();
@@ -7543,12 +7590,18 @@ const H2ResetBackpressureTest = struct {
         stalled = false;
         var small_sent: usize = 0;
         var empty_sends: usize = 0;
+        var stalled_ticks: usize = 0;
         for (0..1024 * 1024) |_| {
             const count = sender.send(payload[0..1]) catch |err| {
                 if (err != error.Timeout) return err;
-                stalled = true;
-                break;
+                stalled_ticks += 1;
+                if (stalled_ticks >= 5) {
+                    stalled = true;
+                    break;
+                }
+                continue;
             };
+            stalled_ticks = 0;
             small_sent += count;
             if (count == 0) empty_sends += 1;
         }
@@ -7560,12 +7613,18 @@ const H2ResetBackpressureTest = struct {
         defer h2.deinit();
         const stream = try h2.stream_manager.getOrCreateStream(1);
         stream.state = .open;
+        var server = Server.init(std.testing.allocator, io);
+        defer server.deinit();
         const started = milliTimestamp(io);
-        Server.cancelH2Stream(&h2, &sender, 1);
+        switch (mode) {
+            .reset => Server.cancelH2Stream(&h2, &sender, 1),
+            .h1_error => try std.testing.expectError(error.Timeout, server.sendError(&sender, 503)),
+            .h2_error => try std.testing.expectError(error.Timeout, server.sendH2ErrorLocked(&h2, &sender, 1, 503)),
+        }
         const elapsed = milliTimestamp(io) - started;
-        std.debug.print("RESET_BACKPRESSURE fallback={} elapsed_ms={d}\n", .{ fallback, elapsed });
+        std.debug.print("CLEANUP_BACKPRESSURE mode={s} fallback={} elapsed_ms={d}\n", .{ @tagName(mode), fallback, elapsed });
         try std.testing.expect(elapsed >= 200 and elapsed < 1500);
-        try std.testing.expectEqual(.closed, stream.state);
+        if (mode == .reset) try std.testing.expectEqual(.closed, stream.state);
         try std.testing.expect(h2.write_mutex.tryLock());
         h2.write_mutex.unlock(io);
         peer.socket.enableNativeTimeouts();
@@ -7582,11 +7641,11 @@ const H2ResetBackpressureTest = struct {
 };
 
 test "HTTP controlled H2 reset cleanup bounds a stalled native peer" {
-    try H2ResetBackpressureTest.run(false);
+    try H2ResetBackpressureTest.run(false, .reset);
 }
 
 test "HTTP controlled H2 reset cleanup bounds a stalled fallback peer with zero async allowance" {
-    try H2ResetBackpressureTest.run(true);
+    try H2ResetBackpressureTest.run(true, .reset);
 }
 
 test "HTTP controlled scheduler failures map to retryable overload without replacing original fences" {
@@ -7673,4 +7732,221 @@ test "HTTP controlled H1 scheduler overload publishes retry guidance and a compl
     try std.testing.expect(mem.indexOf(u8, wire[0..used], " 503 ") != null);
     try std.testing.expect(std.ascii.findIgnoreCase(wire[0..used], "retry-after: 1\r\n") != null);
     try std.testing.expect(mem.endsWith(u8, wire[0..used], routeErrorBody(503)));
+}
+
+test "HTTP controlled H1 error cleanup bounds a stalled native peer" {
+    try H2ResetBackpressureTest.run(false, .h1_error);
+}
+
+test "HTTP controlled H2 error cleanup bounds a stalled native peer" {
+    try H2ResetBackpressureTest.run(false, .h2_error);
+}
+
+test "HTTP controlled H1 error cleanup bounds a stalled fallback peer with zero async allowance" {
+    try H2ResetBackpressureTest.run(true, .h1_error);
+}
+
+test "HTTP controlled H2 error cleanup bounds a stalled fallback peer with zero async allowance" {
+    try H2ResetBackpressureTest.run(true, .h2_error);
+}
+
+test "HTTP controlled H2 error cleanup bounds a contended mutex without unlocked stream mutation" {
+    const io = std.testing.io;
+    var listener = try TcpListener.init(.{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } }, io);
+    defer listener.deinit();
+    var sender = try Socket.connect(listener.getLocalAddress(), io);
+    defer sender.close();
+    var peer = try listener.accept();
+    defer peer.socket.close();
+    peer.socket.enableNativeTimeouts();
+    try peer.socket.setRecvTimeout(500);
+    var server = Server.init(std.testing.allocator, io);
+    defer server.deinit();
+    var h2 = H2Connection.initServer(std.testing.allocator, io);
+    defer h2.deinit();
+    const stream = try h2.stream_manager.getOrCreateStream(1);
+    stream.state = .open;
+    h2.write_mutex.lockUncancelable(io);
+    const started = milliTimestamp(io);
+    const result = server.sendH2ErrorLocked(&h2, &sender, 1, 503);
+    h2.write_mutex.unlock(io);
+    try std.testing.expectError(error.Timeout, result);
+    try std.testing.expect(milliTimestamp(io) - started >= 200 and milliTimestamp(io) - started < 1500);
+    try std.testing.expectEqual(.open, stream.state);
+    var bytes: [1]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 0), try peer.socket.recv(&bytes));
+}
+
+test "HTTP controlled H2 error cleanup bounds credit waits and releases the mutex" {
+    const io = std.testing.io;
+    var listener = try TcpListener.init(.{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } }, io);
+    defer listener.deinit();
+    var sender = try Socket.connect(listener.getLocalAddress(), io);
+    defer sender.close();
+    var peer = try listener.accept();
+    defer peer.socket.close();
+    peer.socket.enableNativeTimeouts();
+    try peer.socket.setRecvTimeout(500);
+    var server = Server.init(std.testing.allocator, io);
+    defer server.deinit();
+    var h2 = H2Connection.initServer(std.testing.allocator, io);
+    defer h2.deinit();
+    const stream = try h2.stream_manager.getOrCreateStream(1);
+    stream.state = .open;
+    stream.send_window = 0;
+    var ready: Io.Event = .unset;
+    var task = try io.concurrent(struct {
+        fn run(value: *Server, connection: *H2Connection, socket: *Socket, signal: *Io.Event) !void {
+            signal.set(connection.io);
+            try value.sendH2ErrorLocked(connection, socket, 1, 503);
+        }
+    }.run, .{ &server, &h2, &sender, &ready });
+    defer task.cancel(io) catch {};
+    try ready.wait(io);
+    // Synchronize with actual header publication rather than assuming the
+    // handler has run by a fixed scheduling delay on a loaded host.
+    var bytes: [1024]u8 = undefined;
+    var used: usize = 0;
+    while (used < 9) {
+        const count = try peer.socket.recv(bytes[used..9]);
+        if (count == 0) return error.EndOfStream;
+        used += count;
+    }
+    try std.testing.expectEqual(@as(u8, 1), bytes[3]);
+    const headers_len: usize = std.mem.readInt(u24, bytes[0..3], .big);
+    try std.testing.expect(headers_len + 9 < bytes.len);
+    while (used < headers_len + 9) {
+        const count = try peer.socket.recv(bytes[used .. headers_len + 9]);
+        if (count == 0) return error.EndOfStream;
+        used += count;
+    }
+    try io.sleep(.fromMilliseconds(20), .awake);
+    try std.testing.expect(h2.write_mutex.tryLock());
+    // A sibling control frame can still be emitted while this stream waits
+    // for credit. The total cleanup deadline is not refreshed by that progress.
+    const ping: [8]u8 = @splat(7);
+    try h2.sendPing(&sender, ping);
+    h2.write_mutex.unlock(io);
+    try std.testing.expectError(error.Timeout, task.await(io));
+    try std.testing.expect(h2.write_mutex.tryLock());
+    h2.write_mutex.unlock(io);
+    try std.testing.expect(!stream.end_stream_sent);
+    while (used < bytes.len) {
+        const count = try peer.socket.recv(bytes[used..]);
+        if (count == 0) break;
+        used += count;
+    }
+    try std.testing.expect(used > 17 and used < bytes.len);
+    try std.testing.expectEqual(@as(u8, 6), bytes[9 + headers_len + 3]);
+}
+
+test "HTTP controlled H2 pump error with no credit resets only its stream without waiting" {
+    const io = std.testing.io;
+    var listener = try TcpListener.init(.{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } }, io);
+    defer listener.deinit();
+    var sender = try Socket.connect(listener.getLocalAddress(), io);
+    defer sender.close();
+    var peer = try listener.accept();
+    defer peer.socket.close();
+    peer.socket.enableNativeTimeouts();
+    try peer.socket.setRecvTimeout(500);
+    var server = Server.init(std.testing.allocator, io);
+    defer server.deinit();
+    var h2 = H2Connection.initServer(std.testing.allocator, io);
+    defer h2.deinit();
+    const rejected = try h2.stream_manager.getOrCreateStream(1);
+    rejected.state = .open;
+    rejected.send_window = 0;
+    const sibling = try h2.stream_manager.getOrCreateStream(3);
+    sibling.state = .open;
+    h2.write_mutex.lockUncancelable(io);
+    server.sendH2ErrorInPump(&h2, &sender, 1, 429);
+    h2.write_mutex.unlock(io);
+    try std.testing.expectEqual(.closed, rejected.state);
+    try std.testing.expectEqual(.open, sibling.state);
+    try server.sendH2ErrorLocked(&h2, &sender, 3, 503);
+    try std.testing.expect(sibling.end_stream_sent);
+    try sender.shutdownWrite();
+    var bytes: [2048]u8 = undefined;
+    var used: usize = 0;
+    while (used < bytes.len) {
+        const count = try peer.socket.recv(bytes[used..]);
+        if (count == 0) break;
+        used += count;
+    }
+    const first_len: usize = std.mem.readInt(u24, bytes[0..3], .big);
+    const reset_offset = first_len + 9;
+    try std.testing.expectEqual(@as(u8, 3), bytes[reset_offset + 3]);
+    try std.testing.expectEqual(@as(u32, 11), std.mem.readInt(u32, bytes[reset_offset + 9 ..][0..4], .big));
+    const sibling_offset = reset_offset + 13;
+    try std.testing.expectEqual(@as(u32, 3), std.mem.readInt(u32, bytes[sibling_offset + 5 ..][0..4], .big));
+}
+
+const ErrorCleanupCancellationTest = struct {
+    fn run(comptime h2_error: bool) !void {
+        const io = std.testing.io;
+        var listener = try TcpListener.init(.{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } }, io);
+        defer listener.deinit();
+        var sender = try Socket.connect(listener.getLocalAddress(), io);
+        defer sender.close();
+        sender.enableNativeTimeouts();
+        var peer = try listener.accept();
+        defer peer.socket.close();
+        peer.socket.enableNativeTimeouts();
+        try peer.socket.setRecvTimeout(500);
+        var server = Server.init(std.testing.allocator, io);
+        defer server.deinit();
+        var h2 = H2Connection.initServer(std.testing.allocator, io);
+        defer h2.deinit();
+        const stream = try h2.stream_manager.getOrCreateStream(1);
+        stream.state = .open;
+        var ready: Io.Event = .unset;
+        var task = try io.concurrent(struct {
+            fn run(value: *Server, connection: *H2Connection, socket: *Socket, signal: *Io.Event) !void {
+                signal.set(connection.io);
+                connection.io.sleep(.fromSeconds(60), .awake) catch |err| {
+                    if (err != error.Canceled) return err;
+                    connection.io.recancel();
+                    if (h2_error) {
+                        try value.sendH2ErrorLocked(connection, socket, 1, 503);
+                    } else {
+                        try value.sendError(socket, 503);
+                    }
+                    return error.Canceled;
+                };
+                return error.FixtureWasNotCanceled;
+            }
+        }.run, .{ &server, &h2, &sender, &ready });
+        defer task.cancel(io) catch {};
+        try ready.wait(io);
+        try std.testing.expectError(error.Canceled, task.cancel(io));
+        try sender.shutdownWrite();
+        var bytes: [2048]u8 = undefined;
+        var used: usize = 0;
+        while (used < bytes.len) {
+            const count = try peer.socket.recv(bytes[used..]);
+            if (count == 0) break;
+            used += count;
+        }
+        try std.testing.expect(used > 0 and used < bytes.len);
+        if (h2_error) {
+            try std.testing.expect(stream.end_stream_sent);
+            const headers_len: usize = std.mem.readInt(u24, bytes[0..3], .big);
+            const data_offset = 9 + headers_len;
+            try std.testing.expectEqual(@as(u8, 0), bytes[data_offset + 3]);
+            try std.testing.expect(bytes[data_offset + 4] & H2Connection.FLAG_END_STREAM != 0);
+            try std.testing.expectEqualStrings(routeErrorBody(503), bytes[data_offset + 9 .. used]);
+        } else {
+            try std.testing.expect(std.mem.indexOf(u8, bytes[0..used], " 503 ") != null);
+            try std.testing.expect(mem.endsWith(u8, bytes[0..used], routeErrorBody(503)));
+        }
+    }
+};
+
+test "HTTP controlled H1 error cleanup survives actual task cancellation" {
+    try ErrorCleanupCancellationTest.run(false);
+}
+
+test "HTTP controlled H2 error cleanup survives actual task cancellation" {
+    try ErrorCleanupCancellationTest.run(true);
 }
