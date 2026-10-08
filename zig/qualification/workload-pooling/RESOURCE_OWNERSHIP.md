@@ -267,3 +267,13 @@ stream mutation on mutex denial. Native and pinned Nix/glibc GNU HTTP gates pass
 see [bounded reset receipts](receipts/2026-10-07/h2-reset-cleanup/README.md).
 This is fixed-size transport housekeeping, not an independently admitted control
 CPU root. Production integration and full default-enablement gates remain pending.
+
+
+Denied execution reentry and cooperative yielded waits now stop runnable work
+without releasing published capsule operation/byte reservations. The original
+owner releases them after consumer cleanup/reaping. Native and pinned Nix/glibc
+scheduler, broker/owner and actual subprocess-to-stalled-TCP gates pass; see
+[retained resume/reap receipts](receipts/2026-10-07/retained-resume-reap/README.md).
+The supplemental child uses production RPC and actual OS reaping; production
+Worker.Client/model startup, current whole API/archive, stuck-reap quarantine and
+full default-enablement qualification remain required.

@@ -294,6 +294,7 @@ test "broker submissions park their parent before independent admission and clea
         try Probe.checked(port.start(port.context, &.{ .io = &borrow, .class = @backingInt(runtime.runnable_abi.Class.query), .retained_bytes = 71, .cancellation = .{ .context = &probe, .is_cancelled = Probe.requested }, .out_handle = &parent }));
         defer port.finish(parent.?);
         probe.parent = parent.?;
+        const parent_retained = state.owner.scheduler.stats().retained_bytes;
         var scope = controls.CheckpointScope.init(.{ .context = &probe, .check_fn = Probe.check, .wait_begin_fn = Probe.park, .wait_end_fn = Probe.reenter });
         defer scope.deinit();
         var provider = try inference.Provider.init(std.testing.allocator, port);
@@ -319,9 +320,10 @@ test "broker submissions park their parent before independent admission and clea
             }
         }
         try std.testing.expectEqual(@as(usize, 1), probe.calls);
-        // Failed reacquisition retires the scheduler entry; the owning C
-        // capsule remains joined and is released by its original caller.
-        try std.testing.expectEqual(@as(usize, if (reject) 0 else 1), state.owner.scheduler.stats().operations);
+        // Failed reacquisition stops runnable execution. The parent capsule
+        // and its reservation remain owned until the original caller finishes.
+        try std.testing.expectEqual(@as(usize, 1), state.owner.scheduler.stats().operations);
+        try std.testing.expectEqual(parent_retained, state.owner.scheduler.stats().retained_bytes);
         try std.testing.expectEqual(@as(usize, if (reject) 0 else 1), state.owner.scheduler.stats().runnable_slots);
     };
 }

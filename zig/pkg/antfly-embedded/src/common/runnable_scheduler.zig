@@ -241,10 +241,35 @@ pub const Scheduler = struct {
         return e.state;
     }
 
-    /// Acquisition and resumed/yielded waits preserve the original deadline.
-    /// On failure this retires the whole runnable entry; caller admission,
-    /// retained output and accepted-write obligations remain separately owned.
+    /// Initial acquisition retires its unpublished entry on failure.
     pub fn wait(self: *Scheduler, e: *Entry) !void {
+        return self.waitImpl(e, false);
+    }
+    /// A published execution may lend its retained ownership to IO or a child.
+    /// Denied reentry stops runnable execution, but only its owning finish may
+    /// release operation/byte reservations after those consumers are fenced.
+    pub fn waitRetained(self: *Scheduler, e: *Entry) !void {
+        return self.waitImpl(e, true);
+    }
+    fn failWait(self: *Scheduler, e: *Entry, err: anyerror, comptime retain: bool) void {
+        if (!retain) return self.finish(e);
+        self.lock();
+        defer self.mutex.unlock();
+        if (e.scheduler != self) return;
+        switch (e.state) {
+            .queued => self.unlink(e),
+            .running => self.used[@backingInt(e.class)] -= e.slots,
+            .resource_blocked => self.metrics.resource_blocked -= 1,
+            .output_blocked => self.metrics.output_blocked -= 1,
+            .stopped => {},
+            .fresh, .finished => unreachable,
+        }
+        e.state = .stopped;
+        e.failure = err;
+        e.ready.set(e.options.io);
+        self.dispatch();
+    }
+    fn waitImpl(self: *Scheduler, e: *Entry, comptime retain: bool) !void {
         self.lock();
         const owned = e.scheduler == self;
         self.mutex.unlock();
@@ -260,7 +285,7 @@ pub const Scheduler = struct {
         }
         while (true) {
             options.check() catch |err| {
-                self.finish(e);
+                self.failWait(e, err, retain);
                 return err;
             };
             self.lock();
@@ -272,26 +297,27 @@ pub const Scheduler = struct {
             self.mutex.unlock();
             if (!still_owned) return error.InvalidRunnableTransition;
             if (waited and options.now() >= until) {
-                self.finish(e);
+                self.failWait(e, error.RunnableWaitTimeout, retain);
                 return error.RunnableWaitTimeout;
             }
             if (s == .running and !closed) {
                 options.check() catch |err| {
-                    self.finish(e);
+                    self.failWait(e, err, retain);
                     return err;
                 };
                 return;
             }
             if (closed) {
-                self.finish(e);
+                self.failWait(e, error.SchedulerClosed, retain);
                 return error.SchedulerClosed;
             }
             if (s != .queued) {
-                self.finish(e);
-                return failure orelse error.InvalidRunnableTransition;
+                const err = failure orelse error.InvalidRunnableTransition;
+                self.failWait(e, err, retain);
+                return err;
             }
             if (options.now() >= until) {
-                self.finish(e);
+                self.failWait(e, error.RunnableWaitTimeout, retain);
                 return error.RunnableWaitTimeout;
             }
             e.ready.waitTimeout(options.io, .{ .duration = .{
@@ -300,7 +326,7 @@ pub const Scheduler = struct {
             } }) catch |err| switch (err) {
                 error.Timeout => {},
                 error.Canceled => {
-                    self.finish(e);
+                    self.failWait(e, err, retain);
                     return err;
                 },
             };
@@ -502,7 +528,7 @@ pub const Execution = struct {
         if (self.checkpoints < owner.config.checkpoint_budget and
             e.options.now() -| self.quantum_start_ns < @as(u64, owner.config.quantum_ms) * std.time.ns_per_ms) return;
         try owner.yield(e);
-        try owner.wait(e);
+        try owner.waitRetained(e);
         self.resume_generation +%= 1;
         self.quantum_start_ns = e.options.now();
         self.checkpoints = 0;
@@ -517,7 +543,7 @@ pub const Execution = struct {
         const owner = e.scheduler orelse return error.InvalidRunnableTransition;
         try owner.reclassifyBlocked(e, class);
         try owner.unblock(e);
-        try owner.wait(e);
+        try owner.waitRetained(e);
         self.resume_generation +%= 1;
         self.quantum_start_ns = e.options.now();
         self.checkpoints = 0;
@@ -888,4 +914,89 @@ test "runnable scheduler reserves control metadata at full ordinary outstanding 
     try s.wait(&first);
     try std.testing.expectEqual(@as(usize, 0), s.stats().control_operations);
     try std.testing.expectEqual(@as(usize, 1), s.stats().control_slots);
+}
+
+test "runnable scheduler denied reentry retains borrowed reservations until owning finish" {
+    const Cause = enum { canceled, deadline, wait_timeout };
+    const Flag = struct {
+        value: bool = false,
+        fn requested(raw: *const anyopaque) bool {
+            return @as(*const @This(), @ptrCast(@alignCast(raw))).value;
+        }
+    };
+    for (std.enums.values(Cause)) |cause| {
+        VirtualClock.value = 0;
+        var flag: Flag = .{};
+        var scheduler = try Scheduler.init(.{ .slots = 3, .max_operations = 4, .max_wait_ms = 1 });
+        defer scheduler.close();
+        var borrowed: Execution = .{};
+        defer borrowed.finish();
+        try borrowed.startWithSlots(&scheduler, .{
+            .io = std.testing.io,
+            .native_now_ns = if (cause == .wait_timeout) null else VirtualClock.now,
+            .deadline_ns = if (cause == .deadline) 10 else null,
+            .cancellation = .{ .ptr = &flag, .requested = Flag.requested },
+            .retained_bytes = 17,
+        }, .inference, 2);
+        try borrowed.park(.resource_blocked);
+        var peer: Execution = .{};
+        defer peer.finish();
+        try peer.startWithSlots(&scheduler, .{ .io = std.testing.io }, .query, 2);
+        if (cause == .canceled) flag.value = true;
+        if (cause == .deadline) VirtualClock.value = 11;
+        try std.testing.expectError(switch (cause) {
+            .canceled => error.Canceled,
+            .deadline => error.DeadlineExceeded,
+            .wait_timeout => error.RunnableWaitTimeout,
+        }, borrowed.enter(.inference));
+        const held = scheduler.stats();
+        try std.testing.expectEqual(State.stopped, scheduler.state(&borrowed.entry.?));
+        try std.testing.expectEqual(@as(usize, 2), held.operations);
+        try std.testing.expectEqual(@as(u64, 17), held.retained_bytes);
+        try std.testing.expectEqual(@as(usize, 2), held.runnable_slots);
+        try std.testing.expectEqual(@as(usize, 0), held.queued);
+        // A detached or still-unreaped consumer cannot silently free its
+        // outstanding operation reservation for a fresh foreground request.
+        var excess = testEntry(.query, 1, 0);
+        try std.testing.expectError(error.SchedulerFull, scheduler.submit(&excess));
+        peer.finish();
+        try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 17), scheduler.stats().retained_bytes);
+        borrowed.finish();
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+    }
+}
+
+test "runnable scheduler canceled yielded capsule retains ownership while peer computes" {
+    var scheduler = try Scheduler.init(.{ .slots = 3, .max_operations = 4, .checkpoint_budget = 1 });
+    defer scheduler.close();
+    var peer = testEntry(.query, 2, 3);
+    const CancelAfterYield = struct {
+        scheduler: *Scheduler,
+        peer: *Entry,
+        fn requested(raw: *const anyopaque) bool {
+            const self: *const @This() = @ptrCast(@alignCast(raw));
+            return self.scheduler.state(self.peer) == .running;
+        }
+    };
+    const cancellation = CancelAfterYield{ .scheduler = &scheduler, .peer = &peer };
+    var borrowed: Execution = .{};
+    defer borrowed.finish();
+    try borrowed.startWithSlots(&scheduler, .{ .io = std.testing.io, .retained_bytes = 17, .cancellation = .{ .ptr = &cancellation, .requested = CancelAfterYield.requested } }, .inference, 2);
+    try scheduler.submit(&peer);
+    defer scheduler.finish(&peer);
+    try std.testing.expectEqual(State.queued, scheduler.state(&peer));
+    try std.testing.expectError(error.Canceled, borrowed.checkpoint());
+    try std.testing.expectEqual(State.running, scheduler.state(&peer));
+    try std.testing.expectEqual(State.stopped, scheduler.state(&borrowed.entry.?));
+    const held = scheduler.stats();
+    try std.testing.expectEqual(@as(usize, 2), held.operations);
+    try std.testing.expectEqual(@as(u64, 20), held.retained_bytes);
+    try std.testing.expectEqual(@as(usize, 2), held.runnable_slots);
+    try std.testing.expectEqual(@as(u64, 1), held.yields);
+    borrowed.finish();
+    try std.testing.expectEqual(@as(u64, 3), scheduler.stats().retained_bytes);
+    scheduler.finish(&peer);
+    try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
 }
