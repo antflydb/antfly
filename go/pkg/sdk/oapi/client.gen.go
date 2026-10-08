@@ -9324,6 +9324,24 @@ func (e TableStorageMode) Valid() bool {
 	}
 }
 
+// Defines values for TableStorageSettingsEngine.
+const (
+	TableStorageSettingsEngineNative TableStorageSettingsEngine = "native"
+	TableStorageSettingsEngineObject TableStorageSettingsEngine = "object"
+)
+
+// Valid indicates whether the value is a known member of the TableStorageSettingsEngine enum.
+func (e TableStorageSettingsEngine) Valid() bool {
+	switch e {
+	case TableStorageSettingsEngineNative:
+		return true
+	case TableStorageSettingsEngineObject:
+		return true
+	default:
+		return false
+	}
+}
+
 // Defines values for TableStorageSettingsDenseEmbeddings.
 const (
 	TableStorageSettingsDenseEmbeddingsPrimaryLsm  TableStorageSettingsDenseEmbeddings = "primary_lsm"
@@ -27415,10 +27433,16 @@ type TableStorageMode string
 type TableStorageSettings struct {
 	// DenseEmbeddings Explicit ownership choice. vector_store requires a fresh local single-shard standalone table without HA or replication. An explicit empty storage object keeps primary_lsm; omit the storage object to use the deployment default.
 	DenseEmbeddings TableStorageSettingsDenseEmbeddings `json:"dense_embeddings,omitempty,omitzero"`
+
+	// Engine Durable table engine, independent of deployment. native uses the process storage engine and shard placement. object uses external lake data with durable sidecars, or an Antfly-owned object WAL and published generations. Object tables do not allocate data Raft groups; omit num_shards and replication_sources. Metadata remains authoritative for table lifetime. Configure the shared destination through storage.artifacts. Writable object document tables initially require immutable schema and index definitions; changes require a new table and explicit migration.
+	Engine TableStorageSettingsEngine `json:"engine,omitempty,omitzero"`
 }
 
 // TableStorageSettingsDenseEmbeddings Explicit ownership choice. vector_store requires a fresh local single-shard standalone table without HA or replication. An explicit empty storage object keeps primary_lsm; omit the storage object to use the deployment default.
 type TableStorageSettingsDenseEmbeddings string
+
+// TableStorageSettingsEngine Durable table engine, independent of deployment. native uses the process storage engine and shard placement. object uses external lake data with durable sidecars, or an Antfly-owned object WAL and published generations. Object tables do not allocate data Raft groups; omit num_shards and replication_sources. Metadata remains authoritative for table lifetime. Configure the shared destination through storage.artifacts. Writable object document tables initially require immutable schema and index definitions; changes require a new table and explicit migration.
+type TableStorageSettingsEngine string
 
 // TableStorageUnreadableError A non-retryable table-storage integrity or format failure.
 type TableStorageUnreadableError struct {

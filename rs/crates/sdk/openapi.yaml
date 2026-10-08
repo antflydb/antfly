@@ -15713,6 +15713,18 @@ components:
         default does not migrate data. Snapshot/backup and split operations currently reject vector_store
         tables; explicitly select primary_lsm when these operations are required.
       properties:
+        engine:
+          type: string
+          enum:
+            - native
+            - object
+          default: native
+          description: Durable table engine, independent of deployment. native uses the process storage
+            engine and shard placement. object uses external lake data with durable sidecars, or an Antfly-owned
+            object WAL and published generations. Object tables do not allocate data Raft groups; omit
+            num_shards and replication_sources. Metadata remains authoritative for table lifetime. Configure
+            the shared destination through storage.artifacts. Writable object document tables initially
+            require immutable schema and index definitions; changes require a new table and explicit migration.
         dense_embeddings:
           type: string
           enum:

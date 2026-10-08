@@ -2007,6 +2007,8 @@ pub const StatusSource = struct {
 
     pub const VTable = struct {
         supports_query_definitions: bool = false,
+        /// Hosting requires native existence, definition CAS and policy authority.
+        supports_object_tables: bool = false,
         acquire_join_planning: ?*const fn (*anyopaque, table_router.RouteBudget) anyerror!?*join_planning.Generation = null,
         system_catalog: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, context: api_operation.RequestContext, input: @import("../system_catalog/server_call.zig").Call) anyerror![]u8 = null,
 
@@ -2718,6 +2720,7 @@ pub const StatusSource = struct {
         return .{
             .system_catalog = Gen.systemCatalog,
             .supports_query_definitions = true,
+            .supports_object_tables = true,
             .status = Gen.status,
             .admin_snapshot = Gen.adminSnapshot,
             .acquire_join_planning = Gen.acquireJoinPlanning,
@@ -3295,6 +3298,7 @@ fn validateTableDefinitionReplacementOnService(
     defer svc.freeAdminSnapshot(&snapshot);
     const current = tables_api.findTableByName(&snapshot, replacement.name) orelse return error.TableNotFound;
     if (!metadata_table_manager.tableDefinitionsEqual(current.*, expected) or replacement.table_id != expected.table_id) return error.TableGenerationChanged;
+    try metadata_table_manager.validateObjectTableMutation(std.heap.page_allocator, expected, replacement);
     try indexes_api.validateArtifactEnrichmentsForTableIndexesJson(std.heap.page_allocator, replacement.indexes_json);
     try managed_embedder.validateEmbeddingProducerOwnershipJson(std.heap.page_allocator, replacement.indexes_json);
     if (try extension_table_ownership.definitionMutationTouchesOwnedState(
@@ -3853,6 +3857,7 @@ pub const ApiHttpServer = struct {
         return distributed_join.partitionForJoinValue(value, partition_count);
     }
 
+    object_tables: @import("object_table_runtime.zig").Manager = .{},
     retained_read_runtime: ?*@import("retained_read_owner.zig").Runtime = null,
     retained_read_runtime_mutex: std.Io.Mutex = .init,
     table_definition_cache: tables_api.DefinitionCache = .{},
@@ -4657,6 +4662,7 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn deinit(self: *ApiHttpServer) void {
+        self.object_tables.deinit(self.owner_alloc);
         if (self.pgwire_listener) |listener| {
             listener.deinit();
             self.pgwire_listener = null;
@@ -10991,6 +10997,7 @@ pub const ApiHttpServer = struct {
         request: api_operation.RequestContext,
         sealed_handles: []const @import("antfly_local_sources").api_backup_contract.SealedHandle,
     ) !void {
+        if (table.storage.engine == .object) return error.UnsupportedBackupFormat;
         if (!std.mem.eql(u8, table.name, table_name)) return error.TableNotFound;
         if (table.read_schema_json.len > 0) {
             // Only a coherent sealed cut may capture both schema generations.
@@ -16499,7 +16506,7 @@ pub const ApiHttpServer = struct {
             error.MetadataMutationOutcomeUnknown => return error.MetadataMutationOutcomeUnknown,
             error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
             error.TableNotFound => return error.NotFound,
-            error.TableTransitionActive, error.TableGenerationChanged => return error.Conflict,
+            error.TableTransitionActive, error.TableGenerationChanged, error.ObjectTableDefinitionConflict, error.ImmutableTableStorageSettings => return error.Conflict,
             error.ExtensionOwnedObject => return error.MethodNotAllowed,
             error.UnsupportedOperation => return error.MethodNotAllowed,
             error.InvalidTableIndexMetadata, error.InvalidCreateIndexRequest, error.UnsupportedCreateTableRequest => return error.InvalidIndexRequest,
@@ -16883,7 +16890,7 @@ pub const ApiHttpServer = struct {
             error.MetadataMutationOutcomeUnknown => return error.MetadataMutationOutcomeUnknown,
             error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
             error.TableNotFound => return error.NotFound,
-            error.TableTransitionActive, error.TableGenerationChanged => return error.Conflict,
+            error.TableTransitionActive, error.TableGenerationChanged, error.ObjectTableDefinitionConflict, error.ImmutableTableStorageSettings => return error.Conflict,
             error.ExtensionOwnedObject, error.UnsupportedOperation => return error.MethodNotAllowed,
             else => return if (metadata_authority.isRetryableError(err)) error.NotLeader else error.InternalFailure,
         };
@@ -16918,7 +16925,7 @@ pub const ApiHttpServer = struct {
                 external_table = schema.external_base_source != null;
             }
             if (@import("relational_index_mutation.zig").drop(alloc, before, index_name) catch |err| switch (err) {
-                error.TableTransitionActive, error.TableGenerationChanged => return error.Conflict,
+                error.TableTransitionActive, error.TableGenerationChanged, error.ObjectTableDefinitionConflict, error.ImmutableTableStorageSettings => return error.Conflict,
                 else => return error.InternalFailure,
             }) |replacement| {
                 defer metadata_table_manager.freeTable(alloc, replacement);
@@ -16940,7 +16947,7 @@ pub const ApiHttpServer = struct {
             error.MetadataMutationOutcomeUnknown => return error.MetadataMutationOutcomeUnknown,
             error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
             error.TableNotFound, error.IndexNotFound => return error.NotFound,
-            error.TableTransitionActive, error.TableGenerationChanged => return error.Conflict,
+            error.TableTransitionActive, error.TableGenerationChanged, error.ObjectTableDefinitionConflict, error.ImmutableTableStorageSettings => return error.Conflict,
             error.ExtensionOwnedObject => return error.MethodNotAllowed,
             error.UnsupportedOperation => return error.MethodNotAllowed,
             error.InvalidEnrichmentConfig,
@@ -17102,7 +17109,7 @@ pub const ApiHttpServer = struct {
         self.source.replaceTableDefinition(table_before, replacement) catch |err| switch (err) {
             error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
             error.TableNotFound => return error.NotFound,
-            error.TableTransitionActive, error.TableGenerationChanged => return error.Conflict,
+            error.TableTransitionActive, error.TableGenerationChanged, error.ObjectTableDefinitionConflict, error.ImmutableTableStorageSettings => return error.Conflict,
             error.ExtensionOwnedObject => return error.MethodNotAllowed,
             error.UnsupportedOperation => return error.MethodNotAllowed,
             error.InvalidTableIndexMetadata, error.InvalidExtensionEnrichment, error.InvalidEnrichmentConfig, error.ConflictingEnrichmentConfig => return error.InvalidEnrichmentRequest,
@@ -17158,7 +17165,7 @@ pub const ApiHttpServer = struct {
         self.source.deleteArtifactEnrichment(alloc, table_name, artifact_name) catch |err| switch (err) {
             error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
             error.TableNotFound, error.EnrichmentNotFound => return error.NotFound,
-            error.TableTransitionActive, error.TableGenerationChanged => return error.Conflict,
+            error.TableTransitionActive, error.TableGenerationChanged, error.ObjectTableDefinitionConflict, error.ImmutableTableStorageSettings => return error.Conflict,
             error.ExtensionOwnedObject => return error.MethodNotAllowed,
             error.UnsupportedOperation => return error.MethodNotAllowed,
             error.InvalidEnrichmentConfig,
@@ -21022,6 +21029,7 @@ pub const ApiHttpServer = struct {
             error.DatabaseNotFound, error.NamespaceNotFound, error.TablespaceNotFound, error.CatalogAlreadyExists, error.CatalogGenerationChanged, error.InvalidCatalogName, error.InvalidCatalogMutation, error.CatalogCommandTooLarge, error.Forbidden => try contextualJsonErrorResponse(self.alloc, system_catalog.httpStatus(err), @errorName(err)),
             error.TableAlreadyExists => try contextual_operations.textAlloc(self.alloc, 409, "table already exists"),
             error.InvalidCreateTableRequest, error.InvalidTableName => try contextual_operations.textAlloc(self.alloc, 400, "invalid table configuration"),
+            error.ObjectTablePlacementUnsupported => try contextual_operations.textAlloc(self.alloc, 400, "object tables do not accept num_shards or replication sources"),
             error.InvalidTableStorageSettings, error.VectorStoreRequiresLocalSingleShardTable => try contextual_operations.textAlloc(self.alloc, 400, "vector_store requires a fresh local single-shard standalone table without replication"),
             error.CreateTableShardCountOutOfRange => try contextual_operations.textAlloc(self.alloc, 400, tables_api.table_initial_ranges_error_message),
             error.CreateTableRequestTooLarge => try contextual_operations.textAlloc(self.alloc, 413, "create table request too large"),
@@ -21297,6 +21305,82 @@ pub const ApiHttpServer = struct {
         return self.handleAdmittedResolvedTableQueryWithContentTypeCancellation(binding.physical, body, content_type, identity, cancellation, binding.label, if (binding.join) |*value| value else null, &resolver);
     }
 
+    /// The native catalog is the authority for existence and incarnation. This
+    /// adapter exposes only data operations; object catalogs cannot create or
+    /// drop native tables or alter their definitions.
+    pub fn tryObjectTableRequest(self: *ApiHttpServer, table_name: []const u8, method: @import("../serverless/api/http_routes.zig").HttpMethod, suffix: []const u8, body: []const u8, identity: ?AuthenticatedIdentity, context: api_operation.RequestContext) !?contextual_operations.OwnedResponse {
+        if (!self.source.vtable.supports_object_tables) return null;
+        // Engine selection is immutable. Avoid a new authority read on every
+        // native request; object operations revalidate the incarnation below.
+        if (try self.statusAdminSnapshot()) |value| {
+            var hint = value;
+            defer self.source.freeAdminSnapshot(&hint);
+            if (tables_api.findTableByName(&hint, table_name)) |candidate| {
+                if (candidate.storage.engine != .object) return null;
+            }
+        }
+        var snapshot = (try self.source.linearizableSnapshot(context)) orelse return error.ReadUnavailable;
+        defer self.source.freeAdminSnapshot(&snapshot);
+        const table = tables_api.findTableByName(&snapshot, table_name) orelse return null;
+        if (table.storage.engine != .object) return null;
+        var schema = try schema_mod.parseValidatedTableSchema(self.alloc, table.schema_json);
+        defer schema.deinit(self.alloc);
+        if (schema.external_base_source != null) return null;
+        if (identity) |user| if (user.row_filter.len != 0) return try contextual_operations.textAlloc(self.alloc, 409, "object-backed document tables do not support credential row filters");
+        // Policy enforcement belongs to native storage owners. Check the
+        // durable publication before bypassing those owners for object data.
+        var policy_context = context;
+        policy_context.row_policy_install_authority = true;
+        const policy_bytes = try self.source.systemCatalog(self.alloc, policy_context, .{ .policy_publication_status = table.table_id });
+        defer self.alloc.free(policy_bytes);
+        var publication = try std.json.parseFromSlice(?@import("antfly_local_sources").system_catalog_policies.PublicationStamp, self.alloc, policy_bytes, .{ .ignore_unknown_fields = true });
+        defer publication.deinit();
+        if (publication.value) |stamp| {
+            try stamp.validateShape();
+            if (stamp.table_id != table.table_id) return error.RowPolicyCatalogChanged;
+            if ((try stamp.servingAuthority()) != null) return try contextual_operations.textAlloc(self.alloc, 409, "object document tables do not support native row policies");
+        }
+        var bound = table.*;
+        if (std.mem.allEqual(u8, &bound.object_storage_identity, 0)) {
+            var store = @import("lake_index_store.zig").Store.openNative(self.alloc, self.cfg.node_config, self.cfg.secret_store, false, self.cfg.deployment_mode, self.cfg.native_lake_artifact_base_dir) catch |err| switch (err) {
+                error.NativeArtifactStorageRequired, error.NativeArtifactStorageUnauthorized => return try contextual_operations.textAlloc(self.alloc, 503, "object table storage is not configured or authorized"),
+                else => return err,
+            };
+            defer store.deinit();
+            bound.object_storage_identity = try @import("object_table_runtime.zig").storeIdentity(self.alloc, &store);
+            _ = try self.source.replaceTableDefinitionStamped(table.*, bound);
+            // Never treat ambiguous admission as a successful binding.
+            var admitted = (try self.source.linearizableSnapshot(context)) orelse return error.ReadUnavailable;
+            defer self.source.freeAdminSnapshot(&admitted);
+            const current = tables_api.findTableByName(&admitted, table_name) orelse return error.TableNotFound;
+            if (!metadata_table_manager.tableDefinitionsEqual(current.*, bound)) return error.TableGenerationChanged;
+        }
+        var response = self.object_tables.handle(self.owner_alloc, self.embedding_provider_runtime.io, bound, .{
+            .config = self.cfg.node_config,
+            .secrets = self.cfg.secret_store,
+            .deployment = self.cfg.deployment_mode,
+            .local_base_dir = self.cfg.native_lake_artifact_base_dir,
+        }, method, suffix, body, context.cancellation) catch |err| switch (err) {
+            error.ObjectTableStorageBindingChanged => return try contextual_operations.textAlloc(self.alloc, 409, "object table storage binding differs from its durable catalog binding"),
+            error.ObjectTableDefinitionConflict => return try contextual_operations.textAlloc(self.alloc, 409, "object table definition is immutable; use a new table and explicit migration"),
+            error.ObjectTableRuntimeCapacityExceeded => return try contextual_operations.textAlloc(self.alloc, 503, "object table runtime capacity exhausted"),
+            error.NativeArtifactStorageRequired, error.NativeArtifactStorageUnauthorized => return try contextual_operations.textAlloc(self.alloc, 503, "object table storage is not configured or authorized"),
+            else => return err,
+        };
+        defer response.deinit(self.owner_alloc);
+        var owned: contextual_operations.OwnedResponse = .{ .status = response.status, .content_type = if (std.mem.startsWith(u8, response.content_type, "application/json")) "application/json" else "text/plain", .body = try self.alloc.dupe(u8, response.body), .public_cors = true };
+        errdefer owned.deinit(self.alloc);
+        if (response.retry_after_seconds) |seconds| {
+            const headers = try self.alloc.alloc(contextual_operations.Header, 1);
+            errdefer self.alloc.free(headers);
+            const name = try self.alloc.dupe(u8, "Retry-After");
+            errdefer self.alloc.free(name);
+            headers[0] = .{ .name = name, .value = try std.fmt.allocPrint(self.alloc, "{d}", .{seconds}) };
+            owned.headers = headers;
+        }
+        return owned;
+    }
+
     pub fn handleAdmittedResolvedTableQueryWithContentTypeCancellation(
         self: *ApiHttpServer,
         table_name: []const u8,
@@ -21311,7 +21395,36 @@ pub const ApiHttpServer = struct {
         if (isNdjsonContentType(content_type)) {
             return try self.handlePublicTableMultiQueryWithCancellation(table_name, body, authenticated_identity, cancellation, response_label, bound_join);
         }
+        if (try self.tryObjectTableRequest(table_name, .post, "query", body, authenticated_identity, .{ .cancellation = if (cancellation) |value| value.token() else .none })) |response| {
+            if (bound_join != null) {
+                var owned = response;
+                owned.deinit(self.alloc);
+                return contextual_operations.textAlloc(self.alloc, 400, "object table joins are not supported");
+            }
+            var owned = response;
+            errdefer owned.deinit(self.alloc);
+            if (owned.status == 200) {
+                var parsed = try std.json.parseFromSlice(std.json.Value, self.alloc, owned.body, .{ .parse_numbers = false });
+                defer parsed.deinit();
+                const label = response_label orelse table_name;
+                relabelObjectQueryResult(&parsed.value, label);
+                const relabeled = try std.json.Stringify.valueAlloc(self.alloc, parsed.value, .{});
+                self.alloc.free(owned.body);
+                owned.body = relabeled;
+            }
+            return owned;
+        }
         return try self.handlePublicTableQueryWithCancellation(table_name, body, authenticated_identity, cancellation, response_label, bound_join, catalog_resolver);
+    }
+
+    fn relabelObjectQueryResult(value: *std.json.Value, label: []const u8) void {
+        if (value.* != .object) return;
+        for ([_][]const u8{ "table", "table_name" }) |key| {
+            if (value.object.getPtr(key)) |field| field.* = .{ .string = label };
+        }
+        if (value.object.getPtr("responses")) |responses| {
+            if (responses.* == .array) for (responses.array.items) |*item| relabelObjectQueryResult(item, label);
+        }
     }
 
     pub fn handlePublicGlobalMultiQuery(self: *ApiHttpServer, body: []const u8, authenticated_identity: ?AuthenticatedIdentity) !contextual_operations.OwnedResponse {

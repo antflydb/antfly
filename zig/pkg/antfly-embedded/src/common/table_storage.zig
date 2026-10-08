@@ -16,14 +16,30 @@
 //! Persisted source-artifact ownership, independent of ANN serving options.
 const std = @import("std");
 
+pub const Engine = enum { native, object };
+
 pub const DenseEmbeddings = enum {
     primary_lsm,
     vector_store,
 };
 
 pub const Settings = struct {
+    engine: Engine = .native,
+
     // Compatibility default for persisted records, not fresh-table admission.
     dense_embeddings: DenseEmbeddings = .primary_lsm,
+
+    pub fn jsonStringify(self: Settings, jw: anytype) !void {
+        try jw.beginObject();
+        // Keep legacy table JSON stable when the engine is implicit.
+        if (self.engine != .native) {
+            try jw.objectField("engine");
+            try jw.write(self.engine);
+        }
+        try jw.objectField("dense_embeddings");
+        try jw.write(self.dense_embeddings);
+        try jw.endObject();
+    }
 
     pub fn resolveStandaloneCreate(requested: ?Settings, num_shards: u32, replicated: bool, external_storage: bool) !Settings {
         const settings = requested orelse if (num_shards == 1 and !replicated and !external_storage)
@@ -39,13 +55,26 @@ pub const Settings = struct {
         var result: Settings = .{};
         var fields = value.object.iterator();
         while (fields.next()) |field| {
+            if (std.mem.eql(u8, field.key_ptr.*, "engine")) {
+                if (field.value_ptr.* != .string) return error.InvalidTableStorageSettings;
+                result.engine = std.meta.stringToEnum(Engine, field.value_ptr.string) orelse return error.InvalidTableStorageSettings;
+                continue;
+            }
             if (!std.mem.eql(u8, field.key_ptr.*, "dense_embeddings"))
                 return error.InvalidTableStorageSettings;
             if (field.value_ptr.* != .string) return error.InvalidTableStorageSettings;
             result.dense_embeddings = std.meta.stringToEnum(DenseEmbeddings, field.value_ptr.string) orelse
                 return error.InvalidTableStorageSettings;
         }
+        if (result.engine == .object and result.dense_embeddings == .vector_store) return error.InvalidTableStorageSettings;
         return result;
+    }
+
+    pub fn validateCreate(self: Settings, num_shards: ?u32, replicated: bool) !void {
+        if (self.engine == .object) {
+            if (self.dense_embeddings != .primary_lsm) return error.InvalidTableStorageSettings;
+            if (num_shards != null or replicated) return error.ObjectTablePlacementUnsupported;
+        }
     }
 
     pub fn validateStandalone(self: Settings, num_shards: u32, replicated: bool, external_storage: bool) !void {
@@ -85,4 +114,19 @@ test "table storage creation policy preserves explicit choices and legacy record
     var legacy = try std.json.parseFromSlice(Settings, std.testing.allocator, "{}", .{});
     defer legacy.deinit();
     try std.testing.expectEqual(.primary_lsm, legacy.value.dense_embeddings);
+}
+
+test "table storage settings object engine rejects data shard placement and vector ownership" {
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"engine\":\"object\"}", .{});
+    defer parsed.deinit();
+    const object = try Settings.parse(parsed.value);
+    try std.testing.expectEqual(.object, object.engine);
+    try object.validateCreate(null, false);
+    try std.testing.expectError(error.ObjectTablePlacementUnsupported, object.validateCreate(1, false));
+    try std.testing.expectError(error.ObjectTablePlacementUnsupported, object.validateCreate(null, true));
+    try std.testing.expectError(error.InvalidTableStorageSettings, (Settings{ .engine = .object, .dense_embeddings = .vector_store }).validateCreate(null, false));
+    const native = try Settings.resolveStandaloneCreate(null, 1, false, false);
+    try std.testing.expectEqual(.native, native.engine);
+    const explicit = try Settings.resolveStandaloneCreate(object, 1, false, false);
+    try std.testing.expectEqual(.primary_lsm, explicit.dense_embeddings);
 }

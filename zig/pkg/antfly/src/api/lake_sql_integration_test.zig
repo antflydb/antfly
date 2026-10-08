@@ -253,3 +253,132 @@ test "lake SQL public residual scan reclaims page and distant timestamp memory" 
     try std.testing.expectEqual(@as(usize, 0), budget.live);
     try std.testing.expect(budget.peak < budget.limit);
 }
+
+test "lake SQL object table document WAL publishes through native hosting without data ranges" {
+    const a = std.testing.allocator;
+    const local = @import("antfly_local_sources");
+    const object = @import("object_table_runtime.zig");
+    var directory = try local.common_test_directory.TestDirectory.init("object-table");
+    defer directory.cleanup();
+    var table: @import("../metadata/table_manager.zig").TableRecord = .{
+        .table_id = 7,
+        .name = "docs",
+        .storage = .{ .engine = .object },
+        .schema_json = @import("tables.zig").default_schema_json,
+        .indexes_json = @import("tables.zig").default_indexes_json,
+        .min_ranges = 0,
+        .desired_replica_count = 0,
+        .object_storage_generation = 11,
+    };
+    const options: object.Options = .{ .deployment = .standalone, .local_base_dir = directory.path() };
+    var store = try @import("lake_index_store.zig").Store.openNative(a, null, null, false, .standalone, directory.path());
+    defer store.deinit();
+    table.object_storage_identity = try object.storeIdentity(a, &store);
+    const ranges = try @import("tables.zig").deriveInitialRanges(a, table);
+    defer a.free(ranges);
+    try std.testing.expectEqual(@as(usize, 0), ranges.len);
+    {
+        var manager: object.Manager = .{};
+        defer manager.deinit(a);
+        var write = try manager.handle(a, std.testing.io, table, options, .post, "batch", "{\"inserts\":{\"doc:a\":{\"body\":\"alpha\"}},\"sync_level\":\"full_index\"}", .none);
+        defer write.deinit(a);
+        try std.testing.expectEqual(@as(u16, 201), write.status);
+        var lookup = try manager.handle(a, std.testing.io, table, options, .get, "lookup", "doc:a", .none);
+        defer lookup.deinit(a);
+        try std.testing.expectEqual(@as(u16, 200), lookup.status);
+        try std.testing.expect(std.mem.indexOf(u8, lookup.body, "alpha") != null);
+        var query = try manager.handle(a, std.testing.io, table, options, .post, "query", "{\"full_text_search\":{\"query\":\"body:alpha\"}}", .none);
+        defer query.deinit(a);
+        try std.testing.expectEqual(@as(u16, 200), query.status);
+        try std.testing.expect(std.mem.indexOf(u8, query.body, "doc:a") != null);
+    }
+    {
+        var reopened: object.Manager = .{};
+        defer reopened.deinit(a);
+        var query = try reopened.handle(a, std.testing.io, table, options, .post, "query", "{\"full_text_search\":{\"query\":\"body:alpha\"}}", .none);
+        defer query.deinit(a);
+        try std.testing.expectEqual(@as(u16, 200), query.status);
+        try std.testing.expect(std.mem.indexOf(u8, query.body, "doc:a") != null);
+        var recreated = table;
+        recreated.object_storage_generation += 1;
+        var empty = try reopened.handle(a, std.testing.io, recreated, options, .get, "query", "", .none);
+        defer empty.deinit(a);
+        try std.testing.expect(std.mem.indexOf(u8, empty.body, "doc:a") == null);
+    }
+}
+
+test "lake SQL object table admission rejects owned relational semantics" {
+    const a = std.testing.allocator;
+    var schema = try std.json.parseFromSlice(std.json.Value, a, Fixture.native_schema, .{});
+    defer schema.deinit();
+    _ = schema.value.object.swapRemove("version");
+    const owned_body = try std.json.Stringify.valueAlloc(a, .{ .storage = .{ .engine = "object" }, .schema = schema.value }, .{});
+    defer a.free(owned_body);
+    try std.testing.expectError(error.RelationalStorageUnavailable, @import("table_contract.zig").parseCreateTableRequest(a, owned_body));
+    var external = try @import("table_contract.zig").parseCreateTableRequest(a, "{\"storage\":{\"engine\":\"object\"},\"schema\":{\"storage_mode\":\"relational\",\"base_source\":{\"kind\":\"external\",\"format\":\"parquet\",\"uri\":\"s3://lake/events\",\"table_id\":\"events\",\"write_policy\":\"read_only\"}}}");
+    defer external.deinit(a);
+    try std.testing.expectEqual(.object, external.storage.?.engine);
+    var sidecar = external;
+    sidecar.indexes_json = @constCast("{\"ordered\":{\"type\":\"relational\"}}");
+    try @import("tables.zig").validateObjectCreateDefinition(a, sidecar);
+}
+
+test "lake SQL object table native API binds storage and fails closed on policy authority" {
+    const a = std.testing.allocator;
+    const metadata = @import("../metadata/table_manager.zig");
+    const metadata_api = @import("../metadata/api.zig");
+    const Source = struct {
+        table: [1]metadata.TableRecord = .{.{
+            .table_id = 7,
+            .name = "docs",
+            .storage = .{ .engine = .object },
+            .schema_json = @import("tables.zig").default_schema_json,
+            .indexes_json = @import("tables.zig").default_indexes_json,
+            .min_ranges = 0,
+            .desired_replica_count = 0,
+            .object_storage_generation = 3,
+        }},
+        unavailable: bool = false,
+        bindings: usize = 0,
+        fn snapshot(raw: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return .{ .status = .{ .metadata_group_id = 1, .metrics = .{} }, .tables = &self.table, .ranges = &.{}, .stores = &.{}, .placement_intents = &.{}, .split_transitions = &.{}, .merge_transitions = &.{} };
+        }
+        fn authoritative(raw: *anyopaque, context: operation.RequestContext) !?metadata_api.AdminSnapshot {
+            try context.ensureActive();
+            return try snapshot(raw);
+        }
+        fn free(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+        fn replace(raw: *anyopaque, expected: metadata.TableRecord, replacement: metadata.TableRecord) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (!metadata.tableDefinitionsEqual(self.table[0], expected)) return error.TableGenerationChanged;
+            try metadata.validateObjectTableMutation(std.testing.allocator, expected, replacement);
+            self.table[0].object_storage_identity = replacement.object_storage_identity;
+            self.bindings += 1;
+        }
+        fn catalog(raw: *anyopaque, alloc: std.mem.Allocator, _: operation.RequestContext, input: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (input != .policy_publication_status) return error.UnexpectedCatalogCall;
+            if (self.unavailable) return error.RowPolicyCatalogChanged;
+            return alloc.dupe(u8, "null");
+        }
+    };
+    var directory = try @import("antfly_local_sources").common_test_directory.TestDirectory.init("object-native-api");
+    defer directory.cleanup();
+    var backend = try @import("antfly_local_sources").storage_background_runtime.BackendRuntimeHandle.init(a, .{});
+    defer backend.deinit();
+    var source: Source = .{};
+    var server = server_mod.ApiHttpServer.init(a, .{ .backend_runtime = backend.ptr(), .deployment_mode = .standalone, .native_lake_artifact_base_dir = directory.path() }, .{ .ptr = &source, .vtable = &.{ .status = undefined, .supports_object_tables = true, .admin_snapshot = Source.snapshot, .linearizable_snapshot = Source.authoritative, .free_admin_snapshot = Source.free, .replace_table_definition = Source.replace, .system_catalog = Source.catalog } }, null, null);
+    defer server.deinit();
+    var write = (try server.tryObjectTableRequest("docs", .post, "batch", "{\"inserts\":{\"a\":{\"body\":\"alpha\"}},\"sync_level\":\"full_index\"}", null, .{})).?;
+    defer write.deinit(a);
+    try std.testing.expectEqual(@as(u16, 201), write.status);
+    try std.testing.expectEqual(@as(usize, 1), source.bindings);
+    try std.testing.expect(!std.mem.allEqual(u8, &source.table[0].object_storage_identity, 0));
+    var query = try server.handleAdmittedResolvedTableQueryWithContentTypeCancellation("docs", "{\"full_text_search\":{\"query\":\"body:alpha\"}}", null, null, null, "public.docs", null, null);
+    defer query.deinit(a);
+    try std.testing.expectEqual(@as(u16, 200), query.status);
+    try std.testing.expect(std.mem.indexOf(u8, query.body, "public.docs") != null);
+    source.unavailable = true;
+    try std.testing.expectError(error.RowPolicyCatalogChanged, server.tryObjectTableRequest("docs", .post, "batch", "{\"inserts\":{\"b\":{\"body\":\"beta\"}}}", null, .{}));
+}

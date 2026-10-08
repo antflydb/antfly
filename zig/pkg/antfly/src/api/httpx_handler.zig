@@ -7397,6 +7397,7 @@ pub const AntflyApiHandler = struct {
                     _ = ctx.status(409);
                     return ctx.text("initial foreign key generations require coordinated parent-owner publication; create the table without foreign keys, then add them through a schema update");
                 },
+                error.ObjectTablePlacementUnsupported => return textResponse(ctx, 400, "object tables do not accept num_shards or replication sources"),
                 error.InvalidTableStorageSettings, error.VectorStoreRequiresLocalSingleShardTable => {
                     _ = ctx.status(400);
                     return ctx.text("vector_store requires a fresh local single-shard standalone table without replication");
@@ -7675,6 +7676,10 @@ pub const AntflyApiHandler = struct {
         };
         if (try self.acquirePublicOperation(ctx, "batchWrite")) |response| return response;
         defer self.releasePublicOperation("batchWrite");
+        if (try self.api_server.tryObjectTableRequest(decoded_table_name, .post, "batch", body_data, authenticated_identity, operationContext(ctx, authenticated_identity))) |value| {
+            var response = value;
+            return respondOwnedContextualResponse(ctx, &response, self.api_server.alloc);
+        }
         return try handleTableBatchOffEventLoop(
             ctx,
             http_server_mod.ApiHttpServer.configuredDurableIo(self.api_server.cfg),
@@ -7930,6 +7935,10 @@ pub const AntflyApiHandler = struct {
         }
         var local_schema_applied = false;
         var mutation = self.api_server.source.mutateSchema(alloc, decoded_table_name, .replace, supported_schema.?, expected_version) catch |err| switch (err) {
+            error.ObjectTableDefinitionConflict, error.ImmutableTableStorageSettings => {
+                _ = ctx.status(409);
+                return ctx.text("object document table definitions are immutable; use a new table and explicit migration");
+            },
             error.ForeignKeyPartialSupportIndexRequired, error.ForeignKeyPartialSupportIndexConflict => return witnessDDLError(ctx, err),
             error.GeneratedColumnRewriteRequired => {
                 _ = ctx.status(409);
@@ -8401,6 +8410,14 @@ pub const AntflyApiHandler = struct {
             );
             lookup_opts.opts.row_policy_principal_proof = row_policy_proof orelse "";
             lookup_opts.opts.row_policy_database = target.database;
+        }
+        if (try self.api_server.tryObjectTableRequest(decoded_table_name, .get, "lookup", decoded_key, authenticated_identity, operationContext(ctx, authenticated_identity))) |value| {
+            var response = value;
+            if (row_policy_proof != null or lookup_opts.opts.fields.len != 0) {
+                response.deinit(self.api_server.alloc);
+                return textResponse(ctx, 400, "object document lookup does not support row policies or field projection");
+            }
+            return respondOwnedContextualResponse(ctx, &response, self.api_server.alloc);
         }
         const consistency = http_server_mod.parseLookupReadConsistency(ctx.request.uri.query orelse "") catch {
             _ = ctx.status(400);

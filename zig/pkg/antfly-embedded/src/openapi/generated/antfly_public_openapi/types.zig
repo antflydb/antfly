@@ -15860,11 +15860,14 @@ pub const TableStatus = struct {
 
 /// Immutable source embedding ownership. Omit storage when creating a table to select vector_store for a local single-shard standalone table without HA or replication, and primary_lsm for other deployments. Existing tables retain their recorded ownership; changing the creation default does not migrate data. Snapshot/backup and split operations currently reject vector_store tables; explicitly select primary_lsm when these operations are required.
 pub const TableStorageSettings = struct {
+    /// Durable table engine, independent of deployment. native uses the process storage engine and shard placement. object uses external lake data with durable sidecars, or an Antfly-owned object WAL and published generations. Object tables do not allocate data Raft groups; omit num_shards and replication_sources. Metadata remains authoritative for table lifetime. Configure the shared destination through storage.artifacts. Writable object document tables initially require immutable schema and index definitions; changes require a new table and explicit migration.
+    engine: ?[]const u8 = null,
     /// Explicit ownership choice. vector_store requires a fresh local single-shard standalone table without HA or replication. An explicit empty storage object keeps primary_lsm; omit the storage object to use the deployment default.
     dense_embeddings: ?[]const u8 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "engine", "engine", true },
         .{ "dense_embeddings", "dense_embeddings", true },
     };
 
@@ -15878,6 +15881,10 @@ pub const TableStorageSettings = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.engine) |value| {
+            try jw.objectField("engine");
+            try jw.write(value);
+        }
         if (self.dense_embeddings) |value| {
             try jw.objectField("dense_embeddings");
             try jw.write(value);

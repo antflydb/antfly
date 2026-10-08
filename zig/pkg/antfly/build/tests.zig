@@ -4659,7 +4659,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     lib_standalone_runtime_test_mod.addImport("usermgr_storage", usermgr_storage_lib_standalone_runtime_test_mod);
     const lib_standalone_runtime_tests = b.addTest(.{
         .root_module = lib_standalone_runtime_test_mod,
-        .filters = &.{
+        .filters = selectTestFilters(b, &.{
             "standalone runtime module compiles",
             "standalone.runtime.test.system catalog",
             "catalog.domain.",
@@ -4745,7 +4745,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "Lease executor accepts optional CertificateRequest with projected CA and verified hostname",
             "Lease executor accepts TLS 1.2 optional CertificateRequest",
             "Lease executor rejects optional CertificateRequest hostname mismatch",
-        },
+        }),
         .test_runner = .{
             .path = b.path("pkg/antfly-embedded/src/test_runner.zig"),
             .mode = .simple,

@@ -2,7 +2,11 @@
 
 Antfly's Zig serverless runtime uses object storage as the durable engine for
 artifacts, manifests, WAL, progress, and catalog state. Object storage is an
-independent storage engine, not a local/distributed per-table override.
+independent storage engine. Native standalone and distributed processes also
+support `storage.engine: object` on individual tables; their catalog remains
+native and object tables allocate no data Raft replicas. See
+[table-level object storage](../design/table-object-storage.md) for ownership and
+initial capability boundaries.
 
 ```text
 deployment mode: serverless
@@ -11,7 +15,8 @@ protocol:        S3-compatible or Google Cloud Storage
 ```
 
 The directory-backed `local` engine and single-file `lite` engine do not accept
-S3 fields. Changing engines is an explicit backup/restore migration.
+S3 fields. Changing process engines is an explicit backup/restore migration. Changing a
+table engine requires an explicit migration into a new table.
 
 ## Configuration
 

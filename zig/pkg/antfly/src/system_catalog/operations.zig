@@ -76,7 +76,16 @@ pub fn storeRootEnrollmentStatus(svc: anytype, alloc: std.mem.Allocator, context
 pub fn mutate(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: Request) ![]u8 {
     try context.ensureActive();
     if (request.mutation.table_id != 0 or request.mutation.storage_name.len != 0) return error.InvalidCatalogMutation;
-    const required_version = if (request.mutation.kind == .table and request.mutation.action == .drop) protocol.system_catalog_drop_version else protocol.system_catalog_version;
+    var object_create = false;
+    if (request.create_table_json) |json| {
+        var create_req = try tables_api.parseStoredCreateTableRequest(alloc, json);
+        defer create_req.deinit(alloc);
+        const storage_settings = create_req.storage orelse @import("antfly_local_sources").common_table_storage.Settings{};
+        try storage_settings.validateCreate(create_req.num_shards, if (create_req.replication_sources_json) |sources| !std.mem.eql(u8, sources, "[]") else false);
+        try tables_api.validateObjectCreateDefinition(alloc, create_req);
+        object_create = storage_settings.engine == .object;
+    }
+    const required_version = if (object_create) protocol.object_table_engine_version else if (request.mutation.kind == .table and request.mutation.action == .drop) protocol.system_catalog_drop_version else protocol.system_catalog_version;
     const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, required_version);
     svc.lockCatalogMutation();
     defer svc.unlockCatalogMutation();
@@ -100,12 +109,15 @@ pub fn mutate(svc: anytype, alloc: std.mem.Allocator, context: operation.Request
         if (try fk_publication.schemaHasForeignKeys(a, table.schema_json)) return error.ForeignKeyGenerationPublicationRequired;
         const policy = admission.placement_policy;
         try policy.validate();
-        if (policy.placement_role) |role| table.placement_role = role;
-        if (policy.desired_replica_count) |count| table.desired_replica_count = count;
-        if (req.num_shards == null) if (policy.min_ranges) |count| {
-            table.min_ranges = count;
-        };
+        if (table.storage.engine == .native) {
+            if (policy.placement_role) |role| table.placement_role = role;
+            if (policy.desired_replica_count) |count| table.desired_replica_count = count;
+            if (req.num_shards == null) if (policy.min_ranges) |count| {
+                table.min_ranges = count;
+            };
+        }
         const generation = try svc.captureTableCreateGeneration(a, table.table_id);
+        if (table.storage.engine == .object) table.object_storage_generation = generation;
         const ranges = try tables_api.deriveInitialRangesForGeneration(a, table, generation);
         command.mutation.table_id = table.table_id;
         command.mutation.storage_name = storage_name;
@@ -126,8 +138,8 @@ pub fn mutate(svc: anytype, alloc: std.mem.Allocator, context: operation.Request
         const policy = admission.placement_policy;
         var replacement = current;
         replacement.placement_role = policy.placement_role orelse "data";
-        replacement.desired_replica_count = policy.desired_replica_count orelse 3;
-        replacement.min_ranges = policy.min_ranges orelse 1;
+        replacement.desired_replica_count = if (replacement.storage.engine == .object) 0 else policy.desired_replica_count orelse 3;
+        replacement.min_ranges = if (replacement.storage.engine == .object) 0 else policy.min_ranges orelse 1;
         command.placement_update = .{ .expected = current, .replacement = replacement };
     }
     const result = try store.prepareSystemCatalogResult(alloc, svc.metadata_group_id, command);

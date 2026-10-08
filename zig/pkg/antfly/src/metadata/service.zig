@@ -3249,6 +3249,20 @@ fn highestSupportedRuntimeStatusVersion(service: anytype, required_version: u16)
 /// decode them. This classifier is shared by single and batched proposals;
 /// ordinary document metadata retains its predecessor admission contract.
 pub fn transitionRequiredCoordinatedDecoderVersion(command: metadata_storage.TransitionCommand) u16 {
+    const object_engine = switch (command) {
+        .upsert_table => |table| table.storage.engine == .object,
+        .compare_and_replace_table => |cas| cas.expected.storage.engine == .object or cas.replacement.storage.engine == .object,
+        .apply_table_topology => |mutation| switch (mutation) {
+            .create => |create| create.table.storage.engine == .object,
+            .drop => false,
+        },
+        .apply_extension_lifecycle, .apply_extension_lifecycle_v2 => |delta| blk: {
+            for (delta.upsert_tables) |table| if (table.storage.engine == .object) break :blk true;
+            break :blk false;
+        },
+        else => false,
+    };
+    if (object_engine) return metadata_topology_protocol.object_table_engine_version;
     switch (command) {
         .mutate_lake_index_lifecycle, .remove_table => return metadata_topology_protocol.lake_index_catalog_version,
         .apply_table_topology => |mutation| if (mutation == .drop) return metadata_topology_protocol.lake_index_catalog_version,
@@ -22357,4 +22371,10 @@ test "metadata.lake index publication requires its own decoder capability" {
     try std.testing.expectEqual(@as(u16, 0), transitionRequiredCoordinatedDecoderVersion(.{ .upsert_table = base }));
     try std.testing.expectEqual(metadata_topology_protocol.lake_index_catalog_version, transitionRequiredCoordinatedDecoderVersion(.{ .upsert_table = next }));
     try std.testing.expectEqual(metadata_topology_protocol.lake_index_catalog_version, transitionRequiredCoordinatedDecoderVersion(.{ .compare_and_replace_table = .{ .expected = next, .replacement = base } }));
+}
+
+test "metadata.lake index object table engine requires its own decoder capability" {
+    const table: metadata_table_manager.TableRecord = .{ .table_id = 9, .name = "objects", .storage = .{ .engine = .object }, .min_ranges = 0, .desired_replica_count = 0 };
+    try std.testing.expectEqual(metadata_topology_protocol.object_table_engine_version, transitionRequiredCoordinatedDecoderVersion(.{ .upsert_table = table }));
+    try std.testing.expectEqual(metadata_topology_protocol.object_table_engine_version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_table_topology = .{ .create = .{ .table = table, .ranges = &.{}, .expected_transition_generation = 0 } } }));
 }
