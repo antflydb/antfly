@@ -2218,6 +2218,7 @@ pub const Store = struct {
     fn admitEstimatedGenerationAssumeLocked(self: *Store, compact_bytes: u64, old_bytes: u64) !void {
         const budget = self.maintenance_policy.options.max_storage_bytes;
         if (budget == 0) return;
+        if (self.artifact_registry) |registry| registry.expireIdle(self.assessment_generation);
         const retained_old: u64 = if (self.currentGenerationHasReaders()) old_bytes else 0;
         if (retained_old +| self.totalRetiredFileBytes() +| self.artifactBytes() +| compact_bytes +| self.file.estimatedGenerationReserveBytes(compact_bytes) > budget) return error.LiteStorageBudgetExceeded;
     }
@@ -2235,6 +2236,10 @@ pub const Store = struct {
         const reserve = try prepared.retirementReserveBytesWithCancel(cancel);
         const reusable = if (try prepared.allocatorStatsWithCancel(cancel)) |stats| stats.reusable_pages *| prepared.header.page_size else 0;
         const total = old_bytes +| self.totalRetiredFileBytes() +| self.artifactBytes() +| prepared_bytes;
+        // Idle cache ownership must not reserve a retired inode. This runs
+        // inside the generation fence, so expired sources can only reopen
+        // after adoption; active uses remain charged by hasGeneration.
+        if (self.artifact_registry) |registry| registry.expireIdle(self.assessment_generation);
         const retained_old: u64 = if (self.currentGenerationHasReaders()) old_bytes else 0;
         const adopted_total = retained_old +| self.totalRetiredFileBytes() +| self.artifactBytes() +| prepared_bytes;
         if (options.max_storage_bytes != 0) {
@@ -5651,4 +5656,97 @@ test "lite reader admission and release proceed while commit fsync is blocked" {
     defer fresh.abort();
     try std.testing.expectEqualStrings("new", try fresh.get("key"));
     try std.testing.expectEqualStrings("old", try pinned.get("key"));
+}
+
+test "lite prepared admission expires idle cached sources but preserves active uses" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "admission-cached-live.aflite");
+    defer a.free(path);
+    const staged_path = try testPath(a, tmp, "admission-cached-prepared.aflite");
+    defer a.free(staged_path);
+    const options: CreateOptions = .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } };
+    var live = try Store.createWithOptions(a, path, options);
+    defer live.close();
+    live.maintenance_start_suppressed = true;
+    var staged = try Store.createWithOptions(a, staged_path, options);
+    defer staged.close();
+    staged.maintenance_start_suppressed = true;
+    try live.file.putIndexCatalogRecord("run", "unchanged");
+    var source = try live.openArtifactSource("run");
+    defer source.close();
+    try std.testing.expect(source.acquireUse());
+    var active = true;
+    defer if (active) source.releaseUse();
+    source.enableIdleExpiry();
+    const old_bytes = (try live.file.file.stat(std.testing.io)).size;
+    const prepared_bytes = (try staged.file.file.stat(std.testing.io)).size;
+    const reserve = try staged.file.retirementReserveBytes();
+    live.maintenance_policy.options.max_storage_bytes = prepared_bytes + @max(old_bytes, reserve);
+    // Match the production adoption lock order; new source opens cannot enter
+    // between expiry and the final retained-inode accounting decision.
+    live.generation_lock.lockUncancelable(std.testing.io);
+    defer live.generation_lock.unlock(std.testing.io);
+    lockStore(&live);
+    defer live.mutex.unlock();
+    try std.testing.expectError(error.LiteStorageBudgetExceeded, live.admitPreparedGenerationAssumeLocked(&staged.file, old_bytes));
+    var bytes: [9]u8 = undefined;
+    try source.readInto(0, &bytes);
+    try std.testing.expectEqualStrings("unchanged", &bytes);
+    source.releaseUse();
+    active = false;
+    try live.admitPreparedGenerationAssumeLocked(&staged.file, old_bytes);
+    try std.testing.expect(!source.acquireUse());
+    try std.testing.expectEqual(@as(u64, 0), live.totalRetiredFileBytes());
+}
+
+test "lite cached source teardown and retirement progress while publication is blocked" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "source-close-retirement.aflite");
+    defer a.free(path);
+    var store = try Store.createWithOptions(a, path, .{ .io = io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    store.maintenance_start_suppressed = true;
+    try store.file.putIndexCatalogRecord("run", "unchanged");
+    var source = try store.openArtifactSource("run");
+    var source_open = true;
+    defer if (source_open) source.close();
+    try std.testing.expect(source.acquireUse());
+    source.enableIdleExpiry();
+    source.releaseUse();
+    const registry = store.artifact_registry.?;
+    const old_bytes = (try store.file.file.stat(io)).size;
+    const Worker = struct {
+        fn close(owned: *@import("../../segment_source.zig").Source) void {
+            owned.close();
+        }
+    };
+    lockStore(&store);
+    var locked = true;
+    defer if (locked) store.mutex.unlock();
+    const thread = try std.Thread.spawn(.{}, Worker.close, .{&source});
+    source_open = false;
+    defer thread.join();
+    // The final source release is queued behind the owner mutex. Retiring the
+    // same source must progress without waiting for that publication callback.
+    const deadline = std.Io.Clock.awake.now(io).addDuration(.fromSeconds(5));
+    var callback_started = false;
+    while (!callback_started and std.Io.Clock.awake.now(io).nanoseconds < deadline.nanoseconds) {
+        registry.mutex.lockUncancelable(io);
+        callback_started = registry.callbacks != 0;
+        registry.mutex.unlock(io);
+        if (!callback_started) io.sleep(.fromMilliseconds(1), .awake) catch {};
+    }
+    if (callback_started) {
+        registry.expireIdle(store.assessment_generation);
+        registry.retire(store.assessment_generation, old_bytes, false);
+    }
+    store.mutex.unlock();
+    locked = false;
+    try std.testing.expect(callback_started);
+    try std.testing.expectEqual(@as(u64, 0), registry.retired_bytes.load(.acquire));
 }

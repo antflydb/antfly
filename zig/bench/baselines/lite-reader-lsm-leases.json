@@ -41,7 +41,10 @@
     "retired_inode_charge_released_after_eviction": true,
     "idle_retired_inode_bytes_after_vacuum": 0,
     "expired_sources_reopen_lazily": true,
-    "unrelated_warm_reads_progress_during_blocked_source_close": true
+    "unrelated_warm_reads_progress_during_blocked_source_close": true,
+    "idle_sources_expire_before_adoption_admission": true,
+    "active_sources_remain_charged_during_admission": true,
+    "teardown_progresses_during_blocked_publication_and_retirement": true
   },
   "native_merge_cursor": {
     "persisted_runs": 24,
@@ -72,5 +75,20 @@
     "failed_provider_calls": 1,
     "retry_supported": true,
     "partial_allocations_failpoint_checked": true
+  },
+  "compressed_owned_point_result": {
+    "compression_policy": "snappy_adaptive",
+    "warm_decoded_cache": true,
+    "queries": 100,
+    "reference_backend_allocator_calls": 500,
+    "reference_encoded_block_loads": 100,
+    "updated_backend_allocator_calls": 0,
+    "updated_encoded_block_loads": 0,
+    "owned_result_values_still_copied": true,
+    "reference_scope": "Two distinct prefix-compressed keys; encoded loads can hit the provider memory cache.",
+    "verified_compressions": [
+      "prefix",
+      "prefix_snappy"
+    ]
   }
 }

@@ -139,6 +139,23 @@ pub const Registry = struct {
         return false;
     }
 
+    /// Drop cache-only descriptors before rewrite admission. The caller holds
+    /// the owner publication mutex; final adoption additionally fences opens
+    /// with generation_lock. Existing uses win the lifetime-lock race and
+    /// remain pinned; future acquisitions reject the closed source.
+    pub fn expireIdle(self: *Registry, generation: u64) void {
+        const runtime = self.io();
+        self.mutex.lockUncancelable(runtime);
+        defer self.mutex.unlock(runtime);
+        var it = self.first;
+        while (it) |state| : (it = state.next) {
+            if (state.generation != generation) continue;
+            @import("antfly_platform").sync.lockYielding(&state.lifetime_mutex);
+            if (state.idle_expiry and state.active_uses == 0) state.closeResources();
+            state.lifetime_mutex.unlock();
+        }
+    }
+
     pub fn retire(self: *Registry, generation: u64, bytes: u64, charged_by_reader: bool) void {
         const runtime = self.io();
         self.mutex.lockUncancelable(runtime);
@@ -392,14 +409,17 @@ const State = struct {
         const self: *State = @ptrCast(@alignCast(ptr));
         const registry = self.registry;
         const runtime = registry.io();
-        if (!self.resources_closed.load(.acquire)) if (registry.beginCallback()) |owner| {
+        @import("antfly_platform").sync.lockYielding(&self.lifetime_mutex);
+        const remove_alias = !self.resources_closed.load(.monotonic) and self.marker != null;
+        self.lifetime_mutex.unlock();
+        // Snapshot under the lifetime lock, but never enter the publication
+        // lane while holding it (publication may retire this same state).
+        if (remove_alias) if (registry.beginCallback()) |owner| {
             defer registry.endCallback();
-            if (self.marker != null) {
-                var remove = Remove{ .key = self.lease_key };
-                // On failure the marker will disappear and bounded orphan
-                // service can retry. A failed release never frees live pages.
-                owner.submitMutation(&remove, Remove.apply) catch {};
-            }
+            var remove = Remove{ .key = self.lease_key };
+            // On failure the marker will disappear and bounded orphan
+            // service can retry. A failed release never frees live pages.
+            owner.submitMutation(&remove, Remove.apply) catch {};
         };
         @import("antfly_platform").sync.lockYielding(&self.lifetime_mutex);
         self.closeResources();
@@ -420,10 +440,6 @@ const State = struct {
             if (!transferred) _ = registry.retired_bytes.fetchSub(self.retired_claim, .acq_rel);
         }
         registry.mutex.unlock(runtime);
-        if (self.marker) |marker| {
-            marker.close(runtime);
-            std.Io.Dir.cwd().deleteFile(runtime, self.marker_path) catch {};
-        }
         self.value.deinit(registry.allocator);
         registry.allocator.free(self.lease_key);
         registry.allocator.free(self.marker_path);

@@ -25622,3 +25622,48 @@ test "lsm local cold source failure wakes all waiters and allows retry" {
     try std.testing.expectEqualStrings("immutable", bytes);
     try std.testing.expectEqual(@as(usize, 2), Hook.calls.load(.monotonic));
 }
+
+test "lsm local compressed point reads borrow warm decoded blocks" {
+    const cases = [_]struct { value: []const u8, compression: lsm_table_file.BlockCompression }{
+        .{ .value = "other", .compression = .prefix },
+        .{ .value = z17RepeatString("compressible-value:", 128), .compression = .prefix_snappy },
+    };
+    for (cases) |case| {
+        const a = std.testing.allocator;
+        var backing = storage_io.MemoryStorage.init(a);
+        defer backing.deinit();
+        var backend_budget = @import("lite/test_allocator.zig").BudgetAllocator{ .backing = a };
+        var backend = try Backend.open(backend_budget.allocator(), "/local-result-lifetimes", .{ .storage = backing.storage(), .flush_threshold = 1, .table_block_compression = .snappy_adaptive });
+        defer backend.close();
+        var runtime = try backend.runtimeStore(a, .{ .name = "docs" });
+        defer runtime.deinit();
+        var write = try runtime.beginWrite();
+        try write.put("document:long-shared-prefix-for-compression:00", "value");
+        try write.put("document:long-shared-prefix-for-compression:01", case.value);
+        try write.commit();
+        var read = try runtime_mod.BoundReadTxn(Backend).open(&backend, .{ .name = "docs" });
+        defer read.abort();
+        var result_budget = @import("lite/test_allocator.zig").BudgetAllocator{ .backing = a };
+        var point = try read.openReadScope(result_budget.allocator());
+        defer point.close();
+        try std.testing.expectEqualStrings("value", try point.get("document:long-shared-prefix-for-compression:00"));
+        try std.testing.expectEqual(case.compression, backend.run_index_cache.items[0].index.blockWindow(0).compression);
+        // Cold compressed point lookup has not populated the decoded cache.
+        try std.testing.expectEqual(@as(usize, 0), backend.run_block_cache.items.len);
+        var batch = try read.openReadScope(a);
+        defer batch.close();
+        const keys = [_][]const u8{ "document:long-shared-prefix-for-compression:00", "document:long-shared-prefix-for-compression:01" };
+        var values: [2]?[]const u8 = undefined;
+        try batch.getManySorted(&keys, &values);
+        const calls = backend_budget.alloc_calls;
+        const loads = backend.read_stats.table_block_loads.load(.monotonic);
+        backend_budget.limit = backend_budget.live;
+        defer backend_budget.limit = std.math.maxInt(usize);
+        for (0..100) |_| try std.testing.expectEqualStrings(case.value, try point.get("document:long-shared-prefix-for-compression:01"));
+        const extra_calls = backend_budget.alloc_calls - calls;
+        const extra_loads = backend.read_stats.table_block_loads.load(.monotonic) - loads;
+        std.debug.print("lite compressed warm point probe: compression={s}, 100 queries, backend allocations={d}, physical block loads={d}, decoded cache blocks={d}\n", .{ @tagName(case.compression), extra_calls, extra_loads, backend.run_block_cache.items.len });
+        try std.testing.expectEqual(@as(usize, 0), extra_calls);
+        try std.testing.expectEqual(@as(u64, 0), extra_loads);
+    }
+}

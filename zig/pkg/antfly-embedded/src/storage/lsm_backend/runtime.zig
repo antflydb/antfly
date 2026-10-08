@@ -7301,6 +7301,11 @@ fn copyTableEntry(allocator: Allocator, entry: lsm_table_file.Entry) !OwnedTable
 
 fn findExactEntryInLocalLease(backend: anytype, run: *Run, index: *const lsm_table_file.TableIndex, window: lsm_table_file.EntryDataWindow, block_index: usize, namespace: backend_types.Namespace, key: []const u8, locked: bool) !?OwnedTableEntry {
     const lease = try loadLocalBlockLease(backend, run, index, window, locked);
+    return findExactEntryInBlockLease(lease, index, block_index, namespace, key);
+}
+
+/// Consumes the retained block reference, including on a miss or error.
+fn findExactEntryInBlockLease(lease: *SharedBytes, index: *const lsm_table_file.TableIndex, block_index: usize, namespace: backend_types.Namespace, key: []const u8) !?OwnedTableEntry {
     errdefer lease.release();
     const positioned = try lsm_table_file.findExactEntryInBlock(index, lease.bytes, block_index, namespace.name, key) orelse {
         lease.release();
@@ -7320,18 +7325,23 @@ fn findExactEntryWithLocalIndex(
     return try findExactEntryWithLocalIndexBlockMeta(backend, run, index, namespace, key);
 }
 
+fn retainLocalCachedBlock(backend: anytype, run: *Run, index: *const lsm_table_file.TableIndex, window: lsm_table_file.EntryDataWindow, backend_locked: bool) ?*SharedBytes {
+    const path = run.path orelse return null;
+    const offset = @as(u64, @intCast(index.entry_data_start)) + window.physicalRelativeOffset();
+    const locked = if (backend_locked) false else lockBackend(@TypeOf(backend.*), backend);
+    defer unlockBackend(@TypeOf(backend.*), backend, locked);
+    if (backend.retainCachedRunBlock(path, run.id, offset, window.physicalLen())) |lease| {
+        backend.recordLocalBlockCacheHit();
+        return lease;
+    }
+    return null;
+}
+
 fn loadLocalBlockLease(backend: anytype, run: *Run, index: *const lsm_table_file.TableIndex, window: lsm_table_file.EntryDataWindow, backend_locked: bool) !*SharedBytes {
     const path = run.path orelse return error.RunStateUnavailable;
     const offset = @as(u64, @intCast(index.entry_data_start)) + window.physicalRelativeOffset();
     const len = window.physicalLen();
-    {
-        const locked = if (backend_locked) false else lockBackend(@TypeOf(backend.*), backend);
-        defer unlockBackend(@TypeOf(backend.*), backend, locked);
-        if (backend.retainCachedRunBlock(path, run.id, offset, len)) |lease| {
-            backend.recordLocalBlockCacheHit();
-            return lease;
-        }
-    }
+    if (retainLocalCachedBlock(backend, run, index, window, backend_locked)) |lease| return lease;
     backend.recordLocalBlockCacheMiss();
     const bytes = try loadRunTableDecodedBlockWithStats(backend, backend.allocator, path, offset, len, window.compression, window.len, window.checksum);
     errdefer backend.allocator.free(bytes);
@@ -7538,10 +7548,17 @@ fn findExactEntryWithLocalIndexBlockMeta(
         backend.recordBloomNegative();
         return null;
     }
+    const window = index.blockWindow(block_index);
+    // Borrow a warm decoded block before allocating compressed lookup scratch.
+    // A miss preserves the compact direct-prefix lookup for cold point reads.
+    if (localBlockCacheEnabled(backend)) {
+        if (retainLocalCachedBlock(backend, run, index, window, false)) |lease| {
+            return findExactEntryInBlockLease(lease, index, block_index, namespace, key);
+        }
+    }
     if (try findExactEntryInCompressedPrefixBlock(backend, run, index, block_index, namespace, key)) |entry| {
         return entry;
     }
-    const window = index.blockWindow(block_index);
     if (localBlockCacheEnabled(backend)) return try findExactEntryInLocalLease(backend, run, index, window, block_index, namespace, key, false);
     const bytes = try loadOwnedBlockForWindow(
         backend,
@@ -7583,10 +7600,17 @@ fn findExactEntryWithLocalIndexBlockMetaMaybeLocked(
         backend.recordBloomNegative();
         return null;
     }
+    const window = index.blockWindow(block_index);
+    // Borrow a warm decoded block before allocating compressed lookup scratch.
+    // A miss preserves the compact direct-prefix lookup for cold point reads.
+    if (localBlockCacheEnabled(backend)) {
+        if (retainLocalCachedBlock(backend, run, index, window, true)) |lease| {
+            return findExactEntryInBlockLease(lease, index, block_index, namespace, key);
+        }
+    }
     if (try findExactEntryInCompressedPrefixBlock(backend, run, index, block_index, namespace, key)) |entry| {
         return entry;
     }
-    const window = index.blockWindow(block_index);
     if (localBlockCacheEnabled(backend)) return try findExactEntryInLocalLease(backend, run, index, window, block_index, namespace, key, true);
     const bytes = try loadOwnedBlockForWindowMaybeLocked(
         backend,
