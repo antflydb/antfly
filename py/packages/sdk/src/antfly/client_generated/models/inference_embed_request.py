@@ -14,6 +14,7 @@ from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
     from ..models.image_url_content_part import ImageURLContentPart
+    from ..models.inference_embedding_group import InferenceEmbeddingGroup
     from ..models.media_content_part import MediaContentPart
     from ..models.text_content_part import TextContentPart
 
@@ -23,43 +24,52 @@ T = TypeVar("T", bound="InferenceEmbedRequest")
 
 @_attrs_define
 class InferenceEmbedRequest:
-    r"""OpenAI-compatible embedding request with inference multimodal content-part extension
+    r"""OpenAI-compatible embedding request with inference multimodal content-part extension. EmbeddingGemma 2 text encoding
+    uses official task prefixes, a shared 8192-token limit, mean pooling including prompt tokens, and normalized
+    vectors.
 
-    Attributes:
-        model (str): Model name to use for embedding generation
-        input_ (list[ImageURLContentPart | MediaContentPart | TextContentPart] | list[str] | str): Input content to
-            embed.
-            Supports:
-            - a single string
-            - an array of strings
-            - an array of OpenAI-style content parts for multimodal embedding
-        encoding_format (InferenceEmbedRequestEncodingFormat | Unset): Encoding format for the embeddings (only "float"
-            supported) Default: InferenceEmbedRequestEncodingFormat.FLOAT.
-        dimensions (int | Unset): Optional truncation size for dense embeddings. Must be a positive integer no larger
-            than the model embedding size. For normalized models the truncated vector is L2-re-normalized (Matryoshka
-            semantics, matching the OpenAI dimensions parameter). Not supported for sparse models.
-        task_type (InferenceEmbedRequestTaskType | Unset): Optional embedding task type using Google embedding task-type
-            names. For Jina v5 text embeddings, query-side tasks use the query prefix and RETRIEVAL_DOCUMENT uses the
-            document prefix. For Qwen3-Embedding models, RETRIEVAL_QUERY uses the model's built-in web-retrieval
-            instruction, RETRIEVAL_DOCUMENT is embedded raw, and every other task type requires an explicit instruction.
-        instruction (str | Unset): Task description for instruction-aware embedding models (Qwen3-Embedding), rendered
-            inside the query instruction wrapper ("Instruct: {instruction}\nQuery:{input}"). Optional for RETRIEVAL_QUERY,
-            which has a model-owned default; required for other non-document task types; rejected for document tasks and
-            models without instruction support.
-        input_type (InferenceEmbedRequestInputType | Unset): Deprecated compatibility alias for task_type.
-            search_query/query map to RETRIEVAL_QUERY; search_document/document map to RETRIEVAL_DOCUMENT; classification
-            and clustering map to their Google task_type equivalents.
-        error_policy (InferenceEmbedRequestErrorPolicy | Unset): Controls how dense embedding requests report per-input
-            failures.
-            `fail_fast` preserves OpenAI-compatible all-or-error behavior.
-            `per_item` returns successful embeddings in `data` and indexed
-            permanent/transient failures in `errors` without failing the
-            entire HTTP request.
-             Default: InferenceEmbedRequestErrorPolicy.FAIL_FAST.
+        Attributes:
+            model (str): Model name to use for embedding generation
+            input_ (list[ImageURLContentPart | MediaContentPart | TextContentPart] | list[InferenceEmbeddingGroup] |
+                list[str] | str): Input content to embed.
+                Supports:
+                - a single string
+                - an array of strings
+                - an array of OpenAI-style content parts for multimodal embedding
+                - an array of ordered groups for EmbeddingGemma 2, one vector per group
+            model_identity (str | Unset): Optional exact asset identity pin. A mismatch returns 409 before inference.
+            encoding_format (InferenceEmbedRequestEncodingFormat | Unset): Encoding format for the embeddings (only "float"
+                supported) Default: InferenceEmbedRequestEncodingFormat.FLOAT.
+            dimensions (int | Unset): Optional truncation size for dense embeddings. EmbeddingGemma 2 supports 768, 512,
+                256, or 128 only. Must be a positive integer no larger than the model embedding size. For normalized models the
+                truncated vector is L2-re-normalized (Matryoshka semantics, matching the OpenAI dimensions parameter). Not
+                supported for sparse models.
+            task_type (InferenceEmbedRequestTaskType | Unset): Optional embedding task type using Google embedding task-type
+                names. EmbeddingGemma 2 uses the official prefix for each listed task, defaulting to RETRIEVAL_DOCUMENT. For
+                Jina v5 text embeddings, query-side tasks use the query prefix and RETRIEVAL_DOCUMENT uses the document prefix.
+                For Qwen3-Embedding models, RETRIEVAL_QUERY uses the model's built-in web-retrieval instruction,
+                RETRIEVAL_DOCUMENT is embedded raw, and every other task type requires an explicit instruction.
+            instruction (str | Unset): Task description for instruction-aware embedding models (Qwen3-Embedding), rendered
+                inside the query instruction wrapper ("Instruct: {instruction}\nQuery:{input}"). Optional for RETRIEVAL_QUERY,
+                which has a model-owned default; required for other non-document task types; rejected for document tasks and
+                models without instruction support.
+            input_type (InferenceEmbedRequestInputType | Unset): Deprecated compatibility alias for task_type.
+                search_query/query map to RETRIEVAL_QUERY; search_document/document map to RETRIEVAL_DOCUMENT; classification
+                and clustering map to their Google task_type equivalents.
+            error_policy (InferenceEmbedRequestErrorPolicy | Unset): Controls how dense embedding requests report per-input
+                failures.
+                `fail_fast` preserves OpenAI-compatible all-or-error behavior.
+                `per_item` returns successful embeddings in `data` and indexed
+                permanent/transient failures in `errors` without failing the
+                entire HTTP request.
+                 Default: InferenceEmbedRequestErrorPolicy.FAIL_FAST.
     """
 
     model: str
-    input_: list[ImageURLContentPart | MediaContentPart | TextContentPart] | list[str] | str
+    input_: (
+        list[ImageURLContentPart | MediaContentPart | TextContentPart] | list[InferenceEmbeddingGroup] | list[str] | str
+    )
+    model_identity: str | Unset = UNSET
     encoding_format: InferenceEmbedRequestEncodingFormat | Unset = InferenceEmbedRequestEncodingFormat.FLOAT
     dimensions: int | Unset = UNSET
     task_type: InferenceEmbedRequestTaskType | Unset = UNSET
@@ -69,30 +79,15 @@ class InferenceEmbedRequest:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        from ..models.image_url_content_part import ImageURLContentPart
-        from ..models.text_content_part import TextContentPart
-
         model = self.model
 
         input_: list[dict[str, Any]] | list[str] | str
         if isinstance(self.input_, list):
-            input_ = self.input_
-
-        elif isinstance(self.input_, list):
-            input_ = []
-            for input_type_2_item_data in self.input_:
-                input_type_2_item: dict[str, Any]
-                if isinstance(input_type_2_item_data, TextContentPart):
-                    input_type_2_item = input_type_2_item_data.to_dict()
-                elif isinstance(input_type_2_item_data, ImageURLContentPart):
-                    input_type_2_item = input_type_2_item_data.to_dict()
-                else:
-                    input_type_2_item = input_type_2_item_data.to_dict()
-
-                input_.append(input_type_2_item)
-
+            input_ = [item if isinstance(item, str) else item.to_dict() for item in self.input_]
         else:
             input_ = self.input_
+
+        model_identity = self.model_identity
 
         encoding_format: str | Unset = UNSET
         if not isinstance(self.encoding_format, Unset):
@@ -122,6 +117,8 @@ class InferenceEmbedRequest:
                 "input": input_,
             }
         )
+        if model_identity is not UNSET:
+            field_dict["model_identity"] = model_identity
         if encoding_format is not UNSET:
             field_dict["encoding_format"] = encoding_format
         if dimensions is not UNSET:
@@ -140,6 +137,7 @@ class InferenceEmbedRequest:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.image_url_content_part import ImageURLContentPart
+        from ..models.inference_embedding_group import InferenceEmbeddingGroup
         from ..models.media_content_part import MediaContentPart
         from ..models.text_content_part import TextContentPart
 
@@ -148,9 +146,16 @@ class InferenceEmbedRequest:
 
         def _parse_input_(
             data: object,
-        ) -> list[ImageURLContentPart | MediaContentPart | TextContentPart] | list[str] | str:
+        ) -> (
+            list[ImageURLContentPart | MediaContentPart | TextContentPart]
+            | list[InferenceEmbeddingGroup]
+            | list[str]
+            | str
+        ):
             try:
                 if not isinstance(data, list):
+                    raise TypeError()
+                if any(not isinstance(item, str) for item in data):
                     raise TypeError()
                 input_type_1 = cast(list[str], data)
 
@@ -196,9 +201,32 @@ class InferenceEmbedRequest:
                 return input_type_2
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
-            return cast(list[ImageURLContentPart | MediaContentPart | TextContentPart] | list[str] | str, data)
+            try:
+                if not isinstance(data, list):
+                    raise TypeError()
+                input_type_3 = []
+                _input_type_3 = data
+                for input_type_3_item_data in _input_type_3:
+                    input_type_3_item = InferenceEmbeddingGroup.from_dict(input_type_3_item_data)
+
+                    input_type_3.append(input_type_3_item)
+
+                return input_type_3
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            if not isinstance(data, str):
+                raise TypeError("embedding input must be text, content parts or groups")
+            return cast(
+                list[ImageURLContentPart | MediaContentPart | TextContentPart]
+                | list[InferenceEmbeddingGroup]
+                | list[str]
+                | str,
+                data,
+            )
 
         input_ = _parse_input_(d.pop("input"))
+
+        model_identity = d.pop("model_identity", UNSET)
 
         _encoding_format = d.pop("encoding_format", UNSET)
         encoding_format: InferenceEmbedRequestEncodingFormat | Unset
@@ -235,6 +263,7 @@ class InferenceEmbedRequest:
         inference_embed_request = cls(
             model=model,
             input_=input_,
+            model_identity=model_identity,
             encoding_format=encoding_format,
             dimensions=dimensions,
             task_type=task_type,

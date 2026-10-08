@@ -228,6 +228,7 @@ test "standalone provider ABI rejects cancellation before dispatch" {
 }
 
 const ModelTextsRequest = struct {
+    model_identity: ?[]const u8 = null,
     model: []const u8,
     texts: []const []const u8,
     task_type: ?[]const u8 = null,
@@ -235,6 +236,7 @@ const ModelTextsRequest = struct {
 };
 
 const ModelPartsRequest = struct {
+    model_identity: ?[]const u8 = null,
     model: []const u8,
     parts: []const template_content.ContentPart,
     attachment_count: usize = 0,
@@ -1032,6 +1034,8 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
         .embed_dense_texts, .embed_dense_texts_with_context => blk: {
             var parsed = try std.json.parseFromSlice(ModelTextsRequest, alloc, request_json, .{ .ignore_unknown_fields = true });
             defer parsed.deinit();
+            var identity_handle = if (parsed.value.model_identity) |expected| try state.node.pinEmbeddingModelIdentity(alloc, state.io, parsed.value.model, expected, execution_control) else null;
+            defer if (identity_handle) |*handle| handle.release();
             const result = if (operation == .embed_dense_texts_with_context)
                 try state.node.embedDenseTextsDirectWithExecutionControlAndTask(
                     state.alloc,
@@ -1087,6 +1091,8 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
                 context.attachment_refs_len,
             );
             defer alloc.free(parts);
+            var identity_handle = if (parsed.value.model_identity) |expected| try state.node.pinEmbeddingModelIdentity(alloc, state.io, parsed.value.model, expected, execution_control) else null;
+            defer if (identity_handle) |*handle| handle.release();
             const result = try localAntflyEmbedDensePartsWithExecutionContext(
                 &state.node,
                 alloc,

@@ -12636,6 +12636,8 @@ export interface components {
          *     }
          */
         AntflyEmbedderConfig: {
+            /** @description Immutable EmbeddingGemma 2 asset and recipe identity returned by /embed. Pin this when indexing; a changed checkpoint, tokenizer, or processor rejects embedding before vector publication. */
+            model_identity?: string;
             /**
              * @description discriminator enum property added by openapi-typescript
              * @enum {string}
@@ -18067,8 +18069,16 @@ export interface components {
         InferenceImageURLContentPart: components["schemas"]["ImageURLContentPart"];
         InferenceMediaContentPart: components["schemas"]["MediaContentPart"];
         InferenceContentPart: components["schemas"]["ContentPart"];
-        /** @description OpenAI-compatible embedding request with inference multimodal content-part extension */
+        /** @description EmbeddingGemma 2 ordered text, image and audio parts producing one joint vector. Video is unsupported. The expanded sequence including all media soft tokens must fit 8192 tokens. */
+        InferenceEmbeddingGroup: {
+            /** @description Document title, allowed only with RETRIEVAL_DOCUMENT and at least one text part. */
+            title?: string;
+            content: components["schemas"]["ContentPart"][];
+        };
+        /** @description OpenAI-compatible embedding request with inference multimodal content-part extension. EmbeddingGemma 2 text encoding uses official task prefixes, a shared 8192-token limit, mean pooling including prompt tokens, and normalized vectors. */
         InferenceEmbedRequest: {
+            /** @description Optional exact asset identity pin. A mismatch returns 409 before inference. */
+            model_identity?: string;
             /** @description Model name to use for embedding generation */
             model: string;
             /**
@@ -18077,18 +18087,19 @@ export interface components {
              *     - a single string
              *     - an array of strings
              *     - an array of OpenAI-style content parts for multimodal embedding
+             *     - an array of ordered groups for EmbeddingGemma 2, one vector per group
              */
-            input: string | string[] | components["schemas"]["ContentPart"][];
+            input: string | string[] | components["schemas"]["ContentPart"][] | components["schemas"]["InferenceEmbeddingGroup"][];
             /**
              * @description Encoding format for the embeddings (only "float" supported)
              * @default float
              * @enum {string}
              */
             encoding_format?: "float";
-            /** @description Optional truncation size for dense embeddings. Must be a positive integer no larger than the model embedding size. For normalized models the truncated vector is L2-re-normalized (Matryoshka semantics, matching the OpenAI dimensions parameter). Not supported for sparse models. */
+            /** @description Optional truncation size for dense embeddings. EmbeddingGemma 2 supports 768, 512, 256, or 128 only. Must be a positive integer no larger than the model embedding size. For normalized models the truncated vector is L2-re-normalized (Matryoshka semantics, matching the OpenAI dimensions parameter). Not supported for sparse models. */
             dimensions?: number;
             /**
-             * @description Optional embedding task type using Google embedding task-type names. For Jina v5 text embeddings, query-side tasks use the query prefix and RETRIEVAL_DOCUMENT uses the document prefix. For Qwen3-Embedding models, RETRIEVAL_QUERY uses the model's built-in web-retrieval instruction, RETRIEVAL_DOCUMENT is embedded raw, and every other task type requires an explicit instruction.
+             * @description Optional embedding task type using Google embedding task-type names. EmbeddingGemma 2 uses the official prefix for each listed task, defaulting to RETRIEVAL_DOCUMENT. For Jina v5 text embeddings, query-side tasks use the query prefix and RETRIEVAL_DOCUMENT uses the document prefix. For Qwen3-Embedding models, RETRIEVAL_QUERY uses the model's built-in web-retrieval instruction, RETRIEVAL_DOCUMENT is embedded raw, and every other task type requires an explicit instruction.
              * @enum {string}
              */
             task_type?: "RETRIEVAL_QUERY" | "RETRIEVAL_DOCUMENT" | "QUESTION_ANSWERING" | "FACT_VERIFICATION" | "CODE_RETRIEVAL_QUERY" | "CLASSIFICATION" | "CLUSTERING" | "SEMANTIC_SIMILARITY";
@@ -18113,6 +18124,8 @@ export interface components {
         };
         /** @description OpenAI-compatible embedding response with a polymorphic `embedding` field for dense or sparse vectors */
         InferenceEmbedResponse: {
+            /** @description EmbeddingGemma 2 SHA256 identity of actual weights, tokenizer, processor and recipe. Dimensions and retrieval roles must also match index configuration. */
+            model_identity?: string;
             /**
              * @description Object type, always "list"
              * @enum {string}
@@ -18739,9 +18752,29 @@ export interface components {
             /** @description List of input modalities this model accepts, such as `text`, `image`, or `audio` */
             inputs?: string[];
         };
+        /** @description EmbeddingGemma 2 similarity decisions only. Other models reject these options. Uncalibrated results contain cosine scores and never probabilities. */
+        InferenceEmbeddingDecisionOptions: {
+            /** @description Qualified fitted raw thresholds in model/calibrations/{id}.json. Bound to the exact asset identity, task, renderer, dimensions and category prototypes; mutually exclusive with manual thresholds. Does not produce probabilities. */
+            calibration_id?: string;
+            /**
+             * @default CLUSTERING
+             * @enum {string}
+             */
+            task_type?: "CLUSTERING" | "CLASSIFICATION";
+            /**
+             * @default 768
+             * @enum {integer}
+             */
+            dimensions?: 768 | 512 | 256 | 128;
+            min_similarity?: number;
+            min_margin?: number;
+        };
         InferenceDecideRequest: {
             model: string;
+            /** @description Pin the exact EmbeddingGemma 2 assets and embedding recipe. */
+            model_identity?: string;
             state: string;
+            embedding_options?: components["schemas"]["InferenceEmbeddingDecisionOptions"];
             questions: {
                 [key: string]: components["schemas"]["InferenceDecideQuestion"];
             };
@@ -18752,10 +18785,17 @@ export interface components {
             instructions: string;
             /** @description Choice uses option IDs mapped to descriptions; score uses ordered descriptions; noul omits criteria. */
             criteria?: {
-                [key: string]: string;
+                [key: string]: string | components["schemas"]["InferenceEmbeddingDecisionCategory"];
             } | string[];
         };
+        /** @description Embedding similarity categories only. The normalized centroid of examples replaces the description prototype; examples use the input renderer. Trained decision models reject this form. */
+        InferenceEmbeddingDecisionCategory: {
+            description?: string;
+            examples: string[];
+        };
         InferenceDecideResponse: {
+            model_identity?: string;
+            renderer_version?: string;
             model: string;
             answers: {
                 [key: string]: components["schemas"]["InferenceDecideAnswer"];
@@ -18768,9 +18808,22 @@ export interface components {
             };
         };
         InferenceDecideAnswer: {
+            prototype_set_hash?: string;
+            calibration_id?: string;
             /** @enum {string} */
             type: "choice" | "score" | "noul";
-            choice?: string;
+            /** @description Selected option, or null when a similarity decision abstains. */
+            choice?: string | null;
+            /** @enum {string} */
+            decision_method?: "embedding_similarity";
+            similarities?: {
+                [key: string]: number;
+            };
+            margin?: number;
+            /** @enum {string} */
+            status?: "selected" | "abstained";
+            /** @enum {string} */
+            abstention_reason?: "tie" | "min_similarity" | "min_margin";
             score?: number;
             noul?: number;
             legend?: {
@@ -19952,6 +20005,10 @@ export interface components {
             /** @description Alias of prompt. */
             instruction?: string;
             examples?: components["schemas"]["ExtractionClassificationExample"][];
+            /** @description Embedding similarity multi-label classification requires explicit raw cosine thresholds or a qualified fitted calibration_id. Values are not probabilities. */
+            similarity_thresholds?: number | {
+                [key: string]: number;
+            };
         };
         ExtractionRegexValidator: {
             /** @enum {string} */
@@ -20392,6 +20449,23 @@ export interface components {
             track_provenance?: boolean;
         };
         ExtractionOptions: {
+            /** @description Options for embedding similarity classifiers. Trained classifiers reject this field. */
+            embedding?: {
+                /** @description Qualified fitted thresholds in model/calibrations/{id}.json, bound to exact model, renderer, task, dimensions, labels and prototypes. Mutually exclusive with manual thresholds. Does not enable probabilities. */
+                calibration_id?: string;
+                /**
+                 * @default CLUSTERING
+                 * @enum {string}
+                 */
+                task_type?: "CLUSTERING" | "CLASSIFICATION";
+                /**
+                 * @default 768
+                 * @enum {integer}
+                 */
+                dimensions?: 768 | 512 | 256 | 128;
+                min_similarity?: number;
+                min_margin?: number;
+            };
             /** Format: float */
             threshold?: number;
             flat_ner?: boolean;
@@ -20442,7 +20516,7 @@ export interface components {
             probability: number;
         };
         /** @description Version 2 typed classification decision. Probabilities follow request label order; ordinal levels are zero-based. */
-        ExtractionDecision: {
+        TrainedExtractionDecision: {
             name: string;
             /** @enum {string} */
             type: "choice" | "score" | "boolean";
@@ -20472,6 +20546,25 @@ export interface components {
              */
             act_probability?: number;
         };
+        /** @description Embedding classification results report raw cosine similarities and no confidence or probabilities. */
+        EmbeddingExtractionDecision: {
+            prototype_set_hash?: string;
+            calibration_id?: string;
+            name: string;
+            /** @enum {string} */
+            mode: "single" | "multi";
+            /** @enum {string} */
+            decision_method: "embedding_similarity";
+            labels: string[];
+            similarities: {
+                [key: string]: number;
+            };
+            /** @enum {string} */
+            status: "selected" | "abstained";
+            margin?: number;
+            abstention_reason?: string;
+        };
+        ExtractionDecision: components["schemas"]["TrainedExtractionDecision"] | components["schemas"]["EmbeddingExtractionDecision"];
         ExtractionAttributeLabel: {
             label: string;
             confidence: components["schemas"]["ExtractionProbability"];
@@ -20519,6 +20612,8 @@ export interface components {
             label: string;
             /** Format: float */
             score?: number;
+            /** @description Raw cosine similarity for embedding classifiers; not a probability. */
+            similarity?: number;
         } & {
             [key: string]: unknown;
         };

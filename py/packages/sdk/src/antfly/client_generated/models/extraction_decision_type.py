@@ -1,10 +1,3 @@
-from enum import StrEnum
+from .trained_extraction_decision_type import TrainedExtractionDecisionType as ExtractionDecisionType
 
-
-class ExtractionDecisionType(StrEnum):
-    BOOLEAN = "boolean"
-    CHOICE = "choice"
-    SCORE = "score"
-
-    def __str__(self) -> str:
-        return str(self.value)
+__all__ = ("ExtractionDecisionType",)

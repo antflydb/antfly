@@ -50,7 +50,10 @@ pub const io = @import("io/io.zig");
 pub const codecs = @import("codecs/codecs.zig");
 pub const compiled_artifact = @import("compiled_artifact.zig");
 pub const graph = @import("graph/root.zig");
+pub const embedding_decisions = @import("extractors/embedding_decisions.zig");
+pub const embedding_gemma2_pipeline = @import("pipelines/embedding_gemma2.zig");
 pub const architectures = struct {
+    pub const embedding_gemma2 = @import("architectures/embedding_gemma2.zig");
     pub const clipclap_format = @import("architectures/clipclap_format.zig");
     pub const deberta = @import("architectures/deberta.zig");
     pub const deberta_graph = @import("architectures/deberta_graph.zig");
@@ -89,6 +92,7 @@ pub const gliner_boundary_export = @import("gliner_boundary_export.zig");
 pub const native_export_safetensors = @import("native_export_safetensors.zig");
 pub const native_run_artifact = @import("native_run_artifact.zig");
 pub const native_embed = @import("native_embed.zig");
+pub const native_decide = @import("native_decide.zig");
 pub const native_classify = @import("native_classify.zig");
 pub const native_rerank = @import("native_rerank.zig");
 pub const native_transcribe = @import("native_transcribe.zig");
@@ -359,4 +363,13 @@ test "raw CUDA attention differential surface reports output drift" {
     try std.testing.expect(stats.max_abs >= 0.5);
     try std.testing.expect(stats.max_ulp > 0);
     try std.testing.expectError(error.InvalidHeadDim, cuda_attention_diff.parseConfig(&.{ "--head-dim", "128" }));
+}
+
+// Keep model-family tests reachable under compile-time test filtering.
+test "embeddinggemma2 declarations compile" {
+    std.testing.refAllDecls(architectures.embedding_gemma2);
+    std.testing.refAllDecls(embedding_decisions);
+    std.testing.refAllDecls(embedding_gemma2_pipeline);
+    _ = @import("architectures/embedding_gemma2_media_weights.zig");
+    _ = server;
 }

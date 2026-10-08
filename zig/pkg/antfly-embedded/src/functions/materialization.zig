@@ -26,11 +26,11 @@ pub fn parse(a: std.mem.Allocator, bytes: []const u8) !std.json.Parsed(Specifica
     errdefer parsed.deinit();
     _ = try d.text(.{ .string = parsed.value.version });
     try parsed.value.decider.validate();
-    try d.validateQuestions(parsed.value.questions, d.capabilities(parsed.value.decider.provider));
+    try d.validateQuestions(parsed.value.questions, parsed.value.decider.resolvedCapabilities());
     return parsed;
 }
 pub fn provenance(a: std.mem.Allocator, spec: Specification, source_fingerprint: ?[]const u8) !d.Json {
-    const bytes = try std.json.Stringify.valueAlloc(a, .{ .version = spec.version, .provider = spec.decider.provider, .model = spec.decider.modelName(), .url = spec.decider.baseUrl(), .questions = spec.questions }, .{});
+    const bytes = try std.json.Stringify.valueAlloc(a, .{ .version = spec.version, .provider = spec.decider.provider, .decision_method = spec.decider.decision_method, .model = spec.decider.modelName(), .model_identity = spec.decider.model_identity, .embedding_options = spec.decider.embedding_options, .url = spec.decider.baseUrl(), .questions = spec.questions }, .{});
     defer a.free(bytes);
     var hash: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(bytes, &hash, .{});

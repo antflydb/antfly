@@ -6,6 +6,8 @@ from typing import TYPE_CHECKING, Any, TypeVar
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
+from ..types import UNSET, Unset
+
 if TYPE_CHECKING:
     from ..models.inference_decide_response_answers import InferenceDecideResponseAnswers
     from ..models.inference_decide_response_usage import InferenceDecideResponseUsage
@@ -21,11 +23,15 @@ class InferenceDecideResponse:
         model (str):
         answers (InferenceDecideResponseAnswers):
         usage (InferenceDecideResponseUsage):
+        model_identity (str | Unset):
+        renderer_version (str | Unset):
     """
 
     model: str
     answers: InferenceDecideResponseAnswers
     usage: InferenceDecideResponseUsage
+    model_identity: str | Unset = UNSET
+    renderer_version: str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -34,6 +40,10 @@ class InferenceDecideResponse:
         answers = self.answers.to_dict()
 
         usage = self.usage.to_dict()
+
+        model_identity = self.model_identity
+
+        renderer_version = self.renderer_version
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
@@ -44,6 +54,10 @@ class InferenceDecideResponse:
                 "usage": usage,
             }
         )
+        if model_identity is not UNSET:
+            field_dict["model_identity"] = model_identity
+        if renderer_version is not UNSET:
+            field_dict["renderer_version"] = renderer_version
 
         return field_dict
 
@@ -59,10 +73,16 @@ class InferenceDecideResponse:
 
         usage = InferenceDecideResponseUsage.from_dict(d.pop("usage"))
 
+        model_identity = d.pop("model_identity", UNSET)
+
+        renderer_version = d.pop("renderer_version", UNSET)
+
         inference_decide_response = cls(
             model=model,
             answers=answers,
             usage=usage,
+            model_identity=model_identity,
+            renderer_version=renderer_version,
         )
 
         inference_decide_response.additional_properties = d

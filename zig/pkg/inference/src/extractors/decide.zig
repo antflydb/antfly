@@ -25,11 +25,14 @@ pub const Question = struct {
     instructions: []const u8,
     labels: []const []const u8,
     descriptions: []const []const u8,
+    examples: []const []const []const u8 = &.{},
 };
 pub const Request = struct {
     model: []const u8,
+    model_identity: ?[]const u8 = null,
     state: []const u8,
     questions: []Question,
+    embedding_options: ?@import("embedding_decisions.zig").Options = null,
 };
 
 fn object(v: Value) !std.json.ObjectMap {
@@ -62,8 +65,14 @@ pub fn parse(a: Allocator, json: []const u8) !Request {
     };
     // The request owns parsed strings through the caller's request arena.
     const root = try object(parsed.value);
-    try onlyKeys(root, &.{ "model", "state", "questions" });
+    try onlyKeys(root, &.{ "model", "model_identity", "state", "questions", "embedding_options" });
     const model = try nonempty(root.get("model") orelse return error.InvalidDecideRequest);
+    const model_identity: ?[]const u8 = if (root.get("model_identity")) |value| blk: {
+        const identity = try nonempty(value);
+        if (identity.len != 64) return error.InvalidDecideRequest;
+        for (identity) |c| if (!std.ascii.isDigit(c) and (c < 'a' or c > 'f')) return error.InvalidDecideRequest;
+        break :blk identity;
+    } else null;
     const state = try nonempty(root.get("state") orelse return error.InvalidDecideRequest);
     if (state.len > 1024 * 1024) return error.DecideRequestLimitExceeded;
     const questions = try object(root.get("questions") orelse return error.InvalidDecideRequest);
@@ -79,16 +88,31 @@ pub fn parse(a: Allocator, json: []const u8) !Request {
         const criteria = fields.get("criteria");
         var labels: [][]const u8 = undefined;
         var descriptions: [][]const u8 = undefined;
+        var examples: []const []const []const u8 = &.{};
         switch (kind) {
             .choice => {
                 const choices = try object(criteria orelse return error.InvalidDecideRequest);
                 if (choices.count() < 2 or choices.count() > 64) return error.InvalidDecideRequest;
                 labels = try a.alloc([]const u8, choices.count());
                 descriptions = try a.alloc([]const u8, choices.count());
-                for (choices.keys(), choices.values(), labels, descriptions) |label, description, *dest_label, *dest_description| {
+                const choice_examples = try a.alloc([]const []const u8, choices.count());
+                examples = choice_examples;
+                for (choices.keys(), choices.values(), labels, descriptions, choice_examples) |label, description, *dest_label, *dest_description, *dest_examples| {
                     if (label.len == 0 or !std.unicode.utf8ValidateSlice(label)) return error.InvalidDecideRequest;
                     dest_label.* = label;
-                    dest_description.* = try nonempty(description);
+                    dest_examples.* = &.{};
+                    if (description == .string) {
+                        dest_description.* = try nonempty(description);
+                    } else {
+                        const definition = try object(description);
+                        try onlyKeys(definition, &.{ "description", "examples" });
+                        const raw_examples = definition.get("examples") orelse return error.InvalidDecideRequest;
+                        if (raw_examples != .array or raw_examples.array.items.len == 0 or raw_examples.array.items.len > 32) return error.InvalidDecideRequest;
+                        const inputs = try a.alloc([]const u8, raw_examples.array.items.len);
+                        for (inputs, raw_examples.array.items) |*dest, value| dest.* = try nonempty(value);
+                        dest_examples.* = inputs;
+                        dest_description.* = if (definition.get("description")) |v| try nonempty(v) else label;
+                    }
                 }
             },
             .score => {
@@ -107,9 +131,9 @@ pub fn parse(a: Allocator, json: []const u8) !Request {
                 descriptions = try a.dupe([]const u8, &.{ "False", "True" });
             },
         }
-        question.* = .{ .name = name, .kind = kind, .instructions = instructions, .labels = labels, .descriptions = descriptions };
+        question.* = .{ .name = name, .kind = kind, .instructions = instructions, .labels = labels, .descriptions = descriptions, .examples = examples };
     }
-    return .{ .model = model, .state = state, .questions = out };
+    return .{ .model = model, .model_identity = model_identity, .state = state, .questions = out, .embedding_options = if (root.get("embedding_options")) |v| try @import("embedding_decisions.zig").Options.parse(v) else null };
 }
 
 fn put(a: Allocator, map: *std.json.ObjectMap, key: []const u8, value: Value) !void {

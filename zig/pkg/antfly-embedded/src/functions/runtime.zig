@@ -68,7 +68,11 @@ pub const Runtime = struct {
     profile_allocator: ?std.mem.Allocator = null,
     provenance: std.ArrayList(struct { decider: []const u8, provider: decisions.Provider, model: []const u8, rows: u64 = 0 }) = .empty,
     pub fn provider(self: *@This()) decisions.DecisionProvider {
-        return .{ .ptr = self, .validate_fn = validate, .evaluate_batch_fn = evaluate, .checkpoint_fn = checkpoint };
+        return .{ .ptr = self, .validate_fn = validate, .evaluate_batch_fn = evaluate, .checkpoint_fn = checkpoint, .capabilities_fn = resolvedCapabilities };
+    }
+    fn resolvedCapabilities(ptr: *anyopaque, name: []const u8) !decisions.Capabilities {
+        const self: *Runtime = @ptrCast(@alignCast(ptr));
+        return (try self.registry.getDeciderConfig(name)).resolvedCapabilities();
     }
     fn checkpoint(ptr: *anyopaque) !void {
         const self: *Runtime = @ptrCast(@alignCast(ptr));
@@ -79,7 +83,7 @@ pub const Runtime = struct {
         const cfg = try self.registry.getDeciderConfig(name);
         try cfg.validate();
         _ = try quotas.Policy.fromConfig(cfg.rate_limit);
-        try decisions.validateQuestions(questions, decisions.capabilities(cfg.provider));
+        try decisions.validateQuestions(questions, cfg.resolvedCapabilities());
     }
     const Job = struct {
         runtime: *Runtime,
@@ -104,7 +108,7 @@ pub const Runtime = struct {
             try checkpoint(self.runtime);
             const a = self.arena.allocator();
             const cfg = self.cfg;
-            const body = try std.json.Stringify.valueAlloc(a, .{ .model = cfg.modelName(), .state = self.request.input, .questions = self.request.questions }, .{});
+            const body = try decisions.wireRequest(a, cfg, self.request.input, self.request.questions);
             const base = if (cfg.provider == .antfly and cfg.url.len == 0) self.runtime.antfly_url orelse cfg.baseUrl() else cfg.baseUrl();
             const url = try std.fmt.allocPrint(a, "{s}{s}", .{ std.mem.trimEnd(u8, base, "/"), if (cfg.provider == .jev) "/v1/systemone" else "/decide" });
             var key_source = try secrets.SecretValue.initConfigOrEnv(a, cfg.api_key, if (cfg.provider == .jev) "TYPESAFE_API_KEY" else "ANTFLY_INFERENCE_API_KEY");
@@ -181,10 +185,10 @@ pub const Runtime = struct {
         for (requests) |request| {
             const cfg = try self.registry.getDeciderConfig(request.decider);
             if (self.rows + requests.len > cfg.max_rows or self.input_tokens >= cfg.max_input_tokens) return error.DecisionLimitExceeded;
-            if (request.input.len > decisions.capabilities(cfg.provider).max_input_bytes) return error.DecisionLimitExceeded;
+            if (request.input.len > cfg.resolvedCapabilities().max_input_bytes) return error.DecisionLimitExceeded;
             // Reserve conservatively before any provider I/O. The same byte-based
             // token estimate is used by the shared provider quota implementation.
-            const body = try std.json.Stringify.valueAlloc(a, .{ .model = cfg.modelName(), .state = request.input, .questions = request.questions }, .{});
+            const body = try decisions.wireRequest(a, cfg, request.input, request.questions);
             defer a.free(body);
             estimated +|= body.len;
             if (estimated > cfg.max_input_tokens) return error.DecisionLimitExceeded;
@@ -211,7 +215,12 @@ pub const Runtime = struct {
             self.batches += 1;
             for (jobs, out[begin..end]) |*job, *value| {
                 if (job.failure) |err| return err;
-                const normalized = try decisions.normalizeResponse(a, job.request.questions, job.response.?);
+                if (job.cfg.model_identity) |expected| {
+                    const root = try decisions.object(job.response.?);
+                    const actual = root.get("model_identity") orelse return error.InvalidDecisionOutput;
+                    if (actual != .string or !std.mem.eql(u8, actual.string, expected)) return error.InvalidDecisionOutput;
+                }
+                const normalized = try decisions.normalizeResponseWithCapabilities(a, job.request.questions, job.response.?, job.cfg.resolvedCapabilities());
                 const usage = normalized.object.get("usage").?.object;
                 if (self.profile_allocator) |stats_a| {
                     const model = normalized.object.get("model").?.string;

@@ -82,6 +82,16 @@ pub const SegmentAttention = struct {
     num_heads: usize,
     head_dim: usize,
 };
+/// Grouped K/V rows retain their original head count. Optional device-only
+/// contract: a declined request uses the caller's existing expanded-head path.
+pub const SegmentAttentionGrouped = struct {
+    visibility: SegmentAttention,
+    num_kv_heads: usize,
+    score_scale: f32,
+    workspace_limit_bytes: usize = 256 * 1024 * 1024,
+    control: ?@import("../execution_control.zig").InferenceExecutionControl = null,
+};
+
 pub const GraphDType = ml.graph.DType;
 pub const OperatorPlan = operator_plan.OperatorPlan;
 
@@ -701,6 +711,8 @@ pub const Gemma4AudioLocalAttentionParams = struct {
     k_scale: f32,
     logit_cap: f32,
     invalid_value: f32,
+    /// HF Gemma4 audio masking uses distance < context_left - 1.
+    exclude_farthest_key: bool = false,
 };
 pub const DecoderRuntimeApplyActivationRequest = backend_contracts.DecoderRuntimeApplyActivationRequest;
 pub const DecoderRuntimeApplyGeluBackwardRequest = backend_contracts.DecoderRuntimeApplyGeluBackwardRequest;
@@ -2288,6 +2300,10 @@ pub const ComputeBackend = struct {
         /// Segment-masked attention for tree-packed sequences; see
         /// `SegmentAttention`. Null declines to the host implementation.
         segmentAttention: ?*const fn (ctx: *anyopaque, Q: CT, K: CT, V: CT, request: *const SegmentAttention) anyerror!?CT = null,
+        segmentAttentionGrouped: ?*const fn (ctx: *anyopaque, Q: CT, K: CT, V: CT, request: *const SegmentAttentionGrouped) anyerror!?CT = null,
+        /// Masked mean of [rows,width], truncated before final readback. Null
+        /// declines; device-only callers must not silently reduce on the host.
+        maskedMeanRows: ?*const fn (ctx: *anyopaque, input: CT, mask: []const i64, width: usize, dimensions: usize) anyerror!?CT = null,
 
         /// Causal self-attention for decoder layers.
         /// Q,K,V: [batch*seq_len, num_heads*head_dim].

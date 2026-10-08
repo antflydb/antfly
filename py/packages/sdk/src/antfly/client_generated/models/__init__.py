@@ -251,6 +251,11 @@ from .edges_response import EdgesResponse
 from .embedder_config import EmbedderConfig
 from .embedder_config_inputs_item import EmbedderConfigInputsItem
 from .embedder_provider import EmbedderProvider
+from .embedding_extraction_decision import EmbeddingExtractionDecision
+from .embedding_extraction_decision_decision_method import EmbeddingExtractionDecisionDecisionMethod
+from .embedding_extraction_decision_mode import EmbeddingExtractionDecisionMode
+from .embedding_extraction_decision_similarities import EmbeddingExtractionDecisionSimilarities
+from .embedding_extraction_decision_status import EmbeddingExtractionDecisionStatus
 from .embedding_index_activity import EmbeddingIndexActivity
 from .embedding_index_activity_phase import EmbeddingIndexActivityPhase
 from .embedding_retrieval_config import EmbeddingRetrievalConfig
@@ -318,6 +323,9 @@ from .extraction_classification_schema import ExtractionClassificationSchema
 from .extraction_classification_schema_activation import ExtractionClassificationSchemaActivation
 from .extraction_classification_schema_label_definitions import ExtractionClassificationSchemaLabelDefinitions
 from .extraction_classification_schema_mode import ExtractionClassificationSchemaMode
+from .extraction_classification_schema_similarity_thresholds_type_1 import (
+    ExtractionClassificationSchemaSimilarityThresholdsType1,
+)
 from .extraction_constraint_and import ExtractionConstraintAnd
 from .extraction_constraint_and_type import ExtractionConstraintAndType
 from .extraction_constraint_any_other_selected import ExtractionConstraintAnyOtherSelected
@@ -412,6 +420,9 @@ from .extraction_object_structure_metadata import ExtractionObjectStructureMetad
 from .extraction_object_structures import ExtractionObjectStructures
 from .extraction_offset_unit import ExtractionOffsetUnit
 from .extraction_options import ExtractionOptions
+from .extraction_options_embedding import ExtractionOptionsEmbedding
+from .extraction_options_embedding_dimensions import ExtractionOptionsEmbeddingDimensions
+from .extraction_options_embedding_task_type import ExtractionOptionsEmbeddingTaskType
 from .extraction_options_overlap import ExtractionOptionsOverlap
 from .extraction_options_word_splitter import ExtractionOptionsWordSplitter
 from .extraction_reader_options import ExtractionReaderOptions
@@ -754,8 +765,12 @@ from .inference_connection_models import InferenceConnectionModels
 from .inference_content_security_config import InferenceContentSecurityConfig
 from .inference_credentials import InferenceCredentials
 from .inference_decide_answer import InferenceDecideAnswer
+from .inference_decide_answer_abstention_reason import InferenceDecideAnswerAbstentionReason
+from .inference_decide_answer_decision_method import InferenceDecideAnswerDecisionMethod
 from .inference_decide_answer_legend import InferenceDecideAnswerLegend
 from .inference_decide_answer_probabilities import InferenceDecideAnswerProbabilities
+from .inference_decide_answer_similarities import InferenceDecideAnswerSimilarities
+from .inference_decide_answer_status import InferenceDecideAnswerStatus
 from .inference_decide_answer_type import InferenceDecideAnswerType
 from .inference_decide_question import InferenceDecideQuestion
 from .inference_decide_question_criteria_type_0 import InferenceDecideQuestionCriteriaType0
@@ -782,6 +797,11 @@ from .inference_embed_request_task_type import InferenceEmbedRequestTaskType
 from .inference_embed_response import InferenceEmbedResponse
 from .inference_embed_response_object import InferenceEmbedResponseObject
 from .inference_embedding_batch_summary import InferenceEmbeddingBatchSummary
+from .inference_embedding_decision_category import InferenceEmbeddingDecisionCategory
+from .inference_embedding_decision_options import InferenceEmbeddingDecisionOptions
+from .inference_embedding_decision_options_dimensions import InferenceEmbeddingDecisionOptionsDimensions
+from .inference_embedding_decision_options_task_type import InferenceEmbeddingDecisionOptionsTaskType
+from .inference_embedding_group import InferenceEmbeddingGroup
 from .inference_embedding_item_error import InferenceEmbeddingItemError
 from .inference_embedding_item_error_stage import InferenceEmbeddingItemErrorStage
 from .inference_embedding_object import InferenceEmbeddingObject
@@ -1348,6 +1368,9 @@ from .topology_changed_error import TopologyChangedError
 from .topology_changed_error_action import TopologyChangedErrorAction
 from .topology_changed_error_error import TopologyChangedErrorError
 from .topology_changed_error_status import TopologyChangedErrorStatus
+from .trained_extraction_decision import TrainedExtractionDecision
+from .trained_extraction_decision_confidence_method import TrainedExtractionDecisionConfidenceMethod
+from .trained_extraction_decision_type import TrainedExtractionDecisionType
 from .transaction_begin_request import TransactionBeginRequest
 from .transaction_begin_response import TransactionBeginResponse
 from .transaction_commit_request import TransactionCommitRequest
@@ -1671,6 +1694,11 @@ __all__ = (
     "EmbedderConfig",
     "EmbedderConfigInputsItem",
     "EmbedderProvider",
+    "EmbeddingExtractionDecision",
+    "EmbeddingExtractionDecisionDecisionMethod",
+    "EmbeddingExtractionDecisionMode",
+    "EmbeddingExtractionDecisionSimilarities",
+    "EmbeddingExtractionDecisionStatus",
     "EmbeddingIndexActivity",
     "EmbeddingIndexActivityPhase",
     "EmbeddingRetrievalConfig",
@@ -1738,6 +1766,7 @@ __all__ = (
     "ExtractionClassificationSchemaActivation",
     "ExtractionClassificationSchemaLabelDefinitions",
     "ExtractionClassificationSchemaMode",
+    "ExtractionClassificationSchemaSimilarityThresholdsType1",
     "ExtractionConstraintAnd",
     "ExtractionConstraintAndType",
     "ExtractionConstraintAnyOtherSelected",
@@ -1768,9 +1797,6 @@ __all__ = (
     "ExtractionConstraintNotType",
     "ExtractionConstraintOr",
     "ExtractionConstraintOrType",
-    "ExtractionDecision",
-    "ExtractionDecisionConfidenceMethod",
-    "ExtractionDecisionType",
     "ExtractionDecoderOptions",
     "ExtractionDecoderOptionsAlgorithm",
     "ExtractionEntity",
@@ -1826,6 +1852,9 @@ __all__ = (
     "ExtractionObjectStructures",
     "ExtractionOffsetUnit",
     "ExtractionOptions",
+    "ExtractionOptionsEmbedding",
+    "ExtractionOptionsEmbeddingDimensions",
+    "ExtractionOptionsEmbeddingTaskType",
     "ExtractionOptionsOverlap",
     "ExtractionOptionsWordSplitter",
     "ExtractionReaderOptions",
@@ -2168,8 +2197,12 @@ __all__ = (
     "InferenceContentSecurityConfig",
     "InferenceCredentials",
     "InferenceDecideAnswer",
+    "InferenceDecideAnswerAbstentionReason",
+    "InferenceDecideAnswerDecisionMethod",
     "InferenceDecideAnswerLegend",
     "InferenceDecideAnswerProbabilities",
+    "InferenceDecideAnswerSimilarities",
+    "InferenceDecideAnswerStatus",
     "InferenceDecideAnswerType",
     "InferenceDecideQuestion",
     "InferenceDecideQuestionCriteriaType0",
@@ -2189,6 +2222,11 @@ __all__ = (
     "InferenceDictationTranscript",
     "InferenceDictationWord",
     "InferenceEmbeddingBatchSummary",
+    "InferenceEmbeddingDecisionCategory",
+    "InferenceEmbeddingDecisionOptions",
+    "InferenceEmbeddingDecisionOptionsDimensions",
+    "InferenceEmbeddingDecisionOptionsTaskType",
+    "InferenceEmbeddingGroup",
     "InferenceEmbeddingItemError",
     "InferenceEmbeddingItemErrorStage",
     "InferenceEmbeddingObject",
@@ -2758,6 +2796,9 @@ __all__ = (
     "TopologyChangedErrorAction",
     "TopologyChangedErrorError",
     "TopologyChangedErrorStatus",
+    "TrainedExtractionDecision",
+    "TrainedExtractionDecisionConfidenceMethod",
+    "TrainedExtractionDecisionType",
     "TransactionBeginRequest",
     "TransactionBeginResponse",
     "TransactionCommitRequest",
@@ -2831,3 +2872,5 @@ __all__ = (
     "YouSearchConfig",
     "YouSearchConfigProvider",
 )
+
+__all__ += ("ExtractionDecision", "ExtractionDecisionType", "ExtractionDecisionConfidenceMethod")

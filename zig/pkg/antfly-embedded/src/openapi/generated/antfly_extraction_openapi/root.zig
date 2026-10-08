@@ -3,6 +3,7 @@
 
 pub const types = @import("types.zig");
 
+pub const EmbeddingExtractionDecision = types.EmbeddingExtractionDecision;
 pub const ExtractionAttributeGroup = types.ExtractionAttributeGroup;
 pub const ExtractionAttributeLabel = types.ExtractionAttributeLabel;
 pub const ExtractionAttributeSelection = types.ExtractionAttributeSelection;
@@ -73,3 +74,4 @@ pub const ExtractionSolverStatus = types.ExtractionSolverStatus;
 pub const ExtractionStructureField = types.ExtractionStructureField;
 pub const ExtractionStructureSchema = types.ExtractionStructureSchema;
 pub const ExtractionToken = types.ExtractionToken;
+pub const TrainedExtractionDecision = types.TrainedExtractionDecision;

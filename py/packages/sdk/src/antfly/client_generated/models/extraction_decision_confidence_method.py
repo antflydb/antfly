@@ -1,9 +1,5 @@
-from enum import StrEnum
+from .trained_extraction_decision_confidence_method import (
+    TrainedExtractionDecisionConfidenceMethod as ExtractionDecisionConfidenceMethod,
+)
 
-
-class ExtractionDecisionConfidenceMethod(StrEnum):
-    MAX_PROBABILITY = "max_probability"
-    NORMALIZED_INVERSE_ENTROPY = "normalized_inverse_entropy"
-
-    def __str__(self) -> str:
-        return str(self.value)
+__all__ = ("ExtractionDecisionConfidenceMethod",)
