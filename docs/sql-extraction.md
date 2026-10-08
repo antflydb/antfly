@@ -4874,3 +4874,27 @@ Public NUMERIC activation still requires exact literal binding and generated
 type identity, typed storage/index/wire/spill contracts and aggregate
 integration. The parity ledger is unchanged; kernel-only tests are not credits
 for original SQL cases.
+
+The exact NUMERIC binary boundary now validates and streams PostgreSQL's
+base-10000 wire representation without decimal formatting or binary64
+conversion. A shared indexed-group constructor validates every input group,
+including discarded fractional groups, before allocating only the significant
+canonical limbs. Decoding applies PostgreSQL's declared-scale truncation before
+precision/scale coercion. Short framing reports 08P01; invalid framing, signs,
+scales and groups report 22P03. Logical non-finite values remain canonical while
+the encoder preserves PostgreSQL's ignored infinity scale-field convention.
+
+A disposable PostgreSQL 18 oracle reproduces 65 sender cases and 47 receiver
+cases through actual binary NUMERIC parameters, not a local round-trip model.
+Large outputs are checked with length and SHA-256 as well as canonical binary
+bytes. Native tests cover exhaustive allocation failures, cancellation at every
+observed checkpoint, sticky admission, writer errors and validation before
+output. Streaming encode allocates nothing. A 65,535-group receiver retains
+one significant limb in one allocation; an all-zero payload allocates nothing.
+All sixteen kernel/codec tests pass and compile-check for wasm32-wasi.
+
+This codec is shared integration infrastructure, not a claim that public
+NUMERIC parameters, results or columns are activated. Exact literal binding,
+generated type identity, typed storage/index/spill, scalar and aggregate
+execution, and public transport dispatch still require integration. No parity
+ledger credit is taken for kernel/codec-only evidence.

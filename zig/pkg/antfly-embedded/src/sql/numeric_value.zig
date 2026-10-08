@@ -52,7 +52,8 @@ pub const Context = struct {
         } else self.since_poll += @intCast(count);
     }
 
-    fn limit(self: *Context) anyerror {
+    /// Shared admission failure for typed codecs using this execution budget.
+    pub fn limit(self: *Context) anyerror {
         if (self.failure) |err| return err;
         self.failure = error.SqlProgramLimitExceeded;
         return error.SqlProgramLimitExceeded;
@@ -150,6 +151,41 @@ fn clone(ctx: *Context, value: Value, scale: u16) !Owned {
 
 fn whitespace(byte: u8) bool {
     return byte == ' ' or (byte >= '\t' and byte <= '\r');
+}
+
+/// Construct canonical owned limbs from an immutable indexed digit source.
+/// The source supplies len()/at(index), allowing wire/storage adapters to
+/// decode directly without an intermediate limb allocation. Validate every
+/// digit, then retain only significant groups visible at the declared scale.
+pub fn fromGroups(ctx: *Context, source: anytype, weight: i16, scale: u16, negative: bool) !Owned {
+    try ctx.charge(1);
+    if (source.len() > std.math.maxInt(u16)) return ctx.limit();
+    if (scale > maximum_scale) return error.InvalidNumericRepresentation;
+    const unit = @divFloor(-@as(i32, scale), 4);
+    const factor: u16 = powers[@intCast(@mod(-@as(i32, scale), 4))];
+    var first: ?usize = null;
+    var last: usize = 0;
+    for (0..source.len()) |i| {
+        try ctx.charge(1);
+        const raw = source.at(i);
+        if (raw >= base) return error.InvalidNumericRepresentation;
+        const exponent = @as(i32, weight) - @as(i32, @intCast(i));
+        const digit = if (exponent < unit) 0 else if (exponent == unit) raw / factor * factor else raw;
+        if (digit != 0) {
+            if (first == null) first = i;
+            last = i;
+        }
+    }
+    const start = first orelse return zero(ctx.alloc, scale);
+    const storage = try ctx.allocate(last - start + 1);
+    errdefer ctx.alloc.free(storage);
+    for (storage, start..) |*digit, i| {
+        try ctx.charge(1);
+        const exponent = @as(i32, weight) - @as(i32, @intCast(i));
+        const raw = source.at(i);
+        digit.* = if (exponent == unit) raw / factor * factor else raw;
+    }
+    return finish(ctx.alloc, storage, @as(i32, weight) - @as(i32, @intCast(start)), scale, negative);
 }
 
 pub fn parse(ctx: *Context, input: []const u8) !Owned {
