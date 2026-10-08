@@ -2569,6 +2569,7 @@ pub const HealthSource = struct {
         try health_metrics.appendPromMetric(writer, "antfly_query_embedding_cache_rejected_admissions_total", "counter", "Query embedding results rejected by cache admission control", api_request_stats.query_embedding_cache.rejected_admissions);
         try health_metrics.appendPromMetric(writer, "antfly_query_embedding_cache_entries", "gauge", "Live query embedding cache entries", api_request_stats.query_embedding_cache.entries);
         try health_metrics.appendPromMetric(writer, "antfly_query_embedding_cache_live_bytes", "gauge", "Accounted live query embedding cache bytes", api_request_stats.query_embedding_cache.live_bytes);
+        try @import("../api/lake_query_metrics.zig").append(writer, api_request_stats.lake_range_cache, api_request_stats.lake_disk_cache, api_request_stats.lake_query);
         try health_metrics.appendPromMetric(writer, "antfly_incoming_graph_route_directory_hits_total", "counter", "Durable incoming-graph route directory hits", api_request_stats.incoming_graph_routes.durable_hits);
         try health_metrics.appendPromMetric(writer, "antfly_incoming_graph_route_directory_misses_total", "counter", "Durable incoming-graph route directory misses, including stale fences", api_request_stats.incoming_graph_routes.durable_misses);
         try health_metrics.appendPromMetric(writer, "antfly_incoming_graph_route_directory_read_failures_total", "counter", "Durable incoming-graph route directory read or decode failures", api_request_stats.incoming_graph_routes.durable_read_failures);
@@ -41386,6 +41387,8 @@ fn consumerTests() type {
             try std.testing.expect(std.mem.indexOf(u8, output, "antfly_data_raft_writer_unavailable_logs_suppressed_total 7") != null);
             try std.testing.expect(std.mem.indexOf(u8, output, "antfly_data_api_first_request_elapsed_ms") != null);
             try std.testing.expect(std.mem.indexOf(u8, output, "antfly_query_embedding_cache_hits_total 0") != null);
+            try std.testing.expect(std.mem.indexOf(u8, output, "antfly_lake_cache_disk_ready 0") != null);
+            try std.testing.expect(std.mem.indexOf(u8, output, "antfly_lake_query_hydration_calls_total 0") != null);
             try std.testing.expect(std.mem.indexOf(u8, output, "antfly_query_embedding_cache_coalesced_waiters_total 0") != null);
             try std.testing.expect(std.mem.indexOf(u8, output, "antfly_query_embedding_cache_uncached_computations_total 0") != null);
             try std.testing.expect(std.mem.indexOf(u8, output, "antfly_query_embedding_cache_producer_compute_ns_total 0") != null);

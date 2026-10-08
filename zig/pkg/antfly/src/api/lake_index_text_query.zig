@@ -38,6 +38,8 @@ pub fn execute(a: A, server: *server_api.ApiHttpServer, table: local.common_topo
 fn executePinned(a: A, server: *server_api.ApiHttpServer, table: local.common_topology_records.TableRecord, req: types.SearchRequest, request: local.api_operation.RequestContext) !?local.api_query.QueryResponse {
     var schema = (try local.serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc(a, table.schema_json)) orelse return null;
     defer schema.deinit(a);
+    const total_started = @import("antfly_platform").time.monotonicNs();
+    defer server.lake_query_metrics.record(.total, total_started);
     // Graph and search aggregation execution require their own native ports;
     // reject them before selecting a publication rather than dropping clauses.
     if (req.graph_queries.len != 0 or req.graph_metric_queries.len != 0 or req.aggregations_json.len != 0) return error.UnsupportedQueryRequest;
@@ -53,7 +55,11 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, table: local.common_to
     context = lease.readContext();
     try server.prepareLakeCache();
     const options: @import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions = .{ .node_config = server.cfg.node_config, .secret_store = server.cfg.secret_store };
-    var source = try local.serverless_query_lake_serving.ServingSource.openCached(a, .{ .storage_mode = .relational, .external_base_source = schema }, options.lakeOptions(), context, &server.lake_read_cache);
+    var source = blk: {
+        const source_started = @import("antfly_platform").time.monotonicNs();
+        defer server.lake_query_metrics.record(.source, source_started);
+        break :blk try local.serverless_query_lake_serving.ServingSource.openCached(a, .{ .storage_mode = .relational, .external_base_source = schema }, options.lakeOptions(), context, &server.lake_read_cache);
+    };
     defer source.deinit();
     var store = try Store.openNative(a, server.cfg.node_config, server.cfg.secret_store, true, server.cfg.deployment_mode, server.cfg.native_lake_artifact_base_dir);
     defer store.deinit();
@@ -62,7 +68,11 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, table: local.common_to
     const ca = arena.allocator();
     var sql_table = try server.sql_schema_cache.resolve(server.embedding_provider_runtime.io, ca, table.schema_json, table.table_id, table.name);
     sql_table.external_indexes = .{ .schema_json = table.schema_json, .catalog_json = table.lake_index_catalog_json, .indexes_json = table.indexes_json, .desired = local.metadata_lake_index_catalog.desiredFingerprint(table) };
-    var selected = (try @import("lake_index_selection.zig").selectCached(ca, sql_table, &source, &store, context, .required, &server.lake_read_cache)) orelse return error.ExternalLakeIndexUnavailable;
+    var selected = blk: {
+        const publication_started = @import("antfly_platform").time.monotonicNs();
+        defer server.lake_query_metrics.record(.publication, publication_started);
+        break :blk (try @import("lake_index_selection.zig").selectCached(ca, sql_table, &source, &store, context, .required, &server.lake_read_cache)) orelse return error.ExternalLakeIndexUnavailable;
+    };
     defer selected.deinit();
     const publication_bytes = try local.metadata_lake_index_catalog.encode(ca, .{ .namespace = selected.publication().namespace, .generation = selected.publication().generation, .published = selected.publication() });
     var snapshot_hash = std.crypto.hash.Blake3.init(.{});
@@ -95,20 +105,23 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, table: local.common_to
     // Hydrate the final page once, after all result movement, into owned values.
     if (owner.typed_delivery) execution_req.include_stored = false;
     const started = @import("antfly_platform").time.monotonicNs();
-    var result = if (execution_req.full_text_queries.len != 0 or execution_req.sparse_queries.len != 0 or execution_req.dense_queries.len != 0)
-        try search.searchComposed(a, execution_req, .{ .ctx = &owner, .search_text_query = Execution.searchText, .search_text = Execution.dispatchText, .search_dense = Execution.searchDense, .search_sparse = Execution.searchSparse, .clone_named_set = Execution.cloneSet, .fuse_named_sets = Execution.fuseSets, .attach_graph_results = Execution.attachGraph })
-    else if (execution_req.dense) |dense| try Execution.searchDense(&owner, a, execution_req, dense) else if (execution_req.sparse) |sparse| try Execution.searchSparse(&owner, a, execution_req, sparse) else if (execution_req.full_text) |text| try Execution.searchText(&owner, a, execution_req, text) else try Execution.dispatchText(&owner, a, execution_req);
+    var result = blk: {
+        defer server.lake_query_metrics.record(.ranking, started);
+        break :blk if (execution_req.full_text_queries.len != 0 or execution_req.sparse_queries.len != 0 or execution_req.dense_queries.len != 0)
+            try search.searchComposed(a, execution_req, .{ .ctx = &owner, .search_text_query = Execution.searchText, .search_text = Execution.dispatchText, .search_dense = Execution.searchDense, .search_sparse = Execution.searchSparse, .clone_named_set = Execution.cloneSet, .fuse_named_sets = Execution.fuseSets, .attach_graph_results = Execution.attachGraph })
+        else if (execution_req.dense) |dense| try Execution.searchDense(&owner, a, execution_req, dense) else if (execution_req.sparse) |sparse| try Execution.searchSparse(&owner, a, execution_req, sparse) else if (execution_req.full_text) |text| try Execution.searchText(&owner, a, execution_req, text) else try Execution.dispatchText(&owner, a, execution_req);
+    };
     defer result.deinit();
     if (!owner.typed_delivery) try owner.attachHighlights(a, effective, &result);
     try context.ensureActive();
-    var meta: local.api_query.QueryResponseMeta = .{ .remote_snapshot = &snapshot_token, .shard_count = 1, .took_ms = @intCast((@import("antfly_platform").time.monotonicNs() -| started) / std.time.ns_per_ms) };
+    var meta: local.api_query.QueryResponseMeta = .{ .remote_snapshot = &snapshot_token, .shard_count = 1, .took_ms = @intCast((@import("antfly_platform").time.monotonicNs() -| total_started) / std.time.ns_per_ms) };
     defer meta.deinit(a);
     try @import("query_post_processing.zig").applyQueryPostProcessing(a, effective, &result, &meta, .{ .source_table = table.name, .backend_runtime = server.cfg.backend_runtime, .secret_store = server.cfg.secret_store, .remote_content = server.cfg.remote_content });
     if (owner.typed_delivery) {
-        if (!effective.count_only and (effective.include_stored or effective.highlight != null)) try owner.hydrateTyped(a, result.hits);
+        if (!effective.count_only and (effective.include_stored or effective.highlight != null)) try owner.hydrateTyped(a, effective, result.hits);
         try owner.attachHighlights(a, effective, &result);
     }
-    meta.took_ms = @intCast((@import("antfly_platform").time.monotonicNs() -| started) / std.time.ns_per_ms);
+    meta.took_ms = @intCast((@import("antfly_platform").time.monotonicNs() -| total_started) / std.time.ns_per_ms);
     return try local.api_query.encodeQueryResponses(a, table.name, effective, meta, result);
 }
 const Execution = struct {
@@ -165,6 +178,8 @@ const Execution = struct {
     }
     fn acquire(raw: ?*anyopaque, name: ?[]const u8) !?search.PinnedTextSource {
         const self = from(raw);
+        const started = @import("antfly_platform").time.monotonicNs();
+        defer self.server.lake_query_metrics.record(.index, started);
         try self.context.ensureActive();
         var count: usize = 0;
         for (self.declarations) |declaration| if (declaration.artifact.kind == .text_segment and declaration.artifact.metadata_version == corpus.metadata_version) {
@@ -193,6 +208,8 @@ const Execution = struct {
         const options = req.highlight orelse return;
         if (req.defer_hierarchy_child_hydration or result.hits.len == 0) return;
         if (req.full_text == null and req.full_text_queries.len == 0) return;
+        const started = @import("antfly_platform").time.monotonicNs();
+        defer self.server.lake_query_metrics.record(.highlight, started);
         try self.context.ensureActive();
         var pins: std.ArrayList(search.PinnedTextSource) = .empty;
         defer {
@@ -235,15 +252,55 @@ const Execution = struct {
         try search.attachHighlightsWithIndexQueries(a, options, queries.items, result.hits, sources);
         try self.context.ensureActive();
     }
-    fn hydrateTyped(self: *Execution, a: A, hits: []types.SearchHit) !void {
+    fn hydrateTyped(self: *Execution, a: A, req: types.SearchRequest, hits: []types.SearchHit) !void {
+        if (hits.len == 0) return;
+        const started = @import("antfly_platform").time.monotonicNs();
+        defer self.server.lake_query_metrics.record(.hydration, started);
         const keys = try a.alloc([]const u8, hits.len);
         defer a.free(keys);
         for (hits, keys) |hit, *key| key.* = hit.id;
-        const values = try loadSelected(std.json.Value, self, a, keys, self.hydration_fields);
+        // Document ordinals have meaning in one text snapshot only. Composed
+        // and vector results keep their existing physical hydration path.
+        var pin: ?search.PinnedTextSource = null;
+        defer if (pin) |*value| value.deinit();
+        const one_text_source = (req.full_text != null and req.full_text_queries.len == 0) or (req.full_text == null and req.full_text_queries.len == 1);
+        if (one_text_source and req.dense_queries.len == 0 and req.sparse_queries.len == 0 and req.dense == null and req.sparse == null) {
+            const bound = for (hits) |hit| {
+                if (hit.native_text_doc_id == null) break false;
+            } else true;
+            if (bound) pin = try acquire(self, if (req.full_text_queries.len == 1) req.full_text_queries[0].index_name else req.primary_text_index_name orelse req.index_name);
+        }
+        try self.hydrateTypedFromSource(a, hits, keys, if (pin) |*value| value else null);
+    }
+    fn hydrateTypedFromSource(self: *Execution, a: A, hits: []types.SearchHit, keys: []const []const u8, pin: ?*const search.PinnedTextSource) !void {
+        const projection = @import("lake_index_source_projection.zig");
+        var fields = self.hydration_fields;
+        var stored_fields: []const []const u8 = &.{};
+        if (pin) |value| if (value.stored_projection_fields.len != 0) {
+            const wanted = fields orelse all: {
+                const all = try self.arena.alloc([]const u8, self.table.columns.len);
+                for (all, self.table.columns) |*path, column| path.* = column.path;
+                break :all all;
+            };
+            const plan = try projection.plan(self.arena, wanted, value.stored_projection_fields);
+            fields = plan.parquet;
+            stored_fields = plan.sidecar;
+        };
+        const values = if (stored_fields.len != 0 and fields.?.len == 0) empty: {
+            const rows = try a.alloc(?std.json.Value, hits.len);
+            @memset(rows, std.json.Value{ .object = .empty });
+            break :empty rows;
+        } else try loadSelected(std.json.Value, self, a, keys, fields);
         defer {
             for (values) |*value| if (value.*) |*owned| types.deinitJsonValue(a, owned);
             a.free(values);
         }
+        if (stored_fields.len != 0) for (hits, values) |hit, *value| {
+            try self.context.ensureActive();
+            const key = try nativeKey(self, a, hit.id);
+            defer a.free(key);
+            if (value.*) |*row| try projection.appendStored(a, pin.?.snapshot, hit.native_text_doc_id.?, key, stored_fields, row) else return error.StoredDocMissing;
+        };
         for (hits, values) |*hit, *value| {
             std.debug.assert(hit.stored_data == null and hit.source_value == null);
             hit.source_value = value.* orelse return error.StoredDocMissing;
@@ -431,6 +488,9 @@ const Execution = struct {
         return loadManySelected(raw, a, keys, null);
     }
     fn loadManySelected(raw: ?*anyopaque, a: A, keys: []const []const u8, selected_fields: ?[]const []const u8) ![]?[]u8 {
+        const self = from(raw);
+        const started = @import("antfly_platform").time.monotonicNs();
+        defer self.server.lake_query_metrics.record(.hydration, started);
         return loadSelected([]u8, raw, a, keys, selected_fields);
     }
     fn loadSelected(comptime T: type, raw: ?*anyopaque, a: A, keys: []const []const u8, selected_fields: ?[]const []const u8) ![]?T {
@@ -696,6 +756,34 @@ test "external lake hydration unions returned and highlight fields without unrel
     try std.testing.expectEqualSlices([]const u8, &.{ "label", "body" }, (try owner.planHydration(req)).?);
     req.filter_query_json = "{}";
     try std.testing.expect((try owner.planHydration(req)) == null);
+}
+
+test "external lake typed sidecar hydration skips Parquet and owns final source fields" {
+    const a = std.testing.allocator;
+    const key = "lake2:" ++ "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" ++ ":00000000:0000000000000000";
+    const bytes = (try local.storage_db_document_mapper.buildTextSegmentFromDocuments(a, &.{.{ .key = key, .value = "{\"body\":\"a needle in the source\",\"unused\":\"not requested\"}" }}, .{}, null)).?;
+    defer a.free(bytes);
+    var writer = try local.index.IndexWriter.init(a);
+    defer writer.deinit();
+    try writer.addSegmentWithId(1, bytes);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var owner: Execution = undefined;
+    owner.arena = arena.allocator();
+    owner.context = .{ .io = std.testing.io };
+    owner.hydration_fields = &.{"body"};
+    // No public/native row mapping or source reader exists. A successful
+    // result proves the covered body did not open a Parquet hydration cursor.
+    owner.files = .empty;
+    owner.private_files = .empty;
+    owner.private_digests = .empty;
+    const pin: search.PinnedTextSource = .{ .snapshot = writer.snapshot(), .name = "body", .text_analysis = .{}, .runtime_schema = null, .stored_projection_fields = &.{"body"} };
+    var hits = [_]types.SearchHit{.{ .id = try a.dupe(u8, key), .native_text_doc_id = 0 }};
+    defer hits[0].deinit(a);
+    try owner.hydrateTypedFromSource(a, &hits, &.{key}, &pin);
+    try std.testing.expectEqualStrings("a needle in the source", hits[0].source_value.?.object.get("body").?.string);
+    try std.testing.expect(hits[0].source_value.?.object.get("unused") == null);
+    try std.testing.expect(hits[0].stored_data == null);
 }
 
 test "external lake typed delivery defers only source-independent native retrieval" {

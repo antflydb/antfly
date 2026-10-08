@@ -317,6 +317,7 @@ const Entry = struct {
     seekable: bool = false,
     analysis: local.introducer.TextAnalysisConfig = .{},
     selected_field: ?[]const u8 = null,
+    stored_projection_fields: []const []const u8 = &.{},
     schema: ?local.storage_schema.TableSchema = null,
     name: []const u8 = "",
     allocator: A,
@@ -324,6 +325,11 @@ const Entry = struct {
     fn build(self: *Entry, io: std.Io, store: stores.ArtifactStore, root: corpus.Root, name: []const u8, schema_json: []const u8, cached: artifacts.CachedRead, cancellation: Cancellation, base: ?*Entry, peers: []const *Entry) !void {
         self.seekable = root.seekable;
         const a = self.arena.allocator();
+        if (root.stored_projection) {
+            const fields = try a.alloc([]const u8, root.binding.column_bindings.len);
+            for (fields, root.binding.column_bindings) |*field, path| field.* = try a.dupe(u8, path);
+            self.stored_projection_fields = fields;
+        }
         var schema = try local.schema_mod.parseValidatedTableSchema(a, schema_json);
         defer schema.deinit(a);
         self.schema = try local.schema_mod.deriveRuntimeTableSchema(a, schema);
@@ -442,11 +448,11 @@ const Entry = struct {
         }
     };
     fn source(self: *Entry, store: stores.ArtifactStore, cached: artifacts.CachedRead, context: Context, cancellation: Cancellation) !local.storage_db_query_search_exec.PinnedTextSource {
-        if (!self.seekable) return .{ .snapshot = self.writer.?.acquireSnapshot(), .name = self.name, .text_analysis = self.analysis, .runtime_schema = self.schema, .selected_field = self.selected_field, .owner = self, .release_owner = releaseSource };
+        if (!self.seekable) return .{ .snapshot = self.writer.?.acquireSnapshot(), .name = self.name, .text_analysis = self.analysis, .runtime_schema = self.schema, .selected_field = self.selected_field, .stored_projection_fields = self.stored_projection_fields, .owner = self, .release_owner = releaseSource };
         const lease = self.allocator.create(QueryLease) catch return error.NativeLakeTextCacheBusy;
         errdefer self.allocator.destroy(lease);
         lease.* = .{ .entry = self, .read = .{ .store = store, .cache = cached, .context = context, .cancellation = cancellation, .resource_manager = self.resource_manager } };
-        return .{ .snapshot = self.writer.?.acquireSnapshotWithReadContext(&lease.read) catch |err| return if (err == error.OutOfMemory) error.NativeLakeTextCacheBusy else err, .name = self.name, .text_analysis = self.analysis, .runtime_schema = self.schema, .selected_field = self.selected_field, .owner = lease, .release_owner = QueryLease.release };
+        return .{ .snapshot = self.writer.?.acquireSnapshotWithReadContext(&lease.read) catch |err| return if (err == error.OutOfMemory) error.NativeLakeTextCacheBusy else err, .name = self.name, .text_analysis = self.analysis, .runtime_schema = self.schema, .selected_field = self.selected_field, .stored_projection_fields = self.stored_projection_fields, .owner = lease, .release_owner = QueryLease.release };
     }
     fn releaseSource(raw: *anyopaque) void {
         const self: *Entry = @ptrCast(@alignCast(raw));

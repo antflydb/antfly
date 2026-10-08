@@ -3959,6 +3959,12 @@ pub const ApiHttpServer = struct {
     sql_plan_cache: sql_plan_cache.Cache,
     sql_schema_cache: sql_schema_cache.Cache,
     lake_read_cache: @import("antfly_local_sources").serverless_query_lake_serving_cache.Cache,
+    // A persistent worker must not consume the last request executor slot or
+    // inherit the single-threaded provider fallback. Allocate at a stable
+    // address on first use; drain the cache before releasing this lane.
+    lake_cache_io: ?*std.Io.Threaded = null,
+    lake_cache_start_mutex: std.Io.Mutex = .init,
+    lake_query_metrics: @import("lake_query_metrics.zig").Metrics = .{},
     lake_reader_leases: @import("lake_index_reader_lease.zig").Pool = .{},
     lake_native_runtimes: @import("lake_index_native_runtime_cache.zig").Cache = .{},
     lake_search_metadata: @import("lake_index_search_metadata.zig").Cache = .{},
@@ -3974,6 +3980,7 @@ pub const ApiHttpServer = struct {
         query_embedding_cache: query_embedding_cache.Stats = .{},
         lake_range_cache: @import("antfly_local_sources").serverless_query_lake_serving_cache.Cache.Stats = .{},
         lake_disk_cache: ?@import("antfly_local_sources").serverless_query_lake_parquet_rowgroup.PersistentObjectRangeCacheStats = null,
+        lake_query: @import("lake_query_metrics.zig").Stats = .{},
         incoming_graph_routes: distributed_graph.IncomingSourceGroupCache.Stats = .{},
         inference_cache_budget: cache_budget.CacheBudget.Stats = .{
             .max_bytes = 0,
@@ -4273,6 +4280,7 @@ pub const ApiHttpServer = struct {
             .query_embedding_cache = self.query_embedding_cache.stats(self.inferenceCacheBudget()),
             .lake_range_cache = self.lake_read_cache.snapshot(),
             .lake_disk_cache = self.lake_read_cache.persistentStats(),
+            .lake_query = self.lake_query_metrics.snapshot(),
             .incoming_graph_routes = self.incoming_graph_routes.stats(),
             .inference_cache_budget = self.inferenceCacheBudget().stats(),
         };
@@ -4711,6 +4719,10 @@ pub const ApiHttpServer = struct {
         self.lake_search_metadata.deinit();
         self.lake_reader_leases.deinit(self.embedding_provider_runtime.io);
         self.lake_read_cache.deinit();
+        if (self.lake_cache_io) |io_impl| {
+            io_impl.deinit();
+            self.owner_alloc.destroy(io_impl);
+        }
         self.embedding_provider_runtime.deinit();
         self.incoming_graph_routes.deinit();
         self.local_resource_manager.deinit(self.owner_alloc);
@@ -12863,6 +12875,34 @@ pub const ApiHttpServer = struct {
         self.lake_text_corpora.attachResourceManager(self.shared_resource_manager orelse &self.local_resource_manager);
         const config = if (self.cfg.node_config) |node| node.lake_cache else common_config.Config.LakeCacheConfig{};
         if (!(self.cfg.lake_cache_enabled orelse config.enabled)) return;
+        const configured_root = self.cfg.lake_cache_root orelse config.root;
+        const root = configured_root orelse path: {
+            const node = self.cfg.node_config orelse {
+                self.lake_read_cache.recordDiskUnavailable(error.NoLocalCacheDirectory);
+                return;
+            };
+            const base = node.storage.local_base_dir orelse
+                (if (node.storage.lite_path) |file| std.fs.path.dirname(file) orelse "." else {
+                    self.lake_read_cache.recordDiskUnavailable(error.NoLocalCacheDirectory);
+                    return;
+                });
+            break :path std.fs.path.join(self.alloc, &.{ base, "cache", "lake-ranges" }) catch |err| {
+                self.lake_read_cache.recordDiskUnavailable(err);
+                return;
+            };
+        };
+        defer if (configured_root == null) self.alloc.free(root);
+        try self.lake_cache_start_mutex.lock(self.embedding_provider_runtime.io);
+        defer self.lake_cache_start_mutex.unlock(self.embedding_provider_runtime.io);
+        if (self.lake_cache_io == null) {
+            const io_impl = self.owner_alloc.create(std.Io.Threaded) catch |err| {
+                self.lake_read_cache.recordDiskUnavailable(err);
+                return;
+            };
+            io_impl.* = std.Io.Threaded.init(self.owner_alloc, .{ .async_limit = .nothing, .concurrent_limit = .limited(1) });
+            self.lake_cache_io = io_impl;
+        }
+        const cache_io = self.lake_cache_io.?.io();
         const policy = self.cfg.lake_cache_policy orelse @import("antfly_local_sources").serverless_query_lake_parquet_rowgroup.PersistentObjectRangeCachePolicy{
             .max_total_bytes = config.max_disk_bytes,
             .max_entries = config.max_entries,
@@ -12870,17 +12910,7 @@ pub const ApiHttpServer = struct {
             .max_write_queue_entries = config.max_write_queue_entries,
             .protected_bytes = config.protected_bytes,
         };
-        if (self.cfg.lake_cache_root orelse config.root) |root| {
-            try self.lake_read_cache.ensurePersistent(self.embedding_provider_runtime.io, root, policy, .{ .resource_manager = self.cfg.resource_manager });
-        } else {
-            const node = self.cfg.node_config orelse return;
-            const base = node.storage.local_base_dir orelse
-                (if (node.storage.lite_path) |path| std.fs.path.dirname(path) orelse "." else return);
-            const path = try std.fs.path.join(self.alloc, &.{ base, "cache", "lake-ranges" });
-            defer self.alloc.free(path);
-            try self.lake_read_cache.ensurePersistent(self.embedding_provider_runtime.io, path, policy, .{ .resource_manager = self.cfg.resource_manager });
-            return;
-        }
+        try self.lake_read_cache.ensurePersistent(cache_io, root, policy, .{ .resource_manager = self.shared_resource_manager orelse &self.local_resource_manager });
     }
 
     pub fn catalogStorageNameAlloc(self: *ApiHttpServer, alloc: std.mem.Allocator) ![]u8 {

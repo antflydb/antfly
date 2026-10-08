@@ -27,13 +27,16 @@ const Declared = local.serverless_segment_sidecar_manifest.DeclaredArtifact;
 const Ref = local.serverless_manifest_artifact_ref.ArtifactRef;
 const Cancellation = @import("antfly_cancellation").CancellationToken;
 const A = std.mem.Allocator;
-pub const metadata_version: u16 = 5;
+pub const metadata_version: u16 = 6;
 pub const max_root_bytes = 4 * 1024 * 1024;
 pub const max_segments = 8192;
 pub const FileGroup = struct { file: state.File, segments: []const artifacts.ChunkRef };
 pub const Root = struct {
     version: u16 = metadata_version,
     seekable: bool = false,
+    /// Stored JSON contains exactly the binding projection, never an implicit
+    /// full source document. Older publications require a format refresh.
+    stored_projection: bool = false,
     domain: [32]u8,
     binding: local.serverless_segment_source_binding.Binding,
     config_json: []const u8,
@@ -257,7 +260,9 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
                     }
                     const id = try plan.privateKey(ba, ref);
                     input_bytes +|= id.len + 128;
-                    try builder.appendSourceDoc(.{ .key = id, .root = root, .stored_data = "", .typed_source = null });
+                    const stored = try std.json.Stringify.valueAlloc(ba, root, .{});
+                    input_bytes +|= stored.len;
+                    try builder.appendSourceDoc(.{ .key = id, .root = root, .stored_data = stored, .typed_source = root });
                     if (builder.batch().docs.len >= 1024 or input_bytes >= 2 * 1024 * 1024) {
                         try flush(a, ca, store, builder.batch(), analysis, &segments, &output_bytes, cancellation);
                         _ = batch_arena.reset(.retain_capacity);
@@ -272,7 +277,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             builder = mapper.TextProjectionBatchBuilder.initWithSelectedField(batch_arena.allocator(), analysis, runtime, null, selected_field);
             input_bytes = 0;
         }
-        const root: Root = .{ .seekable = true, .domain = store.upload_scope.?.domain, .binding = binding, .config_json = spec.config_json, .segments = segments.items, .recipe = recipe, .file_groups = groups };
+        const root: Root = .{ .seekable = true, .stored_projection = true, .domain = store.upload_scope.?.domain, .binding = binding, .config_json = spec.config_json, .segments = segments.items, .recipe = recipe, .file_groups = groups };
         try root.validate();
         const bytes = try std.json.Stringify.valueAlloc(ca, root, .{});
         if (bytes.len > max_root_bytes) return error.NativeLakeTextCorpusTooLarge;
@@ -286,7 +291,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
 }
 fn flush(a: A, out: A, store: *stores.ArtifactStore, batch: mapper.TextProjectionBatch, analysis: local.introducer.TextAnalysisConfig, segments: *std.ArrayList(artifacts.ChunkRef), output_bytes: *usize, cancellation: Cancellation) !void {
     try cancellation.check();
-    const encoded = try mapper.buildTextSegmentsFromProjectionBatch(a, batch, analysis, .{ .target_segment_bytes = 8 * 1024 * 1024, .target_build_memory_bytes = 32 * 1024 * 1024, .store_document_source = false });
+    const encoded = try mapper.buildTextSegmentsFromProjectionBatch(a, batch, analysis, .{ .target_segment_bytes = 8 * 1024 * 1024, .target_build_memory_bytes = 32 * 1024 * 1024, .store_document_source = true });
     defer mapper.freeTextSegments(a, encoded);
     for (encoded) |bytes| {
         try cancellation.check();

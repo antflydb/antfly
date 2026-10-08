@@ -525,6 +525,53 @@ unselected files, row groups and pages and preserve Iceberg delete filtering.
 Authenticated page/block reads share the scoped persistent lake cache, whose
 contents never replace current source or authorization proof.
 
+Cold lake serving uses a server-owned, single-worker `std.Io` persistence lane,
+independent of request/provider executor capacity. Shutdown drains accepted
+writes before releasing its executor and resource manager. Keep the configured
+`lake_cache.root` on persistent local storage with a single process owner to
+reuse authenticated ranges across restarts. Cache availability is optional:
+missing local paths, ownership contention, startup failures and resource pressure
+must not become source authority or query readiness failures.
+
+The data-server metrics expose `antfly_lake_cache_disk_ready`, initialization
+failure reasons, disk/mapping hits, provider reads/bytes, asynchronous write
+errors, queue depth and policy/queue/memory/capacity/allocation/closing drops.
+Source capture, publication loading, index acquisition, ranking, hydration,
+highlighting and total query timings are reported separately. Phase times can
+overlap (for example index acquisition inside ranking/highlighting); do not sum
+them as exclusive elapsed time. Public lake `took_ms` includes cold setup rather
+than starting only after publication/index preparation. Provider cache counters
+describe payload reads, not all GCS HTTP attempts, metadata requests or retries.
+
+Seekable text readers coalesce a fully requested, authenticated 1 MiB pack into
+one GET instead of four 256 KiB GETs without increasing transferred bytes.
+Partial cold reads retain 256 KiB units; a cached pack can satisfy those units
+without a provider read, including after restart. Prefetch admits at most four
+units/packs concurrently (at most 4 MiB of source bytes), charges scheduler
+memory, shares singleflight keys with required reads and joins cancellation.
+Both pack and constituent-unit digests remain enforced.
+
+Native text artifact format 6 stores the indexed binding projection in compressed
+stored-document blocks. Single-text-source typed result pages use that coverage
+proof and native row identity to hydrate covered fields directly from the text
+snapshot. Uncovered display/source fields still use the shared delete-aware
+Parquet cursor. Mixed/composed sources without one proven text identity retain
+physical hydration. This adds build/storage work proportional to the indexed
+source projection, not the whole source document. Existing text publications
+need a format refresh; reconciliation checks artifact format even when schema
+and source signatures have not changed. Retained older roots remain understood
+by garbage collection until their reader leases and retirement obligations end.
+
+Local regression evidence: a complete 1 MiB pack needs one provider request,
+an isolated cold read transfers 256 KiB, a persisted pack supplies a sparse
+post-restart read with zero provider requests/bytes, and fully covered typed
+hydration opens no Parquet cursor. These are deterministic local fixtures, not
+live GCS latency measurements. To verify a deployment, run the same highlighted
+query cold, wait for queue depth to reach zero (and check write errors/drops),
+restart against the same cache root, then compare results, elapsed time, cache
+metrics and actual GCS request/byte telemetry. Authorization and mutable source
+metadata can still require remote validation on a warm cache.
+
 Reader authority lives in native metadata independently of definition CAS.
 One renewable publication lease per process/session amortizes concurrent reads,
 protects an old generation across replacement and DROP, and fences every cache

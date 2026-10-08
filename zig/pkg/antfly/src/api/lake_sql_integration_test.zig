@@ -21,6 +21,71 @@ const operation = @import("antfly_local_sources").api_operation;
 const reads = @import("antfly_local_sources").api_table_read_source;
 const read_view = @import("antfly_local_sources").storage_relational_read_view.View;
 
+test "external lake persistence owns its executor and reuses immutable bytes after restart" {
+    const a = std.testing.allocator;
+    var directory = try @import("antfly_local_sources").common_test_directory.TestDirectory.init("lake-cache-restart");
+    defer directory.cleanup();
+    // No request concurrency is available. Cache startup must not depend on
+    // this lane, nor retain it in its write worker.
+    var request_io = std.Io.Threaded.init(a, .{ .concurrent_limit = .nothing });
+    defer request_io.deinit();
+    const cfg: server_mod.ApiHttpServerConfig = .{
+        .lake_cache_enabled = true,
+        .lake_cache_root = directory.path(),
+        .imported_runtime_io = .{ .api = request_io.io() },
+    };
+    const Provider = struct {
+        calls: usize = 0,
+        fn load(raw: *anyopaque, alloc: std.mem.Allocator) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return alloc.dupe(u8, "authenticated search sidecar");
+        }
+    };
+    var provider: Provider = .{};
+    var token: u8 = 0;
+    const status: server_mod.StatusSource = .{ .ptr = &token, .vtable = &.{ .status = undefined } };
+    const bytes = "authenticated search sidecar";
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    const loader: @import("antfly_local_sources").serverless_query_lake_serving_cache.Cache.ImmutableLoader = .{ .ptr = &provider, .load = Provider.load };
+    {
+        var server = server_mod.ApiHttpServer.init(a, cfg, status, null, null);
+        defer server.deinit();
+        {
+            var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+            server.owner_alloc = failing.allocator();
+            defer server.owner_alloc = a;
+            try server.prepareLakeCache();
+            try std.testing.expect(server.lake_cache_io == null);
+            try std.testing.expectEqualStrings("OutOfMemory", server.requestStats().lake_range_cache.disk_unavailable.?);
+        }
+        try server.prepareLakeCache();
+        try server.prepareLakeCache();
+        try std.testing.expect(server.lake_read_cache.persistent != null);
+        try std.testing.expectEqual(std.Io.Limit.limited(1), server.lake_cache_io.?.concurrent_limit);
+        var lease = try server.lake_read_cache.readImmutableBlockLease(a, @splat(9), "sidecar", bytes.len, digest, .{ .io = request_io.io() }, loader);
+        defer lease.deinit();
+        try std.testing.expectEqualStrings(bytes, lease.bytes());
+        try std.testing.expectEqual(@as(usize, 1), provider.calls);
+        // No explicit flush: server shutdown must drain accepted writes.
+    }
+    {
+        var server = server_mod.ApiHttpServer.init(a, cfg, status, null, null);
+        defer server.deinit();
+        try server.prepareLakeCache();
+        var lease = try server.lake_read_cache.readImmutableBlockLease(a, @splat(9), "sidecar", bytes.len, digest, .{ .io = request_io.io() }, loader);
+        defer lease.deinit();
+        try std.testing.expectEqualStrings(bytes, lease.bytes());
+        try std.testing.expectEqual(@as(usize, 1), provider.calls);
+        const stats = server.requestStats();
+        try std.testing.expectEqual(@as(u64, 0), stats.lake_range_cache.provider_reads);
+        try std.testing.expectEqual(@as(u64, 0), stats.lake_range_cache.provider_bytes);
+        try std.testing.expectEqual(@as(u64, 1), stats.lake_range_cache.disk_hits);
+        try std.testing.expect(stats.lake_range_cache.disk_unavailable == null);
+    }
+}
+
 const Fixture = struct {
     lake_schema: []const u8,
     native_opened: usize = 0,

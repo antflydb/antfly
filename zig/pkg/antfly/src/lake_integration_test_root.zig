@@ -21,6 +21,7 @@ test {
     _ = @import("api/table_contract.zig");
     _ = @import("serverless/build/lake_sidecar_text.zig");
     _ = @import("api/lake_sql_cursor.zig");
+    _ = @import("api/lake_sql_integration_test.zig");
     _ = @import("api/lake_index_row_source.zig");
     _ = @import("api/lake_index_publication.zig");
     _ = @import("api/lake_index_store.zig");

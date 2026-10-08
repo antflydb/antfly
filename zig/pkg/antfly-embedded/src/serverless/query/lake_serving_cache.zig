@@ -74,14 +74,21 @@ pub const Cache = struct {
             if (err == error.Canceled) return err;
             // Local cache availability is never source/readiness authority.
             // Report the reason once and continue serving through RAM/source.
-            while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
-            self.stats.disk_unavailable = @errorName(err);
-            self.mutex.unlock();
+            self.recordDiskUnavailable(err);
             self.persistent_attempted = true;
             return;
         };
         self.persistent_attempted = true;
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        self.stats.disk_unavailable = null;
+        self.mutex.unlock();
         self.persistent_ready.store(true, .release);
+    }
+
+    pub fn recordDiskUnavailable(self: *Cache, err: anyerror) void {
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.mutex.unlock();
+        self.stats.disk_unavailable = @errorName(err);
     }
 
     pub fn persistentStats(self: *Cache) ?parquet.PersistentObjectRangeCacheStats {
@@ -250,6 +257,29 @@ pub const Cache = struct {
     /// or copy occurs on a hit; pinned entries remain charged and unevictable.
     /// Large contiguous segment callers retain readImmutableLease's disk-first
     /// policy so they can discard clean mapped pages under memory pressure.
+    /// Lookup only: never fetch the provider. A persisted broad pack can serve
+    /// sparse reads after restart through one verified, bounded disk mapping.
+    pub fn pinImmutableBlock(self: *Cache, a: Allocator, scope: [32]u8, identity: []const u8, length: usize, digest: [32]u8, context: Context) !?ImmutableLease {
+        try context.ensureActive();
+        const key = try immutableKey(a, scope, identity, length, digest);
+        defer a.free(key);
+        if (self.pin(key)) |pinned| {
+            errdefer pinned.release();
+            try context.ensureActive();
+            return .{ .shared = pinned };
+        }
+        if (self.pinMapping(key)) |mapping| {
+            errdefer mapping.release();
+            try context.ensureActive();
+            return .{ .mapping = mapping };
+        }
+        if (self.persistent) |*disk| if (try disk.readMapped(a, key, length, digest, context)) |mapped| {
+            self.recordRead(true, mapped.bytes.len);
+            return self.admitMapping(key, mapped);
+        };
+        return null;
+    }
+
     pub fn readImmutableBlockLease(self: *Cache, a: Allocator, scope: [32]u8, identity: []const u8, length: usize, digest: [32]u8, context: Context, loader: ImmutableLoader) !ImmutableLease {
         try context.ensureActive();
         const key = try immutableKey(a, scope, identity, length, digest);
