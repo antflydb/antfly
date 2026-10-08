@@ -517,17 +517,19 @@ pub const RoaringBitmap = struct {
     /// Cumulative cardinality: `cumulative_cards[i]` is the sum of
     /// cardinalities of `containers[0..i]` (so the value at the last index is
     /// the cardinality of all-but-last container). Precomputed by
-    /// `ensureRankCache` so `rank()` can find a target's container in
+    /// `prepareRead` so `rank()` can find a target's container in
     /// O(log K) and avoid recomputing per-container popcounts on every call.
     /// Invalidated by mutations (`add`, `remove`, etc.) and freed in
     /// `deinit`. `null` while the cache is unbuilt or stale.
     cumulative_cards: ?[]usize = null,
+    read_rank: ?*FrozenRankIndex = null,
 
     pub fn init(alloc: Allocator) RoaringBitmap {
         return .{ .alloc = alloc, .keys = .empty, .containers = .empty };
     }
 
     pub fn deinit(self: *RoaringBitmap) void {
+        self.clearReadRank();
         for (self.containers.items) |*c| c.deinit(self.alloc);
         self.keys.deinit(self.alloc);
         self.containers.deinit(self.alloc);
@@ -535,13 +537,15 @@ pub const RoaringBitmap = struct {
         self.* = undefined;
     }
 
-    /// Build the cumulative cardinality cache. Idempotent — does nothing if
-    /// already built. `fromBytes` builds it eagerly using the cardinalities
-    /// already in the wire format; this lazy variant exists for tests and
-    /// for future callers that want the rank fast path on a hand-built
-    /// bitmap. Mutations (add/remove) invalidate the cache so it has to be
-    /// re-built afterward.
-    fn ensureRankCache(self: *RoaringBitmap) !void {
+    /// Prepare immutable-read navigation, including per-word rank prefixes.
+    /// Idempotent; mutations invalidate both word and container metadata.
+    pub fn prepareRead(self: *RoaringBitmap) !void {
+        if (self.read_rank == null) {
+            const index = try self.alloc.create(FrozenRankIndex);
+            errdefer self.alloc.destroy(index);
+            index.* = try FrozenRankIndex.init(self.alloc, self.*);
+            self.read_rank = index;
+        }
         if (self.cumulative_cards != null) return;
         const cards = try self.alloc.alloc(usize, self.containers.items.len);
         var sum: usize = 0;
@@ -552,33 +556,42 @@ pub const RoaringBitmap = struct {
         self.cumulative_cards = cards;
     }
 
+    fn clearReadRank(self: *RoaringBitmap) void {
+        if (self.read_rank) |index| {
+            index.deinit();
+            self.alloc.destroy(index);
+            self.read_rank = null;
+        }
+    }
     fn invalidateRankCache(self: *RoaringBitmap) void {
+        self.clearReadRank();
         if (self.cumulative_cards) |c| {
             self.alloc.free(c);
             self.cumulative_cards = null;
         }
     }
 
-    fn findChunk(self: *const RoaringBitmap, key: u16) ?usize {
-        for (self.keys.items, 0..) |k, i| {
-            if (k == key) return i;
-            if (k > key) return null;
+    fn lowerChunk(self: *const RoaringBitmap, key: u16) usize {
+        var lo: usize = 0;
+        var hi = self.keys.items.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (self.keys.items[mid] < key) lo = mid + 1 else hi = mid;
         }
-        return null;
+        return lo;
     }
-
+    fn findChunk(self: *const RoaringBitmap, key: u16) ?usize {
+        const index = self.lowerChunk(key);
+        return if (index < self.keys.items.len and self.keys.items[index] == key) index else null;
+    }
     fn getOrCreateChunk(self: *RoaringBitmap, key: u16) !*Container {
-        var idx: usize = self.keys.items.len;
-        for (self.keys.items, 0..) |k, i| {
-            if (k == key) return &self.containers.items[i];
-            if (k > key) {
-                idx = i;
-                break;
-            }
-        }
-        try self.keys.insert(self.alloc, idx, key);
-        try self.containers.insert(self.alloc, idx, Container{ .array = .empty });
-        return &self.containers.items[idx];
+        const index = self.lowerChunk(key);
+        if (index < self.keys.items.len and self.keys.items[index] == key) return &self.containers.items[index];
+        try self.keys.ensureUnusedCapacity(self.alloc, 1);
+        try self.containers.ensureUnusedCapacity(self.alloc, 1);
+        self.keys.insertAssumeCapacity(index, key);
+        self.containers.insertAssumeCapacity(index, .{ .array = .empty });
+        return &self.containers.items[index];
     }
 
     pub fn add(self: *RoaringBitmap, val: u32) !void {
@@ -681,6 +694,7 @@ pub const RoaringBitmap = struct {
     }
 
     pub fn cardinality(self: *const RoaringBitmap) usize {
+        if (self.read_rank) |index| return index.count;
         var total: usize = 0;
         for (self.containers.items) |*c| total += c.cardinality();
         return total;
@@ -697,6 +711,7 @@ pub const RoaringBitmap = struct {
     /// absent (build-time bitmaps mid-construction), falls back to a linear
     /// per-container walk that re-popcounts on demand.
     pub fn rank(self: *const RoaringBitmap, value: u32) usize {
+        if (self.read_rank) |index| return index.rank(value);
         const target_high: u16 = @intCast(value >> 16);
         const target_low: u16 = @truncate(value);
 
@@ -895,7 +910,7 @@ pub const RoaringBitmap = struct {
         // Build the cumulative cardinality cache while we're already walking
         // every container. The wire format carries per-container cardinality
         // up front, so this is zero extra IO and saves the lazy popcount-walk
-        // that `ensureRankCache` would otherwise do on first `rank()` call.
+        // that `prepareRead` would otherwise do on first `rank()` call.
         const cumulative = try alloc.alloc(usize, n);
         errdefer alloc.free(cumulative);
         var running: usize = 0;
@@ -1852,7 +1867,7 @@ test "rank cache is invalidated on mutation" {
     defer bm.deinit();
     try bm.add(10);
     try bm.add(20);
-    try bm.ensureRankCache();
+    try bm.prepareRead();
     try std.testing.expect(bm.cumulative_cards != null);
 
     // Any mutation drops the cache; the next rank() falls back to the slow
@@ -2059,4 +2074,26 @@ test "range slice owns partial containers on every allocation failure" {
         }
     };
     try std.testing.checkAllAllocationFailures(a, Probe.run, .{&source});
+}
+
+test "external lake prepared bitmap navigation invalidates on mutations and survives OOM" {
+    const a = std.testing.allocator;
+    const Probe = struct {
+        fn run(allocator: Allocator) !void {
+            var bitmap = RoaringBitmap.init(allocator);
+            defer bitmap.deinit();
+            try bitmap.addRange(100, 150000);
+            try bitmap.prepareRead();
+            try std.testing.expectEqual(@as(usize, 149900), bitmap.rangeCardinality(0, 150000));
+            try bitmap.add(200000);
+            try std.testing.expect(bitmap.read_rank == null);
+            try bitmap.prepareRead();
+            try std.testing.expectEqual(@as(usize, 149901), bitmap.cardinality());
+            try bitmap.remove(101);
+            try std.testing.expect(bitmap.read_rank == null);
+            try std.testing.expectEqual(@as(usize, 1), bitmap.rangeCardinality(100, 102));
+        }
+    };
+    try Probe.run(a);
+    try std.testing.checkAllAllocationFailures(a, Probe.run, .{});
 }

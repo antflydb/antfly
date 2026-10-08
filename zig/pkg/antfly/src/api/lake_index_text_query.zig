@@ -463,9 +463,11 @@ const Execution = struct {
             self.plan_arena.deinit();
             self.a.destroy(self);
         }
-        fn next(raw: *anyopaque) !?u32 {
+        fn next(raw: *anyopaque, physical_budget: usize) !?u32 {
             const self: *Ordered = @ptrCast(@alignCast(raw));
+            const start = self.scanned;
             while (true) {
+                if (self.scanned - start >= physical_budget) return error.OrderedCandidateBudgetExceeded;
                 try self.execution.context.ensureActive();
                 if (self.position == self.page.len) {
                     _ = self.window.reset(.retain_capacity);

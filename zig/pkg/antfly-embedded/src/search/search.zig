@@ -269,8 +269,8 @@ pub const NumericRangeQuery = struct {
 
 pub const DateRangeQuery = struct {
     field: []const u8,
-    start_ns: ?u64 = null,
-    end_ns: ?u64 = null,
+    start_ns: ?i128 = null,
+    end_ns: ?i128 = null,
     inclusive_start: bool = true,
     inclusive_end: bool = false,
     boost: f32 = 1.0,

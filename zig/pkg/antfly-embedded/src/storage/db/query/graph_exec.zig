@@ -3225,6 +3225,16 @@ pub const CompiledPatternFilter = union(enum) {
         geo_bbox: std.json.Value,
         geo_shape: std.json.Value,
 
+        /// Admit only the exact canonical integer term representation. Integer
+        /// and floating JSON terms have distinct kinds in the shared matcher.
+        pub fn integerTerm(self: FieldPredicate) !?i64 {
+            if (self != .term or self.term.kind != pathfact_mod.kindFromJsonValue(.{ .integer = 0 })) return null;
+            const value = std.fmt.parseInt(i64, self.term.value, 10) catch return null;
+            var bytes: [32]u8 = undefined;
+            const canonical = try std.fmt.bufPrint(&bytes, "{d}", .{value});
+            return if (std.mem.eql(u8, canonical, self.term.value)) value else null;
+        }
+
         /// Canonical bounds shared by index planners and the row evaluator.
         pub fn standardBounds(self: FieldPredicate) !?struct { lower: ?PatternJsonRangeBound, upper: ?PatternJsonRangeBound } {
             if (self != .standard_range) return null;
@@ -4617,11 +4627,11 @@ fn jsonPatternBoolOrDefault(value: ?std.json.Value, default_value: bool) !bool {
 fn jsonValuesContainDateRange(values: []const std.json.Value, range_query: std.json.Value) !bool {
     if (range_query != .object) return error.InvalidArgument;
     const start_ns = if (range_query.object.get("start_ns")) |value|
-        try jsonU64FromValue(value)
+        try jsonDateNsFromValue(value)
     else
         null;
     const end_ns = if (range_query.object.get("end_ns")) |value|
-        try jsonU64FromValue(value)
+        try jsonDateNsFromValue(value)
     else
         null;
     if (start_ns == null and end_ns == null) return error.InvalidArgument;
@@ -4868,11 +4878,11 @@ pub fn jsonTemporalNsFromValue(value: std.json.Value) ?i128 {
     return @import("../../../datetime.zig").rangeNanoseconds(value);
 }
 
-pub fn jsonDateNsFromValue(value: std.json.Value) !u64 {
+pub fn jsonDateNsFromValue(value: std.json.Value) !i128 {
     return switch (value) {
-        .string => |text| (try parsePatternRfc3339ToNs(text)) orelse error.InvalidArgument,
-        .integer, .float, .number_string => try jsonU64FromValue(value),
-        else => error.InvalidArgument,
+        .float => try jsonU64FromValue(value), // retain legacy integral-float admission
+        .string => |text| @import("../../../datetime.zig").parseDateTimeToSignedNs(text) orelse error.InvalidArgument,
+        else => jsonTemporalNsFromValue(value) orelse error.InvalidArgument,
     };
 }
 

@@ -1160,13 +1160,24 @@ compatibility. Producer recipe v3 fences older projections during rebuilds.
 Search-before walks the immutable ordered tree backward from its upper bound,
 retaining boundary ties for public-ID comparison and the existing probe guards.
 
-Native sparse scoring admits at most 65,536 partial document scores before
-spilling to byte-bounded sorted runs. Sorting contributions by native ordinal and
-original sequence preserves exact f32 accumulation with signed weights. Reduction
-feeds bounded top-k for complete checkpoints. Spill merges observe cancellation;
-capacity reservations and the 1 GiB input budget bound temporary storage. Hosts
-without spill I/O reject overflow admission. This does not introduce WAND or
-change sparse posting payloads.
+Complete sparse checkpoints score encoded postings document at a time with one
+score accumulator, at most 4096 stream cursors, 64 MiB of retained encoded
+postings, and k winners. Contributions retain source/term/chunk addition order.
+Conservative block score bounds include absent terms and both signed endpoints;
+pruning uses strict inequality to retain ties. Prepared bitmap ranks reject
+disjoint ordinal blocks using authenticated trailers without decoding posting
+arrays. Legacy checkpoints, unresolved key predicates, and queries exceeding
+either stream or posting-byte admission retain the bounded spill path: at most
+65,536 partial scores, ordinal/sequence sorting, cancellation, native capacity
+reservations, and a 1 GiB spill input budget. Hosts without spill I/O reject
+overflow admission. Posting payloads remain compatible.
+
+Native date-range parsing, lowering, and serialization now share signed i128
+bounds with datetime doc values, including pre-epoch nanoseconds. Ordered provider
+pulls enforce the remaining physical-row budget internally, so rows absent from
+the text corpus cannot bypass fallback. Residual dictionary kernels memoize only
+reached entries and retain shared leaf semantics; canonical integer term equality
+uses an eight-lane comparison with selection, null, and active masks.
 
 Parquet statistics and standard page directories prune both Parquet and Iceberg
 scans. Standard split-block Bloom filters additionally prune equality misses by

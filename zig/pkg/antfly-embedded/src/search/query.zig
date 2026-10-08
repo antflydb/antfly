@@ -1569,8 +1569,8 @@ fn collectFuzzyCandidateTerms(
 /// Start/end are unix nanoseconds (caller parses ISO8601 before constructing).
 pub const DateRangeFilter = struct {
     field: []const u8,
-    start_ns: ?u64 = null,
-    end_ns: ?u64 = null,
+    start_ns: ?i128 = null,
+    end_ns: ?i128 = null,
     inclusive_start: bool = true,
     inclusive_end: bool = false,
     boost: f32 = 1.0,

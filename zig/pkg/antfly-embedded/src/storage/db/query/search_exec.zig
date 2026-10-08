@@ -142,7 +142,7 @@ pub const IndexedTextPredicate = struct {
 pub const OrderedTextCandidates = struct {
     ptr: *anyopaque,
     scanned_count: ?*const fn (*anyopaque) u64 = null,
-    next: *const fn (*anyopaque) anyerror!?u32,
+    next: *const fn (*anyopaque, usize) anyerror!?u32,
     close: *const fn (*anyopaque) void,
 };
 
@@ -10465,11 +10465,11 @@ fn parseDateRangeQuery(value: std.json.Value) !search_mod.DateRangeQuery {
     if (value != .object) return error.InvalidArgument;
     const field = try requiredFieldOrPath(value.object);
     const start_ns = if (value.object.get("start_ns") != null)
-        try jsonOptionalU64(value.object.get("start_ns"))
+        try jsonOptionalDateOrNs(value.object.get("start_ns").?)
     else
         try jsonOptionalDateTimeNs(value.object.get("start"));
     const end_ns = if (value.object.get("end_ns") != null)
-        try jsonOptionalU64(value.object.get("end_ns"))
+        try jsonOptionalDateOrNs(value.object.get("end_ns").?)
     else
         try jsonOptionalDateTimeNs(value.object.get("end"));
     if (start_ns == null and end_ns == null) return error.InvalidArgument;
@@ -10649,25 +10649,15 @@ fn jsonOptionalU64(value: ?std.json.Value) !?u64 {
     };
 }
 
-fn jsonOptionalDateOrNs(value: std.json.Value) !?u64 {
+fn jsonOptionalDateOrNs(value: std.json.Value) !?i128 {
     return switch (value) {
-        .integer => |number| if (number >= 0) @intCast(number) else error.InvalidArgument,
-        .number_string => |text| std.fmt.parseInt(u64, text, 10) catch {
-            return runtime_schema_mod.parseDateTimeToNs(text) orelse error.InvalidArgument;
-        },
-        .string => |text| runtime_schema_mod.parseDateTimeToNs(text) orelse std.fmt.parseInt(u64, text, 10) catch return error.InvalidArgument,
         .null => null,
-        else => error.InvalidArgument,
+        .string => |text| @import("../../../datetime.zig").parseDateTimeToSignedNs(text) orelse std.fmt.parseInt(i128, text, 10) catch return error.InvalidArgument,
+        else => @import("../../../datetime.zig").rangeNanoseconds(value) orelse return error.InvalidArgument,
     };
 }
-
-fn jsonOptionalDateTimeNs(value: ?std.json.Value) !?u64 {
-    const actual = value orelse return null;
-    return switch (actual) {
-        .string => |text| runtime_schema_mod.parseDateTimeToNs(text) orelse error.InvalidArgument,
-        .null => null,
-        else => error.InvalidArgument,
-    };
+fn jsonOptionalDateTimeNs(value: ?std.json.Value) !?i128 {
+    return jsonOptionalDateOrNs(value orelse .null);
 }
 
 fn jsonU8(value: std.json.Value) ?u8 {
@@ -11370,9 +11360,15 @@ fn sortAndPageTextDocValueCandidatesAlloc(
         };
         const i = position;
         const doc_num = if (ordered) |stream|
-            try stream.next(stream.ptr) orelse break
+            (stream.next(stream.ptr, ordered_scan_budget - ordered_probes) catch |err| switch (err) {
+                error.OrderedCandidateBudgetExceeded => {
+                    ordered_probes = ordered_scan_budget;
+                    continue;
+                },
+                else => return err,
+            }) orelse break
         else if (iterator) |*it| it.next() orelse break else if (position < doc_nums.len) doc_nums[position] else break;
-        if (ordered != null) ordered_probes += 1;
+        if (ordered) |stream| ordered_probes = if (stream.scanned_count) |count| @intCast(count(stream.ptr)) else ordered_probes + 1;
         if (ordered) |stream| if (collect_sort_profile) {
             profile.ordered_scanned_count = if (stream.scanned_count) |count| count(stream.ptr) else profile.ordered_scanned_count + 1;
         };

@@ -2724,6 +2724,13 @@ def test_native_remote_indexed_metadata_predicates_above_id_list_limit(tmp_path)
             search_before=following_dates["hits"]["hits"][0]["_sort"], remote_snapshot=dates["remote_snapshot"])
         assert [h["_source"]["amount"] for h in prior_dates["hits"]["hits"]] == [0, 1], prior_dates
         assert prior_dates["profile"]["sort"]["ordered_scanned_count"] <= 4, prior_dates
+        native_dates = call("POST", "/tables/indexed_predicates/query", {
+            "full_text_search": {"field": "event_time",
+                "start": "1969-12-31T23:59:59.999999999Z",
+                "end": "1970-01-01T00:00:00.000000001Z"},
+            "fields": ["amount"], "limit": 10,
+        })
+        assert {h["_source"]["amount"] for h in native_dates["hits"]["hits"]} == {0, 1}, native_dates
         signed_temporal = {"range": {"event_time": {
             "gte": "1970-01-01T00:00:00Z",
             "lt": "1970-01-01T01:00:00.000000002+01:00",
@@ -2863,6 +2870,60 @@ def test_parquet_embedded_bloom_skips_unreadable_data_pages(tmp_path):
         except requests.exceptions.ConnectionError:
             # A decode error after streaming headers closes the response.
             assert server.proc.poll() is None, server.debug_logs()
+        failed = False
+    finally:
+        server.stop(test_failed=failed)
+
+
+def test_remote_ordered_scan_budget_counts_rows_without_text_ordinals(tmp_path):
+    """Rows omitted from the text corpus still consume the physical probe budget."""
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
+    root = tmp_path / "ordered-physical-budget"
+    objects = root / "buckets" / "antfly" / "objects"
+    objects.mkdir(parents=True)
+    input_file = tmp_path / "budget.parquet"
+    pq.write_table(pa.table({
+        "body": pa.array([None] * 2048 + ["common"] * 100, type=pa.string()),
+        "amount": pa.array([None] * 2048 + list(range(100)), type=pa.int64()),
+    }), input_file, row_group_size=256)
+    payload = input_file.read_bytes()
+    (objects / "part.parquet").write_bytes(b"AFOBJ001" + struct.pack("<QI", len(payload), 0)
+        + hashlib.sha256(payload).hexdigest().encode() + payload)
+    server = StandaloneAntflyServer(binary, "127.0.0.1", 0)
+    failed = True
+    try:
+        def call(method, path, body=None):
+            response = requests.request(method, server.api_url + path, json=body,
+                auth=("admin", AUTH_BOOTSTRAP_PASSWORD), timeout=120)
+            assert response.ok, response.text + server.debug_logs()
+            value = response.json()
+            return value["responses"][0] if "responses" in value else value
+        call("POST", "/tables/physical_budget", {"num_shards": 1, "schema": {
+            "storage_mode": "relational", "default_type": "doc",
+            "document_schemas": {"doc": {"schema": {"type": "object", "additionalProperties": False,
+                "properties": {
+                    "body": {"type": "string", "x-antfly-field": {"type": "text"}},
+                    "amount": {"type": "integer", "x-antfly-field": {"type": "number", "sortable": True}},
+                }}}},
+            "base_source": {"kind": "external", "table_id": "physical-budget",
+                "format": "parquet", "uri": root.as_uri()},
+            "relational_indexes": [{"name": "amount_idx", "keys": [{"column": "amount", "nulls": "first"}]}],
+        }, "indexes": {"body_text": {"type": "full_text"}}})
+        deadline = time.monotonic() + 120
+        while not call("GET", "/tables/physical_budget/indexes/body_text")["status"]["readiness"]["queryable"]:
+            assert time.monotonic() < deadline, server.debug_logs()
+            time.sleep(0.1)
+        result = call("POST", "/tables/physical_budget/query", {
+            "full_text_search": {"term": "common", "field": "body"},
+            "fields": ["amount"], "limit": 3,
+            "order_by": [{"field": "amount", "desc": False}], "profile": True,
+        })
+        assert [hit["_source"]["amount"] for hit in result["hits"]["hits"]] == [0, 1, 2], result
+        profile = result["profile"]["sort"]
+        assert profile["candidate_source"] == "ordered_lake_index_then_text_postings", result
+        assert profile["ordered_scanned_count"] <= 1024, result
         failed = False
     finally:
         server.stop(test_failed=failed)

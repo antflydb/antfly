@@ -174,17 +174,8 @@ fn checkSearchCancellation(cancellation: ?CancellationToken) !void {
     }
 }
 
-const ScoreEntry = struct {
-    doc_num: u32,
-    score: f32,
-    fn worse(_: void, a: @This(), b: @This()) std.math.Order {
-        const order = std.math.order(a.score, b.score);
-        return if (order == .eq) std.math.order(b.doc_num, a.doc_num) else order;
-    }
-    fn better(_: void, a: @This(), b: @This()) bool {
-        return worse({}, a, b) == .gt;
-    }
-};
+const daat = @import("daat.zig");
+const ScoreEntry = daat.Entry;
 
 /// Preserve native f32 addition order while bounding accumulation memory.
 /// Each document's partial sum precedes subsequent contributions in the spill.
@@ -1434,6 +1425,58 @@ fn locatedForwardBytes(txn: anytype, doc_id: []const u8) !?[]const u8 {
     const forward = data[offset..@intCast(end)];
     if (try decodeFwdDocNum(forward) != locator.num) return error.InvalidSparseDocMapSegment;
     return forward;
+}
+
+fn collectPostingStreams(a: Allocator, txn: anytype, query: *const SparseVector, cancellation: ?CancellationToken, byte_budget: usize) !?[]daat.Stream {
+    var streams: std.ArrayList(daat.Stream) = .empty;
+    defer streams.deinit(a);
+    const max_streams = 4096; // bounded navigation; larger fan-out retains spill fallback
+    var retained_bytes: usize = 0;
+    var cursor = try txn.openCursor();
+    defer cursor.close();
+    var next = try cursor.seekAtOrAfter(taggedPrefix(key_segment));
+    while (next) |entry| {
+        try checkSearchCancellation(cancellation);
+        if (entry.key.len == 0 or entry.key[0] != key_segment) break;
+        const id = SparseIndex.segmentIdFromKey(entry.key) orelse return error.InvalidSparseSegment;
+        const version = try immutableVersion(entry.value);
+        var retained: ?[]const u8 = null;
+        for (query.indices, query.values) |term, weight| {
+            if (try segmentTermPayload(entry.value, term) != null) {
+                if (streams.items.len == max_streams) return null;
+                // Retain only matching segments. Cursor entries may be recycled;
+                // transaction point reads remain pinned until query completion.
+                if (retained == null) {
+                    if (entry.value.len > byte_budget - retained_bytes) return null;
+                    retained = try txn.get(entry.key);
+                    retained_bytes += retained.?.len;
+                }
+                const payload = (try segmentTermPayload(retained.?, term)) orelse return error.InvalidSparseSegment;
+                try streams.append(a, .{ .weight = weight, .payload = payload, .segment = id, .version = version });
+            }
+        }
+        next = try cursor.next();
+    }
+    for (query.indices, query.values) |term, weight| {
+        var key: [256]u8 = undefined;
+        const bytes = txn.get(invMetaKey(&key, term)) catch |err| switch (err) {
+            error.NotFound => continue,
+            else => return err,
+        };
+        const metadata = decodeTermMeta(bytes);
+        for (0..metadata.chunk_count) |i| {
+            try checkSearchCancellation(cancellation);
+            if (streams.items.len == max_streams) return null;
+            const chunk = txn.get(invChunkKey(&key, term, @intCast(i))) catch |err| switch (err) {
+                error.NotFound => continue,
+                else => return err,
+            };
+            if (chunk.len > byte_budget - retained_bytes) return null;
+            retained_bytes += chunk.len;
+            try streams.append(a, .{ .weight = weight, .single = chunk });
+        }
+    }
+    return try streams.toOwnedSlice(a);
 }
 
 fn completeLocatorMap(txn: anytype) !bool {
@@ -3896,6 +3939,7 @@ pub const SparseIndex = struct {
             null;
         defer if (ordinal_filter) |*bitmap| bitmap.deinit();
         if (ordinal_filter) |*bitmap| {
+            try bitmap.prepareRead();
             if (bitmap.isEmpty()) return try alloc.alloc(SearchResult, 0);
             // Only the selective forward path needs a hash set. Broad predicates
             // remain compressed and intersect postings before identity/scoring IO.
@@ -3999,6 +4043,22 @@ pub const SparseIndex = struct {
             index: *SparseIndex,
             decisions: *Decisions,
 
+            pub fn check(ctx: *@This()) !void {
+                try checkSearchCancellation(ctx.cancellation);
+            }
+            pub fn mayMatch(ctx: *@This(), first: u32, last: u32) bool {
+                const bitmap = ctx.ordinal_filter orelse return true;
+                return bitmap.rangeCardinality(first, @as(u64, last) + 1) != 0;
+            }
+            pub fn allows(ctx: *@This(), stream: daat.Stream, doc_num: u32) !bool {
+                if (ctx.ordinal_filter) |bitmap| if (!bitmap.contains(doc_num)) return false;
+                if (ctx.filter_doc_nums.count() > 0 and !ctx.filter_doc_nums.contains(doc_num)) return false;
+                if (ctx.direct_filter_doc_nums.count() > 0 and !ctx.direct_filter_doc_nums.contains(doc_num)) return false;
+                if (ctx.exclude_doc_nums.contains(doc_num) or ctx.direct_exclude_doc_nums.contains(doc_num)) return false;
+                if (ctx.index.docNumDeleted(ctx.txn, doc_num)) return false;
+                if (stream.segment) |id| if (!try ctx.incarnations.matches(ctx.alloc, ctx.txn, id, stream.version, doc_num)) return false;
+                return true;
+            }
             fn shouldDecode(ctx: *@This(), bytes: []const u8, range: []const u8) !bool {
                 try checkSearchCancellation(ctx.cancellation);
                 return postingRangeMayMatch(range, bytes, ctx.ordinal_filter);
@@ -4039,91 +4099,120 @@ pub const SparseIndex = struct {
             }
         };
 
-        if (profile_enabled) profile.terms = query_vec.indices.len;
-        const segment_seek_start_ns = if (profile_enabled) nowNs() else 0;
-        var segment_cur = try txn.openCursor();
-        defer segment_cur.close();
-        var maybe_segment = try segment_cur.seekAtOrAfter(taggedPrefix(key_segment));
-        if (profile_enabled) profile.segment_seek_ns += nowNs() - segment_seek_start_ns;
-        while (maybe_segment) |segment_entry| {
-            try checkSearchCancellation(constraints.cancellation);
-            if (segment_entry.key.len == 0 or segment_entry.key[0] != key_segment) break;
-            if (profile_enabled) profile.segment_entries += 1;
-            for (query_vec.indices, 0..) |term_id, qi| {
-                var ctx = AccumulateContext{
+        var fast_entries: ?[]ScoreEntry = null;
+        defer if (fast_entries) |values| alloc.free(values);
+        if ((constraints.key_predicate == null or ordinal_filter != null) and try completeLocatorMap(&txn)) {
+            if (try collectPostingStreams(alloc, &txn, query_vec, constraints.cancellation, 64 * 1024 * 1024)) |input| {
+                defer alloc.free(input);
+                var context = AccumulateContext{
                     .alloc = alloc,
                     .txn = &txn,
                     .incarnations = &incarnations,
-                    .segment_id = segmentIdFromKey(segment_entry.key) orelse return error.InvalidSparseSegment,
-                    .segment_version = try immutableVersion(segment_entry.value),
-                    .query_weight = query_vec.values[qi],
+                    .query_weight = 0,
                     .scores = &scores,
                     .filter_doc_nums = &filter_doc_nums,
                     .direct_filter_doc_nums = &direct_filter_doc_nums,
                     .exclude_doc_nums = &exclude_doc_nums,
                     .direct_exclude_doc_nums = &direct_exclude_doc_nums,
-                    .profile = if (profile_enabled) &profile else null,
+                    .profile = null,
                     .source = .segment,
                     .cancellation = constraints.cancellation,
-                    .key_predicate = if (ordinal_filter == null) constraints.key_predicate else null,
+                    .key_predicate = null,
                     .ordinal_filter = if (ordinal_filter) |*bitmap| bitmap else null,
                     .index = self,
                     .decisions = &decisions,
                 };
-                const segment_decode_start_ns = if (profile_enabled) nowNs() else 0;
-                try forEachSegmentChunk(alloc, segment_entry.value, term_id, &ctx, AccumulateContext.visit);
-                if (profile_enabled) profile.segment_decode_ns += nowNs() - segment_decode_start_ns;
-            }
-            const segment_next_start_ns = if (profile_enabled) nowNs() else 0;
-            maybe_segment = try segment_cur.next();
-            if (profile_enabled) profile.segment_seek_ns += nowNs() - segment_next_start_ns;
-        }
-
-        for (query_vec.indices, 0..) |term_id, qi| {
-            try checkSearchCancellation(constraints.cancellation);
-            const query_weight = query_vec.values[qi];
-            // Check term metadata
-            var meta_key_buf: [256]u8 = undefined;
-            const mk = invMetaKey(&meta_key_buf, term_id);
-            const meta_data = txn.get(mk) catch continue;
-            const tm = decodeTermMeta(meta_data);
-
-            // Scan all chunks for this term
-            for (0..tm.chunk_count) |ci| {
-                if (ci % 32 == 0) try checkSearchCancellation(constraints.cancellation);
-                var ck_buf: [256]u8 = undefined;
-                const ck = invChunkKey(&ck_buf, term_id, @intCast(ci));
-                const chunk_data = txn.get(ck) catch continue;
-
-                if (!try chunkMayMatch(chunk_data, if (ordinal_filter) |*bitmap| bitmap else null)) continue;
-                const delta_start_ns = if (profile_enabled) nowNs() else 0;
-                const decoded = try decodeChunk(alloc, chunk_data);
-                defer alloc.free(decoded.doc_nums);
-                defer alloc.free(decoded.weights);
-
-                var ctx = AccumulateContext{
-                    .alloc = alloc,
-                    .txn = &txn,
-                    .incarnations = &incarnations,
-                    .query_weight = query_weight,
-                    .scores = &scores,
-                    .filter_doc_nums = &filter_doc_nums,
-                    .direct_filter_doc_nums = &direct_filter_doc_nums,
-                    .exclude_doc_nums = &exclude_doc_nums,
-                    .direct_exclude_doc_nums = &direct_exclude_doc_nums,
-                    .profile = if (profile_enabled) &profile else null,
-                    .source = .delta,
-                    .cancellation = constraints.cancellation,
-                    .key_predicate = if (ordinal_filter == null) constraints.key_predicate else null,
-                    .ordinal_filter = if (ordinal_filter) |*bitmap| bitmap else null,
-                    .index = self,
-                    .decisions = &decisions,
-                };
-                try AccumulateContext.visit(&ctx, decoded);
-                if (profile_enabled) profile.delta_chunk_ns += nowNs() - delta_start_ns;
+                var scoring_stats: daat.Stats = .{};
+                fast_entries = try daat.collect(alloc, input, k, &context, &scoring_stats);
+                if (profile_enabled) profile.scored_docs = scoring_stats.scored;
             }
         }
+        if (fast_entries == null) {
+            if (profile_enabled) profile.terms = query_vec.indices.len;
+            const segment_seek_start_ns = if (profile_enabled) nowNs() else 0;
+            var segment_cur = try txn.openCursor();
+            defer segment_cur.close();
+            var maybe_segment = try segment_cur.seekAtOrAfter(taggedPrefix(key_segment));
+            if (profile_enabled) profile.segment_seek_ns += nowNs() - segment_seek_start_ns;
+            while (maybe_segment) |segment_entry| {
+                try checkSearchCancellation(constraints.cancellation);
+                if (segment_entry.key.len == 0 or segment_entry.key[0] != key_segment) break;
+                if (profile_enabled) profile.segment_entries += 1;
+                for (query_vec.indices, 0..) |term_id, qi| {
+                    var ctx = AccumulateContext{
+                        .alloc = alloc,
+                        .txn = &txn,
+                        .incarnations = &incarnations,
+                        .segment_id = segmentIdFromKey(segment_entry.key) orelse return error.InvalidSparseSegment,
+                        .segment_version = try immutableVersion(segment_entry.value),
+                        .query_weight = query_vec.values[qi],
+                        .scores = &scores,
+                        .filter_doc_nums = &filter_doc_nums,
+                        .direct_filter_doc_nums = &direct_filter_doc_nums,
+                        .exclude_doc_nums = &exclude_doc_nums,
+                        .direct_exclude_doc_nums = &direct_exclude_doc_nums,
+                        .profile = if (profile_enabled) &profile else null,
+                        .source = .segment,
+                        .cancellation = constraints.cancellation,
+                        .key_predicate = if (ordinal_filter == null) constraints.key_predicate else null,
+                        .ordinal_filter = if (ordinal_filter) |*bitmap| bitmap else null,
+                        .index = self,
+                        .decisions = &decisions,
+                    };
+                    const segment_decode_start_ns = if (profile_enabled) nowNs() else 0;
+                    try forEachSegmentChunk(alloc, segment_entry.value, term_id, &ctx, AccumulateContext.visit);
+                    if (profile_enabled) profile.segment_decode_ns += nowNs() - segment_decode_start_ns;
+                }
+                const segment_next_start_ns = if (profile_enabled) nowNs() else 0;
+                maybe_segment = try segment_cur.next();
+                if (profile_enabled) profile.segment_seek_ns += nowNs() - segment_next_start_ns;
+            }
 
+            for (query_vec.indices, 0..) |term_id, qi| {
+                try checkSearchCancellation(constraints.cancellation);
+                const query_weight = query_vec.values[qi];
+                // Check term metadata
+                var meta_key_buf: [256]u8 = undefined;
+                const mk = invMetaKey(&meta_key_buf, term_id);
+                const meta_data = txn.get(mk) catch continue;
+                const tm = decodeTermMeta(meta_data);
+
+                // Scan all chunks for this term
+                for (0..tm.chunk_count) |ci| {
+                    if (ci % 32 == 0) try checkSearchCancellation(constraints.cancellation);
+                    var ck_buf: [256]u8 = undefined;
+                    const ck = invChunkKey(&ck_buf, term_id, @intCast(ci));
+                    const chunk_data = txn.get(ck) catch continue;
+
+                    if (!try chunkMayMatch(chunk_data, if (ordinal_filter) |*bitmap| bitmap else null)) continue;
+                    const delta_start_ns = if (profile_enabled) nowNs() else 0;
+                    const decoded = try decodeChunk(alloc, chunk_data);
+                    defer alloc.free(decoded.doc_nums);
+                    defer alloc.free(decoded.weights);
+
+                    var ctx = AccumulateContext{
+                        .alloc = alloc,
+                        .txn = &txn,
+                        .incarnations = &incarnations,
+                        .query_weight = query_weight,
+                        .scores = &scores,
+                        .filter_doc_nums = &filter_doc_nums,
+                        .direct_filter_doc_nums = &direct_filter_doc_nums,
+                        .exclude_doc_nums = &exclude_doc_nums,
+                        .direct_exclude_doc_nums = &direct_exclude_doc_nums,
+                        .profile = if (profile_enabled) &profile else null,
+                        .source = .delta,
+                        .cancellation = constraints.cancellation,
+                        .key_predicate = if (ordinal_filter == null) constraints.key_predicate else null,
+                        .ordinal_filter = if (ordinal_filter) |*bitmap| bitmap else null,
+                        .index = self,
+                        .decisions = &decisions,
+                    };
+                    try AccumulateContext.visit(&ctx, decoded);
+                    if (profile_enabled) profile.delta_chunk_ns += nowNs() - delta_start_ns;
+                }
+            }
+        }
         var entries = std.ArrayListUnmanaged(ScoreEntry).empty;
         defer entries.deinit(alloc);
         var heap = std.PriorityQueue(ScoreEntry, void, ScoreEntry.worse).initContext({});
@@ -4132,23 +4221,25 @@ pub const SparseIndex = struct {
         // removed before heap admission or deleted winners could hide live hits.
         const bounded = try completeLocatorMap(&txn);
         const sort_start_ns = if (profile_enabled) nowNs() else 0;
-        try scores.finish();
-        while (try scores.next(constraints.cancellation)) |entry| {
-            try checkSearchCancellation(constraints.cancellation);
-            if (profile_enabled) profile.scored_docs += 1;
-            if (self.docNumDeleted(&txn, entry.doc_num)) continue;
-            if (!bounded) {
-                try entries.append(alloc, entry);
-            } else if (heap.items.len < k) {
-                try heap.push(alloc, entry);
-            } else if (heap.peek()) |worst| {
-                if (ScoreEntry.better({}, entry, worst)) {
-                    _ = heap.pop();
+        if (fast_entries) |values| try entries.appendSlice(alloc, values) else {
+            try scores.finish();
+            while (try scores.next(constraints.cancellation)) |entry| {
+                try checkSearchCancellation(constraints.cancellation);
+                if (profile_enabled) profile.scored_docs += 1;
+                if (self.docNumDeleted(&txn, entry.doc_num)) continue;
+                if (!bounded) {
+                    try entries.append(alloc, entry);
+                } else if (heap.items.len < k) {
                     try heap.push(alloc, entry);
+                } else if (heap.peek()) |worst| {
+                    if (ScoreEntry.better({}, entry, worst)) {
+                        _ = heap.pop();
+                        try heap.push(alloc, entry);
+                    }
                 }
             }
+            if (bounded) try entries.appendSlice(alloc, heap.items);
         }
-        if (bounded) try entries.appendSlice(alloc, heap.items);
 
         std.mem.sort(ScoreEntry, entries.items, {}, ScoreEntry.better);
         if (profile_enabled) profile.sort_ns = nowNs() - sort_start_ns;
@@ -6255,4 +6346,25 @@ test "sparse bounded accumulation preserves signed f32 addition order across spi
         count += 1;
     }
     try std.testing.expectEqual(@as(usize, 100), count);
+}
+
+test "sparse document streams bound retained segment bytes before scoring" {
+    const a = std.testing.allocator;
+    var bytes: [256]u8 = undefined;
+    const path = tmpPath(&bytes, "stream-byte-admission");
+    defer cleanupTmp(path);
+    var index = try SparseIndex.open(a, path, .{});
+    defer index.close();
+    try index.batchWithOptions(&.{.{ .doc_id = "one", .vec = .{ .indices = &.{1}, .values = &.{1} } }}, &.{}, .{ .prefer_bulk_build = true, .assume_new_doc_ids = true });
+    var txn = try index.beginReadTxn();
+    defer txn.abort();
+    var query: SparseVector = .{ .indices = &.{1}, .values = &.{1} };
+    try std.testing.expect((try collectPostingStreams(a, &txn, &query, null, 0)) == null);
+    const admitted = (try collectPostingStreams(a, &txn, &query, null, 64 * 1024 * 1024)).?;
+    defer a.free(admitted);
+    try std.testing.expectEqual(@as(usize, 1), admitted.len);
+    query = .{ .indices = &.{999}, .values = &.{1} };
+    const unmatched = (try collectPostingStreams(a, &txn, &query, null, 0)).?;
+    defer a.free(unmatched);
+    try std.testing.expectEqual(@as(usize, 0), unmatched.len);
 }

@@ -382,6 +382,56 @@ fn evaluateColumns(a: A, input: Compiled, page: local.sql_catalog.ColumnPage, ma
         .doc_id => unreachable,
         .field_matcher => |field| {
             const name = column(field.path).?;
+            if (page.native == null) if (page.batch.findColumn(name)) |vector| {
+                switch (vector.values) {
+                    inline .dictionary_bytes, .dictionary_i64, .dictionary_f64 => |dictionary, tag| {
+                        // Evaluate only dictionary entries reached by active lanes.
+                        // This preserves short-circuit errors and null semantics.
+                        const cache = try a.alloc(u2, dictionary.values.len);
+                        defer a.free(cache);
+                        @memset(cache, 0);
+                        var null_match: ?bool = null;
+                        var scratch = std.heap.ArenaAllocator.init(a);
+                        defer scratch.deinit();
+                        for (mask, page.selection, 0..) |*match, index, row| {
+                            match.* = false;
+                            if (active) |lanes| if (!lanes[row]) continue;
+                            if (vector.nulls.isNull(index)) {
+                                if (null_match == null) null_match = try field.predicate.matches(scratch.allocator(), &.{.null});
+                                match.* = null_match.?;
+                                continue;
+                            }
+                            const id = dictionary.indices[index];
+                            if (cache[id] == 0) {
+                                _ = scratch.reset(.retain_capacity);
+                                const value: std.json.Value = switch (tag) {
+                                    .dictionary_bytes => .{ .string = dictionary.values[id] },
+                                    .dictionary_i64 => .{ .integer = dictionary.values[id] },
+                                    .dictionary_f64 => .{ .float = dictionary.values[id] },
+                                    else => unreachable,
+                                };
+                                cache[id] = if (try field.predicate.matches(scratch.allocator(), &.{value})) 2 else 1;
+                            }
+                            match.* = cache[id] == 2;
+                        }
+                        return;
+                    },
+                    .i64 => |values| if (try field.predicate.integerTerm()) |term| {
+                        // Gather selected lanes, compare in SIMD, then apply the
+                        // authoritative null and Boolean activity masks.
+                        var row: usize = 0;
+                        while (row < mask.len) : (row += 8) {
+                            var lanes: [8]i64 = @splat(0);
+                            const count = @min(8, mask.len - row);
+                            for (0..count) |lane| lanes[lane] = values[page.selection[row + lane]];
+                            const matches: [8]bool = @as(@Vector(8, i64), lanes) == @as(@Vector(8, i64), @splat(term));
+                            for (0..count) |lane| mask[row + lane] = matches[lane] and !vector.nulls.isNull(page.selection[row + lane]) and (if (active) |enabled| enabled[row + lane] else true);
+                        }
+                        return;
+                    },
+                    else => {},
+                }
+            };
             var scratch = std.heap.ArenaAllocator.init(a);
             defer scratch.deinit();
             for (mask, 0..) |*match, row| {
@@ -540,5 +590,52 @@ test "external lake column residual masks match shared document evaluation" {
             try doc.object.put(ca, "label", (try page.cell(ca, row, "label")).value);
             try std.testing.expectEqual(try compiled.matches(ca, "id", doc), match);
         }
+    }
+}
+
+test "external lake residual dictionary and SIMD kernels preserve active null and selected lanes" {
+    const a = std.testing.allocator;
+    const row_types = local.storage_rowsource_types;
+    var refs: [11]row_types.RowRef = undefined;
+    @memset(&refs, .{ .relational_key = "id" });
+    const numbers = [_]i64{ 7, -1, 7, 4, 7, 9, 7, 7, 2, 7, 7 };
+    const indices = [_]u32{ 0, 1, 0, 1, 2, 0, 0, 1, 2, 0, 0 };
+    const values = [_][]const u8{ "kept", "other", "keeper" };
+    const nulls = [_]u8{ 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0 };
+    const vectors = [_]row_types.ColumnVector{
+        .{ .name = "number", .values = .{ .i64 = &numbers }, .nulls = .{ .bytes = &nulls } },
+        .{ .name = "label", .values = .{ .dictionary_bytes = .{ .values = &values, .indices = &indices } }, .nulls = .{ .bytes = &nulls } },
+    };
+    const page: local.sql_catalog.ColumnPage = .{ .batch = .{ .snapshot = .{ .table_id = "t", .snapshot_id = "s" }, .row_refs = &refs, .columns = &vectors }, .selection = &.{ 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0 } };
+    try page.validate();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    for ([_][]const u8{
+        \\{"term":{"number":7}}
+        ,
+        \\{"prefix":{"path":"/label","value":"ke"}}
+        ,
+        \\{"bool":{"must":[{"term":{"number":7}}],"must_not":[{"term":{"label":"other"}}]}}
+    }) |json| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), json, .{});
+        const compiled = try Graph.compilePatternFilter(arena.allocator(), parsed.value);
+        const Probe = struct {
+            fn run(allocator: A, input: Compiled, columns: local.sql_catalog.ColumnPage) !void {
+                const active = [_]bool{ true, true, false, true, true, true, false, true, true, true, true };
+                var mask: [11]bool = undefined;
+                try evaluateColumns(allocator, input, columns, &mask, &active);
+                var scratch = std.heap.ArenaAllocator.init(allocator);
+                defer scratch.deinit();
+                for (mask, active, 0..) |actual, enabled, row| {
+                    _ = scratch.reset(.retain_capacity);
+                    const ra = scratch.allocator();
+                    var doc: std.json.Value = .{ .object = .empty };
+                    for (columns.batch.columns) |vector| try doc.object.put(ra, vector.name, (try columns.cell(ra, row, vector.name)).value);
+                    try std.testing.expectEqual(enabled and try input.matches(ra, "id", doc), actual);
+                }
+            }
+        };
+        try Probe.run(a, compiled, page);
+        try std.testing.checkAllAllocationFailures(a, Probe.run, .{ compiled, page });
     }
 }

@@ -20,14 +20,24 @@ cancellation between blocks, without formatting a document key per selected row.
 Selective sets (at most 4096 rows, scaled to the requested result count) use
 36-byte forward locators and preserve zero/negative scores for overlapping terms;
 absence of overlap is separate from score. Broader sets intersect native bitmaps
-with authenticated posting-block ordinal trailers before decoding. Posting payloads remain V1; old readers ignore the extended range metadata,
-and unextended blocks derive bounds without allocating decoded arrays. Exact multi-term accumulation retains at most 65,536 document scores in RAM,
-then streams contributions through bounded native spill sorting. Per-document
-addition order is preserved, including signed weights and cancellation between
-terms. The spill input budget is 1 GiB, with native capacity reservations where
-a resource manager is available. Complete checkpoints select winners with a
-bounded top-k heap and sort only k entries, excluding tombstones before admission. Legacy checkpoints retain the
-full candidate sort and defensive identity fallback.
+with authenticated posting-block ordinal trailers before decoding. Posting
+payloads remain V1; old readers ignore the extended range metadata, and unextended
+blocks derive bounds without allocating decoded arrays. Complete checkpoints use
+encoded document-at-a-time posting streams and a bounded top-k heap: scoring
+retains only one document accumulator, at most 4096 stream cursors, 64 MiB of
+retained encoded postings, and k winners. Conservative block bounds include zero
+and both signed weight endpoints; strict score pruning preserves ties. Streams add
+contributions in the original source/term/chunk order, preserving f32 results even
+with mixed signs. Prepared bitmap rank metadata rejects disjoint posting blocks
+without decoded posting arrays. Legacy checkpoints, unresolved key predicates, and
+queries exceeding either stream or posting-byte admission retain the spill
+fallback, which holds at most 65,536 document scores in RAM before streaming
+contributions through bounded native spill sorting. Per-document addition order is
+preserved, including signed weights and cancellation between terms. The spill
+input budget is 1 GiB, with native capacity reservations where a resource manager
+is available. Complete checkpoints select winners with a bounded top-k heap and
+sort only k entries, excluding tombstones before admission. Legacy checkpoints
+retain the full candidate sort and defensive identity fallback.
 
 Persist authenticated mappings between physical file/group/row coordinates and
 native sparse ordinals as part of each immutable publication. Share the physical
@@ -45,15 +55,19 @@ list merely to resolve membership. Preserve score and tie behavior.
 
 ## Residual evaluation over narrowed physical selections
 
-Implemented for vector predicates by retaining an indexed conjunction superset
-and a separate residual IR containing only unresolved children. One pinned
-Parquet cursor borrows compressed physical selections for the entire scan;
-file/group/page pruning and reusable reader plans avoid reopening every 1024
-rows. Only residual dependency columns are projected. Direct-column expressions
-execute shared predicate leaves over page masks, preserving Boolean short
-circuiting and projected document null semantics without per-row JSON objects.
-Nested paths and document-ID expressions retain the shared document evaluator.
-The resulting exact physical set is shared by dense and sparse membership.
+Implemented for vector predicates by retaining an indexed conjunction superset and
+a separate residual IR containing only unresolved children. One pinned Parquet
+cursor borrows compressed physical selections for the entire scan; file/group/page
+pruning and reusable reader plans avoid reopening every 1024 rows. Only residual
+dependency columns are projected. Direct-column expressions execute shared
+predicate leaves over page masks, preserving Boolean short circuiting and
+projected document null semantics without per-row JSON objects. Dictionary columns
+evaluate shared predicate leaves once per reached dictionary entry and cache null
+evaluation separately. Canonical i64 term predicates use an eight-lane equality
+kernel over the active selection, with null lanes masked out. Other leaves retain
+shared semantics. Nested paths and document-ID expressions retain the shared
+document evaluator. The resulting exact physical set is shared by dense and sparse
+membership.
 
 Keep the indexed superset for a partially resolved conjunction. Iterate it in
 bounded file/group/row windows, project the authoritative expression dependencies,
@@ -72,20 +86,23 @@ conjunct narrows residual I/O. Test cancellation and allocation failures.
 Implemented as an optional ordered-candidate provider in shared native text
 sorting. A cardinality/row-goal cost check preserves bounded native sorting for
 tiny memberships. A runtime probe budget restarts the bounded native collector
-when skewed membership defeats that estimate, retaining truthful traversal
-counts and the `ordered_lake_index_then_text_postings` source. Compatible direct
-relational keys stream pinned physical row
+when skewed membership defeats that estimate, retaining truthful traversal counts
+and the `ordered_lake_index_then_text_postings` source. The provider enforces the
+remaining physical probe budget inside each pull, including rows absent from the
+text corpus. Compatible direct relational keys stream pinned physical row
 references without Parquet hydration. Safe required predicates provide tuple
 bounds and equality prefixes; unsupported leaves remain native membership checks.
-Forward and backward cursors seek inclusively on the first ordered field and
-keep complete boundary ties for public-ID comparison. Backward traversal follows
+Forward and backward cursors seek inclusively on the first ordered field and keep
+complete boundary ties for public-ID comparison. Backward traversal follows
 preceding B-tree children from the upper-bound path; it does not reverse a full
-forward scan. Signed datetime keys use the same nanosecond domain as SQL. The collector stops only after the
-boundary key group, preserves exact totals, and reports matching candidates plus
+forward scan. Signed datetime keys and native date-range query bounds use the same
+i128 nanosecond domain as SQL; public parsing and serialization preserve pre-epoch
+and wide timestamps. The collector stops only after the boundary key group,
+preserves exact totals, and reports matching candidates plus
 `ordered_scanned_count` (all traversed physical references before membership).
 Offset is supported. Incompatible null policies/collations and unproven orders
-retain the native doc-value fallback.
-Existing scoring uses full-corpus statistics.
+retain the native doc-value fallback. Existing scoring uses full-corpus
+statistics.
 
 Use compatible ordered relational indexes as candidate producers for field sorts.
 Intersect each ordered candidate with exact search membership, collect the page,
@@ -106,9 +123,12 @@ visited candidates and sort-value reads in profiles.
 Implemented `sliceRebased` and `rangeCardinality` in shared Roaring storage.
 Slices clone only intersecting containers, mask boundary words, and shift with
 word kernels. Segment doc-number filters and counts use these kernels. A direct
-bitmap count over a segment without deletions uses rank/cardinality with no
-result allocation. Compound filters retain bitmap operations and deletion masks.
+bitmap count over a segment without deletions uses rank/cardinality with no result
+allocation. Compound filters retain bitmap operations and deletion masks.
 Union/shift allocation failures now propagate with ownership-safe cleanup.
+Container membership uses binary search. Query-owned sparse selections prepare
+per-word rank prefixes once; mutations invalidate that navigation metadata before
+changing containers.
 
 Fused ordered-index builds reserve spill-file capacity across the cohort: at most
 eight simultaneous sorts retain four runs each, leaving room in the unchanged

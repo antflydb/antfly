@@ -39072,6 +39072,10 @@ pub const DB = struct {
         return storedPatternWrappedPredicate(alloc, name, .{ .object = std.json.ObjectMap.empty });
     }
 
+    fn storedPatternJsonTimestamp(a: Allocator, ns: i128) !std.json.Value {
+        return if (std.math.cast(i64, ns)) |v| .{ .integer = v } else .{ .number_string = try std.fmt.allocPrint(a, "{d}", .{ns}) };
+    }
+
     fn storedPatternJsonU64(value: u64) std.json.Value {
         if (value <= std.math.maxInt(i64)) return .{ .integer = @intCast(value) };
         // Stored-pattern date_range compares numerically; values this large
@@ -39125,8 +39129,8 @@ pub const DB = struct {
                 if (range.start_ns == null and range.end_ns == null) return error.UnsupportedQueryRequest;
                 var body = std.json.ObjectMap.empty;
                 try body.put(alloc, "field", .{ .string = range.field });
-                if (range.start_ns) |ns| try body.put(alloc, "start_ns", storedPatternJsonU64(ns));
-                if (range.end_ns) |ns| try body.put(alloc, "end_ns", storedPatternJsonU64(ns));
+                if (range.start_ns) |ns| try body.put(alloc, "start_ns", try storedPatternJsonTimestamp(alloc, ns));
+                if (range.end_ns) |ns| try body.put(alloc, "end_ns", try storedPatternJsonTimestamp(alloc, ns));
                 try body.put(alloc, "inclusive_start", .{ .bool = range.inclusive_start });
                 try body.put(alloc, "inclusive_end", .{ .bool = range.inclusive_end });
                 break :blk try storedPatternWrappedPredicate(alloc, "date_range", .{ .object = body });
