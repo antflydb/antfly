@@ -284,7 +284,14 @@ fn routeErrorStatus(err: anyerror) ?u16 {
         error.DeadlineExceeded => 504,
         error.BodyTooLarge, error.StreamDataOverflow, error.StreamTooLong, error.ValueTooLong => 413,
         error.BodyCapacityExceeded => 429,
-        error.OutOfMemory => 503,
+        error.OutOfMemory,
+        error.RunnableWaitTimeout,
+        error.SchedulerFull,
+        error.SchedulerClosed,
+        error.ResourceTemporarilyUnavailable,
+        error.QueueFull,
+        error.ConcurrencyUnavailable,
+        => 503,
         error.EndOfStream,
         error.SyntaxError,
         error.UnexpectedToken,
@@ -317,6 +324,7 @@ fn routeErrorBody(code: u16) []const u8 {
         413 => "{\"error\":\"PAYLOAD_TOO_LARGE\",\"message\":\"request payload is too large\"}",
         429 => "{\"error\":\"TOO_MANY_REQUESTS\",\"message\":\"request body capacity exhausted\"}",
         431 => "{\"error\":\"REQUEST_HEADER_FIELDS_TOO_LARGE\",\"message\":\"request headers are too large\"}",
+        503 => "{\"error\":\"SERVICE_UNAVAILABLE\",\"message\":\"execution capacity unavailable; retry the request\"}",
         else => "{\"error\":\"INTERNAL_ERROR\",\"message\":\"internal server error\"}",
     };
 }
@@ -3558,7 +3566,7 @@ pub const Server = struct {
             .{ .name = "content-length", .value = length },
             .{ .name = "retry-after", .value = "1" },
         };
-        const extra_len: usize = if (code == 429) extra.len else extra.len - 1;
+        const extra_len: usize = if (code == 429 or code == 503) extra.len else extra.len - 1;
         var status_buf: [3]u8 = undefined;
         const h2_headers = try H2Connection.buildResponseHeaders(code, extra[0..extra_len], &status_buf, self.allocator);
         defer self.allocator.free(h2_headers);
@@ -3781,7 +3789,7 @@ pub const Server = struct {
         // Every sendError caller terminates the HTTP/1 connection. Make that
         // lifecycle explicit so clients do not return the socket to a pool.
         try resp.headers.set(HeaderName.CONNECTION, "close");
-        if (code == 429) try resp.headers.set("Retry-After", "1");
+        if (code == 429 or code == 503) try resp.headers.set("Retry-After", "1");
         try ensureContentLengthHeader(&resp);
         try ensureDateHeader(self.io, &resp);
 
@@ -7579,4 +7587,90 @@ test "HTTP controlled H2 reset cleanup bounds a stalled native peer" {
 
 test "HTTP controlled H2 reset cleanup bounds a stalled fallback peer with zero async allowance" {
     try H2ResetBackpressureTest.run(true);
+}
+
+test "HTTP controlled scheduler failures map to retryable overload without replacing original fences" {
+    for ([_]anyerror{ error.RunnableWaitTimeout, error.SchedulerFull, error.SchedulerClosed, error.ResourceTemporarilyUnavailable, error.QueueFull, error.ConcurrencyUnavailable }) |err| {
+        try std.testing.expectEqual(@as(?u16, 503), routeErrorStatus(err));
+    }
+    try std.testing.expectEqual(@as(?u16, 408), routeErrorStatus(error.Timeout));
+    try std.testing.expectEqual(@as(?u16, 504), routeErrorStatus(error.DeadlineExceeded));
+    try std.testing.expectEqual(@as(?u16, null), routeErrorStatus(error.Canceled));
+    try std.testing.expect(std.mem.indexOf(u8, routeErrorBody(503), "SERVICE_UNAVAILABLE") != null);
+}
+
+test "HTTP controlled H2 scheduler overload publishes retry guidance and a complete error body" {
+    const allocator = std.testing.allocator;
+    var server = Server.init(allocator, std.testing.io);
+    defer server.deinit();
+    var h2 = H2Connection.initServer(allocator, std.testing.io);
+    defer h2.deinit();
+    const stream = try h2.stream_manager.getOrCreateStream(1);
+    try stream.open();
+    stream.stream_error = error.BodyCapacityExceeded;
+    stream.completed = true;
+
+    var wire = std.ArrayListUnmanaged(u8).empty;
+    defer wire.deinit(allocator);
+    const TestWriter = struct {
+        list: *std.ArrayListUnmanaged(u8),
+        alloc: Allocator,
+        pub fn writeAll(self: @This(), data: []const u8) !void {
+            try self.list.appendSlice(self.alloc, data);
+        }
+    };
+    var writer = TestWriter{ .list = &wire, .alloc = allocator };
+    try server.sendH2Error(&h2, &writer, 1, 503);
+
+    try std.testing.expect(wire.items.len >= 18);
+    const headers_len: usize = std.mem.readInt(u24, wire.items[0..3], .big);
+    try std.testing.expectEqual(@backingInt(http.Http2FrameType.headers), wire.items[3]);
+    try std.testing.expect(wire.items[4] & H2Connection.FLAG_END_HEADERS != 0);
+
+    var client = H2Connection.initClient(allocator, std.testing.io);
+    defer client.deinit();
+    const decoded = try client.decodeFrameHeaders(wire.items[9..][0..headers_len], wire.items[4]);
+    defer stream_mod.freeDecodedHeaders(allocator, decoded.headers);
+    var saw_status = false;
+    var saw_retry_after = false;
+    for (decoded.headers) |header| {
+        if (mem.eql(u8, header.name, ":status") and mem.eql(u8, header.value, "503")) saw_status = true;
+        if (mem.eql(u8, header.name, "retry-after") and mem.eql(u8, header.value, "1")) saw_retry_after = true;
+    }
+    try std.testing.expect(saw_status);
+    try std.testing.expect(saw_retry_after);
+
+    const data_offset = 9 + headers_len;
+    const data_len: usize = std.mem.readInt(u24, wire.items[data_offset..][0..3], .big);
+    try std.testing.expectEqual(@backingInt(http.Http2FrameType.data), wire.items[data_offset + 3]);
+    try std.testing.expect(wire.items[data_offset + 4] & H2Connection.FLAG_END_STREAM != 0);
+    try std.testing.expectEqualStrings(routeErrorBody(503), wire.items[data_offset + 9 ..][0..data_len]);
+    try std.testing.expect(stream.end_stream_sent);
+}
+
+test "HTTP controlled H1 scheduler overload publishes retry guidance and a complete error body" {
+    const io = std.testing.io;
+    var listener = try @import("../net/socket.zig").TcpListener.init(.{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } }, io);
+    defer listener.deinit();
+    var sender = try Socket.connect(listener.getLocalAddress(), io);
+    defer sender.close();
+    var peer = try listener.accept();
+    defer peer.socket.close();
+    peer.socket.enableNativeTimeouts();
+    try peer.socket.setRecvTimeout(500);
+    var server = Server.init(std.testing.allocator, io);
+    defer server.deinit();
+    try server.sendError(&sender, 503);
+    try sender.shutdownWrite();
+    var wire: [2048]u8 = undefined;
+    var used: usize = 0;
+    while (used < wire.len) {
+        const count = try peer.socket.recv(wire[used..]);
+        if (count == 0) break;
+        used += count;
+    }
+    try std.testing.expect(used < wire.len);
+    try std.testing.expect(mem.indexOf(u8, wire[0..used], " 503 ") != null);
+    try std.testing.expect(std.ascii.findIgnoreCase(wire[0..used], "retry-after: 1\r\n") != null);
+    try std.testing.expect(mem.endsWith(u8, wire[0..used], routeErrorBody(503)));
 }

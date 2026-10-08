@@ -285,3 +285,12 @@ shutdown. Their reservations remain held until owning finish. Both scheduler and
 real owner/subprocess gates pass on native and pinned Nix/glibc GNU; see
 [stopped-cause receipts](receipts/2026-10-07/stopped-capsule-causes/README.md).
 Current full API/production qualification and default enablement remain pending.
+
+
+Caller-owned worker output errors preserve original scheduler/fence causes across
+coarse callback statuses; attempted header publication prevents worker fallback.
+HTTP overload mapping now includes scheduler denials and emits retryable 503.
+Native and pinned Nix/glibc helper and HTTP gates pass; see
+[worker output error receipts](receipts/2026-10-07/worker-output-errors/README.md).
+Actual worker integration remains supplemental pending full production/API gates.
+Protected initial error output/control CPU and default enablement remain required.

@@ -139,6 +139,20 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("antfly-inference-worker-owner-handoff-test", "Run real owner capsules through the worker pipe phase transport")
         .dependOn(&b.addRunArtifact(worker_owner_tests).step);
+    const worker_output_error_root = b.createModule(.{
+        .root_source_file = b.path("pkg/inference/src/host/worker_output_error.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    worker_output_error_root.addImport("antfly_runtime_abi", antfly_imports.runtime_abi);
+    const worker_output_error_tests = b.addTest(.{
+        .name = "inference-worker-output-error-tests",
+        .root_module = worker_output_error_root,
+        .max_rss = 1024 * 1024 * 1024,
+    });
+    b.step("antfly-inference-worker-output-error-test", "Run caller-owned scheduler failures through output callback statuses")
+        .dependOn(&b.addRunArtifact(worker_output_error_tests).step);
     const inference_phase_filters = [_][]const u8{ "runnable execution local provider", "runnable execution worker budget" };
     const inference_phase_tests = b.addTest(.{
         .name = "inference-parent-phase-tests",
