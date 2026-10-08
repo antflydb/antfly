@@ -4018,9 +4018,10 @@ var persist_tmp_nonce: u64 = 0;
 
 fn persistTmpPath(buf: []u8) [*:0]const u8 {
     const base = "/tmp/antfly-persist-test-";
-    const ts = platform_time.monotonicNs();
+    var random: [16]u8 = undefined;
+    std.testing.io.random(&random);
     const nonce = @atomicRmw(u64, &persist_tmp_nonce, .Add, 1, .monotonic);
-    const slice = std.fmt.bufPrint(buf, "{s}{d}-{d}\x00", .{ base, ts, nonce }) catch unreachable;
+    const slice = std.fmt.bufPrint(buf, "{s}{x}-{d}\x00", .{ base, random, nonce }) catch unreachable;
     return @ptrCast(slice.ptr);
 }
 
@@ -5581,17 +5582,19 @@ fn persistentSimOptionsAtPath(path: [*:0]const u8, opts: PersistentIndexOptions)
 
 fn persistTmpPathWithSuffix(buf: []u8, suffix: []const u8) [*:0]const u8 {
     const base = "/tmp/antfly-persist-test-";
-    const ts = platform_time.monotonicNs();
+    var random: [16]u8 = undefined;
+    std.testing.io.random(&random);
     const nonce = @atomicRmw(u64, &persist_tmp_nonce, .Add, 1, .monotonic);
-    const slice = std.fmt.bufPrint(buf, "{s}{d}-{d}-{s}\x00", .{ base, ts, nonce, suffix }) catch unreachable;
+    const slice = std.fmt.bufPrint(buf, "{s}{x}-{d}-{s}\x00", .{ base, random, nonce, suffix }) catch unreachable;
     return @ptrCast(slice.ptr);
 }
 
 fn persistentReplayArtifactPath(buf: []u8, suffix: []const u8) []const u8 {
     const base = "/tmp/antfly-persistent-replay-";
-    const ts = platform_time.monotonicNs();
+    var random: [16]u8 = undefined;
+    std.testing.io.random(&random);
     const nonce = @atomicRmw(u64, &persist_tmp_nonce, .Add, 1, .monotonic);
-    return std.fmt.bufPrint(buf, "{s}{d}-{d}-{s}.fixture", .{ base, ts, nonce, suffix }) catch unreachable;
+    return std.fmt.bufPrint(buf, "{s}{x}-{d}-{s}.fixture", .{ base, random, nonce, suffix }) catch unreachable;
 }
 
 fn writePersistentReplayArtifactFile(path: []const u8, contents: []const u8) !void {

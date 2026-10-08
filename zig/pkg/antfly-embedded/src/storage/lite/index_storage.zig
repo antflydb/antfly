@@ -174,6 +174,10 @@ fn openImmutableSource(ptr: *anyopaque, allocator: Allocator, path: []const u8) 
             const state: *@This() = @ptrCast(@alignCast(ptr_));
             try state.snapshot.readIndexValueInto(state.value, offset, out);
         }
+        fn authenticate(ptr_: *anyopaque, offset: u64, length: u64, within: usize, out: []u8, expected: ?u32) !void {
+            const state: *@This() = @ptrCast(@alignCast(ptr_));
+            return state.snapshot.readAuthenticatedIndexValue(state.value, offset, length, within, out, expected);
+        }
         fn checksum(ptr_: *anyopaque, offset: u64, length: u64) !u32 {
             const state: *@This() = @ptrCast(@alignCast(ptr_));
             return state.snapshot.checksumIndexValue(state.value, offset, length);
@@ -192,7 +196,7 @@ fn openImmutableSource(ptr: *anyopaque, allocator: Allocator, path: []const u8) 
     errdefer snapshot.abort();
     const value = try snapshot.openIndexValue(allocator, path);
     state.* = .{ .allocator = allocator, .snapshot = snapshot, .value = value };
-    return .{ .ranges = .{ .ptr = state, .length = value.length, .read_into = State.read, .close = State.close, .checksum = State.checksum } };
+    return .{ .ranges = .{ .ptr = state, .length = value.length, .read_into = State.read, .close = State.close, .checksum = State.checksum, .read_authenticated = State.authenticate } };
 }
 
 // Long-lived sources own their I/O lifetime and lease only immutable roots.
@@ -2149,32 +2153,55 @@ test "lite artifact leases bounded range scope reduces native identity reads" {
     const bytes = try writer.build();
     defer a.free(bytes);
     try storage.writeFileAbsolute("/segment", bytes);
-    var source = try storage.openLeasedImmutableSource(a, "/segment");
+    const Counted = struct {
+        backing: SegmentSource,
+        calls: usize = 0,
+        fn read(raw: *anyopaque, offset: u64, out: []u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            try self.backing.readInto(offset, out);
+        }
+        fn checksum(raw: *anyopaque, offset: u64, length: u64) !u32 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            var scratch: [8192]u8 = undefined;
+            return self.backing.checksum(offset, length, &scratch);
+        }
+        fn close(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.backing.close();
+        }
+    };
+    var counted = Counted{ .backing = try storage.openLeasedImmutableSource(a, "/segment") };
+    var source = SegmentSource{ .ranges = .{ .ptr = &counted, .length = counted.backing.len(), .read_into = Counted.read, .checksum = Counted.checksum, .close = Counted.close } };
     var source_open = true;
     defer if (source_open) source.close();
     var reader = try segment.RangeSegmentReader.init(a, source, .{});
     source_open = false;
     defer reader.deinit();
     const registry = docs.artifact_registry.?;
-    var before = registry.testPageReads();
+    var before = counted.calls;
+    const native_before = registry.testPageReads();
     for (0..count) |doc| {
         const id = (try reader.storedDocIdOwned(a, @intCast(doc), 32)).?;
         a.free(id);
     }
-    const baseline = registry.testPageReads() - before;
+    const baseline = counted.calls - before;
+    const native_uncached = registry.testPageReads() - native_before;
     var scope = try segment.RangeSegmentReader.ReadScope.init(a, &reader, 256 * 1024);
     defer scope.deinit();
-    before = registry.testPageReads();
+    before = counted.calls;
+    const native_scoped_before = registry.testPageReads();
     for (0..count) |doc| {
         const id = (try scope.storedDocIdOwned(a, @intCast(doc), 32)).?;
         defer a.free(id);
         var expected: [32]u8 = undefined;
         try std.testing.expectEqualStrings(try std.fmt.bufPrint(&expected, "article-{d:0>6}", .{doc}), id);
     }
-    const cached = registry.testPageReads() - before;
+    const cached = counted.calls - before;
+    const native_cached = registry.testPageReads() - native_scoped_before;
     try std.testing.expect(cached < baseline / 16);
     try std.testing.expect(scope.cache.retainedBytes() <= 256 * 1024);
-    std.debug.print("LITE_RANGE_SCOPE documents={d} uncached_native_page_reads={d} cached_native_page_reads={d} cache_bytes={d}\n", .{ count, baseline, cached, scope.cache.retainedBytes() });
+    std.debug.print("LITE_RANGE_SCOPE documents={d} uncached_provider_calls={d} cached_provider_calls={d} uncached_native_page_reads={d} cached_native_page_reads={d} cache_bytes={d}\n", .{ count, baseline, cached, native_uncached, native_cached, scope.cache.retainedBytes() });
 }
 
 test "lite artifact leases orphan service advances past live markers with bounded work" {

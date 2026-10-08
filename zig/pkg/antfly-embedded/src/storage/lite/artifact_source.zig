@@ -32,6 +32,7 @@ pub const Registry = struct {
     io_impl: std.Io.Threaded,
     path: []u8,
     store: ?*docs.Store,
+    publication_guard: ?std.Io.File = null,
     mutex: std.Io.Mutex = .init,
     callbacks_done: std.Io.Event = .is_set,
     callbacks: usize = 0,
@@ -46,6 +47,8 @@ pub const Registry = struct {
         const path = try allocator.dupe(u8, store.file.path);
         errdefer allocator.free(path);
         self.* = .{ .allocator = allocator, .io_impl = limits.initService(allocator), .path = path, .store = store };
+        errdefer self.io_impl.deinit();
+        if (!store.read_only) self.publication_guard = try openPublicationGuard(allocator, self.io(), path);
         return self;
     }
 
@@ -66,6 +69,7 @@ pub const Registry = struct {
         std.debug.assert(self.first == null);
         std.debug.assert(self.callbacks == 0);
         std.debug.assert(self.retired_bytes.load(.acquire) == 0);
+        if (self.publication_guard) |guard| guard.close(self.io());
         self.io_impl.deinit();
         if (self.owned_resources) |owner| {
             owner.manager.deinit(owner.allocator);
@@ -161,6 +165,18 @@ pub const Registry = struct {
         }
     }
 
+    fn createMarker(self: *Registry, path: []const u8) !std.Io.File {
+        const runtime = self.io();
+        // File locks alone do not serialize callers sharing one descriptor.
+        // This mutex covers only publication, never the Store writer queue.
+        self.mutex.lockUncancelable(runtime);
+        defer self.mutex.unlock(runtime);
+        const guard = self.publication_guard orelse return error.ReadOnly;
+        try guard.lock(runtime, .exclusive);
+        defer guard.unlock(runtime);
+        return std.Io.Dir.cwd().createFile(runtime, path, .{ .read = true, .exclusive = true, .lock = .exclusive, .lock_nonblocking = true, .permissions = .fromMode(0o600) });
+    }
+
     pub fn open(self: *Registry, key: []const u8) !Source {
         const owner = self.beginCallback() orelse return error.ReadOnly;
         defer self.endCallback();
@@ -182,7 +198,7 @@ pub const Registry = struct {
         defer a.free(marker_name);
         const marker_path = try std.fs.path.join(a, &.{ std.fs.path.dirname(self.path) orelse ".", marker_name });
         errdefer a.free(marker_path);
-        const marker: ?std.Io.File = if (owner.read_only) null else try std.Io.Dir.cwd().createFile(runtime, marker_path, .{ .read = true, .exclusive = true, .lock = .exclusive, .lock_nonblocking = true, .permissions = .fromMode(0o600) });
+        const marker: ?std.Io.File = if (owner.read_only) null else try self.createMarker(marker_path);
         errdefer if (marker) |file| {
             file.close(runtime);
             std.Io.Dir.cwd().deleteFile(runtime, marker_path) catch {};
@@ -209,13 +225,13 @@ pub const Registry = struct {
             .marker_path = marker_path,
             .marker = marker,
         };
-        state.cache = try @import("../../segment_source.zig").ConcurrentBlockCache.init(a, .{ .ranges = .{ .ptr = state, .length = state.value.length, .read_into = State.readUncached, .checksum = State.checksum, .close = State.closeUncached, .resource_manager = owner.resource_manager } }, 160 * 1024);
+        state.cache = try @import("../../segment_source.zig").ConcurrentBlockCache.init(a, .{ .ranges = .{ .ptr = state, .length = state.value.length, .read_into = State.readUncached, .checksum = State.checksum, .visit_range = State.visit, .close = State.closeUncached, .resource_manager = owner.resource_manager } }, 160 * 1024);
         self.mutex.lockUncancelable(runtime);
         state.next = self.first;
         self.first = state;
         _ = self.references.fetchAdd(1, .monotonic);
         self.mutex.unlock(runtime);
-        return .{ .ranges = .{ .ptr = state, .length = state.value.length, .read_into = State.read, .checksum = State.checksum, .close = State.close, .retained_bytes = State.retainedBytes, .resource_manager = owner.resource_manager } };
+        return .{ .ranges = .{ .ptr = state, .length = state.value.length, .read_into = State.read, .checksum = State.checksum, .read_authenticated = State.authenticate, .close = State.close, .retained_bytes = State.retainedBytes, .resource_manager = owner.resource_manager } };
     }
 };
 
@@ -273,6 +289,16 @@ const State = struct {
     fn retainedBytes(ptr: *anyopaque) usize {
         const self: *State = @ptrCast(@alignCast(ptr));
         return self.cache.?.retainedBytes();
+    }
+
+    fn visit(ptr: *anyopaque, offset: u64, length: u64, context: *anyopaque, visitor: *const fn (*anyopaque, u64, []const u8) anyerror!void) !void {
+        const self: *State = @ptrCast(@alignCast(ptr));
+        return self.reader.visitIndexValue(self.value, offset, length, self.checkpoint, context, visitor);
+    }
+
+    fn authenticate(ptr: *anyopaque, offset: u64, length: u64, within: usize, out: []u8, expected: ?u32) !void {
+        const self: *State = @ptrCast(@alignCast(ptr));
+        return self.cache.?.readAuthenticated(offset, length, within, out, expected);
     }
 
     fn checksum(ptr: *anyopaque, offset: u64, length: u64) !u32 {
@@ -387,23 +413,36 @@ pub fn cleanupOrphans(file: *native.NativeFile, sweep: *SweepCursor) !usize {
 /// permanent live files. Locks arbitrate with sources from any process/owner.
 pub const MarkerSweep = struct {
     iterator: ?std.Io.Dir.Iterator = null,
+    publication_guard: ?std.Io.File = null,
 
-    pub fn deinit(self: *MarkerSweep, runtime: std.Io) void {
+    fn resetIterator(self: *MarkerSweep, runtime: std.Io) void {
         if (self.iterator) |it| it.reader.dir.close(runtime);
         self.iterator = null;
+    }
+    pub fn deinit(self: *MarkerSweep, runtime: std.Io) void {
+        self.resetIterator(runtime);
+        if (self.publication_guard) |guard| guard.close(runtime);
+        self.publication_guard = null;
     }
 
     pub fn run(self: *MarkerSweep, file: *native.NativeFile) !void {
         const runtime = file.runtime();
+        if (self.publication_guard == null) self.publication_guard = try openPublicationGuard(file.allocator, runtime, file.path);
+        const guard = self.publication_guard.?;
+        // A new marker is visible before createFile has acquired its lock.
+        // Coordinate that window with every sweeper in the directory, even
+        // when another Store or process owns the marker's artifact root.
+        try guard.lock(runtime, .exclusive);
+        defer guard.unlock(runtime);
         if (self.iterator == null) {
             const dir = try std.Io.Dir.cwd().openDir(runtime, std.fs.path.dirname(file.path) orelse ".", .{ .iterate = true });
             self.iterator = dir.iterate();
         }
-        errdefer self.deinit(runtime);
+        errdefer self.resetIterator(runtime);
         const it = &self.iterator.?;
         for (0..64) |_| {
             const entry = (try it.next(runtime)) orelse {
-                self.deinit(runtime);
+                self.resetIterator(runtime);
                 return;
             };
             if (entry.kind != .file or !std.mem.startsWith(u8, entry.name, marker_prefix)) continue;
@@ -424,3 +463,83 @@ pub const MarkerSweep = struct {
         }
     }
 };
+
+// This persistent inode is deliberately outside the UUID marker namespace.
+// Never unlink it: replacing its inode could split cross-process coordination.
+fn openPublicationGuard(allocator: Allocator, io: std.Io, root: []const u8) !std.Io.File {
+    const path = try std.fs.path.join(allocator, &.{ std.fs.path.dirname(root) orelse ".", ".aflite-lease-publication.lock" });
+    defer allocator.free(path);
+    return std.Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = false, .permissions = .fromMode(0o600) });
+}
+
+test "lite persistent mapped lease publication excludes cross-root marker sweeping" {
+    if (@import("builtin").os.tag != .linux and @import("builtin").os.tag != .macos) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/writer.aflite", .{tmp.sub_path});
+    defer a.free(root);
+    const other = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/other.aflite", .{tmp.sub_path});
+    defer a.free(other);
+    var file = try native.NativeFile.createWithIo(a, io, other, .{ .no_sync = true });
+    defer file.close();
+    const guard = try openPublicationGuard(a, io, root);
+    defer guard.close(io);
+    try guard.lock(io, .exclusive);
+    var held = true;
+    defer if (held) guard.unlock(io);
+    const probe = try openPublicationGuard(a, io, other);
+    defer probe.close(io);
+    try std.testing.expect(!try probe.tryLock(io, .exclusive));
+    const marker_path = try std.fs.path.join(a, &.{ std.fs.path.dirname(root).?, ".aflite-lease-0123456789abcdef0123456789abcdef" });
+    defer a.free(marker_path);
+    // Hold the exact create-to-lock window open deliberately. A different
+    // root's sweeper must not reap this unaliased, not-yet-locked marker.
+    const marker = try std.Io.Dir.cwd().createFile(io, marker_path, .{ .read = true, .exclusive = true });
+    var marker_open = true;
+    defer if (marker_open) marker.close(io);
+    const Worker = struct {
+        file: *native.NativeFile,
+        started: std.Io.Event = .unset,
+        done: std.Io.Event = .unset,
+        result: anyerror!void = {},
+        fn run(self: *@This()) void {
+            var sweep: MarkerSweep = .{};
+            defer sweep.deinit(self.file.runtime());
+            self.started.set(self.file.runtime());
+            self.result = sweep.run(self.file);
+            self.done.set(self.file.runtime());
+        }
+    };
+    var worker = Worker{ .file = &file };
+    const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+    var joined = false;
+    defer if (!joined) {
+        if (held) {
+            guard.unlock(io);
+            held = false;
+        }
+        thread.join();
+    };
+    worker.started.waitUncancelable(io);
+    try io.sleep(.fromMilliseconds(10), .awake);
+    try std.testing.expect(!worker.done.isSet());
+    try marker.lock(io, .exclusive);
+    guard.unlock(io);
+    held = false;
+    thread.join();
+    joined = true;
+    try worker.result;
+    try std.Io.Dir.cwd().access(io, marker_path, .{});
+    // A released/crashed lease remains reclaimable; the coordination inode
+    // is persistent and cannot itself be mistaken for a UUID marker.
+    marker.close(io);
+    marker_open = false;
+    var sweep: MarkerSweep = .{};
+    defer sweep.deinit(io);
+    try sweep.run(&file);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, marker_path, .{}));
+    try std.testing.expect(try probe.tryLock(io, .exclusive));
+    probe.unlock(io);
+}
