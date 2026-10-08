@@ -36,7 +36,7 @@ pub const Cache = struct {
     resource_manager: ?*local.storage_resource_manager.ResourceManager = null,
     // Includes schema arenas, cold segment payloads, decoded native metadata
     // and statistics across every corpus, rather than only encoded file size.
-    heap_budget: local.sql_memory_budget = .{ .backing = std.heap.page_allocator, .limit = 256 * 1024 * 1024 },
+    heap_budget: local.sql_memory_budget = .{ .backing = @import("antfly_platform").allocator.processAllocator(std.heap.smp_allocator), .limit = 256 * 1024 * 1024 },
 
     const Charge = struct { key: [32]u8, bytes: u64 };
     const Reservation = struct { references: usize, bytes: u64 };

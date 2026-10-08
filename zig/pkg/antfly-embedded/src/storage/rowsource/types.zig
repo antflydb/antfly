@@ -28,6 +28,17 @@ pub const SourceKind = enum {
     external_lance,
 };
 
+/// A consumed immutable column owner. Views may copy descriptors and names,
+/// while this lease keeps their payloads alive across cursor pulls and closure.
+pub const ColumnOwner = struct {
+    ptr: *anyopaque,
+    release_fn: *const fn (*anyopaque) void,
+    retained_bytes: usize,
+    pub fn release(self: @This()) void {
+        self.release_fn(self.ptr);
+    }
+};
+
 pub const NextBatchFn = *const fn (ctx: *anyopaque, alloc: Allocator) anyerror!?ColumnBatch;
 pub const DeinitFn = *const fn (ctx: *anyopaque, alloc: Allocator) void;
 

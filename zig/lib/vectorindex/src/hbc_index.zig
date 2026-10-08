@@ -3812,7 +3812,7 @@ fn prepareGlobalSubgroupPlan(self: anytype, txn: anytype, handle: anytype, req: 
     const Index = childType(@TypeOf(self));
     if (comptime !@hasDecl(Index, "nativeGlobalSubgroupRoutingEnabled")) return false;
     if (!self.nativeGlobalSubgroupRoutingEnabled() or max_leaves == 0 or coverage == .complete_snapshot or self.config.metric != .cosine or
-        !self.config.use_quantization or !filter.isTrivial() or req.filter_prefix.len != 0 or req.distance_over != null or req.distance_under != null) return false;
+        !self.config.use_quantization or !filter.isTrivial() or req.key_predicate != null or req.filter_prefix.len != 0 or req.distance_over != null or req.distance_under != null) return false;
     const identity = self.nativeGlobalSubgroupLeaseIdentity(txn) orelse return false;
     const plan = &handle.scratch.global_subgroups;
     const target = try std.math.add(u64, handle.scratch.bytes() - plan.bytes(), try plan.projectedBytes(max_leaves));
@@ -4163,7 +4163,7 @@ fn scoreNativeLeafScan(
         // Dirty/native row manifests have no subgroup permutation or duplicate
         // float16 plane. Preserve the global planner's fallback/order contract.
         if (scratch.global_subgroups.active) try drainGlobalSubgroups(self, txn, scratch, req, approx_query, results, profile, false, now, elapsed);
-        if (filter_state.isTrivial() and req.filter_prefix.len == 0 and req.distance_over == null and req.distance_under == null) {
+        if (filter_state.isTrivial() and req.key_predicate == null and req.filter_prefix.len == 0 and req.distance_over == null and req.distance_under == null) {
             const Sink = struct {
                 target: *search_results.ApproxSearchResults,
                 ids: [8]u64 = undefined,
@@ -4257,7 +4257,7 @@ fn scoreLeafMemberIds(
     // Resolve selective ID and metadata-prefix predicates once per leaf. The
     // sorted metadata batch reuses LSM blocks and replaces the former scalar
     // point lookup (plus cache lock) for every quantized candidate.
-    const filters_active = !filter_state.isTrivial() or req.filter_prefix.len > 0;
+    const filters_active = !filter_state.isTrivial() or req.filter_prefix.len > 0 or req.key_predicate != null;
     const NativeIndex = childType(@TypeOf(self));
     const subgroup_enabled = if (comptime @hasDecl(NativeIndex, "nativeSubgroupRoutingEnabled")) self.nativeSubgroupRoutingEnabled() else false;
     if (subgroup_enabled and coverage_policy != .complete_snapshot and self.config.metric == .cosine and
@@ -4333,7 +4333,7 @@ fn scoreLeafMemberIds(
         scratch.positions[filtered_count] = original_index;
         filtered_count += 1;
     };
-    if (req.filter_prefix.len > 0 and filtered_count > 0) {
+    if ((req.filter_prefix.len > 0 or req.key_predicate != null) and filtered_count > 0) {
         const filter_start = now_fn_u64();
         profile.filter_metadata_batches += 1;
         const candidates = scratch.member_ids[0..filtered_count];
@@ -4364,6 +4364,10 @@ fn scoreLeafMemberIds(
                 profile.filter_rejected += 1;
                 continue;
             }
+            if (req.key_predicate) |predicate| if (!try predicate.allows(predicate.ptr, metadata)) {
+                profile.filter_rejected += 1;
+                continue;
+            };
             scratch.member_ids[prefix_count] = member_id;
             scratch.positions[prefix_count] = original_index;
             prefix_count += 1;
@@ -4393,6 +4397,7 @@ fn scoreLeafMemberIds(
     const has_extra_filters = req.distance_over != null or req.distance_under != null;
     var scoring_req = req;
     scoring_req.filter_prefix = "";
+    scoring_req.key_predicate = null;
     scoring_req.filter_ids = &.{};
     scoring_req.exclude_ids = &.{};
     const empty_filter_state = search_types.RequestFilterState{};
@@ -6722,17 +6727,19 @@ fn memberMatchesRequestWithCachePolicy(
             if (distance - error_bound > threshold) return false;
         } else if (distance >= threshold) return false;
     }
-    if (req.filter_prefix.len > 0) {
+    if (req.filter_prefix.len > 0 or req.key_predicate != null) {
         if (use_cache) {
             if (borrowCachedMetadataHandle(self, txn, vector_id)) |cached_handle| {
                 var handle = cached_handle;
                 defer handle.deinit();
                 if (!std.mem.startsWith(u8, handle.view(), req.filter_prefix)) return false;
+                if (req.key_predicate) |predicate| return try predicate.allows(predicate.ptr, handle.view());
                 return true;
             }
         }
         const metadata = (try loadMetadataRawWithCachePolicy(self, txn, vector_id, use_cache, isNotFoundGeneric)) orelse return false;
         if (!std.mem.startsWith(u8, metadata, req.filter_prefix)) return false;
+        if (req.key_predicate) |predicate| return try predicate.allows(predicate.ptr, metadata);
     }
     return true;
 }
