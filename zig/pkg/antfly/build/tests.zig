@@ -5705,6 +5705,19 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         &graph_metric_integration_filters,
     );
     integration_test_step.dependOn(&run_graph_metric_integration_tests.step);
+    const graph_metric_default_tests = b.addTest(.{
+        .root_module = db_test_mod,
+        .filters = &.{"db graph metric runtime background default "},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const graph_metric_default_http_tests = b.addTest(.{
+        .root_module = api_http_runtime_test_mod,
+        .filters = &.{ "public table query handler preserves retryable failure status", "api http server preserves public query availability errors" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const graph_metric_default_step = b.step("antfly-graph-metric-default-test", "Verify lazy graph metric maintenance, owner lifecycle gates and readiness responses");
+    graph_metric_default_step.dependOn(&addFilteredTestRunArtifact(b, graph_metric_default_tests).step);
+    graph_metric_default_step.dependOn(&addFilteredTestRunArtifact(b, graph_metric_default_http_tests).step);
     // The full gate runs complete graph owner coverage from the same compiler
     // artifact used by the bounded base selection, including page contracts.
     integration_test_step.dependOn(graph_test_step);

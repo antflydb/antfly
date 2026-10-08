@@ -473,6 +473,106 @@ def test_graph_neighbors_traverse_and_shortest_path(serverless_api):
     assert [node["key"] for node in from_fused_result["nodes"]] == ["bob", "carol"]
 
 
+@pytest.mark.fresh_antfly_process
+@pytest.mark.parametrize("kind", ["degree", "pagerank"])
+@pytest.mark.parametrize("refresh", ["background", "manual"])
+def test_stateful_graph_metrics_publish_without_maintenance_configuration(
+    stateful_api, kind, refresh
+):
+    table = f"graph_metric_default_{kind}_{refresh}_{time.time_ns()}"
+    stateful_api.create_table(table)
+    _create_index(
+        stateful_api,
+        table,
+        "graph_idx",
+        {
+            "type": "graph",
+            "metrics": {
+                "rank": {"kind": kind, "refresh": refresh, "max_iterations": 4}
+            },
+        },
+    )
+    stateful_api.batch_write(
+        table,
+        inserts={
+            "a": {"name": "a", "_edges": {"graph_idx": {"cites": [{"target": "b"}]}}},
+            "b": {"name": "b", "_edges": {"graph_idx": {"cites": [{"target": "a"}]}}},
+        },
+        sync_level="full_index",
+    )
+    action_path = f"/tables/{table}/indexes/graph_idx/graph-metrics/rank"
+    if refresh == "manual":
+        not_ready = stateful_api._request(
+            "POST",
+            f"/tables/{table}/query",
+            {"limit": 0, "graph_metric": {"index": "graph_idx", "metric": "rank"}},
+        )
+        assert not_ready.status_code == 503, not_ready.text
+        assert not_ready.json()["code"] == "metric_not_ready"
+        assert not_ready.json()["retryable"] is True
+        stateful_api.post(f"{action_path}:refresh", {})
+
+    def published(after_generation=0):
+        response = stateful_api._request(
+            "POST",
+            f"/tables/{table}/query",
+            {
+                "limit": 0,
+                "graph_metric": {"index": "graph_idx", "metric": "rank", "top_k": 10},
+            },
+        )
+        # Publication is asynchronous; the first generation may not exist yet.
+        if response.status_code in (404, 409, 503):
+            return None
+        result = stateful_api._check(response)["responses"][0]["graph_metric_results"][
+            "rank"
+        ]
+        if result["status"]["published_generation"] <= after_generation:
+            return None
+        return result if len(result["scores"]) == 2 else None
+
+    result = wait_until(published, timeout_s=30.0, interval_s=0.1)
+    assert result is not None, stateful_api.debug_logs()
+    assert {row["node"] for row in result["scores"]} == {"a", "b"}
+    expected_score = 1.0 if kind == "degree" else 0.5
+    for row in result["scores"]:
+        assert row["score"] == pytest.approx(expected_score, abs=1e-6)
+    runtime = stateful_api.get(f"/tables/{table}/indexes/graph_idx")["status"][
+        "graph_metric_runtime"
+    ]
+    assert runtime["enabled"] is True
+    assert runtime["role"] == "combined"
+    assert runtime["owner_id_hash"] != 0
+
+    generation = result["status"]["published_generation"]
+    stateful_api.post(f"{action_path}:rebuild", {})
+    rebuilt = wait_until(lambda: published(generation), timeout_s=30.0, interval_s=0.1)
+    assert rebuilt is not None, stateful_api.debug_logs()
+    reranked = stateful_api.query_table(
+        table,
+        {
+            "limit": 10,
+            "graph_metric_rerank": {"index": "graph_idx", "metric": "rank"},
+        },
+    )
+    assert query_hits_total_value(reranked) == 2
+
+    if stateful_api.supports_restart:
+        stateful_api.restart_server()
+        persisted = wait_until(published, timeout_s=30.0, interval_s=0.1)
+        assert persisted is not None, stateful_api.debug_logs()
+        reopened_runtime = stateful_api.get(f"/tables/{table}/indexes/graph_idx")[
+            "status"
+        ]["graph_metric_runtime"]
+        assert reopened_runtime["owner_id_hash"] != runtime["owner_id_hash"]
+        generation = persisted["status"]["published_generation"]
+        stateful_api.post(f"{action_path}:rebuild", {})
+        assert (
+            wait_until(lambda: published(generation), timeout_s=30.0, interval_s=0.1)
+            is not None
+        )
+
+
 def test_stateful_graph_neighbors_traverse_and_shortest_path(backup_api):
     table_name = f"graph_stateful_{time.time_ns()}"
     neighbors_payload = {

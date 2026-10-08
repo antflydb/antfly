@@ -46,7 +46,10 @@ pub const Role = enum {
 };
 
 pub const Config = struct {
-    enabled: bool = false,
+    /// DB-owned combined runtimes generate a fresh incarnation identity for
+    /// runtime, lease owner, and page worker. Explicit split-role runtimes keep
+    /// their caller-supplied identities.
+    automatic_identity: bool = false,
     start_background_loop: bool = true,
     role: Role = .combined,
     runtime_id: []const u8 = "",
@@ -165,6 +168,7 @@ pub const MaintenanceBoundary = struct {
     };
 
     pub const VTable = struct {
+        has_metrics: ?*const fn (*anyopaque) bool = null,
         run_combined: *const fn (
             *anyopaque,
             index_manager_mod.IndexManager.GraphMetricPlannedMaintenanceOptions,
@@ -204,6 +208,10 @@ pub const MaintenanceBoundary = struct {
         return try self.vtable.run_combined(self.ptr, options);
     }
 
+    pub fn hasMetrics(self: MaintenanceBoundary) bool {
+        return if (self.vtable.has_metrics) |check| check(self.ptr) else true;
+    }
+
     pub fn runCoordinator(
         self: MaintenanceBoundary,
         options: index_manager_mod.IndexManager.GraphMetricPlannedSchedulerSweepOptions,
@@ -227,11 +235,16 @@ pub const MaintenanceBoundary = struct {
 };
 
 const direct_vtable = MaintenanceBoundary.VTable{
+    .has_metrics = directHasMetrics,
     .run_combined = directRunCombined,
     .run_coordinator = directRunCoordinator,
     .run_worker = directRunWorker,
     .run_worker_pool = directRunWorkerPool,
 };
+
+fn directHasMetrics(ptr: *anyopaque) bool {
+    return directIndexManager(ptr).hasConfiguredGraphMetrics();
+}
 
 fn directIndexManager(ptr: *anyopaque) *index_manager_mod.IndexManager {
     return @ptrCast(@alignCast(ptr));
@@ -328,11 +341,16 @@ pub const GraphMetricRuntime = if (builtin.os.tag == .freestanding) struct {
     }
 
     pub fn start(self: *@This()) !void {
-        if (self.config.enabled and self.config.start_background_loop) return error.UnsupportedPlatform;
+        if (self.config.start_background_loop) return error.UnsupportedPlatform;
     }
 
     pub fn notify(self: *@This()) void {
         _ = self;
+    }
+
+    pub fn notifyOpaque(ptr: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        self.notify();
     }
 
     pub fn stats(self: *@This()) Stats {
@@ -367,6 +385,7 @@ pub const GraphMetricRuntime = if (builtin.os.tag == .freestanding) struct {
     }
 } else struct {
     alloc: Allocator,
+    owned_identity: ?[]u8 = null,
     runtime_io: ?Io,
     maintenance_boundary: MaintenanceBoundary,
     config: Config,
@@ -377,6 +396,7 @@ pub const GraphMetricRuntime = if (builtin.os.tag == .freestanding) struct {
     shutdown: bool = false,
     notified: bool = false,
     future: ?Io.Future(void) = null,
+    background_start_allowed: bool = false,
     stats_snapshot: Stats = .{},
 
     pub fn init(
@@ -389,22 +409,36 @@ pub const GraphMetricRuntime = if (builtin.os.tag == .freestanding) struct {
     ) !GraphMetricRuntime {
         const runtime_io = backend_runtime.io();
         _ = apply_mutex;
-        if (config.enabled and runtime_io == null) return error.MissingBackendRuntimeIo;
-        try validateConfig(config);
-        const lease_key = try runtimeLeaseKeyAlloc(alloc, config);
+        if (runtime_io == null) return error.MissingBackendRuntimeIo;
+        var resolved_config = config;
+        var owned_identity: ?[]u8 = null;
+        errdefer if (owned_identity) |identity| alloc.free(identity);
+        if (config.automatic_identity) {
+            if (config.role != .combined) return error.InvalidGraphMetricRuntimeConfig;
+            var nonce: [16]u8 = undefined;
+            try @import("antfly_platform").entropy.fill(runtime_io orelse return error.MissingBackendRuntimeIo, &nonce);
+            const identity = try std.fmt.allocPrint(alloc, "graph-metric-{x}", .{std.mem.readInt(u128, &nonce, .little)});
+            owned_identity = identity;
+            resolved_config.runtime_id = identity;
+            resolved_config.owner_id = identity;
+            resolved_config.planned_options.worker_id = identity;
+        }
+        try validateConfig(resolved_config);
+        const lease_key = try runtimeLeaseKeyAlloc(alloc, resolved_config);
         errdefer alloc.free(lease_key);
         return .{
             .alloc = alloc,
+            .owned_identity = owned_identity,
             .runtime_io = runtime_io,
             .maintenance_boundary = MaintenanceBoundary.direct(index_manager),
-            .config = config,
+            .config = resolved_config,
             .lease_key = lease_key,
             .ownership = try ownership_mod.State.init(alloc, store, lease_key, .{
-                .lease_owned = config.lease_owned,
-                .owner_id = if (config.owner_id.len != 0) config.owner_id else config.runtime_id,
-                .lease_ttl_ms = config.lease_ttl_ms,
+                .lease_owned = resolved_config.lease_owned,
+                .owner_id = if (resolved_config.owner_id.len != 0) resolved_config.owner_id else resolved_config.runtime_id,
+                .lease_ttl_ms = resolved_config.lease_ttl_ms,
             }),
-            .stats_snapshot = initialStatsWithLeaseKey(config, lease_key),
+            .stats_snapshot = initialStatsWithLeaseKey(resolved_config, lease_key),
         };
     }
 
@@ -425,6 +459,7 @@ pub const GraphMetricRuntime = if (builtin.os.tag == .freestanding) struct {
         self.stopRuntime();
         self.ownership.deinit(self.alloc);
         self.alloc.free(self.lease_key);
+        if (self.owned_identity) |identity| self.alloc.free(identity);
         self.* = undefined;
     }
 
@@ -432,24 +467,45 @@ pub const GraphMetricRuntime = if (builtin.os.tag == .freestanding) struct {
         self.stopRuntime();
         self.ownership.deinitPreserveLease(self.alloc);
         self.alloc.free(self.lease_key);
+        if (self.owned_identity) |identity| self.alloc.free(identity);
         self.* = undefined;
     }
 
     pub fn start(self: *GraphMetricRuntime) !void {
-        if (!self.config.enabled) return;
         if (!self.config.start_background_loop) return;
         const runtime_io = self.runtime_io orelse return error.MissingBackendRuntimeIo;
-        self.future = try runtime_io.concurrent(workerMain, .{self});
-        self.recordStarted();
+        // Startup runs after index load, outside the catalog lock. Catalog
+        // notifications use notify() so they never reacquire that lock.
+        const configured = self.maintenance_boundary.hasMetrics();
+        self.mutex.lockUncancelable(runtime_io);
+        defer self.mutex.unlock(runtime_io);
+        self.background_start_allowed = true;
+        if (configured or self.notified) try self.startWorkerLocked(runtime_io);
+    }
+
+    fn startWorkerLocked(self: *GraphMetricRuntime, io: Io) !void {
+        if (self.shutdown or self.future != null) return;
+        self.future = try io.concurrent(workerMain, .{self});
+        self.stats_snapshot.started = true;
     }
 
     pub fn notify(self: *GraphMetricRuntime) void {
-        if (!self.config.enabled) return;
         const io = self.runtime_io orelse return;
         self.mutex.lockUncancelable(io);
         self.notified = true;
+        if (self.background_start_allowed) {
+            self.startWorkerLocked(io) catch |err| {
+                updateErrorStats(&self.stats_snapshot, err);
+                std.log.warn("graph metric maintenance startup failed: {s}", .{@errorName(err)});
+            };
+        }
         self.mutex.unlock(io);
         self.wake_event.set(io);
+    }
+
+    pub fn notifyOpaque(ptr: *anyopaque) void {
+        const self: *GraphMetricRuntime = @ptrCast(@alignCast(ptr));
+        self.notify();
     }
 
     pub fn stats(self: *GraphMetricRuntime) Stats {
@@ -470,7 +526,6 @@ pub const GraphMetricRuntime = if (builtin.os.tag == .freestanding) struct {
     }
 
     pub fn runOnceDetailed(self: *GraphMetricRuntime) !index_manager_mod.IndexManager.GraphMetricPlannedSchedulerSweepResult {
-        if (!self.config.enabled) return .{};
         self.recordTickStarted();
         const now_ms = self.config.clock.nowRealtimeMs();
         if (!self.ensureRuntimeLease(now_ms)) {
@@ -490,7 +545,6 @@ pub const GraphMetricRuntime = if (builtin.os.tag == .freestanding) struct {
         self: *GraphMetricRuntime,
         start_background_builds: bool,
     ) !index_manager_mod.IndexManager.GraphMetricPlannedSchedulerSweepResult {
-        if (!self.config.enabled) return .{};
         self.recordTickStarted();
         if (!coordinatorCallAllowed(self.config)) {
             const err = error.InvalidGraphMetricRuntimeRole;
@@ -519,7 +573,6 @@ pub const GraphMetricRuntime = if (builtin.os.tag == .freestanding) struct {
         self: *GraphMetricRuntime,
         worker_id: []const u8,
     ) !index_manager_mod.IndexManager.GraphMetricPlannedSchedulerSweepResult {
-        if (!self.config.enabled) return .{};
         self.recordTickStarted();
         if (!workerCallAllowed(self.config, worker_id)) {
             const err = error.InvalidGraphMetricBuildWorker;
@@ -546,7 +599,6 @@ pub const GraphMetricRuntime = if (builtin.os.tag == .freestanding) struct {
 
     pub fn runWorkerPoolOnce(self: *GraphMetricRuntime) !index_manager_mod.IndexManager.GraphMetricPlannedSchedulerSweepResult {
         if (!workerPoolCallAllowed(self.config)) {
-            if (!self.config.enabled) return .{};
             self.recordTickStarted();
             const err = error.InvalidGraphMetricRuntimeRole;
             self.recordTickError(err);
@@ -555,7 +607,6 @@ pub const GraphMetricRuntime = if (builtin.os.tag == .freestanding) struct {
         if (self.config.planned_options.worker_ids.len == 0) {
             return try self.runWorkerOnce(self.config.planned_options.worker_id);
         }
-        if (!self.config.enabled) return .{};
         self.recordTickStarted();
         const now_ms = self.config.clock.nowRealtimeMs();
         if (!self.ensureRuntimeLease(now_ms)) {
@@ -644,17 +695,6 @@ pub const GraphMetricRuntime = if (builtin.os.tag == .freestanding) struct {
         };
     }
 
-    fn recordStarted(self: *GraphMetricRuntime) void {
-        const runtime_io = self.runtime_io orelse {
-            self.stats_snapshot.started = true;
-            return;
-        };
-        const io = runtime_io;
-        self.mutex.lockUncancelable(io);
-        self.stats_snapshot.started = true;
-        self.mutex.unlock(io);
-    }
-
     fn recordTickStarted(self: *GraphMetricRuntime) void {
         const runtime_io = self.runtime_io orelse {
             self.stats_snapshot.ticks_started += 1;
@@ -730,7 +770,7 @@ fn updateErrorStats(stats_snapshot: *Stats, err: anyerror) void {
 
 pub fn initialStats(config: Config) Stats {
     return .{
-        .enabled = config.enabled,
+        .enabled = true,
         .role = config.role,
         .runtime_id_hash = identityHash(config.runtime_id),
         .owner_id_hash = identityHash(runtimeOwnerId(config)),
@@ -835,7 +875,6 @@ pub fn runBoundaryTick(
 }
 
 fn validateConfig(config: Config) !void {
-    if (!config.enabled) return;
     if (config.lease_ttl_ms == 0) return error.InvalidGraphMetricRuntimeConfig;
     if (config.lease_owned and
         (config.owner_id.len == 0 or std.mem.eql(u8, config.owner_id, "local")))
@@ -907,41 +946,26 @@ fn configuredWorkerCount(config: Config) usize {
     return if (config.planned_options.worker_id.len == 0) 0 else 1;
 }
 
-test "graph metric runtime config rejects zero lease and maintenance budgets when enabled" {
+test "graph metric runtime config rejects zero lease and maintenance budgets" {
     try std.testing.expectError(error.InvalidGraphMetricRuntimeConfig, validateConfig(.{
-        .enabled = true,
         .lease_ttl_ms = 0,
     }));
     try std.testing.expectError(error.InvalidGraphMetricRuntimeConfig, validateConfig(.{
-        .enabled = true,
         .planned_options = .{ .max_rounds = 0 },
     }));
     try std.testing.expectError(error.InvalidGraphMetricRuntimeConfig, validateConfig(.{
-        .enabled = true,
         .planned_options = .{ .max_metrics_per_round = 0 },
     }));
     try std.testing.expectError(error.InvalidGraphMetricRuntimeConfig, validateConfig(.{
-        .enabled = true,
         .planned_options = .{ .max_pages_per_round = 0 },
     }));
-    try validateConfig(.{
-        .enabled = false,
-        .lease_ttl_ms = 0,
-        .planned_options = .{
-            .max_rounds = 0,
-            .max_metrics_per_round = 0,
-            .max_pages_per_round = 0,
-        },
-    });
 }
 
 test "graph metric runtime requires an explicit incarnation owner for leased operation" {
     try std.testing.expectError(error.InvalidGraphMetricRuntimeConfig, validateConfig(.{
-        .enabled = true,
         .lease_owned = true,
     }));
     try validateConfig(.{
-        .enabled = true,
         .lease_owned = true,
         .owner_id = "runtime-a:pid-42:start-100",
     });
@@ -951,17 +975,14 @@ test "graph metric runtime config rejects worker id lists for single-owner roles
     const workers = [_][]const u8{ "worker-a", "worker-b" };
 
     try validateConfig(.{
-        .enabled = true,
         .role = .coordinator,
         .planned_options = .{ .worker_id = "coordinator-unused" },
     });
     try std.testing.expectError(error.InvalidGraphMetricBuildWorker, validateConfig(.{
-        .enabled = true,
         .role = .coordinator,
         .planned_options = .{ .worker_ids = workers[0..] },
     }));
     try std.testing.expectError(error.InvalidGraphMetricBuildWorker, validateConfig(.{
-        .enabled = true,
         .role = .worker,
         .planned_options = .{
             .worker_id = "worker-a",
@@ -972,7 +993,6 @@ test "graph metric runtime config rejects worker id lists for single-owner roles
 
 test "graph metric runtime role gates apply without durable lease ownership" {
     const combined = Config{
-        .enabled = true,
         .role = .combined,
         .lease_owned = false,
         .planned_options = .{ .worker_id = "combined-worker" },
@@ -982,7 +1002,6 @@ test "graph metric runtime role gates apply without durable lease ownership" {
     try std.testing.expect(workerPoolCallAllowed(combined));
 
     const coordinator = Config{
-        .enabled = true,
         .role = .coordinator,
         .lease_owned = false,
         .planned_options = .{ .worker_id = "coordinator-unused" },
@@ -992,7 +1011,6 @@ test "graph metric runtime role gates apply without durable lease ownership" {
     try std.testing.expect(!workerPoolCallAllowed(coordinator));
 
     const worker = Config{
-        .enabled = true,
         .role = .worker,
         .lease_owned = false,
         .planned_options = .{ .worker_id = "worker-a" },
@@ -1004,7 +1022,6 @@ test "graph metric runtime role gates apply without durable lease ownership" {
 
     const pool_workers = [_][]const u8{ "pool-a", "pool-b" };
     const worker_pool = Config{
-        .enabled = true,
         .role = .worker_pool,
         .lease_owned = false,
         .planned_options = .{ .worker_ids = pool_workers[0..] },
@@ -1025,19 +1042,16 @@ test "graph metric runtime worker pool identity is order independent" {
     const workers_ac = [_][]const u8{ "worker-a", "worker-c" };
 
     const config_ab = Config{
-        .enabled = true,
         .role = .worker_pool,
         .lease_owned = true,
         .planned_options = .{ .worker_ids = workers_ab[0..] },
     };
     const config_ba = Config{
-        .enabled = true,
         .role = .worker_pool,
         .lease_owned = true,
         .planned_options = .{ .worker_ids = workers_ba[0..] },
     };
     const config_ac = Config{
-        .enabled = true,
         .role = .worker_pool,
         .lease_owned = true,
         .planned_options = .{ .worker_ids = workers_ac[0..] },
@@ -1137,7 +1151,6 @@ test "graph metric runtime boundary tick preserves worker pool operation" {
     const workers = [_][]const u8{ "worker-a", "worker-b" };
     var fake = FakeMaintenanceBoundary{};
     const result = try runBoundaryTick(fake.boundary(), .{
-        .enabled = true,
         .role = .worker_pool,
         .planned_options = .{
             .worker_id = "unused-worker",
@@ -1206,6 +1219,22 @@ fn waitForGraphMetricPairFresh(
 fn workerMain(runtime: *GraphMetricRuntime) void {
     while (true) {
         if (isShutdown(runtime)) return;
+        if (!runtime.maintenance_boundary.hasMetrics()) {
+            // Dropping the last metric parks the worker without polling or
+            // renewing a lease. A later catalog install or close wakes it.
+            const io = runtime.runtime_io orelse return;
+            runtime.mutex.lockUncancelable(io);
+            runtime.ownership.release();
+            if (runtime.notified or runtime.shutdown) {
+                runtime.notified = false;
+                runtime.mutex.unlock(io);
+                continue;
+            }
+            runtime.wake_event.reset();
+            runtime.mutex.unlock(io);
+            runtime.wake_event.waitUncancelable(io);
+            continue;
+        }
         const ran = runtime.runOnce() catch |err| {
             if (builtin.os.tag != .freestanding) {
                 std.log.warn("graph metric maintenance worker failed: {s}", .{@errorName(err)});
@@ -1335,7 +1364,6 @@ test "db graph metric runtime lease ownership blocks duplicate owners and allows
         resources.apply_mutex,
         db.backend_runtime,
         .{
-            .enabled = true,
             .runtime_id = "runtime-owned-a",
             .lease_owned = true,
             .owner_id = "runtime-owner-a",
@@ -1357,7 +1385,6 @@ test "db graph metric runtime lease ownership blocks duplicate owners and allows
         resources.apply_mutex,
         db.backend_runtime,
         .{
-            .enabled = true,
             .runtime_id = "runtime-owned-b",
             .lease_owned = true,
             .owner_id = "runtime-owner-b",
@@ -1467,7 +1494,6 @@ test "db graph metric runtime lease releases durable owner lease on deinit" {
         resources.apply_mutex,
         db.backend_runtime,
         .{
-            .enabled = true,
             .runtime_id = "runtime-release-a",
             .lease_owned = true,
             .owner_id = "runtime-release-owner-a",
@@ -1519,7 +1545,6 @@ test "db graph metric runtime lease releases durable owner lease on deinit" {
         resources.apply_mutex,
         db.backend_runtime,
         .{
-            .enabled = true,
             .runtime_id = "runtime-release-b",
             .lease_owned = true,
             .owner_id = "runtime-release-owner-b",
@@ -1576,7 +1601,6 @@ test "db graph metric runtime lease stale deinit preserves replacement owner lea
         resources.apply_mutex,
         db.backend_runtime,
         .{
-            .enabled = true,
             .runtime_id = "runtime-stale-release-a",
             .lease_owned = true,
             .owner_id = "runtime-stale-release-owner-a",
@@ -1622,7 +1646,6 @@ test "db graph metric runtime lease stale deinit preserves replacement owner lea
         resources.apply_mutex,
         db.backend_runtime,
         .{
-            .enabled = true,
             .runtime_id = "runtime-stale-release-b",
             .lease_owned = true,
             .owner_id = "runtime-stale-release-owner-b",
@@ -1678,7 +1701,6 @@ test "db graph metric runtime lease stale deinit preserves replacement owner lea
         resources.apply_mutex,
         db.backend_runtime,
         .{
-            .enabled = true,
             .runtime_id = "runtime-stale-release-c",
             .lease_owned = true,
             .owner_id = "runtime-stale-release-owner-c",
@@ -1759,7 +1781,6 @@ test "db graph metric runtime role leases allow split owners and block duplicate
         resources.apply_mutex,
         db.backend_runtime,
         .{
-            .enabled = true,
             .role = .coordinator,
             .runtime_id = "runtime-role-lease-coordinator-a",
             .lease_owned = true,
@@ -1782,7 +1803,6 @@ test "db graph metric runtime role leases allow split owners and block duplicate
         resources.apply_mutex,
         db.backend_runtime,
         .{
-            .enabled = true,
             .role = .coordinator,
             .runtime_id = "runtime-role-lease-coordinator-b",
             .lease_owned = true,
@@ -1805,7 +1825,6 @@ test "db graph metric runtime role leases allow split owners and block duplicate
         resources.apply_mutex,
         db.backend_runtime,
         .{
-            .enabled = true,
             .role = .worker,
             .runtime_id = "runtime-role-lease-worker",
             .lease_owned = true,
@@ -1828,7 +1847,6 @@ test "db graph metric runtime role leases allow split owners and block duplicate
         resources.apply_mutex,
         db.backend_runtime,
         .{
-            .enabled = true,
             .role = .worker,
             .runtime_id = "runtime-role-lease-worker-duplicate",
             .lease_owned = true,
@@ -1949,7 +1967,6 @@ test "db graph metric runtime role worker leases are scoped by worker identity" 
         resources.apply_mutex,
         db.backend_runtime,
         .{
-            .enabled = true,
             .role = .worker,
             .runtime_id = "runtime-worker-lease-a",
             .lease_owned = true,
@@ -1972,7 +1989,6 @@ test "db graph metric runtime role worker leases are scoped by worker identity" 
         resources.apply_mutex,
         db.backend_runtime,
         .{
-            .enabled = true,
             .role = .worker,
             .runtime_id = "runtime-worker-lease-b",
             .lease_owned = true,
@@ -1995,7 +2011,6 @@ test "db graph metric runtime role worker leases are scoped by worker identity" 
         resources.apply_mutex,
         db.backend_runtime,
         .{
-            .enabled = true,
             .role = .worker,
             .runtime_id = "runtime-worker-lease-a-duplicate",
             .lease_owned = true,
@@ -2106,7 +2121,6 @@ test "db graph metric runtime role worker pool leases are scoped by worker ident
         resources.apply_mutex,
         db.backend_runtime,
         .{
-            .enabled = true,
             .role = .worker_pool,
             .runtime_id = "runtime-worker-pool-lease-a",
             .lease_owned = true,
@@ -2129,7 +2143,6 @@ test "db graph metric runtime role worker pool leases are scoped by worker ident
         resources.apply_mutex,
         db.backend_runtime,
         .{
-            .enabled = true,
             .role = .worker_pool,
             .runtime_id = "runtime-worker-pool-lease-a-reordered",
             .lease_owned = true,
@@ -2152,7 +2165,6 @@ test "db graph metric runtime role worker pool leases are scoped by worker ident
         resources.apply_mutex,
         db.backend_runtime,
         .{
-            .enabled = true,
             .role = .worker_pool,
             .runtime_id = "runtime-worker-pool-lease-b",
             .lease_owned = true,
@@ -2245,7 +2257,6 @@ test "db graph metric runtime role planned worker pools reject duplicate worker 
         resources.apply_mutex,
         db.backend_runtime,
         .{
-            .enabled = true,
             .role = .worker_pool,
             .runtime_id = "runtime-worker-pool-duplicate",
             .planned_options = .{
@@ -2284,7 +2295,6 @@ test "db graph metric runtime role owned runtime worker calls are bound to confi
         resources.apply_mutex,
         db.backend_runtime,
         .{
-            .enabled = true,
             .role = .worker,
             .runtime_id = "runtime-owned-bound-worker",
             .lease_owned = true,
@@ -2336,7 +2346,6 @@ test "db graph metric runtime role owned runtime worker calls are bound to confi
         resources.apply_mutex,
         db.backend_runtime,
         .{
-            .enabled = true,
             .role = .worker_pool,
             .runtime_id = "runtime-owned-bound-pool",
             .lease_owned = true,
@@ -2384,7 +2393,6 @@ test "db graph metric runtime role owned runtime worker calls are bound to confi
         resources.apply_mutex,
         db.backend_runtime,
         .{
-            .enabled = true,
             .role = .coordinator,
             .runtime_id = "runtime-owned-bound-coordinator",
             .lease_owned = true,
@@ -2456,7 +2464,6 @@ test "db graph metric runtime role automatic coordinator and worker loops stay s
         resources.apply_mutex,
         db.backend_runtime,
         .{
-            .enabled = true,
             .role = .coordinator,
             .runtime_id = "runtime-role-coordinator-owner",
             .planned_options = .{
@@ -2476,7 +2483,6 @@ test "db graph metric runtime role automatic coordinator and worker loops stay s
         resources.apply_mutex,
         db.backend_runtime,
         .{
-            .enabled = true,
             .role = .worker,
             .runtime_id = "runtime-role-worker-owner",
             .planned_options = .{
@@ -2642,7 +2648,6 @@ test "db graph metric runtime role distinct worker owners complete separate acti
         resources.apply_mutex,
         db.backend_runtime,
         .{
-            .enabled = true,
             .role = .coordinator,
             .runtime_id = "runtime-distinct-workers-coordinator",
             .lease_owned = true,
@@ -2666,7 +2671,6 @@ test "db graph metric runtime role distinct worker owners complete separate acti
         resources.apply_mutex,
         db.backend_runtime,
         .{
-            .enabled = true,
             .role = .worker,
             .runtime_id = "runtime-distinct-worker-a",
             .lease_owned = true,
@@ -2690,7 +2694,6 @@ test "db graph metric runtime role distinct worker owners complete separate acti
         resources.apply_mutex,
         db.backend_runtime,
         .{
-            .enabled = true,
             .role = .worker,
             .runtime_id = "runtime-distinct-worker-b",
             .lease_owned = true,
@@ -2714,7 +2717,6 @@ test "db graph metric runtime role distinct worker owners complete separate acti
         resources.apply_mutex,
         db.backend_runtime,
         .{
-            .enabled = true,
             .role = .worker,
             .runtime_id = "runtime-distinct-worker-a-replacement",
             .lease_owned = true,
@@ -2860,7 +2862,7 @@ test "db graph metric runtime role distinct worker owners complete separate acti
     defer metric_result.deinit();
     try std.testing.expectEqual(@as(usize, 1), metric_result.graph_metric_results.len);
     try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric_result.graph_metric_results[0].status.state);
-    try std.testing.expectEqual(target_generation, metric_result.graph_metric_results[0].status.published_generation);
+    try std.testing.expectEqual(target_generation, metric_result.graph_metric_results[0].status.published_edge_generation);
     try std.testing.expectEqualStrings("doc:hub", metric_result.graph_metric_results[0].scores[0].node);
 }
 
@@ -2919,7 +2921,6 @@ test "db graph metric runtime background skips paused metrics" {
         resources.apply_mutex,
         db.backend_runtime,
         .{
-            .enabled = true,
             .runtime_id = "runtime-paused-degree",
             .planned_options = .{
                 .worker_id = "runtime-paused-degree-worker",
@@ -3027,7 +3028,6 @@ test "db graph metric runtime background idles after synchronously cleaning a sm
         resources.apply_mutex,
         db.backend_runtime,
         .{
-            .enabled = true,
             .runtime_id = "runtime-failed-terminal-degree",
             .planned_options = .{
                 .worker_id = "runtime-failed-terminal-degree-worker",
@@ -3171,7 +3171,6 @@ test "db graph metric runtime background skips paused active planned builds" {
         resources.apply_mutex,
         db.backend_runtime,
         .{
-            .enabled = true,
             .runtime_id = "runtime-paused-active-degree",
             .planned_options = .{
                 .worker_id = "runtime-paused-active-degree-worker",
@@ -3296,7 +3295,7 @@ test "db graph metric runtime background skips paused active planned builds" {
     try std.testing.expectApproxEqAbs(@as(f64, 1.0), metric_result.graph_metric_results[0].scores[0].score, 0.001);
 }
 
-test "db graph metric runtime background starts automatically and drains notified degree" {
+test "db graph metric runtime background default starts automatically and drains notified degree" {
     const DB = @import("../mod.zig").DB;
     var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
     defer allocator_state.deinit();
@@ -3308,20 +3307,22 @@ test "db graph metric runtime background starts automatically and drains notifie
 
     var db = try DB.open(alloc, std.mem.span(path), .{
         .ttl_cleanup = .{ .enabled = false },
-        .graph_metric_maintenance = .{
-            .enabled = true,
-            .runtime_id = "runtime-auto-degree",
-            .idle_interval_ms = 1,
-            .error_interval_ms = 1,
-            .planned_options = .{
-                .worker_id = "runtime-auto-degree-worker",
-                .max_rounds = 1,
-                .max_metrics_per_round = 8,
-                .max_pages_per_round = 1,
-            },
-        },
     });
     defer db.close();
+    const runtime = db.graph_metric_runtime orelse return error.GraphMetricRuntimeNotInitialized;
+    try std.testing.expect(!runtime.stats().started);
+    try std.testing.expect(runtime.stats().lease_owned);
+    try std.testing.expect(runtime.config.owner_id.len > 0);
+    try std.testing.expectEqualStrings(runtime.config.owner_id, runtime.config.runtime_id);
+    try std.testing.expectEqualStrings(runtime.config.owner_id, runtime.config.planned_options.worker_id);
+    try db.addIndex(.{ .name = "plain_graph", .kind = .graph, .config_json = "{}" });
+    yieldToBackground(&db);
+    try std.testing.expect(!runtime.stats().started);
+    try std.testing.expect(!runtime.stats().has_lease);
+    try std.testing.expectEqual(@as(u64, 0), runtime.stats().ticks_started);
+    var lease = try runtime.ownership.loadLease(alloc);
+    defer if (lease) |*record| lease_mod.deinitRecord(alloc, record);
+    try std.testing.expect(lease == null);
 
     try db.addIndex(.{
         .name = "graph_idx",
@@ -3367,8 +3368,8 @@ test "db graph metric runtime background starts automatically and drains notifie
         const runtime_stats = db.graphMetricRuntimeStats();
         try std.testing.expect(runtime_stats.enabled);
         try std.testing.expectEqual(types.GraphMetricRuntimeRole.combined, runtime_stats.role.?);
-        try std.testing.expectEqual(std.hash.Wyhash.hash(0, "runtime-auto-degree"), runtime_stats.runtime_id_hash);
-        try std.testing.expectEqual(std.hash.Wyhash.hash(0, "runtime-auto-degree-worker"), runtime_stats.worker_id_hash);
+        try std.testing.expectEqual(std.hash.Wyhash.hash(0, runtime.config.runtime_id), runtime_stats.runtime_id_hash);
+        try std.testing.expectEqual(std.hash.Wyhash.hash(0, runtime.config.planned_options.worker_id), runtime_stats.worker_id_hash);
         try std.testing.expect(runtime_stats.ticks_started > 0);
         try std.testing.expect(runtime_stats.durable_progress_ticks > 0);
         try std.testing.expectEqual(@as(u64, 0), runtime_stats.error_ticks);
@@ -3402,6 +3403,162 @@ test "db graph metric runtime background starts automatically and drains notifie
     try std.testing.expectEqual(target_generation, metric_result.graph_metric_results[0].status.published_generation);
     try std.testing.expectEqualStrings("doc:a", metric_result.graph_metric_results[0].scores[0].node);
     try std.testing.expectApproxEqAbs(@as(f64, 1.0), metric_result.graph_metric_results[0].scores[0].score, 0.001);
+}
+
+fn waitForDefaultMetric(db: *@import("../mod.zig").DB, name: []const u8, after_generation: u64) !u64 {
+    for (0..1_000) |_| {
+        yieldToBackground(db);
+        var result = db.search(db.alloc, .{
+            .graph_metric_queries = &.{.{
+                .name = "metric",
+                .query = .{ .index_name = "graph_idx", .metric_name = name, .top_k = 10, .freshness = .fresh },
+            }},
+            .limit = 0,
+        }) catch |err| switch (err) {
+            error.MetricNotReady, error.MetricStale => continue,
+            else => return err,
+        };
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), result.graph_metric_results.len);
+        const metric = result.graph_metric_results[0];
+        if (metric.status.published_generation <= after_generation) continue;
+        try std.testing.expectEqual(@as(usize, 2), metric.scores.len);
+        return metric.status.published_generation;
+    }
+    return error.GraphMetricBuildDidNotConverge;
+}
+
+test "db graph metric runtime background default parks after last metric removal and wakes on install" {
+    const DB = @import("../mod.zig").DB;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.fastTempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+    const config = types.IndexConfig{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"rank\":{\"kind\":\"degree\",\"refresh\":\"manual\"}}}",
+    };
+    try db.addIndex(config);
+    const runtime = db.graph_metric_runtime.?;
+    for (0..1_000) |_| {
+        if (runtime.stats().has_lease) break;
+        yieldToBackground(&db);
+    } else return error.GraphMetricRuntimeDidNotAcquireLease;
+    try std.testing.expect(try db.deleteIndex("graph_idx"));
+    for (0..1_000) |_| {
+        if (!runtime.stats().has_lease) break;
+        yieldToBackground(&db);
+    } else return error.GraphMetricRuntimeDidNotReleaseLease;
+    const parked_ticks = runtime.stats().ticks_started;
+    yieldToBackground(&db);
+    try std.testing.expectEqual(parked_ticks, runtime.stats().ticks_started);
+    try db.addIndex(config);
+    for (0..1_000) |_| {
+        if (runtime.stats().has_lease) break;
+        yieldToBackground(&db);
+    } else return error.GraphMetricRuntimeDidNotReacquireLease;
+    try std.testing.expect(runtime.stats().ticks_started > parked_ticks);
+}
+
+test "db graph metric runtime background default publishes pagerank refresh rebuild and queued restart work" {
+    const DB = @import("../mod.zig").DB;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.fastTempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+    var previous_owner_hash: u64 = 0;
+    var previous_generation: u64 = 0;
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+        previous_owner_hash = db.graph_metric_runtime.?.stats().owner_id_hash;
+        try db.addIndex(.{
+            .name = "graph_idx",
+            .kind = .graph,
+            .config_json = "{\"metrics\":{\"rank\":{\"kind\":\"pagerank\",\"max_iterations\":2},\"manual\":{\"kind\":\"degree\",\"refresh\":\"manual\"}}}",
+        });
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "doc:a", .value = "{\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\"}]}}}" },
+                .{ .key = "doc:b", .value = "{\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:a\"}]}}}" },
+            },
+            .sync_level = .full_index,
+        });
+        _ = try waitForDefaultMetric(&db, "rank", 0);
+        var refresh = try db.refreshGraphMetric(alloc, "graph_idx", "manual");
+        defer refresh.deinit(alloc);
+        const generation = try waitForDefaultMetric(&db, "manual", 0);
+        var rebuild = try db.rebuildGraphMetric(alloc, "graph_idx", "manual");
+        defer rebuild.deinit(alloc);
+        previous_generation = try waitForDefaultMetric(&db, "manual", generation);
+    }
+    {
+        // An external maintenance driver can opt out and leave a durable
+        // request behind. The next ordinary open must resume it automatically.
+        var db = try DB.open(alloc, std.mem.span(path), .{ .graph_metric_maintenance = .{ .start_background_loop = false } });
+        defer db.close();
+        try std.testing.expect(!db.graph_metric_runtime.?.stats().started);
+        var rebuild = try db.rebuildGraphMetric(alloc, "graph_idx", "manual");
+        defer rebuild.deinit(alloc);
+        try std.testing.expect(rebuild.build_queued);
+    }
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+        try std.testing.expect(previous_owner_hash != db.graph_metric_runtime.?.stats().owner_id_hash);
+        _ = try waitForDefaultMetric(&db, "manual", previous_generation);
+        try std.testing.expect(db.graph_metric_runtime.?.stats().has_lease);
+    }
+}
+
+test "db graph metric runtime background default respects readonly standby and worker gates" {
+    const DB = @import("../mod.zig").DB;
+    const OpenOptions = @import("../mod.zig").OpenOptions;
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.fastTempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        db.close();
+    }
+    const Gate = struct {
+        fn check(_: *const anyopaque) !void {
+            return error.ReadOnly;
+        }
+    };
+    var gate_context: u8 = 0;
+    for ([_]OpenOptions{
+        .{ .start_index_workers = false },
+        .{ .start_optional_runtimes = false },
+        .{ .open_mode = .query_readonly },
+        .{ .open_mode = .status_only },
+        .{ .replication_write_gate = .{ .borrowed = .{ .ptr = &gate_context, .check_fn = Gate.check, .allows_background_work = false } } },
+    }) |options| {
+        var db = try DB.open(alloc, std.mem.span(path), options);
+        defer db.close();
+        try std.testing.expect(db.graph_metric_runtime == null);
+        try std.testing.expect(!db.graphMetricRuntimeStats().enabled);
+    }
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtime_workers = false });
+    defer db.close();
+    try std.testing.expect(db.graph_metric_runtime != null);
+    try std.testing.expect(!db.graph_metric_runtime.?.stats().started);
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"rank\":{\"kind\":\"degree\"}}}",
+    });
+    try std.testing.expect(!db.graph_metric_runtime.?.stats().started);
 }
 
 test "db graph metric runtime background open-configured split owners publish degree" {
@@ -3466,7 +3623,6 @@ test "db graph metric runtime background open-configured split owners publish de
                 .open_mode = .writer_no_replay,
                 .ttl_cleanup = .{ .enabled = false },
                 .graph_metric_maintenance = .{
-                    .enabled = true,
                     .start_background_loop = false,
                     .role = .coordinator,
                     .runtime_id = "open-configured-coordinator",
@@ -3504,7 +3660,6 @@ test "db graph metric runtime background open-configured split owners publish de
                 .open_mode = .writer_no_replay,
                 .ttl_cleanup = .{ .enabled = false },
                 .graph_metric_maintenance = .{
-                    .enabled = true,
                     .start_background_loop = false,
                     .role = .worker_pool,
                     .runtime_id = "open-configured-worker-pool",
@@ -3543,7 +3698,6 @@ test "db graph metric runtime background open-configured split owners publish de
                 .open_mode = .writer_no_replay,
                 .ttl_cleanup = .{ .enabled = false },
                 .graph_metric_maintenance = .{
-                    .enabled = true,
                     .start_background_loop = false,
                     .role = .coordinator,
                     .runtime_id = "open-configured-coordinator",
@@ -3653,7 +3807,6 @@ test "db graph metric runtime background separates coordinator and worker ticks"
         resources.apply_mutex,
         db.backend_runtime,
         .{
-            .enabled = true,
             .planned_options = .{
                 .worker_id = "runtime-split-worker",
                 .max_rounds = 1,
@@ -3780,7 +3933,6 @@ test "db graph metric runtime background coordinator and worker loops publish de
         resources.apply_mutex,
         db.backend_runtime,
         .{
-            .enabled = true,
             .role = .coordinator,
             .runtime_id = "runtime-bg-coordinator-owner",
             .idle_interval_ms = 1,
@@ -3802,7 +3954,6 @@ test "db graph metric runtime background coordinator and worker loops publish de
         resources.apply_mutex,
         db.backend_runtime,
         .{
-            .enabled = true,
             .role = .worker,
             .runtime_id = "runtime-bg-worker-owner",
             .idle_interval_ms = 1,
@@ -3938,7 +4089,6 @@ test "db graph metric runtime background coordinator and worker pool loops publi
         resources.apply_mutex,
         db.backend_runtime,
         .{
-            .enabled = true,
             .role = .coordinator,
             .runtime_id = "runtime-bg-pool-coordinator-owner",
             .idle_interval_ms = 1,
@@ -3961,7 +4111,6 @@ test "db graph metric runtime background coordinator and worker pool loops publi
         resources.apply_mutex,
         db.backend_runtime,
         .{
-            .enabled = true,
             .role = .worker_pool,
             .runtime_id = "runtime-bg-pool-worker-owner",
             .idle_interval_ms = 1,
@@ -4089,7 +4238,6 @@ test "db graph metric runtime background coordinator and worker pool loops publi
         resources.apply_mutex,
         db.backend_runtime,
         .{
-            .enabled = true,
             .role = .coordinator,
             .runtime_id = "runtime-bg-pagerank-pool-coordinator-owner",
             .idle_interval_ms = 1,
@@ -4112,7 +4260,6 @@ test "db graph metric runtime background coordinator and worker pool loops publi
         resources.apply_mutex,
         db.backend_runtime,
         .{
-            .enabled = true,
             .role = .worker_pool,
             .runtime_id = "runtime-bg-pagerank-pool-worker-owner",
             .idle_interval_ms = 1,
@@ -4239,7 +4386,6 @@ test "db graph metric runtime background coordinator and worker pool loops publi
         resources.apply_mutex,
         db.backend_runtime,
         .{
-            .enabled = true,
             .role = .coordinator,
             .runtime_id = "runtime-bg-eigenvector-pool-coordinator-owner",
             .idle_interval_ms = 1,
@@ -4262,7 +4408,6 @@ test "db graph metric runtime background coordinator and worker pool loops publi
         resources.apply_mutex,
         db.backend_runtime,
         .{
-            .enabled = true,
             .role = .worker_pool,
             .runtime_id = "runtime-bg-eigenvector-pool-worker-owner",
             .idle_interval_ms = 1,
@@ -4388,7 +4533,6 @@ test "db graph metric runtime background coordinator and worker pool loops publi
         resources.apply_mutex,
         db.backend_runtime,
         .{
-            .enabled = true,
             .role = .coordinator,
             .runtime_id = "runtime-bg-hits-pool-coordinator-owner",
             .idle_interval_ms = 1,
@@ -4411,7 +4555,6 @@ test "db graph metric runtime background coordinator and worker pool loops publi
         resources.apply_mutex,
         db.backend_runtime,
         .{
-            .enabled = true,
             .role = .worker_pool,
             .runtime_id = "runtime-bg-hits-pool-worker-owner",
             .idle_interval_ms = 1,
@@ -4580,7 +4723,6 @@ test "db graph metric runtime background worker pool survives separate reopened 
                 worker_resources.apply_mutex,
                 worker_pool.backend_runtime,
                 .{
-                    .enabled = true,
                     .role = .worker_pool,
                     .runtime_id = "runtime-reopened-pool-worker-owner",
                     .lease_owned = true,
@@ -4615,7 +4757,6 @@ test "db graph metric runtime background worker pool survives separate reopened 
                     worker_resources.apply_mutex,
                     worker_pool.backend_runtime,
                     .{
-                        .enabled = true,
                         .role = .worker_pool,
                         .runtime_id = "runtime-reopened-pool-worker-owner-duplicate",
                         .lease_owned = true,
@@ -4663,7 +4804,6 @@ test "db graph metric runtime background worker pool survives separate reopened 
                 coordinator_resources.apply_mutex,
                 coordinator.backend_runtime,
                 .{
-                    .enabled = true,
                     .role = .coordinator,
                     .runtime_id = "runtime-reopened-pool-coordinator-owner",
                     .lease_owned = true,
@@ -4807,7 +4947,6 @@ test "db graph metric runtime background open-configured pagerank worker pool su
                 .open_mode = .writer_no_replay,
                 .ttl_cleanup = .{ .enabled = false },
                 .graph_metric_maintenance = .{
-                    .enabled = true,
                     .start_background_loop = false,
                     .role = .worker_pool,
                     .runtime_id = "runtime-reopened-pagerank-pool-worker-owner",
@@ -4846,7 +4985,6 @@ test "db graph metric runtime background open-configured pagerank worker pool su
                     duplicate_resources.apply_mutex,
                     worker_pool.backend_runtime,
                     .{
-                        .enabled = true,
                         .role = .worker_pool,
                         .runtime_id = "runtime-reopened-pagerank-pool-worker-owner-duplicate",
                         .lease_owned = true,
@@ -4885,7 +5023,6 @@ test "db graph metric runtime background open-configured pagerank worker pool su
                 .open_mode = .writer_no_replay,
                 .ttl_cleanup = .{ .enabled = false },
                 .graph_metric_maintenance = .{
-                    .enabled = true,
                     .start_background_loop = false,
                     .role = .coordinator,
                     .runtime_id = "runtime-reopened-pagerank-pool-coordinator-owner",
@@ -5033,7 +5170,6 @@ test "db graph metric runtime background open-configured eigenvector worker pool
                 .open_mode = .writer_no_replay,
                 .ttl_cleanup = .{ .enabled = false },
                 .graph_metric_maintenance = .{
-                    .enabled = true,
                     .start_background_loop = false,
                     .role = .worker_pool,
                     .runtime_id = "runtime-reopened-eigenvector-pool-worker-owner",
@@ -5072,7 +5208,6 @@ test "db graph metric runtime background open-configured eigenvector worker pool
                     duplicate_resources.apply_mutex,
                     worker_pool.backend_runtime,
                     .{
-                        .enabled = true,
                         .role = .worker_pool,
                         .runtime_id = "runtime-reopened-eigenvector-pool-worker-owner-duplicate",
                         .lease_owned = true,
@@ -5111,7 +5246,6 @@ test "db graph metric runtime background open-configured eigenvector worker pool
                 .open_mode = .writer_no_replay,
                 .ttl_cleanup = .{ .enabled = false },
                 .graph_metric_maintenance = .{
-                    .enabled = true,
                     .start_background_loop = false,
                     .role = .coordinator,
                     .runtime_id = "runtime-reopened-eigenvector-pool-coordinator-owner",
@@ -5256,7 +5390,6 @@ test "db graph metric runtime background open-configured hits worker pool surviv
                 .open_mode = .writer_no_replay,
                 .ttl_cleanup = .{ .enabled = false },
                 .graph_metric_maintenance = .{
-                    .enabled = true,
                     .start_background_loop = false,
                     .role = .worker_pool,
                     .runtime_id = "runtime-reopened-hits-pool-worker-owner",
@@ -5295,7 +5428,6 @@ test "db graph metric runtime background open-configured hits worker pool surviv
                     duplicate_resources.apply_mutex,
                     worker_pool.backend_runtime,
                     .{
-                        .enabled = true,
                         .role = .worker_pool,
                         .runtime_id = "runtime-reopened-hits-pool-worker-owner-duplicate",
                         .lease_owned = true,
@@ -5334,7 +5466,6 @@ test "db graph metric runtime background open-configured hits worker pool surviv
                 .open_mode = .writer_no_replay,
                 .ttl_cleanup = .{ .enabled = false },
                 .graph_metric_maintenance = .{
-                    .enabled = true,
                     .start_background_loop = false,
                     .role = .coordinator,
                     .runtime_id = "runtime-reopened-hits-pool-coordinator-owner",
@@ -5508,7 +5639,6 @@ test "db graph metric runtime background split ticks survive reopened pagerank h
             resources.apply_mutex,
             coordinator.backend_runtime,
             .{
-                .enabled = true,
                 .role = .coordinator,
                 .runtime_id = "runtime-reopened-coordinator",
                 .lease_owned = true,
@@ -5550,7 +5680,6 @@ test "db graph metric runtime background split ticks survive reopened pagerank h
             resources.apply_mutex,
             worker.backend_runtime,
             .{
-                .enabled = true,
                 .role = .worker,
                 .runtime_id = "runtime-reopened-worker-a",
                 .lease_owned = true,
@@ -5607,7 +5736,6 @@ test "db graph metric runtime background split ticks survive reopened pagerank h
             resources.apply_mutex,
             coordinator.backend_runtime,
             .{
-                .enabled = true,
                 .role = .coordinator,
                 .runtime_id = "runtime-reopened-coordinator",
                 .lease_owned = true,
@@ -5652,7 +5780,6 @@ test "db graph metric runtime background split ticks survive reopened pagerank h
                 resources.apply_mutex,
                 worker.backend_runtime,
                 .{
-                    .enabled = true,
                     .role = .worker,
                     .runtime_id = workers[step_index % workers.len],
                     .lease_owned = true,
@@ -5684,7 +5811,6 @@ test "db graph metric runtime background split ticks survive reopened pagerank h
                 resources.apply_mutex,
                 coordinator.backend_runtime,
                 .{
-                    .enabled = true,
                     .role = .coordinator,
                     .runtime_id = "runtime-reopened-coordinator",
                     .lease_owned = true,
@@ -5816,7 +5942,6 @@ test "db graph metric runtime background reopened coordinators do not duplicate 
                 resources.apply_mutex,
                 worker.backend_runtime,
                 .{
-                    .enabled = true,
                     .role = .worker,
                     .lease_owned = true,
                     .owner_id = workers[step_index % workers.len],
@@ -5862,7 +5987,6 @@ test "db graph metric runtime background reopened coordinators do not duplicate 
                 resources.apply_mutex,
                 coordinator.backend_runtime,
                 .{
-                    .enabled = true,
                     .role = .coordinator,
                     .lease_owned = true,
                     .owner_id = "runtime-publish-race-coordinator",
@@ -5919,7 +6043,6 @@ test "db graph metric runtime background reopened coordinators do not duplicate 
             resources.apply_mutex,
             coordinator.backend_runtime,
             .{
-                .enabled = true,
                 .role = .coordinator,
                 .runtime_id = "runtime-publish-race-coordinator-a",
                 .lease_owned = true,
@@ -5951,7 +6074,6 @@ test "db graph metric runtime background reopened coordinators do not duplicate 
                 duplicate_resources.apply_mutex,
                 coordinator.backend_runtime,
                 .{
-                    .enabled = true,
                     .role = .coordinator,
                     .runtime_id = "runtime-publish-race-coordinator-b",
                     .lease_owned = true,
@@ -6002,7 +6124,6 @@ test "db graph metric runtime background reopened coordinators do not duplicate 
             resources.apply_mutex,
             duplicate_coordinator.backend_runtime,
             .{
-                .enabled = true,
                 .role = .coordinator,
                 .runtime_id = "runtime-publish-race-coordinator-b",
                 .lease_owned = true,
@@ -6053,7 +6174,6 @@ test "db graph metric runtime background reopened coordinators do not duplicate 
                 resources.apply_mutex,
                 worker.backend_runtime,
                 .{
-                    .enabled = true,
                     .role = .worker,
                     .lease_owned = true,
                     .owner_id = "runtime-publish-race-cleaner",
@@ -6170,7 +6290,6 @@ test "db graph metric runtime background reopened coordinators do not duplicate 
                 resources.apply_mutex,
                 worker.backend_runtime,
                 .{
-                    .enabled = true,
                     .role = .worker,
                     .lease_owned = true,
                     .owner_id = workers[step_index % workers.len],
@@ -6216,7 +6335,6 @@ test "db graph metric runtime background reopened coordinators do not duplicate 
                 resources.apply_mutex,
                 coordinator.backend_runtime,
                 .{
-                    .enabled = true,
                     .role = .coordinator,
                     .lease_owned = true,
                     .owner_id = "runtime-eigenvector-publish-race-coordinator",
@@ -6268,7 +6386,6 @@ test "db graph metric runtime background reopened coordinators do not duplicate 
             resources.apply_mutex,
             coordinator.backend_runtime,
             .{
-                .enabled = true,
                 .role = .coordinator,
                 .runtime_id = "runtime-eigenvector-publish-race-coordinator-a",
                 .lease_owned = true,
@@ -6305,7 +6422,6 @@ test "db graph metric runtime background reopened coordinators do not duplicate 
                 duplicate_resources.apply_mutex,
                 coordinator.backend_runtime,
                 .{
-                    .enabled = true,
                     .role = .coordinator,
                     .runtime_id = "runtime-eigenvector-publish-race-coordinator-b",
                     .lease_owned = true,
@@ -6356,7 +6472,6 @@ test "db graph metric runtime background reopened coordinators do not duplicate 
             resources.apply_mutex,
             duplicate_coordinator.backend_runtime,
             .{
-                .enabled = true,
                 .role = .coordinator,
                 .runtime_id = "runtime-eigenvector-publish-race-coordinator-b",
                 .lease_owned = true,
@@ -6407,7 +6522,6 @@ test "db graph metric runtime background reopened coordinators do not duplicate 
                 resources.apply_mutex,
                 worker.backend_runtime,
                 .{
-                    .enabled = true,
                     .role = .worker,
                     .lease_owned = true,
                     .owner_id = "runtime-eigenvector-publish-race-cleaner",
@@ -6523,7 +6637,6 @@ test "db graph metric runtime background reopened coordinators do not duplicate 
                 resources.apply_mutex,
                 worker.backend_runtime,
                 .{
-                    .enabled = true,
                     .role = .worker,
                     .lease_owned = true,
                     .owner_id = workers[step_index % workers.len],
@@ -6569,7 +6682,6 @@ test "db graph metric runtime background reopened coordinators do not duplicate 
                 resources.apply_mutex,
                 coordinator.backend_runtime,
                 .{
-                    .enabled = true,
                     .role = .coordinator,
                     .lease_owned = true,
                     .owner_id = "runtime-hits-publish-race-coordinator",
@@ -6621,7 +6733,6 @@ test "db graph metric runtime background reopened coordinators do not duplicate 
             resources.apply_mutex,
             coordinator.backend_runtime,
             .{
-                .enabled = true,
                 .role = .coordinator,
                 .runtime_id = "runtime-hits-publish-race-coordinator-a",
                 .lease_owned = true,
@@ -6658,7 +6769,6 @@ test "db graph metric runtime background reopened coordinators do not duplicate 
                 duplicate_resources.apply_mutex,
                 coordinator.backend_runtime,
                 .{
-                    .enabled = true,
                     .role = .coordinator,
                     .runtime_id = "runtime-hits-publish-race-coordinator-b",
                     .lease_owned = true,
@@ -6716,7 +6826,6 @@ test "db graph metric runtime background reopened coordinators do not duplicate 
             resources.apply_mutex,
             duplicate_coordinator.backend_runtime,
             .{
-                .enabled = true,
                 .role = .coordinator,
                 .runtime_id = "runtime-hits-publish-race-coordinator-b",
                 .lease_owned = true,
@@ -6774,7 +6883,6 @@ test "db graph metric runtime background reopened coordinators do not duplicate 
                 resources.apply_mutex,
                 worker.backend_runtime,
                 .{
-                    .enabled = true,
                     .role = .worker,
                     .lease_owned = true,
                     .owner_id = "runtime-hits-publish-race-cleaner",
@@ -6883,7 +6991,6 @@ test "db graph metric runtime background cycles multiple worker ids across plann
         resources.apply_mutex,
         db.backend_runtime,
         .{
-            .enabled = true,
             .planned_options = .{
                 .worker_ids = &workers,
                 .max_rounds = 1,
@@ -8604,7 +8711,6 @@ test "db graph metric runtime background drains pagerank through planned mainten
         resources.apply_mutex,
         db.backend_runtime,
         .{
-            .enabled = true,
             .runtime_id = "runtime-pagerank-combined",
             .planned_options = .{
                 .worker_id = "runtime-pagerank-worker",
