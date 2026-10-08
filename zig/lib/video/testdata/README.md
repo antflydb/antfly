@@ -58,3 +58,18 @@ For packet indexes 12 and 59 the closed-GOP fixture reads/submits 13 packets
 (14,137 payload bytes) instead of 60 (61,067 bytes); the open-GOP fixture falls
 back to the initial IDR. Container indexing is excluded from these counters.
 No GPU latency or embedding speedup is inferred from packet savings.
+
+## Portable MJPEG fixture
+
+`mjpeg.mov` is original Apache-2.0 testsrc2 output: eight 64×48 baseline 4:4:4
+JPEG pictures over two seconds. `mjpeg.rgba` is independent FFmpeg 9.0.2 output;
+`mjpeg-oracle.json` pins hashes, byte counts and FFprobe packet clocks/positions.
+Native and WASI tests compare every RGBA channel with maximum error three. This
+qualifies the 4:4:4 fixture, not chroma-upsample parity for subsampled JPEGs.
+
+```sh
+python3 zig/lib/video/scripts/generate_mjpeg_fixtures.py
+```
+
+The generator requires FFmpeg/libavcodec only offline. Runtime decoding uses the
+existing pure Zig JPEG implementation with complete per-sample tables.

@@ -16,12 +16,14 @@ pub const Limits = struct {
     max_packet_bytes: u32 = 16 * 1024 * 1024,
     max_dimension: u32 = 16_384,
 };
+pub const Codec = enum { avc, mjpeg };
 pub const Track = struct {
+    codec: Codec = .avc,
     id: u32,
     timescale: u32,
     width: u16,
     height: u16,
-    /// Borrowed from the reader's retained metadata lease.
+    /// AVC-only, borrowed from retained metadata; empty for complete MJPEG samples.
     avcc: []const u8,
     nal_length_bytes: u3,
     pixel_aspect: struct { horizontal: u32 = 1, vertical: u32 = 1 } = .{},
@@ -204,7 +206,9 @@ const Parser = struct {
                 tag("mdhd") => t.scale = try headerScale(p),
                 tag("hdlr") => {
                     if (p.len < 12) return error.MalformedMedia;
-                    t.handler = u32be(p[8..12]);
+                    // QuickTime minf may also contain a data hdlr; only the
+                    // mdia handler identifies this track as video.
+                    if (depth == 1) t.handler = u32be(p[8..12]);
                 },
                 tag("mdia"), tag("minf"), tag("stbl"), tag("edts"), tag("dinf") => try self.trackBoxes(p, t, depth + 1),
                 tag("dref") => {
@@ -260,7 +264,8 @@ const Parser = struct {
         var cursor: usize = 8;
         for (0..count) |_| {
             const b = try self.box(bytes, cursor);
-            if (b.typ == tag("avc1")) {
+            if (b.typ == tag("avc1") or b.typ == tag("jpeg")) {
+                const codec: Codec = if (b.typ == tag("avc1")) .avc else .mjpeg;
                 if (count != 1) return error.UnsupportedSampleDescription;
                 if (b.payload.len < 78) return error.MalformedMedia;
                 const width = u16be(b.payload[24..26]);
@@ -269,6 +274,7 @@ const Parser = struct {
                 if (width > self.limits.max_dimension or height > self.limits.max_dimension) return error.ResourceLimitExceeded;
                 // External data references cannot safely resolve against this source.
                 if (u16be(b.payload[6..8]) != 1) return error.UnsupportedDataReference;
+                if (codec == .mjpeg and (u16be(b.payload[8..10]) != 0 or u16be(b.payload[40..42]) != 1)) return error.UnsupportedSampleDescription;
                 var child: usize = 78;
                 var avcc: ?[]const u8 = null;
                 var color: []const u8 = &.{};
@@ -280,6 +286,7 @@ const Parser = struct {
                         if (avcc != null) return error.MalformedMedia;
                         avcc = c.payload;
                     }
+                    if (codec == .mjpeg and c.typ == tag("fiel") and (c.payload.len != 2 or c.payload[0] != 1)) return error.UnsupportedInterlacedVideo;
                     if (c.typ == tag("sinf")) return error.UnsupportedEncryptedMedia;
                     if (c.typ == tag("clap")) return error.UnsupportedDisplayGeometry;
                     if (c.typ == tag("colr")) color = c.payload;
@@ -291,11 +298,15 @@ const Parser = struct {
                     }
                     child = c.end;
                 }
-                const config = avcc orelse return error.MalformedMedia;
-                try validateAvcc(config);
-                const nal_len: u3 = @as(u3, @intCast(config[4] & 3)) + 1;
-                if (nal_len == 3) return error.MalformedMedia;
-                t.track = .{ .id = 0, .timescale = 0, .width = width, .height = height, .avcc = config, .nal_length_bytes = nal_len, .pixel_aspect = .{ .horizontal = horizontal, .vertical = vertical }, .color_info = color, .display_matrix = @splat(0) };
+                var config: []const u8 = &.{};
+                var nal_len: u3 = 0;
+                if (codec == .avc) {
+                    config = avcc orelse return error.MalformedMedia;
+                    try validateAvcc(config);
+                    nal_len = @as(u3, @intCast(config[4] & 3)) + 1;
+                    if (nal_len == 3) return error.MalformedMedia;
+                } else if (avcc != null) return error.MalformedMedia;
+                t.track = .{ .codec = codec, .id = 0, .timescale = 0, .width = width, .height = height, .avcc = config, .nal_length_bytes = nal_len, .pixel_aspect = .{ .horizontal = horizontal, .vertical = vertical }, .color_info = color, .display_matrix = @splat(0) };
             }
             cursor = b.end;
         }

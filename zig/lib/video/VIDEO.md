@@ -1,7 +1,8 @@
 # Native video decoding and sampled surfaces
 
 Status: phase 1, the independent phase 2 decoder/preparation library, and the
-independent phase 3 scheduling subset are implemented, 2026-10-08. EmbeddingGemma
+independent phase 3 scheduling subset, and phase 4 portable MJPEG lane are
+implemented, 2026-10-08. EmbeddingGemma
 2 model-token integration, HTTP/SDK video inputs, and resident vision/backbone
 execution remain pending. Tim's PR #1014 is kept separate as requested; its model
 code is not incorporated into this branch.
@@ -48,7 +49,7 @@ See [fixture provenance](testdata/README.md). Run `zig build test-video` from
 ## Implemented decoder and preparation boundary
 
 The public `antfly_video` module exports `sampling`, `avc`, `apple`,
-`preparation`, `decode_plan`, `windows`, `apple_jobs`, and compile-time
+`preparation`, `decode_plan`, `windows`, `apple_jobs`, `mjpeg`, and compile-time
 `capabilities`. Its own `build.zig` supports
 `test-video` and `check-video`; root and inference builds register the same tests.
 `build_support.attach` takes the consumer's shared media and image modules to
@@ -138,8 +139,8 @@ zig build test-video -Dtarget=wasm32-wasi -Doptimize=ReleaseSafe -fwasmtime
 Native macOS decode/GPU tests require access to platform services. Hardware-only
 qualification skips when the platform cannot create the requested decoder;
 portable-target tests explicitly skip Apple routes and test unavailable errors.
-Linux has packet indexing, frame selection, and CPU borrowed-plane preparation;
-its native H.264 decoder and NVDEC/CUDA routes remain planned. Apple frameworks
+Linux has packet indexing, frame selection, CPU preparation and the pure Zig
+MJPEG lane below. Its native H.264 decoder and NVDEC/CUDA routes remain planned. Apple frameworks
 and Objective-C sources are omitted from non-macOS builds.
 
 ## Implemented independent scheduling
@@ -211,8 +212,57 @@ of eight selections (six unique outputs), with CPU/Metal value comparisons,
 depth-one/two bounds, source teardown, late cancellation/retry, sink failures and
 allocation-failure campaigns. Portable planner tests execute on WASI; Linux
 compiles the planner, window reuse and CPU preparation without Apple dependencies.
-Native Linux decode and CUDA/NVDEC remain stage 4 work. Model-specific tokens,
+Native Linux H.264 decode and CUDA/NVDEC remain stage 4 work. Model-specific tokens,
 resident vision/backbone/pooling and retrieval parity still depend on PR #1014.
+
+## Implemented portable MJPEG lane
+
+[mjpeg.zig](src/mjpeg.zig) decodes complete JPEG samples from static MP4/MOV
+`jpeg` visual entries using `lib/image.jpeg` in-process. `Track.codec` distinguishes
+AVC from MJPEG; AVC-only planning/Apple decode fail explicitly for MJPEG. The
+container reader indexes the same sample tables/timelines and distinguishes the
+track handler from QuickTime's additional data handler. MJPEG entry version zero,
+one picture per sample, progressive field metadata and stable geometry are
+required. AVI, abbreviated external JPEG tables, paired/interlaced fields,
+progressive/arithmetic JPEG and dynamic geometry are excluded from this lane.
+
+`decodeFrame` reads just the selected packet, validates one complete baseline
+8-bit, one-scan, one- or three-component JPEG with included tables and a direct
+EOI after entropy, and returns owned RGBA plus packet index/PTS/duration/timebase.
+The JPEG decoder supplies its existing display RGB policy and chroma upsampling;
+this is not the NV12 matrix conversion or a general color-management promise.
+No prior packets, platform decoder or FFmpeg runtime are required. Frames outlive
+the reader/source. Pixel and compressed-packet caps apply before decoding; an
+allocator wrapper enforces actual live decode allocation bytes, including output
+RGBA, and records their high-water mark. Allocator exhaustion remains distinct
+from resource denial. Packet leases use the source's separate read/retention caps.
+
+`mjpeg.prepareWindows` reuses the portable timestamp-window union, then decodes
+and prepares one unique picture at a time. `preparation.referenceRgba` applies
+explicit rotation, the shared quantized Pillow bicubic resize and patch packing;
+its SDR matrix field is unused for already-decoded RGB. Output is a contiguous
+host float array with `frame(slot)` slices and window-to-slot mappings, owned PTS,
+source/codec stamp and copied display/color metadata. Unique-frame and total
+output-byte caps apply before output allocation. The result records decoded
+packets, payload bytes and decode allocation high-water; `reusedSelections()`
+counts duplicate window references. Decode RGBA, preparation scratch and final
+outputs have separate limits, not a global concurrent-request reservation.
+
+The checked-in original 4:4:4 two-second fixture contains eight 64×48 JPEG
+pictures. Every decoded RGBA channel matches independent FFmpeg output within
+three byte levels, with exact packet clocks/positions and hashed provenance.
+This comparison qualifies the fixture and declared JPEG display policy; it does
+not establish subsampled-chroma parity with every FFmpeg conversion policy.
+Ten overlapping selections prepare eight unique outputs/read eight payloads;
+a sparse selected picture reads one payload. Tests cover reader/source teardown,
+malformed/interlaced/progressive inputs, memory/work limits, deterministic
+allocation failure, cancellation during decode/preparation, and retry. The full
+portable decode/preparation suite executes on WASI and compiles for Linux.
+
+This stage supplies host patches for a later model consumer. It does not run an
+embedding model or upload software-decoded pictures to Metal/CUDA. NVDEC/CUDA,
+pure Zig H.264 and resident model execution remain pending independently or behind
+PR #1014 as described in the implementation plan.
 
 ## Remaining module and API shape
 

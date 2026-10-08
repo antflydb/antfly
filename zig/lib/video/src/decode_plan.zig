@@ -23,11 +23,12 @@ const Anchor = struct { index: usize, payload: media.source.Lease };
 pub const Stamp = struct {
     identity: [32]u8,
     config: [32]u8,
+    codec: media.mp4.Codec,
     track_id: u32,
     timescale: u32,
     packets: usize,
     pub fn init(reader: *const media.mp4.Reader) Stamp {
-        var out = Stamp{ .identity = undefined, .config = undefined, .track_id = reader.track.id, .timescale = reader.track.timescale, .packets = reader.packets.len };
+        var out = Stamp{ .codec = reader.track.codec, .identity = undefined, .config = undefined, .track_id = reader.track.id, .timescale = reader.track.timescale, .packets = reader.packets.len };
         std.crypto.hash.sha2.Sha256.hash(reader.input.identity, &out.identity, .{});
         std.crypto.hash.sha2.Sha256.hash(reader.track.avcc, &out.config, .{});
         return out;
@@ -102,6 +103,7 @@ const Builder = struct {
 };
 pub fn create(allocator: std.mem.Allocator, reader: *media.mp4.Reader, selection: []const usize, options: Options) !Plan {
     try reader.input.control.check();
+    if (reader.track.codec != .avc) return error.UnsupportedVideoCodec;
     try avc.validateConfig(reader.track.avcc);
     if (selection.len == 0 or selection.len > options.max_selections) return error.ResourceLimitExceeded;
     for (selection, 0..) |index, i| {

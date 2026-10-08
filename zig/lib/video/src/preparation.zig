@@ -127,10 +127,34 @@ pub fn referenceHost(allocator: std.mem.Allocator, host: HostSurface, options: O
             @memcpy(bytes[(y * width + x) * 3 ..][0..3], &rgb(host.planes, point[0], point[1], host.format, options.matrix));
         }
     }
+    return prepareRgb(allocator, bytes, width, height, g, options, control);
+}
+/// Portable RGBA input, including pure Zig MJPEG output. Uses the same resize
+/// coefficients/patch packing as the NV12 reference after color conversion.
+pub fn referenceRgba(allocator: std.mem.Allocator, bytes: []const u8, source_width: u32, source_height: u32, options: Options, control: media.source.Control) ![]f32 {
+    try control.check();
+    const g = try geometry(source_width, source_height, options);
+    if (bytes.len != @as(usize, source_width) * source_height * 4) return error.InvalidVideoGeometry;
+    const rotated = options.rotation == .clockwise90 or options.rotation == .clockwise270;
+    const width = if (rotated) source_height else source_width;
+    const height = if (rotated) source_width else source_height;
+    const rgb_bytes = try allocator.alloc(u8, @as(usize, width) * height * 3);
+    defer allocator.free(rgb_bytes);
+    for (0..height) |y| {
+        try control.check();
+        for (0..width) |x| {
+            const point = sourcePoint(x, y, source_width, source_height, options.rotation);
+            const offset = (point[1] * source_width + point[0]) * 4;
+            @memcpy(rgb_bytes[(y * width + x) * 3 ..][0..3], bytes[offset..][0..3]);
+        }
+    }
+    return prepareRgb(allocator, rgb_bytes, width, height, g, options, control);
+}
+fn prepareRgb(allocator: std.mem.Allocator, bytes: []const u8, width: usize, height: usize, g: Geometry, options: Options, control: media.source.Control) ![]f32 {
     // Shared image control follows the same deadline through both resize passes.
     var scope = image.work_control.Scope.enter(.{ .context = control.context, .check_fn = control.check_fn });
     defer scope.deinit();
-    const chw = try image.preprocessDecodedRectScaledWithResample(allocator, .{ .data = bytes, .width = width, .height = height, .format = .rgb8 }, g.width, g.height, .{ 0, 0, 0 }, .{ 1, 1, 1 }, 1.0 / 255.0, .pillow_bicubic);
+    const chw = try image.preprocessDecodedRectScaledWithResample(allocator, .{ .data = bytes, .width = @intCast(width), .height = @intCast(height), .format = .rgb8 }, g.width, g.height, .{ 0, 0, 0 }, .{ 1, 1, 1 }, 1.0 / 255.0, .pillow_bicubic);
     defer allocator.free(chw);
     const result = try allocator.alloc(f32, g.values());
     errdefer allocator.free(result);

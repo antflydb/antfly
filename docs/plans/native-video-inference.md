@@ -1,9 +1,9 @@
 # Native video inference and EmbeddingGemma 2
 
-Status: phase 1, the independent phase 2 decoder/preparation library, and the
-independent phase 3 scheduling subset delivered, 2026-10-08. Phase 2 model/API
-integration, phase 3 resident model execution, and stage 4 remain pending; full video
-embedding is not yet available. Tim's open PR #1014 remains a separate dependency
+Status: phase 1, the independent phase 2 decoder/preparation library, the phase 3
+scheduling subset, and stage 4 portable MJPEG lane delivered, 2026-10-08. Phase 2
+model/API integration, phase 3 resident model execution, and the remaining stage 4
+routes remain pending; full video embedding is not yet available. Tim's open PR #1014 remains a separate dependency
 at the user's request. The initial design was written
 against `origin/main` commit `cdf572a7467d581f6f1b39bcf514878488555f11`;
 fetching a newer remote head was unavailable because GitHub DNS resolution failed.
@@ -280,10 +280,22 @@ latency/throughput targets from the baseline before promoting defaults.
 The default Metal route must read back only the final vector, with transfer
 telemetry proving that decoded pixels and projected vision tokens remain on-device.
 
-### 4. NVIDIA and portable codec coverage
+### 4. NVIDIA and portable codec coverage — portable MJPEG lane delivered
 
-Add NVDEC/device preparation with separately qualified CUDA model execution.
-Use MJPEG as a portable end-to-end fixture lane; implement progressive 8-bit
+Delivered independently of PR #1014: complete baseline 8-bit MJPEG samples in
+static MP4/MOV `jpeg` tracks, pure Zig selected-picture RGBA decode using
+`lib/image.jpeg`, and CPU timestamp-window patch preparation with overlap reuse.
+Actual live decode allocations, compressed bytes, pixels and final output bytes
+are bounded; cancellation flows through JPEG/resize kernels and source reads.
+An original two-second 4:4:4 fixture matches independent FFmpeg RGBA within three
+byte levels, with exact packet clocks. Sparse selection reads only its payload;
+ten window references prepare eight unique frames. Malformed/unsupported shapes,
+allocation failures, source teardown and cancellation/retry are qualified.
+Portable decode/preparation executes on WASI and compiles for Linux. See the
+[portable lane contract](../../zig/lib/video/VIDEO.md#implemented-portable-mjpeg-lane).
+
+Remaining: NVDEC/device preparation with separately qualified CUDA model execution,
+software-decode-to-Metal upload/preparation, and progressive 8-bit
 4:2:0 H.264 in pure Zig with a declared supported profile/tool subset. Broaden
 H.264, fragmented MP4, WebM video codecs, HEVC, VP9, and AV1 independently.
 

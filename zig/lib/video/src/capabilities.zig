@@ -5,6 +5,7 @@
 pub const apple_decode_compiled = @import("builtin").os.tag == .macos;
 pub const metal_preparation_compiled = apple_decode_compiled;
 pub const portable_host_preparation = true;
+pub const portable_mjpeg_decode = true;
 pub const portable_h264_decode = false;
 pub const nvdec_decode = false;
 pub const cuda_preparation = false;

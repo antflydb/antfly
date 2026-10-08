@@ -1,7 +1,7 @@
 # Shared media containers and timelines
 
 Status: phase 1 implemented, 2026-10-08. Shared audio demux, bounded sources,
-timelines, and non-fragmented MP4/H.264 packet indexes are available. The broader
+timelines, and non-fragmented MP4/H.264 and MP4/MOV MJPEG indexes are available. The broader
 reader and seek contracts below remain planned unless listed as implemented.
 The initial design checkout is based on `origin/main` at
 `cdf572a7467d581f6f1b39bcf514878488555f11`. A remote refresh was unavailable.
@@ -36,14 +36,15 @@ qualified AAC/ALAC access units, edit/trim metadata, WebM timing, and lacing.
   container primitives; the audio adapters preserve their legacy error boundary.
 - [timeline.zig](src/timeline.zig): checked signed rational rescaling with floor
   rounding and explicit media-to-source edit mapping.
-- [mp4.zig](src/mp4.zig): first supported `avc1` video track, retained `avcC`,
+- [mp4.zig](src/mp4.zig): first supported `avc1` or `jpeg` video track, explicit codec identity, retained AVC-only `avcC`,
   display matrix, pixel aspect and raw color metadata, decode-order packet index,
   independent payload reads, and container sync hints. Indexing skips `mdat`
   payloads, including when `moov` is at the end. Raw media clocks and mapped source
   DTS/PTS remain available; negative composition offsets carry decode preroll.
 
-The MP4 index qualifies non-fragmented, self-contained files with one stable AVC
-sample description, `stsz`/`stz2`, `stco`/`co64`, `stsc`, `stts`, signed/unsigned
+The MP4/MOV index qualifies non-fragmented, self-contained files with one stable
+sample description (AVC or complete JPEG), `stsz`/`stz2`, `stco`/`co64`, `stsc`,
+`stts`, signed/unsigned
 `ctts`, `stss`, and leading empty edits followed by one rate-1 media edit. It
 rejects fragments, external data references, unsupported display geometry and
 edit arrangements, and resource-limit violations. `syncBefore` returns a
@@ -53,6 +54,15 @@ pictures into decode runs. The Apple decoder keeps packet-zero decoding as its
 default/reference. Open-GOP recovery hints alone do not authorize seeking. See
 [the scheduling contract](../video/VIDEO.md#implemented-independent-scheduling);
 codec qualification belongs to video rather than the container reader.
+
+The portable MJPEG lane accepts QuickTime `jpeg` version-zero visual entries
+with one picture per sample and progressive field metadata. Each JPEG is
+independent; `lib/video.mjpeg` reads only selected payloads and validates baseline
+8-bit complete pictures before pure Zig decode. `Track.codec` is explicit; MJPEG
+tracks have empty `avcc` and zero NAL length. A QuickTime data handler in `minf`
+does not overwrite the video track handler in `mdia`. AVI, abbreviated tables
+and paired/interlaced JPEG fields remain unsupported.
+
 WebM **video** indexing, sequential unknown-length providers, and object-store
 adapters are not implemented. The range callback is the integration boundary.
 
