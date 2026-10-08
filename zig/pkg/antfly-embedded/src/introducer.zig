@@ -1277,6 +1277,7 @@ const TextIndexSortEntry = struct {
 };
 
 const TextIndexSortValue = union(enum) {
+    datetime_ns: i128,
     u64_val: u64,
     i64_val: i64,
     f64_val: f64,
@@ -1389,6 +1390,7 @@ fn textIndexSortBoundValuesAlloc(
 
 fn textIndexSortBoundValueAlloc(alloc: Allocator, value: TextIndexSortValue) !segment_mod.SegmentIndexSortBoundValue {
     return switch (value) {
+        .datetime_ns => |v| .{ .datetime_ns = v },
         .u64_val => |v| .{ .u64_val = v },
         .i64_val => |v| .{ .i64_val = v },
         .f64_val => |v| if (std.math.isFinite(v)) .{ .f64_val = v } else error.InvalidSegment,
@@ -1442,6 +1444,7 @@ fn textIndexSortValueFromJsonAlloc(
 
 fn textIndexSortValueFromTypedValueAlloc(alloc: Allocator, value: typed_dv.TypedValue) !TextIndexSortValue {
     return switch (value) {
+        .datetime_ns => |v| .{ .datetime_ns = v },
         .u64_val => |v| .{ .u64_val = v },
         .i64_val => |v| .{ .i64_val = v },
         .f64_val => |v| if (std.math.isFinite(v)) .{ .f64_val = v } else error.InvalidSegment,
@@ -1464,6 +1467,7 @@ fn jsonPathValue(value: std.json.Value, path: []const u8) ?std.json.Value {
 
 fn compareTextIndexSortValues(a: TextIndexSortValue, b: TextIndexSortValue) std.math.Order {
     return switch (a) {
+        .datetime_ns => |av| if (b == .datetime_ns) std.math.order(av, b.datetime_ns) else .lt,
         .u64_val => |av| switch (b) {
             .u64_val => |bv| std.math.order(av, bv),
             else => .lt,
@@ -1970,6 +1974,7 @@ fn cloneTypedValue(alloc: Allocator, value: typed_dv.TypedValue) !typed_dv.Typed
         .geo_point => |point| .{ .geo_point = point },
         .bool_val => |boolean| .{ .bool_val = boolean },
         .numeric_val => |number| .{ .numeric_val = number },
+        .datetime_ns => |ns| .{ .datetime_ns = ns },
     };
 }
 

@@ -45,6 +45,8 @@ pub const Stats = struct {
     files_pruned: usize = 0,
     groups_decoded: usize = 0,
     groups_pruned: usize = 0,
+    bloom_blocks_read: usize = 0,
+    bloom_groups_pruned: usize = 0,
     rows_examined: u64 = 0,
 };
 /// Coordinator-owned immutable work list; workers claim independent row
@@ -250,6 +252,12 @@ pub const Stream = struct {
         mapped.columns = self.mapped_columns.items;
         return mapped;
     }
+    /// Probe standard split-block Bloom filters before opening data pages.
+    /// Unknown physical/logical interpretations cannot supply negative evidence.
+    fn bloomMayMatch(self: *Stream, file: external.FileEntry, group: external.RowGroup) !bool {
+        return bloomGroupMayMatch(self.alloc, self.source.scanner.reader(), file, group, self.groupPredicates(), self.context, &self.stats);
+    }
+
     fn groupPredicates(self: Stream) []const Predicate {
         return if (self.source.inventory.format == .iceberg) self.file_predicates else self.predicates;
     }
@@ -342,6 +350,8 @@ pub const Stream = struct {
                 for (jobs[0..count]) |*job| {
                     self.stats.files_opened += job.stats.files_opened;
                     self.stats.files_pruned += job.stats.files_pruned;
+                    self.stats.bloom_blocks_read += job.stats.bloom_blocks_read;
+                    self.stats.bloom_groups_pruned += job.stats.bloom_groups_pruned;
                     if (job.plan) |*plan| {
                         try self.appendPlanUnits(&units, job.index, plan);
                         plans[job.index] = plan.*;
@@ -518,6 +528,11 @@ pub const Stream = struct {
                     };
                     if (!groupMayMatch(group, self.groupPredicates())) {
                         self.stats.groups_pruned += 1;
+                        continue;
+                    }
+                    if (!try self.bloomMayMatch(plan.inventory.files[0], group)) {
+                        self.stats.groups_pruned += 1;
+                        self.stats.bloom_groups_pruned += 1;
                         continue;
                     }
                     if (group.row_count > self.limits.max_examined_rows -| self.stats.rows_examined) return error.LakeRowsScanBudgetExceeded;
@@ -1077,4 +1092,148 @@ test "external lake Iceberg file bounds resolve field IDs and preserve unknown d
     changed[0].kind = "string";
     changed[0].iceberg_type = "decimal(18,2)";
     try std.testing.expect(icebergFileMayMatch(file, &changed, &.{.{ .column = "renamed", .op = .eq, .value = .{ .bytes = "0.00" } }}));
+}
+
+/// Parquet split-block Bloom membership, XXH64's low word and eight salts.
+fn splitBlockMayContain(bytes: []const u8, hash: u32) bool {
+    if (bytes.len != 32) return true;
+    const salts = [_]u32{ 0x47b6137b, 0x44974d91, 0x8824ad5b, 0xa2b7289d, 0x705495c7, 0x2df1424b, 0x9efc4947, 0x5c6bfb31 };
+    for (salts, 0..) |salt, lane| {
+        const bit: u5 = @intCast((hash *% salt) >> 27);
+        if (std.mem.readInt(u32, bytes[lane * 4 ..][0..4], .little) & (@as(u32, 1) << bit) == 0) return false;
+    }
+    return true;
+}
+
+test "external lake split block Bloom hash masks preserve inserted values" {
+    var bytes: [32]u8 = @splat(0);
+    const hash: u32 = @truncate(std.hash.XxHash64.hash(0, "present"));
+    const salts = [_]u32{ 0x47b6137b, 0x44974d91, 0x8824ad5b, 0xa2b7289d, 0x705495c7, 0x2df1424b, 0x9efc4947, 0x5c6bfb31 };
+    try std.testing.expect(!splitBlockMayContain(&bytes, hash));
+    for (salts, 0..) |salt, lane| {
+        const bit: u5 = @intCast((hash *% salt) >> 27);
+        std.mem.writeInt(u32, bytes[lane * 4 ..][0..4], @as(u32, 1) << bit, .little);
+    }
+    try std.testing.expect(splitBlockMayContain(&bytes, hash));
+    try std.testing.expect(!splitBlockMayContain(&bytes, @truncate(std.hash.XxHash64.hash(0, "absent"))));
+    bytes[0..4].* = @splat(0);
+    try std.testing.expect(!splitBlockMayContain(&bytes, hash));
+}
+
+fn bloomGroupMayMatch(alloc: Allocator, reader: parquet.ObjectRangeReader, file: external.FileEntry, group: external.RowGroup, predicates: []const Predicate, context: Context, stats: *Stats) !bool {
+    const ranges = @import("lake_range_io.zig");
+    const metadata = @import("lake_parquet_metadata.zig");
+    for (predicates) |predicate| {
+        if (predicate.op != .eq) continue;
+        for (group.column_chunks) |chunk| {
+            if (!std.mem.eql(u8, predicate.column, chunk.column_id)) continue;
+            const offset = chunk.bloom_filter_offset orelse continue;
+            var value_bytes: [8]u8 = undefined;
+            const bytes: []const u8 = switch (predicate.value) {
+                .integer => |value| integer: {
+                    if (chunk.logical_type.len != 0 and !std.mem.startsWith(u8, chunk.logical_type, "int")) continue;
+                    if (std.mem.eql(u8, chunk.physical_type, "int32")) {
+                        const narrow = std.math.cast(i32, value) orelse continue;
+                        std.mem.writeInt(i32, value_bytes[0..4], narrow, .little);
+                        break :integer value_bytes[0..4];
+                    }
+                    if (!std.mem.eql(u8, chunk.physical_type, "int64")) continue;
+                    std.mem.writeInt(i64, &value_bytes, value, .little);
+                    break :integer &value_bytes;
+                },
+                .bytes => |value| text: {
+                    if (!std.mem.eql(u8, chunk.physical_type, "byte_array") or
+                        (chunk.logical_type.len != 0 and !std.mem.eql(u8, chunk.logical_type, "string"))) continue;
+                    break :text value;
+                },
+                .boolean => continue,
+            };
+            if (offset >= file.byte_len) continue;
+            const available = if (chunk.bloom_filter_length) |len| @min(file.byte_len - offset, len) else file.byte_len - offset;
+            const header_len: usize = @intCast(@min(available, 256));
+            if (header_len == 0) continue;
+            try context.ensureActive();
+            const object = try ranges.objectRefForExternalFileUri(file);
+            const header = try reader.readPlannedLease(alloc, .{ .object = object, .range = .{ .offset = offset, .len = header_len }, .purpose = .parquet_page_index });
+            defer header.release();
+            const decoded = metadata.parseBloomHeader(header.bytes) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => continue,
+            } orelse continue;
+            if (decoded.header_bytes > available or decoded.bitset_bytes > available - decoded.header_bytes) continue;
+            const hash = std.hash.XxHash64.hash(0, bytes);
+            const block: u64 = ((hash >> 32) * @as(u64, @intCast(decoded.bitset_bytes / 32))) >> 32;
+            const relative: usize = @intCast(decoded.header_bytes + block * 32);
+            stats.bloom_blocks_read += 1;
+            // Small filters already fit in the bounded header lease. Reuse
+            // those bytes instead of issuing another remote request.
+            if (relative <= header.bytes.len and header.bytes.len - relative >= 32) {
+                if (!splitBlockMayContain(header.bytes[relative..][0..32], @truncate(hash))) return false;
+            } else {
+                const probe = try reader.readPlannedLease(alloc, .{ .object = object, .range = .{ .offset = offset + relative, .len = 32 }, .purpose = .parquet_page_index });
+                defer probe.release();
+                if (!splitBlockMayContain(probe.bytes, @truncate(hash))) return false;
+            }
+        }
+    }
+    return true;
+}
+
+test "external lake Bloom pruning reads only metadata and one block with legacy length fallback" {
+    const a = std.testing.allocator;
+    const Fake = struct {
+        bytes: [1024]u8 = @splat(0),
+        reads: usize = 0,
+        fn read(raw: *anyopaque, alloc: Allocator, _: []const u8, _: []const u8, offset: u64, len: usize) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.reads += 1;
+            if (offset < 4 or offset + len > self.bytes.len) return error.TestUnexpectedResult;
+            return alloc.dupe(u8, self.bytes[@intCast(offset)..][0..len]);
+        }
+    };
+    var fake: Fake = .{};
+    const header = [_]u8{ 0x15, 0x80, 0x01, 0x1c, 0x1c, 0, 0, 0x1c, 0x1c, 0, 0, 0x1c, 0x1c, 0, 0, 0 };
+    @memcpy(fake.bytes[4..][0..header.len], &header);
+    var encoded: [8]u8 = undefined;
+    std.mem.writeInt(i64, &encoded, 42, .little);
+    const hash = std.hash.XxHash64.hash(0, &encoded);
+    const block: usize = @intCast(((hash >> 32) * 2) >> 32);
+    const salts = [_]u32{ 0x47b6137b, 0x44974d91, 0x8824ad5b, 0xa2b7289d, 0x705495c7, 0x2df1424b, 0x9efc4947, 0x5c6bfb31 };
+    for (salts, 0..) |salt, lane| {
+        const bit: u5 = @intCast((@as(u32, @truncate(hash)) *% salt) >> 27);
+        std.mem.writeInt(u32, fake.bytes[4 + header.len + block * 32 + lane * 4 ..][0..4], @as(u32, 1) << bit, .little);
+    }
+    var chunk: external.ColumnChunk = .{ .column_id = @constCast("id"), .physical_type = @constCast("int64"), .file_offset = 100, .compressed_len = 1, .bloom_filter_offset = 4, .bloom_filter_length = header.len + 64 };
+    const group: external.RowGroup = .{ .ordinal = 0, .row_count = 10, .column_chunks = @as([*]external.ColumnChunk, @ptrCast(&chunk))[0..1] };
+    const file: external.FileEntry = .{ .file_id = @constCast("part"), .object_uri = @constCast("s3://bucket/part"), .etag = @constCast("v1"), .byte_len = fake.bytes.len, .row_count = 10, .row_groups = &.{} };
+    const reader: parquet.ObjectRangeReader = .{ .ctx = &fake, .read_range_alloc = Fake.read };
+    var stats: Stats = .{};
+    const present = [_]Predicate{.{ .column = "id", .op = .eq, .value = .{ .integer = 42 } }};
+    const absent = [_]Predicate{.{ .column = "id", .op = .eq, .value = .{ .integer = 43 } }};
+    try std.testing.expect(try bloomGroupMayMatch(a, reader, file, group, &present, .{}, &stats));
+    try std.testing.expect(!try bloomGroupMayMatch(a, reader, file, group, &absent, .{}, &stats));
+    chunk.bloom_filter_length = null;
+    try std.testing.expect(try bloomGroupMayMatch(a, reader, file, group, &present, .{}, &stats));
+    try std.testing.expect(!try bloomGroupMayMatch(a, reader, file, group, &absent, .{}, &stats));
+    try std.testing.expectEqual(@as(usize, 4), stats.bloom_blocks_read);
+    try std.testing.expectEqual(@as(usize, 4), fake.reads);
+    // A larger filter reads only its header prefix and the chosen block.
+    fake.bytes[6] = 0x08; // 512-byte bitset (zigzag varint 1024).
+    chunk.bloom_filter_length = header.len + 512;
+    const large_block: usize = @intCast(((hash >> 32) * 16) >> 32);
+    try std.testing.expect(header.len + large_block * 32 >= 256);
+    for (salts, 0..) |salt, lane| {
+        const bit: u5 = @intCast((@as(u32, @truncate(hash)) *% salt) >> 27);
+        std.mem.writeInt(u32, fake.bytes[4 + header.len + large_block * 32 + lane * 4 ..][0..4], @as(u32, 1) << bit, .little);
+    }
+    try std.testing.expect(try bloomGroupMayMatch(a, reader, file, group, &present, .{}, &stats));
+    try std.testing.expectEqual(@as(usize, 6), fake.reads);
+
+    const reads = fake.reads;
+    chunk.logical_type = @constCast("timestamp_nanos");
+    try std.testing.expect(try bloomGroupMayMatch(a, reader, file, group, &absent, .{}, &stats));
+    try std.testing.expectEqual(reads, fake.reads);
+    chunk.logical_type = @constCast("");
+    fake.bytes[8] = 0x2c;
+    try std.testing.expect(try bloomGroupMayMatch(a, reader, file, group, &absent, .{}, &stats));
 }

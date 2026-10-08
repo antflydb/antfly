@@ -406,8 +406,8 @@ runtime before the persistent read cache shuts down.
 Ordered native indexes now accept signed datetime keys. The tuple encoding is
 version 2 and the desired-publication fingerprint is version 5; a generation or
 cursor built with the older encoding cannot be admitted under the new format.
-The encoding keeps signed nanoseconds ordered without losing the existing local
-unsigned timestamp domain.
+The encoding keeps signed nanoseconds ordered while retaining legacy unsigned
+column readability. Native mapped text columns now use the signed format below.
 
 SQL can automatically choose leading equality prefixes and a range on the next
 index key. A scan's requested ordering is separate from the provider's ordering
@@ -1145,8 +1145,32 @@ passes compressed physical selections to one pinned Parquet cursor. Direct
 column expressions use shared leaf predicates with Boolean page masks; nested
 paths retain document evaluation. Ordered text search uses a membership/row-goal
 cost check, consumes proven index row references without Parquet hydration, and
-supports equality-prefix bounds and inclusive forward seeks. Complete public-ID
+supports equality-prefix bounds and inclusive forward and backward seeks. Complete public-ID
 boundary ties remain in the native collector. `profile.sort.ordered_scanned_count`
 reports traversed physical references before membership filtering. Signed native
-datetime sort values and reverse persistent-tree cursors remain separate format
-and execution work; SQL timestamp predicates retain signed correctness.
+datetime sort values and reverse persistent-tree cursors use the contracts below.
+
+
+### Signed native ordering, reverse seeks, and embedded pruning
+
+Mapped native datetime doc values and public sort cursors share signed i128 Unix
+nanoseconds with SQL; public cursors retain normalized RFC3339 transport. Native
+wire tag 7 stores 16-byte signed values, and readers retain legacy unsigned tag-0
+compatibility. Producer recipe v3 fences older projections during rebuilds.
+Search-before walks the immutable ordered tree backward from its upper bound,
+retaining boundary ties for public-ID comparison and the existing probe guards.
+
+Native sparse scoring admits at most 65,536 partial document scores before
+spilling to byte-bounded sorted runs. Sorting contributions by native ordinal and
+original sequence preserves exact f32 accumulation with signed weights. Reduction
+feeds bounded top-k for complete checkpoints. Spill merges observe cancellation;
+capacity reservations and the 1 GiB input budget bound temporary storage. Hosts
+without spill I/O reject overflow admission. This does not introduce WAND or
+change sparse posting payloads.
+
+Parquet statistics and standard page directories prune both Parquet and Iceberg
+scans. Standard split-block Bloom filters additionally prune equality misses by
+reading a small header and one 32-byte block through the shared range cache.
+Inventory v18 carries optional Bloom offsets and lengths, retaining older codec
+readability. Unknown algorithms, physical interpretations and malformed headers
+fall back to scans; exact residual evaluation remains authoritative.

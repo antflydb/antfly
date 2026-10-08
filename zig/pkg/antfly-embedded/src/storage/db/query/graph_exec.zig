@@ -3574,6 +3574,7 @@ fn matcherMatchesOrdinal(
 
     var number_buf: [64]u8 = undefined;
     const root: std.json.Value = switch (cell.value) {
+        .datetime_ns => |v| .{ .number_string = try std.fmt.bufPrint(&number_buf, "{d}", .{v}) },
         .u64_val => |value| if (value <= std.math.maxInt(i64))
             .{ .integer = @intCast(value) }
         else

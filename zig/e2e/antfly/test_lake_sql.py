@@ -2528,7 +2528,7 @@ def test_native_remote_indexed_metadata_predicates_above_id_list_limit(tmp_path)
         "amount": range(count),
         "sort_rank": [0, 1] + list(range(2, count - 1)) + [0],
         "big_integer": [9007199254740992, 9007199254740993] + [9007199254740994] * (count - 2),
-        "event_time": pa.array([0, 1] + [2] * (count - 2), type=pa.timestamp("ns", tz="UTC")),
+        "event_time": pa.array([-1, 0, 1] + [2] * (count - 3), type=pa.timestamp("ns", tz="UTC")),
         "time_text": ["2026-01-01T01:00:00+01:00", "2026-01-01T00:30:00Z"] + ["2026-01-01T00:00:00Z"] * (count - 2),
         "category": ["story", "story"] + ["comment"] * (count - 2),
         "label": ["other"] * (count - 1) + ["kept"],
@@ -2560,7 +2560,7 @@ def test_native_remote_indexed_metadata_predicates_above_id_list_limit(tmp_path)
                         "amount": {"type": "integer", "x-antfly-field": {"type": "number", "sortable": True}},
                         "sort_rank": {"type": "integer", "x-antfly-field": {"type": "number", "sortable": True}},
                         "big_integer": {"type": "integer"},
-                        "event_time": {"type": "datetime"},
+                        "event_time": {"type": "datetime", "x-antfly-field": {"type": "datetime", "sortable": True}},
                         "time_text": {"type": "string"},
                         "category": {"type": "string"},
                         "label": {"type": "string"},
@@ -2572,7 +2572,7 @@ def test_native_remote_indexed_metadata_predicates_above_id_list_limit(tmp_path)
             }, "relational_indexes": [
                 {"name": "amount_idx", "keys": [{"column": "amount", "nulls": "first"}]},
                 {"name": "amount_desc_idx", "keys": [{"column": "amount", "direction": "desc", "nulls": "last"}]},
-                {"name": "event_time_idx", "keys": [{"column": "event_time"}]},
+                {"name": "event_time_idx", "keys": [{"column": "event_time", "nulls": "first"}]},
                 {"name": "big_integer_idx", "keys": [{"column": "big_integer"}]},
                 {"name": "time_text_idx", "keys": [{"column": "time_text"}]},
                 {"name": "category_idx", "keys": [{"column": "category"}]},
@@ -2684,6 +2684,11 @@ def test_native_remote_indexed_metadata_predicates_above_id_list_limit(tmp_path)
             assert [h["_source"]["amount"] for h in continued["hits"]["hits"]] == following, continued
             assert continued["profile"]["sort"]["candidate_source"] == "ordered_lake_index", continued
             assert continued["profile"]["sort"]["ordered_scanned_count"] <= 5, continued
+            previous = query({"match_all": {}}, order_by=[{"field": "amount", "desc": descending}],
+                search_before=continued["hits"]["hits"][0]["_sort"], remote_snapshot=continued["remote_snapshot"], limit=3, profile=True)
+            assert [h["_source"]["amount"] for h in previous["hits"]["hits"]] == expected, previous
+            assert previous["profile"]["sort"]["candidate_source"] == "ordered_lake_index", previous
+            assert previous["profile"]["sort"]["ordered_scanned_count"] <= 5, previous
         prefixed = query({"conjuncts": [{"term": {"field": "category", "value": "comment"}},
             {"range": {"amount": {"gte": 2}}}]}, order_by=[{"field": "amount"}], limit=3, profile=True)
         assert [h["_source"]["amount"] for h in prefixed["hits"]["hits"]] == [2, 3, 4], prefixed
@@ -2708,6 +2713,17 @@ def test_native_remote_indexed_metadata_predicates_above_id_list_limit(tmp_path)
         assert [h["_source"]["amount"] for h in tied["hits"]["hits"]] == [sorted(zeros, key=lambda h: h["_id"])[0]["_source"]["amount"]], tied
         assert tied["profile"]["sort"]["candidate_source"] == "ordered_lake_index", tied
         assert tied["profile"]["sort"]["candidate_count"] <= 4, tied
+        dates = query({"match_all": {}}, order_by=[{"field": "event_time"}], limit=2, profile=True)
+        assert [h["_source"]["amount"] for h in dates["hits"]["hits"]] == [0, 1], dates
+        assert dates["hits"]["hits"][0]["_sort"][0] == "1969-12-31T23:59:59.999999999Z", dates
+        assert dates["profile"]["sort"]["candidate_source"] == "ordered_lake_index", dates
+        following_dates = query({"match_all": {}}, order_by=[{"field": "event_time"}], limit=1, profile=True,
+            search_after=dates["hits"]["hits"][-1]["_sort"], remote_snapshot=dates["remote_snapshot"])
+        assert [h["_source"]["amount"] for h in following_dates["hits"]["hits"]] == [2], following_dates
+        prior_dates = query({"match_all": {}}, order_by=[{"field": "event_time"}], limit=2, profile=True,
+            search_before=following_dates["hits"]["hits"][0]["_sort"], remote_snapshot=dates["remote_snapshot"])
+        assert [h["_source"]["amount"] for h in prior_dates["hits"]["hits"]] == [0, 1], prior_dates
+        assert prior_dates["profile"]["sort"]["ordered_scanned_count"] <= 4, prior_dates
         signed_temporal = {"range": {"event_time": {
             "gte": "1970-01-01T00:00:00Z",
             "lt": "1970-01-01T01:00:00.000000002+01:00",
@@ -2715,6 +2731,138 @@ def test_native_remote_indexed_metadata_predicates_above_id_list_limit(tmp_path)
         for predicate in (signed_temporal, {"bool": {"should": [signed_temporal, {"match_all": {}}], "minimum_should_match": 2}}):
             dated = query(predicate, count=True, fields=[], limit=0)
             assert dated["hits"]["total"] == {"value": 2, "relation": "exact"}, dated
+        failed = False
+    finally:
+        server.stop(test_failed=failed)
+
+
+def _parquet_with_bloom_for_42(payload):
+    """Add a standard Bloom to one PyArrow column without changing its data pages.
+
+    PyArrow does not write Blooms. Preserve its compact-Thrift footer verbatim,
+    inserting only the two standard ColumnMetaData fields and the Bloom payload.
+    The fixed mask is XXH64(seed=0) over little-endian INT64 42, split-block salts.
+    """
+    footer_len = struct.unpack("<I", payload[-8:-4])[0]
+    footer_start = len(payload) - 8 - footer_len
+    footer = payload[footer_start:-8]
+    position = 0
+    insertion = None
+
+    def varint():
+        nonlocal position
+        value = shift = 0
+        while True:
+            byte = footer[position]
+            position += 1
+            value |= (byte & 127) << shift
+            if byte < 128:
+                return value
+            shift += 7
+
+    def value(kind, path):
+        nonlocal position, insertion
+        if kind in (1, 2):
+            return
+        if kind == 3:
+            position += 1
+        elif kind in (4, 5, 6):
+            varint()
+        elif kind == 7:
+            position += 8
+        elif kind == 8:
+            length = varint()
+            position += length
+        elif kind in (9, 10):
+            header = footer[position]
+            position += 1
+            length = varint() if header >> 4 == 15 else header >> 4
+            for _ in range(length):
+                if header & 15 in (1, 2):
+                    position += 1
+                else:
+                    value(header & 15, path)
+        elif kind == 12:
+            field = 0
+            while footer[position]:
+                header = footer[position]
+                position += 1
+                if header >> 4:
+                    field += header >> 4
+                else:
+                    encoded = varint()
+                    field = (encoded >> 1) ^ -(encoded & 1)
+                assert path != (4, 1, 3) or field not in (14, 15)
+                value(header & 15, (*path, field))
+            if path == (4, 1, 3):
+                assert insertion is None
+                insertion = position
+            position += 1
+        else:
+            raise AssertionError(f"Unexpected PyArrow footer type {kind}")
+
+    value(12, ())
+    assert position == len(footer) and insertion is not None
+
+    def encode_varint(number):
+        result = bytearray()
+        while number >= 128:
+            result.append((number & 127) | 128)
+            number >>= 7
+        result.append(number)
+        return bytes(result)
+
+    bloom = bytes.fromhex("15401c1c00001c1c00001c1c000000") + bytes.fromhex(
+        "0001000080000000000000400040000000040000008000000000000810000000"
+    )
+    fields = b"\x06\x1c" + encode_varint(footer_start << 1)
+    fields += b"\x05\x1e" + encode_varint(len(bloom) << 1)
+    footer = footer[:insertion] + fields + footer[insertion:]
+    return payload[:footer_start] + bloom + footer + struct.pack("<I", len(footer)) + b"PAR1"
+
+
+def test_parquet_embedded_bloom_skips_unreadable_data_pages(tmp_path):
+    """An absent equality succeeds without decoding pages; a present value reads them."""
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
+    input_file = tmp_path / "bloom.parquet"
+    pq.write_table(pa.table({"amount": pa.array([42] * 100, type=pa.int64())}), input_file,
+        use_dictionary=False, compression=None, write_statistics=False)
+    payload = _parquet_with_bloom_for_42(input_file.read_bytes())
+    # Independent reader accepts the extended footer and original data pages.
+    input_file.write_bytes(payload)
+    assert pq.read_table(input_file)["amount"].to_pylist() == [42] * 100
+    footer_start = len(payload) - 8 - struct.unpack("<I", payload[-8:-4])[0]
+    bloom_start = footer_start - 47
+    corrupt = payload[:4] + b"\xff" * (bloom_start - 4) + payload[bloom_start:]
+    for name, data in (("valid", payload), ("unreadable", corrupt)):
+        objects = tmp_path / name / "buckets" / "antfly" / "objects"
+        objects.mkdir(parents=True)
+        (objects / "part.parquet").write_bytes(b"AFOBJ001" + struct.pack("<QI", len(data), 0)
+            + hashlib.sha256(data).hexdigest().encode() + data)
+    server = StandaloneAntflyServer(binary, "127.0.0.1", 0)
+    failed = True
+    try:
+        def call(path, body):
+            return requests.post(server.api_url + path, json=body,
+                auth=("admin", AUTH_BOOTSTRAP_PASSWORD), timeout=60)
+        for name in ("valid", "unreadable"):
+            attached = call(f"/tables/bloom_{name}", {"num_shards": 1, "schema": {
+                "storage_mode": "relational", "base_source": {"kind": "external", "table_id": name,
+                    "format": "parquet", "uri": (tmp_path / name).as_uri()}}})
+            assert attached.ok, attached.text + server.debug_logs()
+            absent = call("/sql", {"statement": f"SELECT amount FROM bloom_{name} WHERE amount = 43"})
+            assert absent.ok, absent.text + server.debug_logs()
+            assert absent.json()["rows"] == []
+        present = call("/sql", {"statement": "SELECT amount FROM bloom_valid WHERE amount = 42 LIMIT 1"})
+        assert present.ok and present.json()["rows"] == [["42"]], present.text
+        try:
+            unreadable = call("/sql", {"statement": "SELECT amount FROM bloom_unreadable WHERE amount = 42 LIMIT 1"})
+            assert not unreadable.ok, unreadable.text
+        except requests.exceptions.ConnectionError:
+            # A decode error after streaming headers closes the response.
+            assert server.proc.poll() is None, server.debug_logs()
         failed = False
     finally:
         server.stop(test_failed=failed)

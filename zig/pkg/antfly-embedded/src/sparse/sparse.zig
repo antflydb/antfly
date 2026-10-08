@@ -158,6 +158,8 @@ pub const KeyPredicate = struct {
     select_ordinals: ?*const fn (*anyopaque, Allocator, OrdinalLookup) anyerror!?@import("../encoding/roaring.zig").RoaringBitmap = null,
 };
 pub const SearchConstraints = struct {
+    score_spill: ?@import("../spill_sort.zig").Options = null,
+    max_score_docs: usize = 65536,
     key_predicate: ?KeyPredicate = null,
     filter_doc_ids: []const []const u8 = &.{},
     exclude_doc_ids: []const []const u8 = &.{},
@@ -171,6 +173,91 @@ fn checkSearchCancellation(cancellation: ?CancellationToken) !void {
         if (value.isCancelled()) return error.Cancelled;
     }
 }
+
+const ScoreEntry = struct {
+    doc_num: u32,
+    score: f32,
+    fn worse(_: void, a: @This(), b: @This()) std.math.Order {
+        const order = std.math.order(a.score, b.score);
+        return if (order == .eq) std.math.order(b.doc_num, a.doc_num) else order;
+    }
+    fn better(_: void, a: @This(), b: @This()) bool {
+        return worse({}, a, b) == .gt;
+    }
+};
+
+/// Preserve native f32 addition order while bounding accumulation memory.
+/// Each document's partial sum precedes subsequent contributions in the spill.
+const ScoreAccumulator = struct {
+    const spill = @import("../spill_sort.zig");
+    alloc: Allocator,
+    options: ?spill.Options,
+    limit: usize,
+    cancellation: ?CancellationToken = null,
+    values: std.AutoHashMapUnmanaged(u32, f32) = .empty,
+    sort: ?spill.Sorter = null,
+    sequence: u32 = 0,
+    cursor: ?spill.Cursor = null,
+    head: ?spill.Record = null,
+    iterator: ?std.AutoHashMapUnmanaged(u32, f32).Iterator = null,
+    fn deinit(self: *@This()) void {
+        if (self.cursor) |*cursor| cursor.deinit();
+        if (self.sort) |*sort| sort.deinit();
+        self.values.deinit(self.alloc);
+    }
+    fn write(self: *@This(), doc: u32, value: f32) !void {
+        var bytes: [4]u8 = undefined;
+        std.mem.writeInt(u32, &bytes, @bitCast(value), .little);
+        const key = (@as(u64, doc) << 32) | self.sequence;
+        self.sequence = std.math.add(u32, self.sequence, 1) catch return error.ResourceBudgetExceeded;
+        try self.sort.?.add(key, &bytes);
+    }
+    fn add(self: *@This(), doc: u32, value: f32) !void {
+        if (self.sort == null and !self.values.contains(doc) and self.values.count() >= self.limit) {
+            var options = self.options orelse return error.ResourceBudgetExceeded;
+            options.cancellation = self.cancellation;
+            options.max_input_bytes = @min(options.max_input_bytes, 1024 * 1024 * 1024);
+            self.sort = try spill.Sorter.init(self.alloc, options);
+            var it = self.values.iterator();
+            while (it.next()) |entry| try self.write(entry.key_ptr.*, entry.value_ptr.*);
+            self.values.deinit(self.alloc);
+            self.values = .empty;
+        }
+        if (self.sort != null) return self.write(doc, value);
+        const entry = try self.values.getOrPut(self.alloc, doc);
+        if (!entry.found_existing) entry.value_ptr.* = 0;
+        entry.value_ptr.* += value;
+    }
+    fn finish(self: *@This()) !void {
+        if (self.sort) |*sort| {
+            if (try sort.finish()) |range| self.cursor = spill.Cursor.init(self.alloc, sort.run, range);
+        } else self.iterator = self.values.iterator();
+    }
+    fn next(self: *@This(), cancellation: ?CancellationToken) !?ScoreEntry {
+        if (self.iterator) |*it| {
+            const entry = it.next() orelse return null;
+            return .{ .doc_num = entry.key_ptr.*, .score = entry.value_ptr.* };
+        }
+        const cursor = if (self.cursor) |*c| c else return null;
+        var record = self.head orelse (try cursor.next() orelse return null);
+        self.head = null;
+        const doc: u32 = @intCast(record.key >> 32);
+        var score: f32 = 0;
+        var count: usize = 0;
+        while (true) {
+            if (count % 256 == 0) try checkSearchCancellation(cancellation);
+            if (record.payload.len != 4) return error.InvalidSparseSegment;
+            score += @as(f32, @bitCast(std.mem.readInt(u32, record.payload[0..4], .little)));
+            record = try cursor.next() orelse break;
+            if (record.key >> 32 != doc) {
+                self.head = record;
+                break;
+            }
+            count += 1;
+        }
+        return .{ .doc_num = doc, .score = score };
+    }
+};
 
 const BulkPosting = struct {
     term_id: u32,
@@ -3872,8 +3959,12 @@ pub const SparseIndex = struct {
         };
 
         // Accumulate scores: docNum → score
-        var scores = std.AutoHashMapUnmanaged(u32, f32).empty;
-        defer scores.deinit(alloc);
+        var score_spill = constraints.score_spill;
+        if (score_spill) |*options| if (options.resource_manager == null) {
+            options.resource_manager = self.resource_manager;
+        };
+        var scores: ScoreAccumulator = .{ .alloc = alloc, .options = score_spill, .limit = constraints.max_score_docs, .cancellation = constraints.cancellation };
+        defer scores.deinit();
         var incarnations: IncarnationCache = .{};
         defer incarnations.deinit(alloc);
 
@@ -3895,7 +3986,7 @@ pub const SparseIndex = struct {
             segment_id: ?u64 = null,
             segment_version: u32 = 1,
             query_weight: f32,
-            scores: *std.AutoHashMapUnmanaged(u32, f32),
+            scores: *ScoreAccumulator,
             filter_doc_nums: *const std.AutoHashMapUnmanaged(u32, void),
             direct_filter_doc_nums: *const std.AutoHashMapUnmanaged(u32, void),
             exclude_doc_nums: *const std.AutoHashMapUnmanaged(u32, void),
@@ -3936,9 +4027,7 @@ pub const SparseIndex = struct {
                         try ctx.decisions.allowed.add(doc_num);
                     };
                     const doc_weight = decoded.weights[di];
-                    const gop = try ctx.scores.getOrPut(ctx.alloc, doc_num);
-                    if (!gop.found_existing) gop.value_ptr.* = 0;
-                    gop.value_ptr.* += ctx.query_weight * doc_weight;
+                    try ctx.scores.add(doc_num, ctx.query_weight * doc_weight);
                 }
                 if (ctx.profile) |p| {
                     p.score_collect_ns += nowNs() - collect_start_ns;
@@ -4035,17 +4124,6 @@ pub const SparseIndex = struct {
             }
         }
 
-        const ScoreEntry = struct {
-            doc_num: u32,
-            score: f32,
-            fn worse(_: void, a: @This(), b: @This()) std.math.Order {
-                const order = std.math.order(a.score, b.score);
-                return if (order == .eq) std.math.order(b.doc_num, a.doc_num) else order;
-            }
-            fn better(_: void, a: @This(), b: @This()) bool {
-                return worse({}, a, b) == .gt;
-            }
-        };
         var entries = std.ArrayListUnmanaged(ScoreEntry).empty;
         defer entries.deinit(alloc);
         var heap = std.PriorityQueue(ScoreEntry, void, ScoreEntry.worse).initContext({});
@@ -4054,11 +4132,11 @@ pub const SparseIndex = struct {
         // removed before heap admission or deleted winners could hide live hits.
         const bounded = try completeLocatorMap(&txn);
         const sort_start_ns = if (profile_enabled) nowNs() else 0;
-        var it = scores.iterator();
-        while (it.next()) |e| {
+        try scores.finish();
+        while (try scores.next(constraints.cancellation)) |entry| {
             try checkSearchCancellation(constraints.cancellation);
-            if (self.docNumDeleted(&txn, e.key_ptr.*)) continue;
-            const entry: ScoreEntry = .{ .doc_num = e.key_ptr.*, .score = e.value_ptr.* };
+            if (profile_enabled) profile.scored_docs += 1;
+            if (self.docNumDeleted(&txn, entry.doc_num)) continue;
             if (!bounded) {
                 try entries.append(alloc, entry);
             } else if (heap.items.len < k) {
@@ -4071,7 +4149,7 @@ pub const SparseIndex = struct {
             }
         }
         if (bounded) try entries.appendSlice(alloc, heap.items);
-        if (profile_enabled) profile.scored_docs = scores.count();
+
         std.mem.sort(ScoreEntry, entries.items, {}, ScoreEntry.better);
         if (profile_enabled) profile.sort_ns = nowNs() - sort_start_ns;
 
@@ -6154,4 +6232,27 @@ test "sparse bounded top k matches legacy collection for signed terms and delete
         try std.testing.expectEqualStrings(expected.doc_id, actual.doc_id);
         try std.testing.expectEqual(expected.score, actual.score);
     }
+}
+
+test "sparse bounded accumulation preserves signed f32 addition order across spill" {
+    const a = std.testing.allocator;
+    var scores: ScoreAccumulator = .{ .alloc = a, .limit = 2, .options = .{ .io = std.testing.io, .directory = "/tmp", .chunk_records = 2, .chunk_bytes = 128 } };
+    defer scores.deinit();
+    var expected: [100]f32 = @splat(0);
+    for ([_]f32{ 16777216, 1, -16777216, -0.25, 0.25, -2 }) |term| {
+        for (0..100) |doc| {
+            const contribution = term * @as(f32, @floatFromInt(doc + 1));
+            expected[doc] += contribution;
+            try scores.add(@intCast(doc), contribution);
+            try std.testing.expect(scores.values.count() <= 2);
+        }
+    }
+    try scores.finish();
+    var count: usize = 0;
+    while (try scores.next(null)) |entry| {
+        try std.testing.expectEqual(@as(u32, @intCast(count)), entry.doc_num);
+        try std.testing.expectEqual(@as(u32, @bitCast(expected[count])), @as(u32, @bitCast(entry.score)));
+        count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 100), count);
 }

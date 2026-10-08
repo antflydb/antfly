@@ -550,7 +550,7 @@ fn appendStrongBound(a: A, conditions: *std.ArrayList(catalog.Condition), next: 
 /// Ordered identity-only consumption proves deletes, tuple bounds and ordering
 /// from the pinned publication. Membership enforces other required predicates;
 /// this path must never open a Parquet cursor to recheck an index key.
-pub fn tryOpenOrderedPredicate(a: A, server: *server_api.ApiHttpServer, table: catalog.Table, request: catalog.Scan, context: operation.RequestContext, source: *local.serverless_query_lake_serving.ServingSource) !?Predicate {
+pub fn tryOpenOrderedPredicate(a: A, server: *server_api.ApiHttpServer, table: catalog.Table, request: catalog.Scan, context: operation.RequestContext, source: *local.serverless_query_lake_serving.ServingSource, reverse: bool) !?Predicate {
     const definitions = table.external_indexes orelse return null;
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
@@ -586,7 +586,16 @@ pub fn tryOpenOrderedPredicate(a: A, server: *server_api.ApiHttpServer, table: c
             best_cost = cost;
         } else cursor.close(cursor.ptr);
     }
-    return if (best) |cursor| .{ .cursor = cursor } else null;
+    if (best) |cursor| {
+        if (reverse) {
+            const owner: *Owner = @ptrCast(@alignCast(cursor.ptr));
+            const replacement = try @import("../serverless/graph_segment/page_tree.zig").Cursor.initReverse(a, owner.reader.pages.store(), owner.reader.root.page, owner.predicate_lower, owner.predicate_upper);
+            owner.reader.cursor.?.deinit();
+            owner.reader.cursor = replacement;
+        }
+        return .{ .cursor = cursor };
+    }
+    return null;
 }
 
 pub fn tryOpenAuto(a: A, server: *server_api.ApiHttpServer, table: catalog.Table, request: catalog.Scan, context: operation.RequestContext, source: *local.serverless_query_lake_serving.ServingSource) !?catalog.Cursor {

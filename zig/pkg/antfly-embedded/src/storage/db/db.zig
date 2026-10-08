@@ -40259,6 +40259,7 @@ pub const DB = struct {
         if (bench_profile) prove_ns = platform_time.monotonicNs() - prove_start_ns;
         const inner_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
         const result = try db_query_search.searchSparse(alloc, algebraic_filter.req, sparse, .{
+            .score_spill = if (self.backend_runtime.filesystemIo()) |io| .{ .io = io, .directory = "/tmp", .resource_manager = self.core.index_manager.resource_manager } else null,
             .filter_candidate_presence = true,
             .ctx = self,
             .text_index_entry = textIndexEntryCallback,

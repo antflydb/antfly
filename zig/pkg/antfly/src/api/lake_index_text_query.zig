@@ -495,8 +495,7 @@ const Execution = struct {
             const column = for (self.table.columns) |column| {
                 if (std.mem.eql(u8, column.name, field.field)) break column;
             } else return null;
-            // Native date values and signed SQL timestamps have distinct domains.
-            if (column.type == .datetime) return null;
+            _ = column;
             order.* = .{ .column = field.field, .descending = field.desc, .nulls_first = !field.desc };
         }
         const sql_rows = @import("lake_index_sql_rows.zig");
@@ -512,19 +511,19 @@ const Execution = struct {
         }
         // Seek inclusively on the leading field. Public IDs break ties in the
         // native collector, so an entire boundary tie group must remain visible.
-        if (req.search_after.len != 0) {
-            const bound = req.search_after[0];
+        if (req.search_after.len != 0 or req.search_before.len != 0) {
+            const bound = if (req.search_before.len != 0) req.search_before[0] else req.search_after[0];
             if (bound == .null) return null;
             const kind = (try self.table.column(orders[0].column)).type;
             const normalized = local.sql_lake_values.comparisonValue(ca, bound, kind) catch |err| switch (err) {
                 error.OutOfMemory => return err,
                 else => return null,
             };
-            const condition: local.sql_catalog.Condition = .{ .column = orders[0].column, .op = if (orders[0].descending) .lte else .gte, .value = normalized };
+            const condition: local.sql_catalog.Condition = .{ .column = orders[0].column, .op = if (orders[0].descending != (req.search_before.len != 0)) .lte else .gte, .value = normalized };
             if (!try sql_rows.compatibleSearchConditions(ca, self.table, &.{condition})) return null;
             try conditions.append(ca, condition);
         }
-        var predicate = (try sql_rows.tryOpenOrderedPredicate(a, self.server, self.table, .{ .fields = &.{}, .conditions = conditions.items, .order = orders, .limit = 256, .row_goal = @as(u64, req.offset) + req.limit }, self.request, self.source)) orelse return null;
+        var predicate = (try sql_rows.tryOpenOrderedPredicate(a, self.server, self.table, .{ .fields = &.{}, .conditions = conditions.items, .order = orders, .limit = 256, .row_goal = @as(u64, req.offset) + req.limit }, self.request, self.source, req.search_before.len != 0)) orelse return null;
         errdefer predicate.deinit();
         const owner = try a.create(Ordered);
         owner.* = .{ .a = a, .execution = self, .predicate = predicate, .plan_arena = arena, .window = .init(a), .identities = identities, .lookup = .init(a) };
@@ -609,7 +608,7 @@ const Execution = struct {
         return shape.postprocessVectorSearchResult(a, req, result, false, .{ .ctx = raw, .is_visible = visible, .resolve_parent_id = parent, .load_parent_stored = parentStored, .load_stored = loadOne, .load_many_stored = loadMany, .load_projected_stored = loadProjectedOne, .load_many_projected_stored = loadProjected });
     }
     fn searchSparse(raw: ?*anyopaque, a: A, req: types.SearchRequest, sparse: types.SparseKnnQuery) !types.SearchResult {
-        return search.searchSparse(a, from(raw).vectorRequest(req), sparse, .{ .ctx = raw, .exact_doc_id_filters = true, .project_key = publicKey, .native_key = nativeKey, .filter_candidate_presence = true, .text_index_entry = noLocal, .sparse_index = sparseIndex, .load_projected_document = requireProjected, .load_projected_documents = loadProjected, .postprocess = postprocessVector });
+        return search.searchSparse(a, from(raw).vectorRequest(req), sparse, .{ .score_spill = .{ .io = from(raw).context.io.?, .directory = "/tmp" }, .ctx = raw, .exact_doc_id_filters = true, .project_key = publicKey, .native_key = nativeKey, .filter_candidate_presence = true, .text_index_entry = noLocal, .sparse_index = sparseIndex, .load_projected_document = requireProjected, .load_projected_documents = loadProjected, .postprocess = postprocessVector });
     }
     fn cloneSet(_: ?*anyopaque, a: A, set: local.storage_db_query_graph_exec.NamedResultSet, stored: bool) !types.SearchResult {
         return local.storage_db_query_graph_exec.cloneNamedSetAsResult(a, set, stored);

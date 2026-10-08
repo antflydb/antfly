@@ -3707,6 +3707,7 @@ fn readU64ForDoc(
     const resolved = snap.resolveDocId(global_id) orelse return null;
     const seg = &snap.segments[resolved.seg_idx];
     const reader = (try reads.get(&seg.reader, field)) orelse return null;
+    if (reader.value_type == .datetime_ns) return if (try reader.getDateTimeNs(resolved.local_id)) |ns| std.math.cast(u64, ns) else null;
     if (reader.value_type != .u64_val) return null;
     return try reader.getU64(resolved.local_id);
 }

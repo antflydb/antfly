@@ -106,6 +106,7 @@ pub const SegmentIndexSortField = struct {
 };
 
 pub const SegmentIndexSortBoundValue = union(enum) {
+    datetime_ns: i128,
     u64_val: u64,
     i64_val: i64,
     f64_val: f64,
@@ -2316,6 +2317,7 @@ const MergeDocRef = struct {
 };
 
 const SegmentSortValue = union(enum) {
+    datetime_ns: i128,
     u64_val: u64,
     i64_val: i64,
     f64_val: f64,
@@ -2335,6 +2337,7 @@ const SegmentSortValue = union(enum) {
 };
 
 const SegmentSortValueTag = enum {
+    datetime_ns,
     u64_val,
     i64_val,
     f64_val,
@@ -2346,6 +2349,7 @@ const SegmentSortValueTag = enum {
 
 fn segmentSortValueTag(value: SegmentSortValue) SegmentSortValueTag {
     return switch (value) {
+        .datetime_ns => .datetime_ns,
         .u64_val => .u64_val,
         .i64_val => .i64_val,
         .f64_val => .f64_val,
@@ -2374,6 +2378,7 @@ pub const TypedReadScope = struct {
     const Entry = struct { segment: *const SegmentReader, field: []const u8, reader: ?*typed_dv.TypedDocValuesReader };
     allocator: Allocator,
     entries: std.ArrayListUnmanaged(Entry) = .empty,
+    signed_sort_fields: std.StringHashMapUnmanaged(bool) = .empty,
     cache: ?*typed_dv.TypedDocValuesReader.PointCache = null,
 
     pub fn init(allocator: Allocator) TypedReadScope {
@@ -2389,7 +2394,23 @@ pub const TypedReadScope = struct {
             self.allocator.destroy(reader);
         };
         self.entries.deinit(self.allocator);
+        self.signed_sort_fields.deinit(self.allocator);
         self.* = undefined;
+    }
+    // Resolve a merge field once across the pinned input set. Old unsigned
+    // datetime columns need promotion before sort-domain validation, as well
+    // as when writing the merged column.
+    fn signedSortField(self: *TypedReadScope, inputs: []const MergeInput, field: []const u8) !bool {
+        if (self.signed_sort_fields.get(field)) |signed| return signed;
+        var signed = false;
+        for (inputs) |input| {
+            if (try self.get(input.reader, field)) |reader| if (reader.value_type == .datetime_ns) {
+                signed = true;
+                break;
+            };
+        }
+        try self.signed_sort_fields.put(self.allocator, field, signed);
+        return signed;
     }
     pub fn get(self: *TypedReadScope, segment: *const SegmentReader, field: []const u8) !?*typed_dv.TypedDocValuesReader {
         for (self.entries.items) |entry| if (entry.segment == segment and std.mem.eql(u8, entry.field, field)) return entry.reader;
@@ -3701,6 +3722,12 @@ const ExternalCoordinateSort = struct {
                     offset += 1;
                     continue;
                 }
+                if (tag == .datetime_ns) {
+                    if (offset > bytes.len or bytes.len - offset < 16) return error.InvalidSegment;
+                    key.* = .{ .datetime_ns = std.mem.readInt(i128, bytes[offset..][0..16], .little) };
+                    offset += 16;
+                    continue;
+                }
                 var numeric_tag: u8 = 0;
                 if (tag == .numeric_val) {
                     if (offset >= bytes.len) return error.InvalidSegment;
@@ -3727,7 +3754,7 @@ const ExternalCoordinateSort = struct {
                         offset += size;
                         break :blk if (tag == .id) .{ .id = payload } else .{ .bytes_val = payload };
                     },
-                    .bool_val => unreachable,
+                    .bool_val, .datetime_ns => unreachable,
                 };
             }
             if (offset != bytes.len) return error.InvalidSegment;
@@ -3738,6 +3765,7 @@ const ExternalCoordinateSort = struct {
     fn appendRecord(self: *@This(), record: SortedMergeRecord) !void {
         var length: usize = 8;
         for (record.keys) |key| length = try std.math.add(usize, length, switch (key) {
+            .datetime_ns => 17,
             .bool_val => 2,
             .numeric_val => 10,
             .bytes_val => |v| 9 + v.len,
@@ -3753,6 +3781,12 @@ const ExternalCoordinateSort = struct {
             try self.spool.appendSlice(&.{@backingInt(segmentSortValueTag(key))});
             if (key == .bool_val) {
                 try self.spool.appendSlice(&.{@intFromBool(key.bool_val)});
+                continue;
+            }
+            if (key == .datetime_ns) {
+                var bytes: [16]u8 = undefined;
+                std.mem.writeInt(i128, &bytes, key.datetime_ns, .little);
+                try self.spool.appendSlice(&bytes);
                 continue;
             }
             const value: u64 = switch (key) {
@@ -3774,7 +3808,7 @@ const ExternalCoordinateSort = struct {
                         .f64_val => |n| @bitCast(n),
                     };
                 },
-                .bool_val => unreachable,
+                .bool_val, .datetime_ns => unreachable,
             };
             var encoded: [8]u8 = undefined;
             std.mem.writeInt(u64, &encoded, value, .little);
@@ -4187,6 +4221,7 @@ const StreamingSortReads = struct {
         while (entry.current == null or entry.current.?.doc_id < ref.doc_id) entry.current = (try segmentSortDocValue(entry.cursor.next())) orelse return error.InvalidSegment;
         if (entry.current.?.doc_id != ref.doc_id) return error.InvalidSegment;
         return switch (entry.current.?.value) {
+            .datetime_ns => |ns| .{ .datetime_ns = ns },
             .u64_val => |v| .{ .numeric_val = .{ .u64_val = v } },
             .i64_val => |v| .{ .numeric_val = .{ .i64_val = v } },
             .f64_val => |v| if (std.math.isFinite(v)) .{ .numeric_val = .{ .f64_val = v } } else error.InvalidSegment,
@@ -4218,6 +4253,10 @@ fn loadSegmentSortKeysAlloc(
     for (index_sort, 0..) |field, i| {
         keys[i] = if (streams) |stream| try stream.key(payload_alloc, ref, field.field) else try loadSegmentSortKeyAlloc(payload_alloc, reads, inputs[ref.input_idx].reader, ref.doc_id, field.field);
         initialized += 1;
+        if (keys[i] == .numeric_val and keys[i].numeric_val == .u64_val and try reads.signedSortField(inputs, field.field)) {
+            const ns: i128 = keys[i].numeric_val.u64_val;
+            keys[i] = .{ .datetime_ns = ns };
+        }
     }
     return keys;
 }
@@ -4234,6 +4273,7 @@ fn loadSegmentSortKeyAlloc(
     }
     const dv_reader = (try reads.get(reader, field)) orelse return error.UnsupportedTypedDocValues;
     return switch (dv_reader.value_type) {
+        .datetime_ns => .{ .datetime_ns = (try segmentSortDocValue(dv_reader.getDateTimeNs(doc_id))) orelse return error.InvalidSegment },
         // Normalize legacy scalar numeric columns into the exact tagged
         // domain before comparing sort keys. This keeps sorted compaction
         // valid across an on-disk format rollout without rounding integers.
@@ -4270,6 +4310,7 @@ fn sortedMergeRecordLessThan(index_sort: []const SegmentIndexSortField, a: Sorte
 
 fn compareSegmentSortValues(a: SegmentSortValue, b: SegmentSortValue) std.math.Order {
     return switch (a) {
+        .datetime_ns => |av| if (b == .datetime_ns) std.math.order(av, b.datetime_ns) else .lt,
         .u64_val => |av| switch (b) {
             .u64_val => |bv| std.math.order(av, bv),
             else => .lt,
@@ -4342,6 +4383,7 @@ fn segmentBoundValuesFromSortValuesAlloc(
 
 fn segmentBoundValueFromSortValueAlloc(alloc: Allocator, value: SegmentSortValue) !SegmentIndexSortBoundValue {
     return switch (value) {
+        .datetime_ns => |ns| .{ .datetime_ns = ns },
         .u64_val => |v| .{ .u64_val = v },
         .i64_val => |v| .{ .i64_val = v },
         .f64_val => |v| if (std.math.isFinite(v)) .{ .f64_val = v } else error.InvalidSegment,
@@ -4417,11 +4459,13 @@ fn typedDocValuesValueTypeIsNumeric(value_type: typed_dv.ValueType) bool {
 fn mergeTypedDocValuesValueType(current: ?typed_dv.ValueType, next: typed_dv.ValueType) ?typed_dv.ValueType {
     const existing = current orelse return next;
     if (existing == next) return existing;
+    if ((existing == .datetime_ns and next == .u64_val) or (existing == .u64_val and next == .datetime_ns)) return .datetime_ns;
     if (typedDocValuesValueTypeIsNumeric(existing) and typedDocValuesValueTypeIsNumeric(next)) return .numeric_val;
     return null;
 }
 
 fn addMergedTypedDocValue(writer: anytype, doc_id: u32, value: typed_dv.TypedValue) !void {
+    if (writer.value_type == .datetime_ns and value == .u64_val) return writer.add(doc_id, .{ .datetime_ns = value.u64_val });
     if (writer.value_type != .numeric_val) return writer.add(doc_id, value);
     const numeric: typed_dv.NumericValue = switch (value) {
         .u64_val => |number| .{ .u64_val = number },
@@ -4557,6 +4601,7 @@ fn writeMergeTypedDocValuesSectionsInOrder(
 /// Byte values borrow the merge scope's cache until the next lookup.
 fn typedDocValueBorrowed(reader: *const typed_dv.TypedDocValuesReader, doc: u32) !?typed_dv.TypedValue {
     return switch (reader.value_type) {
+        .datetime_ns => if (try reader.getDateTimeNs(doc)) |ns| .{ .datetime_ns = ns } else null,
         .u64_val => if (try reader.getU64(doc)) |v| .{ .u64_val = v } else null,
         .i64_val => if (try reader.getI64(doc)) |v| .{ .i64_val = v } else null,
         .f64_val => if (try reader.getF64(doc)) |v| .{ .f64_val = v } else null,
@@ -4575,6 +4620,9 @@ fn addTypedDocValueIfPresent(
     out_doc_id: u32,
 ) !void {
     switch (reader.value_type) {
+        .datetime_ns => if (try reader.getDateTimeNs(src_doc_id)) |ns| {
+            try writer.add(out_doc_id, .{ .datetime_ns = ns });
+        },
         .u64_val => if (try reader.getU64(src_doc_id)) |value| {
             try addMergedTypedDocValue(writer, out_doc_id, .{ .u64_val = value });
         },
@@ -4804,6 +4852,12 @@ fn encodeIndexSortBoundTuple(
 ) !void {
     for (values) |value| {
         switch (value) {
+            .datetime_ns => |v| {
+                try out.append(alloc, 6);
+                var bytes: [16]u8 = undefined;
+                std.mem.writeInt(i128, &bytes, v, .big);
+                try out.appendSlice(alloc, &bytes);
+            },
             .u64_val => |v| {
                 try out.append(alloc, 0);
                 try appendU64BE(alloc, out, v);
@@ -4901,6 +4955,12 @@ fn decodeIndexSortBoundTupleAlloc(
             },
             3 => .{ .bytes_val = try decodeBoundBytesAlloc(alloc, data, pos) },
             4 => .{ .id = try decodeBoundBytesAlloc(alloc, data, pos) },
+            6 => blk: {
+                if (pos.* > data.len or data.len - pos.* < 16) return error.InvalidSegment;
+                const ns = std.mem.readInt(i128, data[pos.*..][0..16], .big);
+                pos.* += 16;
+                break :blk .{ .datetime_ns = ns };
+            },
             5 => blk: {
                 if (pos.* + 8 > data.len) return error.InvalidSegment;
                 const bits = std.mem.readInt(u64, data[pos.*..][0..8], .big);
@@ -9345,4 +9405,85 @@ test "authenticated cache stream covers partial blocks and preserves cache fill 
     try std.testing.expect(state.reads > reads);
     try std.testing.expectEqualSlices(u8, state.bytes[29000..29008], &point);
     try std.testing.expect(cache.retainedBytes() <= 64 * 1024);
+}
+
+test "external lake datetime compaction promotes legacy unsigned values without rounding" {
+    const a = std.testing.allocator;
+    try std.testing.expectEqual(typed_dv.ValueType.datetime_ns, mergeTypedDocValuesValueType(.u64_val, .datetime_ns).?);
+    try std.testing.expectEqual(typed_dv.ValueType.datetime_ns, mergeTypedDocValuesValueType(.datetime_ns, .u64_val).?);
+    var writer = typed_dv.TypedDocValuesWriter.init(a, .datetime_ns, 2);
+    defer writer.deinit();
+    try addMergedTypedDocValue(&writer, 0, .{ .u64_val = std.math.maxInt(u64) });
+    try addMergedTypedDocValue(&writer, 1, .{ .datetime_ns = -1 });
+    const bytes = try writer.build();
+    defer a.free(bytes);
+    var reader = try typed_dv.TypedDocValuesReader.init(a, bytes);
+    defer reader.deinit();
+    try std.testing.expectEqual(@as(i128, std.math.maxInt(u64)), (try reader.getDateTimeNs(0)).?);
+    try std.testing.expectEqual(@as(i128, -1), (try reader.getDateTimeNs(1)).?);
+}
+
+test "external lake sorted datetime compaction promotes legacy unsigned sort domains" {
+    const alloc = std.testing.allocator;
+
+    var u64_writer = typed_dv.TypedDocValuesWriter.init(alloc, .u64_val, 1024);
+    defer u64_writer.deinit();
+    try u64_writer.add(0, .{ .u64_val = 9_007_199_254_740_993 });
+    const u64_data = try u64_writer.build();
+    defer alloc.free(u64_data);
+
+    var sw1 = SegmentWriter.init(alloc);
+    defer sw1.deinit();
+    const price1 = try sw1.addField("price");
+    try sw1.addSection(price1, .typed_doc_values, u64_data);
+    try sw1.addStoredDoc("doc:b", "{\"price\":2}");
+    try sw1.addIndexSortMetadata(&.{
+        .{ .field = "price", .desc = false },
+        .{ .field = "_id", .desc = false },
+    });
+    const seg1 = try sw1.build();
+    defer alloc.free(seg1);
+
+    var i64_writer = typed_dv.TypedDocValuesWriter.init(alloc, .datetime_ns, 1024);
+    defer i64_writer.deinit();
+    try i64_writer.add(0, .{ .datetime_ns = -9_007_199_254_740_993 });
+    const i64_data = try i64_writer.build();
+    defer alloc.free(i64_data);
+
+    var sw2 = SegmentWriter.init(alloc);
+    defer sw2.deinit();
+    const price2 = try sw2.addField("price");
+    try sw2.addSection(price2, .typed_doc_values, i64_data);
+    try sw2.addStoredDoc("doc:a", "{\"price\":1}");
+    try sw2.addIndexSortMetadata(&.{
+        .{ .field = "price", .desc = false },
+        .{ .field = "_id", .desc = false },
+    });
+    const seg2 = try sw2.build();
+    defer alloc.free(seg2);
+
+    var reader1 = try SegmentReader.init(alloc, seg1);
+    defer reader1.deinit();
+    var reader2 = try SegmentReader.init(alloc, seg2);
+    defer reader2.deinit();
+
+    const sort_fields = [_]SegmentIndexSortField{
+        .{ .field = "price", .desc = false },
+        .{ .field = "_id", .desc = false },
+    };
+    const merged = try mergeSegmentInputsWithOptions(alloc, &.{
+        .{ .reader = &reader1 },
+        .{ .reader = &reader2 },
+    }, .{ .index_sort = &sort_fields });
+    defer alloc.free(merged);
+
+    var merged_reader = try SegmentReader.init(alloc, merged);
+    defer merged_reader.deinit();
+    try std.testing.expectEqualStrings("doc:a", (try merged_reader.storedDoc(0)).?.id);
+    try std.testing.expectEqualStrings("doc:b", (try merged_reader.storedDoc(1)).?.id);
+    var values = try typed_dv.TypedDocValuesReader.init(alloc, (try merged_reader.getSection("price", .typed_doc_values)) orelse return error.TestExpectedEqual);
+    defer values.deinit();
+    try std.testing.expectEqual(typed_dv.ValueType.datetime_ns, values.value_type);
+    try std.testing.expectEqual(@as(i128, -9_007_199_254_740_993), (try values.getDateTimeNs(0)).?);
+    try std.testing.expectEqual(@as(i128, 9_007_199_254_740_993), (try values.getDateTimeNs(1)).?);
 }

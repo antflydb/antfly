@@ -14896,7 +14896,7 @@ pub const IndexManager = struct {
 
     fn typedDocValueReaderMatchesMapping(value_type: typed_dv.ValueType, mapping: schema_mod.FieldMapping) bool {
         return switch (mapping.field_type) {
-            .datetime => value_type == .u64_val,
+            .datetime => value_type == .u64_val or value_type == .datetime_ns,
             .numeric => switch (value_type) {
                 .u64_val, .i64_val, .f64_val, .numeric_val => true,
                 else => false,

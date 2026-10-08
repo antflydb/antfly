@@ -395,6 +395,7 @@ pub const ProfiledDenseSearchResult = struct {
 };
 
 pub const SparseSearchExecutor = struct {
+    score_spill: ?@import("../../../spill_sort.zig").Options = null,
     /// The provider maps public document IDs exactly into its native identity space.
     exact_doc_id_filters: bool = false,
     /// Project immutable producer identities before filtering, sorting, and paging.
@@ -3064,6 +3065,7 @@ const SortValue = union(enum) {
     bool_value: bool,
     integer: i64,
     u64_value: u64,
+    datetime_ns: i128,
     number: f64,
     number_string: []const u8,
     string: []const u8,
@@ -4043,6 +4045,7 @@ fn sortValueRank(value: SortValue) u8 {
     return switch (value) {
         .null_value => 0,
         .bool_value => 1,
+        .datetime_ns => 4,
         .integer, .u64_value, .number, .number_string => 2,
         .string => 3,
     };
@@ -4153,6 +4156,7 @@ fn compareSortValues(a: SortValue, b: SortValue) std.math.Order {
     if (ar != br) return std.math.order(ar, br);
     return switch (a) {
         .null_value => .eq,
+        .datetime_ns => |av| std.math.order(av, b.datetime_ns),
         .bool_value => |av| std.math.order(@intFromBool(av), @intFromBool(b.bool_value)),
         .integer, .u64_value, .number, .number_string => compareNumberSortValues(a, b),
         .string => |av| std.mem.order(u8, av, b.string),
@@ -5732,7 +5736,7 @@ fn distributedSortTupleScalarClass(value: SortValue) ?SortTupleScalarClass {
     return switch (value) {
         .null_value => null,
         .bool_value => .bool_value,
-        .integer, .u64_value, .number => .numeric,
+        .integer, .u64_value, .number, .datetime_ns => .numeric,
         .number_string => |text| if (jsonNumberStringIsNumeric(text)) .numeric else null,
         .string => .string,
     };
@@ -6121,7 +6125,7 @@ fn ownedSortValueFromJsonForPlanFieldAlloc(
             if (mapping.field_type == .datetime) {
                 if (value) |actual| {
                     if (actual != .null) {
-                        if (datetimeCursorValueAsNs(actual)) |ns| return .{ .u64_value = ns };
+                        if (datetimeCursorValueAsNs(actual)) |ns| return .{ .datetime_ns = ns };
                     }
                 }
             }
@@ -6148,7 +6152,7 @@ fn nativeSortValueRejectionReason(mapping: runtime_schema_mod.FieldMapping, valu
             else => .invalid_doc_value_type,
         },
         .boolean => if (value == .bool_value) null else .invalid_doc_value_type,
-        .datetime => if (sortValueAsU64(value) != null) null else .invalid_doc_value_type,
+        .datetime => if (sortValueAsDateTime(value) != null) null else .invalid_doc_value_type,
         else => .non_scalar_field,
     };
 }
@@ -6197,8 +6201,8 @@ fn sortValueJsonForFieldAlloc(alloc: Allocator, plan: SortExecutionPlan, field: 
     if (plan.runtime_schema) |schema| {
         if (sortFieldMapping(schema, field)) |mapping| {
             if (mapping.field_type == .datetime) {
-                if (sortValueAsU64(value)) |ns| {
-                    return .{ .string = try runtime_schema_mod.formatDateTimeNsAlloc(alloc, ns) };
+                if (sortValueAsDateTime(value)) |ns| {
+                    return .{ .string = try @import("../../../datetime.zig").formatDateTimeSignedNsAlloc(alloc, ns) };
                 }
                 return error.UnsupportedQueryRequest;
             }
@@ -6206,6 +6210,7 @@ fn sortValueJsonForFieldAlloc(alloc: Allocator, plan: SortExecutionPlan, field: 
     }
     return switch (value) {
         .null_value => .null,
+        .datetime_ns => |v| .{ .number_string = try std.fmt.allocPrint(alloc, "{d}", .{v}) },
         .bool_value => |v| .{ .bool = v },
         .integer => |v| .{ .integer = v },
         .u64_value => |v| if (v <= @as(u64, @intCast(std.math.maxInt(i64))))
@@ -6218,13 +6223,18 @@ fn sortValueJsonForFieldAlloc(alloc: Allocator, plan: SortExecutionPlan, field: 
     };
 }
 
-fn datetimeCursorValueAsNs(value: std.json.Value) ?u64 {
+fn sortValueAsDateTime(value: SortValue) ?i128 {
     return switch (value) {
-        .integer => |v| if (v >= 0) @intCast(v) else null,
-        .number_string => |v| std.fmt.parseInt(u64, v, 10) catch null,
-        .string => |v| runtime_schema_mod.parseDateTimeToNs(v),
+        .datetime_ns => |v| v,
+        .integer => |v| v,
+        .u64_value => |v| v,
+        .number_string => |v| std.fmt.parseInt(i128, v, 10) catch null,
         else => null,
     };
+}
+
+fn datetimeCursorValueAsNs(value: std.json.Value) ?i128 {
+    return if (value == .string) @import("../../../datetime.zig").parseDateTimeToSignedNs(value.string) else @import("../../../datetime.zig").rangeNanoseconds(value);
 }
 
 fn appendSortValueJson(alloc: Allocator, values: *std.ArrayListUnmanaged(std.json.Value), plan: SortExecutionPlan, field: []const u8, value: SortValue) !void {
@@ -6241,7 +6251,7 @@ fn sortValueFromCursorJson(plan: SortExecutionPlan, field: []const u8, value: st
         if (sortFieldMapping(schema, field)) |mapping| {
             if (!mappedSortCursorValueIsValid(mapping, value)) return error.InvalidQueryRequest;
             if (mapping.field_type == .datetime) {
-                return .{ .u64_value = datetimeCursorValueAsNs(value) orelse return error.InvalidQueryRequest };
+                return .{ .datetime_ns = datetimeCursorValueAsNs(value) orelse return error.InvalidQueryRequest };
             }
         }
     }
@@ -6275,6 +6285,7 @@ fn cursorRejectionReasonForConcreteSortKey(
         .missing_rejected => .missing_null_policy,
     };
     return switch (sort_key) {
+        .datetime_ns => if (datetimeCursorValueAsNs(cursor_value) != null) null else .invalid_cursor_type,
         .null_value => .missing_null_policy,
         .bool_value => if (cursor_value == .bool) null else .invalid_cursor_type,
         .integer => switch (cursor_value) {
@@ -6302,6 +6313,7 @@ fn sortValueFromCursorJsonForSortKey(plan: SortExecutionPlan, field: []const u8,
         );
         return error.InvalidQueryRequest;
     }
+    if (sort_key == .datetime_ns) return .{ .datetime_ns = datetimeCursorValueAsNs(value) orelse return error.InvalidQueryRequest };
     return sortValueFromCursorJson(plan, field, value);
 }
 
@@ -6780,6 +6792,7 @@ fn nativeSortValueFromTextDocValuesAlloc(
         return error.UnsupportedExactSort;
     };
     return switch (reader.value_type) {
+        .datetime_ns => .{ .datetime_ns = (try reader.getDateTimeNs(resolved.local_id)) orelse return error.UnsupportedExactSort },
         .u64_val => {
             const value = reader.getU64(resolved.local_id) catch |err| switch (err) {
                 error.InvalidData, error.InvalidSegment, error.CorruptInput, error.CrcMismatch => {
@@ -6927,7 +6940,12 @@ fn decorateSortHitAlloc(
                         p.native_doc_value_miss_count += 1;
                     }
                 }
-                if (loaded_native) |native_value| break :blk native_value;
+                if (loaded_native) |native_value| {
+                    if (plan.runtime_schema) |schema| if (sortFieldMapping(schema, field.field)) |mapping| if (mapping.field_type == .datetime) {
+                        break :blk .{ .datetime_ns = sortValueAsDateTime(native_value) orelse return error.UnsupportedExactSort };
+                    };
+                    break :blk native_value;
+                }
                 if (plan.kind == .native_doc_values_top_n or plan.require_native or loader.require_native) {
                     logNativeSortPlanRejection(
                         field.field,
@@ -7867,6 +7885,7 @@ fn compareSortedSegmentDocToCursorAlloc(
 
 fn sortValueFromSegmentBoundValue(value: segment_mod.SegmentIndexSortBoundValue) SortValue {
     return switch (value) {
+        .datetime_ns => |v| .{ .datetime_ns = v },
         .u64_val => |v| .{ .u64_value = v },
         .i64_val => |v| .{ .integer = v },
         .f64_val => |v| .{ .number = v },
@@ -7884,7 +7903,10 @@ fn compareSortedSegmentBoundToCursor(
 ) !std.math.Order {
     if (bound.len != req.order_by.len or cursor.len != req.order_by.len) return error.InvalidSegment;
     for (req.order_by, 0..) |field, i| {
-        const bound_value = sortValueFromSegmentBoundValue(bound[i]);
+        var bound_value = sortValueFromSegmentBoundValue(bound[i]);
+        if (plan.runtime_schema) |schema| if (sortFieldMapping(schema, field.field)) |mapping| if (mapping.field_type == .datetime) {
+            bound_value = .{ .datetime_ns = sortValueAsDateTime(bound_value) orelse return error.InvalidSegment };
+        };
         const cursor_value = try sortValueFromCursorJsonForSortKey(plan, field.field, bound_value, cursor[i]);
         const order = compareSortValues(bound_value, cursor_value);
         if (order != .eq) {
@@ -11320,7 +11342,7 @@ fn sortAndPageTextDocValueCandidatesAlloc(
         .require_native = plan.require_native,
         .load = loadTextDocValueSortValue,
     };
-    var ordered = if (bitmap != null and preferOrderedCandidates(bitmap.?.cardinality(), snapshot.liveDocCount(), sortWindowCapacity(effective_req)) and effective_req.limit > 0 and executor.native_count_visibility_exact and executor.is_expired_key == null and effective_req.search_before.len == 0)
+    var ordered = if (bitmap != null and preferOrderedCandidates(bitmap.?.cardinality(), snapshot.liveDocCount(), sortWindowCapacity(effective_req)) and effective_req.limit > 0 and executor.native_count_visibility_exact and executor.is_expired_key == null)
         if (executor.open_ordered_candidates) |open| try open(executor.ctx, alloc, effective_req, snapshot) else null
     else
         null;
@@ -11393,7 +11415,7 @@ fn sortAndPageTextDocValueCandidatesAlloc(
         if (ordered != null and window_len == window_capacity) {
             var primary_order = effective_req;
             primary_order.order_by = effective_req.order_by[0 .. effective_req.order_by.len - 1];
-            if (compareDecoratedSortHits(primary_order, decorated, window[0]) == .gt) {
+            if (compareDecoratedSortHits(primary_order, decorated, window[0]) == (if (keep_previous_page) std.math.Order.lt else .gt)) {
                 decorated.deinit(alloc);
                 decorated_owned = false;
                 break;
@@ -15554,6 +15576,7 @@ pub fn searchSparse(
         const effective_k = candidate_window;
         const index_search_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
         const raw_hits = try entry.index.searchConstrained(alloc, &query, effective_k, .{
+            .score_spill = executor.score_spill,
             .filter_doc_ids = native_constraints.filter_doc_ids,
             .exclude_doc_ids = native_constraints.exclude_doc_ids,
             .filter_doc_nums = native_constraints.filter_doc_nums,
@@ -16119,7 +16142,7 @@ fn typedDocValuesTypeMatchesMappedSortField(
         .keyword, .link => value_type == .bytes_val,
         .numeric => value_type == .u64_val or value_type == .i64_val or value_type == .f64_val or value_type == .numeric_val,
         .boolean => value_type == .bool_val,
-        .datetime => value_type == .u64_val,
+        .datetime => value_type == .u64_val or value_type == .datetime_ns,
         else => false,
     };
 }
@@ -16222,11 +16245,11 @@ fn snapshotTypedDocValuesCoverageDetailsForMappingWithValidation(
         const value_type = cached.value_type orelse return .{ .status = cached.status };
         if (!typedDocValuesTypeMatchesMappedSortField(value_type, mapping)) return .{ .status = .doc_values_kind_mismatch };
         if (expected_value_type) |expected| {
-            const both_numeric = mapping.field_type == .numeric and
+            const both_numeric = (mapping.field_type == .numeric or mapping.field_type == .datetime) and
                 typedDocValuesTypeMatchesMappedSortField(expected, mapping) and
                 typedDocValuesTypeMatchesMappedSortField(value_type, mapping);
             if (value_type != expected and !both_numeric) return .{ .status = .doc_values_kind_mismatch };
-            if (value_type != expected and both_numeric) expected_value_type = .numeric_val;
+            if (value_type != expected and both_numeric) expected_value_type = if (mapping.field_type == .datetime) .datetime_ns else .numeric_val;
         } else {
             expected_value_type = value_type;
         }
@@ -16414,6 +16437,7 @@ fn mappedSortCursorRejectionReasonForDocValueType(
         return if (datetimeCursorValueAsNs(value) != null) null else .invalid_cursor_type;
     }
     return switch (value_type) {
+        .datetime_ns => if (datetimeCursorValueAsNs(value) != null) null else .invalid_cursor_type,
         .u64_val => switch (value) {
             .integer => |v| if (v >= 0) null else .invalid_cursor_type,
             .number_string => |text| if (std.fmt.parseInt(u64, text, 10)) |_| null else |_| .invalid_cursor_type,
@@ -16574,7 +16598,7 @@ fn indexSortBoundValueMatchesField(
     if (std.mem.eql(u8, field.field, "_id")) return value == .id;
     const mapping = sortFieldMapping(schema, field.field) orelse return false;
     return switch (mapping.field_type) {
-        .datetime => value == .u64_val,
+        .datetime => value == .u64_val or value == .datetime_ns,
         .numeric => switch (value) {
             .f64_val => |v| std.math.isFinite(v),
             .u64_val, .i64_val => true,
@@ -23255,7 +23279,7 @@ test "native sort planner classifies mapping and cursor rejection reasons" {
     try std.testing.expectEqual(NativeSortPlanRejectionReason.invalid_cursor_type, mappedSortCursorRejectionReason(datetime_mapping, .{ .string = "not-a-date" }).?);
     try std.testing.expect(!mappedSortCursorValueIsValid(datetime_mapping, .{ .float = 1_704_067_200_000_000_000.0 }));
     try std.testing.expectEqual(NativeSortPlanRejectionReason.invalid_cursor_type, mappedSortCursorRejectionReason(datetime_mapping, .{ .float = 1_704_067_200_000_000_000.0 }).?);
-    try std.testing.expect(!mappedSortCursorValueIsValid(datetime_mapping, .{ .integer = -1 }));
+    try std.testing.expect(mappedSortCursorValueIsValid(datetime_mapping, .{ .integer = -1 }));
     try std.testing.expect(!mappedSortCursorValueIsValid(datetime_mapping, .null));
     try std.testing.expectEqual(NativeSortPlanRejectionReason.missing_null_policy, mappedSortCursorRejectionReason(datetime_mapping, .null).?);
     try std.testing.expect(mappedSortCursorValueIsValid(numeric_mapping, .{ .number_string = "9223372036854775808" }));
@@ -32322,5 +32346,14 @@ test "external lake selected-field highlights follow native projection rather th
             const fragment = hits[0].highlights[0].fragments[0];
             try std.testing.expectEqualStrings("needle", fragment.text[fragment.spans[0].start..fragment.spans[0].end]);
         }
+    }
+}
+
+test "external lake signed native datetime cursors retain their concrete domain" {
+    const plan: SortExecutionPlan = .{ .kind = .native_doc_values_top_n };
+    for ([_]std.json.Value{ .{ .integer = -1 }, .{ .number_string = "-1" }, .{ .string = "1969-12-31T23:59:59.999999999Z" } }) |cursor| {
+        const key = try sortValueFromCursorJsonForSortKey(plan, "time", .{ .datetime_ns = 0 }, cursor);
+        try std.testing.expectEqual(@as(i128, -1), key.datetime_ns);
+        try std.testing.expectEqual(std.math.Order.lt, compareSortValues(key, .{ .datetime_ns = 0 }));
     }
 }

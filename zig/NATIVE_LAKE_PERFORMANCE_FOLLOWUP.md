@@ -21,9 +21,12 @@ Selective sets (at most 4096 rows, scaled to the requested result count) use
 36-byte forward locators and preserve zero/negative scores for overlapping terms;
 absence of overlap is separate from score. Broader sets intersect native bitmaps
 with authenticated posting-block ordinal trailers before decoding. Posting payloads remain V1; old readers ignore the extended range metadata,
-and unextended blocks derive bounds without allocating decoded arrays. Exact multi-term accumulation retains a score map;
-complete checkpoints select winners with a bounded top-k heap and sort only k
-entries, excluding tombstones before admission. Legacy checkpoints retain the
+and unextended blocks derive bounds without allocating decoded arrays. Exact multi-term accumulation retains at most 65,536 document scores in RAM,
+then streams contributions through bounded native spill sorting. Per-document
+addition order is preserved, including signed weights and cancellation between
+terms. The spill input budget is 1 GiB, with native capacity reservations where
+a resource manager is available. Complete checkpoints select winners with a
+bounded top-k heap and sort only k entries, excluding tombstones before admission. Legacy checkpoints retain the
 full candidate sort and defensive identity fallback.
 
 Persist authenticated mappings between physical file/group/row coordinates and
@@ -74,12 +77,14 @@ counts and the `ordered_lake_index_then_text_postings` source. Compatible direct
 relational keys stream pinned physical row
 references without Parquet hydration. Safe required predicates provide tuple
 bounds and equality prefixes; unsupported leaves remain native membership checks.
-Forward cursors seek inclusively on the first ordered field and keep complete
-boundary ties for public-ID comparison. The collector stops only after the
+Forward and backward cursors seek inclusively on the first ordered field and
+keep complete boundary ties for public-ID comparison. Backward traversal follows
+preceding B-tree children from the upper-bound path; it does not reverse a full
+forward scan. Signed datetime keys use the same nanosecond domain as SQL. The collector stops only after the
 boundary key group, preserves exact totals, and reports matching candidates plus
 `ordered_scanned_count` (all traversed physical references before membership).
-Offset is supported. Backward cursors, timestamp sort domains, incompatible null
-policies/collations and unproven orders retain the native doc-value fallback.
+Offset is supported. Incompatible null policies/collations and unproven orders
+retain the native doc-value fallback.
 Existing scoring uses full-corpus statistics.
 
 Use compatible ordered relational indexes as candidate producers for field sorts.
@@ -170,35 +175,75 @@ and wide integer timestamp regressions additionally cover pre-epoch lexical
 index rejection and signed values beyond i64. The refinements below supersede the residual dependency and forward-cursor
 limitations recorded by that validation run.
 
-## Remaining work after the October 8 refinements
+## Signed datetime, reverse traversal, and bounded sparse refinements
 
-The checkpoint mappings, block rejection, bounded winner collection, residual-only
-projection/page masks, costed ordered selection, equality prefixes and inclusive
-forward seeks are implemented. Full signed timestamp ordering still needs a
-versioned native datetime doc-value/cursor contract: native search currently uses
-unsigned nanoseconds, while relational timestamps use signed wide integers.
-Backward index traversal needs an explicit reverse cursor in the persistent tree;
-a forward scan with a reversed comparator would not prove early stopping.
-Multi-term sparse score accumulation still scales with matching postings; WAND or
-another exact signed-bound algorithm would need a separate proof and benchmark.
-No representative 50-million-row cold/warm throughput result is claimed.
+Native mapped datetime doc values use wire tag 7: signed i128 Unix nanoseconds,
+encoded as 16 little-endian bytes. Legacy tag-0 unsigned datetime columns remain
+readable and normalize into the signed domain for sorting and cursors. Typed
+column merges promote legacy unsigned values when a signed datetime column is
+present. Index-sort bounds carry a distinct signed timestamp tag. Public cursor
+values remain normalized RFC3339 strings, with exact nanosecond precision and
+date-only input compatibility. The native lake producer recipe advances to v3
+so rebuilds cannot reuse unsigned-only source projections.
+
+The persistent page tree supports a reverse half-open cursor with one initial
+upper-bound descent and lazy preceding-child reads. Ordered native search uses
+that traversal for search-before, retains the complete boundary tuple group, and
+returns the previous page in the requested order. Cost and runtime probe guards
+apply in both traversal directions.
+
+Sparse accumulation keeps small queries in a fixed-size hash table and switches
+to native spill runs above the limit. Records sort by native ordinal and original
+contribution sequence; a streaming reducer feeds the existing bounded winner
+heap. This preserves native f32 addition order instead of relying on nonnegative
+WAND bounds. Cancellation is checked during ingestion, merge and reduction.
+Memory-only callers without spill I/O fail scratch admission rather than growing
+without bound. Legacy checkpoints retain defensive identity/hydration fallback.
+The contribution sequence and spill byte budget have explicit checked limits.
+
+## Embedded Parquet pruning
+
+Parquet and Iceberg scans share row-group statistics, standard ColumnIndex /
+OffsetIndex page skipping, and standard split-block Bloom equality probes. Bloom
+metadata survives inventory encoding v18; older inventories, including v17,
+remain readable. Readers support both length-bearing and older offset-only Bloom
+metadata. A probe reads at most 256 header bytes and one 32-byte bitset block,
+through the same versioned range cache and cancellation context as other reads.
+When the selected block fits in the header lease, it is reused without a second
+range request. Invalid compact page-header tags return a decoding error instead
+of terminating the process.
+Only BLOCK / XXHASH / UNCOMPRESSED headers and proven physical encodings supply
+negative evidence. Unsupported algorithms, annotations and malformed headers
+retain scanning. Bloom filters never replace residual predicates.
+
+These structures complement snapshot-bound secondary indexes. Source data files
+remain unchanged. WAND-style posting-work reduction and representative archive
+cold/warm benchmarks remain future opportunities; bounded accumulation alone is
+not a claim of sublinear posting traversal.
 
 
-Validation on 2026-10-08: merged origin/main at 272db51d52 and built the Debug
-server with Zig 0.17.0. All 30 sparse tests, 319 SQL tests (three benchmark
-skips), and 184 lake API tests passed. Column residual masks include exhaustive
-allocation-failure checks and comparison with the shared document evaluator;
-bounded sparse top-k matches the legacy collector with signed weights and deleted
-winners. Block-map tests cover compaction, replacement, deletion, restart and
-legacy completeness fallback. Posting tests prove unchanged V1 payloads and
-legacy range-prefix decoding of extended metadata.
+Validation on 2026-10-08: the Zig 0.17.0 Debug production build passed, along
+with lake-test (397 embedded and 131 server tests), lake-api-test (107 embedded
+and 87 server tests), all 31 sparse tests, 43 native query-reader tests, and
+319 SQL tests (three benchmark skips). Signed datetime regressions cover
+pre-epoch and year-9999 projection, legacy unsigned reads and sorted compaction,
+and concrete cursor domains without schema metadata. Sparse spill tests force
+multiple merge passes and compare every f32 result bit with original-order
+signed accumulation.
 
-All 21 real Parquet/PyIceberg e2e-full tests passed together in 271.11 seconds
-against the final binary. The 100,003-row two-file fixture covers nonpositive
-sparse scores, point-filter native sorting with zero ordered probes, forward
-cursor continuation in both sort directions, combined range/category bounds,
-residual predicates, exact totals and public-ID ties. A text membership clustered
-at the archive end triggers native fallback after at most 1024 ordered probes
-and still returns the exact page and 1000-row total. Apache boundary validation
-(1904 sources), Zig formatting, the joined public OpenAPI comparison and diff
-whitespace checks passed. No cold/warm archive throughput benchmark is claimed.
+All 22 real Parquet/PyIceberg e2e-full tests passed together in 276.59 seconds
+against the final runtime. The 100,003-row two-file fixture covers nonpositive
+sparse scores, broad indexed predicates, point-filter native sorting, forward
+and backward pages in both sort directions, pre-epoch native datetime sorting,
+combined bounds, residual predicates, exact totals and public-ID ties. Skewed
+text membership retains bounded ordered probing and exact native fallback.
+
+An independent PyArrow reader verifies the extended standard Bloom fixture.
+With statistics disabled and unreadable data pages, absent equality succeeds
+through embedded Bloom pruning; present equality attempts decoding, returns an
+error, and leaves the server alive. Unit tests cover offset-only legacy Bloom
+metadata, unsupported annotations/algorithms, small-filter lease reuse and
+bounded probes into larger filters. Real Iceberg snapshot, field-ID, partition,
+delete and restart coverage also passes. Embedded boundary validation (747
+production sources), Zig formatting, Python syntax and diff whitespace checks
+passed. No cold/warm archive throughput benchmark is claimed.

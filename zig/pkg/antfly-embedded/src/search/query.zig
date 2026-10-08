@@ -1582,13 +1582,13 @@ pub const DateRangeFilter = struct {
         var result = roaring.RoaringBitmap.init(alloc);
         errdefer result.deinit();
 
-        if (reader.value_type != .u64_val) return result;
+        if (reader.value_type != .u64_val and reader.value_type != .datetime_ns) return result;
         var cursor = typed_dv.TypedDocValuesReader.Cursor.init(&reader);
         defer cursor.deinit();
         while (try cursor.next()) |entry| {
             if (entry.doc_id >= seg.reader.doc_count) return error.InvalidSegment;
             const doc_id = entry.doc_id;
-            const val = @as(?@TypeOf(entry.value.u64_val), entry.value.u64_val);
+            const val: ?i128 = if (entry.value == .datetime_ns) entry.value.datetime_ns else entry.value.u64_val;
             if (val) |v| {
                 const above_start = if (self.start_ns) |s|
                     (if (self.inclusive_start) v >= s else v > s)
