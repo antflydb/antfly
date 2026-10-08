@@ -386,6 +386,7 @@ fn cleanup(comptime BackendType: type, backend: *BackendType, finalize_deferred:
         for (backend.run_index_cache.items) |*cached| cached.deinit(backend.allocator);
         backend.run_index_cache.deinit(backend.allocator);
     }
+    if (@hasDecl(BackendType, "deinitRunSources")) backend.deinitRunSources();
     if (@hasField(BackendType, "run_block_cache")) {
         for (backend.run_block_cache.items) |*cached| cached.deinit(backend.allocator);
         backend.run_block_cache.deinit(backend.allocator);

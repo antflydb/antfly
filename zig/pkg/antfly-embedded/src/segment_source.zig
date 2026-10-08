@@ -62,7 +62,22 @@ pub const Source = union(enum) {
         resource_manager: ?*resources.ResourceManager = null,
         read_io: ?std.Io = null,
         check_read_context: ?*const fn (*anyopaque) anyerror!void = null,
+        /// Opt-in idle expiry for source caches. A successful acquisition
+        /// protects all source operations until its matching release.
+        acquire_use: ?*const fn (*anyopaque) bool = null,
+        release_use: ?*const fn (*anyopaque) void = null,
+        enable_idle_expiry: ?*const fn (*anyopaque) void = null,
     },
+
+    pub fn acquireUse(self: Source) bool {
+        return if (self == .ranges) if (self.ranges.acquire_use) |acquire| acquire(self.ranges.ptr) else true else true;
+    }
+    pub fn releaseUse(self: Source) void {
+        if (self == .ranges) if (self.ranges.release_use) |release| release(self.ranges.ptr);
+    }
+    pub fn enableIdleExpiry(self: Source) void {
+        if (self == .ranges) if (self.ranges.enable_idle_expiry) |enable| enable(self.ranges.ptr);
+    }
 
     /// Stop query-owned work before its borrowed capability is released.
     pub fn quiesceReadContext(self: Source) void {

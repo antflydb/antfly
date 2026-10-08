@@ -2508,6 +2508,8 @@ pub const NativeFile = struct {
     vacuum_target_indexed: bool = false,
     ledger: ?*allocator_v4.State = null,
     minimum_reader_sequence: ?u64 = null,
+    reader_frontier: ?*const std.atomic.Value(u64) = null,
+    publication_observer: ?struct { context: *anyopaque, notify: *const fn (*anyopaque, CheckpointSlot, bool) void } = null,
     secondary_page_cache: ?*PageCache = null,
     retirement_work_pages: usize = 128,
     allocator_cancel_token: ?*const maintenance.CancelToken = null,
@@ -3098,7 +3100,7 @@ pub const NativeFile = struct {
     }
     fn reuseFrontier(self: *NativeFile) u64 {
         const frontier = self.metadataReuseFrontier();
-        return @min(frontier, self.minimum_reader_sequence orelse frontier);
+        return @min(@min(frontier, self.minimum_reader_sequence orelse frontier), if (self.reader_frontier) |readers| readers.load(.acquire) else frontier);
     }
 
     /// Work is bounded by retired graph objects, including value subtrees. A
@@ -3348,7 +3350,7 @@ pub const NativeFile = struct {
         const item = state.heap.peek() orelse return false;
         // Advancing a fallback slot makes progress only if a reader or a
         // deferred durability barrier is not the remaining visibility fence.
-        return item.epoch <= self.reuseFrontier() or (self.minimum_reader_sequence == null and self.durable_header == null);
+        return item.epoch <= self.reuseFrontier() or (self.minimum_reader_sequence == null and (if (self.reader_frontier) |readers| readers.load(.acquire) == std.math.maxInt(u64) else true) and self.durable_header == null);
     }
 
     fn budgetedCheckpointDue(self: *NativeFile, state: *allocator_v4.State) bool {
@@ -7761,6 +7763,7 @@ pub const NativeFile = struct {
         }
         if (changed) next.commit_sequence = previous.checkpoints[previous.active_checkpoint].commit_sequence + 1;
         if (!durable and !self.no_sync) {
+            defer self.notifyPublication();
             // Keep the last durable checkpoint slots intact until an explicit
             // durability barrier. Readers on this handle see the new roots;
             // reopening after a crash sees the previous complete checkpoint.
@@ -7781,6 +7784,7 @@ pub const NativeFile = struct {
             self.header.checkpoints[self.header.active_checkpoint] = checkpoint;
             return;
         }
+        defer self.notifyPublication();
         if (self.durable_header) |durable| {
             self.header = durable;
             self.durable_header = null;
@@ -7807,6 +7811,10 @@ pub const NativeFile = struct {
             state.released_data_pages = 0;
             state.retired_inline_bytes = 0;
         }
+    }
+
+    fn notifyPublication(self: *NativeFile) void {
+        if (self.publication_observer) |observer| observer.notify(observer.context, self.activeCheckpoint(), self.checkpoint_publication_uncertain);
     }
 
     fn syncIfRequired(self: *NativeFile) !void {
