@@ -3388,6 +3388,24 @@ pub const NativeFile = struct {
         return self.reclaimPagesWithCancel(budget, null);
     }
 
+    /// A sustained writer must contribute reclamation before filling the bounded
+    /// retirement queue. Background scheduling and online vacuum are insufficient
+    /// admission guarantees, particularly while a copy pins an older generation.
+    /// Called by the serialized owner before starting the caller's transaction.
+    pub fn reclaimRetirementPressure(self: *NativeFile) !void {
+        if (!self.header.indexed_reclamation or self.read_only) return;
+        for (0..16) |_| {
+            const state = try self.loadLedger(self.activeCheckpoint());
+            if (state.pending.count() <= state.pending_limit / 2) return;
+            if (!try self.retirementNeedsService()) return error.FileBusy;
+            _ = try self.reclaimPages(4096);
+        }
+        // No caller mutation has started. Readers may retain the remaining debt;
+        // reject admission rather than overflowing or spinning under the lock.
+        const state = try self.loadLedger(self.activeCheckpoint());
+        if (state.pending.count() > state.pending_limit / 2) return error.FileBusy;
+    }
+
     pub fn reclaimPagesWithCancel(self: *NativeFile, budget: usize, cancel: ?*const maintenance.CancelToken) !usize {
         if (!self.header.indexed_reclamation or self.read_only) return 0;
         if (cancel) |token| try token.check();
@@ -15726,4 +15744,46 @@ test "lite native immutable value traversal needs no heap scratch for ordinary e
     }
     try std.testing.expectEqual(@as(usize, 0), budget.alloc_calls);
     std.debug.print("LITE_CURSOR_TRAVERSAL bytes=1048576 traversals=24 heap_allocations={d}\n", .{budget.alloc_calls});
+}
+
+test "lite sustained writers reclaim bounded retirement pressure before admission" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "writer-retirement-pressure.aflite");
+    defer a.free(path);
+    var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .indexed_reclamation = true, .no_sync = true });
+    defer file.close();
+    file.retirement_work_pages = 0;
+    const value = try a.alloc(u8, 8192);
+    defer a.free(value);
+    @memset(value, 'v');
+    try file.beginTransaction();
+    for (0..128) |id| {
+        var key: [32]u8 = undefined;
+        try file.putDocument(try std.fmt.bufPrint(&key, "item-{d}", .{id}), value);
+    }
+    try file.commitTransaction();
+    const pinned = file.activeCheckpoint();
+    file.minimum_reader_sequence = pinned.commit_sequence;
+    try file.beginTransaction();
+    for (0..128) |id| {
+        var key: [32]u8 = undefined;
+        try file.putDocument(try std.fmt.bufPrint(&key, "item-{d}", .{id}), "replacement");
+    }
+    try file.commitTransaction();
+    const state = try file.loadLedger(file.activeCheckpoint());
+    state.pending_limit = state.pending.count() + 64;
+    try std.testing.expectError(error.FileBusy, file.reclaimRetirementPressure());
+    const old = (try file.getDocumentAtCheckpointAlloc(a, pinned, "item-0")).?;
+    defer a.free(old);
+    try std.testing.expectEqualSlices(u8, value, old);
+    file.minimum_reader_sequence = null;
+    try file.reclaimRetirementPressure();
+    const after = try file.loadLedger(file.activeCheckpoint());
+    try std.testing.expect(after.pending.count() <= after.pending_limit / 2);
+    const current = (try file.getDocumentAtCheckpointAlloc(a, file.activeCheckpoint(), "item-0")).?;
+    defer a.free(current);
+    try std.testing.expectEqualStrings("replacement", current);
+    try std.testing.expect((try file.check()).valid);
 }

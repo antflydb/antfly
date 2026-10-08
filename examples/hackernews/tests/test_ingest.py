@@ -339,3 +339,38 @@ def test_lite_reparenting_invalidates_descendants_and_preserves_cycles(tmp_path)
     state.resolve_roots()
     assert state.item(3)["root"] is None and state.item(4)["root"] is None
     state.db.close()
+
+
+def test_lite_retries_busy_admission_and_preserves_unknown_outcomes(
+    tmp_path, monkeypatch
+):
+    import antfly_embedded
+
+    state = ingest.State(tmp_path / "ingestion.aflite")
+    original = state.db.native.batch
+    attempts = []
+
+    def busy_once(writes, timestamp):
+        attempts.append(timestamp)
+        if len(attempts) == 1:
+            raise antfly_embedded.BusyError()
+        return original(writes, timestamp)
+
+    monkeypatch.setattr(state.db.native, "batch", busy_once)
+    with state.transaction():
+        state.put({"id": 1, "type": "story", "time": 1704067200})
+        state.set("maxitem", 1)
+    assert len(attempts) == 2 and attempts[0] == attempts[1]
+    assert state.item(1) is not None and state.get("maxitem") == "1"
+
+    def unknown(writes, timestamp):
+        attempts.append(timestamp)
+        raise antfly_embedded.OutcomeUnknownError()
+
+    monkeypatch.setattr(state.db.native, "batch", unknown)
+    with pytest.raises(antfly_embedded.OutcomeUnknownError):
+        with state.transaction():
+            state.set("maxitem", 2)
+    assert len(attempts) == 3
+    assert state.get("maxitem") == "1"
+    state.db.close()

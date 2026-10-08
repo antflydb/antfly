@@ -390,6 +390,7 @@ pub fn mapError(err: anyerror) ErrorCode {
         error.WouldBlock,
         error.WriterLocked,
         error.FileBusy,
+        error.LiteRetirementBacklogExceeded,
         error.SourceFileChanged,
         error.PortableImportPublicationInProgress,
         error.PortableRuntimeActivationPending,
@@ -451,4 +452,10 @@ test "unauthenticated Lite access to an RLS table is a nonretryable capability e
     try std.testing.expectEqual(ErrorCode.unsupported, mapError(error.RowPolicyDenied));
     try std.testing.expectEqual(ErrorCode.unsupported, mapError(error.RowPolicyTopologyUnsupported));
     try std.testing.expectEqual(ErrorCode.busy, mapError(error.InvalidRowPolicyReceipt));
+}
+
+test "bounded Lite retirement admission is retryable while uncertain publication is not" {
+    try std.testing.expectEqual(ErrorCode.busy, mapError(error.LiteRetirementBacklogExceeded));
+    try std.testing.expectEqual(ErrorCode.busy, mapError(error.FileBusy));
+    try std.testing.expectEqual(ErrorCode.outcome_unknown, mapError(error.OutcomeUnknown));
 }

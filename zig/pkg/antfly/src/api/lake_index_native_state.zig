@@ -43,7 +43,15 @@ pub fn recipe(table: local.common_topology_records.TableRecord, config: []const 
     hash.final(&digest);
     return digest;
 }
-pub fn identity(a: A, provider: *Provider, file: local.serverless_external_source_types.FileEntry) ![32]u8 {
+pub fn identity(a: A, provider: *Provider, input_file: local.serverless_external_source_types.FileEntry) ![32]u8 {
+    // Warm immutable plans retain an authenticated publication instead of
+    // materializing every provider version into the fresh manifest inventory.
+    // Private row keys must use those same versions as the index builder.
+    const file = if (provider.source.verified_files) |files| blk: {
+        const verified = files.get(input_file.file_id) orelse return error.ExternalLakeSnapshotMismatch;
+        if (!std.mem.eql(u8, verified.object_uri, input_file.object_uri) or verified.byte_len != input_file.byte_len) return error.ExternalLakeSnapshotMismatch;
+        break :blk verified.*;
+    } else input_file;
     var hash = std.crypto.hash.Blake3.init(.{});
     part(&hash, "native-lake-private-file-v3");
     if (provider.source.scanner.iceberg_delete_plan != null and provider.source.prepared_deletes == null) {
@@ -241,6 +249,19 @@ test "external lake incremental native file identity ignores snapshot labels and
     var first = try Plan.init(a, ca, &provider, &.{});
     defer first.deinit();
     try std.testing.expect(first.changed[0]);
+    const authenticated_file = source.inventory.files[0];
+    var unresolved_file = authenticated_file;
+    unresolved_file.etag = "";
+    unresolved_file.version_id = @constCast("iceberg:v1:unresolved");
+    try std.testing.expect(!std.mem.eql(u8, &first.files[0].digest, &try identity(a, &provider, unresolved_file)));
+    var verified_files: std.StringHashMapUnmanaged(*const local.serverless_external_source_types.FileEntry) = .empty;
+    defer verified_files.deinit(a);
+    try verified_files.put(a, authenticated_file.file_id, &authenticated_file);
+    source.verified_files = &verified_files;
+    try std.testing.expectEqual(first.files[0].digest, try identity(a, &provider, unresolved_file));
+    unresolved_file.object_uri = @constCast("object://antfly/conflicting.parquet");
+    try std.testing.expectError(error.ExternalLakeSnapshotMismatch, identity(a, &provider, unresolved_file));
+    source.verified_files = null;
     const snapshot = source.inventory.snapshot_id;
     source.inventory.snapshot_id = try a.dupe(u8, "next-snapshot");
     defer {

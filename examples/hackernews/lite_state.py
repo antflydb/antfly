@@ -67,7 +67,18 @@ class LiteStore:
                     )
                     for k, v in self.staged.items()
                 ]
-                self.native.batch(writes, timestamp=self.timestamp)
+                deadline = time.monotonic() + 30
+                while True:
+                    try:
+                        self.native.batch(writes, timestamp=self.timestamp)
+                        break
+                    except antfly.BusyError:
+                        # Lite rejected admission before publication. Release the
+                        # handle between calls so retirement/vacuum can progress.
+                        # OutcomeUnknown and other failures must never be retried.
+                        if time.monotonic() >= deadline:
+                            raise
+                        time.sleep(0.1)
         finally:
             self.staged = None
 

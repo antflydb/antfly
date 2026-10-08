@@ -14,14 +14,31 @@
   },
   "regional_run": {
     "status": "pending",
-    "blocker": "Local DNS resolution failed for storage.googleapis.com and PyPI after successful export. No million-row query or build timings recorded.",
+    "blocker": "DNS restored. Optimized Linux/regional index qualification pending; authenticated immutable row-identity fix and native Lite retirement admission fix are under qualification.",
     "timings": null
   },
   "validation": {
     "lake_tests": 695,
     "objectstore_tests_passed": 79,
     "objectstore_cloud_integration_tests_skipped": 2,
-    "ingestion_unit_tests": 6,
+    "ingestion_unit_tests": 13,
     "ingestion_native_e2e": "Writer snapshots, field IDs, ancestry, tombstones and restart passed locally; exact binary/source recorded in follow-up PR validation."
+  },
+  "ingestion": {
+    "backend": "Antfly Lite",
+    "state_file": "ingestion.aflite",
+    "iceberg_catalog": "Lite-backed single-writer metadata pointer",
+    "gcs_smoke": {
+      "status": "passed",
+      "prefix": "hn-poc/20261008-ingestion-lite-smoke-01",
+      "publication_deletion_restore_stale_restore_rejection": true,
+      "identity": "existing caller credentials; dedicated Workload Identity not deployed"
+    },
+    "million_row_run": {
+      "status": "running_with_native_retirement_admission_fix",
+      "error": "LiteRetirementBacklogExceeded",
+      "timings": null
+    },
+    "superseded_sqlite_timings": "Not qualification of the current Lite writer"
   }
 }
