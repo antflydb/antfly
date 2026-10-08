@@ -515,7 +515,7 @@ fn activationPause(server: *server_mod.ApiHttpServer, context: operation.Request
 
 test "SQL catalog DDL schema validates through native public admission" {
     const alloc = std.testing.allocator;
-    var compiled = try @import("antfly_local_sources").sql_compiler.compile(alloc, "CREATE TABLE items (id BIGINT NOT NULL DEFAULT 9007199254740993, label TEXT DEFAULT NULL, payload JSON DEFAULT NULL, created TIMESTAMPTZ DEFAULT '2026-09-21T00:00:00Z', enabled BOOLEAN DEFAULT TRUE, amount DOUBLE PRECISION DEFAULT 1.5)", .{});
+    var compiled = try @import("antfly_local_sources").sql_compiler.compile(alloc, "CREATE TABLE items (id BIGINT NOT NULL DEFAULT 9007199254740993, label TEXT DEFAULT NULL, payload JSON DEFAULT NULL, created TIMESTAMPTZ DEFAULT '2026-09-21T00:00:00Z', enabled BOOLEAN DEFAULT TRUE, amount DOUBLE PRECISION DEFAULT 1.5, exact_amount NUMERIC DEFAULT 9007199254740993.2500 CHECK (exact_amount>=9007199254740993.25))", .{});
     defer compiled.deinit();
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -530,9 +530,16 @@ test "SQL catalog DDL schema validates through native public admission" {
     defer parsed.deinit(alloc);
     const native = try @import("antfly_local_sources").schema_mod.deriveRuntimeTableSchema(alloc, parsed);
     defer @import("antfly_local_sources").storage_schema.freeSchema(alloc, native);
-    try std.testing.expectEqual(@as(usize, 6), native.relational_columns.len);
+    try std.testing.expectEqual(@as(usize, 7), native.relational_columns.len);
     try std.testing.expectEqual(@import("antfly_local_sources").storage_schema.StorageMode.relational, native.storage_mode);
     try std.testing.expect(parsed.column_defaults != null);
+    try std.testing.expect(native.requires_exact_numeric_expressions);
+    try std.testing.expect(native.requires_exact_numeric_validation);
+    var validator = try @import("antfly_local_sources").schema_mod.CompiledTableValidator.init(alloc, request.schema_json.?);
+    defer validator.deinit(alloc);
+    var row: std.json.Value = .{ .object = .empty };
+    try validator.prepareValue(a, alloc, &row);
+    try std.testing.expectEqualStrings("9007199254740993.2500", row.object.get("exact_amount").?.number_string);
 }
 
 test "SQL catalog ALTER submits native schema CAS without client generations" {

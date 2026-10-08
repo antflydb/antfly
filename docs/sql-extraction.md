@@ -5555,3 +5555,51 @@ without failures or leaks. The 70-case PostgreSQL oracle, inventory integrity,
 Zig formatting, whitespace and control-catalog consistency checks pass. The
 previously documented broad durable-runtime compiler/ownership limitation
 remains separate and is not claimed fixed by these gates.
+
+### Public exact NUMERIC contracts and durable index activation
+
+Public scalar SQL builtin identities and relational expression types now expose
+NUMERIC in the source OpenAPI contract and regenerated Zig, Go, Python and
+TypeScript clients. Relational root number properties accept the numeric SQL
+annotation without changing document or unannotated floating-point semantics.
+Finite input retains its exact JSON lexeme or decimal string; NaN and infinities
+use strings. Const/enum finite numeric members must remain JSON numbers, not
+numeric-looking strings. Typed mutation ingress has an owned-row regression for
+precision above 2^53, retained scale, extreme small exponents and special values.
+
+CHECK, expression-index and unique-expression declarations now derive the exact
+schema-VM capability independently of their output type. A public integer-only
+table with a NUMERIC CHECK still fences pre-capability-21 readers, while scalar
+NUMERIC validation independently requires capability 22. Cold-row CHECK
+evaluation borrows canonical NUMERIC coefficients. SQL expression-index DDL
+retains the exact key domain instead of mislabeling it as binary float. Partial
+index literal identity casts retain their exact lexemes; other literal casts
+remain guarded pending bounded, PostgreSQL-compatible constant folding.
+
+End-to-end LSM tests publish actual public schemas and SQL-generated defaults,
+generated columns, CHECKs and partial covering expression indexes. Mixed invalid
+batches publish neither earlier valid rows nor invalid rows. Reopen and portable
+restore preserve both capability barriers, exact scale and constraints. Covered
+NUMERIC reads explicitly supply the partial-index proof and require zero primary
+lookups; the proof guard is not bypassed for the test.
+
+The relational public-API test owner now imports fixtures unconditionally rather
+than from a named smoke test excluded by its own compiler filters. This restores
+the three FK publication/initial-create tests required by that target's ownership
+audit; no filters or audits were removed.
+
+This activates public scalar storage and schema-expression boundaries, not all
+remaining SQL NUMERIC work. Public column typmods, non-finite floating-domain
+casts, dynamic text casts, broader partial-index constant folding and shared
+statement/reducer/schema work admission remain unfinished. Parse-once evidence
+applies within validation/composition, not the complete write pipeline. Original
+inventory dispositions remain unchanged; infrastructure tests do not establish
+the mounted behavior of an unadjudicated source case.
+
+Validation: 587 local SQL tests (three skips), 226 server SQL tests, 37 schema
+expression tests, the full public relational-row API owner, and native NUMERIC
+storage/index/reopen/restore regressions pass without failures or leaks. The
+70-case disposable PostgreSQL constraint oracle, Python SQL tests (35),
+TypeScript SQL tests (36), focused Go SDK tests, generated contracts, inventory
+integrity, formatting, whitespace and control-catalog consistency are checked.
+The broad durable-runtime compiler/ownership limitation remains separate.

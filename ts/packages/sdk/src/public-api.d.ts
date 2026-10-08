@@ -13700,7 +13700,7 @@ export interface components {
         /** @enum {string} */
         RelationalExpressionOp: "literal" | "column" | "add" | "subtract" | "multiply" | "divide" | "negate" | "concat" | "coalesce" | "lower_ascii" | "upper_ascii" | "eq" | "ne" | "gt" | "gte" | "lt" | "lte" | "is_null" | "is_not_null" | "is_distinct" | "is_not_distinct" | "and" | "or" | "not" | "cast" | "case_when" | "modulo" | "in_list" | "not_in_list";
         /** @enum {string} */
-        RelationalExpressionType: "string" | "blob" | "boolean" | "datetime" | "integer" | "number";
+        RelationalExpressionType: "string" | "blob" | "boolean" | "datetime" | "integer" | "number" | "numeric";
         /**
          * @description Exact PostgreSQL builtin identity for a relational root scalar column.
          *     SQL array columns use SQLArrayElementType for their element identity.
@@ -13708,9 +13708,15 @@ export interface components {
          *     these values. The underlying property type must match. SQL array storage
          *     is not implied by this annotation. Existing unannotated schemas retain
          *     their original domains.
+         *     The numeric identity uses an underlying number property and exact
+         *     PostgreSQL NUMERIC semantics, never binary float. Submit finite values
+         *     as JSON numeric lexemes or decimal strings; special values use strings
+         *     NaN, Infinity and -Infinity. Const/enum finite numeric members must be
+         *     JSON numbers, not strings. Bounds and multipleOf are exact decimals.
+         *     Public scalar NUMERIC schemas require reader capability version 22.
          * @enum {string}
          */
-        SQLBuiltinType: "text" | "int16" | "int32" | "int64" | "float32" | "float64" | "boolean" | "uuid" | "jsonb";
+        SQLBuiltinType: "text" | "int16" | "int32" | "int64" | "float32" | "float64" | "boolean" | "uuid" | "jsonb" | "numeric";
         /**
          * @description Immutable typed scalar expression, limited to 128 nodes and 16 levels.
          *     A literal requires type; omitted value means typed null. A column
@@ -13736,7 +13742,12 @@ export interface components {
          *     semantics. Numeric cast requires type and sql_type, takes one numeric
          *     argument, and performs a checked conversion when evaluated (not when
          *     the schema is compiled). Floating-to-integer casts round ties to even.
-         *     Only int16/int32/int64/float32/float64 identities are accepted here.
+         *     The numeric expression type uses exact PostgreSQL NUMERIC values and
+         *     may specify sql_type numeric. Its literals accept decimal strings or
+         *     exact JSON numeric lexemes, including string-valued special values.
+         *     Exact NUMERIC programs require reader capability version 21 even when
+         *     their result is boolean or integer. Float/integer assignment casts keep
+         *     their declared PostgreSQL rounding and overflow semantics.
          *     case_when takes alternating boolean conditions and result expressions,
          *     followed by a mandatory fallback result (3 to 31 arguments, at most
          *     15 branches). Conditions are evaluated in order; only the selected
@@ -13744,7 +13755,7 @@ export interface components {
          *     expressions must have the same physical type. Numeric SQL lowering
          *     records builtin result-domain promotions as explicit casts. This
          *     operation requires schema capability version 18.
-         *     modulo takes two same-domain integer operands and returns the signed
+         *     modulo takes two same-domain integer or NUMERIC operands and returns the signed
          *     remainder (minInt modulo -1 is zero); a zero divisor rejects the write.
          *     in_list and not_in_list take one probe followed by 1 to 31 same-domain
          *     candidates. The probe is evaluated once; NULL probes return UNKNOWN.

@@ -351,9 +351,13 @@ fn predicateLiteral(expression: Json) anyerror!Json {
     const args = expression.object.get("args").?.array.items;
     if (args.len != 1) return error.UnsupportedSqlShape;
     const source_type = args[0].object.get("type") orelse return error.UnsupportedSqlShape;
-    // Exact NUMERIC predicates still need their public index value domain;
-    // never turn a decimal input-function cast into a binary-float shortcut.
-    if (std.mem.eql(u8, source_type.string, "numeric")) return error.UnsupportedSqlShape;
+    // Identity casts keep an exact decimal lexeme. Other NUMERIC literal
+    // casts still require bounded folding, never a binary-float shortcut.
+    if (std.mem.eql(u8, source_type.string, "numeric")) {
+        const target = expression.object.get("sql_type") orelse return error.UnsupportedSqlShape;
+        if (std.mem.eql(u8, target.string, "numeric")) return predicateLiteral(args[0]);
+        return error.UnsupportedSqlShape;
+    }
     const value = try predicateLiteral(args[0]);
     if (value == .null) return .null;
     const target = expression.object.get("sql_type").?.string;

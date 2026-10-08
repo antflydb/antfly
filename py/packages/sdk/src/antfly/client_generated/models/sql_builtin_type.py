@@ -9,6 +9,7 @@ class SQLBuiltinType(StrEnum):
     INT32 = "int32"
     INT64 = "int64"
     JSONB = "jsonb"
+    NUMERIC = "numeric"
     TEXT = "text"
     UUID = "uuid"
 

@@ -7,6 +7,7 @@ class RelationalExpressionType(StrEnum):
     DATETIME = "datetime"
     INTEGER = "integer"
     NUMBER = "number"
+    NUMERIC = "numeric"
     STRING = "string"
 
     def __str__(self) -> str:

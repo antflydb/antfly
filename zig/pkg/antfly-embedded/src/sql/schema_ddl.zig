@@ -169,7 +169,7 @@ pub fn applyCandidate(alloc: std.mem.Allocator, schema: *Value, ddl: ast.Catalog
                 const nulls: []const u8 = if (key.nulls_first orelse key.descending) "first" else "last";
                 if (key.expression) |expression| {
                     const lowered = try @import("schema_expression.zig").lowerTyped(alloc, schema.*, expression, null);
-                    try keys.append(alloc, try value(alloc, .{ .expression = lowered.expression, .result_type = if (lowered.type == .uuid) "string" else @tagName(lowered.type), .direction = if (key.descending) "desc" else "asc", .nulls = nulls }));
+                    try keys.append(alloc, try value(alloc, .{ .expression = lowered.expression, .result_type = if (lowered.element_type == .numeric) "numeric" else if (lowered.type == .uuid) "string" else @tagName(lowered.type), .direction = if (key.descending) "desc" else "asc", .nulls = nulls }));
                 } else try keys.append(alloc, try value(alloc, .{ .column = key.field, .direction = if (key.descending) "desc" else "asc", .nulls = nulls }));
                 try columns.append(alloc, key.field);
             }

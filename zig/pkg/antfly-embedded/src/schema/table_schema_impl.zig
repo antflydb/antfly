@@ -3346,8 +3346,7 @@ fn parseAnonymousPropertyKeywords(alloc: std.mem.Allocator, context: SchemaConte
         if (value != .string) return error.InvalidSchemaUpdateRequest;
         const physical = field_type orelse return error.InvalidSchemaUpdateRequest;
         const Type = @import("../common/sql_builtin_type.zig").Type;
-        // Public array element identities are a separate generated contract:
-        // their numeric domain does not imply scalar schema activation.
+        // Array element identity never changes the array envelope into a scalar.
         const kind = if (std.mem.eql(u8, physical, "sql_array"))
             Type.fromWire(std.meta.stringToEnum(relational_wire.SQLArrayElementType, value.string) orelse return error.InvalidSchemaUpdateRequest)
         else
@@ -3358,7 +3357,7 @@ fn parseAnonymousPropertyKeywords(alloc: std.mem.Allocator, context: SchemaConte
             .float32, .float64 => !type_spec.integer_only and (std.mem.eql(u8, physical, "numeric") or std.mem.eql(u8, physical, "number")),
             .boolean => std.mem.eql(u8, physical, "boolean"),
             .jsonb => std.mem.eql(u8, physical, "json"),
-            .numeric => false,
+            .numeric => !type_spec.integer_only and (std.mem.eql(u8, physical, "numeric") or std.mem.eql(u8, physical, "number")),
         };
         if (!matches) return error.InvalidSchemaUpdateRequest;
         break :blk kind;

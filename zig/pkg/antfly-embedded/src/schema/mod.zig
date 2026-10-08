@@ -835,8 +835,15 @@ test "relational declarations exact NUMERIC generated programs publish capabilit
 }
 
 fn requiresExactNumericExpressions(schema: ParsedTableSchema) bool {
-    // Wire-typed CHECK/index expression enums still exclude NUMERIC. Raw
-    // default/generated programs must independently fence the new VM domain.
+    if (schema.checks) |checks| for (checks.value) |check| if (check.expression) |expression| {
+        if (exactNumericWire(expression, 0)) return true;
+    };
+    if (schema.relational_indexes) |indexes| for (indexes.value) |index| {
+        for (index.keys) |key| if (key.expression) |expression| if (exactNumericWire(expression, 0)) return true;
+    };
+    if (schema.unique_constraints) |constraints| for (constraints.value) |constraint| if (constraint.keys) |keys| {
+        for (keys) |key| if (key.expression) |expression| if (exactNumericWire(expression, 0)) return true;
+    };
     for ([_]?std.json.Parsed(std.json.Value){ schema.column_defaults, schema.generated_columns }) |definitions| if (definitions) |declarations| {
         if (declarations.value == .array) for (declarations.value.array.items) |entry| {
             if (entry == .object) if (entry.object.get("expression")) |expression| {
@@ -844,6 +851,14 @@ fn requiresExactNumericExpressions(schema: ParsedTableSchema) bool {
             };
         };
     };
+    return false;
+}
+
+fn exactNumericWire(expression: anytype, depth: usize) bool {
+    if (depth > 16) return false;
+    if (expression.type) |kind| if (std.mem.eql(u8, @tagName(kind), "numeric")) return true;
+    if (expression.sql_type) |kind| if (std.mem.eql(u8, @tagName(kind), "numeric")) return true;
+    if (expression.args) |args| for (args) |arg| if (exactNumericWire(arg, depth + 1)) return true;
     return false;
 }
 
@@ -855,15 +870,57 @@ fn requiresExactNumericValidation(schema: ParsedTableSchema) bool {
     return false;
 }
 
+test "relational declarations public NUMERIC SQL DDL retains defaults generated CHECK and expression index domains" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const owned = arena.allocator();
+    var create = try @import("../sql/compiler.zig").compile(owned, "CREATE TABLE amounts (n numeric DEFAULT 9007199254740993.2500, g numeric GENERATED ALWAYS AS (n+0.0001) STORED, CHECK (n>=9007199254740993.25))", .{});
+    defer create.deinit();
+    const ddl = @import("../sql/ddl_runtime.zig");
+    var schema = try std.json.parseFromSliceLeaky(std.json.Value, owned, try ddl.createSchemaAlloc(owned, create.statement.create_table), .{ .parse_numbers = false });
+    var index = try @import("../sql/compiler.zig").compile(owned, "CREATE INDEX by_total ON amounts ((n+0.0001)) INCLUDE (g)", .{});
+    defer index.deinit();
+    try std.testing.expect(try @import("../sql/schema_ddl.zig").apply(owned, &schema, index.statement.catalog_ddl));
+    var validator = try CompiledTableValidator.init(a, try std.json.Stringify.valueAlloc(owned, schema, .{}));
+    defer validator.deinit(a);
+    const runtime = try deriveRuntimeTableSchema(a, validator.schema);
+    defer storage_schema.freeSchema(a, runtime);
+    try std.testing.expect(runtime.requires_exact_numeric_validation);
+    try std.testing.expect(runtime.requires_exact_numeric_expressions);
+    try std.testing.expectEqualStrings("numeric", @tagName(validator.schema.relational_indexes.?.value[0].keys[0].result_type.?));
+    var row: std.json.Value = .{ .object = .empty };
+    try validator.prepareValue(owned, a, &row);
+    try std.testing.expectEqualStrings("9007199254740993.2500", row.object.get("n").?.number_string);
+    try std.testing.expectEqualStrings("9007199254740993.2501", row.object.get("g").?.number_string);
+}
+
+test "relational declarations public NUMERIC CHECK fences readers even with only integer storage" {
+    const a = std.testing.allocator;
+    var create = try @import("../sql/compiler.zig").compile(a, "CREATE TABLE ints (n bigint, CHECK (n>=9007199254740993.5))", .{});
+    defer create.deinit();
+    const bytes = try @import("../sql/ddl_runtime.zig").createSchemaAlloc(a, create.statement.create_table);
+    defer a.free(bytes);
+    var validator = try CompiledTableValidator.init(a, bytes);
+    defer validator.deinit(a);
+    const runtime = try deriveRuntimeTableSchema(a, validator.schema);
+    defer storage_schema.freeSchema(a, runtime);
+    try std.testing.expect(runtime.requires_exact_numeric_expressions);
+    try std.testing.expect(!runtime.requires_exact_numeric_validation);
+    var good = try std.json.parseFromSlice(std.json.Value, a, "{\"n\":9007199254740994}", .{ .parse_numbers = false });
+    defer good.deinit();
+    try validator.prepareValue(good.arena.allocator(), a, &good.value);
+    var bad = try std.json.parseFromSlice(std.json.Value, a, "{\"n\":9007199254740993}", .{ .parse_numbers = false });
+    defer bad.deinit();
+    try std.testing.expectError(error.RelationalCheckViolation, validator.prepareValue(bad.arena.allocator(), a, &bad.value));
+}
+
 test "relational declarations scalar NUMERIC validation advertises its own durable reader capability" {
     const a = std.testing.allocator;
     var parsed = try impl.parseSchema(a,
-        \\{"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"n":{"type":"number"}},"additionalProperties":false}}}}
+        \\{"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"n":{"type":"number","x-antfly-sql-type":"numeric"}},"additionalProperties":false}}}}
     );
     defer parsed.deinit(a);
-    // Exercise derivation independently of the still-guarded public scalar
-    // enum. This does not claim that public schema activation is complete.
-    parsed.document_schemas[0].properties[0].sql_type = .numeric;
     const runtime = try deriveRuntimeTableSchema(a, parsed);
     defer storage_schema.freeSchema(a, runtime);
     const reduced = try deriveRelationalCheckLayout(a, parsed);

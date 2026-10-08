@@ -44,6 +44,27 @@ import (
 
 type relationalHTTPDoer func(*http.Request) (*http.Response, error)
 
+func TestRelationalExactNumericPublicExpressionContract(t *testing.T) {
+	var expression RelationalScalarExpression
+	if err := json.Unmarshal([]byte(`{"op":"literal","type":"numeric","sql_type":"numeric","value":"9007199254740993.2500"}`), &expression); err != nil {
+		t.Fatal(err)
+	}
+	if expression.Type != oapi.RelationalExpressionTypeNumeric || expression.SqlType != oapi.SQLBuiltinTypeNumeric || expression.Value != "9007199254740993.2500" {
+		t.Fatalf("lost exact NUMERIC identity or literal: %+v", expression)
+	}
+	encoded, err := json.Marshal(expression)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var restored RelationalScalarExpression
+	if err := json.Unmarshal(encoded, &restored); err != nil {
+		t.Fatal(err)
+	}
+	if restored.Type != expression.Type || restored.SqlType != expression.SqlType || restored.Value != expression.Value {
+		t.Fatalf("lost exact NUMERIC contract after transport: %s", encoded)
+	}
+}
+
 func TestRelationalNumericAssignmentCastBuiltinIdentity(t *testing.T) {
 	var expression RelationalScalarExpression
 	if err := json.Unmarshal([]byte(`{"op":"cast","type":"integer","sql_type":"int16","args":[{"op":"literal","type":"integer","sql_type":"int32","value":32768}]}`), &expression); err != nil {

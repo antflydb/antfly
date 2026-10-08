@@ -289,6 +289,7 @@ pub const Set = struct {
                     .blob => .{ .blob = cell.value.bytes_val },
                     .integer => .{ .integer = cell.value.i64_val },
                     .number => .{ .number = cell.value.f64_val },
+                    .numeric => .{ .numeric = cell.value.bytes_val },
                     .boolean => .{ .boolean = cell.value.bool_val },
                     .datetime => .{ .datetime = cell.value.u64_val },
                     else => return error.UnsupportedRelationalIndexColumn,

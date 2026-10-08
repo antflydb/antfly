@@ -14,8 +14,18 @@
 
 import { afterEach, describe, expect, expectTypeOf, it, vi } from "vitest";
 import { AntflyClient, SQLExecutionError } from "../src/client.js";
-import type { SQLArrayColumnSchema, SQLArrayElementType } from "../src/index.js";
+import type { RelationalScalarExpression, SQLBuiltinType, SQLArrayColumnSchema, SQLArrayElementType } from "../src/index.js";
 import type { SQLPreparedResponse } from "../src/types.js";
+
+it("exports exact NUMERIC schema and expression identities without rounding literal text", () => {
+  const kind: SQLBuiltinType = "numeric";
+  const expression: RelationalScalarExpression = {
+    op: "literal", type: "numeric", sql_type: kind, value: "9007199254740993.2500",
+  };
+  expect(JSON.parse(JSON.stringify(expression))).toEqual({
+    op: "literal", type: "numeric", sql_type: "numeric", value: "9007199254740993.2500",
+  });
+});
 
 it.each([
   "int64",

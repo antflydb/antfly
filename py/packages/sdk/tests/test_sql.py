@@ -28,6 +28,7 @@ from antfly import (
     SQLArrayElementType,
     SQLArrayValue,
     SQLBuiltinType,
+    RelationalScalarExpression,
     SQLColumn,
     SQLExecutionError,
     SQLPreparedExecutionRequest,
@@ -180,6 +181,13 @@ def test_sql_bound_parameters_and_exact_integer_results():
     assert json.loads(request.call_args.kwargs["content"])["parameters"] == [9223372036854775807]
     assert request.call_args.kwargs["follow_redirects"] is False
     assert request.call_args.kwargs["_max_response_bytes"] == 16 << 20
+
+
+def test_public_numeric_schema_expression_round_trip_retains_exact_literal_text():
+    source = {"op": "literal", "type": "numeric", "sql_type": "numeric", "value": "9007199254740993.2500"}
+    expression = RelationalScalarExpression.from_dict(source)
+    assert expression.sql_type == SQLBuiltinType.NUMERIC
+    assert expression.to_dict() == source
 
 
 def test_sql_numeric_results_preserve_precision_scale_nulls_and_specials():
