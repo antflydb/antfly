@@ -1695,6 +1695,10 @@ pub fn build(b: *std.Build) void {
     tok_test_step.dependOn(&run_tok_tests.step);
     tok_test_step.dependOn(&run_hf_tok_tests.step);
 
+    @import("antfly_media").support.addTests(b, b.path(b.fmt("{s}/lib/media", .{shared_lib_root})), target, optimize);
+    default_test_step.dependOn(&b.top_level_steps.get("test-media").?.step);
+    default_test_step.dependOn(&b.top_level_steps.get("test-video").?.step);
+
     const audio_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path(b.fmt("{s}/lib/audio/audio_test_root.zig", .{shared_lib_root})),
@@ -1716,6 +1720,7 @@ pub fn build(b: *std.Build) void {
             .optimize = .safe,
         }),
     });
+    @import("antfly_media").support.attach(b, audio_open_corpus.root_module, b.path(b.fmt("{s}/lib/media", .{shared_lib_root})));
     audio_open_corpus.root_module.link_libc = true;
     const run_audio_open_corpus = b.addRunArtifact(audio_open_corpus);
     run_audio_open_corpus.addPassthruArgs();
@@ -1730,6 +1735,7 @@ pub fn build(b: *std.Build) void {
             .optimize = .fast,
         }),
     });
+    @import("antfly_media").support.attach(b, audio_xiph_corpora_e2e.root_module, b.path(b.fmt("{s}/lib/media", .{shared_lib_root})));
     audio_xiph_corpora_e2e.root_module.link_libc = true;
     const audio_xiph_corpora_e2e_step = b.step("audio-xiph-corpora-e2e", "Build the lib/audio upstream Xiph corpora e2e runner");
     audio_xiph_corpora_e2e_step.dependOn(&audio_xiph_corpora_e2e.step);
@@ -1755,6 +1761,7 @@ pub fn build(b: *std.Build) void {
             .optimize = .fast,
         }),
     });
+    @import("antfly_media").support.attach(b, audio_misc_corpora_e2e.root_module, b.path(b.fmt("{s}/lib/media", .{shared_lib_root})));
     audio_misc_corpora_e2e.root_module.link_libc = true;
     const audio_misc_corpora_e2e_step = b.step("audio-misc-corpora-e2e", "Build the lib/audio external MP3/AAC/MP4 corpora e2e runner");
     audio_misc_corpora_e2e_step.dependOn(&audio_misc_corpora_e2e.step);
@@ -2013,6 +2020,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    @import("antfly_media").support.attach(b, audio_module_tests_all.root_module, b.path(b.fmt("{s}/lib/media", .{shared_lib_root})));
     audio_module_tests_all.root_module.link_libc = true;
     audio_module_test_step.dependOn(&b.addRunArtifact(audio_module_tests_all).step);
 
@@ -2026,6 +2034,7 @@ pub fn build(b: *std.Build) void {
             }),
             .filters = &.{filter},
         });
+        @import("antfly_media").support.attach(b, audio_module_tests.root_module, b.path(b.fmt("{s}/lib/media", .{shared_lib_root})));
         audio_module_tests.root_module.link_libc = true;
         const run_audio_module_tests = b.addRunArtifact(audio_module_tests);
         audio_module_test_step.dependOn(&run_audio_module_tests.step);

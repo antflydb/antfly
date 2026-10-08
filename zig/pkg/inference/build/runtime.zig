@@ -332,6 +332,8 @@ pub fn create(config: Config) Graph {
         .optimize = optimize,
     });
 
+    @import("antfly_media").support.attach(b, inference_audio_mod, b.path(pathJoin(b, paths.shared_lib_root, "lib/media")));
+
     const inference_chunker_mod = addOrCreateModule(b, config.register_public_modules, "inference_chunker", .{
         .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "lib/chunker/src/mod.zig")),
         .target = target,

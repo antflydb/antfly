@@ -19,6 +19,7 @@
     .version = "0.1.0",
     .minimum_zig_version = "0.17.0",
     .dependencies = .{
+        .antfly_media = .{ .path = "../../lib/media" },
         .product_licenses = .{ .path = "../../lib/product_licenses" },
         .translate_c = .{
             .url = "git+https://codeberg.org/ziglang/translate-c#02ff0c523fb92a38939b04d0145c4a9602a74d56",

@@ -1,5 +1,11 @@
 # Audio Support
 
+The implemented shared MP4/WebM container extraction is documented in
+[MEDIA.md](../media/MEDIA.md), with decoder/surface contracts in
+[VIDEO.md](../video/VIDEO.md) and rollout in the
+[native video inference plan](../../../docs/plans/native-video-inference.md).
+These proposals do not change the audio support or timing described below.
+
 Antfly inference routes native/server audio through `lib/audio`. The public boundary is
 decoded PCM `f32` samples plus sample rate and channel count; encoded bytes are
 handled as adapters above that boundary.

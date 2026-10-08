@@ -14,6 +14,7 @@ linking back to the current documentation. See [placement rules](../README.md#pl
 
 ## Proposed work
 
+- [Native video inference and EmbeddingGemma 2](native-video-inference.md)
 - [Agentic warehouse memory](agentic-warehouse-memory.md)
 - [Operator standalone mode](operator-standalone-mode.md)
 - [Pipelined query API](pipelined-query-api.md)

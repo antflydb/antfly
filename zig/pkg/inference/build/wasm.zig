@@ -82,6 +82,7 @@ pub fn addWasm(ctx: Context, wasm_jinja_mod: *std.Build.Module, wasm_platform_mo
         .optimize = .safe,
         .single_threaded = true,
     });
+    @import("antfly_media").support.attach(b, wasm_audio_mod, b.path(b.pathJoin(&.{ ctx.paths.shared_lib_root, "lib/media" })));
     const wasm_image_mod = b.createModule(.{
         .root_source_file = b.path(b.pathJoin(&.{ ctx.paths.shared_lib_root, "lib/image/src/mod.zig" })),
         .target = wasm_target,

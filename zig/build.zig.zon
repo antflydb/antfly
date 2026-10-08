@@ -19,6 +19,7 @@
     .fingerprint = 0xaf6720431d9566e1,
     .minimum_zig_version = "0.17.0",
     .dependencies = .{
+        .antfly_media = .{ .path = "lib/media" },
         .antfly_platform = .{ .path = "lib/platform" },
         .translate_c = .{
             .url = "git+https://codeberg.org/ziglang/translate-c#02ff0c523fb92a38939b04d0145c4a9602a74d56",
