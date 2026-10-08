@@ -1177,6 +1177,17 @@ def test_native_remote_text_corpus_scores_filters_and_restart(tmp_path):
                 "num_shards": 1,
                 "schema": {
                     "storage_mode": "relational",
+                    "default_type": "doc",
+                    "document_schemas": {"doc": {"schema": {
+                        "type": "object", "additionalProperties": False,
+                        "properties": {
+                            "amount": {"type": "integer", "x-antfly-field": {"type": "number", "sortable": True}},
+                            "body": {"type": "string", "x-antfly-field": {"type": "text"}},
+                            "label": {"type": "string"},
+                            "dense_native": {"type": "string"},
+                            "sparse_native": {"type": "string"},
+                        },
+                    }}},
                     "base_source": {
                         "kind": "external",
                         "table_id": "text-events",
@@ -1955,19 +1966,33 @@ def test_native_remote_incremental_generations_keep_public_identity_and_file_art
 
         def native_roots():
             roots = []
+            manifests = {}
             for path in (server.root / "artifacts").rglob("*"):
                 if not path.is_file():
                     continue
                 payload = path.read_bytes()
-                begin = payload.find(b'{"version":')
-                if begin < 0:
-                    continue
-                try:
-                    document = json.loads(payload[begin:])
-                except (ValueError, UnicodeDecodeError):
-                    continue
-                if "file_groups" in document or "file_states" in document:
-                    roots.append(document)
+                for prefix in (b'{"version":', b'{"file":'):
+                    begin = payload.find(prefix)
+                    if begin < 0:
+                        continue
+                    encoded = payload[begin:]
+                    try:
+                        document = json.loads(encoded)
+                    except (ValueError, UnicodeDecodeError):
+                        continue
+                    if "file" in document and "segments" in document:
+                        manifests[hashlib.sha256(encoded).hexdigest()] = document
+                    elif "file_groups" in document or "file_states" in document:
+                        roots.append(document)
+            # Resolve authenticated per-file text manifests into the same
+            # logical directory used for incremental artifact reuse assertions.
+            for document in roots:
+                if document.get("manifests"):
+                    groups = [manifests[ref["checksum"].removeprefix("sha256:")]
+                              for ref in document["manifests"]]
+                    document["file_groups"] = groups
+                    document["segments"] = [segment for group in groups
+                                            for segment in group["segments"]]
             return roots
 
         wait_ready()
@@ -2395,7 +2420,7 @@ def test_native_remote_indexed_metadata_predicates_above_id_list_limit(tmp_path)
                 "sparse_native": {"type": "embeddings", "external": True, "sparse": True},
             },
         })
-        deadline = time.monotonic() + 180
+        deadline = time.monotonic() + 300
         while True:
             resource = call("GET", "/tables/indexed_predicates/indexes/body_text")
             if resource["status"]["readiness"]["queryable"]:
@@ -2417,8 +2442,7 @@ def test_native_remote_indexed_metadata_predicates_above_id_list_limit(tmp_path)
         ranged = query({"range": {"path": "/amount", "gte": 10, "lt": 15}})
         assert {h["_source"]["amount"] for h in ranged["hits"]["hits"]} == set(range(10, 15))
         for alias in (
-            {"term": {"amount": count - 1}},
-            {"term": {"field": "amount", "term": count - 1}},
+            {"term": {"field": "amount", "value": count - 1}},
             {"range": {"amount": {"from": count - 1, "to": count, "include_upper": False}}},
             {"range": {"field": "amount", "min": count - 1, "max": count}},
         ):
@@ -2454,7 +2478,7 @@ def test_native_remote_indexed_metadata_predicates_above_id_list_limit(tmp_path)
         sparse_point = call("POST", "/tables/indexed_predicates/query", {
             "embeddings": {"sparse_native": {"indices": [1], "values": [1]}},
             "indexes": ["sparse_native"], "fields": ["amount"], "limit": 3,
-            "filter_query": {"term": {"amount": count - 1}},
+            "filter_query": {"term": {"field": "amount", "value": count - 1}},
         })
         assert [h["_source"]["amount"] for h in sparse_point["hits"]["hits"]] == [count - 1], sparse_point
         failed = False

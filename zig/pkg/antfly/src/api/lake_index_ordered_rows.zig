@@ -568,7 +568,10 @@ test "external lake ordered deltas retain untouched pages and delete only one fi
     try std.testing.expectEqual(@as(usize, 2), entries.len);
     try std.testing.expectEqualStrings("b", entries[0].ref.external.file_id);
     try std.testing.expectEqualStrings("a", entries[1].ref.external.file_id);
-    const final_blocks = try reader.nextPredicateBlocks(ca, "", null);
+    var final_predicates: Reader = undefined;
+    try final_predicates.init(a, &store, final, @splat(3), "", null, .none);
+    defer final_predicates.deinit();
+    const final_blocks = try final_predicates.nextPredicateBlocks(ca, "", null);
     try std.testing.expectEqual(@as(usize, 2), final_blocks.len);
     try std.testing.expectEqualStrings("b", final_blocks[0].file);
     try std.testing.expectEqualStrings("a", final_blocks[1].file);

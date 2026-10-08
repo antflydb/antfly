@@ -16240,7 +16240,9 @@ pub const ApiHttpServer = struct {
                 return @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms;
             }
         };
-        const a = std.heap.page_allocator;
+        // Native bulk builders own many small entries. Use the process heap
+        // beneath their working-set budgets rather than one mapping per entry.
+        const a = platform.allocator.processAllocator(std.heap.smp_allocator);
         const lease_ms: u64 = 5 * 60 * 1000;
         const cancel: @import("antfly_cancellation").CancellationToken = .{ .ptr = self, .is_cancelled_fn = Hooks.canceled };
         var context: local.serverless_query_lake_read_context.Context = .{

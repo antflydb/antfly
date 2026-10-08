@@ -1117,3 +1117,5 @@ the remaining expression is evaluated only on the narrowed text candidates.
 Eligible match-all counts use per-segment bitmap cardinalities and do not
 allocate candidate hits for the whole matching population. Other query shapes
 retain their existing candidate and response resource budgets.
+
+Background native publication and native runtime/text cache heaps use the platform process allocator beneath their existing working-set and resource-manager budgets. Bulk sparse/dense and ordered builders retain ordinary small heap entries; using the page allocator here would create a mapping per entry and amplify resident memory and teardown costs. Budget admission and cancellation remain enforced by the build owner.
