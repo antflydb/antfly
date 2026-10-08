@@ -512,7 +512,7 @@ def test_stateful_graph_metrics_publish_without_maintenance_configuration(
         assert not_ready.json()["retryable"] is True
         stateful_api.post(f"{action_path}:refresh", {})
 
-    def published(after_generation=0):
+    def published(after_publication=0):
         response = stateful_api._request(
             "POST",
             f"/tables/{table}/query",
@@ -527,7 +527,11 @@ def test_stateful_graph_metrics_publish_without_maintenance_configuration(
         result = stateful_api._check(response)["responses"][0]["graph_metric_results"][
             "rank"
         ]
-        if result["status"]["published_generation"] <= after_generation:
+        publication = result["status"]["last_event"]
+        if (
+            publication["kind"] != "publish"
+            or publication["sequence"] <= after_publication
+        ):
             return None
         return result if len(result["scores"]) == 2 else None
 
@@ -544,9 +548,9 @@ def test_stateful_graph_metrics_publish_without_maintenance_configuration(
     assert runtime["role"] == "combined"
     assert runtime["owner_id_hash"] != 0
 
-    generation = result["status"]["published_generation"]
+    publication = result["status"]["last_event"]["sequence"]
     stateful_api.post(f"{action_path}:rebuild", {})
-    rebuilt = wait_until(lambda: published(generation), timeout_s=30.0, interval_s=0.1)
+    rebuilt = wait_until(lambda: published(publication), timeout_s=30.0, interval_s=0.1)
     assert rebuilt is not None, stateful_api.debug_logs()
     reranked = stateful_api.query_table(
         table,
@@ -565,10 +569,10 @@ def test_stateful_graph_metrics_publish_without_maintenance_configuration(
             "status"
         ]["graph_metric_runtime"]
         assert reopened_runtime["owner_id_hash"] != runtime["owner_id_hash"]
-        generation = persisted["status"]["published_generation"]
+        publication = persisted["status"]["last_event"]["sequence"]
         stateful_api.post(f"{action_path}:rebuild", {})
         assert (
-            wait_until(lambda: published(generation), timeout_s=30.0, interval_s=0.1)
+            wait_until(lambda: published(publication), timeout_s=30.0, interval_s=0.1)
             is not None
         )
 

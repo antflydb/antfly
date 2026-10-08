@@ -2862,7 +2862,7 @@ test "db graph metric runtime role distinct worker owners complete separate acti
     defer metric_result.deinit();
     try std.testing.expectEqual(@as(usize, 1), metric_result.graph_metric_results.len);
     try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric_result.graph_metric_results[0].status.state);
-    try std.testing.expectEqual(target_generation, metric_result.graph_metric_results[0].status.published_edge_generation);
+    try std.testing.expectEqual(target_generation, metric_result.graph_metric_results[0].status.published_generation);
     try std.testing.expectEqualStrings("doc:hub", metric_result.graph_metric_results[0].scores[0].node);
 }
 
@@ -3405,7 +3405,7 @@ test "db graph metric runtime background default starts automatically and drains
     try std.testing.expectApproxEqAbs(@as(f64, 1.0), metric_result.graph_metric_results[0].scores[0].score, 0.001);
 }
 
-fn waitForDefaultMetric(db: *@import("../mod.zig").DB, name: []const u8, after_generation: u64) !u64 {
+fn waitForDefaultMetric(db: *@import("../mod.zig").DB, name: []const u8, after_publication: u64) !u64 {
     for (0..1_000) |_| {
         yieldToBackground(db);
         var result = db.search(db.alloc, .{
@@ -3421,9 +3421,12 @@ fn waitForDefaultMetric(db: *@import("../mod.zig").DB, name: []const u8, after_g
         defer result.deinit();
         try std.testing.expectEqual(@as(usize, 1), result.graph_metric_results.len);
         const metric = result.graph_metric_results[0];
-        if (metric.status.published_generation <= after_generation) continue;
+        // Public generations identify the graph snapshot, so a rebuild of an
+        // unchanged graph advances the publication event, not that generation.
+        const publication = metric.status.last_event orelse continue;
+        if (publication.kind != .publish or publication.sequence <= after_publication) continue;
         try std.testing.expectEqual(@as(usize, 2), metric.scores.len);
-        return metric.status.published_generation;
+        return publication.sequence;
     }
     return error.GraphMetricBuildDidNotConverge;
 }
@@ -3474,7 +3477,7 @@ test "db graph metric runtime background default publishes pagerank refresh rebu
     const path = TestHelpers.fastTempPath(&path_buf);
     defer TestHelpers.cleanupTempDir(path);
     var previous_owner_hash: u64 = 0;
-    var previous_generation: u64 = 0;
+    var previous_publication: u64 = 0;
     {
         var db = try DB.open(alloc, std.mem.span(path), .{});
         defer db.close();
@@ -3494,10 +3497,10 @@ test "db graph metric runtime background default publishes pagerank refresh rebu
         _ = try waitForDefaultMetric(&db, "rank", 0);
         var refresh = try db.refreshGraphMetric(alloc, "graph_idx", "manual");
         defer refresh.deinit(alloc);
-        const generation = try waitForDefaultMetric(&db, "manual", 0);
+        const publication = try waitForDefaultMetric(&db, "manual", 0);
         var rebuild = try db.rebuildGraphMetric(alloc, "graph_idx", "manual");
         defer rebuild.deinit(alloc);
-        previous_generation = try waitForDefaultMetric(&db, "manual", generation);
+        previous_publication = try waitForDefaultMetric(&db, "manual", publication);
     }
     {
         // An external maintenance driver can opt out and leave a durable
@@ -3513,7 +3516,7 @@ test "db graph metric runtime background default publishes pagerank refresh rebu
         var db = try DB.open(alloc, std.mem.span(path), .{});
         defer db.close();
         try std.testing.expect(previous_owner_hash != db.graph_metric_runtime.?.stats().owner_id_hash);
-        _ = try waitForDefaultMetric(&db, "manual", previous_generation);
+        _ = try waitForDefaultMetric(&db, "manual", previous_publication);
         try std.testing.expect(db.graph_metric_runtime.?.stats().has_lease);
     }
 }
