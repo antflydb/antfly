@@ -27,12 +27,22 @@ pub const Context = struct {
     ptr: ?*anyopaque = null,
     since_poll: u16 = 256,
     failure: ?anyerror = null,
+    /// Optional enclosing execution owner. A scoped kernel retains its local
+    /// work cap while charging and polling the same row/program identity.
+    parent: ?*Context = null,
 
     pub fn charge(self: *Context, count: u64) !void {
         if (self.failure) |err| return err;
         if (count > self.remaining) {
-            self.failure = error.SqlProgramLimitExceeded;
-            return error.SqlProgramLimitExceeded;
+            return self.limit();
+        }
+        if (self.parent) |parent| {
+            parent.charge(count) catch |err| {
+                self.failure = err;
+                return err;
+            };
+            self.remaining -= count;
+            return;
         }
         self.remaining -= count;
         if (count >= 256 -| self.since_poll) {
@@ -47,8 +57,9 @@ pub const Context = struct {
     /// Shared admission failure for typed codecs using this execution budget.
     pub fn limit(self: *Context) anyerror {
         if (self.failure) |err| return err;
-        self.failure = error.SqlProgramLimitExceeded;
-        return error.SqlProgramLimitExceeded;
+        const err = if (self.parent) |parent| parent.limit() else error.SqlProgramLimitExceeded;
+        self.failure = err;
+        return err;
     }
 
     fn allocate(self: *Context, count: usize) ![]u16 {

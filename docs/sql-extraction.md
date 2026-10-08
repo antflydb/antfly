@@ -6191,3 +6191,68 @@ independent PostgreSQL assignments, control-catalog compilation, inventory
 integrity, Ruff, Zig formatting and whitespace checks also pass. These gates do
 not establish completion of the remaining parity inventory or the separate
 broad durable-runtime compiler-memory gate.
+
+### Borrowed typed-array comparison boundary
+
+The durable array-expression work now has a canonical borrowed comparison kernel
+in `sql/array_comparison.zig`. Codec-authenticated pinned array views preserve the
+precise element identity, row-major SQL NULL provenance, dimensions and lower
+bounds. This boundary never infers types from JSON and does not itself establish
+canonical-byte trust. Untrusted ingestion still crosses strict array validation.
+
+Primitive values share the existing typed element comparator; NUMERIC uses its
+canonical borrowed group views. Neither allocates a decoded element vector.
+PostgreSQL's element-count, rank, dimension-length and lower-bound tie-breaks are
+shared with materialized array comparison. JSONB parses only one element pair into
+a reusable independently bounded arena. Shared JSON/array admission can now borrow
+the row's work/cancellation context; local limits remain effective and exhaustion
+or cancellation remains sticky across later comparisons. Binary text comparison
+polls shared work in chunks of at most 256 bytes.
+
+The independently regenerated PostgreSQL fixture contains 36 ordering cases across
+all supported element identities: exact wide integers, NUMERIC scales/specials,
+floating zero/NaN/infinities, NULL elements, empty arrays, rank/shape/bounds,
+binary/C text, UUID and structural JSONB. Tests compare both directions and
+reflexivity, cross-check the existing materialized path, deny every primitive
+allocation, sweep JSONB allocation faults and verify sticky cancellation/quota
+failures. The SQL owner explicitly imports this kernel so its tests are selected;
+the generated control-source catalog includes the same source contract.
+
+In a local Debug sample, 100 equal comparisons of a 10,000-element int64 array
+took 178 ms without decoded allocations versus 201 ms when decoding one vector
+per comparison. That conservative one-vector baseline peaked at 1,320,344 bytes;
+comparison of two independently decoded inputs would require two vectors.
+For 1,000 JSONB element pairs, scratch peaked at 2,012 bytes and was fully
+released afterward. These are local workload samples, not production latency
+guarantees or a claim that every query already uses borrowed array comparison.
+
+Temporary JSONB trees borrow unescaped string and numeric tokens from pinned
+input using the standard JSON scanner. The generic dynamic JSON parser owns
+tokens even when allocation-if-needed is requested, so it cannot provide this
+boundary. A 128 KiB string element now compares within 64 KiB of scratch;
+tests retain strict syntax, escape and duplicate-key validation and sweep
+allocation failures. Owned JSON parsing remains unchanged.
+
+Materialized NUMERIC array validation, ordering and semantic hashing now use a
+scoped exact context that charges its enclosing row/program on every work unit,
+while retaining the array's local cap and inherited coefficient/input limits.
+The parent owns cancellation polling and sticky failures, including exhaustion
+of a child cap. A 1,000-limb regression checks all three operations for exact
+single-charge accounting, mid-coefficient cancellation, sticky quota failure,
+inherited coefficient admission and zero allocations. Scalar NUMERIC ingress
+constructors and other codec owners still need separate shared-context wiring;
+this does not claim complete row preparation uses one execution identity yet.
+
+This is the comparison prerequisite for the durable typed-array VM, not public
+array-expression activation. The VM's value domain, generated/default bindings,
+array casts/operations, schema capability/public expression contract, array DDL,
+and mounted PostgreSQL parity campaigns remain unfinished. Array DDL stays guarded
+until those paths are connected. No original inventory disposition is changed.
+
+Final-source validation passes 608 local and 226 server SQL tests, 60 local and
+5 server schema-expression tests, and 188 local plus 1 server native relational
+integrity tests: 1,088 passing tests, with three existing SQL skips and no failures
+or leaks. The seven focused comparison/admission tests, independently regenerated
+36-case PostgreSQL fixture, inventory integrity, generated control catalog,
+formatting, Ruff and whitespace checks pass. Dispositions remain 448 implemented,
+136 rejected, 73 superseded and 929 unresolved.

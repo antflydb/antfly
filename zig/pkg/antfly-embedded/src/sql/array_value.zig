@@ -268,19 +268,7 @@ pub const Value = struct {
             const order = try compareElement(self.element_type, a, b, budget);
             if (order != .eq) return order;
         }
-        const count = std.math.order(self.elements.len, other.elements.len);
-        if (count != .eq) return count;
-        const rank_order = std.math.order(self.dimensions.len, other.dimensions.len);
-        if (rank_order != .eq) return rank_order;
-        for (self.dimensions, other.dimensions) |a, b| {
-            const order = std.math.order(a.length, b.length);
-            if (order != .eq) return order;
-        }
-        for (self.dimensions, other.dimensions) |a, b| {
-            const order = std.math.order(a.lower, b.lower);
-            if (order != .eq) return order;
-        }
-        return .eq;
+        return compareShape(self.elements.len, other.elements.len, self.dimensions, other.dimensions, budget);
     }
 
     pub fn semanticHash(self: Value, budget: *Budget) !u64 {
@@ -322,7 +310,7 @@ fn validateElement(kind: ElementType, element: Element, budget: *Budget) !void {
     switch (kind) {
         .numeric => {
             var none = std.heap.FixedBufferAllocator.init(&.{});
-            var ctx: @import("numeric_value.zig").Context = .{ .alloc = none.allocator(), .remaining = budget.remaining };
+            var ctx = budget.numericContext(none.allocator());
             defer budget.remaining = @intCast(ctx.remaining);
             try @import("numeric_value.zig").validateCanonical(&ctx, (element.numeric orelse return error.SqlTypeMismatch).*);
         },
@@ -361,7 +349,28 @@ fn validateElement(kind: ElementType, element: Element, budget: *Budget) !void {
     }
 }
 
-fn compareElement(kind: ElementType, a: Element, b: Element, budget: *Budget) !std.math.Order {
+/// PostgreSQL's shape tie-break follows equal row-major elements. Reuse it
+/// for materialized values and borrowed canonical row views.
+pub fn compareShape(left_count: usize, right_count: usize, left: []const Dimension, right: []const Dimension, budget: *Budget) !std.math.Order {
+    try budget.consume(1);
+    const count = std.math.order(left_count, right_count);
+    if (count != .eq) return count;
+    const rank_order = std.math.order(left.len, right.len);
+    if (rank_order != .eq) return rank_order;
+    for (left, right) |a, b| {
+        try budget.consume(1);
+        const order = std.math.order(a.length, b.length);
+        if (order != .eq) return order;
+    }
+    for (left, right) |a, b| {
+        try budget.consume(1);
+        const order = std.math.order(a.lower, b.lower);
+        if (order != .eq) return order;
+    }
+    return .eq;
+}
+
+pub fn compareElement(kind: ElementType, a: Element, b: Element, budget: *Budget) !std.math.Order {
     try budget.consume(1);
     if (a.sql_null or b.sql_null) return if (a.sql_null == b.sql_null) .eq else if (a.sql_null) .gt else .lt;
     if (kind == .float32 or kind == .float64) {
@@ -373,16 +382,13 @@ fn compareElement(kind: ElementType, a: Element, b: Element, budget: *Budget) !s
     return switch (kind) {
         .numeric => blk: {
             var none = std.heap.FixedBufferAllocator.init(&.{});
-            var ctx: @import("numeric_value.zig").Context = .{ .alloc = none.allocator(), .remaining = budget.remaining };
+            var ctx = budget.numericContext(none.allocator());
             defer budget.remaining = @intCast(ctx.remaining);
             break :blk try @import("numeric_value.zig").order(&ctx, a.numeric.?.*, b.numeric.?.*);
         },
         .int16, .int32, .int64 => std.math.order(a.value.integer, b.value.integer),
         .boolean => std.math.order(@intFromBool(a.value.bool), @intFromBool(b.value.bool)),
-        .text, .uuid => blk: {
-            try budget.consume(@min(a.value.string.len, b.value.string.len));
-            break :blk std.mem.order(u8, a.value.string, b.value.string);
-        },
+        .text, .uuid => budget.orderBytes(a.value.string, b.value.string),
         .jsonb => json_order.compare(a.value, b.value, budget, 0),
         .float32, .float64 => unreachable,
     };
@@ -393,7 +399,7 @@ fn hashElement(kind: ElementType, element: Element, budget: *Budget) !u64 {
     if (element.sql_null) return 0x53514c4e554c4c;
     if (kind == .numeric) {
         var none = std.heap.FixedBufferAllocator.init(&.{});
-        var ctx: @import("numeric_value.zig").Context = .{ .alloc = none.allocator(), .remaining = budget.remaining };
+        var ctx = budget.numericContext(none.allocator());
         defer budget.remaining = @intCast(ctx.remaining);
         var hash = std.hash.Wyhash.init(0);
         try @import("numeric_value.zig").hash(&ctx, element.numeric.?.*, &hash);
@@ -447,6 +453,63 @@ pub const Owned = struct {
 
 fn allocationError(budget: *MemoryBudget, err: anyerror) anyerror {
     return if (err == error.OutOfMemory and budget.exhausted) error.SqlProgramLimitExceeded else err;
+}
+
+test "SQL typed array NUMERIC kernels retain shared admission and cancellation" {
+    const exact = @import("numeric_value.zig");
+    const Operation = enum { validate, compare, hash };
+    const Harness = struct {
+        calls: usize = 0,
+        fn poll(ptr: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            self.calls += 1;
+            if (self.calls == 2) return error.Canceled;
+        }
+        fn run(op: Operation, value: Value, work: *Budget) !void {
+            switch (op) {
+                .validate => _ = try Value.initWithBudget(.numeric, value.dimensions, value.elements, .{}, work),
+                .compare => _ = try value.compare(value, work),
+                .hash => _ = try value.semanticHash(work),
+            }
+        }
+    };
+    const digits: [1000]u16 = @splat(1);
+    const number: exact.Value = .{ .digits = &digits, .weight = 999 };
+    const value: Value = .{
+        .element_type = .numeric,
+        .dimensions = &.{.{ .length = 1 }},
+        .elements = &.{.{ .sql_null = false, .numeric = &number }},
+    };
+    var denied = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    for ([_]Operation{ .validate, .compare, .hash }) |op| {
+        var parent: exact.Context = .{ .alloc = denied.allocator() };
+        var work: Budget = .{ .shared = &parent };
+        const local_before = work.remaining;
+        const parent_before = parent.remaining;
+        try Harness.run(op, value, &work);
+        try std.testing.expectEqual(local_before - work.remaining, parent_before - parent.remaining);
+        try std.testing.expect(local_before - work.remaining >= digits.len);
+
+        var cancel: Harness = .{};
+        parent = .{ .alloc = denied.allocator(), .checkpoint = Harness.poll, .ptr = &cancel };
+        work = .{ .shared = &parent };
+        try std.testing.expectError(error.Canceled, Harness.run(op, value, &work));
+        try std.testing.expectEqual(@as(usize, 2), cancel.calls);
+        parent.checkpoint = null;
+        parent.remaining = 8 * 1024 * 1024;
+        work.remaining = 1_048_576;
+        try std.testing.expectError(error.Canceled, Harness.run(op, value, &work));
+
+        parent = .{ .alloc = denied.allocator() };
+        work = .{ .shared = &parent, .remaining = 128 };
+        try std.testing.expectError(error.SqlProgramLimitExceeded, Harness.run(op, value, &work));
+        work.remaining = 1_048_576;
+        try std.testing.expectError(error.SqlProgramLimitExceeded, Harness.run(op, value, &work));
+    }
+    var parent: exact.Context = .{ .alloc = denied.allocator(), .max_groups = 1 };
+    var work: Budget = .{ .shared = &parent };
+    try std.testing.expectError(error.SqlProgramLimitExceeded, Harness.run(.validate, value, &work));
+    try std.testing.expectEqual(@as(usize, 0), denied.alloc_index);
 }
 
 test "SQL typed array quantified comparisons match PostgreSQL reference contracts" {
