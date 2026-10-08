@@ -959,7 +959,8 @@ test "objectstore-backed artifact readers preserve bucket provisioning authority
     var memory = objectstore.MemoryClient.init(alloc);
     defer memory.deinit();
     try std.testing.expectError(error.ArtifactBucketNotFound, ObjectStore.initWithClientOptions(alloc, memory.client(), "missing-bucket", "tenant/a", .{}));
-    try std.testing.expect(!(try memory.client().bucketExists("missing-bucket")));
+    var memory_client = memory.client();
+    try std.testing.expect(!(try memory_client.bucketExists("missing-bucket")));
     var impl = try ObjectStore.initWithClientOptions(alloc, memory.client(), "artifact-bucket", "tenant/a", .{ .ensure_bucket = true });
     defer impl.deinit();
     var reader = try ObjectStore.initWithClientOptions(alloc, memory.client(), "artifact-bucket", "tenant/a", .{ .read_only = true });

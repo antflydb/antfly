@@ -268,6 +268,8 @@ pub fn normalizeDistributedQueryOperationalError(err: anyerror) anyerror {
         error.TopologyChanged,
         error.UnknownGroup,
         error.NotLeader,
+        error.GroupLeaderUnavailable,
+        error.LeaderUnavailable,
         error.ReadIndexTimeout,
         => error.DistributedQueryUnavailable,
         else => err,
@@ -18187,6 +18189,8 @@ fn consumerTests() type {
             try std.testing.expectEqual(error.DistributedQueryUnavailable, normalizeDistributedQueryOperationalError(error.TopologyChanged));
             try std.testing.expectEqual(error.DistributedQueryUnavailable, normalizeDistributedQueryOperationalError(error.UnknownGroup));
             try std.testing.expectEqual(error.DistributedQueryUnavailable, normalizeDistributedQueryOperationalError(error.NotLeader));
+            try std.testing.expectEqual(error.DistributedQueryUnavailable, normalizeDistributedQueryOperationalError(error.GroupLeaderUnavailable));
+            try std.testing.expectEqual(error.DistributedQueryUnavailable, normalizeDistributedQueryOperationalError(error.LeaderUnavailable));
             try std.testing.expectEqual(error.DistributedQueryUnavailable, normalizeDistributedQueryOperationalError(error.ReadIndexTimeout));
             try std.testing.expectEqual(error.Timeout, normalizeDistributedQueryOperationalError(error.Timeout));
             try std.testing.expectEqual(error.InternalFailure, normalizeDistributedQueryOperationalError(error.InternalFailure));

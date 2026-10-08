@@ -110,7 +110,8 @@ pub const Store = struct {
         defer self.docs.mutex.unlock();
         const revision = try self.head();
         if (revision < options.min_revision) return error.Unavailable;
-        var rows = try self.docs.file.metadataCatalogCursor(self.docs.file.activeCheckpoint(), &(self.prefix ++ "entries/".*));
+        const entry_prefix = self.prefix ++ "entries/".*;
+        var rows = try self.docs.file.metadataCatalogCursor(self.docs.file.activeCheckpoint(), &entry_prefix);
         defer rows.deinit();
         var entries: std.ArrayList(contract.Metadata) = .empty;
         errdefer {

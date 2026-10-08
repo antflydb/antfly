@@ -10067,8 +10067,7 @@ test "packed spill preserves legacy and current positional sources with bounded 
                 };
             }
         };
-        var no_resize = @import("../storage/lite/test_allocator.zig").NoResizeAllocator{ .backing = a };
-        try std.testing.checkAllAllocationFailures(no_resize.allocator(), Harness.run, .{ @as([]const ?TermIterator.Entry, &entries), @as([]const FileDocMap, &maps) });
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Harness.run, .{ @as([]const ?TermIterator.Entry, &entries), @as([]const FileDocMap, &maps) });
     }
 }
 

@@ -71,6 +71,8 @@ pub const graph_edge_record_kind: u8 = 0x32;
 /// Durable document-owned retirement of an exact primary graph relationship.
 pub const graph_retirement_kind: u8 = 0x50;
 pub const asset_state_kind: u8 = 0x33;
+/// Durable document-owned target for an explicitly requested producer rerun.
+pub const asset_reprocess_intent_kind: u8 = 0x52;
 pub const graph_asset_state_kind: u8 = 0x34;
 pub const document_unit_record_kind: u8 = 0x35;
 pub const derived_coverage_kind: u8 = 0x36;
@@ -2225,7 +2227,7 @@ pub fn isRestoreArtifactKey(key: []const u8) bool {
     if (kind_pos >= key.len) return false;
     const name_pos = kind_pos + 1;
     switch (key[kind_pos]) {
-        asset_state_kind, document_unit_navigation_summary_kind => {
+        asset_state_kind, asset_reprocess_intent_kind, document_unit_navigation_summary_kind => {
             const name_term = findComponentTerminator(key, name_pos) orelse return false;
             return name_term + 2 == key.len;
         },
