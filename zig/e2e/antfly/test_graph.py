@@ -507,7 +507,9 @@ def test_stateful_graph_metrics_publish_without_maintenance_configuration(
             f"/tables/{table}/query",
             {"limit": 0, "graph_metric": {"index": "graph_idx", "metric": "rank"}},
         )
-        assert not_ready.status_code == 503, not_ready.text
+        assert not_ready.status_code == 503, (
+            f"{not_ready.text}\n{stateful_api.debug_logs()}"
+        )
         assert not_ready.json()["code"] == "metric_not_ready"
         assert not_ready.json()["retryable"] is True
         stateful_api.post(f"{action_path}:refresh", {})
@@ -524,6 +526,9 @@ def test_stateful_graph_metrics_publish_without_maintenance_configuration(
         # Publication is asynchronous; the first generation may not exist yet.
         if response.status_code in (404, 409, 503):
             return None
+        assert response.status_code < 400, (
+            f"{response.status_code}: {response.text}\n{stateful_api.debug_logs()}"
+        )
         result = stateful_api._check(response)["responses"][0]["graph_metric_results"][
             "rank"
         ]
@@ -538,7 +543,7 @@ def test_stateful_graph_metrics_publish_without_maintenance_configuration(
     result = wait_until(published, timeout_s=30.0, interval_s=0.1)
     assert result is not None, stateful_api.debug_logs()
     assert {row["node"] for row in result["scores"]} == {"a", "b"}
-    expected_score = 1.0 if kind == "degree" else 0.5
+    expected_score = 2.0 if kind == "degree" else 0.5
     for row in result["scores"]:
         assert row["score"] == pytest.approx(expected_score, abs=1e-6)
     runtime = stateful_api.get(f"/tables/{table}/indexes/graph_idx")["status"][

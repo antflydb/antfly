@@ -5718,6 +5718,20 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const graph_metric_default_step = b.step("antfly-graph-metric-default-test", "Verify lazy graph metric maintenance, owner lifecycle gates and readiness responses");
     graph_metric_default_step.dependOn(&addFilteredTestRunArtifact(b, graph_metric_default_tests).step);
     graph_metric_default_step.dependOn(&addFilteredTestRunArtifact(b, graph_metric_default_http_tests).step);
+    const graph_metric_boundary_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/runtime_callback_abi.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    graph_metric_boundary_mod.addImport("antfly_runtime_abi", antfly_imports.runtime_abi);
+    const graph_metric_boundary_tests = b.addTest(.{
+        .root_module = graph_metric_boundary_mod,
+        .filters = &.{"boundary dispatcher preserves graph metric readiness across runtime units"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const run_graph_metric_boundary_tests = b.addRunArtifact(graph_metric_boundary_tests);
+    graph_metric_default_step.dependOn(&run_graph_metric_boundary_tests.step);
+    integration_test_step.dependOn(&run_graph_metric_boundary_tests.step);
     // The full gate runs complete graph owner coverage from the same compiler
     // artifact used by the bounded base selection, including page contracts.
     integration_test_step.dependOn(graph_test_step);
