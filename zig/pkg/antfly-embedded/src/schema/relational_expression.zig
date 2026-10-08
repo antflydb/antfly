@@ -120,6 +120,27 @@ fn numericJson(execution: *Execution, input: std.json.Value) !Value {
     return scratch.encode(parsed.value) catch |err| return scratch.failure(err);
 }
 
+/// Already constrained canonical values are reused without decoding limbs or
+/// allocating output. Logical restore may preserve equivalent display scales,
+/// but never a value changed by assignment; physical restore is stricter.
+fn normalizeNumericBinding(execution: *Execution, bytes: []const u8, modifier: exact.TypeModifier, preserve: bool) !Value {
+    const view = binary.layout.View.openWithBudget(bytes, .{ .bytes = execution.numeric.max_input_bytes, .groups = execution.numeric.max_groups }, &execution.numeric) catch |err| return executionFailure(err);
+    if (view.verifyModifier(modifier, &execution.numeric)) |_| {
+        return .{ .numeric = bytes };
+    } else |err| if (err != error.InvalidSqlBinaryRepresentation) return executionFailure(err);
+    var scratch: NumericScratch = undefined;
+    scratch.init(execution);
+    defer scratch.deinit();
+    const parsed = binary.decodeCanonical(&execution.numeric, bytes) catch |err| return scratch.failure(err);
+    const constrained = exact.applyTypeModifier(&execution.numeric, parsed.value, modifier) catch |err| return scratch.failure(err);
+    if (preserve) {
+        if ((exact.order(&execution.numeric, parsed.value, constrained.value) catch |err| return scratch.failure(err)) != .eq)
+            return error.InvalidRelationalGeneratedValue;
+        return .{ .numeric = bytes };
+    }
+    return scratch.encode(constrained.value) catch |err| return scratch.failure(err);
+}
+
 fn numericJsonOutput(execution: *Execution, bytes: []const u8) !std.json.Value {
     var scratch: NumericScratch = undefined;
     scratch.init(execution);
@@ -674,6 +695,13 @@ const Compiler = struct {
                     self.frame("precise SQL builtin type");
                     self.frame(@tagName(kind));
                 }
+                if (self.table.relational_columns[node.ordinal].numeric_modifier) |modifier| {
+                    self.frame("SQL NUMERIC column modifier v1");
+                    var identity: [4]u8 = undefined;
+                    std.mem.writeInt(u16, identity[0..2], modifier.precision, .little);
+                    std.mem.writeInt(i16, identity[2..4], modifier.scale, .little);
+                    self.frame(&identity);
+                }
             },
             else => {
                 const args = input.object.get("args") orelse return error.InvalidRelationalExpression;
@@ -1195,6 +1223,159 @@ test "relational declarations NUMERIC defaults generated topology and strict res
     try std.testing.checkAllAllocationFailures(stable.allocator(), Run.run, .{ encoded, declarations.value });
 }
 
+test "relational declarations NUMERIC target modifiers precede dependent expressions with PostgreSQL oracle" {
+    const a = std.testing.allocator;
+    const source: schema.TableSchema = .{ .storage_mode = .relational, .requires_public_schema = true, .requires_numeric_modifiers = true, .relational_columns = &.{
+        .{ .name = "base", .path = "base", .column_type = .numeric, .sql_element_type = .numeric, .numeric_modifier = .{ .precision = 4, .scale = 2 } },
+        .{ .name = "narrow", .path = "narrow", .column_type = .numeric, .sql_element_type = .numeric, .numeric_modifier = .{ .precision = 3, .scale = 1 } },
+        .{ .name = "total", .path = "total", .column_type = .numeric, .sql_element_type = .numeric, .numeric_modifier = .{ .precision = 5, .scale = 2 } },
+    } };
+    const wire = try schema.serializeSchema(a, source);
+    defer a.free(wire);
+    const declarations = try std.json.parseFromSlice(std.json.Value, a,
+        \\{"defaults":[{"column":"base","expression":{"op":"literal","type":"numeric","value":"1.245"}}],"generated":[{"column":"total","expression":{"op":"add","args":[{"op":"column","column":"base"},{"op":"column","column":"narrow"}]}},{"column":"narrow","expression":{"op":"column","column":"base"}}]}
+    , .{});
+    defer declarations.deinit();
+    const Entry = struct { use_default: bool = false, input: ?[]const u8 = null, expected: ?[]const ?[]const u8 = null, @"error": ?[]const u8 = null };
+    const fixture = try std.json.parseFromSlice(struct { entries: []const Entry }, a, @embedFile("../sql/fixtures/sql_numeric_assignment_reference.json"), .{ .ignore_unknown_fields = true });
+    defer fixture.deinit();
+    const Run = struct {
+        fn run(alloc: Allocator, encoded: []const u8, defs: std.json.Value, cases: []const Entry) !void {
+            const table = try schema.deserializeSchema(alloc, encoded);
+            const set = Set.createOwned(alloc, table, defs.object.get("defaults").?, defs.object.get("generated").?) catch |err| {
+                schema.freeSchema(alloc, table);
+                return err;
+            };
+            defer set.deinit();
+            for (cases) |entry| {
+                var document = try std.json.parseFromSlice(std.json.Value, alloc, "{}", .{});
+                defer document.deinit();
+                if (!entry.use_default) try document.value.object.put(document.arena.allocator(), "base", if (entry.input) |text| .{ .string = text } else .null);
+                if (entry.@"error") |code| {
+                    try std.testing.expectEqualStrings("22003", code);
+                    if (set.applyJson(document.arena.allocator(), &document.value)) |_| return error.TestExpectedError else |err| {
+                        if (err == error.OutOfMemory) return err;
+                        try std.testing.expectEqual(error.RelationalExpressionOverflow, err);
+                    }
+                    try std.testing.expect(!document.value.object.contains("total"));
+                    continue;
+                }
+                try set.applyJson(document.arena.allocator(), &document.value);
+                for ([_][]const u8{ "base", "narrow", "total" }, entry.expected.?) |name, expected| {
+                    const value = document.value.object.get(name).?;
+                    if (expected) |text| try std.testing.expectEqualStrings(text, if (value == .number_string) value.number_string else value.string) else try std.testing.expectEqual(std.json.Value.null, value);
+                }
+                try set.verifyJson(alloc, document.value);
+                if (entry.use_default) {
+                    // Equivalent logical display scales are not repairs.
+                    try document.value.object.put(document.arena.allocator(), "base", .{ .number_string = "1.2500" });
+                    try set.verifyJson(alloc, document.value);
+                    // A consistent-looking generated value cannot authorize
+                    // an unconstrained base assignment during restoration.
+                    try document.value.object.put(document.arena.allocator(), "base", .{ .number_string = "1.245" });
+                    if (set.verifyJson(alloc, document.value)) |_| return error.TestExpectedError else |err| {
+                        if (err == error.OutOfMemory) return err;
+                        try std.testing.expectEqual(error.InvalidRelationalGeneratedValue, err);
+                    }
+                }
+            }
+        }
+    };
+    try Run.run(a, wire, declarations.value, fixture.value.entries);
+    var stable = std.testing.FailingAllocator.init(a, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(stable.allocator(), Run.run, .{ wire, declarations.value, fixture.value.entries[0..1] });
+    try std.testing.checkAllAllocationFailures(stable.allocator(), Run.run, .{ wire, declarations.value, fixture.value.entries[6..7] });
+}
+
+test "relational declarations NUMERIC constrained bindings reuse canonical bytes with sticky admission" {
+    const a = std.testing.allocator;
+    const bytes = try @import("../sql/numeric_storage.zig").encodeJsonAlloc(a, .{ .string = "1.25" });
+    defer a.free(bytes);
+    var none = std.heap.FixedBufferAllocator.init(&.{});
+    var remaining: usize = max_allocated_bytes;
+    var scope = Execution.init(none.allocator(), &remaining);
+    const modifier: exact.TypeModifier = .{ .precision = 4, .scale = 2 };
+    const start = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
+    for (0..10000) |_| {
+        const result = try normalizeNumericBinding(&scope, bytes, modifier, false);
+        try std.testing.expectEqual(bytes.ptr, result.numeric.ptr);
+    }
+    try std.testing.expectEqual(max_allocated_bytes, remaining);
+    std.debug.print("NUMERIC binding reuse: rows=10000 allocated_bytes=0 elapsed_ns={}\n", .{std.Io.Clock.now(.awake, std.testing.io).nanoseconds - start});
+    scope.numeric.remaining = 0;
+    try std.testing.expectError(error.RelationalExpressionBudgetExceeded, normalizeNumericBinding(&scope, bytes, modifier, false));
+    scope.numeric.remaining = 1000;
+    try std.testing.expectError(error.RelationalExpressionBudgetExceeded, normalizeNumericBinding(&scope, bytes, modifier, false));
+    scope = Execution.init(none.allocator(), &remaining);
+    const Poll = struct {
+        fn canceled(_: ?*anyopaque) anyerror!void {
+            return error.Canceled;
+        }
+    };
+    scope.numeric.checkpoint = Poll.canceled;
+    try std.testing.expectError(error.Canceled, normalizeNumericBinding(&scope, bytes, modifier, false));
+    scope.numeric.checkpoint = null;
+    try std.testing.expectError(error.Canceled, normalizeNumericBinding(&scope, bytes, modifier, false));
+}
+
+test "relational declarations NUMERIC generated identity binds target and dependency modifiers and fences cold rows" {
+    const a = std.testing.allocator;
+    var columns = [_]schema.RelationalColumn{
+        .{ .name = "base", .path = "base", .column_type = .numeric, .sql_element_type = .numeric, .numeric_modifier = .{ .precision = 4, .scale = 2 } },
+        .{ .name = "derived", .path = "derived", .column_type = .numeric, .sql_element_type = .numeric, .numeric_modifier = .{ .precision = 4, .scale = 2 } },
+        .{ .name = "cold", .path = "cold", .column_type = .numeric, .sql_element_type = .numeric, .numeric_modifier = .{ .precision = 4, .scale = 2 } },
+    };
+    const table: schema.TableSchema = .{ .storage_mode = .relational, .requires_public_schema = true, .requires_numeric_modifiers = true, .relational_columns = &columns };
+    const defs = try std.json.parseFromSlice(std.json.Value, a,
+        \\[{"column":"derived","expression":{"op":"column","column":"base"}}]
+    , .{});
+    defer defs.deinit();
+    const Run = struct {
+        fn identity(alloc: Allocator, source: schema.TableSchema, declarations: std.json.Value) ![32]u8 {
+            const encoded = try schema.serializeSchema(alloc, source);
+            defer alloc.free(encoded);
+            const owned = try schema.deserializeSchema(alloc, encoded);
+            const set = Set.createOwned(alloc, owned, .null, declarations) catch |err| {
+                schema.freeSchema(alloc, owned);
+                return err;
+            };
+            defer set.deinit();
+            const Row = struct {
+                table_schema: schema.TableSchema,
+                reads: *usize,
+                pub fn ordinalForName(_: @This(), name: []const u8) ?u32 {
+                    return if (std.mem.eql(u8, name, "base")) 0 else 1;
+                }
+                pub fn findCell(self: @This(), _: u32) !?codec.Cell {
+                    self.reads.* += 1;
+                    return null;
+                }
+            };
+            var historical_columns = [_]schema.RelationalColumn{ source.relational_columns[0], source.relational_columns[1] };
+            historical_columns[0].numeric_modifier.?.scale += 1;
+            var historical = source;
+            historical.relational_columns = &historical_columns;
+            var reads: usize = 0;
+            try std.testing.expectEqualSlices(u32, &.{ 0, 1 }, set.modifier_ordinals);
+            try std.testing.expectError(error.InvalidRelationalGeneratedValue, set.verifyRow(alloc, Row{ .table_schema = historical, .reads = &reads }));
+            try std.testing.expectEqual(@as(usize, 0), reads);
+            return generatedFingerprint(set);
+        }
+    };
+    const original = try Run.identity(a, table, defs.value);
+    columns[0].numeric_modifier.?.scale = 1;
+    const dependency = try Run.identity(a, table, defs.value);
+    try std.testing.expect(!std.mem.eql(u8, &original, &dependency));
+    columns[0].numeric_modifier.?.scale = 2;
+    columns[1].numeric_modifier.?.scale = 1;
+    const target = try Run.identity(a, table, defs.value);
+    try std.testing.expect(!std.mem.eql(u8, &original, &target));
+    columns[1].numeric_modifier.?.scale = 2;
+    columns[2].numeric_modifier.?.scale = 1;
+    const unrelated = try Run.identity(a, table, defs.value);
+    try std.testing.expectEqualSlices(u8, &original, &unrelated);
+}
+
 test "relational declarations SQL numeric programs retain narrow domains and checked casts" {
     const alloc = std.testing.allocator;
     const ast = @import("../sql/ast.zig");
@@ -1359,6 +1540,7 @@ pub const Set = struct {
     order: []usize,
     read_columns: []bool,
     generated_columns: []bool,
+    modifier_ordinals: []const u32,
     pub const Binding = struct { ordinal: u32, generated: bool, plan: Plan };
 
     pub fn createOwned(alloc: Allocator, table: schema.TableSchema, defaults: std.json.Value, generated: std.json.Value) !*Set {
@@ -1408,8 +1590,15 @@ pub const Set = struct {
         var states = @as([256]u2, @splat(0));
         var written: usize = 0;
         for (bindings, 0..) |_, i| try visit(bindings, order, &states, &written, i);
+        var constrained: std.ArrayList(u32) = .empty;
+        defer constrained.deinit(alloc);
+        for (table.relational_columns, read_columns, 0..) |column, read, ordinal| {
+            if (read and column.numeric_modifier != null) try constrained.append(alloc, @intCast(ordinal));
+        }
+        const modifier_ordinals = try constrained.toOwnedSlice(alloc);
+        errdefer alloc.free(modifier_ordinals);
         const set = try alloc.create(Set);
-        set.* = .{ .alloc = alloc, .table = table, .bindings = bindings, .order = order, .read_columns = read_columns, .generated_columns = generated_columns };
+        set.* = .{ .alloc = alloc, .table = table, .bindings = bindings, .order = order, .read_columns = read_columns, .generated_columns = generated_columns, .modifier_ordinals = modifier_ordinals };
         return set;
     }
 
@@ -1426,6 +1615,7 @@ pub const Set = struct {
     }
 
     pub fn deinit(self: *Set) void {
+        self.alloc.free(self.modifier_ordinals);
         for (self.bindings) |*binding| binding.plan.deinit();
         self.alloc.free(self.bindings);
         self.alloc.free(self.order);
@@ -1455,11 +1645,17 @@ pub const Set = struct {
 
     pub fn applyValuesWithExecution(self: *const Set, execution: *Execution, values: []Value, present: []bool, defaults: DefaultsPolicy, default_mask: ?[]const bool) !void {
         if (values.len != self.table.relational_columns.len or present.len != values.len or (default_mask != null and default_mask.?.len != values.len)) return error.InvalidRelationalExpressionInput;
-        const alloc = execution.alloc;
+        // Base assignments must cross the target domain before any generated
+        // expression reads them. Ignore submitted generated fields and keep
+        // work proportional to the immutable dependency mask.
+        for (self.modifier_ordinals) |ordinal| {
+            if (!present[ordinal] or self.generated_columns[ordinal]) continue;
+            values[ordinal] = try self.normalizeBinding(execution, ordinal, values[ordinal]);
+        }
         for (self.order) |index| {
             const binding = &self.bindings[index];
             if (!binding.generated and (present[binding.ordinal] or defaults == .preserve_absence or (default_mask != null and !default_mask.?[binding.ordinal]))) continue;
-            values[binding.ordinal] = try self.normalizeBinding(alloc, binding.ordinal, try binding.plan.evaluateWithExecution(execution, values));
+            values[binding.ordinal] = try self.normalizeBinding(execution, binding.ordinal, try binding.plan.evaluateWithExecution(execution, values));
             present[binding.ordinal] = true;
         }
     }
@@ -1476,6 +1672,13 @@ pub const Set = struct {
         defer alloc.free(present);
         try self.readValues(&execution, document.*, values, present, true);
         try self.applyValuesWithExecution(&execution, values, present, .apply_to_absent, null);
+        for (self.modifier_ordinals) |ordinal| {
+            if (self.generated_columns[ordinal]) continue;
+            const column = self.table.relational_columns[ordinal];
+            if (document.object.getPtr(column.name)) |cell| if (values[ordinal] == .numeric) {
+                cell.* = try numericJsonOutput(&execution, values[ordinal].numeric);
+            };
+        }
         for (self.bindings) |binding| {
             const name = self.table.relational_columns[binding.ordinal].name;
             if (!binding.generated and document.object.contains(name)) continue;
@@ -1521,7 +1724,9 @@ pub const Set = struct {
         for (self.table.relational_columns, self.read_columns, 0..) |column, read, ordinal| {
             if (!read) continue;
             const physical = row.ordinalForName(column.name) orelse continue;
-            if (row.table_schema.relational_columns[physical].column_type != column.column_type or row.table_schema.relational_columns[physical].sql_element_type != column.sql_element_type) return error.InvalidRelationalGeneratedValue;
+            if (row.table_schema.relational_columns[physical].column_type != column.column_type or
+                row.table_schema.relational_columns[physical].sql_element_type != column.sql_element_type or
+                !exact.TypeModifier.eql(row.table_schema.relational_columns[physical].numeric_modifier, column.numeric_modifier)) return error.InvalidRelationalGeneratedValue;
             const cell = (try row.findCell(physical)) orelse continue;
             present[ordinal] = true;
             if (cell.is_null) continue;
@@ -1542,12 +1747,16 @@ pub const Set = struct {
     }
 
     fn verifyValues(self: *const Set, execution: *Execution, values: []const Value, present: []const bool) !void {
-        const alloc = execution.alloc;
+        for (self.modifier_ordinals) |ordinal| {
+            if (!present[ordinal] or values[ordinal] == .null) continue;
+            if (values[ordinal] != .numeric) return error.InvalidRelationalGeneratedValue;
+            _ = try normalizeNumericBinding(execution, values[ordinal].numeric, self.table.relational_columns[ordinal].numeric_modifier.?, true);
+        }
         for (self.order) |index| {
             const binding = &self.bindings[index];
             if (!binding.generated) continue;
             if (!present[binding.ordinal]) return error.InvalidRelationalGeneratedValue;
-            const expected = try self.normalizeBinding(alloc, binding.ordinal, try binding.plan.evaluateWithExecution(execution, values));
+            const expected = try self.normalizeBinding(execution, binding.ordinal, try binding.plan.evaluateWithExecution(execution, values));
             const actual = values[binding.ordinal];
             const equal = if (expected == .numeric and actual == .numeric)
                 (valueOrderWithContext(expected, actual, false, &execution.numeric) catch |err| return executionFailure(err)) == .eq
@@ -1560,9 +1769,14 @@ pub const Set = struct {
     /// Stored expressions obey the target domain before dependent expressions
     /// execute. Restore evaluates the identical conversion, never raw float8
     /// arithmetic against an already-rounded float4 physical value.
-    fn normalizeBinding(self: *const Set, alloc: Allocator, ordinal: usize, value: Value) !Value {
+    fn normalizeBinding(self: *const Set, execution: *Execution, ordinal: usize, value: Value) !Value {
         if (value == .null) return value;
-        const kind = self.table.relational_columns[ordinal].sql_element_type orelse return value;
+        const column = self.table.relational_columns[ordinal];
+        if (column.numeric_modifier) |modifier| {
+            if (value != .numeric) return error.InvalidRelationalExpressionInput;
+            return normalizeNumericBinding(execution, value.numeric, modifier, false);
+        }
+        const kind = column.sql_element_type orelse return value;
         return switch (kind) {
             .int16, .int32, .int64 => .{ .integer = casts.checkedInteger(value.integer, kind) catch return error.InvalidRelationalExpressionInput },
             .float32 => .{ .number = casts.floatValue(f32, .{ .float = value.number }) catch return error.InvalidRelationalExpressionInput },
@@ -1570,7 +1784,7 @@ pub const Set = struct {
                 const uuid = @import("../common/uuid.zig");
                 const canonical = uuid.format(uuid.parse(value.string) catch return error.InvalidRelationalExpressionInput);
                 if (std.mem.eql(u8, value.string, &canonical)) break :blk value;
-                break :blk .{ .string = try alloc.dupe(u8, &canonical) };
+                break :blk .{ .string = try execution.alloc.dupe(u8, &canonical) };
             },
             else => value,
         };
@@ -1766,12 +1980,13 @@ fn entries(value: std.json.Value) ![]const std.json.Value {
 /// Identity for online schema admission. Adding, removing, or changing STORED
 /// generated semantics requires a row rewrite; declaration reordering does not.
 pub fn generatedFingerprint(set: ?*const Set) [32]u8 {
-    const Entry = struct { name: []const u8, fingerprint: [32]u8 };
+    const Entry = struct { name: []const u8, fingerprint: [32]u8, modifier: ?exact.TypeModifier };
     var entries_buffer: [256]Entry = undefined;
     var count: usize = 0;
     if (set) |expressions| for (expressions.bindings) |binding| {
         if (!binding.generated) continue;
-        entries_buffer[count] = .{ .name = expressions.table.relational_columns[binding.ordinal].name, .fingerprint = binding.plan.fingerprint };
+        const column = expressions.table.relational_columns[binding.ordinal];
+        entries_buffer[count] = .{ .name = column.name, .fingerprint = binding.plan.fingerprint, .modifier = column.numeric_modifier };
         count += 1;
     };
     const selected = entries_buffer[0..count];
@@ -1788,6 +2003,13 @@ pub fn generatedFingerprint(set: ?*const Set) [32]u8 {
         state.update(&size);
         state.update(entry.name);
         state.update(&entry.fingerprint);
+        if (entry.modifier) |modifier| {
+            state.update("SQL NUMERIC generated target modifier v1\x00");
+            var identity: [4]u8 = undefined;
+            std.mem.writeInt(u16, identity[0..2], modifier.precision, .little);
+            std.mem.writeInt(i16, identity[2..4], modifier.scale, .little);
+            state.update(&identity);
+        }
     }
     var result: [32]u8 = undefined;
     state.final(&result);

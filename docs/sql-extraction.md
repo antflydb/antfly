@@ -5797,3 +5797,41 @@ tests, 185 native relational-index tests and their server integration owner with
 failures or leaks. The focused native array regression and six API schema-cache tests
 also pass. Inventory integrity, control-catalog consistency, formatting and whitespace
 checks remain green.
+
+### NUMERIC assignment domains before defaults and generated dependencies
+
+The native expression set now coerces constrained base inputs before dependent
+expressions run, and constrains each default/generated result before it becomes
+another expression's input. One caller-owned execution carries sticky work,
+cancellation and retained/scratch-byte admission across every conversion. An
+immutable list of constrained dependency ordinals avoids introducing a schema-width
+scan on unconstrained expression evaluation. Already constrained canonical values
+are reused without coefficient or output allocation.
+
+Logical restore accepts equivalent display scales but rejects values that would
+change under assignment. It never repairs the stored input. Physical restore keeps
+the stricter canonical scale/precision boundary. Cold generated verification fences
+modifier identity before reading a mismatched historical cell. Generated-plan
+fingerprints bind target and referenced-column modifiers, while unrelated column
+changes and old unconstrained programs retain their existing identities.
+
+The new independent PostgreSQL 18 oracle verifies 11 real-table assignments,
+including omitted defaults, explicit NULL, positive/negative rounding, base and
+generated-target overflow, NaN and constrained infinities. PostgreSQL forbids
+generated-on-generated declarations; its observer uses equivalent explicit nested
+casts to check the native dependency topology, not to credit additional SQL syntax.
+Native tests also cover logical-restore forgery, every allocation failure, source
+identity fences, sticky cancellation/quota and 10,000 zero-allocation canonical
+binding reuses (approximately 1.4 ms in Debug, not an end-to-end latency benchmark).
+
+Public modifier activation remains guarded. The remaining prerequisites are
+normalized postimages across all mapped fields, generated public schema/DDL
+annotations, modifier-bearing schema-VM casts and integrated reopen/restore
+publication coverage. Original parity dispositions remain unchanged.
+
+Final-source validation passes all 46 schema-expression tests, 600 local SQL tests
+(three existing skips), 226 server SQL tests, 185 native relational-index tests and
+their server integration owner without failures or leaks. All four PostgreSQL value,
+modifier, descriptor and assignment observers reverify successfully. Inventory
+integrity remains 929 unresolved; control-catalog, formatting and whitespace checks
+pass without changing original case classifications.
