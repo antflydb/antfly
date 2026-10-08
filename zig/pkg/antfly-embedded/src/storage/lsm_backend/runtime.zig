@@ -103,6 +103,8 @@ const BlockPin = union(enum) {
     }
 };
 
+const ResultBlockRetention = enum { unknown, pinned, copy };
+
 const SourceBlockLease = union(enum) {
     none,
     owned: OwnedBytes,
@@ -939,7 +941,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         source_key_copies: []?[]u8 = &.{},
         source_blocks: []SourceBlockLease,
         source_run_leases: []?*RunSourceLease = &.{},
-        source_result_pinned: []bool = &.{},
+        source_result_retention: []ResultBlockRetention = &.{},
         source_block_indices: []?usize,
         source_table_indices: []?*const lsm_table_file.TableIndex,
         source_table_index_handles: []?cache_mod.Handle,
@@ -970,7 +972,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
             cursorStorageAdvance(?[]u8, &offset, source_count);
             cursorStorageAdvance(SourceBlockLease, &offset, source_count);
             cursorStorageAdvance(?*RunSourceLease, &offset, source_count);
-            cursorStorageAdvance(bool, &offset, source_count);
+            cursorStorageAdvance(ResultBlockRetention, &offset, source_count);
             cursorStorageAdvance(?usize, &offset, source_count);
             cursorStorageAdvance(?*const lsm_table_file.TableIndex, &offset, source_count);
             cursorStorageAdvance(?cache_mod.Handle, &offset, source_count);
@@ -1093,8 +1095,8 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
             @memset(source_blocks, .none);
             const source_run_leases = cursorStorageSlice(?*RunSourceLease, storage, &offset, source_count);
             @memset(source_run_leases, null);
-            const source_result_pinned = cursorStorageSlice(bool, storage, &offset, source_count);
-            @memset(source_result_pinned, false);
+            const source_result_retention = cursorStorageSlice(ResultBlockRetention, storage, &offset, source_count);
+            @memset(source_result_retention, .unknown);
             const source_block_indices = cursorStorageSlice(?usize, storage, &offset, source_count);
             @memset(source_block_indices, null);
             const source_table_indices = cursorStorageSlice(?*const lsm_table_file.TableIndex, storage, &offset, source_count);
@@ -1133,7 +1135,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
                 .source_key_copies = source_key_copies,
                 .source_blocks = source_blocks,
                 .source_run_leases = source_run_leases,
-                .source_result_pinned = source_result_pinned,
+                .source_result_retention = source_result_retention,
                 .source_block_indices = source_block_indices,
                 .source_table_indices = source_table_indices,
                 .source_table_index_handles = source_table_index_handles,
@@ -1165,7 +1167,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
                 self.allocator.free(self.source_block_indices);
                 self.allocator.free(self.source_blocks);
                 self.allocator.free(self.source_run_leases);
-                self.allocator.free(self.source_result_pinned);
+                self.allocator.free(self.source_result_retention);
                 self.allocator.free(self.source_entries);
                 self.allocator.free(self.source_key_copies);
                 self.allocator.free(self.positions);
@@ -1319,12 +1321,33 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
 
         pub fn retainCurrentValueForTxn(self: *@This(), held_blocks: *std.ArrayListUnmanaged(BlockPin)) !bool {
             const source_index = self.current_visible_source orelse return false;
-            if (self.source_result_pinned.len != 0 and self.source_result_pinned[source_index]) return true;
+            if (self.source_result_retention.len != 0) switch (self.source_result_retention[source_index]) {
+                .pinned => return true,
+                .copy => return false,
+                .unknown => {},
+            };
+            // Local cache payloads are not backed by the external cache's pin
+            // budget. Bound retained amplification per result owner, then let
+            // the caller copy values. The count cap also bounds this scan.
+            if (self.source_blocks[source_index] == .local) {
+                const max_bytes: usize = 1024 * 1024;
+                const max_blocks: usize = 64;
+                var bytes: usize = 0;
+                var count: usize = 0;
+                for (held_blocks.items) |pin| if (pin == .local) {
+                    bytes +|= pin.local.bytes.len;
+                    count += 1;
+                };
+                if (count >= max_blocks or self.source_blocks[source_index].local.bytes.len > max_bytes -| bytes) {
+                    if (self.source_result_retention.len != 0) self.source_result_retention[source_index] = .copy;
+                    return false;
+                }
+            }
             if (self.source_blocks[source_index].retainPin()) |retained_block| {
                 var retained = retained_block;
                 errdefer retained.release();
                 try held_blocks.append(self.backend.allocator, retained);
-                if (self.source_result_pinned.len != 0) self.source_result_pinned[source_index] = true;
+                if (self.source_result_retention.len != 0) self.source_result_retention[source_index] = .pinned;
                 return true;
             }
 
@@ -2083,7 +2106,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
 
         fn clearSourceBlock(self: *@This(), source_index: usize) void {
             self.source_blocks[source_index].release();
-            if (self.source_result_pinned.len != 0) self.source_result_pinned[source_index] = false;
+            if (self.source_result_retention.len != 0) self.source_result_retention[source_index] = .unknown;
             self.source_block_indices[source_index] = null;
         }
 
@@ -2503,7 +2526,7 @@ fn readManySortedFromCursor(
     if (keys.len == 0) return .{};
 
     // Pins belong to this result owner, even when a caller reuses its cursor.
-    if (comptime @hasField(@TypeOf(cursor.*), "source_result_pinned")) @memset(cursor.source_result_pinned, false);
+    if (comptime @hasField(@TypeOf(cursor.*), "source_result_retention")) @memset(cursor.source_result_retention, .unknown);
 
     var result: BatchCursorReadResult = .{};
     backend.recordPointGets(keys.len);
@@ -8959,4 +8982,28 @@ test "lsm local point result copies selected row instead of decoded block" {
     try std.testing.expectEqualStrings("docs", copied.entry.namespace_name.?);
     try std.testing.expectEqualStrings("key", copied.entry.key);
     try std.testing.expectEqualStrings("value", copied.entry.value);
+}
+
+test "lsm local result block retention bounds bytes and pin metadata" {
+    const a = std.testing.allocator;
+    var backend = @import("../lsm_backend.zig").Backend.init(a, .{});
+    defer backend.close();
+    const large = try SharedBytes.create(a, try a.alloc(u8, 2 * 1024 * 1024));
+    defer large.release();
+    const small = try SharedBytes.create(a, try a.alloc(u8, 1024));
+    defer small.release();
+    var blocks = [_]SourceBlockLease{.{ .local = large }};
+    var cursor: MergeCursor(@TypeOf(backend), State) = undefined;
+    cursor.backend = &backend;
+    cursor.current_visible_source = 0;
+    cursor.source_result_retention = &.{};
+    cursor.source_blocks = &blocks;
+    var held: std.ArrayListUnmanaged(BlockPin) = .empty;
+    defer releaseHeldBlocks(&held, a);
+    try std.testing.expect(!try cursor.retainCurrentValueForTxn(&held));
+    try std.testing.expectEqual(@as(usize, 0), held.items.len);
+    blocks[0] = .{ .local = small };
+    for (0..64) |_| try held.append(a, .{ .local = small.retain() });
+    try std.testing.expect(!try cursor.retainCurrentValueForTxn(&held));
+    try std.testing.expectEqual(@as(usize, 64), held.items.len);
 }

@@ -26765,6 +26765,7 @@ test "match_all sorted segment seek uses cursor seek within each segment" {
     var counter = NativeLoadCounter{
         .inner = .{ .snapshot = text_entry.persistent.snapshot() },
     };
+    defer counter.inner.deinit();
     const native_loader = NativeSortValueLoader{
         .ctx = &counter,
         .require_native = true,

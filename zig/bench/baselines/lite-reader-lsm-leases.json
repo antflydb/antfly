@@ -60,7 +60,10 @@
     "values": 2,
     "retained_block_pins": 1,
     "value_payload_copies": 0,
-    "results_survive_cache_eviction": true
+    "results_survive_cache_eviction": true,
+    "max_retained_payload_bytes_per_owner": 1048576,
+    "max_retained_local_blocks_per_owner": 64,
+    "excess_values_copied": true
   },
   "cold_source_singleflight": {
     "concurrent_native_reads": 16,
