@@ -585,13 +585,13 @@ pub const CompiledValidationPlan = struct {
                         else => return error.InvalidBatchRequest,
                     };
                 } else {
-                    const admitted = @import("../sql/array_wire.zig").normalize(column.kind, cell, preserve, .{ .values = .{
+                    _ = @import("../sql/array_wire.zig").normalize(column.kind, cell, preserve, .{ .context = &execution.numeric, .values = .{
                         .work = @intCast(@min(execution.numeric.remaining, std.math.maxInt(usize))),
                     } }) catch |err| {
                         if (err == error.SqlProgramLimitExceeded) return execution.limit();
+                        if (err == error.Canceled) return err;
                         return error.InvalidBatchRequest;
                     };
-                    try execution.charge(admitted.work);
                 }
                 continue;
             }
@@ -3055,6 +3055,43 @@ test "relational declarations SQL row normalization shares array admission and s
     try std.testing.expectError(error.RelationalExpressionBudgetExceeded, plan.normalizeSql(&execution, &document.value, true, .all));
     execution.numeric.remaining = 8 * 1024 * 1024;
     try std.testing.expectError(error.RelationalExpressionBudgetExceeded, plan.normalizeSql(&execution, &document.value, false, .base));
+}
+
+test "relational declarations SQL row array ingress preserves cancellation and atomic normalization" {
+    const a = std.testing.allocator;
+    const expressions = @import("relational_expression.zig");
+    for ([_]@import("../common/sql_builtin_type.zig").Type{ .float32, .numeric }) |kind| {
+        const columns = [_]CompiledValidationPlan.SqlColumn{
+            .{ .name = "base", .kind = kind, .is_array = true, .generated = false, .defaulted = false },
+        };
+        const plan: CompiledValidationPlan = .{ .sql_columns = &columns };
+        var document = try std.json.parseFromSlice(std.json.Value, a, if (kind == .numeric)
+            \\{"base":{"dimensions":[{"length":2,"lower_bound":-2}],"values":["1.25",null],"sql_nulls":[false,true]}}
+        else
+            \\{"base":{"dimensions":[{"length":2,"lower_bound":-2}],"values":[0.1,null],"sql_nulls":[false,true]}}
+        , .{});
+        defer document.deinit();
+        const before = try std.json.Stringify.valueAlloc(a, document.value, .{});
+        defer a.free(before);
+        const Cancel = struct {
+            fn poll(_: ?*anyopaque) !void {
+                return error.Canceled;
+            }
+        };
+        var bytes: usize = expressions.max_allocated_bytes;
+        var row = expressions.Execution.init(a, &bytes);
+        // Let the outer column admission succeed; cancellation must arrive
+        // from inside envelope inspection and keep its transport identity.
+        row.numeric.since_poll = 250;
+        row.numeric.checkpoint = Cancel.poll;
+        try std.testing.expectError(error.Canceled, plan.normalizeSql(&row, &document.value, false, .base));
+        const after = try std.json.Stringify.valueAlloc(a, document.value, .{});
+        defer a.free(after);
+        try std.testing.expectEqualStrings(before, after);
+        row.numeric.checkpoint = null;
+        row.numeric.remaining = 8 * 1024 * 1024;
+        try std.testing.expectError(error.Canceled, plan.normalizeSql(&row, &document.value, false, .base));
+    }
 }
 
 test "relational declarations exact NUMERIC composition parses once and shares the scalar work budget" {

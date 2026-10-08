@@ -24,7 +24,16 @@ const operators = @import("operators.zig");
 const MemoryBudget = @import("memory_budget.zig");
 const A = std.mem.Allocator;
 const Json = std.json.Value;
-pub const Options = struct { values: arrays.Limits = .{}, wire_bytes: usize = 8 * 1024 * 1024 };
+pub const Options = struct {
+    values: arrays.Limits = .{},
+    wire_bytes: usize = 8 * 1024 * 1024,
+    /// Optional enclosing row/program identity. Reported admission work is
+    /// already charged to this context and must not be charged again.
+    context: ?*@import("numeric_value.zig").Context = null,
+    fn limit(self: Options) anyerror {
+        return if (self.context) |context| context.limit() else error.SqlProgramLimitExceeded;
+    }
+};
 pub const Decoded = struct { value: arrays.Value, work: usize, wire_bytes: usize };
 pub const Admission = struct { work: usize, wire_bytes: usize };
 
@@ -74,13 +83,14 @@ const View = struct {
 /// All validation/admission precedes destination writes. Counting and emission
 /// share one view, avoiding per-element JSON serialization/parse allocations.
 fn encodedSize(value: arrays.Value, options: Options) !usize {
-    var work: arrays.Budget = .{ .remaining = options.values.work };
+    var work: arrays.Budget = .{ .remaining = options.values.work, .shared = options.context };
     const canonical = try arrays.Value.initWithBudget(value.element_type, value.dimensions, value.elements, options.values, &work);
     if (canonical.dimensions.len != value.dimensions.len) return error.InvalidSqlArrayShape;
     var size: std.Io.Writer.Discarding = .init(&.{});
     try std.json.Stringify.value(View{ .value = value }, .{}, &size.writer);
-    if (size.count > options.wire_bytes or size.count > work.remaining / 2) return error.SqlProgramLimitExceeded;
-    return std.math.cast(usize, size.count) orelse error.SqlProgramLimitExceeded;
+    if (size.count > options.wire_bytes or size.count > work.remaining / 2) return options.limit();
+    try work.consume(@as(usize, @intCast(size.count)) * 2);
+    return std.math.cast(usize, size.count) orelse options.limit();
 }
 
 pub fn encode(value: arrays.Value, writer: *std.Io.Writer, options: Options) !void {
@@ -104,6 +114,7 @@ pub fn encodeAlloc(a: A, value: arrays.Value, options: Options) ![]u8 {
 /// it on failure; all retained payloads and managed-array allocators are owned.
 pub fn toJsonLeaky(a: A, value: arrays.Value, options: Options) !Json {
     _ = try encodedSize(value, options);
+    var work: arrays.Budget = .{ .remaining = options.values.work, .shared = options.context };
     const axes = try a.alloc(Json, value.dimensions.len);
     for (value.dimensions, axes) |dimension, *axis| {
         var object: std.json.ObjectMap = .empty;
@@ -117,7 +128,9 @@ pub fn toJsonLeaky(a: A, value: arrays.Value, options: Options) !Json {
         flag.* = .{ .bool = cell.sql_null };
         out.* = if (cell.sql_null) .null else switch (value.element_type) {
             .numeric => numeric: {
-                var ctx: @import("numeric_value.zig").Context = .{ .alloc = a, .max_output_bytes = options.wire_bytes };
+                var ctx = work.numericContext(a);
+                defer work.remaining = @intCast(ctx.remaining);
+                ctx.max_output_bytes = @min(ctx.max_output_bytes, options.wire_bytes);
                 break :numeric .{ .string = try @import("numeric_value.zig").format(&ctx, cell.numeric.?.*) };
             },
             .int16, .int32, .int64 => .{ .string = try std.fmt.allocPrint(a, "{d}", .{cell.value.integer}) },
@@ -188,7 +201,8 @@ pub fn decodeLeaky(a: A, kind: arrays.ElementType, input: Json, options: Options
 
 /// Reports validation and materialization work for a shared invocation budget.
 pub fn decodeLeakyMeasured(a: A, kind: arrays.ElementType, input: Json, options: Options) !Decoded {
-    return decodeCells(true, a, kind, input, null, options);
+    return decodeCells(true, a, kind, input, null, options) catch |err|
+        if (err == error.SqlProgramLimitExceeded) options.limit() else err;
 }
 
 /// The cell/axis buffers are owned; text and JSONB payloads borrow the pinned
@@ -237,7 +251,7 @@ pub fn validate(kind: arrays.ElementType, input: Json, options: Options) !Admiss
         var budget: MemoryBudget = .{ .backing = std.heap.page_allocator, .limit = options.values.bytes };
         var arena = std.heap.ArenaAllocator.init(budget.allocator());
         defer arena.deinit();
-        const decoded = decodeLeakyMeasured(arena.allocator(), kind, input, options) catch |err| return quotaError(&budget, err);
+        const decoded = decodeLeakyMeasured(arena.allocator(), kind, input, options) catch |err| return quotaError(&budget, err, options);
         return .{ .work = decoded.work, .wire_bytes = decoded.wire_bytes };
     }
     return (try inspect(kind, input, options)).admission;
@@ -282,7 +296,7 @@ fn inspect(kind: arrays.ElementType, input: Json, options: Options) !Inspection 
     const axes = try arrayField(input.object, "dimensions");
     const values = try arrayField(input.object, "values");
     const nulls = try arrayField(input.object, "sql_nulls");
-    if (axes.len > 6 or values.len > options.values.elements) return error.SqlProgramLimitExceeded;
+    if (axes.len > 6 or values.len > options.values.elements) return options.limit();
     if (values.len != nulls.len) return error.InvalidSqlArrayShape;
     var dimensions: [6]arrays.Dimension = undefined;
     var count: usize = @intFromBool(axes.len != 0);
@@ -293,21 +307,21 @@ fn inspect(kind: arrays.ElementType, input: Json, options: Options) !Inspection 
         dimension.* = .{ .length = std.math.cast(u32, try dimensionInteger(length)) orelse return error.InvalidSqlArrayShape, .lower = std.math.cast(i32, try dimensionInteger(lower)) orelse return error.InvalidSqlArrayShape };
         // Empty arrays have rank zero. Refuse noncanonical zero-length axes.
         if (dimension.length == 0) return error.InvalidSqlArrayShape;
-        if (dimension.length > std.math.maxInt(i32) or @as(i64, dimension.lower) + dimension.length > std.math.maxInt(i32)) return error.SqlProgramLimitExceeded;
-        count = std.math.mul(usize, count, dimension.length) catch return error.SqlProgramLimitExceeded;
-        if (count > options.values.elements) return error.SqlProgramLimitExceeded;
+        if (dimension.length > std.math.maxInt(i32) or @as(i64, dimension.lower) + dimension.length > std.math.maxInt(i32)) return options.limit();
+        count = std.math.mul(usize, count, dimension.length) catch return options.limit();
+        if (count > options.values.elements) return options.limit();
     }
     if (count != values.len) return error.InvalidSqlArrayShape;
-    var work: arrays.Budget = .{ .remaining = options.values.work };
+    var work: arrays.Budget = .{ .remaining = options.values.work, .shared = options.context };
     var bytes: usize = @sizeOf(arrays.Value) + axes.len * @sizeOf(arrays.Dimension);
-    if (bytes > options.values.bytes) return error.SqlProgramLimitExceeded;
+    if (bytes > options.values.bytes) return options.limit();
     for (values, nulls) |raw, flag| {
         if (flag != .bool) return error.InvalidSqlArrayShape;
         if (kind == .numeric and !flag.bool) {
             if (raw != .string) return error.SqlTypeMismatch;
             try work.consume(raw.string.len);
-            bytes = std.math.add(usize, bytes, @sizeOf(arrays.Element) + @sizeOf(@import("numeric_value.zig").Value)) catch return error.SqlProgramLimitExceeded;
-            if (bytes > options.values.bytes) return error.SqlProgramLimitExceeded;
+            bytes = std.math.add(usize, bytes, @sizeOf(arrays.Element) + @sizeOf(@import("numeric_value.zig").Value)) catch return options.limit();
+            if (bytes > options.values.bytes) return options.limit();
             continue;
         }
         if (casts.integral(kind) or casts.floating(kind)) switch (raw) {
@@ -318,12 +332,12 @@ fn inspect(kind: arrays.ElementType, input: Json, options: Options) !Inspection 
         // Reuse the complete typed-array domain validator (JSONB recursion,
         // UTF-8, widths, NULL ownership and finite float4 representation).
         _ = try arrays.Value.initWithBudget(kind, &.{.{ .length = 1 }}, &.{cell}, options.values, &work);
-        bytes = std.math.add(usize, bytes, try operators.datumBytes(cell)) catch return error.SqlProgramLimitExceeded;
-        if (bytes > options.values.bytes) return error.SqlProgramLimitExceeded;
+        bytes = std.math.add(usize, bytes, try operators.datumBytes(cell)) catch return options.limit();
+        if (bytes > options.values.bytes) return options.limit();
     }
     var wire_size: std.Io.Writer.Discarding = .init(&.{});
     try std.json.Stringify.value(input, .{}, &wire_size.writer);
-    if (wire_size.count > options.wire_bytes or wire_size.count > work.remaining / 2) return error.SqlProgramLimitExceeded;
+    if (wire_size.count > options.wire_bytes or wire_size.count > work.remaining / 2) return options.limit();
     try work.consume(@as(usize, @intCast(wire_size.count)) * 2);
     return .{
         .dimensions = dimensions,
@@ -338,7 +352,7 @@ fn decodeCells(comptime own_payloads: bool, a: A, kind: arrays.ElementType, inpu
     const inspected = try inspect(kind, input, options);
     const cells = try a.alloc(arrays.Element, inspected.values.len);
     errdefer if (!own_payloads) a.free(cells);
-    var work: arrays.Budget = .{ .remaining = options.values.work - inspected.admission.work };
+    var work: arrays.Budget = .{ .remaining = options.values.work - inspected.admission.work, .shared = options.context };
     for (inspected.values, inspected.nulls, cells) |raw, flag, *cell| {
         if (kind == .numeric) {
             if (!own_payloads) return error.UnsupportedSqlShape;
@@ -363,16 +377,16 @@ fn decodeOwned(backing: A, kind: arrays.ElementType, input: Json, modifier: ?@im
     const budget = try backing.create(MemoryBudget);
     errdefer backing.destroy(budget);
     budget.* = .{ .backing = backing, .limit = options.values.bytes };
-    const arena = budget.allocator().create(std.heap.ArenaAllocator) catch |err| return quotaError(budget, err);
+    const arena = budget.allocator().create(std.heap.ArenaAllocator) catch |err| return quotaError(budget, err, options);
     errdefer budget.allocator().destroy(arena);
     arena.* = std.heap.ArenaAllocator.init(budget.allocator());
     errdefer arena.deinit();
-    const decoded = decodeCells(true, arena.allocator(), kind, input, modifier, options) catch |err| return quotaError(budget, err);
+    const decoded = decodeCells(true, arena.allocator(), kind, input, modifier, options) catch |err| return quotaError(budget, err, options);
     return .{ .arena = arena, .budget = budget, .value = decoded.value };
 }
 
-fn quotaError(budget: *MemoryBudget, err: anyerror) anyerror {
-    return if (err == error.OutOfMemory and budget.exhausted) error.SqlProgramLimitExceeded else err;
+fn quotaError(budget: *MemoryBudget, err: anyerror, options: Options) anyerror {
+    return if (err == error.SqlProgramLimitExceeded or (err == error.OutOfMemory and budget.exhausted)) options.limit() else err;
 }
 
 test "SQL NUMERIC array assignment matches PostgreSQL modifiers preserving bounds and NULLs" {
@@ -436,7 +450,8 @@ test "SQL NUMERIC array assignment shares its full work budget and unwinds alloc
     const modifier: @import("numeric_value.zig").TypeModifier = .{ .precision = 4, .scale = 2 };
     const Run = struct {
         fn run(alloc: A, input: Json) !void {
-            var value = try decodeBorrowedWithModifier(alloc, .numeric, input, .{ .precision = 4, .scale = 2 }, .{});
+            var parent: @import("numeric_value.zig").Context = .{ .alloc = alloc };
+            var value = try decodeBorrowedWithModifier(alloc, .numeric, input, .{ .precision = 4, .scale = 2 }, .{ .context = &parent });
             defer value.deinit();
             try std.testing.expectEqual(@as(usize, 3), value.value.elements.len);
             try std.testing.expect(value.value.elements[1].sql_null);
@@ -502,6 +517,12 @@ test "SQL array envelope matches PostgreSQL binary values without losing bounds 
         const measured = try decodeLeakyMeasured(arena_view.allocator(), entry.element_type, parsed.value, .{});
         try std.testing.expectEqual(admission.work, measured.work);
         try std.testing.expectEqual(admission.wire_bytes, measured.wire_bytes);
+        var parent: @import("numeric_value.zig").Context = .{ .alloc = arena_view.allocator() };
+        const before = parent.remaining;
+        const shared = try decodeLeakyMeasured(arena_view.allocator(), entry.element_type, parsed.value, .{ .context = &parent });
+        try std.testing.expectEqual(before - parent.remaining, shared.work);
+        try std.testing.expectEqual(measured.work, shared.work);
+        try std.testing.expectEqual(measured.wire_bytes, shared.wire_bytes);
         var binary = std.Io.Writer.Allocating.init(a);
         defer binary.deinit();
         try @import("array_binary.zig").encode(decoded.value, &binary.writer, .{});
@@ -619,6 +640,48 @@ test "SQL array envelope enforces element domains and admission before payload o
     try std.testing.expectError(error.SqlProgramLimitExceeded, decodeLeaky(failing.allocator(), .int64, input.value, .{ .values = .{ .bytes = 0 } }));
     try std.testing.expectError(error.SqlProgramLimitExceeded, decodeLeaky(failing.allocator(), .int64, input.value, .{ .wire_bytes = 1 }));
     try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+}
+
+test "SQL array envelope shared cancellation remains atomic and sticky" {
+    const a = std.testing.allocator;
+    var values: [1000]?f64 = @splat(0.1);
+    values[1] = null;
+    var nulls: [1000]bool = @splat(false);
+    nulls[1] = true;
+    const encoded = try std.json.Stringify.valueAlloc(a, .{
+        .dimensions = [_]struct { length: usize, lower_bound: i32 }{.{ .length = 1000, .lower_bound = -99 }},
+        .values = &values,
+        .sql_nulls = &nulls,
+    }, .{});
+    defer a.free(encoded);
+    var parsed = try std.json.parseFromSlice(Json, a, encoded, .{});
+    defer parsed.deinit();
+    const Cancel = struct {
+        calls: usize = 0,
+        fn poll(ptr: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            self.calls += 1;
+            if (self.calls == 2) return error.Canceled;
+        }
+    };
+    var cancel: Cancel = .{};
+    var parent: @import("numeric_value.zig").Context = .{ .alloc = a, .checkpoint = Cancel.poll, .ptr = &cancel };
+    try std.testing.expectError(error.Canceled, normalize(.float32, &parsed.value, false, .{ .context = &parent }));
+    try std.testing.expectEqual(@as(usize, 2), cancel.calls);
+    for (parsed.value.object.get("values").?.array.items, 0..) |cell, i| {
+        if (i == 1) try std.testing.expect(cell == .null) else try std.testing.expectEqual(@as(f64, 0.1), cell.float);
+    }
+    parent.checkpoint = null;
+    parent.remaining = 8 * 1024 * 1024;
+    try std.testing.expectError(error.Canceled, normalize(.float32, &parsed.value, false, .{ .context = &parent }));
+    parent = .{ .alloc = a };
+    const before = parent.remaining;
+    const admitted = try normalize(.float32, &parsed.value, false, .{ .context = &parent });
+    try std.testing.expectEqual(before - parent.remaining, admitted.work);
+    try std.testing.expectEqual(@as(f64, @as(f32, 0.1)), parsed.value.object.get("values").?.array.items[0].float);
+    parent = .{ .alloc = a };
+    try std.testing.expectError(error.SqlProgramLimitExceeded, normalize(.float32, &parsed.value, true, .{ .context = &parent, .wire_bytes = 1 }));
+    try std.testing.expectError(error.SqlProgramLimitExceeded, normalize(.float32, &parsed.value, true, .{ .context = &parent }));
 }
 
 test "SQL array parsed normalization is atomic and preserves shape and NULL provenance" {

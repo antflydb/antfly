@@ -202,12 +202,11 @@ pub fn normalizeNumericArrayJson(execution: *Execution, input: *std.json.Value, 
     const wire = @import("../sql/array_wire.zig");
     // Borrowed input has its existing wire/domain bounds; only actual scratch
     // and owned output consume the preparation allocation allowance.
-    const inspected = wire.inspectNumericEnvelope(input.*, .{ .values = .{
+    const inspected = wire.inspectNumericEnvelope(input.*, .{ .context = &execution.numeric, .values = .{
         .work = @intCast(@min(execution.numeric.remaining, std.math.maxInt(usize))),
     } }) catch |err| {
         return if (err == error.SqlProgramLimitExceeded) executionFailure(execution.numeric.limit()) else err;
     };
-    execution.numeric.charge(inspected.admission.work) catch |err| return executionFailure(err);
     const alloc = execution.alloc;
     const replacement: ?[]std.json.Value = if (preserve) null else blk: {
         const size = std.math.mul(usize, inspected.values.len, @sizeOf(std.json.Value)) catch return executionFailure(execution.numeric.limit());

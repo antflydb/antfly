@@ -6239,9 +6239,9 @@ while retaining the array's local cap and inherited coefficient/input limits.
 The parent owns cancellation polling and sticky failures, including exhaustion
 of a child cap. A 1,000-limb regression checks all three operations for exact
 single-charge accounting, mid-coefficient cancellation, sticky quota failure,
-inherited coefficient admission and zero allocations. Scalar NUMERIC ingress
-constructors and other codec owners still need separate shared-context wiring;
-this does not claim complete row preparation uses one execution identity yet.
+inherited coefficient admission and zero allocations. This checkpoint did not
+yet wire scalar NUMERIC ingress or other codec owners; the ingress work below
+connects those constructors and parsed array envelopes separately.
 
 This is the comparison prerequisite for the durable typed-array VM, not public
 array-expression activation. The VM's value domain, generated/default bindings,
@@ -6256,3 +6256,40 @@ or leaks. The seven focused comparison/admission tests, independently regenerate
 36-case PostgreSQL fixture, inventory integrity, generated control catalog,
 formatting, Ruff and whitespace checks pass. Dispositions remain 448 implemented,
 136 rejected, 73 superseded and 929 unresolved.
+
+### Shared SQL array ingress execution
+
+NUMERIC text and PostgreSQL binary constructors now borrow the caller's exact
+execution identity while retaining local work limits and inherited input,
+output and coefficient limits. Parsed array-envelope inspection and decoding
+can share that identity too. Reported admission work is already charged when a
+context is supplied; native row normalization no longer charges it again after
+the walk. NUMERIC and other array columns therefore poll cancellation during
+envelope admission, and native row preparation preserves cancellation rather
+than reclassifying it as invalid user data.
+
+Envelope shape, wire, byte and work-cap failures are sticky in the enclosing
+context. Ordinary allocator failures keep their allocator error identity.
+Owned NUMERIC modifier decoding remains unpublished and unwinds under allocation
+faults. Direct NUMERIC JSON materialization also borrows its enclosing context
+and respects inherited output limits.
+
+Regressions cover 2,048-digit text/binary ingress, exact single-charge accounting,
+mid-coefficient cancellation, sticky exhaustion and inherited input/coefficient
+limits. The existing PostgreSQL array-envelope corpus now checks measured work
+against the shared owner's counter. A 1,000-element float4 normalization test
+checks cancellation before any rewrite; native numeric/float4 row normalization
+checks preserve the original envelope and cancellation identity.
+
+The durable VM value domain, public array-expression contract, array DDL and
+mounted parity activation remain unfinished. Storage/binary-array codec owners
+still need explicit shared-context integration; this is not a claim that every
+array path is time-sliced or that row preparation parses each NUMERIC only once.
+No original inventory disposition changes.
+
+Final-source validation passes 610 local and 226 server SQL tests, 61 local and
+5 server schema-expression tests, and 188 local plus 1 server native integrity
+tests: 1,091 passing tests, three existing SQL skips, no failures or leaks.
+All nine focused ingress tests, generated control catalog, inventory integrity,
+formatting and whitespace checks pass. The larger typed-array VM activation is
+not credited by these ingress checks.

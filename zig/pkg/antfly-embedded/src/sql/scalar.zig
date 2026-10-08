@@ -65,7 +65,7 @@ pub fn numericTextLeaky(a: Allocator, text: []const u8, work: *arrays.Budget) !D
 /// The caller discards its bounded region on failure, including owned limbs.
 pub fn numericTextWithModifierLeaky(a: Allocator, text: []const u8, modifier: ?@import("numeric_value.zig").TypeModifier, work: *arrays.Budget) !Datum {
     const exact = @import("numeric_value.zig");
-    var ctx: exact.Context = .{ .alloc = a, .remaining = work.remaining };
+    var ctx = work.numericContext(a);
     defer work.remaining = @intCast(ctx.remaining);
     var parsed = try exact.parse(&ctx, text);
     errdefer parsed.deinit();
@@ -83,13 +83,74 @@ pub fn numericTextWithModifierLeaky(a: Allocator, text: []const u8, modifier: ?@
 }
 pub fn numericBinaryLeaky(a: Allocator, bytes: []const u8, work: *arrays.Budget) !Datum {
     const exact = @import("numeric_value.zig");
-    var ctx: exact.Context = .{ .alloc = a, .remaining = work.remaining };
+    var ctx = work.numericContext(a);
     defer work.remaining = @intCast(ctx.remaining);
     var parsed = try @import("numeric_binary.zig").decode(&ctx, bytes, .{});
     errdefer parsed.deinit();
     const value = try a.create(exact.Value);
     value.* = parsed.value;
     return Datum.typedNumeric(value);
+}
+
+test "SQL NUMERIC ingress constructors retain shared cancellation quotas and limits" {
+    const exact = @import("numeric_value.zig");
+    const a = std.testing.allocator;
+    const text: [2048]u8 = @splat('1');
+    var reference: exact.Context = .{ .alloc = a };
+    var parsed = try exact.parse(&reference, &text);
+    defer parsed.deinit();
+    const bytes = try @import("numeric_binary.zig").encodeAlloc(&reference, parsed.value);
+    defer a.free(bytes);
+    const Cancel = struct {
+        calls: usize = 0,
+        fn poll(ptr: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            self.calls += 1;
+            if (self.calls == 2) return error.Canceled;
+        }
+    };
+    for ([_]bool{ false, true }) |binary_input| {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+        var parent: exact.Context = .{ .alloc = alloc };
+        var work: arrays.Budget = .{ .shared = &parent };
+        const parent_before = parent.remaining;
+        const local_before = work.remaining;
+        const value = if (binary_input) try numericBinaryLeaky(alloc, bytes, &work) else try numericTextLeaky(alloc, &text, &work);
+        try std.testing.expectEqual(local_before - work.remaining, parent_before - parent.remaining);
+        try std.testing.expectEqual(std.math.Order.eq, try exact.order(&reference, parsed.value, value.numeric.?.*));
+
+        var cancel: Cancel = .{};
+        parent = .{ .alloc = alloc, .checkpoint = Cancel.poll, .ptr = &cancel };
+        work = .{ .shared = &parent };
+        if (binary_input) {
+            try std.testing.expectError(error.Canceled, numericBinaryLeaky(alloc, bytes, &work));
+        } else try std.testing.expectError(error.Canceled, numericTextLeaky(alloc, &text, &work));
+        try std.testing.expectEqual(@as(usize, 2), cancel.calls);
+        parent.checkpoint = null;
+        work.remaining = 1_048_576;
+        try std.testing.expectError(error.Canceled, numericTextLeaky(alloc, "1", &work));
+
+        parent = .{ .alloc = alloc };
+        work = .{ .shared = &parent, .remaining = 128 };
+        if (binary_input) {
+            try std.testing.expectError(error.SqlProgramLimitExceeded, numericBinaryLeaky(alloc, bytes, &work));
+        } else try std.testing.expectError(error.SqlProgramLimitExceeded, numericTextLeaky(alloc, &text, &work));
+        work.remaining = 1_048_576;
+        try std.testing.expectError(error.SqlProgramLimitExceeded, numericTextLeaky(alloc, "1", &work));
+
+        parent = .{ .alloc = alloc, .max_input_bytes = 8 };
+        work = .{ .shared = &parent };
+        if (binary_input) {
+            try std.testing.expectError(error.SqlProgramLimitExceeded, numericBinaryLeaky(alloc, bytes, &work));
+        } else try std.testing.expectError(error.SqlProgramLimitExceeded, numericTextLeaky(alloc, &text, &work));
+        parent = .{ .alloc = alloc, .max_groups = 1 };
+        work = .{ .shared = &parent };
+        if (binary_input) {
+            try std.testing.expectError(error.SqlProgramLimitExceeded, numericBinaryLeaky(alloc, bytes, &work));
+        } else try std.testing.expectError(error.SqlProgramLimitExceeded, numericTextLeaky(alloc, &text, &work));
+    }
 }
 
 pub const NumericJsonText = struct {
