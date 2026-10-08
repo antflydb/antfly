@@ -555,8 +555,12 @@ def test_stateful_graph_metrics_publish_without_maintenance_configuration(
             "rank"
         ]
         publication = result["status"]["last_event"]
+        # Reads can see verified scores while the build is still cleaning up.
+        # Wait for completion before testing a distinct forced rebuild; an
+        # action during an active build is intentionally coalesced with it.
         if (
-            publication["kind"] != "publish"
+            result["status"]["state"] != "fresh"
+            or publication["kind"] != "publish"
             or publication["sequence"] <= after_publication
         ):
             return None
@@ -582,7 +586,11 @@ def test_stateful_graph_metrics_publish_without_maintenance_configuration(
     publication = result["status"]["last_event"]["sequence"]
     stateful_api.post(f"{action_path}:rebuild", {})
     rebuilt = wait_until(lambda: published(publication), timeout_s=30.0, interval_s=0.1)
-    assert rebuilt is not None, stateful_api.debug_logs()
+    assert rebuilt is not None, (
+        f"{observed}\n"
+        f"{stateful_api.get(f'/tables/{table}/indexes/graph_idx')}\n"
+        f"{stateful_api.debug_logs()}"
+    )
     reranked = stateful_api.query_table(
         table,
         {
