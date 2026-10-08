@@ -85,7 +85,10 @@ pub const ExecutionScratch = struct {
     }
 
     pub fn failure(self: *ExecutionScratch, err: anyerror) anyerror {
-        return if (err == error.OutOfMemory and self.memory.isExhausted()) self.execution.limit() else err;
+        // Borrowed comparisons can exhaust logical byte admission without
+        // allocating. Keep their failure as sticky as allocator admission.
+        if (err == error.RelationalExpressionBudgetExceeded or (err == error.OutOfMemory and self.memory.isExhausted())) return self.execution.limit();
+        return executionFailure(err);
     }
 };
 
@@ -158,7 +161,8 @@ const NumericScratch = struct {
     }
 };
 
-fn numericJson(execution: *Execution, input: std.json.Value) !Value {
+pub fn numericJson(execution: *Execution, input: std.json.Value) !Value {
+    try execution.charge(0);
     if (input == .null) return .null;
     var scratch: NumericScratch = undefined;
     scratch.init(execution);
@@ -2604,6 +2608,98 @@ fn checkExpressionAllocationFailure(alloc: Allocator) !void {
     const row = try std.json.parseFromSlice(std.json.Value, alloc, "{\"x\":2}", .{});
     defer row.deinit();
     try std.testing.expectEqual(@as(?usize, null), try compiled.checks.?.firstViolationJson(alloc, row.value));
+}
+
+test "relational declarations mixed CHECKs share JSON and ordinal row quotas with sticky activation failures" {
+    const Run = struct {
+        fn run(alloc: Allocator) !void {
+            const impl = @import("table_schema_impl.zig");
+            var table = try impl.parseSchema(alloc,
+                \\{"version":1,"storage_mode":"relational","default_type":"row","checks":[{"name":"positive","column":"n","op":"gte","value":0},{"name":"label","column":"s","op":"eq","value":"keep"},{"name":"small","expression":{"op":"lt","args":[{"op":"column","column":"n"},{"op":"literal","type":"numeric","value":"10"}]}}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"n":{"type":["number","null"],"x-antfly-sql-type":"numeric"},"s":{"type":"string"}},"additionalProperties":false}}}}
+            );
+            defer table.deinit(alloc);
+            var compiled = try impl.CompiledValidationPlan.init(alloc, table);
+            defer compiled.deinit(alloc);
+            const set = compiled.checks.?;
+            const json = try std.json.parseFromSlice(std.json.Value, alloc, "{\"n\":1.25,\"s\":\"keep\"}", .{ .parse_numbers = false });
+            defer json.deinit();
+            const number = try @import("../sql/numeric_storage.zig").encodeJsonAlloc(alloc, json.value.object.get("n").?);
+            defer alloc.free(number);
+            var cells: [2]codec.Cell = undefined;
+            const n = set.layout.ordinalForName(set.table.relational_columns, "n").?;
+            const s = set.layout.ordinalForName(set.table.relational_columns, "s").?;
+            cells[n] = .{ .ordinal = @intCast(n), .path = "n", .value_type = .bytes_val, .is_numeric = true, .value = .{ .bytes_val = number } };
+            cells[s] = .{ .ordinal = @intCast(s), .path = "s", .value_type = .bytes_val, .value = .{ .bytes_val = "keep" } };
+            const bytes = try codec.serializeOrdinal(alloc, set.table.version, set.table.relational_columns, &cells, @splat(0));
+            defer alloc.free(bytes);
+            const row = try codec.ordinalRowView(bytes, set.table, &set.layout);
+            for ([_]bool{ false, true }) |cold| {
+                var budget: usize = max_allocated_bytes;
+                var execution = Execution.init(alloc, &budget);
+                const result = if (cold) try set.firstViolationRowWithExecution(&execution, row) else try set.firstViolationJsonWithExecution(&execution, json.value);
+                try std.testing.expectEqual(@as(?usize, null), result);
+                const used = 8 * 1024 * 1024 - execution.numeric.remaining;
+                try std.testing.expect(used > 0 and budget < max_allocated_bytes);
+                try std.testing.expectEqual(alloc.ptr, execution.alloc.ptr);
+                try std.testing.expectEqual(alloc.vtable, execution.alloc.vtable);
+                execution = Execution.init(alloc, &budget);
+                execution.numeric.remaining = used - 1;
+                const limited = if (cold) set.firstViolationRowWithExecution(&execution, row) else set.firstViolationJsonWithExecution(&execution, json.value);
+                if (limited) |_| return error.TestExpectedError else |err| {
+                    if (err == error.OutOfMemory) return err;
+                    try std.testing.expectEqual(error.RelationalExpressionBudgetExceeded, err);
+                }
+                execution.numeric.remaining = 8 * 1024 * 1024;
+                const activation = if (cold) set.firstFailureRowWithExecution(&execution, row) else set.firstFailureJsonWithExecution(&execution, json.value);
+                try std.testing.expectError(error.RelationalExpressionBudgetExceeded, activation);
+                budget = 1;
+                execution = Execution.init(alloc, &budget);
+                const tiny = if (cold) set.firstViolationRowWithExecution(&execution, row) else set.firstViolationJsonWithExecution(&execution, json.value);
+                try std.testing.expectError(error.RelationalExpressionBudgetExceeded, tiny);
+                const Cancel = struct {
+                    fn poll(_: ?*anyopaque) anyerror!void {
+                        return error.Canceled;
+                    }
+                };
+                budget = max_allocated_bytes;
+                execution = Execution.init(alloc, &budget);
+                execution.numeric.checkpoint = Cancel.poll;
+                const canceled = if (cold) set.firstFailureRowWithExecution(&execution, row) else set.firstFailureJsonWithExecution(&execution, json.value);
+                try std.testing.expectError(error.Canceled, canceled);
+                execution.numeric.checkpoint = null;
+                try std.testing.expectError(error.Canceled, execution.charge(0));
+            }
+        }
+    };
+    try Run.run(std.testing.allocator);
+    var stable = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(stable.allocator(), Run.run, .{});
+}
+
+test "relational declarations borrowed CHECK byte admission remains sticky without allocations" {
+    const alloc = std.testing.allocator;
+    const impl = @import("table_schema_impl.zig");
+    var table = try impl.parseSchema(alloc,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","checks":[{"name":"equal","expression":{"op":"eq","args":[{"op":"literal","type":"string","value":"0123456789"},{"op":"literal","type":"string","value":"0123456789"}]}}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"s":{"type":"string"}},"additionalProperties":false}}}}
+    );
+    defer table.deinit(alloc);
+    var compiled = try impl.CompiledValidationPlan.init(alloc, table);
+    defer compiled.deinit(alloc);
+    const input: std.json.Value = .{ .object = .empty };
+    // Both operands are immutable plan literals. There is no runtime arena
+    // allocation whose failure could accidentally establish stickiness.
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    var budget: usize = 20;
+    var execution = Execution.init(failing.allocator(), &budget);
+    try std.testing.expectEqual(@as(?usize, null), try compiled.checks.?.firstViolationJsonWithExecution(&execution, input));
+    try std.testing.expectEqual(@as(usize, 0), budget);
+    budget = 19;
+    execution = Execution.init(failing.allocator(), &budget);
+    try std.testing.expectError(error.RelationalExpressionBudgetExceeded, compiled.checks.?.firstFailureJsonWithExecution(&execution, input));
+    budget = max_allocated_bytes;
+    execution.numeric.remaining = 8 * 1024 * 1024;
+    try std.testing.expectError(error.RelationalExpressionBudgetExceeded, compiled.checks.?.firstViolationJsonWithExecution(&execution, input));
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
 }
 
 test "relational declarations CHECK expressions release every allocation failure" {

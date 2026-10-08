@@ -45,10 +45,13 @@ pub const Value = union(enum) {
 };
 
 const NumericKeys = @import("../../common/sql_numeric_key_layout.zig");
+const NumericContext = @import("../../sql/numeric_value.zig").Context;
 const NumericBudget = struct {
     remaining: u64 = @import("relational_index_limits.zig").max_stored_key_bytes,
+    shared: ?*NumericContext = null,
     pub fn charge(self: *@This(), count: u64) !void {
         if (count > self.remaining) return self.limit();
+        if (self.shared) |context| try context.charge(count);
         self.remaining -= count;
     }
     pub fn limit(_: *@This()) anyerror {
@@ -299,13 +302,19 @@ pub const TuplePlan = struct {
     /// physical bytes. This also supplies the equality representation for
     /// composite constraint claims and FK probes.
     pub fn appendValues(self: TuplePlan, alloc: Allocator, out: *std.ArrayList(u8), values: []const Value) !bool {
+        return self.appendValuesWithContext(alloc, out, values, null);
+    }
+
+    /// Preserve per-key size limits while charging aggregate work to the row.
+    /// Failure leaves the caller's previously encoded prefix unchanged.
+    pub fn appendValuesWithContext(self: TuplePlan, alloc: Allocator, out: *std.ArrayList(u8), values: []const Value, context: ?*NumericContext) !bool {
         if (values.len > self.keys.len) return error.InvalidRelationalIndexBound;
         const start = out.items.len;
         errdefer out.shrinkRetainingCapacity(start);
         var has_null = false;
         for (values, self.keys[0..values.len]) |value, key| {
             if (value == .null) has_null = true;
-            try appendValue(alloc, out, start, key, value);
+            try appendValueWithContext(alloc, out, start, key, value, context);
         }
         return has_null;
     }
@@ -528,7 +537,12 @@ fn vectorValue(vector: @import("../rowsource/types.zig").ColumnVector, kind: sch
 }
 
 fn appendValue(alloc: Allocator, out: *std.ArrayList(u8), tuple_start: usize, key: BoundKey, value: Value) !void {
-    var numeric_budget: NumericBudget = .{};
+    return appendValueWithContext(alloc, out, tuple_start, key, value, null);
+}
+
+fn appendValueWithContext(alloc: Allocator, out: *std.ArrayList(u8), tuple_start: usize, key: BoundKey, value: Value, context: ?*NumericContext) !void {
+    if (context) |work| try work.charge(1);
+    var numeric_budget: NumericBudget = .{ .shared = context };
     var numeric_source: ?NumericKeys.Source = null;
     const encoded_size: usize = switch (value) {
         .numeric => |bytes| blk: {
@@ -539,12 +553,14 @@ fn appendValue(alloc: Allocator, out: *std.ArrayList(u8), tuple_start: usize, ke
         .boolean => 2,
         .string, .blob => |bytes| blk: {
             try @import("relational_index_limits.zig").admit(bytes.len);
+            if (context) |work| try work.charge(bytes.len);
             break :blk 3 + bytes.len + std.mem.count(u8, bytes, "\x00");
         },
         .datetime => 17,
         else => 9,
     };
     try @import("relational_index_limits.zig").admit(out.items.len - tuple_start +| encoded_size);
+    if (value != .numeric) if (context) |work| try work.charge(encoded_size);
     if (value == .null) {
         try out.append(alloc, if (key.nulls_first) @as(u8, 0) else 0xff);
         return;
@@ -1036,6 +1052,44 @@ test "external lake relational index signed datetime bounds preserve epoch order
     }
 }
 
+test "relational index system shared tuple admission preserves prefixes on late quota and cancellation" {
+    const a = std.testing.allocator;
+    const table: schema.TableSchema = .{ .version = 1, .storage_mode = .relational, .relational_columns = &.{
+        .{ .name = "tenant", .path = "tenant", .column_type = .integer },
+        .{ .name = "n", .path = "n", .column_type = .numeric, .sql_element_type = .numeric },
+    } };
+    var layout = try rows.PhysicalLayout.init(a, table);
+    defer layout.deinit();
+    var plan = try TuplePlan.init(a, table, &layout, &.{ .{ .column = "tenant" }, .{ .column = "n" } });
+    defer plan.deinit();
+    const number = try @import("../../sql/numeric_storage.zig").encodeJsonAlloc(a, .{ .string = "12345.6789" });
+    defer a.free(number);
+    const values = [_]Value{ .{ .integer = 7 }, .{ .numeric = number } };
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    try out.appendSlice(a, "keep");
+    var context: NumericContext = .{ .alloc = a };
+    try std.testing.expect(!try plan.appendValuesWithContext(a, &out, &values, &context));
+    const work = 8 * 1024 * 1024 - context.remaining;
+    try std.testing.expect(work > 1);
+    out.shrinkRetainingCapacity(4);
+    context = .{ .alloc = a, .remaining = work - 1 };
+    try std.testing.expectError(error.SqlProgramLimitExceeded, plan.appendValuesWithContext(a, &out, &values, &context));
+    try std.testing.expectEqualStrings("keep", out.items);
+    context.remaining = 8 * 1024 * 1024;
+    try std.testing.expectError(error.SqlProgramLimitExceeded, plan.appendValuesWithContext(a, &out, &values, &context));
+    const Cancel = struct {
+        fn poll(_: ?*anyopaque) anyerror!void {
+            return error.Canceled;
+        }
+    };
+    context = .{ .alloc = a, .checkpoint = Cancel.poll };
+    try std.testing.expectError(error.Canceled, plan.appendValuesWithContext(a, &out, &values, &context));
+    try std.testing.expectEqualStrings("keep", out.items);
+    context.checkpoint = null;
+    try std.testing.expectError(error.Canceled, plan.appendValuesWithContext(a, &out, &values, &context));
+}
+
 test "relational index system NUMERIC composite tuples match PostgreSQL ranks and borrow canonical coefficients" {
     const a = std.testing.allocator;
     const fixture = try std.json.parseFromSlice(struct {
@@ -1074,6 +1128,12 @@ test "relational index system NUMERIC composite tuples match PostgreSQL ranks an
             try out.appendSlice(a, "row suffix");
             try std.testing.expectEqual(tuple_len, try plan.prefixLen(out.items));
             key.* = try scratch.dupe(u8, out.items[0..tuple_len]);
+            out.clearRetainingCapacity();
+            var shared: NumericContext = .{ .alloc = failing.allocator() };
+            try std.testing.expect(!try plan.appendValuesWithContext(failing.allocator(), &out, &.{ .{ .integer = 7 }, .{ .numeric = wire } }, &shared));
+            try std.testing.expectEqualSlices(u8, key.*, out.items);
+            try std.testing.expect(shared.remaining < 8 * 1024 * 1024);
+            try std.testing.expectEqual(@as(usize, 0), failing.alloc_index);
         }
         for (fixture.value.entries, keys) |left, left_key| for (fixture.value.entries, keys) |right, right_key| {
             const expected = if (descending) std.math.order(right.rank, left.rank) else std.math.order(left.rank, right.rank);

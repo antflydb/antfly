@@ -5998,3 +5998,48 @@ Final-source regression gates pass 601 local SQL tests (three existing skips),
 integration test, without failures or leaks. Control-catalog, inventory integrity,
 formatting and whitespace checks pass. The changes are committed locally, not
 pushed; the unrelated HTTP discovery edit is preserved.
+
+### Shared CHECK admission for expressions and legacy comparisons
+
+Logical row validation now carries the preparation execution context through
+CHECK evaluation as well as normalization, generated verification and recursive
+NUMERIC predicates. Recursive numeric scratch is released and charged before
+CHECK starts, so the latter borrows only the remaining row allowance. Standalone
+JSON and ordinal-row CHECK entry points retain convenience wrappers; shared
+entry points let callers preserve work/cancellation identity across operations.
+Both expression and legacy column CHECKs use bounded unpublished scratch.
+
+Legacy NUMERIC operands parse under the shared exact context. Tuple encoders can
+also borrow that context, charging canonical NUMERIC inspection/encoding and
+non-numeric input/output scans while retaining independent per-key size limits.
+Comparison scans consume the same allowance. Existing unscoped tuple callers
+keep their byte representation and per-key limits; this does not change index
+semantics or fingerprints. Failed shared tuple encoding restores the caller's
+previous output prefix, including a quota failure after part of the tuple was
+written. Work/cancellation failures remain errors during constraint activation,
+not invalid-row diagnostics or fresh allowances.
+
+All 58 focused tests pass without failures or leaks. New tests cover mixed
+legacy NUMERIC/text and expression CHECKs on JSON and ordinal rows, sticky
+quota/cancellation, tiny byte allowances, allocation-fault cleanup and the whole
+recursive-constraint/CHECK pipeline sharing one budget. Borrowed literal text
+comparisons are tested with an allocator rejecting every allocation: exactly
+20 bytes of comparison allowance succeeds, 19 fails, and refilling the same
+execution does not clear its failure. Activation propagates byte exhaustion
+instead of persisting it as a bad-row finding; prior plans may have consumed
+the shared allowance independently of the current row. PostgreSQL revalidates
+all 235 NUMERIC dense-rank fixtures. Inventory classifications are unchanged at
+929 unresolved.
+
+Remaining: physical encoding/field-local restore context integration and public
+NUMERIC column annotation/catalog/DDL activation. Legacy column CHECK comparison
+domains also still inherit index-key size restrictions; decouple SQL scalar
+comparison from persistent key encoding before claiming full PostgreSQL domain
+parity. The shared admission work does not discharge that separate limitation.
+
+Validation also passes 601 local SQL tests (three existing skips), 226 server
+SQL tests, 186 native relational-index tests and their server integration test,
+without failures or leaks. The final borrowed-comparison classification fix is
+covered by the 58-test focused rerun and a fresh complete SQL rerun. Inventory,
+control-catalog, formatting and whitespace checks pass. Changes are committed
+locally only; the unrelated HTTP discovery edit is excluded.

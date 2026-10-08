@@ -213,6 +213,11 @@ pub const Set = struct {
         return null;
     }
 
+    pub fn firstViolationJsonWithExecution(self: *const Set, execution: *expressions.Execution, value: std.json.Value) !?usize {
+        if (try self.firstJsonWithExecution(execution, value, false)) |failure| return failure.index;
+        return null;
+    }
+
     pub const Failure = struct { index: usize, reason: anyerror = error.RelationalCheckViolation };
 
     /// Invalid deterministic expression results become durable invalid-row
@@ -221,23 +226,41 @@ pub const Set = struct {
         return self.firstJson(alloc, value, true);
     }
 
+    pub fn firstFailureJsonWithExecution(self: *const Set, execution: *expressions.Execution, value: std.json.Value) !?Failure {
+        return self.firstJsonWithExecution(execution, value, true);
+    }
+
     fn firstJson(self: *const Set, alloc: Allocator, value: std.json.Value, activation: bool) !?Failure {
+        var budget: usize = expressions.max_allocated_bytes;
+        var execution = expressions.Execution.init(alloc, &budget);
+        return self.firstJsonWithExecution(&execution, value, activation);
+    }
+
+    fn firstJsonWithExecution(self: *const Set, execution: *expressions.Execution, value: std.json.Value, activation: bool) !?Failure {
+        try execution.charge(0);
+        var owner: expressions.ExecutionScratch = undefined;
+        owner.init(execution);
+        defer owner.deinit();
+        return self.firstJsonInner(execution, value, activation) catch |err| return owner.failure(err);
+    }
+
+    fn firstJsonInner(self: *const Set, execution: *expressions.Execution, value: std.json.Value, activation: bool) !?Failure {
         if (value != .object) return error.InvalidBatchRequest;
+        const alloc = execution.alloc;
         var scratch = std.ArrayList(u8).empty;
         defer scratch.deinit(alloc);
-        var arena = std.heap.ArenaAllocator.init(alloc);
-        defer arena.deinit();
-        var budget: usize = expressions.max_allocated_bytes;
-        var execution = expressions.Execution.init(arena.allocator(), &budget);
         for (self.definitions, self.plans, 0..) |definition, *plan, i| {
+            try execution.charge(1);
             const accepted = switch (plan.*) {
                 .comparison => |*comparison| blk: {
                     const ordinal = comparison.tuple.keys[0].ordinal;
-                    const scalar = try valueFromJson(arena.allocator(), self.table.relational_columns[ordinal].column_type, value.object.get(definition.column.?) orelse .null, false);
-                    break :blk (try comparison.evaluateValue(alloc, &scratch, scalar)).satisfiesCheck();
+                    const input = value.object.get(definition.column.?) orelse .null;
+                    const kind = self.table.relational_columns[ordinal].column_type;
+                    const scalar = if (kind == .numeric) try expressions.numericJson(execution, input) else try valueFromJson(alloc, kind, input, false);
+                    break :blk (try comparison.evaluateValueWithContext(alloc, &scratch, scalar, &execution.numeric)).satisfiesCheck();
                 },
                 .expression => |*expression| blk: {
-                    const result = expression.evaluateJsonWithExecution(&execution, value) catch |err| {
+                    const result = expression.evaluateJsonWithExecution(execution, value) catch |err| {
                         if (activation and isDeterministicFailure(err)) return .{ .index = i, .reason = err };
                         return err;
                     };
@@ -256,20 +279,41 @@ pub const Set = struct {
         return null;
     }
 
+    pub fn firstViolationRowWithExecution(self: *const Set, execution: *expressions.Execution, row: codec.OrdinalRowView) !?usize {
+        if (try self.firstRowWithExecution(execution, row, false)) |failure| return failure.index;
+        return null;
+    }
+
     pub fn firstFailureRow(self: *const Set, alloc: Allocator, row: codec.OrdinalRowView) !?Failure {
         return self.firstRow(alloc, row, true);
     }
 
+    pub fn firstFailureRowWithExecution(self: *const Set, execution: *expressions.Execution, row: codec.OrdinalRowView) !?Failure {
+        return self.firstRowWithExecution(execution, row, true);
+    }
+
     fn firstRow(self: *const Set, alloc: Allocator, row: codec.OrdinalRowView, activation: bool) !?Failure {
+        var budget: usize = expressions.max_allocated_bytes;
+        var execution = expressions.Execution.init(alloc, &budget);
+        return self.firstRowWithExecution(&execution, row, activation);
+    }
+
+    fn firstRowWithExecution(self: *const Set, execution: *expressions.Execution, row: codec.OrdinalRowView, activation: bool) !?Failure {
+        try execution.charge(0);
+        var owner: expressions.ExecutionScratch = undefined;
+        owner.init(execution);
+        defer owner.deinit();
+        return self.firstRowInner(execution, row, activation) catch |err| return owner.failure(err);
+    }
+
+    fn firstRowInner(self: *const Set, execution: *expressions.Execution, row: codec.OrdinalRowView, activation: bool) !?Failure {
+        const alloc = execution.alloc;
         var scratch = std.ArrayList(u8).empty;
         defer scratch.deinit(alloc);
-        var arena = std.heap.ArenaAllocator.init(alloc);
-        defer arena.deinit();
-        var budget: usize = expressions.max_allocated_bytes;
-        var execution = expressions.Execution.init(arena.allocator(), &budget);
         for (self.definitions, self.plans, 0..) |definition, *plan, i| {
+            try execution.charge(1);
             if (plan.* == .expression) {
-                const result = plan.expression.evaluateRowWithExecution(&execution, row) catch |err| {
+                const result = plan.expression.evaluateRowWithExecution(execution, row) catch |err| {
                     if (activation and isDeterministicFailure(err)) return .{ .index = i, .reason = err };
                     return err;
                 };
@@ -295,13 +339,16 @@ pub const Set = struct {
                     else => return error.UnsupportedRelationalIndexColumn,
                 };
             };
-            if (!(try comparison.evaluateValue(alloc, &scratch, scalar)).satisfiesCheck()) return .{ .index = i };
+            if (!(try comparison.evaluateValueWithContext(alloc, &scratch, scalar, &execution.numeric)).satisfiesCheck()) return .{ .index = i };
         }
         return null;
     }
 };
 
 fn isDeterministicFailure(err: anyerror) bool {
+    // A shared invocation can exhaust admission because of earlier plans,
+    // not this row's contents. Never persist that as a CHECK violation.
+    if (err == error.RelationalExpressionBudgetExceeded) return false;
     return @import("relational_expression_errors.zig").isInvalidInput(err) or err == error.RelationalIndexColumnTypeMismatch or err == error.InvalidBatchRequest;
 }
 

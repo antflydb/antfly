@@ -712,12 +712,19 @@ const RuntimeValidationContext = struct {
     }
 
     pub fn deinit(self: *RuntimeValidationContext) void {
+        self.finishNumeric();
+        self.active_root_ref_values.deinit(self.alloc);
+        self.* = undefined;
+    }
+
+    fn finishNumeric(self: *RuntimeValidationContext) void {
         if (self.numeric_execution) |execution| {
             execution.deinit();
             self.alloc.destroy(execution);
         }
-        self.active_root_ref_values.deinit(self.alloc);
-        self.* = undefined;
+        self.numeric_execution = null;
+        self.numeric_parsed = null;
+        self.numeric_domain_value = null;
     }
 
     fn rootRefGuard(self: *RuntimeValidationContext, value: *const std.json.Value) !?RootRefGuard {
@@ -1232,6 +1239,9 @@ fn validateDocumentValueInternal(
         if (schema.enforce_types) return error.InvalidBatchRequest;
     }
 
+    // No recursive predicate retains a parsed scalar beyond this point. Free
+    // and charge its scratch before CHECK borrows the remaining row allowance.
+    validation_context.finishNumeric();
     if (physical_fields.len > 0) {
         var path = std.ArrayListUnmanaged(u8).empty;
         defer path.deinit(alloc);
@@ -1239,11 +1249,11 @@ fn validateDocumentValueInternal(
     }
     if (schema.checks) |checks| if (checks.value.len != 0) {
         if (compiled) |plan| {
-            if (try plan.checks.?.firstViolationJson(alloc, value.*) != null) return error.RelationalCheckViolation;
+            if (try plan.checks.?.firstViolationJsonWithExecution(execution, value.*) != null) return error.RelationalCheckViolation;
         } else {
             var plan = try CompiledValidationPlan.init(alloc, schema);
             defer plan.deinit(alloc);
-            if (try plan.checks.?.firstViolationJson(alloc, value.*) != null) return error.RelationalCheckViolation;
+            if (try plan.checks.?.firstViolationJsonWithExecution(execution, value.*) != null) return error.RelationalCheckViolation;
         }
     };
 }
@@ -3038,6 +3048,33 @@ test "relational declarations exact NUMERIC composition parses once and shares t
         for (property.all_of) |child| try child.numeric_constraints.?.validate(&reference, parsed.value);
         try std.testing.expectEqual(reference.remaining, context.numeric_execution.?.context.remaining);
     }
+}
+
+test "relational declarations validation shares one allowance across NUMERIC constraints and all CHECK forms" {
+    const a = std.testing.allocator;
+    const expressions = @import("relational_expression.zig");
+    var table = try parseSchema(a,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","checks":[{"name":"positive","column":"n","op":"gte","value":1},{"name":"small","expression":{"op":"lt","args":[{"op":"column","column":"n"},{"op":"literal","type":"numeric","value":"10"}]}}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"n":{"type":"number","x-antfly-sql-type":"numeric","minimum":1,"multipleOf":0.25}},"additionalProperties":false}}}}
+    );
+    defer table.deinit(a);
+    var compiled = try CompiledValidationPlan.init(a, table);
+    defer compiled.deinit(a);
+    var document = try std.json.parseFromSlice(std.json.Value, a, "{\"n\":1.25}", .{ .parse_numbers = false });
+    defer document.deinit();
+    var budget: usize = expressions.max_allocated_bytes;
+    var row = expressions.Execution.init(a, &budget);
+    try validateDocumentValueInternal(a, table, &document.value, &.{}, &compiled, true, &.{}, false, &row);
+    const used = 8 * 1024 * 1024 - row.numeric.remaining;
+    try std.testing.expect(used > 1);
+    try std.testing.expect(budget < expressions.max_allocated_bytes - @sizeOf(@import("numeric_constraints.zig").Execution));
+    try std.testing.expectEqual(a.ptr, row.numeric.alloc.ptr);
+    try std.testing.expectEqual(a.vtable, row.numeric.alloc.vtable);
+    budget = expressions.max_allocated_bytes;
+    row = expressions.Execution.init(a, &budget);
+    row.numeric.remaining = used - 1;
+    try std.testing.expectError(error.RelationalExpressionBudgetExceeded, validateDocumentValueInternal(a, table, &document.value, &.{}, &compiled, true, &.{}, false, &row));
+    row.numeric.remaining = 8 * 1024 * 1024;
+    try std.testing.expectError(error.RelationalExpressionBudgetExceeded, validateDocumentValueInternal(a, table, &document.value, &.{}, &compiled, true, &.{}, false, &row));
 }
 
 test "relational declarations exact NUMERIC preparation lends sticky quotas to recursive constraints" {
