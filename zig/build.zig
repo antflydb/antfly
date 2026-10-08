@@ -270,6 +270,10 @@ pub fn create(b: *std.Build) ?Artifacts {
     const lib_regex_test_step = b.step("lib-regex-test", "Run standalone lib/regex tests");
     lib_regex_test_step.dependOn(&run_lib_regex_tests.step);
 
+    const sql_regex_tests = b.addTest(.{ .root_module = @import("lib/sql_regex/build.zig").createModule(b, target, optimize, b.path("lib/sql_regex")) });
+    b.step("sql-regex-test", "Run PostgreSQL ARE backend ownership and span contracts").dependOn(&b.addRunArtifact(sql_regex_tests).step);
+    b.step("sql-regex-check", "Compile PostgreSQL ARE backend contracts for the selected target").dependOn(&sql_regex_tests.step);
+
     const lib_scraping_tests = b.addTest(.{
         .root_module = scraping_mod,
     });

@@ -4631,3 +4631,34 @@ all 105 PostgreSQL oracle tests passed, and a fresh database reproduced all 48
 mutation goldens. Inventory integrity and all 20 checker regressions passed.
 The broader in-progress mutation probe still fails at unsupported regex; it is
 not included in these green-gate claims or credited as completed coverage.
+
+### PostgreSQL regex backend foundation (not activated)
+
+The SQL regex gap now has a separate PostgreSQL ARE backend under
+`zig/lib/sql_regex`, rather than adapting the search-index byte automaton or
+restarting a matcher at each possible byte offset. The upstream engine is pinned
+and licensed; its portability layer owns bounded native allocations, explicit
+C collation, per-compilation character-class caching and independent execution
+scratch. Searches use a once-decoded Unicode subject and retain its original
+anchor/lookbehind domain. Pattern ownership never retains a request budget.
+
+The new `zig build sql-regex-test` gate exercises captures, match precedence,
+Unicode spans, empty matches, anchors, lookaround, backreferences, flags, memory
+refusal, cancellation, exhaustive allocation failures, nested native calls and
+shared patterns across `std.Io` workers. An independently regenerated PostgreSQL
+18 C-collation fixture checks 22 exact span/capture contracts. Cached character
+transitions consume work, and a fourfold regular-search input increase remains
+within a fivefold work bound in the regression fixture.
+
+This is an architectural foundation, not completed public SQL regex support.
+Non-libc/WASM portability, reusable execution scratch, complete complex-path
+work charging, prepared/dynamic pattern admission, global replacement/iteration,
+SQL NULL/error contracts and mounted original cases remain unfinished. Other
+collations must be explicitly implemented rather than inheriting host locale.
+The corpus counts remain 432 implemented / 136 rejected / 73 superseded /
+945 unresolved; no regex case is credited by these backend tests.
+
+The native backend gate passes nine tests (about 0.6 seconds / 7 MiB maximum RSS
+in a local Debug run); this is gate runtime, not SQL query latency. The isolated
+backend also cross-compiles its tests for x86_64 Linux GNU without executing
+them. All 22 PostgreSQL span goldens reproduce from a fresh disposable database.
