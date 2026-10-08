@@ -25,7 +25,17 @@ const json_order = @import("json_order.zig");
 const uuid = @import("../common/uuid.zig");
 const MemoryBudget = @import("memory_budget.zig");
 const A = std.mem.Allocator;
-pub const Options = struct { values: arrays.Limits = .{}, wire_bytes: usize = 8 * 1024 * 1024 };
+pub const Options = struct {
+    values: arrays.Limits = .{},
+    wire_bytes: usize = 8 * 1024 * 1024,
+    /// Borrowed request identity; all preparation and emission work is already
+    /// charged here. It must outlive Prepared, including subsequent writes.
+    context: ?*@import("numeric_value.zig").Context = null,
+};
+
+fn preparationError(options: Options, err: anyerror) anyerror {
+    return if (err == error.SqlProgramLimitExceeded and options.context != null) options.context.?.limit() else err;
+}
 
 /// Borrows a pinned immutable input. Primitive preparation allocates nothing;
 /// JSONB canonicalizes once into an independently bounded scratch cohort.
@@ -37,17 +47,23 @@ pub const Prepared = struct {
     jsonb: []?[]const u8,
     encoded_size: usize,
     compact: bool,
+    work: arrays.Budget,
 
     pub fn init(backing: A, input: arrays.Value, options: Options) !Prepared {
-        const value = try arrays.Value.init(input.element_type, input.dimensions, input.elements, options.values);
+        var work: arrays.Budget = .{ .remaining = options.values.work, .shared = options.context };
+        try work.consume(0);
+        const value = arrays.Value.initWithBudget(input.element_type, input.dimensions, input.elements, options.values, &work) catch |err| return preparationError(options, err);
         if (value.dimensions.len != input.dimensions.len) return error.InvalidSqlArrayShape;
         var budget: MemoryBudget = .{ .backing = backing, .limit = options.values.bytes };
-        return initAdmitted(backing, budget.allocator(), value, options) catch |err| return quotaError(&budget, err);
+        return initAdmitted(backing, budget.allocator(), value, options, &work) catch |err| return preparationError(options, quotaError(&budget, err));
     }
 
-    fn initAdmitted(backing: A, scratch: A, value: arrays.Value, options: Options) !Prepared {
+    fn initAdmitted(backing: A, scratch: A, value: arrays.Value, options: Options, work: *arrays.Budget) !Prepared {
         var non_null: usize = 0;
-        for (value.elements) |element| non_null += @intFromBool(!element.sql_null);
+        for (value.elements) |element| {
+            try work.consume(1);
+            non_null += @intFromBool(!element.sql_null);
+        }
         var size = try layout.encodedSectionSize(value.element_type, value.dimensions.len, value.elements.len, non_null);
         if (size > options.wire_bytes) return error.SqlProgramLimitExceeded;
         const jsonb = try scratch.alloc(?[]const u8, if (value.element_type == .jsonb) value.elements.len else 0);
@@ -60,7 +76,9 @@ pub const Prepared = struct {
             if (element.sql_null) continue;
             if (value.element_type == .numeric) {
                 var none = std.heap.FixedBufferAllocator.init(&.{});
-                var ctx: @import("numeric_value.zig").Context = .{ .alloc = none.allocator(), .max_output_bytes = options.wire_bytes };
+                var ctx = work.numericContext(none.allocator());
+                defer work.remaining = @intCast(ctx.remaining);
+                ctx.max_output_bytes = @min(ctx.max_output_bytes, options.wire_bytes);
                 const length = try @import("numeric_binary.zig").encodedSize(&ctx, element.numeric.?.*);
                 size = std.math.add(usize, size, length) catch return error.SqlProgramLimitExceeded;
                 if (size > options.wire_bytes or size > std.math.maxInt(u32)) return error.SqlProgramLimitExceeded;
@@ -69,12 +87,13 @@ pub const Prepared = struct {
             const payload = if (value.element_type == .text) element.value.string else blk: {
                 const bytes = try canonical_json.canonicalJsonValueAlloc(scratch, element.value);
                 jsonb[i] = bytes;
+                try work.consume(bytes.len);
                 break :blk bytes;
             };
             size = std.math.add(usize, size, payload.len) catch return error.SqlProgramLimitExceeded;
             if (size > options.wire_bytes or size > std.math.maxInt(u32)) return error.SqlProgramLimitExceeded;
         };
-        return .{ .value = value, .allocator = backing, .jsonb = jsonb, .encoded_size = size, .compact = layout.usesCompact(value.element_type, value.elements.len, non_null) };
+        return .{ .value = value, .allocator = backing, .jsonb = jsonb, .encoded_size = size, .compact = layout.usesCompact(value.element_type, value.elements.len, non_null), .work = work.* };
     }
 
     pub fn deinit(self: *Prepared) void {
@@ -83,9 +102,16 @@ pub const Prepared = struct {
         self.* = undefined;
     }
 
-    pub fn writeInto(self: Prepared, bytes: []u8) !void {
+    pub fn writeInto(self: *Prepared, bytes: []u8) !void {
         if (bytes.len != self.encoded_size) return error.InvalidSqlArrayStorage;
-        @memset(bytes, 0);
+        try self.work.consume(0);
+        var cleared: usize = 0;
+        while (cleared < bytes.len) {
+            const end = cleared + @min(bytes.len - cleared, 256);
+            try self.work.consume(end - cleared);
+            @memset(bytes[cleared..end], 0);
+            cleared = end;
+        }
         bytes[0] = layout.version;
         bytes[1] = @intCast(self.value.dimensions.len);
         bytes[2] = @intFromBool(self.compact);
@@ -104,6 +130,7 @@ pub const Prepared = struct {
         var payload_at: usize = 0;
         var non_null: usize = 0;
         for (self.value.elements, 0..) |element, i| {
+            try self.work.consume(1);
             if (self.compact and i % 64 == 0) std.mem.writeInt(u32, bytes[slots_start + i / 64 * 4 ..][0..4], @intCast(non_null), .little);
             if (element.sql_null) bytes[bitmap_start + i / 8] |= @as(u8, 1) << @intCast(i % 8);
             if (width == 0) {
@@ -111,7 +138,9 @@ pub const Prepared = struct {
                 if (!element.sql_null) {
                     if (self.value.element_type == .numeric) {
                         var none = std.heap.FixedBufferAllocator.init(&.{});
-                        var ctx: @import("numeric_value.zig").Context = .{ .alloc = none.allocator(), .max_output_bytes = self.encoded_size };
+                        var ctx = self.work.numericContext(none.allocator());
+                        defer self.work.remaining = @intCast(ctx.remaining);
+                        ctx.max_output_bytes = @min(ctx.max_output_bytes, self.encoded_size);
                         const length = try @import("numeric_binary.zig").encodedSize(&ctx, element.numeric.?.*);
                         var writer: std.Io.Writer = .fixed(bytes[payload_start + payload_at ..][0..length]);
                         try @import("numeric_binary.zig").encode(&ctx, element.numeric.?.*, &writer);
@@ -119,7 +148,13 @@ pub const Prepared = struct {
                         continue;
                     }
                     const payload = if (self.value.element_type == .text) element.value.string else self.jsonb[i].?;
-                    @memcpy(bytes[payload_start + payload_at ..][0..payload.len], payload);
+                    var copied: usize = 0;
+                    while (copied < payload.len) {
+                        const end = copied + @min(payload.len - copied, 256);
+                        try self.work.consume(end - copied);
+                        @memcpy(bytes[payload_start + payload_at + copied ..][0 .. end - copied], payload[copied..end]);
+                        copied = end;
+                    }
                     payload_at += payload.len;
                 }
                 continue;
@@ -607,6 +642,148 @@ test "SQL flat array logical hashes exclude dense compact representation choices
     left.final(&left_digest);
     right.final(&right_digest);
     try std.testing.expectEqualSlices(u8, &left_digest, &right_digest);
+}
+
+test "SQL flat array preparation and repeated emission share sticky request admission" {
+    const a = std.testing.allocator;
+    const numeric = @import("numeric_value.zig");
+    const value: arrays.Value = .{
+        .element_type = .int64,
+        .dimensions = &.{.{ .length = 2, .lower = -7 }},
+        .elements = &.{ arrays.Element.json(.{ .integer = 42 }), .{} },
+    };
+    var parent: numeric.Context = .{ .alloc = a };
+    const before = parent.remaining;
+    var prepared = try Prepared.init(a, value, .{ .context = &parent, .values = .{ .work = 200 } });
+    defer prepared.deinit();
+    try std.testing.expectEqual(before - parent.remaining, 200 - prepared.work.remaining);
+    const bytes = try a.alloc(u8, prepared.encoded_size);
+    defer a.free(bytes);
+    try prepared.writeInto(bytes);
+    try std.testing.expectEqual(before - parent.remaining, 200 - prepared.work.remaining);
+    const ordinary = try encodeAlloc(a, value, .{});
+    defer a.free(ordinary);
+    try std.testing.expectEqualSlices(u8, ordinary, bytes);
+    var writes: usize = 1;
+    while (true) {
+        prepared.writeInto(bytes) catch |err| {
+            try std.testing.expectEqual(error.SqlProgramLimitExceeded, err);
+            break;
+        };
+        writes += 1;
+        try std.testing.expect(writes < 20);
+    }
+    try std.testing.expect(writes > 1);
+    parent.remaining = 8 * 1024 * 1024;
+    try std.testing.expectError(error.SqlProgramLimitExceeded, Prepared.init(a, value, .{ .context = &parent }));
+    const empty: arrays.Value = .{ .element_type = .int64, .dimensions = &.{}, .elements = &.{} };
+    try std.testing.expectError(error.SqlProgramLimitExceeded, Prepared.init(a, empty, .{ .context = &parent }));
+    parent = .{ .alloc = a };
+    try std.testing.expectError(error.SqlProgramLimitExceeded, Prepared.init(a, value, .{ .context = &parent, .wire_bytes = 1 }));
+    try std.testing.expectError(error.SqlProgramLimitExceeded, parent.charge(0));
+}
+
+test "SQL flat array NUMERIC preparation inherits request limits and allocation failures stay distinct" {
+    const a = std.testing.allocator;
+    const numeric = @import("numeric_value.zig");
+    var parsing: numeric.Context = .{ .alloc = a };
+    var number = try numeric.parse(&parsing, "12345678901234567890.001200");
+    defer number.deinit();
+    const value: arrays.Value = .{
+        .element_type = .numeric,
+        .dimensions = &.{.{ .length = 1, .lower = 1 }},
+        .elements = &.{arrays.Element.typedNumeric(&number.value)},
+    };
+    var parent: numeric.Context = .{ .alloc = a, .max_groups = 1 };
+    try std.testing.expectError(error.SqlProgramLimitExceeded, Prepared.init(a, value, .{ .context = &parent }));
+    try std.testing.expectError(error.SqlProgramLimitExceeded, parent.charge(0));
+    parent = .{ .alloc = a, .max_output_bytes = 1 };
+    try std.testing.expectError(error.SqlProgramLimitExceeded, Prepared.init(a, value, .{ .context = &parent }));
+    parent = .{ .alloc = a };
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, encodeAlloc(failing.allocator(), value, .{ .context = &parent }));
+    try parent.charge(0);
+    var prepared = try Prepared.init(a, value, .{ .context = &parent });
+    defer prepared.deinit();
+    const bytes = try a.alloc(u8, prepared.encoded_size);
+    defer a.free(bytes);
+    const before = parent.remaining;
+    try prepared.writeInto(bytes);
+    try std.testing.expect(parent.remaining < before);
+    const ordinary = try encodeAlloc(a, value, .{});
+    defer a.free(ordinary);
+    try std.testing.expectEqualSlices(u8, ordinary, bytes);
+}
+
+test "SQL flat array shared JSONB preparation unwinds allocation faults and fences scratch quota" {
+    const a = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, "{\"b\":2,\"a\":[1,null,\"text\"]}", .{});
+    defer parsed.deinit();
+    const value: arrays.Value = .{
+        .element_type = .jsonb,
+        .dimensions = &.{.{ .length = 2, .lower = -3 }},
+        .elements = &.{ arrays.Element.json(parsed.value), .{} },
+    };
+    const Faults = struct {
+        fn run(backing: A, input: arrays.Value) !void {
+            var parent: @import("numeric_value.zig").Context = .{ .alloc = backing };
+            const bytes = encodeAlloc(backing, input, .{ .context = &parent }) catch |err| {
+                if (err == error.OutOfMemory) try std.testing.expect(parent.failure == null);
+                return err;
+            };
+            defer backing.free(bytes);
+            _ = try validateCanonical(backing, .jsonb, bytes, .{});
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Faults.run, .{value});
+    var parent: @import("numeric_value.zig").Context = .{ .alloc = a };
+    const controls: [512]u8 = @splat(1);
+    const expanding: arrays.Value = .{
+        .element_type = .jsonb,
+        .dimensions = &.{.{ .length = 1, .lower = 1 }},
+        .elements = &.{arrays.Element.json(.{ .string = &controls })},
+    };
+    _ = try arrays.Value.init(.jsonb, expanding.dimensions, expanding.elements, .{ .bytes = 1024 });
+    try std.testing.expectError(error.SqlProgramLimitExceeded, Prepared.init(a, expanding, .{
+        .context = &parent,
+        .values = .{ .bytes = 1024 },
+    }));
+    try std.testing.expectError(error.SqlProgramLimitExceeded, parent.charge(0));
+}
+
+test "SQL flat array emission cancellation polls bounded clearing and payload chunks" {
+    const a = std.testing.allocator;
+    const Cancel = struct {
+        calls: usize = 0,
+        fail_at: usize,
+        fn poll(ptr: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            self.calls += 1;
+            if (self.calls == self.fail_at) return error.Canceled;
+        }
+    };
+    const text: [2048]u8 = @splat('x');
+    const value: arrays.Value = .{
+        .element_type = .text,
+        .dimensions = &.{.{ .length = 1, .lower = 0 }},
+        .elements = &.{arrays.Element.json(.{ .string = &text })},
+    };
+    for ([_]usize{ 2, 12 }) |fail_at| {
+        var parent: @import("numeric_value.zig").Context = .{ .alloc = a };
+        var prepared = try Prepared.init(a, value, .{ .context = &parent });
+        defer prepared.deinit();
+        const bytes = try a.alloc(u8, prepared.encoded_size);
+        defer a.free(bytes);
+        var cancel: Cancel = .{ .fail_at = fail_at };
+        parent.checkpoint = Cancel.poll;
+        parent.ptr = &cancel;
+        parent.since_poll = 256;
+        try std.testing.expectError(error.Canceled, prepared.writeInto(bytes));
+        try std.testing.expectEqual(fail_at, cancel.calls);
+        parent.checkpoint = null;
+        parent.remaining = 8 * 1024 * 1024;
+        try std.testing.expectError(error.Canceled, prepared.writeInto(bytes));
+    }
 }
 
 test "SQL flat array primitive preparation uses one output allocation and cold shape projection stays bounded" {

@@ -6341,3 +6341,27 @@ Final-source capability validation passes 611 local and 226 server SQL tests,
 63 local and 5 server schema-expression tests, and 190 local plus 1 server native
 integrity tests: 1,096 passing tests, three existing SQL skips, no failures or
 leaks. Focused capability, generated control catalog and formatting checks pass.
+
+### Canonical array preparation shares its enclosing execution
+
+Array storage preparation and emission now optionally borrow the enclosing
+request's work/cancellation identity. Prepared outputs retain their remaining
+local work allowance across writes; neither a new array nor a repeated emission
+can refill the parent budget. NUMERIC validation and encoding inherit the
+parent's coefficient and output bounds instead of creating fresh cell budgets.
+Output clearing and variable payload copies poll in at most 256-byte chunks.
+
+Primitive preparation retains zero scratch allocations and one final output
+allocation. JSONB canonical buffers retain their separate bounded scratch cohort;
+quota exhaustion poisons the enclosing invocation, while ordinary allocation
+failure remains OutOfMemory. No wire-format or logical-value semantics change.
+The borrowed parent must outlive Prepared and every write.
+
+Sixteen focused flat-array tests pass, including PostgreSQL binary fixture
+round trips, repeated-write accounting, sticky cancellation during clearing and
+payload emission, inherited NUMERIC limits, escaping-expanded JSONB scratch
+quota exhaustion, and allocation-fault cleanup. Generated control catalog and
+immutable inventory checks pass. This does not activate public array programs:
+their bounded JSON-to-row adapters and compiler/DDL propagation remain pending.
+Shared storage decoding and interruption inside canonical JSONB serialization
+also remain separate work; this change does not claim complete time-slicing.
