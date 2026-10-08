@@ -477,7 +477,13 @@ fn evaluateNumericAs(comptime T: type, comptime C: type, a: A, predicate: Graph.
     while (row < mask.len) : (row += 8) {
         var lanes: [8]C = @splat(0);
         const count = @min(8, mask.len - row);
-        for (0..count) |lane| lanes[lane] = if (T == C) values[page.selection[row + lane]] else @floatFromInt(values[page.selection[row + lane]]);
+        for (0..count) |lane| {
+            const position = row + lane;
+            if (active) |enabled| if (!enabled[position]) continue;
+            const index = page.selection[position];
+            if (vector.nulls.isNull(index)) continue;
+            lanes[lane] = if (T == C) values[index] else @floatFromInt(values[index]);
+        }
         const v: @Vector(8, C) = lanes;
         const lower: [8]bool = if (kernel.lower) |bound| (if (kernel.inclusive_lower) v >= @as(@Vector(8, C), @splat(bound)) else v > @as(@Vector(8, C), @splat(bound))) else @splat(true);
         const upper: [8]bool = if (kernel.upper) |bound| (if (kernel.inclusive_upper) v <= @as(@Vector(8, C), @splat(bound)) else v < @as(@Vector(8, C), @splat(bound))) else @splat(true);
@@ -552,7 +558,7 @@ fn evaluateColumns(a: A, input: Compiled, page: local.sql_catalog.ColumnPage, ma
                         if (try evaluateNumeric(f64, a, field.predicate, values, vector, page, mask, active)) return;
                     },
                     .bool => |values| if (field.predicate.booleanTerm()) |term| {
-                        for (mask, page.selection, 0..) |*match, index, row| match.* = values[index] == term and !vector.nulls.isNull(index) and (if (active) |enabled| enabled[row] else true);
+                        for (mask, page.selection, 0..) |*match, index, row| match.* = (if (active) |enabled| enabled[row] else true) and !vector.nulls.isNull(index) and values[index] == term;
                         return;
                     },
                     else => {},
@@ -724,12 +730,12 @@ test "external lake residual dictionary and SIMD kernels preserve active null an
     const row_types = local.storage_rowsource_types;
     var refs: [11]row_types.RowRef = undefined;
     @memset(&refs, .{ .relational_key = "id" });
-    const numbers = [_]i64{ 7, -1, 7, 4, 7, 9, 7, 7, 2, 7, 7 };
+    const numbers = [_]i64{ 7, -1, undefined, 4, 7, 9, 7, 7, 2, undefined, 7 };
     const indices = [_]u32{ 0, 1, 0, 1, 2, 0, 0, 1, 2, 0, 0 };
     const values = [_][]const u8{ "kept", "other", "keeper" };
     const nulls = [_]u8{ 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0 };
-    const floats = [_]f64{ 1, -1, 7, 4.5, 7, 9, 6, 7, 2, 7, 8 };
-    const booleans = [_]bool{ true, false, true, true, false, true, false, true, false, true, false };
+    const floats = [_]f64{ 1, -1, undefined, 4.5, 7, 9, 6, 7, 2, undefined, 8 };
+    const booleans = [_]bool{ true, false, undefined, true, false, true, false, true, false, undefined, false };
     const vectors = [_]row_types.ColumnVector{
         .{ .name = "floating", .values = .{ .f64 = &floats }, .nulls = .{ .bytes = &nulls } },
         .{ .name = "flag", .values = .{ .bool = &booleans }, .nulls = .{ .bytes = &nulls } },
