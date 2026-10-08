@@ -5961,3 +5961,40 @@ Final-source regression gates pass 601 local SQL tests (three existing skips),
 226 server SQL tests, 185 native relational-index tests and their server
 integration test, without failures or leaks. Control-catalog, inventory integrity,
 formatting and whitespace checks pass. No generated public contracts changed.
+
+### Shared recursive NUMERIC constraints and logical restore verification
+
+Recursive scalar NUMERIC predicates now borrow the preparation context rather
+than initializing another work/cancellation allowance. The stable constraint
+owner retains its reusable bounded arena, charges owner/peak scratch memory to
+the row byte allowance, and restores the caller's allocator and limb limits on
+every exit. Composition still parses a scalar once across its predicates.
+Ordinary and typed-row preparation pass the existing row context into validation;
+standalone validation creates one context for SQL normalization, generated-value
+verification and recursive scalar constraints.
+
+Logical generated-value verification also accepts the caller's execution
+context. Its unpublished arena is byte-bounded, restores caller allocators on
+success and failure, and reconciles arena peak capacity against existing VM
+allocation charges rather than counting the same retained output twice. Restore
+continues to reject forged generated values and unconstrained assignments; it
+does not fill defaults or repair stored values.
+
+All 55 focused expression/constraint tests pass without failures or leaks. Tests
+cover borrowed context identity, sticky work/cancellation across constraint and
+scalar-normalization boundaries, restoration of allocators, tiny restore quotas,
+and deterministic allocation-fault cleanup. Live PostgreSQL oracles revalidate
+all 11 default/generated assignment fixtures and 70 constraint predicates. Inventory
+classifications remain unchanged at 929 unresolved.
+
+CHECK evaluation, physical encoding and field-local physical restore still need
+their complete shared-context integration. Public NUMERIC column annotations,
+catalog/DDL activation and integrated publication/reopen/restore evidence remain
+unfinished; public column modifiers stay guarded. These remaining requirements
+are not implied complete by the new preparation and logical-verification paths.
+
+Final-source regression gates pass 601 local SQL tests (three existing skips),
+226 server SQL tests, 185 native relational-index tests and their server
+integration test, without failures or leaks. Control-catalog, inventory integrity,
+formatting and whitespace checks pass. The changes are committed locally, not
+pushed; the unrelated HTTP discovery edit is preserved.

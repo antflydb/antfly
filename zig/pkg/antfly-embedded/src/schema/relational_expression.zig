@@ -51,6 +51,44 @@ pub const Execution = struct {
     }
 };
 
+/// Temporarily own bounded unpublished results while retaining the caller's
+/// work/cancellation identity. Reconcile capacity against existing VM charges
+/// rather than charging the same retained allocation twice.
+pub const ExecutionScratch = struct {
+    execution: *Execution,
+    memory: @import("../sql/memory_budget.zig"),
+    arena: std.heap.ArenaAllocator,
+    saved_alloc: Allocator,
+    saved_numeric_alloc: Allocator,
+    initial_bytes: usize,
+
+    pub fn init(self: *ExecutionScratch, execution: *Execution) void {
+        self.* = .{
+            .execution = execution,
+            .memory = .{ .backing = execution.alloc, .limit = execution.bytes.* },
+            .arena = undefined,
+            .saved_alloc = execution.alloc,
+            .saved_numeric_alloc = execution.numeric.alloc,
+            .initial_bytes = execution.bytes.*,
+        };
+        self.arena = .init(self.memory.allocator());
+        execution.alloc = self.arena.allocator();
+        execution.numeric.alloc = execution.alloc;
+    }
+
+    pub fn deinit(self: *ExecutionScratch) void {
+        self.arena.deinit();
+        const charged = self.initial_bytes -| self.execution.bytes.*;
+        self.execution.bytes.* = self.initial_bytes -| @max(charged, self.memory.peak);
+        self.execution.alloc = self.saved_alloc;
+        self.execution.numeric.alloc = self.saved_numeric_alloc;
+    }
+
+    pub fn failure(self: *ExecutionScratch, err: anyerror) anyerror {
+        return if (err == error.OutOfMemory and self.memory.isExhausted()) self.execution.limit() else err;
+    }
+};
+
 // Preserve the durable validation/transport contract. Numeric kernel errors
 // must not turn deterministic bad rows into retryable activation failures.
 fn executionFailure(err: anyerror) anyerror {
@@ -1480,6 +1518,20 @@ test "relational declarations NUMERIC target modifiers precede dependent express
                 }
                 try set.verifyJson(alloc, document.value);
                 if (entry.use_default) {
+                    var verification_bytes: usize = max_allocated_bytes;
+                    var verification = Execution.init(alloc, &verification_bytes);
+                    try set.verifyJsonWithExecution(&verification, document.value);
+                    try std.testing.expect(verification.numeric.remaining < 8 * 1024 * 1024);
+                    try std.testing.expect(verification_bytes < max_allocated_bytes);
+                    try std.testing.expectEqual(alloc.ptr, verification.alloc.ptr);
+                    try std.testing.expectEqual(alloc.vtable, verification.alloc.vtable);
+                    verification.numeric.remaining = 0;
+                    try std.testing.expectError(error.RelationalExpressionBudgetExceeded, set.verifyJsonWithExecution(&verification, document.value));
+                    verification.numeric.remaining = 8 * 1024 * 1024;
+                    try std.testing.expectError(error.RelationalExpressionBudgetExceeded, set.verifyJsonWithExecution(&verification, document.value));
+                    verification_bytes = 1;
+                    verification = Execution.init(alloc, &verification_bytes);
+                    try std.testing.expectError(error.RelationalExpressionBudgetExceeded, set.verifyJsonWithExecution(&verification, document.value));
                     // Equivalent logical display scales are not repairs.
                     try document.value.object.put(document.arena.allocator(), "base", .{ .number_string = "1.2500" });
                     try set.verifyJson(alloc, document.value);
@@ -2054,20 +2106,30 @@ pub const Set = struct {
     /// Restore never fills defaults or repairs forged generated values. It
     /// verifies the stored canonical logical result in dependency order.
     pub fn verifyJson(self: *const Set, alloc: Allocator, document: std.json.Value) !void {
+        var budget: usize = max_allocated_bytes;
+        var execution = Execution.init(alloc, &budget);
+        return self.verifyJsonWithExecution(&execution, document);
+    }
+
+    pub fn verifyJsonWithExecution(self: *const Set, execution: *Execution, document: std.json.Value) !void {
+        try execution.charge(0);
+        var scratch: ExecutionScratch = undefined;
+        scratch.init(execution);
+        defer scratch.deinit();
+        self.verifyJsonInner(execution, document) catch |err| return scratch.failure(err);
+    }
+
+    fn verifyJsonInner(self: *const Set, execution: *Execution, document: std.json.Value) !void {
         const has_generated = for (self.bindings) |binding| {
             if (binding.generated) break true;
         } else false;
         if (!has_generated) return;
         if (document != .object) return error.InvalidBatchRequest;
-        var scratch = std.heap.ArenaAllocator.init(alloc);
-        defer scratch.deinit();
-        const arena = scratch.allocator();
-        const values = try arena.alloc(Value, self.table.relational_columns.len);
-        const present = try arena.alloc(bool, values.len);
-        var budget: usize = max_allocated_bytes;
-        var execution = Execution.init(arena, &budget);
-        try self.readValues(&execution, document, values, present, false);
-        try self.verifyValues(&execution, values, present);
+        try execution.charge(self.table.relational_columns.len);
+        const values = try execution.alloc.alloc(Value, self.table.relational_columns.len);
+        const present = try execution.alloc.alloc(bool, values.len);
+        try self.readValues(execution, document, values, present, false);
+        try self.verifyValues(execution, values, present);
     }
 
     /// Cold restore verifies generated semantics directly from ordinal cells.

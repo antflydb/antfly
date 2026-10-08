@@ -691,6 +691,7 @@ const RuntimeValidationContext = struct {
     validated_sql_arrays: bool = false,
     physical_numeric_kind: ?RelationalNumericKind = null,
     numeric_execution: ?*@import("numeric_constraints.zig").Execution = null,
+    preparation_execution: ?*@import("relational_expression.zig").Execution = null,
     numeric_domain_value: ?*const std.json.Value = null,
     numeric_parsed: ?@import("../sql/numeric_value.zig").Value = null,
     active_root_ref_values: std.ArrayListUnmanaged(usize) = .{ .items = &.{}, .capacity = 0, .pointer_stability = .{} },
@@ -1071,9 +1072,9 @@ pub fn validateDocumentValueWithPlan(
     if (compiled == null and schema.storage_mode == .relational) {
         var plan = try CompiledValidationPlan.init(alloc, schema);
         defer plan.deinit(alloc);
-        return validateDocumentValueInternal(alloc, schema, value, physical_fields, &plan, true, &.{}, false);
+        return validateDocumentValueInternal(alloc, schema, value, physical_fields, &plan, true, &.{}, false, null);
     }
-    return validateDocumentValueInternal(alloc, schema, value, physical_fields, compiled, true, &.{}, false);
+    return validateDocumentValueInternal(alloc, schema, value, physical_fields, compiled, true, &.{}, false, null);
 }
 
 /// The only boundary that skips verification owns both expression evaluation
@@ -1095,7 +1096,7 @@ pub fn prepareDocumentValueWithPlan(
         try expressions.applyJsonWithExecution(&execution, value);
         try compiled.normalizeSql(&execution, value, false, .derived);
     }
-    return validateDocumentValueInternal(scratch, schema, value, physical_fields, compiled, false, &.{}, true);
+    return validateDocumentValueInternal(scratch, schema, value, physical_fields, compiled, false, &.{}, true, &execution);
 }
 
 /// Typed null metadata is schema-checked by the row preparer before entering
@@ -1120,7 +1121,7 @@ pub fn prepareTypedDocumentValueWithPlan(owned_alloc: std.mem.Allocator, scratch
         pointer.* = value.object.getPtr(name) orelse return error.InvalidBatchRequest;
         if (pointer.*.* != .null) return error.InvalidBatchRequest;
     }
-    return validateDocumentValueInternal(scratch, schema, value, physical_fields, compiled, preserve, pointers, !preserve);
+    return validateDocumentValueInternal(scratch, schema, value, physical_fields, compiled, preserve, pointers, !preserve, &execution);
 }
 
 fn validateDocumentValueInternal(
@@ -1134,6 +1135,7 @@ fn validateDocumentValueInternal(
     // Private proof owned by the preparation boundary above, never a caller
     // assertion on restore or public validation. Expressions have already run.
     sql_admitted: bool,
+    shared_execution: ?*@import("relational_expression.zig").Execution,
 ) !void {
     if (compiled) |plan| try plan.requireSchema(schema);
     if (schema.document_schemas.len == 0 and !schema.enforce_types and schema.ttl_duration_ns == 0 and schema.dynamic_templates.len == 0 and physical_fields.len == 0) return;
@@ -1144,18 +1146,18 @@ fn validateDocumentValueInternal(
     };
 
     const document_schema = try resolveDocumentSchema(schema, root);
-    if (!sql_admitted) if (compiled) |plan| {
-        const expressions_module = @import("relational_expression.zig");
-        var budget: usize = expressions_module.max_allocated_bytes;
-        var execution = expressions_module.Execution.init(alloc, &budget);
-        try plan.normalizeSql(&execution, value, true, .all);
-    };
+    const expressions_module = @import("relational_expression.zig");
+    var budget: usize = expressions_module.max_allocated_bytes;
+    var local_execution = expressions_module.Execution.init(alloc, &budget);
+    const execution = shared_execution orelse &local_execution;
+    try execution.charge(0);
+    if (!sql_admitted) if (compiled) |plan| try plan.normalizeSql(execution, value, true, .all);
     if (verify_generated) if (compiled) |plan| {
-        if (plan.expressions) |expressions| try expressions.verifyJson(alloc, value.*);
+        if (plan.expressions) |expressions| try expressions.verifyJsonWithExecution(execution, value.*);
     } else if (schema.generated_columns != null) {
         var plan = try CompiledValidationPlan.init(alloc, schema);
         defer plan.deinit(alloc);
-        if (plan.expressions) |expressions| try expressions.verifyJson(alloc, value.*);
+        if (plan.expressions) |expressions| try expressions.verifyJsonWithExecution(execution, value.*);
     };
     var validation_context = RuntimeValidationContext{
         .alloc = alloc,
@@ -1163,6 +1165,7 @@ fn validateDocumentValueInternal(
         .compiled = compiled,
         .require_physical_encoding = schema.storage_mode == .relational,
         .validated_sql_arrays = compiled != null,
+        .preparation_execution = execution,
     };
     defer validation_context.deinit();
     var root_property: ?DocumentProperty = null;
@@ -3037,6 +3040,53 @@ test "relational declarations exact NUMERIC composition parses once and shares t
     }
 }
 
+test "relational declarations exact NUMERIC preparation lends sticky quotas to recursive constraints" {
+    const a = std.testing.allocator;
+    const expressions = @import("relational_expression.zig");
+    const Run = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            const definition = try std.json.parseFromSlice(std.json.Value, alloc,
+                \\{"type":"number","allOf":[{"minimum":1},{"maximum":2}],"multipleOf":0.1}
+            , .{ .parse_numbers = false });
+            defer definition.deinit();
+            const scope: SchemaContext = .{ .document_root = definition.value.object, .scope_schema = definition.value.object, .numeric_domain = true };
+            const property = try parseAnonymousProperty(alloc, scope, definition.value.object);
+            defer alloc.destroy(property);
+            defer property.deinit(alloc);
+            property.sql_type = .numeric;
+            var budget: usize = expressions.max_allocated_bytes;
+            var row = expressions.Execution.init(alloc, &budget);
+            var context: RuntimeValidationContext = .{ .alloc = alloc, .require_physical_encoding = true, .preparation_execution = &row };
+            defer context.deinit();
+            const before = row.numeric.remaining;
+            const value: std.json.Value = .{ .number_string = "1.5" };
+            try validateDocumentFieldValueWithContext(&context, property.*, &value, true);
+            try std.testing.expect(row.numeric.remaining < before);
+            try std.testing.expectEqual(&row.numeric, context.numeric_execution.?.shared_context.?);
+            try std.testing.expectEqual(alloc.ptr, row.numeric.alloc.ptr);
+            try std.testing.expectEqual(alloc.vtable, row.numeric.alloc.vtable);
+            try std.testing.expect(budget < expressions.max_allocated_bytes);
+            row.numeric.remaining = 0;
+            try std.testing.expectError(error.RelationalExpressionBudgetExceeded, validateDocumentFieldValueWithContext(&context, property.*, &value, true));
+            row.numeric.remaining = before;
+            try std.testing.expectError(error.RelationalExpressionBudgetExceeded, expressions.normalizeNumericJson(&row, value, null, true));
+            const Cancel = struct {
+                fn poll(_: ?*anyopaque) anyerror!void {
+                    return error.Canceled;
+                }
+            };
+            row = expressions.Execution.init(alloc, &budget);
+            row.numeric.checkpoint = Cancel.poll;
+            try std.testing.expectError(error.Canceled, validateDocumentFieldValueWithContext(&context, property.*, &value, true));
+            row.numeric.checkpoint = null;
+            try std.testing.expectError(error.Canceled, expressions.normalizeNumericJson(&row, value, null, true));
+        }
+    };
+    try Run.run(a);
+    var stable = std.testing.FailingAllocator.init(a, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(stable.allocator(), Run.run, .{});
+}
+
 test "relational declarations exact NUMERIC composition owns plans and preserves faults and cancellation" {
     const a = std.testing.allocator;
     const Run = struct {
@@ -4573,8 +4623,13 @@ fn validateDocumentFieldValueWithContext(
     const exact_numeric = context.numeric_domain_value == value;
     if (exact_numeric and context.numeric_parsed == null) {
         if (context.numeric_execution == null) {
+            const size = @sizeOf(@import("numeric_constraints.zig").Execution);
+            if (context.preparation_execution) |row| if (size > row.bytes.*) return row.limit();
             const execution = try context.alloc.create(@import("numeric_constraints.zig").Execution);
-            execution.init(context.alloc);
+            if (context.preparation_execution) |row| {
+                row.bytes.* -= size;
+                execution.initShared(context.alloc, &row.numeric, row.bytes);
+            } else execution.init(context.alloc);
             context.numeric_execution = execution;
         }
         context.numeric_parsed = context.numeric_execution.?.prepareJson(value.*) catch |err| return switch (err) {

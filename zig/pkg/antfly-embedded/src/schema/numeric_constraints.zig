@@ -29,16 +29,30 @@ pub const Execution = struct {
     memory: @import("../sql/memory_budget.zig"),
     arena: std.heap.ArenaAllocator,
     context: exact.Context,
+    shared_context: ?*exact.Context = null,
+    shared_bytes: ?*usize = null,
 
     pub fn init(self: *Execution, alloc: A) void {
         self.memory = .{ .backing = alloc, .limit = max_bytes };
         self.arena = .init(self.memory.allocator());
         self.context = .{ .alloc = self.arena.allocator() };
+        self.shared_context = null;
+        self.shared_bytes = null;
+    }
+
+    /// Borrow work/cancellation identity, never clone or reset the context.
+    /// This owner contributes its peak scratch capacity to the row allowance.
+    pub fn initShared(self: *Execution, alloc: A, context: *exact.Context, bytes: *usize) void {
+        self.init(alloc);
+        self.shared_context = context;
+        self.shared_bytes = bytes;
+        self.memory.limit = @min(max_bytes, bytes.*);
     }
 
     pub fn deinit(self: *Execution) void {
         self.arena.deinit();
         std.debug.assert(self.memory.live == 0);
+        if (self.shared_bytes) |bytes| bytes.* -|= self.memory.peak;
         self.* = undefined;
     }
 
@@ -49,18 +63,36 @@ pub const Execution = struct {
     /// Borrowed until the next prepare or deinit. Composition predicates can
     /// share one parsed row value without resetting sticky work admission.
     pub fn prepareJson(self: *Execution, value: Json) !exact.Value {
-        try self.context.charge(0);
+        const context = self.shared_context orelse &self.context;
+        try context.charge(0);
+        const saved_alloc = context.alloc;
+        const saved_groups = context.max_groups;
+        context.alloc = self.arena.allocator();
+        context.max_groups = @min(saved_groups, self.memory.limit / 2);
+        defer {
+            context.alloc = saved_alloc;
+            context.max_groups = saved_groups;
+        }
         _ = self.arena.reset(.retain_capacity);
-        return (storage.fromJson(&self.context, value) catch |err| return self.failure(err)).value;
+        return (storage.fromJson(context, value) catch |err| return self.failure(err)).value;
     }
 
     pub fn validate(self: *Execution, plan: *const Plan, value: exact.Value) !void {
-        plan.validate(&self.context, value) catch |err| return self.failure(err);
+        const context = self.shared_context orelse &self.context;
+        const saved_alloc = context.alloc;
+        const saved_groups = context.max_groups;
+        context.alloc = self.arena.allocator();
+        context.max_groups = @min(saved_groups, self.memory.limit / 2);
+        defer {
+            context.alloc = saved_alloc;
+            context.max_groups = saved_groups;
+        }
+        plan.validate(context, value) catch |err| return self.failure(err);
     }
 
     fn failure(self: *Execution, err: anyerror) anyerror {
         return switch (err) {
-            error.OutOfMemory => if (self.memory.isExhausted()) self.context.limit() else err,
+            error.OutOfMemory => if (self.memory.isExhausted()) (self.shared_context orelse &self.context).limit() else err,
             error.SqlInvalidTextRepresentation, error.InvalidSqlNumber, error.SqlNumericOutOfRange => error.InvalidBatchRequest,
             else => err,
         };
