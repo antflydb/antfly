@@ -527,6 +527,7 @@ pub const storage_lsm_backend_repository = @import("storage/lsm_backend/reposito
 pub const storage_lsm_backend_run_directory = @import("storage/lsm_backend/run_directory.zig");
 pub const storage_lsm_backend_run_store = @import("storage/lsm_backend/run_store.zig");
 pub const storage_lsm_backend_runtime = @import("storage/lsm_backend/runtime.zig");
+pub const storage_lsm_backend_shared_bytes = @import("storage/lsm_backend/shared_bytes.zig");
 pub const storage_lsm_backend_state = @import("storage/lsm_backend/state.zig");
 pub const storage_lsm_backend_storage_io = @import("storage/lsm_backend/storage_io.zig");
 pub const storage_lsm_backend_wal = @import("storage/lsm_backend/wal.zig");

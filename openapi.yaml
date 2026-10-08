@@ -5609,6 +5609,10 @@ paths:
             the primary for linearizable reads. `stale` allows a hot standby to
 
             serve the lookup at its safe-read LSN.
+            Owned object document tables support only explicit `stale` reads of
+            published generations. The default `read_index` and `leader_lease`
+            are rejected with HTTP 400. Use `sync_level=full_index` on writes to
+            wait for publication before a stale lookup.
           schema:
             type: string
             enum:
@@ -15943,6 +15947,18 @@ components:
         default does not migrate data. Snapshot/backup and split operations currently reject vector_store
         tables; explicitly select primary_lsm when these operations are required.
       properties:
+        engine:
+          type: string
+          enum:
+            - local
+            - object
+          default: local
+          description: Durable table engine, independent of deployment. local uses the hosting process's local or Lite
+            backend and normal shard placement. object uses external lake data with durable sidecars, or an Antfly-owned
+            object WAL and published generations. Object tables do not allocate data Raft groups; omit
+            num_shards and replication_sources. Metadata remains authoritative for table lifetime. Configure
+            the shared destination through storage.artifacts. Writable object document tables initially
+            require immutable schema and index definitions; changes require a new table and explicit migration.
         dense_embeddings:
           type: string
           enum:

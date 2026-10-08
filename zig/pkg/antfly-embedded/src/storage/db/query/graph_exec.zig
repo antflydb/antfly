@@ -7764,7 +7764,10 @@ test "db query result shape executeSingleNonPatternQueryWithSets hides metric st
             metric_status[0] = .{
                 .name = try alloc_inner.dupe(u8, "pagerank"),
                 .state = .fresh,
-                .published_generation = 5,
+                // The public status reports the published edge generation,
+                // independently of the metric image's publication identifier.
+                .published_generation = 17,
+                .published_edge_generation = 5,
                 .edge_generation = 5,
                 .target_edge_generation = 5,
                 .progress = 1.0,
