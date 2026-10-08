@@ -353,3 +353,13 @@ resume after close. SQL durable sealed plans and storage decisions require
 distinct handoffs. Native/hosted transaction participant fanout currently has
 a bounded task count but no scheduler execution port; accounting those tasks
 is part of the broader completion integration, not covered by serial SQL work.
+
+
+A retained running execution can now resize its CPU team demand. Growth releases
+its old CPU grant and queues the full demand fairly without reacquiring operation
+or byte admission; shrinking returns excess CPU immediately. Denied reentry
+retains ownership to finish. Native and pinned Nix/glibc pass all 33 scheduler/
+admission contracts, including stale queue-timeout regression evidence; see
+[CPU team reservation receipts](receipts/2026-10-07/runnable-team-reservation/README.md).
+Checked ABI exposure, actual transaction/numerical child integration and child
+heap accounting are still required. This is not accepted completion authority.

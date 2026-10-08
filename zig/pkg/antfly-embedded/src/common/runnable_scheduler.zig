@@ -358,6 +358,37 @@ pub const Scheduler = struct {
         self.dispatch();
         e.waited = e.state == .queued;
     }
+    /// Change a running capsule's CPU team demand. Call only after joining all
+    /// children of the old team. Growth relinquishes the old grant and queues
+    /// the full demand fairly; count/bytes stay reserved through denied reentry.
+    pub fn resizeTeam(self: *Scheduler, e: *Entry, slots: usize) !void {
+        const now = e.options.now();
+        self.lock();
+        defer self.mutex.unlock();
+        if (e.scheduler != self or e.state != .running) return error.InvalidRunnableTransition;
+        const capacity = if (e.class == .control) self.config.control_slots else self.config.slots - self.config.control_slots;
+        if (slots == 0 or slots > capacity) return error.InvalidRunnableDemand;
+        // Live accepted work remains charged when admission closes. Resizing
+        // cannot manufacture an independently valid completion capability.
+        if (self.closed) return error.SchedulerClosed;
+        if (slots <= e.slots) {
+            self.used[@backingInt(e.class)] -= e.slots - slots;
+            e.slots = slots;
+            // Shrinking retains the current grant; no old queue deadline
+            // applies to this synchronous return of CPU capacity.
+            e.waited = false;
+            self.dispatch();
+            return;
+        }
+        self.used[@backingInt(e.class)] -= e.slots;
+        e.slots = slots;
+        e.bypasses = 0;
+        self.sequence +|= 1;
+        e.sequence = self.sequence;
+        self.enqueue(e, now);
+        self.dispatch();
+        e.waited = e.state == .queued;
+    }
     pub fn block(self: *Scheduler, e: *Entry, reason: State) !void {
         self.lock();
         defer self.mutex.unlock();
@@ -535,6 +566,21 @@ pub const Execution = struct {
         if (e.state == .stopped) return e.failure orelse error.InvalidRunnableTransition;
         if (needs_running and e.state != .running) return error.InvalidRunnableTransition;
         return owner;
+    }
+    /// Reserve bounded parallel CPU on this same execution before publishing
+    /// child work. Children borrow the team grant and must all join before any
+    /// resize, park, checkpoint or finish. Physical IO ownership and accepted
+    /// durable completion require their separate capabilities.
+    pub fn resizeTeam(self: *Execution, slots: usize) !void {
+        if (slots == 0) return error.InvalidRunnableDemand;
+        const e = if (self.entry) |*entry| entry else return;
+        const owner = try schedulerFor(e, true);
+        try e.options.check();
+        try owner.resizeTeam(e, slots);
+        try owner.waitRetained(e);
+        self.resume_generation +%= 1;
+        self.quantum_start_ns = e.options.now();
+        self.checkpoints = 0;
     }
     pub fn checkpoint(self: *Execution) !void {
         const e = if (self.entry) |*entry| entry else return;
@@ -1137,4 +1183,122 @@ test "runnable scheduler running write retains completion ownership through canc
     try std.testing.expectEqual(@as(usize, 0), scheduler.stats().runnable_slots);
     try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
     try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+}
+
+test "runnable scheduler team growth releases old CPU while preserving fair retained ownership" {
+    var scheduler = try Scheduler.init(.{ .slots = 5, .max_operations = 8 });
+    defer scheduler.close();
+    var parent = testEntry(.write, 1, 19);
+    defer scheduler.finish(&parent);
+    var peer = testEntry(.query, 3, 11);
+    defer scheduler.finish(&peer);
+    try scheduler.submit(&parent);
+    try scheduler.wait(&parent);
+    try scheduler.submit(&peer);
+    try scheduler.wait(&peer);
+    try scheduler.resizeTeam(&parent, 4);
+    try std.testing.expectEqual(State.queued, scheduler.state(&parent));
+    try std.testing.expectEqual(@as(usize, 3), scheduler.stats().runnable_slots);
+    try std.testing.expectEqual(@as(usize, 2), scheduler.stats().operations);
+    try std.testing.expectEqual(@as(u64, 30), scheduler.stats().retained_bytes);
+    var health = testEntry(.control, 1, 7);
+    defer scheduler.finish(&health);
+    try scheduler.submit(&health);
+    try scheduler.wait(&health);
+    try std.testing.expectEqual(@as(usize, 4), scheduler.stats().runnable_slots);
+    scheduler.finish(&health);
+    scheduler.finish(&peer);
+    try scheduler.waitRetained(&parent);
+    try std.testing.expectEqual(State.running, scheduler.state(&parent));
+    try std.testing.expectEqual(@as(usize, 4), scheduler.stats().runnable_slots);
+    try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+    try std.testing.expectEqual(@as(u64, 19), scheduler.stats().retained_bytes);
+    try scheduler.resizeTeam(&parent, 1);
+    try std.testing.expectEqual(@as(usize, 1), scheduler.stats().runnable_slots);
+    try std.testing.expectEqual(@as(u64, 19), scheduler.stats().retained_bytes);
+}
+
+test "runnable execution team reservations preserve original fencing and denied reentry ownership" {
+    const Flag = struct {
+        canceled: bool = false,
+        fn requested(raw: *const anyopaque) bool {
+            return @as(*const @This(), @ptrCast(@alignCast(raw))).canceled;
+        }
+    };
+    var flag: Flag = .{};
+    var scheduler = try Scheduler.init(.{ .slots = 5, .max_operations = 8 });
+    defer scheduler.close();
+    var execution: Execution = .{};
+    defer execution.finish();
+    try execution.start(&scheduler, .{ .io = std.testing.io, .allow_wait = false, .retained_bytes = 23, .cancellation = .{ .ptr = &flag, .requested = Flag.requested } }, .write);
+    const before = execution.resume_generation;
+    try execution.resizeTeam(4);
+    try std.testing.expectEqual(before + 1, execution.resume_generation);
+    try std.testing.expectEqual(@as(usize, 4), scheduler.stats().runnable_slots);
+    try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+    try std.testing.expectEqual(@as(u64, 23), scheduler.stats().retained_bytes);
+    try std.testing.expectError(error.InvalidRunnableDemand, execution.resizeTeam(0));
+    try std.testing.expectError(error.InvalidRunnableDemand, execution.resizeTeam(5));
+    try std.testing.expectEqual(@as(usize, 4), execution.entry.?.slots);
+    try execution.resizeTeam(1);
+    var peer: Execution = .{};
+    defer peer.finish();
+    try peer.startWithSlots(&scheduler, .{ .io = std.testing.io }, .query, 3);
+    // Split the queueing step from the wait to inject cancellation deterministically.
+    try scheduler.resizeTeam(&execution.entry.?, 4);
+    flag.canceled = true;
+    try std.testing.expectError(error.Canceled, scheduler.waitRetained(&execution.entry.?));
+    try std.testing.expectEqual(State.stopped, scheduler.state(&execution.entry.?));
+    try std.testing.expectEqual(@as(usize, 3), scheduler.stats().runnable_slots);
+    try std.testing.expectEqual(@as(usize, 2), scheduler.stats().operations);
+    try std.testing.expectEqual(@as(u64, 23), scheduler.stats().retained_bytes);
+    flag.canceled = false;
+    try std.testing.expectError(error.Canceled, execution.resizeTeam(1));
+    execution.finish();
+    try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+}
+
+test "runnable scheduler team rejection and shutdown preserve existing running grant" {
+    var scheduler = try Scheduler.init(.{ .slots = 4, .control_slots = 1, .max_operations = 8 });
+    defer scheduler.close();
+    var execution: Execution = .{};
+    defer execution.finish();
+    try execution.start(&scheduler, .{ .io = std.testing.io, .retained_bytes = 31 }, .write);
+    var health: Execution = .{};
+    defer health.finish();
+    try health.start(&scheduler, .{ .io = std.testing.io }, .control);
+    try std.testing.expectError(error.InvalidRunnableDemand, health.resizeTeam(2));
+    try std.testing.expectEqual(@as(usize, 1), health.entry.?.slots);
+    health.finish();
+    scheduler.close();
+    try std.testing.expectError(error.SchedulerClosed, execution.resizeTeam(3));
+    try std.testing.expectEqual(State.running, scheduler.state(&execution.entry.?));
+    try std.testing.expectEqual(@as(usize, 1), scheduler.stats().runnable_slots);
+    try std.testing.expectEqual(@as(u64, 31), scheduler.stats().retained_bytes);
+    execution.finish();
+    try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+}
+
+test "runnable execution team shrink does not reuse an expired prior queue wait" {
+    VirtualClock.value = 0;
+    var scheduler = try Scheduler.init(.{ .slots = 5, .max_operations = 8, .max_wait_ms = 1 });
+    defer scheduler.close();
+    var execution: Execution = .{};
+    defer execution.finish();
+    try execution.start(&scheduler, .{ .io = std.testing.io, .native_now_ns = VirtualClock.now, .retained_bytes = 13 }, .write);
+    var peer = testEntry(.query, 3, 0);
+    defer scheduler.finish(&peer);
+    try scheduler.submit(&peer);
+    try scheduler.wait(&peer);
+    try scheduler.resizeTeam(&execution.entry.?, 4);
+    try std.testing.expectEqual(State.queued, scheduler.state(&execution.entry.?));
+    scheduler.finish(&peer);
+    try scheduler.waitRetained(&execution.entry.?);
+    // The team has computed for longer than its old queue timeout. Giving CPU
+    // back is not a new wait and must not stop an otherwise valid execution.
+    VirtualClock.value = 2 * std.time.ns_per_ms;
+    try execution.resizeTeam(1);
+    try std.testing.expectEqual(State.running, scheduler.state(&execution.entry.?));
+    try std.testing.expectEqual(@as(usize, 1), scheduler.stats().runnable_slots);
+    try std.testing.expectEqual(@as(u64, 13), scheduler.stats().retained_bytes);
 }
