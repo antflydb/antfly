@@ -272,7 +272,7 @@ pub fn coalescePhysicalReadsAlloc(
     if (reads.len == 0) return try alloc.alloc(RangeRead, 0);
 
     var sorted = try alloc.dupe(RangeRead, reads);
-    errdefer alloc.free(sorted);
+    defer alloc.free(sorted);
     for (sorted) |read| try read.validate();
     std.mem.sort(RangeRead, sorted, {}, lessThanRangeRead);
 
@@ -293,7 +293,6 @@ pub fn coalescePhysicalReadsAlloc(
         }
     }
     try out.append(alloc, current);
-    alloc.free(sorted);
     return try out.toOwnedSlice(alloc);
 }
 
@@ -356,6 +355,24 @@ fn lessThanRangeRead(_: void, a: RangeRead, b: RangeRead) bool {
     if (bucket_order != .eq) return bucket_order == .lt;
     const key_order = std.mem.order(u8, a.object.key, b.object.key);
     if (key_order != .eq) return key_order == .lt;
+    // Keep every coalescing compatibility class contiguous. Offset-first
+    // ordering lets an interleaved version, codec or decoded column split
+    // otherwise adjacent reads into needless object-store round trips.
+    if (a.object.byte_len != b.object.byte_len) return a.object.byte_len < b.object.byte_len;
+    const etag_order = std.mem.order(u8, a.object.version.etag, b.object.version.etag);
+    if (etag_order != .eq) return etag_order == .lt;
+    const version_order = std.mem.order(u8, a.object.version.version_id, b.object.version.version_id);
+    if (version_order != .eq) return version_order == .lt;
+    if (a.purpose != b.purpose) return @backingInt(a.purpose) < @backingInt(b.purpose);
+    const codec_order = std.mem.order(u8, a.compression_codec, b.compression_codec);
+    if (codec_order != .eq) return codec_order == .lt;
+    switch (a.purpose) {
+        .decoded_column_page, .projected_row_batch => {
+            const column_order = std.mem.order(u8, a.decoded_column_id, b.decoded_column_id);
+            if (column_order != .eq) return column_order == .lt;
+        },
+        else => {},
+    }
     if (a.range.offset != b.range.offset) return a.range.offset < b.range.offset;
     return a.range.len < b.range.len;
 }
@@ -537,6 +554,57 @@ test "lake range planner coalesces adjacent column chunks by object version" {
     try std.testing.expectEqual(@as(u64, 150), coalesced[0].range.len);
     try std.testing.expectEqualStrings("", coalesced[0].decoded_column_id);
     try std.testing.expectEqualStrings("etag-2", coalesced[1].object.version.etag);
+}
+
+test "lake range planner groups interleaved compatible ranges before coalescing" {
+    const a = std.testing.allocator;
+    const Run = struct {
+        fn run(alloc: Allocator) !void {
+            const object: ObjectRef = .{ .bucket = "warehouse", .key = "part", .byte_len = 1000, .version = .{ .etag = "v1" } };
+            var reads: [8]RangeRead = undefined;
+            for (&reads, 0..) |*read, i| {
+                read.* = .{ .object = object, .range = .{ .offset = 100 + i * 10, .len = 10 }, .purpose = .decoded_column_page, .decoded_column_id = "a" };
+                switch (i % 4) {
+                    0 => {},
+                    1 => read.object.version.etag = "v2",
+                    2 => read.compression_codec = "zstd",
+                    3 => read.decoded_column_id = "b",
+                    else => unreachable,
+                }
+            }
+            const merged = try coalescePhysicalReadsAlloc(alloc, &reads, .{ .max_gap_bytes = 30 });
+            defer alloc.free(merged);
+            try std.testing.expectEqual(@as(usize, 4), merged.len);
+            for (merged) |read| {
+                try read.validate();
+                try std.testing.expectEqual(@as(u64, 50), read.range.len);
+            }
+            // Match every original to precisely one compatible containing
+            // range: reduced reads must never cross a version/codec/column.
+            for (reads) |original| {
+                var matches: usize = 0;
+                for (merged) |read| {
+                    if (sameObjectVersion(read.object, original.object) and
+                        read.purpose == original.purpose and
+                        std.mem.eql(u8, read.compression_codec, original.compression_codec) and
+                        std.mem.eql(u8, read.decoded_column_id, original.decoded_column_id) and
+                        read.range.offset <= original.range.offset and read.range.end() >= original.range.end()) matches += 1;
+                }
+                try std.testing.expectEqual(@as(usize, 1), matches);
+            }
+            // A latency-oriented gap policy is optional: callers can forbid
+            // overfetch and retain all eight exact ranges without padding.
+            const exact = try coalescePhysicalReadsAlloc(alloc, &reads, .{ .max_gap_bytes = 0 });
+            defer alloc.free(exact);
+            try std.testing.expectEqual(@as(usize, 8), exact.len);
+            for (exact) |read| try std.testing.expectEqual(@as(u64, 10), read.range.len);
+        }
+    };
+    try Run.run(a);
+    // Force owned-slice conversion to allocate instead of shrinking in place,
+    // so its failure path exercises scratch/output cleanup independently.
+    var stable = std.testing.FailingAllocator.init(a, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(stable.allocator(), Run.run, .{});
 }
 
 test "lake range planner validates cache lanes and decoded column keys" {

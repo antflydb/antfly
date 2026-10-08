@@ -5835,3 +5835,31 @@ their server integration owner without failures or leaks. All four PostgreSQL va
 modifier, descriptor and assignment observers reverify successfully. Inventory
 integrity remains 929 unresolved; control-catalog, formatting and whitespace checks
 pass without changing original case classifications.
+
+### Cold lake reads: compatibility-grouped coalescing
+
+The requested persistent-cache diagnostics/recovery, server-owned write worker,
+shutdown draining, bounded concurrent prefetch, phase timings and sidecar-based
+highlight hydration are already implemented on this branch. The restart
+regressions cover immutable payload reuse with the provider disabled, not
+offline publication discovery or live GCS latency. Deployment verification still
+requires the same node-local cache directory and per-run provider request/byte
+deltas; local tests cannot explain the previously observed missing cache files.
+
+Physical range planning now groups the complete coalescing compatibility class
+before sorting offsets. Previously, interleaved object versions, codecs or
+decoded-column identities could separate otherwise mergeable ranges. The new
+regression reduces eight such reads to four within the configured gap policy,
+verifies each original has exactly one compatible covering range, and verifies
+zero-gap policy keeps all eight exact reads without padding. This is a request
+count fixture, not a measured production latency improvement. Existing response
+size limits and interpretation/version boundaries remain enforced.
+
+The allocation-fault sweep also covers final output ownership: scratch sorting
+storage is now freed exactly once if conversion to an owned result fails.
+Unrelated in-progress SQL modifier and HTTP discovery edits are preserved.
+
+Validation passes the 35 focused cache/reader tests, 164 lake integration tests
+and all 503 lake-native tests without failures or leaks. The composed restart
+test preserves ranking/highlights with zero provider requests and bytes.
+Formatting and whitespace checks pass. No live GCS latency claim is made.
