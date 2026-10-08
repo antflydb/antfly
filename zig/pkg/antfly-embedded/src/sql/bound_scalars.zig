@@ -88,9 +88,15 @@ pub const Bound = struct {
     }
 
     pub fn matchesWithProvider(self: Bound, alloc: Allocator, values: []const scalar.Datum, parameters: []const std.json.Value, provider: ?@import("../functions/decisions.zig").DecisionProvider) !bool {
+        return self.matchesWithLimits(alloc, values, parameters, provider, .{});
+    }
+
+    /// Predicate evaluation must retain the statement's scalar resource owner
+    /// and cancellation controls even on row-based fallback execution paths.
+    pub fn matchesWithLimits(self: Bound, alloc: Allocator, values: []const scalar.Datum, parameters: []const std.json.Value, provider: ?@import("../functions/decisions.zig").DecisionProvider, limits: scalar.EvalLimits) !bool {
         if (self.typed_parameters and self.invocation == null) return error.UnsupportedSqlShape;
         const program = self.predicate orelse return true;
-        const value = try @import("decision_eval.zig").evaluate(alloc, provider, &program, values, parameters);
+        const value = try @import("decision_eval.zig").evaluateWithLimits(alloc, provider, &program, values, parameters, limits);
         if (value.sql_null) return false;
         if (value.value != .bool) return error.SqlTypeMismatch;
         return value.value.bool;

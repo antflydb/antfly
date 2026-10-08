@@ -4777,3 +4777,18 @@ direct realloc-refusal/retry ownership checks. The import-free WASM gate passes
 original-case credit: the corpus remains 437 implemented / 136 rejected /
 73 superseded / 940 unresolved. The broader native work-accounting audit remains
 open rather than being inferred complete from these representative patterns.
+
+Row-based aggregate predicates and ordinary UPDATE/DELETE predicates now use
+the same limits-aware bound predicate evaluator as other statement execution.
+The fallback row path retains the statement-owned regex pool and native
+cancellation/deadline callback instead of constructing a standalone regex
+session for every row. SQL NULL filtering, boolean type checks and typed
+invocation admission remain shared and unchanged.
+
+Three 1,000-row row-only provider regressions (aggregate, UPDATE and DELETE)
+each require one compilation, 999 cache hits and zero active leases on return.
+Native-only cancellation must abort before mutation admission; a clean retry
+reuses the owner correctly. Exhaustive allocation-failure checks cover all
+three paths. This is deterministic preparation/ownership evidence, not a
+wall-clock benchmark or additional original-case credit. The ledger remains
+437 implemented / 136 rejected / 73 superseded / 940 unresolved.

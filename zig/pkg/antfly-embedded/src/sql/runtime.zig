@@ -231,12 +231,7 @@ pub const Context = struct {
     }
 
     pub fn matchesRow(self: Context, alloc: std.mem.Allocator, cells: []const Datum) !bool {
-        if (self.binding.scalars.typed_parameters and self.binding.scalars.invocation == null) return error.UnsupportedSqlShape;
-        const program = self.binding.scalars.predicate orelse return true;
-        const evaluated = try self.evaluate(alloc, program, cells);
-        if (evaluated.sql_null) return false;
-        if (evaluated.value != .bool) return error.SqlTypeMismatch;
-        return evaluated.value.bool;
+        return self.binding.scalars.matchesWithLimits(alloc, cells, self.parameters, self.backend.decision_provider, @import("decision_eval.zig").limitsFor(self.backend));
     }
 
     pub const ScanState = struct {
@@ -1261,7 +1256,7 @@ pub const Context = struct {
                     const expression_cells = if (evaluated) |batch| batch.cells[row_index] else try self.binding.scalars.cells(scratch, row);
                     if (evaluated) |batch| {
                         if (batch.positions[row_index] == null) continue;
-                    } else if (!try self.binding.scalars.matchesWithProvider(scratch, expression_cells, self.parameters, self.backend.decision_provider)) continue;
+                    } else if (!try self.matchesRow(scratch, expression_cells)) continue;
                     if (mutations.items.len >= self.limits.mutation_rows) return error.SqlProgramLimitExceeded;
                     var document: ?Json = null;
                     var json_null_fields: std.ArrayList([]const u8) = .empty;
@@ -2322,6 +2317,96 @@ test "SQL relation cursors close on early limit quota failure and every allocati
     try std.testing.expectError(error.SqlProgramLimitExceeded, execute(std.testing.allocator, backend.coordinated(), &compiled, &.{}, .{ .page_rows = 1, .scan_rows = 2 }));
     try std.testing.expectEqual(@as(usize, 1), backend.statement_opens);
     try std.testing.expectEqual(backend.statement_opens, backend.statement_closes);
+}
+
+test "SQL row aggregate and mutation predicates reuse statement regex resources" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        "SELECT count(*) FROM things WHERE regexp_like(_id, '[0-9]')",
+        "UPDATE things SET id = id WHERE regexp_like(_id, '[0-9]')",
+        "DELETE FROM things WHERE regexp_like(_id, '[0-9]')",
+    }, 0..) |sql, index| {
+        var compiled = try compiler.compile(a, sql, .{});
+        defer compiled.deinit();
+        // Row-only provider: do not accidentally exercise a columnar path.
+        var backend: TestBackend = .{ .row_count = 1000 };
+        var result = try execute(a, backend.iface(), &compiled, &.{}, .{ .page_rows = 37 });
+        defer result.deinit();
+        if (index == 0) {
+            try std.testing.expectEqualStrings("1000", result.output.rows[0][0].string);
+            try std.testing.expectEqual(@as(usize, 0), backend.writes);
+        } else {
+            try std.testing.expectEqual(@as(u64, 1000), result.output.rows_affected);
+            try std.testing.expectEqual(@as(usize, 1), backend.writes);
+        }
+        const stats = result.state.regex_execution.snapshot();
+        try std.testing.expectEqual(@as(usize, 1), stats.lanes);
+        try std.testing.expectEqual(@as(u64, 1), stats.compilations);
+        try std.testing.expectEqual(@as(u64, 999), stats.hits);
+        try std.testing.expectEqual(@as(usize, 0), stats.active);
+    }
+}
+
+test "SQL row predicate native cancellation prevents mutation and releases resources" {
+    const Control = struct {
+        fixture: *TestBackend,
+        calls: usize = 0,
+        fail: bool = true,
+        fn checkpoint(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            // Let a complete page warm the cache before failing a later page.
+            if (self.fail and self.fixture.pages >= 2) return error.Canceled;
+        }
+    };
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        "SELECT count(*) FROM things WHERE regexp_like(_id, '[0-9]')",
+        "UPDATE things SET id = id WHERE regexp_like(_id, '[0-9]')",
+        "DELETE FROM things WHERE regexp_like(_id, '[0-9]')",
+    }) |sql| {
+        var compiled = try compiler.compile(a, sql, .{});
+        defer compiled.deinit();
+        var fixture: TestBackend = .{ .row_count = 100 };
+        var control: Control = .{ .fixture = &fixture };
+        var backend = fixture.iface();
+        // Scan checkpoints succeed; only a native regex poll can cancel.
+        backend.scalar_control = .{ .ptr = &control, .checkpoint = Control.checkpoint };
+        try std.testing.expectError(error.Canceled, execute(a, backend, &compiled, &.{}, .{ .page_rows = 13 }));
+        try std.testing.expect(control.calls > 0);
+        try std.testing.expectEqual(@as(usize, 2), fixture.pages);
+        try std.testing.expectEqual(@as(usize, 0), fixture.writes);
+        control.fail = false;
+        var retried = try execute(a, backend, &compiled, &.{}, .{ .page_rows = 13 });
+        defer retried.deinit();
+        const stats = retried.state.regex_execution.snapshot();
+        try std.testing.expectEqual(@as(u64, 1), stats.compilations);
+        try std.testing.expectEqual(@as(u64, 99), stats.hits);
+        try std.testing.expectEqual(@as(usize, 0), stats.active);
+    }
+}
+
+test "SQL row predicate ownership unwinds every allocation failure" {
+    const Harness = struct {
+        fn run(a: std.mem.Allocator, compiled: *const compiler.Compiled) !void {
+            var backend: TestBackend = .{ .row_count = 8 };
+            var result = try execute(a, backend.iface(), compiled, &.{}, .{ .page_rows = 3 });
+            defer result.deinit();
+            const stats = result.state.regex_execution.snapshot();
+            try std.testing.expectEqual(@as(u64, 1), stats.compilations);
+            try std.testing.expectEqual(@as(u64, 7), stats.hits);
+            try std.testing.expectEqual(@as(usize, 0), stats.active);
+        }
+    };
+    for ([_][]const u8{
+        "SELECT count(*) FROM things WHERE regexp_like(_id, '[0-9]')",
+        "UPDATE things SET id = id WHERE regexp_like(_id, '[0-9]')",
+        "DELETE FROM things WHERE regexp_like(_id, '[0-9]')",
+    }) |sql| {
+        var compiled = try compiler.compile(std.testing.allocator, sql, .{});
+        defer compiled.deinit();
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{&compiled});
+    }
 }
 
 test "SQL empty global aggregates produce one row and grouped empty input produces none" {

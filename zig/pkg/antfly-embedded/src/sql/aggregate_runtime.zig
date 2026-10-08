@@ -30,7 +30,7 @@ fn addRow(context: anytype, bound: *const binding.Bound, grouped: anytype, alloc
 }
 
 fn addCells(context: anytype, bound: *const binding.Bound, grouped: anytype, alloc: std.mem.Allocator, cells: []const Datum) !void {
-    if (!try bound.input.matchesWithProvider(alloc, cells, context.parameters, context.backend.decision_provider)) return;
+    if (!try bound.input.matchesWithLimits(alloc, cells, context.parameters, context.backend.decision_provider, @import("decision_eval.zig").limitsFor(context.backend))) return;
     const values = try alloc.alloc(Datum, bound.group_count);
     for (bound.input.projections[0..bound.group_count], values) |program, *value| value.* = try context.evaluate(alloc, program.?, cells);
     const inputs = try alloc.alloc(Datum, bound.inputs.len);
