@@ -34,6 +34,11 @@ path = "tests/concurrency.rs"
 required-features = ["libantfly", "serde"]
 
 [[test]]
+name = "sql"
+path = "tests/sql.rs"
+required-features = ["libantfly"]
+
+[[test]]
 name = "errors"
 path = "tests/errors.rs"
 required-features = ["libantfly"]
