@@ -761,7 +761,7 @@ fn numericIdentity(node: Node) Numeric {
     return node.sql_type orelse if (node.kind == .integer) .int64 else if (node.kind == .numeric) .numeric else .float64;
 }
 
-test "relational declarations exact NUMERIC arithmetic casts and ordering match PostgreSQL schema programs" {
+test "relational declarations exact NUMERIC SQL lowering and native programs match PostgreSQL" {
     const a = std.testing.allocator;
     const Case = struct {
         op: []const u8,
@@ -798,28 +798,190 @@ test "relational declarations exact NUMERIC arithmetic casts and ordering match 
         defer plan.deinit();
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();
-        if (entry.@"error") |state| {
-            const failure: anyerror = if (std.mem.eql(u8, state, "22012")) error.RelationalExpressionDivisionByZero else if (std.mem.eql(u8, state, "22003")) error.RelationalExpressionOverflow else if (std.mem.eql(u8, state, "0A000")) error.SqlFeatureNotSupported else return error.TestUnexpectedSqlstate;
-            try std.testing.expectError(failure, plan.evaluate(arena.allocator(), &.{}));
-        } else {
-            const result = try plan.evaluate(arena.allocator(), &.{});
-            if (integer_cast) {
-                const wanted = if (entry.expected.? == .integer) entry.expected.?.integer else try std.fmt.parseInt(i64, entry.expected.?.string, 10);
-                try std.testing.expectEqual(wanted, result.integer);
-            } else if (ordering) {
-                var unavailable = std.heap.FixedBufferAllocator.init(&.{});
-                const borrowed = try plan.evaluate(unavailable.allocator(), &.{});
-                try std.testing.expectEqual(entry.expected.?.integer < 0, borrowed.boolean);
+        const owned = arena.allocator();
+        const token: []const u8 = if (std.mem.eql(u8, op, "add")) "+" else if (std.mem.eql(u8, op, "subtract")) "-" else if (std.mem.eql(u8, op, "multiply")) "*" else if (std.mem.eql(u8, op, "divide")) "/" else if (ordering) "<" else "%";
+        const sql = if (integer_cast)
+            try std.fmt.allocPrint(owned, "CAST(CAST('{s}' AS numeric) AS {s})", .{ entry.left, if (std.mem.eql(u8, op, "int16")) "smallint" else if (std.mem.eql(u8, op, "int32")) "integer" else "bigint" })
+        else
+            try std.fmt.allocPrint(owned, "CAST('{s}' AS numeric) {s} CAST('{s}' AS numeric)", .{ entry.left, token, entry.right.? });
+        var compiled = try @import("../sql/compiler.zig").compileScalar(owned, sql, .{});
+        defer compiled.deinit();
+        const lowered = try @import("../sql/schema_expression.zig").lowerColumns(owned, &.{}, compiled.expression, null);
+        var sql_plan = try Plan.init(a, table, lowered.expression, plan.result_kind);
+        defer sql_plan.deinit();
+        for ([_]*Plan{ &plan, &sql_plan }) |candidate| {
+            if (entry.@"error") |state| {
+                const failure: anyerror = if (std.mem.eql(u8, state, "22012")) error.RelationalExpressionDivisionByZero else if (std.mem.eql(u8, state, "22003")) error.RelationalExpressionOverflow else if (std.mem.eql(u8, state, "0A000")) error.SqlFeatureNotSupported else return error.TestUnexpectedSqlstate;
+                try std.testing.expectError(failure, candidate.evaluate(owned, &.{}));
             } else {
-                var context: exact.Context = .{ .alloc = arena.allocator() };
-                const value = try binary.decodeCanonical(&context, result.numeric);
-                const actual = try exact.format(&context, value.value);
-                try std.testing.expectEqualStrings(entry.expected.?.string, actual);
+                const result = try candidate.evaluate(owned, &.{});
+                if (integer_cast) {
+                    const wanted = if (entry.expected.? == .integer) entry.expected.?.integer else try std.fmt.parseInt(i64, entry.expected.?.string, 10);
+                    try std.testing.expectEqual(wanted, result.integer);
+                } else if (ordering) {
+                    var unavailable = std.heap.FixedBufferAllocator.init(&.{});
+                    const borrowed = try candidate.evaluate(unavailable.allocator(), &.{});
+                    try std.testing.expectEqual(entry.expected.?.integer < 0, borrowed.boolean);
+                } else {
+                    var context: exact.Context = .{ .alloc = arena.allocator() };
+                    const value = try binary.decodeCanonical(&context, result.numeric);
+                    const actual = try exact.format(&context, value.value);
+                    try std.testing.expectEqualStrings(entry.expected.?.string, actual);
+                }
             }
         }
         exercised += 1;
     }
     try std.testing.expectEqual(@as(usize, 537), exercised);
+}
+
+test "relational declarations mixed NUMERIC SQL row programs match PostgreSQL" {
+    const a = std.testing.allocator;
+    const columns = [_]@import("../sql/scalar.zig").Column{
+        .{ .name = "n", .type = .number, .element_type = .numeric },
+        .{ .name = "i", .type = .integer, .element_type = .int64 },
+        .{ .name = "f", .type = .number, .element_type = .float64 },
+    };
+    const table: schema.TableSchema = .{ .storage_mode = .relational, .relational_columns = &.{
+        .{ .name = "n", .path = "n", .column_type = .numeric, .sql_element_type = .numeric },
+        .{ .name = "i", .path = "i", .column_type = .integer, .sql_element_type = .int64 },
+        .{ .name = "f", .path = "f", .column_type = .number, .sql_element_type = .float64 },
+    } };
+    const Case = struct { sql: []const u8, n: ?[]const u8, expected: ?[]const u8 = null, @"error": ?[]const u8 = null };
+    const fixture = try std.json.parseFromSlice(struct { entries: []const Case }, a, @embedFile("../sql/fixtures/sql_schema_numeric_reference.json"), .{ .ignore_unknown_fields = true });
+    defer fixture.deinit();
+    for (fixture.value.entries) |entry| {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const owned = arena.allocator();
+        var compiled = try @import("../sql/compiler.zig").compileScalar(owned, entry.sql, .{});
+        defer compiled.deinit();
+        const lowered = @import("../sql/schema_expression.zig").lowerColumns(owned, &columns, compiled.expression, null) catch |err| {
+            if (entry.@"error") |state| {
+                try std.testing.expectEqualStrings(state, @import("../sql/errors.zig").describe(err).code);
+                continue;
+            }
+            return err;
+        };
+        const kind: Kind = if (lowered.element_type == .numeric) .numeric else switch (lowered.type) {
+            .integer => .integer,
+            .number => .number,
+            .boolean => .boolean,
+            else => unreachable,
+        };
+        var plan = Plan.init(a, table, lowered.expression, kind) catch |err| {
+            std.debug.print("NUMERIC schema lowering failed SQL={s}\n", .{entry.sql});
+            return err;
+        };
+        defer plan.deinit();
+        var execution_bytes: usize = max_allocated_bytes;
+        var execution = Execution.init(owned, &execution_bytes);
+        const values = [_]Value{ if (entry.n) |n| try numericJson(&execution, .{ .string = n }) else .null, .{ .integer = 2 }, .{ .number = 1.25 } };
+        if (entry.@"error") |state| {
+            try std.testing.expectError(if (std.mem.eql(u8, state, "22003")) error.RelationalExpressionOverflow else if (std.mem.eql(u8, state, "22012")) error.RelationalExpressionDivisionByZero else return error.TestUnexpectedSqlstate, plan.evaluate(owned, &values));
+            continue;
+        }
+        const result = try plan.evaluate(owned, &values);
+        if (entry.expected) |wanted| switch (result) {
+            .numeric => |bytes| {
+                var context: exact.Context = .{ .alloc = owned };
+                const decoded = try binary.decodeCanonical(&context, bytes);
+                try std.testing.expectEqualStrings(wanted, try exact.format(&context, decoded.value));
+            },
+            .integer => |value| try std.testing.expectEqual(try std.fmt.parseInt(i64, wanted, 10), value),
+            .number => |value| try std.testing.expectEqual(if (lowered.element_type == .float32) @as(f64, try std.fmt.parseFloat(f32, wanted)) else try std.fmt.parseFloat(f64, wanted), value),
+            .boolean => |value| try std.testing.expectEqualStrings(wanted, if (value) "true" else "false"),
+            else => return error.TestUnexpectedResult,
+        } else try std.testing.expect(result == .null);
+    }
+    try std.testing.expectEqual(@as(usize, 62), fixture.value.entries.len);
+}
+
+test "relational declarations SQL NUMERIC lowering owns plans through allocation faults and compares without scratch" {
+    const Fixture = struct {
+        fn run(alloc: Allocator) !void {
+            const columns = [_]@import("../sql/scalar.zig").Column{
+                .{ .name = "n", .type = .number, .element_type = .numeric },
+                .{ .name = "i", .type = .integer, .element_type = .int64 },
+            };
+            const table: schema.TableSchema = .{ .storage_mode = .relational, .relational_columns = &.{
+                .{ .name = "n", .path = "n", .column_type = .numeric, .sql_element_type = .numeric },
+                .{ .name = "i", .path = "i", .column_type = .integer, .sql_element_type = .int64 },
+            } };
+            var plan = blk: {
+                var temporary = std.heap.ArenaAllocator.init(alloc);
+                defer temporary.deinit();
+                const a = temporary.allocator();
+                const text = "CASE WHEN n>i THEN coalesce(n+1.25,i) ELSE 1/(i-i) END";
+                var compiled = try @import("../sql/compiler.zig").compileScalar(a, text, .{});
+                defer compiled.deinit();
+                const lowered = try @import("../sql/schema_expression.zig").lowerColumns(a, &columns, compiled.expression, null);
+                break :blk try Plan.init(alloc, table, lowered.expression, .numeric);
+            };
+            defer plan.deinit();
+            // Plan owns literals after the input JSON/SQL arena is destroyed.
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            const a = arena.allocator();
+            var bytes: usize = max_allocated_bytes;
+            var execution = Execution.init(a, &bytes);
+            const source = try numericJson(&execution, .{ .string = "9007199254740993.2500" });
+            const result = try plan.evaluate(a, &.{ source, .{ .integer = 2 } });
+            const output = try numericJsonOutput(&execution, result.numeric);
+            try std.testing.expectEqualStrings("9007199254740994.5000", output.number_string);
+            if (plan.evaluate(a, &.{ .null, .{ .integer = 2 } })) |_| {
+                return error.TestExpectedError;
+            } else |err| switch (err) {
+                error.RelationalExpressionDivisionByZero => {},
+                else => return err,
+            }
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const columns = [_]@import("../sql/scalar.zig").Column{.{ .name = "n", .type = .number, .element_type = .numeric }};
+    const table: schema.TableSchema = .{ .storage_mode = .relational, .relational_columns = &.{.{ .name = "n", .path = "n", .column_type = .numeric, .sql_element_type = .numeric }} };
+    var compiled = try @import("../sql/compiler.zig").compileScalar(a, "n >= 0.0000", .{});
+    defer compiled.deinit();
+    const lowered = try @import("../sql/schema_expression.zig").lowerColumns(a, &columns, compiled.expression, null);
+    var plan = try Plan.init(std.testing.allocator, table, lowered.expression, .boolean);
+    defer plan.deinit();
+    var bytes: usize = max_allocated_bytes;
+    var execution = Execution.init(a, &bytes);
+    const value = try numericJson(&execution, .{ .string = "9007199254740993.2500" });
+    const start = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
+    for (0..10000) |_| try std.testing.expect((try plan.evaluate(std.testing.failing_allocator, &.{value})).boolean);
+    std.debug.print("SQL durable NUMERIC comparison: rows=10000 scratch_bytes=0 elapsed_ns={}\n", .{std.Io.Clock.now(.awake, std.testing.io).nanoseconds - start});
+}
+
+test "relational declarations NUMERIC SQL defaults preserve assignment failures and reader capability" {
+    const a = std.testing.allocator;
+    var compiled = try @import("../sql/compiler.zig").compile(a, "CREATE TABLE exact_defaults (n bigint DEFAULT 9007199254740993.5, f real DEFAULT 0.100000001490116119384765625, g bigint GENERATED ALWAYS AS (CAST(9007199254740993.5 AS bigint)) STORED)", .{});
+    defer compiled.deinit();
+    const source = try @import("../sql/ddl_runtime.zig").createSchemaAlloc(a, compiled.statement.create_table);
+    defer a.free(source);
+    var validator = try @import("mod.zig").CompiledTableValidator.init(a, source);
+    defer validator.deinit(a);
+    const expressions = validator.execution.expressions.?;
+    try std.testing.expect(expressions.table.requires_exact_numeric_expressions);
+    var document = try std.json.parseFromSlice(std.json.Value, a, "{}", .{});
+    defer document.deinit();
+    try expressions.applyJson(document.arena.allocator(), &document.value);
+    try std.testing.expectEqual(@as(i64, 9007199254740994), document.value.object.get("n").?.integer);
+    try std.testing.expectEqual(@as(i64, 9007199254740994), document.value.object.get("g").?.integer);
+    try std.testing.expectEqual(@as(f64, @as(f32, 0.1)), document.value.object.get("f").?.float);
+    try expressions.verifyJson(a, document.value);
+    var overflow = try @import("../sql/compiler.zig").compile(a, "CREATE TABLE overflow_defaults (n smallint DEFAULT 32767.5)", .{});
+    defer overflow.deinit();
+    const overflow_source = try @import("../sql/ddl_runtime.zig").createSchemaAlloc(a, overflow.statement.create_table);
+    defer a.free(overflow_source);
+    var overflow_validator = try @import("mod.zig").CompiledTableValidator.init(a, overflow_source);
+    defer overflow_validator.deinit(a);
+    var missing = try std.json.parseFromSlice(std.json.Value, a, "{}", .{});
+    defer missing.deinit();
+    try std.testing.expectError(error.RelationalExpressionOverflow, overflow_validator.execution.expressions.?.applyJson(missing.arena.allocator(), &missing.value));
 }
 
 test "relational declarations NUMERIC schema execution owns scratch and shares sticky admission" {

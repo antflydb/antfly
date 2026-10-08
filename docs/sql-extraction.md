@@ -5432,3 +5432,51 @@ its 13.96 GB reservation and duplicate ownership of a guarded graph replay
 raft-batch test. Its compile-time-filtered replicated-apply regression passes
 with the new semantic error included in the expected-failure roundtrip audit;
 this does not establish that the broad runtime target is green.
+
+### Exact NUMERIC SQL schema-expression lowering
+
+SQL schema expressions now lower exact NUMERIC literals, arithmetic, remainder,
+negation, comparisons, CASE, COALESCE, membership and numeric assignment casts
+into the bounded native VM. Durable column nodes explicitly record conversions
+when scalar binding changes their inferred domain; an integer column is never
+merely relabeled as NUMERIC. Unknown numeric input preserves PostgreSQL input
+SQLSTATEs before schema validation. Typed NULLs do not choose a floating domain
+for a decimal comparison or membership list.
+
+Mixed operator comparisons use float8 when required, including precision-sensitive
+integer/real and NUMERIC/real cases; CASE/COALESCE retain their separate real
+common-type rules. Same-domain comparisons avoid unnecessary casts. Simple
+partial-index column/literal predicates survive lowering, including checked
+casts of integer/float literals. Exact NUMERIC index predicate activation remains
+guarded rather than converting decimal input through binary float.
+
+Decimal defaults retain their exact source plus their declared assignment cast.
+Wide integral rounding and narrowing overflow therefore happen during mutations,
+not by prematurely rounding a default through f64. Generated/default programs
+using this domain require the previously introduced reader capability 21.
+Native publication, omitted-value application and strict verification cover a
+wide half-integer default and generated bigint, a real default, and deferred
+smallint overflow.
+
+The existing 537 PostgreSQL arithmetic/cast/order contracts now run through both
+raw native programs and SQL parsing/binding/lowering. A separate independently
+reproducible PostgreSQL 18 fixture covers 62 mixed-row, NULL, special-value,
+conditional, membership, cast and input-error contracts. Exhaustive allocation
+faults cover SQL preparation, independently owned plan literals, scratch,
+successful output and failing execution. A 10,000-row exact comparison sample
+requires zero scratch allocations; its Debug local sample is about 3 ms, not a
+claim about deployed query latency.
+
+This connects exact NUMERIC SQL expressions to native schema execution; it does
+not complete public scalar NUMERIC activation. Public schema/generated expression
+enums, typmods, exact schema constraints/index activation, dynamic text casts,
+non-finite floating domains and complete shared statement/schema work accounting
+remain unfinished. No original
+parity case is credited solely for these infrastructure tests; 929 remain
+unresolved pending source-owned execution/storage evidence.
+
+Validation passes: 587 local SQL tests (three existing skips), 226 server SQL
+tests and 27 schema-expression tests, with no failures or leaks. The independent
+62-case PostgreSQL oracle, inventory integrity, Zig formatting, whitespace and
+control-catalog consistency checks pass. These gates do not supersede the broad
+durable-runtime compiler/ownership failure documented above.

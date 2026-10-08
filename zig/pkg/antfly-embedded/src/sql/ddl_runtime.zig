@@ -169,20 +169,17 @@ pub fn bindDefault(alloc: std.mem.Allocator, value: ast.Value, kind: ast.ColumnT
 /// an INSERT/UPDATE DEFAULT failure, not a schema-publication failure. Keep
 /// the source literal separate from its target domain in the durable plan.
 pub fn defaultExpression(alloc: std.mem.Allocator, value: ast.Value, kind: ast.ColumnType, element: ?@import("array_value.zig").ElementType) !std.json.Value {
-    if (value == .numeric and kind == .number) {
-        if (element == .numeric) return error.UnsupportedSqlShape;
-        // Native real/double defaults retain their assignment cast. Parse the
-        // exact literal directly at the requested width, avoiding a double
-        // rounding through f64 for real defaults.
-        const exact = @import("numeric_value.zig");
-        var context: exact.Context = .{ .alloc = alloc };
-        var source = try exact.parse(&context, value.numeric);
-        defer source.deinit();
-        const text = try exact.format(&context, source.value);
-        defer alloc.free(text);
-        const casts = @import("builtin_cast.zig");
-        const number = if (element == .float32) try casts.floatValue(f32, .{ .string = text }) else try casts.floatValue(f64, .{ .string = text });
-        return defaultExpression(alloc, .{ .number = number }, kind, element);
+    if (value == .numeric and (kind == .integer or kind == .number)) {
+        const target = element orelse if (kind == .integer) @as(@import("array_value.zig").ElementType, .int64) else .float64;
+        const source = try @import("schema_expression.zig").numericLiteral(alloc, .{ .string = value.numeric });
+        // Keep the exact source and assignment domain separate. Overflow and
+        // rounding belong to mutation execution, just as for integer defaults.
+        return std.json.parseFromSliceLeaky(std.json.Value, alloc, try std.json.Stringify.valueAlloc(alloc, .{
+            .op = "cast",
+            .type = if (target == .numeric) "numeric" else @tagName(kind),
+            .sql_type = @tagName(target),
+            .args = &[_]std.json.Value{source},
+        }, .{}), .{ .parse_numbers = false });
     }
     const numeric = (kind == .integer and value == .integer) or (kind == .number and (value == .integer or value == .number));
     if (numeric) {
@@ -192,11 +189,13 @@ pub fn defaultExpression(alloc: std.mem.Allocator, value: ast.Value, kind: ast.C
         const target_type: @import("array_value.zig").ElementType = element orelse if (kind == .integer) .int64 else .float64;
         return std.json.parseFromSliceLeaky(std.json.Value, alloc, try std.json.Stringify.valueAlloc(alloc, .{
             .op = "cast",
-            .type = @tagName(kind),
+            .type = if (target_type == .numeric) "numeric" else @tagName(kind),
             .sql_type = @tagName(target_type),
             .args = &.{.{ .op = "literal", .type = @tagName(source), .sql_type = @tagName(source_type), .value = literal }},
         }, .{}), .{ .parse_numbers = false });
     }
+    if (kind == .number and element == .numeric and (value == .null or value == .string))
+        return @import("schema_expression.zig").numericLiteral(alloc, if (value == .null) .null else .{ .string = value.string });
     const literal = try bindDefault(alloc, value, kind, element);
     return std.json.parseFromSliceLeaky(std.json.Value, alloc, try std.json.Stringify.valueAlloc(alloc, .{ .op = "literal", .type = if (kind == .uuid) "string" else @tagName(kind), .value = literal }, .{}), .{ .parse_numbers = false });
 }
@@ -249,7 +248,9 @@ test "SQL precise scalar DDL preserves CREATE ALTER default assignment casts" {
     try std.testing.expectEqualStrings("float32", properties.get("f").?.object.get("x-antfly-sql-type").?.string);
     const defaults = schema.object.get("column_defaults").?.array.items;
     try std.testing.expectEqualStrings("float32", defaults[1].object.get("expression").?.object.get("sql_type").?.string);
-    try std.testing.expectEqual(@as(f64, @as(f32, 0.1)), defaults[1].object.get("expression").?.object.get("args").?.array.items[0].object.get("value").?.float);
+    const source = defaults[1].object.get("expression").?.object.get("args").?.array.items[0];
+    try std.testing.expectEqualStrings("numeric", source.object.get("type").?.string);
+    try std.testing.expectEqualStrings("0.1", source.object.get("value").?.string);
     for ([_][]const u8{ "CREATE TABLE bad (n smallint DEFAULT 32768)", "CREATE TABLE bad (n integer DEFAULT 2147483648)" }) |sql| {
         var bad = try @import("compiler.zig").compile(a, sql, .{});
         defer bad.deinit();
@@ -295,6 +296,7 @@ test "SQL expression DDL binds defaults and generated columns against the comple
         "ALTER TABLE exprs ALTER COLUMN n SET DEFAULT (2+3)",
         "ALTER TABLE exprs ADD COLUMN h bigint GENERATED ALWAYS AS (n*2) STORED NOT NULL",
         "ALTER TABLE exprs ADD COLUMN extra integer DEFAULT (4*5) NOT NULL",
+        "ALTER TABLE exprs ADD COLUMN rounded real DEFAULT CAST(0.1+0.2 AS double precision)",
     }) |sql| {
         var compiled = try @import("compiler.zig").compile(a, sql, .{});
         defer compiled.deinit();
@@ -306,7 +308,6 @@ test "SQL expression DDL binds defaults and generated columns against the comple
         .{ .sql = "ALTER TABLE exprs ADD COLUMN bad integer GENERATED ALWAYS AS (g+1) STORED", .failure = error.SqlInvalidGenerationExpression },
         .{ .sql = "ALTER TABLE exprs ADD COLUMN bad integer GENERATED ALWAYS AS (absent+1) STORED", .failure = error.UndefinedColumn },
         .{ .sql = "ALTER TABLE exprs ALTER COLUMN g SET DEFAULT 5", .failure = error.InvalidSqlSyntax },
-        .{ .sql = "ALTER TABLE exprs ADD COLUMN bad real DEFAULT CAST(0.1+0.2 AS double precision)", .failure = error.UnsupportedSqlShape },
     }) |case| {
         var compiled = try @import("compiler.zig").compile(a, case.sql, .{});
         defer compiled.deinit();

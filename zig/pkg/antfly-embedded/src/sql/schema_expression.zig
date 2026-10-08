@@ -20,16 +20,35 @@ const ast = @import("ast.zig");
 const scalar = @import("scalar.zig");
 const Json = std.json.Value;
 
+fn nativeType(kind: ast.ColumnType, identity: ?@import("array_value.zig").ElementType) []const u8 {
+    return if (kind == .number and identity == .numeric) "numeric" else if (kind == .uuid) "string" else @tagName(kind);
+}
+
+fn nullLiteral(instruction: scalar.Instruction) bool {
+    return instruction.operation == .literal and instruction.operation.literal == .null;
+}
+
 fn promoteNumeric(alloc: std.mem.Allocator, value: Json, source: scalar.Type, target: scalar.Type) !Json {
     if (target.kind != .integer and target.kind != .number) return value;
     const identity: @import("array_value.zig").ElementType = target.element_type orelse if (target.kind == .integer) .int64 else .float64;
     const source_identity: @import("array_value.zig").ElementType = source.element_type orelse if (source.kind == .integer) .int64 else .float64;
     if (source.kind == target.kind and source_identity == identity) return value;
-    return json(alloc, .{ .op = "cast", .type = @tagName(target.kind.?), .sql_type = @tagName(identity), .args = &[_]Json{value} });
+    return json(alloc, .{ .op = "cast", .type = nativeType(target.kind.?, identity), .sql_type = @tagName(identity), .args = &[_]Json{value} });
 }
 
 fn json(alloc: std.mem.Allocator, input: anytype) !Json {
     return std.json.parseFromSliceLeaky(Json, alloc, try std.json.Stringify.valueAlloc(alloc, input, .{}), .{ .parse_numbers = false });
+}
+
+/// Preserve PostgreSQL input-function SQLSTATEs before handing a durable
+/// literal to schema validation, whose malformed-program errors are broader.
+pub fn numericLiteral(alloc: std.mem.Allocator, value: Json) !Json {
+    if (value != .null) {
+        var context: @import("numeric_value.zig").Context = .{ .alloc = alloc };
+        var parsed = try @import("numeric_storage.zig").fromJson(&context, value);
+        defer parsed.deinit();
+    }
+    return json(alloc, .{ .op = "literal", .type = "numeric", .sql_type = "numeric", .value = value });
 }
 
 pub fn lower(alloc: std.mem.Allocator, schema: Json, expression: *const ast.Scalar, expected: ?ast.ColumnType) !Json {
@@ -59,9 +78,6 @@ pub fn lowerColumns(alloc: std.mem.Allocator, columns: []const scalar.Column, ex
         // widths, however, travel with each operation rather than disappearing
         // into its coarse physical integer/number result kind.
         if (kind == .array) return error.UnsupportedSqlShape;
-        // Query NUMERIC support must not publish a decimal program into the
-        // native expression VM, whose row values still lack decimal limbs.
-        if (instruction.type.element_type == .numeric) return error.UnsupportedSqlShape;
         if (kind == .number and instruction.type.element_type == null) switch (instruction.operation) {
             .binary => |part| switch (part.op) {
                 .add, .subtract, .multiply, .divide => return error.UnsupportedSqlShape,
@@ -71,8 +87,8 @@ pub fn lowerColumns(alloc: std.mem.Allocator, columns: []const scalar.Column, ex
             else => {},
         };
         out.* = switch (instruction.operation) {
-            .literal => |literal| try json(alloc, .{ .op = "literal", .type = if (kind == .uuid) "string" else @tagName(kind), .value = literal }),
-            .column => |ordinal| try json(alloc, .{ .op = "column", .column = columns[ordinal].name }),
+            .literal => |literal| if (instruction.type.element_type == .numeric) try numericLiteral(alloc, literal) else try json(alloc, .{ .op = "literal", .type = nativeType(kind, instruction.type.element_type), .value = literal }),
+            .column => |ordinal| try promoteNumeric(alloc, try json(alloc, .{ .op = "column", .column = columns[ordinal].name }), .{ .kind = columns[ordinal].type, .element_type = columns[ordinal].element_type }, instruction.type),
             .parameter => return error.InvalidSqlParameters,
             .unary => |part| blk: {
                 if (part.op == .positive) break :blk values[part.operand];
@@ -104,13 +120,38 @@ pub fn lowerColumns(alloc: std.mem.Allocator, columns: []const scalar.Column, ex
                 var right = values[part.right];
                 switch (part.op) {
                     .add, .subtract, .multiply, .divide, .modulo => {
-                        if (part.op == .modulo and kind != .integer) return error.UnsupportedSqlShape;
+                        if (part.op == .modulo and kind != .integer and instruction.type.element_type != .numeric) return error.UnsupportedSqlShape;
                         // The query VM promotes operands at execution time. A
                         // durable program must record that promotion explicitly.
                         const indexes = [_]usize{ part.left, part.right };
                         const operands = [_]*Json{ &left, &right };
                         for (indexes, operands) |index, operand| {
                             operand.* = try promoteNumeric(alloc, operand.*, program.instructions[index].type, instruction.type);
+                        }
+                    },
+                    .eq, .neq, .lt, .lte, .gt, .gte, .is_distinct, .is_not_distinct => {
+                        var lhs = program.instructions[part.left].type;
+                        var rhs = program.instructions[part.right].type;
+                        if (nullLiteral(program.instructions[part.left])) lhs = rhs;
+                        if (nullLiteral(program.instructions[part.right])) rhs = lhs;
+                        if ((lhs.kind == .integer or lhs.kind == .number) and
+                            (rhs.kind == .integer or rhs.kind == .number))
+                        {
+                            const casts = @import("builtin_cast.zig");
+                            var identity = try casts.commonNumeric(lhs.element_type orelse if (lhs.kind == .integer) .int64 else .float64, rhs.element_type orelse if (rhs.kind == .integer) .int64 else .float64);
+                            // Mixed NUMERIC/real comparison operators select
+                            // float8; conditional common types still use real.
+                            if (identity == .float32 and lhs.element_type != rhs.element_type) identity = .float64;
+                            const common: scalar.Type = .{ .kind = if (casts.integral(identity)) .integer else .number, .element_type = identity };
+                            // Same physical integer/float domains already
+                            // compare at full precision. Redundant casts also
+                            // obscure simple partial-index column/literal keys.
+                            const same_domain = (lhs.kind == .integer and rhs.kind == .integer) or
+                                (lhs.kind == .number and rhs.kind == .number and lhs.element_type != .numeric and rhs.element_type != .numeric);
+                            if (!same_domain) {
+                                left = try promoteNumeric(alloc, left, program.instructions[part.left].type, common);
+                                right = try promoteNumeric(alloc, right, program.instructions[part.right].type, common);
+                            }
                         }
                     },
                     else => {},
@@ -126,7 +167,7 @@ pub fn lowerColumns(alloc: std.mem.Allocator, columns: []const scalar.Column, ex
                     else => return error.UnsupportedSqlShape,
                 };
                 const args = try alloc.alloc(Json, part.args.len);
-                if (part.function == .mod and kind != .integer) return error.UnsupportedSqlShape;
+                if (part.function == .mod and kind != .integer and instruction.type.element_type != .numeric) return error.UnsupportedSqlShape;
                 for (args, part.args) |*arg, index| arg.* = if (part.function == .coalesce or part.function == .mod)
                     try promoteNumeric(alloc, values[index], program.instructions[index].type, instruction.type)
                 else
@@ -140,7 +181,14 @@ pub fn lowerColumns(alloc: std.mem.Allocator, columns: []const scalar.Column, ex
                 const source = program.instructions[part.operand].type;
                 if ((source.kind == .integer or source.kind == .number) and (part.type == .integer or part.type == .number)) {
                     const target_type: @import("array_value.zig").ElementType = part.element_type orelse if (part.type == .integer) .int64 else .float64;
-                    break :blk try json(alloc, .{ .op = "cast", .type = @tagName(part.type), .sql_type = @tagName(target_type), .args = &[_]Json{values[part.operand]} });
+                    break :blk try json(alloc, .{ .op = "cast", .type = nativeType(part.type, target_type), .sql_type = @tagName(target_type), .args = &[_]Json{values[part.operand]} });
+                }
+                // Validate unknown input with the exact NUMERIC input function;
+                // the durable plan owns its compiled coefficient, never f64.
+                if (part.element_type == .numeric and source.kind == .string and
+                    program.instructions[part.operand].operation == .literal)
+                {
+                    break :blk try numericLiteral(alloc, program.instructions[part.operand].operation.literal);
                 }
                 if (source.kind != part.type) return error.UnsupportedSqlShape;
                 if (source.element_type != part.element_type) return error.UnsupportedSqlShape;
@@ -156,7 +204,7 @@ pub fn lowerColumns(alloc: std.mem.Allocator, columns: []const scalar.Column, ex
                 args[args.len - 1] = if (part.otherwise) |other|
                     try promoteNumeric(alloc, values[other], program.instructions[other].type, instruction.type)
                 else if (kind == .integer or kind == .number)
-                    try json(alloc, .{ .op = "literal", .type = @tagName(kind), .sql_type = @tagName(instruction.type.element_type orelse if (kind == .integer) @as(@import("array_value.zig").ElementType, .int64) else .float64), .value = @as(?u8, null) })
+                    try json(alloc, .{ .op = "literal", .type = nativeType(kind, instruction.type.element_type), .sql_type = @tagName(instruction.type.element_type orelse if (kind == .integer) @as(@import("array_value.zig").ElementType, .int64) else .float64), .value = @as(?u8, null) })
                 else
                     try json(alloc, .{ .op = "literal", .type = if (kind == .uuid) "string" else @tagName(kind), .value = @as(?u8, null) });
                 break :blk try json(alloc, .{ .op = "case_when", .args = args });
@@ -167,12 +215,18 @@ pub fn lowerColumns(alloc: std.mem.Allocator, columns: []const scalar.Column, ex
                 indexes[0] = part.operand;
                 @memcpy(indexes[1..], part.values);
                 var common_type = program.instructions[part.operand].type;
+                for (indexes) |index| {
+                    if (!nullLiteral(program.instructions[index])) {
+                        common_type = program.instructions[index].type;
+                        break;
+                    }
+                }
                 if (common_type.kind == .integer or common_type.kind == .number) {
-                    if (common_type.kind == .number and common_type.element_type == null) return error.UnsupportedSqlShape;
-                    for (indexes[1..]) |index| {
+                    for (indexes) |index| {
+                        if (nullLiteral(program.instructions[index])) continue;
                         const other = program.instructions[index].type;
-                        if (other.kind == .number and other.element_type == null) return error.UnsupportedSqlShape;
-                        const identity = try @import("builtin_cast.zig").commonNumeric(common_type.element_type orelse if (common_type.kind == .integer) .int64 else .float64, other.element_type orelse if (other.kind == .integer) .int64 else .float64);
+                        var identity = try @import("builtin_cast.zig").commonNumeric(common_type.element_type orelse if (common_type.kind == .integer) .int64 else .float64, other.element_type orelse if (other.kind == .integer) .int64 else .float64);
+                        if (identity == .float32 and common_type.element_type != other.element_type) identity = .float64;
                         common_type = .{ .kind = if (@import("builtin_cast.zig").integral(identity)) .integer else .number, .element_type = identity };
                     }
                 }
@@ -217,7 +271,7 @@ pub fn lowerAssignment(alloc: std.mem.Allocator, schema: Json, expression: *cons
         // domain; never persist binary-float evaluation under that contract.
         if (lowered.type == .number and lowered.element_type == null) return error.UnsupportedSqlShape;
         const target: @import("array_value.zig").ElementType = column.element_type orelse if (column.type == .integer) .int64 else .float64;
-        return json(alloc, .{ .op = "cast", .type = @tagName(column.type), .sql_type = @tagName(target), .args = &[_]Json{lowered.expression} });
+        return json(alloc, .{ .op = "cast", .type = nativeType(column.type, target), .sql_type = @tagName(target), .args = &[_]Json{lowered.expression} });
     }
     if (lowered.type != column.type) return error.SqlAssignmentTypeMismatch;
     return lowered.expression;
@@ -284,9 +338,38 @@ fn collectPredicates(alloc: std.mem.Allocator, expression: Json, predicates: *st
         if (std.mem.eql(u8, op, candidate)) break true;
     } else false;
     if (!allowed or args.array.items.len != 2) return error.UnsupportedSqlShape;
-    const literal = args.array.items[1];
-    if (!std.mem.eql(u8, literal.object.get("op").?.string, "literal")) return error.UnsupportedSqlShape;
-    try predicates.append(alloc, try json(alloc, .{ .column = column.string, .op = op, .value = literal.object.get("value") orelse .null }));
+    const literal = try predicateLiteral(args.array.items[1]);
+    try predicates.append(alloc, try json(alloc, .{ .column = column.string, .op = op, .value = literal }));
+}
+
+/// Fold only admitted numeric casts of a literal, never a row-dependent
+/// expression. Predicate values keep their comparison domain after lowering.
+fn predicateLiteral(expression: Json) anyerror!Json {
+    const op = expression.object.get("op").?.string;
+    if (std.mem.eql(u8, op, "literal")) return expression.object.get("value") orelse .null;
+    if (!std.mem.eql(u8, op, "cast")) return error.UnsupportedSqlShape;
+    const args = expression.object.get("args").?.array.items;
+    if (args.len != 1) return error.UnsupportedSqlShape;
+    const source_type = args[0].object.get("type") orelse return error.UnsupportedSqlShape;
+    // Exact NUMERIC predicates still need their public index value domain;
+    // never turn a decimal input-function cast into a binary-float shortcut.
+    if (std.mem.eql(u8, source_type.string, "numeric")) return error.UnsupportedSqlShape;
+    const value = try predicateLiteral(args[0]);
+    if (value == .null) return .null;
+    const target = expression.object.get("sql_type").?.string;
+    const casts = @import("builtin_cast.zig");
+    if (std.mem.eql(u8, target, "float32")) return .{ .float = try casts.floatValue(f32, value) };
+    if (std.mem.eql(u8, target, "float64")) return .{ .float = try casts.floatValue(f64, value) };
+    const identity = std.meta.stringToEnum(@import("array_value.zig").ElementType, target) orelse return error.UnsupportedSqlShape;
+    if (!casts.integral(identity)) return error.UnsupportedSqlShape;
+    if (std.mem.eql(u8, source_type.string, "number"))
+        return .{ .integer = try casts.floatingInteger(try casts.floatValue(f64, value), identity) };
+    return .{ .integer = switch (value) {
+        .integer => |v| try casts.checkedInteger(v, identity),
+        .float => |v| try casts.floatingInteger(v, identity),
+        .number_string => |v| try casts.integerText(v, identity),
+        else => return error.UnsupportedSqlShape,
+    } };
 }
 
 test "SQL schema expressions bind nullable catalog shapes and cold typed arrays" {
@@ -300,6 +383,11 @@ test "SQL schema expressions bind nullable catalog shapes and cold typed arrays"
     defer check.deinit();
     const lowered = try lower(a, schema, check.expression, .boolean);
     try std.testing.expectEqualStrings("and", lowered.object.get("op").?.string);
+    var partial = try @import("compiler.zig").compileScalar(a, "n > 0", .{});
+    defer partial.deinit();
+    const predicates = try lowerIndexPredicate(a, schema, partial.expression);
+    try std.testing.expectEqualStrings("n", predicates[0].object.get("column").?.string);
+    try std.testing.expectEqualStrings("gt", predicates[0].object.get("op").?.string);
     var index = try @import("compiler.zig").compileScalar(a, "lower(label)", .{});
     defer index.deinit();
     const key = try lowerTyped(a, schema, index.expression, null);
@@ -312,6 +400,23 @@ test "SQL schema expressions bind nullable catalog shapes and cold typed arrays"
     var array = try @import("compiler.zig").compileScalar(a, "cold IS NULL", .{});
     defer array.deinit();
     try std.testing.expectError(error.UnsupportedSqlShape, lower(a, schema, array.expression, .boolean));
+}
+
+test "SQL schema comparison lowering preserves simple partial index literals" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const schema = try std.json.parseFromSliceLeaky(Json, a,
+        \\{"default_type":"row","document_schemas":{"row":{"schema":{"properties":{"n":{"type":"integer"},"f":{"type":"number"}}}}}}
+    , .{});
+    for ([_][]const u8{ "n > 1", "f > 1", "f > CAST(1 AS real)", "n > CAST(1 AS smallint)" }) |sql| {
+        var compiled = try @import("compiler.zig").compileScalar(a, sql, .{});
+        defer compiled.deinit();
+        const predicates = try lowerIndexPredicate(a, schema, compiled.expression);
+        try std.testing.expectEqual(@as(usize, 1), predicates.len);
+        try std.testing.expectEqualStrings("gt", predicates[0].object.get("op").?.string);
+        try std.testing.expectEqual(@as(f64, 1), try @import("builtin_cast.zig").floatValue(f64, predicates[0].object.get("value").?));
+    }
 }
 
 test "SQL schema conditional expressions enforce durable branch admission" {
