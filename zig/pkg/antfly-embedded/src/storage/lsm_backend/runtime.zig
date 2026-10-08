@@ -85,16 +85,21 @@ const VisibleBytes = union(enum) {
     }
 };
 
+const SharedBytes = @import("shared_bytes.zig").SharedBytes;
+const RunSourceLease = @import("source_lease.zig").Lease;
+
 const SourceBlockLease = union(enum) {
     none,
     owned: OwnedBytes,
     cached: cache_mod.Handle,
+    local: *SharedBytes,
 
     fn bytes(self: *const @This()) ?[]const u8 {
         return switch (self.*) {
             .none => null,
             .owned => |owned| owned.bytes,
             .cached => |*handle| handle.runTableBlock(),
+            .local => |payload| payload.bytes,
         };
     }
 
@@ -110,6 +115,7 @@ const SourceBlockLease = union(enum) {
             .none => {},
             .owned => |*owned| owned.release(),
             .cached => |*handle| handle.release(),
+            .local => |payload| payload.release(),
         }
         self.* = .none;
     }
@@ -916,6 +922,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         source_entries: []?SourceEntry,
         source_key_copies: []?[]u8 = &.{},
         source_blocks: []SourceBlockLease,
+        source_run_leases: []?*RunSourceLease = &.{},
         source_block_indices: []?usize,
         source_table_indices: []?*const lsm_table_file.TableIndex,
         source_table_index_handles: []?cache_mod.Handle,
@@ -945,6 +952,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
             cursorStorageAdvance(?SourceEntry, &offset, source_count);
             cursorStorageAdvance(?[]u8, &offset, source_count);
             cursorStorageAdvance(SourceBlockLease, &offset, source_count);
+            cursorStorageAdvance(?*RunSourceLease, &offset, source_count);
             cursorStorageAdvance(?usize, &offset, source_count);
             cursorStorageAdvance(?*const lsm_table_file.TableIndex, &offset, source_count);
             cursorStorageAdvance(?cache_mod.Handle, &offset, source_count);
@@ -1065,6 +1073,8 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
             @memset(source_key_copies, null);
             const source_blocks = cursorStorageSlice(SourceBlockLease, storage, &offset, source_count);
             @memset(source_blocks, .none);
+            const source_run_leases = cursorStorageSlice(?*RunSourceLease, storage, &offset, source_count);
+            @memset(source_run_leases, null);
             const source_block_indices = cursorStorageSlice(?usize, storage, &offset, source_count);
             @memset(source_block_indices, null);
             const source_table_indices = cursorStorageSlice(?*const lsm_table_file.TableIndex, storage, &offset, source_count);
@@ -1102,6 +1112,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
                 .source_entries = source_entries,
                 .source_key_copies = source_key_copies,
                 .source_blocks = source_blocks,
+                .source_run_leases = source_run_leases,
                 .source_block_indices = source_block_indices,
                 .source_table_indices = source_table_indices,
                 .source_table_index_handles = source_table_index_handles,
@@ -1118,6 +1129,8 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         pub fn close(self: *@This()) void {
             defer if (self.cursor_reservation) |*lease| lease.release();
             for (0..self.source_blocks.len) |source_index| self.clearSourceBlock(source_index);
+            for (0..self.source_run_leases.len) |source_index| self.clearSourceRunLease(source_index);
+            if (comptime @hasDecl(BackendType, "trimRunSources")) self.backend.trimRunSources();
             for (0..self.source_key_copies.len) |source_index| self.clearSourceKeyCopy(source_index);
             for (self.source_table_index_handles) |*maybe_handle| {
                 if (maybe_handle.*) |*handle| handle.release();
@@ -1130,6 +1143,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
             } else {
                 self.allocator.free(self.source_block_indices);
                 self.allocator.free(self.source_blocks);
+                self.allocator.free(self.source_run_leases);
                 self.allocator.free(self.source_entries);
                 self.allocator.free(self.source_key_copies);
                 self.allocator.free(self.positions);
@@ -1483,6 +1497,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
             const span = &self.run_spans[source_index];
             if (span.current == run_index) return;
             self.clearSourceBlock(source_index);
+            self.clearSourceRunLease(source_index);
             if (self.source_table_index_handles[source_index]) |*handle| handle.release();
             self.source_table_index_handles[source_index] = null;
             self.source_table_indices[source_index] = null;
@@ -2036,6 +2051,12 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
             } };
         }
 
+        fn clearSourceRunLease(self: *@This(), source_index: usize) void {
+            if (self.source_run_leases.len == 0) return;
+            if (self.source_run_leases[source_index]) |lease| lease.release();
+            self.source_run_leases[source_index] = null;
+        }
+
         fn clearSourceBlock(self: *@This(), source_index: usize) void {
             self.source_blocks[source_index].release();
             self.source_block_indices[source_index] = null;
@@ -2144,6 +2165,10 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
                 const block = handle.runTableBlock();
                 self.source_blocks[source_index] = .{ .cached = handle };
                 break :blk block;
+            } else if (localBlockCacheEnabled(self.backend)) blk: {
+                const payload = try loadLocalBlockLease(self.backend, run, index, window, self.backend_locked);
+                self.source_blocks[source_index] = .{ .local = payload };
+                break :blk payload.bytes;
             } else blk: {
                 const owned = try loadOwnedBlockForWindowAllocMaybeLocked(
                     self.backend,
@@ -2156,6 +2181,11 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
                 self.source_blocks[source_index] = .{ .owned = .{ .allocator = self.backend.allocator, .bytes = owned } };
                 break :blk owned;
             };
+            // Retain only sources already opened by real I/O. A fully cached
+            // scan needs no extra descriptor or catalog publication.
+            if (comptime @hasDecl(BackendType, "retainCachedRunSource")) {
+                if (self.source_run_leases.len != 0 and self.source_run_leases[source_index] == null) self.source_run_leases[source_index] = self.backend.retainCachedRunSource(run.path.?);
+            }
             self.source_block_indices[source_index] = window.relative_offset;
             try self.prefetchNextSourceBlock(source_index, run, index, block_index);
             return bytes;
@@ -6681,7 +6711,7 @@ fn loadRunTableIndexWithStats(backend: anytype, allocator: Allocator, path: []co
 
 fn loadRunTableBlockWithStats(backend: anytype, allocator: Allocator, path: []const u8, absolute_offset: u64, len: usize) ![]u8 {
     const start_ns = backend.readStatsNowNs();
-    const loaded = backend.storage.?.readFileRangeAlloc(allocator, path, absolute_offset, len);
+    const loaded = if (@hasDecl(@TypeOf(backend.*), "readRunRangeAlloc")) backend.readRunRangeAlloc(allocator, path, absolute_offset, len) else backend.storage.?.readFileRangeAlloc(allocator, path, absolute_offset, len);
     const elapsed_ns = backend.readStatsElapsedNs(start_ns);
     if (loaded) |bytes| backend.recordTableBlockLoad(bytes.len, elapsed_ns) else |_| backend.recordTableBlockLoad(len, elapsed_ns);
     return try loaded;
@@ -7194,6 +7224,30 @@ const OwnedTableEntry = struct {
     bytes: []u8,
 };
 
+// Point-result ownership needs the selected row, never a duplicate of the
+// entire decoded block. Large rows can still transfer this compact buffer.
+fn copyTableEntry(allocator: Allocator, entry: lsm_table_file.Entry) !OwnedTableEntry {
+    const namespace_len = if (entry.namespace_name) |name| name.len else 0;
+    const bytes = try allocator.alloc(u8, namespace_len + entry.key.len + entry.value.len);
+    var copied = entry;
+    if (entry.namespace_name) |name| {
+        @memcpy(bytes[0..namespace_len], name);
+        copied.namespace_name = bytes[0..namespace_len];
+    }
+    copied.key = bytes[namespace_len..][0..entry.key.len];
+    @memcpy(@constCast(copied.key), entry.key);
+    copied.value = bytes[namespace_len + entry.key.len ..];
+    @memcpy(@constCast(copied.value), entry.value);
+    return .{ .entry = copied, .bytes = bytes };
+}
+
+fn findExactEntryInLocalLease(backend: anytype, run: *Run, index: *const lsm_table_file.TableIndex, window: lsm_table_file.EntryDataWindow, block_index: usize, namespace: backend_types.Namespace, key: []const u8, locked: bool) !?OwnedTableEntry {
+    const lease = try loadLocalBlockLease(backend, run, index, window, locked);
+    defer lease.release();
+    const positioned = try lsm_table_file.findExactEntryInBlock(index, lease.bytes, block_index, namespace.name, key) orelse return null;
+    return try copyTableEntry(backend.allocator, positioned.entry);
+}
+
 fn findExactEntryWithLocalIndex(
     backend: anytype,
     run: *Run,
@@ -7203,6 +7257,37 @@ fn findExactEntryWithLocalIndex(
     const index = try indexForRunNoCache(backend, run);
     try requireTableBlocks(index);
     return try findExactEntryWithLocalIndexBlockMeta(backend, run, index, namespace, key);
+}
+
+fn loadLocalBlockLease(backend: anytype, run: *Run, index: *const lsm_table_file.TableIndex, window: lsm_table_file.EntryDataWindow, backend_locked: bool) !*SharedBytes {
+    const path = run.path orelse return error.RunStateUnavailable;
+    const offset = @as(u64, @intCast(index.entry_data_start)) + window.physicalRelativeOffset();
+    const len = window.physicalLen();
+    {
+        const locked = if (backend_locked) false else lockBackend(@TypeOf(backend.*), backend);
+        defer unlockBackend(@TypeOf(backend.*), backend, locked);
+        if (backend.retainCachedRunBlock(path, run.id, offset, len)) |lease| {
+            backend.recordLocalBlockCacheHit();
+            return lease;
+        }
+    }
+    backend.recordLocalBlockCacheMiss();
+    const bytes = try loadRunTableDecodedBlockWithStats(backend, backend.allocator, path, offset, len, window.compression, window.len, window.checksum);
+    errdefer backend.allocator.free(bytes);
+    const lease = try SharedBytes.create(backend.allocator, bytes);
+    const locked = if (backend_locked) false else lockBackend(@TypeOf(backend.*), backend);
+    defer unlockBackend(@TypeOf(backend.*), backend, locked);
+    // A racing reader can populate the cache while decoding. Drop only our
+    // candidate, retaining the winner rather than growing duplicate entries.
+    if (backend.retainCachedRunBlock(path, run.id, offset, len)) |winner| {
+        lease.release();
+        return winner;
+    }
+    backend.cacheRunBlockLease(path, run.id, offset, len, lease) catch |err| {
+        backend.allocator.destroy(lease);
+        return err;
+    };
+    return lease;
 }
 
 fn loadOwnedBlockForWindowAlloc(
@@ -7396,6 +7481,7 @@ fn findExactEntryWithLocalIndexBlockMeta(
         return entry;
     }
     const window = index.blockWindow(block_index);
+    if (localBlockCacheEnabled(backend)) return try findExactEntryInLocalLease(backend, run, index, window, block_index, namespace, key, false);
     const bytes = try loadOwnedBlockForWindow(
         backend,
         run,
@@ -7440,6 +7526,7 @@ fn findExactEntryWithLocalIndexBlockMetaMaybeLocked(
         return entry;
     }
     const window = index.blockWindow(block_index);
+    if (localBlockCacheEnabled(backend)) return try findExactEntryInLocalLease(backend, run, index, window, block_index, namespace, key, true);
     const bytes = try loadOwnedBlockForWindowMaybeLocked(
         backend,
         run,
@@ -8815,4 +8902,23 @@ test "bulk append index prefix cache releases partial allocations and invalidate
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
+test "lsm local point result copies selected row instead of decoded block" {
+    const a = std.testing.allocator;
+    const block = try a.alloc(u8, 32 * 1024);
+    defer a.free(block);
+    @memset(block, 'x');
+    @memcpy(block[0..4], "docs");
+    @memcpy(block[4..7], "key");
+    @memcpy(block[7..12], "value");
+    var budget = @import("../lite/test_allocator.zig").BudgetAllocator{ .backing = a, .limit = 12 };
+    const copied = try copyTableEntry(budget.allocator(), .{ .namespace_name = block[0..4], .key = block[4..7], .value = block[7..12] });
+    defer budget.allocator().free(copied.bytes);
+    try std.testing.expectEqual(@as(usize, 12), budget.live);
+    try std.testing.expectEqual(@as(usize, 1), budget.alloc_calls);
+    @memset(block, 0);
+    try std.testing.expectEqualStrings("docs", copied.entry.namespace_name.?);
+    try std.testing.expectEqualStrings("key", copied.entry.key);
+    try std.testing.expectEqualStrings("value", copied.entry.value);
 }

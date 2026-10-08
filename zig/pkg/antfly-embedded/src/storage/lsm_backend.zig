@@ -45,6 +45,8 @@ const resource_manager_mod = @import("resource_manager.zig");
 const platform_time = @import("antfly_platform").time;
 const fs_paths = @import("antfly_runtime_fs").fs_paths;
 const CancellationToken = @import("antfly_cancellation").CancellationToken;
+const SharedBytes = @import("lsm_backend/shared_bytes.zig").SharedBytes;
+const RunSourceLease = @import("lsm_backend/source_lease.zig").Lease;
 const native_artifact_sink = @import("native_artifact_sink.zig");
 
 comptime {
@@ -1398,17 +1400,26 @@ pub const Backend = struct {
         }
     };
 
+    const RunSource = struct {
+        path: []u8,
+        lease: *RunSourceLease,
+        access: u64,
+        fn deinit(self: *@This(), a: Allocator) void {
+            a.free(self.path);
+            self.lease.release();
+        }
+    };
     const CachedRunBlock = struct {
         run_id: u64,
         path: []u8,
         block_offset: u64,
         block_len: u32,
-        bytes: []u8,
+        payload: *SharedBytes,
         last_access: u64,
 
         pub fn deinit(self: *CachedRunBlock, allocator: Allocator) void {
             allocator.free(self.path);
-            allocator.free(self.bytes);
+            self.payload.release();
             self.* = undefined;
         }
     };
@@ -1627,6 +1638,12 @@ pub const Backend = struct {
     run_state_cache: std.ArrayListUnmanaged(CachedRunState) = .empty,
     run_index_cache: std.ArrayListUnmanaged(CachedRunIndex) = .empty,
     run_block_cache: std.ArrayListUnmanaged(CachedRunBlock) = .empty,
+    // Independent from the backend lock, which some range-read callers own.
+    run_source_mutex: std.atomic.Mutex = .unlocked,
+    run_sources: std.ArrayListUnmanaged(RunSource) = .empty,
+    run_source_clock: u64 = 0,
+    run_source_epoch: u64 = 0,
+
     run_table_cache: std.ArrayListUnmanaged(CachedRunTable) = .empty,
     local_cache_access_clock: u64 = 0,
     compaction_stats: CompactionStats = .{},
@@ -7090,9 +7107,126 @@ pub const Backend = struct {
                 cached.block_len != block_len or
                 !std.mem.eql(u8, cached.path, path)) continue;
             cached.last_access = self.nextLocalCacheAccess();
-            return cached.bytes;
+            return cached.payload.bytes;
         }
         return null;
+    }
+
+    pub fn retainCachedRunBlock(self: *Backend, path: []const u8, run_id: u64, offset: u64, len: u32) ?*SharedBytes {
+        if (!self.options.local_block_cache_enabled) return null;
+        for (self.run_block_cache.items) |*cached| {
+            if (cached.run_id == run_id and cached.block_offset == offset and cached.block_len == len and std.mem.eql(u8, cached.path, path)) {
+                cached.last_access = self.nextLocalCacheAccess();
+                return cached.payload.retain();
+            }
+        }
+        return null;
+    }
+
+    /// Owns one reference on success; the caller keeps its original reference.
+    pub fn cacheRunBlockLease(self: *Backend, path: []const u8, run_id: u64, offset: u64, len: u32, payload: *SharedBytes) !void {
+        const cached_path = try self.allocator.dupe(u8, path);
+        errdefer self.allocator.free(cached_path);
+        try self.run_block_cache.append(self.allocator, .{ .run_id = run_id, .path = cached_path, .block_offset = offset, .block_len = len, .payload = payload, .last_access = self.nextLocalCacheAccess() });
+        _ = payload.retain();
+        self.evictCachedRunBlocksToBudget();
+    }
+
+    /// Lease exactly the immutable artifact roots, not the whole checkpoint.
+    /// A bounded LRU avoids unbounded catalog leases and descriptor residency.
+    pub fn readRunRangeAlloc(self: *Backend, a: Allocator, path: []const u8, offset: u64, len: usize) ![]u8 {
+        const storage = self.storage.?;
+        if (storage.vtable.open_leased_immutable_source == null) return storage.readFileRangeAlloc(a, path, offset, len);
+        const lease = try self.retainRunSource(path);
+        defer lease.release();
+        const bytes = try a.alloc(u8, len);
+        errdefer a.free(bytes);
+        try lease.source.readInto(offset, bytes);
+        return bytes;
+    }
+
+    fn findRunSourceAssumeLocked(self: *Backend, path: []const u8) ?*RunSourceLease {
+        self.run_source_clock +%= 1;
+        for (self.run_sources.items) |*cached| if (std.mem.eql(u8, cached.path, path)) {
+            cached.access = self.run_source_clock;
+            return cached.lease.retain();
+        };
+        return null;
+    }
+
+    fn retainRunSource(self: *Backend, path: []const u8) !*RunSourceLease {
+        var epoch: u64 = undefined;
+        {
+            @import("antfly_platform").sync.lockYielding(&self.run_source_mutex);
+            defer self.run_source_mutex.unlock();
+            if (self.findRunSourceAssumeLocked(path)) |lease| return lease;
+            epoch = self.run_source_epoch;
+        }
+        // Catalog publication and descriptor I/O must not stall warm sources.
+        // Install under a short lock; a racing winner owns the cached lease.
+        const lease = try self.allocator.create(RunSourceLease);
+        errdefer self.allocator.destroy(lease);
+        const owned_path = try self.allocator.dupe(u8, path);
+        errdefer self.allocator.free(owned_path);
+        var source = try self.storage.?.openLeasedImmutableSource(self.allocator, path);
+        errdefer source.close();
+        lease.* = .{ .allocator = self.allocator, .source = source };
+        @import("antfly_platform").sync.lockYielding(&self.run_source_mutex);
+        if (epoch != self.run_source_epoch) {
+            self.run_source_mutex.unlock();
+            self.allocator.free(owned_path);
+            return lease;
+        }
+        const winner = self.findRunSourceAssumeLocked(path);
+        if (winner != null) {
+            self.run_source_mutex.unlock();
+            self.allocator.free(owned_path);
+            lease.release();
+            return winner.?;
+        }
+        self.run_sources.append(self.allocator, .{ .path = owned_path, .lease = lease, .access = self.run_source_clock }) catch |err| {
+            self.run_source_mutex.unlock();
+            return err;
+        };
+        const retained = lease.retain();
+        self.run_source_mutex.unlock();
+        self.trimRunSources();
+        return retained;
+    }
+
+    pub fn retainCachedRunSource(self: *Backend, path: []const u8) ?*RunSourceLease {
+        @import("antfly_platform").sync.lockYielding(&self.run_source_mutex);
+        defer self.run_source_mutex.unlock();
+        return self.findRunSourceAssumeLocked(path);
+    }
+
+    // Active cursors retain one lease per run. Only idle entries compete for
+    // LRU space, avoiding catalog/descriptor thrash in broad merge cursors.
+    pub fn trimRunSources(self: *Backend) void {
+        while (true) {
+            @import("antfly_platform").sync.lockYielding(&self.run_source_mutex);
+            if (self.run_sources.items.len <= 16) {
+                self.run_source_mutex.unlock();
+                return;
+            }
+            var oldest: ?usize = null;
+            for (self.run_sources.items, 0..) |item, i| {
+                if (item.lease.refs.load(.acquire) != 1) continue;
+                if (oldest == null or item.access < self.run_sources.items[oldest.?].access) oldest = i;
+            }
+            if (oldest == null) {
+                self.run_source_mutex.unlock();
+                return;
+            }
+            var removed = self.run_sources.orderedRemove(oldest.?);
+            self.run_source_mutex.unlock();
+            removed.deinit(self.allocator);
+        }
+    }
+
+    pub fn deinitRunSources(self: *Backend) void {
+        for (self.run_sources.items) |*cached| cached.deinit(self.allocator);
+        self.run_sources.deinit(self.allocator);
     }
 
     pub fn putCachedRunBlock(
@@ -7108,18 +7242,14 @@ pub const Backend = struct {
             return &.{};
         }
         errdefer self.allocator.free(block);
-        const cached_path = try self.allocator.dupe(u8, path);
-        errdefer self.allocator.free(cached_path);
-        try self.run_block_cache.append(self.allocator, .{
-            .run_id = run_id,
-            .path = cached_path,
-            .block_offset = block_offset,
-            .block_len = block_len,
-            .bytes = block,
-            .last_access = self.nextLocalCacheAccess(),
-        });
-        self.evictCachedRunBlocksToBudget();
-        return self.run_block_cache.items[self.run_block_cache.items.len - 1].bytes;
+        const payload = try SharedBytes.create(self.allocator, block);
+        // On error the outer errdefer still owns the byte allocation.
+        self.cacheRunBlockLease(path, run_id, block_offset, block_len, payload) catch |err| {
+            self.allocator.destroy(payload);
+            return err;
+        };
+        payload.release();
+        return self.run_block_cache.items[self.run_block_cache.items.len - 1].payload.bytes;
     }
 
     fn drainObsoleteRuns(self: *Backend) void {
@@ -8493,6 +8623,14 @@ pub const Backend = struct {
     }
 
     fn evictLocalCachesForRun(self: *Backend, path: []const u8, run_id: u64) void {
+        @import("antfly_platform").sync.lockYielding(&self.run_source_mutex);
+        self.run_source_epoch +%= 1;
+        for (self.run_sources.items, 0..) |source, i| if (std.mem.eql(u8, source.path, path)) {
+            var removed = self.run_sources.orderedRemove(i);
+            removed.deinit(self.allocator);
+            break;
+        };
+        self.run_source_mutex.unlock();
         self.evictCachedRunStateForRun(path, run_id);
         self.evictCachedRunIndexForRun(path, run_id);
         self.evictCachedRunBlocksForRun(path, run_id);
@@ -25195,4 +25333,37 @@ fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *con
         break :blk repeated;
     };
     return &result;
+}
+
+test "lsm local decoded block borrowing survives eviction and performs no warm allocation" {
+    const a = std.testing.allocator;
+    var budget = @import("lite/test_allocator.zig").BudgetAllocator{ .backing = a };
+    var backend = Backend.init(budget.allocator(), .{});
+    defer backend.close();
+    const bytes = try backend.allocator.alloc(u8, 32 * 1024);
+    @memset(bytes, 0);
+    @memcpy(bytes[0..4], "data");
+    _ = try backend.putCachedRunBlock("/run", 1, 0, 32768, bytes);
+    const baseline = budget.live;
+    const reference_start = budget.alloc_calls;
+    for (0..4096) |_| {
+        const copy = try backend.allocator.dupe(u8, bytes);
+        backend.allocator.free(copy);
+    }
+    try std.testing.expectEqual(@as(usize, 4096), budget.alloc_calls - reference_start);
+    const calls = budget.alloc_calls;
+    budget.limit = baseline;
+    const pinned = backend.retainCachedRunBlock("/run", 1, 0, 32768).?;
+    defer pinned.release();
+    for (0..4096) |_| {
+        const hit = backend.retainCachedRunBlock("/run", 1, 0, 32768).?;
+        try std.testing.expectEqual(pinned.bytes.ptr, hit.bytes.ptr);
+        hit.release();
+    }
+    try std.testing.expectEqual(baseline, budget.live);
+    try std.testing.expectEqual(calls, budget.alloc_calls);
+    backend.evictCachedRunBlocksForRun("/run", 1);
+    try std.testing.expectEqualStrings("data", pinned.bytes[0..4]);
+    budget.limit = std.math.maxInt(usize);
+    std.debug.print("lite local block probe: 4096 warm hits, reference payload allocation=134217728 bytes/4096 calls, borrowed payload allocation=0 bytes/0 calls\n", .{});
 }

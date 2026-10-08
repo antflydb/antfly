@@ -1,0 +1,56 @@
+{
+  "schema_version": 1,
+  "base_commit": "d3a436b063",
+  "platform": "aarch64-macos",
+  "optimization": "Debug",
+  "scope": "Deterministic allocation, contention, and lifetime fixtures; not a query-throughput or 2 GiB soak benchmark",
+  "warm_local_block_borrowing": {
+    "hits": 4096,
+    "decoded_block_bytes": 32768,
+    "reference_copy_allocator_calls": 4096,
+    "reference_copy_payload_allocated_bytes": 134217728,
+    "borrow_allocator_calls": 0,
+    "borrow_payload_allocated_bytes": 0,
+    "leases_survive_cache_eviction": true
+  },
+  "owned_point_result": {
+    "decoded_block_bytes": 32768,
+    "namespace_bytes": 4,
+    "key_bytes": 3,
+    "value_bytes": 5,
+    "owned_result_bytes": 12,
+    "owned_result_allocator_calls": 1
+  },
+  "reader_admission": {
+    "reads": 128,
+    "writer_fsync_deliberately_blocked": true,
+    "baseline_reads_completed_before_fsync_release": false,
+    "baseline_progress_timeout_seconds": 2,
+    "updated_reads_completed_before_fsync_release": true,
+    "old_snapshot_preserved_after_commit": true
+  },
+  "artifact_sources": {
+    "single_path_reads": 128,
+    "single_path_catalog_lease_creations": 1,
+    "checkpoint_wide_reader_pins_retained": 0,
+    "active_pinned_sources": 24,
+    "repeated_rounds": 4,
+    "additional_catalog_publications_during_repeated_rounds": 0,
+    "idle_source_limit": 16,
+    "original_bytes_survive_replacement_and_vacuum": true,
+    "retired_inode_charge_released_after_eviction": true
+  },
+  "native_merge_cursor": {
+    "persisted_runs": 24,
+    "documents": 48,
+    "active_source_entries_exceed_idle_limit": true,
+    "source_entries_after_cursor_close_at_most": 16,
+    "point_read_after_cursor_close_succeeds": true
+  },
+  "notes": [
+    "The copy reference measures the previous payload-duplication mechanism directly, rather than end-to-end lookup timing.",
+    "Cold block decoding, source creation, cursor metadata, and owned API results still allocate.",
+    "Active cursors retain artifact-specific leases; idle leases are trimmed to 16 and obsolete-run cleanup invalidates them.",
+    "The on-disk .aflite format and public C ABI are unchanged."
+  ]
+}
