@@ -61,7 +61,10 @@ independent; `lib/video.mjpeg` reads only selected payloads and validates baseli
 8-bit complete pictures before pure Zig decode. `Track.codec` is explicit; MJPEG
 tracks have empty `avcc` and zero NAL length. A QuickTime data handler in `minf`
 does not overwrite the video track handler in `mdia`. AVI, abbreviated tables
-and paired/interlaced JPEG fields remain unsupported.
+and paired/interlaced JPEG fields remain unsupported. `lib/video.mjpeg_metal`
+now stages decoded RGBA into a bounded Metal preparation queue on macOS, preserving
+the same owned window/PTS metadata. This remains video orchestration; media has
+no device or model dependency.
 
 WebM **video** indexing, sequential unknown-length providers, and object-store
 adapters are not implemented. The range callback is the integration boundary.

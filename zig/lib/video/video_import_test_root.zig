@@ -15,5 +15,7 @@ test "video consumers share the same media Reader and image coefficient types" {
     _ = video.windows.create;
     _ = video.apple_jobs.prepareWindows;
     _ = video.mjpeg.prepareWindows;
+    _ = video.mjpeg_metal.prepareWindows;
+    _ = video.preparation.Metal.submitRgba;
     _ = video.preparation.referenceRgba;
 }

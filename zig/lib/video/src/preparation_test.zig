@@ -26,6 +26,7 @@ test "video Metal quantized bicubic patch preparation matches CPU with rotation 
             defer a.free(expected);
             var result = try metal.submit(a, &batch.frames[0].surface, options, .{});
             defer result.deinit();
+            try std.testing.expectEqual(@as(usize, 0), result.rgba_staging_bytes);
             try result.wait(std.testing.io, .{});
             _ = try result.buffer();
             const actual = try result.readback(a);

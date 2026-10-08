@@ -1,9 +1,10 @@
 # Native video inference and EmbeddingGemma 2
 
 Status: phase 1, the independent phase 2 decoder/preparation library, the phase 3
-scheduling subset, and stage 4 portable MJPEG lane delivered, 2026-10-08. Phase 2
-model/API integration, phase 3 resident model execution, and the remaining stage 4
-routes remain pending; full video embedding is not yet available. Tim's open PR #1014 remains a separate dependency
+scheduling subset, and stage 4 portable MJPEG/Metal preparation delivered,
+2026-10-08. Phase 2 model/API integration, phase 3 resident model execution, and
+the remaining stage 4 routes remain pending; full video embedding is not yet
+available. Tim's PR #1014 remains a separate dependency
 at the user's request. The initial design was written
 against `origin/main` commit `cdf572a7467d581f6f1b39bcf514878488555f11`;
 fetching a newer remote head was unavailable because GitHub DNS resolution failed.
@@ -265,8 +266,9 @@ counts establish reduced work, not end-to-end latency or retrieval parity.
 
 Still pending after the model dependency: qualify preparation geometry against
 the final processor, implement batched resident vision/projector execution,
-direct device-token backbone inputs, and device pooling/normalization. Qualify the software-decode → Metal
-route as well as VideoToolbox → Metal. Extend the delivered decode/preparation
+direct device-token backbone inputs, and device pooling/normalization. Qualify
+resident model execution on the delivered software-decode → Metal and
+VideoToolbox → Metal preparation routes. Extend the delivered decode/preparation
 queue to overlap resident vision execution, with atomic admission across
 concurrent source/surface/model reservations and any persistent token cache.
 Tune seek-gap thresholds from measured backend/source latency. Establish a
@@ -280,7 +282,7 @@ latency/throughput targets from the baseline before promoting defaults.
 The default Metal route must read back only the final vector, with transfer
 telemetry proving that decoded pixels and projected vision tokens remain on-device.
 
-### 4. NVIDIA and portable codec coverage — portable MJPEG lane delivered
+### 4. NVIDIA and portable codec coverage — MJPEG CPU/Metal lanes delivered
 
 Delivered independently of PR #1014: complete baseline 8-bit MJPEG samples in
 static MP4/MOV `jpeg` tracks, pure Zig selected-picture RGBA decode using
@@ -294,8 +296,18 @@ allocation failures, source teardown and cancellation/retry are qualified.
 Portable decode/preparation executes on WASI and compiles for Linux. See the
 [portable lane contract](../../zig/lib/video/VIDEO.md#implemented-portable-mjpeg-lane).
 
+Also delivered independently: owned packed-RGBA staging on the caller's Metal
+device, shared quantized resize/patch kernels, and bounded software-decode/Metal
+window jobs. CPU/Metal values match within `2e-6` across all rotations and both
+centering modes. Input staging/total work/output caps, depths one/two/eight,
+producer and reader teardown, cancellation/retry and deterministic allocation
+failure are qualified. Separate-window versus shared-window jobs decode/prepare
+10 versus 8 pictures and stage 122,880 versus 98,304 RGBA bytes. Counters report
+logical staging, not physical bus transfers or demonstrated embedding latency.
+See the [software-to-Metal contract](../../zig/lib/video/VIDEO.md#implemented-software-decode-to-metal).
+
 Remaining: NVDEC/device preparation with separately qualified CUDA model execution,
-software-decode-to-Metal upload/preparation, and progressive 8-bit
+and progressive 8-bit
 4:2:0 H.264 in pure Zig with a declared supported profile/tool subset. Broaden
 H.264, fragmented MP4, WebM video codecs, HEVC, VP9, and AV1 independently.
 

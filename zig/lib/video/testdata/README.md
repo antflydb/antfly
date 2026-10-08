@@ -73,3 +73,11 @@ python3 zig/lib/video/scripts/generate_mjpeg_fixtures.py
 
 The generator requires FFmpeg/libavcodec only offline. Runtime decoding uses the
 existing pure Zig JPEG implementation with complete per-sample tables.
+
+The same fixture qualifies `mjpeg_metal.prepareWindows` against CPU patches.
+Separate versus shared overlapping-window jobs prepare ten versus eight pictures
+and stage 122,880 versus 98,304 RGBA bytes. Tests assert depths one/two/eight,
+logical staging caps, buffer/source lifetimes, cancellation/retry and allocation
+failure. Synthetic 160×96 RGBA patterns additionally compare every rotation and
+both centering modes within `2e-6`; alpha is ignored consistently. These are
+preparation/resource receipts, not model or physical bus-transfer benchmarks.

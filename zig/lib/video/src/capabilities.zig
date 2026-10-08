@@ -4,6 +4,7 @@
 /// session creation and the returned Batch.hardware receipt for each source.
 pub const apple_decode_compiled = @import("builtin").os.tag == .macos;
 pub const metal_preparation_compiled = apple_decode_compiled;
+pub const metal_rgba_preparation_compiled = metal_preparation_compiled;
 pub const portable_host_preparation = true;
 pub const portable_mjpeg_decode = true;
 pub const portable_h264_decode = false;

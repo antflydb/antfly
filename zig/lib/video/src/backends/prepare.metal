@@ -26,6 +26,28 @@ kernel void horizontal(texture2d<float, access::read> yplane [[texture(0)]], tex
     uint index = (gid.y * p.tw + gid.x) * 3;
     out[index] = value.r; out[index + 1] = value.g; out[index + 2] = value.b;
 }
+// Software-decoded RGBA is staged once as tightly packed bytes. Alpha is ignored
+// exactly as in the opaque JPEG CPU reference; no NV12 conversion is involved.
+kernel void horizontal_rgba(device const uchar *rgba [[buffer(4)]],
+    device uchar *out [[buffer(0)]], constant Params &p [[buffer(1)]],
+    device const uint *axis [[buffer(2)]], device const int *weights [[buffer(3)]],
+    uint2 gid [[thread_position_in_grid]]) {
+    uint dh = (p.rotation & 1) ? p.sw : p.sh;
+    if (gid.x >= p.tw || gid.y >= dh) return;
+    uint start = axis[gid.x * 3], offset = axis[gid.x * 3 + 1], count = axis[gid.x * 3 + 2];
+    int3 sum = int3(1 << 21);
+    for (uint i = 0; i < count; ++i) {
+        uint2 xy = uint2(start + i, gid.y);
+        if (p.rotation == 1) xy = uint2(xy.y, p.sh - 1 - xy.x);
+        else if (p.rotation == 2) xy = uint2(p.sw - 1 - xy.x, p.sh - 1 - xy.y);
+        else if (p.rotation == 3) xy = uint2(p.sw - 1 - xy.y, xy.x);
+        uint pos = (xy.y * p.sw + xy.x) * 4;
+        sum += int3(rgba[pos], rgba[pos + 1], rgba[pos + 2]) * weights[offset + i];
+    }
+    uchar3 value = uchar3(clamp(sum >> 22, 0, 255));
+    uint index = (gid.y * p.tw + gid.x) * 3;
+    out[index] = value.r; out[index + 1] = value.g; out[index + 2] = value.b;
+}
 kernel void vertical_patch(device const uchar *in [[buffer(0)]], device float *out [[buffer(1)]], constant Params &p [[buffer(2)]],
     device const uint *axis [[buffer(3)]], device const int *weights [[buffer(4)]], uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= p.tw || gid.y >= p.th) return;

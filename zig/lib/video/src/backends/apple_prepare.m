@@ -11,6 +11,7 @@
 @property(nonatomic, strong) id<MTLCommandQueue> queue;
 @property(nonatomic, strong) id<MTLComputePipelineState> horizontal;
 @property(nonatomic, strong) id<MTLComputePipelineState> vertical;
+@property(nonatomic, strong) id<MTLComputePipelineState> horizontalRGBA;
 @property(nonatomic) void *cache;
 @end
 @implementation AVPreparer
@@ -20,6 +21,7 @@
 @property(nonatomic, strong) id<MTLCommandBuffer> command;
 @property(nonatomic, strong) id<MTLBuffer> output;
 @property(nonatomic) void *imported;
+@property(nonatomic, strong) id<MTLBuffer> rgba;
 @property(nonatomic) BOOL completed;
 @end
 @implementation AVPrepared
@@ -39,7 +41,8 @@ int32_t av_preparer_create(void *device, void **out) {
         if (!library) return -1;
         p.horizontal = [p.device newComputePipelineStateWithFunction:[library newFunctionWithName:@"horizontal"] error:&error];
         p.vertical = [p.device newComputePipelineStateWithFunction:[library newFunctionWithName:@"vertical_patch"] error:&error];
-        if (!p.horizontal || !p.vertical) return -1;
+        p.horizontalRGBA = [p.device newComputePipelineStateWithFunction:[library newFunctionWithName:@"horizontal_rgba"] error:&error];
+        if (!p.horizontal || !p.vertical || !p.horizontalRGBA) return -1;
         *out = (__bridge_retained void *)p; return 0;
     }
 }
@@ -47,18 +50,27 @@ void av_preparer_destroy(void *p) { if (p) { id object = (__bridge_transfer id)p
 static id<MTLBuffer> upload(id<MTLDevice> device, const void *bytes, size_t length) {
     return [device newBufferWithBytes:bytes length:length options:MTLResourceStorageModeShared];
 }
-int32_t av_prepare_submit(void *handle, void *surface, const uint32_t *params,
+// Shared dispatch keeps resize/patch packing identical for both input formats.
+static int32_t prepare(void *handle, void *surface, const uint8_t *rgba, size_t rgba_size, const uint32_t *params,
     const uint32_t *xaxis, size_t xsize, const int32_t *xweights, size_t xcount,
     const uint32_t *yaxis, size_t ysize, const int32_t *yweights, size_t ycount, void **out) {
     *out = NULL;
     @autoreleasepool {
         AVPreparer *p = (__bridge AVPreparer *)handle;
         AVPrepared *result = [AVPrepared new];
-        void *imported = NULL;
-        if (av_metal_import(p.cache, surface, &imported)) return -1;
-        result.imported = imported;
-        id<MTLTexture> y = (__bridge id<MTLTexture>)av_metal_plane_texture(imported, 0);
-        id<MTLTexture> uv = (__bridge id<MTLTexture>)av_metal_plane_texture(imported, 1);
+        id<MTLTexture> y = nil, uv = nil;
+        if (rgba) {
+            if (rgba_size != (size_t)params[0] * params[1] * 4) return -1;
+            // Copies before returning; the producer can immediately free RGBA.
+            result.rgba = upload(p.device, rgba, rgba_size);
+            if (!result.rgba) return -1;
+        } else {
+            void *imported = NULL;
+            if (av_metal_import(p.cache, surface, &imported)) return -1;
+            result.imported = imported;
+            y = (__bridge id<MTLTexture>)av_metal_plane_texture(imported, 0);
+            uv = (__bridge id<MTLTexture>)av_metal_plane_texture(imported, 1);
+        }
         size_t height = (params[4] & 1) ? params[0] : params[1];
         id<MTLBuffer> temp = [p.device newBufferWithLength:(size_t)params[2] * height * 3 options:MTLResourceStorageModePrivate];
         result.output = [p.device newBufferWithLength:(size_t)params[2] * params[3] * 3 * sizeof(float) options:MTLResourceStorageModeShared];
@@ -68,7 +80,9 @@ int32_t av_prepare_submit(void *handle, void *surface, const uint32_t *params,
         if (!temp || !result.output || !xb || !xw || !yb || !yw || !result.command) return -1;
         id<MTLComputeCommandEncoder> encoder = [result.command computeCommandEncoder];
         if (!encoder) return -1;
-        [encoder setComputePipelineState:p.horizontal]; [encoder setTexture:y atIndex:0]; [encoder setTexture:uv atIndex:1];
+        [encoder setComputePipelineState:rgba ? p.horizontalRGBA : p.horizontal];
+        if (rgba) [encoder setBuffer:result.rgba offset:0 atIndex:4];
+        else { [encoder setTexture:y atIndex:0]; [encoder setTexture:uv atIndex:1]; }
         [encoder setBuffer:temp offset:0 atIndex:0]; [encoder setBytes:params length:32 atIndex:1];
         [encoder setBuffer:xb offset:0 atIndex:2]; [encoder setBuffer:xw offset:0 atIndex:3];
         [encoder dispatchThreads:MTLSizeMake(params[2], height, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)]; [encoder endEncoding];
@@ -78,6 +92,17 @@ int32_t av_prepare_submit(void *handle, void *surface, const uint32_t *params,
         [encoder dispatchThreads:MTLSizeMake(params[2], params[3], 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)]; [encoder endEncoding];
         [result.command commit]; *out = (__bridge_retained void *)result; return 0;
     }
+}
+int32_t av_prepare_submit(void *handle, void *surface, const uint32_t *params,
+    const uint32_t *xaxis, size_t xsize, const int32_t *xweights, size_t xcount,
+    const uint32_t *yaxis, size_t ysize, const int32_t *yweights, size_t ycount, void **out) {
+    return prepare(handle, surface, NULL, 0, params, xaxis, xsize, xweights, xcount, yaxis, ysize, yweights, ycount, out);
+}
+int32_t av_prepare_rgba_submit(void *handle, const uint8_t *rgba, size_t size, const uint32_t *params,
+    const uint32_t *xaxis, size_t xsize, const int32_t *xweights, size_t xcount,
+    const uint32_t *yaxis, size_t ysize, const int32_t *yweights, size_t ycount, void **out) {
+    if (!rgba) { *out = NULL; return -1; }
+    return prepare(handle, NULL, rgba, size, params, xaxis, xsize, xweights, xcount, yaxis, ysize, yweights, ycount, out);
 }
 int av_prepared_poll(void *p) {
     AVPrepared *result = (__bridge AVPrepared *)p;
@@ -91,6 +116,7 @@ int av_prepared_release_source(void *p) {
     result.completed = YES;
     av_metal_import_release(result.imported); result.imported = NULL;
     result.command = nil;
+    result.rgba = nil;
     return 0;
 }
 void *av_prepared_buffer(void *p) { return (__bridge void *)((__bridge AVPrepared *)p).output; }

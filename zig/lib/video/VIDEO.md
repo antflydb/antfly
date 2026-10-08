@@ -1,8 +1,8 @@
 # Native video decoding and sampled surfaces
 
-Status: phase 1, the independent phase 2 decoder/preparation library, and the
-independent phase 3 scheduling subset, and phase 4 portable MJPEG lane are
-implemented, 2026-10-08. EmbeddingGemma
+Status: phase 1, the independent phase 2 decoder/preparation library, the
+independent phase 3 scheduling subset, phase 4 portable MJPEG lane, and
+software-decode-to-Metal preparation are implemented, 2026-10-08. EmbeddingGemma
 2 model-token integration, HTTP/SDK video inputs, and resident vision/backbone
 execution remain pending. Tim's PR #1014 is kept separate as requested; its model
 code is not incorporated into this branch.
@@ -49,7 +49,8 @@ See [fixture provenance](testdata/README.md). Run `zig build test-video` from
 ## Implemented decoder and preparation boundary
 
 The public `antfly_video` module exports `sampling`, `avc`, `apple`,
-`preparation`, `decode_plan`, `windows`, `apple_jobs`, `mjpeg`, and compile-time
+`preparation`, `decode_plan`, `windows`, `apple_jobs`, `mjpeg`, `mjpeg_metal`, and
+compile-time
 `capabilities`. Its own `build.zig` supports
 `test-video` and `check-video`; root and inference builds register the same tests.
 `build_support.attach` takes the consumer's shared media and image modules to
@@ -259,10 +260,72 @@ malformed/interlaced/progressive inputs, memory/work limits, deterministic
 allocation failure, cancellation during decode/preparation, and retry. The full
 portable decode/preparation suite executes on WASI and compiles for Linux.
 
-This stage supplies host patches for a later model consumer. It does not run an
-embedding model or upload software-decoded pictures to Metal/CUDA. NVDEC/CUDA,
+This CPU route supplies host patches for a later model consumer. The Metal route
+below stages software-decoded pictures on the caller's device. Neither runs an
+embedding model. NVDEC/CUDA,
 pure Zig H.264 and resident model execution remain pending independently or behind
 PR #1014 as described in the implementation plan.
+
+## Implemented software decode to Metal
+
+`preparation.Metal.submitRgba` accepts exactly packed RGBA8 plus dimensions,
+preparation options and original control. It copies input once into owned shared
+Metal storage before returning, so the producer may overwrite/free its buffer
+immediately. RGB is already decoded: alpha and the NV12 matrix option are ignored,
+as in `referenceRgba`. The new horizontal RGBA kernel applies explicit rotation
+and the shared 22-bit bicubic coefficients; the existing vertical kernel clips,
+normalizes/centers and packs patches. Resize intermediates stay on the GPU.
+
+Geometry, pixels, resize scratch, coefficient storage and
+`max_host_staging_bytes` are admitted before native submission. The shared image
+control follows coefficient generation; native allocation/copy/commit remain
+synchronous platform calls. `Prepared` owns the staging buffer, command and output.
+`wait` checks control; `releaseSource` frees completed input/command/intermediates
+while retaining output. Destruction fences pending work even after cancellation.
+No host pixel readback occurs during submission. `buffer()` remains the borrowed
+completed Metal-buffer handoff; a later inference consumer must retain/fence its
+own use before releasing the result.
+
+`Prepared.rgba_staging_bytes` and `coefficient_staging_bytes` count logical input
+bytes supplied to `newBufferWithBytes`. The NV12 import route reports zero RGBA
+staging. These counts exclude command parameters, allocator/driver overhead and
+physical transfer behavior; shared-memory staging is not a PCIe/DMA measurement
+or a zero-copy claim. `readback` remains an explicit test/debug operation.
+
+[mjpeg_metal.zig](src/mjpeg_metal.zig) connects pure Zig MJPEG decode to this
+preparer on the caller's existing Metal device. `prepareWindows` shares one
+preparation policy across the request-local picture union. The decoder works on
+one host frame at a time while prior Metal commands may run. When capacity is
+full it fences the oldest command and releases its staging before submitting
+another. Depth defaults to two with hard maximum eight; individual input staging,
+aggregate in-flight staging, total staging work and retained output bytes have
+separate caps. At most one decoded host frame exists while waiting for capacity.
+Per-command scratch bounds plus queue depth bound the resize/coefficient work;
+these are not whole-process or concurrent-model memory reservations.
+
+The result owns completed unique-picture patch buffers, presentation-ordered
+window mappings/PTS, codec/source stamp, copied display/color metadata, decode/
+payload counts, decode allocation high-water, staging counts and queue/input
+high-water marks. It outlives reader/source/preparer destruction. Errors after
+partial submission join GPU work before releasing staging, outputs and leases.
+Linux/WASI retain the CPU MJPEG path; Metal APIs fail closed there.
+
+Native tests compare CPU/Metal values within `2e-6` across every rotation and
+both centering modes, include nontrivial color/alpha patterns, destroy/overwrite
+producer input immediately, and qualify queue depths one, two and eight. Byte
+caps can force a depth-two queue to retain only one staged input. Late cancellation,
+retry and deterministic allocation failure exercise partial-work cleanup.
+For the original two-second fixture, preparing overlapping windows together gives:
+
+| Work, excluding container indexing | Separate window jobs | Shared window job |
+| --- | ---: | ---: |
+| Decoded/prepared pictures | 10 | 8 |
+| RGBA staging bytes | 122,880 | 98,304 |
+
+Depth two retains at most 24,576 staged RGBA bytes; completed unique patch outputs
+occupy 221,184 bytes. These are asserted logical work/resource counts, not latency
+or embedding benchmarks. Resident vision/projector/backbone/pooling still await
+PR #1014; software H.264 and NVIDIA NVDEC/CUDA remain independent follow-ups.
 
 ## Remaining module and API shape
 

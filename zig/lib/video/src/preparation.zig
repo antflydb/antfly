@@ -8,6 +8,7 @@ const supported = @import("builtin").os.tag == .macos;
 extern fn av_preparer_create(*anyopaque, *?*anyopaque) i32;
 extern fn av_preparer_destroy(*anyopaque) void;
 extern fn av_prepare_submit(*anyopaque, *anyopaque, [*]const u32, [*]const u32, usize, [*]const i32, usize, [*]const u32, usize, [*]const i32, usize, *?*anyopaque) i32;
+extern fn av_prepare_rgba_submit(*anyopaque, [*]const u8, usize, [*]const u32, [*]const u32, usize, [*]const i32, usize, [*]const u32, usize, [*]const i32, usize, *?*anyopaque) i32;
 extern fn av_prepared_poll(*anyopaque) c_int;
 extern fn av_prepared_buffer(*anyopaque) *anyopaque;
 extern fn av_prepared_copy(*anyopaque, [*]f32, usize) i32;
@@ -28,6 +29,8 @@ pub const Options = struct {
     max_soft_tokens: usize = 140,
     max_source_pixels: usize = 16 * 1024 * 1024,
     max_scratch_bytes: usize = 128 * 1024 * 1024,
+    /// Copied RGBA input only; independent of resize scratch/output admission.
+    max_host_staging_bytes: usize = 128 * 1024 * 1024,
 };
 pub const Geometry = struct {
     width: u32,
@@ -215,6 +218,8 @@ pub const Metal = struct {
     pub fn submit(self: *Metal, allocator: std.mem.Allocator, surface: *const apple.Surface, options: Options, control: media.source.Control) !Prepared {
         if (!supported) return error.UnsupportedVideoBackend;
         try control.check();
+        var scope = image.work_control.Scope.enter(.{ .context = control.context, .check_fn = control.check_fn });
+        defer scope.deinit();
         const g = try geometry(surface.width, surface.height, options);
         const rotated = options.rotation == .clockwise90 or options.rotation == .clockwise270;
         var xaxis = try Axis.init(allocator, if (rotated) surface.height else surface.width, g.width, options.max_scratch_bytes / 4);
@@ -225,14 +230,40 @@ pub const Metal = struct {
         const params = [_]u32{ surface.width, surface.height, g.width, g.height, @backingInt(options.rotation), @backingInt(options.matrix), @intFromBool(surface.format == .nv12_full), @intFromBool(options.centered) };
         var out: ?*anyopaque = null;
         if (av_prepare_submit(self.handle, surface.handle, &params, xaxis.table.ptr, xaxis.table.len, xaxis.weights.ptr, xaxis.weights.len, yaxis.table.ptr, yaxis.table.len, yaxis.weights.ptr, yaxis.weights.len, &out) != 0) return error.MetalPreparationFailed;
-        return .{ .handle = out.?, .geometry = g };
+        return .{ .handle = out.?, .geometry = g, .coefficient_staging_bytes = (xaxis.table.len + xaxis.weights.len + yaxis.table.len + yaxis.weights.len) * 4 };
+    }
+    /// Copies tightly packed RGBA into owned Metal storage before returning.
+    /// The producer may free its input immediately. Alpha/matrix are ignored
+    /// as in referenceRgba; explicit rotation and centering still apply.
+    pub fn submitRgba(self: *Metal, allocator: std.mem.Allocator, bytes: []const u8, width: u32, height: u32, options: Options, control: media.source.Control) !Prepared {
+        if (!supported) return error.UnsupportedVideoBackend;
+        try control.check();
+        var scope = image.work_control.Scope.enter(.{ .context = control.context, .check_fn = control.check_fn });
+        defer scope.deinit();
+        const g = try geometry(width, height, options);
+        const size = std.math.mul(usize, try std.math.mul(usize, width, height), 4) catch return error.ResourceLimitExceeded;
+        if (bytes.len != size) return error.InvalidVideoGeometry;
+        if (size > options.max_host_staging_bytes) return error.ResourceLimitExceeded;
+        const rotated = options.rotation == .clockwise90 or options.rotation == .clockwise270;
+        var xaxis = try Axis.init(allocator, if (rotated) height else width, g.width, options.max_scratch_bytes / 4);
+        defer xaxis.deinit();
+        var yaxis = try Axis.init(allocator, if (rotated) width else height, g.height, options.max_scratch_bytes / 4);
+        defer yaxis.deinit();
+        try control.check();
+        const params = [_]u32{ width, height, g.width, g.height, @backingInt(options.rotation), 0, 0, @intFromBool(options.centered) };
+        var out: ?*anyopaque = null;
+        if (av_prepare_rgba_submit(self.handle, bytes.ptr, bytes.len, &params, xaxis.table.ptr, xaxis.table.len, xaxis.weights.ptr, xaxis.weights.len, yaxis.table.ptr, yaxis.table.len, yaxis.weights.ptr, yaxis.weights.len, &out) != 0) return error.MetalPreparationFailed;
+        return .{ .handle = out.?, .geometry = g, .rgba_staging_bytes = bytes.len, .coefficient_staging_bytes = (xaxis.table.len + xaxis.weights.len + yaxis.table.len + yaxis.weights.len) * 4 };
     }
 };
-/// Owns surface import, GPU command, and patch buffer. Destroy fences in-flight
+/// Owns input import/staging, GPU command, and patch buffer. Destroy fences in-flight
 /// work, including after deadline/cancellation. No pixel readback on submit.
 pub const Prepared = struct {
     handle: *anyopaque,
     geometry: Geometry,
+    /// Logical bytes copied by newBufferWithBytes, not physical PCIe/DMA bytes.
+    rgba_staging_bytes: usize = 0,
+    coefficient_staging_bytes: usize = 0,
     pub fn wait(self: *const Prepared, io: std.Io, control: media.source.Control) !void {
         if (!supported) return error.UnsupportedVideoBackend;
         while (true) {
@@ -244,7 +275,7 @@ pub const Prepared = struct {
             }
         }
     }
-    /// After completion, discard the input import/command/intermediates while
+    /// After completion, discard input import/staging/command/intermediates while
     /// retaining the output buffer. Idempotent; wait before calling.
     pub fn releaseSource(self: *Prepared) !void {
         if (!supported) return error.UnsupportedVideoBackend;
