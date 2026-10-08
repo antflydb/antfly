@@ -343,7 +343,7 @@ pub const TuplePlan = struct {
         const inputs = try alloc.alloc(?usize, self.columns.len);
         errdefer alloc.free(inputs);
         @memset(inputs, null);
-        const values = try alloc.alloc(Value, self.columns.len);
+        const values = try alloc.alloc(expressions.Value, self.columns.len);
         errdefer alloc.free(values);
         @memset(values, .null);
         const needed = try alloc.alloc(bool, self.columns.len);
@@ -385,7 +385,7 @@ pub const TuplePlan = struct {
             if (key.expression) |expression| {
                 // The tuple's layout/column-pointer fence above certifies the
                 // expression compiler's ordinals, including cold projections.
-                const value = try expression.plan.evaluateBoundRowWithBudget(scratch.allocator(), row, &expression_budget);
+                const value = (try expression.plan.evaluateBoundRowWithBudget(scratch.allocator(), row, &expression_budget)).scalar(Value) catch return error.UnsupportedRelationalIndexColumn;
                 // Borrowed column/literal results allocate nothing in the
                 // evaluator but still expand the physical key. Charge that
                 // output before appending, including worst-case escaping.
@@ -469,7 +469,7 @@ pub const BatchKeys = struct {
     plan: TuplePlan,
     batch: @import("../rowsource/types.zig").ColumnBatch,
     inputs: []?usize,
-    values: []Value,
+    values: []expressions.Value,
     scratch: std.heap.ArenaAllocator,
 
     pub fn deinit(self: *BatchKeys) void {
@@ -486,15 +486,15 @@ pub const BatchKeys = struct {
         // Only bound dependencies are decoded; unrelated wide columns stay in
         // their physical vectors. NULL slots are checked before dictionary IDs.
         for (self.inputs, self.plan.columns, self.values) |input, column, *value| {
-            value.* = if (input) |index| try vectorValue(self.batch.columns[index], column.column_type, row) else .null;
+            value.* = if (input) |index| expressions.Value.fromScalar(try vectorValue(self.batch.columns[index], column.column_type, row)) else .null;
         }
         var budget: usize = expressions.max_allocated_bytes;
         var has_null = false;
         for (self.plan.keys) |key| {
             const value = if (key.expression) |expression|
-                try expression.plan.evaluateWithBudget(self.scratch.allocator(), self.values, &budget)
+                (try expression.plan.evaluateWithBudget(self.scratch.allocator(), self.values, &budget)).scalar(Value) catch return error.UnsupportedRelationalIndexColumn
             else
-                self.values[key.ordinal];
+                self.values[key.ordinal].scalar(Value) catch return error.UnsupportedRelationalIndexColumn;
             const bytes: usize = switch (value) {
                 .string, .blob => |s| s.len *| 2 +| 3,
                 .numeric => |s| s.len +| 1,

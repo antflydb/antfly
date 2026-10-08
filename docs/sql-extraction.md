@@ -6293,3 +6293,30 @@ tests: 1,091 passing tests, three existing SQL skips, no failures or leaks.
 All nine focused ingress tests, generated control catalog, inventory integrity,
 formatting and whitespace checks pass. The larger typed-array VM activation is
 not credited by these ingress checks.
+
+### Logical row values separate from ordered key operands
+
+The durable expression VM now owns a logical row-value domain independent of
+the ordered-key operand type. Scalar ingress adapts explicitly; index expression
+results project explicitly back into the scalar key domain. Batch key bindings
+retain reusable logical input slots while persistent key encoding and its format
+remain unchanged. Row rewrites use the same logical expression value type.
+
+The row domain also represents canonical typed arrays as pinned bytes plus their
+precise element identity, keeping SQL NULL as a distinct outer tag. It neither
+infers types from JSON nor turns an extent check into a canonical trust proof.
+Array comparisons reuse the borrowed canonical comparator. VM comparison scratch
+is charged against the enclosing execution's remaining byte allowance, including
+arena capacity that an outer invocation arena may retain; work and cancellation
+remain shared. Primitive comparisons need no decoded vectors or heap allocation.
+
+Public array columns/literals and array-valued generated/default bindings remain
+guarded. Their compiler type propagation, JSON/cold-row adapters, public expression
+contract, capability fencing and mounted PostgreSQL activation are still required.
+This domain separation does not activate array indexes or change inventory credit.
+
+Final-source validation passes 611 local and 226 server SQL tests, 62 local and
+5 server schema-expression tests, and 188 local plus 1 server native integrity
+tests: 1,093 passing tests, three existing SQL skips, no failures or leaks.
+Focused scalar projection and bounded array-comparison tests, allocation-fault
+cleanup, generated control catalog, formatting and whitespace checks pass.

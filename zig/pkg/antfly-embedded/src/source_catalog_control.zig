@@ -197,6 +197,7 @@ pub const sql_numeric_aggregate = @import("sql/numeric_aggregate.zig");
 pub const sql_array_binary = @import("sql/array_binary.zig");
 pub const sql_array_storage = @import("sql/array_storage.zig");
 pub const sql_array_comparison = @import("sql/array_comparison.zig");
+pub const sql_row_value = @import("sql/row_value.zig");
 pub const sql_array_text = @import("sql/array_text.zig");
 pub const sql_array_wire = @import("sql/array_wire.zig");
 pub const sql_schema_ddl = @import("sql/schema_ddl.zig");
