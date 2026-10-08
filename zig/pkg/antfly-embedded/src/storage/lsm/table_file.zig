@@ -1967,8 +1967,7 @@ fn encodePrefixCompressedBlockAlloc(allocator: std.mem.Allocator, block_bytes: [
     defer encoded_entries.deinit(allocator);
     var restart_offsets = std.ArrayListUnmanaged(u32).empty;
     defer restart_offsets.deinit(allocator);
-    var previous_key = std.ArrayListUnmanaged(u8).empty;
-    defer previous_key.deinit(allocator);
+    var previous_key: []const u8 = &.{};
 
     var cursor: usize = 0;
     var entry_count: usize = 0;
@@ -1983,7 +1982,7 @@ fn encodePrefixCompressedBlockAlloc(allocator: std.mem.Allocator, block_bytes: [
         if (entry_count % prefix_restart_interval == 0) {
             try restart_offsets.append(allocator, try checkedU32(encoded_entries.items.len));
         } else {
-            shared_key_len = commonPrefixLen(previous_key.items, entry.key);
+            shared_key_len = commonPrefixLen(previous_key, entry.key);
         }
         const unshared_key = entry.key[shared_key_len..];
 
@@ -1996,8 +1995,7 @@ fn encodePrefixCompressedBlockAlloc(allocator: std.mem.Allocator, block_bytes: [
         try encoded_entries.appendSlice(allocator, unshared_key);
         try encoded_entries.appendSlice(allocator, entry.value);
 
-        previous_key.clearRetainingCapacity();
-        try previous_key.appendSlice(allocator, entry.key);
+        previous_key = entry.key;
     }
     if (cursor != block_bytes.len) return error.InvalidTableFile;
 
@@ -2021,32 +2019,47 @@ fn decodePrefixCompressedBlockAlloc(
 ) ![]u8 {
     const view = try parsePrefixBlockPayload(payload);
 
-    var previous_key = std.ArrayListUnmanaged(u8).empty;
-    defer previous_key.deinit(scratch);
-    var current_key = std.ArrayListUnmanaged(u8).empty;
-    defer current_key.deinit(scratch);
+    // The final buffer never moves. Each key shares its prefix directly from
+    // the preceding output key instead of maintaining two growing key arrays.
+    _ = scratch;
+    var previous_key: []const u8 = &.{};
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(allocator);
     try out.ensureTotalCapacityPrecise(allocator, expected_len);
 
     var entries_cursor: usize = 0;
     for (0..view.entry_count) |entry_index| {
-        if (entry_index % view.restart_interval == 0) {
+        const restart = entry_index % view.restart_interval == 0;
+        if (restart) {
             const expected_restart = try view.restartOffset(entry_index / view.restart_interval);
             if (expected_restart != entries_cursor) return error.InvalidTableFile;
         }
-        const entry = try readPrefixBlockEntry(scratch, view.encoded_entries, &entries_cursor, previous_key.items, &current_key);
-        if (try tableEntryEncodedLen(entry) > expected_len -| out.items.len) return error.InvalidTableFile;
-        try appendEntryBytesToList(allocator, &out, .{
-            .namespace_name = entry.namespace_name,
-            .key = entry.key,
-            .value = entry.value,
-            .tombstone = entry.tombstone,
-        });
-
-        previous_key.clearRetainingCapacity();
-        try previous_key.ensureTotalCapacity(scratch, entry.key.len);
-        previous_key.appendSliceAssumeCapacity(entry.key);
+        const tombstone = try readByte(view.encoded_entries, &entries_cursor);
+        if (tombstone > 1) return error.InvalidTableFile;
+        const namespace_len: usize = try readU32(view.encoded_entries, &entries_cursor);
+        const shared_len: usize = try readU32(view.encoded_entries, &entries_cursor);
+        const suffix_len: usize = try readU32(view.encoded_entries, &entries_cursor);
+        const value_len: usize = try readU32(view.encoded_entries, &entries_cursor);
+        if (shared_len > previous_key.len or (restart and shared_len != 0)) return error.InvalidTableFile;
+        const key_len = std.math.add(usize, shared_len, suffix_len) catch return error.InvalidTableFile;
+        if (key_len > std.math.maxInt(u32)) return error.InvalidTableFile;
+        var entry_len = std.math.add(usize, 13, namespace_len) catch return error.InvalidTableFile;
+        entry_len = std.math.add(usize, entry_len, key_len) catch return error.InvalidTableFile;
+        entry_len = std.math.add(usize, entry_len, value_len) catch return error.InvalidTableFile;
+        if (entry_len > expected_len -| out.items.len) return error.InvalidTableFile;
+        const namespace = try readSlice(view.encoded_entries, &entries_cursor, namespace_len);
+        const suffix = try readSlice(view.encoded_entries, &entries_cursor, suffix_len);
+        const value = try readSlice(view.encoded_entries, &entries_cursor, value_len);
+        out.appendAssumeCapacity(tombstone);
+        try appendU32(allocator, &out, @intCast(namespace_len));
+        try appendU32(allocator, &out, @intCast(key_len));
+        try appendU32(allocator, &out, @intCast(value_len));
+        out.appendSliceAssumeCapacity(namespace);
+        const key_start = out.items.len;
+        out.appendSliceAssumeCapacity(previous_key[0..shared_len]);
+        out.appendSliceAssumeCapacity(suffix);
+        previous_key = out.items[key_start..];
+        out.appendSliceAssumeCapacity(value);
     }
     if (entries_cursor != view.encoded_entries.len) return error.InvalidTableFile;
     if (out.items.len != expected_len) return error.InvalidTableFile;
@@ -2078,10 +2091,11 @@ fn parsePrefixBlockPayload(payload: []const u8) !PrefixBlockView {
     const restart_count: usize = @intCast(try readU32(payload, &cursor));
     const encoded_entries_len: usize = @intCast(try readU32(payload, &cursor));
     const encoded_entries = try readSlice(payload, &cursor, encoded_entries_len);
-    const restart_bytes = try readSlice(payload, &cursor, restart_count * @sizeOf(u32));
+    const restart_bytes_len = std.math.mul(usize, restart_count, @sizeOf(u32)) catch return error.InvalidTableFile;
+    const restart_bytes = try readSlice(payload, &cursor, restart_bytes_len);
     if (cursor != payload.len) return error.InvalidTableFile;
     if (entry_count == 0 and restart_count != 0) return error.InvalidTableFile;
-    if (entry_count > 0 and restart_count != ((entry_count + restart_interval - 1) / restart_interval)) return error.InvalidTableFile;
+    if (entry_count > 0 and restart_count != (1 + (entry_count - 1) / restart_interval)) return error.InvalidTableFile;
     return .{
         .entry_count = entry_count,
         .restart_interval = restart_interval,
@@ -2113,7 +2127,8 @@ fn readPrefixBlockEntry(
     const value = try readSlice(encoded_entries, cursor, value_len);
 
     current_key.clearRetainingCapacity();
-    try current_key.ensureTotalCapacity(allocator, shared_key_len + unshared_key.len);
+    const key_len = std.math.add(usize, shared_key_len, unshared_key.len) catch return error.InvalidTableFile;
+    try current_key.ensureTotalCapacity(allocator, key_len);
     current_key.appendSliceAssumeCapacity(previous_key[0..shared_key_len]);
     current_key.appendSliceAssumeCapacity(unshared_key);
     return .{
@@ -2237,7 +2252,11 @@ pub fn findExactEntryInCompressedBlockPayloadWithScratchAlloc(
 }
 
 pub fn validatePrefixDecodedSize(payload: []const u8, logical_len: usize) !void {
-    const ceiling = std.math.add(usize, std.math.mul(usize, logical_len, 4) catch return error.InvalidTableFile, 256) catch return error.InvalidTableFile;
+    // Raw entries have a 13-byte header; prefix entries add four bytes and
+    // at most one four-byte restart per entry. Shared keys only shrink the
+    // payload. Thus even restart_interval=1 fits 2 * logical_len + 32 bytes
+    // (including the 24-byte block header), without assuming compressibility.
+    const ceiling = std.math.add(usize, std.math.mul(usize, logical_len, 2) catch return error.InvalidTableFile, 32) catch return error.InvalidTableFile;
     if (try snappy.decodedLen(payload) > ceiling) return error.InvalidTableFile;
 }
 
@@ -3881,4 +3900,58 @@ test "streaming table unnamed block publication cleans up allocation failures" {
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
+test "table file prefix full decoder reconstructs into output without key scratch" {
+    const a = std.testing.allocator;
+    var raw = std.ArrayListUnmanaged(u8).empty;
+    defer raw.deinit(a);
+    var key: [4096]u8 = @splat('k');
+    for (0..40) |i| {
+        key[key.len - 1] = @intCast(i);
+        try appendEntryBytesToList(a, &raw, .{
+            .namespace_name = if (i % 2 == 0) "docs" else null,
+            .key = &key,
+            .value = if (i % 3 == 0) "" else "value",
+            .tombstone = i % 3 == 0,
+        });
+    }
+    const encoded = try encodePrefixCompressedBlockAlloc(a, raw.items);
+    defer a.free(encoded);
+    var rejected = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    const decoded = try decodePrefixCompressedBlockAlloc(a, rejected.allocator(), encoded, raw.items.len);
+    defer a.free(decoded);
+    try std.testing.expectEqualSlices(u8, raw.items, decoded);
+    try std.testing.expectEqual(@as(usize, 0), rejected.alloc_index);
+    try std.testing.expectError(error.InvalidTableFile, decodePrefixCompressedBlockAlloc(a, rejected.allocator(), encoded, raw.items.len - 1));
+    try std.testing.expectError(error.InvalidTableFile, decodePrefixCompressedBlockAlloc(a, rejected.allocator(), encoded[0 .. encoded.len - 1], raw.items.len));
+    std.debug.print("prefix full decoder: entries=40 key_bytes=4096 scratch_allocations=0\n", .{});
+}
+
+test "table file prefix snappy expansion bound allows worst restart overhead" {
+    const a = std.testing.allocator;
+    const count = 96;
+    var payload = std.ArrayListUnmanaged(u8).empty;
+    defer payload.deinit(a);
+    try payload.appendSlice(a, prefix_block_magic);
+    try appendU32(a, &payload, count);
+    try appendU32(a, &payload, 1);
+    try appendU32(a, &payload, count);
+    try appendU32(a, &payload, 17 * count);
+    for (0..count) |_| {
+        try payload.append(a, 1);
+        for (0..4) |_| try appendU32(a, &payload, 0);
+    }
+    for (0..count) |i| try appendU32(a, &payload, @intCast(i * 17));
+    const encoded = try snappy.encode(a, payload.items);
+    defer a.free(encoded);
+    try validatePrefixDecodedSize(encoded, 13 * count);
+    const decoded = try decodeBlockPayloadWithScratchAlloc(a, a, .prefix_snappy, encoded, 13 * count, Crc32.hash(encoded));
+    defer a.free(decoded);
+    try std.testing.expectEqual(@as(usize, 13 * count), decoded.len);
+    for (0..count) |i| {
+        try std.testing.expectEqual(@as(u8, 1), decoded[i * 13]);
+        for (decoded[i * 13 + 1 .. (i + 1) * 13]) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
+    }
+    try std.testing.expectError(error.InvalidTableFile, validatePrefixDecodedSize(encoded, 1));
 }

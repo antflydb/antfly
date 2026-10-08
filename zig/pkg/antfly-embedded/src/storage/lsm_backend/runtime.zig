@@ -3444,7 +3444,7 @@ fn readManySortedCurrentWithLayoutLocked(
             _ = lockBackend(BackendType, backend);
         };
         if (builtin.is_test) if (test_current_point_unlocked_hook) |hook| try hook(backend);
-        return readManySortedDirectoryBatch(backend, layout.mutable_snapshot.?.state, layout.immutable_memtables, directory, allocator, held_blocks, held_values, namespace, keys, values, false, false);
+        return readManySortedDirectoryBatch(backend, layout.mutable_snapshot.?.state, layout.immutable_memtables, directory, allocator, held_blocks, held_values, namespace, keys, values, false, false, null, allocator);
     }
 
     switch (chooseMultiGetPlan(keys, .stable_probe)) {
@@ -3521,12 +3521,14 @@ pub fn BoundReadTxn(comptime BackendType: type) type {
         read_hint: ?BorrowedReadHint = null,
         held_blocks: std.ArrayListUnmanaged(BlockPin) = .empty,
         held_values: std.ArrayListUnmanaged([]u8) = .empty,
+        planning_scratch: BatchScratch.ProbeScratch = .{},
 
         pub const ReadScope = struct {
             parent: *BoundReadTxn(BackendType),
             allocator: Allocator,
             held_blocks: std.ArrayListUnmanaged(BlockPin) = .empty,
             held_values: std.ArrayListUnmanaged([]u8) = .empty,
+            planning_scratch: BatchScratch.ProbeScratch = .{},
             read_hint: ?BorrowedReadHint = null,
             last_l0_group_index: ?usize = null,
 
@@ -3542,7 +3544,7 @@ pub fn BoundReadTxn(comptime BackendType: type) type {
                 const p = self.parent;
                 p.backend.recordGetManySorted(keys.len);
                 p.backend.recordGetManySortedLocality(keys);
-                const result = try readManySortedFromReadView(p.backend, p.mutable_snapshot, p.immutable_memtables, p.read_view, self.allocator, &self.held_blocks, &self.held_values, p.namespace, keys, values);
+                const result = try readManySortedFromReadView(p.backend, p.mutable_snapshot, p.immutable_memtables, p.read_view, self.allocator, &self.held_blocks, &self.held_values, p.namespace, keys, values, &self.planning_scratch, self.allocator);
                 p.backend.recordGetManySortedResults(result.hits, result.misses);
             }
 
@@ -3565,6 +3567,7 @@ pub fn BoundReadTxn(comptime BackendType: type) type {
             }
 
             pub fn close(self: *@This()) void {
+                self.planning_scratch.deinit(self.allocator);
                 releaseHeldBlocks(&self.held_blocks, self.parent.backend.allocator);
                 releaseHeldValues(&self.held_values, self.allocator);
                 self.* = undefined;
@@ -3638,6 +3641,7 @@ pub fn BoundReadTxn(comptime BackendType: type) type {
 
         pub fn abort(self: *@This()) void {
             const backend = self.backend;
+            self.planning_scratch.deinit(self.metadata_allocator);
             if (!self.owns_snapshot) {
                 releaseHeldBlocks(&self.held_blocks, backend.allocator);
                 releaseHeldValues(&self.held_values, self.allocator);
@@ -3670,7 +3674,7 @@ pub fn BoundReadTxn(comptime BackendType: type) type {
             @memset(values, null);
             self.backend.recordGetManySorted(keys.len);
             self.backend.recordGetManySortedLocality(keys);
-            const result = try readManySortedFromReadView(self.backend, self.mutable_snapshot, self.immutable_memtables, self.read_view, self.allocator, &self.held_blocks, &self.held_values, self.namespace, keys, values);
+            const result = try readManySortedFromReadView(self.backend, self.mutable_snapshot, self.immutable_memtables, self.read_view, self.allocator, &self.held_blocks, &self.held_values, self.namespace, keys, values, &self.planning_scratch, self.metadata_allocator);
             self.backend.recordGetManySortedResults(result.hits, result.misses);
         }
 
@@ -3859,51 +3863,6 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
             return owned;
         }
 
-        fn ownUnpinnedValues(self: *@This(), values: []?[]const u8, first_owned: usize) !void {
-            const Range = struct {
-                base: usize,
-                len: usize,
-                fn less(_: void, lhs: @This(), rhs: @This()) bool {
-                    return lhs.base < rhs.base;
-                }
-            };
-            const count = self.held_values.items.len - first_owned;
-            var inline_ranges: [128]Range = undefined;
-            const ranges = if (count <= inline_ranges.len) inline_ranges[0..count] else try self.metadata_allocator.alloc(Range, count);
-            defer if (count > inline_ranges.len) self.metadata_allocator.free(ranges);
-            for (self.held_values.items[first_owned..], ranges) |owned, *range| range.* = .{ .base = @intFromPtr(owned.ptr), .len = owned.len };
-            std.mem.sort(Range, ranges, {}, Range.less);
-            for (values) |*slot| {
-                const value = slot.* orelse continue;
-                const address = @intFromPtr(value.ptr);
-                var retained = false;
-                for (self.held_blocks.items) |*pin| {
-                    const bytes = switch (pin.*) {
-                        .local => |payload| payload.bytes,
-                        .cached => |*handle| handle.runTableBlock(),
-                    };
-                    const base = @intFromPtr(bytes.ptr);
-                    if (address >= base and address - base <= bytes.len and value.len <= bytes.len - (address - base)) {
-                        retained = true;
-                        break;
-                    }
-                }
-                if (retained) continue;
-                var lo: usize = 0;
-                var hi = ranges.len;
-                while (lo < hi) {
-                    const mid = lo + (hi - lo) / 2;
-                    if (ranges[mid].base <= address) lo = mid + 1 else hi = mid;
-                }
-                if (lo != 0) {
-                    const range = ranges[lo - 1];
-                    if (address - range.base <= range.len and value.len <= range.len - (address - range.base)) continue;
-                }
-                slot.* = try self.ownValue(value);
-                recordPointValueCopy(self.backend);
-            }
-        }
-
         fn ensureStablePointViewLoaded(self: *@This()) !void {
             if (!self.stable_point_view or self.stable_point_view_loaded) return;
             const locked = lockBackend(BackendType, self.backend);
@@ -4043,7 +4002,6 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
                 self.backend.recordGetManySortedLocality(keys);
             }
 
-            const first_owned = self.held_values.items.len;
             var result: BatchCursorReadResult = .{};
             if (self.stable_point_view) {
                 var offset: usize = 0;
@@ -4053,7 +4011,7 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
                     recordMultiGetPlan(self.backend, plan);
                     if (self.read_view.?.directory() == null) try self.ensureStablePointViewLoaded();
                     const chunk_result = if (self.read_view.?.directory()) |directory|
-                        try readManySortedDirectoryBatch(self.backend, &self.empty_state, &.{}, directory, self.allocator, &self.held_blocks, &self.held_values, self.namespace, keys[offset..end], values[offset..end], plan == .sorted_by_run, false)
+                        try readManySortedDirectoryBatch(self.backend, &self.empty_state, &.{}, directory, self.allocator, &self.held_blocks, &self.held_values, self.namespace, keys[offset..end], values[offset..end], plan == .sorted_by_run, false, self.borrowed_batch_scratch orelse &self.batch_scratch, self.metadata_allocator)
                     else switch (plan) {
                         .sorted_by_run => try readManySortedByRunFromSnapshot(
                             self.backend,
@@ -4148,10 +4106,12 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
                         unresolved_index += 1;
                     }
 
+                    var source_namespace = self.namespace;
+                    source_namespace.own_source_point_results = true;
                     const plan = chooseMultiGetPlan(unresolved_keys, .stable_probe);
                     recordMultiGetPlan(self.backend, plan);
                     const unresolved_result = if (layout.read_view.directory()) |directory|
-                        try readManySortedDirectoryBatch(self.backend, &self.empty_state, layout.immutable_memtables, directory, self.allocator, &self.held_blocks, &self.held_values, self.namespace, unresolved_keys, unresolved_values, plan == .sorted_by_run, false)
+                        try readManySortedDirectoryBatch(self.backend, &self.empty_state, layout.immutable_memtables, directory, self.allocator, &self.held_blocks, &self.held_values, source_namespace, unresolved_keys, unresolved_values, plan == .sorted_by_run, false, scratch, self.metadata_allocator)
                     else switch (plan) {
                         .sorted_by_run => try readManySortedByRunFromSnapshot(
                             self.backend,
@@ -4163,7 +4123,7 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
                             self.allocator,
                             &self.held_blocks,
                             &self.held_values,
-                            self.namespace,
+                            source_namespace,
                             unresolved_keys,
                             unresolved_values,
                             false,
@@ -4178,13 +4138,12 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
                             self.allocator,
                             &self.held_blocks,
                             &self.held_values,
-                            self.namespace,
+                            source_namespace,
                             unresolved_keys,
                             unresolved_values,
                             false,
                         ),
                     };
-                    try self.ownUnpinnedValues(unresolved_values, first_owned);
                     for (unresolved_values, unresolved_indexes) |value, index| values[index] = value;
                     result.add(unresolved_result);
                 }
@@ -5269,6 +5228,7 @@ pub fn NamespaceReadTxn(comptime BackendType: type) type {
         read_hint: ?BorrowedReadHint = null,
         held_blocks: std.ArrayListUnmanaged(BlockPin) = .empty,
         held_values: std.ArrayListUnmanaged([]u8) = .empty,
+        planning_scratch: BatchScratch.ProbeScratch = .{},
 
         pub fn open(backend: *BackendType) !@This() {
             const locked = lockBackend(BackendType, backend);
@@ -5310,6 +5270,7 @@ pub fn NamespaceReadTxn(comptime BackendType: type) type {
         }
 
         pub fn abort(self: *@This()) void {
+            self.planning_scratch.deinit(self.metadata_allocator);
             const backend = self.backend;
             if (self.owns_mutable_snapshot) {
                 var owned = @constCast(self.mutable_snapshot);
@@ -5338,7 +5299,7 @@ pub fn NamespaceReadTxn(comptime BackendType: type) type {
             @memset(values, null);
             self.backend.recordGetManySorted(keys.len);
             self.backend.recordGetManySortedLocality(keys);
-            const result = try readManySortedFromReadView(self.backend, self.mutable_snapshot, self.immutable_memtables, self.read_view, self.allocator, &self.held_blocks, &self.held_values, namespace, keys, values);
+            const result = try readManySortedFromReadView(self.backend, self.mutable_snapshot, self.immutable_memtables, self.read_view, self.allocator, &self.held_blocks, &self.held_values, namespace, keys, values, &self.planning_scratch, self.metadata_allocator);
             self.backend.recordGetManySortedResults(result.hits, result.misses);
         }
 
@@ -5518,6 +5479,8 @@ fn readManySortedFromReadView(
     namespace: backend_types.Namespace,
     keys: []const []const u8,
     values: []?[]const u8,
+    reuse: *BatchScratch.ProbeScratch,
+    metadata_allocator: Allocator,
 ) !BatchCursorReadResult {
     const plan = chooseMultiGetPlan(keys, .snapshot);
     recordMultiGetPlan(backend, plan);
@@ -5526,7 +5489,7 @@ fn readManySortedFromReadView(
         .sorted_by_run => return readManySortedByRunFromSnapshot(backend, mutable, immutable_memtables, view.runs, view.l0_groups, view.levels, allocator, held_blocks, held_values, namespace, keys, values, false),
         .cursor => {},
     };
-    if (plan != .cursor) return readManySortedDirectoryBatch(backend, mutable, immutable_memtables, view.directory().?, allocator, held_blocks, held_values, namespace, keys, values, plan == .sorted_by_run, false);
+    if (plan != .cursor) return readManySortedDirectoryBatch(backend, mutable, immutable_memtables, view.directory().?, allocator, held_blocks, held_values, namespace, keys, values, plan == .sorted_by_run, false, reuse, metadata_allocator);
     var cursor = try MergeCursor(@TypeOf(backend.*), State).initView(runtimeScratchAllocator(allocator), backend, mutable, immutable_memtables, view, namespace, false);
     defer cursor.close();
     return readManySortedFromCursor(backend, allocator, held_blocks, held_values, &cursor, keys, values);
@@ -5548,7 +5511,17 @@ fn readManySortedDirectoryBatch(
     values: []?[]const u8,
     sorted_by_run: bool,
     backend_locked: bool,
+    reuse: ?*BatchScratch.ProbeScratch,
+    metadata_allocator: Allocator,
 ) !BatchCursorReadResult {
+    if (reuse) |owner| {
+        const planner = try owner.planning(metadata_allocator, runtimeScratchAllocator(allocator), backend.options.resource_manager);
+        defer planner.finish();
+        return readManySortedDirectoryCandidates(backend, mutable, immutable_memtables, directory, planner.arena.allocator(), allocator, held_blocks, held_values, namespace, keys, values, sorted_by_run, backend_locked) catch |err| {
+            if (planner.denied()) return error.ResourceBudgetExceeded;
+            return err;
+        };
+    }
     const resources = @import("../resource_manager.zig");
     var admitted: ?resources.BudgetedAllocator = null;
     if (comptime @hasField(@TypeOf(backend.options), "resource_manager")) if (backend.options.resource_manager) |manager| {
@@ -5578,17 +5551,32 @@ fn readManySortedDirectoryCandidates(
     backend_locked: bool,
 ) !BatchCursorReadResult {
     const Directory = @import("run_directory.zig").Directory;
-    var selected: std.AutoArrayHashMapUnmanaged(u64, Directory.Handle) = .empty;
+    var selected = std.ArrayListUnmanaged(Directory.Handle).empty;
     defer selected.deinit(scratch);
-    for (keys) |key| {
-        if (mutable.findIndex(namespace, key) != null) continue;
-        var cursor = directory.overlaps(namespace.name, key, namespace.name, key);
-        while (!cursor.done()) {
-            var budget: usize = 16384;
-            while (cursor.next(&budget)) |handle| try selected.put(scratch, handle.run.id, handle);
+    var cursor = directory.sortedPoints(namespace.name, keys);
+    while (!cursor.done()) {
+        var budget: usize = 16384;
+        while (cursor.next(&budget)) |handle| {
+            // Mutable results are resolved before source planning. Exclude a
+            // run if every requested key in its interval is already decided.
+            var lo: usize = 0;
+            var hi = keys.len;
+            while (lo < hi) {
+                const mid = lo + (hi - lo) / 2;
+                if (compareRunBound(namespace.name, keys[mid], handle.run.smallest_namespace_name, handle.run.smallest_key) == .lt) lo = mid + 1 else hi = mid;
+            }
+            var relevant = false;
+            for (keys[lo..]) |key| {
+                if (!runMayContain(handle.run.*, namespace, key)) break;
+                if (mutable.findIndex(namespace, key) == null) {
+                    relevant = true;
+                    break;
+                }
+            }
+            if (relevant) try selected.append(scratch, handle);
         }
     }
-    const handles = selected.values();
+    const handles = selected.items;
     std.mem.sort(Directory.Handle, handles, {}, Directory.readLess);
     const runs = try scratch.alloc(Run, handles.len);
     defer scratch.free(runs);
@@ -5602,6 +5590,11 @@ fn readManySortedDirectoryCandidates(
     defer scratch.free(levels);
     if (sorted_by_run) return readManySortedByRunFromSnapshot(backend, mutable, immutable_memtables, runs, groups, levels, allocator, held_blocks, held_values, namespace, keys, values, backend_locked);
     return readManySortedPointFromSnapshot(backend, mutable, immutable_memtables, runs, groups, levels, allocator, held_blocks, held_values, namespace, keys, values, backend_locked);
+}
+
+fn retainSourcePointValue(backend: anytype, allocator: Allocator, held: *std.ArrayListUnmanaged([]u8), namespace: backend_types.Namespace, value: []const u8) ![]const u8 {
+    if (!namespace.own_source_point_results) return value;
+    return PointResultLifetime.transaction_owned.retain(backend, allocator, held, held.items.len, value);
 }
 
 fn getFromSnapshotRuns(
@@ -5626,7 +5619,7 @@ fn getFromSnapshotRuns(
         if (entry.tombstone) return error.NotFound;
         read_hint.* = null;
         backend.recordMutableHit();
-        return entry.value;
+        return try retainSourcePointValue(backend, value_allocator, held_values, namespace, entry.value);
     }
     for (immutable_memtables) |state| {
         if (state.findIndex(namespace, key)) |idx| {
@@ -5634,7 +5627,7 @@ fn getFromSnapshotRuns(
             if (entry.tombstone) return error.NotFound;
             read_hint.* = null;
             backend.recordMutableHit();
-            return entry.value;
+            return try retainSourcePointValue(backend, value_allocator, held_values, namespace, entry.value);
         }
     }
     var candidate_group_index = if (last_l0_group_index.*) |hinted_index|
@@ -6472,7 +6465,7 @@ fn readManySortedPointFromSnapshotAsync(
             if (entry.tombstone) {
                 result.misses += 1;
             } else {
-                values[key_index] = try result_lifetime.retain(backend, allocator, held_values, held_values.items.len, entry.value);
+                values[key_index] = try (if (namespace.own_source_point_results) PointResultLifetime.transaction_owned else result_lifetime).retain(backend, allocator, held_values, held_values.items.len, entry.value);
                 result.hits += 1;
                 backend.recordMutableHit();
             }
@@ -6485,7 +6478,7 @@ fn readManySortedPointFromSnapshotAsync(
             if (entry.tombstone) {
                 result.misses += 1;
             } else {
-                values[key_index] = try result_lifetime.retain(backend, allocator, held_values, held_values.items.len, entry.value);
+                values[key_index] = try (if (namespace.own_source_point_results) PointResultLifetime.transaction_owned else result_lifetime).retain(backend, allocator, held_values, held_values.items.len, entry.value);
                 result.hits += 1;
                 backend.recordMutableHit();
             }
@@ -6616,7 +6609,7 @@ fn getFromRunIndices(
                 const entry = state.entryAt(idx);
                 if (entry.tombstone) return error.NotFound;
                 read_hint.* = null;
-                return entry.value;
+                return try retainSourcePointValue(backend, value_allocator, held_values, namespace, entry.value);
             }
             continue;
         }
@@ -6629,7 +6622,7 @@ fn getFromRunIndices(
                         const entry = state.entryAt(idx);
                         if (entry.tombstone) return error.NotFound;
                         read_hint.* = null;
-                        return entry.value;
+                        return try retainSourcePointValue(backend, value_allocator, held_values, namespace, entry.value);
                     }
                     continue;
                 }
@@ -6694,7 +6687,7 @@ fn getFromRunIndices(
             .key = entry.key,
             .entry_index = entry_index,
         };
-        return entry.value;
+        return try retainSourcePointValue(backend, value_allocator, held_values, namespace, entry.value);
     }
     return null;
 }
@@ -7411,12 +7404,19 @@ fn retainLocalCachedBlock(backend: anytype, run: *Run, index: *const lsm_table_f
 }
 
 fn localDecodeWorkingBytes(window: lsm_table_file.EntryDataWindow) !usize {
+    return localDecodeWorkingBytesFor(window, false);
+}
+
+fn localDecodeWorkingBytesFor(window: lsm_table_file.EntryDataWindow, point: bool) !usize {
     // Uncompressed input becomes the output allocation directly. Snappy only
-    // needs its encoded input in scratch. Prefix reconstruction still reserves
-    // room for geometrically grown key buffers and an intermediate payload.
+    // needs its encoded input in scratch. Full prefix decoding reconstructs
+    // keys in the output; point decoding still uses restart/key buffers.
+    // Prefix+Snappy reserves the output plus fourfold arena headroom for the
+    // validated intermediate prefix payload (at most twice the logical size).
     const logical_factor: usize = switch (window.compression) {
         .none, .snappy => 1,
-        .prefix, .prefix_snappy => 24,
+        .prefix => if (point) 24 else 1,
+        .prefix_snappy => if (point) 24 else 9,
     };
     const physical_factor: usize = if (window.compression == .none) 0 else 4;
     const logical = std.math.mul(usize, window.len, logical_factor) catch return error.InvalidTableFile;
@@ -7424,13 +7424,13 @@ fn localDecodeWorkingBytes(window: lsm_table_file.EntryDataWindow) !usize {
     return std.math.add(usize, std.math.add(usize, logical, physical) catch return error.InvalidTableFile, LocalReader.retained_bytes_per_workspace + @sizeOf(SharedBytes)) catch return error.InvalidTableFile;
 }
 
-fn localWorkspace(backend: anytype, window: lsm_table_file.EntryDataWindow) !LocalReader.Workspace {
-    return backend.local_reader.acquire(backend.allocator, backend.options.resource_manager, backend.manifestCoordinationIo(), try localDecodeWorkingBytes(window), backend.options.local_decode_working_bytes, window.len + @sizeOf(SharedBytes));
+fn localWorkspace(backend: anytype, window: lsm_table_file.EntryDataWindow, point: bool) !LocalReader.Workspace {
+    return backend.local_reader.acquire(backend.allocator, backend.options.resource_manager, backend.manifestCoordinationIo(), try localDecodeWorkingBytesFor(window, point), backend.options.local_decode_working_bytes, window.len + @sizeOf(SharedBytes));
 }
 
 fn loadDecodedLocalBlock(backend: anytype, allocator: Allocator, path: []const u8, offset: u64, window: lsm_table_file.EntryDataWindow) ![]u8 {
     if (comptime @hasField(@TypeOf(backend.*), "local_reader")) {
-        var work = try localWorkspace(backend, window);
+        var work = try localWorkspace(backend, window, false);
         defer work.release();
         if (window.compression == .none) {
             if (window.physicalLen() != window.len) return error.InvalidTableFile;
@@ -7640,7 +7640,7 @@ fn findExactEntryInCompressedPrefixBlock(
     }
     const path = run.path orelse return error.RunStateUnavailable;
     const absolute_offset = @as(u64, @intCast(index.entry_data_start)) + window.physicalRelativeOffset();
-    var workspace: ?LocalReader.Workspace = if (comptime @hasField(@TypeOf(backend.*), "local_reader")) try localWorkspace(backend, window) else null;
+    var workspace: ?LocalReader.Workspace = if (comptime @hasField(@TypeOf(backend.*), "local_reader")) try localWorkspace(backend, window, true) else null;
     defer if (workspace) |*work| work.release();
     const scratch = if (workspace) |*work| work.allocator() else backend.allocator;
     const payload = try loadRunTableBlockWithStats(backend, scratch, path, absolute_offset, window.physicalLen());
@@ -9387,4 +9387,97 @@ test "lsm cold optimization snappy bounds decode compressible and incompressible
         try std.testing.expectError(error.InvalidTableFile, loadDecodedLocalBlock(&backend, a, "/snappy-block", 0, corrupt));
         try std.testing.expectEqual(@as(usize, 0), backend.local_reader.active);
     }
+}
+
+test "lsm fresh review mixed 257 key metadata allocations" {
+    const B = @import("../lsm_backend.zig").Backend;
+    const Budget = @import("../lite/test_allocator.zig").BudgetAllocator;
+    const a = std.testing.allocator;
+    var storage = storage_io.MemoryStorage.init(a);
+    defer storage.deinit();
+    var backend = try B.open(a, "/fresh-review-257", .{ .storage = storage.storage(), .flush_threshold = 1 });
+    defer backend.close();
+    var runtime = try backend.runtimeStore(a, .{ .name = "docs" });
+    defer runtime.deinit();
+    var keys: [257][]const u8 = undefined;
+    var key_storage: [257][32]u8 = undefined;
+    var values: [257]?[]const u8 = undefined;
+    for (&keys, &key_storage, 0..) |*key, *buffer, i| key.* = try std.fmt.bufPrint(buffer, "document:{d:0>4}", .{i});
+    var disk = try runtime.beginWrite();
+    try disk.put(keys[0], "disk");
+    try disk.commit();
+    backend.options.flush_threshold = std.math.maxInt(usize);
+    var mutable = try runtime.beginWrite();
+    for (keys[1..]) |key| try mutable.put(key, "mutable");
+    try mutable.commit();
+    var metadata = Budget{ .backing = a };
+    var probe = try BoundProbeTxn(B).open(&backend, .{ .name = "docs" });
+    probe.metadata_allocator = metadata.allocator();
+    defer probe.abort();
+    try probe.getManySorted(&keys, &values);
+    const calls = metadata.alloc_calls;
+    for (0..100) |_| {
+        try probe.getManySorted(&keys, &values);
+        try std.testing.expectEqualStrings("disk", values[0].?);
+        for (values[1..]) |value| try std.testing.expectEqualStrings("mutable", value.?);
+    }
+    std.debug.print("fresh review: 100 warm mixed 257-key batches, metadata allocations={d}\n", .{metadata.alloc_calls - calls});
+    try std.testing.expectEqual(@as(usize, 0), metadata.alloc_calls - calls);
+}
+
+test "lsm cold optimization full prefix admission is separate from point scratch" {
+    const window: lsm_table_file.EntryDataWindow = .{
+        .relative_offset = 0,
+        .len = 512 * 1024,
+        .physical_len = 64 * 1024,
+        .compression = .prefix,
+    };
+    const full = try localDecodeWorkingBytes(window);
+    const point = try localDecodeWorkingBytesFor(window, true);
+    try std.testing.expectEqual(23 * @as(usize, window.len), point - full);
+    var snappy_window = window;
+    snappy_window.compression = .prefix_snappy;
+    const snappy_full = try localDecodeWorkingBytes(snappy_window);
+    const snappy_point = try localDecodeWorkingBytesFor(snappy_window, true);
+    try std.testing.expectEqual(15 * @as(usize, window.len), snappy_point - snappy_full);
+    std.debug.print("prefix admission: logical=524288 physical=65536 full={d} point={d} prefix_snappy_full={d}\n", .{ full, point, snappy_full });
+}
+
+test "lsm cold optimization mixed batch owns immutable values before releasing its tip" {
+    const B = @import("../lsm_backend.zig").Backend;
+    const a = std.testing.allocator;
+    var storage = storage_io.MemoryStorage.init(a);
+    defer storage.deinit();
+    var backend = try B.open(a, "/batch-source-lifetime", .{
+        .storage = storage.storage(),
+        .flush_threshold = 1000,
+        .flush_threshold_bytes = 256,
+    });
+    defer backend.close();
+    var runtime = try backend.runtimeStore(a, .{ .name = "docs" });
+    defer runtime.deinit();
+    const original: [300]u8 = @splat('x');
+    var write = try runtime.beginWrite();
+    try write.put("a", &original);
+    try write.commit();
+    try std.testing.expectEqual(@as(usize, 1), backend.activeImmutableMemtableCount());
+    var probe = try BoundProbeTxn(B).open(&backend, .{ .name = "docs" });
+    defer probe.abort();
+    var values: [2]?[]const u8 = undefined;
+    try probe.getManySorted(&.{ "a", "missing" }, &values);
+    const saved = values[0].?;
+    try std.testing.expect(values[1] == null);
+    try std.testing.expectEqual(@as(usize, 0), probe.held_layouts.items.len);
+    try std.testing.expectEqual(@as(usize, 1), probe.held_values.items.len);
+    try std.testing.expect(try backend.runMaintenanceStep());
+    try std.testing.expectEqual(@as(usize, 0), backend.activeImmutableMemtableCount());
+    try std.testing.expectEqual(@as(usize, 0), backend.retired_immutable_memtables.items.len);
+    try std.testing.expectEqualStrings(&original, saved);
+    backend.options.flush_threshold_bytes = std.math.maxInt(usize);
+    var overwrite = try runtime.beginWrite();
+    try overwrite.put("a", "new");
+    try overwrite.commit();
+    try probe.getManySorted(&.{ "a", "missing" }, &values);
+    try std.testing.expectEqualStrings("new", values[0].?);
+    try std.testing.expectEqualStrings(&original, saved);
 }

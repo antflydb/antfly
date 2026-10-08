@@ -28,7 +28,52 @@
     "mixed_writer_100_warm_batches": {
       "keys_per_batch": 2,
       "after_metadata_allocations": 0
+    },
+    "mixed_mutable_probe_257_keys_100_warm_batches": {
+      "keys_per_batch": 257,
+      "mutable_keys": 256,
+      "disk_keys": 1,
+      "before_metadata_allocations": 100,
+      "after_metadata_allocations": 0
+    },
+    "overlapping_directory_points": {
+      "keys": 32,
+      "runs": 32,
+      "before_node_visits": 1024,
+      "after_node_visits": 32
+    },
+    "sparse_directory_points": {
+      "keys": 2,
+      "runs": 1024,
+      "matches": 2,
+      "node_visits": 36
+    },
+    "planning_scratch_100_warm_batches": {
+      "payload_bytes_per_batch": 4096,
+      "after_backing_allocations": 0,
+      "retained_payload_cap_bytes": 65536,
+      "oversized_fixture_bytes": 1048576
+    },
+    "full_prefix_decode_long_keys": {
+      "entries": 40,
+      "key_bytes": 4096,
+      "after_key_scratch_allocations": 0
+    },
+    "full_prefix_decoder_admission": {
+      "logical_bytes": 524288,
+      "physical_bytes": 65536,
+      "before_admission_bytes": 12910680,
+      "after_admission_bytes": 852056,
+      "point_admission_bytes": 12910680
+    },
+    "full_prefix_snappy_decoder_admission": {
+      "logical_bytes": 524288,
+      "physical_bytes": 65536,
+      "before_admission_bytes": 12910680,
+      "after_admission_bytes": 5046360,
+      "point_admission_bytes": 12910680
     }
   },
-  "scope": "Deterministic allocation and admission fixtures, not query throughput or a 2 GiB soak. Caller-owned mutable values and captured read-layout allocations remain necessary and are excluded from metadata-array counts."
+  "scope": "Deterministic allocation, directory traversal, and admission fixtures, not query throughput or a 2 GiB soak. Caller-owned mutable values, captured read-layout allocations, async scheduler metadata, and run-index handle arrays remain necessary or unreused and are excluded from metadata-array counts. Planning scratch retention remains resource charged.",
+  "followup_comparison_commit": "cc48e4652c375181f3cfc2d7a540a75cf38848c5"
 }

@@ -26117,7 +26117,8 @@ test "lsm local writer batches borrow within owner limits and preserve mutable r
     try std.testing.expectEqual(owned, writer.held_values.items.len);
     try std.testing.expectEqual(@as(usize, 1), writer.held_blocks.items.len);
     try std.testing.expect(scratch_keys == writer.batch_scratch.keys.items.ptr);
-    try std.testing.expectEqual(@as(usize, 3), metadata.alloc_calls);
+    // Three input arrays and one heap-stable planning workspace.
+    try std.testing.expectEqual(@as(usize, 4), metadata.alloc_calls);
     const borrowed = values[0].?;
     const cached = backend.run_block_cache.items[0];
     backend.evictCachedRunBlocksForRun(cached.path, cached.run_id);
