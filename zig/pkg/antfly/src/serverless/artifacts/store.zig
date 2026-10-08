@@ -199,6 +199,10 @@ pub const ArtifactStore = struct {
         put_with_cancellation: ?*const fn (*anyopaque, Allocator, []const u8, CancellationToken) anyerror!ArtifactMetadata = null,
         get_alloc: *const fn (*anyopaque, Allocator, []const u8) anyerror![]u8,
         get_alloc_with_cancellation: ?*const fn (*anyopaque, Allocator, []const u8, CancellationToken) anyerror![]u8 = null,
+        /// Return the complete object without a metadata probe, bounded by the
+        /// expected size. The caller verifies exact length and SHA-256; a range
+        /// read cannot substitute because it would hide appended bytes.
+        get_bounded_alloc_with_cancellation: ?*const fn (*anyopaque, Allocator, []const u8, usize, CancellationToken) anyerror![]u8 = null,
         get_range_alloc: *const fn (*anyopaque, Allocator, []const u8, u64, usize) anyerror![]u8,
         get_range_alloc_with_cancellation: ?*const fn (*anyopaque, Allocator, []const u8, u64, usize, CancellationToken) anyerror![]u8 = null,
         get_verified_range_alloc_with_cancellation: ?*const fn (*anyopaque, Allocator, []const u8, u64, []const u8, u64, usize, CancellationToken) anyerror![]u8 = null,
@@ -340,6 +344,14 @@ pub const ArtifactStore = struct {
             return error.ArtifactIntegrityMismatch;
         const expected_len = std.math.cast(usize, expected_byte_len) orelse
             return error.ArtifactTooLarge;
+
+        if (self.vtable.get_bounded_alloc_with_cancellation) |get_bounded| {
+            const payload = try get_bounded(self.ptr, result_alloc, artifact_id, expected_len, cancellation);
+            errdefer result_alloc.free(payload);
+            if (payload.len != expected_len) return error.ArtifactIntegrityMismatch;
+            try validatePayloadSha256WithCancellation(payload, expected_checksum, cancellation);
+            return payload;
+        }
 
         {
             var metadata = try self.statWithCancellationUsingAllocator(result_alloc, artifact_id, cancellation);

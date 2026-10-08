@@ -1013,9 +1013,10 @@ const PersistentObjectRangeCacheState = struct {
         const manager = self.resource_manager orelse return null;
         const source = manager.capacitySource() orelse return null;
         const observation = try source.current();
-        const timestamp_ns = std.Io.Timestamp.now(self.io, .awake).toNanoseconds();
-        const now_ns: u64 = std.math.cast(u64, timestamp_ns) orelse
-            if (timestamp_ns < 0) 0 else std.math.maxInt(u64);
+        // Capacity sources timestamp observations in the native process clock.
+        // Io awake has a different origin on Darwin (UPTIME_RAW), so comparing
+        // it with CLOCK_MONOTONIC can reject every freshly observed write.
+        const now_ns = @import("antfly_platform").time.monotonicNs();
         return manager.reserveCapacity(
             self.alloc,
             source.domain_id,
@@ -6705,6 +6706,47 @@ test "lake persistent object range cache bounds write-behind admission" {
     try std.testing.expectEqual(@as(usize, 0), stats.queued_entries);
     try std.testing.expect((try persistent.readAlloc(alloc, "long", 1)) == null);
     try std.testing.expectEqual(@as(usize, 1), persistent.statsSnapshot().read_misses);
+}
+
+test "lake persistent cache admits native-clock capacity with an offset Io awake clock" {
+    const a = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(a, .{});
+    defer io_impl.deinit();
+    const native_io = io_impl.io();
+    var shifted_vtable = native_io.vtable.*;
+    const Clock = struct {
+        fn now(_: ?*anyopaque, clock: std.Io.Clock) std.Io.Timestamp {
+            if (clock == .awake) return .{ .nanoseconds = 1 };
+            return std.testing.io.vtable.now(std.testing.io.userdata, clock);
+        }
+        fn observe(_: *anyopaque) !resource_manager_mod.CapacityObservation {
+            return .{ .available_bytes = 1024 * 1024 * 1024 * 1024, .capacity_bytes = 1024 * 1024 * 1024 * 1024, .observed_at_ns = @import("antfly_platform").time.monotonicNs(), .valid_for_ns = 5 * std.time.ns_per_s };
+        }
+    };
+    shifted_vtable.now = Clock.now;
+    const io: std.Io = .{ .userdata = native_io.userdata, .vtable = &shifted_vtable };
+    var manager = resource_manager_mod.ResourceManager.init(.{});
+    defer manager.deinit(a);
+    var tag: u8 = 0;
+    try manager.installCapacitySource(.{ .ptr = &tag, .domain_id = 7, .observe = Clock.observe });
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/clock-cache", .{tmp.sub_path});
+    defer a.free(root);
+    {
+        var cache = try PersistentObjectRangeCache.initWithPolicyAndResources(io, root, .{}, .{ .resource_manager = &manager });
+        defer cache.deinit();
+        try std.testing.expectEqual(.enqueued, cache.enqueueWrite("key", "data"));
+        cache.flush();
+        try std.testing.expectEqual(@as(usize, 1), cache.statsSnapshot().writes_completed);
+        try std.testing.expectEqual(@as(usize, 0), cache.statsSnapshot().writes_dropped);
+    }
+    var restarted = try PersistentObjectRangeCache.init(io, root);
+    defer restarted.deinit();
+    const bytes = (try restarted.readAlloc(a, "key", 4)).?;
+    defer a.free(bytes);
+    try std.testing.expectEqualStrings("data", bytes);
+    try std.testing.expectEqual(@as(usize, 1), restarted.statsSnapshot().read_hits);
 }
 
 test "lake persistent object range cache evicts least recently used entries within disk ceilings" {

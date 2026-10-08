@@ -926,9 +926,14 @@ const Authority = struct {
     fn context(self: *Authority) !operation.RequestContext {
         try self.checkpoint();
         try self.credential.validate();
-        return .{
-            .deadline_ns = std.math.cast(u64, self.request.deadline.raw.nanoseconds) orelse return error.DeadlineExceeded,
-            .deadline_io = io_abi.Borrow.init(&self.request.io),
+        // Normalize once at ingress before catalog/storage owner boundaries,
+        // which carry native absolute deadlines rather than an Io clock borrow.
+        // Unrepresentable positive deadlines are effectively unbounded; check()
+        // above still rejects expired requests and explicit cancellation.
+        const deadline = std.math.cast(u64, self.request.deadline.raw.nanoseconds);
+        const native_context: operation.RequestContext = .{
+            .deadline_ns = deadline,
+            .deadline_io = if (deadline != null) io_abi.Borrow.init(&self.request.io) else null,
             .fanout_io = io_abi.Borrow.init(&self.request.io),
             .cancellation = operation.CancellationToken.fromAtomic(self.request.cancel_requested),
             .principal = .{ .kind = .user, .subject = self.identity.*.?.username },
@@ -939,6 +944,7 @@ const Authority = struct {
             .row_policy_credential = self.identity,
             .table_write_authorization = .{ .ptr = self, .allows = allowsWrite },
         };
+        return native_context.platformDeadline();
     }
 
     fn allowsWrite(raw: *const anyopaque, table: []const u8) bool {
@@ -1375,6 +1381,35 @@ test "SQL pgwire credential snapshot observes policy revocation and password rot
         .deadline = .{ .clock = .awake, .raw = .{ .nanoseconds = std.math.maxInt(i96) } },
         .cancel_requested = &cancellation,
     } };
+    {
+        const saved = authority.request;
+        defer authority.request = saved;
+        const OffsetClock = struct {
+            fn now(_: ?*anyopaque, clock: std.Io.Clock) std.Io.Timestamp {
+                if (clock == .awake) return .{ .nanoseconds = std.time.ns_per_s };
+                return std.testing.io.vtable.now(std.testing.io.userdata, clock);
+            }
+        };
+        var vtable = std.testing.io.vtable.*;
+        vtable.now = OffsetClock.now;
+        authority.request.io = .{ .userdata = std.testing.io.userdata, .vtable = &vtable };
+        authority.request.deadline.raw.nanoseconds = 10 * std.time.ns_per_s;
+        const before = @import("antfly_platform").time.monotonicNs();
+        const normalized = try authority.context();
+        const after = @import("antfly_platform").time.monotonicNs();
+        try std.testing.expect(normalized.deadline_io == null);
+        try std.testing.expect(normalized.deadline_ns.? >= before + 9 * std.time.ns_per_s);
+        try std.testing.expect(normalized.deadline_ns.? <= after + 9 * std.time.ns_per_s);
+        try normalized.ensureActive();
+        authority.request.deadline.raw.nanoseconds = std.math.maxInt(i96);
+        try std.testing.expect((try authority.context()).deadline_ns == null);
+        authority.request.deadline.raw.nanoseconds = std.time.ns_per_s;
+        try std.testing.expectError(error.QueryCanceled, authority.context());
+        authority.request.deadline.raw.nanoseconds = 10 * std.time.ns_per_s;
+        cancellation.store(true, .release);
+        defer cancellation.store(false, .release);
+        try std.testing.expectError(error.QueryCanceled, authority.context());
+    }
     const revision: ?u64 = 1;
     var guarded: GuardedCatalog = .{
         .native = .{ .ptr = &native_cursor, .vtable = &.{ .resolve = undefined, .scan = undefined, .mutate = undefined, .open_scan = NativeCursor.open, .checkpoint = NativeCursor.checkpoint } },

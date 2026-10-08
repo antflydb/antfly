@@ -67,28 +67,43 @@ connections have separate prefix allowlists and capabilities (`lake_read` and
 | Normalized, allocator fix only | 26.4 s | 17.8 s | 27.5 s | Rejected; unordered timed out |
 | Same normalized file, follow-up fixes | 22.3 s | 468 ms | 20.0 s | Passed |
 | Untouched BigQuery export, follow-up fixes | 13.7 s | 452 ms | 15.3 s | Passed |
+| Untouched export, cold/cache fixes, two empty-cache runs | 7.6–10.2 s | 379–400 ms | 418–432 ms | Passed |
 
 Search previously cached inventory metadata but never attached the Parquet range
-cache for hydration. Attaching it removes repeated remote reads on warm queries.
-First-query and restart latency still need work: the configured disk-cache
-directory contained no persisted range files. The first query follows index
-publication, so it is not a guaranteed cold-cache measurement. Readiness timing
-on an existing publication is not index-build timing. These results do not
-establish full-archive capacity or concurrent production latency.
+cache for hydration. Attaching it removed repeated remote reads on warm queries.
+The subsequent cold/cache fixes remove an index-wide dictionary diagnostic scan
+from range-backed reader admission, admit readers in bounded parallel jobs, and
+fetch complete immutable artifacts with one bounded, checksum-verified GET.
+Metadata hints overlap independent required header reads.
+
+A clock-domain mismatch prevented disk-cache writes on macOS: capacity probes
+use the native monotonic clock, while admission used Io's awake clock. Cache
+admission now uses the probe's clock. Both new runs persisted 82 cache files
+(about 5 MiB) and reused them after a real process restart. Pgwire normalizes its
+awake-clock deadline before native catalog/storage boundaries; the six prior
+cancellation cases now pass without longer timeouts.
+
+The two new runs copied catalog data into a new state directory with no cache
+files before startup. The harness SQL count precedes text search, so Parquet
+metadata can already be warm. The text index was cold. Older first-query timings
+followed publication. Readiness timing on an existing publication is not
+index-build timing. Empty-cache queries still pay required remote I/O. These
+results do not establish full-archive capacity or concurrent production latency.
 
 A separate raw-export check also passed the previously timed-out unordered
 HN-ID filter in 481 ms.
 
-Flat structured predicates now scan only their required columns against the
-pinned, delete-aware lake snapshot and resolve IDs before ranking/pagination.
-This preserves exact integer comparisons and works when predicate fields are
-absent from the result projection or text index. Match sets are bounded at
-100,000 IDs; nested paths retain the existing residual-filter path. Full-archive
-filtering needs indexed predicate evaluation rather than a full-source scan.
+Tables with declared relational indexes evaluate supported structured predicates
+against indexed physical candidates before ranking, including match sets above
+100,000 rows. This example currently declares only its full-text index: its
+flat structured predicates scan projected columns against the pinned,
+delete-aware lake snapshot and collect up to 100,000 matching IDs. Full-archive
+qualification needs relational indexes on the HN metadata fields and larger
+partitions. Nested paths retain the existing residual-filter path.
 
 ## Remaining deployment work
 
-- Diagnose persistent cache initialization/writes and reduce cold GCS read fanout.
+- Measure remaining cold remote I/O in the deployment region and under concurrency.
 - Qualify larger partitions against build/corpus limits and indexed filtering.
 - Define durable buckets and service identities through Colony's infra workflow.
 - Stream backfills, resolve parent stories, and reconcile edits/deletions.
