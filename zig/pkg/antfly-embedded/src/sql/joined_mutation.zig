@@ -604,7 +604,7 @@ fn returningOutput(context: runtime.Context, bound: Bound, plan: @import("mutati
             if (full) break;
         }
         const evaluated = try a.alloc([]const scalar.Datum, plan.programs.len);
-        for (plan.programs, evaluated) |*program, *column_| column_.* = try decisions.evaluateBatch(a, context.backend.decision_provider, program, page.items, context.parameters);
+        for (plan.programs, evaluated) |*program, *column_| column_.* = try decisions.evaluateBatchWithLimits(a, context.backend.decision_provider, program, page.items, context.parameters, @import("decision_eval.zig").limitsFor(context.backend));
         for (first..end) |index| {
             const values = try context.arena.alloc(std.json.Value, plan.programs.len);
             const flags = try context.arena.alloc(bool, plan.programs.len);

@@ -50,6 +50,7 @@ pub const Datum = struct {
 };
 const arrays = @import("array_value.zig");
 const builtin_cast = @import("builtin_cast.zig");
+const regex_functions = @import("regex_functions.zig");
 pub const Type = struct { kind: ?ast.ColumnType = null, nullable: bool = true, element_type: ?arrays.ElementType = null };
 pub const Column = struct {
     name: []const u8,
@@ -76,8 +77,23 @@ pub const EvalLimits = struct {
     output_bytes: usize = 1024 * 1024,
     decision_values: ?[]const ?Datum = null,
     decision_demand: ?*?DecisionDemand = null,
+    regex_session: ?*regex_functions.Session = null,
+    regex_execution: ?*@import("regex_execution.zig") = null,
+    regex_checkpoint: ?*const fn (?*anyopaque) anyerror!void = null,
+    regex_context: ?*anyopaque = null,
 };
-pub const Function = enum { ai_decide, ai_choice, ai_score, ai_probability, abs, lower, upper, length, octet_length, concat, coalesce, nullif, greatest, least, ceil, floor, round, sqrt, power, mod, substring, trim, ltrim, rtrim, replace, starts_with, date_part, date_trunc, to_timestamp, current_setting, @"$single", @"$pattern_quantified", trunc, sign, to_jsonb, jsonb_build_object, jsonb_extract_path_text, concat_ws, bit_length, strpos, jsonb_typeof, lpad, rpad, repeat, reverse, left, right, split_part, translate, overlay, ascii, chr, @"$array", @"$array_quantified", cardinality, array_ndims, array_length, array_lower, array_upper, @"$array_pattern_quantified", @"$contains", @"$overlaps", array_to_string, jsonb_exists, string_to_array, @"$like_escape", jsonb_set, array_position, array_positions, array_remove, array_replace, array_append, array_prepend, array_cat, jsonb_exists_any, jsonb_exists_all };
+pub const Function = enum { ai_decide, ai_choice, ai_score, ai_probability, abs, lower, upper, length, octet_length, concat, coalesce, nullif, greatest, least, ceil, floor, round, sqrt, power, mod, substring, trim, ltrim, rtrim, replace, starts_with, date_part, date_trunc, to_timestamp, current_setting, @"$single", @"$pattern_quantified", trunc, sign, to_jsonb, jsonb_build_object, jsonb_extract_path_text, concat_ws, bit_length, strpos, jsonb_typeof, lpad, rpad, repeat, reverse, left, right, split_part, translate, overlay, ascii, chr, @"$array", @"$array_quantified", cardinality, array_ndims, array_length, array_lower, array_upper, @"$array_pattern_quantified", @"$contains", @"$overlaps", array_to_string, jsonb_exists, string_to_array, @"$like_escape", jsonb_set, array_position, array_positions, array_remove, array_replace, array_append, array_prepend, array_cat, jsonb_exists_any, jsonb_exists_all, regexp_like, regexp_count, regexp_instr, regexp_substr, regexp_replace };
+
+fn regexFunction(function: Function) ?regex_functions.Function {
+    return switch (function) {
+        .regexp_like => .regexp_like,
+        .regexp_count => .regexp_count,
+        .regexp_instr => .regexp_instr,
+        .regexp_substr => .regexp_substr,
+        .regexp_replace => .regexp_replace,
+        else => null,
+    };
+}
 
 pub const Instruction = struct {
     type: Type,
@@ -1418,8 +1434,80 @@ test "SQL array overlap prepares either constant operand without hot loop alloca
     std.debug.print("SQL array overlap: rows=10000 constant_cells=3 evaluation_scratch_bytes=0 elapsed_ns={}\n", .{std.Io.Clock.now(.awake, std.testing.io).nanoseconds - started});
 }
 
+test "SQL regex cancellation releases the execution lease and permits a clean retry" {
+    const a = std.testing.allocator;
+    var compiled = try @import("compiler.zig").compileScalar(a, "regexp_replace('abc123','[0-9]+','X','g')", .{});
+    defer compiled.deinit();
+    var program = try bind(a, compiled.expression, &.{}, &.{}, .{});
+    defer program.deinit();
+    var owner = @import("regex_execution.zig").init(a, 16 * 1024 * 1024);
+    defer owner.deinit();
+    const Cancellation = struct {
+        canceled: bool = true,
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.canceled) return error.QueryCanceled;
+        }
+    };
+    var cancel: Cancellation = .{};
+    const limits: EvalLimits = .{ .regex_execution = &owner, .regex_checkpoint = Cancellation.check, .regex_context = &cancel };
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    try std.testing.expectError(error.QueryCanceled, program.evaluate(arena.allocator(), &.{}, &.{}, limits));
+    try std.testing.expectEqual(@as(usize, 0), owner.snapshot().active);
+    cancel.canceled = false;
+    const result = try program.evaluate(arena.allocator(), &.{}, &.{}, limits);
+    try std.testing.expectEqualStrings("abcX", result.value.string);
+    try std.testing.expectEqual(@as(usize, 0), owner.snapshot().active);
+}
+
+test "SQL scalar regex functions preserve PostgreSQL values OIDs NULLs and errors" {
+    const Golden = struct { format: u32, collation: []const u8, entries: []const struct { id: []const u8, expression: []const u8, value: Json, oid: ?u32, sqlstate: ?[]const u8 } };
+    const a = std.testing.allocator;
+    const golden = try std.json.parseFromSlice(Golden, a, @embedFile("testdata/regex-postgres.json"), .{});
+    defer golden.deinit();
+    try std.testing.expectEqual(@as(u32, 1), golden.value.format);
+    try std.testing.expectEqualStrings("C", golden.value.collation);
+    var session = regex_functions.Session.init(a, .{}, 16 * 1024 * 1024);
+    defer session.deinit();
+    for (golden.value.entries) |case| {
+        errdefer std.debug.print("PostgreSQL scalar regex fixture {s}: {s}\n", .{ case.id, case.expression });
+        var compiled = @import("compiler.zig").compileScalar(a, case.expression, .{}) catch |err| {
+            try std.testing.expectEqualStrings(case.sqlstate orelse return err, @import("errors.zig").describe(err).code);
+            continue;
+        };
+        defer compiled.deinit();
+        var program = bind(a, compiled.expression, &.{}, &.{}, .{}) catch |err| {
+            try std.testing.expectEqualStrings(case.sqlstate orelse return err, @import("errors.zig").describe(err).code);
+            continue;
+        };
+        defer program.deinit();
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const result = program.evaluate(arena.allocator(), &.{}, &.{}, .{ .regex_session = &session }) catch |err| {
+            try std.testing.expectEqualStrings(case.sqlstate orelse return err, @import("errors.zig").describe(err).code);
+            continue;
+        };
+        try std.testing.expect(case.sqlstate == null);
+        const expected: arrays.ElementType = switch (case.oid.?) {
+            16 => .boolean,
+            23 => .int32,
+            25 => .text,
+            else => return error.UnexpectedRegexResultType,
+        };
+        try std.testing.expectEqual(expected, program.output_type.element_type.?);
+        try std.testing.expectEqual(case.value == .null, result.sql_null);
+        try std.testing.expectEqualStrings(try std.json.Stringify.valueAlloc(arena.allocator(), case.value, .{}), try std.json.Stringify.valueAlloc(arena.allocator(), result.value, .{}));
+    }
+}
+
 fn arity(function: Function, count: usize) !void {
+    if (regexFunction(function)) |regex| {
+        if (!regex_functions.validArity(regex, count)) return error.SqlUndefinedFunction;
+        return;
+    }
     const valid = switch (function) {
+        .regexp_like, .regexp_count, .regexp_instr, .regexp_substr, .regexp_replace => unreachable,
         .array_position => count == 2 or count == 3,
         .array_positions, .array_remove, .array_append, .array_prepend, .array_cat => count == 2,
         .array_replace => count == 3,
@@ -1747,6 +1835,31 @@ const Binder = struct {
                     break :blk .{ .kind = .boolean, .nullable = true };
                 }
                 var merged: Type = .{};
+                if (regexFunction(function)) |regex| {
+                    const replace_start = function == .regexp_replace and (call.args.len > 4 or (call.args.len == 4 and (try self.infer(call.args[3], depth + 1)).kind == .integer));
+                    var nullable = function == .regexp_substr;
+                    for (call.args, 0..) |arg, i| {
+                        const actual = try self.infer(arg, depth + 1);
+                        const desired: ast.ColumnType = if (regex_functions.argument(regex, call.args.len, i, replace_start) == .integer) .integer else .string;
+                        const unknown = arg.* == .literal and arg.literal == .string;
+                        if (actual.kind != null and actual.kind != desired and !unknown) return error.SqlUndefinedFunction;
+                        if (desired == .integer and actual.kind == .integer) {
+                            if (arg.* == .literal and arg.literal == .integer) {
+                                if (std.math.cast(i32, arg.literal.integer) == null) return error.SqlUndefinedFunction;
+                            } else if (actual.element_type != null and actual.element_type != .int16 and actual.element_type != .int32) return error.SqlUndefinedFunction;
+                        }
+                        nullable = nullable or actual.nullable;
+                    }
+                    break :blk .{ .kind = switch (regex) {
+                        .regexp_like => .boolean,
+                        .regexp_count, .regexp_instr => .integer,
+                        else => .string,
+                    }, .element_type = switch (regex) {
+                        .regexp_like => .boolean,
+                        .regexp_count, .regexp_instr => .int32,
+                        else => .text,
+                    }, .nullable = nullable };
+                }
                 if (function == .nullif) try arrayOperator(try self.infer(call.args[0], depth + 1), try self.infer(call.args[1], depth + 1));
                 switch (function) {
                     .@"$single" => merged = try self.infer(call.args[0], depth + 1),
@@ -1937,6 +2050,20 @@ const Binder = struct {
                     break :blk .{ .call = .{ .function = function, .args = &.{}, .setting_identity = resolved.identity } };
                 }
                 const args = try self.alloc.alloc(u32, call.args.len);
+                if (regexFunction(function)) |regex| {
+                    const replace_start = function == .regexp_replace and (call.args.len > 4 or (call.args.len == 4 and (try self.infer(call.args[3], depth + 1)).kind == .integer));
+                    for (call.args, args, 0..) |arg, *out, i| {
+                        const integer = regex_functions.argument(regex, call.args.len, i, replace_start) == .integer;
+                        const desired: ast.ColumnType = if (integer) .integer else .string;
+                        const element: arrays.ElementType = if (integer) .int32 else .text;
+                        if (integer and arg.* == .literal and arg.literal == .string) {
+                            const coercion = try self.alloc.create(ast.Scalar);
+                            coercion.* = .{ .cast = .{ .operand = arg, .type = .integer, .element_type = .int32 } };
+                            out.* = try self.compileArrayContext(coercion, desired, element, depth + 1);
+                        } else out.* = try self.compileArrayContext(arg, desired, element, depth + 1);
+                    }
+                    break :blk .{ .call = .{ .function = function, .args = args } };
+                }
                 if (arrayCompatibleFunction(function)) {
                     const element = try self.arrayCompatibleElement(call, function, depth);
                     for (call.args, args, 0..) |arg, *out, i| {
@@ -2986,10 +3113,27 @@ const Evaluator = struct {
             }
             return .{ .string = try result.toOwnedSlice(self.alloc) };
         }
-        var values: [4]Json = @splat(.null);
+        var values: [7]Json = @splat(.null);
         for (args, 0..) |arg, i| values[i] = try self.run(arg, depth);
         if (function == .nullif) return if (values[0] == .null or (values[1] != .null and (try compare(values[0], values[1])) == .eq)) .null else values[0];
         for (values[0..args.len]) |value| if (value == .null) return .null;
+        if (regexFunction(function)) |regex| {
+            const lease = if (self.limits.regex_execution) |owner| try owner.acquire() else null;
+            defer if (lease) |owned| owned.deinit();
+            var fallback: regex_functions.Session = undefined;
+            const session = if (lease) |owned| owned.session() else self.limits.regex_session orelse blk: {
+                fallback = regex_functions.Session.init(self.alloc, .{}, 16 * 1024 * 1024);
+                break :blk &fallback;
+            };
+            defer if (lease == null and self.limits.regex_session == null) fallback.deinit();
+            var budget: regex_functions.Budget = .{ .remaining = self.limits.pattern_steps -| self.pattern_steps, .checkpoint = self.limits.regex_checkpoint, .ptr = self.limits.regex_context, .checkpoint_interval = 256 };
+            const initial = budget.remaining;
+            defer self.pattern_steps += initial - budget.remaining;
+            const value = regex_functions.evaluate(self.alloc, session, regex, values[0..args.len], self.limits.output_bytes -| self.bytes, &budget) catch |err|
+                return if (self.limits.regex_execution) |owner| owner.mapError(err) else err;
+            if (value == .string) try self.charge(value.string.len);
+            return value;
+        }
         const first = values[0];
         switch (function) {
             .chr => {

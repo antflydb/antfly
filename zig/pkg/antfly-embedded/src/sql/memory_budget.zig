@@ -42,6 +42,11 @@ fn lock(self: *Budget) void {
 pub fn allocator(self: *Budget) std.mem.Allocator {
     return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
 }
+pub fn isExhausted(self: *Budget) bool {
+    self.lock();
+    defer self.mutex.unlock();
+    return self.exhausted or self.admission_exhausted;
+}
 /// Live headroom of this allocator's budget chain, when known. Unknown backing
 /// allocators provide no extra bound; they never imply unlimited admission.
 pub fn headroom(a: std.mem.Allocator) ?usize {

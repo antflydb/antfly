@@ -1,7 +1,7 @@
 // Copyright 2026 Antfly, Inc. SPDX-License-Identifier: Apache-2.0
 //! PostgreSQL ARE backend. No search-index byte automaton, host locale, or
 //! provider allocation is used. Patterns own native blocks; each execution
-//! owns independent scratch. This module is not yet activated in public SQL.
+//! owns independent scratch and bounded execution-local preparation caches.
 const std = @import("std");
 const A = std.mem.Allocator;
 
@@ -10,8 +10,15 @@ pub const Budget = struct {
     remaining: usize = 8 * 1024 * 1024,
     /// Runs synchronously inside a native call; must not yield/suspend.
     checkpoint: ?*const fn (?*anyopaque) anyerror!void = null,
+    /// Bound callback overhead in scalar SQL hot loops while still charging
+    /// every unit of work. Tests/embedders default to checking every charge.
+    checkpoint_interval: usize = 1,
+    until_checkpoint: usize = 0,
     ptr: ?*anyopaque = null,
     failure: ?anyerror = null,
+    pub fn charge(self: *Budget, amount: usize) !void {
+        if (!self.consumeWork(amount)) return self.failure.?;
+    }
     fn consume(self: *Budget) bool {
         return self.consumeWork(1);
     }
@@ -23,13 +30,40 @@ pub const Budget = struct {
             return false;
         }
         self.remaining -= amount;
-        if (self.checkpoint) |check| check(self.ptr) catch |err| {
-            self.failure = err;
-            return false;
-        };
+        if (self.checkpoint) |check| {
+            if (amount >= self.until_checkpoint) {
+                check(self.ptr) catch |err| {
+                    self.failure = err;
+                    return false;
+                };
+                self.until_checkpoint = self.checkpoint_interval -| 1;
+            } else self.until_checkpoint -= amount;
+        }
         return true;
     }
 };
+test "PostgreSQL ARE checkpoint intervals amortize callbacks without discounting work" {
+    const Control = struct {
+        calls: usize = 0,
+        canceled: bool = false,
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            if (self.canceled) return error.QueryCanceled;
+        }
+    };
+    var control: Control = .{};
+    var budget: Budget = .{ .remaining = 10000, .checkpoint = Control.check, .ptr = &control, .checkpoint_interval = 256 };
+    for (0..10000) |_| try budget.charge(1);
+    try std.testing.expectEqual(@as(usize, 0), budget.remaining);
+    try std.testing.expect(control.calls >= 39 and control.calls <= 41);
+    try std.testing.expectError(error.SqlExpressionTooLarge, budget.charge(1));
+    control.canceled = true;
+    var canceled: Budget = .{ .checkpoint = Control.check, .ptr = &control, .checkpoint_interval = 256 };
+    try std.testing.expectError(error.QueryCanceled, canceled.charge(1));
+    try std.testing.expectError(error.QueryCanceled, canceled.charge(1));
+}
+
 pub const Span = extern struct { start: c_long = -1, end: c_long = -1 };
 /// Ordered PostgreSQL flag semantics, including the server's actual basic/
 /// extended flavor transitions. Global occurrence selection is a SQL overload
@@ -372,16 +406,21 @@ pub const Executor = struct {
 /// A session is synchronous and must not be shared by concurrent callers.
 pub const Session = struct {
     const Entry = struct { text: []u8, flags: c_int, hash: u64, touched: u64, program: Program };
+    const ReplacementEntry = struct { hash: u64, touched: u64, plan: Replacement };
     alloc: A,
     limits: Limits,
     maximum_bytes: usize,
     executor: Executor,
     entries: [8]?Entry = @splat(null),
+    replacements: [8]?ReplacementEntry = @splat(null),
     resident: usize = 0,
+    replacement_resident: usize = 0,
     tick: u64 = 0,
     hits: u64 = 0,
     compilations: u64 = 0,
     evictions: u64 = 0,
+    replacement_hits: u64 = 0,
+    replacement_preparations: u64 = 0,
     pub fn init(alloc: A, limits: Limits, maximum_bytes: usize) Session {
         return .{ .alloc = alloc, .limits = limits, .maximum_bytes = maximum_bytes, .executor = Executor.init(alloc, limits) };
     }
@@ -416,7 +455,9 @@ pub const Session = struct {
         const heap = @min(self.limits.heap_bytes, self.maximum_bytes - text.len);
         // Reserve the full compile admission, not merely the eventual retained
         // NFA size. A miss cannot exceed the cache bound while compiling.
-        while (self.resident > self.maximum_bytes - text.len - heap) self.remove(self.oldest() orelse return error.InvalidRegexResponse);
+        while (self.resident > self.maximum_bytes - text.len - heap) {
+            if (self.oldestReplacement()) |index| self.removeReplacement(index) else self.remove(self.oldest() orelse return error.InvalidRegexResponse);
+        }
         var index: usize = 0;
         while (index < self.entries.len and self.entries[index] != null) : (index += 1) {}
         if (index == self.entries.len) {
@@ -434,9 +475,82 @@ pub const Session = struct {
         std.debug.assert(self.resident <= self.maximum_bytes);
         return &self.entries[index].?.program;
     }
+    fn removeReplacement(self: *Session, index: usize) void {
+        const plan = &self.replacements[index].?.plan;
+        const bytes = plan.text.len + plan.tokens.len * @sizeOf(Replacement.Token);
+        self.resident -= bytes;
+        self.replacement_resident -= bytes;
+        plan.deinit();
+        self.replacements[index] = null;
+    }
+    fn oldestReplacement(self: *const Session) ?usize {
+        var result: ?usize = null;
+        for (self.replacements, 0..) |entry, i| if (entry) |value| {
+            if (result == null or value.touched < self.replacements[result.?].?.touched) result = i;
+        };
+        return result;
+    }
+    /// Valid until the next preparation on this synchronous session. Separate
+    /// replacement eviction never invalidates the program currently executing.
+    /// Oversized templates use a caller-owned fallback instead of a rejection.
+    pub const ReplacementLease = union(enum) {
+        cached: *const Replacement,
+        owned: Replacement,
+        pub fn plan(self: *const ReplacementLease) *const Replacement {
+            return switch (self.*) {
+                .cached => |value| value,
+                .owned => |*value| value,
+            };
+        }
+        pub fn deinit(self: *ReplacementLease) void {
+            switch (self.*) {
+                .cached => {},
+                .owned => |*value| value.deinit(),
+            }
+        }
+    };
+    pub fn replacement(self: *Session, fallback: A, text: []const u8, budget: *Budget) !ReplacementLease {
+        if (text.len > 1024 * 1024) return error.SqlExpressionTooLarge;
+        try budget.charge(text.len + self.replacements.len);
+        const hash = std.hash.Wyhash.hash(0, text);
+        self.tick +|= 1;
+        for (&self.replacements) |*slot| if (slot.*) |*entry| {
+            if (entry.hash != hash or entry.plan.text.len != text.len) continue;
+            try budget.charge(text.len);
+            if (!std.mem.eql(u8, text, entry.plan.text)) continue;
+            entry.touched = self.tick;
+            self.replacement_hits +|= 1;
+            return .{ .cached = &entry.plan };
+        };
+        // Conservative peak for ArrayList growth and slice conversion. The
+        // subquota prevents dynamic templates monopolizing compilation space;
+        // never evict a regex while its program is borrowed for replacement.
+        const reservation = text.len + @max(@as(usize, 32), (text.len + 1) * 4) * @sizeOf(Replacement.Token);
+        const maximum = @min(@as(usize, 256 * 1024), self.maximum_bytes / 8);
+        self.replacement_preparations +|= 1;
+        if (reservation > maximum) return .{ .owned = try Replacement.init(fallback, text, budget) };
+        while (self.replacement_resident > maximum - reservation or self.resident > self.maximum_bytes - reservation) {
+            self.removeReplacement(self.oldestReplacement() orelse return .{ .owned = try Replacement.init(fallback, text, budget) });
+        }
+        var index: usize = 0;
+        while (index < self.replacements.len and self.replacements[index] != null) : (index += 1) {}
+        if (index == self.replacements.len) {
+            index = self.oldestReplacement().?;
+            self.removeReplacement(index);
+        }
+        const prepared = try Replacement.init(self.alloc, text, budget);
+        self.replacements[index] = .{ .hash = hash, .touched = self.tick, .plan = prepared };
+        const bytes = prepared.text.len + prepared.tokens.len * @sizeOf(Replacement.Token);
+        std.debug.assert(bytes <= reservation);
+        self.resident += bytes;
+        self.replacement_resident += bytes;
+        std.debug.assert(self.resident <= self.maximum_bytes);
+        return .{ .cached = &self.replacements[index].?.plan };
+    }
     pub fn deinit(self: *Session) void {
         self.executor.deinit();
         for (0..self.entries.len) |index| if (self.entries[index] != null) self.remove(index);
+        for (0..self.replacements.len) |index| if (self.replacements[index] != null) self.removeReplacement(index);
         std.debug.assert(self.resident == 0);
     }
 };
@@ -481,6 +595,85 @@ pub const Replacement = struct {
         self.alloc.free(self.text);
     }
 };
+
+test "PostgreSQL ARE replacement cache reuses templates without evicting a borrowed program" {
+    const a = std.testing.allocator;
+    var session = Session.init(a, .{}, 16 * 1024 * 1024);
+    defer session.deinit();
+    var budget: Budget = .{};
+    const program = try session.pattern("(a)", 3, &budget);
+    var subject = try Subject.init(a, "aba");
+    defer subject.deinit();
+    for (0..1000) |_| {
+        var lease = try session.replacement(a, "<\\1>", &budget);
+        defer lease.deinit();
+        const output = try session.executor.replaceAlloc(a, program, subject, lease.plan(), 0, 0, 1024, &budget);
+        defer a.free(output);
+        try std.testing.expectEqualStrings("<a>b<a>", output);
+    }
+    try std.testing.expectEqual(@as(u64, 1), session.replacement_preparations);
+    try std.testing.expectEqual(@as(u64, 999), session.replacement_hits);
+    for (0..16) |i| {
+        var text: [32]u8 = undefined;
+        var lease = try session.replacement(a, try std.fmt.bufPrint(&text, "replacement-{d}", .{i}), &budget);
+        defer lease.deinit();
+        const output = try session.executor.replaceAlloc(a, program, subject, lease.plan(), 0, 1, 1024, &budget);
+        defer a.free(output);
+        try std.testing.expect(std.mem.startsWith(u8, output, "replacement-"));
+    }
+    try std.testing.expectEqual(@as(u64, 1), session.compilations);
+    try std.testing.expect(session.resident <= session.maximum_bytes);
+    var refused: Budget = .{ .remaining = 0 };
+    try std.testing.expectError(error.SqlExpressionTooLarge, session.replacement(a, "replacement-15", &refused));
+}
+
+test "PostgreSQL ARE warm replacement preparation performs no allocations" {
+    var tracked = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var session = Session.init(tracked.allocator(), .{}, 16 * 1024 * 1024);
+    defer session.deinit();
+    var budget: Budget = .{};
+    {
+        var lease = try session.replacement(tracked.allocator(), "<\\1>", &budget);
+        defer lease.deinit();
+    }
+    const allocations = tracked.alloc_index;
+    tracked.fail_index = allocations;
+    for (0..1000) |_| {
+        var lease = try session.replacement(tracked.allocator(), "<\\1>", &budget);
+        defer lease.deinit();
+        try std.testing.expect(lease == .cached);
+    }
+    try std.testing.expectEqual(allocations, tracked.alloc_index);
+    try std.testing.expectEqual(@as(u64, 1000), session.replacement_hits);
+}
+
+test "PostgreSQL ARE replacement admission owns oversized fallbacks and unwinds allocation faults" {
+    const Faults = struct {
+        fn run(a: A) !void {
+            var session = Session.init(a, .{}, 16 * 1024 * 1024);
+            defer session.deinit();
+            var budget: Budget = .{};
+            {
+                var first = try session.replacement(a, "<\\1>", &budget);
+                defer first.deinit();
+                try std.testing.expect(first == .cached);
+            }
+            {
+                var repeat = try session.replacement(a, "<\\1>", &budget);
+                defer repeat.deinit();
+                try std.testing.expect(repeat == .cached);
+            }
+            var large: [8192]u8 = @splat('x');
+            var fallback = try session.replacement(a, &large, &budget);
+            defer fallback.deinit();
+            try std.testing.expect(fallback == .owned);
+            try std.testing.expectEqualStrings(&large, fallback.plan().text);
+            try std.testing.expect(session.replacement_resident <= 256 * 1024);
+        }
+    };
+    try Faults.run(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Faults.run, .{});
+}
 
 const BoundedOutput = struct {
     alloc: A,

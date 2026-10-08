@@ -50,20 +50,23 @@ fn runReplacements() !u32 {
     const golden = try std.json.parseFromSlice(ReplacementGolden, a, @embedFile("testdata/replacement-postgres.json"), .{});
     defer golden.deinit();
     if (golden.value.format != 1 or !std.mem.eql(u8, golden.value.collation, "C")) return error.InvalidReference;
-    var execution = regex.Executor.init(a, .{});
-    defer execution.deinit();
+    var session = regex.Session.init(a, .{}, 16 * 1024 * 1024);
+    defer session.deinit();
     for (golden.value.entries) |case| {
         var budget: regex.Budget = .{};
-        var program = try regex.Program.compile(a, case.pattern, case.flags, .{}, &budget);
-        defer program.deinit();
+        const program = try session.pattern(case.pattern, case.flags, &budget);
         var subject = try regex.Subject.init(a, case.input);
         defer subject.deinit();
-        var replacement = try regex.Replacement.init(a, case.replacement, &budget);
+        var replacement = try session.replacement(a, case.replacement, &budget);
         defer replacement.deinit();
-        const output = try execution.replaceAlloc(a, &program, subject, &replacement, case.start, case.occurrence, 1024, &budget);
+        var repeat = try session.replacement(a, case.replacement, &budget);
+        defer repeat.deinit();
+        if (repeat.plan() != replacement.plan()) return error.WrongCache;
+        const output = try session.executor.replaceAlloc(a, program, subject, replacement.plan(), case.start, case.occurrence, 1024, &budget);
         defer a.free(output);
         if (!std.mem.eql(u8, case.expected, output)) return error.WrongReplacement;
     }
+    if (session.replacement_hits < golden.value.entries.len) return error.WrongCache;
     return @intCast(golden.value.entries.len);
 }
 fn run() !u32 {

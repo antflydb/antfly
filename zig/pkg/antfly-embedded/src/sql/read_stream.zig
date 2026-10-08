@@ -114,6 +114,51 @@ const Fixture = struct {
     }
 };
 
+test "SQL regex materialized statements retain one owner through derived source lowering" {
+    const a = std.testing.allocator;
+    var compiled = try compiler.compile(a, "SELECT regexp_count(CAST(n AS text),'[0-9]') AS digits FROM (SELECT n FROM docs) AS q", .{});
+    defer compiled.deinit();
+    var fixture: Fixture = .{ .count = 1000 };
+    var result = try runtime.execute(a, fixture.backend(), &compiled, &.{}, .{ .retained_bytes = 4 * 1024 * 1024, .result_rows = 1000, .page_rows = 37 });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 1000), result.output.rows.len);
+    const stats = result.state.regex_execution.snapshot();
+    try std.testing.expectEqual(@as(u64, 1), stats.compilations);
+    try std.testing.expectEqual(@as(u64, 999), stats.hits);
+    try std.testing.expectEqual(@as(usize, 0), stats.active);
+}
+
+test "SQL regex cursor reuses statement patterns across released pages" {
+    const a = std.testing.allocator;
+    var compiled = try compiler.compile(a, "SELECT regexp_like(CAST(n AS text),'[0-9]') AS matched, regexp_count(CAST(n AS text),'[0-9]') AS digits, regexp_replace(CAST(n AS text),'[0-9]','#','g') AS masked FROM docs", .{});
+    defer compiled.deinit();
+    var fixture: Fixture = .{ .count = 1000 };
+    const stream = (try Stream.open(a, fixture.backend(), &compiled, &.{}, .{ .retained_bytes = 1024 * 1024, .page_rows = 37 })).?;
+    defer stream.close();
+    var seen: usize = 0;
+    while (true) {
+        var page = try stream.next(29);
+        defer page.deinit();
+        for (page.output.rows) |row| {
+            try std.testing.expect(row[0].bool);
+            const expected: i64 = if (seen < 10) 1 else if (seen < 100) 2 else 3;
+            try std.testing.expectEqual(expected, row[1].integer);
+            try std.testing.expectEqualStrings((@as([]const u8, "###"))[0..@intCast(expected)], row[2].string);
+            seen += 1;
+        }
+        if (page.exhausted) break;
+    }
+    try std.testing.expectEqual(@as(usize, 1000), seen);
+    const stats = stream.regex_execution.snapshot();
+    try std.testing.expectEqual(@as(usize, 1), stats.lanes);
+    try std.testing.expectEqual(@as(u64, 1), stats.compilations);
+    try std.testing.expectEqual(@as(u64, 2999), stats.hits);
+    try std.testing.expectEqual(@as(u64, 1), stats.replacement_preparations);
+    try std.testing.expectEqual(@as(u64, 999), stats.replacement_hits);
+    try std.testing.expectEqual(@as(usize, 0), stats.active);
+    try std.testing.expect(stream.budget.peak <= stream.budget.limit);
+}
+
 test "SQL pull stream releases pages and streams beyond materialized result limit" {
     var compiled = try compiler.compile(std.testing.allocator, "SELECT n + 1 AS value FROM docs", .{});
     defer compiled.deinit();
@@ -526,19 +571,24 @@ const ParallelScan = struct {
         }
         for (children, lanes, 0..) |child, *lane, index| {
             const credit = self.workers[index % fanout].credit;
-            lane.* = .{ .credit = credit, .stream = .{
-                .budget = .{ .backing = a, .limit = workspace },
-                .arena = undefined,
-                .context = source.context,
-                .cursor = child,
-                .fields = source.fields,
-                .request = source.request,
-                .skip = 0,
-                .remaining = std.math.maxInt(usize),
-                .parallel_checked = true,
-                .projected_alloc = a,
-                .one_scan_page = true,
-            } };
+            lane.* = .{
+                .credit = credit,
+                .stream = .{
+                    .budget = .{ .backing = a, .limit = workspace },
+                    // Context borrows the parent cursor's aggregate regex owner.
+                    .regex_execution = .init(a, 0),
+                    .arena = undefined,
+                    .context = source.context,
+                    .cursor = child,
+                    .fields = source.fields,
+                    .request = source.request,
+                    .skip = 0,
+                    .remaining = std.math.maxInt(usize),
+                    .parallel_checked = true,
+                    .projected_alloc = a,
+                    .one_scan_page = true,
+                },
+            };
             lane.queue = .init(&lane.slots);
             lane.stream.arena = .init(lane.stream.budget.allocator());
             lane.stream.context.alloc = lane.stream.budget.allocator();
@@ -576,6 +626,7 @@ const ParallelScan = struct {
             }
             if (lane.stream.cursor) |cursor| cursor.close(cursor.ptr);
             lane.stream.arena.deinit();
+            lane.stream.regex_execution.deinit();
             std.debug.assert(lane.stream.budget.live == 0);
         }
         for (self.workers[0..self.worker_count]) |*worker| worker.credit.release();
@@ -650,6 +701,7 @@ const ParallelScan = struct {
 
 pub const Stream = struct {
     budget: Budget,
+    regex_execution: @import("regex_execution.zig"),
     arena: std.heap.ArenaAllocator,
     settings: ?*@import("setting_catalog.zig").View = null,
     parameter_invocation: ?*@import("parameter_binding.zig").Invocation = null,
@@ -687,6 +739,8 @@ pub const Stream = struct {
         const self = try alloc.create(Stream);
         errdefer alloc.destroy(self);
         self.budget = .{ .backing = alloc, .limit = limits.retained_bytes };
+        self.regex_execution = .init(self.budget.allocator(), @min(16 * 1024 * 1024, limits.retained_bytes));
+        errdefer self.regex_execution.deinit();
         self.arena = std.heap.ArenaAllocator.init(self.budget.allocator());
         errdefer self.arena.deinit();
         self.spool = null;
@@ -711,6 +765,7 @@ pub const Stream = struct {
         errdefer if (self.parameter_invocation) |invocation| invocation.deinitFrame();
         const arena = self.arena.allocator();
         var statement_backend = backend;
+        statement_backend.regex_execution = &self.regex_execution;
         statement_backend.parameter_fallback_types = try runtime.parameterFallbackTypes(arena, parameters);
         if (backend.setting_capture) |capture| {
             const view = try arena.create(@import("setting_catalog.zig").View);
@@ -888,6 +943,7 @@ pub const Stream = struct {
         if (self.after) |after| self.budget.allocator().free(after);
         if (self.settings) |view| view.deinit();
         if (self.parameter_invocation) |invocation| invocation.deinitFrame();
+        self.regex_execution.deinit();
         self.arena.deinit();
         std.debug.assert(self.budget.live == 0);
         self.budget.backing.destroy(self);
@@ -1368,7 +1424,7 @@ pub const Stream = struct {
                     external = external or decisions.hasExternal(p);
                 };
                 const page_cells = if (external) chunk_cells else null;
-                const predicate_values = if (page_cells) |values| if (self.context.binding.scalars.predicate) |*p| try decisions.evaluateBatch(scratch, self.context.backend.decision_provider, p, values, self.context.parameters) else null else null;
+                const predicate_values = if (page_cells) |values| if (self.context.binding.scalars.predicate) |*p| try decisions.evaluateBatchWithLimits(scratch, self.context.backend.decision_provider, p, values, self.context.parameters, @import("decision_eval.zig").limitsFor(self.context.backend)) else null else null;
                 var selected_cells: std.ArrayList([]const @import("scalar.zig").Datum) = .empty;
                 const positions: []?usize = if (external) try scratch.alloc(?usize, chunk_rows.len) else @constCast(&.{});
                 if (external) {
@@ -1390,7 +1446,7 @@ pub const Stream = struct {
                 }
                 const projection_values = if (external) blk: {
                     const values = try scratch.alloc(?[]const @import("scalar.zig").Datum, self.context.binding.scalars.projections.len);
-                    for (self.context.binding.scalars.projections, values) |optional, *value| value.* = if (optional) |*p| try decisions.evaluateBatch(scratch, self.context.backend.decision_provider, p, selected_cells.items, self.context.parameters) else null;
+                    for (self.context.binding.scalars.projections, values) |optional, *value| value.* = if (optional) |*p| try decisions.evaluateBatchWithLimits(scratch, self.context.backend.decision_provider, p, selected_cells.items, self.context.parameters, @import("decision_eval.zig").limitsFor(self.context.backend)) else null;
                     break :blk values;
                 } else null;
                 for (chunk_rows, 0..) |row, row_index| {
@@ -1403,7 +1459,7 @@ pub const Stream = struct {
                     const values = if (page_cells) |cells| cells[row_index] else try self.context.binding.scalars.cells(eval.allocator(), row);
                     if (external) {
                         if (predicate_values) |predicates| if (predicates[row_index].sql_null or !predicates[row_index].value.bool) continue;
-                    } else if (!try self.context.binding.scalars.matches(eval.allocator(), values, self.context.parameters)) continue;
+                    } else if (!try self.context.matchesRow(eval.allocator(), values)) continue;
                     if (self.skip != 0) {
                         self.skip -= 1;
                         continue;

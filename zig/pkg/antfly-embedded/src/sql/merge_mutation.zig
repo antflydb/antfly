@@ -108,12 +108,15 @@ pub const Candidates = struct {
     }
 
     pub fn selectArmWithProvider(self: Candidates, alloc: Allocator, cells: []const scalar.Datum, parameters: []const std.json.Value, provider: ?DecisionProvider) !?usize {
+        return self.selectArmWithLimits(alloc, cells, parameters, provider, .{});
+    }
+    fn selectArmWithLimits(self: Candidates, alloc: Allocator, cells: []const scalar.Datum, parameters: []const std.json.Value, provider: ?DecisionProvider, limits: scalar.EvalLimits) !?usize {
         if (cells.len != self.query.columns.len or cells.len == 0) return error.InvalidSqlBackendResponse;
         const matched = !cells[0].sql_null;
         for (self.arms, 0..) |arm, index| {
             if (arm.matched != matched) continue;
             if (arm.predicate) |predicate| {
-                const result = try decision_eval.evaluate(alloc, provider, &predicate, cells, parameters);
+                const result = try decision_eval.evaluateWithLimits(alloc, provider, &predicate, cells, parameters, limits);
                 if (result.sql_null) continue;
                 if (result.value != .bool) return error.InvalidSqlBackendResponse;
                 if (!result.value.bool) continue;
@@ -130,6 +133,9 @@ pub const Candidates = struct {
     }
 
     pub fn evaluateValuesWithProvider(self: Candidates, alloc: Allocator, index: usize, cells: []const scalar.Datum, parameters: []const std.json.Value, provider: ?DecisionProvider) ![]const scalar.Datum {
+        return self.evaluateValuesWithLimits(alloc, index, cells, parameters, provider, .{});
+    }
+    fn evaluateValuesWithLimits(self: Candidates, alloc: Allocator, index: usize, cells: []const scalar.Datum, parameters: []const std.json.Value, provider: ?DecisionProvider, limits: scalar.EvalLimits) ![]const scalar.Datum {
         if (index >= self.arms.len or cells.len != self.query.columns.len) return error.InvalidSqlBackendResponse;
         const values = switch (self.arms[index].action) {
             .update => |assignments| assignments,
@@ -137,7 +143,7 @@ pub const Candidates = struct {
             .delete, .nothing => return &.{},
         };
         const result = try alloc.alloc(scalar.Datum, values.len);
-        for (values, result) |assignment, *output| output.* = if (assignment.program) |program| try decision_eval.evaluate(alloc, provider, &program, cells, parameters) else .{};
+        for (values, result) |assignment, *output| output.* = if (assignment.program) |program| try decision_eval.evaluateWithLimits(alloc, provider, &program, cells, parameters, limits) else .{};
         return result;
     }
 
@@ -165,7 +171,7 @@ pub const Candidates = struct {
             if (backend) |active| try active.vtable.checkpoint(active.ptr);
             _ = scratch.reset(.retain_capacity);
             const cells = (try reader.next(scratch.allocator(), false)) orelse return error.InvalidSqlBackendResponse;
-            slot.* = try self.selectArmWithProvider(scratch.allocator(), cells, parameters, if (backend) |active| active.decision_provider else null);
+            slot.* = try self.selectArmWithLimits(scratch.allocator(), cells, parameters, if (backend) |active| active.decision_provider else null, if (backend) |active| decision_eval.limitsFor(active) else .{});
             if (slot.*) |index| switch (self.arms[index].action) {
                 .update, .delete => {
                     if (cells[0].sql_null or cells[0].value != .string) return error.InvalidSqlBackendResponse;
@@ -211,7 +217,7 @@ pub const Candidates = struct {
                     try positions.append(scratch, index);
                 }
                 const values = if (arm.predicate) |*program|
-                    try decision_eval.evaluateBatch(scratch, if (backend) |active| active.decision_provider else null, program, eligible.items, parameters)
+                    try decision_eval.evaluateBatchWithLimits(scratch, if (backend) |active| active.decision_provider else null, program, eligible.items, parameters, if (backend) |active| decision_eval.limitsFor(active) else .{})
                 else
                     null;
                 for (positions.items, 0..) |position, index| {
@@ -284,7 +290,7 @@ pub const Candidates = struct {
                 }
                 for (assignments, 0..) |assignment, column| {
                     const program = assignment.program orelse continue;
-                    const output = try decision_eval.evaluateBatch(scratch, backend.decision_provider, &program, cells.items, parameters);
+                    const output = try decision_eval.evaluateBatchWithLimits(scratch, backend.decision_provider, &program, cells.items, parameters, decision_eval.limitsFor(backend));
                     for (positions.items, output) |position, value| @constCast(values[position].?)[column] = try @import("operators.zig").cloneDatum(alloc, value);
                 }
             }
@@ -389,7 +395,7 @@ pub const Candidates = struct {
                 }
             }
             var key: ?[]const u8 = if (inserting) null else try alloc.dupe(u8, cells[0].value.string);
-            const values = if (assignment_values) |computed| computed[source_index] orelse &.{} else try self.evaluateValuesWithProvider(scratch.allocator(), arm_index, cells, parameters, backend.decision_provider);
+            const values = if (assignment_values) |computed| computed[source_index] orelse &.{} else try self.evaluateValuesWithLimits(scratch.allocator(), arm_index, cells, parameters, backend.decision_provider, decision_eval.limitsFor(backend));
             for (assignments, values) |assignment, datum| {
                 if (assignment.program == null) continue; // DEFAULT: native preparation fills the absent cell.
                 const field = assignment.column;
@@ -1289,7 +1295,7 @@ pub fn execute(context: anytype, bound: Candidates) !@import("runtime.zig").Outp
             const projected = try context.arena.alloc(std.json.Value, plan.programs.len);
             const projected_nulls = try context.arena.alloc(bool, plan.programs.len);
             for (plan.programs, projected, projected_nulls, plan.columns) |program, *value, *is_null, column| {
-                const datum = try decision_eval.evaluate(context.arena, context.backend.decision_provider, &program, cells, context.parameters);
+                const datum = try context.evaluate(context.arena, program, cells);
                 value.* = try context.outputDatum(datum, column.type, column.element_type);
                 is_null.* = datum.sql_null;
             }
@@ -1312,7 +1318,7 @@ pub fn execute(context: anytype, bound: Candidates) !@import("runtime.zig").Outp
                     if (full) break;
                 }
                 const columns = try scratch.alloc([]const scalar.Datum, plan.programs.len);
-                for (plan.programs, columns) |*program, *values| values.* = try decision_eval.evaluateBatch(scratch, context.backend.decision_provider, program, all[first..end], context.parameters);
+                for (plan.programs, columns) |*program, *values| values.* = try decision_eval.evaluateBatchWithLimits(scratch, context.backend.decision_provider, program, all[first..end], context.parameters, @import("decision_eval.zig").limitsFor(context.backend));
                 for (first..end) |index| {
                     const projected = try context.arena.alloc(std.json.Value, plan.programs.len);
                     const projected_nulls = try context.arena.alloc(bool, plan.programs.len);

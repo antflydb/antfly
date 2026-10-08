@@ -482,6 +482,11 @@ pub const AggregatePartialCursor = struct {
 };
 
 pub const Backend = struct {
+    /// Execution-local only: never store this owner in an immutable plan.
+    regex_execution: ?*@import("regex_execution.zig") = null,
+    /// Native scalar callbacks cannot suspend/yield or perform provider I/O.
+    /// Carry an explicit context so lowering can change Backend.ptr safely.
+    scalar_control: ?struct { ptr: ?*anyopaque, checkpoint: *const fn (?*anyopaque) anyerror!void } = null,
     execution_io: ?std.Io = null,
     spill_manager: ?*@import("spill.zig").Manager = null,
     decision_provider: ?@import("../functions/decisions.zig").DecisionProvider = null,

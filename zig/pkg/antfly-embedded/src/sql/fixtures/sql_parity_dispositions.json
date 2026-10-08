@@ -2,6 +2,11 @@
   "ledger_format": 1,
   "inventory_sha256": "c203a4dcf0094b75e1d3764e90beebddaf844a9ce604543c0a4dbc0ffe8ae173",
   "gates": {
+    "sql-mounted-postgres-regex-mutations": {
+      "command": ["zig", "build", "public-api-parity-test", "--cache-dir", ".zig-cache/sql-parity-evidence", "-Dtest-filter=httpx SQL PostgreSQL regex mutations"],
+      "cwd": "zig",
+      "timeout_seconds": 600
+    },
     "sql-mounted-postgres-conflict-shapes": {
       "command": ["zig", "build", "public-api-parity-test", "--cache-dir", ".zig-cache/sql-parity-evidence", "-Dtest-filter=httpx SQL PostgreSQL named conflict targets", "-Dtest-filter=httpx SQL PostgreSQL conflict assignments and defaults"],
       "cwd": "zig",
@@ -13694,8 +13699,20 @@
     },
     {
       "id": "sql-1443",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Unchanged original SQL executes through mounted public HTTP over genuinely activated native logical primary keys. PostgreSQL 18 independently verifies complete RETURNING values, SQL NULL provenance, types and all-table postimages. Execution-owned bounded ARE sessions preserve conflict assignment semantics without sharing mutable matcher scratch; legacy plan fingerprints and non-C collations are not certified.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL regex mutations preserve complete native postimages",
+          "gate": "sql-mounted-postgres-regex-mutations"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL regex mutations preserve complete native postimages",
+          "gate": "sql-postgres-mutation-reference"
+        }
+      ]
     },
     {
       "id": "sql-1444",
@@ -13836,8 +13853,20 @@
     },
     {
       "id": "sql-1471",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Unchanged original SQL executes through mounted public HTTP over genuinely activated native logical primary keys. PostgreSQL 18 independently verifies complete RETURNING values, SQL NULL provenance, types and all-table postimages. Execution-owned bounded ARE sessions preserve conflict assignment semantics without sharing mutable matcher scratch; legacy plan fingerprints and non-C collations are not certified.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL regex mutations preserve complete native postimages",
+          "gate": "sql-mounted-postgres-regex-mutations"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL regex mutations preserve complete native postimages",
+          "gate": "sql-postgres-mutation-reference"
+        }
+      ]
     },
     {
       "id": "sql-1472",
@@ -13846,18 +13875,54 @@
     },
     {
       "id": "sql-1473",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Unchanged original SQL executes through mounted public HTTP over genuinely activated native logical primary keys. PostgreSQL 18 independently verifies complete RETURNING values, SQL NULL provenance, types and all-table postimages. Execution-owned bounded ARE sessions preserve conflict assignment semantics without sharing mutable matcher scratch; legacy plan fingerprints and non-C collations are not certified.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL regex mutations preserve complete native postimages",
+          "gate": "sql-mounted-postgres-regex-mutations"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL regex mutations preserve complete native postimages",
+          "gate": "sql-postgres-mutation-reference"
+        }
+      ]
     },
     {
       "id": "sql-1474",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Unchanged original SQL executes through mounted public HTTP over genuinely activated native logical primary keys. PostgreSQL 18 independently verifies complete RETURNING values, SQL NULL provenance, types and all-table postimages. Execution-owned bounded ARE sessions preserve conflict assignment semantics without sharing mutable matcher scratch; legacy plan fingerprints and non-C collations are not certified.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL regex mutations preserve complete native postimages",
+          "gate": "sql-mounted-postgres-regex-mutations"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL regex mutations preserve complete native postimages",
+          "gate": "sql-postgres-mutation-reference"
+        }
+      ]
     },
     {
       "id": "sql-1475",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Unchanged original SQL executes through mounted public HTTP over genuinely activated native logical primary keys. PostgreSQL 18 independently verifies complete RETURNING values, SQL NULL provenance, types and all-table postimages. Execution-owned bounded ARE sessions preserve conflict assignment semantics without sharing mutable matcher scratch; legacy plan fingerprints and non-C collations are not certified.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL regex mutations preserve complete native postimages",
+          "gate": "sql-mounted-postgres-regex-mutations"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL regex mutations preserve complete native postimages",
+          "gate": "sql-postgres-mutation-reference"
+        }
+      ]
     },
     {
       "id": "sql-1476",

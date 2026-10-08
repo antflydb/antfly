@@ -1440,7 +1440,7 @@ fn Engine(comptime Context: type) type {
                     }
                     if (rows.items.len == 0) return null;
                     const predicates = if (context.binding.scalars.predicate) |*program|
-                        try @import("decision_eval.zig").evaluateBatch(scratch, context.backend.decision_provider, program, cells.items, context.parameters)
+                        try @import("decision_eval.zig").evaluateBatchWithLimits(scratch, context.backend.decision_provider, program, cells.items, context.parameters, @import("decision_eval.zig").limitsFor(context.backend))
                     else
                         null;
                     var selected_rows: std.ArrayList(catalog.Row) = .empty;
@@ -1936,7 +1936,7 @@ fn Engine(comptime Context: type) type {
             pending_failure: ?anyerror = null,
 
             fn iface(self: *Adapter) catalog.Backend {
-                return .{ .execution_io = self.engine.context.backend.execution_io, .spill_manager = self.engine.context.spill, .ptr = self, .decision_provider = self.engine.context.backend.decision_provider, .pinned_statement_snapshot = true, .vtable = &.{ .resolve = resolve, .scan = scan, .open_scan = open, .mutate = mutate, .checkpoint = Adapter.checkpoint } };
+                return .{ .regex_execution = self.engine.context.backend.regex_execution, .scalar_control = self.engine.context.backend.scalar_control, .execution_io = self.engine.context.backend.execution_io, .spill_manager = self.engine.context.spill, .ptr = self, .decision_provider = self.engine.context.backend.decision_provider, .pinned_statement_snapshot = true, .vtable = &.{ .resolve = resolve, .scan = scan, .open_scan = open, .mutate = mutate, .checkpoint = Adapter.checkpoint } };
             }
             fn resolve(ptr: *anyopaque, _: Allocator, _: @import("ast.zig").Name, _: catalog.Action) !catalog.Table {
                 const self: *Adapter = @ptrCast(@alignCast(ptr));
@@ -2033,6 +2033,7 @@ fn Source(comptime Context: type) type {
         const Self = @This();
         alloc: Allocator,
         read: ?catalog.StatementRead = null,
+        regex_execution: @import("regex_execution.zig"),
         single: ?catalog.Cursor = null,
         single_list: [1]catalog.Cursor = undefined,
         engine: Engine(Context),
@@ -2042,8 +2043,9 @@ fn Source(comptime Context: type) type {
         fn create(context: Context) !*Self {
             const relation = context.binding.relation orelse return error.InvalidSqlBackendResponse;
             const self = try context.alloc.create(Self);
-            self.* = .{ .alloc = context.alloc, .engine = .{ .context = context, .cursors = &.{}, .cache_arena = .init(context.alloc) } };
+            self.* = .{ .alloc = context.alloc, .regex_execution = .init(context.alloc, @min(16 * 1024 * 1024, context.limits.retained_bytes)), .engine = .{ .context = context, .cursors = &.{}, .cache_arena = .init(context.alloc) } };
             errdefer self.close();
+            if (self.engine.context.backend.regex_execution == null) self.engine.context.backend.regex_execution = &self.regex_execution;
             if (relation.scans.len != 0) {
                 if (context.statement_capture) |capture| {
                     self.engine.cursors = try capture.cursors(relation);
@@ -2067,6 +2069,7 @@ fn Source(comptime Context: type) type {
             self.engine.deinit();
             if (self.read) |read| read.close(read.ptr);
             if (self.single) |cursor| cursor.close(cursor.ptr);
+            self.regex_execution.deinit();
             self.alloc.destroy(self);
         }
         fn next(raw: *anyopaque, alloc: Allocator, limit: u32) !catalog.Page {
@@ -2092,7 +2095,7 @@ pub fn openCursor(context: anytype) !catalog.Cursor {
 pub fn execute(context: anytype) anyerror!@import("runtime.zig").Output {
     const owner = try Source(@TypeOf(context)).create(context);
     defer owner.close();
-    var lowered = context;
+    var lowered = owner.engine.context;
     lowered.backend = owner.adapter.iface();
     lowered.binding.relation = null;
     return lowered.select(context.binding.relation.?.statement);

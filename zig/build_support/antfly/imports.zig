@@ -308,6 +308,7 @@ pub const AntflyRootImports = struct {
             "pdf",             "query_openapi",      "reader_config",     "readers",
             "regex",           "reranking",          "scraping",          "synthesizing",
             "transcribing",    "vector",             "fst",               "schema_openapi",
+            "sql_regex",
         }) |field| self.addImport(mod, field);
     }
 

@@ -4721,3 +4721,42 @@ This unblocks the capture-replacement expression in the unchanged 48-case
 in-progress scalar regex oracle. Statement/cursor session ownership and mounted
 original-case postimages remain required before claiming public regex completion
 or changing the authoritative corpus ledger.
+
+### Execution-owned PostgreSQL regex scalar activation
+
+The public scalar binder now implements PostgreSQL's text/int4 overloads of
+`regexp_like`, `regexp_count`, `regexp_instr`, `regexp_substr` and
+`regexp_replace`, preserving strict NULLs, lazy branches, Unicode character
+positions, capture selection and ordered flags. A disposable PostgreSQL 18
+oracle independently verifies 48 scalar values, result OIDs and SQLSTATEs.
+
+Statements and pull cursors own bounded matcher-lane pools, including through
+derived-source lowering and decision evaluation. Immutable prepared plans never
+own mutable native scratch. Lanes execute independently; native work does not
+hold the pool bookkeeping lock. Actual allocations across all retained lanes
+share the statement quota, including cache keys and metadata. Native callbacks
+check request cancellation/deadlines synchronously without yielding. Every work
+unit is charged, with callback polling amortized over 256 charged units.
+
+Each lane caches regex programs and immutable replacement templates separately.
+Replacement admission cannot evict a currently borrowed program; large templates
+use a bounded caller-owned fallback rather than becoming unsupported. Pattern
+admission reserves full compilation headroom. Templates are bounded to eight
+entries and at most 256 KiB or one eighth of the lane cache budget. Allocation
+failures, cancellation and cursor close release all ownership.
+
+The 1,000-row pull-cursor regression exercises three regex projections across
+released 29-row pages: one pattern compilation, 2,999 pattern hits, one
+replacement preparation and 999 template hits, within a 1 MiB statement budget.
+This is deterministic preparation/allocation evidence, not a wall-clock latency
+claim. Native cache/fallback/churn/fault tests and import-free WASM oracles cover
+the shared backend. Original-case credit requires mounted mutation postimage
+verification. The mounted gate now verifies five unchanged
+original conflict cases (sql-1443, sql-1471, sql-1473, sql-1474 and sql-1475),
+including complete RETURNING values and all-table native postimages. Together
+with a freshly reproduced 48-case PostgreSQL mutation golden, these bring the
+ledger to 437 implemented / 136 rejected / 73 superseded / 940 unresolved.
+Historical UPDATE ... FOR UPDATE regex cases are invalid PostgreSQL syntax;
+they are not rewritten, silently excluded from an existing golden, or credited.
+Non-C collation support and the complete native
+complex-path work-accounting audit remain separate unfinished requirements.

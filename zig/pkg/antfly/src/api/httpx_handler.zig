@@ -13698,6 +13698,10 @@ test "httpx SQL PostgreSQL mutations capture native source relations and complet
     try postgresNativeMutationCampaigns(&.{});
 }
 
+test "httpx SQL PostgreSQL regex mutations preserve complete native postimages" {
+    try postgresNativeMutationCampaigns(&.{ "sql-1443", "sql-1471", "sql-1473", "sql-1474", "sql-1475" });
+}
+
 test "httpx SQL PostgreSQL named conflict targets preserve complete native postimages" {
     try postgresNativeMutationCampaigns(&.{"sql-1463"});
 }

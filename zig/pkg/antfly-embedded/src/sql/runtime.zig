@@ -64,7 +64,7 @@ pub const Result = struct {
     state: *State,
     output: Output,
 
-    const State = struct { budget: MemoryBudget, arena: std.heap.ArenaAllocator };
+    const State = struct { budget: MemoryBudget, arena: std.heap.ArenaAllocator, regex_execution: @import("regex_execution.zig") };
 
     /// Includes retained result arena capacity and transient native page data.
     pub fn peakMemoryBytes(self: Result) usize {
@@ -80,6 +80,7 @@ pub const Result = struct {
 
     pub fn deinit(self: *Result) void {
         const backing = self.state.budget.backing;
+        self.state.regex_execution.deinit();
         self.state.arena.deinit();
         std.debug.assert(self.state.budget.live == 0);
         backing.destroy(self.state);
@@ -89,6 +90,7 @@ pub const Result = struct {
     pub fn empty(alloc: std.mem.Allocator, command_tag: []const u8) !Result {
         const state = try alloc.create(State);
         state.budget = .{ .backing = alloc, .limit = (Limits{}).retained_bytes };
+        state.regex_execution = .init(state.budget.allocator(), 16 * 1024 * 1024);
         state.arena = std.heap.ArenaAllocator.init(state.budget.allocator());
         var result = Result{ .state = state, .output = .{ .command_tag = "" } };
         errdefer result.deinit();
@@ -127,6 +129,8 @@ pub fn execute(alloc: std.mem.Allocator, backend: catalog.Backend, compiled: *co
     }
     const state = try alloc.create(Result.State);
     state.budget = .{ .backing = alloc, .limit = limits.retained_bytes };
+    state.regex_execution = .init(state.budget.allocator(), @min(16 * 1024 * 1024, limits.retained_bytes));
+    statement_backend.regex_execution = &state.regex_execution;
     state.arena = std.heap.ArenaAllocator.init(state.budget.allocator());
     var result = Result{ .state = state, .output = undefined };
     errdefer result.deinit();
@@ -222,7 +226,17 @@ pub const Context = struct {
     }
 
     pub fn evaluate(self: Context, alloc: std.mem.Allocator, program: @import("scalar.zig").Program, cells: []const Datum) !Datum {
-        return @import("decision_eval.zig").evaluate(alloc, self.backend.decision_provider, &program, cells, self.parameters);
+        const decision = @import("decision_eval.zig");
+        return decision.evaluateWithLimits(alloc, self.backend.decision_provider, &program, cells, self.parameters, decision.limitsFor(self.backend));
+    }
+
+    pub fn matchesRow(self: Context, alloc: std.mem.Allocator, cells: []const Datum) !bool {
+        if (self.binding.scalars.typed_parameters and self.binding.scalars.invocation == null) return error.UnsupportedSqlShape;
+        const program = self.binding.scalars.predicate orelse return true;
+        const evaluated = try self.evaluate(alloc, program, cells);
+        if (evaluated.sql_null) return false;
+        if (evaluated.value != .bool) return error.SqlTypeMismatch;
+        return evaluated.value.bool;
     }
 
     pub const ScanState = struct {
@@ -661,7 +675,7 @@ pub const Context = struct {
                 const chunk_rows = page.rows[first..][0..chunk_cells.len];
                 const page_cells = chunk_cells;
                 const predicate_values = if (self.binding.scalars.predicate) |*predicate|
-                    try @import("decision_eval.zig").evaluateBatch(scratch, self.backend.decision_provider, predicate, page_cells, self.parameters)
+                    try @import("decision_eval.zig").evaluateBatchWithLimits(scratch, self.backend.decision_provider, predicate, page_cells, self.parameters, @import("decision_eval.zig").limitsFor(self.backend))
                 else
                     null;
                 var selected_cells: std.ArrayList([]const Datum) = .empty;
@@ -682,12 +696,12 @@ pub const Context = struct {
                 }
                 const projection_values = try scratch.alloc(?[]const Datum, self.binding.scalars.projections.len);
                 for (self.binding.scalars.projections, projection_values, 0..) |optional, *values, index| values.* = if (!deferred[index] and optional != null)
-                    try @import("decision_eval.zig").evaluateBatch(scratch, self.backend.decision_provider, &optional.?, selected_cells.items, self.parameters)
+                    try @import("decision_eval.zig").evaluateBatchWithLimits(scratch, self.backend.decision_provider, &optional.?, selected_cells.items, self.parameters, @import("decision_eval.zig").limitsFor(self.backend))
                 else
                     null;
                 const order_values = try scratch.alloc(?[]const Datum, self.binding.scalars.orders.len);
                 for (self.binding.scalars.orders, order_values) |optional, *values| values.* = if (top_k != null and optional != null)
-                    try @import("decision_eval.zig").evaluateBatch(scratch, self.backend.decision_provider, &optional.?, selected_cells.items, self.parameters)
+                    try @import("decision_eval.zig").evaluateBatchWithLimits(scratch, self.backend.decision_provider, &optional.?, selected_cells.items, self.parameters, @import("decision_eval.zig").limitsFor(self.backend))
                 else
                     null;
                 for (chunk_rows, 0..) |row, row_index| {
@@ -794,7 +808,7 @@ pub const Context = struct {
                     for (selected[first..][0..inputs.items.len], output) |row, *cells| cells.* = try scratch.dupe(Datum, row.values[0..fields.items.len]);
                     for (deferred, 0..) |needed, column| if (needed) {
                         const program = self.binding.scalars.projections[column].?;
-                        const values = try @import("decision_eval.zig").evaluateBatch(scratch, self.backend.decision_provider, &program, inputs.items, self.parameters);
+                        const values = try @import("decision_eval.zig").evaluateBatchWithLimits(scratch, self.backend.decision_provider, &program, inputs.items, self.parameters, @import("decision_eval.zig").limitsFor(self.backend));
                         for (output, values) |cells, datum| cells[column] = datum;
                     };
                     for (output, first + start..) |values, index| {
@@ -859,7 +873,7 @@ pub const Context = struct {
         if (rows.len != cells.len) return error.InvalidSqlBackendResponse;
         const columns = try alloc.alloc(?[]const Datum, self.binding.scalars.projections.len);
         for (self.binding.scalars.projections, columns) |optional, *values| values.* = if (optional) |*program|
-            try @import("decision_eval.zig").evaluateBatch(alloc, self.backend.decision_provider, program, cells, self.parameters)
+            try @import("decision_eval.zig").evaluateBatchWithLimits(alloc, self.backend.decision_provider, program, cells, self.parameters, @import("decision_eval.zig").limitsFor(self.backend))
         else
             null;
         const output = try alloc.alloc([]const Datum, rows.len);
@@ -886,7 +900,7 @@ pub const Context = struct {
         try self.checkpoint();
         var evaluation = std.heap.ArenaAllocator.init(self.alloc);
         defer evaluation.deinit();
-        const matches = try self.binding.scalars.matchesWithProvider(evaluation.allocator(), &.{}, self.parameters, self.backend.decision_provider);
+        const matches = try self.matchesRow(evaluation.allocator(), &.{});
         if (!evaluation.reset(.retain_capacity)) return error.OutOfMemory;
         if (!matches and !statement.count_all) return .{ .columns = columns, .command_tag = "SELECT" };
         if (self.sink) |sink| {
@@ -1078,7 +1092,7 @@ pub const Context = struct {
             };
             const inputs = try scratch.alloc([]const Datum, programs.items.len);
             @memset(inputs, &.{});
-            const evaluated = try decision.evaluateInvocations(scratch, self.backend.decision_provider, programs.items, inputs, self.parameters);
+            const evaluated = try decision.evaluateInvocationsWithLimits(scratch, self.backend.decision_provider, programs.items, inputs, self.parameters, @import("decision_eval.zig").limitsFor(self.backend));
             for (positions.items, evaluated) |position, datum| values[position][column] = datum;
         }
         return .{ .end = end, .values = values };
@@ -1117,7 +1131,7 @@ pub const Context = struct {
             if (cells.items.len >= self.limits.page_rows or bytes >= self.limits.page_bytes) break;
         }
         const predicates = if (self.binding.scalars.predicate) |*program|
-            try decision.evaluateBatch(scratch, self.backend.decision_provider, program, cells.items, self.parameters)
+            try decision.evaluateBatchWithLimits(scratch, self.backend.decision_provider, program, cells.items, self.parameters, @import("decision_eval.zig").limitsFor(self.backend))
         else
             null;
         const positions = try scratch.alloc(?usize, cells.items.len);
@@ -1135,7 +1149,7 @@ pub const Context = struct {
         }
         const assignments = try scratch.alloc(?[]const Datum, self.binding.scalars.assignments.len);
         for (self.binding.scalars.assignments, assignments) |optional, *values| values.* = if (optional) |*program|
-            try decision.evaluateBatch(scratch, self.backend.decision_provider, program, accepted.items, self.parameters)
+            try decision.evaluateBatchWithLimits(scratch, self.backend.decision_provider, program, accepted.items, self.parameters, @import("decision_eval.zig").limitsFor(self.backend))
         else
             null;
         return .{ .cells = cells.items, .positions = positions, .assignments = assignments };

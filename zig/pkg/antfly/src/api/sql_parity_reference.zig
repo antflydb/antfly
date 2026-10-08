@@ -456,6 +456,7 @@ pub fn runPostgresMutations(alloc: std.mem.Allocator, handler: anytype, tables: 
     const TransactionWrite = @import("antfly_local_sources").storage_db_types.TransactionWrite;
     try std.testing.expectEqual(reference.profile.additional_tables.len + 1, tables.len);
     for (ids, 0..) |id, ordinal| {
+        errdefer std.debug.print("POSTGRES MUTATION CASE {s}\n", .{id});
         const expected = for (reference.entries) |entry| {
             if (std.mem.eql(u8, id, entry.id)) break entry;
         } else return error.MissingPostgresMutationReference;

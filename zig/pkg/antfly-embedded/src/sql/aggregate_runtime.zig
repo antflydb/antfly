@@ -49,7 +49,7 @@ fn addCells(context: anytype, bound: *const binding.Bound, grouped: anytype, all
 
 fn addRows(context: anytype, bound: *const binding.Bound, grouped: anytype, alloc: std.mem.Allocator, cells: []const []const Datum) !void {
     const decision = @import("decision_eval.zig");
-    const predicates = if (bound.input.predicate) |*program| try decision.evaluateBatch(alloc, context.backend.decision_provider, program, cells, context.parameters) else null;
+    const predicates = if (bound.input.predicate) |*program| try decision.evaluateBatchWithLimits(alloc, context.backend.decision_provider, program, cells, context.parameters, @import("decision_eval.zig").limitsFor(context.backend)) else null;
     var accepted: std.ArrayList([]const Datum) = .empty;
     for (cells, 0..) |row, i| {
         if (predicates) |values| {
@@ -67,11 +67,11 @@ fn addRows(context: anytype, bound: *const binding.Bound, grouped: anytype, allo
         @memset(input.*, .{});
     }
     for (bound.input.projections[0..bound.group_count], 0..) |optional, k| {
-        const values = try decision.evaluateBatch(alloc, context.backend.decision_provider, &optional.?, accepted.items, context.parameters);
+        const values = try decision.evaluateBatchWithLimits(alloc, context.backend.decision_provider, &optional.?, accepted.items, context.parameters, @import("decision_eval.zig").limitsFor(context.backend));
         for (keys, values) |key, value| key[k] = value;
     }
     for (bound.inputs, bound.filters, 0..) |index, filter, k| {
-        const filters = if (filter) |slot| try decision.evaluateBatch(alloc, context.backend.decision_provider, &bound.input.projections[slot].?, accepted.items, context.parameters) else null;
+        const filters = if (filter) |slot| try decision.evaluateBatchWithLimits(alloc, context.backend.decision_provider, &bound.input.projections[slot].?, accepted.items, context.parameters, @import("decision_eval.zig").limitsFor(context.backend)) else null;
         var selected: std.ArrayList([]const Datum) = .empty;
         var positions: std.ArrayList(usize) = .empty;
         for (accepted.items, 0..) |row, i| {
@@ -84,7 +84,7 @@ fn addRows(context: anytype, bound: *const binding.Bound, grouped: anytype, allo
             try positions.append(alloc, i);
         }
         if (index) |slot| {
-            const values = try decision.evaluateBatch(alloc, context.backend.decision_provider, &bound.input.projections[slot].?, selected.items, context.parameters);
+            const values = try decision.evaluateBatchWithLimits(alloc, context.backend.decision_provider, &bound.input.projections[slot].?, selected.items, context.parameters, @import("decision_eval.zig").limitsFor(context.backend));
             for (positions.items, values) |i, value| inputs[i][k] = value;
         } else for (positions.items) |i| {
             inputs[i][k] = Datum.json(.{ .integer = 1 });
@@ -241,7 +241,7 @@ fn addGroupedDecisionPages(context: anytype, bound: *const binding.Bound, groupe
             for (row) |cell| bytes +|= try operators.datumBytes(cell);
             if (bytes >= context.limits.page_bytes) break;
         }
-        const predicates = if (bound.having) |*program| try decision.evaluateBatch(a, context.backend.decision_provider, program, cells.items, context.parameters) else null;
+        const predicates = if (bound.having) |*program| try decision.evaluateBatchWithLimits(a, context.backend.decision_provider, program, cells.items, context.parameters, @import("decision_eval.zig").limitsFor(context.backend)) else null;
         var accepted: std.ArrayList([]const Datum) = .empty;
         var positions: std.ArrayList(usize) = .empty;
         for (cells.items, 0..) |row, index| {

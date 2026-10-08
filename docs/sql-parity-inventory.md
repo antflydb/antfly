@@ -1,5 +1,13 @@
 # Original SQL extraction parity inventory
 
+Current audited dispositions: **437 implemented / 136 rejected / 73 superseded /
+940 unresolved**. Five original regex conflict mutations (sql-1443, sql-1471,
+sql-1473, sql-1474 and sql-1475) have mounted public-HTTP evidence with native
+primary-key activation and complete PostgreSQL-backed result/postimage checks.
+Regex component tests alone do not resolve other corpus entries. Historical
+UPDATE ... FOR UPDATE forms remain unresolved PostgreSQL syntax incompatibilities;
+their source SQL has not been rewritten to inflate coverage.
+
 The pinned original source contains 1586 cases: 267 explicitly invalid or
 unsupported cases and 1319 cases requiring review of their original
 planner or runtime contract. These are **not** 1586 promises of working runtime

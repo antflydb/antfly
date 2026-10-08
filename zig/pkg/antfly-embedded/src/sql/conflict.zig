@@ -393,7 +393,7 @@ fn resolvePrepared(context: anytype, table: catalog.Table, clause: ast.Conflict,
             continue;
         }
         const matches = if (binding.predicate) |program| blk: {
-            const value = try @import("decision_eval.zig").evaluate(page_alloc, context.backend.decision_provider, &program, cells, context.parameters);
+            const value = try @import("decision_eval.zig").evaluateWithLimits(page_alloc, context.backend.decision_provider, &program, cells, context.parameters, @import("decision_eval.zig").limitsFor(context.backend));
             break :blk !value.sql_null and value.value == .bool and value.value.bool;
         } else true;
         if (!matches) {
@@ -422,7 +422,7 @@ fn resolvePrepared(context: anytype, table: catalog.Table, clause: ast.Conflict,
                     const deferred = binding.deferred[assignment_index] orelse return error.InvalidSqlBackendResponse;
                     if (deferred_cache[assignment_index] == null) deferred_cache[assignment_index] = try context.deferredScalar(deferred.query, deferred.binding);
                     break :blk deferred_cache[assignment_index].?;
-                } else try @import("decision_eval.zig").evaluate(page_alloc, context.backend.decision_provider, &(program orelse return error.InvalidSqlBackendResponse), cells, context.parameters);
+                } else try @import("decision_eval.zig").evaluateWithLimits(page_alloc, context.backend.decision_provider, &(program orelse return error.InvalidSqlBackendResponse), cells, context.parameters, @import("decision_eval.zig").limitsFor(context.backend));
                 assigned = true;
             }
             if (!assigned and !try previous.hasField(column.name)) continue;
@@ -462,7 +462,7 @@ fn applyDecisionConflicts(context: anytype, scratch: std.mem.Allocator, table: c
     const all_cells = try scratch.alloc([]const scalar.Datum, pending.len);
     for (pending, all_cells) |row, *out| out.* = row.cells;
     const predicates = if (binding.predicate) |*program|
-        try decision_eval.evaluateBatch(scratch, context.backend.decision_provider, program, all_cells, context.parameters)
+        try decision_eval.evaluateBatchWithLimits(scratch, context.backend.decision_provider, program, all_cells, context.parameters, @import("decision_eval.zig").limitsFor(context.backend))
     else
         null;
     var selected: std.ArrayList(DecisionConflictRow) = .empty;
@@ -502,7 +502,7 @@ fn applyDecisionConflicts(context: anytype, scratch: std.mem.Allocator, table: c
             output.* = values;
         } else {
             const program = optional orelse return error.InvalidSqlBackendResponse;
-            output.* = try decision_eval.evaluateBatch(scratch, context.backend.decision_provider, &program, cells.items, context.parameters);
+            output.* = try decision_eval.evaluateBatchWithLimits(scratch, context.backend.decision_provider, &program, cells.items, context.parameters, @import("decision_eval.zig").limitsFor(context.backend));
         }
     }
     for (selected.items, 0..) |candidate, row_index| {

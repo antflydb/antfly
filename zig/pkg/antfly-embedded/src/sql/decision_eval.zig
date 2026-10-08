@@ -18,6 +18,9 @@
 const std = @import("std");
 const scalar = @import("scalar.zig");
 const decisions = @import("../functions/decisions.zig");
+pub fn limitsFor(backend: @import("catalog.zig").Backend) scalar.EvalLimits {
+    return .{ .regex_execution = backend.regex_execution, .regex_checkpoint = if (backend.scalar_control) |control| control.checkpoint else null, .regex_context = if (backend.scalar_control) |control| control.ptr else null };
+}
 /// Single-source reads route by their bound physical identity. Mutations route
 /// by the target. Multi-source reads use the provider's general routing policy;
 /// synthetic relation tables inherit the enclosing query's selected scope.
@@ -141,25 +144,31 @@ fn validateCore(a: std.mem.Allocator, provider: ?decisions.DecisionProvider, pro
 }
 
 pub fn evaluateBatch(a: std.mem.Allocator, provider: ?decisions.DecisionProvider, program: *const scalar.Program, rows: []const []const scalar.Datum, parameters: []const std.json.Value) ![]const scalar.Datum {
+    return evaluateBatchWithLimits(a, provider, program, rows, parameters, .{});
+}
+pub fn evaluateBatchWithLimits(a: std.mem.Allocator, provider: ?decisions.DecisionProvider, program: *const scalar.Program, rows: []const []const scalar.Datum, parameters: []const std.json.Value, limits: scalar.EvalLimits) ![]const scalar.Datum {
     if (!hasExternal(program)) {
         if (try @import("vector_eval.zig").evaluate(a, program, rows, parameters)) |output| return output;
         const output = try a.alloc(scalar.Datum, rows.len);
-        for (rows, output) |cells, *value| value.* = try program.evaluate(a, cells, parameters, .{});
+        for (rows, output) |cells, *value| value.* = try program.evaluate(a, cells, parameters, limits);
         return output;
     }
     const programs = try a.alloc(*const scalar.Program, rows.len);
     @memset(programs, program);
-    return evaluateInvocations(a, provider, programs, rows, parameters);
+    return evaluateInvocationsWithLimits(a, provider, programs, rows, parameters, limits);
 }
 
 /// A VALUES page can contain different programs/configurations for every cell.
 /// Resolve its conditional decision demands together without retaining provider
 /// payloads in the owned mutation arena.
 pub fn evaluateInvocations(a: std.mem.Allocator, provider: ?decisions.DecisionProvider, programs: []const *const scalar.Program, rows: []const []const scalar.Datum, parameters: []const std.json.Value) ![]const scalar.Datum {
-    return evaluateInvocationsCore(a, provider, programs, rows, parameters, null);
+    return evaluateInvocationsWithLimits(a, provider, programs, rows, parameters, .{});
+}
+pub fn evaluateInvocationsWithLimits(a: std.mem.Allocator, provider: ?decisions.DecisionProvider, programs: []const *const scalar.Program, rows: []const []const scalar.Datum, parameters: []const std.json.Value, limits: scalar.EvalLimits) ![]const scalar.Datum {
+    return evaluateInvocationsCore(a, provider, programs, rows, parameters, null, limits);
 }
 
-fn evaluateInvocationsCore(a: std.mem.Allocator, provider: ?decisions.DecisionProvider, programs: []const *const scalar.Program, rows: []const []const scalar.Datum, parameters: []const std.json.Value, prepared: ?[]const scalar.PreparedEvaluation) ![]const scalar.Datum {
+fn evaluateInvocationsCore(a: std.mem.Allocator, provider: ?decisions.DecisionProvider, programs: []const *const scalar.Program, rows: []const []const scalar.Datum, parameters: []const std.json.Value, prepared: ?[]const scalar.PreparedEvaluation, base_limits: scalar.EvalLimits) ![]const scalar.Datum {
     if (programs.len != rows.len) return error.InvalidSqlProgram;
     const output = try a.alloc(scalar.Datum, rows.len);
     const ready = try a.alloc(bool, rows.len);
@@ -176,7 +185,9 @@ fn evaluateInvocationsCore(a: std.mem.Allocator, provider: ?decisions.DecisionPr
         for (rows, programs, 0..) |cells, program, i| {
             if (ready[i]) continue;
             var demand: ?scalar.DecisionDemand = null;
-            const limits: scalar.EvalLimits = .{ .decision_values = values[i], .decision_demand = &demand };
+            var limits = base_limits;
+            limits.decision_values = values[i];
+            limits.decision_demand = &demand;
             const evaluated = if (prepared) |bound| bound[i].evaluate(a, cells, limits) else program.evaluate(a, cells, parameters, limits);
             const value = evaluated catch |err| {
                 if (err != error.DecisionNotEvaluated) return err;
@@ -219,15 +230,21 @@ pub fn hasExternalPrograms(programs: []const scalar.Program) bool {
 }
 
 pub fn evaluate(a: std.mem.Allocator, provider: ?decisions.DecisionProvider, program: *const scalar.Program, cells: []const scalar.Datum, parameters: []const std.json.Value) !scalar.Datum {
-    if (!hasExternal(program)) return program.evaluate(a, cells, parameters, .{});
-    return (try evaluateBatch(a, provider, program, &.{cells}, parameters))[0];
+    return evaluateWithLimits(a, provider, program, cells, parameters, .{});
+}
+pub fn evaluateWithLimits(a: std.mem.Allocator, provider: ?decisions.DecisionProvider, program: *const scalar.Program, cells: []const scalar.Datum, parameters: []const std.json.Value, limits: scalar.EvalLimits) !scalar.Datum {
+    if (!hasExternal(program)) return program.evaluate(a, cells, parameters, limits);
+    return (try evaluateBatchWithLimits(a, provider, program, &.{cells}, parameters, limits))[0];
 }
 
 /// Prepared invocations use the same lazy demand/provider machinery as legacy
 /// execution. Pure scalar calls neither allocate provider state nor rebind.
 pub fn evaluatePrepared(a: std.mem.Allocator, provider: ?decisions.DecisionProvider, prepared: scalar.PreparedEvaluation, cells: []const scalar.Datum) !scalar.Datum {
-    if (!hasExternal(prepared.program)) return prepared.evaluate(a, cells, .{});
-    return (try evaluateInvocationsCore(a, provider, &.{prepared.program}, &.{cells}, &.{}, &.{prepared}))[0];
+    return evaluatePreparedWithLimits(a, provider, prepared, cells, .{});
+}
+pub fn evaluatePreparedWithLimits(a: std.mem.Allocator, provider: ?decisions.DecisionProvider, prepared: scalar.PreparedEvaluation, cells: []const scalar.Datum, limits: scalar.EvalLimits) !scalar.Datum {
+    if (!hasExternal(prepared.program)) return prepared.evaluate(a, cells, limits);
+    return (try evaluateInvocationsCore(a, provider, &.{prepared.program}, &.{cells}, &.{}, &.{prepared}, limits))[0];
 }
 
 pub fn hasExternal(program: *const scalar.Program) bool {
@@ -419,7 +436,7 @@ pub const SortedProjection = struct {
             if (self.has_deferred) @memcpy(row.*[self.outputs.len..], input);
         }
         for (self.outputs, self.deferred, 0..) |*program, deferred, column| if (!deferred) {
-            const output = try evaluateBatch(a, context.backend.decision_provider, program, inputs, context.parameters);
+            const output = try evaluateBatchWithLimits(a, context.backend.decision_provider, program, inputs, context.parameters, limitsFor(context.backend));
             for (values, output) |row, value| row[column] = value;
         };
         const keys = try a.alloc([]scalar.Datum, inputs.len);
@@ -428,7 +445,7 @@ pub const SortedProjection = struct {
             if (column < self.order_outputs.len and self.order_outputs[column] != null) {
                 for (keys, values) |row, value| row[column] = value[self.order_outputs[column].?];
             } else {
-                const output = try evaluateBatch(a, context.backend.decision_provider, program, inputs, context.parameters);
+                const output = try evaluateBatchWithLimits(a, context.backend.decision_provider, program, inputs, context.parameters, limitsFor(context.backend));
                 for (keys, output) |row, value| row[column] = value;
             }
         }
@@ -458,7 +475,7 @@ pub const SortedProjection = struct {
             const values = try a.alloc([]scalar.Datum, inputs.items.len);
             for (selected[first..][0..inputs.items.len], values) |row, *out| out.* = try a.dupe(scalar.Datum, row.values[0..self.outputs.len]);
             for (self.outputs, self.deferred, 0..) |*program, deferred, column| if (deferred) {
-                const output = try evaluateBatch(a, context.backend.decision_provider, program, inputs.items, context.parameters);
+                const output = try evaluateBatchWithLimits(a, context.backend.decision_provider, program, inputs.items, context.parameters, limitsFor(context.backend));
                 for (values, output) |row, value| row[column] = value;
             };
             for (values, first..) |row, index| {
