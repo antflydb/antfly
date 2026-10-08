@@ -6320,3 +6320,24 @@ Final-source validation passes 611 local and 226 server SQL tests, 62 local and
 tests: 1,093 passing tests, three existing SQL skips, no failures or leaks.
 Focused scalar projection and bounded array-comparison tests, allocation-fault
 cleanup, generated control catalog, formatting and whitespace checks pass.
+
+### Durable array-expression reader capability
+
+Schema format 24 fences array-dependent expression programs independently of
+physical array columns. Declaration analysis detects array operands in CHECK,
+index/UNIQUE expressions, defaults and generated programs, using exact column
+names and both public wire and JSON expression representations. A scalar or
+boolean result does not remove its array execution dependency. Unrelated array
+columns and text literals do not over-fence scalar programs.
+
+Older catalog capabilities reject this flag; decoding checks strict booleans
+and every truncated frame before allocation. Format-23 flag-free schemas remain
+readable, and text-projection fingerprints retain their prior representation.
+This is a prerequisite, not public array-expression activation: compiler/DDL
+guards remain until typed bindings, encoding and mounted execution are complete.
+No original inventory disposition changes.
+
+Final-source capability validation passes 611 local and 226 server SQL tests,
+63 local and 5 server schema-expression tests, and 190 local plus 1 server native
+integrity tests: 1,096 passing tests, three existing SQL skips, no failures or
+leaks. Focused capability, generated control catalog and formatting checks pass.

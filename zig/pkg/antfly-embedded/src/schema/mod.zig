@@ -883,6 +883,87 @@ fn requiresExactNumericExpressions(schema: ParsedTableSchema) bool {
     return requiresNumericExpressionCapability(schema, .values);
 }
 
+fn arrayColumn(schema: ParsedTableSchema, name: []const u8) bool {
+    for (schema.document_schemas) |document| for (document.properties) |property| {
+        if (std.mem.eql(u8, name, property.name) and runtimeRelationalColumnType(property) == .sql_array) return true;
+    };
+    return false;
+}
+
+fn arrayExpressionWire(schema: ParsedTableSchema, expression: anytype, depth: usize) bool {
+    if (depth >= @import("relational_expression.zig").max_depth) return false;
+    if (expression.type) |kind| if (std.mem.eql(u8, @tagName(kind), "sql_array")) return true;
+    if (expression.column) |name| if (arrayColumn(schema, name)) return true;
+    if (expression.args) |args| for (args) |arg| if (arrayExpressionWire(schema, arg, depth + 1)) return true;
+    return false;
+}
+
+fn arrayExpressionJson(schema: ParsedTableSchema, expression: std.json.Value, depth: usize) bool {
+    if (depth >= @import("relational_expression.zig").max_depth or expression != .object) return false;
+    if (expression.object.get("type")) |kind| if (kind == .string and std.mem.eql(u8, kind.string, "sql_array")) return true;
+    if (expression.object.get("column")) |name| if (name == .string and arrayColumn(schema, name.string)) return true;
+    if (expression.object.get("args")) |args| if (args == .array) {
+        for (args.array.items) |arg| if (arrayExpressionJson(schema, arg, depth + 1)) return true;
+    };
+    return false;
+}
+
+fn requiresArrayExpressions(schema: ParsedTableSchema) bool {
+    if (schema.checks) |checks| for (checks.value) |check| {
+        if (check.column) |name| if (arrayColumn(schema, name)) return true;
+        if (check.expression) |expression| if (arrayExpressionWire(schema, expression, 0)) return true;
+    };
+    if (schema.relational_indexes) |indexes| for (indexes.value) |index| {
+        for (index.keys) |key| if (key.expression) |expression| if (arrayExpressionWire(schema, expression, 0)) return true;
+    };
+    if (schema.unique_constraints) |constraints| for (constraints.value) |constraint| if (constraint.keys) |keys| {
+        for (keys) |key| if (key.expression) |expression| if (arrayExpressionWire(schema, expression, 0)) return true;
+    };
+    for ([_]?std.json.Parsed(std.json.Value){ schema.column_defaults, schema.generated_columns }) |definitions| if (definitions) |declarations| {
+        if (declarations.value == .array) for (declarations.value.array.items) |entry| {
+            if (entry == .object) {
+                if (entry.object.get("column")) |name| if (name == .string and arrayColumn(schema, name.string)) return true;
+                if (entry.object.get("expression")) |expression| if (arrayExpressionJson(schema, expression, 0)) return true;
+            }
+        };
+    };
+    return false;
+}
+
+test "relational declarations array expression capability tracks hidden operands and exact names" {
+    const a = std.testing.allocator;
+    var schema = try impl.parseSchema(a,
+        \\{"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"a":{"type":"sql_array","x-antfly-sql-type":"int64","nullable":true},"n":{"type":"integer"}},"additionalProperties":false}}}}
+    );
+    defer schema.deinit(a);
+    try std.testing.expect(!requiresArrayExpressions(schema));
+    const Case = struct { text: []const u8, expected: bool };
+    for ([_]Case{
+        .{ .text = "{\"op\":\"is_null\",\"args\":[{\"op\":\"column\",\"column\":\"a\"}]}", .expected = true },
+        .{ .text = "{\"op\":\"eq\",\"args\":[{\"op\":\"column\",\"column\":\"a\"},{\"op\":\"column\",\"column\":\"a\"}]}", .expected = true },
+        .{ .text = "{\"op\":\"is_null\",\"args\":[{\"op\":\"column\",\"column\":\"n\"}]}", .expected = false },
+        .{ .text = "{\"op\":\"column\",\"column\":\"aa\"}", .expected = false },
+        .{ .text = "{\"op\":\"literal\",\"type\":\"string\",\"value\":\"a\"}", .expected = false },
+    }) |case| {
+        var expression = try std.json.parseFromSlice(std.json.Value, a, case.text, .{});
+        defer expression.deinit();
+        var wire = try std.json.parseFromSlice(@import("antfly_schema_openapi").RelationalScalarExpression, a, case.text, .{});
+        defer wire.deinit();
+        try std.testing.expectEqual(case.expected, arrayExpressionJson(schema, expression.value, 0));
+        try std.testing.expectEqual(case.expected, arrayExpressionWire(schema, wire.value, 0));
+    }
+    var literal = try std.json.parseFromSlice(std.json.Value, a, "{\"op\":\"literal\",\"type\":\"sql_array\",\"sql_type\":\"int64\",\"value\":null}", .{});
+    defer literal.deinit();
+    try std.testing.expect(arrayExpressionJson(schema, literal.value, 0));
+    var defaults = try std.json.parseFromSlice(std.json.Value, a,
+        \\[{"column":"n","expression":{"op":"is_null","args":[{"op":"column","column":"a"}]}}]
+    , .{});
+    defer defaults.deinit();
+    schema.column_defaults = defaults;
+    defer schema.column_defaults = null;
+    try std.testing.expect(requiresArrayExpressions(schema));
+}
+
 fn requiresNumericModifiers(schema: ParsedTableSchema) bool {
     for (schema.document_schemas) |document| for (document.properties) |property| {
         if (property.numeric_modifier != null) return true;
@@ -1091,6 +1172,7 @@ pub fn deriveRuntimeTableSchema(alloc: std.mem.Allocator, schema: ParsedTableSch
         .requires_exact_numeric_expressions = requiresExactNumericExpressions(schema),
         .requires_exact_numeric_validation = requiresExactNumericValidation(schema),
         .requires_numeric_modifiers = requiresNumericModifiers(schema),
+        .requires_array_expressions = requiresArrayExpressions(schema),
         .storage_mode = switch (schema.storage_mode) {
             .document => .document,
             .relational => .relational,
@@ -1118,6 +1200,7 @@ pub fn deriveRelationalCheckLayout(alloc: std.mem.Allocator, schema: ParsedTable
         .requires_exact_numeric_expressions = requiresExactNumericExpressions(schema),
         .requires_exact_numeric_validation = requiresExactNumericValidation(schema),
         .requires_numeric_modifiers = requiresNumericModifiers(schema),
+        .requires_array_expressions = requiresArrayExpressions(schema),
         .relational_columns = try deriveRuntimeRelationalColumns(alloc, schema),
     };
 }
