@@ -33,44 +33,75 @@ CASES = [
 ]
 
 
-def generate():
+GLOBAL_CASES = [
+    ("unicode-empty", "", "雪😀", "", 3, 0, 0),
+    ("nonempty-then-empty", ".*", "雪😀", "", 3, 0, 0),
+    ("optional-captures", "(a)?(b*)", "a雪bb😀", "", 3, 0, 2),
+    ("shortest-quantifiers", "a+?", "aaa雪aa", "", 3, 0, 0),
+    ("nonzero-start-lookbehind", "(?<=雪)😀|$", "雪😀雪😀", "", 3, 2, 0),
+    ("nonzero-start-anchor", "^a|$", "aa", "", 3, 1, 0),
+    ("empty-subject", "(a*)", "", "", 3, 0, 1),
+    ("no-match", "z+", "雪😀aa", "", 3, 0, 0),
+    ("repeated-backreferences", r"([a-z]+)-\1", "cat-cat dog-dog", "", 3, 0, 1),
+    ("newline-anchors", "^|$", "a\nb\n", "n", 195, 0, 0),
+]
+
+
+def generate(global_matches=False):
     entries = []
     with postgres() as db:
         if db.execute(
             "SELECT datctype FROM pg_database WHERE datname=current_database()"
         ).fetchone()[0] not in ("C", "POSIX"):
             raise RuntimeError("the explicit C-collation oracle changed")
-        for identity, pattern, text, flags, native_flags, start, captures in CASES:
-            spans = []
-            for group in range(captures + 1):
-                args = (text, pattern, start + 1, 1, flags, group)
-                row = db.execute(
-                    "SELECT regexp_substr(%s,%s,%s,%s,%s,%s), "
-                    "regexp_instr(%s,%s,%s,%s,0,%s,%s), "
-                    "regexp_instr(%s,%s,%s,%s,1,%s,%s)",
-                    args * 3,
-                ).fetchone()
-                spans.append({"start": row[1] - 1, "end": row[2] - 1, "text": row[0]})
-            entries.append(
-                {
-                    "id": identity,
-                    "pattern": pattern,
-                    "input": text,
-                    "flags": native_flags,
-                    "start": start,
-                    "captures": captures,
-                    "matched": spans[0]["text"] is not None,
-                    "spans": spans,
-                }
+        cases = GLOBAL_CASES if global_matches else CASES
+        for identity, pattern, text, flags, native_flags, start, captures in cases:
+            count = (
+                db.execute(
+                    "SELECT regexp_count(%s,%s,%s,%s)",
+                    (text, pattern, start + 1, flags),
+                ).fetchone()[0]
+                if global_matches
+                else 1
             )
+            occurrences = []
+            for occurrence in range(1, count + 1):
+                spans = []
+                for group in range(captures + 1):
+                    args = (text, pattern, start + 1, occurrence, flags, group)
+                    row = db.execute(
+                        "SELECT regexp_substr(%s,%s,%s,%s,%s,%s), "
+                        "regexp_instr(%s,%s,%s,%s,0,%s,%s), "
+                        "regexp_instr(%s,%s,%s,%s,1,%s,%s)",
+                        args * 3,
+                    ).fetchone()
+                    spans.append(
+                        {"start": row[1] - 1, "end": row[2] - 1, "text": row[0]}
+                    )
+                occurrences.append(spans)
+            entry = {
+                "id": identity,
+                "pattern": pattern,
+                "input": text,
+                "flags": native_flags,
+                "start": start,
+                "captures": captures,
+            }
+            if global_matches:
+                entry["occurrences"] = occurrences
+            else:
+                entry["matched"] = occurrences[0][0]["text"] is not None
+                entry["spans"] = occurrences[0]
+            entries.append(entry)
     return {"format": 1, "collation": "C", "entries": entries}
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--check", type=Path)
+    parser.add_argument("--global-matches", action="store_true")
     args = parser.parse_args()
-    observed = generate()
+    observed = generate(args.global_matches)
     if args.check:
         if json.loads(args.check.read_text()) != observed:
             raise SystemExit("PostgreSQL regex reference mismatch")

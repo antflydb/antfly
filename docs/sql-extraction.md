@@ -4662,3 +4662,20 @@ The native backend gate passes nine tests (about 0.6 seconds / 7 MiB maximum RSS
 in a local Debug run); this is gate runtime, not SQL query latency. The isolated
 backend also cross-compiles its tests for x86_64 Linux GNU without executing
 them. All 22 PostgreSQL span goldens reproduce from a fresh disposable database.
+
+The next backend increment removes host libc and validates all 22 span plus ten
+global-occurrence contracts in import-free freestanding WASM, twice per instance.
+Matching now has execution-owned reusable scratch with size-class admission
+counting both live and cached physical bytes. Warm repeated matches make no
+additional native allocations; varying sizes reclaim idle bins rather than
+exceeding the memory bound. Errors clear borrowed budgets and all live scratch
+before retry. Global iteration retains the whole Unicode subject and advances
+empty matches by one codepoint, including exactly one terminal empty match.
+PostgreSQL independently supplies all 26 expected occurrences/capture spans.
+The root backend gate now passes 12 tests (about 0.6 seconds / 8 MiB RSS locally),
+Linux cross-compilation succeeds, and both fixtures reproduce in fresh disposable
+PostgreSQL databases. These measurements are not public SQL latency claims.
+
+Public SQL activation, pattern admission, complete complex-path work charging,
+replacement expansion, non-C collations and original corpus probes remain open;
+this backend progress does not change the authoritative corpus counts.

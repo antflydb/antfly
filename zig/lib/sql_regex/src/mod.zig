@@ -43,13 +43,19 @@ extern fn antfly_regex_captures(*anyopaque) usize;
 extern fn antfly_regex_destroy(*Context, *anyopaque) void;
 
 const Memory = struct {
-    const Header = struct { previous: ?*Header, next: ?*Header, bytes: usize };
+    const Header = struct { previous: ?*Header, next: ?*Header, bytes: usize, requested: usize };
     const header_bytes = std.mem.alignForward(usize, @sizeOf(Header), 16);
     alloc: A,
     limit: usize,
     head: ?*Header = null,
     live: usize = 0,
     peak: usize = 0,
+    resident: usize = 0,
+    resident_peak: usize = 0,
+    allocations: usize = 0,
+    reused: usize = 0,
+    retain: bool = false,
+    cached: [@bitSizeOf(usize)]?*Header = @splat(null),
     budget: ?*Budget,
     failure: ?anyerror = null,
     fn from(raw: *anyopaque) *Memory {
@@ -60,25 +66,44 @@ const Memory = struct {
     }
     fn allocate(raw: *anyopaque, bytes: usize) callconv(.c) ?*anyopaque {
         const self = from(raw);
-        const size = std.math.add(usize, header_bytes, @max(1, bytes)) catch {
+        const required = std.math.add(usize, header_bytes, @max(1, bytes)) catch {
             self.failure = error.SqlExpressionTooLarge;
             return null;
         };
+        const size = if (self.retain) std.math.ceilPowerOfTwo(usize, required) catch {
+            self.failure = error.SqlExpressionTooLarge;
+            return null;
+        } else required;
         if (size > self.limit -| self.live) {
             self.failure = error.SqlExpressionTooLarge;
             return null;
         }
-        const buffer = self.alloc.alignedAlloc(u8, .@"16", size) catch |err| {
-            self.failure = err;
-            return null;
+        const bin = std.math.log2_int(usize, size);
+        const node: *Header = reuse: {
+            if (self.retain) if (self.cached[bin]) |node| {
+                self.cached[bin] = node.next;
+                self.reused += 1;
+                break :reuse node;
+            };
+            // Admission includes cached blocks. Reclaim the largest idle
+            // blocks first; varying patterns cannot grow physical residency
+            // beyond the execution's heap limit.
+            self.trim(self.limit - size);
+            const buffer = self.alloc.alignedAlloc(u8, .@"16", size) catch |err| {
+                self.failure = err;
+                return null;
+            };
+            self.resident += size;
+            self.resident_peak = @max(self.resident_peak, self.resident);
+            self.allocations += 1;
+            break :reuse @ptrCast(buffer.ptr);
         };
-        const node: *Header = @ptrCast(buffer.ptr);
-        node.* = .{ .previous = null, .next = self.head, .bytes = size };
+        node.* = .{ .previous = null, .next = self.head, .bytes = size, .requested = bytes };
         if (self.head) |old| old.previous = node;
         self.head = node;
         self.live += size;
         self.peak = @max(self.peak, self.live);
-        return @ptrCast(buffer.ptr + header_bytes);
+        return @ptrFromInt(@intFromPtr(node) + header_bytes);
     }
     fn release(raw: *anyopaque, pointer: ?*anyopaque) callconv(.c) void {
         const node = header(pointer orelse return);
@@ -86,13 +111,17 @@ const Memory = struct {
         if (node.previous) |previous| previous.next = node.next else self.head = node.next;
         if (node.next) |next| next.previous = node.previous;
         self.live -= node.bytes;
-        const buffer: [*]align(16) u8 = @ptrCast(@alignCast(node));
-        self.alloc.free(buffer[0..node.bytes]);
+        if (self.retain) {
+            const bin = std.math.log2_int(usize, node.bytes);
+            node.previous = null;
+            node.next = self.cached[bin];
+            self.cached[bin] = node;
+        } else self.freeBlock(node);
     }
     fn resize(raw: *anyopaque, pointer: ?*anyopaque, bytes: usize) callconv(.c) ?*anyopaque {
         const old = pointer orelse return allocate(raw, bytes);
         const replacement = allocate(raw, bytes) orelse return null;
-        const size = @min(bytes, header(old).bytes - header_bytes);
+        const size = @min(bytes, header(old).requested);
         @memcpy(@as([*]u8, @ptrCast(replacement))[0..size], @as([*]const u8, @ptrCast(old))[0..size]);
         release(raw, old);
         return replacement;
@@ -107,9 +136,33 @@ const Memory = struct {
         if (self.budget) |budget| if (budget.failure) |err| return err;
         if (self.failure) |err| return err;
     }
-    fn deinit(self: *Memory) void {
+    fn freeBlock(self: *Memory, node: *Header) void {
+        self.resident -= node.bytes;
+        const buffer: [*]align(16) u8 = @ptrCast(@alignCast(node));
+        self.alloc.free(buffer[0..node.bytes]);
+    }
+    fn trim(self: *Memory, maximum: usize) void {
+        var bin = self.cached.len;
+        while (bin > 0 and self.resident > maximum) {
+            bin -= 1;
+            while (self.cached[bin]) |node| {
+                if (self.resident <= maximum) break;
+                self.cached[bin] = node.next;
+                self.freeBlock(node);
+            }
+        }
+    }
+    fn reset(self: *Memory) void {
         while (self.head) |node| release(self, @ptrFromInt(@intFromPtr(node) + header_bytes));
+        self.budget = null;
+        self.failure = null;
         std.debug.assert(self.live == 0);
+    }
+    fn deinit(self: *Memory) void {
+        self.retain = false;
+        self.reset();
+        self.trim(0);
+        std.debug.assert(self.resident == 0);
     }
 };
 
@@ -181,23 +234,82 @@ pub const Program = struct {
         return .{ .memory = memory, .native = native orelse return error.InvalidRegexResponse, .captures = antfly_regex_captures(native.?), .limits = limits };
     }
     pub fn find(self: *const Program, subject: Subject, start: usize, matches: []Span, budget: *Budget) !bool {
-        if (start > subject.len()) return error.SqlInvalidArgument;
-        var memory: Memory = .{ .alloc = self.memory.alloc, .limit = self.limits.heap_bytes, .budget = budget };
-        defer memory.deinit();
-        var context = memory.context(self.limits.stack_bytes);
-        if (!budget.consume()) return budget.failure.?;
-        @memset(matches, .{});
-        const status = antfly_regex_search(&context, self.native, subject.codepoints.ptr, subject.len(), start, matches.ptr, matches.len);
-        try memory.check();
-        if (status == 1) return false;
-        try checkStatus(status);
-        for (matches) |match| _ = try subject.slice(match);
-        return true;
+        var execution = Executor.init(self.memory.alloc, self.limits);
+        defer execution.deinit();
+        return execution.find(self, subject, start, matches, budget);
     }
     pub fn deinit(self: *Program) void {
         var context = self.memory.context(self.limits.stack_bytes);
         antfly_regex_destroy(&context, self.native);
         self.memory.deinit();
+    }
+};
+
+/// One synchronous execution owner, reusable across rows and occurrences.
+/// Never share this mutable scratch between concurrent callers. It retains
+/// neither subject bytes nor a request budget after a call (including errors).
+/// Immutable Programs may be used by independently owned Executors in parallel.
+pub const Executor = struct {
+    memory: Memory,
+    limits: Limits,
+    pub const Stats = struct { resident_bytes: usize, peak_bytes: usize, allocations: usize, reuses: usize };
+    pub fn init(alloc: A, limits: Limits) Executor {
+        return .{ .memory = .{ .alloc = alloc, .limit = limits.heap_bytes, .budget = null, .retain = true }, .limits = limits };
+    }
+    pub fn snapshot(self: *const Executor) Stats {
+        return .{ .resident_bytes = self.memory.resident, .peak_bytes = self.memory.resident_peak, .allocations = self.memory.allocations, .reuses = self.memory.reused };
+    }
+    pub fn find(self: *Executor, program: *const Program, subject: Subject, start: usize, matches: []Span, budget: *Budget) !bool {
+        @memset(matches, .{});
+        errdefer @memset(matches, .{});
+        if (start > subject.len()) return error.SqlInvalidArgument;
+        self.memory.limit = @min(self.limits.heap_bytes, program.limits.heap_bytes);
+        self.memory.trim(self.memory.limit);
+        self.memory.budget = budget;
+        defer self.memory.reset();
+        var context = self.memory.context(@min(self.limits.stack_bytes, program.limits.stack_bytes));
+        if (!budget.consume()) return budget.failure.?;
+        const status = antfly_regex_search(&context, program.native, subject.codepoints.ptr, subject.len(), start, matches.ptr, matches.len);
+        try self.memory.check();
+        if (status == 1) return false;
+        try checkStatus(status);
+        for (matches) |match| _ = try subject.slice(match);
+        return true;
+    }
+    pub fn deinit(self: *Executor) void {
+        self.memory.deinit();
+    }
+};
+
+/// Nonoverlapping PostgreSQL occurrence iteration. All searches retain the
+/// whole subject: a continuation is a character offset, never a UTF-8 slice.
+/// Empty matches advance one codepoint, including exactly one match at EOF.
+/// The caller owns captures and shares one budget across the whole operation.
+pub const MatchCursor = struct {
+    program: *const Program,
+    executor: *Executor,
+    subject: Subject,
+    spans: []Span,
+    position: usize,
+    finished: bool = false,
+    pub fn init(program: *const Program, executor: *Executor, subject: Subject, start: usize, spans: []Span) !MatchCursor {
+        if (start > subject.len() or spans.len == 0) return error.SqlInvalidArgument;
+        return .{ .program = program, .executor = executor, .subject = subject, .spans = spans, .position = start };
+    }
+    pub fn next(self: *MatchCursor, budget: *Budget) !bool {
+        errdefer @memset(self.spans, .{});
+        if (self.finished) return false;
+        if (!try self.executor.find(self.program, self.subject, self.position, self.spans, budget)) {
+            self.finished = true;
+            return false;
+        }
+        const match = self.spans[0];
+        if (match.start < self.position or match.end < match.start) return error.InvalidRegexResponse;
+        const end: usize = @intCast(match.end);
+        if (match.start == match.end) {
+            if (end == self.subject.len()) self.finished = true else self.position = end + 1;
+        } else self.position = end;
+        return true;
     }
 };
 fn checkStatus(status: c_int) !void {
@@ -270,14 +382,119 @@ test "PostgreSQL ARE allocation faults unwind compiled ownership and independent
             defer program.deinit();
             var subject = try Subject.init(a, "雪 cat-cat dog-dog");
             defer subject.deinit();
+            var execution = Executor.init(a, .{});
+            defer execution.deinit();
             var spans: [2]Span = undefined;
-            try std.testing.expect(try program.find(subject, 0, &spans, &budget));
+            try std.testing.expect(try execution.find(&program, subject, 0, &spans, &budget));
             try std.testing.expectEqualStrings("cat-cat", (try subject.slice(spans[0])).?);
-            try std.testing.expect(try program.find(subject, @intCast(spans[0].end), &spans, &budget));
+            try std.testing.expect(try execution.find(&program, subject, @intCast(spans[0].end), &spans, &budget));
             try std.testing.expectEqualStrings("dog-dog", (try subject.slice(spans[0])).?);
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Faults.run, .{});
+}
+
+test "PostgreSQL ARE execution reuses bounded scratch without retaining failed request state" {
+    const a = std.testing.allocator;
+    var budget: Budget = .{};
+    var program = try Program.compile(a, "([[:alpha:]]+)-\\1", 3, .{}, &budget);
+    defer program.deinit();
+    var subject = try Subject.init(a, "雪 cat-cat dog-dog");
+    defer subject.deinit();
+    var execution = Executor.init(a, .{});
+    defer execution.deinit();
+    var spans: [2]Span = undefined;
+    try std.testing.expect(try execution.find(&program, subject, 0, &spans, &budget));
+    const warmed = execution.snapshot();
+    try std.testing.expect(warmed.allocations > 0);
+    for (0..1000) |_| {
+        var row_budget: Budget = .{};
+        try std.testing.expect(try execution.find(&program, subject, 0, &spans, &row_budget));
+        try std.testing.expectEqualStrings("cat-cat", (try subject.slice(spans[0])).?);
+    }
+    try std.testing.expectEqual(warmed.allocations, execution.snapshot().allocations);
+    try std.testing.expect(execution.snapshot().reuses > 1000);
+    try std.testing.expect(execution.snapshot().peak_bytes <= execution.limits.heap_bytes);
+    var refused: Budget = .{ .remaining = 4 };
+    try std.testing.expectError(error.SqlExpressionTooLarge, execution.find(&program, subject, 0, &spans, &refused));
+    for (spans) |span| try std.testing.expectEqual(Span{}, span);
+    try std.testing.expect(execution.memory.budget == null);
+    try std.testing.expect(execution.memory.failure == null);
+    try std.testing.expectEqual(@as(usize, 0), execution.memory.live);
+    var retry: Budget = .{};
+    try std.testing.expect(try execution.find(&program, subject, 0, &spans, &retry));
+    try std.testing.expectEqualStrings("cat-cat", (try subject.slice(spans[0])).?);
+}
+
+test "PostgreSQL ARE scratch admission counts physical cached residency and reclaims idle bins" {
+    var memory: Memory = .{ .alloc = std.testing.allocator, .limit = 512, .budget = null, .retain = true };
+    defer memory.deinit();
+    const small = Memory.allocate(&memory, 17).?;
+    const medium = Memory.allocate(&memory, 91).?;
+    @memset(@as([*]u8, @ptrCast(small))[0..17], 9);
+    const copied = Memory.resize(&memory, small, 34).?;
+    try std.testing.expectEqualSlices(u8, &@as([17]u8, @splat(9)), @as([*]const u8, @ptrCast(copied))[0..17]);
+    Memory.release(&memory, medium);
+    Memory.release(&memory, copied);
+    try std.testing.expect(memory.resident > 0);
+    // The new size class fits only after reclaiming other cached classes.
+    const large = Memory.allocate(&memory, 400).?;
+    try std.testing.expectEqual(@as(usize, 512), memory.resident);
+    Memory.release(&memory, large);
+    try std.testing.expect(Memory.allocate(&memory, 513) == null);
+    try std.testing.expectError(error.SqlExpressionTooLarge, memory.check());
+    memory.reset();
+    memory.limit = 64;
+    memory.trim(memory.limit);
+    try std.testing.expect(memory.resident <= 64);
+    const bounded = Memory.allocate(&memory, 17).?;
+    Memory.release(&memory, bounded);
+    try std.testing.expect(memory.resident <= 64);
+}
+
+test "PostgreSQL ARE global occurrences use independent PostgreSQL oracle spans" {
+    const Golden = struct {
+        format: u32,
+        collation: []const u8,
+        entries: []const struct {
+            id: []const u8,
+            pattern: []const u8,
+            input: []const u8,
+            flags: c_int,
+            start: usize,
+            captures: usize,
+            occurrences: []const []const struct { start: c_long, end: c_long, text: ?[]const u8 },
+        },
+    };
+    const a = std.testing.allocator;
+    const golden = try std.json.parseFromSlice(Golden, a, @embedFile("testdata/global-postgres.json"), .{});
+    defer golden.deinit();
+    try std.testing.expectEqual(@as(u32, 1), golden.value.format);
+    try std.testing.expectEqualStrings("C", golden.value.collation);
+    var execution = Executor.init(a, .{});
+    defer execution.deinit();
+    for (golden.value.entries) |case| {
+        errdefer std.debug.print("PostgreSQL global ARE fixture {s}\n", .{case.id});
+        var budget: Budget = .{};
+        var program = try Program.compile(a, case.pattern, case.flags, .{}, &budget);
+        defer program.deinit();
+        try std.testing.expectEqual(case.captures, program.captures);
+        var subject = try Subject.init(a, case.input);
+        defer subject.deinit();
+        const spans = try a.alloc(Span, case.captures + 1);
+        defer a.free(spans);
+        var cursor = try MatchCursor.init(&program, &execution, subject, case.start, spans);
+        for (case.occurrences) |expected| {
+            try std.testing.expect(try cursor.next(&budget));
+            for (spans, expected) |span, capture| {
+                try std.testing.expectEqual(capture.start, span.start);
+                try std.testing.expectEqual(capture.end, span.end);
+                if (capture.text) |text| try std.testing.expectEqualStrings(text, (try subject.slice(span)).?) else try std.testing.expect((try subject.slice(span)) == null);
+            }
+        }
+        try std.testing.expect(!try cursor.next(&budget));
+        try std.testing.expect(!try cursor.next(&budget));
+    }
 }
 
 test "PostgreSQL ARE cached transitions obey work cancellation and linear regular search" {
@@ -348,6 +565,7 @@ test "PostgreSQL ARE independently generated spans preserve captures flags and C
 }
 
 test "PostgreSQL ARE shares immutable patterns across independent Io workers" {
+    if (comptime @import("builtin").single_threaded) return error.SkipZigTest;
     const a = std.testing.allocator;
     var budget: Budget = .{};
     var program = try Program.compile(a, "([[:alpha:]]+)([0-9]+)", 3, .{}, &budget);

@@ -12,10 +12,22 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <limits.h>
-#include <stdlib.h>
-#include <string.h>
-#include <stdio.h>
-#include <assert.h>
+/* No host libc, host regex or host locale dependency. Diagnostics in the
+ * upstream REG_DEBUG build are deliberately not enabled by this adapter. */
+typedef struct antfly_regex_unused_file FILE;
+#define assert(x) ((void)0)
+void *antfly_regex_copy(void *, const void *, size_t);
+void *antfly_regex_set(void *, int, size_t);
+int antfly_regex_compare(const void *, const void *, size_t);
+size_t antfly_regex_length(const char *);
+char *antfly_regex_find_char(const char *, int);
+void antfly_regex_sort(void *, size_t, size_t, int (*)(const void *, const void *));
+#define memcpy antfly_regex_copy
+#define memset antfly_regex_set
+#define memcmp antfly_regex_compare
+#define strlen antfly_regex_length
+#define strchr antfly_regex_find_char
+#define qsort antfly_regex_sort
 
 typedef uint32_t pg_wchar;
 typedef uint32_t Oid;

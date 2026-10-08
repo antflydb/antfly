@@ -3,7 +3,11 @@
 #include "bridge.h"
 /* A C call never yields. Restore the prior context for nested invocations;
  * compiled patterns retain no pointer to this thread-local operation state. */
+#if defined(ANTFLY_REGEX_SINGLE_THREADED)
+static struct antfly_regex_context *active;
+#else
 static _Thread_local struct antfly_regex_context *active;
+#endif
 void *antfly_regex_allocate(size_t n) { return active->allocate(active->user,n); }
 void *antfly_regex_resize(void *p, size_t n) { return active->resize(active->user,p,n); }
 void antfly_regex_release(void *p) { if (p) active->release(active->user,p); }
