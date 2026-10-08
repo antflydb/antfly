@@ -9,11 +9,11 @@
     "queries_after_initial_cold_read": 100,
     "prefix": {
       "reference_backend_allocator_calls": 500,
-      "updated_backend_allocator_calls": 8
+      "updated_backend_allocator_calls": 5
     },
     "prefix_snappy": {
       "reference_backend_allocator_calls": 604,
-      "updated_backend_allocator_calls": 9
+      "updated_backend_allocator_calls": 5
     },
     "reference_encoded_block_loads": 100,
     "updated_encoded_block_loads": 1,
@@ -42,13 +42,58 @@
     "evicted_pinned_payload_credit_survives_until_final_release": true,
     "host_pressure_reclaims_unpinned_cache_without_blocking_backend": true,
     "denied_admission_preserves_read_results": true,
-    "shutdown_fences_pending_reclaimer_registration": true
+    "shutdown_fences_pending_reclaimer_registration": true,
+    "impossible_admission_preserves_existing_cache": true
   },
   "notes": [
     "Allocation counts cover the backend allocator; owned point results still allocate in the caller's result allocator.",
     "Encoded block loads may hit the provider memory cache; these counts are not physical disk reads.",
     "Cold decoding and first promotion still allocate. Zero allocation applies to the measured warm backend path.",
-    "Resource accounting follows admitted payloads through eviction and result leases. Unadmitted decoded scratch remains transient, and resource-managed result owners copy its values.",
-    "The on-disk format and public C ABI are unchanged."
-  ]
+    "Resource accounting follows decoded scratch and uncached payload leases in the read-working-set slice, then transfers admitted payload credit to the cache slice through eviction and result leases. Resource-managed result owners copy unadmitted values.",
+    "The on-disk format and public C ABI are unchanged.",
+    "Workspace-retention capacity excludes arena bookkeeping. Backend allocation counts exclude runtime metadata supplied by its separate allocator; writer scratch reuse is checked separately."
+  ],
+  "previous_pr_commit": "1ad9a16b18be51ac35fd855b4a82e96a99b99513",
+  "warm_write_batches": {
+    "reference_commit": "1ad9a16b18be51ac35fd855b4a82e96a99b99513",
+    "two_key_batches_after_warmup": 100,
+    "reference_backend_allocator_calls": 206,
+    "updated_backend_allocator_calls": 0,
+    "reference_owned_values": 200,
+    "updated_owned_values": 0,
+    "updated_retained_pins": 1,
+    "writer_metadata_allocations_after_first_warm_batch": 0,
+    "mutable_results_preserved_after_later_publication": true,
+    "borrowed_results_preserved_after_cache_eviction": true
+  },
+  "concurrent_cold_batches": {
+    "readers": 8,
+    "joined_readers": 7,
+    "encoded_block_loads": 1,
+    "shared_failure_and_success_cleanup_verified": true
+  },
+  "transient_compressed_point_reads": {
+    "queries_after_workspace_warmup": 100,
+    "prefix_backend_allocator_calls": 100,
+    "prefix_snappy_backend_allocator_calls": 100,
+    "new_cache_admissions": 0,
+    "hot_cached_block_preserved": true
+  },
+  "compressed_negative_lookup": {
+    "bloom_false_positive": true,
+    "reference_encoded_block_loads": 2,
+    "updated_encoded_block_loads": 1,
+    "updated_cache_admissions": 0
+  },
+  "decoder_policy": {
+    "workspaces": 4,
+    "in_flight_records": 16,
+    "default_active_working_byte_gate": 8388608,
+    "max_retained_arena_capacity_per_workspace": 65536,
+    "oversized_operations_run_alone": true,
+    "scratch_backing_allocation_byte_cap_enforced": true,
+    "scratch_and_uncached_lease_resource_slice": "lsm.read_working_set",
+    "cache_admission_transfers_host_credit_without_double_charge": true,
+    "max_retained_writer_batch_keys": 1024
+  }
 }
