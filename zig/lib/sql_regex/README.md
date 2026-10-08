@@ -19,8 +19,13 @@ Adaptations are intentionally isolated and documented:
   captures and offsets operate on Unicode codepoints. Other collations are not
   implemented and must not silently inherit host locale behavior.
 - `regc_nfa.c` unwinds cancellation through each function's native return type.
+  All native sort callers fail compilation rather than consuming a partially
+  sorted arc array. The allocation-free heapsort itself charges comparisons
+  and exchanges and can unwind cancellation inside a sort.
 - `rege_dfa.c` checks work on cached character transitions and backreference
-  loops, not just cache misses. Sticky request errors prohibit exposing partial
+  loops, not just cache misses. DFA state/arc traversal, cache comparison bytes,
+  eviction-chain traversal and backreference lengths consume work. `regexec.c`
+  also charges backreference dissection. Sticky request errors prohibit exposing partial
   successful results. Upstream parsing and match precedence are retained.
 
 Native allocations use a bounded caller allocator with complete ownership
@@ -45,15 +50,21 @@ The additional `--global-matches --check
 zig/lib/sql_regex/src/testdata/global-postgres.json` fixture verifies ten global
 occurrence contracts (26 matches), including empty matches, Unicode positions,
 anchors, lookbehind and unmatched captures, using PostgreSQL count/substr/instr.
+The `--replacements --check
+zig/lib/sql_regex/src/testdata/replacement-postgres.json` fixture verifies sixteen
+PostgreSQL replacement contracts. Replacement plans own their text and tokenize
+escapes once; streaming expansion never materializes a match list. Output growth
+obeys the byte cap, all copying consumes work, and cancellation exposes no partial
+result. Unknown escapes remain literal; unmatched/nonexistent groups expand empty.
 
 The backend has no host-libc dependency. Memory/string helpers and allocation-free
 heapsort are compiled freestanding without builtin libc substitution. Run
-`zig build test -Dtarget=wasm32-freestanding` here to execute all 32 PostgreSQL
+`zig build test -Dtarget=wasm32-freestanding` here to execute all 48 PostgreSQL
 contracts twice in a WASM module with no host imports. Native concurrency uses
 thread-local call context; single-threaded WASM saves/restores per-instance
 context for nested synchronous invocations. The C call must never yield.
 
-Remaining activation requirements include prepared/dynamic pattern admission, complete work
-charging for complex DFA/backreference paths, SQL functions/NULLs/error mapping,
-replacement expansion, and original mounted corpus campaigns.
+Remaining activation requirements include prepared/dynamic pattern admission,
+the full compile/runtime work-accounting audit, SQL functions/NULLs/error mapping,
+and original mounted corpus campaigns.
 The standalone test gate is not a claim that those layers are complete.

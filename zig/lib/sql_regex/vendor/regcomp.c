@@ -228,7 +228,7 @@ static bool checkmatchall_recurse(struct nfa *nfa, struct state *s,
 static bool check_out_colors_match(struct state *s, color co1, color co2);
 static bool check_in_colors_match(struct state *s, color co1, color co2);
 static void compact(struct nfa *nfa, struct cnfa *cnfa);
-static void carcsort(struct carc *first, size_t n);
+static int carcsort(struct carc *first, size_t n);
 static int	carc_cmp(const void *a, const void *b);
 static void freecnfa(struct cnfa *cnfa);
 static void dumpnfa(struct nfa *nfa, FILE *f);

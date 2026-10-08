@@ -20,6 +20,7 @@ void *antfly_regex_resize_array(void *p, size_t width, size_t count) {
     return antfly_regex_resize(p,width * count);
 }
 int antfly_regex_poll(void) { return active->poll(active->user); }
+int antfly_regex_work(size_t amount) { return active->work(active->user,amount); }
 void *antfly_regex_cached_class(unsigned code) { assert(code < 14); return active->classes[code]; }
 void antfly_regex_cache_class(unsigned code, void *value) { assert(code < 14); active->classes[code] = value; }
 int stack_is_too_deep(void) {

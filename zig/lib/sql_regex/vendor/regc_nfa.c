@@ -639,7 +639,12 @@ sortins(struct nfa *nfa,
 		sortarray[i++] = a;
 	assert(i == n);
 	/* ... sort the array */
-	qsort(sortarray, n, sizeof(struct arc *), sortins_cmp);
+	if (!qsort(sortarray, n, sizeof(struct arc *), sortins_cmp))
+	{
+		FREE(sortarray);
+		NERR(REG_ETOOBIG);
+		return;
+	}
 	/* ... and rebuild arc list in order */
 	/* it seems worth special-casing first and last items to simplify loop */
 	a = sortarray[0];
@@ -706,7 +711,12 @@ sortouts(struct nfa *nfa,
 		sortarray[i++] = a;
 	assert(i == n);
 	/* ... sort the array */
-	qsort(sortarray, n, sizeof(struct arc *), sortouts_cmp);
+	if (!qsort(sortarray, n, sizeof(struct arc *), sortouts_cmp))
+	{
+		FREE(sortarray);
+		NERR(REG_ETOOBIG);
+		return;
+	}
 	/* ... and rebuild arc list in order */
 	/* it seems worth special-casing first and last items to simplify loop */
 	a = sortarray[0];
@@ -991,7 +1001,11 @@ mergeins(struct nfa *nfa,
 	if (NISERR())
 		return;					/* might have failed to sort */
 
-	qsort(arcarray, arccount, sizeof(struct arc *), sortins_cmp);
+	if (!qsort(arcarray, arccount, sizeof(struct arc *), sortins_cmp))
+	{
+		NERR(REG_ETOOBIG);
+		return;
+	}
 
 	/*
 	 * arcarray very likely includes dups, so we must eliminate them.  (This
@@ -3594,7 +3608,11 @@ compact(struct nfa *nfa,
 					NERR(REG_ASSERT);
 					return;
 			}
-		carcsort(first, ca - first);
+		if (!carcsort(first, ca - first))
+		{
+			NERR(REG_ETOOBIG);
+			return;
+		}
 		ca->co = COLORLESS;
 		ca->to = 0;
 		ca++;
@@ -3611,11 +3629,12 @@ compact(struct nfa *nfa,
 /*
  * carcsort - sort compacted-NFA arcs by color
  */
-static void
+static int
 carcsort(struct carc *first, size_t n)
 {
 	if (n > 1)
-		qsort(first, n, sizeof(struct carc), carc_cmp);
+		return qsort(first, n, sizeof(struct carc), carc_cmp);
+	return 1;
 }
 
 static int

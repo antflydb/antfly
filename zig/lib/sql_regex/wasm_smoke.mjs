@@ -7,4 +7,6 @@ assert.deepEqual(WebAssembly.Module.imports(module), [], "the backend must not d
 const instance = await WebAssembly.instantiate(module, {});
 assert.equal(instance.exports.antfly_sql_regex_smoke(), 32);
 assert.equal(instance.exports.antfly_sql_regex_smoke(), 32, "reopening must not retain native context state");
-console.log("32 PostgreSQL ARE contracts passed twice in import-free freestanding WASM");
+assert.equal(instance.exports.antfly_sql_regex_replacement_smoke(), 16);
+assert.equal(instance.exports.antfly_sql_regex_replacement_smoke(), 16);
+console.log("48 PostgreSQL ARE contracts passed twice in import-free freestanding WASM");

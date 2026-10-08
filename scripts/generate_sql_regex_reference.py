@@ -96,16 +96,83 @@ def generate(global_matches=False):
     return {"format": 1, "collation": "C", "entries": entries}
 
 
+REPLACEMENT_CASES = [
+    ("whole-match-unicode", ".", "雪😀", r"<\&>", "", 3, 0, 0),
+    ("global-empty", "", "雪😀", "X", "", 3, 0, 0),
+    ("empty-after-nonempty", ".*", "雪😀", "X", "", 3, 0, 0),
+    ("unmatched-capture", "(a)?(b)", "b", r"<\1>:<\2>", "", 3, 0, 0),
+    ("missing-group", "(a)", "a", r"<\9>", "", 3, 0, 0),
+    ("unknown-escapes", "a", "a", r"\q\0", "", 3, 0, 0),
+    ("literal-backslash", "a", "a", r"\\", "", 3, 0, 0),
+    ("trailing-backslash", "a", "a", "x\\", "", 3, 0, 0),
+    ("capture-one-then-digit", "(a)", "a", r"\12", "", 3, 0, 0),
+    ("escaped-capture-literal", "(a)", "a", r"\\1-\1", "", 3, 0, 0),
+    ("second-occurrence", ".", "雪😀a", r"<\&>", "", 3, 0, 2),
+    ("start-and-occurrence", ".", "雪😀abc", "X", "", 3, 2, 2),
+    ("start-beyond-input", ".", "雪", "X", "", 3, 5, 0),
+    ("missing-occurrence", "a", "aba", "X", "", 3, 0, 3),
+    ("empty-replacement", "a", "aba", "", "", 3, 0, 0),
+    ("nonzero-lookbehind", "(?<=雪)😀|$", "雪😀雪😀", r"<\&>", "", 3, 2, 0),
+]
+
+
+def generate_replacements():
+    entries = []
+    with postgres() as db:
+        if db.execute(
+            "SELECT datctype FROM pg_database WHERE datname=current_database()"
+        ).fetchone()[0] not in ("C", "POSIX"):
+            raise RuntimeError("the explicit C-collation oracle changed")
+        for (
+            identity,
+            pattern,
+            text,
+            replacement,
+            flags,
+            native_flags,
+            start,
+            occurrence,
+        ) in REPLACEMENT_CASES:
+            result = db.execute(
+                "SELECT regexp_replace(%s,%s,%s,%s,%s,%s)",
+                (text, pattern, replacement, start + 1, occurrence, flags),
+            ).fetchone()[0]
+            entries.append(
+                {
+                    "id": identity,
+                    "pattern": pattern,
+                    "input": text,
+                    "replacement": replacement,
+                    "flags": native_flags,
+                    "start": start,
+                    "occurrence": occurrence,
+                    "expected": result,
+                }
+            )
+    return {"format": 1, "collation": "C", "entries": entries}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--check", type=Path)
-    parser.add_argument("--global-matches", action="store_true")
+    kind = parser.add_mutually_exclusive_group()
+    kind.add_argument("--global-matches", action="store_true")
+    kind.add_argument("--replacements", action="store_true")
     args = parser.parse_args()
-    observed = generate(args.global_matches)
+    observed = (
+        generate_replacements() if args.replacements else generate(args.global_matches)
+    )
     if args.check:
         if json.loads(args.check.read_text()) != observed:
             raise SystemExit("PostgreSQL regex reference mismatch")
-        print(f"Verified {len(observed['entries'])} PostgreSQL ARE span contracts")
+        label = (
+            "replacement"
+            if args.replacements
+            else "global occurrence"
+            if args.global_matches
+            else "span"
+        )
+        print(f"Verified {len(observed['entries'])} PostgreSQL ARE {label} contracts")
     else:
         print(json.dumps(observed, ensure_ascii=False, indent=2))
 

@@ -31,9 +31,39 @@ const GlobalGolden = struct {
         occurrences: []const []const struct { start: c_long, end: c_long, text: ?[]const u8 },
     },
 };
+const ReplacementGolden = struct {
+    format: u32,
+    collation: []const u8,
+    entries: []const struct { id: []const u8, pattern: []const u8, input: []const u8, replacement: []const u8, flags: c_int, start: usize, occurrence: usize, expected: []const u8 },
+};
 
 export fn antfly_sql_regex_smoke() u32 {
     return run() catch 0;
+}
+export fn antfly_sql_regex_replacement_smoke() u32 {
+    return runReplacements() catch 0;
+}
+fn runReplacements() !u32 {
+    var memory = std.heap.FixedBufferAllocator.init(&buffer);
+    const a = memory.allocator();
+    const golden = try std.json.parseFromSlice(ReplacementGolden, a, @embedFile("testdata/replacement-postgres.json"), .{});
+    defer golden.deinit();
+    if (golden.value.format != 1 or !std.mem.eql(u8, golden.value.collation, "C")) return error.InvalidReference;
+    var execution = regex.Executor.init(a, .{});
+    defer execution.deinit();
+    for (golden.value.entries) |case| {
+        var budget: regex.Budget = .{};
+        var program = try regex.Program.compile(a, case.pattern, case.flags, .{}, &budget);
+        defer program.deinit();
+        var subject = try regex.Subject.init(a, case.input);
+        defer subject.deinit();
+        var replacement = try regex.Replacement.init(a, case.replacement, &budget);
+        defer replacement.deinit();
+        const output = try execution.replaceAlloc(a, &program, subject, &replacement, case.start, case.occurrence, 1024, &budget);
+        defer a.free(output);
+        if (!std.mem.eql(u8, case.expected, output)) return error.WrongReplacement;
+    }
+    return @intCast(golden.value.entries.len);
 }
 fn run() !u32 {
     var memory = std.heap.FixedBufferAllocator.init(&buffer);

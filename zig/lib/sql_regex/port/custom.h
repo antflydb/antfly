@@ -21,7 +21,7 @@ void *antfly_regex_set(void *, int, size_t);
 int antfly_regex_compare(const void *, const void *, size_t);
 size_t antfly_regex_length(const char *);
 char *antfly_regex_find_char(const char *, int);
-void antfly_regex_sort(void *, size_t, size_t, int (*)(const void *, const void *));
+int antfly_regex_sort(void *, size_t, size_t, int (*)(const void *, const void *));
 #define memcpy antfly_regex_copy
 #define memset antfly_regex_set
 #define memcmp antfly_regex_compare
@@ -39,6 +39,7 @@ void *antfly_regex_resize(void *p, size_t n);
 void antfly_regex_release(void *p);
 void *antfly_regex_array(size_t width, size_t count);
 int antfly_regex_poll(void);
+int antfly_regex_work(size_t amount);
 int stack_is_too_deep(void);
 void pg_set_regex_collation(Oid id);
 void *antfly_regex_cached_class(unsigned code);
@@ -53,6 +54,7 @@ void *antfly_regex_resize_array(void *p, size_t width, size_t count);
  * wrapper additionally checks the sticky caller error, never exposing a match
  * if an interrupted subroutine returned zero during unwinding. */
 #define INTERRUPT(re) do { if (!antfly_regex_poll()) { v->err = REG_ETOOBIG; return 0; } } while (0)
+#define REGEX_WORK(amount) do { if (!antfly_regex_work(amount)) { v->err = REG_ETOOBIG; return 0; } } while (0)
 #define NFA_INTERRUPT(nfa,result) do { if (!antfly_regex_poll()) { (nfa)->v->err = REG_ETOOBIG; return result; } } while (0)
 #define CHR(c) ((unsigned char)(c))
 #define DIGITVAL(c) ((c)-'0')

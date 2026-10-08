@@ -1062,6 +1062,7 @@ cbrdissect(struct vars *v,
 	p = begin;
 	while (numreps-- > 0)
 	{
+		REGEX_WORK(brlen);
 		if ((*v->g->compare) (brstring, p, brlen) != 0)
 			return REG_NOMATCH;
 		p += brlen;

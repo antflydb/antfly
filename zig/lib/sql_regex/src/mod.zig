@@ -13,12 +13,16 @@ pub const Budget = struct {
     ptr: ?*anyopaque = null,
     failure: ?anyerror = null,
     fn consume(self: *Budget) bool {
+        return self.consumeWork(1);
+    }
+    fn consumeWork(self: *Budget, amount: usize) bool {
         if (self.failure != null) return false;
-        if (self.remaining == 0) {
+        if (amount > self.remaining) {
+            self.remaining = 0;
             self.failure = error.SqlExpressionTooLarge;
             return false;
         }
-        self.remaining -= 1;
+        self.remaining -= amount;
         if (self.checkpoint) |check| check(self.ptr) catch |err| {
             self.failure = err;
             return false;
@@ -33,6 +37,7 @@ const Context = extern struct {
     resize: *const fn (*anyopaque, ?*anyopaque, usize) callconv(.c) ?*anyopaque = Memory.resize,
     release: *const fn (*anyopaque, ?*anyopaque) callconv(.c) void = Memory.release,
     poll: *const fn (*anyopaque) callconv(.c) c_int = Memory.poll,
+    work: *const fn (*anyopaque, usize) callconv(.c) c_int = Memory.work,
     stack_base: usize = 0,
     stack_limit: usize,
     classes: [14]?*anyopaque = @splat(null),
@@ -128,6 +133,9 @@ const Memory = struct {
     }
     fn poll(raw: *anyopaque) callconv(.c) c_int {
         return @intFromBool((from(raw).budget orelse return 0).consume());
+    }
+    fn work(raw: *anyopaque, amount: usize) callconv(.c) c_int {
+        return @intFromBool((from(raw).budget orelse return 0).consumeWork(amount));
     }
     fn context(self: *Memory, stack_bytes: usize) Context {
         return .{ .user = self, .stack_limit = stack_bytes };
@@ -278,6 +286,100 @@ pub const Executor = struct {
     }
     pub fn deinit(self: *Executor) void {
         self.memory.deinit();
+    }
+    /// start is a zero-based character offset; occurrence zero replaces all,
+    /// otherwise only that one-based occurrence. SQL arity/NULL/argument
+    /// validation belongs to the scalar binder. No result escapes on failure.
+    pub fn replaceAlloc(self: *Executor, alloc: A, program: *const Program, subject: Subject, replacement: *const Replacement, start: usize, occurrence: usize, maximum: usize, budget: *Budget) ![]u8 {
+        var output: BoundedOutput = .{ .alloc = alloc, .maximum = maximum, .budget = budget };
+        defer output.bytes.deinit(alloc);
+        if (start > subject.len()) {
+            try output.append(subject.bytes);
+            return output.bytes.toOwnedSlice(alloc);
+        }
+        // PostgreSQL replacement syntax refers only to groups 1..9 and the
+        // whole match. Internal backreference matching still owns its native
+        // capture bookkeeping independently of this bounded result array.
+        var captures: [10]Span = undefined;
+        const spans = captures[0..@min(captures.len, program.captures + 1)];
+        var cursor = try MatchCursor.init(program, self, subject, start, spans);
+        var seen: usize = 0;
+        var emitted: usize = 0;
+        while (try cursor.next(budget)) {
+            seen += 1;
+            if (occurrence != 0 and seen != occurrence) continue;
+            const begin = subject.byteOffset(@intCast(spans[0].start));
+            const end = subject.byteOffset(@intCast(spans[0].end));
+            try output.append(subject.bytes[emitted..begin]);
+            for (replacement.tokens) |token| switch (token) {
+                .literal => |text| try output.append(text),
+                .group => |group| {
+                    if (group < spans.len) if (try subject.slice(spans[group])) |text| try output.append(text);
+                },
+            };
+            emitted = end;
+            if (occurrence != 0) break;
+        }
+        try output.append(subject.bytes[emitted..]);
+        return output.bytes.toOwnedSlice(alloc);
+    }
+};
+
+/// Owned and immutable; prepare once for a constant replacement, reuse across
+/// rows. Unknown escapes (including backslash-zero) remain literal as in PG.
+pub const Replacement = struct {
+    const Token = union(enum) { literal: []const u8, group: u4 };
+    alloc: A,
+    text: []u8,
+    tokens: []Token,
+    pub fn init(alloc: A, text: []const u8, budget: *Budget) !Replacement {
+        if (text.len > 1024 * 1024) return error.SqlExpressionTooLarge;
+        if (!budget.consumeWork(text.len + 1)) return budget.failure.?;
+        if (!std.unicode.utf8ValidateSlice(text)) return error.SqlInvalidText;
+        const owned = try alloc.dupe(u8, text);
+        errdefer alloc.free(owned);
+        var tokens: std.ArrayList(Token) = .empty;
+        defer tokens.deinit(alloc);
+        var literal: usize = 0;
+        var index: usize = 0;
+        while (index + 1 < owned.len) {
+            if (owned[index] != '\\') {
+                index += 1;
+                continue;
+            }
+            const escape = owned[index + 1];
+            if (escape != '\\' and escape != '&' and (escape < '1' or escape > '9')) {
+                index += 2;
+                continue;
+            }
+            if (index > literal) try tokens.append(alloc, .{ .literal = owned[literal..index] });
+            if (escape == '\\') try tokens.append(alloc, .{ .literal = owned[index + 1 .. index + 2] }) else try tokens.append(alloc, .{ .group = if (escape == '&') 0 else @intCast(escape - '0') });
+            index += 2;
+            literal = index;
+        }
+        if (literal < owned.len) try tokens.append(alloc, .{ .literal = owned[literal..] });
+        return .{ .alloc = alloc, .text = owned, .tokens = try tokens.toOwnedSlice(alloc) };
+    }
+    pub fn deinit(self: *Replacement) void {
+        self.alloc.free(self.tokens);
+        self.alloc.free(self.text);
+    }
+};
+
+const BoundedOutput = struct {
+    alloc: A,
+    maximum: usize,
+    budget: *Budget,
+    bytes: std.ArrayList(u8) = .empty,
+    fn append(self: *BoundedOutput, bytes: []const u8) !void {
+        if (bytes.len > self.maximum -| self.bytes.items.len) return error.SqlExpressionTooLarge;
+        if (!self.budget.consumeWork(bytes.len + 1)) return self.budget.failure.?;
+        const required = self.bytes.items.len + bytes.len;
+        if (required > self.bytes.capacity) {
+            const growth = self.bytes.capacity +| (self.bytes.capacity / 2 +| 16);
+            try self.bytes.ensureTotalCapacityPrecise(self.alloc, @min(self.maximum, @max(required, growth)));
+        }
+        self.bytes.appendSliceAssumeCapacity(bytes);
     }
 };
 
@@ -494,6 +596,118 @@ test "PostgreSQL ARE global occurrences use independent PostgreSQL oracle spans"
         }
         try std.testing.expect(!try cursor.next(&budget));
         try std.testing.expect(!try cursor.next(&budget));
+    }
+}
+
+test "PostgreSQL ARE streaming replacement agrees with independent PostgreSQL results" {
+    const Golden = struct {
+        format: u32,
+        collation: []const u8,
+        entries: []const struct { id: []const u8, pattern: []const u8, input: []const u8, replacement: []const u8, flags: c_int, start: usize, occurrence: usize, expected: []const u8 },
+    };
+    const a = std.testing.allocator;
+    const golden = try std.json.parseFromSlice(Golden, a, @embedFile("testdata/replacement-postgres.json"), .{});
+    defer golden.deinit();
+    try std.testing.expectEqual(@as(u32, 1), golden.value.format);
+    try std.testing.expectEqualStrings("C", golden.value.collation);
+    var execution = Executor.init(a, .{});
+    defer execution.deinit();
+    for (golden.value.entries) |case| {
+        errdefer std.debug.print("PostgreSQL replacement fixture {s}\n", .{case.id});
+        var budget: Budget = .{};
+        var program = try Program.compile(a, case.pattern, case.flags, .{}, &budget);
+        defer program.deinit();
+        var subject = try Subject.init(a, case.input);
+        defer subject.deinit();
+        var replacement = try Replacement.init(a, case.replacement, &budget);
+        defer replacement.deinit();
+        const output = try execution.replaceAlloc(a, &program, subject, &replacement, case.start, case.occurrence, 1024, &budget);
+        defer a.free(output);
+        try std.testing.expectEqualStrings(case.expected, output);
+    }
+}
+
+test "PostgreSQL ARE streaming replacement bounds output and unwinds every allocation fault" {
+    const Faults = struct {
+        fn run(a: A) !void {
+            var budget: Budget = .{};
+            var program = try Program.compile(a, "(a)(b)?", 3, .{}, &budget);
+            defer program.deinit();
+            var subject = try Subject.init(a, "ab雪a😀ab");
+            defer subject.deinit();
+            var replacement = try Replacement.init(a, "<\\2>-\\1-\\&", &budget);
+            defer replacement.deinit();
+            var execution = Executor.init(a, .{});
+            defer execution.deinit();
+            const refused: ?[]u8 = execution.replaceAlloc(a, &program, subject, &replacement, 0, 0, 1, &budget) catch |err| switch (err) {
+                error.SqlExpressionTooLarge => null,
+                else => return err,
+            };
+            if (refused) |unexpected| {
+                a.free(unexpected);
+                return error.ExpectedOutputLimit;
+            }
+            const output = try execution.replaceAlloc(a, &program, subject, &replacement, 0, 0, 1024, &budget);
+            defer a.free(output);
+            try std.testing.expectEqualStrings("<b>-a-ab雪<>-a-a😀<b>-a-ab", output);
+        }
+    };
+    try Faults.run(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Faults.run, .{});
+}
+
+test "PostgreSQL ARE every native compile and match checkpoint unwinds cancellation" {
+    const Check = struct {
+        calls: usize = 0,
+        cancel_at: usize = std.math.maxInt(usize),
+        fn checkpoint(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            const index = self.calls;
+            self.calls += 1;
+            if (index == self.cancel_at) return error.Canceled;
+        }
+    };
+    const a = std.testing.allocator;
+    var observed: Check = .{};
+    var compile_budget: Budget = .{ .checkpoint = Check.checkpoint, .ptr = &observed };
+    var program = try Program.compile(a, "(a|ab|abc)+\\1", 3, .{}, &compile_budget);
+    defer program.deinit();
+    const compile_checks = observed.calls;
+    for (0..compile_checks) |index| {
+        var check: Check = .{ .cancel_at = index };
+        var budget: Budget = .{ .checkpoint = Check.checkpoint, .ptr = &check };
+        try std.testing.expectError(error.Canceled, Program.compile(a, "(a|ab|abc)+\\1", 3, .{}, &budget));
+    }
+    var subject = try Subject.init(a, "x abcabc y");
+    defer subject.deinit();
+    var execution = Executor.init(a, .{});
+    defer execution.deinit();
+    var spans: [2]Span = undefined;
+    observed.calls = 0;
+    var match_budget: Budget = .{ .checkpoint = Check.checkpoint, .ptr = &observed };
+    try std.testing.expect(try execution.find(&program, subject, 0, &spans, &match_budget));
+    const match_checks = observed.calls;
+    for (0..match_checks) |index| {
+        var check: Check = .{ .cancel_at = index };
+        var budget: Budget = .{ .checkpoint = Check.checkpoint, .ptr = &check };
+        try std.testing.expectError(error.Canceled, execution.find(&program, subject, 0, &spans, &budget));
+        for (spans) |span| try std.testing.expectEqual(Span{}, span);
+    }
+    var retry: Budget = .{};
+    try std.testing.expect(try execution.find(&program, subject, 0, &spans, &retry));
+    try std.testing.expectEqualStrings("abcabc", (try subject.slice(spans[0])).?);
+    var replacement = try Replacement.init(a, "<\\&>", &retry);
+    defer replacement.deinit();
+    observed.calls = 0;
+    var replacement_budget: Budget = .{ .checkpoint = Check.checkpoint, .ptr = &observed };
+    const output = try execution.replaceAlloc(a, &program, subject, &replacement, 0, 0, 1024, &replacement_budget);
+    defer a.free(output);
+    try std.testing.expectEqualStrings("x <abcabc> y", output);
+    const replacement_checks = observed.calls;
+    for (0..replacement_checks) |index| {
+        var check: Check = .{ .cancel_at = index };
+        var budget: Budget = .{ .checkpoint = Check.checkpoint, .ptr = &check };
+        try std.testing.expectError(error.Canceled, execution.replaceAlloc(a, &program, subject, &replacement, 0, 0, 1024, &budget));
     }
 }
 

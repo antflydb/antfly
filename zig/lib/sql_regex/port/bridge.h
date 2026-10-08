@@ -9,6 +9,7 @@ struct antfly_regex_context {
     void *(*resize)(void *, void *, size_t);
     void (*release)(void *, void *);
     int (*poll)(void *);
+    int (*work)(void *, size_t);
     uintptr_t stack_base;
     size_t stack_limit;
     void *classes[14];

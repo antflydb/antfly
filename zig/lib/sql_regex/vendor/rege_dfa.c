@@ -572,6 +572,7 @@ dfa_backref(struct vars *v,
 	while (numreps < maxreps)
 	{
 		INTERRUPT(v->re); /* Antfly: bound repeated backreference probes. */
+		REGEX_WORK(brlen);
 		if ((*v->g->compare) (brstring, p, brlen) != 0)
 			break;
 		p += brlen;
@@ -752,6 +753,7 @@ initialize(struct vars *v,
 	int			i;
 
 	/* is previous one still there? */
+	REGEX_WORK((size_t)d->wordsper * 2 + d->nssused);
 	if (d->nssused > 0 && (d->ssets[0].flags & STARTER))
 		ss = &d->ssets[0];
 	else
@@ -822,6 +824,7 @@ miss(struct vars *v,
 	 * unduly expensive.  As a compromise, check during cache misses.
 	 */
 	INTERRUPT(v->re);
+	REGEX_WORK((size_t)d->wordsper * 3 + d->nstates);
 
 	/*
 	 * What set of states would we end up in after consuming the co character?
@@ -837,6 +840,8 @@ miss(struct vars *v,
 	for (i = 0; i < d->nstates; i++)
 		if (ISBSET(css->states, i))
 			for (ca = cnfa->states[i]; ca->co != COLORLESS; ca++)
+			{
+				REGEX_WORK(1);
 				if (ca->co == co ||
 					(ca->co == RAINBOW && !ispseudocolor))
 				{
@@ -848,6 +853,7 @@ miss(struct vars *v,
 						noprogress = 0;
 					FDEBUG(("%d -> %d\n", i, ca->to));
 				}
+			}
 	if (!gotstate)
 		return NULL;			/* character cannot reach any new state */
 	dolacons = (cnfa->flags & HASLACONS);
@@ -855,11 +861,13 @@ miss(struct vars *v,
 	/* outer loop handles transitive closure of reachable-by-LACON states */
 	while (dolacons)
 	{
+		REGEX_WORK(d->nstates);
 		dolacons = 0;
 		for (i = 0; i < d->nstates; i++)
 			if (ISBSET(d->work, i))
 				for (ca = cnfa->states[i]; ca->co != COLORLESS; ca++)
 				{
+					REGEX_WORK(1);
 					if (ca->co < cnfa->ncolors)
 						continue;	/* not a LACON arc */
 					if (ISBSET(d->work, ca->to))
@@ -886,11 +894,16 @@ miss(struct vars *v,
 
 	/* Is this stateset already in the cache? */
 	for (p = d->ssets, i = d->nssused; i > 0; p++, i--)
+	{
+		REGEX_WORK(1);
+		if (p->hash == h && d->wordsper > 1)
+			REGEX_WORK((size_t)d->wordsper * sizeof(unsigned));
 		if (HIT(h, d->work, p, d->wordsper))
 		{
 			FDEBUG(("cached c%d\n", (int) (p - d->ssets)));
 			break;				/* NOTE BREAK OUT */
 		}
+	}
 	if (i == 0)
 	{							/* nope, need a new cache entry */
 		p = getvacant(v, d, cp, start);
@@ -1006,6 +1019,7 @@ getvacant(struct vars *v,
 	ap = ss->ins;
 	while ((p = ap.ss) != NULL)
 	{
+		REGEX_WORK(1);
 		co = ap.co;
 		FDEBUG(("zapping c%d's %ld outarc\n", (int) (p - d->ssets), (long) co));
 		p->outs[co] = NULL;
@@ -1015,6 +1029,7 @@ getvacant(struct vars *v,
 	ss->ins.ss = NULL;
 
 	/* take it off the inarc chains of the ssets reached by its outarcs */
+	REGEX_WORK(d->ncolors);
 	for (i = 0; i < d->ncolors; i++)
 	{
 		p = ss->outs[i];
@@ -1032,7 +1047,10 @@ getvacant(struct vars *v,
 			for (ap = p->ins; ap.ss != NULL &&
 				 !(ap.ss == ss && ap.co == i);
 				 ap = ap.ss->inchain[ap.co])
+			{
+				REGEX_WORK(1);
 				lastap = ap;
+			}
 			assert(ap.ss != NULL);
 			lastap.ss->inchain[lastap.co] = ss->inchain[i];
 		}
@@ -1070,6 +1088,7 @@ pickss(struct vars *v,
 	/* shortcut for cases where cache isn't full */
 	if (d->nssused < d->nssets)
 	{
+		REGEX_WORK(d->ncolors);
 		i = d->nssused;
 		d->nssused++;
 		ss = &d->ssets[i];
@@ -1090,6 +1109,7 @@ pickss(struct vars *v,
 	}
 
 	/* look for oldest, or old enough anyway */
+	REGEX_WORK(d->nssets);
 	if (cp - start > d->nssets * 2 / 3) /* oldest 33% are expendable */
 		ancient = cp - d->nssets * 2 / 3;
 	else
