@@ -155,6 +155,43 @@ pub const Borrowed = extern struct {
     }
 };
 
+/// Invocation-owned fanout under one retained execution. Demand includes the
+/// coordinator plus every concurrently running child. The allocator must be a
+/// thread-safe, bounded owner which remains alive through all joined children.
+/// This is local trusted state, never a serialized or independently owned root.
+pub const Team = struct {
+    borrow: Borrowed,
+    maximum_slots: usize,
+    allocator: std.mem.Allocator,
+    state: enum { fresh, active, joined } = .fresh,
+
+    pub fn reserve(self: *Team, child_tasks: usize) !void {
+        // A proven aborted attempt may retry after all its children joined.
+        // The same parent fences and retained reservation still govern it.
+        if (self.state == .active) return error.InvalidRunnableTransition;
+        try self.borrow.validate();
+        if (self.maximum_slots == 0 or self.borrow.cpu_slots > self.maximum_slots) return error.InvalidRunnableDemand;
+        // Never shrink the caller's existing grant during admission. Accepted
+        // work retains its admitted team until the execution's owning finish.
+        const slots = @max(self.borrow.cpu_slots, @min(self.maximum_slots, child_tasks +| 1));
+        try self.borrow.resizeTeam(slots);
+        self.state = .active;
+    }
+
+    pub fn childCapacity(self: *const Team) usize {
+        std.debug.assert(self.state == .active);
+        return self.borrow.cpu_slots - 1;
+    }
+
+    /// Every child must already be joined. Do not reacquire CPU under the
+    /// expired foreground fence or discard an accepted completion obligation.
+    /// The owning Execution retains the team grant until its actual finish.
+    pub fn finish(self: *Team) void {
+        std.debug.assert(self.state == .active);
+        self.state = .joined;
+    }
+};
+
 /// Transfer the existing operation to a synchronous child phase, then return
 /// it through the parent's resumption callback. Failure stops the operation;
 /// its owning caller still retires it. No fresh admission or deadline is made.

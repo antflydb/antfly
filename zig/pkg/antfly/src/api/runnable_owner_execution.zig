@@ -539,3 +539,69 @@ test "runnable execution checked team resize cannot expand protected cleanup" {
     try std.testing.expectEqual(@as(usize, 1), owner.owner.scheduler.stats().runnable_slots);
     try std.testing.expectEqual(retained, owner.owner.scheduler.stats().retained_bytes);
 }
+
+test "runnable execution fanout team reserves coordinator and children without a new root" {
+    var owner: State = .{ .owner_alloc = std.testing.allocator, .owner = try runnable.NodeOwner.init(.{ .slots = 5, .max_operations = 8 }), .native_now_ns = TestClock.now };
+    defer owner.owner.tryDeinit() catch @panic("owner leaked");
+    const port = owner.port();
+    const io = std.testing.io;
+    const borrow = runtime.native_abi.IoBorrow.init(&io);
+    var handle: ?*anyopaque = null;
+    try std.testing.expect(port.start(port.context, &.{ .io = &borrow, .class = @backingInt(abi.Class.write), .retained_bytes = 61, .out_handle = &handle }).isOk());
+    defer if (handle) |active| port.finish(active);
+    const retained = owner.owner.scheduler.stats().retained_bytes;
+    var team: abi.Team = .{ .borrow = try abi.Borrowed.fromOwner(port, handle.?, 1, .write), .maximum_slots = 4, .allocator = std.testing.allocator };
+    try team.reserve(8);
+    try std.testing.expectEqual(@as(usize, 3), team.childCapacity());
+    try std.testing.expectEqual(@as(usize, 4), owner.owner.scheduler.stats().runnable_slots);
+    try std.testing.expectEqual(@as(usize, 1), owner.owner.scheduler.stats().operations);
+    try std.testing.expectEqual(@as(usize, 1), owner.owner.borrowers);
+    try std.testing.expectEqual(retained, owner.owner.scheduler.stats().retained_bytes);
+    const allocation = try team.allocator.alloc(u8, 32);
+    team.allocator.free(allocation);
+    try std.testing.expectError(error.InvalidRunnableTransition, team.reserve(1));
+    var health: ?*anyopaque = null;
+    try std.testing.expect(port.start(port.context, &.{ .io = &borrow, .class = @backingInt(abi.Class.control), .allow_wait = 0, .out_handle = &health }).isOk());
+    port.finish(health.?);
+    owner.owner.close();
+    team.finish();
+    try std.testing.expectError(error.SchedulerClosed, team.reserve(8));
+    // Joining fanout does not abandon an accepted write or attempt fresh
+    // foreground admission after shutdown. Only owning finish reclaims it.
+    try std.testing.expectEqual(@as(usize, 4), owner.owner.scheduler.stats().runnable_slots);
+    try std.testing.expectEqual(retained, owner.owner.scheduler.stats().retained_bytes);
+    port.finish(handle.?);
+    handle = null;
+    try std.testing.expectEqual(@as(usize, 0), owner.owner.scheduler.stats().operations);
+}
+
+test "runnable execution fanout team admission rejects unsupported and excessive demand before activation" {
+    var owner: State = .{ .owner_alloc = std.testing.allocator, .owner = try runnable.NodeOwner.init(.{ .slots = 3 }), .native_now_ns = TestClock.now };
+    defer owner.owner.tryDeinit() catch @panic("owner leaked");
+    const port = owner.port();
+    const io = std.testing.io;
+    const borrow = runtime.native_abi.IoBorrow.init(&io);
+    var handle: ?*anyopaque = null;
+    try std.testing.expect(port.start(port.context, &.{ .io = &borrow, .class = @backingInt(abi.Class.write), .out_handle = &handle }).isOk());
+    defer port.finish(handle.?);
+    const retained = owner.owner.scheduler.stats().retained_bytes;
+    var team: abi.Team = .{ .borrow = try abi.Borrowed.fromOwner(port, handle.?, 1, .write), .maximum_slots = 4, .allocator = std.testing.allocator };
+    try std.testing.expectError(error.InvalidRunnableDemand, team.reserve(3));
+    try std.testing.expectEqual(@TypeOf(team.state).fresh, team.state);
+    try std.testing.expectEqual(@as(usize, 1), team.borrow.cpu_slots);
+    team.borrow.resize_team = null;
+    try std.testing.expectError(error.UnsupportedOperation, team.reserve(1));
+    try std.testing.expectEqual(@TypeOf(team.state).fresh, team.state);
+    try std.testing.expectEqual(@as(usize, 1), owner.owner.scheduler.stats().runnable_slots);
+    try std.testing.expectEqual(retained, owner.owner.scheduler.stats().retained_bytes);
+    team.borrow.resize_team = port.resize_team;
+    team.maximum_slots = 1;
+    try team.reserve(8);
+    try std.testing.expectEqual(@as(usize, 0), team.childCapacity());
+    team.finish();
+    try team.reserve(1);
+    try std.testing.expectEqual(@as(usize, 0), team.childCapacity());
+    try std.testing.expectEqual(@as(usize, 1), owner.owner.scheduler.stats().operations);
+    try std.testing.expectEqual(retained, owner.owner.scheduler.stats().retained_bytes);
+    team.finish();
+}

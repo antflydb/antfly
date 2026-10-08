@@ -374,3 +374,15 @@ worker gates pass; see
 The two production inference call-site updates remain supplemental pending full
 archive qualification. SQL fenced adapters and actual transaction/numerical
 children still require integration; accepted completion authority is separate.
+
+
+Invocation-owned Team now reserves coordinator/child CPU on one existing checked
+capsule, provides an owned child allocator, and retains its grant through joined
+completion. Joined attempts may reuse the same original fences; active reuse
+and post-shutdown reservation are rejected. Native and pinned Nix/glibc owner
+gates pass; see
+[participant execution team receipts](receipts/2026-10-07/participant-execution-team/README.md).
+The coordinator fanout/allocator proposal is supplemental: syntax checks pass,
+but coordinator type checking and runtime gates remain pending. Team forwarding
+from request ingress/table-write contracts is not yet wired. Accepted completion
+I/O parking and whole-node/default qualification remain required.
