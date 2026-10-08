@@ -399,3 +399,14 @@ serial bound storage, provisioned/hosted storage and coordinator forwarding are
 supplemental pending full archive and transaction qualification. Protected COMMIT
 keeps its single control slot. Accepted completion parking and default/whole-node
 proof remain outstanding.
+
+
+The SQL write capability factory now enforces ordinary/control root identity
+and prevents any control borrower widening beyond one slot. Its wait/checkpoint
+hooks remain unavailable until accepted completion authority exists. Four real
+scheduler/bounded allocator regressions pass on native and pinned Nix/glibc; see
+[SQL write team receipts](receipts/2026-10-08/sql-write-team/README.md).
+SQL HTTP/pgwire call sites remain supplemental. The proposal narrows team creation
+to mutations/COMMIT and repairs scheduled legacy API constructors which formerly
+had no bounded request owner. The real constructor regression and production
+archive/coordinator gates remain pending. Whole-node/default proof is incomplete.

@@ -1,0 +1,14 @@
+{
+  "exit_code": 0,
+  "tool_session_id": 88250,
+  "tests_passed": 4,
+  "source_sha256": {
+    "zig/pkg/antfly/src/api/runnable_write_team.zig": "9f81139c5b8f09d6b423e7c523bd2a4496cc3a95fe4442f32da275b3fbaa0802",
+    "zig/pkg/antfly/src/api/runnable_write_team_test_root.zig": "b3765dc53102a3d11f78b3bde7142900702128542848e2a616b8f41660c4d168",
+    "zig/pkg/antfly-embedded/src/common/runnable_scheduler.zig": "35f5f7df8155af6276d1097dabae77482e1e0c2214ced266cf1e08e9ed43b306",
+    "zig/pkg/antfly-embedded/src/common/bounded_admission.zig": "de3752df68796efa72f122cc02ca56b030b367bacfc21fa314b853c21bbaa732",
+    "zig/pkg/antfly/src/common/allocation_budget.zig": "5beaeb140e3efaadb11284a6b99903383e22e737d0fb391e02031c8ff3bd95e0",
+    "zig/lib/runtime/src/runtime_runnable_abi.zig": "dfb687000c090fcc75f563b5c97ce4d69c4c0b343054338ebf63291f4b177049"
+  },
+  "scope": "Actual SQL write team capability on real retained scheduler executions and Shared bounded allocator; not SQL ingress or constructor runtime proof"
+}

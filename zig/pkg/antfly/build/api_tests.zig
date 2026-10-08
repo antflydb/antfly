@@ -93,6 +93,27 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .target = target,
         .optimize = optimize,
     }));
+    const sql_write_team_root = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/api/runnable_write_team_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    sql_write_team_root.addImport("antfly_runtime_abi", antfly_imports.runtime_abi);
+    sql_write_team_root.addImport("antfly_local_sources", inference_owner_sources);
+    sql_write_team_root.addImport("antfly_request_allocation_budget", b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/common/allocation_budget.zig"),
+        .target = target,
+        .optimize = optimize,
+    }));
+    const sql_write_team_tests = b.addTest(.{
+        .name = "sql-write-team-tests",
+        .root_module = sql_write_team_root,
+        .filters = &.{ "SQL write team", "SQL protected commit team" },
+        .max_rss = 2 * 1024 * 1024 * 1024,
+    });
+    b.step("antfly-sql-write-team-test", "Run retained SQL write and protected commit CPU team contracts")
+        .dependOn(&b.addRunArtifact(sql_write_team_tests).step);
     const inference_owner_admission = b.createModule(.{
         .root_source_file = b.path("pkg/inference/src/server/runnable_execution.zig"),
         .target = target,
