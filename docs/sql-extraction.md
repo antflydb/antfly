@@ -5769,3 +5769,31 @@ Validation passes 184 native relational-index tests, one server integration test
 or leaks. Inventory integrity remains 929 unresolved. Public modifier activation
 is still guarded: normalized postimages, defaults/generated evaluation order,
 array assignment, public annotation, and schema-VM casts remain to be completed.
+
+### NUMERIC array assignment before canonical row encoding and hashing
+
+Array preparation now shares parsing and modifier coercion under one work budget
+and a bounded unpublished owner. It does not alter the caller's envelope on success
+or failure. Dimensions, signed lower bounds and SQL NULL flags remain authoritative;
+each non-NULL value is rounded and precision-checked before canonical row encoding.
+Logical JSON hashing uses the same constrained array boundary as prepared row hashes.
+No physical binary is interpreted as JSON or silently repaired during strict restore.
+
+All 20 PostgreSQL modifier expectations also run through multidimensional arrays
+with NULL elements and signed bounds. Tests cover exact work exhaustion, memory
+admission, every allocation failure, overflow after rounding, strict native row
+validation and canonical reconstruction/re-encoding. The independent PostgreSQL 18
+oracle reverified all 893 exact NUMERIC contracts. These component tests are not
+end-to-end performance measurements or public durable modifier activation.
+
+The remaining activation work is unchanged apart from array assignment: normalized
+postimages, target-domain coercion before dependent defaults/generated expressions,
+public schema/DDL annotation, modifier-bearing schema-VM instructions, and integrated
+restore/reopen publication coverage must land before removing publication guards.
+No original parity case dispositions were changed.
+
+Final validation passes 600 local SQL tests (three existing skips), 226 server SQL
+tests, 185 native relational-index tests and their server integration owner without
+failures or leaks. The focused native array regression and six API schema-cache tests
+also pass. Inventory integrity, control-catalog consistency, formatting and whitespace
+checks remain green.

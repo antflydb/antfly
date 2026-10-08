@@ -188,7 +188,7 @@ pub fn decodeLeaky(a: A, kind: arrays.ElementType, input: Json, options: Options
 
 /// Reports validation and materialization work for a shared invocation budget.
 pub fn decodeLeakyMeasured(a: A, kind: arrays.ElementType, input: Json, options: Options) !Decoded {
-    return decodeCells(true, a, kind, input, options);
+    return decodeCells(true, a, kind, input, null, options);
 }
 
 /// The cell/axis buffers are owned; text and JSONB payloads borrow the pinned
@@ -210,11 +210,21 @@ pub const Borrowed = struct {
 };
 
 pub fn decodeBorrowed(a: A, kind: arrays.ElementType, input: Json, options: Options) !Borrowed {
+    return decodeBorrowedWithModifier(a, kind, input, null, options);
+}
+
+/// Prepare assignment values without modifying the caller's parsed envelope.
+/// NUMERIC limbs and modifiers share one bounded, unpublished owner.
+pub fn decodeBorrowedWithModifier(a: A, kind: arrays.ElementType, input: Json, modifier: ?@import("numeric_value.zig").TypeModifier, options: Options) !Borrowed {
+    if (modifier) |constraint| {
+        if (kind != .numeric) return error.SqlTypeMismatch;
+        try constraint.validate();
+    }
     if (kind == .numeric) {
-        const owner = try decode(a, kind, input, options);
+        const owner = try decodeOwned(a, kind, input, modifier, options);
         return .{ .value = owner.value, .allocator = a, .numeric_owner = owner };
     }
-    return .{ .value = (try decodeCells(false, a, kind, input, options)).value, .allocator = a };
+    return .{ .value = (try decodeCells(false, a, kind, input, null, options)).value, .allocator = a };
 }
 
 /// Validate an existing parsed envelope without allocating cell vectors or
@@ -317,7 +327,7 @@ fn inspect(kind: arrays.ElementType, input: Json, options: Options) !Inspection 
     };
 }
 
-fn decodeCells(comptime own_payloads: bool, a: A, kind: arrays.ElementType, input: Json, options: Options) !Decoded {
+fn decodeCells(comptime own_payloads: bool, a: A, kind: arrays.ElementType, input: Json, modifier: ?@import("numeric_value.zig").TypeModifier, options: Options) !Decoded {
     const inspected = try inspect(kind, input, options);
     const cells = try a.alloc(arrays.Element, inspected.values.len);
     errdefer if (!own_payloads) a.free(cells);
@@ -325,7 +335,7 @@ fn decodeCells(comptime own_payloads: bool, a: A, kind: arrays.ElementType, inpu
     for (inspected.values, inspected.nulls, cells) |raw, flag, *cell| {
         if (kind == .numeric) {
             if (!own_payloads) return error.UnsupportedSqlShape;
-            cell.* = if (flag.bool) .{} else try @import("scalar.zig").numericTextLeaky(a, raw.string, &work);
+            cell.* = if (flag.bool) .{} else try @import("scalar.zig").numericTextWithModifierLeaky(a, raw.string, modifier, &work);
             continue;
         }
         const decoded = try readElement(kind, raw, flag.bool);
@@ -339,6 +349,10 @@ fn decodeCells(comptime own_payloads: bool, a: A, kind: arrays.ElementType, inpu
 
 /// Stable quota owner, including arena capacity and failure cleanup.
 pub fn decode(backing: A, kind: arrays.ElementType, input: Json, options: Options) !arrays.Owned {
+    return decodeOwned(backing, kind, input, null, options);
+}
+
+fn decodeOwned(backing: A, kind: arrays.ElementType, input: Json, modifier: ?@import("numeric_value.zig").TypeModifier, options: Options) !arrays.Owned {
     const budget = try backing.create(MemoryBudget);
     errdefer backing.destroy(budget);
     budget.* = .{ .backing = backing, .limit = options.values.bytes };
@@ -346,12 +360,93 @@ pub fn decode(backing: A, kind: arrays.ElementType, input: Json, options: Option
     errdefer budget.allocator().destroy(arena);
     arena.* = std.heap.ArenaAllocator.init(budget.allocator());
     errdefer arena.deinit();
-    const value = decodeLeaky(arena.allocator(), kind, input, options) catch |err| return quotaError(budget, err);
-    return .{ .arena = arena, .budget = budget, .value = value };
+    const decoded = decodeCells(true, arena.allocator(), kind, input, modifier, options) catch |err| return quotaError(budget, err);
+    return .{ .arena = arena, .budget = budget, .value = decoded.value };
 }
 
 fn quotaError(budget: *MemoryBudget, err: anyerror) anyerror {
     return if (err == error.OutOfMemory and budget.exhausted) error.SqlProgramLimitExceeded else err;
+}
+
+test "SQL NUMERIC array assignment matches PostgreSQL modifiers preserving bounds and NULLs" {
+    const a = std.testing.allocator;
+    const Entry = struct {
+        op: []const u8,
+        left: []const u8,
+        precision: u16 = 0,
+        scale: i16 = 0,
+        expected: ?Json = null,
+        @"error": ?[]const u8 = null,
+    };
+    const fixture = try std.json.parseFromSlice(struct { entries: []const Entry }, a, @embedFile("fixtures/sql_exact_numeric_reference.json"), .{ .ignore_unknown_fields = true });
+    defer fixture.deinit();
+    var tested: usize = 0;
+    for (fixture.value.entries) |entry| {
+        if (!std.mem.eql(u8, entry.op, "typmod")) continue;
+        tested += 1;
+        const modifier: @import("numeric_value.zig").TypeModifier = .{ .precision = entry.precision, .scale = entry.scale };
+        const json = try std.json.Stringify.valueAlloc(a, .{
+            .dimensions = .{ .{ .length = 2, .lower_bound = -3 }, .{ .length = 2, .lower_bound = 7 } },
+            .values = .{ entry.left, null, entry.left, null },
+            .sql_nulls = .{ false, true, false, true },
+        }, .{});
+        defer a.free(json);
+        const input = try std.json.parseFromSlice(Json, a, json, .{});
+        defer input.deinit();
+        if (entry.@"error") |code| {
+            try std.testing.expectError(if (std.mem.eql(u8, code, "22023")) error.SqlInvalidParameterValue else error.InvalidSqlNumber, decodeBorrowedWithModifier(a, .numeric, input.value, modifier, .{}));
+            continue;
+        }
+        var prepared = try decodeBorrowedWithModifier(a, .numeric, input.value, modifier, .{});
+        defer prepared.deinit();
+        try std.testing.expectEqual(@as(i32, -3), prepared.value.dimensions[0].lower);
+        try std.testing.expectEqual(@as(i32, 7), prepared.value.dimensions[1].lower);
+        const bytes = try @import("array_storage.zig").encodeAlloc(a, prepared.value, .{});
+        defer a.free(bytes);
+        const view = try @import("array_storage.zig").validateCanonical(a, .numeric, bytes, .{});
+        for (0..4) |i| {
+            const cell = try view.cell(i);
+            try std.testing.expectEqual(i % 2 != 0, cell.sql_null);
+            if (cell.sql_null) continue;
+            var ctx: @import("numeric_value.zig").Context = .{ .alloc = a };
+            _ = try @import("numeric_storage.zig").verifyModifier(&ctx, cell.bytes, modifier);
+            const output = try @import("numeric_storage.zig").jsonValueAlloc(a, cell.bytes);
+            defer a.free(if (output == .number_string) output.number_string else output.string);
+            try std.testing.expectEqualStrings(entry.expected.?.string, if (output == .number_string) output.number_string else output.string);
+        }
+        try std.testing.expectEqualStrings(entry.left, input.value.object.get("values").?.array.items[0].string);
+    }
+    try std.testing.expectEqual(@as(usize, 20), tested);
+}
+
+test "SQL NUMERIC array assignment shares its full work budget and unwinds allocation failures" {
+    const a = std.testing.allocator;
+    const text =
+        \\{"dimensions":[{"length":3,"lower_bound":-7}],"values":["12.345",null,"0.001"],"sql_nulls":[false,true,false]}
+    ;
+    const parsed = try std.json.parseFromSlice(Json, a, text, .{});
+    defer parsed.deinit();
+    const modifier: @import("numeric_value.zig").TypeModifier = .{ .precision = 4, .scale = 2 };
+    const Run = struct {
+        fn run(alloc: A, input: Json) !void {
+            var value = try decodeBorrowedWithModifier(alloc, .numeric, input, .{ .precision = 4, .scale = 2 }, .{});
+            defer value.deinit();
+            try std.testing.expectEqual(@as(usize, 3), value.value.elements.len);
+            try std.testing.expect(value.value.elements[1].sql_null);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Run.run, .{parsed.value});
+    var region = std.heap.ArenaAllocator.init(a);
+    defer region.deinit();
+    const measured = try decodeCells(true, region.allocator(), .numeric, parsed.value, modifier, .{});
+    const unconstrained = try validate(.numeric, parsed.value, .{});
+    try std.testing.expect(measured.work > unconstrained.work);
+    var exact = try decodeBorrowedWithModifier(a, .numeric, parsed.value, modifier, .{ .values = .{ .work = measured.work } });
+    defer exact.deinit();
+    try std.testing.expectError(error.SqlProgramLimitExceeded, decodeBorrowedWithModifier(a, .numeric, parsed.value, modifier, .{ .values = .{ .work = measured.work - 1 } }));
+    try std.testing.expectError(error.SqlProgramLimitExceeded, decodeBorrowedWithModifier(a, .numeric, parsed.value, modifier, .{ .values = .{ .bytes = 1 } }));
+    try std.testing.expectError(error.SqlTypeMismatch, decodeBorrowedWithModifier(a, .int64, parsed.value, modifier, .{}));
+    try std.testing.expectEqualStrings("12.345", parsed.value.object.get("values").?.array.items[0].string);
 }
 
 test "SQL borrowed array envelopes preserve pinned payloads and unwind both flat allocations" {

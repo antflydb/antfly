@@ -622,7 +622,7 @@ fn hashRelationalColumnValue(
     switch (column.column_type) {
         .sql_array => {
             const kind = column.sql_element_type orelse return error.InvalidBatchRequest;
-            var decoded = try @import("../../sql/array_wire.zig").decodeBorrowed(alloc, kind, value, .{});
+            var decoded = try @import("../../sql/array_wire.zig").decodeBorrowedWithModifier(alloc, kind, value, column.numeric_modifier, .{});
             defer decoded.deinit();
             const bytes = try @import("../../sql/array_storage.zig").encodeAlloc(alloc, decoded.value, .{});
             defer alloc.free(bytes);

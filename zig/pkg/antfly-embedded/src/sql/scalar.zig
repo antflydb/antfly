@@ -58,11 +58,25 @@ pub const Datum = struct {
 /// Leaky constructors retain limbs and their stable view in the caller's
 /// region. Frames/operators own that region; no input bytes remain borrowed.
 pub fn numericTextLeaky(a: Allocator, text: []const u8, work: *arrays.Budget) !Datum {
+    return numericTextWithModifierLeaky(a, text, null, work);
+}
+
+/// Assignment and parsing consume the same caller-owned invocation budget.
+/// The caller discards its bounded region on failure, including owned limbs.
+pub fn numericTextWithModifierLeaky(a: Allocator, text: []const u8, modifier: ?@import("numeric_value.zig").TypeModifier, work: *arrays.Budget) !Datum {
     const exact = @import("numeric_value.zig");
     var ctx: exact.Context = .{ .alloc = a, .remaining = work.remaining };
     defer work.remaining = @intCast(ctx.remaining);
     var parsed = try exact.parse(&ctx, text);
     errdefer parsed.deinit();
+    if (modifier) |constraint| {
+        var constrained = try exact.applyTypeModifier(&ctx, parsed.value, constraint);
+        errdefer constrained.deinit();
+        const value = try a.create(exact.Value);
+        value.* = constrained.value;
+        parsed.deinit();
+        return Datum.typedNumeric(value);
+    }
     const value = try a.create(exact.Value);
     value.* = parsed.value;
     return Datum.typedNumeric(value);

@@ -4359,7 +4359,7 @@ fn buildRelationalRowValueFromParsedInternal(
 
             const value = if (column.column_type == .sql_array) blk: {
                 const kind = column.sql_element_type orelse return error.InvalidBatchRequest;
-                var decoded = try @import("../../sql/array_wire.zig").decodeBorrowed(output_alloc, kind, found, .{});
+                var decoded = try @import("../../sql/array_wire.zig").decodeBorrowedWithModifier(output_alloc, kind, found, column.numeric_modifier, .{});
                 defer decoded.deinit();
                 const encoded = try @import("../../sql/array_storage.zig").encodeAlloc(output_alloc, decoded.value, .{});
                 errdefer output_alloc.free(encoded);
@@ -6651,6 +6651,51 @@ test "relational index system NUMERIC modifiers round before row hash and strict
     try Run.run(a, table, &layout);
     try std.testing.checkAllAllocationFailures(a, Run.run, .{ table, &layout });
     try std.testing.expectError(error.InvalidSqlNumber, PreparedRelationalWrite.init(a, "row", "{\"n\":99.995}", null, table, &layout));
+}
+
+test "relational index system NUMERIC array modifiers round before hashing and strict restore" {
+    const a = std.testing.allocator;
+    const table: runtime_schema.TableSchema = .{
+        .version = 1,
+        .storage_mode = .relational,
+        .requires_public_schema = true,
+        .requires_numeric_modifiers = true,
+        .relational_columns = &.{.{ .name = "a", .path = "a", .column_type = .sql_array, .sql_element_type = .numeric, .numeric_modifier = .{ .precision = 4, .scale = 2 } }},
+    };
+    var layout = try relational_row_codec.PhysicalLayout.init(a, table);
+    defer layout.deinit();
+    const json =
+        \\{"a":{"dimensions":[{"length":3,"lower_bound":-7}],"values":["12.345",null,"0.001"],"sql_nulls":[false,true,false]}}
+    ;
+    const Run = struct {
+        fn run(alloc: Allocator, schema: runtime_schema.TableSchema, physical: *const relational_row_codec.PhysicalLayout, input: []const u8) !void {
+            var row = try PreparedRelationalWrite.init(alloc, "row", input, null, schema, physical);
+            defer row.deinit(alloc);
+            try row.finalizeMetadata(0);
+            try relational_row_codec.validateOrdinalWithLayout(row.packed_row, schema, physical);
+            const digest = try document_content_hash.hashRelationalParsedValue(alloc, row.parsedValue(), schema);
+            try std.testing.expectEqualSlices(u8, &row.semantic_hash, &digest);
+            const cell = (try relational_row_codec.findCellByOrdinalWithLayout(row.packed_row, schema, physical, 0)).?;
+            const view = try @import("../../common/sql_array_layout.zig").View.open(.numeric, cell.value.bytes_val, .{});
+            try std.testing.expectEqual(@as(usize, 3), view.count);
+            try std.testing.expect((try view.cell(1)).sql_null);
+            const value = try @import("../../sql/numeric_storage.zig").jsonValueAlloc(alloc, (try view.cell(0)).bytes);
+            defer alloc.free(value.number_string);
+            try std.testing.expectEqualStrings("12.35", value.number_string);
+            const rendered = try relational_row_codec.reconstructDocumentAlloc(alloc, &.{cell});
+            defer alloc.free(rendered);
+            var restored = try PreparedRelationalWrite.init(alloc, "row", rendered, null, schema, physical);
+            defer restored.deinit(alloc);
+            try restored.finalizeMetadata(0);
+            try std.testing.expectEqualSlices(u8, row.packed_row, restored.packed_row);
+        }
+    };
+    try Run.run(a, table, &layout, json);
+    try std.testing.checkAllAllocationFailures(a, Run.run, .{ table, &layout, json });
+    const overflow =
+        \\{"a":{"dimensions":[{"length":2,"lower_bound":-7}],"values":["12.345","99.995"],"sql_nulls":[false,false]}}
+    ;
+    try std.testing.expectError(error.InvalidSqlNumber, PreparedRelationalWrite.init(a, "row", overflow, null, table, &layout));
 }
 
 test "relational index system NUMERIC scalar rows hash logical identity and unwind preparation faults" {
