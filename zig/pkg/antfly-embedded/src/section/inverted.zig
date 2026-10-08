@@ -3183,12 +3183,17 @@ pub const TermPostings = struct {
 
     /// Create a postings iterator that yields (doc_id, freq, norm, positions) tuples.
     pub fn iterator(self: *const TermPostings, alloc: Allocator) !PostingsIterator {
+        return self.iteratorWithScratch(alloc, null);
+    }
+
+    fn iteratorWithScratch(self: *const TermPostings, alloc: Allocator, previous: ?*PostingsIterator) !PostingsIterator {
         if (self.inline_single_doc) {
             var inline_iterator = try PostingsIterator.initInlineSingleDoc(self, alloc);
             if (self.metadata_owner) |owner| {
                 owner.retain(owner.ptr);
                 inline_iterator.metadata_owner = owner;
             }
+            adoptMergeIteratorBuffers(&inline_iterator, previous);
             return inline_iterator;
         }
         var iter = PostingsIterator{
@@ -3216,6 +3221,7 @@ pub const TermPostings = struct {
         };
         if (self.metadata_owner) |owner| owner.retain(owner.ptr);
         errdefer iter.deinit();
+        adoptMergeIteratorBuffers(&iter, previous);
         try iter.decodeImpactChunkIds();
         return iter;
     }
@@ -3226,7 +3232,6 @@ pub const PackedPositionView = struct {
     range: ?@import("../segment_source.zig").View = null,
     read_cache: ?*PackedReadCache = null,
     unpacked: ?[]const u32 = null,
-    legacy: ?struct { result: *const LookupResult, doc: u32 } = null,
     start_index: usize = 0,
     encoded_width: ?u8 = null,
     count: usize,
@@ -3236,12 +3241,6 @@ pub const PackedPositionView = struct {
         if (values.len != self.count) return error.InvalidData;
         if (self.unpacked) |positions| {
             @memcpy(values, positions);
-            return;
-        }
-        if (self.legacy != null) {
-            var decoder = try self.cursorAlloc(allocator);
-            defer decoder.deinit();
-            for (values) |*value| value.* = (try decoder.next()) orelse return error.InvalidData;
             return;
         }
         const start_bit = try std.math.mul(usize, self.start_index, self.bits);
@@ -3268,23 +3267,15 @@ pub const PackedPositionView = struct {
         }
     }
     fn packedBytes(self: PackedPositionView) !PackedByteCursor {
-        if (self.unpacked != null or self.legacy != null) return error.InvalidData;
+        if (self.unpacked != null) return error.InvalidData;
         return .{ .reader = try self.cursor(), .position = try std.math.mul(usize, self.start_index, self.bits), .remaining = try std.math.mul(usize, self.count, self.bits) };
     }
     pub fn cursorAlloc(self: PackedPositionView, allocator: Allocator) !PackedPositionCursor {
-        if (self.legacy) |legacy| {
-            const iterator = try allocator.create(PostingsIterator);
-            errdefer allocator.destroy(iterator);
-            iterator.* = try legacy.result.iterator(allocator);
-            errdefer iterator.deinit();
-            const hit = (try iterator.advanceToWithPositions(legacy.doc)) orelse return error.InvalidData;
-            if (hit.doc_id != legacy.doc or hit.positions.len != self.count) return error.InvalidData;
-            return .{ .data = &.{}, .remaining = self.count, .bits = self.bits, .byte_index = 0, .unpacked = hit.positions, .owned_iterator = iterator, .owned_allocator = allocator };
-        }
+        _ = allocator;
         return self.cursor();
     }
     pub fn cursor(self: PackedPositionView) !PackedPositionCursor {
-        if (self.bits > 32 or self.legacy != null) return error.InvalidData;
+        if (self.bits > 32) return error.InvalidData;
         if (self.unpacked) |values| return .{ .data = &.{}, .remaining = self.count, .bits = self.bits, .byte_index = 0, .unpacked = values };
         const start_bit = std.math.mul(usize, self.start_index, self.bits) catch return error.InvalidData;
         const value_bits = std.math.mul(usize, self.count, self.bits) catch return error.InvalidData;
@@ -3321,16 +3312,11 @@ pub const PackedPositionCursor = struct {
     read_cache: ?*PackedReadCache = null,
     unpacked: ?[]const u32 = null,
     unpacked_index: usize = 0,
-    owned_iterator: ?*PostingsIterator = null,
-    owned_allocator: ?Allocator = null,
     read_buffer: [256]u8 = undefined,
     read_start: usize = 0,
     read_length: usize = 0,
     pub fn deinit(self: *PackedPositionCursor) void {
-        if (self.owned_iterator) |iterator| {
-            iterator.deinit();
-            self.owned_allocator.?.destroy(iterator);
-        }
+        _ = self;
     }
     fn readByte(self: *PackedPositionCursor, offset: usize) !u8 {
         if (self.range) |range| {
@@ -3380,6 +3366,13 @@ const PackedReadCache = struct {
     const Page = struct { source: ?Source = null, start: u64 = 0, length: usize = 0, bytes: [4096]u8 = undefined };
     pages: [4]Page = @splat(.{}),
     next: usize = 0,
+    fn clear(self: *PackedReadCache) void {
+        for (&self.pages) |*page| {
+            page.source = null;
+            page.length = 0;
+        }
+        self.next = 0;
+    }
     fn same(a: Source, b: Source) bool {
         if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
         return switch (a) {
@@ -3423,12 +3416,24 @@ const PackedReadCache = struct {
     }
 };
 
-fn exactPositionWidth(view: PackedPositionView, allocator: Allocator) !u8 {
+fn decodedPositionWidth(positions: []const u32) u8 {
     var maximum: u32 = 0;
-    if (view.bits <= 1 and view.legacy == null and view.unpacked == null) {
+    var previous: u32 = 0;
+    for (positions) |position| {
+        maximum |= position -% previous;
+        previous = position;
+    }
+    return @intCast(32 - @clz(maximum));
+}
+
+fn exactPositionWidth(view: PackedPositionView, allocator: Allocator) !u8 {
+    if (view.encoded_width) |width| return width;
+    if (view.unpacked) |positions| return decodedPositionWidth(positions);
+    var maximum: u32 = 0;
+    if (view.bits <= 1 and view.unpacked == null) {
         var bytes = try view.packedBytes();
-        while (try bytes.next()) |part| maximum |= part.value;
-        return if (maximum == 0) 0 else 1;
+        while (try bytes.next()) |part| if (part.value != 0) return 1;
+        return 0;
     }
     var cursor = try view.cursorAlloc(allocator);
     defer cursor.deinit();
@@ -3436,6 +3441,10 @@ fn exactPositionWidth(view: PackedPositionView, allocator: Allocator) !u8 {
     while (try cursor.next()) |position| {
         maximum |= position -% previous;
         previous = position;
+        // A delta using the declared top bit proves the exact width. Most
+        // canonical records need only a prefix, while over-wide records still
+        // get the full scan needed to preserve minimum-width encoding.
+        if (view.unpacked == null and view.bits != 0 and maximum >> @intCast(view.bits - 1) != 0) return view.bits;
     }
     return @intCast(32 - @clz(maximum));
 }
@@ -3468,10 +3477,22 @@ fn positionBits(positions: []const u32) u8 {
     }
     return @intCast(32 - @clz(maximum));
 }
-fn nextPackedHit(iterator: *PostingsIterator, result: *const LookupResult, cache: *PackedReadCache) !?PackedHit {
-    if (iterator.is_one_hit or !usesContiguousPositionGroups(iterator.version) or (iterator.positions_range == null and iterator.positions_data == null)) {
-        const decoded = (try iterator.next()) orelse return null;
-        return .{ .hit = decoded, .positions = .{ .legacy = if (decoded.positions.len == 0) null else .{ .result = result, .doc = decoded.doc_id }, .count = decoded.positions.len, .bits = positionBits(decoded.positions) } };
+// Views borrow immutable source bytes, never the iterator's reusable decode
+// buffer. Legacy records can therefore survive advancement without seeking
+// from the start or materializing an entire position list.
+fn nextPackedHit(iterator: *PostingsIterator, cache: ?*PackedReadCache) !?PackedHit {
+    if (iterator.is_one_hit) {
+        const hit = (try iterator.takeOneHit(false)) orelse return null;
+        const view = PackedPositionView{
+            .data = iterator.one_hit_positions_data,
+            .count = if (iterator.one_hit_has_locs) iterator.one_hit_freq else 0,
+            .bits = iterator.one_hit_position_bits,
+        };
+        return try packedHitWithSmallDecode(iterator, hit, view);
+    }
+    if (iterator.positionLength() == null) {
+        const hit = (try iterator.next()) orelse return null;
+        return .{ .hit = hit, .positions = .{ .count = 0, .bits = 0 } };
     }
     if (iterator.current_chunk_index == std.math.maxInt(usize) or iterator.chunk_doc_pos >= iterator.doc_values.items.len) {
         if (iterator.next_chunk_index >= iterator.chunkCount()) return null;
@@ -3482,23 +3503,65 @@ fn nextPackedHit(iterator: *PostingsIterator, result: *const LookupResult, cache
     const doc_pos = iterator.chunk_doc_pos;
     const doc_id = iterator.doc_values.items[doc_pos];
     const decoded = decodeFreqHasLocs(iterator.freq_values.items[doc_pos]);
-    const count: usize = if (decoded.has_locs) @intCast(decoded.freq) else 0;
-    const bits = try iterator.ensurePositionGroup(doc_pos);
+    var count: usize = if (decoded.has_locs) @intCast(decoded.freq) else 0;
+    const contiguous = usesContiguousPositionGroups(iterator.version);
+    var bits: u8 = 0;
+    if (usesGroupedPositions(iterator.version)) {
+        bits = try iterator.ensurePositionGroup(doc_pos);
+    } else {
+        if (iterator.version < wire_version_chunk_framed_positions) count = try iterator.positionVarint(&iterator.positions_cursor);
+        if (count != 0) {
+            bits = try iterator.positionByte(iterator.positions_cursor);
+            iterator.positions_cursor += 1;
+        }
+    }
+    if (bits > 32) return error.InvalidData;
+    const end = if (iterator.version >= wire_version_chunk_framed_positions) iterator.positions_chunk_end else iterator.positionLength().?;
+    const start = if (contiguous) iterator.positions_group_data_start else iterator.positions_cursor;
+    if (start > end) return error.InvalidData;
+    const length = if (contiguous) end - start else (try std.math.add(usize, try std.math.mul(usize, count, bits), 7)) / 8;
+    if (start > end or length > end - start) return error.InvalidData;
     const view = PackedPositionView{
-        .data = if (iterator.positions_data) |data| data[iterator.positions_group_data_start..iterator.positions_chunk_end] else &.{},
-        .range = if (iterator.positions_range) |range| try @import("../segment_source.zig").View.init(range.source, range.offset + iterator.positions_group_data_start, iterator.positions_chunk_end - iterator.positions_group_data_start) else null,
-        .start_index = iterator.positions_group_value_offset,
+        .data = if (iterator.positions_data) |data| data[start..][0..length] else &.{},
+        .range = if (iterator.positions_range) |range| try @import("../segment_source.zig").View.init(range.source, range.offset + start, length) else null,
+        .start_index = if (contiguous) iterator.positions_group_value_offset else 0,
         .count = count,
         .bits = bits,
         .read_cache = cache,
     };
-    if (count <= 32) return .{ .hit = try iterator.takeCurrentWithPositions(), .positions = view };
+    if (contiguous and count <= 32) {
+        const hit = try iterator.takeCurrentWithPositions();
+        var sized_view = view;
+        sized_view.encoded_width = decodedPositionWidth(hit.positions);
+        return .{ .hit = hit, .positions = sized_view };
+    }
     const norm = try iterator.readNorm(doc_id);
-    try iterator.advanceContiguousPositionRecord(doc_pos, count);
+    if (contiguous) try iterator.advanceContiguousPositionRecord(doc_pos, count) else iterator.positions_cursor += length;
     iterator.chunk_doc_pos += 1;
     iterator.position_records_decoded +|= 1;
     iterator.noteReturnedDoc(doc_id);
-    return .{ .hit = .{ .doc_id = doc_id, .freq = @intCast(decoded.freq), .norm = norm }, .positions = view };
+    return try packedHitWithSmallDecode(iterator, .{ .doc_id = doc_id, .freq = @intCast(decoded.freq), .norm = norm }, view);
+}
+
+fn packedHitWithSmallDecode(iterator: *PostingsIterator, hit: PostingsIterator.Hit, view: PackedPositionView) !PackedHit {
+    if (view.count > 32) return .{ .hit = hit, .positions = view };
+    if (iterator.positions_range != null and view.count > iterator.max_position_record_bytes / 4) return error.SegmentReadBudgetExceeded;
+    if (iterator.positions_range != null) try iterator.positions_buf.ensureTotalCapacityPrecise(iterator.alloc, view.count) else try iterator.positions_buf.ensureTotalCapacity(iterator.alloc, view.count);
+    iterator.positions_buf.items.len = view.count;
+    // A cursor needs no allocator or source-sized temporary buffer.
+    var cursor = try view.cursor();
+    var maximum_delta: u32 = 0;
+    var previous: u32 = 0;
+    for (iterator.positions_buf.items) |*position| {
+        position.* = (try cursor.next()) orelse return error.InvalidData;
+        maximum_delta |= position.* -% previous;
+        previous = position.*;
+    }
+    var decoded = hit;
+    decoded.positions = iterator.positions_buf.items;
+    var sized_view = view;
+    sized_view.encoded_width = @intCast(32 - @clz(maximum_delta));
+    return .{ .hit = decoded, .positions = sized_view };
 }
 
 fn PositionByteWriter(comptime Sink: type) type {
@@ -3633,7 +3696,7 @@ fn appendPackedPositionsToSink(allocator: Allocator, sink: anytype, views: []con
         try output.byte(bits);
         for (group) |view| {
             if (bits == 0) continue;
-            if (view.bits == bits and view.legacy == null and view.unpacked == null) {
+            if (view.bits == bits and view.unpacked == null) {
                 try output.appendPacked(view);
             } else {
                 var cursor = try view.cursorAlloc(allocator);
@@ -4966,18 +5029,15 @@ pub const PostingsIterator = struct {
 
     pub fn deinit(self: *PostingsIterator) void {
         defer if (self.metadata_owner) |owner| owner.release(owner.ptr);
-        if (self.is_one_hit) {
-            if (self.one_hit_owns_scratch) self.positions_buf.deinit(self.alloc);
-        } else {
-            self.position_read_buffer.deinit(self.alloc);
-            self.payload_buffer.deinit(self.alloc);
-            self.doc_values.deinit(self.alloc);
-            self.freq_values.deinit(self.alloc);
-            self.chunk_metas.deinit(self.alloc);
-            self.chunk_meta_values.deinit(self.alloc);
-            self.impact_chunk_ids.deinit(self.alloc);
-            self.positions_buf.deinit(self.alloc);
-        }
+        if (self.is_one_hit and !self.one_hit_owns_scratch) return;
+        self.position_read_buffer.deinit(self.alloc);
+        self.payload_buffer.deinit(self.alloc);
+        self.doc_values.deinit(self.alloc);
+        self.freq_values.deinit(self.alloc);
+        self.chunk_metas.deinit(self.alloc);
+        self.chunk_meta_values.deinit(self.alloc);
+        self.impact_chunk_ids.deinit(self.alloc);
+        self.positions_buf.deinit(self.alloc);
     }
 };
 
@@ -5810,15 +5870,15 @@ fn writeMappedInvertedSection(
     var header_placeholder: [v7_header_size]u8 = undefined;
     @memset(&header_placeholder, 0);
     try sink.appendSlice(&header_placeholder);
-    var term_postings = std.ArrayListUnmanaged(u8).empty;
-    defer term_postings.deinit(alloc);
+    var workspace = PostingMergeWorkspace{};
+    defer workspace.deinit(alloc);
+    const term_postings = &workspace.term_postings;
 
     var total_field_len: u64 = 0;
     const merged_norms = if (stream_norms) StreamedNorms{ .len = merged_doc_count } else try alloc.alloc(u32, merged_doc_count);
     defer if (!stream_norms) alloc.free(merged_norms);
     if (!stream_norms) @memset(merged_norms, 0);
-    var serialize_scratch = PostingSerializeScratch{};
-    defer serialize_scratch.deinit(alloc);
+    const serialize_scratch = &workspace.compact_scratch;
     var dict_builder = try StreamingTermDictionaryBuilder.init(alloc);
     defer dict_builder.deinit();
     var merged_term = std.ArrayListUnmanaged(u8).empty;
@@ -5828,6 +5888,7 @@ fn writeMappedInvertedSection(
     const stream_postings = config.wireVersion() == wire_version_current and config.postings_layout == .posting_count_v35 and monotonicDocMaps(stream_maps);
     while (true) {
         const min_term = findMinCurrentTerm(current_entries) orelse break;
+        defer workspace.finishTerm(alloc);
         merged_term.clearRetainingCapacity();
         try merged_term.appendSlice(alloc, min_term);
 
@@ -5837,7 +5898,7 @@ fn writeMappedInvertedSection(
             if (std.mem.eql(u8, entry.term, merged_term.items)) candidate_frequency += entry.result.docFreq();
         }
         if (stream_postings and candidate_frequency >= 4096) {
-            const value = try appendStreamedMergedTermToSink(alloc, sink, section_start, current_entries, merged_term.items, stream_maps, merged_norms, &total_field_len, config);
+            const value = try appendStreamedMergedTermToSinkWithWorkspace(alloc, sink, section_start, current_entries, merged_term.items, stream_maps, merged_norms, &total_field_len, config, &workspace);
             for (current_entries, 0..) |entry_opt, i| {
                 const entry = entry_opt orelse continue;
                 if (std.mem.eql(u8, entry.term, merged_term.items)) current_entries[i] = try term_iters[i].next();
@@ -5847,9 +5908,9 @@ fn writeMappedInvertedSection(
         }
 
         if (file_maps and !stream_postings and candidate_frequency >= 4096 and config.wireVersion() == wire_version_current and config.postings_layout == .posting_count_v35) {
-            var stream = try ExternalPostingStream.init(alloc, current_entries, merged_term.items, effective_maps);
+            var stream = try ExternalPostingStream.initWithWorkspace(alloc, current_entries, merged_term.items, effective_maps, &workspace);
             defer stream.deinit();
-            const value = try appendPostingStreamToSink(alloc, sink, section_start, &stream, stream.has_positions, merged_norms, &total_field_len, config);
+            const value = try appendPostingStreamToSinkWithWorkspace(alloc, sink, section_start, &stream, stream.has_positions, merged_norms, &total_field_len, config, &workspace.encoding);
             for (current_entries, 0..) |entry_opt, i| {
                 const entry = entry_opt orelse continue;
                 if (std.mem.eql(u8, entry.term, merged_term.items)) current_entries[i] = try term_iters[i].next();
@@ -5859,8 +5920,7 @@ fn writeMappedInvertedSection(
         }
 
         {
-            var acc = PostingAccumulator.init();
-            defer acc.deinit(alloc);
+            const acc = &workspace.compact;
 
             // Compact terms stay in memory. Cross over before appending a hit
             // that would exceed the byte limit, including position payloads.
@@ -5873,21 +5933,21 @@ fn writeMappedInvertedSection(
             for (current_entries, 0..) |entry_opt, seg_idx| {
                 const entry = entry_opt orelse continue;
                 if (!std.mem.eql(u8, entry.term, merged_term.items)) continue;
-                if (!try appendLookupResultToAccumulatorLimited(alloc, &acc, entry.result, effective_maps[seg_idx], merged_norms, &total_field_len, if (bounded) 256 * 1024 else null)) {
+                if (!try appendLookupResultToAccumulatorLimitedWithWorkspace(alloc, acc, entry.result, effective_maps[seg_idx], merged_norms, &total_field_len, if (bounded) 256 * 1024 else null, &workspace)) {
                     spill = true;
                     break;
                 }
             }
             if (spill) {
                 acc.deinit(alloc);
-                acc = PostingAccumulator.init();
+                acc.* = PostingAccumulator.init();
                 total_field_len = initial_field_len;
                 const value = if (stream_postings)
-                    try appendStreamedMergedTermToSink(alloc, sink, section_start, current_entries, merged_term.items, stream_maps, merged_norms, &total_field_len, config)
+                    try appendStreamedMergedTermToSinkWithWorkspace(alloc, sink, section_start, current_entries, merged_term.items, stream_maps, merged_norms, &total_field_len, config, &workspace)
                 else if (file_maps) blk: {
-                    var stream = try ExternalPostingStream.init(alloc, current_entries, merged_term.items, effective_maps);
+                    var stream = try ExternalPostingStream.initWithWorkspace(alloc, current_entries, merged_term.items, effective_maps, &workspace);
                     defer stream.deinit();
-                    break :blk try appendPostingStreamToSink(alloc, sink, section_start, &stream, stream.has_positions, merged_norms, &total_field_len, config);
+                    break :blk try appendPostingStreamToSinkWithWorkspace(alloc, sink, section_start, &stream, stream.has_positions, merged_norms, &total_field_len, config, &workspace.encoding);
                 } else return error.InvalidData;
                 for (current_entries, 0..) |entry_opt, i| {
                     const entry = entry_opt orelse continue;
@@ -5902,11 +5962,16 @@ fn writeMappedInvertedSection(
             }
 
             if (acc.doc_ids.items.len == 0) continue;
-            try sortPostingAccumulatorByDocId(alloc, &acc);
-            const dict_value = try appendMergedTermToSink(alloc, sink, section_start, &term_postings, &serialize_scratch, &acc, config, merged_doc_count);
+            try sortPostingAccumulatorByDocIdWithWorkspace(alloc, acc, &workspace);
+            const dict_value = try appendMergedTermToSink(alloc, sink, section_start, term_postings, serialize_scratch, acc, config, merged_doc_count);
             try dict_builder.add(merged_term.items, dict_value);
         }
     }
+
+    // No more terms can reuse this capacity. Drop it before dictionary/norm
+    // finalization, whose output buffers otherwise overlap the last term.
+    workspace.deinit(alloc);
+    workspace = .{};
 
     if (file_maps) {
         const norms_data = FileNormStream{ .len = @as(usize, merged_doc_count) + 5, .readers = readers, .present = reader_present, .records = effective_maps[0].records, .maps = effective_maps };
@@ -5932,6 +5997,12 @@ fn postingSortEntryLessThan(_: void, a: PostingSortEntry, b: PostingSortEntry) b
 }
 
 fn sortPostingAccumulatorByDocId(alloc: Allocator, acc: *PostingAccumulator) !void {
+    var workspace = PostingMergeWorkspace{};
+    defer workspace.deinit(alloc);
+    return sortPostingAccumulatorByDocIdWithWorkspace(alloc, acc, &workspace);
+}
+
+fn sortPostingAccumulatorByDocIdWithWorkspace(alloc: Allocator, acc: *PostingAccumulator, workspace: *PostingMergeWorkspace) !void {
     if (acc.doc_ids.items.len <= 1) return;
     var ordered = true;
     for (acc.doc_ids.items[1..], acc.doc_ids.items[0 .. acc.doc_ids.items.len - 1]) |next, previous| {
@@ -5942,8 +6013,17 @@ fn sortPostingAccumulatorByDocId(alloc: Allocator, acc: *PostingAccumulator) !vo
     }
     if (ordered) return;
 
-    const entries = try alloc.alloc(PostingSortEntry, acc.doc_ids.items.len);
-    defer alloc.free(entries);
+    // Large reorder buffers must not overlap subsequent term serialization.
+    // Keep only bounded scratch for recurring small terms.
+    defer {
+        var remaining: usize = 64 * 1024;
+        resetMergeBuffers(&workspace.sort_entries, alloc, &remaining);
+        resetMergeBuffers(&workspace.sort_positions, alloc, &remaining);
+    }
+
+    try workspace.sort_entries.ensureTotalCapacityPrecise(alloc, acc.doc_ids.items.len);
+    workspace.sort_entries.items.len = acc.doc_ids.items.len;
+    const entries = workspace.sort_entries.items;
     var positions_start: usize = 0;
     for (entries, 0..) |*entry, i| {
         entry.* = .{
@@ -5956,8 +6036,9 @@ fn sortPostingAccumulatorByDocId(alloc: Allocator, acc: *PostingAccumulator) !vo
 
     std.mem.sort(PostingSortEntry, entries, {}, postingSortEntryLessThan);
 
-    const sorted_positions = try alloc.alloc(u32, acc.all_positions.items.len);
-    defer alloc.free(sorted_positions);
+    try workspace.sort_positions.ensureTotalCapacityPrecise(alloc, acc.all_positions.items.len);
+    workspace.sort_positions.items.len = acc.all_positions.items.len;
+    const sorted_positions = workspace.sort_positions.items;
     var sorted_positions_len: usize = 0;
     for (entries, 0..) |entry, i| {
         acc.doc_ids.items[i] = entry.doc_id;
@@ -6041,6 +6122,19 @@ fn appendLookupResultToAccumulatorLimited(
     total_field_len: *u64,
     byte_limit: ?usize,
 ) !bool {
+    return appendLookupResultToAccumulatorLimitedWithWorkspace(alloc, acc, result, rmap, doc_norms, total_field_len, byte_limit, null);
+}
+
+fn appendLookupResultToAccumulatorLimitedWithWorkspace(
+    alloc: Allocator,
+    acc: *PostingAccumulator,
+    result: LookupResult,
+    rmap: anytype,
+    doc_norms: anytype,
+    total_field_len: *u64,
+    byte_limit: ?usize,
+    workspace: ?*PostingMergeWorkspace,
+) !bool {
     switch (result) {
         .one_hit => |hit| {
             if (hit.doc_num >= mapLength(rmap)) return true;
@@ -6053,8 +6147,14 @@ fn appendLookupResultToAccumulatorLimited(
         },
         .postings => {
             var result_copy = result;
-            var post_iter = try result_copy.iterator(alloc);
-            defer post_iter.deinit();
+            var post_iter = if (workspace) |owner| try reusableMergeIterator(alloc, &result_copy, if (owner.compact_iterator) |*previous| previous else null) else try result_copy.iterator(alloc);
+            defer {
+                if (workspace) |owner| {
+                    var remaining: usize = 256 * 1024;
+                    recycleMergeIterator(&post_iter, alloc, &remaining);
+                    owner.compact_iterator = post_iter;
+                } else post_iter.deinit();
+            }
 
             while (try post_iter.next()) |hit| {
                 if (hit.doc_id >= mapLength(rmap)) continue;
@@ -6088,23 +6188,36 @@ const ExternalPostingStream = struct {
     cursor: ?Spill.Cursor = null,
     positions: std.ArrayListUnmanaged(u32) = .empty,
     read_cache: ?*PackedReadCache = null,
+    workspace: ?*PostingMergeWorkspace = null,
     has_positions: bool = false,
     previous: ?u32 = null,
     fn init(alloc: Allocator, entries: []const ?TermIterator.Entry, term: []const u8, maps: []const FileDocMap) !@This() {
+        return initWithWorkspace(alloc, entries, term, maps, null);
+    }
+    fn initWithWorkspace(alloc: Allocator, entries: []const ?TermIterator.Entry, term: []const u8, maps: []const FileDocMap, workspace: ?*PostingMergeWorkspace) !@This() {
         if (maps.len == 0) return error.InvalidData;
-        var self = @This(){ .allocator = alloc, .sorter = try Spill.Sorter.init(alloc, maps[0].scratch orelse return error.InvalidData) };
+        var self = @This(){ .allocator = alloc, .workspace = workspace, .sorter = try Spill.Sorter.init(alloc, maps[0].scratch orelse return error.InvalidData) };
         errdefer self.deinit();
-        self.read_cache = try alloc.create(PackedReadCache);
-        self.read_cache.?.* = .{};
-        var encoded = std.ArrayListUnmanaged(u8).empty;
-        defer encoded.deinit(alloc);
+        if (workspace) |owner| self.read_cache = try owner.readCache(alloc) else {
+            self.read_cache = try alloc.create(PackedReadCache);
+            self.read_cache.?.clear();
+        }
+        var local_encoded = std.ArrayListUnmanaged(u8).empty;
+        defer local_encoded.deinit(alloc);
+        const encoded = if (workspace) |owner| &owner.spill_encoded else &local_encoded;
         for (entries, maps) |entry_opt, map| {
             const entry = entry_opt orelse continue;
             if (!std.mem.eql(u8, entry.term, term)) continue;
             var result = entry.result;
-            var iterator = try result.iterator(alloc);
-            defer iterator.deinit();
-            while (try nextPackedHit(&iterator, &result, self.read_cache.?)) |packed_hit| {
+            var iterator = if (workspace) |owner| try reusableMergeIterator(alloc, &result, if (owner.compact_iterator) |*previous| previous else null) else try result.iterator(alloc);
+            defer {
+                if (workspace) |owner| {
+                    var remaining: usize = 256 * 1024;
+                    recycleMergeIterator(&iterator, alloc, &remaining);
+                    owner.compact_iterator = iterator;
+                } else iterator.deinit();
+            }
+            while (try nextPackedHit(&iterator, self.read_cache.?)) |packed_hit| {
                 const hit = packed_hit.hit;
                 if (hit.doc_id >= map.len) return error.InvalidData;
                 const doc = try mapDocument(map, hit.doc_id);
@@ -6117,29 +6230,30 @@ const ExternalPostingStream = struct {
                 const encoded_width = try exactPositionWidth(packed_hit.positions, alloc);
                 header[12] = encoded_width;
                 try encoded.appendSlice(alloc, &header);
+                const BufferSink = struct {
+                    allocator: Allocator,
+                    buffer: *std.ArrayListUnmanaged(u8),
+                    fn appendSlice(buffer_sink: *@This(), bytes: []const u8) !void {
+                        try buffer_sink.buffer.appendSlice(buffer_sink.allocator, bytes);
+                    }
+                };
+                var buffer_sink = BufferSink{ .allocator = alloc, .buffer = encoded };
+                var output = PositionByteWriter(*BufferSink){ .sink = &buffer_sink };
                 if (encoded_width != 0) {
-                    if (packed_hit.positions.bits == encoded_width and packed_hit.positions.legacy == null and packed_hit.positions.unpacked == null) {
-                        var bytes = try packed_hit.positions.packedBytes();
-                        while (try bytes.next()) |part| try encoded.append(alloc, part.value);
+                    if (packed_hit.positions.bits == encoded_width and packed_hit.positions.unpacked == null) {
+                        try output.appendPacked(packed_hit.positions);
                     } else {
                         var cursor = try packed_hit.positions.cursorAlloc(alloc);
                         defer cursor.deinit();
-                        var reservoir: u64 = 0;
-                        var bits: u8 = 0;
                         var previous: u32 = 0;
                         while (try cursor.next()) |position| {
-                            reservoir |= @as(u64, if (position >= previous) position - previous else 0) << @intCast(bits);
-                            bits += encoded_width;
+                            try output.value(if (position >= previous) position - previous else 0, encoded_width);
                             previous = position;
-                            while (bits >= 8) {
-                                try encoded.append(alloc, @truncate(reservoir));
-                                reservoir >>= 8;
-                                bits -= 8;
-                            }
                         }
-                        if (bits > 0) try encoded.append(alloc, @truncate(reservoir));
                     }
+                    try output.alignByte();
                 }
+                try output.flush();
                 self.has_positions = self.has_positions or packed_hit.positions.count != 0;
                 try self.sorter.add(doc, encoded.items);
             }
@@ -6150,7 +6264,10 @@ const ExternalPostingStream = struct {
     fn deinit(self: *@This()) void {
         if (self.cursor) |*cursor| cursor.deinit();
         self.positions.deinit(self.allocator);
-        if (self.read_cache) |cache| self.allocator.destroy(cache);
+        if (self.read_cache) |cache| {
+            cache.clear();
+            if (self.workspace == null) self.allocator.destroy(cache);
+        }
         self.sorter.deinit();
     }
     pub fn packedBlock(self: *@This(), acc: *PostingAccumulator, views: *std.ArrayListUnmanaged(PackedPositionView), count: u32) !bool {
@@ -6190,64 +6307,204 @@ const ExternalPostingStream = struct {
     }
 };
 
+// Retain a bounded amount of useful capacity, never a term-sized high-water
+// mark. Only owned lists are visited; source descriptors are cleared separately.
+fn resetMergeBuffers(value: anytype, alloc: Allocator, remaining: *usize) void {
+    const T = @TypeOf(value.*);
+    if (@hasField(T, "capacity") and @hasField(T, "items")) {
+        const bytes = value.capacity * @sizeOf(std.meta.Elem(@TypeOf(value.items)));
+        if (bytes > remaining.*) {
+            value.deinit(alloc);
+            value.* = .empty;
+        } else {
+            remaining.* -= bytes;
+            value.clearRetainingCapacity();
+        }
+    } else {
+        inline for (comptime std.meta.fieldNames(T)) |field| resetMergeBuffers(&@field(value, field), alloc, remaining);
+    }
+}
+
+const merge_iterator_buffers = .{ "position_read_buffer", "payload_buffer", "doc_values", "freq_values", "chunk_metas", "chunk_meta_values", "impact_chunk_ids", "positions_buf" };
+
+fn recycleMergeIterator(iterator: *PostingsIterator, alloc: Allocator, remaining: *usize) void {
+    var recycled = PostingsIterator{ .alloc = alloc };
+    inline for (merge_iterator_buffers) |field| {
+        std.mem.swap(@TypeOf(@field(iterator, field)), &@field(recycled, field), &@field(iterator, field));
+        resetMergeBuffers(&@field(recycled, field), alloc, remaining);
+    }
+    iterator.deinit(); // Release the old metadata authority exactly once.
+    iterator.* = recycled;
+}
+
+fn adoptMergeIteratorBuffers(next: *PostingsIterator, previous: ?*PostingsIterator) void {
+    if (previous) |old| {
+        inline for (merge_iterator_buffers) |field| {
+            std.mem.swap(@TypeOf(@field(next, field)), &@field(next, field), &@field(old, field));
+            @field(next, field).clearRetainingCapacity();
+        }
+        if (next.positions_range != null) {
+            if (next.positions_buf.capacity > next.max_position_record_bytes / 4) {
+                next.positions_buf.deinit(next.alloc);
+                next.positions_buf = .empty;
+            }
+            if (next.position_read_buffer.capacity > next.max_position_record_bytes) {
+                next.position_read_buffer.deinit(next.alloc);
+                next.position_read_buffer = .empty;
+            }
+        }
+        if (next.payload_range != null and next.payload_buffer.capacity > next.max_payload_chunk_bytes) {
+            next.payload_buffer.deinit(next.alloc);
+            next.payload_buffer = .empty;
+        }
+        old.deinit();
+        old.* = .{ .alloc = next.alloc };
+    }
+}
+
+fn reusableMergeIterator(alloc: Allocator, result: *const LookupResult, previous: ?*PostingsIterator) !PostingsIterator {
+    return switch (result.*) {
+        .postings => |*postings| postings.iteratorWithScratch(alloc, previous),
+        .one_hit => |hit| blk: {
+            var next = PostingsIterator.initOneHit(hit);
+            next.alloc = alloc;
+            next.one_hit_owns_scratch = true;
+            adoptMergeIteratorBuffers(&next, previous);
+            break :blk next;
+        },
+    };
+}
+
+const PostingMergeHead = struct { source: usize, doc_id: u32, frequency: u32, norm: u32 };
+const PostingMergeHeap = std.PriorityQueue(PostingMergeHead, void, struct {
+    fn compare(_: void, a: PostingMergeHead, b: PostingMergeHead) std.math.Order {
+        return std.math.order(a.doc_id, b.doc_id);
+    }
+}.compare);
+
+const PostingEncodingWorkspace = struct {
+    acc: PostingAccumulator = .{},
+    position_bytes: std.ArrayListUnmanaged(u8) = .empty,
+    crossover_positions: std.ArrayListUnmanaged(u32) = .empty,
+    position_views: std.ArrayListUnmanaged(PackedPositionView) = .empty,
+    block_scratch: PostingSerializeScratch = .{},
+    navigation: PostingSerializeScratch = .{},
+    records: std.ArrayListUnmanaged(u8) = .empty,
+    fn deinit(self: *PostingEncodingWorkspace, alloc: Allocator) void {
+        var remaining: usize = 0;
+        resetMergeBuffers(self, alloc, &remaining);
+    }
+};
+
+const PostingMergeWorkspace = struct {
+    // Structural arrays are bounded by the input segment count. Payload and
+    // encoding capacity have separate aggregate 256 KiB retention limits.
+    iterators: std.ArrayListUnmanaged(?PostingsIterator) = .empty,
+    head_views: std.ArrayListUnmanaged(PackedPositionView) = .empty,
+    decoded_heads: std.ArrayListUnmanaged([]const u32) = .empty,
+    heap: PostingMergeHeap = .empty,
+    cache: ?*PackedReadCache = null,
+    encoding: PostingEncodingWorkspace = .{},
+    compact: PostingAccumulator = .{},
+    compact_iterator: ?PostingsIterator = null,
+    spill_encoded: std.ArrayListUnmanaged(u8) = .empty,
+    compact_scratch: PostingSerializeScratch = .{},
+    term_postings: std.ArrayListUnmanaged(u8) = .empty,
+    sort_entries: std.ArrayListUnmanaged(PostingSortEntry) = .empty,
+    sort_positions: std.ArrayListUnmanaged(u32) = .empty,
+
+    fn readCache(self: *PostingMergeWorkspace, alloc: Allocator) !*PackedReadCache {
+        if (self.cache == null) {
+            const cache = try alloc.create(PackedReadCache);
+            // Payload bytes are undefined until the descriptor is valid.
+            cache.clear();
+            self.cache = cache;
+        }
+        return self.cache.?;
+    }
+    fn prepare(self: *PostingMergeWorkspace, alloc: Allocator, count: usize) !void {
+        const old = self.iterators.items.len;
+        if (count < old) for (self.iterators.items[count..]) |*slot| if (slot.*) |*iterator| iterator.deinit();
+        try self.iterators.ensureTotalCapacityPrecise(alloc, count);
+        self.iterators.items.len = count;
+        @memset(self.iterators.items[@min(old, count)..], null);
+        try self.head_views.ensureTotalCapacityPrecise(alloc, count);
+        self.head_views.items.len = count;
+        try self.decoded_heads.ensureTotalCapacityPrecise(alloc, count);
+        self.decoded_heads.items.len = count;
+    }
+    fn releaseHeads(self: *PostingMergeWorkspace, alloc: Allocator) void {
+        var remaining: usize = 256 * 1024;
+        for (self.iterators.items) |*slot| if (slot.*) |*iterator| recycleMergeIterator(iterator, alloc, &remaining);
+        if (self.compact_iterator) |*iterator| recycleMergeIterator(iterator, alloc, &remaining);
+        @memset(self.head_views.items, .{ .count = 0, .bits = 0 });
+        @memset(self.decoded_heads.items, &.{});
+        self.heap.clearRetainingCapacity();
+        if (self.cache) |cache| cache.clear();
+    }
+    fn finishTerm(self: *PostingMergeWorkspace, alloc: Allocator) void {
+        self.releaseHeads(alloc);
+        var remaining: usize = 256 * 1024;
+        resetMergeBuffers(&self.compact, alloc, &remaining);
+        resetMergeBuffers(&self.compact_scratch, alloc, &remaining);
+        resetMergeBuffers(&self.term_postings, alloc, &remaining);
+        resetMergeBuffers(&self.spill_encoded, alloc, &remaining);
+        resetMergeBuffers(&self.sort_entries, alloc, &remaining);
+        resetMergeBuffers(&self.sort_positions, alloc, &remaining);
+        resetMergeBuffers(&self.encoding, alloc, &remaining);
+    }
+    fn deinit(self: *PostingMergeWorkspace, alloc: Allocator) void {
+        for (self.iterators.items) |*slot| if (slot.*) |*iterator| iterator.deinit();
+        if (self.compact_iterator) |*iterator| iterator.deinit();
+        self.iterators.deinit(alloc);
+        self.head_views.deinit(alloc);
+        self.decoded_heads.deinit(alloc);
+        self.heap.deinit(alloc);
+        if (self.cache) |cache| alloc.destroy(cache);
+        self.encoding.deinit(alloc);
+        var remaining: usize = 0;
+        resetMergeBuffers(&self.compact, alloc, &remaining);
+        resetMergeBuffers(&self.compact_scratch, alloc, &remaining);
+        resetMergeBuffers(&self.term_postings, alloc, &remaining);
+        resetMergeBuffers(&self.spill_encoded, alloc, &remaining);
+        resetMergeBuffers(&self.sort_entries, alloc, &remaining);
+        resetMergeBuffers(&self.sort_positions, alloc, &remaining);
+    }
+};
+
 /// A heap contains one borrowed hit per source iterator. Each hit is copied
 /// into the output block before advancing its source, so positions never escape
 /// the iterator's bounded working buffer.
 fn MergedPostingStream(comptime Maps: type) type {
     return struct {
-        const Head = struct { source: usize, doc_id: u32, frequency: u32, norm: u32 };
-        const Heap = std.PriorityQueue(Head, void, struct {
-            fn compare(_: void, a: Head, b: Head) std.math.Order {
-                return std.math.order(a.doc_id, b.doc_id);
-            }
-        }.compare);
+        const Head = PostingMergeHead;
+        const Heap = PostingMergeHeap;
         allocator: Allocator,
         iterators: []?PostingsIterator,
         maps: Maps,
-        results: []?LookupResult,
         head_views: []PackedPositionView,
         decoded_heads: [][]const u32,
         dense_ready: bool = false,
-        read_cache: *PackedReadCache,
-        heap: Heap = .empty,
+        read_cache: ?*PackedReadCache,
+        heap: *Heap,
+        workspace: *PostingMergeWorkspace,
 
-        fn init(alloc: Allocator, entries: []const ?TermIterator.Entry, term: []const u8, maps: Maps) !@This() {
-            const iterators = try alloc.alloc(?PostingsIterator, entries.len);
-            errdefer alloc.free(iterators);
-            const results = try alloc.alloc(?LookupResult, entries.len);
-            errdefer alloc.free(results);
-            const head_views = try alloc.alloc(PackedPositionView, entries.len);
-            errdefer alloc.free(head_views);
-            const decoded_heads = try alloc.alloc([]const u32, entries.len);
-            errdefer alloc.free(decoded_heads);
-            const cache = try alloc.create(PackedReadCache);
-            errdefer alloc.destroy(cache);
-            cache.* = .{};
-            @memset(iterators, null);
-            @memset(results, null);
-            var self = @This(){ .allocator = alloc, .iterators = iterators, .results = results, .maps = maps, .read_cache = cache, .head_views = head_views, .decoded_heads = decoded_heads };
-            errdefer {
-                for (self.iterators) |*iterator| if (iterator.*) |*present| present.deinit();
-                self.heap.deinit(alloc);
-            }
+        fn init(alloc: Allocator, entries: []const ?TermIterator.Entry, term: []const u8, maps: Maps, workspace: *PostingMergeWorkspace) !@This() {
+            try workspace.prepare(alloc, entries.len);
+            var self = @This(){ .allocator = alloc, .iterators = workspace.iterators.items, .maps = maps, .read_cache = null, .head_views = workspace.head_views.items, .decoded_heads = workspace.decoded_heads.items, .heap = &workspace.heap, .workspace = workspace };
+            errdefer self.deinit();
             for (entries, 0..) |entry_opt, i| {
                 const entry = entry_opt orelse continue;
                 if (!std.mem.eql(u8, entry.term, term)) continue;
+                if (entry.result == .postings and entry.result.postings.positions_range != null) self.read_cache = try workspace.readCache(alloc);
                 var result = entry.result;
-                self.results[i] = result;
-                self.iterators[i] = try result.iterator(alloc);
+                self.iterators[i] = try reusableMergeIterator(alloc, &result, if (self.iterators[i]) |*previous| previous else null);
                 try self.advance(i);
             }
             return self;
         }
         fn deinit(self: *@This()) void {
-            for (self.iterators) |*iterator| if (iterator.*) |*present| present.deinit();
-            self.allocator.free(self.iterators);
-            self.allocator.free(self.results);
-            self.allocator.free(self.head_views);
-            self.allocator.free(self.decoded_heads);
-            self.allocator.destroy(self.read_cache);
-            self.heap.deinit(self.allocator);
+            self.workspace.releaseHeads(self.allocator);
         }
         fn nextSourceHit(self: *@This(), source: usize) !?PostingsIterator.Hit {
             const iterator = &self.iterators[source].?;
@@ -6266,11 +6523,12 @@ fn MergedPostingStream(comptime Maps: type) type {
                     // is emitted, so a crossover can materialize its view.
                     self.head_views[source].count = hit.positions.len;
                     self.head_views[source].unpacked = hit.positions;
+                    self.head_views[source].encoded_width = null;
                     self.decoded_heads[source] = hit.positions;
                     return hit;
                 }
             }
-            const packed_hit = (try nextPackedHit(iterator, &self.results[source].?, self.read_cache)) orelse return null;
+            const packed_hit = (try nextPackedHit(iterator, self.read_cache)) orelse return null;
             self.head_views[source] = packed_hit.positions;
             self.decoded_heads[source] = packed_hit.hit.positions;
             return packed_hit.hit;
@@ -6295,6 +6553,7 @@ fn MergedPostingStream(comptime Maps: type) type {
                 .start_index = iterator.positions_group_value_offset - head.count,
                 .count = head.count,
                 .bits = iterator.positions_group_bits,
+                .encoded_width = decodedPositionWidth(head.unpacked.?),
                 .read_cache = self.read_cache,
             };
         }
@@ -6374,6 +6633,23 @@ fn appendStreamedMergedTermToSink(
     total_field_len: *u64,
     config: IndexConfig,
 ) !?u64 {
+    var workspace = PostingMergeWorkspace{};
+    defer workspace.deinit(alloc);
+    return appendStreamedMergedTermToSinkWithWorkspace(alloc, sink, section_start, entries, term, maps, norms, total_field_len, config, &workspace);
+}
+
+fn appendStreamedMergedTermToSinkWithWorkspace(
+    alloc: Allocator,
+    sink: anytype,
+    section_start: usize,
+    entries: []const ?TermIterator.Entry,
+    term: []const u8,
+    maps: anytype,
+    norms: anytype,
+    total_field_len: *u64,
+    config: IndexConfig,
+    workspace: *PostingMergeWorkspace,
+) !?u64 {
     var has_positions = false;
     for (entries) |maybe| if (maybe) |entry| {
         if (!std.mem.eql(u8, entry.term, term)) continue;
@@ -6386,9 +6662,9 @@ fn appendStreamedMergedTermToSink(
     };
     const T = @TypeOf(maps);
     const normalized_maps: if (T == []const AffineDocMap or T == []AffineDocMap) []const AffineDocMap else if (T == []const RankDocMap or T == []RankDocMap) []const RankDocMap else if (T == []const FileDocMap or T == []FileDocMap) []const FileDocMap else []const []const u32 = maps;
-    var stream = try MergedPostingStream(@TypeOf(normalized_maps)).init(alloc, entries, term, normalized_maps);
+    var stream = try MergedPostingStream(@TypeOf(normalized_maps)).init(alloc, entries, term, normalized_maps, workspace);
     defer stream.deinit();
-    return appendPostingStreamToSink(alloc, sink, section_start, &stream, has_positions, norms, total_field_len, config);
+    return appendPostingStreamToSinkWithWorkspace(alloc, sink, section_start, &stream, has_positions, norms, total_field_len, config, &workspace.encoding);
 }
 
 /// Common block encoder for in-memory initial runs and merged source cursors.
@@ -6442,31 +6718,40 @@ fn appendPostingStreamToSink(
     total_field_len: *u64,
     config: IndexConfig,
 ) !?u64 {
-    var acc = PostingAccumulator.init();
-    defer acc.deinit(alloc);
-    var position_bytes = std.ArrayListUnmanaged(u8).empty;
-    defer position_bytes.deinit(alloc);
-    var crossover_positions = std.ArrayListUnmanaged(u32).empty;
-    defer crossover_positions.deinit(alloc);
-    var position_views = std.ArrayListUnmanaged(PackedPositionView).empty;
-    defer position_views.deinit(alloc);
+    var workspace = PostingEncodingWorkspace{};
+    defer workspace.deinit(alloc);
+    return appendPostingStreamToSinkWithWorkspace(alloc, sink, section_start, stream, has_positions, norms, total_field_len, config, &workspace);
+}
+
+fn appendPostingStreamToSinkWithWorkspace(
+    alloc: Allocator,
+    sink: anytype,
+    section_start: usize,
+    stream: anytype,
+    has_positions: bool,
+    norms: anytype,
+    total_field_len: *u64,
+    config: IndexConfig,
+    workspace: *PostingEncodingWorkspace,
+) !?u64 {
     const packed_stream = @hasDecl(@TypeOf(stream.*), "packedBlock");
-    var block_scratch = PostingSerializeScratch{};
-    defer block_scratch.deinit(alloc);
-    var navigation = PostingSerializeScratch{};
-    defer navigation.deinit(alloc);
+    const acc = &workspace.acc;
+    const position_bytes = &workspace.position_bytes;
+    const crossover_positions = &workspace.crossover_positions;
+    const position_views = &workspace.position_views;
+    const block_scratch = &workspace.block_scratch;
+    const navigation = &workspace.navigation;
     var payload_length: u64 = 0;
     var positions_length: u64 = 0;
     const span_start = sink.len();
-    var records = std.ArrayListUnmanaged(u8).empty;
-    defer records.deinit(alloc);
+    const records = &workspace.records;
     var doc_freq: u32 = 0;
     var previous_doc: ?u32 = null;
     var current_impact: ?u32 = null;
     var impact_max: u16 = 0;
     var impact_min: u16 = std.math.maxInt(u16);
     if (config.chunk_size == 0) return error.InvalidData;
-    while (if (comptime packed_stream) try stream.packedBlock(&acc, &position_views, config.chunk_size) else try stream.block(&acc, config.chunk_size)) {
+    while (if (comptime packed_stream) try stream.packedBlock(acc, position_views, config.chunk_size) else try stream.block(acc, config.chunk_size)) {
         if (previous_doc) |last| if (last >= acc.doc_ids.items[0]) return error.InvalidData;
         previous_doc = acc.doc_ids.items[acc.doc_ids.items.len - 1];
         for (acc.doc_ids.items, acc.metas.items) |id, meta| {
@@ -6502,7 +6787,7 @@ fn appendPostingStreamToSink(
                     for (position_views.items) |view| {
                         const begin = acc.all_positions.items.len;
                         acc.all_positions.items.len += view.count;
-                        try view.decodeInto(alloc, acc.all_positions.items[begin..], &position_bytes);
+                        try view.decodeInto(alloc, acc.all_positions.items[begin..], position_bytes);
                     }
                 } else {
                     // A crossover prefix borrows acc.all_positions. Decode
@@ -6512,9 +6797,9 @@ fn appendPostingStreamToSink(
                     for (position_views.items) |view| {
                         const begin = crossover_positions.items.len;
                         crossover_positions.items.len += view.count;
-                        try view.decodeInto(alloc, crossover_positions.items[begin..], &position_bytes);
+                        try view.decodeInto(alloc, crossover_positions.items[begin..], position_bytes);
                     }
-                    std.mem.swap(std.ArrayListUnmanaged(u32), &acc.all_positions, &crossover_positions);
+                    std.mem.swap(std.ArrayListUnmanaged(u32), &acc.all_positions, crossover_positions);
                 }
             } else if (!small_position_block) {
                 for (position_views.items) |*view| if (view.encoded_width == null) {
@@ -6525,7 +6810,7 @@ fn appendPostingStreamToSink(
         var position_offset: usize = 0;
         // Size all position frames, including empty-location groups. If the
         // entire term has no positions, the positions stream is omitted.
-        const encoded = try acc.appendEncodedChunk(alloc, &block_scratch, config, 0, acc.doc_ids.items.len, 0, &position_offset, has_positions and (!packed_stream or small_position_block));
+        const encoded = try acc.appendEncodedChunk(alloc, block_scratch, config, 0, acc.doc_ids.items.len, 0, &position_offset, has_positions and (!packed_stream or small_position_block));
         var record: [streamed_record_size]u8 = undefined;
         std.mem.writeInt(u32, record[0..4], encoded.metadata.max_doc, .little);
         std.mem.writeInt(u32, record[4..8], encoded.metadata.doc_count, .little);
@@ -6555,17 +6840,14 @@ fn appendPostingStreamToSink(
     const table_start = sink.len();
     try sink.appendSlice(records.items);
     const impacts: u32 = @intCast(navigation.impact_block_max.items.len / blockMaxRecordSize(config.wireVersion()));
-    try encodeImpactMetadata(alloc, &navigation, impacts, config.wireVersion());
+    try encodeImpactMetadata(alloc, navigation, impacts, config.wireVersion());
     try encodeImpactChunkIds(alloc, &navigation.impact_ids, navigation.impact_chunk_ids.items, &navigation.doc_deltas);
     const impact_start = sink.len();
     try sink.appendSlice(navigation.impact_encoded.items);
     try sink.appendSlice(navigation.impact_ids.items);
     const header_start = sink.len();
-    var marker = std.ArrayListUnmanaged(u8).empty;
-    defer marker.deinit(alloc);
-    try writeVarintU32(alloc, &marker, 0);
-    try writeVarintU32(alloc, &marker, std.math.maxInt(u32));
-    try sink.appendSlice(marker.items);
+    // The descriptor marker is always these two canonical varints.
+    try sink.appendSlice(&.{ 0, 255, 255, 255, 255, 15 });
     const descriptor = StreamedDescriptor{ .doc_frequency = doc_freq, .chunks = @intCast(records.items.len / streamed_record_size), .span_start = span_start - section_start, .span_length = span_length, .table_start = table_start - section_start, .impact_start = impact_start - section_start, .impacts = impacts, .ids_length = @intCast(navigation.impact_ids.items.len), .payload_length = payload_length, .positions_length = positions_length };
     try sink.appendSlice(&descriptor.encode());
     return @intCast(header_start - section_start - v7_header_size);
@@ -9777,11 +10059,12 @@ test "packed spill preserves legacy and current positional sources with bounded 
                 };
             }
         };
-        try std.testing.checkAllAllocationFailures(a, Harness.run, .{ @as([]const ?TermIterator.Entry, &entries), @as([]const FileDocMap, &maps) });
+        var no_resize = @import("../storage/lite/test_allocator.zig").NoResizeAllocator{ .backing = a };
+        try std.testing.checkAllAllocationFailures(no_resize.allocator(), Harness.run, .{ @as([]const ?TermIterator.Entry, &entries), @as([]const FileDocMap, &maps) });
     }
 }
 
-test "streamed inline positions replay ownership unwinds every allocation failure" {
+test "streamed inline position views unwind every allocation failure" {
     const a = std.testing.allocator;
     var builder = InvertedIndexBuilder.init(a, .{});
     defer builder.deinit();
@@ -9861,6 +10144,9 @@ test "packed span writer preserves every width alignment and bounded range reads
 
 test "streamed positions preserve decoded prefix across packed crossover" {
     const a = std.testing.allocator;
+    // Narrow long records followed by wide short records catch stale width
+    // metadata when a decoded head is reused after a packed head.
+    const small_positions = [_]u32{ 1, 1 << 20, 1 << 30 };
     var positions: [16384]u32 = undefined;
     for (&positions, 0..) |*position, i| position.* = @intCast(i * 3);
     for ([_]usize{ 40, 16384 }) |large| {
@@ -9868,7 +10154,7 @@ test "streamed positions preserve decoded prefix across packed crossover" {
         defer input.deinit();
         for (0..256) |doc| {
             const count: usize = if (doc % 3 == 1) large else 3;
-            try input.addDocument(@intCast(doc), &.{.{ .term = "mixed", .freq = @intCast(count), .norm = 7, .positions = positions[0..count] }});
+            try input.addDocument(@intCast(doc), &.{.{ .term = "mixed", .freq = @intCast(count), .norm = 7, .positions = if (count == 3) &small_positions else positions[0..count] }});
         }
         const bytes_ = try input.build();
         defer a.free(bytes_);
@@ -9893,7 +10179,7 @@ test "streamed positions preserve decoded prefix across packed crossover" {
             const hit = (try iterator.next()).?;
             const count: usize = if (doc % 3 == 1) large else 3;
             try std.testing.expectEqual(@as(u32, @intCast(doc)), hit.doc_id);
-            try std.testing.expectEqualSlices(u32, positions[0..count], hit.positions);
+            try std.testing.expectEqualSlices(u32, if (count == 3) &small_positions else positions[0..count], hit.positions);
             expected_total += count;
         }
         try std.testing.expectEqual(expected_total, total);
@@ -9952,4 +10238,375 @@ test "native scoped postings preserve prefetch through caches and translate sect
     defer iterator.deinit();
     _ = try iterator.next();
     try std.testing.expect(state.hints != 0);
+}
+
+test "v23 positional merges and historical spills consume immutable packed records" {
+    const a = std.testing.allocator;
+    const documents = 256;
+    const positions_per_doc = 4096;
+    var positions: [positions_per_doc]u32 = undefined;
+    for (&positions, 0..) |*position, i| position.* = @intCast(i);
+    var builder = InvertedIndexBuilder.init(a, .{ .chunk_size = 16, .postings_layout = .legacy_fixture_v27 });
+    defer builder.deinit();
+    for (0..documents) |doc| try builder.addDocument(@intCast(doc), &.{.{ .term = "legacy", .freq = positions.len, .norm = positions.len, .positions = &positions }});
+    const bytes = try builder.build();
+    defer a.free(bytes);
+    // Test-only v27 supplies the same v23 document-range payload layout.
+    // Its positions are replaced with genuine unframed v23 records below.
+    bytes[4] = wire_version_compact_postings_header;
+    var reader = try InvertedIndexReader.init(a, bytes);
+    reader.version = wire_version_chunk_framed_positions;
+    var result = reader.lookup("legacy").?;
+    var legacy = std.ArrayListUnmanaged(u8).empty;
+    defer legacy.deinit(a);
+    for (0..documents) |_| try appendPackedPositionsForDoc(a, &legacy, &positions);
+    result.postings.version = wire_version_legacy;
+    result.postings.positions_data = legacy.items;
+    result.postings.skip_data = null;
+    var ids: [documents]u32 = undefined;
+    for (&ids, 0..) |*id, doc| id.* = @intCast(doc);
+    const State = struct {
+        bytes: []const u8,
+        reads: usize = 0,
+        read_bytes: usize = 0,
+        fn read(raw: *anyopaque, offset: u64, out: []u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.reads += 1;
+            self.read_bytes += out.len;
+            @memcpy(out, self.bytes[@intCast(offset)..][0..out.len]);
+        }
+        fn close(_: *anyopaque) void {}
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const directory = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer a.free(directory);
+    for ([_]bool{ false, true }) |ranged| {
+        var state = State{ .bytes = legacy.items };
+        const View = @import("../segment_source.zig").View;
+        if (ranged) {
+            result.postings.positions_data = null;
+            result.postings.positions_range = try View.init(.{ .ranges = .{ .ptr = &state, .length = legacy.items.len, .read_into = State.read, .close = State.close } }, 0, legacy.items.len);
+            // The immutable range can exceed the decode cap: only small
+            // bounded windows are read, never a document-sized decode.
+            result.postings.max_position_record_bytes = 128;
+        }
+        const entries = [_]?TermIterator.Entry{.{ .term = "legacy", .result = result }};
+        var output = MergeMemorySink{ .alloc = a };
+        defer output.deinit();
+        try output.output.appendNTimes(a, 0, v7_header_size);
+        var norms: [documents]u32 = @splat(0);
+        var total: u64 = 0;
+        const maps = [_][]const u32{&ids};
+        const Budget = @import("../storage/lite/test_allocator.zig").BudgetAllocator;
+        var budget = Budget{ .backing = a, .limit = 512 * 1024 };
+        const start = @import("antfly_platform").time.monotonicNs();
+        const value = (try appendStreamedMergedTermToSink(budget.allocator(), &output, 0, &entries, "legacy", &maps, &norms, &total, .{})).?;
+        const elapsed = @import("antfly_platform").time.monotonicNs() - start;
+        var output_reader = reader;
+        output_reader.version = wire_version_current;
+        output_reader.chunk_size = productionIndexConfig().chunk_size;
+        output_reader.data = output.output.items;
+        const merged = output_reader.readPostings(value);
+        var iterator = try merged.iterator(a);
+        defer iterator.deinit();
+        for (0..documents) |doc| {
+            const hit = (try iterator.next()).?;
+            try std.testing.expectEqual(@as(u32, @intCast(doc)), hit.doc_id);
+            try std.testing.expectEqualSlices(u32, &positions, hit.positions);
+        }
+        try std.testing.expect((try iterator.next()) == null);
+        try std.testing.expectEqual(@as(usize, 0), budget.live);
+        if (ranged) try std.testing.expect(state.read_bytes < legacy.items.len * 4);
+        std.debug.print("LITE_LEGACY_PACKED ranged={any} docs=256 positions=4096 peak={d} elapsed_ns={d} source_reads={d} source_bytes={d}\n", .{ ranged, budget.peak, elapsed, state.reads, state.read_bytes });
+        var mappings: [documents * 4]u8 = undefined;
+        for (0..documents) |doc| std.mem.writeInt(u32, mappings[doc * 4 ..][0..4], @intCast(documents - 1 - doc), .little);
+        const spill_maps = [_]FileDocMap{.{ .len = documents, .ids = try View.init(.{ .contiguous = &mappings }, 0, mappings.len), .records = try View.init(.{ .contiguous = &.{} }, 0, 0), .monotonic = false, .scratch = .{ .io = std.testing.io, .directory = directory, .chunk_records = 8 } }};
+        var spill_budget = Budget{ .backing = a, .limit = 512 * 1024 };
+        const spill_start = @import("antfly_platform").time.monotonicNs();
+        var stream = try ExternalPostingStream.init(spill_budget.allocator(), &entries, "legacy", &spill_maps);
+        const spill_elapsed = @import("antfly_platform").time.monotonicNs() - spill_start;
+        defer stream.deinit();
+        var acc = PostingAccumulator.init();
+        defer acc.deinit(a);
+        var doc: u32 = 0;
+        while (try stream.block(&acc, 8)) {
+            var offset: usize = 0;
+            for (acc.doc_ids.items, acc.metas.items) |id, meta| {
+                try std.testing.expectEqual(doc, id);
+                doc += 1;
+                try std.testing.expectEqual(@as(u32, positions_per_doc), meta.position_count);
+                try std.testing.expectEqualSlices(u32, &positions, acc.all_positions.items[offset..][0..positions_per_doc]);
+                offset += positions_per_doc;
+            }
+        }
+        try std.testing.expectEqual(@as(u32, documents), doc);
+        try std.testing.expect(stream.sorter.input_bytes < documents * positions_per_doc * 4 / 8);
+        std.debug.print("LITE_LEGACY_SPILL ranged={any} elapsed_ns={d} peak={d} input_bytes={d}\n", .{ ranged, spill_elapsed, spill_budget.peak, stream.sorter.input_bytes });
+    }
+}
+
+test "legacy packed position views survive iterator advancement and validate record bounds" {
+    const a = std.testing.allocator;
+    const expected = [_]u32{ 0, 3, 7, 9 };
+    var data = std.ArrayListUnmanaged(u8).empty;
+    defer data.deinit(a);
+    try appendPackedPositionsForDoc(a, &data, &expected);
+    try appendPackedPositionsForDoc(a, &data, &.{ 1, 1, 1 });
+    try appendPackedPositionsForDoc(a, &data, &.{});
+    var iterator = PostingsIterator{ .alloc = a, .version = wire_version_legacy, .doc_freq = 3, .positions_data = data.items, .current_chunk_index = 0 };
+    defer iterator.deinit();
+    try iterator.doc_values.appendSlice(a, &.{ 0, 1, 2 });
+    try iterator.freq_values.appendSlice(a, &.{ @as(u32, @intCast(encodeFreqHasLocs(4, true))), @as(u32, @intCast(encodeFreqHasLocs(3, true))), @as(u32, @intCast(encodeFreqHasLocs(1, false))) });
+    var cache: PackedReadCache = .{};
+    const first = (try nextPackedHit(&iterator, &cache)).?;
+    _ = (try nextPackedHit(&iterator, &cache)).?;
+    try std.testing.expectEqual(@as(usize, 0), (try nextPackedHit(&iterator, &cache)).?.positions.count);
+    var cursor = try first.positions.cursor();
+    for (expected) |position| try std.testing.expectEqual(@as(?u32, position), try cursor.next());
+    try std.testing.expectEqual(@as(?u32, null), try cursor.next());
+    try std.testing.expectEqual(data.items.len, iterator.positions_cursor);
+    iterator.positions_cursor = 0;
+    iterator.chunk_doc_pos = 0;
+    iterator.positions_data = data.items[0..3];
+    try std.testing.expectError(error.InvalidData, nextPackedHit(&iterator, &cache));
+}
+
+test "legacy small range decode respects its configured capacity cap" {
+    const a = std.testing.allocator;
+    const expected = [_]u32{ 0, 3, 7, 9 };
+    var data = std.ArrayListUnmanaged(u8).empty;
+    defer data.deinit(a);
+    try appendPackedPositionsForDoc(a, &data, &expected);
+    const View = @import("../segment_source.zig").View;
+    var iterator = PostingsIterator{ .alloc = a, .version = wire_version_legacy, .doc_freq = 1, .positions_range = try View.init(.{ .contiguous = data.items }, 0, data.items.len), .max_position_record_bytes = 16, .current_chunk_index = 0 };
+    defer iterator.deinit();
+    var previous = PostingsIterator{ .alloc = a };
+    try previous.positions_buf.ensureTotalCapacityPrecise(a, 32);
+    adoptMergeIteratorBuffers(&iterator, &previous);
+    try iterator.doc_values.append(a, 0);
+    try iterator.freq_values.append(a, @intCast(encodeFreqHasLocs(4, true)));
+    var cache: PackedReadCache = .{};
+    const hit = (try nextPackedHit(&iterator, &cache)).?;
+    try std.testing.expectEqualSlices(u32, &expected, hit.hit.positions);
+    std.debug.print("LITE_DECODE_CAP decoded_bytes={d} capacity_bytes={d} configured_cap={d}\n", .{ hit.hit.positions.len * 4, iterator.positions_buf.capacity * 4, iterator.max_position_record_bytes });
+    try std.testing.expect(iterator.positions_buf.capacity * 4 <= iterator.max_position_record_bytes);
+}
+
+test "bounded merge workspace removes warm term allocations and releases authority" {
+    const a = std.testing.allocator;
+    var builder = InvertedIndexBuilder.init(a, .{});
+    defer builder.deinit();
+    const positions = [_]u32{ 0, 2, 5, 7 };
+    for (0..256) |doc| try builder.addDocument(@intCast(doc), &.{.{ .term = "workspace", .freq = positions.len, .norm = positions.len, .positions = &positions }});
+    const bytes = try builder.build();
+    defer a.free(bytes);
+    var reader = try InvertedIndexReader.init(a, bytes);
+    var result = reader.lookup("workspace").?;
+    const Owner = struct {
+        refs: usize = 1,
+        fn retain(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.refs += 1;
+        }
+        fn release(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.refs -= 1;
+        }
+    };
+    var owner = Owner{};
+    result.postings.metadata_owner = .{ .ptr = &owner, .retain = Owner.retain, .release = Owner.release };
+    const entries = [_]?TermIterator.Entry{.{ .term = "workspace", .result = result }};
+    var ids: [256]u32 = undefined;
+    for (&ids, 0..) |*id, doc| id.* = @intCast(doc);
+    const maps = [_][]const u32{&ids};
+    var norms: [256]u32 = @splat(0);
+    const Budget = @import("../storage/lite/test_allocator.zig").BudgetAllocator;
+    for ([_]bool{ false, true }) |reuse| {
+        var budget = Budget{ .backing = a, .limit = 1024 * 1024 };
+        const alloc = budget.allocator();
+        var workspace = PostingMergeWorkspace{};
+        var alive = true;
+        defer if (alive) workspace.deinit(alloc);
+        var output = MergeMemorySink{ .alloc = a };
+        defer output.deinit();
+        var warm_allocations: usize = 0;
+        var warm_ns: u64 = 0;
+        for (0..32) |run| {
+            output.output.clearRetainingCapacity();
+            try output.output.appendNTimes(a, 0, v7_header_size);
+            var total: u64 = 0;
+            const before = budget.alloc_calls;
+            const start = @import("antfly_platform").time.monotonicNs();
+            const value = (if (reuse)
+                try appendStreamedMergedTermToSinkWithWorkspace(alloc, &output, 0, &entries, "workspace", &maps, &norms, &total, .{}, &workspace)
+            else
+                try appendStreamedMergedTermToSink(alloc, &output, 0, &entries, "workspace", &maps, &norms, &total, .{})).?;
+            const elapsed = @import("antfly_platform").time.monotonicNs() - start;
+            if (run != 0) {
+                warm_allocations += budget.alloc_calls - before;
+                warm_ns += elapsed;
+            }
+            var output_reader = reader;
+            output_reader.data = output.output.items;
+            const merged = output_reader.readPostings(value);
+            var iterator = try merged.iterator(a);
+            defer iterator.deinit();
+            for (0..256) |doc| {
+                const hit = (try iterator.next()).?;
+                try std.testing.expectEqual(@as(u32, @intCast(doc)), hit.doc_id);
+                try std.testing.expectEqualSlices(u32, &positions, hit.positions);
+            }
+            try std.testing.expect((try iterator.next()) == null);
+            workspace.finishTerm(alloc);
+            try std.testing.expectEqual(@as(usize, 1), owner.refs);
+        }
+        if (reuse) try std.testing.expectEqual(@as(usize, 0), warm_allocations);
+        std.debug.print("LITE_TERM_WORKSPACE reuse={any} terms=31 warm_allocations={d} warm_ns={d} peak={d} retained={d}\n", .{ reuse, warm_allocations, warm_ns, budget.peak, budget.live });
+        // One oversized term must not leave an oversized retained workspace.
+        try workspace.encoding.position_bytes.resize(alloc, 512 * 1024);
+        workspace.finishTerm(alloc);
+        try std.testing.expectEqual(@as(usize, 0), workspace.encoding.position_bytes.capacity);
+        try workspace.prepare(alloc, 3);
+        try workspace.prepare(alloc, 1);
+        workspace.finishTerm(alloc);
+        workspace.deinit(alloc);
+        alive = false;
+        try std.testing.expectEqual(@as(usize, 0), budget.live);
+    }
+}
+
+test "packed position width proofs reuse decoded widths and stop on the top bit" {
+    const a = std.testing.allocator;
+    const State = struct {
+        bytes: []const u8,
+        bytes_read: usize = 0,
+        fn read(raw: *anyopaque, offset: u64, out: []u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.bytes_read += out.len;
+            @memcpy(out, self.bytes[@intCast(offset)..][0..out.len]);
+        }
+        fn close(_: *anyopaque) void {}
+    };
+    var deltas: [4096]u32 = @splat(0);
+    var bytes = std.ArrayListUnmanaged(u8).empty;
+    defer bytes.deinit(a);
+    var total_read: usize = 0;
+    var total_available: usize = 0;
+    for (1..33) |width| {
+        const bits: u8 = @intCast(width);
+        deltas[0] = @as(u32, 1) << @intCast(bits - 1);
+        bytes.clearRetainingCapacity();
+        _ = try appendPackedU32(a, &bytes, &deltas, bits);
+        var state = State{ .bytes = bytes.items };
+        const View = @import("../segment_source.zig").View;
+        var view = PackedPositionView{ .range = try View.init(.{ .ranges = .{ .ptr = &state, .length = bytes.items.len, .read_into = State.read, .close = State.close } }, 0, bytes.items.len), .count = deltas.len, .bits = bits };
+        try std.testing.expectEqual(bits, try exactPositionWidth(view, a));
+        total_read += state.bytes_read;
+        total_available += bytes.items.len;
+        try std.testing.expect(state.bytes_read <= 256);
+        state.bytes_read = 0;
+        view.encoded_width = bits;
+        try std.testing.expectEqual(bits, try exactPositionWidth(view, a));
+        try std.testing.expectEqual(@as(usize, 0), state.bytes_read);
+        deltas[0] = 0;
+        bytes.clearRetainingCapacity();
+        _ = try appendPackedU32(a, &bytes, &deltas, bits);
+        state.bytes = bytes.items;
+        view.encoded_width = null;
+        try std.testing.expectEqual(@as(u8, 0), try exactPositionWidth(view, a));
+    }
+    std.debug.print("LITE_WIDTH_PROOF cases=32 full_scan_bytes={d} proof_bytes={d}\n", .{ total_available, total_read });
+}
+
+test "spill preparation reuses bounded iterator scratch across distinct terms" {
+    const a = std.testing.allocator;
+    var builder = InvertedIndexBuilder.init(a, .{});
+    defer builder.deinit();
+    const alpha_positions = [_]u32{ 0, 2, 7 };
+    const omega_positions = [_]u32{ 1, 4, 8, 12, 17 };
+    for (0..64) |doc| try builder.addDocument(@intCast(doc), &.{
+        .{ .term = "alpha", .freq = alpha_positions.len, .norm = 8, .positions = &alpha_positions },
+        .{ .term = "omega", .freq = omega_positions.len, .norm = 8, .positions = &omega_positions },
+    });
+    const bytes = try builder.build();
+    defer a.free(bytes);
+    var reader = try InvertedIndexReader.init(a, bytes);
+    const Owner = struct {
+        refs: usize = 1,
+        fn retain(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.refs += 1;
+        }
+        fn release(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.refs -= 1;
+        }
+    };
+    var owner = Owner{};
+    var alpha = reader.lookup("alpha").?;
+    var omega = reader.lookup("omega").?;
+    alpha.postings.metadata_owner = .{ .ptr = &owner, .retain = Owner.retain, .release = Owner.release };
+    omega.postings.metadata_owner = alpha.postings.metadata_owner;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const directory = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer a.free(directory);
+    var mappings: [64 * 4]u8 = undefined;
+    for (0..64) |doc| std.mem.writeInt(u32, mappings[doc * 4 ..][0..4], @intCast(63 - doc), .little);
+    const View = @import("../segment_source.zig").View;
+    const maps = [_]FileDocMap{.{ .len = 64, .ids = try View.init(.{ .contiguous = &mappings }, 0, mappings.len), .records = try View.init(.{ .contiguous = &.{} }, 0, 0), .monotonic = false, .scratch = .{ .io = std.testing.io, .directory = directory, .chunk_records = 8 } }};
+    const Budget = @import("../storage/lite/test_allocator.zig").BudgetAllocator;
+    var allocation_totals: [2]usize = @splat(0);
+    for ([_]bool{ false, true }, 0..) |reuse, variant| {
+        var budget = Budget{ .backing = a, .limit = 1024 * 1024 };
+        const alloc = budget.allocator();
+        var workspace = PostingMergeWorkspace{};
+        var alive = true;
+        defer if (alive) workspace.deinit(alloc);
+        for (0..8) |run| {
+            const term: []const u8 = if (run % 2 == 0) "alpha" else "omega";
+            const expected: []const u32 = if (run % 2 == 0) &alpha_positions else &omega_positions;
+            const entries = [_]?TermIterator.Entry{.{ .term = term, .result = if (run % 2 == 0) alpha else omega }};
+            const before = budget.alloc_calls;
+            var stream = try ExternalPostingStream.initWithWorkspace(alloc, &entries, term, &maps, if (reuse) &workspace else null);
+            {
+                defer stream.deinit();
+                var acc = PostingAccumulator.init();
+                defer acc.deinit(alloc);
+                var doc: u32 = 0;
+                while (try stream.block(&acc, 8)) {
+                    var offset: usize = 0;
+                    for (acc.doc_ids.items, acc.metas.items) |id, meta| {
+                        try std.testing.expectEqual(doc, id);
+                        doc += 1;
+                        try std.testing.expectEqual(expected.len, meta.position_count);
+                        try std.testing.expectEqualSlices(u32, expected, acc.all_positions.items[offset..][0..expected.len]);
+                        offset += expected.len;
+                    }
+                }
+                try std.testing.expectEqual(@as(u32, 64), doc);
+            }
+            workspace.finishTerm(alloc);
+            try std.testing.expectEqual(@as(usize, 1), owner.refs);
+            if (run > 1) allocation_totals[variant] += budget.alloc_calls - before;
+        }
+        workspace.deinit(alloc);
+        alive = false;
+        try std.testing.expectEqual(@as(usize, 0), budget.live);
+        std.debug.print("LITE_SPILL_WORKSPACE reuse={any} warm_terms=6 allocations={d} peak={d}\n", .{ reuse, allocation_totals[variant], budget.peak });
+    }
+    try std.testing.expect(allocation_totals[1] < allocation_totals[0]);
+    const Harness = struct {
+        fn run(alloc: Allocator, entries: []const ?TermIterator.Entry, input_maps: []const FileDocMap) !void {
+            var workspace = PostingMergeWorkspace{};
+            defer workspace.deinit(alloc);
+            var stream = try ExternalPostingStream.initWithWorkspace(alloc, entries, "alpha", input_maps, &workspace);
+            defer stream.deinit();
+        }
+    };
+    const entries = [_]?TermIterator.Entry{.{ .term = "alpha", .result = alpha }};
+    var stable = @import("../storage/lite/test_allocator.zig").NoResizeAllocator{ .backing = a };
+    try std.testing.checkAllAllocationFailures(stable.allocator(), Harness.run, .{ @as([]const ?TermIterator.Entry, &entries), @as([]const FileDocMap, &maps) });
+    try std.testing.expectEqual(@as(usize, 1), owner.refs);
 }
