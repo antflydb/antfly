@@ -54412,8 +54412,9 @@ fn implementationTests() type {
                 try std.testing.expectEqual(@as(u64, 2), item.replay_applied_sequence);
                 try std.testing.expect(!item.replay_catch_up_required);
                 // Replay convergence does not complete asynchronous native projection
-                // publication. Any remaining backfill here must be that explicit debt.
-                try std.testing.expectEqual(item.dense_vector_projection_pending, item.backfill_active);
+                // publication. Any remaining backfill must be that explicit debt;
+                // native validation can still be pending after backfill finishes.
+                if (item.backfill_active) try std.testing.expect(item.dense_vector_projection_pending);
                 try std.testing.expect(statuses.items[0].metadata.target_observation_complete);
             }
 
