@@ -641,6 +641,50 @@
           "text": "a+"
         }
       ]
+    },
+    {
+      "id": "greedy-backtrack-capture",
+      "pattern": "(a|ab|abc)+\\1",
+      "input": "x abcabc y",
+      "flags": 3,
+      "start": 0,
+      "captures": 1,
+      "options": "",
+      "matched": true,
+      "spans": [
+        {
+          "start": 2,
+          "end": 8,
+          "text": "abcabc"
+        },
+        {
+          "start": 2,
+          "end": 5,
+          "text": "abc"
+        }
+      ]
+    },
+    {
+      "id": "shortest-backtrack-capture",
+      "pattern": "(a|ab|abc)+?\\1",
+      "input": "x abcabc y",
+      "flags": 3,
+      "start": 0,
+      "captures": 1,
+      "options": "",
+      "matched": true,
+      "spans": [
+        {
+          "start": 2,
+          "end": 8,
+          "text": "abcabc"
+        },
+        {
+          "start": 2,
+          "end": 5,
+          "text": "abc"
+        }
+      ]
     }
   ]
 }

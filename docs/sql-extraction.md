@@ -4760,3 +4760,20 @@ Historical UPDATE ... FOR UPDATE regex cases are invalid PostgreSQL syntax;
 they are not rewritten, silently excluded from an existing golden, or credited.
 Non-C collation support and the complete native
 complex-path work-accounting audit remain separate unfinished requirements.
+
+The next native hardening increment explicitly charges greedy/shortest repetition
+backtracking and verification, capture-vector initialization, final DFA scans and
+reallocation copies. Recursive capture clearing now independently checks stack
+depth and work, and its callers propagate failure before further dissection.
+Repetition failures free their endpoint arrays; a refused realloc leaves its old
+allocation intact and retryable. Allocation stops after sticky work/cancellation
+failure without compromising cleanup initialization.
+
+Two new independent PostgreSQL capture-span fixtures preserve greedy and shortest
+backreference behavior. The native gate passes 23 tests, including cancellation
+at every observed compile/match/replacement checkpoint for both patterns and
+direct realloc-refusal/retry ownership checks. The import-free WASM gate passes
+63 PostgreSQL contracts twice. These safety regressions grant no additional
+original-case credit: the corpus remains 437 implemented / 136 rejected /
+73 superseded / 940 unresolved. The broader native work-accounting audit remains
+open rather than being inferred complete from these representative patterns.

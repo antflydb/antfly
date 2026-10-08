@@ -146,6 +146,7 @@ const Memory = struct {
     }
     fn allocate(raw: *anyopaque, bytes: usize) callconv(.c) ?*anyopaque {
         const self = from(raw);
+        if (self.budget) |budget| if (budget.failure != null) return null;
         const required = std.math.add(usize, header_bytes, @max(1, bytes)) catch {
             self.failure = error.SqlExpressionTooLarge;
             return null;
@@ -200,8 +201,10 @@ const Memory = struct {
     }
     fn resize(raw: *anyopaque, pointer: ?*anyopaque, bytes: usize) callconv(.c) ?*anyopaque {
         const old = pointer orelse return allocate(raw, bytes);
-        const replacement = allocate(raw, bytes) orelse return null;
         const size = @min(bytes, header(old).requested);
+        // Failed realloc must retain the old allocation and its contents.
+        if (from(raw).budget) |budget| if (!budget.consumeWork(size)) return null;
+        const replacement = allocate(raw, bytes) orelse return null;
         @memcpy(@as([*]u8, @ptrCast(replacement))[0..size], @as([*]const u8, @ptrCast(old))[0..size]);
         release(raw, old);
         return replacement;
@@ -248,6 +251,31 @@ const Memory = struct {
         std.debug.assert(self.resident == 0);
     }
 };
+
+test "PostgreSQL ARE realloc work refusal preserves old ownership and permits retry" {
+    var refused: Budget = .{ .remaining = 8 };
+    var memory: Memory = .{ .alloc = std.testing.allocator, .limit = 4096, .budget = &refused };
+    defer memory.deinit();
+    const initial = Memory.allocate(&memory, 16) orelse return error.OutOfMemory;
+    const original: [*]u8 = @ptrCast(initial);
+    @memset(original[0..16], 0x5a);
+    const live = memory.live;
+    try std.testing.expect(Memory.resize(&memory, initial, 32) == null);
+    try std.testing.expectError(error.SqlExpressionTooLarge, memory.check());
+    try std.testing.expectEqual(live, memory.live);
+    try std.testing.expectEqual(@as(usize, 1), memory.allocations);
+    try std.testing.expectEqual(@as(usize, 16), Memory.header(initial).requested);
+    try std.testing.expectEqualSlices(u8, &(@as([16]u8, @splat(0x5a))), original[0..16]);
+    try std.testing.expect(Memory.allocate(&memory, 16) == null);
+    var retry: Budget = .{};
+    memory.budget = &retry;
+    const resized = Memory.resize(&memory, initial, 32) orelse return error.OutOfMemory;
+    const bytes: [*]const u8 = @ptrCast(resized);
+    try std.testing.expectEqualSlices(u8, &(@as([16]u8, @splat(0x5a))), bytes[0..16]);
+    try std.testing.expectEqual(@as(usize, 16), (Budget{}).remaining - retry.remaining);
+    Memory.release(&memory, resized);
+    try std.testing.expectEqual(@as(usize, 0), memory.live);
+}
 
 /// Decode once per subject. Sparse byte checkpoints bound returned-span
 /// conversion to at most 63 codepoints without a machine-word offset per cell.
@@ -1045,46 +1073,48 @@ test "PostgreSQL ARE every native compile and match checkpoint unwinds cancellat
         }
     };
     const a = std.testing.allocator;
-    var observed: Check = .{};
-    var compile_budget: Budget = .{ .checkpoint = Check.checkpoint, .ptr = &observed };
-    var program = try Program.compile(a, "(a|ab|abc)+\\1", 3, .{}, &compile_budget);
-    defer program.deinit();
-    const compile_checks = observed.calls;
-    for (0..compile_checks) |index| {
-        var check: Check = .{ .cancel_at = index };
-        var budget: Budget = .{ .checkpoint = Check.checkpoint, .ptr = &check };
-        try std.testing.expectError(error.Canceled, Program.compile(a, "(a|ab|abc)+\\1", 3, .{}, &budget));
-    }
-    var subject = try Subject.init(a, "x abcabc y");
-    defer subject.deinit();
-    var execution = Executor.init(a, .{});
-    defer execution.deinit();
-    var spans: [2]Span = undefined;
-    observed.calls = 0;
-    var match_budget: Budget = .{ .checkpoint = Check.checkpoint, .ptr = &observed };
-    try std.testing.expect(try execution.find(&program, subject, 0, &spans, &match_budget));
-    const match_checks = observed.calls;
-    for (0..match_checks) |index| {
-        var check: Check = .{ .cancel_at = index };
-        var budget: Budget = .{ .checkpoint = Check.checkpoint, .ptr = &check };
-        try std.testing.expectError(error.Canceled, execution.find(&program, subject, 0, &spans, &budget));
-        for (spans) |span| try std.testing.expectEqual(Span{}, span);
-    }
-    var retry: Budget = .{};
-    try std.testing.expect(try execution.find(&program, subject, 0, &spans, &retry));
-    try std.testing.expectEqualStrings("abcabc", (try subject.slice(spans[0])).?);
-    var replacement = try Replacement.init(a, "<\\&>", &retry);
-    defer replacement.deinit();
-    observed.calls = 0;
-    var replacement_budget: Budget = .{ .checkpoint = Check.checkpoint, .ptr = &observed };
-    const output = try execution.replaceAlloc(a, &program, subject, &replacement, 0, 0, 1024, &replacement_budget);
-    defer a.free(output);
-    try std.testing.expectEqualStrings("x <abcabc> y", output);
-    const replacement_checks = observed.calls;
-    for (0..replacement_checks) |index| {
-        var check: Check = .{ .cancel_at = index };
-        var budget: Budget = .{ .checkpoint = Check.checkpoint, .ptr = &check };
-        try std.testing.expectError(error.Canceled, execution.replaceAlloc(a, &program, subject, &replacement, 0, 0, 1024, &budget));
+    for ([_][]const u8{ "(a|ab|abc)+\\1", "(a|ab|abc)+?\\1" }) |pattern| {
+        var observed: Check = .{};
+        var compile_budget: Budget = .{ .checkpoint = Check.checkpoint, .ptr = &observed };
+        var program = try Program.compile(a, pattern, 3, .{}, &compile_budget);
+        defer program.deinit();
+        const compile_checks = observed.calls;
+        for (0..compile_checks) |index| {
+            var check: Check = .{ .cancel_at = index };
+            var budget: Budget = .{ .checkpoint = Check.checkpoint, .ptr = &check };
+            try std.testing.expectError(error.Canceled, Program.compile(a, pattern, 3, .{}, &budget));
+        }
+        var subject = try Subject.init(a, "x abcabc y");
+        defer subject.deinit();
+        var execution = Executor.init(a, .{});
+        defer execution.deinit();
+        var spans: [2]Span = undefined;
+        observed.calls = 0;
+        var match_budget: Budget = .{ .checkpoint = Check.checkpoint, .ptr = &observed };
+        try std.testing.expect(try execution.find(&program, subject, 0, &spans, &match_budget));
+        const match_checks = observed.calls;
+        for (0..match_checks) |index| {
+            var check: Check = .{ .cancel_at = index };
+            var budget: Budget = .{ .checkpoint = Check.checkpoint, .ptr = &check };
+            try std.testing.expectError(error.Canceled, execution.find(&program, subject, 0, &spans, &budget));
+            for (spans) |span| try std.testing.expectEqual(Span{}, span);
+        }
+        var retry: Budget = .{};
+        try std.testing.expect(try execution.find(&program, subject, 0, &spans, &retry));
+        try std.testing.expectEqualStrings("abcabc", (try subject.slice(spans[0])).?);
+        var replacement = try Replacement.init(a, "<\\&>", &retry);
+        defer replacement.deinit();
+        observed.calls = 0;
+        var replacement_budget: Budget = .{ .checkpoint = Check.checkpoint, .ptr = &observed };
+        const output = try execution.replaceAlloc(a, &program, subject, &replacement, 0, 0, 1024, &replacement_budget);
+        defer a.free(output);
+        try std.testing.expectEqualStrings("x <abcabc> y", output);
+        const replacement_checks = observed.calls;
+        for (0..replacement_checks) |index| {
+            var check: Check = .{ .cancel_at = index };
+            var budget: Budget = .{ .checkpoint = Check.checkpoint, .ptr = &check };
+            try std.testing.expectError(error.Canceled, execution.replaceAlloc(a, &program, subject, &replacement, 0, 0, 1024, &budget));
+        }
     }
 }
 

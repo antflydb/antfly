@@ -1,7 +1,10 @@
 # PostgreSQL regular-expression backend
 
-This is an in-progress SQL backend, not the byte/FST matcher used by search.
-It is not yet wired into public SQL and does not establish corpus-case coverage.
+This is the PostgreSQL ARE backend for the public SQL regex scalar functions,
+not the byte/FST matcher used by search. Execution-owned statement/cursor lanes
+provide bounded pattern and replacement caches. Component tests alone do not
+establish original corpus-case coverage; five conflict mutations additionally
+have mounted native storage/postimage evidence.
 
 The vendored Henry Spencer/PostgreSQL ARE core is pinned to upstream commit
 `1370a7832a2ab7bda5625fd1f0448808b534cd50` (REL_18_STABLE). C files originate
@@ -25,7 +28,11 @@ Adaptations are intentionally isolated and documented:
 - `rege_dfa.c` checks work on cached character transitions and backreference
   loops, not just cache misses. DFA state/arc traversal, cache comparison bytes,
   eviction-chain traversal and backreference lengths consume work. `regexec.c`
-  also charges backreference dissection. Sticky request errors prohibit exposing partial
+  also charges backreference dissection, repetition verification/backtracking,
+  capture-vector initialization and final DFA scans. Recursive capture clearing
+  has its own stack/work guard. Repetition failures release their endpoint arrays
+  before returning, and canceled/quota-refused reallocation preserves the old
+  allocation. Sticky request errors prohibit exposing partial
   successful results. Upstream parsing and match precedence are retained.
 
 Native allocations use a bounded caller allocator with complete ownership
@@ -72,12 +79,15 @@ result. Unknown escapes remain literal; unmatched/nonexistent groups expand empt
 
 The backend has no host-libc dependency. Memory/string helpers and allocation-free
 heapsort are compiled freestanding without builtin libc substitution. Run
-`zig build test -Dtarget=wasm32-freestanding` here to execute all 61 PostgreSQL
+`zig build test -Dtarget=wasm32-freestanding` here to execute all 63 PostgreSQL
 contracts twice in a WASM module with no host imports. Native concurrency uses
 thread-local call context; single-threaded WASM saves/restores per-instance
 context for nested synchronous invocations. The C call must never yield.
 
-Remaining activation requirements include prepared/dynamic pattern admission,
-the full compile/runtime work-accounting audit, SQL functions/NULLs/error mapping,
-and original mounted corpus campaigns.
-The standalone test gate is not a claim that those layers are complete.
+Public binding, strict SQL NULLs, overload/error mapping and statement/cursor
+ownership have independent PostgreSQL scalar and native integration tests.
+Remaining work includes the full compile/runtime work-accounting audit,
+non-C collations and broader original mounted corpus campaigns. Cancellation
+enumeration covers every observed compile/match/replacement checkpoint for both
+greedy and shortest backreference repetition, with clean retry and leak checks;
+it is not an exhaustive proof of every native path.

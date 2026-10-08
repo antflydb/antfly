@@ -186,6 +186,7 @@ longest(struct vars *v,
 
 	/* find last match, if any */
 	post = d->lastpost;
+	REGEX_WORK(d->nssused);
 	for (ss = d->ssets, i = d->nssused; i > 0; ss++, i--)
 		if ((ss->flags & POSTSTATE) && post != ss->lastseen &&
 			(post == NULL || post < ss->lastseen))
@@ -600,6 +601,7 @@ lastcold(struct vars *v,
 	nopr = d->lastnopr;
 	if (nopr == NULL)
 		nopr = v->start;
+	REGEX_WORK(d->nssused);
 	for (ss = d->ssets, i = d->nssused; i > 0; ss++, i--)
 		if ((ss->flags & NOPROGRESS) && nopr < ss->lastseen)
 			nopr = ss->lastseen;

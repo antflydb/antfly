@@ -275,6 +275,12 @@ pg_regexec(regex_t *re,
 	}
 	for (i = 0; i < n; i++)
 		v->subdfas[i] = NULL;
+	/* Antfly: initialize before a failure can enter cleanup. */
+	if (!antfly_regex_work(n))
+	{
+		st = REG_ETOOBIG;
+		goto cleanup;
+	}
 
 	assert(v->g->nlacons >= 0);
 	n = (size_t) v->g->nlacons;
@@ -289,6 +295,11 @@ pg_regexec(regex_t *re,
 		}
 		for (i = 0; i < n; i++)
 			v->ladfas[i] = NULL;
+		if (!antfly_regex_work(n))
+		{
+			st = REG_ETOOBIG;
+			goto cleanup;
+		}
 		v->lblastcss = (struct sset **) MALLOC(n * sizeof(struct sset *));
 		v->lblastcp = (chr **) MALLOC(n * sizeof(chr *));
 		if (v->lblastcss == NULL || v->lblastcp == NULL)
@@ -300,6 +311,11 @@ pg_regexec(regex_t *re,
 		{
 			v->lblastcss[i] = NULL;
 			v->lblastcp[i] = NULL;
+		}
+		if (!antfly_regex_work(n * 2))
+		{
+			st = REG_ETOOBIG;
+			goto cleanup;
 		}
 	}
 
@@ -667,6 +683,10 @@ zapallsubs(regmatch_t *p,
 {
 	size_t		i;
 
+	/* Complete initialization even if charging fails: caller cleanup and
+	 * capture ownership must never observe uninitialized slots. */
+	(void) antfly_regex_work(n);
+
 	for (i = n - 1; i > 0; i--)
 	{
 		p[i].rm_so = -1;
@@ -684,6 +704,13 @@ zaptreesubs(struct vars *v,
 	int			n = t->capno;
 	struct subre *t2;
 
+	/* Antfly: this independent recursive walk bypasses cdissect's guard. */
+	if (STACK_TOO_DEEP(v->re))
+	{
+		v->err = REG_ETOOBIG;
+		return;
+	}
+
 	if (n > 0)
 	{
 		if ((size_t) n < v->nmatch)
@@ -694,7 +721,11 @@ zaptreesubs(struct vars *v,
 	}
 
 	for (t2 = t->child; t2 != NULL; t2 = t2->sibling)
+	{
 		zaptreesubs(v, t2);
+		if (ISERR())
+			return;
+	}
 }
 
 /*
@@ -877,6 +908,7 @@ ccondissect(struct vars *v,
 				}
 				/* Reset left's matches (right should have done so itself) */
 				zaptreesubs(v, left);
+				NOERR();
 			}
 			if (er != REG_NOMATCH)
 				return er;
@@ -958,6 +990,7 @@ crevcondissect(struct vars *v,
 				}
 				/* Reset left's matches (right should have done so itself) */
 				zaptreesubs(v, left);
+				NOERR();
 			}
 			if (er != REG_NOMATCH)
 				return er;
@@ -1116,6 +1149,13 @@ caltdissect(struct vars *v,
 /*
  * citerdissect - dissect match for iteration node
  */
+/* Antfly: iteration owns its endpoint array across every backtrack. Failure
+ * must release it before returning, including verification-only iterations. */
+#define ITERATION_WORK() do { \
+	if (!antfly_regex_work(1)) { \
+		v->err = REG_ETOOBIG; FREE(endpts); return v->err; \
+	} \
+} while (0)
 static int						/* regexec return code */
 citerdissect(struct vars *v,
 			 struct subre *t,
@@ -1196,6 +1236,7 @@ citerdissect(struct vars *v,
 	/* iterate until satisfaction or failure */
 	while (k > 0)
 	{
+		ITERATION_WORK();
 		/* try to find an endpoint for the k'th sub-match */
 		endpts[k] = longest(v, d, endpts[k - 1], limit, (int *) NULL);
 		if (ISERR())
@@ -1249,8 +1290,10 @@ citerdissect(struct vars *v,
 
 		for (i = nverified + 1; i <= k; i++)
 		{
+			ITERATION_WORK();
 			/* zap any match data from a non-last iteration */
 			zaptreesubs(v, t->child);
+			if (ISERR()) { FREE(endpts); return v->err; }
 			er = cdissect(v, t->child, endpts[i - 1], endpts[i]);
 			if (er == REG_OKAY)
 			{
@@ -1283,6 +1326,7 @@ backtrack:
 		 */
 		while (k > 0)
 		{
+			ITERATION_WORK();
 			chr		   *prev_end = endpts[k - 1];
 
 			if (endpts[k] > prev_end)
@@ -1403,6 +1447,7 @@ creviterdissect(struct vars *v,
 	/* iterate until satisfaction or failure */
 	while (k > 0)
 	{
+		ITERATION_WORK();
 		/* disallow zero-length match unless necessary to achieve min */
 		if (limit == endpts[k - 1] &&
 			limit != end &&
@@ -1462,8 +1507,10 @@ creviterdissect(struct vars *v,
 
 		for (i = nverified + 1; i <= k; i++)
 		{
+			ITERATION_WORK();
 			/* zap any match data from a non-last iteration */
 			zaptreesubs(v, t->child);
+			if (ISERR()) { FREE(endpts); return v->err; }
 			er = cdissect(v, t->child, endpts[i - 1], endpts[i]);
 			if (er == REG_OKAY)
 			{
@@ -1495,6 +1542,7 @@ backtrack:
 		 */
 		while (k > 0)
 		{
+			ITERATION_WORK();
 			if (endpts[k] < end)
 			{
 				limit = endpts[k] + 1;
@@ -1514,4 +1562,5 @@ backtrack:
 
 
 
+#undef ITERATION_WORK
 #include "rege_dfa.c"

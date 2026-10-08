@@ -43,6 +43,8 @@ CASES = [
     ("ordered-quoted-flavor", "(a)", "(a)", "eq", 4, 0, 0),
     ("ordered-basic-flavor", "a+", "a+", "qb", 0, 0, 0),
     ("ordered-basic-insensitive", "A+", "a+", "qib", 8, 0, 0),
+    ("greedy-backtrack-capture", r"(a|ab|abc)+\1", "x abcabc y", "", 3, 0, 1),
+    ("shortest-backtrack-capture", r"(a|ab|abc)+?\1", "x abcabc y", "", 3, 0, 1),
 ]
 
 
