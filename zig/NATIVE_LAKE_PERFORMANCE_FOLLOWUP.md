@@ -283,3 +283,9 @@ large-segment admission through small live blocks, and ten ordered indexes acros
 two bounded cohorts. A real Parquet E2E regression compares filtered sparse
 scores and ranking with the unfiltered quantized scorer before and after restart.
 Representative archive throughput and cold-cache measurements remain pending.
+
+Paged sparse roots also carry conservative authenticated native ordinal bounds.
+Positive selections reject disjoint segments before opening posting streams,
+avoiding a first-block read from every later segment for a point query. Older
+paged roots without the optional bounds retain the ordinary read path. The
+multi-segment regression admits only the overlapping stream and reads one block.

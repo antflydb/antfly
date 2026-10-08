@@ -1439,7 +1439,7 @@ fn locatedForwardBytes(txn: anytype, doc_id: []const u8) !?[]const u8 {
     return forward;
 }
 
-fn collectPostingStreams(a: Allocator, txn: anytype, query: *const SparseVector, cancellation: ?CancellationToken, byte_budget: usize, page_reader: *PageReader) !?[]daat.Stream {
+fn collectPostingStreams(a: Allocator, txn: anytype, query: *const SparseVector, cancellation: ?CancellationToken, byte_budget: usize, page_reader: *PageReader, selected: ?*const @import("../encoding/roaring.zig").RoaringBitmap) !?[]daat.Stream {
     var streams: std.ArrayList(daat.Stream) = .empty;
     defer streams.deinit(a);
     const max_streams = byte_budget / @sizeOf(daat.Stream); // navigation budget is independent of archive bytes
@@ -1452,6 +1452,12 @@ fn collectPostingStreams(a: Allocator, txn: anytype, query: *const SparseVector,
         if (entry.key.len == 0 or entry.key[0] != key_segment) break;
         const id = SparseIndex.segmentIdFromKey(entry.key) orelse return error.InvalidSparseSegment;
         const version = try immutableVersion(entry.value);
+        if (selected) |bitmap| if (try posting_pages.ordinalBounds(entry.value)) |bounds| {
+            if (bitmap.rangeCardinality(bounds[0], @as(u64, bounds[1]) + 1) == 0) {
+                next = try cursor.next();
+                continue;
+            }
+        };
         var retained: ?[]const u8 = null;
         for (query.indices, query.values) |term, weight| {
             if (posting_pages.paged(entry.value)) {
@@ -3893,7 +3899,7 @@ pub const SparseIndex = struct {
         var fast_entries: ?[]ScoreEntry = null;
         defer if (fast_entries) |values| alloc.free(values);
         if ((constraints.key_predicate == null or ordinal_filter != null) and try completeLocatorMap(&txn)) {
-            if (try collectPostingStreams(alloc, &txn, query_vec, constraints.cancellation, 64 * 1024 * 1024, &page_reader)) |input| {
+            if (try collectPostingStreams(alloc, &txn, query_vec, constraints.cancellation, 64 * 1024 * 1024, &page_reader, if (ordinal_filter) |*bitmap| bitmap else null)) |input| {
                 defer {
                     for (input) |*stream| stream.deinit();
                     alloc.free(input);
@@ -6160,12 +6166,12 @@ test "sparse document streams bound retained segment bytes before scoring" {
     defer txn.abort();
     var query: SparseVector = .{ .indices = &.{1}, .values = &.{1} };
     var page_reader: PageReader = .{ .txn = &txn };
-    try std.testing.expect((try collectPostingStreams(a, &txn, &query, null, 0, &page_reader)) == null);
-    const admitted = (try collectPostingStreams(a, &txn, &query, null, 64 * 1024 * 1024, &page_reader)).?;
+    try std.testing.expect((try collectPostingStreams(a, &txn, &query, null, 0, &page_reader, null)) == null);
+    const admitted = (try collectPostingStreams(a, &txn, &query, null, 64 * 1024 * 1024, &page_reader, null)).?;
     defer a.free(admitted);
     try std.testing.expectEqual(@as(usize, 1), admitted.len);
     query = .{ .indices = &.{999}, .values = &.{1} };
-    const unmatched = (try collectPostingStreams(a, &txn, &query, null, 0, &page_reader)).?;
+    const unmatched = (try collectPostingStreams(a, &txn, &query, null, 0, &page_reader, null)).?;
     defer a.free(unmatched);
     try std.testing.expectEqual(@as(usize, 0), unmatched.len);
 }
@@ -6238,6 +6244,11 @@ test "sparse paged archive admission depends on live blocks rather than segment 
     const writes = try arena.allocator().alloc(SparseWrite, 2048);
     for (writes, 0..) |*write, i| write.* = .{ .doc_id = try std.fmt.allocPrint(arena.allocator(), "doc-{d:0>4}", .{i}), .vec = .{ .indices = &.{1}, .values = &.{1} } };
     try index.batchWithOptions(writes, &.{}, .{ .prefer_bulk_build = true, .assume_new_doc_ids = true });
+    for (writes, 0..) |*write, i| write.doc_id = try std.fmt.allocPrint(arena.allocator(), "doc-{d:0>4}", .{i + 2048});
+    try index.batchWithOptions(writes, &.{}, .{ .prefer_bulk_build = true, .assume_new_doc_ids = true });
+    var selected = @import("../encoding/roaring.zig").RoaringBitmap.init(a);
+    defer selected.deinit();
+    try selected.add(2047);
     var txn = try index.beginReadTxn();
     defer txn.abort();
     {
@@ -6249,11 +6260,12 @@ test "sparse paged archive admission depends on live blocks rather than segment 
     }
     const query: SparseVector = .{ .indices = &.{1}, .values = &.{1} };
     var reader: PageReader = .{ .txn = &txn, .budget = 8192 };
-    const streams = (try collectPostingStreams(a, &txn, &query, null, 1024, &reader)).?;
+    const streams = (try collectPostingStreams(a, &txn, &query, null, 1024, &reader, &selected)).?;
     defer {
         for (streams) |*stream| stream.deinit();
         a.free(streams);
     }
+    try std.testing.expectEqual(@as(usize, 1), streams.len);
     const Context = struct {
         pub fn check(_: *@This()) !void {}
         pub fn allows(_: *@This(), _: daat.Stream, _: u32) !bool {

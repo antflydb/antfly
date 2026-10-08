@@ -1204,3 +1204,9 @@ reuse and avoids decoding unchanged files. Publication continues sharing its
 existing replay across native builders. See the
 [performance contracts](NATIVE_LAKE_PERFORMANCE_FOLLOWUP.md) for validation and
 remaining archive measurements.
+
+Paged sparse roots also carry conservative authenticated native ordinal bounds.
+Positive selections reject disjoint segments before opening posting streams,
+avoiding a first-block read from every later segment for a point query. Older
+paged roots without the optional bounds retain the ordinary read path. The
+multi-segment regression admits only the overlapping stream and reads one block.

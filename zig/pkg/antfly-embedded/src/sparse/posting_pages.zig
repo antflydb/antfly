@@ -18,8 +18,19 @@ pub fn directory(root: []const u8) ![]const u8 {
     if (root.len < 16) return error.InvalidSparseSegment;
     const count = std.mem.readInt(u32, root[12..16], .little);
     const end = 16 + @as(u64, count) * 20;
-    if (end > root.len or (paged(root) and end != root.len)) return error.InvalidSparseSegment;
+    if (end > root.len or (paged(root) and end != root.len and end + 12 != root.len)) return error.InvalidSparseSegment;
     return root[16..@intCast(end)];
+}
+/// Conservative authenticated segment bounds; older paged roots omit them.
+pub fn ordinalBounds(root: []const u8) !?[2]u32 {
+    if (!paged(root)) return null;
+    const dir = try directory(root);
+    const tail = root[16 + dir.len ..];
+    if (tail.len == 0) return null;
+    if (tail.len != 12 or !std.mem.eql(u8, tail[0..4], "O32B")) return error.InvalidSparseSegment;
+    const bounds: [2]u32 = .{ std.mem.readInt(u32, tail[4..8], .little), std.mem.readInt(u32, tail[8..12], .little) };
+    if (bounds[0] > bounds[1]) return error.InvalidSparseSegment;
+    return bounds;
 }
 pub fn hasTerm(root: []const u8, term: u32) !bool {
     const dir = try directory(root);
@@ -43,6 +54,8 @@ pub fn key(id: u64, term: u32, last: u32) [17]u8 {
 pub fn publish(a: A, txn: anytype, id: u64, legacy: []const u8) ![]u8 {
     const dir = try directory(legacy);
     var position: usize = 0;
+    var first_ordinal: ?u32 = null;
+    var last_ordinal: u32 = 0;
     while (position < dir.len) : (position += 20) {
         const entry = dir[position..][0..20];
         const term = std.mem.readInt(u32, entry[0..4], .little);
@@ -66,13 +79,24 @@ pub fn publish(a: A, txn: anytype, id: u64, legacy: []const u8) ![]u8 {
             var last: u32 = 0;
             for (0..count) |i| last = std.math.add(u32, last, std.mem.readInt(u32, chunk[13 + i * 4 ..][0..4], .little)) catch return error.InvalidChunk;
             if (previous) |prior| if (last <= prior) return error.InvalidChunk;
+            const first = std.mem.readInt(u32, chunk[13..17], .little);
+            first_ordinal = if (first_ordinal) |before| @min(before, first) else first;
+            last_ordinal = @max(last_ordinal, last);
             try txn.put(&key(id, term, last), block);
             previous = last;
             at += @intCast(size);
         }
     }
-    const root = try a.dupe(u8, legacy[0 .. 16 + dir.len]);
+    const header_len = 16 + dir.len;
+    const root = try a.alloc(u8, header_len + @as(usize, if (first_ordinal != null) 12 else 0));
+    @memcpy(root[0..header_len], legacy[0..header_len]);
     @memcpy(root[0..8], magic);
+    if (first_ordinal) |first| {
+        const tail = root[header_len..];
+        @memcpy(tail[0..4], "O32B");
+        std.mem.writeInt(u32, tail[4..8], first, .little);
+        std.mem.writeInt(u32, tail[8..12], last_ordinal, .little);
+    }
     return root;
 }
 pub fn materializedSize(root: []const u8) !usize {
@@ -86,13 +110,14 @@ pub fn materialize(a: A, txn: anytype, id: u64, root: []const u8) ![]u8 {
     if (!paged(root)) return a.dupe(u8, root);
     const result = try a.alloc(u8, try materializedSize(root));
     errdefer a.free(result);
-    @memcpy(result[0..root.len], root);
+    const header_len = 16 + (try directory(root)).len;
+    @memcpy(result[0..header_len], root[0..header_len]);
     @memcpy(result[0..8], legacy_magic);
     var cursor = try txn.openCursor();
     defer cursor.close();
     const prefix = key(id, 0, 0);
     var next = try cursor.seekAtOrAfter(prefix[0..9]);
-    var at = root.len;
+    var at = header_len;
     while (next) |entry| {
         if (entry.key.len != 17 or !std.mem.eql(u8, entry.key[0..9], prefix[0..9])) break;
         if (entry.value.len > result.len - at) return error.InvalidSparseSegment;
@@ -247,6 +272,8 @@ test "paged posting codec seeks one block bounds memory and reclaims every page 
             const root = try publish(a, &txn, 42, &legacy);
             defer a.free(root);
             try std.testing.expect(paged(root));
+            try std.testing.expectEqual([2]u32{ 0, 5 }, (try ordinalBounds(root)).?);
+            try std.testing.expectEqual(null, try ordinalBounds(root[0 .. root.len - 12]));
             try std.testing.expect(try hasTerm(root, 7));
             try std.testing.expect(!try hasTerm(root, 8));
             const restored = try materialize(a, &txn, 42, root);
