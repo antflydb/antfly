@@ -1,7 +1,9 @@
 # Native video inference and EmbeddingGemma 2
 
-Status: phase 1 delivered, stages 2–4 planned, 2026-10-08. Native video decoding
-and embedding are not yet available. The initial design was written
+Status: phase 1 and the independent phase 2 decoder/preparation library delivered,
+2026-10-08. Phase 2 model/API integration and stages 3–4 remain pending; full video
+embedding is not yet available. Tim's open PR #1014 remains a separate dependency
+at the user's request. The initial design was written
 against `origin/main` commit `cdf572a7467d581f6f1b39bcf514878488555f11`;
 fetching a newer remote head was unavailable because GitHub DNS resolution failed.
 
@@ -215,10 +217,23 @@ packet/timeline/selection parity, bounded metadata/source buffers, and
 cancellation/lease/allocation failures. See the library docs for the precise
 implemented API and unsupported shapes.
 
-### 2. Apple decode and correct EmbeddingGemma video
+### 2. Apple decode and correct EmbeddingGemma video — library delivered, integration pending
 
-Implement VideoToolbox H.264 sessions and surface ownership; add Metal import
-and a parity-preserving prepared patch path. Integrate video-specific ordered
+Delivered independently of PR #1014: native VideoToolbox H.264 sessions with
+owned selected NV12 surfaces, explicit hardware enforcement/route receipts,
+CoreVideo-to-Metal imports, and portable CPU/Metal quantized bicubic patch
+preparation. Tests qualify progressive fixture decode, CPU/Metal prepared values,
+rotation/SDR policies, drain/retry, owned metadata/surface lifetimes, limits and
+allocation failures. Linux and wasm builds exclude Apple dependencies, and the
+portable selection/host-preparation suites execute on WASI. See
+[VIDEO.md](../../zig/lib/video/VIDEO.md) for the implemented API and limits.
+
+The decoder starts from packet zero; random-access dependency optimization,
+full native-workspace accounting, generalized color/display policies and model
+preparation geometry parity require later qualification. Model/backend code from
+Tim's current head `7a7b63f63da5e772309597ba2409a9ef50860a59` is not merged here.
+
+Remaining after that dependency is available: integrate video-specific ordered
 tokens with the final PR #1014 interfaces. Add internal borrowed surfaces and
 canonical API/SDK video contracts. A host preparation path can establish the
 oracle before device fusion is enabled.

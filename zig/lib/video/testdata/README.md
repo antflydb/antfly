@@ -19,3 +19,24 @@ The generator also checks an independent standard-library transcription against
 the executed method. Running without `--numpy` records that upstream execution
 was skipped; such a receipt does not satisfy the checked-in conformance test.
 Review snapshot and receipt changes together when updating processor policy.
+
+## Decoder and preparation fixtures
+
+`decode-bframes.mp4` copies the original shared media fixture; its NV12 receipt
+is an independent FFmpeg 9.0.2 decode in presentation order. Native tests compare
+selected pictures by PTS with a maximum byte difference of two. `prepare-sdr.mp4`
+is original 160×96 testsrc2 output used for resize/rotation tests.
+`decode-hardware.mp4` is an original 640×360 four-picture B-frame clip used for
+hardware-only route qualification. All are Apache-2.0 synthetic assets.
+`decode-oracle.json` pins their hashes and tool version.
+
+Regenerate from the worktree root (requires FFmpeg with libx264):
+
+```sh
+python3 zig/lib/video/scripts/generate_decode_fixtures.py
+```
+
+CPU/Metal comparisons use explicit SDR color/chroma conventions and shared
+quantized bicubic coefficients. They qualify that preparation contract; model
+geometry, official decoder color conversion, vision tokens, and embeddings still
+need end-to-end processor/model qualification after PR #1014 is integrated.

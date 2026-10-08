@@ -1696,6 +1696,7 @@ pub fn build(b: *std.Build) void {
     tok_test_step.dependOn(&run_hf_tok_tests.step);
 
     @import("antfly_media").support.addTests(b, b.path(b.fmt("{s}/lib/media", .{shared_lib_root})), target, optimize);
+    @import("antfly_video").support.addTests(b, b.path(b.fmt("{s}/lib/video", .{shared_lib_root})), target, optimize);
     default_test_step.dependOn(&b.top_level_steps.get("test-media").?.step);
     default_test_step.dependOn(&b.top_level_steps.get("test-video").?.step);
 

@@ -432,3 +432,7 @@ migration and are not implemented.
   COD writes the stored code-block exponent matching the encoder's
   OpenJPEG-style exponent, and detail-subband precinct assignment uses
   subband-local half-resolution precinct dimensions.
+
+The video preparation layer reuses the public `processing.BicubicAxis` and
+`buildPillowBicubicAxis` coefficient builder for its CPU/Metal resize comparison.
+The existing image resize implementation and public raster boundary are unchanged.

@@ -47,7 +47,8 @@ sample description, `stsz`/`stz2`, `stco`/`co64`, `stsc`, `stts`, signed/unsigne
 `ctts`, `stss`, and leading empty edits followed by one rate-1 media edit. It
 rejects fragments, external data references, unsupported display geometry and
 edit arrangements, and resource-limit violations. `syncBefore` returns a
-container hint; codec-aware random-access plans require the later decoder phase.
+container hint; the implemented Apple decoder conservatively starts at packet
+zero. Codec-aware random-access plans remain future work.
 WebM **video** indexing, sequential unknown-length providers, and object-store
 adapters are not implemented. The range callback is the integration boundary.
 
@@ -58,7 +59,8 @@ reads, cancellation/retry, independent leases, and allocation failures. See
 [testdata/README.md](testdata/README.md) for provenance and regeneration.
 
 From `zig/`, run `zig build test-media test-video`; from `zig/lib/media/`,
-run `zig build check-media check-video -Dtarget=wasm32-wasi` to check portability.
+run `zig build check-media -Dtarget=wasm32-wasi`; `zig/lib/video/` has its own
+`check-video` and `test-video` steps for decoder/preparation portability.
 Use the repository's Zig 0.17 toolchain. Existing audio regression tests continue
 through the inference package's audio test steps.
 

@@ -1,7 +1,9 @@
 # Native video decoding and sampled surfaces
 
-Status: phase 1 frame selection implemented, 2026-10-08. Video codec decoding,
-surface ownership, inference integration, and Metal execution remain planned.
+Status: phase 1 and the independent phase 2 decoder/preparation library are
+implemented, 2026-10-08. EmbeddingGemma 2 model-token integration, HTTP/SDK video
+inputs, and resident vision/backbone execution remain pending. Tim's PR #1014 is
+kept separate as requested; its model code is not incorporated into this branch.
 
 Related documents:
 
@@ -12,7 +14,7 @@ Related documents:
 
 ## Goal and boundary
 
-`lib/video` will decode container packets into timestamped, leased surfaces and
+`lib/video` decodes qualified AVC container packets into timestamped, leased surfaces and
 execute explicit frame-selection plans. It owns codec capability negotiation,
 reference-picture lifetime, presentation reordering, and bounded decoder work.
 It consumes `lib/media`; model adapters own vision budgets, tensor layouts,
@@ -42,7 +44,99 @@ invalid-policy, cancellation/deadline, and VFR tests enforce bounded behavior.
 See [fixture provenance](testdata/README.md). Run `zig build test-video` from
 `zig/` with Zig 0.17. This phase does not decode pictures or return embeddings.
 
-## Proposed module and API shape
+## Implemented decoder and preparation boundary
+
+The public `antfly_video` module exports `sampling`, `avc`, `apple`,
+`preparation`, and compile-time `capabilities`. Its own `build.zig` supports
+`test-video` and `check-video`; root and inference builds register the same tests.
+`build_support.attach` takes the consumer's shared media and image modules to
+reuse their types and controls without compiling a file into two Zig modules.
+`check-video` also compiles a consumer that imports these libraries together.
+
+[apple.zig](src/backends/apple.zig) orchestrates VideoToolbox through narrow
+[platform bindings](src/backends/apple_video.m). `decodeSelected` accepts a media
+MP4 reader, unique decode indexes in the desired output order, and budgets.
+It decodes from packet zero through the latest selected index and retains only
+selected NV12 pictures. It copies source PTS, duration, timescale, display matrix,
+pixel aspect, and raw color metadata into an owned batch. Frame surfaces and
+metadata survive reader destruction. No speculative open-GOP seeking is enabled.
+
+Each call owns its session. Native sample buffers copy packet bytes into owned
+CoreMedia blocks so source leases release after submission. Decode uses neither
+asynchronous nor temporal flags; callbacks complete before submission returns.
+Success drains delayed output; every failure and cancellation drains callbacks
+and invalidates the session before releasing callback state or retained frames.
+The original control/deadline is checked between reads, packets and callbacks.
+The native drain itself is a blocking platform call, not a preemptible deadline.
+
+Hardware is required by default, using a real CFBoolean specification and a
+post-decode hardware-property check. Explicit `require_hardware=false` permits
+platform software decode and records the actual route in `Batch.hardware`.
+The initial lane accepts static `avc1` Baseline/Main/High 8-bit 4:2:0 configuration;
+malformed lengths, unsupported profiles, and in-band parameter-set changes fail
+before packet submission. CoreMedia-derived SPS geometry must match container
+geometry before session allocation; dynamic output geometry is rejected.
+This qualifies the checked-in progressive fixtures, not every legal profile tool.
+
+Selected-frame count, packet bytes/work, retained native plane bytes, source
+pixels, and preparation allocations have limits. Decoder picture-pool admission
+uses a conservative estimate; opaque OS decoder workspace is not charged through
+the Zig allocator. Exact whole-request native/device admission still belongs to
+the production scheduling work. `Surface.fromBorrowed` retains an existing
+CoreVideo pixel buffer without copying. `Surface.map` is an explicit host lease.
+
+`MetalCache` accepts the inference backend's existing `id<MTLDevice>` and imports
+the NV12 planes into R8/RG8 textures without host pixel materialization. Imports
+retain pixel buffers and texture wrappers independently of decoder/cache owners;
+the consumer fences GPU work before releasing them.
+
+[preparation.zig](src/preparation.zig) provides portable `HostSurface` NV12 input,
+CPU `referenceHost`/`reference`, and Metal `submit`. Callers supply target geometry,
+rotation and an explicit BT.601/BT.709 SDR matrix; surface format determines full
+or video range. The eventual model adapter must resolve color metadata, chroma
+siting, pixel aspect, and geometry policy. HDR, arbitrary display transforms and
+color-policy inference are not qualified by these APIs. Chroma sampling currently
+uses the explicit nearest 4:2:0 cell convention shared by CPU and Metal paths.
+
+The Metal kernels convert sampled NV12 cells to quantized RGB, apply two-pass
+Pillow bicubic resizing with shared 22-bit integer coefficients and byte clipping,
+and pack patch-major `[patch_y, patch_x, channel]` float values. Dimensions are
+multiples of 48 for patch size 16/pooling 3; the default budget is 140 soft tokens.
+Inputs can remain in `[0,1]` or be centered to `[-1,1]` for the vision patch linear.
+Target geometry is supplied by the pinned processor adapter, not guessed here.
+The bounded horizontal RGB intermediate stays on the GPU; no full-resolution
+host RGB image is constructed by `submit`.
+
+`Prepared` owns its surface import, command and Metal patch buffer. `wait`
+checks caller control while polling with `std.Io`; destruction fences in-flight
+work even after cancellation. `buffer` is a borrowed `id<MTLBuffer>` after
+completion for the next resident consumer. `readback` is an explicit reference/
+debug path. This library handoff does not yet execute a vision tower or embedding.
+
+Qualification includes independent FFmpeg NV12 comparisons (maximum byte error
+2), a hardware-only 640×360 B-frame fixture, CPU/Metal resized patch comparisons
+across four rotations and both SDR matrices (one byte per channel after resizing),
+full-range colored borrowed planes, lease/queue lifetime, cancellation/retry,
+retention limits, and allocator-failure campaigns. Shader values allow floating
+point tolerance while resize coefficients and byte clipping are shared. Fixture
+hashes and offline tool provenance are in `testdata/decode-oracle.json`.
+
+From `zig/lib/video/` with Zig 0.17:
+
+```sh
+zig build test-video -Doptimize=ReleaseSafe
+zig build check-video -Dtarget=x86_64-linux-musl -Doptimize=ReleaseSafe
+zig build test-video -Dtarget=wasm32-wasi -Doptimize=ReleaseSafe -fwasmtime
+```
+
+Native macOS decode/GPU tests require access to platform services. Hardware-only
+qualification skips when the platform cannot create the requested decoder;
+portable-target tests explicitly skip Apple routes and test unavailable errors.
+Linux has packet indexing, frame selection, and CPU borrowed-plane preparation;
+its native H.264 decoder and NVDEC/CUDA routes remain planned. Apple frameworks
+and Objective-C sources are omitted from non-macOS builds.
+
+## Remaining module and API shape
 
 Proposed modules are `src/mod.zig`, `decoder.zig`, `surface.zig`, `sampling.zig`,
 `software/`, and optional `backends/videotoolbox.zig` and `backends/nvdec.zig`.

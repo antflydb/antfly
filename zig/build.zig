@@ -88,6 +88,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     const target = shared.target;
     const optimize = shared.optimize;
     @import("antfly_media").support.addTests(b, b.path("lib/media"), target, optimize);
+    @import("antfly_video").support.addTests(b, b.path("lib/video"), target, optimize);
     const vopr_mod = shared.vopr_mod;
     const strip = shared.strip;
     const lmdb_backend = shared.lmdb_backend;
