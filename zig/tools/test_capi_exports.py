@@ -98,7 +98,7 @@ void antfly_second(
     @unittest.skipUnless(
         platform.system() in {"Darwin", "Linux"}
         and (shutil.which("clang") or shutil.which("cc"))
-        and shutil.which("ar"),
+        and shutil.which("xcrun" if platform.system() == "Darwin" else "ar"),
         "native compiler and archiver required",
     )
     def test_native_link_policy_and_executable_and_shared_consumers(self):
@@ -133,7 +133,11 @@ int termite_metal_buffer_alloc(void) { return 8; }
                 subprocess.check_output(["xcrun", "--show-sdk-path"], text=True).strip()
             )
             archive = self.root / "api.a"
-            subprocess.run(["ar", "rcs", str(archive), str(object_file)], check=True)
+            # GNU ar can place Mach-O members at two-byte alignment. Apple's
+            # linker requires eight-byte alignment, so use the SDK archiver.
+            subprocess.run(
+                ["xcrun", "ar", "rcs", str(archive), str(object_file)], check=True
+            )
             exports.link_macho(
                 argparse.Namespace(
                     sdk=sdk,
