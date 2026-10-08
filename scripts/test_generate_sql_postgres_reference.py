@@ -1720,6 +1720,78 @@ class PostgresReferenceTest(unittest.TestCase):
             ).fetchall()
             self.assertEqual([(n, n * 10) for n in range(1, 129)], rows)
 
+    def test_wildcard_ordinals_select_rows_before_unneeded_scalar_outputs(self):
+        import psycopg
+
+        for sql, expected in (
+            (
+                "SELECT o.*,(SELECT i.y FROM (SELECT 1 AS y UNION ALL SELECT 2) i WHERE o.x=1) AS v FROM (SELECT 1 AS x UNION ALL SELECT 2) o ORDER BY 1 DESC LIMIT 1",
+                [(2, None)],
+            ),
+            (
+                "SELECT o.*,o.x+10 AS rank,(SELECT i.y FROM (SELECT 1 AS y UNION ALL SELECT 2) i WHERE o.x=1) AS v FROM (SELECT 1 AS x UNION ALL SELECT 2) o ORDER BY 2 DESC LIMIT 1",
+                [(2, 12, None)],
+            ),
+            (
+                "SELECT o.*,(SELECT o.x+10) AS rank FROM (SELECT 1 AS x UNION ALL SELECT 2) o ORDER BY 2 DESC LIMIT 1",
+                [(2, 12)],
+            ),
+            (
+                "SELECT o.*,o.*,(SELECT i.y FROM (SELECT 1 AS y UNION ALL SELECT 2) i WHERE o.x=1) AS v FROM (SELECT 1 AS x UNION ALL SELECT 2) o ORDER BY 2 DESC LIMIT 1",
+                [(2, 2, None)],
+            ),
+            (
+                "WITH c(x) AS (SELECT 1 UNION ALL SELECT 2) SELECT c.*,(SELECT i.y FROM (SELECT 1 AS y UNION ALL SELECT 2) i WHERE c.x=1) AS v FROM c ORDER BY 1 DESC LIMIT 1",
+                [(2, None)],
+            ),
+            (
+                "SELECT p.k,l.x,l.v FROM (SELECT 1 AS k) p CROSS JOIN LATERAL (SELECT q.*,(SELECT i.y FROM (SELECT 1 AS y UNION ALL SELECT 2) i WHERE q.x=p.k) AS v FROM (SELECT 1 AS x UNION ALL SELECT 2) q ORDER BY 1 DESC LIMIT 1) l",
+                [(1, 2, None)],
+            ),
+            (
+                "SELECT * FROM ((SELECT o.*,(SELECT i.y FROM (SELECT 1 AS y UNION ALL SELECT 2) i WHERE o.x=1) AS v FROM (SELECT 1 AS x UNION ALL SELECT 2) o ORDER BY 1 DESC LIMIT 1) UNION ALL SELECT 3,CAST(NULL AS BIGINT)) s ORDER BY 1",
+                [(2, None), (3, None)],
+            ),
+            (
+                "SELECT o.*,(SELECT o.x+10) AS rank FROM (SELECT 1 AS x UNION ALL SELECT 2) o ORDER BY 1 ASC LIMIT 1 OFFSET 1",
+                [(2, 12)],
+            ),
+        ):
+            with self.subTest(sql=sql):
+                self.assertEqual(expected, self.db.execute(sql).fetchall())
+        with (
+            self.assertRaises(psycopg.Error) as error,
+            self.db.transaction(force_rollback=True),
+        ):
+            self.db.execute(
+                "SELECT o.*,(SELECT i.y FROM (SELECT 1 AS y UNION ALL SELECT 2) i WHERE o.x=1) AS v FROM (SELECT 1 AS x UNION ALL SELECT 2) o ORDER BY 1 ASC LIMIT 1 OFFSET 1"
+            )
+        self.assertEqual("21000", error.exception.sqlstate)
+
+    def test_sorted_scalar_callbacks_evaluate_prefix_before_offset(self):
+        import psycopg
+
+        with self.db.transaction(force_rollback=True):
+            self.db.execute("CREATE SEQUENCE scalar_calls")
+            self.db.execute(
+                "CREATE FUNCTION scalar_callback(n bigint) RETURNS bigint LANGUAGE plpgsql VOLATILE AS $$ BEGIN PERFORM nextval('scalar_calls'); RETURN n; END $$"
+            )
+            for offset in (0, 1, 130, 512):
+                self.db.execute("SELECT setval('scalar_calls',1,false)")
+                with psycopg.RawCursor(self.db) as cursor:
+                    rows = cursor.execute(
+                        "SELECT o.*,(SELECT scalar_callback(o.x)) FROM generate_series(1,512) o(x) ORDER BY 1 DESC LIMIT $1 OFFSET $2",
+                        (2, offset),
+                    ).fetchall()
+                self.assertEqual(
+                    [(n, n) for n in range(512 - offset, max(0, 510 - offset), -1)],
+                    rows,
+                )
+                value, called = self.db.execute(
+                    "SELECT last_value,is_called FROM scalar_calls"
+                ).fetchone()
+                self.assertEqual(min(offset + 2, 512), value if called else 0)
+
     def test_quantified_correlated_boundaries_preserve_three_valued_truth(self):
         for sql, expected in (
             (

@@ -256,7 +256,7 @@ fn bindImpl(allocator: std.mem.Allocator, backend: catalog.Backend, compiled: *c
     }
     if (explicit_parameter_types.len > compiled.parameter_count) return error.InvalidSqlParameters;
     if (compiled.statement == .select) try @import("window_binding.zig").validatePlacement(compiled.statement.select);
-    if (compiled.statement == .select and @import("subquery_lowering.zig").accepts(compiled.statement.select)) {
+    if (compiled.statement == .select and @import("subquery_lowering.zig").accepts(compiled.statement.select) and !@import("subquery_lowering.zig").needsProjectionDomain(compiled.statement.select)) {
         var lowered = compiled.*;
         lowered.statement = .{ .select = try @import("subquery_lowering.zig").lower(allocator, compiled.statement.select) };
         return bindInternal(allocator, backend, &lowered, explicit_parameter_types);

@@ -997,15 +997,15 @@ test "SQL global aggregate invocation constants reuse a captured empty or nonemp
 
 test "SQL sorted scalar producers execute only selected parents and retain cold scan pruning" {
     const cases = [_]struct { sql: []const u8, calls: usize, rows: usize, scans: usize = 512 }{
-        .{ .sql = "SELECT (SELECT ai_probability(o.id,'Refund?','local')) FROM source o ORDER BY o.delta DESC LIMIT $1 OFFSET $2", .calls = 2, .rows = 2 },
+        .{ .sql = "SELECT (SELECT ai_probability(o.id,'Refund?','local')) FROM source o ORDER BY o.delta DESC LIMIT $1 OFFSET $2", .calls = 3, .rows = 2 },
         .{ .sql = "SELECT (SELECT ai_probability(o.id,'Refund?','local')) FROM source o ORDER BY o.delta DESC LIMIT 0 OFFSET $2", .calls = 0, .rows = 0, .scans = 0 },
         .{ .sql = "SELECT (SELECT ai_probability(o.id,'Refund?','local')) AS p FROM source o ORDER BY p LIMIT $1 OFFSET $2", .calls = 512, .rows = 2 },
-        .{ .sql = "SELECT o.delta AS rank,(SELECT ai_probability(o.id,'Refund?','local')) FROM source o ORDER BY rank DESC LIMIT $1 OFFSET $2", .calls = 2, .rows = 2 },
-        .{ .sql = "SELECT o.delta,(SELECT ai_probability(o.id,'Refund?','local')) FROM source o ORDER BY 1 DESC LIMIT $1 OFFSET $2", .calls = 2, .rows = 2 },
-        .{ .sql = "SELECT ai_probability(o.id,'Sort?','local') AS rank,(SELECT ai_probability(o.id,'Output?','local')) FROM source o ORDER BY rank DESC LIMIT $1 OFFSET $2", .calls = 514, .rows = 2 },
-        .{ .sql = "SELECT ai_probability(o.id,'Sort?','local') AS rank,(SELECT ai_probability(o.id,'Output?','local')) FROM source o WHERE o.delta>5000 ORDER BY rank DESC LIMIT $1 OFFSET $2", .calls = 14, .rows = 2 },
-        .{ .sql = "SELECT (SELECT ai_probability(o.id,'Sort?','local')) AS rank,(SELECT ai_probability(o.id,'Output?','local')) FROM source o ORDER BY rank DESC LIMIT $1 OFFSET $2", .calls = 514, .rows = 2 },
-        .{ .sql = "SELECT (SELECT ai_probability(o.id,'Output?','local')) FROM source o ORDER BY (SELECT ai_probability(o.id,'Sort?','local')) DESC LIMIT $1 OFFSET $2", .calls = 514, .rows = 2 },
+        .{ .sql = "SELECT o.delta AS rank,(SELECT ai_probability(o.id,'Refund?','local')) FROM source o ORDER BY rank DESC LIMIT $1 OFFSET $2", .calls = 3, .rows = 2 },
+        .{ .sql = "SELECT o.delta,(SELECT ai_probability(o.id,'Refund?','local')) FROM source o ORDER BY 1 DESC LIMIT $1 OFFSET $2", .calls = 3, .rows = 2 },
+        .{ .sql = "SELECT ai_probability(o.id,'Sort?','local') AS rank,(SELECT ai_probability(o.id,'Output?','local')) FROM source o ORDER BY rank DESC LIMIT $1 OFFSET $2", .calls = 515, .rows = 2 },
+        .{ .sql = "SELECT ai_probability(o.id,'Sort?','local') AS rank,(SELECT ai_probability(o.id,'Output?','local')) FROM source o WHERE o.delta>5000 ORDER BY rank DESC LIMIT $1 OFFSET $2", .calls = 15, .rows = 2 },
+        .{ .sql = "SELECT (SELECT ai_probability(o.id,'Sort?','local')) AS rank,(SELECT ai_probability(o.id,'Output?','local')) FROM source o ORDER BY rank DESC LIMIT $1 OFFSET $2", .calls = 515, .rows = 2 },
+        .{ .sql = "SELECT (SELECT ai_probability(o.id,'Output?','local')) FROM source o ORDER BY (SELECT ai_probability(o.id,'Sort?','local')) DESC LIMIT $1 OFFSET $2", .calls = 515, .rows = 2 },
         .{ .sql = "SELECT (SELECT ai_probability(o.id,'Refund?','local')) FROM source o LIMIT $1 OFFSET $2", .calls = 3, .rows = 2, .scans = 3 },
     };
     for (cases) |case| {
@@ -1131,6 +1131,32 @@ test "SQL target-only mutation subqueries share one captured relational plan" {
         try std.testing.expectEqual(@as(usize, 1), backend.closes);
         try std.testing.expectEqual(@as(usize, 1), backend.commits);
         try std.testing.expectEqual(@as(usize, 2), backend.writes);
+    }
+}
+
+test "SQL sorted wildcard projection pins one catalog identity and evaluates only the selected prefix" {
+    for ([_]usize{ 0, 1, 130, 512 }) |offset| {
+        var backend: Backend = .{ .returning_mode = true, .row_count = 512 };
+        var provider: @import("antfly_local_sources").sql_decision_eval.testing.Provider = .{};
+        var iface = backend.backend();
+        iface.decision_provider = provider.provider();
+        var compiled = try compiler.compile(std.testing.allocator, "SELECT o.*,(SELECT ai_probability(o.id,'Output?','local')) AS p FROM source o ORDER BY 2 DESC LIMIT $1 OFFSET $2", .{});
+        defer compiled.deinit();
+        var result = try runtime.execute(std.testing.allocator, iface, &compiled, &.{ .{ .integer = 2 }, .{ .integer = @intCast(offset) } }, .{ .page_rows = 4 });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, if (offset == 512) 0 else 2), result.output.rows.len);
+        try std.testing.expectEqual(@min(offset + 2, 512), provider.calls);
+        try std.testing.expectEqual(@as(usize, 1), backend.source_resolves);
+        try std.testing.expectEqual(@as(usize, 512), backend.rows_read);
+        try std.testing.expectEqual(@as(usize, 1), backend.last_scan_count);
+        try std.testing.expectEqual(@as(usize, 1), backend.captures);
+        try std.testing.expectEqual(@as(usize, 1), backend.closes);
+        try std.testing.expectEqualStrings("id", result.output.columns[0].name);
+        try std.testing.expectEqualStrings("delta", result.output.columns[1].name);
+        for (result.output.rows, 0..) |row, index| {
+            try std.testing.expectEqual((512 - offset - index) * 10, try std.fmt.parseInt(usize, row[1].string, 10));
+            try std.testing.expectApproxEqAbs(@as(f64, 0.9), row[2].float, 0.00001);
+        }
     }
 }
 

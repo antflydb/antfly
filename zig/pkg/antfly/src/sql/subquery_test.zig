@@ -200,6 +200,46 @@ test "SQL sorted scalar outputs retain computed aliases and NULL provenance" {
     }
 }
 
+test "SQL sorted wildcard scalar outputs bind ordinals before selection" {
+    var backend: Backend = .{};
+    for ([_]struct { sql: []const u8, rows: []const u8 }{
+        .{ .sql = "SELECT o.*,(SELECT i.y FROM (SELECT 1 AS y UNION ALL SELECT 2) i WHERE o.x=1) AS v FROM (SELECT 1 AS x UNION ALL SELECT 2) o ORDER BY 1 DESC LIMIT 1", .rows = "[[\"2\",null]]" },
+        .{ .sql = "SELECT o.*,o.x+10 AS rank,(SELECT i.y FROM (SELECT 1 AS y UNION ALL SELECT 2) i WHERE o.x=1) AS v FROM (SELECT 1 AS x UNION ALL SELECT 2) o ORDER BY 2 DESC LIMIT 1", .rows = "[[\"2\",\"12\",null]]" },
+        .{ .sql = "SELECT o.*,(SELECT o.x+10) AS rank FROM (SELECT 1 AS x UNION ALL SELECT 2) o ORDER BY 2 DESC LIMIT 1", .rows = "[[\"2\",\"12\"]]" },
+        .{ .sql = "SELECT o.*,(SELECT o.x+10) AS rank FROM (SELECT 1 AS x UNION ALL SELECT 2) o ORDER BY 1 ASC LIMIT 1 OFFSET 1", .rows = "[[\"2\",\"12\"]]" },
+        .{ .sql = "SELECT o.*,o.*,(SELECT i.y FROM (SELECT 1 AS y UNION ALL SELECT 2) i WHERE o.x=1) AS v FROM (SELECT 1 AS x UNION ALL SELECT 2) o ORDER BY 2 DESC LIMIT 1", .rows = "[[\"2\",\"2\",null]]" },
+        .{ .sql = "WITH c(x) AS (SELECT 1 UNION ALL SELECT 2) SELECT c.*,(SELECT i.y FROM (SELECT 1 AS y UNION ALL SELECT 2) i WHERE c.x=1) AS v FROM c ORDER BY 1 DESC LIMIT 1", .rows = "[[\"2\",null]]" },
+        .{ .sql = "SELECT p.k,l.x,l.v FROM (SELECT 1 AS k) p CROSS JOIN LATERAL (SELECT q.*,(SELECT i.y FROM (SELECT 1 AS y UNION ALL SELECT 2) i WHERE q.x=p.k) AS v FROM (SELECT 1 AS x UNION ALL SELECT 2) q ORDER BY 1 DESC LIMIT 1) l", .rows = "[[\"1\",\"2\",null]]" },
+        .{ .sql = "SELECT * FROM ((SELECT o.*,(SELECT i.y FROM (SELECT 1 AS y UNION ALL SELECT 2) i WHERE o.x=1) AS v FROM (SELECT 1 AS x UNION ALL SELECT 2) o ORDER BY 1 DESC LIMIT 1) UNION ALL SELECT 3,CAST(NULL AS BIGINT)) s ORDER BY 1", .rows = "[[\"2\",null],[\"3\",null]]" },
+    }) |case| {
+        var compiled = try compiler.compile(std.testing.allocator, case.sql, .{});
+        defer compiled.deinit();
+        var result = try runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{});
+        defer result.deinit();
+        const rows = try std.json.Stringify.valueAlloc(std.testing.allocator, result.output.rows, .{});
+        defer std.testing.allocator.free(rows);
+        try std.testing.expectEqualStrings(case.rows, rows);
+    }
+    var skipped = try compiler.compile(std.testing.allocator, "SELECT o.*,(SELECT i.y FROM (SELECT 1 AS y UNION ALL SELECT 2) i WHERE o.x=1) AS v FROM (SELECT 1 AS x UNION ALL SELECT 2) o ORDER BY 1 ASC LIMIT 1 OFFSET 1", .{});
+    defer skipped.deinit();
+    try std.testing.expectError(error.SqlCardinalityViolation, runtime.execute(std.testing.allocator, backend.backend(), &skipped, &.{}, .{}));
+}
+
+test "SQL sorted wildcard ordinal staging releases all allocations" {
+    const Faults = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var backend: Backend = .{};
+            var compiled = try compiler.compile(a, "SELECT o.*,(SELECT o.x+10) AS rank FROM (SELECT 1 AS x UNION ALL SELECT 2) o ORDER BY 1 ASC LIMIT $1 OFFSET $2", .{});
+            defer compiled.deinit();
+            var result = try runtime.execute(a, backend.backend(), &compiled, &.{ .{ .integer = 1 }, .{ .integer = 1 } }, .{});
+            defer result.deinit();
+            try std.testing.expectEqual(@as(usize, 1), result.output.rows.len);
+            try std.testing.expectEqualStrings("12", result.output.rows[0][1].string);
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Faults.run, .{});
+}
+
 test "SQL row bounds validate negative parameters at execution in their own domain" {
     var backend: Backend = .{};
     for ([_]struct { sql: []const u8, code: []const u8 }{

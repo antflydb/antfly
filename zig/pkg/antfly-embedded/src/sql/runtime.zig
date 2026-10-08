@@ -509,6 +509,24 @@ pub const Context = struct {
         self.backend = @import("decision_eval.zig").scopedBackend(self.backend, self.binding);
         try @import("decision_eval.zig").validateStatement(self.arena, self.backend.decision_provider, self.binding, self.parameters);
         var statement = requested;
+        if (statement.selection_prefix) {
+            if (!statement.internal_projection) return error.InvalidSqlBackendResponse;
+            const skipped = try self.offsetCount(statement.offset);
+            if (skipped > self.limits.scan_rows) return error.SqlProgramLimitExceeded;
+            if (try self.hasRowLimit(statement.limit) or statement.scalar_cardinality_limit) {
+                const requested_rows = statement.capRows(try self.count(statement.limit, 2));
+                const prefix = if (requested_rows == 0) 0 else std.math.add(usize, skipped, requested_rows) catch return error.SqlProgramLimitExceeded;
+                if (prefix > self.limits.scan_rows) return error.SqlProgramLimitExceeded;
+                statement.limit = .{ .integer = std.math.cast(i64, prefix) orelse return error.SqlProgramLimitExceeded };
+            } else statement.limit = null;
+            statement.offset = null;
+            statement.scalar_cardinality_limit = false;
+            statement.selection_prefix = false;
+            // This transparent sorted cursor may forward a large skipped
+            // prefix. Public output quotas still belong to its outer consumer;
+            // storage scan, retained-memory and spill limits remain in force.
+            self.limits.result_rows = self.limits.scan_rows;
+        }
         if (statement.limit != null and !try self.hasRowLimit(statement.limit))
             statement.limit = if (statement.scalar_cardinality_limit) .{ .integer = 2 } else null;
         // A scalar child's internal two-row bound is physical demand, not an

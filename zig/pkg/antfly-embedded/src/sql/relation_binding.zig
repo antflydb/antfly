@@ -399,13 +399,46 @@ const Builder = struct {
         return expressions;
     }
 
+    fn lowerSubqueries(self: *Builder, statement: ast.Select, scope: []const ast.Cte, depth: usize) anyerror!ast.Select {
+        const subqueries = @import("subquery_lowering.zig");
+        if (!subqueries.accepts(statement)) return statement;
+        var prepared = statement;
+        if (subqueries.needsOwnProjectionDomain(statement)) {
+            // Only the source's catalog shape is needed. Keep its authorized
+            // identities for executable binding so wildcard ordinals cannot
+            // observe a different schema epoch or add physical scan readers.
+            var shape: Builder = .{
+                .alloc = self.alloc,
+                .backend = self.backend,
+                .parameters = self.parameters,
+                .identities = self.identities,
+                .shape_only = true,
+                .node_limit = self.node_limit,
+                .outer_scope = self.outer_scope,
+                .outer_next = self.outer_next,
+                .recursive_active = self.recursive_active,
+                .recursive_next = self.recursive_next,
+            };
+            const source = try shape.querySource(statement, scope, depth + 1);
+            self.identities = shape.identities;
+            const expanded = try expandWildcards(self.alloc, source.columns, statement.columns, null);
+            const projections = try self.alloc.dupe(ast.Projection, expanded);
+            for (projections) |*projection| if (projection.bound_column) |ordinal| {
+                const column = source.columns[ordinal];
+                projection.field = if (column.qualifier.len == 0) column.name else try std.fmt.allocPrint(self.alloc, "{s}\x00{s}", .{ column.qualifier, column.name });
+                projection.bound_column = null;
+            };
+            prepared.columns = projections;
+        }
+        return subqueries.lower(self.alloc, prepared);
+    }
+
     fn inferShape(self: *Builder, statement: ast.Select, expected: []const ast.ColumnType) !void {
         // RETURNING/assignment inference enters directly, before describe's
         // ordinary SELECT normalization. Use the same relational boundary so
         // parameters inside scalar children (including LIMIT) are constrained
         // in their own domain instead of compiling $scalar as a scalar builtin.
-        const subqueries = @import("subquery_lowering.zig");
-        const normalized = if (subqueries.accepts(statement)) try subqueries.lower(self.alloc, statement) else statement;
+        const normalized = try self.lowerSubqueries(statement, &.{}, 0);
         const root = try self.querySource(normalized, &.{}, 0);
         const expressions = try self.constrainSelect(root, try self.lower(root, normalized));
         if (self.assignment_expected.len != 0) {
@@ -448,8 +481,9 @@ const Builder = struct {
 
     fn collectSet(self: *Builder, query: *const ast.Select, scope: []const ast.Cte, leaves: *std.ArrayList(*const ast.Select), depth: usize) anyerror!void {
         if (depth > 32) return error.SqlProgramLimitExceeded;
-        const source = try self.querySource(query.*, scope, depth + 1);
-        const lowered = try self.lower(source, query.*);
+        const normalized = try self.lowerSubqueries(query.*, scope, depth);
+        const source = try self.querySource(normalized, scope, depth + 1);
+        const lowered = try self.lower(source, normalized);
         const expressions = try self.alloc.alloc(*const ast.Scalar, if (lowered.count_all) 1 else lowered.columns.len);
         if (lowered.count_all) {
             expressions[0] = try self.scalarNode(.{ .literal = .{ .integer = 0 } });
@@ -1051,12 +1085,12 @@ const Builder = struct {
     }
 
     fn derivedContext(self: *Builder, query: *const ast.Select, alias: []const u8, names: []const []const u8, scope: []const ast.Cte, depth: usize, resolve_unknown: bool) anyerror!*const Node {
-        if (@import("subquery_lowering.zig").accepts(query.*)) {
+        const prepared: ?Prepared = if (self.prepared.fetchRemove(query)) |entry| entry.value else null;
+        if (prepared == null and query.set_operation == null and query.values_arms.len == 0 and @import("subquery_lowering.zig").accepts(query.*)) {
             const rewritten = try self.alloc.create(ast.Select);
-            rewritten.* = try @import("subquery_lowering.zig").lower(self.alloc, query.*);
+            rewritten.* = try self.lowerSubqueries(query.*, scope, depth);
             return self.derivedContext(rewritten, alias, names, scope, depth + 1, resolve_unknown);
         }
-        const prepared: ?Prepared = if (self.prepared.fetchRemove(query)) |entry| entry.value else null;
         var child = if (prepared) |entry| entry.source else try self.querySource(query.*, scope, depth + 1);
         var lowered = if (prepared) |entry| entry.lowered else try self.lower(child, query.*);
         if (self.shape_only) {
@@ -1615,13 +1649,14 @@ fn validateAggregateLevel(alloc: Allocator, columns: []const Column, input: *con
 
 pub fn bind(alloc: Allocator, backend: catalog.Backend, statement: ast.Select, parameters: []?ast.ColumnType) anyerror!Bound {
     var builder: Builder = .{ .alloc = alloc, .backend = backend, .parameters = parameters, .node_limit = if (statement.generated_values) 8192 else 256 };
+    const normalized = try builder.lowerSubqueries(statement, &.{}, 0);
     if (std.mem.indexOfScalar(?ast.ColumnType, parameters, null) != null) {
-        var shape: Builder = .{ .alloc = alloc, .backend = backend, .parameters = parameters, .shape_only = true, .node_limit = if (statement.generated_values) 8192 else 256 };
-        try shape.inferShape(statement, &.{});
+        var shape: Builder = .{ .alloc = alloc, .backend = backend, .parameters = parameters, .identities = builder.identities, .shape_only = true, .node_limit = if (statement.generated_values) 8192 else 256 };
+        try shape.inferShape(normalized, &.{});
         builder.identities = shape.identities;
     }
-    const root = try builder.querySource(statement, &.{}, 0);
-    const lowered = try builder.lower(root, statement);
+    const root = try builder.querySource(normalized, &.{}, 0);
+    const lowered = try builder.lower(root, normalized);
     var needed: std.StringHashMapUnmanaged(void) = .empty;
     try markSelect(alloc, &needed, lowered);
     try projectScans(&builder, root, &needed);

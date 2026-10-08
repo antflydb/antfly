@@ -704,7 +704,7 @@ by their own semantics.
 
 Row-source scalar projections now have a transparent selection stage: sort-required
 producers execute before sorting, while independent output producers execute only
-for selected rows. Computed sort aliases retain one materialized value, reused by
+for the sorted prefix consumed by OFFSET plus LIMIT. Computed sort aliases retain one materialized value, reused by
 the final projection. The stage preserves original column identities, correlation
 frames and NULL provenance instead of introducing a user-visible derived scope.
 Cold forwarded columns do not become physical scan dependencies; an internal
@@ -712,10 +712,11 @@ Cold forwarded columns do not become physical scan dependencies; an internal
 pulls propagate remaining output demand without reducing residual-filter scan
 capacity or truncating join builds.
 
-Native counters check 512 sort candidates with only two independent output
-invocations, 512 required sort invocations plus two output invocations, and twelve
-WHERE-qualified sort invocations plus two outputs. All use one captured read.
-Without sorting, PostgreSQL's projection-before-OFFSET behavior is retained:
+Native counters check 512 sort candidates with only three independent output
+invocations for LIMIT 2 OFFSET 1, 512 required sort invocations plus three output
+invocations, and twelve WHERE-qualified sort invocations plus three outputs.
+All use one captured read. PostgreSQL's projection-before-OFFSET behavior is
+retained with and without sorting:
 LIMIT 2 OFFSET 1 demands exactly three scalar outputs and source rows, and a
 cardinality failure on a skipped row remains observable. These are tested plan
 contracts, not a promise of identical error precedence across PostgreSQL optimizer
@@ -739,8 +740,18 @@ enumeration covers the final permutation's ownership across multiple window
 specifications. Window input explicitly clears that scalar-result bound: COUNT,
 SUM, frame calculations and sort keys must still see all required input rows.
 
-General grouped/window scalar-subquery output staging, cross-level aggregate lifting and wildcard
-ORDER BY ordinal mapping remain unfinished. These shared execution regressions
+Wildcard ORDER BY ordinals now expand against a catalog-only source view before
+selection staging. Its identity cache is retained for executable binding, with
+one schema resolution and one physical read capture. Derived/CTE/set-arm/lateral
+domains preserve positional order and output labels. Internal sorted prefixes
+retain OFFSET rows for projection without spending the public response-row
+quota on those skipped rows; scan, retained-memory and spill budgets still apply.
+PostgreSQL callback counters and native provider counters verify prefix demand
+at offsets 0, 1, 130 and 512. Allocation-fault and mounted endpoint checks cover
+successful discarded-tail selection and errors on consumed prefix/sort rows.
+
+General grouped/window scalar-subquery output staging and cross-level aggregate
+lifting remain unfinished. These shared execution regressions
 do not independently change the original-case dispositions.
 
 ### Shared streaming ordered-set execution

@@ -1108,6 +1108,23 @@ fn rowProjectionReads(statement: ast.Select) bool {
     return false;
 }
 
+pub fn needsOwnProjectionDomain(statement: ast.Select) bool {
+    if (statement.order_by.len == 0 or !rowProjectionReads(statement)) return false;
+    const positional = for (statement.order_by) |order| {
+        if (order.position != null) break true;
+    } else false;
+    if (!positional) return false;
+    for (statement.columns) |column| if (column.wildcard) return true;
+    return false;
+}
+
+pub fn needsProjectionDomain(statement: ast.Select) bool {
+    if (needsOwnProjectionDomain(statement)) return true;
+    for (statement.values_arms) |arm| if (needsProjectionDomain(arm.*)) return true;
+    if (statement.set_operation) |set| return needsProjectionDomain(set.left.*) or needsProjectionDomain(set.right.*);
+    return false;
+}
+
 fn selectionOrders(alloc: Allocator, statement: ast.Select) !?[]ast.Order {
     if (statement.order_by.len == 0 or !rowProjectionReads(statement)) return null;
     var wildcard = false;
@@ -1137,7 +1154,7 @@ pub fn lower(alloc: Allocator, statement: ast.Select) !ast.Select {
         const arms = try alloc.alloc(*const ast.Select, statement.values_arms.len);
         for (statement.values_arms, arms) |arm, *out| {
             const rewritten = try alloc.create(ast.Select);
-            rewritten.* = if (accepts(arm.*)) try lower(alloc, arm.*) else arm.*;
+            rewritten.* = if (accepts(arm.*) and !needsOwnProjectionDomain(arm.*)) try lower(alloc, arm.*) else arm.*;
             out.* = rewritten;
         }
         var result = statement;
@@ -1146,9 +1163,9 @@ pub fn lower(alloc: Allocator, statement: ast.Select) !ast.Select {
     }
     if (statement.set_operation) |set| {
         const left = try alloc.create(ast.Select);
-        left.* = if (accepts(set.left.*)) try lower(alloc, set.left.*) else set.left.*;
+        left.* = if (accepts(set.left.*) and !needsOwnProjectionDomain(set.left.*)) try lower(alloc, set.left.*) else set.left.*;
         const right = try alloc.create(ast.Select);
-        right.* = if (accepts(set.right.*)) try lower(alloc, set.right.*) else set.right.*;
+        right.* = if (accepts(set.right.*) and !needsOwnProjectionDomain(set.right.*)) try lower(alloc, set.right.*) else set.right.*;
         var result = statement;
         result.set_operation = .{ .kind = set.kind, .all = set.all, .left = left, .right = right };
         return result;
@@ -1196,6 +1213,7 @@ pub fn lower(alloc: Allocator, statement: ast.Select) !ast.Select {
         if (needs_row_demand) demand = try builder.testValue(.is_true, value);
     }
     const columns = try alloc.dupe(ast.Projection, statement.columns);
+    var sorted_offset = false;
     if (try selectionOrders(alloc, statement)) |orders| {
         for (orders) |*order| if (order.expression) |value| {
             if (value.* == .column) continue;
@@ -1222,7 +1240,9 @@ pub fn lower(alloc: Allocator, statement: ast.Select) !ast.Select {
             .limit = statement.limit,
             .offset = statement.offset,
             .scalar_cardinality_limit = statement.scalar_cardinality_limit,
+            .selection_prefix = statement.offset != null,
         };
+        sorted_offset = statement.offset != null;
         builder.source = try builder.relation(.{ .derived = .{ .query = selected, .alias = "$selected", .preserve_scope = true } });
         result.predicate = null;
         result.order_by = &.{};
@@ -1248,5 +1268,16 @@ pub fn lower(alloc: Allocator, statement: ast.Select) !ast.Select {
     result.order_by = orders;
     result.source = builder.source;
     result.table = null;
+    if (sorted_offset) {
+        const projected = try alloc.create(ast.Select);
+        projected.* = result;
+        return .{
+            .source = try builder.relation(.{ .derived = .{ .query = projected, .alias = "$sorted_offset_output" } }),
+            .limit = statement.limit,
+            .offset = statement.offset,
+            .scalar_cardinality_limit = statement.scalar_cardinality_limit,
+            .required_output_columns = statement.required_output_columns,
+        };
+    }
     return result;
 }

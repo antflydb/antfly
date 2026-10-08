@@ -133,6 +133,9 @@ pub const Select = struct {
     /// A compiler-owned transparent selection frame already carries the
     /// enclosing query's outer bindings; do not append them a second time.
     selection_staged: bool = false,
+    /// Internal sorted prefix includes OFFSET rows for post-sort projection.
+    /// The enclosing consumer applies OFFSET only after those values exist.
+    selection_prefix: bool = false,
     /// Compiler-only ordinal forwarding; its width is not a user projection
     /// or a physical storage-field request. Retained-memory limits still apply.
     internal_projection: bool = false,
