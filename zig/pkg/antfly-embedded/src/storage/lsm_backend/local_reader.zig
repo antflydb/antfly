@@ -104,7 +104,8 @@ pub const Pool = struct {
         }
     }
     /// Caller owns mutex; this returns with it unlocked. The stack waiter is
-    /// detached before notification, so neither reuse nor teardown races it.
+    /// detached before notification. Reacquiring the mutex below fences the
+    /// notifier's final access, including Event.set's wake operation.
     fn waitLocked(self: *Pool, io: ?std.Io) void {
         var waiter = Waiter{ .next = self.waiters, .io = io };
         self.waiters = &waiter;
@@ -112,6 +113,10 @@ pub const Pool = struct {
         if (io) |owned| waiter.done.waitUncancelable(owned) else {
             while (!waiter.notified.load(.acquire)) platform.time.yieldBriefly();
         }
+        // Waking is not proof that notifyLocked has finished accessing this
+        // stack frame. Keep it alive until the notifier releases the mutex.
+        platform.sync.lockYielding(&self.mutex);
+        self.mutex.unlock();
     }
 
     pub const Workspace = struct {
@@ -322,4 +327,42 @@ test "lsm local decoder byte gate admits oversized work alone and wakes waiters"
     try std.testing.expect(waiting);
     try std.testing.expectEqual(@as(usize, 128 * 1024), pool.peak_active_bytes);
     try std.testing.expectEqual(@as(usize, 0), pool.active);
+}
+
+test "lsm local waiter keeps stack alive until notifier unlocks with and without io" {
+    const Worker = struct {
+        pool: *Pool,
+        io: ?std.Io,
+        returned: std.Io.Event = .unset,
+        fn run(self: *@This()) void {
+            platform.sync.lockYielding(&self.pool.mutex);
+            self.pool.waitLocked(self.io);
+            self.returned.set(std.testing.io);
+        }
+    };
+    for ([_]?std.Io{ null, std.testing.io }) |io| {
+        var pool: Pool = .{};
+        defer pool.deinit();
+        var worker = Worker{ .pool = &pool, .io = io };
+        const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+        defer thread.join();
+        const deadline = std.Io.Clock.awake.now(std.testing.io).addDuration(.fromSeconds(5));
+        while (true) {
+            platform.sync.lockYielding(&pool.mutex);
+            if (pool.waiters != null) break;
+            pool.mutex.unlock();
+            if (std.Io.Clock.awake.now(std.testing.io).nanoseconds >= deadline.nanoseconds) return error.WaiterNotRegistered;
+            platform.time.yieldBriefly();
+        }
+        pool.notifyLocked();
+        const returned_early = blk: {
+            defer pool.mutex.unlock();
+            // Give the awakened thread an opportunity to return while the
+            // notifier still owns the stack-lifetime fence.
+            std.testing.io.sleep(.fromMilliseconds(100), .awake) catch {};
+            break :blk worker.returned.isSet();
+        };
+        worker.returned.waitUncancelable(std.testing.io);
+        try std.testing.expect(!returned_early);
+    }
 }
