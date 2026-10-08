@@ -1019,9 +1019,11 @@ test "serverless objectstore-backed artifacts preserve distinct client and resul
     try std.testing.expectEqual(@as(u64, "allocator-safe".len), stat.byte_len);
     try store.verifyContentWithCancellationUsingAllocator(result_alloc, meta.artifact_id, meta.byte_len, meta.checksum, .none);
 
-    var query_buffer: [1024]u8 = undefined;
-    var query_fba = std.heap.FixedBufferAllocator.init(&query_buffer);
-    const query_alloc = query_fba.allocator();
+    // A fixed buffer only reclaims its tail, so its cursor cannot prove that
+    // metadata freed before a retained body was released is leak-free.
+    var query_budget = @import("antfly_local_sources").storage_test_allocator.BoundedAllocator.init(result_alloc, 1024);
+    defer std.debug.assert(query_budget.deinit() == 0);
+    const query_alloc = query_budget.allocator();
     const verified = try store.getVerifiedAllocWithCancellationUsingAllocator(
         query_alloc,
         meta.artifact_id,
@@ -1029,9 +1031,9 @@ test "serverless objectstore-backed artifacts preserve distinct client and resul
         meta.checksum,
         .none,
     );
-    try std.testing.expect(query_fba.ownsSlice(verified));
+    try std.testing.expectEqual(verified.len, query_budget.live);
     query_alloc.free(verified);
-    try std.testing.expectEqual(@as(usize, 0), query_fba.end_index);
+    try std.testing.expectEqual(@as(usize, 0), query_budget.live);
 
     const key = try keyForChecksumAlloc(result_alloc, "tenant/a", meta.checksum);
     defer result_alloc.free(key);
