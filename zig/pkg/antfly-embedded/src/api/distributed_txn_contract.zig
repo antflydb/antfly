@@ -69,6 +69,29 @@ pub const PreDecisionContext = struct {
     }
 };
 
+/// Invocation-owned commit authority. The original pre-decision fences are
+/// separate from post-commit response cancellation; neither may replace the
+/// independent authority needed to finish or recover accepted mutations.
+pub const CommitControl = struct {
+    team: ?*@import("antfly_runtime_abi").runnable_abi.Team = null,
+    pre_decision: PreDecisionContext = .{},
+
+    pub fn requiresAwareCallback(self: CommitControl) bool {
+        return self.team != null or self.pre_decision.requiresAwareCallback();
+    }
+
+    pub fn fromRequest(request: @import("operation.zig").RequestContext) CommitControl {
+        return .{
+            .team = request.execution_team,
+            .pre_decision = .{
+                .deadline_ns = request.deadline_ns,
+                .deadline_io = request.deadline_io,
+                .cancellation = request.cancellation,
+            },
+        };
+    }
+};
+
 /// Authenticated private recovery observation. A locator is never authority by
 /// itself: hidden owner handlers validate the exact plan and scope together.
 pub const TxnStatusRequest = struct {

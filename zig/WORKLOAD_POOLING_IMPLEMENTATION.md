@@ -1300,3 +1300,17 @@ worker now captures a deadline before routing and shares it across participants,
 BEGIN, PREPARE and retries; its actual worker regression and full production
 gates still need to run. SQL ingress and physical durability deadline coverage
 remain pending, so these focused results do not enable defaults.
+
+### Original commit-control callback contract (2026-10-08, focused gates passed)
+
+CommitControl carries the request-owned execution team and original pre-decision
+deadline, clock and cancellation independently of post-commit visibility
+cancellation. New batch/stable-ID callbacks fail closed when a supplied control
+would otherwise be discarded. All six compiled callback tests pass on native
+macOS and pinned Nix/glibc Linux, including foreign dispatch and exact fallible
+fence errors; [receipts](qualification/workload-pooling/receipts/2026-10-08/sql-commit-control/README.md)
+pin the tested RequestContext execution-team field and boundary source. Hosted
+worker/retry wiring and its actual no-skip regression are proposed separately
+and still require production qualification. Provisioned/bound sources, SQL
+ingress adoption and physical durability waits remain pending. Defaults remain
+disabled.
