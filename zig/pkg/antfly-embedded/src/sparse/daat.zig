@@ -19,7 +19,17 @@ pub const Entry = struct {
     }
 };
 pub const Stats = struct { scored: usize = 0, skipped_blocks: usize = 0 };
+pub const BlockReader = struct {
+    ptr: *anyopaque,
+    resident: *usize,
+    read: *const fn (*anyopaque, A, u64, u32, u64) anyerror!?[]u8,
+};
 pub const Stream = struct {
+    reader: ?BlockReader = null,
+    allocator: ?A = null,
+    owned: ?[]u8 = null,
+    term: u32 = 0,
+    seek_target: u64 = 0,
     segment: ?u64 = null,
     version: u32 = 1,
     weight: f32,
@@ -34,18 +44,46 @@ pub const Stream = struct {
     min_weight: f32 = 0,
     step: f32 = 0,
     upper: f32 = 0,
+    pub fn deinit(self: *Stream) void {
+        if (self.owned) |bytes| {
+            self.reader.?.resident.* -= bytes.len;
+            self.allocator.?.free(bytes);
+        }
+        self.owned = null;
+    }
+    pub fn seek(self: *Stream, target: u64) !void {
+        if (target > std.math.maxInt(u32)) {
+            self.doc = null;
+            return;
+        }
+        if (self.reader != null and (self.doc == null or target > self.last)) {
+            self.seek_target = target;
+            try self.load();
+        }
+        while (self.doc) |doc| {
+            if (doc >= target) break;
+            try self.advance();
+        }
+    }
     pub fn advance(self: *Stream) !void {
         if (self.doc != null and self.index + 1 < self.count) {
             self.index += 1;
             self.doc = std.math.add(u32, self.doc.?, std.mem.readInt(u32, self.chunk[13 + @as(usize, self.index) * 4 ..][0..4], .little)) catch return error.InvalidChunk;
             return;
         }
+        if (self.reader != null and self.doc != null) self.seek_target = @as(u64, self.last) + 1;
         try self.load();
     }
     fn load(self: *Stream) !void {
         const prior = self.doc;
         self.doc = null;
         var ordinal_bounds: ?[2]u32 = null;
+        if (self.reader) |reader| {
+            self.deinit();
+            self.owned = try reader.read(reader.ptr, self.allocator.?, self.segment.?, self.term, self.seek_target);
+            self.payload = self.owned orelse return;
+            self.offset = 0;
+        }
         const bytes = if (self.single) |bytes| blk: {
             self.single = null;
             break :blk bytes;
@@ -106,6 +144,7 @@ pub const Stream = struct {
                 stats.skipped_blocks += 1;
                 // Retain the last ordinal as a cross-block ordering fence.
                 self.doc = self.last;
+                if (self.reader != null) self.seek_target = @as(u64, end) + 1;
                 try self.load();
             } else try self.advance();
         }
@@ -126,13 +165,29 @@ pub fn collect(a: A, streams: []Stream, k: usize, context: anytype, stats: *Stat
     defer queue.deinit(a);
     for (streams, 0..) |*stream, i| {
         try context.check();
-        try stream.advance();
+        if (comptime @hasDecl(@typeInfo(@TypeOf(context)).pointer.child, "nextCandidate")) {
+            if (stream.reader != null) {
+                try stream.seek(context.nextCandidate(0));
+            } else {
+                try stream.advance();
+                if (stream.doc) |doc| try stream.seek(context.nextCandidate(doc));
+            }
+        } else try stream.advance();
         if (stream.doc != null) try queue.push(a, i);
     }
     var next_bounds: u64 = 0;
     while (queue.peek()) |first| {
         try context.check();
         const doc = streams[first].doc.?;
+        if (comptime @hasDecl(@typeInfo(@TypeOf(context)).pointer.child, "nextCandidate")) {
+            const candidate = context.nextCandidate(doc);
+            if (candidate > doc) {
+                _ = queue.pop();
+                try streams[first].seek(candidate);
+                if (streams[first].doc != null) try queue.push(a, first);
+                continue;
+            }
+        }
         if (comptime @hasDecl(@typeInfo(@TypeOf(context)).pointer.child, "mayMatch")) {
             if (!context.mayMatch(doc, streams[first].last)) {
                 _ = queue.pop();

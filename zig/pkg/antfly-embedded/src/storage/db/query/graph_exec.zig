@@ -3235,6 +3235,86 @@ pub const CompiledPatternFilter = union(enum) {
             return if (std.mem.eql(u8, canonical, self.term.value)) value else null;
         }
 
+        /// A batch kernel is admitted only when it has the same scalar domain
+        /// as the authoritative matcher. Mixed wide integer/float bounds retain
+        /// its exact scalar comparison instead of rounding integer endpoints.
+        pub fn NumericKernel(comptime T: type) type {
+            return struct {
+                lower: ?T = null,
+                upper: ?T = null,
+                inclusive_lower: bool = true,
+                inclusive_upper: bool = true,
+                fn operand(value: std.json.Value) ?T {
+                    if (T == i64) return if (value == .integer) value.integer else null;
+                    return switch (value) {
+                        .float => |number| if (std.math.isFinite(number)) number else null,
+                        .integer => |number| if (number >= -9007199254740992 and number <= 9007199254740992) @floatFromInt(number) else null,
+                        else => null,
+                    };
+                }
+            };
+        }
+        pub fn numericKernel(self: FieldPredicate, comptime T: type) !?NumericKernel(T) {
+            const Kernel = NumericKernel(T);
+            if (self == .term) {
+                if (T == i64) {
+                    const value = (try self.integerTerm()) orelse return null;
+                    return .{ .lower = value, .upper = value };
+                }
+                if (self.term.kind != pathfact_mod.kindFromJsonValue(.{ .float = 0 })) return null;
+                const value = std.fmt.parseFloat(f64, self.term.value) catch return null;
+                // Canonical term matching distinguishes signed zero spellings.
+                if (!std.math.isFinite(value) or value == 0) return null;
+                var bytes: [64]u8 = undefined;
+                const canonical = try jsonScalarTermSlice(.{ .float = value }, &bytes);
+                if (!std.mem.eql(u8, canonical, self.term.value)) return null;
+                return .{ .lower = value, .upper = value };
+            }
+            if (self == .standard_range) {
+                if (self.standard_range != .object) return null;
+                const bounds = (try self.standardBounds()).?;
+                if (bounds.lower == null and bounds.upper == null) return null;
+                var result: Kernel = .{};
+                if (bounds.lower) |bound| {
+                    result.lower = Kernel.operand(bound.value) orelse return null;
+                    result.inclusive_lower = bound.inclusive;
+                }
+                if (bounds.upper) |bound| {
+                    result.upper = Kernel.operand(bound.value) orelse return null;
+                    result.inclusive_upper = bound.inclusive;
+                }
+                return result;
+            }
+            if (T == f64 and self == .numeric_range) {
+                const range = self.numeric_range;
+                if (range != .object) return null;
+                var result: Kernel = .{};
+                if (range.object.get("min")) |value| result.lower = try jsonNumberFromValue(value);
+                if (range.object.get("max")) |value| result.upper = try jsonNumberFromValue(value);
+                if (result.lower) |value| if (!std.math.isFinite(value)) return null;
+                if (result.upper) |value| if (!std.math.isFinite(value)) return null;
+                if (result.lower == null and result.upper == null) return null;
+                result.inclusive_lower = try jsonPatternBoolOrDefault(range.object.get("inclusive_min"), true);
+                result.inclusive_upper = try jsonPatternBoolOrDefault(range.object.get("inclusive_max"), false);
+                return result;
+            }
+            return null;
+        }
+        pub fn booleanTerm(self: FieldPredicate) ?bool {
+            if (self == .bool_field) {
+                if (self.bool_field != .object) return null;
+                const value = self.bool_field.object.get("value") orelse return null;
+                return if (value == .bool) value.bool else null;
+            }
+            if (self != .term or self.term.kind != pathfact_mod.kindFromJsonValue(.{ .bool = false })) return null;
+            if (std.mem.eql(u8, self.term.value, "true")) return true;
+            if (std.mem.eql(u8, self.term.value, "false")) return false;
+            return null;
+        }
+        pub fn nullTerm(self: FieldPredicate) bool {
+            return self == .term and self.term.kind == pathfact_mod.kindFromJsonValue(.null) and std.mem.eql(u8, self.term.value, "null");
+        }
+
         /// Canonical bounds shared by index planners and the row evaluator.
         pub fn standardBounds(self: FieldPredicate) !?struct { lower: ?PatternJsonRangeBound, upper: ?PatternJsonRangeBound } {
             if (self != .standard_range) return null;

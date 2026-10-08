@@ -6805,9 +6805,9 @@ test "segment range typed values stream chunks with bounded navigation and propa
         fn close(_: *anyopaque) void {}
     };
     const cases = [_]typed_dv.TypedValue{
-        .{ .u64_val = 123 },                                      .{ .i64_val = -42 },   .{ .f64_val = 1.25 },
-        .{ .geo_point = .{ .lat = 42, .lon = -71 } },             .{ .bool_val = true }, .{ .bytes_val = "a value" },
-        .{ .numeric_val = .{ .u64_val = std.math.maxInt(u64) } },
+        .{ .u64_val = 123 },                                      .{ .i64_val = -42 },    .{ .f64_val = 1.25 },
+        .{ .geo_point = .{ .lat = 42, .lon = -71 } },             .{ .bool_val = true },  .{ .bytes_val = "a value" },
+        .{ .numeric_val = .{ .u64_val = std.math.maxInt(u64) } }, .{ .datetime_ns = -1 },
     };
     for (cases) |value| {
         var writer = typed_dv.TypedDocValuesWriter.init(a, switch (value) {
@@ -6818,6 +6818,7 @@ test "segment range typed values stream chunks with bounded navigation and propa
             .bool_val => .bool_val,
             .bytes_val => .bytes_val,
             .numeric_val => .numeric_val,
+            .datetime_ns => .datetime_ns,
         }, 64);
         defer writer.deinit();
         for (0..256) |doc| try writer.add(@intCast(doc), value);

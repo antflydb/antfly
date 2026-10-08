@@ -83,13 +83,14 @@ pub const HistogramResult = struct {
 };
 
 pub const DateHistogramResult = struct {
-    keys: []u64,
+    keys: []i128,
     counts: []u64,
 };
 
 pub const BucketKey = union(enum) {
     int: i64,
     uint: u64,
+    timestamp: i128,
     range_idx: u32,
     string: []const u8,
 };
@@ -3242,11 +3243,11 @@ fn collectSubAggs(
         while (it.next()) |v| v.deinit(alloc);
         i64_buckets.deinit(alloc);
     }
-    var u64_buckets = std.AutoHashMapUnmanaged(u64, BucketList){};
+    var timestamp_buckets = std.AutoHashMapUnmanaged(i128, BucketList){};
     defer {
-        var it = u64_buckets.valueIterator();
+        var it = timestamp_buckets.valueIterator();
         while (it.next()) |v| v.deinit(alloc);
-        u64_buckets.deinit(alloc);
+        timestamp_buckets.deinit(alloc);
     }
     var u32_buckets = std.AutoHashMapUnmanaged(u32, BucketList){};
     defer {
@@ -3268,9 +3269,9 @@ fn collectSubAggs(
         },
         .date_histogram => |dh| {
             for (scored) |hit| {
-                if (try readU64ForDoc(alloc, reads, snap, hit.doc_id, spec.field)) |ns| {
-                    const bk = aggregation_mod.truncateToInterval(ns, dh.interval);
-                    const gop = try u64_buckets.getOrPut(alloc, bk);
+                if (try readTimestampForDoc(alloc, reads, snap, hit.doc_id, spec.field)) |ns| {
+                    const bk = try aggregation_mod.truncateSignedToInterval(ns, dh.interval);
+                    const gop = try timestamp_buckets.getOrPut(alloc, bk);
                     if (!gop.found_existing) gop.value_ptr.* = .empty;
                     try gop.value_ptr.append(alloc, hit);
                 }
@@ -3322,8 +3323,8 @@ fn collectSubAggs(
     // Build BucketSubResult array from whichever bucket map was used
     if (i64_buckets.count() > 0) {
         return try buildSubResultsI64(alloc, reads, snap, &i64_buckets, spec.sub_aggs);
-    } else if (u64_buckets.count() > 0) {
-        return try buildSubResultsU64(alloc, reads, snap, &u64_buckets, spec.sub_aggs);
+    } else if (timestamp_buckets.count() > 0) {
+        return try buildSubResultsTimestamp(alloc, reads, snap, &timestamp_buckets, spec.sub_aggs);
     } else if (u32_buckets.count() > 0) {
         return try buildSubResultsU32(alloc, reads, snap, &u32_buckets, spec.sub_aggs);
     }
@@ -3376,11 +3377,11 @@ fn buildSubResultsI64(
     return results;
 }
 
-fn buildSubResultsU64(
+fn buildSubResultsTimestamp(
     alloc: Allocator,
     reads: *segment_mod.TypedReadScope,
     snap: *const index_mod.IndexSnapshot,
-    buckets: *std.AutoHashMapUnmanaged(u64, std.ArrayListUnmanaged(scorer_mod.ScoredHit)),
+    buckets: *std.AutoHashMapUnmanaged(i128, std.ArrayListUnmanaged(scorer_mod.ScoredHit)),
     sub_specs: []const AggSpec,
 ) ![]const BucketSubResult {
     var results = try alloc.alloc(BucketSubResult, buckets.count());
@@ -3388,14 +3389,14 @@ fn buildSubResultsU64(
     var it = buckets.iterator();
     while (it.next()) |entry| {
         results[idx] = .{
-            .bucket_key = .{ .uint = entry.key_ptr.* },
+            .bucket_key = .{ .timestamp = entry.key_ptr.* },
             .aggs = try collectLeafAggs(alloc, reads, snap, entry.value_ptr.items, sub_specs),
         };
         idx += 1;
     }
     std.mem.sort(BucketSubResult, results, {}, struct {
         fn cmp(_: void, a: BucketSubResult, b: BucketSubResult) bool {
-            return a.bucket_key.uint < b.bucket_key.uint;
+            return a.bucket_key.timestamp < b.bucket_key.timestamp;
         }
     }.cmp);
     return results;
@@ -3475,11 +3476,11 @@ fn collectOneAgg(
             return .{ .terms = entries };
         },
         .date_histogram => |dh| {
-            var agg = aggregation_mod.DateHistogramAgg.init(alloc, dh.interval);
+            var agg = aggregation_mod.SignedDateHistogramAgg.init(alloc, dh.interval);
             defer agg.deinit();
 
             for (scored) |hit| {
-                if (try readU64ForDoc(alloc, reads, snap, hit.doc_id, spec.field)) |ns| {
+                if (try readTimestampForDoc(alloc, reads, snap, hit.doc_id, spec.field)) |ns| {
                     try agg.collect(ns);
                 }
             }
@@ -3695,21 +3696,21 @@ fn readBytesForDoc(
     return reader.getBytesAllocWithAllocator(alloc, resolved.local_id);
 }
 
-/// Read a u64 typed doc value for a global doc ID.
-fn readU64ForDoc(
+/// Read signed timestamps, promoting legacy unsigned doc values exactly.
+fn readTimestampForDoc(
     alloc: Allocator,
     reads: *segment_mod.TypedReadScope,
     snap: *const index_mod.IndexSnapshot,
     global_id: u32,
     field: []const u8,
-) !?u64 {
+) !?i128 {
     _ = alloc;
     const resolved = snap.resolveDocId(global_id) orelse return null;
     const seg = &snap.segments[resolved.seg_idx];
     const reader = (try reads.get(&seg.reader, field)) orelse return null;
-    if (reader.value_type == .datetime_ns) return if (try reader.getDateTimeNs(resolved.local_id)) |ns| std.math.cast(u64, ns) else null;
+    if (reader.value_type == .datetime_ns) return try reader.getDateTimeNs(resolved.local_id);
     if (reader.value_type != .u64_val) return null;
-    return try reader.getU64(resolved.local_id);
+    return if (try reader.getU64(resolved.local_id)) |ns| @as(i128, ns) else null;
 }
 
 /// Read a geo_point typed doc value for a global doc ID.
@@ -5802,4 +5803,63 @@ test "external lake indexed bitmap filters preserve ranking disjunction and exac
     defer remaining.deinit();
     try std.testing.expectEqual(@as(usize, 1), remaining.hits.len);
     try std.testing.expectEqual(@as(u32, 0), remaining.hits[0].doc_id);
+}
+
+test "search signed date histogram retains negative wide and nested buckets" {
+    const alloc = std.testing.allocator;
+
+    // Build inverted index (all docs match "x")
+    var inv_builder = inverted.InvertedIndexBuilder.init(alloc, .{});
+    defer inv_builder.deinit();
+    try inv_builder.addDocument(0, &.{.{ .term = "x", .freq = 1, .norm = 10 }});
+    try inv_builder.addDocument(1, &.{.{ .term = "x", .freq = 1, .norm = 10 }});
+    try inv_builder.addDocument(2, &.{.{ .term = "x", .freq = 1, .norm = 10 }});
+    const inv_data = try inv_builder.build();
+    defer alloc.free(inv_data);
+
+    var dv_writer = typed_dv.TypedDocValuesWriter.init(alloc, .datetime_ns, 1024);
+    defer dv_writer.deinit();
+    try dv_writer.add(0, .{ .datetime_ns = -1 });
+    try dv_writer.add(1, .{ .datetime_ns = 0 });
+    try dv_writer.add(2, .{ .datetime_ns = 253402300799999999999 });
+    const dv_data = try dv_writer.build();
+    defer alloc.free(dv_data);
+
+    var seg_writer = segment_mod.SegmentWriter.init(alloc);
+    defer seg_writer.deinit();
+    const title_idx = try seg_writer.addField("title");
+    try seg_writer.addSection(title_idx, .inverted_text, inv_data);
+    const ts_idx = try seg_writer.addField("timestamp");
+    try seg_writer.addSection(ts_idx, .typed_doc_values, dv_data);
+    try seg_writer.addStoredDoc("d1", "{}");
+    try seg_writer.addStoredDoc("d2", "{}");
+    try seg_writer.addStoredDoc("d3", "{}");
+    const seg_bytes = try seg_writer.build();
+    defer alloc.free(seg_bytes);
+
+    var writer = try index_mod.IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(seg_bytes);
+
+    const snap = writer.snapshot();
+    var result = try execute(alloc, snap, .{
+        .query = .{ .term = .{ .field = "title", .term = "x" } },
+        .k = 10,
+        .aggregations = &.{
+            .{ .name = "by_hour", .field = "timestamp", .agg_type = .{ .date_histogram = .{ .interval = .hour } }, .sub_aggs = &.{.{ .name = "nested", .field = "timestamp", .agg_type = .{ .date_histogram = .{ .interval = .day } } }} },
+        },
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), result.aggregations.len);
+    const dh = result.aggregations[0].result.date_histogram;
+    try std.testing.expectEqual(@as(usize, 3), dh.keys.len);
+    try std.testing.expectEqual(@as(i128, -std.time.ns_per_hour), dh.keys[0]);
+    try std.testing.expectEqual(@as(i128, 0), dh.keys[1]);
+    try std.testing.expect(dh.keys[2] > std.math.maxInt(u64));
+    for (dh.counts) |count| try std.testing.expectEqual(@as(u64, 1), count);
+    const nested = result.aggregations[0].sub_results.?;
+    try std.testing.expectEqual(@as(usize, 3), nested.len);
+    try std.testing.expectEqual(dh.keys[0], nested[0].bucket_key.timestamp);
+    try std.testing.expectEqual(@as(i128, -std.time.ns_per_day), nested[0].aggs[0].result.date_histogram.keys[0]);
 }

@@ -8,7 +8,7 @@ validation requirements.
 ## Native sparse predicate intersection
 
 Implemented through query-owned compressed native ordinal selections. Native
-sparse recipe v4 persists authenticated 1024-row physical-to-native ordinal
+sparse recipe v5 persists authenticated 1024-row physical-to-native ordinal
 blocks inside the checkpoint. Each entry stores a two-byte physical offset and
 four-byte native ordinal; ingestion coalesces writes with at most 64 resident
 blocks. Inserts, replacements, deletes and compaction update these maps in the
@@ -17,35 +17,31 @@ legacy checkpoints, which retain point lookup fallback until rebuilt. Queries
 translate a physical selection with one lookup per occupied block and check
 cancellation between blocks, without formatting a document key per selected row.
 
-Selective sets (at most 4096 rows, scaled to the requested result count) use
-36-byte forward locators and preserve zero/negative scores for overlapping terms;
-absence of overlap is separate from score. Broader sets intersect native bitmaps
-with authenticated posting-block ordinal trailers before decoding. Posting
-payloads remain V1; old readers ignore the extended range metadata, and unextended
-blocks derive bounds without allocating decoded arrays. Complete checkpoints use
-encoded document-at-a-time posting streams and a bounded top-k heap: scoring
-retains only one document accumulator, at most 4096 stream cursors, 64 MiB of
-retained encoded postings, and k winners. Conservative block bounds include zero
-and both signed weight endpoints; strict score pruning preserves ties. Streams add
-contributions in the original source/term/chunk order, preserving f32 results even
-with mixed signs. Prepared bitmap rank metadata rejects disjoint posting blocks
-without decoded posting arrays. Legacy checkpoints, unresolved key predicates, and
-queries exceeding either stream or posting-byte admission retain the spill
-fallback, which holds at most 65,536 document scores in RAM before streaming
-contributions through bounded native spill sorting. Per-document addition order is
-preserved, including signed weights and cancellation between terms. The spill
-input budget is 1 GiB, with native capacity reservations where a resource manager
-is available. Complete checkpoints select winners with a bounded top-k heap and
-sort only k entries, excluding tombstones before admission. Legacy checkpoints
-retain the full candidate sort and defensive identity fallback.
+All positive selections use the canonical quantized posting scorer. Point filters
+seek directly to the posting block covering the next selected native ordinal;
+broad filters intersect the same ordinal bitmaps with posting ranges. This keeps
+scores and ties identical to unfiltered scoring, including zero and negative
+scores for overlapping terms. Forward locators remain identity/update metadata.
 
-Persist authenticated mappings between physical file/group/row coordinates and
-native sparse ordinals as part of each immutable publication. Share the physical
-selection contract with dense and text readers; do not expand broad predicates
-into public key arrays. Intersect selected ordinals with postings before scoring.
-For highly selective predicates, choose a forward-vector scoring path using
-cardinality and projected read cost. Keep mutable-index incarnation checks where
-required; omit them only under an explicit immutable publication proof.
+New immutable segments publish an `ASPSPG01` term-directory root and independent
+posting-block KV values keyed by segment, term, and final ordinal. Chunk payloads
+remain V1. Query cursors retain one encoded block per active stream, with a shared
+64 MiB resident-block admission budget; navigation has a separate byte budget
+instead of a fixed 4096-stream limit. Selective seeks avoid loading earlier blocks.
+Legacy `ASPSSEG1` roots remain readable with their original encoded-byte budget.
+Maintenance reconstructs legacy bytes only after compaction reservation; pages,
+roots, incarnations and physical maps publish atomically. Replaced block keys are
+deleted in the same transaction, preserving existing backend snapshot readers.
+The v5 producer fence rebuilds older publications into paged segments.
+
+Document-at-a-time scoring retains one document accumulator and k winners.
+Conservative block bounds include zero and both signed weight endpoints; strict
+score pruning preserves ties. Contributions retain source/term/chunk f32 addition
+order. Prepared bitmap ranks reject disjoint blocks without decoded arrays.
+Legacy checkpoints, unresolved key predicates and admission overflow retain the
+bounded spill fallback: 65,536 in-memory partial scores and a 1 GiB spill-input
+budget, with native capacity reservations and cancellation. Complete identities
+exclude tombstones before winner admission.
 
 Acceptance: point and broad filters, exclusions, mixed terms, changed files,
 deletes, restart, and cancellation agree with an exact reference scorer. Measure
@@ -63,9 +59,12 @@ dependency columns are projected. Direct-column expressions execute shared
 predicate leaves over page masks, preserving Boolean short circuiting and
 projected document null semantics without per-row JSON objects. Dictionary columns
 evaluate shared predicate leaves once per reached dictionary entry and cache null
-evaluation separately. Canonical i64 term predicates use an eight-lane equality
-kernel over the active selection, with null lanes masked out. Other leaves retain
-shared semantics. Nested paths and document-ID expressions retain the shared
+evaluation separately. Canonical i64/f64 terms and supported numeric ranges use
+eight-lane kernels over active selections. Boolean terms, scalar null terms and
+scalar existence predicates avoid per-row document shaping. Standard integer
+bounds retain exact integer comparison; numeric-range operators retain their
+existing f64 domain. Wide mixed bounds, nonfinite values and composite columns
+keep authoritative shared semantics, including null evaluation and errors. Nested paths and document-ID expressions retain the shared
 document evaluator. The resulting exact physical set is shared by dense and sparse
 membership.
 
@@ -133,7 +132,12 @@ changing containers.
 Fused ordered-index builds reserve spill-file capacity across the cohort: at most
 eight simultaneous sorts retain four runs each, leaving room in the unchanged
 64-file budget for pending writes and merge outputs. Level-aware compaction
-remains in the shared sort implementation.
+remains in the shared sort implementation. Publication already shares decoded
+replay across index builders. Direct ordered-index callers now create a union
+projection replay when they exceed eight definitions. A separately tested
+changed-file planner unions dependencies across all cohorts, reuses proved seed
+roots and captures each required file once; unchanged files need no Parquet
+rescan. Cohort sort ownership and the file budget remain unchanged.
 
 Add a Roaring range-slice/rebase operation that copies or combines containers and
 masks boundary words without iterating every selected row. Use it to lower global
@@ -169,7 +173,7 @@ date filters avoid full archive scans.
 
 ## Delivery and measurement
 
-- [x] Implement native sparse ordinal intersection and selective forward scoring.
+- [x] Implement native sparse ordinal intersection and selective posting seeks.
 - [x] Evaluate vector residuals over indexed physical selections.
 - [x] Add compatible ordered-index top-N execution.
 - [x] Add bulk bitmap slice/rebase and cardinality kernels.
@@ -267,3 +271,15 @@ bounded probes into larger filters. Real Iceberg snapshot, field-ID, partition,
 delete and restart coverage also passes. Embedded boundary validation (747
 production sources), Zig formatting, Python syntax and diff whitespace checks
 passed. No cold/warm archive throughput benchmark is claimed.
+
+## Signed histogram and paging regressions
+
+Native embedded date histograms, including nested bucket keys, retain signed i128
+nanoseconds. Shared UTC truncation uses floor division for pre-epoch intervals
+and correct Gregorian conversion at year 0000 and 9999. The unsigned collector
+remains available for legacy callers. Tests cover negative/wide timestamps,
+calendar boundaries, nested results, posting-page OOM cleanup and reclamation,
+large-segment admission through small live blocks, and ten ordered indexes across
+two bounded cohorts. A real Parquet E2E regression compares filtered sparse
+scores and ranking with the unfiltered quantized scorer before and after restart.
+Representative archive throughput and cold-cache measurements remain pending.

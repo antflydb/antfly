@@ -53,21 +53,34 @@ pub fn part(ns: u64, field: Unit) f64 {
 }
 
 pub fn truncate(ns: u64, field: Unit) ?u64 {
-    const days: i64 = @intCast(ns / std.time.ns_per_s / 86400);
-    const civil = civilFromDays(days);
-    return switch (field) {
-        .year => civilDateTimeToNs(civil.year, 1, 1, 0, 0, 0, 0),
-        .quarter => civilDateTimeToNs(civil.year, (civil.month - 1) / 3 * 3 + 1, 1, 0, 0, 0, 0),
-        .month => civilDateTimeToNs(civil.year, civil.month, 1, 0, 0, 0, 0),
-        .week => std.math.cast(u64, @as(i128, days - @mod(days + 3, 7)) * 86400 * std.time.ns_per_s),
-        .day => ns / std.time.ns_per_day * std.time.ns_per_day,
-        .hour => ns / std.time.ns_per_hour * std.time.ns_per_hour,
-        .minute => ns / std.time.ns_per_min * std.time.ns_per_min,
-        .second => ns / std.time.ns_per_s * std.time.ns_per_s,
-        .milliseconds => ns / std.time.ns_per_ms * std.time.ns_per_ms,
-        .microseconds => ns / std.time.ns_per_us * std.time.ns_per_us,
+    return std.math.cast(u64, truncateSigned(ns, field) orelse return null);
+}
+
+/// Calendar operations share the canonical signed RFC3339 domain. Fixed-size
+/// intervals use floor division, including for sub-epoch fractional instants.
+pub fn truncateSigned(ns: i128, field: Unit) ?i128 {
+    const day_ns = std.time.ns_per_day;
+    const days = @divFloor(ns, day_ns);
+    const duration: ?i128 = switch (field) {
+        .day => day_ns,
+        .hour => std.time.ns_per_hour,
+        .minute => std.time.ns_per_min,
+        .second => std.time.ns_per_s,
+        .milliseconds => std.time.ns_per_ms,
+        .microseconds => std.time.ns_per_us,
         else => null,
     };
+    if (duration) |size| return std.math.mul(i128, @divFloor(ns, size), size) catch null;
+    if (field == .week) return std.math.mul(i128, days - @mod(days + 3, 7), day_ns) catch null;
+    if (field != .year and field != .quarter and field != .month) return null;
+    if (days < daysFromCivil(0, 1, 1) or days >= daysFromCivil(10000, 1, 1)) return null;
+    const civil = civilFromDays(@intCast(days));
+    return civilDateTimeToSignedNs(civil.year, switch (field) {
+        .year => 1,
+        .quarter => (civil.month - 1) / 3 * 3 + 1,
+        .month => civil.month,
+        else => unreachable,
+    }, 1, 0, 0, 0, 0);
 }
 
 /// Exact temporal operands shared by lake indexes and standard range filters.
@@ -235,7 +248,7 @@ pub const CivilDate = struct {
 
 pub fn civilFromDays(days_since_epoch: i64) CivilDate {
     const z = days_since_epoch + 719_468;
-    const era = @divFloor(if (z >= 0) z else z - 146_096, 146_097);
+    const era = @divFloor(z, 146_097);
     const doe = z - era * 146_097;
     const yoe = @divFloor(doe - @divFloor(doe, 1460) + @divFloor(doe, 36_524) - @divFloor(doe, 146_096), 365);
     var year = yoe + era * 400;
@@ -254,10 +267,21 @@ pub fn civilFromDays(days_since_epoch: i64) CivilDate {
 pub fn daysFromCivil(year: i64, month: i64, day: i64) i64 {
     var y = year;
     y -= if (month <= 2) @as(i64, 1) else @as(i64, 0);
-    const era = @divFloor(if (y >= 0) y else y - 399, 400);
+    const era = @divFloor(y, 400);
     const yoe = y - era * 400;
     const mp = month + (if (month > 2) @as(i64, -3) else @as(i64, 9));
     const doy = @divFloor(153 * mp + 2, 5) + day - 1;
     const doe = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy;
     return era * 146_097 + doe - 719_468;
+}
+
+test "signed civil calendar roundtrips the RFC3339 lower year boundary" {
+    for ([_]i64{ 0, 1, 4, 1600, 1969, 1970, 9999 }) |year| {
+        for ([_]i64{ 1, 2, 3, 12 }) |month| {
+            const date = civilFromDays(daysFromCivil(year, month, 1));
+            try std.testing.expectEqual(year, date.year);
+            try std.testing.expectEqual(@as(u8, @intCast(month)), date.month);
+            try std.testing.expectEqual(@as(u8, 1), date.day);
+        }
+    }
 }

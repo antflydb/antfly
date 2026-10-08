@@ -461,6 +461,43 @@ fn columnEvaluable(input: Compiled) bool {
         },
     };
 }
+/// Evaluate selected primitive lanes without constructing per-row JSON cells.
+fn evaluateNumeric(comptime T: type, a: A, predicate: Graph.CompiledPatternFilter.FieldPredicate, values: []const T, vector: local.storage_rowsource_types.ColumnVector, page: local.sql_catalog.ColumnPage, mask: []bool, active: ?[]const bool) !bool {
+    // The legacy numeric_range operator intentionally compares as f64;
+    // standard ranges retain exact integer and mixed-domain scalar semantics.
+    if (T == i64 and predicate == .numeric_range) return evaluateNumericAs(i64, f64, a, predicate, values, vector, page, mask, active);
+    return evaluateNumericAs(T, T, a, predicate, values, vector, page, mask, active);
+}
+fn evaluateNumericAs(comptime T: type, comptime C: type, a: A, predicate: Graph.CompiledPatternFilter.FieldPredicate, values: []const T, vector: local.storage_rowsource_types.ColumnVector, page: local.sql_catalog.ColumnPage, mask: []bool, active: ?[]const bool) !bool {
+    // Admission errors belong to the scalar evaluator on reached lanes.
+    // Inactive branches must not observe malformed bound errors.
+    const kernel = (predicate.numericKernel(C) catch return false) orelse return false;
+    var null_match: ?bool = null;
+    var row: usize = 0;
+    while (row < mask.len) : (row += 8) {
+        var lanes: [8]C = @splat(0);
+        const count = @min(8, mask.len - row);
+        for (0..count) |lane| lanes[lane] = if (T == C) values[page.selection[row + lane]] else @floatFromInt(values[page.selection[row + lane]]);
+        const v: @Vector(8, C) = lanes;
+        const lower: [8]bool = if (kernel.lower) |bound| (if (kernel.inclusive_lower) v >= @as(@Vector(8, C), @splat(bound)) else v > @as(@Vector(8, C), @splat(bound))) else @splat(true);
+        const upper: [8]bool = if (kernel.upper) |bound| (if (kernel.inclusive_upper) v <= @as(@Vector(8, C), @splat(bound)) else v < @as(@Vector(8, C), @splat(bound))) else @splat(true);
+        for (0..count) |lane| {
+            const position = row + lane;
+            mask[position] = false;
+            if (active) |enabled| if (!enabled[position]) continue;
+            if (vector.nulls.isNull(page.selection[position])) {
+                if (null_match == null) null_match = try predicate.matches(a, &.{.null});
+                mask[position] = null_match.?;
+                continue;
+            }
+            if (C == f64 and !std.math.isFinite(lanes[lane])) {
+                mask[position] = try predicate.matches(a, &.{.{ .float = lanes[lane] }});
+            } else mask[position] = lower[lane] and upper[lane];
+        }
+    }
+    return true;
+}
+
 fn evaluateColumns(a: A, input: Compiled, page: local.sql_catalog.ColumnPage, mask: []bool, active: ?[]const bool) anyerror!void {
     switch (input) {
         .match_all => for (mask, 0..) |*match, row| {
@@ -471,6 +508,10 @@ fn evaluateColumns(a: A, input: Compiled, page: local.sql_catalog.ColumnPage, ma
         .field_matcher => |field| {
             const name = column(field.path).?;
             if (page.native == null) if (page.batch.findColumn(name)) |vector| {
+                if ((field.predicate == .exists or field.predicate.nullTerm()) and vector.values != .json and vector.values != .vector_f32) {
+                    for (mask, page.selection, 0..) |*match, index, row| match.* = (field.predicate == .exists or vector.nulls.isNull(index)) and (if (active) |enabled| enabled[row] else true);
+                    return;
+                }
                 switch (vector.values) {
                     inline .dictionary_bytes, .dictionary_i64, .dictionary_f64 => |dictionary, tag| {
                         // Evaluate only dictionary entries reached by active lanes.
@@ -504,17 +545,14 @@ fn evaluateColumns(a: A, input: Compiled, page: local.sql_catalog.ColumnPage, ma
                         }
                         return;
                     },
-                    .i64 => |values| if (try field.predicate.integerTerm()) |term| {
-                        // Gather selected lanes, compare in SIMD, then apply the
-                        // authoritative null and Boolean activity masks.
-                        var row: usize = 0;
-                        while (row < mask.len) : (row += 8) {
-                            var lanes: [8]i64 = @splat(0);
-                            const count = @min(8, mask.len - row);
-                            for (0..count) |lane| lanes[lane] = values[page.selection[row + lane]];
-                            const matches: [8]bool = @as(@Vector(8, i64), lanes) == @as(@Vector(8, i64), @splat(term));
-                            for (0..count) |lane| mask[row + lane] = matches[lane] and !vector.nulls.isNull(page.selection[row + lane]) and (if (active) |enabled| enabled[row + lane] else true);
-                        }
+                    .i64 => |values| {
+                        if (try evaluateNumeric(i64, a, field.predicate, values, vector, page, mask, active)) return;
+                    },
+                    .f64 => |values| {
+                        if (try evaluateNumeric(f64, a, field.predicate, values, vector, page, mask, active)) return;
+                    },
+                    .bool => |values| if (field.predicate.booleanTerm()) |term| {
+                        for (mask, page.selection, 0..) |*match, index, row| match.* = values[index] == term and !vector.nulls.isNull(index) and (if (active) |enabled| enabled[row] else true);
                         return;
                     },
                     else => {},
@@ -690,7 +728,11 @@ test "external lake residual dictionary and SIMD kernels preserve active null an
     const indices = [_]u32{ 0, 1, 0, 1, 2, 0, 0, 1, 2, 0, 0 };
     const values = [_][]const u8{ "kept", "other", "keeper" };
     const nulls = [_]u8{ 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0 };
+    const floats = [_]f64{ 1, -1, 7, 4.5, 7, 9, 6, 7, 2, 7, 8 };
+    const booleans = [_]bool{ true, false, true, true, false, true, false, true, false, true, false };
     const vectors = [_]row_types.ColumnVector{
+        .{ .name = "floating", .values = .{ .f64 = &floats }, .nulls = .{ .bytes = &nulls } },
+        .{ .name = "flag", .values = .{ .bool = &booleans }, .nulls = .{ .bytes = &nulls } },
         .{ .name = "number", .values = .{ .i64 = &numbers }, .nulls = .{ .bytes = &nulls } },
         .{ .name = "label", .values = .{ .dictionary_bytes = .{ .values = &values, .indices = &indices } }, .nulls = .{ .bytes = &nulls } },
     };
@@ -700,6 +742,28 @@ test "external lake residual dictionary and SIMD kernels preserve active null an
     defer arena.deinit();
     for ([_][]const u8{
         \\{"term":{"number":7}}
+        ,
+        \\{"range":{"number":{"gt":2,"lte":7}}}
+        ,
+        \\{"range":{"number":{"gte":2}}}
+        ,
+        \\{"range":{"number":{"lt":7}}}
+        ,
+        \\{"range":{"number":{"gt":2.5,"lte":7}}}
+        ,
+        \\{"numeric_range":{"path":"/number","min":2,"max":7}}
+        ,
+        \\{"range":{"floating":{"gte":1,"lt":7}}}
+        ,
+        \\{"numeric_range":{"path":"/floating","min":1,"max":7,"inclusive_max":true}}
+        ,
+        \\{"term":{"floating":4.5}}
+        ,
+        \\{"term":{"flag":true}}
+        ,
+        \\{"term":{"number":null}}
+        ,
+        \\{"exists":{"field":"number"}}
         ,
         \\{"prefix":{"path":"/label","value":"ke"}}
         ,
@@ -725,5 +789,33 @@ test "external lake residual dictionary and SIMD kernels preserve active null an
         };
         try Probe.run(a, compiled, page);
         try std.testing.checkAllAllocationFailures(a, Probe.run, .{ compiled, page });
+    }
+}
+
+test "external lake residual numeric kernels preserve nonfinite errors and inactive lanes" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const refs = [_]local.storage_rowsource_types.RowRef{.{ .relational_key = "id" }};
+    const values = [_]f64{std.math.nan(f64)};
+    const vectors = [_]local.storage_rowsource_types.ColumnVector{.{ .name = "value", .values = .{ .f64 = &values } }};
+    const page: local.sql_catalog.ColumnPage = .{ .batch = .{ .snapshot = .{ .table_id = "t", .snapshot_id = "s" }, .row_refs = &refs, .columns = &vectors }, .selection = &.{0} };
+    const range_json = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), "{\"range\":{\"value\":{\"gte\":1}}}", .{});
+    const range = try Graph.compilePatternFilter(arena.allocator(), range_json);
+    var mask: [1]bool = undefined;
+    try std.testing.expectError(error.SqlNumericOutOfRange, evaluateColumns(a, range, page, &mask, null));
+    try evaluateColumns(a, range, page, &mask, &.{false});
+    try std.testing.expect(!mask[0]);
+    const numeric_json = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), "{\"numeric_range\":{\"path\":\"/value\",\"min\":1,\"max\":7}}", .{});
+    const numeric = try Graph.compilePatternFilter(arena.allocator(), numeric_json);
+    try evaluateColumns(a, numeric, page, &mask, null);
+    // The authoritative numeric_range matcher uses unordered comparisons.
+    try std.testing.expect(mask[0]);
+    for ([_][]const u8{ "{}", "{\"min\":\"bad\"}" }) |json| {
+        const malformed = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), json, .{});
+        const invalid: Compiled = .{ .field_matcher = .{ .path = .{ .single = "value" }, .predicate = .{ .numeric_range = malformed } } };
+        try evaluateColumns(a, invalid, page, &mask, &.{false});
+        try std.testing.expect(!mask[0]);
+        try std.testing.expectError(error.InvalidArgument, evaluateColumns(a, invalid, page, &mask, null));
     }
 }

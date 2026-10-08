@@ -2990,3 +2990,129 @@ def test_remote_ordered_scan_budget_counts_rows_without_text_ordinals(tmp_path):
         failed = False
     finally:
         server.stop(test_failed=failed)
+
+
+def test_native_sparse_metadata_filters_preserve_quantized_scores_and_ranking(tmp_path):
+    """Selective index plans share posting weights with unfiltered search."""
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    root = tmp_path / "source"
+    objects = root / "buckets" / "antfly" / "objects"
+    objects.mkdir(parents=True)
+    data = tmp_path / "source.parquet"
+    pq.write_table(
+        pa.table(
+            {
+                "amount": [0, 1, 2],
+                "sparse_native": [json.dumps({"1": w}) for w in (1, 1.1, 100)],
+            }
+        ),
+        data,
+    )
+    payload = data.read_bytes()
+    (objects / "part.parquet").write_bytes(
+        b"AFOBJ001"
+        + struct.pack("<QI", len(payload), 0)
+        + hashlib.sha256(payload).hexdigest().encode()
+        + payload
+    )
+    server = StandaloneAntflyServer(
+        resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN))),
+        "127.0.0.1",
+        0,
+    )
+    failed = True
+    try:
+
+        def call(method, path, body=None):
+            r = requests.request(
+                method,
+                server.api_url + path,
+                json=body,
+                auth=("admin", AUTH_BOOTSTRAP_PASSWORD),
+                timeout=90,
+            )
+            assert r.ok, r.text + server.debug_logs()
+            v = r.json()
+            return v["responses"][0] if "responses" in v else v
+
+        call(
+            "POST",
+            "/tables/review_sparse",
+            {
+                "num_shards": 1,
+                "schema": {
+                    "storage_mode": "relational",
+                    "default_type": "doc",
+                    "document_schemas": {
+                        "doc": {
+                            "schema": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "properties": {
+                                    "amount": {"type": "integer"},
+                                    "sparse_native": {"type": "string"},
+                                },
+                            }
+                        }
+                    },
+                    "base_source": {
+                        "kind": "external",
+                        "table_id": "review-sparse",
+                        "format": "parquet",
+                        "uri": root.as_uri(),
+                    },
+                    "relational_indexes": [
+                        {"name": "amount_idx", "keys": [{"column": "amount"}]}
+                    ],
+                },
+                "indexes": {
+                    "sparse_native": {
+                        "type": "embeddings",
+                        "external": True,
+                        "sparse": True,
+                    }
+                },
+            },
+        )
+        deadline = time.monotonic() + 90
+        while not call("GET", "/tables/review_sparse/indexes/sparse_native")["status"][
+            "readiness"
+        ]["queryable"]:
+            assert time.monotonic() < deadline
+            time.sleep(0.1)
+        base = {
+            "embeddings": {"sparse_native": {"indices": [1], "values": [1]}},
+            "indexes": ["sparse_native"],
+            "fields": ["amount"],
+            "limit": 3,
+        }
+        all_hits = call("POST", "/tables/review_sparse/query", base)["hits"]["hits"]
+        selected = call(
+            "POST",
+            "/tables/review_sparse/query",
+            dict(base, filter_query={"term": {"path": "/amount", "value": 1}}),
+        )["hits"]["hits"]
+        original = next(h for h in all_hits if h["_source"]["amount"] == 1)
+        assert original["_score"] == selected[0]["_score"]
+        ranged = call(
+            "POST",
+            "/tables/review_sparse/query",
+            dict(base, filter_query={"range": {"path": "/amount", "gte": 0, "lt": 2}}),
+        )["hits"]["hits"]
+        expected = [h for h in all_hits if h["_source"]["amount"] < 2]
+        assert [(h["_id"], h["_score"]) for h in expected] == [
+            (h["_id"], h["_score"]) for h in ranged
+        ]
+        server.restart()
+        reopened = call(
+            "POST",
+            "/tables/review_sparse/query",
+            dict(base, filter_query={"range": {"path": "/amount", "gte": 0, "lt": 2}}),
+        )["hits"]["hits"]
+        assert [(h["_id"], h["_score"]) for h in ranged] == [
+            (h["_id"], h["_score"]) for h in reopened
+        ]
+        failed = False
+    finally:
+        server.stop(test_failed=failed)

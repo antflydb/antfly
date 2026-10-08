@@ -1135,8 +1135,8 @@ describes their contracts, differential and E2E validation, fallback shapes,
 and remaining large-archive measurements.
 
 
-Native sparse recipe v4 stores transactionally maintained physical ordinal maps
-in 1024-row checkpoint blocks, alongside selective forward locators. Broad
+Native sparse recipe v5 stores transactionally maintained physical ordinal maps
+in 1024-row checkpoint blocks, alongside identity/update forward locators. Broad
 predicates translate compressed row selections by block and reject disjoint posting blocks through backward-compatible ordinal range trailers before decoding; Unextended ranges and older checkpoints retain read fallbacks. Exact winner collection uses a bounded heap when the checkpoint proves
 complete identities. Nonpositive dot products remain matches when terms overlap.
 
@@ -1161,8 +1161,11 @@ Search-before walks the immutable ordered tree backward from its upper bound,
 retaining boundary ties for public-ID comparison and the existing probe guards.
 
 Complete sparse checkpoints score encoded postings document at a time with one
-score accumulator, at most 4096 stream cursors, 64 MiB of retained encoded
-postings, and k winners. Contributions retain source/term/chunk addition order.
+score accumulator and k winners. Paged immutable segments retain one block per
+active stream under a shared 64 MiB block budget and a separate navigation byte
+budget; stream count has no fixed 4096 cliff. Legacy segments retain their encoded
+byte admission. Selective filters seek the block covering the next selected
+ordinal and use the same quantized scorer as broad/unfiltered searches. Contributions retain source/term/chunk addition order.
 Conservative block score bounds include absent terms and both signed endpoints;
 pruning uses strict inequality to retain ties. Prepared bitmap ranks reject
 disjoint ordinal blocks using authenticated trailers without decoding posting
@@ -1177,7 +1180,12 @@ bounds with datetime doc values, including pre-epoch nanoseconds. Ordered provid
 pulls enforce the remaining physical-row budget internally, so rows absent from
 the text corpus cannot bypass fallback. Residual dictionary kernels memoize only
 reached entries and retain shared leaf semantics; canonical integer term equality
-uses an eight-lane comparison with selection, null, and active masks.
+and supported i64/f64 numeric ranges use eight-lane comparisons with selection,
+null, and active masks. Boolean terms and scalar null/existence predicates also
+have typed kernels. Mixed wide bounds and nonfinite values retain shared leaf
+semantics. Native date-histogram collectors and nested bucket keys retain signed
+i128 nanoseconds and share UTC interval truncation across pre-epoch dates and
+calendar boundaries.
 
 Parquet statistics and standard page directories prune both Parquet and Iceberg
 scans. Standard split-block Bloom filters additionally prune equality misses by
@@ -1185,3 +1193,14 @@ reading a small header and one 32-byte block through the shared range cache.
 Inventory v18 carries optional Bloom offsets and lengths, retaining older codec
 readability. Unknown algorithms, physical interpretations and malformed headers
 fall back to scans; exact residual evaluation remains authoritative.
+
+Paged sparse roots (`ASPSPG01`) reference independently seekable KV blocks by
+segment/term/final ordinal. Existing `ASPSSEG1` segments remain readable; native
+sparse recipe v5 fences publications for rebuild. Compaction reserves before
+materializing source payloads and transactionally replaces roots and block keys.
+Direct ordered-index builds exceeding eight definitions share one union-projection
+replay across bounded cohorts; its changed-file union preserves incremental seed
+reuse and avoids decoding unchanged files. Publication continues sharing its
+existing replay across native builders. See the
+[performance contracts](NATIVE_LAKE_PERFORMANCE_FOLLOWUP.md) for validation and
+remaining archive measurements.

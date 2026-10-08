@@ -26,6 +26,7 @@ const spill = local.sql_spill;
 const Declared = local.serverless_segment_sidecar_manifest.DeclaredArtifact;
 const Cancellation = @import("antfly_cancellation").CancellationToken;
 const A = std.mem.Allocator;
+const cohort_files = @import("lake_index_cohort_files.zig");
 
 pub fn logicalName(a: A, name: []const u8) ![]u8 {
     var digest: [32]u8 = undefined;
@@ -63,6 +64,26 @@ const Entry = struct {
         self.tuple.deinit();
     }
 };
+/// The same seed proof is used by shared replay planning and cohort execution.
+fn priorRoot(a: A, store: *stores.ArtifactStore, binding: local.serverless_segment_source_binding.Binding, name: []const u8, digest: [32]u8, candidates: []const Declared, cancellation: Cancellation) !?ordered.Root {
+    for (candidates) |decl| {
+        if (decl.artifact.kind != .ordered_row_index or decl.artifact.metadata_version != ordered.metadata_version or !std.mem.eql(u8, decl.name, name)) continue;
+        var previous_binding = decl.binding;
+        previous_binding.snapshot_id = binding.snapshot_id;
+        if (!@import("../serverless/build/lake_rebuild.zig").bindingsEqual(binding, previous_binding)) continue;
+        const root = try ordered.loadRoot(a, store.*, decl.artifact, cancellation, null);
+        if (!std.mem.eql(u8, root.source, binding.source_id) or !std.mem.eql(u8, root.snapshot, decl.binding.snapshot_id) or root.file_fingerprints.len != root.files.len or !std.mem.eql(u8, &root.domain, &store.upload_scope.?.domain) or !std.mem.eql(u8, &root.fingerprint, &digest)) continue;
+        return root;
+    }
+    return null;
+}
+fn bindingFor(a: A, source: *local.serverless_query_lake_serving.ServingSource, tuple: tuples.TuplePlan, predicate: ?predicates.Plan, cover: []const []const u8) !local.serverless_segment_source_binding.Binding {
+    return .{ .sidecar_kind = .ordered_rows, .source_kind = switch (source.inventory.format) {
+        .parquet => .external_parquet,
+        .iceberg => .external_iceberg,
+        .lance => return error.UnsupportedExternalLakeIndex,
+    }, .row_ref_kind = .external, .source_id = source.inventory.source_id, .snapshot_id = source.inventory.snapshot_id, .schema_fingerprint = source.inventory.schema_fingerprint, .index_config_hash = try std.fmt.allocPrint(a, "native-ordered-rows-v5:{s}", .{std.fmt.bytesToHex(&fingerprint(tuple, predicate, cover), .lower)}), .column_bindings = try tuple.columnBindings(a) };
+}
 pub fn build(a: A, out: A, table: local.common_topology_records.TableRecord, source: *local.serverless_query_lake_serving.ServingSource, store: *stores.ArtifactStore, provider: *@import("lake_index_row_source.zig").Provider, cancellation: Cancellation, reusable: []const Declared) ![]const Declared {
     return buildIncremental(a, out, table, source, store, provider, cancellation, reusable, &.{});
 }
@@ -89,6 +110,47 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
     for (contract, sql_table.columns) |*column, definition| column.* = .{ .name = definition.path, .kind = @tagName(definition.type), .required = !definition.nullable };
     var input = provider.*;
     input.schema_contract = if (source.iceberg_schema) |selected| selected.columns else contract;
+    // Publication normally supplies a replay shared with text/vector builders.
+    // Direct callers also need one decode pipeline across ordered cohorts.
+    var replay_columns: std.StringHashMapUnmanaged(void) = .empty;
+    defer replay_columns.deinit(a);
+    var planned_roots: ?[]?ordered.Root = null;
+    var planned_files: ?[]const cohort_files.File = null;
+    var replay_files: ?[]const bool = null;
+    if (input.replay == null and definitions.len > 8) {
+        const roots = try ca.alloc(?ordered.Root, definitions.len);
+        @memset(roots, null);
+        const requirements = try ca.alloc(cohort_files.Requirement, definitions.len);
+        const current_files = try ca.alloc(cohort_files.File, source.inventory.files.len);
+        for (current_files, source.inventory.files) |*current, file| current.* = .{ .id = file.file_id, .digest = try state.identity(a, &input, file) };
+        for (definitions, 0..) |definition, index| {
+            var tuple = try tuples.TuplePlan.init(a, schema, &layout, definition.keys);
+            defer tuple.deinit();
+            var predicate: ?predicates.Plan = if (definition.where.len != 0) try predicates.Plan.init(a, schema, &layout, definition.where) else null;
+            defer if (predicate) |*plan| plan.deinit();
+            const cover = try coverColumns(ca, definition);
+            for (try tuple.columnBindings(ca)) |column| try replay_columns.put(a, column, {});
+            for (cover) |column| try replay_columns.put(a, column, {});
+            if (predicate) |plan| for (plan.conditions) |condition| for (try condition.tuple.columnBindings(ca)) |column| try replay_columns.put(a, column, {});
+            const name = try logicalName(ca, definition.name);
+            const binding = try bindingFor(ca, source, tuple, predicate, cover);
+            const reused = for (reusable) |decl| {
+                if (decl.artifact.kind == .ordered_row_index and decl.artifact.metadata_version == ordered.metadata_version and std.mem.eql(u8, decl.name, name) and std.mem.eql(u8, decl.binding.index_config_hash, binding.index_config_hash)) break true;
+            } else false;
+            if (!reused) roots[index] = try priorRoot(ca, store, binding, name, fingerprint(tuple, predicate, cover), candidates, cancellation);
+            requirements[index] = .{ .reused = reused, .previous = if (roots[index]) |root| .{ .files = root.files, .fingerprints = root.file_fingerprints } else null };
+        }
+        replay_files = try cohort_files.requiredFiles(ca, current_files, requirements);
+        planned_roots = roots;
+        planned_files = current_files;
+    }
+    const shared_columns = try ca.alloc([]const u8, replay_columns.count());
+    var replay_keys = replay_columns.keyIterator();
+    for (shared_columns) |*column| column.* = replay_keys.next().?.*;
+    var replay = @import("lake_index_build_replay.zig").Replay.init(a, &input, shared_columns);
+    defer replay.deinit();
+    replay.only_files = replay_files;
+    if (shared_columns.len != 0) input.replay = &replay;
     var files: std.StringHashMapUnmanaged(u32) = .empty;
     defer files.deinit(a);
     for (source.inventory.files, 0..) |file, index| try files.put(a, file.file_id, std.math.cast(u32, index) orelse return error.LakeSidecarBuildLimitExceeded);
@@ -108,7 +170,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         }
         var columns: std.StringHashMapUnmanaged(void) = .empty;
         defer columns.deinit(a);
-        for (definitions[first..end]) |definition| {
+        for (definitions[first..end], first..) |definition, definition_index| {
             var tuple = try tuples.TuplePlan.init(a, schema, &layout, definition.keys);
             errdefer tuple.deinit();
             var predicate: ?predicates.Plan = if (definition.where.len != 0) try predicates.Plan.init(a, schema, &layout, definition.where) else null;
@@ -119,12 +181,8 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             for (paths) |path| try columns.put(a, path, {});
             if (predicate) |plan| for (plan.conditions) |condition| for (try condition.tuple.columnBindings(ca)) |path| try columns.put(a, path, {});
             const name = try logicalName(ca, definition.name);
-            const hash = try std.fmt.allocPrint(ca, "native-ordered-rows-v5:{s}", .{std.fmt.bytesToHex(&fingerprint(tuple, predicate, cover), .lower)});
-            const binding: local.serverless_segment_source_binding.Binding = .{ .sidecar_kind = .ordered_rows, .source_kind = switch (source.inventory.format) {
-                .parquet => .external_parquet,
-                .iceberg => .external_iceberg,
-                .lance => return error.UnsupportedExternalLakeIndex,
-            }, .row_ref_kind = .external, .source_id = source.inventory.source_id, .snapshot_id = source.inventory.snapshot_id, .schema_fingerprint = source.inventory.schema_fingerprint, .index_config_hash = hash, .column_bindings = paths };
+            const binding = try bindingFor(ca, source, tuple, predicate, cover);
+            const hash = binding.index_config_hash;
             const previous = for (reusable) |decl| {
                 if (decl.artifact.kind == .ordered_row_index and decl.artifact.metadata_version == ordered.metadata_version and std.mem.eql(u8, decl.name, name) and std.mem.eql(u8, decl.binding.index_config_hash, hash)) break decl;
             } else null;
@@ -134,15 +192,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
                 tuple.deinit();
                 continue;
             }
-            const prior: ?ordered.Root = for (candidates) |decl| {
-                if (decl.artifact.kind != .ordered_row_index or decl.artifact.metadata_version != ordered.metadata_version or !std.mem.eql(u8, decl.name, name)) continue;
-                var previous_binding = decl.binding;
-                previous_binding.snapshot_id = binding.snapshot_id;
-                if (!@import("../serverless/build/lake_rebuild.zig").bindingsEqual(binding, previous_binding)) continue;
-                const root = try ordered.loadRoot(ca, store.*, decl.artifact, cancellation, null);
-                if (!std.mem.eql(u8, root.source, binding.source_id) or !std.mem.eql(u8, root.snapshot, decl.binding.snapshot_id) or root.file_fingerprints.len != root.files.len or !std.mem.eql(u8, &root.domain, &store.upload_scope.?.domain) or !std.mem.eql(u8, &root.fingerprint, &fingerprint(tuple, predicate, cover))) continue;
-                break root;
-            } else null;
+            const prior = if (planned_roots) |roots| roots[definition_index] else try priorRoot(ca, store, binding, name, fingerprint(tuple, predicate, cover), candidates, cancellation);
             const changed = try ca.alloc(bool, source.inventory.files.len);
             const slots = try ca.alloc(u32, source.inventory.files.len);
             var slot_names: std.ArrayList([]const u8) = .empty;
@@ -160,8 +210,8 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             if (prior) |root| for (root.files, 0..) |file, slot| {
                 if (!files.contains(file)) try vacant.append(ca, @intCast(slot));
             };
-            for (source.inventory.files, changed, slots) |file, *replace, *slot| {
-                const digest = try state.identity(a, &input, file);
+            for (source.inventory.files, changed, slots, 0..) |file, *replace, *slot, file_index| {
+                const digest = if (planned_files) |planned| planned[file_index].digest else try state.identity(a, &input, file);
                 const found = try slot_map.getOrPut(a, file.file_id);
                 if (!found.found_existing) {
                     found.value_ptr.* = try claimSlot(ca, &slot_names, &slot_hashes, &vacant, file.file_id, digest);
@@ -320,9 +370,20 @@ test "external lake native ordered indexes spill real Parquet and seek exact exp
     defer a.free(bytes);
     var object = try client.putObject("antfly", "part.parquet", bytes, .{});
     object.deinit(a);
-    const schema_json = try std.fmt.allocPrint(a,
+    const base_schema_json = try std.fmt.allocPrint(a,
         \\{{"version":1,"storage_mode":"relational","default_type":"row","base_source":{{"kind":"external","table_id":"lake","format":"parquet","uri":"file://{s}","schema_fingerprint":"schema"}},"relational_indexes":[{{"name":"amount_idx","keys":[{{"column":"amount"}}]}},{{"name":"expression_idx","keys":[{{"expression":{{"op":"negate","args":[{{"op":"column","column":"amount"}}]}},"result_type":"integer","direction":"desc"}}],"include_columns":["amount"],"where":[{{"column":"amount","op":"gt","value":0}}]}}],"document_schemas":{{"row":{{"schema":{{"type":"object","properties":{{"amount":{{"type":"integer"}}}},"additionalProperties":false}}}}}}}}
     , .{directory.path()});
+    defer a.free(base_schema_json);
+    var schema_arena = std.heap.ArenaAllocator.init(a);
+    defer schema_arena.deinit();
+    const sa = schema_arena.allocator();
+    var schema_value = try std.json.parseFromSliceLeaky(std.json.Value, sa, base_schema_json, .{});
+    const indexes = schema_value.object.getPtr("relational_indexes").?;
+    for (0..8) |index| {
+        const json = try std.fmt.allocPrint(sa, "{{\"name\":\"extra_{d}\",\"keys\":[{{\"column\":\"amount\"}}]}}", .{index});
+        try indexes.array.append(try std.json.parseFromSliceLeaky(std.json.Value, sa, json, .{}));
+    }
+    const schema_json = try std.json.Stringify.valueAlloc(a, schema_value, .{});
     defer a.free(schema_json);
     var binding = (try local.serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc(a, schema_json)).?;
     defer binding.deinit(a);
@@ -340,7 +401,7 @@ test "external lake native ordered indexes spill real Parquet and seek exact exp
     var provider: @import("lake_index_row_source.zig").Provider = .{ .source = &source, .context = .{ .io = std.testing.io } };
     const table: local.common_topology_records.TableRecord = .{ .table_id = 1, .name = "lake", .schema_json = schema_json, .indexes_json = "{}" };
     const declarations = try build(a, ca, table, &source, &store, &provider, .none, &.{});
-    try std.testing.expectEqual(@as(usize, 2), declarations.len);
+    try std.testing.expectEqual(@as(usize, 10), declarations.len);
     var parsed = try local.schema_mod.parseValidatedTableSchema(a, schema_json);
     defer parsed.deinit(a);
     const runtime = try local.schema_mod.deriveRuntimeTableSchema(a, parsed);
@@ -356,7 +417,7 @@ test "external lake native ordered indexes spill real Parquet and seek exact exp
         const target = values[17];
         var lower: std.ArrayList(u8) = .empty;
         defer lower.deinit(a);
-        _ = try tuple.appendValues(a, &lower, &.{.{ .integer = if (index == 0) target else -target }});
+        _ = try tuple.appendValues(a, &lower, &.{.{ .integer = if (index == 1) -target else target }});
         const upper = try a.dupe(u8, lower.items);
         defer a.free(upper);
         upper[upper.len - 1] += 1;
@@ -379,6 +440,12 @@ test "external lake native ordered indexes spill real Parquet and seek exact exp
         try std.testing.expectEqualStrings("amount", root.cover[0]);
         try std.testing.expectEqual(target, (try block.cell(cover.row, 0)).value.integer);
         try std.testing.expectEqualStrings(entries[0].key, (try block.keyCell(cover.row, 0)).value.string);
+    }
+    const incremental = try buildIncremental(a, ca, table, &source, &store, &provider, .none, &.{}, declarations);
+    try std.testing.expectEqual(declarations.len, incremental.len);
+    for (incremental) |declaration| {
+        const root = try ordered.loadRoot(ca, store, declaration.artifact, .none, null);
+        try std.testing.expectEqual(@as(u64, 4096), root.page.?.records);
     }
     const reused = try build(a, ca, table, &source, &store, &provider, .none, declarations);
     for (declarations, reused) |old, new| try std.testing.expectEqualStrings(old.artifact.artifact_id, new.artifact.artifact_id);

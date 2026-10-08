@@ -143,12 +143,6 @@ const SearchProfile = struct {
     results: usize = 0,
 };
 
-const ForwardScoreEntry = struct {
-    doc_num: u32,
-    score: f32,
-    doc_id: ?[]u8,
-};
-
 pub const OrdinalLookup = @import("ordinal_lookup.zig").Lookup;
 pub const KeyPredicate = struct {
     ptr: *anyopaque,
@@ -175,6 +169,8 @@ fn checkSearchCancellation(cancellation: ?CancellationToken) !void {
 }
 
 const daat = @import("daat.zig");
+const posting_pages = @import("posting_pages.zig");
+const PageReader = posting_pages.Reader(backend_erased.ReadTxn);
 const ScoreEntry = daat.Entry;
 
 /// Preserve native f32 addition order while bounding accumulation memory.
@@ -813,6 +809,9 @@ fn forEachSegmentChunk(
     comptime func: fn (@TypeOf(context), DecodedChunk) anyerror!void,
 ) !void {
     const payload = (try segmentTermPayload(segment, term_id)) orelse return;
+    return forEachPayloadChunk(alloc, payload, context, func);
+}
+fn forEachPayloadChunk(alloc: Allocator, payload: []const u8, context: anytype, comptime func: fn (@TypeOf(context), DecodedChunk) anyerror!void) !void {
     var pos: usize = 0;
     while (pos < payload.len) {
         if (pos + 8 > payload.len) return error.InvalidSparseSegment;
@@ -834,6 +833,19 @@ fn forEachSegmentChunk(
         try func(context, decoded);
         pos = range_end;
     }
+}
+
+fn forEachStoredSegmentChunk(alloc: Allocator, txn: anytype, id: u64, root: []const u8, term: u32, context: anytype, comptime func: fn (@TypeOf(context), DecodedChunk) anyerror!void) !void {
+    if (!posting_pages.paged(root)) return forEachSegmentChunk(alloc, root, term, context, func);
+    const Visitor = struct {
+        a: Allocator,
+        context: @TypeOf(context),
+        fn visit(self: *@This(), _: u32, payload: []const u8) !void {
+            try forEachPayloadChunk(self.a, payload, self.context, func);
+        }
+    };
+    var visitor: Visitor = .{ .a = alloc, .context = context };
+    try posting_pages.forEachBlock(txn, id, term, &visitor, Visitor.visit);
 }
 
 fn encodeDocMapSegment(alloc: Allocator, writes: []const SparseWrite, docs: []const BulkDoc) ![]u8 {
@@ -1427,10 +1439,10 @@ fn locatedForwardBytes(txn: anytype, doc_id: []const u8) !?[]const u8 {
     return forward;
 }
 
-fn collectPostingStreams(a: Allocator, txn: anytype, query: *const SparseVector, cancellation: ?CancellationToken, byte_budget: usize) !?[]daat.Stream {
+fn collectPostingStreams(a: Allocator, txn: anytype, query: *const SparseVector, cancellation: ?CancellationToken, byte_budget: usize, page_reader: *PageReader) !?[]daat.Stream {
     var streams: std.ArrayList(daat.Stream) = .empty;
     defer streams.deinit(a);
-    const max_streams = 4096; // bounded navigation; larger fan-out retains spill fallback
+    const max_streams = byte_budget / @sizeOf(daat.Stream); // navigation budget is independent of archive bytes
     var retained_bytes: usize = 0;
     var cursor = try txn.openCursor();
     defer cursor.close();
@@ -1442,7 +1454,11 @@ fn collectPostingStreams(a: Allocator, txn: anytype, query: *const SparseVector,
         const version = try immutableVersion(entry.value);
         var retained: ?[]const u8 = null;
         for (query.indices, query.values) |term, weight| {
-            if (try segmentTermPayload(entry.value, term) != null) {
+            if (posting_pages.paged(entry.value)) {
+                if (!try posting_pages.hasTerm(entry.value, term)) continue;
+                if (streams.items.len == max_streams) return null;
+                try streams.append(a, .{ .weight = weight, .segment = id, .version = version, .term = term, .reader = page_reader.interface(), .allocator = a });
+            } else if (try segmentTermPayload(entry.value, term) != null) {
                 if (streams.items.len == max_streams) return null;
                 // Retain only matching segments. Cursor entries may be recycled;
                 // transaction point reads remain pinned until query completion.
@@ -1583,7 +1599,7 @@ fn findCaptured(entries: []const CapturedIncarnation, doc_num: u32) ?CapturedInc
 /// Allocation-free upper bound. Posting buffers are charged per occurrence;
 /// incarnation metadata uses a bounded cache (collisions only overestimate).
 /// Reverse values are borrowed from the same snapshot used by actual capture.
-fn incarnationWorkingBytes(txn: anytype, data: []const u8, docmap: bool) !u64 {
+fn incarnationWorkingBytes(txn: anytype, data: []const u8, docmap: bool, id: ?u64) !u64 {
     const Context = struct {
         txn: @TypeOf(txn),
         bytes: u64,
@@ -1637,7 +1653,12 @@ fn incarnationWorkingBytes(txn: anytype, data: []const u8, docmap: bool) !u64 {
     };
     _ = try immutableVersion(data);
     var context: Context = .{ .txn = txn, .bytes = std.math.mul(u64, data.len, 4) catch return error.ResourceBudgetExceeded };
-    if (docmap) _ = try forEachDocMapEntry(data, &context, Context.document) else try forEachSegmentTermPayload(data, &context, Context.posting);
+    if (docmap) {
+        _ = try forEachDocMapEntry(data, &context, Context.document);
+    } else if (posting_pages.paged(data)) {
+        context.bytes = std.math.mul(u64, try posting_pages.materializedSize(data), 4) catch return error.ResourceBudgetExceeded;
+        try posting_pages.forEachBlock(txn, id.?, null, &context, Context.posting);
+    } else try forEachSegmentTermPayload(data, &context, Context.posting);
     return context.bytes;
 }
 
@@ -2220,10 +2241,12 @@ pub const SparseIndex = struct {
     pub const SegmentCompactionSource = struct {
         id: u64,
         data: []u8,
+        root: ?[]u8 = null,
         incarnations: []CapturedIncarnation,
 
         pub fn deinit(self: @This(), alloc: Allocator) void {
             alloc.free(self.data);
+            if (self.root) |root| alloc.free(root);
             for (self.incarnations) |entry| if (entry.doc_id) |bytes| alloc.free(bytes);
             alloc.free(self.incarnations);
         }
@@ -2321,7 +2344,7 @@ pub const SparseIndex = struct {
             var entry_opt = try preflight.seekAtOrAfter(&prefix);
             while (entry_opt) |entry| {
                 if (entry.key.len == 0 or entry.key[0] != tag) break;
-                const bytes = try incarnationWorkingBytes(&txn, entry.value, kind == 1);
+                const bytes = try incarnationWorkingBytes(&txn, entry.value, kind == 1, if (kind == 0) segmentIdFromKey(entry.key) else null);
                 preflight_bytes = std.math.add(u64, preflight_bytes, bytes) catch return error.ResourceBudgetExceeded;
                 counts[kind] += 1;
                 if (counts[kind] >= max_segments) break;
@@ -2345,11 +2368,13 @@ pub const SparseIndex = struct {
         while (maybe_segment) |entry| {
             if (entry.key.len == 0 or entry.key[0] != key_segment) break;
             const id = segmentIdFromKey(entry.key) orelse return error.InvalidSparseSegment;
-            const data = try alloc.dupe(u8, entry.value);
+            const data = try posting_pages.materialize(alloc, &txn, id, entry.value);
             var transferred = false;
             errdefer if (!transferred) alloc.free(data);
+            const root = if (posting_pages.paged(entry.value)) try alloc.dupe(u8, entry.value) else null;
+            errdefer if (!transferred) if (root) |bytes| alloc.free(bytes);
             const incarnations = try captureIncarnations(alloc, &txn, id, data, false);
-            const source: SegmentCompactionSource = .{ .id = id, .data = data, .incarnations = incarnations };
+            const source: SegmentCompactionSource = .{ .id = id, .data = data, .root = root, .incarnations = incarnations };
             sources.append(alloc, source) catch |err| {
                 for (incarnations) |item| if (item.doc_id) |bytes| alloc.free(bytes);
                 alloc.free(incarnations);
@@ -2551,7 +2576,7 @@ pub const SparseIndex = struct {
                 error.NotFound => return false,
                 else => return err,
             };
-            if (!std.mem.eql(u8, current, source.data)) return false;
+            if (!std.mem.eql(u8, current, source.root orelse source.data)) return false;
         }
         for (task.docmaps) |source| {
             var key_buf: [16]u8 = undefined;
@@ -2559,14 +2584,18 @@ pub const SparseIndex = struct {
                 error.NotFound => return false,
                 else => return err,
             };
-            if (!std.mem.eql(u8, current, source.data)) return false;
+            if (!std.mem.eql(u8, current, source.root orelse source.data)) return false;
         }
 
         if (result.data != null or result.docmap != null) {
             const segment_id = self.next_segment_id;
             self.next_segment_id += 1;
             var key_buf: [16]u8 = undefined;
-            if (result.data) |data| try txnAppendPut(&txn, self.dbi, segmentKey(&key_buf, segment_id), data);
+            if (result.data) |data| {
+                const root = try posting_pages.publish(self.alloc, &txn, segment_id, data);
+                defer self.alloc.free(root);
+                try txn.put(segmentKey(&key_buf, segment_id), root);
+            }
             if (result.docmap) |data| try txnAppendPut(&txn, self.dbi, docMapSegmentKey(&key_buf, segment_id), data);
             for (result.incarnations) |epoch| try putSegmentIncarnation(&txn, segment_id, epoch.doc_num, epoch.epoch, false);
             for (result.docmap_incarnations) |epoch| try putSegmentIncarnation(&txn, segment_id, epoch.doc_num, epoch.epoch, true);
@@ -2576,6 +2605,7 @@ pub const SparseIndex = struct {
 
         for (task.sources) |source| {
             var key_buf: [16]u8 = undefined;
+            try posting_pages.remove(&txn, source.id);
             txnDelete(&txn, self.dbi, segmentKey(&key_buf, source.id)) catch {};
             for (source.incarnations) |epoch| {
                 var key: [17]u8 = undefined;
@@ -2768,7 +2798,9 @@ pub const SparseIndex = struct {
             const segment_data = try encodeSegmentFromSortedPostings(self.alloc, postings.items, self.chunk_size);
             defer self.alloc.free(segment_data);
             var segment_key_buf: [16]u8 = undefined;
-            try txnAppendPut(&txn, self.dbi, segmentKey(&segment_key_buf, segment_id), segment_data);
+            const root = try posting_pages.publish(self.alloc, &txn, segment_id, segment_data);
+            defer self.alloc.free(root);
+            try txn.put(segmentKey(&segment_key_buf, segment_id), root);
         }
         self.write_profile.posting_write_ns += elapsedSince(phase_start_ns);
 
@@ -3684,205 +3716,6 @@ pub const SparseIndex = struct {
         return decodeChunkRangeMeta(data);
     }
 
-    fn scoreFwdDataAgainstQuery(
-        data: []const u8,
-        query_weights: *const std.AutoHashMapUnmanaged(u32, f32),
-    ) !?f32 {
-        const parsed = try parseFwdDocNumAndTermCount(data);
-        const term_count: usize = @intCast(parsed.term_count);
-        const terms_start = parsed.terms_start;
-        const weights_start = terms_start + term_count * 4;
-        if (data.len < weights_start + term_count * 4) return error.InvalidChunk;
-
-        var score: f32 = 0;
-        var matched = false;
-        for (0..term_count) |i| {
-            const term_pos = terms_start + i * 4;
-            const term_id = std.mem.readInt(u32, data[term_pos..][0..4], .little);
-            const query_weight = query_weights.get(term_id) orelse continue;
-            matched = true;
-            const weight_pos = weights_start + i * 4;
-            const bits = std.mem.readInt(u32, data[weight_pos..][0..4], .little);
-            const doc_weight: f32 = @bitCast(bits);
-            score += query_weight * doc_weight;
-        }
-        return if (matched) score else null;
-    }
-
-    fn appendForwardScoreIfMatch(
-        self: *SparseIndex,
-        alloc: Allocator,
-        txn: anytype,
-        entries: *std.ArrayListUnmanaged(ForwardScoreEntry),
-        query_weights: *const std.AutoHashMapUnmanaged(u32, f32),
-        doc_num: u32,
-        doc_id: []const u8,
-        fwd_data: []const u8,
-    ) !void {
-        if (self.docNumDeleted(txn, doc_num)) return;
-        const score = (try scoreFwdDataAgainstQuery(fwd_data, query_weights)) orelse return;
-        try entries.append(alloc, .{
-            .doc_num = doc_num,
-            .score = score,
-            .doc_id = try alloc.dupe(u8, doc_id),
-        });
-    }
-
-    fn maybeSearchFilterDriven(
-        self: *SparseIndex,
-        alloc: Allocator,
-        txn: anytype,
-        query_vec: *const SparseVector,
-        k: u32,
-        filter_doc_nums: *const std.AutoHashMapUnmanaged(u32, void),
-        direct_filter_doc_nums: *const std.AutoHashMapUnmanaged(u32, void),
-        exclude_doc_nums: *const std.AutoHashMapUnmanaged(u32, void),
-        direct_exclude_doc_nums: *const std.AutoHashMapUnmanaged(u32, void),
-        profile: ?*SearchProfile,
-        ordinal_filter: ?*const @import("../encoding/roaring.zig").RoaringBitmap,
-        cancellation: ?CancellationToken,
-    ) !?[]SearchResult {
-        if (k == 0 or query_vec.indices.len == 0) return try alloc.alloc(SearchResult, 0);
-        if (filter_doc_nums.count() == 0 and direct_filter_doc_nums.count() == 0) return null;
-
-        const filter_estimate = if (filter_doc_nums.count() == 0)
-            direct_filter_doc_nums.count()
-        else if (direct_filter_doc_nums.count() == 0)
-            filter_doc_nums.count()
-        else
-            @min(filter_doc_nums.count(), direct_filter_doc_nums.count());
-        // Forward-vector scoring wins only when the native positive filter is
-        // genuinely selective. Medium and broad filters are faster through the
-        // postings path because postings skip non-matching query terms without
-        // loading every filtered document vector.
-        const max_filter_docs = @min(@max(@as(usize, 128), @as(usize, k) * 32), @as(usize, 4096));
-        if (filter_estimate > max_filter_docs) return null;
-
-        var query_weights = std.AutoHashMapUnmanaged(u32, f32).empty;
-        defer query_weights.deinit(alloc);
-        try query_weights.ensureTotalCapacity(alloc, @intCast(query_vec.indices.len));
-        for (query_vec.indices, 0..) |term_id, i| {
-            const gop = try query_weights.getOrPut(alloc, term_id);
-            if (!gop.found_existing) gop.value_ptr.* = 0;
-            gop.value_ptr.* += query_vec.values[i];
-        }
-
-        var selected = std.ArrayListUnmanaged(u32).empty;
-        defer selected.deinit(alloc);
-        var wanted = std.AutoHashMapUnmanaged(u32, void).empty;
-        defer wanted.deinit(alloc);
-
-        const first = if (filter_doc_nums.count() > 0 and (direct_filter_doc_nums.count() == 0 or filter_doc_nums.count() <= direct_filter_doc_nums.count()))
-            filter_doc_nums
-        else
-            direct_filter_doc_nums;
-        const second = if (first == filter_doc_nums) direct_filter_doc_nums else filter_doc_nums;
-        var filter_it = first.iterator();
-        while (filter_it.next()) |entry| {
-            try checkSearchCancellation(cancellation);
-            const doc_num = entry.key_ptr.*;
-            if (ordinal_filter) |bitmap| if (!bitmap.contains(doc_num)) continue;
-            if (second.count() > 0 and !second.contains(doc_num)) continue;
-            if (exclude_doc_nums.contains(doc_num)) continue;
-            if (direct_exclude_doc_nums.contains(doc_num)) continue;
-            if (self.docNumDeleted(txn, doc_num)) continue;
-            try selected.append(alloc, doc_num);
-            try wanted.put(alloc, doc_num, {});
-        }
-        if (selected.items.len == 0) return try alloc.alloc(SearchResult, 0);
-        if (selected.items.len > max_filter_docs) return null;
-
-        var entries = std.ArrayListUnmanaged(ForwardScoreEntry).empty;
-        defer {
-            for (entries.items) |entry| {
-                if (entry.doc_id) |doc_id| alloc.free(doc_id);
-            }
-            entries.deinit(alloc);
-        }
-
-        const score_start_ns = if (profile != null) nowNs() else 0;
-        for (selected.items) |doc_num| {
-            try checkSearchCancellation(cancellation);
-            if (!wanted.contains(doc_num)) continue;
-            var rev_buf: [256]u8 = undefined;
-            const doc_id = txnGet(txn, self.dbi, revKey(&rev_buf, doc_num)) catch continue;
-            if (doc_id.len + 1 > 256) continue;
-            var fwd_buf: [256]u8 = undefined;
-            const fwd_data = txnGet(txn, self.dbi, fwdKey(&fwd_buf, doc_id)) catch |err| switch (err) {
-                error.NotFound => (try locatedForwardBytes(txn, doc_id)) orelse continue,
-                else => return err,
-            };
-            try self.appendForwardScoreIfMatch(alloc, txn, &entries, &query_weights, doc_num, doc_id, fwd_data);
-            _ = wanted.remove(doc_num);
-        }
-
-        if (wanted.count() > 0) {
-            const LookupContext = struct {
-                alloc: Allocator,
-                index: *SparseIndex,
-                txn: @TypeOf(txn),
-                wanted: *std.AutoHashMapUnmanaged(u32, void),
-                query_weights: *const std.AutoHashMapUnmanaged(u32, f32),
-                entries: *std.ArrayListUnmanaged(ForwardScoreEntry),
-
-                fn visit(ctx: *@This(), entry: DocMapLookup) !bool {
-                    if (entry.doc_num > std.math.maxInt(u32)) return false;
-                    const doc_num: u32 = @intCast(entry.doc_num);
-                    if (!ctx.wanted.contains(doc_num)) return false;
-                    try ctx.index.appendForwardScoreIfMatch(ctx.alloc, ctx.txn, ctx.entries, ctx.query_weights, doc_num, entry.doc_id, entry.fwd_data);
-                    _ = ctx.wanted.remove(doc_num);
-                    return ctx.wanted.count() == 0;
-                }
-            };
-
-            var cur = try txn.openCursor();
-            defer cur.close();
-            var maybe_entry = try cur.seekAtOrAfter(taggedPrefix(key_docmap_segment));
-            while (maybe_entry) |entry| {
-                if (entry.key.len == 0 or entry.key[0] != key_docmap_segment) break;
-                var ctx = LookupContext{
-                    .alloc = alloc,
-                    .index = self,
-                    .txn = txn,
-                    .wanted = &wanted,
-                    .query_weights = &query_weights,
-                    .entries = &entries,
-                };
-                if (try forEachCurrentDocMapEntry(txn, entry.key, entry.value, &ctx, LookupContext.visit)) break;
-                maybe_entry = try cur.next();
-            }
-        }
-        if (profile) |p| {
-            p.filter_forward_ns += nowNs() - score_start_ns;
-            p.filter_forward_docs = selected.items.len;
-            p.scored_docs = entries.items.len;
-            p.filter_forward_path = true;
-        }
-
-        std.mem.sort(ForwardScoreEntry, entries.items, {}, struct {
-            fn cmp(_: void, a: ForwardScoreEntry, b: ForwardScoreEntry) bool {
-                return a.score > b.score;
-            }
-        }.cmp);
-
-        const n = @min(@as(usize, @intCast(k)), entries.items.len);
-        if (n == 0) return try alloc.alloc(SearchResult, 0);
-        var results = try alloc.alloc(SearchResult, n);
-        errdefer alloc.free(results);
-        for (entries.items[0..n], 0..) |*entry, i| {
-            results[i] = .{
-                .doc_id = entry.doc_id.?,
-                .doc_num = entry.doc_num,
-                .score = entry.score,
-            };
-            entry.doc_id = null;
-        }
-        if (profile) |p| p.results = n;
-        return results;
-    }
-
-    /// Search for top-k documents matching a sparse query vector.
-    /// DAAT: accumulate scores per doc, then extract top-k.
     pub fn search(self: *SparseIndex, alloc: Allocator, query_vec: *const SparseVector, k: u32) ![]SearchResult {
         return try self.searchConstrained(alloc, query_vec, k, .{});
     }
@@ -3938,69 +3771,19 @@ pub const SparseIndex = struct {
         else
             null;
         defer if (ordinal_filter) |*bitmap| bitmap.deinit();
+        if (constraints.key_predicate == null and ordinal_filter == null and (filter_doc_nums.count() != 0 or direct_filter_doc_nums.count() != 0)) {
+            ordinal_filter = @import("../encoding/roaring.zig").RoaringBitmap.init(alloc);
+            const first = if (filter_doc_nums.count() != 0) &filter_doc_nums else &direct_filter_doc_nums;
+            var it = first.keyIterator();
+            while (it.next()) |num| {
+                if (filter_doc_nums.count() != 0 and direct_filter_doc_nums.count() != 0 and !direct_filter_doc_nums.contains(num.*)) continue;
+                try ordinal_filter.?.add(num.*);
+            }
+        }
         if (ordinal_filter) |*bitmap| {
             try bitmap.prepareRead();
             if (bitmap.isEmpty()) return try alloc.alloc(SearchResult, 0);
-            // Only the selective forward path needs a hash set. Broad predicates
-            // remain compressed and intersect postings before identity/scoring IO.
-            if (bitmap.cardinality() <= @min(@max(@as(usize, 128), @as(usize, k) * 32), @as(usize, 4096))) {
-                var it = bitmap.iterator();
-                while (it.next()) |num| {
-                    if (constraints.filter_doc_nums.len != 0 and !direct_filter_doc_nums.contains(num)) continue;
-                    if (constraints.filter_doc_nums.len == 0) try direct_filter_doc_nums.put(alloc, num, {});
-                }
-                // An existing direct constraint may contain unselected rows.
-                var intersection = std.AutoHashMapUnmanaged(u32, void).empty;
-                errdefer intersection.deinit(alloc);
-                var selected = direct_filter_doc_nums.keyIterator();
-                while (selected.next()) |num| if (bitmap.contains(num.*)) {
-                    try intersection.put(alloc, num.*, {});
-                };
-                direct_filter_doc_nums.deinit(alloc);
-                direct_filter_doc_nums = intersection;
-                if (direct_filter_doc_nums.count() == 0) return try alloc.alloc(SearchResult, 0);
-            }
         }
-        if (constraints.key_predicate == null or ordinal_filter != null) if (try self.maybeSearchFilterDriven(
-            alloc,
-            &txn,
-            query_vec,
-            k,
-            &filter_doc_nums,
-            &direct_filter_doc_nums,
-            &exclude_doc_nums,
-            &direct_exclude_doc_nums,
-            if (profile_enabled) &profile else null,
-            if (ordinal_filter) |*bitmap| bitmap else null,
-            constraints.cancellation,
-        )) |results| {
-            if (profile_enabled) {
-                std.log.info(
-                    "antfly_bench_sparse_search k={d} terms={d} results={d} scored_docs={d} total_ms={d} filter_ms={d} filter_forward_ms={d} filter_forward_docs={d} segment_seek_ms={d} segment_decode_ms={d} delta_chunk_ms={d} score_collect_ms={d} sort_ms={d} hydrate_ms={d} segment_entries={d} segment_chunks={d} delta_chunks={d} filter_forward={}",
-                    .{
-                        k,
-                        query_vec.indices.len,
-                        profile.results,
-                        profile.scored_docs,
-                        (nowNs() - total_start_ns) / std.time.ns_per_ms,
-                        profile.filter_resolve_ns / std.time.ns_per_ms,
-                        profile.filter_forward_ns / std.time.ns_per_ms,
-                        profile.filter_forward_docs,
-                        profile.segment_seek_ns / std.time.ns_per_ms,
-                        profile.segment_decode_ns / std.time.ns_per_ms,
-                        profile.delta_chunk_ns / std.time.ns_per_ms,
-                        profile.score_collect_ns / std.time.ns_per_ms,
-                        profile.sort_ns / std.time.ns_per_ms,
-                        profile.hydrate_ns / std.time.ns_per_ms,
-                        profile.segment_entries,
-                        profile.segment_chunks,
-                        profile.delta_chunks,
-                        profile.filter_forward_path,
-                    },
-                );
-            }
-            return results;
-        };
 
         // Accumulate scores: docNum → score
         var score_spill = constraints.score_spill;
@@ -4045,6 +3828,13 @@ pub const SparseIndex = struct {
 
             pub fn check(ctx: *@This()) !void {
                 try checkSearchCancellation(ctx.cancellation);
+            }
+            pub fn nextCandidate(ctx: *@This(), first: u32) u64 {
+                if (ctx.ordinal_filter) |bitmap| {
+                    var iterator = bitmap.iterator();
+                    return iterator.seekTo(first) orelse @as(u64, std.math.maxInt(u32)) + 1;
+                }
+                return first;
             }
             pub fn mayMatch(ctx: *@This(), first: u32, last: u32) bool {
                 const bitmap = ctx.ordinal_filter orelse return true;
@@ -4099,11 +3889,15 @@ pub const SparseIndex = struct {
             }
         };
 
+        var page_reader: PageReader = .{ .txn = &txn };
         var fast_entries: ?[]ScoreEntry = null;
         defer if (fast_entries) |values| alloc.free(values);
         if ((constraints.key_predicate == null or ordinal_filter != null) and try completeLocatorMap(&txn)) {
-            if (try collectPostingStreams(alloc, &txn, query_vec, constraints.cancellation, 64 * 1024 * 1024)) |input| {
-                defer alloc.free(input);
+            if (try collectPostingStreams(alloc, &txn, query_vec, constraints.cancellation, 64 * 1024 * 1024, &page_reader)) |input| {
+                defer {
+                    for (input) |*stream| stream.deinit();
+                    alloc.free(input);
+                }
                 var context = AccumulateContext{
                     .alloc = alloc,
                     .txn = &txn,
@@ -4123,7 +3917,13 @@ pub const SparseIndex = struct {
                     .decisions = &decisions,
                 };
                 var scoring_stats: daat.Stats = .{};
-                fast_entries = try daat.collect(alloc, input, k, &context, &scoring_stats);
+                fast_entries = daat.collect(alloc, input, k, &context, &scoring_stats) catch |err| switch (err) {
+                    // Page sizes are learned lazily. A query exceeding the live
+                    // block budget retries through the existing bounded spill
+                    // collector after every admitted stream is released.
+                    error.ResourceBudgetExceeded => null,
+                    else => return err,
+                };
                 if (profile_enabled) profile.scored_docs = scoring_stats.scored;
             }
         }
@@ -4160,7 +3960,7 @@ pub const SparseIndex = struct {
                         .decisions = &decisions,
                     };
                     const segment_decode_start_ns = if (profile_enabled) nowNs() else 0;
-                    try forEachSegmentChunk(alloc, segment_entry.value, term_id, &ctx, AccumulateContext.visit);
+                    try forEachStoredSegmentChunk(alloc, &txn, ctx.segment_id.?, segment_entry.value, term_id, &ctx, AccumulateContext.visit);
                     if (profile_enabled) profile.segment_decode_ns += nowNs() - segment_decode_start_ns;
                 }
                 const segment_next_start_ns = if (profile_enabled) nowNs() else 0;
@@ -4600,7 +4400,7 @@ pub const SparseIndex = struct {
                     .selected_doc_nums = &collected.selected_doc_nums,
                     .out = &out,
                 };
-                try forEachSegmentChunk(alloc, segment_entry.value, term_id, &segment_ctx, SegmentStatsContext.visit);
+                try forEachStoredSegmentChunk(alloc, &src_txn, segmentIdFromKey(segment_entry.key).?, segment_entry.value, term_id, &segment_ctx, SegmentStatsContext.visit);
             }
             maybe_segment = try src_cur.next();
         }
@@ -5450,14 +5250,14 @@ test "sparse incarnation preflight amortizes repeated terms and conservatively c
     defer alloc.free(repeated);
     var txn = try index.beginReadTxn();
     defer txn.abort();
-    const repeated_bytes = try incarnationWorkingBytes(&txn, repeated, false);
+    const repeated_bytes = try incarnationWorkingBytes(&txn, repeated, false, null);
     // Includes encoded buffers and posting arrays, not 512 metadata bytes for
     // every occurrence of the same document. Final reservation doubles this.
     try std.testing.expect(repeated_bytes < postings.len * 512);
     for (&postings, 0..) |*posting, i| posting.doc_num = if (i % 2 == 0) 1 else 4097;
     const collisions = try encodeSegmentFromSortedPostings(alloc, &postings, 128);
     defer alloc.free(collisions);
-    const collision_bytes = try incarnationWorkingBytes(&txn, collisions, false);
+    const collision_bytes = try incarnationWorkingBytes(&txn, collisions, false, null);
     try std.testing.expect(collision_bytes >= repeated_bytes + (postings.len - 1) * 512);
 }
 
@@ -6135,7 +5935,7 @@ test "sparse backend store opens concrete txn handles" {
     }
 }
 
-test "sparse physical ordinal selection uses forward scoring and intersects direct constraints" {
+test "sparse physical ordinal selection uses canonical scoring and intersects direct constraints" {
     const a = std.testing.allocator;
     var pb: [256]u8 = undefined;
     const path = tmpPath(&pb, "physical-ordinals");
@@ -6359,12 +6159,140 @@ test "sparse document streams bound retained segment bytes before scoring" {
     var txn = try index.beginReadTxn();
     defer txn.abort();
     var query: SparseVector = .{ .indices = &.{1}, .values = &.{1} };
-    try std.testing.expect((try collectPostingStreams(a, &txn, &query, null, 0)) == null);
-    const admitted = (try collectPostingStreams(a, &txn, &query, null, 64 * 1024 * 1024)).?;
+    var page_reader: PageReader = .{ .txn = &txn };
+    try std.testing.expect((try collectPostingStreams(a, &txn, &query, null, 0, &page_reader)) == null);
+    const admitted = (try collectPostingStreams(a, &txn, &query, null, 64 * 1024 * 1024, &page_reader)).?;
     defer a.free(admitted);
     try std.testing.expectEqual(@as(usize, 1), admitted.len);
     query = .{ .indices = &.{999}, .values = &.{1} };
-    const unmatched = (try collectPostingStreams(a, &txn, &query, null, 0)).?;
+    const unmatched = (try collectPostingStreams(a, &txn, &query, null, 0, &page_reader)).?;
     defer a.free(unmatched);
     try std.testing.expectEqual(@as(usize, 0), unmatched.len);
+}
+
+test "sparse paged postings roundtrip seek and reclaim immutable blocks" {
+    const a = std.testing.allocator;
+    var path_bytes: [256]u8 = undefined;
+    const path = tmpPath(&path_bytes, "paged-postings");
+    defer cleanupTmp(path);
+    var index = try SparseIndex.open(a, path, .{});
+    defer index.close();
+    const postings = [_]BulkPosting{
+        .{ .term_id = 1, .doc_num = 0, .weight = 1, .doc_id = "a" },
+        .{ .term_id = 1, .doc_num = 1, .weight = 1.1, .doc_id = "b" },
+        .{ .term_id = 1, .doc_num = 2, .weight = 100, .doc_id = "c" },
+        .{ .term_id = 2, .doc_num = 2, .weight = -2, .doc_id = "c" },
+    };
+    const legacy = try encodeSegmentFromSortedPostings(a, &postings, 2);
+    defer a.free(legacy);
+    {
+        var txn = try index.beginBatchTxn(.{});
+        errdefer txn.abort();
+        const root = try posting_pages.publish(a, &txn, 42, legacy);
+        defer a.free(root);
+        const restored = try posting_pages.materialize(a, &txn, 42, root);
+        defer a.free(restored);
+        try std.testing.expectEqualSlices(u8, legacy, restored);
+        try std.testing.expect(try posting_pages.hasTerm(root, 1));
+        try std.testing.expect(!try posting_pages.hasTerm(root, 99));
+        try txn.commit();
+    }
+    {
+        var txn = try index.beginReadTxn();
+        defer txn.abort();
+        var reader: PageReader = .{ .txn = &txn };
+        var stream: daat.Stream = .{ .weight = 1, .segment = 42, .version = 2, .term = 1, .reader = reader.interface(), .allocator = a };
+        defer stream.deinit();
+        try stream.seek(2);
+        try std.testing.expectEqual(@as(?u32, 2), stream.doc);
+        try std.testing.expectEqual(@as(f32, 100), stream.contribution());
+        try std.testing.expectEqual(@as(usize, 1), reader.blocks);
+        try stream.advance();
+        try std.testing.expectEqual(null, stream.doc);
+        try std.testing.expectEqual(@as(usize, 0), reader.resident);
+    }
+    {
+        var txn = try index.beginBatchTxn(.{});
+        errdefer txn.abort();
+        try posting_pages.remove(&txn, 42);
+        try txn.commit();
+    }
+    var txn = try index.beginReadTxn();
+    defer txn.abort();
+    var reader: PageReader = .{ .txn = &txn };
+    var stream: daat.Stream = .{ .weight = 1, .segment = 42, .term = 1, .reader = reader.interface(), .allocator = a };
+    defer stream.deinit();
+    try stream.seek(0);
+    try std.testing.expectEqual(null, stream.doc);
+}
+
+test "sparse paged archive admission depends on live blocks rather than segment bytes" {
+    const a = std.testing.allocator;
+    var path_bytes: [256]u8 = undefined;
+    const path = tmpPath(&path_bytes, "paged-archive-admission");
+    defer cleanupTmp(path);
+    var index = try SparseIndex.open(a, path, .{ .chunk_size = 128 });
+    defer index.close();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const writes = try arena.allocator().alloc(SparseWrite, 2048);
+    for (writes, 0..) |*write, i| write.* = .{ .doc_id = try std.fmt.allocPrint(arena.allocator(), "doc-{d:0>4}", .{i}), .vec = .{ .indices = &.{1}, .values = &.{1} } };
+    try index.batchWithOptions(writes, &.{}, .{ .prefer_bulk_build = true, .assume_new_doc_ids = true });
+    var txn = try index.beginReadTxn();
+    defer txn.abort();
+    {
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        const root = (try cursor.seekAtOrAfter(taggedPrefix(key_segment))).?.value;
+        try std.testing.expect(posting_pages.paged(root));
+        try std.testing.expect(try posting_pages.materializedSize(root) > 8192);
+    }
+    const query: SparseVector = .{ .indices = &.{1}, .values = &.{1} };
+    var reader: PageReader = .{ .txn = &txn, .budget = 8192 };
+    const streams = (try collectPostingStreams(a, &txn, &query, null, 1024, &reader)).?;
+    defer {
+        for (streams) |*stream| stream.deinit();
+        a.free(streams);
+    }
+    const Context = struct {
+        pub fn check(_: *@This()) !void {}
+        pub fn allows(_: *@This(), _: daat.Stream, _: u32) !bool {
+            return true;
+        }
+        pub fn nextCandidate(_: *@This(), first: u32) u64 {
+            return if (first <= 2047) 2047 else @as(u64, std.math.maxInt(u32)) + 1;
+        }
+    };
+    var context: Context = .{};
+    var stats: daat.Stats = .{};
+    const results = try daat.collect(a, streams, 1, &context, &stats);
+    defer a.free(results);
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqual(@as(u32, 2047), results[0].doc_num);
+    try std.testing.expectEqual(@as(usize, 1), reader.blocks);
+    try std.testing.expect(reader.bytes < 8192);
+}
+
+test "sparse selective filters retain quantized scores and tie order" {
+    const a = std.testing.allocator;
+    var path_bytes: [256]u8 = undefined;
+    const path = tmpPath(&path_bytes, "canonical-filter-scores");
+    defer cleanupTmp(path);
+    var index = try SparseIndex.open(a, path, .{});
+    defer index.close();
+    try index.batchWithOptions(&.{
+        .{ .doc_id = "a", .vec = .{ .indices = &.{1}, .values = &.{1} } },
+        .{ .doc_id = "b", .vec = .{ .indices = &.{1}, .values = &.{1.1} } },
+        .{ .doc_id = "c", .vec = .{ .indices = &.{1}, .values = &.{100} } },
+    }, &.{}, .{ .prefer_bulk_build = true, .assume_new_doc_ids = true });
+    const query: SparseVector = .{ .indices = &.{1}, .values = &.{1} };
+    const all = try index.search(a, &query, 3);
+    defer SparseIndex.freeResults(a, all);
+    const filtered = try index.searchConstrained(a, &query, 3, .{ .filter_doc_ids = &.{ "a", "b" } });
+    defer SparseIndex.freeResults(a, filtered);
+    try std.testing.expectEqual(@as(usize, 2), filtered.len);
+    for (filtered, all[1..]) |actual, expected| {
+        try std.testing.expectEqualStrings(expected.doc_id, actual.doc_id);
+        try std.testing.expectEqual(@as(u32, @bitCast(expected.score)), @as(u32, @bitCast(actual.score)));
+    }
 }
