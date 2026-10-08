@@ -31,7 +31,26 @@ pub const metadata_version: u16 = 8;
 pub const max_root_bytes = 4 * 1024 * 1024;
 pub const max_segments = 262144;
 pub const physical = @import("lake_index_physical_ordinals.zig");
-pub const FileGroup = struct { file: state.File, segments: []const artifacts.ChunkRef, rows: []const physical.Block = &.{} };
+pub const FileGroup = struct {
+    file: state.File,
+    segments: []const artifacts.ChunkRef,
+    rows: []const physical.Block = &.{},
+    pub fn validate(self: FileGroup, domain: [32]u8) !void {
+        if (self.segments.len > max_segments) return error.InvalidNativeLakeTextCorpus;
+        try state.validate(&.{self.file}, domain);
+        _ = try physical.validate(self.rows);
+        for (self.rows) |block| if (block.bitmap) |ref| {
+            const scope = (try stores.uploadScopeFromArtifactId(ref.artifact_id)) orelse return error.InvalidNativeLakeTextCorpus;
+            if (!std.mem.eql(u8, &scope.domain, &domain)) return error.InvalidNativeLakeTextCorpus;
+        };
+        for (self.segments) |segment| {
+            if (segment.byte_len == 0 or segment.byte_len > 32 * 1024 * 1024) return error.InvalidNativeLakeTextCorpus;
+            try stores.validateSha256ArtifactIdentity(segment.artifact_id, segment.checksum);
+            const scope = (try stores.uploadScopeFromArtifactId(segment.artifact_id)) orelse return error.InvalidNativeLakeTextCorpus;
+            if (!std.mem.eql(u8, &scope.domain, &domain)) return error.InvalidNativeLakeTextCorpus;
+        }
+    }
+};
 pub const Root = struct {
     version: u16 = metadata_version,
     seekable: bool = false,
@@ -55,12 +74,7 @@ pub const Root = struct {
         }
         var segment_position: usize = 0;
         for (self.file_groups) |group| {
-            try state.validate(&.{group.file}, self.domain);
-            _ = try physical.validate(group.rows);
-            for (group.rows) |block| if (block.bitmap) |ref| {
-                const scope = (try stores.uploadScopeFromArtifactId(ref.artifact_id)) orelse return error.InvalidNativeLakeTextCorpus;
-                if (!std.mem.eql(u8, &scope.domain, &self.domain)) return error.InvalidNativeLakeTextCorpus;
-            };
+            try group.validate(self.domain);
             for (group.segments) |segment| {
                 if (segment_position >= self.segments.len or (!std.mem.eql(u8, segment.artifact_id, self.segments[segment_position].artifact_id) or !std.mem.eql(u8, segment.checksum, self.segments[segment_position].checksum) or segment.byte_len != self.segments[segment_position].byte_len)) return error.InvalidNativeLakeTextCorpus;
                 segment_position += 1;
@@ -77,24 +91,40 @@ pub const Root = struct {
         }
     }
 };
-pub fn loadRoot(a: A, store: stores.ArtifactStore, ref: Ref, cancellation: Cancellation, cache: ?artifacts.CachedRead) !Root {
+/// Read only the authenticated root directory; callers own child admission.
+pub fn loadRootDirectory(a: A, store: stores.ArtifactStore, ref: Ref, cancellation: Cancellation, cache: ?artifacts.CachedRead) !Root {
     if (ref.kind != .text_segment or ref.metadata_version != metadata_version or ref.byte_len > max_root_bytes) return error.InvalidNativeLakeTextCorpus;
     const bytes = try artifacts.readArtifact(a, store, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, cancellation, cache);
     defer a.free(bytes);
-    var root = try std.json.parseFromSliceLeaky(Root, a, bytes, .{ .allocate = .alloc_always });
-    // Validate the bounded directory before following any child reference.
+    const root = try std.json.parseFromSliceLeaky(Root, a, bytes, .{ .allocate = .alloc_always });
     try root.validate();
+    if (root.manifests.len != 0 and (root.segments.len != 0 or root.file_groups.len != 0)) return error.InvalidNativeLakeTextCorpus;
+    const scope = (try stores.uploadScopeFromArtifactId(ref.artifact_id)) orelse return error.InvalidNativeLakeTextCorpus;
+    if (!std.mem.eql(u8, &root.domain, &scope.domain)) return error.InvalidNativeLakeTextCorpus;
+    return root;
+}
+/// One independently admitted immutable file manifest. Share validation with
+/// serving while allowing GC to checkpoint between file jobs.
+pub fn loadFileManifest(a: A, store: stores.ArtifactStore, ref: artifacts.ChunkRef, domain: [32]u8, cancellation: Cancellation, cache: ?artifacts.CachedRead) !FileGroup {
+    if (ref.byte_len == 0 or ref.byte_len > max_root_bytes) return error.InvalidNativeLakeTextCorpus;
+    const scope = (try stores.uploadScopeFromArtifactId(ref.artifact_id)) orelse return error.InvalidNativeLakeTextCorpus;
+    if (!std.mem.eql(u8, &scope.domain, &domain)) return error.InvalidNativeLakeTextCorpus;
+    const bytes = try artifacts.readArtifact(a, store, ref, cancellation, cache);
+    defer a.free(bytes);
+    const group = try std.json.parseFromSliceLeaky(FileGroup, a, bytes, .{ .allocate = .alloc_always });
+    try group.validate(domain);
+    return group;
+}
+pub fn loadRoot(a: A, store: stores.ArtifactStore, ref: Ref, cancellation: Cancellation, cache: ?artifacts.CachedRead) !Root {
+    var root = try loadRootDirectory(a, store, ref, cancellation, cache);
     if (root.manifests.len != 0) {
-        if (root.segments.len != 0 or root.file_groups.len != 0) return error.InvalidNativeLakeTextCorpus;
         var groups: std.ArrayList(FileGroup) = .empty;
         var segments: std.ArrayList(artifacts.ChunkRef) = .empty;
         var metadata_budget: u64 = 32 * 1024 * 1024;
         for (root.manifests) |manifest| {
             try cancellation.check();
             try stores.chargeReadBudget(&metadata_budget, manifest.byte_len);
-            const page = try artifacts.readArtifact(a, store, manifest, cancellation, cache);
-            defer a.free(page);
-            const group = try std.json.parseFromSliceLeaky(FileGroup, a, page, .{ .allocate = .alloc_always });
+            const group = try loadFileManifest(a, store, manifest, root.domain, cancellation, cache);
             if (group.segments.len > max_segments -| segments.items.len) return error.InvalidNativeLakeTextCorpus;
             try groups.append(a, group);
             try segments.appendSlice(a, group.segments);
@@ -103,8 +133,6 @@ pub fn loadRoot(a: A, store: stores.ArtifactStore, ref: Ref, cancellation: Cance
         root.segments = segments.items;
         try root.validate();
     }
-    const scope = (try stores.uploadScopeFromArtifactId(ref.artifact_id)) orelse return error.InvalidNativeLakeTextCorpus;
-    if (!std.mem.eql(u8, &root.domain, &scope.domain)) return error.InvalidNativeLakeTextCorpus;
     return root;
 }
 /// The serving cache supplies mapped, pinned native segment bytes. A bounded
