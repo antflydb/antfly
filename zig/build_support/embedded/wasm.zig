@@ -120,6 +120,7 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
     const regex_mod = b.createModule(.{ .root_source_file = b.path("lib/regex/src/mod.zig"), .target = wasm_target, .optimize = optimize });
     regex_mod.addImport("antfly_fst", fst_mod);
     regex_mod.addImport("antfly_platform", wasm_platform_mod);
+    const sql_regex_mod = @import("../../lib/sql_regex/build.zig").createModule(b, wasm_target, optimize, b.path("lib/sql_regex"));
     const chunking_mod = b.createModule(.{ .root_source_file = b.path("lib/chunking/src/mod.zig"), .target = wasm_target, .optimize = optimize });
     chunking_mod.addImport("antfly-json", json_mod);
     chunking_mod.addImport("antfly_chunking_api_openapi", api.chunking_api);
@@ -148,6 +149,7 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
         wasm_hash_mod,
         fst_mod,
         regex_mod,
+        sql_regex_mod,
         wasm_image_mod,
         wasm_font_mod,
         wasm_pdf_mod,

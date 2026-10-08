@@ -31,6 +31,47 @@ pub const Budget = struct {
     }
 };
 pub const Span = extern struct { start: c_long = -1, end: c_long = -1 };
+/// Ordered PostgreSQL flag semantics, including the server's actual basic/
+/// extended flavor transitions. Global occurrence selection is a SQL overload
+/// concern, separate from native compilation flags.
+pub const Flags = struct {
+    native: c_int = 3,
+    global: bool = false,
+    pub fn parse(text: []const u8, allow_global: bool) !Flags {
+        if (text.len > 16 * 1024) return error.SqlExpressionTooLarge;
+        var result: Flags = .{};
+        for (text) |flag| switch (flag) {
+            'g' => if (allow_global) {
+                result.global = true;
+            } else return error.SqlInvalidArgument,
+            'b' => result.native &= ~@as(c_int, 7),
+            'c' => result.native &= ~@as(c_int, 8),
+            'e' => {
+                result.native |= 1;
+                result.native &= ~@as(c_int, 7);
+            },
+            'i' => result.native |= 8,
+            'm', 'n' => result.native |= 192,
+            'p' => {
+                result.native |= 64;
+                result.native &= ~@as(c_int, 128);
+            },
+            'q' => {
+                result.native |= 4;
+                result.native &= ~@as(c_int, 3);
+            },
+            's' => result.native &= ~@as(c_int, 192),
+            't' => result.native &= ~@as(c_int, 32),
+            'w' => {
+                result.native &= ~@as(c_int, 64);
+                result.native |= 128;
+            },
+            'x' => result.native |= 32,
+            else => return error.SqlInvalidArgument,
+        };
+        return result;
+    }
+};
 const Context = extern struct {
     user: *anyopaque,
     allocate: *const fn (*anyopaque, usize) callconv(.c) ?*anyopaque = Memory.allocate,
@@ -325,6 +366,81 @@ pub const Executor = struct {
     }
 };
 
+/// Execution-owned bounded LRU, never a mutable global/prepared-plan cache.
+/// The backing allocator must reclaim frees; do not use a per-row arena.
+/// Borrowed programs live until the next pattern admission or session close.
+/// A session is synchronous and must not be shared by concurrent callers.
+pub const Session = struct {
+    const Entry = struct { text: []u8, flags: c_int, hash: u64, touched: u64, program: Program };
+    alloc: A,
+    limits: Limits,
+    maximum_bytes: usize,
+    executor: Executor,
+    entries: [8]?Entry = @splat(null),
+    resident: usize = 0,
+    tick: u64 = 0,
+    hits: u64 = 0,
+    compilations: u64 = 0,
+    evictions: u64 = 0,
+    pub fn init(alloc: A, limits: Limits, maximum_bytes: usize) Session {
+        return .{ .alloc = alloc, .limits = limits, .maximum_bytes = maximum_bytes, .executor = Executor.init(alloc, limits) };
+    }
+    fn remove(self: *Session, index: usize) void {
+        const entry = &self.entries[index].?;
+        self.resident -= entry.text.len + entry.program.memory.resident;
+        entry.program.deinit();
+        self.alloc.free(entry.text);
+        self.entries[index] = null;
+        self.evictions +|= 1;
+    }
+    fn oldest(self: *const Session) ?usize {
+        var result: ?usize = null;
+        for (self.entries, 0..) |entry, i| if (entry) |value| {
+            if (result == null or value.touched < self.entries[result.?].?.touched) result = i;
+        };
+        return result;
+    }
+    pub fn pattern(self: *Session, text: []const u8, flags: c_int, budget: *Budget) !*const Program {
+        if (text.len > self.limits.pattern_bytes or text.len >= self.maximum_bytes) return error.SqlExpressionTooLarge;
+        if (!budget.consumeWork(text.len + self.entries.len)) return budget.failure.?;
+        const hash = std.hash.Wyhash.hash(@as(u32, @bitCast(flags)), text);
+        self.tick +|= 1;
+        for (&self.entries) |*slot| if (slot.*) |*entry| {
+            if (entry.hash != hash or entry.flags != flags or entry.text.len != text.len) continue;
+            if (!budget.consumeWork(text.len)) return budget.failure.?;
+            if (!std.mem.eql(u8, text, entry.text)) continue;
+            entry.touched = self.tick;
+            self.hits +|= 1;
+            return &entry.program;
+        };
+        const heap = @min(self.limits.heap_bytes, self.maximum_bytes - text.len);
+        // Reserve the full compile admission, not merely the eventual retained
+        // NFA size. A miss cannot exceed the cache bound while compiling.
+        while (self.resident > self.maximum_bytes - text.len - heap) self.remove(self.oldest() orelse return error.InvalidRegexResponse);
+        var index: usize = 0;
+        while (index < self.entries.len and self.entries[index] != null) : (index += 1) {}
+        if (index == self.entries.len) {
+            index = self.oldest().?;
+            self.remove(index);
+        }
+        const owned = try self.alloc.dupe(u8, text);
+        errdefer self.alloc.free(owned);
+        var limits = self.limits;
+        limits.heap_bytes = heap;
+        self.compilations +|= 1;
+        const program = try Program.compile(self.alloc, text, flags, limits, budget);
+        self.entries[index] = .{ .text = owned, .flags = flags, .hash = hash, .touched = self.tick, .program = program };
+        self.resident += owned.len + program.memory.resident;
+        std.debug.assert(self.resident <= self.maximum_bytes);
+        return &self.entries[index].?.program;
+    }
+    pub fn deinit(self: *Session) void {
+        self.executor.deinit();
+        for (0..self.entries.len) |index| if (self.entries[index] != null) self.remove(index);
+        std.debug.assert(self.resident == 0);
+    }
+};
+
 /// Owned and immutable; prepare once for a constant replacement, reuse across
 /// rows. Unknown escapes (including backslash-zero) remain literal as in PG.
 pub const Replacement = struct {
@@ -439,6 +555,74 @@ test "PostgreSQL ARE captures Unicode character spans and preserves the original
     try std.testing.expectEqualStrings("1", (try subject.slice(matches[2])).?);
     try std.testing.expect(try program.find(subject, 4, &matches, &budget));
     try std.testing.expectEqualStrings("B22", (try subject.slice(matches[0])).?);
+}
+
+test "PostgreSQL ARE execution session owns bounded LRU patterns and reuses warm scratch" {
+    const a = std.testing.allocator;
+    var session = Session.init(a, .{}, 16 * 1024 * 1024);
+    defer session.deinit();
+    var budget: Budget = .{};
+    var text = [_]u8{ 'a', 'b', 'c' };
+    _ = try session.pattern(&text, 3, &budget);
+    text[0] = 'x';
+    var subject = try Subject.init(a, "雪abc😀");
+    defer subject.deinit();
+    var spans: [1]Span = undefined;
+    const first = try session.pattern("abc", 3, &budget);
+    try std.testing.expect(try session.executor.find(first, subject, 0, &spans, &budget));
+    const warmed = session.executor.snapshot().allocations;
+    for (0..1000) |_| {
+        var row_budget: Budget = .{};
+        const program = try session.pattern("abc", 3, &row_budget);
+        try std.testing.expect(program.memory.budget == null);
+        try std.testing.expect(try session.executor.find(program, subject, 0, &spans, &row_budget));
+        try std.testing.expectEqualStrings("abc", (try subject.slice(spans[0])).?);
+    }
+    try std.testing.expectEqual(@as(u64, 1), session.compilations);
+    try std.testing.expectEqual(warmed, session.executor.snapshot().allocations);
+    _ = try session.pattern("abc", 11, &budget);
+    try std.testing.expectEqual(@as(u64, 2), session.compilations);
+    for ([_][]const u8{ "a", "b", "c", "d", "e", "f", "g", "h", "i" }) |pattern| {
+        _ = try session.pattern(pattern, 3, &budget);
+        try std.testing.expect(session.resident <= session.maximum_bytes);
+    }
+    try std.testing.expect(session.evictions > 0);
+    try std.testing.expectError(error.SqlInvalidRegularExpression, session.pattern("[", 3, &budget));
+    const program = try session.pattern("abc", 3, &budget);
+    try std.testing.expect(try session.executor.find(program, subject, 0, &spans, &budget));
+    var refused = Session.init(a, .{}, 32);
+    defer refused.deinit();
+    try std.testing.expectError(error.SqlExpressionTooLarge, refused.pattern("abc", 3, &budget));
+    try std.testing.expectEqual(@as(usize, 0), refused.resident);
+}
+
+test "PostgreSQL ARE session admission unwinds every allocation failure" {
+    const Faults = struct {
+        fn run(a: A) !void {
+            var session = Session.init(a, .{}, 16 * 1024 * 1024);
+            defer session.deinit();
+            var budget: Budget = .{};
+            var subject = try Subject.init(a, "abc abc");
+            defer subject.deinit();
+            var spans: [1]Span = undefined;
+            for ([_][]const u8{ "a", "(ab)+", "a|ab" }) |pattern| {
+                const program = try session.pattern(pattern, 3, &budget);
+                try std.testing.expect(try session.executor.find(program, subject, 0, &spans, &budget));
+            }
+            const retained = try session.pattern("a", 3, &budget);
+            try std.testing.expect(try session.executor.find(retained, subject, 0, &spans, &budget));
+            try std.testing.expectEqual(@as(u64, 3), session.compilations);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Faults.run, .{});
+}
+
+test "PostgreSQL ARE ordered flags reject unknown and disallowed global options" {
+    try std.testing.expect((try Flags.parse("gi", true)).global);
+    try std.testing.expectEqual(@as(c_int, 11), (try Flags.parse("gi", true)).native);
+    try std.testing.expectError(error.SqlInvalidArgument, Flags.parse("g", false));
+    try std.testing.expectError(error.SqlInvalidArgument, Flags.parse("z", true));
+    try std.testing.expectError(error.SqlInvalidArgument, Flags.parse("é", true));
 }
 
 test "PostgreSQL ARE keeps longest shortest empty lookaround and backreference semantics" {
@@ -747,6 +931,7 @@ test "PostgreSQL ARE independently generated spans preserve captures flags and C
             pattern: []const u8,
             input: []const u8,
             flags: c_int,
+            options: []const u8,
             start: usize,
             captures: usize,
             matched: bool,
@@ -761,7 +946,9 @@ test "PostgreSQL ARE independently generated spans preserve captures flags and C
     for (golden.value.entries) |case| {
         errdefer std.debug.print("PostgreSQL ARE fixture {s}\n", .{case.id});
         var budget: Budget = .{};
-        var program = try Program.compile(a, case.pattern, case.flags, .{}, &budget);
+        const flags = try Flags.parse(case.options, false);
+        try std.testing.expectEqual(case.flags, flags.native);
+        var program = try Program.compile(a, case.pattern, flags.native, .{}, &budget);
         defer program.deinit();
         try std.testing.expectEqual(case.captures, program.captures);
         var subject = try Subject.init(a, case.input);

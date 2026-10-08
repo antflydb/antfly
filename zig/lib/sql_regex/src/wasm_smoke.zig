@@ -12,6 +12,7 @@ const Golden = struct {
         pattern: []const u8,
         input: []const u8,
         flags: c_int,
+        options: []const u8,
         start: usize,
         captures: usize,
         matched: bool,
@@ -72,8 +73,10 @@ fn run() !u32 {
     defer golden.deinit();
     if (golden.value.format != 1 or !std.mem.eql(u8, golden.value.collation, "C")) return error.InvalidReference;
     for (golden.value.entries) |case| {
+        const flags = try regex.Flags.parse(case.options, false);
+        if (flags.native != case.flags) return error.WrongFlags;
         var budget: regex.Budget = .{};
-        var program = try regex.Program.compile(a, case.pattern, case.flags, .{}, &budget);
+        var program = try regex.Program.compile(a, case.pattern, flags.native, .{}, &budget);
         defer program.deinit();
         if (program.captures != case.captures) return error.WrongCaptures;
         var subject = try regex.Subject.init(a, case.input);
@@ -92,18 +95,18 @@ fn run() !u32 {
     const global = try std.json.parseFromSlice(GlobalGolden, a, @embedFile("testdata/global-postgres.json"), .{});
     defer global.deinit();
     if (global.value.format != 1 or !std.mem.eql(u8, global.value.collation, "C")) return error.InvalidReference;
-    var execution = regex.Executor.init(a, .{});
-    defer execution.deinit();
+    var session = regex.Session.init(a, .{}, 16 * 1024 * 1024);
+    defer session.deinit();
     for (global.value.entries) |case| {
         var budget: regex.Budget = .{};
-        var program = try regex.Program.compile(a, case.pattern, case.flags, .{}, &budget);
-        defer program.deinit();
+        const program = try session.pattern(case.pattern, case.flags, &budget);
+        if (program != try session.pattern(case.pattern, case.flags, &budget)) return error.WrongCache;
         if (program.captures != case.captures) return error.WrongCaptures;
         var subject = try regex.Subject.init(a, case.input);
         defer subject.deinit();
         const spans = try a.alloc(regex.Span, case.captures + 1);
         defer a.free(spans);
-        var cursor = try regex.MatchCursor.init(&program, &execution, subject, case.start, spans);
+        var cursor = try regex.MatchCursor.init(program, &session.executor, subject, case.start, spans);
         for (case.occurrences) |expected| {
             if (!try cursor.next(&budget)) return error.MissingMatch;
             for (spans, expected) |actual, capture| {
@@ -116,5 +119,6 @@ fn run() !u32 {
         }
         if (try cursor.next(&budget)) return error.UnexpectedMatch;
     }
+    if (session.hits < global.value.entries.len) return error.WrongCache;
     return @intCast(golden.value.entries.len + global.value.entries.len);
 }

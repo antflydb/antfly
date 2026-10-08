@@ -4692,3 +4692,14 @@ checkpoint cancellation and allocation-fault tests cover compile, match and
 replacement cleanup, including executor reuse after errors. Public SQL binding,
 pattern cache admission, the full accounting audit and original mounted corpus
 probes are still required; these backend contracts do not earn corpus credits.
+
+Execution-owned regex sessions now provide a bounded eight-entry LRU, owning
+pattern keys and flag identity and reserving full compile headroom before cache
+admission. A 1,000-row warm fixture compiles once with no additional native
+scratch allocations; native fault tests cover admission/cleanup, and the WASM
+oracle exercises session reuse. Thirteen additional PostgreSQL ordered-flag
+contracts bring the import-free WASM oracle to 61 contracts. The dedicated
+backend module is wired through native SQL/storage owners and browser imports,
+without changing the search-index matcher. Public scalar binding and the actual
+statement/cursor session-owner integration remain unfinished, so the corpus
+ledger is still 432 implemented / 136 rejected / 73 superseded / 945 unresolved.

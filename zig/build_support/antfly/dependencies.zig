@@ -576,6 +576,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     });
     regex_mod.addImport("antfly_fst", fst_mod);
     regex_mod.addImport("antfly_platform", platform_mod);
+    const sql_regex_mod = @import("../../lib/sql_regex/build.zig").createModule(b, target, optimize, b.path("lib/sql_regex"));
     const jsonschema_mod = b.createModule(.{
         .root_source_file = b.path("lib/jsonschema/src/mod.zig"),
         .target = target,
@@ -1218,6 +1219,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
         .casbin = casbin_mod,
         .fst = fst_mod,
         .regex = regex_mod,
+        .sql_regex = sql_regex_mod,
         .json = json_mod,
         .jsonschema = jsonschema_mod,
         .mcp = mcp_mod,
@@ -1252,6 +1254,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     sql_test_mod.addImport("antfly_platform", platform_mod);
     sql_test_mod.addImport("antfly_schema_openapi", schema_openapi_mod);
     sql_test_mod.addImport("antfly_regex", regex_mod);
+    sql_test_mod.addImport("antfly_sql_regex", sql_regex_mod);
     sql_test_mod.addImport("antfly_hash", hash_mod);
     sql_test_mod.addImport("bloom", bloom_mod);
     sql_test_mod.link_libc = link_libc;
@@ -1265,6 +1268,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     refinement_bench_mod.addImport("antfly_platform", platform_mod);
     refinement_bench_mod.addImport("antfly_schema_openapi", schema_openapi_mod);
     refinement_bench_mod.addImport("antfly_regex", regex_mod);
+    refinement_bench_mod.addImport("antfly_sql_regex", sql_regex_mod);
     refinement_bench_mod.addImport("antfly_hash", hash_mod);
     refinement_bench_mod.addImport("bloom", bloom_mod);
     refinement_bench_mod.link_libc = link_libc;

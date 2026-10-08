@@ -30,6 +30,19 @@ CASES = [
     ("counted-quantifier", "a{2,3}", "aaaa", "", 3, 0, 0),
     ("noncapturing", "(?:a|ab)+", "abab", "", 3, 0, 0),
     ("word-boundary", r"\mcat\M", "bobcat cat!", "", 3, 0, 0),
+    ("ordered-sensitive", "abc", "ABC", "ic", 3, 0, 0),
+    ("ordered-insensitive", "abc", "ABC", "ci", 11, 0, 0),
+    ("ordered-single-line", ".+", "a\nb", "ns", 3, 0, 0),
+    ("ordered-newline", ".+", "a\nb", "sn", 195, 0, 0),
+    ("partial-newline", ".+", "a\nb", "np", 67, 0, 0),
+    ("newline-anchors-only", "^b", "a\nb", "nw", 131, 0, 0),
+    ("ordered-tight", "a b", "ab a b", "xt", 3, 0, 0),
+    ("ordered-expanded", "a b", "ab a b", "tx", 35, 0, 0),
+    ("basic-flavor", "a+", "aaa a+", "b", 0, 0, 0),
+    ("server-extended-transition", "a+", "aaa a+", "e", 0, 0, 0),
+    ("ordered-quoted-flavor", "(a)", "(a)", "eq", 4, 0, 0),
+    ("ordered-basic-flavor", "a+", "a+", "qb", 0, 0, 0),
+    ("ordered-basic-insensitive", "A+", "a+", "qib", 8, 0, 0),
 ]
 
 
@@ -90,6 +103,7 @@ def generate(global_matches=False):
             if global_matches:
                 entry["occurrences"] = occurrences
             else:
+                entry["options"] = flags
                 entry["matched"] = occurrences[0][0]["text"] is not None
                 entry["spans"] = occurrences[0]
             entries.append(entry)

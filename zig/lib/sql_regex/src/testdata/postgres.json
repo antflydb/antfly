@@ -9,6 +9,7 @@
       "flags": 3,
       "start": 0,
       "captures": 2,
+      "options": "",
       "matched": true,
       "spans": [
         {
@@ -35,6 +36,7 @@
       "flags": 3,
       "start": 4,
       "captures": 2,
+      "options": "",
       "matched": true,
       "spans": [
         {
@@ -61,6 +63,7 @@
       "flags": 3,
       "start": 0,
       "captures": 0,
+      "options": "",
       "matched": true,
       "spans": [
         {
@@ -77,6 +80,7 @@
       "flags": 3,
       "start": 0,
       "captures": 0,
+      "options": "",
       "matched": true,
       "spans": [
         {
@@ -93,6 +97,7 @@
       "flags": 3,
       "start": 0,
       "captures": 0,
+      "options": "",
       "matched": true,
       "spans": [
         {
@@ -109,6 +114,7 @@
       "flags": 3,
       "start": 1,
       "captures": 0,
+      "options": "",
       "matched": true,
       "spans": [
         {
@@ -125,6 +131,7 @@
       "flags": 3,
       "start": 1,
       "captures": 0,
+      "options": "",
       "matched": false,
       "spans": [
         {
@@ -141,6 +148,7 @@
       "flags": 3,
       "start": 0,
       "captures": 0,
+      "options": "",
       "matched": true,
       "spans": [
         {
@@ -157,6 +165,7 @@
       "flags": 3,
       "start": 0,
       "captures": 0,
+      "options": "",
       "matched": true,
       "spans": [
         {
@@ -173,6 +182,7 @@
       "flags": 3,
       "start": 0,
       "captures": 1,
+      "options": "",
       "matched": true,
       "spans": [
         {
@@ -194,6 +204,7 @@
       "flags": 3,
       "start": 0,
       "captures": 2,
+      "options": "",
       "matched": true,
       "spans": [
         {
@@ -220,6 +231,7 @@
       "flags": 3,
       "start": 0,
       "captures": 2,
+      "options": "",
       "matched": true,
       "spans": [
         {
@@ -246,6 +258,7 @@
       "flags": 3,
       "start": 0,
       "captures": 0,
+      "options": "",
       "matched": true,
       "spans": [
         {
@@ -262,6 +275,7 @@
       "flags": 11,
       "start": 0,
       "captures": 0,
+      "options": "i",
       "matched": true,
       "spans": [
         {
@@ -278,6 +292,7 @@
       "flags": 4,
       "start": 0,
       "captures": 0,
+      "options": "q",
       "matched": true,
       "spans": [
         {
@@ -294,6 +309,7 @@
       "flags": 35,
       "start": 0,
       "captures": 0,
+      "options": "x",
       "matched": true,
       "spans": [
         {
@@ -310,6 +326,7 @@
       "flags": 3,
       "start": 0,
       "captures": 0,
+      "options": "",
       "matched": true,
       "spans": [
         {
@@ -326,6 +343,7 @@
       "flags": 195,
       "start": 0,
       "captures": 0,
+      "options": "n",
       "matched": true,
       "spans": [
         {
@@ -342,6 +360,7 @@
       "flags": 195,
       "start": 0,
       "captures": 0,
+      "options": "n",
       "matched": true,
       "spans": [
         {
@@ -358,6 +377,7 @@
       "flags": 3,
       "start": 0,
       "captures": 0,
+      "options": "",
       "matched": true,
       "spans": [
         {
@@ -374,6 +394,7 @@
       "flags": 3,
       "start": 0,
       "captures": 0,
+      "options": "",
       "matched": true,
       "spans": [
         {
@@ -390,12 +411,234 @@
       "flags": 3,
       "start": 0,
       "captures": 0,
+      "options": "",
       "matched": true,
       "spans": [
         {
           "start": 7,
           "end": 10,
           "text": "cat"
+        }
+      ]
+    },
+    {
+      "id": "ordered-sensitive",
+      "pattern": "abc",
+      "input": "ABC",
+      "flags": 3,
+      "start": 0,
+      "captures": 0,
+      "options": "ic",
+      "matched": false,
+      "spans": [
+        {
+          "start": -1,
+          "end": -1,
+          "text": null
+        }
+      ]
+    },
+    {
+      "id": "ordered-insensitive",
+      "pattern": "abc",
+      "input": "ABC",
+      "flags": 11,
+      "start": 0,
+      "captures": 0,
+      "options": "ci",
+      "matched": true,
+      "spans": [
+        {
+          "start": 0,
+          "end": 3,
+          "text": "ABC"
+        }
+      ]
+    },
+    {
+      "id": "ordered-single-line",
+      "pattern": ".+",
+      "input": "a\nb",
+      "flags": 3,
+      "start": 0,
+      "captures": 0,
+      "options": "ns",
+      "matched": true,
+      "spans": [
+        {
+          "start": 0,
+          "end": 3,
+          "text": "a\nb"
+        }
+      ]
+    },
+    {
+      "id": "ordered-newline",
+      "pattern": ".+",
+      "input": "a\nb",
+      "flags": 195,
+      "start": 0,
+      "captures": 0,
+      "options": "sn",
+      "matched": true,
+      "spans": [
+        {
+          "start": 0,
+          "end": 1,
+          "text": "a"
+        }
+      ]
+    },
+    {
+      "id": "partial-newline",
+      "pattern": ".+",
+      "input": "a\nb",
+      "flags": 67,
+      "start": 0,
+      "captures": 0,
+      "options": "np",
+      "matched": true,
+      "spans": [
+        {
+          "start": 0,
+          "end": 1,
+          "text": "a"
+        }
+      ]
+    },
+    {
+      "id": "newline-anchors-only",
+      "pattern": "^b",
+      "input": "a\nb",
+      "flags": 131,
+      "start": 0,
+      "captures": 0,
+      "options": "nw",
+      "matched": true,
+      "spans": [
+        {
+          "start": 2,
+          "end": 3,
+          "text": "b"
+        }
+      ]
+    },
+    {
+      "id": "ordered-tight",
+      "pattern": "a b",
+      "input": "ab a b",
+      "flags": 3,
+      "start": 0,
+      "captures": 0,
+      "options": "xt",
+      "matched": true,
+      "spans": [
+        {
+          "start": 3,
+          "end": 6,
+          "text": "a b"
+        }
+      ]
+    },
+    {
+      "id": "ordered-expanded",
+      "pattern": "a b",
+      "input": "ab a b",
+      "flags": 35,
+      "start": 0,
+      "captures": 0,
+      "options": "tx",
+      "matched": true,
+      "spans": [
+        {
+          "start": 0,
+          "end": 2,
+          "text": "ab"
+        }
+      ]
+    },
+    {
+      "id": "basic-flavor",
+      "pattern": "a+",
+      "input": "aaa a+",
+      "flags": 0,
+      "start": 0,
+      "captures": 0,
+      "options": "b",
+      "matched": true,
+      "spans": [
+        {
+          "start": 4,
+          "end": 6,
+          "text": "a+"
+        }
+      ]
+    },
+    {
+      "id": "server-extended-transition",
+      "pattern": "a+",
+      "input": "aaa a+",
+      "flags": 0,
+      "start": 0,
+      "captures": 0,
+      "options": "e",
+      "matched": true,
+      "spans": [
+        {
+          "start": 4,
+          "end": 6,
+          "text": "a+"
+        }
+      ]
+    },
+    {
+      "id": "ordered-quoted-flavor",
+      "pattern": "(a)",
+      "input": "(a)",
+      "flags": 4,
+      "start": 0,
+      "captures": 0,
+      "options": "eq",
+      "matched": true,
+      "spans": [
+        {
+          "start": 0,
+          "end": 3,
+          "text": "(a)"
+        }
+      ]
+    },
+    {
+      "id": "ordered-basic-flavor",
+      "pattern": "a+",
+      "input": "a+",
+      "flags": 0,
+      "start": 0,
+      "captures": 0,
+      "options": "qb",
+      "matched": true,
+      "spans": [
+        {
+          "start": 0,
+          "end": 2,
+          "text": "a+"
+        }
+      ]
+    },
+    {
+      "id": "ordered-basic-insensitive",
+      "pattern": "A+",
+      "input": "a+",
+      "flags": 8,
+      "start": 0,
+      "captures": 0,
+      "options": "qib",
+      "matched": true,
+      "spans": [
+        {
+          "start": 0,
+          "end": 2,
+          "text": "a+"
         }
       ]
     }
