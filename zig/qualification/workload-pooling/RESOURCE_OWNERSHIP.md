@@ -424,3 +424,16 @@ No production consumer activates it yet. Independent completion task/Io ownershi
 pre-seal/participant acceptance wiring, checked ABI exposure, physical WAL/Raft
 waits and authoritative durable recovery transfer still require implementation
 and qualification. Write suspension remains withheld; pooling stays disabled.
+
+
+Initial Scheduler.wait can no longer retire an active completion's live consumers;
+it routes active completion to retained wait. The reproduced premature-finish
+failure is preserved. All 40 scheduler/admission and 30 real-owner/SQL/worker/cleanup
+regressions pass on native and pinned Nix/glibc; see
+[completion wait retention receipts](receipts/2026-10-08/completion-wait-retention/README.md).
+A real bounded two-task fixture cancels/joins foreground, closes admission, and
+resumes completion in its independent task cancellation scope, including joined
+cleanup after completion cancellation before storage work. This proves task/root
+lifetime mechanics, not physical durability or node-wide thread bounds. No
+production consumer activates completion; checked exposure, pre-acceptance task
+reservation, physical WAL/Raft waits and durable recovery transfer remain required.

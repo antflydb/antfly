@@ -246,8 +246,13 @@ pub const Scheduler = struct {
         return e.state;
     }
 
-    /// Initial acquisition retires its unpublished entry on failure.
+    /// Initial acquisition retires an unpublished entry on failure. A caller
+    /// cannot use this API to discard an active completion's live consumers.
     pub fn wait(self: *Scheduler, e: *Entry) !void {
+        self.lock();
+        const completing = e.scheduler == self and e.completion_active;
+        self.mutex.unlock();
+        if (completing) return self.waitRetained(e);
         return self.waitImpl(e, false);
     }
     /// A published execution may lend its retained ownership to IO or a child.
@@ -1558,5 +1563,123 @@ test "runnable scheduler closing foreground releases CPU to retained completion 
         foreground.finish();
         completion.finish();
         try std.testing.expectEqual(@as(usize, 0), owner.stats().operations);
+    }
+}
+
+test "runnable scheduler initial wait cannot retire an active completion consumer" {
+    const Clock = struct {
+        var now_ns: u64 = 0;
+        fn now() u64 {
+            return now_ns;
+        }
+    };
+    Clock.now_ns = 0;
+    var owner = try Scheduler.init(.{ .slots = 3, .control_slots = 1 });
+    const consumer = try std.testing.allocator.alloc(u8, 64);
+    defer std.testing.allocator.free(consumer);
+    var execution: Execution = .{};
+    defer execution.finish();
+    try execution.start(&owner, .{ .io = std.testing.io, .native_now_ns = Clock.now, .retained_bytes = consumer.len }, .write);
+    try execution.reserveCompletion(.{ .io = std.testing.io, .native_now_ns = Clock.now, .deadline_ns = 100 });
+    try execution.activateCompletion();
+    try execution.park(.resource_blocked);
+    try owner.unblock(&execution.entry.?);
+    Clock.now_ns = 100;
+    // A legacy caller using initial wait still cannot discard a published
+    // completion's live buffers. Only a joined owner may finish the root.
+    try std.testing.expectError(error.DeadlineExceeded, owner.wait(&execution.entry.?));
+    try std.testing.expectEqual(State.stopped, execution.entry.?.state);
+    try std.testing.expectEqual(@as(usize, 1), owner.stats().operations);
+    try std.testing.expectEqual(@as(u64, 64), owner.stats().retained_bytes);
+    try std.testing.expectEqual(@as(usize, 0), owner.stats().runnable_slots);
+    consumer[0] = 17;
+    try std.testing.expectEqual(@as(u8, 17), consumer[0]);
+    execution.finish();
+    try std.testing.expectEqual(@as(usize, 0), owner.stats().operations);
+}
+
+test "runnable execution independent completion task outlives actual foreground cancellation" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    const Fixture = struct {
+        io: std.Io,
+        owner: *Scheduler,
+        execution: Execution = .{},
+        ready: std.Io.Event = .unset,
+        completion_go: std.Io.Event = .unset,
+        never: std.Io.Event = .unset,
+        completion: ?std.Io.Future(anyerror!void) = null,
+        transferred: std.atomic.Value(bool) = .init(false),
+
+        fn foreground(self: *@This()) anyerror!void {
+            try self.execution.start(self.owner, .{ .io = self.io, .retained_bytes = 256 }, .write);
+            var transferred = false;
+            defer if (!transferred) self.execution.finish();
+            // Reserve the independent task/resources before entering a phase
+            // which might accept durable work. It initially waits for handoff.
+            self.completion = try self.io.concurrent(complete, .{self});
+            defer if (!transferred) {
+                _ = self.completion.?.cancel(self.io) catch {};
+            };
+            const deadline = self.execution.entry.?.options.now() + 10 * std.time.ns_per_s;
+            try self.execution.reserveCompletion(.{ .io = self.io, .deadline_ns = deadline });
+            try self.execution.activateCompletion();
+            try self.execution.park(.resource_blocked);
+            self.transferred.store(true, .release);
+            transferred = true;
+            self.ready.set(self.io);
+            // This is a real task cancellation point, not a mocked boolean.
+            try self.never.wait(self.io);
+            return error.TestUnexpectedResult;
+        }
+
+        fn complete(self: *@This()) anyerror!void {
+            // A cancellation before the handoff leaves finish to the parent;
+            // afterwards this joined task owns finish even if its wait fails.
+            defer if (self.transferred.load(.acquire)) self.execution.finish();
+            try self.completion_go.wait(self.io);
+            // The original task was canceled and joined; this task has its
+            // own cancellation scope on the still-owned executor instance.
+            try self.io.checkCancel();
+            try self.execution.enter(.write);
+            try self.execution.checkpoint();
+            try std.testing.expectEqual(@as(usize, 1), self.owner.stats().operations);
+            try std.testing.expectEqual(@as(u64, 256), self.owner.stats().retained_bytes);
+            try std.testing.expectEqual(@as(usize, 1), self.owner.stats().runnable_slots);
+        }
+    };
+    for ([_]bool{ false, true }) |cancel_completion| {
+        var threaded = std.Io.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .limited(2) });
+        defer threaded.deinit();
+        const io = threaded.io();
+        var owner = try Scheduler.init(.{ .slots = 3, .control_slots = 1, .checkpoint_budget = 1 });
+        var fixture = Fixture{ .io = io, .owner = &owner };
+        var foreground = try io.concurrent(Fixture.foreground, .{&fixture});
+        defer {
+            _ = foreground.cancel(io) catch {};
+            fixture.completion_go.set(io);
+            if (fixture.completion) |*completion| _ = completion.cancel(io) catch {};
+        }
+        try fixture.ready.waitTimeout(io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+        try std.testing.expectEqual(@as(usize, 1), owner.stats().operations);
+        try std.testing.expectEqual(@as(usize, 0), owner.stats().runnable_slots);
+        var health: Execution = .{};
+        defer health.finish();
+        try health.start(&owner, .{ .io = io }, .control);
+        health.finish();
+        try std.testing.expectError(error.Canceled, foreground.cancel(io));
+        owner.close();
+        try std.testing.expectEqual(@as(usize, 1), owner.stats().resource_blocked);
+        try std.testing.expectEqual(@as(usize, 1), owner.stats().operations);
+        if (cancel_completion) {
+            // No storage has been contacted in this fixture. The failed task must
+            // join before releasing the handed-off root and retained metadata.
+            try std.testing.expectError(error.Canceled, fixture.completion.?.cancel(io));
+        } else {
+            fixture.completion_go.set(io);
+            try fixture.completion.?.await(io);
+        }
+        try std.testing.expectEqual(@as(usize, 0), owner.stats().operations);
+        try std.testing.expectEqual(@as(u64, 0), owner.stats().retained_bytes);
+        try std.testing.expectEqual(@as(usize, 0), owner.stats().runnable_slots);
     }
 }
