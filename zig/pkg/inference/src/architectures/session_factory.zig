@@ -380,13 +380,22 @@ fn captureGlinerDecisionIdentity(mf: *const manifest_mod.ModelManifest, store: t
     const encoder = mf.gliner_span_encoder_digest orelse return null;
     const tokenizer = mf.gliner_span_tokenizer_digest orelse return null;
     const tokenizer_config = mf.gliner_span_tokenizer_config_digest orelse return null;
-    const reader = store.singleSafetensorsReader() orelse return null;
-    var all_f32 = true;
-    var entries = reader.header.tensors.iterator();
-    while (entries.next()) |entry| if (entry.value_ptr.dtype != .f32) {
-        all_f32 = false;
-        break;
-    };
+    var inventory: gliner_decide_qualification.TensorInventory = undefined;
+    var weight: gliner_decide_qualification.Digest = undefined;
+    var companion: ?gliner_decide_qualification.Digest = null;
+    if (store.singleSafetensorsReader()) |reader| {
+        inventory = .{ .count = reader.header.tensors.count(), .all_f32 = true };
+        var entries = reader.header.tensors.iterator();
+        while (entries.next()) |entry| if (entry.value_ptr.dtype != .f32) {
+            inventory.all_f32 = false;
+            break;
+        };
+        weight = gliner_decide_qualification.Digest.of(reader.file_bytes);
+    } else if (store.glinerGgufSnapshot()) |snapshot| {
+        inventory = .{ .count = snapshot.tensor_count, .all_f32 = snapshot.all_f32 };
+        weight = gliner_decide_qualification.Digest.of(snapshot.encoder);
+        companion = gliner_decide_qualification.Digest.of(snapshot.head);
+    } else return null;
     return .{
         .encoder_family = family,
         .geometry = .{
@@ -406,8 +415,9 @@ fn captureGlinerDecisionIdentity(mf: *const manifest_mod.ModelManifest, store: t
             .sep_struct = mf.gliner_token_sep_struct,
             .sep_text = mf.gliner_token_sep_text,
         },
-        .inventory = .{ .count = reader.header.tensors.count(), .all_f32 = all_f32 },
-        .weight = gliner_decide_qualification.Digest.of(reader.file_bytes),
+        .inventory = inventory,
+        .weight = weight,
+        .weight_companion = companion,
         .sidecars = .{
             .config = config,
             .encoder_config = encoder,
