@@ -590,7 +590,7 @@ def test_stateful_graph_metrics_publish_without_maintenance_configuration(
             "graph_metric_rerank": {"index": "graph_idx", "metric": "rank"},
         },
     )
-    assert query_hits_total_value(reranked) == 2
+    assert query_hits_total_value(reranked["responses"][0]["hits"]) == 2
 
     if stateful_api.supports_restart:
         stateful_api.restart_server()
