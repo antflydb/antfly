@@ -131,6 +131,7 @@ const Execution = struct {
     files: std.StringHashMapUnmanaged([]const u8) = .empty,
     private_files: std.StringHashMapUnmanaged([]const u8) = .empty,
     private_digests: std.StringHashMapUnmanaged([]const u8) = .empty,
+    text_identities: std.AutoHashMapUnmanaged(usize, @import("lake_index_text_predicate.zig").Identities) = .empty,
     sparse_entries: std.StringHashMapUnmanaged(*local.storage_db_catalog_index_manager.IndexManager.SparseIndex) = .empty,
     dense_entries: std.StringHashMapUnmanaged(*local.storage_db_catalog_index_manager.IndexManager.DenseIndex) = .empty,
     runtimes: std.ArrayList(*@import("lake_index_native_runtime_cache.zig").Entry) = .empty,
@@ -190,7 +191,11 @@ const Execution = struct {
         const root = metadata.value.*;
         if (!std.mem.eql(u8, &root.domain, &self.domain)) return error.InvalidNativeLakeTextCorpus;
         if (!@import("../serverless/build/lake_rebuild.zig").bindingsEqual(root.binding, selected.binding)) return error.InvalidNativeLakeTextCorpus;
-        return try self.server.lake_text_corpora.acquire(self.server.embedding_provider_runtime.io, self.store.artifactStore(), selected.artifact, root, self.schema_json, cached, self.context, cancellation);
+        var pin = try self.server.lake_text_corpora.acquire(self.server.embedding_provider_runtime.io, self.store.artifactStore(), selected.artifact, root, self.schema_json, cached, self.context, cancellation);
+        errdefer pin.deinit();
+        const identities = try @import("lake_index_text_predicate.zig").Identities.init(self.arena, root, pin.snapshot);
+        try self.text_identities.put(self.arena, @intFromPtr(pin.snapshot), identities);
+        return pin;
     }
     fn attachHighlights(self: *Execution, a: A, req: types.SearchRequest, result: *types.SearchResult) !void {
         const options = req.highlight orelse return;
@@ -339,8 +344,14 @@ const Execution = struct {
             }
         }
     }
+    fn resolveIndexedFilter(raw: ?*anyopaque, a: A, snapshot: *const local.index.IndexSnapshot, json: []const u8) !?search.IndexedTextPredicate {
+        const self = from(raw);
+        const identities = self.text_identities.get(@intFromPtr(snapshot)) orelse return null;
+        const resolver: @import("lake_index_text_predicate.zig").Resolver = .{ .server = self.server, .table = self.table, .source = self.source, .context = self.request, .identities = identities, .snapshot = snapshot, .private_digests = &self.private_digests };
+        return resolver.resolve(a, json);
+    }
     fn searchText(raw: ?*anyopaque, a: A, req: types.SearchRequest, text: types.TextQuery) !types.SearchResult {
-        return search.searchTextQuery(a, req, text, .{ .ctx = raw, .exact_doc_id_filters = true, .acquire_text_source = acquire, .project_key = publicKey, .native_key = nativeKey, .filter_candidate_presence = true, .text_index_entry = noLocal, .text_index_is_chunk_backed = chunkBacked, .search_match_all = matchAll, .project_stored_search = project, .load_stored = loadOne, .load_projected_documents = loadProjected, .postprocess = postprocess });
+        return search.searchTextQuery(a, req, text, .{ .ctx = raw, .exact_doc_id_filters = true, .acquire_text_source = acquire, .resolve_indexed_filter = resolveIndexedFilter, .native_count_visibility_exact = true, .project_key = publicKey, .native_key = nativeKey, .filter_candidate_presence = true, .text_index_entry = noLocal, .text_index_is_chunk_backed = chunkBacked, .search_match_all = matchAll, .project_stored_search = project, .load_stored = loadOne, .load_projected_documents = loadProjected, .postprocess = postprocess });
     }
     fn dispatchText(raw: ?*anyopaque, a: A, req: types.SearchRequest) !types.SearchResult {
         return search.searchText(a, req, .{ .ctx = raw, .func = searchText });
@@ -454,86 +465,108 @@ const Execution = struct {
             a.free(result);
         }
         if (keys.len == 0) return result;
-        // One selection spans the complete ranked result. The cursor orders
-        // physical coordinates once; by_key scatters bounded pages back into
-        // rank order and fans duplicate identities out to their consumers.
-        hydrate: {
-            var arena = std.heap.ArenaAllocator.init(a);
-            defer arena.deinit();
-            const ca = arena.allocator();
-            const refs = try ca.alloc(local.storage_rowsource_types.RowRef, keys.len);
-            const canonical = try ca.alloc([]const u8, keys.len);
-            for (keys, canonical, refs) |input_key, *mapped, *ref| {
-                const key = try publicKey(raw, ca, input_key);
-                mapped.* = key;
-                if (key.len != 96 or !std.mem.startsWith(u8, key, "lake1:") or key[70] != ':' or key[79] != ':') return error.ExternalLakeSnapshotMismatch;
-                const file = self.files.get(key[6..70]) orelse return error.ExternalLakeSnapshotMismatch;
-                ref.* = .{ .external = .{ .source_id = self.source.inventory.source_id, .snapshot_id = self.source.inventory.snapshot_id, .file_id = file, .row_group_ordinal = std.fmt.parseUnsigned(u32, key[71..79], 16) catch return error.ExternalLakeSnapshotMismatch, .row_ordinal = std.fmt.parseUnsigned(u64, key[80..96], 16) catch return error.ExternalLakeSnapshotMismatch } };
+        // Small results keep one selection. Larger results use a bounded
+        // external ordering pass, then visit physical windows in file/group/row
+        // order. Window size never becomes a public result/candidate limit.
+        var manager: local.sql_spill.Manager = .{ .alloc = a, .io = self.context.io.?, .context = self, .checkpoint = scanCheckpoint };
+        defer manager.deinit();
+        var order = local.sql_spill.Sort.init(a, &manager, &.{.{}}, 512 * 1024);
+        defer order.deinit();
+        const window = local.sql_lake_cursor.max_selection_rows;
+        if (keys.len > window) {
+            var scratch = std.heap.ArenaAllocator.init(a);
+            defer scratch.deinit();
+            for (keys, 0..) |key, position| {
+                _ = scratch.reset(.retain_capacity);
+                const canonical_key = try publicKey(raw, scratch.allocator(), key);
+                try order.add(.{ .values = &.{}, .keys = &.{local.sql_scalar.Datum.fromJson(.{ .string = canonical_key })}, .ordinal = position });
             }
-            var by_key: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(usize)) = .empty;
-            for (canonical, 0..) |key, position| {
-                const entry = try by_key.getOrPut(ca, key);
-                if (!entry.found_existing) entry.value_ptr.* = .empty;
-                try entry.value_ptr.append(ca, position);
-            }
-            const fields = if (selected_fields) |selected| selected else all: {
-                const all_fields = try ca.alloc([]const u8, self.table.columns.len);
-                for (all_fields, self.table.columns) |*field, column| field.* = column.path;
-                break :all all_fields;
-            };
-            var request = self.request;
-            request.cancellation = .{ .ptr = self, .is_cancelled_fn = canceled };
-            const cursor = try local.sql_lake_cursor.openPinned(a, self.table, .{ .fields = fields, .row_refs = refs, .limit = std.math.cast(u32, keys.len) orelse return error.QueryResponseTooLarge }, request, self.source);
-            defer cursor.close(cursor.ptr);
-            if (T == std.json.Value or T == types.ColumnSource) if (cursor.next_columns) |next_columns| {
+        }
+        var first: usize = 0;
+        while (first < keys.len) {
+            const count = @min(window, keys.len - first);
+            defer first += count;
+            hydrate: {
+                var arena = std.heap.ArenaAllocator.init(a);
+                defer arena.deinit();
+                const ca = arena.allocator();
+                const refs = try ca.alloc(local.storage_rowsource_types.RowRef, count);
+                const canonical = try ca.alloc([]const u8, count);
+                const window_positions = try ca.alloc(usize, count);
+                for (canonical, refs, window_positions, first..) |*mapped, *ref, *position, input_position| {
+                    const sorted = if (keys.len > window) (try order.next(ca)) orelse return error.InvalidSqlBackendResponse else null;
+                    position.* = if (sorted) |row| @intCast(row.ordinal) else input_position;
+                    const key = if (sorted) |row| row.keys[0].value.string else try publicKey(raw, ca, keys[input_position]);
+                    mapped.* = key;
+                    if (key.len != 96 or !std.mem.startsWith(u8, key, "lake1:") or key[70] != ':' or key[79] != ':') return error.ExternalLakeSnapshotMismatch;
+                    const file = self.files.get(key[6..70]) orelse return error.ExternalLakeSnapshotMismatch;
+                    ref.* = .{ .external = .{ .source_id = self.source.inventory.source_id, .snapshot_id = self.source.inventory.snapshot_id, .file_id = file, .row_group_ordinal = std.fmt.parseUnsigned(u32, key[71..79], 16) catch return error.ExternalLakeSnapshotMismatch, .row_ordinal = std.fmt.parseUnsigned(u64, key[80..96], 16) catch return error.ExternalLakeSnapshotMismatch } };
+                }
+                var by_key: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(usize)) = .empty;
+                for (canonical, window_positions) |key, position| {
+                    const entry = try by_key.getOrPut(ca, key);
+                    if (!entry.found_existing) entry.value_ptr.* = .empty;
+                    try entry.value_ptr.append(ca, position);
+                }
+                const fields = if (selected_fields) |selected| selected else all: {
+                    const all_fields = try ca.alloc([]const u8, self.table.columns.len);
+                    for (all_fields, self.table.columns) |*field, column| field.* = column.path;
+                    break :all all_fields;
+                };
+                var request = self.request;
+                request.cancellation = .{ .ptr = self, .is_cancelled_fn = canceled };
+                const cursor = try local.sql_lake_cursor.openPinned(a, self.table, .{ .fields = fields, .row_refs = refs, .limit = @intCast(count) }, request, self.source);
+                defer cursor.close(cursor.ptr);
+                if (T == std.json.Value or T == types.ColumnSource) if (cursor.next_columns) |next_columns| {
+                    while (true) {
+                        var page_arena = std.heap.ArenaAllocator.init(a);
+                        defer page_arena.deinit();
+                        const pa = page_arena.allocator();
+                        const page = try next_columns(cursor.ptr, pa, 4096);
+                        try page.validate();
+                        if (T == types.ColumnSource and page.native != null) return error.UnsupportedSqlExecution;
+                        const retained = if (T == types.ColumnSource) try types.ColumnSourcePage.retainOrCopy(a, page.batch, page.selection, page.retain_columns) else {};
+                        defer if (T == types.ColumnSource) retained.release();
+                        for (0..page.selection.len) |row_index| {
+                            const identity = try page.cell(pa, row_index, "_id");
+                            if (identity.value != .string) return error.InvalidSqlBackendResponse;
+                            const positions = by_key.get(identity.value.string) orelse return error.InvalidSqlBackendResponse;
+                            for (positions.items) |position| {
+                                if (result[position] != null) return error.InvalidSqlBackendResponse;
+                                if (T == types.ColumnSource) {
+                                    result[position] = retained.row(row_index);
+                                    continue;
+                                }
+                                var value: std.json.Value = .{ .object = .empty };
+                                errdefer types.deinitJsonValue(a, &value);
+                                for (page.batch.columns) |column| {
+                                    const cell = try page.cell(pa, row_index, column.name);
+                                    const name = try a.dupe(u8, column.name);
+                                    errdefer a.free(name);
+                                    var owned_cell = try types.cloneJsonValue(a, cell.value);
+                                    errdefer types.deinitJsonValue(a, &owned_cell);
+                                    try value.object.put(a, name, owned_cell);
+                                }
+                                result[position] = value;
+                            }
+                        }
+                        if (page.after == null) break;
+                    }
+                    break :hydrate;
+                };
+                if (T == types.ColumnSource) return error.UnsupportedSqlExecution;
                 while (true) {
-                    var page_arena = std.heap.ArenaAllocator.init(a);
-                    defer page_arena.deinit();
-                    const pa = page_arena.allocator();
-                    const page = try next_columns(cursor.ptr, pa, 256);
-                    try page.validate();
-                    if (T == types.ColumnSource and page.native != null) return error.UnsupportedSqlExecution;
-                    const retained = if (T == types.ColumnSource) try types.ColumnSourcePage.retainOrCopy(a, page.batch, page.selection, page.retain_columns) else {};
-                    defer if (T == types.ColumnSource) retained.release();
-                    for (0..page.selection.len) |row_index| {
-                        const identity = try page.cell(pa, row_index, "_id");
-                        if (identity.value != .string) return error.InvalidSqlBackendResponse;
-                        const positions = by_key.get(identity.value.string) orelse return error.InvalidSqlBackendResponse;
+                    const page = try cursor.next(cursor.ptr, a, 256);
+                    defer page.deinit();
+                    for (page.rows) |row| {
+                        const positions = by_key.get(row.id) orelse return error.InvalidSqlBackendResponse;
                         for (positions.items) |position| {
                             if (result[position] != null) return error.InvalidSqlBackendResponse;
-                            if (T == types.ColumnSource) {
-                                result[position] = retained.row(row_index);
-                                continue;
-                            }
-                            var value: std.json.Value = .{ .object = .empty };
-                            errdefer types.deinitJsonValue(a, &value);
-                            for (page.batch.columns) |column| {
-                                const cell = try page.cell(pa, row_index, column.name);
-                                const name = try a.dupe(u8, column.name);
-                                errdefer a.free(name);
-                                var owned_cell = try types.cloneJsonValue(a, cell.value);
-                                errdefer types.deinitJsonValue(a, &owned_cell);
-                                try value.object.put(a, name, owned_cell);
-                            }
-                            result[position] = value;
+                            result[position] = if (T == std.json.Value) try types.cloneJsonValue(a, row.value) else try std.json.Stringify.valueAlloc(a, row.value, .{});
                         }
                     }
                     if (page.after == null) break;
                 }
-                break :hydrate;
-            };
-            if (T == types.ColumnSource) return error.UnsupportedSqlExecution;
-            while (true) {
-                const page = try cursor.next(cursor.ptr, a, 256);
-                defer page.deinit();
-                for (page.rows) |row| {
-                    const positions = by_key.get(row.id) orelse return error.InvalidSqlBackendResponse;
-                    for (positions.items) |position| {
-                        if (result[position] != null) return error.InvalidSqlBackendResponse;
-                        result[position] = if (T == std.json.Value) try types.cloneJsonValue(a, row.value) else try std.json.Stringify.valueAlloc(a, row.value, .{});
-                    }
-                }
-                if (page.after == null) break;
             }
         }
         try self.context.ensureActive();

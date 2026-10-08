@@ -2201,3 +2201,148 @@ def test_vector_only_remote_table_supports_index_independent_queries(
         failed = False
     finally:
         server.stop(test_failed=failed)
+
+
+def test_native_remote_large_hydration_and_residual_filter(tmp_path):
+    """Physical selection windows are not a public result/candidate cap."""
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
+    root = tmp_path / "large-selection"
+    objects = root / "buckets" / "antfly" / "objects"
+    objects.mkdir(parents=True)
+    count = 65537
+    input_file = tmp_path / "selection.parquet"
+    pq.write_table(
+        pa.table({"body": ["common"] * count, "amount": range(count)}),
+        input_file, row_group_size=4096, use_dictionary=True,
+        compression="snappy", write_page_index=True,
+    )
+    payload = input_file.read_bytes()
+    (objects / "part.parquet").write_bytes(
+        b"AFOBJ001" + struct.pack("<QI", len(payload), 0)
+        + hashlib.sha256(payload).hexdigest().encode() + payload
+    )
+    server = StandaloneAntflyServer(binary, "127.0.0.1", 0)
+    failed = True
+    try:
+        def call(method, path, body=None):
+            response = requests.request(
+                method, server.api_url + path, json=body,
+                auth=("admin", AUTH_BOOTSTRAP_PASSWORD), timeout=180,
+            )
+            assert response.ok, response.text + server.debug_logs()
+            return response.json()
+
+        call("POST", "/tables/large_selection", {
+            "num_shards": 1,
+            "schema": {"storage_mode": "relational", "base_source": {
+                "kind": "external", "table_id": "large-selection",
+                "format": "parquet", "uri": root.as_uri(),
+            }},
+            "indexes": {"body_text": {"type": "full_text", "field": "body"}},
+        })
+        deadline = time.monotonic() + 180
+        while True:
+            resource = call("GET", "/tables/large_selection/indexes/body_text")
+            if resource["status"]["readiness"]["queryable"]:
+                break
+            assert time.monotonic() < deadline, str(resource) + server.debug_logs()
+            time.sleep(0.1)
+        query = {"full_text_search": {"match_all": {}}, "fields": ["amount"], "limit": count}
+        result = call("POST", "/tables/large_selection/query", query)["responses"][0]
+        hits = result["hits"]["hits"]
+        assert len(hits) == count
+        assert len({hit["_id"] for hit in hits}) == count
+        assert {hit["_source"]["amount"] for hit in hits} == set(range(count))
+        # The unindexed numeric field forces complete-source residual filtering
+        # over all candidates BEFORE the small final page is selected.
+        filtered = call("POST", "/tables/large_selection/query", dict(
+            query, limit=10, filter_query={"term": {"path": "/amount", "value": count - 1}},
+        ))["responses"][0]
+        assert [hit["_source"]["amount"] for hit in filtered["hits"]["hits"]] == [count - 1]
+        failed = False
+    finally:
+        server.stop(test_failed=failed)
+
+
+def test_native_remote_indexed_metadata_predicates_above_id_list_limit(tmp_path):
+    """Seek and broad reverse-merge paths share exact bitmap search semantics."""
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
+    root = tmp_path / "indexed-predicates"
+    objects = root / "buckets" / "antfly" / "objects"
+    objects.mkdir(parents=True)
+    count = 100003
+    input_file = tmp_path / "predicates.parquet"
+    pq.write_table(pa.table({
+        "body": ["common"] * count,
+        "amount": range(count),
+        "category": ["story", "story"] + ["comment"] * (count - 2),
+        "label": ["other"] * (count - 1) + ["kept"],
+    }), input_file, row_group_size=4096, compression="snappy", write_page_index=True)
+    payload = input_file.read_bytes()
+    (objects / "part.parquet").write_bytes(
+        b"AFOBJ001" + struct.pack("<QI", len(payload), 0)
+        + hashlib.sha256(payload).hexdigest().encode() + payload
+    )
+    server = StandaloneAntflyServer(binary, "127.0.0.1", 0)
+    failed = True
+    try:
+        def call(method, path, body=None):
+            response = requests.request(method, server.api_url + path, json=body,
+                auth=("admin", AUTH_BOOTSTRAP_PASSWORD), timeout=180)
+            assert response.ok, response.text + server.debug_logs()
+            value = response.json()
+            return value["responses"][0] if "responses" in value else value
+
+        call("POST", "/tables/indexed_predicates", {
+            "num_shards": 1,
+            "schema": {"storage_mode": "relational", "base_source": {
+                "kind": "external", "table_id": "indexed-predicates",
+                "format": "parquet", "uri": root.as_uri(),
+            }, "relational_indexes": [
+                {"name": "amount_idx", "keys": [{"column": "amount"}]},
+                {"name": "category_idx", "keys": [{"column": "category"}]},
+            ]},
+            "indexes": {"body_text": {"type": "full_text", "field": "body"}},
+        })
+        deadline = time.monotonic() + 180
+        while True:
+            resource = call("GET", "/tables/indexed_predicates/indexes/body_text")
+            if resource["status"]["readiness"]["queryable"]:
+                break
+            assert time.monotonic() < deadline, str(resource) + server.debug_logs()
+            time.sleep(0.1)
+
+        def query(predicate, **options):
+            return call("POST", "/tables/indexed_predicates/query", dict({
+                "full_text_search": {"term": "common", "field": "body"},
+                "fields": ["amount"], "limit": 10, "filter_query": predicate,
+            }, **options))
+
+        point = {"term": {"path": "/amount", "value": count - 1}}
+        assert [h["_source"]["amount"] for h in query(point)["hits"]["hits"]] == [count - 1]
+        boolean = query({"bool": {"filter": [point]}})
+        assert [h["_source"]["amount"] for h in boolean["hits"]["hits"]] == [count - 1]
+        assert query({"term": {"path": "/amount", "value": count}})["hits"]["hits"] == []
+        ranged = query({"range": {"path": "/amount", "gte": 10, "lt": 15}})
+        assert {h["_source"]["amount"] for h in ranged["hits"]["hits"]} == set(range(10, 15))
+        broad = {"term": {"path": "/category", "value": "comment"}}
+        hits = query(broad)["hits"]["hits"]
+        assert len(hits) == 10 and all(h["_source"]["amount"] >= 2 for h in hits)
+        counted = query(broad, count=True, fields=[], limit=0)
+        assert counted["hits"]["total"] == {"value": count - 2, "relation": "exact"}, counted
+        residual = query({"conjuncts": [point, {"prefix": {"path": "/label", "value": "ke"}}]})
+        assert [h["_source"]["amount"] for h in residual["hits"]["hits"]] == [count - 1]
+        union = query({"disjuncts": [point, {"term": {"path": "/amount", "value": 0}}]})
+        assert {h["_source"]["amount"] for h in union["hits"]["hits"]} == {0, count - 1}
+        excluded = call("POST", "/tables/indexed_predicates/query", {
+            "full_text_search": {"term": "common", "field": "body"},
+            "fields": ["amount"], "limit": 10, "exclusion_query": broad,
+        })
+        assert {h["_source"]["amount"] for h in excluded["hits"]["hits"]} == {0, 1}
+        failed = False
+    finally:
+        server.stop(test_failed=failed)

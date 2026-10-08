@@ -47,6 +47,11 @@ pub const Delivery = struct {
     start_fn: *const fn (*anyopaque, usize) anyerror!void,
     write_fn: *const fn (*anyopaque, []const u8) anyerror!void,
     max_bytes: usize = std.math.maxInt(usize),
+    preparation_bytes: usize = 4 * 1024 * 1024,
+    spill_io: ?std.Io = null,
+    /// Public transport owns the result until completion. Once spooled, source
+    /// leases can be released eagerly; reusable/internal callers leave false.
+    consume_columns: bool = false,
     pub const Writer = struct {
         sink: Delivery,
         buffer: [16 * 1024]u8 = undefined,

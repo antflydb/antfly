@@ -1223,6 +1223,26 @@ pub const Iterator = struct {
         }
     }
 
+    /// Seek to a chunk containing lower, skipping preceding containers.
+    pub fn seek(self: *Iterator, lower: u32) void {
+        const high: u16 = @intCast(lower >> 16);
+        self.chunk_idx = 0;
+        while (self.chunk_idx < self.bitmap.keys.items.len and self.bitmap.keys.items[self.chunk_idx] < high) self.chunk_idx += 1;
+        self.bm_iter = null;
+        self.initChunk();
+        if (self.chunk_idx == self.bitmap.keys.items.len or self.bitmap.keys.items[self.chunk_idx] != high) return;
+        const low: u16 = @truncate(lower);
+        switch (self.bitmap.containers.items[self.chunk_idx]) {
+            .array => |a| {
+                while (self.array_pos < a.items.len and a.items[self.array_pos] < low) self.array_pos += 1;
+            },
+            .bitmap => |words| {
+                const word: usize = low / 64;
+                self.bm_iter = .{ .words = words, .word_idx = word, .current = words[word] & (@as(u64, std.math.maxInt(u64)) << @as(u6, @truncate(low))) };
+            },
+        }
+    }
+
     pub fn next(self: *Iterator) ?u32 {
         while (self.chunk_idx < self.bitmap.containers.items.len) {
             const high: u32 = @as(u32, self.bitmap.keys.items[self.chunk_idx]) << 16;
@@ -1863,4 +1883,19 @@ test "frozen rank navigation matches sparse dense and boundary ranks with bounde
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{bitmap});
+}
+
+test "external lake bitmap seeks skip containers and preserve bit and array boundaries" {
+    var bitmap = RoaringBitmap.init(std.testing.allocator);
+    defer bitmap.deinit();
+    for (0..100001) |value| try bitmap.add(@intCast(value));
+    try bitmap.add(200003);
+    var it = bitmap.iterator();
+    it.seek(65535);
+    try std.testing.expectEqual(@as(?u32, 65535), it.next());
+    try std.testing.expectEqual(@as(?u32, 65536), it.next());
+    it.seek(100002);
+    try std.testing.expectEqual(@as(?u32, 200003), it.next());
+    it.seek(200004);
+    try std.testing.expectEqual(@as(?u32, null), it.next());
 }

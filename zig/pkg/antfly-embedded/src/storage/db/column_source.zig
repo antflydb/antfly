@@ -165,6 +165,24 @@ pub const Prepared = struct {
     const Field = struct { name: []const u8, value: Value };
     fields: []const Field,
     encoded_len: usize,
+    pub fn retainedBytes(self: Prepared) usize {
+        var size = self.fields.len * @sizeOf(Field);
+        for (self.fields) |field| {
+            size +|= field.name.len;
+            if (field.value == .raw) size +|= field.value.raw.len;
+        }
+        return size;
+    }
+    /// Raw fragments and names may belong to per-hit preparation scratch.
+    /// Scalar strings continue borrowing the immutable result page.
+    pub fn clone(self: Prepared, a: A) !Prepared {
+        const fields = try a.dupe(Field, self.fields);
+        for (fields) |*field| {
+            field.name = try a.dupe(u8, field.name);
+            if (field.value == .raw) field.value.raw = try a.dupe(u8, field.value.raw);
+        }
+        return .{ .fields = fields, .encoded_len = self.encoded_len };
+    }
     fn stringLength(bytes: []const u8) !usize {
         var length = try std.math.add(usize, bytes.len, 2);
         for (bytes) |byte| length = try std.math.add(usize, length, switch (byte) {

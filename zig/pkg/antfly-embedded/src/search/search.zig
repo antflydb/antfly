@@ -32,6 +32,7 @@ const scorer_mod = @import("scorer.zig");
 pub const SearchDiagnostics = scorer_mod.SearchDiagnostics;
 const query_mod = @import("query.zig");
 const aggregation_mod = @import("aggregation.zig");
+const roaring = @import("../encoding/roaring.zig");
 const typed_dv = @import("../section/typed_doc_values.zig");
 const segment_mod = @import("../segment.zig");
 const inverted = @import("../section/inverted.zig");
@@ -143,6 +144,8 @@ pub const SearchRequest = struct {
     graph_queries: []const NamedGraphQuery = &.{},
     expand_strategy: graph_query.ExpandStrategy = .@"union",
     distributed_text_stats: []const distributed_stats_mod.TextFieldStats = &.{},
+    filter_doc_bitmap: ?*const roaring.RoaringBitmap = null,
+    exclude_doc_bitmap: ?*const roaring.RoaringBitmap = null,
     filter_doc_nums: []const u32 = &.{},
     filter_doc_nums_positive: bool = false,
     exclude_doc_nums: []const u32 = &.{},
@@ -280,6 +283,7 @@ pub const DocIdQuery = struct {
 
 pub const DocNumQuery = struct {
     ids: []const u32,
+    bitmap: ?*const roaring.RoaringBitmap = null,
     boost: f32 = 1.0,
 };
 
@@ -575,6 +579,15 @@ pub fn execute(
 /// skips BM25 scoring and stored payload loading; callers that need MVCC
 /// visibility or stored pattern filters can still postprocess the returned doc
 /// IDs through their normal result pipeline.
+/// Exact snapshot count with at most one segment's filter bitmap in memory.
+/// Callers must separately prove that no primary visibility/residual check is owed.
+pub fn countMatches(alloc: Allocator, snap: *const index_mod.IndexSnapshot, query: SearchQuery) !u32 {
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const filter = try searchQueryToFilterArena(arena.allocator(), query);
+    return std.math.cast(u32, try snap.countFilter(alloc, filter)) orelse error.CountOverflow;
+}
+
 pub fn executeCountCandidates(
     alloc: Allocator,
     snap: *const index_mod.IndexSnapshot,
@@ -655,6 +668,9 @@ fn executeMatch(
     mq: MatchQuery,
     request: SearchRequest,
 ) !SearchResult {
+    if (request.filter_doc_bitmap != null or request.exclude_doc_bitmap != null) {
+        if (try executeSimpleTextBool(alloc, snap, .{ .should = &.{.{ .match = mq }} }, request)) |result| return result;
+    }
     const analyzer = mq.analyzer orelse &analysis_mod.default_analyzer;
     const tokens = try analyzer.analyze(alloc, mq.text);
     defer analysis_mod.Analyzer.freeTokens(alloc, tokens);
@@ -692,6 +708,9 @@ fn executeTerm(
     tq: TermQuery,
     request: SearchRequest,
 ) !SearchResult {
+    if (request.filter_doc_bitmap != null or request.exclude_doc_bitmap != null) {
+        if (try executeSimpleTextBool(alloc, snap, .{ .should = &.{.{ .term = tq }} }, request)) |result| return result;
+    }
     const results = try searchSnapshotTerms(alloc, snap, tq.field, &.{tq.term}, request);
     defer alloc.free(results.hits);
     if (tq.boost != 1.0) {
@@ -709,13 +728,14 @@ fn searchSnapshotTerms(
     request: SearchRequest,
 ) !scorer_mod.SearchResults {
     const stats = matchingFieldStats(request.distributed_text_stats, field, terms);
+    const k = if (request.filter_doc_bitmap != null or request.exclude_doc_bitmap != null) @as(u32, @intCast(@min(snap.liveDocCount(), std.math.maxInt(u32)))) else effectiveK(request, snap);
     if (request.diagnostics) |diagnostics| {
         if (stats == null) {
             return snap.searchWithConfigDiagnostics(
                 alloc,
                 field,
                 terms,
-                effectiveK(request, snap),
+                k,
                 request.bm25_config,
                 diagnostics,
             );
@@ -725,7 +745,7 @@ fn searchSnapshotTerms(
         alloc,
         field,
         terms,
-        effectiveK(request, snap),
+        k,
         stats,
         request.bm25_config,
     );
@@ -920,6 +940,8 @@ fn executeScoredPhraseFilter(
     var collector = FastTopK{
         .alloc = alloc,
         .k = effectiveK(request, snap),
+        .filter_doc_bitmap = request.filter_doc_bitmap,
+        .exclude_doc_bitmap = request.exclude_doc_bitmap,
         .filter_doc_nums = request.filter_doc_nums,
         .filter_doc_nums_positive = request.filter_doc_nums_positive,
         .exclude_doc_nums = request.exclude_doc_nums,
@@ -1203,7 +1225,7 @@ fn executeDocNum(
     dq: DocNumQuery,
     request: SearchRequest,
 ) !SearchResult {
-    return executeFilterQuery(alloc, snap, .{ .doc_num = .{ .doc_nums = dq.ids } }, request, dq.boost);
+    return executeFilterQuery(alloc, snap, .{ .doc_num = .{ .doc_nums = dq.ids, .bitmap = dq.bitmap } }, request, dq.boost);
 }
 
 fn executeBoolField(
@@ -1542,10 +1564,12 @@ fn subtractScoresFromHits(alloc: Allocator, map: *ScoreMap, hits: []const scorer
 }
 
 fn requestHasDocNumConstraints(request: SearchRequest) bool {
-    return request.filter_doc_nums_positive or request.exclude_doc_nums.len > 0;
+    return request.filter_doc_bitmap != null or request.exclude_doc_bitmap != null or request.filter_doc_nums_positive or request.exclude_doc_nums.len > 0;
 }
 
 fn requestAllowsDocNum(request: SearchRequest, doc_id: u32) bool {
+    if (request.filter_doc_bitmap) |bitmap| if (!bitmap.contains(doc_id)) return false;
+    if (request.exclude_doc_bitmap) |bitmap| if (bitmap.contains(doc_id)) return false;
     if (request.filter_doc_nums_positive and !containsSortedU32(request.filter_doc_nums, doc_id)) return false;
     if (containsSortedU32(request.exclude_doc_nums, doc_id)) return false;
     return true;
@@ -1631,6 +1655,8 @@ const FastTermState = struct {
 const FastTopK = struct {
     alloc: Allocator,
     k: u32,
+    filter_doc_bitmap: ?*const roaring.RoaringBitmap = null,
+    exclude_doc_bitmap: ?*const roaring.RoaringBitmap = null,
     filter_doc_nums: []const u32 = &.{},
     filter_doc_nums_positive: bool = false,
     exclude_doc_nums: []const u32 = &.{},
@@ -1660,6 +1686,8 @@ const FastTopK = struct {
     }
 
     fn allows(self: *const FastTopK, doc_id: u32) bool {
+        if (self.filter_doc_bitmap) |bitmap| if (!bitmap.contains(doc_id)) return false;
+        if (self.exclude_doc_bitmap) |bitmap| if (bitmap.contains(doc_id)) return false;
         if (self.filter_doc_nums_positive and !containsSortedU32(self.filter_doc_nums, doc_id)) return false;
         if (containsSortedU32(self.exclude_doc_nums, doc_id)) return false;
         return true;
@@ -1884,6 +1912,29 @@ fn collectOptionalScores(
     return .{ .count = count, .score = score };
 }
 
+/// A monotonic bitmap/postings intersection. Selective predicates seek postings
+/// directly to the next admitted document instead of decoding every match.
+const BitmapGate = struct {
+    iterator: ?roaring.Iterator = null,
+    next: ?u32 = null,
+    end: u64,
+    fn init(bitmap: ?*const roaring.RoaringBitmap, offset: u32, count: u32) BitmapGate {
+        var gate: BitmapGate = .{ .end = @as(u64, offset) + count };
+        if (bitmap) |set| {
+            gate.iterator = set.iterator();
+            gate.iterator.?.seek(offset);
+            gate.next = gate.iterator.?.next();
+        }
+        return gate;
+    }
+    fn target(self: *BitmapGate, current: u32) ?u32 {
+        if (self.iterator == null) return current;
+        while (self.next != null and self.next.? < current) self.next = self.iterator.?.next();
+        const value = self.next orelse return null;
+        return if (value < self.end) value else null;
+    }
+};
+
 fn collectFastShouldSegment(
     collector: *FastTopK,
     seg: *const index_mod.SegmentEntry,
@@ -1896,6 +1947,7 @@ fn collectFastShouldSegment(
     bm25_config: inverted.BM25Config,
     boost: f32,
 ) !void {
+    var gate = BitmapGate.init(collector.filter_doc_bitmap, doc_offset, seg.reader.doc_count);
     while (true) {
         var min_doc: ?u32 = null;
         for (should_states) |state| {
@@ -1904,6 +1956,13 @@ fn collectFastShouldSegment(
             if (min_doc == null or doc_id < min_doc.?) min_doc = doc_id;
         }
         const doc_id = min_doc orelse break;
+        const admitted = gate.target(doc_offset + doc_id) orelse break;
+        if (admitted > doc_offset + doc_id) {
+            for (should_states) |*state| if (!state.exhausted) {
+                try state.advanceTo(admitted - doc_offset);
+            };
+            continue;
+        }
 
         var should_count: u32 = 0;
         var score: f32 = 0;
@@ -2157,7 +2216,13 @@ fn collectFastMustSegment(
         if (state.doc_freq < must_states[lead_idx].doc_freq) lead_idx = i;
     }
 
+    var gate = BitmapGate.init(collector.filter_doc_bitmap, doc_offset, seg.reader.doc_count);
     while (!must_states[lead_idx].exhausted) {
+        const admitted = gate.target(doc_offset + must_states[lead_idx].current.?.doc_id) orelse return;
+        if (admitted > doc_offset + must_states[lead_idx].current.?.doc_id) {
+            try must_states[lead_idx].advanceTo(admitted - doc_offset);
+            if (must_states[lead_idx].exhausted) return;
+        }
         var target = must_states[lead_idx].current.?.doc_id;
         var aligned = false;
 
@@ -2299,6 +2364,8 @@ fn executeSimpleTextBool(
     var collector = FastTopK{
         .alloc = alloc,
         .k = effectiveK(request, snap),
+        .filter_doc_bitmap = request.filter_doc_bitmap,
+        .exclude_doc_bitmap = request.exclude_doc_bitmap,
         .filter_doc_nums = request.filter_doc_nums,
         .filter_doc_nums_positive = request.filter_doc_nums_positive,
         .exclude_doc_nums = request.exclude_doc_nums,
@@ -2368,6 +2435,29 @@ fn executeBool(
     bq: BoolQuery,
     request: SearchRequest,
 ) anyerror!SearchResult {
+    if (bq.boost == 1 and bq.should.len == 0 and bq.must.len >= 1 and bq.must.len <= 2 and bq.must_not.len <= 1 and
+        request.filter_doc_bitmap == null and request.exclude_doc_bitmap == null)
+    {
+        var constrained = request;
+        var recognized = bq.must.len == 2 or bq.must_not.len == 1;
+        if (bq.must.len == 2) {
+            if (bq.must[1] == .doc_num and bq.must[1].doc_num.ids.len == 0 and bq.must[1].doc_num.boost == 0 and bq.must[1].doc_num.bitmap != null)
+                constrained.filter_doc_bitmap = bq.must[1].doc_num.bitmap
+            else
+                recognized = false;
+        }
+        if (bq.must_not.len == 1) {
+            if (bq.must_not[0] == .doc_num and bq.must_not[0].doc_num.ids.len == 0 and bq.must_not[0].doc_num.bitmap != null)
+                constrained.exclude_doc_bitmap = bq.must_not[0].doc_num.bitmap
+            else
+                recognized = false;
+        }
+        if (recognized) {
+            constrained.query = bq.must[0];
+            constrained.graph_queries = &.{};
+            return execute(alloc, snap, constrained);
+        }
+    }
     if (try executeSimpleTextBool(alloc, snap, bq, request)) |result| return result;
     return executeBoolAllHit(alloc, snap, bq, request);
 }
@@ -2534,7 +2624,7 @@ pub fn searchQueryToFilterArena(alloc: Allocator, sq: SearchQuery) anyerror!quer
             .inclusive_end = rq.inclusive_end,
         } },
         .doc_id => |dq| .{ .doc_id = .{ .doc_ids = dq.ids } },
-        .doc_num => |dq| .{ .doc_num = .{ .doc_nums = dq.ids } },
+        .doc_num => |dq| .{ .doc_num = .{ .doc_nums = dq.ids, .bitmap = dq.bitmap } },
         .bool_field => |bq| .{ .bool_field = .{ .field = bq.field, .value = bq.value } },
         .geo_distance => |gq| .{ .geo_distance = .{
             .field = gq.field,
@@ -2698,7 +2788,7 @@ fn queryToFilter(alloc: Allocator, sq: SearchQuery) !OwnedFilter {
             .filter_slice = &.{},
         },
         .doc_num => |dq| .{
-            .filter = .{ .doc_num = .{ .doc_nums = dq.ids } },
+            .filter = .{ .doc_num = .{ .doc_nums = dq.ids, .bitmap = dq.bitmap } },
             .duped_terms = &.{},
             .filter_slice = &.{},
         },
@@ -3044,6 +3134,18 @@ fn buildResult(
     total_relation: TotalHitsRelation,
     request: SearchRequest,
 ) !SearchResult {
+    if (request.filter_doc_bitmap != null or request.exclude_doc_bitmap != null) {
+        var filtered: std.ArrayListUnmanaged(scorer_mod.ScoredHit) = .empty;
+        defer filtered.deinit(alloc);
+        for (scored) |hit| if (requestAllowsDocNum(request, hit.doc_id)) {
+            try filtered.append(alloc, hit);
+        };
+        var next = request;
+        next.filter_doc_bitmap = null;
+        next.exclude_doc_bitmap = null;
+        const count = if (filtered.items.len == scored.len) total_count else @as(u32, @intCast(filtered.items.len));
+        return buildResult(alloc, snap, filtered.items, count, total_relation, next);
+    }
     // Apply cursor filter: skip all results at or before the cursor position.
     // Scored results are sorted by (score desc, doc_id asc).
     var filtered_start: usize = 0;
@@ -5659,4 +5761,44 @@ test "external lake impossible Boolean conjunction skips global scoring reads" {
     const states = (try initFastTermStates(a, snap, &reader, "title", terms[1..], true)).?;
     defer deinitFastTermStates(a, states);
     try std.testing.expectEqual(@as(u32, 4), states[0].doc_freq);
+}
+
+test "external lake indexed bitmap filters preserve ranking disjunction and exact counts" {
+    const a = std.testing.allocator;
+    const bytes = try buildTestSegmentWithStoredDocs(a, &.{
+        .{ .id = "zero", .data = "{}", .terms = &.{.{ .term = "alpha", .freq = 4, .norm = 10 }} },
+        .{ .id = "one", .data = "{}", .terms = &.{.{ .term = "beta", .freq = 2, .norm = 10 }} },
+        .{ .id = "two", .data = "{}", .terms = &.{.{ .term = "alpha", .freq = 1, .norm = 10 }} },
+    });
+    defer a.free(bytes);
+    var writer = try index_mod.IndexWriter.init(a);
+    defer writer.deinit();
+    try writer.addSegment(bytes);
+    var bitmap = roaring.RoaringBitmap.init(a);
+    defer bitmap.deinit();
+    try bitmap.add(1);
+    try bitmap.add(2);
+    const base: SearchQuery = .{ .match = .{ .field = "title", .text = "alpha beta" } };
+    const query: SearchQuery = .{ .bool_query = .{ .must = &.{ base, .{ .doc_num = .{ .ids = &.{}, .bitmap = &bitmap, .boost = 0 } } } } };
+    var original = try execute(a, writer.snapshot(), .{ .query = base, .k = 3, .include_stored = false });
+    defer original.deinit();
+    var filtered = try execute(a, writer.snapshot(), .{ .query = query, .k = 3, .include_stored = false });
+    defer filtered.deinit();
+    try std.testing.expectEqual(@as(usize, 2), filtered.hits.len);
+    for (filtered.hits) |hit| {
+        try std.testing.expect(bitmap.contains(hit.doc_id));
+        const score = for (original.hits) |before| {
+            if (before.doc_id == hit.doc_id) break before.score;
+        } else return error.TestUnexpectedResult;
+        try std.testing.expectEqual(score, hit.score);
+    }
+    var count = try executeCountCandidates(a, writer.snapshot(), query);
+    defer count.deinit();
+    try std.testing.expectEqual(@as(u32, 2), count.total_hits);
+    try std.testing.expectEqual(@as(u32, 2), try countMatches(a, writer.snapshot(), query));
+    const excluded: SearchQuery = .{ .bool_query = .{ .must = &.{base}, .must_not = &.{.{ .doc_num = .{ .ids = &.{}, .bitmap = &bitmap } }} } };
+    var remaining = try execute(a, writer.snapshot(), .{ .query = excluded, .k = 3, .include_stored = false });
+    defer remaining.deinit();
+    try std.testing.expectEqual(@as(usize, 1), remaining.hits.len);
+    try std.testing.expectEqual(@as(u32, 0), remaining.hits[0].doc_id);
 }

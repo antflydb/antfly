@@ -27,7 +27,7 @@ const Declared = local.serverless_segment_sidecar_manifest.DeclaredArtifact;
 const Ref = local.serverless_manifest_artifact_ref.ArtifactRef;
 const Cancellation = @import("antfly_cancellation").CancellationToken;
 const A = std.mem.Allocator;
-pub const metadata_version: u16 = 6;
+pub const metadata_version: u16 = 7;
 pub const max_root_bytes = 4 * 1024 * 1024;
 pub const max_segments = 8192;
 pub const FileGroup = struct { file: state.File, segments: []const artifacts.ChunkRef };
@@ -187,7 +187,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             for (paths, runtime.relational_columns) |*path, column| path.* = column.name;
             binding.column_bindings = paths;
         }
-        binding.index_config_hash = try std.fmt.allocPrint(ca, "native-text-corpus-v4:{s}", .{want.binding.index_config_hash});
+        binding.index_config_hash = try std.fmt.allocPrint(ca, "native-text-corpus-v5:{s}", .{want.binding.index_config_hash});
         const recipe = state.recipe(table, spec.config_json);
         const prior = for (reusable) |declaration| {
             if (declaration.artifact.kind == .text_segment and declaration.artifact.metadata_version == metadata_version and std.mem.eql(u8, declaration.name, want.name) and rebuild.bindingsEqual(declaration.binding, binding)) break declaration;
@@ -235,6 +235,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
                 continue;
             }
             const first_segment = segments.items.len;
+            var previous_id: ?[96]u8 = null;
             var input = provider.*;
             input.only_file = file_ordinal;
             input.only_files = null;
@@ -256,6 +257,8 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
                         if (value == .string) input_bytes +|= value.string.len;
                     }
                     const id = try plan.privateKey(ba, ref);
+                    if (previous_id) |last_id| if (std.mem.order(u8, &last_id, id) != .lt) return error.InvalidNativeLakeTextCorpus;
+                    previous_id = id[0..96].*;
                     input_bytes +|= id.len + 128;
                     try builder.appendSourceDoc(.{ .key = id, .root = root, .stored_data = "", .typed_source = null });
                     if (builder.batch().docs.len >= 1024 or input_bytes >= 2 * 1024 * 1024) {
@@ -286,6 +289,11 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
 }
 fn flush(a: A, out: A, store: *stores.ArtifactStore, batch: mapper.TextProjectionBatch, analysis: local.introducer.TextAnalysisConfig, segments: *std.ArrayList(artifacts.ChunkRef), output_bytes: *usize, cancellation: Cancellation) !void {
     try cancellation.check();
+    // Version 7 attests ascending producer identities inside each file group.
+    // Segment construction preserves input order; the predicate consumer may seek.
+    for (batch.docs, 0..) |doc, i| {
+        if (i != 0 and std.mem.order(u8, batch.docs[i - 1].id, doc.id) != .lt) return error.InvalidNativeLakeTextCorpus;
+    }
     const encoded = try mapper.buildTextSegmentsFromProjectionBatch(a, batch, analysis, .{ .target_segment_bytes = 8 * 1024 * 1024, .target_build_memory_bytes = 32 * 1024 * 1024, .store_document_source = false });
     defer mapper.freeTextSegments(a, encoded);
     for (encoded) |bytes| {

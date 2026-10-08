@@ -148,6 +148,8 @@ const PhysicalResult = struct {
         return null;
     }
     units: []const Unit,
+    start: u64,
+    end: u64,
 };
 const PhysicalPin = struct {
     lease: Decoded.Lease,
@@ -189,9 +191,12 @@ const CoalescedRead = struct {
     bytes: ?[]u8 = null,
     pieces: []const Piece = &.{},
     shared: ?Decoded.Lease = null,
+    reused: std.ArrayList(Decoded.Lease) = .empty,
     fn deinit(self: *@This()) void {
         if (self.bytes) |bytes| self.a.free(bytes);
         if (self.shared) |lease| lease.release();
+        for (self.reused.items) |lease| lease.release();
+        self.reused.deinit(self.a);
     }
     fn loadPhysical(raw: *anyopaque, item: *Decoded.Item) !void {
         const loader: *PhysicalLoader = @ptrCast(@alignCast(raw));
@@ -200,8 +205,29 @@ const CoalescedRead = struct {
         const a = item.arena.allocator();
         var units: std.ArrayList(PhysicalResult.Unit) = .empty;
         const missing = try a.alloc(bool, self.pieces.len);
+        // All joined flights have completed before this loader is registered.
+        // Reuse their immutable units without waiting while owning a flight.
+        try cache.cache.physical.dependMany(item, self.reused.items);
         for (self.pieces, missing) |piece, *miss| {
             try self.cancellation.check();
+            const reused = found: {
+                for (self.reused.items) |lease| {
+                    const result: *PhysicalResult = @ptrCast(@alignCast(lease.item.payload.extension));
+                    for (result.units) |unit| if (unit.offset == piece.pack_offset and unit.length == piece.ref.byte_len) {
+                        // Successful slices must match this directory's proof.
+                        if (unit.result) |value| {
+                            if (!std.mem.eql(u8, &value.digest, &(try stores.sha256DigestFromChecksum(piece.ref.checksum)))) return error.ArtifactIntegrityMismatch;
+                        } else |_| {}
+                        try units.append(a, unit);
+                        break :found true;
+                    };
+                }
+                break :found false;
+            };
+            if (reused) {
+                miss.* = false;
+                continue;
+            }
             miss.* = !(cache.cache.probeImmutableBlock(a, cache.scope, piece.ref.artifact_id, @intCast(piece.ref.byte_len), try stores.sha256DigestFromChecksum(piece.ref.checksum), cache.context) catch |err| {
                 cache.context.ensureActive() catch return error.Canceled;
                 return err;
@@ -235,7 +261,7 @@ const CoalescedRead = struct {
             first = end;
         }
         const result = try a.create(PhysicalResult);
-        result.* = .{ .units = units.items };
+        result.* = .{ .start = self.start, .end = self.start + self.length, .units = units.items };
         item.payload = .{ .extension = result };
     }
     const PhysicalLoader = struct {
@@ -248,13 +274,37 @@ const CoalescedRead = struct {
             return false;
         }
     };
+    fn remainingCoverage(self: *const @This(), domain: [32]u8) Decoded.Cache.Coverage {
+        const end = self.start + self.length;
+        var begin = self.start;
+        while (begin < end) {
+            var covered = begin;
+            for (self.reused.items) |lease| {
+                const result: *const PhysicalResult = @ptrCast(@alignCast(lease.item.payload.extension));
+                if (result.start <= begin) covered = @max(covered, @min(end, result.end));
+            }
+            if (covered != begin) {
+                begin = covered;
+                continue;
+            }
+            var finish = end;
+            for (self.reused.items) |lease| {
+                const result: *const PhysicalResult = @ptrCast(@alignCast(lease.item.payload.extension));
+                if (result.start > begin) finish = @min(finish, result.start);
+            }
+            return .{ .domain = domain, .start = begin, .end = finish, .overlap = true };
+        }
+        // All intervals have been composed. Build our final immutable result
+        // without joining an already consumed partial interval again.
+        return .{ .domain = domain, .start = self.start, .end = end };
+    }
     fn verifiedLease(self: *@This(), a: A, piece: Piece, cache: artifacts.CachedRead) !ServingCache.VerifiedLease {
         // One pack-scoped flight, acquired without waiting on other unit
         // flights. Its owned result contains only verified cold runs.
         if (self.shared) |lease| {
             const result: *PhysicalResult = @ptrCast(@alignCast(lease.item.payload.extension));
             if (try result.get(piece)) |value| return PhysicalPin.retain(lease, value);
-            lease.release();
+            try self.reused.append(self.a, lease);
             self.shared = null;
         }
         var hash = std.crypto.hash.sha2.Sha256.init(.{});
@@ -276,10 +326,10 @@ const CoalescedRead = struct {
         // leader's expired reader lease. Restore our exact error below.
         flight_context.checkpoint = null;
         flight_context.cancellation = .fromCallback(&loader, PhysicalLoader.canceled);
-        {
+        while (true) {
             try self.cancellation.check();
             const lease = if (cache.context.io != null)
-                cache.cache.physical.acquireCovered(ranged.finalResult(), pack_bytes * 3, flight_context, .{ .ptr = &loader, .load = loadPhysical }, .{ .domain = domain, .start = self.start, .end = self.start + self.length }) catch |err| {
+                cache.cache.physical.acquireCovered(ranged.finalResult(), pack_bytes * 3, flight_context, .{ .ptr = &loader, .load = loadPhysical }, self.remainingCoverage(domain)) catch |err| {
                     try cache.context.ensureActive();
                     try self.cancellation.check();
                     return err;
@@ -293,6 +343,11 @@ const CoalescedRead = struct {
             var owns_lease = true;
             defer if (owns_lease) lease.release();
             const result: *PhysicalResult = @ptrCast(@alignCast(lease.item.payload.extension));
+            if (result.start > self.start or result.end < self.start + self.length) {
+                try self.reused.append(self.a, lease);
+                owns_lease = false;
+                continue;
+            }
             if (try result.get(piece)) |value| {
                 self.shared = lease;
                 owns_lease = false;
@@ -1232,6 +1287,29 @@ test "external lake physical pack flights share different unit leaders without r
     live_open = false;
     try second_disjoint;
     try std.testing.expect(overlapped);
+    try std.testing.expectEqual(@as(usize, 0), cache.physical.flights.count());
+    // Partially overlapping requests compose completed verified slices. The
+    // second reader downloads only its unclaimed tail, even with no residency.
+    provider.started = .unset;
+    provider.release = .unset;
+    const before_bytes = cache.snapshot().provider_bytes;
+    leader = try io.concurrent(Owner.read, .{ owner, read, @as(u64, 0), output[0 .. block_bytes * 2] });
+    leader_open = true;
+    try provider.started.wait(io);
+    live = try io.concurrent(Owner.read, .{ owner, read, @as(u64, block_bytes), other[0 .. block_bytes * 2] });
+    live_open = true;
+    try Wait.shared(&cache);
+    provider.release.set(io);
+    const overlap_leader = leader.await(io);
+    leader_open = false;
+    try overlap_leader;
+    const overlap_waiter = live.await(io);
+    live_open = false;
+    try overlap_waiter;
+    try std.testing.expectEqualSlices(u8, bytes[0 .. block_bytes * 2], output[0 .. block_bytes * 2]);
+    try std.testing.expectEqualSlices(u8, bytes[block_bytes .. block_bytes * 3], other[0 .. block_bytes * 2]);
+    try std.testing.expectEqual(@as(u64, block_bytes * 3), cache.snapshot().provider_bytes - before_bytes);
+    try std.testing.expectEqual(@as(usize, 8), provider.calls.load(.acquire));
     try std.testing.expectEqual(@as(usize, 0), cache.physical.flights.count());
 }
 

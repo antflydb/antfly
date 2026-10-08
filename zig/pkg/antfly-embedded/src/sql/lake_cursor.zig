@@ -22,6 +22,7 @@ const rows = @import("../serverless/query/lake_rows.zig");
 const serving = @import("../serverless/query/lake_serving.zig");
 const operation = @import("../api/operation.zig");
 const Allocator = std.mem.Allocator;
+pub const max_selection_rows = @import("../serverless/query/lake_row_selection.zig").max_candidates;
 
 pub fn open(alloc: Allocator, table: catalog.Table, request: catalog.Scan, context: operation.RequestContext, options: @import("../serverless/lake_host.zig").OpenOptions) !catalog.Cursor {
     return openWithCache(alloc, table, request, context, options, null, null);

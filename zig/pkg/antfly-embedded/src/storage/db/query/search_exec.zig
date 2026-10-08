@@ -132,7 +132,18 @@ pub const PinnedTextSource = struct {
     }
 };
 
+pub const IndexedTextPredicate = struct {
+    bitmap: roaring.RoaringBitmap,
+    exact: bool = true,
+};
+
 pub const SearchTextQueryExecutor = struct {
+    /// Provider attests that its pinned snapshot already enforces primary row
+    /// visibility. Fully native counts can skip per-hit postprocessing.
+    native_count_visibility_exact: bool = false,
+    /// Exact provider predicates in this pinned snapshot's document-number space.
+    /// Null leaves the original predicate owed to residual evaluation.
+    resolve_indexed_filter: ?*const fn (?*anyopaque, Allocator, *const index_mod.IndexSnapshot, []const u8) anyerror!?IndexedTextPredicate = null,
     /// The provider maps public document IDs exactly into its native identity space.
     exact_doc_id_filters: bool = false,
     /// Project immutable producer identities before filtering, sorting, and paging.
@@ -11529,7 +11540,34 @@ pub fn searchTextQuery(
     const snapshot = text_source.snapshot;
     const can_apply_live_all_docs = !chunk_backed or (try snapshot.hasDocOrdinalCoverage());
     const constraints_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
+    var indexed_include: ?IndexedTextPredicate = null;
+    defer if (indexed_include) |*predicate| predicate.bitmap.deinit();
+    var indexed_exclude: ?IndexedTextPredicate = null;
+    defer if (indexed_exclude) |*predicate| predicate.bitmap.deinit();
+    if (!suppress_native_resolved_doc_filter and effective_req.order_by.len == 0) {
+        if (executor.resolve_indexed_filter) |resolve| {
+            if (effective_req.filter_query_json.len != 0) indexed_include = try resolve(executor.ctx, alloc, snapshot, effective_req.filter_query_json);
+            if (effective_req.exclusion_query_json.len != 0) indexed_exclude = try resolve(executor.ctx, alloc, snapshot, effective_req.exclusion_query_json);
+            // An exclusion superset would discard valid rows. Keep it residual.
+            if (indexed_exclude) |*predicate| if (!predicate.exact) {
+                predicate.bitmap.deinit();
+                indexed_exclude = null;
+            };
+        }
+    }
+    if (indexed_include != null or indexed_exclude != null) {
+        const must = try arena_alloc.alloc(search_mod.SearchQuery, if (indexed_include != null) 2 else 1);
+        must[0] = base_search_query;
+        const exclusions = try arena_alloc.alloc(search_mod.SearchQuery, if (indexed_exclude != null) 1 else 0);
+        if (indexed_include) |*bitmap| must[1] = .{ .doc_num = .{ .ids = &.{}, .bitmap = &bitmap.bitmap, .boost = 0 } };
+        if (indexed_exclude) |*bitmap| exclusions[0] = .{ .doc_num = .{ .ids = &.{}, .bitmap = &bitmap.bitmap } };
+        base_search_query = .{ .bool_query = .{ .must = must, .must_not = exclusions } };
+    }
     var constraint_req = effective_req;
+    if (indexed_include) |predicate| if (predicate.exact) {
+        constraint_req.filter_query_json = "";
+    };
+    if (indexed_exclude != null) constraint_req.exclusion_query_json = "";
     constraint_req.resolved_doc_filter = null;
     constraint_req.full_text = null;
     if (suppress_native_resolved_doc_filter) {
@@ -11563,6 +11601,10 @@ pub fn searchTextQuery(
         .apply_live_all_docs = can_apply_live_all_docs,
     });
     defer native_constraints.deinit(alloc);
+    if (indexed_include) |predicate| if (predicate.exact) {
+        native_constraints.filter_query_json_resolved = true;
+    };
+    if (indexed_exclude != null) native_constraints.exclusion_query_json_resolved = true;
     const derive_constraints_ns = if (bench_query_profile) platform_time.monotonicNs() - constraints_start_ns else 0;
 
     const resolved_filter_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
@@ -11599,7 +11641,9 @@ pub fn searchTextQuery(
         native_constraints.exclusion_query_json_resolved,
     );
 
-    if (native_constraints.positive_filter and native_constraints.filter_doc_ids.len == 0 and native_constraints.filter_doc_nums.len == 0) {
+    if ((indexed_include != null and indexed_include.?.bitmap.cardinality() == 0) or
+        (native_constraints.positive_filter and native_constraints.filter_doc_ids.len == 0 and native_constraints.filter_doc_nums.len == 0))
+    {
         const score_profile = if (collect_score_profile) sortResultProfile(effective_req, .{
             .kind = .score_top_k,
         }, false, .{
@@ -11629,6 +11673,21 @@ pub fn searchTextQuery(
     const full_candidate_limit = effectiveTextCandidateLimit(snapshot.liveDocCount(), native_constraints);
     const requires_field_sort = effective_req.order_by.len > 0;
     const search_query = try textSearchQueryWithNativeDocIdsAlloc(arena_alloc, base_search_query, native_constraints, effective_req.count_only);
+    if (executor.native_count_visibility_exact and effective_req.count_only and !unresolved_stored_filters and
+        !chunk_backed and !group_chunk_parents and effective_req.return_mode == .parent and effective_req.hierarchy_group_level == .source and
+        !effective_req.hierarchy_grouped_matches and effective_req.full_text_queries.len == 0 and
+        effective_req.dense_queries.len == 0 and effective_req.sparse_queries.len == 0 and
+        effective_req.authorization_filter_query_json.len == 0 and effective_req.filter_prefix.len == 0 and
+        effective_req.doc_filter_bindings.len == 0 and effective_req.query == .match_all and
+        !effective_req.hasHitEvaluation() and effective_req.evaluation_limit == 0 and effective_req.pruner == null and
+        effective_req.hierarchy_children == null and !effective_req.hierarchy_include_source and !effective_req.hierarchy_include_unit and
+        effective_req.graph_queries.len == 0 and effective_req.aggregations_json.len == 0 and executor.is_expired_key == null)
+    {
+        try checkSearchRequestDeadline(effective_req);
+        const total = try search_mod.countMatches(alloc, snapshot, search_query);
+        try checkSearchRequestDeadline(effective_req);
+        return .{ .alloc = alloc, .hits = &.{}, .total_hits = total, .total_hits_relation = .exact, .graph_results = &.{} };
+    }
     // The primary document store is the source of truth. Production text
     // segments retain compact keys for hit identity, but no longer duplicate
     // source bodies merely to project a result page.

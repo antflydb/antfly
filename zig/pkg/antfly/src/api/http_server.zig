@@ -21287,7 +21287,7 @@ pub const ApiHttpServer = struct {
             }
         };
         var bridge: ?Bridge = if (delivery) |target| .{ .server = self, .table_name = table_name, .target = target } else null;
-        var resolver = CatalogQueryResolver{ .arena = catalog_arena.allocator(), .delivery = if (bridge) |*value| .{ .ptr = value, .start_fn = Bridge.start, .write_fn = Bridge.write, .max_bytes = value.target.max_bytes } else null };
+        var resolver = CatalogQueryResolver{ .arena = catalog_arena.allocator(), .delivery = if (bridge) |*value| .{ .ptr = value, .start_fn = Bridge.start, .write_fn = Bridge.write, .max_bytes = value.target.max_bytes, .preparation_bytes = value.target.preparation_bytes, .spill_io = self.embedding_provider_runtime.io, .consume_columns = true } else null };
         var binding = self.bindCatalogQuery(self.alloc, .{ .deadline_ns = deadline, .cancellation = if (cancellation) |value| value.token() else .none }, table_name, body, &identity, &resolver) catch |err| return self.publicQueryOperationErrorResponse(table_name, body, err);
         defer binding.deinit();
         if (bridge) |*value| value.table_name = binding.physical;
@@ -21395,6 +21395,7 @@ pub const ApiHttpServer = struct {
                 false,
             ),
             error.QueryCandidateBudgetExceeded => try contextualQueryCandidateBudgetExceededResponse(self.alloc),
+            error.QueryResponseTooLarge => try contextual_operations.jsonErrorAlloc(self.alloc, 413, "query response exceeds delivery resource limit"),
             error.RerankerCandidateLimitExceeded => try contextualRerankerCandidateLimitExceededResponse(self.alloc),
             error.GraphWorkBudgetExceeded => contextual_operations.jsonWithStatus(
                 422,

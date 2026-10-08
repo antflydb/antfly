@@ -324,6 +324,7 @@ pub fn loadRoot(a: A, store: stores.ArtifactStore, ref: Ref, cancellation: Cance
 /// Caller retains the leased root and store capability through cursor close.
 /// A batch is owned by its caller, including all physical identity strings.
 pub const Reader = struct {
+    physical_cursor: ?tree.Cursor = null,
     root: Root,
     pages: page_store.PageStore,
     cursor: ?tree.Cursor = null,
@@ -355,6 +356,26 @@ pub const Reader = struct {
     pub fn deinit(self: *Reader) void {
         if (self.cursor) |*cursor| cursor.deinit();
         self.cursor = null;
+        if (self.physical_cursor) |*cursor| cursor.deinit();
+        self.physical_cursor = null;
+    }
+    /// Reverse-tree order is physical file/group/row order. Test the stored
+    /// tuple against the exact seek bounds without opening Parquet columns.
+    pub fn nextPhysical(self: *Reader, a: A, max_rows: usize, lower: []const u8, upper: ?[]const u8) ![]const rows.RowRef {
+        if (max_rows == 0 or max_rows > 65536) return error.InvalidNativeLakeRowIndex;
+        if (self.physical_cursor == null) self.physical_cursor = try tree.Cursor.init(self.cursor.?.alloc, self.pages.store(), self.root.reverse orelse return error.InvalidNativeLakeRowIndex, "", null);
+        var refs: std.ArrayList(rows.RowRef) = .empty;
+        errdefer refs.deinit(a);
+        while (refs.items.len < max_rows) {
+            const record = try self.physical_cursor.?.next() orelse break;
+            if (record.key.len < 32) return error.InvalidNativeLakeRowIndex;
+            const key = record.key[16..];
+            if (!std.mem.eql(u8, record.key[0..16], key[key.len - 16 ..])) return error.InvalidNativeLakeRowIndex;
+            if (std.mem.order(u8, key, lower) == .lt) continue;
+            if (upper) |end| if (std.mem.order(u8, key, end) != .lt) continue;
+            try refs.append(a, try self.decode(.{ .key = key, .value = record.key[0..16] }));
+        }
+        return refs.toOwnedSlice(a);
     }
     pub const Entry = struct { key: []const u8, ref: rows.RowRef, cover: ?Cover = null };
     pub const Cover = struct { block: artifacts.ChunkRef, row: u16 };
@@ -451,6 +472,18 @@ test "external lake ordered deltas retain untouched pages and delete only one fi
     for (0..2048) |n| try Make.add(&first, @intCast(n), 0, n);
     const ref = try publish(a, ca, &store, &first, "ordered", @splat(3), inventory, &.{}, .none);
     const root = try loadRoot(ca, store, ref, .none, null);
+    // Physical reverse traversal applies tuple bounds without hydration.
+    var predicate_reader: Reader = undefined;
+    var lower_key: [4]u8 = undefined;
+    var upper_key: [4]u8 = undefined;
+    std.mem.writeInt(u32, &lower_key, 100, .big);
+    std.mem.writeInt(u32, &upper_key, 103, .big);
+    try predicate_reader.init(a, &store, root, @splat(3), &lower_key, &upper_key, .none);
+    defer predicate_reader.deinit();
+    const physical_matches = try predicate_reader.nextPhysical(ca, 1024, &lower_key, &upper_key);
+    try std.testing.expectEqual(@as(usize, 3), physical_matches.len);
+    for (physical_matches, 100..) |row, expected_row| try std.testing.expectEqual(@as(u64, @intCast(expected_row)), row.external.row_ordinal);
+    try std.testing.expectEqual(@as(usize, 0), (try predicate_reader.nextPhysical(ca, 1024, &lower_key, &upper_key)).len);
     const Pages = struct {
         refs: std.AutoHashMapUnmanaged([32]u8, void) = .empty,
         alloc: A,

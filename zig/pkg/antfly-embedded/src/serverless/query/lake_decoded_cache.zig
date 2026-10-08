@@ -43,10 +43,12 @@ pub const Item = struct {
     cached: bool = false,
     /// A decoded page pins its immutable chunk dictionary in this cache.
     dependency: ?*Item = null,
+    dependencies: []const *Item = &.{},
     touched: u64 = 0,
     fn destroy(self: *Item, cache: *Cache) void {
         const parent = self.dependency;
         const a = self.budget.backing;
+        for (self.dependencies) |item| cache.releaseLocked(item);
         if (self.payload == .page_directory) self.payload.page_directory.deinit();
         if (self.payload == .prepared) self.payload.prepared.destroy(self.budget.allocator());
         if (self.payload == .snapshot) self.payload.snapshot.deinit(self.budget.allocator());
@@ -89,7 +91,13 @@ pub const Cache = struct {
     max_loaders: usize = 16,
     exclusive_loading: bool = false,
     exclusive_waiters: usize = 0,
-    pub const Coverage = struct { domain: [32]u8, start: u64, end: u64 };
+    pub const Coverage = struct {
+        domain: [32]u8,
+        start: u64,
+        end: u64,
+        /// Opt in only when the caller can compose partial immutable results.
+        overlap: bool = false,
+    };
     const Flight = struct {
         coverage: ?Coverage = null,
         refs: usize = 1,
@@ -128,7 +136,9 @@ pub const Cache = struct {
                 const wanted = coverage orelse break :covered null;
                 var candidates = self.flights.valueIterator();
                 while (candidates.next()) |candidate| if (candidate.*.coverage) |available| {
-                    if (std.mem.eql(u8, &wanted.domain, &available.domain) and available.start <= wanted.start and wanted.end <= available.end) break :covered candidate.*;
+                    if (std.mem.eql(u8, &wanted.domain, &available.domain) and
+                        ((available.start <= wanted.start and wanted.end <= available.end) or
+                            (wanted.overlap and available.start < wanted.end and wanted.start < available.end))) break :covered candidate.*;
                 };
                 break :covered null;
             };
@@ -258,6 +268,20 @@ pub const Cache = struct {
         std.debug.assert(page.item.dependency == null);
         dictionary.item.refs += 1;
         page.item.dependency = dictionary.item;
+    }
+    /// An immutable composed result pins all physical inputs. Allocate before
+    /// changing references, so allocation failure leaves ownership untouched.
+    pub fn dependMany(self: *Cache, item: *Item, inputs: []const Lease) !void {
+        std.debug.assert(item.dependencies.len == 0);
+        const parents = try item.arena.allocator().alloc(*Item, inputs.len);
+        self.lock();
+        defer self.mutex.unlock();
+        for (inputs, parents) |input, *parent| {
+            std.debug.assert(input.cache == self);
+            input.item.refs += 1;
+            parent.* = input.item;
+        }
+        item.dependencies = parents;
     }
     pub fn deinit(self: *Cache) void {
         // Remove leaf pages first; their release makes dictionaries evictable.
