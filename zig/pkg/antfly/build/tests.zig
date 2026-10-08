@@ -1716,6 +1716,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "SQL pgwire dispatch preserves imported executor authority including unavailable views",
         "httpx antfly ChatGPT connector policy",
         "storage-kernel query request preserves final projection while raw retrieval defers it",
+        "api http server executes direct foreign table query through registry",
         "api http server executes direct foreign table aggregations through registry",
         "unconfigured remote catalog authority skips background work without borrowing internal credentials",
         "usermgr openapi module generates extractor surface for routed endpoints",
@@ -4659,7 +4660,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     lib_standalone_runtime_test_mod.addImport("usermgr_storage", usermgr_storage_lib_standalone_runtime_test_mod);
     const lib_standalone_runtime_tests = b.addTest(.{
         .root_module = lib_standalone_runtime_test_mod,
-        .filters = &.{
+        .filters = selectTestFilters(b, &.{
             "standalone runtime module compiles",
             "standalone.runtime.test.system catalog",
             "catalog.domain.",
@@ -4745,7 +4746,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "Lease executor accepts optional CertificateRequest with projected CA and verified hostname",
             "Lease executor accepts TLS 1.2 optional CertificateRequest",
             "Lease executor rejects optional CertificateRequest hostname mismatch",
-        },
+        }),
         .test_runner = .{
             .path = b.path("pkg/antfly-embedded/src/test_runner.zig"),
             .mode = .simple,
@@ -4764,7 +4765,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     // these fixtures their own control-only source profile, separate from
     // the resident storage owners used by the runtime and restore slices.
     const standalone_initial_fk_test_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly/src/standalone_runtime_test_root.zig"),
+        .root_source_file = b.path("pkg/antfly/src/standalone_runtime_control_test_root.zig"),
         .target = target,
         .optimize = optimize,
     });

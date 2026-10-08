@@ -2473,6 +2473,7 @@ pub fn validateTransitionCommandDataGroupIds(command: TransitionCommand) !void {
             )) return error.InvalidStoreReporterFence;
         },
         .compare_and_replace_table => |replacement| {
+            try metadata_table_manager.validateObjectTableMutation(std.heap.page_allocator, replacement.expected, replacement.replacement);
             if (replacement.expected.table_id == 0 or
                 replacement.replacement.table_id != replacement.expected.table_id or
                 !std.mem.eql(u8, replacement.replacement.name, replacement.expected.name))
@@ -2490,11 +2491,13 @@ pub fn validateTransitionCommandDataGroupIds(command: TransitionCommand) !void {
             .create => |create| {
                 if (create.table.table_id == 0 or
                     create.table.name.len == 0 or
-                    create.ranges.len == 0 or
+                    (create.ranges.len == 0 and create.table.storage.engine != .object) or
                     create.ranges.len > topology_protocol.max_initial_ranges or
                     create.ranges.len != @as(usize, create.table.min_ranges))
                     return error.InvalidTableTopologyMutation;
-                metadata_table_manager.validateCompleteKeyspaceRanges(create.ranges) catch
+                if (create.table.storage.engine == .object) {
+                    if (create.ranges.len != 0 or create.table.desired_replica_count != 0 or create.table.storage.dense_embeddings != .primary_lsm or create.table.storage_migration != null) return error.InvalidTableTopologyMutation;
+                } else metadata_table_manager.validateCompleteKeyspaceRanges(create.ranges) catch
                     return error.InvalidTableTopologyMutation;
                 for (create.ranges) |record| {
                     try group_ids.requireDataGroupId(record.group_id);
@@ -14329,6 +14332,10 @@ pub const RaftApplyStore = struct {
         if (encoded_existing) |encoded| {
             const existing = try decodeTableRecord(self.alloc, encoded);
             retained = existing;
+            metadata_table_manager.validateObjectTableMutation(self.alloc, existing, record) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return,
+            };
             // Reconciliation may retain a generation but never publish, clear,
             // or steal one through an unconditional table upsert. Omission
             // retains internal state so schema reconciliation can continue
@@ -15856,6 +15863,10 @@ pub const RaftApplyStore = struct {
         const current = try decodeTableRecord(self.alloc, encoded);
         defer metadata_table_manager.freeTable(self.alloc, current);
         if (!metadata_table_manager.tableDefinitionsEqual(current, expected)) return;
+        metadata_table_manager.validateObjectTableMutation(self.alloc, current, replacement) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return,
+        };
         const lake_transition_allowed = @import("antfly_local_sources").metadata_lake_index_catalog.transitionAllowed(self.alloc, current, replacement) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => false,
@@ -18876,7 +18887,7 @@ pub fn decodeTransitionCommand(alloc: std.mem.Allocator, encoded: []const u8) !?
                 const table = try readFramedTableRecord(alloc, encoded, &pos);
                 errdefer metadata_table_manager.freeTable(alloc, table);
                 const range_count = try readInt(encoded, &pos, u32);
-                if (range_count == 0 or range_count > topology_protocol.max_initial_ranges)
+                if ((range_count == 0 and table.storage.engine != .object) or range_count > topology_protocol.max_initial_ranges)
                     return error.InvalidMetadataTransitionEncoding;
                 const ranges = try alloc.alloc(metadata.RangeRecord, range_count);
                 var decoded_count: usize = 0;
@@ -18903,7 +18914,7 @@ pub fn decodeTransitionCommand(alloc: std.mem.Allocator, encoded: []const u8) !?
                 const table = try readFramedTableRecord(alloc, encoded, &pos);
                 errdefer metadata_table_manager.freeTable(alloc, table);
                 const range_count = try readInt(encoded, &pos, u32);
-                if (range_count == 0 or range_count > topology_protocol.max_initial_ranges)
+                if ((range_count == 0 and table.storage.engine != .object) or range_count > topology_protocol.max_initial_ranges)
                     return error.InvalidMetadataTransitionEncoding;
                 const ranges = try alloc.alloc(metadata.RangeRecord, range_count);
                 var decoded_count: usize = 0;
@@ -19474,6 +19485,7 @@ fn decodeTableProjection(alloc: std.mem.Allocator, encoded: []const u8, mode: en
     errdefer alloc.free(name);
     var fields: [8][]const u8 = undefined;
     var count: usize = 0;
+    var storage: @import("antfly_local_sources").common_table_storage.Settings = .{};
     var lake_index_catalog_json: []const u8 = "";
     while (pos < encoded.len and count < fields.len) : (count += 1) {
         const length = try readInt(encoded, &pos, u32);
@@ -19489,13 +19501,14 @@ fn decodeTableProjection(alloc: std.mem.Allocator, encoded: []const u8, mode: en
             pos += length;
         }
         lake_index_catalog_json = try readLakeIndexCatalogExtension(encoded, &pos);
-        _ = try readTableStorageExtension(encoded, &pos);
+        storage = (try readTableStorageExtension(encoded, &pos)).storage;
     }
     // Legacy, read-schema, and restore-intent records respectively. Borrow all
     // framed fields to validate the encoding, but copy only query-owned data.
     if (count != 5 and count != 6 and count != 8) return error.InvalidMetadataTransitionEncoding;
     return .{ .table_id = table_id, .name = name, .query_definition = if (mode != .identity) try (system_catalog.QueryDefinition{
         .table_id = table_id,
+        .storage_engine = storage.engine,
         .schema_json = fields[1],
         .read_schema_json = if (mode == .schema or count == 5) "" else fields[2],
         .indexes_json = if (mode == .schema) "" else fields[if (count == 5) 2 else 3],
@@ -21087,7 +21100,12 @@ fn appendTableRecord(
     }
     if (record.requiresStorageMetadataExtension()) {
         try appendInt(alloc, out, u32, table_storage_metadata_magic);
-        try appendInt(alloc, out, u16, table_storage_metadata_version);
+        try appendInt(alloc, out, u16, if (record.storage.engine == .object) 2 else table_storage_metadata_version);
+        if (record.storage.engine == .object) {
+            try out.append(alloc, 1);
+            try appendInt(alloc, out, u64, record.object_storage_generation);
+            try out.appendSlice(alloc, &record.object_storage_identity);
+        }
         try out.append(alloc, switch (record.storage.dense_embeddings) {
             .primary_lsm => 0,
             .vector_store => 1,
@@ -21512,6 +21530,8 @@ fn readTableRecordWithReadSchema(
 }
 
 const BorrowedTableStorage = struct {
+    object_storage_generation: u64 = 0,
+    object_storage_identity: [32]u8 = @splat(0),
     storage: @import("antfly_local_sources").common_table_storage.Settings = .{},
     migration: ?@import("antfly_local_sources").common_vector_migration.Admission = null,
 };
@@ -21531,8 +21551,15 @@ fn readLakeIndexCatalogExtension(encoded: []const u8, pos: *usize) ![]const u8 {
 fn readTableStorageExtension(encoded: []const u8, pos: *usize) !BorrowedTableStorage {
     var result: BorrowedTableStorage = .{};
     if (pos.* == encoded.len) return result;
-    if (try readInt(encoded, pos, u32) != table_storage_metadata_magic or
-        try readInt(encoded, pos, u16) != table_storage_metadata_version) return error.InvalidMetadataTransitionEncoding;
+    if (try readInt(encoded, pos, u32) != table_storage_metadata_magic) return error.InvalidMetadataTransitionEncoding;
+    const version = try readInt(encoded, pos, u16);
+    if (version != table_storage_metadata_version and version != 2) return error.InvalidMetadataTransitionEncoding;
+    if (version == 2) {
+        if (try readInt(encoded, pos, u8) != 1) return error.InvalidMetadataTransitionEncoding;
+        result.storage.engine = .object;
+        result.object_storage_generation = try readInt(encoded, pos, u64);
+        for (&result.object_storage_identity) |*byte| byte.* = try readInt(encoded, pos, u8);
+    }
     result.storage.dense_embeddings = switch (try readInt(encoded, pos, u8)) {
         0 => .primary_lsm,
         1 => .vector_store,
@@ -21560,7 +21587,8 @@ fn readTableStorageExtension(encoded: []const u8, pos: *usize) !BorrowedTableSto
         },
         else => return error.InvalidMetadataTransitionEncoding,
     }
-    if (pos.* != encoded.len or (result.storage.dense_embeddings == .primary_lsm and result.migration == null)) return error.InvalidMetadataTransitionEncoding;
+    if (pos.* != encoded.len or (result.storage.engine == .local and result.storage.dense_embeddings == .primary_lsm and result.migration == null)) return error.InvalidMetadataTransitionEncoding;
+    if (result.storage.engine == .object and (result.storage.dense_embeddings != .primary_lsm or result.migration != null)) return error.InvalidMetadataTransitionEncoding;
     return result;
 }
 
@@ -21601,6 +21629,8 @@ fn readTableRecordWithRestoreIntent(
     if (extension.migration) |*migration| migration.request.job_id = try alloc.dupe(u8, migration.request.job_id);
     return .{
         .storage = extension.storage,
+        .object_storage_generation = extension.object_storage_generation,
+        .object_storage_identity = extension.object_storage_identity,
         .storage_migration = extension.migration,
         .relational_retirement_json = relational_retirement_json,
         .lake_index_catalog_json = lake_index_catalog_json,
@@ -31245,4 +31275,74 @@ test "metadata runtime index source producer completion uses framed extension an
         try std.testing.expectEqual(version == runtime_status_protocol.framed_index_record_version, decoded.source_replay[0].producer_complete);
         try std.testing.expect(!decoded.source_replay[1].producer_complete);
     }
+}
+
+test "metadata.lake index object table engine framing preserves empty topology and incarnation" {
+    const a = std.testing.allocator;
+    const table: metadata.TableRecord = .{
+        .table_id = 19,
+        .name = "object_docs",
+        .storage = .{ .engine = .object },
+        .schema_json = @import("../../api/tables.zig").default_schema_json,
+        .min_ranges = 0,
+        .desired_replica_count = 0,
+        .object_storage_generation = 37,
+        .object_storage_identity = @splat(9),
+    };
+    const bytes = try encodeTableRecord(a, table);
+    defer a.free(bytes);
+    const decoded = try decodeTableRecord(a, bytes);
+    defer metadata_table_manager.freeTable(a, decoded);
+    try std.testing.expect(metadata_table_manager.tableDefinitionsEqual(table, decoded));
+    const cloned = try metadata_table_manager.cloneTable(a, decoded);
+    defer metadata_table_manager.freeTable(a, cloned);
+    try std.testing.expect(metadata_table_manager.tableDefinitionsEqual(table, cloned));
+    const command: TransitionCommand = .{ .apply_table_topology = .{ .create = .{ .expected_transition_generation = 37, .table = table, .ranges = &.{} } } };
+    try validateTransitionCommandDataGroupIds(command);
+    const wire = try encodeTransitionCommand(a, command);
+    defer a.free(wire);
+    const table_bytes = try encodeTableRecord(a, table);
+    defer a.free(table_bytes);
+    const projection = try decodeTableQueryProjection(a, table_bytes, true);
+    defer projection.deinit(a);
+    try std.testing.expectEqual(.object, projection.query_definition.?.storage_engine);
+    var roundtrip = (try decodeTransitionCommand(a, wire)).?;
+    defer roundtrip.deinit(a);
+    try std.testing.expect(metadata_table_manager.tableDefinitionsEqual(table, roundtrip.apply_table_topology.create.table));
+    try std.testing.expectEqual(@as(usize, 0), roundtrip.apply_table_topology.create.ranges.len);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/object-topology", .{tmp.sub_path});
+    defer a.free(root);
+    var applied = table;
+    applied.object_storage_generation = 0;
+    const create = try encodeTransitionCommand(a, .{ .apply_table_topology = .{ .create = .{ .expected_transition_generation = 0, .table = applied, .ranges = &.{} } } });
+    defer a.free(create);
+    {
+        var store = try RaftApplyStore.init(a, .{ .root_dir = root });
+        defer store.deinit();
+        const entries = try raft_state_machine.encodeCommittedEntries(a, &.{.{ .term = 1, .index = 1, .entry_type = .normal, .data = create }});
+        defer a.free(entries);
+        try store.snapshotBuilder().applyBatch(.{ .group_id = 21, .commit_index = 1, .entries_bytes = entries });
+    }
+    {
+        var reopened = try RaftApplyStore.init(a, .{ .root_dir = root });
+        defer reopened.deinit();
+        const tables = try reopened.listTables(a, 21);
+        defer reopened.freeTables(a, tables);
+        const ranges = try reopened.listRanges(a, 21);
+        defer reopened.freeRanges(a, ranges);
+        try std.testing.expectEqual(@as(usize, 1), tables.len);
+        try std.testing.expectEqual(@as(usize, 0), ranges.len);
+        try std.testing.expect(metadata_table_manager.tableDefinitionsEqual(applied, tables[0]));
+    }
+    var invalid = table;
+    invalid.storage.engine = .local;
+    try std.testing.expectError(error.InvalidTableTopologyMutation, validateTransitionCommandDataGroupIds(.{ .apply_table_topology = .{ .create = .{ .table = invalid, .ranges = &.{}, .expected_transition_generation = 37 } } }));
+    invalid = table;
+    invalid.object_storage_identity = @splat(8);
+    try std.testing.expectError(error.ImmutableTableStorageSettings, metadata_table_manager.validateObjectTableMutation(a, table, invalid));
+    invalid = table;
+    invalid.indexes_json = "{\"new\":{\"type\":\"full_text\"}}";
+    try std.testing.expectError(error.ObjectTableDefinitionConflict, metadata_table_manager.validateObjectTableMutation(a, table, invalid));
 }

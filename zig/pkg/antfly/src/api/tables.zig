@@ -1088,6 +1088,25 @@ pub fn parseCreateTableRequest(alloc: std.mem.Allocator, body: []const u8) !Crea
     return parseCreateTableRequestWithOptions(alloc, body, false);
 }
 
+pub fn validateObjectCreateDefinition(alloc: std.mem.Allocator, req: CreateTableRequest) !void {
+    const storage = req.storage orelse @import("antfly_local_sources").common_table_storage.Settings{};
+    if (storage.engine != .object) return;
+    try storage.validateCreate(req.num_shards, if (req.replication_sources_json) |sources| !std.mem.eql(u8, sources, "[]") else false);
+    const validated = try @import("antfly_local_sources").schema_table_schema_impl.parseCreateSchemaRequest(alloc, effectiveSchemaJson(req.schema_json));
+    defer alloc.free(validated);
+    var schema = try std.json.parseFromSlice(std.json.Value, alloc, validated, .{});
+    defer schema.deinit();
+    // Creation may contain an external schema-inference draft. Its source was
+    // validated above; native ingress binds the columns before publication.
+    // External relational sidecars retain native catalog-fenced publication.
+    if (schema.value.object.get("base_source")) |source| {
+        if (source == .object) if (source.object.get("kind")) |kind| {
+            if (kind == .string and std.mem.eql(u8, kind.string, "external")) return;
+        };
+    }
+    try @import("../serverless/catalog/storage_capabilities.zig").requireDefinition(alloc, req.schema_json orelse "{}", "{}", req.indexes_json orelse "{}");
+}
+
 pub fn parseStoredCreateTableRequest(alloc: std.mem.Allocator, body: []const u8) !CreateTableRequest {
     return parseCreateTableRequestWithOptions(alloc, body, true);
 }
@@ -1458,6 +1477,10 @@ pub fn deriveInitialRangesForGeneration(
     table: metadata_table_manager.TableRecord,
     transition_generation: u64,
 ) ![]metadata_table_manager.RangeRecord {
+    if (table.storage.engine == .object) {
+        if (table.min_ranges != 0 or table.desired_replica_count != 0) return error.ObjectTablePlacementUnsupported;
+        return alloc.alloc(metadata_table_manager.RangeRecord, 0);
+    }
     if (table.min_ranges == 0) return error.InvalidCreateTableRequest;
     if (table.min_ranges > max_table_initial_ranges)
         return error.CreateTableShardCountOutOfRange;
@@ -1910,7 +1933,7 @@ fn buildTableStatusWithRanges(
         .name = table.name,
         .table_id = try std.fmt.allocPrint(alloc, "{d}", .{table.table_id}),
         .description = if (table.description.len > 0) table.description else null,
-        .storage = .{ .dense_embeddings = @tagName(table.storage.dense_embeddings) },
+        .storage = .{ .engine = @tagName(table.storage.engine), .dense_embeddings = @tagName(table.storage.dense_embeddings) },
         .indexes = try parseTableIndexes(alloc, table.indexes_json),
         .shards = shards,
         .schema = if (definition) |value| value.schema else try parseOptionalTableSchema(alloc, table.schema_json),

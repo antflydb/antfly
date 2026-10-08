@@ -3,6 +3,12 @@
 The remote index lifecycle, persistent cache tiers, SQL materialization matching,
 and public status/explain contract are specified in [REMOTE_TABLE_SERVING.md](REMOTE_TABLE_SERVING.md).
 
+The proposed writable-table, multi-provider catalog, source connector, and
+recent/archive merge architecture is captured in
+[Lake ingestion, change capture, and publication](../docs/plans/lake-ingestion-and-publication.md).
+Remote lake reads and native index publication already exist; that plan describes
+additional ingestion and Parquet/Iceberg write capabilities, not current APIs.
+
 Antfly relational mode makes typed rows first-class while keeping JSON as a
 document-backed column type. Lake query mode extends that contract to files
 owned by users in object storage: Parquet datasets, Iceberg tables, and later

@@ -54,7 +54,8 @@ const std = @import("std");
 /// Version 27 persists reduction ownership for exact contribution retention.
 /// Version 28 maintains immutable ownership counts and publication root sets.
 /// Version 29 admits seekable native text corpora and their durable GC frontier.
-pub const current_version: u16 = 29;
+pub const current_version: u16 = 30;
+pub const object_table_engine_version: u16 = 30;
 pub const lake_index_catalog_version: u16 = 29;
 pub const durable_activation_version: u16 = 9;
 pub const store_report_update_version: u16 = 8;

@@ -8,6 +8,12 @@ It is intentionally narrower than query-time `foreign_sources`.
 request time. CDC is a control-plane workflow that ingests external changes into
 canonical Antfly table storage.
 
+The proposed generalization to other database connectors, lake notifications,
+authenticated commit hooks, and managed archive publication is described in
+[Lake ingestion, change capture, and publication](../docs/plans/lake-ingestion-and-publication.md).
+It builds on this subsystem's canonical apply, metadata ownership, and durable
+checkpoint contracts; it does not imply those additional source APIs exist today.
+
 ## Metadata substrate
 
 - Public create-table parsing accepts `replication_sources`.
