@@ -2809,7 +2809,8 @@ fn lateVisibilityExactCandidateBudgetFromRaw(raw: ?[]const u8) u32 {
     return if (parsed == 0) std.math.maxInt(u32) else parsed;
 }
 
-fn lateVisibilityExactCandidateBudget() u32 {
+/// Shared ceiling for plans that leave exact predicate evaluation to candidates.
+pub fn lateVisibilityExactCandidateBudget() u32 {
     return lateVisibilityExactCandidateBudgetFromRaw(getenv("ANTFLY_TEXT_LATE_VISIBILITY_EXACT_CANDIDATE_BUDGET"));
 }
 

@@ -101,13 +101,20 @@ results do not establish full-archive capacity or concurrent production latency.
 A separate raw-export check also passed the previously timed-out unordered
 HN-ID filter in 481 ms.
 
-Tables with declared relational indexes evaluate supported structured predicates
-against indexed physical candidates before ranking, including match sets above
-100,000 rows. The default example now declares the five HN metadata indexes. With
-`--text-only`, flat structured predicates scan projected columns against the
-pinned, delete-aware lake snapshot and collect up to 100,000 matching IDs.
-Full-archive qualification still needs larger partitions. Nested paths retain
-the existing residual-filter path.
+The example declares five HN metadata indexes. For flat structured predicates,
+the lake planner compares a projected scan, an exact index range, intersections
+of indexes, and a selective index followed by residual evaluation. It estimates
+work from authenticated range cardinalities, projected Parquet bytes/rows, and
+whether index metadata is resident. These are relative work estimates rather
+than calibrated latency predictions. No user hint is required.
+
+Index candidates borrow the current query's authorized artifact store and leased
+publication. Losing candidates release their metadata handles without reading
+result rows. A partial candidate set retains the full predicate for exact
+ranking/counts; it is allowed only within the engine's configured exact candidate
+budget. Exclusions and vector filters require exact sets. Broad exact scans and
+indexes support match sets above 100,000 rows; full-archive qualification still
+needs larger partitions. Nested paths retain the existing residual-filter path.
 
 ## Same-region qualification
 
@@ -164,7 +171,8 @@ metadata indexes. Later cycles reused publication. Individual indexed metadata
 filters took 213–241 ms warm; their conjunction took 753 ms. The text-only
 projected scans took 141–159 ms on this small cached sample. These indexes
 provide scalable predicate evaluation; the 10k check does not demonstrate a
-filtering latency win. Compound predicates currently incur repeated index setup.
+filtering latency win. These measurements precede the automatic predicate planner
+and shared query-scoped index setup.
 
 Cold searches received 5.7–7.4 MB and used 0.65–1.06 seconds of aggregate CPU.
 Their reported execution time was 1.2–1.7 seconds, leaving 2.6–3.2 seconds outside
