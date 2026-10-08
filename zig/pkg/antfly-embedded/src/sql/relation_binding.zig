@@ -129,7 +129,8 @@ pub const Node = struct {
     },
 };
 pub const virtual_table_name = "$sql_relation";
-pub const Bound = struct { root: *const Node, scans: []const catalog.StatementScan, table: catalog.Table, statement: ast.Select };
+pub const Bound = struct { root: *const Node, scans: []const catalog.StatementScan, table: catalog.Table, statement: ast.Select, prepared_fields: []const []const u8 = &.{} };
+pub const prepared_scope_name = "$sql_prepared_scope";
 
 fn qualified(node: *const ast.Scalar) bool {
     return switch (node.*) {
@@ -301,6 +302,8 @@ const Builder = struct {
     alloc: Allocator,
     backend: catalog.Backend,
     parameters: []?ast.ColumnType,
+    prepared_scope: ?[]const Column = null,
+    prepared_demands: std.StringHashMapUnmanaged(void) = .empty,
     scans: std.ArrayList(catalog.StatementScan) = .empty,
     identities: std.StringHashMapUnmanaged(catalog.Table) = .empty,
     outer_references: ?*std.StringHashMapUnmanaged(void) = null,
@@ -457,6 +460,7 @@ const Builder = struct {
                 .identities = self.identities,
                 .next_column = self.next_column,
                 .shape_only = true,
+                .prepared_scope = self.prepared_scope,
                 .node_limit = self.node_limit,
                 .outer_scope = self.outer_scope,
                 .outer_next = self.outer_next,
@@ -531,7 +535,12 @@ const Builder = struct {
                 return self.lowerSubqueries(prepared, scope, depth + 1);
             }
         }
-        return subqueries.lower(self.alloc, prepared);
+        const prepared_aliases: ?subqueries.PreparedScope = if (self.prepared_scope) |columns| aliases: {
+            const names = try self.alloc.alloc([]const u8, columns.len);
+            for (columns, names) |column, *name| name.* = column.qualifier;
+            break :aliases .{ .table = prepared_scope_name, .qualifiers = names };
+        } else null;
+        return subqueries.lowerWithPreparedScope(self.alloc, prepared, prepared_aliases);
     }
 
     fn inferShape(self: *Builder, statement: ast.Select, expected: []const ast.ColumnType) !void {
@@ -1338,6 +1347,25 @@ const Builder = struct {
         try self.backend.vtable.checkpoint(self.backend.ptr);
         return switch (input.*) {
             .table => |reference| blk: {
+                if (reference.prepared_rows and std.mem.eql(u8, reference.name.table, prepared_scope_name)) {
+                    const authorized = self.prepared_scope orelse return error.InvalidSqlBackendResponse;
+                    const columns = try self.alloc.dupe(Column, authorized);
+                    const names = try self.alloc.alloc([]const u8, columns.len);
+                    for (columns, names) |*column, *name| {
+                        name.* = column.internal;
+                        column.internal = try self.internal();
+                        // The prepared cursor owns typed cells, not expressions
+                        // or outer frames from the mutation input's planner.
+                        column.origin = null;
+                        column.outer_level = 0;
+                        column.outer_frame = null;
+                        column.outer_ordinal = null;
+                        column.outer_dependencies = 0;
+                        column.grouped_scope = null;
+                        if (self.shape_only) try self.shape_columns.append(self.alloc, .{ .name = column.internal, .type = column.type, .element_type = column.element_type, .nullable = column.nullable });
+                    }
+                    break :blk try self.node(columns, .{ .prepared_rows = names });
+                }
                 if (!reference.mutation_target and !reference.prepared_rows and reference.name.database == null and reference.name.namespace == null) {
                     var i = scope.len;
                     while (i != 0) {
@@ -1690,7 +1718,12 @@ fn markSelect(alloc: Allocator, needed: *std.StringHashMapUnmanaged(void), state
 }
 fn projectScans(builder: *Builder, node: *const Node, needed: *std.StringHashMapUnmanaged(void)) anyerror!void {
     switch (node.operation) {
-        .singleton, .recursive_ref, .outer_ref, .literal_rows, .prepared_rows => {},
+        .singleton, .recursive_ref, .outer_ref, .literal_rows => {},
+        .prepared_rows => |names| {
+            if (builder.prepared_scope != null) for (node.columns, names) |column, name| {
+                if (needed.contains(column.internal)) try builder.prepared_demands.put(builder.alloc, name, {});
+            };
+        },
         .materialized_ref => |source| {
             // A materialized CTE stores its complete declared output once;
             // references can project different columns without changing its
@@ -1791,10 +1824,21 @@ fn validateAggregateLevel(alloc: Allocator, columns: []const Column, input: *con
 }
 
 pub fn bind(alloc: Allocator, backend: catalog.Backend, statement: ast.Select, parameters: []?ast.ColumnType) anyerror!Bound {
-    var builder: Builder = .{ .alloc = alloc, .backend = backend, .parameters = parameters, .node_limit = if (statement.generated_values) 8192 else 256 };
+    return bindWithPreparedScope(alloc, backend, statement, parameters, null);
+}
+
+/// Only a mutation owner may supply this already-authorized scope. It is an
+/// input relation of prepared target images and coherent captured source rows,
+/// not a physical catalog name or an authorization shortcut for child scans.
+pub fn bindPreparedScope(alloc: Allocator, backend: catalog.Backend, statement: ast.Select, parameters: []?ast.ColumnType, columns: []const Column) anyerror!Bound {
+    return bindWithPreparedScope(alloc, backend, statement, parameters, columns);
+}
+
+fn bindWithPreparedScope(alloc: Allocator, backend: catalog.Backend, statement: ast.Select, parameters: []?ast.ColumnType, columns: ?[]const Column) anyerror!Bound {
+    var builder: Builder = .{ .alloc = alloc, .backend = backend, .parameters = parameters, .prepared_scope = columns, .node_limit = if (statement.generated_values) 8192 else 256 };
     const normalized = try builder.lowerSubqueries(statement, &.{}, 0);
     if (std.mem.indexOfScalar(?ast.ColumnType, parameters, null) != null) {
-        var shape: Builder = .{ .alloc = alloc, .backend = backend, .parameters = parameters, .identities = builder.identities, .shape_only = true, .node_limit = if (statement.generated_values) 8192 else 256 };
+        var shape: Builder = .{ .alloc = alloc, .backend = backend, .parameters = parameters, .identities = builder.identities, .shape_only = true, .prepared_scope = columns, .node_limit = if (statement.generated_values) 8192 else 256 };
         try shape.inferShape(normalized, &.{});
         builder.identities = shape.identities;
     }
@@ -1803,7 +1847,10 @@ pub fn bind(alloc: Allocator, backend: catalog.Backend, statement: ast.Select, p
     var needed: std.StringHashMapUnmanaged(void) = .empty;
     try markSelect(alloc, &needed, lowered);
     try projectScans(&builder, root, &needed);
-    return .{ .root = root, .scans = try builder.scans.toOwnedSlice(alloc), .table = try builder.virtualTable(root.columns), .statement = lowered };
+    const prepared_fields = try alloc.alloc([]const u8, builder.prepared_demands.count());
+    var iterator = builder.prepared_demands.keyIterator();
+    for (prepared_fields) |*field| field.* = iterator.next().?.*;
+    return .{ .root = root, .scans = try builder.scans.toOwnedSlice(alloc), .table = try builder.virtualTable(root.columns), .statement = lowered, .prepared_fields = prepared_fields };
 }
 
 /// Assignment types cross arbitrary derived/CTE/set boundaries before binding

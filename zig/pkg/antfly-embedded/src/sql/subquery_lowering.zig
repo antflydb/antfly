@@ -101,22 +101,32 @@ pub fn accepts(statement: ast.Select) bool {
     return false;
 }
 const Names = std.StringHashMapUnmanaged(void);
-fn aliases(alloc: Allocator, relation: *const ast.Relation, names: *Names) !void {
+/// Compiler-owned input relations can retain multiple lexical qualifiers even
+/// though their physical rows are supplied by one prepared cursor.
+pub const PreparedScope = struct { table: []const u8, qualifiers: []const []const u8 };
+fn aliases(alloc: Allocator, relation: *const ast.Relation, names: *Names, prepared: ?PreparedScope) !void {
     switch (relation.*) {
-        .table => |table| try names.put(alloc, table.alias orelse table.name.table, {}),
+        .table => |table| {
+            if (table.prepared_rows) if (prepared) |scope| if (std.mem.eql(u8, table.name.table, scope.table)) {
+                for (scope.qualifiers) |qualifier| try names.put(alloc, qualifier, {});
+                return;
+            };
+            try names.put(alloc, table.alias orelse table.name.table, {});
+        },
         .derived => |query| if (query.phase_scope != null or query.preserve_scope) {
-            if (query.query.source) |source| try aliases(alloc, source, names) else if (query.query.table) |table| try names.put(alloc, table.table, {});
+            if (query.query.source) |source| try aliases(alloc, source, names, prepared) else if (query.query.table) |table| try names.put(alloc, table.table, {});
             if (query.phase_scope != null) try names.put(alloc, query.alias, {});
         } else try names.put(alloc, query.alias, {}),
         .join => |join| {
-            try aliases(alloc, join.left, names);
-            try aliases(alloc, join.right, names);
+            try aliases(alloc, join.left, names, prepared);
+            try aliases(alloc, join.right, names, prepared);
         },
     }
 }
 const Key = struct { inner: *const ast.Scalar, outer: *const ast.Scalar, comparison: ast.Scalar.Binary = .eq };
 const Builder = struct {
     alloc: Allocator,
+    prepared_scope: ?PreparedScope = null,
     source: *const ast.Relation,
     outer: Names = .empty,
     serial: usize = 0,
@@ -392,7 +402,7 @@ const Builder = struct {
         if (original.set_operation != null or original.ctes.len != 0 or original.order_by.len != 0 or original.limit != null or original.offset != null or original.group_by.len != 0 or original.having != null or @import("window_binding.zig").accepts(original.*)) return error.UnsupportedSqlShape;
         if (!exists and original.columns.len != 1 and !original.count_all) return error.InvalidSqlParameters;
         var local: Names = .empty;
-        if (original.source) |source| try aliases(self.alloc, source, &local) else if (original.table) |table| try local.put(self.alloc, table.table, {});
+        if (original.source) |source| try aliases(self.alloc, source, &local, self.prepared_scope) else if (original.table) |table| try local.put(self.alloc, table.table, {});
         if (exists) if (original.predicate) |predicate| {
             const filter = try self.predicateScalar(predicate);
             if (self.hasOuterOr(filter, local)) {
@@ -573,7 +583,7 @@ const Builder = struct {
         if (expression.call.args.len != 1 or original.columns.len != 1 or original.count_all) return error.InvalidSqlParameters;
         if (original.set_operation != null or original.ctes.len != 0 or original.order_by.len != 0 or original.limit != null or original.offset != null or original.group_by.len != 0 or original.having != null or @import("aggregate_binding.zig").accepts(original.*) or @import("window_binding.zig").accepts(original.*)) return error.UnsupportedSqlShape;
         var local: Names = .empty;
-        if (original.source) |source| try aliases(self.alloc, source, &local) else if (original.table) |table| try local.put(self.alloc, table.table, {});
+        if (original.source) |source| try aliases(self.alloc, source, &local, self.prepared_scope) else if (original.table) |table| try local.put(self.alloc, table.table, {});
         const value = original.columns[0].expression orelse try self.scalar(.{ .column = original.columns[0].field });
         if (self.referencesOuter(value, local)) return error.UnsupportedSqlShape;
         const operand = try self.rewrite(expression.call.args[0]);
@@ -637,7 +647,7 @@ const Builder = struct {
         if (expression.call.args.len != 1 or original.columns.len != 1 or original.count_all) return error.InvalidSqlParameters;
         if (original.set_operation != null or original.ctes.len != 0 or original.order_by.len != 0 or original.limit != null or original.offset != null or original.group_by.len != 0 or original.having != null or @import("aggregate_binding.zig").accepts(original.*) or @import("window_binding.zig").accepts(original.*)) return error.UnsupportedSqlShape;
         var local: Names = .empty;
-        if (original.source) |source| try aliases(self.alloc, source, &local) else if (original.table) |table| try local.put(self.alloc, table.table, {});
+        if (original.source) |source| try aliases(self.alloc, source, &local, self.prepared_scope) else if (original.table) |table| try local.put(self.alloc, table.table, {});
         const value = original.columns[0].expression orelse try self.scalar(.{ .column = original.columns[0].field });
         if (self.referencesOuter(value, local)) return error.UnsupportedSqlShape;
         const operand = try self.rewrite(expression.call.args[0]);
@@ -688,7 +698,7 @@ const Builder = struct {
         if (expression.call.args.len != 1 or original.columns.len != 1 or original.count_all) return error.InvalidSqlParameters;
         if (original.set_operation != null or original.ctes.len != 0 or original.order_by.len != 0 or original.limit != null or original.offset != null or original.group_by.len != 0 or original.having != null or @import("aggregate_binding.zig").accepts(original.*) or @import("window_binding.zig").accepts(original.*)) return error.UnsupportedSqlShape;
         var local: Names = .empty;
-        if (original.source) |source| try aliases(self.alloc, source, &local) else if (original.table) |table| try local.put(self.alloc, table.table, {});
+        if (original.source) |source| try aliases(self.alloc, source, &local, self.prepared_scope) else if (original.table) |table| try local.put(self.alloc, table.table, {});
         const value = original.columns[0].expression orelse try self.scalar(.{ .column = original.columns[0].field });
         if (self.referencesOuter(value, local)) return error.UnsupportedSqlShape;
         const operand = try self.rewrite(expression.call.args[0]);
@@ -759,7 +769,7 @@ const Builder = struct {
         }
         var local: Names = .empty;
         if (query.source) |source| {
-            try aliases(self.alloc, source, &local);
+            try aliases(self.alloc, source, &local, self.prepared_scope);
             const scope: NestedScope = .{ .source = source };
             if (self.nestedOuterRelation(source, &scope)) return true;
         } else if (query.table) |table| try local.put(self.alloc, table.table, {});
@@ -832,7 +842,7 @@ const Builder = struct {
         const operands = expression.call.args[0].call.args;
         if (operands.len == 0 or operands.len > 256) return error.InvalidSqlSyntax;
         var local: Names = .empty;
-        if (original.source) |source| try aliases(self.alloc, source, &local) else if (original.table) |table| try local.put(self.alloc, table.table, {});
+        if (original.source) |source| try aliases(self.alloc, source, &local, self.prepared_scope) else if (original.table) |table| try local.put(self.alloc, table.table, {});
         var keys: std.ArrayList(Key) = .empty;
         // Non-keyed correlated query boundaries need an Apply-owned producer;
         // never strip their sort/page/group domain while hoisting a build.
@@ -1021,7 +1031,7 @@ const Builder = struct {
         if (scalarBoundary(query)) return true;
         if (query.predicate == null and (query.source != null or query.table != null)) return true;
         var local: Names = .empty;
-        if (query.source) |source| try aliases(self.alloc, source, &local) else if (query.table) |table| try local.put(self.alloc, table.table, {});
+        if (query.source) |source| try aliases(self.alloc, source, &local, self.prepared_scope) else if (query.table) |table| try local.put(self.alloc, table.table, {});
         for (query.columns) |projection| {
             if (projection.wildcard) continue;
             const value = projection.expression orelse try self.scalar(.{ .column = projection.field });
@@ -1189,11 +1199,15 @@ fn selectionOrders(alloc: Allocator, statement: ast.Select) !?[]ast.Order {
 }
 
 pub fn lower(alloc: Allocator, statement: ast.Select) !ast.Select {
+    return lowerWithPreparedScope(alloc, statement, null);
+}
+
+pub fn lowerWithPreparedScope(alloc: Allocator, statement: ast.Select, prepared_scope: ?PreparedScope) !ast.Select {
     if (statement.values_arms.len != 0) {
         const arms = try alloc.alloc(*const ast.Select, statement.values_arms.len);
         for (statement.values_arms, arms) |arm, *out| {
             const rewritten = try alloc.create(ast.Select);
-            rewritten.* = if (accepts(arm.*) and !needsProjectionDomain(arm.*)) try lower(alloc, arm.*) else arm.*;
+            rewritten.* = if (accepts(arm.*) and !needsProjectionDomain(arm.*)) try lowerWithPreparedScope(alloc, arm.*, prepared_scope) else arm.*;
             out.* = rewritten;
         }
         var result = statement;
@@ -1202,9 +1216,9 @@ pub fn lower(alloc: Allocator, statement: ast.Select) !ast.Select {
     }
     if (statement.set_operation) |set| {
         const left = try alloc.create(ast.Select);
-        left.* = if (accepts(set.left.*) and !needsProjectionDomain(set.left.*)) try lower(alloc, set.left.*) else set.left.*;
+        left.* = if (accepts(set.left.*) and !needsProjectionDomain(set.left.*)) try lowerWithPreparedScope(alloc, set.left.*, prepared_scope) else set.left.*;
         const right = try alloc.create(ast.Select);
-        right.* = if (accepts(set.right.*) and !needsProjectionDomain(set.right.*)) try lower(alloc, set.right.*) else set.right.*;
+        right.* = if (accepts(set.right.*) and !needsProjectionDomain(set.right.*)) try lowerWithPreparedScope(alloc, set.right.*, prepared_scope) else set.right.*;
         var result = statement;
         result.set_operation = .{ .kind = set.kind, .all = set.all, .left = left, .right = right };
         return result;
@@ -1228,13 +1242,13 @@ pub fn lower(alloc: Allocator, statement: ast.Select) !ast.Select {
             .scalar_cardinality_limit = statement.scalar_cardinality_limit,
         };
     }
-    var builder: Builder = .{ .alloc = alloc, .source = undefined };
+    var builder: Builder = .{ .alloc = alloc, .source = undefined, .prepared_scope = prepared_scope };
     if (statement.source) |source| builder.source = source else if (statement.table) |table| builder.source = try builder.relation(.{ .table = .{ .name = table } }) else {
         const singleton = try alloc.create(ast.Select);
         singleton.* = .{ .columns = try alloc.dupe(ast.Projection, &.{.{ .expression = try builder.scalar(.{ .literal = .{ .integer = 1 } }) }}) };
         builder.source = try builder.relation(.{ .derived = .{ .query = singleton, .alias = "$singleton", .hidden = true } });
     }
-    try aliases(alloc, builder.source, &builder.outer);
+    try aliases(alloc, builder.source, &builder.outer, prepared_scope);
     var result = statement;
     // Resolve the row-selection domain before attaching downstream producers.
     // Keep the predicate as a hidden, single-evaluation prerequisite: repeating

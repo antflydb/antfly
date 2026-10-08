@@ -688,6 +688,201 @@ test "SQL joined mutations preserve one capture exact fences typed values and do
     }
 }
 
+test "SQL joined RETURNING subqueries share prepared target and captured source scope" {
+    const Fixture = struct { entries: []const struct { sql: []const u8, rows: []const []const ?[]const u8, scans: usize, read_rows: ?usize = null } };
+    const fixture = try std.json.parseFromSlice(Fixture, std.testing.allocator, @import("antfly_local_sources").sql_parity_fixtures.joined_returning_subquery_reference, .{});
+    defer fixture.deinit();
+    for (fixture.value.entries) |case| {
+        var backend: Backend = .{ .arrays = true, .array_first = 9007199254740993, .array_lower = -1, .returning_mode = true };
+        var compiled = try compiler.compile(std.testing.allocator, case.sql, .{});
+        defer compiled.deinit();
+        var result = try runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{ .page_rows = 1 });
+        defer result.deinit();
+        for (result.output.columns, [_][]const u8{ "n", "delta", "d" }) |column_, name| {
+            try std.testing.expectEqualStrings(name, column_.name);
+            try std.testing.expectEqual(.integer, column_.type);
+        }
+        try std.testing.expectEqual(@as(u64, 2), result.output.rows_affected);
+        try std.testing.expectEqual(case.rows.len, result.output.rows.len);
+        for (case.rows, result.output.rows, result.output.sql_nulls.?) |expected, actual, nulls| {
+            try std.testing.expectEqual(expected.len, actual.len);
+            for (expected, actual, nulls) |wanted, value, is_null| {
+                try std.testing.expectEqual(wanted == null, is_null);
+                if (wanted) |text| try std.testing.expectEqualStrings(text, value.string);
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 1), backend.captures);
+        try std.testing.expectEqual(@as(usize, 1), backend.closes);
+        try std.testing.expectEqual(@as(usize, 1), backend.commits);
+        try std.testing.expectEqual(case.scans, backend.last_scan_count);
+        try std.testing.expectEqual(case.read_rows orelse case.scans * 2, backend.rows_read);
+    }
+}
+
+test "SQL joined RETURNING subqueries prune cold scope and scale by captured rows" {
+    var previous_work: usize = 0;
+    var previous_count: usize = 0;
+    for ([_]usize{ 128, 512, 1024 }) |count| {
+        var backend: Backend = .{ .returning_mode = true, .cold_source = true, .cold_width = 128, .row_count = count };
+        var compiled = try compiler.compile(std.testing.allocator, "UPDATE target t SET n=t.n+s.delta,cold='new' FROM source s WHERE t._id=s.id RETURNING t.n,s.delta,(SELECT x.delta FROM source x WHERE x.id=s.id)", .{});
+        defer compiled.deinit();
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const binding = try describe.bind(arena.allocator(), backend.backend(), &compiled, &.{});
+        try std.testing.expectEqual(@as(usize, 3), binding.joined_mutation.?.returning_scope.len);
+        try std.testing.expectEqual(@as(usize, 2), binding.joined_mutation.?.returning_sources.len);
+        try std.testing.expectEqual(@as(usize, 1), backend.source_resolves);
+        var result = try runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{ .page_rows = 17, .result_rows = count });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(u64, count), result.output.rows_affected);
+        try std.testing.expectEqual(3 * count, backend.rows_read);
+        try std.testing.expect(backend.checkpoints < 100 * count);
+        if (previous_count != 0) try std.testing.expect(backend.checkpoints <= previous_work * count / previous_count + 2 * count);
+        previous_count = count;
+        previous_work = backend.checkpoints;
+        for (result.output.rows, 0..) |row, index| {
+            try std.testing.expectEqual(@as(i64, @intCast((index + 1) * 11)), try std.fmt.parseInt(i64, row[0].string, 10));
+            try std.testing.expectEqualStrings(row[1].string, row[2].string);
+        }
+        try std.testing.expectEqual(@as(usize, 1), backend.captures);
+        try std.testing.expectEqual(@as(usize, 1), backend.closes);
+        try std.testing.expectEqual(@as(usize, 1), backend.commits);
+        std.debug.print("SQL joined RETURNING: targets={} rows={} checkpoints={} peak_bytes={}\n", .{ count, backend.rows_read, backend.checkpoints, result.peakMemoryBytes() });
+    }
+}
+
+test "SQL joined RETURNING subqueries unwind allocation faults and every cancellation" {
+    const sql = "UPDATE target t SET n=t.n+s.delta,cold='new' FROM source s WHERE t._id=s.id RETURNING t.n,s.delta,(SELECT x.delta FROM source x WHERE x.id=s.id)";
+    const Faults = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var backend: Backend = .{ .returning_mode = true };
+            var compiled = try compiler.compile(a, sql, .{});
+            defer compiled.deinit();
+            var result = runtime.execute(a, backend.backend(), &compiled, &.{}, .{ .page_rows = 1 }) catch |err| {
+                try std.testing.expectEqual(@as(usize, 0), backend.commits);
+                try std.testing.expectEqual(backend.captures, backend.closes);
+                return err;
+            };
+            defer result.deinit();
+            try std.testing.expectEqual(@as(usize, 2), result.output.rows.len);
+            try std.testing.expectEqual(@as(usize, 1), backend.commits);
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Faults.run, .{});
+    var backend: Backend = .{ .returning_mode = true };
+    var compiled = try compiler.compile(std.testing.allocator, sql, .{});
+    defer compiled.deinit();
+    var baseline = try runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{ .page_rows = 1 });
+    defer baseline.deinit();
+    for (1..backend.checkpoints + 1) |point| {
+        var canceled: Backend = .{ .returning_mode = true, .cancel_at = point };
+        try std.testing.expectError(error.Canceled, runtime.execute(std.testing.allocator, canceled.backend(), &compiled, &.{}, .{ .page_rows = 1 }));
+        try std.testing.expectEqual(@as(usize, 0), canceled.commits);
+        try std.testing.expectEqual(canceled.captures, canceled.closes);
+    }
+}
+
+test "SQL joined RETURNING subqueries replay typed arrays and JSON nulls through disk and memory" {
+    const local = @import("antfly_local_sources");
+    for ([_]bool{ false, true }) |disk| for ([_]bool{ false, true }) |document| {
+        var backend: Backend = .{ .arrays = true, .array_first = 3, .array_lower = 3, .returning_mode = true, .document = document };
+        var interface = backend.backend();
+        if (disk) interface.execution_io = std.testing.io;
+        var compiled = try compiler.compile(std.testing.allocator, "UPDATE target t SET a=s.a,cold='new' FROM source s WHERE t.id=s.id RETURNING t.a,t.j,(SELECT s.a),(SELECT x.a FROM source x WHERE x.id=s.id)", .{});
+        defer compiled.deinit();
+        var result = try runtime.execute(std.testing.allocator, interface, &compiled, &.{}, .{ .page_rows = 1, .spill_bytes = 16 << 20, .retained_bytes = 4 << 20 });
+        defer result.deinit();
+        for (result.output.columns, [_]local.sql_array_value.ElementType{ .int64, .jsonb, .int16, .int16 }) |column_, element| {
+            try std.testing.expectEqual(.array, column_.type);
+            try std.testing.expectEqual(element, column_.element_type.?);
+        }
+        for (result.output.rows, result.output.sql_nulls.?) |row, flags| {
+            for (flags) |flag| try std.testing.expect(!flag);
+            for ([_]usize{ 0, 2, 3 }) |index| {
+                var array = try local.sql_array_wire.decode(std.testing.allocator, if (index == 0) .int64 else .int16, row[index], .{});
+                defer array.deinit();
+                try std.testing.expectEqual(@as(i32, 3), array.value.dimensions[0].lower);
+                try std.testing.expectEqual(@as(i64, 3), array.value.elements[0].value.integer);
+                try std.testing.expect(array.value.elements[1].sql_null);
+            }
+            var json = try local.sql_array_wire.decode(std.testing.allocator, .jsonb, row[1], .{});
+            defer json.deinit();
+            try std.testing.expect(!json.value.elements[0].sql_null);
+            try std.testing.expect(json.value.elements[0].value == .null);
+            try std.testing.expect(json.value.elements[1].sql_null);
+        }
+        try std.testing.expectEqual(@as(usize, 1), backend.captures);
+        try std.testing.expectEqual(@as(usize, 1), backend.closes);
+        try std.testing.expectEqual(@as(usize, 1), backend.commits);
+    };
+}
+
+test "SQL joined RETURNING subquery failures preserve atomic publication" {
+    for ([_]struct { expression: []const u8, failure: anyerror }{
+        .{ .expression = "(SELECT x.delta FROM source x)", .failure = error.SqlCardinalityViolation },
+        .{ .expression = "(SELECT 1/(x.delta-x.delta) FROM source x WHERE x.id=s.id)", .failure = error.SqlDivisionByZero },
+        .{ .expression = "(SELECT id)", .failure = error.AmbiguousSqlColumn },
+        .{ .expression = "(SELECT s.absent)", .failure = error.UndefinedColumn },
+        .{ .expression = "row_number() OVER ()+(SELECT s.delta)", .failure = error.UnsupportedSqlShape },
+        .{ .expression = "sum(t.n)+(SELECT s.delta)", .failure = error.UnsupportedSqlShape },
+    }) |case| {
+        const sql = try std.fmt.allocPrint(std.testing.allocator, "UPDATE target t SET n=t.n+s.delta,cold='new' FROM source s WHERE t.id=s.id RETURNING s.delta,{s}", .{case.expression});
+        defer std.testing.allocator.free(sql);
+        var backend: Backend = .{ .arrays = true, .returning_mode = true };
+        var compiled = try compiler.compile(std.testing.allocator, sql, .{});
+        defer compiled.deinit();
+        try std.testing.expectError(case.failure, runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{}));
+        try std.testing.expectEqual(@as(usize, 0), backend.commits);
+        try std.testing.expectEqual(backend.captures, backend.closes);
+    }
+    for ([_]@FieldType(Backend, "prepare_guard"){ .absence, .conflict }) |guard| {
+        var backend: Backend = .{ .returning_mode = true, .prepare_guard = guard };
+        var compiled = try compiler.compile(std.testing.allocator, "DELETE FROM target t USING source s WHERE t._id=s.id RETURNING s.delta,(SELECT s.delta)", .{});
+        defer compiled.deinit();
+        try std.testing.expectError(error.InvalidSqlBackendResponse, runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{}));
+        try std.testing.expectEqual(@as(usize, 0), backend.commits);
+        try std.testing.expectEqual(backend.captures, backend.closes);
+    }
+}
+
+test "SQL joined RETURNING subqueries handle zero width empty targets and coherent fanout" {
+    for ([_]bool{ false, true }) |empty| {
+        var backend: Backend = .{ .returning_mode = true, .empty_target = empty };
+        var compiled = try compiler.compile(std.testing.allocator, "DELETE FROM target t USING source s WHERE t._id=s.id RETURNING (SELECT max(x.delta) FROM source x)", .{});
+        defer compiled.deinit();
+        var result = try runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(@as(u64, if (empty) 0 else 2), result.output.rows_affected);
+        for (result.output.rows) |row| try std.testing.expectEqualStrings("20", row[0].string);
+        try std.testing.expectEqual(@as(usize, if (empty) 0 else 1), backend.commits);
+        try std.testing.expectEqual(@as(usize, 1), backend.captures);
+        try std.testing.expectEqual(backend.captures, backend.closes);
+    }
+    var backend: Backend = .{ .returning_mode = true, .duplicates = true };
+    var compiled = try compiler.compile(std.testing.allocator, "DELETE FROM target t USING source s WHERE t._id=s.id RETURNING s.delta,(SELECT s.delta)", .{});
+    defer compiled.deinit();
+    var result = try runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{ .mutation_rows = 1 });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u64, 1), result.output.rows_affected);
+    try std.testing.expectEqualStrings(result.output.rows[0][0].string, result.output.rows[0][1].string);
+    try std.testing.expectEqual(@as(usize, 1), backend.writes);
+}
+
+test "SQL joined RETURNING subqueries use generated postimages and shared parameter identity" {
+    var backend: Backend = .{ .returning_mode = true, .default_mode = true, .generated_mode = true };
+    var compiled = try compiler.compile(std.testing.allocator, "UPDATE target t SET n=t.n+s.delta+$1,cold=DEFAULT,g=DEFAULT FROM source s WHERE t._id=s.id RETURNING t.g,(SELECT s.delta+t.g+$1)", .{});
+    defer compiled.deinit();
+    var result = try runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{.{ .integer = 1 }}, .{ .page_rows = 1 });
+    defer result.deinit();
+    try std.testing.expectEqualStrings("24", result.output.rows[0][0].string);
+    try std.testing.expectEqualStrings("35", result.output.rows[0][1].string);
+    try std.testing.expectEqualStrings("46", result.output.rows[1][0].string);
+    try std.testing.expectEqualStrings("67", result.output.rows[1][1].string);
+    try std.testing.expectEqual(@as(usize, 1), backend.captures);
+    try std.testing.expectEqual(@as(usize, 1), backend.closes);
+    try std.testing.expectEqual(@as(usize, 1), backend.commits);
+}
+
 test "SQL RETURNING relations share one cut and evaluate prepared postimages before commit" {
     const cases = [_]struct { sql: []const u8, first: []const []const []const u8, nulls: []const bool = &.{ false, false } }{
         .{ .sql = "UPDATE target SET n=n+10,cold='new' RETURNING n,(SELECT delta FROM source WHERE id='a') AS x", .first = &.{ &.{ "11", "10" }, &.{ "12", "10" } } },

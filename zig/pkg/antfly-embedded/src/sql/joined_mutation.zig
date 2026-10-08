@@ -130,6 +130,8 @@ pub const Bound = struct {
     deleting: bool,
     returning: ?[]const ast.Projection,
     returning_plan: ?@import("mutation_returning.zig").Plan = null,
+    returning_binding: ?*const describe.BoundStatement = null,
+    returning_query: ?ast.Select = null,
     returning_scope: []const @import("relation_binding.zig").Column = &.{},
     returning_sources: []const usize = &.{},
     target_qualifier: []const u8 = "",
@@ -223,6 +225,8 @@ pub fn bind(alloc: Allocator, backend: catalog.Backend, table: catalog.Table, co
     // prepared target images; do not silently resolve an ambiguous bare name
     // to the target, or perform another catalog/read capture for this check.
     var returning_plan: ?@import("mutation_returning.zig").Plan = null;
+    var returning_binding: ?*const describe.BoundStatement = null;
+    var returning_query: ?ast.Select = null;
     var scope: []const @import("relation_binding.zig").Column = &.{};
     var captured: std.ArrayList(usize) = .empty;
     if (returning) |projections_| {
@@ -232,17 +236,35 @@ pub fn bind(alloc: Allocator, backend: catalog.Backend, table: catalog.Table, co
             const field: ast.Scalar = .{ .column = projection.field };
             _ = try @import("relation_binding.zig").lowerBoundExpression(alloc, relation.root.columns, projection.expression orelse &field);
         }
-        if (!describe.returningReads(returning)) {
+        {
             scope = relation.root.columns;
             const slots = try alloc.alloc(scalar.Column, scope.len);
             for (scope, slots) |field, *slot| slot.* = .{ .name = field.internal, .type = field.type, .element_type = field.element_type };
-            const plan = try @import("mutation_returning.zig").bind(alloc, backend, scope, slots, projections_, alias, parameters);
             const authorized_scope = scope;
             var required = try alloc.alloc(bool, scope.len);
             @memset(required, false);
-            for (plan.programs) |program| for (program.required_columns) |ordinal| {
-                required[ordinal] = true;
-            };
+            if (!describe.returningReads(returning)) {
+                const plan = try @import("mutation_returning.zig").bind(alloc, backend, scope, slots, projections_, alias, parameters);
+                for (plan.programs) |program| for (program.required_columns) |ordinal| {
+                    required[ordinal] = true;
+                };
+            } else {
+                const relations = @import("relation_binding.zig");
+                const expanded = try relations.expandWildcards(alloc, scope, projections_, alias);
+                const outputs = try alloc.dupe(ast.Projection, expanded);
+                for (outputs) |*projection| if (projection.bound_column) |ordinal| {
+                    const field = scope[ordinal];
+                    projection.field = try std.fmt.allocPrint(alloc, "{s}\x00{s}", .{ field.qualifier, field.name });
+                    projection.bound_column = null;
+                };
+                const prepared_source = try alloc.create(ast.Relation);
+                prepared_source.* = .{ .table = .{ .name = .{ .table = relations.prepared_scope_name }, .prepared_rows = true } };
+                returning_query = .{ .source = prepared_source, .columns = outputs, .ctes = query.ctes };
+                const output = try describe.bindPreparedReturning(alloc, adapter.iface(), returning_query.?, parameters, scope);
+                for (scope, required) |field, *needed| for (output.relation.?.prepared_fields) |name_| {
+                    if (std.mem.eql(u8, name_, field.internal)) needed.* = true;
+                };
+            }
             // Keep execution width proportional to RETURNING dependencies,
             // not to all columns in every authorized joined table. The full
             // scope remains authoritative for ambiguity and wildcard binding.
@@ -256,7 +278,11 @@ pub fn bind(alloc: Allocator, backend: catalog.Backend, table: catalog.Table, co
                 try source_ordinals.append(alloc, ordinal);
             }
             scope = dense_scope.items;
-            returning_plan = try @import("mutation_returning.zig").bind(alloc, backend, authorized_scope, dense_slots.items, projections_, alias, parameters);
+            if (returning_query) |selection| {
+                const output = try alloc.create(describe.BoundStatement);
+                output.* = try describe.bindPreparedReturning(alloc, adapter.iface(), selection, parameters, scope);
+                returning_binding = output;
+            } else returning_plan = try @import("mutation_returning.zig").bind(alloc, backend, authorized_scope, dense_slots.items, projections_, alias, parameters);
             required = try alloc.alloc(bool, scope.len);
             @memset(required, true);
             if (deleting) {
@@ -305,7 +331,7 @@ pub fn bind(alloc: Allocator, backend: catalog.Backend, table: catalog.Table, co
             input.parameter_types = parameters;
         }
     }
-    return .{ .input = input, .query = query, .fields = fields.items, .preserve = preserve.items, .default_paths = default_paths.items, .deleting = deleting, .returning = returning, .returning_plan = returning_plan, .returning_scope = scope, .returning_sources = captured.items, .target_qualifier = alias };
+    return .{ .input = input, .query = query, .fields = fields.items, .preserve = preserve.items, .default_paths = default_paths.items, .deleting = deleting, .returning = returning, .returning_plan = returning_plan, .returning_binding = returning_binding, .returning_query = returning_query, .returning_scope = scope, .returning_sources = captured.items, .target_qualifier = alias };
 }
 
 fn equalityConjuncts(alloc: Allocator, expression: *const ast.Scalar) anyerror!?*const ast.Scalar {
@@ -459,6 +485,16 @@ pub fn execute(execution: anytype, definition_: Bound) !runtime.Output {
     // result per match. Only required source RETURNING cells enter the bounded
     // typed capture; no per-row JSON compatibility representation is retained.
     try read.selectInto(definition_.query, .{ .ptr = &collector, .append = Collector.append });
+    if (definition_.returning_binding) |binding| {
+        const output = try relationalReturningOutput(execution, definition_, pending_mutations.items, sources);
+        if (sources) |capture| capture.close();
+        sources_live = false;
+        var committed = try execution.commitPreparedMutations(target, output.prepared, if (definition_.deleting) "DELETE" else "UPDATE");
+        committed.columns = binding.columns;
+        committed.rows = output.rows;
+        committed.sql_nulls = output.nulls;
+        return committed;
+    }
     if (definition_.returning_plan) |plan| {
         const output = try returningOutput(execution, definition_, plan, pending_mutations.items, sources);
         if (sources) |capture| capture.close();
@@ -473,6 +509,53 @@ pub fn execute(execution: anytype, definition_: Bound) !runtime.Output {
 }
 
 const ReturningOutput = struct { prepared: []const catalog.Mutation, rows: []const []const std.json.Value, nulls: []const []const bool };
+
+fn relationalReturningOutput(context: runtime.Context, bound: Bound, input: []const catalog.Mutation, sources: ?*@import("result_cursor.zig").Cursor) !ReturningOutput {
+    if (input.len > context.limits.result_rows) return error.SqlResultTooLarge;
+    const prepared = if (input.len == 0) input else try (context.backend.vtable.prepare_mutations orelse return error.UnsupportedSqlExecution)(context.backend.ptr, context.arena, context.binding.table.?, input);
+    if (prepared.len != input.len) return error.InvalidSqlBackendResponse;
+    const names = try context.arena.alloc([]const u8, bound.returning_scope.len);
+    var fields: std.ArrayList([]const u8) = .empty;
+    for (bound.returning_scope, names) |field, *name| {
+        name.* = field.internal;
+        if (std.mem.eql(u8, field.qualifier, bound.target_qualifier)) try fields.append(context.arena, field.name);
+    }
+    const images = try runtime.Context.ReturningImages.init(context.arena, context.binding.table.?, fields.items);
+    const layout = try catalog.Row.TypedLayout.init(context.arena, names);
+    const Cursor = @import("result_cursor.zig").Cursor;
+    const rows = if (context.spill) |manager| try Cursor.create(context.alloc, manager, names.len) else try Cursor.createMemory(context.alloc, names.len, context.limits.retained_bytes / 2);
+    defer rows.close();
+    const reader = if (sources) |capture| try capture.openReplayReader() else null;
+    defer if (reader) |cursor| cursor.close();
+    var scratch = std.heap.ArenaAllocator.init(context.alloc);
+    defer scratch.deinit();
+    for (prepared, input) |mutation, original| {
+        try context.checkpoint();
+        _ = scratch.reset(.retain_capacity);
+        const a = scratch.allocator();
+        const image = try images.row(a, mutation, original);
+        const cells = try a.alloc(scalar.Datum, names.len);
+        @memset(cells, .{});
+        if (reader) |cursor| {
+            const source = (try cursor.next()) orelse return error.InvalidSqlBackendResponse;
+            if (source.len != bound.returning_sources.len) return error.InvalidSqlBackendResponse;
+            for (source, bound.returning_sources) |value, ordinal| cells[ordinal] = value;
+        }
+        for (bound.returning_scope, cells) |field, *datum| if (std.mem.eql(u8, field.qualifier, bound.target_qualifier)) {
+            datum.* = try image.cell(field.name);
+        };
+        try Cursor.append(rows, cells);
+    }
+    if (reader) |cursor| if (cursor.index != input.len or cursor.owner.count() != input.len) return error.InvalidSqlBackendResponse;
+    var output_context = context;
+    output_context.binding = bound.returning_binding.?.*;
+    output_context.returning_cursor = rows;
+    output_context.returning_layout = layout;
+    output_context.sink = null;
+    const output = if (input.len == 0) runtime.Output{ .columns = output_context.binding.columns, .rows = &.{}, .sql_nulls = &.{}, .command_tag = "SELECT" } else try output_context.select(bound.returning_query.?);
+    if (output.rows.len != input.len) return error.InvalidSqlBackendResponse;
+    return .{ .prepared = prepared, .rows = output.rows, .nulls = output.sql_nulls orelse return error.InvalidSqlBackendResponse };
+}
 
 fn returningOutput(context: runtime.Context, bound: Bound, plan: @import("mutation_returning.zig").Plan, input: []const catalog.Mutation, sources: ?*@import("result_cursor.zig").Cursor) !ReturningOutput {
     if (input.len > context.limits.result_rows) return error.SqlResultTooLarge;

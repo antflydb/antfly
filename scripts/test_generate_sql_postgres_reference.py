@@ -506,6 +506,114 @@ class PostgresReferenceTest(unittest.TestCase):
                     2, self.db.execute("SELECT count(*) FROM source").fetchone()[0]
                 )
 
+    def test_joined_returning_subqueries_share_target_and_source_scope(self):
+        import json
+        from generate_sql_postgres_reference import execute
+
+        fixture = json.loads(
+            (FIXTURES / "sql_joined_returning_subquery_reference.json").read_text()
+        )
+        for entry in fixture["entries"]:
+            with (
+                self.subTest(sql=entry["sql"]),
+                self.db.transaction(force_rollback=True),
+            ):
+                self.db.execute("CREATE TABLE target(id text,n bigint,cold text)")
+                self.db.execute("CREATE TABLE source(id text,delta bigint)")
+                self.db.execute("INSERT INTO target VALUES ('a',1,'old'),('b',2,'old')")
+                self.db.execute("INSERT INTO source VALUES ('a',10),('b',20)")
+                result = execute(
+                    self.db,
+                    {
+                        "id": "joined-returning-subquery",
+                        "sql": entry["sql"],
+                        "params": [],
+                    },
+                )
+                self.assertEqual(
+                    [
+                        [None if value is None else int(value) for value in row]
+                        for row in entry["rows"]
+                    ],
+                    result["rows"],
+                )
+                self.assertEqual(2, result["affected"])
+                self.assertEqual([20, 20, 20], result["column_oids"])
+                self.assertEqual(["n", "delta", "d"], result["columns"])
+                self.assertEqual(
+                    [[value is None for value in row] for row in entry["rows"]],
+                    result["sql_nulls"],
+                )
+                self.assertEqual(
+                    []
+                    if entry["sql"].startswith("DELETE")
+                    else [(11, "new"), (22, "new")],
+                    self.db.execute("SELECT n,cold FROM target ORDER BY id").fetchall(),
+                )
+                self.assertEqual(
+                    [("a", 10), ("b", 20)],
+                    self.db.execute("SELECT * FROM source ORDER BY id").fetchall(),
+                )
+
+    def test_joined_returning_subqueries_preserve_array_and_null_domains(self):
+        from generate_sql_postgres_reference import execute
+
+        with self.db.transaction(force_rollback=True):
+            self.db.execute(
+                "CREATE TABLE target(id text,a bigint[],j jsonb[],cold text)"
+            )
+            self.db.execute("CREATE TABLE source(id text,a smallint[])")
+            self.db.execute(
+                "INSERT INTO target VALUES ('a',ARRAY[1::bigint],ARRAY['null'::jsonb,NULL],'old')"
+            )
+            self.db.execute("INSERT INTO source VALUES ('a','[3:4]={3,NULL}')")
+            result = execute(
+                self.db,
+                {
+                    "id": "joined-returning-array-subquery",
+                    "sql": "UPDATE target t SET a=s.a,cold='new' FROM source s WHERE t.id=s.id RETURNING t.a,t.j,(SELECT s.a),(SELECT x.a FROM source x WHERE x.id=s.id)",
+                    "params": [],
+                },
+            )
+            self.assertEqual([1016, 3807, 1005, 1005], result["column_oids"])
+            self.assertEqual([[False] * 4], result["sql_nulls"])
+            row = result["rows"][0]
+            for index in (0, 2, 3):
+                self.assertEqual(
+                    {
+                        "dimensions": [{"length": 2, "lower_bound": 3}],
+                        "values": ["3", None],
+                        "sql_nulls": [False, True],
+                    },
+                    row[index],
+                )
+            self.assertEqual([None, None], row[1]["values"])
+            self.assertEqual([False, True], row[1]["sql_nulls"])
+
+    def test_joined_returning_rejects_top_level_phase_functions(self):
+        import psycopg
+
+        with self.db.transaction(force_rollback=True):
+            self.db.execute("CREATE TABLE target(id text,n bigint)")
+            self.db.execute("CREATE TABLE source(id text,delta bigint)")
+            self.db.execute("INSERT INTO target VALUES ('a',1)")
+            self.db.execute("INSERT INTO source VALUES ('a',10)")
+            for expression, sqlstate in (
+                ("row_number() OVER ()+(SELECT s.delta)", "42P20"),
+                ("sum(t.n)+(SELECT s.delta)", "42803"),
+            ):
+                with self.subTest(expression=expression):
+                    with self.assertRaises(psycopg.Error) as caught:
+                        with self.db.transaction():
+                            self.db.execute(
+                                "UPDATE target t SET n=s.delta FROM source s WHERE t.id=s.id RETURNING "
+                                + expression
+                            )
+                    self.assertEqual(sqlstate, caught.exception.sqlstate)
+                    self.assertEqual(
+                        [(1,)], self.db.execute("SELECT n FROM target").fetchall()
+                    )
+
     def test_update_from_fanout_selects_one_coherent_source_match(self):
         from generate_sql_postgres_reference import execute
 

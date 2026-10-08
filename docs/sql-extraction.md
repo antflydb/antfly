@@ -4414,10 +4414,29 @@ UPDATE FROM and DELETE USING select one coherent matched source row per target
 before affected-row admission, rather than rejecting PostgreSQL's legal UPDATE
 fanout or returning columns from different matches. This does not promise which
 matching row is chosen; MERGE retains its independent cardinality contract.
-Target-only relational RETURNING subqueries retain their existing path; broader
-source-aware/correlated RETURNING subqueries still need implementation and
-original-case evidence. No original corpus disposition is credited solely for
-these component fixtures.
+Source-aware RETURNING subqueries use the ordinary relational planner over a
+compiler-owned prepared input. Its lexical scope retains the original target
+and source qualifiers; dependency analysis prunes that input before capture.
+Target fields come from normalized native images and source fields from the
+same coherent joined representative, with typed, spill-capable replay. Child
+physical scans join the mutation's single statement capture, never a new
+post-write snapshot. RETURNING errors and cancellation precede publication.
+The shared PostgreSQL oracle verifies nine scalar statements plus typed-array
+correlation, including CTE/derived sources, dead branches and empty scalar
+results. Native component tests additionally cover every allocation failure and
+checkpoint cancellation, normalization guard tampering, generated postimages,
+shared parameters, zero-width prepared rows, fanout and disk-backed replay.
+With 128 cold source columns, 128/512/1,024 targets read exactly 384/1,536/3,072
+physical rows through one capture. Checkpoints were 2,280/8,906/17,739 and peak
+statement bytes 4,946,138/7,131,447/8,489,103 in the local debug fixture. These
+measure bounded scan/planner work, not production latency or throughput.
+The complete SQL build passes 509 local-owner tests and 219 server-owner tests
+(three existing benchmark skips), and all 102 PostgreSQL oracle regressions
+pass. The pull-stream allocation-fault regression uses the shared stable
+allocate/copy/free harness so address-dependent remap decisions cannot change
+the enumerated allocation count; injected failures and leak checks remain active.
+Original-case evidence is still required: no original corpus disposition is
+credited solely for these component fixtures.
 
 ### Durable DDL expression schema identities
 

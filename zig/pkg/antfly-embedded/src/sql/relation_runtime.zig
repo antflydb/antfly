@@ -806,7 +806,7 @@ fn Engine(comptime Context: type) type {
                 .scan => |scan| self.cursors[scan.index].estimated_rows,
                 .singleton => 1,
                 .literal_rows => |rows| rows.len,
-                .prepared_rows => self.context.returning_rows.len,
+                .prepared_rows => if (self.context.returning_cursor) |cursor| cursor.count() else self.context.returning_rows.len,
                 .query => |query| blk: {
                     const source = self.estimate(query.source);
                     if (query.statement.limit) |limit| {
@@ -870,6 +870,7 @@ fn Engine(comptime Context: type) type {
             unmatched_index: usize = 0,
             output_index: usize = 0,
             result_cursor: ?*@import("result_cursor.zig").Cursor = null,
+            prepared_reader: ?*@import("result_cursor.zig").Cursor.ReplayReader = null,
             query_fields: ?[]const []const u8 = null,
             query_skip: usize = 0,
             query_remaining: usize = 0,
@@ -933,6 +934,7 @@ fn Engine(comptime Context: type) type {
                 return self;
             }
             pub fn deinit(self: *Iterator) void {
+                if (self.prepared_reader) |reader| reader.close();
                 if (self.cached_reader) |reader| reader.close();
                 if (self.result_cursor) |cursor| cursor.close();
                 if (self.page) |page| page.deinit();
@@ -1074,6 +1076,19 @@ fn Engine(comptime Context: type) type {
                         break :blk values;
                     },
                     .prepared_rows => |names| blk: {
+                        if (self.engine.context.returning_cursor) |cursor| {
+                            if (self.prepared_reader == null) self.prepared_reader = try cursor.openReplayReader();
+                            const row = (try self.prepared_reader.?.next()) orelse break :blk null;
+                            const layout = self.engine.context.returning_layout orelse return error.InvalidSqlBackendResponse;
+                            const values = try alloc.alloc(Datum, self.node.columns.len);
+                            for (names, self.node.columns, values) |name, column, *out| {
+                                const ordinal = layout.ordinals.get(name) orelse return error.InvalidSqlBackendResponse;
+                                if (ordinal >= row.len) return error.InvalidSqlBackendResponse;
+                                out.* = try operators.cloneDatum(alloc, try describe.coerceDatum(alloc, row[ordinal], column.type, column.element_type));
+                            }
+                            self.output_index += 1;
+                            break :blk values;
+                        }
                         if (self.output_index == self.engine.context.returning_rows.len) break :blk null;
                         const row = self.engine.context.returning_rows[self.output_index];
                         self.output_index += 1;

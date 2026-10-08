@@ -210,6 +210,8 @@ pub const Context = struct {
     typed_output: bool = false,
     statement_capture: ?*@import("mutation_capture.zig") = null,
     returning_rows: []const catalog.Row = &.{},
+    returning_cursor: ?*@import("result_cursor.zig").Cursor = null,
+    returning_layout: ?catalog.Row.TypedLayout = null,
     /// Typed values borrowed from the active Apply frame, not from input rows.
     /// Their lifetime covers this invocation, including empty global grouping.
     invocation_constants: []const Datum = &.{},
