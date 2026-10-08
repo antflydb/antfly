@@ -11,6 +11,10 @@ pub const Entry = struct {
     doc_num: u32,
     score: f32,
     pub fn worse(_: void, a: @This(), b: @This()) std.math.Order {
+        // Keep the comparator total even for callers outside collect. Scoring
+        // rejects nonfinite values before ranking; NaNs sort below real scores.
+        if (std.math.isNan(a.score)) return if (std.math.isNan(b.score)) std.math.order(b.doc_num, a.doc_num) else .lt;
+        if (std.math.isNan(b.score)) return .gt;
         const order = std.math.order(a.score, b.score);
         return if (order == .eq) std.math.order(b.doc_num, a.doc_num) else order;
     }
@@ -18,7 +22,12 @@ pub const Entry = struct {
         return worse({}, a, b) == .gt;
     }
 };
-pub const Stats = struct { scored: usize = 0, skipped_blocks: usize = 0 };
+pub fn addScore(left: f32, right: f32) !f32 {
+    const result = left + right;
+    if (!std.math.isFinite(right) or !std.math.isFinite(result)) return error.SparseScoreOverflow;
+    return result;
+}
+pub const Stats = struct { scored: usize = 0, skipped_blocks: usize = 0, skipped_prefixes: usize = 0 };
 pub const BlockReader = struct {
     ptr: *anyopaque,
     resident: *usize,
@@ -29,6 +38,7 @@ pub const Stream = struct {
     allocator: ?A = null,
     owned: ?[]u8 = null,
     term: u32 = 0,
+    query_order: usize = 0,
     seek_target: u64 = 0,
     segment: ?u64 = null,
     version: u32 = 1,
@@ -176,6 +186,8 @@ pub fn collect(a: A, streams: []Stream, k: usize, context: anytype, stats: *Stat
         if (stream.doc != null) try queue.push(a, i);
     }
     var next_bounds: u64 = 0;
+    var prefix_end: u64 = 0;
+    var prefix_upper: f32 = 0;
     while (queue.peek()) |first| {
         try context.check();
         const doc = streams[first].doc.?;
@@ -214,13 +226,39 @@ pub fn collect(a: A, streams: []Stream, k: usize, context: anytype, stats: *Stat
                 continue;
             }
         }
+        if (winners.items.len == k) {
+            // Terms with a later next document cannot contribute in this lead
+            // range. Current bounds expire at the earliest block end. Strict
+            // pruning and canonical f32 addition preserve signed scores/ties.
+            // Cache until a term starts contributing or a block bound expires;
+            // dense ranges do not pay an all-stream traversal per document.
+            if (doc >= prefix_end) {
+                prefix_upper = 0;
+                prefix_end = @as(u64, std.math.maxInt(u32)) + 1;
+                for (streams) |stream| if (stream.doc) |next| {
+                    prefix_end = @min(prefix_end, @as(u64, stream.last) + 1);
+                    if (next <= doc) prefix_upper += stream.upper else prefix_end = @min(prefix_end, next);
+                };
+            }
+            if (std.math.isFinite(prefix_upper) and prefix_upper < winners.peek().?.score) {
+                while (queue.peek()) |i| {
+                    if (streams[i].doc.? != doc) break;
+                    _ = queue.pop();
+                    try context.check();
+                    try streams[i].seek(prefix_end);
+                    if (streams[i].doc != null) try queue.push(a, i);
+                }
+                stats.skipped_prefixes += 1;
+                continue;
+            }
+        }
         var score: f32 = 0;
         var matched = false;
         while (queue.peek()) |i| {
             if (streams[i].doc.? != doc) break;
             _ = queue.pop();
             if (try context.allows(streams[i], doc)) {
-                score += streams[i].contribution();
+                score = try addScore(score, streams[i].contribution());
                 matched = true;
             }
             try streams[i].advance();
@@ -341,4 +379,98 @@ test "sparse document scoring preserves source addition order and bitmap block r
     try std.testing.expectEqual(@as(usize, 0), empty.len);
     try std.testing.expectEqual(@as(usize, 3), stats.skipped_blocks);
     try std.testing.expectEqual(@as(usize, 0), stats.scored);
+}
+
+test "finite sparse weights fail with controlled overflow before ranking" {
+    var chunks: [2][23]u8 = @splat(@splat(0));
+    for (&chunks, [_]f32{ 1e20, -1e20 }) |*bytes, weight| {
+        bytes[0] = 1;
+        std.mem.writeInt(u32, bytes[1..5], 2, .little);
+        std.mem.writeInt(u32, bytes[5..9], @bitCast(weight), .little);
+        std.mem.writeInt(u32, bytes[9..13], @bitCast(weight), .little);
+        std.mem.writeInt(u32, bytes[17..21], 1, .little);
+    }
+    const Context = struct {
+        pub fn check(_: *@This()) !void {}
+        pub fn allows(_: *@This(), _: Stream, _: u32) !bool {
+            return true;
+        }
+    };
+    var context: Context = .{};
+    var streams = [_]Stream{ .{ .weight = 1e20, .single = &chunks[0] }, .{ .weight = 1e20, .single = &chunks[1] } };
+    var stats: Stats = .{};
+    try std.testing.expectError(error.SparseScoreOverflow, collect(std.testing.allocator, &streams, 2, &context, &stats));
+    try std.testing.expectError(error.SparseScoreOverflow, addScore(3e38, 3e38));
+    try std.testing.expectEqual(std.math.Order.lt, Entry.worse({}, .{ .doc_num = 0, .score = std.math.nan(f32) }, .{ .doc_num = 1, .score = 0 }));
+}
+
+test "sparse block prefix pivots skip low lead ranges before later high terms" {
+    var first: [13 + 100 * 5]u8 = @splat(0);
+    var second: [23]u8 = @splat(0);
+    first[0] = 1;
+    second[0] = 1;
+    std.mem.writeInt(u32, first[1..5], 100, .little);
+    std.mem.writeInt(u32, first[5..9], @bitCast(@as(f32, 100)), .little);
+    std.mem.writeInt(u32, first[9..13], @bitCast(@as(f32, 1)), .little);
+    for (1..100) |i| std.mem.writeInt(u32, first[13 + i * 4 ..][0..4], 1, .little);
+    first[413] = 255;
+    std.mem.writeInt(u32, second[1..5], 2, .little);
+    std.mem.writeInt(u32, second[5..9], @bitCast(@as(f32, 1000)), .little);
+    std.mem.writeInt(u32, second[9..13], @bitCast(@as(f32, 1000)), .little);
+    std.mem.writeInt(u32, second[17..21], 100, .little);
+    const Context = struct {
+        pub fn check(_: *@This()) !void {}
+        pub fn allows(_: *@This(), _: Stream, _: u32) !bool {
+            return true;
+        }
+    };
+    var context: Context = .{};
+    var streams = [_]Stream{ .{ .weight = 1, .single = &first }, .{ .weight = 1, .single = &second } };
+    var stats: Stats = .{};
+    const result = try collect(std.testing.allocator, &streams, 1, &context, &stats);
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqual(@as(u32, 0), result[0].doc_num);
+    try std.testing.expectEqual(@as(f32, 1100), result[0].score);
+    try std.testing.expectEqual(@as(usize, 1), stats.scored);
+    try std.testing.expectEqual(@as(usize, 1), stats.skipped_prefixes);
+}
+
+test "sparse block prefix pivots match exhaustive signed f32 scores across randomized streams" {
+    const a = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x9661017);
+    const random = prng.random();
+    const Context = struct {
+        pub fn check(_: *@This()) !void {}
+        pub fn allows(_: *@This(), _: Stream, doc: u32) !bool {
+            return doc % 13 != 0;
+        }
+    };
+    var context: Context = .{};
+    const scales = [_]f32{ 0, 1, -1, 1.25, -9, 16777216, -16777216 };
+    for (0..100) |_| {
+        var chunks: [8][13 + 64 * 5]u8 = @splat(@splat(0));
+        var weights: [8]f32 = undefined;
+        for (&chunks, &weights, 0..) |*bytes, *weight, term| {
+            bytes[0] = 1;
+            std.mem.writeInt(u32, bytes[1..5], 64, .little);
+            std.mem.writeInt(u32, bytes[5..9], @bitCast(@as(f32, 10)), .little);
+            std.mem.writeInt(u32, bytes[9..13], @bitCast(@as(f32, -10)), .little);
+            std.mem.writeInt(u32, bytes[13..17], @intCast(term % 4), .little);
+            for (1..64) |i| std.mem.writeInt(u32, bytes[13 + i * 4 ..][0..4], 4, .little);
+            random.bytes(bytes[269..]);
+            weight.* = scales[random.uintLessThan(usize, scales.len)];
+        }
+        var streams: [8]Stream = undefined;
+        for (&streams, &chunks, weights) |*stream, *bytes, weight| stream.* = .{ .weight = weight, .single = bytes };
+        var stats: Stats = .{};
+        const all = try collect(a, &streams, 256, &context, &stats);
+        defer a.free(all);
+        for (&streams, &chunks, weights) |*stream, *bytes, weight| stream.* = .{ .weight = weight, .single = bytes };
+        const top = try collect(a, &streams, 3, &context, &stats);
+        defer a.free(top);
+        for (top, all[0..top.len]) |actual, expected| {
+            try std.testing.expectEqual(expected.doc_num, actual.doc_num);
+            try std.testing.expectEqual(expected.score, actual.score);
+        }
+    }
 }

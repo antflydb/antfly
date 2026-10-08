@@ -2,14 +2,59 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Immutable posting blocks addressed by segment, term and final ordinal.
-//! Roots retain the legacy term directory; maintenance reconstructs legacy
-//! bytes, while query cursors seek blocks without pinning whole segment values.
+//! Roots retain the legacy term directory. Queries seek posting blocks and
+//! native maintenance merges streams into spooled copy-on-write output.
 const std = @import("std");
 const daat = @import("daat.zig");
 const A = std.mem.Allocator;
 const magic = "ASPSPG01";
 const legacy_magic = "ASPSSEG1";
 const tag: u8 = 0x0d;
+pub const route_tag: u8 = 0x0e;
+const route_ready = [_]u8{0x0f};
+pub fn routeKey(term: u32, id: u64) [13]u8 {
+    var bytes: [13]u8 = undefined;
+    bytes[0] = route_tag;
+    std.mem.writeInt(u32, bytes[1..5], term, .big);
+    std.mem.writeInt(u64, bytes[5..13], id, .big);
+    return bytes;
+}
+pub fn routed(txn: anytype) !bool {
+    const bytes = txn.get(&route_ready) catch |err| switch (err) {
+        error.NotFound => return false,
+        else => return err,
+    };
+    return std.mem.eql(u8, bytes, &.{1});
+}
+fn route(txn: anytype, id: u64, root: []const u8) !void {
+    const dir = try directory(root);
+    var at: usize = 0;
+    while (at < dir.len) : (at += 20) try txn.put(&routeKey(std.mem.readInt(u32, dir[at..][0..4], .little), id), &.{});
+}
+/// Older snapshots keep the discovery fallback until the first publication
+/// builds a complete directory. Routes and the coverage fence commit together.
+pub fn ensureRoutes(a: A, txn: anytype) !void {
+    if (try routed(txn)) return;
+    var lower: [9]u8 = @splat(0);
+    lower[0] = 0x03;
+    while (true) {
+        var id: u64 = undefined;
+        const root = blk: {
+            var cursor = try txn.openCursor();
+            defer cursor.close();
+            const entry = (try cursor.seekAtOrAfter(&lower)) orelse break;
+            if (entry.key.len == 0 or entry.key[0] != 0x03) break;
+            if (entry.key.len != 9) return error.InvalidSparseSegment;
+            id = std.mem.readInt(u64, entry.key[1..9], .big);
+            break :blk try a.dupe(u8, entry.value);
+        };
+        defer a.free(root);
+        try route(txn, id, root);
+        if (id == std.math.maxInt(u64)) break;
+        std.mem.writeInt(u64, lower[1..9], id + 1, .big);
+    }
+    try txn.put(&route_ready, &.{1});
+}
 pub const max_block_bytes = 1024 * 1024;
 pub fn paged(root: []const u8) bool {
     return root.len >= 16 and std.mem.eql(u8, root[0..8], magic);
@@ -52,6 +97,7 @@ pub fn key(id: u64, term: u32, last: u32) [17]u8 {
     return result;
 }
 pub fn publish(a: A, txn: anytype, id: u64, legacy: []const u8) ![]u8 {
+    try ensureRoutes(a, txn);
     const dir = try directory(legacy);
     var position: usize = 0;
     var first_ordinal: ?u32 = null;
@@ -97,6 +143,8 @@ pub fn publish(a: A, txn: anytype, id: u64, legacy: []const u8) ![]u8 {
         std.mem.writeInt(u32, tail[4..8], first, .little);
         std.mem.writeInt(u32, tail[8..12], last_ordinal, .little);
     }
+    errdefer a.free(root);
+    try route(txn, id, root);
     return root;
 }
 pub fn materializedSize(root: []const u8) !usize {
@@ -129,6 +177,24 @@ pub fn materialize(a: A, txn: anytype, id: u64, root: []const u8) ![]u8 {
     return result;
 }
 pub fn remove(txn: anytype, id: u64) !void {
+    var root_key: [9]u8 = undefined;
+    root_key[0] = 0x03;
+    std.mem.writeInt(u64, root_key[1..9], id, .big);
+    if (txn.get(&root_key)) |root| {
+        const length = (try directory(root)).len;
+        var at: usize = 0;
+        while (at < length) : (at += 20) {
+            const dir = try directory(try txn.get(&root_key));
+            const term = std.mem.readInt(u32, dir[at..][0..4], .little);
+            txn.delete(&routeKey(term, id)) catch |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            };
+        }
+    } else |err| switch (err) {
+        error.NotFound => {},
+        else => return err,
+    }
     const prefix = key(id, 0, 0);
     while (true) {
         var keys: [128][17]u8 = undefined;
@@ -153,19 +219,69 @@ pub fn remove(txn: anytype, id: u64) !void {
 }
 pub fn Reader(comptime Txn: type) type {
     return struct {
+        const Cursor = @typeInfo(@TypeOf(@as(*Txn, undefined).openCursor())).error_union.payload;
+        const scheduler = @import("../sql/parallel_scheduler.zig");
+        const Warm = struct {
+            snapshot: ?Txn = null,
+            id: u64 = 0,
+            term: u32 = 0,
+            lower: u32 = 0,
+            task: ?scheduler.Task(anyerror!void) = null,
+            fn run(self: *@This()) anyerror!void {
+                var cursor = try self.snapshot.?.openCursor();
+                defer cursor.close();
+                const seek = key(self.id, self.term, self.lower);
+                // The fork has independent scratch and pins the exact query
+                // snapshot. Loading this cursor entry warms native read caches.
+                _ = try cursor.seekAtOrAfter(&seek);
+            }
+            fn retire(self: *@This(), io: std.Io) void {
+                if (self.task) |*task| task.cancel(io) catch {};
+                if (comptime @hasDecl(Txn, "forkRead")) {
+                    if (self.snapshot) |*snapshot| snapshot.abort();
+                }
+                self.* = .{};
+            }
+        };
+        cursor: ?Cursor = null,
+        io: ?std.Io = null,
+        warming: [8]Warm = @splat(.{}),
         txn: *Txn,
         resident: usize = 0,
         budget: usize = 64 * 1024 * 1024,
         blocks: usize = 0,
         bytes: usize = 0,
+        pub fn deinit(self: *@This()) void {
+            if (self.io) |io| for (&self.warming) |*warm| warm.retire(io);
+            if (self.cursor) |*cursor| cursor.close();
+            self.cursor = null;
+        }
+        fn prefetch(self: *@This(), id: u64, term: u32, last: u32) void {
+            if (comptime !@hasDecl(Txn, "forkRead")) return;
+            const io = self.io orelse return;
+            if (last == std.math.maxInt(u32) or self.blocks < 2) return;
+            for (&self.warming) |*warm| {
+                if (warm.task) |*task| {
+                    if (!task.isComplete()) continue;
+                    warm.retire(io);
+                }
+                warm.snapshot = self.txn.forkRead() catch return;
+                warm.id = id;
+                warm.term = term;
+                warm.lower = last + 1;
+                warm.task = scheduler.global().submitTransient(io, max_block_bytes, Warm.run, .{warm});
+                if (warm.task == null) warm.retire(io);
+                return;
+            }
+        }
         pub fn interface(self: *@This()) daat.BlockReader {
             return .{ .ptr = self, .read = read, .resident = &self.resident };
         }
         fn read(raw: *anyopaque, a: A, id: u64, term: u32, lower: u64) !?[]u8 {
             const self: *@This() = @ptrCast(@alignCast(raw));
             if (lower > std.math.maxInt(u32)) return null;
-            var cursor = try self.txn.openCursor();
-            defer cursor.close();
+            if (self.cursor == null) self.cursor = try self.txn.openCursor();
+            const cursor = &self.cursor.?;
             const seek = key(id, term, @intCast(lower));
             const entry = (try cursor.seekAtOrAfter(&seek)) orelse return null;
             if (entry.key.len != 17 or !std.mem.eql(u8, entry.key[0..13], seek[0..13])) return null;
@@ -174,6 +290,7 @@ pub fn Reader(comptime Txn: type) type {
             self.resident += bytes.len;
             self.blocks += 1;
             self.bytes += bytes.len;
+            self.prefetch(id, term, std.mem.readInt(u32, entry.key[13..17], .big));
             return bytes;
         }
     };
@@ -204,6 +321,10 @@ test "paged posting codec seeks one block bounds memory and reclaims every page 
             }
             self.entries.deinit(self.a);
         }
+        fn get(self: *@This(), k: []const u8) anyerror![]const u8 {
+            for (self.entries.items) |entry| if (std.mem.eql(u8, entry.key, k)) return entry.value;
+            return error.NotFound;
+        }
         fn put(self: *@This(), k: []const u8, value: []const u8) !void {
             const owned_key = try self.a.dupe(u8, k);
             errdefer self.a.free(owned_key);
@@ -216,7 +337,7 @@ test "paged posting codec seeks one block bounds memory and reclaims every page 
                 }
             }.less);
         }
-        fn delete(self: *@This(), k: []const u8) !void {
+        fn delete(self: *@This(), k: []const u8) anyerror!void {
             for (self.entries.items, 0..) |entry, i| if (std.mem.eql(u8, entry.key, k)) {
                 self.a.free(entry.key);
                 self.a.free(entry.value);
@@ -280,6 +401,7 @@ test "paged posting codec seeks one block bounds memory and reclaims every page 
             defer a.free(restored);
             try std.testing.expectEqualSlices(u8, &legacy, restored);
             var reader: Reader(FakeTxn) = .{ .txn = &txn, .budget = 64 };
+            defer reader.deinit();
             var stream: daat.Stream = .{ .weight = 1, .segment = 42, .term = 7, .reader = reader.interface(), .allocator = a };
             defer stream.deinit();
             try stream.seek(4);
@@ -294,10 +416,118 @@ test "paged posting codec seeks one block bounds memory and reclaims every page 
             reader.budget = 1;
             try std.testing.expectError(error.ResourceBudgetExceeded, stream.seek(0));
             try std.testing.expectEqual(@as(usize, 0), reader.resident);
+            var root_key: [9]u8 = @splat(0);
+            root_key[0] = 0x03;
+            std.mem.writeInt(u64, root_key[1..9], 42, .big);
+            try txn.put(&root_key, root);
+            try std.testing.expect(try routed(&txn));
+            _ = try txn.get(&routeKey(7, 42));
             try remove(&txn, 42);
-            try std.testing.expectEqual(@as(usize, 0), txn.entries.items.len);
+            try std.testing.expectError(error.NotFound, txn.get(&routeKey(7, 42)));
+            try txn.delete(&root_key);
+            try std.testing.expectEqual(@as(usize, 1), txn.entries.items.len);
         }
     };
     try Probe.run(std.testing.allocator);
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{});
+}
+
+/// Incremental compaction output. Native owners spool blocks into a private,
+/// capacity-accounted run; only the term directory remains in memory.
+pub const Builder = struct {
+    pub const Run = @import("../postings_run.zig").Run;
+    a: A,
+    run: ?*Run = null,
+    payload: std.ArrayList(u8) = .empty,
+    dir: std.ArrayList(u8) = .empty,
+    current: ?u32 = null,
+    term_start: u64 = 0,
+    total: u64 = 0,
+    chunks: u32 = 0,
+    first: ?u32 = null,
+    last: u32 = 0,
+    pub fn init(a: A, scratch: ?@import("../spill_sort.zig").Options) !Builder {
+        return .{ .a = a, .run = if (scratch) |options| try Run.createWithResources(a, options.io, options.directory, options.resource_manager) else null };
+    }
+    pub fn deinit(self: *Builder) void {
+        if (self.run) |run| run.deinit();
+        self.payload.deinit(self.a);
+        self.dir.deinit(self.a);
+    }
+    fn finishTerm(self: *Builder) !void {
+        const term = self.current orelse return;
+        var entry: [20]u8 = undefined;
+        std.mem.writeInt(u32, entry[0..4], term, .little);
+        std.mem.writeInt(u32, entry[4..8], self.chunks, .little);
+        std.mem.writeInt(u64, entry[8..16], self.term_start, .little);
+        std.mem.writeInt(u32, entry[16..20], std.math.cast(u32, self.total - self.term_start) orelse return error.ResourceBudgetExceeded, .little);
+        try self.dir.appendSlice(self.a, &entry);
+    }
+    pub fn append(self: *Builder, term: u32, first: u32, last: u32, block: []const u8) !void {
+        if (block.len > max_block_bytes) return error.ResourceBudgetExceeded;
+        if (self.current == null or self.current.? != term) {
+            if (self.current) |previous| if (term <= previous) return error.InvalidSparseSegment;
+            try self.finishTerm();
+            self.current = term;
+            self.term_start = self.total;
+            self.chunks = 0;
+        }
+        if (self.run) |run| {
+            var header: [12]u8 = undefined;
+            std.mem.writeInt(u32, header[0..4], term, .little);
+            std.mem.writeInt(u32, header[4..8], last, .little);
+            std.mem.writeInt(u32, header[8..12], @intCast(block.len), .little);
+            try run.appendSlice(&header);
+            try run.appendSlice(block);
+        } else try self.payload.appendSlice(self.a, block);
+        self.total = try std.math.add(u64, self.total, block.len);
+        self.chunks = try std.math.add(u32, self.chunks, 1);
+        self.first = if (self.first) |prior| @min(prior, first) else first;
+        self.last = @max(self.last, last);
+    }
+    pub fn finish(self: *Builder) !?[]u8 {
+        if (self.first == null) return null;
+        try self.finishTerm();
+        const header_len = 16 + self.dir.items.len;
+        const bytes = try self.a.alloc(u8, header_len + if (self.run != null) @as(usize, 12) else self.payload.items.len);
+        errdefer self.a.free(bytes);
+        @memcpy(bytes[0..8], if (self.run != null) magic else legacy_magic);
+        std.mem.writeInt(u32, bytes[8..12], 2, .little);
+        std.mem.writeInt(u32, bytes[12..16], @intCast(self.dir.items.len / 20), .little);
+        @memcpy(bytes[16..header_len], self.dir.items);
+        var at: usize = 16;
+        while (at < header_len) : (at += 20) {
+            const offset = std.mem.readInt(u64, bytes[at + 8 ..][0..8], .little);
+            std.mem.writeInt(u64, bytes[at + 8 ..][0..8], try std.math.add(u64, header_len, offset), .little);
+        }
+        if (self.run) |run| {
+            try run.seal(0);
+            @memcpy(bytes[header_len..][0..4], "O32B");
+            std.mem.writeInt(u32, bytes[header_len + 4 ..][0..4], self.first.?, .little);
+            std.mem.writeInt(u32, bytes[header_len + 8 ..][0..4], self.last, .little);
+        } else @memcpy(bytes[header_len..], self.payload.items);
+        return bytes;
+    }
+};
+
+pub fn publishRun(a: A, txn: anytype, id: u64, root: []const u8, run: *Builder.Run) !void {
+    if (!paged(root)) return error.InvalidSparseSegment;
+    try ensureRoutes(a, txn);
+    const view = try run.sealedView();
+    var offset: u64 = 0;
+    while (offset < view.length) {
+        var header: [12]u8 = undefined;
+        try view.readInto(offset, &header);
+        offset += 12;
+        const term = std.mem.readInt(u32, header[0..4], .little);
+        const last = std.mem.readInt(u32, header[4..8], .little);
+        const length = std.mem.readInt(u32, header[8..12], .little);
+        if (length > max_block_bytes) return error.InvalidSparseSegment;
+        const bytes = try a.alloc(u8, length);
+        defer a.free(bytes);
+        try view.readInto(offset, bytes);
+        try txn.put(&key(id, term, last), bytes);
+        offset += length;
+    }
+    try route(txn, id, root);
 }

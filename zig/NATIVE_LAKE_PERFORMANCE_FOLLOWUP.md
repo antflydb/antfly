@@ -8,7 +8,7 @@ validation requirements.
 ## Native sparse predicate intersection
 
 Implemented through query-owned compressed native ordinal selections. Native
-sparse recipe v5 persists authenticated 1024-row physical-to-native ordinal
+sparse recipe v6 persists authenticated 1024-row physical-to-native ordinal
 blocks inside the checkpoint. Each entry stores a two-byte physical offset and
 four-byte native ordinal; ingestion coalesces writes with at most 64 resident
 blocks. Inserts, replacements, deletes and compaction update these maps in the
@@ -29,14 +29,34 @@ remain V1. Query cursors retain one encoded block per active stream, with a shar
 64 MiB resident-block admission budget; navigation has a separate byte budget
 instead of a fixed 4096-stream limit. Selective seeks avoid loading earlier blocks.
 Legacy `ASPSSEG1` roots remain readable with their original encoded-byte budget.
-Maintenance reconstructs legacy bytes only after compaction reservation; pages,
-roots, incarnations and physical maps publish atomically. Replaced block keys are
+Maintenance merges posting streams from a pinned backend snapshot, retaining one
+encoded block per active source and one output chunk. Native owners spool output
+blocks into a private capacity-accounted run; publication reads one bounded block
+at a time. Complete input segments and corpus-wide decoded posting/sort arrays are
+no longer required for paged compaction. Legacy roots remain readable. Term
+directories, captured incarnation proofs and docmap maintenance still use explicit
+memory admission; this is a bound on posting working state, not constant total
+maintenance memory. Pages, roots, incarnations and physical maps publish atomically. Replaced block keys are
 deleted in the same transaction, preserving existing backend snapshot readers.
-The v5 producer fence rebuilds older publications into paged segments.
+The v6 producer fence rebuilds older remote publications with term-to-segment
+routes. Routes, posting pages and roots commit atomically; a coverage marker
+allows older local checkpoints to retain segment discovery until their next
+publication creates complete routes. Compaction removes old routes in the same
+transaction. Queries seek relevant routes and reuse one posting-page cursor,
+avoiding archive-wide root discovery and per-block cursor construction. Native
+queries also warm the following posting block through at most eight speculative
+jobs on the shared CPU/I/O scheduler. Each job owns an independent fork of the
+same immutable snapshot; saturation yields to required work. Completion or
+cancellation joins the worker before releasing its read lease. Speculation keeps
+no result buffers and relies on the independently bounded native read caches.
 
 Document-at-a-time scoring retains one document accumulator and k winners.
 Conservative block bounds include zero and both signed weight endpoints; strict
-score pruning preserves ties. Contributions retain source/term/chunk f32 addition
+score pruning preserves ties. Block-prefix pivots exclude terms whose next
+posting lies beyond the lead range, with a fence at the earliest block end.
+Nonfinite bounds disable pruning. Nonfinite contributions or f32 accumulation
+overflow return `SparseScoreOverflow` before ranking in both streaming and spill
+paths. The comparator also defines a total order for defensive NaN handling. Contributions retain source/term/chunk f32 addition
 order. Prepared bitmap ranks reject disjoint blocks without decoded arrays.
 Legacy checkpoints, unresolved key predicates and admission overflow retain the
 bounded spill fallback: 65,536 in-memory partial scores and a 1 GiB spill-input
@@ -51,7 +71,7 @@ list merely to resolve membership. Preserve score and tie behavior.
 
 ## Residual evaluation over narrowed physical selections
 
-Implemented for vector predicates by retaining an indexed conjunction superset and
+Implemented for text and vector predicates by retaining an indexed conjunction superset and
 a separate residual IR containing only unresolved children. One pinned Parquet
 cursor borrows compressed physical selections for the entire scan; file/group/page
 pruning and reusable reader plans avoid reopening every 1024 rows. Only residual
@@ -66,7 +86,11 @@ bounds retain exact integer comparison; numeric-range operators retain their
 existing f64 domain. Wide mixed bounds, nonfinite values and composite columns
 keep authoritative shared semantics, including null evaluation and errors. Nested paths and document-ID expressions retain the shared
 document evaluator. The resulting exact physical set is shared by dense and sparse
-membership.
+membership. Text selections exceeding the late-visibility budget invert native
+ordinals into physical selections through the pinned file/block directory.
+Contiguous extents remain compressed, authenticated live-row bitmaps restore
+deleted holes, and temporary artifact copies are released between blocks.
+Only selected blocks and residual dependencies reach the pinned scan.
 
 Keep the indexed superset for a partially resolved conjunction. Iterate it in
 bounded file/group/row windows, project the authoritative expression dependencies,

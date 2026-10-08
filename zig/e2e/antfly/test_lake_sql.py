@@ -3004,7 +3004,7 @@ def test_native_sparse_metadata_filters_preserve_quantized_scores_and_ranking(tm
         pa.table(
             {
                 "amount": [0, 1, 2],
-                "sparse_native": [json.dumps({"1": w}) for w in (1, 1.1, 100)],
+                "sparse_native": [json.dumps({"1": w, "2": 1e20, "3": -1e20}) for w in (1, 1.1, 100)],
             }
         ),
         data,
@@ -3088,6 +3088,17 @@ def test_native_sparse_metadata_filters_preserve_quantized_scores_and_ranking(tm
             "limit": 3,
         }
         all_hits = call("POST", "/tables/review_sparse/query", base)["hits"]["hits"]
+        overflow = requests.post(
+            server.api_url + "/tables/review_sparse/query",
+            json=dict(base, embeddings={"sparse_native": {
+                "indices": [2, 3], "values": [1e20, 1e20],
+            }}),
+            auth=("admin", AUTH_BOOTSTRAP_PASSWORD),
+            timeout=90,
+        )
+        assert not overflow.ok, overflow.text
+        # A valid query must still work after rejecting finite-input overflow.
+        assert call("POST", "/tables/review_sparse/query", base)["hits"]["hits"] == all_hits
         selected = call(
             "POST",
             "/tables/review_sparse/query",

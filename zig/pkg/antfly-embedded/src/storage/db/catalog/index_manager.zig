@@ -18662,7 +18662,7 @@ pub const IndexManager = struct {
 
     pub fn beginSparseCompactionTask(self: *IndexManager) !?SparseCompactionTask {
         for (self.sparse_indexes.items) |*entry| {
-            var task = (try entry.index.beginSegmentCompactionTask(self.alloc, .{})) orelse continue;
+            var task = (try entry.index.beginSegmentCompactionTask(self.alloc, .{ .scratch = if (self.io) |io| .{ .io = io, .directory = self.base_path, .resource_manager = self.resource_manager } else null })) orelse continue;
             errdefer task.deinit(self.alloc);
             return .{
                 .index_name = try self.alloc.dupe(u8, entry.config.name),
@@ -18673,7 +18673,7 @@ pub const IndexManager = struct {
         return null;
     }
 
-    pub fn executeSparseCompactionTask(alloc: Allocator, task: *const SparseCompactionTask) !SparseCompactionResult {
+    pub fn executeSparseCompactionTask(alloc: Allocator, task: *SparseCompactionTask) !SparseCompactionResult {
         return try sparse_mod.SparseIndex.executeSegmentCompactionTask(alloc, &task.task, task.chunk_size);
     }
 

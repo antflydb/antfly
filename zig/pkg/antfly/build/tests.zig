@@ -2589,8 +2589,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     test_imports.configure(b, lake_scaffold_test_mod, true, true);
     lake_scaffold_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
     const lake_scaffold_tests = b.addTest(.{
-        // Measured macOS ReleaseFast peak: 11.68 GB for the native lake owner.
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 13 else 10) * 1024 * 1024 * 1024,
+        // Measured macOS ReleaseSafe partition peak: 15.67 GB. Reserve headroom
+        // for native lake API codegen rather than failing scheduler admission.
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 18 else 10) * 1024 * 1024 * 1024,
         .root_module = lake_scaffold_test_mod,
         .filters = &.{ "lake", "parquet", "iceberg", "external source", "row fragment", "sidecar" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },

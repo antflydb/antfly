@@ -119,6 +119,44 @@ pub const Identities = struct {
         };
         return try std.math.add(u32, span.lower, try std.math.add(u32, block.base, rank));
     }
+    /// Invert only selected ordinal blocks. Contiguous extents stay compressed;
+    /// delete holes are resolved within their authenticated physical block.
+    fn physicalSelection(self: Identities, a: A, selected: *const Bitmap, store: @import("../serverless/artifacts/store.zig").ArtifactStore, cached: @import("lake_index_aggregate_artifact.zig").CachedRead) !PhysicalSet {
+        var result = PhysicalSet.init(a);
+        errdefer result.deinit();
+        var temporary = std.heap.ArenaAllocator.init(a);
+        defer temporary.deinit();
+        const ta = temporary.allocator();
+        var files = self.files.iterator();
+        while (files.next()) |file| {
+            const span = file.value_ptr.*;
+            if (selected.rangeCardinality(span.lower, span.upper) == 0) continue;
+            for (span.rows) |block| {
+                const lower = try std.math.add(u32, span.lower, block.base);
+                const upper = @as(u64, lower) + block.count;
+                if (selected.rangeCardinality(lower, upper) == 0) continue;
+                _ = temporary.reset(.retain_capacity);
+                var cache: std.StringHashMapUnmanaged(Bitmap) = .empty;
+                var ranks = try selected.sliceRebased(a, lower, upper);
+                defer ranks.deinit();
+                var physical = if (block.bitmap != null) blk: {
+                    const live = try liveRows(ta, &cache, store, cached, block);
+                    if (ranks.cardinality() == block.count) break :blk try live.clone(a);
+                    var matches = Bitmap.init(a);
+                    errdefer matches.deinit();
+                    var rows_it = live.iterator();
+                    var rank: u32 = 0;
+                    while (rows_it.next()) |row| : (rank += 1) if (ranks.contains(rank)) {
+                        try matches.add(row);
+                    };
+                    break :blk matches;
+                } else try ranks.addOffset(block.lower);
+                defer physical.deinit();
+                try result.addBlock(.{ .file = file.key_ptr.*, .group = block.group, .base = block.high << corpus.physical.shift, .selection = .{ .bitmap = physical } });
+            }
+        }
+        return result;
+    }
 };
 
 pub const PhysicalSet = @import("lake_index_physical_set.zig").Set;
@@ -153,10 +191,14 @@ fn PredicateResolver(comptime Set: type) type {
                 if (!resolved.exact and !usable) {
                     var partial = resolved;
                     defer partial.bitmap.deinit();
-                    result = if (Set == PhysicalSet)
-                        try self.scanSelected(a, partial.residual orelse compiled, &partial.bitmap)
-                    else
-                        try self.scanExpression(a, compiled);
+                    if (Set == PhysicalSet) {
+                        result = try self.scanSelected(a, partial.residual orelse compiled, &partial.bitmap);
+                    } else {
+                        const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &self.server.lake_read_cache, .scope = self.store_identity, .context = self.read_context };
+                        var selected = try self.identities.physicalSelection(a, &partial.bitmap, self.store, cached);
+                        defer selected.deinit();
+                        result = try self.scanSelected(a, partial.residual orelse compiled, &selected);
+                    }
                 }
             }
             if (Set == Bitmap) return if (result) |resolved| .{ .bitmap = resolved.bitmap, .exact = resolved.exact } else null;
@@ -824,4 +866,44 @@ test "external lake residual numeric kernels preserve nonfinite errors and inact
         try std.testing.expect(!mask[0]);
         try std.testing.expectError(error.InvalidArgument, evaluateColumns(a, invalid, page, &mask, null));
     }
+}
+
+test "external lake large ordinal selections invert compressed extents and deleted holes" {
+    const a = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("native-text-inverse-selection");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    var cache = local.serverless_query_lake_serving_cache.Cache.init(a);
+    defer cache.deinit();
+    const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &cache, .scope = @splat(8), .context = .{ .io = std.testing.io } };
+    var live = Bitmap.init(a);
+    defer live.deinit();
+    for ([_]u32{ 5, 7, 9 }) |row| try live.add(row);
+    const bytes = try live.toBytes(a);
+    defer a.free(bytes);
+    var ref = try store.put(bytes);
+    defer ref.deinit(a);
+    const blocks = [_]corpus.physical.Block{
+        .{ .group = 0, .high = 0, .base = 0, .count = 200001, .lower = 3 },
+        .{ .group = 2, .high = 1 << 32, .base = 200001, .count = 3, .lower = 5, .bitmap = .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len } },
+    };
+    var identities: Identities = .{ .offsets = &.{} };
+    defer identities.files.deinit(a);
+    try identities.files.put(a, "selected", .{ .lower = 10, .upper = 200014, .rows = &blocks });
+    try identities.files.put(a, "unselected", .{ .lower = 300000, .upper = 500004, .rows = &blocks });
+    var selected = Bitmap.init(a);
+    defer selected.deinit();
+    try selected.addRange(10, 200011);
+    try selected.add(200012);
+    var physical = try identities.physicalSelection(a, &selected, store, cached);
+    defer physical.deinit();
+    try std.testing.expectEqual(@as(usize, 1), physical.files.count());
+    try std.testing.expect(physical.contains("selected", 0, 3));
+    try std.testing.expect(physical.contains("selected", 0, 200003));
+    try std.testing.expect(!physical.contains("selected", 0, 200004));
+    try std.testing.expect(physical.contains("selected", 2, (@as(u64, 1) << 52) + 7));
+    try std.testing.expect(!physical.contains("selected", 2, (@as(u64, 1) << 52) + 5));
+    try std.testing.expect(!physical.contains("selected", 2, (@as(u64, 1) << 52) + 6));
 }

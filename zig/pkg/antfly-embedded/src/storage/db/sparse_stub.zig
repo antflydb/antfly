@@ -131,6 +131,7 @@ pub const SparseIndex = struct {
     pub const SegmentCompactionOptions = struct {
         min_segments: usize = 32,
         max_segments: usize = 128,
+        scratch: ?@import("../../spill_sort.zig").Options = null,
     };
 
     pub const SegmentCompactionTask = struct {
@@ -203,7 +204,7 @@ pub const SparseIndex = struct {
         return null;
     }
 
-    pub fn executeSegmentCompactionTask(_: Allocator, _: *const SegmentCompactionTask, _: u32) !SegmentCompactionResult {
+    pub fn executeSegmentCompactionTask(_: Allocator, _: *SegmentCompactionTask, _: u32) !SegmentCompactionResult {
         return error.UnsupportedPlatform;
     }
 
