@@ -1088,3 +1088,53 @@ test "runnable fail-fast acquisition retains fair bounded published reentry" {
     try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
     try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
 }
+
+test "runnable scheduler running write retains completion ownership through cancellation and shutdown" {
+    const Flag = struct {
+        canceled: bool = false,
+        fn requested(raw: *const anyopaque) bool {
+            return @as(*const @This(), @ptrCast(@alignCast(raw))).canceled;
+        }
+    };
+    var flag: Flag = .{};
+    var scheduler = try Scheduler.init(.{ .slots = 3, .max_operations = 4 });
+    defer scheduler.close();
+    var write: Execution = .{};
+    defer write.finish();
+    try write.startWithSlots(&scheduler, .{
+        .io = std.testing.io,
+        .retained_bytes = 4096,
+        .cancellation = .{ .ptr = &flag, .requested = Flag.requested },
+    }, .write, 2);
+    const generation = write.resume_generation;
+    // The native write has crossed its own acceptance fence. Until that owner
+    // reports completion, foreground cancellation must not reclaim its grant.
+    // This tests the scheduler side of that contract, not WAL/Raft acceptance.
+    flag.canceled = true;
+    try std.testing.expectError(error.Canceled, write.checkpoint());
+    try std.testing.expectEqual(State.running, scheduler.state(&write.entry.?));
+    try std.testing.expectEqual(@as(usize, 2), scheduler.stats().runnable_slots);
+    try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+    try std.testing.expectEqual(@as(u64, 4096), scheduler.stats().retained_bytes);
+    var health: Execution = .{};
+    defer health.finish();
+    try health.start(&scheduler, .{ .io = std.testing.io, .allow_wait = false }, .control);
+    try health.checkpoint();
+    try std.testing.expectEqual(@as(usize, 3), scheduler.stats().runnable_slots);
+    health.finish();
+    scheduler.close();
+    // Close stops admission and blocked reentry; live native execution is
+    // joined by its caller and remains charged until that caller finishes.
+    try std.testing.expectEqual(State.running, scheduler.state(&write.entry.?));
+    try std.testing.expectEqual(@as(usize, 2), scheduler.stats().runnable_slots);
+    try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+    try std.testing.expectEqual(@as(u64, 4096), scheduler.stats().retained_bytes);
+    var fresh: Execution = .{};
+    defer fresh.finish();
+    try std.testing.expectError(error.SchedulerClosed, fresh.start(&scheduler, .{ .io = std.testing.io }, .write));
+    try std.testing.expectEqual(generation, write.resume_generation);
+    write.finish();
+    try std.testing.expectEqual(@as(usize, 0), scheduler.stats().runnable_slots);
+    try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+    try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+}

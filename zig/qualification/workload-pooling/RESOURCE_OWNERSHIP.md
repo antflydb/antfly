@@ -342,3 +342,14 @@ transport and real-owner gates pass; see
 [owned HTTP cleanup receipts](receipts/2026-10-07/owned-http-cleanup/README.md).
 Full production wiring remains supplemental. Other pump/control paths, accepted
 durable completion, quarantine, whole-node/default proof remain required.
+
+
+A running write retains CPU/operation/byte charges through foreground cancellation
+and scheduler shutdown until owning finish, with health headroom before close.
+Native and pinned Nix/glibc pass the explicit lifecycle regression; see
+[write completion baseline and acceptance audit](receipts/2026-10-07/durable-write-retention/README.md).
+Accepted-write parking remains unimplemented: ordinary parked entries cannot
+resume after close. SQL durable sealed plans and storage decisions require
+distinct handoffs. Native/hosted transaction participant fanout currently has
+a bounded task count but no scheduler execution port; accounting those tasks
+is part of the broader completion integration, not covered by serial SQL work.
