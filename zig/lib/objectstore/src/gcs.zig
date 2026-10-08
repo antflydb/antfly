@@ -2186,6 +2186,24 @@ test "json api client round-trips against env-configured endpoint" {
     defer get.deinit(alloc);
     try std.testing.expectEqualStrings("hello-gcs", get.body);
 
+    var pinned = try client.getObject(bucket, key, .{
+        .version_id = meta.version_id.?,
+        .if_match_etag = meta.etag.?,
+        .range = .{ .offset = 0, .length = 5 },
+        .skip_metadata_probe = true,
+        .max_response_bytes = 5,
+    });
+    defer pinned.deinit(alloc);
+    try std.testing.expectEqualStrings("hello", pinned.body);
+    try std.testing.expect(pinned.conditional_etag_verified);
+    try std.testing.expectEqualStrings(meta.version_id.?, pinned.metadata.version_id.?);
+    try std.testing.expectError(error.PreconditionFailed, client.getObject(bucket, key, .{
+        .if_match_etag = "definitely-not-the-current-etag",
+        .range = .{ .offset = 0, .length = 5 },
+        .skip_metadata_probe = true,
+        .max_response_bytes = 5,
+    }));
+
     var listed = try client.listObjects(bucket, .{
         .prefix = "zig-objectstore-gcs/",
     });
