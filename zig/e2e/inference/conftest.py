@@ -29,6 +29,9 @@ Usage:
     # Optional inference server model-cache limit:
     ANTFLY_INFERENCE_MAX_LOADED_MODELS=1 uv run --project e2e/inference pytest e2e/inference
 
+    # Bounded local qualification of slower Debug generation/diarization:
+    ANTFLY_INFERENCE_REQUEST_TIMEOUT=120 uv run --project e2e/inference pytest e2e/inference
+
     # Separate deadline for explicitly marked first-use model/backend initialization:
     ANTFLY_INFERENCE_FIRST_USE_REQUEST_TIMEOUT=1800 uv run --project e2e/inference pytest e2e/inference
 
