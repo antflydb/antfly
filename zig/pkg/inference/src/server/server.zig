@@ -9294,13 +9294,15 @@ pub const Node = struct {
         defer if (owned_io) |*io_impl| io_impl.deinit();
         const io = self.inferenceIo(allocator, null, &owned_io);
 
-        const extractor_ctx = extractors_mod.Context{
+        var reader_admission = ExtractionReaderAdmission{ .node = self, .allocator = allocator };
+        var extractor_ctx = extractors_mod.Context{
             .allocator = allocator,
             .io = io,
             .models_dir = self.config.models_dir,
             .session_manager = &self.session_manager,
             .model_manager = &self.model_manager,
             .reader_resolver = &self.extraction_reader_resolver,
+            .reader_admission = .{ .ptr = &reader_admission, .validate = ExtractionReaderAdmission.validate },
             .gliner_pipeline_factory = .{ .ptr = self, .create = createGlinerPipeline },
             .execution_control = execution_control,
         };
@@ -9311,8 +9313,29 @@ pub const Node = struct {
         defer extractor.deinit(allocator);
         var admission_manifest = try manifest_mod.loadFromDir(allocator, extractor.modelPath());
         defer admission_manifest.deinit();
-        const executor_contract = try resolvedInferenceExecutorContract(self, "extract", &admission_manifest);
-        config.max_input_tokens_per_item = executor_contract.batch.max_input_tokens_per_item;
+        const extraction_contract = try resolvedInferenceExecutorContract(self, "extract", &admission_manifest);
+        var text_admission = ExtractionTextAdmission{ .contract = extraction_contract, .schema_bytes = request.schema_json.len };
+        extractor_ctx.text_admission = .{ .ptr = &text_admission, .validate = ExtractionTextAdmission.validate };
+        config.max_input_tokens_per_item = extraction_contract.batch.max_input_tokens_per_item;
+        var image_manifest: ?manifest_mod.ModelManifest = null;
+        defer if (image_manifest) |*manifest| manifest.deinit();
+        const composed_reader = media_shape.image_count > 0 and extractor == .extractor;
+        if (composed_reader) {
+            const reader_path = try extractor.imageModelPath(extractor_ctx);
+            defer allocator.free(reader_path);
+            image_manifest = try manifest_mod.loadFromDir(allocator, reader_path);
+            // The extractor consumes OCR text, not the original images.
+            try validateInferenceExecutorInvocation(extraction_contract, .{
+                .item_count = request.inputs.len,
+                .schema_bytes = request.schema_json.len,
+                .has_text = true,
+            });
+        }
+        const media_manifest = if (image_manifest) |*manifest| manifest else &admission_manifest;
+        const executor_contract = if (composed_reader)
+            try resolvedInferenceExecutorContract(self, "read", media_manifest)
+        else
+            extraction_contract;
 
         // Fetch and decode request media only after resolver preflight succeeds.
         var parsed_inputs = try parseDirectExtractionInputs(
@@ -9335,7 +9358,7 @@ pub const Node = struct {
                 return error.InferenceEncodedBytesExceeded;
             const physical_mime = image_pipeline.mimeEssenceForEncoded(image_bytes) orelse
                 return error.InvalidInferenceMedia;
-            if (!manifestAcceptsExecutorMime(&admission_manifest, physical_mime))
+            if (!manifestAcceptsExecutorMime(media_manifest, physical_mime))
                 return error.UnsupportedInferenceMimeType;
             const info = image_pipeline.inspectEncodedForInference(image_bytes, null) catch
                 return error.InvalidInferenceMedia;
@@ -9353,7 +9376,7 @@ pub const Node = struct {
             .encoded_media_bytes = encoded_media_bytes,
             .decoded_pixels = decoded_pixels,
             .media_parts_per_item = if (parsed_inputs.images.items.len > 0) 1 else 0,
-            .schema_bytes = request.schema_json.len,
+            .schema_bytes = if (composed_reader) 0 else request.schema_json.len,
             .has_text = parsed_inputs.texts.items.len > 0,
             .has_image = parsed_inputs.images.items.len > 0,
         });
@@ -11957,9 +11980,9 @@ pub const Node = struct {
             const parsed_tool_calls = if (tool_parser) |*parser| blk: {
                 parser.reset();
                 _ = parser.feed(result.text) catch |err|
-                    return ctx.status(500).json(.{ .@"error" = "GENERATION_FAILED", .message = @errorName(err) });
+                    return generationErrorResponse(ctx, err);
                 tool_response_text = parser.finishText(ctx.allocator) catch |err|
-                    return ctx.status(500).json(.{ .@"error" = "GENERATION_FAILED", .message = @errorName(err) });
+                    return generationErrorResponse(ctx, err);
                 response_text = tool_response_text.?;
                 if (response_text.len == 0) response_text = result.text;
                 const calls = parser.toolCalls();
@@ -12100,9 +12123,9 @@ pub const Node = struct {
                 const parsed_tool_calls = if (tool_parser) |*parser| blk: {
                     parser.reset();
                     _ = parser.feed(result.text) catch |err|
-                        return ctx.status(500).json(.{ .@"error" = "GENERATION_FAILED", .message = @errorName(err) });
+                        return generationErrorResponse(ctx, err);
                     tool_response_text = parser.finishText(ctx.allocator) catch |err|
-                        return ctx.status(500).json(.{ .@"error" = "GENERATION_FAILED", .message = @errorName(err) });
+                        return generationErrorResponse(ctx, err);
                     response_text = tool_response_text.?;
                     if (response_text.len == 0) response_text = result.text;
                     const calls = parser.toolCalls();
@@ -12943,9 +12966,9 @@ pub const Node = struct {
         const parsed_tool_calls = if (tool_parser) |*parser| blk: {
             parser.reset();
             _ = parser.feed(result.text) catch |err|
-                return ctx.status(500).json(.{ .@"error" = "GENERATION_FAILED", .message = @errorName(err) });
+                return generationErrorResponse(ctx, err);
             tool_response_text = parser.finishText(ctx.allocator) catch |err|
-                return ctx.status(500).json(.{ .@"error" = "GENERATION_FAILED", .message = @errorName(err) });
+                return generationErrorResponse(ctx, err);
             response_text = tool_response_text.?;
             if (response_text.len == 0) response_text = result.text;
             const calls = parser.toolCalls();
@@ -23285,6 +23308,45 @@ fn measureDirectGenerateDecodedPixels(
     return decoded_pixels;
 }
 
+const ExtractionTextAdmission = struct {
+    contract: ResolvedInferenceExecutorContract,
+    schema_bytes: usize,
+
+    fn validate(ptr: *anyopaque, texts: []const []const u8) !void {
+        const self: *ExtractionTextAdmission = @ptrCast(@alignCast(ptr));
+        try validateInferenceExecutorInvocation(self.contract, .{
+            .item_count = texts.len,
+            .text_bytes_per_item = maxTextBytes(texts),
+            .schema_bytes = self.schema_bytes,
+            .has_text = true,
+        });
+    }
+};
+
+const ExtractionReaderAdmission = struct {
+    node: *Node,
+    allocator: std.mem.Allocator,
+
+    fn validate(ptr: *anyopaque, model_path: []const u8, images: []const []const u8, options: readers_mod.ReadOptions) !void {
+        const self: *ExtractionReaderAdmission = @ptrCast(@alignCast(ptr));
+        var manifest = try manifest_mod.loadFromDir(self.allocator, model_path);
+        defer manifest.deinit();
+        const contract = try resolvedInferenceExecutorContract(self.node, "read", &manifest);
+        var encoded_bytes: usize = 0;
+        for (images) |image| encoded_bytes = std.math.add(usize, encoded_bytes, image.len) catch
+            return error.InferenceEncodedBytesExceeded;
+        try validateInferenceExecutorInvocation(contract, .{
+            .item_count = images.len,
+            .text_bytes_per_item = if (options.prompt) |prompt| prompt.len else 0,
+            .output_tokens_per_item = options.max_tokens orelse 0,
+            .encoded_media_bytes = encoded_bytes,
+            .decoded_pixels = try measureExecutorDecodedImages(&manifest, images),
+            .media_parts_per_item = 1,
+            .has_image = true,
+        });
+    }
+};
+
 const GenerateExecutorContractFailure = struct {
     status: u16,
     batch: api.GenerateBatchError,
@@ -23766,6 +23828,13 @@ test "task-neutral executor contract enforces every resolved resource dimension"
     try std.testing.expectError(error.InferenceCandidateLimitExceeded, validateInferenceExecutorInvocation(contract, .{ .candidates_per_request = 3 }));
     try std.testing.expectError(error.InferenceSchemaBytesExceeded, validateInferenceExecutorInvocation(contract, .{ .schema_bytes = 17 }));
     try std.testing.expectError(error.UnsupportedInferenceModality, validateInferenceExecutorInvocation(contract, .{ .has_audio = true }));
+    var text_contract = contract;
+    text_contract.accepts_image = false;
+    var ocr_admission = ExtractionTextAdmission{ .contract = text_contract, .schema_bytes = 16 };
+    try ExtractionTextAdmission.validate(&ocr_admission, &.{"12345678"});
+    try std.testing.expectError(error.InferenceTextBytesExceeded, ExtractionTextAdmission.validate(&ocr_admission, &.{"123456789"}));
+    ocr_admission.schema_bytes = 17;
+    try std.testing.expectError(error.InferenceSchemaBytesExceeded, ExtractionTextAdmission.validate(&ocr_admission, &.{"OCR"}));
 }
 
 test "generate executor contract error maps unqualified GLiNER boundary runtime to a dedicated response" {
@@ -28371,6 +28440,15 @@ test "generation live pressure is an actionable retryable capacity error" {
     const saturated_batch_error = batchGenerationError(error.ConcurrencyUnavailable);
     try std.testing.expectEqualStrings("MODEL_RESOURCE_BUSY", saturated_batch_error.code);
     try std.testing.expect(saturated_batch_error.retryable);
+
+    var malformed = try generationErrorResponse(&ctx, error.InvalidToolArguments);
+    defer malformed.deinit();
+    try std.testing.expectEqual(@as(u16, 502), malformed.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, malformed.body.?, "\"error\":\"TOOL_ARGUMENTS_INVALID\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, malformed.body.?, "\"retryable\":true") != null);
+    const malformed_batch = batchGenerationError(error.InvalidToolArguments);
+    try std.testing.expectEqualStrings("TOOL_ARGUMENTS_INVALID", malformed_batch.code);
+    try std.testing.expect(malformed_batch.retryable);
 }
 
 test "registerRoutesOn supports alternate prefixes through the shared router" {
@@ -33310,6 +33388,12 @@ fn generationRequestFailure(err: anyerror) ?GenerationRequestFailure {
         .retryable = true,
     };
     return switch (err) {
+        error.InvalidToolArguments => .{
+            .status = 502,
+            .code = "TOOL_ARGUMENTS_INVALID",
+            .message = "model generated malformed tool arguments; request a corrected tool call",
+            .retryable = true,
+        },
         error.PromptTooLong => .{
             .status = 400,
             .code = "INVALID_REQUEST",

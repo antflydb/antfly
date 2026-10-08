@@ -279,6 +279,10 @@ test "boundary dispatcher preserves local calls and maps cross-unit calls" {
             return error.DistributedQueryUnavailable;
         }
 
+        fn malformedGeneratedToolArguments(_: *u32) anyerror!void {
+            return error.InvalidGeneratedToolArguments;
+        }
+
         fn storageReadUnavailable(_: *u32) anyerror!void {
             return error.StorageReadTemporarilyUnavailable;
         }
@@ -361,6 +365,10 @@ test "boundary dispatcher preserves local calls and maps cross-unit calls" {
     try std.testing.expectError(
         error.DistributedQueryUnavailable,
         TestBoundary.call("retryable_fail", &callbacks.foreignDispatch, &callbacks.distributedQueryUnavailable, .{&base}),
+    );
+    try std.testing.expectError(
+        error.InvalidGeneratedToolArguments,
+        TestBoundary.call("retryable_fail", &callbacks.foreignDispatch, &callbacks.malformedGeneratedToolArguments, .{&base}),
     );
     try std.testing.expectError(
         error.StorageReadTemporarilyUnavailable,

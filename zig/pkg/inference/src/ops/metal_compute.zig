@@ -6767,11 +6767,15 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (bufHasAnyQuantizedStorage(buf) or buf.native_dense_bytes != null or buf.lazy_multiply != null or
             buf.view_strides != null or buf.logical_view_strides != null or buf.view_index_map != null or
             buf.view_base_offset != 0)
+        {
             return error.UnsupportedResidentTrainingPrimitive;
+        }
         const device = buf.metal_tensor orelse return error.ResidentTrainingRequiresDeviceTensor;
         if (!device.isDevice() or (dtype != null and device.dtype != dtype.?) or
             buf.integer_storage != (device.dtype == .i32))
+        {
             return error.UnsupportedResidentTrainingPrimitive;
+        }
         const logical = buf.logical_shape orelse return error.InvalidResidentTrainingShape;
         const count = try ops.resident_training.shapeElements(i64, logical, limits);
         if (device.elemCount() != count or device.deviceByteLen() != count * 4)
@@ -8020,9 +8024,16 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .f32, .f16, .bf16, .f64 => .f32,
             inline .i8, .i16, .i32, .i64, .u8, .bool_ => |tag| @field(metal_tensor_mod.DType, @tagName(tag)),
         };
-        if (source.dtype == physical) return self.ctFromOwnedMetalTensor(try source.retainedCopy());
-        const output = (try metal_runtime.decoderRuntimeCastTypedDevice(self.provider_impl, source, physical)) orelse return null;
-        return self.ctFromOwnedMetalTensor(output);
+        const output = if (source.dtype == physical)
+            try source.retainedCopy()
+        else
+            (try metal_runtime.decoderRuntimeCastTypedDevice(self.provider_impl, source, physical)) orelse return null;
+        const result = try self.ctFromOwnedMetalTensor(output);
+        if (buf.integer_bounds) |bounds| {
+            if (physical == .i64 or (physical == .i32 and bounds.minimum >= std.math.minInt(i32) and bounds.maximum <= std.math.maxInt(i32)))
+                toBuf(result).integer_bounds = bounds;
+        }
+        return result;
     }
 
     fn toFloat32Op(ctx: *anyopaque, tensor: CT, allocator: std.mem.Allocator) anyerror![]f32 {
@@ -8730,7 +8741,25 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             const dtype: ops.GraphDType = switch (exported.dtype) {
                 inline else => |tag| @field(ops.GraphDType, @tagName(tag)),
             };
-            return (try native_ctx.cb.fromConstantBytes(exported.payload.bytes, dtype, shape_i64)) orelse error.UnsupportedTensorType;
+            const host_tensor = (try native_ctx.cb.fromConstantBytes(exported.payload.bytes, dtype, shape_i64)) orelse return error.UnsupportedTensorType;
+            // Reuse the exact integer bytes already observed by this fallback.
+            // Backward scatter can then retain device values and indices
+            // instead of rejecting a dynamically converted index tensor.
+            if ((dtype == .i32 or dtype == .i64) and exported.payload.bytes.len != 0) {
+                const width: usize = if (dtype == .i32) 4 else 8;
+                var minimum: i64 = std.math.maxInt(i64);
+                var maximum: i64 = std.math.minInt(i64);
+                for (0..exported.payload.bytes.len / width) |i| {
+                    const value: i64 = if (dtype == .i32)
+                        std.mem.readInt(i32, exported.payload.bytes[i * width ..][0..4], .little)
+                    else
+                        std.mem.readInt(i64, exported.payload.bytes[i * width ..][0..8], .little);
+                    minimum = @min(minimum, value);
+                    maximum = @max(maximum, value);
+                }
+                buf.integer_bounds = .{ .minimum = minimum, .maximum = maximum };
+            }
+            return host_tensor;
         }
         const shape_i32 = try self.i32ShapeFromI64(shape_i64);
         defer self.allocator.free(shape_i32);
@@ -12331,7 +12360,36 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         var rhs = if (toBuf(b).integer_storage) try toBuf(b).metal_tensor.?.retainedCopy() else try self.ownedDeviceMetalTensorFromCt(b);
         defer rhs.deinit();
         const output = (try metal_runtime.decoderRuntimeIntegerBinaryDevice(self.provider_impl, lhs, rhs, kind)) orelse return error.UnsupportedTensorType;
-        return self.ctFromOwnedMetalTensor(output);
+        const result = try self.ctFromOwnedMetalTensor(output);
+        if (kind == 3) {
+            toBuf(result).integer_bounds = .{ .minimum = 0, .maximum = 1 };
+        } else if (toBuf(a).integer_bounds) |left| {
+            if (toBuf(b).integer_bounds) |right| {
+                const range: ?@TypeOf(left) = checked: {
+                    const minimum: i64, const maximum: i64 = switch (kind) {
+                        0 => .{ std.math.add(i64, left.minimum, right.minimum) catch break :checked null, std.math.add(i64, left.maximum, right.maximum) catch break :checked null },
+                        2 => .{ std.math.sub(i64, left.minimum, right.maximum) catch break :checked null, std.math.sub(i64, left.maximum, right.minimum) catch break :checked null },
+                        1 => products: {
+                            const products = [_]i64{
+                                std.math.mul(i64, left.minimum, right.minimum) catch break :checked null,
+                                std.math.mul(i64, left.minimum, right.maximum) catch break :checked null,
+                                std.math.mul(i64, left.maximum, right.minimum) catch break :checked null,
+                                std.math.mul(i64, left.maximum, right.maximum) catch break :checked null,
+                            };
+                            break :products .{ std.mem.min(i64, &products), std.mem.max(i64, &products) };
+                        },
+                        else => break :checked null,
+                    };
+                    // A wrapping narrow result cannot retain an unbounded
+                    // mathematical interval as an index admission proof.
+                    if (output.dtype == .i32 and (minimum < std.math.minInt(i32) or maximum > std.math.maxInt(i32))) break :checked null;
+                    if (output.dtype != .i32 and output.dtype != .i64) break :checked null;
+                    break :checked .{ .minimum = minimum, .maximum = maximum };
+                };
+                toBuf(result).integer_bounds = range;
+            }
+        }
+        return result;
     }
 
     fn lessThanOp(ctx: *anyopaque, a: CT, b: CT) anyerror!CT {
@@ -13959,7 +14017,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
     fn primScatterAddOp(ctx: *anyopaque, input: CT, indices: CT, input_shape: []const i64, indices_shape: []const i64, axis: u8) anyerror!CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
-        if (toBuf(indices).integer_storage) return self.residentTrainingScatter(input, indices, input_shape, indices_shape, axis, .{}, null);
+        if (toBuf(indices).resident_index_storage != null) return self.residentTrainingScatter(input, indices, input_shape, indices_shape, axis, .{}, null);
         if (toBuf(input).integer_storage) return error.UnsupportedResidentTrainingPrimitive;
         if (axis != 0 or input_shape.len != 2 or indices_shape.len == 0) return error.UnsupportedPrimitiveOp;
         if (input_shape[0] <= 0 or input_shape[1] <= 0 or indices_shape[0] <= 0) return error.UnsupportedShape;
@@ -13967,13 +14025,20 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const value_rows: usize = @intCast(input_shape[0]);
         const dim: usize = @intCast(input_shape[1]);
         const out_rows: usize = @intCast(indices_shape[0]);
+        if (toBuf(indices).integer_storage) {
+            const bounds = toBuf(indices).integer_bounds orelse return error.UnsupportedResidentTrainingIndexProof;
+            if (bounds.minimum < -indices_shape[0] or bounds.maximum >= indices_shape[0]) return error.IndexOutOfBounds;
+        }
 
         var values_mt = self.ownedDeviceMetalTensorFromCt(input) catch |err| switch (err) {
             error.UnsupportedTensorType => return error.UnsupportedPrimitiveOp,
             else => return err,
         };
         defer values_mt.deinit();
-        var indices_mt = self.ownedDeviceMetalTensorFromCt(indices) catch |err| switch (err) {
+        var indices_mt = (if (toBuf(indices).integer_storage)
+            toBuf(indices).metal_tensor.?.retainedCopy()
+        else
+            self.ownedDeviceMetalTensorFromCt(indices)) catch |err| switch (err) {
             error.UnsupportedTensorType => return error.UnsupportedPrimitiveOp,
             else => return err,
         };
@@ -34494,6 +34559,45 @@ test "metal_compute: scatterAdd axis0 keeps two-input autodiff form resident" {
         0,   0,   0,   0,
         0,   0,   0,   0,
     }, out_data);
+    // Graph constants retain integer storage. Exercise duplicate reductions
+    // with both widths without downloading or reinterpreting them as floats.
+    inline for (.{ i32, i64 }) |T| {
+        const raw = [_]T{ 2, 0, 2 };
+        const typed = (try MetalCompute.fromConstantBytesOp(&metal_compute, std.mem.sliceAsBytes(&raw), if (T == i32) .i32 else .i64, &.{3})).?;
+        defer metal_cb.free(typed);
+        const typed_out = try metal_cb.primScatterAdd(values, typed, &.{ 3, 4 }, &.{ 5, 4 }, 0);
+        defer metal_cb.free(typed_out);
+        try std.testing.expect(MetalCompute.debugHasDeviceTensor(&metal_cb, typed_out));
+        const typed_data = try metal_cb.toFloat32(typed_out, allocator);
+        defer allocator.free(typed_data);
+        try std.testing.expectEqualSlices(f32, out_data, typed_data);
+        const zeros = [_]T{ 0, 0, 0 };
+        const zero_indices = (try MetalCompute.fromConstantBytesOp(&metal_compute, std.mem.sliceAsBytes(&zeros), if (T == i32) .i32 else .i64, &.{3})).?;
+        defer metal_cb.free(zero_indices);
+        const computed = try metal_compute.integerBinary(typed, zero_indices, 0);
+        defer metal_cb.free(computed);
+        const computed_out = try metal_cb.primScatterAdd(values, computed, &.{ 3, 4 }, &.{ 5, 4 }, 0);
+        defer metal_cb.free(computed_out);
+        const computed_data = try metal_cb.toFloat32(computed_out, allocator);
+        defer allocator.free(computed_data);
+        try std.testing.expectEqualSlices(f32, out_data, computed_data);
+        const negative = [_]T{ -3, -5, -3 };
+        const negative_indices = (try MetalCompute.fromConstantBytesOp(&metal_compute, std.mem.sliceAsBytes(&negative), if (T == i32) .i32 else .i64, &.{3})).?;
+        defer metal_cb.free(negative_indices);
+        const negative_out = try metal_cb.primScatterAdd(values, negative_indices, &.{ 3, 4 }, &.{ 5, 4 }, 0);
+        defer metal_cb.free(negative_out);
+        const negative_data = try metal_cb.toFloat32(negative_out, allocator);
+        defer allocator.free(negative_data);
+        try std.testing.expectEqualSlices(f32, out_data, negative_data);
+        const too_negative = [_]T{ 2, -6, 2 };
+        const bad_negative = (try MetalCompute.fromConstantBytesOp(&metal_compute, std.mem.sliceAsBytes(&too_negative), if (T == i32) .i32 else .i64, &.{3})).?;
+        defer metal_cb.free(bad_negative);
+        try std.testing.expectError(error.IndexOutOfBounds, metal_cb.primScatterAdd(values, bad_negative, &.{ 3, 4 }, &.{ 5, 4 }, 0));
+        const invalid = [_]T{ 2, 5, 2 };
+        const bad = (try MetalCompute.fromConstantBytesOp(&metal_compute, std.mem.sliceAsBytes(&invalid), if (T == i32) .i32 else .i64, &.{3})).?;
+        defer metal_cb.free(bad);
+        try std.testing.expectError(error.IndexOutOfBounds, metal_cb.primScatterAdd(values, bad, &.{ 3, 4 }, &.{ 5, 4 }, 0));
+    }
 }
 
 test "metal_compute: generic broadcast keeps device tensors resident" {

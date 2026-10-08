@@ -3262,13 +3262,13 @@ fn embeddingsRuntimeView(item: anytype, table_doc_count: u64, coverage_policy: E
     if (if (observation_current) enrichment else null) |stats| {
         const index_applied_sequence = view.replay_applied_sequence;
         const index_target_sequence = view.replay_target_sequence;
-        view.replay_target_sequence = @max(index_target_sequence, stats.target_sequence);
-        view.replay_applied_sequence = if (index_target_sequence == 0)
-            stats.applied_sequence
-        else if (stats.target_sequence == 0)
-            index_applied_sequence
-        else
-            @min(index_applied_sequence, stats.applied_sequence);
+        // Artifact commits advance the index ledger independently from the
+        // source producer ledger. Compare each owner with its own target;
+        // combining their watermarks invents debt after both have settled.
+        if (index_target_sequence == 0 and index_applied_sequence == 0) {
+            view.replay_target_sequence = stats.target_sequence;
+            view.replay_applied_sequence = stats.applied_sequence;
+        }
         if (view.replay_applied_sequence < view.replay_target_sequence) {
             view.replay_catch_up_required = true;
             view.backfill_active = true;
@@ -3277,6 +3277,10 @@ fn embeddingsRuntimeView(item: anytype, table_doc_count: u64, coverage_policy: E
                 @as(f64, @floatFromInt(view.replay_applied_sequence)) /
                     @as(f64, @floatFromInt(view.replay_target_sequence)),
             );
+        } else if (stats.applied_sequence < stats.target_sequence) {
+            view.backfill_active = true;
+            view.backfill_progress = @min(1.0, @as(f64, @floatFromInt(stats.applied_sequence)) /
+                @as(f64, @floatFromInt(stats.target_sequence)));
         } else if (stats.retrying) {
             view.backfill_active = true;
             if (view.backfill_progress >= 1.0) view.backfill_progress = 0.999;
@@ -5297,6 +5301,22 @@ fn consumerTests() type {
             }, true);
             try std.testing.expect(!view.backfill_active);
             try std.testing.expectEqual(@as(f64, 1.0), view.backfill_progress);
+            // Both owners are settled, but generated artifact commits have
+            // advanced the index beyond the source-only producer watermark.
+            const separate_ledgers = embeddingsRuntimeView(item, 3, .strict, false, 42, 99, .{
+                .enabled = true,
+                .applied_sequence = 1,
+                .target_sequence = 1,
+            }, true);
+            try std.testing.expect(!separate_ledgers.backfill_active);
+            try std.testing.expectEqual(@as(u64, 5), separate_ledgers.replay_applied_sequence);
+            try std.testing.expectEqual(@as(u64, 5), separate_ledgers.replay_target_sequence);
+            const pending_producer = embeddingsRuntimeView(item, 3, .strict, false, 42, 99, .{
+                .enabled = true,
+                .applied_sequence = 1,
+                .target_sequence = 2,
+            }, true);
+            try std.testing.expect(pending_producer.backfill_active);
         }
 
         test "derived coverage source totals ignore derived index fan out" {

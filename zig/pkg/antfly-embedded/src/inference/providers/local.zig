@@ -999,6 +999,12 @@ test "antfly provider preserves explicit distributed admission denial" {
     try std.testing.expect(!isInferenceAdmissionDenied(response));
     response.body = "not JSON";
     try std.testing.expect(!isInferenceAdmissionDenied(response));
+    var malformed = httpx.Response.init(std.testing.allocator, 502);
+    defer malformed.deinit();
+    malformed.body = "{\"error\":\"TOOL_ARGUMENTS_INVALID\",\"retryable\":true}";
+    try std.testing.expectEqual(error.InvalidGeneratedToolArguments, generationResponseError(std.testing.allocator, malformed));
+    malformed.body = "{\"error\":\"TOOL_ARGUMENTS_INVALID\",\"retryable\":false}";
+    try std.testing.expectEqual(error.GenerateRequestFailed, generationResponseError(std.testing.allocator, malformed));
 }
 
 fn logEmbedFailure(kind: []const u8, url: []const u8, status: u16, body: ?[]const u8) void {

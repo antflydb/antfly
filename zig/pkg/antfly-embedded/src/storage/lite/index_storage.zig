@@ -35,6 +35,12 @@ const StorageIo = storage_io.Storage;
 const SegmentSource = @import("../../segment_source.zig").Source;
 const MappedArtifact = @import("../../segment_source.zig").MappedArtifact;
 
+// Root leases use file descriptors and lock markers, independently of mmap.
+const supports_native_artifact_leases = switch (builtin.os.tag) {
+    .linux, .macos, .freebsd, .netbsd, .openbsd, .dragonfly => true,
+    else => false,
+};
+
 const supports_mapped_artifacts = switch (builtin.os.tag) {
     .linux, .macos, .freebsd, .netbsd, .openbsd, .dragonfly => true,
     else => false,
@@ -52,7 +58,7 @@ pub const Store = struct {
         .read_file_range_alloc = readFileRangeAlloc,
         .open_immutable_source = openImmutableSource,
         // Root leases require hosted file descriptors and lock markers.
-        .open_leased_immutable_source = if (supports_mapped_artifacts) openLeasedImmutableSource else null,
+        .open_leased_immutable_source = if (supports_native_artifact_leases) openLeasedImmutableSource else null,
         .map_immutable_artifact = if (supports_mapped_artifacts) mapImmutableArtifact else null,
         .file_size = fileSize,
         .read_file_trailer_alloc = readFileTrailerAlloc,
@@ -520,7 +526,7 @@ const NativeAtomicWriteSink = struct {
         .crc32_prefix = crc32Prefix,
         .crc32_range = crc32Range,
         .finish = finish,
-        .finish_source = if (supports_mapped_artifacts) finishSource else null,
+        .finish_source = if (supports_native_artifact_leases) finishSource else null,
         .finish_mapped = if (supports_mapped_artifacts) finishMapped else null,
         .abort = abort,
         .set_cache_intent = setCacheIntent,
@@ -537,6 +543,10 @@ const NativeAtomicWriteSink = struct {
         const io = self.storage.docs.file.runtime();
         if (self.file) |file| file.close(io);
         if (self.tmp_path) |path| {
+            // A staging path can remain if its initial unlink failed.
+            // Abort and failed publication must remove it even if canceled.
+            const previous = io.swapCancelProtection(.blocked);
+            defer _ = io.swapCancelProtection(previous);
             std.Io.Dir.cwd().deleteFile(io, path) catch {};
             self.allocator.free(path);
         }
@@ -1051,6 +1061,66 @@ test "lite native index storage aborts atomic writes without publishing partial 
     }
 }
 
+test "lite native staged abort removes staging despite pending cancellation" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp, "canceled-staging.aflite");
+    defer alloc.free(path);
+    var pool = std.Io.Threaded.init(alloc, .{ .concurrent_limit = .limited(4) });
+    defer pool.deinit();
+    const io = pool.io();
+    var docs = try docstore.Store.createWithOptions(alloc, path, .{ .no_sync = true, .io = io });
+    defer docs.close();
+    var indexes = Store.init(alloc, &docs);
+    try indexes.storage().writeFileAbsolute("/published", "retained");
+    const State = struct {
+        started: std.Io.Event = .unset,
+        release: std.Io.Event = .unset,
+        failure: ?anyerror = null,
+        fn run(i: std.Io, self: *@This(), storage: StorageIo) void {
+            self.write(i, storage) catch |err| {
+                self.failure = err;
+                self.started.set(i);
+            };
+        }
+        fn write(self: *@This(), i: std.Io, storage: StorageIo) !void {
+            var sink = try storage.beginAtomicWrite(std.testing.allocator, "/block");
+            defer sink.abort();
+            const chunk: [64 * 1024]u8 = @splat('x');
+            try sink.appendSlice(&chunk); // Force a physical staging file.
+            const native_sink: *NativeAtomicWriteSink = @ptrCast(@alignCast(sink.ptr));
+            if (native_sink.tmp_path == null) {
+                // Model a failed initial unlink on POSIX, retaining a named
+                // staging inode so this exercises deletion on every host.
+                const retained_path = try std.fs.path.join(std.testing.allocator, &.{ std.fs.path.dirname(native_sink.storage.docs.file.path).?, ".aflite-write-canceled-regression" });
+                errdefer std.testing.allocator.free(retained_path);
+                const retained_file = try std.Io.Dir.cwd().createFile(i, retained_path, .{ .read = true, .exclusive = true });
+                if (native_sink.file) |file| file.close(i);
+                native_sink.file = retained_file;
+                native_sink.tmp_path = retained_path;
+            }
+            self.started.set(i);
+            // Re-arm the cancellation delivered by the gate so it is
+            // deterministically pending when the deferred abort starts.
+            self.release.wait(i) catch i.recancel();
+        }
+    };
+    var state: State = .{};
+    var child = try io.concurrent(State.run, .{ io, &state, indexes.storage() });
+    state.started.waitUncancelable(io);
+    child.cancel(io);
+    if (state.failure) |err| return err;
+    var iter = tmp.dir.iterate();
+    while (try iter.next(io)) |entry| {
+        try std.testing.expect(!std.mem.startsWith(u8, entry.name, ".aflite-write-"));
+    }
+    try std.testing.expectError(error.FileNotFound, indexes.storage().fileSize("/block"));
+    const retained = try indexes.storage().readFileAlloc(alloc, "/published", 32);
+    defer alloc.free(retained);
+    try std.testing.expectEqualStrings("retained", retained);
+}
+
 test "lite native index storage read-only open rejects mutations" {
     const allocator = std.testing.allocator;
 
@@ -1382,6 +1452,10 @@ test "lite native cold atomic writes preserve hot pages with bounded cache admis
     {
         var docs = try docstore.Store.createWithOptions(alloc, path, .{ .no_sync = true, .io = std.testing.io });
         defer docs.close();
+        // Cache admission assertions need one stable file generation. Automatic
+        // vacuum can replace the file and reclaim its cache during inspection;
+        // concurrent maintenance is covered by the dedicated vacuum tests.
+        docs.maintenance_start_suppressed = true;
         docs.file.page_cache.limit_bytes = 256 * 1024;
         var indexes = Store.init(alloc, &docs);
         const storage = indexes.storage();
@@ -2131,7 +2205,7 @@ test "lite artifact leases transfer retired inode accounting between readers" {
     try std.testing.expect((try cursor.next()) == null);
 }
 
-test "lite artifact leases bounded range scope reduces native identity reads" {
+test "lite artifact leases bounded range scope reduces source identity reads" {
     const a = std.testing.allocator;
     const segment = @import("../../segment.zig");
     var tmp = std.testing.tmpDir(.{});
@@ -2153,43 +2227,38 @@ test "lite artifact leases bounded range scope reduces native identity reads" {
     const bytes = try writer.build();
     defer a.free(bytes);
     try storage.writeFileAbsolute("/segment", bytes);
-    const Counted = struct {
-        backing: SegmentSource,
-        calls: usize = 0,
-        fn read(raw: *anyopaque, offset: u64, out: []u8) !void {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            self.calls += 1;
-            try self.backing.readInto(offset, out);
-        }
-        fn checksum(raw: *anyopaque, offset: u64, length: u64) !u32 {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            var scratch: [8192]u8 = undefined;
-            return self.backing.checksum(offset, length, &scratch);
-        }
-        fn close(raw: *anyopaque) void {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            self.backing.close();
-        }
-    };
-    var counted = Counted{ .backing = try storage.openLeasedImmutableSource(a, "/segment") };
-    var source = SegmentSource{ .ranges = .{ .ptr = &counted, .length = counted.backing.len(), .read_into = Counted.read, .checksum = Counted.checksum, .close = Counted.close } };
+    var source = try storage.openLeasedImmutableSource(a, "/segment");
     var source_open = true;
     defer if (source_open) source.close();
     var reader = try segment.RangeSegmentReader.init(a, source, .{});
     source_open = false;
     defer reader.deinit();
+    // Native artifact and integrity caches may already eliminate physical
+    // reads. Measure calls to that source separately from actual disk reads.
+    const Counting = struct {
+        original: segment.SegmentSource,
+        calls: usize = 0,
+        fn read(ptr: *anyopaque, offset: u64, out_bytes: []u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try self.original.readInto(offset, out_bytes);
+        }
+        fn close(_: *anyopaque) void {}
+    };
+    var counting = Counting{ .original = reader.source };
+    reader.source = .{ .ranges = .{ .ptr = &counting, .length = counting.original.len(), .read_into = Counting.read, .close = Counting.close } };
+    defer reader.source = counting.original;
     const registry = docs.artifact_registry.?;
-    var before = counted.calls;
     const native_before = registry.testPageReads();
     for (0..count) |doc| {
         const id = (try reader.storedDocIdOwned(a, @intCast(doc), 32)).?;
         a.free(id);
     }
-    const baseline = counted.calls - before;
+    const baseline = counting.calls;
     const native_uncached = registry.testPageReads() - native_before;
+    counting.calls = 0;
     var scope = try segment.RangeSegmentReader.ReadScope.init(a, &reader, 256 * 1024);
     defer scope.deinit();
-    before = counted.calls;
     const native_scoped_before = registry.testPageReads();
     for (0..count) |doc| {
         const id = (try scope.storedDocIdOwned(a, @intCast(doc), 32)).?;
@@ -2197,8 +2266,9 @@ test "lite artifact leases bounded range scope reduces native identity reads" {
         var expected: [32]u8 = undefined;
         try std.testing.expectEqualStrings(try std.fmt.bufPrint(&expected, "article-{d:0>6}", .{doc}), id);
     }
-    const cached = counted.calls - before;
+    const cached = counting.calls;
     const native_cached = registry.testPageReads() - native_scoped_before;
+    try std.testing.expect(baseline >= count);
     try std.testing.expect(cached < baseline / 16);
     try std.testing.expect(scope.cache.retainedBytes() <= 256 * 1024);
     std.debug.print("LITE_RANGE_SCOPE documents={d} uncached_provider_calls={d} cached_provider_calls={d} uncached_native_page_reads={d} cached_native_page_reads={d} cache_bytes={d}\n", .{ count, baseline, cached, native_uncached, native_cached, scope.cache.retainedBytes() });
@@ -2243,4 +2313,38 @@ test "lite artifact leases orphan service advances past live markers with bounde
     try std.testing.expectEqual(@as(usize, 64), try artifact.cleanupOrphans(&docs.file, &sweep));
     try std.testing.expectEqual(@as(usize, 1), try artifact.cleanupOrphans(&docs.file, &sweep));
     try std.testing.expect((try docs.checkWithCancel(null)).valid);
+}
+
+test "lite atomic publication returns owned immutable source without requiring mapping" {
+    if (!supports_native_artifact_leases) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "published-source.aflite");
+    defer a.free(path);
+    var docs = try docstore.Store.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io, .reclamation = .{ .enabled = false } });
+    var docs_open = true;
+    defer if (docs_open) docs.close();
+    var store = Store.init(a, &docs);
+    var storage = store.storage();
+    var source_only_storage = storage.vtable.*;
+    source_only_storage.map_immutable_artifact = null;
+    storage.vtable = &source_only_storage;
+    var writer = try storage.beginAtomicWrite(a, "/published");
+    var active = true;
+    defer if (active) writer.abort();
+    try writer.appendSlice("original");
+    try std.testing.expect(writer.vtable.finish_source != null);
+    var source_only_writer = writer.vtable.*;
+    source_only_writer.finish_mapped = null;
+    writer.vtable = &source_only_writer;
+    active = false;
+    var source = try writer.vtable.finish_source.?(writer.ptr);
+    defer source.close();
+    try storage.writeFileAbsolute("/published", "replacement");
+    docs.close();
+    docs_open = false;
+    var bytes: [8]u8 = undefined;
+    try source.readInto(0, &bytes);
+    try std.testing.expectEqualStrings("original", &bytes);
 }

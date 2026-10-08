@@ -4222,7 +4222,9 @@ pub const ApiHttpServer = struct {
         return runtime.apiFilesystemIo();
     }
 
-    fn configuredDurableIo(cfg: ApiHttpServerConfig) ?std.Io {
+    /// Imported views preserve the owning archive's executor state. Rebuilding
+    /// Threaded's vtable from a foreign runtime pointer splits wakeup/TLS state.
+    pub fn configuredDurableIo(cfg: ApiHttpServerConfig) ?std.Io {
         if (cfg.imported_runtime_io) |views| return views.durable;
         const runtime = cfg.backend_runtime orelse return null;
         return runtime.io();
@@ -13924,7 +13926,7 @@ pub const ApiHttpServer = struct {
             error.HAReadWaitForMetadata,
             error.ReadUnavailable,
             => return error.ReadUnavailable,
-            error.DistributedQueryUnavailable => return error.DistributedQueryUnavailable,
+            error.GroupLeaderUnavailable, error.LeaderUnavailable, error.NotLeader, error.UnknownGroup, error.ReadIndexTimeout, error.DistributedQueryUnavailable => return error.DistributedQueryUnavailable,
             error.PersistentDescriptorAdmissionExhausted,
             error.PortableImportPublicationInProgress,
             error.PortableImportRecoveryRequired,
@@ -14122,6 +14124,9 @@ pub const ApiHttpServer = struct {
             return source.lookup(alloc, table_name, key, scoped, consistency) catch |err| switch (err) {
                 error.StorageReadTemporarilyUnavailable,
                 error.StorageKernelOwnerStaleDescriptor,
+                error.CatalogRoutingUnavailable,
+                error.CatalogProjectionRefreshRequired,
+                error.CatalogRoutingSnapshotTimeout,
                 error.NotLeader,
                 error.LeaderUnavailable,
                 error.GroupLeaderUnavailable,
@@ -14281,7 +14286,7 @@ pub const ApiHttpServer = struct {
                 error.HAReadWaitForMetadata,
                 error.ReadUnavailable,
                 => return error.ReadUnavailable,
-                error.DistributedQueryUnavailable => return error.DistributedQueryUnavailable,
+                error.GroupLeaderUnavailable, error.LeaderUnavailable, error.NotLeader, error.UnknownGroup, error.ReadIndexTimeout, error.DistributedQueryUnavailable => return error.DistributedQueryUnavailable,
                 error.PersistentDescriptorAdmissionExhausted,
                 error.StorageBusy,
                 error.StorageKernelOwnerStaleDescriptor,
@@ -14358,7 +14363,7 @@ pub const ApiHttpServer = struct {
             error.HAReadWaitForMetadata,
             error.ReadUnavailable,
             => return error.ReadUnavailable,
-            error.DistributedQueryUnavailable => return error.DistributedQueryUnavailable,
+            error.GroupLeaderUnavailable, error.LeaderUnavailable, error.NotLeader, error.UnknownGroup, error.ReadIndexTimeout, error.DistributedQueryUnavailable => return error.DistributedQueryUnavailable,
             error.PersistentDescriptorAdmissionExhausted,
             error.StorageBusy,
             error.StorageKernelOwnerStaleDescriptor,
@@ -14468,7 +14473,7 @@ pub const ApiHttpServer = struct {
             error.HAReadWaitForMetadata,
             error.ReadUnavailable,
             => return error.ReadUnavailable,
-            error.DistributedQueryUnavailable => return error.DistributedQueryUnavailable,
+            error.GroupLeaderUnavailable, error.LeaderUnavailable, error.NotLeader, error.UnknownGroup, error.ReadIndexTimeout, error.DistributedQueryUnavailable => return error.DistributedQueryUnavailable,
             error.PersistentDescriptorAdmissionExhausted,
             error.StorageBusy,
             error.StorageKernelOwnerStaleDescriptor,
@@ -16158,7 +16163,7 @@ pub const ApiHttpServer = struct {
         var authoritative_snapshot = (self.source.linearizableSnapshot(.{}) catch return .retry) orelse return .retry;
         defer self.source.freeAdminSnapshot(&authoritative_snapshot);
         const table = tables_api.findTableByName(&authoritative_snapshot, pending.table_name) orelse return .complete;
-        var schema = schema_mod.parseValidatedTableSchema(alloc, if (table.schema_json.len == 0) "{}" else table.schema_json) catch return .retry;
+        var schema = schema_mod.parseValidatedTableSchema(alloc, table.schema_json) catch return .retry;
         defer schema.deinit(alloc);
         if (schema.external_base_source != null) {
             self.reconcileNativeLakeIndexes(table.*, schema) catch |err| {
@@ -16314,12 +16319,10 @@ pub const ApiHttpServer = struct {
         try ensureTableOperationActive(request);
         const table_before = (self.loadOwnedTableRecord(alloc, table_name) catch |err| return metadataAccessFailure(err)) orelse return error.NotFound;
         defer metadata_table_manager.freeTable(alloc, table_before);
-        var table_schema = schema_mod.parseValidatedTableSchema(alloc, if (table_before.schema_json.len == 0) "{}" else table_before.schema_json) catch return error.InvalidIndexRequest;
+        var table_schema = schema_mod.parseValidatedTableSchema(alloc, table_before.schema_json) catch return error.InvalidIndexRequest;
         defer table_schema.deinit(alloc);
         const external_table = table_schema.external_base_source != null;
-        const index_json = table_contract.parseCreateIndexRequest(alloc, index_name, body) catch {
-            return error.InvalidIndexRequest;
-        };
+        const index_json = table_contract.parseCreateIndexRequest(alloc, index_name, body) catch return error.InvalidIndexRequest;
         defer alloc.free(index_json);
         const relational = @import("relational_index_mutation.zig");
         if (relational.isRelational(alloc, index_json) catch return error.InvalidIndexRequest) {
@@ -16335,9 +16338,7 @@ pub const ApiHttpServer = struct {
             return response;
         }
         if (relational.contains(alloc, table_before.schema_json, index_name) catch return error.InternalFailure) return error.Conflict;
-        tables_api.validatePublicAlgebraicIndexJson(alloc, index_json) catch {
-            return error.InvalidIndexRequest;
-        };
+        tables_api.validatePublicAlgebraicIndexJson(alloc, index_json) catch return error.InvalidIndexRequest;
         const expanded_index_json = tables_api.expandSchemaDerivedAlgebraicIndexAlloc(alloc, table_name, index_json, table_before.schema_json) catch |err| switch (err) {
             error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest => return error.InvalidIndexRequest,
             else => return error.InternalFailure,
@@ -16389,8 +16390,7 @@ pub const ApiHttpServer = struct {
             },
         };
 
-        const uses_artifact_sources = indexes_api.indexConfigUsesArtifactSources(alloc, normalized_index_json) catch
-            return error.InvalidIndexRequest;
+        const uses_artifact_sources = indexes_api.indexConfigUsesArtifactSources(alloc, normalized_index_json) catch return error.InvalidIndexRequest;
         try self.admitArtifactSources(request, uses_artifact_sources);
 
         const destination_principal = if (request.destination_authorization_principal.len > 0)
@@ -16403,8 +16403,7 @@ pub const ApiHttpServer = struct {
             table_name,
             destination_principal,
             .{ .manager = self.cfg.user_manager, .auth_enabled = self.cfg.auth_enabled },
-        ) catch
-            return error.InvalidIndexRequest;
+        ) catch return error.InvalidIndexRequest;
         defer alloc.free(authorized_index_json);
 
         // Reserve the response before consensus. Nothing after the irreversible
@@ -21471,7 +21470,7 @@ pub const ApiHttpServer = struct {
             error.MetricStale => try contextualQueryTemporarilyUnavailableResponse(self.alloc, .metric_stale),
             error.HAReadRequiresPrimary, error.ReadRequiresPrimary => try contextualQueryTemporarilyUnavailableResponse(self.alloc, .read_requires_primary),
             error.HAReadWaitForApply, error.HAReadWaitForMetadata, error.ReadUnavailable => try contextualQueryTemporarilyUnavailableResponse(self.alloc, .standby_read_unavailable),
-            error.DistributedQueryUnavailable => try contextualQueryTemporarilyUnavailableResponse(self.alloc, .distributed_query_unavailable),
+            error.GroupLeaderUnavailable, error.LeaderUnavailable, error.NotLeader, error.UnknownGroup, error.ReadIndexTimeout, error.DistributedQueryUnavailable => try contextualQueryTemporarilyUnavailableResponse(self.alloc, .distributed_query_unavailable),
             error.StorageBusy, error.PersistentDescriptorAdmissionExhausted, error.StorageReadTemporarilyUnavailable, error.StorageKernelOwnerStaleDescriptor, error.ConcurrencyUnavailable => try contextualQueryTemporarilyUnavailableResponse(self.alloc, .storage_read_temporarily_unavailable),
             error.InvalidManifest,
             error.InvalidTableFile,
@@ -30847,7 +30846,7 @@ test "api http point lookup retries bounded local readiness races" {
         }
     };
 
-    const transient_errors = [_]anyerror{ error.StorageReadTemporarilyUnavailable, error.StorageKernelOwnerStaleDescriptor, error.NotLeader, error.LeaderUnavailable, error.GroupLeaderUnavailable, error.UnknownGroup, error.ReadIndexTimeout, error.TopologyChanged, error.IdentityReadGenerationChanged, error.DocIdentityNamespaceMismatch };
+    const transient_errors = [_]anyerror{ error.StorageReadTemporarilyUnavailable, error.StorageKernelOwnerStaleDescriptor, error.CatalogRoutingUnavailable, error.CatalogProjectionRefreshRequired, error.CatalogRoutingSnapshotTimeout, error.NotLeader, error.LeaderUnavailable, error.GroupLeaderUnavailable, error.UnknownGroup, error.ReadIndexTimeout, error.TopologyChanged, error.IdentityReadGenerationChanged, error.DocIdentityNamespaceMismatch };
     for (transient_errors) |first_error| {
         var reads = FakeReads{ .first_error = first_error };
         var server = ApiHttpServer.init(
@@ -42691,6 +42690,11 @@ test "api http server preserves public query availability errors" {
         .{ .query_error = error.MetricStale, .status = 503, .body = "", .json = true, .unavailable_code = "metric_stale", .unavailable_message = "graph metric is awaiting a fresh generation" },
         .{ .query_error = error.ReadUnavailable, .status = 503, .body = "", .json = true, .unavailable_code = "standby_read_unavailable", .unavailable_message = "standby read unavailable" },
         .{ .query_error = error.DistributedQueryUnavailable, .status = 503, .body = "", .json = true, .unavailable_code = "distributed_query_unavailable", .unavailable_message = "distributed query unavailable" },
+        .{ .query_error = error.GroupLeaderUnavailable, .status = 503, .body = "", .json = true, .unavailable_code = "distributed_query_unavailable", .unavailable_message = "distributed query unavailable" },
+        .{ .query_error = error.LeaderUnavailable, .status = 503, .body = "", .json = true, .unavailable_code = "distributed_query_unavailable", .unavailable_message = "distributed query unavailable" },
+        .{ .query_error = error.NotLeader, .status = 503, .body = "", .json = true, .unavailable_code = "distributed_query_unavailable", .unavailable_message = "distributed query unavailable" },
+        .{ .query_error = error.UnknownGroup, .status = 503, .body = "", .json = true, .unavailable_code = "distributed_query_unavailable", .unavailable_message = "distributed query unavailable" },
+        .{ .query_error = error.ReadIndexTimeout, .status = 503, .body = "", .json = true, .unavailable_code = "distributed_query_unavailable", .unavailable_message = "distributed query unavailable" },
         .{ .query_error = error.ReadRequiresPrimary, .status = 503, .body = "", .json = true, .unavailable_code = "read_requires_primary", .unavailable_message = "read requires primary" },
         .{ .query_error = error.StorageReadTemporarilyUnavailable, .status = 503, .body = "", .json = true, .unavailable_code = "storage_read_temporarily_unavailable", .unavailable_message = "storage read temporarily unavailable" },
         .{ .query_error = error.StorageKernelOwnerStaleDescriptor, .status = 503, .body = "", .json = true, .unavailable_code = "storage_read_temporarily_unavailable", .unavailable_message = "storage read temporarily unavailable" },
@@ -44497,6 +44501,7 @@ test "api http server create index installs exact visible config and defers lagg
                 .body = case.body,
             });
             defer response.deinit(alloc);
+            if (response.status != 201) std.debug.print("create-index fixture {s}: status={} body={s}\n", .{ case.name, response.status, response.body });
             try std.testing.expectEqual(@as(u16, 201), response.status);
             var stored = try indexes_api.lookupSingleIndexConfig(alloc, artifact_source.indexes_json, case.name);
             defer if (stored) |*found| found.deinit();

@@ -8481,7 +8481,13 @@ pub fn decoderRuntimeScatterAddAxis0F32Device(
 ) !?MetalTensor {
     const runtime = self.raw_decode_runtime orelse return null;
     if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
-    if (!values.isDevice() or !indices.isDevice()) return null;
+    if (!values.isDevice() or !indices.isDevice() or values.dtype != .f32) return null;
+    const index_type: u32 = switch (indices.dtype) {
+        .f32 => 0,
+        .i32 => 1,
+        .i64 => 2,
+        else => return null,
+    };
     if (out_rows == 0 or value_rows == 0 or dim == 0) return null;
     if (value_rows > std.math.maxInt(usize) / dim or out_rows > std.math.maxInt(usize) / dim) return null;
     if (values.elemCount() != value_rows * dim or indices.elemCount() < value_rows) return null;
@@ -8494,6 +8500,7 @@ pub fn decoderRuntimeScatterAddAxis0F32Device(
         values.deviceByteOffset(),
         indices.deviceHandle(),
         indices.deviceByteOffset(),
+        index_type,
         out_rows,
         value_rows,
         dim,
@@ -21571,6 +21578,7 @@ pub extern fn termite_metal_decode_runtime_scatter_add_axis0_f32_device(
     values_offset: usize,
     indices_handle: ?*anyopaque,
     indices_offset: usize,
+    index_type: u32,
     out_rows: usize,
     value_rows: usize,
     dim: usize,

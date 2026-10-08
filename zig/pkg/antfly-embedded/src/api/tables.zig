@@ -264,6 +264,8 @@ pub fn cloneJsonValueAlloc(alloc: std.mem.Allocator, value: std.json.Value) !std
 /// Admission and publication share a table-wide declaration ceiling. Public
 /// recipes must not commit definitions that can never fit their artifact directory.
 pub fn validateLakeIndexCapacity(a: std.mem.Allocator, schema_json: []const u8, indexes_json: []const u8) !void {
+    // Empty schemas are the supported default for native document tables.
+    if (schema_json.len == 0) return;
     var schema = try std.json.parseFromSlice(std.json.Value, a, schema_json, .{});
     defer schema.deinit();
     if (schema.value != .object) return;
@@ -301,6 +303,7 @@ pub fn validateLakeIndexCapacity(a: std.mem.Allocator, schema_json: []const u8, 
 
 test "lake catalog admission bounds recipes across indexes before commit" {
     const a = std.testing.allocator;
+    try validateLakeIndexCapacity(a, "", "{\"native_index\":{\"type\":\"embeddings\"}}");
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const aa = arena.allocator();

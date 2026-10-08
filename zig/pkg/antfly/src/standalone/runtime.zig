@@ -2479,7 +2479,7 @@ const LocalStandaloneMetadata = struct {
         {
             try server.hot_standby_public_gate_state.checkWrite(server.hot_standby_public_gate_state.currentGeneration());
         };
-        if (!lockAtomicUntil(&self.mutex, context.deadline_ns)) return error.DeadlineExceeded;
+        if (!lockAtomicUntil(&self.mutex, (try context.platformDeadline()).deadline_ns)) return error.DeadlineExceeded;
         var locked = true;
         defer if (locked) self.mutex.unlock();
         if (self.catalog_durability_failed) return error.MetadataMutationOutcomeUnknown;
@@ -5245,6 +5245,7 @@ pub fn runFromIterator(
             .extension_package_store_dir = resolved.extension_package_store_dir,
             .node_config = if (loaded_config) |*cfg| cfg else null,
             .native_lake_artifact_base_dir = data_dir,
+            .backup_staging_root = data_dir,
             .user_manager = if (user_manager) |*manager| manager else null,
             .session_store = if (lite_session_store) |*store| store else if (native_sessions) |*store| store else null,
             .restore_job_store = if (local_metadata.lifecycle_store == null) restore_job_store else null,
@@ -14394,6 +14395,28 @@ test "system catalog standalone routing generation retains old identity through 
     try std.testing.expectEqual(revision, old.snapshot.value.catalog_revision);
     try std.testing.expect(!old.table_indexes.contains("new"));
     try std.testing.expect(current.table_indexes.contains("new"));
+
+    // Pgwire supplies an Io awake deadline, whose epoch need not agree with
+    // the platform clock used by the catalog mutex. A valid remaining budget
+    // must survive that boundary, while an expired one must still fail.
+    const FakeClock = struct {
+        fn now(raw: ?*anyopaque, _: std.Io.Clock) std.Io.Timestamp {
+            const value: *const u64 = @ptrCast(@alignCast(raw.?));
+            return .{ .nanoseconds = value.* };
+        }
+    };
+    var clock_now: u64 = 10;
+    var clock_vtable = std.testing.io.vtable.*;
+    clock_vtable.now = FakeClock.now;
+    const clock_io: std.Io = .{ .userdata = &clock_now, .vtable = &clock_vtable };
+    const context: antfly.public_api.operation.RequestContext = .{
+        .deadline_ns = clock_now + std.time.ns_per_s,
+        .deadline_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&clock_io),
+    };
+    const page = try metadata.statusSource().systemCatalog(alloc, context, .{ .list_tables = .{} });
+    defer alloc.free(page);
+    clock_now = context.deadline_ns.?;
+    try std.testing.expectError(error.DeadlineExceeded, metadata.statusSource().systemCatalog(alloc, context, .{ .list_tables = .{} }));
 }
 
 test "system catalog standalone imports main checkpoints and current logical seeds atomically" {

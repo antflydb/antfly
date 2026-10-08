@@ -762,7 +762,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     const lib_common_config_tests = b.addTest(.{
         .root_module = antfly_test_mod,
-        .filters = &.{"common config"},
+        .filters = &.{ "common config", "external lake native artifact collection config validates bounded operator controls" },
         .test_runner = .{
             .path = b.path("pkg/antfly-embedded/src/test_runner.zig"),
             .mode = .simple,
@@ -1711,7 +1711,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     lib_bedrock_test_step.dependOn(&run_lib_bedrock_tests.step);
 
     const api_http_runtime_default_filters = [_][]const u8{
-        "ChatGPT connector policy",
+        "caller cancellation does not interrupt protected child work",
+        "httpx SQL dispatch preserves imported executor authority including unavailable views",
+        "SQL pgwire dispatch preserves imported executor authority including unavailable views",
+        "httpx antfly ChatGPT connector policy",
         "storage-kernel query request preserves final projection while raw retrieval defers it",
         "api http server executes direct foreign table aggregations through registry",
         "unconfigured remote catalog authority skips background work without borrowing internal credentials",
@@ -2591,6 +2594,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     const run_lake_scaffold_tests = addFilteredTestRunArtifact(b, lake_scaffold_tests);
+    // The query engine owner runs the shared bitmap kernels. Lake-named
+    // regressions must not acquire a second owner through this broad filter.
+    addRuntimeSkipTestFilters(run_lake_scaffold_tests, &.{"encoding.roaring.test."});
     const lake_integration_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/lake_integration_test_root.zig"),
         .target = target,
@@ -6280,6 +6286,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.artifact_producer_input.",
             "storage.db.artifact_producer_obligations.",
             "storage.db.artifact_producer_readiness.",
+            "storage.db.artifact_reprocess_intent.",
             "storage.memory_budget.",
             "storage.test_allocator.",
             "storage.db.artifact_producer_provenance.",
@@ -6368,6 +6375,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
             "storage.db.column_read_cache.",
             "storage.db.column_scan_plan.",
+            "storage.db.column_source.",
             "storage.db.db.",
             "storage.db.dense_exact.",
             "storage.db.doc_filter_wire.",
@@ -6409,6 +6417,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.source_publication_job.",
             "storage.db.mod.",
             "storage.db.native_backup.",
+            "storage.db.snapshot_staging.",
             "storage.db.ownership.",
             "storage.db.planning_stats.",
             "storage.db.planning_bindings.",
@@ -6922,7 +6931,6 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "metadata.table_workflow.",
             "metadata.transition_state.",
             "metadata.relational_topology_admission.",
-            "transition actions module compiles",
             "metadata.transition_controller.",
             "metadata.transition_driver.",
             "metadata.online_merge.",
