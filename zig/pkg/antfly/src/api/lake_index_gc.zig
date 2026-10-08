@@ -240,6 +240,7 @@ pub const Collector = struct {
                 const root = try self.retainedNativeRoot(a, @import("lake_index_ordered_rows.zig"), ref);
                 try self.markPages(a, root.domain, root.page, true);
                 try self.markPages(a, root.domain, root.reverse, false);
+                try self.markPages(a, root.domain, root.predicates, false);
             },
             // These lake producers publish self-contained segments. New paged
             // formats must register a child-reference walker before GC accepts
@@ -257,6 +258,13 @@ pub const Collector = struct {
                 if (ref.metadata_version >= 1 and ref.metadata_version <= @import("lake_index_native_text.zig").metadata_version) {
                     try stores.chargeReadBudget(&self.remaining_reads, ref.byte_len);
                     const root = try self.retainedNativeRoot(a, @import("lake_index_native_text.zig"), ref);
+                    for (root.manifests) |manifest| {
+                        try stores.chargeReadBudget(&self.remaining_reads, manifest.byte_len);
+                        _ = try self.mark(manifest);
+                    }
+                    for (root.file_groups) |group| for (group.rows) |block| {
+                        if (block.bitmap) |bitmap| _ = try self.mark(bitmap);
+                    };
                     for (root.segments) |segment| {
                         if (root.seekable) {
                             if (self.progress) |progress| try progress.enqueue(.{ .text_directory = segment }) else try self.markTextDirectory(a, segment);
@@ -389,10 +397,25 @@ test "external lake native GC retains shared aggregate blocks and durable reader
     text_binding.sidecar_kind = .text;
     var text_segment = try store.put("authenticated native text child");
     defer text_segment.deinit(a);
-    const text_root_bytes = try std.json.Stringify.valueAlloc(ca, @import("lake_index_native_text.zig").Root{ .version = 1, .domain = domain, .binding = text_binding, .config_json = "{}", .segments = &.{.{ .artifact_id = text_segment.artifact_id, .checksum = text_segment.checksum, .byte_len = text_segment.byte_len }} }, .{});
+    var holes = local.encoding_roaring.RoaringBitmap.init(a);
+    defer holes.deinit();
+    try holes.add(0);
+    try holes.add(2);
+    const hole_bytes = try holes.toBytes(ca);
+    var hole_upload = try store.put(hole_bytes);
+    defer hole_upload.deinit(a);
+    const text = @import("lake_index_native_text.zig");
+    const manifest_bytes = try std.json.Stringify.valueAlloc(ca, text.FileGroup{
+        .file = .{ .id = "part", .digest = @splat(7) },
+        .segments = &.{.{ .artifact_id = text_segment.artifact_id, .checksum = text_segment.checksum, .byte_len = text_segment.byte_len }},
+        .rows = &.{.{ .group = 0, .high = 0, .base = 0, .count = 2, .lower = 0, .bitmap = .{ .artifact_id = hole_upload.artifact_id, .checksum = hole_upload.checksum, .byte_len = hole_upload.byte_len } }},
+    }, .{});
+    var text_manifest = try store.put(manifest_bytes);
+    defer text_manifest.deinit(a);
+    const text_root_bytes = try std.json.Stringify.valueAlloc(ca, text.Root{ .domain = domain, .binding = text_binding, .config_json = "{}", .manifests = &.{.{ .artifact_id = text_manifest.artifact_id, .checksum = text_manifest.checksum, .byte_len = text_manifest.byte_len }} }, .{});
     var text_upload = try store.put(text_root_bytes);
     defer text_upload.deinit(a);
-    const text_ref: local.serverless_manifest_artifact_ref.ArtifactRef = .{ .name = "text", .kind = .text_segment, .metadata_version = 1, .artifact_id = text_upload.artifact_id, .checksum = text_upload.checksum, .byte_len = text_upload.byte_len };
+    const text_ref: local.serverless_manifest_artifact_ref.ArtifactRef = .{ .name = "text", .kind = .text_segment, .metadata_version = @import("lake_index_native_text.zig").metadata_version, .artifact_id = text_upload.artifact_id, .checksum = text_upload.checksum, .byte_len = text_upload.byte_len };
     var sparse_binding = binding;
     sparse_binding.sidecar_kind = .sparse;
     var sparse_child = try store.put("authenticated native sparse file block");
@@ -490,6 +513,12 @@ test "external lake native GC retains shared aggregate blocks and durable reader
     var second: Collector = .{ .a = a, .table = 4, .authority = authority, .store = store, .identity = identity, .context = .{}, .options = .{ .dry_run = false }, .token = @splat(8) };
     try std.testing.expect((try second.run()).deleted >= 2);
     try std.testing.expectEqual(@as(usize, 1), harness.state.publications.len);
+    const retained_holes = try store.getAlloc(hole_upload.artifact_id);
+    defer a.free(retained_holes);
+    try std.testing.expectEqualSlices(u8, hole_bytes, retained_holes);
+    const retained_manifest = try store.getAlloc(text_manifest.artifact_id);
+    defer a.free(retained_manifest);
+    try std.testing.expectEqualSlices(u8, manifest_bytes, retained_manifest);
     const retained_sparse = try store.getAlloc(sparse_child.artifact_id);
     defer a.free(retained_sparse);
     try std.testing.expectEqualStrings("authenticated native sparse file block", retained_sparse);

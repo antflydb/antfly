@@ -52,6 +52,13 @@ pub const Delivery = struct {
     /// Public transport owns the result until completion. Once spooled, source
     /// leases can be released eagerly; reusable/internal callers leave false.
     consume_columns: bool = false,
+    /// Synchronous bounded preparation while the producer's snapshot is leased.
+    /// Only consumed/spooled delivery invokes this; reusable results stay eager.
+    hydrator: ?struct {
+        ptr: *anyopaque,
+        load: *const fn (*anyopaque, std.mem.Allocator, []@import("../storage/db/types.zig").SearchHit) anyerror!void,
+        release: *const fn (*anyopaque, []@import("../storage/db/types.zig").SearchHit) void,
+    } = null,
     pub const Writer = struct {
         sink: Delivery,
         buffer: [16 * 1024]u8 = undefined,

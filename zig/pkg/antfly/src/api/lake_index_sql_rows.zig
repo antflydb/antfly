@@ -425,6 +425,16 @@ pub const Predicate = struct {
         const owner: *Owner = @ptrCast(@alignCast(self.cursor.ptr));
         return owner.predicate_count;
     }
+    pub fn hasBlocks(self: Predicate) bool {
+        if (self.scan) return false;
+        const owner: *Owner = @ptrCast(@alignCast(self.cursor.ptr));
+        return owner.reader.root.predicates != null;
+    }
+    pub fn nextBlocks(self: *Predicate, a: A) ![]const ordered.predicate_blocks.Block {
+        const owner: *Owner = @ptrCast(@alignCast(self.cursor.ptr));
+        try owner.read_context.ensureActive();
+        return owner.reader.nextPredicateBlocks(a, owner.predicate_lower, owner.predicate_upper);
+    }
     pub fn nextPhysical(self: *Predicate, a: A, count: usize) ![]const local.storage_rowsource_types.RowRef {
         if (self.scan) return self.next(a, count);
         const owner: *Owner = @ptrCast(@alignCast(self.cursor.ptr));
@@ -473,11 +483,19 @@ fn searchConditionsCompatible(runtime: local.storage_schema.TableSchema, conditi
             if (std.mem.eql(u8, column.name, condition.column)) break column.column_type;
         } else return false;
         const compatible = switch (kind) {
-            .string => condition.value == .string,
+            .string => condition.value == .string and (condition.op == .eq or blk: {
+                // The shared standard-range evaluator interprets RFC3339
+                // bounds chronologically; a lexical tuple index cannot prove it.
+                _ = local.storage_db_query_graph_exec.jsonDateNsFromValue(condition.value) catch break :blk true;
+                break :blk false;
+            }),
             .integer => condition.value == .integer,
-            .number => condition.value == .integer or condition.value == .float,
+            .number => condition.value == .float or (condition.value == .integer and blk: {
+                const rounded: f64 = @floatFromInt(condition.value.integer);
+                break :blk (@as(i128, @intFromFloat(rounded)) == condition.value.integer);
+            }),
             .boolean => condition.value == .bool,
-            .datetime => condition.op != .eq and (condition.value == .string or condition.value == .integer),
+            .datetime => false,
             else => false,
         };
         if (!compatible) return false;

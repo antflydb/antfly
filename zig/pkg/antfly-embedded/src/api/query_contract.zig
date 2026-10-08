@@ -3775,6 +3775,7 @@ fn ColumnWireResult(comptime T: type) type {
         hits: []db_mod.types.SearchHit,
         req: db_mod.types.SearchRequest,
         scratch: *std.heap.ArenaAllocator,
+        alloc: std.mem.Allocator,
         failure: *?anyerror,
         plan: ?*ColumnWirePlan = null,
         pub fn jsonStringify(self: @This(), w: *std.json.Stringify) std.json.Stringify.Error!void {
@@ -3788,7 +3789,22 @@ fn ColumnWireResult(comptime T: type) type {
                     try w.objectField("hits");
                     try w.beginArray();
                     var released: usize = 0;
-                    for (self.base.hits.?.hits.?, self.hits, 0..) |api_hit, hit, hit_index| {
+                    var hit_arena = std.heap.ArenaAllocator.init(self.alloc);
+                    defer hit_arena.deinit();
+                    for (self.base.hits.?.hits.?, self.hits, 0..) |base_hit, _, hit_index| {
+                        const hydrator = if (self.plan) |plan| plan.sink.hydrator else null;
+                        if (hydrator) |loader| if (hit_index % 64 == 0) {
+                            loader.load(loader.ptr, self.alloc, self.hits[hit_index..@min(self.hits.len, hit_index + 64)]) catch |err| {
+                                self.failure.* = err;
+                                return error.WriteFailed;
+                            };
+                        };
+                        const hit = self.hits[hit_index];
+                        _ = hit_arena.reset(.retain_capacity);
+                        const api_hit = if (hydrator != null) toOpenApiHit(hit_arena.allocator(), self.req, hit) catch |err| {
+                            self.failure.* = err;
+                            return error.WriteFailed;
+                        } else base_hit;
                         if (self.req.cancellation) |token| token.check() catch |err| {
                             self.failure.* = err;
                             return error.WriteFailed;
@@ -3827,6 +3843,7 @@ fn ColumnWireResult(comptime T: type) type {
                                 if (consumed.column_source) |source| source.deinit();
                                 consumed.column_source = null;
                             }
+                            if (plan.sink.hydrator) |loader| loader.release(loader.ptr, self.hits[released .. hit_index + 1]);
                             released = hit_index + 1;
                         };
                     }
@@ -3853,6 +3870,10 @@ fn encodeColumnWire(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest, b
         var plan: ColumnWirePlan = undefined;
         plan.init(alloc, sink, req);
         defer plan.deinit();
+        if (sink.hydrator != null) {
+            if (!sink.consume_columns or sink.spill_io == null) return error.InvalidArgument;
+            try plan.startSpill();
+        }
         // Bound pinned decoded payloads too. Unique page accounting avoids
         // charging a shared page once per hit. The set is itself budgeted.
         if (sink.consume_columns and sink.spill_io != null) {
@@ -3868,7 +3889,7 @@ fn encodeColumnWire(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest, b
                 }
             };
         }
-        const wrapped = ColumnWireResult(@TypeOf(base)){ .base = base, .hits = hits, .req = req, .scratch = &scratch, .failure = &failure, .plan = &plan };
+        const wrapped = ColumnWireResult(@TypeOf(base)){ .base = base, .hits = hits, .req = req, .scratch = &scratch, .alloc = alloc, .failure = &failure, .plan = &plan };
         std.json.Stringify.value(.{ .responses = &.{wrapped} }, options, &plan.writer) catch |err| return failure orelse (plan.failure orelse err);
         plan.writer.flush() catch |err| return plan.failure orelse err;
         // Every prepared fragment now belongs to residency or the spool.
@@ -3896,7 +3917,7 @@ fn encodeColumnWire(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest, b
         delivered.* = plan.length;
         return empty;
     }
-    const wrapped = ColumnWireResult(@TypeOf(base)){ .base = base, .hits = hits, .req = req, .scratch = &scratch, .failure = &failure };
+    const wrapped = ColumnWireResult(@TypeOf(base)){ .base = base, .hits = hits, .req = req, .scratch = &scratch, .alloc = alloc, .failure = &failure };
     return std.json.Stringify.valueAlloc(alloc, .{ .responses = &.{wrapped} }, options) catch |err| return failure orelse err;
 }
 
@@ -3966,7 +3987,7 @@ pub fn encodeQueryResponsesWithDelivery(
                 .table = req.response_table_name orelse table_name,
                 .remote_snapshot = meta.remote_snapshot,
             };
-            break :blk if (hasColumnSources(emitted_hits)) try encodeColumnWire(alloc, req, query_results[0], emitted_hits, delivery, &delivered) else try std.json.Stringify.valueAlloc(
+            break :blk if (hasColumnSources(emitted_hits) or (if (delivery) |sink| sink.hydrator != null else false)) try encodeColumnWire(alloc, req, query_results[0], emitted_hits, delivery, &delivered) else try std.json.Stringify.valueAlloc(
                 alloc,
                 metadata_openapi.QueryResponses{ .responses = query_results },
                 .{ .emit_null_optional_fields = false },
@@ -3998,7 +4019,7 @@ pub fn encodeQueryResponsesWithDelivery(
                 .table = req.response_table_name orelse table_name,
                 .remote_snapshot = meta.remote_snapshot,
             };
-            break :blk if (hasColumnSources(emitted_hits)) try encodeColumnWire(alloc, req, query_results[0], emitted_hits, delivery, &delivered) else try std.json.Stringify.valueAlloc(
+            break :blk if (hasColumnSources(emitted_hits) or (if (delivery) |sink| sink.hydrator != null else false)) try encodeColumnWire(alloc, req, query_results[0], emitted_hits, delivery, &delivered) else try std.json.Stringify.valueAlloc(
                 alloc,
                 metadata_openapi.StatefulQueryResponses{ .responses = query_results },
                 .{ .emit_null_optional_fields = false },

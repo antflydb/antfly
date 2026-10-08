@@ -589,6 +589,42 @@ pub const RoaringBitmap = struct {
         try container.add(self.alloc, low);
     }
 
+    /// Union a half-open interval using word kernels for dense containers.
+    /// The u64 upper endpoint permits including maxInt(u32) without wrapping.
+    pub fn addRange(self: *RoaringBitmap, lower: u32, upper: u64) !void {
+        if (upper > @as(u64, 1) << 32 or upper < lower) return error.InvalidRange;
+        if (upper == lower) return;
+        self.invalidateRankCache();
+        var position: u64 = lower;
+        while (position < upper) {
+            const key: u16 = @intCast(position >> 16);
+            const end = @min(upper, ((position >> 16) + 1) << 16);
+            const begin_low: u32 = @intCast(position & 0xffff);
+            const end_low: u32 = @intCast(end - (@as(u64, key) << 16));
+            const container = try self.getOrCreateChunk(key);
+            if (container.* == .array and container.array.items.len + end_low - begin_low <= array_max) {
+                for (begin_low..end_low) |low| try container.add(self.alloc, @intCast(low));
+            } else {
+                if (container.* == .array) {
+                    const bitmap = try self.alloc.alloc(u64, bitmap_words);
+                    @memset(bitmap, 0);
+                    for (container.array.items) |low| bitmapSet(bitmap, low);
+                    container.array.deinit(self.alloc);
+                    container.* = .{ .bitmap = bitmap };
+                }
+                const first = begin_low / 64;
+                const last = (end_low - 1) / 64;
+                for (first..last + 1) |word| {
+                    const start_bit: u6 = if (word == first) @intCast(begin_low % 64) else 0;
+                    const end_bits = if (word == last) (end_low - 1) % 64 + 1 else 64;
+                    const mask = (@as(u64, std.math.maxInt(u64)) << start_bit) & (if (end_bits == 64) std.math.maxInt(u64) else (@as(u64, 1) << @as(u6, @intCast(end_bits))) - 1);
+                    container.bitmap[word] |= mask;
+                }
+            }
+            position = end;
+        }
+    }
+
     /// Bulk-add a strictly-ascending slice of u32 values. The caller asserts
     /// that `vals` is sorted ascending and free of duplicates within the slice;
     /// values may still collide with existing bitmap members (those are deduped).
@@ -1898,4 +1934,25 @@ test "external lake bitmap seeks skip containers and preserve bit and array boun
     try std.testing.expectEqual(@as(?u32, 200003), it.next());
     it.seek(200004);
     try std.testing.expectEqual(@as(?u32, null), it.next());
+}
+
+test "external lake bitmap interval kernels preserve overlaps chunk boundaries and u32 endpoints" {
+    var bitmap = RoaringBitmap.init(std.testing.allocator);
+    defer bitmap.deinit();
+    try bitmap.add(1);
+    try bitmap.addRange(65534, 65540);
+    try bitmap.addRange(65536, 70000);
+    try bitmap.addRange(std.math.maxInt(u32), @as(u64, 1) << 32);
+    try std.testing.expectEqual(@as(usize, 4468), bitmap.cardinality());
+    try std.testing.expect(bitmap.contains(1));
+    try std.testing.expect(!bitmap.contains(65533));
+    try std.testing.expect(bitmap.contains(65534));
+    try std.testing.expect(bitmap.contains(69999));
+    try std.testing.expect(!bitmap.contains(70000));
+    try std.testing.expect(bitmap.contains(std.math.maxInt(u32)));
+    const bytes = try bitmap.toBytes(std.testing.allocator);
+    defer std.testing.allocator.free(bytes);
+    var decoded = try RoaringBitmap.fromBytes(std.testing.allocator, bytes);
+    defer decoded.deinit();
+    try std.testing.expect(bitmap.eql(&decoded));
 }

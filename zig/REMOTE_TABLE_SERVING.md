@@ -1045,16 +1045,69 @@ a residual predicate, but an exclusion never discards rows using a superset.
 Unsupported expressions retain the shared exact residual evaluator.
 
 The consumer builds a Roaring bitmap in the pinned text snapshot's document
-number space. Selective predicates seek file-local, ascending text identities;
-broad predicates traverse the physical reverse tree and merge those identities
-in order. Neither path hydrates Parquet predicate columns or constructs a string
-ID list proportional to matching rows. The bitmap is applied before top-k
-ranking, preserves global BM25 statistics, and also constrains exact counts.
-Final result hydration keeps existing snapshot/delete checks and file/row-group
-selection. Native text metadata version 7 attests identity order; older text
-publications require rebuilding. This optimization covers native text search,
-including filtered field sorting; vector-only and mixed vector queries retain
-their existing identity resolver.
+number space. Both selective and broad predicates seek the tuple bounds in an immutable
+compressed row-set tree. Contiguous per-tuple/file/group physical blocks encode
+as extents; scattered selections encode as Roaring sets. Broad categorical
+predicates consume blocks rather than one forward record per matching row.
+Initial publication aggregates the sorted tuple stream; incremental publication
+replaces only changed-file blocks through bounded spill and copy-on-write pages.
+The forward/reverse trees remain available for SQL seeks and file replacement;
+predicate evaluation does not scan the unrelated physical reverse tree. Native text metadata version 8
+publishes a delete-aware physical-row ordinal directory per file. Contiguous
+2^20-row blocks need only an ordinal base and extent; blocks with holes use an
+authenticated Roaring bitmap and rank. Group identifiers and the high bits of
+64-bit row coordinates select blocks without truncation. Mapping an index result
+needs neither formatted private IDs nor binary/sequential stored-ID decoding.
+The bitmap is applied before top-k and exact counts, preserving corpus statistics.
+Text metadata version 8 and ordered-row metadata version 5 rebuild automatically
+under reader/topology protocol 33. Existing publication and spill quotas still
+apply; this change does not claim a measured 50-million-row build capacity.
+
+Planning consumes the shared compiled predicate IR. Shorthand terms, field/path
+aliases, range aliases and boolean structure have one grammar. Standard numeric
+ranges compare integers exactly, including mixed integer/float bounds, using the
+same scalar order as SQL. A planner uses a tuple index only when its order proves
+the shared predicate: RFC3339 ranges over string columns retain chronological
+fallback evaluation, and integer bounds that cannot be represented exactly in a
+floating-point index remain residual. Explicit datetime columns also retain the
+shared evaluator until their unit/normalization contract is proven compatible.
+
+Dense, sparse and mixed retrieval use compressed physical-row predicate sets,
+without the legacy 100,000 matching-ID limit. Dense leaf admission reuses batched
+native metadata reads before scoring; scalar/rerank paths enforce the same
+membership callback and propagate errors. Sparse postings point-seek existing
+native reverse identities and cache accepted/rejected doc numbers in compressed
+bitmaps across terms. Membership is enforced before top-k, including when a lower
+scoring eligible row would otherwise fall outside an unfiltered candidate page.
+Candidate scoring still follows each native index's search/effort semantics.
+
+Native field sorting can use the shared doc-value top-N heap for remote text.
+It iterates compressed membership instead of materializing all candidate doc
+numbers and projects public IDs before tie breaking or cursor comparison. Only
+the selected page loads source. Public scores are evaluated for that page against
+the original query and complete corpus statistics. A producer's private-ID sorted
+segment attestation does not imply public-ID order; such plans use the native
+comparator heap. This path requires complete native doc-value coverage.
+
+Corpus construction assembles bounded projection batches (65,536 documents,
+8 MiB source bytes or 24 MiB arena capacity, whichever comes first), then uses the
+shared 8 MiB segment/32 MiB build-budget splitter. Resetting the projection arena
+releases its capacity before the next batch. The old 1,024-document flush and
+512 MiB total encoded-output limit no longer bound a corpus. Immutable per-file
+manifests keep segment and ordinal references out of the bounded root; unchanged
+files reuse their segments and ordinal maps. Manifest metadata, segment sizes,
+snapshot doc-number capacity, cache admission and cancellation remain bounded.
+GC follows manifests, ordinal hole bitmaps and native segment directories for
+both current publications and retained reader roots, with durable continuation.
+
+Public consumed delivery can hydrate 64 ranked hits at a time, grouping physical
+reads inside each window, attach highlights from hidden dependencies and append
+validated fragments directly to the private response spool. Source leases and
+highlight payloads are released after each fragment. A complete hydrated source
+array is no longer retained before spooling. Validation, exact length accounting
+and resource failures still precede headers; replay retains the publication lease
+and observes backpressure. Internal reusable results remain eager. Ranking/result
+metadata is still admitted separately; this is not an unbounded result cursor.
 
 When a scalar predicate has no published index, the same consumer can use a
 bounded typed SQL scan. It pushes conditions into Iceberg partition, Parquet

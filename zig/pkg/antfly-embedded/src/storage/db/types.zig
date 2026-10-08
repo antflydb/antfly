@@ -1936,6 +1936,8 @@ pub const SearchRequest = struct {
     // Internal text-index execution hook. This is request-local state used to
     // avoid converting text-native doc nums through shard ordinals and back.
     resolved_text_doc_filter: ?*const anyopaque = null,
+    /// Request-local native metadata membership, never serialized to workers.
+    native_key_predicate: ?struct { ptr: *anyopaque, allows: *const fn (*anyopaque, []const u8) anyerror!bool } = null,
     resolved_doc_filter_owned: bool = false,
     resolved_doc_filter_wire_context: ?ResolvedDocFilterWireContext = null,
     /// Request-local authorization hook used only by the distributed graph
@@ -2055,6 +2057,7 @@ const hierarchy_children_rejected_fields = [_][]const u8{
     "filter_ids",
     "exclude_ids",
     "resolved_text_doc_filter",
+    "native_key_predicate",
     "graph_table_read_authorizer",
     "require_algebraic_filter_resolution",
     "distributed_text_stats",

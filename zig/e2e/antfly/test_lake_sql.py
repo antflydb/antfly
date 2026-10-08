@@ -1222,6 +1222,20 @@ def test_native_remote_text_corpus_scores_filters_and_restart(tmp_path):
             "row-2055",
         }
         assert all(hit["_score"] > 0 for hit in hits)
+        # Native doc-value top-N uses public IDs/cursors and hydrates only the
+        # selected page. Public scores still use the complete BM25 corpus.
+        native_order = dict(request, full_text_index="all_text", fields=["label"],
+            order_by=[{"field": "amount", "desc": True}], profile=True, limit=2)
+        ordered = call("POST", "/tables/lake_text/query", native_order)
+        assert [h["_source"]["label"] for h in ordered["hits"]["hits"]] == ["row-2055", "row-129"], ordered
+        assert ordered["profile"]["sort"]["plan"] == "native_doc_values_top_n", ordered
+        assert all(h["_id"].startswith("lake1:") for h in ordered["hits"]["hits"]), ordered
+        next_ordered = call("POST", "/tables/lake_text/query", dict(native_order,
+            search_after=ordered["hits"]["hits"][-1]["_sort"], remote_snapshot=ordered["remote_snapshot"]))
+        assert [h["_source"]["label"] for h in next_ordered["hits"]["hits"]] == ["row-18", "row-17"], next_ordered
+        previous_ordered = call("POST", "/tables/lake_text/query", dict(native_order,
+            search_before=next_ordered["hits"]["hits"][0]["_sort"], remote_snapshot=ordered["remote_snapshot"]))
+        assert [h["_id"] for h in previous_ordered["hits"]["hits"]] == [h["_id"] for h in ordered["hits"]["hits"]], previous_ordered
         # Highlight from the pinned original document, including fields omitted
         # from the result projection. Returned source must stay projected.
         highlight_request = dict(
@@ -2332,7 +2346,7 @@ def test_native_remote_large_hydration_and_residual_filter(tmp_path):
 
 
 def test_native_remote_indexed_metadata_predicates_above_id_list_limit(tmp_path):
-    """Seek and broad reverse-merge paths share exact bitmap search semantics."""
+    """Bounded index seeks and ordinal maps share exact bitmap semantics."""
     pa = pytest.importorskip("pyarrow")
     pq = pytest.importorskip("pyarrow.parquet")
     binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
@@ -2343,7 +2357,10 @@ def test_native_remote_indexed_metadata_predicates_above_id_list_limit(tmp_path)
     input_file = tmp_path / "predicates.parquet"
     pq.write_table(pa.table({
         "body": ["common"] * count,
+        "sparse_native": ['{"1":1}'] * count,
         "amount": range(count),
+        "big_integer": [9007199254740992, 9007199254740993] + [9007199254740994] * (count - 2),
+        "time_text": ["2026-01-01T01:00:00+01:00", "2026-01-01T00:30:00Z"] + ["2026-01-01T00:00:00Z"] * (count - 2),
         "category": ["story", "story"] + ["comment"] * (count - 2),
         "label": ["other"] * (count - 1) + ["kept"],
     }), input_file, row_group_size=4096, compression="snappy", write_page_index=True)
@@ -2369,9 +2386,14 @@ def test_native_remote_indexed_metadata_predicates_above_id_list_limit(tmp_path)
                 "format": "parquet", "uri": root.as_uri(),
             }, "relational_indexes": [
                 {"name": "amount_idx", "keys": [{"column": "amount"}]},
+                {"name": "big_integer_idx", "keys": [{"column": "big_integer"}]},
+                {"name": "time_text_idx", "keys": [{"column": "time_text"}]},
                 {"name": "category_idx", "keys": [{"column": "category"}]},
             ]},
-            "indexes": {"body_text": {"type": "full_text", "field": "body"}},
+            "indexes": {
+                "body_text": {"type": "full_text", "field": "body"},
+                "sparse_native": {"type": "embeddings", "external": True, "sparse": True},
+            },
         })
         deadline = time.monotonic() + 180
         while True:
@@ -2394,6 +2416,21 @@ def test_native_remote_indexed_metadata_predicates_above_id_list_limit(tmp_path)
         assert query({"term": {"path": "/amount", "value": count}})["hits"]["hits"] == []
         ranged = query({"range": {"path": "/amount", "gte": 10, "lt": 15}})
         assert {h["_source"]["amount"] for h in ranged["hits"]["hits"]} == set(range(10, 15))
+        for alias in (
+            {"term": {"amount": count - 1}},
+            {"term": {"field": "amount", "term": count - 1}},
+            {"range": {"amount": {"from": count - 1, "to": count, "include_upper": False}}},
+            {"range": {"field": "amount", "min": count - 1, "max": count}},
+        ):
+            assert [h["_source"]["amount"] for h in query(alias)["hits"]["hits"]] == [count - 1]
+        precise = {"range": {"big_integer": {"gt": 9007199254740992}}}
+        temporal = {"range": {"time_text": {"gte": "2026-01-01T00:15:00Z"}}}
+        for predicate, expected in ((precise, count - 1), (temporal, 1)):
+            direct = query(predicate, count=True, fields=[], limit=0)
+            # Requiring two should clauses exercises the authoritative fallback.
+            fallback = query({"bool": {"should": [predicate, {"match_all": {}}],
+                "minimum_should_match": 2}}, count=True, fields=[], limit=0)
+            assert direct["hits"]["total"] == fallback["hits"]["total"] == {"value": expected, "relation": "exact"}
         broad = {"term": {"path": "/category", "value": "comment"}}
         hits = query(broad)["hits"]["hits"]
         assert len(hits) == 10 and all(h["_source"]["amount"] >= 2 for h in hits)
@@ -2408,6 +2445,18 @@ def test_native_remote_indexed_metadata_predicates_above_id_list_limit(tmp_path)
             "fields": ["amount"], "limit": 10, "exclusion_query": broad,
         })
         assert {h["_source"]["amount"] for h in excluded["hits"]["hits"]} == {0, 1}
+        sparse = call("POST", "/tables/indexed_predicates/query", {
+            "embeddings": {"sparse_native": {"indices": [1], "values": [1]}},
+            "indexes": ["sparse_native"], "fields": ["amount"], "limit": 3,
+            "filter_query": broad,
+        })
+        assert len(sparse["hits"]["hits"]) == 3 and all(h["_source"]["amount"] >= 2 for h in sparse["hits"]["hits"]), sparse
+        sparse_point = call("POST", "/tables/indexed_predicates/query", {
+            "embeddings": {"sparse_native": {"indices": [1], "values": [1]}},
+            "indexes": ["sparse_native"], "fields": ["amount"], "limit": 3,
+            "filter_query": {"term": {"amount": count - 1}},
+        })
+        assert [h["_source"]["amount"] for h in sparse_point["hits"]["hits"]] == [count - 1], sparse_point
         failed = False
     finally:
         server.stop(test_failed=failed)

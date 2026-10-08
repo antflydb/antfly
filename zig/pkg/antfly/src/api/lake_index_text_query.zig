@@ -92,13 +92,21 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, table: local.common_to
     owner.private_digests = metadata.private_digests;
     var effective = req;
     effective.cancellation = .{ .ptr = &owner, .is_cancelled_fn = Execution.canceled };
-    // Vector-only and mixed vector requests retain their existing identity
-    // resolver. Native text predicates resolve inside their pinned ordinal space.
+    const has_vectors = effective.dense != null or effective.sparse != null or effective.dense_queries.len != 0 or effective.sparse_queries.len != 0;
     const has_text = for (owner.declarations) |declaration| {
         if (declaration.artifact.kind == .text_segment) break true;
     } else false;
-    if (!has_text or effective.dense != null or effective.sparse != null or effective.dense_queries.len != 0 or effective.sparse_queries.len != 0)
-        try @import("lake_index_search_filter.zig").resolve(ca, sql_table, &source, request, &effective);
+    if (has_vectors) {
+        const resolver: @import("lake_index_text_predicate.zig").PhysicalResolver = .{ .server = server, .table = sql_table, .source = &source, .context = normalized, .store = store.artifactStore(), .store_identity = store.identity, .read_context = context };
+        if (effective.filter_query_json.len != 0) {
+            const resolved = (try resolver.resolve(ca, effective.filter_query_json)) orelse return error.UnsupportedQueryRequest;
+            owner.vector_include = resolved.bitmap;
+        }
+        if (effective.exclusion_query_json.len != 0) {
+            const resolved = (try resolver.resolve(ca, effective.exclusion_query_json)) orelse return error.UnsupportedQueryRequest;
+            owner.vector_exclude = resolved.bitmap;
+        }
+    } else if (!has_text) try @import("lake_index_search_filter.zig").resolve(ca, sql_table, &source, request, &effective);
     owner.hydration_fields = try owner.planHydration(effective);
     owner.typed_delivery = canDeliverTypedSource(effective);
     var execution_req = effective;
@@ -115,12 +123,18 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, table: local.common_to
     var meta: local.api_query.QueryResponseMeta = .{ .remote_snapshot = &snapshot_token, .shard_count = 1, .took_ms = @intCast((@import("antfly_platform").time.monotonicNs() -| started) / std.time.ns_per_ms) };
     defer meta.deinit(a);
     try @import("query_post_processing.zig").applyQueryPostProcessing(a, effective, &result, &meta, .{ .source_table = table.name, .backend_runtime = server.cfg.backend_runtime, .secret_store = server.cfg.secret_store, .remote_content = server.cfg.remote_content });
-    if (owner.typed_delivery) {
+    var prepared_delivery = delivery;
+    const lazy_hydration = owner.typed_delivery and !effective.count_only and (effective.include_stored or effective.highlight != null) and
+        (if (delivery) |sink| sink.consume_columns and sink.spill_io != null else false);
+    if (lazy_hydration) {
+        owner.delivery_request = effective;
+        prepared_delivery.?.hydrator = .{ .ptr = &owner, .load = Execution.hydrateDelivery, .release = Execution.releaseDelivery };
+    } else if (owner.typed_delivery) {
         if (!effective.count_only and (effective.include_stored or effective.highlight != null)) try owner.hydrateTyped(a, result.hits);
         try owner.attachHighlights(a, effective, &result);
     }
     meta.took_ms = @intCast((@import("antfly_platform").time.monotonicNs() -| started) / std.time.ns_per_ms);
-    return try local.api_query.encodeQueryResponsesWithDelivery(a, table.name, effective, meta, result, delivery);
+    return try local.api_query.encodeQueryResponsesWithDelivery(a, table.name, effective, meta, result, prepared_delivery);
 }
 const Execution = struct {
     server: *server_api.ApiHttpServer,
@@ -133,7 +147,12 @@ const Execution = struct {
     request: local.api_operation.RequestContext,
     schema_json: []const u8,
     hydration_fields: ?[]const []const u8 = null,
+    vector_include: ?@import("lake_index_physical_set.zig").Set = null,
+    vector_exclude: ?@import("lake_index_physical_set.zig").Set = null,
     typed_delivery: bool = false,
+    delivery_request: ?types.SearchRequest = null,
+    highlight_pins: std.ArrayList(search.PinnedTextSource) = .empty,
+    highlight_queries: ?[]const search.HighlightQuery = null,
     arena: A,
     result_allocator: A = std.heap.page_allocator,
     files: std.StringHashMapUnmanaged([]const u8) = .empty,
@@ -143,7 +162,25 @@ const Execution = struct {
     sparse_entries: std.StringHashMapUnmanaged(*local.storage_db_catalog_index_manager.IndexManager.SparseIndex) = .empty,
     dense_entries: std.StringHashMapUnmanaged(*local.storage_db_catalog_index_manager.IndexManager.DenseIndex) = .empty,
     runtimes: std.ArrayList(*@import("lake_index_native_runtime_cache.zig").Entry) = .empty,
+    fn vectorRequest(self: *Execution, req: types.SearchRequest) types.SearchRequest {
+        var result = req;
+        if (self.vector_include != null or self.vector_exclude != null) {
+            result.native_key_predicate = .{ .ptr = self, .allows = allowsVectorKey };
+            result.filter_query_json = "";
+            result.exclusion_query_json = "";
+        }
+        return result;
+    }
+    fn allowsVectorKey(raw: *anyopaque, key: []const u8) !bool {
+        const self: *Execution = @ptrCast(@alignCast(raw));
+        const coordinate = try @import("lake_index_native_state.zig").coordinates(key);
+        const file = self.private_files.get(key[6..70]) orelse return error.ExternalLakeSnapshotMismatch;
+        if (self.vector_include) |*include| if (!include.contains(file, coordinate.group, coordinate.row)) return false;
+        if (self.vector_exclude) |*exclude| if (exclude.contains(file, coordinate.group, coordinate.row)) return false;
+        return true;
+    }
     fn deinit(self: *Execution) void {
+        for (self.highlight_pins.items) |*pin| pin.deinit();
         for (self.runtimes.items) |runtime| runtime.release();
     }
     fn from(raw: ?*anyopaque) *Execution {
@@ -210,31 +247,29 @@ const Execution = struct {
         if (req.defer_hierarchy_child_hydration or result.hits.len == 0) return;
         if (req.full_text == null and req.full_text_queries.len == 0) return;
         try self.context.ensureActive();
-        var pins: std.ArrayList(search.PinnedTextSource) = .empty;
-        defer {
-            for (pins.items) |*pin| pin.deinit();
-            pins.deinit(a);
-        }
-        var queries: std.ArrayList(search.HighlightQuery) = .empty;
-        defer queries.deinit(a);
-        if (req.full_text_queries.len != 0) {
-            for (req.full_text_queries) |named| {
-                var pin = (try acquire(self, named.index_name)) orelse continue;
-                pins.append(a, pin) catch |err| {
+        if (self.highlight_queries == null) {
+            var queries: std.ArrayList(search.HighlightQuery) = .empty;
+
+            if (req.full_text_queries.len != 0) {
+                for (req.full_text_queries) |named| {
+                    var pin = (try acquire(self, named.index_name)) orelse continue;
+                    self.highlight_pins.append(self.arena, pin) catch |err| {
+                        pin.deinit();
+                        return err;
+                    };
+                    try queries.append(self.arena, .{ .query = named.query, .text_analysis = pin.text_analysis, .runtime_schema = pin.runtime_schema, .selected_field = pin.selected_field });
+                }
+            } else if (req.full_text) |query| {
+                var pin = (try acquire(self, req.primary_text_index_name orelse req.index_name)) orelse return;
+                self.highlight_pins.append(self.arena, pin) catch |err| {
                     pin.deinit();
                     return err;
                 };
-                try queries.append(a, .{ .query = named.query, .text_analysis = pin.text_analysis, .runtime_schema = pin.runtime_schema, .selected_field = pin.selected_field });
+                try queries.append(self.arena, .{ .query = query, .text_analysis = pin.text_analysis, .runtime_schema = pin.runtime_schema, .selected_field = pin.selected_field });
             }
-        } else if (req.full_text) |query| {
-            var pin = (try acquire(self, req.primary_text_index_name orelse req.index_name)) orelse return;
-            pins.append(a, pin) catch |err| {
-                pin.deinit();
-                return err;
-            };
-            try queries.append(a, .{ .query = query, .text_analysis = pin.text_analysis, .runtime_schema = pin.runtime_schema, .selected_field = pin.selected_field });
+            self.highlight_queries = queries.items;
         }
-        if (queries.items.len == 0) return;
+        if (self.highlight_queries.?.len == 0) return;
         // Highlight the original source even when result shaping projected it
         // away. Hydration keeps the same snapshot, deletes and reader lease.
         var sources: ?[]?[]u8 = null;
@@ -248,8 +283,22 @@ const Execution = struct {
             for (result.hits, keys) |hit, *key| key.* = hit.id;
             sources = try loadManySelected(self, a, keys, self.hydration_fields);
         }
-        try search.attachHighlightsWithIndexQueries(a, options, queries.items, result.hits, sources);
+        try search.attachHighlightsWithIndexQueries(a, options, self.highlight_queries.?, result.hits, sources);
         try self.context.ensureActive();
+    }
+    fn hydrateDelivery(raw: *anyopaque, a: A, hits: []types.SearchHit) !void {
+        const self: *Execution = @ptrCast(@alignCast(raw));
+        try self.context.ensureActive();
+        try self.hydrateTyped(a, hits);
+        var result: types.SearchResult = .{ .alloc = a, .hits = hits, .total_hits = @intCast(hits.len), .graph_results = &.{} };
+        try self.attachHighlights(a, self.delivery_request.?, &result);
+    }
+    fn releaseDelivery(raw: *anyopaque, hits: []types.SearchHit) void {
+        const self: *Execution = @ptrCast(@alignCast(raw));
+        for (hits) |*hit| {
+            types.freeHighlights(self.result_allocator, hit.highlights);
+            hit.highlights = &.{};
+        }
     }
     fn hydrateTyped(self: *Execution, a: A, hits: []types.SearchHit) !void {
         const keys = try a.alloc([]const u8, hits.len);
@@ -355,7 +404,7 @@ const Execution = struct {
     fn resolveIndexedFilter(raw: ?*anyopaque, a: A, snapshot: *const local.index.IndexSnapshot, json: []const u8) !?search.IndexedTextPredicate {
         const self = from(raw);
         const identities = self.text_identities.get(@intFromPtr(snapshot)) orelse return null;
-        const resolver: @import("lake_index_text_predicate.zig").Resolver = .{ .server = self.server, .table = self.table, .source = self.source, .context = self.request, .identities = identities, .snapshot = snapshot, .private_digests = &self.private_digests };
+        const resolver: @import("lake_index_text_predicate.zig").Resolver = .{ .server = self.server, .table = self.table, .source = self.source, .context = self.request, .identities = identities, .store = self.store.artifactStore(), .store_identity = self.store.identity, .read_context = self.context };
         return resolver.resolve(a, json);
     }
     fn searchText(raw: ?*anyopaque, a: A, req: types.SearchRequest, text: types.TextQuery) !types.SearchResult {
@@ -407,7 +456,7 @@ const Execution = struct {
         return entry.index.searchProfiledRequest(req);
     }
     fn searchDense(raw: ?*anyopaque, a: A, req: types.SearchRequest, dense: types.DenseKnnQuery) !types.SearchResult {
-        return search.searchDense(a, req, dense, .{ .ctx = raw, .exact_doc_id_filters = true, .filter_candidate_presence = true, .text_index_entry = noLocal, .dense_index = denseIndex, .lookup_doc_key = lookupDocKey, .resolve_hit_key = densePublicKey, .lookup_vector_id = lookupVectorId, .load_projected_document = requireProjected, .load_projected_documents = loadProjected, .hbc_search = denseSearch, .hbc_search_profiled = denseSearchProfiled, .postprocess = postprocessVector });
+        return search.searchDense(a, from(raw).vectorRequest(req), dense, .{ .ctx = raw, .exact_doc_id_filters = true, .filter_candidate_presence = true, .text_index_entry = noLocal, .dense_index = denseIndex, .lookup_doc_key = lookupDocKey, .resolve_hit_key = densePublicKey, .lookup_vector_id = lookupVectorId, .load_projected_document = requireProjected, .load_projected_documents = loadProjected, .hbc_search = denseSearch, .hbc_search_profiled = denseSearchProfiled, .postprocess = postprocessVector });
     }
     fn sparseIndex(raw: ?*anyopaque, name: ?[]const u8) !?*local.storage_db_catalog_index_manager.IndexManager.SparseIndex {
         const self = from(raw);
@@ -436,7 +485,7 @@ const Execution = struct {
         return shape.postprocessVectorSearchResult(a, req, result, false, .{ .ctx = raw, .is_visible = visible, .resolve_parent_id = parent, .load_parent_stored = parentStored, .load_stored = loadOne, .load_many_stored = loadMany, .load_projected_stored = loadProjectedOne, .load_many_projected_stored = loadProjected });
     }
     fn searchSparse(raw: ?*anyopaque, a: A, req: types.SearchRequest, sparse: types.SparseKnnQuery) !types.SearchResult {
-        return search.searchSparse(a, req, sparse, .{ .ctx = raw, .exact_doc_id_filters = true, .project_key = publicKey, .native_key = nativeKey, .filter_candidate_presence = true, .text_index_entry = noLocal, .sparse_index = sparseIndex, .load_projected_document = requireProjected, .load_projected_documents = loadProjected, .postprocess = postprocessVector });
+        return search.searchSparse(a, from(raw).vectorRequest(req), sparse, .{ .ctx = raw, .exact_doc_id_filters = true, .project_key = publicKey, .native_key = nativeKey, .filter_candidate_presence = true, .text_index_entry = noLocal, .sparse_index = sparseIndex, .load_projected_document = requireProjected, .load_projected_documents = loadProjected, .postprocess = postprocessVector });
     }
     fn cloneSet(_: ?*anyopaque, a: A, set: local.storage_db_query_graph_exec.NamedResultSet, stored: bool) !types.SearchResult {
         return local.storage_db_query_graph_exec.cloneNamedSetAsResult(a, set, stored);
@@ -623,7 +672,6 @@ const Execution = struct {
 /// operators keep the encoded provider path. Independent native retrieval
 /// hands leased column pages directly to highlights and the public encoder.
 fn canDeliverTypedSource(req: types.SearchRequest) bool {
-    for (req.order_by) |order| if (!std.mem.eql(u8, order.field, "_score") and !std.mem.eql(u8, order.field, "_id")) return false;
     return !requiresEarlySource(req) and
         req.evaluation_limit == 0 and req.pruner == null and req.return_mode == .parent and !req.hierarchy_grouped_matches and req.hierarchy_group_level == .source and
         req.hierarchy_children == null and !req.defer_hierarchy_child_hydration and !req.hierarchy_include_source and !req.hierarchy_include_unit and
@@ -775,7 +823,7 @@ test "external lake typed delivery separates final projection from residual pred
     req.search_before = &.{};
     req.filter_query_json = "";
     req.order_by = &.{.{ .field = "amount" }};
-    try std.testing.expect(!canDeliverTypedSource(req));
+    try std.testing.expect(canDeliverTypedSource(req));
     req.order_by = &.{};
     req.hierarchy_include_source = true;
     try std.testing.expect(!canDeliverTypedSource(req));
