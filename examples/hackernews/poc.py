@@ -64,9 +64,12 @@ def main():
         action="store_true",
         help="Read a short-lived token from stdin instead of gcloud; never persist it",
     )
+    parser.add_argument("--build-timeout", type=int, default=300)
     args = parser.parse_args()
     if args.repeats < 1 or args.concurrency < 1:
         parser.error("repeats and concurrency must be positive")
+    if args.expected_rows < 2 or args.build_timeout < 1:
+        parser.error("expected rows must be >=2 and build timeout must be positive")
     artifact_prefix = args.artifact_prefix or args.prefix
     metadata_columns = (
         []
@@ -276,8 +279,18 @@ def main():
                 },
             )
         started = time.monotonic()
-        deadline = started + 300
+        build_before = resource_counters()
+        peak_rss_bytes = 0
+        deadline = started + args.build_timeout
         while True:
+            if Path(f"/proc/{process.pid}/status").exists():
+                for line in (
+                    Path(f"/proc/{process.pid}/status").read_text().splitlines()
+                ):
+                    if line.startswith("VmHWM:"):
+                        peak_rss_bytes = max(
+                            peak_rss_bytes, int(line.split()[1]) * 1024
+                        )
             status = call("GET", "/tables/hn_archive_poc/indexes/body_text")
             if status.get("status", {}).get("readiness", {}).get("queryable"):
                 break
@@ -285,10 +298,17 @@ def main():
                 raise RuntimeError("Index construction failed: " + json.dumps(status))
             if time.monotonic() >= deadline:
                 raise RuntimeError(
-                    "Index not queryable after 300 seconds: " + json.dumps(status)
+                    f"Index not queryable after {args.build_timeout} seconds: "
+                    + json.dumps(status)
                 )
             time.sleep(1)
         ready_seconds = round(time.monotonic() - started, 2)
+        build_after = resource_counters()
+        build_profile = (
+            None
+            if build_before is None
+            else {key: build_after[key] - value for key, value in build_before.items()}
+        )
         metadata_status = {}
         for column in metadata_columns:
             # Relational indexes are published with the pinned lake snapshot.
@@ -530,6 +550,8 @@ def main():
             "sql_count": count,
             "row_count": args.expected_rows,
             "ready_seconds": ready_seconds,
+            "build_profile": build_profile,
+            "build_peak_rss_bytes": peak_rss_bytes,
             "first_search_ms": first_ms,
             "warm_search_ms": warm_ms,
             "after_restart_ms": restart_ms,
@@ -549,7 +571,7 @@ def main():
                 "empty_date_filter_before_and_after_restart",
                 "concurrent_search",
             ],
-            "note": "Temporary bucket has an eight-day deletion lifecycle. Timings are a 10k-row smoke check, not archive-scale benchmarks.",
+            "note": "Qualification of the reported row count. The temporary demo bucket has an eight-day deletion lifecycle.",
         }
         if exact_filter_status == "passed":
             report["verified"].append("exact_filter")

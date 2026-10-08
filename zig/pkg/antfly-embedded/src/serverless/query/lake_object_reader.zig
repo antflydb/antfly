@@ -65,6 +65,7 @@ pub const ObjectStorageRangeReader = struct {
         const self: *@This() = @ptrCast(@alignCast(ctx));
         var result = try self.getObjectWithRetry(alloc, bucket, key, .{
             .range = .{ .offset = offset, .length = len },
+            .max_response_bytes = len,
         });
         defer result.deinit(alloc);
         if (result.body.len != len) return error.InvalidLakeRangeRead;
@@ -81,12 +82,16 @@ pub const ObjectStorageRangeReader = struct {
         const len: usize = std.math.cast(usize, read.range.len) orelse return error.InvalidLakeRangeRead;
         var result = try self.getObjectWithRetry(alloc, read.object.bucket, read.object.key, .{
             .range = .{ .offset = read.range.offset, .length = len },
+            // The plan already carries the authorized object version. Enforce
+            // it on GET and validate response evidence without another HEAD.
+            .skip_metadata_probe = true,
+            .max_response_bytes = len,
             .if_match_etag = if (read.object.version.etag.len == 0) null else read.object.version.etag,
             .version_id = if (read.object.version.version_id.len == 0) null else read.object.version.version_id,
         });
         defer result.deinit(alloc);
         if (result.body.len != len) return error.InvalidLakeRangeRead;
-        try validatePlannedObjectMetadata(read, result.metadata);
+        try validatePlannedObjectMetadata(read, result.metadata, result.conditional_etag_verified);
         try validatePlannedObjectChecksum(read, result.metadata, result.body);
         return try alloc.dupe(u8, result.body);
     }
@@ -115,8 +120,8 @@ pub const ObjectStorageRangeReader = struct {
     }
 };
 
-fn validatePlannedObjectMetadata(read: lake_range_io.RangeRead, metadata: object_storage.ObjectMetadata) !void {
-    if (read.object.version.etag.len != 0) {
+fn validatePlannedObjectMetadata(read: lake_range_io.RangeRead, metadata: object_storage.ObjectMetadata, conditional_etag_verified: bool) !void {
+    if (!conditional_etag_verified and read.object.version.etag.len != 0) {
         const returned_etag = metadata.etag orelse return error.PreconditionFailed;
         if (!std.mem.eql(u8, returned_etag, read.object.version.etag)) return error.PreconditionFailed;
     }
@@ -318,7 +323,9 @@ test "object storage range reader validates returned planned object metadata" {
             return error.UnsupportedOperation;
         }
         fn getObject(ptr: *anyopaque, a: Allocator, bucket: []const u8, key: []const u8, opts: object_storage.GetOptions) !object_storage.GetResult {
-            _ = opts;
+            try std.testing.expect(opts.skip_metadata_probe);
+            try std.testing.expectEqual(@as(?usize, 6), opts.max_response_bytes);
+            try std.testing.expectEqualStrings("etag-a", opts.if_match_etag.?);
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return .{
                 .body = try a.dupe(u8, "456789"),
@@ -727,4 +734,23 @@ test "object storage range reader does not retry stale object identity" {
     };
     try std.testing.expectError(error.PreconditionFailed, parquet_reader.readPlannedAlloc(alloc, read));
     try std.testing.expectEqual(@as(usize, 1), stale.get_attempts);
+}
+
+test "planned lake reads accept enforced conditional proof and still reject wrong versions" {
+    const read: lake_range_io.RangeRead = .{
+        .object = .{ .bucket = "bucket", .key = "part", .byte_len = 4, .version = .{ .etag = "json-etag", .version_id = "42" } },
+        .range = .{ .offset = 0, .len = 4 },
+        .purpose = .parquet_footer,
+    };
+    var metadata: object_storage.ObjectMetadata = .{
+        .bucket = @constCast("bucket"),
+        .key = @constCast("part"),
+        .content_length = 4,
+        .etag = @constCast("media-etag"),
+        .version_id = @constCast("42"),
+    };
+    try std.testing.expectError(error.PreconditionFailed, validatePlannedObjectMetadata(read, metadata, false));
+    try validatePlannedObjectMetadata(read, metadata, true);
+    metadata.version_id = @constCast("43");
+    try std.testing.expectError(error.PreconditionFailed, validatePlannedObjectMetadata(read, metadata, true));
 }

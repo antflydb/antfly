@@ -55,11 +55,28 @@ def main():
     parser.add_argument(
         "--cycles", type=int, default=2, help="Empty-cache/restart cycles per table"
     )
+    parser.add_argument("--expected-rows", type=int, default=10000)
+    parser.add_argument("--build-timeout", type=int, default=300)
+    parser.add_argument("--lifetime", type=int, default=2700)
+    parser.add_argument("--cpu", default="2")
+    parser.add_argument("--memory", default="8Gi")
+    parser.add_argument("--disk", default="4Gi")
+    parser.add_argument("--concurrency", type=int, default=4)
     args = parser.parse_args()
     if not args.binary.is_file():
         parser.error("binary must be an existing Linux executable")
     if args.cycles < 1 or args.repeats < 1:
         parser.error("cycles and repeats must be positive")
+    if (
+        args.expected_rows < 2
+        or args.build_timeout < 1
+        or args.lifetime < args.build_timeout + 120
+    ):
+        parser.error(
+            "row count must be >=2 and lifetime must exceed build timeout by 120s"
+        )
+    if args.concurrency < 1:
+        parser.error("concurrency must be positive")
     args.output.mkdir(parents=True, exist_ok=False)
     # kubectl's auth plugin may cache credentials beside its kubeconfig. Keep
     # those standard CLI files outside the delivered results and remove them.
@@ -108,7 +125,7 @@ def main():
         "metadata": {"name": pod_name, "labels": {"app": "hackernews-benchmark"}},
         "spec": {
             "restartPolicy": "Never",
-            "activeDeadlineSeconds": 2700,
+            "activeDeadlineSeconds": args.lifetime,
             "automountServiceAccountToken": False,
             "nodeSelector": {
                 "topology.kubernetes.io/region": args.region,
@@ -118,17 +135,21 @@ def main():
                 {
                     "name": "benchmark",
                     "image": SDK_IMAGE,
-                    "command": ["python3", "-c", "import time; time.sleep(2700)"],
+                    "command": [
+                        "python3",
+                        "-c",
+                        f"import time; time.sleep({args.lifetime})",
+                    ],
                     "resources": {
                         "requests": {
-                            "cpu": "2",
-                            "memory": "8Gi",
-                            "ephemeral-storage": "4Gi",
+                            "cpu": args.cpu,
+                            "memory": args.memory,
+                            "ephemeral-storage": args.disk,
                         },
                         "limits": {
-                            "cpu": "2",
-                            "memory": "8Gi",
-                            "ephemeral-storage": "4Gi",
+                            "cpu": args.cpu,
+                            "memory": args.memory,
+                            "ephemeral-storage": args.disk,
                         },
                     },
                 }
@@ -187,6 +208,12 @@ def main():
                 "--bearer-stdin",
                 "--repeats",
                 str(args.repeats),
+                "--expected-rows",
+                str(args.expected_rows),
+                "--build-timeout",
+                str(args.build_timeout),
+                "--concurrency",
+                str(args.concurrency),
             ]
             if mode == "text-only":
                 command.append("--text-only")
@@ -270,7 +297,8 @@ def main():
             "revision": args.revision,
             "binary_sha256": digest.hexdigest(),
             "runs": reports,
-            "note": "10k-row qualification; region and optimization differ from prior local Debug runs.",
+            "row_count": args.expected_rows,
+            "note": "Pinned regional qualification; compare only matching source, resources and optimization.",
         }
         (args.output / "regional.json").write_text(json.dumps(report, indent=2) + "\n")
     finally:

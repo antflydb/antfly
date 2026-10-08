@@ -1,0 +1,27 @@
+{
+  "date": "2026-10-08",
+  "base_main_revision": "cdf572a7467d581f6f1b39bcf514878488555f11",
+  "source": "gs://colony-import-sources-antfly-dev-01/hn-poc/20261008-scale/archive",
+  "row_count": 1000000,
+  "compressed_bytes": 449870756,
+  "bigquery": {
+    "project": "antfly-dev-01",
+    "job_id": "bqjob_r7befce4b7d8a5479_000001a11cf22a81_1",
+    "maximum_bytes_billed": 21474836480,
+    "processed_bytes": 19753352019,
+    "billed_bytes": 19754123264,
+    "export_rows": 1000000
+  },
+  "regional_run": {
+    "status": "pending",
+    "blocker": "Local DNS resolution failed for storage.googleapis.com and PyPI after successful export. No million-row query or build timings recorded.",
+    "timings": null
+  },
+  "validation": {
+    "lake_tests": 695,
+    "objectstore_tests_passed": 79,
+    "objectstore_cloud_integration_tests_skipped": 2,
+    "ingestion_unit_tests": 6,
+    "ingestion_native_e2e": "Writer snapshots, field IDs, ancestry, tombstones and restart passed locally; exact binary/source recorded in follow-up PR validation."
+  }
+}

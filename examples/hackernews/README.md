@@ -24,10 +24,10 @@ encoding and plain fallback pages. Its dictionary headers use the deprecated
 The untouched export passed this check after the compatibility fix.
 
 `normalize.py` is optional: it decodes HTML/entities and writes DataPageV2
-Parquet. This converter materializes the sample in memory; larger backfills need
-a streaming converter. Keep `hn_id` for HN links. `parent_id` identifies the
-immediate parent, which may be another comment; root-story resolution is future
-ingestion work.
+Parquet. This converter iterates batches and writes bounded row groups instead of
+materializing the whole export. Keep `hn_id` for HN links. `parent_id` identifies the
+immediate parent, which may be another comment; `ingest.py` resolves root stories through its durable on-disk
+ancestry graph, including parents arriving after their children.
 
 ## Run the check
 
@@ -228,3 +228,94 @@ its first search. These are 10k-row measurements, not archive capacity results.
 - Define durable buckets and service identities through Colony's infra workflow.
 - Stream backfills, resolve parent stories, and reconcile edits/deletions.
 - Build Recent/Historical routing and the public search interface.
+
+
+## Million-row qualification
+
+`export-scale.sql` exports the newest million live story/comment rows between
+January and September 2025. Use a fresh prefix and a BigQuery dry run before
+execution. October 8's export processed 19,753,352,019 bytes, produced exactly
+1,000,000 rows, and wrote 449,870,756 compressed bytes. The job was capped at
+21,474,836,480 billed bytes; LIMIT does not reduce the scan.
+
+The runner accepts explicit scale, build and resource budgets:
+
+```sh
+python3 examples/hackernews/regional.py \
+  --binary /path/to/linux-antfly --revision EXACT-SOURCE-REVISION \
+  --source-prefix hn-poc/20261008-scale --expected-rows 1000000 \
+  --run-prefix hn-poc/NEW-UNIQUE-SCALE-RUN --output /tmp/hn-scale-results \
+  --build-timeout 1800 --lifetime 7200 --cpu 4 --memory 16Gi --disk 16Gi
+```
+
+Reports include readiness time, server peak RSS during construction, construction
+CPU/network deltas, cold/warm/restart timings, filter-oracle comparisons,
+pagination and concurrency. RSS is the Antfly process high-water mark, not a
+sum of all pod processes; network counters include control/background traffic.
+Use identical resources and source when comparing binaries. Increasing the build
+budget does not change the existing 15-second unordered-filter regression budget.
+
+## Durable historical ingestion
+
+Use a dedicated Iceberg warehouse and a persistent state volume. The ingestor
+uses SQLite WAL with full synchronous commits, streams Parquet input batches,
+deduplicates by HN ID, checkpoints source content hashes and offsets, and retains
+retry work before advancing its API cursor. Export full records (including
+`dead` and `deleted`) for a durable backfill; the qualification SQL intentionally
+contains only live rows. Its retained item map preserves tombstone ancestry.
+
+```sh
+uv run --project examples/hackernews python examples/hackernews/ingest.py \
+  --state /data/hackernews --warehouse gs://hackernews-archive-antfly-dev-01/items \
+  backfill /data/imports/part-*.parquet
+uv run --project examples/hackernews python examples/hackernews/ingest.py \
+  --state /data/hackernews --warehouse gs://hackernews-archive-antfly-dev-01/items \
+  run
+```
+
+Polls fetch new IDs, the official HN API's recent updates and a bounded rolling
+reconciliation sweep. [`updates.json`](https://github.com/HackerNews/API) is a
+recent-changes feed, not a durable log; the sweep catches missed moderation and
+edits after downtime. Catch-up time depends on the sweep budget and archive size.
+Null responses remain queued for retry. Missing ancestors are fetched in bounded
+batches; unresolved parents/cycles produce a null `root_story_id`, never an
+invented root. Complete live records can clear earlier moderation flags.
+
+Affected months are replaced using bounded Parquet writes and one Iceberg
+transaction. Publication creates immutable metadata and uses a generation-match
+CAS for `metadata/version-hint.text`. A persisted publication journal recovers
+failed/lost pointer writes. Attach Antfly to the **warehouse directory**, with
+`format: iceberg`, to follow commits; an explicit metadata-file attachment pins
+that one metadata file. Existing native index reconciliation detects a changed
+snapshot and publishes matching sidecars; queries cannot reuse a mismatched
+publication. Files are immutable, but the warehouse's commit pointer changes.
+
+Archive publication defaults to hourly, separately from one-minute API polling.
+This initial implementation replaces changed months and retains old snapshot
+objects, so it has write/storage amplification. It is suitable for a batched
+historical tier; a high-frequency whole-archive service needs file-level upserts,
+compaction and a reviewed retention policy. Recent native-table ingestion and
+the public UI remain separate work. No automatic snapshot deletion is included.
+
+The SQLite item map **and** catalog must share a persistent state volume owned by
+one writer. Take a streamed, consistent off-volume checkpoint after publication:
+
+```sh
+uv run --project examples/hackernews python examples/hackernews/ingest.py \
+  --state /data/hackernews --warehouse gs://hackernews-archive-antfly-dev-01/items \
+  --backup-root gs://hackernews-state-antfly-dev-01/ingestion backup
+```
+
+`restore` uses the same arguments and requires an empty state directory. It
+checks file digests/SQLite integrity and refuses an older checkpoint if the
+archive has advanced: reconcile the current catalog and source state before
+recovery in that case. Backups are explicit, not automatically scheduled.
+Native serving requires Parquet Iceberg field IDs; the writer emits those IDs
+from the Iceberg schema on every batch. GCS uses application default credentials; GKE uses the dedicated ingestor
+Workload Identity. Keep credentials out of state, image layers and reports.
+
+Run local correctness tests with the existing lake/iceberg E2E environment:
+
+```sh
+uv run --project zig/e2e/antfly --extra lake --extra iceberg pytest -q examples/hackernews/tests
+```
