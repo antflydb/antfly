@@ -217,6 +217,24 @@ pub fn runNumberWireContracts(alloc: std.mem.Allocator) !void {
     try std.testing.expect(!try rowMatches(alloc, &json, &.{.{ .integer = 33 }}, &.{false}, &.{.{ .float = 33 }}));
 }
 
+fn expectMutationRejected(alloc: std.mem.Allocator, handler: anytype, statement: []const u8, sqlstate: []const u8) !void {
+    var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
+    defer request.deinit();
+    const body = try std.json.Stringify.valueAlloc(alloc, .{ .statement = statement }, .{});
+    defer alloc.free(body);
+    request.body = body;
+    var context = httpx.Context.init(alloc, std.testing.io, &request);
+    defer context.deinit();
+    var response = try handler.executeSQL(&context);
+    defer response.deinit();
+    if (response.status.code < 400 or response.status.code >= 500)
+        std.debug.print("PRIMARY KEY ADMISSION status={d}: {s}\n", .{ response.status.code, response.body orelse "" });
+    try std.testing.expect(response.status.code >= 400 and response.status.code < 500);
+    const diagnostic = try std.json.parseFromSlice(wire.SQLDiagnostic, alloc, response.body.?, .{});
+    defer diagnostic.deinit();
+    try std.testing.expectEqualStrings(sqlstate, diagnostic.value.code);
+}
+
 fn execute(alloc: std.mem.Allocator, handler: anytype, case: *const fixtures.Corpus.Case) !std.json.Parsed(wire.SQLResponse) {
     var parameter_arena = std.heap.ArenaAllocator.init(alloc);
     defer parameter_arena.deinit();
@@ -383,14 +401,14 @@ pub const MutationReference = struct {
 
 pub const PostgresMutationReference = struct {
     pub const Seed = struct { key: []const u8, value: Json };
-    pub const Table = struct { name: []const u8, schema: Json, rows: []const Seed };
+    pub const Table = struct { name: []const u8, schema: Json, primary_key: []const []const u8 = &.{}, rows: []const Seed };
     pub const Rows = struct {
         columns: []const []const u8,
         column_oids: []const u32,
         rows: []const []const Json,
         sql_nulls: []const []const bool,
     };
-    profile: struct { schema: Json, rows: []const Seed, additional_tables: []const Table },
+    profile: struct { schema: Json, primary_key: []const []const u8 = &.{}, rows: []const Seed, additional_tables: []const Table },
     entries: []const struct {
         id: []const u8,
         command_tag: []const u8,
@@ -403,14 +421,39 @@ pub const PostgresMutationReference = struct {
     },
 };
 
+/// Fixture writes use the production integrity planner and native transaction
+/// boundary. Resetting primary rows alone would strand logical unique claims.
+fn commitMutationFixture(a: std.mem.Allocator, source: @import("antfly_local_sources").api_table_read_source.TableReadSource, records: []const @import("antfly_local_sources").common_topology_records.TableRecord, table: anytype, writes: []const @import("antfly_local_sources").storage_db_types.TransactionWrite, deletes: []const []const u8, sequence: u64) !void {
+    const local = @import("antfly_local_sources");
+    var prepared = try local.api_relational_integrity_commit.prepare(a, source, records, &.{.{ .table_name = table.name, .relational_schema_version = 1, .writes = writes, .deletes = deletes }});
+    defer prepared.deinit();
+    try std.testing.expectEqual(@as(usize, 1), prepared.tables.len);
+    const request = prepared.tables[0];
+    try std.testing.expectEqualStrings(table.name, request.table_name);
+    try std.testing.expect(request.relational_integrity_generation_set != null);
+    var id: [16]u8 = @splat(0);
+    std.mem.writeInt(u64, id[0..8], sequence, .little);
+    _ = try table.db.beginTransactionWithId(id, sequence);
+    errdefer table.db.abortTransaction(id, sequence) catch {};
+    try table.db.writeTransaction(id, .{
+        .relational_schema_version = request.relational_schema_version,
+        .relational_integrity_generation_set = request.relational_integrity_generation_set,
+        .writes = request.writes,
+        .deletes = request.deletes,
+        .predicates = request.predicates,
+        .integrity_commands = request.integrity_commands,
+    });
+    try table.db.commitTransaction(id, sequence);
+}
+
 /// Exact-source native execution plus complete, independent storage read-back
 /// of every fixture table. Selection is explicit and fail-closed, never a
 /// discovery skip. Constraint-owner activation is a separate fixture contract;
 /// callers must not credit key-changing cases using unconstrained native DBs.
-pub fn runPostgresMutations(alloc: std.mem.Allocator, handler: anytype, tables: anytype, reference: PostgresMutationReference, ids: []const []const u8) !void {
+pub fn runPostgresMutations(alloc: std.mem.Allocator, handler: anytype, tables: anytype, records: []const @import("antfly_local_sources").common_topology_records.TableRecord, reference: PostgresMutationReference, ids: []const []const u8) !void {
     var corpus = try fixtures.Corpus.init(alloc);
     defer corpus.deinit();
-    const BatchWrite = @import("antfly_local_sources").storage_db_types.BatchWrite;
+    const TransactionWrite = @import("antfly_local_sources").storage_db_types.TransactionWrite;
     try std.testing.expectEqual(reference.profile.additional_tables.len + 1, tables.len);
     for (ids, 0..) |id, ordinal| {
         const expected = for (reference.entries) |entry| {
@@ -430,10 +473,26 @@ pub fn runPostgresMutations(alloc: std.mem.Allocator, handler: anytype, tables: 
             try std.testing.expect(previous.documents.len <= 4096);
             const deletes = try a.alloc([]const u8, previous.documents.len);
             for (previous.documents, deletes) |document, *key| key.* = document.id;
-            if (deletes.len != 0) try table.db.batch(.{ .deletes = deletes, .timestamp_ns = @as(u64, @intCast(ordinal * 2 + 1000)) });
-            const writes = try a.alloc(BatchWrite, seeds.len);
+            if (deletes.len != 0) try commitMutationFixture(a, handler.api_server.table_reads.?, records, table, &.{}, deletes, @intCast((ordinal * tables.len + table_index) * 2 + 1000));
+            const writes = try a.alloc(TransactionWrite, seeds.len);
             for (seeds, writes) |seed, *write| write.* = .{ .key = seed.key, .value = try std.json.Stringify.valueAlloc(a, seed.value, .{}) };
-            try table.db.batch(.{ .writes = writes, .timestamp_ns = @as(u64, @intCast(ordinal * 2 + 1001)) });
+            try commitMutationFixture(a, handler.api_server.table_reads.?, records, table, writes, &.{}, @intCast((ordinal * tables.len + table_index) * 2 + 1001));
+        }
+        if (ordinal == 0) {
+            var before = try tables[0].db.scan(a, "", "", .{ .include_documents = true, .limit = 4097 });
+            defer before.deinit(a);
+            // These logical identities differ from physical document keys.
+            // A unique claim and NOT NULL admission must both be real; the
+            // complete post-state comparison below detects accidental writes.
+            try expectMutationRejected(a, handler, "INSERT INTO usage_records (id) VALUES ('u1')", "23505");
+            try expectMutationRejected(a, handler, "INSERT INTO usage_records (id) VALUES (NULL)", "23502");
+            var after = try tables[0].db.scan(a, "", "", .{ .include_documents = true, .limit = 4097 });
+            defer after.deinit(a);
+            try std.testing.expectEqual(before.documents.len, after.documents.len);
+            for (before.documents, after.documents) |prior, current| {
+                try std.testing.expectEqualStrings(prior.id, current.id);
+                try std.testing.expectEqualStrings(prior.json, current.json);
+            }
         }
         const response = try execute(a, handler, try corpus.get(id));
         defer response.deinit();

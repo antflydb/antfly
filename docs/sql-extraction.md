@@ -4438,6 +4438,31 @@ the enumerated allocation count; injected failures and leak checks remain active
 Original-case evidence is still required: no original corpus disposition is
 credited solely for these component fixtures.
 
+### Constraint-equivalent native mutation evidence
+
+Thirteen additional original mutation cases now have mounted native/PostgreSQL
+evidence: 426 implemented, 136 rejected, 73 superseded and 951 unresolved, with
+the original 1,586-case inventory unchanged. Recursive cases remain unresolved
+until their original fixture exercises a nontrivial recursive step.
+
+The native campaign derives logical primary keys from the PostgreSQL profile
+through the production DDL builder. Fresh databases bootstrap real enforced
+activation; complete owner ranges let admission verify native coverage rather
+than accepting a fabricated readiness envelope. Seed and reset writes use the
+integrity planner and native atomic transactions, so resetting rows also retires
+their unique claims. Duplicate and NULL keys fail with PostgreSQL SQLSTATEs
+23505 and 23502, without changing the captured primary rows. Exact-source
+mutations verify complete RETURNING results and all three tables' persisted
+state. These isolated owner fixtures do not prove distributed read cuts or
+multi-owner activation.
+
+The stronger profile exposed a primary-key DDL lifetime bug: inserting required
+columns can move the parent schema object's slots. Lowering now borrows the
+nested properties map independently, without new allocations. Composite-key
+growth and allocation-failure regressions are selected by the SQL test gate.
+The complete gate passes 510 local-owner and 219 server-owner tests, with three
+existing opt-in benchmark skips; the mounted mutation campaign also passes.
+
 ### Durable DDL expression schema identities
 
 Check, expression-index, partial-index and ALTER DEFAULT binding now share a

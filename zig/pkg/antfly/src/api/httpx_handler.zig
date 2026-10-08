@@ -13688,8 +13688,8 @@ test "httpx SQL expression DDL defaults generated mutations and restore" {
 }
 
 test "httpx SQL PostgreSQL mutations capture native source relations and complete storage" {
-    // Exact-source non-key mutations. Logical PK/index-owner activation is
-    // deliberately not claimed by this fixture: sql-0012, sql-0013,
+    // Exact-source mutations over genuinely activated native logical PKs:
+    // sql-0012, sql-0013,
     // sql-0571, sql-0572, sql-0598, sql-0599, sql-0606, sql-0607,
     // sql-0608, sql-0609, sql-0619, sql-0620, sql-0657, sql-0667,
     // sql-1499, sql-1500, sql-1508, sql-1519, sql-1533, sql-1564.
@@ -13717,23 +13717,34 @@ test "httpx SQL PostgreSQL mutations capture native source relations and complet
         defer arena.deinit();
         const a = arena.allocator();
         const names = [_][]const u8{ "usage_records", "archived_records", "source_records" };
-        const schemas = [_][]const u8{
-            try std.json.Stringify.valueAlloc(a, profile.schema, .{}),
-            try std.json.Stringify.valueAlloc(a, profile.additional_tables[0].schema, .{}),
-            try std.json.Stringify.valueAlloc(a, profile.additional_tables[1].schema, .{}),
-        };
+        const declarations = [_]std.json.Value{ profile.schema, profile.additional_tables[0].schema, profile.additional_tables[1].schema };
+        const primary_keys = [_][]const []const u8{ profile.primary_key, profile.additional_tables[0].primary_key, profile.additional_tables[1].primary_key };
+        var schemas: [3][]const u8 = undefined;
+        for (declarations, primary_keys, names, &schemas) |declaration, columns, name, *schema| {
+            var owned = declaration;
+            try std.testing.expect(columns.len != 0);
+            try std.testing.expect(try @import("antfly_local_sources").sql_schema_ddl.apply(a, &owned, .{
+                .kind = .table,
+                .action = .alter_schema,
+                .name = .{ .table = name },
+                .schema_change = .{ .add_unique = .{ .name = try std.fmt.allocPrint(a, "{s}_pkey", .{name}), .columns = columns, .primary = true } },
+            }));
+            schema.* = try std.json.Stringify.valueAlloc(a, owned, .{});
+        }
         var databases: [3]db_mod.DB = undefined;
         var opened: usize = 0;
         defer for (databases[0..opened]) |*database| database.close();
-        var source: Source = .{ .records = undefined, .reads = undefined };
+        var ranges: [3]@import("antfly_local_sources").common_topology_records.RangeRecord = undefined;
+        var source: Source = .{ .records = undefined, .reads = undefined, .ranges = &ranges };
         const Table = struct { name: []const u8, db: *db_mod.DB };
         var tables: [3]Table = undefined;
         for (&databases, names, schemas, 0..) |*database, name, schema, i| {
             const path = try std.fmt.allocPrint(a, "{s}/{s}", .{ directory.path(), name });
-            database.* = try db_mod.DB.open(alloc, path, .{ .start_optional_runtimes = false, .start_index_workers = false });
+            database.* = try db_mod.DB.open(alloc, path, .{ .start_optional_runtimes = false, .start_index_workers = false, .identity_namespace = .{ .table_id = 7 + i, .shard_id = 1, .range_id = 1 } });
             opened += 1;
             try database.setSchemaJson(alloc, schema);
             source.records[i] = .{ .table_id = 7 + i, .name = name, .schema_json = schema };
+            ranges[i] = .{ .table_id = 7 + i, .group_id = 7 + i, .range_id = 1, .start_key = "", .doc_identity_shard_id = 1, .doc_identity_range_id = 1 };
             source.reads[i] = table_reads.BoundTableReadSource.init(name, 7 + i, database, raft_mod.read_gate.alreadyReadSafeBarrier());
             tables[i] = .{ .name = name, .db = database };
         }
@@ -13743,7 +13754,7 @@ test "httpx SQL PostgreSQL mutations capture native source relations and complet
         var server = ApiHttpServer.init(alloc, .{ .backend_runtime = backend_runtime.ptr() }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.systemCatalog, .admin_snapshot = Source.snapshot, .free_admin_snapshot = Source.freeSnapshot, .supports_query_definitions = true } }, source.source(), writes.source());
         defer server.deinit();
         var handler = AntflyApiHandler{ .api_server = &server };
-        try parity.runPostgresMutations(alloc, &handler, &tables, parsed.value, campaign.ids);
+        try parity.runPostgresMutations(alloc, &handler, &tables, &source.records, parsed.value, campaign.ids);
         try std.testing.expect(source.captures != 0);
         if (campaign.expected_captures) |count| try std.testing.expectEqual(count, source.captures);
     }

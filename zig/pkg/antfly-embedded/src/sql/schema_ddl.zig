@@ -69,8 +69,9 @@ fn requirePrimaryColumns(alloc: std.mem.Allocator, schema: *Value, columns: []co
     if (document.* != .object) return error.InvalidSqlBackendResponse;
     const row = document.object.getPtr("schema") orelse return error.InvalidSqlBackendResponse;
     if (row.* != .object) return error.InvalidSqlBackendResponse;
-    const properties = row.object.getPtr("properties") orelse return error.InvalidSqlBackendResponse;
-    if (properties.* != .object) return error.InvalidSqlBackendResponse;
+    // Adding required can relocate row slots, but not this nested map's data.
+    const properties = row.object.get("properties") orelse return error.InvalidSqlBackendResponse;
+    if (properties != .object) return error.InvalidSqlBackendResponse;
     if (columns.len == 0) return error.InvalidSqlSyntax;
     // Validate the entire key before changing either the column shape or its
     // uniqueness declaration. A failed composite key cannot leave a prefix
@@ -269,6 +270,36 @@ pub fn applyCandidate(alloc: std.mem.Allocator, schema: *Value, ddl: ast.Catalog
         },
     }
     return true;
+}
+
+fn primaryKeyGrowth(allocator: std.mem.Allocator) !void {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var schema = try value(a, .{ .default_type = "row", .document_schemas = .{ .row = .{ .schema = .{
+        .type = "object",
+        .properties = .{ .id = .{ .type = "integer", .nullable = true }, .tenant = .{ .type = "keyword" } },
+        .additionalProperties = false,
+    } } } });
+    try std.testing.expect(try apply(a, &schema, .{
+        .kind = .table,
+        .action = .alter_schema,
+        .name = .{ .table = "items" },
+        .schema_change = .{ .add_unique = .{ .name = "items_pk", .columns = &.{ "tenant", "id" }, .primary = true } },
+    }));
+    const row = schema.object.get("document_schemas").?.object.get("row").?.object.get("schema").?;
+    const required = row.object.get("required").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), required.len);
+    for ([_][]const u8{ "tenant", "id" }, required) |column, entry| {
+        try std.testing.expectEqualStrings(column, entry.string);
+        try std.testing.expect(!row.object.get("properties").?.object.get(column).?.object.get("nullable").?.bool);
+    }
+    try std.testing.expect(hasPrimary(schema));
+}
+
+test "primary key schema lowering retains column ownership across row map growth" {
+    try primaryKeyGrowth(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, primaryKeyGrowth, .{});
 }
 
 test "primary key schema lowering rejects deferred timing and empty keys" {

@@ -1679,6 +1679,30 @@ class PostgresReferenceTest(unittest.TestCase):
             result["entries"][0]["final_tables"]["usage_records"]["rows"],
         )
 
+    def test_original_mutation_profiles_enforce_logical_primary_keys(self):
+        import json
+
+        cases = [
+            self.case("INSERT INTO usage_records (id) VALUES ('u1')"),
+            self.case("INSERT INTO usage_records (id) VALUES (NULL)"),
+            self.case(
+                "UPDATE usage_records SET status='verified' WHERE id='u1' RETURNING id,status"
+            ),
+        ]
+        for name in (
+            "sql_mutation_postgres_reference.json",
+            "sql_correlated_mutation_postgres_reference.json",
+        ):
+            with self.subTest(profile=name):
+                profile = json.loads((FIXTURES / name).read_text())["profile"]
+                result = mutation_reference(self.db, cases, profile)
+                self.assertEqual(
+                    ["23505", "23502"],
+                    [entry["sqlstate"] for entry in result["excluded"]],
+                )
+                self.assertEqual(1, len(result["entries"]))
+                self.assertEqual([["u1", "verified"]], result["entries"][0]["rows"])
+
     def test_original_postgres_mutation_campaign_goldens_are_complete_and_repeatable(
         self,
     ):

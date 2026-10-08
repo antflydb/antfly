@@ -32,6 +32,11 @@
       "cwd": "zig",
       "timeout_seconds": 600
     },
+    "sql-postgres-mutation-reference": {
+      "command": ["uv", "run", "--no-project", "--with", "psycopg[binary]==3.3.6", "python", "scripts/generate_sql_postgres_reference.py", "mutation", "--check", "zig/pkg/antfly-embedded/src/sql/fixtures/sql_mutation_postgres_reference.json"],
+      "cwd": ".",
+      "timeout_seconds": 120
+    },
     "sql-postgres-correlated-reference": {
       "command": ["uv", "run", "--no-project", "--with", "psycopg[binary]==3.3.6", "python", "scripts/generate_sql_postgres_reference.py", "correlated_mutation", "--check", "zig/pkg/antfly-embedded/src/sql/fixtures/sql_correlated_mutation_postgres_reference.json"],
       "cwd": ".",
@@ -6356,13 +6361,21 @@
     },
     {
       "id": "sql-0598",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL and tagged parameters execute through mounted HTTP over native typed tables with genuinely enforced logical primary keys, database-backed activation coverage and integrity-prepared seed/reset transactions. Independent PostgreSQL results verify complete RETURNING labels/types/values, SQL NULL provenance, affected counts and persisted state of all three tables. Duplicate and NULL primary keys reject atomically with matching SQLSTATEs. This proves the isolated single-owner profile, not distributed read-cut or multi-owner activation.",
+      "evidence": [
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL PostgreSQL mutations capture native source relations and complete storage", "gate": "sql-postgres-correlated-mutations"},
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL PostgreSQL mutations capture native source relations and complete storage", "gate": "sql-postgres-mutation-reference"}
+      ]
     },
     {
       "id": "sql-0599",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL and tagged parameters execute through mounted HTTP over native typed tables with genuinely enforced logical primary keys, database-backed activation coverage and integrity-prepared seed/reset transactions. Independent PostgreSQL results verify complete RETURNING labels/types/values, SQL NULL provenance, affected counts and persisted state of all three tables. Duplicate and NULL primary keys reject atomically with matching SQLSTATEs. This proves the isolated single-owner profile, not distributed read-cut or multi-owner activation.",
+      "evidence": [
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL PostgreSQL mutations capture native source relations and complete storage", "gate": "sql-postgres-correlated-mutations"},
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL PostgreSQL mutations capture native source relations and complete storage", "gate": "sql-postgres-mutation-reference"}
+      ]
     },
     {
       "id": "sql-0600",
@@ -6452,13 +6465,21 @@
     },
     {
       "id": "sql-0608",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL and tagged parameters execute through mounted HTTP over native typed tables with genuinely enforced logical primary keys, database-backed activation coverage and integrity-prepared seed/reset transactions. Independent PostgreSQL results verify complete RETURNING labels/types/values, SQL NULL provenance, affected counts and persisted state of all three tables. Duplicate and NULL primary keys reject atomically with matching SQLSTATEs. This proves the isolated single-owner profile, not distributed read-cut or multi-owner activation.",
+      "evidence": [
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL PostgreSQL mutations capture native source relations and complete storage", "gate": "sql-postgres-correlated-mutations"},
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL PostgreSQL mutations capture native source relations and complete storage", "gate": "sql-postgres-mutation-reference"}
+      ]
     },
     {
       "id": "sql-0609",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL and tagged parameters execute through mounted HTTP over native typed tables with genuinely enforced logical primary keys, database-backed activation coverage and integrity-prepared seed/reset transactions. Independent PostgreSQL results verify complete RETURNING labels/types/values, SQL NULL provenance, affected counts and persisted state of all three tables. Duplicate and NULL primary keys reject atomically with matching SQLSTATEs. This proves the isolated single-owner profile, not distributed read-cut or multi-owner activation.",
+      "evidence": [
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL PostgreSQL mutations capture native source relations and complete storage", "gate": "sql-postgres-correlated-mutations"},
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL PostgreSQL mutations capture native source relations and complete storage", "gate": "sql-postgres-mutation-reference"}
+      ]
     },
     {
       "id": "sql-0610",
@@ -6522,13 +6543,21 @@
     },
     {
       "id": "sql-0619",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL and tagged parameters execute through mounted HTTP over native typed tables with genuinely enforced logical primary keys, database-backed activation coverage and integrity-prepared seed/reset transactions. Independent PostgreSQL results verify complete RETURNING labels/types/values, SQL NULL provenance, affected counts and persisted state of all three tables. Duplicate and NULL primary keys reject atomically with matching SQLSTATEs. This proves the isolated single-owner profile, not distributed read-cut or multi-owner activation.",
+      "evidence": [
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL PostgreSQL mutations capture native source relations and complete storage", "gate": "sql-postgres-correlated-mutations"},
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL PostgreSQL mutations capture native source relations and complete storage", "gate": "sql-postgres-mutation-reference"}
+      ]
     },
     {
       "id": "sql-0620",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL and tagged parameters execute through mounted HTTP over native typed tables with genuinely enforced logical primary keys, database-backed activation coverage and integrity-prepared seed/reset transactions. Independent PostgreSQL results verify complete RETURNING labels/types/values, SQL NULL provenance, affected counts and persisted state of all three tables. Duplicate and NULL primary keys reject atomically with matching SQLSTATEs. This proves the isolated single-owner profile, not distributed read-cut or multi-owner activation.",
+      "evidence": [
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL PostgreSQL mutations capture native source relations and complete storage", "gate": "sql-postgres-correlated-mutations"},
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL PostgreSQL mutations capture native source relations and complete storage", "gate": "sql-postgres-mutation-reference"}
+      ]
     },
     {
       "id": "sql-0621",
@@ -6713,8 +6742,12 @@
     },
     {
       "id": "sql-0657",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL and tagged parameters execute through mounted HTTP over native typed tables with genuinely enforced logical primary keys, database-backed activation coverage and integrity-prepared seed/reset transactions. Independent PostgreSQL results verify complete RETURNING labels/types/values, SQL NULL provenance, affected counts and persisted state of all three tables. Duplicate and NULL primary keys reject atomically with matching SQLSTATEs. This proves the isolated single-owner profile, not distributed read-cut or multi-owner activation.",
+      "evidence": [
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL PostgreSQL mutations capture native source relations and complete storage", "gate": "sql-postgres-correlated-mutations"},
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL PostgreSQL mutations capture native source relations and complete storage", "gate": "sql-postgres-mutation-reference"}
+      ]
     },
     {
       "id": "sql-0658",
@@ -6763,8 +6796,12 @@
     },
     {
       "id": "sql-0667",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL and tagged parameters execute through mounted HTTP over native typed tables with genuinely enforced logical primary keys, database-backed activation coverage and integrity-prepared seed/reset transactions. Independent PostgreSQL results verify complete RETURNING labels/types/values, SQL NULL provenance, affected counts and persisted state of all three tables. Duplicate and NULL primary keys reject atomically with matching SQLSTATEs. This proves the isolated single-owner profile, not distributed read-cut or multi-owner activation.",
+      "evidence": [
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL PostgreSQL mutations capture native source relations and complete storage", "gate": "sql-postgres-correlated-mutations"},
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL PostgreSQL mutations capture native source relations and complete storage", "gate": "sql-postgres-mutation-reference"}
+      ]
     },
     {
       "id": "sql-0668",
@@ -13976,13 +14013,21 @@
     },
     {
       "id": "sql-1499",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL and tagged parameters execute through mounted HTTP over native typed tables with genuinely enforced logical primary keys, database-backed activation coverage and integrity-prepared seed/reset transactions. Independent PostgreSQL results verify complete RETURNING labels/types/values, SQL NULL provenance, affected counts and persisted state of all three tables. Duplicate and NULL primary keys reject atomically with matching SQLSTATEs. This proves the isolated single-owner profile, not distributed read-cut or multi-owner activation.",
+      "evidence": [
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL PostgreSQL mutations capture native source relations and complete storage", "gate": "sql-postgres-correlated-mutations"},
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL PostgreSQL mutations capture native source relations and complete storage", "gate": "sql-postgres-mutation-reference"}
+      ]
     },
     {
       "id": "sql-1500",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL and tagged parameters execute through mounted HTTP over native typed tables with genuinely enforced logical primary keys, database-backed activation coverage and integrity-prepared seed/reset transactions. Independent PostgreSQL results verify complete RETURNING labels/types/values, SQL NULL provenance, affected counts and persisted state of all three tables. Duplicate and NULL primary keys reject atomically with matching SQLSTATEs. This proves the isolated single-owner profile, not distributed read-cut or multi-owner activation.",
+      "evidence": [
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL PostgreSQL mutations capture native source relations and complete storage", "gate": "sql-postgres-correlated-mutations"},
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL PostgreSQL mutations capture native source relations and complete storage", "gate": "sql-postgres-mutation-reference"}
+      ]
     },
     {
       "id": "sql-1501",
@@ -14037,8 +14082,12 @@
     },
     {
       "id": "sql-1508",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL and tagged parameters execute through mounted HTTP over native typed tables with genuinely enforced logical primary keys, database-backed activation coverage and integrity-prepared seed/reset transactions. Independent PostgreSQL results verify complete RETURNING labels/types/values, SQL NULL provenance, affected counts and persisted state of all three tables. Duplicate and NULL primary keys reject atomically with matching SQLSTATEs. This proves the isolated single-owner profile, not distributed read-cut or multi-owner activation.",
+      "evidence": [
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL PostgreSQL mutations capture native source relations and complete storage", "gate": "sql-postgres-correlated-mutations"},
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL PostgreSQL mutations capture native source relations and complete storage", "gate": "sql-postgres-mutation-reference"}
+      ]
     },
     {
       "id": "sql-1509",
@@ -14196,8 +14245,12 @@
     },
     {
       "id": "sql-1533",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL and tagged parameters execute through mounted HTTP over native typed tables with genuinely enforced logical primary keys, database-backed activation coverage and integrity-prepared seed/reset transactions. Independent PostgreSQL results verify complete RETURNING labels/types/values, SQL NULL provenance, affected counts and persisted state of all three tables. Duplicate and NULL primary keys reject atomically with matching SQLSTATEs. This proves the isolated single-owner profile, not distributed read-cut or multi-owner activation.",
+      "evidence": [
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL PostgreSQL mutations capture native source relations and complete storage", "gate": "sql-postgres-correlated-mutations"},
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL PostgreSQL mutations capture native source relations and complete storage", "gate": "sql-postgres-mutation-reference"}
+      ]
     },
     {
       "id": "sql-1534",
@@ -14351,8 +14404,12 @@
     },
     {
       "id": "sql-1564",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL and tagged parameters execute through mounted HTTP over native typed tables with genuinely enforced logical primary keys, database-backed activation coverage and integrity-prepared seed/reset transactions. Independent PostgreSQL results verify complete RETURNING labels/types/values, SQL NULL provenance, affected counts and persisted state of all three tables. Duplicate and NULL primary keys reject atomically with matching SQLSTATEs. This proves the isolated single-owner profile, not distributed read-cut or multi-owner activation.",
+      "evidence": [
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL PostgreSQL mutations capture native source relations and complete storage", "gate": "sql-postgres-correlated-mutations"},
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL PostgreSQL mutations capture native source relations and complete storage", "gate": "sql-postgres-mutation-reference"}
+      ]
     },
     {
       "id": "sql-1565",

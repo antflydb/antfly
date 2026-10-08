@@ -33,6 +33,7 @@ pub fn Tables(comptime count: usize) type {
         records: [count]local.common_topology_records.TableRecord,
         reads: [count]table_reads.BoundTableReadSource,
         captures: usize = 0,
+        ranges: []local.common_topology_records.RangeRecord = &.{},
 
         pub fn status(_: *anyopaque) !metadata.MetadataStatus {
             return .{ .metadata_group_id = 1, .metrics = .{} };
@@ -72,7 +73,7 @@ pub fn Tables(comptime count: usize) type {
         }
         pub fn snapshot(ptr: *anyopaque) !metadata.AdminSnapshot {
             const self: *Self = @ptrCast(@alignCast(ptr));
-            return .{ .status = try status(ptr), .tables = &self.records, .ranges = &.{}, .stores = &.{}, .placement_intents = &.{}, .split_transitions = &.{}, .merge_transitions = &.{} };
+            return .{ .status = try status(ptr), .tables = &self.records, .ranges = self.ranges, .stores = &.{}, .placement_intents = &.{}, .split_transitions = &.{}, .merge_transitions = &.{} };
         }
         pub fn freeSnapshot(_: *anyopaque, _: *metadata.AdminSnapshot) void {}
 
