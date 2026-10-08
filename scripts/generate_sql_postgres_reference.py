@@ -755,6 +755,31 @@ def mutation_reference(
     }
 
 
+def aggregate_order_observer(case):
+    """Expose complete COUNT peer frontiers without imposing a tie order.
+
+    The source query still executes exactly as stored in the inventory. Only
+    this independent observer drops LIMIT and projects the existing sort key.
+    Fail closed outside the explicit simple grouped-count shape.
+    """
+    if case.get("family") != "aggregate":
+        return None
+    match = re.fullmatch(
+        r"SELECT organization_id, (COUNT\(\*\)(?: FILTER \(WHERE .+\))?) "
+        r"AS ([a-z_]+) FROM usage_records(.*?) GROUP BY organization_id "
+        r"ORDER BY \2 DESC LIMIT 5",
+        case["sql"],
+    )
+    if not match:
+        return None
+    expression, label, predicate = match.groups()
+    return (
+        f"SELECT organization_id, {expression} AS {label}, "
+        f"{expression} AS order_key FROM usage_records{predicate} "
+        "GROUP BY organization_id ORDER BY order_key DESC"
+    )
+
+
 def read_reference(db, cases, profile):
     import psycopg
 
@@ -770,7 +795,9 @@ def read_reference(db, cases, profile):
                 with db.transaction(force_rollback=True):
                     db.execute("SET TRANSACTION READ ONLY")
                     entry = execute(db, case, read=True)
-                    observer_sql = ORDER_OBSERVERS.get(case["id"])
+                    observer_sql = ORDER_OBSERVERS.get(
+                        case["id"]
+                    ) or aggregate_order_observer(case)
                     if "sql-1345" <= case["id"] <= "sql-1365":
                         # These originals sort by their projected amount. The
                         # observer exposes the full peer frontier, not a second
@@ -862,6 +889,65 @@ def set_read_profile():
     return profile
 
 
+def aggregate_read_profile():
+    """Independent aggregate witnesses: matches, nonmatches and SQL NULLs.
+
+    Keep the baseline campaign unchanged. In particular, the regex inputs must
+    include distinct uppercase captures, repeated captures, multiple digit
+    groups, Unicode text, no match, empty text and a SQL NULL.
+    """
+    columns = {
+        "organization_id": {"type": "keyword"},
+        "status": {"type": "keyword", "nullable": True},
+        "quantity": {"type": "integer", "nullable": True},
+        "enabled": {"type": "boolean", "nullable": True},
+        "metadata": {"type": "json", "nullable": True},
+    }
+    values = [
+        ("a", "op_READY12 34", 3, True, "external"),
+        ("a", "active", 2, False, "internal"),
+        ("a", "OPEN", 0, None, "external"),
+        ("a", "X9 Y10", None, True, None),
+        ("b", "open", 1, False, "internal"),
+        ("b", "READY12", 4, None, "external"),
+        ("b", "éZ7", 0, True, None),
+        ("c", "", 0, False, "external"),
+        ("c", None, None, None, None),
+    ]
+    return {
+        "format": 1,
+        "schema": {
+            "version": 1,
+            "storage_mode": "relational",
+            "default_type": "row",
+            "document_schemas": {
+                "row": {
+                    "schema": {
+                        "type": "object",
+                        "properties": columns,
+                        "additionalProperties": False,
+                    }
+                }
+            },
+        },
+        "rows": [
+            {
+                "key": f"r{index:02}",
+                "value": {
+                    "organization_id": organization,
+                    **({"status": status} if status is not None else {}),
+                    **({"quantity": quantity} if quantity is not None else {}),
+                    **({"enabled": enabled} if enabled is not None else {}),
+                    "metadata": {"source": source},
+                },
+            }
+            for index, (organization, status, quantity, enabled, source) in enumerate(
+                values
+            )
+        ],
+    }
+
+
 def typed_array_read_profile():
     """Keep the scalar campaign stable; declare a separate stored-array domain."""
     profile = json.loads((FIXTURES / "sql_read_campaign_profile.json").read_text())
@@ -917,6 +1003,22 @@ def validate_ordered_groups(entry):
         if offset == len(entry["rows"]):
             return
     raise ValueError("ordered reference frontier is incomplete")
+
+
+def normalize_ordered_contract(entry):
+    """Canonicalize only members of genuine peers, never the frontier order."""
+    if "ordered_groups" not in entry:
+        return
+    validate_ordered_groups(entry)
+    for group in entry["ordered_groups"]:
+        pairs = sorted(
+            zip(group["rows"], group["sql_nulls"], strict=True),
+            key=lambda pair: json.dumps(pair, sort_keys=True, allow_nan=False),
+        )
+        group["rows"] = [row for row, _ in pairs]
+        group["sql_nulls"] = [nulls for _, nulls in pairs]
+    entry["row_count"] = len(entry.pop("rows"))
+    entry.pop("sql_nulls")
 
 
 def document_reference(db, cases, schemas):
@@ -1026,6 +1128,7 @@ def main():
         choices=[
             "read",
             "typed_array_read",
+            "aggregate_read",
             "set_read",
             "document",
             "lateral",
@@ -1070,6 +1173,7 @@ def main():
         if args.campaign in {
             "read",
             "typed_array_read",
+            "aggregate_read",
             "set_read",
             "lateral",
             "mutation",
@@ -1080,6 +1184,8 @@ def main():
                 if args.campaign == "set_read"
                 else typed_array_read_profile()
                 if args.campaign == "typed_array_read"
+                else aggregate_read_profile()
+                if args.campaign == "aggregate_read"
                 else json.loads(
                     (
                         FIXTURES / f"sql_{args.campaign}_campaign_profile.json"
@@ -1111,10 +1217,7 @@ def main():
             output.pop("excluded", None)
             output.pop("server_version", None)
             for entry in output["entries"]:
-                if "ordered_groups" in entry:
-                    validate_ordered_groups(entry)
-                    entry["row_count"] = len(entry.pop("rows"))
-                    entry.pop("sql_nulls")
+                normalize_ordered_contract(entry)
         if result != expected:
             parser.error("PostgreSQL reference drift")
         if extended:

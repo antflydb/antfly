@@ -35,6 +35,9 @@ from generate_sql_postgres_reference import (
     execute,
     postgres,
     read_reference,
+    aggregate_read_profile,
+    aggregate_order_observer,
+    normalize_ordered_contract,
     set_read_profile,
     mutation_reference,
     SEEDS,
@@ -2516,6 +2519,46 @@ class PostgresReferenceTest(unittest.TestCase):
                 self.db.execute("SELECT n,cold FROM target ORDER BY _id").fetchall(),
             )
 
+    def test_original_aggregate_campaign_covers_match_nonmatch_null_witnesses(self):
+        import json
+
+        manifest = json.loads(
+            (FIXTURES / "sql_aggregate_read_campaign.json").read_text()
+        )
+        ids = {entry["id"] for entry in manifest["entries"]}
+        self.assertEqual(12, len(ids))
+        inventory = json.loads((FIXTURES / "sql_parity_inventory.json").read_text())[
+            "entries"
+        ]
+        cases = [case for case in inventory if case["id"] in ids]
+        profile = aggregate_read_profile()
+        result = read_reference(self.db, cases, profile)
+        self.assertEqual([], result["excluded"])
+        self.assertEqual(ids, {entry["id"] for entry in result["entries"]})
+        golden = json.loads(
+            (FIXTURES / "sql_aggregate_read_reference.json").read_text()
+        )
+        self.assertEqual(profile, golden["profile"])
+        actual, expected = deepcopy(result["entries"]), deepcopy(golden["entries"])
+        for entry in actual + expected:
+            normalize_ordered_contract(entry)
+        self.assertEqual(actual, expected)
+        by_id = {entry["id"]: entry for entry in result["entries"]}
+        self.assertEqual([[6, 9, 4]], by_id["sql-1251"]["rows"])
+        self.assertEqual([20, 20, 20], by_id["sql-1251"]["column_oids"])
+        self.assertEqual([[44, 352]], by_id["sql-1250"]["rows"])
+        self.assertEqual({"a": 1, "b": 1, "c": 1}, dict(by_id["sql-1245"]["rows"]))
+        self.assertEqual({"a": 0, "b": 0, "c": 0}, dict(by_id["sql-1248"]["rows"]))
+        self.assertEqual(1, len(by_id["sql-1248"]["ordered_groups"]))
+        for case in cases:
+            observer = aggregate_order_observer(case)
+            if case["id"] < "sql-1250":
+                self.assertIsNotNone(observer)
+                self.assertNotIn("LIMIT", observer)
+                self.assertIn(" AS order_key", observer)
+            else:
+                self.assertIsNone(observer)
+
     def test_original_set_campaign_preserves_duplicate_and_null_witnesses(self):
         import json
         from collections import Counter
@@ -3906,6 +3949,52 @@ class PostgresReferenceTest(unittest.TestCase):
 
 
 class OrderingContractTest(unittest.TestCase):
+    def test_golden_comparison_normalizes_only_genuine_peer_members(self):
+        entry = {
+            "rows": [["first"], ["peer-b"]],
+            "sql_nulls": [[False], [False]],
+            "ordered_groups": [
+                {"rows": [["first"]], "sql_nulls": [[False]]},
+                {"rows": [["peer-a"], ["peer-b"]], "sql_nulls": [[False], [False]]},
+                {"rows": [["worse"]], "sql_nulls": [[False]]},
+            ],
+        }
+        permuted = deepcopy(entry)
+        permuted["rows"][1] = ["peer-a"]
+        permuted["ordered_groups"][1]["rows"].reverse()
+        normalize_ordered_contract(entry)
+        normalize_ordered_contract(permuted)
+        self.assertEqual(entry, permuted)
+        self.assertEqual(2, entry["row_count"])
+        # Duplicates remain significant; normalization must not turn bags into
+        # sets or erase distinct SQL NULL provenance.
+        duplicated = deepcopy(permuted)
+        duplicated["ordered_groups"][1]["rows"].append(["peer-a"])
+        duplicated["ordered_groups"][1]["sql_nulls"].append([False])
+        self.assertNotEqual(entry, duplicated)
+
+    def test_aggregate_observer_is_not_a_general_query_rewriter(self):
+        sql = "SELECT organization_id, COUNT(*) AS n FROM usage_records GROUP BY organization_id ORDER BY n DESC LIMIT 5"
+        self.assertIsNone(aggregate_order_observer({"family": "read", "sql": sql}))
+        self.assertIsNone(
+            aggregate_order_observer(
+                {"family": "aggregate", "sql": sql.replace("DESC", "ASC")}
+            )
+        )
+        self.assertIsNone(
+            aggregate_order_observer(
+                {"family": "aggregate", "sql": sql.replace("COUNT(*)", "SUM(quantity)")}
+            )
+        )
+        self.assertIsNone(
+            aggregate_order_observer(
+                {
+                    "family": "aggregate",
+                    "sql": sql.replace("LIMIT 5", "LIMIT 5 OFFSET 2"),
+                }
+            )
+        )
+
     def test_ordered_peer_frontier_accepts_ties_but_not_worse_or_duplicate_rows(self):
         entry = {
             "rows": [["first"], ["peer-b"]],

@@ -2,6 +2,16 @@
   "ledger_format": 1,
   "inventory_sha256": "c203a4dcf0094b75e1d3764e90beebddaf844a9ce604543c0a4dbc0ffe8ae173",
   "gates": {
+    "sql-original-aggregate-reads": {
+      "command": ["zig", "build", "public-api-parity-test", "--cache-dir", ".zig-cache/sql-parity-evidence", "-Dtest-filter=httpx SQL PostgreSQL original aggregate reads preserve filters captures and nulls"],
+      "cwd": "zig",
+      "timeout_seconds": 600
+    },
+    "sql-postgres-aggregate-reference": {
+      "command": ["uv", "run", "--no-project", "--with", "psycopg[binary]==3.3.6", "python", "scripts/generate_sql_postgres_reference.py", "aggregate_read", "--check", "zig/pkg/antfly-embedded/src/sql/fixtures/sql_aggregate_read_reference.json"],
+      "cwd": ".",
+      "timeout_seconds": 120
+    },
     "sql-mounted-postgres-regex-mutations": {
       "command": ["zig", "build", "public-api-parity-test", "--cache-dir", ".zig-cache/sql-parity-evidence", "-Dtest-filter=httpx SQL PostgreSQL regex mutations"],
       "cwd": "zig",
@@ -11689,8 +11699,20 @@
     },
     {
       "id": "sql-1225",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original aggregate SELECT executes through mounted public HTTP over native relational storage. An independent PostgreSQL 18 C/UTF-8 fixture verifies complete values, labels, type OIDs and SQL NULL flags with escaped-pattern, match/nonmatch, nullable boolean, JSON source, distinct-capture and multibyte-text witnesses. Complete grouped-count peer frontiers permit only genuine sort ties. This does not certify exact NUMERIC aggregates or unrelated grouped-expression domains.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original aggregate reads preserve filters captures and nulls",
+          "gate": "sql-original-aggregate-reads"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original aggregate reads preserve filters captures and nulls",
+          "gate": "sql-postgres-aggregate-reference"
+        }
+      ]
     },
     {
       "id": "sql-1226",
@@ -11726,8 +11748,20 @@
     },
     {
       "id": "sql-1232",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original aggregate SELECT executes through mounted public HTTP over native relational storage. An independent PostgreSQL 18 C/UTF-8 fixture verifies complete values, labels, type OIDs and SQL NULL flags with escaped-pattern, match/nonmatch, nullable boolean, JSON source, distinct-capture and multibyte-text witnesses. Complete grouped-count peer frontiers permit only genuine sort ties. This does not certify exact NUMERIC aggregates or unrelated grouped-expression domains.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original aggregate reads preserve filters captures and nulls",
+          "gate": "sql-original-aggregate-reads"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original aggregate reads preserve filters captures and nulls",
+          "gate": "sql-postgres-aggregate-reference"
+        }
+      ]
     },
     {
       "id": "sql-1233",
@@ -11800,38 +11834,122 @@
     },
     {
       "id": "sql-1242",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original aggregate SELECT executes through mounted public HTTP over native relational storage. An independent PostgreSQL 18 C/UTF-8 fixture verifies complete values, labels, type OIDs and SQL NULL flags with escaped-pattern, match/nonmatch, nullable boolean, JSON source, distinct-capture and multibyte-text witnesses. Complete grouped-count peer frontiers permit only genuine sort ties. This does not certify exact NUMERIC aggregates or unrelated grouped-expression domains.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original aggregate reads preserve filters captures and nulls",
+          "gate": "sql-original-aggregate-reads"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original aggregate reads preserve filters captures and nulls",
+          "gate": "sql-postgres-aggregate-reference"
+        }
+      ]
     },
     {
       "id": "sql-1243",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original aggregate SELECT executes through mounted public HTTP over native relational storage. An independent PostgreSQL 18 C/UTF-8 fixture verifies complete values, labels, type OIDs and SQL NULL flags with escaped-pattern, match/nonmatch, nullable boolean, JSON source, distinct-capture and multibyte-text witnesses. Complete grouped-count peer frontiers permit only genuine sort ties. This does not certify exact NUMERIC aggregates or unrelated grouped-expression domains.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original aggregate reads preserve filters captures and nulls",
+          "gate": "sql-original-aggregate-reads"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original aggregate reads preserve filters captures and nulls",
+          "gate": "sql-postgres-aggregate-reference"
+        }
+      ]
     },
     {
       "id": "sql-1244",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original aggregate SELECT executes through mounted public HTTP over native relational storage. An independent PostgreSQL 18 C/UTF-8 fixture verifies complete values, labels, type OIDs and SQL NULL flags with escaped-pattern, match/nonmatch, nullable boolean, JSON source, distinct-capture and multibyte-text witnesses. Complete grouped-count peer frontiers permit only genuine sort ties. This does not certify exact NUMERIC aggregates or unrelated grouped-expression domains.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original aggregate reads preserve filters captures and nulls",
+          "gate": "sql-original-aggregate-reads"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original aggregate reads preserve filters captures and nulls",
+          "gate": "sql-postgres-aggregate-reference"
+        }
+      ]
     },
     {
       "id": "sql-1245",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original aggregate SELECT executes through mounted public HTTP over native relational storage. An independent PostgreSQL 18 C/UTF-8 fixture verifies complete values, labels, type OIDs and SQL NULL flags with escaped-pattern, match/nonmatch, nullable boolean, JSON source, distinct-capture and multibyte-text witnesses. Complete grouped-count peer frontiers permit only genuine sort ties. This does not certify exact NUMERIC aggregates or unrelated grouped-expression domains.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original aggregate reads preserve filters captures and nulls",
+          "gate": "sql-original-aggregate-reads"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original aggregate reads preserve filters captures and nulls",
+          "gate": "sql-postgres-aggregate-reference"
+        }
+      ]
     },
     {
       "id": "sql-1246",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original aggregate SELECT executes through mounted public HTTP over native relational storage. An independent PostgreSQL 18 C/UTF-8 fixture verifies complete values, labels, type OIDs and SQL NULL flags with escaped-pattern, match/nonmatch, nullable boolean, JSON source, distinct-capture and multibyte-text witnesses. Complete grouped-count peer frontiers permit only genuine sort ties. This does not certify exact NUMERIC aggregates or unrelated grouped-expression domains.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original aggregate reads preserve filters captures and nulls",
+          "gate": "sql-original-aggregate-reads"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original aggregate reads preserve filters captures and nulls",
+          "gate": "sql-postgres-aggregate-reference"
+        }
+      ]
     },
     {
       "id": "sql-1247",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original aggregate SELECT executes through mounted public HTTP over native relational storage. An independent PostgreSQL 18 C/UTF-8 fixture verifies complete values, labels, type OIDs and SQL NULL flags with escaped-pattern, match/nonmatch, nullable boolean, JSON source, distinct-capture and multibyte-text witnesses. Complete grouped-count peer frontiers permit only genuine sort ties. This does not certify exact NUMERIC aggregates or unrelated grouped-expression domains.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original aggregate reads preserve filters captures and nulls",
+          "gate": "sql-original-aggregate-reads"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original aggregate reads preserve filters captures and nulls",
+          "gate": "sql-postgres-aggregate-reference"
+        }
+      ]
     },
     {
       "id": "sql-1248",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original aggregate SELECT executes through mounted public HTTP over native relational storage. An independent PostgreSQL 18 C/UTF-8 fixture verifies complete values, labels, type OIDs and SQL NULL flags with escaped-pattern, match/nonmatch, nullable boolean, JSON source, distinct-capture and multibyte-text witnesses. Complete grouped-count peer frontiers permit only genuine sort ties. This does not certify exact NUMERIC aggregates or unrelated grouped-expression domains.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original aggregate reads preserve filters captures and nulls",
+          "gate": "sql-original-aggregate-reads"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original aggregate reads preserve filters captures and nulls",
+          "gate": "sql-postgres-aggregate-reference"
+        }
+      ]
     },
     {
       "id": "sql-1249",
@@ -11852,18 +11970,42 @@
     },
     {
       "id": "sql-1250",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original aggregate SELECT executes through mounted public HTTP over native relational storage. An independent PostgreSQL 18 C/UTF-8 fixture verifies complete values, labels, type OIDs and SQL NULL flags with escaped-pattern, match/nonmatch, nullable boolean, JSON source, distinct-capture and multibyte-text witnesses. Complete grouped-count peer frontiers permit only genuine sort ties. This does not certify exact NUMERIC aggregates or unrelated grouped-expression domains.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original aggregate reads preserve filters captures and nulls",
+          "gate": "sql-original-aggregate-reads"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original aggregate reads preserve filters captures and nulls",
+          "gate": "sql-postgres-aggregate-reference"
+        }
+      ]
     },
     {
       "id": "sql-1251",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original aggregate SELECT executes through mounted public HTTP over native relational storage. An independent PostgreSQL 18 C/UTF-8 fixture verifies complete values, labels, type OIDs and SQL NULL flags with escaped-pattern, match/nonmatch, nullable boolean, JSON source, distinct-capture and multibyte-text witnesses. Complete grouped-count peer frontiers permit only genuine sort ties. This does not certify exact NUMERIC aggregates or unrelated grouped-expression domains.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original aggregate reads preserve filters captures and nulls",
+          "gate": "sql-original-aggregate-reads"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original aggregate reads preserve filters captures and nulls",
+          "gate": "sql-postgres-aggregate-reference"
+        }
+      ]
     },
     {
       "id": "sql-1252",
       "status": "implemented",
-      "reason": "Exact original SELECT and logical parameters execute through public HTTP over native typed rows. An independent bounded SQLite reference checks complete results, SQL NULL provenance and explicit column labels on the shared nine-row fixture. Tagged source parameters become current public JSON values without integer rounding. Distributed activation and legacy physical plan fingerprints are not certified.",
+      "reason": "The unchanged original aggregate SELECT executes through mounted public HTTP over native relational storage. An independent PostgreSQL 18 C/UTF-8 fixture verifies complete values, labels, type OIDs and SQL NULL flags with escaped-pattern, match/nonmatch, nullable boolean, JSON source, distinct-capture and multibyte-text witnesses. Complete grouped-count peer frontiers permit only genuine sort ties. This does not certify exact NUMERIC aggregates or unrelated grouped-expression domains.",
       "evidence": [
         {
           "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
@@ -11874,6 +12016,16 @@
           "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
           "test": "httpx SQL executes one relational page with exact integer parameters",
           "gate": "sql-read-reference-reproducibility"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original aggregate reads preserve filters captures and nulls",
+          "gate": "sql-original-aggregate-reads"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original aggregate reads preserve filters captures and nulls",
+          "gate": "sql-postgres-aggregate-reference"
         }
       ]
     },

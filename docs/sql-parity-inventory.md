@@ -1,7 +1,12 @@
 # Original SQL extraction parity inventory
 
-Current audited dispositions: **437 implemented / 136 rejected / 73 superseded /
-940 unresolved**. Five original regex conflict mutations (sql-1443, sql-1471,
+Current audited dispositions: **448 implemented / 136 rejected / 73 superseded /
+929 unresolved**. Eleven original aggregate cases now have mounted native
+public-HTTP and independent PostgreSQL evidence for escaped patterns, nullable
+filters, text lengths and regex aggregate inputs. A twelfth already-implemented
+MIN/MAX case gained the same PostgreSQL gate without duplicate credit. Grouped
+count observers preserve genuine ties rather than requiring one arbitrary order.
+Five original regex conflict mutations (sql-1443, sql-1471,
 sql-1473, sql-1474 and sql-1475) have mounted public-HTTP evidence with native
 primary-key activation and complete PostgreSQL-backed result/postimage checks.
 Regex component tests alone do not resolve other corpus entries. Historical

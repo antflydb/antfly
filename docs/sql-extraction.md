@@ -4792,3 +4792,21 @@ reuses the owner correctly. Exhaustive allocation-failure checks cover all
 three paths. This is deterministic preparation/ownership evidence, not a
 wall-clock benchmark or additional original-case credit. The ledger remains
 437 implemented / 136 rejected / 73 superseded / 940 unresolved.
+
+A dedicated original aggregate campaign now has nine independent native rows
+with escaped-pattern matches, no matches, repeated/distinct uppercase captures,
+multiple digit groups, multibyte text, empty text and omitted SQL NULL fields.
+Twelve unchanged original SELECTs compare complete public results, PostgreSQL
+type OIDs and SQL NULL flags against a fresh PostgreSQL 18 C/UTF-8 oracle.
+Grouped-count observers expose the full sort-key peer frontier; the source
+queries still execute unchanged, and only genuinely tied output order is free.
+The regex original returns digit-group sum 6, character-offset sum 9 and four
+distinct non-NULL captures; UTF-8 length aggregates return 44 bytes and 352 bits.
+The always-false FILTER retains all three groups with zero counts.
+
+Eleven previously unresolved originals (sql-1225, sql-1232, sql-1242 through
+sql-1248, sql-1250 and sql-1251) now have both mounted and PostgreSQL evidence
+gates. sql-1252 gains stronger PostgreSQL coverage without duplicate credit.
+The ledger is 448 implemented / 136 rejected / 73 superseded / 929 unresolved.
+This increment does not claim exact NUMERIC aggregate support, arbitrary SQL
+aliases in HAVING, or completion of the remaining aggregate domains.
