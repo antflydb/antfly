@@ -170,6 +170,36 @@ def cases():
     ):
         for op in ("int16", "int32", "int64"):
             result.append({"op": op, "left": left})
+    division_pairs = pairs + [
+        ("1", "3"),
+        ("-10.00", "3.0"),
+        ("10.00", "-3.0"),
+        ("1", "200000000000000000000"),
+        ("999999999999999999999", "100000000000000000000"),
+        ("1e-1001", "1"),
+        ("1e-999", "1"),
+        ("1e100", "1e-100"),
+        ("0.000000000000000000001", "1.000000000000000000002"),
+        ("10000000000000001", "10000000000000000"),
+        ("9999999999999999999999999999", "99999999999999999999"),
+        ("5000000000000000000000000001", "50000000000000000001"),
+        ("1000000000000000000000000001", "999999999999999999999999999"),
+        ("1.00000000000000000000", "0.00000000000000000003"),
+    ]
+    division_rng = random.Random(20261009)
+    for _ in range(64):
+        division_pairs.append(
+            tuple(
+                f"{division_rng.randint(-(10**200), 10**200)}e-{division_rng.randrange(401)}"
+                for _ in range(2)
+            )
+        )
+    specials = ("0", "-0.00", "1", "-1", "NaN", "Infinity", "-Infinity")
+    division_pairs.extend((left, right) for left in specials for right in specials)
+    for left, right in division_pairs:
+        for op in ("divide", "divide_trunc", "remainder"):
+            result.append({"op": op, "left": left, "right": right})
+    result.append({"op": "remainder", "left": "1e131071", "right": "12345"})
     return result
 
 
@@ -181,6 +211,17 @@ def evaluate(db, case):
         symbol = {"add": "+", "subtract": "-", "multiply": "*"}[op]
         sql = f"SELECT (%s::numeric {symbol} %s::numeric)::text"
         args = (case["left"], case["right"])
+    elif op in {"divide", "remainder"}:
+        symbol = "/" if op == "divide" else "%%"
+        sql, args = (
+            f"SELECT (%s::numeric {symbol} %s::numeric)::text",
+            (case["left"], case["right"]),
+        )
+    elif op == "divide_trunc":
+        sql, args = (
+            "SELECT div(%s::numeric,%s::numeric)::text",
+            (case["left"], case["right"]),
+        )
     elif op == "typmod":
         # Modifiers are generated integers, never interpolated user SQL.
         sql = (
@@ -207,6 +248,8 @@ def evaluate(db, case):
 
 
 def verify_boundaries(db):
+    import psycopg
+
     # Keep giant outputs out of the fixture, but verify their exact domain and
     # display scale with PostgreSQL rather than inferring them from small cases.
     contracts = (
@@ -216,6 +259,10 @@ def verify_boundaries(db):
         ("round(%s::numeric,%s::int4)", ("1.0", 2147483647), (16385, 16383, False)),
         ("round(%s::numeric,%s::int4)", ("1e131071", -2147483648), (1, 0, True)),
         ("%s::numeric", ("0x" + "f" * 4096,), (4933, 0, False)),
+        ("%s::numeric / %s::numeric", ("1e-16383", "1e-16383"), (1002, 1000, False)),
+        ("%s::numeric / %s::numeric", ("1e-16383", "1"), (1002, 1000, True)),
+        ("%s::numeric %% %s::numeric", ("1e131071", "1e-16383"), (16385, 16383, True)),
+        ("%s::numeric / %s::numeric", ("1e131071", "1"), (131072, 0, False)),
     )
     for expression, args, expected in contracts:
         with db.transaction(force_rollback=True):
@@ -225,6 +272,19 @@ def verify_boundaries(db):
             ).fetchone()
             if actual != expected:
                 raise ValueError(f"PostgreSQL NUMERIC boundary drift: {actual!r}")
+    for expression in ("%s::numeric / %s::numeric", "div(%s::numeric,%s::numeric)"):
+        try:
+            with db.transaction(force_rollback=True):
+                db.execute(f"SELECT {expression}", ("1e131071", "1e-16383"))
+        except psycopg.Error as error:
+            if error.sqlstate != "22003":
+                raise ValueError(
+                    f"PostgreSQL NUMERIC overflow drift: {error.sqlstate}"
+                ) from error
+        else:
+            raise ValueError(
+                "PostgreSQL NUMERIC quotient overflow unexpectedly accepted"
+            )
 
 
 def main():

@@ -4844,3 +4844,33 @@ typed-row/index encoding, wire/spill support and aggregate integration remain
 unfinished. No original parity cases are credited for kernel-only evidence:
 the ledger remains 448 implemented / 136 rejected / 73 superseded /
 929 unresolved.
+
+The next exact NUMERIC increment adds PostgreSQL-compatible division, truncated
+integer division and remainder to the shared kernel. A normalized base-10000
+long-division loop corrects quotient estimates with bounded reusable scratch;
+an exact guard group supplies decimal rounding. Remainder is computed directly,
+so a representable result is not rejected because an intermediate quotient
+would overflow the stored NUMERIC domain. General remainders retain the
+divisor-sized buffer rather than the larger dividend scratch allocation.
+
+One-limb division keeps terminating exponent zeroes implicit; one-limb
+remainder reduces virtual zeroes using modular exponentiation. Full-range
+1e131071 / 1 and 1e131071 % 7 pass with a 64-unit work budget and a one-limb
+allocation limit. The large-exponent remainder modulo 12345 matches PostgreSQL
+and retains only two limbs rather than the 32769-limb dividend workspace.
+
+The independent PostgreSQL oracle now reproduces 799 complete result/error
+contracts plus ten full-domain summaries and two quotient-overflow checks.
+Eleven native tests additionally cover all 9999 one-limb divisors against u128,
+quotient-estimate correction/addback, every observed cancellation checkpoint
+and exhaustive allocation failures across general, short and remainder paths.
+For a 2048-digit numerator and 1024-digit divisor, debug microbenchmarks use
+three allocations for integer quotient and two for remainder, independent of
+quotient length; observed times are approximately 0.8 ms locally. General
+dense division remains quadratic and explicitly work-bounded. Native tests
+also compile-check for wasm32-wasi without claiming execution on that target.
+
+Public NUMERIC activation still requires exact literal binding and generated
+type identity, typed storage/index/wire/spill contracts and aggregate
+integration. The parity ledger is unchanged; kernel-only tests are not credits
+for original SQL cases.

@@ -153,6 +153,7 @@ fn whitespace(byte: u8) bool {
 }
 
 pub fn parse(ctx: *Context, input: []const u8) !Owned {
+    try ctx.charge(1);
     if (input.len > ctx.max_input_bytes) return ctx.limit();
     var start: usize = 0;
     var end = input.len;
@@ -586,8 +587,221 @@ pub fn multiply(ctx: *Context, left: Value, right: Value) !Owned {
     return finish(ctx.alloc, storage, weight, scale, left.negative != right.negative);
 }
 
+const DigitSequence = struct {
+    digits: []const u16,
+    zeroes: usize = 0,
+    fn len(self: DigitSequence) usize {
+        return self.digits.len + self.zeroes;
+    }
+    fn at(self: DigitSequence, i: usize) u16 {
+        return if (i < self.digits.len) self.digits[i] else 0;
+    }
+};
+
+const DivisionResult = enum { quotient, remainder };
+
+/// Normalized base-10000 division. Exponent zeroes remain virtual at the call
+/// boundary. General divisors use reusable scratch, never per-digit buffers.
+/// Remainder-only execution never constructs an unrepresentable quotient.
+fn divideDigits(ctx: *Context, dividend: DigitSequence, divisor: DigitSequence, result_low: i32, scale: u16, negative: bool, result_kind: DivisionResult) !Owned {
+    try ctx.charge(1);
+    if (dividend.len() < divisor.len()) {
+        if (result_kind == .quotient) return zero(ctx.alloc, scale);
+        const storage = try ctx.allocate(dividend.len());
+        errdefer ctx.alloc.free(storage);
+        for (storage, 0..) |*digit, i| {
+            try ctx.charge(1);
+            digit.* = dividend.at(i);
+        }
+        return finish(ctx.alloc, storage, @as(i32, @intCast(storage.len)) - 1 + result_low, scale, negative);
+    }
+    if (divisor.len() == 1) {
+        return divideSingle(ctx, dividend, divisor.digits[0], result_low, scale, negative, result_kind);
+    }
+    return divideGeneral(ctx, dividend, divisor, result_low, scale, negative, result_kind);
+}
+
+fn divideSingle(ctx: *Context, dividend: DigitSequence, divisor: u16, result_low: i32, scale: u16, negative: bool, result_kind: DivisionResult) !Owned {
+    var carry: u32 = 0;
+    for (dividend.digits) |digit| {
+        try ctx.charge(1);
+        carry = (carry * base + digit) % divisor;
+    }
+    if (result_kind == .remainder) {
+        // Reduce exponent zeroes in logarithmic work without expansion.
+        var exponent = dividend.zeroes;
+        var factor: u32 = base % divisor;
+        while (exponent != 0 and carry != 0) : (exponent >>= 1) {
+            try ctx.charge(1);
+            if (exponent & 1 != 0) carry = carry * factor % divisor;
+            factor = factor * factor % divisor;
+        }
+        if (carry == 0) return zero(ctx.alloc, scale);
+        const output = try ctx.allocate(1);
+        errdefer ctx.alloc.free(output);
+        output[0] = @intCast(carry);
+        return finish(ctx.alloc, output, result_low, scale, negative);
+    }
+    var tail: usize = 0;
+    // Four base-10000 groups exhaust all factors of two/five in a one-limb
+    // divisor. If still nonzero, the expansion cannot terminate later.
+    while (tail < dividend.zeroes and tail < 4 and carry != 0) : (tail += 1) {
+        try ctx.charge(1);
+        carry = carry * base % divisor;
+    }
+    if (carry != 0) tail = dividend.zeroes;
+    const output = try ctx.allocate(dividend.digits.len + tail);
+    errdefer ctx.alloc.free(output);
+    carry = 0;
+    for (output, 0..) |*digit, i| {
+        try ctx.charge(1);
+        const total = carry * base + dividend.at(i);
+        digit.* = @intCast(total / divisor);
+        carry = total % divisor;
+    }
+    return finish(ctx.alloc, output, @as(i32, @intCast(dividend.len())) - 1 + result_low, scale, negative);
+}
+
+fn normalizeDigits(ctx: *Context, input: DigitSequence, output: []u16, factor: u32) !u16 {
+    var carry: u32 = 0;
+    var i = output.len;
+    while (i != 0) {
+        i -= 1;
+        try ctx.charge(1);
+        const total = @as(u32, input.at(i)) * factor + carry;
+        output[i] = @intCast(total % base);
+        carry = total / base;
+    }
+    return @intCast(carry);
+}
+
+fn divideGeneral(ctx: *Context, dividend: DigitSequence, divisor: DigitSequence, result_low: i32, scale: u16, negative: bool, result_kind: DivisionResult) !Owned {
+    const n = divisor.len();
+    const count = dividend.len() - n + 1;
+    const u = try ctx.allocate(dividend.len() + 1);
+    errdefer ctx.alloc.free(u);
+    const v = try ctx.allocate(n);
+    errdefer ctx.alloc.free(v);
+    const normalization: u32 = base / (@as(u32, divisor.digits[0]) + 1);
+    u[0] = try normalizeDigits(ctx, dividend, u[1..], normalization);
+    const carry_out = try normalizeDigits(ctx, divisor, v, normalization);
+    std.debug.assert(carry_out == 0 and v[0] >= base / 2);
+    const output: []u16 = if (result_kind == .quotient) try ctx.allocate(count) else &.{};
+    errdefer ctx.alloc.free(output);
+    for (0..count) |j| {
+        const digit = try subtractDivisor(ctx, u[j..][0 .. n + 1], v);
+        if (result_kind == .quotient) output[j] = digit;
+    }
+    if (result_kind == .quotient) {
+        const result = try finish(ctx.alloc, output, @as(i32, @intCast(output.len)) - 1 + result_low, scale, negative);
+        ctx.alloc.free(u);
+        ctx.alloc.free(v);
+        return result;
+    }
+    // Transfer the divisor-sized buffer, not the potentially much larger
+    // dividend scratch, to the retained remainder owner.
+    var carry: u32 = 0;
+    for (u[count..], v) |digit, *out| {
+        try ctx.charge(1);
+        const total = carry * base + digit;
+        out.* = @intCast(total / normalization);
+        carry = total % normalization;
+    }
+    std.debug.assert(carry == 0);
+    const result = try finish(ctx.alloc, v, @as(i32, @intCast(n)) - 1 + result_low, scale, negative);
+    ctx.alloc.free(u);
+    return result;
+}
+
+fn subtractDivisor(ctx: *Context, u: []u16, v: []const u16) !u16 {
+    try ctx.charge(1);
+    const top = @as(u32, u[0]) * base + u[1];
+    var estimate: u32 = @min(top / v[0], base - 1);
+    var residual = top - estimate * v[0];
+    while (residual < base and estimate * v[1] > residual * base + u[2]) {
+        try ctx.charge(1);
+        estimate -= 1;
+        residual += v[0];
+    }
+    var carry: u32 = 0;
+    var borrow: i32 = 0;
+    var i = v.len;
+    while (i != 0) {
+        i -= 1;
+        try ctx.charge(1);
+        const product = estimate * v[i] + carry;
+        carry = product / base;
+        const difference = @as(i32, u[i + 1]) - @as(i32, @intCast(product % base)) - borrow;
+        borrow = @intFromBool(difference < 0);
+        u[i + 1] = @intCast(difference + borrow * base);
+    }
+    const head = @as(i32, u[0]) - @as(i32, @intCast(carry)) - borrow;
+    u[0] = @intCast(@mod(head, base));
+    if (head < 0) {
+        estimate -= 1;
+        carry = 0;
+        i = v.len;
+        while (i != 0) {
+            i -= 1;
+            try ctx.charge(1);
+            const total = @as(u32, u[i + 1]) + v[i] + carry;
+            u[i + 1] = @intCast(total % base);
+            carry = total / base;
+        }
+        u[0] = @intCast((@as(u32, u[0]) + carry) % base);
+    }
+    return @intCast(estimate);
+}
+
+pub fn divide(ctx: *Context, left: Value, right: Value) !Owned {
+    return divideMode(ctx, left, right, false);
+}
+
+pub fn divideTruncated(ctx: *Context, left: Value, right: Value) !Owned {
+    return divideMode(ctx, left, right, true);
+}
+
+fn divideMode(ctx: *Context, left: Value, right: Value, integer: bool) !Owned {
+    try ctx.charge(1);
+    if (left.kind == .nan or right.kind == .nan) return special(ctx.alloc, .nan);
+    if (right.isZero()) return error.SqlDivisionByZero;
+    if (left.kind != .finite) {
+        if (right.kind != .finite) return special(ctx.alloc, .nan);
+        const negative = (left.kind == .negative_infinity) != right.negative;
+        return special(ctx.alloc, if (negative) .negative_infinity else .positive_infinity);
+    }
+    if (right.kind != .finite) return zero(ctx.alloc, 0);
+    const first_left = if (left.isZero()) 0 else left.digits[0];
+    const estimate_weight = left.weight - right.weight - @as(i32, @intFromBool(first_left <= right.digits[0]));
+    // PostgreSQL selects at least sixteen significant digits from the leading
+    // base-10000 groups and clamps division display scale to one thousand.
+    const scale: u16 = if (integer) 0 else @intCast(std.math.clamp(@max(16 - estimate_weight * 4, @max(left.scale, right.scale)), 0, 1000));
+    if (left.isZero()) return zero(ctx.alloc, scale);
+    // One entire guard group proves the final decimal rounding digit exactly.
+    const fractional_groups: i32 = if (integer) 0 else @divTrunc(@as(i32, scale) + 3, 4) + 1;
+    const shift = left.lowest() - right.lowest() + fractional_groups;
+    const dividend: DigitSequence = .{ .digits = left.digits, .zeroes = @intCast(@max(shift, 0)) };
+    const divisor: DigitSequence = .{ .digits = right.digits, .zeroes = @intCast(@max(-shift, 0)) };
+    var quotient = try divideDigits(ctx, dividend, divisor, -fractional_groups, @intCast(fractional_groups * 4), left.negative != right.negative, .quotient);
+    if (integer) return quotient;
+    defer quotient.deinit();
+    return quantize(ctx, quotient.value, scale, .half_away);
+}
+
+pub fn remainder(ctx: *Context, left: Value, right: Value) !Owned {
+    try ctx.charge(1);
+    if (left.kind == .nan or right.kind == .nan) return special(ctx.alloc, .nan);
+    if (right.isZero()) return error.SqlDivisionByZero;
+    if (left.kind != .finite) return special(ctx.alloc, .nan);
+    if (right.kind != .finite) return clone(ctx, left, left.scale);
+    const scale = @max(left.scale, right.scale);
+    if (left.isZero()) return zero(ctx.alloc, scale);
+    const shift = left.lowest() - right.lowest();
+    return divideDigits(ctx, .{ .digits = left.digits, .zeroes = @intCast(@max(shift, 0)) }, .{ .digits = right.digits, .zeroes = @intCast(@max(-shift, 0)) }, @min(left.lowest(), right.lowest()), scale, left.negative, .remainder);
+}
+
 const OracleCase = struct {
-    op: enum { parse, add, subtract, multiply, order, round, truncate, typmod, int16, int32, int64 },
+    op: enum { parse, add, subtract, multiply, order, round, truncate, typmod, int16, int32, int64, divide, divide_trunc, remainder },
     left: []const u8,
     right: ?[]const u8 = null,
     precision: u16 = 0,
@@ -620,6 +834,9 @@ fn oracleText(ctx: *Context, entry: OracleCase) ![]u8 {
         .add => try add(ctx, left.value, right.value),
         .subtract => try subtract(ctx, left.value, right.value),
         .multiply => try multiply(ctx, left.value, right.value),
+        .divide => try divide(ctx, left.value, right.value),
+        .divide_trunc => try divideTruncated(ctx, left.value, right.value),
+        .remainder => try remainder(ctx, left.value, right.value),
         .round => try quantize(ctx, left.value, entry.scale, .half_away),
         .truncate => try quantize(ctx, left.value, entry.scale, .truncate),
         .typmod => try applyTypeModifier(ctx, left.value, .{ .precision = entry.precision, .scale = @intCast(entry.scale) }),
@@ -634,11 +851,11 @@ test "SQL exact NUMERIC kernel matches independent PostgreSQL oracle" {
     const fixture = try std.json.parseFromSlice(struct { reference: []const u8, entries: []const OracleCase }, a, @embedFile("fixtures/sql_exact_numeric_reference.json"), .{});
     defer fixture.deinit();
     try std.testing.expectEqualStrings("PostgreSQL exact NUMERIC kernel", fixture.value.reference);
-    try std.testing.expectEqual(@as(usize, 312), fixture.value.entries.len);
+    try std.testing.expectEqual(@as(usize, 799), fixture.value.entries.len);
     for (fixture.value.entries) |entry| {
         var ctx: Context = .{ .alloc = a };
         if (entry.@"error") |state| {
-            const expected: anyerror = if (std.mem.eql(u8, state, "22P02")) error.SqlInvalidTextRepresentation else if (std.mem.eql(u8, state, "22003")) error.InvalidSqlNumber else if (std.mem.eql(u8, state, "22023")) error.SqlInvalidParameterValue else if (std.mem.eql(u8, state, "0A000")) error.SqlFeatureNotSupported else return error.UnexpectedNumericOracleError;
+            const expected: anyerror = if (std.mem.eql(u8, state, "22P02")) error.SqlInvalidTextRepresentation else if (std.mem.eql(u8, state, "22003")) error.InvalidSqlNumber else if (std.mem.eql(u8, state, "22023")) error.SqlInvalidParameterValue else if (std.mem.eql(u8, state, "0A000")) error.SqlFeatureNotSupported else if (std.mem.eql(u8, state, "22012")) error.SqlDivisionByZero else return error.UnexpectedNumericOracleError;
             try std.testing.expectError(expected, oracleText(&ctx, entry));
             continue;
         }
@@ -739,6 +956,20 @@ test "SQL exact NUMERIC ownership unwinds every allocation failure" {
             defer sum.deinit();
             var difference = try subtract(&ctx, left.value, right.value);
             defer difference.deinit();
+            var quotient = try divide(&ctx, left.value, right.value);
+            defer quotient.deinit();
+            var integral = try divideTruncated(&ctx, left.value, right.value);
+            defer integral.deinit();
+            var residual = try remainder(&ctx, left.value, right.value);
+            defer residual.deinit();
+            var small_residual = try remainder(&ctx, right.value, left.value);
+            defer small_residual.deinit();
+            var seven = try parse(&ctx, "7");
+            defer seven.deinit();
+            var short_quotient = try divideTruncated(&ctx, left.value, seven.value);
+            defer short_quotient.deinit();
+            var short_remainder = try remainder(&ctx, left.value, seven.value);
+            defer short_remainder.deinit();
             var product = try multiply(&ctx, sum.value, difference.value);
             defer product.deinit();
             var rounded = try quantize(&ctx, product.value, 3, .half_away);
@@ -783,6 +1014,12 @@ test "SQL exact NUMERIC quota and cancellation failures are sticky and retry saf
             var minimum = try parse(ctx, "-9223372036854775808.49");
             defer minimum.deinit();
             try std.testing.expectEqual(std.math.minInt(i64), try toInteger(i64, ctx, minimum.value));
+            var divisor = try parse(ctx, "123456789012345678901234567890123456789");
+            defer divisor.deinit();
+            var quotient = try divide(ctx, product.value, divisor.value);
+            defer quotient.deinit();
+            var residual = try remainder(ctx, product.value, divisor.value);
+            defer residual.deinit();
         }
     };
     var poll: Poll = .{};
@@ -810,6 +1047,7 @@ test "SQL exact NUMERIC admission limits remain sticky across all operations" {
     var ctx: Context = .{ .alloc = a, .max_input_bytes = 1 };
     try std.testing.expectError(error.SqlProgramLimitExceeded, parse(&ctx, "12"));
     try std.testing.expectError(error.SqlProgramLimitExceeded, parse(&ctx, "0"));
+    try std.testing.expectError(error.SqlProgramLimitExceeded, parse(&ctx, ""));
     ctx = .{ .alloc = a, .max_groups = 1 };
     try std.testing.expectError(error.SqlProgramLimitExceeded, parse(&ctx, "12345"));
     try std.testing.expectError(error.SqlProgramLimitExceeded, toInteger(i64, &ctx, .{}));
@@ -819,6 +1057,136 @@ test "SQL exact NUMERIC admission limits remain sticky across all operations" {
     ctx = .{ .alloc = a, .remaining = 1 };
     try std.testing.expectError(error.SqlProgramLimitExceeded, multiply(&ctx, number.value, number.value));
     try std.testing.expectError(error.SqlProgramLimitExceeded, order(&ctx, .{}, .{}));
+    try std.testing.expectError(error.SqlProgramLimitExceeded, divide(&ctx, .{}, .{}));
+    try std.testing.expectError(error.SqlProgramLimitExceeded, remainder(&ctx, .{}, .{}));
+}
+
+test "SQL exact NUMERIC division corrects quotient estimates and addback exactly" {
+    const a = std.testing.allocator;
+    const scenarios = [_]struct { u: []const u16, v: []const u16 }{
+        .{ .u = &.{ 0, 5000, 0, 0 }, .v = &.{ 5000, 0, 1 } },
+        .{ .u = &.{ 4999, 0, 0 }, .v = &.{ 5000, 9999 } },
+        .{ .u = &.{ 5000, 0, 0 }, .v = &.{ 5000, 9999 } },
+    };
+    for (scenarios) |scenario| {
+        var numerator: u128 = 0;
+        var denominator: u128 = 0;
+        for (scenario.u) |digit| numerator = numerator * base + digit;
+        for (scenario.v) |digit| denominator = denominator * base + digit;
+        const scratch = try a.dupe(u16, scenario.u);
+        defer a.free(scratch);
+        var ctx: Context = .{ .alloc = a };
+        const digit = try subtractDivisor(&ctx, scratch, scenario.v);
+        try std.testing.expectEqual(numerator / denominator, digit);
+        var residual: u128 = 0;
+        for (scratch) |part| residual = residual * base + part;
+        try std.testing.expectEqual(numerator % denominator, residual);
+    }
+}
+
+test "SQL exact NUMERIC remainder avoids oversized intermediate quotients and preserves domain boundaries" {
+    const a = std.testing.allocator;
+    var ctx: Context = .{ .alloc = a };
+    var huge = try parse(&ctx, "1e131071");
+    defer huge.deinit();
+    var tiny = try parse(&ctx, "1e-16383");
+    defer tiny.deinit();
+    var residual = try remainder(&ctx, huge.value, tiny.value);
+    defer residual.deinit();
+    try std.testing.expect(residual.value.isZero());
+    try std.testing.expectEqual(@as(u16, 16383), residual.value.scale);
+    try std.testing.expectError(error.InvalidSqlNumber, divide(&ctx, huge.value, tiny.value));
+    try std.testing.expectError(error.InvalidSqlNumber, divideTruncated(&ctx, huge.value, tiny.value));
+    var equal = try divide(&ctx, tiny.value, tiny.value);
+    defer equal.deinit();
+    try std.testing.expectEqual(@as(u16, 1000), equal.value.scale);
+    try std.testing.expectEqual(@as(u16, 1), equal.value.digits[0]);
+    var one = try parse(&ctx, "1");
+    defer one.deinit();
+    var underflow = try divide(&ctx, tiny.value, one.value);
+    defer underflow.deinit();
+    try std.testing.expect(underflow.value.isZero());
+    try std.testing.expectEqual(@as(u16, 1000), underflow.value.scale);
+    var large_quotient = try divide(&ctx, huge.value, one.value);
+    defer large_quotient.deinit();
+    try std.testing.expectEqual(@as(usize, 1), large_quotient.value.digits.len);
+    try std.testing.expectEqual(huge.value.weight, large_quotient.value.weight);
+    try std.testing.expect(large_quotient.allocation.len <= 2);
+    var bounded: Context = .{ .alloc = a, .remaining = 64, .max_groups = 1 };
+    var compact = try divide(&bounded, huge.value, one.value);
+    defer compact.deinit();
+    try std.testing.expectEqual(huge.value.weight, compact.value.weight);
+    var seven = try parse(&ctx, "7");
+    defer seven.deinit();
+    bounded = .{ .alloc = a, .remaining = 64, .max_groups = 1 };
+    var modular = try remainder(&bounded, huge.value, seven.value);
+    defer modular.deinit();
+    try std.testing.expectEqual(@as(u16, 3), modular.value.digits[0]);
+    var wide_divisor = try parse(&ctx, "12345");
+    defer wide_divisor.deinit();
+    var wide_residual = try remainder(&ctx, huge.value, wide_divisor.value);
+    defer wide_residual.deinit();
+    try std.testing.expectEqual(@as(u16, 7270), wide_residual.value.digits[0]);
+    try std.testing.expectEqual(@as(usize, 2), wide_residual.allocation.len);
+}
+
+test "SQL exact NUMERIC one-limb division matches native u128 for every divisor" {
+    const a = std.testing.allocator;
+    var ctx: Context = .{ .alloc = a };
+    var left = try parse(&ctx, "1e32");
+    defer left.deinit();
+    const numerator: u128 = std.math.pow(u128, 10, 32);
+    for (1..base) |denominator| {
+        const digits = [_]u16{@intCast(denominator)};
+        const right: Value = .{ .digits = &digits };
+        ctx = .{ .alloc = a };
+        var quotient = try divideTruncated(&ctx, left.value, right);
+        defer quotient.deinit();
+        var residual = try remainder(&ctx, left.value, right);
+        defer residual.deinit();
+        const q = try format(&ctx, quotient.value);
+        defer a.free(q);
+        const r = try format(&ctx, residual.value);
+        defer a.free(r);
+        var buffer: [64]u8 = undefined;
+        try std.testing.expectEqualStrings(try std.fmt.bufPrint(&buffer, "{d}", .{numerator / denominator}), q);
+        try std.testing.expectEqualStrings(try std.fmt.bufPrint(&buffer, "{d}", .{numerator % denominator}), r);
+    }
+}
+
+test "SQL exact NUMERIC division benchmark bounds buffers independently of quotient digits" {
+    const a = std.testing.allocator;
+    for ([_]usize{ 64, 256, 1024 }) |digits| {
+        const input = try a.alloc(u8, digits * 2);
+        defer a.free(input);
+        @memset(input, '9');
+        var ctx: Context = .{ .alloc = a };
+        var left = try parse(&ctx, input);
+        defer left.deinit();
+        @memset(input[0..digits], '3');
+        var right = try parse(&ctx, input[0..digits]);
+        defer right.deinit();
+        for ([_]DivisionResult{ .quotient, .remainder }) |kind| {
+            var tracked = std.testing.FailingAllocator.init(a, .{});
+            ctx = .{ .alloc = tracked.allocator() };
+            const started = std.Io.Clock.awake.now(std.testing.io).nanoseconds;
+            var result = if (kind == .quotient) try divideTruncated(&ctx, left.value, right.value) else try remainder(&ctx, left.value, right.value);
+            defer result.deinit();
+            const elapsed = std.Io.Clock.awake.now(std.testing.io).nanoseconds - started;
+            try std.testing.expectEqual(@as(usize, if (kind == .quotient) 3 else 2), tracked.alloc_index);
+            std.debug.print("NUMERIC division: operation={s} numerator_digits={d} divisor_digits={d} allocations={d} work={d} elapsed_ns={d}\n", .{ @tagName(kind), digits * 2, digits, tracked.alloc_index, 8 * 1024 * 1024 - ctx.remaining, elapsed });
+        }
+    }
+    var ctx: Context = .{ .alloc = a };
+    var left = try parse(&ctx, "123456789012345678901234567890");
+    defer left.deinit();
+    var right = try parse(&ctx, "7");
+    defer right.deinit();
+    var tracked = std.testing.FailingAllocator.init(a, .{});
+    ctx = .{ .alloc = tracked.allocator() };
+    var result = try divideTruncated(&ctx, left.value, right.value);
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), tracked.alloc_index);
 }
 
 test "SQL exact NUMERIC multiplication benchmark retains one bounded output allocation" {
