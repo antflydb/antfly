@@ -37,6 +37,7 @@ pub const Scalar = union(enum) {
         operand: *const Scalar,
         type: ColumnType,
         element_type: ?@import("array_value.zig").ElementType = null,
+        numeric_modifier: ?@import("../common/sql_builtin_type.zig").NumericModifier = null,
         /// Coercion origin controls binding diagnostics, not execution identity.
         coercion: enum { explicit, function } = .explicit,
         pub fn withOperand(self: @This(), operand: *const Scalar) @This() {
@@ -286,6 +287,7 @@ pub const Column = struct {
     /// Declared array dimensions are not PostgreSQL type identity and are not
     /// retained here. Durable schema admission must not infer this from rows.
     element_type: ?@import("array_value.zig").ElementType = null,
+    numeric_modifier: ?@import("../common/sql_builtin_type.zig").NumericModifier = null,
     nullable: bool = true,
     default_expression: ?*const Scalar = null,
     generated_expression: ?*const Scalar = null,

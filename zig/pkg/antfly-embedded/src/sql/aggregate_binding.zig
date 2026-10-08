@@ -118,7 +118,7 @@ pub fn same(a: *const ast.Scalar, b: *const ast.Scalar) bool {
         },
         .unary => |unary| unary.op == b.unary.op and same(unary.operand, b.unary.operand),
         .binary => |binary| binary.op == b.binary.op and same(binary.left, b.binary.left) and same(binary.right, b.binary.right),
-        .cast => |cast| cast.type == b.cast.type and cast.element_type == b.cast.element_type and same(cast.operand, b.cast.operand),
+        .cast => |cast| cast.type == b.cast.type and cast.element_type == b.cast.element_type and @import("../common/sql_builtin_type.zig").NumericModifier.eql(cast.numeric_modifier, b.cast.numeric_modifier) and same(cast.operand, b.cast.operand),
         .call => |call| blk: {
             if (!std.mem.eql(u8, call.name, b.call.name) or call.star != b.call.star or call.distinct != b.call.distinct or (call.filter == null) != (b.call.filter == null) or call.args.len != b.call.args.len) break :blk false;
             // Query and window domains cannot lose their metadata through
@@ -516,6 +516,9 @@ test "SQL NUMERIC expression identity shares owned literals without merging scal
         .{ .left = "SUM(1.20)", .right = "SUM(1.20)", .equal = true },
         .{ .left = "SUM(1.20)", .right = "SUM(1.2)", .equal = false },
         .{ .left = "SUM(1.20::numeric)", .right = "SUM(1.20::double precision)", .equal = false },
+        .{ .left = "SUM(1.245::numeric(4,2))", .right = "SUM(1.245::numeric(4,2))", .equal = true },
+        .{ .left = "SUM(1.245::numeric(4,2))", .right = "SUM(1.245::numeric(4,1))", .equal = false },
+        .{ .left = "SUM(1.245::numeric(4,2))", .right = "SUM(1.245::numeric(5,2))", .equal = false },
     }) |case| {
         var left = try @import("compiler.zig").compileScalar(a, case.left, .{});
         defer left.deinit();

@@ -16,6 +16,33 @@
 //! Exact builtin identity shared by SQL binding and immutable storage schemas.
 //! Backing values are durable; append identities, never reorder or reuse them.
 //! This module has no query-runtime or native-storage dependencies.
+/// A coercion/column modifier, not another builtin type or value identity.
+/// For arrays this constrains each NUMERIC element, never dimensions/bounds.
+pub const NumericModifier = struct {
+    precision: u16,
+    scale: i16 = 0,
+
+    pub fn validate(self: NumericModifier) !void {
+        if (self.precision < 1 or self.precision > 1000 or self.scale < -1000 or self.scale > 1000)
+            return error.SqlInvalidParameterValue;
+    }
+
+    pub fn eql(left: ?NumericModifier, right: ?NumericModifier) bool {
+        if (left) |a| {
+            const b = right orelse return false;
+            return a.precision == b.precision and a.scale == b.scale;
+        }
+        return right == null;
+    }
+
+    /// PostgreSQL encodes a signed eleven-bit scale plus its varlena header.
+    pub fn postgres(self: NumericModifier) !i32 {
+        try self.validate();
+        const scale: u16 = @bitCast(self.scale);
+        return @intCast((@as(u32, self.precision) << 16 | (scale & 0x7ff)) + 4);
+    }
+};
+
 pub const Type = enum(u8) {
     text = 0,
     int16 = 1,

@@ -137,7 +137,18 @@ pub fn createSchemaAlloc(alloc: std.mem.Allocator, create: ast.CreateTable) anye
     return std.json.Stringify.valueAlloc(alloc, schema, .{});
 }
 
+test "SQL NUMERIC modifier declarations cannot silently publish unconstrained columns" {
+    var compiled = try @import("compiler.zig").compile(std.testing.allocator, "CREATE TABLE constrained (n numeric(4,2))", .{});
+    defer compiled.deinit();
+    const column = compiled.statement.create_table.columns[0];
+    try std.testing.expectEqual(@as(u16, 4), column.numeric_modifier.?.precision);
+    try std.testing.expectError(error.UnsupportedSqlShape, columnProperty(std.testing.allocator, column, true));
+}
+
 pub fn columnProperty(alloc: std.mem.Allocator, column: ast.Column, nullable: bool) !std.json.Value {
+    // Durable modifier publication needs schema validation and reader fencing;
+    // parsing a declaration must never silently publish an unconstrained type.
+    if (column.numeric_modifier != null) return error.UnsupportedSqlShape;
     const bytes = if (column.type == .uuid)
         try std.json.Stringify.valueAlloc(alloc, .{ .type = "keyword", .nullable = nullable, .format = "uuid" }, .{})
     else

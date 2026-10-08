@@ -38,6 +38,9 @@ pub const Error = std.mem.Allocator.Error || error{
     DuplicateSqlColumn,
     SqlInvalidUnicodeEscape,
     SqlInvalidTextEncoding,
+    SqlInvalidParameterValue,
+    SqlInvalidTextRepresentation,
+    SqlNumericOutOfRange,
 };
 
 /// Immutable and schema independent: safely share a compiled statement between
@@ -503,7 +506,7 @@ const Parser = struct {
             try self.expectKeyword(.as);
             const kind = try self.castType();
             try self.expect(.rparen);
-            left = try self.scalarNode(.{ .cast = .{ .operand = operand, .type = kind.type, .element_type = kind.element_type } });
+            left = try self.scalarNode(.{ .cast = .{ .operand = operand, .type = kind.type, .element_type = kind.element_type, .numeric_modifier = kind.numeric_modifier } });
         } else if (self.peek(.identifier) and !self.tokens[self.pos].owned and std.ascii.eqlIgnoreCase(self.tokens[self.pos].text, "array") and self.pos + 1 < self.tokens.len and self.tokens[self.pos + 1].kind == .lbracket) {
             self.pos += 1;
             left = try self.arrayConstructor(depth + 1);
@@ -689,7 +692,7 @@ const Parser = struct {
                 if (minimum > 8) break;
                 self.pos += 1;
                 const kind = try self.castType();
-                left = try self.scalarNode(.{ .cast = .{ .operand = left, .type = kind.type, .element_type = kind.element_type } });
+                left = try self.scalarNode(.{ .cast = .{ .operand = left, .type = kind.type, .element_type = kind.element_type, .numeric_modifier = kind.numeric_modifier } });
                 continue;
             }
             // PostgreSQL's postfix spellings share the ordinary IS NULL
@@ -1668,7 +1671,32 @@ const Parser = struct {
         return self.scalarNode(.{ .call = .{ .name = "$array_pattern_quantified", .args = try self.alloc.dupe(*const ast.Scalar, &.{ operand, input, all_node, insensitive_node, negated_node }) } });
     }
 
-    const CastType = struct { type: ast.ColumnType, element_type: ?@import("array_value.zig").ElementType = null };
+    const CastType = struct { type: ast.ColumnType, element_type: ?@import("array_value.zig").ElementType = null, numeric_modifier: ?@import("../common/sql_builtin_type.zig").NumericModifier = null };
+
+    fn numericModifier(self: *Parser) Error!?@import("../common/sql_builtin_type.zig").NumericModifier {
+        if (!self.take(.lparen)) return null;
+        var arguments: [2][]const u8 = undefined;
+        var count: usize = 0;
+        while (true) {
+            const negative = self.take(.minus);
+            if (negative and !self.peek(.number)) return self.fail(error.InvalidSqlSyntax, "expected numeric type modifier");
+            const text = if (self.peek(.number) or self.peek(.string)) text: {
+                const current = self.tokens[self.pos];
+                self.pos += 1;
+                break :text current.text;
+            } else if (self.peek(.identifier)) try self.identifier() else return self.fail(error.InvalidSqlSyntax, "expected numeric type modifier");
+            if (count < arguments.len) arguments[count] = if (negative) try std.fmt.allocPrint(self.alloc, "-{s}", .{text}) else text;
+            count += 1;
+            if (!self.take(.comma)) break;
+        }
+        try self.expect(.rparen);
+        if (count == 0 or count > 2) return self.fail(error.SqlInvalidParameterValue, "NUMERIC requires precision and optional scale");
+        const casts = @import("builtin_cast.zig");
+        const precision = casts.integerText(arguments[0], .int32) catch |err| return self.fail(if (err == error.SqlNumericOutOfRange) error.SqlNumericOutOfRange else error.SqlInvalidTextRepresentation, "invalid NUMERIC precision");
+        const scale = if (count == 2) casts.integerText(arguments[1], .int32) catch |err| return self.fail(if (err == error.SqlNumericOutOfRange) error.SqlNumericOutOfRange else error.SqlInvalidTextRepresentation, "invalid NUMERIC scale") else 0;
+        if (precision < 1 or precision > 1000 or scale < -1000 or scale > 1000) return self.fail(error.SqlInvalidParameterValue, "NUMERIC precision must be 1..1000 and scale -1000..1000");
+        return .{ .precision = @intCast(precision), .scale = @intCast(scale) };
+    }
 
     fn castType(self: *Parser) Error!CastType {
         const start = self.pos;
@@ -1702,6 +1730,7 @@ const Parser = struct {
         if (std.ascii.eqlIgnoreCase(name_value, "double")) {
             if (!self.ddlWord("precision")) return self.fail(error.InvalidSqlSyntax, "expected DOUBLE PRECISION");
         }
+        const numeric_modifier = if (element == .numeric) try self.numericModifier() else null;
         if (!self.take(.lbracket)) {
             if (element) |resolved| return .{ .type = switch (resolved) {
                 .text => .string,
@@ -1710,7 +1739,7 @@ const Parser = struct {
                 .float32, .float64, .numeric => .number,
                 .boolean => .boolean,
                 .jsonb => .json,
-            }, .element_type = resolved };
+            }, .element_type = resolved, .numeric_modifier = numeric_modifier };
             self.pos = start;
             return .{ .type = try self.columnType() };
         }
@@ -1725,7 +1754,7 @@ const Parser = struct {
             try self.expect(.rbracket);
             if (!self.take(.lbracket)) break;
         }
-        return .{ .type = .array, .element_type = resolved };
+        return .{ .type = .array, .element_type = resolved, .numeric_modifier = numeric_modifier };
     }
 
     fn columnType(self: *Parser) Error!ast.ColumnType {
@@ -1756,7 +1785,7 @@ const Parser = struct {
 
     fn columnDefinition(self: *Parser, name_value: []const u8) Error!ast.Column {
         const declared = try self.castType();
-        return .{ .name = name_value, .type = declared.type, .element_type = declared.element_type };
+        return .{ .name = name_value, .type = declared.type, .element_type = declared.element_type, .numeric_modifier = declared.numeric_modifier };
     }
 
     pub fn createTable(self: *Parser) Error!ast.CreateTable {

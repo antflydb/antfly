@@ -15,15 +15,7 @@ pub const maximum_weight = 32767;
 pub const Kind = enum { finite, nan, positive_infinity, negative_infinity };
 pub const Rounding = enum { half_away, half_even, truncate };
 
-pub const TypeModifier = struct {
-    precision: u16,
-    scale: i16 = 0,
-
-    pub fn validate(self: TypeModifier) !void {
-        if (self.precision < 1 or self.precision > 1000 or self.scale < -1000 or self.scale > 1000)
-            return error.SqlInvalidParameterValue;
-    }
-};
+pub const TypeModifier = @import("../common/sql_builtin_type.zig").NumericModifier;
 
 pub const Context = struct {
     alloc: A,

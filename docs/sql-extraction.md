@@ -5644,3 +5644,42 @@ schema-expression owner (38 local and five server tests), and 179 native
 relational-owner tests pass without failures or leaks. The independent 44-case
 PostgreSQL oracle, inventory integrity,
 formatting, whitespace and control-catalog consistency checks pass.
+
+### NUMERIC precision/scale execution boundary
+
+An immutable dependency-neutral modifier now carries precision and signed scale
+through parsed scalar/array casts and bound instructions. The existing exact
+kernel performs half-away rounding followed by precision overflow checking;
+negative scales and scales greater than precision follow PostgreSQL. Array
+coercion preserves bounds, dimensions and NULL elements without mutating inputs.
+Valid literal results remain cached. Speculative constant preparation defers
+modifier overflow in unreachable CASE branches without swallowing invalid input
+syntax or unrelated failures. Aggregate expression identity includes modifiers.
+
+One evaluator budget covers array traversal, exact coercion and output ownership;
+even large all-NULL arrays poll cancellation. Dynamic array execution is covered
+by exhaustive allocation failures and work/byte limit regressions. A disposable
+PostgreSQL 18 oracle independently records 46 values, errors, type OIDs and wire
+modifiers. The execution regression compares values, SQLSTATEs, builtin identity
+and direct-cast modifier encoding; it does not yet assert public/pgwire metadata.
+The shared lexer also accepts strictly separated decimal digits in integer,
+fractional and exponent parts, preserving source spelling and malformed-token
+rejection. NUMERIC type modifier range failures have SQLSTATE 22023, not XX000.
+
+This is an execution prerequisite, not complete modifier activation. Generated
+public descriptors, pgwire result descriptors, durable column enforcement and
+schema-expression reader capability fencing remain unfinished. DDL and durable
+expression publication explicitly reject modifiers until those contracts can
+preserve and enforce them; parsing never silently publishes an unconstrained
+column or drops quantization from a durable program. Original inventory
+dispositions remain unchanged at 929 unresolved cases.
+
+Validation: `zig build sql-test antfly-schema-expression-test lib-sql-parser-test`
+passes 593 local SQL tests (three existing skips), 226 server SQL tests and all
+43 schema-expression tests. A final six-test focused rerun covers the subsequent
+zero-allocation constant reuse and aggregate modifier-identity regressions. Both
+scalar and array constants are evaluated 10,000 times with a zero-capacity row
+allocator and reuse the same owned result; this is an allocation/work contract,
+not an end-to-end latency benchmark. The independent 46-case PostgreSQL oracle,
+inventory integrity, control-catalog consistency, formatting and whitespace
+checks pass without changing original case dispositions.

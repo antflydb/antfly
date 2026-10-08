@@ -613,6 +613,15 @@ test "bounded lexer releases owned tokens on quota failure" {
     try std.testing.expectError(error.SqlTokenLimitExceeded, tokenizeBoundedDiagnosticAlloc(std.testing.allocator, "\"quoted\" 'string' excess", 2));
 }
 
+fn scanDecimalDigitsEnd(sql: []const u8, start: usize) usize {
+    var i = start;
+    while (i < sql.len and std.ascii.isDigit(sql[i])) {
+        i += 1;
+        if (i + 1 < sql.len and sql[i] == '_' and std.ascii.isDigit(sql[i + 1])) i += 1;
+    }
+    return i;
+}
+
 fn scanNumberEnd(sql: []const u8, start: usize, diagnostic: *LexDiagnostic) !usize {
     var i = start;
     var has_decimal_point = false;
@@ -621,15 +630,15 @@ fn scanNumberEnd(sql: []const u8, start: usize, diagnostic: *LexDiagnostic) !usi
         has_decimal_point = true;
         i += 1;
         std.debug.assert(i < sql.len and std.ascii.isDigit(sql[i]));
-        while (i < sql.len and std.ascii.isDigit(sql[i])) i += 1;
+        i = scanDecimalDigitsEnd(sql, i);
     } else {
         std.debug.assert(std.ascii.isDigit(sql[i]));
-        while (i < sql.len and std.ascii.isDigit(sql[i])) i += 1;
+        i = scanDecimalDigitsEnd(sql, i);
         if (i < sql.len and sql[i] == '.') {
             if (i + 1 < sql.len and sql[i + 1] == '.') return lexError(diagnostic, .malformed_numeric_literal, start, i + 2);
             has_decimal_point = true;
             i += 1;
-            while (i < sql.len and std.ascii.isDigit(sql[i])) i += 1;
+            i = scanDecimalDigitsEnd(sql, i);
         }
     }
 
@@ -639,7 +648,7 @@ fn scanNumberEnd(sql: []const u8, start: usize, diagnostic: *LexDiagnostic) !usi
         if (i >= sql.len or !std.ascii.isDigit(sql[i])) {
             return lexError(diagnostic, .malformed_numeric_literal, start, @min(i + 1, sql.len));
         }
-        while (i < sql.len and std.ascii.isDigit(sql[i])) i += 1;
+        i = scanDecimalDigitsEnd(sql, i);
     }
 
     // Never split a malformed decimal into two NUMBER tokens: doing so can
@@ -882,12 +891,12 @@ test "sql adapter lexer rejects unterminated dollar quoted literals" {
 
 test "sql adapter lexer handles PostgreSQL numeric literal forms" {
     const alloc = std.testing.allocator;
-    const sql = "SELECT .5, 1., 1e2, 1.25E-3";
+    const sql = "SELECT .5, 1., 1e2, 1.25E-3, 1_0, .5_6, 1_0., 1.2_3, 1e1_0";
 
     var tokens = try tokenizeAlloc(alloc, sql);
     defer freeTokens(alloc, &tokens);
 
-    const expected = [_][]const u8{ ".5", "1.", "1e2", "1.25E-3" };
+    const expected = [_][]const u8{ ".5", "1.", "1e2", "1.25E-3", "1_0", ".5_6", "1_0.", "1.2_3", "1e1_0" };
     var number_index: usize = 0;
     for (tokens.items) |token| {
         if (token.kind != .number) continue;
@@ -908,6 +917,11 @@ test "sql adapter lexer rejects malformed numeric literals" {
         "SELECT 1e+",
         "SELECT 1alias",
         "SELECT .5alias",
+        "SELECT 1_",
+        "SELECT 1__0",
+        "SELECT 1._0",
+        "SELECT 1e_2",
+        "SELECT .5_",
     };
     for (invalid) |sql| {
         try std.testing.expectError(error.UnsupportedSqlShape, tokenizeAlloc(alloc, sql));

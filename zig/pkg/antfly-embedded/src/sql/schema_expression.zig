@@ -178,6 +178,7 @@ pub fn lowerColumns(alloc: std.mem.Allocator, columns: []const scalar.Column, ex
                 break :blk result;
             },
             .cast => |part| blk: {
+                if (part.numeric_modifier != null) return error.UnsupportedSqlShape;
                 const source = program.instructions[part.operand].type;
                 // NULL retains its explicit target domain without invoking an
                 // input function or borrowing the unknown literal's identity.
@@ -383,6 +384,9 @@ test "SQL schema expressions bind nullable catalog shapes and cold typed arrays"
     defer index.deinit();
     const key = try lowerTyped(a, schema, index.expression, null);
     try std.testing.expectEqual(ast.ColumnType.string, key.type);
+    var constrained = try @import("compiler.zig").compileScalar(a, "CAST(n AS numeric(4,2)) > 0", .{});
+    defer constrained.deinit();
+    try std.testing.expectError(error.UnsupportedSqlShape, lower(a, schema, constrained.expression, .boolean));
     for ([_][]const u8{ "n + n > 0", "CAST(n AS smallint) + CAST(n AS smallint) > 0", "+n > 0", "n > -1" }) |sql| {
         var numeric = try @import("compiler.zig").compileScalar(a, sql, .{});
         defer numeric.deinit();
