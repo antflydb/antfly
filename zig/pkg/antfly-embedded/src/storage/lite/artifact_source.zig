@@ -120,7 +120,11 @@ pub const Registry = struct {
         defer self.mutex.unlock(runtime);
         var total: u64 = 0;
         var it = self.first;
-        while (it) |state| : (it = state.next) total += state.reader.test_page_reads.load(.monotonic);
+        while (it) |state| : (it = state.next) {
+            @import("antfly_platform").sync.lockYielding(&state.lifetime_mutex);
+            if (!state.resources_closed.load(.monotonic)) total += state.reader.test_page_reads.load(.monotonic);
+            state.lifetime_mutex.unlock();
+        }
         return total;
     }
 
@@ -130,9 +134,26 @@ pub const Registry = struct {
         defer self.mutex.unlock(runtime);
         var it = self.first;
         while (it) |state| : (it = state.next) {
-            if (state.generation == generation) return true;
+            if (state.generation == generation and !state.resources_closed.load(.acquire)) return true;
         }
         return false;
+    }
+
+    /// Drop cache-only descriptors before rewrite admission. The caller holds
+    /// the owner publication mutex; final adoption additionally fences opens
+    /// with generation_lock. Existing uses win the lifetime-lock race and
+    /// remain pinned; future acquisitions reject the closed source.
+    pub fn expireIdle(self: *Registry, generation: u64) void {
+        const runtime = self.io();
+        self.mutex.lockUncancelable(runtime);
+        defer self.mutex.unlock(runtime);
+        var it = self.first;
+        while (it) |state| : (it = state.next) {
+            if (state.generation != generation) continue;
+            @import("antfly_platform").sync.lockYielding(&state.lifetime_mutex);
+            if (state.idle_expiry and state.active_uses == 0) state.closeResources();
+            state.lifetime_mutex.unlock();
+        }
     }
 
     pub fn retire(self: *Registry, generation: u64, bytes: u64, charged_by_reader: bool) void {
@@ -144,7 +165,8 @@ pub const Registry = struct {
         while (it) |state| : (it = state.next) {
             if (state.generation != generation) continue;
             state.retired_size = bytes;
-            claimant = state;
+            state.retire();
+            if (!state.resources_closed.load(.acquire)) claimant = state;
         }
         if (!charged_by_reader) if (claimant) |state| {
             state.retired_claim = bytes;
@@ -158,11 +180,27 @@ pub const Registry = struct {
         defer self.mutex.unlock(runtime);
         var it = self.first;
         while (it) |state| : (it = state.next) {
-            if (state.generation != generation or state.retired_size == 0) continue;
+            if (state.generation != generation or state.retired_size == 0 or state.resources_closed.load(.acquire)) continue;
             state.retired_claim = state.retired_size;
             _ = self.retired_bytes.fetchAdd(state.retired_claim, .acq_rel);
             return;
         }
+    }
+
+    fn releaseClosedClaim(self: *Registry, state: *State) void {
+        const runtime = self.io();
+        self.mutex.lockUncancelable(runtime);
+        defer self.mutex.unlock(runtime);
+        if (state.retired_claim == 0) return;
+        var it = self.first;
+        while (it) |other| : (it = other.next) {
+            if (other == state or other.generation != state.generation or other.resources_closed.load(.acquire)) continue;
+            other.retired_claim = state.retired_claim;
+            state.retired_claim = 0;
+            return;
+        }
+        _ = self.retired_bytes.fetchSub(state.retired_claim, .acq_rel);
+        state.retired_claim = 0;
     }
 
     fn createMarker(self: *Registry, path: []const u8) !std.Io.File {
@@ -231,7 +269,7 @@ pub const Registry = struct {
         self.first = state;
         _ = self.references.fetchAdd(1, .monotonic);
         self.mutex.unlock(runtime);
-        return .{ .ranges = .{ .ptr = state, .length = state.value.length, .read_into = State.read, .checksum = State.checksum, .read_authenticated = State.authenticate, .close = State.close, .retained_bytes = State.retainedBytes, .resource_manager = owner.resource_manager } };
+        return .{ .ranges = .{ .ptr = state, .length = state.value.length, .read_into = State.read, .checksum = State.checksum, .read_authenticated = State.authenticate, .close = State.close, .retained_bytes = State.retainedBytes, .resource_manager = owner.resource_manager, .acquire_use = State.acquireUse, .release_use = State.releaseUse, .enable_idle_expiry = State.enableIdleExpiry } };
     }
 };
 
@@ -275,6 +313,63 @@ const State = struct {
     retired_size: u64 = 0,
     retired_claim: u64 = 0,
     cache: ?@import("../../segment_source.zig").ConcurrentBlockCache = null,
+    lifetime_mutex: std.atomic.Mutex = .unlocked,
+    active_uses: usize = 0,
+    idle_expiry: bool = false,
+    retired: bool = false,
+    resources_closed: std.atomic.Value(bool) = .init(false),
+
+    fn closeResources(self: *State) void {
+        if (self.resources_closed.load(.monotonic)) return;
+        self.cache.?.deinit();
+        self.cache = null;
+        self.reader.close();
+        if (self.marker) |marker| {
+            marker.close(self.registry.io());
+            self.marker = null;
+            std.Io.Dir.cwd().deleteFile(self.registry.io(), self.marker_path) catch {};
+        }
+        self.resources_closed.store(true, .release);
+    }
+
+    // Registry -> lifetime is the only nested lock order. Release closes
+    // resources first, then updates registry accounting after unlocking.
+    fn retire(self: *State) void {
+        @import("antfly_platform").sync.lockYielding(&self.lifetime_mutex);
+        defer self.lifetime_mutex.unlock();
+        self.retired = true;
+        if (self.idle_expiry and self.active_uses == 0) self.closeResources();
+    }
+
+    fn acquireUse(ptr: *anyopaque) bool {
+        const self: *State = @ptrCast(@alignCast(ptr));
+        @import("antfly_platform").sync.lockYielding(&self.lifetime_mutex);
+        defer self.lifetime_mutex.unlock();
+        if (self.resources_closed.load(.monotonic)) return false;
+        self.active_uses += 1;
+        return true;
+    }
+
+    fn releaseUse(ptr: *anyopaque) void {
+        const self: *State = @ptrCast(@alignCast(ptr));
+        @import("antfly_platform").sync.lockYielding(&self.lifetime_mutex);
+        std.debug.assert(self.active_uses > 0);
+        self.active_uses -= 1;
+        const expire = self.active_uses == 0 and self.idle_expiry and self.retired;
+        if (expire) self.closeResources();
+        self.lifetime_mutex.unlock();
+        if (expire) self.registry.releaseClosedClaim(self);
+    }
+
+    fn enableIdleExpiry(ptr: *anyopaque) void {
+        const self: *State = @ptrCast(@alignCast(ptr));
+        @import("antfly_platform").sync.lockYielding(&self.lifetime_mutex);
+        self.idle_expiry = true;
+        const expire = self.active_uses == 0 and self.retired;
+        if (expire) self.closeResources();
+        self.lifetime_mutex.unlock();
+        if (expire) self.registry.releaseClosedClaim(self);
+    }
 
     fn read(ptr: *anyopaque, offset: u64, out: []u8) !void {
         const self: *State = @ptrCast(@alignCast(ptr));
@@ -288,7 +383,9 @@ const State = struct {
 
     fn retainedBytes(ptr: *anyopaque) usize {
         const self: *State = @ptrCast(@alignCast(ptr));
-        return self.cache.?.retainedBytes();
+        @import("antfly_platform").sync.lockYielding(&self.lifetime_mutex);
+        defer self.lifetime_mutex.unlock();
+        return if (self.cache) |*cache| cache.retainedBytes() else 0;
     }
 
     fn visit(ptr: *anyopaque, offset: u64, length: u64, context: *anyopaque, visitor: *const fn (*anyopaque, u64, []const u8) anyerror!void) !void {
@@ -312,17 +409,21 @@ const State = struct {
         const self: *State = @ptrCast(@alignCast(ptr));
         const registry = self.registry;
         const runtime = registry.io();
-        if (registry.beginCallback()) |owner| {
+        @import("antfly_platform").sync.lockYielding(&self.lifetime_mutex);
+        const remove_alias = !self.resources_closed.load(.monotonic) and self.marker != null;
+        self.lifetime_mutex.unlock();
+        // Snapshot under the lifetime lock, but never enter the publication
+        // lane while holding it (publication may retire this same state).
+        if (remove_alias) if (registry.beginCallback()) |owner| {
             defer registry.endCallback();
-            if (self.marker != null) {
-                var remove = Remove{ .key = self.lease_key };
-                // On failure the marker will disappear and bounded orphan
-                // service can retry. A failed release never frees live pages.
-                owner.submitMutation(&remove, Remove.apply) catch {};
-            }
-        }
-        self.cache.?.deinit();
-        self.reader.close();
+            var remove = Remove{ .key = self.lease_key };
+            // On failure the marker will disappear and bounded orphan
+            // service can retry. A failed release never frees live pages.
+            owner.submitMutation(&remove, Remove.apply) catch {};
+        };
+        @import("antfly_platform").sync.lockYielding(&self.lifetime_mutex);
+        self.closeResources();
+        self.lifetime_mutex.unlock();
         registry.mutex.lockUncancelable(runtime);
         var link = &registry.first;
         while (link.* != self) link = &link.*.?.next;
@@ -331,7 +432,7 @@ const State = struct {
             var it = registry.first;
             var transferred = false;
             while (it) |other| : (it = other.next) {
-                if (other.generation != self.generation) continue;
+                if (other.generation != self.generation or other.resources_closed.load(.acquire)) continue;
                 other.retired_claim = self.retired_claim;
                 transferred = true;
                 break;
@@ -339,10 +440,6 @@ const State = struct {
             if (!transferred) _ = registry.retired_bytes.fetchSub(self.retired_claim, .acq_rel);
         }
         registry.mutex.unlock(runtime);
-        if (self.marker) |marker| {
-            marker.close(runtime);
-            std.Io.Dir.cwd().deleteFile(runtime, self.marker_path) catch {};
-        }
         self.value.deinit(registry.allocator);
         registry.allocator.free(self.lease_key);
         registry.allocator.free(self.marker_path);
