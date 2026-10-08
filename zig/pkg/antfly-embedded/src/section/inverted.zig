@@ -8867,6 +8867,14 @@ pub const RangeInvertedIndexReader = struct {
         if (dict_length < term_dict_header_size or dict_length > view.length - v7_header_size) return error.InvalidData;
         const dict_offset = view.length - dict_length;
         if (@as(u64, bloom_length) + norms_length > dict_offset - v7_header_size) return error.InvalidData;
+        // The header identifies three independent required metadata reads.
+        // Hint them together so remote sources overlap their bounded requests;
+        // required reads still authenticate bytes and surface every error.
+        view.source.prefetch(view.offset + dict_offset, term_dict_header_size);
+        if (bloom_length >= bloom.magic.len + 13)
+            view.source.prefetch(view.offset + dict_offset - bloom_length, bloom.magic.len + 13);
+        if (norms_length >= 5)
+            view.source.prefetch(view.offset + dict_offset - bloom_length - norms_length, 5);
         var dict: [term_dict_header_size]u8 = undefined;
         try view.readInto(dict_offset, &dict);
         if (!std.mem.eql(u8, dict[0..4], term_dict_magic)) return error.InvalidData;

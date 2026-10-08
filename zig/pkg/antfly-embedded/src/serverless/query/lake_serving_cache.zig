@@ -79,6 +79,7 @@ pub const Cache = struct {
             while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
             self.stats.disk_unavailable = @errorName(err);
             self.mutex.unlock();
+            std.log.scoped(.lake_cache).warn("persistent cache unavailable; serving through RAM/source: {s}", .{@errorName(err)});
             self.persistent_attempted = true;
             return;
         };
