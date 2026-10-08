@@ -128,7 +128,7 @@ def main():
         generator_sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
         numpy_version=np.__version__ if args.numpy else None,
         upstream_snapshot_executed=args.numpy,
-        provenance="Observed upstream method pinned by source-snapshot SHA-256; remote commit lookup unavailable due DNS. NumPy verification executes the unmodified snapshot method body.",
+        provenance="Observed upstream method pinned by source-snapshot SHA-256; remote commit lookup unavailable due DNS. NumPy verification executes the snapshot method with repository formatting and unchanged upstream logic.",
         cases=output,
     )
     (path.parents[1] / "testdata/sampling-oracle.json").write_text(

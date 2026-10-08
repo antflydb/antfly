@@ -1,6 +1,6 @@
 # Copyright 2026 the HuggingFace Team. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-# Source-method snapshot observed 2026-10-08, without edits to the method body:
+# Source-method snapshot observed 2026-10-08, with repository formatting and unchanged method logic:
 # https://github.com/huggingface/transformers/blob/main/src/transformers/models/embedding_gemma2/video_processing_embedding_gemma2.py
 # This is a conformance oracle, not part of the Antfly runtime.
 class EmbeddingGemma2VideoProcessor:

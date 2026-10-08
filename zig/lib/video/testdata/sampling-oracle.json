@@ -2,11 +2,11 @@
   "policy": "embeddinggemma2-frame-index-v1",
   "source_url": "https://github.com/huggingface/transformers/blob/main/src/transformers/models/embedding_gemma2/video_processing_embedding_gemma2.py",
   "observed": "2026-10-08",
-  "reference_snapshot_sha256": "7fcf96d086b7635c6229179de8093e42bb198fa968c113f9213598a06f264ca2",
-  "generator_sha256": "6aed9a8cfa21f76c6d3aa90e80d464ceb3f28f30dbf78952e2a6ab6915b6181b",
+  "reference_snapshot_sha256": "1dfff9b8f8631bfa70ad2db97afd75b3fcdfc7b0d94da48bceddf430c84a8e43",
+  "generator_sha256": "83722f69ff7badd069db4ab4dac66851e005c9603fd27b298b7147aea00dcb2d",
   "numpy_version": "2.4.4",
   "upstream_snapshot_executed": true,
-  "provenance": "Observed upstream method pinned by source-snapshot SHA-256; remote commit lookup unavailable due DNS. NumPy verification executes the unmodified snapshot method body.",
+  "provenance": "Observed upstream method pinned by source-snapshot SHA-256; remote commit lookup unavailable due DNS. NumPy verification executes the snapshot method with repository formatting and unchanged upstream logic.",
   "cases": [
     {
       "total_frames": 60,
