@@ -5722,3 +5722,28 @@ The focused API owner executes the generated NUMERIC descriptor regression.
 The full TypeScript SDK suite passes 433 tests with one skip. Inventory integrity,
 control-catalog consistency, Rust-spec synchronization, formatting and whitespace
 checks pass. No original unsupported cases were reclassified by these checks.
+
+### Strict NUMERIC modifier storage boundary
+
+The shared exact-row boundary now separates caller-budgeted write coercion from
+strict stored-byte verification. Writes parse, round and precision-check through
+one execution budget before canonical encoding. Verification borrows canonical
+limbs and checks precision, declared display scale and negative-scale divisibility
+without allocating, formatting or rounding. A valid unconstrained encoding is
+not automatically a valid constrained stored value; restore cannot silently
+repair a value that violates its immutable column layout. NaN follows PostgreSQL,
+while constrained infinities are rejected. Sticky cancellation/quota failures
+remain authoritative even when a later call supplies an invalid modifier.
+
+All 20 modifier cases in the independently reverified 893-case PostgreSQL exact
+NUMERIC oracle exercise this boundary. Tests also cover canonical-but-unconstrained
+payload rejection, every write/owned-output allocation failure and zero-capacity
+verification. All 74 NUMERIC owner tests pass without failures or leaks. A Debug
+probe verifies 10,000 rows with zero allocations in approximately 1.3 ms; this is
+a component work/allocation measurement, not an end-to-end benchmark.
+
+Durable activation remains incomplete: schema-owned modifier descriptors, public
+schema annotation and DDL publication, assignment/default/generated enforcement,
+schema-VM modifier instructions, restore integration and capability fencing must
+all use this boundary before the publication guards can be removed. The original
+parity dispositions remain unchanged.

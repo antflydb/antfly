@@ -83,6 +83,31 @@ pub const View = struct {
         return view;
     }
 
+    /// Verify an already canonical stored value against its column modifier.
+    /// Unlike write coercion this never rounds, normalizes or allocates. The
+    /// display scale is part of the schema-bound physical representation.
+    pub fn verifyModifier(self: View, modifier: @import("sql_builtin_type.zig").NumericModifier, budget: anytype) !void {
+        try budget.charge(1);
+        try modifier.validate();
+        if (self.kind == .nan) return;
+        if (self.kind != .finite) return error.InvalidSqlBinaryRepresentation;
+        if (self.scale != @as(u16, @intCast(@max(modifier.scale, 0))))
+            return error.InvalidSqlBinaryRepresentation;
+        if (self.count == 0) return;
+        var leading = self.group(0);
+        var decimal_digits: i32 = 1;
+        while (leading >= 10) : (decimal_digits += 1) leading /= 10;
+        if (@as(i32, self.weight) * 4 + decimal_digits > @as(i32, modifier.precision) - modifier.scale)
+            return error.InvalidSqlBinaryRepresentation;
+        // Negative scale rounds to powers of ten left of the decimal point;
+        // scale zero alone cannot prove those low significant digits absent.
+        const low = @as(i32, self.weight) - self.count + 1;
+        const cut = @divFloor(-@as(i32, modifier.scale), 4);
+        const factor = ([_]u16{ 1, 10, 100, 1000 })[@intCast(@mod(-@as(i32, modifier.scale), 4))];
+        if (low < cut or (low == cut and self.group(self.count - 1) % factor != 0))
+            return error.InvalidSqlBinaryRepresentation;
+    }
+
     /// Compare canonical pinned views without materializing coefficients.
     /// PostgreSQL orders NaN above infinity and treats equal NaNs as equal.
     pub fn order(self: View, other: View, budget: anytype) !std.math.Order {
