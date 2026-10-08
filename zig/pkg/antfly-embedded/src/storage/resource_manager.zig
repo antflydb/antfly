@@ -195,6 +195,9 @@ pub const Slice = enum(u8) {
     /// the capacity-domain ledger; this slice owns only queued key/payload
     /// memory until the cache worker completes or drops the write.
     lake_range_cache_queue,
+    /// Decoder scratch and uncached decoded payload leases. Appended to keep
+    /// existing resource IDs stable and separate reads from mutable admission.
+    lsm_read_working_set,
 
     pub fn name(self: Slice) []const u8 {
         return switch (self) {
@@ -232,6 +235,7 @@ pub const Slice = enum(u8) {
             .dense_vector_block_build_working_set => "dense.vector_block_build_working_set",
             .dense_source_payload_state => "dense.source_payload_state",
             .lake_range_cache_queue => "lake.range_cache_queue",
+            .lsm_read_working_set => "lsm.read_working_set",
         };
     }
 };
@@ -469,6 +473,7 @@ pub const Options = struct {
             .dense_source_payload_state = .{ .soft_limit_bytes = 192 * 1024 * 1024, .hard_limit_bytes = 384 * 1024 * 1024 },
             .relational_preparation_working_set = .{ .soft_limit_bytes = 128 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
             .lake_range_cache_queue = .{ .soft_limit_bytes = 384 * 1024 * 1024, .hard_limit_bytes = 512 * 1024 * 1024 },
+            .lsm_read_working_set = .{ .soft_limit_bytes = 64 * 1024 * 1024, .hard_limit_bytes = 128 * 1024 * 1024 },
         }).values;
     }
 
@@ -509,6 +514,7 @@ pub const Options = struct {
             .dense_source_payload_state = .{ .soft_action = .report, .hard_action = .throttle_writes },
             .relational_preparation_working_set = .{ .soft_action = .report, .hard_action = .reject_work },
             .lake_range_cache_queue = .{ .soft_action = .report, .hard_action = .reject_work },
+            .lsm_read_working_set = .{ .soft_action = .report, .hard_action = .reject_work },
         }).values;
     }
 };
@@ -2806,6 +2812,29 @@ pub const ResourceManager = struct {
         return true;
     }
 
+    /// Reclassify an existing owner atomically without a second host charge.
+    /// No allocation or callback occurs; destination slice admission still applies.
+    fn reclassifyReservation(self: *ResourceManager, reservation: *Reservation, destination: Slice) !void {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        const owned = self.reservation_identities.getPtr(reservation.identity) orelse return error.ReservationReleased;
+        if (reservation.manager != self or reservation.released or owned.slice != reservation.slice or owned.bytes != reservation.bytes)
+            return error.ResourceAccountingMismatch;
+        if (destination == reservation.slice) return;
+        const source = &self.slices[sliceIndex(reservation.slice)];
+        const target = &self.slices[sliceIndex(destination)];
+        const next = std.math.add(u64, target.used_bytes, reservation.bytes) catch return error.ResourceBudgetExceeded;
+        if (target.budget.hard_limit_bytes != 0 and next > target.budget.hard_limit_bytes) return error.ResourceBudgetExceeded;
+        if (source.used_bytes < reservation.bytes) return error.ResourceAccountingMismatch;
+        source.used_bytes -= reservation.bytes;
+        target.used_bytes = next;
+        target.peak_bytes = @max(target.peak_bytes, next);
+        if (target.budget.soft_limit_bytes != 0 and next > target.budget.soft_limit_bytes) target.soft_limit_events +|= 1;
+        owned.slice = destination;
+        reservation.slice = destination;
+        self.pressure_change.advance();
+    }
+
     /// Move already-accounted credit between two live reservations without
     /// changing slice or host usage. This is the ownership handoff used when
     /// operation admission pre-reserves allocator headroom before the
@@ -3633,6 +3662,15 @@ pub const Reservation = struct {
         _ = self.manager.shrinkReservation(self, bytes);
     }
 
+    pub fn reclassify(self: *Reservation, destination: Slice) !void {
+        if (self.released) return error.ReservationReleased;
+        if (self.bytes == 0 and self.identity == 0) {
+            self.slice = destination;
+            return;
+        }
+        try self.manager.reclassifyReservation(self, destination);
+    }
+
     pub fn transferCreditTo(self: *Reservation, destination: *Reservation, bytes: u64) !void {
         if (self.released or destination.released) return error.ReservationReleased;
         try self.manager.transferReservationCredit(self, destination, bytes);
@@ -4166,11 +4204,11 @@ test "default tokenizer cache budget is aligned with its resource slice" {
     );
 }
 
-test "default lake range cache queue budget is aligned with its terminal resource slice" {
+test "default lake range cache queue budget keeps its stable resource identity" {
     const budgets = Options.defaultBudgets();
     const policies = Options.defaultPolicies();
     const index = @backingInt(Slice.lake_range_cache_queue);
-    try std.testing.expectEqual(slice_count - 1, index);
+    try std.testing.expectEqual(@as(usize, 33), index);
     try std.testing.expectEqual(@as(u64, 384 * 1024 * 1024), budgets[index].soft_limit_bytes);
     try std.testing.expectEqual(@as(u64, 512 * 1024 * 1024), budgets[index].hard_limit_bytes);
     try std.testing.expectEqual(PressureAction.report, policies[index].soft_action);
@@ -6286,4 +6324,30 @@ test "source vector payloads scoped allocator receipts distinguish admission and
     // Allocations and frees are interchangeable with the original allocator.
     budget.threadSafeAllocator().free(memory);
     try std.testing.expect(first.last_failure == null);
+}
+
+test "resource manager reclassifies owned read credit without a second host charge" {
+    const a = std.testing.allocator;
+    for ([_]u64{ 128, 256 }) |limit| {
+        var budgets = Options.defaultBudgets();
+        budgets[@backingInt(Slice.lsm_block_table_cache)] = .{ .hard_limit_bytes = limit };
+        var manager = ResourceManager.init(.{ .budgets = budgets, .memory_budget = .{ .hard_limit_bytes = 150 } });
+        defer manager.deinit(a);
+        var credit = try manager.reserveWithoutReclaim(.lsm_read_working_set, 150);
+        defer credit.release();
+        if (limit < 150) {
+            try std.testing.expectError(error.ResourceBudgetExceeded, credit.reclassify(.lsm_block_table_cache));
+            try std.testing.expectEqual(Slice.lsm_read_working_set, credit.slice);
+            try std.testing.expectEqual(@as(u64, 150), manager.sliceStats(.lsm_read_working_set).used_bytes);
+            try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lsm_block_table_cache).used_bytes);
+        } else {
+            try credit.reclassify(.lsm_block_table_cache);
+            try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lsm_read_working_set).used_bytes);
+            try std.testing.expectEqual(@as(u64, 150), manager.sliceStats(.lsm_block_table_cache).used_bytes);
+        }
+        try std.testing.expectEqual(@as(u64, 150), manager.snapshot().memory.peak_bytes);
+        credit.release();
+        try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
+        try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.accounting_errors);
+    }
 }
