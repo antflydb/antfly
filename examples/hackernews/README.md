@@ -189,9 +189,37 @@ One indexed cycle had one background-created file before its first query.
 Post-restart reads reused the persisted cache and received 33–97 KB for text
 only and about 38 KB with metadata indexes, rather than downloading megabytes.
 
+### Automatic predicate planner results
+
+[planner-qualification.json](planner-qualification.json) records the follow-up
+on `10e36b97f1`, using the same raw export, GKE node, Linux `fast` optimization,
+and pod resources. Each mode ran twice with five warm samples per filter in
+each cycle. The table pools those ten samples per filter:
+
+| Indexed filter | Before planner | After planner |
+|---|---:|---:|
+| Item type equality | 220 ms | 144 ms |
+| Author equality | 240 ms | 156 ms |
+| Points range | 217 ms | 156 ms |
+| Creation-time range | 223 ms | 141 ms |
+| Four-field conjunction | 753 ms | 142 ms |
+
+The conjunction improved about 5.3×; its reported native execution median fell
+from 612 ms to 11 ms. All filter totals and ranked pages matched the residual
+oracle before and after restart. HN IDs and scores were identical across both
+modes, all cycles, and the before/after binaries. The temporary pod and its
+local Kubernetes credential directory were removed.
+
+The indexed table's unfiltered highlighted search took 3.92–4.36 seconds cold,
+146–152 ms warm, and 203–216 ms after restart. Most warm request time still sits
+outside the native execution timer. This fix removes repeated predicate setup;
+remote source/publication preparation remains a latency target. Cache was empty
+before startup; one cycle per mode had one background-created cache file at
+its first search. These are 10k-row measurements, not archive capacity results.
+
 ## Remaining deployment work
 
-- Reduce source/publication preparation and repeated predicate setup, preserving snapshot and cancellation guarantees.
+- Reduce remote source/publication preparation, preserving snapshot and cancellation guarantees.
 - Qualify larger partitions against build/corpus limits and indexed filtering.
 - Define durable buckets and service identities through Colony's infra workflow.
 - Stream backfills, resolve parent stories, and reconcile edits/deletions.
