@@ -9,7 +9,7 @@ const native = @import("runtime_native_abi.zig");
 const errors = @import("runtime_error_abi.zig");
 const http = @import("runtime_http_abi.zig");
 
-pub const abi_version: u32 = 1;
+pub const abi_version: u32 = 2;
 pub const Class = enum(c_int) { query, write, inference, background, control };
 pub const Wait = enum(c_int) { resource, output };
 
@@ -21,7 +21,9 @@ pub const Start = extern struct {
     deadline_ns: u64 = 0,
     has_deadline: u8 = 0,
     native_deadline: u8 = 0,
-    reserved: [6]u8 = @splat(0),
+    /// Initial acquisition only; published reentry keeps bounded fair waits.
+    allow_wait: u8 = 1,
+    reserved: [5]u8 = @splat(0),
     cancellation: http.CancellationView = .{},
     class: c_int,
     slots: usize = 1,
@@ -30,7 +32,7 @@ pub const Start = extern struct {
 
     pub fn validate(self: *const Start) !void {
         if (self.version != abi_version or self.struct_size != @sizeOf(Start)) return error.UnsupportedVersion;
-        if (self.has_deadline > 1 or self.native_deadline > 1 or !std.mem.allEqual(u8, &self.reserved, 0)) return error.InvalidArgument;
+        if (self.has_deadline > 1 or self.native_deadline > 1 or self.allow_wait > 1 or !std.mem.allEqual(u8, &self.reserved, 0)) return error.InvalidArgument;
         if (self.native_deadline != 0 and self.clock_io != null) return error.InvalidArgument;
         _ = std.enums.fromInt(Class, self.class) orelse return error.InvalidArgument;
         if (self.slots == 0) return error.InvalidRunnableDemand;
@@ -143,6 +145,13 @@ pub const Transfer = struct {
 test "runnable execution ABI rejects malformed inputs before borrowing executor state" {
     var handle: ?*anyopaque = null;
     var start: Start = .{ .io = @ptrFromInt(8), .class = @backingInt(Class.inference), .out_handle = &handle };
+    try start.validate();
+    start.version = 1;
+    try std.testing.expectError(error.UnsupportedVersion, start.validate());
+    start.version = abi_version;
+    start.allow_wait = 2;
+    try std.testing.expectError(error.InvalidArgument, start.validate());
+    start.allow_wait = 0;
     try start.validate();
     start.struct_size -= 1;
     try std.testing.expectError(error.UnsupportedVersion, start.validate());

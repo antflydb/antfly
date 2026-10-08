@@ -275,6 +275,13 @@ pub const Scheduler = struct {
         self.mutex.unlock();
         if (!owned) return error.InvalidRunnableTransition;
         const options = e.options;
+        // Fail-fast initial consumers may run under a transport lock. Never
+        // suspend that caller for CPU; unpublished rejection releases its
+        // reservation. Published reentry still uses its bounded fair queue.
+        if (!retain and !options.allow_wait and e.waited) {
+            self.failWait(e, error.ResourceTemporarilyUnavailable, false);
+            return error.ResourceTemporarilyUnavailable;
+        }
         const start = options.now();
         const until = @min(options.deadline_ns orelse std.math.maxInt(u64), e.queued_since_ns +| @as(u64, self.config.max_wait_ms) * std.time.ns_per_ms);
         defer {
@@ -1023,4 +1030,61 @@ test "runnable scheduler canceled yielded capsule retains ownership while peer c
     try std.testing.expectEqual(@as(u64, 3), scheduler.stats().retained_bytes);
     scheduler.finish(&peer);
     try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+}
+
+test "runnable fail-fast initial control admission never waits or leaks a reservation" {
+    var scheduler = try Scheduler.init(.{ .slots = 3, .max_operations = 8, .max_bytes = 128, .control_bytes = 64, .max_wait_ms = 1000 });
+    var ordinary: Execution = .{};
+    defer ordinary.finish();
+    try ordinary.startWithSlots(&scheduler, .{ .io = std.testing.io, .retained_bytes = 17 }, .query, 2);
+    var first: Execution = .{};
+    defer first.finish();
+    try first.start(&scheduler, .{ .io = std.testing.io, .retained_bytes = 31, .allow_wait = false }, .control);
+    var rejected: Execution = .{};
+    defer rejected.finish();
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, rejected.start(&scheduler, .{ .io = std.testing.io, .retained_bytes = 19, .allow_wait = false }, .control));
+    try std.testing.expect(rejected.entry == null);
+    const active = scheduler.stats();
+    try std.testing.expectEqual(@as(usize, 2), active.operations);
+    try std.testing.expectEqual(@as(u64, 48), active.retained_bytes);
+    try std.testing.expectEqual(@as(usize, 1), active.control_operations);
+    try std.testing.expectEqual(@as(usize, 3), active.runnable_slots);
+    try std.testing.expectEqual(@as(usize, 0), active.queued);
+    first.finish();
+    try rejected.start(&scheduler, .{ .io = std.testing.io, .retained_bytes = 19, .allow_wait = false }, .control);
+    try std.testing.expectEqual(@as(usize, 1), scheduler.stats().control_slots);
+    rejected.finish();
+    ordinary.finish();
+    try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+    try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+}
+
+test "runnable fail-fast acquisition retains fair bounded published reentry" {
+    const io = std.testing.io;
+    var scheduler = try Scheduler.init(.{ .slots = 3, .max_operations = 8, .max_wait_ms = 1000 });
+    var first: Execution = .{};
+    defer first.finish();
+    try first.start(&scheduler, .{ .io = io, .retained_bytes = 31, .allow_wait = false }, .control);
+    try first.park(.output_blocked);
+    var peer: Execution = .{};
+    defer peer.finish();
+    try peer.start(&scheduler, .{ .io = io, .retained_bytes = 11, .allow_wait = false }, .control);
+    try std.testing.expectEqual(@as(usize, 2), scheduler.stats().control_operations);
+    try std.testing.expectEqual(@as(u64, 42), scheduler.stats().retained_bytes);
+    var release = try io.concurrent(struct {
+        fn run(value: *Execution, lane: std.Io) !void {
+            try lane.sleep(.fromMilliseconds(20), .awake);
+            value.finish();
+        }
+    }.run, .{ &peer, io });
+    defer release.cancel(io) catch {};
+    try first.enter(.control);
+    try release.await(io);
+    try std.testing.expectEqual(@as(u64, 2), first.resume_generation);
+    try std.testing.expectEqual(@as(usize, 1), scheduler.stats().control_operations);
+    try std.testing.expectEqual(@as(u64, 31), scheduler.stats().retained_bytes);
+    try std.testing.expectEqual(@as(usize, 1), scheduler.stats().control_slots);
+    first.finish();
+    try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+    try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
 }

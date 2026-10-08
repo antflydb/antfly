@@ -70,6 +70,7 @@ fn startChecked(raw: *anyopaque, options: *const abi.Start) !void {
         .deadline_ns = if (options.has_deadline != 0) options.deadline_ns else null,
         .cancellation = .{ .ptr = value, .requested = Capsule.cancelled },
         .retained_bytes = options.retained_bytes +| @sizeOf(Capsule),
+        .allow_wait = options.allow_wait != 0,
     }, std.enums.fromInt(runnable.Class, options.class) orelse return error.InvalidArgument, options.slots);
     options.out_handle.* = value;
 }
@@ -287,4 +288,26 @@ test "runnable execution borrowed child rejects stale deadlines headers and shut
         try std.testing.expectEqual(@as(u64, 0), owner.owner.scheduler.stats().retained_bytes);
         try owner.owner.tryDeinit();
     }
+}
+
+test "runnable execution port forwards fail-fast control admission without publishing rejected capsules" {
+    var owner: State = .{ .owner_alloc = std.testing.allocator, .owner = try runnable.NodeOwner.init(.{ .slots = 3, .max_operations = 8, .max_wait_ms = 1000 }), .native_now_ns = TestClock.now };
+    const port = owner.port();
+    const io = std.testing.io;
+    const borrow = runtime.native_abi.IoBorrow.init(&io);
+    var first: ?*anyopaque = null;
+    try std.testing.expect(port.start(port.context, &.{ .io = &borrow, .class = @backingInt(abi.Class.control), .allow_wait = 0, .retained_bytes = 31, .out_handle = &first }).isOk());
+    defer if (first) |handle| port.finish(handle);
+    const before = owner.owner.scheduler.stats();
+    var rejected: ?*anyopaque = null;
+    try std.testing.expectEqual(error.ResourceTemporarilyUnavailable, runtime.error_abi.errorFromStatus(port.start(port.context, &.{ .io = &borrow, .class = @backingInt(abi.Class.control), .allow_wait = 0, .retained_bytes = 19, .out_handle = &rejected })));
+    try std.testing.expect(rejected == null);
+    try std.testing.expectEqual(before.operations, owner.owner.scheduler.stats().operations);
+    try std.testing.expectEqual(before.retained_bytes, owner.owner.scheduler.stats().retained_bytes);
+    try std.testing.expectEqual(@as(usize, 1), owner.owner.borrowers);
+    try std.testing.expectEqual(@as(usize, 0), owner.owner.scheduler.stats().queued);
+    port.finish(first.?);
+    first = null;
+    try std.testing.expectEqual(@as(usize, 0), owner.owner.borrowers);
+    try owner.owner.tryDeinit();
 }

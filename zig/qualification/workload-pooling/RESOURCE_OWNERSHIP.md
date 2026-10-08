@@ -304,3 +304,12 @@ Native and pinned Nix/glibc pass all server tests and selected transport contrac
 see [error cleanup receipts](receipts/2026-10-07/error-output-budget/README.md).
 Independent control CPU admission outside frame locks and full production/API,
 whole-node/default qualification remain required.
+
+
+Initial runnable acquisition now honors fail-fast allow_wait policy, while
+published reentry retains bounded fair waiting. Checked runnable ABI version 2
+forwards that policy and rejects legacy/malformed inputs. Native and pinned
+Nix/glibc scheduler, ABI and real-owner/subprocess gates pass; see
+[fail-fast acquisition receipts](receipts/2026-10-07/fail-fast-runnable-acquisition/README.md).
+Independent transport cleanup wiring and its own bounded count/byte subquota
+must still preserve health/control headroom. Full default-enablement proof is pending.
