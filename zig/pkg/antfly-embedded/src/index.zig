@@ -1296,6 +1296,18 @@ pub const IndexSnapshot = struct {
     /// The caller owns the returned data.
     pub const DecompressedDoc = struct { id: []const u8, data: []u8 };
 
+    pub const StoredDocBlockCache = segment_mod.SegmentReader.StoredDocBlockCache;
+
+    /// Request-owned, bounded decoded blocks for ranked (not physical-order)
+    /// result hydration. Returned identity/body expire on the next cache get.
+    /// The snapshot must remain pinned until the cache is destroyed.
+    pub fn storedDocWithBlockCache(self: *const IndexSnapshot, cache: *StoredDocBlockCache, global_id: u32) !?segment_mod.SegmentReader.StoredDocRef {
+        const resolved = self.resolveDocId(global_id) orelse return null;
+        const segment = &self.segments[resolved.seg_idx];
+        segment.noteAccess();
+        return cache.get(&segment.reader, resolved.local_id);
+    }
+
     pub fn storedDocDecompressed(self: *const IndexSnapshot, alloc: Allocator, global_id: u32) !?DecompressedDoc {
         const resolved = self.resolveDocId(global_id) orelse return null;
         self.segments[resolved.seg_idx].noteAccess();

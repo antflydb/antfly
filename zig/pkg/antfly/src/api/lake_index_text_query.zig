@@ -295,11 +295,13 @@ const Execution = struct {
             for (values) |*value| if (value.*) |*owned| types.deinitJsonValue(a, owned);
             a.free(values);
         }
+        var hydrator = projection.Hydrator.init(a);
+        defer hydrator.deinit();
         if (stored_fields.len != 0) for (hits, values) |hit, *value| {
             try self.context.ensureActive();
             const key = try nativeKey(self, a, hit.id);
             defer a.free(key);
-            if (value.*) |*row| try projection.appendStored(a, pin.?.snapshot, hit.native_text_doc_id.?, key, stored_fields, row) else return error.StoredDocMissing;
+            if (value.*) |*row| try hydrator.append(a, pin.?.snapshot, hit.native_text_doc_id.?, key, stored_fields, row) else return error.StoredDocMissing;
         };
         for (hits, values) |*hit, *value| {
             std.debug.assert(hit.stored_data == null and hit.source_value == null);

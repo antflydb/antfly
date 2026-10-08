@@ -611,7 +611,10 @@ test "external lake cold ranked highlights survive restart with no provider byte
         // Use the same typed source projection and highlighter as delivery;
         // no Parquet source is available to hide an accidental fallback.
         hits[0].source_value = .{ .object = .empty };
-        try @import("lake_index_source_projection.zig").appendStored(a, snapshot, result.hits[0].doc_id, stored.id, &.{ "label", "body" }, &hits[0].source_value.?);
+        var hydrator = @import("lake_index_source_projection.zig").Hydrator.init(a);
+        defer hydrator.deinit();
+        try hydrator.append(a, snapshot, result.hits[0].doc_id, stored.id, &.{ "label", "body" }, &hits[0].source_value.?);
+        try std.testing.expectEqual(@as(usize, 1), hydrator.blocks.decode_count);
         try search.attachHighlightsWithIndexQueries(a, .{ .fields = &.{"body"} }, &.{.{
             .query = .{ .match = .{ .field = "body", .text = "alpha" } },
             .text_analysis = .{},
