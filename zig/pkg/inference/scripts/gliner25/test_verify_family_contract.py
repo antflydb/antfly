@@ -1,3 +1,18 @@
+# Copyright 2026 Antfly, Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from __future__ import annotations
 
 import hashlib
@@ -119,10 +134,14 @@ class FamilyContractTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "model.safetensors"
             path.write_bytes(struct.pack("<Q", family.MAX_HEADER_BYTES + 1))
-            with self.assertRaisesRegex(family.ContractError, "invalid safetensors header"):
+            with self.assertRaisesRegex(
+                family.ContractError, "invalid safetensors header"
+            ):
                 family.safetensors_header(path)
 
-    def test_unselected_rope_metadata_and_tokenizer_bytes_are_identity_bound(self) -> None:
+    def test_unselected_rope_metadata_and_tokenizer_bytes_are_identity_bound(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             model, generated = self.fixture(root, "decide_1b")
@@ -133,7 +152,9 @@ class FamilyContractTest(unittest.TestCase):
             encoder = json.loads(encoder_path.read_text(encoding="utf-8"))
             encoder["rope_parameters"]["full_attention"]["rope_theta"] = 160001.0
             encoder_path.write_text(json.dumps(encoder), encoding="utf-8")
-            with self.assertRaisesRegex(family.ContractError, "sidecar SHA-256 differs"):
+            with self.assertRaisesRegex(
+                family.ContractError, "sidecar SHA-256 differs"
+            ):
                 family.verify_model("decide_1b", model, contract_path=contract)
 
             model, generated = self.fixture(root, "multi_v1")
@@ -154,7 +175,11 @@ class FamilyBenchmarkContractTest(unittest.TestCase):
         code.write_bytes(b"trusted\n")
         info = root / "package-1.0.dist-info"
         info.mkdir()
-        digest = base64.urlsafe_b64encode(hashlib.sha256(code.read_bytes()).digest()).decode().rstrip("=")
+        digest = (
+            base64.urlsafe_b64encode(hashlib.sha256(code.read_bytes()).digest())
+            .decode()
+            .rstrip("=")
+        )
         record = info / "RECORD"
         record.write_text(
             f"package.py,sha256={digest},{code.stat().st_size}\n"
@@ -184,18 +209,30 @@ class FamilyBenchmarkContractTest(unittest.TestCase):
             root = Path(tmp)
             _, record = self.wheel_tree(root)
             original = record.read_text()
-            for extra in (original.splitlines()[0] + "\n", "../escape.py,sha256=invalid,1\n"):
+            for extra in (
+                original.splitlines()[0] + "\n",
+                "../escape.py,sha256=invalid,1\n",
+            ):
                 record.write_text(original + extra)
-                with self.assertRaisesRegex(benchmark.BenchmarkError, "escapes or is duplicated"):
+                with self.assertRaisesRegex(
+                    benchmark.BenchmarkError, "escapes or is duplicated"
+                ):
                     benchmark.verify_record_tree(root, None)
 
     def test_isolated_runtime_rejects_wrong_distribution_inventory(self) -> None:
         contract = benchmark.strict_json(benchmark.RUNTIME_CONTRACT_1B)
         expected = contract["oracle_runtime_decide_1b"]
-        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
-            benchmark.platform, "python_version", return_value=expected["python"]
-        ), mock.patch.object(benchmark.unicodedata, "unidata_version", expected["unicode"]), mock.patch.object(
-            benchmark.importlib.metadata, "distributions", return_value=[]
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            mock.patch.object(
+                benchmark.platform, "python_version", return_value=expected["python"]
+            ),
+            mock.patch.object(
+                benchmark.unicodedata, "unidata_version", expected["unicode"]
+            ),
+            mock.patch.object(
+                benchmark.importlib.metadata, "distributions", return_value=[]
+            ),
         ):
             with self.assertRaisesRegex(benchmark.BenchmarkError, "inventory differs"):
                 benchmark.verify_runtime_dir(Path(tmp), contract)
@@ -206,11 +243,15 @@ class FamilyBenchmarkContractTest(unittest.TestCase):
         try:
             for name in names:
                 sys.modules.pop(name, None)
-            with mock.patch.object(benchmark.importlib.util, "find_spec", return_value=None):
+            with mock.patch.object(
+                benchmark.importlib.util, "find_spec", return_value=None
+            ):
                 identity = benchmark.install_inference_peft_shim()
             self.assertFalse(identity["executed_peft_code"])
             self.assertFalse(isinstance(object(), sys.modules["peft"].PeftModel))
-            self.assertFalse(isinstance(object(), sys.modules["peft.tuners.lora.layer"].LoraLayer))
+            self.assertFalse(
+                isinstance(object(), sys.modules["peft.tuners.lora.layer"].LoraLayer)
+            )
         finally:
             for name in names:
                 sys.modules.pop(name, None)
@@ -234,7 +275,9 @@ class FamilyBenchmarkContractTest(unittest.TestCase):
         evidence = row["native_classification"]["tasks"]
         self.assertEqual([task["name"] for task in evidence], list(schema["tasks"]))
         for task in evidence:
-            self.assertEqual(task["labels"], list(schema["tasks"][task["name"]]["labels"]))
+            self.assertEqual(
+                task["labels"], list(schema["tasks"][task["name"]]["labels"])
+            )
         first = next(iter(row["schema"]["tasks"].values()))
         first["labels"].pop(next(iter(first["labels"])))
         with self.assertRaisesRegex(benchmark.BenchmarkError, "inventory differs"):
@@ -243,8 +286,13 @@ class FamilyBenchmarkContractTest(unittest.TestCase):
     def test_extraction_schema_restores_entity_order(self) -> None:
         _, _, rows = benchmark.load_capture("multi_decide", "extract")
         row = json.loads(json.dumps(rows[0]))
-        row["schema"]["entities"] = dict(reversed(list(row["schema"]["entities"].items())))
-        self.assertEqual(row["native_schema"]["entities"], list(benchmark.ordered_extract_schema(row)["entities"]))
+        row["schema"]["entities"] = dict(
+            reversed(list(row["schema"]["entities"].items()))
+        )
+        self.assertEqual(
+            row["native_schema"]["entities"],
+            list(benchmark.ordered_extract_schema(row)["entities"]),
+        )
         row["schema"]["entities"].pop(next(iter(row["schema"]["entities"])))
         with self.assertRaisesRegex(benchmark.BenchmarkError, "inventory differs"):
             benchmark.ordered_extract_schema(row)
@@ -256,15 +304,27 @@ class FamilyBenchmarkContractTest(unittest.TestCase):
             benchmark.encoded_evidence(model, "text", {}, boundary=True)
         model.processor.collate_fn_inference.assert_not_called()
 
-    def test_canonical_output_preserves_selected_labels_and_source_offsets(self) -> None:
+    def test_canonical_output_preserves_selected_labels_and_source_offsets(
+        self,
+    ) -> None:
         schema = {"classifications": [{"name": "intent"}], "entities": ["person"]}
         output = {
-            "intent": {"value": "refund", "probabilities": {"refund": 0.8, "sales": 0.2}},
-            "entities": {"person": [{"text": "María", "confidence": 0.9, "start": 0, "end": 5}]},
+            "intent": {
+                "value": "refund",
+                "probabilities": {"refund": 0.8, "sales": 0.2},
+            },
+            "entities": {
+                "person": [{"text": "María", "confidence": 0.9, "start": 0, "end": 5}]
+            },
         }
         expected = benchmark.canonical_expected({}, schema, output)
-        self.assertEqual([{"label": "refund", "confidence": 0.8}], expected["classifications"][0]["labels"])
-        self.assertEqual({"start": 0, "end": 5}, expected["entities"][0]["values"][0]["source"])
+        self.assertEqual(
+            [{"label": "refund", "confidence": 0.8}],
+            expected["classifications"][0]["labels"],
+        )
+        self.assertEqual(
+            {"start": 0, "end": 5}, expected["entities"][0]["values"][0]["source"]
+        )
 
     def test_decide_dispatch_uses_decide_preprocessor(self) -> None:
         extract = mock.Mock()

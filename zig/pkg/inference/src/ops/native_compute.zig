@@ -37575,7 +37575,7 @@ fn gqaPagedAttentionOp(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, attn_bias_
                 if (!attention.skip_kv_write)
                     try view.kv_manager.writeLayerKvSuffix(view.kv_cache.sequence_id, attention.layer_index, item_kv_len, item_q_len, k_slice, v_slice);
                 const item_ct = try gqaPagedAttentionDirect(self, view.kv_manager, attention.layer_index, q_slice, bias, item_attention, num_heads, num_kv_heads, head_dim);
-                defer freeTensor(undefined, item_ct);
+                defer freeTensor(self, item_ct);
                 const item = getData(item_ct);
                 @memcpy(output[b * q_span ..][0..item_q_span], item);
             }
@@ -37606,7 +37606,7 @@ fn gqaPagedAttentionOp(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, attn_bias_
             if (!attention.skip_kv_write)
                 try view.kv_manager.writeLayerKvSuffix(view.kv_cache.sequence_id, attention.layer_index, attention.kv_sequence_len, attention.query_sequence_len, k_slice, v_slice);
             const item_ct = try gqaPagedAttentionDirect(self, view.kv_manager, attention.layer_index, q_slice, bias, item_attention, num_heads, num_kv_heads, head_dim);
-            defer freeTensor(undefined, item_ct);
+            defer freeTensor(self, item_ct);
             const item = getData(item_ct);
             @memcpy(output[b * q_span ..][0..q_span], item);
         }
@@ -47594,6 +47594,76 @@ test "gqa causal attention matches naive reference" {
         if (diff > max_diff) max_diff = diff;
     }
     try std.testing.expect(max_diff < 1e-4);
+}
+
+test "native paged attention cleans up mixed and uniform batch intermediates" {
+    const allocator = std.testing.allocator;
+    var weights = WeightStore{ .allocator = allocator, .resident_weights = .empty, .lazy_weights = .empty };
+    defer weights.resident_weights.deinit(allocator);
+    defer weights.lazy_weights.deinit(allocator);
+    var compute = NativeCompute.init(allocator, &weights, null);
+    defer compute.deinit();
+    var cb = compute.computeBackend();
+    const q = try cb.fromFloat32Shape(&.{ 0, 0, 0, 0 }, &.{ 2, 2 });
+    defer cb.free(q);
+    const k = try cb.fromFloat32Shape(&.{ 0, 0, 0, 0 }, &.{ 2, 2 });
+    defer cb.free(k);
+    const v = try cb.fromFloat32Shape(&.{ 3, 5, 7, 9 }, &.{ 2, 2 });
+    defer cb.free(v);
+
+    // Native coverage keeps both cleanup paths exercised without GPU hardware.
+    for ([_]bool{ false, true }) |mixed| {
+        var manager = runtime.kv.manager.KvManager.init(allocator);
+        defer manager.deinit();
+        const pool = try manager.addPool(.{
+            .backend = .native,
+            .dtype = .f32,
+            .page_size_tokens = 2,
+            .num_layers_packed = 1,
+            .num_kv_heads = 1,
+            .head_dim = 2,
+        });
+        const sequences = [_]runtime.kv.manager.SequenceId{
+            try manager.attachSequence(pool),
+            try manager.attachSequence(pool),
+        };
+        const prior_values = [_][2]f32{ .{ 1, 3 }, .{ 5, 7 } };
+        var views: [2]ops.KvBatchView = undefined;
+        for (sequences, prior_values, 0..) |sequence, prior, index| {
+            try manager.appendTokens(sequence, 2);
+            try manager.writeLayerKvSuffix(sequence, 0, 1, 1, &.{ 0, 0 }, &prior);
+            const table = manager.blockTable(sequence).?;
+            views[index] = .{
+                .kv_cache = .{
+                    .sequence_id = sequence,
+                    .pool_id = pool,
+                    .logical_block_count = table.len(),
+                    .tail_tokens = table.tail_tokens,
+                    .logical_blocks = table.blocks.items,
+                },
+                .kv_manager = &manager,
+                .per_item_query_len = if (mixed) 1 else null,
+                .per_item_total_len = if (mixed) 2 else null,
+                .per_item_kv_len = if (mixed) 2 else null,
+                .per_item_mode = if (mixed) .paged_decode else null,
+            };
+        }
+        const result = try cb.gqaPagedAttention(q, k, v, null, .{
+            .mode = .paged_decode,
+            .total_sequence_len = 2,
+            .query_sequence_len = 1,
+            .kv_sequence_len = 2,
+            .kv_batch = &views,
+            .layer_index = 0,
+        }, 2, 1, 1, 2);
+        defer cb.free(result);
+        const values = try cb.toFloat32(result, allocator);
+        defer allocator.free(values);
+        // Zero queries give equal attention to the prior and appended values.
+        try std.testing.expectEqual(@as(usize, 4), values.len);
+        for (values, [_]f32{ 2, 4, 6, 8 }) |actual, expected|
+            try std.testing.expectApproxEqAbs(expected, actual, 1e-6);
+    }
 }
 
 test "compressed-key paged attention scores encoded keys directly" {

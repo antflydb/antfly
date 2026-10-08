@@ -4765,7 +4765,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     // these fixtures their own control-only source profile, separate from
     // the resident storage owners used by the runtime and restore slices.
     const standalone_initial_fk_test_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly/src/standalone_runtime_test_root.zig"),
+        .root_source_file = b.path("pkg/antfly/src/standalone_runtime_control_test_root.zig"),
         .target = target,
         .optimize = optimize,
     });

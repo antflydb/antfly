@@ -32175,7 +32175,7 @@ test "ordered artifact inventory unit chunk callback reconstructs publishes and 
             return error.TestUnexpectedResult;
         }
     };
-    try std.testing.checkAllAllocationFailures(alloc, AllocationCheck.run, .{ runtime, request, unit_key });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, AllocationCheck.run, .{ runtime, request, unit_key });
     harness.calls = 1;
     try std.testing.expectError(error.ArtifactPublicationPending, publishOrderedUnitChunks(runtime, request, "chunks", unit_key));
     try harness.apply(&db, 6);
@@ -32733,7 +32733,7 @@ fn testOrderedChunkVectorCallback(dense: bool) !void {
                     try std.testing.expectEqualDeep(page.claim, prepared.record.claim);
                 }
             };
-            try std.testing.checkAllAllocationFailures(alloc, AllocationCheck.run, .{ &read, db.root_incarnation, vector_request, plan.plan(), progress });
+            try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, AllocationCheck.run, .{ &read, db.root_incarnation, vector_request, plan.plan(), progress });
         }
         var previous_page: ?census.Page = null;
         defer if (previous_page) |*page| page.deinit();
@@ -32853,7 +32853,7 @@ fn testOrderedChunkVectorCallback(dense: bool) !void {
                     try closure.requireCurrent(txn, root);
                 }
             };
-            if (pass == 0) try std.testing.checkAllAllocationFailures(alloc, ClosureAllocations.run, .{ &snapshot, db.root_incarnation, vector_request, plan.plan() });
+            if (pass == 0) try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, ClosureAllocations.run, .{ &snapshot, db.root_incarnation, vector_request, plan.plan() });
         }
         {
             var writer = try db.core.store.beginWriteTxn();
