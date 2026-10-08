@@ -1307,6 +1307,9 @@ fn validateRelationalSchema(alloc: Allocator, schema: TableSchema) !void {
             .float32, .float64 => .number,
             .boolean => .boolean,
             .jsonb => .json,
+            // Exact scalar NUMERIC needs its own physical row contract; it
+            // must not be admitted as a lossy floating-point number column.
+            .numeric => return error.InvalidSchema,
         };
         if (column.column_type != physical) return error.InvalidSchema;
     };
@@ -2917,6 +2920,10 @@ test "relational index system SQL schema rejects incompatible descriptors and ma
     malformed[malformed.len - 2] = 255;
     try std.testing.expectError(error.InvalidSchema, deserializeSchema(alloc, malformed));
     column.sql_element_type = .uuid;
+    table.relational_columns = &.{column};
+    try std.testing.expectError(error.InvalidSchema, serializeSchema(alloc, table));
+    column.sql_element_type = .numeric;
+    column.column_type = .number;
     table.relational_columns = &.{column};
     try std.testing.expectError(error.InvalidSchema, serializeSchema(alloc, table));
     table.storage_mode = .document;

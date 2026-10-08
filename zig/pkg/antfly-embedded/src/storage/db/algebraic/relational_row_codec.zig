@@ -2086,6 +2086,7 @@ fn validateSqlCell(column: runtime_schema.RelationalColumn, cell: Cell) !void {
         },
         .boolean => if (cell.value != .bool_val) return error.InvalidRelationalRow,
         .jsonb => if (cell.value != .bytes_val or !cell.is_json) return error.InvalidRelationalRow,
+        .numeric => return error.InvalidRelationalRow,
     }
 }
 

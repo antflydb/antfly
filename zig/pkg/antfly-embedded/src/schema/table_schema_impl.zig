@@ -587,6 +587,7 @@ pub const CompiledValidationPlan = struct {
                 },
                 .boolean => if (cell.* != .bool) return error.InvalidBatchRequest,
                 .jsonb => {},
+                .numeric => return error.InvalidBatchRequest,
             }
         }
     }
