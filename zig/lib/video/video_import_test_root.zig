@@ -11,4 +11,7 @@ test "video consumers share the same media Reader and image coefficient types" {
     // Both paths must resolve the same source files through one shared module.
     _ = image.processing.BicubicAxis;
     _ = video.preparation.referenceHost;
+    _ = video.decode_plan.create;
+    _ = video.windows.create;
+    _ = video.apple_jobs.prepareWindows;
 }

@@ -1,9 +1,10 @@
 # Native video decoding and sampled surfaces
 
-Status: phase 1 and the independent phase 2 decoder/preparation library are
-implemented, 2026-10-08. EmbeddingGemma 2 model-token integration, HTTP/SDK video
-inputs, and resident vision/backbone execution remain pending. Tim's PR #1014 is
-kept separate as requested; its model code is not incorporated into this branch.
+Status: phase 1, the independent phase 2 decoder/preparation library, and the
+independent phase 3 scheduling subset are implemented, 2026-10-08. EmbeddingGemma
+2 model-token integration, HTTP/SDK video inputs, and resident vision/backbone
+execution remain pending. Tim's PR #1014 is kept separate as requested; its model
+code is not incorporated into this branch.
 
 Related documents:
 
@@ -42,12 +43,13 @@ a remote commit lookup was unavailable. This qualifies the inspected snapshot,
 rather than every Transformers release. Large-candidate, allocation-failure,
 invalid-policy, cancellation/deadline, and VFR tests enforce bounded behavior.
 See [fixture provenance](testdata/README.md). Run `zig build test-video` from
-`zig/` with Zig 0.17. This phase does not decode pictures or return embeddings.
+`zig/` with Zig 0.17. The sampling module does not decode pictures or return embeddings.
 
 ## Implemented decoder and preparation boundary
 
 The public `antfly_video` module exports `sampling`, `avc`, `apple`,
-`preparation`, and compile-time `capabilities`. Its own `build.zig` supports
+`preparation`, `decode_plan`, `windows`, `apple_jobs`, and compile-time
+`capabilities`. Its own `build.zig` supports
 `test-video` and `check-video`; root and inference builds register the same tests.
 `build_support.attach` takes the consumer's shared media and image modules to
 reuse their types and controls without compiling a file into two Zig modules.
@@ -56,10 +58,12 @@ reuse their types and controls without compiling a file into two Zig modules.
 [apple.zig](src/backends/apple.zig) orchestrates VideoToolbox through narrow
 [platform bindings](src/backends/apple_video.m). `decodeSelected` accepts a media
 MP4 reader, unique decode indexes in the desired output order, and budgets.
-It decodes from packet zero through the latest selected index and retains only
-selected NV12 pictures. It copies source PTS, duration, timescale, display matrix,
+By default it decodes from packet zero through the latest selected index and
+retains only selected NV12 pictures. Explicit `seek_mode=verified_idr` uses the
+qualified dependency planner described below. It copies source PTS, duration, timescale, display matrix,
 pixel aspect, and raw color metadata into an owned batch. Frame surfaces and
-metadata survive reader destruction. No speculative open-GOP seeking is enabled.
+metadata survive reader destruction. Non-IDR open-GOP recovery points never
+authorize a skipped dependency region.
 
 Each call owns its session. Native sample buffers copy packet bytes into owned
 CoreMedia blocks so source leases release after submission. Decode uses neither
@@ -81,8 +85,8 @@ This qualifies the checked-in progressive fixtures, not every legal profile tool
 Selected-frame count, packet bytes/work, retained native plane bytes, source
 pixels, and preparation allocations have limits. Decoder picture-pool admission
 uses a conservative estimate; opaque OS decoder workspace is not charged through
-the Zig allocator. Exact whole-request native/device admission still belongs to
-the production scheduling work. `Surface.fromBorrowed` retains an existing
+the Zig allocator. Queued imports and outputs have separate limits; atomic
+admission across concurrent model requests remains future work. `Surface.fromBorrowed` retains an existing
 CoreVideo pixel buffer without copying. `Surface.map` is an explicit host lease.
 
 `MetalCache` accepts the inference backend's existing `id<MTLDevice>` and imports
@@ -110,7 +114,9 @@ host RGB image is constructed by `submit`.
 `Prepared` owns its surface import, command and Metal patch buffer. `wait`
 checks caller control while polling with `std.Io`; destruction fences in-flight
 work even after cancellation. `buffer` is a borrowed `id<MTLBuffer>` after
-completion for the next resident consumer. `readback` is an explicit reference/
+completion for the next resident consumer. `releaseSource` discards completed
+input imports, commands and intermediates while preserving the output; it is
+idempotent after completion. `readback` is an explicit reference/
 debug path. This library handoff does not yet execute a vision tower or embedding.
 
 Qualification includes independent FFmpeg NV12 comparisons (maximum byte error
@@ -135,6 +141,78 @@ portable-target tests explicitly skip Apple routes and test unavailable errors.
 Linux has packet indexing, frame selection, and CPU borrowed-plane preparation;
 its native H.264 decoder and NVDEC/CUDA routes remain planned. Apple frameworks
 and Objective-C sources are omitted from non-macOS builds.
+
+## Implemented independent scheduling
+
+[decode_plan.zig](src/decode_plan.zig) builds bounded, ordered decode runs for
+unique selected packet indexes. The portable planner probes container sync hints
+and validates length-prefixed AVC NALs. A nonzero run starts only at a sample
+containing IDR slices and no ordinary VCL slices. Container keyframe flags,
+ordinary I pictures and recovery-point SEI alone are insufficient. Full bitstream
+syntax remains the decoder's responsibility; this is a conservative static-avc1
+planner, not a general H.264 dependency parser. Missing usable hints fall back to
+packet zero. `from_start` remains the reference/default for `decodeSelected`.
+
+Probe candidates, aggregate probe bytes, individual packet bytes, backward search
+steps, selections and submitted packets are bounded independently. Accepted probe
+leases are reused during submission, so those packets are not read twice. Plans
+are move-only and retain source leases until `deinit`; providers must outlive them.
+Overlapping dependency ranges merge. `merge_gap_packets` optionally bridges small
+gaps; its default zero minimizes packet submissions, without claiming optimal
+latency on every device/source. The native session drains between disjoint runs
+and the next verified IDR resets references. Source timestamps remain unchanged.
+Batches report submitted/skipped packets, probe bytes and peak retained plane
+bytes. `max_decode_packets` applies to actual planned submissions.
+
+[windows.zig](src/windows.zig) applies the native timestamp policy to bounded
+half-open clip windows, preserving each window's presentation order and mapping
+it to a request-local union of unique picture indexes/PTS. The owned plan records
+hashed immutable source identity and AVC configuration, track ID and timescale.
+Reuse is limited to one source/track/request and one preparation policy. It is
+not a persistent URL cache, model FPS parity claim or vision-token cache. Empty
+windows fail explicitly; window count, selections and unique pictures are capped.
+
+`apple.decodeTo` sends borrowed selected frames to a sink outside the native
+callback, releasing each surface after the sink returns. Consumers retain or
+import pictures they need longer. Errors/cancellation drain the decoder before
+callback state is freed. It returns an owned metadata/counter batch with no
+retained frames; sink order follows decoder delivery, not window presentation.
+
+[apple_jobs.zig](src/apple_jobs.zig) connects that stream to the caller's existing
+`preparation.Metal` device/queue. `prepareWindows` prepares each unique picture
+once and returns completed Metal patch buffers plus owned window mappings, PTS,
+source stamp and decode metadata. Window entries index the shared output array.
+No host pixel readback occurs in this API; explicit `Prepared.readback` remains
+available for testing. Geometry/color policy is supplied once for the request.
+
+The preparation queue defaults to depth two, with a hard maximum of eight and a
+separate actual imported-plane byte cap. When full, the producer waits for the
+oldest command, releases its source import/command/intermediates, then continues
+decode. One additional borrowed decoder output may exist while this wait runs.
+All completed output buffers remain owned by the result under a checked total
+output-byte cap. Queue depth and imported-plane byte high-water marks are
+reported. Cancellation or allocation/consumer/GPU errors fence submitted work
+before releasing results. Limits describe library-owned leases and admission
+estimates; opaque OS decoder/texture-cache workspace and concurrent model
+reservations are not included in a whole-process memory guarantee.
+
+Qualification uses original closed/open-GOP fixtures with hashed FFprobe
+receipts. Native range-backed sparse decoding produces exact baseline pixels:
+
+| Closed-GOP input: 60 pictures; select packet indexes 12 and 59 | From start | Verified IDR |
+| --- | ---: | ---: |
+| Decoder submissions | 60 | 13 |
+| Payload reads, excluding container indexing | 60 | 13 |
+| Payload bytes, including qualification probes | 61,067 | 14,137 |
+
+The open-GOP fixture requires all 60 packets. These are tested work/read counts,
+not latency or end-to-end embedding benchmarks. Overlapping windows reuse two
+of eight selections (six unique outputs), with CPU/Metal value comparisons,
+depth-one/two bounds, source teardown, late cancellation/retry, sink failures and
+allocation-failure campaigns. Portable planner tests execute on WASI; Linux
+compiles the planner, window reuse and CPU preparation without Apple dependencies.
+Native Linux decode and CUDA/NVDEC remain stage 4 work. Model-specific tokens,
+resident vision/backbone/pooling and retrieval parity still depend on PR #1014.
 
 ## Remaining module and API shape
 

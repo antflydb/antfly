@@ -47,8 +47,12 @@ sample description, `stsz`/`stz2`, `stco`/`co64`, `stsc`, `stts`, signed/unsigne
 `ctts`, `stss`, and leading empty edits followed by one rate-1 media edit. It
 rejects fragments, external data references, unsupported display geometry and
 edit arrangements, and resource-limit violations. `syncBefore` returns a
-container hint; the implemented Apple decoder conservatively starts at packet
-zero. Codec-aware random-access plans remain future work.
+container hint. `lib/video.decode_plan` now qualifies static-avc1 IDR samples
+before allowing nonzero starts, retains bounded probe leases, and groups selected
+pictures into decode runs. The Apple decoder keeps packet-zero decoding as its
+default/reference. Open-GOP recovery hints alone do not authorize seeking. See
+[the scheduling contract](../video/VIDEO.md#implemented-independent-scheduling);
+codec qualification belongs to video rather than the container reader.
 WebM **video** indexing, sequential unknown-length providers, and object-store
 adapters are not implemented. The range callback is the integration boundary.
 

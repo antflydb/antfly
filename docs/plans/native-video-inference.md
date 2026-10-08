@@ -1,7 +1,8 @@
 # Native video inference and EmbeddingGemma 2
 
-Status: phase 1 and the independent phase 2 decoder/preparation library delivered,
-2026-10-08. Phase 2 model/API integration and stages 3–4 remain pending; full video
+Status: phase 1, the independent phase 2 decoder/preparation library, and the
+independent phase 3 scheduling subset delivered, 2026-10-08. Phase 2 model/API
+integration, phase 3 resident model execution, and stage 4 remain pending; full video
 embedding is not yet available. Tim's open PR #1014 remains a separate dependency
 at the user's request. The initial design was written
 against `origin/main` commit `cdf572a7467d581f6f1b39bcf514878488555f11`;
@@ -207,8 +208,8 @@ existing MP4/WebM audio adapters, bounded immutable sources and packet leases,
 signed timeline mapping, a non-fragmented AVC MP4 index, and frame selection.
 Six synthetic MP4 fixtures pin FFprobe packet/timeline receipts; 77 sampling
 cases execute a hashed upstream method snapshot with NumPy 2.4.4. Runtime code
-has no FFmpeg or Python dependency. WebM video and generalized seek/decode plans
-remain later work.
+has no FFmpeg or Python dependency. WebM video and generalized codec dependency
+plans remain later work; static-avc1 IDR planning is delivered in stage 3.
 
 Exit validation: the original and migrated MP4 audio suites each pass 68 tests,
 and the original and migrated WebM suites each pass 16 tests. Root `test-media`
@@ -228,9 +229,10 @@ allocation failures. Linux and wasm builds exclude Apple dependencies, and the
 portable selection/host-preparation suites execute on WASI. See
 [VIDEO.md](../../zig/lib/video/VIDEO.md) for the implemented API and limits.
 
-The decoder starts from packet zero; random-access dependency optimization,
-full native-workspace accounting, generalized color/display policies and model
-preparation geometry parity require later qualification. Model/backend code from
+The decoder defaults to packet zero; optional verified-IDR dependency planning
+is delivered in the independent stage 3 subset below. Full native-workspace
+accounting, generalized color/display policies and model preparation geometry
+parity require later qualification. Model/backend code from
 Tim's current head `7a7b63f63da5e772309597ba2409a9ef50860a59` is not merged here.
 
 Remaining after that dependency is available: integrate video-specific ordered
@@ -243,15 +245,33 @@ HTTP/group parity, qualified source-format capabilities, and drain/retry tests.
 Do not claim an efficient route while it still round-trips full pixels or vision
 tokens through host memory.
 
-### 3. Metal resident vision and production scheduling
+### 3. Metal resident vision and production scheduling — scheduling subset delivered
 
-Complete the Metal implementation track above: reference-compatible preparation
-kernels, batched resident vision/projector execution, direct device-token backbone
-inputs, and device pooling/normalization. Qualify the software-decode → Metal
-route as well as VideoToolbox → Metal. Overlap decode/preparation/vision and bound
-all queues and reservations. Add long-video window reuse and measured
-dependency-aware seek selection. Establish a synchronized full-pipeline baseline
-against official pinned PyTorch MPS using equivalent sampling and dtype.
+Delivered independently of PR #1014: portable bounded static-avc1 decode plans
+that verify IDR payloads rather than trust sync hints; overlapping timestamp-window
+plans that reuse unique pictures; borrowed-frame streaming outside native
+callbacks; and a bounded decode-to-Metal preparation queue. Completed commands
+release source imports/intermediates while retaining output buffers. Results own
+window mappings/PTS/configuration identity, output buffers, metadata and work/
+queue counters. Cancellation and allocation/consumer failures drain/fence work.
+
+Qualification: a 60-picture closed-GOP range source selected at packet indexes
+12 and 59 uses 13 submissions/reads and 14,137 payload bytes, versus 60 and 61,067
+from the start, with exact pixel parity. Open-GOP recovery hints fall back to the
+initial IDR. Overlap reuse, depth-one/two bounds, CPU/Metal output comparisons,
+reader teardown, allocation failures and cancellation/retry are tested. Linux
+compiles the portable APIs; WASI executes portable planner/host tests. These
+counts establish reduced work, not end-to-end latency or retrieval parity.
+
+Still pending after the model dependency: qualify preparation geometry against
+the final processor, implement batched resident vision/projector execution,
+direct device-token backbone inputs, and device pooling/normalization. Qualify the software-decode → Metal
+route as well as VideoToolbox → Metal. Extend the delivered decode/preparation
+queue to overlap resident vision execution, with atomic admission across
+concurrent source/surface/model reservations and any persistent token cache.
+Tune seek-gap thresholds from measured backend/source latency. Establish a
+synchronized full-pipeline baseline against official pinned PyTorch MPS using
+equivalent sampling and dtype.
 
 Exit: retrieval parity plus demonstrated end-to-end benefit on short clips and
 long sparse/windowed inputs; no unbounded memory growth under concurrent load,

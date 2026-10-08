@@ -3,6 +3,7 @@
 const std = @import("std");
 const media = @import("antfly_media");
 const avc = @import("../avc.zig");
+const decode_plan = @import("../decode_plan.zig");
 const supported = @import("builtin").os.tag == .macos;
 extern fn av_decoder_create([*]const u8, usize, u32, u32, c_int, *const fn (*anyopaque, usize, i32, ?*anyopaque) callconv(.c) void, *anyopaque, *?*anyopaque) i32;
 extern fn av_decoder_submit(*anyopaque, [*]const u8, usize, usize, i64, i64, u32, u32) i32;
@@ -41,6 +42,10 @@ pub const Surface = struct {
     pub fn deinit(self: *Surface) void {
         if (supported) av_surface_release(self.handle);
         self.* = undefined;
+    }
+    pub fn storageBytes(self: *const Surface) u64 {
+        if (!supported) return 0;
+        return av_surface_storage_bytes(self.handle);
     }
     pub fn map(self: *const Surface) !Mapping {
         if (!supported) return error.UnsupportedVideoBackend;
@@ -87,6 +92,9 @@ pub const Batch = struct {
     frames: []Frame,
     hardware: bool,
     submitted_packets: usize,
+    skipped_packets: usize,
+    probe_bytes: usize,
+    peak_retained_surface_bytes: u64,
     display_matrix: [9]i32,
     pixel_aspect: @FieldType(media.mp4.Track, "pixel_aspect"),
     /// Owned copy: display metadata remains available after Reader.deinit().
@@ -108,14 +116,21 @@ pub const Options = struct {
     max_retained_surface_bytes: u64 = 128 * 1024 * 1024,
     max_decode_packets: usize = 500_000,
     max_packet_bytes: usize = 16 * 1024 * 1024,
+    seek_mode: decode_plan.Mode = .from_start,
+    max_probe_candidates: usize = 256,
+    max_probe_bytes: usize = 16 * 1024 * 1024,
+    max_search_steps: usize = 1_000_000,
+    merge_gap_packets: usize = 0,
 };
 const Capture = struct {
     reader: *const media.mp4.Reader,
     indexes: []const usize,
     slots: []?Frame,
+    seen: []bool,
     control: media.source.Control,
     failure: ?anyerror = null,
     retained: u64 = 0,
+    peak_retained: u64 = 0,
     max_retained: u64,
     /// Defensive even though temporal/asynchronous decode flags are disabled.
     mutex: std.atomic.Mutex = .unlocked,
@@ -138,7 +153,7 @@ const Capture = struct {
                 self.failure = error.MissingDecodedFrame;
                 return;
             }
-            if (self.slots[slot] != null) {
+            if (self.seen[slot]) {
                 self.failure = error.DuplicateDecodedFrame;
                 return;
             }
@@ -158,29 +173,58 @@ const Capture = struct {
                 return;
             }
             self.retained += bytes;
+            self.peak_retained = @max(self.peak_retained, self.retained);
+            self.seen[slot] = true;
             const packet = self.reader.packets[index];
             self.slots[slot] = .{ .decode_index = index, .pts = packet.pts, .duration = packet.duration, .timescale = self.reader.track.timescale, .surface = surface };
             return;
         }
     }
 };
-/// Decodes forward from the beginning, retaining only requested pictures. The
-/// returned order matches indexes (normally a presentation-order sampling plan).
-/// No speculative sync seeking: open GOP dependency qualification is later work.
-/// Each call owns its session; cancellation drains callbacks before freeing state.
+/// Sink receives a borrowed picture outside the native callback. Retain/import
+/// it during accept if it must outlive that call; cancellation/errors drain the
+/// native session before destroying callback state. Single-consumer.
+pub const Sink = struct {
+    context: *anyopaque,
+    accept: *const fn (*anyopaque, *const Frame) anyerror!void,
+};
+/// Returned order matches indexes. from_start remains the reference/default;
+/// verified_idr explicitly opts into conservative dependency-aware seeking.
 pub fn decodeSelected(allocator: std.mem.Allocator, reader: *media.mp4.Reader, indexes: []const usize, options: Options) !Batch {
+    return decode(allocator, reader, indexes, options, null);
+}
+/// Streams selected pictures into a consumer and returns owned decode metadata
+/// and counters in a Batch with no retained frames.
+pub fn decodeTo(allocator: std.mem.Allocator, reader: *media.mp4.Reader, indexes: []const usize, options: Options, sink: Sink) !Batch {
+    return decode(allocator, reader, indexes, options, sink);
+}
+fn flush(capture: *Capture, sink: ?Sink) !void {
+    if (capture.failure) |err| return err;
+    if (sink) |consumer| for (capture.slots) |*slot| {
+        if (slot.*) |*frame| {
+            try capture.control.check();
+            try consumer.accept(consumer.context, frame);
+            capture.retained -= av_surface_storage_bytes(frame.surface.handle);
+            frame.surface.deinit();
+            slot.* = null;
+        }
+    };
+}
+fn decode(allocator: std.mem.Allocator, reader: *media.mp4.Reader, indexes: []const usize, options: Options, sink: ?Sink) !Batch {
     if (!supported) return error.UnsupportedVideoBackend;
     try reader.input.control.check();
-    try avc.validateConfig(reader.track.avcc);
-    if (indexes.len == 0 or indexes.len > options.max_frames) return error.ResourceLimitExceeded;
     if (reader.track.timescale > std.math.maxInt(i32)) return error.UnsupportedTimeline;
-    var end: usize = 0;
-    for (indexes, 0..) |index, i| {
-        if (index >= reader.packets.len) return error.InvalidPacketIndex;
-        for (indexes[0..i]) |other| if (other == index) return error.DuplicateFrameSelection;
-        end = @max(end, index);
-    }
-    if (end >= options.max_decode_packets) return error.ResourceLimitExceeded;
+    var plan = try decode_plan.create(allocator, reader, indexes, .{
+        .mode = options.seek_mode,
+        .max_selections = options.max_frames,
+        .max_decode_packets = options.max_decode_packets,
+        .max_probe_candidates = options.max_probe_candidates,
+        .max_probe_bytes = options.max_probe_bytes,
+        .max_packet_bytes = options.max_packet_bytes,
+        .max_search_steps = options.max_search_steps,
+        .merge_gap_packets = options.merge_gap_packets,
+    });
+    defer plan.deinit();
     // Conservative bound includes native row alignment, all selected pictures,
     // and a fixed extra decoder pool (16 reference pictures + 8 outputs).
     const row = std.mem.alignForward(u64, @as(u64, reader.track.width) + 256, 256);
@@ -190,32 +234,47 @@ pub fn decodeSelected(allocator: std.mem.Allocator, reader: *media.mp4.Reader, i
     defer allocator.free(slots);
     @memset(slots, null);
     errdefer for (slots) |*slot| if (slot.*) |*f| f.surface.deinit();
-    var capture = Capture{ .reader = reader, .indexes = indexes, .slots = slots, .control = reader.input.control, .max_retained = options.max_retained_surface_bytes };
+    const seen = try allocator.alloc(bool, indexes.len);
+    defer allocator.free(seen);
+    @memset(seen, false);
+    var capture = Capture{ .reader = reader, .indexes = indexes, .slots = slots, .seen = seen, .control = reader.input.control, .max_retained = options.max_retained_surface_bytes };
     var handle: ?*anyopaque = null;
     if (av_decoder_create(reader.track.avcc.ptr, reader.track.avcc.len, reader.track.width, reader.track.height, @intFromBool(options.require_hardware), Capture.callback, &capture, &handle) != 0) return error.VideoDecoderUnavailable;
     // This defer runs before capture/slot cleanup on every failure path.
     defer av_decoder_destroy(handle.?);
-    for (0..end + 1) |index| {
-        try reader.input.control.check();
-        const packet = reader.packets[index];
-        if (packet.size > options.max_packet_bytes) return error.ResourceLimitExceeded;
-        var lease = try reader.readPacket(index);
-        defer lease.deinit();
-        try avc.validatePacket(lease.bytes, reader.track.nal_length_bytes);
-        if (av_decoder_submit(handle.?, lease.bytes.ptr, lease.bytes.len, index, packet.pts, packet.dts, packet.duration, reader.track.timescale) != 0) return error.VideoDecodeFailed;
-        if (capture.failure) |err| return err;
+    for (plan.runs) |run| {
+        for (run.first..run.last + 1) |index| {
+            try reader.input.control.check();
+            const packet = reader.packets[index];
+            if (packet.size > options.max_packet_bytes) return error.ResourceLimitExceeded;
+            var lease: ?media.source.Lease = null;
+            defer if (lease) |*owned| owned.deinit();
+            const bytes = plan.anchorBytes(index) orelse blk: {
+                lease = try reader.readPacket(index);
+                break :blk lease.?.bytes;
+            };
+            try avc.validatePacket(bytes, reader.track.nal_length_bytes);
+            if (index == run.first and index != 0 and !try avc.isIdr(bytes, reader.track.nal_length_bytes)) return error.UnverifiedDecodeStart;
+            if (av_decoder_submit(handle.?, bytes.ptr, bytes.len, index, packet.pts, packet.dts, packet.duration, reader.track.timescale) != 0) return error.VideoDecodeFailed;
+            try flush(&capture, sink);
+        }
+        // Fence before crossing a skipped dependency region. The next run starts
+        // at an IDR picture, which resets reference pictures in the same session.
+        if (av_decoder_drain(handle.?) != 0) return error.VideoDecodeFailed;
+        try flush(&capture, sink);
     }
-    if (av_decoder_drain(handle.?) != 0) return error.VideoDecodeFailed;
     const hardware = av_decoder_hardware(handle.?) != 0;
     if (options.require_hardware and !hardware) return error.HardwareVideoDecoderRequired;
     if (capture.failure) |err| return err;
     try reader.input.control.check();
-    for (slots) |slot| if (slot == null) return error.MissingDecodedFrame;
+    for (seen) |received| if (!received) return error.MissingDecodedFrame;
     const color_info = try allocator.dupe(u8, reader.track.color_info);
     errdefer allocator.free(color_info);
-    const frames = try allocator.alloc(Frame, indexes.len);
-    for (frames, slots) |*frame, slot| frame.* = slot.?;
-    return .{ .allocator = allocator, .frames = frames, .hardware = hardware, .submitted_packets = end + 1, .display_matrix = reader.track.display_matrix, .pixel_aspect = reader.track.pixel_aspect, .color_info = color_info };
+    const frames = try allocator.alloc(Frame, if (sink != null) 0 else indexes.len);
+    if (sink == null) for (frames, slots) |*frame, slot| {
+        frame.* = slot.?;
+    };
+    return .{ .allocator = allocator, .frames = frames, .hardware = hardware, .submitted_packets = plan.submitted_packets, .skipped_packets = plan.skipped_packets, .probe_bytes = plan.probe_bytes, .peak_retained_surface_bytes = capture.peak_retained, .display_matrix = reader.track.display_matrix, .pixel_aspect = reader.track.pixel_aspect, .color_info = color_info };
 }
 /// Device is a borrowed id<MTLDevice> from the consuming inference backend. The
 /// cache owns no model runtime and does not silently pick a different GPU.

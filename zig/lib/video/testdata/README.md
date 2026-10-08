@@ -40,3 +40,21 @@ CPU/Metal comparisons use explicit SDR color/chroma conventions and shared
 quantized bicubic coefficients. They qualify that preparation contract; model
 geometry, official decoder color conversion, vision tokens, and embeddings still
 need end-to-end processor/model qualification after PR #1014 is integrated.
+
+## Scheduling fixtures
+
+`schedule-closed.mp4` and `schedule-open.mp4` are original Apache-2.0 testsrc2
+clips: 60 pictures at 10 FPS, fixed GOP 10, and two B pictures. Closed GOPs carry
+IDR starts; open GOPs advertise non-IDR recovery pictures that require prior
+dependencies. `scheduling-oracle.json` records hashes, tool versions and FFprobe
+packet clocks/positions/flags. Tests compare optimized native output exactly
+against decode-from-start and verify actual range read/submission counts.
+
+```sh
+python3 zig/lib/video/scripts/generate_scheduling_fixtures.py
+```
+
+For packet indexes 12 and 59 the closed-GOP fixture reads/submits 13 packets
+(14,137 payload bytes) instead of 60 (61,067 bytes); the open-GOP fixture falls
+back to the initial IDR. Container indexing is excluded from these counters.
+No GPU latency or embedding speedup is inferred from packet savings.

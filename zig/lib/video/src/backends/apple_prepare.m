@@ -20,6 +20,7 @@
 @property(nonatomic, strong) id<MTLCommandBuffer> command;
 @property(nonatomic, strong) id<MTLBuffer> output;
 @property(nonatomic) void *imported;
+@property(nonatomic) BOOL completed;
 @end
 @implementation AVPrepared
 - (void)dealloc { if (_command.status >= MTLCommandBufferStatusCommitted) [_command waitUntilCompleted]; av_metal_import_release(_imported); }
@@ -79,8 +80,18 @@ int32_t av_prepare_submit(void *handle, void *surface, const uint32_t *params,
     }
 }
 int av_prepared_poll(void *p) {
-    MTLCommandBufferStatus status = ((__bridge AVPrepared *)p).command.status;
+    AVPrepared *result = (__bridge AVPrepared *)p;
+    if (result.completed) return 1;
+    MTLCommandBufferStatus status = result.command.status;
     return status == MTLCommandBufferStatusCompleted ? 1 : status == MTLCommandBufferStatusError ? -1 : 0;
+}
+int av_prepared_release_source(void *p) {
+    if (av_prepared_poll(p) != 1) return -1;
+    AVPrepared *result = (__bridge AVPrepared *)p;
+    result.completed = YES;
+    av_metal_import_release(result.imported); result.imported = NULL;
+    result.command = nil;
+    return 0;
 }
 void *av_prepared_buffer(void *p) { return (__bridge void *)((__bridge AVPrepared *)p).output; }
 int32_t av_prepared_copy(void *p, float *out, size_t count) {

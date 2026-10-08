@@ -11,6 +11,7 @@ extern fn av_prepare_submit(*anyopaque, *anyopaque, [*]const u32, [*]const u32, 
 extern fn av_prepared_poll(*anyopaque) c_int;
 extern fn av_prepared_buffer(*anyopaque) *anyopaque;
 extern fn av_prepared_copy(*anyopaque, [*]f32, usize) i32;
+extern fn av_prepared_release_source(*anyopaque) c_int;
 extern fn av_prepared_destroy(*anyopaque) void;
 
 pub const Rotation = enum(u32) { none, clockwise90, half_turn, clockwise270 };
@@ -37,7 +38,7 @@ pub const Geometry = struct {
         return self.patches * 768;
     }
 };
-fn geometry(source_width: u32, source_height_u32: u32, options: Options) !Geometry {
+pub fn geometry(source_width: u32, source_height_u32: u32, options: Options) !Geometry {
     if (source_width == 0 or source_height_u32 == 0 or options.width == 0 or options.height == 0) return error.InvalidVideoGeometry;
     // Match the qualified texture/display bounds even when caller budgets grow.
     if (source_width > 16_384 or source_height_u32 > 16_384 or options.width > 16_384 or options.height > 16_384) return error.ResourceLimitExceeded;
@@ -218,6 +219,12 @@ pub const Prepared = struct {
                 else => try std.Io.sleep(io, .fromMilliseconds(1), .awake),
             }
         }
+    }
+    /// After completion, discard the input import/command/intermediates while
+    /// retaining the output buffer. Idempotent; wait before calling.
+    pub fn releaseSource(self: *Prepared) !void {
+        if (!supported) return error.UnsupportedVideoBackend;
+        if (av_prepared_release_source(self.handle) != 0) return error.MetalPreparationNotReady;
     }
     /// Borrowed id<MTLBuffer>; wait before consuming on another queue. For a
     /// resident inference consumer this is the handoff, not a host tensor copy.

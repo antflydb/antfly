@@ -109,3 +109,22 @@ test "AVC rejects malformed lengths and in-band parameter changes before decode"
     try std.testing.expectError(error.MalformedVideoConfig, validateConfig(&.{ 1, 100, 0 }));
     try std.testing.expectError(error.UnsupportedVideoProfile, validateConfig(&.{ 1, 110, 0, 0, 0, 0, 0 }));
 }
+
+/// An IDR picture resets prior reference dependencies. Ordinary I pictures,
+/// recovery-point SEI and container sync flags alone do not establish that.
+/// Full slice syntax is still validated by the actual decoder.
+pub fn isIdr(bytes: []const u8, length_bytes: u3) !bool {
+    try validatePacket(bytes, length_bytes);
+    var cursor: usize = 0;
+    var has_idr = false;
+    while (cursor < bytes.len) {
+        var size: usize = 0;
+        for (bytes[cursor..][0..length_bytes]) |byte| size = (size << 8) | byte;
+        cursor += length_bytes;
+        const kind = bytes[cursor] & 31;
+        if (kind >= 1 and kind <= 4) return false;
+        if (kind == 5) has_idr = true;
+        cursor += size;
+    }
+    return has_idr;
+}
