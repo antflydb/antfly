@@ -5707,7 +5707,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     integration_test_step.dependOn(&run_graph_metric_integration_tests.step);
     const graph_metric_default_tests = b.addTest(.{
         .root_module = db_test_mod,
-        .filters = &.{"db graph metric runtime background default "},
+        .filters = &.{ "db graph metric runtime background default ", "db graph runtime replicated split fences topology before receipt and retires it after" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     const graph_metric_default_http_tests = b.addTest(.{
