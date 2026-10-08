@@ -20541,11 +20541,22 @@ pub const ApiHttpServer = struct {
         return .{ .revision = resolver.revision orelse 0, .tables = tables };
     }
 
+    fn isForeignQueryPrimary(logical: []const u8, foreign_sources: anytype) bool {
+        const target = system_catalog.Target.parse(logical) catch return false;
+        return target.isDefault() and foreign_sources.contains(target.table) and !std.mem.startsWith(u8, logical, system_catalog.target_key_prefix);
+    }
+
+    pub const BoundQueryDispatch = struct {
+        primary_foreign: bool,
+        context: api_operation.RequestContext,
+    };
+
     const BoundCatalogQuery = struct {
         arena: std.heap.ArenaAllocator,
         physical: []const u8,
         label: []const u8,
         join: ?distributed_join.ParsedSupportedJoinRequest,
+        dispatch: BoundQueryDispatch,
         revision: ?u64 = null,
 
         pub fn deinit(self: *@This()) void {
@@ -20562,7 +20573,7 @@ pub const ApiHttpServer = struct {
         const primary_key = try target.resourceNameAlloc(a);
         const parsed_request = try parsePublicTableQueryBody(a, body);
         const foreign_sources = if (join) |value| value.foreign_sources else try foreign_sources_api.postgresSourceMapFromMetadataOpenApiResolvedWithSecrets(a, parsed_request.value.foreign_sources, self.cfg.secret_store);
-        const primary_foreign = target.isDefault() and foreign_sources.contains(target.table) and !std.mem.startsWith(u8, logical, system_catalog.target_key_prefix);
+        const primary_foreign = isForeignQueryPrimary(logical, foreign_sources);
         if (identity.*) |value| {
             if (!permissionsAllow(value.permissions, .table, primary_key, .read)) return error.Forbidden;
             if (join) |*value_join| try applyAuthenticatedIdentityToJoinRequest(a, value, &value_join.join);
@@ -20570,7 +20581,7 @@ pub const ApiHttpServer = struct {
         const label = try target.displayNameAlloc(a);
         if (self.source.vtable.system_catalog == null) {
             const owned_result_physical = try a.dupe(u8, logical);
-            return .{ .arena = arena, .physical = owned_result_physical, .label = label, .join = join };
+            return .{ .arena = arena, .physical = owned_result_physical, .label = label, .join = join, .dispatch = .{ .primary_foreign = primary_foreign, .context = context } };
         }
         // Primary and every native RHS resolve under the same metadata read
         // transaction. Keep this owned binding for all execution retries.
@@ -20588,12 +20599,25 @@ pub const ApiHttpServer = struct {
         }
         if (targets.items.len == 0) {
             const owned_result_physical = try a.dupe(u8, logical);
-            return .{ .arena = arena, .physical = owned_result_physical, .label = label, .join = join };
+            return .{ .arena = arena, .physical = owned_result_physical, .label = label, .join = join, .dispatch = .{ .primary_foreign = primary_foreign, .context = context } };
         }
         var local_resolver = CatalogQueryResolver{ .arena = a };
         const result = try self.resolveQueryCatalog(shared_resolver orelse &local_resolver, context, targets.items, true);
         if (result.tables.len != targets.items.len) return error.InvalidCatalogRecord;
         for (result.tables) |table| if (table == null) return error.TableNotFound;
+        // Validate all native participants before dispatch, including nested
+        // RHS tables and empty-left joins. External lake sources remain native.
+        if (join != null and self.source.vtable.supports_object_tables) {
+            for (result.tables) |resolved| {
+                if (self.source.vtable.supports_query_definitions and resolved.?.query_definition == null) return error.InvalidCatalogRecord;
+                const resolver = shared_resolver orelse &local_resolver;
+                const definition = (try self.queryTableDefinition(resolver.arena, resolver, resolved.?.name, context)) orelse continue;
+                if (definition.storage.engine != .object) continue;
+                var schema = try schema_mod.parseValidatedTableSchema(a, definition.schema_json);
+                defer schema.deinit(a);
+                if (schema.external_base_source == null) return error.ObjectTableJoinUnsupported;
+            }
+        }
         const offset: usize = if (primary_foreign) 0 else 1;
         const physical = if (primary_foreign) try a.dupe(u8, logical) else result.tables[0].?.name;
         if (!primary_foreign) if (identity.*) |*value| try projectCatalogIdentity(self.alloc, value, primary_key, physical);
@@ -20601,7 +20625,7 @@ pub const ApiHttpServer = struct {
             reference.right_label = try rhs.displayNameAlloc(a);
             reference.right_table = @constCast(table.?.name);
         }
-        return .{ .arena = arena, .physical = physical, .label = label, .join = join, .revision = result.revision };
+        return .{ .arena = arena, .physical = physical, .label = label, .join = join, .dispatch = .{ .primary_foreign = primary_foreign, .context = context }, .revision = result.revision };
     }
 
     /// Select borrowed physical records before collecting per-table status or
@@ -21303,7 +21327,7 @@ pub const ApiHttpServer = struct {
         var binding = self.bindCatalogQuery(self.alloc, .{ .deadline_ns = deadline, .cancellation = if (cancellation) |value| value.token() else .none }, table_name, body, &identity, &resolver) catch |err| return self.publicQueryOperationErrorResponse(table_name, body, err);
         defer binding.deinit();
         if (bridge) |*value| value.table_name = binding.physical;
-        return self.handleAdmittedResolvedTableQueryWithContentTypeCancellation(binding.physical, body, content_type, identity, cancellation, binding.label, if (binding.join) |*value| value else null, &resolver);
+        return self.handleAdmittedResolvedTableQueryWithContentTypeCancellation(binding.physical, body, content_type, identity, cancellation, binding.label, if (binding.join) |*value| value else null, &resolver, binding.dispatch);
     }
 
     /// The native catalog is the authority for existence and incarnation. This
@@ -21325,6 +21349,7 @@ pub const ApiHttpServer = struct {
 
     fn tryObjectTableRequestWithOptions(self: *ApiHttpServer, table_name: []const u8, method: @import("../serverless/api/http_routes.zig").HttpMethod, suffix: []const u8, body: []const u8, identity: ?AuthenticatedIdentity, context: api_operation.RequestContext, options: ObjectTableRequestOptions) !?contextual_operations.OwnedResponse {
         if (!self.source.vtable.supports_object_tables) return null;
+        try context.ensureActive();
         // Select the engine from a request-owned, targeted definition. Native
         // requests never clone the full catalog merely to choose a data path.
         var arena = std.heap.ArenaAllocator.init(self.alloc);
@@ -21356,6 +21381,7 @@ pub const ApiHttpServer = struct {
             if (stamp.table_id != table.table_id) return error.RowPolicyCatalogChanged;
             if ((try stamp.servingAuthority()) != null) return try contextual_operations.textAlloc(self.alloc, 409, "object document tables do not support native row policies");
         }
+        try context.ensureActive();
         var bound = table.*;
         if (std.mem.allEqual(u8, &bound.object_storage_identity, 0)) {
             var store = @import("lake_index_store.zig").Store.openNative(self.alloc, self.cfg.node_config, self.cfg.secret_store, false, self.cfg.deployment_mode, self.cfg.native_lake_artifact_base_dir) catch |err| switch (err) {
@@ -21364,6 +21390,7 @@ pub const ApiHttpServer = struct {
             };
             defer store.deinit();
             bound.object_storage_identity = try @import("object_table_runtime.zig").storeIdentity(self.alloc, &store);
+            try context.ensureActive();
             _ = try self.source.replaceTableDefinitionStamped(table.*, bound);
             // Never treat ambiguous admission as a successful binding.
             var admitted = (try self.source.linearizableSnapshot(context)) orelse return error.ReadUnavailable;
@@ -21376,7 +21403,9 @@ pub const ApiHttpServer = struct {
             .secrets = self.cfg.secret_store,
             .deployment = self.cfg.deployment_mode,
             .local_base_dir = self.cfg.native_lake_artifact_base_dir,
-        }, method, suffix, body, context.cancellation) catch |err| switch (err) {
+            .graph_execution_limits = self.cfg.graph_execution_limits,
+            .remote_content = self.cfg.remote_content,
+        }, method, suffix, body, context) catch |err| switch (err) {
             error.ObjectTableStorageBindingChanged => return try contextual_operations.textAlloc(self.alloc, 409, "object table storage binding differs from its durable catalog binding"),
             error.ObjectTableDefinitionConflict => return try contextual_operations.textAlloc(self.alloc, 409, "object table definition is immutable; use a new table and explicit migration"),
             error.ObjectTableRuntimeCapacityExceeded => return try contextual_operations.textAlloc(self.alloc, 503, "object table runtime capacity exhausted"),
@@ -21407,16 +21436,28 @@ pub const ApiHttpServer = struct {
         response_label: ?[]const u8,
         bound_join: ?*const distributed_join.ParsedSupportedJoinRequest,
         catalog_resolver: ?*CatalogQueryResolver,
+        bound_dispatch: ?BoundQueryDispatch,
     ) !contextual_operations.OwnedResponse {
         if (isNdjsonContentType(content_type)) {
             return try self.handlePublicTableMultiQueryWithCancellation(table_name, body, authenticated_identity, cancellation, response_label, bound_join);
         }
-        if (try self.tryObjectTableQuery(table_name, body, authenticated_identity, cancellation, response_label, bound_join, catalog_resolver)) |response| return response;
+        if (self.tryObjectTableQuery(table_name, body, authenticated_identity, cancellation, response_label, bound_join, catalog_resolver, bound_dispatch) catch |err| return self.publicQueryOperationErrorResponse(table_name, body, err)) |response| return response;
         return try self.handlePublicTableQueryWithCancellation(table_name, body, authenticated_identity, cancellation, response_label, bound_join, catalog_resolver);
     }
 
-    fn tryObjectTableQuery(self: *ApiHttpServer, table_name: []const u8, body: []const u8, authenticated_identity: ?AuthenticatedIdentity, cancellation: ?*const http_common.RequestCancellation, response_label: ?[]const u8, bound_join: ?*const distributed_join.ParsedSupportedJoinRequest, catalog_resolver: ?*CatalogQueryResolver) !?contextual_operations.OwnedResponse {
-        if (try self.tryObjectTableRequestWithOptions(table_name, .post, "query", body, authenticated_identity, .{ .deadline_ns = try query_contract.queryExecutionDeadlineNsFromBody(self.alloc, body), .cancellation = if (cancellation) |value| value.token() else .none }, .{ .has_join = bound_join != null, .resolver = catalog_resolver })) |response| {
+    fn tryObjectTableQuery(self: *ApiHttpServer, table_name: []const u8, body: []const u8, authenticated_identity: ?AuthenticatedIdentity, cancellation: ?*const http_common.RequestCancellation, response_label: ?[]const u8, bound_join: ?*const distributed_join.ParsedSupportedJoinRequest, catalog_resolver: ?*CatalogQueryResolver, bound_dispatch: ?BoundQueryDispatch) !?contextual_operations.OwnedResponse {
+        if (bound_dispatch) |binding| if (binding.primary_foreign) return null;
+        // Foreign aliases are request bindings, not native catalog tables.
+        // Reuse the binding predicate for direct, NDJSON and global dispatch.
+        if (bound_dispatch == null) {
+            var foreign_arena = std.heap.ArenaAllocator.init(self.alloc);
+            defer foreign_arena.deinit();
+            const parsed_request = try parsePublicTableQueryBody(foreign_arena.allocator(), body);
+            const foreign_sources = try foreign_sources_api.postgresSourceMapFromMetadataOpenApiResolvedWithSecrets(foreign_arena.allocator(), parsed_request.value.foreign_sources, self.cfg.secret_store);
+            if (isForeignQueryPrimary(table_name, foreign_sources)) return null;
+        }
+        const request_context = if (bound_dispatch) |binding| binding.context else api_operation.RequestContext{ .deadline_ns = try query_contract.queryExecutionDeadlineNsFromBody(self.alloc, body), .cancellation = if (cancellation) |value| value.token() else .none };
+        if (try self.tryObjectTableRequestWithOptions(table_name, .post, "query", body, authenticated_identity, request_context, .{ .has_join = bound_join != null, .resolver = catalog_resolver })) |response| {
             var owned = response;
             errdefer owned.deinit(self.alloc);
             if (owned.status == 200) {
@@ -21427,6 +21468,7 @@ pub const ApiHttpServer = struct {
                 const relabeled = try std.json.Stringify.valueAlloc(self.alloc, parsed.value, .{});
                 self.alloc.free(owned.body);
                 owned.body = relabeled;
+                try request_context.ensureActive();
             }
             return owned;
         }
@@ -21477,6 +21519,7 @@ pub const ApiHttpServer = struct {
         err: anyerror,
     ) !contextual_operations.OwnedResponse {
         return switch (err) {
+            error.ObjectTableJoinUnsupported => try contextual_operations.textAlloc(self.alloc, 400, "object table joins are not supported"),
             error.Forbidden => try contextual_operations.jsonErrorAlloc(self.alloc, 403, "forbidden"),
             error.CatalogGenerationChanged => try contextual_operations.jsonErrorAlloc(self.alloc, 409, "catalog changed during query binding"),
             error.InvalidCatalogName => try contextual_operations.jsonErrorAlloc(self.alloc, 400, "invalid table target"),
@@ -21738,7 +21781,7 @@ pub const ApiHttpServer = struct {
 
             const line_label = response_label orelse binding.label;
             const line_join = if (binding.join) |*value| value else bound_join;
-            var query_response: query_api.QueryResponse = if (try self.tryObjectTableQuery(table_name, line, line_identity, cancellation, line_label, line_join, &catalog_resolver)) |value| object: {
+            var query_response: query_api.QueryResponse = if (self.tryObjectTableQuery(table_name, line, line_identity, cancellation, line_label, line_join, &catalog_resolver, binding.dispatch) catch |err| return self.publicQueryOperationErrorResponse(table_name, line, err)) |value| object: {
                 var response = value;
                 if (response.status != 200) return response;
                 defer response.deinit(self.alloc);
@@ -55986,6 +56029,9 @@ test "api http server executes direct foreign table query through registry" {
     try registry.register(alloc, .postgres, DummyForeign.factory);
 
     const DummyStatus = struct {
+        fn catalog(_: *anyopaque, _: std.mem.Allocator, _: api_operation.RequestContext, _: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            return error.UnexpectedNativeCatalogRead;
+        }
         fn status(_: *anyopaque) !metadata_api.MetadataStatus {
             return .{ .metadata_group_id = 1, .metrics = .{} };
         }
@@ -55993,7 +56039,7 @@ test "api http server executes direct foreign table query through registry" {
 
     var server = ApiHttpServer.init(alloc, .{}, .{
         .ptr = undefined,
-        .vtable = &.{ .status = DummyStatus.status },
+        .vtable = &.{ .status = DummyStatus.status, .supports_object_tables = true, .supports_query_definitions = true, .system_catalog = DummyStatus.catalog },
     }, null, null);
     defer server.deinit();
     server.setForeignRegistry(&registry);
@@ -56001,6 +56047,8 @@ test "api http server executes direct foreign table query through registry" {
         .ptr = undefined,
         .vtable = undefined,
     };
+
+    server.table_reads = dummy_source;
 
     const body =
         \\{"fields":["name"],"limit":1,"offset":2,"order_by":[{"field":"name"}],"filter_query":{"term":"active","field":"status"},"foreign_sources":{"pg_customers":{"type":"postgres","dsn":"${secret:pg_dsn}","postgres_table":"customers","columns":[{"name":"status","type":"text"}]}}}
@@ -56027,6 +56075,20 @@ test "api http server executes direct foreign table query through registry" {
     try std.testing.expectEqualStrings("postgres://resolved", DummyForeign.last_dsn.?);
     try std.testing.expect(DummyForeign.saw_no_deadline);
     try std.testing.expect(DummyForeign.saw_cancellation);
+
+    // Exercise the public binding and object engine selector, not just the
+    // foreign executor. No native definition may be read for this alias.
+    for ([_]?[]const u8{ null, "application/x-ndjson" }) |content_type| {
+        var public = try server.handlePublicTableQueryWithContentType("pg_customers", body, content_type, null);
+        defer public.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 200), public.status);
+        try std.testing.expect(std.mem.indexOf(u8, public.body, "Alice") != null);
+    }
+    const global_body = try std.fmt.allocPrint(alloc, "{{\"table\":\"pg_customers\",{s}", .{body[1..]});
+    defer alloc.free(global_body);
+    var public_multi = try server.handlePublicGlobalMultiQuery(global_body, null);
+    defer public_multi.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), public_multi.status);
 
     DummyForeign.cancel_when_observed = true;
     defer DummyForeign.cancel_when_observed = false;

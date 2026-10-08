@@ -280,14 +280,17 @@ test "lake SQL object table document WAL publishes through native hosting withou
     {
         var manager: object.Manager = .{};
         defer manager.deinit(a);
-        var write = try manager.handle(a, std.testing.io, table, options, .post, "batch", "{\"inserts\":{\"doc:a\":{\"body\":\"alpha\"}},\"sync_level\":\"full_index\"}", .none);
+        // Deadline expiry prevents cold runtime creation and any WAL effect.
+        try std.testing.expectError(error.DeadlineExceeded, manager.handle(a, std.testing.io, table, options, .post, "batch", "{}", .{ .deadline_ns = 0 }));
+        try std.testing.expectEqual(@as(usize, 0), manager.entries.count());
+        var write = try manager.handle(a, std.testing.io, table, options, .post, "batch", "{\"inserts\":{\"doc:a\":{\"body\":\"alpha\"}},\"sync_level\":\"full_index\"}", .{});
         defer write.deinit(a);
         try std.testing.expectEqual(@as(u16, 201), write.status);
-        var lookup = try manager.handle(a, std.testing.io, table, options, .get, "lookup", "doc:a", .none);
+        var lookup = try manager.handle(a, std.testing.io, table, options, .get, "lookup", "doc:a", .{});
         defer lookup.deinit(a);
         try std.testing.expectEqual(@as(u16, 200), lookup.status);
         try std.testing.expect(std.mem.indexOf(u8, lookup.body, "alpha") != null);
-        var query = try manager.handle(a, std.testing.io, table, options, .post, "query", "{\"full_text_search\":{\"query\":\"body:alpha\"}}", .none);
+        var query = try manager.handle(a, std.testing.io, table, options, .post, "query", "{\"full_text_search\":{\"query\":\"body:alpha\"}}", .{});
         defer query.deinit(a);
         try std.testing.expectEqual(@as(u16, 200), query.status);
         try std.testing.expect(std.mem.indexOf(u8, query.body, "doc:a") != null);
@@ -295,13 +298,13 @@ test "lake SQL object table document WAL publishes through native hosting withou
     {
         var reopened: object.Manager = .{};
         defer reopened.deinit(a);
-        var query = try reopened.handle(a, std.testing.io, table, options, .post, "query", "{\"full_text_search\":{\"query\":\"body:alpha\"}}", .none);
+        var query = try reopened.handle(a, std.testing.io, table, options, .post, "query", "{\"full_text_search\":{\"query\":\"body:alpha\"}}", .{});
         defer query.deinit(a);
         try std.testing.expectEqual(@as(u16, 200), query.status);
         try std.testing.expect(std.mem.indexOf(u8, query.body, "doc:a") != null);
         var recreated = table;
         recreated.object_storage_generation += 1;
-        var empty = try reopened.handle(a, std.testing.io, recreated, options, .get, "query", "", .none);
+        var empty = try reopened.handle(a, std.testing.io, recreated, options, .get, "query", "", .{});
         defer empty.deinit(a);
         try std.testing.expect(std.mem.indexOf(u8, empty.body, "doc:a") == null);
     }
@@ -353,7 +356,7 @@ test "lake SQL object table native API binds storage and fails closed on policy 
             const self: *@This() = @ptrCast(@alignCast(raw));
             try std.testing.expectEqualStrings("local_docs", name);
             self.local_queries += 1;
-            return .{ .json = try alloc.dupe(u8, "{\"responses\":[{\"table\":\"local_docs\",\"hits\":[]}]}") };
+            return .{ .json = try alloc.dupe(u8, "{\"responses\":[{\"table\":\"local_docs\",\"hits\":{\"hits\":[]}}]}") };
         }
         fn snapshot(raw: *anyopaque) !metadata_api.AdminSnapshot {
             const self: *@This() = @ptrCast(@alignCast(raw));
@@ -381,6 +384,7 @@ test "lake SQL object table native API binds storage and fails closed on policy 
             return switch (input) {
                 .query_definition => |name| blk: {
                     self.definition_reads += 1;
+                    if (!std.mem.eql(u8, name, "local_docs") and !std.mem.eql(u8, name, "docs")) break :blk alloc.dupe(u8, "null");
                     break :blk std.json.Stringify.valueAlloc(alloc, domain.QueryDefinition.fromTable(if (std.mem.eql(u8, name, "local_docs")) local_table else self.table[0]), .{});
                 },
                 .resolve => std.json.Stringify.valueAlloc(alloc, domain.ResolvedTable.fromTable(self.table[0]), .{}),
@@ -404,17 +408,41 @@ test "lake SQL object table native API binds storage and fails closed on policy 
     var backend = try @import("antfly_local_sources").storage_background_runtime.BackendRuntimeHandle.init(a, .{});
     defer backend.deinit();
     var source: Source = .{};
-    var server = server_mod.ApiHttpServer.init(a, .{ .backend_runtime = backend.ptr(), .deployment_mode = .standalone, .native_lake_artifact_base_dir = directory.path() }, .{ .ptr = &source, .vtable = &.{ .status = undefined, .supports_object_tables = true, .supports_query_definitions = true, .admin_snapshot = Source.forbiddenSnapshot, .linearizable_snapshot = Source.authoritative, .free_admin_snapshot = Source.free, .replace_table_definition = Source.replace, .system_catalog = Source.catalog } }, .{ .ptr = &source, .vtable = &.{ .lookup = undefined, .scan = undefined, .query = Source.localQuery } }, null);
+    var server = server_mod.ApiHttpServer.init(a, .{ .backend_runtime = backend.ptr(), .deployment_mode = .standalone, .native_lake_artifact_base_dir = directory.path(), .graph_execution_limits = .{ .max_explored_nodes = 1 } }, .{ .ptr = &source, .vtable = &.{ .status = undefined, .supports_object_tables = true, .supports_query_definitions = true, .admin_snapshot = Source.forbiddenSnapshot, .linearizable_snapshot = Source.authoritative, .free_admin_snapshot = Source.free, .replace_table_definition = Source.replace, .system_catalog = Source.catalog } }, .{ .ptr = &source, .vtable = &.{ .lookup = undefined, .scan = undefined, .query = Source.localQuery } }, null);
     defer server.deinit();
     var write = (try server.tryObjectTableRequest("docs", .post, "batch", "{\"inserts\":{\"a\":{\"body\":\"alpha\"}},\"sync_level\":\"full_index\"}", null, .{})).?;
     defer write.deinit(a);
     try std.testing.expectEqual(@as(u16, 201), write.status);
     try std.testing.expectEqual(@as(usize, 1), source.bindings);
     try std.testing.expect(!std.mem.allEqual(u8, &source.table[0].object_storage_identity, 0));
-    var query = try server.handleAdmittedResolvedTableQueryWithContentTypeCancellation("docs", "{\"full_text_search\":{\"query\":\"body:alpha\"}}", null, null, null, "public.docs", null, null);
+    var query = try server.handleAdmittedResolvedTableQueryWithContentTypeCancellation("docs", "{\"full_text_search\":{\"query\":\"body:alpha\"}}", null, null, null, "public.docs", null, null, null);
     defer query.deinit(a);
     try std.testing.expectEqual(@as(u16, 200), query.status);
     try std.testing.expect(std.mem.indexOf(u8, query.body, "public.docs") != null);
+    try std.testing.expectEqual(@as(u64, 1), server.object_tables.entries.get(.{ 7, 3 }).?.stack.handler.graph_execution_limits.max_explored_nodes);
+    // Both primary and every nested native RHS are rejected before native
+    // execution, even when the local left side would return no hits.
+    const queries_before_join = source.local_queries;
+    for ([_][]const u8{
+        "{\"full_text_search\":{\"match_all\":{}},\"join\":{\"right_table\":\"docs\",\"on\":{\"left_field\":\"body\",\"right_field\":\"body\"}}}",
+        "{\"full_text_search\":{\"match_all\":{}},\"join\":{\"right_table\":\"local_docs\",\"on\":{\"left_field\":\"body\",\"right_field\":\"body\"},\"nested_join\":{\"right_table\":\"docs\",\"on\":{\"left_field\":\"body\",\"right_field\":\"body\"}}}}",
+    }) |join_body| {
+        for ([_]?[]const u8{ null, "application/x-ndjson" }) |content_type| {
+            var rejected = try server.handlePublicTableQueryWithContentType("local_docs", join_body, content_type, null);
+            defer rejected.deinit(a);
+            try std.testing.expectEqual(@as(u16, 400), rejected.status);
+            try std.testing.expect(std.mem.indexOf(u8, rejected.body, "object table joins") != null);
+        }
+        const global_join = try std.fmt.allocPrint(a, "{{\"table\":\"local_docs\",{s}", .{join_body[1..]});
+        defer a.free(global_join);
+        var rejected_multi = try server.handlePublicGlobalMultiQuery(global_join, null);
+        defer rejected_multi.deinit(a);
+        try std.testing.expectEqual(@as(u16, 400), rejected_multi.status);
+    }
+    try std.testing.expectEqual(queries_before_join, source.local_queries);
+    var expired_query = try server.handleAdmittedResolvedTableQueryWithContentTypeCancellation("docs", "{\"full_text_search\":{\"match_all\":{}}}", null, null, null, null, null, null, .{ .primary_foreign = false, .context = .{ .deadline_ns = 0 } });
+    defer expired_query.deinit(a);
+    try std.testing.expectEqual(@as(u16, 504), expired_query.status);
     const definitions_before = source.definition_reads;
     for ([_]?[]const u8{ null, "application/x-ndjson" }) |content_type| {
         var routed = try server.handlePublicTableQueryWithContentType("docs", "{\"full_text_search\":{\"query\":\"body:alpha\"}}", content_type, null);

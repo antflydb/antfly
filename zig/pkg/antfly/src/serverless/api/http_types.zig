@@ -19,6 +19,24 @@ const http_routes = @import("http_routes.zig");
 
 const Allocator = std.mem.Allocator;
 
+/// Request-scoped cancellation bridge for engines accepting cancellation
+/// tokens. The context owns the clock semantics; callbacks are never retained.
+pub const RequestGuard = struct {
+    context: @import("antfly_local_sources").api_operation.RequestContext,
+    pub fn token(self: *const @This()) cancellation_mod.CancellationToken {
+        return .{ .ptr = self, .is_cancelled_fn = isCancelled, .check_fn = check };
+    }
+    fn check(ptr: *const anyopaque) !void {
+        const self: *const @This() = @ptrCast(@alignCast(ptr));
+        return self.context.ensureActive();
+    }
+    fn isCancelled(ptr: *const anyopaque) bool {
+        const self: *const @This() = @ptrCast(@alignCast(ptr));
+        self.context.ensureActive() catch return true;
+        return false;
+    }
+};
+
 pub const HttpRequest = struct {
     method: http_routes.HttpMethod,
     path: []const u8,
@@ -27,8 +45,13 @@ pub const HttpRequest = struct {
     /// Application work must not retain this callback beyond the request.
     cancellation: cancellation_mod.CancellationToken = .none,
 
+    deadline_ns: ?u64 = null,
+    deadline_io: @FieldType(@import("antfly_local_sources").api_operation.RequestContext, "deadline_io") = null,
+    pub fn context(self: HttpRequest) @import("antfly_local_sources").api_operation.RequestContext {
+        return .{ .cancellation = self.cancellation, .deadline_ns = self.deadline_ns, .deadline_io = self.deadline_io };
+    }
     pub fn ensureActive(self: HttpRequest) !void {
-        return self.cancellation.check();
+        return self.context().ensureActive();
     }
 };
 

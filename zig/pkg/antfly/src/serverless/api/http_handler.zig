@@ -276,8 +276,12 @@ pub const HttpHandler = struct {
         self.graph_execution_limits = limits;
     }
 
-    pub fn handle(self: *HttpHandler, req: HttpRequest) !HttpResponse {
-        try req.ensureActive();
+    pub fn handle(self: *HttpHandler, input: HttpRequest) !HttpResponse {
+        const guard = http_types.RequestGuard{ .context = try input.context().platformDeadline() };
+        var req = input;
+        req.cancellation = guard.token();
+        const request_context = guard.context;
+        try guard.context.ensureActive();
         const route = http_routes.match(req.method, req.path) orelse return try textResponse(self.alloc, 404, "not found");
         const admission: ?*RequestAdmission = switch (http_routes.admissionClass(route)) {
             .none => null,
@@ -292,7 +296,7 @@ pub const HttpHandler = struct {
             }
         }
         defer if (admission) |gate| gate.release();
-        try req.ensureActive();
+        try guard.context.ensureActive();
 
         var response = switch (route) {
             .health => try self.handleHealth(),
@@ -313,7 +317,7 @@ pub const HttpHandler = struct {
             },
             .ingest_batch => |value| try self.handleIngestBatch(value.namespace, req.body),
             .ingest_table_batch => |value| try self.handleIngestTableBatch(value.table_name, req.body),
-            .table_batch => |value| try self.handleTableBatch(value.table_name, req.body, req.cancellation),
+            .table_batch => |value| try self.handleTableBatch(value.table_name, req.body, request_context),
             .build_namespace => |value| try self.handleBuildNamespace(value.namespace),
             .internal_table_build => |value| try self.handleBuildTable(value.table_name),
             .build_status => |value| try self.handleBuildStatus(value.namespace),
@@ -332,7 +336,7 @@ pub const HttpHandler = struct {
             .publish_head => |value| try self.handlePublishHead(value.namespace, req.body),
             .query => |value| try self.handleQuery(value.namespace, req.cancellation),
             .table_query => |value| try self.handleTableQuery(value.table_name, req.cancellation),
-            .table_query_request => |value| try self.handleTableQueryRequest(value.table_name, req.body, req.cancellation),
+            .table_query_request => |value| try self.handleTableQueryRequest(value.table_name, req.body, request_context),
             .table_query_published => |value| try self.handleTableQueryPublished(value.table_name, req.cancellation),
             .table_query_latest => |value| try self.handleTableQueryLatest(value.table_name, req.cancellation),
             .query_search => |value| try self.handleQuerySearch(value.namespace, req.body, req.cancellation),
@@ -353,7 +357,9 @@ pub const HttpHandler = struct {
             .query_version_artifact => |value| try self.handleQueryVersionArtifact(value.namespace, value.version.?, value.artifact_index, req.cancellation),
         };
         errdefer response.deinit(self.alloc);
-        try req.ensureActive();
+        // Batch responses carry durable WAL acceptance, including pending
+        // publication. Never replace them with a pre-commit timeout response.
+        if (route != .table_batch) try guard.context.ensureActive();
         return response;
     }
 
@@ -1088,8 +1094,10 @@ pub const HttpHandler = struct {
         return try jsonResponse(self.alloc, 202, table_result);
     }
 
-    fn handleTableBatch(self: *HttpHandler, table_name: []const u8, body: []const u8, cancellation: CancellationToken) !HttpResponse {
-        var resp = try public_table_http.handleTableBatch(self.alloc, table_name, body, self.tableApi(cancellation));
+    fn handleTableBatch(self: *HttpHandler, table_name: []const u8, body: []const u8, request: api_operation.RequestContext) !HttpResponse {
+        var api = self.tableApi(request.cancellation);
+        api.request = request;
+        var resp = try public_table_http.handleTableBatch(self.alloc, table_name, body, api);
         defer resp.deinit(self.alloc);
         return switch (resp.status) {
             201, 202 => blk: {
@@ -1361,7 +1369,7 @@ pub const HttpHandler = struct {
         }
         try self.resolveSemanticQueryRequest(table_name, &plan, cancellation);
 
-        var session = try self.query.openHeadSession(namespace);
+        var session = try self.query.openHeadSessionWithCancellation(namespace, cancellation);
         errdefer session.deinit();
         session.setCancellation(cancellation);
         session.setDiagnostics(diagnostics);
@@ -2650,7 +2658,7 @@ pub const HttpHandler = struct {
         const namespace = self.catalog.resolveTableNamespaceAlloc(join.right_table) catch return error.FileNotFound;
         defer self.alloc.free(namespace);
 
-        var session = self.query.openHeadSession(namespace) catch |err| switch (err) {
+        var session = self.query.openHeadSessionWithCancellation(namespace, cancellation) catch |err| switch (err) {
             error.FileNotFound => return error.FileNotFound,
             else => return err,
         };
@@ -2931,7 +2939,7 @@ pub const HttpHandler = struct {
             },
         };
 
-        var session = self.query.openHeadSession(namespace) catch |err| switch (err) {
+        var session = self.query.openHeadSessionWithCancellation(namespace, cancellation) catch |err| switch (err) {
             error.FileNotFound => return error.FileNotFound,
             else => return err,
         };
@@ -2950,18 +2958,21 @@ pub const HttpHandler = struct {
         return try self.encodeTableQuerySessionResponseJsonAlloc(table_name, &session, .published, &.{});
     }
 
-    fn handleTableQueryRequest(self: *HttpHandler, table_name: []const u8, body: []const u8, cancellation: CancellationToken) !HttpResponse {
-        try cancellation.check();
+    fn handleTableQueryRequest(self: *HttpHandler, table_name: []const u8, body: []const u8, request: api_operation.RequestContext) !HttpResponse {
+        try request.ensureActive();
         var diagnostics = api_operation.RequestDiagnostics{};
+        var api = self.tableApiWithDiagnostics(request.cancellation, &diagnostics);
+        api.request = request;
+        api.request.diagnostics = &diagnostics;
         var resp = try public_table_http.handleTableQueryRequest(
             self.alloc,
             table_name,
             body,
             null,
-            self.tableApiWithDiagnostics(cancellation, &diagnostics),
+            api,
         );
         defer resp.deinit(self.alloc);
-        try cancellation.check();
+        try request.ensureActive();
         if (resp.status == 422) {
             if (diagnostics.graph_metric_rejection) |*diagnostic| {
                 const rejection_body = try public_table_http.graphMetricMaterializationRejectedBodyWithContext(
@@ -3192,7 +3203,7 @@ pub const HttpHandler = struct {
                 });
             }
         } else {
-            session = self.query.openHeadSession(namespace) catch |err| switch (err) {
+            session = self.query.openHeadSessionWithCancellation(namespace, cancellation) catch |err| switch (err) {
                 error.FileNotFound => return try textResponse(self.alloc, 404, "not found"),
                 else => return err,
             };
@@ -4186,7 +4197,7 @@ pub const HttpHandler = struct {
         const namespace = self.catalog.resolveTableNamespaceAlloc(table_name) catch return try textResponse(self.alloc, 404, "not found");
         defer self.alloc.free(namespace);
 
-        var session = self.query.openHeadSession(namespace) catch |err| switch (err) {
+        var session = self.query.openHeadSessionWithCancellation(namespace, cancellation) catch |err| switch (err) {
             error.FileNotFound => return try textResponse(self.alloc, 404, "not found"),
             else => return try textResponse(self.alloc, 500, "query failed"),
         };
@@ -4204,7 +4215,7 @@ pub const HttpHandler = struct {
         const namespace = self.catalog.resolveTableNamespaceAlloc(table_name) catch return try textResponse(self.alloc, 404, "not found");
         defer self.alloc.free(namespace);
 
-        var session = self.query.openHeadSession(namespace) catch |err| switch (err) {
+        var session = self.query.openHeadSessionWithCancellation(namespace, cancellation) catch |err| switch (err) {
             error.FileNotFound => return try textResponse(self.alloc, 404, "not found"),
             else => return try textResponse(self.alloc, 500, "query failed"),
         };
@@ -4222,7 +4233,7 @@ pub const HttpHandler = struct {
         const namespace = self.catalog.resolveTableNamespaceAlloc(table_name) catch return try textResponse(self.alloc, 404, "not found");
         defer self.alloc.free(namespace);
 
-        var session = self.query.openHeadSession(namespace) catch |err| switch (err) {
+        var session = self.query.openHeadSessionWithCancellation(namespace, cancellation) catch |err| switch (err) {
             error.FileNotFound => return try textResponse(self.alloc, 404, "not found"),
             else => return try textResponse(self.alloc, 500, "query failed"),
         };
@@ -4274,7 +4285,7 @@ pub const HttpHandler = struct {
         };
         defer req.deinit(self.alloc);
 
-        var session = self.query.openHeadSession(namespace) catch |err| switch (err) {
+        var session = self.query.openHeadSessionWithCancellation(namespace, cancellation) catch |err| switch (err) {
             error.FileNotFound => return try textResponse(self.alloc, 404, "not found"),
             else => return try textResponse(self.alloc, 500, "query failed"),
         };
@@ -4289,7 +4300,7 @@ pub const HttpHandler = struct {
         };
         defer req.deinit(self.alloc);
 
-        var session = self.query.openVersionSession(namespace, version) catch |err| switch (err) {
+        var session = self.query.openVersionSessionWithCancellation(namespace, version, cancellation) catch |err| switch (err) {
             error.FileNotFound => return try textResponse(self.alloc, 404, "not found"),
             else => return try textResponse(self.alloc, 500, "query failed"),
         };
@@ -5172,7 +5183,7 @@ pub const HttpHandler = struct {
         };
         defer req.deinit(self.alloc);
 
-        var session = self.query.openHeadSession(namespace) catch |err| switch (err) {
+        var session = self.query.openHeadSessionWithCancellation(namespace, cancellation) catch |err| switch (err) {
             error.FileNotFound => return try textResponse(self.alloc, 404, "not found"),
             else => return try textResponse(self.alloc, 500, "query failed"),
         };
@@ -5187,7 +5198,7 @@ pub const HttpHandler = struct {
         };
         defer req.deinit(self.alloc);
 
-        var session = self.query.openVersionSession(namespace, version) catch |err| switch (err) {
+        var session = self.query.openVersionSessionWithCancellation(namespace, version, cancellation) catch |err| switch (err) {
             error.FileNotFound => return try textResponse(self.alloc, 404, "not found"),
             else => return try textResponse(self.alloc, 500, "query failed"),
         };
@@ -5202,7 +5213,7 @@ pub const HttpHandler = struct {
         };
         defer req.deinit(self.alloc);
 
-        var session = self.query.openHeadSession(namespace) catch |err| switch (err) {
+        var session = self.query.openHeadSessionWithCancellation(namespace, cancellation) catch |err| switch (err) {
             error.FileNotFound => return try textResponse(self.alloc, 404, "not found"),
             else => return try textResponse(self.alloc, 500, "query failed"),
         };
@@ -5217,7 +5228,7 @@ pub const HttpHandler = struct {
         };
         defer req.deinit(self.alloc);
 
-        var session = self.query.openVersionSession(namespace, version) catch |err| switch (err) {
+        var session = self.query.openVersionSessionWithCancellation(namespace, version, cancellation) catch |err| switch (err) {
             error.FileNotFound => return try textResponse(self.alloc, 404, "not found"),
             else => return try textResponse(self.alloc, 500, "query failed"),
         };
@@ -5383,7 +5394,7 @@ pub const HttpHandler = struct {
     }
 
     fn handleQueryHead(self: *HttpHandler, namespace: []const u8, cancellation: CancellationToken) !HttpResponse {
-        var session = self.query.openHeadSession(namespace) catch |err| switch (err) {
+        var session = self.query.openHeadSessionWithCancellation(namespace, cancellation) catch |err| switch (err) {
             error.FileNotFound => return try textResponse(self.alloc, 404, "not found"),
             else => return try textResponse(self.alloc, 500, "query failed"),
         };
@@ -5393,7 +5404,7 @@ pub const HttpHandler = struct {
     }
 
     fn handleQueryLatest(self: *HttpHandler, namespace: []const u8, cancellation: CancellationToken) !HttpResponse {
-        var session = self.query.openHeadSession(namespace) catch |err| switch (err) {
+        var session = self.query.openHeadSessionWithCancellation(namespace, cancellation) catch |err| switch (err) {
             error.FileNotFound => return try textResponse(self.alloc, 404, "not found"),
             else => return try textResponse(self.alloc, 500, "query failed"),
         };
@@ -5409,7 +5420,7 @@ pub const HttpHandler = struct {
     }
 
     fn handleQueryVersion(self: *HttpHandler, namespace: []const u8, version: u64, cancellation: CancellationToken) !HttpResponse {
-        var session = self.query.openVersionSession(namespace, version) catch |err| switch (err) {
+        var session = self.query.openVersionSessionWithCancellation(namespace, version, cancellation) catch |err| switch (err) {
             error.FileNotFound => return try textResponse(self.alloc, 404, "not found"),
             else => return try textResponse(self.alloc, 500, "query failed"),
         };
@@ -5419,7 +5430,7 @@ pub const HttpHandler = struct {
     }
 
     fn handleQueryHeadArtifact(self: *HttpHandler, namespace: []const u8, artifact_index: usize, cancellation: CancellationToken) !HttpResponse {
-        var session = self.query.openHeadSession(namespace) catch |err| switch (err) {
+        var session = self.query.openHeadSessionWithCancellation(namespace, cancellation) catch |err| switch (err) {
             error.FileNotFound => return try textResponse(self.alloc, 404, "not found"),
             else => return try textResponse(self.alloc, 500, "query failed"),
         };
@@ -5429,7 +5440,7 @@ pub const HttpHandler = struct {
     }
 
     fn handleQueryVersionArtifact(self: *HttpHandler, namespace: []const u8, version: u64, artifact_index: usize, cancellation: CancellationToken) !HttpResponse {
-        var session = self.query.openVersionSession(namespace, version) catch |err| switch (err) {
+        var session = self.query.openVersionSessionWithCancellation(namespace, version, cancellation) catch |err| switch (err) {
             error.FileNotFound => return try textResponse(self.alloc, 404, "not found"),
             else => return try textResponse(self.alloc, 500, "query failed"),
         };
@@ -5883,7 +5894,7 @@ pub const HttpHandler = struct {
         };
         defer status.deinit(self.alloc);
         if (!status.publish_admitted) return error.Backpressured;
-        request.cancellation.check() catch return error.Canceled;
+        request.ensureActive() catch |err| return if (err == error.DeadlineExceeded) error.DeadlineExceeded else if (err == error.Canceled) error.Canceled else error.InternalFailure;
         try self.preflightPublicTableBatchSyncLevel(req.sync_level, status);
 
         const namespace = self.catalog.resolveTableNamespaceAlloc(table_name) catch |err| switch (err) {
@@ -5904,6 +5915,7 @@ pub const HttpHandler = struct {
         };
         defer freeDocumentMutations(self.alloc, mutations);
 
+        request.ensureActive() catch |err| return if (err == error.DeadlineExceeded) error.DeadlineExceeded else if (err == error.Canceled) error.Canceled else error.InternalFailure;
         var result = self.api.ingestBatch(.{
             .namespace = namespace,
             .timestamp_ns = currentTimeNs(),
@@ -5914,7 +5926,7 @@ pub const HttpHandler = struct {
         };
         defer result.deinit(self.alloc);
 
-        self.enforcePublicTableBatchSyncLevel(table_name, namespace, req.sync_level, result.end_lsn, request.cancellation) catch |err| {
+        self.enforcePublicTableBatchSyncLevel(table_name, namespace, req.sync_level, result.end_lsn, request) catch |err| {
             if (err == error.InternalFailure) {
                 std.log.err("serverless public table batch sync wait failed table={s} sync_level={} end_lsn={} err={}", .{
                     table_name,
@@ -5957,17 +5969,18 @@ pub const HttpHandler = struct {
         namespace: []const u8,
         sync_level: db_types.SyncLevel,
         end_lsn: u64,
-        cancellation: CancellationToken,
+        request: api_operation.RequestContext,
     ) public_table_http.TableApi.ExecuteBatchError!void {
         switch (sync_level) {
             .propose, .write => return,
             .full_text, .enrichments, .full_index => {},
         }
+        const sync_request = request.platformDeadline() catch return error.CommittedPending;
         const timeout_ns = 30 * std.time.ns_per_s;
         const start_ns = platform_time.monotonicNs();
-        const deadline_ns = start_ns +| timeout_ns;
+        const deadline_ns = @min(start_ns +| timeout_ns, sync_request.deadline_ns orelse std.math.maxInt(u64));
         const sync_cancellation_state = SyncWaitCancellation{
-            .upstream = cancellation,
+            .upstream = sync_request.cancellation,
             .deadline_ns = deadline_ns,
         };
         const sync_cancellation = sync_cancellation_state.token();
@@ -6011,7 +6024,7 @@ pub const HttpHandler = struct {
                     },
                 };
             }
-            if (cancellation.isCancelled()) return error.CommittedPending;
+            if (request.cancellation.isCancelled()) return error.CommittedPending;
             if (platform_time.monotonicNs() >= deadline_ns) {
                 std.log.err(
                     "serverless public table batch sync timeout table={s} sync_level={} end_lsn={} published={} latest={} pending_rebuild={} enrichment_complete={} chunk_preview_complete={} chunk_embeddings_complete={} rerank_terms_complete={} graph_metrics_configured={} graph_metrics_pending={} graph_metrics_rejected={} active_stage={any}",
@@ -6120,7 +6133,9 @@ pub const HttpHandler = struct {
         _ = alloc;
         _ = row_filter_json;
         const self: *HttpHandler = @ptrCast(@alignCast(ptr));
-        return self.executePublicTableQueryJsonAlloc(table_name, body, request.cancellation) catch |err| switch (err) {
+        const guard = http_types.RequestGuard{ .context = request };
+        request.ensureActive() catch |err| return if (err == error.DeadlineExceeded) error.DeadlineExceeded else if (err == error.Canceled) error.Canceled else error.InternalFailure;
+        return self.executePublicTableQueryJsonAlloc(table_name, body, guard.token()) catch |err| switch (err) {
             error.ManifestReadLeaseContended, error.ManifestVersionRetired => return error.StorageReadTemporarilyUnavailable,
             error.ManifestReadLeaseExpired, error.DeadlineExceeded => return error.DeadlineExceeded,
             error.InvalidQueryRequest => return error.InvalidQueryRequest,
@@ -12560,6 +12575,109 @@ test "serverless index catalog rejects artifact-backed sources before publicatio
     try validateServerlessIndexCatalog(alloc,
         \\{"full_text_index_v0":{"type":"full_text"},"body_search":{"type":"full_text","field":"body"}}
     );
+}
+
+test "serverless request deadlines preserve accepted WAL and pending publication" {
+    const alloc = std.testing.allocator;
+
+    var artifact_root_buf: [256]u8 = undefined;
+    var manifest_root_buf: [256]u8 = undefined;
+    var wal_root_buf: [256]u8 = undefined;
+    var catalog_root_buf: [256]u8 = undefined;
+    const artifact_root = tmpPath(&artifact_root_buf, "artifacts-deadline-http");
+    const manifest_root = tmpPath(&manifest_root_buf, "manifests-deadline-http");
+    const wal_root = tmpPath(&wal_root_buf, "wal-deadline-http");
+    const catalog_root = tmpPath(&catalog_root_buf, "catalog-deadline-http");
+    defer cleanupTmp(artifact_root);
+    defer cleanupTmp(manifest_root);
+    defer cleanupTmp(wal_root);
+    defer cleanupTmp(catalog_root);
+
+    var fs_artifacts = try @import("../artifacts/mod.zig").FsStore.init(alloc, std.mem.span(artifact_root));
+    var artifact_store = fs_artifacts.artifactStore();
+    defer artifact_store.deinit();
+
+    var fs_manifests = try manifest_mod.FsStore.init(alloc, std.mem.span(manifest_root));
+    var manifest_store = fs_manifests.manifestStore();
+    defer manifest_store.deinit();
+
+    var fs_progress = try @import("../catalog/fs_progress_store.zig").FsProgressStore.init(alloc, std.mem.span(manifest_root));
+    var progress_store = fs_progress.progressStore();
+    defer progress_store.deinit();
+
+    var fs_wal = try @import("../wal/mod.zig").FsStore.init(alloc, std.mem.span(wal_root));
+    var wal_store = fs_wal.walStore();
+    defer wal_store.deinit();
+
+    var fs_catalog = try @import("../catalog/fs_store.zig").FsStore.init(alloc, std.mem.span(catalog_root));
+    var catalog_store = fs_catalog.catalogStore();
+    defer catalog_store.deinit();
+
+    var builder = build_mod.Builder.init(alloc, &artifact_store, &manifest_store, &progress_store, &wal_store);
+    var api = api_service.Service.init(alloc, &wal_store, &builder);
+    var catalog = catalog_mod.CatalogService.init(alloc, &artifact_store, &manifest_store, &progress_store, &wal_store, &builder, &catalog_store);
+    defer catalog.deinit();
+    var query = query_mod.QueryRuntime.init(alloc, &artifact_store, &manifest_store, &progress_store);
+    defer query.deinit();
+    var runtime_status = api_types.RuntimeStatusResult{
+        .role = .combined,
+        .tick_interval_ms = 1,
+        .validated = true,
+        .targets = try alloc.alloc(api_types.RuntimeStorageTarget, 0),
+    };
+    defer runtime_status.deinit(alloc);
+    var handler = HttpHandler.init(alloc, &api, &catalog, &manifest_store, &progress_store, &query, &runtime_status);
+
+    var create = try handler.handle(.{ .method = .put, .path = "/tables/docs", .body = "{\"schema\":{\"default_type\":\"doc\"}}" });
+    defer create.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 201), create.status);
+    const namespace = try catalog.resolveTableNamespaceAlloc("docs");
+    defer alloc.free(namespace);
+    const Clock = struct {
+        var ticks: i96 = 0;
+        var append_fn: @FieldType(wal_mod.WalStore.VTable, "append") = undefined;
+        fn now(_: ?*anyopaque, _: std.Io.Clock) std.Io.Timestamp {
+            return .{ .nanoseconds = ticks };
+        }
+        fn append(ptr: *anyopaque, ns: []const u8, timestamp: u64, payload: []const u8) !u64 {
+            const lsn = try append_fn(ptr, ns, timestamp, payload);
+            // Deterministic expiry immediately after durable append.
+            ticks = 100;
+            return lsn;
+        }
+    };
+    Clock.ticks = 0;
+    var clock_vtable = std.testing.io.vtable.*;
+    clock_vtable.now = Clock.now;
+    const clock_io = std.Io{ .userdata = null, .vtable = &clock_vtable };
+    const borrow = @import("antfly_runtime_abi").io_abi.Borrow.init(&clock_io);
+    var table_api = handler.tableApi(.none);
+    table_api.request = .{ .deadline_ns = 0, .deadline_io = borrow };
+    const body = "{\"inserts\":{\"doc:a\":{\"body\":\"alpha\"}},\"sync_level\":\"full_index\"}";
+    try std.testing.expectError(error.DeadlineExceeded, public_table_http.handleTableBatch(alloc, "docs", body, table_api));
+    try std.testing.expectEqual(@as(u64, 0), try wal_store.latestLsn(namespace));
+
+    const original_vtable = wal_store.vtable;
+    Clock.append_fn = original_vtable.append;
+    var wal_vtable = original_vtable.*;
+    wal_vtable.append = Clock.append;
+    wal_store.vtable = &wal_vtable;
+    defer wal_store.vtable = original_vtable;
+    table_api.request.deadline_ns = 100;
+    var pending = try public_table_http.handleTableBatch(alloc, "docs", body, table_api);
+    defer pending.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 202), pending.status);
+    try std.testing.expect(std.mem.indexOf(u8, pending.body, "committed") != null);
+    try std.testing.expectEqual(@as(u64, 1), try wal_store.latestLsn(namespace));
+
+    // Query read checkpoints preserve the deadline error rather than reducing
+    // it to a disconnected-client cancellation.
+    Clock.ticks = 0;
+    const guard = http_types.RequestGuard{ .context = .{ .deadline_ns = 100, .deadline_io = borrow } };
+    try guard.token().check();
+    Clock.ticks = 100;
+    try std.testing.expectError(error.DeadlineExceeded, guard.token().check());
+    try std.testing.expect(guard.token().isCancelled());
 }
 
 test "serverless http handler serves the table public lifecycle and consistency routes" {

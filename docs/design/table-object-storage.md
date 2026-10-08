@@ -145,7 +145,13 @@ The narrow query definition carries the table engine from the same catalog read
 that binds the query. Single-table JSON, table NDJSON, and global multi-query
 requests all dispatch through that binding, authorize each line independently,
 and retain logical table labels in responses. Mixed local/object requests select
-a data path per table; joins involving owned object tables remain unsupported.
+a data path per table. Binding preserves the distinction between a request-local
+foreign alias and a catalog table: foreign primaries go directly to their source
+executor without native engine discovery. Join admission checks every native
+participant, including nested right sides, against definitions from that same
+catalog revision before executing any side. Owned object document participants
+return HTTP 400 even when another side would produce no hits. External lake
+participants retain native join support.
 Point writes and lookups use a targeted definition read to select the engine,
 rather than cloning every table and range in an administrative snapshot. Object
 execution still revalidates the authoritative incarnation and physical binding.
@@ -160,6 +166,33 @@ and then perform a stale lookup. Supporting read-index-equivalent object reads
 will require a WAL visibility fence or an authoritative WAL overlay; metadata
 consensus alone cannot provide that data guarantee. External lake tables retain
 their existing native read contracts.
+
+## Hosted execution configuration and request lifetime
+
+Hosted object stacks inherit the native API's configured graph execution limits
+and remote content configuration. Engine selection must not restore serverless
+bootstrap defaults in place of explicit host limits.
+
+The bound query retains its original request context and absolute deadline across
+catalog resolution and object dispatch. The object runtime accepts that context,
+normalizes borrowed executor clocks to platform monotonic time while preserving
+remaining time, and checks it during admission, cold initialization, lookup and
+response delivery. Waiting for the runtime registry mutex remains cancelable.
+Request-scoped deadline checkpoints are also exposed through a fallible
+cancellation token to object query and artifact readers. Session acquisition
+passes that token through HEAD and manifest reads into the object-store client,
+before opening reader leases or accessing document and index artifacts. The
+callback is borrowed only for synchronous request execution; background workers
+retain their own
+lifetime and do not retain inbound request callbacks. Store operations that do
+not support interruption are checked at their boundaries; their individual
+transport timeouts still bound an in-flight call.
+
+Before WAL append, expiration rejects the write. After WAL acceptance, expiration
+must preserve its durable outcome. Publication synchronization uses the earlier
+of the request deadline and the existing 30-second synchronization ceiling and
+returns the committed/pending acknowledgment when that budget expires. A final
+response checkpoint must never turn an accepted batch into a pre-commit timeout.
 
 ## Initial capability boundaries
 

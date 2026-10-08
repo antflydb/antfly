@@ -1716,6 +1716,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "SQL pgwire dispatch preserves imported executor authority including unavailable views",
         "httpx antfly ChatGPT connector policy",
         "storage-kernel query request preserves final projection while raw retrieval defers it",
+        "api http server executes direct foreign table query through registry",
         "api http server executes direct foreign table aggregations through registry",
         "unconfigured remote catalog authority skips background work without borrowing internal credentials",
         "usermgr openapi module generates extractor surface for routed endpoints",
