@@ -411,7 +411,7 @@ const Builder = struct {
             },
             .binary => |part| .{ .binary = .{ .op = part.op, .left = try self.inferenceExpression(part.left, columns), .right = try self.inferenceExpression(part.right, columns) } },
             .unary => |part| .{ .unary = .{ .op = part.op, .operand = try self.inferenceExpression(part.operand, columns) } },
-            .cast => |part| .{ .cast = .{ .type = part.type, .element_type = part.element_type, .operand = try self.inferenceExpression(part.operand, columns) } },
+            .cast => |part| .{ .cast = part.withOperand(try self.inferenceExpression(part.operand, columns)) },
             .case_when => |part| blk: {
                 const branches = try self.alloc.alloc(ast.Scalar.Branch, part.branches.len);
                 for (part.branches, branches) |branch, *out| out.* = .{ .condition = try self.inferenceExpression(branch.condition, columns), .value = try self.inferenceExpression(branch.value, columns) };
@@ -654,6 +654,7 @@ const Builder = struct {
             .string => return .{ .nullable = false },
             .integer => return .{ .kind = .integer, .nullable = false },
             .number => return .{ .kind = .number, .nullable = false },
+            .numeric => return .{ .kind = .number, .element_type = .numeric, .nullable = false },
             .boolean => return .{ .kind = .boolean, .nullable = false },
             .parameter => {},
         };
@@ -831,7 +832,7 @@ const Builder = struct {
             .literal => input.*,
             .unary => |part| .{ .unary = .{ .op = part.op, .operand = try self.expression(columns, part.operand, aliases) } },
             .binary => |part| .{ .binary = .{ .op = part.op, .left = try self.expression(columns, part.left, aliases), .right = try self.expression(columns, part.right, aliases) } },
-            .cast => |part| .{ .cast = .{ .type = part.type, .element_type = part.element_type, .operand = try self.expression(columns, part.operand, aliases) } },
+            .cast => |part| .{ .cast = part.withOperand(try self.expression(columns, part.operand, aliases)) },
             .call => |part| blk: {
                 const args = try self.alloc.alloc(*const ast.Scalar, part.args.len);
                 for (part.args, args) |arg, *out| out.* = try self.expression(columns, arg, aliases);
@@ -999,12 +1000,17 @@ const Builder = struct {
         return true;
     }
 
-    fn literalDatum(expression_: *const ast.Scalar) !scalar.Datum {
+    fn literalDatum(a: std.mem.Allocator, expression_: *const ast.Scalar) !scalar.Datum {
         if (expression_.* != .literal) return error.InvalidSqlBackendResponse;
         const value = expression_.literal;
+        if (value == .numeric) {
+            var budget: @import("array_value.zig").Budget = .{};
+            return scalar.numericTextLeaky(a, value.numeric, &budget);
+        }
         return .{ .value = switch (value) {
             .integer => |number| .{ .integer = number },
             .number => |number| .{ .float = number },
+            .numeric => unreachable,
             .boolean => |boolean| .{ .bool = boolean },
             .string => |string| .{ .string = string },
             .null => .null,
@@ -1115,7 +1121,7 @@ const Builder = struct {
                     for (statement.values_arms[first..arm_index], rows, 0..) |row_query, *row, index| {
                         if (index % 64 == 0) try self.backend.vtable.checkpoint(self.backend.ptr);
                         const values = try self.alloc.alloc(scalar.Datum, row_query.columns.len);
-                        for (row_query.columns, values, common) |projection, *value, kind| value.* = try describe.coerceDatum(self.alloc, try literalDatum(projection.expression orelse return error.InvalidSqlBackendResponse), kind.kind.?, kind.element_type);
+                        for (row_query.columns, values, common) |projection, *value, kind| value.* = try describe.coerceDatum(self.alloc, try literalDatum(self.alloc, projection.expression orelse return error.InvalidSqlBackendResponse), kind.kind.?, kind.element_type);
                         row.* = values;
                     }
                     try grouped.append(self.alloc, try self.node(columns, .{ .literal_rows = rows }));

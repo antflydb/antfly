@@ -45,6 +45,7 @@ test "SQL ordered-set execution preserves grouped namespaces and shares compatib
         .{ .sql = "SELECT g,mode() WITHIN GROUP (ORDER BY x) FILTER (WHERE x>5),percentile_cont(0.5) WITHIN GROUP (ORDER BY x) FROM (SELECT 2 AS g,10 AS x UNION ALL SELECT 1,3 UNION ALL SELECT 2,20 UNION ALL SELECT 1,1) t GROUP BY g HAVING COUNT(*)=2 ORDER BY g", .rows = "[[\"1\",null,2],[\"2\",\"10\",15]]" },
         .{ .sql = "SELECT percentile_cont(NULL) WITHIN GROUP (ORDER BY x),mode() WITHIN GROUP (ORDER BY x),COUNT(*) FROM (SELECT 1 AS x) t WHERE false", .rows = "[[null,null,\"0\"]]" },
         .{ .sql = "SELECT percentile_disc(0.5) WITHIN GROUP (ORDER BY x) FROM (SELECT 9007199254740993 AS x UNION ALL SELECT 9007199254740995) t", .rows = "[[\"9007199254740993\"]]" },
+        .{ .sql = "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY '1')", .rows = "[[1]]" },
         .{ .sql = "SELECT array_length(percentile_cont(ARRAY[0.25,NULL,0.75]) WITHIN GROUP (ORDER BY x),1) FROM (SELECT 1 AS x UNION ALL SELECT 3) t", .rows = "[[\"3\"]]" },
         .{ .sql = "SELECT percentile_cont(ARRAY[0.25,NULL,0.75]) WITHIN GROUP (ORDER BY x) IS NOT DISTINCT FROM ARRAY[1.5,NULL,2.5]::float8[] FROM (SELECT 1 AS x UNION ALL SELECT 3) t", .rows = "[[true]]" },
         .{ .sql = "SELECT percentile_disc('[0:2]={0.25,NULL,0.75}'::float8[]) WITHIN GROUP (ORDER BY x) IS NOT DISTINCT FROM '[0:2]={1,NULL,3}'::bigint[] FROM (SELECT 1::bigint AS x UNION ALL SELECT 3::bigint) t", .rows = "[[true]]" },
@@ -83,6 +84,10 @@ test "SQL ordered-set execution preserves grouped namespaces and shares compatib
         .{ .sql = "SELECT mode() WITHIN GROUP (ORDER BY 1) OVER ()", .code = "0A000" },
         .{ .sql = "SELECT percentile_cont(-1) WITHIN GROUP(ORDER BY x) FROM (SELECT 1 AS x) t WHERE false", .code = "22003" },
         .{ .sql = "SELECT percentile_cont(0.5) WITHIN GROUP(ORDER BY true)", .code = "42883" },
+        .{ .sql = "SELECT percentile_cont(0.5) WITHIN GROUP(ORDER BY '1'::text)", .code = "42883" },
+        .{ .sql = "SELECT percentile_cont(0.5) WITHIN GROUP(ORDER BY ARRAY[1])", .code = "42883" },
+        .{ .sql = "SELECT percentile_cont(0.5) WITHIN GROUP(ORDER BY 'x')", .code = "22P02" },
+        .{ .sql = "SELECT percentile_cont(0.5) WITHIN GROUP(ORDER BY CAST(true AS uuid))", .code = "42846" },
     };
     for (invalid) |case| {
         var compiled = try compiler.compile(std.testing.allocator, case.sql, .{});

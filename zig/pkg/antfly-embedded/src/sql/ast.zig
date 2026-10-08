@@ -33,7 +33,18 @@ pub const Scalar = union(enum) {
         /// Earlier arguments belong to the grouped direct-argument domain.
         within_group: ?*const WithinGroup = null,
     },
-    cast: struct { operand: *const Scalar, type: ColumnType, element_type: ?@import("array_value.zig").ElementType = null },
+    cast: struct {
+        operand: *const Scalar,
+        type: ColumnType,
+        element_type: ?@import("array_value.zig").ElementType = null,
+        /// Coercion origin controls binding diagnostics, not execution identity.
+        coercion: enum { explicit, function } = .explicit,
+        pub fn withOperand(self: @This(), operand: *const Scalar) @This() {
+            var result = self;
+            result.operand = operand;
+            return result;
+        }
+    },
     case_when: struct { branches: []const Branch, otherwise: ?*const Scalar = null },
     in_list: struct { operand: *const Scalar, values: []const *const Scalar, negated: bool = false },
 
@@ -57,6 +68,9 @@ pub const Value = union(enum) {
     boolean: bool,
     integer: i64,
     number: f64,
+    /// Exact SQL numeric spelling, owned by the compiled statement. Decimal,
+    /// scientific and oversized integer literals never cross floating point.
+    numeric: []const u8,
     string: []const u8,
     /// One-based positional parameter. Binding never mutates the compiled IR.
     parameter: u32,

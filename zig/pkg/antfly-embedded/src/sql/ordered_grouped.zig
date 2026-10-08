@@ -269,7 +269,9 @@ test "SQL grouped ordered streams spill once per domain and release every alloca
             defer grouped.deinit();
             var collector = try Collector.init(grouped, &bound, &manager, if (disk) 8192 else 1024 * 1024);
             defer collector.deinit();
-            try std.testing.expectEqual(@as(usize, 1), collector.sorts.len);
+            // Continuous values are double; discrete/mode remain integers.
+            // Only the latter two share one exact source-domain stream.
+            try std.testing.expectEqual(@as(usize, 2), collector.sorts.len);
             const groups: usize = if (disk) 128 else 3;
             // Interleaved keys force nonadjacent groups through the shared
             // sort. Two equal-frequency values make mode's tie rule visible.
@@ -278,6 +280,7 @@ test "SQL grouped ordered streams spill once per domain and release every alloca
                 try collector.add(&.{Datum.json(.{ .integer = @intCast(groups - g - 1) })}, &.{ value, value, value });
             };
             try std.testing.expectEqual(groups * 4, collector.sorts[0].total);
+            try std.testing.expectEqual(groups * 4, collector.sorts[1].total);
             var scratch = std.heap.ArenaAllocator.init(a);
             defer scratch.deinit();
             for (0..groups) |g| {

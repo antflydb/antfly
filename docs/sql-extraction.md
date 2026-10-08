@@ -5032,3 +5032,62 @@ native numeric vector kernels remain incomplete. Unsupported native scalar
 NUMERIC descriptors fail closed instead of being stored as floating point.
 This infrastructure work does not by itself credit any original inventory case;
 the original ledger counts and provenance remain unchanged.
+
+### Exact default literals and PostgreSQL rounding domains
+
+Decimal/scientific literals and integer literals outside signed i64 now retain
+their exact source spelling in the owned AST, rather than crossing f64 during
+parsing. Binding prepares immutable NUMERIC constants once, preserving display
+scale, large integers and public result identity through scalar and set paths.
+Small integral literals retain their integer domain. Proven floating-domain
+literal coercions, including explicit real/double casts, are resolved once at
+bind time so primitive vector kernels do not repeatedly parse decimal text.
+This does not convert expressions that belong in the NUMERIC domain: an integer
+plus a decimal literal retains exact NUMERIC scalar execution.
+
+NUMERIC abs, ceil, floor, sign, mod, round and trunc use exact typed values.
+Two-argument round/trunc resolve the PostgreSQL (numeric, integer) overload,
+including negative scales, strict SQL NULLs and unknown string literals; real,
+double and explicit bigint scale overloads are rejected. One-argument rounding,
+ceiling/floor and sign select double precision for integer/real inputs, as
+PostgreSQL does. NUMERIC rounding is half-away-from-zero; double rounding is
+ties-to-even. Nested scale evaluation and NUMERIC ANY/ALL share the evaluator's
+work budget, including conversion work, instead of borrowing overlapping quotas.
+Exact integer array probes use five stack base-10000 groups and allocate no
+decimal coefficient. Numeric float parameters use the existing PostgreSQL
+significant-digit conversion rather than shortest-string conversion.
+
+Continuous percentile inputs are explicitly converted to double precision;
+discrete percentiles/mode keep their source domain and cannot share a narrowed
+sort stream with exact integers. Aggregate expression identity now includes
+the builtin cast identity, preventing NUMERIC/double reducers from aliasing.
+
+PostgreSQL 18 oracle checks cover rounding ties, negative scales, display scale,
+NULLs, special NUMERIC values, double overload identity and SQLSTATE 42883 for
+missing overloads. The latest focused gates pass 52 NUMERIC tests and the
+ordered-set server regression. Function coercions distinguish unknown strings
+from typed text, arrays and dates; explicit user-cast failures keep their own
+SQLSTATE. Cast rewrites copy all metadata, including coercion origin. Identical
+owned decimal spellings share expression work without merging different scales.
+Prepared literal, rounding and exact integer-array tests destroy the parsed AST
+and execute 1,000 probes per shape with a zero-capacity allocator. This verifies
+ownership and zero hot allocations, not a production latency speedup.
+
+The original inventory remains unchanged: 448 implemented, 136 rejected,
+73 superseded and 929 unresolved. Remaining decimal work includes native scalar
+catalog/row/index/expression-VM activation, typmods, exact sqrt/power and other numeric
+functions, complete assignment/coercion coverage, mixed-domain join keys and
+native NUMERIC vector kernels. These tests do not certify those unfinished
+boundaries or award new inventory credits.
+
+Native real/double literal defaults parse directly at their declared width and
+retain a durable assignment cast; real literals do not round through f64 first.
+Native expression lowering explicitly refuses NUMERIC instructions until that
+VM has an exact decimal value domain, instead of publishing a lossy program.
+
+Final validation: `zig build sql-test pgwire-test check-openapi lake-integration-test`
+passes on the final source, with 573 local SQL tests (three existing skips),
+226 server SQL tests and 161 lake integration tests, without failures or leaks.
+The 84-test pgwire gate requires permission to bind disposable loopback listeners;
+the restricted sandbox otherwise produces EPERM failures in three listener tests.
+OpenAPI, formatting, whitespace and original-inventory integrity checks pass.

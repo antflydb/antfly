@@ -1672,9 +1672,64 @@ test "SQL NUMERIC set projections preserve exact cells across mapped batches" {
     try std.testing.expectEqual(@import("array_value.zig").ElementType.numeric, result.output.columns[0].element_type.?);
 }
 
+test "SQL NUMERIC literals preserve PostgreSQL inference precision scale and mixed casts" {
+    const a = std.testing.allocator;
+    const cases = [_]struct { sql: []const u8, values: []const []const u8, numeric: bool = true }{
+        .{ .sql = "SELECT 0.1 + 0.2, 1.0 / 3.0, 9223372036854775808, 1.2300, 1e3", .values = &.{ "0.3", "0.33333333333333333333", "9223372036854775808", "1.2300", "1000" } },
+        .{ .sql = "SELECT -9223372036854775809, 18446744073709551616, -1.2300", .values = &.{ "-9223372036854775809", "18446744073709551616", "-1.2300" } },
+        .{ .sql = "SELECT round(1.255, 2), trunc(-1.255, 2), round(1, 2), round(1250, -2)", .values = &.{ "1.26", "-1.25", "1.00", "1300" } },
+        .{ .sql = "SELECT ceil(1.200), floor(-1.200), abs(-1.200), sign('Infinity'::numeric)", .values = &.{ "2", "-2", "1.200", "1" } },
+        .{ .sql = "SELECT round('NaN'::numeric, 2), trunc('Infinity'::numeric, 2), mod(5.50, 2.0)", .values = &.{ "NaN", "Infinity", "1.50" } },
+        .{ .sql = "SELECT 9223372036854775807, -9223372036854775808", .values = &.{ "9223372036854775807", "-9223372036854775808" }, .numeric = false },
+        .{ .sql = "SELECT 0.1 + 0.2::DOUBLE PRECISION", .values = &.{"0.30000000000000004"}, .numeric = false },
+        .{ .sql = "SELECT trunc(9007199254740993), ceil(1), floor(1::real), sign(-1)", .values = &.{ "9007199254740992", "1", "1", "-1" }, .numeric = false },
+        .{ .sql = "SELECT round(2.5::double precision), round(3.5::double precision), round(-2.5::double precision), round(-3.5::double precision)", .values = &.{ "2", "4", "-2", "-4" }, .numeric = false },
+        .{ .sql = "SELECT round(2.5), round(3.5), round(-2.5), round(-3.5)", .values = &.{ "3", "4", "-3", "-4" } },
+    };
+    for (cases) |case| {
+        var fixture: TestBackend = .{ .row_count = 0 };
+        var compiled = try compiler.compile(a, case.sql, .{});
+        defer compiled.deinit();
+        var result = try execute(a, fixture.iface(), &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), result.output.rows.len);
+        for (case.values, result.output.rows[0], result.output.columns) |text, actual, column| {
+            const rendered = if (actual == .string) actual.string else try std.json.Stringify.valueAlloc(a, actual, .{});
+            defer if (actual != .string) a.free(rendered);
+            try std.testing.expectEqualStrings(text, rendered);
+            try std.testing.expectEqual(case.numeric, column.element_type == .numeric);
+        }
+    }
+}
+
+test "SQL NUMERIC scaled rounding resolves PostgreSQL overloads and strict nulls" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        "SELECT round(1.25::double precision, 1)",
+        "SELECT trunc(1.25::real, 1)",
+        "SELECT round(1.25, 1::bigint)",
+    }) |sql| {
+        var fixture: TestBackend = .{ .row_count = 0 };
+        var compiled = try compiler.compile(a, sql, .{});
+        defer compiled.deinit();
+        try std.testing.expectError(error.SqlUndefinedFunction, execute(a, fixture.iface(), &compiled, &.{}, .{}));
+    }
+    var fixture: TestBackend = .{ .row_count = 0 };
+    var compiled = try compiler.compile(a, "SELECT round(NULL::numeric, 2), trunc(1.25, NULL::integer), round('1.255', '2')", .{});
+    defer compiled.deinit();
+    var result = try execute(a, fixture.iface(), &compiled, &.{}, .{});
+    defer result.deinit();
+    try std.testing.expect(result.output.rows[0][0] == .null);
+    try std.testing.expect(result.output.rows[0][1] == .null);
+    try std.testing.expectEqualStrings("1.26", result.output.rows[0][2].string);
+    for (result.output.columns) |column| try std.testing.expectEqual(@import("array_value.zig").ElementType.numeric, column.element_type.?);
+}
+
 test "SQL NUMERIC SUM AVG execute grouped distinct empty and special reductions" {
     const a = std.testing.allocator;
     const cases = [_]struct { sql: []const u8, rows: []const [2]?[]const u8, count: usize = 4 }{
+        .{ .sql = "SELECT SUM(1.20), AVG(1.20) FROM things", .rows = &.{.{ "4.80", "1.20000000000000000000" }} },
+        .{ .sql = "SELECT SUM(0.1 + 0.2), AVG(0.1 + 0.2) FROM things", .rows = &.{.{ "1.2", "0.30000000000000000000" }} },
         .{ .sql = "SELECT SUM('1.20'::numeric + _id::numeric), AVG('1.20'::numeric + _id::numeric) FROM things", .rows = &.{.{ "10.80", "2.7000000000000000" }} },
         .{ .sql = "SELECT SUM('1.20'::numeric + _id::numeric), AVG('1.20'::numeric + _id::numeric) FROM things GROUP BY _id::bigint % 2 ORDER BY _id::bigint % 2", .rows = &.{ .{ "4.40", "2.2000000000000000" }, .{ "6.40", "3.2000000000000000" } } },
         .{ .sql = "SELECT SUM(DISTINCT '1.20'::numeric), AVG(DISTINCT '1.20'::numeric) FROM things", .rows = &.{.{ "1.20", "1.20000000000000000000" }} },

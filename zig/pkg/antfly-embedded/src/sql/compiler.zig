@@ -382,19 +382,20 @@ const Parser = struct {
         if (!self.peek(.number)) return self.fail(if (self.pos == self.tokens.len or self.peek(.semicolon) or self.peek(.rparen)) error.InvalidSqlSyntax else error.UnsupportedSqlShape, "expected a literal or positional parameter; expression is not supported");
         const t = self.tokens[self.pos];
         self.pos += 1;
-        if (std.mem.indexOfAny(u8, t.text, ".eE") != null) {
-            const parsed = std.fmt.parseFloat(f64, t.text) catch return self.fail(error.InvalidSqlNumber, "invalid numeric literal");
-            if (!std.math.isFinite(parsed)) return self.fail(error.InvalidSqlNumber, "numeric literal must be finite");
-            return .{ .number = if (negative) -parsed else parsed };
-        }
-        const magnitude = std.fmt.parseInt(u64, t.text, 10) catch return self.fail(error.InvalidSqlNumber, "integer literal exceeds 64-bit range");
+        const radix = t.text.len > 2 and t.text[0] == '0' and std.mem.indexOfScalar(u8, "xXoObB", t.text[1]) != null;
+        if (!radix and std.mem.indexOfAny(u8, t.text, ".eE") != null) return self.numericLiteral(t.text, negative);
+        const magnitude = std.fmt.parseInt(u64, t.text, 0) catch return self.numericLiteral(t.text, negative);
         if (negative) {
-            if (magnitude > @as(u64, std.math.maxInt(i64)) + 1) return self.fail(error.InvalidSqlNumber, "integer literal exceeds 64-bit range");
+            if (magnitude > @as(u64, std.math.maxInt(i64)) + 1) return self.numericLiteral(t.text, negative);
             if (magnitude == @as(u64, std.math.maxInt(i64)) + 1) return .{ .integer = std.math.minInt(i64) };
             return .{ .integer = -@as(i64, @intCast(magnitude)) };
         }
-        if (magnitude > std.math.maxInt(i64)) return self.fail(error.InvalidSqlNumber, "integer literal exceeds 64-bit range");
+        if (magnitude > std.math.maxInt(i64)) return self.numericLiteral(t.text, negative);
         return .{ .integer = @intCast(magnitude) };
+    }
+
+    fn numericLiteral(self: *Parser, text: []const u8, negative: bool) Error!ast.Value {
+        return .{ .numeric = if (negative) try std.fmt.allocPrint(self.alloc, "-{s}", .{text}) else try self.alloc.dupe(u8, text) };
     }
 
     fn scalarNode(self: *Parser, expression: ast.Scalar) Error!*const ast.Scalar {
@@ -2672,8 +2673,11 @@ test "compiler bounds resources and validates parameters and numbers" {
     try std.testing.expectError(error.SqlLimitExceeded, compile(std.testing.allocator, "SELECT * FROM t WHERE (((a=1)))", .{ .max_depth = 2 }));
     try std.testing.expectError(error.InvalidSqlParameter, compile(std.testing.allocator, "DELETE FROM t WHERE x=$0", .{}));
     try std.testing.expectError(error.InvalidSqlParameter, compile(std.testing.allocator, "DELETE FROM t WHERE x=$1025", .{}));
-    try std.testing.expectError(error.InvalidSqlNumber, compile(std.testing.allocator, "INSERT INTO t(x) VALUES (9223372036854775808)", .{}));
-    try std.testing.expectError(error.InvalidSqlNumber, compile(std.testing.allocator, "INSERT INTO t(x) VALUES (1e9999)", .{}));
+    for ([_][]const u8{ "SELECT 9223372036854775808", "SELECT 1e9999" }) |sql| {
+        var exact = try compile(std.testing.allocator, sql, .{});
+        defer exact.deinit();
+        try std.testing.expect(exact.statement.select.columns[0].expression.?.literal == .numeric);
+    }
     try std.testing.expectError(error.DuplicateSqlColumn, compile(std.testing.allocator, "UPDATE t SET x=1,X=2", .{}));
 }
 

@@ -179,8 +179,12 @@ pub const Program = struct {
         return switch (self.instructions[index].operation) {
             .literal => true,
             .cast => |cast| self.literalInstruction(cast.operand),
+            .unary => |unary| self.literalInstruction(unary.operand),
             .call => |call| blk: {
-                if (call.function != .@"$array" and call.function != .string_to_array) break :blk false;
+                switch (call.function) {
+                    .@"$array", .string_to_array, .abs, .ceil, .floor, .round, .trunc, .sign, .mod => {},
+                    else => break :blk false,
+                }
                 for (call.args) |arg| if (!self.literalInstruction(arg)) break :blk false;
                 break :blk true;
             },
@@ -1137,7 +1141,12 @@ fn common(left: Type, right: Type) !Type {
         return .{ .kind = .array, .element_type = element, .nullable = left.nullable or right.nullable };
     }
     const kind = if (left.kind == null) right.kind else if (right.kind == null) left.kind else if (left.kind == right.kind) left.kind else if ((left.kind == .uuid and right.kind == .string) or (left.kind == .string and right.kind == .uuid)) ast.ColumnType.uuid else if (numeric(left.kind) and numeric(right.kind)) ast.ColumnType.number else return error.SqlTypeMismatch;
-    const element: ?arrays.ElementType = if (left.kind == null) right.element_type else if (right.kind == null) left.element_type else if (kind == .integer) (if (left.element_type == null or right.element_type == null or left.element_type == .int64 or right.element_type == .int64) .int64 else if (left.element_type == .int32 or right.element_type == .int32) .int32 else .int16) else if (kind == .number) (if (left.element_type == .float64 or right.element_type == .float64) .float64 else if (left.element_type == .float32 or right.element_type == .float32) .float32 else if (left.element_type == .numeric or right.element_type == .numeric) .numeric else null) else left.element_type orelse right.element_type;
+    const element: ?arrays.ElementType = if (left.kind == null) right.element_type else if (right.kind == null) left.element_type else if (kind == .integer)
+        (if (left.element_type == null or right.element_type == null or left.element_type == .int64 or right.element_type == .int64) .int64 else if (left.element_type == .int32 or right.element_type == .int32) .int32 else .int16)
+    else if (kind == .number)
+        (if (left.element_type == .float64 or right.element_type == .float64 or (left.kind == .number and left.element_type == null) or (right.kind == .number and right.element_type == null)) .float64 else if (left.element_type == .float32 or right.element_type == .float32) .float32 else if (left.element_type == .numeric or right.element_type == .numeric) .numeric else null)
+    else
+        left.element_type orelse right.element_type;
     return .{ .kind = kind, .element_type = element, .nullable = left.nullable or right.nullable };
 }
 
@@ -1153,9 +1162,9 @@ fn literalType(value: ast.Value) Type {
         .null, .parameter => null,
         .boolean => .boolean,
         .integer => .integer,
-        .number => .number,
+        .number, .numeric => .number,
         .string => .string,
-    }, .element_type = if (value == .integer) (if (std.math.cast(i32, value.integer) != null) .int32 else .int64) else null, .nullable = value == .null or value == .parameter };
+    }, .element_type = if (value == .numeric) .numeric else if (value == .integer) (if (std.math.cast(i32, value.integer) != null) .int32 else .int64) else null, .nullable = value == .null or value == .parameter };
 }
 pub fn statementConstant(node: *const ast.Scalar) bool {
     return switch (node.*) {
@@ -1570,7 +1579,8 @@ fn arity(function: Function, count: usize) !void {
         .array_length, .array_lower, .array_upper => count == 2,
         .ai_decide, .ai_probability => count == 3,
         .ai_choice, .ai_score => count == 4,
-        .abs, .lower, .upper, .length, .octet_length, .ceil, .floor, .round, .trunc, .sign, .sqrt, .to_timestamp, .current_setting, .to_jsonb, .bit_length, .jsonb_typeof, .reverse, .ascii, .chr => count == 1,
+        .abs, .lower, .upper, .length, .octet_length, .ceil, .floor, .sign, .sqrt, .to_timestamp, .current_setting, .to_jsonb, .bit_length, .jsonb_typeof, .reverse, .ascii, .chr => count == 1,
+        .round, .trunc => count == 1 or count == 2,
         .concat_ws => count >= 2,
         .jsonb_build_object => count % 2 == 0,
         .jsonb_extract_path_text => count >= 2,
@@ -1676,11 +1686,18 @@ const Binder = struct {
                 if (cast.type == .array and cast.element_type == null) return error.InvalidSqlProgram;
                 if (cast.type == .array) try self.typeArrayConstructors(cast.operand, cast.element_type.?, depth + 1);
                 const source = try self.infer(cast.operand, depth + 1);
+                if (cast.coercion == .function and cast.type == .number and source.kind != null) {
+                    // An explicit text/date/boolean cast is not an implicit
+                    // numeric-function overload. Only unknown string literals
+                    // can acquire that argument type during resolution.
+                    const unknown = cast.operand.* == .literal and cast.operand.literal == .string;
+                    if (!unknown and !numeric(source.kind)) return error.SqlUndefinedFunction;
+                }
                 if (cast.type == .array and source.kind != null and source.kind != .array and source.kind != .string) return error.SqlTypeMismatch;
                 if (cast.type == .array and source.kind == .array and !builtin_cast.allowed(source.element_type.?, cast.element_type.?)) return error.SqlCannotCoerce;
                 if (cast.type != .array and cast.element_type != null and source.kind != null and source.kind != .array and source.kind != .datetime) {
                     const source_element = source.element_type orelse try arrayElementType(source.kind.?);
-                    if (!builtin_cast.allowed(source_element, cast.element_type.?)) return error.SqlCannotCoerce;
+                    if (!builtin_cast.allowed(source_element, cast.element_type.?)) return if (cast.coercion == .function) error.SqlUndefinedFunction else error.SqlCannotCoerce;
                 }
                 // Default decimal constructors need an exact NUMERIC array
                 // representation before narrowing to integers. An explicit
@@ -1883,6 +1900,15 @@ const Binder = struct {
                     break :blk .{ .kind = .boolean, .nullable = true };
                 }
                 var merged: Type = .{};
+                if ((function == .round or function == .trunc) and call.args.len == 2) {
+                    const value = try self.infer(call.args[0], depth + 1);
+                    const scale = try self.infer(call.args[1], depth + 1);
+                    const unknown_value = call.args[0].* == .literal and call.args[0].literal == .string;
+                    const unknown_scale = call.args[1].* == .literal and call.args[1].literal == .string;
+                    if (value.kind != null and !unknown_value and (!numeric(value.kind) or (value.element_type != null and builtin_cast.floating(value.element_type.?)))) return error.SqlUndefinedFunction;
+                    if (scale.kind != null and !unknown_scale and (scale.kind != .integer or (scale.element_type != null and scale.element_type != .int16 and scale.element_type != .int32))) return error.SqlUndefinedFunction;
+                    break :blk .{ .kind = .number, .element_type = .numeric, .nullable = value.nullable or scale.nullable };
+                }
                 if (regexFunction(function)) |regex| {
                     const replace_start = function == .regexp_replace and (call.args.len > 4 or (call.args.len == 4 and (try self.infer(call.args[3], depth + 1)).kind == .integer));
                     var nullable = function == .regexp_substr;
@@ -1926,6 +1952,15 @@ const Binder = struct {
                 };
                 if (function == .abs or function == .ceil or function == .floor or function == .round or function == .trunc or function == .sign or function == .sqrt or function == .power or function == .mod) {
                     if (merged.kind != null and !numeric(merged.kind)) return error.SqlTypeMismatch;
+                }
+                switch (function) {
+                    .ceil, .floor, .round, .trunc, .sign => if (merged.element_type != .numeric) {
+                        // PostgreSQL has NUMERIC and double-precision overloads,
+                        // not integer or real overloads, for these functions.
+                        merged.kind = .number;
+                        merged.element_type = .float64;
+                    },
+                    else => {},
                 }
                 break :blk .{ .element_type = switch (function) {
                     .sqrt, .power, .date_part => .float64,
@@ -2001,6 +2036,11 @@ const Binder = struct {
 
     fn compileArrayContext(self: *Binder, expression: *const ast.Scalar, expected: ?ast.ColumnType, array_element: ?arrays.ElementType, depth: usize) anyerror!u32 {
         if (depth >= self.limits.depth or self.instructions.items.len >= self.limits.nodes) return error.SqlProgramLimitExceeded;
+        if (expression.* == .cast and expression.cast.type == .number and expression.cast.element_type != null and builtin_cast.floating(expression.cast.element_type.?)) {
+            const operand = expression.cast.operand;
+            if (operand.* == .literal and operand.literal == .numeric)
+                return self.compileArrayContext(operand, .number, expression.cast.element_type, depth + 1);
+        }
         const empty_constructor = expression.* == .call and std.mem.eql(u8, expression.call.name, "$array") and expression.call.args.len == 0;
         if (depth == 0 and empty_constructor and self.limits.assignment) return error.UnknownSqlArrayType;
         var kind = if (empty_constructor and array_element != null) Type{ .kind = .array, .element_type = array_element, .nullable = false } else try self.infer(expression, depth);
@@ -2011,6 +2051,18 @@ const Binder = struct {
         if (kind.kind == .array and kind.element_type == null) kind.element_type = array_element;
         if (expected == .uuid and expression.* == .literal and expression.literal == .string) kind.kind = .uuid;
         var instruction: Instruction = .{ .type = kind, .operation = undefined };
+        if (expression.* == .literal and expression.literal == .numeric and expected == .number and array_element != null and builtin_cast.floating(array_element.?)) {
+            // Resolve a proven floating-domain constant once, retaining vector
+            // eligibility without converting any NUMERIC-domain expression.
+            var work: arrays.Budget = .{};
+            const value = try numericTextLeaky(self.alloc, expression.literal.numeric, &work);
+            var evaluator: Evaluator = .{ .program = undefined, .alloc = self.alloc, .cells = &.{}, .parameters = &.{}, .limits = .{} };
+            const converted = try evaluator.castDatumBuiltin(value, .numeric, array_element.?);
+            instruction.type = .{ .kind = .number, .element_type = array_element, .nullable = false };
+            instruction.operation = .{ .literal = converted.value };
+            try self.instructions.append(self.alloc, instruction);
+            return @intCast(self.instructions.items.len - 1);
+        }
         instruction.operation = switch (expression.*) {
             .literal => |value| if (value == .parameter) blk: {
                 if (kind.kind == .array and !self.typed_parameters) return error.UnsupportedSqlShape;
@@ -2031,6 +2083,7 @@ const Binder = struct {
                 .boolean => |v| .{ .bool = v },
                 .integer => |v| .{ .integer = v },
                 .number => |v| .{ .float = v },
+                .numeric => |v| .{ .number_string = try self.alloc.dupe(u8, v) },
                 .string => |v| .{ .string = if (kind.kind == .uuid) @import("../common/uuid.zig").canonicalAlloc(self.alloc, v) catch |err| switch (err) {
                     error.InvalidUuid => return error.SqlTypeMismatch,
                     else => return err,
@@ -2105,6 +2158,16 @@ const Binder = struct {
                     break :blk .{ .call = .{ .function = function, .args = &.{}, .setting_identity = resolved.identity } };
                 }
                 const args = try self.alloc.alloc(u32, call.args.len);
+                if ((function == .round or function == .trunc) and call.args.len == 2) {
+                    for (call.args, args, 0..) |arg, *out, i| {
+                        const target: arrays.ElementType = if (i == 0) .numeric else .int32;
+                        const desired: ast.ColumnType = if (i == 0) .number else .integer;
+                        const coercion = try self.alloc.create(ast.Scalar);
+                        coercion.* = .{ .cast = .{ .operand = arg, .type = desired, .element_type = target } };
+                        out.* = try self.compileArrayContext(coercion, desired, target, depth + 1);
+                    }
+                    break :blk .{ .call = .{ .function = function, .args = args } };
+                }
                 if (regexFunction(function)) |regex| {
                     const replace_start = function == .regexp_replace and (call.args.len > 4 or (call.args.len == 4 and (try self.infer(call.args[3], depth + 1)).kind == .integer));
                     for (call.args, args, 0..) |arg, *out, i| {
@@ -2119,6 +2182,15 @@ const Binder = struct {
                     }
                     break :blk .{ .call = .{ .function = function, .args = args } };
                 }
+                if (kind.element_type == .float64) switch (function) {
+                    .ceil, .floor, .round, .trunc, .sign => {
+                        const coercion = try self.alloc.create(ast.Scalar);
+                        coercion.* = .{ .cast = .{ .operand = call.args[0], .type = .number, .element_type = .float64 } };
+                        args[0] = try self.compileArrayContext(coercion, .number, .float64, depth + 1);
+                        break :blk .{ .call = .{ .function = function, .args = args } };
+                    },
+                    else => {},
+                };
                 if (arrayCompatibleFunction(function)) {
                     const element = try self.arrayCompatibleElement(call, function, depth);
                     for (call.args, args, 0..) |arg, *out, i| {
@@ -2374,6 +2446,7 @@ const Evaluator = struct {
                     if (source_element == .jsonb and datum.value == .null and target != .text and target != .jsonb) break :blk .{};
                     break :blk try self.castDatumBuiltin(datum, source_element, target);
                 }
+                if (datum.numeric != null) break :blk try self.castDatumBuiltin(datum, .numeric, try arrayElementType(cast.type));
                 if (cast.type == .string and self.program.instructions[cast.operand].type.kind == .json) break :blk Datum.json(.{ .string = try self.jsonText(datum.value) });
                 if (cast.type == .json and self.program.instructions[cast.operand].type.kind == .json) break :blk datum;
                 if (datum.value == .null and cast.type == .string) break :blk Datum.json(.{ .string = "null" });
@@ -2443,8 +2516,14 @@ const Evaluator = struct {
                 try self.charge(joined.allocated_bytes);
                 break :blk Datum.json(joined.value);
             } else if (binary.op == .eq or binary.op == .neq or binary.op == .lt or binary.op == .lte or binary.op == .gt or binary.op == .gte or binary.op == .is_distinct or binary.op == .is_not_distinct) blk: {
-                const left = try self.runDatum(binary.left, depth + 1);
-                const right = try self.runDatum(binary.right, depth + 1);
+                var left = try self.runDatum(binary.left, depth + 1);
+                var right = try self.runDatum(binary.right, depth + 1);
+                // Numeric/real operators resolve in double precision, while
+                // NUMERIC/integer comparisons retain exact integer identity.
+                if ((left.numeric != null and right.value == .float) or (right.numeric != null and left.value == .float)) {
+                    if (left.numeric != null) left = try self.castDatumBuiltin(left, .numeric, .float64);
+                    if (right.numeric != null) right = try self.castDatumBuiltin(right, .numeric, .float64);
+                }
                 if (binary.op == .is_distinct or binary.op == .is_not_distinct) {
                     const equal = if (left.sql_null or right.sql_null) left.sql_null and right.sql_null else (try compareDatums(left, right)) == .eq;
                     break :blk Datum.json(.{ .bool = equal == (binary.op == .is_not_distinct) });
@@ -2643,11 +2722,14 @@ const Evaluator = struct {
                         if (probe.array != null or op != .integer or every != .bool) return error.SqlTypeMismatch;
                         const compare_op = std.enums.fromInt(arrays.Comparison, op.integer) orelse return error.InvalidSqlProgram;
                         const mixed_number = probe.value == .float and arrayScalarType(array.element_type) == .integer;
-                        const element: arrays.Element = if (probe.sql_null) .{} else arrays.Element.json(try self.convert(probe.value, if (mixed_number) .number else arrayScalarType(array.element_type)));
-                        var work: arrays.Budget = .{ .remaining = self.limits.steps -| self.steps };
-                        const initial = work.remaining;
-                        const accepted = if (mixed_number) try mixedNumberQuantified(array.*, element, compare_op, every.bool, &work) else try array.quantified(element, compare_op, if (every.bool) .all else .any, &work);
-                        self.steps += initial - work.remaining;
+                        const exact_number = probe.numeric != null or array.element_type == .numeric;
+                        const element: arrays.Element = if (exact_number) probe else if (probe.sql_null) .{} else arrays.Element.json(try self.convert(probe.value, if (mixed_number) .number else arrayScalarType(array.element_type)));
+                        const accepted = if (exact_number) try self.numericQuantified(probe, array.*, compare_op, every.bool) else ordinary: {
+                            var work: arrays.Budget = .{ .remaining = self.limits.steps -| self.steps };
+                            const initial = work.remaining;
+                            defer self.steps += initial - work.remaining;
+                            break :ordinary if (mixed_number) try mixedNumberQuantified(array.*, element, compare_op, every.bool, &work) else try array.quantified(element, compare_op, if (every.bool) .all else .any, &work);
+                        };
                         break :blk if (accepted) |value| Datum.json(.{ .bool = value }) else .{};
                     },
                     .cardinality, .array_ndims, .array_length, .array_lower, .array_upper => {
@@ -2802,6 +2884,7 @@ const Evaluator = struct {
                         }
                         break :blk Datum.json(.{ .string = try output.toOwnedSlice(self.alloc) });
                     },
+                    .abs, .ceil, .floor, .round, .trunc, .sign, .mod => break :blk if (instruction.type.element_type == .numeric) try self.numericFunction(call.function, call.args, depth + 1) else Datum.fromJson(try self.invokeFunction(call.function, call.args, self.program.translations.get(index), depth + 1)),
                     else => break :blk Datum.fromJson(try self.invokeFunction(call.function, call.args, self.program.translations.get(index), depth + 1)),
                 }
             },
@@ -3041,6 +3124,86 @@ const Evaluator = struct {
         const text = try exact.format(&context, number.*);
         try self.charge(text.len);
         return if (number.kind == .finite) .{ .number_string = text } else .{ .string = text };
+    }
+
+    fn numericFunction(self: *Evaluator, function: Function, args: []const u32, depth: usize) !Datum {
+        const exact = @import("numeric_value.zig");
+        const first = try self.runDatum(args[0], depth);
+        if (first.sql_null) return .{};
+        const input = try self.castDatumBuiltin(first, self.program.instructions[args[0]].type.element_type, .numeric);
+        if (function == .mod) {
+            const second = try self.runDatum(args[1], depth);
+            if (second.sql_null) return .{};
+            return self.numericArithmetic(.modulo, input, try self.castDatumBuiltin(second, self.program.instructions[args[1]].type.element_type, .numeric));
+        }
+        const value = input.numeric.?.*;
+        if (function == .abs or function == .sign) {
+            try self.charge(@sizeOf(exact.Value));
+            const result = try self.alloc.create(exact.Value);
+            if (function == .abs) {
+                result.* = value;
+                result.negative = false;
+                if (result.kind == .negative_infinity) result.kind = .positive_infinity;
+            } else result.* = if (value.kind == .nan) .{ .kind = .nan } else if (value.isZero()) .{} else .{ .digits = &.{1}, .negative = value.negative or value.kind == .negative_infinity };
+            return Datum.typedNumeric(result);
+        }
+        const scale: i32 = if (args.len == 2) selected: {
+            const requested = try self.runDatum(args[1], depth);
+            if (requested.sql_null) return .{};
+            if (requested.value != .integer) return error.SqlTypeMismatch;
+            break :selected std.math.cast(i32, requested.value.integer) orelse return error.SqlNumericOutOfRange;
+        } else 0;
+        // Evaluate both arguments before borrowing the remaining work budget.
+        // Nested scale expressions must not receive a second copy of it.
+        var ctx: exact.Context = .{ .alloc = self.alloc, .remaining = self.limits.steps -| self.steps, .max_output_bytes = self.limits.output_bytes -| self.bytes };
+        const before = ctx.remaining;
+        defer self.steps += @intCast(before - ctx.remaining);
+        var result = try exact.quantize(&ctx, value, scale, if (function == .round) .half_away else .truncate);
+        errdefer result.deinit();
+        if (function == .ceil or function == .floor) {
+            const order = try exact.order(&ctx, value, result.value);
+            if ((function == .ceil and order == .gt) or (function == .floor and order == .lt)) {
+                const one: exact.Value = .{ .digits = &.{1} };
+                const adjusted = if (function == .ceil) try exact.add(&ctx, result.value, one) else try exact.subtract(&ctx, result.value, one);
+                result.deinit();
+                result = adjusted;
+            }
+        }
+        try self.charge(@sizeOf(exact.Value) + result.allocation.len * 2);
+        const owned = try self.alloc.create(exact.Value);
+        owned.* = result.value;
+        return Datum.typedNumeric(owned);
+    }
+
+    fn numericQuantified(self: *Evaluator, probe: Datum, array: arrays.Value, op: arrays.Comparison, every: bool) !?bool {
+        const exact = @import("numeric_value.zig");
+        const floating = builtin_cast.floating(array.element_type) or probe.value == .float;
+        const needle = if (!probe.sql_null and floating) try self.castDatumBuiltin(probe, null, .float64) else probe;
+        var unknown = false;
+        for (array.elements) |element| {
+            if (self.steps >= self.limits.steps) return error.SqlProgramLimitExceeded;
+            self.steps += 1;
+            if (needle.sql_null or element.sql_null) {
+                unknown = true;
+                continue;
+            }
+            const order = if (floating) float: {
+                const right = try self.castDatumBuiltin(element, array.element_type, .float64);
+                break :float try compare(needle.value, right.value);
+            } else logical: {
+                var left_storage: [5]u16 = undefined;
+                var right_storage: [5]u16 = undefined;
+                const left = if (needle.numeric) |value| value.* else if (needle.value == .integer) exact.integerView(needle.value.integer, &left_storage) else return error.SqlTypeMismatch;
+                const right = if (element.numeric) |value| value.* else if (element.value == .integer) exact.integerView(element.value.integer, &right_storage) else return error.SqlTypeMismatch;
+                var context: exact.Context = .{ .alloc = self.alloc, .remaining = self.limits.steps -| self.steps };
+                const before = context.remaining;
+                defer self.steps += @intCast(before - context.remaining);
+                break :logical try exact.order(&context, left, right);
+            };
+            const accepted = op.accepts(order);
+            if (accepted != every) return accepted;
+        }
+        return if (unknown) null else every;
     }
 
     fn numericArithmetic(self: *Evaluator, operation: ast.Scalar.Binary, left: Datum, right: Datum) !Datum {
@@ -3348,7 +3511,7 @@ const Evaluator = struct {
                 .ceil => @ceil(first.float),
                 .floor => @floor(first.float),
                 .trunc => @trunc(first.float),
-                else => @round(first.float),
+                else => roundTiesEven(first.float),
             }) else error.SqlTypeMismatch,
             .sign => return switch (first) {
                 .integer => |value| .{ .integer = if (value < 0) -1 else if (value > 0) 1 else 0 },
@@ -3651,6 +3814,14 @@ const Evaluator = struct {
     }
 };
 
+fn roundTiesEven(value: f64) f64 {
+    const magnitude = @abs(value);
+    const integral = @floor(magnitude);
+    const fraction = magnitude - integral;
+    const rounded = if (fraction > 0.5 or (fraction == 0.5 and @mod(integral, 2) != 0)) integral + 1 else integral;
+    return std.math.copysign(rounded, value);
+}
+
 fn finite(value: f64) !Json {
     if (!std.math.isFinite(value)) return error.SqlNumericOutOfRange;
     return .{ .float = value };
@@ -3951,12 +4122,37 @@ test "SQL NUMERIC scalar operators retain exact values and scale" {
     }
 }
 
+test "SQL NUMERIC prepared literals rounding and integer array probes require no hot allocation" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        "9007199254740993.1200",
+        "round(1.255, 2)",
+        "abs(-1.2300)",
+        "9007199254740993.0 = ANY(ARRAY[9007199254740992,9007199254740993])",
+        "-9223372036854775808.0 = ANY(ARRAY[-9223372036854775808])",
+    }) |sql| {
+        var compiled = try @import("compiler.zig").compileScalar(a, sql, .{});
+        var program = bind(a, compiled.expression, &.{}, &.{}, .{}) catch |err| {
+            compiled.deinit();
+            return err;
+        };
+        defer program.deinit();
+        compiled.deinit();
+        var none = std.heap.FixedBufferAllocator.init(&.{});
+        for (0..1000) |_| {
+            const result = try program.evaluate(none.allocator(), &.{}, &.{}, .{});
+            try std.testing.expect(!result.sql_null);
+            if (result.numeric == null) try std.testing.expectEqual(true, result.value.bool);
+        }
+    }
+}
+
 test "SQL scalar bound programs preserve lazy truth exact integers and function semantics" {
     const cases = [_]struct { sql: []const u8, expected: []const u8 }{
         .{ .sql = "1 + 2 * 3", .expected = "7" },
         .{ .sql = "trunc(-7.9)", .expected = "-7" },
         .{ .sql = "trunc(7.9)", .expected = "7" },
-        .{ .sql = "trunc(9007199254740993)", .expected = "9007199254740993" },
+        .{ .sql = "trunc(9007199254740993)", .expected = "9007199254740992" },
         .{ .sql = "trunc(NULL)", .expected = "null" },
         .{ .sql = "sign(-9223372036854775808)", .expected = "-1" },
         .{ .sql = "sign(9223372036854775807)", .expected = "1" },
@@ -4012,7 +4208,9 @@ test "SQL scalar bound programs preserve lazy truth exact integers and function 
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer arena.deinit();
         const value = try program.evaluate(arena.allocator(), &.{}, &.{}, .{});
-        const encoded = try std.json.Stringify.valueAlloc(arena.allocator(), value.value, .{});
+        var exact_context: @import("numeric_value.zig").Context = .{ .alloc = arena.allocator() };
+        const logical: Json = if (value.numeric) |number| .{ .number_string = try @import("numeric_value.zig").format(&exact_context, number.*) } else value.value;
+        const encoded = try std.json.Stringify.valueAlloc(arena.allocator(), logical, .{});
         try std.testing.expectEqualStrings(case.expected, encoded);
     }
 }
@@ -4023,7 +4221,7 @@ test "SQL trunc and sign reject invalid types arity and nonfinite numeric inputs
         defer compiled.deinit();
         try std.testing.expectError(error.SqlTypeMismatch, bind(std.testing.allocator, compiled.expression, &.{}, &.{}, .{}));
     }
-    for ([_][]const u8{ "trunc(1, 2)", "sign()" }) |sql| {
+    for ([_][]const u8{ "trunc(1, 2, 3)", "sign()" }) |sql| {
         var compiled = try @import("compiler.zig").compileScalar(std.testing.allocator, sql, .{});
         defer compiled.deinit();
         try std.testing.expectError(error.InvalidSqlParameters, bind(std.testing.allocator, compiled.expression, &.{}, &.{}, .{}));

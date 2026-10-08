@@ -169,6 +169,21 @@ pub fn bindDefault(alloc: std.mem.Allocator, value: ast.Value, kind: ast.ColumnT
 /// an INSERT/UPDATE DEFAULT failure, not a schema-publication failure. Keep
 /// the source literal separate from its target domain in the durable plan.
 pub fn defaultExpression(alloc: std.mem.Allocator, value: ast.Value, kind: ast.ColumnType, element: ?@import("array_value.zig").ElementType) !std.json.Value {
+    if (value == .numeric and kind == .number) {
+        if (element == .numeric) return error.UnsupportedSqlShape;
+        // Native real/double defaults retain their assignment cast. Parse the
+        // exact literal directly at the requested width, avoiding a double
+        // rounding through f64 for real defaults.
+        const exact = @import("numeric_value.zig");
+        var context: exact.Context = .{ .alloc = alloc };
+        var source = try exact.parse(&context, value.numeric);
+        defer source.deinit();
+        const text = try exact.format(&context, source.value);
+        defer alloc.free(text);
+        const casts = @import("builtin_cast.zig");
+        const number = if (element == .float32) try casts.floatValue(f32, .{ .string = text }) else try casts.floatValue(f64, .{ .string = text });
+        return defaultExpression(alloc, .{ .number = number }, kind, element);
+    }
     const numeric = (kind == .integer and value == .integer) or (kind == .number and (value == .integer or value == .number));
     if (numeric) {
         const source: ast.ColumnType = if (value == .integer) .integer else .number;
@@ -234,7 +249,7 @@ test "SQL precise scalar DDL preserves CREATE ALTER default assignment casts" {
     try std.testing.expectEqualStrings("float32", properties.get("f").?.object.get("x-antfly-sql-type").?.string);
     const defaults = schema.object.get("column_defaults").?.array.items;
     try std.testing.expectEqualStrings("float32", defaults[1].object.get("expression").?.object.get("sql_type").?.string);
-    try std.testing.expectEqual(@as(f64, 0.1), defaults[1].object.get("expression").?.object.get("args").?.array.items[0].object.get("value").?.float);
+    try std.testing.expectEqual(@as(f64, @as(f32, 0.1)), defaults[1].object.get("expression").?.object.get("args").?.array.items[0].object.get("value").?.float);
     for ([_][]const u8{ "CREATE TABLE bad (n smallint DEFAULT 32768)", "CREATE TABLE bad (n integer DEFAULT 2147483648)" }) |sql| {
         var bad = try @import("compiler.zig").compile(a, sql, .{});
         defer bad.deinit();

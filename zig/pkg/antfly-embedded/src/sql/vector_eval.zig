@@ -662,7 +662,7 @@ test "SQL direct column kernels preserve physical selection and SQL nulls" {
     const nulls = [_]u8{ 0, 0, 0, 1, 0, 0 };
     const columns = [_]types.ColumnVector{.{ .name = "n", .values = .{ .i64 = &numbers }, .nulls = .{ .bytes = &nulls } }};
     const page = @import("catalog.zig").ColumnPage{ .batch = .{ .snapshot = .{ .table_id = "t", .snapshot_id = "s" }, .row_refs = &refs, .columns = &columns }, .selection = &.{ 5, 3, 1, 0, 1 } };
-    for ([_][]const u8{ "n * 2", "n > 9007199254740992", "n + 0.5", "n IS NOT DISTINCT FROM NULL" }) |sql| {
+    for ([_][]const u8{ "n * 2", "n > 9007199254740992", "n + 0.5::double precision", "n IS NOT DISTINCT FROM NULL" }) |sql| {
         var compiled = try @import("compiler.zig").compileScalar(a, sql, .{});
         defer compiled.deinit();
         const bound_columns = [_]scalar.Column{.{ .name = "n", .type = .integer }};
@@ -674,6 +674,23 @@ test "SQL direct column kernels preserve physical selection and SQL nulls" {
             try std.testing.expectEqualDeep(try program.evaluate(arena.allocator(), &.{input}, &.{}, .{}), actual);
         }
     }
+}
+
+test "SQL NUMERIC integer decimal expressions retain exact scalar fallback instead of float kernels" {
+    const a = std.testing.allocator;
+    var compiled = try @import("compiler.zig").compileScalar(a, "n + 0.5", .{});
+    defer compiled.deinit();
+    var program = try scalar.bind(a, compiled.expression, &.{.{ .name = "n", .type = .integer }}, &.{}, .{});
+    defer program.deinit();
+    try std.testing.expectEqual(@import("array_value.zig").ElementType.numeric, program.output_type.element_type.?);
+    const input: Datum = Datum.json(.{ .integer = 9007199254740993 });
+    const cells = [_][]const Datum{ &.{input}, &.{input}, &.{input}, &.{input} };
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    try std.testing.expect((try evaluate(arena.allocator(), &program, &cells, &.{})) == null);
+    const result = try program.evaluate(arena.allocator(), &.{input}, &.{}, .{});
+    var context: @import("numeric_value.zig").Context = .{ .alloc = arena.allocator() };
+    try std.testing.expectEqualStrings("9007199254740993.5", try @import("numeric_value.zig").format(&context, result.numeric.?.*));
 }
 
 test "SQL shared scheduled column kernels match scalar values over permuted nullable pages" {

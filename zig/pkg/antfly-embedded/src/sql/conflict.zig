@@ -204,6 +204,7 @@ fn appendArbiterConditions(alloc: std.mem.Allocator, table: catalog.Table, expre
         .boolean => |value| .{ .bool = value },
         .integer => |value| .{ .integer = value },
         .number => |value| .{ .float = value },
+        .numeric => |value| .{ .number_string = value },
         .string => |value| .{ .string = value },
         .parameter => return error.InvalidSqlParameters,
     };

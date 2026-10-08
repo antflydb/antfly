@@ -113,11 +113,12 @@ pub fn same(a: *const ast.Scalar, b: *const ast.Scalar) bool {
         .column => |name| std.mem.eql(u8, name, b.column),
         .literal => |literal| if (std.meta.activeTag(literal) != std.meta.activeTag(b.literal)) false else switch (literal) {
             .string => |value| std.mem.eql(u8, value, b.literal.string),
+            .numeric => |value| std.mem.eql(u8, value, b.literal.numeric),
             inline else => |value, tag| std.meta.eql(value, @field(b.literal, @tagName(tag))),
         },
         .unary => |unary| unary.op == b.unary.op and same(unary.operand, b.unary.operand),
         .binary => |binary| binary.op == b.binary.op and same(binary.left, b.binary.left) and same(binary.right, b.binary.right),
-        .cast => |cast| cast.type == b.cast.type and same(cast.operand, b.cast.operand),
+        .cast => |cast| cast.type == b.cast.type and cast.element_type == b.cast.element_type and same(cast.operand, b.cast.operand),
         .call => |call| blk: {
             if (!std.mem.eql(u8, call.name, b.call.name) or call.star != b.call.star or call.distinct != b.call.distinct or (call.filter == null) != (b.call.filter == null) or call.args.len != b.call.args.len) break :blk false;
             // Query and window domains cannot lose their metadata through
@@ -182,7 +183,7 @@ const Builder = struct {
             if (call.filter) |filter| if (contains(filter)) return error.SqlGroupingError;
             const ordered_input = call.args[call.args.len - 1];
             if (self.inference) {
-                var value = if (kind == .continuous) try self.node(.{ .cast = .{ .operand = ordered_input, .type = .number } }) else ordered_input;
+                var value = if (kind == .continuous) try self.node(.{ .cast = .{ .operand = ordered_input, .type = .number, .element_type = .float64, .coercion = .function } }) else ordered_input;
                 // Array fractions preserve an array output shape during the
                 // source-domain inference pass too, not only at final bind.
                 if (kind != .mode and ((call.args[0].* == .cast and call.args[0].cast.type == .array) or (call.args[0].* == .call and std.mem.eql(u8, call.args[0].call.name, "$array"))))
@@ -197,7 +198,13 @@ const Builder = struct {
             const index = self.aggregates.items.len;
             try self.aggregates.append(self.alloc, input);
             try self.inputs.append(self.alloc, self.arguments.items.len);
-            try self.arguments.append(self.alloc, .{ .expression = ordered_input });
+            // PostgreSQL percentile_cont orders double precision (or interval),
+            // unlike percentile_disc/mode, which retain the input domain.
+            const physical_input = if (kind == .continuous)
+                try self.node(.{ .cast = .{ .operand = ordered_input, .type = .number, .element_type = .float64, .coercion = .function } })
+            else
+                ordered_input;
+            try self.arguments.append(self.alloc, .{ .expression = physical_input });
             try self.filters.append(self.alloc, if (call.filter != null) self.arguments.items.len else null);
             if (call.filter) |filter| try self.arguments.append(self.alloc, .{ .expression = filter });
             try self.ordered.append(self.alloc, .{ .index = index, .direct = direct, .original_direct = if (kind == .mode) null else call.args[0] });
@@ -240,7 +247,7 @@ const Builder = struct {
             .literal => input.*,
             .unary => |unary| .{ .unary = .{ .op = unary.op, .operand = try self.rewrite(unary.operand) } },
             .binary => |binary| .{ .binary = .{ .op = binary.op, .left = try self.rewrite(binary.left), .right = try self.rewrite(binary.right) } },
-            .cast => |cast| .{ .cast = .{ .type = cast.type, .element_type = cast.element_type, .operand = try self.rewrite(cast.operand) } },
+            .cast => |cast| .{ .cast = cast.withOperand(try self.rewrite(cast.operand)) },
             .call => |call| blk: {
                 const args = try self.alloc.alloc(*const ast.Scalar, call.args.len);
                 for (call.args, args) |arg, *out| out.* = try self.rewrite(arg);
@@ -503,6 +510,21 @@ test "aggregate HAVING cannot see even ambiguous output aliases" {
     try std.testing.expectError(error.UndefinedColumn, bind(arena.allocator(), null, compiled.statement.select, &.{}));
 }
 
+test "SQL NUMERIC expression identity shares owned literals without merging scales or cast domains" {
+    const a = std.testing.allocator;
+    for ([_]struct { left: []const u8, right: []const u8, equal: bool }{
+        .{ .left = "SUM(1.20)", .right = "SUM(1.20)", .equal = true },
+        .{ .left = "SUM(1.20)", .right = "SUM(1.2)", .equal = false },
+        .{ .left = "SUM(1.20::numeric)", .right = "SUM(1.20::double precision)", .equal = false },
+    }) |case| {
+        var left = try @import("compiler.zig").compileScalar(a, case.left, .{});
+        defer left.deinit();
+        var right = try @import("compiler.zig").compileScalar(a, case.right, .{});
+        defer right.deinit();
+        try std.testing.expectEqual(case.equal, same(left.expression, right.expression));
+    }
+}
+
 test "ordered aggregate binding separates grouped direct arguments and shares only compatible input domains" {
     const table: catalog.Table = .{ .id = 1, .physical_name = "t", .schema_version = 1, .columns = &.{
         .{ .name = "x", .path = "x", .type = .integer },
@@ -517,9 +539,11 @@ test "ordered aggregate binding separates grouped direct arguments and shares on
     const bound = try bind(arena.allocator(), table, compiled.statement.select, &parameters);
     try std.testing.expectEqual(ast.ColumnType.number, parameters[0].?);
     try std.testing.expectEqual(@as(usize, 5), bound.ordered.len);
-    try std.testing.expectEqual(@as(usize, 3), bound.ordered_class_count);
-    try std.testing.expectEqual(bound.ordered[0].sort_class, bound.ordered[1].sort_class);
-    try std.testing.expectEqual(bound.ordered[0].sort_class, bound.ordered[2].sort_class);
+    try std.testing.expectEqual(@as(usize, 4), bound.ordered_class_count);
+    // Continuous percentiles narrow to double; discrete and mode retain exact
+    // integers. Their sort streams cannot be shared above 2^53.
+    try std.testing.expect(bound.ordered[0].sort_class != bound.ordered[1].sort_class);
+    try std.testing.expectEqual(bound.ordered[1].sort_class, bound.ordered[2].sort_class);
     try std.testing.expect(bound.ordered[2].direct == null);
     try std.testing.expect(bound.ordered[3].filter != null);
     try std.testing.expect(bound.ordered[4].order.descending);

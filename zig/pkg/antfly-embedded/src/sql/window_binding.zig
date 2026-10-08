@@ -164,7 +164,7 @@ const Builder = struct {
         return self.node(switch (node_.*) {
             .binary => |part| .{ .binary = .{ .op = part.op, .left = try self.rewrite(part.left), .right = try self.rewrite(part.right) } },
             .unary => |part| .{ .unary = .{ .op = part.op, .operand = try self.rewrite(part.operand) } },
-            .cast => |part| .{ .cast = .{ .type = part.type, .element_type = part.element_type, .operand = try self.rewrite(part.operand) } },
+            .cast => |part| .{ .cast = part.withOperand(try self.rewrite(part.operand)) },
             .call => |part| blk: {
                 const args = try self.alloc.alloc(*const ast.Scalar, part.args.len);
                 for (part.args, args) |arg, *out| out.* = try self.rewrite(arg);

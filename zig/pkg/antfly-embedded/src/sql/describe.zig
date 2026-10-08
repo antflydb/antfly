@@ -156,10 +156,11 @@ pub fn describe(allocator: std.mem.Allocator, backend: catalog.Backend, compiled
 }
 
 fn assignmentLiteral(value: ast.Value, kind: ast.ColumnType) !ast.Value {
-    if (value == .parameter or value == .null) return value;
+    if (value == .parameter or value == .null or value == .numeric) return value;
     const raw: std.json.Value = switch (value) {
         .integer => |v| .{ .integer = v },
         .number => |v| .{ .float = v },
+        .numeric => unreachable,
         .boolean => |v| .{ .bool = v },
         .string => |v| .{ .string = v },
         .null, .parameter => unreachable,
@@ -867,6 +868,7 @@ pub fn bindLiteral(allocator: std.mem.Allocator, node: ast.Value, kind: ast.Colu
         .boolean => |value_| .{ .bool = value_ },
         .integer => |value_| .{ .integer = value_ },
         .number => |value_| .{ .float = value_ },
+        .numeric => |value_| .{ .number_string = value_ },
         .string => |value_| .{ .string = value_ },
         .parameter => unreachable,
     }, kind);

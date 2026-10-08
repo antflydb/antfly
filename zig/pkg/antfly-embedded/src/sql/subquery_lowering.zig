@@ -544,7 +544,7 @@ const Builder = struct {
             .column => return error.SqlGroupingError,
             .unary => |part| .{ .unary = .{ .op = part.op, .operand = try self.aggregateResult(part.operand, alias, columns) } },
             .binary => |part| .{ .binary = .{ .op = part.op, .left = try self.aggregateResult(part.left, alias, columns), .right = try self.aggregateResult(part.right, alias, columns) } },
-            .cast => |part| .{ .cast = .{ .type = part.type, .element_type = part.element_type, .operand = try self.aggregateResult(part.operand, alias, columns) } },
+            .cast => |part| .{ .cast = part.withOperand(try self.aggregateResult(part.operand, alias, columns)) },
             .call => |part| blk: {
                 if (part.subquery != null or part.window != null or part.filter != null or part.distinct or part.star) return error.UnsupportedSqlShape;
                 var copy = part;
@@ -1120,7 +1120,7 @@ const Builder = struct {
                 }
                 break :blk .{ .binary = .{ .op = part.op, .left = left, .right = try self.rewriteDemand(part.right, right_demand) } };
             },
-            .cast => |part| .{ .cast = .{ .type = part.type, .element_type = part.element_type, .operand = try self.rewriteDemand(part.operand, demand) } },
+            .cast => |part| .{ .cast = part.withOperand(try self.rewriteDemand(part.operand, demand)) },
             .case_when => |part| blk: {
                 const branches = try self.alloc.alloc(ast.Scalar.Branch, part.branches.len);
                 var remaining = demand;

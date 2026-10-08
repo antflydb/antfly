@@ -537,6 +537,20 @@ fn decodeInput(a: A, descriptor: scalar.Type, input: Input, limits: Limits, work
             if (datum.array != null or datum.patterns != null) return error.SqlTypeMismatch;
             var owned = datum;
             if (kind == .numeric and datum.numeric == null) {
+                if (datum.value == .float) {
+                    const exact = @import("numeric_value.zig");
+                    const parsed = conversion: {
+                        var context: exact.Context = .{ .alloc = a, .remaining = work.remaining, .max_output_bytes = limits.bytes };
+                        const initial = context.remaining;
+                        defer work.consume(initial - context.remaining) catch {};
+                        break :conversion try exact.fromFloat(&context, datum.value.float, false);
+                    };
+                    const value = try a.create(exact.Value);
+                    value.* = parsed.value;
+                    owned = scalar.Datum.typedNumeric(value);
+                    _ = try arrays.Value.initWithBudget(kind, &.{.{ .length = 1 }}, &.{owned}, .{ .bytes = limits.bytes }, work);
+                    return owned;
+                }
                 var buffer: [20]u8 = undefined;
                 const bytes = switch (datum.value) {
                     .integer => |integer| try std.fmt.bufPrint(&buffer, "{d}", .{integer}),

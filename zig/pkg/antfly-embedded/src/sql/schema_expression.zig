@@ -59,6 +59,9 @@ pub fn lowerColumns(alloc: std.mem.Allocator, columns: []const scalar.Column, ex
         // widths, however, travel with each operation rather than disappearing
         // into its coarse physical integer/number result kind.
         if (kind == .array) return error.UnsupportedSqlShape;
+        // Query NUMERIC support must not publish a decimal program into the
+        // native expression VM, whose row values still lack decimal limbs.
+        if (instruction.type.element_type == .numeric) return error.UnsupportedSqlShape;
         if (kind == .number and instruction.type.element_type == null) switch (instruction.operation) {
             .binary => |part| switch (part.op) {
                 .add, .subtract, .multiply, .divide => return error.UnsupportedSqlShape,

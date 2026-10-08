@@ -169,7 +169,7 @@ const Builder = struct {
         return switch (value.*) {
             .literal, .column => value,
             .unary => |part| self.node(.{ .unary = .{ .op = part.op, .operand = try self.rewrite(part.operand) } }),
-            .cast => |part| self.node(.{ .cast = .{ .type = part.type, .element_type = part.element_type, .operand = try self.rewrite(part.operand) } }),
+            .cast => |part| self.node(.{ .cast = part.withOperand(try self.rewrite(part.operand)) }),
             .binary => |part| self.node(.{ .binary = .{ .op = part.op, .left = try self.rewrite(part.left), .right = try self.rewrite(part.right) } }),
             .call => |part| blk: {
                 // The child binds later against completed phase identities.

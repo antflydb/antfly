@@ -577,6 +577,40 @@ pub fn subtract(ctx: *Context, left: Value, right: Value) !Owned {
     return add(ctx, left, right.negated());
 }
 
+/// Allocation-free exact integer view for comparisons and coercion planning.
+/// The caller's five groups cover every i64, including its negative minimum.
+pub fn integerView(value: i64, storage: *[5]u16) Value {
+    if (value == 0) return .{};
+    var remaining_integer: u64 = @abs(value);
+    var first: usize = storage.len;
+    while (remaining_integer != 0) : (remaining_integer /= base) {
+        first -= 1;
+        storage[first] = @intCast(remaining_integer % base);
+    }
+    var last: usize = storage.len;
+    while (storage[last - 1] == 0) last -= 1;
+    return .{ .digits = storage[first..last], .weight = @intCast(storage.len - first - 1), .negative = value < 0 };
+}
+
+test "SQL exact NUMERIC integer views cover i64 endpoints and trimmed groups without allocation" {
+    var no_memory = std.heap.FixedBufferAllocator.init(&.{});
+    var context: Context = .{ .alloc = no_memory.allocator() };
+    var parsing: Context = .{ .alloc = std.testing.allocator };
+    for ([_]i64{ 0, 1, -1, 9999, 10000, -100000000, 9007199254740993, std.math.minInt(i64), std.math.maxInt(i64) }) |integer| {
+        var digits: [5]u16 = undefined;
+        const view = integerView(integer, &digits);
+        var text: [20]u8 = undefined;
+        var expected = try parse(&parsing, try std.fmt.bufPrint(&text, "{d}", .{integer}));
+        defer expected.deinit();
+        try std.testing.expectEqual(std.math.Order.eq, try order(&context, view, expected.value));
+        try std.testing.expectEqual(integer < 0, view.negative);
+        if (view.digits.len != 0) {
+            try std.testing.expect(view.digits[0] != 0);
+            try std.testing.expect(view.digits[view.digits.len - 1] != 0);
+        }
+    }
+}
+
 pub fn quantize(ctx: *Context, value: Value, requested_scale: i32, mode: Rounding) !Owned {
     try ctx.charge(1);
     if (value.kind != .finite) return special(ctx.alloc, value.kind);
