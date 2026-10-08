@@ -1387,7 +1387,12 @@ const Parser = struct {
         try self.expectKeyword(.conflict);
         var columns: std.ArrayList([]const u8) = .empty;
         var expressions: std.ArrayList(*const ast.Scalar) = .empty;
+        const constraint_name = if (self.keyword(.on)) name: {
+            try self.expectKeyword(.constraint);
+            break :name try self.identifier();
+        } else null;
         if (self.take(.lparen)) {
+            if (constraint_name != null) return self.fail(error.InvalidSqlSyntax, "named conflict target cannot include inferred keys");
             while (true) {
                 try self.node();
                 const expression = try self.scalar(0, 0);
@@ -1397,10 +1402,11 @@ const Parser = struct {
             try self.expect(.rparen);
         }
         const arbiter_predicate = if (self.keyword(.where)) try self.scalar(0, 0) else null;
+        if (constraint_name != null and arbiter_predicate != null) return self.fail(error.InvalidSqlSyntax, "named conflict target cannot include an inference predicate");
         if (arbiter_predicate != null and columns.items.len + expressions.items.len == 0) return self.fail(error.UnsupportedSqlShape, "partial conflict inference requires an explicit target");
         try self.expectKeyword(.do);
-        if (self.keyword(.nothing)) return .{ .columns = try columns.toOwnedSlice(self.alloc), .expressions = try expressions.toOwnedSlice(self.alloc), .arbiter_predicate = arbiter_predicate };
-        if (columns.items.len + expressions.items.len == 0) return self.fail(error.UnsupportedSqlShape, "ON CONFLICT DO UPDATE requires an explicit conflict target");
+        if (self.keyword(.nothing)) return .{ .columns = try columns.toOwnedSlice(self.alloc), .constraint_name = constraint_name, .expressions = try expressions.toOwnedSlice(self.alloc), .arbiter_predicate = arbiter_predicate };
+        if (constraint_name == null and columns.items.len + expressions.items.len == 0) return self.fail(error.UnsupportedSqlShape, "ON CONFLICT DO UPDATE requires an explicit conflict target");
         try self.expectKeyword(.update);
         try self.expectKeyword(.set);
         var assignments: std.ArrayList(ast.Assignment) = .empty;
@@ -1421,7 +1427,7 @@ const Parser = struct {
         }
         const filter = if (self.keyword(.where)) try self.scalar(0, 0) else null;
         if (filter) |expression| try self.checkScalarDepth(expression, 0);
-        return .{ .columns = try columns.toOwnedSlice(self.alloc), .expressions = try expressions.toOwnedSlice(self.alloc), .arbiter_predicate = arbiter_predicate, .assignments = try assignments.toOwnedSlice(self.alloc), .predicate = filter };
+        return .{ .columns = try columns.toOwnedSlice(self.alloc), .constraint_name = constraint_name, .expressions = try expressions.toOwnedSlice(self.alloc), .arbiter_predicate = arbiter_predicate, .assignments = try assignments.toOwnedSlice(self.alloc), .predicate = filter };
     }
 
     fn update(self: *Parser) Error!ast.Update {
@@ -2859,9 +2865,23 @@ test "SQL original duplicate point update target rejects before backend access" 
     try std.testing.expectError(error.DuplicateSqlColumn, compile(std.testing.allocator, "UPDATE usage_records SET status = 'active', status = lower(status) WHERE id = 'u1'", .{}));
 }
 
-test "SQL original named conflict target rejects before backend access" {
-    // sql-1487: named constraints are not an admitted ON CONFLICT arbiter.
-    try std.testing.expectError(error.InvalidSqlSyntax, compile(std.testing.allocator, "INSERT INTO usage_records (id, status) VALUES ('u_bad_named', 'pending') ON CONFLICT ON CONSTRAINT usage_records_id_key DO NOTHING", .{}));
+test "SQL original absent named conflict target rejects before row evaluation" {
+    // sql-1487: existence/kind/timing are catalog binding decisions, not a
+    // syntax rejection. An absent name must still fail before row evaluation.
+    var compiled = try compile(std.testing.allocator, "INSERT INTO usage_records (id, status) VALUES ('u_bad_named', 'pending') ON CONFLICT ON CONSTRAINT usage_records_id_key DO NOTHING", .{});
+    defer compiled.deinit();
+    try std.testing.expectEqualStrings("usage_records_id_key", compiled.statement.insert.conflict.?.constraint_name.?);
+    const Backend = struct {
+        fn checkpoint(_: *anyopaque) !void {}
+        fn generate(_: *anyopaque, _: std.mem.Allocator) ![]const u8 {
+            return error.UnexpectedIdentityGeneration;
+        }
+        fn resolve(_: *anyopaque, _: std.mem.Allocator, _: ast.Name, _: @import("catalog.zig").Action) !@import("catalog.zig").Table {
+            return .{ .id = 1, .physical_name = "usage_records", .schema_version = 1, .columns = &.{ .{ .name = "id", .path = "id", .type = .string }, .{ .name = "status", .path = "status", .type = .string } } };
+        }
+    };
+    var backend_tag: u8 = 0;
+    try std.testing.expectError(error.SqlConstraintNotFound, @import("describe.zig").describe(std.testing.allocator, .{ .ptr = &backend_tag, .vtable = &.{ .resolve = Backend.resolve, .generate_row_id = Backend.generate, .scan = undefined, .mutate = undefined, .checkpoint = Backend.checkpoint } }, &compiled, &.{}));
 }
 
 test "SQL original multi-output mutation selector rejects before backend access" {

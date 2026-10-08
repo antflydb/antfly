@@ -1739,6 +1739,76 @@ class PostgresReferenceTest(unittest.TestCase):
                         [(4, 8)], self.db.execute("SELECT n,g FROM items").fetchall()
                     )
 
+    def test_named_conflict_arbiters_select_exact_constraint_and_preserve_error_timing(
+        self,
+    ):
+        import psycopg
+
+        with self.db.transaction(force_rollback=True):
+            self.db.execute("CREATE TEMP SEQUENCE named_default_sequence")
+            self.db.execute(
+                "CREATE TEMP TABLE named_items (_id text PRIMARY KEY, "
+                "n bigint DEFAULT nextval('named_default_sequence'), other bigint, "
+                'CONSTRAINT "Selected Unique" UNIQUE(n), '
+                "CONSTRAINT other_key UNIQUE(other), "
+                "CONSTRAINT positive_n CHECK(n>0), "
+                "CONSTRAINT parent_fk FOREIGN KEY(other) REFERENCES named_items(n), "
+                "CONSTRAINT deferred_key UNIQUE(n) DEFERRABLE INITIALLY IMMEDIATE)"
+            )
+            self.db.execute("INSERT INTO named_items(_id,n) VALUES('existing',3)")
+            # A named target ignores an equivalent deferrable constraint.
+            self.assertEqual(
+                [("existing", 6)],
+                self.db.execute(
+                    "INSERT INTO named_items(_id,n) VALUES('proposed',3) "
+                    'ON CONFLICT ON CONSTRAINT "Selected Unique" '
+                    "DO UPDATE SET n=named_items.n+excluded.n RETURNING _id,n"
+                ).fetchall(),
+            )
+            self.assertEqual(
+                [],
+                self.db.execute(
+                    "INSERT INTO named_items(_id,n) VALUES('skipped',6) "
+                    'ON CONFLICT ON CONSTRAINT "Selected Unique" DO NOTHING RETURNING n'
+                ).fetchall(),
+            )
+            for name, state in (
+                ("absent_key", "42704"),
+                ("positive_n", "42809"),
+                ("parent_fk", "42809"),
+                ("selected unique", "42704"),
+            ):
+                with self.subTest(name=name):
+                    with self.assertRaises(psycopg.Error) as caught:
+                        with self.db.transaction():
+                            self.db.execute(
+                                "INSERT INTO named_items(_id) VALUES('invalid') "
+                                f'ON CONFLICT ON CONSTRAINT "{name}" DO NOTHING'
+                            )
+                    self.assertEqual(state, caught.exception.sqlstate)
+                    self.assertFalse(
+                        self.db.execute(
+                            "SELECT is_called FROM named_default_sequence"
+                        ).fetchone()[0]
+                    )
+            # Deferrability is checked by execution, after proposed defaults.
+            with self.assertRaises(psycopg.Error) as caught:
+                with self.db.transaction():
+                    self.db.execute(
+                        "INSERT INTO named_items(_id) VALUES('deferred') "
+                        "ON CONFLICT ON CONSTRAINT deferred_key DO NOTHING"
+                    )
+            self.assertEqual("55000", caught.exception.sqlstate)
+            self.assertTrue(
+                self.db.execute(
+                    "SELECT is_called FROM named_default_sequence"
+                ).fetchone()[0]
+            )
+            self.assertEqual(
+                [("existing", 6)],
+                self.db.execute("SELECT _id,n FROM named_items").fetchall(),
+            )
+
     def test_original_mutation_profiles_enforce_logical_primary_keys(self):
         import json
 

@@ -4592,3 +4592,42 @@ postimages and error atomicity. These component tests do not credit unrelated
 original corpus cases. The expanded mounted mutation campaign has reached the
 still-unsupported regexp substring/count case; broader regex and named-constraint
 arbiters remain follow-up work, and the corpus dispositions are unchanged.
+
+### Named conflict arbiters
+
+`ON CONFLICT ON CONSTRAINT` now retains the exact folded or quoted constraint
+name through the SQL catalog, pgwire authorization wrapper and embedded/public
+native adapters. Request-owned catalog descriptors distinguish UNIQUE/primary
+constraints from CHECK/FK constraints and unrelated access indexes. The native
+integrity planner independently binds the selected name to one durable unique
+generation, preserving schema fences, all-owner coverage, staged writes and
+guarded owner claims. It does not widen a named target to equivalent or unrelated
+unique constraints; final mutation validation still enforces every constraint.
+
+Absent names fail with 42704 and CHECK/FK names with 42809 before proposed row
+evaluation. PostgreSQL rejects deferrable arbiters later, after proposed defaults;
+the native owner-resolution path preserves that timing and returns 55000 without
+publishing writes. PostgreSQL 18 sequence-backed tests verify these distinctions.
+Composite named arbitration is exercised through real embedded native storage,
+including an equivalent deferrable constraint, a nonselected unique violation,
+cold reopen and a raced absence guard. Allocation-fault tests retain exact name
+ownership across schema-cache eviction and prohibit partially committed writes.
+
+Mounted original-case probes compare affected counts, RETURNING types/NULLs and
+complete three-table native postimages with independently regenerated PostgreSQL
+goldens. Regex operations, renamed-constraint DDL, alternate archive layouts and
+recursive-arm execution remain separate gaps; generic fixture success does not
+prove those original contracts.
+
+Six newly verified original cases (sql-1390, sql-1392, sql-1393, sql-1439,
+sql-1463 and sql-1465) bring the inventory to 432 implemented, 136 rejected,
+73 superseded and 945 unresolved. The absent-name original sql-1487 remains a
+verified rejection, now at catalog binding with 42704 rather than a parser error.
+
+Validation: the complete SQL gate passed 510 local and 226 server tests with
+three existing opt-in skips and zero leaks. The selected mounted API gate passed
+all three tests, the native embedded gate passed both arbitration/reopen tests,
+all 105 PostgreSQL oracle tests passed, and a fresh database reproduced all 48
+mutation goldens. Inventory integrity and all 20 checker regressions passed.
+The broader in-progress mutation probe still fails at unsupported regex; it is
+not included in these green-gate claims or credited as completed coverage.

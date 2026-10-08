@@ -13693,6 +13693,20 @@ test "httpx SQL PostgreSQL mutations capture native source relations and complet
     // sql-0571, sql-0572, sql-0598, sql-0599, sql-0606, sql-0607,
     // sql-0608, sql-0609, sql-0619, sql-0620, sql-0657, sql-0667,
     // sql-1499, sql-1500, sql-1508, sql-1519, sql-1533, sql-1564.
+    // Correlated-source campaign: sql-0600, sql-0601, sql-0602,
+    // sql-0610, sql-0611, sql-0612.
+    try postgresNativeMutationCampaigns(&.{});
+}
+
+test "httpx SQL PostgreSQL named conflict targets preserve complete native postimages" {
+    try postgresNativeMutationCampaigns(&.{"sql-1463"});
+}
+
+test "httpx SQL PostgreSQL conflict assignments and defaults preserve complete native postimages" {
+    try postgresNativeMutationCampaigns(&.{ "sql-1390", "sql-1392", "sql-1393", "sql-1439", "sql-1465" });
+}
+
+fn postgresNativeMutationCampaigns(comptime selected: []const []const u8) !void {
     const alloc = std.testing.allocator;
     const parity = @import("sql_parity_reference.zig");
     const Source = @import("sql_parity_sources.zig").Tables(3);
@@ -13705,6 +13719,7 @@ test "httpx SQL PostgreSQL mutations capture native source relations and complet
         } },
         .{ .bytes = @import("antfly_local_sources").sql_parity_fixtures.correlated_mutation_postgres_reference, .ids = &.{ "sql-0600", "sql-0601", "sql-0602", "sql-0610", "sql-0611", "sql-0612" }, .expected_captures = 6 },
     }) |campaign| {
+        if (selected.len != 0 and campaign.expected_captures != null) continue;
         const parsed = try std.json.parseFromSlice(parity.PostgresMutationReference, alloc, campaign.bytes, .{ .ignore_unknown_fields = true });
         defer parsed.deinit();
         const profile = parsed.value.profile;
@@ -13754,8 +13769,8 @@ test "httpx SQL PostgreSQL mutations capture native source relations and complet
         var server = ApiHttpServer.init(alloc, .{ .backend_runtime = backend_runtime.ptr() }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.systemCatalog, .admin_snapshot = Source.snapshot, .free_admin_snapshot = Source.freeSnapshot, .supports_query_definitions = true } }, source.source(), writes.source());
         defer server.deinit();
         var handler = AntflyApiHandler{ .api_server = &server };
-        try parity.runPostgresMutations(alloc, &handler, &tables, &source.records, parsed.value, campaign.ids);
-        try std.testing.expect(source.captures != 0);
+        try parity.runPostgresMutations(alloc, &handler, &tables, &source.records, parsed.value, if (selected.len != 0) selected else campaign.ids);
+        if (selected.len == 0) try std.testing.expect(source.captures != 0);
         if (campaign.expected_captures) |count| try std.testing.expectEqual(count, source.captures);
     }
 }

@@ -2,6 +2,11 @@
   "ledger_format": 1,
   "inventory_sha256": "c203a4dcf0094b75e1d3764e90beebddaf844a9ce604543c0a4dbc0ffe8ae173",
   "gates": {
+    "sql-mounted-postgres-conflict-shapes": {
+      "command": ["zig", "build", "public-api-parity-test", "--cache-dir", ".zig-cache/sql-parity-evidence", "-Dtest-filter=httpx SQL PostgreSQL named conflict targets", "-Dtest-filter=httpx SQL PostgreSQL conflict assignments and defaults"],
+      "cwd": "zig",
+      "timeout_seconds": 600
+    },
     "sql-original-set-reads": {
       "command": ["zig", "build", "public-api-parity-test", "--cache-dir", ".zig-cache/sql-parity-evidence", "-Dtest-filter=httpx SQL PostgreSQL original set reads preserve cross table bags and nulls"],
       "cwd": "zig",
@@ -13409,8 +13414,9 @@
     },
     {
       "id": "sql-1390",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The original boolean old/excluded conflict assignment executes against activated native logical primary keys. PostgreSQL goldens verify affected counts, RETURNING OIDs/NULLs and complete native table postimages.",
+      "evidence": [{"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL PostgreSQL conflict assignments and defaults preserve complete native postimages", "gate": "sql-mounted-postgres-conflict-shapes"}, {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL PostgreSQL conflict assignments and defaults preserve complete native postimages", "gate": "sql-postgres-mutation-reference"}]
     },
     {
       "id": "sql-1391",
@@ -13419,13 +13425,15 @@
     },
     {
       "id": "sql-1392",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The original excluded-row arithmetic conflict assignment executes against activated native logical primary keys with PostgreSQL-verified affected counts, typed RETURNING and complete postimages.",
+      "evidence": [{"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL PostgreSQL conflict assignments and defaults preserve complete native postimages", "gate": "sql-mounted-postgres-conflict-shapes"}, {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL PostgreSQL conflict assignments and defaults preserve complete native postimages", "gate": "sql-postgres-mutation-reference"}]
     },
     {
       "id": "sql-1393",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The original schema-qualified old-row and excluded-row arithmetic binds the existing native conflict owner and matches PostgreSQL RETURNING and complete postimages.",
+      "evidence": [{"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL PostgreSQL conflict assignments and defaults preserve complete native postimages", "gate": "sql-mounted-postgres-conflict-shapes"}, {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL PostgreSQL conflict assignments and defaults preserve complete native postimages", "gate": "sql-postgres-mutation-reference"}]
     },
     {
       "id": "sql-1394",
@@ -13664,8 +13672,9 @@
     },
     {
       "id": "sql-1439",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The exact original same-table INSERT SELECT encounters a real existing ready row and applies implicit DEFAULT NULL only to the selected conflict update. PostgreSQL goldens verify affected counts, typed RETURNING NULL and complete postimages.",
+      "evidence": [{"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL PostgreSQL conflict assignments and defaults preserve complete native postimages", "gate": "sql-mounted-postgres-conflict-shapes"}, {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL PostgreSQL conflict assignments and defaults preserve complete native postimages", "gate": "sql-postgres-mutation-reference"}]
     },
     {
       "id": "sql-1440",
@@ -13785,8 +13794,9 @@
     },
     {
       "id": "sql-1463",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The exact original named primary-key arbiter resolves one guarded durable constraint generation, rather than falling back to targetless arbitration. Mounted native affected counts, RETURNING and full postimages match PostgreSQL.",
+      "evidence": [{"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL PostgreSQL named conflict targets preserve complete native postimages", "gate": "sql-mounted-postgres-conflict-shapes"}, {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL PostgreSQL named conflict targets preserve complete native postimages", "gate": "sql-postgres-mutation-reference"}]
     },
     {
       "id": "sql-1464",
@@ -13795,8 +13805,9 @@
     },
     {
       "id": "sql-1465",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The exact original VALUES conflict update applies DEFAULT through selected native replacement preparation. Mounted PostgreSQL goldens verify implicit NULL, typed RETURNING, affected counts and complete postimages.",
+      "evidence": [{"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL PostgreSQL conflict assignments and defaults preserve complete native postimages", "gate": "sql-mounted-postgres-conflict-shapes"}, {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL PostgreSQL conflict assignments and defaults preserve complete native postimages", "gate": "sql-postgres-mutation-reference"}]
     },
     {
       "id": "sql-1466",
@@ -13908,8 +13919,8 @@
     {
       "id": "sql-1487",
       "status": "rejected",
-      "reason": "The original rejected this named ON CONFLICT target before native authorization or mutation. The current parser rejects the exact SQL with InvalidSqlSyntax before backend access; named arbiters are not silently treated as an untargeted conflict action.",
-      "evidence": [{"path": "zig/pkg/antfly-embedded/src/sql/compiler.zig", "test": "SQL original named conflict target rejects before backend access", "gate": "sql-compiler-rejections"}]
+      "reason": "The original rejects this absent named ON CONFLICT target. The current compiler retains the exact name and catalog binding rejects it with SqlConstraintNotFound (42704) before row evaluation, identity generation or writes. Valid named arbiters are distinct from targetless conflict actions; this original rejection remains verified, not reclassified as a new positive case.",
+      "evidence": [{"path": "zig/pkg/antfly-embedded/src/sql/compiler.zig", "test": "SQL original absent named conflict target rejects before row evaluation", "gate": "sql-compiler-rejections"}]
     },
     {
       "id": "sql-1488",

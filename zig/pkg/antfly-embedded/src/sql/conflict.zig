@@ -35,6 +35,15 @@ pub const Bound = struct {
 };
 
 pub fn bind(alloc: std.mem.Allocator, backend: catalog.Backend, table: catalog.Table, name: ast.Name, aliased: bool, clause: ast.Conflict, parameters: []?ast.ColumnType, capture_types: []const scalar.Type) !Bound {
+    if (clause.constraint_name) |constraint_name| {
+        if (clause.columns.len != 0 or clause.expressions.len != 0 or clause.arbiter_predicate != null) return error.InvalidSqlBackendResponse;
+        const constraint = for (table.constraints) |value| {
+            if (std.mem.eql(u8, value.name, constraint_name)) break value;
+        } else return error.SqlConstraintNotFound;
+        if (constraint.kind != .unique) return error.WrongConflictConstraintKind;
+        // PostgreSQL rejects deferrable arbiters during execution, after
+        // proposed-row defaults. Native generation binding owns that check.
+    }
     if ((clause.capture_count != 0 or clause.deferred_count != 0) and (!backend.atomic_statement_read_set or backend.vtable.open_statement == null)) return error.SqlRangeTrackingRequired;
     if (clause.deferred_count != 0 and !backend.dynamic_statement_read_set) return error.SqlStatementSnapshotRequired;
     if (capture_types.len != clause.capture_count) return error.InvalidSqlBackendResponse;
@@ -213,11 +222,11 @@ fn invert(op: catalog.Condition.Op) catalog.Condition.Op {
 }
 
 pub fn primary(clause: ast.Conflict) bool {
-    return clause.expressions.len == 0 and clause.columns.len == 1 and std.mem.eql(u8, clause.columns[0], "_id");
+    return clause.constraint_name == null and clause.expressions.len == 0 and clause.columns.len == 1 and std.mem.eql(u8, clause.columns[0], "_id");
 }
 
 pub fn allowsDuplicateKeys(clause: ast.Conflict) bool {
-    return clause.assignments.len == 0 and (primary(clause) or (clause.columns.len == 0 and clause.expressions.len == 0));
+    return clause.assignments.len == 0 and (primary(clause) or (clause.constraint_name == null and clause.columns.len == 0 and clause.expressions.len == 0));
 }
 
 /// A retained point snapshot plus an atomic version predicate is optimistic
@@ -230,9 +239,9 @@ pub fn resolve(context: anytype, table: catalog.Table, clause: ast.Conflict, bin
     const prepare = context.backend.vtable.prepare_mutations orelse return error.UnsupportedSqlExecution;
     const normalized = try prepare(context.backend.ptr, context.arena, table, proposed);
     if (normalized.len != proposed.len) return error.InvalidSqlBackendResponse;
-    const owners = if (!primary(clause)) try (context.backend.vtable.resolve_conflict_owners orelse return error.UnsupportedSqlExecution)(context.backend.ptr, context.arena, table, clause.columns, binding.arbiter_expressions, binding.arbiter_conditions, normalized) else null;
+    const owners = if (!primary(clause)) try (context.backend.vtable.resolve_conflict_owners orelse return error.UnsupportedSqlExecution)(context.backend.ptr, context.arena, table, .{ .columns = clause.columns, .expressions = binding.arbiter_expressions, .conditions = binding.arbiter_conditions, .constraint_name = clause.constraint_name }, normalized) else null;
     if (owners) |items| if (items.len != normalized.len) return error.InvalidSqlBackendResponse;
-    if (clause.columns.len == 0 and clause.expressions.len == 0) {
+    if (clause.constraint_name == null and clause.columns.len == 0 and clause.expressions.len == 0) {
         for (proposed, normalized) |original, value| {
             if (!std.mem.eql(u8, original.key, value.key) or value.row == null or value.expected_version != 0) return error.InvalidSqlBackendResponse;
         }

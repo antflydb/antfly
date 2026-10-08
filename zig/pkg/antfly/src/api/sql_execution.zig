@@ -557,17 +557,17 @@ pub const Adapter = struct {
         return @import("antfly_local_sources").storage_row_identity.generate(alloc, self.server.sharedApiIo() orelse return error.UnsupportedSqlExecution);
     }
 
-    fn resolveConflictOwners(ptr: *anyopaque, alloc: std.mem.Allocator, table: catalog.Table, columns: []const []const u8, expressions: []const catalog.ConflictExpression, conditions: []const catalog.Condition, mutations: []const catalog.Mutation) ![]const catalog.ConflictOwner {
+    fn resolveConflictOwners(ptr: *anyopaque, alloc: std.mem.Allocator, table: catalog.Table, target: catalog.ConflictTarget, mutations: []const catalog.Mutation) ![]const catalog.ConflictOwner {
         const self: *Adapter = @ptrCast(@alignCast(ptr));
         try self.verify(alloc, table);
         const integrity = @import("antfly_local_sources").api_relational_integrity_commit;
-        const predicates = try @import("antfly_local_sources").sql_conflict_predicate.toNative(alloc, conditions);
-        const keys = try @import("antfly_local_sources").sql_conflict_predicate.expressionsToNative(alloc, expressions);
+        const predicates = try @import("antfly_local_sources").sql_conflict_predicate.toNative(alloc, target.conditions);
+        const keys = try @import("antfly_local_sources").sql_conflict_predicate.expressionsToNative(alloc, target.expressions);
         var snapshot = (try self.server.source.adminSnapshot()) orelse return error.IntegrityCatalogUnavailable;
         defer self.server.source.freeAdminSnapshot(&snapshot);
         const writes = try @import("antfly_local_sources").sql_mutation_images.writes(db_types.BatchWrite, alloc, mutations);
         const previous = if (self.staged) |staged| try staged.distributedTables(alloc) else &.{};
-        const owners = try integrity.resolveConflictOwners(alloc, self.server.table_reads orelse return error.UnsupportedSqlExecution, snapshot.tables, snapshot.ranges, table.physical_name, table.schema_version, columns, keys, predicates, writes, previous, self.context);
+        const owners = try integrity.resolveConflictTargetOwners(alloc, self.server.table_reads orelse return error.UnsupportedSqlExecution, snapshot.tables, snapshot.ranges, table.physical_name, table.schema_version, .{ .columns = target.columns, .expressions = keys, .predicate = predicates, .constraint_name = target.constraint_name }, writes, previous, self.context);
         try self.verify(alloc, table);
         const result = try alloc.alloc(catalog.ConflictOwner, owners.len);
         for (owners, result) |*owner, *out| out.* = .{ .key = owner.key, .identity = owner.identity, .identities = owner.identities, .guard = owner };

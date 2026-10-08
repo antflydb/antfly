@@ -70,10 +70,19 @@ const Fixture = struct {
     arrays: bool = false,
     default_evaluations: usize = 0,
     fail_defaults: bool = false,
+    owner_calls: usize = 0,
+    expected_constraint: ?[]const u8 = null,
     capture_states: [8]Cursor = undefined,
     capture_cursors: [8]catalog.Cursor = undefined,
-    fn owners(ptr: *anyopaque, alloc: Allocator, _: catalog.Table, columns: []const []const u8, _: []const catalog.ConflictExpression, _: []const catalog.Condition, input: []const catalog.Mutation) ![]const catalog.ConflictOwner {
-        if (columns.len != 0) try std.testing.expectEqualStrings("n", columns[0]);
+    fn owners(ptr: *anyopaque, alloc: Allocator, _: catalog.Table, target: catalog.ConflictTarget, input: []const catalog.Mutation) ![]const catalog.ConflictOwner {
+        const self: *Fixture = @ptrCast(@alignCast(ptr));
+        self.owner_calls += 1;
+        if (self.expected_constraint) |name| {
+            try std.testing.expectEqualStrings(name, target.constraint_name.?);
+            try std.testing.expectEqual(@as(usize, 0), target.columns.len);
+            if (std.mem.eql(u8, name, "deferred_key")) return error.DeferrableConflictArbiter;
+        }
+        if (target.columns.len != 0) try std.testing.expectEqualStrings("n", target.columns[0]);
         const result = try alloc.alloc(catalog.ConflictOwner, input.len);
         for (input, result) |mutation, *owner| {
             const number = mutation.row.?.object.get("n").?.integer;
@@ -96,7 +105,13 @@ const Fixture = struct {
             .{ .name = "a", .path = "a", .type = .array, .element_type = .int64 },
             .{ .name = "j", .path = "j", .type = .array, .element_type = .jsonb },
         } };
-        return .{ .id = 1, .physical_name = "items", .schema_version = 7, .columns = &.{
+        return .{ .id = 1, .physical_name = "items", .schema_version = 7, .constraints = &.{
+            .{ .name = "items_n_key", .kind = .unique },
+            .{ .name = "Selected Unique", .kind = .unique },
+            .{ .name = "deferred_key", .kind = .unique, .deferrable = true },
+            .{ .name = "positive_n", .kind = .check },
+            .{ .name = "parent_fk", .kind = .foreign_key },
+        }, .columns = &.{
             .{ .name = "n", .path = "n", .type = .integer, .nullable = false },
             .{ .name = "g", .path = "g", .type = .integer, .generated = true },
         } };
@@ -310,6 +325,86 @@ test "SQL DEFAULT VALUES conflict uses prepared defaults and generated identity"
     try std.testing.expectEqualStrings("existing", result.output.rows[0][0].string);
     try std.testing.expectEqualStrings("3", result.output.rows[0][1].string);
     try std.testing.expectEqualStrings("6", result.output.rows[0][2].string);
+}
+
+test "SQL conflict named arbiters preserve selection guards and quoted identities" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "items_n_key", "Selected Unique" }) |name| {
+        var fixture: Fixture = .{ .expected_constraint = name };
+        var backend = fixture.backend();
+        var vtable = backend.vtable.*;
+        vtable.resolve_conflict_owners = Fixture.owners;
+        backend.vtable = &vtable;
+        const sql = try std.fmt.allocPrint(a, "INSERT INTO items(_id,n) VALUES('proposed',3) ON CONFLICT ON CONSTRAINT \"{s}\" DO UPDATE SET n=items.n+excluded.n RETURNING _id,n,g", .{name});
+        defer a.free(sql);
+        var compiled = try compiler.compile(a, sql, .{});
+        defer compiled.deinit();
+        var result = try runtime.execute(a, backend, &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), fixture.owner_calls);
+        try std.testing.expectEqual(@as(usize, 1), fixture.guards);
+        try std.testing.expectEqual(@as(usize, 1), fixture.commits);
+        try std.testing.expectEqualStrings("existing", result.output.rows[0][0].string);
+        try std.testing.expectEqualStrings("7", result.output.rows[0][1].string);
+        try std.testing.expectEqualStrings("14", result.output.rows[0][2].string);
+    }
+}
+
+test "SQL conflict named arbiter errors precede proposed values and backend owner reads" {
+    const a = std.testing.allocator;
+    for ([_]struct { name: []const u8, failure: anyerror, state: []const u8 }{
+        .{ .name = "absent_key", .failure = error.SqlConstraintNotFound, .state = "42704" },
+        .{ .name = "positive_n", .failure = error.WrongConflictConstraintKind, .state = "42809" },
+        .{ .name = "parent_fk", .failure = error.WrongConflictConstraintKind, .state = "42809" },
+        .{ .name = "selected unique", .failure = error.SqlConstraintNotFound, .state = "42704" },
+    }) |case| {
+        var fixture: Fixture = .{ .fail_defaults = true };
+        const sql = try std.fmt.allocPrint(a, "INSERT INTO items(_id,n) VALUES('proposed',1/0) ON CONFLICT ON CONSTRAINT \"{s}\" DO NOTHING", .{case.name});
+        defer a.free(sql);
+        var compiled = try compiler.compile(a, sql, .{});
+        defer compiled.deinit();
+        try std.testing.expectError(case.failure, runtime.execute(a, fixture.backend(), &compiled, &.{}, .{}));
+        try std.testing.expectEqualStrings(case.state, @import("antfly_local_sources").sql_errors.describe(case.failure).code);
+        try std.testing.expectEqual(@as(usize, 0), fixture.default_evaluations);
+        try std.testing.expectEqual(@as(usize, 0), fixture.owner_calls);
+        try std.testing.expectEqual(@as(usize, 0), fixture.commits);
+    }
+}
+
+test "SQL conflict named deferrable arbiter rejection follows proposed defaults" {
+    var fixture: Fixture = .{ .expected_constraint = "deferred_key" };
+    var backend = fixture.backend();
+    var vtable = backend.vtable.*;
+    vtable.resolve_conflict_owners = Fixture.owners;
+    backend.vtable = &vtable;
+    var compiled = try compiler.compile(std.testing.allocator, "INSERT INTO items(_id) VALUES('proposed') ON CONFLICT ON CONSTRAINT deferred_key DO NOTHING", .{});
+    defer compiled.deinit();
+    try std.testing.expectError(error.DeferrableConflictArbiter, runtime.execute(std.testing.allocator, backend, &compiled, &.{}, .{}));
+    try std.testing.expectEqual(@as(usize, 1), fixture.default_evaluations);
+    try std.testing.expectEqual(@as(usize, 1), fixture.owner_calls);
+    try std.testing.expectEqual(@as(usize, 0), fixture.commits);
+}
+
+test "SQL conflict named arbiters unwind every allocation failure before commit" {
+    const Faults = struct {
+        fn run(a: Allocator) !void {
+            var fixture: Fixture = .{ .expected_constraint = "items_n_key" };
+            var backend = fixture.backend();
+            var vtable = backend.vtable.*;
+            vtable.resolve_conflict_owners = Fixture.owners;
+            backend.vtable = &vtable;
+            var compiled = try compiler.compile(a, "INSERT INTO items(_id,n) VALUES('proposed',3) ON CONFLICT ON CONSTRAINT items_n_key DO UPDATE SET n=items.n+excluded.n RETURNING n", .{});
+            defer compiled.deinit();
+            var result = runtime.execute(a, backend, &compiled, &.{}, .{}) catch |err| {
+                try std.testing.expectEqual(@as(usize, 0), fixture.commits);
+                return err;
+            };
+            defer result.deinit();
+            try std.testing.expectEqual(@as(usize, 1), fixture.guards);
+        }
+    };
+    try Faults.run(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Faults.run, .{});
 }
 
 test "SQL conflict DEFAULT evaluates only selected native updates and regenerates columns" {

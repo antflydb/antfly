@@ -1597,8 +1597,9 @@ test "capi SQL local integrity coordinator enforces unique arbitration and self 
     for ([_]struct { statement: []const u8, count: u64 }{
         .{ .statement = "INSERT INTO rows (_id,id,parent) VALUES ('p',1,NULL),('c',2,1)", .count = 2 },
         .{ .statement = "INSERT INTO rows (_id,id,parent) VALUES ('skipped',1,NULL) ON CONFLICT (id) DO NOTHING RETURNING id", .count = 0 },
+        .{ .statement = "INSERT INTO rows (_id,id,parent) VALUES ('skipped',1,NULL) ON CONFLICT ON CONSTRAINT pk DO NOTHING RETURNING id", .count = 0 },
         .{ .statement = "INSERT INTO rows (_id,id,parent) VALUES ('skipped',1,NULL),('also_skipped',1,NULL) ON CONFLICT DO NOTHING RETURNING id", .count = 0 },
-        .{ .statement = "INSERT INTO rows (_id,id,parent) VALUES ('new',1,NULL) ON CONFLICT (id) DO UPDATE SET id=3 RETURNING id", .count = 1 },
+        .{ .statement = "INSERT INTO rows (_id,id,parent) VALUES ('new',1,NULL) ON CONFLICT ON CONSTRAINT pk DO UPDATE SET id=3 RETURNING id", .count = 1 },
     }) |case| {
         var compiled = try sql.compiler.compile(alloc, case.statement, .{});
         defer compiled.deinit();
@@ -1628,7 +1629,7 @@ test "capi SQL local integrity coordinator enforces unique arbitration and self 
     const table = try backend.vtable.resolve(backend.ptr, arena.allocator(), .{ .table = "rows" }, .read_write);
     const row = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), "{\"id\":4,\"parent\":null}", .{});
     var mutation: antfly.capi_dependencies.sql_catalog.Mutation = .{ .key = "racer", .row = row, .expected_version = 0 };
-    const owners = try backend.vtable.resolve_conflict_owners.?(backend.ptr, arena.allocator(), table, &.{"id"}, &.{}, &.{}, &.{mutation});
+    const owners = try backend.vtable.resolve_conflict_owners.?(backend.ptr, arena.allocator(), table, .{ .constraint_name = "pk" }, &.{mutation});
     try std.testing.expect(owners[0].key == null);
     mutation.conflict_guard = owners[0].guard;
     var winner = try sql.compiler.compile(alloc, "INSERT INTO rows (_id,id,parent) VALUES ('winner',4,NULL)", .{});
@@ -1637,6 +1638,52 @@ test "capi SQL local integrity coordinator enforces unique arbitration and self 
     defer won.deinit();
     try std.testing.expectError(error.PreparedReadSetChanged, backend.vtable.mutate(backend.ptr, arena.allocator(), table, &.{mutation}));
     try std.testing.expect(try database.lookup(alloc, "racer", .{}) == null);
+}
+
+test "capi SQL named composite conflicts select one immediate generation and survive reopen" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("capi-named-composite");
+    defer directory.cleanup();
+    const sql = @import("antfly_local_sources").capi_sql;
+    for (0..2) |phase| {
+        var database = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false, .identity_namespace = .{ .table_id = 701, .shard_id = 702 } });
+        defer database.close();
+        if (phase == 0) try database.setSchemaJson(alloc,
+            \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"Selected Pair","columns":["tenant","id"]},{"name":"equivalent_deferred","columns":["id","tenant"],"deferrable":true},{"name":"n_key","columns":["n"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"tenant":{"type":"integer"},"n":{"type":"integer"}},"additionalProperties":false}}}}
+        );
+        var adapter = @import("antfly_local_sources").capi_sql.Adapter(antfly){ .db = &database, .table_name = "rows" };
+        if (phase == 0) {
+            var seed = try sql.compiler.compile(alloc, "INSERT INTO rows(_id,tenant,id,n) VALUES('original',7,1,10),('other',8,2,20)", .{});
+            defer seed.deinit();
+            var seeded = try sql.runtime.execute(alloc, adapter.backend(), &seed, &.{}, .{});
+            defer seeded.deinit();
+        }
+        const statement = if (phase == 0)
+            "INSERT INTO rows(_id,tenant,id,n) VALUES('proposed',7,1,20) ON CONFLICT ON CONSTRAINT \"Selected Pair\" DO UPDATE SET n=rows.n+excluded.n RETURNING _id,tenant,id,n"
+        else
+            "INSERT INTO rows(_id,tenant,id,n) VALUES('proposed',7,1,5) ON CONFLICT ON CONSTRAINT \"Selected Pair\" DO UPDATE SET n=rows.n+excluded.n RETURNING _id,tenant,id,n";
+        var compiled = try sql.compiler.compile(alloc, statement, .{});
+        defer compiled.deinit();
+        var result = try sql.runtime.execute(alloc, adapter.backend(), &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(@as(u64, 1), result.output.rows_affected);
+        try std.testing.expectEqualStrings("original", result.output.rows[0][0].string);
+        try std.testing.expectEqualStrings("7", result.output.rows[0][1].string);
+        try std.testing.expectEqualStrings("1", result.output.rows[0][2].string);
+        try std.testing.expectEqualStrings(if (phase == 0) "30" else "35", result.output.rows[0][3].string);
+        try std.testing.expect(try database.lookup(alloc, "proposed", .{}) == null);
+        var original = (try database.lookup(alloc, "original", .{})).?;
+        defer original.deinit(alloc);
+        try std.testing.expect(std.mem.indexOf(u8, original.json, if (phase == 0) "\"n\":30" else "\"n\":35") != null);
+        var rejected = try sql.compiler.compile(alloc, "INSERT INTO rows(_id,tenant,id,n) VALUES('invalid',9,3,20) ON CONFLICT ON CONSTRAINT \"Selected Pair\" DO NOTHING", .{});
+        defer rejected.deinit();
+        try std.testing.expectError(error.UniqueConstraintViolation, sql.runtime.execute(alloc, adapter.backend(), &rejected, &.{}, .{}));
+        try std.testing.expect(try database.lookup(alloc, "invalid", .{}) == null);
+        var deferred = try sql.compiler.compile(alloc, "INSERT INTO rows(_id,tenant,id,n) VALUES('deferred',9,3,40) ON CONFLICT ON CONSTRAINT equivalent_deferred DO NOTHING", .{});
+        defer deferred.deinit();
+        try std.testing.expectError(error.DeferrableConflictArbiter, sql.runtime.execute(alloc, adapter.backend(), &deferred, &.{}, .{}));
+        try std.testing.expect(try database.lookup(alloc, "deferred", .{}) == null);
+    }
 }
 
 test "capi SQL native expression partial unique claims reject collisions and arbitrate targetless inserts" {

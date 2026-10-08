@@ -36,6 +36,32 @@ pub const Index = struct {
     columns: []const []const u8,
 };
 
+/// Pinned declarative constraints, not similarly named access indexes. Native
+/// execution independently rebinds the name to its guarded durable generation.
+pub const Constraint = struct {
+    name: []const u8,
+    kind: enum { unique, check, foreign_key },
+    deferrable: bool = false,
+
+    pub fn derive(alloc: std.mem.Allocator, schema: anytype) ![]const Constraint {
+        var count: usize = 0;
+        inline for (.{ "unique_constraints", "checks", "foreign_keys" }) |field| {
+            if (@field(schema, field)) |values| count = try std.math.add(usize, count, values.value.len);
+        }
+        const output = try alloc.alloc(Constraint, count);
+        errdefer alloc.free(output);
+        var initialized: usize = 0;
+        errdefer for (output[0..initialized]) |value| alloc.free(value.name);
+        inline for (.{ "unique_constraints", "checks", "foreign_keys" }, .{ .unique, .check, .foreign_key }) |field, kind| {
+            if (@field(schema, field)) |values| for (values.value) |definition| {
+                output[initialized] = .{ .name = try alloc.dupe(u8, definition.name), .kind = kind, .deferrable = if (@hasField(@TypeOf(definition), "deferrable")) definition.deferrable orelse false else false };
+                initialized += 1;
+            };
+        }
+        return output;
+    }
+};
+
 pub const Table = struct {
     pub const ExternalIndexes = struct {
         /// Fresh query-definition metadata, allocated for this execution. A
@@ -68,6 +94,7 @@ pub const Table = struct {
     external_indexes: ?ExternalIndexes = null,
     columns: []const Column,
     indexes: []const Index = &.{},
+    constraints: []const Constraint = &.{},
     /// Request-owned logical authority. Never use a mutable adapter's last
     /// resolved name to validate an earlier table in a join or subquery.
     scope: ?Scope = null,
@@ -401,6 +428,12 @@ pub const Mutation = struct {
     previous: ?*const Row = null,
 };
 pub const ConflictExpression = struct { json: []const u8, result_type: ast.ColumnType };
+pub const ConflictTarget = struct {
+    columns: []const []const u8 = &.{},
+    expressions: []const ConflictExpression = &.{},
+    conditions: []const Condition = &.{},
+    constraint_name: ?[]const u8 = null,
+};
 
 pub const ConflictOwner = struct {
     key: ?[]const u8,
@@ -496,7 +529,7 @@ pub const Backend = struct {
         /// Native opaque identity, generated once before mutation admission.
         /// Providers without this capability require an explicit _id.
         generate_row_id: ?*const fn (*anyopaque, std.mem.Allocator) anyerror![]const u8 = null,
-        resolve_conflict_owners: ?*const fn (*anyopaque, std.mem.Allocator, Table, []const []const u8, []const ConflictExpression, []const Condition, []const Mutation) anyerror![]const ConflictOwner = null,
+        resolve_conflict_owners: ?*const fn (*anyopaque, std.mem.Allocator, Table, ConflictTarget, []const Mutation) anyerror![]const ConflictOwner = null,
         // All returned data belongs to the supplied allocator. Scans receive
         // a short-lived page arena, not the retained statement result arena.
         resolve: *const fn (*anyopaque, std.mem.Allocator, ast.Name, Action) anyerror!Table,

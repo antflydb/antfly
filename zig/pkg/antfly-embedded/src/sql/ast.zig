@@ -226,6 +226,7 @@ pub const Insert = struct {
 };
 pub const Conflict = struct {
     columns: []const []const u8,
+    constraint_name: ?[]const u8 = null,
     expressions: []const *const Scalar = &.{},
     /// Optional predicate used to infer partial unique arbiters. It is distinct
     /// from the DO UPDATE predicate, which runs only after an arbiter conflict.
