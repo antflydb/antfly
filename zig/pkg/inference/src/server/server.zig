@@ -11980,9 +11980,9 @@ pub const Node = struct {
             const parsed_tool_calls = if (tool_parser) |*parser| blk: {
                 parser.reset();
                 _ = parser.feed(result.text) catch |err|
-                    return ctx.status(500).json(.{ .@"error" = "GENERATION_FAILED", .message = @errorName(err) });
+                    return generationErrorResponse(ctx, err);
                 tool_response_text = parser.finishText(ctx.allocator) catch |err|
-                    return ctx.status(500).json(.{ .@"error" = "GENERATION_FAILED", .message = @errorName(err) });
+                    return generationErrorResponse(ctx, err);
                 response_text = tool_response_text.?;
                 if (response_text.len == 0) response_text = result.text;
                 const calls = parser.toolCalls();
@@ -12123,9 +12123,9 @@ pub const Node = struct {
                 const parsed_tool_calls = if (tool_parser) |*parser| blk: {
                     parser.reset();
                     _ = parser.feed(result.text) catch |err|
-                        return ctx.status(500).json(.{ .@"error" = "GENERATION_FAILED", .message = @errorName(err) });
+                        return generationErrorResponse(ctx, err);
                     tool_response_text = parser.finishText(ctx.allocator) catch |err|
-                        return ctx.status(500).json(.{ .@"error" = "GENERATION_FAILED", .message = @errorName(err) });
+                        return generationErrorResponse(ctx, err);
                     response_text = tool_response_text.?;
                     if (response_text.len == 0) response_text = result.text;
                     const calls = parser.toolCalls();
@@ -12966,9 +12966,9 @@ pub const Node = struct {
         const parsed_tool_calls = if (tool_parser) |*parser| blk: {
             parser.reset();
             _ = parser.feed(result.text) catch |err|
-                return ctx.status(500).json(.{ .@"error" = "GENERATION_FAILED", .message = @errorName(err) });
+                return generationErrorResponse(ctx, err);
             tool_response_text = parser.finishText(ctx.allocator) catch |err|
-                return ctx.status(500).json(.{ .@"error" = "GENERATION_FAILED", .message = @errorName(err) });
+                return generationErrorResponse(ctx, err);
             response_text = tool_response_text.?;
             if (response_text.len == 0) response_text = result.text;
             const calls = parser.toolCalls();
@@ -28440,6 +28440,15 @@ test "generation live pressure is an actionable retryable capacity error" {
     const saturated_batch_error = batchGenerationError(error.ConcurrencyUnavailable);
     try std.testing.expectEqualStrings("MODEL_RESOURCE_BUSY", saturated_batch_error.code);
     try std.testing.expect(saturated_batch_error.retryable);
+
+    var malformed = try generationErrorResponse(&ctx, error.InvalidToolArguments);
+    defer malformed.deinit();
+    try std.testing.expectEqual(@as(u16, 502), malformed.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, malformed.body.?, "\"error\":\"TOOL_ARGUMENTS_INVALID\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, malformed.body.?, "\"retryable\":true") != null);
+    const malformed_batch = batchGenerationError(error.InvalidToolArguments);
+    try std.testing.expectEqualStrings("TOOL_ARGUMENTS_INVALID", malformed_batch.code);
+    try std.testing.expect(malformed_batch.retryable);
 }
 
 test "registerRoutesOn supports alternate prefixes through the shared router" {
@@ -33379,6 +33388,12 @@ fn generationRequestFailure(err: anyerror) ?GenerationRequestFailure {
         .retryable = true,
     };
     return switch (err) {
+        error.InvalidToolArguments => .{
+            .status = 502,
+            .code = "TOOL_ARGUMENTS_INVALID",
+            .message = "model generated malformed tool arguments; request a corrected tool call",
+            .retryable = true,
+        },
         error.PromptTooLong => .{
             .status = 400,
             .code = "INVALID_REQUEST",

@@ -722,6 +722,7 @@ pub const Detail = enum(c_int) {
     unsupported_iceberg_schema_evolution,
     unsupported_iceberg_delete_file,
     invalid_sql_spill,
+    invalid_generated_tool_arguments,
 };
 
 pub const Status = extern struct {
@@ -1217,6 +1218,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.UnsupportedGeneratorProvider => status(.unsupported, .unsupported_generator_provider),
         error.GenerateRequestFailed => status(.unavailable, .generate_request_failed),
         error.GenerationCapacityUnavailable => status(.retryable, .generation_capacity_unavailable),
+        error.InvalidGeneratedToolArguments => status(.retryable, .invalid_generated_tool_arguments),
         error.RateLimit => status(.retryable, .generation_rate_limit),
         error.InvalidRateLimitPolicy => status(.invalid_argument, .invalid_rate_limit_policy),
         error.ConflictingRateLimitPolicy => status(.conflict, .conflicting_rate_limit_policy),
@@ -2063,6 +2065,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .unsupported_generator_provider => "UnsupportedGeneratorProvider",
         .generate_request_failed => "GenerateRequestFailed",
         .generation_capacity_unavailable => "GenerationCapacityUnavailable",
+        .invalid_generated_tool_arguments => "InvalidGeneratedToolArguments",
         .generation_rate_limit => "RateLimit",
         .invalid_rate_limit_policy => "InvalidRateLimitPolicy",
         .conflicting_rate_limit_policy => "ConflictingRateLimitPolicy",
@@ -2247,6 +2250,9 @@ test "generation capacity retains retryability across the runtime boundary" {
     const result = statusFromError(error.GenerationCapacityUnavailable);
     try std.testing.expectEqual(@backingInt(Code.retryable), result.code);
     try std.testing.expectEqual(error.GenerationCapacityUnavailable, errorFromStatus(result));
+    const malformed = statusFromError(error.InvalidGeneratedToolArguments);
+    try std.testing.expectEqual(@backingInt(Code.retryable), malformed.code);
+    try std.testing.expectEqual(error.InvalidGeneratedToolArguments, errorFromStatus(malformed));
 }
 
 test "system catalog errors retain their stable runtime boundary classification" {

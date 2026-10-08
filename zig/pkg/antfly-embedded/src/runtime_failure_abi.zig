@@ -732,6 +732,7 @@ pub const Status = enum(u32) {
     enrichment_worker_failed = 772,
     commit_visibility_not_satisfied = 773,
     commit_propagation_incomplete = 774,
+    invalid_generated_tool_arguments = 775,
 };
 
 /// Lossless failure metadata for compiled operation and per-item boundaries.
