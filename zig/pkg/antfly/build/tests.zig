@@ -762,7 +762,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     const lib_common_config_tests = b.addTest(.{
         .root_module = antfly_test_mod,
-        .filters = &.{"common config"},
+        .filters = &.{ "common config", "external lake native artifact collection config validates bounded operator controls" },
         .test_runner = .{
             .path = b.path("pkg/antfly-embedded/src/test_runner.zig"),
             .mode = .simple,
