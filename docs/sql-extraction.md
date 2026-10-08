@@ -6435,3 +6435,58 @@ The larger SQL/native integration revalidation remains separately tracked.
 Public array-expression compilation, precise branch/result type propagation,
 binding/assignment normalization, row rewrites, generated contracts and DDL
 activation remain unfinished. No original inventory disposition changes.
+
+### Typed array programs and streaming assignment regions
+
+The durable expression compiler now retains precise array element identity in
+literals, columns, conditional branches and plan results. Comparisons and IN
+require matching operand identities; generated/default targets require the
+exact result identity even for SQL NULL. JSON ingress prepares canonical owned
+bytes; pinned values and cold ordinal reads borrow the authenticated row owner.
+Historical source projection cannot reinterpret a different element type.
+
+NUMERIC-array assignment checks canonical constrained coefficients without
+allocating. When rounding is required, it streams one coefficient at a time
+into an unpublished output buffer, preserving dimensions, lower bounds and
+NULL flags without a decoded cell vector. Base assignments normalize before
+generated dependencies execute. Restore verifies the declared target domain
+and logical generated result without repairing stored values or forcing an
+equivalent display scale.
+
+Request-region allocation accounting now has an opt-in monotonic footprint.
+Frees and shrinks cannot refund bytes that an enclosing arena may retain;
+moving replacements reserve their complete allocation. Ordinary reclaiming
+owners retain their existing accounting. Execution scratch and output capacity
+share the same allowance, including intermediate buffers, and quota/cancellation
+failures remain sticky without converting ordinary backing OOM into a quota.
+
+Cold dictionary index batches bind array dependencies as logical row operands,
+checking NULL slots before dictionary addressing. Scalar expression keys reuse
+the existing ordered codec; array-valued ordered keys remain explicitly guarded.
+Explicit row rewrite adapters retain canonical payloads and exact element
+identity without a JSON round trip. This does not authorize ordinary restore
+to rewrite historical rows.
+
+The 10,000-cell Debug assignment fixture produces 161,270 output bytes using
+five backing allocations and 505,224 total charged allocation bytes, with no
+flat cell vector. Tracked allocation bytes exactly equal the invocation charge.
+The observed approximately 10 ms is a local sample, not a production benchmark.
+Existing PostgreSQL oracle fixtures cover 11 binary arrays across nine element
+domains, with NUMERIC covered separately by 20 modifier boundary cases and
+generated assignment tests. No new parity disposition is inferred from these
+internal adapters. Public generated expression contracts, SQL DDL/lowering,
+direct array CHECK declarations and mounted activation campaigns remain work.
+
+Validation is recorded as separate receipts, not a green combined invocation:
+SQL revalidation passes 620 local and 226 server tests with three existing skips.
+Final schema validation passes 72 local and five server tests, including
+generated-array assignment and both physical-domain and derivation rejection.
+Native validation passes all 192 local tests and its server contract, including
+the new NULL dictionary-slot and rewrite-identity regressions. These runs have
+no failures or leaks. An earlier combined run failed because the fixture omitted
+required catalog flags; its corrected successor also exposed that the strict
+codec rejects an invalid target coefficient before a forged row can be built.
+The final test asserts that rejection and separately constructs a domain-valid
+wrong generated value. No production validation was relaxed to make it pass.
+Formatting, whitespace and the storage control-catalog check pass. No original
+inventory dispositions or public feature claims are changed by this unit.

@@ -21,6 +21,10 @@ backing: std.mem.Allocator,
 limit: usize,
 live: usize = 0,
 peak: usize = 0,
+/// Request regions may retain freed backing buffers. In this mode frees and
+/// shrinks never refund admission, and remap may only resize in place.
+monotonic: bool = false,
+spent: usize = 0,
 exhausted: bool = false,
 mutex: std.atomic.Mutex = .unlocked,
 /// Optional shared admission for the live allocations of an active operation.
@@ -47,19 +51,26 @@ pub fn isExhausted(self: *Budget) bool {
     defer self.mutex.unlock();
     return self.exhausted or self.admission_exhausted;
 }
+/// Conservative region footprint, including intermediate buffers retained by
+/// an enclosing arena. Ordinary reclaiming owners retain peak-live accounting.
+pub fn footprint(self: *Budget) usize {
+    self.lock();
+    defer self.mutex.unlock();
+    return if (self.monotonic) self.spent else self.peak;
+}
 /// Live headroom of this allocator's budget chain, when known. Unknown backing
 /// allocators provide no extra bound; they never imply unlimited admission.
 pub fn headroom(a: std.mem.Allocator) ?usize {
     if (a.vtable.alloc != alloc) return null;
     const self: *Budget = @ptrCast(@alignCast(a.ptr));
     self.lock();
-    const available = self.limit - self.live;
+    const available = self.limit -| if (self.monotonic) self.spent else self.live;
     const backing = self.backing;
     self.mutex.unlock();
     return if (headroom(backing)) |parent| @min(available, parent) else available;
 }
 fn admit(self: *Budget, growth: usize) bool {
-    if (growth > self.limit - self.live) {
+    if (growth > self.limit -| if (self.monotonic) self.spent else self.live) {
         self.exhausted = true;
         return false;
     }
@@ -73,6 +84,7 @@ fn releaseAdmission(self: *Budget, bytes: usize) void {
     if (self.admission) |owner| owner.release(owner.ptr, bytes);
 }
 fn account(self: *Budget, old: usize, new: usize) void {
+    if (self.monotonic) self.spent += new -| old;
     self.live = self.live - old + new;
     self.peak = @max(self.peak, self.live);
 }
@@ -106,7 +118,15 @@ fn remap(ptr: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, len: usize,
     self.lock();
     defer self.mutex.unlock();
     if (!self.admit(len -| bytes.len)) return null;
-    const result = self.backing.rawRemap(bytes, alignment, len, ra) orelse {
+    const result = if (self.monotonic) blk: {
+        // A moving remap may leave the old allocation in a parent arena.
+        // Force allocator fallback to reserve the complete replacement.
+        if (!self.backing.rawResize(bytes, alignment, len, ra)) {
+            self.releaseAdmission(len -| bytes.len);
+            return null;
+        }
+        break :blk bytes.ptr;
+    } else self.backing.rawRemap(bytes, alignment, len, ra) orelse {
         self.releaseAdmission(len -| bytes.len);
         return null;
     };
@@ -121,6 +141,47 @@ fn free(ptr: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ra: usize) v
     self.backing.rawFree(bytes, alignment, ra);
     self.releaseAdmission(bytes.len);
     self.account(bytes.len, 0);
+}
+
+test "SQL monotonic region budget charges freed and replacement buffers without refund" {
+    var region = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer region.deinit();
+    var budget: Budget = .{ .backing = region.allocator(), .limit = 256, .monotonic = true };
+    const a = budget.allocator();
+    const first = try a.alloc(u8, 100);
+    const separator = try a.alloc(u8, 10);
+    @memset(first, 42);
+    // Not the arena tail: realloc must own a complete replacement, not merely
+    // charge its 20-byte growth while retaining the original 100 bytes.
+    const replacement = try a.realloc(first, 120);
+    for (replacement[0..100]) |byte| try std.testing.expectEqual(@as(u8, 42), byte);
+    try std.testing.expectEqual(@as(usize, 230), budget.footprint());
+    a.free(separator);
+    a.free(replacement);
+    try std.testing.expectEqual(@as(usize, 0), budget.live);
+    try std.testing.expectEqual(@as(?usize, 26), headroom(a));
+    try std.testing.expectError(error.OutOfMemory, a.alloc(u8, 27));
+    const last = try a.alloc(u8, 26);
+    a.free(last);
+    try std.testing.expectEqual(@as(usize, 256), budget.footprint());
+    try std.testing.expectEqual(@as(?usize, 0), headroom(a));
+}
+
+test "SQL monotonic region budget admits in-place growth and never refunds shrinking" {
+    var buffer: [256]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&buffer);
+    var budget: Budget = .{ .backing = fixed.allocator(), .limit = 128, .monotonic = true };
+    const a = budget.allocator();
+    const original = try a.alloc(u8, 64);
+    const grown = try a.realloc(original, 96);
+    try std.testing.expectEqual(original.ptr, grown.ptr);
+    try std.testing.expectEqual(@as(usize, 96), budget.footprint());
+    const shrunk = try a.realloc(grown, 32);
+    try std.testing.expectEqual(@as(usize, 96), budget.footprint());
+    a.free(shrunk);
+    const final = try a.alloc(u8, 32);
+    a.free(final);
+    try std.testing.expectEqual(@as(usize, 128), budget.footprint());
 }
 
 test "SQL nested memory budget headroom respects the live shared parent" {

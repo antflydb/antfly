@@ -68,7 +68,7 @@ pub const ExecutionScratch = struct {
     pub fn init(self: *ExecutionScratch, execution: *Execution) void {
         self.* = .{
             .execution = execution,
-            .memory = .{ .backing = execution.alloc, .limit = execution.bytes.* },
+            .memory = .{ .backing = execution.alloc, .limit = execution.bytes.*, .monotonic = true },
             .arena = undefined,
             .saved_alloc = execution.alloc,
             .saved_numeric_alloc = execution.numeric.alloc,
@@ -82,7 +82,7 @@ pub const ExecutionScratch = struct {
     pub fn deinit(self: *ExecutionScratch) void {
         self.arena.deinit();
         const charged = self.initial_bytes -| self.execution.bytes.*;
-        self.execution.bytes.* = self.initial_bytes -| @max(charged, self.memory.peak);
+        self.execution.bytes.* = self.initial_bytes -| @max(charged, self.memory.footprint());
         self.execution.alloc = self.saved_alloc;
         self.execution.numeric.alloc = self.saved_numeric_alloc;
     }
@@ -120,7 +120,7 @@ const NumericScratch = struct {
     fn init(self: *NumericScratch, execution: *Execution) void {
         self.* = .{
             .execution = execution,
-            .memory = .{ .backing = execution.alloc, .limit = execution.bytes.* },
+            .memory = .{ .backing = execution.alloc, .limit = execution.bytes.*, .monotonic = true },
             .saved_alloc = execution.numeric.alloc,
             .saved_output = execution.numeric.max_output_bytes,
             .saved_groups = execution.numeric.max_groups,
@@ -133,7 +133,7 @@ const NumericScratch = struct {
 
     fn deinit(self: *NumericScratch) void {
         self.arena.deinit();
-        self.execution.bytes.* -|= self.memory.peak;
+        self.execution.bytes.* -|= self.memory.footprint();
         self.execution.numeric.alloc = self.saved_alloc;
         self.execution.numeric.max_output_bytes = self.saved_output;
         self.execution.numeric.max_groups = self.saved_groups;
@@ -142,7 +142,7 @@ const NumericScratch = struct {
     fn encode(self: *NumericScratch, value: exact.Value) !Value {
         const ctx = &self.execution.numeric;
         const size = try binary.encodedSize(ctx, value);
-        if (size > self.execution.bytes.* -| self.memory.peak) return error.RelationalExpressionBudgetExceeded;
+        if (size > self.execution.bytes.* -| self.memory.footprint()) return error.RelationalExpressionBudgetExceeded;
         const output = try allocateOutput(self.execution.alloc, size, self.execution.bytes);
         errdefer self.execution.alloc.free(output);
         var writer: std.Io.Writer = .fixed(output);
@@ -152,7 +152,7 @@ const NumericScratch = struct {
 
     fn json(self: *NumericScratch, value: exact.Value) !std.json.Value {
         const text = try exact.format(&self.execution.numeric, value);
-        if (text.len > self.execution.bytes.* -| self.memory.peak) return error.RelationalExpressionBudgetExceeded;
+        if (text.len > self.execution.bytes.* -| self.memory.footprint()) return error.RelationalExpressionBudgetExceeded;
         const output = try allocateOutput(self.execution.alloc, text.len, self.execution.bytes);
         @memcpy(output, text);
         return if (value.kind == .finite) .{ .number_string = output } else .{ .string = output };
@@ -203,7 +203,7 @@ pub fn arrayJson(
         .wire_bytes = execution.numeric.max_output_bytes,
     }) catch |err| return scratch.failure(err);
     defer prepared.deinit();
-    if (prepared.encoded_size > execution.bytes.* -| scratch.memory.peak) return execution.limit();
+    if (prepared.encoded_size > execution.bytes.* -| scratch.memory.footprint()) return execution.limit();
     const output = allocateOutput(execution.alloc, prepared.encoded_size, execution.bytes) catch |err| return scratch.failure(err);
     errdefer execution.alloc.free(output);
     prepared.writeInto(output) catch |err| return scratch.failure(err);
@@ -226,9 +226,10 @@ fn arrayJsonOutputLeaky(execution: *Execution, array: @import("../sql/row_value.
     }) catch |err| return scratch.failure(err);
     var retained: @import("../sql/memory_budget.zig") = .{
         .backing = execution.alloc,
-        .limit = execution.bytes.* -| scratch.memory.peak,
+        .limit = execution.bytes.* -| scratch.memory.footprint(),
+        .monotonic = true,
     };
-    defer execution.bytes.* -|= retained.peak;
+    defer execution.bytes.* -|= retained.footprint();
     var output = @import("../sql/array_wire.zig").toJsonLeaky(retained.allocator(), decoded.value, .{
         .context = &execution.numeric,
         .values = limits,
@@ -328,6 +329,85 @@ fn normalizeNumericBinding(execution: *Execution, bytes: []const u8, modifier: e
     return scratch.encode(constrained.value) catch |err| return scratch.failure(err);
 }
 
+/// Canonical assignment streams one coefficient at a time. Already constrained
+/// arrays are borrowed without allocation; coercion never builds a flat cell
+/// vector or serializes JSON. Preserve mode verifies logical values, not scale.
+fn normalizeNumericArrayBinding(execution: *Execution, input: Value, modifier: exact.TypeModifier, preserve: bool) !Value {
+    try execution.charge(0);
+    if (input == .null) return input;
+    if (input != .sql_array or input.sql_array.element_type != .numeric) return error.InvalidRelationalExpressionInput;
+    try modifier.validate();
+    const storage = @import("../sql/array_storage.zig");
+    const view = storage.validateCanonical(execution.alloc, .numeric, input.sql_array.bytes, .{
+        .context = &execution.numeric,
+        .wire_bytes = max_output_bytes,
+    }) catch |err| return executionFailure(err);
+    const constrained = for (0..view.count) |i| {
+        const cell = try view.cell(i);
+        if (cell.sql_null) continue;
+        const number = try binary.layout.View.openAuthenticated(cell.bytes, .{});
+        if (number.verifyModifier(modifier, &execution.numeric)) |_| {} else |err| {
+            if (err != error.InvalidSqlBinaryRepresentation) return executionFailure(err);
+            break false;
+        }
+    } else true;
+    if (constrained) return input;
+
+    var scratch: NumericScratch = undefined;
+    scratch.init(execution);
+    defer scratch.deinit();
+    var retained: @import("../sql/memory_budget.zig") = .{
+        .backing = execution.alloc,
+        .limit = execution.bytes.*,
+        .monotonic = true,
+    };
+    defer execution.bytes.* -|= retained.footprint();
+    const owner = retained.allocator();
+    var output: std.ArrayList(u8) = .empty;
+    errdefer output.deinit(owner);
+    if (!preserve) {
+        output.resize(owner, view.payload_start) catch |err| return if (retained.isExhausted()) execution.limit() else scratch.failure(err);
+        var copied: usize = 0;
+        while (copied < view.payload_start) {
+            const end = copied + @min(view.payload_start - copied, 256);
+            execution.charge(end - copied) catch |err| return scratch.failure(err);
+            @memcpy(output.items[copied..end], input.sql_array.bytes[copied..end]);
+            copied = end;
+        }
+    }
+    for (0..view.count) |i| {
+        const remaining = execution.bytes.* -| retained.footprint();
+        if (scratch.memory.footprint() > remaining) return execution.limit();
+        scratch.memory.limit = remaining;
+        if (!scratch.arena.reset(.retain_capacity)) return scratch.failure(error.OutOfMemory);
+        const cell = try view.cell(i);
+        if (!preserve) std.mem.writeInt(u32, output.items[view.slots_start + i * 4 ..][0..4], @intCast(output.items.len - view.payload_start), .little);
+        if (cell.sql_null) continue;
+        var parsed = binary.decodeCanonical(&execution.numeric, cell.bytes) catch |err| return scratch.failure(err);
+        defer parsed.deinit();
+        var rounded = exact.applyTypeModifier(&execution.numeric, parsed.value, modifier) catch |err| return scratch.failure(err);
+        defer rounded.deinit();
+        if (preserve) {
+            if ((exact.order(&execution.numeric, parsed.value, rounded.value) catch |err| return scratch.failure(err)) != .eq)
+                return error.InvalidRelationalGeneratedValue;
+            continue;
+        }
+        const length = binary.encodedSize(&execution.numeric, rounded.value) catch |err| return scratch.failure(err);
+        if (length > max_output_bytes -| output.items.len) return execution.limit();
+        retained.limit = execution.bytes.* -| scratch.memory.footprint();
+        if (retained.footprint() > retained.limit) return execution.limit();
+        const start = output.items.len;
+        output.resize(owner, start + length) catch |err| return if (retained.isExhausted()) execution.limit() else scratch.failure(err);
+        var writer: std.Io.Writer = .fixed(output.items[start..]);
+        binary.encode(&execution.numeric, rounded.value, &writer) catch |err| return scratch.failure(err);
+    }
+    if (preserve) return input;
+    std.mem.writeInt(u32, output.items[view.slots_start + @as(usize, view.count) * 4 ..][0..4], @intCast(output.items.len - view.payload_start), .little);
+    retained.limit = execution.bytes.* -| scratch.memory.footprint();
+    const bytes = output.toOwnedSlice(owner) catch |err| return if (retained.isExhausted()) execution.limit() else scratch.failure(err);
+    return .{ .sql_array = .{ .element_type = .numeric, .bytes = bytes } };
+}
+
 fn numericJsonOutput(execution: *Execution, bytes: []const u8) !std.json.Value {
     var scratch: NumericScratch = undefined;
     scratch.init(execution);
@@ -355,6 +435,7 @@ pub const Plan = struct {
     dependencies: []const u32,
     fingerprint: [32]u8,
     result_kind: Kind,
+    result_sql_type: ?Numeric = null,
     literal_bytes: usize,
 
     pub fn init(alloc: Allocator, table: schema.TableSchema, expression: std.json.Value, expected: Kind) !Plan {
@@ -368,7 +449,7 @@ pub const Plan = struct {
         if (compiler.nodes.items[root].kind != expected) return error.InvalidRelationalExpressionType;
         var fingerprint: [32]u8 = undefined;
         compiler.hash.final(&fingerprint);
-        return .{ .arena = arena, .nodes = compiler.nodes.items, .dependencies = compiler.dependencies.items, .fingerprint = fingerprint, .result_kind = expected, .literal_bytes = compiler.literal_bytes };
+        return .{ .arena = arena, .nodes = compiler.nodes.items, .dependencies = compiler.dependencies.items, .fingerprint = fingerprint, .result_kind = expected, .result_sql_type = compiler.nodes.items[root].sql_type, .literal_bytes = compiler.literal_bytes };
     }
 
     pub fn deinit(self: *Plan) void {
@@ -465,12 +546,14 @@ pub const Plan = struct {
                 .json => |json| blk: {
                     const input = json.object.get(node.column_name) orelse .null;
                     if (node.kind == .blob) break :blk try decodeBlob(execution, try BlobOperand.fromJson(input));
+                    if (node.kind == .sql_array) break :blk try arrayJson(execution, node.sql_type.?, input, null);
                     break :blk if (node.kind == .numeric) try numericJson(execution, input) else try scalarJson(alloc, node.kind, input, false);
                 },
                 .row, .bound_row => |row| blk: {
                     const ordinal = if (source == .bound_row) node.ordinal else row.ordinalForName(node.column_name) orelse break :blk .null;
                     if (ordinal >= row.table_schema.relational_columns.len) return error.RelationalIndexColumnTypeMismatch;
                     if (row.table_schema.relational_columns[ordinal].column_type != node.kind) return error.RelationalIndexColumnTypeMismatch;
+                    if (node.kind == .sql_array and row.table_schema.relational_columns[ordinal].sql_element_type != node.sql_type) return error.RelationalIndexColumnTypeMismatch;
                     const cell = (try row.findCell(ordinal)) orelse break :blk .null;
                     if (cell.is_null) break :blk .null;
                     break :blk switch (node.kind) {
@@ -479,6 +562,7 @@ pub const Plan = struct {
                         .integer => .{ .integer = cell.value.i64_val },
                         .number => .{ .number = cell.value.f64_val },
                         .numeric => .{ .numeric = cell.value.bytes_val },
+                        .sql_array => .{ .sql_array = .{ .element_type = node.sql_type.?, .bytes = cell.value.bytes_val } },
                         .boolean => .{ .boolean = cell.value.bool_val },
                         .datetime => .{ .datetime = cell.value.u64_val },
                         else => return error.InvalidRelationalExpressionType,
@@ -486,6 +570,7 @@ pub const Plan = struct {
                 },
             };
             if (value != .null and !valueHasKind(value, node.kind)) return error.InvalidRelationalExpressionInput;
+            if (value == .sql_array and value.sql_array.element_type != node.sql_type) return error.InvalidRelationalExpressionInput;
             if (value == .number and !std.math.isFinite(value.number)) return error.InvalidRelationalExpressionInput;
             return value;
         }
@@ -876,6 +961,175 @@ fn compareValues(execution: *Execution, a: Value, b: Value, fold_ascii: bool) !s
     return valueOrderWithContext(a, b, fold_ascii, &execution.numeric);
 }
 
+test "relational declarations typed array programs share PostgreSQL values across JSON pinned and cold rows" {
+    const a = std.testing.allocator;
+    const Fixture = struct { entries: []const struct { element_type: Numeric, binary: []const u8 } };
+    var fixture = try std.json.parseFromSlice(Fixture, a, @embedFile("../sql/fixtures/sql_array_binary_reference.json"), .{ .ignore_unknown_fields = true });
+    defer fixture.deinit();
+    for (fixture.value.entries) |entry| {
+        var region = std.heap.ArenaAllocator.init(a);
+        defer region.deinit();
+        const r = region.allocator();
+        const pg = try r.alloc(u8, entry.binary.len / 2);
+        _ = try std.fmt.hexToBytes(pg, entry.binary);
+        var original = try @import("../sql/array_binary.zig").decode(r, entry.element_type, pg, .{});
+        defer original.deinit();
+        const canonical = try @import("../sql/array_storage.zig").encodeAlloc(r, original.value, .{});
+        const envelope = try @import("../sql/array_wire.zig").encodeAlloc(r, original.value, .{});
+        const table: schema.TableSchema = .{ .version = 1, .storage_mode = .relational, .requires_array_expressions = true, .relational_columns = &.{
+            .{ .name = "a", .path = "a", .column_type = .sql_array, .sql_element_type = entry.element_type },
+        } };
+        const text = try std.fmt.allocPrint(r, "{{\"op\":\"eq\",\"args\":[{{\"op\":\"column\",\"column\":\"a\"}},{{\"op\":\"literal\",\"type\":\"sql_array\",\"sql_type\":\"{s}\",\"value\":{s}}}]}}", .{ @tagName(entry.element_type), envelope });
+        var plan = blk: {
+            var input = try std.json.parseFromSlice(std.json.Value, a, text, .{});
+            defer input.deinit();
+            break :blk try Plan.init(a, table, input.value, .boolean);
+        };
+        defer plan.deinit();
+        // Compilation owns the literal after the parsed request is released.
+        const pinned: Value = .{ .sql_array = .{ .element_type = entry.element_type, .bytes = canonical } };
+        try std.testing.expect((try plan.evaluate(r, &.{pinned})).boolean);
+        var wrong = pinned;
+        wrong.sql_array.element_type = if (entry.element_type == .int64) .int32 else .int64;
+        try std.testing.expectError(error.InvalidRelationalExpressionInput, plan.evaluate(r, &.{wrong}));
+        var document = try std.json.parseFromSlice(std.json.Value, r, try std.fmt.allocPrint(r, "{{\"a\":{s}}}", .{envelope}), .{});
+        defer document.deinit();
+        try std.testing.expect((try plan.evaluateJson(r, document.value)).boolean);
+        var layout = try codec.PhysicalLayout.init(r, table);
+        defer layout.deinit();
+        const bytes = try codec.serializeOrdinal(r, table.version, table.relational_columns, &.{
+            .{ .ordinal = 0, .path = "a", .value_type = .bytes_val, .sql_array_element_type = entry.element_type, .value = .{ .bytes_val = canonical } },
+        }, @splat(0));
+        const row = try codec.ordinalRowView(bytes, table, &layout);
+        try std.testing.expect((try plan.evaluateRow(r, row)).boolean);
+        var allowance: usize = max_allocated_bytes;
+        try std.testing.expect((try plan.evaluateBoundRowWithBudget(r, row, &allowance)).boolean);
+        var wrong_columns = [_]schema.RelationalColumn{table.relational_columns[0]};
+        wrong_columns[0].sql_element_type = wrong.sql_array.element_type;
+        var wrong_row = row;
+        wrong_row.table_schema.relational_columns = &wrong_columns;
+        try std.testing.expectError(error.RelationalIndexColumnTypeMismatch, plan.evaluateRow(r, wrong_row));
+    }
+    try std.testing.expectEqual(@as(usize, 11), fixture.value.entries.len);
+}
+
+test "relational declarations typed array branches preserve exact identities and own literals under faults" {
+    const a = std.testing.allocator;
+    const table: schema.TableSchema = .{ .storage_mode = .relational, .relational_columns = &.{
+        .{ .name = "a", .path = "a", .column_type = .sql_array, .sql_element_type = .int64 },
+    } };
+    const probe: Value = .{ .sql_array = .{ .element_type = .int64, .bytes = &.{ 1, 0, 0, 0, 0, 0, 0, 0 } } };
+    for ([_][]const u8{
+        \\{"op":"coalesce","args":[{"op":"literal","type":"sql_array","sql_type":"int64","value":null},{"op":"column","column":"a"}]}
+        ,
+        \\{"op":"case_when","args":[{"op":"literal","type":"boolean","value":true},{"op":"column","column":"a"},{"op":"literal","type":"sql_array","sql_type":"int64","value":null}]}
+    }) |text| {
+        var input = try std.json.parseFromSlice(std.json.Value, a, text, .{});
+        defer input.deinit();
+        var plan = try Plan.init(a, table, input.value, .sql_array);
+        defer plan.deinit();
+        try std.testing.expectEqual(Numeric.int64, plan.result_sql_type.?);
+        const result = try plan.evaluate(std.testing.failing_allocator, &.{probe});
+        try std.testing.expectEqual(probe.sql_array.bytes.ptr, result.sql_array.bytes.ptr);
+        try std.testing.expectEqual(Numeric.int64, result.sql_array.element_type);
+    }
+    for ([_][]const u8{
+        \\{"op":"coalesce","args":[{"op":"column","column":"a"},{"op":"literal","type":"sql_array","sql_type":"int32"}]}
+        ,
+        \\{"op":"case_when","args":[{"op":"literal","type":"boolean","value":true},{"op":"column","column":"a"},{"op":"literal","type":"sql_array","sql_type":"int32"}]}
+        ,
+        \\{"op":"in_list","args":[{"op":"column","column":"a"},{"op":"literal","type":"sql_array","sql_type":"int32"}]}
+        ,
+        \\{"op":"eq","args":[{"op":"column","column":"a"},{"op":"literal","type":"sql_array","sql_type":"int32"}]}
+        ,
+        \\{"op":"literal","type":"sql_array","value":null}
+    }) |text| {
+        var input = try std.json.parseFromSlice(std.json.Value, a, text, .{});
+        defer input.deinit();
+        try std.testing.expectError(error.InvalidRelationalExpressionType, Plan.init(a, table, input.value, .sql_array));
+    }
+    const Faults = struct {
+        fn run(alloc: Allocator) !void {
+            var plan = blk: {
+                var input = try std.json.parseFromSlice(std.json.Value, alloc,
+                    \\{"op":"coalesce","args":[{"op":"literal","type":"sql_array","sql_type":"int64"},{"op":"literal","type":"sql_array","sql_type":"int64","value":{"dimensions":[{"length":2,"lower_bound":-2}],"values":["42",null],"sql_nulls":[false,true]}}]}
+                , .{});
+                defer input.deinit();
+                break :blk try Plan.init(alloc, .{}, input.value, .sql_array);
+            };
+            defer plan.deinit();
+            const value = try plan.evaluate(std.testing.failing_allocator, &.{});
+            const view = try value.sql_array.view();
+            try std.testing.expectEqual(@as(u32, 2), view.count);
+            try std.testing.expectEqual(@as(i32, -2), (try view.dimension(0)).lower);
+            try std.testing.expect((try view.cell(1)).sql_null);
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Faults.run, .{});
+}
+
+test "relational declarations generated NUMERIC arrays normalize dependencies and strictly verify restore" {
+    const a = std.testing.allocator;
+    const table: schema.TableSchema = .{ .version = 1, .storage_mode = .relational, .requires_public_schema = true, .requires_array_expressions = true, .requires_numeric_modifiers = true, .relational_columns = &.{
+        .{ .name = "a", .path = "a", .column_type = .sql_array, .sql_element_type = .numeric, .numeric_modifier = .{ .precision = 4, .scale = 2 } },
+        .{ .name = "g", .path = "g", .column_type = .sql_array, .sql_element_type = .numeric, .numeric_modifier = .{ .precision = 3, .scale = 1 } },
+    } };
+    var declarations = try std.json.parseFromSlice(std.json.Value, a,
+        \\[{"column":"g","expression":{"op":"column","column":"a"}}]
+    , .{});
+    defer declarations.deinit();
+    const serialized = try schema.serializeSchema(a, table);
+    defer a.free(serialized);
+    const set = blk: {
+        const owned = try schema.deserializeSchema(a, serialized);
+        errdefer schema.freeSchema(a, owned);
+        break :blk try Set.createOwned(a, owned, .null, declarations.value);
+    };
+    defer set.deinit();
+    var document = try std.json.parseFromSlice(std.json.Value, a,
+        \\{"a":{"dimensions":[{"length":3,"lower_bound":-1}],"values":["12.345",null,"-12.345"],"sql_nulls":[false,true,false]}}
+    , .{});
+    defer document.deinit();
+    const r = document.arena.allocator();
+    try set.applyJson(r, &document.value);
+    const assigned = document.value.object.get("a").?.object.get("values").?.array.items;
+    const generated = document.value.object.get("g").?.object.get("values").?.array.items;
+    try std.testing.expectEqualStrings("12.35", assigned[0].string);
+    try std.testing.expectEqualStrings("-12.35", assigned[2].string);
+    try std.testing.expectEqualStrings("12.4", generated[0].string);
+    try std.testing.expectEqualStrings("-12.4", generated[2].string);
+    try set.verifyJson(r, document.value);
+    var layout = try codec.PhysicalLayout.init(r, set.table);
+    defer layout.deinit();
+    var allowance: usize = max_allocated_bytes;
+    var execution = Execution.init(r, &allowance);
+    var cells: [2]codec.Cell = undefined;
+    for (set.table.relational_columns, &cells, 0..) |column, *cell, ordinal| {
+        const value = try arrayJson(&execution, .numeric, document.value.object.get(column.name).?, null);
+        cell.* = .{ .ordinal = @intCast(ordinal), .path = column.name, .value_type = .bytes_val, .sql_array_element_type = .numeric, .value = .{ .bytes_val = value.sql_array.bytes } };
+    }
+    const bytes = try codec.serializeOrdinal(r, table.version, table.relational_columns, &cells, @splat(0));
+    try set.verifyRow(r, try codec.ordinalRowView(bytes, set.table, &layout));
+    // A valid coefficient in the wrong target domain must not be repaired by
+    // restore, even though normal assignment could round it to the right value.
+    cells[1].value.bytes_val = cells[0].value.bytes_val;
+    try std.testing.expectError(error.InvalidSqlBinaryRepresentation, codec.serializeOrdinal(r, table.version, table.relational_columns, &cells, @splat(0)));
+    // A canonical coefficient in the right domain still needs generated-value
+    // verification: type/physical integrity alone cannot prove its derivation.
+    generated[0] = .{ .string = "12.3" };
+    generated[2] = .{ .string = "-12.3" };
+    const wrong_value = try arrayJson(&execution, .numeric, document.value.object.get("g").?, null);
+    cells[1].value.bytes_val = wrong_value.sql_array.bytes;
+    const forged = try codec.serializeOrdinal(r, table.version, table.relational_columns, &cells, @splat(0));
+    try std.testing.expectError(error.InvalidRelationalGeneratedValue, set.verifyRow(r, try codec.ordinalRowView(forged, set.table, &layout)));
+    // Exact target identity is checked even for a typed SQL NULL default.
+    var wrong = try std.json.parseFromSlice(std.json.Value, a,
+        \\[{"column":"g","expression":{"op":"literal","type":"sql_array","sql_type":"int64"}}]
+    , .{});
+    defer wrong.deinit();
+    try std.testing.expectError(error.InvalidRelationalExpressionType, Set.createOwned(a, table, wrong.value, .null));
+}
+
 test "relational declarations typed array JSON adapter owns canonical PostgreSQL values and unwinds faults" {
     const a = std.testing.allocator;
     const arrays = @import("../sql/array_value.zig");
@@ -1186,6 +1440,10 @@ fn valueHasKind(value: Value, kind: Kind) bool {
     };
 }
 
+fn sameOperandType(a: Node, b: Node) bool {
+    return a.kind == b.kind and (a.kind != .sql_array or a.sql_type == b.sql_type);
+}
+
 const Compiler = struct {
     alloc: Allocator,
     execution: *Execution,
@@ -1232,12 +1490,17 @@ const Compiler = struct {
                 node.kind = std.meta.stringToEnum(Kind, kind.string) orelse return error.InvalidRelationalExpression;
                 const value = input.object.get("value") orelse .null;
                 switch (node.kind) {
-                    .string, .blob, .boolean, .datetime, .integer, .number, .numeric => {},
+                    .string, .blob, .boolean, .datetime, .integer, .number, .numeric, .sql_array => {},
                     .json => if (value != .null) return error.InvalidRelationalExpressionType,
                     else => return error.InvalidRelationalExpressionType,
                 }
                 if (node.kind == .blob and value == .string and value.string.len > std.base64.standard.Encoder.calcSize(max_output_bytes)) return error.RelationalExpressionBudgetExceeded;
-                node.literal = (if (node.kind == .numeric) numericJson(self.execution, value) else scalarJson(self.alloc, node.kind, value, true)) catch |err| switch (err) {
+                if (node.kind == .sql_array) {
+                    const identity = input.object.get("sql_type") orelse return error.InvalidRelationalExpressionType;
+                    if (identity != .string) return error.InvalidRelationalExpressionType;
+                    node.sql_type = std.meta.stringToEnum(Numeric, identity.string) orelse return error.InvalidRelationalExpressionType;
+                }
+                node.literal = (if (node.kind == .sql_array) arrayJson(self.execution, node.sql_type.?, value, null) else if (node.kind == .numeric) numericJson(self.execution, value) else scalarJson(self.alloc, node.kind, value, true)) catch |err| switch (err) {
                     error.OutOfMemory => return err,
                     error.SqlProgramLimitExceeded, error.RelationalExpressionBudgetExceeded => return err,
                     else => return error.InvalidRelationalExpressionType,
@@ -1254,6 +1517,7 @@ const Compiler = struct {
                 self.frame(@tagName(node.kind));
                 self.literal_bytes += switch (node.literal) {
                     .string, .blob, .numeric => |bytes| bytes.len,
+                    .sql_array => |array| array.bytes.len,
                     .datetime => 16,
                     else => 8,
                 };
@@ -1277,7 +1541,7 @@ const Compiler = struct {
                         std.mem.writeInt(u64, &bytes, @bitCast(number), .little);
                         self.hash.update(&bytes);
                     },
-                    .sql_array => unreachable, // Literal compilation rejects arrays until their wire contract is activated.
+                    .sql_array => |array| self.frame(array.bytes),
                 }
             },
             .column => {
@@ -1290,8 +1554,9 @@ const Compiler = struct {
                 node.kind = self.table.relational_columns[node.ordinal].column_type;
                 node.sql_type = self.table.relational_columns[node.ordinal].sql_element_type;
                 if (node.kind == .numeric and node.sql_type != .numeric) return error.InvalidRelationalExpressionType;
+                if (node.kind == .sql_array and node.sql_type == null) return error.InvalidRelationalExpressionType;
                 switch (node.kind) {
-                    .string, .blob, .boolean, .datetime, .integer, .number, .numeric => {},
+                    .string, .blob, .boolean, .datetime, .integer, .number, .numeric, .sql_array => {},
                     else => return error.InvalidRelationalExpressionType,
                 }
                 if (std.mem.indexOfScalar(u32, self.dependencies.items, node.ordinal) == null) try self.dependencies.append(self.alloc, node.ordinal);
@@ -1325,12 +1590,16 @@ const Compiler = struct {
                 const children = try self.alloc.alloc(u16, length);
                 for (args.array.items, children) |arg, *child| child.* = try self.compile(arg, depth + 1);
                 node.children = children;
-                node.kind = self.nodes.items[children[if (op == .case_when) children.len - 1 else 0]].kind;
+                const operand = self.nodes.items[children[if (op == .case_when) children.len - 1 else 0]];
+                node.kind = operand.kind;
                 if (op == .case_when) {
                     for (children[0 .. children.len - 1], 0..) |child, i| {
-                        if (self.nodes.items[child].kind != (if (i % 2 == 0) Kind.boolean else node.kind)) return error.InvalidRelationalExpressionType;
+                        const candidate = self.nodes.items[child];
+                        if (i % 2 == 0) {
+                            if (candidate.kind != .boolean) return error.InvalidRelationalExpressionType;
+                        } else if (!sameOperandType(candidate, operand)) return error.InvalidRelationalExpressionType;
                     }
-                } else for (children[1..]) |child| if (self.nodes.items[child].kind != node.kind) return error.InvalidRelationalExpressionType;
+                } else for (children[1..]) |child| if (!sameOperandType(self.nodes.items[child], operand)) return error.InvalidRelationalExpressionType;
                 if (isComparison(op)) {
                     if (input.object.get("collation")) |collation| {
                         if (collation != .string or node.kind != .string) return error.UnsupportedRelationalIndexCollation;
@@ -1354,6 +1623,7 @@ const Compiler = struct {
                     .modulo => if (node.kind != .integer and node.kind != .numeric) return error.InvalidRelationalExpressionType,
                     .concat, .lower_ascii, .upper_ascii => if (node.kind != .string) return error.InvalidRelationalExpressionType,
                     .coalesce, .case_when => {
+                        if (node.kind == .sql_array) node.sql_type = operand.sql_type;
                         if (node.kind == .integer or node.kind == .number or node.kind == .numeric) {
                             const identity = numericIdentity(self.nodes.items[children[children.len - 1]]);
                             const same = for (children, 0..) |child, i| {
@@ -1374,12 +1644,12 @@ const Compiler = struct {
         if (input.object.get("sql_type")) |identity| {
             if (identity != .string) return error.InvalidRelationalExpressionType;
             const typed = std.meta.stringToEnum(Numeric, identity.string) orelse return error.InvalidRelationalExpressionType;
-            if ((node.kind != .integer or !casts.integral(typed)) and (node.kind != .number or !casts.floating(typed)) and (node.kind != .numeric or typed != .numeric)) return error.InvalidRelationalExpressionType;
+            if (node.kind != .sql_array and (node.kind != .integer or !casts.integral(typed)) and (node.kind != .number or !casts.floating(typed)) and (node.kind != .numeric or typed != .numeric)) return error.InvalidRelationalExpressionType;
             node.sql_type = typed;
-            if (op == .literal and node.kind != .numeric) node.literal = numericCast(node.literal, typed) catch return error.InvalidRelationalExpressionType;
+            if (op == .literal and node.kind != .numeric and node.kind != .sql_array) node.literal = numericCast(node.literal, typed) catch return error.InvalidRelationalExpressionType;
             // Do not change fingerprints of historical unannotated programs.
             // Typed operations/casts have a distinct, immutable semantic key.
-            self.frame("SQL numeric expression identity v1");
+            self.frame(if (node.kind == .sql_array) "SQL array expression identity v1" else "SQL numeric expression identity v1");
             self.frame(@tagName(typed));
             if (op == .add or op == .subtract or op == .multiply or op == .divide or op == .modulo or op == .negate) {
                 for (node.children) |child| if (numericIdentity(self.nodes.items[child]) != typed) return error.InvalidRelationalExpressionType;
@@ -2056,15 +2326,23 @@ test "relational declarations NUMERIC JSON assignments share PostgreSQL scalar a
         var budget: usize = max_allocated_bytes;
         var execution = Execution.init(alloc, &budget);
         const modifier: exact.TypeModifier = .{ .precision = entry.precision, .scale = entry.scale };
+        const raw_array = try arrayJson(&execution, .numeric, document.value, null);
         if (entry.@"error") |code| {
             const expected = if (std.mem.eql(u8, code, "22023")) error.SqlInvalidParameterValue else error.RelationalExpressionOverflow;
             try std.testing.expectError(expected, normalizeNumericJson(&execution, .{ .string = entry.left }, modifier, false));
             try std.testing.expectError(expected, normalizeNumericArrayJson(&execution, &document.value, modifier, false));
             try std.testing.expectError(expected, arrayJson(&execution, .numeric, document.value, modifier));
+            try std.testing.expectError(expected, normalizeNumericArrayBinding(&execution, raw_array, modifier, false));
             try std.testing.expectEqual(original.ptr, document.value.object.get("values").?.array.items.ptr);
             continue;
         }
         const adapted = try arrayJson(&execution, .numeric, document.value, modifier);
+        const assigned = try normalizeNumericArrayBinding(&execution, raw_array, modifier, false);
+        try std.testing.expectEqualSlices(u8, adapted.sql_array.bytes, assigned.sql_array.bytes);
+        const before_reuse = budget;
+        const reused = try normalizeNumericArrayBinding(&execution, assigned, modifier, false);
+        try std.testing.expectEqual(assigned.sql_array.bytes.ptr, reused.sql_array.bytes.ptr);
+        try std.testing.expectEqual(before_reuse, budget);
         const adapted_view = try adapted.sql_array.view();
         try std.testing.expectEqual(@as(u32, 4), adapted_view.count);
         try std.testing.expectEqual(@as(i32, -3), (try adapted_view.dimension(0)).lower);
@@ -2090,6 +2368,104 @@ test "relational declarations NUMERIC JSON assignments share PostgreSQL scalar a
         try std.testing.expectEqual(cells.ptr, document.value.object.get("values").?.array.items.ptr);
     }
     try std.testing.expectEqual(@as(usize, 20), tested);
+}
+
+test "relational declarations canonical NUMERIC array assignment streams with fault and preservation safety" {
+    const a = std.testing.allocator;
+    const arrays = @import("../sql/array_value.zig");
+    const storage = @import("../sql/array_storage.zig");
+    var parsing: exact.Context = .{ .alloc = a };
+    var number = try exact.parse(&parsing, "12.345");
+    defer number.deinit();
+    var cells: [45]arrays.Element = undefined;
+    for (&cells, 0..) |*cell, i| cell.* = if (i % 5 == 0) .{} else arrays.Element.typedNumeric(&number.value);
+    const bytes = try storage.encodeAlloc(a, .{ .element_type = .numeric, .dimensions = &.{.{ .length = cells.len, .lower = -7 }}, .elements = &cells }, .{});
+    defer a.free(bytes);
+    const input: Value = .{ .sql_array = .{ .element_type = .numeric, .bytes = bytes } };
+    const target: exact.TypeModifier = .{ .precision = 4, .scale = 2 };
+    const Run = struct {
+        fn run(alloc: Allocator, source: Value, modifier: exact.TypeModifier) !void {
+            var allowance: usize = max_allocated_bytes;
+            var execution = Execution.init(alloc, &allowance);
+            const result = normalizeNumericArrayBinding(&execution, source, modifier, false) catch |err| {
+                if (err == error.OutOfMemory) try std.testing.expect(execution.numeric.failure == null);
+                try std.testing.expectEqual(alloc.ptr, execution.alloc.ptr);
+                try std.testing.expectEqual(alloc.vtable, execution.numeric.alloc.vtable);
+                return err;
+            };
+            defer alloc.free(result.sql_array.bytes);
+            try std.testing.expect(result.sql_array.bytes.ptr != source.sql_array.bytes.ptr);
+            const view = try storage.validateCanonical(alloc, .numeric, result.sql_array.bytes, .{});
+            try std.testing.expectEqual(@as(i32, -7), (try view.dimension(0)).lower);
+            for (0..view.count) |i| {
+                const cell = try view.cell(i);
+                try std.testing.expectEqual(i % 5 == 0, cell.sql_null);
+                if (!cell.sql_null) try (try binary.layout.View.open(cell.bytes, .{})).verifyStoredModifier(modifier);
+            }
+            var no_bytes: usize = 0;
+            var no_heap = Execution.init(std.testing.failing_allocator, &no_bytes);
+            const reused = try normalizeNumericArrayBinding(&no_heap, result, modifier, false);
+            try std.testing.expectEqual(result.sql_array.bytes.ptr, reused.sql_array.bytes.ptr);
+            try std.testing.expectEqual(@as(usize, 0), no_bytes);
+            try std.testing.expectEqual(alloc.ptr, execution.alloc.ptr);
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Run.run, .{ input, target });
+    var allowance: usize = max_allocated_bytes;
+    var execution = Execution.init(a, &allowance);
+    try std.testing.expectError(error.InvalidRelationalGeneratedValue, normalizeNumericArrayBinding(&execution, input, target, true));
+    const Cancel = struct {
+        calls: usize = 0,
+        fn poll(ptr: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            self.calls += 1;
+            if (self.calls == 4) return error.Canceled;
+        }
+    };
+    var cancel: Cancel = .{};
+    execution = Execution.init(a, &allowance);
+    execution.numeric.checkpoint = Cancel.poll;
+    execution.numeric.ptr = &cancel;
+    try std.testing.expectError(error.Canceled, normalizeNumericArrayBinding(&execution, input, target, false));
+    try std.testing.expectEqual(@as(usize, 4), cancel.calls);
+    execution.numeric.checkpoint = null;
+    execution.numeric.remaining = 8 * 1024 * 1024;
+    try std.testing.expectError(error.Canceled, normalizeNumericArrayBinding(&execution, input, target, false));
+    var scaled = try exact.parse(&parsing, "12.3500");
+    defer scaled.deinit();
+    const same_bytes = try storage.encodeAlloc(a, .{ .element_type = .numeric, .dimensions = &.{.{ .length = 1 }}, .elements = &.{arrays.Element.typedNumeric(&scaled.value)} }, .{});
+    defer a.free(same_bytes);
+    execution = Execution.init(a, &allowance);
+    const same: Value = .{ .sql_array = .{ .element_type = .numeric, .bytes = same_bytes } };
+    try std.testing.expectEqual(same_bytes.ptr, (try normalizeNumericArrayBinding(&execution, same, target, true)).sql_array.bytes.ptr);
+}
+
+test "relational declarations canonical NUMERIC array assignment bounds scratch independently of cell count" {
+    const a = std.testing.allocator;
+    const arrays = @import("../sql/array_value.zig");
+    const storage = @import("../sql/array_storage.zig");
+    var parsing: exact.Context = .{ .alloc = a };
+    var number = try exact.parse(&parsing, "123.4567");
+    defer number.deinit();
+    const cells = try a.alloc(arrays.Element, 10000);
+    defer a.free(cells);
+    @memset(cells, arrays.Element.typedNumeric(&number.value));
+    const input = try storage.encodeAlloc(a, .{ .element_type = .numeric, .dimensions = &.{.{ .length = @intCast(cells.len), .lower = -9 }}, .elements = cells }, .{});
+    defer a.free(input);
+    var tracked = std.testing.FailingAllocator.init(a, .{});
+    var allowance: usize = max_allocated_bytes;
+    var execution = Execution.init(tracked.allocator(), &allowance);
+    const before = execution.numeric.remaining;
+    const started = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
+    const result = try normalizeNumericArrayBinding(&execution, .{ .sql_array = .{ .element_type = .numeric, .bytes = input } }, .{ .precision = 5, .scale = 2 }, false);
+    const elapsed = std.Io.Clock.now(.awake, std.testing.io).nanoseconds - started;
+    defer tracked.allocator().free(result.sql_array.bytes);
+    try std.testing.expectEqual(tracked.allocated_bytes, max_allocated_bytes - allowance);
+    try std.testing.expect(tracked.alloc_index < 100);
+    try std.testing.expect(tracked.allocated_bytes < cells.len * @sizeOf(arrays.Element));
+    std.debug.print("canonical NUMERIC array assignment: cells={} output_bytes={} total_allocation_bytes={} allocations={} work={} elapsed_ns={} flat_cell_vectors=0\n", .{
+        cells.len, result.sql_array.bytes.len, tracked.allocated_bytes, tracked.alloc_index, before - execution.numeric.remaining, elapsed,
+    });
 }
 
 test "relational declarations NUMERIC JSON array preparation is atomic bounded and cancellation aware" {
@@ -2461,6 +2837,7 @@ pub const Set = struct {
                 for (bindings[0..initialized]) |binding| if (binding.ordinal == ordinal) return error.InvalidRelationalExpression;
                 var plan = try Plan.init(alloc, table, entry.object.get("expression") orelse return error.InvalidRelationalExpression, table.relational_columns[ordinal].column_type);
                 errdefer plan.deinit();
+                if (plan.result_kind == .sql_array and plan.result_sql_type != table.relational_columns[ordinal].sql_element_type) return error.InvalidRelationalExpressionType;
                 total_nodes += plan.nodes.len;
                 total_literal_bytes += plan.literal_bytes;
                 if (total_nodes > 4096 or total_literal_bytes > max_allocated_bytes) return error.RelationalExpressionBudgetExceeded;
@@ -2583,8 +2960,11 @@ pub const Set = struct {
         for (self.modifier_ordinals) |ordinal| {
             if (self.generated_columns[ordinal]) continue;
             const column = self.table.relational_columns[ordinal];
-            if (document.object.getPtr(column.name)) |cell| if (values[ordinal] == .numeric) {
-                cell.* = try numericJsonOutput(execution, values[ordinal].numeric);
+            if (document.object.getPtr(column.name)) |cell| switch (values[ordinal]) {
+                .numeric => |bytes| cell.* = try numericJsonOutput(execution, bytes),
+                .sql_array => |array| cell.* = try arrayJsonOutputLeaky(execution, array),
+                .null => {},
+                else => return error.InvalidRelationalExpressionInput,
             };
         }
         for (self.bindings) |binding| {
@@ -2668,6 +3048,7 @@ pub const Set = struct {
                 .integer => .{ .integer = cell.value.i64_val },
                 .number => .{ .number = cell.value.f64_val },
                 .numeric => .{ .numeric = cell.value.bytes_val },
+                .sql_array => .{ .sql_array = .{ .element_type = column.sql_element_type orelse return error.InvalidRelationalGeneratedValue, .bytes = cell.value.bytes_val } },
                 .boolean => .{ .boolean = cell.value.bool_val },
                 .datetime => .{ .datetime = cell.value.u64_val },
                 else => return error.InvalidRelationalGeneratedValue,
@@ -2679,8 +3060,14 @@ pub const Set = struct {
     fn verifyValues(self: *const Set, execution: *Execution, values: []const Value, present: []const bool) !void {
         for (self.modifier_ordinals) |ordinal| {
             if (!present[ordinal] or values[ordinal] == .null) continue;
-            if (values[ordinal] != .numeric) return error.InvalidRelationalGeneratedValue;
-            _ = try normalizeNumericBinding(execution, values[ordinal].numeric, self.table.relational_columns[ordinal].numeric_modifier.?, true);
+            const modifier = self.table.relational_columns[ordinal].numeric_modifier.?;
+            if (self.table.relational_columns[ordinal].column_type == .sql_array) {
+                if (values[ordinal] != .sql_array or values[ordinal].sql_array.element_type != .numeric) return error.InvalidRelationalGeneratedValue;
+                _ = try normalizeNumericArrayBinding(execution, values[ordinal], modifier, true);
+            } else {
+                if (values[ordinal] != .numeric) return error.InvalidRelationalGeneratedValue;
+                _ = try normalizeNumericBinding(execution, values[ordinal].numeric, modifier, true);
+            }
         }
         for (self.order) |index| {
             const binding = &self.bindings[index];
@@ -2704,6 +3091,11 @@ pub const Set = struct {
     fn normalizeBinding(self: *const Set, execution: *Execution, ordinal: usize, value: Value) !Value {
         if (value == .null) return value;
         const column = self.table.relational_columns[ordinal];
+        if (column.column_type == .sql_array) {
+            if (value != .sql_array or value.sql_array.element_type != column.sql_element_type) return error.InvalidRelationalExpressionInput;
+            if (column.numeric_modifier) |modifier| return normalizeNumericArrayBinding(execution, value, modifier, false);
+            return value;
+        }
         if (column.numeric_modifier) |modifier| {
             if (value != .numeric) return error.InvalidRelationalExpressionInput;
             return normalizeNumericBinding(execution, value.numeric, modifier, false);
@@ -2732,6 +3124,7 @@ pub const Set = struct {
             if (!self.read_columns[ordinal] or (ignore_generated and self.generated_columns[ordinal])) continue;
             if (input) |scalar| switch (column.column_type) {
                 .numeric => value.* = try numericJson(execution, scalar),
+                .sql_array => value.* = try arrayJson(execution, column.sql_element_type orelse return error.InvalidRelationalExpressionInput, scalar, null),
                 .blob => value.* = try decodeBlob(execution, try BlobOperand.fromJson(scalar)),
                 .string, .boolean, .datetime, .integer, .number => value.* = try scalarJson(execution.alloc, column.column_type, scalar, false),
                 else => {},
@@ -2767,7 +3160,7 @@ pub fn foldConstantJson(execution: *Execution, expression: std.json.Value) !std.
 
 fn foldConstantJsonImpl(execution: *Execution, expression: std.json.Value) !std.json.Value {
     try execution.numeric.charge(1);
-    var memory: @import("../sql/memory_budget.zig") = .{ .backing = execution.alloc, .limit = execution.bytes.* };
+    var memory: @import("../sql/memory_budget.zig") = .{ .backing = execution.alloc, .limit = execution.bytes.*, .monotonic = true };
     var arena = std.heap.ArenaAllocator.init(memory.allocator());
     defer arena.deinit();
     const plan: Plan = compile: {
@@ -2782,7 +3175,7 @@ fn foldConstantJsonImpl(execution: *Execution, expression: std.json.Value) !std.
             execution.numeric.alloc = numeric_alloc;
             // Charge real arena capacity, including failed compilation. This
             // is monotonic even when an outer arena cannot reclaim frees.
-            execution.bytes.* -|= memory.peak;
+            execution.bytes.* -|= memory.footprint();
         }
         var compiler: Compiler = .{ .alloc = compilation.alloc, .table = .{ .storage_mode = .relational }, .execution = &compilation };
         compiler.hash.update("antfly immutable scalar expression v1");
@@ -2795,7 +3188,7 @@ fn foldConstantJsonImpl(execution: *Execution, expression: std.json.Value) !std.
         std.debug.assert(compiler.dependencies.items.len == 0);
         var fingerprint: [32]u8 = undefined;
         compiler.hash.final(&fingerprint);
-        break :compile .{ .arena = arena, .nodes = compiler.nodes.items, .dependencies = &.{}, .fingerprint = fingerprint, .result_kind = compiler.nodes.items[root].kind, .literal_bytes = compiler.literal_bytes };
+        break :compile .{ .arena = arena, .nodes = compiler.nodes.items, .dependencies = &.{}, .fingerprint = fingerprint, .result_kind = compiler.nodes.items[root].kind, .result_sql_type = compiler.nodes.items[root].sql_type, .literal_bytes = compiler.literal_bytes };
     };
     const result = try plan.evaluateWithExecution(execution, &.{});
     return boundedValueToJson(execution, result);

@@ -486,7 +486,18 @@ pub const BatchKeys = struct {
         // Only bound dependencies are decoded; unrelated wide columns stay in
         // their physical vectors. NULL slots are checked before dictionary IDs.
         for (self.inputs, self.plan.columns, self.values) |input, column, *value| {
-            value.* = if (input) |index| expressions.Value.fromScalar(try vectorValue(self.batch.columns[index], column.column_type, row)) else .null;
+            value.* = if (input) |index| blk: {
+                const vector = self.batch.columns[index];
+                // Array dependencies are logical operands, not ordered keys.
+                // The pinned schema owns element identity; payloads borrow the
+                // retained batch. NULLs must precede dictionary addressing.
+                if (vector.nulls.isNull(row)) break :blk .null;
+                if (column.column_type == .sql_array) break :blk .{ .sql_array = .{
+                    .element_type = column.sql_element_type orelse return error.RelationalIndexColumnTypeMismatch,
+                    .bytes = try vector.bytesAt(row),
+                } };
+                break :blk expressions.Value.fromScalar(try vectorValue(vector, column.column_type, row));
+            } else .null;
         }
         var budget: usize = expressions.max_allocated_bytes;
         var has_null = false;
@@ -994,6 +1005,40 @@ test "relational index system SQL tuples bind precise direct and expression doma
         var new_tuple = try testTupleAlloc(alloc, after, current, &cells);
         defer new_tuple.deinit(alloc);
         try std.testing.expectEqualSlices(u8, old_tuple.bytes, new_tuple.bytes);
+    }
+}
+
+test "relational index system array dependent scalar keys share cold dictionary and pinned row bytes" {
+    const a = std.testing.allocator;
+    const sources = @import("../rowsource/types.zig");
+    const table: schema.TableSchema = .{ .version = 1, .storage_mode = .relational, .requires_array_expressions = true, .relational_columns = &.{
+        .{ .name = "a", .path = "a", .column_type = .sql_array, .sql_element_type = .int64 },
+    } };
+    var layout = try rows.PhysicalLayout.init(a, table);
+    defer layout.deinit();
+    var plan = try TuplePlan.init(a, table, &layout, &.{.{ .expression_json = "{\"op\":\"is_null\",\"args\":[{\"op\":\"column\",\"column\":\"a\"}]}", .result_type = .boolean }});
+    defer plan.deinit();
+    try std.testing.expectError(error.UnsupportedRelationalIndexColumn, TuplePlan.init(a, table, &layout, &.{.{ .column = "a" }}));
+    const empty: []const u8 = &.{ 1, 0, 0, 0, 0, 0, 0, 0 };
+    const batch: sources.ColumnBatch = .{
+        .snapshot = .{ .table_id = "arrays", .snapshot_id = "one" },
+        .row_refs = &.{ .{ .relational_key = "one" }, .{ .relational_key = "two" } },
+        .columns = &.{.{ .name = "a", .nulls = .{ .bytes = &.{ 0, 1 } }, .values = .{ .dictionary_bytes = .{
+            .values = &.{empty},
+            .indices = &.{ 0, std.math.maxInt(u32) },
+        } } }},
+    };
+    var bound = try plan.bindBatch(a, batch);
+    defer bound.deinit();
+    var actual: std.ArrayList(u8) = .empty;
+    defer actual.deinit(a);
+    for (0..2) |i| {
+        actual.clearRetainingCapacity();
+        try std.testing.expect(!try bound.append(a, &actual, i));
+        const cells = [_]rows.Cell{.{ .ordinal = 0, .path = "a", .value_type = .bytes_val, .sql_array_element_type = .int64, .is_null = i == 1, .value = .{ .bytes_val = empty } }};
+        var expected = try testTupleAlloc(a, plan, table, &cells);
+        defer expected.deinit(a);
+        try std.testing.expectEqualSlices(u8, expected.bytes, actual.items);
     }
 }
 
