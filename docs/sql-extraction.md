@@ -4570,3 +4570,25 @@ The complete 212-test server shard subsequently passed with maximum RSS of
 17,252,352 bytes (about 16.5 MiB), below the unchanged 384 MiB build estimate;
 its local debug runtime was approximately 123 seconds. All twelve shared
 runner selection/progress/diagnostic regressions pass as well.
+
+### Owner-masked conflict defaults
+
+`ON CONFLICT DO UPDATE SET column = DEFAULT` now retains an explicit default
+assignment through parsing and binding. The conflict operator omits that field
+from the selected replacement image; the shared native preparation pipeline
+evaluates its declared default (or implicit SQL NULL) and recomputes generated
+columns. It does not substitute NULL for a declared default, eagerly prepare
+unselected updates, or reuse the proposed INSERT value. Generated columns accept
+DEFAULT but not ordinary assignment. Existing old/excluded expressions retain
+simultaneous-assignment semantics.
+
+Dense bound target ordinals replace per-row assignment-name scans in both scalar
+and decision-batched conflict execution. Defaults remain behind owner selection
+and the DO UPDATE predicate in both paths. Component regressions cover new-row
+inserts, false predicates and their fences, generated columns, explicit NULL,
+default/provider failures before commit, and exhaustive allocation failures.
+A PostgreSQL 18 sequence-backed oracle independently checks evaluation timing,
+postimages and error atomicity. These component tests do not credit unrelated
+original corpus cases. The expanded mounted mutation campaign has reached the
+still-unsupported regexp substring/count case; broader regex and named-constraint
+arbiters remain follow-up work, and the corpus dispositions are unchanged.

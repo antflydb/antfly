@@ -1679,6 +1679,66 @@ class PostgresReferenceTest(unittest.TestCase):
             result["entries"][0]["final_tables"]["usage_records"]["rows"],
         )
 
+    def test_conflict_defaults_are_owner_and_predicate_masked_and_regenerate_columns(
+        self,
+    ):
+        import psycopg
+
+        cases = (
+            ("existing", "n=DEFAULT,g=DEFAULT", "", [(1, 2)], True),
+            ("existing", "g=DEFAULT", "", [(4, 8)], False),
+            ("new", "n=DEFAULT", "", [(7, 14)], False),
+            ("existing", "n=DEFAULT", " WHERE FALSE", [], False),
+            ("existing", "g=DEFAULT,n=items.n+excluded.n", "", [(11, 22)], False),
+        )
+        for key, assignment, predicate, expected, called in cases:
+            with self.subTest(assignment=assignment, key=key, predicate=predicate):
+                with self.db.transaction(force_rollback=True):
+                    self.db.execute("CREATE TEMP SEQUENCE conflict_default_sequence")
+                    self.db.execute(
+                        "CREATE TEMP TABLE items (_id text PRIMARY KEY, "
+                        "n bigint NOT NULL DEFAULT nextval('conflict_default_sequence'), "
+                        "g bigint GENERATED ALWAYS AS (n*2) STORED)"
+                    )
+                    self.db.execute("INSERT INTO items(_id,n) VALUES('existing',4)")
+                    result = self.db.execute(
+                        f"INSERT INTO items(_id,n) VALUES(%s,7) ON CONFLICT(_id) "
+                        f"DO UPDATE SET {assignment}{predicate} RETURNING n,g",
+                        (key,),
+                    ).fetchall()
+                    self.assertEqual(expected, result)
+                    self.assertEqual(
+                        called,
+                        self.db.execute(
+                            "SELECT is_called FROM conflict_default_sequence"
+                        ).fetchone()[0],
+                    )
+                    rows = self.db.execute(
+                        "SELECT n,g FROM items ORDER BY _id"
+                    ).fetchall()
+                    self.assertEqual(
+                        [(4, 8), (7, 14)] if key == "new" else expected or [(4, 8)],
+                        rows,
+                    )
+        for assignment, state in (("n=NULL", "23502"), ("g=7", "428C9")):
+            with self.subTest(assignment=assignment):
+                with self.db.transaction(force_rollback=True):
+                    self.db.execute(
+                        "CREATE TEMP TABLE items (_id text PRIMARY KEY, n bigint NOT NULL, "
+                        "g bigint GENERATED ALWAYS AS (n*2) STORED)"
+                    )
+                    self.db.execute("INSERT INTO items(_id,n) VALUES('existing',4)")
+                    with self.assertRaises(psycopg.Error) as caught:
+                        with self.db.transaction():
+                            self.db.execute(
+                                "INSERT INTO items(_id,n) VALUES('existing',7) "
+                                f"ON CONFLICT(_id) DO UPDATE SET {assignment}"
+                            )
+                    self.assertEqual(state, caught.exception.sqlstate)
+                    self.assertEqual(
+                        [(4, 8)], self.db.execute("SELECT n,g FROM items").fetchall()
+                    )
+
     def test_original_mutation_profiles_enforce_logical_primary_keys(self):
         import json
 

@@ -1409,6 +1409,11 @@ const Parser = struct {
             const column_name = try self.identifier();
             for (assignments.items) |prior| if (std.mem.eql(u8, prior.field, column_name)) return self.fail(error.DuplicateSqlColumn, "duplicate conflict assignment");
             try self.expect(.eq);
+            if (self.keyword(.default)) {
+                try assignments.append(self.alloc, .{ .field = column_name, .use_default = true });
+                if (!self.take(.comma)) break;
+                continue;
+            }
             const expression = try self.scalar(0, 0);
             try self.checkScalarDepth(expression, 0);
             try assignments.append(self.alloc, .{ .field = column_name, .expression = expression });

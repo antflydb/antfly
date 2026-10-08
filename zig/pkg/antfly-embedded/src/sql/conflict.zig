@@ -26,6 +26,8 @@ pub const Bound = struct {
     columns: []const scalar.Column,
     row_width: usize,
     assignments: []const ?scalar.Program,
+    // Dense target ordinals eliminate assignment-name scans for every row.
+    column_assignments: []const ?usize,
     deferred: []const ?Deferred = &.{},
     predicate: ?scalar.Program,
     arbiter_conditions: []const catalog.Condition = &.{},
@@ -74,12 +76,24 @@ pub fn bind(alloc: std.mem.Allocator, backend: catalog.Backend, table: catalog.T
         column.* = .{ .name = try std.fmt.allocPrint(alloc, "$conflict_capture_{d}", .{ordinal}), .type = descriptor.kind orelse return error.InvalidSqlBackendResponse, .element_type = descriptor.element_type, .nullable = true };
     }
     var pass: usize = 0;
+    const column_assignments = try alloc.alloc(?usize, table.columns.len);
+    @memset(column_assignments, null);
+    for (clause.assignments, 0..) |assignment, assignment_index| {
+        const target = try table.column(assignment.field);
+        if (target.generated and !assignment.use_default) return error.SqlGeneratedColumnWrite;
+        if (std.mem.eql(u8, target.name, "_id")) return error.UnsupportedSqlShape;
+        const ordinal = for (table.columns, 0..) |column, index| {
+            if (std.mem.eql(u8, column.name, target.name)) break index;
+        } else return error.InvalidSqlBackendResponse;
+        if (column_assignments[ordinal] != null) return error.DuplicateSqlColumn;
+        column_assignments[ordinal] = assignment_index;
+    }
     while (true) : (pass += 1) {
         if (pass > parameters.len + 1) return error.ConflictingSqlParameterTypes;
         var changed = false;
         for (clause.assignments) |assignment| {
             const column = try table.column(assignment.field);
-            if (column.generated or std.mem.eql(u8, column.name, "_id")) return error.UnsupportedSqlShape;
+            if (assignment.use_default) continue;
             const expression = assignment.expression orelse return error.InvalidSqlBackendResponse;
             if (assignment.deferred_scalar) continue;
             if (assignment.capture_ordinal) |ordinal| {
@@ -102,6 +116,10 @@ pub fn bind(alloc: std.mem.Allocator, backend: catalog.Backend, table: catalog.T
     const deferred = try alloc.alloc(?Bound.Deferred, clause.assignments.len);
     for (clause.assignments, assignments, deferred) |assignment, *program, *later| {
         later.* = null;
+        if (assignment.use_default) {
+            program.* = null;
+            continue;
+        }
         if (assignment.deferred_scalar) {
             program.* = null;
             const expression = assignment.expression orelse return error.InvalidSqlBackendResponse;
@@ -130,7 +148,7 @@ pub fn bind(alloc: std.mem.Allocator, backend: catalog.Backend, table: catalog.T
                 try scalar.bindExpectedWithSettings(alloc, root, columns, parameters, column.type, .{ .assignment = true }, backend.settings_view);
         }
     }
-    return .{ .columns = columns, .row_width = count, .assignments = assignments, .deferred = deferred, .predicate = if (clause.predicate) |expression| try scalar.bindExpectedWithSettings(alloc, expression, columns, parameters, .boolean, .{ .invocation = backend.parameter_invocation }, backend.settings_view) else null, .arbiter_conditions = arbiter_conditions, .arbiter_expressions = arbiter_expressions };
+    return .{ .columns = columns, .row_width = count, .assignments = assignments, .column_assignments = column_assignments, .deferred = deferred, .predicate = if (clause.predicate) |expression| try scalar.bindExpectedWithSettings(alloc, expression, columns, parameters, .boolean, .{ .invocation = backend.parameter_invocation }, backend.settings_view) else null, .arbiter_conditions = arbiter_conditions, .arbiter_expressions = arbiter_expressions };
 }
 
 fn bindArbiterPredicate(alloc: std.mem.Allocator, table: catalog.Table, expression: *const ast.Scalar) ![]const catalog.Condition {
@@ -224,6 +242,7 @@ pub fn resolve(context: anytype, table: catalog.Table, clause: ast.Conflict, bin
 }
 
 fn resolvePrepared(context: anytype, table: catalog.Table, clause: ast.Conflict, binding: Bound, proposed: []const catalog.Mutation, normalized: []const catalog.Mutation, owners: ?[]const catalog.ConflictOwner, captured: []const []const scalar.Datum) ![]const catalog.Mutation {
+    if (binding.column_assignments.len != table.columns.len) return error.InvalidSqlBackendResponse;
     if (binding.deferred.len != 0 and binding.deferred.len != clause.assignments.len) return error.InvalidSqlBackendResponse;
     const buffer = try context.arena.alloc(catalog.Mutation, normalized.len);
     const captured_buffer = try context.arena.alloc([]const scalar.Datum, normalized.len);
@@ -257,9 +276,7 @@ fn resolvePrepared(context: anytype, table: catalog.Table, clause: ast.Conflict,
     if (clause.assignments.len != 0) for (table.columns, 0..) |column, ordinal| {
         // Preserve ordinary columns for replacement; generated columns are
         // recomputed natively and fetched only if old-row expressions need one.
-        const replaced = for (clause.assignments) |assignment| {
-            if (std.mem.eql(u8, assignment.field, column.name)) break true;
-        } else false;
+        const replaced = binding.column_assignments[ordinal] != null;
         var needed = !column.generated and !replaced;
         const width = binding.row_width;
         for (binding.assignments) |program| if (program) |bound_program| for (bound_program.required_columns) |required| {
@@ -382,7 +399,12 @@ fn resolvePrepared(context: anytype, table: catalog.Table, clause: ast.Conflict,
             if (column.generated) continue;
             var datum = cells[column_index];
             var assigned = false;
-            for (clause.assignments, binding.assignments, 0..) |assignment, program, assignment_index| if (std.mem.eql(u8, assignment.field, column.name)) {
+            if (binding.column_assignments[column_index]) |assignment_index| {
+                const assignment = clause.assignments[assignment_index];
+                // Omission, not NULL: native preparation owns DEFAULT and
+                // generated values, only after this owner passed WHERE.
+                if (assignment.use_default) continue;
+                const program = binding.assignments[assignment_index];
                 datum = if (assignment.capture_ordinal != null and assignment.capture_expression == null) blk: {
                     const ordinal = assignment.capture_ordinal.?;
                     if (ordinal >= captured_row.len) return error.InvalidSqlBackendResponse;
@@ -393,8 +415,7 @@ fn resolvePrepared(context: anytype, table: catalog.Table, clause: ast.Conflict,
                     break :blk deferred_cache[assignment_index].?;
                 } else try @import("decision_eval.zig").evaluate(page_alloc, context.backend.decision_provider, &(program orelse return error.InvalidSqlBackendResponse), cells, context.parameters);
                 assigned = true;
-                break;
-            };
+            }
             if (!assigned and !try previous.hasField(column.name)) continue;
             if (column.type == .json and datum.value == .null and !datum.sql_null) try nulls.append(context.arena, column.name);
             try row.put(context.arena, column.name, try context.storageDatum(datum, column));
@@ -454,7 +475,9 @@ fn applyDecisionConflicts(context: anytype, scratch: std.mem.Allocator, table: c
     if (selected.items.len == 0) return;
     const assignment_values = try scratch.alloc([]const scalar.Datum, clause.assignments.len);
     for (clause.assignments, binding.assignments, assignment_values, 0..) |assignment, optional, *output, index| {
-        if (assignment.capture_ordinal != null and assignment.capture_expression == null) {
+        if (assignment.use_default) {
+            output.* = &.{};
+        } else if (assignment.capture_ordinal != null and assignment.capture_expression == null) {
             const ordinal = binding.row_width * 3 + assignment.capture_ordinal.?;
             const values = try scratch.alloc(scalar.Datum, cells.items.len);
             for (cells.items, values) |row, *value| {
@@ -481,11 +504,11 @@ fn applyDecisionConflicts(context: anytype, scratch: std.mem.Allocator, table: c
             if (column.generated) continue;
             var datum = candidate.cells[column_index];
             var assigned = false;
-            for (clause.assignments, 0..) |assignment, index| if (std.mem.eql(u8, assignment.field, column.name)) {
+            if (binding.column_assignments[column_index]) |index| {
+                if (clause.assignments[index].use_default) continue;
                 datum = assignment_values[index][row_index];
                 assigned = true;
-                break;
-            };
+            }
             if (!assigned and !candidate.presence[column_index]) continue;
             if (column.type == .json and datum.value == .null and !datum.sql_null) try nulls.append(context.arena, column.name);
             try row.put(context.arena, column.name, try context.storageDatum(datum, column));
@@ -542,7 +565,7 @@ fn conflictArrayOwnershipScenario(backing: std.mem.Allocator) !void {
     var program = try scalar.bindExpected(backing, &expression, &.{}, &.{}, .integer, .{});
     defer program.deinit();
     const clause: ast.Conflict = .{ .columns = &.{"_id"}, .assignments = &.{.{ .field = "n", .expression = &expression }} };
-    const binding: Bound = .{ .columns = &.{}, .row_width = width, .assignments = &.{program}, .predicate = null };
+    const binding: Bound = .{ .columns = &.{}, .row_width = width, .assignments = &.{program}, .column_assignments = &.{ null, null, 0, null }, .predicate = null };
     var token: u8 = 0;
     const context: @import("runtime.zig").Context = .{
         .alloc = backing,
