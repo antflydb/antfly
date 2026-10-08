@@ -1287,3 +1287,16 @@ All 167 VOPR tests pass on native macOS and pinned Nix/glibc Linux;
 retain original failures, the unsuccessful first wrapper, final assembly and
 source hashes. The new production transaction binary and consolidated API gates
 still need to run; these simulator results do not enable defaults.
+
+### Pre-decision clock ceilings (2026-10-08, callback contracts passed)
+
+PreDecisionContext can clamp a shared deadline into an attempt's clock domain
+without extending the original budget, while retaining cancellation, route
+fences and restore identity. All five callback-contract tests pass on native
+macOS and pinned Nix/glibc Linux;
+[receipts](qualification/workload-pooling/receipts/2026-10-08/predecision-clock-budget/README.md)
+retain commands, source and initial failed expectations. The working-tree hosted
+worker now captures a deadline before routing and shares it across participants,
+BEGIN, PREPARE and retries; its actual worker regression and full production
+gates still need to run. SQL ingress and physical durability deadline coverage
+remain pending, so these focused results do not enable defaults.

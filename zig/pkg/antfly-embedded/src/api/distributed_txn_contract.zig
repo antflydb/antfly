@@ -47,6 +47,18 @@ pub const PreDecisionContext = struct {
     deadline_io: ?@import("antfly_runtime_abi").io_abi.Borrow = null,
     cancellation: db_types.CancellationToken = .none,
 
+    /// Clamp an existing budget into the destination clock domain. Sampling
+    /// that clock first prevents translation from extending the caller's
+    /// remaining time. Preserve all identity and cancellation fences.
+    pub fn boundDeadline(self: PreDecisionContext, ceiling_ns: u64, clock_io: ?@import("antfly_runtime_abi").io_abi.Borrow) PreDecisionContext {
+        const routing = @import("routing_budget.zig");
+        const target: routing.RoutingBudget = .{ .io = clock_io };
+        var result = self;
+        result.deadline_ns = @min(ceiling_ns, target.deadlineFrom(.{ .deadline_ns = self.deadline_ns, .io = self.deadline_io }) orelse ceiling_ns);
+        result.deadline_io = clock_io;
+        return result;
+    }
+
     /// A legacy callback cannot carry these admission fences or hidden-owner
     /// identity. Even an inactive/incomplete supplied token must not be silently
     /// discarded: its caller requires this context-aware operation contract.

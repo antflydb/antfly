@@ -1603,6 +1603,58 @@ fn consumerTests() type {
     const test_owner_root = @import("antfly_source_root");
     if (@hasDecl(test_owner_root, "implementation_tests_only") and test_owner_root.implementation_tests_only) return struct {};
     const Suite = struct {
+        test "compiled table write boundary deadline clamps preserve clock epochs and caller fences" {
+            const Clock = struct {
+                current: i96,
+                advance_other: ?*@This() = null,
+                fn now(raw: ?*anyopaque, _: std.Io.Clock) std.Io.Timestamp {
+                    const self: *@This() = @ptrCast(@alignCast(raw.?));
+                    if (self.advance_other) |other| other.current += 25;
+                    return .{ .nanoseconds = self.current };
+                }
+                const vtable = blk: {
+                    var value = std.Io.failing.vtable.*;
+                    value.now = now;
+                    break :blk value;
+                };
+                fn borrow(self: *@This()) @import("antfly_runtime_abi").io_abi.Borrow {
+                    const io: std.Io = .{ .userdata = self, .vtable = &vtable };
+                    return @import("antfly_runtime_abi").io_abi.Borrow.init(&io);
+                }
+            };
+            var target: Clock = .{ .current = 10_000 };
+            var origin: Clock = .{ .current = 100, .advance_other = &target };
+            var canceled = std.atomic.Value(bool).init(false);
+            const original: distributed_txn.PreDecisionContext = .{
+                .route_fence = .{ .metadata_group_id = 1, .metadata_incarnation = @splat(1), .catalog_revision = 2, .table_id = 7, .topology_epoch = 3, .route = .{ .group_id = 9, .range_id = 10, .identity_namespace = .{ .table_id = 7, .shard_id = 9, .range_id = 10 } } },
+                .deadline_ns = 180,
+                .deadline_io = origin.borrow(),
+                .cancellation = db_mod.types.CancellationToken.fromAtomic(&canceled),
+                .restore_staging_scope = @splat(3),
+                .restore_staging_plan_id = @splat(4),
+            };
+            const translated = original.boundDeadline(20_000, target.borrow());
+            // A source-clock read consumes 25 destination nanoseconds. That
+            // latency cannot be added to the remaining 80-nanosecond budget.
+            try std.testing.expectEqual(@as(?u64, 10_080), translated.deadline_ns);
+            try std.testing.expectEqual(@as(i96, 55), @as(i96, @intCast(translated.deadline_ns.?)) - target.current);
+            try std.testing.expectEqualDeep(original.route_fence, translated.route_fence);
+            try std.testing.expectEqualDeep(original.cancellation, translated.cancellation);
+            try std.testing.expectEqualDeep(original.restore_staging_scope, translated.restore_staging_scope);
+            try std.testing.expectEqualDeep(original.restore_staging_plan_id, translated.restore_staging_plan_id);
+            try std.testing.expect(translated.deadline_io.?.userdata == target.borrow().userdata);
+            const attempt = translated.boundDeadline(10_050, target.borrow());
+            const next = attempt.boundDeadline(30_000, target.borrow());
+            try std.testing.expectEqual(attempt.deadline_ns, next.deadline_ns);
+            canceled.store(true, .seq_cst);
+            try std.testing.expectError(error.Canceled, next.cancellation.check());
+            origin.current = 200;
+            const expired = original.boundDeadline(20_000, target.borrow());
+            try std.testing.expect(expired.deadline_ns.? <= @as(u64, @intCast(target.current)));
+            const empty: distributed_txn.PreDecisionContext = .{};
+            try std.testing.expectEqual(@as(?u64, 42), empty.boundDeadline(42, null).deadline_ns);
+        }
+
         test "compiled table write boundary never discards pre-decision fences in legacy fallback" {
             const Fake = struct {
                 legacy_calls: usize = 0,
