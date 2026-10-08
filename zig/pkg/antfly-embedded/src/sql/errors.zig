@@ -137,6 +137,7 @@ pub fn describe(err: anyerror) Diagnostic {
         error.SqlGeneratedColumnWrite => .{ .code = "428C9", .message = "A generated column cannot be assigned directly.", .hint = "Omit the generated column and let the server compute its value." },
         error.InvalidSqlNumber, error.RelationalExpressionOverflow => .{ .code = "22003", .message = "A numeric value is outside the supported range.", .hint = "Use a value representable by the target column type." },
         error.RelationalExpressionDivisionByZero => .{ .code = "22012", .message = "An expression attempted division by zero.", .hint = "Check divisors in the mutation and computed expressions." },
+        error.SqlFeatureNotSupported => .{ .code = "0A000", .message = "The requested value conversion is not supported.", .hint = "Check nonfinite numeric values and the target type.", .retryable = false },
         error.DuplicateSqlRow, error.UniqueConstraintViolation => .{ .code = "23505", .message = "The mutation violates a unique constraint.", .hint = "Use distinct row identities and unique column values.", .retryable = false },
         error.ForeignKeyViolation, error.ForeignKeyParentMissing, error.ForeignKeyReferenced, error.ForeignKeyMatchFullViolation => .{ .code = "23503", .message = "The mutation violates a foreign key constraint.", .hint = "Ensure referenced rows exist and dependent rows satisfy the configured foreign key action.", .retryable = false },
         error.SqlNotNullViolation => .{ .code = "23502", .message = "A required column cannot be null.", .hint = "Provide a non-null value for every required column.", .retryable = false },
@@ -193,6 +194,7 @@ test "SQL diagnostics retain definite constraints conflicts and unknown outcomes
         .{ .err = error.SqlMutationOutcomeUnknown, .code = "40003", .retryable = false },
         .{ .err = error.QueryCanceled, .code = "57014", .retryable = null },
         .{ .err = error.RowPolicyUnsupported, .code = "0A000", .retryable = false },
+        .{ .err = error.SqlFeatureNotSupported, .code = "0A000", .retryable = false },
         .{ .err = error.SqlWrongAggregateKind, .code = "42809", .retryable = false },
         .{ .err = error.UndefinedSqlFunction, .code = "42883", .retryable = false },
     }) |case| {

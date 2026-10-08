@@ -275,6 +275,9 @@ pub const TableSchema = struct {
     requires_typed_expressions: bool = false,
     /// Membership/remainder programs require reader capability 19.
     requires_predicate_expressions: bool = false,
+    /// Exact NUMERIC programs may produce nonnumeric results. Readers must
+    /// still support their logical value domain even without NUMERIC columns.
+    requires_exact_numeric_expressions: bool = false,
     exact_fields: []const ExactField = &.{},
     dynamic_templates: []const DynamicTemplate = &.{},
     declared_fields: []const DeclaredField = &.{},
@@ -297,7 +300,7 @@ const schema_version_prefix = "\x00\x00__metadata__:schema_v";
 /// Current durable runtime-schema format. Catalog compatibility checks use the
 /// same exported constant so a writer can never silently drift from the format
 /// it advertises in transactional table metadata.
-pub const storage_format_version: u32 = 20;
+pub const storage_format_version: u32 = 21;
 
 /// Serialize a TableSchema to bytes. Caller owns the returned slice.
 pub fn serializeSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
@@ -389,6 +392,7 @@ fn serializeSchemaFormat(alloc: Allocator, schema: TableSchema, format_version: 
     };
     if (format_version < 18 and schema.requires_typed_expressions) return error.UnsupportedVersion;
     if (format_version < 19 and schema.requires_predicate_expressions) return error.UnsupportedVersion;
+    if (format_version < 21 and schema.requires_exact_numeric_expressions) return error.UnsupportedVersion;
     if (format_version < 20) for (schema.relational_columns) |column| {
         if (column.column_type == .numeric or column.sql_element_type == .numeric) return error.UnsupportedVersion;
     };
@@ -525,6 +529,7 @@ fn serializeSchemaFormat(alloc: Allocator, schema: TableSchema, format_version: 
 
     if (format_version >= 18) try buf.append(alloc, @intFromBool(schema.requires_typed_expressions));
     if (format_version >= 19) try buf.append(alloc, @intFromBool(schema.requires_predicate_expressions));
+    if (format_version >= 21) try buf.append(alloc, @intFromBool(schema.requires_exact_numeric_expressions));
     return buf.toOwnedSlice(alloc);
 }
 
@@ -1068,6 +1073,7 @@ fn deserializeSchemaOwned(alloc: Allocator, data: []const u8) !TableSchema {
         .requires_public_schema = requires_public_schema,
         .requires_typed_expressions = if (fmt_version >= 18) data[pos] == 1 else false,
         .requires_predicate_expressions = if (fmt_version >= 19) data[pos + 1] == 1 else false,
+        .requires_exact_numeric_expressions = if (fmt_version >= 21) data[pos + 2] == 1 else false,
         .exact_fields = exact_fields,
         .dynamic_templates = templates,
         .declared_fields = declared_fields,
@@ -1301,6 +1307,7 @@ fn validateSerializedSchema(data: []const u8) !void {
     }
     if (format_version >= 18) try cursor.readBool();
     if (format_version >= 19) try cursor.readBool();
+    if (format_version >= 21) try cursor.readBool();
     try cursor.finish();
 }
 
@@ -1311,6 +1318,7 @@ fn validateRelationalSchema(alloc: Allocator, schema: TableSchema) !void {
     };
     if (schema.requires_typed_expressions and (schema.storage_mode != .relational or !schema.requires_public_schema)) return error.InvalidSchema;
     if (schema.requires_predicate_expressions and (schema.storage_mode != .relational or !schema.requires_public_schema)) return error.InvalidSchema;
+    if (schema.requires_exact_numeric_expressions and (schema.storage_mode != .relational or !schema.requires_public_schema)) return error.InvalidSchema;
     for (schema.relational_columns) |column| if (column.column_type == .sql_array) {
         if (schema.storage_mode != .relational or column.sql_element_type == null or column.is_json or column.json_kind != .none)
             return error.InvalidSchema;
@@ -2920,6 +2928,23 @@ test "relational index system SQL typed expression capability survives strict sc
     defer alloc.free(malformed);
     malformed[malformed.len - 1] = 2;
     try std.testing.expectError(error.InvalidSchema, deserializeSchema(alloc, malformed));
+}
+
+test "relational index system exact NUMERIC programs fence readers without NUMERIC columns" {
+    const a = std.testing.allocator;
+    const current: TableSchema = .{ .storage_mode = .relational, .requires_public_schema = true, .requires_exact_numeric_expressions = true, .relational_columns = &.{.{ .name = "n", .path = "n", .column_type = .integer }} };
+    try std.testing.expectError(error.UnsupportedVersion, serializeSchemaFormat(a, current, 20));
+    const bytes = try serializeSchema(a, current);
+    defer a.free(bytes);
+    const decoded = try deserializeSchema(a, bytes);
+    defer freeSchema(a, decoded);
+    try std.testing.expect(decoded.requires_exact_numeric_expressions);
+    try std.testing.expect(try schemasEqual(a, current, decoded));
+    try std.testing.expectError(error.InvalidFormat, deserializeSchema(a, bytes[0 .. bytes.len - 1]));
+    const malformed = try a.dupe(u8, bytes);
+    defer a.free(malformed);
+    malformed[malformed.len - 1] = 2;
+    try std.testing.expectError(error.InvalidSchema, deserializeSchema(a, malformed));
 }
 
 test "relational index system SQL predicate expression capability rejects older encodings" {

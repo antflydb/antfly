@@ -722,6 +722,7 @@ pub const Detail = enum(c_int) {
     unsupported_iceberg_schema_evolution,
     unsupported_iceberg_delete_file,
     invalid_sql_spill,
+    sql_feature_not_supported,
 };
 
 pub const Status = extern struct {
@@ -847,6 +848,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.RelationalRewriteBudgetExceeded => status(.invalid_argument, .relational_rewrite_budget_exceeded),
         error.RelationalExpressionOverflow => status(.invalid_argument, .relational_expression_overflow),
         error.RelationalExpressionDivisionByZero => status(.invalid_argument, .relational_expression_division_by_zero),
+        error.SqlFeatureNotSupported => status(.unsupported, .sql_feature_not_supported),
         error.RelationalExpressionBudgetExceeded => status(.invalid_argument, .relational_expression_budget_exceeded),
         error.RelationalIndexKeyTooLarge => status(.invalid_argument, .relational_index_key_too_large),
         error.InvalidRelationalExpressionInput => status(.invalid_argument, .invalid_relational_expression_input),
@@ -1540,6 +1542,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .relational_rewrite_budget_exceeded => "RelationalRewriteBudgetExceeded",
         .relational_expression_overflow => "RelationalExpressionOverflow",
         .relational_expression_division_by_zero => "RelationalExpressionDivisionByZero",
+        .sql_feature_not_supported => "SqlFeatureNotSupported",
         .relational_expression_budget_exceeded => "RelationalExpressionBudgetExceeded",
         .relational_index_key_too_large => "RelationalIndexKeyTooLarge",
         .invalid_relational_expression_input => "InvalidRelationalExpressionInput",

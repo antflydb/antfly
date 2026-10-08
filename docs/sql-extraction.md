@@ -5375,3 +5375,60 @@ generated control-catalog consistency and original inventory integrity checks
 pass. The inventory remains 448 implemented, 136 rejected, 73 superseded and
 929 unresolved; these internal boundaries do not independently credit public
 NUMERIC schema/DDL cases.
+
+### Exact NUMERIC schema execution and reader capability
+
+The immutable schema VM now retains canonical NUMERIC bytes through literals,
+column reads, arithmetic, comparisons, membership, lazy conditionals, casts and
+generated/default bindings. Exact operations use the existing coefficient
+kernel, not f64 or JSON-number conversion. Comparisons borrow binary limbs;
+identity casts borrow their input, and negation copies only the canonical
+binary payload while retaining display scale. Generated-value restore checks
+compare logical NUMERIC values without filling missing outputs or repairing
+forged values.
+
+An execution context carries sticky work/cancellation admission across plans.
+Numeric temporary arenas are capacity-bounded and charged monotonically along
+with retained outputs, including when the caller itself uses an arena. CHECK
+expression sets share this context rather than resetting numeric work at each
+constraint. Deterministic kernel failures map to the established durable
+validation errors, preserving activation diagnostics and transport SQLSTATEs;
+cancellation and allocator failures remain distinguishable. PostgreSQL's
+nonfinite-to-integer rejection retains SQLSTATE 0A000 through append-only
+runtime/storage ABI identities, definite replicated-apply outcomes, C API
+unsupported status and remote SQL mutation diagnostics.
+
+Schema format/capability 21 records exact-NUMERIC expression requirements even
+when all stored columns and expression outputs are integral or boolean. Public
+raw generated/default declarations derive this requirement recursively; the
+transactional catalog rejects an older reader capability. Strict framing
+validates the added flag and truncated/corrupted records.
+
+The native oracle gate covers 537 PostgreSQL cases: 430 arithmetic/remainder,
+72 checked integer casts and 35 ordering cases (also run without an available
+allocator). Allocation-fault fixtures cover preparation, scratch ownership,
+default/generated dependency ordering, explicit NULL, logically equivalent
+display scales and forged/missing restore values. A schema-validator generated
+column fixture verifies exact rounding above 2^53 and durable capability
+publication.
+
+Public scalar NUMERIC schema annotations and generated expression enums, SQL
+lowering/DDL activation, typmods and complete nonfinite native float casts
+remain unfinished. The new schema
+context does not yet unify defaults, generated expressions and every CHECK
+form under one complete request-level quota. No original inventory case is
+credited solely for this native execution infrastructure.
+
+Validation: the combined SQL/schema-expression/archive-ABI gate exits zero,
+with 586 local SQL tests (three existing skips), 226 server SQL tests, 24
+schema-expression tests and seven archive-boundary tests, without failures or
+leaks. The native relational gate passes 174 local and one server-owner test;
+the focused C API status regression passes. PostgreSQL independently rechecks
+all 893 kernel reference contracts. Inventory integrity, formatting,
+whitespace and dependency-catalog consistency pass, with 929 cases unresolved.
+
+The broad durable-runtime target also exposes a 14.46 GB compiler peak against
+its 13.96 GB reservation and duplicate ownership of a guarded graph replay
+raft-batch test. Its compile-time-filtered replicated-apply regression passes
+with the new semantic error included in the expected-failure roundtrip audit;
+this does not establish that the broad runtime target is green.

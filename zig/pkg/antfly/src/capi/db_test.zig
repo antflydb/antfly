@@ -3992,7 +3992,8 @@ test "capi relational expression errors preserve public status semantics" {
     const expression_errors = antfly.capi_dependencies.relational_expression_errors;
     inline for (@typeInfo(expression_errors.Error).error_set.error_names.?) |field| {
         const err = @field(expression_errors.Error, field);
-        try std.testing.expectEqual(if (expression_errors.isInvalidInput(err)) capi.ErrorCode.invalid_argument else capi.ErrorCode.intent_conflict, capi.mapError(err));
+        const expected: capi.ErrorCode = if (err == error.SqlFeatureNotSupported) .unsupported else if (expression_errors.isInvalidInput(err)) .invalid_argument else .intent_conflict;
+        try std.testing.expectEqual(expected, capi.mapError(err));
     }
 }
 

@@ -24,10 +24,109 @@ pub const Kind = schema.RelationalColumnType;
 const Allocator = std.mem.Allocator;
 const Numeric = @import("../common/sql_builtin_type.zig").Type;
 const casts = @import("../sql/builtin_cast.zig");
+const exact = @import("../sql/numeric_value.zig");
+const binary = @import("../sql/numeric_binary.zig");
 pub const max_nodes = 128;
 pub const max_depth = 16;
 pub const max_output_bytes = 1024 * 1024;
 pub const max_allocated_bytes = 4 * max_output_bytes;
+
+/// One invocation can span several immutable plans. Work/cancellation remain
+/// sticky across nodes and bindings, independently of retained-byte admission.
+pub const Execution = struct {
+    alloc: Allocator,
+    bytes: *usize,
+    numeric: exact.Context,
+
+    pub fn init(alloc: Allocator, bytes: *usize) Execution {
+        return .{ .alloc = alloc, .bytes = bytes, .numeric = .{ .alloc = alloc } };
+    }
+};
+
+// Preserve the durable validation/transport contract. Numeric kernel errors
+// must not turn deterministic bad rows into retryable activation failures.
+fn executionFailure(err: anyerror) anyerror {
+    return switch (err) {
+        error.SqlDivisionByZero => error.RelationalExpressionDivisionByZero,
+        error.InvalidSqlNumber, error.SqlNumericOutOfRange => error.RelationalExpressionOverflow,
+        error.SqlInvalidTextRepresentation => error.InvalidRelationalExpressionInput,
+        error.SqlProgramLimitExceeded => error.RelationalExpressionBudgetExceeded,
+        else => err,
+    };
+}
+
+/// Numeric scratch is an unpublished bounded region. Charge arena capacity,
+/// not only result bytes: a caller arena may not reclaim out-of-order frees.
+const NumericScratch = struct {
+    execution: *Execution,
+    memory: @import("../sql/memory_budget.zig"),
+    arena: std.heap.ArenaAllocator = undefined,
+    saved_alloc: Allocator,
+    saved_output: usize,
+    saved_groups: usize,
+
+    fn init(self: *NumericScratch, execution: *Execution) void {
+        self.* = .{
+            .execution = execution,
+            .memory = .{ .backing = execution.alloc, .limit = execution.bytes.* },
+            .saved_alloc = execution.numeric.alloc,
+            .saved_output = execution.numeric.max_output_bytes,
+            .saved_groups = execution.numeric.max_groups,
+        };
+        self.arena = .init(self.memory.allocator());
+        execution.numeric.alloc = self.arena.allocator();
+        execution.numeric.max_output_bytes = @min(self.saved_output, @min(max_output_bytes, execution.bytes.*));
+        execution.numeric.max_groups = @min(self.saved_groups, execution.bytes.* / 2);
+    }
+
+    fn deinit(self: *NumericScratch) void {
+        self.arena.deinit();
+        self.execution.bytes.* -|= self.memory.peak;
+        self.execution.numeric.alloc = self.saved_alloc;
+        self.execution.numeric.max_output_bytes = self.saved_output;
+        self.execution.numeric.max_groups = self.saved_groups;
+    }
+
+    fn encode(self: *NumericScratch, value: exact.Value) !Value {
+        const ctx = &self.execution.numeric;
+        const size = try binary.encodedSize(ctx, value);
+        if (size > self.execution.bytes.* -| self.memory.peak) return error.RelationalExpressionBudgetExceeded;
+        const output = try allocateOutput(self.execution.alloc, size, self.execution.bytes);
+        errdefer self.execution.alloc.free(output);
+        var writer: std.Io.Writer = .fixed(output);
+        try binary.encode(ctx, value, &writer);
+        return .{ .numeric = output };
+    }
+
+    fn json(self: *NumericScratch, value: exact.Value) !std.json.Value {
+        const text = try exact.format(&self.execution.numeric, value);
+        if (text.len > self.execution.bytes.* -| self.memory.peak) return error.RelationalExpressionBudgetExceeded;
+        const output = try allocateOutput(self.execution.alloc, text.len, self.execution.bytes);
+        @memcpy(output, text);
+        return if (value.kind == .finite) .{ .number_string = output } else .{ .string = output };
+    }
+
+    fn failure(self: *NumericScratch, err: anyerror) anyerror {
+        return if (err == error.OutOfMemory and self.memory.isExhausted()) error.RelationalExpressionBudgetExceeded else executionFailure(err);
+    }
+};
+
+fn numericJson(execution: *Execution, input: std.json.Value) !Value {
+    if (input == .null) return .null;
+    var scratch: NumericScratch = undefined;
+    scratch.init(execution);
+    defer scratch.deinit();
+    const parsed = @import("../sql/numeric_storage.zig").fromJson(&execution.numeric, input) catch |err| return scratch.failure(err);
+    return scratch.encode(parsed.value) catch |err| return scratch.failure(err);
+}
+
+fn numericJsonOutput(execution: *Execution, bytes: []const u8) !std.json.Value {
+    var scratch: NumericScratch = undefined;
+    scratch.init(execution);
+    defer scratch.deinit();
+    const parsed = binary.decodeCanonical(&execution.numeric, bytes) catch |err| return scratch.failure(err);
+    return scratch.json(parsed.value) catch |err| return scratch.failure(err);
+}
 
 const Op = enum { literal, column, add, subtract, multiply, divide, modulo, negate, concat, coalesce, lower_ascii, upper_ascii, eq, ne, gt, gte, lt, lte, is_null, is_not_null, is_distinct, is_not_distinct, @"and", @"or", not, cast, case_when, in_list, not_in_list };
 const Node = struct {
@@ -52,7 +151,9 @@ pub const Plan = struct {
     pub fn init(alloc: Allocator, table: schema.TableSchema, expression: std.json.Value, expected: Kind) !Plan {
         var arena = std.heap.ArenaAllocator.init(alloc);
         errdefer arena.deinit();
-        var compiler: Compiler = .{ .alloc = arena.allocator(), .table = table };
+        var bytes: usize = max_allocated_bytes;
+        var execution = Execution.init(arena.allocator(), &bytes);
+        var compiler: Compiler = .{ .alloc = arena.allocator(), .table = table, .execution = &execution };
         compiler.hash.update("antfly immutable scalar expression v1");
         const root = try compiler.compile(expression, 0);
         if (compiler.nodes.items[root].kind != expected) return error.InvalidRelationalExpressionType;
@@ -74,7 +175,12 @@ pub const Plan = struct {
     }
 
     pub fn evaluateWithBudget(self: *const Plan, alloc: Allocator, values: []const Value, budget: *usize) !Value {
-        return self.evaluateNode(alloc, .{ .values = values }, @intCast(self.nodes.len - 1), budget);
+        var execution = Execution.init(alloc, budget);
+        return self.evaluateWithExecution(&execution, values);
+    }
+
+    pub fn evaluateWithExecution(self: *const Plan, execution: *Execution, values: []const Value) !Value {
+        return self.evaluateNode(execution, .{ .values = values }, @intCast(self.nodes.len - 1)) catch |err| return executionFailure(err);
     }
 
     pub fn evaluateJson(self: *const Plan, alloc: Allocator, document: std.json.Value) !Value {
@@ -83,8 +189,13 @@ pub const Plan = struct {
     }
 
     pub fn evaluateJsonWithBudget(self: *const Plan, alloc: Allocator, document: std.json.Value, budget: *usize) !Value {
+        var execution = Execution.init(alloc, budget);
+        return self.evaluateJsonWithExecution(&execution, document);
+    }
+
+    pub fn evaluateJsonWithExecution(self: *const Plan, execution: *Execution, document: std.json.Value) !Value {
         if (document != .object) return error.InvalidRelationalExpressionInput;
-        return self.evaluateNode(alloc, .{ .json = document }, @intCast(self.nodes.len - 1), budget);
+        return self.evaluateNode(execution, .{ .json = document }, @intCast(self.nodes.len - 1)) catch |err| return executionFailure(err);
     }
 
     pub fn evaluateRow(self: *const Plan, alloc: Allocator, row: codec.OrdinalRowView) !Value {
@@ -93,18 +204,31 @@ pub const Plan = struct {
     }
 
     pub fn evaluateRowWithBudget(self: *const Plan, alloc: Allocator, row: codec.OrdinalRowView, budget: *usize) !Value {
-        return self.evaluateNode(alloc, .{ .row = row }, @intCast(self.nodes.len - 1), budget);
+        var execution = Execution.init(alloc, budget);
+        return self.evaluateRowWithExecution(&execution, row);
+    }
+
+    pub fn evaluateRowWithExecution(self: *const Plan, execution: *Execution, row: codec.OrdinalRowView) !Value {
+        return self.evaluateNode(execution, .{ .row = row }, @intCast(self.nodes.len - 1)) catch |err| return executionFailure(err);
     }
 
     /// Caller must fence the exact immutable source layout used to compile this
     /// plan. TuplePlan establishes that proof once per scan, including history.
     pub fn evaluateBoundRowWithBudget(self: *const Plan, alloc: Allocator, row: codec.OrdinalRowView, budget: *usize) !Value {
-        return self.evaluateNode(alloc, .{ .bound_row = row }, @intCast(self.nodes.len - 1), budget);
+        var execution = Execution.init(alloc, budget);
+        return self.evaluateBoundRowWithExecution(&execution, row);
+    }
+
+    pub fn evaluateBoundRowWithExecution(self: *const Plan, execution: *Execution, row: codec.OrdinalRowView) !Value {
+        return self.evaluateNode(execution, .{ .bound_row = row }, @intCast(self.nodes.len - 1)) catch |err| return executionFailure(err);
     }
 
     const Source = union(enum) { values: []const Value, json: std.json.Value, row: codec.OrdinalRowView, bound_row: codec.OrdinalRowView };
 
-    fn evaluateNode(self: *const Plan, alloc: Allocator, source: Source, index: u16, budget: *usize) anyerror!Value {
+    fn evaluateNode(self: *const Plan, execution: *Execution, source: Source, index: u16) anyerror!Value {
+        try execution.numeric.charge(1);
+        const alloc = execution.alloc;
+        const budget = execution.bytes;
         const node = self.nodes[index];
         if (node.op == .literal) return node.literal;
         if (node.op == .column) {
@@ -117,7 +241,7 @@ pub const Plan = struct {
                         if (size > budget.*) return error.RelationalExpressionBudgetExceeded;
                         budget.* -= size;
                     }
-                    break :blk try checks.valueFromJson(alloc, node.kind, input, false);
+                    break :blk if (node.kind == .numeric) try numericJson(execution, input) else try checks.valueFromJson(alloc, node.kind, input, false);
                 },
                 .row, .bound_row => |row| blk: {
                     const ordinal = if (source == .bound_row) node.ordinal else row.ordinalForName(node.column_name) orelse break :blk .null;
@@ -130,6 +254,7 @@ pub const Plan = struct {
                         .blob => .{ .blob = cell.value.bytes_val },
                         .integer => .{ .integer = cell.value.i64_val },
                         .number => .{ .number = cell.value.f64_val },
+                        .numeric => .{ .numeric = cell.value.bytes_val },
                         .boolean => .{ .boolean = cell.value.bool_val },
                         .datetime => .{ .datetime = cell.value.u64_val },
                         else => return error.InvalidRelationalExpressionType,
@@ -143,15 +268,15 @@ pub const Plan = struct {
         if (node.op == .case_when) {
             var i: usize = 0;
             while (i + 1 < node.children.len) : (i += 2) {
-                const condition = try self.evaluateNode(alloc, source, node.children[i], budget);
+                const condition = try self.evaluateNode(execution, source, node.children[i]);
                 if (condition != .null and condition.boolean)
-                    return self.evaluateNode(alloc, source, node.children[i + 1], budget);
+                    return self.evaluateNode(execution, source, node.children[i + 1]);
             }
-            return self.evaluateNode(alloc, source, node.children[node.children.len - 1], budget);
+            return self.evaluateNode(execution, source, node.children[node.children.len - 1]);
         }
         if (node.op == .coalesce) {
             for (node.children) |child| {
-                const value = try self.evaluateNode(alloc, source, child, budget);
+                const value = try self.evaluateNode(execution, source, child);
                 if (value != .null) return value;
             }
             return .null;
@@ -159,7 +284,7 @@ pub const Plan = struct {
         if (node.op == .@"and" or node.op == .@"or") {
             var unknown = false;
             for (node.children) |child| {
-                const value = try self.evaluateNode(alloc, source, child, budget);
+                const value = try self.evaluateNode(execution, source, child);
                 if (value == .null) {
                     unknown = true;
                     continue;
@@ -169,16 +294,16 @@ pub const Plan = struct {
             return if (unknown) .null else .{ .boolean = node.op == .@"and" };
         }
         if (node.op == .is_null or node.op == .is_not_null) {
-            const value = try self.evaluateNode(alloc, source, node.children[0], budget);
+            const value = try self.evaluateNode(execution, source, node.children[0]);
             return .{ .boolean = (value == .null) == (node.op == .is_null) };
         }
         if (node.op == .in_list or node.op == .not_in_list) {
             // The probe is evaluated once. NULL candidates do not terminate
             // the search: a later equality wins over UNKNOWN.
-            const probe = try self.evaluateNode(alloc, source, node.children[0], budget);
+            const probe = try self.evaluateNode(execution, source, node.children[0]);
             var unknown = probe == .null;
             for (node.children[1..]) |child| {
-                const candidate = try self.evaluateNode(alloc, source, child, budget);
+                const candidate = try self.evaluateNode(execution, source, child);
                 if (probe == .null or candidate == .null) {
                     unknown = true;
                     continue;
@@ -190,13 +315,13 @@ pub const Plan = struct {
                 };
                 if (bytes > budget.* / 2) return error.RelationalExpressionBudgetExceeded;
                 budget.* -= bytes * 2;
-                if (try valueOrder(probe, candidate, false) == .eq) return .{ .boolean = node.op == .in_list };
+                if (try valueOrderWithContext(probe, candidate, false, &execution.numeric) == .eq) return .{ .boolean = node.op == .in_list };
             }
             return if (unknown) .null else .{ .boolean = node.op == .not_in_list };
         }
         if (isComparison(node.op)) {
-            const left = try self.evaluateNode(alloc, source, node.children[0], budget);
-            const right = try self.evaluateNode(alloc, source, node.children[1], budget);
+            const left = try self.evaluateNode(execution, source, node.children[0]);
+            const right = try self.evaluateNode(execution, source, node.children[1]);
             if (left == .null or right == .null) return switch (node.op) {
                 .is_distinct => .{ .boolean = (left == .null) != (right == .null) },
                 .is_not_distinct => .{ .boolean = (left == .null) == (right == .null) },
@@ -212,7 +337,7 @@ pub const Plan = struct {
             };
             if (compared_bytes > budget.* / 2) return error.RelationalExpressionBudgetExceeded;
             budget.* -= compared_bytes * 2;
-            const order = try valueOrder(left, right, node.fold_ascii);
+            const order = try valueOrderWithContext(left, right, node.fold_ascii, &execution.numeric);
             return .{ .boolean = switch (node.op) {
                 .eq, .is_not_distinct => order == .eq,
                 .ne, .is_distinct => order != .eq,
@@ -225,10 +350,11 @@ pub const Plan = struct {
         }
         var operands: [32]Value = undefined;
         for (node.children, 0..) |child, i| {
-            operands[i] = try self.evaluateNode(alloc, source, child, budget);
+            operands[i] = try self.evaluateNode(execution, source, child);
             if (operands[i] == .null) return .null;
         }
         const a = operands[0];
+        if (a == .numeric or node.kind == .numeric) return numericOperation(execution, node, operands[0..node.children.len], self.nodes[node.children[0]]);
         switch (node.op) {
             .not => return .{ .boolean = !a.boolean },
             .cast => return numericCast(a, node.sql_type.?),
@@ -296,6 +422,69 @@ pub const Plan = struct {
     }
 };
 
+fn numericOperand(ctx: *exact.Context, value: Value, real: bool) !exact.Value {
+    return switch (value) {
+        .numeric => |bytes| (try binary.decodeCanonical(ctx, bytes)).value,
+        .integer => |integer| (try @import("../sql/numeric_storage.zig").fromJson(ctx, .{ .integer = integer })).value,
+        .number => |number| (try exact.fromFloat(ctx, number, real)).value,
+        else => error.InvalidRelationalExpressionInput,
+    };
+}
+
+fn numericOperation(execution: *Execution, node: Node, operands: []const Value, source: Node) !Value {
+    const input = operands[0];
+    if (input == .numeric and (node.op == .negate or (node.op == .cast and node.sql_type == .numeric))) {
+        const View = @import("../common/sql_numeric_layout.zig").View;
+        const view = try View.openWithBudget(input.numeric, .{}, &execution.numeric);
+        if (node.op == .cast or view.kind == .nan or (view.kind == .finite and view.count == 0)) return input;
+        try execution.numeric.charge(input.numeric.len);
+        const bytes = try allocateOutput(execution.alloc, input.numeric.len, execution.bytes);
+        @memcpy(bytes, input.numeric);
+        const sign: u16 = switch (view.kind) {
+            .finite => if (view.negative) 0 else 0x4000,
+            .positive_infinity => 0xf000,
+            .negative_infinity => 0xd000,
+            .nan => unreachable,
+        };
+        std.mem.writeInt(u16, bytes[4..6], sign, .big);
+        return .{ .numeric = bytes };
+    }
+    var scratch: NumericScratch = undefined;
+    scratch.init(execution);
+    defer scratch.deinit();
+    return numericOperationInner(&scratch, node, operands, source) catch |err| return scratch.failure(err);
+}
+
+fn numericOperationInner(scratch: *NumericScratch, node: Node, operands: []const Value, source: Node) !Value {
+    const ctx = &scratch.execution.numeric;
+    const a = try numericOperand(ctx, operands[0], source.sql_type == .float32);
+    if (node.op == .cast) {
+        const target = node.sql_type.?;
+        if (target == .numeric) return scratch.encode(a);
+        if (casts.integral(target)) {
+            const integer = try exact.toInteger(i64, ctx, a);
+            return numericCast(.{ .integer = integer }, target);
+        }
+        const text = try exact.format(ctx, a);
+        return finite(if (target == .float32)
+            try casts.floatValue(f32, .{ .number_string = text })
+        else if (target == .float64)
+            try casts.floatValue(f64, .{ .number_string = text })
+        else
+            return error.InvalidRelationalExpressionType);
+    }
+    const b = try numericOperand(ctx, operands[1], false);
+    const result = try switch (node.op) {
+        .add => exact.add(ctx, a, b),
+        .subtract => exact.subtract(ctx, a, b),
+        .multiply => exact.multiply(ctx, a, b),
+        .divide => exact.divide(ctx, a, b),
+        .modulo => exact.remainder(ctx, a, b),
+        else => return error.InvalidRelationalExpressionType,
+    };
+    return scratch.encode(result.value);
+}
+
 fn numericCast(value: Value, target: Numeric) !Value {
     if (value == .null) return .null;
     if (casts.integral(target)) return .{ .integer = switch (value) {
@@ -330,6 +519,11 @@ fn isComparison(op: Op) bool {
 }
 
 fn valueOrder(a: Value, b: Value, fold_ascii: bool) !std.math.Order {
+    var context: exact.Context = .{ .alloc = std.heap.page_allocator };
+    return valueOrderWithContext(a, b, fold_ascii, &context);
+}
+
+fn valueOrderWithContext(a: Value, b: Value, fold_ascii: bool, context: *exact.Context) !std.math.Order {
     return switch (a) {
         .null => unreachable,
         .string => |left| blk: {
@@ -342,12 +536,10 @@ fn valueOrder(a: Value, b: Value, fold_ascii: bool) !std.math.Order {
         },
         .blob => |value| std.mem.order(u8, value, b.blob),
         .numeric => |bytes| blk: {
-            const numeric = @import("../sql/numeric_value.zig");
             const View = @import("../common/sql_numeric_layout.zig").View;
-            var budget: numeric.Context = .{ .alloc = std.heap.page_allocator };
-            const left = try View.openWithBudget(bytes, .{}, &budget);
-            const right = try View.openWithBudget(b.numeric, .{}, &budget);
-            break :blk try left.order(right, &budget);
+            const left = try View.openWithBudget(bytes, .{}, context);
+            const right = try View.openWithBudget(b.numeric, .{}, context);
+            break :blk try left.order(right, context);
         },
         .boolean => |value| std.math.order(@intFromBool(value), @intFromBool(b.boolean)),
         .integer => |value| std.math.order(value, b.integer),
@@ -370,6 +562,7 @@ fn valueHasKind(value: Value, kind: Kind) bool {
 
 const Compiler = struct {
     alloc: Allocator,
+    execution: *Execution,
     table: schema.TableSchema,
     nodes: std.ArrayList(Node) = .empty,
     dependencies: std.ArrayList(u32) = .empty,
@@ -413,13 +606,14 @@ const Compiler = struct {
                 node.kind = std.meta.stringToEnum(Kind, kind.string) orelse return error.InvalidRelationalExpression;
                 const value = input.object.get("value") orelse .null;
                 switch (node.kind) {
-                    .string, .blob, .boolean, .datetime, .integer, .number => {},
+                    .string, .blob, .boolean, .datetime, .integer, .number, .numeric => {},
                     .json => if (value != .null) return error.InvalidRelationalExpressionType,
                     else => return error.InvalidRelationalExpressionType,
                 }
                 if (node.kind == .blob and value == .string and value.string.len > std.base64.standard.Encoder.calcSize(max_output_bytes)) return error.RelationalExpressionBudgetExceeded;
-                node.literal = checks.valueFromJson(self.alloc, node.kind, value, true) catch |err| switch (err) {
+                node.literal = (if (node.kind == .numeric) numericJson(self.execution, value) else checks.valueFromJson(self.alloc, node.kind, value, true)) catch |err| switch (err) {
                     error.OutOfMemory => return err,
+                    error.SqlProgramLimitExceeded, error.RelationalExpressionBudgetExceeded => return err,
                     else => return error.InvalidRelationalExpressionType,
                 };
                 switch (node.literal) {
@@ -433,7 +627,7 @@ const Compiler = struct {
                 }
                 self.frame(@tagName(node.kind));
                 self.literal_bytes += switch (node.literal) {
-                    .string, .blob => |bytes| bytes.len,
+                    .string, .blob, .numeric => |bytes| bytes.len,
                     .datetime => 16,
                     else => 8,
                 };
@@ -468,8 +662,9 @@ const Compiler = struct {
                 } else return error.RelationalIndexColumnNotFound;
                 node.kind = self.table.relational_columns[node.ordinal].column_type;
                 node.sql_type = self.table.relational_columns[node.ordinal].sql_element_type;
+                if (node.kind == .numeric and node.sql_type != .numeric) return error.InvalidRelationalExpressionType;
                 switch (node.kind) {
-                    .string, .blob, .boolean, .datetime, .integer, .number => {},
+                    .string, .blob, .boolean, .datetime, .integer, .number, .numeric => {},
                     else => return error.InvalidRelationalExpressionType,
                 }
                 if (std.mem.indexOfScalar(u32, self.dependencies.items, node.ordinal) == null) try self.dependencies.append(self.alloc, node.ordinal);
@@ -514,19 +709,18 @@ const Compiler = struct {
                 }
                 switch (op) {
                     .cast => {
-                        if (node.kind != .integer and node.kind != .number) return error.InvalidRelationalExpressionType;
+                        if (node.kind != .integer and node.kind != .number and node.kind != .numeric) return error.InvalidRelationalExpressionType;
                         const kind = input.object.get("type") orelse return error.InvalidRelationalExpression;
                         if (kind != .string) return error.InvalidRelationalExpression;
                         node.kind = std.meta.stringToEnum(Kind, kind.string) orelse return error.InvalidRelationalExpressionType;
                         if (input.object.get("sql_type") == null) return error.InvalidRelationalExpression;
                     },
-                    .add, .subtract, .multiply, .divide, .negate => if (node.kind != .integer and node.kind != .number) return error.InvalidRelationalExpressionType,
+                    .add, .subtract, .multiply, .divide, .negate => if (node.kind != .integer and node.kind != .number and node.kind != .numeric) return error.InvalidRelationalExpressionType,
                     // PostgreSQL has no float4/float8 remainder operator.
-                    // Exact NUMERIC remainder needs its own value domain.
-                    .modulo => if (node.kind != .integer) return error.InvalidRelationalExpressionType,
+                    .modulo => if (node.kind != .integer and node.kind != .numeric) return error.InvalidRelationalExpressionType,
                     .concat, .lower_ascii, .upper_ascii => if (node.kind != .string) return error.InvalidRelationalExpressionType,
                     .coalesce, .case_when => {
-                        if (node.kind == .integer or node.kind == .number) {
+                        if (node.kind == .integer or node.kind == .number or node.kind == .numeric) {
                             const identity = numericIdentity(self.nodes.items[children[children.len - 1]]);
                             const same = for (children, 0..) |child, i| {
                                 if (op == .case_when and i % 2 == 0 and i + 1 < children.len) continue;
@@ -546,9 +740,9 @@ const Compiler = struct {
         if (input.object.get("sql_type")) |identity| {
             if (identity != .string) return error.InvalidRelationalExpressionType;
             const typed = std.meta.stringToEnum(Numeric, identity.string) orelse return error.InvalidRelationalExpressionType;
-            if ((node.kind != .integer or !casts.integral(typed)) and (node.kind != .number or !casts.floating(typed))) return error.InvalidRelationalExpressionType;
+            if ((node.kind != .integer or !casts.integral(typed)) and (node.kind != .number or !casts.floating(typed)) and (node.kind != .numeric or typed != .numeric)) return error.InvalidRelationalExpressionType;
             node.sql_type = typed;
-            if (op == .literal) node.literal = numericCast(node.literal, typed) catch return error.InvalidRelationalExpressionType;
+            if (op == .literal and node.kind != .numeric) node.literal = numericCast(node.literal, typed) catch return error.InvalidRelationalExpressionType;
             // Do not change fingerprints of historical unannotated programs.
             // Typed operations/casts have a distinct, immutable semantic key.
             self.frame("SQL numeric expression identity v1");
@@ -564,7 +758,168 @@ const Compiler = struct {
 };
 
 fn numericIdentity(node: Node) Numeric {
-    return node.sql_type orelse if (node.kind == .integer) .int64 else .float64;
+    return node.sql_type orelse if (node.kind == .integer) .int64 else if (node.kind == .numeric) .numeric else .float64;
+}
+
+test "relational declarations exact NUMERIC arithmetic casts and ordering match PostgreSQL schema programs" {
+    const a = std.testing.allocator;
+    const Case = struct {
+        op: []const u8,
+        left: []const u8,
+        right: ?[]const u8 = null,
+        expected: ?std.json.Value = null,
+        @"error": ?[]const u8 = null,
+    };
+    const fixture = try std.json.parseFromSlice(struct { entries: []const Case }, a, @embedFile("../sql/fixtures/sql_exact_numeric_reference.json"), .{ .ignore_unknown_fields = true });
+    defer fixture.deinit();
+    const table: schema.TableSchema = .{ .storage_mode = .relational };
+    var exercised: usize = 0;
+    for (fixture.value.entries) |entry| {
+        const op: []const u8 = if (std.mem.eql(u8, entry.op, "remainder")) "modulo" else entry.op;
+        const integer_cast = std.mem.eql(u8, op, "int16") or std.mem.eql(u8, op, "int32") or std.mem.eql(u8, op, "int64");
+        const ordering = std.mem.eql(u8, op, "order");
+        if (!std.mem.eql(u8, op, "add") and !std.mem.eql(u8, op, "subtract") and
+            !std.mem.eql(u8, op, "multiply") and !std.mem.eql(u8, op, "divide") and
+            !std.mem.eql(u8, op, "modulo") and !integer_cast and !ordering) continue;
+        const Literal = struct { op: []const u8 = "literal", type: []const u8 = "numeric", value: []const u8 };
+        const text = if (integer_cast) try std.json.Stringify.valueAlloc(a, .{
+            .op = "cast",
+            .type = "integer",
+            .sql_type = op,
+            .args = [1]Literal{.{ .value = entry.left }},
+        }, .{}) else try std.json.Stringify.valueAlloc(a, .{
+            .op = if (ordering) "lt" else op,
+            .args = [2]Literal{ .{ .value = entry.left }, .{ .value = entry.right.? } },
+        }, .{});
+        defer a.free(text);
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, text, .{});
+        defer parsed.deinit();
+        var plan = try Plan.init(a, table, parsed.value, if (integer_cast) .integer else if (ordering) .boolean else .numeric);
+        defer plan.deinit();
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        if (entry.@"error") |state| {
+            const failure: anyerror = if (std.mem.eql(u8, state, "22012")) error.RelationalExpressionDivisionByZero else if (std.mem.eql(u8, state, "22003")) error.RelationalExpressionOverflow else if (std.mem.eql(u8, state, "0A000")) error.SqlFeatureNotSupported else return error.TestUnexpectedSqlstate;
+            try std.testing.expectError(failure, plan.evaluate(arena.allocator(), &.{}));
+        } else {
+            const result = try plan.evaluate(arena.allocator(), &.{});
+            if (integer_cast) {
+                const wanted = if (entry.expected.? == .integer) entry.expected.?.integer else try std.fmt.parseInt(i64, entry.expected.?.string, 10);
+                try std.testing.expectEqual(wanted, result.integer);
+            } else if (ordering) {
+                var unavailable = std.heap.FixedBufferAllocator.init(&.{});
+                const borrowed = try plan.evaluate(unavailable.allocator(), &.{});
+                try std.testing.expectEqual(entry.expected.?.integer < 0, borrowed.boolean);
+            } else {
+                var context: exact.Context = .{ .alloc = arena.allocator() };
+                const value = try binary.decodeCanonical(&context, result.numeric);
+                const actual = try exact.format(&context, value.value);
+                try std.testing.expectEqualStrings(entry.expected.?.string, actual);
+            }
+        }
+        exercised += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 537), exercised);
+}
+
+test "relational declarations NUMERIC schema execution owns scratch and shares sticky admission" {
+    const a = std.testing.allocator;
+    const parsed = try std.json.parseFromSlice(std.json.Value, a,
+        \\{"op":"multiply","args":[{"op":"literal","type":"numeric","value":"9007199254740993.0001"},{"op":"literal","type":"numeric","value":"3.000"}]}
+    , .{});
+    defer parsed.deinit();
+    const Run = struct {
+        fn run(alloc: Allocator, expression: std.json.Value) !void {
+            var plan = try Plan.init(alloc, .{ .storage_mode = .relational }, expression, .numeric);
+            defer plan.deinit();
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            var bytes: usize = max_allocated_bytes;
+            var execution = Execution.init(arena.allocator(), &bytes);
+            const result = try plan.evaluateWithExecution(&execution, &.{});
+            const text = try numericJsonOutput(&execution, result.numeric);
+            try std.testing.expectEqualStrings("27021597764222979.0003000", text.number_string);
+            try std.testing.expect(bytes < max_allocated_bytes);
+            try std.testing.expectEqual(arena.allocator().ptr, execution.numeric.alloc.ptr);
+            execution.numeric.remaining = 0;
+            try std.testing.expectError(error.RelationalExpressionBudgetExceeded, plan.evaluateWithExecution(&execution, &.{}));
+            execution.numeric.remaining = 1000;
+            try std.testing.expectError(error.RelationalExpressionBudgetExceeded, plan.evaluateWithExecution(&execution, &.{}));
+            var tiny: usize = 1;
+            var bounded = Execution.init(arena.allocator(), &tiny);
+            try std.testing.expectError(error.RelationalExpressionBudgetExceeded, plan.evaluateWithExecution(&bounded, &.{}));
+            const Poll = struct {
+                fn canceled(_: ?*anyopaque) anyerror!void {
+                    return error.Canceled;
+                }
+            };
+            var canceled = Execution.init(arena.allocator(), &bytes);
+            canceled.numeric.checkpoint = Poll.canceled;
+            try std.testing.expectError(error.Canceled, plan.evaluateWithExecution(&canceled, &.{}));
+            canceled.numeric.checkpoint = null;
+            try std.testing.expectError(error.Canceled, plan.evaluateWithExecution(&canceled, &.{}));
+        }
+    };
+    try Run.run(a, parsed.value);
+    var stable = std.testing.FailingAllocator.init(a, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(stable.allocator(), Run.run, .{parsed.value});
+}
+
+test "relational declarations NUMERIC defaults generated topology and strict restoration" {
+    const a = std.testing.allocator;
+    const source: schema.TableSchema = .{ .storage_mode = .relational, .relational_columns = &.{
+        .{ .name = "base", .path = "base", .column_type = .numeric, .sql_element_type = .numeric },
+        .{ .name = "sum", .path = "sum", .column_type = .numeric, .sql_element_type = .numeric },
+        .{ .name = "negative", .path = "negative", .column_type = .numeric, .sql_element_type = .numeric },
+    } };
+    const encoded = try schema.serializeSchema(a, source);
+    defer a.free(encoded);
+    const declarations = try std.json.parseFromSlice(std.json.Value, a,
+        \\{"defaults":[{"column":"base","expression":{"op":"literal","type":"numeric","value":"9007199254740993.0001"}}],"generated":[{"column":"negative","expression":{"op":"negate","args":[{"op":"column","column":"sum"}]}},{"column":"sum","expression":{"op":"add","args":[{"op":"column","column":"base"},{"op":"literal","type":"numeric","value":"0.0002"}]}}]}
+    , .{});
+    defer declarations.deinit();
+    const Run = struct {
+        fn run(alloc: Allocator, wire: []const u8, defs: std.json.Value) !void {
+            const table = try schema.deserializeSchema(alloc, wire);
+            const set = Set.createOwned(alloc, table, defs.object.get("defaults").?, defs.object.get("generated").?) catch |err| {
+                schema.freeSchema(alloc, table);
+                return err;
+            };
+            defer set.deinit();
+            var document = try std.json.parseFromSlice(std.json.Value, alloc, "{}", .{});
+            defer document.deinit();
+            try set.applyJson(document.arena.allocator(), &document.value);
+            try std.testing.expectEqualStrings("9007199254740993.0001", document.value.object.get("base").?.number_string);
+            try std.testing.expectEqualStrings("9007199254740993.0003", document.value.object.get("sum").?.number_string);
+            try std.testing.expectEqualStrings("-9007199254740993.0003", document.value.object.get("negative").?.number_string);
+            try set.verifyJson(alloc, document.value);
+            // Restore accepts logically equivalent display scales but never
+            // repairs missing or forged generated values.
+            try document.value.object.put(document.arena.allocator(), "sum", .{ .number_string = "9007199254740993.000300" });
+            try set.verifyJson(alloc, document.value);
+            try document.value.object.put(document.arena.allocator(), "sum", .{ .number_string = "9007199254740993.0004" });
+            try invalidGenerated(alloc, set, document.value);
+            _ = document.value.object.swapRemove("sum");
+            try invalidGenerated(alloc, set, document.value);
+            var explicit_null = try std.json.parseFromSlice(std.json.Value, alloc, "{\"base\":null}", .{});
+            defer explicit_null.deinit();
+            try set.applyJson(explicit_null.arena.allocator(), &explicit_null.value);
+            try std.testing.expectEqual(std.json.Value.null, explicit_null.value.object.get("sum").?);
+            try std.testing.expectEqual(std.json.Value.null, explicit_null.value.object.get("negative").?);
+            try set.verifyJson(alloc, explicit_null.value);
+        }
+        fn invalidGenerated(alloc: Allocator, set: *const Set, document: std.json.Value) !void {
+            if (set.verifyJson(alloc, document)) |_| {
+                return error.TestExpectedError;
+            } else |err| {
+                if (err == error.OutOfMemory) return err;
+                try std.testing.expectEqual(error.InvalidRelationalGeneratedValue, err);
+            }
+        }
+    };
+    try Run.run(a, encoded, declarations.value);
+    var stable = std.testing.FailingAllocator.init(a, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(stable.allocator(), Run.run, .{ encoded, declarations.value });
 }
 
 test "relational declarations SQL numeric programs retain narrow domains and checked casts" {
@@ -820,12 +1175,18 @@ pub const Set = struct {
     }
 
     pub fn applyValuesWithDefaultMask(self: *const Set, alloc: Allocator, values: []Value, present: []bool, defaults: DefaultsPolicy, default_mask: ?[]const bool) !void {
-        if (values.len != self.table.relational_columns.len or present.len != values.len or (default_mask != null and default_mask.?.len != values.len)) return error.InvalidRelationalExpressionInput;
         var budget: usize = max_allocated_bytes;
+        var execution = Execution.init(alloc, &budget);
+        return self.applyValuesWithExecution(&execution, values, present, defaults, default_mask);
+    }
+
+    pub fn applyValuesWithExecution(self: *const Set, execution: *Execution, values: []Value, present: []bool, defaults: DefaultsPolicy, default_mask: ?[]const bool) !void {
+        if (values.len != self.table.relational_columns.len or present.len != values.len or (default_mask != null and default_mask.?.len != values.len)) return error.InvalidRelationalExpressionInput;
+        const alloc = execution.alloc;
         for (self.order) |index| {
             const binding = &self.bindings[index];
             if (!binding.generated and (present[binding.ordinal] or defaults == .preserve_absence or (default_mask != null and !default_mask.?[binding.ordinal]))) continue;
-            values[binding.ordinal] = try self.normalizeBinding(alloc, binding.ordinal, try binding.plan.evaluateNode(alloc, .{ .values = values }, @intCast(binding.plan.nodes.len - 1), &budget));
+            values[binding.ordinal] = try self.normalizeBinding(alloc, binding.ordinal, try binding.plan.evaluateWithExecution(execution, values));
             present[binding.ordinal] = true;
         }
     }
@@ -834,16 +1195,19 @@ pub const Set = struct {
     /// output-only: any submitted value is overwritten deterministically.
     pub fn applyJson(self: *const Set, alloc: Allocator, document: *std.json.Value) !void {
         if (document.* != .object) return error.InvalidBatchRequest;
+        var budget: usize = max_allocated_bytes;
+        var execution = Execution.init(alloc, &budget);
         const values = try alloc.alloc(Value, self.table.relational_columns.len);
         defer alloc.free(values);
         const present = try alloc.alloc(bool, values.len);
         defer alloc.free(present);
-        try self.readValues(alloc, document.*, values, present, true);
-        try self.applyValues(alloc, values, present);
+        try self.readValues(&execution, document.*, values, present, true);
+        try self.applyValuesWithExecution(&execution, values, present, .apply_to_absent, null);
         for (self.bindings) |binding| {
             const name = self.table.relational_columns[binding.ordinal].name;
             if (!binding.generated and document.object.contains(name)) continue;
-            try document.object.put(alloc, try alloc.dupe(u8, name), try valueToJson(alloc, values[binding.ordinal]));
+            const value = values[binding.ordinal];
+            try document.object.put(alloc, try alloc.dupe(u8, name), if (value == .numeric) try numericJsonOutput(&execution, value.numeric) else try valueToJson(alloc, value));
         }
     }
 
@@ -860,8 +1224,10 @@ pub const Set = struct {
         const arena = scratch.allocator();
         const values = try arena.alloc(Value, self.table.relational_columns.len);
         const present = try arena.alloc(bool, values.len);
-        try self.readValues(arena, document, values, present, false);
-        try self.verifyValues(arena, values, present);
+        var budget: usize = max_allocated_bytes;
+        var execution = Execution.init(arena, &budget);
+        try self.readValues(&execution, document, values, present, false);
+        try self.verifyValues(&execution, values, present);
     }
 
     /// Cold restore verifies generated semantics directly from ordinal cells.
@@ -891,22 +1257,30 @@ pub const Set = struct {
                 .blob => .{ .blob = cell.value.bytes_val },
                 .integer => .{ .integer = cell.value.i64_val },
                 .number => .{ .number = cell.value.f64_val },
+                .numeric => .{ .numeric = cell.value.bytes_val },
                 .boolean => .{ .boolean = cell.value.bool_val },
                 .datetime => .{ .datetime = cell.value.u64_val },
                 else => return error.InvalidRelationalGeneratedValue,
             };
         }
-        try self.verifyValues(arena, values, present);
+        var budget: usize = max_allocated_bytes;
+        var execution = Execution.init(arena, &budget);
+        try self.verifyValues(&execution, values, present);
     }
 
-    fn verifyValues(self: *const Set, alloc: Allocator, values: []const Value, present: []const bool) !void {
-        var budget: usize = max_allocated_bytes;
+    fn verifyValues(self: *const Set, execution: *Execution, values: []const Value, present: []const bool) !void {
+        const alloc = execution.alloc;
         for (self.order) |index| {
             const binding = &self.bindings[index];
             if (!binding.generated) continue;
             if (!present[binding.ordinal]) return error.InvalidRelationalGeneratedValue;
-            const expected = try self.normalizeBinding(alloc, binding.ordinal, try binding.plan.evaluateNode(alloc, .{ .values = values }, @intCast(binding.plan.nodes.len - 1), &budget));
-            if (!try valuesEqual(expected, values[binding.ordinal])) return error.InvalidRelationalGeneratedValue;
+            const expected = try self.normalizeBinding(alloc, binding.ordinal, try binding.plan.evaluateWithExecution(execution, values));
+            const actual = values[binding.ordinal];
+            const equal = if (expected == .numeric and actual == .numeric)
+                (valueOrderWithContext(expected, actual, false, &execution.numeric) catch |err| return executionFailure(err)) == .eq
+            else
+                try valuesEqual(expected, actual);
+            if (!equal) return error.InvalidRelationalGeneratedValue;
         }
     }
 
@@ -929,7 +1303,7 @@ pub const Set = struct {
         };
     }
 
-    fn readValues(self: *const Set, alloc: Allocator, document: std.json.Value, values: []Value, present: []bool, ignore_generated: bool) !void {
+    fn readValues(self: *const Set, execution: *Execution, document: std.json.Value, values: []Value, present: []bool, ignore_generated: bool) !void {
         for (self.table.relational_columns, values, present, 0..) |column, *value, *exists, ordinal| {
             const input = document.object.get(column.name);
             exists.* = input != null;
@@ -938,7 +1312,8 @@ pub const Set = struct {
             // decoding. The immutable mask is compiled once per schema.
             if (!self.read_columns[ordinal] or (ignore_generated and self.generated_columns[ordinal])) continue;
             if (input) |scalar| switch (column.column_type) {
-                .string, .blob, .boolean, .datetime, .integer, .number => value.* = try checks.valueFromJson(alloc, column.column_type, scalar, false),
+                .numeric => value.* = try numericJson(execution, scalar),
+                .string, .blob, .boolean, .datetime, .integer, .number => value.* = try checks.valueFromJson(execution.alloc, column.column_type, scalar, false),
                 else => {},
             };
         }

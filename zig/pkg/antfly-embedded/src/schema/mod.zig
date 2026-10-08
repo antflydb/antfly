@@ -803,6 +803,50 @@ fn requiresTypedExpressions(schema: ParsedTableSchema, predicate: bool) bool {
     return false;
 }
 
+fn exactNumericExpression(value: std.json.Value, depth: usize) bool {
+    if (depth > 16 or value != .object) return false;
+    for ([_][]const u8{ "type", "sql_type" }) |field| if (value.object.get(field)) |kind| {
+        if (kind == .string and std.mem.eql(u8, kind.string, "numeric")) return true;
+    };
+    if (value.object.get("args")) |args| if (args == .array) for (args.array.items) |arg| {
+        if (exactNumericExpression(arg, depth + 1)) return true;
+    };
+    return false;
+}
+
+test "relational declarations exact NUMERIC generated programs publish capability for integer output" {
+    const a = std.testing.allocator;
+    var validator = try CompiledTableValidator.init(a,
+        \\{"storage_mode":"relational","default_type":"row","generated_columns":[{"column":"n","expression":{"op":"cast","type":"integer","sql_type":"int64","args":[{"op":"literal","type":"numeric","value":"9007199254740993.5"}]}}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"n":{"type":"integer"}},"additionalProperties":false}}}}
+    );
+    defer validator.deinit(a);
+    const runtime = try deriveRuntimeTableSchema(a, validator.schema);
+    defer storage_schema.freeSchema(a, runtime);
+    try std.testing.expect(runtime.requires_exact_numeric_expressions);
+    const bytes = try storage_schema.serializeSchema(a, runtime);
+    defer a.free(bytes);
+    const restored = try storage_schema.deserializeSchema(a, bytes);
+    defer storage_schema.freeSchema(a, restored);
+    try std.testing.expect(restored.requires_exact_numeric_expressions);
+    var document = try std.json.parseFromSlice(std.json.Value, a, "{}", .{});
+    defer document.deinit();
+    try validator.prepareValue(document.arena.allocator(), a, &document.value);
+    try std.testing.expectEqual(@as(i64, 9007199254740994), document.value.object.get("n").?.integer);
+}
+
+fn requiresExactNumericExpressions(schema: ParsedTableSchema) bool {
+    // Wire-typed CHECK/index expression enums still exclude NUMERIC. Raw
+    // default/generated programs must independently fence the new VM domain.
+    for ([_]?std.json.Parsed(std.json.Value){ schema.column_defaults, schema.generated_columns }) |definitions| if (definitions) |declarations| {
+        if (declarations.value == .array) for (declarations.value.array.items) |entry| {
+            if (entry == .object) if (entry.object.get("expression")) |expression| {
+                if (exactNumericExpression(expression, 0)) return true;
+            };
+        };
+    };
+    return false;
+}
+
 pub fn deriveRuntimeTableSchema(alloc: std.mem.Allocator, schema: ParsedTableSchema) !storage_schema.TableSchema {
     const exact_fields = try deriveRuntimeExactDocumentFields(alloc, schema);
     errdefer freeRuntimeExactFields(alloc, exact_fields);
@@ -888,6 +932,7 @@ pub fn deriveRuntimeTableSchema(alloc: std.mem.Allocator, schema: ParsedTableSch
         .requires_public_schema = schema.storage_mode == .relational,
         .requires_typed_expressions = requiresTypedExpressions(schema, false),
         .requires_predicate_expressions = requiresTypedExpressions(schema, true),
+        .requires_exact_numeric_expressions = requiresExactNumericExpressions(schema),
         .storage_mode = switch (schema.storage_mode) {
             .document => .document,
             .relational => .relational,
@@ -912,6 +957,7 @@ pub fn deriveRelationalCheckLayout(alloc: std.mem.Allocator, schema: ParsedTable
         .requires_public_schema = true,
         .requires_typed_expressions = requiresTypedExpressions(schema, false),
         .requires_predicate_expressions = requiresTypedExpressions(schema, true),
+        .requires_exact_numeric_expressions = requiresExactNumericExpressions(schema),
         .relational_columns = try deriveRuntimeRelationalColumns(alloc, schema),
     };
 }

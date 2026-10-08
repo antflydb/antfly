@@ -228,6 +228,7 @@ pub const Set = struct {
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
         var budget: usize = expressions.max_allocated_bytes;
+        var execution = expressions.Execution.init(arena.allocator(), &budget);
         for (self.definitions, self.plans, 0..) |definition, *plan, i| {
             const accepted = switch (plan.*) {
                 .comparison => |*comparison| blk: {
@@ -236,7 +237,7 @@ pub const Set = struct {
                     break :blk (try comparison.evaluateValue(alloc, &scratch, scalar)).satisfiesCheck();
                 },
                 .expression => |*expression| blk: {
-                    const result = expression.evaluateJsonWithBudget(arena.allocator(), value, &budget) catch |err| {
+                    const result = expression.evaluateJsonWithExecution(&execution, value) catch |err| {
                         if (activation and isDeterministicFailure(err)) return .{ .index = i, .reason = err };
                         return err;
                     };
@@ -265,9 +266,10 @@ pub const Set = struct {
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
         var budget: usize = expressions.max_allocated_bytes;
+        var execution = expressions.Execution.init(arena.allocator(), &budget);
         for (self.definitions, self.plans, 0..) |definition, *plan, i| {
             if (plan.* == .expression) {
-                const result = plan.expression.evaluateRowWithBudget(arena.allocator(), row, &budget) catch |err| {
+                const result = plan.expression.evaluateRowWithExecution(&execution, row) catch |err| {
                     if (activation and isDeterministicFailure(err)) return .{ .index = i, .reason = err };
                     return err;
                 };

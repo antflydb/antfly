@@ -726,6 +726,7 @@ pub const Status = enum(u32) {
     graph_generation_mismatch = 766,
     initial_child_provision_already_committed = 767,
     metadata_replication_pending = 768,
+    sql_feature_not_supported = 769,
 };
 
 /// Lossless failure metadata for compiled operation and per-item boundaries.

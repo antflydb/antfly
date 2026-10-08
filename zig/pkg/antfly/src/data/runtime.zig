@@ -1329,6 +1329,7 @@ const RaftTableApplyStateMachine = struct {
         InvalidRelationalGeneratedValue,
         GeneratedColumnRewriteRequired,
         InitialChildProvisionAlreadyCommitted,
+        SqlFeatureNotSupported,
 
         fn fromError(err: anyerror) ?ExpectedApplyFailure {
             inline for (@typeInfo(@import("antfly_local_sources").storage_db_online_source_contract.Rejection).error_set.error_names.?) |field| {
