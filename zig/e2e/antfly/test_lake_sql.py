@@ -2523,7 +2523,7 @@ def test_native_remote_indexed_metadata_predicates_above_id_list_limit(tmp_path)
     count = 100003
     input_file = tmp_path / "predicates.parquet"
     data_table = pa.table({
-        "body": ["common"] * count,
+        "body": ["common early"] * (count - 1000) + ["common late"] * 1000,
         "sparse_native": ['{"1":1}'] * count,
         "amount": range(count),
         "sort_rank": [0, 1] + list(range(2, count - 1)) + [0],
@@ -2576,6 +2576,7 @@ def test_native_remote_indexed_metadata_predicates_above_id_list_limit(tmp_path)
                 {"name": "big_integer_idx", "keys": [{"column": "big_integer"}]},
                 {"name": "time_text_idx", "keys": [{"column": "time_text"}]},
                 {"name": "category_idx", "keys": [{"column": "category"}]},
+                {"name": "category_amount_idx", "keys": [{"column": "category"}, {"column": "amount", "nulls": "first"}]},
                 {"name": "rank_idx", "keys": [{"column": "sort_rank", "nulls": "first"}]},
             ]},
             "indexes": {
@@ -2644,6 +2645,18 @@ def test_native_remote_indexed_metadata_predicates_above_id_list_limit(tmp_path)
             "filter_query": {"term": {"field": "amount", "value": count - 1}},
         })
         assert [h["_source"]["amount"] for h in sparse_point["hits"]["hits"]] == [count - 1], sparse_point
+        for weight in (-1, 0):
+            signed = call("POST", "/tables/indexed_predicates/query", {
+                "embeddings": {"sparse_native": {"indices": [1], "values": [weight]}},
+                "indexes": ["sparse_native"], "fields": ["amount"], "limit": 3,
+                "filter_query": {"term": {"field": "amount", "value": count - 1}},
+            })
+            assert [h["_source"]["amount"] for h in signed["hits"]["hits"]] == [count - 1], signed
+            assert signed["hits"]["hits"][0]["_score"] == weight, signed
+        selective_sort = query(point, order_by=[{"field": "amount"}], limit=1, profile=True)
+        assert [h["_source"]["amount"] for h in selective_sort["hits"]["hits"]] == [count - 1], selective_sort
+        assert selective_sort["profile"]["sort"]["candidate_source"] != "ordered_lake_index", selective_sort
+        assert selective_sort["profile"]["sort"]["ordered_scanned_count"] == 0, selective_sort
         sparse_residual = call("POST", "/tables/indexed_predicates/query", {
             "embeddings": {"sparse_native": {"indices": [1], "values": [1]}},
             "indexes": ["sparse_native"], "fields": ["amount"], "limit": 3,
@@ -2664,6 +2677,32 @@ def test_native_remote_indexed_metadata_predicates_above_id_list_limit(tmp_path)
             profile = ordered["profile"]["sort"]
             assert profile["candidate_source"] == "ordered_lake_index", profile
             assert profile["candidate_count"] <= 11, profile
+            assert profile["ordered_scanned_count"] <= 11, profile
+            continued = query({"match_all": {}}, order_by=[{"field": "amount", "desc": descending}],
+                search_after=ordered["hits"]["hits"][-1]["_sort"], remote_snapshot=ordered["remote_snapshot"], limit=3, profile=True)
+            following = list(range(count - 11, count - 14, -1)) if descending else list(range(10, 13))
+            assert [h["_source"]["amount"] for h in continued["hits"]["hits"]] == following, continued
+            assert continued["profile"]["sort"]["candidate_source"] == "ordered_lake_index", continued
+            assert continued["profile"]["sort"]["ordered_scanned_count"] <= 5, continued
+        prefixed = query({"conjuncts": [{"term": {"field": "category", "value": "comment"}},
+            {"range": {"amount": {"gte": 2}}}]}, order_by=[{"field": "amount"}], limit=3, profile=True)
+        assert [h["_source"]["amount"] for h in prefixed["hits"]["hits"]] == [2, 3, 4], prefixed
+        assert prefixed["profile"]["sort"]["candidate_source"] == "ordered_lake_index", prefixed
+        continued = query({"conjuncts": [{"term": {"field": "category", "value": "comment"}},
+            {"range": {"amount": {"gte": 2}}}]}, order_by=[{"field": "amount"}], limit=3, profile=True,
+            search_after=prefixed["hits"]["hits"][-1]["_sort"], remote_snapshot=prefixed["remote_snapshot"])
+        assert [h["_source"]["amount"] for h in continued["hits"]["hits"]] == [5, 6, 7], continued
+        assert continued["profile"]["sort"]["candidate_source"] == "ordered_lake_index", continued
+        assert continued["profile"]["sort"]["ordered_scanned_count"] <= 5, continued
+        if count > 10000:
+            skewed = call("POST", "/tables/indexed_predicates/query", {
+                "full_text_search": {"term": "late", "field": "body"}, "fields": ["amount"],
+                "order_by": [{"field": "amount"}], "limit": 3, "profile": True,
+            })
+            assert [h["_source"]["amount"] for h in skewed["hits"]["hits"]] == list(range(count - 1000, count - 997)), skewed
+            assert skewed["hits"]["total"] == {"value": 1000, "relation": "exact"}, skewed
+            assert skewed["profile"]["sort"]["candidate_source"] == "ordered_lake_index_then_text_postings", skewed
+            assert skewed["profile"]["sort"]["ordered_scanned_count"] <= 1024, skewed
         tied = query({"match_all": {}}, order_by=[{"field": "sort_rank"}], limit=1, profile=True)
         zeros = query({"term": {"field": "amount", "value": 0}})["hits"]["hits"] + query(point)["hits"]["hits"]
         assert [h["_source"]["amount"] for h in tied["hits"]["hits"]] == [sorted(zeros, key=lambda h: h["_id"])[0]["_source"]["amount"]], tied

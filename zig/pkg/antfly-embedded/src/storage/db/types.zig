@@ -15,6 +15,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+pub const SparseOrdinalLookup = @import("../../sparse/ordinal_lookup.zig").Lookup;
 const graph_mod = @import("../../graph/graph.zig");
 const traversal_mod = @import("../../graph/traversal.zig");
 const paths_mod = @import("../../graph/paths.zig");
@@ -1940,7 +1941,7 @@ pub const SearchRequest = struct {
     native_key_predicate: ?struct {
         ptr: *anyopaque,
         allows: *const fn (*anyopaque, []const u8) anyerror!bool,
-        select_ordinals: ?*const fn (*anyopaque, Allocator, *anyopaque, *const fn (*anyopaque, []const u8) anyerror!?u32) anyerror!?@import("../../encoding/roaring.zig").RoaringBitmap = null,
+        select_ordinals: ?*const fn (*anyopaque, Allocator, SparseOrdinalLookup) anyerror!?@import("../../encoding/roaring.zig").RoaringBitmap = null,
     } = null,
     resolved_doc_filter_owned: bool = false,
     resolved_doc_filter_wire_context: ?ResolvedDocFilterWireContext = null,
@@ -2797,6 +2798,7 @@ pub const SortProfile = struct {
     sorted_segment_scanned_count: u64 = 0,
     sorted_segment_scan_budget: u64 = 0,
     candidate_count: u64 = 0,
+    ordered_scanned_count: u64 = 0,
     cursor_rejected_count: u64 = 0,
     admitted_count: u64 = 0,
     replaced_count: u64 = 0,

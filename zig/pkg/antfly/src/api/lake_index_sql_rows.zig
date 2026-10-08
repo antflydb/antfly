@@ -477,6 +477,15 @@ pub fn tryOpenPredicate(a: A, server: *server_api.ApiHttpServer, table: catalog.
     return null;
 }
 
+pub fn compatibleSearchConditions(a: A, table: catalog.Table, conditions: []const catalog.Condition) !bool {
+    const definitions = table.external_indexes orelse return false;
+    var parsed = try local.schema_mod.parseValidatedTableSchema(a, definitions.schema_json);
+    defer parsed.deinit(a);
+    const runtime = try local.schema_mod.deriveRuntimeTableSchema(a, parsed);
+    defer local.storage_schema.freeSchema(a, runtime);
+    return searchConditionsCompatible(runtime, conditions);
+}
+
 fn searchConditionsCompatible(runtime: local.storage_schema.TableSchema, conditions: []const catalog.Condition) bool {
     for (conditions) |condition| {
         const kind = for (runtime.relational_columns) |column| {
@@ -520,8 +529,68 @@ pub fn openPinned(a: A, server: *server_api.ApiHttpServer, table: catalog.Table,
     return (try openWithPolicy(a, server, table, request, context, source, .required, null, false)) orelse error.ExternalLakeIndexUnavailable;
 }
 
+// Combine predicate and inclusive cursor bounds before access proof. Keeping a
+// weaker duplicate would either disable seeking or widen the physical walk.
+fn appendStrongBound(a: A, conditions: *std.ArrayList(catalog.Condition), next: catalog.Condition) !void {
+    const lower = next.op == .gt or next.op == .gte;
+    const upper = next.op == .lt or next.op == .lte;
+    for (conditions.items) |*previous| {
+        if (!std.mem.eql(u8, previous.column, next.column)) continue;
+        const previous_lower = previous.op == .gt or previous.op == .gte;
+        const previous_upper = previous.op == .lt or previous.op == .lte;
+        if (!(lower and previous_lower) and !(upper and previous_upper)) continue;
+        const order = try local.sql_scalar.compare(next.value, previous.value);
+        if ((lower and order == .gt) or (upper and order == .lt) or
+            (order == .eq and (next.op == .gt or next.op == .lt))) previous.* = next;
+        return;
+    }
+    try conditions.append(a, next);
+}
+
+/// Ordered identity-only consumption proves deletes, tuple bounds and ordering
+/// from the pinned publication. Membership enforces other required predicates;
+/// this path must never open a Parquet cursor to recheck an index key.
+pub fn tryOpenOrderedPredicate(a: A, server: *server_api.ApiHttpServer, table: catalog.Table, request: catalog.Scan, context: operation.RequestContext, source: *local.serverless_query_lake_serving.ServingSource) !?Predicate {
+    const definitions = table.external_indexes orelse return null;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    var parsed = try local.schema_mod.parseValidatedTableSchema(a, definitions.schema_json);
+    defer parsed.deinit(a);
+    const indexes = (try parsed.relationalIndexDefinitions(ca)) orelse return null;
+    var best: ?catalog.Cursor = null;
+    errdefer if (best) |cursor| cursor.close(cursor.ptr);
+    var best_cost: u64 = std.math.maxInt(u64);
+    for (indexes) |index| {
+        var conditions: std.ArrayList(catalog.Condition) = .empty;
+        for (request.conditions) |condition| for (index.keys) |key| {
+            if (key.expression_json == null and std.mem.eql(u8, key.column, condition.column)) {
+                var normalized = condition;
+                normalized.value = try local.sql_lake_values.comparisonValue(ca, condition.value, (try table.column(condition.column)).type);
+                try appendStrongBound(ca, &conditions, normalized);
+                break;
+            }
+        };
+        var candidate = request;
+        candidate.conditions = conditions.items;
+        const indexed = (try chooseAccess(ca, &.{index}, candidate)) orelse continue;
+        var cost: u64 = 0;
+        const cursor = (try openWithPolicy(a, server, table, indexed, context, source, .automatic, &cost, true)) orelse continue;
+        if (!cursor.order_satisfied) {
+            cursor.close(cursor.ptr);
+            continue;
+        }
+        if (cost < best_cost) {
+            if (best) |prior| prior.close(prior.ptr);
+            best = cursor;
+            best_cost = cost;
+        } else cursor.close(cursor.ptr);
+    }
+    return if (best) |cursor| .{ .cursor = cursor } else null;
+}
+
 pub fn tryOpenAuto(a: A, server: *server_api.ApiHttpServer, table: catalog.Table, request: catalog.Scan, context: operation.RequestContext, source: *local.serverless_query_lake_serving.ServingSource) !?catalog.Cursor {
-    if (request.index_range != null or request.primary_order or request.row_refs != null or request.primary_key != null) return null;
+    if (request.index_range != null or request.primary_order or request.row_refs != null or request.physical_selection != null or request.primary_key != null) return null;
     if (request.index_equality != null) return openWithPolicy(a, server, table, request, context, source, .automatic, null, false);
     const definitions = table.external_indexes orelse return null;
     if (definitions.schema_json.len == 0 or server.source.lakeIndexLifecycleAuthority(context) == null) return null;
@@ -607,7 +676,7 @@ fn chooseAccess(a: A, indexes: []const local.storage_relational_index.Relational
 
 fn openWithPolicy(a: A, server: *server_api.ApiHttpServer, table: catalog.Table, request: catalog.Scan, context: operation.RequestContext, source: *local.serverless_query_lake_serving.ServingSource, policy: @import("lake_index_selection.zig").Policy, estimated_cost: ?*u64, identities_only: bool) !?catalog.Cursor {
     const index_name = if (request.index_range) |range| range.name else if (request.index_equality) |equality| equality.name else return error.ExternalLakeIndexUnavailable;
-    if (request.primary_order or request.row_refs != null) return error.UnsupportedSqlExecution;
+    if (request.primary_order or request.row_refs != null or request.physical_selection != null) return error.UnsupportedSqlExecution;
     const definitions = table.external_indexes orelse return error.ExternalLakeIndexUnavailable;
     const authority = server.source.lakeIndexLifecycleAuthority(context) orelse return if (policy == .automatic) null else error.ExternalLakeIndexUnavailable;
     const normalized = try context.platformDeadline();
@@ -928,4 +997,23 @@ test "external lake temporal index admission rejects lexical pre-epoch bounds" {
     }
     try std.testing.expect(searchConditionsCompatible(schema, &.{.{ .column = "text", .op = .gte, .value = .{ .string = "plain" } }}));
     try std.testing.expect(!searchConditionsCompatible(schema, &.{.{ .column = "ts", .op = .gte, .value = .{ .string = "malformed" } }}));
+}
+
+test "external lake ordered cursor bounds retain strongest direction and inclusivity" {
+    const a = std.testing.allocator;
+    var conditions: std.ArrayList(catalog.Condition) = .empty;
+    defer conditions.deinit(a);
+    for ([_]catalog.Condition{
+        .{ .column = "amount", .op = .gte, .value = .{ .integer = 10 } },
+        .{ .column = "amount", .op = .gte, .value = .{ .integer = 9 } },
+        .{ .column = "amount", .op = .gt, .value = .{ .integer = 10 } },
+        .{ .column = "amount", .op = .lte, .value = .{ .integer = 30 } },
+        .{ .column = "amount", .op = .lt, .value = .{ .integer = 20 } },
+        .{ .column = "amount", .op = .lte, .value = .{ .integer = 20 } },
+    }) |condition| try appendStrongBound(a, &conditions, condition);
+    try std.testing.expectEqual(@as(usize, 2), conditions.items.len);
+    try std.testing.expectEqual(catalog.Condition.Op.gt, conditions.items[0].op);
+    try std.testing.expectEqual(@as(i64, 10), conditions.items[0].value.integer);
+    try std.testing.expectEqual(catalog.Condition.Op.lt, conditions.items[1].op);
+    try std.testing.expectEqual(@as(i64, 20), conditions.items[1].value.integer);
 }

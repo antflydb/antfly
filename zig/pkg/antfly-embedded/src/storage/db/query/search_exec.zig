@@ -141,6 +141,7 @@ pub const IndexedTextPredicate = struct {
 /// public ID tie breaker. The collector must finish the boundary tie group.
 pub const OrderedTextCandidates = struct {
     ptr: *anyopaque,
+    scanned_count: ?*const fn (*anyopaque) u64 = null,
     next: *const fn (*anyopaque) anyerror!?u32,
     close: *const fn (*anyopaque) void,
 };
@@ -3504,6 +3505,7 @@ const DecoratedSortHit = struct {
 
 const SortCollectorProfile = struct {
     candidate_count: u64 = 0,
+    ordered_scanned_count: u64 = 0,
     cursor_rejected_count: u64 = 0,
     admitted_count: u64 = 0,
     replaced_count: u64 = 0,
@@ -3676,6 +3678,7 @@ fn sortResultProfile(
         .exactness = sortPlanExactnessName(sortExecutionPlanExactness(plan)),
         .source = sortPlanSourceName(sortExecutionPlanSource(plan)),
         .candidate_source = profile.candidate_source,
+        .ordered_scanned_count = profile.ordered_scanned_count,
         .cursor_support = sortPlanCursorSupportName(sortExecutionPlanCursorSupport(plan)),
         .source_load = sortPlanSourceLoadName(sortExecutionPlanSourceLoadForRequest(plan, req)),
         .distributed_behavior = sortPlanDistributedBehaviorName(sortExecutionPlanDistributedBehavior(plan)),
@@ -11204,6 +11207,18 @@ fn sortAndPageTextDocValueDocNumsAlloc(
     return sortAndPageTextDocValueCandidatesAlloc(alloc, req, snapshot, doc_nums, null, executor, plan);
 }
 
+fn preferOrderedCandidates(matches: usize, live: u64, goal: usize) bool {
+    if (matches == 0 or matches <= goal) return false;
+    const expected_probes = (@as(u128, goal) + 1) * live / matches;
+    return expected_probes < matches;
+}
+
+test "external lake ordered producer cost preserves selective native sorting" {
+    try std.testing.expect(!preferOrderedCandidates(1, 50_000_000, 1));
+    try std.testing.expect(!preferOrderedCandidates(100, 50_000_000, 10));
+    try std.testing.expect(preferOrderedCandidates(50_000_000, 50_000_000, 10));
+}
+
 fn sortAndPageTextDocValueCandidatesAlloc(
     alloc: Allocator,
     req: types.SearchRequest,
@@ -11305,20 +11320,40 @@ fn sortAndPageTextDocValueCandidatesAlloc(
         .require_native = plan.require_native,
         .load = loadTextDocValueSortValue,
     };
-    const ordered = if (bitmap != null and effective_req.limit > 0 and executor.native_count_visibility_exact and executor.is_expired_key == null and effective_req.search_after.len == 0 and effective_req.search_before.len == 0)
+    var ordered = if (bitmap != null and preferOrderedCandidates(bitmap.?.cardinality(), snapshot.liveDocCount(), sortWindowCapacity(effective_req)) and effective_req.limit > 0 and executor.native_count_visibility_exact and executor.is_expired_key == null and effective_req.search_before.len == 0)
         if (executor.open_ordered_candidates) |open| try open(executor.ctx, alloc, effective_req, snapshot) else null
     else
         null;
     defer if (ordered) |stream| stream.close(stream.ptr);
     if (ordered != null) observeSortCandidateSource(if (collect_sort_profile) &profile else null, "ordered_lake_index");
+    const ordered_scan_budget: usize = @max(1024, candidate_count);
+    var ordered_probes: usize = 0;
     var visible_candidate_count: usize = 0;
     var iterator = if (bitmap) |set| set.iterator() else null;
     var position: usize = 0;
     while (true) {
+        // Cardinality costing assumes distribution. A skewed membership must
+        // not walk the archive: discard the partial window and resume the
+        // untouched compressed membership iterator once the bounded walk loses.
+        if (ordered) |stream| if (ordered_probes >= ordered_scan_budget) {
+            if (collect_sort_profile) {
+                if (stream.scanned_count) |count| profile.ordered_scanned_count = count(stream.ptr);
+                profile.candidate_source = "ordered_lake_index_then_text_postings";
+            }
+            stream.close(stream.ptr);
+            ordered = null;
+            for (window[0..window_len]) |*item| item.deinit(alloc);
+            window_len = 0;
+            visible_candidate_count = 0;
+        };
         const i = position;
         const doc_num = if (ordered) |stream|
             try stream.next(stream.ptr) orelse break
         else if (iterator) |*it| it.next() orelse break else if (position < doc_nums.len) doc_nums[position] else break;
+        if (ordered != null) ordered_probes += 1;
+        if (ordered) |stream| if (collect_sort_profile) {
+            profile.ordered_scanned_count = if (stream.scanned_count) |count| count(stream.ptr) else profile.ordered_scanned_count + 1;
+        };
         if (ordered != null and !bitmap.?.contains(doc_num)) {
             if (position % 1024 == 0) try checkSearchRequestDeadline(effective_req);
             position += 1;
@@ -11379,7 +11414,12 @@ fn sortAndPageTextDocValueCandidatesAlloc(
         decorated_owned = false;
     }
 
-    if (ordered != null) visible_candidate_count = bitmap.?.cardinality();
+    if (ordered) |stream| {
+        visible_candidate_count = bitmap.?.cardinality();
+        if (collect_sort_profile) if (stream.scanned_count) |count| {
+            profile.ordered_scanned_count = count(stream.ptr);
+        };
+    }
     try checkSearchRequestDeadline(effective_req);
     const final_sort_start_ns = if (collect_sort_profile) platform_time.monotonicNs() else 0;
     std.sort.pdq(DecoratedSortHit, window[0..window_len], effective_req, decoratedLessThan);

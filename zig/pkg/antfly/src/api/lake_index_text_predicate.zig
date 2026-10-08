@@ -127,7 +127,7 @@ pub const PhysicalResolver = PredicateResolver(PhysicalSet);
 fn PredicateResolver(comptime Set: type) type {
     return struct {
         const Self = @This();
-        const PredicateResult = if (Set == Bitmap) Result else struct { bitmap: Set, exact: bool = true };
+        const PredicateResult = struct { bitmap: Set, exact: bool = true, residual: ?Compiled = null };
         server: *@import("http_server.zig").ApiHttpServer,
         table: local.sql_catalog.Table,
         source: *local.serverless_query_lake_serving.ServingSource,
@@ -137,22 +137,23 @@ fn PredicateResolver(comptime Set: type) type {
         store_identity: [32]u8,
         read_context: local.serverless_query_lake_read_context.Context,
 
-        pub fn resolve(self: Self, a: A, json: []const u8) !?PredicateResult {
+        pub fn resolve(self: Self, a: A, json: []const u8) !?if (Set == Bitmap) Result else PredicateResult {
             var arena = std.heap.ArenaAllocator.init(a);
             defer arena.deinit();
             const parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), json, .{});
             const compiled = try Graph.compilePatternFilter(arena.allocator(), parsed.value);
-            const result = try self.value(a, compiled, 0, true);
+            const result = try self.value(a, arena.allocator(), compiled, 0, true);
             if (Set == PhysicalSet) if (result) |resolved| {
                 if (!resolved.exact) {
                     var partial = resolved;
                     defer partial.bitmap.deinit();
-                    return self.scanSelected(a, compiled, &partial.bitmap);
+                    return self.scanSelected(a, partial.residual orelse compiled, &partial.bitmap);
                 }
             };
+            if (Set == Bitmap) return if (result) |resolved| .{ .bitmap = resolved.bitmap, .exact = resolved.exact } else null;
             return result;
         }
-        fn value(self: Self, a: A, input: Compiled, depth: usize, allow_scan: bool) anyerror!?PredicateResult {
+        fn value(self: Self, a: A, pa: A, input: Compiled, depth: usize, allow_scan: bool) anyerror!?PredicateResult {
             if (depth > 64) return null;
             var arena = std.heap.ArenaAllocator.init(a);
             defer arena.deinit();
@@ -164,16 +165,21 @@ fn PredicateResolver(comptime Set: type) type {
             // Separate indexes may enforce individual conjuncts. An unresolved
             // child makes this whole predicate residual; OR/NOT never use supersets.
             switch (input) {
-                .conjuncts => |children| if (try self.resolveChildren(a, children, true, depth)) |result| return result,
-                .disjuncts => |children| if (try self.resolveChildren(a, children, false, depth)) |result| return result,
+                .conjuncts => |children| if (try self.resolveChildren(a, pa, children, true, depth)) |result| return result,
+                .disjuncts => |children| if (try self.resolveChildren(a, pa, children, false, depth)) |result| return result,
                 .bool_query => |boolean| {
                     // A required OR is indexable when every branch is exact.
                     if (boolean.must.len == 0 and boolean.must_not.len == 0 and boolean.min_should == 1) {
-                        if (try self.resolveChildren(a, boolean.should, false, depth)) |result| return result;
+                        if (try self.resolveChildren(a, pa, boolean.should, false, depth)) |result| return result;
                     } else if (boolean.must.len != 0) {
-                        if (try self.resolveChildren(a, boolean.must, true, depth)) |resolved| {
+                        if (try self.resolveChildren(a, pa, boolean.must, true, depth)) |resolved| {
                             var result = resolved;
+                            errdefer result.bitmap.deinit();
                             result.exact = result.exact and boolean.min_should == 0 and boolean.must_not.len == 0;
+                            if (!result.exact) {
+                                const must = if (result.residual) |residual| try pa.dupe(Compiled, &.{residual}) else try pa.alloc(Compiled, 0);
+                                result.residual = .{ .bool_query = .{ .must = must, .should = boolean.should, .must_not = boolean.must_not, .min_should = boolean.min_should } };
+                            }
                             return result;
                         }
                     }
@@ -185,15 +191,18 @@ fn PredicateResolver(comptime Set: type) type {
             }
             return if (allow_scan) self.scanExpression(a, input) else null;
         }
-        fn resolveChildren(self: Self, a: A, input: []const Compiled, conjunction: bool, depth: usize) !?PredicateResult {
+        fn resolveChildren(self: Self, a: A, pa: A, input: []const Compiled, conjunction: bool, depth: usize) !?PredicateResult {
             if (input.len == 0) return null;
             var result: ?PredicateResult = null;
             errdefer if (result) |*predicate| predicate.bitmap.deinit();
             var exact = true;
+            var residual: std.ArrayList(Compiled) = .empty;
+            defer residual.deinit(pa);
             for (input) |child| {
-                var next = (try self.value(a, child, depth + 1, false)) orelse {
+                var next = (try self.value(a, pa, child, depth + 1, false)) orelse {
                     if (conjunction) {
                         exact = false;
+                        try residual.append(pa, child);
                         continue;
                     }
                     if (result) |*predicate| predicate.bitmap.deinit();
@@ -205,12 +214,19 @@ fn PredicateResolver(comptime Set: type) type {
                     return null;
                 }
                 exact = exact and next.exact;
+                if (!next.exact) residual.append(pa, next.residual orelse child) catch |err| {
+                    next.bitmap.deinit();
+                    return err;
+                };
                 if (result) |*predicate| {
                     defer next.bitmap.deinit();
                     if (conjunction) predicate.bitmap.andWith(&next.bitmap) else try predicate.bitmap.orWith(&next.bitmap);
                 } else result = next;
             }
-            if (result) |*predicate| predicate.exact = exact;
+            if (result) |*predicate| {
+                predicate.exact = exact;
+                if (!exact) predicate.residual = .{ .conjuncts = try residual.toOwnedSlice(pa) };
+            }
             return result;
         }
         fn index(self: Self, a: A, conditions: []const Condition, scan: bool) !?Set {
@@ -278,34 +294,26 @@ fn PredicateResolver(comptime Set: type) type {
             if (!try @import("lake_index_search_filter.zig").dependencies(arena.allocator(), self.table, input, &fields)) return null;
             var result = Set.init(a);
             errdefer result.deinit();
-            var refs: [1024]local.storage_rowsource_types.RowRef = undefined;
+            const Selection = @typeInfo(@FieldType(local.sql_catalog.Scan, "physical_selection")).optional.child;
+            var blocks: std.ArrayList(Selection.Block) = .empty;
+            const ca = arena.allocator();
             var files = selected.files.iterator();
             while (files.next()) |file| {
-                var blocks = file.value_ptr.iterator();
-                while (blocks.next()) |block| {
-                    var it = block.value_ptr.iterator();
-                    while (true) {
-                        try self.context.ensureActive();
-                        var count: usize = 0;
-                        while (count < refs.len) : (count += 1) {
-                            const row = it.next() orelse break;
-                            refs[count] = .{ .external = .{
-                                .source_id = self.source.inventory.source_id,
-                                .snapshot_id = self.source.inventory.snapshot_id,
-                                .file_id = file.key_ptr.*,
-                                .row_group_ordinal = block.key_ptr.group,
-                                .row_ordinal = (@as(u64, block.key_ptr.high) << 32) | row,
-                            } };
-                        }
-                        if (count == 0) break;
-                        try self.scanInto(a, input, fields.items, refs[0..count], &result);
-                    }
+                const file_index = if (self.source.fileMap()) |map| map.get(file.key_ptr.*) orelse return error.ExternalLakeSnapshotMismatch else for (self.source.inventory.files, 0..) |entry, file_position| {
+                    if (std.mem.eql(u8, entry.file_id, file.key_ptr.*)) break file_position;
+                } else return error.ExternalLakeSnapshotMismatch;
+                var entries = file.value_ptr.iterator();
+                while (entries.next()) |block| {
+                    if (block.value_ptr.isEmpty()) continue;
+                    try blocks.append(ca, .{ .file = file_index, .group = block.key_ptr.group, .high = block.key_ptr.high, .rows = block.value_ptr });
                 }
             }
+            std.mem.sort(Selection.Block, blocks.items, {}, Selection.blockLess);
+            try self.scanInto(a, input, fields.items, .{ .blocks = blocks.items }, &result);
             return .{ .bitmap = result };
         }
-        fn scanInto(self: Self, a: A, input: Compiled, fields: []const []const u8, refs: ?[]const local.storage_rowsource_types.RowRef, result: *Set) !void {
-            const cursor = try local.sql_lake_cursor.openPinned(a, self.table, .{ .fields = fields, .row_refs = refs, .limit = 1024 }, self.context, self.source);
+        fn scanInto(self: Self, a: A, input: Compiled, fields: []const []const u8, selection: @FieldType(local.sql_catalog.Scan, "physical_selection"), result: *Set) !void {
+            const cursor = try local.sql_lake_cursor.openPinned(a, self.table, .{ .fields = fields, .physical_selection = selection, .limit = 1024 }, self.context, self.source);
             defer cursor.close(cursor.ptr);
             var row_arena = std.heap.ArenaAllocator.init(a);
             defer row_arena.deinit();
@@ -320,7 +328,13 @@ fn PredicateResolver(comptime Set: type) type {
                 const page = try cursor.next_columns.?(cursor.ptr, page_arena.allocator(), 1024);
                 try page.validate();
                 if (page.native != null) return error.InvalidSqlBackendResponse;
+                const mask = if (columnEvaluable(input)) try page_arena.allocator().alloc(bool, page.selection.len) else null;
+                if (mask) |matches| try evaluateColumns(page_arena.allocator(), input, page, matches, null);
                 for (page.selection, 0..) |position, row| {
+                    if (mask) |matches| {
+                        if (matches[row]) try self.addMatch(lookup.allocator(), result, &bitmap_cache, page.batch.row_refs[position]);
+                        continue;
+                    }
                     _ = row_arena.reset(.retain_capacity);
                     const ra = row_arena.allocator();
                     const ref = page.batch.row_refs[position];
@@ -339,12 +353,107 @@ fn PredicateResolver(comptime Set: type) type {
     };
 }
 
+// Execute normalized expression nodes over column pages. Leaf semantics stay in
+// the shared search compiler; Boolean masks avoid rebuilding a JSON object/ID
+// for each row while preserving the remote document projection semantics.
+fn columnEvaluable(input: Compiled) bool {
+    return switch (input) {
+        .match_all, .match_none => true,
+        .doc_id => false,
+        .field_matcher => |field| column(field.path) != null,
+        .conjuncts, .disjuncts => |children| blk: {
+            for (children) |child| if (!columnEvaluable(child)) break :blk false;
+            break :blk true;
+        },
+        .bool_query => |b| blk: {
+            for (b.must) |child| if (!columnEvaluable(child)) break :blk false;
+            for (b.should) |child| if (!columnEvaluable(child)) break :blk false;
+            for (b.must_not) |child| if (!columnEvaluable(child)) break :blk false;
+            break :blk true;
+        },
+    };
+}
+fn evaluateColumns(a: A, input: Compiled, page: local.sql_catalog.ColumnPage, mask: []bool, active: ?[]const bool) anyerror!void {
+    switch (input) {
+        .match_all => for (mask, 0..) |*match, row| {
+            match.* = if (active) |lanes| lanes[row] else true;
+        },
+        .match_none => @memset(mask, false),
+        .doc_id => unreachable,
+        .field_matcher => |field| {
+            const name = column(field.path).?;
+            var scratch = std.heap.ArenaAllocator.init(a);
+            defer scratch.deinit();
+            for (mask, 0..) |*match, row| {
+                match.* = false;
+                if (active) |lanes| if (!lanes[row]) continue;
+                _ = scratch.reset(.retain_capacity);
+                const cell = try page.cell(scratch.allocator(), row, name);
+                match.* = try field.predicate.matches(scratch.allocator(), &.{cell.value});
+            }
+        },
+        .conjuncts, .disjuncts => |children| {
+            const conjunction = input == .conjuncts;
+            for (mask, 0..) |*match, row| match.* = conjunction and (if (active) |lanes| lanes[row] else true);
+            const pending = try a.alloc(bool, mask.len);
+            defer a.free(pending);
+            const child_mask = try a.alloc(bool, mask.len);
+            defer a.free(child_mask);
+            for (children) |child| {
+                for (pending, mask, 0..) |*lane, match, row| lane.* = (if (active) |lanes| lanes[row] else true) and (if (conjunction) match else !match);
+                try evaluateColumns(a, child, page, child_mask, pending);
+                for (mask, child_mask) |*match, next| match.* = if (conjunction) match.* and next else match.* or next;
+            }
+        },
+        .bool_query => |b| {
+            for (mask, 0..) |*match, row| match.* = if (active) |lanes| lanes[row] else true;
+            const child_mask = try a.alloc(bool, mask.len);
+            defer a.free(child_mask);
+            for (b.must) |child| {
+                try evaluateColumns(a, child, page, child_mask, mask);
+                for (mask, child_mask) |*match, next| match.* = match.* and next;
+            }
+            if (b.min_should > 0) {
+                const counts = try a.alloc(usize, mask.len);
+                defer a.free(counts);
+                @memset(counts, 0);
+                const pending = try a.alloc(bool, mask.len);
+                defer a.free(pending);
+                for (b.should) |child| {
+                    for (pending, mask, counts) |*lane, match, count| lane.* = match and count < b.min_should;
+                    try evaluateColumns(a, child, page, child_mask, pending);
+                    for (counts, child_mask) |*count, next| count.* += @intFromBool(next);
+                }
+                for (mask, counts) |*match, count| match.* = match.* and count >= b.min_should;
+            }
+            for (b.must_not) |child| {
+                try evaluateColumns(a, child, page, child_mask, mask);
+                for (mask, child_mask) |*match, next| match.* = match.* and !next;
+            }
+        },
+    }
+}
+
 // Plan the shared compiler's normalized IR, never a second JSON grammar.
 fn column(path: Compiled.FieldPath) ?[]const u8 {
     return switch (path) {
         .single => |name| name,
         .dotted, .json_pointer => |parts| if (parts.len == 1) parts[0] else null,
     };
+}
+/// Only required predicates may bound an ordered producer. OR/NOT and
+/// unsupported leaves remain membership checks in the native collector.
+pub fn requiredConditions(a: A, input: Compiled, out: *std.ArrayList(Condition), depth: usize) anyerror!void {
+    if (depth > 64) return;
+    switch (input) {
+        .conjuncts => |children| for (children) |child| try requiredConditions(a, child, out, depth + 1),
+        .bool_query => |b| for (b.must) |child| try requiredConditions(a, child, out, depth + 1),
+        .field_matcher => {
+            const before = out.items.len;
+            if (!try collectConditions(a, input, out, depth)) out.shrinkRetainingCapacity(before);
+        },
+        else => {},
+    }
 }
 fn collectConditions(a: A, input: Compiled, out: *std.ArrayList(Condition), depth: usize) !bool {
     if (depth > 64) return false;
@@ -394,5 +503,42 @@ test "external lake predicate planner shares term and range aliases with the com
         try std.testing.expectEqual(@as(usize, 3), conditions.items.len);
         try std.testing.expectEqualStrings("kind", conditions.items[0].column);
         try std.testing.expectEqual(Condition.Op.lt, conditions.items[2].op);
+    }
+}
+
+test "external lake column residual masks match shared document evaluation" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    const Datum = @import("antfly_local_sources").sql_scalar.Datum;
+    const values = [_]Datum{ Datum.json(.{ .string = "kept" }), Datum.json(.{ .string = "other" }), Datum.json(.null) };
+    const vectors = [_][]const Datum{&values};
+    const Batch = @typeInfo(@FieldType(@typeInfo(@FieldType(local.sql_catalog.ColumnPage, "native")).optional.child, "values")).pointer.child;
+    const batch: Batch = .{ .vectors = .{ .values = &vectors, .count = 3 } };
+    const page: local.sql_catalog.ColumnPage = .{ .native = .{ .values = &batch, .names = &.{"label"} }, .selection = &.{ 2, 0, 1 } };
+    for ([_][]const u8{
+        \\{"prefix":{"path":"/label","value":"ke"}}
+        ,
+        \\{"bool":{"should":[{"term":{"label":"kept"}},{"exists":{"field":"label"}}],"minimum_should_match":2}}
+        ,
+        \\{"bool":{"must_not":[{"term":{"label":"other"}}]}}
+    }) |json| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, ca, json, .{});
+        const compiled = try Graph.compilePatternFilter(ca, parsed.value);
+        const Check = struct {
+            fn run(allocator: A, input: Compiled, columns: local.sql_catalog.ColumnPage) !void {
+                var actual: [3]bool = undefined;
+                try evaluateColumns(allocator, input, columns, &actual, null);
+            }
+        };
+        try std.testing.checkAllAllocationFailures(a, Check.run, .{ compiled, page });
+        var mask: [3]bool = undefined;
+        try evaluateColumns(ca, compiled, page, &mask, null);
+        for (mask, 0..) |match, row| {
+            var doc: std.json.Value = .{ .object = .empty };
+            try doc.object.put(ca, "label", (try page.cell(ca, row, "label")).value);
+            try std.testing.expectEqual(try compiled.matches(ca, "id", doc), match);
+        }
     }
 }

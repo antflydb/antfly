@@ -171,7 +171,7 @@ const Execution = struct {
         }
         return result;
     }
-    fn selectSparseOrdinals(raw: *anyopaque, a: A, lookup_ctx: *anyopaque, lookup: *const fn (*anyopaque, []const u8) anyerror!?u32) !?local.encoding_roaring.RoaringBitmap {
+    fn selectSparseOrdinals(raw: *anyopaque, a: A, lookup: types.SparseOrdinalLookup) !?local.encoding_roaring.RoaringBitmap {
         const self: *Execution = @ptrCast(@alignCast(raw));
         const include = if (self.vector_include) |*set| set else return null;
         var result = local.encoding_roaring.RoaringBitmap.init(a);
@@ -181,7 +181,14 @@ const Execution = struct {
             const digest = self.private_digests.get(file.key_ptr.*) orelse return error.ExternalLakeSnapshotMismatch;
             var blocks = file.value_ptr.iterator();
             while (blocks.next()) |block| {
-                var rows = block.value_ptr.iterator();
+                try self.context.ensureActive();
+                var prefix: [80]u8 = undefined;
+                const bytes_prefix = try std.fmt.bufPrint(&prefix, "lake2:{s}:{x:0>8}:", .{ digest, block.key_ptr.group });
+                var selection = try block.value_ptr.clone(a);
+                defer selection.deinit();
+                if (self.vector_exclude) |*exclude| if (exclude.files.getPtr(file.key_ptr.*)) |excluded_blocks| if (excluded_blocks.getPtr(block.key_ptr.*)) |excluded| selection.andNotWith(excluded);
+                if (try lookup.block(lookup.ptr, a, bytes_prefix, block.key_ptr.high, &selection, &result)) continue;
+                var rows = selection.iterator();
                 var visited: usize = 0;
                 while (rows.next()) |low| {
                     if (visited % 256 == 0) try self.context.ensureActive();
@@ -190,7 +197,7 @@ const Execution = struct {
                     if (self.vector_exclude) |*exclude| if (exclude.contains(file.key_ptr.*, block.key_ptr.group, row)) continue;
                     var key: [96]u8 = undefined;
                     const bytes = try std.fmt.bufPrint(&key, "lake2:{s}:{x:0>8}:{x:0>16}", .{ digest, block.key_ptr.group, row });
-                    if (try lookup(lookup_ctx, bytes)) |num| try result.add(num);
+                    if (try lookup.one(lookup.ptr, bytes)) |num| try result.add(num);
                 }
             }
         }
@@ -435,49 +442,43 @@ const Execution = struct {
     const Ordered = struct {
         a: A,
         execution: *Execution,
-        cursor: local.sql_catalog.Cursor,
-        orders: []local.sql_catalog.Scan.Order,
+        predicate: @import("lake_index_sql_rows.zig").Predicate,
+        plan_arena: std.heap.ArenaAllocator,
         identities: @import("lake_index_text_predicate.zig").Identities,
-        page: ?local.sql_catalog.Page = null,
+        page: []const local.storage_rowsource_types.RowRef = &.{},
+        window: std.heap.ArenaAllocator,
         position: usize = 0,
+        scanned: u64 = 0,
         lookup: std.heap.ArenaAllocator,
         bitmaps: std.StringHashMapUnmanaged(local.encoding_roaring.RoaringBitmap) = .empty,
+        fn scannedCount(raw: *anyopaque) u64 {
+            const self: *Ordered = @ptrCast(@alignCast(raw));
+            return self.scanned;
+        }
         fn close(raw: *anyopaque) void {
             const self: *Ordered = @ptrCast(@alignCast(raw));
-            if (self.page) |page| page.deinit();
-            self.cursor.close(self.cursor.ptr);
+            self.predicate.deinit();
+            self.window.deinit();
             self.lookup.deinit();
-            self.a.free(self.orders);
+            self.plan_arena.deinit();
             self.a.destroy(self);
         }
         fn next(raw: *anyopaque) !?u32 {
             const self: *Ordered = @ptrCast(@alignCast(raw));
             while (true) {
                 try self.execution.context.ensureActive();
-                if (self.page == null or self.position == self.page.?.rows.len) {
-                    if (self.page) |page| {
-                        const finished = page.after == null;
-                        page.deinit();
-                        self.page = null;
-                        if (finished) return null;
-                    }
-                    self.page = try self.cursor.next(self.cursor.ptr, self.a, 256);
+                if (self.position == self.page.len) {
+                    _ = self.window.reset(.retain_capacity);
+                    self.page = try self.predicate.next(self.window.allocator(), 256);
                     self.position = 0;
-                    if (self.page.?.rows.len == 0) return null;
+                    if (self.page.len == 0) return null;
                 }
-                const key = self.page.?.rows[self.position].id;
+                const ref = self.page[self.position];
                 self.position += 1;
-                const coordinate = try @import("lake_index_native_state.zig").coordinates(key);
+                self.scanned += 1;
                 const execution = self.execution;
-                const file = execution.files.get(key[6..70]) orelse return error.ExternalLakeSnapshotMismatch;
                 const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &execution.server.lake_read_cache, .scope = execution.store.identity, .context = execution.context };
-                if (try self.identities.ordinal(self.lookup.allocator(), &self.bitmaps, execution.store.artifactStore(), cached, .{ .external = .{
-                    .source_id = execution.source.inventory.source_id,
-                    .snapshot_id = execution.source.inventory.snapshot_id,
-                    .file_id = file,
-                    .row_group_ordinal = coordinate.group,
-                    .row_ordinal = coordinate.row,
-                } })) |number| return number;
+                if (try self.identities.ordinal(self.lookup.allocator(), &self.bitmaps, execution.store.artifactStore(), cached, ref)) |number| return number;
             }
         }
     };
@@ -486,8 +487,10 @@ const Execution = struct {
         if (req.order_by.len < 2 or !std.mem.eql(u8, req.order_by[req.order_by.len - 1].field, "_id")) return null;
         const identities = self.text_identities.get(@intFromPtr(snapshot)) orelse return null;
         var arena = std.heap.ArenaAllocator.init(a);
-        defer arena.deinit();
-        const orders = try arena.allocator().alloc(local.sql_catalog.Scan.Order, req.order_by.len - 1);
+        var keep_arena = false;
+        defer if (!keep_arena) arena.deinit();
+        const ca = arena.allocator();
+        const orders = try ca.alloc(local.sql_catalog.Scan.Order, req.order_by.len - 1);
         for (orders, req.order_by[0..orders.len]) |*order, field| {
             const column = for (self.table.columns) |column| {
                 if (std.mem.eql(u8, column.name, field.field)) break column;
@@ -496,19 +499,37 @@ const Execution = struct {
             if (column.type == .datetime) return null;
             order.* = .{ .column = field.field, .descending = field.desc, .nulls_first = !field.desc };
         }
-        const owned_orders = try a.dupe(local.sql_catalog.Scan.Order, orders);
-        var keep_orders = false;
-        defer if (!keep_orders) a.free(owned_orders);
-        const cursor = (try @import("lake_index_sql_rows.zig").tryOpenAuto(a, self.server, self.table, .{ .fields = &.{}, .order = owned_orders, .limit = 256 }, self.request, self.source)) orelse return null;
-        errdefer cursor.close(cursor.ptr);
-        if (!cursor.order_satisfied) {
-            cursor.close(cursor.ptr);
-            return null;
+        const sql_rows = @import("lake_index_sql_rows.zig");
+        var conditions: std.ArrayList(local.sql_catalog.Condition) = .empty;
+        if (req.filter_query_json.len != 0) {
+            const parsed = try std.json.parseFromSlice(std.json.Value, ca, req.filter_query_json, .{});
+            const compiled = try local.storage_db_query_graph_exec.compilePatternFilter(ca, parsed.value);
+            var required: std.ArrayList(local.sql_catalog.Condition) = .empty;
+            try @import("lake_index_text_predicate.zig").requiredConditions(ca, compiled, &required, 0);
+            for (required.items) |condition| {
+                if (try sql_rows.compatibleSearchConditions(ca, self.table, &.{condition})) try conditions.append(ca, condition);
+            }
         }
+        // Seek inclusively on the leading field. Public IDs break ties in the
+        // native collector, so an entire boundary tie group must remain visible.
+        if (req.search_after.len != 0) {
+            const bound = req.search_after[0];
+            if (bound == .null) return null;
+            const kind = (try self.table.column(orders[0].column)).type;
+            const normalized = local.sql_lake_values.comparisonValue(ca, bound, kind) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return null,
+            };
+            const condition: local.sql_catalog.Condition = .{ .column = orders[0].column, .op = if (orders[0].descending) .lte else .gte, .value = normalized };
+            if (!try sql_rows.compatibleSearchConditions(ca, self.table, &.{condition})) return null;
+            try conditions.append(ca, condition);
+        }
+        var predicate = (try sql_rows.tryOpenOrderedPredicate(a, self.server, self.table, .{ .fields = &.{}, .conditions = conditions.items, .order = orders, .limit = 256, .row_goal = @as(u64, req.offset) + req.limit }, self.request, self.source)) orelse return null;
+        errdefer predicate.deinit();
         const owner = try a.create(Ordered);
-        owner.* = .{ .a = a, .execution = self, .cursor = cursor, .orders = owned_orders, .identities = identities, .lookup = .init(a) };
-        keep_orders = true;
-        return .{ .ptr = owner, .next = Ordered.next, .close = Ordered.close };
+        owner.* = .{ .a = a, .execution = self, .predicate = predicate, .plan_arena = arena, .window = .init(a), .identities = identities, .lookup = .init(a) };
+        keep_arena = true;
+        return .{ .ptr = owner, .next = Ordered.next, .scanned_count = Ordered.scannedCount, .close = Ordered.close };
     }
     fn searchText(raw: ?*anyopaque, a: A, req: types.SearchRequest, text: types.TextQuery) !types.SearchResult {
         return search.searchTextQuery(a, req, text, .{ .ctx = raw, .exact_doc_id_filters = true, .acquire_text_source = acquire, .resolve_indexed_filter = resolveIndexedFilter, .open_ordered_candidates = openOrderedTextCandidates, .native_count_visibility_exact = true, .project_key = publicKey, .native_key = nativeKey, .filter_candidate_presence = true, .text_index_entry = noLocal, .text_index_is_chunk_backed = chunkBacked, .search_match_all = matchAll, .project_stored_search = project, .load_stored = loadOne, .load_projected_documents = loadProjected, .postprocess = postprocess });

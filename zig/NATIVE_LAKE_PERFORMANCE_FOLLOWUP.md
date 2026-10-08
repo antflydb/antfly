@@ -7,17 +7,24 @@ validation requirements.
 
 ## Native sparse predicate intersection
 
-Implemented through query-owned compressed native ordinal selections. Physical
-keys point-read authenticated 36-byte checkpoint locators containing ordinal,
-docmap segment, forward-vector offset/length, and incarnation. Bulk ingest and
-compaction publish locators transactionally. Fresh checkpoints carry a complete-map
-marker so missing vectors never trigger a legacy docmap scan. Replacement and deletion retain
-incarnation checks; older local checkpoints retain the authoritative scan
-fallback. Remote build recipe v3 regenerates locators. Selective sets (at most
-4096 rows, scaled to the requested result count) use forward scoring. Broader
-sets intersect postings before reverse identity reads and score accumulation.
-No broad key/hash array is created. Broad physical sets still perform one locator
-lookup per selected row; block-level ordinal maps are a possible further win.
+Implemented through query-owned compressed native ordinal selections. Native
+sparse recipe v4 persists authenticated 1024-row physical-to-native ordinal
+blocks inside the checkpoint. Each entry stores a two-byte physical offset and
+four-byte native ordinal; ingestion coalesces writes with at most 64 resident
+blocks. Inserts, replacements, deletes and compaction update these maps in the
+same transaction. A completeness marker distinguishes missing vectors from
+legacy checkpoints, which retain point lookup fallback until rebuilt. Queries
+translate a physical selection with one lookup per occupied block and check
+cancellation between blocks, without formatting a document key per selected row.
+
+Selective sets (at most 4096 rows, scaled to the requested result count) use
+36-byte forward locators and preserve zero/negative scores for overlapping terms;
+absence of overlap is separate from score. Broader sets intersect native bitmaps
+with authenticated posting-block ordinal trailers before decoding. Posting payloads remain V1; old readers ignore the extended range metadata,
+and unextended blocks derive bounds without allocating decoded arrays. Exact multi-term accumulation retains a score map;
+complete checkpoints select winners with a bounded top-k heap and sort only k
+entries, excluding tombstones before admission. Legacy checkpoints retain the
+full candidate sort and defensive identity fallback.
 
 Persist authenticated mappings between physical file/group/row coordinates and
 native sparse ordinals as part of each immutable publication. Share the physical
@@ -35,11 +42,15 @@ list merely to resolve membership. Preserve score and tie behavior.
 
 ## Residual evaluation over narrowed physical selections
 
-Implemented for vector predicates by retaining the indexed conjunction superset
-and evaluating the shared compiled predicate through delete-aware pinned Parquet
-cursors in windows of at most 1024 physical references. The resulting exact
-physical set is shared by dense and sparse membership. Unsupported OR shapes
-retain the full authoritative evaluation.
+Implemented for vector predicates by retaining an indexed conjunction superset
+and a separate residual IR containing only unresolved children. One pinned
+Parquet cursor borrows compressed physical selections for the entire scan;
+file/group/page pruning and reusable reader plans avoid reopening every 1024
+rows. Only residual dependency columns are projected. Direct-column expressions
+execute shared predicate leaves over page masks, preserving Boolean short
+circuiting and projected document null semantics without per-row JSON objects.
+Nested paths and document-ID expressions retain the shared document evaluator.
+The resulting exact physical set is shared by dense and sparse membership.
 
 Keep the indexed superset for a partially resolved conjunction. Iterate it in
 bounded file/group/row windows, project the authoritative expression dependencies,
@@ -56,14 +67,20 @@ conjunct narrows residual I/O. Test cancellation and allocation failures.
 ## Ordered lake index top-N
 
 Implemented as an optional ordered-candidate provider in shared native text
-sorting. Compatible direct relational keys supply native text ordinals. The
-collector intersects exact search membership, maintains its bounded window, and
-finishes the boundary key tie group before stopping. Public ID ties are sorted
-by the existing collector, independently of private index key order. Exact totals
-come from compressed membership, and profiles expose `ordered_lake_index` and
-visited matching candidates. Offset is supported. Cursor requests, timestamp
-sorts, incompatible null policies/collations, and unproven orderings retain the
-native doc-value top-N fallback. Existing scoring uses full-corpus statistics.
+sorting. A cardinality/row-goal cost check preserves bounded native sorting for
+tiny memberships. A runtime probe budget restarts the bounded native collector
+when skewed membership defeats that estimate, retaining truthful traversal
+counts and the `ordered_lake_index_then_text_postings` source. Compatible direct
+relational keys stream pinned physical row
+references without Parquet hydration. Safe required predicates provide tuple
+bounds and equality prefixes; unsupported leaves remain native membership checks.
+Forward cursors seek inclusively on the first ordered field and keep complete
+boundary ties for public-ID comparison. The collector stops only after the
+boundary key group, preserves exact totals, and reports matching candidates plus
+`ordered_scanned_count` (all traversed physical references before membership).
+Offset is supported. Backward cursors, timestamp sort domains, incompatible null
+policies/collations and unproven orders retain the native doc-value fallback.
+Existing scoring uses full-corpus statistics.
 
 Use compatible ordered relational indexes as candidate producers for field sorts.
 Intersect each ordered candidate with exact search membership, collect the page,
@@ -150,6 +167,38 @@ checks require at most 11 decorated candidates and an exact total of 100,003;
 the cross-file boundary tie check requires at most four. These counters establish
 early stopping, not a cold/warm throughput comparison. Final temporal admission
 and wide integer timestamp regressions additionally cover pre-epoch lexical
-index rejection and signed values beyond i64. Narrowed residual evaluation still
-projects the full predicate dependency set rather than a separate residual-only
-expression, and the remaining fallback shapes are listed above.
+index rejection and signed values beyond i64. The refinements below supersede the residual dependency and forward-cursor
+limitations recorded by that validation run.
+
+## Remaining work after the October 8 refinements
+
+The checkpoint mappings, block rejection, bounded winner collection, residual-only
+projection/page masks, costed ordered selection, equality prefixes and inclusive
+forward seeks are implemented. Full signed timestamp ordering still needs a
+versioned native datetime doc-value/cursor contract: native search currently uses
+unsigned nanoseconds, while relational timestamps use signed wide integers.
+Backward index traversal needs an explicit reverse cursor in the persistent tree;
+a forward scan with a reversed comparator would not prove early stopping.
+Multi-term sparse score accumulation still scales with matching postings; WAND or
+another exact signed-bound algorithm would need a separate proof and benchmark.
+No representative 50-million-row cold/warm throughput result is claimed.
+
+
+Validation on 2026-10-08: merged origin/main at 272db51d52 and built the Debug
+server with Zig 0.17.0. All 30 sparse tests, 319 SQL tests (three benchmark
+skips), and 184 lake API tests passed. Column residual masks include exhaustive
+allocation-failure checks and comparison with the shared document evaluator;
+bounded sparse top-k matches the legacy collector with signed weights and deleted
+winners. Block-map tests cover compaction, replacement, deletion, restart and
+legacy completeness fallback. Posting tests prove unchanged V1 payloads and
+legacy range-prefix decoding of extended metadata.
+
+All 21 real Parquet/PyIceberg e2e-full tests passed together in 271.11 seconds
+against the final binary. The 100,003-row two-file fixture covers nonpositive
+sparse scores, point-filter native sorting with zero ordered probes, forward
+cursor continuation in both sort directions, combined range/category bounds,
+residual predicates, exact totals and public-ID ties. A text membership clustered
+at the archive end triggers native fallback after at most 1024 ordered probes
+and still returns the exact page and 1000-row total. Apache boundary validation
+(1904 sources), Zig formatting, the joined public OpenAPI comparison and diff
+whitespace checks passed. No cold/warm archive throughput benchmark is claimed.

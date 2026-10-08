@@ -149,12 +149,13 @@ const ForwardScoreEntry = struct {
     doc_id: ?[]u8,
 };
 
+pub const OrdinalLookup = @import("ordinal_lookup.zig").Lookup;
 pub const KeyPredicate = struct {
     ptr: *anyopaque,
     allows: *const fn (*anyopaque, []const u8) anyerror!bool,
     /// Resolve an exact positive physical selection against this read transaction.
     /// Null retains the key predicate path (for example exclusion-only queries).
-    select_ordinals: ?*const fn (*anyopaque, Allocator, *anyopaque, *const fn (*anyopaque, []const u8) anyerror!?u32) anyerror!?@import("../encoding/roaring.zig").RoaringBitmap = null,
+    select_ordinals: ?*const fn (*anyopaque, Allocator, OrdinalLookup) anyerror!?@import("../encoding/roaring.zig").RoaringBitmap = null,
 };
 pub const SearchConstraints = struct {
     key_predicate: ?KeyPredicate = null,
@@ -219,7 +220,7 @@ const RetainedChunk = struct {
 };
 
 // ============================================================================
-// Chunk encoding (matches Go's encoding.go format v1)
+// Chunk encoding (compatible Go v1 payload; optional ordinal range metadata)
 // ============================================================================
 
 const CHUNK_FORMAT_VERSION: u8 = 1;
@@ -286,6 +287,34 @@ fn decodeChunkMaxWeight(data: []const u8) !f32 {
     return @bitCast(bits);
 }
 
+// Unextended legacy chunks can still reject disjoint selections without
+// allocating doc-number/weight arrays. New range metadata makes this O(1).
+fn chunkMayMatch(data: []const u8, bitmap: ?*const @import("../encoding/roaring.zig").RoaringBitmap) !bool {
+    if (data.len < 13 or data[0] != CHUNK_FORMAT_VERSION) return error.InvalidChunk;
+    const n = std.mem.readInt(u32, data[1..5], .little);
+    if (n == 0 or 13 + @as(u64, n) * 5 != data.len) return error.InvalidChunk;
+    if (bitmap == null) return true;
+    const lower = std.mem.readInt(u32, data[13..17], .little);
+    var upper = lower;
+    for (1..n) |i| upper = std.math.add(u32, upper, std.mem.readInt(u32, data[13 + i * 4 ..][0..4], .little)) catch return error.InvalidChunk;
+    return bitmap.?.rangeCardinality(lower, @as(u64, upper) + 1) != 0;
+}
+fn postingRangeMayMatch(range: []const u8, chunk: []const u8, bitmap: ?*const @import("../encoding/roaring.zig").RoaringBitmap) !bool {
+    if (bitmap == null) return true;
+    if (range.len < 8) return error.InvalidChunk;
+    const end = 8 + @as(u64, std.mem.readInt(u32, range[0..4], .little)) + std.mem.readInt(u32, range[4..8], .little);
+    if (end > range.len) return error.InvalidChunk;
+    const tail = range[@intCast(end)..];
+    if (tail.len != 0) {
+        if (tail.len != 12 or !std.mem.eql(u8, tail[0..4], "O32B")) return error.InvalidChunk;
+        const lower = std.mem.readInt(u32, tail[4..8], .little);
+        const upper = std.mem.readInt(u32, tail[8..12], .little);
+        if (lower > upper) return error.InvalidChunk;
+        return bitmap.?.rangeCardinality(lower, @as(u64, upper) + 1) != 0;
+    }
+    return chunkMayMatch(chunk, bitmap);
+}
+
 fn decodeChunk(alloc: Allocator, data: []const u8) !DecodedChunk {
     if (data.len < 13) return error.InvalidChunk;
     var pos: usize = 0;
@@ -303,6 +332,7 @@ fn decodeChunk(alloc: Allocator, data: []const u8) !DecodedChunk {
     const min_w: f32 = @bitCast(min_w_bits);
     pos += 4;
 
+    if (@as(u64, pos) + @as(u64, n) * 5 != data.len or n == 0) return error.InvalidChunk;
     // Delta-decode doc nums
     var doc_nums = try alloc.alloc(u32, n);
     errdefer alloc.free(doc_nums);
@@ -597,7 +627,7 @@ fn encodeSegmentFromSortedPostings(
 
             const chunk = try encodeChunk(alloc, doc_nums, weights);
             defer alloc.free(chunk);
-            const range = try encodeChunkRangeMeta(alloc, min_doc_id.?, max_doc_id.?);
+            const range = try encodeChunkOrdinalRange(alloc, min_doc_id.?, max_doc_id.?, doc_nums);
             defer alloc.free(range);
 
             try appendU32Le(alloc, &term_payload, @intCast(chunk.len));
@@ -714,6 +744,12 @@ fn forEachSegmentChunk(
         const chunk_end = pos + @as(usize, chunk_len);
         const range_end = chunk_end + @as(usize, range_len);
         if (range_end > payload.len) return error.InvalidSparseSegment;
+        if (@hasDecl(@typeInfo(@TypeOf(context)).pointer.child, "shouldDecode")) {
+            if (!try context.shouldDecode(payload[pos..chunk_end], payload[chunk_end..range_end])) {
+                pos = range_end;
+                continue;
+            }
+        }
         const decoded = try decodeChunk(alloc, payload[pos..chunk_end]);
         defer alloc.free(decoded.doc_nums);
         defer alloc.free(decoded.weights);
@@ -867,6 +903,21 @@ fn encodeChunkRangeMeta(alloc: Allocator, min_doc_id: []const u8, max_doc_id: []
     return buf;
 }
 
+// Readers before ordinal bounds ignore trailing range bytes. Preserve that
+// wire contract: the posting payload and document-ID range prefix stay V1.
+fn encodeChunkOrdinalRange(alloc: Allocator, min_id: []const u8, max_id: []const u8, nums: []const u32) ![]u8 {
+    if (nums.len == 0) return error.InvalidChunk;
+    const prefix = try encodeChunkRangeMeta(alloc, min_id, max_id);
+    defer alloc.free(prefix);
+    const result = try alloc.alloc(u8, prefix.len + 12);
+    @memcpy(result[0..prefix.len], prefix);
+    const tail = result[prefix.len..];
+    @memcpy(tail[0..4], "O32B");
+    std.mem.writeInt(u32, tail[4..8], nums[0], .little);
+    std.mem.writeInt(u32, tail[8..12], nums[nums.len - 1], .little);
+    return result;
+}
+
 fn decodeChunkRangeMeta(data: []const u8) !ChunkRangeMeta {
     if (data.len < 8) return error.InvalidChunk;
     const min_len = std.mem.readInt(u32, data[0..4], .little);
@@ -1001,6 +1052,7 @@ const key_doc_incarnation: u8 = 0x08;
 const key_segment_incarnation: u8 = 0x09;
 const key_docmap_incarnation: u8 = 0x0a;
 const key_docmap_locator: u8 = 0x0b;
+const key_physical_block: u8 = 0x0c;
 const key_inv: u8 = 0x10;
 
 const meta_next_doc_num: u8 = 0x01;
@@ -1008,6 +1060,7 @@ const meta_doc_count: u8 = 0x02;
 const meta_term_count: u8 = 0x03;
 const meta_next_segment_id: u8 = 0x04;
 const meta_complete_locators: u8 = 0x05;
+const meta_complete_physical: u8 = 0x06;
 
 const inv_kind_meta: u8 = 0x01;
 const inv_kind_chunk: u8 = 0x02;
@@ -1149,15 +1202,122 @@ fn readLocator(txn: anytype, doc_id: []const u8) !?DocMapLocator {
     if (locator.epoch != current) return null;
     return locator;
 }
-fn publishDocMapLocators(txn: anytype, segment: u64, data: []const u8) !void {
+// Lake private identities encode immutable object/group/row coordinates. Each
+// durable 1024-row block stores only (low-row:u16, native-ordinal:u32) pairs.
+// The write overlay coalesces all modifications before one put per block.
+const PhysicalMaps = struct {
+    const Key = [89]u8; // tag + 80-byte physical prefix + block ordinal
+    a: Allocator,
+    blocks: std.AutoHashMapUnmanaged(Key, *[1024]u64) = .empty,
+    fn deinit(self: *@This()) void {
+        var values = self.blocks.valueIterator();
+        while (values.next()) |value| self.a.destroy(value.*);
+        self.blocks.deinit(self.a);
+    }
+    fn key(prefix: []const u8, block: u64) !Key {
+        if (prefix.len != 80 or !std.mem.startsWith(u8, prefix, "lake2:") or prefix[70] != ':' or prefix[79] != ':') return error.InvalidSparsePhysicalMap;
+        var result: Key = undefined;
+        result[0] = key_physical_block;
+        @memcpy(result[1..81], prefix);
+        std.mem.writeInt(u64, result[81..89], block, .big);
+        return result;
+    }
+    fn load(self: *@This(), txn: anytype, block_key: Key) !*[1024]u64 {
+        if (!self.blocks.contains(block_key) and self.blocks.count() >= 64) {
+            try self.flush(txn);
+            self.deinit();
+            self.blocks = .empty;
+        }
+        const entry = try self.blocks.getOrPut(self.a, block_key);
+        if (entry.found_existing) return entry.value_ptr.*;
+        errdefer _ = self.blocks.remove(block_key);
+        const values = try self.a.create([1024]u64);
+        errdefer self.a.destroy(values);
+        @memset(values, 0);
+        const data = txn.get(&block_key) catch |err| switch (err) {
+            error.NotFound => &.{},
+            else => return err,
+        };
+        if (data.len % 6 != 0) return error.InvalidSparsePhysicalMap;
+        var position: usize = 0;
+        while (position < data.len) : (position += 6) {
+            const row = std.mem.readInt(u16, data[position..][0..2], .little);
+            if (row >= 1024 or values[row] != 0) return error.InvalidSparsePhysicalMap;
+            values[row] = @as(u64, std.mem.readInt(u32, data[position + 2 ..][0..4], .little)) + 1;
+        }
+        entry.value_ptr.* = values;
+        return values;
+    }
+    fn update(self: *@This(), txn: anytype, id: []const u8, num: ?u32) !void {
+        if (id.len != 96 or !std.mem.startsWith(u8, id, "lake2:")) return;
+        const row = std.fmt.parseInt(u64, id[80..96], 16) catch return error.InvalidSparsePhysicalMap;
+        const values = try self.load(txn, try key(id[0..80], row >> 10));
+        values[row & 1023] = if (num) |value| @as(u64, value) + 1 else 0;
+    }
+    fn flush(self: *@This(), txn: anytype) !void {
+        var entries = self.blocks.iterator();
+        var bytes: [1024 * 6]u8 = undefined;
+        while (entries.next()) |entry| {
+            var size: usize = 0;
+            for (entry.value_ptr.*, 0..) |num, row| {
+                if (num == 0) continue;
+                std.mem.writeInt(u16, bytes[size..][0..2], @intCast(row), .little);
+                std.mem.writeInt(u32, bytes[size + 2 ..][0..4], @intCast(num - 1), .little);
+                size += 6;
+            }
+            try txn.put(entry.key_ptr, bytes[0..size]);
+        }
+    }
+};
+fn selectPhysicalBlock(txn: anytype, a: Allocator, prefix: []const u8, high: u32, rows: *const @import("../encoding/roaring.zig").RoaringBitmap, result: *@import("../encoding/roaring.zig").RoaringBitmap, cancellation: ?CancellationToken) !bool {
+    _ = a;
+    const marker = txn.get(metaKey(meta_complete_physical)) catch |err| switch (err) {
+        error.NotFound => return false,
+        else => return err,
+    };
+    if (!std.mem.eql(u8, marker, &.{1})) return error.InvalidSparsePhysicalMap;
+    var iterator = rows.iterator();
+    while (iterator.next()) |first| {
+        try checkSearchCancellation(cancellation);
+        const base = first & ~@as(u32, 1023);
+        const row = (@as(u64, high) << 32) | base;
+        const block_key = try PhysicalMaps.key(prefix, row >> 10);
+        const data = txn.get(&block_key) catch |err| switch (err) {
+            error.NotFound => &.{},
+            else => return err,
+        };
+        if (data.len % 6 != 0) return error.InvalidSparsePhysicalMap;
+        var pos: usize = 0;
+        while (pos < data.len) : (pos += 6) {
+            const low = std.mem.readInt(u16, data[pos..][0..2], .little);
+            if (low >= 1024) return error.InvalidSparsePhysicalMap;
+            if (rows.contains(base | low)) try result.add(std.mem.readInt(u32, data[pos + 2 ..][0..4], .little));
+        }
+        if (base == std.math.maxInt(u32) - 1023) break;
+        iterator.seek(base + 1024);
+    }
+    return true;
+}
+
+fn publishDocMapLocators(a: Allocator, txn: anytype, segment: u64, data: []const u8) !void {
+    var maps: PhysicalMaps = .{ .a = a };
+    defer maps.deinit();
     const Context = struct {
         txn: @TypeOf(txn),
         segment: u64,
         data: []const u8,
+        maps: *PhysicalMaps,
         fn visit(self: *@This(), entry: DocMapLookup) !bool {
             if (entry.doc_id.len >= 256) return false;
             const epoch = try segmentIncarnation(self.txn, self.segment, try immutableVersion(self.data), entry.doc_num, true);
             if (epoch != try currentIncarnation(self.txn, entry.doc_num)) return false;
+            var tombstone: [16]u8 = undefined;
+            const deleted = self.txn.get(docTombstoneKey(&tombstone, entry.doc_num)) catch |err| switch (err) {
+                error.NotFound => null,
+                else => return err,
+            };
+            if (deleted != null) return false;
+            try self.maps.update(self.txn, entry.doc_id, std.math.cast(u32, entry.doc_num) orelse return error.DocNumOverflow);
             var bytes: [36]u8 = undefined;
             std.mem.writeInt(u64, bytes[0..8], entry.doc_num, .little);
             std.mem.writeInt(u64, bytes[8..16], self.segment, .little);
@@ -1169,8 +1329,9 @@ fn publishDocMapLocators(txn: anytype, segment: u64, data: []const u8) !void {
             return false;
         }
     };
-    var context: Context = .{ .txn = txn, .segment = segment, .data = data };
+    var context: Context = .{ .txn = txn, .segment = segment, .data = data, .maps = &maps };
     _ = try forEachDocMapEntry(data, &context, Context.visit);
+    try maps.flush(txn);
 }
 fn locatedForwardBytes(txn: anytype, doc_id: []const u8) !?[]const u8 {
     const locator = (try readLocator(txn, doc_id)) orelse return null;
@@ -1327,12 +1488,14 @@ fn incarnationWorkingBytes(txn: anytype, data: []const u8, docmap: bool) !u64 {
                 if (next > payload.len or length < 13) return error.InvalidSparseSegment;
                 const chunk = payload[pos..end];
                 if (chunk[0] != CHUNK_FORMAT_VERSION) return error.InvalidChunk;
+                const header: usize = 13;
+                if (chunk.len < header) return error.InvalidChunk;
                 const count = std.mem.readInt(u32, chunk[1..5], .little);
                 const encoded = std.math.mul(usize, count, 5) catch return error.InvalidChunk;
-                if (encoded != chunk.len - 13) return error.InvalidChunk;
+                if (encoded != chunk.len - header) return error.InvalidChunk;
                 var doc_num: u32 = 0;
                 for (0..count) |i| {
-                    const delta = std.mem.readInt(u32, chunk[13 + i * 4 ..][0..4], .little);
+                    const delta = std.mem.readInt(u32, chunk[header + i * 4 ..][0..4], .little);
                     doc_num = std.math.add(u32, doc_num, delta) catch return error.InvalidChunk;
                     try self.documentNumber(doc_num);
                 }
@@ -1442,6 +1605,7 @@ fn metaKey(kind: u8) *const [2]u8 {
         meta_term_count => &.{ key_meta, meta_term_count },
         meta_next_segment_id => &.{ key_meta, meta_next_segment_id },
         meta_complete_locators => &.{ key_meta, meta_complete_locators },
+        meta_complete_physical => &.{ key_meta, meta_complete_physical },
         else => unreachable,
     };
 }
@@ -1861,12 +2025,15 @@ pub const SparseIndex = struct {
         var touched_terms = std.AutoHashMapUnmanaged(u32, void).empty;
         defer touched_terms.deinit(self.alloc);
         const touched_terms_ptr = if (options.defer_term_range_updates) &touched_terms else null;
+        var physical_maps: PhysicalMaps = .{ .a = self.alloc };
+        defer physical_maps.deinit();
 
         // Process deletes
         var phase_start_ns = nowNs();
         for (deletes) |doc_id| {
             const effect = try self.processDelete(scratch, txn, doc_id, touched_terms_ptr);
             self.applyDeleteEffect(effect);
+            try physical_maps.update(txn, doc_id, null);
             _ = scratch_arena.reset(.retain_capacity);
         }
         self.write_profile.incremental_delete_ns += elapsedSince(phase_start_ns);
@@ -1875,8 +2042,10 @@ pub const SparseIndex = struct {
         phase_start_ns = nowNs();
         for (writes) |w| {
             try self.processInsert(scratch, txn, w.doc_id, w.vec, w.doc_num, touched_terms_ptr);
+            try physical_maps.update(txn, w.doc_id, try self.docNumForDocIdTxn(txn, w.doc_id));
             _ = scratch_arena.reset(.retain_capacity);
         }
+        try physical_maps.flush(txn);
         self.write_profile.incremental_insert_ns += elapsedSince(phase_start_ns);
 
         phase_start_ns = nowNs();
@@ -2271,7 +2440,7 @@ pub const SparseIndex = struct {
             if (result.docmap) |data| try txnAppendPut(&txn, self.dbi, docMapSegmentKey(&key_buf, segment_id), data);
             for (result.incarnations) |epoch| try putSegmentIncarnation(&txn, segment_id, epoch.doc_num, epoch.epoch, false);
             for (result.docmap_incarnations) |epoch| try putSegmentIncarnation(&txn, segment_id, epoch.doc_num, epoch.epoch, true);
-            if (result.docmap) |data| try publishDocMapLocators(&txn, segment_id, data);
+            if (result.docmap) |data| try publishDocMapLocators(self.alloc, &txn, segment_id, data);
             try persistNextSegmentId(self, &txn);
         }
 
@@ -2433,7 +2602,7 @@ pub const SparseIndex = struct {
             var rev_key_buf: [16]u8 = undefined;
             try txnAppendPut(&txn, self.dbi, revKey(&rev_key_buf, doc.doc_num), write.doc_id);
         }
-        try publishDocMapLocators(&txn, segment_id, docmap_data);
+        try publishDocMapLocators(self.alloc, &txn, segment_id, docmap_data);
         const complete = for (bulk_docs.items) |doc| {
             if (writes[doc.write_idx].doc_id.len >= 256) break false;
         } else true;
@@ -2443,6 +2612,7 @@ pub const SparseIndex = struct {
                 else => return err,
             };
         } else if (prev_next_doc_num == 0) try txn.put(metaKey(meta_complete_locators), &.{1});
+        if (prev_next_doc_num == 0) try txn.put(metaKey(meta_complete_physical), &.{1});
         self.write_profile.fwd_rev_put_ns += elapsedSince(phase_start_ns);
 
         phase_start_ns = nowNs();
@@ -2959,7 +3129,7 @@ pub const SparseIndex = struct {
         if (profile) |active_profile| active_profile.chunk_put_ns += elapsedSince(phase_start_ns);
 
         phase_start_ns = nowNs();
-        const meta = try encodeChunkRangeMeta(alloc, min_doc_id, max_doc_id);
+        const meta = try encodeChunkOrdinalRange(alloc, min_doc_id, max_doc_id, doc_nums);
         if (profile) |active_profile| active_profile.range_meta_encode_ns += elapsedSince(phase_start_ns);
         defer alloc.free(meta);
         var meta_ck_buf: [256]u8 = undefined;
@@ -3387,7 +3557,7 @@ pub const SparseIndex = struct {
     fn scoreFwdDataAgainstQuery(
         data: []const u8,
         query_weights: *const std.AutoHashMapUnmanaged(u32, f32),
-    ) !f32 {
+    ) !?f32 {
         const parsed = try parseFwdDocNumAndTermCount(data);
         const term_count: usize = @intCast(parsed.term_count);
         const terms_start = parsed.terms_start;
@@ -3395,16 +3565,18 @@ pub const SparseIndex = struct {
         if (data.len < weights_start + term_count * 4) return error.InvalidChunk;
 
         var score: f32 = 0;
+        var matched = false;
         for (0..term_count) |i| {
             const term_pos = terms_start + i * 4;
             const term_id = std.mem.readInt(u32, data[term_pos..][0..4], .little);
             const query_weight = query_weights.get(term_id) orelse continue;
+            matched = true;
             const weight_pos = weights_start + i * 4;
             const bits = std.mem.readInt(u32, data[weight_pos..][0..4], .little);
             const doc_weight: f32 = @bitCast(bits);
             score += query_weight * doc_weight;
         }
-        return score;
+        return if (matched) score else null;
     }
 
     fn appendForwardScoreIfMatch(
@@ -3418,8 +3590,7 @@ pub const SparseIndex = struct {
         fwd_data: []const u8,
     ) !void {
         if (self.docNumDeleted(txn, doc_num)) return;
-        const score = try scoreFwdDataAgainstQuery(fwd_data, query_weights);
-        if (score <= 0) return;
+        const score = (try scoreFwdDataAgainstQuery(fwd_data, query_weights)) orelse return;
         try entries.append(alloc, .{
             .doc_num = doc_num,
             .score = score,
@@ -3621,14 +3792,19 @@ pub const SparseIndex = struct {
         const Lookup = struct {
             index: *SparseIndex,
             txn: @TypeOf(&txn),
+            cancellation: ?CancellationToken,
+            fn block(raw: *anyopaque, a: Allocator, prefix: []const u8, high: u32, rows: *const @import("../encoding/roaring.zig").RoaringBitmap, result: *@import("../encoding/roaring.zig").RoaringBitmap) !bool {
+                const ctx: *@This() = @ptrCast(@alignCast(raw));
+                return selectPhysicalBlock(ctx.txn, a, prefix, high, rows, result, ctx.cancellation);
+            }
             fn lookup(raw: *anyopaque, key: []const u8) !?u32 {
                 const ctx: *@This() = @ptrCast(@alignCast(raw));
                 return ctx.index.docNumForDocIdTxn(ctx.txn, key);
             }
         };
-        var lookup: Lookup = .{ .index = self, .txn = &txn };
+        var lookup: Lookup = .{ .index = self, .txn = &txn, .cancellation = constraints.cancellation };
         var ordinal_filter = if (constraints.key_predicate) |predicate|
-            if (predicate.select_ordinals) |select| try select(predicate.ptr, alloc, &lookup, Lookup.lookup) else null
+            if (predicate.select_ordinals) |select| try select(predicate.ptr, alloc, .{ .ptr = &lookup, .one = Lookup.lookup, .block = Lookup.block }) else null
         else
             null;
         defer if (ordinal_filter) |*bitmap| bitmap.deinit();
@@ -3732,6 +3908,10 @@ pub const SparseIndex = struct {
             index: *SparseIndex,
             decisions: *Decisions,
 
+            fn shouldDecode(ctx: *@This(), bytes: []const u8, range: []const u8) !bool {
+                try checkSearchCancellation(ctx.cancellation);
+                return postingRangeMayMatch(range, bytes, ctx.ordinal_filter);
+            }
             fn visit(ctx: *@This(), decoded: DecodedChunk) !void {
                 const collect_start_ns = if (ctx.profile != null) nowNs() else 0;
                 for (decoded.doc_nums, 0..) |doc_num, di| {
@@ -3826,6 +4006,7 @@ pub const SparseIndex = struct {
                 const ck = invChunkKey(&ck_buf, term_id, @intCast(ci));
                 const chunk_data = txn.get(ck) catch continue;
 
+                if (!try chunkMayMatch(chunk_data, if (ordinal_filter) |*bitmap| bitmap else null)) continue;
                 const delta_start_ns = if (profile_enabled) nowNs() else 0;
                 const decoded = try decodeChunk(alloc, chunk_data);
                 defer alloc.free(decoded.doc_nums);
@@ -3854,24 +4035,44 @@ pub const SparseIndex = struct {
             }
         }
 
-        // Extract top-k using a simple sort (fine for reasonable result sizes)
-        const ScoreEntry = struct { doc_num: u32, score: f32 };
+        const ScoreEntry = struct {
+            doc_num: u32,
+            score: f32,
+            fn worse(_: void, a: @This(), b: @This()) std.math.Order {
+                const order = std.math.order(a.score, b.score);
+                return if (order == .eq) std.math.order(b.doc_num, a.doc_num) else order;
+            }
+            fn better(_: void, a: @This(), b: @This()) bool {
+                return worse({}, a, b) == .gt;
+            }
+        };
         var entries = std.ArrayListUnmanaged(ScoreEntry).empty;
         defer entries.deinit(alloc);
-
+        var heap = std.PriorityQueue(ScoreEntry, void, ScoreEntry.worse).initContext({});
+        defer heap.deinit(alloc);
+        // New checkpoints prove complete reverse identities. Tombstones must be
+        // removed before heap admission or deleted winners could hide live hits.
+        const bounded = try completeLocatorMap(&txn);
+        const sort_start_ns = if (profile_enabled) nowNs() else 0;
         var it = scores.iterator();
         while (it.next()) |e| {
             try checkSearchCancellation(constraints.cancellation);
-            try entries.append(alloc, .{ .doc_num = e.key_ptr.*, .score = e.value_ptr.* });
-        }
-        if (profile_enabled) profile.scored_docs = entries.items.len;
-
-        const sort_start_ns = if (profile_enabled) nowNs() else 0;
-        std.mem.sort(ScoreEntry, entries.items, {}, struct {
-            fn cmp(_: void, a: ScoreEntry, b: ScoreEntry) bool {
-                return a.score > b.score; // descending
+            if (self.docNumDeleted(&txn, e.key_ptr.*)) continue;
+            const entry: ScoreEntry = .{ .doc_num = e.key_ptr.*, .score = e.value_ptr.* };
+            if (!bounded) {
+                try entries.append(alloc, entry);
+            } else if (heap.items.len < k) {
+                try heap.push(alloc, entry);
+            } else if (heap.peek()) |worst| {
+                if (ScoreEntry.better({}, entry, worst)) {
+                    _ = heap.pop();
+                    try heap.push(alloc, entry);
+                }
             }
-        }.cmp);
+        }
+        if (bounded) try entries.appendSlice(alloc, heap.items);
+        if (profile_enabled) profile.scored_docs = scores.count();
+        std.mem.sort(ScoreEntry, entries.items, {}, ScoreEntry.better);
         if (profile_enabled) profile.sort_ns = nowNs() - sort_start_ns;
 
         const n = @min(k, @as(u32, @intCast(entries.items.len)));
@@ -4698,7 +4899,7 @@ fn pruneTermPostings(
         }
         const encoded = try encodeChunk(alloc, out_doc_nums, out_weights);
         errdefer alloc.free(encoded);
-        const encoded_meta = try encodeChunkRangeMeta(alloc, range.min_doc_id, range.max_doc_id);
+        const encoded_meta = try encodeChunkOrdinalRange(alloc, range.min_doc_id, range.max_doc_id, out_doc_nums);
         errdefer alloc.free(encoded_meta);
         try kept.append(alloc, .{
             .chunk_bytes = encoded,
@@ -4890,7 +5091,7 @@ fn writeChunkWithRangeMetaToTxn(
     var ck_buf: [256]u8 = undefined;
     try txnPut(dest_txn, dest_dbi, invChunkKey(&ck_buf, term_id, chunk_idx), encoded);
 
-    const meta = try encodeChunkRangeMeta(alloc, min_doc_id, max_doc_id);
+    const meta = try encodeChunkOrdinalRange(alloc, min_doc_id, max_doc_id, doc_nums);
     defer alloc.free(meta);
     var meta_ck_buf: [256]u8 = undefined;
     try txnPut(dest_txn, dest_dbi, invChunkMetaKey(&meta_ck_buf, term_id, chunk_idx), meta);
@@ -5781,11 +5982,11 @@ test "sparse physical ordinal selection uses forward scoring and intersects dire
         fn allows(_: *anyopaque, _: []const u8) !bool {
             return error.UnexpectedReverseIdentityRead;
         }
-        fn select(raw: *anyopaque, alloc: Allocator, ctx: *anyopaque, lookup: *const fn (*anyopaque, []const u8) anyerror!?u32) !?@import("../encoding/roaring.zig").RoaringBitmap {
+        fn select(raw: *anyopaque, alloc: Allocator, lookup: OrdinalLookup) !?@import("../encoding/roaring.zig").RoaringBitmap {
             const self: *@This() = @ptrCast(@alignCast(raw));
             var result = @import("../encoding/roaring.zig").RoaringBitmap.init(alloc);
             errdefer result.deinit();
-            if (try lookup(ctx, self.key)) |num| try result.add(num);
+            if (try lookup.one(lookup.ptr, self.key)) |num| try result.add(num);
             return result;
         }
     };
@@ -5798,6 +5999,17 @@ test "sparse physical ordinal selection uses forward scoring and intersects dire
     const excluded = try idx.searchConstrained(a, &query, 1, .{ .exclude_doc_ids = &.{"low"}, .key_predicate = .{ .ptr = &predicate, .allows = Predicate.allows, .select_ordinals = Predicate.select } });
     defer SparseIndex.freeResults(a, excluded);
     try std.testing.expectEqual(@as(usize, 0), excluded.len);
+    for ([_]f32{ -1, 0 }) |weight| {
+        const signed_query: SparseVector = .{ .indices = &.{1}, .values = &.{weight} };
+        const signed = try idx.searchConstrained(a, &signed_query, 1, .{ .key_predicate = .{ .ptr = &predicate, .allows = Predicate.allows, .select_ordinals = Predicate.select } });
+        defer SparseIndex.freeResults(a, signed);
+        try std.testing.expectEqual(@as(usize, 1), signed.len);
+        try std.testing.expectEqual(weight, signed[0].score);
+    }
+    const absent_query: SparseVector = .{ .indices = &.{2}, .values = &.{-1} };
+    const absent = try idx.searchConstrained(a, &absent_query, 1, .{ .key_predicate = .{ .ptr = &predicate, .allows = Predicate.allows, .select_ordinals = Predicate.select } });
+    defer SparseIndex.freeResults(a, absent);
+    try std.testing.expectEqual(@as(usize, 0), absent.len);
     predicate.key = "missing";
     const empty = try idx.searchConstrained(a, &query, 1, .{ .key_predicate = .{ .ptr = &predicate, .allows = Predicate.allows, .select_ordinals = Predicate.select } });
     defer SparseIndex.freeResults(a, empty);
@@ -5837,4 +6049,109 @@ test "sparse forward locators survive compaction replacement deletion and restar
     try std.testing.expectEqual(@as(usize, 1), hits.len);
     try std.testing.expectEqualStrings("first", hits[0].doc_id);
     try std.testing.expectApproxEqAbs(@as(f32, 5), hits[0].score, 0.001);
+}
+
+test "sparse posting block bounds preserve v1 decoding and reject disjoint selections" {
+    const a = std.testing.allocator;
+    const Bitmap = @import("../encoding/roaring.zig").RoaringBitmap;
+    const nums = &.{ @as(u32, 7), 100, std.math.maxInt(u32) };
+    const bytes = try encodeChunk(a, nums, &.{ -2, 0, 3 });
+    defer a.free(bytes);
+    try std.testing.expectEqual(@as(u8, 1), bytes[0]);
+    try std.testing.expectEqual(@as(usize, 13 + 3 * 5), bytes.len);
+    const extended = try encodeChunkOrdinalRange(a, "first", "last", nums);
+    defer a.free(extended);
+    const legacy = try encodeChunkRangeMeta(a, "first", "last");
+    defer a.free(legacy);
+    // The unmodified legacy decoder ignores the ordinal trailer.
+    const old_range = try decodeChunkRangeMeta(extended);
+    try std.testing.expectEqualStrings("first", old_range.min_doc_id);
+    try std.testing.expectEqualStrings("last", old_range.max_doc_id);
+    var rows = Bitmap.init(a);
+    defer rows.deinit();
+    try rows.add(1);
+    try std.testing.expect(!try chunkMayMatch(bytes, &rows));
+    try std.testing.expect(!try postingRangeMayMatch(extended, bytes, &rows));
+    try rows.add(std.math.maxInt(u32));
+    try std.testing.expect(try postingRangeMayMatch(extended, bytes, &rows));
+    try std.testing.expect(try postingRangeMayMatch(legacy, bytes, &rows));
+    const decoded = try decodeChunk(a, bytes);
+    defer a.free(decoded.doc_nums);
+    defer a.free(decoded.weights);
+    try std.testing.expectEqualSlices(u32, nums, decoded.doc_nums);
+    try std.testing.expectError(error.InvalidChunk, decodeChunk(a, bytes[0 .. bytes.len - 1]));
+}
+
+test "sparse physical block maps retain current identities across compaction edits and restart" {
+    const a = std.testing.allocator;
+    const Bitmap = @import("../encoding/roaring.zig").RoaringBitmap;
+    const prefix = "lake2:" ++ "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" ++ ":00000000:";
+    const first = prefix ++ "0000000000000001";
+    const second = prefix ++ "0000000000000402";
+    var pb: [256]u8 = undefined;
+    const path = tmpPath(&pb, "physical-block-maps");
+    defer cleanupTmp(path);
+    {
+        var idx = try SparseIndex.open(a, path, .{});
+        defer idx.close();
+        for ([_][]const u8{ first, second }) |id| try idx.batchWithOptions(&.{.{ .doc_id = id, .vec = .{ .indices = &.{1}, .values = &.{1} } }}, &.{}, .{ .prefer_bulk_build = true, .assume_new_doc_ids = true });
+        try std.testing.expect(try idx.compactSegmentsWithOptions(a, .{ .min_segments = 2 }));
+        try idx.batch(&.{.{ .doc_id = first, .vec = .{ .indices = &.{1}, .values = &.{5} } }}, &.{second});
+    }
+    var idx = try SparseIndex.open(a, path, .{});
+    defer idx.close();
+    var txn = try idx.beginReadTxn();
+    defer txn.abort();
+    var rows = Bitmap.init(a);
+    defer rows.deinit();
+    try rows.addRange(0, 2048);
+    var selected = Bitmap.init(a);
+    defer selected.deinit();
+    try std.testing.expect(try selectPhysicalBlock(&txn, a, prefix, 0, &rows, &selected, null));
+    try std.testing.expectEqual(@as(usize, 1), selected.cardinality());
+    try std.testing.expect(selected.contains((try idx.docNumForDocIdTxn(&txn, first)).?));
+    // A legacy checkpoint without the completeness proof must request fallback.
+    txn.abort();
+    var write = try idx.beginWriteTxn();
+    errdefer write.abort();
+    try write.delete(metaKey(meta_complete_physical));
+    try write.commit();
+    txn = try idx.beginReadTxn();
+    try std.testing.expect(!try selectPhysicalBlock(&txn, a, prefix, 0, &rows, &selected, null));
+}
+
+test "sparse bounded top k matches legacy collection for signed terms and deleted winners" {
+    const a = std.testing.allocator;
+    var pb: [256]u8 = undefined;
+    const path = tmpPath(&pb, "bounded-top-k");
+    defer cleanupTmp(path);
+    var idx = try SparseIndex.open(a, path, .{});
+    defer idx.close();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    const writes = try ca.alloc(SparseWrite, 300);
+    for (writes, 0..) |*write, i| {
+        const weights = try ca.alloc(f32, 2);
+        weights[0] = @floatFromInt(i);
+        weights[1] = @floatFromInt(i % 7);
+        write.* = .{ .doc_id = try std.fmt.allocPrint(ca, "doc-{d}", .{i}), .vec = .{ .indices = &.{ 1, 2 }, .values = weights } };
+    }
+    try idx.batchWithOptions(writes, &.{}, .{ .prefer_bulk_build = true, .assume_new_doc_ids = true });
+    try idx.batch(&.{}, &.{ "doc-0", "doc-1", "doc-2" });
+    const query: SparseVector = .{ .indices = &.{ 1, 2 }, .values = &.{ -1, 3 } };
+    const bounded = try idx.search(a, &query, 7);
+    defer SparseIndex.freeResults(a, bounded);
+    try std.testing.expectEqual(@as(usize, 7), bounded.len);
+    var txn = try idx.beginWriteTxn();
+    errdefer txn.abort();
+    try txn.delete(metaKey(meta_complete_locators));
+    try txn.commit();
+    const legacy = try idx.search(a, &query, 7);
+    defer SparseIndex.freeResults(a, legacy);
+    try std.testing.expectEqual(bounded.len, legacy.len);
+    for (bounded, legacy) |actual, expected| {
+        try std.testing.expectEqualStrings(expected.doc_id, actual.doc_id);
+        try std.testing.expectEqual(expected.score, actual.score);
+    }
 }

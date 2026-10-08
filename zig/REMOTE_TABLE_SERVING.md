@@ -1133,3 +1133,20 @@ residuals, compatible ordered-index top-N, bulk bitmap counts, and normalized
 temporal predicates. [Native lake performance follow-up](NATIVE_LAKE_PERFORMANCE_FOLLOWUP.md)
 describes their contracts, differential and E2E validation, fallback shapes,
 and remaining large-archive measurements.
+
+
+Native sparse recipe v4 stores transactionally maintained physical ordinal maps
+in 1024-row checkpoint blocks, alongside selective forward locators. Broad
+predicates translate compressed row selections by block and reject disjoint posting blocks through backward-compatible ordinal range trailers before decoding; Unextended ranges and older checkpoints retain read fallbacks. Exact winner collection uses a bounded heap when the checkpoint proves
+complete identities. Nonpositive dot products remain matches when terms overlap.
+
+Vector residual evaluation retains only unresolved predicate dependencies and
+passes compressed physical selections to one pinned Parquet cursor. Direct
+column expressions use shared leaf predicates with Boolean page masks; nested
+paths retain document evaluation. Ordered text search uses a membership/row-goal
+cost check, consumes proven index row references without Parquet hydration, and
+supports equality-prefix bounds and inclusive forward seeks. Complete public-ID
+boundary ties remain in the native collector. `profile.sort.ordered_scanned_count`
+reports traversed physical references before membership filtering. Signed native
+datetime sort values and reverse persistent-tree cursors remain separate format
+and execution work; SQL timestamp predicates retain signed correctness.

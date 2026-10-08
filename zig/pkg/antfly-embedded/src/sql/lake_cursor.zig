@@ -93,6 +93,10 @@ pub fn openPinned(alloc: Allocator, table: catalog.Table, request: catalog.Scan,
     var stream = try @import("../serverless/query/lake_stream.zig").Stream.init(alloc, source, columns.items, pruning.items, .{ .deadline_ns = normalized.deadline_ns, .cancellation = @import("../storage/object_storage.zig").CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) }, .{});
     errdefer stream.deinit();
     stream.identity_only = identity_only;
+    if (request.physical_selection) |selection| {
+        if (request.row_refs != null) return error.InvalidLakeCandidateReference;
+        try stream.selectRows(selection);
+    }
     if (request.row_refs) |refs| try stream.selectRows(try @import("../serverless/query/lake_row_selection.zig").Selection.initWithMap(owned, source.inventory, refs, source.fileMap()));
     if (source.iceberg_schema != null or std.mem.startsWith(u8, binding.binding.schema_fingerprint, "parquet-schema:") or std.mem.indexOf(u8, binding.binding.schema_fingerprint, ":hash=") != null) {
         var contract: std.ArrayList(@import("../serverless/query/lake_schema.zig").Column) = .empty;

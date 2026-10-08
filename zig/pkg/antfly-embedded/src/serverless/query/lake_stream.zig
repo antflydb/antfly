@@ -279,7 +279,7 @@ pub const Stream = struct {
         var files: std.ArrayList(usize) = .empty;
         defer files.deinit(self.alloc);
         const rank = self.source.fileRanks();
-        if (!self.owns_files and rank != null) {
+        if (!self.owns_files and rank != null and selection.blocks.len == 0) {
             for (selection.coordinates) |coordinate| {
                 if (files.items.len == 0 or files.items[files.items.len - 1] != coordinate.file) try files.append(self.alloc, coordinate.file);
             }

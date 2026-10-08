@@ -6369,6 +6369,7 @@ fn buildSortProfileValue(
     try sort.put(alloc, "sort_lifecycle_state", .{ .string = profile.sort_lifecycle_state });
     try sort.put(alloc, "index_sort_coverage", .{ .string = profile.index_sort_coverage });
     try sort.put(alloc, "candidate_count", try buildProfileUnsignedValue(alloc, profile.candidate_count));
+    try sort.put(alloc, "ordered_scanned_count", try buildProfileUnsignedValue(alloc, profile.ordered_scanned_count));
     try sort.put(alloc, "cursor_rejected_count", try buildProfileUnsignedValue(alloc, profile.cursor_rejected_count));
     try sort.put(alloc, "selected_count", try buildProfileUnsignedValue(alloc, profile.selected_count));
     try sort.put(alloc, "total_us", try buildProfileUnsignedValue(alloc, profile.total_us));
