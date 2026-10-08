@@ -14,12 +14,12 @@
     "leases_survive_cache_eviction": true
   },
   "owned_point_result": {
-    "decoded_block_bytes": 32768,
-    "namespace_bytes": 4,
-    "key_bytes": 3,
-    "value_bytes": 5,
-    "owned_result_bytes": 12,
-    "owned_result_allocator_calls": 1
+    "warm": true,
+    "returned_value_bytes": 5,
+    "owned_result_bytes": 5,
+    "owned_result_allocator_calls": 1,
+    "backend_allocator_calls": 0,
+    "selected_row_scratch_copied": false
   },
   "reader_admission": {
     "reads": 128,
@@ -38,7 +38,10 @@
     "additional_catalog_publications_during_repeated_rounds": 0,
     "idle_source_limit": 16,
     "original_bytes_survive_replacement_and_vacuum": true,
-    "retired_inode_charge_released_after_eviction": true
+    "retired_inode_charge_released_after_eviction": true,
+    "idle_retired_inode_bytes_after_vacuum": 0,
+    "expired_sources_reopen_lazily": true,
+    "unrelated_warm_reads_progress_during_blocked_source_close": true
   },
   "native_merge_cursor": {
     "persisted_runs": 24,
@@ -52,5 +55,19 @@
     "Cold block decoding, source creation, cursor metadata, and owned API results still allocate.",
     "Active cursors retain artifact-specific leases; idle leases are trimmed to 16 and obsolete-run cleanup invalidates them.",
     "The on-disk .aflite format and public C ABI are unchanged."
-  ]
+  ],
+  "local_batch_results": {
+    "values": 2,
+    "retained_block_pins": 1,
+    "value_payload_copies": 0,
+    "results_survive_cache_eviction": true
+  },
+  "cold_source_singleflight": {
+    "concurrent_native_reads": 16,
+    "catalog_lease_creations": 1,
+    "failure_waiters": 8,
+    "failed_provider_calls": 1,
+    "retry_supported": true,
+    "partial_allocations_failpoint_checked": true
+  }
 }

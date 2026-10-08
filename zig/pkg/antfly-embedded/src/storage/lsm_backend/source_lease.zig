@@ -22,11 +22,26 @@ pub const Lease = struct {
     allocator: Allocator,
     refs: platform.atomic.Value(usize) = .init(1),
     source: SegmentSource,
-    pub fn retain(self: *@This()) *@This() {
+    pub fn retainOwner(self: *@This()) *@This() {
+        _ = self.refs.fetchAdd(1, .monotonic);
+        return self;
+    }
+    /// Convert a held metadata reference to an active provider use outside
+    /// cache locks. Failure leaves the held reference for releaseOwner.
+    pub fn activateHeld(self: *@This()) bool {
+        return self.source.acquireUse();
+    }
+    pub fn retain(self: *@This()) ?*@This() {
+        if (!self.source.acquireUse()) return null;
         _ = self.refs.fetchAdd(1, .monotonic);
         return self;
     }
     pub fn release(self: *@This()) void {
+        self.source.releaseUse();
+        self.releaseOwner();
+    }
+    /// Cache ownership does not count as active provider use.
+    pub fn releaseOwner(self: *@This()) void {
         if (self.refs.fetchSub(1, .acq_rel) == 1) {
             self.source.close();
             self.allocator.destroy(self);

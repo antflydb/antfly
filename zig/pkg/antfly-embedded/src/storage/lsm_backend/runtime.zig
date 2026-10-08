@@ -70,11 +70,13 @@ const VisibleBytes = union(enum) {
     none,
     owned: OwnedBytes,
     borrowed,
+    local: *SharedBytes,
 
     fn release(self: *@This()) void {
         switch (self.*) {
             .none, .borrowed => {},
             .owned => |*owned| owned.release(),
+            .local => |payload| payload.release(),
         }
         self.* = .none;
     }
@@ -87,6 +89,19 @@ const VisibleBytes = union(enum) {
 
 const SharedBytes = @import("shared_bytes.zig").SharedBytes;
 const RunSourceLease = @import("source_lease.zig").Lease;
+
+/// Transaction result pins share the same lifetime contract for both caches.
+const BlockPin = union(enum) {
+    cached: cache_mod.Handle,
+    local: *SharedBytes,
+    fn release(self: *@This()) void {
+        switch (self.*) {
+            .cached => |*handle| handle.release(),
+            .local => |payload| payload.release(),
+        }
+        self.* = undefined;
+    }
+};
 
 const SourceBlockLease = union(enum) {
     none,
@@ -103,9 +118,10 @@ const SourceBlockLease = union(enum) {
         };
     }
 
-    fn retainCached(self: *const @This()) ?cache_mod.Handle {
+    fn retainPin(self: *const @This()) ?BlockPin {
         return switch (self.*) {
-            .cached => |*handle| handle.retain(),
+            .cached => |*handle| .{ .cached = handle.retain() },
+            .local => |payload| .{ .local = payload.retain() },
             else => null,
         };
     }
@@ -276,7 +292,7 @@ fn bulkStateHasDuplicateKeys(allocator: Allocator, state: *const State) !bool {
     return false;
 }
 
-fn releaseHeldBlocks(held_blocks: *std.ArrayListUnmanaged(cache_mod.Handle), allocator: Allocator) void {
+fn releaseHeldBlocks(held_blocks: *std.ArrayListUnmanaged(BlockPin), allocator: Allocator) void {
     for (held_blocks.items) |*handle| handle.release();
     held_blocks.deinit(allocator);
 }
@@ -923,6 +939,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         source_key_copies: []?[]u8 = &.{},
         source_blocks: []SourceBlockLease,
         source_run_leases: []?*RunSourceLease = &.{},
+        source_result_pinned: []bool = &.{},
         source_block_indices: []?usize,
         source_table_indices: []?*const lsm_table_file.TableIndex,
         source_table_index_handles: []?cache_mod.Handle,
@@ -953,6 +970,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
             cursorStorageAdvance(?[]u8, &offset, source_count);
             cursorStorageAdvance(SourceBlockLease, &offset, source_count);
             cursorStorageAdvance(?*RunSourceLease, &offset, source_count);
+            cursorStorageAdvance(bool, &offset, source_count);
             cursorStorageAdvance(?usize, &offset, source_count);
             cursorStorageAdvance(?*const lsm_table_file.TableIndex, &offset, source_count);
             cursorStorageAdvance(?cache_mod.Handle, &offset, source_count);
@@ -1075,6 +1093,8 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
             @memset(source_blocks, .none);
             const source_run_leases = cursorStorageSlice(?*RunSourceLease, storage, &offset, source_count);
             @memset(source_run_leases, null);
+            const source_result_pinned = cursorStorageSlice(bool, storage, &offset, source_count);
+            @memset(source_result_pinned, false);
             const source_block_indices = cursorStorageSlice(?usize, storage, &offset, source_count);
             @memset(source_block_indices, null);
             const source_table_indices = cursorStorageSlice(?*const lsm_table_file.TableIndex, storage, &offset, source_count);
@@ -1113,6 +1133,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
                 .source_key_copies = source_key_copies,
                 .source_blocks = source_blocks,
                 .source_run_leases = source_run_leases,
+                .source_result_pinned = source_result_pinned,
                 .source_block_indices = source_block_indices,
                 .source_table_indices = source_table_indices,
                 .source_table_index_handles = source_table_index_handles,
@@ -1144,6 +1165,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
                 self.allocator.free(self.source_block_indices);
                 self.allocator.free(self.source_blocks);
                 self.allocator.free(self.source_run_leases);
+                self.allocator.free(self.source_result_pinned);
                 self.allocator.free(self.source_entries);
                 self.allocator.free(self.source_key_copies);
                 self.allocator.free(self.positions);
@@ -1295,12 +1317,14 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
             }
         }
 
-        pub fn retainCurrentValueForTxn(self: *@This(), held_blocks: *std.ArrayListUnmanaged(cache_mod.Handle)) !bool {
+        pub fn retainCurrentValueForTxn(self: *@This(), held_blocks: *std.ArrayListUnmanaged(BlockPin)) !bool {
             const source_index = self.current_visible_source orelse return false;
-            if (self.source_blocks[source_index].retainCached()) |retained_block| {
+            if (self.source_result_pinned.len != 0 and self.source_result_pinned[source_index]) return true;
+            if (self.source_blocks[source_index].retainPin()) |retained_block| {
                 var retained = retained_block;
                 errdefer retained.release();
                 try held_blocks.append(self.backend.allocator, retained);
+                if (self.source_result_pinned.len != 0) self.source_result_pinned[source_index] = true;
                 return true;
             }
 
@@ -2059,6 +2083,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
 
         fn clearSourceBlock(self: *@This(), source_index: usize) void {
             self.source_blocks[source_index].release();
+            if (self.source_result_pinned.len != 0) self.source_result_pinned[source_index] = false;
             self.source_block_indices[source_index] = null;
         }
 
@@ -2468,7 +2493,7 @@ fn advanceSortedBatchCursorToKey(cursor: anytype, current: ?backend_adapter.Entr
 fn readManySortedFromCursor(
     backend: anytype,
     allocator: Allocator,
-    held_blocks: ?*std.ArrayListUnmanaged(cache_mod.Handle),
+    held_blocks: ?*std.ArrayListUnmanaged(BlockPin),
     held_values: *std.ArrayListUnmanaged([]u8),
     cursor: anytype,
     keys: []const []const u8,
@@ -2476,6 +2501,9 @@ fn readManySortedFromCursor(
 ) !BatchCursorReadResult {
     @memset(values, null);
     if (keys.len == 0) return .{};
+
+    // Pins belong to this result owner, even when a caller reuses its cursor.
+    if (comptime @hasField(@TypeOf(cursor.*), "source_result_pinned")) @memset(cursor.source_result_pinned, false);
 
     var result: BatchCursorReadResult = .{};
     backend.recordPointGets(keys.len);
@@ -2517,7 +2545,7 @@ const PointResultLifetime = enum {
     snapshot_pinned,
     transaction_owned,
 
-    fn forBlockPins(blocks: ?*std.ArrayListUnmanaged(cache_mod.Handle)) PointResultLifetime {
+    fn forBlockPins(blocks: ?*std.ArrayListUnmanaged(BlockPin)) PointResultLifetime {
         return if (blocks != null) .snapshot_pinned else .transaction_owned;
     }
 
@@ -2554,7 +2582,7 @@ fn readManySortedPointFromSnapshot(
     l0_groups: []const RunGroup,
     levels: []const RunLevel,
     allocator: Allocator,
-    held_blocks: ?*std.ArrayListUnmanaged(cache_mod.Handle),
+    held_blocks: ?*std.ArrayListUnmanaged(BlockPin),
     held_values: *std.ArrayListUnmanaged([]u8),
     namespace: backend_types.Namespace,
     keys: []const []const u8,
@@ -2578,7 +2606,7 @@ fn readManySortedPointFromSnapshot(
         PointResultLifetime.forBlockPins(held_blocks),
     )) |result| return result;
 
-    var local_held_blocks = std.ArrayListUnmanaged(cache_mod.Handle).empty;
+    var local_held_blocks = std.ArrayListUnmanaged(BlockPin).empty;
     defer if (held_blocks == null) releaseHeldBlocks(&local_held_blocks, backend.allocator);
     const block_handles = held_blocks orelse &local_held_blocks;
     var batch_indexes = RunBatchIndexHandles{ .allocator = runtimeScratchAllocator(allocator) };
@@ -2637,14 +2665,14 @@ const RunBatchIndexState = struct {
         self.* = undefined;
     }
 
-    fn transferBlock(self: *@This(), allocator: Allocator, held_blocks: *std.ArrayListUnmanaged(cache_mod.Handle)) !void {
+    fn transferBlock(self: *@This(), allocator: Allocator, held_blocks: *std.ArrayListUnmanaged(BlockPin)) !void {
         if (self.block_handle) |handle| {
             self.block_handle = null;
             self.block_index = null;
             if (self.block_has_values) {
                 var transfer = handle;
                 errdefer transfer.release();
-                try held_blocks.append(allocator, transfer);
+                try held_blocks.append(allocator, .{ .cached = transfer });
             } else {
                 var discard = handle;
                 discard.release();
@@ -2685,7 +2713,7 @@ const RunBatchIndexHandles = struct {
         unreachable;
     }
 
-    fn transferBlocks(self: *@This(), allocator: Allocator, held_blocks: *std.ArrayListUnmanaged(cache_mod.Handle)) !void {
+    fn transferBlocks(self: *@This(), allocator: Allocator, held_blocks: *std.ArrayListUnmanaged(BlockPin)) !void {
         for (self.items.items) |*item| try item.transferBlock(allocator, held_blocks);
     }
 };
@@ -2698,7 +2726,7 @@ fn readManySortedByRunFromSnapshot(
     l0_groups: []const RunGroup,
     levels: []const RunLevel,
     allocator: Allocator,
-    held_blocks: ?*std.ArrayListUnmanaged(cache_mod.Handle),
+    held_blocks: ?*std.ArrayListUnmanaged(BlockPin),
     held_values: *std.ArrayListUnmanaged([]u8),
     namespace: backend_types.Namespace,
     keys: []const []const u8,
@@ -2706,7 +2734,7 @@ fn readManySortedByRunFromSnapshot(
     backend_locked: bool,
 ) !BatchCursorReadResult {
     @memset(values, null);
-    var local_held_blocks = std.ArrayListUnmanaged(cache_mod.Handle).empty;
+    var local_held_blocks = std.ArrayListUnmanaged(BlockPin).empty;
     defer if (held_blocks == null) releaseHeldBlocks(&local_held_blocks, backend.allocator);
     const block_handles = held_blocks orelse &local_held_blocks;
 
@@ -2754,7 +2782,7 @@ fn readManyCurrentPointLocked(
     backend: *BackendType,
     namespace: backend_types.Namespace,
     allocator: Allocator,
-    held_blocks: ?*std.ArrayListUnmanaged(cache_mod.Handle),
+    held_blocks: ?*std.ArrayListUnmanaged(BlockPin),
     held_values: *std.ArrayListUnmanaged([]u8),
     keys: []const []const u8,
     values: []?[]const u8,
@@ -2784,7 +2812,7 @@ fn getCurrentPointRetainedLocked(
     backend: *BackendType,
     namespace: backend_types.Namespace,
     allocator: Allocator,
-    held_blocks: ?*std.ArrayListUnmanaged(cache_mod.Handle),
+    held_blocks: ?*std.ArrayListUnmanaged(BlockPin),
     held_values: *std.ArrayListUnmanaged([]u8),
     key: []const u8,
 ) !?[]const u8 {
@@ -2863,7 +2891,7 @@ fn getFromRunPointRetainedLocked(
     backend: anytype,
     run: *Run,
     run_index: usize,
-    held_blocks: ?*std.ArrayListUnmanaged(cache_mod.Handle),
+    held_blocks: ?*std.ArrayListUnmanaged(BlockPin),
     held_values: *std.ArrayListUnmanaged([]u8),
     value_allocator: Allocator,
     namespace: backend_types.Namespace,
@@ -2915,7 +2943,7 @@ fn getOwnedDirectoryPoint(
     namespace: backend_types.Namespace,
     key: []const u8,
 ) ![]const u8 {
-    var blocks: std.ArrayListUnmanaged(cache_mod.Handle) = .empty;
+    var blocks: std.ArrayListUnmanaged(BlockPin) = .empty;
     defer releaseHeldBlocks(&blocks, backend.allocator);
     var hint: ?BorrowedReadHint = null;
     const first_owned = held_values.items.len;
@@ -2928,7 +2956,7 @@ fn readManyCurrentSortedPointByRunLocked(
     backend: *BackendType,
     namespace: backend_types.Namespace,
     allocator: Allocator,
-    held_blocks: ?*std.ArrayListUnmanaged(cache_mod.Handle),
+    held_blocks: ?*std.ArrayListUnmanaged(BlockPin),
     held_values: *std.ArrayListUnmanaged([]u8),
     keys: []const []const u8,
     values: []?[]const u8,
@@ -2983,7 +3011,7 @@ fn readManyCurrentSortedPointByRunLocked(
         }
     }
 
-    var local_held_blocks = std.ArrayListUnmanaged(cache_mod.Handle).empty;
+    var local_held_blocks = std.ArrayListUnmanaged(BlockPin).empty;
     defer if (held_blocks == null) releaseHeldBlocks(&local_held_blocks, backend.allocator);
     const block_handles = held_blocks orelse &local_held_blocks;
     var batch_indexes = RunBatchIndexHandles{ .allocator = metadata_allocator };
@@ -3370,7 +3398,7 @@ fn readManySortedCurrentWithLayoutLocked(
     layout: *const CurrentReadLayout(BackendType),
     namespace: backend_types.Namespace,
     allocator: Allocator,
-    held_blocks: ?*std.ArrayListUnmanaged(cache_mod.Handle),
+    held_blocks: ?*std.ArrayListUnmanaged(BlockPin),
     held_values: *std.ArrayListUnmanaged([]u8),
     keys: []const []const u8,
     values: []?[]const u8,
@@ -3431,7 +3459,7 @@ fn readManySortedCurrentLocked(
     backend: *BackendType,
     namespace: backend_types.Namespace,
     allocator: Allocator,
-    held_blocks: ?*std.ArrayListUnmanaged(cache_mod.Handle),
+    held_blocks: ?*std.ArrayListUnmanaged(BlockPin),
     held_values: *std.ArrayListUnmanaged([]u8),
     keys: []const []const u8,
     values: []?[]const u8,
@@ -3458,13 +3486,13 @@ pub fn BoundReadTxn(comptime BackendType: type) type {
         levels: []RunLevel = &.{},
         last_l0_group_index: ?usize = null,
         read_hint: ?BorrowedReadHint = null,
-        held_blocks: std.ArrayListUnmanaged(cache_mod.Handle) = .empty,
+        held_blocks: std.ArrayListUnmanaged(BlockPin) = .empty,
         held_values: std.ArrayListUnmanaged([]u8) = .empty,
 
         pub const ReadScope = struct {
             parent: *BoundReadTxn(BackendType),
             allocator: Allocator,
-            held_blocks: std.ArrayListUnmanaged(cache_mod.Handle) = .empty,
+            held_blocks: std.ArrayListUnmanaged(BlockPin) = .empty,
             held_values: std.ArrayListUnmanaged([]u8) = .empty,
             read_hint: ?BorrowedReadHint = null,
             last_l0_group_index: ?usize = null,
@@ -3491,7 +3519,7 @@ pub fn BoundReadTxn(comptime BackendType: type) type {
             pub fn reset(self: *@This()) void {
                 for (self.held_blocks.items) |*handle| handle.release();
                 for (self.held_values.items) |value| self.allocator.free(value);
-                if (self.held_blocks.capacity * @sizeOf(cache_mod.Handle) > 64 * 1024) {
+                if (self.held_blocks.capacity * @sizeOf(BlockPin) > 64 * 1024) {
                     self.held_blocks.deinit(self.parent.backend.allocator);
                     self.held_blocks = .empty;
                 } else self.held_blocks.clearRetainingCapacity();
@@ -3751,7 +3779,7 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
         levels: []RunLevel = &.{},
         last_l0_group_index: ?usize = null,
         read_hint: ?BorrowedReadHint = null,
-        held_blocks: std.ArrayListUnmanaged(cache_mod.Handle) = .empty,
+        held_blocks: std.ArrayListUnmanaged(BlockPin) = .empty,
         held_values: std.ArrayListUnmanaged([]u8) = .empty,
 
         pub fn open(backend: *BackendType, namespace: backend_types.Namespace) !@This() {
@@ -4857,7 +4885,7 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
                     break :blk try CurrentReadLayout(BackendType).init(self.backend, self.allocator);
                 };
                 defer layout.deinitAfterUnlockedRead();
-                var blocks = std.ArrayListUnmanaged(cache_mod.Handle).empty;
+                var blocks = std.ArrayListUnmanaged(BlockPin).empty;
                 defer releaseHeldBlocks(&blocks, self.backend.allocator);
                 var values = std.ArrayListUnmanaged([]u8).empty;
                 defer {
@@ -5165,7 +5193,7 @@ pub fn NamespaceReadTxn(comptime BackendType: type) type {
         levels: []RunLevel = &.{},
         last_l0_group_index: ?usize = null,
         read_hint: ?BorrowedReadHint = null,
-        held_blocks: std.ArrayListUnmanaged(cache_mod.Handle) = .empty,
+        held_blocks: std.ArrayListUnmanaged(BlockPin) = .empty,
         held_values: std.ArrayListUnmanaged([]u8) = .empty,
 
         pub fn open(backend: *BackendType) !@This() {
@@ -5299,7 +5327,7 @@ fn getFromDirectoryPoint(
     directory: *const @import("run_directory.zig").Directory,
     immutable_memtables: []const *const State,
     read_hint: *?BorrowedReadHint,
-    held_blocks: *std.ArrayListUnmanaged(cache_mod.Handle),
+    held_blocks: *std.ArrayListUnmanaged(BlockPin),
     held_values: *std.ArrayListUnmanaged([]u8),
     value_allocator: Allocator,
     namespace: backend_types.Namespace,
@@ -5330,7 +5358,7 @@ fn getFromDirectoryPointCandidates(
     backend: anytype,
     directory: *const @import("run_directory.zig").Directory,
     read_hint: *?BorrowedReadHint,
-    held_blocks: *std.ArrayListUnmanaged(cache_mod.Handle),
+    held_blocks: *std.ArrayListUnmanaged(BlockPin),
     held_values: *std.ArrayListUnmanaged([]u8),
     scratch: Allocator,
     value_allocator: Allocator,
@@ -5387,7 +5415,7 @@ fn getFromReadView(
     view: RunReadView,
     last_l0_group_index: *?usize,
     read_hint: *?BorrowedReadHint,
-    held_blocks: *std.ArrayListUnmanaged(cache_mod.Handle),
+    held_blocks: *std.ArrayListUnmanaged(BlockPin),
     held_values: *std.ArrayListUnmanaged([]u8),
     allocator: Allocator,
     namespace: backend_types.Namespace,
@@ -5411,7 +5439,7 @@ fn readManySortedFromReadView(
     immutable_memtables: []const *const State,
     view: RunReadView,
     allocator: Allocator,
-    held_blocks: *std.ArrayListUnmanaged(cache_mod.Handle),
+    held_blocks: *std.ArrayListUnmanaged(BlockPin),
     held_values: *std.ArrayListUnmanaged([]u8),
     namespace: backend_types.Namespace,
     keys: []const []const u8,
@@ -5439,7 +5467,7 @@ fn readManySortedDirectoryBatch(
     immutable_memtables: []const *const State,
     directory: *const @import("run_directory.zig").Directory,
     allocator: Allocator,
-    held_blocks: ?*std.ArrayListUnmanaged(cache_mod.Handle),
+    held_blocks: ?*std.ArrayListUnmanaged(BlockPin),
     held_values: *std.ArrayListUnmanaged([]u8),
     namespace: backend_types.Namespace,
     keys: []const []const u8,
@@ -5467,7 +5495,7 @@ fn readManySortedDirectoryCandidates(
     directory: *const @import("run_directory.zig").Directory,
     scratch: Allocator,
     allocator: Allocator,
-    held_blocks: ?*std.ArrayListUnmanaged(cache_mod.Handle),
+    held_blocks: ?*std.ArrayListUnmanaged(BlockPin),
     held_values: *std.ArrayListUnmanaged([]u8),
     namespace: backend_types.Namespace,
     keys: []const []const u8,
@@ -5511,7 +5539,7 @@ fn getFromSnapshotRuns(
     levels: []const RunLevel,
     last_l0_group_index: *?usize,
     read_hint: *?BorrowedReadHint,
-    held_blocks: *std.ArrayListUnmanaged(cache_mod.Handle),
+    held_blocks: *std.ArrayListUnmanaged(BlockPin),
     held_values: *std.ArrayListUnmanaged([]u8),
     value_allocator: Allocator,
     namespace: backend_types.Namespace,
@@ -5840,7 +5868,7 @@ fn readPointRunCandidate(
     runs: []Run,
     candidate: PointRunCandidate,
     read_hint: *?BorrowedReadHint,
-    held_blocks: *std.ArrayListUnmanaged(cache_mod.Handle),
+    held_blocks: *std.ArrayListUnmanaged(BlockPin),
     held_values: *std.ArrayListUnmanaged([]u8),
     value_allocator: Allocator,
     namespace: backend_types.Namespace,
@@ -5875,7 +5903,7 @@ fn getFromPathRunIndicesPrechecked(
     runs: []Run,
     run_indices: []const usize,
     read_hint: *?BorrowedReadHint,
-    held_blocks: *std.ArrayListUnmanaged(cache_mod.Handle),
+    held_blocks: *std.ArrayListUnmanaged(BlockPin),
     held_values: *std.ArrayListUnmanaged([]u8),
     value_allocator: Allocator,
     namespace: backend_types.Namespace,
@@ -5955,7 +5983,7 @@ fn readPointRunCandidateWithStats(
     runs: []Run,
     candidate: PointRunCandidate,
     read_hint: *?BorrowedReadHint,
-    held_blocks: *std.ArrayListUnmanaged(cache_mod.Handle),
+    held_blocks: *std.ArrayListUnmanaged(BlockPin),
     held_values: *std.ArrayListUnmanaged([]u8),
     value_allocator: Allocator,
     namespace: backend_types.Namespace,
@@ -6494,7 +6522,7 @@ fn getFromRunIndices(
     runs: []Run,
     run_indices: []const usize,
     read_hint: *?BorrowedReadHint,
-    held_blocks: *std.ArrayListUnmanaged(cache_mod.Handle),
+    held_blocks: *std.ArrayListUnmanaged(BlockPin),
     held_values: *std.ArrayListUnmanaged([]u8),
     value_allocator: Allocator,
     namespace: backend_types.Namespace,
@@ -6737,7 +6765,7 @@ fn getFromRunWithBlockCache(
     run: *Run,
     run_index: usize,
     read_hint: *?BorrowedReadHint,
-    held_blocks: *std.ArrayListUnmanaged(cache_mod.Handle),
+    held_blocks: *std.ArrayListUnmanaged(BlockPin),
     held_values: *std.ArrayListUnmanaged([]u8),
     value_allocator: Allocator,
     namespace: backend_types.Namespace,
@@ -6756,7 +6784,7 @@ fn getFromRunWithBlockCacheBatch(
     run: *Run,
     run_index: usize,
     read_hint: *?BorrowedReadHint,
-    held_blocks: *std.ArrayListUnmanaged(cache_mod.Handle),
+    held_blocks: *std.ArrayListUnmanaged(BlockPin),
     held_values: *std.ArrayListUnmanaged([]u8),
     value_allocator: Allocator,
     namespace: backend_types.Namespace,
@@ -6776,7 +6804,7 @@ fn getFromRunWithBlockCacheIndex(
     run_index: usize,
     index: *const lsm_table_file.TableIndex,
     read_hint: *?BorrowedReadHint,
-    held_blocks: *std.ArrayListUnmanaged(cache_mod.Handle),
+    held_blocks: *std.ArrayListUnmanaged(BlockPin),
     held_values: *std.ArrayListUnmanaged([]u8),
     value_allocator: Allocator,
     namespace: backend_types.Namespace,
@@ -6797,7 +6825,7 @@ fn getFromRunWithBlockCacheIndex(
     var pinned = located orelse return null;
     errdefer if (pinned.handle) |*handle| handle.release();
     if (pinned.handle) |handle| {
-        try held_blocks.append(backend.allocator, handle);
+        try held_blocks.append(backend.allocator, .{ .cached = handle });
     }
     return .{
         .entry_index = pinned.entry_index,
@@ -6811,7 +6839,7 @@ fn getFromRunWithBlockCacheBatchState(
     run_index: usize,
     state: *RunBatchIndexState,
     read_hint: *?BorrowedReadHint,
-    held_blocks: *std.ArrayListUnmanaged(cache_mod.Handle),
+    held_blocks: *std.ArrayListUnmanaged(BlockPin),
     held_values: *std.ArrayListUnmanaged([]u8),
     value_allocator: Allocator,
     namespace: backend_types.Namespace,
@@ -7039,7 +7067,7 @@ fn loadBatchBlock(
     run: *Run,
     index: *const lsm_table_file.TableIndex,
     state: *RunBatchIndexState,
-    held_blocks: *std.ArrayListUnmanaged(cache_mod.Handle),
+    held_blocks: *std.ArrayListUnmanaged(BlockPin),
     block_index: usize,
     retain_block: bool,
 ) ![]const u8 {
@@ -7058,7 +7086,7 @@ fn findExactEntryInBatchBlocks(
     run: *Run,
     index: *const lsm_table_file.TableIndex,
     state: *RunBatchIndexState,
-    held_blocks: *std.ArrayListUnmanaged(cache_mod.Handle),
+    held_blocks: *std.ArrayListUnmanaged(BlockPin),
     held_values: *std.ArrayListUnmanaged([]u8),
     value_allocator: Allocator,
     namespace: backend_types.Namespace,
@@ -7119,10 +7147,13 @@ fn visibleEntryFromRunIndices(
         if (run.path != null) {
             const loaded = try loadVisibleEntryFromPathRunMaybeLocked(backend, run, namespace, key, backend_locked) orelse continue;
             if (loaded.entry.tombstone) {
-                backend.allocator.free(loaded.bytes);
+                loaded.deinit(backend.allocator);
                 return .tombstone;
             }
-            visible_entry_bytes.setOwned(backend.allocator, loaded.bytes);
+            if (loaded.local) |lease| {
+                visible_entry_bytes.release();
+                visible_entry_bytes.* = .{ .local = lease };
+            } else visible_entry_bytes.setOwned(backend.allocator, loaded.bytes);
             return .{ .value = .{
                 .key = loaded.entry.key,
                 .value = loaded.entry.value,
@@ -7221,7 +7252,11 @@ fn indexForRunNoCacheMaybeLocked(backend: anytype, run: *Run, backend_locked: bo
 
 const OwnedTableEntry = struct {
     entry: lsm_table_file.Entry,
-    bytes: []u8,
+    bytes: []u8 = &.{},
+    local: ?*SharedBytes = null,
+    fn deinit(self: @This(), allocator: Allocator) void {
+        if (self.local) |lease| lease.release() else allocator.free(self.bytes);
+    }
 };
 
 // Point-result ownership needs the selected row, never a duplicate of the
@@ -7243,9 +7278,12 @@ fn copyTableEntry(allocator: Allocator, entry: lsm_table_file.Entry) !OwnedTable
 
 fn findExactEntryInLocalLease(backend: anytype, run: *Run, index: *const lsm_table_file.TableIndex, window: lsm_table_file.EntryDataWindow, block_index: usize, namespace: backend_types.Namespace, key: []const u8, locked: bool) !?OwnedTableEntry {
     const lease = try loadLocalBlockLease(backend, run, index, window, locked);
-    defer lease.release();
-    const positioned = try lsm_table_file.findExactEntryInBlock(index, lease.bytes, block_index, namespace.name, key) orelse return null;
-    return try copyTableEntry(backend.allocator, positioned.entry);
+    errdefer lease.release();
+    const positioned = try lsm_table_file.findExactEntryInBlock(index, lease.bytes, block_index, namespace.name, key) orelse {
+        lease.release();
+        return null;
+    };
+    return .{ .entry = positioned.entry, .local = lease };
 }
 
 fn findExactEntryWithLocalIndex(
@@ -7595,14 +7633,14 @@ fn getFromRunWithLocalIndex(
 ) !?[]const u8 {
     const loaded = try findExactEntryWithLocalIndexMaybeLocked(backend, run, namespace, key, backend_locked) orelse return null;
     var transferred = false;
-    defer if (!transferred) backend.allocator.free(loaded.bytes);
+    defer if (!transferred) loaded.deinit(backend.allocator);
     if (loaded.entry.tombstone) return error.NotFound;
 
     // Wide values dominate their block. Transfer the decoded allocation when
     // its owner matches rather than copying the row out and immediately
     // freeing it. Small metadata gets keep their compact value-only buffer;
     // retained amplification is at most 2x for this transfer path.
-    if (loaded.entry.value.len >= 4096 and loaded.entry.value.len >= loaded.bytes.len / 2 and
+    if (loaded.local == null and loaded.entry.value.len >= 4096 and loaded.entry.value.len >= loaded.bytes.len / 2 and
         value_allocator.ptr == backend.allocator.ptr and value_allocator.vtable == backend.allocator.vtable)
     {
         try held_values.append(value_allocator, loaded.bytes);

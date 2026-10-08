@@ -2258,11 +2258,19 @@ test "lite lsm artifact sources reuse navigation without checkpoint pins and sur
     }
     try std.testing.expectEqual(@as(usize, 1), backend.run_sources.items.len);
     try std.testing.expectEqual(@as(u64, 0), (try docs.reclamationStatus()).retained_readers);
+    const old_use = backend.retainCachedRunSource("/runs/one").?;
+    var old_use_open = true;
+    defer if (old_use_open) old_use.release();
     try storage.writeFileAbsolute("/runs/one", "replacement run");
     _ = try docs.vacuum();
     const old = try backend.readRunRangeAlloc(a, "/runs/one", 0, 9);
     defer a.free(old);
     try std.testing.expectEqualStrings("immutable", old);
+    old_use.release();
+    old_use_open = false;
+    const reopened = try backend.readRunRangeAlloc(a, "/runs/one", 0, 11);
+    defer a.free(reopened);
+    try std.testing.expectEqualStrings("replacement", reopened);
     var pinned: [24]?*@import("../lsm_backend/source_lease.zig").Lease = @splat(null);
     defer for (&pinned) |*lease| if (lease.*) |owned| {
         owned.release();
@@ -2337,4 +2345,82 @@ test "lite lsm merge cursor retains active run sources and trims idle leases on 
     cursor_open = false;
     try std.testing.expect(backend.run_sources.items.len <= 16);
     try std.testing.expectEqualStrings("first", try read.get("a00"));
+}
+
+test "lite lsm idle run source releases retired inode during vacuum" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "review-idle.aflite");
+    defer a.free(path);
+    var docs = try docstore.Store.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io, .reclamation = .{ .enabled = false } });
+    defer docs.close();
+    docs.maintenance_start_suppressed = true;
+    var indexes = Store.init(a, &docs);
+    const storage = indexes.storage();
+    var backend = @import("../lsm_backend.zig").Backend.init(a, .{ .storage = storage });
+    defer backend.close();
+    try storage.writeFileAbsolute("/runs/idle", "unchanged immutable run");
+    const bytes = try backend.readRunRangeAlloc(a, "/runs/idle", 0, 9);
+    a.free(bytes);
+    _ = try docs.vacuum();
+    const status = try docs.reclamationStatus();
+    try std.testing.expectEqual(@as(u64, 0), status.retained_readers);
+    try std.testing.expectEqual(@as(usize, 1), backend.run_sources.items.len);
+    try std.testing.expectEqual(@as(u64, 0), status.retired_file_bytes);
+    try std.testing.expectEqual(@as(u64, 0), docs.artifact_registry.?.testPageReads());
+    const reopened = try backend.readRunRangeAlloc(a, "/runs/idle", 0, 9);
+    defer a.free(reopened);
+    try std.testing.expectEqualStrings("unchanged", reopened);
+    try std.testing.expectEqual(@as(usize, 1), backend.run_sources.items.len);
+}
+
+test "lite lsm concurrent cold reads share one source open" {
+    const Hook = struct {
+        fn read(backend: *@import("../lsm_backend.zig").Backend) anyerror!void {
+            const bytes = try backend.readRunRangeAlloc(std.testing.allocator, "/runs/cold", 0, 9);
+            defer std.testing.allocator.free(bytes);
+            try std.testing.expectEqualStrings("immutable", bytes);
+        }
+    };
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "lsm-cold-flight.aflite");
+    defer a.free(path);
+    var docs = try docstore.Store.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io, .reclamation = .{ .enabled = false } });
+    defer docs.close();
+    docs.maintenance_start_suppressed = true;
+    var indexes = Store.init(a, &docs);
+    try indexes.storage().writeFileAbsolute("/runs/cold", "immutable run");
+    const before = docs.file.activeCheckpoint().commit_sequence;
+    var backend = @import("../lsm_backend.zig").Backend.init(a, .{ .storage = indexes.storage() });
+    defer backend.close();
+    var readers: [16]std.Io.Future(anyerror!void) = undefined;
+    var started: usize = 0;
+    lockStore(&docs);
+    var locked = true;
+    defer {
+        if (locked) docs.mutex.unlock();
+        for (readers[0..started]) |*reader| reader.await(std.testing.io) catch {};
+    }
+    for (&readers) |*reader| {
+        reader.* = try std.testing.io.concurrent(Hook.read, .{&backend});
+        started += 1;
+    }
+    const deadline = std.Io.Clock.awake.now(std.testing.io).addDuration(.fromSeconds(5));
+    while (true) {
+        platform_sync.lockYielding(&backend.run_source_mutex);
+        const joined = backend.run_source_opens.items.len == 1 and backend.run_source_opens.items[0].refs == readers.len;
+        backend.run_source_mutex.unlock();
+        if (joined) break;
+        if (std.Io.Clock.awake.now(std.testing.io).nanoseconds > deadline.nanoseconds) return error.Timeout;
+        try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+    }
+    docs.mutex.unlock();
+    locked = false;
+    for (&readers) |*reader| try reader.await(std.testing.io);
+    try std.testing.expectEqual(before + 1, docs.file.activeCheckpoint().commit_sequence);
+    try std.testing.expectEqual(@as(usize, 1), backend.run_sources.items.len);
+    try std.testing.expectEqual(@as(usize, 0), backend.run_source_opens.items.len);
 }

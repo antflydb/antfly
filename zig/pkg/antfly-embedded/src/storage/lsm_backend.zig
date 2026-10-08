@@ -1406,8 +1406,18 @@ pub const Backend = struct {
         access: u64,
         fn deinit(self: *@This(), a: Allocator) void {
             a.free(self.path);
-            self.lease.release();
+            self.lease.releaseOwner();
         }
+    };
+    const SourceOpen = struct {
+        path: []u8,
+        epoch: u64,
+        refs: usize = 1,
+        io: ?std.Io,
+        done: std.Io.Event = .unset,
+        completed: std.atomic.Value(bool) = .init(false),
+        result: ?*RunSourceLease = null,
+        failure: ?anyerror = null,
     };
     const CachedRunBlock = struct {
         run_id: u64,
@@ -1643,6 +1653,7 @@ pub const Backend = struct {
     run_sources: std.ArrayListUnmanaged(RunSource) = .empty,
     run_source_clock: u64 = 0,
     run_source_epoch: u64 = 0,
+    run_source_opens: std.ArrayListUnmanaged(*SourceOpen) = .empty,
 
     run_table_cache: std.ArrayListUnmanaged(CachedRunTable) = .empty,
     local_cache_access_clock: u64 = 0,
@@ -7149,55 +7160,125 @@ pub const Backend = struct {
         self.run_source_clock +%= 1;
         for (self.run_sources.items) |*cached| if (std.mem.eql(u8, cached.path, path)) {
             cached.access = self.run_source_clock;
-            return cached.lease.retain();
+            return cached.lease.retainOwner();
         };
         return null;
     }
 
-    fn retainRunSource(self: *Backend, path: []const u8) !*RunSourceLease {
-        var epoch: u64 = undefined;
-        {
-            @import("antfly_platform").sync.lockYielding(&self.run_source_mutex);
-            defer self.run_source_mutex.unlock();
-            if (self.findRunSourceAssumeLocked(path)) |lease| return lease;
-            epoch = self.run_source_epoch;
+    fn releaseSourceOpen(self: *Backend, flight: *SourceOpen) void {
+        platform.sync.lockYielding(&self.run_source_mutex);
+        flight.refs -= 1;
+        const last = flight.refs == 0;
+        self.run_source_mutex.unlock();
+        if (last) {
+            if (flight.result) |lease| lease.release();
+            self.allocator.free(flight.path);
+            self.allocator.destroy(flight);
         }
-        // Catalog publication and descriptor I/O must not stall warm sources.
-        // Install under a short lock; a racing winner owns the cached lease.
+    }
+
+    fn openRunSource(self: *Backend, flight: *SourceOpen) !*RunSourceLease {
         const lease = try self.allocator.create(RunSourceLease);
         errdefer self.allocator.destroy(lease);
-        const owned_path = try self.allocator.dupe(u8, path);
-        errdefer self.allocator.free(owned_path);
-        var source = try self.storage.?.openLeasedImmutableSource(self.allocator, path);
+        var source = try self.storage.?.openLeasedImmutableSource(self.allocator, flight.path);
         errdefer source.close();
         lease.* = .{ .allocator = self.allocator, .source = source };
-        @import("antfly_platform").sync.lockYielding(&self.run_source_mutex);
-        if (epoch != self.run_source_epoch) {
+        // Protect the initial read before opting into expiry. Retirement can
+        // race source creation, but can never close a successfully acquired use.
+        if (!source.acquireUse()) return error.SourceExpired;
+        errdefer source.releaseUse();
+        lease.refs.store(2, .monotonic); // cache owner + flight's active use
+        source.enableIdleExpiry();
+        const owned_path = try self.allocator.dupe(u8, flight.path);
+        errdefer self.allocator.free(owned_path);
+        platform.sync.lockYielding(&self.run_source_mutex);
+        if (flight.epoch != self.run_source_epoch) {
             self.run_source_mutex.unlock();
             self.allocator.free(owned_path);
+            lease.releaseOwner();
             return lease;
         }
-        const winner = self.findRunSourceAssumeLocked(path);
-        if (winner != null) {
-            self.run_source_mutex.unlock();
-            self.allocator.free(owned_path);
-            lease.release();
-            return winner.?;
-        }
+        self.run_source_clock +%= 1;
         self.run_sources.append(self.allocator, .{ .path = owned_path, .lease = lease, .access = self.run_source_clock }) catch |err| {
             self.run_source_mutex.unlock();
             return err;
         };
-        const retained = lease.retain();
         self.run_source_mutex.unlock();
         self.trimRunSources();
-        return retained;
+        return lease;
+    }
+
+    fn retainRunSource(self: *Backend, path: []const u8) !*RunSourceLease {
+        while (true) {
+            platform.sync.lockYielding(&self.run_source_mutex);
+            const cached = self.findRunSourceAssumeLocked(path) orelse break;
+            self.run_source_mutex.unlock();
+            if (cached.activateHeld()) return cached;
+            // Keep metadata alive while removing an expired cache owner. No
+            // provider callbacks or descriptor cleanup run under this lock.
+            platform.sync.lockYielding(&self.run_source_mutex);
+            var expired: ?RunSource = null;
+            for (self.run_sources.items, 0..) |entry, i| if (entry.lease == cached) {
+                expired = self.run_sources.orderedRemove(i);
+                break;
+            };
+            self.run_source_mutex.unlock();
+            if (expired) |*removed| removed.deinit(self.allocator);
+            cached.releaseOwner();
+        }
+        // A miss exits the loop holding the cache lock, so joining/creating
+        // an in-flight open is atomic with the last cache lookup.
+        for (self.run_source_opens.items) |flight| if (std.mem.eql(u8, flight.path, path)) {
+            flight.refs += 1;
+            self.run_source_mutex.unlock();
+            defer self.releaseSourceOpen(flight);
+            if (flight.io) |io| flight.done.waitUncancelable(io) else {
+                while (!flight.completed.load(.acquire)) platform_time.yieldBriefly();
+            }
+            if (flight.failure) |err| return err;
+            return flight.result.?.retain().?;
+        };
+        const flight = self.allocator.create(SourceOpen) catch |err| {
+            self.run_source_mutex.unlock();
+            return err;
+        };
+        const owned_path = self.allocator.dupe(u8, path) catch |err| {
+            self.allocator.destroy(flight);
+            self.run_source_mutex.unlock();
+            return err;
+        };
+        flight.* = .{ .path = owned_path, .epoch = self.run_source_epoch, .io = self.manifestCoordinationIo() };
+        self.run_source_opens.append(self.allocator, flight) catch |err| {
+            self.allocator.free(owned_path);
+            self.allocator.destroy(flight);
+            self.run_source_mutex.unlock();
+            return err;
+        };
+        self.run_source_mutex.unlock();
+        defer self.releaseSourceOpen(flight);
+        const opened = self.openRunSource(flight);
+        platform.sync.lockYielding(&self.run_source_mutex);
+        if (opened) |lease| flight.result = lease else |err| flight.failure = err;
+        for (self.run_source_opens.items, 0..) |pending, i| if (pending == flight) {
+            _ = self.run_source_opens.swapRemove(i);
+            break;
+        };
+        flight.completed.store(true, .release);
+        if (flight.io) |io| flight.done.set(io);
+        self.run_source_mutex.unlock();
+        if (flight.failure) |err| return err;
+        return flight.result.?.retain().?;
     }
 
     pub fn retainCachedRunSource(self: *Backend, path: []const u8) ?*RunSourceLease {
-        @import("antfly_platform").sync.lockYielding(&self.run_source_mutex);
-        defer self.run_source_mutex.unlock();
-        return self.findRunSourceAssumeLocked(path);
+        platform.sync.lockYielding(&self.run_source_mutex);
+        const lease = self.findRunSourceAssumeLocked(path);
+        self.run_source_mutex.unlock();
+        if (lease) |held| {
+            if (held.activateHeld()) return held;
+            held.releaseOwner();
+        }
+        return null;
     }
 
     // Active cursors retain one lease per run. Only idle entries compete for
@@ -7227,6 +7308,8 @@ pub const Backend = struct {
     pub fn deinitRunSources(self: *Backend) void {
         for (self.run_sources.items) |*cached| cached.deinit(self.allocator);
         self.run_sources.deinit(self.allocator);
+        std.debug.assert(self.run_source_opens.items.len == 0);
+        self.run_source_opens.deinit(self.allocator);
     }
 
     pub fn putCachedRunBlock(
@@ -8625,12 +8708,13 @@ pub const Backend = struct {
     fn evictLocalCachesForRun(self: *Backend, path: []const u8, run_id: u64) void {
         @import("antfly_platform").sync.lockYielding(&self.run_source_mutex);
         self.run_source_epoch +%= 1;
+        var retired_source: ?RunSource = null;
         for (self.run_sources.items, 0..) |source, i| if (std.mem.eql(u8, source.path, path)) {
-            var removed = self.run_sources.orderedRemove(i);
-            removed.deinit(self.allocator);
+            retired_source = self.run_sources.orderedRemove(i);
             break;
         };
         self.run_source_mutex.unlock();
+        if (retired_source) |*removed| removed.deinit(self.allocator);
         self.evictCachedRunStateForRun(path, run_id);
         self.evictCachedRunIndexForRun(path, run_id);
         self.evictCachedRunBlocksForRun(path, run_id);
@@ -25366,4 +25450,175 @@ test "lsm local decoded block borrowing survives eviction and performs no warm a
     try std.testing.expectEqualStrings("data", pinned.bytes[0..4]);
     budget.limit = std.math.maxInt(usize);
     std.debug.print("lite local block probe: 4096 warm hits, reference payload allocation=134217728 bytes/4096 calls, borrowed payload allocation=0 bytes/0 calls\n", .{});
+}
+
+test "lsm local source eviction closes outside warm source lock" {
+    const Hook = struct {
+        var entered: std.Io.Event = .unset;
+        var release: std.Io.Event = .unset;
+        var done: std.Io.Event = .unset;
+        fn read(_: *anyopaque, _: u64, _: []u8) !void {}
+        fn close(_: *anyopaque) void {
+            entered.set(std.testing.io);
+            release.waitUncancelable(std.testing.io);
+        }
+        fn evict(backend: *Backend) void {
+            backend.evictLocalCachesForRun("/old", 1);
+        }
+        fn warm(backend: *Backend) void {
+            defer done.set(std.testing.io);
+            if (backend.retainCachedRunSource("/warm")) |lease| lease.release();
+        }
+    };
+    const a = std.testing.allocator;
+    var backend = Backend.init(a, .{});
+    defer backend.close();
+    var context: u8 = 0;
+    const old = try a.create(RunSourceLease);
+    old.* = .{ .allocator = a, .source = .{ .ranges = .{ .ptr = &context, .length = 0, .read_into = Hook.read, .close = Hook.close } } };
+    try backend.run_sources.append(a, .{ .path = try a.dupe(u8, "/old"), .lease = old, .access = 0 });
+    const warm = try a.create(RunSourceLease);
+    warm.* = .{ .allocator = a, .source = .{ .contiguous = "" } };
+    try backend.run_sources.append(a, .{ .path = try a.dupe(u8, "/warm"), .lease = warm, .access = 1 });
+    Hook.entered.reset();
+    Hook.release.reset();
+    Hook.done.reset();
+    var eviction = try std.testing.io.concurrent(Hook.evict, .{&backend});
+    defer {
+        Hook.release.set(std.testing.io);
+        eviction.await(std.testing.io);
+    }
+    try Hook.entered.waitTimeout(std.testing.io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+    var reader = try std.testing.io.concurrent(Hook.warm, .{&backend});
+    const progress = Hook.done.waitTimeout(std.testing.io, .{ .duration = .{ .raw = .fromMilliseconds(200), .clock = .awake } });
+    Hook.release.set(std.testing.io);
+    reader.await(std.testing.io);
+    eviction.await(std.testing.io);
+    try progress;
+}
+
+test "lsm local point reads allocate only returned value and batch results retain local blocks" {
+    const a = std.testing.allocator;
+    var backing = storage_io.MemoryStorage.init(a);
+    defer backing.deinit();
+    var backend_budget = @import("lite/test_allocator.zig").BudgetAllocator{ .backing = a };
+    var backend = try Backend.open(backend_budget.allocator(), "/local-result-lifetimes", .{ .storage = backing.storage(), .flush_threshold = 1, .table_block_compression = .none });
+    defer backend.close();
+    var runtime = try backend.runtimeStore(a, .{ .name = "docs" });
+    defer runtime.deinit();
+    var write = try runtime.beginWrite();
+    try write.put("key:00", "value");
+    try write.put("key:01", "other");
+    try write.commit();
+    var read = try runtime_mod.BoundReadTxn(Backend).open(&backend, .{ .name = "docs" });
+    defer read.abort();
+    var result_budget = @import("lite/test_allocator.zig").BudgetAllocator{ .backing = a };
+    var point = try read.openReadScope(result_budget.allocator());
+    defer point.close();
+    try std.testing.expectEqualStrings("value", try point.get("key:00"));
+    const calls = backend_budget.alloc_calls;
+    const result_calls = result_budget.alloc_calls;
+    const result_live = result_budget.live;
+    backend_budget.limit = backend_budget.live;
+    defer backend_budget.limit = std.math.maxInt(usize);
+    try std.testing.expectEqualStrings("other", try point.get("key:01"));
+    try std.testing.expectEqual(calls, backend_budget.alloc_calls);
+    try std.testing.expectEqual(result_calls + 1, result_budget.alloc_calls);
+    try std.testing.expectEqual(result_live + 5, result_budget.live);
+    backend_budget.limit = std.math.maxInt(usize);
+    var batch = try read.openReadScope(a);
+    defer batch.close();
+    const keys = [_][]const u8{ "key:00", "key:01" };
+    var values: [2]?[]const u8 = undefined;
+    const copies = backend.read_stats.cursor_value_copies.load(.monotonic);
+    try batch.getManySorted(&keys, &values);
+    try std.testing.expectEqual(@as(usize, 0), batch.held_values.items.len);
+    try std.testing.expectEqual(@as(usize, 1), batch.held_blocks.items.len);
+    try std.testing.expectEqual(copies, backend.read_stats.cursor_value_copies.load(.monotonic));
+    while (backend.run_block_cache.items.len != 0) {
+        const cached = backend.run_block_cache.items[0];
+        backend.evictCachedRunBlocksForRun(cached.path, cached.run_id);
+    }
+    try std.testing.expectEqualStrings("value", values[0].?);
+    try std.testing.expectEqualStrings("other", values[1].?);
+    std.debug.print("lite local result probe: warm point = 1 value allocation/5 bytes, zero backend allocations; batch = 1 block pin/2 values, zero value copies\n", .{});
+}
+
+test "lsm local cold source open releases every partial allocation" {
+    const Fixture = struct {
+        fn open(_: *anyopaque, _: Allocator, _: []const u8) !@import("../segment_source.zig").Source {
+            return .{ .contiguous = "immutable" };
+        }
+        fn run(a: Allocator) !void {
+            var backing = storage_io.MemoryStorage.init(a);
+            defer backing.deinit();
+            var vtable = backing.storage().vtable.*;
+            vtable.open_leased_immutable_source = open;
+            var backend = Backend.init(a, .{ .storage = .{ .ptr = backing.storage().ptr, .vtable = &vtable } });
+            defer backend.close();
+            const bytes = try backend.readRunRangeAlloc(a, "/cold", 0, 9);
+            defer a.free(bytes);
+            try std.testing.expectEqualStrings("immutable", bytes);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
+test "lsm local cold source failure wakes all waiters and allows retry" {
+    const Hook = struct {
+        var entered: std.Io.Event = .unset;
+        var release: std.Io.Event = .unset;
+        var calls: std.atomic.Value(usize) = .init(0);
+        var fail: bool = true;
+        fn open(_: *anyopaque, _: Allocator, _: []const u8) anyerror!@import("../segment_source.zig").Source {
+            _ = calls.fetchAdd(1, .monotonic);
+            entered.set(std.testing.io);
+            release.waitUncancelable(std.testing.io);
+            if (fail) return error.InjectedSourceOpenFailure;
+            return .{ .contiguous = "immutable" };
+        }
+        fn read(backend: *Backend) anyerror!void {
+            try std.testing.expectError(error.InjectedSourceOpenFailure, backend.readRunRangeAlloc(std.testing.allocator, "/cold", 0, 9));
+        }
+    };
+    const a = std.testing.allocator;
+    var backing = storage_io.MemoryStorage.init(a);
+    defer backing.deinit();
+    var vtable = backing.storage().vtable.*;
+    vtable.open_leased_immutable_source = Hook.open;
+    var backend = Backend.init(a, .{ .storage = .{ .ptr = backing.storage().ptr, .vtable = &vtable } });
+    defer backend.close();
+    Hook.entered.reset();
+    Hook.release.reset();
+    Hook.calls.store(0, .monotonic);
+    Hook.fail = true;
+    var readers: [8]std.Io.Future(anyerror!void) = undefined;
+    var started: usize = 0;
+    defer {
+        Hook.release.set(std.testing.io);
+        for (readers[0..started]) |*reader| reader.await(std.testing.io) catch {};
+    }
+    for (&readers) |*reader| {
+        reader.* = try std.testing.io.concurrent(Hook.read, .{&backend});
+        started += 1;
+    }
+    try Hook.entered.waitTimeout(std.testing.io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+    const deadline = std.Io.Clock.awake.now(std.testing.io).addDuration(.fromSeconds(5));
+    while (true) {
+        platform.sync.lockYielding(&backend.run_source_mutex);
+        const joined = backend.run_source_opens.items.len == 1 and backend.run_source_opens.items[0].refs == readers.len;
+        backend.run_source_mutex.unlock();
+        if (joined) break;
+        if (std.Io.Clock.awake.now(std.testing.io).nanoseconds > deadline.nanoseconds) return error.Timeout;
+        try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+    }
+    Hook.release.set(std.testing.io);
+    for (&readers) |*reader| try reader.await(std.testing.io);
+    try std.testing.expectEqual(@as(usize, 1), Hook.calls.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 0), backend.run_source_opens.items.len);
+    Hook.fail = false;
+    const bytes = try backend.readRunRangeAlloc(a, "/cold", 0, 9);
+    defer a.free(bytes);
+    try std.testing.expectEqualStrings("immutable", bytes);
+    try std.testing.expectEqual(@as(usize, 2), Hook.calls.load(.monotonic));
 }
