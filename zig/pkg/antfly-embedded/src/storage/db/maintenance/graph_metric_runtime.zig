@@ -3495,10 +3495,10 @@ test "db graph metric runtime background default publishes pagerank refresh rebu
             .sync_level = .full_index,
         });
         _ = try waitForDefaultMetric(&db, "rank", 0);
-        var refresh = try db.refreshGraphMetric(alloc, "graph_idx", "manual");
+        var refresh = try db.scheduleGraphMetricBuild(alloc, "graph_idx", "manual", false);
         defer refresh.deinit(alloc);
         const publication = try waitForDefaultMetric(&db, "manual", 0);
-        var rebuild = try db.rebuildGraphMetric(alloc, "graph_idx", "manual");
+        var rebuild = try db.scheduleGraphMetricBuild(alloc, "graph_idx", "manual", true);
         defer rebuild.deinit(alloc);
         previous_publication = try waitForDefaultMetric(&db, "manual", publication);
     }
@@ -3508,7 +3508,7 @@ test "db graph metric runtime background default publishes pagerank refresh rebu
         var db = try DB.open(alloc, std.mem.span(path), .{ .graph_metric_maintenance = .{ .start_background_loop = false } });
         defer db.close();
         try std.testing.expect(!db.graph_metric_runtime.?.stats().started);
-        var rebuild = try db.rebuildGraphMetric(alloc, "graph_idx", "manual");
+        var rebuild = try db.scheduleGraphMetricBuild(alloc, "graph_idx", "manual", true);
         defer rebuild.deinit(alloc);
         try std.testing.expect(rebuild.build_queued);
     }
