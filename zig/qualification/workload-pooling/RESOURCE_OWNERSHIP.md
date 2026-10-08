@@ -212,3 +212,19 @@ Shutdown closes the node owner before joining its consumers, while accepted
 durable completion retains an independently valid completion contract. API
 destruction alone must not invalidate a borrowed node owner. These lifetimes and
 the mixed-class schedules need qualification before default enablement.
+
+
+## Qualified per-write socket controls
+
+The isolated socket component borrows original cancellation/deadline controls
+through one output operation without replacing a connection-wide request deadline.
+Native and fallback backpressure tests passed on macOS and pinned Nix/glibc Linux;
+see [the receipts](receipts/2026-10-07/controlled-output-socket/README.md).
+An application cancellation monitor reports the original cause before runtime
+recancel, avoiding a panic when the executing task itself was not cancelled.
+
+HTTP streaming headers/chunks, H2 lock and flow-control waits, and the inference
+output adapter still need this mechanism connected to their original controls.
+Partial frame transmission needs explicit transport retirement. These socket
+receipts do not qualify those integrations, physical scheduler ownership, or
+pooling defaults.

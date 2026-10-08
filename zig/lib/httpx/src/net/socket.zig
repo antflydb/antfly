@@ -18,6 +18,33 @@ const common = @import("../util/common.zig");
 
 const is_windows = builtin.os.tag == .windows;
 
+/// Borrowed original request controls for one output operation. Callbacks may
+/// run on the timeout monitor; they must not checkpoint or park a CPU grant.
+/// The remaining timeout must derive from the original absolute deadline.
+pub const WriteControl = struct {
+    pub const Error = error{ Canceled, Timeout };
+    ptr: ?*anyopaque = null,
+    check_fn: ?*const fn (?*anyopaque) Error!void = null,
+    remaining_ms_fn: ?*const fn (?*anyopaque) Error!?u64 = null,
+
+    pub fn active(self: WriteControl) bool {
+        return self.check_fn != null or self.remaining_ms_fn != null;
+    }
+    pub fn check(self: WriteControl) !void {
+        if (self.check_fn) |check_fn| try check_fn(self.ptr);
+        if (self.remaining_ms_fn) |remaining| if (try remaining(self.ptr)) |ms| if (ms == 0) return error.Timeout;
+    }
+    pub fn timeout(self: WriteControl, configured: ?u64) !?u64 {
+        try self.check();
+        const remaining = if (self.remaining_ms_fn) |remaining| try remaining(self.ptr) else null;
+        if (remaining) |ms| {
+            if (ms == 0) return error.Timeout;
+            return if (configured) |limit| @min(ms, limit) else ms;
+        }
+        return configured;
+    }
+};
+
 const WindowsSocket = if (is_windows) struct {
     extern "ws2_32" fn setsockopt(
         socket: net.Socket.Handle,
@@ -274,19 +301,33 @@ pub const Socket = struct {
 
     /// Sends data, returning the number of bytes written.
     pub fn send(self: *Self, data: []const u8) !usize {
+        return self.sendControlled(data, .{});
+    }
+
+    pub fn sendControlled(self: *Self, data: []const u8, control: WriteControl) !usize {
+        // A per-stream budget must not become a later sibling's native socket
+        // timeout. H2 callers serialize writes with the connection write mutex.
+        defer if (control.active() and self.native_timeouts and !is_windows)
+            self.setNativeTimeout(posix.SO.SNDTIMEO, self.send_timeout_ms orelse 0) catch {};
         const operation_deadline_ms = self.socketOperationDeadline(.send);
         while (true) {
             try self.checkRequestCancellation();
+            try control.check();
             const wait = try self.operationWait(operation_deadline_ms);
             // Abortive cancellation shuts down reads without sending FIN.
             // A blocked native send must also wake to observe cancellation;
             // unlike reads, writes can safely retry after a polling timeout.
-            const poll_cancellation = self.native_timeouts and !is_windows and self.request_cancel_cb != null;
+            const poll_cancellation = self.native_timeouts and !is_windows and (self.request_cancel_cb != null or control.active());
+            const bounded_timeout_ms = try control.timeout(wait.timeout_ms);
             const timeout_ms = if (poll_cancellation)
-                @min(wait.timeout_ms orelse 25, 25)
+                @min(bounded_timeout_ms orelse 25, 25)
             else
-                wait.timeout_ms;
-            const sent = self.netWriteWithTimeout(data, timeout_ms) catch |err| {
+                bounded_timeout_ms;
+            const sent = self.netWriteWithTimeout(data, timeout_ms, control) catch |err| {
+                // A monitor may report application cancellation without the
+                // executing Io task being cancelled. Preserve that original
+                // cause before recancel, which is only valid for runtime IO.
+                try control.check();
                 if (err == error.Canceled) self.io.recancel();
                 try self.checkRequestCancellation();
                 if (err == error.Timeout or err == error.WouldBlock) {
@@ -300,6 +341,7 @@ pub const Socket = struct {
                 return error.SendFailed;
             };
             try self.checkRequestDeadline();
+            try control.check();
             return sent;
         }
     }
@@ -344,6 +386,12 @@ pub const Socket = struct {
         while (sent < data.len) {
             sent += try self.send(data[sent..]);
         }
+    }
+
+    pub fn sendAllControlled(self: *Self, data: []const u8, control: WriteControl) !void {
+        try control.check();
+        var sent: usize = 0;
+        while (sent < data.len) sent += try self.sendControlled(data[sent..], control);
     }
 
     /// Alias for sendAll — provides the `writeAll` interface expected by
@@ -485,20 +533,31 @@ pub const Socket = struct {
         };
     }
 
-    fn netWriteWithTimeout(self: *Self, data: []const u8, timeout_ms: ?u64) !usize {
+    fn writeControlTimer(io: Io, timeout_ms: ?u64, control: WriteControl) !void {
+        if (!control.active()) return timeoutTask(io, timeout_ms.?);
+        const deadline: ?i128 = if (timeout_ms) |ms| Io.Clock.awake.now(io).nanoseconds + @as(i128, ms) * std.time.ns_per_ms else null;
+        while (true) {
+            try control.check();
+            const remaining = if (deadline) |fence| fence - Io.Clock.awake.now(io).nanoseconds else 25 * std.time.ns_per_ms;
+            if (remaining <= 0) return;
+            try io.sleep(.fromNanoseconds(@intCast(@min(remaining, 25 * std.time.ns_per_ms))), .awake);
+        }
+    }
+
+    fn netWriteWithTimeout(self: *Self, data: []const u8, timeout_ms: ?u64, control: WriteControl) !usize {
         if (self.native_timeouts and !is_windows) {
             if (timeout_ms) |timeout| try self.setNativeTimeout(posix.SO.SNDTIMEO, timeout);
             return sendPosixOnce(self.handle, data);
         }
-        const timeout = timeout_ms orelse return self.netWrite(data);
+        if (timeout_ms == null and !control.active()) return self.netWrite(data);
         const Outcome = union(enum) {
             operation: void,
-            timer: Io.Cancelable!void,
+            timer: anyerror!void,
         };
         var operation_result: net.Stream.Writer.Error!usize = undefined;
         var outcomes: [2]Outcome = undefined;
         var select = Io.Select(Outcome).init(self.io, &outcomes);
-        try select.concurrent(.timer, timeoutTask, .{ self.io, timeout });
+        try select.concurrent(.timer, writeControlTimer, .{ self.io, timeout_ms, control });
         select.concurrent(.operation, netWriteTask, .{ self, data, &operation_result }) catch |err| {
             select.cancelDiscard();
             return err;
@@ -2000,4 +2059,85 @@ test "ChunkedBodyReader preserves truncation versus invalid framing at every pha
     const n = try chunked.reader_iface.readSliceShort(&output);
     try std.testing.expectEqualStrings("hello", output[0..n]);
     try chunked.checkReadError();
+}
+
+const ControlledWriteTest = struct {
+    io: Io,
+    deadline_ms: ?i64 = null,
+    canceled: std.atomic.Value(bool) = .init(false),
+    fn check(raw: ?*anyopaque) WriteControl.Error!void {
+        const self: *@This() = @ptrCast(@alignCast(raw.?));
+        if (self.canceled.load(.acquire)) return error.Canceled;
+        if (self.deadline_ms) |deadline| if (common.milliTimestamp(self.io) >= deadline) return error.Timeout;
+    }
+    fn remaining(raw: ?*anyopaque) WriteControl.Error!?u64 {
+        const self: *@This() = @ptrCast(@alignCast(raw.?));
+        try check(raw);
+        const deadline = self.deadline_ms orelse return null;
+        return @intCast(@max(0, deadline - common.milliTimestamp(self.io)));
+    }
+    fn control(self: *@This()) WriteControl {
+        return .{ .ptr = self, .check_fn = check, .remaining_ms_fn = remaining };
+    }
+    fn blocked(socket: *Socket, payload: []const u8, control_value: WriteControl) !void {
+        // TCP can accept more bytes after the initial fill as ACKs arrive.
+        // Keep one absolute control across every write until it actually stalls.
+        for (0..1024) |_| try socket.sendAllControlled(payload, control_value);
+        return error.FixtureBufferDidNotFill;
+    }
+    fn run(comptime fallback: bool, comptime cancel: bool) !void {
+        if (is_windows) return error.SkipZigTest;
+        if (fallback and builtin.os.tag != .linux) return error.SkipZigTest;
+        var lane = Io.Threaded.init(std.testing.allocator, .{ .async_limit = .nothing, .concurrent_limit = .limited(4) });
+        defer lane.deinit();
+        const io = lane.io();
+        var listener = try TcpListener.init(.{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } }, io);
+        defer listener.deinit();
+        var sender = try Socket.connect(listener.getLocalAddress(), io);
+        defer sender.close();
+        var accepted = try listener.accept();
+        defer accepted.socket.close();
+        const buffer_size: u32 = 4096;
+        try Socket.setSocketOption(sender.handle, posix.SOL.SOCKET, posix.SO.SNDBUF, std.mem.asBytes(&buffer_size));
+        try Socket.setSocketOption(accepted.socket.handle, posix.SOL.SOCKET, posix.SO.RCVBUF, std.mem.asBytes(&buffer_size));
+        sender.enableNativeTimeouts();
+        try sender.setSendTimeout(5);
+        try TimedFallbackTest.fill(sender.handle);
+        try sender.setSendTimeout(0);
+        sender.native_timeouts = !fallback;
+        sender.setRequestDeadline(common.milliTimestamp(io) + 10_000);
+        const original_socket_deadline = sender.request_deadline_ms;
+        var request = ControlledWriteTest{ .io = io, .deadline_ms = if (cancel) null else common.milliTimestamp(io) + 300 };
+        if (!cancel) try io.sleep(.fromMilliseconds(50), .awake);
+        var canceler: ?Io.Future(void) = if (cancel) try io.concurrent(struct {
+            fn run(active_io: Io, flag: *std.atomic.Value(bool)) void {
+                active_io.sleep(.fromMilliseconds(50), .awake) catch {};
+                flag.store(true, .release);
+            }
+        }.run, .{ io, &request.canceled }) else null;
+        defer if (canceler) |*task| task.cancel(io);
+        var payload: [128 * 1024]u8 = @splat(0xa5);
+        const start = common.milliTimestamp(io);
+        try std.testing.expectError(if (cancel) error.Canceled else error.Timeout, blocked(&sender, &payload, request.control()));
+        const elapsed = common.milliTimestamp(io) - start;
+        std.debug.print("CONTROLLED_WRITE backend={s} cause={s} elapsed_ms={d}\n", .{ if (fallback) "fallback" else "native", if (cancel) "canceled" else "deadline", elapsed });
+        try std.testing.expect(elapsed < 1000);
+        try std.testing.expectEqual(original_socket_deadline, sender.request_deadline_ms);
+        if (!cancel) try std.testing.expect(common.milliTimestamp(io) >= request.deadline_ms.?);
+        try std.testing.expectEqual(@as(?u64, null), sender.send_timeout_ms);
+        if (canceler) |*task| task.await(io);
+    }
+};
+
+test "Socket controlled native write retains the original deadline under backpressure" {
+    try ControlledWriteTest.run(false, false);
+}
+test "Socket controlled native write observes original cancellation under backpressure" {
+    try ControlledWriteTest.run(false, true);
+}
+test "Socket controlled fallback write retains the original deadline with zero async allowance" {
+    try ControlledWriteTest.run(true, false);
+}
+test "Socket controlled fallback write observes original cancellation with zero async allowance" {
+    try ControlledWriteTest.run(true, true);
 }

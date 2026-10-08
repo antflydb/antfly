@@ -1,0 +1,11 @@
+{
+  "state": "terminal",
+  "exit_code": 1,
+  "observed_at": 1791419910.6789901,
+  "scope": "20 passed, 8 skipped, 1 fixture failed: one write completed without reaching persistent backpressure",
+  "source_sha256": {
+    "zig/lib/httpx/src/net/socket.zig": "9cb51e1155b255516839f4fbc2267065a56224b8e9558dba986ddd9f183dc3c4",
+    "zig/lib/httpx/src/httpx.zig": "277ffdac9b9aaf0c5da757496dd5566ceae613e40b3ab57fd2a3ec43033d4600",
+    "zig/lib/json/src/mod.zig": "63867c1f746b5dbb6dcf0945bd938fd8f5d5b4a5548b578d31ad422b40ac20d3"
+  }
+}

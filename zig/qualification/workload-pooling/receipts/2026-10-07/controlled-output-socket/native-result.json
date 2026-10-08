@@ -1,0 +1,34 @@
+{
+  "state": "terminal",
+  "exit_code": 0,
+  "observed_at": 1791420416.695162,
+  "passed": 21,
+  "skipped": 8,
+  "failed": 0,
+  "selected": 29,
+  "argv": [
+    "/Users/ajroetker/bin/zig-0.17.0/zig",
+    "test",
+    "-OReleaseSafe",
+    "-lc",
+    "--test-filter",
+    "socket",
+    "--cache-dir",
+    "/private/tmp/antfly-worker-phase-native-cache",
+    "--dep",
+    "antfly-json",
+    "-Mroot=lib/httpx/src/httpx.zig",
+    "-Mantfly-json=lib/json/src/mod.zig"
+  ],
+  "source_sha256": {
+    "zig/lib/httpx/src/net/socket.zig": "781b4439fc5f025a305440114a8c2f831bef19c93a74c54a9641afc3f5780c51",
+    "zig/lib/httpx/src/util/common.zig": "5baac932275002d819ae55d201f0ec9dff1b28b7f684f6c7df0824dac059b76a",
+    "zig/lib/httpx/src/server/server.zig": "2b2b0b39a980ef7c36f12aebccc746c93edaea2cc4dfcba416709ac2db446e98",
+    "zig/lib/httpx/src/protocol/h2_connection.zig": "c3976a3a35158b86da23cbc60baef0f040e81e99863e810fdae02bed0557c127",
+    "zig/lib/runtime/src/runtime_http_bridge.zig": "3044f564384bb17476cb585510f51c8123a67fbfbcf3a000eb62d67c5292b724",
+    "zig/build.zig": "23aec190effb2c1a352a2c0074ae8e64557ed6807702f5dc4112c30cc9400612",
+    "zig/lib/httpx/src/httpx.zig": "277ffdac9b9aaf0c5da757496dd5566ceae613e40b3ab57fd2a3ec43033d4600",
+    "zig/lib/json/src/mod.zig": "63867c1f746b5dbb6dcf0945bd938fd8f5d5b4a5548b578d31ad422b40ac20d3"
+  },
+  "hash_capture": "After native completion; source files remained unchanged during the corrected native and GNU tests. GNU manifest captured at launch."
+}
