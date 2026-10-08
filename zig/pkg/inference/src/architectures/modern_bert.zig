@@ -536,7 +536,9 @@ pub fn forwardPackedCT(
 ) !CT {
     try validateConfig(config);
     const seq_len = input_ids.len;
-    if (seq_len == 0 or seq_len > config.max_position_embeddings or packed_row.positions.len != seq_len) return error.InvalidInputShape;
+    // Independent packed branches restart their logical positions, so their
+    // combined physical rows can exceed the model's positional window.
+    if (seq_len == 0 or seq_len > @import("../models/laya.zig").max_packed_len_limit or packed_row.positions.len != seq_len) return error.InvalidInputShape;
     for (packed_row.positions) |p| if (p < 0 or p >= config.max_position_embeddings) return error.InvalidInputShape;
     const mask = try allocator.alloc(i64, seq_len);
     defer allocator.free(mask);
@@ -584,7 +586,7 @@ pub fn forwardBranchesCT(
     if (rows == 0 or packed_row.positions.len != rows or branches.keys.len != config.num_hidden_layers or branches.values.len != config.num_hidden_layers) return error.InvalidInputShape;
     for (packed_row.positions) |p| if (p < 0 or p >= config.max_position_embeddings) return error.InvalidInputShape;
     const seq_len = std.math.add(usize, branches.prefix_rows, rows) catch return error.InvalidInputShape;
-    if (seq_len > config.max_position_embeddings) return error.InvalidInputShape;
+    if (seq_len > @import("../models/laya.zig").max_packed_len_limit) return error.InvalidInputShape;
     const mask = try allocator.alloc(i64, seq_len);
     defer allocator.free(mask);
     @memset(mask, 1);

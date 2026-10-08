@@ -385,6 +385,7 @@ comptime {
     _ = @import("antfly_local_sources").storage_lsm_backend_dependency_validation;
     _ = @import("antfly_local_sources").storage_lsm_backend_runtime;
     _ = @import("antfly_local_sources").storage_lsm_backend_current_point_test;
+    _ = @import("antfly_local_sources").storage_lsm_backend_shared_bytes;
     _ = @import("antfly_local_sources").storage_lsm_backend_state;
     _ = @import("antfly_local_sources").storage_lsm_backend_storage_io;
     _ = @import("antfly_local_sources").storage_lsm_backend_wal;

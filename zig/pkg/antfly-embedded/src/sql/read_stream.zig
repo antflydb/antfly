@@ -225,7 +225,7 @@ fn allocationScenario(alloc: std.mem.Allocator) !void {
 }
 
 test "SQL pull stream unwinds every allocation failure" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, allocationScenario, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, allocationScenario, .{});
 }
 
 const Spool = @import("result_cursor.zig").Cursor;
