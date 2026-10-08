@@ -5196,3 +5196,33 @@ measure different tasks, not competing complete query plans. The first compile
 reported a 3.44 GB peak against a 3.22 GB declared RSS claim; a cached rerun and
 both runtime samples pass, but this does not prove cold compilation fits that
 resource claim. The final Debug fixture also passes validation and owned decode.
+
+### Cold lake search: restart composition and warm startup admission
+
+The persistent-cache recovery, phase diagnostics, bounded range concurrency,
+packed text reads and sidecar hydration implemented earlier are now covered by
+a composed ranked-search/highlighting restart regression. It starts with an
+empty cache, ranks a top hit, projects display/body fields from the immutable
+text sidecar and runs the production highlighter. Shutdown drains accepted
+writes. A fresh cache and index writer rebuild decoded navigation from disk
+with all provider read methods disabled. Scores and highlights remain valid,
+with zero provider requests/bytes and nonzero disk hits. No Parquet reader is
+available to mask a source-hydration fallback. This exercises immutable query
+payload reuse, not offline publication discovery or a complete HTTP request.
+
+Warm cache preparation now checks the acquire-published owner before path
+allocation or startup locking. Failed initialization still takes the bounded
+retry path. The server executor/restart test also verifies warm preparation
+returns while the startup mutex is held; recovery tests verify the readiness
+transition only follows successful initialization.
+
+For deployment verification, keep the same node-local directory across a
+graceful restart and compare `antfly_lake_cache_provider_reads_total`,
+`antfly_lake_cache_provider_bytes_total`, disk hits and per-phase query timings
+for the same highlighted request. Check disk-ready, initialization failure
+reasons, completed/queued/dropped writes and last write error before restart.
+Counters restart with the process; compare per-run deltas rather than absolute
+values. An abrupt crash can lose pending cache writes without losing source
+data. Cache eviction, changed object versions or credentials can legitimately
+require new provider reads. These local fixtures do not establish the cause of
+the observed deployment's missing cache files or quantify live GCS latency.

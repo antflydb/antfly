@@ -101,6 +101,13 @@ pub const Cache = struct {
         self.persistent_ready.store(true, .release);
     }
 
+    /// The owner is immutable after publication, until all server readers
+    /// quiesce. Startup callers can skip path allocation and startup locking
+    /// once ready; a failed initialization must still enter bounded recovery.
+    pub fn persistentReady(self: *const Cache) bool {
+        return self.persistent_ready.load(.acquire);
+    }
+
     fn persistentCache(self: *Cache) ?*parquet.PersistentObjectRangeCache {
         if (!self.persistent_ready.load(.acquire)) return null;
         return &self.persistent.?;
@@ -1106,18 +1113,21 @@ test "external lake disk cache recovers from ownership contention with bounded r
     const retry = start + 60 * std.time.ns_per_s;
     var cache = Cache.initWithMemoryLimit(a, 0);
     defer cache.deinit();
+    try std.testing.expect(!cache.persistentReady());
     {
         var owner = try parquet.PersistentObjectRangeCache.init(io, root);
         defer owner.deinit();
         try cache.ensurePersistentAt(io, root, .{}, .{}, start);
         try std.testing.expect(cache.persistentCache() == null);
         try std.testing.expectEqualStrings("WouldBlock", cache.snapshot().disk_unavailable.?);
+        try std.testing.expect(!cache.persistentReady());
         try std.testing.expectEqual(@as(u64, 1), cache.snapshot().disk_init_failures);
         // A busy serving process must not repeat inventory/lock attempts.
         for (0..100) |_| try cache.ensurePersistentAt(io, root, .{}, .{}, retry - 1);
         try std.testing.expectEqual(@as(u64, 1), cache.snapshot().disk_init_attempts);
     }
     try cache.ensurePersistentAt(io, root, .{}, .{}, retry);
+    try std.testing.expect(cache.persistentReady());
     try std.testing.expect(cache.persistentStats() != null);
     try std.testing.expect(cache.snapshot().disk_unavailable == null);
     try std.testing.expectEqual(@as(u64, 2), cache.snapshot().disk_init_attempts);

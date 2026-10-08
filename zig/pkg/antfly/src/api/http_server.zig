@@ -12875,6 +12875,10 @@ pub const ApiHttpServer = struct {
         self.lake_text_corpora.attachResourceManager(self.shared_resource_manager orelse &self.local_resource_manager);
         const config = if (self.cfg.node_config) |node| node.lake_cache else common_config.Config.LakeCacheConfig{};
         if (!(self.cfg.lake_cache_enabled orelse config.enabled)) return;
+        // Configuration and the published disk owner are server-lifetime
+        // immutable. Warm queries need neither path allocation nor the
+        // serialized startup lane. Failed startup still retries below.
+        if (self.lake_read_cache.persistentReady()) return;
         const configured_root = self.cfg.lake_cache_root orelse config.root;
         const root = configured_root orelse path: {
             const node = self.cfg.node_config orelse {

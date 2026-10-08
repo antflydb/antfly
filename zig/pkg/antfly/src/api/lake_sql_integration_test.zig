@@ -63,6 +63,13 @@ test "external lake persistence owns its executor and reuses immutable bytes aft
         try server.prepareLakeCache();
         try server.prepareLakeCache();
         try std.testing.expect(server.lake_read_cache.persistent != null);
+        try std.testing.expect(server.lake_read_cache.persistentReady());
+        {
+            // A published owner must not queue warm queries behind startup.
+            try server.lake_cache_start_mutex.lock(request_io.io());
+            defer server.lake_cache_start_mutex.unlock(request_io.io());
+            try server.prepareLakeCache();
+        }
         try std.testing.expectEqual(std.Io.Limit.limited(1), server.lake_cache_io.?.concurrent_limit);
         var lease = try server.lake_read_cache.readImmutableBlockLease(a, @splat(9), "sidecar", bytes.len, digest, .{ .io = request_io.io() }, loader);
         defer lease.deinit();
