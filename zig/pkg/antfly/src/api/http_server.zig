@@ -14122,6 +14122,9 @@ pub const ApiHttpServer = struct {
             return source.lookup(alloc, table_name, key, scoped, consistency) catch |err| switch (err) {
                 error.StorageReadTemporarilyUnavailable,
                 error.StorageKernelOwnerStaleDescriptor,
+                error.CatalogRoutingUnavailable,
+                error.CatalogProjectionRefreshRequired,
+                error.CatalogRoutingSnapshotTimeout,
                 error.NotLeader,
                 error.LeaderUnavailable,
                 error.GroupLeaderUnavailable,
@@ -30838,7 +30841,7 @@ test "api http point lookup retries bounded local readiness races" {
         }
     };
 
-    const transient_errors = [_]anyerror{ error.StorageReadTemporarilyUnavailable, error.StorageKernelOwnerStaleDescriptor, error.NotLeader, error.LeaderUnavailable, error.GroupLeaderUnavailable, error.UnknownGroup, error.ReadIndexTimeout, error.TopologyChanged, error.IdentityReadGenerationChanged, error.DocIdentityNamespaceMismatch };
+    const transient_errors = [_]anyerror{ error.StorageReadTemporarilyUnavailable, error.StorageKernelOwnerStaleDescriptor, error.CatalogRoutingUnavailable, error.CatalogProjectionRefreshRequired, error.CatalogRoutingSnapshotTimeout, error.NotLeader, error.LeaderUnavailable, error.GroupLeaderUnavailable, error.UnknownGroup, error.ReadIndexTimeout, error.TopologyChanged, error.IdentityReadGenerationChanged, error.DocIdentityNamespaceMismatch };
     for (transient_errors) |first_error| {
         var reads = FakeReads{ .first_error = first_error };
         var server = ApiHttpServer.init(
