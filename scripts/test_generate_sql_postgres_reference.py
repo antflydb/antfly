@@ -321,6 +321,40 @@ class PostgresReferenceTest(unittest.TestCase):
                     self.db.execute("ALTER TABLE exprs ALTER COLUMN g SET DEFAULT 5")
             self.assertEqual("42601", failure.exception.sqlstate)
 
+    def test_durable_membership_remainder_schema_contract(self):
+        import psycopg
+
+        with self.db.transaction(force_rollback=True):
+            self.db.execute(
+                "CREATE TABLE exprs (n smallint, label text, bucket integer GENERATED ALWAYS AS (MOD(n,3)) STORED, CHECK (label IN ('ready','pending')), CHECK ((n>0) IS NOT FALSE OR n IN (-7,-3)))"
+            )
+            self.db.execute("CREATE INDEX by_total ON exprs ((n % 3)) INCLUDE (bucket)")
+            self.db.execute(
+                "INSERT INTO exprs(n,label) VALUES (-7,'ready'),(NULL,NULL)"
+            )
+            with self.assertRaises(psycopg.Error) as failure:
+                with self.db.transaction():
+                    self.db.execute(
+                        "INSERT INTO exprs(n,label) VALUES (3,'pending'),(-1,'ready')"
+                    )
+            self.assertEqual("23514", failure.exception.sqlstate)
+            self.assertEqual(
+                [(-7, "ready", -1), (None, None, None)],
+                self.db.execute(
+                    "SELECT n,label,bucket FROM exprs ORDER BY n"
+                ).fetchall(),
+            )
+            with self.assertRaises(psycopg.Error) as failure:
+                with self.db.transaction():
+                    self.db.execute("INSERT INTO exprs(n,label) VALUES (1,'invalid')")
+            self.assertEqual("23514", failure.exception.sqlstate)
+            self.assertEqual(
+                (0,),
+                self.db.execute(
+                    "INSERT INTO exprs(n,label) VALUES (-3,'pending') RETURNING bucket"
+                ).fetchone(),
+            )
+
     def test_durable_numeric_expression_builtin_domains(self):
         import json
         import psycopg

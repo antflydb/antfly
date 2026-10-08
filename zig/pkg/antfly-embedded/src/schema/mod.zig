@@ -762,36 +762,42 @@ pub const documentDateTimeToNs = impl.documentDateTimeToNs;
 pub const documentIntegerToI64 = impl.documentIntegerToI64;
 pub const documentNumberToF64 = impl.documentNumberToF64;
 
-fn typedNumericJson(expression: std.json.Value, depth: usize) bool {
+fn typedNumericJson(expression: std.json.Value, depth: usize, predicate: bool) bool {
     if (depth > 16 or expression != .object) return false;
-    if (expression.object.contains("sql_type")) return true;
-    if (expression.object.get("op")) |op| if (op == .string and (std.mem.eql(u8, op.string, "cast") or std.mem.eql(u8, op.string, "case_when"))) return true;
+    if (!predicate and expression.object.contains("sql_type")) return true;
+    if (expression.object.get("op")) |op| if (op == .string and expressionCapabilityOp(op.string, predicate)) return true;
     if (expression.object.get("args")) |args| if (args == .array) for (args.array.items) |arg| {
-        if (typedNumericJson(arg, depth + 1)) return true;
+        if (typedNumericJson(arg, depth + 1, predicate)) return true;
     };
     return false;
 }
 
-fn typedNumericWire(expression: anytype, depth: usize) bool {
-    if (depth > 16) return false;
-    if (expression.sql_type != null or expression.op == .cast or expression.op == .case_when) return true;
-    if (expression.args) |args| for (args) |arg| if (typedNumericWire(arg, depth + 1)) return true;
+fn expressionCapabilityOp(op: []const u8, predicate: bool) bool {
+    const names: []const []const u8 = if (predicate) &.{ "modulo", "in_list", "not_in_list" } else &.{ "cast", "case_when" };
+    for (names) |name| if (std.mem.eql(u8, op, name)) return true;
     return false;
 }
 
-fn requiresTypedExpressions(schema: ParsedTableSchema) bool {
+fn typedNumericWire(expression: anytype, depth: usize, predicate: bool) bool {
+    if (depth > 16) return false;
+    if ((!predicate and expression.sql_type != null) or expressionCapabilityOp(@tagName(expression.op), predicate)) return true;
+    if (expression.args) |args| for (args) |arg| if (typedNumericWire(arg, depth + 1, predicate)) return true;
+    return false;
+}
+
+fn requiresTypedExpressions(schema: ParsedTableSchema, predicate: bool) bool {
     if (schema.checks) |checks| for (checks.value) |check| if (check.expression) |expression| {
-        if (typedNumericWire(expression, 0)) return true;
+        if (typedNumericWire(expression, 0, predicate)) return true;
     };
     if (schema.relational_indexes) |indexes| for (indexes.value) |index| {
-        for (index.keys) |key| if (key.expression) |expression| if (typedNumericWire(expression, 0)) return true;
+        for (index.keys) |key| if (key.expression) |expression| if (typedNumericWire(expression, 0, predicate)) return true;
     };
     if (schema.unique_constraints) |constraints| for (constraints.value) |constraint| if (constraint.keys) |keys| {
-        for (keys) |key| if (key.expression) |expression| if (typedNumericWire(expression, 0)) return true;
+        for (keys) |key| if (key.expression) |expression| if (typedNumericWire(expression, 0, predicate)) return true;
     };
     for ([_]?std.json.Parsed(std.json.Value){ schema.column_defaults, schema.generated_columns }) |definitions| if (definitions) |declarations| {
         if (declarations.value == .array) for (declarations.value.array.items) |entry| {
-            if (entry == .object) if (entry.object.get("expression")) |expression| if (typedNumericJson(expression, 0)) return true;
+            if (entry == .object) if (entry.object.get("expression")) |expression| if (typedNumericJson(expression, 0, predicate)) return true;
         };
     };
     return false;
@@ -880,7 +886,8 @@ pub fn deriveRuntimeTableSchema(alloc: std.mem.Allocator, schema: ParsedTableSch
         .ttl_field = ttl_field,
         .enforce_types = schema.enforce_types,
         .requires_public_schema = schema.storage_mode == .relational,
-        .requires_typed_expressions = requiresTypedExpressions(schema),
+        .requires_typed_expressions = requiresTypedExpressions(schema, false),
+        .requires_predicate_expressions = requiresTypedExpressions(schema, true),
         .storage_mode = switch (schema.storage_mode) {
             .document => .document,
             .relational => .relational,
@@ -903,7 +910,8 @@ pub fn deriveRelationalCheckLayout(alloc: std.mem.Allocator, schema: ParsedTable
         .ttl_field = "",
         .storage_mode = .relational,
         .requires_public_schema = true,
-        .requires_typed_expressions = requiresTypedExpressions(schema),
+        .requires_typed_expressions = requiresTypedExpressions(schema, false),
+        .requires_predicate_expressions = requiresTypedExpressions(schema, true),
         .relational_columns = try deriveRuntimeRelationalColumns(alloc, schema),
     };
 }

@@ -19,6 +19,46 @@ const rows = @import("relational_rows.zig");
 const mapper = @import("document_mapper.zig");
 const alloc = std.testing.allocator;
 
+test "relational index system SQL membership and remainder survive reopen and portable restore" {
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const compiler = @import("../../sql/compiler.zig");
+    var create = try compiler.compile(a, "CREATE TABLE exprs (n smallint, label text, bucket integer GENERATED ALWAYS AS (MOD(n,3)) STORED, CHECK (label IN ('ready','pending')), CHECK ((n>0) IS NOT FALSE OR n IN (-7,-3)))", .{});
+    defer create.deinit();
+    var schema = try std.json.parseFromSliceLeaky(std.json.Value, a, try @import("../../sql/ddl_runtime.zig").createSchemaAlloc(a, create.statement.create_table), .{});
+    var index = try compiler.compile(a, "CREATE INDEX by_total ON exprs ((n % 3)) INCLUDE (bucket)", .{});
+    defer index.deinit();
+    try std.testing.expect(try @import("../../sql/schema_ddl.zig").apply(a, &schema, index.statement.catalog_ddl));
+    const json = try std.json.Stringify.valueAlloc(a, schema, .{});
+    const TestDirectory = @import("../../common/test_directory.zig").TestDirectory;
+    var directory = try TestDirectory.init("sql-membership-remainder-reopen");
+    defer directory.cleanup();
+    const options: db_mod.OpenOptions = .{ .start_optional_runtimes = false, .start_index_workers = false, .primary_backend = .{ .lsm = .{} } };
+    var archive: std.ArrayListUnmanaged(u8) = .empty;
+    defer archive.deinit(alloc);
+    {
+        var db = try db_mod.DB.open(alloc, directory.path(), options);
+        defer db.close();
+        try db.setSchemaJson(alloc, json);
+        try std.testing.expect(db.core.schema.?.requires_predicate_expressions);
+        try db.batch(.{ .writes = &.{ .{ .key = "negative", .value = "{\"n\":-7,\"label\":\"ready\"}" }, .{ .key = "unknown", .value = "{\"n\":null,\"label\":null}" } } });
+        try std.testing.expectError(error.RelationalCheckViolation, db.batch(.{ .writes = &.{ .{ .key = "not-committed", .value = "{\"n\":3,\"label\":\"pending\"}" }, .{ .key = "invalid", .value = "{\"n\":-1,\"label\":\"ready\"}" } } }));
+        try std.testing.expect((try db.get(alloc, "not-committed")) == null);
+        try ready(&db);
+        try @import("../portable_backup.zig").exportPortable(alloc, db.core.store, &archive);
+    }
+    var reopened = try db_mod.DB.open(alloc, directory.path(), options);
+    defer reopened.close();
+    var restored_directory = try TestDirectory.init("sql-membership-remainder-restored");
+    defer restored_directory.cleanup();
+    var restored = try db_mod.DB.open(alloc, restored_directory.path(), options);
+    defer restored.close();
+    try restored.importPortableIntoEmpty(alloc, archive.items, @import("doc_identity.zig").default_namespace);
+    try verifyPredicates(&reopened);
+    try verifyPredicates(&restored);
+}
+
 test "relational index system expression CHECK activation records arithmetic failure and resumes after repair" {
     const initial =
         \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"x":{"type":"integer"},"y":{"type":"integer"},"wide":{"type":"string"}},"additionalProperties":false}}}}
@@ -179,6 +219,26 @@ fn ready(db: *db_mod.DB) !void {
         _ = try db.runRelationalIndexMaintenancePass();
     }
     return error.IndexBuildDidNotConverge;
+}
+
+fn verifyPredicates(db: *db_mod.DB) !void {
+    try std.testing.expect(db.core.schema.?.requires_predicate_expressions);
+    try std.testing.expectEqual(@import("../schema.zig").storage_format_version, db.core.table_catalog.schema_format_version);
+    try ready(db);
+    var reader = try db.beginRelationalRows(alloc, .{ .index = "by_total", .fields = &.{"bucket"} });
+    defer reader.deinit();
+    var page = try reader.nextPage(alloc, std.testing.io, .{ .rows = 8, .records = 256, .time_ns = std.time.ns_per_s });
+    defer page.deinit();
+    try std.testing.expectEqual(@as(usize, 2), page.rows.len);
+    try std.testing.expectEqual(@as(usize, 0), page.primary_lookups);
+    for (page.rows) |row| {
+        var decoded = try std.json.parseFromSlice(std.json.Value, alloc, row.json, .{});
+        defer decoded.deinit();
+        const bucket = decoded.value.object.get("bucket").?;
+        if (std.mem.eql(u8, row.key, "negative")) try std.testing.expectEqual(@as(i64, -1), bucket.integer) else try std.testing.expect(bucket == .null);
+    }
+    try std.testing.expectError(error.RelationalCheckViolation, db.batch(.{ .writes = &.{.{ .key = "bad-after-recovery", .value = "{\"n\":1,\"label\":\"invalid\"}" }} }));
+    try db.batch(.{ .writes = &.{.{ .key = "valid-after-recovery", .value = "{\"n\":-3,\"label\":\"pending\"}" }} });
 }
 
 test "relational index system staged restore preserves historical absence and rejects forged generated values" {

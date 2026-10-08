@@ -2234,11 +2234,10 @@ const Evaluator = struct {
             },
             .in_list => |list| blk: {
                 const operand = try self.runDatum(list.operand, depth + 1);
-                if (operand.sql_null) break :blk .{};
-                var unknown = false;
+                var unknown = operand.sql_null;
                 for (list.values) |item| {
                     const value = try self.runDatum(item, depth + 1);
-                    if (value.sql_null) {
+                    if (operand.sql_null or value.sql_null) {
                         unknown = true;
                         continue;
                     }

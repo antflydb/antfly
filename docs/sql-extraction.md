@@ -4459,3 +4459,40 @@ with a failing allocator proving zero per-row scratch allocations. This is a
 component latency sample, not a production throughput claim. Native admission
 also exercises conditional checks and expression indexes through atomic batch
 failure, LSM reopen and portable restore.
+
+Durable predicate programs now retain bounded `IN`/`NOT IN` membership and
+integer remainder. Membership evaluates the probe once, observes candidate
+errors even for a NULL probe, and lets an equality witness override earlier
+NULL candidates. Numeric operands retain their bound promotions and checked
+arithmetic before comparison. Integer remainder preserves the dividend's sign
+and returns zero for minInt modulo -1, unlike division overflow. Exact decimal
+and floating remainder are not approximated by binary-float durable programs.
+Boolean truth tests lower to the existing null-safe comparison operations;
+UNKNOWN is never silently treated as FALSE.
+
+Membership and remainder require schema capability 19, including string-only
+membership programs without numeric type annotations. Generated public enums
+come from OpenAPI. Original inventory dispositions remain unchanged until
+exact-source native/PostgreSQL campaigns establish complete case evidence.
+
+The focused `zig build antfly-schema-expression-test` gate executes all twenty
+durable declaration tests, including the shared sixty-five-expression fixture
+through both query and durable evaluators. PostgreSQL independently checks the
+same fixture and the membership/remainder DDL with atomic CHECK failures.
+The 165-test relational index system gate covers expression-index publication,
+covering projection, LSM reopen, portable restore and capability guards.
+A local debug membership/remainder sample evaluated 10,000 rows in about
+5.4 ms with a failing allocator proving zero per-row scratch allocations;
+this excludes preparation, storage and network work.
+
+Durable text-to-numeric casts and exact decimal operations remain unsupported;
+these new probes use exact builtin integer operands rather than claiming those
+domains. General partial-index predicates still require richer implication and
+durable predicate representation beyond the existing conjunctive contract.
+
+The complete SQL run passed 509 local-owner tests (three opt-in benchmark skips).
+Its server binary independently passed all 213 tests. The build invocation still
+fails its declared 384 MiB process RSS bound, reporting about 1.04 GB; the
+statement admission tests do not establish a bound on the entire test process.
+This remains a validation-gate issue, not a green full-build result, and the
+process limit has not been raised to hide it.

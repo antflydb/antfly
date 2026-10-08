@@ -73,6 +73,13 @@ pub fn lowerColumns(alloc: std.mem.Allocator, columns: []const scalar.Column, ex
             .parameter => return error.InvalidSqlParameters,
             .unary => |part| blk: {
                 if (part.op == .positive) break :blk values[part.operand];
+                switch (part.op) {
+                    .is_true, .is_not_true, .is_false, .is_not_false => {
+                        const literal = try json(alloc, .{ .op = "literal", .type = "boolean", .value = part.op == .is_true or part.op == .is_not_true });
+                        break :blk try json(alloc, .{ .op = if (part.op == .is_true or part.op == .is_false) "is_not_distinct" else "is_distinct", .args = &[_]Json{ values[part.operand], literal } });
+                    },
+                    else => {},
+                }
                 const op: []const u8 = switch (part.op) {
                     .negative => "negate",
                     .not => "not",
@@ -87,13 +94,14 @@ pub fn lowerColumns(alloc: std.mem.Allocator, columns: []const scalar.Column, ex
             .binary => |part| blk: {
                 const op: []const u8 = switch (part.op) {
                     .neq => "ne",
-                    .add, .subtract, .multiply, .divide, .concat, .eq, .lt, .lte, .gt, .gte, .@"and", .@"or", .is_distinct, .is_not_distinct => @tagName(part.op),
+                    .add, .subtract, .multiply, .divide, .modulo, .concat, .eq, .lt, .lte, .gt, .gte, .@"and", .@"or", .is_distinct, .is_not_distinct => @tagName(part.op),
                     else => return error.UnsupportedSqlShape,
                 };
                 var left = values[part.left];
                 var right = values[part.right];
                 switch (part.op) {
-                    .add, .subtract, .multiply, .divide => {
+                    .add, .subtract, .multiply, .divide, .modulo => {
+                        if (part.op == .modulo and kind != .integer) return error.UnsupportedSqlShape;
                         // The query VM promotes operands at execution time. A
                         // durable program must record that promotion explicitly.
                         const indexes = [_]usize{ part.left, part.right };
@@ -111,15 +119,19 @@ pub fn lowerColumns(alloc: std.mem.Allocator, columns: []const scalar.Column, ex
                     .lower => "lower_ascii",
                     .upper => "upper_ascii",
                     .coalesce => "coalesce",
+                    .mod => "modulo",
                     else => return error.UnsupportedSqlShape,
                 };
                 const args = try alloc.alloc(Json, part.args.len);
-                for (args, part.args) |*arg, index| arg.* = if (part.function == .coalesce)
+                if (part.function == .mod and kind != .integer) return error.UnsupportedSqlShape;
+                for (args, part.args) |*arg, index| arg.* = if (part.function == .coalesce or part.function == .mod)
                     try promoteNumeric(alloc, values[index], program.instructions[index].type, instruction.type)
                 else
                     values[index];
                 if (part.function == .coalesce and args.len == 1) break :blk args[0];
-                break :blk try json(alloc, .{ .op = op, .args = args });
+                var result = try json(alloc, .{ .op = op, .args = args });
+                if (part.function == .mod) if (instruction.type.element_type) |identity| try result.object.put(alloc, "sql_type", .{ .string = @tagName(identity) });
+                break :blk result;
             },
             .cast => |part| blk: {
                 const source = program.instructions[part.operand].type;
@@ -146,12 +158,30 @@ pub fn lowerColumns(alloc: std.mem.Allocator, columns: []const scalar.Column, ex
                     try json(alloc, .{ .op = "literal", .type = if (kind == .uuid) "string" else @tagName(kind), .value = @as(?u8, null) });
                 break :blk try json(alloc, .{ .op = "case_when", .args = args });
             },
-            .in_list => return error.UnsupportedSqlShape,
+            .in_list => |part| blk: {
+                if (part.values.len == 0 or part.values.len > 31) return error.SqlLimitExceeded;
+                const indexes = try alloc.alloc(u32, part.values.len + 1);
+                indexes[0] = part.operand;
+                @memcpy(indexes[1..], part.values);
+                var common_type = program.instructions[part.operand].type;
+                if (common_type.kind == .integer or common_type.kind == .number) {
+                    if (common_type.kind == .number and common_type.element_type == null) return error.UnsupportedSqlShape;
+                    for (indexes[1..]) |index| {
+                        const other = program.instructions[index].type;
+                        if (other.kind == .number and other.element_type == null) return error.UnsupportedSqlShape;
+                        const identity = try @import("builtin_cast.zig").commonNumeric(common_type.element_type orelse if (common_type.kind == .integer) .int64 else .float64, other.element_type orelse if (other.kind == .integer) .int64 else .float64);
+                        common_type = .{ .kind = if (@import("builtin_cast.zig").integral(identity)) .integer else .number, .element_type = identity };
+                    }
+                }
+                const args = try alloc.alloc(Json, indexes.len);
+                for (indexes, args) |index, *arg| arg.* = try promoteNumeric(alloc, values[index], program.instructions[index].type, common_type);
+                break :blk try json(alloc, .{ .op = if (part.negated) "not_in_list" else "in_list", .args = args });
+            },
         };
         const typed_numeric = switch (instruction.operation) {
             .literal => kind == .integer or kind == .number,
             .binary => |part| switch (part.op) {
-                .add, .subtract, .multiply, .divide => true,
+                .add, .subtract, .multiply, .divide, .modulo => true,
                 else => false,
             },
             .unary => |part| part.op == .negative,

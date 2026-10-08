@@ -19,6 +19,7 @@ const selectTestFilters = @import("../../../build_support/antfly/test_support.zi
 const compileFiltersWithAnchors = @import("../../../build_support/antfly/test_support.zig").compileFiltersWithAnchors;
 const addFilteredTestRunArtifactWithRuntimeFilters = @import("../../../build_support/antfly/test_support.zig").addFilteredTestRunArtifactWithRuntimeFilters;
 const addFilteredTestRunArtifact = @import("../../../build_support/antfly/test_support.zig").addFilteredTestRunArtifact;
+const addCuratedTestRunArtifact = @import("../../../build_support/antfly/test_support.zig").addCuratedTestRunArtifact;
 
 pub const AddTestsOptions = struct {
     api_http_runtime_test_mod: *std.Build.Module,
@@ -1670,6 +1671,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-relational-rows-test", "Run generated relational row and schema boundary contracts").dependOn(&addFilteredTestRunArtifact(b, api_relational_row_contract_tests).step);
+    b.step("antfly-schema-expression-test", "Run durable expression semantics and bounded preparation contracts")
+        .dependOn(&addCuratedTestRunArtifact(b, api_relational_row_contract_tests, &.{"relational declarations"}).step);
     const restore_lookup_authority_tests = b.addTest(.{
         .root_module = api_public_table_http_docid_test_mod,
         .filters = &.{ "private restore lookup plan identity", "compiled lookup wire preserves binary scope", "ancestors-only hierarchy survives the internal wire re-encode without a stray group_by" },

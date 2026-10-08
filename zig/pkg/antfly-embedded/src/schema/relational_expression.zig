@@ -29,7 +29,7 @@ pub const max_depth = 16;
 pub const max_output_bytes = 1024 * 1024;
 pub const max_allocated_bytes = 4 * max_output_bytes;
 
-const Op = enum { literal, column, add, subtract, multiply, divide, negate, concat, coalesce, lower_ascii, upper_ascii, eq, ne, gt, gte, lt, lte, is_null, is_not_null, is_distinct, is_not_distinct, @"and", @"or", not, cast, case_when };
+const Op = enum { literal, column, add, subtract, multiply, divide, modulo, negate, concat, coalesce, lower_ascii, upper_ascii, eq, ne, gt, gte, lt, lte, is_null, is_not_null, is_distinct, is_not_distinct, @"and", @"or", not, cast, case_when, in_list, not_in_list };
 const Node = struct {
     op: Op,
     kind: Kind,
@@ -172,6 +172,28 @@ pub const Plan = struct {
             const value = try self.evaluateNode(alloc, source, node.children[0], budget);
             return .{ .boolean = (value == .null) == (node.op == .is_null) };
         }
+        if (node.op == .in_list or node.op == .not_in_list) {
+            // The probe is evaluated once. NULL candidates do not terminate
+            // the search: a later equality wins over UNKNOWN.
+            const probe = try self.evaluateNode(alloc, source, node.children[0], budget);
+            var unknown = probe == .null;
+            for (node.children[1..]) |child| {
+                const candidate = try self.evaluateNode(alloc, source, child, budget);
+                if (probe == .null or candidate == .null) {
+                    unknown = true;
+                    continue;
+                }
+                const bytes: usize = switch (probe) {
+                    .string => |value| @min(value.len, candidate.string.len),
+                    .blob => |value| @min(value.len, candidate.blob.len),
+                    else => 0,
+                };
+                if (bytes > budget.* / 2) return error.RelationalExpressionBudgetExceeded;
+                budget.* -= bytes * 2;
+                if (valueOrder(probe, candidate, false) == .eq) return .{ .boolean = node.op == .in_list };
+            }
+            return if (unknown) .null else .{ .boolean = node.op == .not_in_list };
+        }
         if (isComparison(node.op)) {
             const left = try self.evaluateNode(alloc, source, node.children[0], budget);
             const right = try self.evaluateNode(alloc, source, node.children[1], budget);
@@ -215,7 +237,7 @@ pub const Plan = struct {
                 .number => |v| numericCast(.{ .number = -v }, node.sql_type orelse .float64),
                 else => unreachable,
             },
-            .add, .subtract, .multiply, .divide => {
+            .add, .subtract, .multiply, .divide, .modulo => {
                 const b = operands[1];
                 if (node.kind == .integer) {
                     const result = switch (node.op) {
@@ -226,6 +248,11 @@ pub const Plan = struct {
                             if (b.integer == 0) return error.RelationalExpressionDivisionByZero;
                             if (a.integer == std.math.minInt(i64) and b.integer == -1) return error.RelationalExpressionOverflow;
                             break :blk @divTrunc(a.integer, b.integer);
+                        },
+                        .modulo => blk: {
+                            if (b.integer == 0) return error.RelationalExpressionDivisionByZero;
+                            // Unlike division, minInt % -1 is exactly zero.
+                            break :blk if (b.integer == -1) 0 else @rem(a.integer, b.integer);
                         },
                         else => unreachable,
                     } catch return error.RelationalExpressionOverflow;
@@ -364,7 +391,7 @@ const Compiler = struct {
                 .literal => std.mem.eql(u8, name, "type") or std.mem.eql(u8, name, "value") or std.mem.eql(u8, name, "sql_type"),
                 .column => std.mem.eql(u8, name, "column"),
                 .cast => std.mem.eql(u8, name, "args") or std.mem.eql(u8, name, "type") or std.mem.eql(u8, name, "sql_type"),
-                .add, .subtract, .multiply, .divide, .negate => std.mem.eql(u8, name, "args") or std.mem.eql(u8, name, "sql_type"),
+                .add, .subtract, .multiply, .divide, .modulo, .negate => std.mem.eql(u8, name, "args") or std.mem.eql(u8, name, "sql_type"),
                 else => std.mem.eql(u8, name, "args") or (isComparison(op) and std.mem.eql(u8, name, "collation")),
             };
             if (!allowed) return error.InvalidRelationalExpression;
@@ -452,6 +479,7 @@ const Compiler = struct {
                 const valid = switch (op) {
                     .negate, .lower_ascii, .upper_ascii, .not, .is_null, .is_not_null, .cast => length == 1,
                     .concat, .coalesce, .@"and", .@"or" => length >= 2 and length <= 32,
+                    .in_list, .not_in_list => length >= 2 and length <= 32,
                     .case_when => length >= 3 and length <= 31 and length % 2 == 1,
                     else => length == 2,
                 };
@@ -485,6 +513,9 @@ const Compiler = struct {
                         if (input.object.get("sql_type") == null) return error.InvalidRelationalExpression;
                     },
                     .add, .subtract, .multiply, .divide, .negate => if (node.kind != .integer and node.kind != .number) return error.InvalidRelationalExpressionType,
+                    // PostgreSQL has no float4/float8 remainder operator.
+                    // Exact NUMERIC remainder needs its own value domain.
+                    .modulo => if (node.kind != .integer) return error.InvalidRelationalExpressionType,
                     .concat, .lower_ascii, .upper_ascii => if (node.kind != .string) return error.InvalidRelationalExpressionType,
                     .coalesce, .case_when => {
                         if (node.kind == .integer or node.kind == .number) {
@@ -498,6 +529,7 @@ const Compiler = struct {
                     },
                     .@"and", .@"or", .not => if (node.kind != .boolean) return error.InvalidRelationalExpressionType,
                     .is_null, .is_not_null => node.kind = .boolean,
+                    .in_list, .not_in_list => node.kind = .boolean,
                     .eq, .ne, .gt, .gte, .lt, .lte, .is_distinct, .is_not_distinct => {},
                     else => unreachable,
                 }
@@ -513,7 +545,7 @@ const Compiler = struct {
             // Typed operations/casts have a distinct, immutable semantic key.
             self.frame("SQL numeric expression identity v1");
             self.frame(@tagName(typed));
-            if (op == .add or op == .subtract or op == .multiply or op == .divide or op == .negate) {
+            if (op == .add or op == .subtract or op == .multiply or op == .divide or op == .modulo or op == .negate) {
                 for (node.children) |child| if (numericIdentity(self.nodes.items[child]) != typed) return error.InvalidRelationalExpressionType;
             }
         }
@@ -564,10 +596,21 @@ test "relational declarations SQL numeric programs retain narrow domains and che
         var plan = try Plan.init(alloc, table, lowered.expression, expected);
         defer plan.deinit();
         const cells = [_]Value{ if (case.n) |n| .{ .integer = n } else .null, .{ .integer = case.i }, .{ .integer = 9007199254740993 }, .{ .number = 16777216 }, .{ .number = case.d } };
+        var query = try @import("../sql/scalar.zig").bind(a, compiled.expression, &columns, &.{}, .{});
+        defer query.deinit();
+        const Datum = @import("../sql/scalar.zig").Datum;
+        const inputs = [_]Datum{ if (case.n) |n| Datum.json(.{ .integer = n }) else .{}, Datum.json(.{ .integer = case.i }), Datum.json(.{ .integer = 9007199254740993 }), Datum.json(.{ .float = 16777216 }), Datum.json(.{ .float = case.d }) };
         if (case.@"error") |state| {
             const failure = if (std.mem.eql(u8, state, "22003")) error.RelationalExpressionOverflow else if (std.mem.eql(u8, state, "22012")) error.RelationalExpressionDivisionByZero else return error.TestUnexpectedSqlstate;
             try std.testing.expectError(failure, plan.evaluate(alloc, &cells));
-        } else try std.testing.expect(valuesEqual(try checks.valueFromJson(a, expected, case.expected, true), try plan.evaluate(alloc, &cells)));
+            try std.testing.expectError(if (std.mem.eql(u8, state, "22003")) error.SqlNumericOutOfRange else error.SqlDivisionByZero, query.evaluate(a, &inputs, &.{}, .{}));
+        } else {
+            const wanted = try checks.valueFromJson(a, expected, case.expected, true);
+            try std.testing.expect(valuesEqual(wanted, try plan.evaluate(alloc, &cells)));
+            const actual = try query.evaluate(a, &inputs, &.{}, .{});
+            try std.testing.expectEqual(case.expected == .null, actual.sql_null);
+            try std.testing.expect(valuesEqual(wanted, try checks.valueFromJson(a, expected, actual.value, true)));
+        }
     }
 }
 
@@ -599,6 +642,28 @@ test "relational declarations SQL numeric programs conditional allocation faults
             try std.testing.expectError(error.RelationalExpressionDivisionByZero, plan.evaluate(std.testing.failing_allocator, &.{ .null, .{ .integer = 1 } }));
             // Fault probes reach this point only after all preparation succeeds.
             std.debug.print("SQL durable CASE: rows=10000 scratch_bytes=0 elapsed_ns={}\n", .{std.Io.Clock.now(.awake, std.testing.io).nanoseconds - start});
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
+test "relational declarations SQL membership preparation faults and zero scratch evaluation" {
+    const Fixture = struct {
+        fn run(alloc: Allocator) !void {
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            const a = arena.allocator();
+            var compiled = try @import("../sql/compiler.zig").compileScalar(a, "(n % 3) IN (NULL,CAST(-1 AS smallint),1) AND (n>0) IS NOT UNKNOWN", .{});
+            defer compiled.deinit();
+            const columns = [_]@import("../sql/scalar.zig").Column{.{ .name = "n", .type = .integer, .element_type = .int16 }};
+            const table: schema.TableSchema = .{ .storage_mode = .relational, .relational_columns = &.{.{ .name = "n", .path = "n", .column_type = .integer, .sql_element_type = .int16 }} };
+            const lowered = try @import("../sql/schema_expression.zig").lowerColumns(a, &columns, compiled.expression, null);
+            var plan = try Plan.init(alloc, table, lowered.expression, .boolean);
+            defer plan.deinit();
+            const start = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
+            for (0..10000) |_| try std.testing.expect((try plan.evaluate(std.testing.failing_allocator, &.{.{ .integer = -7 }})).boolean);
+            try std.testing.expect(!(try plan.evaluate(std.testing.failing_allocator, &.{.null})).boolean);
+            std.debug.print("SQL durable membership: rows=10000 scratch_bytes=0 elapsed_ns={}\n", .{std.Io.Clock.now(.awake, std.testing.io).nanoseconds - start});
         }
     };
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});

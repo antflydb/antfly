@@ -49,6 +49,13 @@ class RelationalColumnExpression:
             expressions must have the same physical type. Numeric SQL lowering
             records builtin result-domain promotions as explicit casts. This
             operation requires schema capability version 18.
+            modulo takes two same-domain integer operands and returns the signed
+            remainder (minInt modulo -1 is zero); a zero divisor rejects the write.
+            in_list and not_in_list take one probe followed by 1 to 31 same-domain
+            candidates. The probe is evaluated once; NULL probes return UNKNOWN.
+            A matching candidate wins over NULL candidates; otherwise a NULL
+            candidate makes the result UNKNOWN. These operations require schema
+            capability version 19.
     """
 
     column: str
