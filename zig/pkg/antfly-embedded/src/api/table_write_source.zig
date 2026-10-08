@@ -32,6 +32,7 @@ const runtime_status = @import("runtime_status.zig");
 const runtime_callback_abi = @import("../runtime_callback_abi.zig");
 const runtime_error_abi = @import("antfly_runtime_abi").error_abi;
 const runtime_native_abi = @import("antfly_runtime_abi").native_abi;
+const runnable_abi = @import("antfly_runtime_abi").runnable_abi;
 
 pub const LocalStructuralReconcileState = enum {
     complete,
@@ -631,6 +632,27 @@ pub const TableWriteSource = struct {
             index_json: ?[]const u8,
             stamp: metadata_api.CatalogMutationStamp,
         ) anyerror!?void = null,
+        /// Borrowed invocation state crosses only the private same-process
+        /// boundary. The caller retains the team and its allocator until the
+        /// callback has joined every child. Never serialize this capability.
+        commit_batch_with_execution: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            tables: []const distributed_txn.TableCommitRequest,
+            sync_level: db_mod.types.SyncLevel,
+            cancellation: db_mod.types.CancellationToken,
+            team: *runnable_abi.Team,
+        ) anyerror!?distributed_txn.CommitOutcome = null,
+        commit_transaction_with_id_with_execution: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            txn_id: db_mod.types.TxnId,
+            begin_timestamp: u64,
+            tables: []const distributed_txn.TableCommitRequest,
+            sync_level: db_mod.types.SyncLevel,
+            cancellation: db_mod.types.CancellationToken,
+            team: *runnable_abi.Team,
+        ) anyerror!?distributed_txn.CommitOutcome = null,
     };
 
     pub fn activateRangeTracking(self: TableWriteSource, alloc: std.mem.Allocator, table: []const u8, context: @import("operation.zig").RequestContext) !void {
@@ -938,6 +960,19 @@ pub const TableWriteSource = struct {
         return try BoundaryAbi.call("commit_batch_with_cancellation", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, tables, sync_level, cancellation });
     }
 
+    pub fn commitBatchWithExecution(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        tables: []const distributed_txn.TableCommitRequest,
+        sync_level: db_mod.types.SyncLevel,
+        cancellation: db_mod.types.CancellationToken,
+        team: ?*runnable_abi.Team,
+    ) !?distributed_txn.CommitOutcome {
+        const execution = team orelse return self.commitBatchWithCancellation(alloc, tables, sync_level, cancellation);
+        const callback = self.vtable.commit_batch_with_execution orelse return error.UnsupportedOperation;
+        return BoundaryAbi.call("commit_batch_with_execution", self.boundary_dispatch, callback, .{ self.ptr, alloc, tables, sync_level, cancellation, execution });
+    }
+
     pub fn commitTransactionWithId(
         self: TableWriteSource,
         alloc: std.mem.Allocator,
@@ -962,6 +997,25 @@ pub const TableWriteSource = struct {
         const fn_ptr = self.vtable.commit_transaction_with_id_with_cancellation orelse
             return try self.commitTransactionWithId(alloc, txn_id, begin_timestamp, tables, sync_level);
         return try BoundaryAbi.call("commit_transaction_with_id_with_cancellation", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, txn_id, begin_timestamp, tables, sync_level, cancellation });
+    }
+
+    pub fn supportsTransactionExecution(self: TableWriteSource) bool {
+        return self.vtable.commit_transaction_with_id_with_execution != null;
+    }
+
+    pub fn commitTransactionWithIdAndExecution(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        txn_id: db_mod.types.TxnId,
+        begin_timestamp: u64,
+        tables: []const distributed_txn.TableCommitRequest,
+        sync_level: db_mod.types.SyncLevel,
+        cancellation: db_mod.types.CancellationToken,
+        team: ?*runnable_abi.Team,
+    ) !?distributed_txn.CommitOutcome {
+        const execution = team orelse return self.commitTransactionWithIdAndCancellation(alloc, txn_id, begin_timestamp, tables, sync_level, cancellation);
+        const callback = self.vtable.commit_transaction_with_id_with_execution orelse return error.UnsupportedOperation;
+        return BoundaryAbi.call("commit_transaction_with_id_with_execution", self.boundary_dispatch, callback, .{ self.ptr, alloc, txn_id, begin_timestamp, tables, sync_level, cancellation, execution });
     }
 
     pub fn acknowledgeTransactionCommit(
@@ -1545,6 +1599,112 @@ fn consumerTests() type {
     const test_owner_root = @import("antfly_source_root");
     if (@hasDecl(test_owner_root, "implementation_tests_only") and test_owner_root.implementation_tests_only) return struct {};
     const Suite = struct {
+        test "compiled table write boundary forwards retained execution teams without legacy fallback" {
+            const Fake = struct {
+                expected: ?*runnable_abi.Team = null,
+                calls: usize = 0,
+                legacy_calls: usize = 0,
+                resizes: usize = 0,
+                failure: ?anyerror = null,
+                fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) anyerror!?void {
+                    return null;
+                }
+                fn legacy(raw: *anyopaque, _: std.mem.Allocator, _: []const distributed_txn.TableCommitRequest, _: db_mod.types.SyncLevel, cancellation: db_mod.types.CancellationToken) anyerror!?distributed_txn.CommitOutcome {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.legacy_calls += 1;
+                    try cancellation.check();
+                    return .{ .committed = .{ .participant_count = 0 } };
+                }
+                fn legacyId(raw: *anyopaque, alloc: std.mem.Allocator, _: db_mod.types.TxnId, _: u64, tables: []const distributed_txn.TableCommitRequest, sync_level: db_mod.types.SyncLevel, cancellation: db_mod.types.CancellationToken) anyerror!?distributed_txn.CommitOutcome {
+                    return legacy(raw, alloc, tables, sync_level, cancellation);
+                }
+                fn check(_: *anyopaque) callconv(.c) runtime_error_abi.Status {
+                    return runtime_error_abi.statusFromError(error.UnsupportedOperation);
+                }
+                fn phase(_: *anyopaque, _: c_int) callconv(.c) runtime_error_abi.Status {
+                    return runtime_error_abi.statusFromError(error.UnsupportedOperation);
+                }
+                fn resize(raw: *anyopaque, slots: usize) callconv(.c) runtime_error_abi.Status {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    if (slots != 3) return runtime_error_abi.statusFromError(error.InvalidRunnableDemand);
+                    self.resizes += 1;
+                    return .{};
+                }
+                fn commit(raw: *anyopaque, _: std.mem.Allocator, _: []const distributed_txn.TableCommitRequest, _: db_mod.types.SyncLevel, cancellation: db_mod.types.CancellationToken, team: *runnable_abi.Team) anyerror!?distributed_txn.CommitOutcome {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    try std.testing.expect(self.expected.? == team);
+                    self.calls += 1;
+                    try cancellation.check();
+                    try team.reserve(8);
+                    defer team.finish();
+                    try std.testing.expectEqual(@as(usize, 2), team.childCapacity());
+                    // The boundary forwards the bounded allocator itself,
+                    // rather than replacing it with an unbounded fallback.
+                    try std.testing.expectError(error.OutOfMemory, team.allocator.alloc(u8, 1));
+                    if (self.failure) |err| return err;
+                    return .{ .committed = .{ .participant_count = 1 } };
+                }
+                fn commitId(raw: *anyopaque, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, timestamp: u64, tables: []const distributed_txn.TableCommitRequest, sync_level: db_mod.types.SyncLevel, cancellation: db_mod.types.CancellationToken, team: *runnable_abi.Team) anyerror!?distributed_txn.CommitOutcome {
+                    try std.testing.expectEqual(std.mem.zeroes(db_mod.types.TxnId), txn_id);
+                    try std.testing.expectEqual(@as(u64, 19), timestamp);
+                    return commit(raw, alloc, tables, sync_level, cancellation, team);
+                }
+                fn foreignDispatch(contract: *const runtime_native_abi.CallContract, callback: *const anyopaque, args: *const anyopaque, output: ?*anyopaque) callconv(.c) runtime_error_abi.Status {
+                    return TableWriteSource.BoundaryAbi.local_dispatch(contract, callback, args, output);
+                }
+            };
+            var fake = Fake{};
+            var storage: [0]u8 = .{};
+            var bounded = std.heap.FixedBufferAllocator.init(&storage);
+            var team: runnable_abi.Team = .{
+                .borrow = .{ .context = &fake, .cpu_slots = 1, .parent_class = @backingInt(runnable_abi.Class.write), .checkpoint = Fake.check, .park = Fake.phase, .enter = Fake.phase, .resize_team = Fake.resize },
+                .maximum_slots = 3,
+                .allocator = bounded.allocator(),
+            };
+            fake.expected = &team;
+            const txn_id = std.mem.zeroes(db_mod.types.TxnId);
+            var canceled = std.atomic.Value(bool).init(false);
+            const cancellation = db_mod.types.CancellationToken.fromAtomic(&canceled);
+            inline for (.{ TableWriteSource.BoundaryAbi.local_dispatch, Fake.foreignDispatch }) |dispatch| {
+                const source: TableWriteSource = .{
+                    .ptr = &fake,
+                    .boundary_dispatch = dispatch,
+                    .vtable = &.{ .batch = Fake.batch, .commit_batch_with_cancellation = Fake.legacy, .commit_transaction_with_id_with_cancellation = Fake.legacyId, .commit_batch_with_execution = Fake.commit, .commit_transaction_with_id_with_execution = Fake.commitId },
+                };
+                try std.testing.expect(source.supportsTransactionExecution());
+                const outcome = (try source.commitBatchWithExecution(std.testing.allocator, &.{}, .write, cancellation, &team)).?;
+                try std.testing.expect(outcome == .committed);
+                try std.testing.expect(team.state == .joined);
+                _ = try source.commitTransactionWithIdAndExecution(std.testing.allocator, txn_id, 19, &.{}, .write, cancellation, &team);
+                inline for (.{ error.SchedulerFull, error.RunnableWaitTimeout, error.CommitDecisionUnknown, error.RaftBatchWriteOutcomeUnknown }) |failure| {
+                    fake.failure = failure;
+                    try std.testing.expectError(failure, source.commitBatchWithExecution(std.testing.allocator, &.{}, .write, cancellation, &team));
+                    try std.testing.expectError(failure, source.commitTransactionWithIdAndExecution(std.testing.allocator, txn_id, 19, &.{}, .write, cancellation, &team));
+                    try std.testing.expect(team.state == .joined);
+                }
+                fake.failure = null;
+                canceled.store(true, .release);
+                const resizes = fake.resizes;
+                try std.testing.expectError(error.Canceled, source.commitBatchWithExecution(std.testing.allocator, &.{}, .write, cancellation, &team));
+                try std.testing.expectEqual(resizes, fake.resizes);
+                canceled.store(false, .release);
+                try std.testing.expectEqual(@as(usize, 0), fake.legacy_calls);
+                _ = try source.commitBatchWithExecution(std.testing.allocator, &.{}, .write, cancellation, null);
+                _ = try source.commitTransactionWithIdAndExecution(std.testing.allocator, txn_id, 19, &.{}, .write, cancellation, null);
+                try std.testing.expectEqual(@as(usize, 2), fake.legacy_calls);
+                fake.legacy_calls = 0;
+                const unsupported: TableWriteSource = .{
+                    .ptr = &fake,
+                    .boundary_dispatch = dispatch,
+                    .vtable = &.{ .batch = Fake.batch, .commit_batch_with_cancellation = Fake.legacy, .commit_transaction_with_id_with_cancellation = Fake.legacyId },
+                };
+                try std.testing.expect(!unsupported.supportsTransactionExecution());
+                try std.testing.expectError(error.UnsupportedOperation, unsupported.commitBatchWithExecution(std.testing.allocator, &.{}, .write, cancellation, &team));
+                try std.testing.expectError(error.UnsupportedOperation, unsupported.commitTransactionWithIdAndExecution(std.testing.allocator, txn_id, 19, &.{}, .write, cancellation, &team));
+                try std.testing.expectEqual(@as(usize, 0), fake.legacy_calls);
+            }
+        }
+
         test "compiled table write boundary transports cancellation and committed failure identity" {
             const Fake = struct {
                 calls: usize = 0,

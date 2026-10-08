@@ -386,3 +386,16 @@ The coordinator fanout/allocator proposal is supplemental: syntax checks pass,
 but coordinator type checking and runtime gates remain pending. Team forwarding
 from request ingress/table-write contracts is not yet wired. Accepted completion
 I/O parking and whole-node/default qualification remain required.
+
+
+Private table-write callbacks now accept an explicit retained execution team,
+with fail-closed support checks and no legacy fallback for supplied capabilities.
+Two named direct/compiled callback regressions plus their discovery test pass on
+native and pinned Nix/glibc; see
+[table-write execution contract receipts](receipts/2026-10-07/table-write-execution-contract/README.md).
+The focused contract root must import the source directly: the initial consumer
+module roots discovered neither named regression. SQL ingress/request-context,
+serial bound storage, provisioned/hosted storage and coordinator forwarding are
+supplemental pending full archive and transaction qualification. Protected COMMIT
+keeps its single control slot. Accepted completion parking and default/whole-node
+proof remain outstanding.

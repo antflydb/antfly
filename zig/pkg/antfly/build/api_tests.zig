@@ -66,6 +66,21 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const test_imports = @import("../../../build_support/antfly/test_support.zig").Imports{ .runtime = antfly_imports, .vopr = options.vopr, .lmdb_engine = options.lmdb_engine };
     const antfly_test_mod = options.antfly_test_mod;
     const run_lib_usermgr_tests = options.run_lib_usermgr_tests;
+    const table_write_execution_root = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/table_write_execution_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configureConsumer(b, table_write_execution_root);
+    table_write_execution_root.addImport("antfly_source_root", table_write_execution_root);
+    const table_write_execution_tests = b.addTest(.{
+        .name = "table-write-execution-contract-tests",
+        .root_module = table_write_execution_root,
+        .filters = &.{"compiled table write boundary"},
+        .max_rss = 2 * 1024 * 1024 * 1024,
+    });
+    b.step("antfly-table-write-execution-contract-test", "Verify retained table-write teams across private callback dispatch")
+        .dependOn(&b.addRunArtifact(table_write_execution_tests).step);
     // This contract gate owns only the API execution capsule and inference
     // control/admission boundary; it needs no resident storage/model archive.
     const inference_owner_sources = b.createModule(.{
@@ -1186,6 +1201,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "distributed txn coordinator never restarts a transaction id on topology change",
             "db transaction recovery runtime resolves table-group participants through distributed txn resolver",
             "compiled table write boundary transports cancellation and committed failure identity",
+            "compiled table write boundary forwards retained execution teams without legacy fallback",
             "pre-decision context deadline has typed admission provenance",
             "bound stable single-group transaction retry does not reapply transforms",
             "bound single-group batch reports prepared intent conflicts",
@@ -1842,7 +1858,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .dependOn(&addFilteredTestRunArtifact(b, row_semantics_codec_tests).step);
     const api_transaction_contract_tests = b.addTest(.{
         .root_module = api_transactions_docid_test_mod,
-        .filters = &.{ "distributed txn", "hosted participant", "stable distributed transaction retry", "internal batch parser owns binary staged restore controls", "merge page internal codec", "online merge private", "durable SQL session rejects duplicate savepoint ids" },
+        .filters = &.{ "compiled table write boundary", "distributed txn", "hosted participant", "stable distributed transaction retry", "internal batch parser owns binary staged restore controls", "merge page internal codec", "online merge private", "durable SQL session rejects duplicate savepoint ids" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-transactions-test", "Run transaction coordinator and participant contracts").dependOn(&addFilteredTestRunArtifact(b, api_transaction_contract_tests).step);
