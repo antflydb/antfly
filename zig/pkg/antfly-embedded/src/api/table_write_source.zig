@@ -1095,8 +1095,10 @@ pub const TableWriteSource = struct {
         participants: []const []const u8,
         context: distributed_txn.PreDecisionContext,
     ) !?void {
-        const fn_ptr = self.vtable.txn_begin_group_local_with_pre_decision_context orelse
+        const fn_ptr = self.vtable.txn_begin_group_local_with_pre_decision_context orelse {
+            if (context.requiresAwareCallback()) return error.UnsupportedOperation;
             return try self.txnBeginGroupLocal(alloc, group_id, table_name, txn_id, begin_timestamp, topology_epoch, retain_terminal, participants);
+        };
         return try BoundaryAbi.call("txn_begin_group_local_with_pre_decision_context", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, txn_id, begin_timestamp, topology_epoch, retain_terminal, participants, context });
     }
 
@@ -1112,8 +1114,10 @@ pub const TableWriteSource = struct {
     ) !?void {
         if (req.range_guards.len != 0 and context.route_fence == null) return error.CatalogRouteFenceRequired;
         if (context.route_fence != null and self.vtable.txn_prepare_group_local_with_pre_decision_context == null) return error.CatalogRouteFenceUnsupported;
-        const fn_ptr = self.vtable.txn_prepare_group_local_with_pre_decision_context orelse
+        const fn_ptr = self.vtable.txn_prepare_group_local_with_pre_decision_context orelse {
+            if (context.requiresAwareCallback()) return error.UnsupportedOperation;
             return try self.txnPrepareGroupLocal(alloc, group_id, table_name, txn_id, topology_epoch, req);
+        };
         return try BoundaryAbi.call("txn_prepare_group_local_with_pre_decision_context", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, txn_id, topology_epoch, req, context });
     }
 
@@ -1599,6 +1603,86 @@ fn consumerTests() type {
     const test_owner_root = @import("antfly_source_root");
     if (@hasDecl(test_owner_root, "implementation_tests_only") and test_owner_root.implementation_tests_only) return struct {};
     const Suite = struct {
+        test "compiled table write boundary never discards pre-decision fences in legacy fallback" {
+            const Fake = struct {
+                legacy_calls: usize = 0,
+                aware_calls: usize = 0,
+                expected: distributed_txn.PreDecisionContext = .{},
+                fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) anyerror!?void {
+                    return null;
+                }
+                fn begin(raw: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, _: u64, _: u64, _: bool, _: []const []const u8) anyerror!?void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.legacy_calls += 1;
+                    return {};
+                }
+                fn prepare(raw: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, _: u64, _: db_mod.types.TransactionIntentRequest) anyerror!?void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.legacy_calls += 1;
+                    return {};
+                }
+                fn beginAware(raw: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, _: u64, _: u64, _: bool, _: []const []const u8, context: distributed_txn.PreDecisionContext) anyerror!?void {
+                    return aware(raw, context);
+                }
+                fn prepareAware(raw: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, _: u64, _: db_mod.types.TransactionIntentRequest, context: distributed_txn.PreDecisionContext) anyerror!?void {
+                    return aware(raw, context);
+                }
+                fn aware(raw: *anyopaque, context: distributed_txn.PreDecisionContext) anyerror!?void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.aware_calls += 1;
+                    try std.testing.expectEqualDeep(self.expected, context);
+                    try context.cancellation.check();
+                    return {};
+                }
+                fn fence(_: *const anyopaque) anyerror!void {
+                    return error.DeadlineExceeded;
+                }
+                fn foreignDispatch(contract: *const runtime_native_abi.CallContract, callback: *const anyopaque, args: *const anyopaque, output: ?*anyopaque) callconv(.c) runtime_error_abi.Status {
+                    return TableWriteSource.BoundaryAbi.local_dispatch(contract, callback, args, output);
+                }
+            };
+            var fake: Fake = .{};
+            var canceled = std.atomic.Value(bool).init(false);
+            const io = std.testing.io;
+            const clock = runtime_native_abi.IoBorrow.init(&io);
+            const contexts = [_]distributed_txn.PreDecisionContext{
+                .{ .deadline_ns = 123 },                                                   .{ .deadline_io = clock },
+                .{ .cancellation = db_mod.types.CancellationToken.fromAtomic(&canceled) }, .{ .cancellation = .{ .ptr = &canceled } },
+                .{ .cancellation = .{ .check_fn = Fake.fence } },                          .{ .cancellation = .{ .ptr = &canceled, .check_fn = Fake.fence } },
+                .{ .restore_staging_scope = @splat(1) },                                   .{ .restore_staging_plan_id = @splat(2) },
+            };
+            const id = std.mem.zeroes(db_mod.types.TxnId);
+            inline for (.{ TableWriteSource.BoundaryAbi.local_dispatch, Fake.foreignDispatch }) |dispatch| {
+                var source: TableWriteSource = .{ .ptr = &fake, .boundary_dispatch = dispatch, .vtable = &.{ .batch = Fake.batch, .txn_begin_group_local = Fake.begin, .txn_prepare_group_local = Fake.prepare } };
+                const before = fake.legacy_calls;
+                for (contexts) |context| {
+                    try std.testing.expectError(error.UnsupportedOperation, source.txnBeginGroupLocalWithPreDecisionContext(std.testing.allocator, 7, "docs", id, 1, 2, false, &.{}, context));
+                    try std.testing.expectError(error.UnsupportedOperation, source.txnPrepareGroupLocalWithPreDecisionContext(std.testing.allocator, 7, "docs", id, 2, .{}, context));
+                }
+                try std.testing.expectEqual(before, fake.legacy_calls);
+                _ = try source.txnBeginGroupLocalWithPreDecisionContext(std.testing.allocator, 7, "docs", id, 1, 2, false, &.{}, .{});
+                _ = try source.txnPrepareGroupLocalWithPreDecisionContext(std.testing.allocator, 7, "docs", id, 2, .{}, .{});
+                try std.testing.expectEqual(before + 2, fake.legacy_calls);
+                source.vtable = &.{ .batch = Fake.batch, .txn_begin_group_local = Fake.begin, .txn_prepare_group_local = Fake.prepare, .txn_begin_group_local_with_pre_decision_context = Fake.beginAware, .txn_prepare_group_local_with_pre_decision_context = Fake.prepareAware };
+                for (contexts) |context| {
+                    fake.expected = context;
+                    if (context.cancellation.ptr != null and context.cancellation.check_fn != null) {
+                        try std.testing.expectError(error.DeadlineExceeded, source.txnBeginGroupLocalWithPreDecisionContext(std.testing.allocator, 7, "docs", id, 1, 2, false, &.{}, context));
+                        try std.testing.expectError(error.DeadlineExceeded, source.txnPrepareGroupLocalWithPreDecisionContext(std.testing.allocator, 7, "docs", id, 2, .{}, context));
+                    } else {
+                        _ = try source.txnBeginGroupLocalWithPreDecisionContext(std.testing.allocator, 7, "docs", id, 1, 2, false, &.{}, context);
+                        _ = try source.txnPrepareGroupLocalWithPreDecisionContext(std.testing.allocator, 7, "docs", id, 2, .{}, context);
+                    }
+                }
+                canceled.store(true, .release);
+                fake.expected = .{ .cancellation = db_mod.types.CancellationToken.fromAtomic(&canceled) };
+                try std.testing.expectError(error.Canceled, source.txnBeginGroupLocalWithPreDecisionContext(std.testing.allocator, 7, "docs", id, 1, 2, false, &.{}, fake.expected));
+                try std.testing.expectError(error.Canceled, source.txnPrepareGroupLocalWithPreDecisionContext(std.testing.allocator, 7, "docs", id, 2, .{}, fake.expected));
+                canceled.store(false, .release);
+            }
+            try std.testing.expectEqual(@as(usize, 36), fake.aware_calls);
+        }
+
         test "compiled table write boundary forwards retained execution teams without legacy fallback" {
             const Fake = struct {
                 expected: ?*runnable_abi.Team = null,

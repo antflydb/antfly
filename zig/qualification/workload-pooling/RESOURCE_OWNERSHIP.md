@@ -489,3 +489,15 @@ helper tests pass; see
 Static source selection is preserved, but compiled inventories, actual batch tests
 and compiler-memory reduction remain unverified. Runtime limits are unchanged.
 Full production, storage deadline/handoff and default qualification remain pending.
+
+
+BEGIN/PREPARE callback wrappers now reject legacy fallback when an explicitly
+supplied pre-decision deadline/clock/token/route/restore context cannot be carried.
+The preserved negative test reproduced legacy success with a supplied deadline.
+All 41 focused boundary/task/SQL-team/owner/worker/cleanup contracts execute and
+pass on native and pinned Nix/glibc; see
+[pre-decision fence receipts](receipts/2026-10-08/predecision-fences/README.md).
+Empty contexts preserve legacy behavior; capable callbacks preserve context and
+exact cancellation/checkpoint errors. Shared completion deadlines across physical
+coordinator/storage waits, pre-seal task handoff and durable recovery transfer
+remain unfinished. This is callback proof, not default or physical wait proof.

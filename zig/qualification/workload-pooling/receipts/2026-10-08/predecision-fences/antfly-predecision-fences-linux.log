@@ -1,0 +1,56 @@
+antfly-http-cleanup-owner-test
++- run test http-cleanup-owner-tests w
+H2 stream handler error: error.DeadlineExceeded
+failed command: /cache/o/bf4cc1b2ab3b17a7728d5757586248e4/http-cleanup-owner-tests --cache-dir=/cache --seed=0x99d798a8 --listen=-
+
+antfly-inference-worker-owner-handoff-test
++- run test inference-worker-owner-handoff-tests w
+REAL_SINK transport=h1 cancel=false start
+REAL_SINK await backpressure
+REAL_SINK output status=timeout begins=5 ends=5
+REAL_SINK await peer EOF
+REAL_SINK transport=h1 cancel=true start
+REAL_SINK await backpressure
+REAL_SINK output status=canceled begins=5 ends=5
+REAL_SINK await peer EOF
+REAL_SINK transport=h2 cancel=false start
+REAL_SINK await backpressure
+REAL_SINK output status=timeout begins=168 ends=168
+REAL_SINK await peer EOF
+REAL_SINK transport=h2 cancel=true start
+REAL_SINK await backpressure
+REAL_SINK output status=canceled begins=164 ends=164
+REAL_SINK await peer EOF
+failed command: /cache/o/d9ec1b6ebfd1138cb4c314db6a6f8771/inference-worker-owner-handoff-tests --cache-dir=/cache --seed=0x99d798a8 --listen=-
+
+Build Summary: 28/28 steps succeeded; 41/41 tests passed
+antfly-http-cleanup-owner-test success
++- run test http-cleanup-owner-tests 2 pass (2 total) 266ms MaxRSS:32M
+   +- compile test http-cleanup-owner-tests safe aarch64-linux-gnu success 14s MaxRSS:743M
+antfly-inference-owner-handoff-test success
++- run test inference-owner-handoff-tests 24 pass (24 total) 7ms MaxRSS:32M
+   +- compile test inference-owner-handoff-tests safe aarch64-linux-gnu success 15s MaxRSS:934M
+antfly-inference-worker-owner-handoff-test success
++- run test inference-worker-owner-handoff-tests 2 pass (2 total) 1s MaxRSS:32M
+   +- compile test inference-worker-owner-handoff-tests safe aarch64-linux-gnu success 13s MaxRSS:706M
+antfly-sql-write-team-test success
++- run test sql-write-team-tests 6 pass (6 total) 2ms MaxRSS:32M
+   +- compile test sql-write-team-tests safe aarch64-linux-gnu success 11s MaxRSS:636M
+antfly-completion-task-test success
++- run test completion-task-tests 3 pass (3 total) 210ms MaxRSS:32M
+   +- compile test completion-task-tests safe aarch64-linux-gnu success 11s MaxRSS:640M
+antfly-table-write-execution-contract-test success
++- run test table-write-execution-contract-tests 4 pass (4 total) 9ms MaxRSS:32M
+   +- compile test table-write-execution-contract-tests safe aarch64-linux-gnu success 12s MaxRSS:947M
+      +- options cached
+      +- options cached
+      +- options cached
+      +- WriteFile tokenizer.json success
+      +- WriteFile lib/pdf/fonts/roboto/Roboto-Regular.ttf success
+      +- options cached
+      +- run exe patch_sentencepiece_proto (sentencepiece_proto) success 30ms
+         +- compile exe patch_sentencepiece_proto safe native cached 47ms MaxRSS:57M
+         +- run exe protoc-zig (sentencepiece_proto_raw) success 57ms
+         |  +- compile exe protoc-zig safe native cached 78ms MaxRSS:59M
+         +- run exe protoc-zig (sentencepiece_proto_raw) (+1 more reused dependencies)
+
