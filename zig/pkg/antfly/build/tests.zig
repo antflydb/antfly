@@ -6900,7 +6900,6 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "metadata.table_workflow.",
             "metadata.transition_state.",
             "metadata.relational_topology_admission.",
-            "transition actions module compiles",
             "metadata.transition_controller.",
             "metadata.transition_driver.",
             "metadata.online_merge.",

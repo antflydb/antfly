@@ -54387,7 +54387,19 @@ fn implementationTests() type {
             // exact owner observation and must be able to discharge the target fence;
             // carrying the cached false bit forward would leave completion unknown
             // forever after restart.
-            try std.testing.expect(source.overlayCachedManagedRuntimeStatusBestEffort("docs", 7001, cached.db));
+            // Admission is nonblocking and native publication may still hold the
+            // apply lock. Wait for the exact owner observation, rather than requiring
+            // the first opportunistic sample to win a scheduling race.
+            const observation_deadline_ns = platform_time.monotonicNs() + 15 * std.time.ns_per_s;
+            while (platform_time.monotonicNs() < observation_deadline_ns) {
+                _ = source.overlayCachedManagedRuntimeStatusBestEffort("docs", 7001, cached.db);
+                var observed = (try source.source().localRuntimeStatuses(alloc, "docs")).?;
+                const complete = observed.items[0].metadata.target_observation_complete and
+                    observed.items[0].stats.indexes[0].replay_target_sequence == 2;
+                observed.deinit(alloc);
+                if (complete) break;
+                try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+            }
             {
                 var statuses = (try source.source().localRuntimeStatuses(alloc, "docs")).?;
                 defer statuses.deinit(alloc);
@@ -54412,7 +54424,7 @@ fn implementationTests() type {
 
             // A global replay entry for another managed-index kind must not recreate
             // dense replay debt in the next authoritative owner publication.
-            try std.testing.expect(source.publishManagedRuntimeStatusBestEffort("docs", 7001, cached.db));
+            try publishRuntimeStatusSnapshotConsistent(&source, alloc, "docs", 7001, cached.db);
             var statuses = (try source.source().localRuntimeStatuses(alloc, "docs")).?;
             defer statuses.deinit(alloc);
             try std.testing.expectEqual(@as(u64, 2), statuses.items[0].stats.indexes[0].replay_target_sequence);

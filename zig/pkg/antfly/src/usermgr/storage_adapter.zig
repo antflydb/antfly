@@ -17,14 +17,15 @@ const std = @import("std");
 const casbin = @import("antfly_casbin");
 const storage = @import("usermgr_storage");
 const user_manager = @import("antfly_local_sources").usermgr_user_manager;
+const portable_seed_contract = @import("portable_seed_contract.zig");
 
 const Allocator = std.mem.Allocator;
 const backend_erased = storage.backend_erased;
 const backend_types = backend_erased.types;
 const lsm_backend = storage.lsm_backend;
 
-pub const users_namespace: backend_types.Namespace = .{ .name = "usermgr_users" };
-pub const casbin_namespace: backend_types.Namespace = .{ .name = "usermgr_casbin" };
+pub const users_namespace: backend_types.Namespace = .{ .name = portable_seed_contract.users_namespace };
+pub const casbin_namespace: backend_types.Namespace = .{ .name = portable_seed_contract.casbin_namespace };
 
 const PersistedPermission = struct {
     resource: []const u8,
@@ -345,15 +346,7 @@ pub fn materializePortableSeedToPath(
 }
 
 fn validPortableSeedKey(namespace: backend_types.Namespace, key: []const u8) bool {
-    if (std.mem.eql(u8, namespace.name.?, users_namespace.name.?)) {
-        return std.mem.startsWith(u8, key, "userpass:") or
-            std.mem.startsWith(u8, key, "usermeta:") or
-            std.mem.startsWith(u8, key, "userinstance:") or
-            std.mem.startsWith(u8, key, "apikey:");
-    }
-    return std.mem.startsWith(u8, key, "p::") or
-        std.mem.startsWith(u8, key, "p2::") or
-        std.mem.startsWith(u8, key, "g::");
+    return portable_seed_contract.validKey(namespace.name orelse return false, key);
 }
 
 pub const StorageCasbinAdapter = struct {
@@ -730,6 +723,7 @@ test "portable auth seed preserves credentials policies roles filters and api ke
     const artifact = try source.exportPortableSeedWithLease(alloc, "seed-auth-7", &lease);
     lease.release();
     defer alloc.free(artifact);
+    try @import("../storage/hot_standby/seed_topology.zig").validatePortableAuthSeedBody(alloc, "seed-auth-7", artifact);
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

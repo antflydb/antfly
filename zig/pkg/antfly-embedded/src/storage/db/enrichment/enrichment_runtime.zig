@@ -31862,7 +31862,9 @@ test "document extraction missing OCR model is a terminal unit failure" {
 
     try std.testing.expectEqualStrings("failed_ocr", units[0].extraction_status.?);
     try std.testing.expect(!units[0].ocr_used);
-    try std.testing.expectEqual(@as(?bool, true), units[0].ocr_failure_retryable);
+    // A missing configured model is terminal until the operator repairs the
+    // configuration; it must not schedule an automatic retry loop.
+    try std.testing.expectEqual(@as(?bool, false), units[0].ocr_failure_retryable);
     try std.testing.expect(std.mem.indexOf(u8, units[0].extraction_warning.?, "ModelNotFound") != null);
 }
 
