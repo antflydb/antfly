@@ -476,3 +476,16 @@ HTTP/pgwire bridge construction and SQL-adapter forwarding remain supplemental
 pending full API/archive proof. SQL sealing/participant acceptance has not moved
 to the completion task. Finite physical storage waits, recovery transfer and
 whole-node/default qualification remain incomplete; no production activation.
+
+
+The older GNU production gate ended with a signal-KILL compiler failure on its
+monolithic pooling test root; dependent jobs did not launch. The current gate now
+proposes four serial compiler batches preserving all 31 pooling filters, disjoint
+first-match ownership and combined inventory auditing. A dedicated participant-team
+gate makes that actual regression's result explicit without replacing the broad
+transaction gate. Native/pinned Nix/glibc build graph checks and ten existing audit
+helper tests pass; see
+[qualification batch receipts](receipts/2026-10-08/qualification-batches/README.md).
+Static source selection is preserved, but compiled inventories, actual batch tests
+and compiler-memory reduction remain unverified. Runtime limits are unchanged.
+Full production, storage deadline/handoff and default qualification remain pending.

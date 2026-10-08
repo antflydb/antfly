@@ -277,18 +277,37 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "read fence owns bounded",
         "read fence invalidates",
     };
-    const pooling_tests = b.addTest(.{
-        .name = "default-workload-pooling-tests",
-        .root_module = options.api_http_runtime_test_mod,
-        .filters = &pooling_filters,
-        // Runnable integration compilation peaked at 20.18 GB on macOS and
-        // 24.11 GB with Nix/glibc Zig on GNU AArch64. These compiler allowances
-        // are separate from the unchanged 2/4 GiB qualification runtime limits.
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 22 else 23) * 1024 * 1024 * 1024,
-        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
-    });
-    b.step("antfly-workload-pooling-test", "Run bounded waiting and shared HTTP/SQL admission contracts")
-        .dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, pooling_tests, &pooling_filters).step);
+    // Keep the entire curated selection, but compile it in serial batches.
+    // The previous monolithic Linux test compiler was killed with a 22 GiB
+    // container limit. Batching changes compilation, not runtime resource limits.
+    const pooling_batch_size = 8;
+    const pooling_batch_count = (pooling_filters.len + pooling_batch_size - 1) / pooling_batch_size;
+    const test_support = @import("../../../build_support/antfly/test_support.zig");
+    var pooling_batches: [pooling_batch_count]test_support.OwnerTests = undefined;
+    var previous_pooling_compile: ?*std.Build.Step.Compile = null;
+    for (&pooling_batches, 0..) |*batch, index| {
+        const start = index * pooling_batch_size;
+        const filters = pooling_filters[start..@min(start + pooling_batch_size, pooling_filters.len)];
+        const tests = b.addTest(.{
+            .name = b.fmt("default-workload-pooling-tests-{d}", .{index}),
+            .root_module = options.api_http_runtime_test_mod,
+            .filters = filters,
+            .max_rss = @as(usize, if (target.result.os.tag == .macos) 22 else 23) * 1024 * 1024 * 1024,
+            .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+        });
+        // Inventory auditing needs every batch compiled first. Chain compiler
+        // steps (not runs) to avoid an audit/compile cycle and concurrent peaks.
+        if (previous_pooling_compile) |previous| tests.step.dependOn(&previous.step);
+        previous_pooling_compile = tests;
+        // Filters can overlap (e.g. "runnable scheduler" also matches
+        // "config runnable scheduler"). Give each test to its first batch;
+        // otherwise the combined inventory correctly rejects duplicate owners.
+        batch.* = .{ .artifact = tests, .filters = filters, .skip_filters = pooling_filters[0..start] };
+    }
+    const pooling_step = b.step("antfly-workload-pooling-test", "Run all bounded waiting and shared HTTP/SQL admission contracts in serial compiler batches");
+    // Combined inventory validates caller selections across all batches; runs
+    // stay serial and every original default filter remains selected.
+    test_support.addOwnerTestRuns(b, pooling_step, &pooling_batches, &.{});
 
     const read_authority_filters = [_][]const u8{ "SQL pgwire credential snapshot", "SQL read resume fences", "read fence validates each", "read fence owns bounded", "read fence invalidates" };
     const read_authority_tests = b.addTest(.{
@@ -1904,6 +1923,17 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-transactions-test", "Run transaction coordinator and participant contracts").dependOn(&addFilteredTestRunArtifact(b, api_transaction_contract_tests).step);
+    const participant_team_tests = b.addTest(.{
+        .name = "participant-team-contract-tests",
+        .root_module = api_transactions_docid_test_mod,
+        .filters = &.{"distributed txn participant team bounds CPU and child allocations"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const participant_team_run = addFilteredTestRunArtifact(b, participant_team_tests);
+    participant_team_run.addArg("--require-no-skips");
+    b.step("antfly-participant-team-test", "Require the actual coordinator participant team and bounded child allocation regression")
+        .dependOn(&participant_team_run.step);
+
     const run_api_public_table_http_docid_tests = addFilteredTestRunArtifact(b, api_public_table_http_docid_tests);
     b.step("antfly-api-public-table-http-test", "Run public table HTTP response contracts").dependOn(&run_api_public_table_http_docid_tests.step);
     const api_relational_row_contract_tests = b.addTest(.{
