@@ -173,16 +173,7 @@ pub const TuplePlan = struct {
             }
             var fold_ascii = false;
             if (definition.collation) |collation| {
-                if (column_type != .string) return error.UnsupportedRelationalIndexCollation;
-                if (std.ascii.eqlIgnoreCase(collation, "C") or
-                    std.ascii.eqlIgnoreCase(collation, "POSIX") or
-                    std.ascii.eqlIgnoreCase(collation, "binary"))
-                {} else if (std.ascii.eqlIgnoreCase(collation, "ci") or
-                    std.ascii.eqlIgnoreCase(collation, "case_insensitive") or
-                    std.ascii.eqlIgnoreCase(collation, "antfly.case_insensitive"))
-                {
-                    fold_ascii = true;
-                } else return error.UnsupportedRelationalIndexCollation;
+                fold_ascii = try expressions.foldAsciiCollation(column_type, collation);
             }
             key.* = .{
                 .ordinal = @intCast(ordinal),

@@ -13707,7 +13707,7 @@ export interface components {
         /** @enum {string} */
         RelationalExpressionOp: "literal" | "column" | "add" | "subtract" | "multiply" | "divide" | "negate" | "concat" | "coalesce" | "lower_ascii" | "upper_ascii" | "eq" | "ne" | "gt" | "gte" | "lt" | "lte" | "is_null" | "is_not_null" | "is_distinct" | "is_not_distinct" | "and" | "or" | "not" | "cast" | "case_when" | "modulo" | "in_list" | "not_in_list";
         /** @enum {string} */
-        RelationalExpressionType: "string" | "blob" | "boolean" | "datetime" | "integer" | "number" | "numeric";
+        RelationalExpressionType: "string" | "blob" | "boolean" | "datetime" | "integer" | "number" | "numeric" | "sql_array";
         /**
          * @description Exact PostgreSQL builtin identity for a relational root scalar column.
          *     SQL array columns use SQLArrayElementType for their element identity.
@@ -13765,6 +13765,17 @@ export interface components {
          *     and signed-scale coercion. Overflow is checked when the selected cast
          *     executes; unselected lazy branches do not fail. Modifier-bearing programs
          *     require reader capability version 23 even with integer/boolean output.
+         *     The sql_array expression type requires sql_type on literals, including
+         *     typed NULL, to declare the element builtin. Non-null literals use the
+         *     ordinal SQL array envelope (dimensions with length/lower_bound, values,
+         *     and sql_nulls), retaining shape and lower bounds. Array columns derive
+         *     their exact element identity from the immutable schema. Comparisons,
+         *     IN, COALESCE and CASE require matching array element identities; no
+         *     element type is inferred from values. Array-dependent programs require
+         *     reader capability version 24 even with scalar output. Assignment to a
+         *     NUMERIC array column applies its precision/signed-scale modifier to
+         *     each element. Array-valued ordered index keys and array casts are not
+         *     supported by this expression contract.
          *     case_when takes alternating boolean conditions and result expressions,
          *     followed by a mandatory fallback result (3 to 31 arguments, at most
          *     15 branches). Conditions are evaluated in order; only the selected
@@ -13783,7 +13794,7 @@ export interface components {
         RelationalScalarExpression: {
             op: components["schemas"]["RelationalExpressionOp"];
             type?: components["schemas"]["RelationalExpressionType"];
-            /** @description Numeric builtin result identity; accepted only on numeric literals, arithmetic, negate, and cast. Requires schema capability version 18. */
+            /** @description Numeric builtin result identity on numeric literals, arithmetic, negate, and cast (capability version 18), or required array element identity on sql_array literals including typed NULL (capability version 24). */
             sql_type?: components["schemas"]["SQLBuiltinType"];
             /** @description Optional precision/signed-scale coercion; accepted only on cast with type numeric and sql_type numeric. Requires reader capability version 23. */
             numeric_modifier?: components["schemas"]["SQLNumericModifier"];

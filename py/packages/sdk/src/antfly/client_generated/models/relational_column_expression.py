@@ -51,6 +51,17 @@ class RelationalColumnExpression:
             and signed-scale coercion. Overflow is checked when the selected cast
             executes; unselected lazy branches do not fail. Modifier-bearing programs
             require reader capability version 23 even with integer/boolean output.
+            The sql_array expression type requires sql_type on literals, including
+            typed NULL, to declare the element builtin. Non-null literals use the
+            ordinal SQL array envelope (dimensions with length/lower_bound, values,
+            and sql_nulls), retaining shape and lower bounds. Array columns derive
+            their exact element identity from the immutable schema. Comparisons,
+            IN, COALESCE and CASE require matching array element identities; no
+            element type is inferred from values. Array-dependent programs require
+            reader capability version 24 even with scalar output. Assignment to a
+            NUMERIC array column applies its precision/signed-scale modifier to
+            each element. Array-valued ordered index keys and array casts are not
+            supported by this expression contract.
             case_when takes alternating boolean conditions and result expressions,
             followed by a mandatory fallback result (3 to 31 arguments, at most
             15 branches). Conditions are evaluated in order; only the selected

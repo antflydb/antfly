@@ -1,6 +1,32 @@
 from antfly import RelationalColumnExpression, RelationalIndexPredicate
-from antfly.client_generated.models.sql_builtin_type import SQLBuiltinType
 from antfly.client_generated.models.relational_expression_op import RelationalExpressionOp
+from antfly.client_generated.models.relational_expression_type import RelationalExpressionType
+from antfly.client_generated.models.sql_builtin_type import SQLBuiltinType
+
+
+def test_generated_array_literal_keeps_exact_cells_bounds_and_sql_nulls():
+    for identity in SQLBuiltinType:
+        for value in (
+            None,
+            {
+                "dimensions": [{"length": 2, "lower_bound": -4}],
+                "values": ["9007199254740993", None],
+                "sql_nulls": [False, True],
+            },
+        ):
+            source = {
+                "column": "a",
+                "expression": {
+                    "op": "literal",
+                    "type": "sql_array",
+                    "sql_type": identity.value,
+                    "value": value,
+                },
+            }
+            model = RelationalColumnExpression.from_dict(source)
+            assert model.expression.type_ is RelationalExpressionType.SQL_ARRAY
+            assert model.expression.sql_type is identity
+            assert model.to_dict() == source
 
 
 def test_generated_recursive_expression_and_partial_predicate_roundtrip():

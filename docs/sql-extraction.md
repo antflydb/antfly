@@ -5864,6 +5864,40 @@ and all 503 lake-native tests without failures or leaks. The composed restart
 test preserves ranking/highlights with zero provider requests and bytes.
 Formatting and whitespace checks pass. No live GCS latency claim is made.
 
+### Public typed array declarations and SQL DDL binding
+
+Array expression literals now use the generated public `sql_array` enum and
+require their exact builtin element identity, including typed NULLs. OpenAPI,
+Go, Python, Rust, TypeScript and Zig contracts are synchronized. Public server
+prechecks share the typed VM's field and arity grammar, admitting CASE and IN
+without relaxing typed compilation. TypeScript bounds ordinal envelopes and
+counts wire bytes without allocating a serialized copy; generated SDK round-trip
+tests preserve exact integer strings, lower bounds and SQL NULL flags.
+
+Direct CHECKs resolve columns against the pinned physical layout rather than
+constructing ordered index keys. This admits logical array comparisons while
+keeping array-valued ordered keys guarded. SQL CREATE/ALTER column declarations,
+typed NULL defaults, same-identity array column comparisons, CASE, COALESCE and
+IN lower through the existing query binder into the durable VM. Unknown NULLs
+acquire their element identity from the consumer, not from their value. Generated
+NUMERIC arrays retain per-element precision/signed-scale assignment coercion.
+
+Independent PostgreSQL verification covers 36 ordering fixtures across all ten
+element domains. Public defaults and direct CHECKs exercise those fixtures on
+JSON and cold ordinal rows; SQL DDL tests compile generated NUMERIC arrays into
+the public schema validator. Array constructors, element-changing durable casts,
+non-NULL SQL array defaults and array-valued ordered keys remain unfinished and
+explicitly guarded. Original inventory dispositions are unchanged; this is not
+a claim of complete array or SQL parity.
+
+Validation passes 74 local and six server schema-expression tests, 621 local
+SQL tests (three existing skips) and 226 server SQL tests, without failures or
+leaks. SDK checks pass: Go packages, 291 Python tests, 16 Rust unit tests plus
+two integration tests, TypeScript typechecking and 478 tests (one existing skip).
+The PostgreSQL ordering oracle and generated OpenAPI/Python checks pass.
+Inventory integrity, control-catalog, formatting and whitespace checks pass;
+all 929 unresolved original cases retain their dispositions.
+
 ### Durable NUMERIC modifier expressions and generated wire contracts
 
 Durable scalar casts now carry validated NUMERIC precision/signed-scale

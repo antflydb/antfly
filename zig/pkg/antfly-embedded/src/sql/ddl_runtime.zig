@@ -150,13 +150,14 @@ test "SQL NUMERIC modifier declarations publish exact constrained column identit
 }
 
 pub fn columnProperty(alloc: std.mem.Allocator, column: ast.Column, nullable: bool) !std.json.Value {
-    if (column.numeric_modifier != null and (column.type != .number or column.element_type != .numeric)) return error.UnsupportedSqlShape;
+    if (column.numeric_modifier != null and ((column.type != .number and column.type != .array) or column.element_type != .numeric)) return error.UnsupportedSqlShape;
+    if (column.type == .array and column.element_type == null) return error.UnsupportedSqlShape;
     const bytes = if (column.type == .uuid)
         try std.json.Stringify.valueAlloc(alloc, .{ .type = "keyword", .nullable = nullable, .format = "uuid" }, .{})
     else
         try std.json.Stringify.valueAlloc(alloc, .{
             .type = switch (column.type) {
-                .array => return error.UnsupportedSqlShape,
+                .array => "sql_array",
                 .string => "keyword",
                 .uuid => unreachable,
                 .integer => "integer",
@@ -187,6 +188,13 @@ pub fn bindDefault(alloc: std.mem.Allocator, value: ast.Value, kind: ast.ColumnT
 /// an INSERT/UPDATE DEFAULT failure, not a schema-publication failure. Keep
 /// the source literal separate from its target domain in the durable plan.
 pub fn defaultExpression(alloc: std.mem.Allocator, value: ast.Value, kind: ast.ColumnType, element: ?@import("array_value.zig").ElementType) !std.json.Value {
+    if (kind == .array and value == .null) return std.json.parseFromSliceLeaky(std.json.Value, alloc, try std.json.Stringify.valueAlloc(alloc, .{
+        .op = "literal",
+        .type = "sql_array",
+        .sql_type = @tagName(element orelse return error.UnsupportedSqlShape),
+        .value = @as(?u8, null),
+    }, .{}), .{});
+    if (kind == .array) return error.UnsupportedSqlShape;
     if (value == .numeric and (kind == .integer or kind == .number)) {
         const target = element orelse if (kind == .integer) @as(@import("array_value.zig").ElementType, .int64) else .float64;
         const source = try @import("schema_expression.zig").numericLiteral(alloc, .{ .string = value.numeric });
@@ -356,21 +364,30 @@ test "SQL expression DDL staging unwinds every allocation fault" {
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
 }
 
-test "SQL array DDL refuses schema publication before typed storage admission" {
+test "SQL array DDL preserves precise element identity through CREATE and ALTER" {
     var create = try @import("compiler.zig").compile(std.testing.allocator, "CREATE TABLE arrays (a int4[2][3])", .{});
     defer create.deinit();
-    try std.testing.expectError(error.UnsupportedSqlShape, createSchemaAlloc(std.testing.allocator, create.statement.create_table));
+    const created = try createSchemaAlloc(std.testing.allocator, create.statement.create_table);
+    defer std.testing.allocator.free(created);
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
     var base = try @import("compiler.zig").compile(alloc, "CREATE TABLE arrays (id bigint)", .{});
+    const candidate = try std.json.parseFromSliceLeaky(std.json.Value, alloc, created, .{});
+    const properties = try @import("schema_columns.zig").properties(candidate);
+    const column = try @import("schema_columns.zig").column("a", properties.object.get("a").?);
+    try std.testing.expectEqual(.array, column.type);
+    try std.testing.expectEqual(.int32, column.element_type.?);
     defer base.deinit();
     const original = try createSchemaAlloc(alloc, base.statement.create_table);
     var schema = try std.json.parseFromSliceLeaky(std.json.Value, alloc, original, .{});
     var alter = try @import("compiler.zig").compile(alloc, "ALTER TABLE arrays ADD COLUMN a jsonb[]", .{});
     defer alter.deinit();
-    try std.testing.expectError(error.UnsupportedSqlShape, @import("schema_ddl.zig").apply(alloc, &schema, alter.statement.catalog_ddl));
-    try std.testing.expectEqualStrings(original, try std.json.Stringify.valueAlloc(alloc, schema, .{}));
+    _ = try @import("schema_ddl.zig").apply(alloc, &schema, alter.statement.catalog_ddl);
+    const altered = try @import("schema_columns.zig").properties(schema);
+    const added = try @import("schema_columns.zig").column("a", altered.object.get("a").?);
+    try std.testing.expectEqual(.array, added.type);
+    try std.testing.expectEqual(.jsonb, added.element_type.?);
 }
 
 test "SQL UUID CREATE TABLE retains typed native schema format" {

@@ -20,6 +20,7 @@ const std = @import("std");
 const wire = @import("antfly_schema_openapi");
 const impl = @import("antfly_local_sources").schema_table_schema_impl;
 const ColumnKind = @import("antfly_local_sources").storage_schema.RelationalColumnType;
+const expressions = @import("antfly_local_sources").schema_relational_expression;
 
 /// Request-local cached binding for column/op predicates. Parsed API handlers
 /// reuse their immutable schema; raw/wire paths parse only referenced fields.
@@ -90,42 +91,45 @@ fn visit(value: std.json.Value, depth: usize, nodes: *usize) bool {
     const op_value = value.object.get("op") orelse return false;
     if (op_value != .string) return false;
     const op = std.meta.stringToEnum(wire.RelationalExpressionOp, op_value.string) orelse return false;
-    const comparison = switch (op) {
-        .eq, .ne, .gt, .gte, .lt, .lte, .is_distinct, .is_not_distinct => true,
-        else => false,
-    };
+    const compiled_op = std.meta.stringToEnum(expressions.Op, @tagName(op)) orelse return false;
     var fields = value.object.iterator();
     while (fields.next()) |field| {
         const name = field.key_ptr.*;
-        if (std.mem.eql(u8, name, "op")) continue;
-        const allowed = switch (op) {
-            .literal => std.mem.eql(u8, name, "type") or std.mem.eql(u8, name, "value"),
-            .column => std.mem.eql(u8, name, "column"),
-            else => std.mem.eql(u8, name, "args") or (comparison and std.mem.eql(u8, name, "collation")),
-        };
-        if (!allowed) return false;
+        if (!expressions.acceptsField(compiled_op, name)) return false;
+    }
+    if (value.object.get("sql_type")) |identity| {
+        if (identity != .string or std.meta.stringToEnum(wire.SQLBuiltinType, identity.string) == null) return false;
     }
     switch (op) {
         .literal => {
             const kind = value.object.get("type") orelse return false;
             if (!validType(kind)) return false;
-            if (value.object.get("value")) |literal| if (literal == .object or literal == .array) return false;
+            const array = std.mem.eql(u8, kind.string, "sql_array");
+            if (array and value.object.get("sql_type") == null) return false;
+            if (value.object.get("value")) |literal| {
+                if (array) {
+                    if (literal != .null and literal != .object) return false;
+                } else if (literal == .object or literal == .array) return false;
+            }
         },
         .column => {
             const column = value.object.get("column") orelse return false;
             if (column != .string or column.string.len == 0) return false;
         },
         else => {
+            if (op == .cast) {
+                const kind = value.object.get("type") orelse return false;
+                if (!validType(kind) or value.object.get("sql_type") == null) return false;
+                if (!std.mem.eql(u8, kind.string, "integer") and !std.mem.eql(u8, kind.string, "number") and !std.mem.eql(u8, kind.string, "numeric")) return false;
+                if (value.object.get("numeric_modifier")) |modifier| {
+                    if (modifier != .object or !std.mem.eql(u8, kind.string, "numeric") or !std.mem.eql(u8, value.object.get("sql_type").?.string, "numeric")) return false;
+                }
+            }
             if (value.object.get("collation")) |collation| if (collation != .string or collation.string.len == 0) return false;
             const args = value.object.get("args") orelse return false;
             if (args != .array) return false;
             const count = args.array.items.len;
-            const correct = switch (op) {
-                .negate, .lower_ascii, .upper_ascii, .is_null, .is_not_null, .not => count == 1,
-                .concat, .coalesce, .@"and", .@"or" => count >= 2 and count <= 32,
-                else => count == 2,
-            };
-            if (!correct) return false;
+            if (!expressions.acceptsArity(compiled_op, count)) return false;
             for (args.array.items) |arg| if (!visit(arg, depth + 1, nodes)) return false;
         },
     }
@@ -260,6 +264,54 @@ pub fn cloneCanonicalExpression(alloc: std.mem.Allocator, source: wire.Relationa
     try canonicalizeOwnedExpression(alloc, &result);
     result.args = children;
     return result;
+}
+
+test "relational declarations public expression grammar shares typed array numeric CASE and IN shapes" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        \\{"op":"literal","type":"sql_array","sql_type":"int64"}
+        ,
+        \\{"op":"literal","type":"sql_array","sql_type":"int64","value":{"dimensions":[{"length":1,"lower_bound":-2}],"values":["9007199254740993"],"sql_nulls":[false]}}
+        ,
+        \\{"op":"cast","type":"numeric","sql_type":"numeric","numeric_modifier":{"precision":4,"scale":2},"args":[{"op":"literal","type":"numeric","sql_type":"numeric","value":"1.255"}]}
+        ,
+        \\{"op":"case_when","args":[{"op":"literal","type":"boolean","value":true},{"op":"literal","type":"integer","value":1},{"op":"literal","type":"integer","value":2}]}
+        ,
+        \\{"op":"in_list","args":[{"op":"literal","type":"integer","value":1},{"op":"literal","type":"integer","value":2},{"op":"literal","type":"integer","value":1}]}
+    }) |text| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, text, .{});
+        defer parsed.deinit();
+        try std.testing.expect(valid(parsed.value));
+        const op = parsed.value.object.get("op").?.string;
+        const expected: ColumnKind = if (std.mem.eql(u8, op, "cast")) .numeric else if (std.mem.eql(u8, op, "literal")) .sql_array else if (std.mem.eql(u8, op, "case_when")) .integer else .boolean;
+        var plan = try expressions.Plan.init(a, .{}, parsed.value, expected);
+        defer plan.deinit();
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        _ = try plan.evaluate(arena.allocator(), &.{});
+    }
+    for ([_][]const u8{
+        \\{"op":"literal","type":"sql_array"}
+        ,
+        \\{"op":"literal","type":"sql_array","sql_type":"bad"}
+        ,
+        \\{"op":"literal","type":"sql_array","sql_type":"int64","value":[]}
+        ,
+        \\{"op":"column","column":"a","sql_type":"int64"}
+        ,
+        \\{"op":"case_when","args":[{"op":"literal","type":"boolean"},{"op":"literal","type":"integer"}]}
+        ,
+        \\{"op":"cast","type":"sql_array","sql_type":"int64","args":[{"op":"literal","type":"integer"}]}
+        ,
+        \\{"op":"cast","type":"integer","sql_type":"int64","numeric_modifier":{"precision":4,"scale":2},"args":[{"op":"literal","type":"integer"}]}
+    }) |text| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, text, .{});
+        defer parsed.deinit();
+        try std.testing.expect(!valid(parsed.value));
+    }
+    inline for (@typeInfo(wire.RelationalExpressionOp).@"enum".field_names) |name| {
+        try std.testing.expect(std.meta.stringToEnum(expressions.Op, name) != null);
+    }
 }
 
 test "relational declarations canonical public expression copy preserves borrowed epoch nodes" {

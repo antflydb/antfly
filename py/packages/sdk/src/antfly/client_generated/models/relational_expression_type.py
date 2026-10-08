@@ -8,6 +8,7 @@ class RelationalExpressionType(StrEnum):
     INTEGER = "integer"
     NUMBER = "number"
     NUMERIC = "numeric"
+    SQL_ARRAY = "sql_array"
     STRING = "string"
 
     def __str__(self) -> str:

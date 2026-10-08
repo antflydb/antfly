@@ -61,12 +61,14 @@ fn compile(alloc: Allocator, table: schema.TableSchema, layout: *const codec.Phy
     const unary = operation == .is_null or operation == .is_not_null;
     const literal = definition.value orelse .null;
     if (unary and literal != .null) return error.InvalidRelationalPredicate;
-    // Resolve the pinned column and validate the supported collation, but do
-    // not encode either operand as a persistent index key. CHECK's logical
-    // domain is bounded by execution admission, not escaped key byte limits.
-    var binding = try tuples.TuplePlan.init(alloc, table, layout, &.{.{ .column = column, .collation = definition.collation }});
-    defer binding.deinit();
-    const ordinal = binding.keys[0].ordinal;
+    // CHECK operands live in the logical row domain, not the independently
+    // versioned ordered-key domain. Resolve once against the pinned layout;
+    // arrays and wide logical values need no synthetic key allocation.
+    if (table.storage_mode != .relational) return error.InvalidRelationalIndexDefinition;
+    if (layout.schema_version != table.version or layout.column_count != table.relational_columns.len) return error.RelationalRowSchemaMismatch;
+    const ordinal = layout.ordinalForName(table.relational_columns, column) orelse return error.RelationalIndexColumnNotFound;
+    const bound = table.relational_columns[ordinal];
+    if (definition.collation) |collation| _ = try expressions.foldAsciiCollation(bound.column_type, collation);
     const a = arena.allocator();
     var reference: std.json.Value = .{ .object = .empty };
     try reference.object.put(a, "op", .{ .string = "column" });
@@ -76,7 +78,8 @@ fn compile(alloc: Allocator, table: schema.TableSchema, layout: *const codec.Phy
     if (!unary) {
         var operand: std.json.Value = .{ .object = .empty };
         try operand.object.put(a, "op", .{ .string = "literal" });
-        try operand.object.put(a, "type", .{ .string = @tagName(table.relational_columns[ordinal].column_type) });
+        try operand.object.put(a, "type", .{ .string = @tagName(bound.column_type) });
+        if (bound.column_type == .sql_array) try operand.object.put(a, "sql_type", .{ .string = @tagName(bound.sql_element_type orelse return error.InvalidRelationalExpressionType) });
         try operand.object.put(a, "value", literal);
         try args.array.append(operand);
     }

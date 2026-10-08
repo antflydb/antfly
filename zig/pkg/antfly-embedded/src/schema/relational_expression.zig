@@ -416,7 +416,30 @@ fn numericJsonOutput(execution: *Execution, bytes: []const u8) !std.json.Value {
     return scratch.json(parsed.value) catch |err| return scratch.failure(err);
 }
 
-const Op = enum { literal, column, add, subtract, multiply, divide, modulo, negate, concat, coalesce, lower_ascii, upper_ascii, eq, ne, gt, gte, lt, lte, is_null, is_not_null, is_distinct, is_not_distinct, @"and", @"or", not, cast, case_when, in_list, not_in_list };
+pub const Op = enum { literal, column, add, subtract, multiply, divide, modulo, negate, concat, coalesce, lower_ascii, upper_ascii, eq, ne, gt, gte, lt, lte, is_null, is_not_null, is_distinct, is_not_distinct, @"and", @"or", not, cast, case_when, in_list, not_in_list };
+
+/// Shared structural grammar for public prechecks and typed compilation.
+/// These rules grant no column/type authority; the pinned compiler owns that.
+pub fn acceptsField(op: Op, name: []const u8) bool {
+    if (std.mem.eql(u8, name, "op")) return true;
+    return switch (op) {
+        .literal => std.mem.eql(u8, name, "type") or std.mem.eql(u8, name, "value") or std.mem.eql(u8, name, "sql_type"),
+        .column => std.mem.eql(u8, name, "column"),
+        .cast => std.mem.eql(u8, name, "args") or std.mem.eql(u8, name, "type") or std.mem.eql(u8, name, "sql_type") or std.mem.eql(u8, name, "numeric_modifier"),
+        .add, .subtract, .multiply, .divide, .modulo, .negate => std.mem.eql(u8, name, "args") or std.mem.eql(u8, name, "sql_type"),
+        else => std.mem.eql(u8, name, "args") or (isComparison(op) and std.mem.eql(u8, name, "collation")),
+    };
+}
+
+pub fn acceptsArity(op: Op, count: usize) bool {
+    return switch (op) {
+        .literal, .column => false,
+        .negate, .lower_ascii, .upper_ascii, .not, .is_null, .is_not_null, .cast => count == 1,
+        .concat, .coalesce, .@"and", .@"or", .in_list, .not_in_list => count >= 2 and count <= 32,
+        .case_when => count >= 3 and count <= 31 and count % 2 == 1,
+        else => count == 2,
+    };
+}
 const Node = struct {
     op: Op,
     kind: Kind,
@@ -1130,6 +1153,87 @@ test "relational declarations generated NUMERIC arrays normalize dependencies an
     try std.testing.expectError(error.InvalidRelationalExpressionType, Set.createOwned(a, table, wrong.value, .null));
 }
 
+test "relational declarations public array defaults and direct CHECKs match PostgreSQL ordering across cold rows" {
+    const a = std.testing.allocator;
+    const api = @import("mod.zig");
+    const Fixture = struct { entries: []const struct { element_type: Numeric, left_binary: []const u8, right_binary: []const u8, order: std.math.Order } };
+    var fixture = try std.json.parseFromSlice(Fixture, a, @embedFile("../sql/fixtures/sql_array_order_reference.json"), .{ .ignore_unknown_fields = true });
+    defer fixture.deinit();
+    for (fixture.value.entries) |entry| {
+        var region = std.heap.ArenaAllocator.init(a);
+        defer region.deinit();
+        const r = region.allocator();
+        var envelopes: [2]std.json.Value = undefined;
+        var canonical: [2][]u8 = undefined;
+        for ([_][]const u8{ entry.left_binary, entry.right_binary }, 0..) |hex, i| {
+            const pg = try r.alloc(u8, hex.len / 2);
+            _ = try std.fmt.hexToBytes(pg, hex);
+            var array = try @import("../sql/array_binary.zig").decode(r, entry.element_type, pg, .{});
+            defer array.deinit();
+            envelopes[i] = try @import("../sql/array_wire.zig").toJsonLeaky(r, array.value, .{});
+            canonical[i] = try @import("../sql/array_storage.zig").encodeAlloc(r, array.value, .{});
+        }
+        var public = try std.json.parseFromSliceLeaky(std.json.Value, r,
+            \\{"version":1,"storage_mode":"relational","default_type":"row","column_defaults":[{"column":"a","expression":{"op":"literal","type":"sql_array","sql_type":"int64","value":null}}],"checks":[{"name":"bound","column":"a","op":"gte","value":null}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"a":{"type":"sql_array","x-antfly-sql-type":"int64"}},"additionalProperties":false}}}}
+        , .{});
+        const literal = &public.object.getPtr("column_defaults").?.array.items[0].object.getPtr("expression").?.object;
+        try literal.put(r, "sql_type", .{ .string = @tagName(entry.element_type) });
+        try literal.put(r, "value", envelopes[0]);
+        try public.object.getPtr("checks").?.array.items[0].object.put(r, "value", envelopes[1]);
+        const property = &public.object.getPtr("document_schemas").?.object.getPtr("row").?.object.getPtr("schema").?.object.getPtr("properties").?.object.getPtr("a").?.object;
+        try property.put(r, "x-antfly-sql-type", .{ .string = @tagName(entry.element_type) });
+        var validator = try api.CompiledTableValidator.init(a, try std.json.Stringify.valueAlloc(r, public, .{}));
+        defer validator.deinit(a);
+        const runtime = try api.deriveRuntimeTableSchema(a, validator.schema);
+        defer schema.freeSchema(a, runtime);
+        try std.testing.expect(runtime.requires_array_expressions);
+        try std.testing.expect(runtime.requires_public_schema);
+        var document: std.json.Value = .{ .object = .empty };
+        try validator.execution.expressions.?.applyJson(r, &document);
+        const expected: ?usize = if (entry.order == .lt) 0 else null;
+        try std.testing.expectEqual(expected, try validator.execution.checks.?.firstViolationJson(r, document));
+        var layout = try codec.PhysicalLayout.init(r, runtime);
+        defer layout.deinit();
+        const stored = try codec.serializeOrdinal(r, runtime.version, runtime.relational_columns, &.{
+            .{ .ordinal = 0, .path = "a", .value_type = .bytes_val, .sql_array_element_type = entry.element_type, .value = .{ .bytes_val = canonical[0] } },
+        }, @splat(0));
+        try std.testing.expectEqual(expected, try validator.execution.checks.?.firstViolationRow(r, try codec.ordinalRowView(stored, runtime, &layout)));
+        try document.object.put(r, "a", .null);
+        try std.testing.expectEqual(@as(?usize, null), try validator.execution.checks.?.firstViolationJson(r, document));
+        try checks.validateDefinitions(r, runtime, &.{.{ .name = "nonnull", .column = "a", .op = .is_not_null }});
+        var nonrelational = runtime;
+        nonrelational.storage_mode = .document;
+        try std.testing.expectError(error.InvalidRelationalIndexDefinition, checks.validateDefinitions(r, nonrelational, &.{.{ .name = "nonnull", .column = "a", .op = .is_not_null }}));
+        try std.testing.expectError(error.UnsupportedRelationalIndexCollation, checks.validateDefinitions(r, runtime, &.{.{ .name = "bad_collation", .column = "a", .op = .is_null, .collation = "ci" }}));
+    }
+    try std.testing.expectEqual(@as(usize, 36), fixture.value.entries.len);
+}
+
+test "relational declarations SQL array DDL publishes precise generated domains defaults and CHECKs" {
+    const a = std.testing.allocator;
+    var parsed = try @import("../sql/compiler.zig").compile(a, "CREATE TABLE array_domains (a numeric(4,2)[], g numeric(3,1)[] GENERATED ALWAYS AS (a) STORED, missing bigint[] DEFAULT NULL, CHECK (a IS NOT NULL))", .{});
+    defer parsed.deinit();
+    const json = try @import("../sql/ddl_runtime.zig").createSchemaAlloc(a, parsed.statement.create_table);
+    defer a.free(json);
+    var validator = try @import("mod.zig").CompiledTableValidator.init(a, json);
+    defer validator.deinit(a);
+    const runtime = try @import("mod.zig").deriveRuntimeTableSchema(a, validator.schema);
+    defer schema.freeSchema(a, runtime);
+    try std.testing.expect(runtime.requires_array_expressions);
+    try std.testing.expect(runtime.requires_numeric_modifiers);
+    var document = try std.json.parseFromSlice(std.json.Value, a,
+        \\{"a":{"dimensions":[{"length":2,"lower_bound":-4}],"values":["12.345","-12.345"],"sql_nulls":[false,false]}}
+    , .{});
+    defer document.deinit();
+    const r = document.arena.allocator();
+    try validator.execution.expressions.?.applyJson(r, &document.value);
+    try std.testing.expectEqualStrings("12.35", document.value.object.get("a").?.object.get("values").?.array.items[0].string);
+    try std.testing.expectEqualStrings("12.4", document.value.object.get("g").?.object.get("values").?.array.items[0].string);
+    try std.testing.expectEqual(std.json.Value.null, document.value.object.get("missing").?);
+    try std.testing.expectEqual(@as(?usize, null), try validator.execution.checks.?.firstViolationJson(r, document.value));
+    try validator.execution.expressions.?.verifyJson(r, document.value);
+}
+
 test "relational declarations typed array JSON adapter owns canonical PostgreSQL values and unwinds faults" {
     const a = std.testing.allocator;
     const arrays = @import("../sql/array_value.zig");
@@ -1444,6 +1548,19 @@ fn sameOperandType(a: Node, b: Node) bool {
     return a.kind == b.kind and (a.kind != .sql_array or a.sql_type == b.sql_type);
 }
 
+/// One collation contract for logical CHECKs, expression operands and ordered
+/// scalar keys. Non-string domains never inherit a string collation implicitly.
+pub fn foldAsciiCollation(kind: Kind, collation: []const u8) !bool {
+    if (kind != .string) return error.UnsupportedRelationalIndexCollation;
+    if (std.ascii.eqlIgnoreCase(collation, "ci") or
+        std.ascii.eqlIgnoreCase(collation, "case_insensitive") or
+        std.ascii.eqlIgnoreCase(collation, "antfly.case_insensitive")) return true;
+    if (std.ascii.eqlIgnoreCase(collation, "C") or
+        std.ascii.eqlIgnoreCase(collation, "POSIX") or
+        std.ascii.eqlIgnoreCase(collation, "binary")) return false;
+    return error.UnsupportedRelationalIndexCollation;
+}
+
 const Compiler = struct {
     alloc: Allocator,
     execution: *Execution,
@@ -1471,15 +1588,7 @@ const Compiler = struct {
         var fields = input.object.iterator();
         while (fields.next()) |field| {
             const name = field.key_ptr.*;
-            if (std.mem.eql(u8, name, "op")) continue;
-            const allowed = switch (op) {
-                .literal => std.mem.eql(u8, name, "type") or std.mem.eql(u8, name, "value") or std.mem.eql(u8, name, "sql_type"),
-                .column => std.mem.eql(u8, name, "column"),
-                .cast => std.mem.eql(u8, name, "args") or std.mem.eql(u8, name, "type") or std.mem.eql(u8, name, "sql_type") or std.mem.eql(u8, name, "numeric_modifier"),
-                .add, .subtract, .multiply, .divide, .modulo, .negate => std.mem.eql(u8, name, "args") or std.mem.eql(u8, name, "sql_type"),
-                else => std.mem.eql(u8, name, "args") or (isComparison(op) and std.mem.eql(u8, name, "collation")),
-            };
-            if (!allowed) return error.InvalidRelationalExpression;
+            if (!acceptsField(op, name)) return error.InvalidRelationalExpression;
         }
         self.frame(op_value.string);
         var node: Node = .{ .op = op, .kind = undefined };
@@ -1578,14 +1687,7 @@ const Compiler = struct {
                 const args = input.object.get("args") orelse return error.InvalidRelationalExpression;
                 if (args != .array) return error.InvalidRelationalExpression;
                 const length = args.array.items.len;
-                const valid = switch (op) {
-                    .negate, .lower_ascii, .upper_ascii, .not, .is_null, .is_not_null, .cast => length == 1,
-                    .concat, .coalesce, .@"and", .@"or" => length >= 2 and length <= 32,
-                    .in_list, .not_in_list => length >= 2 and length <= 32,
-                    .case_when => length >= 3 and length <= 31 and length % 2 == 1,
-                    else => length == 2,
-                };
-                if (!valid) return error.InvalidRelationalExpression;
+                if (!acceptsArity(op, length)) return error.InvalidRelationalExpression;
                 self.hash.update(&.{@intCast(length)});
                 const children = try self.alloc.alloc(u16, length);
                 for (args.array.items, children) |arg, *child| child.* = try self.compile(arg, depth + 1);
@@ -1602,10 +1704,8 @@ const Compiler = struct {
                 } else for (children[1..]) |child| if (!sameOperandType(self.nodes.items[child], operand)) return error.InvalidRelationalExpressionType;
                 if (isComparison(op)) {
                     if (input.object.get("collation")) |collation| {
-                        if (collation != .string or node.kind != .string) return error.UnsupportedRelationalIndexCollation;
-                        if (std.ascii.eqlIgnoreCase(collation.string, "ci") or std.ascii.eqlIgnoreCase(collation.string, "case_insensitive") or std.ascii.eqlIgnoreCase(collation.string, "antfly.case_insensitive")) {
-                            node.fold_ascii = true;
-                        } else if (!std.ascii.eqlIgnoreCase(collation.string, "C") and !std.ascii.eqlIgnoreCase(collation.string, "POSIX") and !std.ascii.eqlIgnoreCase(collation.string, "binary")) return error.UnsupportedRelationalIndexCollation;
+                        if (collation != .string) return error.UnsupportedRelationalIndexCollation;
+                        node.fold_ascii = try foldAsciiCollation(node.kind, collation.string);
                     }
                     self.hash.update(&.{@intFromBool(node.fold_ascii)});
                     node.kind = .boolean;
