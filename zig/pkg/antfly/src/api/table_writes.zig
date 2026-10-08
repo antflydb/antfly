@@ -14056,11 +14056,16 @@ pub const ProvisionedTableWriteSource = struct {
                         null,
                         null,
                         status,
-                    ) catch |err| {
-                        std.log.warn(
-                            "compiled owner reconcile status publication failed table={s} group_id={d} err={s}",
-                            .{ table_name, group_id, @errorName(err) },
-                        );
+                    ) catch |err| switch (err) {
+                        error.RuntimeStatusPublicationFenced, error.RuntimeStatusPublicationContended => {
+                            // Durable reconciliation can finish while its own
+                            // lifecycle edge invalidates the sampled epoch.
+                            // Keep progress debt until a fresh observation is
+                            // published; otherwise the scheduler retires the
+                            // only owner that can make readiness visible.
+                            return self.deferredStartupCatchUpResult(table_name, group_id, metadata.advance_index_repairs, busy_result);
+                        },
+                        else => return err,
                     };
                 }
             }
@@ -32947,6 +32952,55 @@ fn consumerTests() type {
             defer alloc.free(cleared);
             try std.testing.expectEqual(@as(usize, 0), cleared.len);
             try std.testing.expectEqual(@as(usize, 3), fake.calls);
+        }
+
+        test "compiled startup catch-up retains debt after status publication is fenced" {
+            if (comptime !control_only_storage_sources) return error.SkipZigTest;
+            const alloc = std.testing.allocator;
+            const Fake = struct {
+                cache: *runtime_status.TableRuntimeSnapshotCache,
+                invalidate: bool = true,
+                fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) anyerror!?void {
+                    return error.UnexpectedBatch;
+                }
+                fn observe(ptr: *anyopaque, _: std.mem.Allocator, group: u64, table: []const u8, _: ?[]const u8, _: bool, _: db_mod.types.ArtifactRepairRunOptions, _: bool) anyerror!?table_write_source.LocalStructuralReconcileObservation {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    if (self.invalidate) self.cache.invalidateTable(table);
+                    return .{
+                        .result = .{ .state = .complete },
+                        .runtime_status = .{
+                            .group_id = group,
+                            .stats = .{},
+                            .metadata = .{
+                                .lsm_root_generation = table_reads.backend_current_root_generation,
+                                .source = .live_writer_publish,
+                                .freshness = .fresh,
+                            },
+                        },
+                    };
+                }
+            };
+            var cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
+            defer cache.deinit();
+            var fake = Fake{ .cache = &cache };
+            var source = ProvisionedTableWriteSource.init("/tmp/unused-owner-publication-retry", table_catalog.emptyCatalogSource());
+            defer source.deinit();
+            source.runtime_status_cache = &cache;
+            source.local_write_source = .{ .ptr = &fake, .vtable = &.{
+                .batch = Fake.batch,
+                .reconcile_table_group_local_observed = Fake.observe,
+            } };
+            const deferred = try source.catchUpTableGroupBestEffortWithMetadata(alloc, 7001, "docs", .{});
+            try std.testing.expect(deferred.busy and deferred.had_debt);
+            const debt = try source.snapshotDeferredStartupCatchUpGroups(alloc);
+            defer alloc.free(debt);
+            try std.testing.expectEqual(@as(usize, 1), debt.len);
+            fake.invalidate = false;
+            const complete = try source.catchUpTableGroupBestEffortWithMetadata(alloc, 7001, "docs", .{});
+            try std.testing.expect(!complete.busy and !complete.had_debt);
+            const cleared = try source.snapshotDeferredStartupCatchUpGroups(alloc);
+            defer alloc.free(cleared);
+            try std.testing.expectEqual(@as(usize, 0), cleared.len);
         }
 
         test "compiled structural reconciliation publishes its owner observation and defers absent proof" {

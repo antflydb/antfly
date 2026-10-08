@@ -6254,6 +6254,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.artifact_producer_input.",
             "storage.db.artifact_producer_obligations.",
             "storage.db.artifact_producer_readiness.",
+            "storage.db.artifact_reprocess_intent.",
             "storage.memory_budget.",
             "storage.test_allocator.",
             "storage.db.artifact_producer_provenance.",

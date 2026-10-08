@@ -13555,7 +13555,11 @@ fn searchDenseInternal(
             };
             var doc_key_owned = true;
             errdefer if (doc_key_owned) alloc.free(doc_key);
-            var source_artifact_ref = if (entry.embedding_names.len > 0 or entry.chunk_name != null)
+            var source_artifact_ref = if (entry.embedding_names.len == 0 and internal_keys.isChunkArtifactRecordKey(doc_key)) blk: {
+                const member_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(alloc, doc_key, entry.embedding_name orelse entry.config.name);
+                defer alloc.free(member_key);
+                break :blk try artifact_ids.decodeArtifactRefAlloc(alloc, member_key);
+            } else if (entry.embedding_names.len > 0 or entry.chunk_name != null)
                 try artifact_ids.decodeArtifactRefAlloc(alloc, doc_key)
             else
                 null;
@@ -15420,7 +15424,11 @@ pub fn searchSparse(
 
         const hit_build_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
         for (raw_hits[@intCast(start)..@intCast(end)], 0..) |hit, i| {
-            var source_artifact_ref = if (multi_source_members)
+            var source_artifact_ref = if (!multi_source_members and internal_keys.isChunkArtifactRecordKey(hit.doc_id)) blk: {
+                const member_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(alloc, hit.doc_id, entry.embedding_name orelse entry.config.name);
+                defer alloc.free(member_key);
+                break :blk try artifact_ids.decodeArtifactRefAlloc(alloc, member_key);
+            } else if (multi_source_members)
                 try artifact_ids.decodeArtifactRefAlloc(alloc, hit.doc_id)
             else
                 null;
@@ -26765,6 +26773,7 @@ test "match_all sorted segment seek uses cursor seek within each segment" {
     var counter = NativeLoadCounter{
         .inner = .{ .snapshot = text_entry.persistent.snapshot() },
     };
+    defer counter.inner.deinit();
     const native_loader = NativeSortValueLoader{
         .ctx = &counter,
         .require_native = true,

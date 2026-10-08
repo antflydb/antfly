@@ -16139,7 +16139,7 @@ pub const ApiHttpServer = struct {
         var authoritative_snapshot = (self.source.linearizableSnapshot(.{}) catch return .retry) orelse return .retry;
         defer self.source.freeAdminSnapshot(&authoritative_snapshot);
         const table = tables_api.findTableByName(&authoritative_snapshot, pending.table_name) orelse return .complete;
-        var schema = if (table.schema_json.len == 0) schema_mod.ParsedTableSchema{} else schema_mod.parseValidatedTableSchema(alloc, table.schema_json) catch return .retry;
+        var schema = schema_mod.parseValidatedTableSchema(alloc, table.schema_json) catch return .retry;
         defer schema.deinit(alloc);
         if (schema.external_base_source != null) {
             self.reconcileNativeLakeIndexes(table.*, schema) catch |err| {
@@ -16293,12 +16293,10 @@ pub const ApiHttpServer = struct {
         try ensureTableOperationActive(request);
         const table_before = (self.loadOwnedTableRecord(alloc, table_name) catch |err| return metadataAccessFailure(err)) orelse return error.NotFound;
         defer metadata_table_manager.freeTable(alloc, table_before);
-        var table_schema = if (table_before.schema_json.len == 0) schema_mod.ParsedTableSchema{} else schema_mod.parseValidatedTableSchema(alloc, table_before.schema_json) catch return error.InvalidIndexRequest;
+        var table_schema = schema_mod.parseValidatedTableSchema(alloc, table_before.schema_json) catch return error.InvalidIndexRequest;
         defer table_schema.deinit(alloc);
         const external_table = table_schema.external_base_source != null;
-        const index_json = table_contract.parseCreateIndexRequest(alloc, index_name, body) catch {
-            return error.InvalidIndexRequest;
-        };
+        const index_json = table_contract.parseCreateIndexRequest(alloc, index_name, body) catch return error.InvalidIndexRequest;
         defer alloc.free(index_json);
         const relational = @import("relational_index_mutation.zig");
         if (relational.isRelational(alloc, index_json) catch return error.InvalidIndexRequest) {
@@ -16314,9 +16312,7 @@ pub const ApiHttpServer = struct {
             return response;
         }
         if (relational.contains(alloc, table_before.schema_json, index_name) catch return error.InternalFailure) return error.Conflict;
-        tables_api.validatePublicAlgebraicIndexJson(alloc, index_json) catch {
-            return error.InvalidIndexRequest;
-        };
+        tables_api.validatePublicAlgebraicIndexJson(alloc, index_json) catch return error.InvalidIndexRequest;
         const expanded_index_json = tables_api.expandSchemaDerivedAlgebraicIndexAlloc(alloc, table_name, index_json, table_before.schema_json) catch |err| switch (err) {
             error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest => return error.InvalidIndexRequest,
             else => return error.InternalFailure,
@@ -16368,8 +16364,7 @@ pub const ApiHttpServer = struct {
             },
         };
 
-        const uses_artifact_sources = indexes_api.indexConfigUsesArtifactSources(alloc, normalized_index_json) catch
-            return error.InvalidIndexRequest;
+        const uses_artifact_sources = indexes_api.indexConfigUsesArtifactSources(alloc, normalized_index_json) catch return error.InvalidIndexRequest;
         try self.admitArtifactSources(request, uses_artifact_sources);
 
         const destination_principal = if (request.destination_authorization_principal.len > 0)
@@ -16382,8 +16377,7 @@ pub const ApiHttpServer = struct {
             table_name,
             destination_principal,
             .{ .manager = self.cfg.user_manager, .auth_enabled = self.cfg.auth_enabled },
-        ) catch
-            return error.InvalidIndexRequest;
+        ) catch return error.InvalidIndexRequest;
         defer alloc.free(authorized_index_json);
 
         // Reserve the response before consensus. Nothing after the irreversible
@@ -44441,6 +44435,7 @@ test "api http server create index installs exact visible config and defers lagg
                 .body = case.body,
             });
             defer response.deinit(alloc);
+            if (response.status != 201) std.debug.print("create-index fixture {s}: status={} body={s}\n", .{ case.name, response.status, response.body });
             try std.testing.expectEqual(@as(u16, 201), response.status);
             var stored = try indexes_api.lookupSingleIndexConfig(alloc, artifact_source.indexes_json, case.name);
             defer if (stored) |*found| found.deinit();

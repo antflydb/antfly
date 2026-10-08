@@ -2235,6 +2235,21 @@ pub const IndexManager = struct {
             return true;
         }
 
+        pub fn certifiedEmptyNativeCheckpoint(self: *DenseIndex, checkpoint: apply_state.ProjectionCheckpoint) ?apply_state.ProjectionCheckpoint {
+            while (!self.serving_certificate_mutex.tryLock()) std.atomic.spinLoopHint();
+            defer self.serving_certificate_mutex.unlock();
+            const verified = self.verified_serving_certificate orelse return null;
+            if (checkpoint.status != .clean or verified.capture_incarnation != self.capture_incarnation or
+                verified.published_count != 0 or verified.generation != checkpoint.generation or
+                verified.config_hash != checkpoint.config_hash or verified.applied_sequence > checkpoint.applied_sequence)
+                return null;
+            const snapshot = self.index.nativeServingSnapshot() orelse return null;
+            if (snapshot.active_count != 0 or snapshot.source_sequence < checkpoint.applied_sequence) return null;
+            var certified = checkpoint;
+            certified.published_count = 0;
+            return certified;
+        }
+
         /// Status reads must never turn a previously failed certificate into
         /// a valid one just because later live writes reach the same count.
         pub fn hasValidatedServingCertificate(self: *DenseIndex, checkpoint: apply_state.ProjectionCheckpoint) bool {

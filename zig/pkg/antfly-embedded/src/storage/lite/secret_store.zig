@@ -110,7 +110,8 @@ pub const Store = struct {
         defer self.docs.mutex.unlock();
         const revision = try self.head();
         if (revision < options.min_revision) return error.Unavailable;
-        var rows = try self.docs.file.metadataCatalogCursor(self.docs.file.activeCheckpoint(), &(self.prefix ++ "entries/".*));
+        const entry_prefix = self.prefix ++ "entries/".*;
+        var rows = try self.docs.file.metadataCatalogCursor(self.docs.file.activeCheckpoint(), &entry_prefix);
         defer rows.deinit();
         var entries: std.ArrayList(contract.Metadata) = .empty;
         errdefer {
@@ -712,6 +713,8 @@ test "lite secret metadata listing seeks its scope without loading unrelated cat
     defer alloc.free(path);
     var docs = try docstore.Store.create(alloc, path, true);
     defer docs.close();
+    // Measure foreground prefix reads without a concurrent reclamation pass.
+    docs.maintenance_start_suppressed = true;
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const mutations = try arena.allocator().alloc(native.CatalogMutation, 2048);

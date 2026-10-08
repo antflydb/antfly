@@ -11761,6 +11761,13 @@ pub const DB = struct {
         if (ownership == .external) return .external_coverage;
         const generation = self.core.index_manager.coverageGenerationForIndex(index_name) orelse
             return .coverage_incarnation_unavailable;
+        // Empty-table activation is an explicit publication too. Its exact
+        // certificate survives later producer debt without authorizing a new,
+        // unvalidated empty generation over a non-empty corpus.
+        if (cfg.kind == .dense_vector and checkpoint.status == .clean and checkpoint.published_count == @as(?u64, 0)) {
+            const dense = self.core.denseIndex(index_name) orelse return .physical_index_unavailable;
+            if (dense.hasValidatedServingCertificate(checkpoint)) return .queryable;
+        }
         const produced = (try loadDerivedCoverageCounters(alloc, self.core.store, index_name, generation, null, null)).produced orelse return .coverage_counter_unavailable;
         if (produced == 0) return .no_published_sources;
         return switch (cfg.kind) {
@@ -26935,6 +26942,26 @@ pub const DB = struct {
 
     /// Requires the DB apply lock.
     fn finalizeCompletedIndexAdmissionLocked(self: *DB, index_name: []const u8, key: []const u8) !void {
+        if (self.core.denseIndex(index_name)) |entry| {
+            const raw = self.core.store.get(self.alloc, key) catch |err| switch (err) {
+                error.NotFound => null,
+                else => return err,
+            };
+            defer if (raw) |value| self.alloc.free(value);
+            if (raw) |value| {
+                const marker = try decodeManagedIndexAdmissionMarker(value);
+                if (marker.disposition == .activation_fence and marker.source_doc_count == 0 and
+                    marker.config_hash == types.indexConfigHash(entry.config) and
+                    entry.index.servingActiveCountForCheckpoint() == @as(?u64, 0))
+                {
+                    var checkpoint = try self.core.loadProjectionCheckpoint(self.alloc, index_name);
+                    if (checkpoint.status == .clean and checkpoint.config_hash == marker.config_hash) {
+                        checkpoint.published_count = 0;
+                        try self.core.saveProjectionCheckpoint(index_name, checkpoint);
+                    }
+                }
+            }
+        }
         self.core.store.delete(key) catch |err| switch (err) {
             error.NotFound => {},
             else => return err,
@@ -27781,7 +27808,7 @@ pub const DB = struct {
                 try replayPendingDerivedBatches(self, null, null, .{
                     .index_names = &.{index_name},
                     .truncate_replay = false,
-                    .deadline_ns = wait.deadline_ns,
+                    .deadline_ns = if (wait.deadline_ns) |deadline| platform_time.monotonicNs() +| (deadline -| clock.nowRealtimeNs()) else null,
                 });
             }
             snapshot_mutation = self.core.snapshot_admission.acquireMutation();
@@ -33158,7 +33185,27 @@ pub const DB = struct {
     /// Seed certificate validation before replay can advance live cardinality.
     fn validateOpenedDenseServingCertificates(self: *DB) void {
         for (self.core.index_manager.dense_indexes.items) |*entry| {
-            const checkpoint = self.core.loadProjectionCheckpoint(self.alloc, entry.config.name) catch continue;
+            var checkpoint = self.core.loadProjectionCheckpoint(self.alloc, entry.config.name) catch continue;
+            // A durable native source-only commit can advance its watermark
+            // past the empty activation's count sidecar. Recover that explicit
+            // zero publication only at open, with the same clean generation
+            // and an empty durable native snapshot. Missing certificates and
+            // unfinished generations still require ordinary materialization.
+            if (checkpoint.published_count == null and checkpoint.status == .clean) {
+                const previous = apply_state.loadProjectionCheckpointWithSidecar(self.alloc, self.core.index_manager.checkpointIo(), self.core.store, self.core.applied_sequence_checkpoint_path, entry.config.name) catch null;
+                if (previous) |certificate| {
+                    const native_snapshot = entry.index.nativeServingSnapshot();
+                    if (certificate.status == .clean and certificate.published_count == @as(?u64, 0) and
+                        certificate.generation == checkpoint.generation and certificate.config_hash == checkpoint.config_hash and
+                        certificate.applied_sequence <= checkpoint.applied_sequence and native_snapshot != null and
+                        native_snapshot.?.active_count == 0 and native_snapshot.?.source_sequence >= checkpoint.applied_sequence)
+                    {
+                        checkpoint.published_count = 0;
+                        if (!openModeRequiresReadOnlyBackends(self.open_mode))
+                            self.core.saveProjectionCheckpoint(entry.config.name, checkpoint) catch continue;
+                    }
+                }
+            }
             if (!entry.validateServingCertificate(checkpoint)) {
                 // An absent or newer sidecar may not describe the native
                 // WAL's immutable generation after an in-flight source
@@ -33185,7 +33232,8 @@ pub const DB = struct {
             .sparse_vector => self.core.sparseIndex(item.name) != null,
             else => false,
         };
-        if (!installed or self.observeResidentIndexAdmission(alloc, item.name, preloaded_repair_state) != .admitted) return false;
+        const admission = self.observeResidentIndexAdmission(alloc, item.name, preloaded_repair_state);
+        if (!installed or admission != .admitted) return false;
         if (item.kind == .dense_vector) {
             const entry = self.core.denseIndex(item.name) orelse return false;
             if (item.projection_checkpoint_published_count) |certified| {
@@ -33196,7 +33244,10 @@ pub const DB = struct {
                     .published_count = certified,
                 };
                 if (!entry.hasValidatedServingCertificate(checkpoint) and
-                    !entry.hasRecoveredNativeServingCertificate(checkpoint)) return false;
+                    !entry.hasRecoveredNativeServingCertificate(checkpoint))
+                {
+                    return false;
+                }
             } else if (item.coverage_produced_count != 0) {
                 const checkpoint: apply_state.ProjectionCheckpoint = .{
                     .applied_sequence = item.projection_checkpoint_applied_sequence,
@@ -40226,6 +40277,10 @@ pub const DB = struct {
     }
 
     fn proveVectorSearchAccessPath(self: *DB, index_name: ?[]const u8, layout: algebraic_mod.ir.PhysicalLayout, constrained: bool) !void {
+        // Native vector routes use the access-path owner directly and may
+        // bypass the callback lookup. An installed physical index still has
+        // to satisfy its durable admission gate before it can serve.
+        try self.failIfIndexQuarantined(index_name);
         const selected_path = switch (layout) {
             .dense_vector => self.core.index_manager.denseVectorAccessPath(index_name),
             .sparse_vector => self.core.index_manager.sparseVectorAccessPath(index_name),
@@ -48194,20 +48249,25 @@ fn markPrecomputedEnrichmentAppliedForSyncContext(ctx: *const BatchExecutionCont
     if (sync_level != .enrichments or sequence == 0) return;
     const runtime = ctx.enrichment_runtime orelse return;
     const runtime_stats = runtime.stats();
-    if (runtime_stats.applied_sequence >= sequence -| 1 or
-        try noPendingEnrichmentReplayThroughContext(ctx, runtime_stats.applied_sequence, sequence))
-    {
+    if (try noPendingEnrichmentReplayThroughContext(ctx, runtime_stats.applied_sequence, sequence)) {
         try runtime.markAppliedThrough(sequence);
     }
 }
 
 fn noPendingEnrichmentReplayThroughContext(ctx: *const BatchExecutionContext, applied_sequence: u64, sequence: u64) !bool {
-    const pending = try enrichment_worker.collectPendingDocumentGroups(ctx.alloc, ctx.replay_source, applied_sequence);
-    defer enrichment_worker.freePendingDocumentGroups(ctx.alloc, pending);
-    for (pending) |group| {
-        if (group.sequence <= sequence) return false;
-    }
-    return true;
+    var cursor = try ctx.replay_source.openMatchingCursor(ctx.alloc, applied_sequence, .enrichment);
+    defer cursor.deinit(ctx.alloc);
+    const Probe = struct {
+        through: u64,
+        pending: bool = false,
+        fn consume(ptr: *anyopaque, at: u64, _: []const u8) !void {
+            const probe: *@This() = @ptrCast(@alignCast(ptr));
+            probe.pending = at <= probe.through;
+        }
+    };
+    var probe = Probe{ .through = sequence };
+    _ = try cursor.forEachNext(1, &probe, Probe.consume);
+    return !probe.pending;
 }
 
 fn runMaintenanceUntilContext(ctx: *const BatchExecutionContext, sequence: u64, sync_targets: ManagedSyncTargets) !void {
@@ -50334,6 +50394,16 @@ fn saveAppliedSequencesBatchLockedContext(
             if (!ctx.index_manager.densePostingCoverageIncludesByName(update.index_name, update.sequence)) {
                 try ctx.index_manager.ensureDensePostingCoverageByName(update.index_name, update.sequence);
             }
+            // Only an already-certified empty publication may carry its zero
+            // count across a source-only native commit. Ordinary native
+            // ingest keeps the count-sidecar optimization.
+            if (ctx.index_manager.denseIndex(update.index_name)) |entry| {
+                const checkpoint = ctx.index_manager.denseProjectionCheckpointMetadata(update.index_name) orelse return error.InvalidDerivedApplyState;
+                if (entry.certifiedEmptyNativeCheckpoint(checkpoint)) |certified| {
+                    try apply_state.saveProjectionCheckpointWithSidecar(ctx.alloc, ctx.index_manager.checkpointIo(), ctx.store, ctx.applied_sequence_checkpoint_path, update.index_name, certified);
+                    _ = entry.validateServingCertificate(certified);
+                }
+            }
         } else {
             generic_updates.appendAssumeCapacity(update);
         }
@@ -50409,13 +50479,14 @@ fn savePhysicalProjectionMetadataForAppliedSequenceUpdates(
             continue;
         };
         const current = index_manager.denseProjectionCheckpointMetadata(update.index_name) orelse continue;
-        try index_manager.saveDenseProjectionCheckpointMetadata(update.index_name, .{
+        const checkpoint: apply_state.ProjectionCheckpoint = .{
             .applied_sequence = update.sequence,
             .status = current.status,
             .generation = if (update.generation != 0) update.generation else current.generation,
             .config_hash = if (update.config_hash != 0) update.config_hash else current.config_hash,
             .published_count = update.published_count,
-        });
+        };
+        try index_manager.saveDenseProjectionCheckpointMetadata(update.index_name, checkpoint);
     }
 }
 
@@ -83099,7 +83170,7 @@ test "db document extraction chunks units through source artifact enrichment" {
     try db.addIndex(.{
         .name = "document_chunk_sparse_v1",
         .kind = .sparse_vector,
-        .config_json = "{\"field\":\"sparse_embedding\"}",
+        .config_json = "{\"field\":\"sparse_embedding\",\"embedding_name\":\"document_chunk_sparse_v1\"}",
     });
     const embedding_cfg = db.core.index_manager.getEnrichment(.embedding, "document_chunk_dense_v1") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("document_chunks_v1", embedding_cfg.source_artifact_name);
@@ -94005,12 +94076,15 @@ test "idle generated coverage gap becomes durable paged recovery debt" {
     // generic dense artifact repair. The recovery owner below persists the
     // exact job class when no live producer owns the gap.
     try std.testing.expect(!(try db.denseArtifactRebuildMaintenanceNeeded(alloc)));
-    // Artifact-backed text participates in enrichment replay, but it does
-    // not emit the vector outcome tuple used by this recovery audit.
+    // Text and vectors maintain independent source-completion receipts. Both
+    // missing receipts need durable recovery when the source count is unknown.
     try std.testing.expect(try db.core.indexRequiresEnrichmentReplay("document_text"));
-    try std.testing.expectEqual(@as(usize, 1), try db.ensureGeneratedCoverageRecoveryIntents(alloc));
-    try std.testing.expectEqual(@as(?u128, null), try db.indexRepairIdForIndex(alloc, "document_text"));
-    try std.testing.expect(!db.core.index_manager.repairUnavailable("document_text"));
+    try std.testing.expectEqual(@as(usize, 2), try db.ensureGeneratedCoverageRecoveryIntents(alloc));
+    const text_repair_id = (try db.indexRepairIdForIndex(alloc, "document_text")) orelse return error.TestUnexpectedResult;
+    var text_entry = try db.loadIndexRepairEntryById(alloc, text_repair_id);
+    defer text_entry.deinit(alloc);
+    try std.testing.expectEqual(index_repair_state.WorkClass.initial_build, text_entry.intent.work_class);
+    try std.testing.expectEqual(index_repair_state.SourceReplayState.pending, text_entry.intent.source_replay_state);
     try std.testing.expect(try db.generatedCoverageRecoveryOwnedByInitialBuild(alloc));
     // The exact initial-build job owns this temporary zero-vector state. The
     // generic artifact planner must not enqueue a duplicate repair job.
@@ -106649,6 +106723,56 @@ test "db online vector publication leaves foreground and posting mutation admiss
     // Structural retirement owns the catalog now. Optional publication must
     // yield before touching an index, rather than waiting under another fence.
     try std.testing.expectEqual(@as(usize, 0), try db.publishVectorBlockBasesOnline(.{}));
+}
+
+test "db source-only batch retains a certified empty dense generation" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var gated = GateDenseEmbedder{ .allowed_successes = .init(0) };
+    const options: OpenOptions = .{
+        .start_index_workers = false,
+        .start_optional_runtime_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .enrichment = .{ .dense_embedder = gated.interface() },
+    };
+    var db = try DB.open(alloc, std.mem.span(path), options);
+    defer db.close();
+    const config: types.IndexConfig = .{
+        .name = "dense_idx",
+        .kind = .dense_vector,
+        .config_json =
+        \\{"field":"body","dims":3,"embedding_name":"dense_idx","publication_policy":"progressive","generator":{"kind":"dense_embedding","source_field":"body","embedding_name":"dense_idx"}}
+        ,
+        .coverage_generation = 33,
+    };
+    try std.testing.expectEqual(@as(?u128, null), try db.admitManagedIndex(config));
+    const before = try db.core.loadProjectionCheckpoint(alloc, config.name);
+    try std.testing.expectEqual(@as(?u64, 0), before.published_count);
+    try std.testing.expect(try db.progressiveManagedGenerationIsQueryable(alloc, config.name));
+    try db.batch(.{ .writes = &.{.{ .key = "source", .value = "{\"body\":\"pending embedding\"}" }}, .sync_level = .write });
+    try replayPendingDerivedBatches(&db, null, null, .{});
+    try db.flushAppliedSequencesForIdle();
+    const after = try db.core.loadProjectionCheckpoint(alloc, config.name);
+    // The blocked provider leaves its derived source watermark pending.
+    try std.testing.expectEqual(before.applied_sequence, after.applied_sequence);
+    try std.testing.expectEqual(@as(?u64, 0), after.published_count);
+    // Reopening a sibling's owner may durably cover a source-only native
+    // window before its count sidecar has been refreshed.
+    try db.core.index_manager.ensureDensePostingCoverageByName(config.name, before.applied_sequence + 1);
+    db.close();
+    db = try DB.open(alloc, std.mem.span(path), options);
+    try std.testing.expect(try db.progressiveManagedGenerationIsQueryable(alloc, config.name));
+    const stats = try db.stats(alloc);
+    defer types.freeDBStats(alloc, stats);
+    for (stats.indexes) |item| if (std.mem.eql(u8, item.name, config.name)) {
+        try std.testing.expect(item.serving_snapshot_ready);
+        try std.testing.expectEqual(@as(u64, 0), item.coverage_produced_count);
+        return;
+    };
+    return error.IndexNotFound;
 }
 
 test "db empty inline dense generation finalizes without scanning primary documents" {
@@ -133262,7 +133386,7 @@ test "db extractEnrichments field-index planning is allocation atomic" {
         }
     };
     for ([_][]const u8{ "{\"links\":[\"target\"]}", "{\"links\":[]}" }) |value|
-        try std.testing.checkAllAllocationFailures(alloc, Check.run, .{ &db, value });
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Check.run, .{ &db, value });
 }
 
 test "overwritten document keys release failures and preserve request order" {

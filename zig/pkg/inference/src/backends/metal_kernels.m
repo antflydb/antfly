@@ -11497,10 +11497,10 @@ static NSString *termite_metal_shader_source(void) {
            "    for (uint kk = 0u; kk < p.k; ++kk) { float r = p.rhs_contract_axis == 0u ? rhs[rhs_base + kk * p.n + col] : rhs[rhs_base + col * p.k + kk]; acc += lhs[lhs_base + row * p.k + kk] * r; }\n"
            "    output[gid] = acc;\n"
            "}\n"
-           "kernel void termite_scatter_add_axis0_f32(device const float *values [[buffer(0)]], device const float *indices [[buffer(1)]], device float *output [[buffer(2)]], constant termite_metal_scatter_add_axis0_f32_params &p [[buffer(3)]], threadgroup uint *matches [[threadgroup(0)]], uint lid [[thread_index_in_threadgroup]], uint2 tpg [[threads_per_threadgroup]], uint2 group [[threadgroup_position_in_grid]]) {\n"
+           "kernel void termite_scatter_add_axis0_f32(device const float *values [[buffer(0)]], device const uchar *indices [[buffer(1)]], device float *output [[buffer(2)]], constant termite_metal_scatter_add_axis0_f32_params &p [[buffer(3)]], threadgroup uint *matches [[threadgroup(0)]], uint lid [[thread_index_in_threadgroup]], uint2 tpg [[threads_per_threadgroup]], uint2 group [[threadgroup_position_in_grid]]) {\n"
            "    uint out_row = group.x; uint col = group.y * tpg.x + lid; if (out_row >= p.out_rows || p.dim == 0u) return; float acc = 0.0f;\n"
            "    for (uint tile = 0u; tile < p.value_rows; tile += tpg.x) {\n"
-           "        if (lid == 0u) { uint count = 0u; uint end = min(tile + tpg.x, p.value_rows); for (uint row = tile; row < end; ++row) { uint target = uint(rint(indices[row])); if (target == out_row) matches[1u + count++] = row; } matches[0] = count; }\n"
+           "        if (lid == 0u) { uint count = 0u; uint end = min(tile + tpg.x, p.value_rows); for (uint row = tile; row < end; ++row) { uint target; if (p.reserved0 == 2u) { uint2 wide = ((device const uint2 *)indices)[row]; if (wide.y == 0u) target = wide.x; else if (wide.y == 0xffffffffu) target = wide.x + p.out_rows; else continue; } else if (p.reserved0 == 1u) { int index = ((device const int *)indices)[row]; target = index < 0 ? uint(index) + p.out_rows : uint(index); } else { target = uint(rint(((device const float *)indices)[row])); } if (target == out_row) matches[1u + count++] = row; } matches[0] = count; }\n"
            "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "        if (col < p.dim) { uint count = matches[0]; for (uint match = 0u; match < count; ++match) acc += values[matches[1u + match] * p.dim + col]; }\n"
            "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
@@ -48081,6 +48081,7 @@ int termite_metal_decode_runtime_scatter_add_axis0_f32_device(
     size_t values_offset,
     void *indices_handle,
     size_t indices_offset,
+    uint32_t index_type,
     size_t out_rows,
     size_t value_rows,
     size_t dim,
@@ -48090,13 +48091,14 @@ int termite_metal_decode_runtime_scatter_add_axis0_f32_device(
     if (runtime == NULL || values_handle == NULL || indices_handle == NULL || output_handle == NULL) return -1;
     if (runtime->scatter_add_axis0_f32_pipeline == nil) return -2;
     if (out_rows == 0 || value_rows == 0 || dim == 0 || out_rows > UINT32_MAX || value_rows > UINT32_MAX || dim > UINT32_MAX) return -3;
+    if (index_type > 2u) return -3;
     if (value_rows > SIZE_MAX / dim || out_rows > SIZE_MAX / dim) return -4;
     @autoreleasepool {
         id<MTLBuffer> values_buffer = (__bridge id<MTLBuffer>)values_handle;
         id<MTLBuffer> indices_buffer = (__bridge id<MTLBuffer>)indices_handle;
         id<MTLBuffer> output_buffer = (__bridge id<MTLBuffer>)output_handle;
         const size_t values_bytes = value_rows * dim * sizeof(float);
-        const size_t indices_bytes = value_rows * sizeof(float);
+        const size_t indices_bytes = value_rows * (index_type == 2u ? sizeof(int64_t) : sizeof(uint32_t));
         const size_t total = out_rows * dim;
         const size_t output_bytes = total * sizeof(float);
         if (total > UINT32_MAX) return -5;
@@ -48105,7 +48107,7 @@ int termite_metal_decode_runtime_scatter_add_axis0_f32_device(
             .out_rows = (uint32_t)out_rows,
             .value_rows = (uint32_t)value_rows,
             .dim = (uint32_t)dim,
-            .reserved0 = 0,
+            .reserved0 = index_type,
         };
         bool frame_owned = true;
         id<MTLCommandBuffer> command_buffer = termite_metal_decode_runtime_command_buffer(runtime, __func__, &frame_owned);

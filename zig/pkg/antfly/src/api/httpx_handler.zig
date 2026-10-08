@@ -7763,6 +7763,7 @@ pub const AntflyApiHandler = struct {
             },
             else => return err,
         };
+        if (!std.mem.eql(u8, response.status, "success")) _ = ctx.status(202);
         return ctx.openApiJson(response);
     }
 

@@ -839,6 +839,50 @@ def _read_log_tail(path: Path, *, limit: int = 200000) -> str:
     return data[-limit:]
 
 
+def _e2e_backup_connections() -> dict:
+    connections = {
+        E2E_BACKUP_CONNECTION: {
+            "kind": "external_io",
+            "capabilities": ["backup.write", "restore.read"],
+            "external_io": {"protocol": "filesystem", "root": "/"},
+        }
+    }
+    for backend, scheme in (("S3", "s3"), ("GCS", "gs")):
+        if os.environ.get(f"OBJECTSTORE_{backend}_INTEGRATION") != "1":
+            continue
+        bucket = os.environ.get(f"OBJECTSTORE_{backend}_TEST_BUCKET")
+        if not bucket:
+            continue
+        external = {
+            "protocol": "s3" if backend == "S3" else "gcs",
+            "buckets": [bucket],
+            "prefix": f"antfly-backup-e2e/{scheme}",
+        }
+        if backend == "S3":
+            external.update(
+                region=os.environ.get("AWS_REGION", "us-east-1"),
+                addressing_style="path",
+                credentials={"source": "default"},
+            )
+            if endpoint := os.environ.get("AWS_ENDPOINT_URL"):
+                external.update(
+                    endpoint=endpoint, use_ssl=endpoint.startswith("https:")
+                )
+        else:
+            if endpoint := os.environ.get("GCS_JSON_API_ENDPOINT"):
+                external["endpoint"] = endpoint
+            if endpoint := os.environ.get("GCS_JSON_API_UPLOAD_ENDPOINT"):
+                external["upload_endpoint"] = endpoint
+            if project := os.environ.get("GOOGLE_CLOUD_PROJECT"):
+                external["project_id"] = project
+        connections[f"{E2E_BACKUP_CONNECTION}-{scheme}"] = {
+            "kind": "external_io",
+            "capabilities": ["backup.write", "restore.read"],
+            "external_io": external,
+        }
+    return connections
+
+
 def _write_remote_content_e2e_config(
     root: Path, *, pgwire_port: int | None = None
 ) -> Path:
@@ -858,12 +902,16 @@ def _write_remote_content_e2e_config(
                     if pgwire_port is not None
                     else {}
                 ),
-                "connections": {
-                    E2E_BACKUP_CONNECTION: {
-                        "kind": "external_io",
-                        "capabilities": ["backup.write", "restore.read"],
-                        "external_io": {"protocol": "filesystem", "root": "/"},
-                    }
+                "connections": _e2e_backup_connections(),
+                "inference": {
+                    "models_dir": os.environ.get(
+                        "ANTFLY_INFERENCE_STANDALONE_MODELS_DIR",
+                        str(Path("~/.antfly/inference/models").expanduser()),
+                    ),
+                    "ml_dir": os.environ.get(
+                        "ANTFLY_INFERENCE_STANDALONE_ML_DIR",
+                        str(Path("~/.antfly/inference/ml").expanduser()),
+                    ),
                 },
             }
         ),
@@ -3283,13 +3331,14 @@ def stateful_api(request: pytest.FixtureRequest):
             *,
             backup_id: str,
             location: str,
+            connection: str = E2E_BACKUP_CONNECTION,
             table_names: list[str] | None = None,
             backup_format: str | None = None,
         ) -> dict:
             payload: dict[str, object] = {
                 "backup_id": backup_id,
                 "location": location,
-                "connection": E2E_BACKUP_CONNECTION,
+                "connection": connection,
             }
             if table_names is not None:
                 payload["table_names"] = table_names
@@ -3308,13 +3357,14 @@ def stateful_api(request: pytest.FixtureRequest):
             *,
             backup_id: str,
             location: str,
+            connection: str = E2E_BACKUP_CONNECTION,
             table_names: list[str] | None = None,
             restore_mode: str | None = None,
         ) -> dict:
             payload: dict[str, object] = {
                 "backup_id": backup_id,
                 "location": location,
-                "connection": E2E_BACKUP_CONNECTION,
+                "connection": connection,
             }
             if table_names is not None:
                 payload["table_names"] = table_names
@@ -3331,9 +3381,12 @@ def stateful_api(request: pytest.FixtureRequest):
             except requests.RequestException as err:
                 self._raise_request_error(err)
 
-        def list_backups(self, *, location: str) -> dict:
+        def list_backups(
+            self, *, location: str, connection: str = E2E_BACKUP_CONNECTION
+        ) -> dict:
             response = self.s.get(
-                f"{self.url}/backups?location={location}&connection={E2E_BACKUP_CONNECTION}",
+                f"{self.url}/backups",
+                params={"location": location, "connection": connection},
                 timeout=30,
             )
             return self._check(response)
@@ -3918,13 +3971,14 @@ def backup_api(request: pytest.FixtureRequest):
             *,
             backup_id: str,
             location: str,
+            connection: str = E2E_BACKUP_CONNECTION,
             table_names: list[str] | None = None,
             backup_format: str | None = None,
         ) -> dict:
             payload: dict[str, object] = {
                 "backup_id": backup_id,
                 "location": location,
-                "connection": E2E_BACKUP_CONNECTION,
+                "connection": connection,
             }
             if table_names is not None:
                 payload["table_names"] = table_names
@@ -3943,13 +3997,14 @@ def backup_api(request: pytest.FixtureRequest):
             *,
             backup_id: str,
             location: str,
+            connection: str = E2E_BACKUP_CONNECTION,
             table_names: list[str] | None = None,
             restore_mode: str | None = None,
         ) -> dict:
             payload: dict[str, object] = {
                 "backup_id": backup_id,
                 "location": location,
-                "connection": E2E_BACKUP_CONNECTION,
+                "connection": connection,
             }
             if table_names is not None:
                 payload["table_names"] = table_names
@@ -3966,9 +4021,12 @@ def backup_api(request: pytest.FixtureRequest):
             except requests.RequestException as err:
                 self._raise_request_error(err)
 
-        def list_backups(self, *, location: str) -> dict:
+        def list_backups(
+            self, *, location: str, connection: str = E2E_BACKUP_CONNECTION
+        ) -> dict:
             response = self.s.get(
-                f"{self.url}/backups?location={location}&connection={E2E_BACKUP_CONNECTION}",
+                f"{self.url}/backups",
+                params={"location": location, "connection": connection},
                 timeout=30,
             )
             return self._check(response)
