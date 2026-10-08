@@ -28,7 +28,7 @@ pub const Options = struct { values: arrays.Limits = .{}, wire_bytes: usize = 8 
 pub const Decoded = struct { value: arrays.Value, work: usize, wire_bytes: usize };
 pub const Admission = struct { work: usize, wire_bytes: usize };
 
-const Inspection = struct {
+pub const Inspection = struct {
     dimensions: [6]arrays.Dimension,
     rank: usize,
     values: []const Json,
@@ -268,6 +268,13 @@ pub fn normalize(kind: arrays.ElementType, input: *Json, preserve: bool, options
         }
     }
     return inspected.admission;
+}
+
+/// Validate envelope metadata and wire admission without allocating or parsing
+/// NUMERIC limbs. The caller must validate every non-NULL value under its own
+/// shared execution context; this is not a complete typed-array validation.
+pub fn inspectNumericEnvelope(input: Json, options: Options) !Inspection {
+    return inspect(.numeric, input, options);
 }
 
 fn inspect(kind: arrays.ElementType, input: Json, options: Options) !Inspection {

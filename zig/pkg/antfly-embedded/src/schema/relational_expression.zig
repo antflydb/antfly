@@ -41,6 +41,14 @@ pub const Execution = struct {
     pub fn init(alloc: Allocator, bytes: *usize) Execution {
         return .{ .alloc = alloc, .bytes = bytes, .numeric = .{ .alloc = alloc } };
     }
+
+    pub fn charge(self: *Execution, work: u64) !void {
+        self.numeric.charge(work) catch |err| return executionFailure(err);
+    }
+
+    pub fn limit(self: *Execution) anyerror {
+        return executionFailure(self.numeric.limit());
+    }
 };
 
 // Preserve the durable validation/transport contract. Numeric kernel errors
@@ -107,7 +115,8 @@ const NumericScratch = struct {
     }
 
     fn failure(self: *NumericScratch, err: anyerror) anyerror {
-        return if (err == error.OutOfMemory and self.memory.isExhausted()) error.RelationalExpressionBudgetExceeded else executionFailure(err);
+        if (err == error.RelationalExpressionBudgetExceeded or (err == error.OutOfMemory and self.memory.isExhausted())) return self.execution.limit();
+        return executionFailure(err);
     }
 };
 
@@ -118,6 +127,75 @@ fn numericJson(execution: *Execution, input: std.json.Value) !Value {
     defer scratch.deinit();
     const parsed = @import("../sql/numeric_storage.zig").fromJson(&execution.numeric, input) catch |err| return scratch.failure(err);
     return scratch.encode(parsed.value) catch |err| return scratch.failure(err);
+}
+
+/// Assignment and logical restore share exact parsing, work and cancellation.
+/// Preservation validates the target domain without repairing logical values;
+/// the physical row codec separately enforces canonical bytes.
+pub fn normalizeNumericJson(execution: *Execution, input: std.json.Value, modifier: ?exact.TypeModifier, preserve: bool) !std.json.Value {
+    execution.numeric.charge(0) catch |err| return executionFailure(err);
+    if (input == .null) return input;
+    var scratch: NumericScratch = undefined;
+    scratch.init(execution);
+    defer scratch.deinit();
+    return normalizeNumericJsonInner(&scratch, input, modifier, preserve) catch |err| return scratch.failure(err);
+}
+
+fn normalizeNumericJsonInner(scratch: *NumericScratch, input: std.json.Value, modifier: ?exact.TypeModifier, preserve: bool) !std.json.Value {
+    const ctx = &scratch.execution.numeric;
+    const parsed = try @import("../sql/numeric_storage.zig").fromJson(ctx, input);
+    const constrained = if (modifier) |target| try exact.applyTypeModifier(ctx, parsed.value, target) else parsed;
+    if (preserve) {
+        if (modifier != null and try exact.order(ctx, parsed.value, constrained.value) != .eq) return error.InvalidRelationalGeneratedValue;
+        return input;
+    }
+    return scratch.json(constrained.value);
+}
+
+/// NUMERIC array cells borrow one reusable scratch arena and one sticky work
+/// budget. No cell gets a fresh quota. Publish replacement values only after
+/// complete admission, preserving dimensions, SQL NULLs and signed bounds.
+pub fn normalizeNumericArrayJson(execution: *Execution, input: *std.json.Value, modifier: ?exact.TypeModifier, preserve: bool) !void {
+    execution.numeric.charge(0) catch |err| return executionFailure(err);
+    const wire = @import("../sql/array_wire.zig");
+    // Borrowed input has its existing wire/domain bounds; only actual scratch
+    // and owned output consume the preparation allocation allowance.
+    const inspected = wire.inspectNumericEnvelope(input.*, .{ .values = .{
+        .work = @intCast(@min(execution.numeric.remaining, std.math.maxInt(usize))),
+    } }) catch |err| {
+        return if (err == error.SqlProgramLimitExceeded) executionFailure(execution.numeric.limit()) else err;
+    };
+    execution.numeric.charge(inspected.admission.work) catch |err| return executionFailure(err);
+    const alloc = execution.alloc;
+    const replacement: ?[]std.json.Value = if (preserve) null else blk: {
+        const size = std.math.mul(usize, inspected.values.len, @sizeOf(std.json.Value)) catch return executionFailure(execution.numeric.limit());
+        if (size > execution.bytes.*) return executionFailure(execution.numeric.limit());
+        const cells = try alloc.alloc(std.json.Value, inspected.values.len);
+        execution.bytes.* -= size;
+        break :blk cells;
+    };
+    var completed: usize = 0;
+    errdefer if (replacement) |cells| {
+        for (cells[0..completed]) |cell| if (cell == .string) alloc.free(cell.string);
+        alloc.free(cells);
+    };
+    var scratch: NumericScratch = undefined;
+    scratch.init(execution);
+    defer scratch.deinit();
+    for (inspected.values, inspected.nulls, 0..) |raw, flag, index| {
+        execution.numeric.charge(1) catch |err| return scratch.failure(err);
+        if (flag.bool) {
+            if (replacement) |cells| cells[index] = .null;
+        } else {
+            _ = scratch.arena.reset(.retain_capacity);
+            // Output admission reduces the capacity available to later cells.
+            scratch.memory.limit = execution.bytes.*;
+            const value = normalizeNumericJsonInner(&scratch, raw, modifier, preserve) catch |err| return scratch.failure(err);
+            if (replacement) |cells| cells[index] = .{ .string = if (value == .number_string) value.number_string else value.string };
+        }
+        completed += 1;
+    }
+    if (replacement) |cells| input.object.getPtr("values").?.* = .{ .array = .fromOwnedSlice(alloc, cells) };
 }
 
 /// Already constrained canonical values are reused without decoding limbs or
@@ -1422,6 +1500,144 @@ test "relational declarations NUMERIC target modifiers precede dependent express
     try std.testing.checkAllAllocationFailures(stable.allocator(), Run.run, .{ wire, declarations.value, fixture.value.entries[6..7] });
 }
 
+test "relational declarations NUMERIC JSON assignments share PostgreSQL scalar and array semantics" {
+    const a = std.testing.allocator;
+    const Entry = struct { op: []const u8, left: []const u8, precision: u16 = 0, scale: i16 = 0, expected: ?std.json.Value = null, @"error": ?[]const u8 = null };
+    const fixture = try std.json.parseFromSlice(struct { entries: []const Entry }, a, @embedFile("../sql/fixtures/sql_exact_numeric_reference.json"), .{ .ignore_unknown_fields = true });
+    defer fixture.deinit();
+    var tested: usize = 0;
+    for (fixture.value.entries) |entry| {
+        if (!std.mem.eql(u8, entry.op, "typmod")) continue;
+        tested += 1;
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+        const json = try std.json.Stringify.valueAlloc(alloc, .{
+            .dimensions = .{ .{ .length = 2, .lower_bound = -3 }, .{ .length = 2, .lower_bound = 7 } },
+            .values = .{ entry.left, null, entry.left, null },
+            .sql_nulls = .{ false, true, false, true },
+        }, .{});
+        var document = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
+        defer document.deinit();
+        const original = document.value.object.get("values").?.array.items;
+        var budget: usize = max_allocated_bytes;
+        var execution = Execution.init(alloc, &budget);
+        const modifier: exact.TypeModifier = .{ .precision = entry.precision, .scale = entry.scale };
+        if (entry.@"error") |code| {
+            const expected = if (std.mem.eql(u8, code, "22023")) error.SqlInvalidParameterValue else error.RelationalExpressionOverflow;
+            try std.testing.expectError(expected, normalizeNumericJson(&execution, .{ .string = entry.left }, modifier, false));
+            try std.testing.expectError(expected, normalizeNumericArrayJson(&execution, &document.value, modifier, false));
+            try std.testing.expectEqual(original.ptr, document.value.object.get("values").?.array.items.ptr);
+            continue;
+        }
+        const scalar = try normalizeNumericJson(&execution, .{ .string = entry.left }, modifier, false);
+        try std.testing.expectEqualStrings(entry.expected.?.string, if (scalar == .number_string) scalar.number_string else scalar.string);
+        try normalizeNumericArrayJson(&execution, &document.value, modifier, false);
+        const cells = document.value.object.get("values").?.array.items;
+        try std.testing.expectEqualStrings(entry.expected.?.string, cells[0].string);
+        try std.testing.expectEqualStrings(entry.expected.?.string, cells[2].string);
+        try std.testing.expectEqual(std.json.Value.null, cells[1]);
+        try std.testing.expectEqual(std.json.Value.null, cells[3]);
+        try std.testing.expectEqual(@as(i64, -3), document.value.object.get("dimensions").?.array.items[0].object.get("lower_bound").?.integer);
+        try std.testing.expectEqual(@as(i64, 7), document.value.object.get("dimensions").?.array.items[1].object.get("lower_bound").?.integer);
+        try normalizeNumericArrayJson(&execution, &document.value, modifier, true);
+        try std.testing.expectEqual(cells.ptr, document.value.object.get("values").?.array.items.ptr);
+    }
+    try std.testing.expectEqual(@as(usize, 20), tested);
+}
+
+test "relational declarations NUMERIC JSON array preparation is atomic bounded and cancellation aware" {
+    const a = std.testing.allocator;
+    const text =
+        \\{"dimensions":[{"length":4,"lower_bound":-3}],"values":["1.245",null,"2.5",null],"sql_nulls":[false,true,false,true]}
+    ;
+    const modifier: exact.TypeModifier = .{ .precision = 4, .scale = 2 };
+    const Run = struct {
+        fn run(alloc: Allocator, source: []const u8, target: exact.TypeModifier, overflow: bool) !void {
+            var document = try std.json.parseFromSlice(std.json.Value, alloc, source, .{});
+            defer document.deinit();
+            const owned = document.arena.allocator();
+            const original = document.value.object.get("values").?.array.items;
+            if (overflow) original[2] = .{ .string = "999.995" };
+            var budget: usize = max_allocated_bytes;
+            var execution = Execution.init(owned, &budget);
+            if (overflow) {
+                if (normalizeNumericArrayJson(&execution, &document.value, target, false)) |_| return error.TestExpectedError else |err| {
+                    if (err == error.OutOfMemory) return err;
+                    try std.testing.expectEqual(error.RelationalExpressionOverflow, err);
+                }
+                try std.testing.expectEqual(original.ptr, document.value.object.get("values").?.array.items.ptr);
+                try std.testing.expectEqualStrings("1.245", original[0].string);
+            } else {
+                try normalizeNumericArrayJson(&execution, &document.value, target, false);
+                const cells = document.value.object.get("values").?.array.items;
+                try std.testing.expectEqualStrings("1.25", cells[0].string);
+                try std.testing.expectEqualStrings("2.50", cells[2].string);
+                try std.testing.expect(budget < max_allocated_bytes);
+            }
+        }
+    };
+    try Run.run(a, text, modifier, false);
+    try Run.run(a, text, modifier, true);
+    var stable = std.testing.FailingAllocator.init(a, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(stable.allocator(), Run.run, .{ text, modifier, false });
+    try std.testing.checkAllAllocationFailures(stable.allocator(), Run.run, .{ text, modifier, true });
+    var document = try std.json.parseFromSlice(std.json.Value, a, text, .{});
+    defer document.deinit();
+    const original = document.value.object.get("values").?.array.items;
+    var budget: usize = max_allocated_bytes;
+    var execution = Execution.init(a, &budget);
+    try normalizeNumericArrayJson(&execution, &document.value, null, true);
+    const used = 8 * 1024 * 1024 - execution.numeric.remaining;
+    try std.testing.expectEqual(original.ptr, document.value.object.get("values").?.array.items.ptr);
+    try std.testing.expectError(error.InvalidRelationalGeneratedValue, normalizeNumericArrayJson(&execution, &document.value, modifier, true));
+    execution = Execution.init(a, &budget);
+    execution.numeric.remaining = used - 1;
+    try std.testing.expectError(error.RelationalExpressionBudgetExceeded, normalizeNumericArrayJson(&execution, &document.value, null, true));
+    execution.numeric.remaining = 8 * 1024 * 1024;
+    try std.testing.expectError(error.RelationalExpressionBudgetExceeded, normalizeNumericJson(&execution, .{ .integer = 1 }, null, true));
+    const Poll = struct {
+        fn canceled(_: ?*anyopaque) anyerror!void {
+            return error.Canceled;
+        }
+    };
+    execution = Execution.init(a, &budget);
+    execution.numeric.checkpoint = Poll.canceled;
+    try std.testing.expectError(error.Canceled, normalizeNumericArrayJson(&execution, &document.value, null, true));
+    execution.numeric.checkpoint = null;
+    try std.testing.expectError(error.Canceled, normalizeNumericJson(&execution, .{ .integer = 1 }, null, true));
+    budget = 1;
+    execution = Execution.init(a, &budget);
+    try std.testing.expectError(error.RelationalExpressionBudgetExceeded, normalizeNumericArrayJson(&execution, &document.value, null, true));
+    budget = max_allocated_bytes;
+    try std.testing.expectError(error.RelationalExpressionBudgetExceeded, normalizeNumericJson(&execution, .{ .integer = 1 }, null, true));
+}
+
+test "relational declarations NUMERIC JSON array validation reuses bounded scratch across ten thousand cells" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const values = try alloc.alloc([]const u8, 10000);
+    @memset(values, "1.25");
+    const nulls = try alloc.alloc(bool, values.len);
+    @memset(nulls, false);
+    const json = try std.json.Stringify.valueAlloc(alloc, .{
+        .dimensions = .{.{ .length = values.len, .lower_bound = -100 }},
+        .values = values,
+        .sql_nulls = nulls,
+    }, .{});
+    var document = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
+    defer document.deinit();
+    var budget: usize = max_allocated_bytes;
+    var execution = Execution.init(alloc, &budget);
+    const start = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
+    try normalizeNumericArrayJson(&execution, &document.value, .{ .precision = 4, .scale = 2 }, true);
+    // Retained scratch is bounded by the largest cell, not the cell count.
+    try std.testing.expect(max_allocated_bytes - budget < 4096);
+    std.debug.print("NUMERIC JSON array admission: cells=10000 scratch_bytes={} work={} elapsed_ns={}\n", .{ max_allocated_bytes - budget, 8 * 1024 * 1024 - execution.numeric.remaining, std.Io.Clock.now(.awake, std.testing.io).nanoseconds - start });
+}
+
 test "relational declarations NUMERIC constrained bindings reuse canonical bytes with sticky admission" {
     const a = std.testing.allocator;
     const bytes = try @import("../sql/numeric_storage.zig").encodeJsonAlloc(a, .{ .string = "1.25" });
@@ -1798,27 +2014,40 @@ pub const Set = struct {
     /// Mutates a request-owned DOM without reparsing it. Generated fields are
     /// output-only: any submitted value is overwritten deterministically.
     pub fn applyJson(self: *const Set, alloc: Allocator, document: *std.json.Value) !void {
-        if (document.* != .object) return error.InvalidBatchRequest;
         var budget: usize = max_allocated_bytes;
         var execution = Execution.init(alloc, &budget);
+        return self.applyJsonWithExecution(&execution, document);
+    }
+
+    pub fn applyJsonWithExecution(self: *const Set, execution: *Execution, document: *std.json.Value) !void {
+        execution.numeric.charge(0) catch |err| return executionFailure(err);
+        if (document.* != .object) return error.InvalidBatchRequest;
+        const alloc = execution.alloc;
+        const count = self.table.relational_columns.len;
+        execution.numeric.charge(count) catch |err| return executionFailure(err);
+        const staging_bytes = std.math.mul(usize, count, @sizeOf(Value) + @sizeOf(bool)) catch return executionFailure(execution.numeric.limit());
+        if (staging_bytes > execution.bytes.*) return executionFailure(execution.numeric.limit());
         const values = try alloc.alloc(Value, self.table.relational_columns.len);
         defer alloc.free(values);
         const present = try alloc.alloc(bool, values.len);
         defer alloc.free(present);
-        try self.readValues(&execution, document.*, values, present, true);
-        try self.applyValuesWithExecution(&execution, values, present, .apply_to_absent, null);
+        execution.bytes.* -= staging_bytes;
+        try self.readValues(execution, document.*, values, present, true);
+        try self.applyValuesWithExecution(execution, values, present, .apply_to_absent, null);
         for (self.modifier_ordinals) |ordinal| {
             if (self.generated_columns[ordinal]) continue;
             const column = self.table.relational_columns[ordinal];
             if (document.object.getPtr(column.name)) |cell| if (values[ordinal] == .numeric) {
-                cell.* = try numericJsonOutput(&execution, values[ordinal].numeric);
+                cell.* = try numericJsonOutput(execution, values[ordinal].numeric);
             };
         }
         for (self.bindings) |binding| {
             const name = self.table.relational_columns[binding.ordinal].name;
             if (!binding.generated and document.object.contains(name)) continue;
             const value = values[binding.ordinal];
-            try document.object.put(alloc, try alloc.dupe(u8, name), if (value == .numeric) try numericJsonOutput(&execution, value.numeric) else try valueToJson(alloc, value));
+            const key = try allocateOutput(alloc, name.len, execution.bytes);
+            @memcpy(key, name);
+            try document.object.put(alloc, key, try boundedValueToJson(execution, value));
         }
     }
 

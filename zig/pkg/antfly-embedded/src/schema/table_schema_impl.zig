@@ -495,7 +495,8 @@ const SchemaContext = struct {
 /// Slice identities remain stable when schema/property structs are copied.
 pub const CompiledValidationPlan = struct {
     const PropertyMap = std.StringHashMapUnmanaged(usize);
-    const SqlColumn = struct { name: []const u8, kind: @import("../common/sql_builtin_type.zig").Type, generated: bool, is_array: bool };
+    const SqlColumn = struct { name: []const u8, kind: @import("../common/sql_builtin_type.zig").Type, generated: bool, defaulted: bool, is_array: bool };
+    const Normalization = enum { base, derived, all };
     /// Borrowed immutable epoch identity, stable across owner struct moves.
     schema_documents: []const DocumentSchema = &.{},
     schema_version: u32 = 0,
@@ -521,7 +522,13 @@ pub const CompiledValidationPlan = struct {
                     };
                     break :generated false;
                 };
-                try sql_columns.append(alloc, .{ .name = property.name, .kind = @import("../common/sql_builtin_type.zig").Type.fromWire(kind), .generated = generated, .is_array = propertyIsSqlArray(property) });
+                const defaulted = defaulted: {
+                    if (schema.column_defaults) |columns| for (columns.value.array.items) |entry| {
+                        if (std.mem.eql(u8, entry.object.get("column").?.string, property.name)) break :defaulted true;
+                    };
+                    break :defaulted false;
+                };
+                try sql_columns.append(alloc, .{ .name = property.name, .kind = @import("../common/sql_builtin_type.zig").Type.fromWire(kind), .generated = generated, .defaulted = defaulted, .is_array = propertyIsSqlArray(property) });
             };
         };
         plan.sql_columns = try sql_columns.toOwnedSlice(alloc);
@@ -559,15 +566,32 @@ pub const CompiledValidationPlan = struct {
             return error.InvalidBatchRequest;
     }
 
-    fn normalizeSql(self: *const CompiledValidationPlan, alloc: std.mem.Allocator, root: *std.json.Value, preserve: bool, ignore_generated: bool) !void {
+    fn normalizeSql(self: *const CompiledValidationPlan, execution: *@import("relational_expression.zig").Execution, root: *std.json.Value, preserve: bool, selection: Normalization) !void {
         if (root.* != .object) return;
+        const alloc = execution.alloc;
         const casts = @import("../sql/builtin_cast.zig");
         for (self.sql_columns) |column| {
-            if (ignore_generated and column.generated) continue;
+            if (selection == .base and column.generated) continue;
+            if (selection == .derived and !column.generated and !column.defaulted) continue;
+            try execution.charge(1);
             const cell = root.object.getPtr(column.name) orelse continue;
             if (cell.* == .null) continue;
             if (column.is_array) {
-                _ = @import("../sql/array_wire.zig").normalize(column.kind, cell, preserve, .{}) catch return error.InvalidBatchRequest;
+                if (column.kind == .numeric) {
+                    // Unconstrained API values are validated, not rewritten.
+                    @import("relational_expression.zig").normalizeNumericArrayJson(execution, cell, null, true) catch |err| switch (err) {
+                        error.OutOfMemory, error.Canceled, error.RelationalExpressionBudgetExceeded => return err,
+                        else => return error.InvalidBatchRequest,
+                    };
+                } else {
+                    const admitted = @import("../sql/array_wire.zig").normalize(column.kind, cell, preserve, .{ .values = .{
+                        .work = @intCast(@min(execution.numeric.remaining, std.math.maxInt(usize))),
+                    } }) catch |err| {
+                        if (err == error.SqlProgramLimitExceeded) return execution.limit();
+                        return error.InvalidBatchRequest;
+                    };
+                    try execution.charge(admitted.work);
+                }
                 continue;
             }
             switch (column.kind) {
@@ -590,7 +614,9 @@ pub const CompiledValidationPlan = struct {
                         const canonical = uuid.format(uuid.parse(cell.string) catch return error.InvalidBatchRequest);
                         if (!std.mem.eql(u8, cell.string, &canonical)) {
                             if (preserve) return error.InvalidBatchRequest;
+                            if (canonical.len > execution.bytes.*) return execution.limit();
                             cell.string = try alloc.dupe(u8, &canonical);
+                            execution.bytes.* -= canonical.len;
                         }
                     }
                 },
@@ -1061,10 +1087,13 @@ pub fn prepareDocumentValueWithPlan(
     compiled: *const CompiledValidationPlan,
 ) !void {
     try compiled.requireSchema(schema);
-    try compiled.normalizeSql(owned_alloc, value, false, true);
+    const expressions_module = @import("relational_expression.zig");
+    var budget: usize = expressions_module.max_allocated_bytes;
+    var execution = expressions_module.Execution.init(owned_alloc, &budget);
+    try compiled.normalizeSql(&execution, value, false, .base);
     if (compiled.expressions) |expressions| {
-        try expressions.applyJson(owned_alloc, value);
-        try compiled.normalizeSql(owned_alloc, value, false, false);
+        try expressions.applyJsonWithExecution(&execution, value);
+        try compiled.normalizeSql(&execution, value, false, .derived);
     }
     return validateDocumentValueInternal(scratch, schema, value, physical_fields, compiled, false, &.{}, true);
 }
@@ -1075,11 +1104,14 @@ pub fn prepareDocumentValueWithPlan(
 pub fn prepareTypedDocumentValueWithPlan(owned_alloc: std.mem.Allocator, scratch: std.mem.Allocator, schema: TableSchema, value: *std.json.Value, physical_fields: []const PhysicalFieldValidation, compiled: *const CompiledValidationPlan, json_null_fields: []const []const u8, preserve: bool) !void {
     try compiled.requireSchema(schema);
     if (value.* != .object) return error.InvalidBatchRequest;
+    const expressions_module = @import("relational_expression.zig");
+    var budget: usize = expressions_module.max_allocated_bytes;
+    var execution = expressions_module.Execution.init(owned_alloc, &budget);
     if (!preserve) {
-        try compiled.normalizeSql(owned_alloc, value, false, true);
+        try compiled.normalizeSql(&execution, value, false, .base);
         if (compiled.expressions) |expressions| {
-            try expressions.applyJson(owned_alloc, value);
-            try compiled.normalizeSql(owned_alloc, value, false, false);
+            try expressions.applyJsonWithExecution(&execution, value);
+            try compiled.normalizeSql(&execution, value, false, .derived);
         }
     }
     const pointers = try scratch.alloc(*const std.json.Value, json_null_fields.len);
@@ -1112,7 +1144,12 @@ fn validateDocumentValueInternal(
     };
 
     const document_schema = try resolveDocumentSchema(schema, root);
-    if (!sql_admitted) if (compiled) |plan| try plan.normalizeSql(alloc, value, true, false);
+    if (!sql_admitted) if (compiled) |plan| {
+        const expressions_module = @import("relational_expression.zig");
+        var budget: usize = expressions_module.max_allocated_bytes;
+        var execution = expressions_module.Execution.init(alloc, &budget);
+        try plan.normalizeSql(&execution, value, true, .all);
+    };
     if (verify_generated) if (compiled) |plan| {
         if (plan.expressions) |expressions| try expressions.verifyJson(alloc, value.*);
     } else if (schema.generated_columns != null) {
@@ -2942,6 +2979,39 @@ test "relational declarations exact NUMERIC field validation matches PostgreSQL 
         };
         try std.testing.expect(case.expected);
     }
+}
+
+test "relational declarations SQL row normalization shares array admission and skips unchanged base fields" {
+    const a = std.testing.allocator;
+    const expressions = @import("relational_expression.zig");
+    const columns = [_]CompiledValidationPlan.SqlColumn{
+        .{ .name = "base", .kind = .numeric, .is_array = true, .generated = false, .defaulted = false },
+        .{ .name = "derived", .kind = .numeric, .is_array = true, .generated = true, .defaulted = false },
+    };
+    const plan: CompiledValidationPlan = .{ .sql_columns = &columns };
+    var document = try std.json.parseFromSlice(std.json.Value, a,
+        \\{"base":{"dimensions":[{"length":2,"lower_bound":-2}],"values":["1.25",null],"sql_nulls":[false,true]},"derived":false}
+    , .{});
+    defer document.deinit();
+    var budget: usize = expressions.max_allocated_bytes;
+    var execution = expressions.Execution.init(a, &budget);
+    try plan.normalizeSql(&execution, &document.value, false, .base);
+    const used = 8 * 1024 * 1024 - execution.numeric.remaining;
+    try std.testing.expectError(error.InvalidBatchRequest, plan.normalizeSql(&execution, &document.value, false, .derived));
+    // Invalid submitted generated fields are ignored before evaluation, but
+    // produced values cannot bypass their ordinary array-domain validation.
+    document.value.object.getPtr("derived").?.* = document.value.object.get("base").?;
+    document.value.object.getPtr("base").?.* = .{ .bool = false };
+    execution = expressions.Execution.init(a, &budget);
+    try plan.normalizeSql(&execution, &document.value, false, .derived);
+    try std.testing.expectError(error.InvalidBatchRequest, plan.normalizeSql(&execution, &document.value, true, .all));
+    document.value.object.getPtr("base").?.* = document.value.object.get("derived").?;
+    execution = expressions.Execution.init(a, &budget);
+    execution.numeric.remaining = used;
+    // Each array fits alone; the row must not receive two independent quotas.
+    try std.testing.expectError(error.RelationalExpressionBudgetExceeded, plan.normalizeSql(&execution, &document.value, true, .all));
+    execution.numeric.remaining = 8 * 1024 * 1024;
+    try std.testing.expectError(error.RelationalExpressionBudgetExceeded, plan.normalizeSql(&execution, &document.value, false, .base));
 }
 
 test "relational declarations exact NUMERIC composition parses once and shares the scalar work budget" {

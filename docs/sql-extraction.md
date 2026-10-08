@@ -5920,3 +5920,44 @@ tests. Rust validation also exposed and corrected a stale aggregate-recipe
 default initializer so the current generated API builds. OpenAPI/Python/Rust
 generation checks, control-catalog, inventory, formatting and whitespace checks
 pass. The work is committed locally, not pushed.
+
+### Shared SQL postimage preparation and reusable NUMERIC array scratch
+
+Both ordinary and typed-row preparation now carry one expression execution
+context through base SQL normalization, default/generated evaluation and derived
+normalization. Array metadata admission and NUMERIC cells consume that same
+sticky work budget. Expression staging vectors, owned outputs and UUID rewrites
+also consume the preparation byte allowance. The post-expression pass visits
+only default/generated SQL columns, avoiding a second validation of unrelated
+base arrays. Submitted generated fields remain output-only and are ignored by
+the pre-expression pass.
+
+NUMERIC JSON assignment supports exact scalar and array precision/signed-scale
+normalization without floating point. Array preparation reuses one bounded
+scratch arena across cells and publishes replacement values only after every
+cell succeeds. Dimensions, signed lower bounds and SQL NULL flags survive
+unchanged. Preservation mode rejects values that assignment would change and
+never rewrites the input; physical restore still has its stricter canonical-byte
+codec checks. Unconstrained public arrays are validated without rewriting their
+lexemes. This does not admit finite numeric-looking strings as scalar API numbers.
+
+Tests reuse all 20 PostgreSQL modifier oracle cases for scalar and array JSON
+assignment, sweep success/late-overflow allocation failures, check sticky
+work/cancellation across scalar/array boundaries, and prove row admission cannot
+reset its work quota per array. A Debug validation of 10,000 constrained array
+cells uses 70 bytes of scratch, 550,154 work units and about 6.7 ms on this
+machine. This bounds scratch by the largest cell; it is not an end-to-end query
+benchmark and excludes the already-parsed request DOM. All 54 durable-expression
+tests pass without failures or leaks, and the live PostgreSQL oracle revalidates
+893 exact-NUMERIC contracts.
+
+Public NUMERIC column modifiers remain guarded. Recursive scalar constraints,
+generated-value restore verification and later physical encoding still have
+separate contexts; joining those budgets, public column annotations/catalog/DDL
+activation and integrated restore/reopen evidence remain required. Inventory
+classifications are unchanged at 929 unresolved.
+
+Final-source regression gates pass 601 local SQL tests (three existing skips),
+226 server SQL tests, 185 native relational-index tests and their server
+integration test, without failures or leaks. Control-catalog, inventory integrity,
+formatting and whitespace checks pass. No generated public contracts changed.
