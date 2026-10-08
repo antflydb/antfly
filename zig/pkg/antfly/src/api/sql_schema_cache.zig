@@ -198,6 +198,7 @@ fn derive(entry: *Entry, json: []const u8) !void {
             .string => .string,
             .integer => .integer,
             .number => .number,
+            .numeric => .number,
             .boolean => .boolean,
             .datetime => .datetime,
             .json => .json,

@@ -43,6 +43,8 @@ pub fn open(alloc: std.mem.Allocator, native: catalog.Cursor, staged: *const tra
     const selected_layout = try selected_projection.pageLayout(arena);
     var row_filter = if (row_filter_json) |filter| try @import("antfly_local_sources").search_pattern_filter.PreparedPatternFilter.init(alloc, filter) else null;
     defer if (row_filter) |*filter| filter.deinit();
+    var numeric_context: @import("antfly_local_sources").sql_numeric_value.Context = .{ .alloc = arena };
+    const conditions = try prepareConditions(arena, table, request.conditions, &numeric_context);
     var rows: std.ArrayList(catalog.Row) = .empty;
     for (staged.tables) |entry| {
         if (!std.mem.eql(u8, staged.physicalName(entry.table_name), table.physical_name)) continue;
@@ -65,15 +67,15 @@ pub fn open(alloc: std.mem.Allocator, native: catalog.Cursor, staged: *const tra
                     if (std.mem.eql(u8, field, column.path)) break true;
                 } else false;
                 try nulls.append(arena, raw == .null and !json_null);
-                const typed = if (raw == .null or column.type == .array) raw else try @import("antfly_local_sources").sql_describe.coerce(raw, column.type);
+                const typed = if (raw == .null or column.type == .array or column.element_type == .numeric) raw else try @import("antfly_local_sources").sql_describe.coerce(raw, column.type);
                 try object.put(arena, column.path, typed);
             }
             const observed = for (entry.predicates.items) |predicate| {
                 if (std.mem.eql(u8, predicate.key, write.key)) break predicate;
             } else return error.InvalidSqlBackendResponse;
             const row = try full_projection.adaptBorrowed(arena, full_layout, catalog.Row{ .id = write.key, .version = observed.expected_version, .value = .{ .object = object }, .sql_nulls = nulls.items, .expected_content_digest = observed.expected_content_digest, .document = if (request.include_document) value else null });
-            if (try matches(row, request.conditions)) {
-                if (selected_projection.has_arrays) {
+            if (try matches(row, conditions, &numeric_context)) {
+                if (selected_projection.has_typed_cells) {
                     try rows.append(arena, try selected_projection.adaptBorrowed(arena, selected_layout, row));
                     continue;
                 }
@@ -98,8 +100,29 @@ pub fn open(alloc: std.mem.Allocator, native: catalog.Cursor, staged: *const tra
     return .{ .ptr = cursor, .next = Cursor.next, .close = Cursor.close };
 }
 
-fn matches(row: catalog.Row, conditions: []const catalog.Condition) !bool {
-    for (conditions) |condition| {
+const Numeric = @import("antfly_local_sources").sql_numeric_value;
+const PreparedCondition = struct { condition: catalog.Condition, numeric: ?Numeric.Value = null };
+
+/// Bind exact operands once, before staged row traversal. The cursor arena
+/// owns coefficients; the same context meters preparation and every probe.
+fn prepareConditions(a: std.mem.Allocator, table: catalog.Table, conditions: []const catalog.Condition, context: *Numeric.Context) ![]const PreparedCondition {
+    const prepared = try a.alloc(PreparedCondition, conditions.len);
+    for (conditions, prepared) |condition, *item| {
+        item.* = .{ .condition = condition };
+        const column = try table.column(condition.column);
+        if (condition.op == .is_null or condition.op == .is_not_null or condition.value == .null or column.element_type != .numeric or column.type != .number) continue;
+        const operand = @import("antfly_local_sources").sql_numeric_storage.fromJson(context, condition.value) catch |err| switch (err) {
+            error.InvalidBatchRequest => return error.SqlTypeMismatch,
+            else => return err,
+        };
+        item.numeric = operand.value;
+    }
+    return prepared;
+}
+
+fn matches(row: catalog.Row, conditions: []const PreparedCondition, numeric_context: *Numeric.Context) !bool {
+    for (conditions) |item| {
+        const condition = item.condition;
         const cell = try row.cell(condition.column);
         if (condition.op == .is_null) {
             if (!cell.sql_null) return false;
@@ -111,7 +134,9 @@ fn matches(row: catalog.Row, conditions: []const catalog.Condition) !bool {
         }
         if (cell.sql_null or condition.value == .null) return false;
         if (cell.array != null) return error.UnsupportedSqlShape;
-        const order = try @import("antfly_local_sources").sql_scalar.compare(cell.value, condition.value);
+        const order = if (cell.numeric) |number| blk: {
+            break :blk try Numeric.order(numeric_context, number.*, item.numeric orelse return error.InvalidSqlBackendResponse);
+        } else try @import("antfly_local_sources").sql_scalar.compare(cell.value, condition.value);
         if (!switch (condition.op) {
             .eq => order == .eq,
             .neq => order != .eq,
@@ -270,6 +295,78 @@ test "SQL session overlay prepares staged arrays once and preserves omitted fiel
     try std.testing.expect(narrow.rows[0].typed_cells == null);
     try std.testing.expect(!try narrow.rows[0].hasField("missing"));
     try std.testing.expect((try narrow.rows[0].cell("missing")).sql_null);
+}
+
+test "SQL session overlay NUMERIC staged rows retain exact values after cursor close without arrays" {
+    const a = std.testing.allocator;
+    var output = std.heap.ArenaAllocator.init(a);
+    defer output.deinit();
+    const Native = struct {
+        fn next(_: *anyopaque, _: std.mem.Allocator, _: u32) !catalog.Page {
+            return .{ .rows = &.{} };
+        }
+        fn close(_: *anyopaque) void {}
+    };
+    var native: u8 = 0;
+    var staged = try transactions.parseCommitRequest(a,
+        \\{"read_set":[{"table":"t","key":"key","version":"0"}],"tables":{"t":{"inserts":{"key":{"n":"9007199254740993.1200","j":null,"absent":null}}}}}
+    );
+    defer staged.deinit(a);
+    const table: catalog.Table = .{ .id = 1, .physical_name = "t", .schema_version = 1, .columns = &.{
+        .{ .name = "n", .path = "n", .type = .number, .element_type = .numeric },
+        .{ .name = "j", .path = "j", .type = .json },
+        .{ .name = "absent", .path = "absent", .type = .number, .element_type = .numeric },
+        .{ .name = "missing", .path = "missing", .type = .number, .element_type = .numeric },
+    } };
+    const cursor = try open(a, .{ .ptr = &native, .next = Native.next, .close = Native.close }, &staged, table, .{
+        .fields = &.{ "n", "absent", "missing" },
+        .limit = 1,
+        .conditions = &.{.{ .column = "n", .op = .eq, .value = .{ .number_string = "9007199254740993.12" } }},
+    }, null);
+    const page = cursor.next(cursor.ptr, output.allocator(), 1) catch |err| {
+        cursor.close(cursor.ptr);
+        return err;
+    };
+    cursor.close(cursor.ptr);
+    try std.testing.expectEqual(@as(usize, 1), page.rows.len);
+    const row = page.rows[0];
+    try std.testing.expect(try row.hasField("absent"));
+    try std.testing.expect(!try row.hasField("missing"));
+    try std.testing.expect((try row.cell("absent")).sql_null);
+    try std.testing.expect((try row.cell("missing")).sql_null);
+    const number = (try row.cell("n")).numeric.?;
+    try std.testing.expectEqual(@as(u16, 4), number.scale);
+    var ctx: @import("antfly_local_sources").sql_numeric_value.Context = .{ .alloc = output.allocator() };
+    const text = try @import("antfly_local_sources").sql_numeric_value.format(&ctx, number.*);
+    try std.testing.expectEqualStrings("9007199254740993.1200", text);
+}
+
+test "SQL session overlay NUMERIC conditions prepare once and share bounded allocation-free probe work" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const table: catalog.Table = .{ .id = 1, .physical_name = "t", .schema_version = 1, .columns = &.{
+        .{ .name = "n", .path = "n", .type = .number, .element_type = .numeric },
+    } };
+    var ctx: Numeric.Context = .{ .alloc = a };
+    const conditions = try prepareConditions(a, table, &.{
+        .{ .column = "n", .op = .gte, .value = .{ .number_string = "9007199254740993.12" } },
+        .{ .column = "n", .op = .lt, .value = .{ .string = "9007199254740993.13" } },
+    }, &ctx);
+    var number = try Numeric.parse(&ctx, "9007199254740993.1200");
+    defer number.deinit();
+    const scalar = @import("antfly_local_sources").sql_scalar;
+    const layout = try catalog.Row.TypedLayout.init(a, &.{"n"});
+    const row = try catalog.Row.fromDatums(a, "key", layout, &.{scalar.Datum.typedNumeric(&number.value)});
+    const start = ctx.remaining;
+    var none = std.heap.FixedBufferAllocator.init(&.{});
+    ctx.alloc = none.allocator();
+    for (0..1000) |_| try std.testing.expect(try matches(row, conditions, &ctx));
+    try std.testing.expect(ctx.remaining < start);
+    ctx.remaining = 0;
+    try std.testing.expectError(error.SqlProgramLimitExceeded, matches(row, conditions, &ctx));
+    ctx = .{ .alloc = a };
+    try std.testing.expectError(error.SqlTypeMismatch, prepareConditions(a, table, &.{.{ .column = "n", .op = .eq, .value = .{ .float = 1.2 } }}, &ctx));
 }
 
 test "SQL session overlay merges pages and suppresses replaced and deleted rows" {

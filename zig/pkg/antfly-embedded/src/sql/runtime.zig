@@ -1631,6 +1631,18 @@ fn numericBoundaryScenario(backing: std.mem.Allocator) !void {
     };
     try std.testing.expectEqualStrings("9007199254740993.1200", output.string);
     try std.testing.expectEqualStrings(output.string, stored.string);
+    const table: catalog.Table = .{ .id = 1, .physical_name = "rows", .schema_version = 1, .columns = &.{
+        .{ .name = "n", .path = "n", .type = .number, .element_type = .numeric },
+    } };
+    var object: std.json.ObjectMap = .empty;
+    try object.put(a, "n", stored);
+    const mutation: catalog.Mutation = .{ .key = "row", .expected_version = 7, .row = .{ .object = object } };
+    const adapter = try Context.ReturningImages.init(a, table, null);
+    try std.testing.expect(adapter.projection.has_typed_cells);
+    const image = try adapter.row(a, mutation, mutation);
+    const numeric_cell = try image.cell("n");
+    try std.testing.expect(numeric_cell.numeric != null and !numeric_cell.sql_null);
+    try std.testing.expectEqualStrings(output.string, (try context.outputDatum(numeric_cell, .number, .numeric)).string);
     for ([_]Json{ .{ .string = "9007199254740993.1200" }, .{ .number_string = "9007199254740993.1200" } }) |token| {
         try std.testing.expectEqualStrings(output.string, (try context.outputDatum(Datum.json(token), .number, .numeric)).string);
     }
@@ -1832,7 +1844,7 @@ fn mutationArrayOwnershipScenario(backing: std.mem.Allocator) !void {
     try std.testing.expectEqualStrings("2", array.elements[2].value.object.get("x").?.array.items[1].number_string);
     try std.testing.expect(!(try row.cell("j")).sql_null);
     const narrow = try Context.ReturningImages.init(a, table, &.{"n"});
-    try std.testing.expect(!narrow.projection.has_arrays);
+    try std.testing.expect(!narrow.projection.has_typed_cells);
     const scalar_row = try narrow.row(a, mutation, mutation);
     try std.testing.expect(scalar_row.typed_cells == null);
     try std.testing.expectEqual(@as(i64, 3), (try scalar_row.cell("n")).value.integer);

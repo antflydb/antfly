@@ -190,6 +190,7 @@ pub const sql_bound_scalars = @import("sql/bound_scalars.zig");
 pub const sql_replay_rows = @import("sql/replay_rows.zig");
 pub const sql_array_value = @import("sql/array_value.zig");
 pub const sql_numeric_value = @import("sql/numeric_value.zig");
+pub const sql_numeric_storage = @import("sql/numeric_storage.zig");
 pub const sql_numeric_binary = @import("sql/numeric_binary.zig");
 pub const sql_numeric_key = @import("sql/numeric_key.zig");
 pub const sql_numeric_aggregate = @import("sql/numeric_aggregate.zig");

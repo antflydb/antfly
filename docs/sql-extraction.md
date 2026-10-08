@@ -5331,3 +5331,47 @@ SDK SQL gates pass 34 Python and 35 TypeScript tests; TypeScript typechecking
 and all Go SDK package tests also pass. The pinned package-manager test launcher
 remained live without starting Vitest; the same pinned Node runtime ran the
 installed Vitest entrypoint directly. No parity dispositions changed.
+
+### Exact NUMERIC SQL page projection and mutation images
+
+SQL projection now selects the typed-cell boundary for scalar NUMERIC as well
+as arrays. Previously a scalar-only NUMERIC selection could bypass adaptation
+or enter generic JSON-number coercion. The native schema-cache mapping retains
+the physical NUMERIC column's exact SQL identity. Borrowed native pages share
+one page-owned name directory; source lexemes parse directly to owned decimal
+coefficients, and an already-rounded f64 is rejected instead of silently accepted.
+Unselected ordinary scalar projections retain their existing cheap path.
+
+The owned document decoder also builds typed rows for these selections. It
+preserves precision, display scale, missing-versus-present NULL metadata, mixed
+JSONB nulls and array bounds; all coefficients and borrowed primitive-array
+payloads survive release of the input JSON and source page. Mutation RETURNING
+images use that same typed boundary even without an array column present.
+
+Evidence compares all 65 independent PostgreSQL binary sender payloads after
+SQL projection, verifies shared page layout, rejects rounded backend cells and
+required NULLs, and injects every allocation failure through mixed typed-row
+ownership and mutation images. The fault harness disables address-dependent
+arena remaps so failure indexes cover deterministic fallback allocations.
+This is not public native NUMERIC schema/default/generated/check activation:
+those boundaries and a shared schema-expression execution budget remain
+unfinished. Original inventory dispositions are unchanged.
+
+Session overlays preserve NUMERIC input before generic number coercion, not
+only at the final projection boundary. Exact filter operands bind once per
+cursor; their immutable coefficients and every staged-row comparison share
+one bounded work context. Probes compare typed logical values, never a NUMERIC
+datum's JSON-null placeholder. A scalar-only staged-row regression checks exact
+equality across different display scales and retained values after cursor close.
+A second fixture probes prepared bounds 1,000 times with no allocation available,
+then verifies work exhaustion and rejects a pre-rounded f64 input.
+The existing native API owner runs schema-cache and session-overlay contracts;
+they are intentionally not pulled into the storage-independent SQL test root.
+
+Validation passes 586 local SQL tests (three existing skips), 226 server SQL
+tests, pgwire/OpenAPI gates, and all 12 focused native API schema-cache and
+session-overlay contracts, with no failures or leaks. Formatting, whitespace,
+generated control-catalog consistency and original inventory integrity checks
+pass. The inventory remains 448 implemented, 136 rejected, 73 superseded and
+929 unresolved; these internal boundaries do not independently credit public
+NUMERIC schema/DDL cases.
