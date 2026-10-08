@@ -104,7 +104,10 @@ const Names = std.StringHashMapUnmanaged(void);
 fn aliases(alloc: Allocator, relation: *const ast.Relation, names: *Names) !void {
     switch (relation.*) {
         .table => |table| try names.put(alloc, table.alias orelse table.name.table, {}),
-        .derived => |query| if (query.preserve_scope) try aliases(alloc, query.query.source.?, names) else try names.put(alloc, query.alias, {}),
+        .derived => |query| if (query.phase_scope != null or query.preserve_scope) {
+            if (query.query.source) |source| try aliases(alloc, source, names) else if (query.query.table) |table| try names.put(alloc, table.table, {});
+            if (query.phase_scope != null) try names.put(alloc, query.alias, {});
+        } else try names.put(alloc, query.alias, {}),
         .join => |join| {
             try aliases(alloc, join.left, names);
             try aliases(alloc, join.right, names);
@@ -1154,6 +1157,7 @@ pub fn needsOwnProjectionDomain(statement: ast.Select) bool {
 }
 
 pub fn needsProjectionDomain(statement: ast.Select) bool {
+    if (@import("phase_projection.zig").accepts(statement)) return true;
     if (needsOwnProjectionDomain(statement)) return true;
     for (statement.values_arms) |arm| if (needsProjectionDomain(arm.*)) return true;
     if (statement.set_operation) |set| return needsProjectionDomain(set.left.*) or needsProjectionDomain(set.right.*);
@@ -1189,7 +1193,7 @@ pub fn lower(alloc: Allocator, statement: ast.Select) !ast.Select {
         const arms = try alloc.alloc(*const ast.Select, statement.values_arms.len);
         for (statement.values_arms, arms) |arm, *out| {
             const rewritten = try alloc.create(ast.Select);
-            rewritten.* = if (accepts(arm.*) and !needsOwnProjectionDomain(arm.*)) try lower(alloc, arm.*) else arm.*;
+            rewritten.* = if (accepts(arm.*) and !needsProjectionDomain(arm.*)) try lower(alloc, arm.*) else arm.*;
             out.* = rewritten;
         }
         var result = statement;
@@ -1198,9 +1202,9 @@ pub fn lower(alloc: Allocator, statement: ast.Select) !ast.Select {
     }
     if (statement.set_operation) |set| {
         const left = try alloc.create(ast.Select);
-        left.* = if (accepts(set.left.*) and !needsOwnProjectionDomain(set.left.*)) try lower(alloc, set.left.*) else set.left.*;
+        left.* = if (accepts(set.left.*) and !needsProjectionDomain(set.left.*)) try lower(alloc, set.left.*) else set.left.*;
         const right = try alloc.create(ast.Select);
-        right.* = if (accepts(set.right.*) and !needsOwnProjectionDomain(set.right.*)) try lower(alloc, set.right.*) else set.right.*;
+        right.* = if (accepts(set.right.*) and !needsProjectionDomain(set.right.*)) try lower(alloc, set.right.*) else set.right.*;
         var result = statement;
         result.set_operation = .{ .kind = set.kind, .all = set.all, .left = left, .right = right };
         return result;

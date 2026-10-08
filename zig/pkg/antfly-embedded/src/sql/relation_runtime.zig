@@ -1050,9 +1050,18 @@ fn Engine(comptime Context: type) type {
                     },
                     .outer_ref => |id| if (self.emitted) null else blk: {
                         const values = self.engine.outer_values[id] orelse return error.InvalidSqlBackendResponse;
-                        if (values.len != self.node.columns.len) return error.InvalidSqlBackendResponse;
                         self.emitted = true;
-                        break :blk values;
+                        const identity = values.len == self.node.columns.len and for (self.node.columns, 0..) |column, ordinal| {
+                            if (column.outer_ordinal != ordinal) break false;
+                        } else true;
+                        if (identity) break :blk values;
+                        const selected = try alloc.alloc(Datum, self.node.columns.len);
+                        for (self.node.columns, selected) |column, *out| {
+                            const ordinal = column.outer_ordinal orelse return error.InvalidSqlBackendResponse;
+                            if (ordinal >= values.len) return error.InvalidSqlBackendResponse;
+                            out.* = values[ordinal];
+                        }
+                        break :blk selected;
                     },
                     .singleton => if (self.emitted) null else blk: {
                         self.emitted = true;

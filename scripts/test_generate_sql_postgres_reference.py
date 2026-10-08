@@ -1817,6 +1817,138 @@ class PostgresReferenceTest(unittest.TestCase):
             )
         self.assertEqual("21000", error.exception.sqlstate)
 
+    def test_phase_outputs_evaluate_scalar_children_after_grouping_and_windows(self):
+        for sql, expected in (
+            (
+                "SELECT t.x,(SELECT t.x+10) AS v FROM (SELECT 1 AS x UNION ALL SELECT 1 UNION ALL SELECT 2) t GROUP BY t.x ORDER BY t.x",
+                [(1, 11), (2, 12)],
+            ),
+            (
+                "SELECT SUM(t.x),(SELECT 1) AS v FROM (SELECT 1 AS x UNION ALL SELECT 2) t",
+                [(3, 1)],
+            ),
+            (
+                "SELECT t.x,row_number() OVER (ORDER BY t.x) AS n,(SELECT i.y FROM (SELECT 1 AS y UNION ALL SELECT 2) i WHERE t.x=1) AS v FROM (SELECT 1 AS x UNION ALL SELECT 2) t ORDER BY t.x DESC LIMIT 1",
+                [(2, 2, None)],
+            ),
+            (
+                "SELECT t.x,COUNT(*)+(SELECT t.x) AS n FROM (SELECT 1 AS x UNION ALL SELECT 1 UNION ALL SELECT 2) t GROUP BY t.x HAVING (SELECT t.x)>1 ORDER BY t.x",
+                [(2, 3)],
+            ),
+            (
+                "SELECT t.x+1 AS k,COUNT(*),(SELECT 9) AS v FROM (SELECT 1 AS x UNION ALL SELECT 1 UNION ALL SELECT 2) t GROUP BY 1 ORDER BY k",
+                [(2, 2, 9), (3, 1, 9)],
+            ),
+            (
+                "SELECT t.x+1 AS k,COUNT(*),(SELECT 9) AS v FROM (SELECT 1 AS x UNION ALL SELECT 1 UNION ALL SELECT 2) t GROUP BY k ORDER BY k",
+                [(2, 2, 9), (3, 1, 9)],
+            ),
+            (
+                "SELECT t.x+1 AS k,COUNT(*),(SELECT 9) AS v FROM (SELECT 1 AS x UNION ALL SELECT 1 UNION ALL SELECT 2) t GROUP BY x+1 ORDER BY k",
+                [(2, 2, 9), (3, 1, 9)],
+            ),
+            (
+                "SELECT t.x,COUNT(*),row_number() OVER (ORDER BY COUNT(*) DESC),(SELECT t.x) FROM (SELECT 1 AS x UNION ALL SELECT 1 UNION ALL SELECT 2) t GROUP BY t.x ORDER BY t.x",
+                [(1, 2, 1, 1), (2, 1, 2, 2)],
+            ),
+            ("SELECT COUNT(*),(SELECT 7) FROM (SELECT 1 AS x) t WHERE false", [(0, 7)]),
+            (
+                "SELECT t.x,(SELECT i.y FROM (SELECT 1 AS y UNION ALL SELECT 2) i) FROM (SELECT 1 AS x) t WHERE false GROUP BY t.x",
+                [],
+            ),
+            (
+                "SELECT t.x,(SELECT i.y FROM (SELECT 1 AS y UNION ALL SELECT 2) i WHERE t.x=1) FROM (SELECT 1 AS x UNION ALL SELECT 2) t GROUP BY t.x ORDER BY t.x DESC LIMIT 1",
+                [(2, None)],
+            ),
+            (
+                "SELECT t.x,(SELECT t.x FROM (SELECT 3 AS x) t) FROM (SELECT 1 AS x UNION ALL SELECT 2) t GROUP BY t.x ORDER BY t.x",
+                [(1, 3), (2, 3)],
+            ),
+            (
+                "SELECT t.x,(SELECT x+10) FROM (SELECT 1 AS x UNION ALL SELECT 2) t GROUP BY t.x ORDER BY t.x",
+                [(1, 11), (2, 12)],
+            ),
+            (
+                "SELECT CASE WHEN COUNT(*)=0 THEN (SELECT i.y FROM (SELECT 1 AS y UNION ALL SELECT 2) i) ELSE 1 END FROM (SELECT 1 AS x) t",
+                [(1,)],
+            ),
+            (
+                "WITH c(x) AS (SELECT 1 UNION ALL SELECT 2) SELECT t.x,(SELECT c.x FROM c WHERE c.x=t.x) FROM c t GROUP BY t.x ORDER BY t.x",
+                [(1, 1), (2, 2)],
+            ),
+            (
+                "SELECT p.k,l.x,l.v FROM (SELECT 1 AS k) p CROSS JOIN LATERAL (SELECT q.x,(SELECT q.x+p.k) AS v FROM (SELECT 1 AS x UNION ALL SELECT 2) q GROUP BY q.x ORDER BY q.x DESC LIMIT 1) l",
+                [(1, 2, 3)],
+            ),
+            (
+                "SELECT t.x,COUNT(*),row_number() OVER (ORDER BY t.x),(SELECT t.x) FROM (SELECT 1 AS x UNION ALL SELECT 2) t GROUP BY t.x HAVING t.x>1 ORDER BY t.x",
+                [(2, 1, 1, 2)],
+            ),
+            (
+                "SELECT t.x,COUNT(*),row_number() OVER (ORDER BY t.x),(SELECT t.x) FROM (SELECT 1 AS x UNION ALL SELECT 2) t GROUP BY t.x HAVING (SELECT t.x)>1 ORDER BY t.x",
+                [(2, 1, 1, 2)],
+            ),
+            (
+                "SELECT t.x,CASE WHEN row_number() OVER (ORDER BY t.x)=1 THEN (SELECT t.x+10) ELSE 0 END FROM (SELECT 1 AS x UNION ALL SELECT 2) t ORDER BY t.x",
+                [(1, 11), (2, 0)],
+            ),
+            (
+                "SELECT t.x,SUM((SELECT t.x)) OVER (ORDER BY t.x)+(SELECT 1) FROM (SELECT 1 AS x UNION ALL SELECT 2) t ORDER BY t.x",
+                [(1, 2), (2, 4)],
+            ),
+            (
+                "SELECT * FROM ((SELECT t.x,(SELECT t.x+10) FROM (SELECT 1 AS x UNION ALL SELECT 1 UNION ALL SELECT 2) t GROUP BY t.x ORDER BY t.x DESC LIMIT 1) UNION ALL SELECT 3,13) s ORDER BY 1",
+                [(2, 12), (3, 13)],
+            ),
+        ):
+            with self.subTest(sql=sql):
+                self.assertEqual(expected, self.db.execute(sql).fetchall())
+
+    def test_phase_output_grouping_and_cardinality_diagnostics(self):
+        import psycopg
+
+        for sql, code in (
+            ("SELECT COUNT(*),(SELECT t.x) FROM (SELECT 1 AS x) t", "42803"),
+            (
+                "SELECT t.x,(SELECT t.y) FROM (SELECT 1 AS x,2 AS y) t GROUP BY t.x",
+                "42803",
+            ),
+            (
+                "SELECT t.x+1,(SELECT t.x+1) FROM (SELECT 1 AS x) t GROUP BY t.x+1",
+                "42803",
+            ),
+            (
+                "SELECT t.x,(SELECT t.missing) FROM (SELECT 1 AS x) t GROUP BY t.x",
+                "42703",
+            ),
+            (
+                "SELECT t.x,(SELECT i.y FROM (SELECT 1 AS y UNION ALL SELECT 2) i WHERE t.x=1) FROM (SELECT 1 AS x UNION ALL SELECT 2) t GROUP BY t.x ORDER BY t.x ASC LIMIT 1 OFFSET 1",
+                "21000",
+            ),
+        ):
+            with self.subTest(sql=sql):
+                with (
+                    self.assertRaises(psycopg.Error) as error,
+                    self.db.transaction(force_rollback=True),
+                ):
+                    self.db.execute(sql)
+                self.assertEqual(code, error.exception.sqlstate)
+
+        with psycopg.RawCursor(self.db) as cursor:
+            result = cursor.execute(
+                "SELECT t.x,COUNT(*)+(SELECT t.x+$1) AS n FROM (SELECT 1 AS x UNION ALL SELECT 1 UNION ALL SELECT 2) t GROUP BY t.x HAVING (SELECT t.x)>$2 ORDER BY n DESC,t.x DESC LIMIT $3 OFFSET $4",
+                (2, 0, 1, 1),
+            ).fetchall()
+        self.assertEqual([(1, 5)], result)
+
+        cursor = self.db.execute(
+            "SELECT COUNT(*),EXISTS(SELECT 1) FROM (SELECT 1 AS x) t"
+        )
+        self.assertEqual(
+            ["count", "exists"], [column.name for column in cursor.description]
+        )
+        self.assertEqual([(1, True)], cursor.fetchall())
+
     def test_sorted_scalar_callbacks_evaluate_prefix_before_offset(self):
         import psycopg
 

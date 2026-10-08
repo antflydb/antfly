@@ -14816,6 +14816,36 @@ test "httpx SQL executes one relational page with exact integer parameters" {
             try std.testing.expectEqualStrings("1", result.value.rows[0][1].string);
             try std.testing.expectEqualStrings("1", result.value.rows[0][2].string);
         }
+        {
+            for ([_]struct { sql: []const u8, n: ?[]const u8 }{
+                .{ .sql = "SELECT q.id,SUM(q.quantity) AS n,(SELECT q.id) AS v FROM (SELECT t.id,t.quantity FROM usage_records t WHERE t._id IN ('a','b')) q GROUP BY q.id ORDER BY n DESC LIMIT 1", .n = "3" },
+                .{ .sql = "SELECT q.id,row_number() OVER (ORDER BY q.quantity DESC) AS n,(SELECT u.quantity FROM usage_records u WHERE u._id IN ('a','b') AND q.id='u1') AS v FROM (SELECT t.id,t.quantity FROM usage_records t WHERE t._id IN ('a','b')) q ORDER BY q.quantity DESC LIMIT 1", .n = "1" },
+                .{ .sql = "SELECT q.id,SUM(q.quantity),row_number() OVER (ORDER BY q.id),(SELECT q.id) FROM (SELECT t.id,t.quantity FROM usage_records t WHERE t._id IN ('a','b')) q GROUP BY q.id HAVING (SELECT q.id)='u2' ORDER BY q.id", .n = "3" },
+                .{ .sql = "SELECT q.id,(SELECT q.quantity) FROM (SELECT t.id,t.quantity FROM usage_records t WHERE t._id IN ('a','b')) q GROUP BY q.id", .n = null },
+            }) |case| {
+                const body = try std.json.Stringify.valueAlloc(alloc, .{ .statement = case.sql }, .{});
+                defer alloc.free(body);
+                var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
+                defer request.deinit();
+                request.body = body;
+                var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+                defer ctx.deinit();
+                var response = try text_handler.executeSQL(&ctx);
+                defer response.deinit();
+                try std.testing.expectEqual(@as(u16, if (case.n == null) 400 else 200), response.status.code);
+                if (case.n) |n| {
+                    const result = try std.json.parseFromSlice(sql_wire.SQLResponse, alloc, response.body.?, .{});
+                    defer result.deinit();
+                    try std.testing.expectEqual(@as(usize, 1), result.value.rows.len);
+                    try std.testing.expectEqualStrings("u2", result.value.rows[0][0].string);
+                    try std.testing.expectEqualStrings(n, result.value.rows[0][1].string);
+                } else {
+                    const diagnostic = try std.json.parseFromSlice(sql_wire.SQLDiagnostic, alloc, response.body.?, .{});
+                    defer diagnostic.deinit();
+                    try std.testing.expectEqualStrings("42803", diagnostic.value.code);
+                }
+            }
+        }
         for ([_]struct { body: []const u8, expected_id: ?[]const u8 }{
             .{ .body = "{\"statement\":\"INSERT INTO usage_records (id,status,quantity) VALUES ('u_default',DEFAULT,7) RETURNING id,status\"}", .expected_id = "u_default" },
             .{ .body = "{\"statement\":\"INSERT INTO usage_records DEFAULT VALUES RETURNING _id,status\"}", .expected_id = null },

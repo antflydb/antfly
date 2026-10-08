@@ -283,6 +283,91 @@ test "SQL window input subquery staging releases every allocation" {
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Faults.run, .{});
 }
 
+test "SQL phase outputs evaluate scalar children after grouping and windows" {
+    var backend: Backend = .{};
+    for ([_]struct { sql: []const u8, rows: []const u8 }{
+        .{ .sql = "SELECT t.x,(SELECT t.x+10) AS v FROM (SELECT 1 AS x UNION ALL SELECT 1 UNION ALL SELECT 2) t GROUP BY t.x ORDER BY t.x", .rows = "[[\"1\",\"11\"],[\"2\",\"12\"]]" },
+        .{ .sql = "SELECT SUM(t.x),(SELECT 1) AS v FROM (SELECT 1 AS x UNION ALL SELECT 2) t", .rows = "[[\"3\",\"1\"]]" },
+        .{ .sql = "SELECT t.x,row_number() OVER (ORDER BY t.x) AS n,(SELECT i.y FROM (SELECT 1 AS y UNION ALL SELECT 2) i WHERE t.x=1) AS v FROM (SELECT 1 AS x UNION ALL SELECT 2) t ORDER BY t.x DESC LIMIT 1", .rows = "[[\"2\",\"2\",null]]" },
+        .{ .sql = "SELECT t.x,COUNT(*)+(SELECT t.x) AS n FROM (SELECT 1 AS x UNION ALL SELECT 1 UNION ALL SELECT 2) t GROUP BY t.x HAVING (SELECT t.x)>1 ORDER BY t.x", .rows = "[[\"2\",\"3\"]]" },
+        .{ .sql = "SELECT t.x+1 AS k,COUNT(*),(SELECT 9) AS v FROM (SELECT 1 AS x UNION ALL SELECT 1 UNION ALL SELECT 2) t GROUP BY 1 ORDER BY k", .rows = "[[\"2\",\"2\",\"9\"],[\"3\",\"1\",\"9\"]]" },
+        .{ .sql = "SELECT t.x+1 AS k,COUNT(*),(SELECT 9) AS v FROM (SELECT 1 AS x UNION ALL SELECT 1 UNION ALL SELECT 2) t GROUP BY k ORDER BY k", .rows = "[[\"2\",\"2\",\"9\"],[\"3\",\"1\",\"9\"]]" },
+        .{ .sql = "SELECT t.x+1 AS k,COUNT(*),(SELECT 9) AS v FROM (SELECT 1 AS x UNION ALL SELECT 1 UNION ALL SELECT 2) t GROUP BY x+1 ORDER BY k", .rows = "[[\"2\",\"2\",\"9\"],[\"3\",\"1\",\"9\"]]" },
+        .{ .sql = "SELECT t.x,COUNT(*),row_number() OVER (ORDER BY COUNT(*) DESC),(SELECT t.x) FROM (SELECT 1 AS x UNION ALL SELECT 1 UNION ALL SELECT 2) t GROUP BY t.x ORDER BY t.x", .rows = "[[\"1\",\"2\",\"1\",\"1\"],[\"2\",\"1\",\"2\",\"2\"]]" },
+        .{ .sql = "SELECT COUNT(*),(SELECT 7) FROM (SELECT 1 AS x) t WHERE false", .rows = "[[\"0\",\"7\"]]" },
+        .{ .sql = "SELECT t.x,(SELECT i.y FROM (SELECT 1 AS y UNION ALL SELECT 2) i) FROM (SELECT 1 AS x) t WHERE false GROUP BY t.x", .rows = "[]" },
+        .{ .sql = "SELECT t.x,(SELECT i.y FROM (SELECT 1 AS y UNION ALL SELECT 2) i WHERE t.x=1) FROM (SELECT 1 AS x UNION ALL SELECT 2) t GROUP BY t.x ORDER BY t.x DESC LIMIT 1", .rows = "[[\"2\",null]]" },
+        .{ .sql = "SELECT t.x,(SELECT t.x FROM (SELECT 3 AS x) t) FROM (SELECT 1 AS x UNION ALL SELECT 2) t GROUP BY t.x ORDER BY t.x", .rows = "[[\"1\",\"3\"],[\"2\",\"3\"]]" },
+        .{ .sql = "SELECT t.x,(SELECT x+10) FROM (SELECT 1 AS x UNION ALL SELECT 2) t GROUP BY t.x ORDER BY t.x", .rows = "[[\"1\",\"11\"],[\"2\",\"12\"]]" },
+        .{ .sql = "SELECT CASE WHEN COUNT(*)=0 THEN (SELECT i.y FROM (SELECT 1 AS y UNION ALL SELECT 2) i) ELSE 1 END FROM (SELECT 1 AS x) t", .rows = "[[\"1\"]]" },
+        .{ .sql = "WITH c(x) AS (SELECT 1 UNION ALL SELECT 2) SELECT t.x,(SELECT c.x FROM c WHERE c.x=t.x) FROM c t GROUP BY t.x ORDER BY t.x", .rows = "[[\"1\",\"1\"],[\"2\",\"2\"]]" },
+        .{ .sql = "SELECT p.k,l.x,l.v FROM (SELECT 1 AS k) p CROSS JOIN LATERAL (SELECT q.x,(SELECT q.x+p.k) AS v FROM (SELECT 1 AS x UNION ALL SELECT 2) q GROUP BY q.x ORDER BY q.x DESC LIMIT 1) l", .rows = "[[\"1\",\"2\",\"3\"]]" },
+        .{ .sql = "SELECT t.x,COUNT(*),row_number() OVER (ORDER BY t.x),(SELECT t.x) FROM (SELECT 1 AS x UNION ALL SELECT 2) t GROUP BY t.x HAVING t.x>1 ORDER BY t.x", .rows = "[[\"2\",\"1\",\"1\",\"2\"]]" },
+        .{ .sql = "SELECT t.x,COUNT(*),row_number() OVER (ORDER BY t.x),(SELECT t.x) FROM (SELECT 1 AS x UNION ALL SELECT 2) t GROUP BY t.x HAVING (SELECT t.x)>1 ORDER BY t.x", .rows = "[[\"2\",\"1\",\"1\",\"2\"]]" },
+        .{ .sql = "SELECT t.x,CASE WHEN row_number() OVER (ORDER BY t.x)=1 THEN (SELECT t.x+10) ELSE 0 END FROM (SELECT 1 AS x UNION ALL SELECT 2) t ORDER BY t.x", .rows = "[[\"1\",\"11\"],[\"2\",\"0\"]]" },
+        .{ .sql = "SELECT t.x,SUM((SELECT t.x)) OVER (ORDER BY t.x)+(SELECT 1) FROM (SELECT 1 AS x UNION ALL SELECT 2) t ORDER BY t.x", .rows = "[[\"1\",\"2\"],[\"2\",\"4\"]]" },
+        .{ .sql = "SELECT * FROM ((SELECT t.x,(SELECT t.x+10) FROM (SELECT 1 AS x UNION ALL SELECT 1 UNION ALL SELECT 2) t GROUP BY t.x ORDER BY t.x DESC LIMIT 1) UNION ALL SELECT 3,13) s ORDER BY 1", .rows = "[[\"2\",\"12\"],[\"3\",\"13\"]]" },
+    }) |case| {
+        var compiled = try compiler.compile(std.testing.allocator, case.sql, .{});
+        defer compiled.deinit();
+        var result = runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{}) catch |err| {
+            std.debug.print("phase output failed: {s}: {s}\n", .{ case.sql, @errorName(err) });
+            return err;
+        };
+        defer result.deinit();
+        const rows = try std.json.Stringify.valueAlloc(std.testing.allocator, result.output.rows, .{});
+        defer std.testing.allocator.free(rows);
+        try std.testing.expectEqualStrings(case.rows, rows);
+    }
+}
+
+test "SQL phase outputs retain aggregate and EXISTS labels" {
+    var backend: Backend = .{};
+    var compiled = try compiler.compile(std.testing.allocator, "SELECT COUNT(*),EXISTS(SELECT 1) FROM (SELECT 1 AS x) t", .{});
+    defer compiled.deinit();
+    var result = try runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{});
+    defer result.deinit();
+    try std.testing.expectEqualStrings("count", result.output.columns[0].name);
+    try std.testing.expectEqualStrings("exists", result.output.columns[1].name);
+    try std.testing.expectEqualStrings("1", result.output.rows[0][0].string);
+    try std.testing.expect(result.output.rows[0][1].bool);
+}
+
+test "SQL phase outputs preserve grouping and child cardinality diagnostics" {
+    var backend: Backend = .{};
+    for ([_]struct { sql: []const u8, code: []const u8 }{
+        .{ .sql = "SELECT COUNT(*),(SELECT t.x) FROM (SELECT 1 AS x) t", .code = "42803" },
+        .{ .sql = "SELECT t.x,(SELECT t.y) FROM (SELECT 1 AS x,2 AS y) t GROUP BY t.x", .code = "42803" },
+        .{ .sql = "SELECT t.x+1,(SELECT t.x+1) FROM (SELECT 1 AS x) t GROUP BY t.x+1", .code = "42803" },
+        .{ .sql = "SELECT t.x,(SELECT t.missing) FROM (SELECT 1 AS x) t GROUP BY t.x", .code = "42703" },
+        .{ .sql = "SELECT t.x,(SELECT i.y FROM (SELECT 1 AS y UNION ALL SELECT 2) i WHERE t.x=1) FROM (SELECT 1 AS x UNION ALL SELECT 2) t GROUP BY t.x ORDER BY t.x ASC LIMIT 1 OFFSET 1", .code = "21000" },
+    }) |case| {
+        var compiled = try compiler.compile(std.testing.allocator, case.sql, .{});
+        defer compiled.deinit();
+        if (runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{})) |value| {
+            var result = value;
+            result.deinit();
+            return error.ExpectedPhaseOutputFailure;
+        } else |err| try std.testing.expectEqualStrings(case.code, @import("antfly_local_sources").sql_errors.describe(err).code);
+    }
+}
+
+test "SQL phase outputs release every allocation with prepared grouped demand" {
+    const Faults = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var backend: Backend = .{};
+            var compiled = try compiler.compile(a, "SELECT t.x,COUNT(*)+(SELECT t.x+$1) AS n FROM (SELECT 1 AS x UNION ALL SELECT 1 UNION ALL SELECT 2) t GROUP BY t.x HAVING (SELECT t.x)>$2 ORDER BY n DESC,t.x DESC LIMIT $3 OFFSET $4", .{});
+            defer compiled.deinit();
+            var result = try runtime.execute(a, backend.backend(), &compiled, &.{ .{ .integer = 2 }, .{ .integer = 0 }, .{ .integer = 1 }, .{ .integer = 1 } }, .{});
+            defer result.deinit();
+            try std.testing.expectEqual(@as(usize, 1), result.output.rows.len);
+            try std.testing.expectEqualStrings("1", result.output.rows[0][0].string);
+            try std.testing.expectEqualStrings("5", result.output.rows[0][1].string);
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Faults.run, .{});
+}
+
 test "SQL row bounds validate negative parameters at execution in their own domain" {
     var backend: Backend = .{};
     for ([_]struct { sql: []const u8, code: []const u8 }{

@@ -1186,6 +1186,53 @@ test "SQL window input subqueries share keys and retain qualified input demand" 
     }
 }
 
+test "SQL phase outputs prune wide cold layouts and demand only sorted scalar results" {
+    for ([_][]const u8{
+        "SELECT o.id,SUM(o.delta) AS n,(SELECT ai_probability(o.id,'Output?','local')) AS p FROM source o GROUP BY o.id ORDER BY n DESC LIMIT 2",
+        "SELECT o.id,row_number() OVER (ORDER BY o.delta DESC) AS n,(SELECT ai_probability(o.id,'Output?','local')) AS p FROM source o ORDER BY o.delta DESC LIMIT 2",
+    }, 0..) |sql, shape| {
+        var small_work: usize = 0;
+        for ([_]usize{ 128, 1024 }) |count| {
+            var backend: Backend = .{ .returning_mode = true, .cold_source = true, .cold_width = 1024, .row_count = count };
+            var provider: @import("antfly_local_sources").sql_decision_eval.testing.Provider = .{};
+            var iface = backend.backend();
+            iface.decision_provider = provider.provider();
+            var compiled = try compiler.compile(std.testing.allocator, sql, .{});
+            defer compiled.deinit();
+            var result = try runtime.execute(std.testing.allocator, iface, &compiled, &.{}, .{});
+            defer result.deinit();
+            try std.testing.expectEqual(@as(usize, 2), result.output.rows.len);
+            try std.testing.expectEqual(@as(usize, 2), provider.calls);
+            try std.testing.expectEqual(count, backend.rows_read);
+            try std.testing.expectEqual(@as(usize, 1), backend.source_resolves);
+            try std.testing.expectEqual(@as(usize, 1), backend.last_scan_count);
+            try std.testing.expectEqual(@as(usize, 1), backend.captures);
+            try std.testing.expectEqual(@as(usize, 1), backend.closes);
+            for (result.output.rows, 0..) |row, index| {
+                const expected = try std.fmt.allocPrint(std.testing.allocator, "row{d}", .{count - index - 1});
+                defer std.testing.allocator.free(expected);
+                try std.testing.expectEqualStrings(expected, row[0].string);
+            }
+            if (count == 128) small_work = backend.checkpoints else try std.testing.expect(backend.checkpoints < small_work * 16);
+            std.debug.print("SQL phase output: shape={s} rows={} checkpoints={} peak_bytes={} output_calls=2\n", .{ if (shape == 0) "grouped" else "window", count, backend.checkpoints, result.peakMemoryBytes() });
+        }
+    }
+}
+
+test "SQL phase outputs cancel every checkpoint and release one captured read" {
+    var compiled = try compiler.compile(std.testing.allocator, "SELECT o.id,row_number() OVER (ORDER BY o.delta DESC),(SELECT o.delta+1) FROM source o ORDER BY o.delta DESC LIMIT 1", .{});
+    defer compiled.deinit();
+    var baseline: Backend = .{ .returning_mode = true };
+    var output = try runtime.execute(std.testing.allocator, baseline.backend(), &compiled, &.{}, .{});
+    output.deinit();
+    for (1..baseline.checkpoints + 1) |checkpoint| {
+        var backend: Backend = .{ .returning_mode = true, .cancel_at = checkpoint };
+        try std.testing.expectError(error.Canceled, runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{}));
+        try std.testing.expectEqual(backend.captures, backend.closes);
+        try std.testing.expectEqual(@as(usize, 0), backend.commits);
+    }
+}
+
 test "SQL row subquery assigns positional values after bounded ordered source" {
     for ([_][]const u8{
         "UPDATE target SET (n,cold)=(SELECT delta AS amount,'new' AS label FROM source ORDER BY amount DESC LIMIT 1) RETURNING n,cold",

@@ -40,6 +40,9 @@ pub const Column = struct {
     outer_level: u8 = 0,
     outer_frame: ?usize = null,
     outer_ordinal: ?usize = null,
+    outer_dependencies: u32 = 0,
+    /// Diagnostic-only source domain, never a forwarded raw grouping row.
+    grouped_scope: ?*const []const Column = null,
 };
 
 /// Expand only authorized visible columns, before allocating expression
@@ -256,12 +259,51 @@ pub const TargetResolveAdapter = struct {
     }
 };
 
+const PhaseReferences = struct {
+    builder: *Builder,
+    columns: []const Column,
+    needed: *std.StringHashMapUnmanaged(void),
+    scope: []const ast.Cte,
+    depth: usize,
+
+    pub fn column(self: *@This(), name: []const u8) !void {
+        const resolved = try Builder.field(self.columns, name);
+        try self.needed.put(self.builder.alloc, resolved.internal, {});
+    }
+    pub fn subquery(self: *@This(), query: *const ast.Select) !void {
+        _ = try self.builder.derivedContext(query, "$phase_probe", &.{}, self.scope, self.depth + 1, true);
+    }
+};
+
+const PhaseEquality = struct {
+    builder: *Builder,
+    columns: []const Column,
+    bound: std.AutoHashMapUnmanaged(*const ast.Scalar, *const ast.Scalar) = .empty,
+
+    fn expression(self: *@This(), value: *const ast.Scalar) !*const ast.Scalar {
+        if (self.bound.get(value)) |prior| return prior;
+        const normalized = try self.builder.expression(self.columns, value, &.{});
+        try self.bound.put(self.builder.alloc, value, normalized);
+        return normalized;
+    }
+    fn same(ptr: *anyopaque, left: *const ast.Scalar, right: *const ast.Scalar) anyerror!bool {
+        if (left == right) return true;
+        const aggregates = @import("aggregate_binding.zig");
+        const reads = @import("subquery_lowering.zig");
+        // Never erase a child's lexical domain to compare scalar syntax.
+        if (reads.has(left) or reads.has(right)) return aggregates.same(left, right);
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return aggregates.same(try self.expression(left), try self.expression(right));
+    }
+};
+
 const Builder = struct {
     alloc: Allocator,
     backend: catalog.Backend,
     parameters: []?ast.ColumnType,
     scans: std.ArrayList(catalog.StatementScan) = .empty,
     identities: std.StringHashMapUnmanaged(catalog.Table) = .empty,
+    outer_references: ?*std.StringHashMapUnmanaged(void) = null,
     next_column: usize = 0,
     nodes: usize = 0,
     node_limit: usize = 256,
@@ -403,7 +445,8 @@ const Builder = struct {
         const subqueries = @import("subquery_lowering.zig");
         if (!subqueries.accepts(statement)) return statement;
         var prepared = statement;
-        if (subqueries.needsOwnProjectionDomain(statement)) {
+        const phases = @import("phase_projection.zig");
+        if (subqueries.needsOwnProjectionDomain(statement) or phases.accepts(statement)) {
             // Only the source's catalog shape is needed. Keep its authorized
             // identities for executable binding so wildcard ordinals cannot
             // observe a different schema epoch or add physical scan readers.
@@ -412,12 +455,22 @@ const Builder = struct {
                 .backend = self.backend,
                 .parameters = self.parameters,
                 .identities = self.identities,
+                .next_column = self.next_column,
                 .shape_only = true,
                 .node_limit = self.node_limit,
                 .outer_scope = self.outer_scope,
                 .outer_next = self.outer_next,
                 .recursive_active = self.recursive_active,
                 .recursive_next = self.recursive_next,
+                .outer_references = self.outer_references,
+            };
+            try shape.shape_columns.appendSlice(self.alloc, self.shape_columns.items);
+            var outer = self.outer_scope;
+            while (outer) |frame| : (outer = frame.parent) for (frame.columns) |column| {
+                const present = for (shape.shape_columns.items) |known| {
+                    if (std.mem.eql(u8, known.name, column.internal)) break true;
+                } else false;
+                if (!present) try shape.shape_columns.append(self.alloc, .{ .name = column.internal, .type = column.type, .element_type = column.element_type, .nullable = column.nullable });
             };
             const source = try shape.querySource(statement, scope, depth + 1);
             self.identities = shape.identities;
@@ -429,6 +482,54 @@ const Builder = struct {
                 projection.bound_column = null;
             };
             prepared.columns = projections;
+            if (phases.accepts(prepared)) {
+                try @import("window_binding.zig").validatePlacement(prepared);
+                const groups = try self.alloc.dupe(*const ast.Scalar, prepared.group_by);
+                for (groups) |*group| {
+                    if (group.*.* == .literal and group.*.literal == .integer) {
+                        const ordinal = std.math.cast(usize, group.*.literal.integer) orelse return error.SqlGroupingError;
+                        if (ordinal == 0 or ordinal > projections.len) return error.SqlGroupingError;
+                        const projection = projections[ordinal - 1];
+                        group.* = projection.expression orelse try self.scalarNode(.{ .column = projection.field });
+                    } else if (group.*.* == .column) {
+                        _ = field(source.columns, group.*.column) catch |err| {
+                            if (err != error.UndefinedColumn) return err;
+                            var found: ?*const ast.Scalar = null;
+                            for (projections) |projection| if (std.mem.eql(u8, projection.alias orelse projection.field, group.*.column)) {
+                                const value = projection.expression orelse try self.scalarNode(.{ .column = projection.field });
+                                if (found) |prior| if (!@import("aggregate_binding.zig").same(prior, value)) return error.AmbiguousSqlColumn;
+                                found = value;
+                            };
+                            group.* = found orelse return err;
+                        };
+                    }
+                }
+                prepared.group_by = groups;
+                prepared = try @import("order_aliases.zig").normalize(self.alloc, prepared);
+                var needed: std.StringHashMapUnmanaged(void) = .empty;
+                const child_scope = try self.alloc.alloc(ast.Cte, scope.len + prepared.ctes.len);
+                @memcpy(child_scope[0..scope.len], scope);
+                @memcpy(child_scope[scope.len..], prepared.ctes);
+                if (shape.outer_next == 32) return error.SqlProgramLimitExceeded;
+                const frame: OuterScope = .{ .id = shape.outer_next, .columns = source.columns, .parent = self.outer_scope, .cte_boundary = child_scope.len };
+                shape.outer_next += 1;
+                shape.outer_scope = &frame;
+                shape.outer_references = &needed;
+                var references: PhaseReferences = .{ .builder = &shape, .columns = source.columns, .needed = &needed, .scope = child_scope, .depth = depth };
+                for (prepared.columns) |projection| try phases.visitReferences(projection.expression orelse try self.scalarNode(.{ .column = projection.field }), groups, &references);
+                if (prepared.having) |value| try phases.visitReferences(value, groups, &references);
+                for (prepared.order_by) |order| if (order.expression) |value| try phases.visitReferences(value, groups, &references);
+                self.identities = shape.identities;
+                const fields = try self.alloc.alloc(phases.Field, source.columns.len);
+                for (source.columns, fields) |column, *out| out.* = .{
+                    .name = if (column.qualifier.len == 0) column.name else try std.fmt.allocPrint(self.alloc, "{s}\x00{s}", .{ column.qualifier, column.name }),
+                    .qualifier = column.qualifier,
+                    .needed = needed.contains(column.internal),
+                };
+                var equality: PhaseEquality = .{ .builder = &shape, .columns = source.columns };
+                prepared = try phases.lower(self.alloc, prepared, fields, .{ .ptr = &equality, .same = PhaseEquality.same });
+                return self.lowerSubqueries(prepared, scope, depth + 1);
+            }
         }
         return subqueries.lower(self.alloc, prepared);
     }
@@ -660,11 +761,25 @@ const Builder = struct {
             }
             found = column;
         }
-        return found orelse error.UndefinedColumn;
+        if (found) |column| return column;
+        for (columns) |column| if (column.grouped_scope) |original| {
+            const rejected = field(original.*, name) catch |err| {
+                if (err == error.UndefinedColumn) continue;
+                return err;
+            };
+            if (rejected.outer_level == 0) return error.SqlGroupingError;
+        };
+        return error.UndefinedColumn;
     }
     fn resolveField(self: *Builder, columns: []const Column, name: []const u8) !Column {
         const column = try field(columns, name);
-        if (column.outer_frame) |id| self.outer_used[id] = true;
+        for (0..32) |id| if (column.outer_dependencies & (@as(u32, 1) << @intCast(id)) != 0) {
+            self.outer_used[id] = true;
+        };
+        if (column.outer_frame) |id| {
+            self.outer_used[id] = true;
+            if (self.outer_references) |references| try references.put(self.alloc, column.internal, {});
+        }
         return column;
     }
     fn scalarNode(self: *Builder, value: ast.Scalar) !*const ast.Scalar {
@@ -767,6 +882,10 @@ const Builder = struct {
             } else {
                 const column = if (projection.bound_column) |ordinal| source.columns[ordinal] else try self.resolveField(source.columns, projection.field);
                 if (column.outer_frame) |id| self.outer_used[id] = true;
+                for (0..32) |id| if (column.outer_dependencies & (@as(u32, 1) << @intCast(id)) != 0) {
+                    self.outer_used[id] = true;
+                };
+                if (column.outer_frame != null) if (self.outer_references) |references| try references.put(self.alloc, column.internal, {});
                 try projections.append(self.alloc, .{ .field = column.internal, .expression = if (column.untyped_null) try self.scalarNode(.{ .literal = .null }) else null, .alias = projection.alias orelse column.name });
             }
         }
@@ -894,6 +1013,9 @@ const Builder = struct {
         var outer: ?*const Node = null;
         var frame: ?*const OuterScope = nearest;
         var level: u8 = 1;
+        var forwarded: std.StringHashMapUnmanaged(void) = .empty;
+        defer forwarded.deinit(self.alloc);
+        for (source.columns) |column| try forwarded.put(self.alloc, column.internal, {});
         while (frame) |current| : ({
             frame = current.parent;
             level += 1;
@@ -901,17 +1023,22 @@ const Builder = struct {
             // A compiler-owned membership probe binds before its enclosing
             // SELECT programs. Do not attach the same lexical frame again
             // when that SELECT subsequently completes source construction.
-            const present = for (source.columns) |column| {
-                if (column.outer_frame == current.id and column.outer_level != 0) break true;
-            } else false;
-            if (present or current.columns.len == 0) continue;
-            const columns = try self.alloc.dupe(Column, current.columns);
-            for (columns, 0..) |*column, ordinal| {
+            var columns: std.ArrayList(Column) = .empty;
+            for (current.columns, 0..) |original, ordinal| {
+                // A nearer frame can forward a grandparent's identity. Keep
+                // that one slot rather than registering its internal name
+                // twice in a nested phase/Apply virtual table.
+                if (forwarded.contains(original.internal)) continue;
+                try forwarded.put(self.alloc, original.internal, {});
+                var column = original;
+                if (original.outer_frame) |id| column.outer_dependencies |= @as(u32, 1) << @intCast(id);
                 column.outer_level = level;
                 column.outer_frame = current.id;
                 column.outer_ordinal = ordinal;
+                try columns.append(self.alloc, column);
             }
-            const reference = try self.node(columns, .{ .outer_ref = current.id });
+            if (columns.items.len == 0) continue;
+            const reference = try self.node(try columns.toOwnedSlice(self.alloc), .{ .outer_ref = current.id });
             outer = if (outer) |left| try self.joinNode(left, reference, .cross, null, null) else reference;
         }
         const result = try self.joinNode(outer orelse return source, source, .cross, null, null);
@@ -1274,6 +1401,22 @@ const Builder = struct {
             },
             .derived => |query| blk: {
                 const result = if (query.preserve_scope) try self.selectionStage(query.query.*, scope, depth + 1) else try self.derived(query.query, query.alias, query.columns, scope, depth + 1);
+                if (query.phase_scope) |phase| {
+                    if (phase.columns.len != result.columns.len) return error.InvalidSqlBackendResponse;
+                    const original = if (self.shape_only) try self.querySource(query.query.*, scope, depth + 1) else if (result.operation == .query) result.operation.query.source else return error.InvalidSqlBackendResponse;
+                    const grouped_scope = if (phase.grouped) try self.alloc.create([]const Column) else null;
+                    if (grouped_scope) |domain| domain.* = original.columns;
+                    for (@constCast(result.columns), phase.columns) |*column, reference| {
+                        if (reference) |name| {
+                            const source_column = try field(original.columns, name);
+                            column.name = source_column.name;
+                            column.qualifier = source_column.qualifier;
+                            column.scope = source_column.scope;
+                            column.visible = source_column.visible;
+                        } else column.visible = false;
+                    }
+                    if (result.columns.len != 0) @constCast(result.columns)[0].grouped_scope = grouped_scope;
+                }
                 if (query.hidden) for (@constCast(result.columns)) |*column| {
                     column.visible = false;
                 };

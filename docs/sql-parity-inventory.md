@@ -763,9 +763,38 @@ in both sort keys and unused definitions. Native allocation-fault enumeration
 covers shared named-window inputs and labels; the mounted endpoint exercises
 their public execution path.
 
-General grouped/window scalar-subquery output staging and cross-level aggregate
-lifting remain unfinished. These shared execution regressions
-do not independently change the original-case dispositions.
+Scalar output reads now bind above a typed grouping/window boundary. Aggregates
+and window results have one owned slot; grouped source identities survive without
+forwarding raw ungrouped rows. A catalog-only dependency pass uses ordinary
+lexical binding for child references, including CTEs, shadowing and lateral
+grandparents. Window boundaries forward only referenced source columns, not an
+entire table layout. Group-expression equality compares bound identities rather
+than spelling, so qualified/unqualified expressions and GROUP BY aliases or
+ordinals share their proper slot. Missing grouped fields retain PostgreSQL's
+42803 diagnostic; unknown fields retain 42703.
+
+HAVING owns the completed-group domain before windows. A HAVING subquery and
+window projection use separate group/filter/window phases; output selection
+then runs independent scalar children only for the consumed sorted prefix.
+Native counters verify 128/1,024 input rows, two output-provider invocations and
+one captured scan without reading 1,024 unrelated columns. The scale check
+records the following request-tracked peaks (not whole-process RSS or production
+throughput claims):
+
+| Shape | Input rows | Checkpoints | Peak tracked bytes |
+| --- | ---: | ---: | ---: |
+| Grouped | 128 | 524 | 8,781,813 |
+| Grouped | 1,024 | 3,286 | 8,898,058 |
+| Window | 128 | 927 | 4,197,936 |
+| Window | 1,024 | 6,538 | 4,369,934 |
+
+Allocation-fault tests
+cover prepared grouped HAVING and paging; cancellation checks every recorded
+checkpoint and releases each captured read without publication. PostgreSQL and
+mounted HTTP contracts cover grouped/global/window outputs, empty inputs,
+conditional demand, grouping diagnostics and sort-prefix cardinality failures.
+Cross-level aggregate ownership lifting remains unfinished. These shared
+execution regressions do not independently change original-case dispositions.
 
 ### Shared streaming ordered-set execution
 
