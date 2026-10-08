@@ -88,9 +88,10 @@ pub fn runtimeCompileMaxRss(unit: RuntimeLibraryUnit, profile: CompileMemoryProf
         // platform frameworks. Linux ARM64 reached 4.99 GB in the
         // v0.2.1-rc0 release build, while the integrated HA API kernel
         // reached 8.10 GB in a clean aarch64-linux-musl ReleaseFast
-        // build. Linux retains 10 GiB. The macOS claim now includes a
-        // provisional margin over the subsequently exceeded 11 GiB claim.
-        .api_kernel => @as(usize, if (target.os.tag == .macos) 14 else 10) * 1024 * 1024 * 1024,
+        // build. Linux retains 10 GiB. October's native lake codegen reached
+        // 15.10 GB on macOS, exceeding 14 GiB. Reserve 18 GiB to retain at
+        // least 25% headroom over that measured peak.
+        .api_kernel => @as(usize, if (target.os.tag == .macos) 18 else 10) * 1024 * 1024 * 1024,
         // September's macOS 20 GiB claim is below the reported 22–23 GB
         // compiler peak. 28 GiB includes >=25% headroom at 23 decimal GB.
         // Keep the measured Linux profiles separate. The other macOS bumps
