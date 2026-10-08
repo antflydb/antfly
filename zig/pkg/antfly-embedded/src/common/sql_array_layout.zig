@@ -31,7 +31,18 @@ pub const version: u8 = 1;
 pub const header_size: usize = 8;
 pub const max_rank: usize = 6;
 const compact_flag: u16 = 1;
-pub const Limits = struct { elements: usize = 65536, bytes: usize = 8 * 1024 * 1024 };
+pub const Limits = struct {
+    elements: usize = 65536,
+    bytes: usize = 8 * 1024 * 1024,
+    numeric_bytes: usize = 8 * 1024 * 1024,
+    numeric_groups: usize = 65535,
+};
+const NoBudget = struct {
+    pub fn charge(_: *@This(), _: u64) !void {}
+    pub fn limit(_: *@This()) anyerror {
+        return error.SqlProgramLimitExceeded;
+    }
+};
 
 pub fn width(kind: Kind) usize {
     return switch (kind) {
@@ -164,7 +175,15 @@ pub const View = struct {
     }
 
     pub fn open(kind: Kind, bytes: []const u8, limits: Limits) !View {
-        const view = try openAuthenticated(kind, bytes, limits);
+        var budget: NoBudget = .{};
+        return openWithBudget(kind, bytes, limits, &budget);
+    }
+
+    /// Strict admission scans share the caller's work and cancellation owner.
+    /// Authentication-only projection remains O(rank) and is not validation.
+    pub fn openWithBudget(kind: Kind, bytes: []const u8, limits: Limits, budget: anytype) !View {
+        try budget.charge(1);
+        const view = openAuthenticated(kind, bytes, limits) catch |err| return if (err == error.SqlProgramLimitExceeded) budget.limit() else err;
         const count = view.count;
         if (count == 0) return view;
         const slots_start = view.slots_start;
@@ -176,6 +195,7 @@ pub const View = struct {
         if (width(kind) == 0) {
             var previous: u32 = 0;
             for (0..count) |i| {
+                try budget.charge(1);
                 const next = view.offset(i + 1);
                 if (next < previous or next > bytes.len - minimum) return error.InvalidSqlArrayStorage;
                 previous = next;
@@ -184,6 +204,7 @@ pub const View = struct {
         if (width(kind) != 0) {
             var non_null: usize = 0;
             for (0..(count + 63) / 64) |block| {
+                try budget.charge(1);
                 if (view.compact and view.offset(block) != non_null) return error.InvalidSqlArrayStorage;
                 const bits = @min(64, @as(usize, count) - block * 64);
                 const mask = if (bits == 64) std.math.maxInt(u64) else (@as(u64, 1) << @intCast(bits)) - 1;
@@ -193,6 +214,7 @@ pub const View = struct {
             if (view.compact != usesCompact(kind, count, non_null)) return error.NonCanonicalSqlArrayStorage;
         }
         for (0..count) |i| {
+            try budget.charge(1);
             const raw = view.cellUnchecked(i);
             if (raw.sql_null) {
                 for (raw.bytes) |byte| if (byte != 0) return error.NonCanonicalSqlArrayStorage;
@@ -209,9 +231,26 @@ pub const View = struct {
                     const bits = std.mem.readInt(u64, raw.bytes[0..8], .little);
                     if (std.math.isNan(@as(f64, @bitCast(bits))) and bits != 0x7ff8000000000000) return error.NonCanonicalSqlArrayStorage;
                 },
-                .text => if (!std.unicode.utf8ValidateSlice(raw.bytes) or std.mem.indexOfScalar(u8, raw.bytes, 0) != null) return error.SqlInvalidTextEncoding,
+                .text => {
+                    var position: usize = 0;
+                    while (position < raw.bytes.len) {
+                        var end = position + @min(raw.bytes.len - position, 256);
+                        // Keep the standard vectorized validator, splitting
+                        // only at codepoint boundaries (at most 3-byte backoff
+                        // for valid UTF-8; malformed continuation runs reject).
+                        if (end < raw.bytes.len) while (end > position and raw.bytes[end] & 0xc0 == 0x80) : (end -= 1) {};
+                        if (end == position) return error.SqlInvalidTextEncoding;
+                        try budget.charge(end - position);
+                        const chunk = raw.bytes[position..end];
+                        if (!std.unicode.utf8ValidateSlice(chunk) or std.mem.indexOfScalar(u8, chunk, 0) != null) return error.SqlInvalidTextEncoding;
+                        position = end;
+                    }
+                },
                 .jsonb => if (raw.bytes.len == 0) return error.InvalidSqlArrayStorage,
-                .numeric => _ = @import("sql_numeric_layout.zig").View.open(raw.bytes, .{ .bytes = limits.bytes }) catch |err| return switch (err) {
+                .numeric => _ = @import("sql_numeric_layout.zig").View.openWithBudget(raw.bytes, .{
+                    .bytes = @min(limits.bytes, limits.numeric_bytes),
+                    .groups = limits.numeric_groups,
+                }, budget) catch |err| return switch (err) {
                     error.InvalidSqlBinaryRepresentation => error.InvalidSqlArrayStorage,
                     else => err,
                 },

@@ -210,6 +210,35 @@ pub fn arrayJson(
     return .{ .sql_array = .{ .element_type = kind, .bytes = output } };
 }
 
+/// Materialize the public ordinal envelope directly, without stringify/parse.
+/// Like other row DOM adapters this is region-owned: the caller discards its
+/// row region on failure. No managed-array allocator may retain a stack budget.
+fn arrayJsonOutputLeaky(execution: *Execution, array: @import("../sql/row_value.zig").Array) !std.json.Value {
+    try execution.charge(0);
+    var scratch: NumericScratch = undefined;
+    scratch.init(execution);
+    defer scratch.deinit();
+    const limits: @import("../sql/array_value.zig").Limits = .{ .bytes = execution.bytes.* };
+    const decoded = @import("../sql/array_storage.zig").decodeLeaky(scratch.arena.allocator(), array.element_type, array.bytes, .{
+        .context = &execution.numeric,
+        .values = limits,
+        .wire_bytes = execution.numeric.max_output_bytes,
+    }) catch |err| return scratch.failure(err);
+    var retained: @import("../sql/memory_budget.zig") = .{
+        .backing = execution.alloc,
+        .limit = execution.bytes.* -| scratch.memory.peak,
+    };
+    defer execution.bytes.* -|= retained.peak;
+    var output = @import("../sql/array_wire.zig").toJsonLeaky(retained.allocator(), decoded.value, .{
+        .context = &execution.numeric,
+        .values = limits,
+        .wire_bytes = execution.numeric.max_output_bytes,
+    }) catch |err| return if (err == error.OutOfMemory and retained.isExhausted()) execution.limit() else scratch.failure(err);
+    var work: @import("../sql/array_value.zig").Budget = .{ .shared = &execution.numeric };
+    @import("../sql/json_order.zig").rehomeArrayAllocators(&output, execution.alloc, &work, 0) catch |err| return scratch.failure(err);
+    return output;
+}
+
 /// Assignment and logical restore share exact parsing, work and cancellation.
 /// Preservation validates the target domain without repairing logical values;
 /// the physical row codec separately enforces canonical bytes.
@@ -897,6 +926,91 @@ test "relational declarations typed array JSON adapter owns canonical PostgreSQL
         try std.testing.expectEqualSlices(u8, expected, result.sql_array.bytes);
         _ = try storage.validateCanonical(a, entry.element_type, result.sql_array.bytes, .{});
     }
+}
+
+test "relational declarations typed array result DOM owns PostgreSQL values and rehomes allocator lifetimes" {
+    const a = std.testing.allocator;
+    const arrays = @import("../sql/array_value.zig");
+    const storage = @import("../sql/array_storage.zig");
+    const Fixture = struct { entries: []const struct { element_type: arrays.ElementType, binary: []const u8 } };
+    var fixture = try std.json.parseFromSlice(Fixture, a, @embedFile("../sql/fixtures/sql_array_binary_reference.json"), .{ .ignore_unknown_fields = true });
+    defer fixture.deinit();
+    const Run = struct {
+        fn owners(value: std.json.Value, owner: Allocator) !void {
+            switch (value) {
+                .array => |items| {
+                    try std.testing.expectEqual(owner.ptr, items.allocator.ptr);
+                    try std.testing.expectEqual(owner.vtable, items.allocator.vtable);
+                    for (items.items) |item| try owners(item, owner);
+                },
+                .object => |object| for (object.values()) |item| try owners(item, owner),
+                else => {},
+            }
+        }
+        fn run(backing: Allocator, kind: arrays.ElementType, bytes: []const u8) !void {
+            var region = std.heap.ArenaAllocator.init(backing);
+            defer region.deinit();
+            const owner = region.allocator();
+            var allowance: usize = max_allocated_bytes;
+            var execution = Execution.init(owner, &allowance);
+            const output = blk: {
+                const source = try backing.dupe(u8, bytes);
+                defer backing.free(source);
+                break :blk arrayJsonOutputLeaky(&execution, .{ .element_type = kind, .bytes = source }) catch |err| {
+                    if (err == error.OutOfMemory) try std.testing.expect(execution.numeric.failure == null);
+                    try std.testing.expectEqual(owner.ptr, execution.alloc.ptr);
+                    try std.testing.expectEqual(owner.vtable, execution.numeric.alloc.vtable);
+                    return err;
+                };
+            };
+            try owners(output, owner);
+            try std.testing.expect(allowance < max_allocated_bytes);
+            const rebound = try arrayJson(&execution, kind, output, null);
+            try std.testing.expectEqualSlices(u8, bytes, rebound.sql_array.bytes);
+            try std.testing.expectEqual(owner.ptr, execution.alloc.ptr);
+            try std.testing.expectEqual(owner.vtable, execution.numeric.alloc.vtable);
+        }
+    };
+    for (fixture.value.entries) |entry| {
+        const pg = try a.alloc(u8, entry.binary.len / 2);
+        defer a.free(pg);
+        _ = try std.fmt.hexToBytes(pg, entry.binary);
+        var original = try @import("../sql/array_binary.zig").decode(a, entry.element_type, pg, .{});
+        defer original.deinit();
+        const bytes = try storage.encodeAlloc(a, original.value, .{});
+        defer a.free(bytes);
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Run.run, .{ entry.element_type, bytes });
+    }
+}
+
+test "relational declarations typed array result DOM admission is sticky across scratch and retained quotas" {
+    const a = std.testing.allocator;
+    const arrays = @import("../sql/array_value.zig");
+    const storage = @import("../sql/array_storage.zig");
+    var object = try std.json.parseFromSlice(std.json.Value, a, "{\"a\":[1,null,true],\"b\":\"text\"}", .{});
+    defer object.deinit();
+    const cells: [20]arrays.Element = @splat(arrays.Element.json(object.value));
+    const bytes = try storage.encodeAlloc(a, .{ .element_type = .jsonb, .dimensions = &.{.{ .length = cells.len, .lower = -7 }}, .elements = &cells }, .{});
+    defer a.free(bytes);
+    var failures: usize = 0;
+    var successes: usize = 0;
+    for ([_]usize{ 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536 }) |initial| {
+        var region = std.heap.ArenaAllocator.init(a);
+        defer region.deinit();
+        var allowance = initial;
+        var execution = Execution.init(region.allocator(), &allowance);
+        if (arrayJsonOutputLeaky(&execution, .{ .element_type = .jsonb, .bytes = bytes })) |_| {
+            successes += 1;
+            try std.testing.expect(allowance < initial);
+        } else |err| {
+            try std.testing.expectEqual(error.RelationalExpressionBudgetExceeded, err);
+            failures += 1;
+            allowance = max_allocated_bytes;
+            execution.numeric.remaining = 8 * 1024 * 1024;
+            try std.testing.expectError(error.RelationalExpressionBudgetExceeded, execution.charge(0));
+        }
+    }
+    try std.testing.expect(failures != 0 and successes != 0);
 }
 
 test "relational declarations typed array JSON adapter preserves sticky cancellation and byte admission" {
@@ -2754,6 +2868,7 @@ test "relational declarations constant folding owns output and shares sticky adm
 fn boundedValueToJson(execution: *Execution, value: Value) !std.json.Value {
     return switch (value) {
         .numeric => |bytes| numericJsonOutput(execution, bytes),
+        .sql_array => |array| arrayJsonOutputLeaky(execution, array),
         .string => |bytes| blk: {
             const output = try allocateOutput(execution.alloc, bytes.len, execution.bytes);
             @memcpy(output, bytes);
@@ -2787,7 +2902,11 @@ fn valueToJson(alloc: Allocator, value: Value) !std.json.Value {
         .numeric => |bytes| @import("../sql/numeric_storage.zig").jsonValueAlloc(alloc, bytes),
         .boolean => |boolean| .{ .bool = boolean },
         .datetime => |datetime| .{ .number_string = try std.fmt.allocPrint(alloc, "{d}", .{datetime}) },
-        .sql_array => error.InvalidRelationalExpressionType,
+        .sql_array => |array| blk: {
+            var allowance: usize = max_allocated_bytes;
+            var execution = Execution.init(alloc, &allowance);
+            break :blk arrayJsonOutputLeaky(&execution, array);
+        },
     };
 }
 

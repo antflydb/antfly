@@ -28,13 +28,33 @@ const A = std.mem.Allocator;
 pub const Options = struct {
     values: arrays.Limits = .{},
     wire_bytes: usize = 8 * 1024 * 1024,
-    /// Borrowed request identity; all preparation and emission work is already
+    /// Borrowed request identity; all codec work is already
     /// charged here. It must outlive Prepared, including subsequent writes.
     context: ?*@import("numeric_value.zig").Context = null,
 };
 
 fn preparationError(options: Options, err: anyerror) anyerror {
     return if (err == error.SqlProgramLimitExceeded and options.context != null) options.context.?.limit() else err;
+}
+
+const LayoutBudget = struct {
+    work: *arrays.Budget,
+    pub fn charge(self: *@This(), count: u64) !void {
+        try self.work.consume(@intCast(count));
+    }
+    pub fn limit(self: *@This()) anyerror {
+        return if (self.work.shared) |parent| parent.limit() else error.SqlProgramLimitExceeded;
+    }
+};
+
+fn openView(expected: arrays.ElementType, bytes: []const u8, options: Options, work: *arrays.Budget) !layout.View {
+    var budget: LayoutBudget = .{ .work = work };
+    return layout.View.openWithBudget(expected, bytes, .{
+        .elements = options.values.elements,
+        .bytes = options.wire_bytes,
+        .numeric_bytes = if (options.context) |context| context.max_input_bytes else options.wire_bytes,
+        .numeric_groups = if (options.context) |context| context.max_groups else 65535,
+    }, &budget);
 }
 
 /// Borrows a pinned immutable input. Primitive preparation allocates nothing;
@@ -194,14 +214,15 @@ pub fn encodeAlloc(a: A, value: arrays.Value, options: Options) ![]u8 {
 pub const Decoded = struct { value: arrays.Value, work: usize };
 
 pub fn decode(backing: A, expected: arrays.ElementType, bytes: []const u8, options: Options) !arrays.Owned {
+    if (options.context) |context| try context.charge(0);
     const budget = try backing.create(MemoryBudget);
     errdefer backing.destroy(budget);
     budget.* = .{ .backing = backing, .limit = options.values.bytes };
-    const arena = budget.allocator().create(std.heap.ArenaAllocator) catch |err| return quotaError(budget, err);
+    const arena = budget.allocator().create(std.heap.ArenaAllocator) catch |err| return preparationError(options, quotaError(budget, err));
     errdefer budget.allocator().destroy(arena);
     arena.* = std.heap.ArenaAllocator.init(budget.allocator());
     errdefer arena.deinit();
-    const decoded = decodeLeaky(arena.allocator(), expected, bytes, options) catch |err| return quotaError(budget, err);
+    const decoded = decodeLeaky(arena.allocator(), expected, bytes, options) catch |err| return preparationError(options, quotaError(budget, err));
     return .{ .arena = arena, .budget = budget, .value = decoded.value };
 }
 
@@ -209,18 +230,17 @@ pub fn decode(backing: A, expected: arrays.ElementType, bytes: []const u8, optio
 /// references escape in nested JSON arrays. Callers destroy the region on error.
 pub fn decodeLeaky(backing: A, expected: arrays.ElementType, bytes: []const u8, options: Options) !Decoded {
     var budget: MemoryBudget = .{ .backing = backing, .limit = options.values.bytes };
-    return decodeAdmitted(budget.allocator(), backing, expected, bytes, options) catch |err| return quotaError(&budget, err);
+    return decodeAdmitted(budget.allocator(), backing, expected, bytes, options) catch |err| return preparationError(options, quotaError(&budget, err));
 }
 
 fn decodeAdmitted(a: A, owner: A, expected: arrays.ElementType, bytes: []const u8, options: Options) !Decoded {
-    if (bytes.len > options.values.work) return error.SqlProgramLimitExceeded;
-    const view = try layout.View.open(expected, bytes, .{ .elements = options.values.elements, .bytes = options.wire_bytes });
-    var work: arrays.Budget = .{ .remaining = options.values.work };
-    try work.consume(bytes.len);
+    var work: arrays.Budget = .{ .remaining = options.values.work, .shared = options.context };
+    const view = try openView(expected, bytes, options, &work);
     const dimensions = try a.alloc(arrays.Dimension, view.rank);
     for (dimensions, 0..) |*dimension, i| dimension.* = try view.dimension(i);
     const cells = try a.alloc(arrays.Element, view.count);
     for (cells, 0..) |*cell, i| {
+        try work.consume(1);
         const raw = try view.cell(i);
         if (raw.sql_null) {
             cell.* = .{};
@@ -228,7 +248,9 @@ fn decodeAdmitted(a: A, owner: A, expected: arrays.ElementType, bytes: []const u
         }
         if (expected == .numeric) {
             const numeric = @import("numeric_value.zig");
-            var ctx: numeric.Context = .{ .alloc = a, .remaining = work.remaining, .max_input_bytes = options.wire_bytes, .max_groups = options.values.bytes / 2 };
+            var ctx = work.numericContext(a);
+            ctx.max_input_bytes = @min(ctx.max_input_bytes, options.wire_bytes);
+            ctx.max_groups = @min(ctx.max_groups, options.values.bytes / 2);
             defer work.remaining = @intCast(ctx.remaining);
             var parsed = @import("numeric_binary.zig").decodeCanonical(&ctx, raw.bytes) catch |err| return switch (err) {
                 error.InvalidSqlBinaryRepresentation => error.InvalidSqlArrayStorage,
@@ -242,14 +264,14 @@ fn decodeAdmitted(a: A, owner: A, expected: arrays.ElementType, bytes: []const u
         }
         cell.* = arrays.Element.json(switch (expected) {
             .numeric => unreachable,
-            .text => .{ .string = try a.dupe(u8, raw.bytes) },
+            .text => .{ .string = try dupeBytes(a, raw.bytes, &work) },
             .int16 => .{ .integer = std.mem.readInt(i16, raw.bytes[0..2], .little) },
             .int32 => .{ .integer = std.mem.readInt(i32, raw.bytes[0..4], .little) },
             .int64 => .{ .integer = std.mem.readInt(i64, raw.bytes[0..8], .little) },
             .float32 => .{ .float = @as(f32, @bitCast(std.mem.readInt(u32, raw.bytes[0..4], .little))) },
             .float64 => .{ .float = @bitCast(std.mem.readInt(u64, raw.bytes[0..8], .little)) },
             .boolean => .{ .bool = raw.bytes[0] == 1 },
-            .uuid => .{ .string = try a.dupe(u8, &uuid.format(raw.bytes[0..16].*)) },
+            .uuid => .{ .string = try dupeBytes(a, &uuid.format(raw.bytes[0..16].*), &work) },
             .jsonb => try decodeJsonb(a, owner, raw.bytes, &work),
         });
     }
@@ -257,12 +279,26 @@ fn decodeAdmitted(a: A, owner: A, expected: arrays.ElementType, bytes: []const u
     return .{ .value = value, .work = options.values.work - work.remaining };
 }
 
+fn dupeBytes(a: A, bytes: []const u8, work: *arrays.Budget) ![]u8 {
+    const output = try a.alloc(u8, bytes.len);
+    errdefer a.free(output);
+    var offset: usize = 0;
+    while (offset < bytes.len) {
+        const end = offset + @min(bytes.len - offset, 256);
+        try work.consume(end - offset);
+        @memcpy(output[offset..end], bytes[offset..end]);
+        offset = end;
+    }
+    return output;
+}
+
 fn decodeJsonb(a: A, owner: A, bytes: []const u8, work: *arrays.Budget) !std.json.Value {
     var value = try json_order.parseTextLeaky(a, bytes, work);
     try json_order.validateTextDomain(value, work, 0);
     const canonical = try canonical_json.canonicalJsonValueAlloc(a, value);
     defer a.free(canonical);
-    if (!std.mem.eql(u8, bytes, canonical)) return error.NonCanonicalSqlArrayStorage;
+    try work.consume(canonical.len);
+    if (try work.orderBytes(bytes, canonical) != .eq) return error.NonCanonicalSqlArrayStorage;
     try json_order.rehomeArrayAllocators(&value, owner, work, 0);
     return value;
 }
@@ -271,11 +307,13 @@ fn decodeJsonb(a: A, owner: A, bytes: []const u8, work: *arrays.Budget) !std.jso
 /// vector. Primitive and NUMERIC arrays stay allocation-free; JSONB reuses one bounded
 /// region, so peak scratch is proportional to one element, not the whole array.
 pub fn validateCanonical(a: A, expected: arrays.ElementType, bytes: []const u8, options: Options) !layout.View {
-    if (bytes.len > options.values.work) return error.SqlProgramLimitExceeded;
-    const view = try layout.View.open(expected, bytes, .{ .elements = options.values.elements, .bytes = options.wire_bytes });
+    return validateCanonicalAdmitted(a, expected, bytes, options) catch |err| return preparationError(options, err);
+}
+
+fn validateCanonicalAdmitted(a: A, expected: arrays.ElementType, bytes: []const u8, options: Options) !layout.View {
+    var work: arrays.Budget = .{ .remaining = options.values.work, .shared = options.context };
+    const view = try openView(expected, bytes, options, &work);
     if (expected != .jsonb) return view;
-    var work: arrays.Budget = .{ .remaining = options.values.work };
-    try work.consume(bytes.len);
     var budget: MemoryBudget = .{ .backing = a, .limit = options.values.bytes };
     var scratch = std.heap.ArenaAllocator.init(budget.allocator());
     defer scratch.deinit();
@@ -642,6 +680,157 @@ test "SQL flat array logical hashes exclude dense compact representation choices
     left.final(&left_digest);
     right.final(&right_digest);
     try std.testing.expectEqualSlices(u8, &left_digest, &right_digest);
+}
+
+test "SQL flat array readers share PostgreSQL fixture work and unwind allocation failures" {
+    const a = std.testing.allocator;
+    const Fixture = struct { entries: []const struct { element_type: arrays.ElementType, binary: []const u8 } };
+    var fixture = try std.json.parseFromSlice(Fixture, a, @embedFile("fixtures/sql_array_binary_reference.json"), .{ .ignore_unknown_fields = true });
+    defer fixture.deinit();
+    const Faults = struct {
+        fn run(backing: A, kind: arrays.ElementType, bytes: []const u8) !void {
+            var parent: @import("numeric_value.zig").Context = .{ .alloc = backing };
+            var owned = decode(backing, kind, bytes, .{ .context = &parent }) catch |err| {
+                if (err == error.OutOfMemory) try std.testing.expect(parent.failure == null);
+                return err;
+            };
+            defer owned.deinit();
+            const encoded = try encodeAlloc(backing, owned.value, .{ .context = &parent });
+            defer backing.free(encoded);
+            try std.testing.expectEqualSlices(u8, bytes, encoded);
+            _ = validateCanonical(backing, kind, bytes, .{ .context = &parent }) catch |err| {
+                if (err == error.OutOfMemory) try std.testing.expect(parent.failure == null);
+                return err;
+            };
+        }
+    };
+    for (fixture.value.entries) |entry| {
+        const pg = try a.alloc(u8, entry.binary.len / 2);
+        defer a.free(pg);
+        _ = try std.fmt.hexToBytes(pg, entry.binary);
+        var original = try @import("array_binary.zig").decode(a, entry.element_type, pg, .{});
+        defer original.deinit();
+        const bytes = try encodeAlloc(a, original.value, .{});
+        defer a.free(bytes);
+        var parent: @import("numeric_value.zig").Context = .{ .alloc = a };
+        const before = parent.remaining;
+        _ = try validateCanonical(a, entry.element_type, bytes, .{ .context = &parent });
+        try std.testing.expect(parent.remaining < before);
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const decode_before = parent.remaining;
+        const decoded = try decodeLeaky(arena.allocator(), entry.element_type, bytes, .{ .context = &parent });
+        try std.testing.expectEqual(decode_before - parent.remaining, decoded.work);
+        var work: arrays.Budget = .{};
+        try std.testing.expectEqual(std.math.Order.eq, try original.value.compare(decoded.value, &work));
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Faults.run, .{ entry.element_type, bytes });
+    }
+}
+
+test "SQL flat array strict readers poll directory and UTF8 scans with sticky cancellation" {
+    const a = std.testing.allocator;
+    const numeric = @import("numeric_value.zig");
+    const cells: [1000]arrays.Element = @splat(arrays.Element.json(.{ .integer = 42 }));
+    const integers = try encodeAlloc(a, .{ .element_type = .int64, .dimensions = &.{.{ .length = cells.len }}, .elements = &cells }, .{});
+    defer a.free(integers);
+    var text: [1024]u8 = @splat('x');
+    for ([_]usize{ 253, 509, 765 }) |at| @memcpy(text[at..][0..4], "\xf0\x9f\x98\x80");
+    const strings = try encodeAlloc(a, .{
+        .element_type = .text,
+        .dimensions = &.{.{ .length = 1, .lower = -9 }},
+        .elements = &.{arrays.Element.json(.{ .string = &text })},
+    }, .{});
+    defer a.free(strings);
+    const Cancel = struct {
+        calls: usize = 0,
+        fail_at: usize = 3,
+        fn poll(ptr: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            self.calls += 1;
+            if (self.calls == self.fail_at) return error.Canceled;
+        }
+    };
+    for ([_]struct { kind: arrays.ElementType, bytes: []const u8 }{
+        .{ .kind = .int64, .bytes = integers }, .{ .kind = .text, .bytes = strings },
+    }) |input| {
+        var denied = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+        var cancel: Cancel = .{};
+        var parent: numeric.Context = .{ .alloc = a, .checkpoint = Cancel.poll, .ptr = &cancel };
+        try std.testing.expectError(error.Canceled, validateCanonical(denied.allocator(), input.kind, input.bytes, .{ .context = &parent }));
+        try std.testing.expectEqual(@as(usize, 3), cancel.calls);
+        try std.testing.expectEqual(@as(usize, 0), denied.alloc_index);
+        parent.checkpoint = null;
+        parent.remaining = 8 * 1024 * 1024;
+        try std.testing.expectError(error.Canceled, decode(a, input.kind, input.bytes, .{ .context = &parent }));
+        parent = .{ .alloc = a };
+        _ = try validateCanonical(denied.allocator(), input.kind, input.bytes, .{ .context = &parent });
+    }
+    var copy_cancel: Cancel = .{ .fail_at = 6 };
+    var copy_parent: numeric.Context = .{ .alloc = a, .checkpoint = Cancel.poll, .ptr = &copy_cancel };
+    try std.testing.expectError(error.Canceled, decode(a, .text, strings, .{ .context = &copy_parent }));
+    try std.testing.expectEqual(@as(usize, 6), copy_cancel.calls);
+    var owned = try decode(a, .text, strings, .{});
+    defer owned.deinit();
+    try std.testing.expectEqualStrings(&text, owned.value.elements[0].value.string);
+    const corrupt = try a.dupe(u8, strings);
+    defer a.free(corrupt);
+    const view = try layout.View.open(.text, strings, .{});
+    corrupt[view.payload_start + 255] = 'x';
+    try std.testing.expectError(error.SqlInvalidTextEncoding, validateCanonical(a, .text, corrupt, .{}));
+    // Cross the 256-byte polling boundary inside a four-byte codepoint.
+    // Every possible replacement must agree with the standard UTF-8 oracle,
+    // including continuations, overlongs, surrogate leads and embedded NUL.
+    var boundary_parent: numeric.Context = .{ .alloc = a };
+    for (0..256) |replacement| {
+        corrupt[view.payload_start + 255] = @intCast(replacement);
+        const payload = corrupt[view.payload_start..];
+        const valid = std.unicode.utf8ValidateSlice(payload) and std.mem.indexOfScalar(u8, payload, 0) == null;
+        if (valid) {
+            _ = try validateCanonical(a, .text, corrupt, .{ .context = &boundary_parent });
+        } else {
+            try std.testing.expectError(error.SqlInvalidTextEncoding, validateCanonical(a, .text, corrupt, .{ .context = &boundary_parent }));
+        }
+    }
+    @memcpy(corrupt, strings);
+    corrupt[view.payload_start + 520] = 0;
+    try std.testing.expect(std.unicode.utf8ValidateSlice(corrupt[view.payload_start..]));
+    try std.testing.expectError(error.SqlInvalidTextEncoding, validateCanonical(a, .text, corrupt, .{ .context = &boundary_parent }));
+}
+
+test "SQL flat array readers inherit NUMERIC and scratch limits without poisoning ordinary OOM" {
+    const a = std.testing.allocator;
+    const numeric = @import("numeric_value.zig");
+    var parsing: numeric.Context = .{ .alloc = a };
+    var number = try numeric.parse(&parsing, "12345678901234567890.001200");
+    defer number.deinit();
+    const bytes = try encodeAlloc(a, .{
+        .element_type = .numeric,
+        .dimensions = &.{.{ .length = 1 }},
+        .elements = &.{arrays.Element.typedNumeric(&number.value)},
+    }, .{});
+    defer a.free(bytes);
+    for ([_]bool{ false, true }) |decode_owned| {
+        var parent: numeric.Context = .{ .alloc = a, .max_groups = 1 };
+        if (decode_owned) {
+            try std.testing.expectError(error.SqlProgramLimitExceeded, decode(a, .numeric, bytes, .{ .context = &parent }));
+        } else {
+            var denied = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+            try std.testing.expectError(error.SqlProgramLimitExceeded, validateCanonical(denied.allocator(), .numeric, bytes, .{ .context = &parent }));
+            try std.testing.expectEqual(@as(usize, 0), denied.alloc_index);
+        }
+        parent.max_groups = 65535;
+        parent.remaining = 8 * 1024 * 1024;
+        try std.testing.expectError(error.SqlProgramLimitExceeded, parent.charge(0));
+        parent = .{ .alloc = a, .max_input_bytes = 4 };
+        try std.testing.expectError(error.SqlProgramLimitExceeded, validateCanonical(a, .numeric, bytes, .{ .context = &parent }));
+    }
+    var parent: numeric.Context = .{ .alloc = a };
+    try std.testing.expectError(error.SqlProgramLimitExceeded, decode(a, .numeric, bytes, .{ .context = &parent, .values = .{ .bytes = 0 } }));
+    try std.testing.expectError(error.SqlProgramLimitExceeded, parent.charge(0));
+    parent = .{ .alloc = a };
+    var denied = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, decode(denied.allocator(), .numeric, bytes, .{ .context = &parent }));
+    try parent.charge(0);
 }
 
 test "SQL flat array preparation and repeated emission share sticky request admission" {

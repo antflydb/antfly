@@ -6398,3 +6398,40 @@ checking rounding, overflow, SQL NULL flags and multidimensional bounds. Sticky
 cancellation, byte exhaustion, allocator restoration, control catalog and
 formatting checks pass. The 1,100-test integrated storage result above predates
 this adapter; it is not reported as a full current-source gate.
+
+### Shared strict array readers and owned result envelopes
+
+Canonical array directories now expose budget-aware strict opening without a
+SQL dependency. Directory/checkpoint/cell scans, text validation and embedded
+NUMERIC coefficients charge and poll the caller's work/cancellation identity.
+UTF-8 validation retains the standard vectorized validator in bounded chunks
+split at codepoint boundaries. Header-only authenticated projection remains
+O(rank), and is still not a canonical admission proof.
+
+Storage decoding and strict JSONB verification use that same owner. NUMERIC
+child contexts inherit input/coefficient limits; text copies poll at 256-byte
+boundaries. Reported decode work has already been charged to the parent. Quota
+failures remain sticky, while ordinary backing-allocation failure stays OOM.
+Strict primitive and NUMERIC admission still allocate nothing; JSONB reuses
+one bounded element region. Canonical JSONB serialization itself still needs
+internal sorting/number-emission interruption; this is not claimed complete.
+
+The row VM's canonical-array output path directly materializes the ordinal
+JSON envelope instead of stringify/parse. Decode scratch and retained DOM
+capacity are summed against the enclosing byte allowance. Managed arrays,
+including nested JSONB arrays, are rehomed to the row owner before a temporary
+budget leaves scope. This is a region-owned adapter: callers discard the row
+region on failure, as with other leaky row DOM materializers.
+
+Final focused validation passes 19 flat-array tests, including all 11 PostgreSQL
+element fixtures, allocation-fault sweeps, sticky directory/text-copy
+cancellation, inherited NUMERIC bounds, and all 256 byte mutations at a UTF-8
+polling boundary plus a distinct UTF-8-valid embedded NUL case. Final-source
+schema validation passes 67 local and 5 server tests, no failures or leaks.
+Those tests verify result DOM ownership after source-byte destruction, exact
+canonical round trips, nested allocator lifetimes and combined byte quotas.
+The larger SQL/native integration revalidation remains separately tracked.
+
+Public array-expression compilation, precise branch/result type propagation,
+binding/assignment normalization, row rewrites, generated contracts and DDL
+activation remain unfinished. No original inventory disposition changes.
