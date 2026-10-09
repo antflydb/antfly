@@ -23,6 +23,7 @@ const control_only_storage_sources = storage_source_options.control_only;
 const fs_paths = @import("antfly_runtime_fs").fs_paths;
 const common_group_ids = @import("antfly_local_sources").common_group_ids;
 const common_secrets = @import("antfly_local_sources").common_secrets;
+const relation_catalog = @import("antfly_local_sources").system_catalog_domain;
 const metadata_mod = @import("domain.zig");
 const extension_domain = @import("../extensions/mod.zig");
 const metadata_api = @import("api.zig");
@@ -489,6 +490,50 @@ fn replaceTableDefinitionStampedWithReceipt(
     expected: metadata_table_manager.TableRecord,
     replacement: metadata_table_manager.TableRecord,
 ) !metadata_api.CatalogMutationStamp {
+    return replaceTableDefinitionGuardedWithReceipt(service, expected, replacement, null);
+}
+
+/// Cheap admission uses the same bounded point contract as SQL name binding.
+/// It is not authority to commit: native apply repeats the exact owner/binding
+/// check in the replacing transaction. Never retain a group-wide revision CAS.
+fn requireRelationMutationOwner(service: anytype, expected: metadata_table_manager.TableRecord, guard: relation_catalog.RelationMutationGuard) !void {
+    return requireRelationMutationOwnerWithContext(service, expected, guard, .{});
+}
+
+fn requireRelationMutationOwnerWithContext(service: anytype, expected: metadata_table_manager.TableRecord, guard: relation_catalog.RelationMutationGuard, context: api_operation.RequestContext) !void {
+    try context.ensureActive();
+    try guard.validate();
+    if (guard.owner.table_id != expected.table_id) return error.InvalidCatalogMutation;
+    try service.ensureLinearizableReadWithContext(context);
+    const store = service.projectedStore() orelse return error.MissingMetadataStore;
+    const request: relation_catalog.ResolveMany = .{ .relations = &.{guard.target} };
+    const resolved = try store.resolveSystemCatalogIdentities(service.alloc, service.metadata_group_id, request);
+    defer resolved.deinit(service.alloc);
+    try context.ensureActive();
+    try resolved.validateRelations(request);
+    const owner = resolved.relations[0] orelse return error.CatalogGenerationChanged;
+    if (!std.mem.eql(u8, &resolved.relation_epoch.?.incarnation, &guard.incarnation) or
+        !owner.owner.eql(guard.owner) or !std.mem.eql(u8, owner.logical_table, guard.logical_table) or
+        !std.mem.eql(u8, owner.table.name, expected.name)) return error.CatalogGenerationChanged;
+}
+
+fn replaceTableDefinitionGuardedWithReceipt(
+    service: anytype,
+    expected: metadata_table_manager.TableRecord,
+    replacement: metadata_table_manager.TableRecord,
+    relation_guard: ?relation_catalog.RelationMutationGuard,
+) !metadata_api.CatalogMutationStamp {
+    return replaceTableDefinitionGuardedWithContextReceipt(service, expected, replacement, relation_guard, .{});
+}
+
+fn replaceTableDefinitionGuardedWithContextReceipt(
+    service: anytype,
+    expected: metadata_table_manager.TableRecord,
+    replacement: metadata_table_manager.TableRecord,
+    relation_guard: ?relation_catalog.RelationMutationGuard,
+    context: api_operation.RequestContext,
+) !metadata_api.CatalogMutationStamp {
+    try context.ensureActive();
     if (expected.table_id == 0 or
         replacement.table_id != expected.table_id or
         !std.mem.eql(u8, replacement.name, expected.name))
@@ -496,7 +541,7 @@ fn replaceTableDefinitionStampedWithReceipt(
     const store = service.projectedStore() orelse return error.MissingMetadataStore;
     if (comptime @TypeOf(service.*) == MetadataService or @TypeOf(service.*) == MetadataHttpService) {
         if (replacement.lake_index_catalog_json.len != 0 or expected.lake_index_catalog_json.len != 0) {
-            try service.ensureLinearizableRead();
+            try service.ensureLinearizableReadWithContext(context);
             var arena = std.heap.ArenaAllocator.init(service.alloc);
             defer arena.deinit();
             const a = arena.allocator();
@@ -515,7 +560,7 @@ fn replaceTableDefinitionStampedWithReceipt(
         // relational index/schema DDL before proposing a metadata mutation;
         // apply repeats the guard at its authoritative table-record writer.
         if (comptime @TypeOf(service.*) == MetadataService or @TypeOf(service.*) == MetadataHttpService) {
-            try service.ensureLinearizableRead();
+            try service.ensureLinearizableReadWithContext(context);
             try store.requirePolicyIndexMutationAllowed(service.metadata_group_id, expected.table_id);
         }
     }
@@ -526,12 +571,14 @@ fn replaceTableDefinitionStampedWithReceipt(
     if (baseline_fence.active()) return error.TableTransitionActive;
     const metadata_incarnation = (try service.metadataIncarnation()) orelse
         return error.MissingMetadataIncarnation;
+    try context.ensureActive();
     const receipt = try service.proposeTransitionCommandWithReceipt(.{ .compare_and_replace_table = .{
         .expected = expected,
         .replacement = replacement,
+        .relation_guard = relation_guard,
     } });
 
-    service.waitForTransitionApplied(receipt) catch |err| {
+    service.waitForTransitionAppliedWithContext(receipt, context) catch |err| {
         std.log.warn(
             "table definition mutation outcome became ambiguous after admission table={s} table_id={} term={} index={} err={s}",
             .{ expected.name, expected.table_id, receipt.term, receipt.index, @errorName(err) },
@@ -576,6 +623,73 @@ fn replaceTableDefinitionStampedWithReceipt(
     return error.MetadataMutationOutcomeUnknown;
 }
 
+test "relation mutation admission uses exact point ownership without source revision serialization" {
+    const a = std.testing.allocator;
+    const expected: metadata_table_manager.TableRecord = .{ .table_id = 7, .name = "physical" };
+    const guard: relation_catalog.RelationMutationGuard = .{ .target = .{ .name = "idx" }, .logical_table = "logical", .owner = .{ .table_id = 7, .schema_version = 1, .schema_digest = @splat(1), .kind = .index }, .incarnation = @splat(1) };
+    const FakeStore = struct {
+        current: ?relation_catalog.ResolvedRelation = .{ .owner = guard.owner, .table = .{ .table_id = 7, .name = "physical" }, .logical_table = "logical" },
+        revision: u64 = 10,
+        incarnation: [16]u8 = @splat(1),
+        attested: bool = true,
+        calls: usize = 0,
+        fn resolveSystemCatalogIdentities(self: *@This(), alloc: std.mem.Allocator, _: u64, request: relation_catalog.ResolveMany) !relation_catalog.ResolvedMany {
+            self.calls += 1;
+            try std.testing.expectEqual(@as(usize, 1), request.relations.len);
+            try std.testing.expectEqualStrings("idx", request.relations[0].name);
+            try std.testing.expect(!request.include_query_definitions);
+            try std.testing.expect(request.expected_revision == null and request.expected_relation_epoch == null);
+            const relations = try alloc.alloc(?relation_catalog.ResolvedRelation, 1);
+            errdefer alloc.free(relations);
+            relations[0] = null;
+            if (self.current) |current| {
+                const table = try current.table.clone(alloc);
+                errdefer table.deinit(alloc);
+                relations[0] = .{ .owner = current.owner, .table = table, .logical_table = try alloc.dupe(u8, current.logical_table) };
+            }
+            return .{ .revision = self.revision, .tables = &.{}, .relations = relations, .relation_epoch = if (self.attested) .{ .revision = self.revision, .incarnation = self.incarnation } else null };
+        }
+    };
+    const FakeService = struct {
+        alloc: std.mem.Allocator = a,
+        metadata_group_id: u64 = 21,
+        store: FakeStore = .{},
+        reads: usize = 0,
+        fn projectedStore(self: *@This()) ?*FakeStore {
+            return &self.store;
+        }
+        fn ensureLinearizableReadWithContext(self: *@This(), context: api_operation.RequestContext) !void {
+            try context.ensureActive();
+            self.reads += 1;
+        }
+    };
+    var service: FakeService = .{};
+    try requireRelationMutationOwner(&service, expected, guard);
+    try std.testing.expectEqual(@as(usize, 1), service.reads);
+    try std.testing.expectEqual(@as(usize, 1), service.store.calls);
+    try std.testing.expectError(error.DeadlineExceeded, requireRelationMutationOwnerWithContext(&service, expected, guard, .{ .deadline_ns = 0 }));
+    try std.testing.expectEqual(@as(usize, 1), service.reads);
+    service.store.revision = 999;
+    try requireRelationMutationOwner(&service, expected, guard);
+    service.store.incarnation[0] ^= 1;
+    try std.testing.expectError(error.CatalogGenerationChanged, requireRelationMutationOwner(&service, expected, guard));
+    service.store.incarnation = guard.incarnation;
+    service.store.current.?.logical_table = "renamed";
+    try std.testing.expectError(error.CatalogGenerationChanged, requireRelationMutationOwner(&service, expected, guard));
+    service.store.current.?.logical_table = guard.logical_table;
+    service.store.current.?.table.name = "different_physical";
+    try std.testing.expectError(error.CatalogGenerationChanged, requireRelationMutationOwner(&service, expected, guard));
+    service.store.current.?.table.name = expected.name;
+    service.store.current.?.owner.schema_version += 1;
+    try std.testing.expectError(error.CatalogGenerationChanged, requireRelationMutationOwner(&service, expected, guard));
+    service.store.current.?.owner = guard.owner;
+    service.store.attested = false;
+    try std.testing.expectError(error.TableTopologyUpgradeRequired, requireRelationMutationOwner(&service, expected, guard));
+    service.store.attested = true;
+    service.store.current = null;
+    try std.testing.expectError(error.CatalogGenerationChanged, requireRelationMutationOwner(&service, expected, guard));
+}
+
 test "table definition stamp distinguishes rejection from post-admission ambiguity" {
     const FakeStore = struct {
         current: metadata_table_manager.TableRecord,
@@ -606,6 +720,8 @@ test "table definition stamp distinguishes rejection from post-admission ambigui
         proposal_error: ?anyerror = null,
         wait_error: ?anyerror = null,
         wait_calls: usize = 0,
+        proposed_guard: ?relation_catalog.RelationMutationGuard = null,
+        wait_deadline: ?u64 = null,
 
         pub fn projectedStore(self: *@This()) ?*FakeStore {
             return &self.store;
@@ -617,9 +733,10 @@ test "table definition stamp distinguishes rejection from post-admission ambigui
 
         pub fn proposeTransitionCommandWithReceipt(
             self: *@This(),
-            _: metadata_storage.TransitionCommand,
+            command: metadata_storage.TransitionCommand,
         ) !MetadataProposalReceipt {
             if (self.proposal_error) |err| return err;
+            self.proposed_guard = command.compare_and_replace_table.relation_guard;
             return .{ .term = 7, .index = 19 };
         }
 
@@ -628,6 +745,12 @@ test "table definition stamp distinguishes rejection from post-admission ambigui
             try std.testing.expectEqual(@as(u64, 19), receipt.index);
             self.wait_calls += 1;
             if (self.wait_error) |err| return err;
+        }
+
+        pub fn waitForTransitionAppliedWithContext(self: *@This(), receipt: MetadataProposalReceipt, context: api_operation.RequestContext) !void {
+            self.wait_deadline = context.deadline_ns;
+            try context.ensureActive();
+            return self.waitForTransitionApplied(receipt);
         }
     };
 
@@ -654,6 +777,8 @@ test "table definition stamp distinguishes rejection from post-admission ambigui
     const ambiguous_errors = [_]anyerror{
         error.NotLeader,
         error.MetadataProposalApplyTimeout,
+        error.Canceled,
+        error.DeadlineExceeded,
     };
     for (ambiguous_errors) |wait_error| {
         var ambiguous: FakeService = .{
@@ -689,6 +814,19 @@ test "table definition stamp distinguishes rejection from post-admission ambigui
     );
     try std.testing.expectEqual(@as(usize, 1), superseded.wait_calls);
     try std.testing.expectEqual(@as(usize, 1), superseded.store.reads);
+    const guard: relation_catalog.RelationMutationGuard = .{ .target = .{ .name = "idx" }, .logical_table = "logical", .owner = .{ .table_id = expected.table_id, .schema_version = 1, .schema_digest = @splat(1), .kind = .index }, .incarnation = @splat(1) };
+    const guarded_stamp = try replaceTableDefinitionGuardedWithReceipt(&committed, expected, replacement, guard);
+    try std.testing.expectEqual(@as(u64, 19), guarded_stamp.index);
+    try std.testing.expect(committed.proposed_guard.?.owner.eql(guard.owner));
+    try std.testing.expectEqualStrings(guard.logical_table, committed.proposed_guard.?.logical_table);
+    const deadline = std.math.maxInt(u64);
+    _ = try replaceTableDefinitionGuardedWithContextReceipt(&committed, expected, replacement, guard, .{ .deadline_ns = deadline });
+    try std.testing.expectEqual(deadline, committed.wait_deadline.?);
+    var canceled_before_admission: FakeService = .{ .alloc = std.testing.allocator, .store = .{ .current = expected } };
+    try std.testing.expectError(error.DeadlineExceeded, replaceTableDefinitionGuardedWithContextReceipt(&canceled_before_admission, expected, replacement, guard, .{ .deadline_ns = 0 }));
+    try std.testing.expect(canceled_before_admission.proposed_guard == null);
+    committed.wait_error = error.NotLeader;
+    try std.testing.expectError(error.MetadataMutationOutcomeUnknown, replaceTableDefinitionGuardedWithReceipt(&committed, expected, replacement, guard));
 }
 
 /// A compact drop command derived from one coherent storage read transaction.
@@ -6607,6 +6745,16 @@ pub const MetadataService = struct {
         return replaceTableDefinitionStampedWithReceipt(self, expected, replacement);
     }
 
+    pub fn replaceRelationTableDefinitionStamped(self: *MetadataService, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord, guard: relation_catalog.RelationMutationGuard) !metadata_api.CatalogMutationStamp {
+        return self.replaceRelationTableDefinitionStampedWithContext(.{}, expected, replacement, guard);
+    }
+
+    pub fn replaceRelationTableDefinitionStampedWithContext(self: *MetadataService, context: api_operation.RequestContext, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord, guard: relation_catalog.RelationMutationGuard) !metadata_api.CatalogMutationStamp {
+        try requireRelationMutationOwnerWithContext(self, expected, guard, context);
+        try ensureCoordinatedDecoderWithContext(self, .{ .compare_and_replace_table = .{ .expected = expected, .replacement = replacement, .relation_guard = guard } }, context);
+        return replaceTableDefinitionGuardedWithContextReceipt(self, expected, replacement, guard, context);
+    }
+
     pub fn removeTable(self: *MetadataService, table_id: u64) !void {
         const store = self.projectedStore() orelse return error.MissingMetadataStore;
         const baseline_fence = try store.getTableTransitionFence(
@@ -9636,6 +9784,16 @@ pub const MetadataHttpService = struct {
         replacement: metadata_table_manager.TableRecord,
     ) !metadata_api.CatalogMutationStamp {
         return replaceTableDefinitionStampedWithReceipt(self, expected, replacement);
+    }
+
+    pub fn replaceRelationTableDefinitionStamped(self: *MetadataHttpService, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord, guard: relation_catalog.RelationMutationGuard) !metadata_api.CatalogMutationStamp {
+        return self.replaceRelationTableDefinitionStampedWithContext(.{}, expected, replacement, guard);
+    }
+
+    pub fn replaceRelationTableDefinitionStampedWithContext(self: *MetadataHttpService, context: api_operation.RequestContext, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord, guard: relation_catalog.RelationMutationGuard) !metadata_api.CatalogMutationStamp {
+        try requireRelationMutationOwnerWithContext(self, expected, guard, context);
+        try ensureCoordinatedDecoderWithContext(self, .{ .compare_and_replace_table = .{ .expected = expected, .replacement = replacement, .relation_guard = guard } }, context);
+        return replaceTableDefinitionGuardedWithContextReceipt(self, expected, replacement, guard, context);
     }
 
     pub fn removeTable(self: *MetadataHttpService, table_id: u64) !void {
@@ -18649,7 +18807,10 @@ test "relation reconciliation worker HTTP capability observation does not append
     // preceding probe-only cohort cannot certify that this commit happened.
     _ = try svc.ensureTableTopologyProtocolReadyWithContext(.{}, metadata_topology_protocol.relation_publication_version);
     const activated = (try store.topologyActivation(group)).?;
-    try std.testing.expectEqual(metadata_topology_protocol.relation_publication_version, activated.version);
+    // This fixture's sole voter advertises the current decoder. Admission
+    // durably activates the highest unanimous version, not only the minimum
+    // capability requested by this older publication operation.
+    try std.testing.expectEqual(metadata_topology_protocol.current_version, activated.version);
     try std.testing.expect(svc.raft.host.http_host.host.raftStatus(group).?.applied_index > before);
 }
 

@@ -2281,10 +2281,26 @@ replacements retain their previous wire tag. Guard decoding is capped at 8 KiB,
 rejects trailing bytes and uses owned parsing/cloning rather than leaking partial
 JSON allocations. All 37 native relation-store tests pass, including rename
 races, mixed activation floors, exact wire round trips, every truncation and
-exhaustive allocation faults. The proposal-layer mixed-member gate is still
-running. Public index lowering, scoped SQL authorization/search-path binding,
+exhaustive allocation faults. The proposal-layer mixed-member gate completes
+all 50 build steps and all 18 tests. Its probe-only HTTP fixture now asserts
+activation at the highest unanimous decoder version rather than pinning an
+older publication floor. Public index lowering, scoped SQL authorization/search-path binding,
 bootstrap and exact admitted-result handling remain unfinished; this internal
 fence receives no original-case credit.
+The metadata services now also expose guarded replacement internally. Admission
+performs one linearizable, definition-free relation point lookup and compares
+the exact active owner, logical/physical binding and incarnation; unrelated
+source revisions are intentionally not preconditions. The guard survives into
+the proposed native command. Receipt observation retains the existing
+non-retryable ambiguity semantics after admission and never tries to resolve
+the removed index name after a successful drop. The service point-read and
+guarded-receipt gate passes all 20 tests and 50 build steps. The context-aware
+follow-up carries request deadlines through linearizable admission, capability
+activation and receipt waiting, checks activity before proposal, and maps
+post-admission cancellation/deadline failures to outcome-unknown. The final
+context-aware cut passes all 20 tests and 50 build steps, including deadline
+propagation and before/after-admission failure semantics. Public SQL transport
+is not yet wired and no additional original cases are credited.
 The first standalone gate exposed missing storage-owner cleanup symbols in its
 unlinked test composition. Its catalog tests now use a dedicated module linked
 to the production ABI providers, without changing unrelated restore roots or
