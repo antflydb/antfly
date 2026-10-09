@@ -112860,12 +112860,18 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
             .enabled = true,
             .max_pending_segments = 0,
             .resume_pending_segments = 0,
-            .max_pending_bytes = 1,
+            .max_pending_bytes = before.pending_heap_bytes + 1,
             .backpressure_max_wait_ms = 3,
         },
     );
     try byte_only_runtime.start();
+    // A disk-backed corpus can exceed the byte watermark while a merge is
+    // pending. Its retained bytes must not block a publication that fits the
+    // remaining heap budget, even if that merge cannot finish yet.
+    try std.testing.expect(before.pending_bytes > before.pending_heap_bytes + 1);
+    var byte_permit = try byte_only_runtime.acquireProducerPermit("ft_v1", 0, 1);
     try std.testing.expectError(error.TextMergeBackpressureTimeout, byte_only_runtime.acquireProducerPermit("ft_v1", 0, 1));
+    byte_permit.release();
     byte_only_runtime.deinit();
 
     resources.index_manager.cancelTextMergeTask(&held_task);
@@ -113416,10 +113422,24 @@ test "db text merge producer admission isolates quarantined dimensions" {
         },
     );
     defer byte_runtime.deinit();
+    // Disk-only quarantine cannot strand the heap byte dimension. In-flight
+    // reservations still enforce its cap and release independently of merges.
+    try std.testing.expectEqual(@as(u64, 0), quarantined_stats.pending_heap_bytes);
+    var disk_quarantine_permit = try byte_runtime.acquireProducerPermit("healthy", 0, 1);
     try std.testing.expectError(
-        error.TextMergeBackpressureUnavailable,
+        error.TextMergeBackpressureTimeout,
         byte_runtime.acquireProducerPermit("healthy", 0, 1),
     );
+    disk_quarantine_permit.release();
+    // One oversized publication is allowed when no heap or reservation debt
+    // exists, even above a retained disk corpus. It still excludes a second
+    // producer until its reservation is released.
+    var oversized_disk_permit = try byte_runtime.acquireProducerPermit("healthy", 0, 2);
+    try std.testing.expectError(
+        error.TextMergeBackpressureTimeout,
+        byte_runtime.acquireProducerPermit("healthy", 0, 1),
+    );
+    oversized_disk_permit.release();
 }
 
 test "db text kernel admits natural segments below hard segment limit" {
