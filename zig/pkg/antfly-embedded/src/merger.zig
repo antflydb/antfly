@@ -37,6 +37,11 @@ pub const MergePolicy = struct {
     skew_weight: f64 = 1.0,
     size_weight: f64 = 1.0,
     delete_reclaim_weight: f64 = 2.0,
+    /// Within the segment budget, merge only to reclaim deletions once at
+    /// least this fraction of a window's documents are deleted. Without a
+    /// floor, a single deleted document makes every window eligible and a
+    /// stream of small updates keeps rewriting the whole index.
+    min_reclaim_delete_ratio: f64 = 0.2,
 
     /// Plan a merge: pick the best set of segments to merge.
     /// Returns owned segment indices, or null if no merge is needed.
@@ -94,7 +99,15 @@ pub const MergePolicy = struct {
 
                 const len = offset + 1;
                 if (len < 2) continue;
-                if (segments.len <= self.max_segments_per_tier and !has_candidate_deletions) continue;
+
+                const delete_ratio = if (total_docs == 0)
+                    0.0
+                else
+                    @as(f64, @floatFromInt(total_deleted)) / @as(f64, @floatFromInt(total_docs));
+                if (segments.len <= self.max_segments_per_tier) {
+                    if (!has_candidate_deletions) continue;
+                    if (total_docs > 0 and delete_ratio < self.min_reclaim_delete_ratio) continue;
+                }
 
                 const skew = if (smallest_size == 0)
                     1.0
@@ -104,10 +117,6 @@ pub const MergePolicy = struct {
                     1.0
                 else
                     @as(f64, @floatFromInt(total_size)) / @as(f64, @floatFromInt(self.max_segment_size));
-                const delete_ratio = if (total_docs == 0)
-                    0.0
-                else
-                    @as(f64, @floatFromInt(total_deleted)) / @as(f64, @floatFromInt(total_docs));
                 const floor_bonus: f64 = if (largest_size <= self.floor_segment_size) 0.25 else 0.0;
                 const max_segments_per_tier: usize = @max(@as(usize, 1), @as(usize, self.max_segments_per_tier));
                 const budget_pressure: f64 = if (segments.len > max_segments_per_tier)
