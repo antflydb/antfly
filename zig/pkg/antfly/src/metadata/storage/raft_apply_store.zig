@@ -2848,6 +2848,40 @@ test "system catalog relation namespace transaction journal rejects writes befor
 
 const checkpoint_magic = "AMCKPT\x00\x00";
 const checkpoint_encoded_len = 26;
+// Replica-local installation receipt, not replicated catalog state. Retain
+// only the latest snapshot, independently of later committed-entry watermarks.
+const MetadataSnapshotInstallCut = struct {
+    const magic = "AMSI01";
+    const encoded_len = magic.len + 8 + 8 + 32;
+    index: u64,
+    bytes: u64,
+    digest: [32]u8,
+
+    fn of(index: u64, encoded: []const u8) !@This() {
+        if (index == 0 or encoded.len == 0) return error.InvalidMetadataSnapshot;
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(encoded, &digest, .{});
+        return .{ .index = index, .bytes = encoded.len, .digest = digest };
+    }
+    fn encode(self: @This()) [encoded_len]u8 {
+        var out: [encoded_len]u8 = undefined;
+        @memcpy(out[0..magic.len], magic);
+        std.mem.writeInt(u64, out[magic.len..][0..8], self.index, .big);
+        std.mem.writeInt(u64, out[magic.len + 8 ..][0..8], self.bytes, .big);
+        @memcpy(out[magic.len + 16 ..], &self.digest);
+        return out;
+    }
+    fn decode(encoded: []const u8) !@This() {
+        if (encoded.len != encoded_len or !std.mem.eql(u8, encoded[0..magic.len], magic)) return error.InvalidMetadataSnapshot;
+        const value: @This() = .{
+            .index = std.mem.readInt(u64, encoded[magic.len..][0..8], .big),
+            .bytes = std.mem.readInt(u64, encoded[magic.len + 8 ..][0..8], .big),
+            .digest = encoded[magic.len + 16 ..][0..32].*,
+        };
+        if (value.index == 0 or value.bytes == 0) return error.InvalidMetadataSnapshot;
+        return value;
+    }
+};
 fn encodeMetadataCheckpoint(value: AppliedMetadataCheckpoint) [checkpoint_encoded_len]u8 {
     var bytes: [checkpoint_encoded_len]u8 = undefined;
     std.mem.writeInt(u64, bytes[0..8], value.commit_index, .little);
@@ -16828,6 +16862,17 @@ pub const RaftApplyStore = struct {
         encoded: []const u8,
     ) !void {
         const self: *RaftApplyStore = @ptrCast(@alignCast(ptr));
+        const install_cut = try MetadataSnapshotInstallCut.of(commit_index, encoded);
+        const io = self.io_impl.io();
+        {
+            // An exact retry needs two point reads, no decoding, source scan,
+            // row allocation, writes or repeated listener notifications.
+            self.apply_mutex.lockUncancelable(io);
+            defer self.apply_mutex.unlock(io);
+            var read = try self.store.beginReadTxn();
+            defer read.abort();
+            if (try snapshotInstallAlreadyAppliedTxn(&read, group_id, install_cut)) return;
+        }
         const rows = try decodeMetadataSnapshotAlloc(alloc, encoded);
         defer freeMetadataSnapshotRows(alloc, rows);
         try validateMetadataSnapshotRows(alloc, group_id, rows);
@@ -16866,7 +16911,6 @@ pub const RaftApplyStore = struct {
         };
 
         const checkpoint = AppliedMetadataCheckpoint.fromInput(commit_index, .snapshot, encoded);
-        const io = self.io_impl.io();
         self.apply_mutex.lockUncancelable(io);
         defer self.apply_mutex.unlock(io);
         try self.checkpoints.ensureUnusedCapacity(self.alloc, 1);
@@ -16874,6 +16918,8 @@ pub const RaftApplyStore = struct {
         const existing = blk: {
             var read_txn = try self.store.beginReadTxn();
             defer read_txn.abort();
+            // Preparation ran off-lock. Another install/apply may have won.
+            if (try snapshotInstallAlreadyAppliedTxn(&read_txn, group_id, install_cut)) return;
             if (try stagingGet(&read_txn, source_key)) |bytes| {
                 const revision = incoming_source orelse return error.InvalidMetadataSnapshot;
                 if (revision < try relation_reconciliation.sourceRevision(bytes)) return error.InvalidMetadataSnapshot;
@@ -16923,10 +16969,14 @@ pub const RaftApplyStore = struct {
         var watermark_key_buf: [128]u8 = undefined;
         const watermark_key = try keyForGroup(&watermark_key_buf, group_id);
 
-        const writes = try alloc.alloc(docstore.KVPair, rows.len + 1);
+        var receipt_key_buf: [128]u8 = undefined;
+        const receipt_key = try snapshotInstallKeyForGroup(&receipt_key_buf, group_id);
+        const receipt = install_cut.encode();
+        const writes = try alloc.alloc(docstore.KVPair, rows.len + 2);
         defer alloc.free(writes);
         for (rows, 0..) |row, i| writes[i] = .{ .key = row.key, .value = row.value };
         writes[rows.len] = .{ .key = watermark_key, .value = &watermark };
+        writes[rows.len + 1] = .{ .key = receipt_key, .value = &receipt };
         const deletes = try alloc.alloc([]const u8, existing.len + derived_existing.len);
         defer alloc.free(deletes);
         for (existing, 0..) |row, i| deletes[i] = row.key;
@@ -17281,6 +17331,27 @@ pub const RaftApplyStore = struct {
 
     fn keyForGroup(buf: []u8, group_id: u64) ![]const u8 {
         return try std.fmt.bufPrint(buf, "\x00\x00__metadata__:metadata_raft_apply:{d}", .{group_id});
+    }
+
+    fn snapshotInstallKeyForGroup(buf: []u8, group_id: u64) ![]const u8 {
+        return std.fmt.bufPrint(buf, "\x00\x00__metadata__:metadata_snapshot_install:{d}", .{group_id});
+    }
+
+    fn snapshotInstallAlreadyAppliedTxn(txn: *docstore.DocStore.Txn, group: u64, expected: MetadataSnapshotInstallCut) !bool {
+        const applied = try durableAppliedIndexTxn(txn, group);
+        var buf: [128]u8 = undefined;
+        if (try stagingGet(txn, try snapshotInstallKeyForGroup(&buf, group))) |bytes| {
+            const prior = try MetadataSnapshotInstallCut.decode(bytes);
+            if (prior.index > applied) return error.InvalidMetadataSnapshot;
+            if (prior.index == expected.index) {
+                if (!std.meta.eql(prior, expected)) return error.InvalidMetadataSnapshot;
+                return true;
+            }
+        }
+        // Never roll back a later committed prefix. An equal index without an
+        // installation receipt cannot authenticate a different snapshot cut.
+        if (applied >= expected.index) return error.InvalidMetadataSnapshot;
+        return false;
     }
 
     fn outcomeChangesCatalog(signals: []const OwnedProjectionSignal) bool {
@@ -35670,6 +35741,171 @@ test "system catalog report pages keep stable slots and bound sparse rewrites ac
     }
 }
 
+test "metadata raft apply store snapshot installation receipts fence retries and retain completed prefixes after restart" {
+    const a = std.testing.allocator;
+    const group: u64 = 41;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/snapshot-retry", .{tmp.sub_path});
+    defer a.free(path);
+    var store = try RaftApplyStore.init(a, .{ .root_dir = path });
+    defer store.deinit();
+    try store.applyStandaloneCommand(group, .{ .upsert_table = .{ .table_id = 8, .name = "before", .schema_json = "{}" } });
+    const snapshot = try store.snapshotBuilder().buildSnapshot(a, group);
+    defer a.free(snapshot);
+    const Capture = struct {
+        projections: usize = 0,
+        keys: usize = 0,
+        reads: usize = 0,
+        applies: usize = 0,
+        fn projection(ptr: *anyopaque, _: ProjectionSignal) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.projections += 1;
+        }
+        fn matches(_: *anyopaque, _: CommittedKeySignal) bool {
+            return true;
+        }
+        fn key(ptr: *anyopaque, _: CommittedKeySignal) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.keys += 1;
+        }
+        fn applied(ptr: *anyopaque, actual_group: u64, index: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(group, actual_group);
+            try std.testing.expectEqual(@as(u64, 11), index);
+            self.applies += 1;
+        }
+    };
+    var capture: Capture = .{};
+    try store.addProjectionListener(.{ .ptr = &capture, .vtable = &.{ .on_projection_signal = Capture.projection } });
+    try store.addCommittedKeyListener(.{ .ptr = &capture, .vtable = &.{ .matches_key = Capture.matches, .on_committed_key = Capture.key } });
+    const Fault = struct {
+        fn run(alloc: std.mem.Allocator, encoded: []const u8) !void {
+            // The fault runner first performs a successful baseline. Every
+            // numbered trial needs a fresh receiver, not its installed receipt.
+            var trial = std.testing.tmpDir(.{});
+            defer trial.cleanup();
+            const trial_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/receiver", .{trial.sub_path});
+            defer std.testing.allocator.free(trial_path);
+            var owner = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = trial_path });
+            defer owner.deinit();
+            var observed: Capture = .{};
+            try owner.addProjectionListener(.{ .ptr = &observed, .vtable = &.{ .on_projection_signal = Capture.projection } });
+            try owner.addCommittedKeyListener(.{ .ptr = &observed, .vtable = &.{ .matches_key = Capture.matches, .on_committed_key = Capture.key } });
+            RaftApplyStore.installSnapshotFromRaft(&owner, alloc, group, 10, encoded) catch |err| {
+                try std.testing.expectEqual(@as(u64, 0), try owner.durableAppliedIndex(group));
+                var read = try owner.store.beginReadTxn();
+                defer read.abort();
+                var buf: [128]u8 = undefined;
+                try std.testing.expect((try RaftApplyStore.stagingGet(&read, try RaftApplyStore.snapshotInstallKeyForGroup(&buf, group))) == null);
+                try std.testing.expectEqual(@as(usize, 0), observed.projections + observed.keys);
+                return err;
+            };
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Fault.run, .{snapshot});
+    try RaftApplyStore.installSnapshotFromRaft(&store, a, group, 10, snapshot);
+    try std.testing.expect(capture.projections != 0 and capture.keys != 0);
+    capture = .{};
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    try RaftApplyStore.installSnapshotFromRaft(&store, failing.allocator(), group, 10, snapshot);
+    try std.testing.expectEqual(@as(usize, 0), capture.projections);
+    try std.testing.expectEqual(@as(usize, 0), capture.keys);
+    const Host = struct {
+        store: *RaftApplyStore,
+        capture: *Capture,
+        pages: usize = 3,
+        fn build(ptr: *anyopaque, alloc: std.mem.Allocator, id: u64) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.store.snapshotBuilder().buildSnapshot(alloc, id);
+        }
+        fn install(ptr: *anyopaque, alloc: std.mem.Allocator, id: u64, index: u64, bytes: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try RaftApplyStore.installSnapshotFromRaft(self.store, alloc, id, index, bytes);
+        }
+        fn apply(ptr: *anyopaque, batch: raft_state_machine.ApplyBatch) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.pages != 0) {
+                self.pages -= 1;
+                return error.CatalogPublicationProofPending;
+            }
+            try self.store.snapshotBuilder().applyBatch(batch);
+        }
+        fn retry(_: *anyopaque, _: u64, err: anyerror) bool {
+            return err == error.CatalogPublicationProofPending;
+        }
+        fn delegate(ptr: *anyopaque, _: u64, _: ?raft_engine.core.types.Snapshot, _: []const raft_engine.core.Entry, reads: []const raft_engine.core.ReadState) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(@as(u64, 11), try self.store.durableAppliedIndex(group));
+            self.capture.reads += reads.len;
+        }
+    };
+    var host: Host = .{ .store = &store, .capture = &capture };
+    var machine: raft_state_machine.MetadataStateMachine = .{
+        .alloc = a,
+        .snapshot_builder = .{ .ptr = &host, .vtable = &.{ .build_snapshot = Host.build, .install_snapshot = Host.install, .apply_batch = Host.apply, .is_apply_retryable = Host.retry } },
+        .applied_sink = .{ .ptr = &capture, .vtable = &.{ .set_applied_index = Capture.applied } },
+        .delegate = .{ .ptr = &host, .vtable = &.{ .apply_ready = Host.delegate } },
+    };
+    const command = try encodeTransitionCommand(a, .{ .upsert_table = .{ .table_id = 8, .name = "after", .schema_json = "{}" } });
+    defer a.free(command);
+    const incoming: raft_engine.core.types.Snapshot = .{ .metadata = .{ .index = 10, .term = 1 }, .data = @constCast(snapshot) };
+    const entries = [_]raft_engine.core.Entry{.{ .index = 11, .term = 1, .data = command }};
+    const reads = [_]raft_engine.core.ReadState{.{ .index = 11, .request_ctx = @constCast("reader") }};
+    for (0..3) |_| {
+        try std.testing.expectError(error.CatalogPublicationProofPending, machine.stateMachine().applyReady(group, incoming, &entries, &reads));
+        try std.testing.expectEqual(@as(u64, 10), try store.durableAppliedIndex(group));
+        try std.testing.expectEqual(@as(usize, 0), capture.projections + capture.keys + capture.reads + capture.applies);
+    }
+    try machine.stateMachine().applyReady(group, incoming, &entries, &reads);
+    try std.testing.expectEqual(@as(usize, 1), capture.applies);
+    try std.testing.expectEqual(@as(usize, 1), capture.reads);
+    capture = .{};
+    try RaftApplyStore.installSnapshotFromRaft(&store, failing.allocator(), group, 10, snapshot);
+    try std.testing.expectEqual(@as(u64, 11), try store.durableAppliedIndex(group));
+    const after = (try store.getTable(a, group, 8)).?;
+    defer metadata_table_manager.freeTable(a, after);
+    try std.testing.expectEqualStrings("after", after.name);
+    try std.testing.expectEqual(@as(usize, 0), capture.projections + capture.keys);
+    const changed = try a.dupe(u8, snapshot);
+    defer a.free(changed);
+    changed[changed.len - 1] ^= 1;
+    try std.testing.expectError(error.InvalidMetadataSnapshot, RaftApplyStore.installSnapshotFromRaft(&store, failing.allocator(), group, 10, changed));
+    try std.testing.expectError(error.InvalidMetadataSnapshot, RaftApplyStore.installSnapshotFromRaft(&store, a, group, 9, snapshot));
+    const current = try store.snapshotBuilder().buildSnapshot(a, group);
+    defer a.free(current);
+    var receipt_buf: [128]u8 = undefined;
+    const receipt_key = try RaftApplyStore.snapshotInstallKeyForGroup(&receipt_buf, group);
+    const rows = try decodeMetadataSnapshotAlloc(a, current);
+    defer freeMetadataSnapshotRows(a, rows);
+    for (rows) |row| try std.testing.expect(!std.mem.eql(u8, row.key, receipt_key));
+    try RaftApplyStore.installSnapshotFromRaft(&store, a, group, 12, current);
+    store.deinit();
+    store = try RaftApplyStore.init(a, .{ .root_dir = path });
+    try RaftApplyStore.installSnapshotFromRaft(&store, failing.allocator(), group, 12, current);
+    try std.testing.expectEqual(@as(u64, 12), try store.durableAppliedIndex(group));
+    try std.testing.expectError(error.InvalidMetadataSnapshot, RaftApplyStore.installSnapshotFromRaft(&store, a, group, 10, snapshot));
+    const receipt = try store.store.get(a, receipt_key);
+    defer a.free(receipt);
+    for (0..6) |fault| {
+        var corrupt: [MetadataSnapshotInstallCut.encoded_len]u8 = undefined;
+        @memcpy(&corrupt, receipt);
+        switch (fault) {
+            0 => corrupt[0] ^= 1,
+            1 => @memset(corrupt[MetadataSnapshotInstallCut.magic.len..][0..8], 0),
+            2 => @memset(corrupt[MetadataSnapshotInstallCut.magic.len + 8 ..][0..8], 0),
+            3 => std.mem.writeInt(u64, corrupt[MetadataSnapshotInstallCut.magic.len..][0..8], 99, .big),
+            4 => corrupt[corrupt.len - 1] ^= 1,
+            5 => {},
+            else => unreachable,
+        }
+        try store.store.put(receipt_key, if (fault == 5) corrupt[0 .. corrupt.len - 1] else &corrupt);
+        try std.testing.expectError(error.InvalidMetadataSnapshot, RaftApplyStore.installSnapshotFromRaft(&store, a, group, 12, current));
+        try std.testing.expectEqual(@as(u64, 12), try store.durableAppliedIndex(group));
+    }
+    try store.store.put(receipt_key, receipt);
+}
+
 test "metadata raft apply store checkpoints validate format and import legacy watermarks" {
     const alloc = std.testing.allocator;
     const expected = AppliedMetadataCheckpoint.fromInput(13, .committed_entries, "legacy-batch");
@@ -35845,11 +36081,13 @@ test "system catalog runtime references preserve observations and reject stale g
     // Logical snapshots preserve enough state for the same fenced reference
     // after installation; no process-local acknowledgement is authoritative.
     const snapshot = try store.snapshotBuilder().buildSnapshot(a, 21);
-    try std.testing.expect(try store.snapshotBuilder().installSnapshot(a, 21, 1, snapshot));
-    try store.ensureDerivedCatalogIndexes(21);
+    var receiver = try RaftApplyStore.init(alloc, .{ .root_dir = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/runtime-reference-receiver", .{tmp.sub_path}) });
+    defer receiver.deinit();
+    try std.testing.expect(try receiver.snapshotBuilder().installSnapshot(a, 21, 1, snapshot));
+    try receiver.ensureDerivedCatalogIndexes(21);
     const restored_entries = try raft_state_machine.encodeCommittedEntries(a, &.{.{ .term = 1, .index = 2, .entry_type = .normal, .data = encoded }});
-    try store.snapshotBuilder().applyBatch(.{ .group_id = 21, .commit_index = 2, .entries_bytes = restored_entries });
-    current = (try store.listStores(a, 21))[0];
+    try receiver.snapshotBuilder().applyBatch(.{ .group_id = 21, .commit_index = 2, .entries_bytes = restored_entries });
+    current = (try receiver.listStores(a, 21))[0];
     try std.testing.expectEqual(@as(u64, 123), current.runtime_statuses[0].updated_at_ns);
 }
 

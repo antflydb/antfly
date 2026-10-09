@@ -3692,6 +3692,37 @@ test "opaque metadata relation reconciliation work retains owned cuts across pro
     try std.testing.expect(std.meta.eql(expected, try recovered.relationReconciliationWork(group)));
 }
 
+test "opaque metadata snapshot retries retain later committed prefix across reopen" {
+    const a = std.testing.allocator;
+    const group: u64 = 41;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(path);
+    var store = try metadata_apply_client.RaftApplyStore.init(a, .{ .root_dir = path, .no_sync = true });
+    defer store.deinit();
+    try store.applyStandaloneCommand(group, .{ .upsert_table = .{ .table_id = 8, .name = "before", .schema_json = "{}" } });
+    const snapshot = try store.snapshotBuilder().buildSnapshot(a, group);
+    defer a.free(snapshot);
+    try std.testing.expect(try store.snapshotBuilder().installSnapshot(a, group, 11, snapshot));
+    try store.snapshotBuilder().applyBatch(.{ .group_id = group, .commit_index = 12, .entries_bytes = "completed-prefix" });
+    try store.applyStandaloneCommand(group, .{ .upsert_table = .{ .table_id = 8, .name = "after", .schema_json = "{}" } });
+    try std.testing.expect(try store.snapshotBuilder().installSnapshot(a, group, 11, snapshot));
+    store.deinit();
+    store = try metadata_apply_client.RaftApplyStore.init(a, .{ .root_dir = path, .no_sync = true });
+    try std.testing.expect(try store.snapshotBuilder().installSnapshot(a, group, 11, snapshot));
+    try std.testing.expectEqual(@as(u64, 12), (try store.latestCheckpoint(group)).?.commit_index);
+    const table = (try store.getTable(a, group, 8)).?;
+    defer @import("../metadata/table_manager.zig").freeTable(a, table);
+    try std.testing.expectEqualStrings("after", table.name);
+    const changed = try a.dupe(u8, snapshot);
+    defer a.free(changed);
+    changed[changed.len - 1] ^= 1;
+    try std.testing.expectError(error.InvalidMetadataSnapshot, store.snapshotBuilder().installSnapshot(a, group, 11, changed));
+    try std.testing.expectError(error.InvalidMetadataSnapshot, store.snapshotBuilder().installSnapshot(a, group, 12, snapshot));
+    try std.testing.expectEqual(@as(u64, 12), (try store.latestCheckpoint(group)).?.commit_index);
+}
+
 test "opaque metadata apply owner preserves semantic error identity" {
     const path = "/tmp/antfly-storage-kernel-metadata-errors";
     cleanup(path);

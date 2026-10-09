@@ -2095,6 +2095,30 @@ owner regression, with no failures or leaks. Runtime error transport passes
 tests, and the released storage-status identity fingerprint is unchanged.
 Inventory integrity, control-source catalog, formatting and whitespace gates
 pass; the original 475/136/73/902 dispositions remain unchanged.
+Native metadata snapshot retries now use a replica-local installation receipt
+(`AMSI01`): one fixed-size record per group carrying the installed Raft index,
+byte length and SHA-256 of the accepted bytes. The receipt and snapshot rows
+commit atomically with the applied watermark. Exact retries perform two point
+reads and no decoding, catalog scans, row allocation, writes or repeated
+notifications; hashing the supplied bytes remains linear in input size and
+runs outside the apply lock. The receipt survives later entry commits and
+reopen, so a retried snapshot prefix cannot roll back completed log work.
+Changed bytes at the installed index, corrupt/future receipts, and stale or
+equal-index snapshots without a matching receipt are rejected. Only the latest
+receipt is retained, bounding history storage, and it is deliberately excluded
+from replicated catalog snapshots. A final locked recheck fences concurrent
+apply/installation during off-lock preparation.
+Native tests inject every caller-allocator failure during first installation,
+verify atomic absence of receipt/watermark/notifications on failure, prove
+zero caller allocation on exact retries, and run the actual metadata wrapper
+through three deferred preparation rounds followed by one completed entry/read.
+They cover later-prefix retention, same-length byte substitution, six receipt
+faults, receipt replacement, snapshot exclusion and restart. The opaque-owner
+regression repeats these preservation/fork checks across the compiled ABI and
+reopen. The earlier self-install fixture now restores into a separate receiver
+before replaying its referenced heartbeat, matching actual snapshot transfer.
+This completes native snapshot-prefix retry amortization, not root publication
+or public SQL activation; the original parity dispositions remain unchanged.
 The owned table-cut projector can now combine an exact predecessor definition
 with a plan-fenced successor definition in expected linear time. It retains
 old-only active names, both owners for shared names and pending-only new names,
