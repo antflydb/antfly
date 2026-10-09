@@ -3163,6 +3163,57 @@ pub fn parseEntryAt(raw: []const u8, absolute_offset: usize) !Entry {
     };
 }
 
+/// Bound to one immutable indexed raw block. Dense forward probes walk at most
+/// eight rows before seeking; sparse and backward probes retain binary search.
+/// The caller resets this reader whenever its block owner changes.
+pub const IndexedPointReader = struct {
+    current: ?BorrowedDecoded.PositionedEntry = null,
+    test_parsed_rows: if (@import("builtin").is_test) usize else void = if (@import("builtin").is_test) 0 else {},
+
+    fn at(self: *@This(), index: *const TableIndex, raw: []const u8, block_index: usize, row: usize) !BorrowedDecoded.PositionedEntry {
+        if (@import("builtin").is_test) self.test_parsed_rows += 1;
+        const offset = index.entryStartInBlock(row, block_index) - index.blocks[block_index].relative_offset;
+        return .{ .index = row, .entry = try parseEntryAt(raw, offset) };
+    }
+
+    pub fn find(self: *@This(), index: *const TableIndex, raw: []const u8, block_index: usize, namespace_name: ?[]const u8, key: []const u8) !?BorrowedDecoded.PositionedEntry {
+        errdefer self.current = null;
+        const block = index.blocks[block_index];
+        var lo: usize = block.first_entry_index;
+        var hi: usize = lo + block.entry_count;
+        if (self.current) |current| {
+            switch (compareEntryTo(current.entry, namespace_name, key)) {
+                .eq => return current,
+                .gt => hi = current.index,
+                .lt => {
+                    lo = current.index + 1;
+                    var steps: usize = 0;
+                    while (lo < hi and steps < 8) : (steps += 1) {
+                        const row = try self.at(index, raw, block_index, lo);
+                        self.current = row;
+                        const order = compareEntryTo(row.entry, namespace_name, key);
+                        if (order != .lt) return if (order == .eq) row else null;
+                        lo += 1;
+                    }
+                },
+            }
+        }
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            const row = try self.at(index, raw, block_index, mid);
+            if (compareEntryTo(row.entry, namespace_name, key) == .lt) lo = mid + 1 else hi = mid;
+        }
+        if (lo == block.first_entry_index + block.entry_count) {
+            // Keep the last row, so later misses can avoid another full seek.
+            if (block.entry_count != 0) self.current = try self.at(index, raw, block_index, lo - 1);
+            return null;
+        }
+        const row = try self.at(index, raw, block_index, lo);
+        self.current = row;
+        return if (compareEntryTo(row.entry, namespace_name, key) == .eq) row else null;
+    }
+};
+
 pub fn findExactEntryInBlock(
     index: *const TableIndex,
     raw_block: []const u8,
@@ -4219,4 +4270,42 @@ test "prefix point reader bounds selected results without rejecting skipped valu
     try std.testing.expectEqualStrings("small", found.entry.value);
     try std.testing.expectError(error.InvalidTableFile, reader.find(a, null, "a"));
     try std.testing.expectEqualStrings("small", (try reader.find(a, null, "b")).?.entry.value);
+}
+
+test "indexed point reader adapts dense sparse backwards repeated and missing probes" {
+    const a = std.testing.allocator;
+    var keys: [512][8]u8 = undefined;
+    var entries: [512]Entry = undefined;
+    for (&entries, 0..) |*entry, i| {
+        const key = try std.fmt.bufPrint(&keys[i], "k{d:0>6}", .{i});
+        entry.* = .{ .namespace_name = "docs", .key = key, .value = "v", .tombstone = i % 17 == 0 };
+    }
+    var filter = try buildFilterAlloc(a, &entries, .{});
+    defer filter.deinit(a);
+    const encoded = try encodeWithFilterAllocOptions(a, &entries, filter, .{ .block_compression = .none });
+    defer a.free(encoded);
+    var index = try decodeIndexAlloc(a, encoded);
+    defer index.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), index.blockCount());
+    const window = index.blockWindow(0);
+    const raw = encoded[index.entry_data_start + window.relative_offset ..][0..window.len];
+    var reader: IndexedPointReader = .{};
+    var baseline: IndexedPointReader = .{};
+    for (entries) |entry| {
+        baseline.current = null;
+        const expected = (try baseline.find(&index, raw, 0, "docs", entry.key)).?;
+        const found = (try reader.find(&index, raw, 0, "docs", entry.key)).?;
+        try std.testing.expectEqual(expected.index, found.index);
+        try std.testing.expectEqual(entry.tombstone, found.entry.tombstone);
+    }
+    try std.testing.expect(reader.test_parsed_rows <= entries.len + 16);
+    std.debug.print("\nindexed dense points: keys=512 parsed_rows={d}->{d}\n", .{ baseline.test_parsed_rows, reader.test_parsed_rows });
+    for ([_][]const u8{ "k000255", "k000000", "k000511", "k000511", "k000256x", "k000256", "k999999", "a", "k000007" }) |key| {
+        const oracle = try findExactEntryInBlock(&index, raw, 0, "docs", key);
+        const found = try reader.find(&index, raw, 0, "docs", key);
+        try std.testing.expectEqual(oracle == null, found == null);
+        if (oracle) |row| try std.testing.expectEqual(row.index, found.?.index);
+    }
+    try std.testing.expect(try reader.find(&index, raw, 0, "other", "k000000") == null);
+    try std.testing.expectEqual(@as(usize, 1), (try reader.find(&index, raw, 0, "docs", entries[1].key)).?.index);
 }

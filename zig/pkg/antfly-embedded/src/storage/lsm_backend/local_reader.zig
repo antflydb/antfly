@@ -67,6 +67,8 @@ pub const Pool = struct {
     const Slot = struct {
         busy: bool = false,
         initialized: bool = false,
+        bound_manager: ?*resources.ResourceManager = null,
+        bound_backing: std.mem.Allocator = undefined,
         arena: std.heap.ArenaAllocator = undefined,
         budget: ?resources.BudgetedAllocator = null,
         cap: Capped = .{},
@@ -151,7 +153,19 @@ pub const Pool = struct {
                     self.active_bytes += bytes;
                     self.peak_active_bytes = @max(self.peak_active_bytes, self.active_bytes);
                     if (self.allocator == null) self.allocator = backing;
+                    self.mutex.unlock();
+                    // The busy slot is exclusively owned. Release retained
+                    // credit before rebinding, outside the coordination lock.
+                    if (slot.initialized and (slot.bound_manager != manager or slot.bound_backing.ptr != backing.ptr or slot.bound_backing.vtable != backing.vtable)) {
+                        slot.arena.deinit();
+                        if (slot.budget) |*budget| budget.deinit();
+                        slot.budget = null;
+                        slot.cap = .{};
+                        slot.initialized = false;
+                    }
                     if (!slot.initialized) {
+                        slot.bound_manager = manager;
+                        slot.bound_backing = backing;
                         if (manager) |host| {
                             slot.budget = resources.BudgetedAllocator.init(host, .lsm_read_working_set, backing, 1);
                             slot.budget.?.credit_quantum = 4096;
@@ -161,7 +175,6 @@ pub const Pool = struct {
                         slot.initialized = true;
                     }
                     slot.cap.limit = @max(slot.cap.live, bytes -| output_bytes);
-                    self.mutex.unlock();
                     return .{ .pool = self, .slot = slot, .bytes = bytes };
                 };
             }

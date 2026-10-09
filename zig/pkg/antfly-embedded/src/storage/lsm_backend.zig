@@ -1668,6 +1668,8 @@ pub const Backend = struct {
     run_index_cache: std.ArrayListUnmanaged(CachedRunIndex) = .empty,
     run_block_cache: std.ArrayListUnmanaged(CachedRunBlock) = .empty,
     local_reader: LocalReader = .{},
+    // Independent slots keep shared point batches from blocking local decoders.
+    point_reader: LocalReader = .{},
     run_block_cache_bytes: usize = 0,
     local_block_cache_reclaimer: ?u64 = null,
     local_block_heat: [64]LocalBlockHeat = @splat(.{}),
@@ -26266,9 +26268,9 @@ test "lsm local transient reads preserve hot cache and reuse compressed point sc
         for (0..100) |_| try std.testing.expectEqualStrings(value, try point.get("document:long-shared-prefix-for-compression:01"));
         const extra = budget.alloc_calls - calls;
         std.debug.print("lite transient point scratch probe: 100 reads, backend allocations={d}, encoded loads={d}\n", .{ extra, backend.read_stats.table_block_loads.load(.monotonic) - loads });
-        // Only compact owned point entries allocate; encoded input and prefix
-        // reconstruction/snappy intermediates reuse the bounded workspace.
-        try std.testing.expectEqual(@as(usize, 100), extra);
+        // Point values go directly into their result owner; encoded input and
+        // key/snappy intermediates reuse the bounded decoder workspace.
+        try std.testing.expectEqual(@as(usize, 0), extra);
         const keys = [_][]const u8{ "document:long-shared-prefix-for-compression:00", "document:long-shared-prefix-for-compression:01" };
         var values: [2]?[]const u8 = undefined;
         var scan = try read.openReadScope(a);

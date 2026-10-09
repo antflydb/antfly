@@ -311,5 +311,47 @@
       "Count actual async copies at their copy site, and avoid counting adoption again."
     ],
     "limitations": "Backend allocation counts exclude the result scratch allocator. Payload buffer counts exclude metadata and storage/cache construction. Small packing trades bounded spare capacity for fewer buffers; these Debug fixtures do not establish end-to-end QPS or 2 GiB soak behavior."
+  },
+  "dense_prefix_scratch_followup": {
+    "comparison_commit": "257d6f683d97cac7432bfa7b8d3db6903880444c",
+    "merged_main_commit": "e8a1bfcabc33a3596b8e7ea3b2040e433c5cd8d1",
+    "fixtures": {
+      "local_prefix": {
+        "lookups": 1000,
+        "intermediate_backend_allocations_before": 1000,
+        "intermediate_backend_allocations_after": 0,
+        "owned_payload_buffers_after": 3,
+        "scope": "MemoryStorage, prefix-compressed block, local/global decoded caches disabled, 128 distinct 80-byte keys, one-byte values. Backend allocation counter excludes result allocator. Compare legacy owned-entry decoder with direct-to-result output; metadata/workspace prewarmed."
+      },
+      "dense_indexed_points": {
+        "keys": 512,
+        "parsed_rows_binary_seek_each_key": 5122,
+        "parsed_rows_adaptive": 522,
+        "scope": "One uncompressed indexed block, sorted distinct keys. Test-only row-parse counter; baseline clears cursor per key. Backward, duplicate, sparse, missing and namespace probes checked against the existing binary-search oracle."
+      },
+      "shared_decoded_scratch": {
+        "batches_after_warmup": 100,
+        "decoded_bytes_per_batch": 16384,
+        "unpooled_backend_allocations": 100,
+        "pooled_backend_allocations": 0,
+        "retained_bytes": 24638,
+        "scope": "Synthetic valid Snappy payload; counts decode-buffer allocation requests with and without workspace reuse, excluding payload generation and result copying."
+      },
+      "shared_prefix_scratch": {
+        "batches_after_warmup": 100,
+        "keys_per_batch": 64,
+        "pooled_backend_allocations": 0,
+        "retained_bytes": 2420,
+        "scope": "Prefix-compressed table payload, 80-byte keys; shared decompression and reconstructed-key storage. Allocation-failure inventory uses no-resize allocator."
+      }
+    },
+    "design": [
+      "Emit local prefix point values directly into result-owner packing while preserving existing warm local leases and promotion.",
+      "Bind adaptive row readers to immutable shared block owners. Forward probes walk at most eight rows before binary search; backward probes seek and duplicate probes reuse the current row.",
+      "Acquire shared scratch workspace lazily from an independent four-slot pool. Physical arena capacity is bounded at 768 KiB per active batch; retain at most 64 KiB per idle slot plus arena headers.",
+      "Optional decode and small-key workspace exhaustion falls back to separately admitted mandatory scratch. Large keys retain existing scratch handling. Release shared block readers before resetting workspace.",
+      "Rebind idle workspace backing/manager by releasing old buffers and admission credit outside the coordination lock."
+    ],
+    "limitations": "Debug helper measurements do not establish end-to-end throughput or 2 GiB soak behavior. A batch may wait for one of four workspace slots. Arena non-LIFO churn can exhaust optional pooled capacity and use mandatory scratch; oversized batches may discard/reallocate excess capacity. Retained workspaces remain resource-accounted."
   }
 }

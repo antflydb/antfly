@@ -6447,8 +6447,10 @@ const BatchAsyncBlock = struct {
     decoded: ?[]u8 = null,
     decode_disabled: bool = false,
     checksum_validated: bool = false,
+    raw_reader: lsm_table_file.IndexedPointReader = .{},
     prefix_reader: ?lsm_table_file.PrefixPointReader = null,
     prefix_key_bytes: usize = 0,
+    prefix_allocator: ?Allocator = null,
 };
 
 const BatchAsyncBlocks = struct {
@@ -6457,6 +6459,14 @@ const BatchAsyncBlocks = struct {
     entries: [max_point_async_stack_reads]BatchAsyncBlock = @splat(.{}),
     allocator: Allocator,
     scratch_allocator: ?Allocator = null,
+    workspace: ?LocalReader.Workspace = null,
+    workspace_config: ?struct {
+        pool: *LocalReader,
+        backing: Allocator,
+        manager: ?*@import("../resource_manager.zig").ResourceManager,
+        io: ?std.Io,
+        limit: usize,
+    } = null,
     limit: usize = max_point_async_stack_reads,
     decoded_bytes: usize = 0,
     prefix_key_bytes: usize = 0,
@@ -6465,16 +6475,32 @@ const BatchAsyncBlocks = struct {
         return self.scratch_allocator orelse self.allocator;
     }
 
+    // Acquire lazily: warm decoded reads do not touch the workspace gate.
+    // Arena capacity bounds physical scratch even when non-LIFO frees cannot
+    // reclaim idle decodes. Optional decode exhaustion uses ordinary scratch.
+    fn reusableAllocator(self: *@This()) Allocator {
+        if (self.workspace_config) |config| {
+            if (self.workspace == null) self.workspace = config.pool.acquire(config.backing, config.manager, config.io, 3 * max_decoded_bytes, config.limit, 0);
+            return self.workspace.?.allocator();
+        }
+        return self.allocator;
+    }
+
+    fn prefixAllocator(self: *@This(), entry: *BatchAsyncBlock) Allocator {
+        return entry.prefix_allocator orelse self.scratchAllocator();
+    }
+
     fn clearPrefixReader(self: *@This(), entry: *BatchAsyncBlock) void {
-        if (entry.prefix_reader) |*reader| reader.deinit(self.scratchAllocator());
+        if (entry.prefix_reader) |*reader| reader.deinit(self.prefixAllocator(entry));
         entry.prefix_reader = null;
+        entry.prefix_allocator = null;
         self.prefix_key_bytes -= entry.prefix_key_bytes;
         entry.prefix_key_bytes = 0;
     }
 
     fn prefixReader(self: *@This(), entry: *BatchAsyncBlock, payload: []const u8, first_entry_index: usize, entry_count: usize) !*lsm_table_file.PrefixPointReader {
-        _ = self;
         if (entry.prefix_reader == null) {
+            entry.prefix_allocator = if (entry.read.logical_len <= max_decoded_block_bytes and self.workspace_config != null) self.reusableAllocator() else self.scratchAllocator();
             const reader = try lsm_table_file.PrefixPointReader.init(payload, first_entry_index, entry.read.logical_len);
             if (reader.entryCount() != entry_count) return error.InvalidTableFile;
             entry.prefix_reader = reader;
@@ -6502,7 +6528,7 @@ const BatchAsyncBlocks = struct {
         entry.read.release();
         if (entry.decoded) |bytes| {
             self.decoded_bytes -= bytes.len;
-            self.allocator.free(bytes);
+            self.reusableAllocator().free(bytes);
         }
         entry.* = .{};
     }
@@ -6511,6 +6537,8 @@ const BatchAsyncBlocks = struct {
         for (self.entries[0..self.limit]) |*entry| self.clear(entry);
         std.debug.assert(self.decoded_bytes == 0);
         std.debug.assert(self.prefix_key_bytes == 0);
+        if (self.workspace) |*work| work.release();
+        self.workspace = null;
     }
 
     fn find(self: *@This(), path: []const u8, run_id: u64, generation: u64, offset: u64, len: u32) ?*BatchAsyncBlock {
@@ -6582,7 +6610,7 @@ const BatchAsyncBlocks = struct {
             for (self.entries[0..self.limit]) |*idle| if (idle != entry and idle.users == 0) self.clear(idle);
         }
         if (self.decoded_bytes + decoded_len > max_decoded_bytes) return null;
-        const bytes = snappy.decode(self.allocator, payload) catch |err| switch (err) {
+        const bytes = snappy.decode(self.reusableAllocator(), payload) catch |err| switch (err) {
             error.OutOfMemory => {
                 // Optional cache admission must not fail an otherwise readable
                 // point or repeatedly ask the allocator for the same block.
@@ -6911,7 +6939,7 @@ fn consumeAsyncPointReadWithScratch(
     const block = index.blocks[read.block_index];
     const backing_read = if (read.shared_block) |shared_owner| &shared_owner.read else read;
     if (backing_read.decoded_handle) |handle| {
-        const found = (try lsm_table_file.findExactEntryInBlock(index, handle.runTableBlock(), read.block_index, namespace.name, key)) orelse {
+        const found = (if (read.shared_block) |owner| try owner.raw_reader.find(index, handle.runTableBlock(), read.block_index, namespace.name, key) else try lsm_table_file.findExactEntryInBlock(index, handle.runTableBlock(), read.block_index, namespace.name, key)) orelse {
             backend.recordPointRunSurvivorMiss();
             return null;
         };
@@ -6920,15 +6948,21 @@ fn consumeAsyncPointReadWithScratch(
     const payload = try payloadForAsyncPointRead(backend, read);
     if (shared) |pool| if (read.shared_block) |owner| if (try pool.decodedPayload(owner, payload)) |decoded| {
         const positioned = if (read.compression == .prefix or read.compression == .prefix_snappy) {
-            const reader = try pool.prefixReader(owner, decoded, block.first_entry_index, block.entry_count);
+            var reader = try pool.prefixReader(owner, decoded, block.first_entry_index, block.entry_count);
             // The result must be copied before a large key's scratch is freed.
             defer pool.finishPrefixRead(owner);
-            const found = try reader.find(scratch, namespace.name, key) orelse {
+            const found = (reader.find(pool.prefixAllocator(owner), namespace.name, key) catch |err| fallback: {
+                if (err != error.OutOfMemory or pool.workspace == null or owner.prefix_allocator.?.ptr != pool.workspace.?.allocator().ptr) return err;
+                pool.clearPrefixReader(owner);
+                reader = try pool.prefixReader(owner, decoded, block.first_entry_index, block.entry_count);
+                owner.prefix_allocator = scratch;
+                break :fallback try reader.find(scratch, namespace.name, key);
+            }) orelse {
                 backend.recordPointRunSurvivorMiss();
                 return null;
             };
             return try retainAsyncDecodedPointEntry(backend, read, read_hint, held_values, value_allocator, namespace, found, .{ .prefix_records = decoded });
-        } else try lsm_table_file.findExactEntryInBlock(index, decoded, read.block_index, namespace.name, key);
+        } else try owner.raw_reader.find(index, decoded, read.block_index, namespace.name, key);
         const found = positioned orelse {
             backend.recordPointRunSurvivorMiss();
             return null;
@@ -7281,6 +7315,13 @@ fn readManySortedPointFromSourceAsync(
     var scratch = PointReadScratch.init(backend);
     defer scratch.deinit();
     var shared: BatchAsyncBlocks = .{ .allocator = if (decode_budget) |*budget| budget.allocator() else runtimeScratchAllocator(allocator), .scratch_allocator = scratch.allocator(), .limit = configured_limit };
+    if (comptime @hasField(@TypeOf(backend.*), "point_reader")) shared.workspace_config = .{
+        .pool = &backend.point_reader,
+        .backing = backend.allocator,
+        .manager = backend.options.resource_manager,
+        .io = backend.manifestCoordinationIo(),
+        .limit = backend.options.local_decode_working_bytes,
+    };
     defer shared.deinit();
     var slots: [max_point_async_stack_reads]BatchAsyncPointSlot = undefined;
     for (slots[0..configured_limit]) |*slot| slot.* = .{};
@@ -8175,6 +8216,8 @@ const OwnedTableEntry = struct {
     entry: lsm_table_file.Entry,
     bytes: []u8 = &.{},
     local: ?*SharedBytes = null,
+    // The point caller already owns this value; bytes/local carry no owner.
+    final_point_value: bool = false,
     fn deinit(self: @This(), allocator: Allocator) void {
         if (self.local) |lease| lease.release() else allocator.free(self.bytes);
     }
@@ -8479,6 +8522,8 @@ fn loadOwnedBlockForWindowMaybeLocked(
     return try loadOwnedBlockForWindowAllocMaybeLocked(backend, backend.allocator, run, index, window, backend_locked);
 }
 
+const PointValueOutput = struct { allocator: Allocator, held: *PointResultValues };
+
 fn findExactEntryInCompressedPrefixBlock(
     backend: anytype,
     run: *Run,
@@ -8486,6 +8531,7 @@ fn findExactEntryInCompressedPrefixBlock(
     block_index: usize,
     namespace: backend_types.Namespace,
     key: []const u8,
+    output: ?PointValueOutput,
 ) !?OwnedTableEntry {
     const block = index.blocks[block_index];
     const window = index.blockWindow(block_index);
@@ -8500,6 +8546,10 @@ fn findExactEntryInCompressedPrefixBlock(
     const scratch = if (workspace) |*work| work.allocator() else backend.allocator;
     const payload = try loadRunTableBlockWithStats(backend, scratch, path, absolute_offset, window.physicalLen());
     defer scratch.free(payload);
+    if (output) |target| {
+        const found = try findExactEntryInCachedPrefixWithScratch(backend, payload, block, window, target.held, target.allocator, scratch, namespace, key, .transaction_owned) orelse return null;
+        return .{ .entry = found.entry, .final_point_value = true };
+    }
     const positioned = try lsm_table_file.findExactEntryInCompressedBlockPayloadWithScratchAlloc(
         backend.allocator,
         scratch,
@@ -8523,6 +8573,17 @@ fn findExactEntryWithLocalIndexBlockMeta(
     index: *const lsm_table_file.TableIndex,
     namespace: backend_types.Namespace,
     key: []const u8,
+) !?OwnedTableEntry {
+    return findExactEntryWithLocalIndexBlockMetaWithOutput(backend, run, index, namespace, key, null);
+}
+
+fn findExactEntryWithLocalIndexBlockMetaWithOutput(
+    backend: anytype,
+    run: *Run,
+    index: *const lsm_table_file.TableIndex,
+    namespace: backend_types.Namespace,
+    key: []const u8,
+    output: ?PointValueOutput,
 ) !?OwnedTableEntry {
     const block_index = index.findBlockIndex(namespace.name, key) orelse return null;
     const block = index.blocks[block_index];
@@ -8550,7 +8611,7 @@ fn findExactEntryWithLocalIndexBlockMeta(
         }
     }
     if (window.compression == .prefix or window.compression == .prefix_snappy)
-        return try findExactEntryInCompressedPrefixBlock(backend, run, index, block_index, namespace, key);
+        return try findExactEntryInCompressedPrefixBlock(backend, run, index, block_index, namespace, key, output);
     if (localBlockCacheEnabled(backend)) return try findExactEntryInLocalLease(backend, run, index, window, block_index, namespace, key, false);
     const bytes = try loadOwnedBlockForWindow(
         backend,
@@ -8583,7 +8644,19 @@ fn findExactEntryWithLocalIndexBlockMetaMaybeLocked(
     key: []const u8,
     backend_locked: bool,
 ) !?OwnedTableEntry {
-    if (!backend_locked) return try findExactEntryWithLocalIndexBlockMeta(backend, run, index, namespace, key);
+    return findExactEntryWithLocalIndexBlockMetaMaybeLockedWithOutput(backend, run, index, namespace, key, backend_locked, null);
+}
+
+fn findExactEntryWithLocalIndexBlockMetaMaybeLockedWithOutput(
+    backend: anytype,
+    run: *Run,
+    index: *const lsm_table_file.TableIndex,
+    namespace: backend_types.Namespace,
+    key: []const u8,
+    backend_locked: bool,
+    output: ?PointValueOutput,
+) !?OwnedTableEntry {
+    if (!backend_locked) return try findExactEntryWithLocalIndexBlockMetaWithOutput(backend, run, index, namespace, key, output);
 
     const block_index = index.findBlockIndex(namespace.name, key) orelse return null;
     const block = index.blocks[block_index];
@@ -8608,7 +8681,7 @@ fn findExactEntryWithLocalIndexBlockMetaMaybeLocked(
         }
     }
     if (window.compression == .prefix or window.compression == .prefix_snappy)
-        return try findExactEntryInCompressedPrefixBlock(backend, run, index, block_index, namespace, key);
+        return try findExactEntryInCompressedPrefixBlock(backend, run, index, block_index, namespace, key, output);
     if (localBlockCacheEnabled(backend)) return try findExactEntryInLocalLease(backend, run, index, window, block_index, namespace, key, true);
     const bytes = try loadOwnedBlockForWindowMaybeLocked(
         backend,
@@ -8677,10 +8750,13 @@ fn getFromRunWithLocalIndex(
     key: []const u8,
     backend_locked: bool,
 ) !?[]const u8 {
-    const loaded = try findExactEntryWithLocalIndexMaybeLocked(backend, run, namespace, key, backend_locked) orelse return null;
+    const index = try indexForRunNoCacheMaybeLocked(backend, run, backend_locked);
+    try requireTableBlocks(index);
+    const loaded = try findExactEntryWithLocalIndexBlockMetaMaybeLockedWithOutput(backend, run, index, namespace, key, backend_locked, .{ .allocator = value_allocator, .held = held_values }) orelse return null;
     var transferred = false;
     defer if (!transferred) loaded.deinit(backend.allocator);
     if (loaded.entry.tombstone) return error.NotFound;
+    if (loaded.final_point_value) return loaded.entry.value;
     if (namespace.borrow_local_point_results) if (held_blocks) |pins| if (loaded.local) |payload| {
         if (try retainLocalResultPin(backend, payload, pins)) return loaded.entry.value;
     };
@@ -11793,11 +11869,19 @@ test "lsm shared cold async batch promotes within a tight aggregate budget" {
         var decoded = cache.retainRunTableBlock(run.path.?, run.id, backend.root_generation, offset, window.physicalLen());
         defer if (decoded) |*handle| handle.release();
         try std.testing.expect(decoded != null);
-        try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lsm_read_working_set).used_bytes);
+        var retained_scratch: u64 = 0;
+        for (backend.point_reader.slots) |slot| if (slot.initialized) {
+            try std.testing.expect(slot.cap.live <= LocalReader.retained_bytes_per_workspace + 128);
+            retained_scratch += slot.cap.live;
+        };
+        try std.testing.expectEqual(retained_scratch, manager.sliceStats(.lsm_read_working_set).used_bytes);
+        try std.testing.expectEqual(@as(usize, 0), backend.point_reader.active);
     }
     try std.testing.expectEqual(@as(u64, 1), backend.snapshotReadStats().table_block_loads - before);
     try std.testing.expect(manager.snapshot().memory.peak_bytes <= 24 * 1024);
     try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.accounting_errors);
+    backend.point_reader.deinit();
+    try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lsm_read_working_set).used_bytes);
 }
 
 test "lsm async reuse warm snapshot batches avoid result copies and per-key indexes" {
@@ -12457,4 +12541,137 @@ test "lsm async reuse ordinary fallback packs copies without pin metadata" {
             }
         }
     }
+}
+
+test "lsm point followup local prefix writes directly to packed result storage" {
+    const a = std.testing.allocator;
+    const B = @import("../lsm_backend.zig").Backend;
+    const Budget = @import("../lite/test_allocator.zig").BudgetAllocator;
+    var storage = storage_io.MemoryStorage.init(a);
+    defer storage.deinit();
+    var budget = Budget{ .backing = a };
+    var backend = try B.open(budget.allocator(), "/point-direct-prefix", .{ .storage = storage.storage(), .local_block_cache_enabled = false, .flush_threshold = 1 });
+    defer backend.close();
+    var keys: [128][80]u8 = undefined;
+    var write = try NamespaceWriteTxn(B).open(&backend);
+    errdefer write.abort();
+    for (&keys, 0..) |*key, i| {
+        @memset(key, 'k');
+        key[79] = @intCast(i);
+        try write.put(.{}, key, "v");
+    }
+    try write.commit();
+    while (try backend.runMaintenanceStep()) {}
+    const run = run_store.at(&backend, 0);
+    const index = try indexForRunNoCache(&backend, run);
+    const codec = index.blockWindow(0).compression;
+    try std.testing.expect(codec == .prefix or codec == .prefix_snappy);
+    var held: PointResultValues = .empty;
+    defer releaseHeldValues(&held, a);
+    try held.ensureTotalCapacity(a, 32);
+    const first = (try getFromRunWithLocalIndex(&backend, run, null, &held, a, .{}, &keys[0], false)).?;
+    const before = budget.alloc_calls;
+    const before_copies = backend.snapshotReadStats().point_value_copies;
+    for (0..1000) |i| try std.testing.expectEqualStrings("v", (try getFromRunWithLocalIndex(&backend, run, null, &held, a, .{}, &keys[i % keys.len], i % 2 == 0)).?);
+    try std.testing.expectEqual(@as(usize, 0), budget.alloc_calls - before);
+    try std.testing.expectEqual(@as(u64, 1000), backend.snapshotReadStats().point_value_copies - before_copies);
+    try std.testing.expectEqualStrings("v", first);
+    try std.testing.expectEqual(@as(usize, 3), held.items.len);
+    const before_legacy = budget.alloc_calls;
+    for (0..1000) |i| {
+        const loaded = (try findExactEntryWithLocalIndexMaybeLocked(&backend, run, .{}, &keys[i % keys.len], i % 2 == 0)).?;
+        defer loaded.deinit(backend.allocator);
+        try std.testing.expectEqualStrings("v", loaded.entry.value);
+    }
+    try std.testing.expectEqual(@as(usize, 1000), budget.alloc_calls - before_legacy);
+    std.debug.print("\nlocal prefix point: lookups=1000 intermediate_backend_allocations=1000->0 payload_buffers=3\n", .{});
+}
+
+test "lsm point followup shared decoded scratch reuses bounded workspace" {
+    const a = std.testing.allocator;
+    const Budget = @import("../lite/test_allocator.zig").BudgetAllocator;
+    var budget = Budget{ .backing = a };
+    var pool: LocalReader = .{};
+    defer pool.deinit();
+    const raw: [16 * 1024]u8 = @splat('x');
+    const compressed = try @import("../../encoding/snappy.zig").encode(a, &raw);
+    defer a.free(compressed);
+    const read: AsyncPointBlockRead = .{ .candidate = .{ .run_index = 0 }, .path = "/fixture", .run_id = 1, .generation = 1, .index_handle = null, .block_index = 0, .absolute_offset = 0, .physical_len = @intCast(compressed.len), .logical_len = raw.len, .compression = .snappy, .checksum = @import("antfly_hash").Crc32.hash(compressed), .status = .ready_handle };
+    var warm_calls: usize = 0;
+    for (0..101) |i| {
+        var shared: BatchAsyncBlocks = .{ .allocator = a, .workspace_config = .{ .pool = &pool, .backing = budget.allocator(), .manager = null, .io = std.testing.io, .limit = 8 * 1024 * 1024 } };
+        const block = shared.insert(read);
+        const bytes = (try shared.decodedPayload(block, compressed)).?;
+        try std.testing.expectEqualSlices(u8, &raw, bytes);
+        shared.deinit();
+        if (i == 0) warm_calls = budget.alloc_calls;
+    }
+    try std.testing.expectEqual(warm_calls, budget.alloc_calls);
+    try std.testing.expectEqual(@as(usize, 0), pool.active);
+    try std.testing.expect(budget.live <= LocalReader.retained_bytes_per_workspace + 128);
+    const before_unpooled = budget.alloc_calls;
+    for (0..100) |_| {
+        var shared: BatchAsyncBlocks = .{ .allocator = budget.allocator() };
+        const block = shared.insert(read);
+        try std.testing.expectEqualSlices(u8, &raw, (try shared.decodedPayload(block, compressed)).?);
+        shared.deinit();
+    }
+    try std.testing.expectEqual(@as(usize, 100), budget.alloc_calls - before_unpooled);
+    std.debug.print("\nshared decoded scratch: batches=100 warm_backend_allocations=100->0 retained_bytes={d}\n", .{budget.live});
+}
+
+test "lsm point followup shared prefix keys reuse workspace and failure cleanup" {
+    const a = std.testing.allocator;
+    const Budget = @import("../lite/test_allocator.zig").BudgetAllocator;
+    var keys: [64][80]u8 = undefined;
+    var entries: [64]lsm_table_file.Entry = undefined;
+    for (&entries, 0..) |*entry, i| {
+        @memset(&keys[i], 'k');
+        keys[i][79] = @intCast(i);
+        entry.* = .{ .key = &keys[i], .value = "v" };
+    }
+    const encoded = try lsm_table_file.encodeAlloc(a, &entries);
+    defer a.free(encoded);
+    var index = try lsm_table_file.decodeIndexAlloc(a, encoded);
+    defer index.deinit(a);
+    const window = index.blockWindow(0);
+    try std.testing.expect(window.compression == .prefix or window.compression == .prefix_snappy);
+    const payload = encoded[index.entry_data_start + window.physicalRelativeOffset() ..][0..window.physicalLen()];
+    const read: AsyncPointBlockRead = .{ .candidate = .{ .run_index = 0 }, .path = "/prefix-fixture", .run_id = 1, .generation = 1, .index_handle = null, .block_index = 0, .absolute_offset = 0, .physical_len = window.physicalLen(), .logical_len = window.len, .compression = window.compression, .checksum = window.checksum, .status = .ready_handle };
+    const Fixture = struct {
+        fn run(backing: Allocator, compressed: []const u8, block_read: AsyncPointBlockRead, key: []const u8) !void {
+            var pool: LocalReader = .{};
+            defer pool.deinit();
+            var shared: BatchAsyncBlocks = .{ .allocator = backing, .workspace_config = .{ .pool = &pool, .backing = backing, .manager = null, .io = std.testing.io, .limit = 8 * 1024 * 1024 } };
+            defer shared.deinit();
+            const block = shared.insert(block_read);
+            const decoded = try shared.decodedPayload(block, compressed) orelse return error.OutOfMemory;
+            const reader = try shared.prefixReader(block, decoded, 0, 64);
+            defer shared.finishPrefixRead(block);
+            const row = try reader.find(shared.prefixAllocator(block), null, key) orelse return error.NotFound;
+            try std.testing.expectEqualStrings("v", row.entry.value);
+        }
+    };
+    var no_resize = @import("../lite/test_allocator.zig").NoResizeAllocator{ .backing = a };
+    try std.testing.checkAllAllocationFailures(no_resize.allocator(), Fixture.run, .{ payload, read, &keys[32] });
+    var budget = Budget{ .backing = a };
+    var pool: LocalReader = .{};
+    defer pool.deinit();
+    var warm_calls: usize = 0;
+    for (0..101) |i| {
+        var shared: BatchAsyncBlocks = .{ .allocator = a, .workspace_config = .{ .pool = &pool, .backing = budget.allocator(), .manager = null, .io = std.testing.io, .limit = 8 * 1024 * 1024 } };
+        const block = shared.insert(read);
+        const decoded = (try shared.decodedPayload(block, payload)).?;
+        const reader = try shared.prefixReader(block, decoded, 0, entries.len);
+        for (entries) |entry| {
+            const row = (try reader.find(shared.prefixAllocator(block), null, entry.key)).?;
+            try std.testing.expectEqualStrings("v", row.entry.value);
+        }
+        shared.finishPrefixRead(block);
+        shared.deinit();
+        if (i == 0) warm_calls = budget.alloc_calls;
+    }
+    try std.testing.expectEqual(warm_calls, budget.alloc_calls);
+    try std.testing.expect(budget.live <= LocalReader.retained_bytes_per_workspace + 128);
+    std.debug.print("\nshared prefix scratch: batches=100 keys_per_batch=64 warm_backend_allocations=0 retained_bytes={d}\n", .{budget.live});
 }
