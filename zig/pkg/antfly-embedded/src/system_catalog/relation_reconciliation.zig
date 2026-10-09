@@ -24,6 +24,7 @@ const job_prefix = "\x00\x00__metadata__:sql_relation_reconciliation:v1:";
 const candidate_prefix = "\x00\x00__metadata_derived__:sql_relation_candidate:v1:";
 const retirement_prefix = "\x00\x00__metadata__:sql_relation_retirement:v1:";
 const root_prefix = "\x00\x00__metadata__:sql_relation_root:v1:";
+const source_prefix = "\x00\x00__metadata__:sql_relation_source:v1:";
 pub const max_cursor_bytes = 512;
 pub const max_tables_per_page = 64;
 pub const max_page_bytes = 4 * 1024 * 1024;
@@ -259,9 +260,41 @@ pub fn retirementKey(buf: []u8, generation: Generation) ![]const u8 {
     return buf[0 .. retirement_prefix.len + 24];
 }
 
-pub const RecordKind = enum { job, root, retirement, candidate };
+/// Independent of job/GC progress: only authoritative source mutations advance
+/// this clock, in their existing transaction. Zero denotes an untracked source,
+/// not an empty catalog.
+pub fn sourceKey(buf: []u8, group: u64) ![]const u8 {
+    return groupPrefix(buf, .source, group);
+}
+pub fn sourceRevision(bytes: []const u8) !u64 {
+    if (bytes.len != 8) return error.InvalidCatalogRecord;
+    const revision = std.mem.readInt(u64, bytes[0..8], .big);
+    if (revision == 0) return error.InvalidCatalogRecord;
+    return revision;
+}
+pub fn readSourceRevision(reader: anytype, group: u64) !u64 {
+    var buf: [128]u8 = undefined;
+    return if (try optionalGet(reader, try sourceKey(&buf, group))) |bytes| try sourceRevision(bytes) else 0;
+}
+pub fn advanceSource(txn: anytype, group: u64) !void {
+    const previous = try readSourceRevision(txn, group);
+    const next = std.math.add(u64, previous, 1) catch return error.CatalogGenerationExhausted;
+    var bytes: [8]u8 = undefined;
+    std.mem.writeInt(u64, &bytes, next, .big);
+    var buf: [128]u8 = undefined;
+    try txn.put(try sourceKey(&buf, group), &bytes);
+}
+/// Ordinary writers must not implicitly enable a new protocol on mixed-version
+/// peers. Capability-gated adoption installs the first clock; writers advance
+/// only that explicitly tracked authority. No public adoption occurs here.
+pub fn advanceTrackedSource(txn: anytype, group: u64) !void {
+    if (try readSourceRevision(txn, group) != 0) try advanceSource(txn, group);
+}
+
+pub const RecordKind = enum { source, job, root, retirement, candidate };
 pub fn allGroupsPrefix(kind: RecordKind) []const u8 {
     return switch (kind) {
+        .source => source_prefix,
         .job => job_prefix,
         .root => root_prefix,
         .retirement => retirement_prefix,
@@ -292,7 +325,7 @@ pub fn classify(key: []const u8) !?Record {
             const group = std.mem.readInt(u64, tail[0..8], .big);
             if (group == 0) return error.InvalidCatalogRecord;
             switch (kind) {
-                .job, .root => {
+                .source, .job, .root => {
                     if (tail.len != 8) return error.InvalidCatalogRecord;
                     return .{ .kind = kind, .group_id = group };
                 },
@@ -359,6 +392,7 @@ pub fn Verifier(comptime Reader: type) type {
             const record = (try classify(key)) orelse return;
             if (record.group_id != self.group_id) return error.InvalidCatalogRecord;
             switch (record.kind) {
+                .source => _ = try sourceRevision(value),
                 .job => {
                     const state = try State.decode(value);
                     if (self.current == null or !std.mem.eql(u8, &(try self.current.?.encode()), &(try state.encode()))) return error.InvalidCatalogRecord;
@@ -492,6 +526,11 @@ pub fn ReplayVerifier(comptime Before: type, comptime After: type) type {
             const old = try optionalGet(self.before, key);
             const next = try optionalGet(self.after, key);
             switch (record.kind) {
+                .source => {
+                    const value = next orelse return error.InvalidCatalogRecord;
+                    const revision = try sourceRevision(value);
+                    if (old) |bytes| if (revision < try sourceRevision(bytes)) return error.InvalidCatalogRecord;
+                },
                 .job, .root => {}, // Whole-record fences were checked by init.
                 .retirement => try self.checkRetirement(record.generation.?),
                 .candidate => {
@@ -1329,6 +1368,50 @@ test "relation reconciliation stored cut verification rejects missing forged and
     foreign.group_id = 42;
     const foreign_key = try candidateKey(&buf, &foreign, test_claims[0].key);
     try std.testing.expectError(error.InvalidCatalogRecord, verifier.feed(foreign_key, &owner));
+}
+
+test "relation reconciliation source clock validates encoding overflow and replay monotonicity" {
+    var before = TestTxn.init();
+    defer before.deinit();
+    var after = TestTxn.init();
+    defer after.deinit();
+    try std.testing.expectEqual(@as(u64, 0), try readSourceRevision(&before, 41));
+    try advanceTrackedSource(&before, 41);
+    try std.testing.expectEqual(@as(u64, 0), try readSourceRevision(&before, 41));
+    try advanceSource(&before, 41);
+    try advanceSource(&after, 41);
+    try advanceSource(&after, 41);
+    var buf: [128]u8 = undefined;
+    const key = try sourceKey(&buf, 41);
+    try std.testing.expectEqual(RecordKind.source, (try classify(key)).?.kind);
+    try std.testing.expectEqual(@as(u64, 2), try readSourceRevision(&after, 41));
+    {
+        var verifier = try Verifier(TestTxn).init(&after, 41);
+        try verifier.feed(key, try after.get(key));
+        try verifier.finish();
+    }
+    {
+        var replay = try ReplayVerifier(TestTxn, TestTxn).init(std.testing.allocator, &before, &after, 41);
+        defer replay.deinit();
+        try replay.feed(key);
+        try replay.finish();
+    }
+    {
+        var replay = try ReplayVerifier(TestTxn, TestTxn).init(std.testing.allocator, &after, &before, 41);
+        defer replay.deinit();
+        try std.testing.expectError(error.InvalidCatalogRecord, replay.feed(key));
+    }
+    try before.delete(key);
+    {
+        var replay = try ReplayVerifier(TestTxn, TestTxn).init(std.testing.allocator, &after, &before, 41);
+        defer replay.deinit();
+        try std.testing.expectError(error.InvalidCatalogRecord, replay.feed(key));
+    }
+    try std.testing.expectError(error.InvalidCatalogRecord, sourceRevision(""));
+    try std.testing.expectError(error.InvalidCatalogRecord, sourceRevision(&@as([8]u8, @splat(0))));
+    try after.put(key, &@as([8]u8, @splat(255)));
+    try std.testing.expectError(error.CatalogGenerationExhausted, advanceSource(&after, 41));
+    try std.testing.expectEqual(std.math.maxInt(u64), try readSourceRevision(&after, 41));
 }
 
 test "relation reconciliation replay verifies deltas immutable seals and bounded GC cuts" {

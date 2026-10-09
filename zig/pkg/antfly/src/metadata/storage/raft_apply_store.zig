@@ -432,14 +432,14 @@ test "system catalog relation namespace transaction reconciliation binary replay
     const epoch: r.Epoch = .{ .incarnation = @splat(1), .revision = 17 };
     const initial = try r.State.init(group, try r.nextJobId(null), epoch);
     const T = struct {
-        const Variant = enum { valid, missing_claim, missing_job, forged, wrong_name, cross_group };
+        const Variant = enum { valid, missing_claim, missing_job, missing_source, stale_epoch, forged, wrong_name, cross_group };
         const Source = struct {
             row: r.SourceRow,
             pub fn nextAfter(self: *@This(), after: []const u8) !?r.SourceRow {
                 return if (std.mem.order(u8, after, self.row.key) == .lt) self.row else null;
             }
         };
-        fn effect(store: *RaftApplyStore, state: r.State, variant: Variant) ![]u8 {
+        fn effect(store: *RaftApplyStore, requested: r.State, variant: Variant) ![]u8 {
             var txn = try store.store.beginWriteTxn();
             defer txn.abort();
             var capture = @import("antfly_local_sources").storage_txn_mutation_capture.Capture.init(a);
@@ -452,6 +452,12 @@ test "system catalog relation namespace transaction reconciliation binary replay
             try store.applyTransitionCommandTxn(&txn, group, .{ .upsert_table = .{ .table_id = 7, .name = "incoming", .schema_json = "{}" } });
             var cut = try relation_names.TableCut.init(a, .{ .namespace_id = system_catalog.default_namespace_id, .table_id = 7, .name = "incoming", .schema_json = "{}" });
             defer cut.deinit();
+            // Internal adoption fixture; production adoption still requires
+            // the metadata writer capability barrier before tracking starts.
+            try r.advanceSource(&txn, group);
+            try store.applyTransitionCommandTxn(&txn, group, .{ .initialize_metadata_incarnation = "11111111111111111111111111111111".* });
+            var state = try r.State.init(group, requested.job_id, try RaftApplyStore.relationSourceEpochTxn(&txn, group));
+            if (variant == .stale_epoch) state.epoch.revision += 1;
             // Construct matching candidate/job hashes from the forged source:
             // replay must also prove membership in the authoritative schema.
             var claim = cut.claims[0];
@@ -467,6 +473,7 @@ test "system catalog relation namespace transaction reconciliation binary replay
             switch (variant) {
                 .missing_claim => try std.testing.expect(capture.keys.remove(try r.candidateKey(&buf, &state, claim.key))),
                 .missing_job => try std.testing.expect(capture.keys.remove(try r.jobKey(&buf, group))),
+                .missing_source => try std.testing.expect(capture.keys.remove(try r.sourceKey(&buf, group))),
                 .cross_group => {
                     var other = state;
                     other.group_id += 1;
@@ -492,7 +499,7 @@ test "system catalog relation namespace transaction reconciliation binary replay
     defer source.deinit();
     const valid = try T.effect(&source, initial, .valid);
     defer a.free(valid);
-    for ([_]T.Variant{ .missing_claim, .missing_job, .forged, .wrong_name, .cross_group }) |variant| {
+    for ([_]T.Variant{ .missing_claim, .missing_job, .missing_source, .stale_epoch, .forged, .wrong_name, .cross_group }) |variant| {
         const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/rec-binary-{s}", .{ tmp.sub_path, @tagName(variant) });
         defer a.free(root);
         const invalid = try T.effect(&source, initial, variant);
@@ -529,6 +536,146 @@ test "system catalog relation namespace transaction reconciliation binary replay
         const state = try r.State.decode(try txn.get(try r.jobKey(&buf, group)));
         try std.testing.expectEqual(@as(u64, 1), state.expected.claims);
     }
+}
+
+test "system catalog relation namespace transaction source epoch fences schema changes without fencing job progress" {
+    const a = std.testing.allocator;
+    const r = relation_reconciliation;
+    const group: u64 = 41;
+    const T = struct {
+        const Source = struct {
+            row: r.SourceRow,
+            pub fn nextAfter(self: *@This(), after: []const u8) !?r.SourceRow {
+                return if (std.mem.order(u8, after, self.row.key) == .lt) self.row else null;
+            }
+        };
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/rec-source-epoch", .{tmp.sub_path});
+    defer a.free(root);
+    var expected: r.Epoch = undefined;
+    {
+        var store = try RaftApplyStore.init(a, .{ .root_dir = root });
+        defer store.deinit();
+        {
+            var txn = try store.store.beginReadTxn();
+            defer txn.abort();
+            try std.testing.expectError(error.InvalidMetadataIncarnation, RaftApplyStore.relationSourceEpochTxn(&txn, group));
+        }
+        try store.applyStandaloneCommand(group, .{ .initialize_metadata_incarnation = "11111111111111111111111111111111".* });
+        {
+            var txn = try store.store.beginWriteTxn();
+            errdefer txn.abort();
+            try std.testing.expectError(error.CatalogSourceUntracked, RaftApplyStore.relationSourceEpochTxn(&txn, group));
+            try r.advanceSource(&txn, group);
+            try txn.commit();
+        }
+        const table: metadata.TableRecord = .{ .table_id = 7, .name = "items", .schema_json = "{}" };
+        try store.applyStandaloneCommand(group, .{ .upsert_table = table });
+        var pinned = try store.store.beginReadTxn();
+        defer pinned.abort();
+        const epoch = try RaftApplyStore.relationSourceEpochTxn(&pinned, group);
+        try std.testing.expectEqual(@as(u64, 2), epoch.revision);
+        try std.testing.expectEqualSlices(u8, &@as([16]u8, @splat(0x11)), &epoch.incarnation);
+        // Exact metadata rewrites and the job's own continuation are not
+        // source mutations, even though the standalone commit clock advances.
+        try store.applyStandaloneCommand(group, .{ .upsert_table = table });
+        var cut = try relation_names.TableCut.init(a, .{ .namespace_id = system_catalog.default_namespace_id, .table_id = table.table_id, .name = table.name, .schema_json = table.schema_json });
+        defer cut.deinit();
+        var physical_buf: [160]u8 = undefined;
+        var rows: T.Source = .{ .row = .{ .key = try tableKeyForGroup(&physical_buf, group, table.table_id), .table_id = table.table_id, .claims = cut.claims } };
+        const initial = try r.State.init(group, try r.nextJobId(null), epoch);
+        var page = try r.Page.prepareSource(a, initial, epoch, &rows);
+        defer page.deinit();
+        {
+            var txn = try store.store.beginWriteTxn();
+            errdefer txn.abort();
+            const current = try RaftApplyStore.relationSourceEpochTxn(&txn, group);
+            try std.testing.expect(epoch.eql(current));
+            try r.start(&txn, &initial, current, null);
+            try page.apply(&txn, current);
+            try txn.commit();
+        }
+        var verified = try r.Page.prepareSource(a, page.after, epoch, &rows);
+        defer verified.deinit();
+        try store.applyStandaloneCommand(group, .{ .upsert_table = .{ .table_id = table.table_id, .name = "renamed", .schema_json = table.schema_json } });
+        {
+            var txn = try store.store.beginWriteTxn();
+            defer txn.abort();
+            expected = try RaftApplyStore.relationSourceEpochTxn(&txn, group);
+            try std.testing.expect(expected.revision > epoch.revision);
+            try std.testing.expectError(error.CatalogGenerationChanged, verified.apply(&txn, expected));
+            // Even a staged clock write must roll back with its source txn.
+            try r.advanceSource(&txn, group);
+        }
+        try std.testing.expect(epoch.eql(try RaftApplyStore.relationSourceEpochTxn(&pinned, group)));
+        var txn = try store.store.beginReadTxn();
+        defer txn.abort();
+        try std.testing.expect(expected.eql(try RaftApplyStore.relationSourceEpochTxn(&txn, group)));
+        {
+            var write = try store.store.beginWriteTxn();
+            defer write.abort();
+            var journal = command_journal.Journal.initVerification(a, &write, group, RaftApplyStore.relationSourceReplayBeforeKey);
+            defer journal.deinit();
+            try journal.attach();
+            const encoded = try encodeTableRecord(a, .{ .table_id = table.table_id, .name = "unpublished", .schema_json = table.schema_json });
+            defer a.free(encoded);
+            var buf: [160]u8 = undefined;
+            // Model an authenticated producer that omitted its clock write.
+            try write.put(try tableKeyForGroup(&buf, group, table.table_id), encoded);
+            try std.testing.expectError(error.InvalidCatalogRecord, RaftApplyStore.verifyRelationSourceDeltaTxn(&write, group, &journal));
+            try r.advanceSource(&write, group);
+            try RaftApplyStore.verifyRelationSourceDeltaTxn(&write, group, &journal);
+            try journal.accept();
+        }
+        try verifyReconciliationGroupTxn(&txn, group);
+        const snapshot = try store.buildMetadataSnapshotTxn(a, &txn, group, null);
+        defer a.free(snapshot);
+        const snapshot_rows = try decodeMetadataSnapshotAlloc(a, snapshot);
+        defer freeMetadataSnapshotRows(a, snapshot_rows);
+        var selected: std.ArrayList(docstore.OwnedKVPair) = .empty;
+        defer selected.deinit(a);
+        var source_buf: [128]u8 = undefined;
+        const source_key = try r.sourceKey(&source_buf, group);
+        var lower: [8]u8 = undefined;
+        std.mem.writeInt(u64, &lower, epoch.revision, .big);
+        for ([_]bool{ false, true }) |omit| {
+            selected.clearRetainingCapacity();
+            for (snapshot_rows) |row| {
+                var copy = row;
+                if (std.mem.eql(u8, row.key, source_key)) {
+                    if (omit) continue;
+                    copy.value = &lower;
+                }
+                try selected.append(a, copy);
+            }
+            const invalid = try encodeMetadataSnapshot(a, selected.items);
+            defer a.free(invalid);
+            try std.testing.expectError(error.InvalidMetadataSnapshot, RaftApplyStore.installSnapshotFromRaft(&store, a, group, 10, invalid));
+        }
+        selected.clearRetainingCapacity();
+        const substituted = try encodeTableRecord(a, .{ .table_id = table.table_id, .name = "substituted", .schema_json = table.schema_json });
+        defer a.free(substituted);
+        var table_buf: [160]u8 = undefined;
+        const table_key = try tableKeyForGroup(&table_buf, group, table.table_id);
+        for (snapshot_rows) |row| {
+            var copy = row;
+            if (std.mem.eql(u8, row.key, table_key)) copy.value = substituted;
+            try selected.append(a, copy);
+        }
+        const inconsistent = try encodeMetadataSnapshot(a, selected.items);
+        defer a.free(inconsistent);
+        try std.testing.expectError(error.InvalidMetadataSnapshot, RaftApplyStore.installSnapshotFromRaft(&store, a, group, 10, inconsistent));
+        try RaftApplyStore.installSnapshotFromRaft(&store, a, group, 10, snapshot);
+        try std.testing.expect(expected.eql(try RaftApplyStore.relationSourceEpochTxn(&txn, group)));
+    }
+    var recovered = try RaftApplyStore.init(a, .{ .root_dir = root });
+    defer recovered.deinit();
+    var txn = try recovered.store.beginReadTxn();
+    defer txn.abort();
+    try std.testing.expect(expected.eql(try RaftApplyStore.relationSourceEpochTxn(&txn, group)));
+    try verifyReconciliationGroupTxn(&txn, group);
 }
 
 test "system catalog relation namespace transaction replay verification skips unrelated before-image payloads" {
@@ -698,6 +845,8 @@ test "system catalog relation namespace transaction checkpoint export and import
             try store.applyStandaloneCommand(43, .{ .upsert_table = .{ .table_id = 13, .name = "other_adopted_group", .schema_json = "{}" } });
             var txn = try store.store.beginWriteTxn();
             errdefer txn.abort();
+            // Tracking may be adopted before the first reconciliation job.
+            try relation_reconciliation.advanceSource(&txn, 42);
             var registry: relation_names.Store(docstore.DocStore.Txn) = .{ .txn = &txn, .alloc = a, .group_id = group };
             const key: relation_names.Key = .{ .namespace_id = system_catalog.default_namespace_id, .name = "incoming" };
             var buf: [160]u8 = undefined;
@@ -766,6 +915,7 @@ test "system catalog relation namespace transaction checkpoint export and import
         try std.testing.expectEqual(@as(u32, 1), index_owner.schema_version);
         var buf: [160]u8 = undefined;
         _ = try txn.get(try tableKeyForGroup(&buf, 42, 11));
+        try std.testing.expectEqual(@as(u64, 1), try relation_reconciliation.readSourceRevision(&txn, 42));
         registry.group_id = 43;
         try std.testing.expectEqual(@as(u64, 13), (try registry.getClaim(.{ .namespace_id = system_catalog.default_namespace_id, .name = "other_adopted_group" })).?.table_id);
     }
@@ -8144,13 +8294,15 @@ pub const RaftApplyStore = struct {
         var decoder = try metadata_chunks.StreamingDecoder.init(self.alloc, descriptor, .{ .ptr = &reader, .read_frame = Reader.read });
         defer decoder.deinit();
         const relation_writer = try relationWriterEnabledTxn(&txn, descriptor.group_id);
-        var relation_journal = command_journal.Journal.initVerification(self.alloc, &txn, descriptor.group_id, if (relation_writer) relationReplayBeforeKey else reconciliationReplayBeforeKey);
+        const source_tracked = try relation_reconciliation.readSourceRevision(&txn, descriptor.group_id) != 0;
+        var relation_journal = command_journal.Journal.initVerification(self.alloc, &txn, descriptor.group_id, if (relation_writer) relationReplayBeforeKey else relationSourceReplayBeforeKey);
         defer relation_journal.deinit();
         if (relation_writer) try relation_journal.attach();
         var reconciliation_changed = false;
         // Each row is decoded once into bounded owned scratch. Store writes
         // remain invisible until next(null) verifies both complete hashes.
         while (try decoder.next()) |row| {
+            if (source_tracked and try relationSourceReplayBeforeKey(descriptor.group_id, row.key) and !relation_journal.attached) try relation_journal.attach();
             if (try reconciliationReplayBeforeKey(descriptor.group_id, row.key)) {
                 reconciliation_changed = true;
                 if (!relation_journal.attached) try relation_journal.attach();
@@ -8178,8 +8330,10 @@ pub const RaftApplyStore = struct {
             var keys = relation_journal.originals.keyIterator();
             while (keys.next()) |key| try replay.feed(key.*);
             try replay.finish();
+            try verifyReconciliationEpochTxn(&txn, descriptor.group_id, &relation_journal);
             try self.verifyReconciliationSourceOwnersTxn(&txn, descriptor.group_id, &relation_journal);
         }
+        if (relation_journal.attached) try verifyRelationSourceDeltaTxn(&txn, descriptor.group_id, &relation_journal);
         if (relation_journal.attached) try relation_journal.accept();
         var sequence_bytes: [8]u8 = undefined;
         std.mem.writeInt(u64, &sequence_bytes, descriptor.sequence, .little);
@@ -8579,6 +8733,7 @@ pub const RaftApplyStore = struct {
         if (update.import_catalog) |state| {
             if (!bootstrap or update.logical != null) return error.InvalidStandaloneCatalog;
             try system_catalog_storage.importState(self.alloc, &txn, group_id, state);
+            try relation_reconciliation.advanceTrackedSource(&txn, group_id);
         }
         if (update.auxiliary_json) |auxiliary| try txn.put(standalone_catalog_key, auxiliary);
         if (bootstrap and update.auxiliary_json == null) return error.InvalidStandaloneCatalog;
@@ -11298,6 +11453,7 @@ pub const RaftApplyStore = struct {
         hash: [32]u8,
     ) !void {
         try system_catalog_storage.applyDelta(alloc, txn, group_id, delta, meta, hash);
+        try relation_reconciliation.advanceTrackedSource(txn, group_id);
         // Physical rows can be installed before their binding (initial FK
         // publication) or afterward (restore). Bindings and the legacy-only
         // listing must always become visible in the same transaction.
@@ -14430,6 +14586,7 @@ pub const RaftApplyStore = struct {
         system_catalog,
         relation_writer,
         relation_names,
+        relation_source,
         relation_reconciliation,
         relation_candidates,
         relation_retirements,
@@ -14496,6 +14653,7 @@ pub const RaftApplyStore = struct {
         .{ .projection = .relation_writer, .key = .{ .point = relationWriterKeyForGroup } },
         .{ .projection = .relation_names, .key = .{ .prefix = relation_names.Key.prefixForGroup } },
         .{ .projection = .relation_reconciliation, .key = .{ .point = relation_reconciliation.jobKey } },
+        .{ .projection = .relation_source, .key = .{ .point = relation_reconciliation.sourceKey } },
         .{ .projection = .relation_candidates, .key = .{ .prefix = relation_reconciliation.candidatesForGroup } },
         .{ .projection = .relation_retirements, .key = .{ .prefix = relation_reconciliation.retirementsForGroup } },
         .{ .projection = .relation_root, .key = .{ .point = relation_reconciliation.rootKey } },
@@ -14628,7 +14786,7 @@ pub const RaftApplyStore = struct {
         return if ((mask & metadataSnapshotProjectionBit(.table)) != 0)
             mask | metadataSnapshotProjectionBit(.lake_index_lifecycle) | metadataSnapshotProjectionBit(.relation_writer) | metadataSnapshotProjectionBit(.relation_names) |
                 metadataSnapshotProjectionBit(.relation_reconciliation) | metadataSnapshotProjectionBit(.relation_candidates) |
-                metadataSnapshotProjectionBit(.relation_retirements) | metadataSnapshotProjectionBit(.relation_root)
+                metadataSnapshotProjectionBit(.relation_retirements) | metadataSnapshotProjectionBit(.relation_root) | metadataSnapshotProjectionBit(.relation_source)
         else
             mask;
     }
@@ -14722,6 +14880,23 @@ pub const RaftApplyStore = struct {
             if (std.mem.eql(u8, row.key, root_key)) break try relation_reconciliation.Generation.decode(row.value);
         } else null;
 
+        var source_key_buf: [128]u8 = undefined;
+        const source_key = try relation_reconciliation.sourceKey(&source_key_buf, group_id);
+        const incoming_source: ?u64 = for (rows) |row| {
+            if (std.mem.eql(u8, row.key, source_key)) break try relation_reconciliation.sourceRevision(row.value);
+        } else null;
+        var incoming_source_cut: RelationSourceCut = .{};
+        if (incoming_source != null) for (rows) |row| {
+            if (try relationSourceKey(group_id, row.key)) try incoming_source_cut.feed(row.key, row.value);
+        };
+        // Pin and stream the local source off the serialized apply path. A
+        // locked point recheck below fences concurrent source mutations.
+        const local_source_cut = blk: {
+            var read = try self.store.beginReadTxn();
+            defer read.abort();
+            break :blk try relationSourceCutTxn(&read, group_id, incoming_source);
+        };
+
         const checkpoint = AppliedMetadataCheckpoint.fromInput(commit_index, .snapshot, encoded);
         const io = self.io_impl.io();
         self.apply_mutex.lockUncancelable(io);
@@ -14731,6 +14906,12 @@ pub const RaftApplyStore = struct {
         const existing = blk: {
             var read_txn = try self.store.beginReadTxn();
             defer read_txn.abort();
+            if (try stagingGet(&read_txn, source_key)) |bytes| {
+                const revision = incoming_source orelse return error.InvalidMetadataSnapshot;
+                if (revision < try relation_reconciliation.sourceRevision(bytes)) return error.InvalidMetadataSnapshot;
+                if (revision == try relation_reconciliation.sourceRevision(bytes) and
+                    (local_source_cut.revision != revision or !local_source_cut.eql(incoming_source_cut))) return error.InvalidMetadataSnapshot;
+            }
             if (try stagingGet(&read_txn, reconciliation_key)) |bytes| {
                 const local = try relation_reconciliation.State.decode(bytes);
                 const incoming = incoming_reconciliation orelse return error.InvalidMetadataSnapshot;
@@ -15154,6 +15335,19 @@ pub const RaftApplyStore = struct {
         return true;
     }
 
+    /// Read from the same pinned transaction as the source rows. An absent
+    /// cluster identity cannot authorize a durable reconciliation generation.
+    fn relationSourceEpochTxn(txn: *docstore.DocStore.Txn, group_id: u64) !relation_reconciliation.Epoch {
+        var buf: [160]u8 = undefined;
+        const bytes = (try stagingGet(txn, try metadataIncarnationKeyForGroup(&buf, group_id))) orelse return error.InvalidMetadataIncarnation;
+        const record = try decodeMetadataIncarnationRecord(bytes);
+        var incarnation: [16]u8 = undefined;
+        _ = std.fmt.hexToBytes(&incarnation, &record.incarnation) catch return error.InvalidMetadataIncarnation;
+        const revision = try relation_reconciliation.readSourceRevision(txn, group_id);
+        if (revision == 0) return error.CatalogSourceUntracked;
+        return .{ .incarnation = incarnation, .revision = revision };
+    }
+
     const RelationSnapshot = struct {
         cut: ?relation_names.TableCut = null,
         bound: bool = false,
@@ -15217,7 +15411,96 @@ pub const RaftApplyStore = struct {
         return std.fmt.parseInt(u64, suffix, 10) catch error.InvalidCatalogRecord;
     }
     fn relationReplayBeforeKey(group_id: u64, key: []const u8) !bool {
-        return try reconciliationReplayBeforeKey(group_id, key) or try capturedRelationTableId(key, group_id) != null or try relation_names.Key.fromStorageKey(key, group_id) != null;
+        return try relationSourceReplayBeforeKey(group_id, key) or try relation_names.Key.fromStorageKey(key, group_id) != null;
+    }
+    fn relationSourceKey(group_id: u64, key: []const u8) !bool {
+        var buf: [160]u8 = undefined;
+        const prefix = try system_catalog_storage.prefixForGroup(&buf, group_id);
+        return try capturedRelationTableId(key, group_id) != null or
+            (std.mem.startsWith(u8, key, prefix) and std.mem.startsWith(u8, key[prefix.len..], "record:"));
+    }
+    const RelationSourceCut = struct {
+        revision: u64 = 0,
+        rows: u64 = 0,
+        fingerprint: u256 = 0,
+        fn feed(self: *@This(), key: []const u8, value: []const u8) !void {
+            var hash = std.crypto.hash.Blake3.init(.{});
+            hash.update("antfly.relation-source-cut.v1");
+            var lengths: [16]u8 = undefined;
+            std.mem.writeInt(u64, lengths[0..8], @intCast(key.len), .big);
+            std.mem.writeInt(u64, lengths[8..16], @intCast(value.len), .big);
+            hash.update(&lengths);
+            hash.update(key);
+            hash.update(value);
+            var digest: [32]u8 = undefined;
+            hash.final(&digest);
+            // Commutative addition, not XOR: duplicate entries cannot cancel.
+            self.fingerprint +%= std.mem.readInt(u256, &digest, .little);
+            self.rows = std.math.add(u64, self.rows, 1) catch return error.InvalidMetadataSnapshot;
+        }
+        fn eql(self: @This(), other: @This()) bool {
+            return self.rows == other.rows and self.fingerprint == other.fingerprint;
+        }
+    };
+    fn relationSourceCutTxn(txn: *docstore.DocStore.Txn, group_id: u64, expected: ?u64) !RelationSourceCut {
+        var result: RelationSourceCut = .{ .revision = try relation_reconciliation.readSourceRevision(txn, group_id) };
+        if (result.revision == 0 or expected == null or expected.? != result.revision) return result;
+        var table_buf: [160]u8 = undefined;
+        var catalog_buf: [160]u8 = undefined;
+        var record_buf: [192]u8 = undefined;
+        const tables = try tablePrefixForGroup(&table_buf, group_id);
+        const records = try std.fmt.bufPrint(&record_buf, "{s}record:", .{try system_catalog_storage.prefixForGroup(&catalog_buf, group_id)});
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        for ([_][]const u8{ tables, records }) |prefix| {
+            var entry = try cursor.seekAtOrAfter(prefix);
+            while (entry) |row| : (entry = try cursor.next()) {
+                if (!std.mem.startsWith(u8, row.key, prefix)) break;
+                try result.feed(row.key, row.value);
+            }
+        }
+        return result;
+    }
+    fn relationSourceReplayBeforeKey(group_id: u64, key: []const u8) !bool {
+        return try reconciliationReplayBeforeKey(group_id, key) or try relationSourceKey(group_id, key);
+    }
+    fn verifyReconciliationEpochTxn(txn: *docstore.DocStore.Txn, group_id: u64, journal: *command_journal.Journal) !void {
+        var buf: [128]u8 = undefined;
+        const key = try relation_reconciliation.jobKey(&buf, group_id);
+        const final = (try stagingGet(txn, key)) orelse return;
+        var before = journal.beforeReader();
+        const prior = before.get(key) catch |err| blk: {
+            if (err == error.NotFound) break :blk null;
+            return err;
+        };
+        if (prior) |bytes| if (std.mem.eql(u8, bytes, final)) return;
+        const state = try relation_reconciliation.State.decode(final);
+        const epoch = relationSourceEpochTxn(txn, group_id) catch |err| switch (err) {
+            error.CatalogSourceUntracked, error.InvalidMetadataIncarnation => return error.InvalidCatalogRecord,
+            else => return err,
+        };
+        if (!state.epoch.eql(epoch)) return error.InvalidCatalogRecord;
+    }
+    fn verifyRelationSourceDeltaTxn(txn: *docstore.DocStore.Txn, group_id: u64, journal: *command_journal.Journal) !void {
+        var before = journal.beforeReader();
+        const old = try relation_reconciliation.readSourceRevision(&before, group_id);
+        const next = try relation_reconciliation.readSourceRevision(txn, group_id);
+        if (next < old) return error.InvalidCatalogRecord;
+        var buf: [128]u8 = undefined;
+        // Released document effects predate this source clock. Once a clock
+        // or reconciliation job exists, source changes must advance it.
+        if (old == 0 and next == 0) {
+            if (try stagingGet(txn, try relation_reconciliation.jobKey(&buf, group_id)) != null) return error.InvalidCatalogRecord;
+            return;
+        }
+        var entries = journal.originals.iterator();
+        while (entries.next()) |entry| {
+            if (!try relationSourceKey(group_id, entry.key_ptr.*)) continue;
+            const prior = entry.value_ptr.*;
+            const final = try stagingGet(txn, entry.key_ptr.*);
+            const changed = if (prior) |bytes| if (final) |value| !std.mem.eql(u8, bytes, value) else true else final != null;
+            if (changed and next <= old) return error.InvalidCatalogRecord;
+        }
     }
     fn reconciliationReplayBeforeKey(group_id: u64, key: []const u8) !bool {
         const record = (try relation_reconciliation.classify(key)) orelse return false;
@@ -16143,6 +16426,7 @@ pub const RaftApplyStore = struct {
         const existing_table_name = try self.lookupTableNameTxn(txn, group_id, table_id);
         defer if (existing_table_name) |name| self.alloc.free(name);
         try self.removeSystemCatalogTableTxn(txn, group_id, table_id);
+        if (try stagingGet(txn, key) != null) try relation_reconciliation.advanceTrackedSource(txn, group_id);
         txn.delete(key) catch |err| switch (err) {
             error.NotFound => {},
             else => return err,
@@ -17459,6 +17743,7 @@ pub const RaftApplyStore = struct {
                 }
                 try self.removeSystemCatalogTableTxn(txn, group_id, drop.table_id);
                 try txn.delete(table_key);
+                try relation_reconciliation.advanceTrackedSource(txn, group_id);
                 var fingerprint_key_buf: [192]u8 = undefined;
                 txn.delete(try tableSchemaFingerprintKeyForGroup(&fingerprint_key_buf, group_id, drop.table_id)) catch |err| switch (err) {
                     error.NotFound => {}, // Older table records may predate the fingerprint index.
@@ -18005,6 +18290,13 @@ pub const RaftApplyStore = struct {
             error.NotFound => null,
             else => return err,
         };
+        const source_tracked = try relation_reconciliation.readSourceRevision(txn, group_id) != 0;
+        var previous_digest: ?[32]u8 = null;
+        if (source_tracked) if (encoded_existing) |encoded| {
+            var digest: [32]u8 = undefined;
+            std.crypto.hash.Blake3.hash(encoded, &digest, .{});
+            previous_digest = digest;
+        };
         if (encoded_existing) |encoded| {
             const existing = try decodeTableRecord(self.alloc, encoded);
             defer metadata_table_manager.freeTable(self.alloc, existing);
@@ -18040,6 +18332,11 @@ pub const RaftApplyStore = struct {
         try self.synchronizeLakeIndexLifecycleTxn(txn, group_id, record);
         const value = try encodeTableRecord(self.alloc, record);
         defer self.alloc.free(value);
+        if (source_tracked) {
+            var digest: [32]u8 = undefined;
+            std.crypto.hash.Blake3.hash(value, &digest, .{});
+            if (previous_digest == null or !std.mem.eql(u8, &previous_digest.?, &digest)) try relation_reconciliation.advanceSource(txn, group_id);
+        }
         try txn.put(key, value);
         const fingerprint = policyTableSchemaRecordDigest(record);
         var fingerprint_key_buf: [192]u8 = undefined;
@@ -24611,6 +24908,13 @@ fn verifyReconciliationCheckpointTxn(txn: *docstore.DocStore.Txn) !void {
         while (entry) |row| : (entry = try cursor.next()) {
             if (!std.mem.startsWith(u8, row.key, prefix)) break;
             const record = (try r.classify(row.key)) orelse return error.InvalidCatalogRecord;
+            // Source-only groups are valid before any job. Validate their
+            // point value without rescanning every candidate a second time;
+            // the job pass verifies complete cuts, later passes catch orphans.
+            if (kind == .source) {
+                _ = try r.sourceRevision(row.value);
+                continue;
+            }
             if (previous_group != record.group_id) {
                 if (kind == .job) try verifyReconciliationGroupTxn(txn, record.group_id) else {
                     var buf: [128]u8 = undefined;

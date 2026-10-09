@@ -1544,7 +1544,7 @@ candidate insertions, and checks retirement progress with bounded successor
 probes. New candidate owners are independently point-derived from authoritative
 table schemas and bindings, preventing a forged claim and matching forged job
 hash from authenticating each other. Per-effect work is bounded by the source
-page's table/claim limits; unrelated document effects do not install a
+page's table/claim limits; non-catalog metadata effects do not install a
 before-image observer. Native tests reject missing job/claim effects, forged
 owners, wrong names and cross-group keys without publishing a receipt or
 signals, then retry the valid effect at the same log position and reopen the
@@ -1552,7 +1552,32 @@ store to verify durable idempotence. Pure tests cover immutable seals, GC
 cursor skips, incomplete intent removal and allocator failures. This is delta
 consistency and active-source membership, not a complete-source adoption or
 serving capability proof; pending-generation sources remain unwired.
-Authoritative epoch wiring, pending-generation reservation sources,
+A separate durable source clock now advances transactionally at native table
+write/delete, logical catalog delta and standalone import boundaries after
+explicit internal adoption. Exact table rewrites and job/GC progress do not
+advance it. Untracked document groups remain untracked: ordinary writers must
+not silently adopt a protocol before the metadata capability barrier. A pinned
+native source epoch combines this clock with the validated cluster incarnation;
+absent authority or an untracked source fails closed. Advancing binary job
+effects validate against that actual receiver epoch,
+not only the producer's internally consistent job fields. Unchanged stale jobs
+may remain durable for replacement/GC; their continuation cannot advance.
+Snapshots/checkpoints
+retain and verify the clock even in groups without jobs. Snapshot installation
+and binary replay reject clock removal/regression; tracked source changes
+cannot replay without an advancing clock.
+Snapshot installation also rejects source changes at an unchanged tracked
+revision. Its pinned local comparison streams outside the apply lock with
+constant scratch and a locked revision recheck; newer revisions avoid this
+local scan. Source-only checkpoint groups are validated without another
+candidate-range pass.
+Native tests cover stale pages after
+renames, unchanged epochs during job progress, pinned MVCC reads, transaction
+abort, missing-clock effects, snapshot omission/downgrade and restart. Pure
+tests cover zero/malformed values, exhaustion, monotonic replay and no implicit
+adoption. Clock hashing is skipped for untracked table writers. The adoption
+coordinator and writer capability barrier are not activated by this machinery.
+Capability-gated source adoption, pending-generation reservation sources,
 Raft job commands, GC scheduling,
 capability barriers and atomic active-root publication still
 precede writer adoption and SQL point resolution. No original SQL case is
