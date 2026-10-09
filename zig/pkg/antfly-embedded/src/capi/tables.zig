@@ -148,7 +148,11 @@ pub fn drop(handle: *h.Handle, name: []const u8, if_exists: bool) !void {
     for (handle.table_handles.items) |id| {
         const child, const slot = h.handle_registry.enter(id) orelse continue;
         defer h.HandleRegistry.leave(slot);
-        if (child.selected_db == &table.db or (child.selected_table_name != null and child.selected_table_id == table.id)) return error.SqlStatementReadUnavailable;
+        // A child can still cache a pointer into a retired generation. That
+        // address may have been reused by an unrelated table after refresh.
+        if (child.selected_table_name) |selected_name| {
+            if (child.selected_table_id == table.id and std.mem.eql(u8, selected_name, name)) return error.SqlStatementReadUnavailable;
+        }
     }
     var sessions = handle.sql_sessions.valueIterator();
     while (sessions.next()) |session| {

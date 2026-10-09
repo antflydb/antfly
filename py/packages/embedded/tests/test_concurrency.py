@@ -255,6 +255,30 @@ def test_table_handle_rebinds_and_rejects_recreated_table(tmp_path: Path) -> Non
                     table.lookup("item")
 
 
+def test_stale_table_handle_does_not_block_unrelated_drop(tmp_path: Path) -> None:
+    path = tmp_path / "table-drop-identity.aflite"
+    # Manual maintenance keeps refreshes driven by the calls below.
+    options = antfly_embedded.OpenOptions(no_sync=True, profile=antfly_embedded.Profile.HOSTED)
+    with antfly_embedded.create_with_options(path, options) as first:
+        first.create_table("foo", {})
+        with first.open_table("foo") as foo:
+            with antfly_embedded.open_with_options(path, options) as second:
+                second.create_table("bar", {})
+                first.list_tables()
+                second.batch_json({"inserts": {"touch": {"version": 1}}})
+                first.list_tables()
+                # Do not call foo before DROP: its cached DB pointer still
+                # names the original generation, which has now been retired.
+                first.drop_table("bar")
+                assert first.list_tables() == ["default", "foo"]
+                with pytest.raises(SQLStateError) as error:
+                    first.sql("DROP TABLE foo")
+                assert error.value.sqlstate == "53300"
+                foo.stats()
+        first.drop_table("foo")
+        assert first.list_tables() == ["default"]
+
+
 def test_idle_connections_allow_vacuum_and_refresh_replacement(tmp_path: Path) -> None:
     path = tmp_path / "vacuum-connections.aflite"
     with antfly_embedded.create(path, no_sync=True) as first:
