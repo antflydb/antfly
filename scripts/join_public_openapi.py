@@ -134,7 +134,10 @@ def walk_refs(value: object, rename_schema) -> object:
                         + child[len(ai_extraction_prefix) :]
                     )
                 elif child.startswith("../ai/decision.yaml#/components/schemas/"):
-                    out[key] = "specs/openapi/ai/decision.yaml#/components/schemas/" + child.rsplit("/", 1)[-1]
+                    out[key] = (
+                        "specs/openapi/ai/decision.yaml#/components/schemas/"
+                        + child.rsplit("/", 1)[-1]
+                    )
                 else:
                     out[key] = child
                 continue

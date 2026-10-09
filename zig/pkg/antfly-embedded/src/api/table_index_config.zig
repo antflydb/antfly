@@ -72,6 +72,12 @@ pub fn validateIndexConfig(alloc: std.mem.Allocator, index_name: []const u8, ind
     return try validateIndexConfigWithOptions(alloc, index_name, index_json, .{});
 }
 
+test "external lake full text source storage requires a boolean opt in" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "{\"type\":\"full_text\"}", "{\"type\":\"full_text\",\"store_source\":false}", "{\"type\":\"full_text\",\"store_source\":true}" }) |value| try validateIndexConfig(a, "text", value);
+    for ([_][]const u8{ "{\"store_source\":\"true\"}", "{\"store_source\":1}", "{\"store_source\":null}", "{\"store_source\":[]}" }) |value| try std.testing.expectError(error.InvalidCreateTableRequest, validateIndexConfig(a, "text", value));
+}
+
 pub fn validateIndexConfigWithOptions(
     alloc: std.mem.Allocator,
     index_name: []const u8,
@@ -91,6 +97,12 @@ pub fn validateIndexConfigWithOptions(
         algebraic.index.validateConfig(parsed.value) catch return error.InvalidCreateTableRequest;
     } else if (cfg.kind == .graph) {
         try validateGraphConfig(alloc, cfg.config_json);
+    } else if (cfg.kind == .full_text) {
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, cfg.config_json, .{});
+        defer parsed.deinit();
+        if (parsed.value.object.get("store_source")) |value| {
+            if (value != .bool) return error.InvalidCreateTableRequest;
+        }
     }
 }
 

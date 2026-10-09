@@ -107,11 +107,11 @@ pub fn runtimeCompileMaxRss(unit: RuntimeLibraryUnit, profile: CompileMemoryProf
         // platform frameworks. Linux ARM64 reached 4.99 GB in the
         // v0.2.1-rc0 release build, while the integrated HA API kernel
         // reached 8.10 GB in a clean aarch64-linux-musl ReleaseFast
-        // build. Linux retains 10 GiB. The macOS claim now includes a
-        // provisional margin over the subsequently exceeded 11 GiB claim.
-        // Pinned Nix glibc Zig 0.17 native ARM64 GNU ReleaseSafe reached
-        // 12,550,221,824 bytes. Fifteen GiB provides >25% measured headroom.
-        .api_kernel => @as(usize, if (target.os.tag == .macos) 14 else if (native_gnu_arm64_safe) 15 else 10) * 1024 * 1024 * 1024,
+        // build. Linux retains 10 GiB. October's native lake codegen reached
+        // 19.81 GB on macOS with paged native maintenance. Reserve 24 GiB
+        // to retain at least 25% headroom over that measured peak.
+        .api_kernel => @as(usize, if (target.os.tag == .macos) 24 else if (native_gnu_arm64_safe) 15 else 10) * 1024 * 1024 * 1024,
+        // Pinned Nix GNU ARM64 ReleaseSafe retains its measured 15 GiB reservation.
         // September's macOS 20 GiB claim is below the reported 22–23 GB
         // compiler peak. 28 GiB includes >=25% headroom at 23 decimal GB.
         // Keep the measured Linux profiles separate. The other macOS bumps
@@ -126,7 +126,8 @@ pub fn runtimeCompileMaxRss(unit: RuntimeLibraryUnit, profile: CompileMemoryProf
         // for this profile; preserve other hosts/modes and runtime limits.
         // Pinned Nix GNU ARM64 ReleaseSafe peaked at 13,191,520,256 bytes;
         // sixteen GiB provides >25% measured headroom for that profile.
-        .distributed => @as(usize, if (target.os.tag == .macos) (if (profile.optimize == .safe) 17 else 13) else if (native_gnu_arm64_safe) 16 else 11) * 1024 * 1024 * 1024,
+        .distributed => @as(usize, if (target.os.tag == .macos) 18 else if (native_gnu_arm64_safe) 16 else 11) * 1024 * 1024 * 1024,
+        // Upstream hosted lake measurements raise the macOS distributed claim to 18 GiB.
         .enrichment_compute => 4 * 1024 * 1024 * 1024,
         // This is deliberately a separate non-PIC product unit. The
         // cold aarch64-macOS ReleaseFast build peaks near 2 GiB;
@@ -168,6 +169,8 @@ test "native GNU ARM64 ReleaseSafe claims cover pinned Nix compiler peaks" {
 test "macOS reservations cover reported storage peak and prevent unsafe overlap" {
     const macos = try std.zig.system.resolveTargetQuery(std.testing.io, .{ .cpu_arch = .aarch64, .os_tag = .macos });
     const profile: CompileMemoryProfile = .{ .host = macos, .target = macos, .optimize = .fast, .strip = false, .cpu_inference = true };
+    const reported_api_bytes: usize = 19_808_337_920;
+    try std.testing.expect(runtimeCompileMaxRss(.api_kernel, profile) >= reported_api_bytes + reported_api_bytes / 4);
     const reported_storage_bytes: usize = 23_000_000_000;
     const storage = runtimeCompileMaxRss(.storage_kernel, profile);
     try std.testing.expect(storage >= reported_storage_bytes + reported_storage_bytes / 4);
@@ -181,13 +184,14 @@ test "measured release reservations admit storage with inference and preserve un
     const macos = try std.zig.system.resolveTargetQuery(std.testing.io, .{ .cpu_arch = .aarch64, .os_tag = .macos });
     const measured: CompileMemoryProfile = .{ .host = linux, .target = linux, .optimize = .fast, .strip = true, .cpu_inference = true };
     const budget = 22 * 1024 * 1024 * 1024;
-    try std.testing.expectEqual(@as(usize, 17) * 1024 * 1024 * 1024, runtimeCompileMaxRss(.distributed, .{
+    const hosted_distributed_peak: usize = 15_407_759_360;
+    try std.testing.expect(runtimeCompileMaxRss(.distributed, .{
         .host = macos,
         .target = macos,
         .optimize = .safe,
         .strip = false,
         .cpu_inference = true,
-    }));
+    }) >= hosted_distributed_peak + hosted_distributed_peak / 4);
     try std.testing.expect(runtimeCompileMaxRss(.storage_kernel, measured) + runtimeCompileMaxRss(.inference, measured) <= budget);
     var conservative = measured;
     conservative.cpu_inference = false;

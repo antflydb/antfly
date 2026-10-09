@@ -259,6 +259,7 @@ pub const Collector = struct {
                 const root = try self.retainedNativeRoot(a, @import("lake_index_ordered_rows.zig"), ref);
                 try self.markPages(a, root.domain, root.page, true);
                 try self.markPages(a, root.domain, root.reverse, false);
+                try self.markPages(a, root.domain, root.ties, false);
                 try self.markPages(a, root.domain, root.predicates, false);
             },
             // These lake producers publish self-contained segments. New paged

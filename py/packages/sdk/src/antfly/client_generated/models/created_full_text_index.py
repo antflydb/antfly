@@ -32,6 +32,7 @@ class CreatedFullTextIndex:
         sources (list[FullTextArtifactIndexSource] | Unset):
         mem_only (bool | Unset):
         field (str | Unset):
+        store_source (bool | Unset):
         analysis_config (TextAnalysisConfig | Unset): Custom text analysis for a full-text index. Component maps are
             keyed
             by the name that analyzers and `field_analyzers` reference. Built-in
@@ -70,6 +71,7 @@ class CreatedFullTextIndex:
     sources: list[FullTextArtifactIndexSource] | Unset = UNSET
     mem_only: bool | Unset = UNSET
     field: str | Unset = UNSET
+    store_source: bool | Unset = UNSET
     analysis_config: TextAnalysisConfig | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
@@ -100,6 +102,8 @@ class CreatedFullTextIndex:
 
         field = self.field
 
+        store_source = self.store_source
+
         analysis_config: dict[str, Any] | Unset = UNSET
         if not isinstance(self.analysis_config, Unset):
             analysis_config = self.analysis_config.to_dict()
@@ -124,6 +128,8 @@ class CreatedFullTextIndex:
             field_dict["mem_only"] = mem_only
         if field is not UNSET:
             field_dict["field"] = field
+        if store_source is not UNSET:
+            field_dict["store_source"] = store_source
         if analysis_config is not UNSET:
             field_dict["analysis_config"] = analysis_config
 
@@ -166,6 +172,8 @@ class CreatedFullTextIndex:
 
         field = d.pop("field", UNSET)
 
+        store_source = d.pop("store_source", UNSET)
+
         _analysis_config = d.pop("analysis_config", UNSET)
         analysis_config: TextAnalysisConfig | Unset
         if isinstance(_analysis_config, Unset):
@@ -182,6 +190,7 @@ class CreatedFullTextIndex:
             sources=sources,
             mem_only=mem_only,
             field=field,
+            store_source=store_source,
             analysis_config=analysis_config,
         )
 

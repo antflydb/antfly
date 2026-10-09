@@ -122,6 +122,7 @@ class Database:
     def __init__(self, handle: int) -> None:
         self._lib = _ffi.get_lib()
         self._handle: int | None = handle
+        self._owner: Database | None = None
         self._lock = threading.Lock()
         self._cond = threading.Condition(self._lock)
         self._active = 0
@@ -196,6 +197,8 @@ class Database:
             errors.raise_for_code(
                 self._lib.antfly_db_open_table(ctypes.c_void_p(handle), name_slice, ctypes.byref(out))
             )
+            if out.value is None:
+                raise errors.InternalError(message="antfly_db_open_table returned ANTFLY_OK with a null handle")
             table = Database(out.value)
             table._owner = self
             return table

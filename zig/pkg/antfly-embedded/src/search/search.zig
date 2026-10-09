@@ -83,13 +83,14 @@ pub const HistogramResult = struct {
 };
 
 pub const DateHistogramResult = struct {
-    keys: []u64,
+    keys: []i128,
     counts: []u64,
 };
 
 pub const BucketKey = union(enum) {
     int: i64,
     uint: u64,
+    timestamp: i128,
     range_idx: u32,
     string: []const u8,
 };
@@ -269,8 +270,8 @@ pub const NumericRangeQuery = struct {
 
 pub const DateRangeQuery = struct {
     field: []const u8,
-    start_ns: ?u64 = null,
-    end_ns: ?u64 = null,
+    start_ns: ?i128 = null,
+    end_ns: ?i128 = null,
     inclusive_start: bool = true,
     inclusive_end: bool = false,
     boost: f32 = 1.0,
@@ -284,6 +285,7 @@ pub const DocIdQuery = struct {
 pub const DocNumQuery = struct {
     ids: []const u32,
     bitmap: ?*const roaring.RoaringBitmap = null,
+    producer: ?query_mod.DocNumProducer = null,
     boost: f32 = 1.0,
 };
 
@@ -1225,7 +1227,7 @@ fn executeDocNum(
     dq: DocNumQuery,
     request: SearchRequest,
 ) !SearchResult {
-    return executeFilterQuery(alloc, snap, .{ .doc_num = .{ .doc_nums = dq.ids, .bitmap = dq.bitmap } }, request, dq.boost);
+    return executeFilterQuery(alloc, snap, .{ .doc_num = .{ .doc_nums = dq.ids, .bitmap = dq.bitmap, .producer = dq.producer } }, request, dq.boost);
 }
 
 fn executeBoolField(
@@ -2438,6 +2440,23 @@ fn executeBool(
     if (bq.boost == 1 and bq.should.len == 0 and bq.must.len >= 1 and bq.must.len <= 2 and bq.must_not.len <= 1 and
         request.filter_doc_bitmap == null and request.exclude_doc_bitmap == null)
     {
+        const producer_include = bq.must.len == 2 and bq.must[1] == .doc_num and bq.must[1].doc_num.producer != null and bq.must[1].doc_num.boost == 0;
+        const producer_exclude = bq.must_not.len == 1 and bq.must_not[0] == .doc_num and bq.must_not[0].doc_num.producer != null;
+        const native_include = bq.must.len == 1 or (bq.must[1] == .doc_num and bq.must[1].doc_num.ids.len == 0 and bq.must[1].doc_num.boost == 0 and (bq.must[1].doc_num.bitmap != null or producer_include));
+        const native_exclude = bq.must_not.len == 0 or (bq.must_not[0] == .doc_num and bq.must_not[0].doc_num.ids.len == 0 and (bq.must_not[0].doc_num.bitmap != null or producer_exclude));
+        if ((producer_include or producer_exclude) and native_include and native_exclude) {
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            const filter = try searchQueryToFilterArena(arena.allocator(), .{ .bool_query = bq });
+            var membership = try snap.executeFilterBitmap(alloc, filter);
+            defer membership.deinit();
+            var constrained = request;
+            constrained.query = bq.must[0];
+            constrained.filter_doc_bitmap = &membership;
+            constrained.graph_queries = &.{};
+            return execute(alloc, snap, constrained);
+        }
+
         var constrained = request;
         var recognized = bq.must.len == 2 or bq.must_not.len == 1;
         if (bq.must.len == 2) {
@@ -2624,7 +2643,7 @@ pub fn searchQueryToFilterArena(alloc: Allocator, sq: SearchQuery) anyerror!quer
             .inclusive_end = rq.inclusive_end,
         } },
         .doc_id => |dq| .{ .doc_id = .{ .doc_ids = dq.ids } },
-        .doc_num => |dq| .{ .doc_num = .{ .doc_nums = dq.ids, .bitmap = dq.bitmap } },
+        .doc_num => |dq| .{ .doc_num = .{ .doc_nums = dq.ids, .bitmap = dq.bitmap, .producer = dq.producer } },
         .bool_field => |bq| .{ .bool_field = .{ .field = bq.field, .value = bq.value } },
         .geo_distance => |gq| .{ .geo_distance = .{
             .field = gq.field,
@@ -2788,7 +2807,7 @@ fn queryToFilter(alloc: Allocator, sq: SearchQuery) !OwnedFilter {
             .filter_slice = &.{},
         },
         .doc_num => |dq| .{
-            .filter = .{ .doc_num = .{ .doc_nums = dq.ids, .bitmap = dq.bitmap } },
+            .filter = .{ .doc_num = .{ .doc_nums = dq.ids, .bitmap = dq.bitmap, .producer = dq.producer } },
             .duped_terms = &.{},
             .filter_slice = &.{},
         },
@@ -3242,11 +3261,11 @@ fn collectSubAggs(
         while (it.next()) |v| v.deinit(alloc);
         i64_buckets.deinit(alloc);
     }
-    var u64_buckets = std.AutoHashMapUnmanaged(u64, BucketList){};
+    var timestamp_buckets = std.AutoHashMapUnmanaged(i128, BucketList){};
     defer {
-        var it = u64_buckets.valueIterator();
+        var it = timestamp_buckets.valueIterator();
         while (it.next()) |v| v.deinit(alloc);
-        u64_buckets.deinit(alloc);
+        timestamp_buckets.deinit(alloc);
     }
     var u32_buckets = std.AutoHashMapUnmanaged(u32, BucketList){};
     defer {
@@ -3268,9 +3287,9 @@ fn collectSubAggs(
         },
         .date_histogram => |dh| {
             for (scored) |hit| {
-                if (try readU64ForDoc(alloc, reads, snap, hit.doc_id, spec.field)) |ns| {
-                    const bk = aggregation_mod.truncateToInterval(ns, dh.interval);
-                    const gop = try u64_buckets.getOrPut(alloc, bk);
+                if (try readTimestampForDoc(alloc, reads, snap, hit.doc_id, spec.field)) |ns| {
+                    const bk = try aggregation_mod.truncateSignedToInterval(ns, dh.interval);
+                    const gop = try timestamp_buckets.getOrPut(alloc, bk);
                     if (!gop.found_existing) gop.value_ptr.* = .empty;
                     try gop.value_ptr.append(alloc, hit);
                 }
@@ -3322,8 +3341,8 @@ fn collectSubAggs(
     // Build BucketSubResult array from whichever bucket map was used
     if (i64_buckets.count() > 0) {
         return try buildSubResultsI64(alloc, reads, snap, &i64_buckets, spec.sub_aggs);
-    } else if (u64_buckets.count() > 0) {
-        return try buildSubResultsU64(alloc, reads, snap, &u64_buckets, spec.sub_aggs);
+    } else if (timestamp_buckets.count() > 0) {
+        return try buildSubResultsTimestamp(alloc, reads, snap, &timestamp_buckets, spec.sub_aggs);
     } else if (u32_buckets.count() > 0) {
         return try buildSubResultsU32(alloc, reads, snap, &u32_buckets, spec.sub_aggs);
     }
@@ -3376,11 +3395,11 @@ fn buildSubResultsI64(
     return results;
 }
 
-fn buildSubResultsU64(
+fn buildSubResultsTimestamp(
     alloc: Allocator,
     reads: *segment_mod.TypedReadScope,
     snap: *const index_mod.IndexSnapshot,
-    buckets: *std.AutoHashMapUnmanaged(u64, std.ArrayListUnmanaged(scorer_mod.ScoredHit)),
+    buckets: *std.AutoHashMapUnmanaged(i128, std.ArrayListUnmanaged(scorer_mod.ScoredHit)),
     sub_specs: []const AggSpec,
 ) ![]const BucketSubResult {
     var results = try alloc.alloc(BucketSubResult, buckets.count());
@@ -3388,14 +3407,14 @@ fn buildSubResultsU64(
     var it = buckets.iterator();
     while (it.next()) |entry| {
         results[idx] = .{
-            .bucket_key = .{ .uint = entry.key_ptr.* },
+            .bucket_key = .{ .timestamp = entry.key_ptr.* },
             .aggs = try collectLeafAggs(alloc, reads, snap, entry.value_ptr.items, sub_specs),
         };
         idx += 1;
     }
     std.mem.sort(BucketSubResult, results, {}, struct {
         fn cmp(_: void, a: BucketSubResult, b: BucketSubResult) bool {
-            return a.bucket_key.uint < b.bucket_key.uint;
+            return a.bucket_key.timestamp < b.bucket_key.timestamp;
         }
     }.cmp);
     return results;
@@ -3475,11 +3494,11 @@ fn collectOneAgg(
             return .{ .terms = entries };
         },
         .date_histogram => |dh| {
-            var agg = aggregation_mod.DateHistogramAgg.init(alloc, dh.interval);
+            var agg = aggregation_mod.SignedDateHistogramAgg.init(alloc, dh.interval);
             defer agg.deinit();
 
             for (scored) |hit| {
-                if (try readU64ForDoc(alloc, reads, snap, hit.doc_id, spec.field)) |ns| {
+                if (try readTimestampForDoc(alloc, reads, snap, hit.doc_id, spec.field)) |ns| {
                     try agg.collect(ns);
                 }
             }
@@ -3695,20 +3714,21 @@ fn readBytesForDoc(
     return reader.getBytesAllocWithAllocator(alloc, resolved.local_id);
 }
 
-/// Read a u64 typed doc value for a global doc ID.
-fn readU64ForDoc(
+/// Read signed timestamps, promoting legacy unsigned doc values exactly.
+fn readTimestampForDoc(
     alloc: Allocator,
     reads: *segment_mod.TypedReadScope,
     snap: *const index_mod.IndexSnapshot,
     global_id: u32,
     field: []const u8,
-) !?u64 {
+) !?i128 {
     _ = alloc;
     const resolved = snap.resolveDocId(global_id) orelse return null;
     const seg = &snap.segments[resolved.seg_idx];
     const reader = (try reads.get(&seg.reader, field)) orelse return null;
+    if (reader.value_type == .datetime_ns) return try reader.getDateTimeNs(resolved.local_id);
     if (reader.value_type != .u64_val) return null;
-    return try reader.getU64(resolved.local_id);
+    return if (try reader.getU64(resolved.local_id)) |ns| @as(i128, ns) else null;
 }
 
 /// Read a geo_point typed doc value for a global doc ID.
@@ -5801,4 +5821,140 @@ test "external lake indexed bitmap filters preserve ranking disjunction and exac
     defer remaining.deinit();
     try std.testing.expectEqual(@as(usize, 1), remaining.hits.len);
     try std.testing.expectEqual(@as(u32, 0), remaining.hits[0].doc_id);
+}
+
+test "search signed date histogram retains negative wide and nested buckets" {
+    const alloc = std.testing.allocator;
+
+    // Build inverted index (all docs match "x")
+    var inv_builder = inverted.InvertedIndexBuilder.init(alloc, .{});
+    defer inv_builder.deinit();
+    try inv_builder.addDocument(0, &.{.{ .term = "x", .freq = 1, .norm = 10 }});
+    try inv_builder.addDocument(1, &.{.{ .term = "x", .freq = 1, .norm = 10 }});
+    try inv_builder.addDocument(2, &.{.{ .term = "x", .freq = 1, .norm = 10 }});
+    const inv_data = try inv_builder.build();
+    defer alloc.free(inv_data);
+
+    var dv_writer = typed_dv.TypedDocValuesWriter.init(alloc, .datetime_ns, 1024);
+    defer dv_writer.deinit();
+    try dv_writer.add(0, .{ .datetime_ns = -1 });
+    try dv_writer.add(1, .{ .datetime_ns = 0 });
+    try dv_writer.add(2, .{ .datetime_ns = 253402300799999999999 });
+    const dv_data = try dv_writer.build();
+    defer alloc.free(dv_data);
+
+    var seg_writer = segment_mod.SegmentWriter.init(alloc);
+    defer seg_writer.deinit();
+    const title_idx = try seg_writer.addField("title");
+    try seg_writer.addSection(title_idx, .inverted_text, inv_data);
+    const ts_idx = try seg_writer.addField("timestamp");
+    try seg_writer.addSection(ts_idx, .typed_doc_values, dv_data);
+    try seg_writer.addStoredDoc("d1", "{}");
+    try seg_writer.addStoredDoc("d2", "{}");
+    try seg_writer.addStoredDoc("d3", "{}");
+    const seg_bytes = try seg_writer.build();
+    defer alloc.free(seg_bytes);
+
+    var writer = try index_mod.IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(seg_bytes);
+
+    const snap = writer.snapshot();
+    var result = try execute(alloc, snap, .{
+        .query = .{ .term = .{ .field = "title", .term = "x" } },
+        .k = 10,
+        .aggregations = &.{
+            .{ .name = "by_hour", .field = "timestamp", .agg_type = .{ .date_histogram = .{ .interval = .hour } }, .sub_aggs = &.{.{ .name = "nested", .field = "timestamp", .agg_type = .{ .date_histogram = .{ .interval = .day } } }} },
+        },
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), result.aggregations.len);
+    const dh = result.aggregations[0].result.date_histogram;
+    try std.testing.expectEqual(@as(usize, 3), dh.keys.len);
+    try std.testing.expectEqual(@as(i128, -std.time.ns_per_hour), dh.keys[0]);
+    try std.testing.expectEqual(@as(i128, 0), dh.keys[1]);
+    try std.testing.expect(dh.keys[2] > std.math.maxInt(u64));
+    for (dh.counts) |count| try std.testing.expectEqual(@as(u64, 1), count);
+    const nested = result.aggregations[0].sub_results.?;
+    try std.testing.expectEqual(@as(usize, 3), nested.len);
+    try std.testing.expectEqual(dh.keys[0], nested[0].bucket_key.timestamp);
+    try std.testing.expectEqual(@as(i128, -std.time.ns_per_day), nested[0].aggs[0].result.date_histogram.keys[0]);
+}
+
+test "external lake deferred membership refines text candidates with exact scores counts and exclusions" {
+    const a = std.testing.allocator;
+    const bytes = try buildTestSegmentWithStoredDocs(a, &.{
+        .{ .id = "zero", .data = "{}", .terms = &.{.{ .term = "rare", .freq = 4, .norm = 10 }} },
+        .{ .id = "one", .data = "{}", .terms = &.{.{ .term = "common", .freq = 2, .norm = 10 }} },
+        .{ .id = "two", .data = "{}", .terms = &.{.{ .term = "rare", .freq = 1, .norm = 10 }} },
+    });
+    defer a.free(bytes);
+    var writer = try index_mod.IndexWriter.init(a);
+    defer writer.deinit();
+    try writer.addSegment(bytes);
+    try writer.addSegment(bytes);
+    const Producer = struct {
+        calls: usize = 0,
+        probed: usize = 0,
+        fail: bool = false,
+        fn produce(raw: *anyopaque, alloc: Allocator, offset: u32, count: u32, candidates: ?*const roaring.RoaringBitmap) !roaring.RoaringBitmap {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.fail) return error.InjectedMembershipFailure;
+            self.calls += 1;
+            var result = roaring.RoaringBitmap.init(alloc);
+            errdefer result.deinit();
+            const selected = candidates orelse return error.ExpectedTextCandidates;
+            self.probed += selected.cardinality();
+            var iterator = selected.iterator();
+            while (iterator.next()) |doc| {
+                if (doc >= count) return error.InvalidArgument;
+                if ((offset + doc) % 2 == 0) try result.add(doc);
+            }
+            return result;
+        }
+    };
+    var producer: Producer = .{};
+    const deferred: SearchQuery = .{ .doc_num = .{ .ids = &.{}, .producer = .{ .ptr = &producer, .produce = Producer.produce }, .boost = 0 } };
+    const base: SearchQuery = .{ .match = .{ .field = "title", .text = "rare" } };
+    const included: SearchQuery = .{ .bool_query = .{ .must = &.{ base, deferred } } };
+    const excluded: SearchQuery = .{ .bool_query = .{ .must = &.{base}, .must_not = &.{deferred} } };
+    var original = try execute(a, writer.snapshot(), .{ .query = base, .k = 6, .include_stored = false });
+    defer original.deinit();
+    var bitmap = roaring.RoaringBitmap.init(a);
+    defer bitmap.deinit();
+    for ([_]u32{ 0, 2, 4 }) |doc| try bitmap.add(doc);
+    const bitmap_clause: SearchQuery = .{ .doc_num = .{ .ids = &.{}, .bitmap = &bitmap, .boost = 0 } };
+    for ([_]SearchQuery{ included, excluded }) |query| {
+        const reference_query: SearchQuery = if (query.bool_query.must.len == 2)
+            .{ .bool_query = .{ .must = &.{ base, bitmap_clause } } }
+        else
+            .{ .bool_query = .{ .must = &.{base}, .must_not = &.{bitmap_clause} } };
+        var reference = try execute(a, writer.snapshot(), .{ .query = reference_query, .k = 6, .include_stored = false });
+        defer reference.deinit();
+        var result = try execute(a, writer.snapshot(), .{ .query = query, .k = 6, .include_stored = false });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 2), result.hits.len);
+        try std.testing.expectEqual(@as(u32, 2), try countMatches(a, writer.snapshot(), query));
+        var count = try executeCountCandidates(a, writer.snapshot(), query);
+        defer count.deinit();
+        try std.testing.expectEqual(@as(u32, 2), count.total_hits);
+        for (result.hits) |hit| {
+            try std.testing.expectEqual(query.bool_query.must.len == 2, hit.doc_id % 2 == 0);
+            const expected = for (original.hits) |before| {
+                if (before.doc_id == hit.doc_id) break before.score;
+            } else return error.TestUnexpectedResult;
+            // Existing filtered/unfiltered scorer kernels can differ by an
+            // f32 ULP; deferred membership must exactly match bitmap scoring.
+            try std.testing.expectApproxEqAbs(expected, hit.score, 0.000001);
+            const bitmap_score = for (reference.hits) |before| {
+                if (before.doc_id == hit.doc_id) break before.score;
+            } else return error.TestUnexpectedResult;
+            try std.testing.expectEqual(bitmap_score, hit.score);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 12), producer.calls);
+    try std.testing.expectEqual(@as(usize, 24), producer.probed);
+    producer.fail = true;
+    try std.testing.expectError(error.InjectedMembershipFailure, execute(a, writer.snapshot(), .{ .query = included, .k = 2 }));
 }

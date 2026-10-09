@@ -207,6 +207,15 @@ pub const SparseCompactionRuntime = if (builtin.os.tag == .freestanding) struct 
         self.mutex.unlock(io);
     }
 
+    fn enterLocatorBatch(raw: *anyopaque) !void {
+        const self: *SparseCompactionRuntime = @ptrCast(@alignCast(raw));
+        if (!try lockApplyExclusiveCancellable(self)) return error.Canceled;
+    }
+    fn leaveLocatorBatch(raw: *anyopaque) void {
+        const self: *SparseCompactionRuntime = @ptrCast(@alignCast(raw));
+        self.apply_mutex.unlockExclusive();
+    }
+
     pub fn runOnce(self: *SparseCompactionRuntime) !bool {
         var maybe_task: ?index_manager_mod.IndexManager.SparseCompactionTask = null;
         if (!try lockApplyExclusiveCancellable(self)) return false;
@@ -234,9 +243,11 @@ pub const SparseCompactionRuntime = if (builtin.os.tag == .freestanding) struct 
         // and a pending cancellation is re-observed immediately afterward.
         var retirement = try MandatoryApplyRetirement.acquire(self);
         defer retirement.deinit();
-        const finish_result = self.index_manager.finishSparseCompactionTask(&task, &result);
+        const finish_result = self.index_manager.publishSparseCompactionTask(&task, &result);
         try retirement.releaseAndCheckCancellation();
-        _ = try finish_result;
+        if (try finish_result) {
+            try index_manager_mod.IndexManager.completeSparseCompactionTask(work_alloc, &task, &result, .{ .ptr = self, .enter = enterLocatorBatch, .leave = leaveLocatorBatch });
+        }
         return true;
     }
 };

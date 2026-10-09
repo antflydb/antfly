@@ -1831,8 +1831,11 @@ fn synthesizePulledModelManifestJsonInternal(
     if (qualified_boundary_decide) try appendUniqueOwnedString(allocator, &capabilities, "typed_decisions");
     // Reserved public capability: neither an alias nor a caller-supplied CSV
     // may publish it for a merely similar boundary artifact.
+    // EmbeddingGemma 2 decides by embedding similarity, not typed decisions;
+    // its manifest derives `decide` from the architecture itself.
+    const similarity_decider = manifest.embedding_style == .embedding_gemma2 and manifest.hasCapability("embedding_similarity");
     if (!qualified_decide and !qualified_boundary_decide and !manifest.laya_declared) {
-        if (taskListContains(tasks.items, "decide") or taskListContains(capabilities.items, "typed_decisions"))
+        if ((taskListContains(tasks.items, "decide") and !similarity_decider) or taskListContains(capabilities.items, "typed_decisions"))
             return error.UnsupportedGlinerDecisionArtifact;
     }
 
@@ -2083,6 +2086,48 @@ test "pull manifest synthesis operates on private staging and remains receipted"
     var manifest = try manifest_mod.loadFromDir(allocator, model_dir);
     defer manifest.deinit();
     try std.testing.expectEqual(manifest_mod.ModelType.generator, manifest.model_type);
+}
+
+test "pull publishes EmbeddingGemma 2 similarity decisions without typed decisions" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const model_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "staging" });
+    defer allocator.free(model_dir);
+    try download.beginManagedDownload(allocator, io, model_dir);
+    const config = @embedFile("../architectures/embedding_gemma2_config.json");
+    const tokenizer = "{\"added_tokens\":[]}";
+    for ([_][2][]const u8{
+        .{ "config.json", config },
+        .{ "tokenizer.json", tokenizer },
+        .{ "model.safetensors", "payload" },
+    }) |file| {
+        const path = try std.fs.path.join(allocator, &.{ model_dir, file[0] });
+        defer allocator.free(path);
+        try Dir.cwd().writeFile(io, .{ .sub_path = path, .data = file[1] });
+    }
+    const plan_path = try std.fs.path.join(allocator, &.{ model_dir, download.managed_download_plan_filename });
+    defer allocator.free(plan_path);
+    const plan_json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"version\":1,\"artifacts\":[{{\"path\":\"config.json\",\"size\":{d}}},{{\"path\":\"tokenizer.json\",\"size\":{d}}},{{\"path\":\"model.safetensors\",\"size\":7}}]}}",
+        .{ config.len, tokenizer.len },
+    );
+    defer allocator.free(plan_json);
+    try Dir.cwd().writeFile(io, .{ .sub_path = plan_path, .data = plan_json });
+
+    var registry = ModelRegistry.init(allocator, model_dir);
+    try registry.writePulledModelManifest(io, model_dir, null, null);
+    var manifest = try manifest_mod.loadFromManagedPlanDir(allocator, model_dir);
+    defer manifest.deinit();
+    try std.testing.expectEqual(manifest_mod.EmbeddingStyle.embedding_gemma2, manifest.embedding_style);
+    try std.testing.expect(manifest.hasTask("embed"));
+    try std.testing.expect(manifest.hasTask("decide"));
+    try std.testing.expect(manifest.hasCapability("embedding_similarity"));
+    try std.testing.expect(!manifest.hasCapability("typed_decisions"));
+    // Caller-supplied typed decisions stay reserved for qualified deciders.
+    try std.testing.expectError(error.UnsupportedGlinerDecisionArtifact, registry.writePulledModelManifest(io, model_dir, null, "typed_decisions"));
 }
 
 test "pull upgrades a large Laya manifest without tasks and preserves metadata" {

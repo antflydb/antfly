@@ -34,6 +34,50 @@ const typed_dv = @import("../section/typed_doc_values.zig");
 const geo = @import("geo.zig");
 const epoch = std.time.epoch;
 
+/// Native timestamp buckets preserve the signed, nanosecond storage domain.
+/// The unsigned collector below remains available to legacy aggregation ports.
+pub const SignedDateHistogramAgg = DateHistogram(i128);
+
+fn DateHistogram(comptime Timestamp: type) type {
+    return struct {
+        alloc: Allocator,
+        interval: DateInterval,
+        buckets: std.AutoHashMapUnmanaged(Timestamp, u64) = .empty,
+        pub fn init(alloc: Allocator, interval: DateInterval) @This() {
+            return .{ .alloc = alloc, .interval = interval };
+        }
+        pub fn deinit(self: *@This()) void {
+            self.buckets.deinit(self.alloc);
+        }
+        pub fn collect(self: *@This(), timestamp: Timestamp) !void {
+            const entry = try self.buckets.getOrPut(self.alloc, if (Timestamp == i128) try truncateSignedToInterval(timestamp, self.interval) else truncateToInterval(timestamp, self.interval));
+            if (!entry.found_existing) entry.value_ptr.* = 0;
+            entry.value_ptr.* += 1;
+        }
+        pub fn getCount(self: *const @This(), key: Timestamp) u64 {
+            return self.buckets.get(key) orelse 0;
+        }
+        pub fn sortedKeys(self: *const @This(), alloc: Allocator) ![]Timestamp {
+            const result = try alloc.alloc(Timestamp, self.buckets.count());
+            var it = self.buckets.keyIterator();
+            for (result) |*key| key.* = it.next().?.*;
+            std.mem.sort(Timestamp, result, {}, std.sort.asc(Timestamp));
+            return result;
+        }
+    };
+}
+
+pub fn truncateSignedToInterval(ns: i128, interval: DateInterval) !i128 {
+    return @import("../datetime.zig").truncateSigned(ns, switch (interval) {
+        .minute => .minute,
+        .hour => .hour,
+        .day => .day,
+        .week => .week,
+        .month => .month,
+        .year => .year,
+    }) orelse error.InvalidDateTime;
+}
+
 // ============================================================================
 // Stats aggregation
 // ============================================================================
@@ -244,53 +288,7 @@ pub const DateInterval = enum {
 };
 
 /// Calendar-aligned histogram over u64 nanosecond timestamps.
-pub const DateHistogramAgg = struct {
-    alloc: Allocator,
-    interval: DateInterval,
-    buckets: std.ArrayHashMapUnmanaged(u64, u64, HashU64, true),
-
-    const HashU64 = struct {
-        pub fn hash(_: @This(), key: u64) u32 {
-            return @truncate(key ^ (key >> 32));
-        }
-        pub fn eql(_: @This(), a: u64, b: u64, _: usize) bool {
-            return a == b;
-        }
-    };
-
-    pub fn init(alloc: Allocator, interval: DateInterval) DateHistogramAgg {
-        return .{
-            .alloc = alloc,
-            .interval = interval,
-            .buckets = .empty,
-        };
-    }
-
-    pub fn deinit(self: *DateHistogramAgg) void {
-        self.buckets.deinit(self.alloc);
-    }
-
-    pub fn collect(self: *DateHistogramAgg, ns_timestamp: u64) !void {
-        const bucket_key = truncateToInterval(ns_timestamp, self.interval);
-        const gop = try self.buckets.getOrPut(self.alloc, bucket_key);
-        if (!gop.found_existing) gop.value_ptr.* = 0;
-        gop.value_ptr.* += 1;
-    }
-
-    pub fn getCount(self: *const DateHistogramAgg, key: u64) u64 {
-        return self.buckets.get(key) orelse 0;
-    }
-
-    pub fn sortedKeys(self: *const DateHistogramAgg, alloc: Allocator) ![]u64 {
-        const keys = try alloc.dupe(u64, self.buckets.keys());
-        std.mem.sort(u64, keys, {}, struct {
-            fn cmp(_: void, a: u64, b: u64) bool {
-                return a < b;
-            }
-        }.cmp);
-        return keys;
-    }
-};
+pub const DateHistogramAgg = DateHistogram(u64);
 
 const ns_per_sec: u64 = 1_000_000_000;
 
@@ -740,4 +738,20 @@ test "geohash grid aggregation" {
     try std.testing.expectEqual(@as(u64, 2), top[0].count);
     // Second cell should have count 1 (NYC)
     try std.testing.expectEqual(@as(u64, 1), top[1].count);
+}
+
+test "signed date histograms align negative weeks leap months and wide years" {
+    const datetime = @import("../datetime.zig");
+    const before = datetime.parseRfc3339ToSignedNs("1969-12-31T23:59:59Z").?;
+    try std.testing.expectEqual(@as(i128, -std.time.ns_per_min), try truncateSignedToInterval(before, .minute));
+    try std.testing.expectEqual(datetime.parseRfc3339ToSignedNs("1969-12-29T00:00:00Z").?, try truncateSignedToInterval(before, .week));
+    for ([_][]const u8{ "0000-02-29T12:00:00Z", "1968-02-29T12:00:00Z", "9999-02-28T12:00:00Z" }) |text| {
+        const ns = datetime.parseRfc3339ToSignedNs(text).?;
+        var month: [20]u8 = "0000-02-01T00:00:00Z".*;
+        @memcpy(month[0..4], text[0..4]);
+        var year: [20]u8 = "0000-01-01T00:00:00Z".*;
+        @memcpy(year[0..4], text[0..4]);
+        try std.testing.expectEqual(datetime.parseRfc3339ToSignedNs(&month).?, try truncateSignedToInterval(ns, .month));
+        try std.testing.expectEqual(datetime.parseRfc3339ToSignedNs(&year).?, try truncateSignedToInterval(ns, .year));
+    }
 }

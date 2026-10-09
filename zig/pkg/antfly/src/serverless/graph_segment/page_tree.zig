@@ -679,6 +679,8 @@ pub const Cursor = struct {
     frames: [max_height + 1]Frame = undefined,
     depth: usize = 0,
     upper: ?[]const u8,
+    lower: []const u8 = "",
+    reverse: bool = false,
 
     const Frame = struct { page: Page, next: usize, end: ?[]const u8 };
     pub const Record = struct { key: []const u8, value: []const u8 };
@@ -689,6 +691,72 @@ pub const Cursor = struct {
         if (upper) |bound| if (!less(lower, bound)) return self;
         if (root) |ref| try self.descend(ref, lower, null, null);
         return self;
+    }
+
+    /// Reverse traversal of the same half-open range. Seek one root-to-leaf
+    /// path at the upper bound, then visit preceding siblings lazily.
+    pub fn initReverse(alloc: Allocator, store: Store, root: ?Ref, lower: []const u8, upper: ?[]const u8) !Cursor {
+        var self: Cursor = .{ .alloc = alloc, .store = store, .upper = upper, .lower = lower, .reverse = true };
+        errdefer self.deinit();
+        if (upper) |bound| if (!less(lower, bound)) return self;
+        if (root) |ref| try self.descendReverse(ref, upper, null, null);
+        return self;
+    }
+
+    fn descendReverse(self: *Cursor, first: Ref, upper: ?[]const u8, first_key: ?[]const u8, end_key: ?[]const u8) !void {
+        var ref = first;
+        var expected_first = first_key;
+        var expected_end = end_key;
+        while (true) {
+            if (self.depth == self.frames.len) return error.InvalidGraphPage;
+            var page = try load(self.alloc, self.store, ref);
+            errdefer page.deinit(self.alloc);
+            if (expected_first) |key| if (!std.mem.eql(u8, key, page.entries[0].key)) return error.InvalidGraphPage;
+            if (expected_end) |key| if (!less(page.entries[page.entries.len - 1].key, key)) return error.InvalidGraphPage;
+            var lo: usize = 0;
+            var hi = page.entries.len;
+            if (upper) |bound| {
+                while (lo < hi) {
+                    const mid = lo + (hi - lo) / 2;
+                    if (less(page.entries[mid].key, bound)) lo = mid + 1 else hi = mid;
+                }
+            } else lo = hi;
+            if (ref.height == 0 or lo == 0) {
+                self.frames[self.depth] = .{ .page = page, .next = lo, .end = expected_end };
+                self.depth += 1;
+                return;
+            }
+            const index = lo - 1;
+            self.frames[self.depth] = .{ .page = page, .next = index, .end = expected_end };
+            self.depth += 1;
+            ref = page.entries[index].child.?;
+            expected_first = page.entries[index].key;
+            if (index + 1 < page.entries.len) expected_end = page.entries[index + 1].key;
+        }
+    }
+
+    fn previous(self: *Cursor) !?Record {
+        while (self.depth != 0) {
+            const frame = &self.frames[self.depth - 1];
+            if (frame.next == 0) {
+                frame.page.deinit(self.alloc);
+                self.depth -= 1;
+                continue;
+            }
+            frame.next -= 1;
+            const entry = frame.page.entries[frame.next];
+            if (entry.child) |child| {
+                const end = if (frame.next + 1 < frame.page.entries.len) frame.page.entries[frame.next + 1].key else frame.end;
+                try self.descendReverse(child, null, entry.key, end);
+            } else {
+                if (less(entry.key, self.lower)) {
+                    self.deinit();
+                    return null;
+                }
+                return .{ .key = entry.key, .value = entry.value };
+            }
+        }
+        return null;
     }
 
     /// Resume an ordered stream by its stable record offset without reading
@@ -762,6 +830,7 @@ pub const Cursor = struct {
 
     pub fn next(self: *Cursor) !?Record {
         try self.store.check(self.store.ptr);
+        if (self.reverse) return self.previous();
         while (self.depth != 0) {
             const frame = &self.frames[self.depth - 1];
             if (frame.next == frame.page.entries.len) {
@@ -1362,4 +1431,41 @@ test "external lake contribution retention adopts full branches and removes obso
     try std.testing.expect(try retainKnown(a, backing.store(), prior, &.{}) == null);
     // Prior generations remain immutable and readable after the cut.
     try std.testing.expectEqual(@as(u64, 2000), try countRange(a, backing.store(), prior, "", null));
+}
+
+test "external lake reverse tree seeks bounded ranges across leaves" {
+    const a = std.testing.allocator;
+    var backing: TestStore = .{ .alloc = a };
+    defer backing.deinit();
+    const Source = struct {
+        index: u64 = 0,
+        key: [8]u8 = undefined,
+        pub fn next(self: *@This()) !?Cursor.Record {
+            if (self.index == 10000) return null;
+            std.mem.writeInt(u64, &self.key, self.index, .big);
+            self.index += 1;
+            return .{ .key = &self.key, .value = "value" };
+        }
+    };
+    var source: Source = .{};
+    const root = try buildSorted(a, backing.store(), &source);
+    for ([_][2]u64{ .{ 0, 10000 }, .{ 0, 1 }, .{ 228, 500 }, .{ 9990, 10000 }, .{ 500, 500 }, .{ 10001, 11000 } }) |bounds| {
+        var lower: [8]u8 = undefined;
+        var upper: [8]u8 = undefined;
+        std.mem.writeInt(u64, &lower, bounds[0], .big);
+        std.mem.writeInt(u64, &upper, bounds[1], .big);
+        var reverse = try Cursor.initReverse(a, backing.store(), root, &lower, &upper);
+        defer reverse.deinit();
+        var expected = @min(bounds[1], 10000);
+        while (try reverse.next()) |record| {
+            expected -= 1;
+            try std.testing.expectEqual(expected, std.mem.readInt(u64, record.key[0..8], .big));
+        }
+        try std.testing.expectEqual(@min(bounds[0], 10000), expected);
+    }
+    const before = backing.reads;
+    var last = try Cursor.initReverse(a, backing.store(), root, "", null);
+    defer last.deinit();
+    try std.testing.expectEqual(@as(u64, 9999), std.mem.readInt(u64, (try last.next()).?.key[0..8], .big));
+    try std.testing.expect(backing.reads - before <= root.?.height + 1);
 }

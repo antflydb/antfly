@@ -22,8 +22,10 @@ const Allocator = std.mem.Allocator;
 
 pub const Options = struct {
     io: std.Io,
+    cancellation: ?@import("antfly_cancellation").CancellationToken = null,
     directory: []const u8,
     resource_manager: ?*@import("storage/resource_manager.zig").ResourceManager = null,
+    max_input_bytes: usize = std.math.maxInt(usize),
     chunk_bytes: usize = 256 * 1024,
     chunk_records: usize = 1024,
     fan_in: usize = 4,
@@ -53,7 +55,12 @@ pub const Sorter = struct {
         self.run.deinit();
         self.* = undefined;
     }
+    fn check(self: *const Sorter) !void {
+        if (self.options.cancellation) |token| if (token.isCancelled()) return error.Cancelled;
+    }
     pub fn add(self: *Sorter, key: u64, payload: []const u8) !void {
+        try self.check();
+        if (payload.len > self.options.max_input_bytes -| self.input_bytes or 16 > self.options.max_input_bytes -| (self.input_bytes +| payload.len)) return error.ResourceBudgetExceeded;
         if (self.chunk.items.len != 0 and (self.chunk.items.len >= self.options.chunk_records or self.chunk_bytes >= self.options.chunk_bytes)) try self.flush();
         const owned = try self.payloads.allocator().dupe(u8, payload);
         try self.chunk.append(self.allocator, .{ .key = key, .payload = owned });
@@ -106,6 +113,7 @@ pub const Sorter = struct {
         for (cursors[0..ranges.len], 0..) |*cursor, i| heads[i] = try cursor.nextView();
         var copied: [16 * 1024]u8 = undefined;
         while (true) {
+            try self.check();
             var selected: ?usize = null;
             for (heads[0..ranges.len], 0..) |head, i| if (head) |record| {
                 if (selected == null or record.key < heads[selected.?].?.key) selected = i;
@@ -138,6 +146,7 @@ pub const Sorter = struct {
         return result;
     }
     pub fn finish(self: *Sorter) !?Range {
+        try self.check();
         try self.flush();
         var range: ?Range = null;
         for (&self.levels) |*level| {

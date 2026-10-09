@@ -7926,7 +7926,8 @@ test "merged inverted section cleans up partially initialized term iterators" {
             defer failing_alloc.free(merged);
         }
     };
-    try std.testing.checkAllAllocationFailures(alloc, Runner.run, .{ first, second });
+    // Stable remaps keep allocation counts deterministic across fault injections.
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Runner.run, .{ first, second });
 }
 
 test "sparse field postings beyond first chunk survive merge" {
