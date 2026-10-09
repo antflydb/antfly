@@ -1886,10 +1886,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const api_http_runtime_tests = b.addTest(.{
         .root_module = api_http_runtime_test_mod,
         .filters = @import("../../../build_support/antfly/test_support.zig").compileFiltersWithAnchors(b, &.{"api module compiles"}, api_http_runtime_filters),
-        // The native-generation merge raised this linked API/DB harness to
-        // 16.01 GB in macOS ReleaseFast codegen. Reserve measured usage plus
+        // Native lake kernels peak at 18.50 GB in macOS ReleaseFast codegen.
+        // Reserve measured usage plus
         // headroom; the shared runner still caps aggregate compilation.
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 17 else 7) * 1024 * 1024 * 1024,
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 19 else 7) * 1024 * 1024 * 1024,
         .test_runner = .{
             .path = b.path("pkg/antfly-embedded/src/test_runner.zig"),
             .mode = .simple,
@@ -1907,7 +1907,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .name = "lake-api-tests",
         .root_module = api_http_runtime_test_mod,
         .filters = @import("../../../build_support/antfly/test_support.zig").compileFiltersWithAnchors(b, &.{"api module compiles"}, lake_api_filters),
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 17 else 7) * 1024 * 1024 * 1024,
+        // The native ordering and sparse integration suite peaks at 27.89 GB
+        // in macOS ReleaseFast codegen. Reserve 28 GiB, including headroom,
+        // so the shared scheduler admits only one large API compiler at a time.
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 28 else 7) * 1024 * 1024 * 1024,
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("lake-api-test", "Run mounted API lake and SQL integration tests").dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, lake_api_tests, lake_api_filters).step);
@@ -2036,7 +2039,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     test_imports.configure(b, lite_reader_test_mod, true, true);
     const lite_reader_tests = b.addTest(.{
         .root_module = lite_reader_test_mod,
-        .filters = &.{ "search.search.", "search.query.", "index.", "merger.", "segment.", "section.inverted.", "section.typed_doc_values.", "section.doc_values.", "section.vector_section." },
+        .filters = &.{ "search.search.", "search.query.", "search.aggregation.", "datetime.", "index.", "merger.", "segment.", "section.inverted.", "section.typed_doc_values.", "section.doc_values.", "section.vector_section." },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("lite-bounded-reader-test", "Verify segment scratch reuse and stored search result ownership")
@@ -2590,6 +2593,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     test_imports.configure(b, lake_scaffold_test_mod, true, true);
     lake_scaffold_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
     const lake_scaffold_tests = b.addTest(.{
+        // Measured macOS ReleaseSafe partition peak: 15.67 GB. Reserve headroom
+        // for native lake API codegen rather than failing scheduler admission.
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 18 else 10) * 1024 * 1024 * 1024,
         .root_module = lake_scaffold_test_mod,
         .filters = &.{ "lake", "parquet", "iceberg", "external source", "row fragment", "sidecar" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
@@ -2620,6 +2626,19 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     lake_refinement_bench_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
     const lake_refinement_bench = b.addTest(.{ .root_module = lake_refinement_bench_mod, .filters = &.{"native dictionary refinement benchmark"} });
     b.step("lake-native-refinement-bench", "Compare repeated and reused native Parquet dictionary decoding").dependOn(&b.addRunArtifact(lake_refinement_bench).step);
+    const bitmap_seek_bench_mod = b.createModule(.{
+        .root_source_file = b.path("bench/bitmap_seek_bench.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    bitmap_seek_bench_mod.addImport("roaring", b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/encoding/roaring.zig"),
+        .target = target,
+        .optimize = optimize,
+    }));
+    const bitmap_seek_bench = b.addTest(.{ .root_module = bitmap_seek_bench_mod, .filters = &.{"native bitmap lower-bound seek benchmark"} });
+    b.step("lake-bitmap-seek-bench", "Measure fresh bitmap lower-bound probes across 50 million ordinals").dependOn(&b.addRunArtifact(bitmap_seek_bench).step);
+
     const lake_test_step = b.step("lake-test", "Run Antfly lake-native tests");
     lake_test_step.dependOn(&run_lake_scaffold_tests.step);
     unit_test_step.dependOn(&run_lake_scaffold_tests.step);

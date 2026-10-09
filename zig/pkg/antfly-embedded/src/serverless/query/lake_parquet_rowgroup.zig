@@ -270,6 +270,8 @@ pub const PersistentObjectRangeCacheStats = struct {
     temporary_files_removed: usize = 0,
     writes_completed: usize = 0,
     write_errors: usize = 0,
+    /// Static error name; safe to expose after the worker/request is gone.
+    last_write_error: ?[]const u8 = null,
     writes_coalesced: usize = 0,
     writes_dropped: usize = 0,
     dropped_bytes: usize = 0,
@@ -1122,7 +1124,11 @@ fn persistentObjectRangeWorkerMain(state: *PersistentObjectRangeCacheState) void
         }
         state.mutex.unlock(io);
 
-        const outcome = state.writeQueued(task) catch null;
+        var write_error: ?[]const u8 = null;
+        const outcome = state.writeQueued(task) catch |err| failure: {
+            write_error = @errorName(err);
+            break :failure null;
+        };
         state.mutex.lockUncancelable(io);
         _ = state.pending.remove(task.cache_key);
         decrementSaturating(&state.pending_bytes, task.memory_bytes);
@@ -1135,6 +1141,7 @@ fn persistentObjectRangeWorkerMain(state: *PersistentObjectRangeCacheState) void
             },
         } else {
             state.stats.write_errors += 1;
+            state.stats.last_write_error = write_error;
         }
         state.condition.broadcast(io);
         state.mutex.unlock(io);
@@ -9967,6 +9974,124 @@ test "lake persistent cache holds one root owner until shutdown" {
     const bytes = (try successor.readAlloc(a, "key", 5)).?;
     defer a.free(bytes);
     try std.testing.expectEqualStrings("bytes", bytes);
+}
+
+test "external lake projected pages reuse header payload and survive restart without provider reads" {
+    const a = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/projected-restart", .{tmp.sub_path});
+    defer a.free(root);
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(a);
+    for (0..4) |_| try appendPlainI64DataPage(&bytes, a, &.{ 10, 20 });
+    const amount_end = bytes.items.len;
+    // Unselected body data must never be pulled into the projected read.
+    try bytes.appendNTimes(a, 'x', 512 * 1024);
+    const storage = @import("../../storage/object_storage.zig");
+    var memory = storage.MemoryObjectStorage.init(a);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("bucket");
+    var put = try client.putObject("bucket", "data", bytes.items, .{});
+    defer put.deinit(a);
+    const Provider = struct {
+        base: storage.ObjectStorage,
+        calls: usize = 0,
+        bytes: usize = 0,
+        fail: bool = false,
+        vtable: storage.ObjectStorage.VTable,
+        fn get(raw: *anyopaque, alloc: Allocator, bucket: []const u8, key: []const u8, options: storage.GetOptions) !storage.GetResult {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (self.fail) return error.ProviderUnavailable;
+            var base = self.base;
+            base.allocator = alloc;
+            const result = try base.getObject(bucket, key, options);
+            self.bytes += result.body.len;
+            return result;
+        }
+    };
+    var provider: Provider = .{ .base = client, .vtable = client.vtable.* };
+    provider.vtable.get_object = Provider.get;
+    const base = @import("lake_object_reader.zig").ObjectStorageRangeReader.init(.{ .allocator = a, .ptr = &provider, .vtable = &provider.vtable });
+    var chunks = [_]external_source.ColumnChunk{
+        .{ .column_id = @constCast("amount"), .file_offset = 0, .compressed_len = amount_end, .uncompressed_len = amount_end, .physical_type = @constCast("int64"), .encoding = @constCast("plain") },
+        .{ .column_id = @constCast("body"), .file_offset = amount_end, .compressed_len = bytes.items.len - amount_end, .uncompressed_len = bytes.items.len - amount_end, .physical_type = @constCast("byte_array"), .encoding = @constCast("plain") },
+    };
+    var groups = [_]external_source.RowGroup{.{ .ordinal = 0, .row_count = 8, .file_offset = 0, .total_byte_len = bytes.items.len, .column_chunks = &chunks }};
+    var files = [_]external_source.FileEntry{.{ .file_id = @constCast("data"), .object_uri = @constCast("s3://bucket/data"), .etag = put.etag.?, .byte_len = bytes.items.len, .row_count = 8, .row_groups = &groups }};
+    const inventory: external_source.Inventory = .{ .format = .parquet, .source_id = @constCast("events"), .source_uri = @constCast("s3://bucket"), .snapshot_id = @constCast("v1"), .schema_fingerprint = @constCast("v1"), .files = &files };
+    const shared = @import("lake_serving_cache.zig");
+    for (0..2) |restart| {
+        var cache = shared.Cache.init(a);
+        defer cache.deinit();
+        try cache.ensurePersistent(io, root, .{}, .{});
+        var reader: shared.Reader = .{ .cache = &cache, .base = base, .scope = @splat(0), .context = .{ .io = io } };
+        var cursor = try @import("lake_parquet_cursor.zig").Cursor.init(a, reader.reader(), inventory, "data", 0, &.{"amount"}, .{});
+        defer cursor.deinit();
+        var rows: usize = 0;
+        while (try cursor.next()) |batch| {
+            for (0..batch.rowCount()) |index| {
+                try std.testing.expectEqual(@as(i64, if (rows % 2 == 0) 10 else 20), try batch.columns[0].integerAt(index));
+                rows += 1;
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 8), rows);
+        try std.testing.expectEqual(@as(usize, 4), provider.calls);
+        try std.testing.expect(provider.bytes < 4 * amount_end);
+        try std.testing.expect(provider.bytes < 512 * 1024);
+        if (restart == 0) {
+            try std.testing.expectEqual(@as(u64, 4), cache.snapshot().provider_reads);
+        } else {
+            try std.testing.expectEqual(@as(u64, 0), cache.snapshot().provider_reads);
+            try std.testing.expectEqual(@as(u64, 4), cache.snapshot().disk_hits);
+        }
+        provider.fail = true;
+    }
+}
+
+test "lake persistent cache exposes publication failures and recovers the write worker" {
+    const a = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(a, .{});
+    defer threaded.deinit();
+    const native_io = threaded.io();
+    const Fault = struct {
+        var fail: std.atomic.Value(bool) = .init(true);
+        var original: @TypeOf(std.testing.io.vtable.dirRename) = undefined;
+        fn rename(raw: ?*anyopaque, old_dir: std.Io.Dir, old_path: []const u8, new_dir: std.Io.Dir, new_path: []const u8) std.Io.Dir.RenameError!void {
+            if (fail.load(.acquire)) return error.AccessDenied;
+            return original(raw, old_dir, old_path, new_dir, new_path);
+        }
+    };
+    Fault.fail.store(true, .release);
+    Fault.original = native_io.vtable.dirRename;
+    var vtable = native_io.vtable.*;
+    vtable.dirRename = Fault.rename;
+    const io: std.Io = .{ .userdata = native_io.userdata, .vtable = &vtable };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/write-failure", .{tmp.sub_path});
+    defer a.free(root);
+    var disk = try PersistentObjectRangeCache.init(io, root);
+    defer disk.deinit();
+    try std.testing.expectEqual(.enqueued, disk.enqueueWrite("key", "data"));
+    disk.flush();
+    const failed = disk.statsSnapshot();
+    try std.testing.expectEqual(@as(usize, 1), failed.write_errors);
+    try std.testing.expectEqualStrings("AccessDenied", failed.last_write_error.?);
+    try std.testing.expectEqual(@as(usize, 0), failed.queued_entries);
+    try std.testing.expectEqual(@as(usize, 0), failed.entries);
+    Fault.fail.store(false, .release);
+    try std.testing.expectEqual(.enqueued, disk.enqueueWrite("key", "data"));
+    disk.flush();
+    try std.testing.expectEqual(@as(usize, 1), disk.statsSnapshot().writes_completed);
+    const restored = (try disk.readAlloc(a, "key", 4)).?;
+    defer a.free(restored);
+    try std.testing.expectEqualStrings("data", restored);
 }
 
 test "lake persistent cache recovery preserves priority when capacity shrinks" {

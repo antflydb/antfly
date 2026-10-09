@@ -10256,6 +10256,10 @@ components:
           type: integer
           format: int64
           description: Candidate documents considered by sort execution.
+        ordered_scanned_count:
+          type: integer
+          format: int64
+          description: Ordered lake entries traversed before native membership filtering.
         cursor_rejected_count:
           type: integer
           format: int64

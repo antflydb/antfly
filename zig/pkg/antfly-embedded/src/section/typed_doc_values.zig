@@ -52,6 +52,8 @@ pub const ValueType = enum(u8) {
     bool_val = 4,
     i64_val = 5,
     numeric_val = 6,
+    /// Signed Unix nanoseconds, fixed 16-byte little endian (wire tag v1).
+    datetime_ns = 7,
 };
 
 pub const NumericValue = union(enum(u8)) {
@@ -131,6 +133,7 @@ pub const TypedValue = union(enum) {
     geo_point: GeoPoint,
     bool_val: bool,
     numeric_val: NumericValue,
+    datetime_ns: i128,
 };
 
 fn typedValueMatchesValueType(value: TypedValue, value_type: ValueType) bool {
@@ -142,6 +145,7 @@ fn typedValueMatchesValueType(value: TypedValue, value_type: ValueType) bool {
         .geo_point => value == .geo_point,
         .bool_val => value == .bool_val,
         .numeric_val => value == .numeric_val,
+        .datetime_ns => value == .datetime_ns,
     };
 }
 
@@ -180,6 +184,7 @@ fn parseValueType(raw: u8) !ValueType {
         @backingInt(ValueType.bool_val) => .bool_val,
         @backingInt(ValueType.i64_val) => .i64_val,
         @backingInt(ValueType.numeric_val) => .numeric_val,
+        @backingInt(ValueType.datetime_ns) => .datetime_ns,
         else => error.InvalidData,
     };
 }
@@ -273,7 +278,7 @@ pub const TypedDocValuesWriter = struct {
         const next_raw_bytes = try std.math.add(usize, self.raw_value_bytes, switch (value) {
             .bytes_val => |bytes| try std.math.add(usize, bytes.len, 8),
             .bool_val => 5,
-            .geo_point => 20,
+            .geo_point, .datetime_ns => 20,
             .numeric_val => 13,
             else => 12,
         });
@@ -307,7 +312,7 @@ pub const TypedDocValuesWriter = struct {
                 const value_bytes: usize = switch (self.entries.items[next_entry].value) {
                     .u64_val, .i64_val, .f64_val => 8,
                     .numeric_val => 9,
-                    .geo_point => 16,
+                    .geo_point, .datetime_ns => 16,
                     .bool_val => 1,
                     .bytes_val => |bytes| std.math.add(usize, bytes.len, 4) catch return error.InvalidData,
                 };
@@ -370,6 +375,11 @@ pub const TypedDocValuesWriter = struct {
 
     fn writeValue(self: *TypedDocValuesWriter, out: *std.ArrayListUnmanaged(u8), value: TypedValue) !void {
         switch (self.value_type) {
+            .datetime_ns => {
+                var bytes: [16]u8 = undefined;
+                std.mem.writeInt(i128, &bytes, value.datetime_ns, .little);
+                try out.appendSlice(self.alloc, &bytes);
+            },
             .u64_val => {
                 const v = value.u64_val;
                 try out.appendSlice(self.alloc, &@as([8]u8, @bitCast(@as(u64, v))));
@@ -447,7 +457,7 @@ pub const StreamingWriter = struct {
         const bytes: usize = switch (value) {
             .bytes_val => |v| try std.math.add(usize, 8, v.len),
             .bool_val => 5,
-            .geo_point => 20,
+            .geo_point, .datetime_ns => 20,
             .numeric_val => 13,
             else => 12,
         };
@@ -940,6 +950,7 @@ pub const TypedDocValuesReader = struct {
                 const doc_offset = 4 + pos * 4;
                 const doc_id = std.mem.readInt(u32, self.chunk.data[doc_offset..][0..4], .little);
                 const value: TypedValue = switch (self.chunk.value_type) {
+                    .datetime_ns => .{ .datetime_ns = std.mem.readInt(i128, self.chunk.data[self.chunk.values_start + pos * 16 ..][0..16], .little) },
                     .u64_val => .{ .u64_val = std.mem.readInt(u64, self.chunk.data[self.chunk.values_start + pos * 8 ..][0..8], .little) },
                     .i64_val => .{ .i64_val = std.mem.readInt(i64, self.chunk.data[self.chunk.values_start + pos * 8 ..][0..8], .little) },
                     .f64_val => .{ .f64_val = try decodeSerializableF64(self.chunk.data[self.chunk.values_start + pos * 8 ..][0..8].*) },
@@ -1087,6 +1098,17 @@ pub const TypedDocValuesReader = struct {
         const num_docs = std.mem.readInt(u32, found.chunk_data[0..4], .little);
         const val_off = try fixedValueOffset(found.chunk_data, num_docs, found.pos, 8);
         return std.mem.readInt(u64, found.chunk_data[val_off..][0..8], .little);
+    }
+
+    /// Legacy unsigned columns and signed v1 datetime columns share one reader contract.
+    pub fn getDateTimeNs(self: *const TypedDocValuesReader, doc_id: u32) !?i128 {
+        if (self.value_type == .u64_val) return if (try self.getU64(doc_id)) |v| @as(i128, v) else null;
+        if (self.value_type != .datetime_ns) return error.InvalidData;
+        const found = try self.findDoc(doc_id) orelse return null;
+        defer if (found.owned) self.alloc.free(found.chunk_data);
+        const num_docs = std.mem.readInt(u32, found.chunk_data[0..4], .little);
+        const val_off = try fixedValueOffset(found.chunk_data, num_docs, found.pos, 16);
+        return std.mem.readInt(i128, found.chunk_data[val_off..][0..16], .little);
     }
 
     /// Get a single i64 value for a doc.
@@ -1303,6 +1325,9 @@ pub const TypedDocValuesReader = struct {
         num_docs: u32,
     ) !void {
         switch (self.value_type) {
+            .datetime_ns => {
+                _ = try fixedValueSpanStart(chunk_data, num_docs, 16);
+            },
             .u64_val, .i64_val => {
                 _ = try fixedValueSpanStart(chunk_data, num_docs, 8);
             },
@@ -2174,4 +2199,29 @@ test "streamed typed directories roundtrip through range readers and unwind allo
     };
     try Sweep.run(a);
     try std.testing.checkAllAllocationFailures(a, Sweep.run, .{});
+}
+
+test "external lake signed datetime doc values round trip wide instants and legacy columns" {
+    const a = std.testing.allocator;
+    var writer = TypedDocValuesWriter.init(a, .datetime_ns, 2);
+    defer writer.deinit();
+    const values = [_]i128{ -1, -2208988800000000000, 0, 18446744073709551616, 253402300799999999999 };
+    for (values, 0..) |value, i| try writer.add(@intCast(i), .{ .datetime_ns = value });
+    const bytes = try writer.build();
+    defer a.free(bytes);
+    var reader = try TypedDocValuesReader.init(a, bytes);
+    defer reader.deinit();
+    for (values, 0..) |value, i| try std.testing.expectEqual(value, (try reader.getDateTimeNs(@intCast(i))).?);
+    var cursor = TypedDocValuesReader.Cursor.init(&reader);
+    defer cursor.deinit();
+    for (values) |value| try std.testing.expectEqual(value, (try cursor.next()).?.value.datetime_ns);
+    try std.testing.expectEqual(null, try cursor.next());
+    var old = TypedDocValuesWriter.init(a, .u64_val, 2);
+    defer old.deinit();
+    try old.add(0, .{ .u64_val = std.math.maxInt(u64) });
+    const legacy = try old.build();
+    defer a.free(legacy);
+    var old_reader = try TypedDocValuesReader.init(a, legacy);
+    defer old_reader.deinit();
+    try std.testing.expectEqual(@as(i128, std.math.maxInt(u64)), (try old_reader.getDateTimeNs(0)).?);
 }

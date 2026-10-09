@@ -1520,6 +1520,8 @@ pub const Sort = struct {
     keys: @import("typed_store.zig").Store,
     estimated: usize = 0,
     runs: [32]?Sequential = @splat(null),
+    /// Cohort callers also reserve file capacity for pending runs and merges.
+    run_limit: usize = 32,
     run_levels: [32]u8 = @splat(0),
     outputs: [8]?Sequential = @splat(null),
     heads: [8]?Decoded = @splat(null),
@@ -1766,6 +1768,7 @@ pub const Sort = struct {
         return self.admitRun(run);
     }
     fn admitRun(self: *Sort, input: Sequential) !void {
+        std.debug.assert(self.run_limit >= 1 and self.run_limit <= self.runs.len);
         var run = input;
         errdefer run.close();
         var level: u8 = 0;
@@ -1774,7 +1777,7 @@ pub const Sort = struct {
             var indices: [8]usize = undefined;
             var count: usize = 0;
             var empty: ?usize = null;
-            for (self.runs, self.run_levels, 0..) |slot, candidate_level, index| {
+            for (self.runs[0..self.run_limit], self.run_levels[0..self.run_limit], 0..) |slot, candidate_level, index| {
                 if (slot == null) {
                     empty = index;
                 } else if (candidate_level == level and count < fan_in - 1) {
@@ -1793,8 +1796,8 @@ pub const Sort = struct {
             if (empty == null and count < fan_in - 1) {
                 count = 0;
                 var order: [32]usize = undefined;
-                for (&order, 0..) |*index, i| index.* = i;
-                std.mem.sort(usize, &order, self, struct {
+                for (order[0..self.run_limit], 0..) |*index, i| index.* = i;
+                std.mem.sort(usize, order[0..self.run_limit], self, struct {
                     fn less(sort: *Sort, a: usize, b: usize) bool {
                         return sort.run_levels[a] < sort.run_levels[b];
                     }
@@ -1827,7 +1830,7 @@ pub const Sort = struct {
     fn fanIn(self: *const Sort) usize {
         const block_workspace = if (self.blockBytes() > 128) self.blockBytes() *| 8 else 0;
         const head_bytes = self.max_row_bytes *| 4 +| self.manager.buffer_bytes *| 2 +| block_workspace +| 512;
-        return @min(@min(self.outputs.len, @max(@as(usize, 2), self.merge_fan_in)), @max(@as(usize, 2), self.memory_bytes / @max(1, head_bytes)));
+        return @min(self.run_limit + 1, @min(@min(self.outputs.len, @max(@as(usize, 2), self.merge_fan_in)), @max(@as(usize, 2), self.memory_bytes / @max(1, head_bytes))));
     }
     fn readRun(self: *Sort, file: *Sequential, a: Allocator, offset: u64) !Decoded {
         if (offset == 0) try file.seal();
@@ -2866,4 +2869,37 @@ fn typedSpillVectorScenario(a: Allocator) !void {
 test "SQL typed spill vectors preserve dictionaries nulls exact integers and float bits under allocation failure" {
     try typedSpillVectorScenario(std.testing.allocator);
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, typedSpillVectorScenario, .{});
+}
+
+test "SQL fused sort cohorts reserve shared file capacity for merges" {
+    const a = std.testing.allocator;
+    const Hook = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    var dummy: u8 = 0;
+    var manager: Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check };
+    defer manager.deinit();
+    {
+        var sorts: [8]Sort = undefined;
+        for (&sorts) |*sort| {
+            sort.* = Sort.init(a, &manager, &.{.{}}, 4096);
+            sort.run_limit = 4;
+            sort.parallel_runs = false;
+        }
+        defer for (&sorts) |*sort| sort.deinit();
+        for (0..512) |i| for (&sorts) |*sort| {
+            try sort.add(.{ .values = &.{}, .keys = &.{Datum.json(.{ .integer = @intCast(511 - i) })}, .ordinal = i });
+        };
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        for (&sorts) |*sort| {
+            for (0..512) |i| {
+                _ = arena.reset(.retain_capacity);
+                const row = (try sort.next(arena.allocator())).?;
+                try std.testing.expectEqual(@as(i64, @intCast(i)), row.keys[0].value.integer);
+            }
+            try std.testing.expect((try sort.next(arena.allocator())) == null);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), manager.files);
 }
