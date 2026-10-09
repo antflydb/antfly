@@ -15486,6 +15486,10 @@ test "distributed graph fans out per-group expand and hydrate with worker io" {
         hydrate_active: std.atomic.Value(u32) = .init(0),
         max_expand_active: std.atomic.Value(u32) = .init(0),
         max_hydrate_active: std.atomic.Value(u32) = .init(0),
+        edge_calls: std.atomic.Value(u32) = .init(0),
+        edge_active: std.atomic.Value(u32) = .init(0),
+        max_edge_active: std.atomic.Value(u32) = .init(0),
+        cancel_on_edge: ?*std.atomic.Value(bool) = null,
 
         fn verifyChild(self: *@This(), borrow: ?runnable_abi.Borrowed) !void {
             const scheduler = self.scheduler orelse {
@@ -15559,6 +15563,7 @@ test "distributed graph fans out per-group expand and hydrate with worker io" {
                 .vtable = &.{
                     .execute_graph_expand = executeGraphExpand,
                     .execute_graph_hydrate = executeGraphHydrate,
+                    .execute_graph_get_edges = executeGraphEdges,
                     .fanout_io = fanoutIo,
                 },
             };
@@ -15626,6 +15631,41 @@ test "distributed graph fans out per-group expand and hydrate with worker io" {
                 },
             };
             return .{ .expansions = expansions };
+        }
+
+        fn executeGraphEdges(
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            req: GraphEdgesRequest,
+            _: raft_mod.ReadConsistency,
+        ) !GraphEdgesResponse {
+            const state: *TestState = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("docs", table_name);
+            try std.testing.expectEqualStrings("doc:a", req.key);
+            try std.testing.expectEqual(graph_mod.EdgeDirection.out, req.direction);
+            try state.verifyChild(req.execution_runnable);
+            _ = state.edge_calls.fetchAdd(1, .monotonic);
+            const active = state.edge_active.fetchAdd(1, .monotonic) + 1;
+            defer _ = state.edge_active.fetchSub(1, .monotonic);
+            TestState.updateMax(&state.max_edge_active, active);
+            try state.io_impl.io().sleep(.fromMilliseconds(10), .awake);
+            const edges = try alloc.alloc(graph_mod.Edge, 1);
+            errdefer alloc.free(edges);
+            edges[0] = try cloneOwnedGraphEdge(alloc, .{
+                .source = req.key,
+                .target = if (group_id == 11) "doc:b" else "doc:o",
+                .edge_type = "R",
+                .weight = 1,
+                .created_at = 0,
+                .updated_at = 0,
+                .metadata = "",
+            });
+            // Denied publication must still join this callback and destroy
+            // the slot's already allocated result before retiring its child.
+            if (state.cancel_on_edge) |flag| flag.store(true, .release);
+            return .{ .edges = edges, .scanned_rows = 1 };
         }
 
         fn executeGraphHydrate(
@@ -15762,6 +15802,40 @@ test "distributed graph fans out per-group expand and hydrate with worker io" {
             try std.testing.expect(hit.doc_ordinal == null);
         }
 
+        var edge_worker = FakeWorker.iface(&state);
+        edge_worker.execution_deadline_ns = req.execution_deadline_ns;
+        edge_worker.cancellation = req.cancellation;
+        edge_worker.runnable = req.execution_runnable;
+        const topology_epoch = try table_catalog.topologyEpoch(std.testing.allocator, FakeCatalog.iface(), "docs");
+        var admission = GraphNodeAdmissionContext.init(std.testing.allocator, FakeCatalog.iface(), edge_worker, "docs", "graph_idx", topology_epoch, req, null, &.{}, .{}, .read_index);
+        defer admission.deinit();
+        const edge_reader = DistributedEdgeReader{ .catalog = FakeCatalog.iface(), .worker = edge_worker, .source_table = "docs", .index_name = "graph_idx", .consistency = .read_index, .admission = &admission };
+        const edges = try edge_reader.getEdgesBounded(std.testing.allocator, null, "doc:a", &.{"R"}, .out, 4, 4096);
+        defer edge_reader.freeEdges(std.testing.allocator, edges);
+        try std.testing.expectEqual(@as(usize, 2), edges.len);
+        try std.testing.expectEqualStrings("doc:b", edges[0].target);
+        try std.testing.expectEqualStrings("doc:o", edges[1].target);
+        try std.testing.expectEqual(@as(u64, 11), edges[0].origin_group_id);
+        try std.testing.expectEqual(@as(u64, 22), edges[1].origin_group_id);
+        try std.testing.expectEqual(@as(u32, 2), state.edge_calls.load(.acquire));
+        try std.testing.expectEqual(@as(u32, 0), state.edge_active.load(.acquire));
+        if (capacity == 2) {
+            try std.testing.expectEqual(@as(u32, 1), state.max_edge_active.load(.acquire));
+        } else {
+            try std.testing.expect(state.max_edge_active.load(.acquire) >= 2);
+        }
+        if (capacity != 0) {
+            try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+            try std.testing.expectEqual(@as(u64, 23), scheduler.stats().retained_bytes);
+        }
+        state.cancel_on_edge = &cancellation;
+        try std.testing.expectError(if (capacity == 0) error.Cancelled else error.Canceled, edge_reader.getEdgesBounded(std.testing.allocator, null, "doc:a", &.{"R"}, .out, 4, 4096));
+        try std.testing.expect(state.edge_calls.load(.acquire) > 2);
+        try std.testing.expectEqual(@as(u32, 0), state.edge_active.load(.acquire));
+        if (capacity != 0) {
+            try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+            try std.testing.expectEqual(@as(u64, 23), scheduler.stats().retained_bytes);
+        }
         cancellation.store(true, .release);
         try std.testing.expectError(if (capacity == 0) error.Cancelled else error.Canceled, @import("antfly_local_sources").api_local_query_contract.checkQueryDeadline(req));
         try std.testing.expectError(if (capacity == 0) error.Cancelled else error.Canceled, executeCrossRange(
