@@ -482,8 +482,11 @@ pub const Predicate = struct {
         return owner.reader.nextPhysical(a, count, owner.predicate_lower, owner.predicate_upper);
     }
     pub fn next(self: *Predicate, a: A, count: usize) ![]const local.storage_rowsource_types.RowRef {
+        return self.nextFor(a, count, null);
+    }
+    pub fn nextFor(self: *Predicate, a: A, count: usize, execution: ?*Execution) ![]const local.storage_rowsource_types.RowRef {
         if (self.scan) while (true) {
-            const page = try self.cursor.next_columns.?(self.cursor.ptr, a, @intCast(count));
+            const page = try self.cursor.columnsFor(execution, a, @intCast(count));
             if (page.native != null) return error.InvalidSqlBackendResponse;
             if (page.selection.len == 0) {
                 if (page.after == null) return &.{};
@@ -493,6 +496,8 @@ pub const Predicate = struct {
             for (refs, page.selection) |*ref, position| ref.* = page.batch.row_refs[position];
             return refs;
         };
+        if (execution) |active| try Owner.bindCoordinator(self.cursor.ptr, active);
+        defer if (execution != null) Owner.releaseCoordinator(self.cursor.ptr);
         const owner: *Owner = @ptrCast(@alignCast(self.cursor.ptr));
         try owner.read_context.ensureActive();
         if (owner.public_order) |*cursor| {
@@ -698,6 +703,10 @@ pub const SearchOrder = struct {
     id_descending: bool = false,
 };
 pub fn tryOpenOrderedPredicate(a: A, server: *server_api.ApiHttpServer, table: catalog.Table, request: catalog.Scan, context: operation.RequestContext, source: *local.serverless_query_lake_serving.ServingSource, reverse: bool, search_order: SearchOrder) !?Predicate {
+    return tryOpenOrderedPredicateFor(a, server, table, request, context, source, reverse, search_order, null);
+}
+pub fn tryOpenOrderedPredicateFor(a: A, server: *server_api.ApiHttpServer, table: catalog.Table, request: catalog.Scan, context: operation.RequestContext, source: *local.serverless_query_lake_serving.ServingSource, reverse: bool, search_order: SearchOrder, execution: ?*Execution) !?Predicate {
+    if (execution) |owner| try owner.checkpoint();
     const definitions = table.external_indexes orelse return null;
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
@@ -723,12 +732,12 @@ pub fn tryOpenOrderedPredicate(a: A, server: *server_api.ApiHttpServer, table: c
         candidate.conditions = conditions.items;
         const indexed = (try chooseAccess(ca, &.{index}, candidate)) orelse continue;
         var cost: u64 = 0;
-        const cursor = (try openWithPolicy(a, server, table, indexed, context, source, .automatic, &cost, true)) orelse continue;
+        const cursor = (try openWithPolicy(a, server, table, indexed, context, source, .automatic, &cost, true, execution)) orelse continue;
         if (!cursor.order_satisfied) {
             cursor.close(cursor.ptr);
             continue;
         }
-        const complete = preparePublicOrder(a, cursor, index, parsed, candidate, reverse, search_order) catch |err| {
+        const complete = preparePublicOrderFor(a, cursor, index, parsed, candidate, reverse, search_order, execution) catch |err| {
             cursor.close(cursor.ptr);
             return err;
         };
@@ -741,6 +750,8 @@ pub fn tryOpenOrderedPredicate(a: A, server: *server_api.ApiHttpServer, table: c
     }
     if (best) |cursor| {
         if (reverse and !best_complete) {
+            if (execution) |active| try Owner.bindCoordinator(cursor.ptr, active);
+            defer if (execution != null) Owner.releaseCoordinator(cursor.ptr);
             const owner: *Owner = @ptrCast(@alignCast(cursor.ptr));
             const replacement = try @import("../serverless/graph_segment/page_tree.zig").Cursor.initReverse(a, owner.reader.pages.store(), owner.reader.root.page, owner.predicate_lower, owner.predicate_upper);
             owner.reader.cursor.?.deinit();
@@ -749,6 +760,12 @@ pub fn tryOpenOrderedPredicate(a: A, server: *server_api.ApiHttpServer, table: c
         return .{ .cursor = cursor, .complete_order = best_complete };
     }
     return null;
+}
+
+fn preparePublicOrderFor(a: A, cursor: catalog.Cursor, definition: local.storage_relational_index.RelationalIndexDefinition, parsed: anytype, request: catalog.Scan, reverse: bool, search_order: SearchOrder, execution: ?*Execution) !bool {
+    if (execution) |active| try Owner.bindCoordinator(cursor.ptr, active);
+    defer if (execution != null) Owner.releaseCoordinator(cursor.ptr);
+    return preparePublicOrder(a, cursor, definition, parsed, request, reverse, search_order);
 }
 
 fn preparePublicOrder(a: A, cursor: catalog.Cursor, definition: local.storage_relational_index.RelationalIndexDefinition, parsed: anytype, request: catalog.Scan, reverse: bool, search_order: SearchOrder) !bool {

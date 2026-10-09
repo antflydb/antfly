@@ -551,7 +551,7 @@ const Execution = struct {
                 try self.execution.context.ensureActive();
                 if (self.position == self.page.len) {
                     _ = self.window.reset(.retain_capacity);
-                    self.page = try self.predicate.next(self.window.allocator(), @min(self.page_size, physical_budget - @as(usize, @intCast(self.scanned - start))));
+                    self.page = try self.predicate.nextFor(self.window.allocator(), @min(self.page_size, physical_budget - @as(usize, @intCast(self.scanned - start))), self.execution.context.execution);
                     self.position = 0;
                     if (self.page.len == 0) return null;
                 }
@@ -605,7 +605,7 @@ const Execution = struct {
             if (!try sql_rows.compatibleSearchConditions(ca, self.table, &.{condition})) return null;
             try conditions.append(ca, condition);
         }
-        var predicate = (try sql_rows.tryOpenOrderedPredicate(a, self.server, self.table, .{ .fields = &.{}, .conditions = conditions.items, .order = orders, .limit = 256, .row_goal = @as(u64, req.offset) + req.limit }, self.request, self.source, req.search_before.len != 0, .{ .values = if (req.search_before.len != 0) req.search_before else req.search_after, .id_descending = req.order_by[req.order_by.len - 1].desc })) orelse return null;
+        var predicate = (try sql_rows.tryOpenOrderedPredicateFor(a, self.server, self.table, .{ .fields = &.{}, .conditions = conditions.items, .order = orders, .limit = 256, .row_goal = @as(u64, req.offset) + req.limit }, self.request, self.source, req.search_before.len != 0, .{ .values = if (req.search_before.len != 0) req.search_before else req.search_after, .id_descending = req.order_by[req.order_by.len - 1].desc }, self.context.execution)) orelse return null;
         errdefer predicate.deinit();
         const owner = try a.create(Ordered);
         owner.* = .{ .a = a, .execution = self, .predicate = predicate, .plan_arena = arena, .window = .init(a), .identities = identities, .page_size = if (predicate.complete_order) @min(256, @as(usize, req.offset) + req.limit + 1) else 256 };

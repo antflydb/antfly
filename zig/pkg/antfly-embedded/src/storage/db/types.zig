@@ -2011,6 +2011,7 @@ const hierarchy_children_supported_internal_fields = [_][]const u8{
     "resolved_doc_filter_wire_context",
     "identity_read_generation",
     "execution_deadline_ns",
+    "execution_runnable",
     "cancellation",
     "graph_execution_limits",
     "graph_physical_scan_observation",
