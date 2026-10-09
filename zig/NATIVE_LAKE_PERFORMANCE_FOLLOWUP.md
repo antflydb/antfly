@@ -616,8 +616,8 @@ boundary file resolution uses binary search over that permutation. Participating
 files for a logical tie are sorted and stored in the existing bounded,
 singleflight decoded cache; reverse pagination traverses the same array backward.
 Cold scans retain the sequential directory cursor and its pending next-group
-record. Only groups estimated to span directory pages are cached. Warm cache hits seek past the group's
-directory entries. Both paths binary-search the participating file array at a
+record. Only groups estimated to span directory pages are cached. Warm cache hits
+seek past the group's directory entries. Both paths binary-search the participating file array at a
 pagination boundary instead of rejecting all preceding files individually.
 This preserves the read budget for high-cardinality sort keys.
 
@@ -647,8 +647,18 @@ predicates. The shared WAND helper consumes its incoming iterator on success and
 failure so allocation failures release authenticated metadata owners.
 
 Validation of the review refinements on 2026-10-09: all 20 focused tests, 63 sparse
-tests, 372 native reader tests, and 33 standalone bitmap tests pass without leaks.
-The 5000-distinct-key scan succeeds forward and backward under the existing read
-budget. License headers, Apache and embedded source boundaries, formatting and
-whitespace checks pass. The optimized server rebuild and real Parquet/PyIceberg
-E2E run remain pending; these unit results do not establish archive throughput.
+tests, and 372 native reader tests pass without leaks after merging `origin/main`
+through `a202a18842`. The unchanged bitmap implementation also passes all 33
+standalone tests. The 5000-distinct-key scan succeeds forward and backward under
+the existing read budget. License headers, Apache and embedded source boundaries,
+formatting and whitespace checks pass.
+
+Both Debug and ReleaseFast server builds pass at `c11d61de61` (main through
+`bfbcb03eae`). All 26 real Parquet/PyIceberg E2E cases pass against that optimized
+binary in 91 seconds with unchanged fixture limits, including the 100003-row
+predicate archive. These server/E2E results precede the final upstream merge;
+the focused, sparse and reader checks above were rerun afterward. A diagnostic
+Debug E2E run passed 25 cases but exceeded the archive fixture's 300-second
+index-publication deadline before its query assertions. No fixture deadline or
+production limit was relaxed. Representative archive throughput remains
+unmeasured.
