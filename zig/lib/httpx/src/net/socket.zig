@@ -223,6 +223,47 @@ pub const WriteControl = struct {
     }
 };
 
+/// Synchronous borrowed setup envelope. Combines the original request controls
+/// with its already captured deadline; it creates no execution authority.
+/// The view must not outlive this stack owner or be retained by a connection.
+pub const DeadlineControl = struct {
+    io: Io,
+    deadline_ms: ?i64,
+    original: WriteControl = .{},
+
+    fn check(raw: ?*anyopaque) WriteControl.Error!void {
+        const self: *@This() = @ptrCast(@alignCast(raw.?));
+        try self.original.check();
+        if (self.deadline_ms) |deadline| if (common.milliTimestamp(self.io) >= deadline) return error.Timeout;
+    }
+    fn remaining(raw: ?*anyopaque) WriteControl.Error!?u64 {
+        const self: *@This() = @ptrCast(@alignCast(raw.?));
+        try check(raw);
+        const original = try self.original.timeout(null);
+        const deadline = self.deadline_ms orelse return original;
+        const ms: u64 = @intCast(@max(0, deadline - common.milliTimestamp(self.io)));
+        if (ms == 0) return error.Timeout;
+        return if (original) |limit| @min(limit, ms) else ms;
+    }
+    fn begin(raw: ?*anyopaque) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw.?));
+        try self.original.wait_begin_fn.?(self.original.ptr);
+    }
+    fn end(raw: ?*anyopaque) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw.?));
+        try self.original.wait_end_fn.?(self.original.ptr);
+    }
+    pub fn view(self: *@This()) WriteControl {
+        return .{
+            .ptr = self,
+            .check_fn = check,
+            .remaining_ms_fn = remaining,
+            .wait_begin_fn = if (self.original.wait_begin_fn != null) begin else null,
+            .wait_end_fn = if (self.original.wait_end_fn != null) end else null,
+        };
+    }
+};
+
 const WindowsSocket = if (is_windows) struct {
     extern "ws2_32" fn setsockopt(
         socket: net.Socket.Handle,

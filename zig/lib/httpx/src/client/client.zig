@@ -2423,7 +2423,8 @@ pub const Client = struct {
     /// If two fibers race to create the same host:port, the loser discards
     /// its connection and uses the winner's.
     fn getOrCreateH2Conn(self: *Self, host: []const u8, port: u16, is_tls: bool, deadline_ms: ?i64, interrupt: *RequestInterrupt, execution_wait: ?socket_mod.WriteControl) !H2Lease {
-        const wait_options = @import("admission.zig").Options{ .execution_wait = execution_wait };
+        var setup_control = socket_mod.DeadlineControl{ .io = self.io, .deadline_ms = deadline_ms, .original = execution_wait orelse .{} };
+        const wait_options = @import("admission.zig").Options{ .execution_wait = setup_control.view() };
         try wait_options.check();
         var key_buf: [280]u8 = undefined;
         const key = std.fmt.bufPrint(&key_buf, "{s}:{s}:{d}", .{ if (is_tls) "https" else "http", host, port }) catch return error.InvalidUri;
@@ -2494,10 +2495,13 @@ pub const Client = struct {
         };
         errdefer self.allocator.destroy(entry);
 
-        entry.socket = try self.connectHost(host, port, deadline_ms, execution_wait);
+        entry.socket = try self.connectHost(host, port, deadline_ms, setup_control.view());
         // Guard socket close only until fibers take ownership (recv_running).
         // After fibers start, the errdefer at line ~521 handles shutdown.
         errdefer if (!entry.recv_running) entry.socket.close();
+        // The socket is not yet available to the request interrupter. Bound
+        // setup transport itself with the same captured request deadline.
+        entry.socket.setRequestDeadline(deadline_ms);
         entry.socket.setNoDelay(true) catch {};
         entry.socket.setKeepAlive(true) catch {};
 
@@ -2511,7 +2515,7 @@ pub const Client = struct {
             entry.session = TlsSession.init(tls_cfg, self.io);
             errdefer entry.session.deinit();
             entry.session.attachSocket(&entry.socket);
-            var transport_scope = try entry.session.controlTransport(execution_wait);
+            var transport_scope = try entry.session.controlTransport(setup_control.view());
             defer transport_scope.deinit();
             entry.session.handshake(host) catch |err| {
                 try entry.session.checkTransportError();
@@ -2543,7 +2547,7 @@ pub const Client = struct {
         if (is_tls) {
             // The connection remains exclusive until SETTINGS completes. The
             // scope ends before any shared reader/ping task is published.
-            var transport_scope = try entry.session.controlTransport(execution_wait);
+            var transport_scope = try entry.session.controlTransport(setup_control.view());
             defer transport_scope.deinit();
             const w = try entry.session.getWriter();
             entry.h2.sendClientPreface(w) catch |err| {
@@ -2556,7 +2560,7 @@ pub const Client = struct {
                 return err;
             };
         } else {
-            var writer = socket_mod.ControlledWriter{ .socket = &entry.socket, .control = execution_wait orelse .{} };
+            var writer = socket_mod.ControlledWriter{ .socket = &entry.socket, .control = setup_control.view() };
             const Reader = struct {
                 socket: *Socket,
                 control: socket_mod.WriteControl,
@@ -2564,7 +2568,7 @@ pub const Client = struct {
                     return reader.socket.recvControlled(bytes, reader.control);
                 }
             };
-            var reader = Reader{ .socket = &entry.socket, .control = execution_wait orelse .{} };
+            var reader = Reader{ .socket = &entry.socket, .control = setup_control.view() };
             try entry.h2.sendClientPreface(&writer);
             try self.exchangeH2Settings(&entry.h2, &reader, &writer);
         }
@@ -2574,6 +2578,12 @@ pub const Client = struct {
             entry.socket.shutdown();
             return err;
         };
+
+        // A shared connection must not retain its creator's request deadline
+        // or the temporary native socket timeouts used during setup.
+        entry.socket.setRequestDeadline(null);
+        try entry.socket.setRecvTimeout(0);
+        try entry.socket.setSendTimeout(0);
 
         // Spawn background fibers before taking the lock for insertion.
         if (entry.recv_group.concurrent(self.io, h2RecvLoopFiber, .{entry})) {
@@ -7474,18 +7484,18 @@ test "original request control deadline interrupts stalled TLS setup before publ
     };
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
     const io = std.testing.io;
-    for ([_]bool{ false, true }) |pooled| for ([_]bool{ false, true }) |streaming| {
+    for ([_]bool{ false, true }) |borrowed_budget| for ([_]bool{ false, true }) |pooled| for ([_]bool{ false, true }) |streaming| {
         var listener = try socket_mod.TcpListener.init(.{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } }, io);
         defer listener.deinit();
         var server = try io.concurrent(State.serve, .{&listener});
         defer server.cancel(io) catch {};
-        var client = Client.initWithConfig(std.testing.allocator, io, .{ .keep_alive = pooled, .verify_ssl = false, .retry_policy = .{ .max_retries = 0 }, .timeouts = .{ .connect_ms = 30_000, .request_ms = if (streaming) 0 else 30_000 } });
+        var client = Client.initWithConfig(std.testing.allocator, io, .{ .keep_alive = pooled, .verify_ssl = false, .retry_policy = .{ .max_retries = 0 }, .timeouts = .{ .connect_ms = 30_000, .request_ms = if (!borrowed_budget) 300 else if (streaming) 0 else 30_000 } });
         defer client.deinit();
         const url = try std.fmt.allocPrint(std.testing.allocator, "https://127.0.0.1:{d}/", .{listener.getLocalAddress().getPort()});
         defer std.testing.allocator.free(url);
         const started = common.milliTimestamp(io);
         var state = State{ .io = io, .deadline_ms = started + 300 };
-        const options = RequestOptions{ .socket_control = .{ .ptr = &state, .remaining_ms_fn = State.remaining, .wait_begin_fn = State.begin, .wait_end_fn = State.end } };
+        const options = RequestOptions{ .socket_control = .{ .ptr = &state, .remaining_ms_fn = if (borrowed_budget) State.remaining else null, .wait_begin_fn = State.begin, .wait_end_fn = State.end } };
         var output: std.ArrayListUnmanaged(u8) = .empty;
         defer output.deinit(std.testing.allocator);
         if (streaming) {
@@ -7503,4 +7513,49 @@ test "original request control deadline interrupts stalled TLS setup before publ
         try std.testing.expectEqual(@as(usize, 0), client.tls_pool.stats().connecting);
         try std.testing.expectEqual(@as(usize, 0), client.tls_pool.stats().total);
     };
+}
+
+test "H2 setup deadline physically interrupts silent settings without published interrupter" {
+    const Server = struct {
+        fn serve(listener: *socket_mod.TcpListener, io: Io) !void {
+            var peer = try listener.accept();
+            defer peer.socket.close();
+            peer.socket.enableNativeTimeouts();
+            try peer.socket.setRecvTimeout(2_000);
+            var reader = peer.socket.reader();
+            var h2 = H2Connection.initServer(std.testing.allocator, io);
+            defer h2.deinit();
+            try h2.readClientPreface(&reader);
+            var settings = try h2.readFrame(&reader);
+            defer settings.deinit(std.testing.allocator);
+            try std.testing.expect(settings.header.frame_type == .settings);
+            // Never send server SETTINGS. The unpublished connection has no
+            // background reader or request interrupter to close it for us.
+            var bytes: [128]u8 = undefined;
+            while (true) {
+                const n = std.posix.read(peer.socket.handle, &bytes) catch |err| switch (err) {
+                    error.ConnectionResetByPeer => break,
+                    else => return err,
+                };
+                if (n == 0) break;
+            }
+        }
+    };
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var listener = try socket_mod.TcpListener.init(.{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } }, io);
+    defer listener.deinit();
+    var server = try io.concurrent(Server.serve, .{ &listener, io });
+    defer server.cancel(io) catch {};
+    var client = Client.initWithConfig(std.testing.allocator, io, .{ .http2_enabled = true, .h2_read_idle_timeout_ms = 0, .timeouts = .{ .connect_ms = 0 } });
+    defer client.deinit();
+    var interrupt = RequestInterrupt{};
+    const started = common.milliTimestamp(io);
+    try std.testing.expectError(error.Timeout, client.getOrCreateH2Conn("127.0.0.1", listener.getLocalAddress().getPort(), false, started + 300, &interrupt, null));
+    try server.await(io);
+    try std.testing.expect(common.milliTimestamp(io) - started < 2_000);
+    try std.testing.expectEqual(@as(usize, 0), client.connection_slots.used.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), client.h2_opening.count());
+    try std.testing.expectEqual(@as(usize, 0), client.h2_conns.count());
+    try std.testing.expect(interrupt.socket == null and interrupt.h2_entry == null);
 }

@@ -106,6 +106,12 @@ pub const Connection = struct {
         return mixin.baseShouldEvict(self, idle_timeout_ms, max_requests, now);
     }
 
+    /// Rejected publication must not send a TLS alert during retirement.
+    pub fn reject(self: *Connection) void {
+        self.socket.abortRequest();
+        self.socket.shutdown();
+    }
+
     pub fn close(self: *Connection) void {
         self.socket.close();
     }
@@ -175,6 +181,12 @@ pub const TlsConnection = struct {
         if (self.in_use) return false;
         if (!self.session.connected) return true;
         return mixin.baseShouldEvict(self, idle_timeout_ms, max_requests, now);
+    }
+
+    /// Rejected publication must not send a TLS alert during retirement.
+    pub fn reject(self: *TlsConnection) void {
+        self.socket.abortRequest();
+        self.socket.shutdown();
     }
 
     pub fn close(self: *TlsConnection) void {
@@ -396,13 +408,14 @@ pub fn GenericPool(comptime Entry: type, comptime Context: type) type {
                 self.waiters -= 1;
                 self.mutex.unlock(self.io);
             };
+            var setup_control = socket_mod.DeadlineControl{ .io = self.io, .deadline_ms = options.deadline_ms, .original = options.execution_wait orelse .{} };
             while (true) {
                 try options.check();
                 if (options.isCancelled()) return error.Cancelled;
                 const current = milliTimestamp(self.io);
                 if (options.deadline_ms) |original| if (current >= original) return error.Timeout;
                 if (queued and current >= deadline) return error.Timeout;
-                const connection = self.getConnectionControlled(host, port, options.execution_wait) catch |err| switch (err) {
+                const connection = self.getConnectionControlled(host, port, setup_control.view()) catch |err| switch (err) {
                     error.PoolExhausted, error.PoolExhaustedForHost => {
                         self.mutex.lockUncancelable(self.io);
                         defer self.mutex.unlock(self.io);
@@ -418,8 +431,12 @@ pub fn GenericPool(comptime Entry: type, comptime Context: type) type {
                     },
                     else => return err,
                 };
-                errdefer self.evictConnection(connection);
-                try options.check();
+                errdefer {
+                    if (@hasDecl(Entry, "reject")) connection.reject();
+                    self.evictConnection(connection);
+                }
+                try setup_control.view().check();
+                if (options.isCancelled()) return error.Cancelled;
                 return connection;
             }
         }
@@ -1125,4 +1142,25 @@ test "outbound pool denied connect resume retires socket and reclaims physical c
     try std.testing.expectEqual(@as(usize, 1), try accepted.socket.recv(&byte));
     try std.testing.expectEqualStrings("x", &byte);
     try std.testing.expectEqual(@as(usize, 1), state.ends);
+}
+
+test "outbound pool rejects cancellation arriving during construction without wait callbacks" {
+    const Check = struct {
+        fn canceled(raw: *const anyopaque) bool {
+            const signal: *const std.atomic.Value(bool) = @ptrCast(@alignCast(raw));
+            return signal.load(.acquire);
+        }
+    };
+    var signal = std.atomic.Value(bool).init(false);
+    const io = std.testing.io;
+    var context = PoolTestContext{ .io = io, .cancel_after_create = &signal };
+    var slots = ConnectionSlots{ .limit = 1 };
+    var pool_inst = TestPool.init(std.testing.allocator, io, &context);
+    defer pool_inst.deinit();
+    pool_inst.bindSlots(&slots);
+    try std.testing.expectError(error.Cancelled, pool_inst.getConnectionWait("a", 80, .{ .context = &signal, .cancelled = Check.canceled }, 1, 1000));
+    try std.testing.expectEqual(@as(usize, 1), context.calls.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), pool_inst.totalCount());
+    try std.testing.expectEqual(@as(usize, 0), pool_inst.stats().connecting);
+    try std.testing.expectEqual(@as(usize, 0), slots.used.load(.acquire));
 }

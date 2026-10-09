@@ -183,8 +183,9 @@ pub const TlsSession = struct {
         }
     };
 
-    /// Exclusive HTTP/1 owner only: never install a stream's controls on a
-    /// shared H2 TLS session. The scope ends before releasing the pool lease.
+    /// Exclusive transport owner only: HTTP/1 requests or unpublished H2
+    /// setup. End the scope before releasing a pool lease or starting a shared
+    /// H2 reader. Published H2 sessions must not borrow a stream's controls.
     pub fn controlTransport(self: *Self, control: ?@import("../net/socket.zig").WriteControl) !TransportScope {
         if (control == null) return .{ .session = self, .active = false };
         if (self.transport_control != null) return error.InvalidOutputWait;
