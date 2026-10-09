@@ -189,7 +189,7 @@ pub const RequestOptions = struct {
     /// until the request method returns.
     cancellation: ?CancellationToken = null,
     /// Borrowed by the request until all transport tasks physically join.
-    /// Currently applies to plain HTTP/1 reads and writes. Parsing and body
+    /// Applies to HTTP/1 socket reads and writes, including TLS. Parsing and body
     /// decoding retain CPU; shared H2 readers never borrow a stream's grant.
     socket_control: ?socket_mod.WriteControl = null,
 };
@@ -673,7 +673,7 @@ const TlsSessionIoReader = struct {
     inner: *TlsSession,
     max_read: usize,
     reader_iface: Io.Reader,
-    read_error: ?TlsSession.ReadError = null,
+    read_error: ?anyerror = null,
     const max_empty_reads: usize = 5000;
 
     fn init(inner: *TlsSession, max_read: usize, buffer: []u8) TlsSessionIoReader {
@@ -693,7 +693,7 @@ const TlsSessionIoReader = struct {
         return @fieldParentPtr("reader_iface", r);
     }
 
-    fn checkReadError(self: *const TlsSessionIoReader) TlsSession.ReadError!void {
+    fn checkReadError(self: *const TlsSessionIoReader) !void {
         if (self.read_error) |err| return err;
     }
 
@@ -709,7 +709,7 @@ const TlsSessionIoReader = struct {
 
         while (true) {
             p.read_error = null;
-            const n = p.inner.read(read_buf) catch |err| {
+            const n = p.inner.readControlled(read_buf) catch |err| {
                 p.read_error = err;
                 return error.ReadFailed;
             };
@@ -2212,13 +2212,24 @@ pub const Client = struct {
     /// Sends request and reads response over an established TLS session.
     /// If `keep_alive_out` is non-null, sets it based on the response's keep-alive header.
     fn executeOnTls(self: *Self, session: *TlsSession, req: *Request, keep_alive_out: ?*bool) !Response {
+        var transport_scope = try session.controlTransport(req.socket_control);
+        defer transport_scope.deinit();
         const request_head = try serializeRequestHeadAlloc(self.allocator, req);
         defer self.allocator.free(request_head);
         const w = try session.getWriter();
         req.notifySend();
-        try w.writeAll(request_head);
-        try req.writeBody(w);
-        try session.flush();
+        w.writeAll(request_head) catch |err| {
+            try session.checkTransportError();
+            return err;
+        };
+        req.writeBody(w) catch |err| {
+            try session.checkTransportError();
+            return err;
+        };
+        session.flush() catch |err| {
+            try session.checkTransportError();
+            return err;
+        };
         const result = try self.readResponse(session, req.method, self.responseSizeLimit(req));
         if (keep_alive_out) |out| {
             out.* = result.reusable;
@@ -2235,13 +2246,24 @@ pub const Client = struct {
         progress_ctx: ?*anyopaque,
         keep_alive_out: ?*bool,
     ) !Response {
+        var transport_scope = try session.controlTransport(req.socket_control);
+        defer transport_scope.deinit();
         const request_head = try serializeRequestHeadAlloc(self.allocator, req);
         defer self.allocator.free(request_head);
         const w = try session.getWriter();
         req.notifySend();
-        try w.writeAll(request_head);
-        try req.writeBody(w);
-        try session.flush();
+        w.writeAll(request_head) catch |err| {
+            try session.checkTransportError();
+            return err;
+        };
+        req.writeBody(w) catch |err| {
+            try session.checkTransportError();
+            return err;
+        };
+        session.flush() catch |err| {
+            try session.checkTransportError();
+            return err;
+        };
         const result = try self.readResponseToWriter(
             session,
             req.method,
@@ -2263,7 +2285,14 @@ pub const Client = struct {
         var session = TlsSession.init(tls_cfg, self.io);
         defer session.deinit();
         session.attachSocket(socket);
-        try session.handshake(host);
+        {
+            var transport_scope = try session.controlTransport(req.socket_control);
+            defer transport_scope.deinit();
+            session.handshake(host) catch |err| {
+                try session.checkTransportError();
+                return err;
+            };
+        }
         return self.executeOnTls(&session, req, null);
     }
 
@@ -2281,7 +2310,14 @@ pub const Client = struct {
         var session = TlsSession.init(tls_cfg, self.io);
         defer session.deinit();
         session.attachSocket(socket);
-        try session.handshake(host);
+        {
+            var transport_scope = try session.controlTransport(req.socket_control);
+            defer transport_scope.deinit();
+            session.handshake(host) catch |err| {
+                try session.checkTransportError();
+                return err;
+            };
+        }
         return self.executeOnTlsToWriter(&session, req, writer, progress_cb, progress_ctx, null);
     }
 
@@ -3312,7 +3348,7 @@ pub const Client = struct {
         } else if (Source == *TlsSession) {
             var empty_read_policy = EmptyReadPolicy.init(TlsSessionIoReader.max_empty_reads);
             while (true) {
-                const n = try source.read(buf);
+                const n = try source.readControlled(buf);
                 switch (empty_read_policy.observe(n)) {
                     .done => return n,
                     .retry => sleepAfterEmptyRead(source.io),
@@ -6704,4 +6740,156 @@ test "HTTP1 request controls fence header and body input before publication" {
         try std.testing.expectEqual(state.begins, state.ends);
         try std.testing.expect(state.ends >= 3);
     };
+}
+
+const python_tls_control_server =
+    \\import socket, ssl, sys, time
+    \\ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    \\ctx.maximum_version = ssl.TLSVersion.TLSv1_2
+    \\ctx.load_cert_chain('cert.pem', 'key.pem')
+    \\listener = socket.socket()
+    \\listener.bind(('127.0.0.1', 0))
+    \\listener.listen(1)
+    \\print(listener.getsockname()[1], flush=True)
+    \\try:
+    \\    raw, _ = listener.accept()
+    \\    raw.settimeout(3)
+    \\    with ctx.wrap_socket(raw, server_side=True) as conn:
+    \\        request_count = 2 if len(sys.argv) > 2 and sys.argv[2] == 'reuse' else 1
+    \\        for request_index in range(request_count):
+    \\            data = b''
+    \\            while b'\r\n\r\n' not in data:
+    \\                part = conn.recv(4096)
+    \\                if not part: raise EOFError()
+    \\                data += part
+    \\            framing = sys.argv[1]
+    \\            head = b'HTTP/1.1 200 OK\r\nConnection: ' + (b'keep-alive' if request_index + 1 < request_count else b'close') + b'\r\n'
+    \\            if framing == 'fixed': head += b'Content-Length: 7\r\n'
+    \\            if framing == 'chunked': head += b'Transfer-Encoding: chunked\r\n'
+    \\            conn.sendall(head + b'\r\n')
+    \\            time.sleep(0.02)
+    \\            conn.sendall(b'7\r\npayload\r\n0\r\n\r\n' if framing == 'chunked' else b'payload')
+    \\except (OSError, EOFError):
+    \\    pass
+;
+
+test "HTTPS request controls retire denied handshake and body waits without retaining grants" {
+    const Mode = enum { success, denied_write, denied_read, canceled_read };
+    const Framing = enum { fixed, chunked, close_delimited };
+    const State = struct {
+        mode: Mode,
+        parked: bool = false,
+        begins: usize = 0,
+        ends: usize = 0,
+        fn check(raw: ?*anyopaque) socket_mod.WriteControl.Error!void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.mode == .canceled_read and self.ends >= 3) return error.Canceled;
+        }
+        fn begin(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try std.testing.expect(!self.parked);
+            self.begins += 1;
+            self.parked = true;
+        }
+        fn end(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try std.testing.expect(self.parked);
+            self.ends += 1;
+            if (self.mode == .denied_write or (self.mode == .denied_read and self.ends >= 3)) return error.DeadlineExceeded;
+            self.parked = false;
+        }
+    };
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    for ([_]bool{ false, true }) |pooled| for ([_]bool{ false, true }) |streaming| for (std.enums.values(Framing)) |framing| for (std.enums.values(Mode)) |mode| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.writeFile(io, .{ .sub_path = "cert.pem", .data = test_tls_cert_pem });
+        try tmp.dir.writeFile(io, .{ .sub_path = "key.pem", .data = test_tls_key_pem });
+        try tmp.dir.writeFile(io, .{ .sub_path = "server.py", .data = python_tls_control_server });
+        var child = try std.process.spawn(io, .{ .argv = &.{ "python3", "server.py", @tagName(framing) }, .cwd = .{ .dir = tmp.dir }, .stdin = .ignore, .stdout = .pipe, .stderr = .inherit });
+        defer child.kill(io);
+        var stdout_buffer: [64]u8 = undefined;
+        var stdout_reader = child.stdout.?.readerStreaming(io, &stdout_buffer);
+        const port_line = (try stdout_reader.interface.takeDelimiter('\n')) orelse return error.TestServerExited;
+        const port = try std.fmt.parseUnsigned(u16, port_line, 10);
+        const url = try std.fmt.allocPrint(alloc, "https://127.0.0.1:{d}/", .{port});
+        defer alloc.free(url);
+        var state: State = .{ .mode = mode };
+        var completed_ends: usize = 0;
+        {
+            var client = Client.initWithConfig(alloc, io, .{ .keep_alive = pooled, .verify_ssl = false, .retry_policy = .{ .max_retries = 0 } });
+            defer client.deinit();
+            const options: RequestOptions = .{ .timeout_ms = 3_000, .socket_control = .{ .ptr = &state, .check_fn = State.check, .wait_begin_fn = State.begin, .wait_end_fn = State.end } };
+            var output: std.ArrayListUnmanaged(u8) = .empty;
+            defer output.deinit(alloc);
+            const result = if (streaming) client.getToWriter(url, options, arrayListWriter(&output, alloc), null, null) else client.get(url, options);
+            switch (mode) {
+                .success => {
+                    var response = try result;
+                    defer response.deinit();
+                    try std.testing.expectEqualStrings("payload", if (streaming) output.items else response.body.?);
+                    try std.testing.expect(!state.parked);
+                },
+                .denied_write, .denied_read => try std.testing.expectError(error.DeadlineExceeded, result),
+                .canceled_read => try std.testing.expectError(error.Canceled, result),
+            }
+            if (mode != .success) try std.testing.expectEqual(@as(usize, 0), output.items.len);
+            try std.testing.expectEqual(state.begins, state.ends);
+            try std.testing.expect(state.ends > 0);
+            completed_ends = state.ends;
+        }
+        // Client/pool retirement must not call the departed request context.
+        try std.testing.expectEqual(completed_ends, state.ends);
+    };
+}
+
+test "HTTPS pooled reuse clears the previous request transport controls" {
+    const Control = struct {
+        parked: bool = false,
+        ends: usize = 0,
+        fn begin(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try std.testing.expect(!self.parked);
+            self.parked = true;
+        }
+        fn end(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try std.testing.expect(self.parked);
+            self.parked = false;
+            self.ends += 1;
+        }
+        fn options(self: *@This()) RequestOptions {
+            return .{ .timeout_ms = 3_000, .socket_control = .{ .ptr = self, .wait_begin_fn = begin, .wait_end_fn = end } };
+        }
+    };
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "cert.pem", .data = test_tls_cert_pem });
+    try tmp.dir.writeFile(io, .{ .sub_path = "key.pem", .data = test_tls_key_pem });
+    try tmp.dir.writeFile(io, .{ .sub_path = "server.py", .data = python_tls_control_server });
+    var child = try std.process.spawn(io, .{ .argv = &.{ "python3", "server.py", "fixed", "reuse" }, .cwd = .{ .dir = tmp.dir }, .stdin = .ignore, .stdout = .pipe, .stderr = .inherit });
+    defer child.kill(io);
+    var stdout_buffer: [64]u8 = undefined;
+    var stdout_reader = child.stdout.?.readerStreaming(io, &stdout_buffer);
+    const port_line = (try stdout_reader.interface.takeDelimiter('\n')) orelse return error.TestServerExited;
+    const port = try std.fmt.parseUnsigned(u16, port_line, 10);
+    const url = try std.fmt.allocPrint(alloc, "https://127.0.0.1:{d}/", .{port});
+    defer alloc.free(url);
+    var client = Client.initWithConfig(alloc, io, .{ .keep_alive = true, .verify_ssl = false, .retry_policy = .{ .max_retries = 0 } });
+    defer client.deinit();
+    var first: Control = .{};
+    var response = try client.get(url, first.options());
+    defer response.deinit();
+    try std.testing.expectEqualStrings("payload", response.body.?);
+    try std.testing.expect(first.ends > 0 and !first.parked);
+    const first_ends = first.ends;
+    var second: Control = .{};
+    var next_response = try client.get(url, second.options());
+    defer next_response.deinit();
+    try std.testing.expectEqualStrings("payload", next_response.body.?);
+    try std.testing.expect(second.ends > 0 and !second.parked);
+    try std.testing.expectEqual(first_ends, first.ends);
 }

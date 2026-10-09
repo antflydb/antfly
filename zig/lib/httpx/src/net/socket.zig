@@ -1053,6 +1053,8 @@ pub const SliceIoReader = struct {
 pub const SocketIoWriter = struct {
     socket: *Socket,
     writer_iface: Io.Writer,
+    control: ?WriteControl = null,
+    last_write_error: ?anyerror = null,
 
     pub fn init(socket: *Socket, buffer: []u8) SocketIoWriter {
         return .{
@@ -1069,13 +1071,34 @@ pub const SocketIoWriter = struct {
         return @fieldParentPtr("writer_iface", w);
     }
 
+    fn send(self: *@This(), bytes: []const u8) Io.Writer.Error!void {
+        const result = if (self.control) |control| self.socket.sendAllControlled(bytes, control) else self.socket.sendAll(bytes);
+        result catch |err| {
+            self.last_write_error = err;
+            return error.WriteFailed;
+        };
+    }
+
     fn drain(w: *Io.Writer, bufs: []const []const u8, splat: usize) Io.Writer.Error!usize {
         const p = parent(w);
         if (bufs.len == 0) {
             const buffered = w.buffered();
             if (buffered.len == 0) return 0;
-            p.socket.sendAll(buffered) catch return error.WriteFailed;
+            try p.send(buffered);
             return w.consumeAll();
+        }
+        if (p.control != null) {
+            var sent = w.buffered().len;
+            try p.send(w.buffered());
+            for (bufs[0 .. bufs.len - 1]) |bytes| {
+                try p.send(bytes);
+                sent += bytes.len;
+            }
+            for (0..splat) |_| {
+                try p.send(bufs[bufs.len - 1]);
+                sent += bufs[bufs.len - 1].len;
+            }
+            return w.consume(sent);
         }
         const n = (p.socket.io.operate(.{ .net_write = .{
             .socket_handle = p.socket.handle,
@@ -1102,7 +1125,7 @@ pub const SocketIoWriter = struct {
             const n_read = file_reader.file.readStreaming(file_reader.io, &.{w.buffer[0..chunk_len]}) catch return error.ReadFailed;
             if (n_read == 0) break;
 
-            p.socket.sendAll(w.buffer[0..n_read]) catch return error.WriteFailed;
+            try p.send(w.buffer[0..n_read]);
             total += n_read;
         }
 
@@ -1113,7 +1136,7 @@ pub const SocketIoWriter = struct {
         const p = parent(w);
         while (w.end != 0) {
             const buffered = w.buffered();
-            p.socket.sendAll(buffered) catch return error.WriteFailed;
+            try p.send(buffered);
             _ = w.consumeAll();
         }
     }
@@ -1125,7 +1148,7 @@ pub const SocketIoWriter = struct {
         const to_flush = w.end - preserved_len;
         if (to_flush > 0) {
             const p = parent(w);
-            p.socket.sendAll(w.buffer[0..to_flush]) catch return error.WriteFailed;
+            try p.send(w.buffer[0..to_flush]);
         }
         if (preserved_len > 0 and to_flush > 0) {
             @memmove(w.buffer[0..preserved_len], w.buffer[to_flush..][0..preserved_len]);
@@ -2568,4 +2591,43 @@ test "Socket controlled receive fences physical input and rejects denied publica
         try std.testing.expectEqual(@as(usize, 1), state.begins);
         try std.testing.expectEqual(@as(usize, 0), reader.reader_iface.end);
     };
+}
+
+test "SocketIoWriter controlled drain preserves buffered vectors and splats" {
+    const State = struct {
+        parked: bool = false,
+        waits: usize = 0,
+        fn begin(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try std.testing.expect(!self.parked);
+            self.parked = true;
+            self.waits += 1;
+        }
+        fn end(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try std.testing.expect(self.parked);
+            self.parked = false;
+        }
+    };
+    const io = std.testing.io;
+    var listener = try TcpListener.init(.{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } }, io);
+    defer listener.deinit();
+    var sender = try Socket.connect(listener.getLocalAddress(), io);
+    defer sender.close();
+    var accepted = try listener.accept();
+    defer accepted.socket.close();
+    var buffer: [32]u8 = undefined;
+    var writer = SocketIoWriter.init(&sender, &buffer);
+    var state: State = .{};
+    writer.control = .{ .ptr = &state, .wait_begin_fn = State.begin, .wait_end_fn = State.end };
+    try writer.writer_iface.writeAll("header");
+    const sent = try SocketIoWriter.drain(&writer.writer_iface, &.{ "ab", "cd" }, 3);
+    try std.testing.expectEqual(@as(usize, 8), sent);
+    try std.testing.expectEqual(@as(usize, 0), writer.writer_iface.end);
+    var received: [14]u8 = undefined;
+    var count: usize = 0;
+    while (count < received.len) count += try accepted.socket.recv(received[count..]);
+    try std.testing.expectEqualStrings("headerabcdcdcd", &received);
+    try std.testing.expect(!state.parked);
+    try std.testing.expectEqual(@as(usize, 5), state.waits);
 }
