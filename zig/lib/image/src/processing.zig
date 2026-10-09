@@ -25,6 +25,8 @@ pub const Resample = enum(u32) {
     /// is distinct from the legacy bicubic sampler used by existing model
     /// configurations so parity-sensitive callers must opt in explicitly.
     pillow_bicubic = 4,
+    /// Torchvision uint8 antialiased bicubic, with adaptive int16 coefficients.
+    torchvision_bicubic = 5,
 };
 
 pub const PixelFormat = enum(u8) {
@@ -217,7 +219,7 @@ pub fn preprocessDecodedRectScaledWithResampleInto(
         return;
     }
 
-    if (resample == .pillow_bicubic) {
+    if (resample == .pillow_bicubic or resample == .torchvision_bicubic) {
         try preprocessDecodedRectPillowBicubic(
             allocator,
             resolved_img,
@@ -227,6 +229,7 @@ pub fn preprocessDecodedRectScaledWithResampleInto(
             mean,
             std_dev,
             rescale_factor,
+            resample == .torchvision_bicubic,
         );
         return;
     }
@@ -645,6 +648,7 @@ pub const BicubicAxis = struct {
     starts: []usize,
     offsets: []usize,
     weights: []i32,
+    precision_bits: u6,
 
     pub fn deinit(self: *@This()) void {
         self.allocator.free(self.starts);
@@ -660,6 +664,7 @@ pub fn buildPillowBicubicAxis(
     allocator: std.mem.Allocator,
     source_size: usize,
     target_size: usize,
+    torchvision: bool,
 ) !BicubicAxis {
     if (source_size == 0 or target_size == 0) return error.InvalidImageDimensions;
     const starts = try allocator.alloc(usize, target_size);
@@ -682,7 +687,7 @@ pub fn buildPillowBicubicAxis(
         last = @min(last, @as(isize, @intCast(source_size)));
         if (last <= first) return error.InvalidImageDimensions;
         starts[target] = @intCast(first);
-        offsets[target] = weights.items.len;
+        offsets[target] = float_weights.items.len;
         const float_start = float_weights.items.len;
         var total: f64 = 0.0;
         var source = first;
@@ -693,26 +698,39 @@ pub fn buildPillowBicubicAxis(
             total += weight;
         }
         if (total == 0.0 or !std.math.isFinite(total)) return error.InvalidImageDimensions;
-        for (float_weights.items[float_start..]) |weight| {
-            const normalized = weight / total;
-            const scaled = normalized * @as(f64, 1 << pillow_precision_bits);
-            const rounded = if (scaled < 0.0) scaled - 0.5 else scaled + 0.5;
-            try weights.append(allocator, @intFromFloat(rounded));
+        for (float_weights.items[float_start..]) |*weight| weight.* /= total;
+    }
+    offsets[target_size] = float_weights.items.len;
+    var precision: u6 = pillow_precision_bits;
+    if (torchvision) {
+        // PyTorch 2.10 UpSampleKernel.cpp compute_index_ranges_int16_weights:
+        // select the largest fixed-point scale whose coefficients fit int16.
+        var maximum: f64 = 0;
+        for (float_weights.items) |weight| maximum = @max(maximum, weight);
+        precision = 0;
+        while (precision < 22) : (precision += 1) {
+            const next: i64 = @intFromFloat(0.5 + maximum * @as(f64, @floatFromInt(@as(u64, 1) << (precision + 1))));
+            if (next >= 1 << 15) break;
         }
     }
-    offsets[target_size] = weights.items.len;
+    for (float_weights.items) |weight| {
+        const scaled = weight * @as(f64, @floatFromInt(@as(u64, 1) << precision));
+        const rounded = if (scaled < 0.0) scaled - 0.5 else scaled + 0.5;
+        try weights.append(allocator, @intFromFloat(rounded));
+    }
     return .{
         .allocator = allocator,
         .starts = starts,
         .offsets = offsets,
         .weights = try weights.toOwnedSlice(allocator),
+        .precision_bits = precision,
     };
 }
 
 const pillow_precision_bits = 22;
 
-fn clipPillowAccumulator(value: i64) u8 {
-    return @intCast(std.math.clamp(value >> pillow_precision_bits, 0, 255));
+fn clipPillowAccumulator(value: i64, precision_bits: u6) u8 {
+    return @intCast(std.math.clamp(value >> precision_bits, 0, 255));
 }
 
 /// Pillow resizes 8-bit images in two passes, materializing an 8-bit
@@ -727,10 +745,11 @@ fn preprocessDecodedRectPillowBicubic(
     mean: [3]f32,
     std_dev: [3]f32,
     rescale_factor: f32,
+    torchvision: bool,
 ) !void {
-    var horizontal_axis = try buildPillowBicubicAxis(allocator, img.width, target_width);
+    var horizontal_axis = try buildPillowBicubicAxis(allocator, img.width, target_width, torchvision);
     defer horizontal_axis.deinit();
-    var vertical_axis = try buildPillowBicubicAxis(allocator, img.height, target_height);
+    var vertical_axis = try buildPillowBicubicAxis(allocator, img.height, target_height, torchvision);
     defer vertical_axis.deinit();
 
     const horizontal_pixels = std.math.mul(usize, target_width, img.height) catch
@@ -746,11 +765,11 @@ fn preprocessDecodedRectPillowBicubic(
             const begin = horizontal_axis.offsets[target_x];
             const end = horizontal_axis.offsets[target_x + 1];
             for (0..3) |channel| {
-                var value: i64 = 1 << (pillow_precision_bits - 1);
+                var value: i64 = @as(i64, 1) << (horizontal_axis.precision_bits - 1);
                 for (horizontal_axis.weights[begin..end], 0..) |weight, offset| {
                     value += @as(i64, @intFromFloat(pixelAt(img, @intCast(start + offset), @intCast(source_y), channel))) * weight;
                 }
-                horizontal[(source_y * target_width + target_x) * 3 + channel] = clipPillowAccumulator(value);
+                horizontal[(source_y * target_width + target_x) * 3 + channel] = clipPillowAccumulator(value, horizontal_axis.precision_bits);
             }
         }
     }
@@ -762,12 +781,12 @@ fn preprocessDecodedRectPillowBicubic(
         const end = vertical_axis.offsets[target_y + 1];
         for (0..target_width) |target_x| {
             for (0..3) |channel| {
-                var value: i64 = 1 << (pillow_precision_bits - 1);
+                var value: i64 = @as(i64, 1) << (vertical_axis.precision_bits - 1);
                 for (vertical_axis.weights[begin..end], 0..) |weight, offset| {
                     const source_y = start + offset;
                     value += @as(i64, horizontal[(source_y * target_width + target_x) * 3 + channel]) * weight;
                 }
-                const sample: f32 = @floatFromInt(clipPillowAccumulator(value));
+                const sample: f32 = @floatFromInt(clipPillowAccumulator(value, vertical_axis.precision_bits));
                 result[channel * target_height * target_width + target_y * target_width + target_x] =
                     normalizeSample(sample, mean[channel], std_dev[channel], rescale_factor);
             }
@@ -1049,4 +1068,17 @@ test "bicubic downsampling matches Pillow RGB pixels" {
     );
     defer alloc.free(legacy);
     try std.testing.expect(!std.mem.eql(f32, legacy, out));
+}
+
+test "embeddinggemma2 torchvision bicubic matches pinned uint8 pixels" {
+    const a = std.testing.allocator;
+    var pixels: [7 * 13 * 3]u8 = undefined;
+    for (0..7) |y| for (0..13) |x| for (0..3) |c| {
+        pixels[(y * 13 + x) * 3 + c] = @intCast((x * 37 + y * 83 + c * 59) % 256);
+    };
+    const actual = try preprocessDecodedRectScaledWithResample(a, .{ .data = &pixels, .width = 13, .height = 7, .format = .rgb8 }, 5, 3, .{ 0, 0, 0 }, .{ 1, 1, 1 }, 1, .torchvision_bicubic);
+    defer a.free(actual);
+    // PyTorch 2.10.0 / torchvision 0.25.0, CHW uint8 resize, antialias=true.
+    const expected = [_]f32{ 102, 140, 106, 122, 137, 142, 120, 135, 138, 120, 140, 106, 138, 133, 107, 128, 153, 120, 120, 123, 120, 140, 122, 121, 143, 145, 133, 124, 103, 144, 143, 109, 137, 140, 107, 126, 110, 133, 128, 110, 109, 151, 133, 122, 156 };
+    try std.testing.expectEqualSlices(f32, &expected, actual);
 }

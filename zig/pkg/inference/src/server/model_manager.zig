@@ -30,6 +30,7 @@ const backends = @import("../backends/backends.zig");
 const model_caps = @import("../models/capabilities.zig");
 const manifest_mod = @import("../models/manifest.zig");
 const model_compatibility = @import("../models/compatibility.zig");
+const gliner_decide_qualification = @import("../models/gliner_decide_qualification.zig");
 const managed_receipt = @import("../registry/managed_receipt.zig");
 const safetensors_mod = @import("../models/safetensors.zig");
 const c_file = @import("../util/c_file.zig");
@@ -2342,6 +2343,8 @@ fn ownSelectedFirstBackendPreference(
 }
 
 pub const LoadedModel = struct {
+    embedding_identity: ?[64]u8 = null,
+    embedding_asset_signature: ?[32]u8 = null,
     manifest: manifest_mod.ModelManifest,
     hf_tok: ?*hf_tokenizer.HfTokenizer,
     sp_tok: ?*sentencepiece.Processor,
@@ -2350,6 +2353,7 @@ pub const LoadedModel = struct {
     model_manager: *ModelManager,
     model_dir: []const u8,
     allocator: std.mem.Allocator,
+
     /// Borrowed from the serving BackendRuntime and valid for the model's
     /// loaded lifetime. Offline model owners leave this null.
     executor_io: ?std.Io = null,
@@ -2395,6 +2399,9 @@ pub const LoadedModel = struct {
     text_projection_resource_lease: ?runtime.tier.memory.AdmissionLease = null,
     visual_projection_resource_lease: ?runtime.tier.memory.AdmissionLease = null,
     audio_projection_resource_lease: ?runtime.tier.memory.AdmissionLease = null,
+    embedding_prototype_cache: ?*@import("../extractors/embedding_prototypes.zig").Cache = null,
+    embedding_prototype_cache_lease: ?runtime.tier.memory.AdmissionLease = null,
+    embedding_prototype_cache_mutex: std.atomic.Mutex = .unlocked,
     /// Last complete optional-session JIT snapshot. Metrics use it when a
     /// cold sidecar load owns embedding_session_lock, keeping scrapes bounded
     /// without racing publication of the optional session handles.
@@ -2417,10 +2424,43 @@ pub const LoadedModel = struct {
     /// retired model while new requests load a fresh session.
     retired: bool = false,
 
+    pub fn verifyEmbeddingIdentity(self: *const LoadedModel) !void {
+        const expected = self.embedding_asset_signature orelse return;
+        const actual = try @import("../models/embedding_gemma2_identity.zig").signature(self.allocator, self.executor_io orelse std.Options.debug_io, self.model_dir, self.manifest.safetensors_path.?);
+        if (!std.mem.eql(u8, &expected, &actual)) return error.ModelArtifactsChanging;
+    }
+
     pub fn getTokenizer(self: *LoadedModel) tokenizer_mod.Tokenizer {
         if (self.hf_tok) |ht| return ht.tokenizer();
         if (self.sp_tok) |sp| return sp.tokenizer();
         unreachable;
+    }
+
+    pub fn getEmbeddingPrototypeCache(self: *LoadedModel, limits: runtime.tier.memory.Limits, control: InferenceExecutionControl) !*@import("../extractors/embedding_prototypes.zig").Cache {
+        const prototypes = @import("../extractors/embedding_prototypes.zig");
+        try control.lock(&self.embedding_prototype_cache_mutex);
+        if (self.embedding_prototype_cache) |cache| {
+            self.embedding_prototype_cache_mutex.unlock();
+            return cache;
+        }
+        self.embedding_prototype_cache_mutex.unlock();
+        // Admission may evict other models. Do it without cache/execution
+        // locks, while the caller's ModelHandle pins this model generation.
+        var lease = try self.model_manager.acquireRunResourceAmounts(.cpu, limits, .{ .host_weight_bytes = prototypes.admitted_bytes });
+        errdefer lease.release();
+        const cache = try self.allocator.create(prototypes.Cache);
+        errdefer self.allocator.destroy(cache);
+        cache.* = .{};
+        try control.lock(&self.embedding_prototype_cache_mutex);
+        defer self.embedding_prototype_cache_mutex.unlock();
+        if (self.embedding_prototype_cache) |published| {
+            self.allocator.destroy(cache);
+            lease.release();
+            return published;
+        }
+        self.embedding_prototype_cache = cache;
+        self.embedding_prototype_cache_lease = lease;
+        return cache;
     }
 
     pub fn attachIo(self: *LoadedModel, io: std.Io) void {
@@ -2826,6 +2866,7 @@ pub const LoadedModel = struct {
             session_factory.supportsResidentTextEncoder(self.session);
         var pipeline = EmbeddingPipeline.init(allocator, self.session, tok, .{
             .max_length = self.manifest.maxTextSequenceLength(),
+            .reject_truncation = self.manifest.embedding_style == .embedding_gemma2,
             .normalize = self.manifest.normalize,
             .pooling = switch (self.manifest.pooling) {
                 .mean => .mean,
@@ -2838,7 +2879,7 @@ pub const LoadedModel = struct {
             // native architecture vtable. Use declared encoder semantics too,
             // otherwise a short BGE-M3 request is padded to its full 8K window.
             // The pipeline still preserves explicitly fixed input dimensions.
-            .trim_padding_to_batch_max = isJinaStyleEmbeddingManifest(&self.manifest) or
+            .trim_padding_to_batch_max = self.manifest.embedding_style == .embedding_gemma2 or isJinaStyleEmbeddingManifest(&self.manifest) or
                 @import("../models/bert.zig").isBertModel(self.manifest.config_model_arch) or
                 self.manifest.bert_model_type == .roberta or
                 generic_encoder != null or
@@ -2978,7 +3019,12 @@ pub const LoadedModel = struct {
             .execution_lock = self.targetInferenceExecutionMutex(),
             .config = .{
                 .max_width = self.manifest.gliner_max_width,
-                .max_length = self.manifest.max_position_embeddings,
+                .max_length = if (self.manifest.gliner_architecture == .span and
+                    self.manifest.gliner_span_encoder_family == .modern_bert and
+                    self.session.backend() == .cuda)
+                    @min(self.manifest.max_position_embeddings, 512)
+                else
+                    self.manifest.max_position_embeddings,
                 .threshold = self.manifest.gliner_threshold,
                 .flat_ner = self.manifest.gliner_flat_ner,
                 .default_labels = self.manifest.gliner_default_labels,
@@ -3029,6 +3075,8 @@ pub const LoadedModel = struct {
     }
 
     pub fn deinit(self: *LoadedModel) void {
+        if (self.embedding_prototype_cache) |cache| self.allocator.destroy(cache);
+        if (self.embedding_prototype_cache_lease) |*lease| lease.release();
         if (self.projector_store) |store| {
             store.close();
             self.projector_store = null;
@@ -4203,6 +4251,29 @@ pub const ModelManager = struct {
         self: *const ModelManager,
     ) *runtime.tier.memory.AdmissionController {
         return &self.resource_domain.?.admission;
+    }
+
+    /// Exact admission ownership held by the live Hugging Face tokenizer
+    /// caches. Cache growth is charged in independent quantum leases owned by
+    /// ResourceDomain records, rather than by LoadedModel.tokenizer_resource_lease.
+    /// Callers that reconcile an idle domain must include both sources.
+    pub fn tokenizerCacheAdmissionAmounts(
+        self: *const ModelManager,
+    ) !runtime.tier.memory.AdmissionAmounts {
+        const domain = self.resource_domain orelse return .{};
+        var total: runtime.tier.memory.AdmissionAmounts = .{};
+        for (&domain.tokenizer_cache_budget_shards) |*shard| {
+            spinLock(&shard.mutex);
+            {
+                defer shard.mutex.unlock();
+                var records = shard.records.valueIterator();
+                while (records.next()) |record_ptr| {
+                    for (record_ptr.*.credits.items) |credit|
+                        total = try total.merge(credit.amounts);
+                }
+            }
+        }
+        return total;
     }
 
     fn tokenizerCacheBudgetShard(
@@ -7210,6 +7281,29 @@ pub const ModelManager = struct {
         if (man.hasIncompleteColqwenBundle()) return error.IncompleteColqwenBundle;
         if (man.hasIncompleteClipclapGgufBundle()) return error.IncompleteClipclapGgufBundle;
         if (man.hasIncompleteFlorence2GgufBundle()) return error.IncompleteFlorence2Bundle;
+        var eg2_backends: [2]backends.BackendType = undefined;
+        if (man.embedding_style == .embedding_gemma2) {
+            var count: usize = 0;
+            for (sm.preferred_backends) |backend| {
+                if (backend != .native and backend != .metal) continue;
+                var duplicate = false;
+                for (eg2_backends[0..count]) |existing| if (existing == backend) {
+                    duplicate = true;
+                };
+                if (!duplicate) {
+                    eg2_backends[count] = backend;
+                    count += 1;
+                }
+            }
+            if (count == 0) return error.UnsupportedEmbeddingGemma2Backend;
+            sm.preferred_backends = eg2_backends[0..count];
+        }
+
+        const eg2_identity = @import("../models/embedding_gemma2_identity.zig");
+        const embedding_signature: ?[32]u8 = if (man.embedding_style == .embedding_gemma2)
+            try eg2_identity.signature(self.allocator, sm.io orelse std.Options.debug_io, model_dir, man.safetensors_path orelse return error.UnsupportedEmbeddingGemma2Weights)
+        else
+            null;
 
         var qualified_profile_bundle: ?kernel_jit_profile_output.LoadedProfileBundle =
             if (sm.kernel_jit.qualified_profile_path) |path|
@@ -7233,6 +7327,7 @@ pub const ModelManager = struct {
         // Load tokenizer
         var hf_tok: ?*hf_tokenizer.HfTokenizer = null;
         var sp_tok: ?*sentencepiece.Processor = null;
+        var gliner_span_tokenizer_digest: ?gliner_decide_qualification.Digest = null;
 
         const tokenizer_type = blk: {
             if (shouldPreferSentencePieceOverride(man, model_dir, self.allocator)) {
@@ -7273,6 +7368,18 @@ pub const ModelManager = struct {
                     // separate pathname check leaves a replacement window.
                     try man.verifyBoundarySidecar("tokenizer.json", bytes);
                     break :blk try hf_tokenizer.HfTokenizer.loadFromBytesWithOptions(self.allocator, bytes, .{ .strict_unigram_normalizer = true });
+                } else if (man.gliner_architecture == .span and man.gliner_span_declared) blk: {
+                    const path = man.tokenizer_json_path orelse return error.NoTokenizerFound;
+                    const bytes = try c_file.readFileMax(self.allocator, path, 32 * 1024 * 1024);
+                    defer self.allocator.free(bytes);
+                    const digest = gliner_decide_qualification.Digest.of(bytes);
+                    if (man.gliner_span_tokenizer_digest) |expected| {
+                        if (digest.size_bytes != expected.size_bytes or !std.mem.eql(u8, &digest.sha256, &expected.sha256))
+                            return error.GlinerDecisionArtifactMismatch;
+                    } else return error.MissingGlinerDecisionIdentity;
+                    const tokenizer = try hf_tokenizer.HfTokenizer.loadFromBytes(self.allocator, bytes);
+                    gliner_span_tokenizer_digest = digest;
+                    break :blk tokenizer;
                 } else try loadHuggingFaceTokenizerFromManifest(self.allocator, &man);
                 try hf_tok.?.configureBpeCache(self.tokenizer_cache_config);
                 try hf_tok.?.configureParallelBpe(
@@ -7314,6 +7421,8 @@ pub const ModelManager = struct {
             const identity = try session_factory.getGlinerBoundaryIdentity(session);
             try identity.verifySidecars(try man.boundarySidecarDigests());
         }
+        if (gliner_span_tokenizer_digest) |digest|
+            try session_factory.sealGlinerDecisionTokenizerDigest(session, digest);
 
         var whisper_prompt_cache: ?whisper_prompt.PromptCache = if (session_factory.getWhisperConfig(session) != null)
             try whisper_prompt.PromptCache.init(
@@ -7409,13 +7518,22 @@ pub const ModelManager = struct {
                 ),
             };
         } else null;
+        // Hash only after tokenizer/session admission owns the loaded assets.
+        const embedding_snapshot: ?eg2_identity.Snapshot = if (embedding_signature) |before| blk: {
+            const snapshot = try eg2_identity.snapshot(self.allocator, sm.io orelse std.Options.debug_io, model_dir, man.safetensors_path.?, control orelse .{});
+            if (!std.mem.eql(u8, &before, &snapshot.signature)) return error.ModelArtifactsChanging;
+            break :blk snapshot;
+        } else null;
         const owned_model_dir = try self.allocator.dupe(u8, model_dir);
         var owned_model_dir_owned = true;
         errdefer if (owned_model_dir_owned) self.allocator.free(owned_model_dir);
         const model = try self.allocator.create(LoadedModel);
         var model_storage_owned = true;
         errdefer if (model_storage_owned) self.allocator.destroy(model);
+        if (embedding_snapshot) |snapshot| if (!std.mem.eql(u8, &snapshot.signature, &try eg2_identity.signature(self.allocator, sm.io orelse std.Options.debug_io, model_dir, man.safetensors_path.?))) return error.ModelArtifactsChanging;
         model.* = .{
+            .embedding_identity = if (embedding_snapshot) |snapshot| snapshot.digest else null,
+            .embedding_asset_signature = if (embedding_snapshot) |snapshot| snapshot.signature else null,
             .manifest = man,
             .hf_tok = hf_tok,
             .sp_tok = sp_tok,
@@ -9364,9 +9482,6 @@ fn loadSessionForPreferredBackends(
             resource_lease = null;
             defer loaded.deinit();
             if (control) |active| try active.check();
-            try session_factory.prepareGlinerBoundaryResident(loaded.session, control);
-            try session_factory.prepareLayaResident(loaded.session, control);
-            if (loaded.resource_lease) |*lease| try lease.retain(resident_amounts);
             if (manager.admission_enabled) {
                 if (serving_floor) |floor| session_factory.configureReservedGenerationWorkspace(
                     &loaded.session,
@@ -9387,6 +9502,12 @@ fn loadSessionForPreferredBackends(
                     &man,
                 );
             }
+            // Resident preparation can populate the shared weight cache.
+            // Install its owner and hard limits while it is still empty,
+            // keeping the construction peak leased until preparation drains.
+            try session_factory.prepareGlinerBoundaryResident(loaded.session, control);
+            try session_factory.prepareLayaResident(loaded.session, control);
+            if (loaded.resource_lease) |*lease| try lease.retain(resident_amounts);
             return loaded.take();
         } else |err| {
             std.log.warn("loadModel({s}) backend {s} failed: {s}", .{ model_dir, @tagName(backend), @errorName(err) });

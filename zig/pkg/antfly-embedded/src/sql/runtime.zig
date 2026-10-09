@@ -2594,7 +2594,7 @@ test "SQL decisions execute batches across projection predicate aggregation and 
             self.calls += requests.len;
             self.max_batch = @max(self.max_batch, requests.len);
             const output = try a.alloc(Json, requests.len);
-            for (output) |*value| value.* = try std.json.parseFromSliceLeaky(Json, a, "{\"model\":\"mock\",\"answers\":{\"answer\":{\"type\":\"noul\",\"noul\":0.9}},\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}", .{});
+            for (output) |*value| value.* = try std.json.parseFromSliceLeaky(Json, a, "{\"model\":\"mock\",\"answers\":[{\"name\":\"answer\",\"type\":\"predicate\",\"decision_method\":\"typed\",\"probability\":0.9}],\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}", .{});
             return output;
         }
     };
@@ -2645,7 +2645,7 @@ test "SQL decisions execute batches across projection predicate aggregation and 
     }
     var invalid = try compiler.compile(a, "SELECT ai_decide(CAST(id AS TEXT), '{}', 'local') FROM things", .{});
     defer invalid.deinit();
-    try std.testing.expectError(error.DecisionLimitExceeded, execute(a, fixture.iface(), &invalid, &.{}, .{}));
+    try std.testing.expectError(error.InvalidDecisionSpecification, execute(a, fixture.iface(), &invalid, &.{}, .{}));
     try std.testing.expectEqual(@as(usize, 0), fixture.pages);
 }
 
@@ -2945,7 +2945,7 @@ const InsertDecisionFixture = struct {
         self.max_batch = @max(self.max_batch, requests.len);
         const results = try a.alloc(Json, requests.len);
         for (results) |*result| {
-            result.* = try std.json.parseFromSliceLeaky(Json, a, "{\"model\":\"mock\",\"answers\":{\"answer\":{\"type\":\"noul\",\"noul\":0.9}},\"usage\":{\"input_tokens\":2,\"output_tokens\":0}}", .{});
+            result.* = try std.json.parseFromSliceLeaky(Json, a, "{\"model\":\"mock\",\"answers\":[{\"name\":\"answer\",\"type\":\"predicate\",\"decision_method\":\"typed\",\"probability\":0.9}],\"usage\":{\"input_tokens\":2,\"output_tokens\":0}}", .{});
             const payload = try a.alloc(u8, self.metadata_bytes);
             @memset(payload, 'x');
             try result.object.put(a, "metadata", .{ .string = payload });
@@ -2991,7 +2991,7 @@ test "SQL INSERT values release provider payloads and batch heterogeneous condit
         try std.testing.expectEqual(@as(usize, 0), fixture.writes);
     }
     var fixture: InsertDecisionFixture = .{};
-    var json = try compiler.compile(a, "INSERT INTO things (_id,payload) VALUES ('row0',ai_decide('input','{\"answer\":{\"type\":\"noul\",\"instructions\":\"Refund?\"}}','local')),('row1',ai_decide('input','{\"answer\":{\"type\":\"noul\",\"instructions\":\"Refund?\"}}','local'))", .{});
+    var json = try compiler.compile(a, "INSERT INTO things (_id,payload) VALUES ('row0',ai_decide('input','[{\"name\":\"answer\",\"type\":\"predicate\",\"instructions\":\"Refund?\"}]','local')),('row1',ai_decide('input','[{\"name\":\"answer\",\"type\":\"predicate\",\"instructions\":\"Refund?\"}]','local'))", .{});
     defer json.deinit();
     var result = try execute(a, fixture.backend(), &json, &.{}, .{ .page_rows = 1 });
     defer result.deinit();
@@ -3013,7 +3013,7 @@ test "SQL INSERT decision pages unwind allocation failures before commit" {
 
 fn constantDecisionAllocationScenario(a: std.mem.Allocator) !void {
     var fixture: InsertDecisionFixture = .{ .metadata_bytes = 0 };
-    var compiled = try compiler.compile(a, "SELECT ai_probability('input','Refund?','local'),ai_decide('input','{\"answer\":{\"type\":\"noul\",\"instructions\":\"Refund?\"}}','local')", .{});
+    var compiled = try compiler.compile(a, "SELECT ai_probability('input','Refund?','local'),ai_decide('input','[{\"name\":\"answer\",\"type\":\"predicate\",\"instructions\":\"Refund?\"}]','local')", .{});
     defer compiled.deinit();
     var result = try execute(a, fixture.backend(), &compiled, &.{}, .{});
     defer result.deinit();
@@ -3225,7 +3225,7 @@ test "SQL nested blocking result ownership unwinds allocation failures" {
             try std.testing.expectEqualStrings("5", result.output.rows[0][0].string);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Scenario.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Scenario.run, .{});
 }
 
 test "SQL joins consume native column batches without invoking the JSON cursor" {

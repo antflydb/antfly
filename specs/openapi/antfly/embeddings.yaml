@@ -369,6 +369,10 @@ components:
 
         Models are loaded from the `models/embedders/{name}/` directory.
       properties:
+        model_identity:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+          description: Immutable EmbeddingGemma 2 asset and recipe identity returned by /embed. Pin this when indexing; a changed checkpoint, tokenizer, or processor rejects embedding before vector publication.
         provider:
           type: string
           enum: [antfly]

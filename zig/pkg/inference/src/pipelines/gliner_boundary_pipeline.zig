@@ -114,6 +114,9 @@ pub const Result = struct {
 };
 pub const Options = struct {
     threshold: f32 = 0.5,
+    /// Legacy extraction filters below-cutoff multi-label results to empty.
+    /// Public v2 and provider classification retain the upstream best fallback.
+    classification_multi_label_fallback: bool = true,
     overlap: boundary.OverlapPolicy = .flat,
     offset_unit: boundary.OffsetUnit = .utf8_bytes,
     /// Only a valid witness may survive a search-node budget. Cancellation,
@@ -949,7 +952,8 @@ pub fn presentClassifications(allocator: Allocator, compiled: *const schema_mod.
                     selected.* |= @as(constraints.Selection, 1) << @intCast(label);
             }
             if (classification.mode == .multi) {
-                if (selected.* == 0) selected.* = @as(constraints.Selection, 1) << @intCast(best);
+                if (selected.* == 0 and options.classification_multi_label_fallback)
+                    selected.* = @as(constraints.Selection, 1) << @intCast(best);
             } else for (0..@min(classification.top_k, probs.len)) |_| {
                 var next: ?usize = null;
                 for (probs, 0..) |probability, label| {
@@ -1322,6 +1326,96 @@ fn expectValues(expected: []const ExpectedValue, actual: []const Value, toleranc
     try std.testing.expectEqual(expected.len, actual.len);
     for (expected, actual) |want, got| try expectValue(want, got, tolerance);
 }
+
+fn codepointOffsetToByte(text: []const u8, target: usize) !usize {
+    var view = try std.unicode.Utf8View.init(text);
+    var iterator = view.iterator();
+    var index: usize = 0;
+    while (iterator.nextCodepointSlice()) |slice| : (index += 1) {
+        if (index == target) return @intFromPtr(slice.ptr) - @intFromPtr(text.ptr);
+    }
+    if (index == target) return text.len;
+    return error.InvalidFamilyReference;
+}
+
+fn expectValueUtf8FromCodepoints(text: []const u8, expected: ExpectedValue, actual: Value, tolerance: f32) !void {
+    try std.testing.expectEqualStrings(expected.text, actual.text);
+    try std.testing.expectApproxEqAbs(expected.confidence, actual.confidence, tolerance);
+    if (expected.source) |source| {
+        try std.testing.expect(actual.source != null);
+        try std.testing.expectEqual(boundary.OffsetUnit.utf8_bytes, actual.source.?.unit);
+        try std.testing.expectEqual(try codepointOffsetToByte(text, source.start), actual.source.?.start);
+        try std.testing.expectEqual(try codepointOffsetToByte(text, source.end), actual.source.?.end);
+    } else try std.testing.expect(actual.source == null);
+    try std.testing.expectEqual(expected.attributes.len, actual.attributes.len);
+    for (expected.attributes, actual.attributes) |want, got| {
+        try std.testing.expectEqualStrings(want.name, got.name);
+        try expectLabels(want.labels, got.labels, tolerance);
+    }
+}
+
+/// Check a UTF-8-byte presentation against an oracle captured in Unicode
+/// codepoint coordinates. Learned values and confidence scores are unchanged;
+/// only source coordinates are converted against the exact original text.
+pub fn expectSampleUtf8FromCodepoints(text: []const u8, expected: ExpectedSample, actual: Sample, tolerance: f32) !void {
+    try std.testing.expectEqual(expected.entities.len, actual.entities.len);
+    for (expected.entities, actual.entities) |want, got| {
+        try std.testing.expectEqualStrings(want.name, got.name);
+        try std.testing.expectEqual(want.values.len, got.values.len);
+        for (want.values, got.values) |want_value, got_value|
+            try expectValueUtf8FromCodepoints(text, want_value, got_value, tolerance);
+    }
+    try std.testing.expectEqual(expected.classifications.len, actual.classifications.len);
+    for (expected.classifications, actual.classifications) |want, got| {
+        try std.testing.expectEqualStrings(want.name, got.name);
+        try expectLabels(want.labels, got.labels, tolerance);
+    }
+    try std.testing.expectEqual(expected.structures.len, actual.structures.len);
+    for (expected.structures, actual.structures) |want, got| {
+        try std.testing.expectEqualStrings(want.name, got.name);
+        try std.testing.expectEqual(want.instances.len, got.instances.len);
+        for (want.instances, got.instances) |want_record, got_record| {
+            try std.testing.expectEqual(want_record.fields.len, got_record.fields.len);
+            for (want_record.fields, got_record.fields) |want_field, got_field| {
+                try std.testing.expectEqualStrings(want_field.name, got_field.name);
+                try std.testing.expectEqual(want_field.values.len, got_field.values.len);
+                for (want_field.values, got_field.values) |want_value, got_value|
+                    try expectValueUtf8FromCodepoints(text, want_value, got_value, tolerance);
+            }
+        }
+    }
+    try std.testing.expectEqual(expected.relations.len, actual.relations.len);
+    for (expected.relations, actual.relations) |want, got| {
+        try std.testing.expectEqualStrings(want.name, got.name);
+        try expectValueUtf8FromCodepoints(text, want.head, got.head, tolerance);
+        try expectValueUtf8FromCodepoints(text, want.tail, got.tail, tolerance);
+        try std.testing.expectApproxEqAbs(want.confidence, got.confidence, tolerance);
+        try std.testing.expectEqual(want.derived, got.derived);
+        try std.testing.expectEqual(want.head_entity_type, got.head_entity_type);
+        try std.testing.expectEqual(want.tail_entity_type, got.tail_entity_type);
+    }
+}
+
+fn expectNormalizedSyntheticTerminal(expected: ExpectedSample, actual: Sample, tolerance: f32, offset_unit: boundary.OffsetUnit) !void {
+    try std.testing.expectEqual(@as(usize, 1), expected.entities.len);
+    try std.testing.expectEqual(@as(usize, 1), expected.entities[0].values.len);
+    const upstream = expected.entities[0].values[0];
+    try std.testing.expectEqualStrings("a.", upstream.text);
+    try std.testing.expectEqual(@as(usize, 0), upstream.source.?.start);
+    try std.testing.expectEqual(@as(usize, 2), upstream.source.?.end);
+    // The upstream span covers punctuation its processor synthesized past the
+    // original source. Native presentation cannot return that invalid span,
+    // and retains the entity task with no values rather than inventing
+    // clipped learned text.
+    _ = tolerance;
+    _ = offset_unit;
+    try std.testing.expectEqual(@as(usize, 1), actual.entities.len);
+    try std.testing.expectEqualStrings(expected.entities[0].name, actual.entities[0].name);
+    try std.testing.expectEqual(@as(usize, 0), actual.entities[0].values.len);
+    try std.testing.expectEqual(@as(usize, 0), actual.classifications.len);
+    try std.testing.expectEqual(@as(usize, 0), actual.structures.len);
+    try std.testing.expectEqual(@as(usize, 0), actual.relations.len);
+}
 pub fn expectSample(expected: ExpectedSample, actual: Sample, tolerance: f32) !void {
     try std.testing.expectEqual(expected.entities.len, actual.entities.len);
     for (expected.entities, actual.entities) |want, got| {
@@ -1365,6 +1459,334 @@ pub const PublishedModelFiles = struct {
     @"tokenizer.json": PublishedModelPin,
     @"tokenizer_config.json": PublishedModelPin,
 };
+pub const FamilySidecars = struct {
+    @"config.json": PublishedModelPin,
+    @"encoder_config/config.json": PublishedModelPin,
+    @"tokenizer.json": PublishedModelPin,
+    @"tokenizer_config.json": PublishedModelPin,
+};
+pub const FamilyCheckpoint = struct {
+    environment_prefix: []const u8,
+    capture_environment_prefix: ?[]const u8 = null,
+    profile: []const u8,
+    repo: []const u8,
+    revision: []const u8,
+    capture_fixture: []const u8,
+    capture: PublishedModelPin,
+    scope: []const u8 = "upstream_multilingual_family_reference",
+    request_count: usize = 11,
+    generator_sha256: []const u8 = "4e9fee278e8e4757f1ee03aec87208dfc7cbb58eb7a009b30e8f525c8eb9cde5",
+    contract_sha256: []const u8 = "0beb19e072fd46f0318bd7a1e2c0ac3b8ad1deaf47bdc0cf1ce7ca1e9c6364c5",
+    requests_sha256: []const u8 = "f5a609866d7077c63956cde11bdbd8164c1d8072073d6634ac4da3ed816526b5",
+    exercise_utf8_offsets: bool = false,
+    pythonhashseed: ?usize = 0,
+    model: PublishedModelPin,
+    sidecars: FamilySidecars,
+};
+
+/// Compare a family result against its pinned upstream capture while keeping
+/// the one documented upstream synthetic-terminal case explicit. The native
+/// pipeline drops that out-of-source value while retaining its empty task;
+/// every other fixture remains strict captured parity.
+pub fn expectFamilySample(
+    checkpoint: FamilyCheckpoint,
+    request_id: []const u8,
+    text: []const u8,
+    expected: ExpectedSample,
+    actual: Sample,
+    tolerance: f32,
+    offset_unit: boundary.OffsetUnit,
+) !void {
+    if (std.mem.eql(u8, checkpoint.capture_fixture, "family/multi_v1_general_entity_capture.json") and
+        std.mem.eql(u8, request_id, "bare_short"))
+        return expectNormalizedSyntheticTerminal(expected, actual, tolerance, offset_unit);
+    return switch (offset_unit) {
+        .unicode_codepoints => expectSample(expected, actual, tolerance),
+        .utf8_bytes => expectSampleUtf8FromCodepoints(text, expected, actual, tolerance),
+        .utf16_codeunits => error.InvalidFamilyReference,
+    };
+}
+pub const FamilyReference = struct {
+    format_version: u32,
+    status: []const u8,
+    scope: []const u8,
+    qualification: bool,
+    native_runtime_qualified: bool,
+    production_qualified: bool,
+    model: struct {
+        status: []const u8,
+        qualification: bool,
+        profile: []const u8,
+        repo: []const u8,
+        revision: []const u8,
+        architecture: []const u8,
+        encoder_family: []const u8,
+        tensor_count: usize,
+        parameter_count: usize,
+        model_size_bytes: usize,
+        tensor_header_sha256: []const u8,
+        model_sha256: []const u8,
+        sidecars: FamilySidecars,
+    },
+    source: struct { repo: []const u8, revision: []const u8, package_version: []const u8 },
+    runtime: struct {
+        python: []const u8,
+        unicode: []const u8,
+        packages: struct {
+            @"huggingface-hub": []const u8,
+            numpy: []const u8,
+            pydantic: []const u8,
+            safetensors: []const u8,
+            tokenizers: []const u8,
+            torch: []const u8,
+            transformers: []const u8,
+        },
+        absent_packages: []const []const u8,
+        device: []const u8,
+        dtype: []const u8,
+        threads: usize,
+        pythonhashseed: ?usize = null,
+    },
+    artifacts: struct { generator_sha256: []const u8, contract_sha256: []const u8, requests_sha256: []const u8 },
+    requests: []const struct {
+        id: []const u8,
+        kind: enum { extract, classification } = .extract,
+        text: []const u8,
+        native_schema: std.json.Value,
+        native_schema_json: []const u8,
+        native_options: struct { offset_unit: []const u8, include_confidence: bool, include_spans: bool } = .{
+            .offset_unit = "unicode_codepoints",
+            .include_confidence = true,
+            .include_spans = true,
+        },
+        native_expected: ExpectedSample,
+        encoded: struct { input_ids: []const i64, attention_mask: []const i64 },
+        native_classification: ?struct {
+            input_ids: []const i64,
+            tasks: []const struct { name: []const u8, labels: []const []const u8, raw_logits: []const f32 },
+        } = null,
+    },
+};
+pub const multilingual_family_checkpoints = [_]FamilyCheckpoint{
+    .{
+        .environment_prefix = "ANTFLY_GLINER25_MULTI_V1",
+        .profile = "multi_v1",
+        .repo = "fastino/gliner2.5-multi-v1",
+        .revision = "2ca71aafb3446d9014e1c55c7ff51c9bc7209c47",
+        .capture_fixture = "family/multi_v1_capture.json",
+        .capture = .{ .sha256 = "4c46106eaa56b5899ca607cb4deca877d197ecb0f3800ac5198c44a17fbddcd2", .size_bytes = 74084 },
+        .exercise_utf8_offsets = true,
+        .model = .{ .sha256 = "c1ff4ec0bc00031c15530b8f3c33d3677f27949e6a0cb52e1247a6224b6c5395", .size_bytes = 1149461028 },
+        .sidecars = .{
+            .@"config.json" = .{ .sha256 = "8b59a0f426a65859c89cd1ea850c3529c09aa3be3a6fafd8eddfdd17b1bf0146", .size_bytes = 3151 },
+            .@"encoder_config/config.json" = .{ .sha256 = "fa4f9ef2903b5369ab172333aae4574e6a476511d7465845cf59f8360ee18716", .size_bytes = 857 },
+            .@"tokenizer.json" = .{ .sha256 = "c62446df87ae18ec98b133f8f84fc449a07cc89bbf8ef192a4cb5f9c53777a7a", .size_bytes = 16035853 },
+            .@"tokenizer_config.json" = .{ .sha256 = "0bf3ea0873234bd9bfdd3853c440395009ac6365a925b91654daed5396d655e1", .size_bytes = 645 },
+        },
+    },
+    .{
+        .environment_prefix = "ANTFLY_GLINER25_MULTI_DECIDE",
+        .profile = "multi_decide",
+        .repo = "fastino/GLiNER2.5-multi-Decide",
+        .revision = "a35a0cd3b7a0f00f2effc576f454cd48fa98aa5f",
+        .capture_fixture = "family/multi_decide_capture.json",
+        .capture = .{ .sha256 = "06163fe217ff9769df3a045a30c9583cd6c352e72a23077c11e7aaa6ce59074d", .size_bytes = 68545 },
+        .exercise_utf8_offsets = true,
+        .model = .{ .sha256 = "9efe0f88c99f2aa794452e9559dc60e98d60d9fa2bf1b60cf2710411b6da5b4e", .size_bytes = 1149461028 },
+        .sidecars = .{
+            .@"config.json" = .{ .sha256 = "be5123080c0f3f01b938bc46a5dd0d7a2e515a34f6df798dfd70ed04c277c8bf", .size_bytes = 3152 },
+            .@"encoder_config/config.json" = .{ .sha256 = "d0ebbcb8b458e285a39e12cc315cbaf3d1c6f631e7281e6b22dd5b4071183f83", .size_bytes = 858 },
+            .@"tokenizer.json" = .{ .sha256 = "c62446df87ae18ec98b133f8f84fc449a07cc89bbf8ef192a4cb5f9c53777a7a", .size_bytes = 16035853 },
+            .@"tokenizer_config.json" = .{ .sha256 = "fd4a31dc2f1f17e31638c5f0e783b81cdb2fbe6bddd116a8d9e5d50d78148cf1", .size_bytes = 646 },
+        },
+    },
+};
+pub const multilingual_endpoint_checkpoints = [_]FamilyCheckpoint{
+    .{
+        .environment_prefix = multilingual_family_checkpoints[0].environment_prefix,
+        .capture_environment_prefix = "ANTFLY_GLINER25_MULTI_V1_ENDPOINT",
+        .profile = multilingual_family_checkpoints[0].profile,
+        .repo = multilingual_family_checkpoints[0].repo,
+        .revision = multilingual_family_checkpoints[0].revision,
+        .capture_fixture = "family/multi_v1_endpoint_capture.json",
+        .capture = .{ .sha256 = "225c5f54bc738e73d1d8007d7297f436e8fe7a10fa1301c53cc79e2b777b027d", .size_bytes = 34648 },
+        .scope = "upstream_mixed_feature_endpoint_bounds",
+        .request_count = 2,
+        .generator_sha256 = "5fb775edf439803b75ed7d131c330e98e6ae9a355caa7ce2fb1695f0431f4de7",
+        .requests_sha256 = "de6ba26cd1d11ab598be5b8e6120d4fc81718fe9fd2e6419ab612e3926e480ff",
+        .exercise_utf8_offsets = true,
+        .pythonhashseed = null,
+        .model = multilingual_family_checkpoints[0].model,
+        .sidecars = multilingual_family_checkpoints[0].sidecars,
+    },
+    .{
+        .environment_prefix = multilingual_family_checkpoints[1].environment_prefix,
+        .capture_environment_prefix = "ANTFLY_GLINER25_MULTI_DECIDE_ENDPOINT",
+        .profile = multilingual_family_checkpoints[1].profile,
+        .repo = multilingual_family_checkpoints[1].repo,
+        .revision = multilingual_family_checkpoints[1].revision,
+        .capture_fixture = "family/multi_decide_endpoint_capture.json",
+        .capture = .{ .sha256 = "34eeb1a5853aa2168b168dfe41a86ab143a22eb5014a0804a0dc6a6ca045887c", .size_bytes = 29767 },
+        .scope = "upstream_mixed_feature_endpoint_bounds",
+        .request_count = 2,
+        .generator_sha256 = "5fb775edf439803b75ed7d131c330e98e6ae9a355caa7ce2fb1695f0431f4de7",
+        .requests_sha256 = "de6ba26cd1d11ab598be5b8e6120d4fc81718fe9fd2e6419ab612e3926e480ff",
+        .exercise_utf8_offsets = true,
+        .pythonhashseed = null,
+        .model = multilingual_family_checkpoints[1].model,
+        .sidecars = multilingual_family_checkpoints[1].sidecars,
+    },
+};
+pub const multilingual_classification_floor_checkpoints = [_]FamilyCheckpoint{
+    .{
+        .environment_prefix = multilingual_family_checkpoints[0].environment_prefix,
+        .capture_environment_prefix = "ANTFLY_GLINER25_MULTI_V1_CLASSIFICATION_FLOOR",
+        .profile = multilingual_family_checkpoints[0].profile,
+        .repo = multilingual_family_checkpoints[0].repo,
+        .revision = multilingual_family_checkpoints[0].revision,
+        .capture_fixture = "family/multi_v1_classification_floor_capture.json",
+        .capture = .{ .sha256 = "e35c96c23333b36dc701f01a3329801e9d69ee8f89f26debfbb069d1f9b5d06d", .size_bytes = 14720 },
+        .request_count = 1,
+        .requests_sha256 = "c5fa0407f71a1f2e62e6ba5b0cfb7aecdeda2a08298116ad4eb73ec0b9898314",
+        .exercise_utf8_offsets = true,
+        .model = multilingual_family_checkpoints[0].model,
+        .sidecars = multilingual_family_checkpoints[0].sidecars,
+    },
+    .{
+        .environment_prefix = multilingual_family_checkpoints[1].environment_prefix,
+        .capture_environment_prefix = "ANTFLY_GLINER25_MULTI_DECIDE_CLASSIFICATION_FLOOR",
+        .profile = multilingual_family_checkpoints[1].profile,
+        .repo = multilingual_family_checkpoints[1].repo,
+        .revision = multilingual_family_checkpoints[1].revision,
+        .capture_fixture = "family/multi_decide_classification_floor_capture.json",
+        .capture = .{ .sha256 = "1b272c6365931525c15f8a647485525a527837596da3b64f18c6516c53a97c2a", .size_bytes = 14754 },
+        .request_count = 1,
+        .requests_sha256 = "c5fa0407f71a1f2e62e6ba5b0cfb7aecdeda2a08298116ad4eb73ec0b9898314",
+        .exercise_utf8_offsets = true,
+        .model = multilingual_family_checkpoints[1].model,
+        .sidecars = multilingual_family_checkpoints[1].sidecars,
+    },
+};
+pub const multilingual_general_classification_checkpoints = [_]FamilyCheckpoint{
+    .{
+        .environment_prefix = multilingual_family_checkpoints[0].environment_prefix,
+        .capture_environment_prefix = "ANTFLY_GLINER25_MULTI_V1_GENERAL_CLASSIFICATION",
+        .profile = multilingual_family_checkpoints[0].profile,
+        .repo = multilingual_family_checkpoints[0].repo,
+        .revision = multilingual_family_checkpoints[0].revision,
+        .capture_fixture = "family/multi_v1_general_classification_capture.json",
+        .capture = .{ .sha256 = "0e50db3599a5f2fbf412ae15adcf924f668244ea68d1afeecdb7c852075cfee3", .size_bytes = 73287 },
+        .request_count = 7,
+        .requests_sha256 = "b4c3fe4d67f5f092bb9c9d5781d524011499dd954d348f2ff4fd8e6ee54520ab",
+        .exercise_utf8_offsets = true,
+        .model = multilingual_family_checkpoints[0].model,
+        .sidecars = multilingual_family_checkpoints[0].sidecars,
+    },
+    .{
+        .environment_prefix = multilingual_family_checkpoints[1].environment_prefix,
+        .capture_environment_prefix = "ANTFLY_GLINER25_MULTI_DECIDE_GENERAL_CLASSIFICATION",
+        .profile = multilingual_family_checkpoints[1].profile,
+        .repo = multilingual_family_checkpoints[1].repo,
+        .revision = multilingual_family_checkpoints[1].revision,
+        .capture_fixture = "family/multi_decide_general_classification_capture.json",
+        .capture = .{ .sha256 = "94bae6ffda2bf1a14538583b4a895c1f7a2493e5ae7448f5bb79c3e83eea1136", .size_bytes = 73312 },
+        .request_count = 7,
+        .requests_sha256 = "b4c3fe4d67f5f092bb9c9d5781d524011499dd954d348f2ff4fd8e6ee54520ab",
+        .exercise_utf8_offsets = true,
+        .model = multilingual_family_checkpoints[1].model,
+        .sidecars = multilingual_family_checkpoints[1].sidecars,
+    },
+};
+pub const multilingual_general_entity_checkpoints = [_]FamilyCheckpoint{
+    .{
+        .environment_prefix = multilingual_family_checkpoints[0].environment_prefix,
+        .capture_environment_prefix = "ANTFLY_GLINER25_MULTI_V1_GENERAL_ENTITY",
+        .profile = multilingual_family_checkpoints[0].profile,
+        .repo = multilingual_family_checkpoints[0].repo,
+        .revision = multilingual_family_checkpoints[0].revision,
+        .capture_fixture = "family/multi_v1_general_entity_capture.json",
+        .capture = .{ .sha256 = "6f42e7caec49c8323719768763f9cc038f7a0bd66ae95cbe678017001565d862", .size_bytes = 39651 },
+        .request_count = 4,
+        .requests_sha256 = "0362626845854c6f3893c9640b4a8c207b0463168dd2083cedcbeeda5c2e98dc",
+        .exercise_utf8_offsets = true,
+        .model = multilingual_family_checkpoints[0].model,
+        .sidecars = multilingual_family_checkpoints[0].sidecars,
+    },
+    .{
+        .environment_prefix = multilingual_family_checkpoints[1].environment_prefix,
+        .capture_environment_prefix = "ANTFLY_GLINER25_MULTI_DECIDE_GENERAL_ENTITY",
+        .profile = multilingual_family_checkpoints[1].profile,
+        .repo = multilingual_family_checkpoints[1].repo,
+        .revision = multilingual_family_checkpoints[1].revision,
+        .capture_fixture = "family/multi_decide_general_entity_capture.json",
+        .capture = .{ .sha256 = "2d274bbe573d23a0b24582a1e296f098c92b059427af06a8969f239db77deb78", .size_bytes = 35386 },
+        .request_count = 4,
+        .requests_sha256 = "0362626845854c6f3893c9640b4a8c207b0463168dd2083cedcbeeda5c2e98dc",
+        .exercise_utf8_offsets = true,
+        .model = multilingual_family_checkpoints[1].model,
+        .sidecars = multilingual_family_checkpoints[1].sidecars,
+    },
+};
+pub const multilingual_clean_entity_short_checkpoints = [_]FamilyCheckpoint{
+    .{
+        .environment_prefix = multilingual_family_checkpoints[0].environment_prefix,
+        .capture_environment_prefix = "ANTFLY_GLINER25_MULTI_V1_CLEAN_ENTITY_SHORT",
+        .profile = multilingual_family_checkpoints[0].profile,
+        .repo = multilingual_family_checkpoints[0].repo,
+        .revision = multilingual_family_checkpoints[0].revision,
+        .capture_fixture = "family/multi_v1_clean_entity_short_capture.json",
+        .capture = .{ .sha256 = "d0d4a26965c8d705e340b8bb9a806804513483b33c4ced959172ba4a817df450", .size_bytes = 15406 },
+        .request_count = 2,
+        .requests_sha256 = "407fb1be410c7200c8daed0246a3ffb93be4d6b905ad770f915a5f21ceaaba6c",
+        .exercise_utf8_offsets = true,
+        .model = multilingual_family_checkpoints[0].model,
+        .sidecars = multilingual_family_checkpoints[0].sidecars,
+    },
+    .{
+        .environment_prefix = multilingual_family_checkpoints[1].environment_prefix,
+        .capture_environment_prefix = "ANTFLY_GLINER25_MULTI_DECIDE_CLEAN_ENTITY_SHORT",
+        .profile = multilingual_family_checkpoints[1].profile,
+        .repo = multilingual_family_checkpoints[1].repo,
+        .revision = multilingual_family_checkpoints[1].revision,
+        .capture_fixture = "family/multi_decide_clean_entity_short_capture.json",
+        .capture = .{ .sha256 = "30663c9d9e73ac2a2282817e12d8e06c54523a593a9a1ae38332a60f6ecedc97", .size_bytes = 14997 },
+        .request_count = 2,
+        .requests_sha256 = "407fb1be410c7200c8daed0246a3ffb93be4d6b905ad770f915a5f21ceaaba6c",
+        .exercise_utf8_offsets = true,
+        .model = multilingual_family_checkpoints[1].model,
+        .sidecars = multilingual_family_checkpoints[1].sidecars,
+    },
+};
+pub const multilingual_source_word_floor_checkpoints = [_]FamilyCheckpoint{
+    .{
+        .environment_prefix = multilingual_family_checkpoints[0].environment_prefix,
+        .capture_environment_prefix = "ANTFLY_GLINER25_MULTI_V1_SOURCE_WORD_FLOOR",
+        .profile = multilingual_family_checkpoints[0].profile,
+        .repo = multilingual_family_checkpoints[0].repo,
+        .revision = multilingual_family_checkpoints[0].revision,
+        .capture_fixture = "family/multi_v1_source_word_floor_capture.json",
+        .capture = .{ .sha256 = "b8eada9defc76432e621c3add1fdb0df1a7212d034707401aa882f5f0cec8316", .size_bytes = 15929 },
+        .request_count = 2,
+        .requests_sha256 = "97c978fff4aa205a6f2d1d201bd473458926884550e3a670f0624cc1ec381852",
+        .exercise_utf8_offsets = true,
+        .model = multilingual_family_checkpoints[0].model,
+        .sidecars = multilingual_family_checkpoints[0].sidecars,
+    },
+    .{
+        .environment_prefix = multilingual_family_checkpoints[1].environment_prefix,
+        .capture_environment_prefix = "ANTFLY_GLINER25_MULTI_DECIDE_SOURCE_WORD_FLOOR",
+        .profile = multilingual_family_checkpoints[1].profile,
+        .repo = multilingual_family_checkpoints[1].repo,
+        .revision = multilingual_family_checkpoints[1].revision,
+        .capture_fixture = "family/multi_decide_source_word_floor_capture.json",
+        .capture = .{ .sha256 = "128f281deccdd916be3fd8fef7996ca8350e48bca653d503a526e8213eb4749a", .size_bytes = 15513 },
+        .request_count = 2,
+        .requests_sha256 = "97c978fff4aa205a6f2d1d201bd473458926884550e3a670f0624cc1ec381852",
+        .exercise_utf8_offsets = true,
+        .model = multilingual_family_checkpoints[1].model,
+        .sidecars = multilingual_family_checkpoints[1].sidecars,
+    },
+};
 pub const ReferenceFixture = struct {
     format_version: u32,
     source_commit: []const u8,
@@ -1393,6 +1815,221 @@ fn readPinnedFile(a: Allocator, directory: []const u8, name: []const u8, expecte
     errdefer a.free(bytes);
     try expectPinnedBytes(expected, bytes);
     return bytes;
+}
+fn expectSamePin(expected: PublishedModelPin, actual: PublishedModelPin) !void {
+    try std.testing.expectEqual(expected.size_bytes, actual.size_bytes);
+    try std.testing.expectEqualStrings(expected.sha256, actual.sha256);
+}
+fn familyCheckpointParity(comptime expected: FamilyCheckpoint) !void {
+    const platform = @import("antfly_platform");
+    const model_environment = expected.environment_prefix ++ "_MODEL_DIR";
+    const capture_environment = (expected.capture_environment_prefix orelse expected.environment_prefix) ++ "_CAPTURE";
+    const directory = platform.env.getenv(model_environment) orelse return error.SkipZigTest;
+    const capture_path = platform.env.getenv(capture_environment);
+    const c_file = @import("../util/c_file.zig");
+    const fixtures = @import("../architectures/gliner/boundary_parity_test.zig");
+    const safetensors = @import("../models/safetensors.zig");
+    const native = @import("../ops/native_compute.zig");
+    const engine = @import("../architectures/gliner/boundary_engine.zig");
+    const a = std.testing.allocator;
+
+    const capture_bytes = if (capture_path) |path|
+        try c_file.readFileMax(a, path, 2 * 1024 * 1024)
+    else
+        try fixtures.fixtureBytes(a, expected.capture_fixture);
+    defer a.free(capture_bytes);
+    try expectPinnedBytes(expected.capture, capture_bytes);
+    const capture = try std.json.parseFromSlice(FamilyReference, a, capture_bytes, .{ .ignore_unknown_fields = true });
+    defer capture.deinit();
+    try std.testing.expectEqual(@as(u32, 1), capture.value.format_version);
+    try std.testing.expectEqualStrings("captured", capture.value.status);
+    try std.testing.expectEqualStrings(expected.scope, capture.value.scope);
+    try std.testing.expect(!capture.value.qualification);
+    try std.testing.expect(!capture.value.native_runtime_qualified);
+    try std.testing.expect(!capture.value.production_qualified);
+    try std.testing.expectEqualStrings("https://github.com/fastino-ai/GLiNER2", capture.value.source.repo);
+    try std.testing.expectEqualStrings("55656fbfa01d3d4a77485e1a1eeeaf682990ccdf", capture.value.source.revision);
+    try std.testing.expectEqualStrings("2.0.0", capture.value.source.package_version);
+    try std.testing.expectEqualStrings("3.12.3", capture.value.runtime.python);
+    try std.testing.expectEqualStrings("15.0.0", capture.value.runtime.unicode);
+    try std.testing.expectEqualStrings("0.36.0", capture.value.runtime.packages.@"huggingface-hub");
+    try std.testing.expectEqualStrings("2.3.5", capture.value.runtime.packages.numpy);
+    try std.testing.expectEqualStrings("2.12.3", capture.value.runtime.packages.pydantic);
+    try std.testing.expectEqualStrings("0.7.0", capture.value.runtime.packages.safetensors);
+    try std.testing.expectEqualStrings("0.21.4", capture.value.runtime.packages.tokenizers);
+    try std.testing.expectEqualStrings("2.9.1", capture.value.runtime.packages.torch);
+    try std.testing.expectEqualStrings("4.55.4", capture.value.runtime.packages.transformers);
+    try std.testing.expectEqual(@as(usize, 1), capture.value.runtime.absent_packages.len);
+    try std.testing.expectEqualStrings("peft", capture.value.runtime.absent_packages[0]);
+    try std.testing.expectEqualStrings("cpu", capture.value.runtime.device);
+    try std.testing.expectEqualStrings("float32", capture.value.runtime.dtype);
+    try std.testing.expect(capture.value.runtime.threads > 0);
+    try std.testing.expectEqual(expected.pythonhashseed, capture.value.runtime.pythonhashseed);
+    try std.testing.expectEqualStrings("captured", capture.value.status);
+    try std.testing.expectEqualStrings("verified", capture.value.model.status);
+    try std.testing.expect(!capture.value.model.qualification);
+    try std.testing.expectEqualStrings(expected.profile, capture.value.model.profile);
+    try std.testing.expectEqualStrings(expected.repo, capture.value.model.repo);
+    try std.testing.expectEqualStrings(expected.revision, capture.value.model.revision);
+    try std.testing.expectEqualStrings("boundary", capture.value.model.architecture);
+    try std.testing.expectEqualStrings("deberta-v2", capture.value.model.encoder_family);
+    try std.testing.expectEqual(@as(usize, 334), capture.value.model.tensor_count);
+    try std.testing.expectEqual(@as(usize, 287355159), capture.value.model.parameter_count);
+    try std.testing.expectEqualStrings("013eacdfc5811df532e5afc637b013307dd93787b7dfdc95e5c404a9d6ca4e6c", capture.value.model.tensor_header_sha256);
+    try std.testing.expectEqual(expected.model.size_bytes, capture.value.model.model_size_bytes);
+    try std.testing.expectEqualStrings(expected.model.sha256, capture.value.model.model_sha256);
+    inline for (.{ "config.json", "encoder_config/config.json", "tokenizer.json", "tokenizer_config.json" }) |name|
+        try expectSamePin(@field(expected.sidecars, name), @field(capture.value.model.sidecars, name));
+    // These bind the oracle rows to the reviewed generator, family contract,
+    // and exact checkpoint-specific request corpus. They are evidence pins,
+    // not qualification.
+    try std.testing.expectEqualStrings(expected.generator_sha256, capture.value.artifacts.generator_sha256);
+    try std.testing.expectEqualStrings(expected.contract_sha256, capture.value.artifacts.contract_sha256);
+    try std.testing.expectEqualStrings(expected.requests_sha256, capture.value.artifacts.requests_sha256);
+    try std.testing.expectEqual(expected.request_count, capture.value.requests.len);
+
+    const weight_path = try std.fs.path.join(a, &.{ directory, "model.safetensors" });
+    defer a.free(weight_path);
+    var weights = fixtures.TensorFixture{ .allocator = a, .reader = try safetensors.MMapReader.openFileAbsolute(a, weight_path) };
+    defer weights.deinit();
+    try expectPinnedBytes(expected.model, weights.reader.file_bytes);
+    const tokenizer_bytes = try readPinnedFile(a, directory, "tokenizer.json", expected.sidecars.@"tokenizer.json");
+    defer a.free(tokenizer_bytes);
+    const tokenizer = try @import("inference_hf_tokenizer").HfTokenizer.loadFromBytes(a, tokenizer_bytes);
+    defer tokenizer.tokenizer().deinitTokenizer();
+    const config_bytes = try readPinnedFile(a, directory, "config.json", expected.sidecars.@"config.json");
+    defer a.free(config_bytes);
+    const encoder_bytes = try readPinnedFile(a, directory, "encoder_config/config.json", expected.sidecars.@"encoder_config/config.json");
+    defer a.free(encoder_bytes);
+    const tokenizer_config = try readPinnedFile(a, directory, "tokenizer_config.json", expected.sidecars.@"tokenizer_config.json");
+    defer a.free(tokenizer_config);
+    const config = try model.parseConfig(a, config_bytes, encoder_bytes);
+    var store = try weights.loadWeights();
+    defer store.deinitOwned();
+    var backend = native.NativeCompute.init(a, &store, null);
+    defer backend.deinit();
+    const cb = backend.computeBackend();
+
+    for (capture.value.requests) |request| {
+        errdefer std.debug.print("{s} family checkpoint pipeline fixture: {s}\n", .{ expected.profile, request.id });
+        try std.testing.expectEqualStrings("unicode_codepoints", request.native_options.offset_unit);
+        try std.testing.expect(request.native_options.include_confidence);
+        try std.testing.expect(request.native_options.include_spans);
+        // The explicit JSON string is intentional: JSON object order is part
+        // of the upstream schema prompt, while the enclosing evidence file is
+        // written with sorted keys for deterministic capture identity.
+        const schema_value = try std.json.parseFromSlice(std.json.Value, a, request.native_schema_json, .{});
+        defer schema_value.deinit();
+        try std.testing.expectEqual(.object, std.meta.activeTag(schema_value.value));
+        var schema = try schema_mod.compile(a, request.native_schema_json, .{});
+        defer schema.deinit();
+        var prepared = try processor.prepare(a, tokenizer.tokenizer(), &.{.{ .text = request.text, .schema = &schema }}, .{});
+        defer prepared.deinit();
+        try std.testing.expectEqual(@as(usize, 1), prepared.samples.len);
+        try std.testing.expectEqualSlices(i64, request.encoded.input_ids, prepared.samples[0].input_ids);
+        try std.testing.expectEqualSlices(i64, request.encoded.input_ids, prepared.input_ids);
+        try std.testing.expectEqualSlices(i64, request.encoded.attention_mask, prepared.attention_mask);
+        std.debug.print("{s}/{s}: tokens={d} words={d} sequence={d} word_width={d} queries={d} classifications={d} groups={d}\n", .{
+            expected.profile,
+            request.id,
+            prepared.samples[0].input_ids.len,
+            prepared.samples[0].words.len,
+            prepared.sequence_length,
+            prepared.word_width,
+            prepared.query_width,
+            prepared.classification_width,
+            prepared.group_width,
+        });
+        var encoded = try engine.encodeNative(&cb, a, &config, &prepared, .{});
+        defer encoded.deinit();
+        const core: CoreView = .{
+            .text_states = encoded.text_states,
+            .query_states = encoded.query_states,
+            .classification_states = encoded.classification_states,
+            .text_lengths = encoded.text_lengths,
+        };
+        if (request.native_classification) |reference| {
+            try std.testing.expectEqualSlices(i64, reference.input_ids, prepared.samples[0].input_ids);
+            var context = scoring.NativeContext{ .cb = &cb, .config = &config, .prepared = &prepared, .core = core, .scores = null };
+            var scores = try context.scorer().classify(a, .{}, null);
+            defer scores.deinit();
+            var offset: usize = 0;
+            for (reference.tasks, 0..) |task, task_index| {
+                try std.testing.expect(task_index < schema.schema.classifications.len);
+                const compiled = schema.schema.classifications[task_index].task;
+                try std.testing.expectEqualStrings(task.name, compiled.name);
+                try std.testing.expectEqual(task.labels.len, task.raw_logits.len);
+                try std.testing.expectEqual(task.labels.len, compiled.labels.len);
+                for (task.labels, task.raw_logits, 0..) |label, raw_logit, label_index| {
+                    try std.testing.expectEqualStrings(label, compiled.labels[label_index]);
+                    const route = prepared.samples[0].classification_labels[offset + label_index];
+                    try std.testing.expectEqual(task_index, route.schema_index);
+                    try std.testing.expectEqual(label_index, route.label_index);
+                    try std.testing.expectEqualStrings(label, route.name);
+                    try std.testing.expectApproxEqAbs(raw_logit, scores.logits[offset + label_index], fp32_confidence_tolerance);
+                }
+                offset += task.labels.len;
+            }
+            try std.testing.expectEqual(prepared.classification_width, offset);
+            try std.testing.expectEqual(offset, scores.logits.len);
+
+            // Exercise the public typed-decision presentation contract with
+            // every label retained. Removing only structured cardinality
+            // controls and adding top_k does not alter prompts, definitions,
+            // marker routing, or tokenization.
+            var ordinary_value = try std.json.parseFromSlice(std.json.Value, a, request.native_schema_json, .{});
+            defer ordinary_value.deinit();
+            const ordinary_tasks = ordinary_value.value.object.getPtr("classifications") orelse return error.InvalidFamilyReference;
+            try std.testing.expectEqual(reference.tasks.len, ordinary_tasks.array.items.len);
+            for (ordinary_tasks.array.items) |*task| {
+                _ = task.object.orderedRemove("min_labels");
+                _ = task.object.orderedRemove("max_labels");
+                const labels = task.object.get("labels") orelse return error.InvalidFamilyReference;
+                try task.object.put(ordinary_value.arena.allocator(), "top_k", .{ .integer = @intCast(labels.array.items.len) });
+            }
+            const ordinary_json = try std.json.Stringify.valueAlloc(a, ordinary_value.value, .{});
+            defer a.free(ordinary_json);
+            var ordinary_schema = try schema_mod.compile(a, ordinary_json, .{});
+            defer ordinary_schema.deinit();
+            var ordinary_prepared = try processor.prepare(a, tokenizer.tokenizer(), &.{.{ .text = request.text, .schema = &ordinary_schema }}, .{});
+            defer ordinary_prepared.deinit();
+            try std.testing.expectEqualSlices(i64, reference.input_ids, ordinary_prepared.samples[0].input_ids);
+            try std.testing.expectEqualSlices(i64, prepared.input_ids, ordinary_prepared.input_ids);
+            try std.testing.expectEqualSlices(i64, prepared.attention_mask, ordinary_prepared.attention_mask);
+            try std.testing.expectEqualSlices(i64, prepared.cls_marker_indices, ordinary_prepared.cls_marker_indices);
+            try std.testing.expectEqualSlices(bool, prepared.cls_marker_mask, ordinary_prepared.cls_marker_mask);
+            try std.testing.expectEqualSlices(i64, prepared.cls_group_index, ordinary_prepared.cls_group_index);
+            var ordinary_result = try runNative(&cb, a, &config, &ordinary_prepared, &.{&ordinary_schema}, core, .{ .offset_unit = .unicode_codepoints });
+            defer ordinary_result.deinit();
+            try std.testing.expectEqual(@as(usize, 1), ordinary_result.samples.len);
+            try std.testing.expectEqual(reference.tasks.len, ordinary_result.samples[0].classifications.len);
+            for (reference.tasks, ordinary_result.samples[0].classifications, ordinary_schema.schema.classifications) |task, actual, compiled| {
+                try std.testing.expectEqualStrings(task.name, actual.name);
+                try std.testing.expectEqual(task.labels.len, actual.labels.len);
+                const probabilities = try a.alloc(f32, task.raw_logits.len);
+                defer a.free(probabilities);
+                try softmax(task.raw_logits, @as(f32, @floatCast(compiled.task.temperature)) * config.head.classification_temperature, probabilities);
+                for (task.labels, probabilities, actual.labels) |label, probability, got| {
+                    try std.testing.expectEqualStrings(label, got.label);
+                    try std.testing.expectApproxEqAbs(probability, got.confidence, fp32_confidence_tolerance);
+                }
+            }
+        } else try std.testing.expectEqual(.extract, request.kind);
+        var result = try runNative(&cb, a, &config, &prepared, &.{&schema}, core, .{ .offset_unit = .unicode_codepoints });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), result.samples.len);
+        try expectFamilySample(expected, request.id, request.text, request.native_expected, result.samples[0], fp32_confidence_tolerance, .unicode_codepoints);
+        // Endpoint texts are intentionally ASCII, so the pinned spans are
+        // identical under both public offset units. Reuse the same encoded
+        // states and logits to qualify presentation without a second encoder
+        // pass obscuring the comparison.
+        if (expected.exercise_utf8_offsets) {
+            var utf8_result = try runNative(&cb, a, &config, &prepared, &.{&schema}, core, .{ .offset_unit = .utf8_bytes });
+            defer utf8_result.deinit();
+            try std.testing.expectEqual(@as(usize, 1), utf8_result.samples.len);
+            try expectFamilySample(expected, request.id, request.text, request.native_expected, utf8_result.samples[0], fp32_confidence_tolerance, .utf8_bytes);
+        }
+    }
 }
 fn publishedCheckpointParity(comptime variant: []const u8, comptime environment: [:0]const u8, comptime fixture_name: []const u8) !void {
     const directory = @import("antfly_platform").env.getenv(environment) orelse return error.SkipZigTest;
@@ -1464,6 +2101,48 @@ test "gliner boundary pipeline Python parity pinned base checkpoint all inferenc
 }
 test "gliner boundary pipeline Python parity pinned multi checkpoint all inference tasks" {
     try publishedCheckpointParity("multi", "ANTFLY_GLINER25_MULTI_MODEL_DIR", "pipeline_cases_multi.json");
+}
+test "gliner boundary pipeline pinned multilingual v1 family reference" {
+    try familyCheckpointParity(multilingual_family_checkpoints[0]);
+}
+test "gliner boundary pipeline pinned multilingual Decide family reference" {
+    try familyCheckpointParity(multilingual_family_checkpoints[1]);
+}
+test "gliner boundary pipeline pinned multilingual v1 endpoint bounds" {
+    try familyCheckpointParity(multilingual_endpoint_checkpoints[0]);
+}
+test "gliner boundary pipeline pinned multilingual Decide endpoint bounds" {
+    try familyCheckpointParity(multilingual_endpoint_checkpoints[1]);
+}
+test "gliner boundary pipeline pinned multilingual v1 classification floor" {
+    try familyCheckpointParity(multilingual_classification_floor_checkpoints[0]);
+}
+test "gliner boundary pipeline pinned multilingual Decide classification floor" {
+    try familyCheckpointParity(multilingual_classification_floor_checkpoints[1]);
+}
+test "gliner boundary pipeline pinned multilingual v1 general classification bounds" {
+    try familyCheckpointParity(multilingual_general_classification_checkpoints[0]);
+}
+test "gliner boundary pipeline pinned multilingual Decide general classification bounds" {
+    try familyCheckpointParity(multilingual_general_classification_checkpoints[1]);
+}
+test "gliner boundary pipeline pinned multilingual v1 general entity bounds" {
+    try familyCheckpointParity(multilingual_general_entity_checkpoints[0]);
+}
+test "gliner boundary pipeline pinned multilingual Decide general entity bounds" {
+    try familyCheckpointParity(multilingual_general_entity_checkpoints[1]);
+}
+test "gliner boundary pipeline pinned multilingual v1 clean entity short bound" {
+    try familyCheckpointParity(multilingual_clean_entity_short_checkpoints[0]);
+}
+test "gliner boundary pipeline pinned multilingual Decide clean entity short bound" {
+    try familyCheckpointParity(multilingual_clean_entity_short_checkpoints[1]);
+}
+test "gliner boundary pipeline pinned multilingual v1 source word floor" {
+    try familyCheckpointParity(multilingual_source_word_floor_checkpoints[0]);
+}
+test "gliner boundary pipeline pinned multilingual Decide source word floor" {
+    try familyCheckpointParity(multilingual_source_word_floor_checkpoints[1]);
 }
 
 /// Real full-pipeline parity for a converted (precision != fp32) bundle,
@@ -1807,6 +2486,38 @@ test "gliner boundary classification presentation shares temperature fallback pr
         }
     };
     try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Check.run, .{ &ordinary, &raw });
+}
+
+test "ordinary classification threshold endpoints include exact sigmoid probabilities" {
+    const a = std.testing.allocator;
+    var compiled = try schema_mod.compile(a,
+        \\{"classifications":[{"name":"all","labels":["zero","one"],"multi_label":true,"activation":"sigmoid","threshold":0},{"name":"exact_one","labels":["zero","one"],"multi_label":true,"activation":"sigmoid","threshold":1},{"name":"fallback","labels":["zero","also_zero"],"multi_label":true,"activation":"sigmoid","threshold":0.99}]}
+    , .{ .allow_legacy_classification_threshold_endpoints = true });
+    defer compiled.deinit();
+    const raw = [_][]const f64{ &.{ -1000, 1000 }, &.{ -1000, 1000 }, &.{ -1000, -1000 } };
+    var output = try presentClassifications(a, &compiled, &raw, 1, .{});
+    defer output.deinit();
+
+    try std.testing.expect(output.diagnostics == null);
+    try std.testing.expectEqual(@as(usize, 3), output.classifications.len);
+    try std.testing.expectEqual(@as(usize, 2), output.classifications[0].labels.len);
+    try std.testing.expectEqualStrings("zero", output.classifications[0].labels[0].label);
+    try std.testing.expectEqual(@as(f32, 0), output.classifications[0].labels[0].confidence);
+    try std.testing.expectEqualStrings("one", output.classifications[0].labels[1].label);
+    try std.testing.expectEqual(@as(f32, 1), output.classifications[0].labels[1].confidence);
+    try std.testing.expectEqual(@as(usize, 1), output.classifications[1].labels.len);
+    try std.testing.expectEqualStrings("one", output.classifications[1].labels[0].label);
+    try std.testing.expectEqual(@as(f32, 1), output.classifications[1].labels[0].confidence);
+    try std.testing.expectEqual(@as(usize, 1), output.classifications[2].labels.len);
+    try std.testing.expectEqualStrings("zero", output.classifications[2].labels[0].label);
+    try std.testing.expectEqual(@as(f32, 0), output.classifications[2].labels[0].confidence);
+
+    var no_fallback = try presentClassifications(a, &compiled, &raw, 1, .{ .classification_multi_label_fallback = false });
+    defer no_fallback.deinit();
+    try std.testing.expect(no_fallback.diagnostics == null);
+    try std.testing.expectEqual(@as(usize, 2), no_fallback.classifications[0].labels.len);
+    try std.testing.expectEqual(@as(usize, 1), no_fallback.classifications[1].labels.len);
+    try std.testing.expectEqual(@as(usize, 0), no_fallback.classifications[2].labels.len);
 }
 
 test "gliner boundary classification top_k preserves ordinary and structured presentation" {

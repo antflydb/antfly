@@ -351,6 +351,12 @@ pub fn create(config: Config) Graph {
         .target = target,
         .optimize = optimize,
     });
+    // Reuse the embedded consumer's source identity when sharing a build.
+    // Keep build imports inside this package so standalone builds work too.
+    const decisions_mod = b.modules.get("antfly_decisions") orelse b.addModule("antfly_decisions", .{
+        .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "lib/decisions/root.zig")),
+    });
+    inference_mod.addImport("antfly_decisions", decisions_mod);
     addInferenceRootImports(inference_mod, .{
         .c_bindings = c_bindings,
         .build_info_mod = shared.build_info_mod,
@@ -392,6 +398,7 @@ pub fn create(config: Config) Graph {
         .target = target,
         .optimize = optimize,
     });
+    inference_internal_mod.addImport("antfly_decisions", decisions_mod);
     inference_internal_mod.addImport("build_info", shared.build_info_mod);
     identities.addImports(inference_internal_mod);
     inference_internal_mod.addImport("build_options", build_options_mod);
@@ -509,7 +516,10 @@ pub fn applyCBindings(module: *std.Build.Module, bindings: CBindings) void {
 pub fn addStandaloneExecutable(b: *std.Build, graph: Graph, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize, inference_root: []const u8, link_libc: bool) *std.Build.Step.Compile {
     const exe = b.addExecutable(.{
         .name = "antfly-inference",
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 10 else 7) * 1024 * 1024 * 1024,
+        // The F32 Metal ReleaseFast CLI measured 12.7 GiB during compilation.
+        // Match the inference-test headroom so the scheduler admits this
+        // measured build rather than rejecting its completed artifact.
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 14 else 7) * 1024 * 1024 * 1024,
         .root_module = b.createModule(.{
             .root_source_file = b.path(pathJoin(b, inference_root, "src/main.zig")),
             .target = target,
@@ -644,6 +654,7 @@ pub fn addInferenceApiOverride(
             .{ "../shared/generating.yaml", "antfly_generating_openapi" },
             .{ "../shared/chunking.yaml", "antfly_chunking_api_openapi" },
             .{ "../ai/extraction.yaml", "antfly_extraction_openapi" },
+            .{ "../ai/decision.yaml", "antfly_decision_openapi" },
         },
     });
 }
@@ -683,6 +694,7 @@ fn addInferenceApiModule(
             .target = target,
             .optimize = optimize,
         });
+        mod.addImport("antfly_decision_openapi", addDecisionOpenApiModule(b, target, optimize, paths));
         mod.addImport("httpx", httpx_mod);
         mod.addImport("antfly_generating_openapi", generating_openapi_mod);
         mod.addImport("antfly_chunking_api_openapi", chunking_api_openapi_mod);
@@ -695,6 +707,7 @@ fn addInferenceApiModule(
             .target = target,
             .optimize = optimize,
         });
+        mod.addImport("antfly_decision_openapi", addDecisionOpenApiModule(b, target, optimize, paths));
         mod.addImport("httpx", httpx_mod);
         mod.addImport("antfly_generating_openapi", generating_openapi_mod);
         mod.addImport("antfly_chunking_api_openapi", chunking_api_openapi_mod);
@@ -708,11 +721,16 @@ fn addInferenceApiModule(
         .target = target,
         .optimize = optimize,
     });
+    mod.addImport("antfly_decision_openapi", addDecisionOpenApiModule(b, target, optimize, paths));
     mod.addImport("httpx", httpx_mod);
     mod.addImport("antfly_generating_openapi", generating_openapi_mod);
     mod.addImport("antfly_chunking_api_openapi", chunking_api_openapi_mod);
     mod.addImport("antfly_extraction_openapi", shared.extraction_openapi orelse addExtractionOpenApiModule(b, target, optimize, paths, generating_openapi_mod));
     return mod;
+}
+
+fn addDecisionOpenApiModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize, paths: Paths) *std.Build.Module {
+    return b.createModule(.{ .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "pkg/antfly-embedded/src/openapi/generated/antfly_decision_openapi/root.zig")), .target = target, .optimize = optimize });
 }
 
 fn addChunkingApiOpenApiModule(

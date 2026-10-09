@@ -42,6 +42,8 @@ pub fn classifyCreateTableRequestError(err: anyerror) CreateTableRequestErrorDis
     return switch (err) {
         error.InvalidCreateTableRequest,
         error.InvalidTableStorageSettings,
+        error.ObjectTablePlacementUnsupported,
+        error.RelationalStorageUnavailable,
         error.VectorStoreRequiresLocalSingleShardTable,
         error.ImmutableTableStorageSettings,
         error.VectorStoreRequiresEmptyTable,
@@ -187,6 +189,7 @@ pub fn parseCreateTableRequest(alloc: std.mem.Allocator, body: []const u8) !tabl
         if (num_shards > tables_api.max_table_initial_ranges)
             return error.CreateTableShardCountOutOfRange;
     }
+    try tables_api.validateObjectCreateDefinition(alloc, req);
     return req;
 }
 

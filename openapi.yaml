@@ -5609,6 +5609,14 @@ paths:
             the primary for linearizable reads. `stale` allows a hot standby to
 
             serve the lookup at its safe-read LSN.
+
+            Owned object document tables support only explicit `stale` reads of
+
+            published generations. The default `read_index` and `leader_lease`
+
+            are rejected with HTTP 400. Use `sync_level=full_index` on writes to
+
+            wait for publication before a stale lookup.
           schema:
             type: string
             enum:
@@ -11250,10 +11258,15 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/InferenceError'
-  /ai/v1/decide:
+  /ai/v1/decisions:
     post:
-      summary: Answer named choice, ordinal score, and Boolean questions
       operationId: decide
+      summary: Answer named decision questions
+      description: Execute one text input or an Antfly batch. Embedding similarity supports choice and
+        multi_choice; trained decision models support choice, score and predicate. Answer variants distinguish
+        trained probabilities from raw cosine similarities.
+      tags:
+        - Inference
       requestBody:
         required: true
         content:
@@ -11262,7 +11275,7 @@ paths:
               $ref: '#/components/schemas/InferenceDecideRequest'
       responses:
         '200':
-          description: Decision distributions and derived answers
+          description: Named decision answers, diagnostics and aggregate token usage
           content:
             application/json:
               schema:
@@ -15943,6 +15956,19 @@ components:
         default does not migrate data. Snapshot/backup and split operations currently reject vector_store
         tables; explicitly select primary_lsm when these operations are required.
       properties:
+        engine:
+          type: string
+          enum:
+            - local
+            - object
+          default: local
+          description: Durable table engine, independent of deployment. local uses the hosting process's
+            local or Lite backend and normal shard placement. object uses external lake data with durable
+            sidecars, or an Antfly-owned object WAL and published generations. Object tables do not allocate
+            data Raft groups; omit num_shards and replication_sources. Metadata remains authoritative
+            for table lifetime. Configure the shared destination through storage.artifacts. Writable object
+            document tables initially require immutable schema and index definitions; changes require
+            a new table and explicit migration.
         dense_embeddings:
           type: string
           enum:
@@ -21524,8 +21550,14 @@ components:
           type: string
           minLength: 1
         questions:
-          type: object
-          additionalProperties: true
+          type: array
+          minItems: 1
+          maxItems: 64
+          description: Named decision question array using choice choices, score levels, or predicate
+            instructions.
+          items:
+            type: object
+            additionalProperties: true
         statement:
           type: string
           minLength: 1
@@ -25330,6 +25362,12 @@ components:
 
         Models are loaded from the `models/embedders/{name}/` directory.
       properties:
+        model_identity:
+          type: string
+          pattern: ^[0-9a-f]{64}$
+          description: Immutable EmbeddingGemma 2 asset and recipe identity returned by /embed. Pin this
+            when indexing; a changed checkpoint, tokenizer, or processor rejects embedding before vector
+            publication.
         provider:
           type: string
           enum:
@@ -35370,13 +35408,36 @@ components:
       $ref: '#/components/schemas/MediaContentPart'
     InferenceContentPart:
       $ref: '#/components/schemas/ContentPart'
+    InferenceEmbeddingGroup:
+      type: object
+      additionalProperties: false
+      required:
+        - content
+      description: EmbeddingGemma 2 ordered text, image and audio parts producing one joint vector. Video
+        is unsupported. The expanded sequence including all media soft tokens must fit 8192 tokens.
+      properties:
+        title:
+          type: string
+          description: Document title, allowed only with RETRIEVAL_DOCUMENT and at least one text part.
+        content:
+          type: array
+          minItems: 1
+          maxItems: 64
+          items:
+            $ref: '#/components/schemas/ContentPart'
     InferenceEmbedRequest:
       type: object
-      description: OpenAI-compatible embedding request with inference multimodal content-part extension
+      description: OpenAI-compatible embedding request with inference multimodal content-part extension.
+        EmbeddingGemma 2 text encoding uses official task prefixes, a shared 8192-token limit, mean pooling
+        including prompt tokens, and normalized vectors.
       required:
         - model
         - input
       properties:
+        model_identity:
+          type: string
+          pattern: ^[0-9a-f]{64}$
+          description: Optional exact asset identity pin. A mismatch returns 409 before inference.
         model:
           type: string
           description: Model name to use for embedding generation
@@ -35391,6 +35452,8 @@ components:
             - an array of strings
 
             - an array of OpenAI-style content parts for multimodal embedding
+
+            - an array of ordered groups for EmbeddingGemma 2, one vector per group
           oneOf:
             - type: string
               description: Single text string
@@ -35402,6 +35465,13 @@ components:
               description: Array of multimodal content parts
               items:
                 $ref: '#/components/schemas/ContentPart'
+            - type: array
+              minItems: 1
+              maxItems: 128
+              description: Ordered groups. Legacy flat content parts continue to produce one vector per
+                part.
+              items:
+                $ref: '#/components/schemas/InferenceEmbeddingGroup'
         encoding_format:
           type: string
           description: Encoding format for the embeddings (only "float" supported)
@@ -35410,15 +35480,16 @@ components:
             - float
         dimensions:
           type: integer
-          description: Optional truncation size for dense embeddings. Must be a positive integer no larger
-            than the model embedding size. For normalized models the truncated vector is L2-re-normalized
-            (Matryoshka semantics, matching the OpenAI dimensions parameter). Not supported for sparse
-            models.
+          description: Optional truncation size for dense embeddings. EmbeddingGemma 2 supports 768, 512,
+            256, or 128 only. Must be a positive integer no larger than the model embedding size. For
+            normalized models the truncated vector is L2-re-normalized (Matryoshka semantics, matching
+            the OpenAI dimensions parameter). Not supported for sparse models.
         task_type:
           type: string
-          description: Optional embedding task type using Google embedding task-type names. For Jina v5
-            text embeddings, query-side tasks use the query prefix and RETRIEVAL_DOCUMENT uses the document
-            prefix. For Qwen3-Embedding models, RETRIEVAL_QUERY uses the model's built-in web-retrieval
+          description: Optional embedding task type using Google embedding task-type names. EmbeddingGemma
+            2 uses the official prefix for each listed task, defaulting to RETRIEVAL_DOCUMENT. For Jina
+            v5 text embeddings, query-side tasks use the query prefix and RETRIEVAL_DOCUMENT uses the
+            document prefix. For Qwen3-Embedding models, RETRIEVAL_QUERY uses the model's built-in web-retrieval
             instruction, RETRIEVAL_DOCUMENT is embedded raw, and every other task type requires an explicit
             instruction.
           enum:
@@ -35475,6 +35546,10 @@ components:
         - model
         - usage
       properties:
+        model_identity:
+          type: string
+          description: EmbeddingGemma 2 SHA256 identity of actual weights, tokenizer, processor and recipe.
+            Dimensions and retrieval roles must also match index configuration.
         object:
           type: string
           description: Object type, always "list"
@@ -36566,107 +36641,61 @@ components:
       additionalProperties: false
       required:
         - model
-        - state
         - questions
       properties:
         model:
           type: string
           minLength: 1
-        state:
+        model_identity:
+          type: string
+          pattern: ^[0-9a-f]{64}$
+          description: Pin the exact EmbeddingGemma 2 assets and embedding recipe.
+        input:
           type: string
           minLength: 1
           maxLength: 1048576
+        inputs:
+          type: array
+          items:
+            $ref: '#/components/schemas/DecisionInput'
+          minItems: 1
+          maxItems: 128
         questions:
-          type: object
-          minProperties: 1
-          maxProperties: 64
-          additionalProperties:
+          type: array
+          items:
             $ref: '#/components/schemas/InferenceDecideQuestion'
-    InferenceDecideQuestion:
+          minItems: 1
+          maxItems: 64
+        embedding_options:
+          $ref: '#/components/schemas/EmbeddingDecisionOptions'
+      description: Supply exactly one of input (single text) or inputs (Antfly batch extension). Question
+        names must be unique. Single text and named question arrays follow OpenAI Decisions conventions;
+        local models support text input and string choice values. Request bodies are bounded at 16 MiB.
+    InferenceDecideResponse:
       type: object
       additionalProperties: false
       required:
-        - type
-        - instructions
-      properties:
-        type:
-          type: string
-          enum:
-            - choice
-            - score
-            - noul
-        instructions:
-          type: string
-          minLength: 1
-        criteria:
-          description: Choice uses option IDs mapped to descriptions; score uses ordered descriptions;
-            noul omits criteria.
-          oneOf:
-            - type: object
-              minProperties: 2
-              maxProperties: 64
-              additionalProperties:
-                type: string
-            - type: array
-              minItems: 2
-              maxItems: 64
-              items:
-                type: string
-    InferenceDecideResponse:
-      type: object
-      required:
         - model
-        - answers
         - usage
       properties:
         model:
           type: string
+        model_identity:
+          type: string
+        renderer_version:
+          type: string
         answers:
-          type: object
-          additionalProperties:
+          type: array
+          items:
             $ref: '#/components/schemas/InferenceDecideAnswer'
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/DecisionBatchItem'
         usage:
-          type: object
-          required:
-            - input_tokens
-            - output_tokens
-          properties:
-            input_tokens:
-              type: integer
-              description: Encoded prompt tokens consumed by the executor, including repeated state text
-                for split GLiNER tasks.
-            output_tokens:
-              type: integer
-              description: Zero for classifier executors, which emit no generated tokens.
-    InferenceDecideAnswer:
-      type: object
-      required:
-        - type
-      properties:
-        type:
-          type: string
-          enum:
-            - choice
-            - score
-            - noul
-        choice:
-          type: string
-        score:
-          type: number
-        noul:
-          type: number
-          minimum: 0
-          maximum: 1
-        legend:
-          type: object
-          additionalProperties:
-            type: string
-        probabilities:
-          type: object
-          additionalProperties:
-            type: number
-            minimum: 0
-            maximum: 1
+          $ref: '#/components/schemas/DecisionUsage'
+      description: Single-input responses have answers. Batch responses have data in input order, with
+        one named answer array per input and aggregate usage.
     InferenceModelsResponse:
       type: object
       required:
@@ -36725,7 +36754,8 @@ components:
           type: object
           additionalProperties:
             $ref: '#/components/schemas/InferenceModelInfo'
-          description: Models declaring the decide task and typed_decisions capability
+          description: Models declaring the decide task and either typed_decisions or embedding_similarity
+            capability
         generators:
           type: object
           additionalProperties:
@@ -38599,7 +38629,7 @@ components:
           description: Model-facing label description.
           x-go-type-skip-optional-pointer: false
       additionalProperties: false
-    ExtractionDecisionProbability:
+    ExtractionClassificationThreshold:
       type: number
       format: double
       minimum: 0
@@ -38653,7 +38683,7 @@ components:
           type: integer
           minimum: 1
           description: Maximum labels for ordinary single-label classification; the server uses 1 when
-            omitted. Version 2 constrained or ordinal selection uses min_labels/max_labels. Advanced set-selection
+            omitted. Version 2 constrained classification uses min_labels/max_labels. Advanced set-selection
             options or cross-task constraints on any classification in the collection reject every explicit
             top_k in that collection, including 1. Omit top_k when using these options.
         mode:
@@ -38661,12 +38691,8 @@ components:
           enum:
             - single
             - multi
-            - ordinal
-            - boolean
           description: >
-            Version 2 classification mode. Ordinal labels are ordered from lowest to highest.
-
-            Typed-decision extractors support boolean with labels ["false", "true"] in that order.
+            Version 2 ordinary classification mode. Standalone ordinal scores use the decision API.
 
             Each model rejects modes it does not support.
           x-go-type-skip-optional-pointer: false
@@ -38694,7 +38720,7 @@ components:
           x-go-type-skip-optional-pointer: false
         threshold:
           allOf:
-            - $ref: '#/components/schemas/ExtractionDecisionProbability'
+            - $ref: '#/components/schemas/ExtractionClassificationThreshold'
           x-go-type-skip-optional-pointer: false
         candidate_threshold:
           allOf:
@@ -39207,7 +39233,7 @@ components:
           x-go-type-skip-optional-pointer: false
         threshold:
           allOf:
-            - $ref: '#/components/schemas/ExtractionDecisionProbability'
+            - $ref: '#/components/schemas/ExtractionClassificationThreshold'
           x-go-type-skip-optional-pointer: false
         candidate_threshold:
           allOf:
@@ -39246,7 +39272,7 @@ components:
           x-go-type-skip-optional-pointer: false
         threshold:
           allOf:
-            - $ref: '#/components/schemas/ExtractionDecisionProbability'
+            - $ref: '#/components/schemas/ExtractionClassificationThreshold'
           x-go-type-skip-optional-pointer: false
         candidate_threshold:
           allOf:
@@ -39838,78 +39864,6 @@ components:
           $ref: '#/components/schemas/ExtractionSchema'
         options:
           $ref: '#/components/schemas/ExtractionOptions'
-    ExtractionLabelProbability:
-      type: object
-      required:
-        - label
-        - probability
-      properties:
-        label:
-          type: string
-        probability:
-          type: number
-          format: float
-          minimum: 0
-          maximum: 1
-    ExtractionDecision:
-      type: object
-      description: Version 2 typed classification decision. Probabilities follow request label order;
-        ordinal levels are zero-based.
-      required:
-        - name
-        - type
-        - label
-        - probabilities
-        - confidence
-        - confidence_method
-      properties:
-        name:
-          type: string
-        type:
-          type: string
-          enum:
-            - choice
-            - score
-            - boolean
-        label:
-          type: string
-          description: Highest-probability label. This is distinct from the expected ordinal value.
-        probabilities:
-          type: array
-          items:
-            $ref: '#/components/schemas/ExtractionLabelProbability'
-        confidence:
-          type: number
-          format: float
-          minimum: 0
-          maximum: 1
-        confidence_method:
-          type: string
-          enum:
-            - normalized_inverse_entropy
-            - max_probability
-          description: Entropy confidence is not the probability that the selected label is correct.
-        expected_value:
-          type: number
-          format: float
-          description: Score decisions only; sum of zero-based level index times probability.
-          minimum: 0
-          x-go-type-skip-optional-pointer: false
-        true_probability:
-          type: number
-          format: float
-          minimum: 0
-          maximum: 1
-          description: Boolean decisions only; probability of the true label.
-          x-go-type-skip-optional-pointer: false
-        act_probability:
-          type: number
-          format: float
-          minimum: 0
-          maximum: 1
-          description: Auxiliary model estimate for acting, from models with an action head (Laya). Does
-            not authorize or execute a tool call.
-          x-go-type-skip-optional-pointer: false
     ExtractionAttributeLabel:
       type: object
       required:
@@ -40011,7 +39965,6 @@ components:
         score:
           type: number
           format: float
-      additionalProperties: true
     ExtractionRecordMetadata:
       type: object
       properties:
@@ -40124,12 +40077,6 @@ components:
     ExtractionObject:
       type: object
       properties:
-        decisions:
-          type: array
-          description: Typed decision results from capable extractors, alongside compatible per-label
-            classifications.
-          items:
-            $ref: '#/components/schemas/ExtractionDecision'
         id:
           type: string
         offset_unit:
@@ -40266,6 +40213,578 @@ components:
           $ref: '#/components/schemas/TextChunkOptions'
         audio:
           $ref: '#/components/schemas/InferenceAudioChunkConfig'
+    DecisionInput:
+      type: object
+      additionalProperties: false
+      required:
+        - input
+      properties:
+        id:
+          type: string
+          minLength: 1
+        input:
+          type: string
+          minLength: 1
+          maxLength: 1048576
+    DecisionChoice:
+      type: object
+      additionalProperties: false
+      required:
+        - value
+      properties:
+        value:
+          type: string
+          minLength: 1
+        description:
+          type: string
+          minLength: 1
+        examples:
+          type: array
+          items:
+            type: string
+            minLength: 1
+          minItems: 1
+          maxItems: 32
+      description: Local decision models use string choice identifiers. Embedding category examples replace
+        the description with their normalized centroid; trained models reject examples.
+    EmbeddingDecisionAcceptance:
+      type: object
+      additionalProperties: false
+      properties:
+        calibration_id:
+          type: string
+          pattern: ^[A-Za-z0-9_-]{1,64}$
+          description: Public API identifier for a server-side fitted threshold artifact at model/calibrations/{id}.json.
+            The server verifies qualification and the exact asset identity, prompt profile, dimensions,
+            renderer and this question's label/prototype set. Mutually exclusive with manual thresholds;
+            never produces probabilities.
+        min_similarity:
+          type: number
+          minimum: -1
+          maximum: 1
+          description: For a single choice, abstain when the highest cosine similarity is below this value.
+            It is a similarity threshold, not an accuracy or probability estimate.
+        min_margin:
+          type: number
+          minimum: 0
+          maximum: 2
+          description: For a single choice, require this gap between the highest and second-highest cosine
+            similarities. For multi_choice, require every score to be at least this distance from its
+            own selection threshold; otherwise abstain.
+      description: Question-specific acceptance policy for embedding similarity. Trained decision models
+        reject it.
+    ChoiceDecisionQuestion:
+      type: object
+      additionalProperties: false
+      required:
+        - type
+        - name
+        - instructions
+        - choices
+      properties:
+        type:
+          type: string
+          enum:
+            - choice
+        name:
+          type: string
+          minLength: 1
+        instructions:
+          type: string
+          minLength: 1
+        choices:
+          type: array
+          items:
+            $ref: '#/components/schemas/DecisionChoice'
+          minItems: 2
+          maxItems: 64
+        embedding_options:
+          $ref: '#/components/schemas/EmbeddingDecisionAcceptance'
+    MultiChoiceDecisionQuestion:
+      type: object
+      additionalProperties: false
+      required:
+        - type
+        - name
+        - instructions
+        - choices
+      properties:
+        type:
+          type: string
+          enum:
+            - multi_choice
+        name:
+          type: string
+          minLength: 1
+        instructions:
+          type: string
+          minLength: 1
+        choices:
+          type: array
+          items:
+            $ref: '#/components/schemas/DecisionChoice'
+          minItems: 2
+          maxItems: 64
+        embedding_options:
+          $ref: '#/components/schemas/EmbeddingDecisionAcceptance'
+        similarity_thresholds:
+          description: Required raw cosine cutoff for every choice, either one common cutoff or a complete
+            choice-to-cutoff map. Alternatively supply a qualified question-specific calibration_id. Mutually
+            exclusive with calibration_id. Scores equal to their cutoff are selected.
+          oneOf:
+            - type: number
+              minimum: -1
+              maximum: 1
+            - type: object
+              additionalProperties:
+                type: number
+                minimum: -1
+                maximum: 1
+      description: Antfly multi-label extension for embedding similarity; selected, empty and abstained
+        are distinct results.
+    DecisionLevel:
+      type: object
+      additionalProperties: false
+      required:
+        - label
+      properties:
+        label:
+          type: string
+          minLength: 1
+        description:
+          type: string
+          minLength: 1
+      description: Ordered score level, from lowest to highest. Results assign zero-based numeric values
+        to these levels.
+    ScoreDecisionQuestion:
+      type: object
+      additionalProperties: false
+      required:
+        - type
+        - name
+        - instructions
+        - levels
+      properties:
+        type:
+          type: string
+          enum:
+            - score
+        name:
+          type: string
+          minLength: 1
+        instructions:
+          type: string
+          minLength: 1
+        levels:
+          type: array
+          items:
+            $ref: '#/components/schemas/DecisionLevel'
+          minItems: 2
+          maxItems: 64
+    PredicateDecisionQuestion:
+      type: object
+      additionalProperties: false
+      required:
+        - type
+        - name
+        - instructions
+      properties:
+        type:
+          type: string
+          enum:
+            - predicate
+        name:
+          type: string
+          minLength: 1
+        instructions:
+          type: string
+          minLength: 1
+      description: Estimate whether the condition in instructions holds for the input. The trained answer
+        reports probability in [0,1].
+    InferenceDecideQuestion:
+      oneOf:
+        - $ref: '#/components/schemas/ChoiceDecisionQuestion'
+        - $ref: '#/components/schemas/MultiChoiceDecisionQuestion'
+        - $ref: '#/components/schemas/ScoreDecisionQuestion'
+        - $ref: '#/components/schemas/PredicateDecisionQuestion'
+    EmbeddingDecisionOptions:
+      type: object
+      additionalProperties: false
+      properties:
+        task_type:
+          type: string
+          enum:
+            - CLUSTERING
+            - CLASSIFICATION
+          default: CLUSTERING
+          description: Prompt profile for the decision input and category prototypes. The embedding endpoint
+            also accepts task_type; decision routing restricts it to these two profiles.
+        dimensions:
+          type: integer
+          enum:
+            - 768
+            - 512
+            - 256
+            - 128
+          default: 768
+          description: Truncate and renormalize embeddings to this dimension before cosine scoring.
+      description: Request-wide embedding geometry defaults. Acceptance thresholds and calibration belong
+        to individual questions.
+    DecisionChoiceProbability:
+      type: object
+      additionalProperties: false
+      required:
+        - value
+        - probability
+      properties:
+        value:
+          type: string
+          minLength: 1
+        probability:
+          type: number
+          minimum: 0
+          maximum: 1
+    TrainedChoiceAnswer:
+      type: object
+      additionalProperties: false
+      required:
+        - name
+        - type
+        - decision_method
+        - choice
+        - probabilities
+        - confidence
+        - confidence_method
+      properties:
+        name:
+          type: string
+          minLength: 1
+        type:
+          type: string
+          enum:
+            - choice
+        decision_method:
+          type: string
+          enum:
+            - typed
+        confidence:
+          type: number
+          minimum: 0
+          maximum: 1
+          description: Model diagnostic; entropy confidence is not the probability that the chosen label
+            is correct.
+        confidence_method:
+          type: string
+          enum:
+            - normalized_inverse_entropy
+            - max_probability
+        act_probability:
+          type: number
+          minimum: 0
+          maximum: 1
+          description: Applicable action-head diagnostic. It does not authorize or execute an action.
+        choice:
+          type: string
+          minLength: 1
+        probabilities:
+          type: array
+          items:
+            $ref: '#/components/schemas/DecisionChoiceProbability'
+          minItems: 2
+    DecisionLevelProbability:
+      type: object
+      additionalProperties: false
+      required:
+        - label
+        - value
+        - probability
+      properties:
+        label:
+          type: string
+          minLength: 1
+        value:
+          type: integer
+          minimum: 0
+        probability:
+          type: number
+          minimum: 0
+          maximum: 1
+    TrainedScoreAnswer:
+      type: object
+      additionalProperties: false
+      required:
+        - name
+        - type
+        - decision_method
+        - score
+        - probabilities
+        - confidence
+        - confidence_method
+      properties:
+        name:
+          type: string
+          minLength: 1
+        type:
+          type: string
+          enum:
+            - score
+        decision_method:
+          type: string
+          enum:
+            - typed
+        confidence:
+          type: number
+          minimum: 0
+          maximum: 1
+          description: Model diagnostic; entropy confidence is not the probability that the chosen label
+            is correct.
+        confidence_method:
+          type: string
+          enum:
+            - normalized_inverse_entropy
+            - max_probability
+        act_probability:
+          type: number
+          minimum: 0
+          maximum: 1
+          description: Applicable action-head diagnostic. It does not authorize or execute an action.
+        score:
+          type: number
+          minimum: 0
+        probabilities:
+          type: array
+          items:
+            $ref: '#/components/schemas/DecisionLevelProbability'
+          minItems: 2
+    TrainedPredicateAnswer:
+      type: object
+      additionalProperties: false
+      required:
+        - name
+        - type
+        - decision_method
+        - probability
+      properties:
+        name:
+          type: string
+          minLength: 1
+        type:
+          type: string
+          enum:
+            - predicate
+        decision_method:
+          type: string
+          enum:
+            - typed
+        confidence:
+          type: number
+          minimum: 0
+          maximum: 1
+          description: Model diagnostic; entropy confidence is not the probability that the chosen label
+            is correct.
+        confidence_method:
+          type: string
+          enum:
+            - normalized_inverse_entropy
+            - max_probability
+        act_probability:
+          type: number
+          minimum: 0
+          maximum: 1
+          description: Applicable action-head diagnostic. It does not authorize or execute an action.
+        probability:
+          type: number
+          minimum: 0
+          maximum: 1
+          description: The model-estimated probability that the condition in instructions holds.
+    DecisionSimilarity:
+      type: object
+      additionalProperties: false
+      required:
+        - value
+        - similarity
+      properties:
+        value:
+          type: string
+          minLength: 1
+        similarity:
+          type: number
+          minimum: -1
+          maximum: 1
+    EmbeddingChoiceAnswer:
+      type: object
+      additionalProperties: false
+      required:
+        - name
+        - type
+        - decision_method
+        - similarity_metric
+        - similarities
+        - margin
+        - status
+        - prototype_set_hash
+        - choice
+      properties:
+        name:
+          type: string
+          minLength: 1
+        type:
+          type: string
+          enum:
+            - choice
+        decision_method:
+          type: string
+          enum:
+            - embedding_similarity
+        similarity_metric:
+          type: string
+          enum:
+            - cosine
+          description: Cosine is fixed for this embedding recipe and its threshold artifacts. Index distance
+            settings are independent.
+        similarities:
+          type: array
+          items:
+            $ref: '#/components/schemas/DecisionSimilarity'
+          minItems: 2
+        margin:
+          type: number
+          minimum: 0
+          maximum: 2
+        status:
+          type: string
+          enum:
+            - selected
+            - abstained
+        prototype_set_hash:
+          type: string
+          pattern: ^[0-9a-f]{64}$
+        calibration_id:
+          type: string
+        abstention_reason:
+          type: string
+          enum:
+            - tie
+            - min_similarity
+            - min_margin
+        choice:
+          type: string
+          nullable: true
+          description: Selected identifier, or null on abstention.
+      description: Raw cosine scores are neither probabilities nor confidence. Empty means no label met
+        its threshold; abstained means the requested margin could not be established.
+    EmbeddingMultiChoiceAnswer:
+      type: object
+      additionalProperties: false
+      required:
+        - name
+        - type
+        - decision_method
+        - similarity_metric
+        - similarities
+        - margin
+        - status
+        - prototype_set_hash
+        - choices
+        - similarity_thresholds
+      properties:
+        name:
+          type: string
+          minLength: 1
+        type:
+          type: string
+          enum:
+            - multi_choice
+        decision_method:
+          type: string
+          enum:
+            - embedding_similarity
+        similarity_metric:
+          type: string
+          enum:
+            - cosine
+          description: Cosine is fixed for this embedding recipe and its threshold artifacts. Index distance
+            settings are independent.
+        similarities:
+          type: array
+          items:
+            $ref: '#/components/schemas/DecisionSimilarity'
+          minItems: 2
+        margin:
+          type: number
+          minimum: 0
+          maximum: 2
+        status:
+          type: string
+          enum:
+            - selected
+            - empty
+            - abstained
+        prototype_set_hash:
+          type: string
+          pattern: ^[0-9a-f]{64}$
+        calibration_id:
+          type: string
+        abstention_reason:
+          type: string
+          enum:
+            - tie
+            - min_similarity
+            - min_margin
+        choices:
+          type: array
+          items:
+            type: string
+            minLength: 1
+        similarity_thresholds:
+          type: object
+          additionalProperties:
+            type: number
+            minimum: -1
+            maximum: 1
+          description: Effective cosine selection threshold for every choice, including fitted calibration
+            thresholds.
+      description: Raw cosine scores are neither probabilities nor confidence. Empty means no label met
+        its threshold; abstained means the requested margin could not be established.
+    InferenceDecideAnswer:
+      oneOf:
+        - $ref: '#/components/schemas/TrainedChoiceAnswer'
+        - $ref: '#/components/schemas/TrainedScoreAnswer'
+        - $ref: '#/components/schemas/TrainedPredicateAnswer'
+        - $ref: '#/components/schemas/EmbeddingChoiceAnswer'
+        - $ref: '#/components/schemas/EmbeddingMultiChoiceAnswer'
+    DecisionBatchItem:
+      type: object
+      additionalProperties: false
+      required:
+        - input_index
+        - answers
+      properties:
+        input_index:
+          type: integer
+          minimum: 0
+        id:
+          type: string
+          minLength: 1
+        answers:
+          type: array
+          items:
+            $ref: '#/components/schemas/InferenceDecideAnswer'
+    DecisionUsage:
+      type: object
+      additionalProperties: false
+      required:
+        - input_tokens
+        - output_tokens
+      properties:
+        input_tokens:
+          type: integer
+          minimum: 0
+          description: Encoded tokens including repeated input text for split model tasks.
+        output_tokens:
+          type: integer
+          minimum: 0
+          description: Zero for classifiers, which generate no tokens.
   responses:
     CommittedMutationAccepted:
       description: Mutation committed with pending visibility or explicit repair debt

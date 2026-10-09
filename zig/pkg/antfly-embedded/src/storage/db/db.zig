@@ -4842,6 +4842,7 @@ pub const DB = struct {
     /// Creation/provisioning-only configuration. Existing persisted authority
     /// cannot be changed, and populated roots require an explicit migration.
     pub fn configureTableStorage(self: *DB, settings: table_storage_mod.Settings) !void {
+        if (settings.engine != .local) return error.ObjectStorageRequiresHostedTable;
         lockApply(self);
         defer self.core.unlockApply();
         const raw = self.core.store.get(self.alloc, &internal_keys.table_storage_settings_key) catch |err| switch (err) {
@@ -45028,7 +45029,7 @@ fn testEmbeddingArtifactOrigins(alloc: Allocator) !void {
 }
 
 test "ordered artifact inventory authored ingress differs from unhashed provider output" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, testEmbeddingArtifactOrigins, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, testEmbeddingArtifactOrigins, .{});
 }
 
 test "ordered artifact inventory DB authored acceptance survives projection and reopen" {
@@ -45350,7 +45351,7 @@ test "materialized preserved sources release writes and store rows across alloca
             try std.testing.expectEqualStrings("stored", sources.items[1].text);
         }
     };
-    try std.testing.checkAllAllocationFailures(alloc, Failure.run, .{ db.core.store, writes.items });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Failure.run, .{ db.core.store, writes.items });
 }
 
 const chunkEmbeddingSourcesForRequest = local_mutation.chunkEmbeddingSourcesForRequest;
@@ -61383,7 +61384,7 @@ test "relational transform preparation releases every failed allocation" {
             try std.testing.expectEqual(@as(usize, 2), prepared.writes.len);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
 }
 
 test "generated embedding memo releases failed insertion allocations" {
@@ -61397,7 +61398,7 @@ test "generated embedding memo releases failed insertion allocations" {
             try memo.putSparseCopy(key, .{ .indices = @constCast(&[_]u32{1}), .values = @constCast(&[_]f32{2}) });
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
 }
 
 test "prepared relational batch uses bounded parallel workers safely" {
@@ -63110,7 +63111,7 @@ test "relational columnar prepared ownership aggregates and aborts atomically" {
                 _ = try payloads.prepare(target, preparation.allocator(), 1, changes);
             }
         };
-        try std.testing.checkAllAllocationFailures(alloc, Failure.run, .{ db.core.store, @as([]const payloads.Delta, &deltas) });
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Failure.run, .{ db.core.store, @as([]const payloads.Delta, &deltas) });
         const prepared = try payloads.prepare(db.core.store, scratch, 1, &deltas);
         try std.testing.expectEqual(@as(usize, 2), prepared.writes.items.len);
         try std.testing.expectEqual(@as(u64, 299), prepared.shared);
@@ -79234,7 +79235,7 @@ test "document child range partition preserves single ownership on allocation fa
     );
     defer alloc.free(remote_key);
 
-    try std.testing.checkAllAllocationFailures(
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(
         alloc,
         struct {
             fn run(failing_alloc: Allocator, routed_key: []const u8) !void {
@@ -79298,7 +79299,7 @@ test "document child range partition preserves single ownership on allocation fa
 test "generated enrichment preparation helpers release partial allocations" {
     const alloc = std.testing.allocator;
 
-    try std.testing.checkAllAllocationFailures(
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(
         alloc,
         struct {
             fn run(failing_alloc: Allocator) !void {
@@ -79319,7 +79320,7 @@ test "generated enrichment preparation helpers release partial allocations" {
         .{},
     );
 
-    try std.testing.checkAllAllocationFailures(
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(
         alloc,
         struct {
             fn run(failing_alloc: Allocator) !void {
@@ -79348,7 +79349,7 @@ test "generated enrichment preparation helpers release partial allocations" {
         .doc_key = "doc:a",
         .source_field = "body",
     };
-    try std.testing.checkAllAllocationFailures(
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(
         alloc,
         struct {
             fn run(
@@ -82753,7 +82754,7 @@ test "db query drops full text hits whose stored document row was deleted direct
             try std.testing.expectEqualSlices(bool, &.{ false, true }, single);
         }
     };
-    try std.testing.checkAllAllocationFailures(alloc, PresenceAllocationCheck.run, .{ &db, remote_member_key, remote_source_key, remote_embedding_ref });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, PresenceAllocationCheck.run, .{ &db, remote_member_key, remote_source_key, remote_embedding_ref });
 
     // Presence is a candidate visibility rule, including IDs-only and count
     // requests. Apply it before offset/limit, and refill an orphaned top hit.
@@ -84445,7 +84446,7 @@ test "db extractEnrichments exposes cleaned writes and special fields" {
             try std.testing.expectEqual(@as(f32, 1), packed_result.dense_embeddings[0].vector[0]);
         }
     };
-    try std.testing.checkAllAllocationFailures(alloc, Failure.run, .{&db});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Failure.run, .{&db});
 }
 
 test "db extractEnrichments rejects unsupported legacy summaries field" {
@@ -84536,7 +84537,7 @@ test "db computeEnrichments synchronously builds chunk and embedding outputs" {
             try std.testing.expect(computed.dense_embeddings.len != 0);
         }
     };
-    try std.testing.checkAllAllocationFailures(alloc, AllocationSweep.run, .{&db});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, AllocationSweep.run, .{&db});
 }
 
 test "db leased enrichment worker generates dense embeddings" {
@@ -85876,7 +85877,7 @@ test "retired repair cleanup propagates allocation failures from durable metadat
     const encoded_issue = try encodeArtifactRepairIssueValueAlloc(alloc, issue);
     defer alloc.free(encoded_issue);
 
-    try std.testing.checkAllAllocationFailures(
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(
         alloc,
         struct {
             fn run(failing_alloc: Allocator, key: []const u8) !void {
@@ -85889,7 +85890,7 @@ test "retired repair cleanup propagates allocation failures from durable metadat
         }.run,
         .{issue_key},
     );
-    try std.testing.checkAllAllocationFailures(
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(
         alloc,
         struct {
             fn run(failing_alloc: Allocator, raw: []const u8) !void {
@@ -101341,7 +101342,7 @@ test "index repair intent string replacement is allocation failure safe" {
         .replace_last_error = true,
     });
 
-    try std.testing.checkAllAllocationFailures(
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(
         alloc,
         struct {
             fn run(failing_alloc: Allocator, target_db: *DB, target_repair_id: u128) !void {
@@ -101359,7 +101360,7 @@ test "index repair intent string replacement is allocation failure safe" {
         }.run,
         .{ &db, repair_id },
     );
-    try std.testing.checkAllAllocationFailures(
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(
         alloc,
         struct {
             fn run(failing_alloc: Allocator, target_db: *DB, target_repair_id: u128) !void {
@@ -116429,7 +116430,7 @@ test "db ordered artifact inventory chunk projection streams pinned snapshots an
             try std.testing.expectEqualStrings("binary", value.object.get("escaped\x00").?.array.items[0].object.get("body").?.string);
         }
     };
-    try std.testing.checkAllAllocationFailures(alloc, Harness.project, .{ &db, &read });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Harness.project, .{ &db, &read });
     var current = (try loadChunkFieldValueTxn(&db, alloc, "doc\x00", null)).?;
     defer freeJsonValue(alloc, &current);
     try std.testing.expectEqualStrings("new", current.object.get("chunks").?.array.items[0].object.get("body").?.string);
@@ -127559,7 +127560,7 @@ test "db graph stale generation cleanup retires the exact fact identity" {
             try std.testing.expectEqual(@as(usize, 1), stale_copy.deletes.len);
         }
     };
-    try std.testing.checkAllAllocationFailures(alloc, FailureCase.run, .{ db.core.store, key, generation });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, FailureCase.run, .{ db.core.store, key, generation });
     var stale = try collectGraphMutationsForArtifacts(alloc, db.core.store, &.{key}, "facts", .{ .expected_generation = generation + 1 });
     defer stale.deinit();
     try std.testing.expectEqual(@as(usize, 1), stale.deletes.len);
@@ -127594,7 +127595,7 @@ test "db algebraic path conversion preserves provenance under allocation failure
             try std.testing.expectEqual(item.traversal_direction, path.edges[0].traversal_direction);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.convert, .{edge});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Case.convert, .{edge});
 }
 
 test "db graph endpoint deletion retires inline identities and preserves independent facts" {
@@ -129046,7 +129047,7 @@ test "db ordered artifact inventory staged generations resume and switch snapsho
             defer page.deinit();
         }
     };
-    try std.testing.checkAllAllocationFailures(alloc, Check.prepare, .{ &plan, previous });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Check.prepare, .{ &plan, previous });
     var page = try generations.PreparedAppend.init(alloc, &plan, previous, &.{"second"});
     defer page.deinit();
     for (0..2) |pass| {
@@ -129126,7 +129127,7 @@ test "db ordered artifact inventory staged generations resume and switch snapsho
             } else try std.testing.expect(artifact == null);
         }
     };
-    try std.testing.checkAllAllocationFailures(alloc, LookupCheck.run, .{ &db, public_id, @as(?[]const u8, "first") });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, LookupCheck.run, .{ &db, public_id, @as(?[]const u8, "first") });
     const empty = try generations.Spec.init(authority, scope, @splat(4), chunks.Builder.init().finish(), 2);
     var replacement = try generations.Plan.init(alloc, scope, empty);
     defer replacement.deinit();
@@ -129194,7 +129195,7 @@ test "db ordered artifact inventory staged generations resume and switch snapsho
         try std.testing.expectError(error.EnrichmentSourceChanged, plan.publish(&txn, empty.id(), Guard{}));
         try std.testing.expectError(error.EnrichmentSourceChanged, page.stage(&plan, &txn));
     }
-    try std.testing.checkAllAllocationFailures(alloc, LookupCheck.run, .{ &db, public_id, @as(?[]const u8, null) });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, LookupCheck.run, .{ &db, public_id, @as(?[]const u8, null) });
     try std.testing.expectEqual(@import("../artifact_footprint.zig").Family.generated, @import("../artifact_footprint.zig").classify(plan.head_key).?);
 }
 
@@ -129246,7 +129247,7 @@ test "db ordered artifact inventory generation retirement resumes after restart 
                 defer page.deinit();
             }
         };
-        try std.testing.checkAllAllocationFailures(alloc, Check.run, .{ &plan, authority, state });
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Check.run, .{ &plan, authority, state });
         first_page = try generations.PreparedRetirement.init(alloc, &plan, authority, state, 17);
         var txn = try db.core.store.beginWriteTxn();
         errdefer txn.abort();
@@ -129400,7 +129401,7 @@ test "db ordered artifact inventory generation discovery resumes scoped cursors 
             try std.testing.expect(page.states.len > 0 and page.states.len <= 2);
         }
     };
-    try std.testing.checkAllAllocationFailures(alloc, Check.run, .{ &db, scope });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Check.run, .{ &db, scope });
     {
         var txn = try db.core.store.beginWriteTxn();
         defer txn.abort();
@@ -130005,7 +130006,7 @@ test "db ordered artifact inventory chunk reconstruction resumes bounded pages a
             defer page.deinit();
         }
     };
-    try std.testing.checkAllAllocationFailures(alloc, Harness.prepare, .{ db.core.store, scope, first });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Harness.prepare, .{ db.core.store, scope, first });
     const other_scope: reconstruction.Scope = .{ .document = scope.document, .producer = scope.producer, .unit = "other" };
     try std.testing.expectError(error.InvalidBatchRequest, reconstruction.prepare(alloc, db.core.store, other_scope, first, .{}));
     // A deletion behind the completed scan invalidates its fixed-size witness.
@@ -131147,7 +131148,7 @@ test "document extraction catalog snapshot releases every allocation on failure"
             }
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
 }
 test "pending document-unit dense embedding collection releases every failed allocation" {
     const Harness = struct {
@@ -131172,7 +131173,7 @@ test "pending document-unit dense embedding collection releases every failed all
             try std.testing.expectEqualStrings("second_consumer", pending.items[1].consumer_indexes[1]);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
 }
 
 test "pending document-unit sparse embedding collection releases every failed allocation" {
@@ -131198,7 +131199,7 @@ test "pending document-unit sparse embedding collection releases every failed al
             try std.testing.expectEqualStrings("second_consumer", pending.items[1].consumer_indexes[1]);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
 }
 
 test "pending document-unit chunk sources append atomically under allocation failure" {
@@ -131224,7 +131225,7 @@ test "pending document-unit chunk sources append atomically under allocation fai
             }
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
 }
 
 fn graphTestApplyOrdered(db: *DB, req: types.BatchRequest, receipt: OrderedApplyReceipt) !void {
@@ -131983,7 +131984,7 @@ test "db graph fact neighbor replay releases partial allocations" {
             try std.testing.expectEqual(@as(usize, 2), generated.keys.len);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
 }
 
 test "db graph fact transform preserves exact metadata" {
@@ -132118,7 +132119,7 @@ test "db graph fact enrichment observes pending graph replay" {
             }
         }
     };
-    try std.testing.checkAllAllocationFailures(alloc, RefreshAllocationFixture.run, .{&db});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, RefreshAllocationFixture.run, .{&db});
     // Simulate an older consumer window withdrawing this owner after a source
     // refresh. Invalidation must make the next sample restore current primary
     // effects even though no new primary revision has arrived.
@@ -133098,8 +133099,8 @@ test "document collectors release text projections and materialized values on al
     for ([_]bool{ false, true }) |inline_values| {
         // Mixed batches exercise per-value ownership; ordinary batches also
         // exhaust failures before and after the exact-size slab allocation.
-        try std.testing.checkAllAllocationFailures(alloc, textCollectorFailureSweep, .{ db.core.store, db.core.index_manager, @as([]const derived_types.DerivedDocument, &docs), inline_values });
-        try std.testing.checkAllAllocationFailures(alloc, textCollectorFailureSweep, .{ db.core.store, db.core.index_manager, @as([]const derived_types.DerivedDocument, docs[1..]), inline_values });
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, textCollectorFailureSweep, .{ db.core.store, db.core.index_manager, @as([]const derived_types.DerivedDocument, &docs), inline_values });
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, textCollectorFailureSweep, .{ db.core.store, db.core.index_manager, @as([]const derived_types.DerivedDocument, docs[1..]), inline_values });
     }
 }
 
@@ -133153,7 +133154,7 @@ test "document collectors asset projection borrows ordinary names and preserves 
             try std.testing.expectEqualStrings("{\"caption\":\"projected value\"}", result);
         }
     };
-    try std.testing.checkAllAllocationFailures(alloc, Check.run, .{ db.core.index_manager, @as([]const u8, escaped) });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Check.run, .{ db.core.index_manager, @as([]const u8, escaped) });
 }
 
 test "document collectors ordinary slab excludes projected assets" {
@@ -133216,7 +133217,7 @@ test "document collectors JSON string writing preserves escaping and output owne
     for (inputs) |input| {
         const expected = try std.fmt.allocPrint(std.testing.allocator, "{f}", .{std.json.fmt(input, .{})});
         defer std.testing.allocator.free(expected);
-        try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{ input, expected });
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Check.run, .{ input, expected });
     }
     var output = std.ArrayListUnmanaged(u8).empty;
     defer output.deinit(std.testing.allocator);
@@ -133241,7 +133242,7 @@ test "document collectors JSON numeric fields preserve boundaries and ownership 
             try std.testing.expectEqualStrings("{\"zero\":0,\"max\":18446744073709551615,\"size\":42}", out.items);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
     var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(std.testing.allocator);
     try out.ensureTotalCapacityPrecise(std.testing.allocator, 128);
@@ -133269,7 +133270,7 @@ test "document collectors JSON media encoding preserves padding escaping and fai
         _ = std.base64.standard.Encoder.encode(encoded, bytes[0..len]);
         const expected = try std.fmt.allocPrint(alloc, "[{{\"type\":\"text\",\"text\":\"prefix\\n\"}},{{\"type\":\"media\",\"mime_type\":\"quoted\\\"type\",\"data\":\"{s}\"}},{{\"type\":\"media\",\"url\":\"suffix\"}}]", .{encoded});
         defer alloc.free(expected);
-        try std.testing.checkAllAllocationFailures(alloc, Check.run, .{ @as([]const u8, bytes[0..len]), @as([]const u8, expected) });
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Check.run, .{ @as([]const u8, bytes[0..len]), @as([]const u8, expected) });
     }
 }
 
@@ -133302,7 +133303,7 @@ test "document collectors sparse borrowed JSON owns numeric outputs and cleans e
         try store.put(key, value);
         doc.* = .{ .key = id, .action = .upsert };
     }
-    try std.testing.checkAllAllocationFailures(alloc, sparseCollectorOwnershipSweep, .{ &store, @as(?*index_manager_mod.IndexManager, null), @as([]const derived_types.DerivedDocument, &docs), false });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, sparseCollectorOwnershipSweep, .{ &store, @as(?*index_manager_mod.IndexManager, null), @as([]const derived_types.DerivedDocument, &docs), false });
     var result = try collectSparseFieldWritesProfiled(alloc, &store, null, &docs, .{ .start = "", .end = "" }, "vec", .{}, null);
     defer result.deinit();
     // Returned numeric arrays outlive the collector's read transaction.
@@ -133344,7 +133345,7 @@ test "document collectors sparse relational rows still decode under allocation f
     defer alloc.free(key);
     try db.core.store.put(key, packed_row);
     const docs = [_]derived_types.DerivedDocument{.{ .key = "row", .action = .upsert }};
-    try std.testing.checkAllAllocationFailures(alloc, sparseCollectorOwnershipSweep, .{ db.core.store, @as(?*index_manager_mod.IndexManager, db.core.index_manager), @as([]const derived_types.DerivedDocument, &docs), true });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, sparseCollectorOwnershipSweep, .{ db.core.store, @as(?*index_manager_mod.IndexManager, db.core.index_manager), @as([]const derived_types.DerivedDocument, &docs), true });
 }
 
 fn embeddingWriteIdentitySweep(alloc: Allocator, key: []const u8, expected: []const u8, manager: ?*index_manager_mod.IndexManager) !void {
@@ -133370,7 +133371,7 @@ test "document collectors embedding identity accepted and rejected keys clean ev
     defer alloc.free(rejected);
     for ([_][]const u8{ doc, derived, rejected }) |key| {
         for ([_]?*index_manager_mod.IndexManager{ null, db.core.index_manager }) |manager|
-            try std.testing.checkAllAllocationFailures(alloc, embeddingWriteIdentitySweep, .{ key, @as([]const u8, "dense"), manager });
+            try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, embeddingWriteIdentitySweep, .{ key, @as([]const u8, "dense"), manager });
     }
     try std.testing.expectEqual(@as(?OwnedEmbeddingArtifactWriteIdentity, null), try decodeEmbeddingArtifactWriteIdentityAlloc(alloc, rejected, "dense"));
     try std.testing.expectEqual(@as(?OwnedEmbeddingArtifactWriteIdentity, null), try decodeEmbeddingArtifactWriteIdentityForManagedIndexAlloc(alloc, db.core.index_manager, .{ .name = "dense", .kind = .dense_vector }, rejected));
@@ -133433,7 +133434,7 @@ test "overwritten document keys release failures and preserve request order" {
             try std.testing.expectEqualStrings("last", keys[2]);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
 }
 
 test "artifact projection construction releases failures with real local resources" {
@@ -133457,9 +133458,9 @@ test "artifact projection construction releases failures with real local resourc
         }
     };
     const source = read_projection.Source{ .core = db.core };
-    try std.testing.checkAllAllocationFailures(alloc, Check.run, .{ source, types.ArtifactKind.asset, @as([]const u8, "{\"entities\":[{\"text\":\"Antfly\"}]}") });
-    try std.testing.checkAllAllocationFailures(alloc, Check.run, .{ source, types.ArtifactKind.chunk, @as([]const u8, "{\"body\":\"hello\",\"_chunk_id\":0}") });
-    try std.testing.checkAllAllocationFailures(alloc, Check.run, .{ source, types.ArtifactKind.chunk, @as([]const u8, "plain chunk") });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Check.run, .{ source, types.ArtifactKind.asset, @as([]const u8, "{\"entities\":[{\"text\":\"Antfly\"}]}") });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Check.run, .{ source, types.ArtifactKind.chunk, @as([]const u8, "{\"body\":\"hello\",\"_chunk_id\":0}") });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Check.run, .{ source, types.ArtifactKind.chunk, @as([]const u8, "plain chunk") });
 }
 
 test "lite bounded reader integration scans native relational dirty rows" {

@@ -10,6 +10,7 @@ from ..models.create_algebraic_index_request_type import CreateAlgebraicIndexReq
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
+    from ..models.algebraic_aggregate_config import AlgebraicAggregateConfig
     from ..models.enrichment_config import EnrichmentConfig
 
 
@@ -25,8 +26,11 @@ class CreateAlgebraicIndexRequest:
         description (str | Unset): Optional description of the index and its purpose
         version (int | Unset): Version of the index implementation. Defaults to 0. Default: 0.
         enrichments (list[EnrichmentConfig] | Unset): Inline managed enrichment definitions required by this index.
-        derive_from_schema (bool | Unset): When true, derive the algebraic capability sidecar from the table schema.
-            Internal fields and materialization definitions are not public API.
+        derive_from_schema (bool | Unset): When true, derive typed fields and capabilities from the table schema.
+            Physical fields, laws, joins and state remain engine-owned.
+        aggregates (list[AlgebraicAggregateConfig] | Unset): Desired exact aggregate recipes over schema column names.
+            Eligible SQL automatically reuses complete, snapshot-bound materializations; unsupported SQL shapes retain
+            scanning.
     """
 
     type_: CreateAlgebraicIndexRequestType
@@ -34,6 +38,7 @@ class CreateAlgebraicIndexRequest:
     version: int | Unset = 0
     enrichments: list[EnrichmentConfig] | Unset = UNSET
     derive_from_schema: bool | Unset = UNSET
+    aggregates: list[AlgebraicAggregateConfig] | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -52,6 +57,13 @@ class CreateAlgebraicIndexRequest:
 
         derive_from_schema = self.derive_from_schema
 
+        aggregates: list[dict[str, Any]] | Unset = UNSET
+        if not isinstance(self.aggregates, Unset):
+            aggregates = []
+            for aggregates_item_data in self.aggregates:
+                aggregates_item = aggregates_item_data.to_dict()
+                aggregates.append(aggregates_item)
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -67,11 +79,14 @@ class CreateAlgebraicIndexRequest:
             field_dict["enrichments"] = enrichments
         if derive_from_schema is not UNSET:
             field_dict["derive_from_schema"] = derive_from_schema
+        if aggregates is not UNSET:
+            field_dict["aggregates"] = aggregates
 
         return field_dict
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.algebraic_aggregate_config import AlgebraicAggregateConfig
         from ..models.enrichment_config import EnrichmentConfig
 
         d = dict(src_dict)
@@ -92,12 +107,22 @@ class CreateAlgebraicIndexRequest:
 
         derive_from_schema = d.pop("derive_from_schema", UNSET)
 
+        _aggregates = d.pop("aggregates", UNSET)
+        aggregates: list[AlgebraicAggregateConfig] | Unset = UNSET
+        if _aggregates is not UNSET:
+            aggregates = []
+            for aggregates_item_data in _aggregates:
+                aggregates_item = AlgebraicAggregateConfig.from_dict(aggregates_item_data)
+
+                aggregates.append(aggregates_item)
+
         create_algebraic_index_request = cls(
             type_=type_,
             description=description,
             version=version,
             enrichments=enrichments,
             derive_from_schema=derive_from_schema,
+            aggregates=aggregates,
         )
 
         create_algebraic_index_request.additional_properties = d

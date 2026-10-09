@@ -82,6 +82,16 @@ pub const SegmentAttention = struct {
     num_heads: usize,
     head_dim: usize,
 };
+/// Grouped K/V rows retain their original head count. Optional device-only
+/// contract: a declined request uses the caller's existing expanded-head path.
+pub const SegmentAttentionGrouped = struct {
+    visibility: SegmentAttention,
+    num_kv_heads: usize,
+    score_scale: f32,
+    workspace_limit_bytes: usize = 256 * 1024 * 1024,
+    control: ?@import("../execution_control.zig").InferenceExecutionControl = null,
+};
+
 pub const GraphDType = ml.graph.DType;
 pub const OperatorPlan = operator_plan.OperatorPlan;
 
@@ -701,6 +711,8 @@ pub const Gemma4AudioLocalAttentionParams = struct {
     k_scale: f32,
     logit_cap: f32,
     invalid_value: f32,
+    /// HF Gemma4 audio masking uses distance < context_left - 1.
+    exclude_farthest_key: bool = false,
 };
 pub const DecoderRuntimeApplyActivationRequest = backend_contracts.DecoderRuntimeApplyActivationRequest;
 pub const DecoderRuntimeApplyGeluBackwardRequest = backend_contracts.DecoderRuntimeApplyGeluBackwardRequest;
@@ -1520,6 +1532,38 @@ pub const ComputeBackend = struct {
         return output;
     }
 
+    /// Fixed-shape, strictly resident FP32 Q/K/V projection. This remains a
+    /// separate boundary contract so generic multi-dot outputs cannot escape
+    /// the request scope's physical ownership and accounting.
+    pub fn glinerBoundaryPackedQkv(self: *const ComputeBackend, request: *const gliner_boundary_device.PackedQkvRequest) !gliner_boundary_device.PackedQkvResult {
+        errdefer self.cancelGlinerBoundaryOwnedScope();
+        try self.checkExecutionControl();
+        const op = self.vtable.glinerBoundaryPackedQkv orelse return error.UnsupportedGlinerBoundaryPackedQkv;
+        const output = try op(self.ptr, request);
+        errdefer {
+            self.free(output.query);
+            self.free(output.key);
+            self.free(output.value);
+        }
+        try self.checkExecutionControl();
+        return output;
+    }
+
+    pub fn glinerBoundaryFusedFfn(self: *const ComputeBackend, request: *const gliner_boundary_device.FusedFfnRequest) !CT {
+        errdefer self.cancelGlinerBoundaryOwnedScope();
+        try self.checkExecutionControl();
+        const op = self.vtable.glinerBoundaryFusedFfn orelse return error.UnsupportedGlinerBoundaryFusedFfn;
+        const output = try op(self.ptr, request);
+        errdefer self.free(output);
+        try self.checkExecutionControl();
+        return output;
+    }
+
+    pub fn glinerBoundaryFusedFfnAvailable(self: *const ComputeBackend) bool {
+        const op = self.vtable.glinerBoundaryFusedFfnAvailable orelse return false;
+        return op(self.ptr);
+    }
+
     pub fn glinerBoundaryDownload(self: *const ComputeBackend, tensor: CT, output: []f32) !void {
         errdefer self.cancelGlinerBoundaryOwnedScope();
         try self.checkExecutionControl();
@@ -1736,6 +1780,9 @@ pub const ComputeBackend = struct {
         cumulativeSum: ?*const fn (ctx: *anyopaque, tensor: CT, axis: u8, exclusive: bool, reverse: bool) anyerror!?CT = null,
         convertDType: ?*const fn (ctx: *anyopaque, tensor: CT, target: GraphDType) anyerror!?CT = null,
         glinerBoundaryDevice: ?*const fn (ctx: *anyopaque, request: *const gliner_boundary_device.Request) anyerror!CT = null,
+        glinerBoundaryPackedQkv: ?*const fn (ctx: *anyopaque, request: *const gliner_boundary_device.PackedQkvRequest) anyerror!gliner_boundary_device.PackedQkvResult = null,
+        glinerBoundaryFusedFfnAvailable: ?*const fn (ctx: *anyopaque) bool = null,
+        glinerBoundaryFusedFfn: ?*const fn (ctx: *anyopaque, request: *const gliner_boundary_device.FusedFfnRequest) anyerror!CT = null,
         glinerBoundaryScope: ?*const fn (ctx: *anyopaque, request: *const gliner_boundary_device.ScopeRequest) anyerror!gliner_boundary_device.ScopeStats = null,
         glinerBoundaryResidentPreparation: ?*const fn (ctx: *anyopaque, enabled: bool) anyerror!void = null,
         recordLossGradient: ?*const fn (ctx: *anyopaque, request: *const record_loss_math.Request) anyerror!void = null,
@@ -1946,6 +1993,9 @@ pub const ComputeBackend = struct {
         /// callers fall back to add + layerNorm.
         addLayerNorm: ?*const fn (ctx: *anyopaque, a: CT, b: CT, gamma: CT, beta: CT, dim: usize, eps: f32) anyerror!?CT = null,
         addLayerNormSum: ?*const fn (ctx: *anyopaque, a: CT, b: CT, gamma: CT, beta: CT, dim: usize, eps: f32) anyerror!?AddLayerNormSumResult = null,
+        /// Strict centered variance for GLiNER/ModernBERT; no E[x²]-E[x]² substitution.
+        addLayerNormSumCentered: ?*const fn (ctx: *anyopaque, a: CT, b: CT, gamma: CT, beta: CT, dim: usize, eps: f32) anyerror!?AddLayerNormSumResult = null,
+        packedQkvRope: ?*const fn (ctx: *anyopaque, input: CT, positions: CT, hidden: usize, head_dim: usize, theta: f32) anyerror!?SplitLastDim3Result = null,
         ensureDeviceResident: ?*const fn (ctx: *anyopaque, tensor: CT) anyerror!?CT = null,
         conv1dIm2col: ?*const fn (ctx: *anyopaque, input: CT, batch: usize, in_channels: usize, time_steps: usize, kernel_size: usize, stride: usize, padding: usize, time_major: bool) anyerror!?CT = null,
         whisperLogitsStatsEncode: ?*const fn (ctx: *anyopaque, logits: CT, params: *const WhisperLogitsParams, suppress_ids: []const i32) anyerror!bool = null,
@@ -2288,6 +2338,10 @@ pub const ComputeBackend = struct {
         /// Segment-masked attention for tree-packed sequences; see
         /// `SegmentAttention`. Null declines to the host implementation.
         segmentAttention: ?*const fn (ctx: *anyopaque, Q: CT, K: CT, V: CT, request: *const SegmentAttention) anyerror!?CT = null,
+        segmentAttentionGrouped: ?*const fn (ctx: *anyopaque, Q: CT, K: CT, V: CT, request: *const SegmentAttentionGrouped) anyerror!?CT = null,
+        /// Masked mean of [rows,width], truncated before final readback. Null
+        /// declines; device-only callers must not silently reduce on the host.
+        maskedMeanRows: ?*const fn (ctx: *anyopaque, input: CT, mask: []const i64, width: usize, dimensions: usize) anyerror!?CT = null,
 
         /// Causal self-attention for decoder layers.
         /// Q,K,V: [batch*seq_len, num_heads*head_dim].
@@ -3820,6 +3874,16 @@ pub const ComputeBackend = struct {
     /// no fused kernel or an input is not device resident.
     pub fn addLayerNormSum(self: *const ComputeBackend, a: CT, b: CT, gamma: CT, beta: CT, dim: usize, eps: f32) !?AddLayerNormSumResult {
         if (self.vtable.addLayerNormSum) |f| return f(self.ptr, a, b, gamma, beta, dim, eps);
+        return null;
+    }
+
+    pub fn addLayerNormSumCentered(self: *const ComputeBackend, a: CT, b: CT, gamma: CT, beta: CT, dim: usize, eps: f32) !?AddLayerNormSumResult {
+        if (self.vtable.addLayerNormSumCentered) |f| return f(self.ptr, a, b, gamma, beta, dim, eps);
+        return null;
+    }
+
+    pub fn packedQkvRope(self: *const ComputeBackend, input: CT, positions: CT, hidden: usize, head_dim: usize, theta: f32) !?SplitLastDim3Result {
+        if (self.vtable.packedQkvRope) |f| return f(self.ptr, input, positions, hidden, head_dim, theta);
         return null;
     }
 
@@ -5706,5 +5770,87 @@ test "DeBERTa embeddings forward controls and release cancelled backend outputs"
             try std.testing.expect(!fake.output_live);
             if (has_backend_control) try std.testing.expectEqual(@as(usize, 0), request_probe.checks);
         }
+    }
+}
+
+test "packed boundary QKV releases all outputs and cancels its owned scope on request cancellation" {
+    const Probe = struct {
+        checks: usize = 0,
+        cancelled: bool = false,
+
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.checks += 1;
+            if (self.cancelled) return error.Cancelled;
+        }
+        fn control(self: *@This()) InferenceExecutionControl {
+            return .{ .ptr = self, .check_fn = check };
+        }
+    };
+    const Fake = struct {
+        probe: *Probe,
+        cancel_during: bool,
+        calls: usize = 0,
+        frees: usize = 0,
+        scope_active: bool = true,
+        outputs: [3]u8 = @splat(0),
+
+        fn packedOp(raw: *anyopaque, _: *const gliner_boundary_device.PackedQkvRequest) !gliner_boundary_device.PackedQkvResult {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (self.cancel_during) self.probe.cancelled = true;
+            return .{
+                .query = @ptrCast(&self.outputs[0]),
+                .key = @ptrCast(&self.outputs[1]),
+                .value = @ptrCast(&self.outputs[2]),
+            };
+        }
+        fn free(raw: *anyopaque, tensor: CT) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            for (&self.outputs) |*output| if (tensor == @as(CT, @ptrCast(output))) {
+                self.frees += 1;
+                return;
+            };
+            unreachable;
+        }
+        fn scope(raw: *anyopaque, request: *const gliner_boundary_device.ScopeRequest) !gliner_boundary_device.ScopeStats {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            switch (request.*) {
+                .snapshot => {},
+                .cancel => self.scope_active = false,
+                .begin, .finish => unreachable,
+            }
+            return .{ .active = self.scope_active, .generation = 1 };
+        }
+    };
+    const Case = enum { success, pre_cancel, post_cancel };
+    for ([_]Case{ .success, .pre_cancel, .post_cancel }) |case| {
+        var probe = Probe{ .cancelled = case == .pre_cancel };
+        var fake = Fake{ .probe = &probe, .cancel_during = case == .post_cancel };
+        var vtable: ComputeBackend.VTable = undefined;
+        vtable.glinerBoundaryPackedQkv = Fake.packedOp;
+        vtable.glinerBoundaryScope = Fake.scope;
+        vtable.freeTensor = Fake.free;
+        const cb = ComputeBackend{ .ptr = &fake, .vtable = &vtable, .execution_control = probe.control() };
+        const marker: CT = @ptrCast(&fake.outputs[0]);
+        const request = gliner_boundary_device.PackedQkvRequest{
+            .input = marker,
+            .packed_weight = marker,
+            .biases = @splat(marker),
+            .rows = 1,
+            .hidden = 1,
+        };
+        if (case == .success) {
+            const result = try cb.glinerBoundaryPackedQkv(&request);
+            cb.free(result.query);
+            cb.free(result.key);
+            cb.free(result.value);
+            try std.testing.expect(fake.scope_active);
+        } else {
+            try std.testing.expectError(error.Cancelled, cb.glinerBoundaryPackedQkv(&request));
+            try std.testing.expect(!fake.scope_active);
+        }
+        try std.testing.expectEqual(@as(usize, if (case == .pre_cancel) 0 else 1), fake.calls);
+        try std.testing.expectEqual(@as(usize, if (case == .post_cancel or case == .success) 3 else 0), fake.frees);
     }
 }
