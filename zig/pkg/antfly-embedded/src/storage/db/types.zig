@@ -15,6 +15,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+pub const SparseOrdinalSelection = @import("../../sparse/ordinal_lookup.zig").Selection;
 pub const SparseOrdinalLookup = @import("../../sparse/ordinal_lookup.zig").Lookup;
 const graph_mod = @import("../../graph/graph.zig");
 const traversal_mod = @import("../../graph/traversal.zig");
@@ -1947,6 +1948,7 @@ pub const SearchRequest = struct {
     native_key_predicate: ?struct {
         ptr: *anyopaque,
         allows: *const fn (*anyopaque, []const u8) anyerror!bool,
+        select_constraints: ?*const fn (*anyopaque, Allocator, SparseOrdinalLookup) anyerror!?SparseOrdinalSelection = null,
         select_ordinals: ?*const fn (*anyopaque, Allocator, SparseOrdinalLookup) anyerror!?@import("../../encoding/roaring.zig").RoaringBitmap = null,
     } = null,
     resolved_doc_filter_owned: bool = false,

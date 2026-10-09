@@ -204,6 +204,8 @@ pub const OrdinalLookup = @import("ordinal_lookup.zig").Lookup;
 pub const KeyPredicate = struct {
     ptr: *anyopaque,
     allows: *const fn (*anyopaque, []const u8) anyerror!bool,
+    /// Resolve exact include/exclude masks without expanding a complement.
+    select_constraints: ?*const fn (*anyopaque, Allocator, OrdinalLookup) anyerror!?@import("ordinal_lookup.zig").Selection = null,
     /// Resolve an exact positive physical selection against this read transaction.
     /// Null retains the key predicate path (for example exclusion-only queries).
     select_ordinals: ?*const fn (*anyopaque, Allocator, OrdinalLookup) anyerror!?@import("../encoding/roaring.zig").RoaringBitmap = null,
@@ -4694,11 +4696,19 @@ pub const SparseIndex = struct {
             }
         };
         var lookup: Lookup = .{ .index = self, .txn = &txn, .cancellation = constraints.cancellation };
-        var ordinal_filter = if (constraints.key_predicate) |predicate|
+        const masks = if (constraints.key_predicate) |predicate|
+            if (predicate.select_constraints) |select| try select(predicate.ptr, alloc, .{ .ptr = &lookup, .one = Lookup.lookup, .block = Lookup.block }) else null
+        else
+            null;
+        var ordinal_exclude = if (masks) |selected| selected.exclude else null;
+        defer if (ordinal_exclude) |*bitmap| bitmap.deinit();
+        var ordinal_filter = if (masks) |selected| selected.include else if (constraints.key_predicate) |predicate|
             if (predicate.select_ordinals) |select| try select(predicate.ptr, alloc, .{ .ptr = &lookup, .one = Lookup.lookup, .block = Lookup.block }) else null
         else
             null;
         defer if (ordinal_filter) |*bitmap| bitmap.deinit();
+        if (ordinal_exclude) |*bitmap| try bitmap.prepareRead();
+        const predicate_resolved = if (masks) |selection| !selection.residual else ordinal_filter != null;
         if (constraints.key_predicate == null and ordinal_filter == null and (filter_doc_nums.count() != 0 or direct_filter_doc_nums.count() != 0)) {
             ordinal_filter = @import("../encoding/roaring.zig").RoaringBitmap.init(alloc);
             const first = if (filter_doc_nums.count() != 0) &filter_doc_nums else &direct_filter_doc_nums;
@@ -4731,10 +4741,13 @@ pub const SparseIndex = struct {
         const Decisions = struct {
             allowed: @import("../encoding/roaring.zig").RoaringBitmap,
             denied: @import("../encoding/roaring.zig").RoaringBitmap,
+            complete: bool,
+            identities: ?backend_erased.Cursor = null,
         };
-        var decisions: Decisions = .{ .allowed = .init(alloc), .denied = .init(alloc) };
+        var decisions: Decisions = .{ .allowed = .init(alloc), .denied = .init(alloc), .complete = try completeLocatorMap(&txn) };
         defer decisions.allowed.deinit();
         defer decisions.denied.deinit();
+        defer if (decisions.identities) |*cursor| cursor.close();
         const ScoreSource = enum { segment, delta };
         const AccumulateContext = struct {
             alloc: Allocator,
@@ -4754,6 +4767,7 @@ pub const SparseIndex = struct {
             cancellation: ?CancellationToken,
             key_predicate: ?KeyPredicate,
             ordinal_filter: ?*const @import("../encoding/roaring.zig").RoaringBitmap,
+            ordinal_exclude: ?*const @import("../encoding/roaring.zig").RoaringBitmap,
             index: *SparseIndex,
             decisions: *Decisions,
 
@@ -4761,24 +4775,66 @@ pub const SparseIndex = struct {
                 try checkSearchCancellation(ctx.cancellation);
             }
             pub fn nextCandidate(ctx: *@This(), first: u32) u64 {
+                const Bitmap = @import("../encoding/roaring.zig").RoaringBitmap;
+                var includes: [1]*const Bitmap = undefined;
+                var excludes: [1]*const Bitmap = undefined;
+                var ni: usize = 0;
+                var ne: usize = 0;
                 if (ctx.ordinal_filter) |bitmap| {
-                    var iterator = bitmap.iterator();
-                    return iterator.seekTo(first) orelse @as(u64, std.math.maxInt(u32)) + 1;
+                    includes[0] = bitmap;
+                    ni = 1;
                 }
-                return first;
+                if (ctx.ordinal_exclude) |bitmap| {
+                    excludes[0] = bitmap;
+                    ne = 1;
+                }
+                return Bitmap.candidateLowerBound(first, 0x1_0000_0000, includes[0..ni], excludes[0..ne]);
             }
             pub fn mayMatch(ctx: *@This(), first: u32, last: u32) bool {
-                const bitmap = ctx.ordinal_filter orelse return true;
-                return bitmap.rangeCardinality(first, @as(u64, last) + 1) != 0;
+                if (ctx.ordinal_filter) |bitmap| if (bitmap.rangeCardinality(first, @as(u64, last) + 1) == 0) return false;
+                if (ctx.ordinal_exclude) |bitmap| if (bitmap.rangeCardinality(first, @as(u64, last) + 1) == @as(u64, last) + 1 - first) return false;
+                return true;
+            }
+            fn allowsKey(ctx: *@This(), doc_num: u32) !bool {
+                if (ctx.key_predicate) |predicate| if (!ctx.decisions.allowed.contains(doc_num)) {
+                    if (ctx.decisions.denied.contains(doc_num)) return false;
+                    if (ctx.index.docNumDeleted(ctx.visibility, doc_num)) return false;
+                    var owned: ?[]u8 = null;
+                    defer if (owned) |id| ctx.alloc.free(id);
+                    const id = if (ctx.decisions.complete) blk: {
+                        // Borrow one reverse identity from independent cursor
+                        // scratch. Point gets would retain every reached key
+                        // until the parent transaction closes on arena backends.
+                        if (ctx.decisions.identities == null) ctx.decisions.identities = try ctx.txn.openCursor();
+                        var key: [9]u8 = undefined;
+                        const wanted = revKey(&key, doc_num);
+                        const entry = (try ctx.decisions.identities.?.seekAtOrAfter(wanted)) orelse return false;
+                        if (!std.mem.eql(u8, entry.key, wanted)) return false;
+                        break :blk entry.value;
+                    } else blk: {
+                        owned = ctx.index.resolveDocIdByDocNum(ctx.alloc, ctx.txn, doc_num) catch |err| switch (err) {
+                            error.NotFound => return false,
+                            else => return err,
+                        };
+                        break :blk owned.?;
+                    };
+                    if (!try predicate.allows(predicate.ptr, id)) {
+                        try ctx.decisions.denied.add(doc_num);
+                        return false;
+                    }
+                    try ctx.decisions.allowed.add(doc_num);
+                };
+                return true;
             }
             pub fn allows(ctx: *@This(), stream: daat.Stream, doc_num: u32) !bool {
                 if (ctx.ordinal_filter) |bitmap| if (!bitmap.contains(doc_num)) return false;
+                if (ctx.ordinal_exclude) |bitmap| if (bitmap.contains(doc_num)) return false;
                 if (ctx.filter_doc_nums.count() > 0 and !ctx.filter_doc_nums.contains(doc_num)) return false;
                 if (ctx.direct_filter_doc_nums.count() > 0 and !ctx.direct_filter_doc_nums.contains(doc_num)) return false;
                 if (ctx.exclude_doc_nums.contains(doc_num) or ctx.direct_exclude_doc_nums.contains(doc_num)) return false;
                 if (ctx.index.docNumDeleted(ctx.visibility, doc_num)) return false;
                 if (stream.segment) |id| if (!try ctx.incarnations.matches(ctx.alloc, ctx.visibility, id, stream.version, doc_num)) return false;
-                return true;
+                return ctx.allowsKey(doc_num);
             }
             fn shouldDecode(ctx: *@This(), bytes: []const u8, range: []const u8) !bool {
                 try checkSearchCancellation(ctx.cancellation);
@@ -4789,24 +4845,13 @@ pub const SparseIndex = struct {
                 for (decoded.doc_nums, 0..) |doc_num, di| {
                     if (di % 256 == 0) try checkSearchCancellation(ctx.cancellation);
                     if (ctx.ordinal_filter) |bitmap| if (!bitmap.contains(doc_num)) continue;
+                    if (ctx.ordinal_exclude) |bitmap| if (bitmap.contains(doc_num)) continue;
                     if (ctx.filter_doc_nums.count() > 0 and !ctx.filter_doc_nums.contains(doc_num)) continue;
                     if (ctx.direct_filter_doc_nums.count() > 0 and !ctx.direct_filter_doc_nums.contains(doc_num)) continue;
                     if (ctx.exclude_doc_nums.contains(doc_num)) continue;
                     if (ctx.direct_exclude_doc_nums.contains(doc_num)) continue;
                     if (ctx.segment_id) |id| if (!try ctx.incarnations.matches(ctx.alloc, ctx.visibility, id, ctx.segment_version, doc_num)) continue;
-                    if (ctx.key_predicate) |predicate| if (!ctx.decisions.allowed.contains(doc_num)) {
-                        if (ctx.decisions.denied.contains(doc_num)) continue;
-                        const id = ctx.index.resolveDocIdByDocNum(ctx.alloc, ctx.txn, doc_num) catch |err| switch (err) {
-                            error.NotFound => continue,
-                            else => return err,
-                        };
-                        defer ctx.alloc.free(id);
-                        if (!try predicate.allows(predicate.ptr, id)) {
-                            try ctx.decisions.denied.add(doc_num);
-                            continue;
-                        }
-                        try ctx.decisions.allowed.add(doc_num);
-                    };
+                    if (!try ctx.allowsKey(doc_num)) continue;
                     const doc_weight = decoded.weights[di];
                     try ctx.scores.add(doc_num, ctx.query_weight * doc_weight);
                 }
@@ -4824,7 +4869,7 @@ pub const SparseIndex = struct {
         defer page_reader.deinit();
         var fast_entries: ?[]ScoreEntry = null;
         defer if (fast_entries) |values| alloc.free(values);
-        if ((constraints.key_predicate == null or ordinal_filter != null) and try completeLocatorMap(&txn)) {
+        if (decisions.complete) {
             if (try collectPostingStreams(alloc, &txn, query_vec, constraints.cancellation, 64 * 1024 * 1024, &page_reader, if (ordinal_filter) |*bitmap| bitmap else null)) |input| {
                 defer {
                     for (input) |*stream| stream.deinit();
@@ -4844,8 +4889,9 @@ pub const SparseIndex = struct {
                     .profile = null,
                     .source = .segment,
                     .cancellation = constraints.cancellation,
-                    .key_predicate = null,
+                    .key_predicate = if (!predicate_resolved) constraints.key_predicate else null,
                     .ordinal_filter = if (ordinal_filter) |*bitmap| bitmap else null,
+                    .ordinal_exclude = if (ordinal_exclude) |*bitmap| bitmap else null,
                     .index = self,
                     .decisions = &decisions,
                 };
@@ -4888,8 +4934,9 @@ pub const SparseIndex = struct {
                         .profile = if (profile_enabled) &profile else null,
                         .source = .segment,
                         .cancellation = constraints.cancellation,
-                        .key_predicate = if (ordinal_filter == null) constraints.key_predicate else null,
+                        .key_predicate = if (!predicate_resolved) constraints.key_predicate else null,
                         .ordinal_filter = if (ordinal_filter) |*bitmap| bitmap else null,
+                        .ordinal_exclude = if (ordinal_exclude) |*bitmap| bitmap else null,
                         .index = self,
                         .decisions = &decisions,
                     };
@@ -4938,8 +4985,9 @@ pub const SparseIndex = struct {
                         .profile = if (profile_enabled) &profile else null,
                         .source = .delta,
                         .cancellation = constraints.cancellation,
-                        .key_predicate = if (ordinal_filter == null) constraints.key_predicate else null,
+                        .key_predicate = if (!predicate_resolved) constraints.key_predicate else null,
                         .ordinal_filter = if (ordinal_filter) |*bitmap| bitmap else null,
+                        .ordinal_exclude = if (ordinal_exclude) |*bitmap| bitmap else null,
                         .index = self,
                         .decisions = &decisions,
                     };
@@ -7878,4 +7926,77 @@ test "sparse visibility partial page failures never become cached absence" {
     try std.testing.expectEqual(@as(?u64, 0), page.block);
     var missing: [9]u8 = undefined;
     try std.testing.expectError(error.NotFound, page.get(docIncarnationKey(&missing, 8)));
+}
+
+test "sparse exclusion masks retain bounded scoring without reverse key callbacks" {
+    const a = std.testing.allocator;
+    var pb: [256]u8 = undefined;
+    const path = tmpPath(&pb, "exclusion-ordinals");
+    defer cleanupTmp(path);
+    var idx = try SparseIndex.open(a, path, .{ .chunk_size = 32 });
+    defer idx.close();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    const writes = try ca.alloc(SparseWrite, 512);
+    for (writes, 0..) |*write, i| {
+        const values = try ca.alloc(f32, 2);
+        values[0] = @floatFromInt(i + 1);
+        values[1] = 1;
+        write.* = .{ .doc_id = try std.fmt.allocPrint(ca, "doc-{d}", .{i}), .vec = .{ .indices = &.{ 1, 2 }, .values = values } };
+    }
+    try idx.batchWithOptions(writes, &.{}, .{ .prefer_bulk_build = true, .assume_new_doc_ids = true });
+    const Selection = @import("ordinal_lookup.zig").Selection;
+    const Predicate = struct {
+        mode: enum { exclude, both, empty, residual } = .exclude,
+        calls: usize = 0,
+        fn allows(raw: *anyopaque, key: []const u8) !bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.mode != .residual) return error.UnexpectedReverseIdentityRead;
+            self.calls += 1;
+            return try std.fmt.parseInt(usize, key[4..], 10) >= 300;
+        }
+        fn select(raw: *anyopaque, alloc: Allocator, lookup: OrdinalLookup) !?Selection {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            var result: Selection = .{};
+            errdefer result.deinit();
+            if (self.mode == .residual) {
+                result.residual = true;
+                return result;
+            }
+            result.exclude = .init(alloc);
+            for (0..300) |i| {
+                var key: [32]u8 = undefined;
+                if (try lookup.one(lookup.ptr, try std.fmt.bufPrint(&key, "doc-{d}", .{i}))) |num| try result.exclude.?.add(num);
+            }
+            if (self.mode != .exclude) result.include = .init(alloc);
+            if (self.mode == .both) for (400..450) |i| {
+                var key: [32]u8 = undefined;
+                if (try lookup.one(lookup.ptr, try std.fmt.bufPrint(&key, "doc-{d}", .{i}))) |num| try result.include.?.add(num);
+            };
+            return result;
+        }
+    };
+    var predicate: Predicate = .{};
+    const excluded = try ca.alloc([]const u8, 300);
+    for (excluded, 0..) |*key, i| key.* = writes[i].doc_id;
+    const included = try ca.alloc([]const u8, 50);
+    for (included, 400..) |*key, i| key.* = writes[i].doc_id;
+    for ([_]@TypeOf(predicate.mode){ .exclude, .both, .empty, .residual }) |mode| {
+        predicate.mode = mode;
+        for ([_]f32{ 1, -1, 0 }) |weight| {
+            const query: SparseVector = .{ .indices = &.{ 1, 2 }, .values = &.{ weight, -1 } };
+            predicate.calls = 0;
+            const expected = try idx.searchConstrained(a, &query, 3, .{ .exclude_doc_ids = excluded, .filter_doc_ids = if (mode == .both) included else if (mode == .empty) &.{"missing"} else &.{} });
+            defer SparseIndex.freeResults(a, expected);
+            const actual = try idx.searchConstrained(a, &query, 3, .{ .max_score_docs = 1, .key_predicate = .{ .ptr = &predicate, .allows = Predicate.allows, .select_constraints = Predicate.select } });
+            defer SparseIndex.freeResults(a, actual);
+            if (mode == .residual) try std.testing.expect(predicate.calls > 0 and predicate.calls <= 512);
+            try std.testing.expectEqual(expected.len, actual.len);
+            for (actual, expected) |hit, reference| {
+                try std.testing.expectEqualStrings(reference.doc_id, hit.doc_id);
+                try std.testing.expectEqual(reference.score, hit.score);
+            }
+        }
+    }
 }
