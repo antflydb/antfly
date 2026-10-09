@@ -12892,10 +12892,22 @@ pub fn collectExplicitBackgroundTextStats(
             try checkSearchRequestDeadline(executor.controls);
             term_doc_sets[term_index] = roaring.RoaringBitmap.init(alloc);
             initialized_sets += 1;
-            const doc_nums = try snapshot.executeFilter(alloc, .{ .term = .{
+            const Budget = struct {
+                controls: types.SearchRequest,
+                pub fn checkpoint(self: @This()) !void {
+                    try checkSearchRequestDeadline(self.controls);
+                }
+                pub fn waitForProgress(_: @This()) !void {
+                    return error.ExecutionWaitUnsupported;
+                }
+            };
+            const admission = @import("../../../common/read_admission.zig");
+            var adapter = admission.Adapter(Budget){ .budget = .{ .controls = executor.controls } };
+            const payload = adapter.payload();
+            const doc_nums = try query_mod.executeFilterWithAdmission(alloc, snapshot, .{ .term = .{
                 .field = request.field,
                 .term = term,
-            } });
+            } }, admission.Port.init(&payload));
             defer alloc.free(doc_nums);
             for (doc_nums, 0..) |doc_num, doc_index| {
                 if (doc_index % 64 == 0) try checkSearchRequestDeadline(executor.controls);

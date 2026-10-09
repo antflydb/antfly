@@ -37,6 +37,7 @@ const levenshtein = @import("levenshtein.zig");
 const regex_mod = @import("regex.zig");
 const typed_dv = @import("../section/typed_doc_values.zig");
 const geo = @import("geo.zig");
+const read_admission = @import("../common/read_admission.zig");
 const synonyms_mod = @import("../section/synonyms.zig");
 
 // Range-backed codecs propagate storage failures as well as decode failures.
@@ -126,6 +127,11 @@ pub const TermFilter = struct {
     boost: f32 = 1.0,
 
     pub fn execute(self: TermFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry) FilterError!roaring.RoaringBitmap {
+        return self.executeWithAdmission(alloc, seg, null);
+    }
+
+    pub fn executeWithAdmission(self: TermFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry, control: ?read_admission.Port) FilterError!roaring.RoaringBitmap {
+        if (control) |budget| try budget.checkpoint();
         var inv_reader = (try seg.reader.invertedIndexScoped(alloc, self.field)) orelse
             return roaring.RoaringBitmap.init(alloc);
         defer inv_reader.deinit();
@@ -137,7 +143,7 @@ pub const TermFilter = struct {
         if ((try inv_reader.lookup(self.term))) |lookup_result| {
             switch (lookup_result) {
                 .postings => |p| {
-                    var bm = try p.docBitmap(alloc);
+                    var bm = try postingsBitmapWithAdmission(alloc, p, control);
                     defer bm.deinit();
                     try result.orWith(&bm);
                 },
@@ -157,11 +163,12 @@ pub const TermFilter = struct {
                     alloc.free(terms);
                 }
                 for (terms) |syn_term| {
+                    if (control) |budget| try budget.checkpoint();
                     if (std.mem.eql(u8, syn_term, self.term)) continue; // skip primary
                     if ((try inv_reader.lookup(syn_term))) |syn_result| {
                         switch (syn_result) {
                             .postings => |p| {
-                                var bm = try p.docBitmap(alloc);
+                                var bm = try postingsBitmapWithAdmission(alloc, p, control);
                                 defer bm.deinit();
                                 try result.orWith(&bm);
                             },
@@ -172,9 +179,30 @@ pub const TermFilter = struct {
             }
         }
 
+        if (control) |budget| try budget.checkpoint();
         return result;
     }
 };
+
+/// Keep the ordinary bitmap path for uncontrolled callers. Controlled
+/// scans decode bounded postings chunks and checkpoint between groups of hits.
+fn postingsBitmapWithAdmission(alloc: Allocator, postings: inverted.TermPostings, control: ?read_admission.Port) !roaring.RoaringBitmap {
+    const budget = control orelse return postings.docBitmap(alloc);
+    var bitmap = roaring.RoaringBitmap.init(alloc);
+    errdefer bitmap.deinit();
+    var iter = try postings.iterator(alloc);
+    defer iter.deinit();
+    iter.decode_positions = false;
+    var count: usize = 0;
+    while (true) {
+        if (count % 64 == 0) try budget.checkpoint();
+        const hit = (try iter.nextScoring()) orelse break;
+        try bitmap.add(hit.doc_id);
+        count += 1;
+    }
+    try budget.checkpoint();
+    return bitmap;
+}
 
 /// Boolean composition of sub-filters.
 ///
@@ -1807,12 +1835,27 @@ pub fn executeFilter(
     snap: *const index_mod.IndexSnapshot,
     filter: Filter,
 ) ![]u32 {
+    return executeFilterWithAdmission(alloc, snap, filter, null);
+}
+
+/// Borrow controls only for this synchronous scan; never mutate shared readers.
+pub fn executeFilterWithAdmission(alloc: Allocator, snap: *const index_mod.IndexSnapshot, filter: Filter, control: ?read_admission.Port) ![]u32 {
+    if (control) |budget| try budget.checkpoint();
     var all_ids = std.ArrayListUnmanaged(u32).empty;
     defer all_ids.deinit(alloc);
 
     var doc_offset: u32 = 0;
     for (snap.segments) |*seg| {
-        var bm = try filter.executeWithOffset(alloc, seg, doc_offset);
+        if (control) |budget| try budget.checkpoint();
+        var bm = if (filter == .term and control != null) blk: {
+            seg.beginAccess();
+            defer seg.endAccess();
+            break :blk try filter.term.executeWithAdmission(alloc, seg, control);
+        } else try filter.executeWithOffset(alloc, seg, doc_offset);
+        if (control) |budget| budget.checkpoint() catch |err| {
+            bm.deinit();
+            return err;
+        };
         defer bm.deinit();
 
         // Remove deleted docs while pinning the shared bitmap containers.
@@ -1824,13 +1867,17 @@ pub fn executeFilter(
 
         // Collect with offset
         var iter = bm.iterator();
+        var collected: usize = 0;
         while (iter.next()) |doc_id| {
+            if (collected % 64 == 0) if (control) |budget| try budget.checkpoint();
+            collected += 1;
             try all_ids.append(alloc, doc_id + doc_offset);
         }
 
         doc_offset += seg.reader.doc_count;
     }
 
+    if (control) |budget| try budget.checkpoint();
     return try alloc.dupe(u32, all_ids.items);
 }
 
@@ -3774,4 +3821,76 @@ test "term filter with synonym expansion" {
     try testing.expect(bm.contains(0)); // "fast" — direct match
     try testing.expect(bm.contains(1)); // "quick" — synonym expansion
     try testing.expect(!bm.contains(2)); // "slow" — not a synonym
+    const Budget = struct {
+        pub fn checkpoint(_: @This()) !void {}
+        pub fn waitForProgress(_: @This()) !void {
+            return error.TestUnexpectedResult;
+        }
+    };
+    var adapter = read_admission.Adapter(Budget){ .budget = .{} };
+    const payload = adapter.payload();
+    const controlled = try executeFilterWithAdmission(alloc, snap, filter, read_admission.Port.init(&payload));
+    defer alloc.free(controlled);
+    try testing.expectEqualSlices(u32, &.{ 0, 1 }, controlled);
+}
+
+test "controlled term filter checkpoints preserve exact results and retire partial scans" {
+    const alloc = testing.allocator;
+    const docs: [193]TestTermDocument = @splat(.{ .terms = &.{.{ .term = "alpha", .freq = 1, .norm = 10 }} });
+    const bytes = try buildTestSegmentWithTerms(alloc, &docs);
+    defer alloc.free(bytes);
+    var writer = try index_mod.IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(bytes);
+    try writer.addSegment(bytes);
+    _ = try writer.deleteById("17");
+    const snap = writer.snapshot();
+    const filter: Filter = .{ .term = .{ .field = "body", .term = "alpha" } };
+    const expected = try executeFilter(alloc, snap, filter);
+    defer alloc.free(expected);
+    const Budget = struct {
+        checks: usize = 0,
+        fail_at: ?usize = null,
+        cause: anyerror = error.Canceled,
+        pub fn checkpoint(self: *@This()) !void {
+            self.checks += 1;
+            if (self.fail_at == self.checks) return self.cause;
+        }
+        pub fn waitForProgress(_: *@This()) !void {
+            return error.TestUnexpectedResult;
+        }
+    };
+    var budget: Budget = .{};
+    var adapter = read_admission.Adapter(*Budget){ .budget = &budget };
+    const payload = adapter.payload();
+    const port = read_admission.Port.init(&payload);
+    const actual = try executeFilterWithAdmission(alloc, snap, filter, port);
+    defer alloc.free(actual);
+    try testing.expectEqualSlices(u32, expected, actual);
+    try testing.expect(expected.len < docs.len * 2);
+    try testing.expect(expected.len > docs.len);
+    const AllocationCase = struct {
+        fn run(a: Allocator, snapshot: *const index_mod.IndexSnapshot, f: Filter) !void {
+            var b: Budget = .{};
+            var control_adapter = read_admission.Adapter(*Budget){ .budget = &b };
+            const control_payload = control_adapter.payload();
+            const ids = try executeFilterWithAdmission(a, snapshot, f, read_admission.Port.init(&control_payload));
+            defer a.free(ids);
+            try testing.expect(ids.len > 193);
+        }
+    };
+    try testing.checkAllAllocationFailures(alloc, AllocationCase.run, .{ snap, filter });
+    const checks = budget.checks;
+    try testing.expect(checks > 12);
+    for ([_]anyerror{ error.Canceled, error.DeadlineExceeded, error.SchedulerClosed, error.Forbidden }) |cause| {
+        for (1..checks + 1) |fail_at| {
+            budget = .{ .fail_at = fail_at, .cause = cause };
+            try testing.expectError(cause, executeFilterWithAdmission(alloc, snap, filter, port));
+            try testing.expectEqual(fail_at, budget.checks);
+        }
+    }
+    budget = .{};
+    const retry = try executeFilterWithAdmission(alloc, snap, filter, port);
+    defer alloc.free(retry);
+    try testing.expectEqualSlices(u32, expected, retry);
 }

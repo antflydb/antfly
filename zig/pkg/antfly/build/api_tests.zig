@@ -2365,6 +2365,22 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-transaction-capture-budget-test", "Require original transaction routing controls and capture cleanup")
         .dependOn(&transaction_capture_run.step);
 
+    const text_filter_controls_root = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/text_filter_controls_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, text_filter_controls_root, true, true);
+    text_filter_controls_root.addImport("antfly_source_root", text_filter_controls_root);
+    const text_filter_controls_tests = b.addTest(.{
+        .name = "text-filter-controls-tests",
+        .root_module = text_filter_controls_root,
+        .filters = &.{ "controlled term filter checkpoints", "term filter with synonym expansion" },
+        .max_rss = 3 * 1024 * 1024 * 1024,
+    });
+    b.step("antfly-text-filter-controls-test", "Verify controlled postings scans preserve exact results and retire rejected partial scans")
+        .dependOn(&b.addRunArtifact(text_filter_controls_tests).step);
+
     const storage_read_admission_root = b.createModule(.{
         .root_source_file = b.path("pkg/antfly-embedded/src/storage_read_admission_test_root.zig"),
         .target = target,
