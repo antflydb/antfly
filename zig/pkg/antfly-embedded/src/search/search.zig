@@ -1680,6 +1680,42 @@ const FastTopK = struct {
     pending: [64]scorer_mod.ScoredHit = undefined,
     pending_count: usize = 0,
 
+    fn complete(producer: ?query_mod.DocNumProducer) ?*const roaring.RoaringBitmap {
+        const value = producer orelse return null;
+        const get = value.materialized orelse return null;
+        return get(value.ptr);
+    }
+    fn nextAllowed(self: *const FastTopK, gate: *BitmapGate, first: u32) u64 {
+        var target: u64 = first;
+        while (target < gate.end) {
+            target = gate.target(@intCast(target)) orelse return 4294967296;
+            if (complete(self.producers.include)) |bitmap| {
+                var iterator = bitmap.iterator();
+                const included = iterator.seekTo(@intCast(target)) orelse return 4294967296;
+                if (included > target) {
+                    target = included;
+                    continue;
+                }
+            }
+            if (self.exclude_doc_bitmap) |bitmap| {
+                const next = bitmap.nextAbsent(@intCast(target));
+                if (next > target) {
+                    target = next;
+                    continue;
+                }
+            }
+            if (complete(self.producers.exclude)) |bitmap| {
+                const next = bitmap.nextAbsent(@intCast(target));
+                if (next > target) {
+                    target = next;
+                    continue;
+                }
+            }
+            return target;
+        }
+        return 4294967296;
+    }
+
     fn beginSegment(self: *FastTopK, offset: u32, count: u32) !void {
         try self.flushPending();
         self.segment_offset = offset;
@@ -1978,7 +2014,7 @@ const BitmapGate = struct {
     }
     fn target(self: *BitmapGate, current: u32) ?u32 {
         if (self.iterator == null) return current;
-        while (self.next != null and self.next.? < current) self.next = self.iterator.?.next();
+        if (self.next != null and self.next.? < current) self.next = self.iterator.?.seekTo(current);
         const value = self.next orelse return null;
         return if (value < self.end) value else null;
     }
@@ -2005,7 +2041,9 @@ fn collectFastShouldSegment(
             if (min_doc == null or doc_id < min_doc.?) min_doc = doc_id;
         }
         const doc_id = min_doc orelse break;
-        const admitted = gate.target(doc_offset + doc_id) orelse break;
+        const admitted64 = collector.nextAllowed(&gate, doc_offset + doc_id);
+        if (admitted64 >= gate.end) break;
+        const admitted: u32 = @intCast(admitted64);
         if (admitted > doc_offset + doc_id) {
             for (should_states) |*state| if (!state.exhausted) {
                 try state.advanceTo(admitted - doc_offset);
@@ -2267,7 +2305,9 @@ fn collectFastMustSegment(
 
     var gate = BitmapGate.init(collector.filter_doc_bitmap, doc_offset, seg.reader.doc_count);
     while (!must_states[lead_idx].exhausted) {
-        const admitted = gate.target(doc_offset + must_states[lead_idx].current.?.doc_id) orelse return;
+        const admitted64 = collector.nextAllowed(&gate, doc_offset + must_states[lead_idx].current.?.doc_id);
+        if (admitted64 >= gate.end) return;
+        const admitted: u32 = @intCast(admitted64);
         if (admitted > doc_offset + must_states[lead_idx].current.?.doc_id) {
             try must_states[lead_idx].advanceTo(admitted - doc_offset);
             if (must_states[lead_idx].exhausted) return;
@@ -2354,15 +2394,7 @@ fn collectFilteredWandSegment(alloc: Allocator, snap: *const index_mod.IndexSnap
         offset: u32,
         gate: BitmapGate,
         pub fn nextCandidate(self: *@This(), first: u32) u64 {
-            var target: u64 = first;
-            while (target < self.gate.end) {
-                target = self.gate.target(@intCast(target)) orelse return @as(u64, std.math.maxInt(u32)) + 1;
-                const excluded = self.base.exclude_doc_bitmap orelse return target;
-                const next = excluded.nextAbsent(@intCast(target));
-                if (next == target) return target;
-                target = next;
-            }
-            return @as(u64, std.math.maxInt(u32)) + 1;
+            return self.base.nextAllowed(&self.gate, first);
         }
         pub fn topKLimit(self: *@This()) u32 {
             return self.base.k;
@@ -2456,9 +2488,9 @@ fn executeSimpleTextBoolWithProducers(
     if (bq.pure_should_optional and must_terms.items.len == 0) return null;
 
     // A pure, minimum-one disjunction is exactly the query shape handled by
-    // the production Block-Max WAND scorer. Keep constrained, prohibited,
-    // minimum-N, and per-term-boosted shapes on the boolean iterator path
-    // until their scorer semantics are represented directly in WAND.
+    // the production Block-Max WAND scorer. Unconstrained requests use the
+    // snapshot helper; constrained requests use its shared segment scorer below.
+    // Prohibited, minimum-N, and per-term-boosted shapes retain boolean iterators.
     if (must_terms.items.len == 0 and
         must_not_terms.items.len == 0 and
         effective_min_should == 1 and
@@ -6182,4 +6214,33 @@ test "external lake producer top k prunes common text without a complete members
             try std.testing.expectEqual(@as(u32, 8192), try countMatches(a, writer.snapshot(), query));
         }
     }
+    // Once adaptive probing switches to complete membership, the same scorer
+    // must seek to the sparse materialized answer instead of scanning onward.
+    var point = roaring.RoaringBitmap.init(a);
+    defer point.deinit();
+    try point.add(7001);
+    try point.prepareRead();
+    const Materialized = struct {
+        bitmap: *const roaring.RoaringBitmap,
+        ready: bool = false,
+        probed: usize = 0,
+        fn complete(raw: *anyopaque) ?*const roaring.RoaringBitmap {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return if (self.ready) self.bitmap else null;
+        }
+        fn produce(raw: *anyopaque, alloc: Allocator, offset: u32, count: u32, candidates: ?*const roaring.RoaringBitmap) !roaring.RoaringBitmap {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.probed += (candidates orelse return error.ExpectedBoundedCandidates).cardinality();
+            self.ready = true;
+            return self.bitmap.sliceRebased(alloc, offset, @as(u64, offset) + count);
+        }
+    };
+    var materialized: Materialized = .{ .bitmap = &point };
+    const adaptive: SearchQuery = .{ .doc_num = .{ .ids = &.{}, .boost = 0, .producer = .{ .ptr = &materialized, .produce = Materialized.produce, .materialized = Materialized.complete } } };
+    var sparse_answer = try execute(a, writer.snapshot(), .{ .query = .{ .bool_query = .{ .must = &.{ term, adaptive } } }, .k = 3, .include_stored = false });
+    defer sparse_answer.deinit();
+    try std.testing.expectEqual(@as(usize, 1), sparse_answer.hits.len);
+    try std.testing.expectEqual(@as(u32, 7001), sparse_answer.hits[0].doc_id);
+    try std.testing.expectEqual(TotalHitsRelation.exact, sparse_answer.total_hits_relation);
+    try std.testing.expect(materialized.probed <= 65);
 }

@@ -1266,3 +1266,57 @@ test "block-max scorer proves sparse matches complete below top-k" {
         try std.testing.expectEqual(if (k == 4) TotalHitsRelation.exact else .gte, boundary.total_relation);
     }
 }
+
+test "WAND membership seeks preserve selective single multi and unbounded scoring" {
+    const a = std.testing.allocator;
+    var builder = inverted.InvertedIndexBuilder.init(a, .{ .chunk_size = 128 });
+    defer builder.deinit();
+    for (0..8192) |i| try builder.addDocument(@intCast(i), &.{
+        .{ .term = "first", .freq = 1, .norm = 10 },
+        .{ .term = "second", .freq = 2, .norm = 10 },
+    });
+    const bytes = try builder.build();
+    defer a.free(bytes);
+    var reader = try inverted.InvertedIndexReader.init(a, bytes);
+    const Collector = struct {
+        base: TopKCollector,
+        calls: usize = 0,
+        pub fn nextCandidate(self: *@This(), first: u32) u64 {
+            self.calls += 1;
+            return if (first <= 7001) 7001 else 4294967296;
+        }
+        pub fn topKLimit(self: *@This()) u32 {
+            return self.base.topKLimit();
+        }
+        pub fn minCompetitiveScore(self: *@This()) f32 {
+            return self.base.minCompetitiveScore();
+        }
+        pub fn worstCompetitiveDocId(self: *@This()) ?u32 {
+            return self.base.worstCompetitiveDocId();
+        }
+        pub fn markLowerBound(self: *@This()) void {
+            self.base.markLowerBound();
+        }
+        pub fn collect(self: *@This(), hit: ScoredHit) !void {
+            if (hit.doc_id != 7001) return error.UnexpectedRejectedScore;
+            try self.base.collect(hit);
+        }
+    };
+    for ([_]usize{ 1, 2 }) |count| for ([_]bool{ false, true }) |bounded| {
+        var scorer = WANDScorer.init(a, 1, 8192, reader.avgDocLen(), .{});
+        defer scorer.deinit();
+        for (([_][]const u8{ "first", "second" })[0..count]) |term| {
+            const lookup = reader.lookup(term) orelse return error.TestUnexpectedResult;
+            try scorer.addTerm(try lookup.iterator(a), lookup.docFreq(), if (bounded) switch (lookup) {
+                .postings => |p| p.block_max,
+                .one_hit => null,
+            } else null, 128, 0);
+        }
+        var collector: Collector = .{ .base = .init(a, 1) };
+        defer collector.base.deinit();
+        try scorer.executeInto(&collector);
+        try std.testing.expectEqual(@as(u32, 1), collector.base.total_count);
+        try std.testing.expectEqual(@as(u32, 7001), collector.base.hits.items[0].doc_id);
+        try std.testing.expect(collector.calls <= 4);
+    };
+}

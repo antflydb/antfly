@@ -560,8 +560,11 @@ scores directly into one bounded top-K collector. Deferred metadata membership
 receives at most 64 live candidates from one native segment per batch. Include
 and exclusion producers share that candidate batch and retain their existing
 request-owned adaptive reverse-index probes and full-membership fallback.
-A pending batch can only delay the competitive cutoff, so block pruning remains
-conservative. Segment transitions flush before changing ordinal offsets.
+When adaptive probing materializes complete membership, a borrowed complete-set
+hook immediately enables ordinal seeks in the same scoring pass. Candidate-local
+answers never enter that hook. A pending batch can only delay the competitive
+cutoff, so block pruning remains conservative. Segment transitions flush before
+changing ordinal offsets.
 
 Filtered minimum-one disjunctions use the native Block-Max WAND scorer with the
 same corpus document frequencies, field lengths, BM25 configuration and bound
