@@ -32463,7 +32463,12 @@ test "statistics primary hydration adapter preserves controls and retires reject
             defer freeOptionalOwnedBytes(a, rows);
             try std.testing.expectEqualStrings("stored alpha", rows[0].?);
             fixture.cancel_on_return = true;
-            try std.testing.expectError(error.Cancelled, executor.loadManyStored(a, &.{"doc:a"}));
+            const rejected = executor.loadManyStored(a, &.{"doc:a"}) catch |err| switch (err) {
+                error.Cancelled => return,
+                else => return err,
+            };
+            freeOptionalOwnedBytes(a, rejected);
+            return error.TestUnexpectedResult;
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
