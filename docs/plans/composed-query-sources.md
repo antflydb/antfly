@@ -42,8 +42,37 @@ that cut. Native durable reader leases and source snapshot pins protect archive
 artifacts; copied WAL images allow independent WAL retirement. Access, row-policy,
 schema/index recipe and source/table incarnation are rechecked on every page.
 Drop/recreate or policy changes return a conflict. Mutable native-table leaves
-without retained remote snapshots cannot issue a production composed cursor.
+retain an immutable physical generation with a server-written `native2:`
+capability. Ordered native table queries return the same capability in
+`remote_snapshot`; clients echo it with the hit's `_sort` tuple as `search_after`
+or `search_before`. A bare cursor tuple cannot select a new live generation.
 These are independent per-table cuts, not an atomic cross-table transaction.
+
+Native owners drain accepted derivations to one sequence, then seal primary and
+text/dense/sparse/graph projection manifests together. Immutable LSM runs and
+source-vector blocks/sealed extents are hardlinked; only committed generated and
+active source-vector WAL prefixes are copied, with a shared 16 MiB budget.
+Both `primary_lsm` and `vector_store` source embedding ownership participate.
+No result set or corpus-sized document copy is retained. Filtering, preflight,
+term statistics and algebraic partials open that same readonly generation, so
+ranking and totals do not drift between pages. The descriptor fences incarnation,
+schema/index recipes and artifact-store identity; each physical manifest also
+fences table/shard/range identity. A missing owner generation, incompatible storage
+backend, active vector migration or incomplete projection fails explicitly;
+resume never falls back to live data.
+
+Capabilities expire after 60 seconds, including across daemon restart, and pages
+do not renew them. Owners admit at most 64 cuts. Per-cut shared file leases
+protect active readers from expiry collection; subsequent captures reclaim
+expired cuts and interrupted staging under a separate parent guard. Native
+capability artifacts use their own bounded expiry collection domain. This first
+physical adapter requires filesystem-managed LSM roots and immutable native
+projection checkpoints. Retained cut directories belong to their physical owner;
+loss/relocation of that directory invalidates the cursor until a future provider
+can transfer the complete retained generation. Query capture briefly closes
+write admission while derivations converge and manifests are sealed; deadlines,
+cancellation and WAL-budget failures bound this work. The retained files never
+hold an apply lock across cursor pages.
 
 Overlay keys are flat integer, string or boolean fields; numeric/timestamp key
 normalization is not enabled yet. The changes input must retain one unique latest
@@ -79,9 +108,26 @@ All declared vector recipes must finish for the requested cut; incomplete or fai
 enrichment returns readiness rather than stale hits. The background worker runs
 recent enrichment before WAL-to-Parquet draining, so blocked Parquet publication
 does not block completed recent vectors. Materialized dense/sparse vectors and
-managed text-field embedding providers share the archive builder's row-to-vector
-semantics. Multimodal inputs and document template/chunking pipelines are outside
-this flat lake-row implementation.
+managed embedding providers share the archive builder's row-to-vector semantics.
+Templates render against the complete typed row through native template helpers,
+including secret-aware remote content and binary media. URLs are resolved before
+memoization, so cached vectors describe captured bytes. Native text/media chunking
+creates independently indexed vectors rather than pooling a document's chunks.
+Input/output bytes, media parts and unit counts are bounded and share the request
+cancellation/deadline controls. Sparse recipes support text chunks and reject
+media explicitly; dense media support depends on the configured provider.
+
+Chunk membership and original source units are durable records in the same
+native vector checkpoint. They retain offsets, time/frame coordinates and source
+fingerprints. Private vector identities extend the parent row identity with an
+ordinal; public IDs use Antfly's canonical artifact key encoding and index-specific
+`<index>_chunks` / `<index>_sources` names, preventing collisions between recipes.
+Parent, member and unit result shaping uses the native hierarchy pipeline and its
+bounded grouping/candidate expansion. Overlay visibility is evaluated on each
+chunk's parent before vector selection, so an edit/delete suppresses every old
+archive chunk. Incremental publication retires all replaced chunk/source records
+and rebuilds the changed input's complete membership. Archive and accepted-WAL
+builders use the same producer, binary-safe memo identity and durable payloads.
 
 Durable, ETag-fenced jobs bind table incarnation, archive generation, WAL cut and
 index recipe. Completed per-input embeddings are memoized for seven days and

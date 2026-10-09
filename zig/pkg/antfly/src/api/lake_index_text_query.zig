@@ -257,6 +257,7 @@ const Execution = struct {
     vector_filter: ?std.json.Value = null,
     vector_exclusion: ?std.json.Value = null,
     active_recent: bool = false,
+    unit_runtime: ?*@import("lake_index_native_runtime_cache.zig").Entry = null,
     recent_declarations: []const local.serverless_segment_sidecar_manifest.DeclaredArtifact = &.{},
     recent_dense_entries: std.StringHashMapUnmanaged(*local.storage_db_catalog_index_manager.IndexManager.DenseIndex) = .empty,
     recent_sparse_entries: std.StringHashMapUnmanaged(*local.storage_db_catalog_index_manager.IndexManager.SparseIndex) = .empty,
@@ -286,7 +287,8 @@ const Execution = struct {
         }
         return result;
     }
-    fn allowsVectorKey(raw: *anyopaque, key: []const u8) !bool {
+    fn allowsVectorKey(raw: *anyopaque, member_key: []const u8) !bool {
+        const key = try @import("lake_enrichment_units.zig").parent(member_key);
         const self: *Execution = @ptrCast(@alignCast(raw));
         try self.context.ensureActive();
         if (self.overlay) |pending_overlay| if (pending_overlay.row(key)) |row| {
@@ -317,24 +319,48 @@ const Execution = struct {
         self.context.ensureActive() catch return true;
         return false;
     }
-    fn publicKey(raw: ?*anyopaque, a: A, key: []const u8) ![]u8 {
+    fn publicKey(raw: ?*anyopaque, a: A, member_key: []const u8) ![]u8 {
+        const units = @import("lake_enrichment_units.zig");
+        const key = try units.parent(member_key);
         const self = from(raw);
+        if (key.len != member_key.len) {
+            const public_parent = try publicKey(raw, a, key);
+            defer a.free(public_parent);
+            const runtime = self.unit_runtime orelse return error.InvalidChunkArtifact;
+            const entry_name = if (runtime.dense_entry) |entry| entry.config.name else runtime.sparse_entry.?.config.name;
+            const name = try std.fmt.allocPrint(a, "{s}_chunks", .{entry_name});
+            defer a.free(name);
+            return local.storage_internal_keys.chunkArtifactKeyAlloc(a, public_parent, name, try std.fmt.parseUnsigned(u32, member_key[key.len + units.marker.len ..], 16));
+        }
         if (self.overlay) |overlay| if (overlay.row(key) != null) return a.dupe(u8, key);
         const position = try @import("lake_index_native_state.zig").coordinates(key);
         if (std.mem.startsWith(u8, key, "lake1:")) {
             if (!self.files.contains(key[6..70])) return error.ExternalLakeSnapshotMismatch;
-            return a.dupe(u8, key);
+            return units.rebind(a, member_key, key);
         }
         const file = self.private_files.get(key[6..70]) orelse return error.ExternalLakeSnapshotMismatch;
-        return local.storage_rowsource_identity.allocId(a, .{ .external = .{ .source_id = self.source.inventory.source_id, .snapshot_id = self.source.inventory.snapshot_id, .file_id = file, .row_group_ordinal = position.group, .row_ordinal = position.row } });
+        const parent_key = try local.storage_rowsource_identity.allocId(a, .{ .external = .{ .source_id = self.source.inventory.source_id, .snapshot_id = self.source.inventory.snapshot_id, .file_id = file, .row_group_ordinal = position.group, .row_ordinal = position.row } });
+        defer a.free(parent_key);
+        return units.rebind(a, member_key, parent_key);
     }
-    fn nativeKey(raw: ?*anyopaque, a: A, key: []const u8) ![]u8 {
+    fn nativeKey(raw: ?*anyopaque, a: A, member_key: []const u8) ![]u8 {
+        const units = @import("lake_enrichment_units.zig");
+        if (local.storage_internal_keys.isChunkArtifactRecordKey(member_key)) {
+            var ref = (try local.storage_db_artifact_ids.decodeArtifactRefAlloc(a, member_key)) orelse return error.InvalidChunkArtifact;
+            defer ref.deinit(a);
+            const base = try nativeKey(raw, a, ref.document_id);
+            defer a.free(base);
+            return @constCast(try units.identity(a, base, .{ .ordinal = ref.chunk_id orelse return error.InvalidChunkArtifact, .chunked = true }));
+        }
+        const key = try units.parent(member_key);
         const self = from(raw);
-        if (!std.mem.startsWith(u8, key, "lake1:")) return a.dupe(u8, key);
+        if (!std.mem.startsWith(u8, key, "lake1:")) return a.dupe(u8, member_key);
         const position = try @import("lake_index_native_state.zig").coordinates(key);
         const file = self.files.get(key[6..70]) orelse return a.dupe(u8, key);
         const digest = self.private_digests.get(file) orelse return error.ExternalLakeSnapshotMismatch;
-        return std.fmt.allocPrint(a, "lake2:{s}:{x:0>8}:{x:0>16}", .{ digest, position.group, position.row });
+        const parent_key = try std.fmt.allocPrint(a, "lake2:{s}:{x:0>8}:{x:0>16}", .{ digest, position.group, position.row });
+        defer a.free(parent_key);
+        return units.rebind(a, member_key, parent_key);
     }
     fn densePublicKey(raw: ?*anyopaque, a: A, _: *local.storage_db_catalog_index_manager.IndexManager.DenseIndex, key: []const u8) ![]u8 {
         return publicKey(raw, a, key);
@@ -619,13 +645,20 @@ const Execution = struct {
         const selected = for (declarations) |declaration| {
             if (declaration.artifact.kind == .vector_segment and declaration.artifact.metadata_version == native.metadata_version and (if (name) |explicit| std.mem.eql(u8, explicit, declaration.name) else count == 1)) break declaration;
         } else return error.IndexNotFound;
-        if (entries.get(selected.name)) |entry| return entry;
+        if (entries.get(selected.name)) |entry| {
+            for (self.runtimes.items) |runtime| if (runtime.dense_entry == entry) {
+                self.unit_runtime = runtime;
+                break;
+            };
+            return entry;
+        }
         try self.runtimes.ensureUnusedCapacity(self.arena, 1);
         const runtime = try self.server.lake_native_runtimes.acquire(self.server, selected, try @import("lake_recent_vectors.zig").runtimeDomain(selected), self.store.identity, self.context);
         errdefer runtime.release();
         const entry = runtime.dense_entry.?;
         try entries.put(self.arena, selected.name, entry);
         self.runtimes.appendAssumeCapacity(runtime);
+        self.unit_runtime = runtime;
         return entry;
     }
     fn lookupDocKey(raw: ?*anyopaque, name: []const u8, id: u64) !?[]u8 {
@@ -681,20 +714,51 @@ const Execution = struct {
         const selected = for (declarations) |declaration| {
             if (declaration.artifact.kind == .sparse_segment and declaration.artifact.metadata_version == native.metadata_version and (if (name) |explicit| std.mem.eql(u8, explicit, declaration.name) else count == 1)) break declaration;
         } else return error.IndexNotFound;
-        if (entries.get(selected.name)) |entry| return entry;
+        if (entries.get(selected.name)) |entry| {
+            for (self.runtimes.items) |runtime| if (runtime.sparse_entry == entry) {
+                self.unit_runtime = runtime;
+                break;
+            };
+            return entry;
+        }
         try self.runtimes.ensureUnusedCapacity(self.arena, 1);
         const runtime = try self.server.lake_native_runtimes.acquire(self.server, selected, try @import("lake_recent_vectors.zig").runtimeDomain(selected), self.store.identity, self.context);
         errdefer runtime.release();
         const entry = runtime.sparse_entry.?;
         try entries.put(self.arena, selected.name, entry);
         self.runtimes.appendAssumeCapacity(runtime);
+        self.unit_runtime = runtime;
         return entry;
     }
     fn requireProjected(raw: ?*anyopaque, a: A, req: types.SearchRequest, key: []const u8) ![]u8 {
         return (try loadProjectedOne(raw, a, req, key)) orelse error.StoredDocMissing;
     }
-    fn postprocessVector(raw: ?*anyopaque, a: A, req: types.SearchRequest, result: types.SearchResult, _: bool) !types.SearchResult {
-        return shape.postprocessVectorSearchResult(a, req, result, false, .{ .ctx = raw, .is_visible = visible, .resolve_parent_id = parent, .load_parent_stored = parentStored, .load_stored = loadOne, .load_many_stored = loadMany, .load_projected_stored = loadProjectedOne, .load_many_projected_stored = loadProjected });
+    fn postprocessVector(raw: ?*anyopaque, a: A, req: types.SearchRequest, result: types.SearchResult, known_chunk_backed: bool) !types.SearchResult {
+        var owned = result;
+        var transferred = false;
+        errdefer if (!transferred) owned.deinit();
+        var chunk_backed = known_chunk_backed;
+        for (owned.hits) |*hit| {
+            if (!local.storage_internal_keys.isChunkArtifactRecordKey(hit.id)) continue;
+            chunk_backed = true;
+            var ref = (try local.storage_db_artifact_ids.decodeArtifactRefAlloc(a, hit.id)) orelse return error.InvalidChunkArtifact;
+            errdefer ref.deinit(a);
+            const payload = try from(raw).unitPayload(a, hit.id);
+            defer a.free(payload);
+            var metadata = try std.json.parseFromSlice(std.json.Value, a, payload, .{});
+            defer metadata.deinit();
+            const unit_id = metadata.value.object.get("_parent_unit_id").?.string;
+            // Native chunk refs carry a unit_id directly. A source ref is
+            // reserved for embeddings and would make the chunk ref invalid.
+            if (ref.unit_id) |previous| a.free(previous);
+            ref.unit_id = null;
+            ref.unit_id = try a.dupe(u8, unit_id);
+            if (hit.artifact_ref) |*previous| previous.deinit(a);
+            hit.artifact_ref = ref;
+        }
+        // The shape function takes ownership, including its error paths.
+        transferred = true;
+        return shape.postprocessVectorSearchResult(a, req, owned, chunk_backed, .{ .ctx = raw, .is_visible = visible, .resolve_parent_id = parent, .load_parent_stored = parentStored, .load_stored = loadOne, .load_many_stored = loadMany, .load_projected_stored = loadProjectedOne, .load_many_projected_stored = loadProjected });
     }
     fn searchSparse(raw: ?*anyopaque, a: A, req: types.SearchRequest, query: types.SparseKnnQuery) !types.SearchResult {
         const self = from(raw);
@@ -726,6 +790,67 @@ const Execution = struct {
         return values[0];
     }
     fn attachGraph(_: ?*anyopaque, _: A, _: types.SearchRequest, _: *types.SearchResult, _: []const local.storage_db_query_graph_exec.NamedResultSet) !void {}
+    fn unitPayload(self: *Execution, a: A, key: []const u8) ![]u8 {
+        try self.context.ensureActive();
+        const unit_key = local.storage_internal_keys.isDocumentUnitArtifactRecordKey(key);
+        const chunk_key = local.storage_internal_keys.isChunkArtifactRecordKey(key);
+        var artifact_ref = if (unit_key or chunk_key) (try local.storage_db_artifact_ids.decodeArtifactRefAlloc(a, key)) orelse return error.InvalidChunkArtifact else null;
+        defer if (artifact_ref) |*ref| ref.deinit(a);
+        const public_parent = if (artifact_ref) |ref| ref.document_id else try @import("lake_enrichment_units.zig").parent(key);
+        var runtime = self.unit_runtime orelse return error.InvalidChunkArtifact;
+        if (artifact_ref) |ref| {
+            const suffix = if (unit_key) "_sources" else "_chunks";
+            if (!std.mem.endsWith(u8, ref.name, suffix)) return error.InvalidChunkArtifact;
+            const index_name = ref.name[0 .. ref.name.len - suffix.len];
+            const recent = if (self.overlay) |overlay| overlay.row(public_parent) != null else false;
+            runtime = for (self.runtimes.items) |candidate| {
+                if (candidate.dense_entry) |entry| {
+                    if (std.mem.eql(u8, index_name, entry.config.name) and ((self.recent_dense_entries.get(index_name) == entry) == recent)) break candidate;
+                } else if (candidate.sparse_entry) |entry| {
+                    if (std.mem.eql(u8, index_name, entry.config.name) and ((self.recent_sparse_entries.get(index_name) == entry) == recent)) break candidate;
+                }
+            } else return error.InvalidChunkArtifact;
+        }
+        const entry_name = if (runtime.dense_entry) |entry| entry.config.name else runtime.sparse_entry.?.config.name;
+        const source_name = try std.fmt.allocPrint(a, "{s}_sources", .{entry_name});
+        defer a.free(source_name);
+        const native = if (unit_key) source_key: {
+            const ref = artifact_ref.?;
+            const base = try nativeKey(self, a, ref.document_id);
+            defer a.free(base);
+            break :source_key try @import("lake_enrichment_units.zig").sourceKey(a, base, try std.fmt.parseUnsigned(u32, ref.unit_id orelse return error.InvalidChunkArtifact, 10));
+        } else try nativeKey(self, a, key);
+        defer a.free(native);
+        const bytes = if (runtime.vectors) |vectors| dense_payload: {
+            var txn = try vectors.beginRead();
+            defer txn.abort();
+            break :dense_payload try a.dupe(u8, try txn.get(.{ .name = "lake_units" }, native));
+        } else sparse_payload: {
+            var txn = try runtime.sparse_entry.?.index.beginReadTxn();
+            defer txn.abort();
+            const record_key = try std.fmt.allocPrint(a, "lake-unit:{s}", .{native});
+            defer a.free(record_key);
+            break :sparse_payload try a.dupe(u8, try txn.get(record_key));
+        };
+        defer a.free(bytes);
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const pa = arena.allocator();
+        var value = try std.json.parseFromSliceLeaky(std.json.Value, pa, bytes, .{});
+        try value.object.put(pa, "_parent_doc_key", .{ .string = public_parent });
+        if (!unit_key) {
+            const unit_id = value.object.get("_parent_unit_id").?.string;
+            try value.object.put(pa, "_parent_unit_key", .{ .string = try local.storage_internal_keys.documentUnitArtifactKeyAlloc(pa, public_parent, source_name, unit_id) });
+        }
+        const field_name = if (runtime.dense_entry) |entry| entry.field_name else runtime.sparse_entry.?.field_name;
+        if (value.object.get("text")) |text| if (text == .string) try value.object.put(pa, field_name, text);
+        try value.object.put(pa, "_source_field", .{ .string = field_name });
+        if (artifact_ref) |ref| try value.object.put(pa, "_artifact_name", .{ .string = ref.name });
+        try value.object.put(pa, "_source_artifact_name", .{ .string = source_name });
+        try value.object.put(pa, "_id", .{ .string = key });
+        try value.object.put(pa, "_type", .{ .string = if (unit_key) "unit" else "chunk" });
+        return std.json.Stringify.valueAlloc(a, value, .{});
+    }
     fn loadOne(raw: ?*anyopaque, a: A, key: []const u8) !?[]u8 {
         const result = try loadMany(raw, a, &.{key});
         defer a.free(result);
@@ -749,6 +874,29 @@ const Execution = struct {
             a.free(result);
         }
         if (keys.len == 0) return result;
+        var members = false;
+        for (keys) |key| if ((try @import("lake_enrichment_units.zig").parent(key)).len != key.len or local.storage_internal_keys.isDocumentUnitArtifactRecordKey(key) or local.storage_internal_keys.isChunkArtifactRecordKey(key)) {
+            members = true;
+            break;
+        };
+        if (members) {
+            for (keys, 0..) |key, position| {
+                const base = try @import("lake_enrichment_units.zig").parent(key);
+                if (base.len == key.len and !local.storage_internal_keys.isDocumentUnitArtifactRecordKey(key) and !local.storage_internal_keys.isChunkArtifactRecordKey(key)) {
+                    const values = try loadSelected(T, raw, a, &.{key}, selected_fields);
+                    result[position] = values[0];
+                    a.free(values);
+                } else {
+                    if (T == types.ColumnSource) return error.UnsupportedSqlExecution;
+                    const bytes = try self.unitPayload(a, key);
+                    if (T == std.json.Value) {
+                        result[position] = try std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{ .allocate = .alloc_always });
+                        a.free(bytes);
+                    } else result[position] = bytes;
+                }
+            }
+            return result;
+        }
         if (self.overlay) |overlay| {
             var archive: std.ArrayList([]const u8) = .empty;
             defer archive.deinit(a);
@@ -919,7 +1067,12 @@ const Execution = struct {
         return true;
     }
     fn parent(_: ?*anyopaque, a: A, hit: types.SearchHit) ![]u8 {
-        return a.dupe(u8, hit.id);
+        if (try local.storage_db_artifact_ids.decodeArtifactRefAlloc(a, hit.id)) |decoded| {
+            var ref = decoded;
+            defer ref.deinit(a);
+            return a.dupe(u8, ref.document_id);
+        }
+        return a.dupe(u8, try @import("lake_enrichment_units.zig").parent(hit.id));
     }
     fn parentStored(raw: ?*anyopaque, a: A, _: types.SearchRequest, key: []const u8) !?[]u8 {
         return loadOne(raw, a, key);

@@ -192,6 +192,22 @@ class RestAuthority(BaseHTTPRequestHandler):
     @atomic_authority_operation
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        if self.path == "/embedding/v1/embeddings":
+            inputs = body["input"]
+            if isinstance(inputs, str):
+                inputs = [inputs]
+            return self.respond(
+                200,
+                {
+                    "object": "list",
+                    "data": [
+                        {"object": "embedding", "index": index, "embedding": [1.0, 0.0]}
+                        for index, _ in enumerate(inputs)
+                    ],
+                    "model": "fixture",
+                    "usage": {"prompt_tokens": 0, "total_tokens": 0},
+                },
+            )
         try:
             if "schema" in body:
                 if self.server.metadata is not None:
@@ -341,6 +357,13 @@ def test_native_catalog_file_commit_read_and_restart(tmp_path, mode, native_rows
     state = State(tmp_path / "ingestion.aflite")
 
     def call(method, path, body=None):
+        if (
+            native_rows == "overlay"
+            and body is not None
+            and "full_text_search" in body
+            and "indexes" not in body
+        ):
+            body = dict(body, indexes=["body_text"])
         request = Request(
             endpoint + path,
             None if body is None else json.dumps(body).encode(),
@@ -354,6 +377,10 @@ def test_native_catalog_file_commit_read_and_restart(tmp_path, mode, native_rows
             payload = error.read()
             error.read = io.BytesIO(payload).read
             error.add_note(payload.decode("utf-8", errors="replace"))
+            error.add_note(f"{method} {path} {body}")
+            raise
+        except Exception as error:
+            error.add_note(f"{method} {path} {body}")
             raise
 
     def start():
@@ -452,6 +479,30 @@ def test_native_catalog_file_commit_read_and_restart(tmp_path, mode, native_rows
                         "body_text": {"type": "full_text"},
                         **(
                             {
+                                **{
+                                    name: {
+                                        "type": "embeddings",
+                                        "field": "body",
+                                        "dimension": 2,
+                                        "embedder": {
+                                            "provider": "openai",
+                                            "model": "fixture",
+                                            "url": origin + "/embedding/v1",
+                                            "api_key": "fixture",
+                                        },
+                                        "chunker": {
+                                            "provider": "mock",
+                                            "text": {
+                                                "target_tokens": 1,
+                                                "overlap_tokens": 0,
+                                            },
+                                        },
+                                    }
+                                    for name in (
+                                        "managed_chunks",
+                                        "managed_chunks_second",
+                                    )
+                                },
                                 "dense_native": {
                                     "type": "embeddings",
                                     "external": True,
@@ -582,6 +633,55 @@ def test_native_catalog_file_commit_read_and_restart(tmp_path, mode, native_rows
                 if time.monotonic() >= deadline:
                     pytest.fail(json.dumps(found))
                 time.sleep(0.1)
+            call(
+                "POST",
+                "/tables/hn_live_native",
+                {
+                    "schema": {
+                        "default_type": "row",
+                        "document_schemas": {
+                            "row": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "amount": {
+                                            "type": "integer",
+                                            "x-antfly-field": {
+                                                "type": "numeric",
+                                                "sortable": True,
+                                            },
+                                        },
+                                        "body": {"type": "string"},
+                                    },
+                                }
+                            }
+                        },
+                    },
+                    "indexes": {"body_text": {"type": "full_text"}},
+                },
+            )
+            call(
+                "POST",
+                "/tables/hn_live_native/batch",
+                {
+                    "inserts": {
+                        "recent": {"amount": 100, "body": "original native current"}
+                    },
+                    "sync_level": "full_index",
+                },
+            )
+            mixed_query = {
+                "source": {"union": [{"table": "hn"}, {"table": "hn_live_native"}]},
+                "full_text_search": {"match": "original", "field": "body"},
+                "order_by": [{"field": "amount"}],
+                "fields": ["amount"],
+                "limit": 1,
+            }
+            mixed_first = call("POST", "/query", mixed_query)["responses"][0]
+            assert mixed_first["hits"]["hits"][0]["_source"]["amount"] == 1, mixed_first
+            mixed_next = dict(
+                mixed_query, limit=10, source_cursor=mixed_first["next_source_cursor"]
+            )
             current_uri = warehouse + "/current"
             call(
                 "POST",
@@ -770,6 +870,17 @@ def test_native_catalog_file_commit_read_and_restart(tmp_path, mode, native_rows
             assert accepted["table_id"] > 0
             assert accepted["object_generation"] >= 0
             assert call("POST", "/tables/hn/lake/changes", batch) == accepted
+            if native_rows == "overlay":
+                call(
+                    "POST",
+                    "/tables/hn_live_native/batch",
+                    {
+                        "inserts": {
+                            "recent": {"amount": 200, "body": "changed native current"}
+                        },
+                        "sync_level": "full_index",
+                    },
+                )
             # A caller restart immediately after acceptance must not strand WAL.
             stop()
             start()
@@ -825,6 +936,68 @@ def test_native_catalog_file_commit_read_and_restart(tmp_path, mode, native_rows
                     assert (
                         deleted.get("responses", [deleted])[0]["hits"]["hits"] == []
                     ), deleted
+                chunk_requests = []
+                for name in ("managed_chunks", "managed_chunks_second"):
+                    chunk_query = {
+                        "embeddings": {name: [1, 0]},
+                        "indexes": [name],
+                        "limit": 10,
+                    }
+                    chunk_requests.append(chunk_query)
+                    parents = call(
+                        "POST", "/tables/hn/query", dict(chunk_query, fields=["amount"])
+                    )["responses"][0]
+                    assert sorted(
+                        hit["_source"]["amount"] for hit in parents["hits"]["hits"]
+                    ) == [1, 3], parents
+                    filtered_chunks = call(
+                        "POST",
+                        "/tables/hn/query",
+                        dict(
+                            chunk_query,
+                            fields=["amount"],
+                            filter_query={"term": {"path": "/amount", "value": 3}},
+                        ),
+                    )["responses"][0]
+                    assert [
+                        hit["_source"]["amount"]
+                        for hit in filtered_chunks["hits"]["hits"]
+                    ] == [3], filtered_chunks
+                    members = call(
+                        "POST",
+                        "/tables/hn/query",
+                        dict(chunk_query, hierarchy={}, fields=["text"]),
+                    )["responses"][0]
+                    assert len(members["hits"]["hits"]) >= 3, members
+                    assert all(
+                        hit["_source"]["text"] for hit in members["hits"]["hits"]
+                    ), members
+                    units = call(
+                        "POST",
+                        "/tables/hn/query",
+                        dict(
+                            chunk_query,
+                            hierarchy={"group_by": {"level": "unit"}},
+                            fields=["text"],
+                        ),
+                    )["responses"][0]
+                    assert len(units["hits"]["hits"]) == 2, units
+                    assert all(
+                        hit["_source"]["text"] for hit in units["hits"]["hits"]
+                    ), units
+                first_members = call(
+                    "POST",
+                    "/tables/hn/query",
+                    dict(chunk_requests[0], hierarchy={}, fields=[]),
+                )["responses"][0]
+                second_members = call(
+                    "POST",
+                    "/tables/hn/query",
+                    dict(chunk_requests[1], hierarchy={}, fields=[]),
+                )["responses"][0]
+                assert {hit["_id"] for hit in first_members["hits"]["hits"]}.isdisjoint(
+                    {hit["_id"] for hit in second_members["hits"]["hits"]}
+                )
                 # Reload durable recent artifacts independently of process caches.
                 stop()
                 start()
@@ -835,6 +1008,19 @@ def test_native_catalog_file_commit_read_and_restart(tmp_path, mode, native_rows
                         "hits"
                     ]["hits"]
                 ) == [1, 3, 4], dense_reopened
+                chunk_reopened = call(
+                    "POST",
+                    "/tables/hn/query",
+                    dict(chunk_requests[0], hierarchy={}, fields=["text"]),
+                )["responses"][0]
+                assert len(chunk_reopened["hits"]["hits"]) >= 3, chunk_reopened
+                assert all(
+                    hit["_source"]["text"] for hit in chunk_reopened["hits"]["hits"]
+                ), chunk_reopened
+                mixed_restarted = call("POST", "/query", mixed_next)["responses"][0]
+                assert [
+                    hit["_source"]["amount"] for hit in mixed_restarted["hits"]["hits"]
+                ] == [2, 3, 100], mixed_restarted
                 status = call(
                     "POST",
                     "/tables/hn/lake/maintenance",

@@ -243,18 +243,27 @@ fn buildSegments(a: A, out: A, table: local.common_topology_records.TableRecord,
                 defer page_arena.deinit();
                 const pa = page_arena.allocator();
                 var writes: std.ArrayList(hbc.BatchInsertItem) = .empty;
+                var unit_records: std.StringHashMapUnmanaged([]const u8) = .empty;
                 for (ids[start..@min(start + 128, ids.len)]) |id| {
                     try context.ensureActive();
                     const row = overlay.row(id).?;
-                    const value = row.object.get(producer.column) orelse .null;
-                    const vector = (try producer.dense(pa, value, archive.dims)) orelse continue;
-                    const vector_id = dense.vectorId(id);
-                    if ((try used.getOrPut(budget.allocator(), vector_id)).found_existing) return error.NativeLakeVectorIdentityCollision;
-                    try writes.append(pa, .{ .vector_id = vector_id, .vector = vector, .metadata = id });
+                    for (try producer.units(pa, row)) |unit| {
+                        const vector = (try producer.denseUnit(pa, unit, archive.dims)) orelse continue;
+                        const key = try @import("lake_enrichment_units.zig").identity(pa, id, unit);
+                        if (unit.chunked) {
+                            try unit_records.put(pa, key, try @import("lake_enrichment_units.zig").recordJson(pa, unit));
+                            try unit_records.put(pa, try @import("lake_enrichment_units.zig").sourceKey(pa, id, unit.source_ordinal), try @import("lake_enrichment_units.zig").sourceJson(pa, unit));
+                        }
+                        const vector_id = dense.vectorId(key);
+                        if ((try used.getOrPut(budget.allocator(), vector_id)).found_existing) return error.NativeLakeVectorIdentityCollision;
+                        try writes.append(pa, .{ .vector_id = vector_id, .vector = vector, .metadata = key });
+                    }
                 }
                 var transaction = try vectors.beginBatchWithOptions(.{ .mode = .bulk_ingest });
                 errdefer transaction.abort();
                 for (writes.items) |write| try transaction.put(.{ .name = "exact_vectors" }, write.metadata, try @import("antfly_vector").codec.encodePackedF32BytesAlloc(pa, write.vector));
+                var records = unit_records.iterator();
+                while (records.next()) |record| try transaction.put(.{ .name = "lake_units" }, record.key_ptr.*, record.value_ptr.*);
                 try transaction.commit();
                 try context.ensureActive();
                 try index.batchInsertWithMetadataOptions(writes.items, .{ .assume_absent_ids = true, .bulk_ingest = true, .skip_vector_store = true });
@@ -285,12 +294,26 @@ fn buildSegments(a: A, out: A, table: local.common_topology_records.TableRecord,
                 defer page_arena.deinit();
                 const pa = page_arena.allocator();
                 var writes: std.ArrayList(local.sparse_sparse.SparseWrite) = .empty;
+                var unit_records: std.StringHashMapUnmanaged([]const u8) = .empty;
                 for (ids[start..@min(start + 128, ids.len)]) |id| {
                     try context.ensureActive();
                     const row = overlay.row(id).?;
-                    const value = row.object.get(producer.column) orelse .null;
-                    const vector = (try producer.sparse(pa, value)) orelse continue;
-                    try writes.append(pa, .{ .doc_id = id, .vec = .{ .indices = vector.indices, .values = vector.values } });
+                    for (try producer.units(pa, row)) |unit| {
+                        const vector = (try producer.sparseUnit(pa, unit)) orelse continue;
+                        const key = try @import("lake_enrichment_units.zig").identity(pa, id, unit);
+                        if (unit.chunked) {
+                            try unit_records.put(pa, key, try @import("lake_enrichment_units.zig").recordJson(pa, unit));
+                            try unit_records.put(pa, try @import("lake_enrichment_units.zig").sourceKey(pa, id, unit.source_ordinal), try @import("lake_enrichment_units.zig").sourceJson(pa, unit));
+                        }
+                        try writes.append(pa, .{ .doc_id = key, .vec = .{ .indices = vector.indices, .values = vector.values } });
+                    }
+                }
+                if (unit_records.count() != 0) {
+                    var transaction = try index.backendStore().beginBatch();
+                    errdefer transaction.abort();
+                    var records = unit_records.iterator();
+                    while (records.next()) |record| try transaction.put(try std.fmt.allocPrint(pa, "lake-unit:{s}", .{record.key_ptr.*}), record.value_ptr.*);
+                    try transaction.commit();
                 }
                 try index.batchWithOptions(writes.items, &.{}, .{ .prefer_bulk_build = true, .assume_new_doc_ids = true, .backend_batch_options = .{ .mode = .bulk_ingest } });
             }

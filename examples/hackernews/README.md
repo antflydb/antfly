@@ -518,3 +518,24 @@ The generated full-text index consumes the row schema so its declared sortable
 columns have native doc values. Searching with `field: "body"` still restricts
 text matching to that field. A field-specific text index consumes only that field
 and cannot sort by an unrelated column merely because a predicate index exists.
+
+
+### Chunk enrichment and native current-table cursors
+
+The archive and accepted-WAL builders also accept managed embedding indexes with
+`template` and `chunker` configurations. They use Antfly's native multimodal and
+chunking providers and store independently addressable chunk vectors, original
+source units and offsets in the published checkpoint. HN's text fixture remains
+text-only; it does not require a paid media model. Sparse indexes support text
+chunks; media embeddings require a compatible dense provider.
+
+A mutable native current table can participate in the same saved union/overlay
+source. Ordered native queries return a `native2:` `remote_snapshot`; echo it with
+`_sort` as `search_after`/`search_before`. Composed continuation stores each native
+leaf capability automatically. Later writes/deletes and a daemon restart preserve
+that generation until its 60-second expiry. Both `primary_lsm` and `vector_store`
+source-vector ownership are supported on filesystem-managed LSM owners. Missing
+owner files, expiry or catalog/recipe changes produce a conflict.
+`tests/test_native_cursor_http.py` qualifies mutations and restart against the real
+standalone daemon for both storage settings. Full historical HN deployment and
+archive-scale latency still need operational qualification.

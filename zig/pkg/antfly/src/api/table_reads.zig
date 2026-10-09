@@ -11839,9 +11839,15 @@ fn queryDbDetailed(
 ) !LocalQueryExecution {
     var owner = db_owner;
     errdefer owner.deinit();
-    const db = owner.db();
+    var db = owner.db();
     var reads = raft_mod.FeatureDBReads.init(group_id, read_safety_barrier);
     try reads.reads.prepareSearchWithConsistency(group_id, req, consistency);
+    if (req.native_query_cut) |cut| {
+        const retained = try db.openQueryCut(cut, req.cancellation orelse .none);
+        owner.deinit();
+        owner = .{ .owned = retained };
+        db = owner.db();
+    }
     if (req.aggregations_json.len != 0) {
         var lease = try db.beginQueryReadLease();
         errdefer lease.release();
@@ -13014,7 +13020,7 @@ fn collectProvisionedAlgebraicDistributedPartials(
     for (group_ids, 0..) |group_id, group_index| {
         var group_req = req;
         if (required_identity_generations) |generations| group_req.identity_read_generation = generations[group_index].?;
-        const body = try encodeAlgebraicPartialsRequestWithProgramAtGeneration(alloc, group_req.index_name orelse selected_index_name, group_req.identity_read_generation, access_paths, &.{}, tensor_program);
+        const body = try withNativeCutEnvelope(alloc, group_req, try encodeAlgebraicPartialsRequestWithProgramAtGeneration(alloc, group_req.index_name orelse selected_index_name, group_req.identity_read_generation, access_paths, &.{}, tensor_program));
         defer alloc.free(body);
         var db_owner: ?LocalQueryDbOwner = null;
         defer if (db_owner) |*owner| owner.deinit();
@@ -14136,7 +14142,7 @@ fn collectHostedAlgebraicDistributedPartials(
     for (group_ids, 0..) |group_id, group_index| {
         var group_req = req;
         if (required_identity_generations) |generations| group_req.identity_read_generation = generations[group_index].?;
-        const body = try encodeAlgebraicPartialsRequestWithProgramAtGeneration(alloc, group_req.index_name orelse selected_index_name, group_req.identity_read_generation, access_paths, &.{}, tensor_program);
+        const body = try withNativeCutEnvelope(alloc, group_req, try encodeAlgebraicPartialsRequestWithProgramAtGeneration(alloc, group_req.index_name orelse selected_index_name, group_req.identity_read_generation, access_paths, &.{}, tensor_program));
         defer alloc.free(body);
         const route = routes[group_index];
         const shard_partials = switch (route) {
@@ -14165,6 +14171,17 @@ fn queryNeedsDistributedTextStats(req: db_mod.types.SearchRequest) bool {
     if (req.full_text != null) return true;
     if (db_query_search.isTextQuery(req.query) and !db_query_search.isDefaultMatchAll(req.query)) return true;
     return req.full_text_queries.len > 0;
+}
+
+fn withNativeCutEnvelope(a: std.mem.Allocator, req: db_mod.types.SearchRequest, owned: []u8) ![]u8 {
+    const cut = req.native_query_cut orelse return owned;
+    defer a.free(owned);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, owned, .{});
+    defer parsed.deinit();
+    const pa = parsed.arena.allocator();
+    const encoded = try std.json.Stringify.valueAlloc(pa, cut.forDeadline(req.execution_deadline_ns), .{});
+    try parsed.value.object.put(pa, "_native_cut", try std.json.parseFromSliceLeaky(std.json.Value, pa, encoded, .{}));
+    return std.json.Stringify.valueAlloc(a, parsed.value, .{});
 }
 
 fn encodeQueryTextStatsRequest(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest) ![]u8 {
@@ -14198,6 +14215,12 @@ fn encodeExplicitTextStatsRequestForSearchRequest(
     defer out.deinit(alloc);
     try out.append(alloc, '{');
     var top_first = true;
+    if (req.native_query_cut) |cut| {
+        try appendJsonFieldName(alloc, &out, &top_first, "_native_cut");
+        const encoded_cut = try std.json.Stringify.valueAlloc(alloc, cut.forDeadline(req.execution_deadline_ns), .{});
+        defer alloc.free(encoded_cut);
+        try out.appendSlice(alloc, encoded_cut);
+    }
     if (req.identity_read_generation) |generation| try appendJsonFieldU64(alloc, &out, &top_first, "_identity_read_generation", generation);
     try db_mod.doc_filter_wire.appendSearchRequestFieldAlloc(alloc, &out, &top_first, req);
     try appendJsonFieldName(alloc, &out, &top_first, "fields");
@@ -14239,6 +14262,12 @@ fn encodeBackgroundTextStatsRequestForSearchRequest(
     defer out.deinit(alloc);
     try out.append(alloc, '{');
     var top_first = true;
+    if (req.native_query_cut) |cut| {
+        try appendJsonFieldName(alloc, &out, &top_first, "_native_cut");
+        const encoded_cut = try std.json.Stringify.valueAlloc(alloc, cut.forDeadline(req.execution_deadline_ns), .{});
+        defer alloc.free(encoded_cut);
+        try out.appendSlice(alloc, encoded_cut);
+    }
     if (req.identity_read_generation) |generation| try appendJsonFieldU64(alloc, &out, &top_first, "_identity_read_generation", generation);
     try db_mod.doc_filter_wire.appendSearchRequestFieldAlloc(alloc, &out, &top_first, req);
     try appendJsonFieldName(alloc, &out, &top_first, "background_fields");

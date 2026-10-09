@@ -15443,7 +15443,7 @@ pub const GeoShapeQuery = struct {
 /// A stateful global query. Specify a table target or a composed source.
 pub const GlobalStatefulQueryRequest = struct {
     lake_read: ?LakeReadRequirement = null,
-    /// Opaque remote index snapshot token returned by a previous query. Required when replaying search_after or search_before against an external table; a changed publication returns 409.
+    /// Opaque retained snapshot token returned by an ordered native or external-table query. Echo with search_after or search_before. Native and lake cuts expire within 60 seconds; missing, expired or incompatible generations return 409.
     remote_snapshot: ?[]const u8 = null,
     evaluate: ?QueryEvaluation = null,
     table_target: ?CatalogTableTarget = null,
@@ -15523,7 +15523,7 @@ pub const GlobalStatefulQueryRequest = struct {
     source: ?ComposedQuerySource = null,
     /// Explicit reciprocal rank scoring across source lists after visibility resolution. Required for score ordering; shared corpus BM25 is not implemented. Constant 60, equal source weights.
     source_ranking: ?[]const u8 = null,
-    /// Opaque composed continuation retaining per-leaf archive publications and accepted WAL cuts for up to 60 seconds from their creation. Publication and restart preserve the cut. Authorization, policy, recipe, source and table incarnation changes invalidate it. Leaf search_after/search_before tuples are unsupported.
+    /// Opaque composed continuation retaining per-leaf native generations or archive publications and accepted WAL cuts for up to 60 seconds from their creation. Publication and restart preserve the cut. Authorization, policy, recipe, source and table incarnation changes invalidate it. Leaf search_after/search_before tuples are unsupported.
     source_cursor: ?[]const u8 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
@@ -31424,7 +31424,7 @@ pub const QueryProfile = struct {
 
 pub const QueryRequest = struct {
     lake_read: ?LakeReadRequirement = null,
-    /// Opaque remote index snapshot token returned by a previous query. Required when replaying search_after or search_before against an external table; a changed publication returns 409.
+    /// Opaque retained snapshot token returned by an ordered native or external-table query. Echo with search_after or search_before. Native and lake cuts expire within 60 seconds; missing, expired or incompatible generations return 409.
     remote_snapshot: ?[]const u8 = null,
     evaluate: ?QueryEvaluation = null,
     table_target: ?CatalogTableTarget = null,
@@ -31749,7 +31749,7 @@ pub const QueryResult = struct {
     source_ranking: ?[]const u8 = null,
     /// Opaque continuation for composed queries. Pass as source_cursor with the same query; valid until the earliest retained leaf cut expires (at most 60 seconds). Publication and restart preserve it; authorization and incarnation fences remain enforced.
     next_source_cursor: ?[]const u8 = null,
-    /// Opaque remote snapshot to echo with ordered pagination. Lake tokens retain the archive publication, metadata and accepted WAL cut for 60 seconds; other remote engines may provide an invalidation-only fence. Every use rechecks access and incarnation.
+    /// Opaque snapshot to echo with ordered pagination. Native tokens retain the complete physical generation; lake tokens retain the archive publication, metadata and accepted WAL cut, for at most 60 seconds. Every use rechecks access, incarnation and recipe. Unavailable retained generations return 409.
     remote_snapshot: ?[]const u8 = null,
     /// Function evaluation scope, population, usage, and scoped aggregations.
     evaluation: ?std.json.ArrayHashMap(std.json.Value) = null,
@@ -31862,7 +31862,7 @@ pub const QueryResultBase = struct {
     source_ranking: ?[]const u8 = null,
     /// Opaque continuation for composed queries. Pass as source_cursor with the same query; valid until the earliest retained leaf cut expires (at most 60 seconds). Publication and restart preserve it; authorization and incarnation fences remain enforced.
     next_source_cursor: ?[]const u8 = null,
-    /// Opaque remote snapshot to echo with ordered pagination. Lake tokens retain the archive publication, metadata and accepted WAL cut for 60 seconds; other remote engines may provide an invalidation-only fence. Every use rechecks access and incarnation.
+    /// Opaque snapshot to echo with ordered pagination. Native tokens retain the complete physical generation; lake tokens retain the archive publication, metadata and accepted WAL cut, for at most 60 seconds. Every use rechecks access, incarnation and recipe. Unavailable retained generations return 409.
     remote_snapshot: ?[]const u8 = null,
     /// Function evaluation scope, population, usage, and scoped aggregations.
     evaluation: ?std.json.ArrayHashMap(std.json.Value) = null,
@@ -38923,7 +38923,7 @@ pub const StatefulGraphResult = union(enum) {
 /// Stateful Antfly query request. Canonical clients use graph_queries; deprecated graph_searches is retained only at the stateful public transport boundary for the v0.2 transition window.
 pub const StatefulQueryRequest = struct {
     lake_read: ?LakeReadRequirement = null,
-    /// Opaque remote index snapshot token returned by a previous query. Required when replaying search_after or search_before against an external table; a changed publication returns 409.
+    /// Opaque retained snapshot token returned by an ordered native or external-table query. Echo with search_after or search_before. Native and lake cuts expire within 60 seconds; missing, expired or incompatible generations return 409.
     remote_snapshot: ?[]const u8 = null,
     evaluate: ?QueryEvaluation = null,
     table_target: ?CatalogTableTarget = null,
@@ -39262,7 +39262,7 @@ pub const StatefulQueryResult = struct {
     source_ranking: ?[]const u8 = null,
     /// Opaque continuation for composed queries. Pass as source_cursor with the same query; valid until the earliest retained leaf cut expires (at most 60 seconds). Publication and restart preserve it; authorization and incarnation fences remain enforced.
     next_source_cursor: ?[]const u8 = null,
-    /// Opaque remote snapshot to echo with ordered pagination. Lake tokens retain the archive publication, metadata and accepted WAL cut for 60 seconds; other remote engines may provide an invalidation-only fence. Every use rechecks access and incarnation.
+    /// Opaque snapshot to echo with ordered pagination. Native tokens retain the complete physical generation; lake tokens retain the archive publication, metadata and accepted WAL cut, for at most 60 seconds. Every use rechecks access, incarnation and recipe. Unavailable retained generations return 409.
     remote_snapshot: ?[]const u8 = null,
     /// Function evaluation scope, population, usage, and scoped aggregations.
     evaluation: ?std.json.ArrayHashMap(std.json.Value) = null,

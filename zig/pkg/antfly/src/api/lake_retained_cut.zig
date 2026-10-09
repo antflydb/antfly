@@ -113,9 +113,10 @@ pub fn saveCursor(a: A, store: *stores.ArtifactStore, identity: catalog.Digest, 
     for (sources.array.items) |source| {
         if (source != .object) return error.InvalidQueryRequest;
         const remote = source.object.get("remote_snapshot") orelse return error.InvalidQueryRequest;
-        if (remote != .string or !std.mem.startsWith(u8, remote.string, prefix)) return error.UnsupportedQueryRequest;
+        if (remote != .string) return error.UnsupportedQueryRequest;
+        const leaf_prefix = if (std.mem.startsWith(u8, remote.string, prefix)) prefix else if (std.mem.startsWith(u8, remote.string, @import("native_retained_cut.zig").prefix)) @import("native_retained_cut.zig").prefix else return error.UnsupportedQueryRequest;
         const split = std.mem.lastIndexOfScalar(u8, remote.string, ':') orelse return error.InvalidQueryRequest;
-        const leaf_scope = (try stores.uploadScopeFromArtifactId(remote.string[prefix.len..split])) orelse return error.InvalidQueryRequest;
+        const leaf_scope = (try stores.uploadScopeFromArtifactId(remote.string[leaf_prefix.len..split])) orelse return error.InvalidQueryRequest;
         expires = @min(expires, leaf_scope.fencingToken());
     }
     if (expires <= now) return error.CatalogGenerationChanged;

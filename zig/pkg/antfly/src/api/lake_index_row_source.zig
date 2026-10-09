@@ -27,6 +27,7 @@ const Cancellation = @import("antfly_cancellation").CancellationToken;
 const A = std.mem.Allocator;
 pub const Provider = struct {
     source: *serving.ServingSource,
+    enrichment_columns: bool = false,
     vector_memo: ?@import("lake_vector_enrichment.zig").Memo = null,
     embedding_options: ?local.inference_managed_embedder.InitOptions = null,
     context: Context,
@@ -63,10 +64,14 @@ pub const Provider = struct {
             cursor.* = .{ .provider = self.*, .binding = binding, .cancellation = cancellation };
             return .{ .kind = kind, .ctx = cursor, .next_batch = FileCursor.next, .deinit_fn = FileCursor.deinit };
         }
-        if (self.replay) |replay| if (try replay.open(a, binding, self.only_file, cancellation)) |source| return source;
+        if (!self.enrichment_columns) if (self.replay) |replay| if (try replay.open(a, binding, self.only_file, cancellation)) |source| return source;
         var names: std.ArrayList([]const u8) = .empty;
         defer names.deinit(a);
-        try names.appendSlice(a, binding.column_bindings);
+        if (self.enrichment_columns) {
+            const schema = if (self.source.iceberg_schema) |selected| selected.columns else self.schema_contract;
+            for (schema) |column| try names.append(a, column.name);
+            if (names.items.len == 0) return error.InvalidLakeEnrichmentSchema;
+        } else try names.appendSlice(a, binding.column_bindings);
         if (self.source.scanner.iceberg_delete_plan) |plan| for (plan.files) |file| for (file.equality_columns) |column| {
             const present = for (names.items) |name| {
                 if (std.mem.eql(u8, name, column)) break true;

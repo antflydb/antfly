@@ -19,9 +19,15 @@ separate existing foundation. Native writable Iceberg now adds catalog commits,
 bounded recent text visibility, JSON union/keyed composition, opt-in accepted
 SQL visibility and scheduled bounded compaction/GC. Recent dense/sparse vector
 segments, durable enrichment jobs, saved source definitions and retained composed
-cursor cuts are implemented for writable lakes. Additional managed connectors,
-multimodal/chunk enrichment and mutable native-table cursor retention remain
-extensions.
+cursor cuts are implemented for writable lakes. Archive and accepted-WAL vector
+builders now share native multimodal templates and independent chunk enrichment,
+including durable source-unit payloads. Mutable native tables retain readonly
+physical generations for ordered and composed cursors; primary LSM and native
+source-vector storage participate. The bounded capture, expiry, owner-location
+and storage-provider contracts are documented in
+[Composed query sources](composed-query-sources.md). Additional vendor subscription
+provisioning and full-archive deployment/performance qualification remain separate
+work.
 
 The long-term goal is one table/query contract for externally owned lakes and
 Antfly-owned data, with a shared durable ingestion path for application writes,

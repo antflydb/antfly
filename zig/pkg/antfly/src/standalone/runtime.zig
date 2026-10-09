@@ -1293,7 +1293,7 @@ const LocalStandaloneMetadata = struct {
         const lifecycle = @import("../metadata/lake_index_lifecycle.zig");
         const before = try lifecycle.parse(a, try store.getLakeIndexLifecycle(a, group_ids.main_metadata_group_id, table_id));
         if (before.revision != revision) return error.CatalogGenerationChanged;
-        _ = try lifecycle.encode(a, try mutation.apply(a, before));
+        try mutation.preflight(a, before);
         try store.applyStandaloneCommand(group_ids.main_metadata_group_id, .{ .mutate_lake_index_lifecycle = .{ .table_id = table_id, .expected_revision = revision, .mutation = mutation } });
         self.epoch = @max(1, try store.standaloneRevision());
         self.durable_revision = self.epoch;

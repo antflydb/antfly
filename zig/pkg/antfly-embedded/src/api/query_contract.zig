@@ -2233,7 +2233,7 @@ fn applyCommonSearchRequestOptions(
     if (request.offset) |offset| req.offset = @intCast(offset);
     if (request.count) |count| req.count_only = count;
     if (request.remote_snapshot) |snapshot| {
-        const retained_lake = std.mem.startsWith(u8, snapshot, "lake2:") and snapshot.len > 64 and snapshot.len <= 512;
+        const retained_lake = (std.mem.startsWith(u8, snapshot, "lake2:") or std.mem.startsWith(u8, snapshot, "native2:")) and snapshot.len > 64 and snapshot.len <= 512;
         if (snapshot.len != 64 and !retained_lake) return error.InvalidQueryRequest;
         if (retained_lake) for (snapshot) |byte| if (byte <= 0x20 or byte >= 0x7f) return error.InvalidQueryRequest;
         req.remote_snapshot = try alloc.dupe(u8, snapshot);
@@ -3993,7 +3993,7 @@ pub fn encodeQueryResponsesWithDelivery(
                 .took = meta.took_ms,
                 .status = 200,
                 .table = req.response_table_name orelse table_name,
-                .remote_snapshot = meta.remote_snapshot,
+                .remote_snapshot = meta.remote_snapshot orelse if (req.native_query_cut != null) req.remote_snapshot else null,
             };
             break :blk if (hasColumnSources(emitted_hits) or (if (delivery) |sink| sink.hydrator != null else false)) try encodeColumnWire(alloc, req, query_results[0], emitted_hits, delivery, &delivered) else try std.json.Stringify.valueAlloc(
                 alloc,
@@ -4025,7 +4025,7 @@ pub fn encodeQueryResponsesWithDelivery(
                 .took = meta.took_ms,
                 .status = 200,
                 .table = req.response_table_name orelse table_name,
-                .remote_snapshot = meta.remote_snapshot,
+                .remote_snapshot = meta.remote_snapshot orelse if (req.native_query_cut != null) req.remote_snapshot else null,
             };
             break :blk if (hasColumnSources(emitted_hits) or (if (delivery) |sink| sink.hydrator != null else false)) try encodeColumnWire(alloc, req, query_results[0], emitted_hits, delivery, &delivered) else try std.json.Stringify.valueAlloc(
                 alloc,
@@ -11790,6 +11790,7 @@ fn isInternalShardFieldName(name: []const u8) bool {
         "_filter_query_json",
         "_exclusion_query_json",
         "_identity_read_generation",
+        "_native_cut",
         "_index_name",
         "_primary_text_index_name",
         "_embedding_limits",
@@ -12129,6 +12130,7 @@ fn removeInternalShardFields(object: *std.json.ObjectMap) void {
         "_filter_query_json",
         "_exclusion_query_json",
         "_identity_read_generation",
+        "_native_cut",
         "_index_name",
         "_primary_text_index_name",
         "_embedding_limits",

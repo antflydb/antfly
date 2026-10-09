@@ -22361,9 +22361,9 @@ components:
           $ref: '#/components/schemas/LakeReadRequirement'
         remote_snapshot:
           type: string
-          description: Opaque remote index snapshot token returned by a previous query. Required when
-            replaying search_after or search_before against an external table; a changed publication returns
-            409.
+          description: Opaque retained snapshot token returned by an ordered native or external-table
+            query. Echo with search_after or search_before. Native and lake cuts expire within 60 seconds;
+            missing, expired or incompatible generations return 409.
         evaluate:
           $ref: '#/components/schemas/QueryEvaluation'
         table_target:
@@ -23314,10 +23314,10 @@ components:
                 source weights.
             source_cursor:
               type: string
-              description: Opaque composed continuation retaining per-leaf archive publications and accepted
-                WAL cuts for up to 60 seconds from their creation. Publication and restart preserve the
-                cut. Authorization, policy, recipe, source and table incarnation changes invalidate it.
-                Leaf search_after/search_before tuples are unsupported.
+              description: Opaque composed continuation retaining per-leaf native generations or archive
+                publications and accepted WAL cuts for up to 60 seconds from their creation. Publication
+                and restart preserve the cut. Authorization, policy, recipe, source and table incarnation
+                changes invalidate it. Leaf search_after/search_before tuples are unsupported.
     Analyses:
       x-go-type-skip-optional-pointer: false
       type: object
@@ -24449,9 +24449,10 @@ components:
             preserve it; authorization and incarnation fences remain enforced.
         remote_snapshot:
           type: string
-          description: Opaque remote snapshot to echo with ordered pagination. Lake tokens retain the
-            archive publication, metadata and accepted WAL cut for 60 seconds; other remote engines may
-            provide an invalidation-only fence. Every use rechecks access and incarnation.
+          description: Opaque snapshot to echo with ordered pagination. Native tokens retain the complete
+            physical generation; lake tokens retain the archive publication, metadata and accepted WAL
+            cut, for at most 60 seconds. Every use rechecks access, incarnation and recipe. Unavailable
+            retained generations return 409.
         evaluation:
           type: object
           additionalProperties: true

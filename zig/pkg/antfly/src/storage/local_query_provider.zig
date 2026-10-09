@@ -38,11 +38,33 @@ pub fn execute(
     out_failure.* = .{};
     if (request.version != abi.abi_version)
         return fail(error.InvalidAbiVersion, .validate_request, out_failure);
-    const db: *db_mod.DB = @ptrCast(@alignCast(request.db orelse
+    const live_db: *db_mod.DB = @ptrCast(@alignCast(request.db orelse
         return fail(error.InvalidArgument, .validate_request, out_failure)));
     const table_name = request.table_name.slice();
     if (table_name.len == 0 or request.request_json.len == 0)
         return fail(error.InvalidArgument, .validate_request, out_failure);
+
+    const alloc = std.heap.c_allocator;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, request.request_json.slice(), .{}) catch |err| return fail(err, .validate_request, out_failure);
+    defer parsed.deinit();
+    var body = parsed.value;
+    if (body == .object) if (body.object.get("query_request")) |nested| {
+        body = nested;
+    };
+    if (body == .object) if (body.object.get("query_json")) |nested| {
+        if (nested == .string) body = std.json.parseFromSliceLeaky(std.json.Value, parsed.arena.allocator(), nested.string, .{}) catch |err| return fail(err, .validate_request, out_failure);
+    };
+    var retained: ?db_mod.DB = null;
+    defer if (retained) |*cut| cut.close();
+    if (body == .object) if (body.object.get("_native_cut")) |input| {
+        if (request.dialect != .internal) return fail(error.InvalidQueryRequest, .validate_request, out_failure);
+        const bytes = std.json.Stringify.valueAlloc(alloc, input, .{}) catch |err| return fail(err, .validate_request, out_failure);
+        defer alloc.free(bytes);
+        var descriptor = std.json.parseFromSlice(@typeInfo(@FieldType(db_mod.types.SearchRequest, "native_query_cut")).optional.child, alloc, bytes, .{}) catch |err| return fail(err, .validate_request, out_failure);
+        defer descriptor.deinit();
+        retained = live_db.openQueryCut(descriptor.value, requestCancellationToken(request)) catch |err| return fail(err, .validate_request, out_failure);
+    };
+    const db: *db_mod.DB = if (retained) |*cut| cut else live_db;
 
     return switch (request.kind) {
         .search => executeSearch(request, db, table_name, out_response, out_failure),
@@ -115,6 +137,7 @@ fn executeSearch(
     var result = captured.result;
     defer result.deinit();
     var meta: query_api.QueryResponseMeta = .{
+        .remote_snapshot = if (owned.req.remote_snapshot) |token| if (std.mem.startsWith(u8, token, "native2:") and db.open_mode == .query_readonly) alloc.dupe(u8, token) catch |err| return fail(err, executeOperation(request.dialect), out_failure) else null else null,
         .dense_search = if (captured.dense_profile) |profile|
             @import("../api/dense_search_profile.zig").fromStorage(profile)
         else

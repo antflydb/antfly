@@ -187,3 +187,106 @@ test "external lake incremental native publication appends replaces removes and 
         if (phase == 1) try std.testing.expectEqual(@as(usize, 4), reused);
     }
 }
+
+test "external lake managed chunks publish independent vectors and replace their complete source membership" {
+    const a = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("native-chunk-publication");
+    defer directory.cleanup();
+    var fs = try local.storage_object_storage.FilesystemObjectStorage.init(a, directory.path());
+    defer fs.deinit();
+    var client = fs.client();
+    try client.makeBucket("antfly");
+    const first = try local.serverless_query_lake_parquet_rowgroup.buildTestPlainI64AndByteArrayParquetObjectAlloc(a, &.{}, &.{
+        .{ .column_id = "body", .field_id = 1, .converted_type = 0, .values = &.{"alpha beta gamma delta"} },
+        .{ .column_id = "dense", .field_id = 2, .converted_type = 0, .values = &.{"[1,0]"} },
+        .{ .column_id = "sparse", .field_id = 3, .converted_type = 0, .values = &.{"{\"1\":2}"} },
+    });
+    defer a.free(first);
+    const replacement = try local.serverless_query_lake_parquet_rowgroup.buildTestPlainI64AndByteArrayParquetObjectAlloc(a, &.{}, &.{
+        .{ .column_id = "body", .field_id = 1, .converted_type = 0, .values = &.{"replacement epsilon"} },
+        .{ .column_id = "dense", .field_id = 2, .converted_type = 0, .values = &.{"[0,1]"} },
+        .{ .column_id = "sparse", .field_id = 3, .converted_type = 0, .values = &.{"{\"2\":3}"} },
+    });
+    defer a.free(replacement);
+    var uploaded = try client.putObject("antfly", "part.parquet", first, .{});
+    uploaded.deinit(a);
+    const schema_json = try std.fmt.allocPrint(a,
+        \\{{"version":1,"storage_mode":"relational","default_type":"row","base_source":{{"kind":"external","table_id":"lake","format":"parquet","uri":"file://{s}","schema_fingerprint":"schema"}},"document_schemas":{{"row":{{"schema":{{"type":"object","properties":{{"body":{{"type":"string"}},"dense":{{"type":"string"}},"sparse":{{"type":"string"}}}},"additionalProperties":false}}}}}}}}
+    , .{directory.path()});
+    defer a.free(schema_json);
+    var binding = (try local.serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc(a, schema_json)).?;
+    defer binding.deinit(a);
+    const artifact_path = try std.fs.path.join(a, &.{ directory.path(), "artifacts" });
+    defer a.free(artifact_path);
+    var artifact_fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, artifact_path);
+    defer artifact_fs.deinit();
+    var store = artifact_fs.artifactStore();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    const Clock = struct {
+        fn now(_: *const anyopaque) !u64 {
+            return 101;
+        }
+    };
+    var clock: u8 = 0;
+    var table: local.common_topology_records.TableRecord = .{ .table_id = 7, .name = "lake", .schema_json = schema_json, .indexes_json =
+        \\{"semantic":{"type":"embeddings","field":"body","dimension":2,"embedder":{"provider":"antfly","model":"local-model"},"template":"{{body}} {{dense}}","chunker":{"provider":"mock","text":{"target_tokens":1,"overlap_tokens":0}}},"sparse_chunks":{"type":"embeddings","field":"body","sparse":true,"embedder":{"provider":"antfly","model":"local-model","sparse":true},"chunker":{"provider":"mock","text":{"target_tokens":1,"overlap_tokens":0}}}}
+    };
+    const Provider = struct {
+        calls: usize = 0,
+        sparse_calls: usize = 0,
+        fn dense(raw: *anyopaque, alloc: std.mem.Allocator, _: []const u8, texts: []const []const u8) ![][]f32 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += texts.len;
+            const vectors = try alloc.alloc([]f32, texts.len);
+            for (vectors) |*vector| vector.* = try alloc.dupe(f32, &.{ 1, 0 });
+            return vectors;
+        }
+        fn controlled(raw: *anyopaque, alloc: std.mem.Allocator, model: []const u8, texts: []const []const u8, context: local.inference_managed_embedder.EmbeddingRequestContext) ![][]f32 {
+            try context.check();
+            return dense(raw, alloc, model, texts);
+        }
+        fn sparse(raw: *anyopaque, alloc: std.mem.Allocator, _: []const u8, texts: []const []const u8) ![]local.storage_db_enrichment_embedder.SparseEmbedding {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.sparse_calls += texts.len;
+            const vectors = try alloc.alloc(local.storage_db_enrichment_embedder.SparseEmbedding, texts.len);
+            for (vectors) |*vector| vector.* = .{ .indices = try alloc.dupe(u32, &.{1}), .values = try alloc.dupe(f32, &.{2}) };
+            return vectors;
+        }
+        fn sparseControlled(raw: *anyopaque, alloc: std.mem.Allocator, model: []const u8, texts: []const []const u8, context: local.inference_managed_embedder.EmbeddingRequestContext) ![]local.storage_db_enrichment_embedder.SparseEmbedding {
+            try context.check();
+            return sparse(raw, alloc, model, texts);
+        }
+    };
+    var provider: Provider = .{};
+    const options: local.inference_managed_embedder.InitOptions = .{ .io = std.testing.io, .antfly_provider = .{ .ptr = &provider, .embed_dense_texts = Provider.dense, .embed_dense_texts_with_context = Provider.controlled, .embed_sparse_texts = Provider.sparse, .embed_sparse_texts_with_context = Provider.sparseControlled } };
+    for (0..2) |phase| {
+        if (phase == 1) {
+            var result = try client.putObject("antfly", "part.parquet", replacement, .{});
+            result.deinit(a);
+        }
+        var source = try serving.ServingSource.open(a, .{ .storage_mode = .relational, .external_base_source = binding }, .{});
+        defer source.deinit();
+        table.lake_index_catalog_json = try publication.begin(ca, std.testing.io, table, &source, @splat(7), .{}, 100, 20);
+        const before = provider.calls;
+        const sparse_before = provider.sparse_calls;
+        table.lake_index_catalog_json = try publication.buildWithLeaseAndEmbedding(ca, &store, table, &source, @splat(7), .{ .io = std.testing.io }, .none, .{ .ptr = &clock, .now_ms = Clock.now }, null, options, null);
+        var parsed = try catalog.parse(a, table.lake_index_catalog_json);
+        defer parsed.deinit();
+        try @import("lake_index_directory.zig").hydrate(parsed.arena.allocator(), store, &parsed.value.published.?, .none, null);
+        const declarations = parsed.value.published.?.declarations;
+        try std.testing.expectEqual(@as(usize, 2), declarations.len);
+        for (declarations) |declaration| {
+            const states = if (declaration.artifact.kind == .vector_segment)
+                (try @import("lake_index_native_dense.zig").loadRoot(ca, store, declaration.artifact, .none, null)).file_states
+            else
+                (try @import("lake_index_native_sparse.zig").loadRoot(ca, store, declaration.artifact, .none, null)).file_states;
+            try std.testing.expectEqual(@as(usize, 1), states.len);
+            try std.testing.expectEqual(@as(u16, 108), states[0].key_width);
+            const count = states[0].count;
+            try std.testing.expect(count > 1);
+            try std.testing.expectEqual(count, if (declaration.artifact.kind == .vector_segment) provider.calls - before else provider.sparse_calls - sparse_before);
+        }
+    }
+}

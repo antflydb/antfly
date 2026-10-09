@@ -140,20 +140,39 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
                 defer a.free(keys);
                 var ids: std.ArrayList(u64) = .empty;
                 defer ids.deinit(a);
-                for (0..keys.len / 96) |row| try ids.append(a, vectorId(keys[row * 96 ..][0..96]));
+                for (0..keys.len / deletes.key_width) |row| try ids.append(a, vectorId(keys[row * deletes.key_width ..][0..deletes.key_width]));
                 // Exact vectors remain available to native HBC deletion until its batch commits.
                 try index.beginExperimentalPostingMutationCapture();
                 errdefer index.cancelExperimentalPostingMutationCapture();
                 try index.batchDelete(ids.items);
                 try index.persistExperimentalPostingSidecarAtAppliedSequence(0, .{});
+                var source_keys: std.ArrayList([]u8) = .empty;
+                defer {
+                    for (source_keys.items) |key| a.free(key);
+                    source_keys.deinit(a);
+                }
+                if (deletes.key_width == 108) {
+                    var read = try vectors.beginRead();
+                    defer read.abort();
+                    for (0..keys.len / deletes.key_width) |row| {
+                        const key = keys[row * deletes.key_width ..][0..deletes.key_width];
+                        try source_keys.append(a, try @import("lake_enrichment_units.zig").sourceKeyFromRecord(a, key, try read.get(.{ .name = "lake_units" }, key)));
+                    }
+                }
                 var transaction = try vectors.beginBatch();
                 errdefer transaction.abort();
-                for (0..keys.len / 96) |row| try transaction.delete(.{ .name = "exact_vectors" }, keys[row * 96 ..][0..96]);
+                for (source_keys.items) |key| try transaction.delete(.{ .name = "lake_units" }, key);
+                for (0..keys.len / deletes.key_width) |row| {
+                    const key = keys[row * deletes.key_width ..][0..deletes.key_width];
+                    try transaction.delete(.{ .name = "exact_vectors" }, key);
+                    if (deletes.key_width == 108) try transaction.delete(.{ .name = "lake_units" }, key);
+                }
                 try transaction.commit();
             }
         }
         var input_provider = provider.*;
         input_provider.only_files = plan.changed;
+        input_provider.enrichment_columns = @import("lake_enrichment_units.zig").configured(producer.config, "template") != null;
         const rows = try input_provider.provider().open_with_cancellation_fn.?(input_provider.provider().ptr, a, binding, cancellation);
         defer rows.deinit(a);
         var input: u64 = 512 * 1024 * 1024;
@@ -162,22 +181,30 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             defer page_arena.deinit();
             const pa = page_arena.allocator();
             var writes: std.ArrayList(hbc.BatchInsertItem) = .empty;
+            var unit_records: std.StringHashMapUnmanaged([]const u8) = .empty;
             for (batch.row_refs, 0..) |ref, ordinal| {
                 try cancellation.check();
                 try provider.context.ensureActive();
                 const page: local.sql_catalog.ColumnPage = .{ .batch = batch, .selection = &.{ordinal} };
-                const value = (try page.cell(pa, 0, wanted.build_spec.?.vector.vector_column)).value;
-                const vector = (try producer.dense(pa, value, dims)) orelse continue;
-                const key = try plan.privateKey(pa, ref);
-                try tracker.append(ref, key);
-                const id = vectorId(key);
-                if ((try identities.getOrPut(budget.allocator(), id)).found_existing) return error.NativeLakeVectorIdentityCollision;
-                if (seed != null) if (try index.getMetadata(id)) |existing| {
-                    defer index.alloc.free(existing);
-                    return error.NativeLakeVectorIdentityCollision;
-                };
-                try stores.chargeReadBudget(&input, @as(u64, dims) * 4 + 128);
-                try writes.append(pa, .{ .vector_id = id, .vector = vector, .metadata = key });
+                const row = try @import("lake_enrichment_units.zig").rowValue(pa, page);
+                const parent_key = try plan.privateKey(pa, ref);
+                for (try producer.units(pa, row)) |unit| {
+                    const vector = (try producer.denseUnit(pa, unit, dims)) orelse continue;
+                    const key = try @import("lake_enrichment_units.zig").identity(pa, parent_key, unit);
+                    try tracker.append(ref, key);
+                    if (unit.chunked) {
+                        try unit_records.put(pa, key, try @import("lake_enrichment_units.zig").recordJson(pa, unit));
+                        try unit_records.put(pa, try @import("lake_enrichment_units.zig").sourceKey(pa, parent_key, unit.source_ordinal), try @import("lake_enrichment_units.zig").sourceJson(pa, unit));
+                    }
+                    const id = vectorId(key);
+                    if ((try identities.getOrPut(budget.allocator(), id)).found_existing) return error.NativeLakeVectorIdentityCollision;
+                    if (seed != null) if (try index.getMetadata(id)) |existing| {
+                        defer index.alloc.free(existing);
+                        return error.NativeLakeVectorIdentityCollision;
+                    };
+                    try stores.chargeReadBudget(&input, @as(u64, dims) * 4 + 128);
+                    try writes.append(pa, .{ .vector_id = id, .vector = vector, .metadata = key });
+                }
             }
             var transaction = try vectors.beginBatchWithOptions(.{ .mode = if (seed == null) .bulk_ingest else .default });
             errdefer transaction.abort();
@@ -185,6 +212,8 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
                 const encoded_vector = try @import("antfly_vector").codec.encodePackedF32BytesAlloc(pa, write.vector);
                 try transaction.put(.{ .name = "exact_vectors" }, write.metadata, encoded_vector);
             }
+            var records = unit_records.iterator();
+            while (records.next()) |record| try transaction.put(.{ .name = "lake_units" }, record.key_ptr.*, record.value_ptr.*);
             try transaction.commit();
             if (seed != null) try index.beginExperimentalPostingMutationCapture();
             errdefer if (seed != null) index.cancelExperimentalPostingMutationCapture();

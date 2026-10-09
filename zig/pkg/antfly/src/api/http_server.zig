@@ -9242,6 +9242,18 @@ pub const ApiHttpServer = struct {
         }
         try tables_api.routeQueryRequestToActiveReadIndex(self.alloc, &table, query_req);
         query_req.prepared_read_table_id = table.table_id;
+        // Internal owners already select the retained DB before schema routing.
+        // Only a request-scoped resolver owns capability descriptor memory.
+        if (resolver != null) if (query_req.remote_snapshot) |token| if (std.mem.startsWith(u8, token, @import("native_retained_cut.zig").prefix)) {
+            var store = try @import("lake_index_store.zig").Store.openNative(alloc, self.cfg.node_config, self.cfg.secret_store, true, self.cfg.deployment_mode, self.cfg.native_lake_artifact_base_dir);
+            defer store.deinit();
+            var artifacts = store.artifactStore();
+            const cut = try @import("native_retained_cut.zig").load(alloc, &artifacts, store.identity, token, table, @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms, query_req.cancellation orelse .none);
+            query_req.native_query_cut = .{ .id = cut.id, .table_id = cut.table_id, .expires_ms = cut.expires_ms, .create = if (resolver) |cache| if (cache.native_capture_token) |minted| std.mem.eql(u8, minted, token) else false else false, .timeout_ms = if (query_req.execution_deadline_ns) |deadline| (deadline -| @import("antfly_platform").time.monotonicNs()) / std.time.ns_per_ms else null };
+            const remaining = cut.expires_ms -| (@import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms);
+            const cut_deadline = @import("antfly_platform").time.monotonicNs() +| remaining * std.time.ns_per_ms;
+            query_req.execution_deadline_ns = if (query_req.execution_deadline_ns) |deadline| @min(deadline, cut_deadline) else cut_deadline;
+        };
     }
 
     fn validatePublicQuerySortCapabilities(self: *ApiHttpServer, table_name: []const u8, query_req: db_mod.types.SearchRequest) !void {
@@ -14253,6 +14265,7 @@ pub const ApiHttpServer = struct {
         defer catalog_arena.deinit();
         var local_catalog = CatalogQueryResolver{ .arena = catalog_arena.allocator() };
         const resolver = catalog_resolver orelse &local_catalog;
+        defer resolver.native_capture_token = null;
 
         try ensureRequestActive(cancellation);
         try ensureRequestDeadline(request_deadline_ns);
@@ -14970,6 +14983,7 @@ pub const ApiHttpServer = struct {
         var local_catalog = CatalogQueryResolver{ .arena = catalog_arena.allocator() };
         const resolver = catalog_resolver orelse &local_catalog;
 
+        defer resolver.native_capture_token = null;
         try ensureRequestActive(cancellation);
         var semantic_resolver = self.semanticStatusResolver(query_embedding_security_scope.domain, query_embedding_security_scope.value);
         semantic_resolver.query_embedding_deadline_ns = request_deadline_ns;
@@ -15001,6 +15015,20 @@ pub const ApiHttpServer = struct {
         }
         query_req.req.cancellation = cancellation;
         query_req.req.response_table_name = response_label;
+        if (query_req.req.remote_snapshot == null and (query_req.req.order_by.len != 0 or query_req.req.search_after.len != 0 or query_req.req.search_before.len != 0)) {
+            if (query_req.req.search_after.len != 0 or query_req.req.search_before.len != 0) return error.CatalogGenerationChanged;
+            const context: api_operation.RequestContext = .{ .deadline_ns = request_deadline_ns, .cancellation = cancellation orelse .none };
+            if (try self.queryTableDefinition(resolver.arena, resolver, table_name, context)) |table| {
+                const external = try @import("antfly_local_sources").serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc(resolver.arena, table.schema_json);
+                if (external == null and table.storage.engine != .object) {
+                    var store = try @import("lake_index_store.zig").Store.openNative(resolver.arena, self.cfg.node_config, self.cfg.secret_store, false, self.cfg.deployment_mode, self.cfg.native_lake_artifact_base_dir);
+                    defer store.deinit();
+                    var artifacts = store.artifactStore();
+                    query_req.req.remote_snapshot = try @import("native_retained_cut.zig").save(alloc, &artifacts, store.identity, self.embedding_provider_runtime.io, table, @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms, context.cancellation);
+                    resolver.native_capture_token = query_req.req.remote_snapshot;
+                }
+            }
+        }
         self.routeQueryToReadSchemaWithResolver(table_name, &query_req.req, resolver) catch |err| switch (err) {
             error.TableNotFound => return error.TableNotFound,
             error.InvalidSchemaUpdateRequest, error.InvalidTableIndexMetadata => return error.InvalidQueryRequest,
@@ -15029,7 +15057,7 @@ pub const ApiHttpServer = struct {
         if (try self.queryTableDefinition(resolver.arena, resolver, table_name, lake_request)) |table| {
             if (try @import("lake_index_text_query.zig").executeWithDelivery(alloc, self, table, query_req.req, lake_request, delivery)) |result| return result;
         }
-        if (query_req.req.remote_snapshot != null) return error.InvalidQueryRequest;
+        if (query_req.req.remote_snapshot != null and query_req.req.native_query_cut == null) return error.InvalidQueryRequest;
         return (queryWithTransientReadRetry(
             alloc,
             self.sharedApiIo(),
@@ -20582,6 +20610,7 @@ pub const ApiHttpServer = struct {
     }
 
     const CatalogQueryResolver = struct {
+        native_capture_token: ?[]const u8 = null,
         arena: std.mem.Allocator,
         delivery: ?@import("antfly_local_sources").api_query_response.Delivery = null,
         revision: ?u64 = null,
@@ -21664,7 +21693,21 @@ pub const ApiHttpServer = struct {
                     const policy = try resolveEffectiveRowFilterJson(a, identity, binding.physical);
                     defer if (policy) |filter| a.free(filter);
                     if (runner.overlay and policy != null) return error.UnsupportedQueryRequest;
-                    var response = try runner.server.handleAdmittedResolvedTableQueryWithContentTypeCancellation(binding.physical, leaf_query, null, identity, runner.cancellation, binding.label, if (binding.join) |*value| value else null, &resolver, binding.dispatch);
+                    var native_query = leaf_query;
+                    const external = try @import("antfly_local_sources").serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc(scratch, bound.schema_json);
+                    if (bound.storage.engine != .object and external == null) {
+                        var request = try std.json.parseFromSliceLeaky(std.json.Value, scratch, leaf_query, .{});
+                        if (!request.object.contains("remote_snapshot")) {
+                            var store = try @import("lake_index_store.zig").Store.openNative(scratch, runner.server.cfg.node_config, runner.server.cfg.secret_store, false, runner.server.cfg.deployment_mode, runner.server.cfg.native_lake_artifact_base_dir);
+                            defer store.deinit();
+                            var artifacts = store.artifactStore();
+                            const token = try @import("native_retained_cut.zig").save(scratch, &artifacts, store.identity, runner.server.embedding_provider_runtime.io, bound.*, @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms, context.cancellation);
+                            try request.object.put(scratch, "remote_snapshot", .{ .string = token });
+                            resolver.native_capture_token = token;
+                            native_query = try std.json.Stringify.valueAlloc(scratch, request, .{});
+                        }
+                    }
+                    var response = try runner.server.handleAdmittedResolvedTableQueryWithContentTypeCancellation(binding.physical, native_query, null, identity, runner.cancellation, binding.label, if (binding.join) |*value| value else null, &resolver, binding.dispatch);
                     if (response.status != 200) return response;
                     errdefer response.deinit(runner.server.alloc);
                     var after = (try runner.server.source.linearizableSnapshot(context)) orelse return error.UnsupportedQueryRequest;
@@ -21674,7 +21717,11 @@ pub const ApiHttpServer = struct {
                     var parsed = try std.json.parseFromSliceLeaky(std.json.Value, scratch, response.body, .{});
                     const identity_json = try std.json.Stringify.valueAlloc(scratch, .{ .id = bound.table_id, .generation = bound.object_storage_generation, .schema = &localDigest(bound.schema_json), .indexes = &localDigest(bound.indexes_json), .policy = &localDigest(policy orelse "null") }, .{});
                     const value = try std.json.parseFromSliceLeaky(std.json.Value, scratch, identity_json, .{});
-                    for (parsed.object.getPtr("responses").?.array.items) |*result| try result.object.put(scratch, "_composed_identity", value);
+                    const leaf_input = try std.json.parseFromSliceLeaky(std.json.Value, scratch, native_query, .{});
+                    for (parsed.object.getPtr("responses").?.array.items) |*result| {
+                        try result.object.put(scratch, "_composed_identity", value);
+                        if (leaf_input.object.get("remote_snapshot")) |token| try result.object.put(scratch, "remote_snapshot", token);
+                    }
                     const encoded = try std.json.Stringify.valueAlloc(runner.server.alloc, parsed, .{});
                     runner.server.alloc.free(response.body);
                     response.body = encoded;

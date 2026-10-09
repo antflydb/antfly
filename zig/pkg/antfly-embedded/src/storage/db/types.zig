@@ -1848,6 +1848,8 @@ pub const SearchRequest = struct {
     index_name: ?[]const u8 = null,
     primary_text_index_name: ?[]const u8 = null,
     remote_snapshot: ?[]const u8 = null,
+    /// Borrowed, trusted coordinator control; never accepted from public JSON.
+    native_query_cut: ?@import("native_query_cut_contract.zig").Request = null,
     lake_read: ?struct {
         visibility: enum { accepted, published } = .accepted,
         through: ?struct { table_id: u64, object_generation: u64, wal_lsn: u64 } = null,
@@ -1989,6 +1991,7 @@ const hierarchy_children_validated_fields = [_][]const u8{
 const hierarchy_children_supported_internal_fields = [_][]const u8{
     "response_table_name",
     "prepared_read_table_id",
+    "native_query_cut",
     "document_lookup_groups",
     "filter_query_json",
     "exclusion_query_json",

@@ -33,9 +33,9 @@ class QueryResult:
         next_source_cursor (str | Unset): Opaque continuation for composed queries. Pass as source_cursor with the same
             query; valid until the earliest retained leaf cut expires (at most 60 seconds). Publication and restart preserve
             it; authorization and incarnation fences remain enforced.
-        remote_snapshot (str | Unset): Opaque remote snapshot to echo with ordered pagination. Lake tokens retain the
-            archive publication, metadata and accepted WAL cut for 60 seconds; other remote engines may provide an
-            invalidation-only fence. Every use rechecks access and incarnation.
+        remote_snapshot (str | Unset): Opaque snapshot to echo with ordered pagination. Native tokens retain the
+            complete physical generation; lake tokens retain the archive publication, metadata and accepted WAL cut, for at
+            most 60 seconds. Every use rechecks access, incarnation and recipe. Unavailable retained generations return 409.
         evaluation (QueryResultBaseEvaluation | Unset): Function evaluation scope, population, usage, and scoped
             aggregations.
         hits (QueryHits | Unset): A list of query hits.

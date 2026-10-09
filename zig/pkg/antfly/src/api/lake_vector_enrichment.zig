@@ -25,9 +25,11 @@ pub const Producer = struct {
     memo: ?Memo = null,
     name: []const u8,
     column: []const u8,
+    config: V,
+    options: ?managed.InitOptions,
     pub fn init(a: A, name: []const u8, column: []const u8, config: V, options: ?managed.InitOptions) !Producer {
-        var result: Producer = .{ .allocator = a, .name = name, .column = column };
-        if (config.object.contains("embedder")) {
+        var result: Producer = .{ .allocator = a, .name = name, .column = column, .config = config, .options = options };
+        if (@import("lake_enrichment_units.zig").configured(config, "embedder") != null) {
             const opts = options orelse return error.LakeEmbeddingProviderUnavailable;
             var indexes: V = .{ .object = .empty };
             defer indexes.object.deinit(a);
@@ -38,6 +40,39 @@ pub const Producer = struct {
     }
     pub fn deinit(self: *Producer) void {
         if (self.managed) |*owner| owner.deinit();
+    }
+    /// Prepare the complete row through the same template, media marker and
+    /// chunker interfaces used by native document enrichment. Each unit owns
+    /// a distinct vector identity; never pool chunks into a document vector.
+    pub fn units(self: *Producer, a: A, row: V) ![]const @import("lake_enrichment_units.zig").Unit {
+        if (self.memo) |memo| try memo.context.ensureActive();
+        return @import("lake_enrichment_units.zig").prepare(a, self.config, self.column, row, self.options);
+    }
+    pub fn denseUnit(self: *Producer, a: A, unit: @import("lake_enrichment_units.zig").Unit, dims: u32) !?[]const f32 {
+        if (unit.materialized) |value| return self.dense(a, value, dims);
+        if (unit.parts.len == 1 and unit.parts[0] == .text) return self.dense(a, .{ .string = unit.parts[0].text }, dims);
+        const owner = if (self.managed) |*value| value else return error.LakeEmbeddingProviderUnavailable;
+        const input = try @import("lake_enrichment_units.zig").partsJson(a, unit.parts);
+        defer a.free(input);
+        const key = if (self.memo) |memo| try memo.key(a, self.name, "dense-parts", dims, .{ .string = input }) else null;
+        var probe: Probe = .{};
+        if (self.memo) |memo| {
+            probe = try memo.read(a, key.?);
+            if (probe.vector) |cached| return try materializedDense(a, cached, dims);
+        }
+        const vector = try owner.denseInterface().embedDenseParts(a, self.name, unit.parts, dims);
+        if (vector.len != dims) return error.InvalidVectorDimensions;
+        for (vector) |component| if (!std.math.isFinite(component)) return error.InvalidVectorValue;
+        if (self.memo) |memo| {
+            const value = try std.json.parseFromSliceLeaky(V, a, try std.json.Stringify.valueAlloc(a, vector, .{}), .{});
+            return try materializedDense(a, try memo.write(a, key.?, probe.etag, value), dims);
+        }
+        return vector;
+    }
+    pub fn sparseUnit(self: *Producer, a: A, unit: @import("lake_enrichment_units.zig").Unit) !?local.storage_db_enrichment_embedder.SparseEmbedding {
+        if (unit.materialized) |value| return self.sparse(a, value);
+        if (unit.parts.len != 1 or unit.parts[0] != .text) return error.UnsupportedSparseMediaInput;
+        return self.sparse(a, .{ .string = unit.parts[0].text });
     }
     pub fn dense(self: *Producer, a: A, value: V, dims: u32) !?[]const f32 {
         if (value == .null) return null;
