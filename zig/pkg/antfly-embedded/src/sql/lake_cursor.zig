@@ -2096,7 +2096,7 @@ test "lake SQL split planning owns footer workers and returns cursors without th
         var store: Context.Store = .{ .base = lake.meter.client(), .context = original };
         lake.source.scanner.object_reader.client = store.client(a);
         try lake.source.attachCache(&cache, lake.table.external_base_source.?.binding, original);
-        var scheduler = try Runnable.Scheduler.init(.{ .slots = 2, .max_bytes = 64 * 1024 * 1024, .max_operations = if (case == .registry_full) 1 else 128 });
+        var scheduler = try Runnable.Scheduler.init(.{ .slots = 2, .max_bytes = 64 * 1024 * 1024, .max_operations = if (case == .registry_full) 2 else 128 });
         var signal: std.atomic.Value(bool) = .init(false);
         Clock.value.store(0, .release);
         var planning: Runnable.Execution = .{};
