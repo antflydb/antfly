@@ -37,6 +37,7 @@ const typed_dv = @import("../../../section/typed_doc_values.zig");
 const roaring = @import("../../../encoding/roaring.zig");
 const snappy = @import("../../../encoding/snappy.zig");
 const distributed_stats_mod = @import("../../../search/distributed_stats.zig");
+const text_stats_ownership = @import("../../../search/text_stats_ownership.zig");
 const runtime_preflight = @import("../runtime_preflight.zig");
 const control_contract = @import("control_contract.zig");
 const analysis_mod = @import("../../../search/analysis.zig");
@@ -12606,32 +12607,8 @@ pub fn collectSearchRequestTextStats(
 
     if (stats_map.count() == 0) return &.{};
 
-    var requests = try alloc.alloc(ExplicitTextStatRequest, stats_map.count());
-    defer {
-        for (requests) |request| {
-            for (request.terms) |term| alloc.free(term);
-            if (request.terms.len > 0) alloc.free(request.terms);
-        }
-        alloc.free(requests);
-    }
-
-    var request_index: usize = 0;
-    var it = stats_map.iterator();
-    while (it.next()) |entry| {
-        const terms = try alloc.alloc([]const u8, entry.value_ptr.terms.count());
-        var term_index: usize = 0;
-        var term_it = entry.value_ptr.terms.keyIterator();
-        while (term_it.next()) |term| {
-            terms[term_index] = try alloc.dupe(u8, term.*);
-            term_index += 1;
-        }
-        requests[request_index] = .{
-            .index_name = entry.value_ptr.index_name,
-            .field = entry.value_ptr.field,
-            .terms = terms,
-        };
-        request_index += 1;
-    }
+    const requests = try text_stats_ownership.requestsFromMap(ExplicitTextStatRequest, alloc, &stats_map);
+    defer text_stats_ownership.freeRequests(alloc, requests, requests.len);
 
     return try collectExplicitTextStats(alloc, requests, executor);
 }
@@ -12665,10 +12642,7 @@ pub fn collectExplicitTextStats(
             if (term_doc_freqs.len > 0) alloc.free(term_doc_freqs);
         }
         for (request.terms, 0..) |term, term_index| {
-            term_doc_freqs[term_index] = .{
-                .term = try alloc.dupe(u8, term),
-                .doc_freq = try snapshot.termDocFreq(alloc, request.field, term),
-            };
+            term_doc_freqs[term_index] = try text_stats_ownership.termDocFreq(alloc, snapshot, request.field, term);
             initialized_terms += 1;
         }
         out[i] = .{
@@ -13100,22 +13074,7 @@ fn appendFieldTerm(
     term: []const u8,
 ) !void {
     const map_key = try textStatsMapKeyAlloc(alloc, index_name, field);
-    errdefer alloc.free(map_key);
-
-    const gop = try stats_map.getOrPut(alloc, map_key);
-    if (!gop.found_existing) {
-        gop.key_ptr.* = map_key;
-        gop.value_ptr.* = .{
-            .field = try alloc.dupe(u8, field),
-            .index_name = index_name,
-        };
-    } else {
-        alloc.free(map_key);
-    }
-    const term_gop = try gop.value_ptr.terms.getOrPut(alloc, term);
-    if (!term_gop.found_existing) {
-        term_gop.key_ptr.* = try alloc.dupe(u8, term);
-    }
+    try text_stats_ownership.appendTerm(SearchRequestTextStatEntry, alloc, stats_map, map_key, index_name, field, term);
 }
 
 fn textStatsMapKeyAlloc(alloc: Allocator, index_name: ?[]const u8, field: []const u8) ![]u8 {
