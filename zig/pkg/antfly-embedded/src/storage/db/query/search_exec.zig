@@ -2911,7 +2911,11 @@ fn logExactSortBudgetRejection(
 }
 
 fn checkSearchRequestDeadline(req: types.SearchRequest) !void {
-    if (req.execution_runnable) |grant| try grant.checkpoint();
+    if (req.execution_runnable) |grant| {
+        try grant.validate();
+        const status = grant.checkpoint(grant.context);
+        if (!status.isOk()) return @import("antfly_runtime_abi").error_abi.errorFromStatus(status);
+    }
     if (req.cancellation) |cancellation| {
         if (cancellation.isCancelled()) return error.Cancelled;
     }

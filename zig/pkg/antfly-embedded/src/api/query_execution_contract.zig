@@ -27,7 +27,11 @@ const db_mod = @import("../storage/db/control_root.zig");
 pub const algebraic_ir = db_mod.algebraic.ir;
 
 pub fn checkQueryDeadline(req: db_mod.types.SearchRequest) !void {
-    if (req.execution_runnable) |grant| try grant.checkpoint();
+    if (req.execution_runnable) |grant| {
+        try grant.validate();
+        const status = grant.checkpoint(grant.context);
+        if (!status.isOk()) return @import("antfly_runtime_abi").error_abi.errorFromStatus(status);
+    }
     if (req.cancellation) |value| {
         if (value.isCancelled()) return error.Cancelled;
     }
