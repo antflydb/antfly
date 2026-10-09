@@ -246,6 +246,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .optimize = optimize,
     }));
     inference_owner_sources.addImport("antfly_cancellation", antfly_imports.cancellation);
+    inference_owner_sources.addImport("antfly_runtime_abi", antfly_imports.runtime_abi);
     const fanout_owner_root = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/api/runnable_fanout_owner.zig"),
         .target = target,
@@ -257,7 +258,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const fanout_owner_tests = b.addTest(.{
         .name = "runnable-fanout-owner-tests",
         .root_module = fanout_owner_root,
-        .filters = &.{"fanout owner retains joined result slots"},
+        .filters = &.{ "fanout owner retains joined result slots", "remote wait restores the original request phase" },
         .max_rss = 3 * 1024 * 1024 * 1024,
     });
     b.step("antfly-runnable-fanout-owner-test", "Verify independent child result ownership and original phase through joining and rejected resumption")

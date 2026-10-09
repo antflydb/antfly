@@ -60,6 +60,27 @@ pub fn resumeCoordinator(parent: ?abi.Borrowed, original_class: ?abi.Class) !voi
     try checked(borrow.enter(borrow.context, @backingInt(class)));
 }
 
+pub const RemoteWait = struct {
+    borrow: ?@import("antfly_runtime_abi").runnable_abi.Borrowed,
+    parked_class: ?@import("antfly_runtime_abi").runnable_abi.Class = null,
+
+    pub fn boundary(self: *@This()) ?@import("antfly_local_sources").common_execution_wait.Boundary {
+        if (self.borrow == null) return null;
+        return .{ .ptr = self, .begin = begin, .end = end };
+    }
+    fn begin(raw: *anyopaque) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (self.parked_class != null) return error.InvalidRunnableTransition;
+        self.parked_class = try @import("runnable_fanout_owner.zig").parkCoordinator(self.borrow);
+    }
+    fn end(raw: *anyopaque) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        const phase = self.parked_class orelse return error.InvalidRunnableTransition;
+        try @import("runnable_fanout_owner.zig").resumeCoordinator(self.borrow, phase);
+        self.parked_class = null;
+    }
+};
+
 pub fn checked(status: runtime.error_abi.Status) !void {
     if (!status.isOk()) return runtime.error_abi.errorFromStatus(status);
 }
@@ -150,6 +171,76 @@ test "fanout owner retains joined result slots and original phase through denied
             result.* = null;
             owner.retire();
         }
+        try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 23), scheduler.stats().retained_bytes);
+        root.finish();
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+    };
+}
+
+test "remote wait restores the original request phase and rejects stopped authority" {
+    const native = @import("antfly_local_sources").common_request_admission.runnable_scheduler;
+    const Case = enum { success, cancel, expire, shutdown };
+    const Signal = struct {
+        fn requested(raw: *const anyopaque) bool {
+            return @as(*const std.atomic.Value(bool), @ptrCast(@alignCast(raw))).load(.acquire);
+        }
+    };
+    var absent = RemoteWait{ .borrow = null };
+    try std.testing.expect(absent.boundary() == null);
+    for ([_]native.Class{ .query, .inference }) |phase| for (std.enums.values(Case)) |case| {
+        const io = std.testing.io;
+        var scheduler = try native.Scheduler.init(.{ .slots = 2, .control_slots = 1 });
+        defer scheduler.close();
+        var canceled = std.atomic.Value(bool).init(false);
+        var root = native.Execution{};
+        defer root.finish();
+        const deadline = @as(u64, @intCast(std.Io.Clock.awake.now(io).nanoseconds)) + 100 * std.time.ns_per_ms;
+        try root.start(&scheduler, .{ .io = io, .retained_bytes = 23, .deadline_ns = deadline, .cancellation = .{ .ptr = &canceled, .requested = Signal.requested } }, phase);
+        var read = @import("runnable_local_read.zig").Read{ .execution = &root, .allocator = std.testing.allocator };
+        const team = try read.team();
+        var wait = RemoteWait{ .borrow = team.borrow };
+        const boundary = wait.boundary().?;
+        try boundary.beginWait();
+        try std.testing.expectEqual(phase, try root.retainedClass());
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().runnable_slots);
+        try std.testing.expectEqual(@as(usize, 1), scheduler.stats().resource_blocked);
+        try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 23), scheduler.stats().retained_bytes);
+        // Physical remote waits release capacity while retaining the original
+        // operation. Protected control must still execute at C1.
+        var control = native.Execution{};
+        defer control.finish();
+        try control.start(&scheduler, .{ .io = io, .retained_bytes = 7 }, .control);
+        try control.checkpoint();
+        control.finish();
+        switch (case) {
+            .success => {},
+            .cancel => canceled.store(true, .release),
+            .expire => while (@as(u64, @intCast(std.Io.Clock.awake.now(io).nanoseconds)) < deadline) try io.sleep(.fromMilliseconds(1), .awake),
+            .shutdown => scheduler.close(),
+        }
+        const grants = scheduler.stats().grants;
+        const resumption = boundary.endWait();
+        switch (case) {
+            .success => {
+                try resumption;
+                try std.testing.expect(wait.parked_class == null);
+                try std.testing.expectEqual(phase, try root.retainedClass());
+                // Reuse is synchronous and preserves the same request scope.
+                try boundary.beginWait();
+                try boundary.endWait();
+            },
+            .cancel => try std.testing.expectError(error.Canceled, resumption),
+            .expire => try std.testing.expectError(error.DeadlineExceeded, resumption),
+            .shutdown => try std.testing.expectError(error.SchedulerClosed, resumption),
+        }
+        if (case != .success) {
+            try std.testing.expect(wait.parked_class != null);
+            try std.testing.expectEqual(grants, scheduler.stats().grants);
+        }
+        try std.testing.expectEqual(@as(?u64, deadline), root.entry.?.options.deadline_ns);
         try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
         try std.testing.expectEqual(@as(u64, 23), scheduler.stats().retained_bytes);
         root.finish();
