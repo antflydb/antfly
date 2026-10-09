@@ -70,8 +70,8 @@ pub const Bridge = struct {
         const receiver = try self.allocator.create(ChildReceiver);
         errdefer self.allocator.destroy(receiver);
         receiver.* = .{ .io = io };
-        // Foreign dispatch may retain this IO callback context. Its address
-        // therefore belongs to the child packet, never to this stack frame.
+        // Keep the IO value in the retained packet. Its underlying executor
+        // remains borrowed from the caller through the child's physical join.
         const io_borrow = runtime.native_abi.IoBorrow.init(&receiver.io);
         try self.borrow.reserveChild(&.{ .io = &io_borrow, .retained_bytes = bytes, .out_child = &receiver.child });
         errdefer receiver.child.deinit();
@@ -114,6 +114,14 @@ fn classFromAbi(raw: c_int) !native.Class {
 const TestAuthority = struct {
     execution: *native.Execution,
     allocator: std.mem.Allocator = std.testing.allocator,
+    const Dispatch = @FieldType(runtime.native_abi.IoBorrow, "dispatch");
+    const P = @typeInfo(@typeInfo(Dispatch).pointer.child).@"fn".param_types;
+    var original_dispatch: Dispatch = undefined;
+    var foreign_calls: std.atomic.Value(usize) = .init(0);
+    fn dispatch(a: P[0].?, b: P[1].?, c: P[2].?, d: P[3].?, e: P[4].?, f: P[5].?) callconv(.c) void {
+        _ = foreign_calls.fetchAdd(1, .release);
+        original_dispatch(a, b, c, d, e, f);
+    }
     fn borrowed(self: *@This()) abi.Borrowed {
         return .{ .context = self, .cpu_slots = 1, .parent_class = @backingInt(abi.Class.query), .checkpoint = check, .park = park, .enter = enter, .reserve_child = reserve, .check_lifetime = lifetime };
     }
@@ -142,7 +150,8 @@ const TestAuthority = struct {
         const self = owner(raw);
         // Exercise retained IO callback contexts even in this one-codegen test.
         var io = options.io.*;
-        io.native_codegen_identity = null;
+        original_dispatch = io.dispatch;
+        io.dispatch = dispatch;
         var forwarded = options.*;
         forwarded.io = &io;
         @import("runnable_local_child.zig").reserve(self.execution, self.allocator, &forwarded) catch |err| return runtime.error_abi.statusFromError(err);
@@ -185,6 +194,7 @@ test "native execution borrow preserves physical child lifetime and protected co
     };
     for (std.enums.values(Case)) |case| {
         Clock.time.store(10, .release);
+        TestAuthority.foreign_calls.store(0, .release);
         var canceled: std.atomic.Value(bool) = .init(false);
         var owner = try native.Scheduler.init(.{ .slots = 2 });
         var original: native.Execution = .{};
@@ -242,6 +252,7 @@ test "native execution borrow preserves physical child lifetime and protected co
         // physical join and is retired only by the owned child adapter finish.
         try std.testing.expectEqual(retained, owner.stats().retained_bytes);
         child.finish();
+        try std.testing.expect(TestAuthority.foreign_calls.load(.acquire) != 0);
         try std.testing.expectEqual(@as(usize, 0), original.entry.?.children);
         try std.testing.expectEqual(@as(u64, 19), owner.stats().retained_bytes);
         parent.finish();
