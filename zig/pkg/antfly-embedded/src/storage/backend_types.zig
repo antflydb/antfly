@@ -67,6 +67,10 @@ pub const Namespace = struct {
     /// Opt-in owner-bounded local point borrowing; ordinary point APIs keep
     /// their owned-result contract. This hint is not namespace identity.
     borrow_local_point_results: bool = false,
+    /// Current-tip batch readers release source generations at the end of the
+    /// call. Copy source-owned values at resolution; disk results already carry
+    /// a block pin or transaction allocation. Not part of namespace identity.
+    own_source_point_results: bool = false,
 
     pub const BlockCacheAdmission = enum {
         retain,
