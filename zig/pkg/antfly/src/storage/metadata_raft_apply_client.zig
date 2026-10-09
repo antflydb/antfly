@@ -400,7 +400,10 @@ pub const RaftApplyStore = struct {
         return self.catalogProjection(?system_catalog.ResolvedTable, alloc, group_id, .{ .catalog_resolve_identity = target });
     }
     pub fn resolveSystemCatalogIdentities(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: system_catalog.ResolveMany) !system_catalog.ResolvedMany {
-        return self.catalogProjection(system_catalog.ResolvedMany, alloc, group_id, .{ .catalog_resolve_many = request });
+        const result = try self.catalogProjection(system_catalog.ResolvedMany, alloc, group_id, .{ .catalog_resolve_many = request });
+        errdefer result.deinit(alloc);
+        try result.validateRelations(request);
+        return result;
     }
     pub fn tableWriteValidation(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, name: []const u8) ![]u8 {
         return self.catalogProjection([]u8, alloc, group_id, .{ .catalog_write_validation = name });

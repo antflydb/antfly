@@ -182,6 +182,100 @@ fn adoptLiveRelationWriterForTest(store: *RaftApplyStore, a: std.mem.Allocator, 
     return ready;
 }
 
+test "system catalog relation namespace transaction bulk resolution requires a live root and follows schema ownership" {
+    const a = std.testing.allocator;
+    const group: u64 = 41;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/relation-resolution", .{tmp.sub_path});
+    defer a.free(root);
+    var store = try RaftApplyStore.init(a, .{ .root_dir = root });
+    defer store.deinit();
+    try store.applyStandaloneCommand(group, .{ .initialize_metadata_incarnation = "01010101010101010101010101010101".* });
+    const description: [256 * 1024]u8 = @splat('x');
+    var table: metadata.TableRecord = .{ .table_id = 7, .name = "items", .description = &description, .schema_json = "{\"version\":1,\"relational_indexes\":[{\"name\":\"old_idx\"}]}" };
+    try store.applyStandaloneCommand(group, .{ .upsert_table = table });
+    const targets = [_]system_catalog.RelationTarget{ .{ .name = "items" }, .{ .name = "old_idx" }, .{ .name = "new_idx" }, .{ .namespace = "missing", .name = "old_idx" } };
+    try std.testing.expectError(error.CatalogPublicationProofPending, store.resolveSystemCatalogIdentities(a, group, .{ .relations = &targets }));
+    _ = try adoptLiveRelationWriterForTest(&store, a, group);
+    var epoch: relation_reconciliation.Epoch = undefined;
+    {
+        const resolved = try store.resolveSystemCatalogIdentities(a, group, .{ .relations = &targets, .include_query_definitions = true });
+        defer resolved.deinit(a);
+        epoch = resolved.relation_epoch.?;
+        try resolved.validateRelations(.{ .relations = &targets, .include_query_definitions = true });
+        try std.testing.expectEqual(@as(usize, 0), resolved.tables.len);
+        try std.testing.expectEqual(relation_names.Kind.table, resolved.relations[0].?.owner.kind);
+        try std.testing.expectEqual(relation_names.Kind.index, resolved.relations[1].?.owner.kind);
+        try std.testing.expectEqualStrings(table.name, resolved.relations[1].?.table.name);
+        try std.testing.expectEqualStrings(table.schema_json, resolved.relations[1].?.table.query_definition.?.schema_json);
+        try std.testing.expect(resolved.relations[2] == null);
+        try std.testing.expect(resolved.relations[3] == null);
+        const encoded = try std.json.Stringify.valueAlloc(a, resolved, .{});
+        defer a.free(encoded);
+        var wire = try std.json.parseFromSlice(system_catalog.ResolvedMany, a, encoded, .{});
+        defer wire.deinit();
+        try wire.value.validateRelations(.{ .relations = &targets, .include_query_definitions = true, .expected_relation_epoch = epoch });
+        try std.testing.expect(wire.value.relations[1].?.owner.eql(resolved.relations[1].?.owner));
+    }
+    {
+        // Identity lookup must not allocate the table's large administrative
+        // description or decode a schema DOM for each requested index.
+        var buffer: [16 * 1024]u8 = undefined;
+        var bounded = std.heap.FixedBufferAllocator.init(&buffer);
+        const resolved = try store.resolveSystemCatalogIdentities(bounded.allocator(), group, .{ .relations = &targets, .expected_relation_epoch = epoch });
+        defer resolved.deinit(bounded.allocator());
+        try std.testing.expectEqual(@as(u64, 7), resolved.relations[1].?.owner.table_id);
+    }
+    var foreign_epoch = epoch;
+    foreign_epoch.incarnation[0] ^= 1;
+    try std.testing.expectError(error.CatalogGenerationChanged, store.resolveSystemCatalogIdentities(a, group, .{ .relations = &targets, .expected_relation_epoch = foreign_epoch }));
+    table.schema_json = "{\"version\":2,\"relational_indexes\":[{\"name\":\"new_idx\"}]}";
+    try store.applyStandaloneCommand(group, .{ .upsert_table = table });
+    {
+        const resolved = try store.resolveSystemCatalogIdentities(a, group, .{ .relations = &targets });
+        defer resolved.deinit(a);
+        try std.testing.expect(resolved.relation_epoch.?.revision > epoch.revision);
+        // The obsolete derived registry still contains old_idx, but cannot
+        // turn the published root's authoritative miss into a hit.
+        try std.testing.expect(resolved.relations[1] == null);
+        try std.testing.expectEqual(@as(u32, 2), resolved.relations[2].?.owner.schema_version);
+        try std.testing.expect(resolved.relations[2].?.table.query_definition == null);
+        try resolved.validateRelations(.{ .relations = &targets });
+        try std.testing.expectError(error.InvalidCatalogRecord, resolved.validateRelations(.{ .relations = &targets, .include_query_definitions = true }));
+        var invalid = resolved.relations[2].?;
+        invalid.owner.phase = .reserved;
+        invalid.owner.publication_id = @splat(1);
+        const reserved: system_catalog.ResolvedMany = .{ .revision = resolved.revision, .tables = &.{}, .relation_epoch = resolved.relation_epoch, .relations = &.{invalid} };
+        try std.testing.expectError(error.InvalidCatalogRecord, reserved.validateRelations(.{ .relations = &.{targets[2]} }));
+    }
+    try std.testing.expectError(error.CatalogGenerationChanged, store.resolveSystemCatalogIdentities(a, group, .{ .relations = &targets, .expected_relation_epoch = epoch }));
+    const too_many: [257]system_catalog.RelationTarget = @splat(.{ .name = "items" });
+    try std.testing.expectError(error.CatalogCommandTooLarge, store.resolveSystemCatalogIdentities(a, group, .{ .relations = &too_many }));
+    try std.testing.expectError(error.InvalidCatalogName, store.resolveSystemCatalogIdentities(a, group, .{ .relations = &.{.{ .name = "" }} }));
+    // Older peers omit the attestation field. Their default response must not
+    // be treated as a successful relation lookup with no matches.
+    var old = try std.json.parseFromSlice(system_catalog.ResolvedMany, a, "{\"revision\":1,\"tables\":[]}", .{});
+    defer old.deinit();
+    try std.testing.expect(old.value.relation_epoch == null);
+    try std.testing.expectError(error.TableTopologyUpgradeRequired, old.value.validateRelations(.{ .relations = &targets }));
+    const legacy_wire = struct {
+        targets: []const system_catalog.Target,
+        storage_names: []const []const u8,
+        include_query_definitions: bool,
+        expected_revision: ?u64,
+    };
+    const request_bytes = try std.json.Stringify.valueAlloc(a, system_catalog.ResolveMany{}, .{});
+    defer a.free(request_bytes);
+    var legacy_request = try std.json.parseFromSlice(legacy_wire, a, request_bytes, .{});
+    defer legacy_request.deinit();
+    const legacy_result = struct { revision: u64, tables: []const ?system_catalog.ResolvedTable, logical_names: []const ?[]const u8 };
+    const result_bytes = try std.json.Stringify.valueAlloc(a, old.value, .{});
+    defer a.free(result_bytes);
+    var legacy_response = try std.json.parseFromSlice(legacy_result, a, result_bytes, .{});
+    defer legacy_response.deinit();
+}
+
 test "system catalog relation namespace transaction live writers pin roots recover and ignore obsolete registry bytes" {
     const a = std.testing.allocator;
     const group: u64 = 41;
@@ -13794,11 +13888,21 @@ pub const RaftApplyStore = struct {
     }
 
     pub fn resolveSystemCatalogIdentities(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: system_catalog.ResolveMany) !system_catalog.ResolvedMany {
-        if (request.targets.len > 256 or request.storage_names.len > 256 - request.targets.len) return error.CatalogCommandTooLarge;
+        if (request.targets.len > 256 or request.storage_names.len > 256 - request.targets.len or request.relations.len > 256 - request.targets.len - request.storage_names.len) return error.CatalogCommandTooLarge;
+        if (request.expected_relation_epoch != null and request.relations.len == 0) return error.InvalidCatalogMutation;
+        for (request.relations) |target| try target.validate();
         var txn = try self.beginQueryCatalogReadTxn(group_id);
         defer txn.abort();
         const meta = try system_catalog_storage.readMeta(alloc, &txn, group_id);
         if (request.expected_revision) |expected| if (expected != meta.revision) return error.CatalogGenerationChanged;
+        // One root and one source cut for the whole batch. An unpublished or
+        // stale registry cannot attest absence, even for a missing namespace.
+        var live = if (request.relations.len != 0)
+            (try relation_reconciliation.LiveStore(docstore.DocStore.Txn).open(&txn, group_id)) orelse return error.CatalogPublicationProofPending
+        else
+            null;
+        if (live) |value| if (!value.root.epoch.eql(try relationSourceEpochTxn(&txn, group_id))) return error.CatalogGenerationChanged;
+        if (request.expected_relation_epoch) |expected| if (!live.?.root.epoch.eql(expected)) return error.CatalogGenerationChanged;
         const tables = try alloc.alloc(?system_catalog.ResolvedTable, request.targets.len);
         var initialized: usize = 0;
         errdefer {
@@ -13815,7 +13919,33 @@ pub const RaftApplyStore = struct {
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
         const view: system_catalog_storage.View = .{ .alloc = arena.allocator(), .txn = &txn, .group_id = group_id, .meta = meta };
-        return .{ .revision = meta.revision, .tables = tables, .logical_names = try system_catalog.logicalNamesAlloc(alloc, view, request.storage_names) };
+        const relations = try alloc.alloc(?system_catalog.ResolvedRelation, request.relations.len);
+        @memset(relations, null);
+        errdefer {
+            for (relations) |relation| if (relation) |value| value.deinit(alloc);
+            alloc.free(relations);
+        }
+        for (request.relations, relations) |target, *slot| {
+            const namespace_id = (try resolveSystemCatalogNamespaceTxn(alloc, &txn, group_id, target.database, target.namespace)) orelse continue;
+            const owner = (try live.?.getClaim(.{ .namespace_id = namespace_id, .name = target.name })) orelse continue;
+            var key_buf: [160]u8 = undefined;
+            const bytes = txn.get(try tableKeyForGroup(&key_buf, group_id, owner.table_id)) catch |err| switch (err) {
+                error.NotFound => return error.InvalidCatalogRecord,
+                else => return err,
+            };
+            var table = try decodeTableIdentity(alloc, bytes);
+            errdefer table.deinit(alloc);
+            if (table.table_id != owner.table_id) return error.InvalidCatalogRecord;
+            if (request.include_query_definitions) {
+                table.query_definition = try self.queryTableDefinitionTxn(alloc, &txn, group_id, table.name);
+                const definition = table.query_definition orelse return error.InvalidCatalogRecord;
+                var digest: [32]u8 = undefined;
+                std.crypto.hash.Blake3.hash(definition.schema_json, &digest, .{});
+                if (!std.mem.eql(u8, &digest, &owner.schema_digest)) return error.InvalidCatalogRecord;
+            }
+            slot.* = .{ .owner = owner, .table = table };
+        }
+        return .{ .revision = meta.revision, .tables = tables, .logical_names = try system_catalog.logicalNamesAlloc(alloc, view, request.storage_names), .relation_epoch = if (live) |value| value.root.epoch else null, .relations = relations };
     }
 
     pub fn writeValidationRevision(self: *RaftApplyStore, group_id: u64) !u64 {
@@ -13875,14 +14005,18 @@ pub const RaftApplyStore = struct {
         return projection.query_definition;
     }
 
+    fn resolveSystemCatalogNamespaceTxn(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, database_name: []const u8, namespace_name: []const u8) !?u64 {
+        var database = try system_catalog_storage.find(alloc, txn, group_id, .database, 0, database_name);
+        defer if (database) |*parsed| parsed.deinit();
+        const database_id = if (database) |parsed| parsed.value.id else if (std.mem.eql(u8, database_name, system_catalog.default_database_name)) system_catalog.default_database_id else return null;
+        var namespace = try system_catalog_storage.find(alloc, txn, group_id, .namespace, database_id, namespace_name);
+        defer if (namespace) |*parsed| parsed.deinit();
+        return if (namespace) |parsed| parsed.value.id else if (database_id == system_catalog.default_database_id and std.mem.eql(u8, namespace_name, system_catalog.default_namespace_name)) system_catalog.default_namespace_id else null;
+    }
+
     fn resolveSystemCatalogResultTxn(self: *RaftApplyStore, comptime Result: type, alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, target: system_catalog.Target) !?Result {
         try target.validate();
-        var database = try system_catalog_storage.find(alloc, txn, group_id, .database, 0, target.database);
-        defer if (database) |*parsed| parsed.deinit();
-        const database_id = if (database) |parsed| parsed.value.id else if (std.mem.eql(u8, target.database, system_catalog.default_database_name)) system_catalog.default_database_id else return null;
-        var namespace = try system_catalog_storage.find(alloc, txn, group_id, .namespace, database_id, target.namespace);
-        defer if (namespace) |*parsed| parsed.deinit();
-        const namespace_id = if (namespace) |parsed| parsed.value.id else if (database_id == system_catalog.default_database_id and std.mem.eql(u8, target.namespace, system_catalog.default_namespace_name)) system_catalog.default_namespace_id else return null;
+        const namespace_id = (try resolveSystemCatalogNamespaceTxn(alloc, txn, group_id, target.database, target.namespace)) orelse return null;
         if (try system_catalog_storage.find(alloc, txn, group_id, .table, namespace_id, target.table)) |value| {
             var binding = value;
             defer binding.deinit();

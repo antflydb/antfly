@@ -2817,6 +2817,12 @@ const LocalStandaloneMetadata = struct {
                 return std.json.Stringify.valueAlloc(alloc, identity, .{});
             },
             .resolve_many => |request| {
+                if (request.relations.len != 0 or request.expected_relation_epoch != null) {
+                    const store = self.lifecycle_store orelse return error.CatalogPublicationProofPending;
+                    const resolved = try store.resolveSystemCatalogIdentities(alloc, group_ids.main_metadata_group_id, request);
+                    defer resolved.deinit(alloc);
+                    return std.json.Stringify.valueAlloc(alloc, resolved, .{});
+                }
                 if (request.targets.len > 256 or request.storage_names.len > 256 - request.targets.len) return error.CatalogCommandTooLarge;
                 const revision = self.systemCatalogState().revision;
                 if (request.expected_revision) |expected| if (expected != revision) return error.CatalogGenerationChanged;
@@ -13794,8 +13800,12 @@ test "system catalog standalone checkpoint preserves bindings and rolls back und
     try std.testing.expectEqual(metadata.systemCatalogState().next_id, seeded.systemCatalogState().next_id);
     try std.testing.expectEqual(metadata.systemCatalogState().revision, seeded.systemCatalogState().revision);
     const previous_store = metadata.lifecycle_store;
+    // No point-resolution attestation exists before a durable root has been
+    // published; neither the memory catalog nor an old derived map substitutes.
+    try std.testing.expectError(error.CatalogPublicationProofPending, source.systemCatalog(alloc, .{}, .{ .resolve_many = .{ .relations = &.{.{ .name = "events" }} } }));
     metadata.lifecycle_store = null;
     defer metadata.lifecycle_store = previous_store;
+    try std.testing.expectError(error.CatalogPublicationProofPending, source.systemCatalog(alloc, .{}, .{ .resolve_many = .{ .relations = &.{.{ .name = "events" }} } }));
     try std.testing.expectError(error.CatalogStorageUnavailable, source.systemCatalog(alloc, .{}, .{ .mutate = .{ .mutation = .{ .action = .rename, .kind = .database, .name = "warehouse", .new_name = "undurable" } } }));
     try std.testing.expect((try metadata.resolveSystemCatalogLocked(.{ .database = "warehouse", .table = "events" })) != null);
     try std.testing.expect((try metadata.resolveSystemCatalogLocked(.{ .database = "undurable", .table = "events" })) == null);

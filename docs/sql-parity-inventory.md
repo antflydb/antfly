@@ -2235,6 +2235,28 @@ build steps (18 tests), 14 current worker component tests, all 450 hot-standby
 tests, and 93/93 runtime build steps (three selected runtime regressions).
 The runtime gate required loopback networking for its existing HTTP listener;
 the sandbox-only listener rejection was not counted as a code failure.
+Bulk catalog resolution now has an opt-in relation-name contract: at most 256
+combined forward, reverse and relation lookups share one immutable transaction.
+It pins one published live root and its source incarnation/revision, checks
+optional epoch fences, and never falls back to obsolete derived claims or table
+scans. Results contain active ownership and the physical table identity, with
+query definitions captured and digest-checked only when requested. Reservations
+are not lookup results. Missing/unpublished roots cannot attest name absence.
+The storage-owner bridge validates peer attestation, result cardinality, active
+phase and owner/definition identity; older peers cannot silently turn unsupported
+resolution into a miss. Ordinary table requests/responses retain their prior
+wire shape. Standalone relation requests use the durable authority as well.
+Native coverage includes source-epoch/incarnation fences, root-following schema
+updates, obsolete-registry misses, a 16 KiB identity allocation budget despite a
+256 KiB table description, malformed peer responses and strict legacy wire
+decoding. This remains infrastructure: PostgreSQL DROP INDEX lowering, scoped
+authorization and publication bootstrap still need public SQL activation and
+unchanged-original/native/oracle evidence before any corpus credit.
+The final native relation-store gate passed 50/50 build steps and all 35 tests,
+including the new contract round trip and strict legacy decoding. Inventory
+integrity remains 475 implemented / 136 rejected / 73 superseded / 902 unresolved.
+Standalone qualification is tracked separately; its running build is not
+evidence of a completed standalone gate.
 The owned table-cut projector can now combine an exact predecessor definition
 with a plan-fenced successor definition in expected linear time. It retains
 old-only active names, both owners for shared names and pending-only new names,

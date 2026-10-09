@@ -860,6 +860,29 @@ pub const Request = struct {
     physical_name: ?[]const u8 = null,
 };
 
+/// Relation names share a namespace with tables, indexes and constraint indexes.
+/// Resolution never guesses a table owner from a schema inventory scan.
+pub const RelationTarget = struct {
+    database: []const u8 = default_database_name,
+    namespace: []const u8 = default_namespace_name,
+    name: []const u8,
+
+    pub fn validate(self: @This()) !void {
+        try validateName(self.database);
+        try validateName(self.namespace);
+        try (@import("relation_names.zig").Key{ .namespace_id = 1, .name = self.name }).validate();
+    }
+};
+
+pub const ResolvedRelation = struct {
+    owner: @import("relation_names.zig").Owner,
+    table: ResolvedTable,
+
+    pub fn deinit(self: @This(), alloc: std.mem.Allocator) void {
+        self.table.deinit(alloc);
+    }
+};
+
 pub const ResolveMany = struct {
     targets: []const Target = &.{},
     /// Internal reverse lookup for dependency authorization and schema output.
@@ -867,18 +890,63 @@ pub const ResolveMany = struct {
     storage_names: []const []const u8 = &.{},
     include_query_definitions: bool = false,
     expected_revision: ?u64 = null,
+    relations: []const RelationTarget = &.{},
+    expected_relation_epoch: ?@import("relation_reconciliation.zig").Epoch = null,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        if (self.relations.len != 0 or self.expected_relation_epoch != null) {
+            try jw.write(.{ .targets = self.targets, .storage_names = self.storage_names, .include_query_definitions = self.include_query_definitions, .expected_revision = self.expected_revision, .relations = self.relations, .expected_relation_epoch = self.expected_relation_epoch });
+        } else {
+            // Keep ordinary table resolution compatible with strict old peers.
+            try jw.write(.{ .targets = self.targets, .storage_names = self.storage_names, .include_query_definitions = self.include_query_definitions, .expected_revision = self.expected_revision });
+        }
+    }
 };
 
 pub const ResolvedMany = struct {
     revision: u64,
     tables: []const ?ResolvedTable,
     logical_names: []const ?[]const u8 = &.{},
+    /// Null means the receiver did not attest authoritative relation resolution.
+    /// A missing field from an older peer must never prove name absence.
+    relation_epoch: ?@import("relation_reconciliation.zig").Epoch = null,
+    relations: []const ?ResolvedRelation = &.{},
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        if (self.relation_epoch != null or self.relations.len != 0) {
+            try jw.write(.{ .revision = self.revision, .tables = self.tables, .logical_names = self.logical_names, .relation_epoch = self.relation_epoch, .relations = self.relations });
+        } else {
+            try jw.write(.{ .revision = self.revision, .tables = self.tables, .logical_names = self.logical_names });
+        }
+    }
+
+    /// Validate the optional capability before consuming a peer's answers.
+    /// In particular, an old receiver's empty default is not a negative lookup.
+    pub fn validateRelations(self: @This(), request: ResolveMany) !void {
+        if (request.relations.len == 0) {
+            if (request.expected_relation_epoch != null) return error.InvalidCatalogMutation;
+            return;
+        }
+        const epoch = self.relation_epoch orelse return error.TableTopologyUpgradeRequired;
+        if (epoch.revision == 0 or std.mem.allEqual(u8, &epoch.incarnation, 0) or self.relations.len != request.relations.len) return error.InvalidCatalogRecord;
+        if (request.expected_relation_epoch) |expected| if (!epoch.eql(expected)) return error.CatalogGenerationChanged;
+        for (self.relations) |relation| if (relation) |value| {
+            try value.owner.validate();
+            if (value.owner.phase != .active or value.table.table_id != value.owner.table_id or value.table.name.len == 0) return error.InvalidCatalogRecord;
+            if (request.include_query_definitions) {
+                const definition = value.table.query_definition orelse return error.InvalidCatalogRecord;
+                if (definition.table_id != value.owner.table_id) return error.InvalidCatalogRecord;
+            }
+        };
+    }
 
     pub fn deinit(self: @This(), alloc: std.mem.Allocator) void {
         for (self.tables) |table| if (table) |value| value.deinit(alloc);
         alloc.free(self.tables);
         for (self.logical_names) |name| if (name) |value| alloc.free(value);
         alloc.free(self.logical_names);
+        for (self.relations) |relation| if (relation) |value| value.deinit(alloc);
+        alloc.free(self.relations);
     }
 };
 
