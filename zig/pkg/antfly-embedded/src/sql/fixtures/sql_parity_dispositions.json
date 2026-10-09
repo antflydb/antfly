@@ -14000,18 +14000,30 @@
     },
     {
       "id": "sql-1452",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The exact cross-table INSERT SELECT executes through mounted HTTP over native typed storage. Independent PostgreSQL expectations verify both RETURNING columns, affected rows and complete postimages of all three fixture tables, including unchanged source rows. Logical primary-key admission and fixture resets use native integrity machinery. This certifies the isolated source profile, not distributed cross-owner atomic publication.",
+      "evidence": [
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL PostgreSQL mutations capture native source relations and complete storage", "gate": "sql-postgres-correlated-mutations"},
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL PostgreSQL mutations capture native source relations and complete storage", "gate": "sql-postgres-mutation-reference"}
+      ]
     },
     {
       "id": "sql-1453",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The exact CTE-backed cross-table INSERT SELECT retains its computed source expressions, ordering and LIMIT through mounted native execution. PostgreSQL verifies complete RETURNING metadata, SQL NULL provenance and persisted postimages of every fixture table. Enforced logical primary keys and integrity-planned resets prevent an unconstrained substitute fixture. Distributed cross-owner activation remains separate.",
+      "evidence": [
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL PostgreSQL mutations capture native source relations and complete storage", "gate": "sql-postgres-correlated-mutations"},
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL PostgreSQL mutations capture native source relations and complete storage", "gate": "sql-postgres-mutation-reference"}
+      ]
     },
     {
       "id": "sql-1454",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The exact column-aliased CTE INSERT SELECT executes unchanged through mounted native SQL. PostgreSQL verifies source alias binding, computed values, ordering/LIMIT, complete RETURNING and all three persisted table postimages. The fixture genuinely enforces logical primary keys; this is not a distributed ownership or atomic-publication claim.",
+      "evidence": [
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL PostgreSQL mutations capture native source relations and complete storage", "gate": "sql-postgres-correlated-mutations"},
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL PostgreSQL mutations capture native source relations and complete storage", "gate": "sql-postgres-mutation-reference"}
+      ]
     },
     {
       "id": "sql-1455",
@@ -14221,13 +14233,21 @@
     },
     {
       "id": "sql-1482",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The exact multi-row VALUES INSERT with ON CONFLICT(id) DO NOTHING executes against an enforced native logical primary key. PostgreSQL verifies affected rows, complete RETURNING metadata/NULLs and every persisted table postimage. Duplicate and NULL primary-key admission probes reject atomically before execution. This proves the isolated single-owner profile.",
+      "evidence": [
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL PostgreSQL mutations capture native source relations and complete storage", "gate": "sql-postgres-correlated-mutations"},
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL PostgreSQL mutations capture native source relations and complete storage", "gate": "sql-postgres-mutation-reference"}
+      ]
     },
     {
       "id": "sql-1483",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The exact repeated-target multi-row INSERT DO NOTHING preserves the first proposed row and skips the duplicate through native logical primary-key arbitration. Independent PostgreSQL expectations check affected rows, RETURNING status and full storage state of every fixture table. The duplicate/NULL key admission probes and integrity-planned resets ensure real ownership, not an unconstrained table.",
+      "evidence": [
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL PostgreSQL mutations capture native source relations and complete storage", "gate": "sql-postgres-correlated-mutations"},
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL PostgreSQL mutations capture native source relations and complete storage", "gate": "sql-postgres-mutation-reference"}
+      ]
     },
     {
       "id": "sql-1484",
@@ -14275,23 +14295,39 @@
     },
     {
       "id": "sql-1489",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The exact INSERT RETURNING usage_records.* executes unchanged through mounted native SQL. PostgreSQL verifies every declared output column, type, SQL NULL flag, affected count and complete persisted state, including untouched rows and tables. Logical primary-key enforcement is independently probed. Hidden physical identity is not exposed by the wildcard.",
+      "evidence": [
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL PostgreSQL mutations capture native source relations and complete storage", "gate": "sql-postgres-correlated-mutations"},
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL PostgreSQL mutations capture native source relations and complete storage", "gate": "sql-postgres-mutation-reference"}
+      ]
     },
     {
       "id": "sql-1490",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The exact schema-qualified INSERT RETURNING public.usage_records.* executes through mounted native SQL. PostgreSQL verifies wildcard qualification and every output label/type/NULL, affected count and complete persisted postimages. The fixture retains enforced logical primary keys and integrity-planned seed/reset writes; distributed activation is not claimed.",
+      "evidence": [
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL PostgreSQL mutations capture native source relations and complete storage", "gate": "sql-postgres-correlated-mutations"},
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL PostgreSQL mutations capture native source relations and complete storage", "gate": "sql-postgres-mutation-reference"}
+      ]
     },
     {
       "id": "sql-1491",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The exact aliased INSERT RETURNING u.id,u.status AS returned_status executes through mounted native SQL with genuine logical primary-key enforcement. PostgreSQL verifies alias binding, labels, types, SQL NULL provenance, affected rows and full persisted state of every fixture table. No source SQL or parameters are rewritten.",
+      "evidence": [
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL PostgreSQL mutations capture native source relations and complete storage", "gate": "sql-postgres-correlated-mutations"},
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL PostgreSQL mutations capture native source relations and complete storage", "gate": "sql-postgres-mutation-reference"}
+      ]
     },
     {
       "id": "sql-1492",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The exact schema-qualified INSERT with qualified RETURNING fields executes unchanged through mounted native SQL. PostgreSQL verifies qualification, the returned alias, types/NULLs, affected rows and all persisted table postimages. Duplicate/NULL key probes and integrity-planned seed/reset writes establish the isolated native owner profile.",
+      "evidence": [
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL PostgreSQL mutations capture native source relations and complete storage", "gate": "sql-postgres-correlated-mutations"},
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL PostgreSQL mutations capture native source relations and complete storage", "gate": "sql-postgres-mutation-reference"}
+      ]
     },
     {
       "id": "sql-1493",

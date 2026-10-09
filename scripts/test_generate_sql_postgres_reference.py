@@ -244,6 +244,33 @@ class PostgresReferenceTest(unittest.TestCase):
         cls.db = cls.server.__enter__()
         cls.addClassCleanup(cls.server.__exit__, None, None, None)
 
+    def test_not_valid_check_still_enforces_new_writes(self):
+        import psycopg
+
+        with self.db.transaction(force_rollback=True):
+            self.db.execute("CREATE TEMP TABLE not_valid_owner(id text PRIMARY KEY, amount bigint)")
+            self.db.execute("INSERT INTO not_valid_owner VALUES ('old', -1)")
+            self.db.execute("ALTER TABLE not_valid_owner ADD CONSTRAINT nonnegative CHECK (amount >= 0) NOT VALID")
+            self.assertEqual(
+                [(False,)],
+                self.db.execute("SELECT convalidated FROM pg_constraint WHERE conrelid = 'not_valid_owner'::regclass AND conname = 'nonnegative'").fetchall(),
+            )
+            # NOT VALID exempts historical rows from the installation scan,
+            # never a newly inserted or updated row from enforcement.
+            for sql in (
+                "INSERT INTO not_valid_owner VALUES ('new', -1)",
+                "UPDATE not_valid_owner SET amount = -2 WHERE id = 'old'",
+                "ALTER TABLE not_valid_owner VALIDATE CONSTRAINT nonnegative",
+            ):
+                with self.subTest(sql=sql):
+                    with self.assertRaises(psycopg.errors.CheckViolation) as caught:
+                        with self.db.transaction():
+                            self.db.execute(sql)
+                    self.assertEqual('23514', caught.exception.sqlstate)
+                    self.assertEqual([('old', -1)], self.db.execute("SELECT id, amount FROM not_valid_owner").fetchall())
+            self.db.execute("INSERT INTO not_valid_owner VALUES ('valid', 1), ('nullable', NULL)")
+            self.assertEqual(3, self.db.execute("SELECT count(*) FROM not_valid_owner").fetchone()[0])
+
     def test_array_overlap_and_string_output_match_shared_native_contracts(self):
         import json
         import psycopg
@@ -1962,7 +1989,8 @@ class PostgresReferenceTest(unittest.TestCase):
             "entries"
         ]
         ids = {case["id"] for case in golden["entries"]}
-        self.assertEqual(8, len(ids))
+        self.assertEqual(10, len(ids))
+        self.assertTrue({"sql-1509", "sql-1514"} <= ids)
         cases = [case for case in inventory if case["id"] in ids]
         result = mutation_reference(self.db, cases, profile)
         self.assertEqual([], result["excluded"])
@@ -1983,11 +2011,11 @@ class PostgresReferenceTest(unittest.TestCase):
             "entries"
         ]
         base = mutation_profile()
-        for owner, case_id, fixture in (
-            ("partial-active-email", "sql-1455", "partial"),
-            ("lower-email", "sql-1458", "lower"),
-            ("tenant-lower-email", "sql-1460", "mixed"),
-            ("upper-email", "sql-1461", "upper"),
+        for owner, case_ids, fixture in (
+            ("partial-active-email", {"sql-1455", "sql-1510", "sql-1515"}, "partial"),
+            ("lower-email", {"sql-1458"}, "lower"),
+            ("tenant-lower-email", {"sql-1460"}, "mixed"),
+            ("upper-email", {"sql-1461"}, "upper"),
         ):
             with self.subTest(owner=owner):
                 profile = mutation_profile(owner)
@@ -1996,8 +2024,8 @@ class PostgresReferenceTest(unittest.TestCase):
                 self.assertEqual(
                     base["additional_tables"], profile["additional_tables"]
                 )
-                cases = [case for case in inventory if case["id"] == case_id]
-                self.assertEqual(1, len(cases))
+                cases = [case for case in inventory if case["id"] in case_ids]
+                self.assertEqual(len(case_ids), len(cases))
                 result = mutation_reference(self.db, cases, profile)
                 self.assertEqual([], result["excluded"])
                 golden = json.loads(

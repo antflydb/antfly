@@ -1,7 +1,11 @@
 # Original SQL extraction parity inventory
 
-Current audited dispositions: **466 implemented / 136 rejected / 73 superseded /
-911 unresolved**. Four original partial/expression-index upserts now have exact
+Current audited dispositions: **475 implemented / 136 rejected / 73 superseded /
+902 unresolved**. Nine further cross-table INSERT/CTE, multi-row DO NOTHING and
+qualified RETURNING contracts now have unchanged-source mounted native and
+PostgreSQL evidence. Every case verifies complete table postimages and genuine
+logical primary-key enforcement, rather than just affected counts or parsing.
+Four original partial/expression-index upserts now have exact
 PostgreSQL and native owner-activation evidence, including complete three-table
 postimages, independent admission probes and bounded point-owner resolution.
 Eight original non-primary-key upserts now have exact native
@@ -1410,9 +1414,22 @@ capability barriers, authorized point resolution, and DROP/REINDEX integration
 remain required before unqualified index DDL is enabled. The registry must not
 become a second independently committed catalog, nor may a table scan replace
 the missing point-resolution path. No original case is credited for this
-component work; the count remains 466 implemented / 911 unresolved.
+component work; current counts are reported at the top of this inventory.
 
 ### Remaining query and mutation activation
+
+The primary-key-only mutation campaign must not certify schema-dependent
+contracts merely because their statement text executes against its baseline.
+In particular, `sql-1412` declares a NOT VALID CHECK in the original setup;
+PostgreSQL still enforces that CHECK on new writes. The baseline has no such
+CHECK, so successful insertion there does not establish parity. The six
+unique-selector cases (`sql-1509`, `sql-1510`, `sql-1512`, `sql-1514`,
+`sql-1515`, `sql-1517`) likewise need their ordinary/partial/expression-predicate
+index owners and bounded native access evidence. Their original setup also
+uses VALIDATE CONSTRAINT on index names, which is not a PostgreSQL constraint
+operation. Keep these cases unresolved until the intended PostgreSQL contract
+and its activated fixture are independently tested; a table scan against the
+baseline is not a substitute for unique-owner activation.
 
 JSONB path extraction now shares strict typed binding and immutable traversal
 between `jsonb_extract_path` and `jsonb_extract_path_text`. Missing components

@@ -35,6 +35,11 @@ pub fn Tables(comptime count: usize) type {
         captures: usize = 0,
         lookup_calls: std.atomic.Value(usize) = .init(0),
         unbounded_reads: std.atomic.Value(usize) = .init(0),
+        // This concrete fixture owns BoundTableReadSource handles. Inspect its
+        // pinned native reader, never confuse diagnostics with authenticated
+        // commit proofs or widen the capabilities of an owner-local source.
+        require_indexed_reads: bool = false,
+        indexed_reads: std.atomic.Value(usize) = .init(0),
         ranges: []local.common_topology_records.RangeRecord = &.{},
 
         pub fn status(_: *anyopaque) !metadata.MetadataStatus {
@@ -125,7 +130,21 @@ pub fn Tables(comptime count: usize) type {
         fn openRead(ptr: *anyopaque, a: std.mem.Allocator, table: []const u8, from: []const u8, to: []const u8, opts: db.types.ScanOptions, consistency: raft.ReadConsistency) !?native.RelationalReadView {
             const self: *Self = @ptrCast(@alignCast(ptr));
             if (from.len == 0 and to.len == 0) _ = self.unbounded_reads.fetchAdd(1, .monotonic);
-            return (try self.read(table)).openRelationalRead(a, table, from, to, opts, consistency);
+            const view = try (try self.read(table)).openRelationalRead(a, table, from, to, opts, consistency);
+            if (view) |retained| {
+                errdefer retained.deinit();
+                if (self.require_indexed_reads) {
+                    const session: *db.DB.RelationalReadSession = @ptrCast(@alignCast(retained.ptr));
+                    const index = session.reader.index orelse return error.ExpectedNativeIndexRead;
+                    try std.testing.expect(index.generation != 0);
+                    try std.testing.expect(std.mem.order(u8, session.reader.lower, session.reader.upper) == .lt);
+                    // Mutation preimages must still come from primary rows;
+                    // an index-only result cannot supply their commit digest.
+                    try std.testing.expect(!session.reader.index_only);
+                    _ = self.indexed_reads.fetchAdd(1, .monotonic);
+                }
+            }
+            return view;
         }
         fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db.types.ScanOptions, _: raft.ReadConsistency) !?native.ScanResponse {
             return error.UnexpectedFallbackRead;

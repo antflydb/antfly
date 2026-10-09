@@ -803,7 +803,12 @@ pub const Adapter = struct {
             wrapper.* = .{ .alloc = alloc, .statement = statement };
             return .{ .ptr = wrapper, .next = SingleStatementCursor.next, .close = SingleStatementCursor.close };
         }
-        if (self.staged) |staged| {
+        // An empty transaction buffer has nothing to merge. Keeping it on
+        // the overlay path unnecessarily forces every UPDATE/DELETE and
+        // session read into primary order, disabling ready native indexes.
+        // Guarded isolation above still owns its separate proof admission.
+        if (self.staged != null and self.staged.?.tables.len != 0) {
+            const staged = self.staged.?;
             // A session SELECT needs one native statement snapshot. Multi-owner
             // sources without that guarantee remain explicitly unsupported.
             const row_filter = try http_server.resolveEffectiveRowFilterJson(alloc, self.identity.*, table.physical_name);
@@ -814,7 +819,12 @@ pub const Adapter = struct {
             errdefer native_cursor.close(native_cursor.ptr);
             return try @import("sql_session_overlay.zig").open(alloc, native_cursor, staged, table, ordered, row_filter);
         }
-        return openNativeScan(ptr, alloc, table, request);
+        const native_cursor = try openNativeScan(ptr, alloc, table, request);
+        // Empty overlays still need one retained statement view. A session
+        // must never fall back to stateless pages from multiple visibility
+        // cuts merely because it has not staged its first write yet.
+        if (self.staged != null and native_cursor == null) return error.UnsupportedSqlExecution;
+        return native_cursor;
     }
 
     const AggregateArtifactCursor = struct {
@@ -1747,6 +1757,58 @@ test "SQL require-index equality uses exact native bounds only inside a guarded 
     fake = 3;
     const disabled = try adapter.prepareScan(alloc, table, request);
     try std.testing.expectEqualStrings("", disabled.opts.row_policy_principal_proof);
+}
+
+test "SQL API empty transaction overlays preserve native index planning" {
+    const reads = @import("antfly_local_sources").api_table_read_source;
+    const Fake = struct {
+        auto_index: bool = true,
+        opens: usize = 0,
+        closes: usize = 0,
+        fn resolve(_: *anyopaque, alloc: std.mem.Allocator, _: operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            if (call == .policy_publication_status) return alloc.dupe(u8, "null");
+            return alloc.dupe(u8, "{\"revision\":3,\"tables\":[{\"table_id\":7,\"name\":\"physical\"}]}");
+        }
+        fn open(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, opts: db_types.ScanOptions, _: @import("../raft/read_gate.zig").ReadConsistency) !?reads.RelationalReadView {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(self.auto_index, opts.relational_query.?.auto_index);
+            self.opens += 1;
+            return .{ .ptr = ptr, .vtable = &.{ .next = unexpectedNext, .close = close } };
+        }
+        fn unexpectedNext(_: *anyopaque, _: std.mem.Allocator, _: u32) !reads.RelationalReadView.Page {
+            return error.UnexpectedRead;
+        }
+        fn close(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.closes += 1;
+        }
+    };
+    var fake: Fake = .{};
+    var server: http_server.ApiHttpServer = undefined;
+    server.alloc = std.testing.allocator;
+    server.source = .{ .ptr = &fake, .vtable = &.{ .status = undefined, .system_catalog = Fake.resolve } };
+    server.table_reads = .{ .ptr = &fake, .vtable = &.{ .lookup = undefined, .scan = undefined, .query = undefined, .open_relational_read = Fake.open } };
+    var identity: ?http_server.AuthenticatedIdentity = null;
+    var adapter: Adapter = .{ .server = &server, .identity = &identity, .context = .{} };
+    const table: catalog.Table = .{ .id = 7, .physical_name = "physical", .schema_version = 9, .columns = &.{.{ .name = "id", .path = "id", .type = .string }}, .scope = .{ .database = "d", .namespace = "n", .name = "logical", .revision = 3 } };
+    const request: catalog.Scan = .{ .fields = &.{"id"}, .limit = 8 };
+    var staged: @import("transactions.zig").OwnedTransactionCommitRequest = .{};
+    var staged_table: @import("transactions.zig").TableCommitRequest = .{ .table_name = @constCast("physical") };
+    for (0..3) |step| {
+        adapter.staged = if (step == 0) null else &staged;
+        if (step == 2) staged.tables = (&staged_table)[0..1];
+        fake.auto_index = step != 2;
+        const cursor = (try Adapter.openScan(&adapter, std.testing.allocator, table, request)) orelse return error.MissingSqlCursor;
+        cursor.close(cursor.ptr);
+    }
+    try std.testing.expectEqual(@as(usize, 3), fake.opens);
+    try std.testing.expectEqual(fake.opens, fake.closes);
+    staged.tables = &.{};
+    adapter.staged = &staged;
+    server.table_reads.?.vtable = &.{ .lookup = undefined, .scan = undefined, .query = undefined };
+    try std.testing.expectError(error.UnsupportedSqlExecution, Adapter.openScan(&adapter, std.testing.allocator, table, request));
+    adapter.staged = null;
+    try std.testing.expect((try Adapter.openScan(&adapter, std.testing.allocator, table, request)) == null);
 }
 
 test "SQL API document preparation uses native normalization and retains mutation fences" {
