@@ -23,6 +23,6 @@
     "sha256": "c15cf0f3f17d714d1aa5a642da8e118db53d79429eb015771ba816aa7c6c1cbd"
   },
   "rust": {
-    "version": "1.93.1"
+    "version": "1.95.0"
   }
 }
