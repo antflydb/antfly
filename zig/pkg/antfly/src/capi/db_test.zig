@@ -1957,7 +1957,7 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     defer cleanupTestFile(invalid_snapshot_path);
     defer cleanupTestFile(invalid_snapshot_file_path);
 
-    try std.testing.expectEqual(@as(u32, 2), antfly_abi_version());
+    try std.testing.expectEqual(public.abi_version, antfly_abi_version());
     try std.testing.expectEqualStrings("ANTFLY_OK", std.mem.span(antfly_error_code_name(@backingInt(capi.ErrorCode.ok))));
     try std.testing.expectEqualStrings("ANTFLY_INVALID_ARGUMENT", std.mem.span(antfly_error_code_name(@backingInt(capi.ErrorCode.invalid_argument))));
     try std.testing.expectEqualStrings("ANTFLY_OUTCOME_UNKNOWN", std.mem.span(antfly_error_code_name(@backingInt(capi.ErrorCode.outcome_unknown))));
