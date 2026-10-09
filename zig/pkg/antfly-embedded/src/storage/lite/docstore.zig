@@ -1055,6 +1055,7 @@ test "lite allocator v4 releasing the last old reader starts idle retirement" {
 }
 
 pub const OpenOptions = struct {
+    externally_locked: bool = false,
     reclamation: reclamation.Options = .{},
     read_only: bool = false,
     no_sync: bool = false,
@@ -1063,6 +1064,7 @@ pub const OpenOptions = struct {
 };
 
 pub const CreateOptions = struct {
+    externally_locked: bool = false,
     reclamation: reclamation.Options = .{},
     exclusive: bool = false,
     no_sync: bool = false,
@@ -1084,6 +1086,7 @@ const MutationRequest = struct {
 const ReadPin = struct {
     sequence: u64,
     pinned_at: std.Io.Timestamp,
+    kernel_reader: bool = false,
     previous: ?*ReadPin = null,
     next: ?*ReadPin = null,
 };
@@ -1097,6 +1100,8 @@ const ReadGeneration = struct {
     file: native.NativeFile,
     checkpoint: native.CheckpointSlot = .{},
     references: usize = 0,
+    scoped_reader_lock: bool = false,
+    kernel_readers: usize = 0,
     retired: bool = false,
     next_retired: ?*ReadGeneration = null,
     retained_bytes: u64 = 0,
@@ -1214,6 +1219,7 @@ pub const Store = struct {
     pub fn openWithOptions(allocator: Allocator, path: []const u8, opts: OpenOptions) !Store {
         const policy = try reclamation.Policy.init(opts.reclamation);
         const native_opts = native.OpenOptions{
+            .externally_locked = opts.externally_locked,
             .read_only = opts.read_only,
             .wait_for_reader_lock = opts.read_only,
             .no_sync = opts.no_sync,
@@ -1241,7 +1247,7 @@ pub const Store = struct {
             _ = try result.vacuumWithCancel(null);
         }
         if (!opts.read_only) result.maintainOnce(false) catch |err| result.recordMaintenanceError(err);
-        result.maintenance_start_suppressed = false;
+        result.maintenance_start_suppressed = opts.externally_locked;
         return result;
     }
 
@@ -1272,6 +1278,7 @@ pub const Store = struct {
         else
             try native.NativeFile.createWithOptions(allocator, path, native_opts);
         file.retirement_work_pages = opts.reclamation.retirement_work_pages;
+        file.externally_locked = opts.externally_locked;
         file.reserve_retirement_capacity = true;
         if (opts.reclamation.max_storage_bytes != 0) file.max_file_bytes = opts.reclamation.max_storage_bytes;
         file.vacuum_target_indexed = opts.reclamation.page_reuse;
@@ -1281,6 +1288,7 @@ pub const Store = struct {
             .read_only = false,
             .resource_manager = opts.resource_manager,
             .maintenance_policy = policy,
+            .maintenance_start_suppressed = opts.externally_locked,
         };
     }
 
@@ -1344,7 +1352,7 @@ pub const Store = struct {
         if (self.read_generation != null) return;
         const generation = try self.allocator.create(ReadGeneration);
         errdefer self.allocator.destroy(generation);
-        generation.* = .{ .owner_generation = self.assessment_generation, .checkpoint = self.file.activeCheckpoint(), .file = try native.NativeFile.openWithIo(self.allocator, io, self.file.path, .{ .read_only = true, .internal_reader = self.file.header.indexed_reclamation, .resource_manager = self.resource_manager }) };
+        generation.* = .{ .owner_generation = self.assessment_generation, .checkpoint = self.file.activeCheckpoint(), .scoped_reader_lock = self.file.externally_locked, .file = try native.NativeFile.openWithIo(self.allocator, io, self.file.path, .{ .read_only = true, .internal_reader = self.file.header.indexed_reclamation or self.file.externally_locked, .resource_manager = self.resource_manager }) };
         self.read_generation = generation;
         self.file.secondary_page_cache = &generation.file.page_cache;
         self.file.reader_frontier = &self.reader_frontier;
@@ -1370,8 +1378,16 @@ pub const Store = struct {
     }
 
     // Called with read_mutex held. Pins are ordered by published sequence.
-    fn pinInitializedReadGeneration(self: *Store, pin: *ReadPin) *ReadGeneration {
+    fn pinInitializedReadGeneration(self: *Store, pin: *ReadPin) !*ReadGeneration {
         const generation = self.read_generation.?;
+        // An idle connection must not fence reclamation. Only actual read
+        // transactions hold the inode lock, including streams between calls.
+        if (generation.scoped_reader_lock and pin.kernel_reader) {
+            if (generation.kernel_readers == 0) {
+                if (!try generation.file.file.tryLock(generation.file.runtime(), .shared)) return error.FileBusy;
+            }
+            generation.kernel_readers += 1;
+        }
         if (generation.references == 0) generation.pinned_at = pin.pinned_at;
         generation.references += 1;
         pin.previous = generation.last_pin;
@@ -1386,7 +1402,7 @@ pub const Store = struct {
         const io = self.file.runtime();
         self.read_mutex.lockUncancelable(io);
         defer self.read_mutex.unlock(io);
-        return self.pinInitializedReadGeneration(pin);
+        return try self.pinInitializedReadGeneration(pin);
     }
 
     fn retireReadGeneration(self: *Store, old_bytes: u64) void {
@@ -1424,6 +1440,10 @@ pub const Store = struct {
         std.debug.assert(generation.references > 0);
         if (pin.previous) |previous| previous.next = pin.next else generation.first_pin = pin.next;
         if (pin.next) |next| next.previous = pin.previous else generation.last_pin = pin.previous;
+        if (generation.scoped_reader_lock and pin.kernel_reader) {
+            generation.kernel_readers -= 1;
+            if (generation.kernel_readers == 0) generation.file.file.unlock(generation.file.runtime());
+        }
         self.allocator.destroy(pin);
         generation.references -= 1;
         if (generation.first_pin) |first| generation.pinned_at = first.pinned_at;
@@ -2595,7 +2615,7 @@ pub const Txn = struct {
 
     pub fn openReadWithPrefix(store: *Store, prefix: []const u8) !Txn {
         try validatePrefix(prefix);
-        if (store.read_only) return .{ .allocator = store.allocator, .store = store, .prefix = prefix, .checkpoint = store.file.activeCheckpoint() };
+        if (store.read_only and !store.file.externally_locked) return .{ .allocator = store.allocator, .store = store, .prefix = prefix, .checkpoint = store.file.activeCheckpoint() };
         const io = store.file.runtime();
         store.generation_lock.lockSharedUncancelable(io);
         defer store.generation_lock.unlockShared(io);
@@ -2615,8 +2635,15 @@ pub const Txn = struct {
         defer store.read_mutex.unlock(io);
         if (store.read_outcome_unknown) return error.OutcomeUnknown;
         const checkpoint = store.read_generation.?.checkpoint;
-        pin.* = .{ .sequence = checkpoint.commit_sequence, .pinned_at = std.Io.Clock.awake.now(io) };
-        return .{ .allocator = store.allocator, .store = store, .read_pin = pin, .prefix = prefix, .read_generation = store.pinInitializedReadGeneration(pin), .checkpoint = checkpoint };
+        // Nested reads borrow the current writer's publication lease. Taking
+        // another inode lock here would conflict with its page allocator's
+        // exclusive reuse lock. Persistent SQL streams open outside a writer
+        // transaction and retain their own kernel reader fence instead.
+        store.writer_mutex.lockUncancelable(io);
+        const kernel_reader = !store.file.externally_locked or !store.writer_active;
+        store.writer_mutex.unlock(io);
+        pin.* = .{ .sequence = checkpoint.commit_sequence, .pinned_at = std.Io.Clock.awake.now(io), .kernel_reader = kernel_reader };
+        return .{ .allocator = store.allocator, .store = store, .read_pin = pin, .prefix = prefix, .read_generation = try store.pinInitializedReadGeneration(pin), .checkpoint = checkpoint };
     }
 
     pub fn openWrite(store: *Store) !Txn {
