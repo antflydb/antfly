@@ -1344,6 +1344,7 @@ from .table_status import TableStatus
 from .table_storage_mode import TableStorageMode
 from .table_storage_settings import TableStorageSettings
 from .table_storage_settings_dense_embeddings import TableStorageSettingsDenseEmbeddings
+from .table_storage_settings_engine import TableStorageSettingsEngine
 from .table_storage_unreadable_error import TableStorageUnreadableError
 from .table_storage_unreadable_error_code import TableStorageUnreadableErrorCode
 from .tablespace_catalog_record import TablespaceCatalogRecord
@@ -2791,6 +2792,7 @@ __all__ = (
     "TableStorageMode",
     "TableStorageSettings",
     "TableStorageSettingsDenseEmbeddings",
+    "TableStorageSettingsEngine",
     "TableStorageUnreadableError",
     "TableStorageUnreadableErrorCode",
     "TavilySearchConfig",

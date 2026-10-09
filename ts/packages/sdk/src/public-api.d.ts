@@ -24076,7 +24076,10 @@ export interface operations {
                  * @description Read consistency for the lookup. The default `read_index` routes to
                  *     the primary for linearizable reads. `stale` allows a hot standby to
                  *     serve the lookup at its safe-read LSN.
-                 *     Owned object document tables support only explicit `stale` reads of published generations. The default `read_index` and `leader_lease` are rejected with HTTP 400. Use `sync_level=full_index` on writes to wait for publication before a stale lookup.
+                 *     Owned object document tables support only explicit `stale` reads of
+                 *     published generations. The default `read_index` and `leader_lease`
+                 *     are rejected with HTTP 400. Use `sync_level=full_index` on writes to
+                 *     wait for publication before a stale lookup.
                  */
                 consistency?: "read_index" | "leader_lease" | "stale";
             };
