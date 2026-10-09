@@ -1374,6 +1374,20 @@ from current SQL extraction is not repaired by naming this inventory check a ful
 
 ## Concrete remaining reviews
 
+JSONB path extraction now shares strict typed binding and immutable traversal
+between `jsonb_extract_path` and `jsonb_extract_path_text`. Missing components
+and SQL NULL do not skip evaluation of later arguments; JSON null remains a
+value for JSONB extraction and becomes SQL NULL only for text extraction.
+Reads and path updates share PostgreSQL's signed 32-bit ordinal parser,
+including leading whitespace but excluding trailing whitespace/separators.
+Text extraction uses the canonical JSONB writer rather than API JSON encoding,
+preserving object-key order, separators and decimal scale. PostgreSQL goldens
+and native tests cover these distinctions, and repeated point extraction
+borrows the original string under a zero-capacity allocator and shared work
+budget. These are component contracts, not original-case completion credit:
+generated document/index owner profiles and explicit UNIQUE-arbiter mutation
+profiles are still required before their historical cases can be activated.
+
 Quantified scalar children now retain correlated ORDER/LIMIT/OFFSET,
 group/aggregate, window and nested-derived boundaries in a typed Apply
 producer. Comparison results are projected once and reduced into separate

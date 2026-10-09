@@ -32,13 +32,15 @@ def verify(db, cases):
     for case in cases:
         with db.transaction(force_rollback=True):
             db.execute("SET TRANSACTION READ ONLY")
-            cursor = db.execute("SELECT " + case["sql"])
+            cursor = db.execute(
+                "SELECT " + case["sql"] + ", (" + case["sql"] + ") IS NULL"
+            )
             if "error" in case:
                 raise AssertionError(f"PostgreSQL unexpectedly accepted {case['sql']}")
             actual = cursor.fetchone()
             if "oid" in case and cursor.description[0].type_code != case["oid"]:
                 raise AssertionError(f"PostgreSQL result type drift: {case['sql']}")
-            if actual != (case["value"],):
+            if actual != (case["value"], case.get("sql_null", case["value"] is None)):
                 raise AssertionError(f"PostgreSQL drift: {case['sql']}: {actual!r}")
 
 
@@ -50,6 +52,7 @@ def main():
         for path in (
             FIXTURE,
             FIXTURE.with_name("sql_scalar_kernel_reference.json"),
+            FIXTURE.with_name("sql_json_path_reference.json"),
         )
     ]
     for fixture in fixtures:

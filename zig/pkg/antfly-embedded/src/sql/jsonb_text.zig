@@ -19,6 +19,24 @@ const std = @import("std");
 const Json = std.json.Value;
 const Budget = @import("json_order.zig").Budget;
 
+/// Canonical SQL text is distinct from API JSON serialization. Preflight
+/// through the same writer, then allocate the exact output once. Object-key
+/// sorting scratch is reclaimed independently of the retained result owner.
+pub fn format(a: std.mem.Allocator, value: Json, limit: usize, work: *Budget) ![]u8 {
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    var counter: std.Io.Writer.Discarding = .init(&.{});
+    try write(scratch.allocator(), value, &counter.writer, limit, work, 0);
+    if (counter.count > limit) return error.SqlProgramLimitExceeded;
+    const output = try a.alloc(u8, @intCast(counter.count));
+    errdefer a.free(output);
+    _ = scratch.reset(.retain_capacity);
+    var writer: std.Io.Writer = .fixed(output);
+    try write(scratch.allocator(), value, &writer, limit, work, 0);
+    std.debug.assert(writer.end == output.len);
+    return output;
+}
+
 fn number(raw: []const u8, writer: *std.Io.Writer, limit: usize, work: *Budget) !void {
     _ = @import("../common/json_number.zig").Number.parse(raw) orelse return error.SqlTypeMismatch;
     try work.consume(raw.len);
@@ -70,6 +88,43 @@ fn number(raw: []const u8, writer: *std.Io.Writer, limit: usize, work: *Budget) 
         if (ordinal >= places) try writer.writeByte(byte);
         ordinal += 1;
     }
+}
+
+test "SQL JSONB text formatting owns exact output and cleans allocation and cancellation failures" {
+    const a = std.testing.allocator;
+    var object: std.json.ObjectMap = .empty;
+    defer object.deinit(a);
+    const wide: [512]u8 = @splat('a');
+    try object.put(a, "zz", .{ .integer = 2 });
+    try object.put(a, "a", .{ .string = &wide });
+    const value: Json = .{ .object = object };
+    const Probe = struct {
+        fn run(alloc: std.mem.Allocator, input: Json) !void {
+            var work: Budget = .{};
+            const text = try format(alloc, input, 4096, &work);
+            defer alloc.free(text);
+            try std.testing.expect(std.mem.startsWith(u8, text, "{\"a\": \""));
+            try std.testing.expect(std.mem.endsWith(u8, text, "\", \"zz\": 2}"));
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Probe.run, .{value});
+    var tiny: Budget = .{};
+    try std.testing.expectError(error.SqlProgramLimitExceeded, format(a, value, 1, &tiny));
+    const Cancel = struct {
+        polls: usize = 0,
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.polls += 1;
+            if (self.polls == 3) return error.QueryCanceled;
+        }
+    };
+    var cancel: Cancel = .{};
+    var context: @import("numeric_value.zig").Context = .{ .alloc = a, .checkpoint = Cancel.check, .ptr = &cancel };
+    var work: Budget = .{ .shared = &context };
+    // The third poll is in the second pass, after output allocation. Both
+    // the retained output and canonical-key scratch must unwind on error.
+    try std.testing.expectError(error.QueryCanceled, format(a, value, 4096, &work));
+    try std.testing.expectEqual(@as(usize, 3), cancel.polls);
 }
 
 pub fn write(a: std.mem.Allocator, value: Json, writer: *std.Io.Writer, limit: usize, work: *Budget, depth: usize) anyerror!void {

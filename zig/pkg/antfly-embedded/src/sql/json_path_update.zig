@@ -71,15 +71,7 @@ pub fn set(owner: std.mem.Allocator, target: Json, path: *const arrays.Value, re
     return .{ .value = result, .allocated_bytes = memory.peak };
 }
 
-fn ordinal(key: []const u8) !i32 {
-    // PostgreSQL's strtoint accepts leading ASCII whitespace and a sign, but
-    // neither trailing whitespace nor Zig's digit separators/base prefixes.
-    const digits = std.mem.trimStart(u8, key, " \t\n\r\x0b\x0c");
-    const start: usize = if (digits.len > 0 and (digits[0] == '+' or digits[0] == '-')) 1 else 0;
-    if (digits.len == start) return error.SqlInvalidTextRepresentation;
-    for (digits[start..]) |c| if (c < '0' or c > '9') return error.SqlInvalidTextRepresentation;
-    return std.fmt.parseInt(i32, digits, 10) catch return error.SqlInvalidTextRepresentation;
-}
+const ordinal = @import("json_path.zig").ordinal;
 
 fn rebuild(a: std.mem.Allocator, owner: std.mem.Allocator, frames: []const Frame, replacement: Json, work: *Work) !Json {
     var made: [128]Json = undefined;

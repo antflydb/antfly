@@ -214,7 +214,7 @@ pub const EvalLimits = struct {
     regex_checkpoint: ?*const fn (?*anyopaque) anyerror!void = null,
     regex_context: ?*anyopaque = null,
 };
-pub const Function = enum { ai_decide, ai_choice, ai_score, ai_probability, abs, lower, upper, length, octet_length, concat, coalesce, nullif, greatest, least, ceil, floor, round, sqrt, power, mod, substring, trim, ltrim, rtrim, replace, starts_with, date_part, date_trunc, to_timestamp, current_setting, @"$single", @"$pattern_quantified", trunc, sign, to_jsonb, jsonb_build_object, jsonb_extract_path_text, concat_ws, bit_length, strpos, jsonb_typeof, lpad, rpad, repeat, reverse, left, right, split_part, translate, overlay, ascii, chr, @"$array", @"$array_quantified", cardinality, array_ndims, array_length, array_lower, array_upper, @"$array_pattern_quantified", @"$contains", @"$overlaps", array_to_string, jsonb_exists, string_to_array, @"$like_escape", jsonb_set, array_position, array_positions, array_remove, array_replace, array_append, array_prepend, array_cat, jsonb_exists_any, jsonb_exists_all, regexp_like, regexp_count, regexp_instr, regexp_substr, regexp_replace, jsonb_array_length, initcap };
+pub const Function = enum { ai_decide, ai_choice, ai_score, ai_probability, abs, lower, upper, length, octet_length, concat, coalesce, nullif, greatest, least, ceil, floor, round, sqrt, power, mod, substring, trim, ltrim, rtrim, replace, starts_with, date_part, date_trunc, to_timestamp, current_setting, @"$single", @"$pattern_quantified", trunc, sign, to_jsonb, jsonb_build_object, jsonb_extract_path_text, concat_ws, bit_length, strpos, jsonb_typeof, lpad, rpad, repeat, reverse, left, right, split_part, translate, overlay, ascii, chr, @"$array", @"$array_quantified", cardinality, array_ndims, array_length, array_lower, array_upper, @"$array_pattern_quantified", @"$contains", @"$overlaps", array_to_string, jsonb_exists, string_to_array, @"$like_escape", jsonb_set, array_position, array_positions, array_remove, array_replace, array_append, array_prepend, array_cat, jsonb_exists_any, jsonb_exists_all, regexp_like, regexp_count, regexp_instr, regexp_substr, regexp_replace, jsonb_array_length, initcap, jsonb_extract_path };
 
 fn regexFunction(function: Function) ?regex_functions.Function {
     return switch (function) {
@@ -1989,7 +1989,7 @@ fn arity(function: Function, count: usize) !void {
         .round, .trunc => count == 1 or count == 2,
         .concat_ws => count >= 2,
         .jsonb_build_object => count % 2 == 0,
-        .jsonb_extract_path_text => count >= 2,
+        .jsonb_extract_path_text, .jsonb_extract_path => count >= 2,
         .nullif, .power, .mod, .starts_with, .strpos, .repeat, .left, .right, .date_part, .date_trunc, .@"$single" => count == 2,
         .@"$pattern_quantified", .@"$array_pattern_quantified" => count == 5,
         .substring, .lpad, .rpad => count == 2 or count == 3,
@@ -1999,7 +1999,7 @@ fn arity(function: Function, count: usize) !void {
         .coalesce, .greatest, .least => count > 0,
         .concat => count > 0,
     };
-    if (!valid) return if (arrayCompatibleFunction(function) or function == .jsonb_exists_any or function == .jsonb_exists_all or function == .jsonb_array_length or function == .initcap) error.SqlUndefinedFunction else error.InvalidSqlParameters;
+    if (!valid) return if (arrayCompatibleFunction(function) or function == .jsonb_exists_any or function == .jsonb_exists_all or function == .jsonb_array_length or function == .initcap or function == .jsonb_extract_path or function == .jsonb_extract_path_text) error.SqlUndefinedFunction else error.InvalidSqlParameters;
 }
 
 const Binder = struct {
@@ -2182,6 +2182,15 @@ const Binder = struct {
                 }
                 const function = try functionId(call.name);
                 try arity(function, call.args.len);
+                if (function == .jsonb_extract_path or function == .jsonb_extract_path_text) {
+                    for (call.args, 0..) |arg, i| {
+                        const actual = try self.infer(arg, depth + 1);
+                        const desired: ast.ColumnType = if (i == 0) .json else .string;
+                        const unknown = arg.* == .literal and arg.literal == .string;
+                        if (actual.kind != null and actual.kind != desired and !unknown) return error.SqlUndefinedFunction;
+                    }
+                    break :blk .{ .kind = if (function == .jsonb_extract_path) .json else .string, .element_type = if (function == .jsonb_extract_path) .jsonb else .text, .nullable = true };
+                }
                 if (function == .jsonb_array_length or function == .initcap) {
                     const arg = call.args[0];
                     const actual = try self.infer(arg, depth + 1);
@@ -2684,11 +2693,11 @@ const Binder = struct {
                         .to_timestamp => .number,
                         .concat => null,
                         .to_jsonb, .jsonb_build_object => null,
-                        .jsonb_extract_path_text => if (i == 0) .json else .string,
+                        .jsonb_extract_path_text, .jsonb_extract_path => if (i == 0) .json else .string,
                         else => kind.kind,
                     };
                     const actual = try self.infer(arg, depth + 1);
-                    if (function == .jsonb_array_length and arg.* == .literal and arg.literal == .string) {
+                    if ((function == .jsonb_array_length or ((function == .jsonb_extract_path or function == .jsonb_extract_path_text) and i == 0)) and arg.* == .literal and arg.literal == .string) {
                         const coercion = try self.alloc.create(ast.Scalar);
                         coercion.* = .{ .cast = .{ .operand = arg, .type = .json, .element_type = .jsonb } };
                         out.* = try self.compileArrayContext(coercion, .json, .jsonb, depth + 1);
@@ -3455,27 +3464,54 @@ const Evaluator = struct {
                         }
                         break :blk Datum.json(.{ .object = object });
                     },
-                    .jsonb_extract_path_text => {
+                    .jsonb_extract_path_text, .jsonb_extract_path => {
                         var value = try self.runDatum(call.args[0], depth + 1);
-                        if (value.sql_null) break :blk .{};
                         for (call.args[1..]) |arg| {
+                            // Strict calls evaluate every argument, even after
+                            // SQL NULL or a missing intermediate component.
                             const key = try self.runDatum(arg, depth + 1);
-                            if (key.sql_null) break :blk .{};
-                            if (key.value != .string) return error.SqlTypeMismatch;
+                            if (key.sql_null) {
+                                value = .{};
+                                continue;
+                            }
+                            if (key.array != null or key.value != .string) return error.SqlTypeMismatch;
+                            if (value.sql_null) continue;
+                            try self.workOwner().charge(key.value.string.len);
                             value.value = switch (value.value) {
-                                .object => |object| object.get(key.value.string) orelse break :blk .{},
+                                .object => |object| object.get(key.value.string) orelse {
+                                    value = .{};
+                                    continue;
+                                },
                                 .array => |array| element: {
-                                    const ordinal = std.fmt.parseInt(i64, key.value.string, 10) catch break :blk .{};
+                                    const ordinal = @import("json_path.zig").ordinal(key.value.string) catch {
+                                        value = .{};
+                                        continue;
+                                    };
                                     const count: i64 = @intCast(array.items.len);
-                                    const position = if (ordinal < 0) count +| ordinal else ordinal;
-                                    if (position < 0 or position >= count) break :blk .{};
+                                    const position = if (ordinal < 0) count + ordinal else ordinal;
+                                    if (position < 0 or position >= count) {
+                                        value = .{};
+                                        continue;
+                                    }
                                     break :element array.items[@intCast(position)];
                                 },
-                                else => break :blk .{},
+                                else => {
+                                    value = .{};
+                                    continue;
+                                },
                             };
                         }
+                        if (value.sql_null) break :blk .{};
+                        // JSON null is retained by JSONB extraction but maps
+                        // to SQL NULL for its text-returning counterpart.
+                        if (call.function == .jsonb_extract_path) break :blk value;
                         if (value.value == .null) break :blk .{};
-                        break :blk Datum.json(.{ .string = if (value.value == .string) value.value.string else try self.jsonText(value.value) });
+                        if (value.value == .string) break :blk value;
+                        var work = self.workBudget();
+                        const text = try @import("jsonb_text.zig").format(self.alloc, value.value, self.limits.output_bytes -| self.bytes, &work);
+                        errdefer self.alloc.free(text);
+                        try self.charge(text.len);
+                        break :blk Datum.json(.{ .string = text });
                     },
                     .@"$single" => {
                         const count = try self.runDatum(call.args[1], depth + 1);
@@ -4648,9 +4684,17 @@ test "SQL PostgreSQL text reference preserves Unicode slicing replacement and er
 }
 
 test "SQL PostgreSQL scalar kernels preserve JSON cardinality text casing signatures and errors" {
+    try checkScalarKernelReference(@embedFile("fixtures/sql_scalar_kernel_reference.json"));
+}
+
+test "SQL PostgreSQL JSON path extraction preserves JSON null strict arguments and signatures" {
+    try checkScalarKernelReference(@embedFile("fixtures/sql_json_path_reference.json"));
+}
+
+fn checkScalarKernelReference(bytes: []const u8) !void {
     const a = std.testing.allocator;
-    const Golden = struct { entries: []const struct { sql: []const u8, value: Json = .null, oid: ?u32 = null, @"error": ?[]const u8 = null } };
-    const fixture = try std.json.parseFromSlice(Golden, a, @embedFile("fixtures/sql_scalar_kernel_reference.json"), .{ .ignore_unknown_fields = true });
+    const Golden = struct { entries: []const struct { sql: []const u8, value: Json = .null, sql_null: ?bool = null, oid: ?u32 = null, @"error": ?[]const u8 = null } };
+    const fixture = try std.json.parseFromSlice(Golden, a, bytes, .{ .ignore_unknown_fields = true });
     defer fixture.deinit();
     for (fixture.value.entries) |case| {
         errdefer std.debug.print("scalar kernel fixture: {s}\n", .{case.sql});
@@ -4671,10 +4715,35 @@ test "SQL PostgreSQL scalar kernels preserve JSON cardinality text casing signat
             continue;
         };
         try std.testing.expect(case.@"error" == null);
-        try std.testing.expectEqual(if (case.oid.? == 23) arrays.ElementType.int32 else .text, program.output_type.element_type.?);
-        try std.testing.expectEqual(case.value == .null, actual.sql_null);
+        try std.testing.expectEqual(switch (case.oid.?) {
+            23 => arrays.ElementType.int32,
+            25 => .text,
+            3802 => .jsonb,
+            else => return error.UnexpectedScalarKernelResultType,
+        }, program.output_type.element_type.?);
+        try std.testing.expectEqual(case.sql_null orelse (case.value == .null), actual.sql_null);
         try std.testing.expectEqualStrings(try std.json.Stringify.valueAlloc(arena.allocator(), case.value, .{}), try std.json.Stringify.valueAlloc(arena.allocator(), actual.value, .{}));
     }
+}
+
+test "SQL JSON path extraction borrows immutable values without allocations and shares work limits" {
+    const a = std.testing.allocator;
+    var compiled = try @import("compiler.zig").compileScalar(a, "jsonb_extract_path(doc, 'a', ' 1')", .{});
+    defer compiled.deinit();
+    var program = try bind(a, compiled.expression, &.{.{ .name = "doc", .type = .json, .element_type = .jsonb }}, &.{}, .{});
+    defer program.deinit();
+    const document = try std.json.parseFromSlice(Json, a, "{\"a\":[0,\"borrowed\"]}", .{});
+    defer document.deinit();
+    const source = document.value.object.get("a").?.array.items[1].string;
+    var no_memory = std.heap.FixedBufferAllocator.init(&.{});
+    for (0..1000) |_| {
+        const result = try program.evaluate(no_memory.allocator(), &.{Datum.json(document.value)}, &.{}, .{ .steps = 32 });
+        try std.testing.expect(!result.sql_null);
+        try std.testing.expectEqualStrings("borrowed", result.value.string);
+        try std.testing.expect(result.value.string.ptr == source.ptr);
+    }
+    try std.testing.expectEqual(@as(usize, 0), no_memory.end_index);
+    try std.testing.expectError(error.SqlProgramLimitExceeded, program.evaluate(no_memory.allocator(), &.{Datum.json(document.value)}, &.{}, .{ .steps = 3 }));
 }
 
 test "SQL JSON cardinality reads parsed arrays without allocation or element work" {
