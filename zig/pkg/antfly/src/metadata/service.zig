@@ -45,6 +45,7 @@ const metadata_table_manager = @import("table_manager.zig");
 const metadata_table_workflow = @import("table_workflow.zig");
 const metadata_topology_protocol = @import("topology_protocol.zig");
 const metadata_storage = @import("storage/mod.zig");
+const RelationPublicationPreparation = relation_worker.PublicationPreparation(metadata_storage.RaftApplyStore.RelationPublicationScan, metadata_storage.RaftApplyStore.RelationPublicationProof);
 const platform_clock = @import("antfly_platform").clock;
 const process_memory_mod = @import("antfly_platform").process_memory;
 const platform_time = @import("antfly_platform").time;
@@ -4070,8 +4071,21 @@ const metadata_status_cache_refresh_interval_ms: u64 = 5 * std.time.ms_per_s;
 
 /// Share the serving control cadence, but do not hold a catalog lane or wait
 /// for apply. The worker's own try-lock serializes concurrent HTTP rounds.
+fn closeRelationPublicationPreparation(service: anytype) void {
+    service.relation_reconciliation_worker.lane.lockUncancelable(std.Options.debug_io);
+    defer service.relation_reconciliation_worker.lane.unlock(std.Options.debug_io);
+    service.relation_reconciliation_worker.closing = true;
+    service.relation_publication_preparation.cancel();
+}
+
 fn runRelationReconciliationRound(service: anytype) !void {
-    const store = service.projectedStore() orelse return;
+    const store = service.projectedStore() orelse {
+        if (service.relation_reconciliation_worker.lane.tryLock()) {
+            defer service.relation_reconciliation_worker.lane.unlock(std.Options.debug_io);
+            service.relation_publication_preparation.cancel();
+        }
+        return;
+    };
     const Host = struct {
         service: @TypeOf(service),
         store: @TypeOf(store),
@@ -4085,6 +4099,18 @@ fn runRelationReconciliationRound(service: anytype) !void {
         }
         pub fn observe(self: *@This()) !@import("antfly_local_sources").system_catalog_relation_reconciliation.Work {
             return self.store.relationReconciliationWork(self.service.metadata_group_id);
+        }
+        pub fn beginPublicationScan(self: *@This(), state: @import("antfly_local_sources").system_catalog_relation_reconciliation.State) !*metadata_storage.RaftApplyStore.RelationPublicationScan {
+            return self.store.beginRelationPublicationScan(self.service.alloc, state);
+        }
+        pub fn preparePublication(self: *@This(), work: @import("antfly_local_sources").system_catalog_relation_reconciliation.Work, leader_cut: relation_worker.Leader, now_ns: u64) !bool {
+            return self.service.relation_publication_preparation.step(self, work, leader_cut, now_ns);
+        }
+        pub fn cancelPublication(self: *@This()) void {
+            self.service.relation_publication_preparation.cancel();
+        }
+        pub fn expirePublication(self: *@This(), now_ns: u64) void {
+            self.service.relation_publication_preparation.expire(now_ns);
         }
         pub fn propose(self: *@This(), command: @import("relation_reconciliation_command.zig").Command, term: u64) !relation_worker.Receipt {
             const bytes = try command.encodeAlloc(self.service.alloc);
@@ -4108,7 +4134,7 @@ fn runRelationReconciliationRound(service: anytype) !void {
     };
     var host: Host = .{ .service = service, .store = store };
     _ = service.relation_reconciliation_worker.step(&host, service.metadata_group_id, platform_time.monotonicNs()) catch |err| switch (err) {
-        error.NotLeader, error.TableTopologyProtocolUpgradeRequired, error.DeadlineExceeded, error.Canceled, error.ResourceTemporarilyUnavailable, error.MetadataMutationOutcomeUnknown => return,
+        error.NotLeader, error.TableTopologyProtocolUpgradeRequired, error.DeadlineExceeded, error.Canceled, error.ResourceTemporarilyUnavailable, error.MetadataMutationOutcomeUnknown, error.CatalogGenerationChanged, error.CatalogPublicationScanExpired => return,
         else => return err,
     };
 }
@@ -5432,6 +5458,7 @@ pub const MetadataService = struct {
     cdc_job_owner_id: u64 = 0,
     reconcile_lease: metadata_reconcile_lease.State,
     relation_reconciliation_worker: relation_worker.Worker = .{},
+    relation_publication_preparation: RelationPublicationPreparation = .{},
     // Coordinate proposal progress across in-process callers just as the HTTP
     // service does: one waiter drives Raft while the others sleep on a
     // generation signal instead of polling independently.
@@ -5529,6 +5556,7 @@ pub const MetadataService = struct {
     }
 
     pub fn deinit(self: *MetadataService) void {
+        closeRelationPublicationPreparation(self);
         if (self.online_merge_runtime) |*runtime| runtime.deinit();
         self.online_merge_runtime = null;
         shutdownCdcRuntimeJobs(self);
@@ -8112,6 +8140,7 @@ pub const MetadataHttpService = struct {
     cdc_job_owner_id: u64 = 0,
     reconcile_lease: metadata_reconcile_lease.State,
     relation_reconciliation_worker: relation_worker.Worker = .{},
+    relation_publication_preparation: RelationPublicationPreparation = .{},
     runtime_mutex: std.Io.Mutex = .init,
     catalog_mutation_mutex: std.Io.RwLock = .init,
     store_report_lanes: [64]std.Io.Mutex = @splat(.init),
@@ -8255,6 +8284,7 @@ pub const MetadataHttpService = struct {
     }
 
     pub fn deinit(self: *MetadataHttpService) void {
+        closeRelationPublicationPreparation(self);
         if (self.online_merge_runtime) |*runtime| runtime.deinit();
         self.online_merge_runtime = null;
         shutdownRuntimeStatusProtocolProbe(self);
@@ -18461,11 +18491,14 @@ test "relation reconciliation worker drives real metadata control rounds without
                 // Simulated cadence avoids sleeps; the pure worker tests
                 // separately assert the production interval/read budgets.
                 svc.relation_reconciliation_worker.next_round_at_ns = 0;
-                if (round == 2) svc.relation_reconciliation_worker = .{};
+                if (round == 2) {
+                    svc.relation_publication_preparation.cancel();
+                    svc.relation_reconciliation_worker = .{};
+                }
                 try svc.runRound();
                 const work = try store.relationReconciliationWork(group);
                 if (work.current) |state| if (state.epoch.eql(work.epoch.?) and work.garbage == null and
-                    (if (failed) state.failure != .none else state.phase == .ready)) return work;
+                    (if (failed) state.failure != .none else state.phase == .ready and svc.relation_publication_preparation.proof != null and std.meta.eql(state, svc.relation_publication_preparation.proof.?.state))) return work;
             }
             return error.ReconciliationDidNotConverge;
         }

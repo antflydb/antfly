@@ -1930,6 +1930,31 @@ and the owned snapshot handle. The final native gate passes 170 catalog and
 formatting and whitespace checks pass. Coordinator scan scheduling,
 capability/lifecycle barriers, automatic writer adoption and atomic root
 publication remain unfinished. No original SQL disposition is changed.
+Both metadata service variants now schedule the owned publication verifier
+through the existing serialized control-round lane. Each active scan consumes
+one page budget per round and defers that worker's GC append until verification
+finishes. The local completed proof is cached, not treated as serving authority.
+Exact ready state, source epoch, root and leader term changes discard old work;
+leader loss, missing projection and service teardown release the retained scan.
+Shutdown closes the worker before releasing resources, preventing recreation.
+Snapshot lifetime is capped at 60 seconds with delayed retry; expiry runs before
+leader/status observation, so runtime-lane contention cannot indefinitely pin
+an old snapshot. Transient failures back off, while corruption stops retries
+for the unchanged cut. Very large/slow catalogs can exceed this preparation
+deadline and require further scheduling/renewal work; expiry is not successful
+verification. Proofs retain their write-transaction recheck requirement and are
+not refreshed merely because unrelated metadata or GC commits changed apply
+position. Coordinator tests cover per-step work, completion caching, term/root/
+epoch replacement, cancellation, resource/corruption failures, expiry and
+shutdown. The real service fixture now waits for matching completed evidence
+rather than accepting only a ready job flag. Capability/lifecycle barriers,
+writer adoption, atomic root publication and public SQL resolution remain
+unfinished; original case dispositions are unchanged.
+Final focused validation passes all 10 coordinator tests without failures or
+leaks, including the four new preparation/lifetime tests and the real service
+fixture. Inventory, control-catalog, formatting and whitespace checks pass.
+An earlier final compile exhausted local disk; only obsolete generated test
+binaries/objects were removed before the successful final run.
 The owned table-cut projector can now combine an exact predecessor definition
 with a plan-fenced successor definition in expected linear time. It retains
 old-only active names, both owners for shared names and pending-only new names,

@@ -11,6 +11,83 @@ const control = @import("relation_reconciliation_command.zig");
 pub const Receipt = struct { term: u64, index: u64 };
 pub const Leader = struct { term: u64, applied_index: u64 };
 pub const round_interval_ns = 250 * std.time.ns_per_ms;
+pub const publication_snapshot_lifetime_ns = 60 * std.time.ns_per_s;
+
+/// One owned bounded scan, serialized by the worker lane. Evidence is local,
+/// never publication authority: the eventual write must recheck its proof.
+/// Scan is injected so resource ownership and scheduling are fault-testable.
+pub fn PublicationPreparation(comptime Scan: type, comptime Proof: type) type {
+    return struct {
+        const Cut = struct { state: r.State, root: ?r.Generation, term: u64 };
+        cut: ?Cut = null,
+        scan: ?*Scan = null,
+        proof: ?Proof = null,
+        expires_at_ns: u64 = 0,
+        retry_after_ns: u64 = 0,
+        stopped: bool = false,
+
+        pub fn cancel(self: *@This()) void {
+            self.closeScan();
+            self.* = .{};
+        }
+        fn closeScan(self: *@This()) void {
+            if (self.scan) |scan| scan.deinit();
+            self.scan = null;
+        }
+        fn failed(self: *@This(), err: anyerror, now_ns: u64) void {
+            self.closeScan();
+            self.proof = null;
+            // Do not repeatedly rescan/log a corrupt immutable cut. Resource
+            // failures are retryable, but cannot create a tight retry loop.
+            self.stopped = err == error.InvalidCatalogRecord;
+            self.retry_after_ns = now_ns +| std.time.ns_per_s;
+        }
+        pub fn expire(self: *@This(), now_ns: u64) void {
+            if (self.scan != null and now_ns >= self.expires_at_ns) self.failed(error.CatalogPublicationScanExpired, now_ns);
+        }
+        /// true consumes this round's work budget; no GC append should race
+        /// the in-progress proof. No scan may survive a term/source/root cut
+        /// change, failure, expiry or service teardown.
+        pub fn step(self: *@This(), host: anytype, work: r.Work, leader: Leader, now_ns: u64) !bool {
+            const state = work.current orelse {
+                self.cancel();
+                return false;
+            };
+            if (work.epoch == null or !state.epoch.eql(work.epoch.?) or state.phase != .ready or state.failure != .none) {
+                self.cancel();
+                return false;
+            }
+            const next: Cut = .{ .state = state, .root = work.root, .term = leader.term };
+            if (!std.meta.eql(self.cut, @as(?Cut, next))) {
+                self.cancel();
+                self.cut = next;
+            }
+            if (self.proof != null or self.stopped) return false;
+            if (self.scan == null) {
+                if (now_ns < self.retry_after_ns) return false;
+                self.scan = host.beginPublicationScan(state) catch |err| {
+                    self.failed(err, now_ns);
+                    return err;
+                };
+                self.expires_at_ns = now_ns +| publication_snapshot_lifetime_ns;
+            }
+            if (now_ns >= self.expires_at_ns) {
+                self.failed(error.CatalogPublicationScanExpired, now_ns);
+                return error.CatalogPublicationScanExpired;
+            }
+            const proof = self.scan.?.step(null) catch |err| {
+                self.failed(err, now_ns);
+                return err;
+            };
+            if (proof) |value| {
+                self.proof = value;
+                self.closeScan();
+                return false;
+            }
+            return true;
+        }
+    };
+}
 
 /// Select only from an observed committed cut. Stale generations are replaced
 /// by CAS, including terminal failures; unchanged failed epochs stay stopped.
@@ -35,6 +112,7 @@ pub const Worker = struct {
     next_round_at_ns: u64 = 0,
     pending: ?Receipt = null,
     prefer_gc: bool = false,
+    closing: bool = false,
 
     /// Host supplies a local leader/applied cut, one pinned bounded work read,
     /// and capability-gated append in the exact captured term. No apply waits,
@@ -43,20 +121,32 @@ pub const Worker = struct {
     pub fn step(self: *Worker, host: anytype, group: u64, now_ns: u64) !bool {
         if (!self.lane.tryLock()) return false;
         defer self.lane.unlock(std.Options.debug_io);
+        if (self.closing) return false;
         if (now_ns < self.next_round_at_ns) return false;
         self.next_round_at_ns = now_ns +| round_interval_ns;
+        // Expiry must not depend on successful leader/status observation.
+        // A contended runtime lane cannot retain an old snapshot indefinitely.
+        host.expirePublication(now_ns);
         const leader: Leader = (try host.leader()) orelse {
             self.pending = null;
+            host.cancelPublication();
             return false;
         };
-        if (leader.term == 0) return error.InvalidCatalogRecord;
+        if (leader.term == 0) {
+            host.cancelPublication();
+            return error.InvalidCatalogRecord;
+        }
         if (self.pending) |receipt| {
             if (receipt.term == leader.term and leader.applied_index < receipt.index) return false;
             // Applied is not proof that our intent won. A term change may
             // overwrite it; always observe the actual durable successor.
             self.pending = null;
         }
-        const work: r.Work = try host.observe();
+        const work: r.Work = host.observe() catch |err| {
+            host.cancelPublication();
+            return err;
+        };
+        if (try host.preparePublication(work, leader, now_ns)) return false;
         const command = (try nextIntent(work, group, self.prefer_gc)) orelse return false;
         const receipt: Receipt = try host.propose(command, leader.term);
         if (receipt.term != leader.term or receipt.index == 0) return error.InvalidCatalogRecord;
@@ -74,7 +164,20 @@ const Fake = struct {
     last: ?control.Command = null,
     lose_term: bool = false,
     ambiguous: bool = false,
+    leader_error: ?anyerror = null,
+    cancellations: usize = 0,
+    expirations: usize = 0,
+    pub fn cancelPublication(self: *@This()) void {
+        self.cancellations += 1;
+    }
+    pub fn expirePublication(self: *@This(), _: u64) void {
+        self.expirations += 1;
+    }
+    pub fn preparePublication(_: *@This(), _: r.Work, _: Leader, _: u64) !bool {
+        return false;
+    }
     pub fn leader(self: *@This()) !?Leader {
+        if (self.leader_error) |err| return err;
         return self.cut;
     }
     pub fn observe(self: *@This()) !r.Work {
@@ -91,6 +194,108 @@ const Fake = struct {
     }
 };
 const epoch: r.Epoch = .{ .incarnation = @splat(1), .revision = 1 };
+
+const ScanHost = struct {
+    begins: usize = 0,
+    steps: usize = 0,
+    closes: usize = 0,
+    begin_error: ?anyerror = null,
+    step_error: ?anyerror = null,
+    const Scan = struct {
+        owner: *ScanHost,
+        remaining: usize = 2,
+        pub fn step(self: *@This(), _: ?*const std.atomic.Value(bool)) !?u64 {
+            self.owner.steps += 1;
+            if (self.owner.step_error) |err| return err;
+            self.remaining -= 1;
+            return if (self.remaining == 0) 42 else null;
+        }
+        pub fn deinit(self: *@This()) void {
+            self.owner.closes += 1;
+            std.testing.allocator.destroy(self);
+        }
+    };
+    pub fn beginPublicationScan(self: *@This(), _: r.State) !*Scan {
+        self.begins += 1;
+        if (self.begin_error) |err| return err;
+        const scan = try std.testing.allocator.create(Scan);
+        scan.* = .{ .owner = self };
+        return scan;
+    }
+};
+fn publicationWorkForTest() !r.Work {
+    var ready = try r.State.init(41, try r.nextJobId(null), epoch);
+    ready.phase = .ready;
+    return .{ .epoch = epoch, .current = ready, .root = null };
+}
+
+test "relation reconciliation worker publication preparation yields closes and retains only completed evidence" {
+    var host: ScanHost = .{};
+    var preparation: PublicationPreparation(ScanHost.Scan, u64) = .{};
+    defer preparation.cancel();
+    const work = try publicationWorkForTest();
+    const leader: Leader = .{ .term = 7, .applied_index = 1 };
+    try std.testing.expect(try preparation.step(&host, work, leader, 0));
+    try std.testing.expect(preparation.proof == null and preparation.scan != null);
+    try std.testing.expectEqual(@as(usize, 1), host.steps);
+    try std.testing.expect(!try preparation.step(&host, work, leader, round_interval_ns));
+    try std.testing.expectEqual(@as(?u64, 42), preparation.proof);
+    try std.testing.expect(preparation.scan == null);
+    for (0..10) |round| try std.testing.expect(!try preparation.step(&host, work, leader, round * round_interval_ns));
+    try std.testing.expectEqual(@as(usize, 1), host.begins);
+    try std.testing.expectEqual(@as(usize, 2), host.steps);
+    try std.testing.expectEqual(@as(usize, 1), host.closes);
+}
+
+test "relation reconciliation worker publication preparation discards changed terms roots and source epochs" {
+    var host: ScanHost = .{};
+    var preparation: PublicationPreparation(ScanHost.Scan, u64) = .{};
+    defer preparation.cancel();
+    var work = try publicationWorkForTest();
+    var leader: Leader = .{ .term = 7, .applied_index = 1 };
+    try std.testing.expect(try preparation.step(&host, work, leader, 0));
+    leader.term += 1;
+    try std.testing.expect(try preparation.step(&host, work, leader, round_interval_ns));
+    try std.testing.expectEqual(@as(usize, 1), host.closes);
+    work.root = r.Generation.of(&work.current.?);
+    try std.testing.expect(try preparation.step(&host, work, leader, 2 * round_interval_ns));
+    try std.testing.expectEqual(@as(usize, 2), host.closes);
+    work.epoch.?.revision += 1;
+    try std.testing.expect(!try preparation.step(&host, work, leader, 3 * round_interval_ns));
+    try std.testing.expect(preparation.scan == null and preparation.proof == null and preparation.cut == null);
+    try std.testing.expectEqual(@as(usize, 3), host.closes);
+    work.current.?.epoch = work.epoch.?;
+    try std.testing.expect(try preparation.step(&host, work, leader, 4 * round_interval_ns));
+    preparation.cancel(); // Leadership loss/service teardown, idempotently.
+    preparation.cancel();
+    try std.testing.expectEqual(host.begins, host.closes);
+}
+
+test "relation reconciliation worker publication preparation bounds snapshot lifetime and retry failures" {
+    var host: ScanHost = .{};
+    var preparation: PublicationPreparation(ScanHost.Scan, u64) = .{};
+    defer preparation.cancel();
+    const work = try publicationWorkForTest();
+    var leader: Leader = .{ .term = 7, .applied_index = 1 };
+    try std.testing.expect(try preparation.step(&host, work, leader, 0));
+    try std.testing.expectError(error.CatalogPublicationScanExpired, preparation.step(&host, work, leader, publication_snapshot_lifetime_ns));
+    try std.testing.expect(preparation.scan == null and preparation.proof == null);
+    try std.testing.expectEqual(@as(usize, 1), host.closes);
+    try std.testing.expect(!try preparation.step(&host, work, leader, publication_snapshot_lifetime_ns + 1));
+    const retry = preparation.retry_after_ns;
+    host.begin_error = error.OutOfMemory;
+    try std.testing.expectError(error.OutOfMemory, preparation.step(&host, work, leader, retry));
+    host.begin_error = null;
+    host.step_error = error.InvalidCatalogRecord;
+    try std.testing.expectError(error.InvalidCatalogRecord, preparation.step(&host, work, leader, preparation.retry_after_ns));
+    const attempts = host.begins;
+    try std.testing.expect(!try preparation.step(&host, work, leader, preparation.retry_after_ns));
+    try std.testing.expectEqual(attempts, host.begins);
+    host.step_error = null;
+    leader.term += 1;
+    try std.testing.expect(try preparation.step(&host, work, leader, preparation.retry_after_ns));
+    try std.testing.expect(preparation.scan != null and !preparation.stopped);
+}
 
 test "relation reconciliation worker budgets pending work and alternates GC" {
     const prior = try r.State.init(41, try r.nextJobId(null), epoch);
@@ -113,6 +318,24 @@ test "relation reconciliation worker budgets pending work and alternates GC" {
     try std.testing.expect(!try worker.step(&host, 41, 4 * round_interval_ns));
     worker.lane.unlock(std.Options.debug_io);
     try std.testing.expectEqual(@as(usize, 3), host.reads);
+}
+
+test "relation reconciliation worker expires publication work before unavailable leader observations" {
+    var host: Fake = .{ .work = try publicationWorkForTest(), .leader_error = error.ResourceTemporarilyUnavailable };
+    var worker: Worker = .{};
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, worker.step(&host, 41, 0));
+    try std.testing.expectEqual(@as(usize, 1), host.expirations);
+    host.leader_error = null;
+    host.cut = null;
+    try std.testing.expect(!try worker.step(&host, 41, round_interval_ns));
+    try std.testing.expectEqual(@as(usize, 1), host.cancellations);
+    host.cut = .{ .term = 0, .applied_index = 0 };
+    try std.testing.expectError(error.InvalidCatalogRecord, worker.step(&host, 41, 2 * round_interval_ns));
+    try std.testing.expectEqual(@as(usize, 2), host.cancellations);
+    try std.testing.expectEqual(@as(usize, 3), host.expirations);
+    worker.closing = true;
+    try std.testing.expect(!try worker.step(&host, 41, 3 * round_interval_ns));
+    try std.testing.expectEqual(@as(usize, 3), host.expirations);
 }
 
 test "relation reconciliation worker retains terminal failures and replaces changed epochs" {
