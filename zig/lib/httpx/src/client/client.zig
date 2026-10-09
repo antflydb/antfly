@@ -572,6 +572,78 @@ fn ensureRequestDeadline(io: Io, deadline_ms: ?i64) !void {
     if (common.milliTimestamp(io) >= deadline) return error.Timeout;
 }
 
+/// Busy pools apply backpressure before any request bytes are sent. Admission
+/// shares the whole-request deadline and remains cancelable without a socket.
+fn acquirePooledConnection(comptime Entry: type, pool: anytype, io: Io, host: []const u8, port: u16, deadline_ms: ?i64, interrupt: *const RequestInterrupt) !*Entry {
+    while (true) {
+        try io.checkCancel();
+        if (interrupt.isCancellationRequested()) return error.Cancelled;
+        try ensureRequestDeadline(io, deadline_ms);
+        // Observe before checkout so a release between failure and parking
+        // changes the futex value and cannot leave the request asleep.
+        const observed = pool.availability_epoch.load(.acquire);
+        return pool.getConnection(host, port) catch |err| switch (err) {
+            error.PoolExhausted, error.PoolExhaustedForHost => {
+                const wait_ms = if (deadline_ms) |deadline|
+                    @min(@as(i64, cancellation_poll_interval_ms), @max(1, deadline - common.milliTimestamp(io)))
+                else
+                    cancellation_poll_interval_ms;
+                try Io.futexWaitTimeout(io, u32, &pool.availability_epoch.raw, observed, .{ .duration = .{ .clock = .awake, .raw = .fromMilliseconds(@intCast(wait_ms)) } });
+                continue;
+            },
+            else => return err,
+        };
+    }
+}
+
+test "busy H1 pool admission wakes on release without increasing capacity" {
+    const Fixture = struct {
+        availability_epoch: std.atomic.Value(u32) = .init(0),
+        ready: std.atomic.Value(bool) = .init(false),
+        entry: u8 = 1,
+        fn getConnection(self: *@This(), _: []const u8, _: u16) anyerror!*u8 {
+            if (!self.ready.load(.acquire)) return error.PoolExhaustedForHost;
+            return &self.entry;
+        }
+        fn release(self: *@This(), io: Io) !void {
+            try io.sleep(.fromMilliseconds(10), .awake);
+            self.ready.store(true, .release);
+            _ = self.availability_epoch.fetchAdd(1, .release);
+            Io.futexWake(io, u32, &self.availability_epoch.raw, std.math.maxInt(u32));
+        }
+    };
+    var pool: Fixture = .{};
+    var interrupt: RequestInterrupt = .{};
+    var release = try std.testing.io.concurrent(Fixture.release, .{ &pool, std.testing.io });
+    defer release.cancel(std.testing.io) catch {};
+    const entry = try acquirePooledConnection(u8, &pool, std.testing.io, "host", 443, common.milliTimestamp(std.testing.io) + 1000, &interrupt);
+    try std.testing.expect(entry == &pool.entry);
+    try release.await(std.testing.io);
+}
+
+test "busy H1 pool admission uses the original deadline" {
+    var pool = ConnectionPool.initWithConfig(std.testing.allocator, std.testing.io, .{ .max_connections = 0 }, {});
+    defer pool.deinit();
+    var interrupt: RequestInterrupt = .{};
+    try std.testing.expectError(error.Timeout, acquirePooledConnection(@import("pool.zig").Connection, &pool, std.testing.io, "host", 80, common.milliTimestamp(std.testing.io) + 10, &interrupt));
+}
+
+test "busy H1 pool admission cancels before a socket exists" {
+    const Cancel = struct {
+        fn run(interrupt: *RequestInterrupt, io: Io) !void {
+            try io.sleep(.fromMilliseconds(10), .awake);
+            interrupt.cancelled.store(true, .release);
+        }
+    };
+    var pool = ConnectionPool.initWithConfig(std.testing.allocator, std.testing.io, .{ .max_connections = 0 }, {});
+    defer pool.deinit();
+    var interrupt: RequestInterrupt = .{};
+    var cancel = try std.testing.io.concurrent(Cancel.run, .{ &interrupt, std.testing.io });
+    defer cancel.cancel(std.testing.io) catch {};
+    try std.testing.expectError(error.Cancelled, acquirePooledConnection(@import("pool.zig").Connection, &pool, std.testing.io, "host", 80, common.milliTimestamp(std.testing.io) + 1000, &interrupt));
+    try cancel.await(std.testing.io);
+}
+
 fn isSafeUnsentRetryError(err: anyerror) bool {
     return switch (err) {
         error.GoawayRefused,
@@ -1922,7 +1994,7 @@ pub const Client = struct {
 
         if (req.uri.isTls()) {
             if (self.config.keep_alive and self.config.address_filter == null) {
-                var tls_conn = try self.tls_pool.getConnection(host, port);
+                var tls_conn = try acquirePooledConnection(TlsConnection, &self.tls_pool, self.io, host, port, deadline_ms, interrupt);
                 var ok = false;
                 defer {
                     if (ok) self.tls_pool.releaseConnection(tls_conn) else self.tls_pool.evictConnection(tls_conn);
@@ -1946,7 +2018,7 @@ pub const Client = struct {
         }
 
         if (self.config.keep_alive and self.config.address_filter == null) {
-            var conn = try self.pool.getConnection(host, port);
+            var conn = try acquirePooledConnection(@import("pool.zig").Connection, &self.pool, self.io, host, port, deadline_ms, interrupt);
             var ok = false;
             defer {
                 if (ok) self.pool.releaseConnection(conn) else self.pool.evictConnection(conn);
@@ -2025,7 +2097,7 @@ pub const Client = struct {
 
         if (req.uri.isTls()) {
             if (self.config.keep_alive and self.config.address_filter == null) {
-                var tls_conn = try self.tls_pool.getConnection(host, port);
+                var tls_conn = try acquirePooledConnection(TlsConnection, &self.tls_pool, self.io, host, port, deadline_ms, interrupt);
                 var ok = false;
                 defer {
                     if (ok) self.tls_pool.releaseConnection(tls_conn) else self.tls_pool.evictConnection(tls_conn);
@@ -2048,7 +2120,7 @@ pub const Client = struct {
         }
 
         if (self.config.keep_alive and self.config.address_filter == null) {
-            var conn = try self.pool.getConnection(host, port);
+            var conn = try acquirePooledConnection(@import("pool.zig").Connection, &self.pool, self.io, host, port, deadline_ms, interrupt);
             var ok = false;
             defer {
                 if (ok) self.pool.releaseConnection(conn) else self.pool.evictConnection(conn);
@@ -5365,7 +5437,13 @@ test "request cancellation before socket publication prevents sending" {
             } else |err| {
                 try std.testing.expectEqual(error.Cancelled, err);
             }
-            try serving.await(fixture_io);
+            // Pooled admission observes cancellation before connecting. The
+            // non-pooled path still exercises cancellation at publication.
+            if (keep_alive) {
+                serving.cancel(fixture_io) catch {};
+            } else {
+                try serving.await(fixture_io);
+            }
             try std.testing.expectEqual(@as(usize, 0), server.routeHitCount(0));
             try std.testing.expectEqual(@as(usize, 0), client.pool.stats().total);
             try std.testing.expectEqual(@as(usize, 0), bytes.items.len);

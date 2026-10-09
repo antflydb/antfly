@@ -570,6 +570,12 @@ The authorized incremental budget is $150; the dry run estimated 19,372,806,880
 bytes. The pinned October 9 export completed with 47,717,307 live story/comment
 rows in 334 Parquet objects (21,195,813,507 compressed bytes). Full-archive index
 and latency qualification and an HN public deployment are still outstanding.
+The first regional full-archive attempt registered the source in 51.7 seconds,
+then repeatedly hit `PoolExhaustedForHost` during publication; both temporary
+pods were stopped. HTTP/1 request admission now waits for released capacity with
+the original request deadline and cancellation, instead of failing immediately
+when lake coverage submits more checks than the per-host pool limit. Full-archive
+qualification must be repeated with that change before reporting capacity or latency.
 For a full archive, use `regional.py --modes indexed --cycles 1` to give the
 metadata-index build its own bounded pod lifetime. Run `--modes text-only` with
 a separate artifact prefix afterward. The default runs both modes in one pod;

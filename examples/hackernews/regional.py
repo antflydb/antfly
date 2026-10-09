@@ -327,7 +327,10 @@ def main():
     finally:
         try:
             if created:
-                run(kubectl + ["delete", "pod", pod_name, "--wait=false"])
+                run(
+                    kubectl
+                    + ["delete", "pod", pod_name, "--wait=false", "--ignore-not-found"]
+                )
         finally:
             credentials.cleanup()
 
