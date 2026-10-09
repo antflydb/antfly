@@ -186,6 +186,7 @@ pub fn apply(alloc: std.mem.Allocator, schema: *Value, ddl: ast.CatalogDdl) !boo
 /// In-place builder for an already unpublished schema, allowing CREATE's
 /// constraint batch to avoid cloning the entire schema for every constraint.
 pub fn applyCandidate(alloc: std.mem.Allocator, schema: *Value, ddl: ast.CatalogDdl) !bool {
+    if (ddl.kind == .index and ddl.index_targets.len > 1) return error.UnsupportedSqlShape;
     const change = ddl.schema_change orelse return error.InvalidSqlSyntax;
     if (schema.* != .object) return error.InvalidSqlBackendResponse;
     switch (change) {

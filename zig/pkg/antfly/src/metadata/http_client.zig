@@ -1231,7 +1231,7 @@ pub const MetadataHttpClient = struct {
                 error.InvalidCatalogMutation,
             403 => error.Forbidden,
             404 => error.CatalogNotFound,
-            405 => if (input == .relation_replace and std.mem.eql(u8, response.body, "ExtensionOwnedObject"))
+            405 => if ((input == .relation_replace or input == .relation_schema_mutate) and std.mem.eql(u8, response.body, "ExtensionOwnedObject"))
                 error.ExtensionOwnedObject
             else
                 error.TableTopologyProtocolUpgradeRequired,

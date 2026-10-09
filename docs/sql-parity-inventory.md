@@ -505,8 +505,8 @@ original entry remains identifiable by its canonical hash (sorted JSON keys,
 compact separators, UTF-8 without ASCII escaping).
 
 The matching `sql_parity_dispositions.json` must account for every ID exactly once.
-The current branch records 365 implemented, 136 rejected and 73 superseded
-cases, with 1,012 still unresolved. The earlier batches add 77 exact compiler
+The current branch records 478 implemented, 136 rejected and 73 superseded
+cases, with 899 still unresolved. The earlier batches add 77 exact compiler
 rejection contracts, 115 mounted native reads, twelve native UPDATE/DELETE
 contracts and six independently referenced mutations
 contracts; they do not claim complete SQL
@@ -519,7 +519,8 @@ positive contracts. Native execution checks full persisted state as well as
 public results. Five recorded gates verify mounted execution, both PostgreSQL
 references, oracle safety/ordering contracts and pipeline allocation-fault
 regressions. This is a validated batch, not completion of either entire campaign;
-getting below 800 now requires at least 213 additional resolved dispositions.
+At that checkpoint, getting below 800 required at least 213 additional resolved
+dispositions; the current inventory report remains the authority for totals.
 
 Six exact correlated and tuple-membership UPDATE/DELETE originals
 (`sql-0600`–`sql-0602`, `sql-0610`–`sql-0612`) now execute against native typed
@@ -2338,8 +2339,32 @@ stale-membership rejection and a subsequent source rebuild. The native store's
 standalone private-transport cut separately completes all 66 build steps, with
 178 tests passing and one skipped. That gate includes private admission and
 missing-capability rejection without durable state changes; it does not prove
-standalone publication bootstrap or public SQL index activation. Public SQL
-index lowering remains unfinished and no original-case dispositions change.
+standalone publication bootstrap or complete public SQL index activation.
+Index DDL now has its own internal relation kind rather than masquerading as
+an ALTER TABLE with a client-supplied owner. CREATE retains its owning table;
+DROP retains qualified index names, multiple targets, dependency behavior and
+CONCURRENTLY intent. The ordinary public path resolves names and definitions
+from one immutable relation cut, authorizes the logical owning table before
+object-type diagnostics, and carries the exact owner through metadata-local
+schema preparation into native guarded CAS. It does not materialize a complete
+catalog for an ordinary non-retiring index mutation. Pgwire carries its pinned
+search path into that bounded lookup, with same-schema creation and qualified
+names taking precedence. Malformed or stale mutation replies stay uncertain,
+and schema-version exhaustion is checked before admission. Constraint-backed
+indexes require removal through their owning constraint, with actionable
+diagnostics. Retirement receipts retain the target epoch rather than the still
+active predecessor. Fresh-catalog/standalone publication bootstrap, atomic
+multi-owner DROP, online CONCURRENTLY builds and CASCADE dependency retirement
+remain unfinished; these contracts are not implemented as blocking aliases or
+independently committed loops. Qualification includes all 24 catalog/pgwire
+owner-layer tests (47 build steps), 89 focused SQL tests with one skipped
+(61 steps), all 23 real/pure coordinator tests, and 178 standalone catalog
+tests with one skipped (66 steps). The standalone HTTP fixtures require local
+listener permission; the authorized run passes after the sandbox-only bind
+failures. A separate PostgreSQL 18 oracle checks same-schema creation, ordered
+index shadowing and exact SQLSTATEs. These are foundation and target-semantics
+witnesses, not original-case end-to-end coverage. No original-case dispositions
+change.
 The first standalone gate exposed missing storage-owner cleanup symbols in its
 unlinked test composition. Its catalog tests now use a dedicated module linked
 to the production ABI providers, without changing unrelated restore roots or

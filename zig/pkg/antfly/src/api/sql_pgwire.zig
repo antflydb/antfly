@@ -808,6 +808,7 @@ const Job = struct {
             .context = context,
             .database = self.request.database orelse "default",
             .namespace = self.request.namespace orelse "public",
+            .ddl_search_path = if (self.request.search_path) |*path| path else null,
             .session_id = self.request.session_id,
             .session_namespace = self.request.session_namespace,
             .setting_overlay = self.request.setting_overlay,

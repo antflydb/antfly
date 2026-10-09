@@ -244,6 +244,57 @@ class PostgresReferenceTest(unittest.TestCase):
         cls.db = cls.server.__enter__()
         cls.addClassCleanup(cls.server.__exit__, None, None, None)
 
+    def test_index_namespace_ownership_search_path_and_diagnostics(self):
+        import psycopg
+
+        with self.db.transaction(force_rollback=True):
+            self.db.execute("CREATE SCHEMA index_path_target")
+            self.db.execute("CREATE TABLE public.index_path_shadow(id bigint)")
+            self.db.execute(
+                "CREATE TABLE index_path_target.index_path_owner(id bigint PRIMARY KEY)"
+            )
+            self.db.execute(
+                "CREATE INDEX namespace_key ON public.index_path_shadow(id)"
+            )
+            self.db.execute("SET LOCAL search_path TO public, index_path_target")
+            # CREATE binds the table first; an unrelated index in an earlier
+            # namespace cannot capture the new index's namespace or collide.
+            self.db.execute("CREATE INDEX namespace_key ON index_path_owner(id)")
+            self.assertEqual(
+                [("index_path_target",), ("public",)],
+                self.db.execute(
+                    "SELECT n.nspname FROM pg_class c JOIN pg_namespace n "
+                    "ON n.oid = c.relnamespace WHERE c.relname = 'namespace_key' "
+                    "AND c.relkind = 'i' ORDER BY n.nspname"
+                ).fetchall(),
+            )
+            # DROP resolves the index itself, so the earlier namespace wins.
+            self.db.execute("DROP INDEX namespace_key")
+            self.assertIsNone(
+                self.db.execute("SELECT to_regclass('public.namespace_key')").fetchone()[0]
+            )
+            self.assertIsNotNone(
+                self.db.execute(
+                    "SELECT to_regclass('index_path_target.namespace_key')"
+                ).fetchone()[0]
+            )
+            for sql, state in (
+                ("DROP INDEX index_path_target.missing_key", "42704"),
+                ("DROP INDEX index_path_target.index_path_owner", "42809"),
+                ("DROP INDEX index_path_target.index_path_owner_pkey", "2BP01"),
+                (
+                    "CREATE INDEX index_path_target.qualified_key "
+                    "ON index_path_target.index_path_owner(id)",
+                    "42601",
+                ),
+            ):
+                with self.subTest(sql=sql):
+                    with self.assertRaises(psycopg.Error) as caught:
+                        with self.db.transaction():
+                            self.db.execute(sql)
+                    self.assertEqual(state, caught.exception.sqlstate)
+            self.db.execute("DROP INDEX index_path_target.namespace_key")
+
     def test_not_valid_check_still_enforces_new_writes(self):
         import psycopg
 

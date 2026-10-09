@@ -41,6 +41,18 @@ pub const RelationReplacementResult = struct {
     stamp: ?@import("../metadata/api.zig").CatalogMutationStamp = null,
 };
 
+/// Metadata owns the full predecessor record; ingress supplies logical intent
+/// and the owner it authorized, never a synthesized partial table record.
+pub const RelationSchemaMutation = struct {
+    guard: domain.RelationMutationGuard,
+    schema_json: []const u8,
+
+    pub fn validate(self: @This()) !void {
+        try self.guard.validate();
+        if (self.schema_json.len > domain.max_command_bytes) return error.CatalogCommandTooLarge;
+    }
+};
+
 pub const Call = union(enum) {
     lake_index_lifecycle_read: u64,
     lake_index_lifecycle_work: ?u64,
@@ -89,6 +101,7 @@ pub const Call = union(enum) {
     resolve: Target,
     resolve_many: ResolveMany,
     relation_replace: RelationReplacement,
+    relation_schema_mutate: RelationSchemaMutation,
     query_definition: []const u8,
     mutate: Request,
     // A distinct operation makes older peers reject unsupported point reads.
@@ -98,7 +111,7 @@ pub const Call = union(enum) {
 
     pub fn requiresAdministrativeGrant(self: @This()) bool {
         return switch (self) {
-            .relation_replace => true,
+            .relation_replace, .relation_schema_mutate => true,
             .lake_index_lifecycle_mutate, .setting_mutate, .policy_definition_mutate, .policy_publication_mutate, .policy_publication_begin, .fk_generation_publication_begin, .fk_generation_publication_mutate, .fk_initial_create_begin, .fk_initial_create_mutate, .store_root_enroll, .store_root_enrollment_status => true,
             else => false,
         };
@@ -177,6 +190,10 @@ test "system catalog relation replacement requires a body-bound administrative m
     try std.testing.expect(call.requiresAdministrativeGrant());
     try std.testing.expect(call.isMutation());
     try std.testing.expect(!call.requiresSettingAuthorityReadGrant());
+    const schema: Call = .{ .relation_schema_mutate = undefined };
+    try std.testing.expect(schema.requiresAdministrativeGrant());
+    try std.testing.expect(schema.isMutation());
+    try std.testing.expect(!schema.requiresSettingAuthorityReadGrant());
 }
 
 test "system catalog relation replacement wire retains exact owner and rejects identity changes" {

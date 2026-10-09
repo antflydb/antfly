@@ -2026,15 +2026,27 @@ const Parser = struct {
     }
 
     fn indexDdl(self: *Parser, create: bool, unique: bool) Error!ast.CatalogDdl {
+        const concurrently = self.ddlWord("concurrently");
         const conditional = self.keyword(.@"if");
         if (conditional) {
             if (create) try self.expectKeyword(.not);
             try self.expectKeyword(.exists);
         }
+        if (!create) {
+            var targets = std.ArrayList(ast.Name).empty;
+            while (true) {
+                try self.node();
+                try targets.append(self.alloc, try self.name());
+                if (!self.take(.comma)) break;
+            }
+            const cascade = self.keyword(.cascade);
+            if (!cascade) _ = self.keyword(.restrict);
+            const first = targets.items[0];
+            return .{ .kind = .index, .action = .drop, .name = first, .conditional = conditional, .concurrently = concurrently, .cascade = cascade, .index_targets = try targets.toOwnedSlice(self.alloc), .schema_change = .{ .drop_index = first.table } };
+        }
         const index_name = try self.identifier();
         try self.expectKeyword(.on);
         const table_name = try self.tableReferenceName();
-        if (!create) return .{ .kind = .table, .action = .alter_schema, .name = table_name, .conditional = conditional, .schema_change = .{ .drop_index = index_name } };
         try self.expect(.lparen);
         var keys = std.ArrayList(ast.Order).empty;
         while (true) {
@@ -2061,7 +2073,7 @@ const Parser = struct {
         }
         const partial_predicate = if (self.keyword(.where)) try self.scalar(0, 0) else null;
         if (partial_predicate) |expression| try self.checkScalarDepth(expression, 0);
-        return .{ .kind = .table, .action = .alter_schema, .name = table_name, .conditional = conditional, .schema_change = .{ .create_index = .{ .name = index_name, .keys = try keys.toOwnedSlice(self.alloc), .include_columns = try included.toOwnedSlice(self.alloc), .unique = unique, .predicate = partial_predicate } } };
+        return .{ .kind = .index, .action = .create, .name = .{ .table = index_name }, .index_table = table_name, .conditional = conditional, .concurrently = concurrently, .schema_change = .{ .create_index = .{ .name = index_name, .keys = try keys.toOwnedSlice(self.alloc), .include_columns = try included.toOwnedSlice(self.alloc), .unique = unique, .predicate = partial_predicate } } };
     }
 
     fn schemaDefault(self: *Parser) Error!*const ast.Scalar {
@@ -2538,6 +2550,35 @@ test "policy DDL parses draft definitions and never accepts publication commands
     try std.testing.expectEqual(.disable, disabled.statement.policy_ddl.action);
     try std.testing.expectError(error.InvalidSqlSyntax, compile(std.testing.allocator, "CREATE POLICY bad ON accounts FOR INSERT USING (true)", .{}));
     try std.testing.expectError(error.InvalidSqlSyntax, compile(std.testing.allocator, "CREATE POLICY bad ON accounts FOR SELECT WITH CHECK (true)", .{}));
+}
+
+test "compiler index DDL retains namespace ownership and distributed statement contracts" {
+    var create = try compile(std.testing.allocator, "CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS email_key ON ONLY tenant.accounts (lower(email)) INCLUDE (id) WHERE email IS NOT NULL", .{});
+    defer create.deinit();
+    const index = create.statement.catalog_ddl;
+    try std.testing.expectEqual(.index, index.kind);
+    try std.testing.expectEqual(.create, index.action);
+    try std.testing.expect(index.concurrently and index.conditional);
+    try std.testing.expectEqualStrings("email_key", index.name.table);
+    try std.testing.expectEqualStrings("tenant", index.index_table.?.namespace.?);
+    try std.testing.expectEqualStrings("accounts", index.index_table.?.table);
+    try std.testing.expect(index.schema_change.?.create_index.unique);
+    var drop = try compile(std.testing.allocator, "DROP INDEX IF EXISTS tenant.email_key, public.other_key CASCADE", .{});
+    defer drop.deinit();
+    const targets = drop.statement.catalog_ddl;
+    try std.testing.expectEqual(.index, targets.kind);
+    try std.testing.expectEqual(.drop, targets.action);
+    try std.testing.expectEqual(@as(usize, 2), targets.index_targets.len);
+    try std.testing.expect(targets.cascade and targets.conditional);
+    try std.testing.expectEqualStrings("tenant", targets.index_targets[0].namespace.?);
+    try std.testing.expectEqualStrings("other_key", targets.index_targets[1].table);
+    var concurrent = try compile(std.testing.allocator, "DROP INDEX CONCURRENTLY tenant.email_key RESTRICT", .{});
+    defer concurrent.deinit();
+    try std.testing.expect(concurrent.statement.catalog_ddl.concurrently);
+    try std.testing.expect(!concurrent.statement.catalog_ddl.cascade);
+    // CREATE names inherit the table's schema; DROP is not table-bound syntax.
+    try std.testing.expectError(error.InvalidSqlSyntax, compile(std.testing.allocator, "CREATE INDEX tenant.email_key ON tenant.accounts (email)", .{}));
+    try std.testing.expectError(error.UnsupportedSqlShape, compile(std.testing.allocator, "DROP INDEX email_key ON accounts", .{}));
 }
 
 test "compiler ONLY scopes exact table references across read and write statements" {

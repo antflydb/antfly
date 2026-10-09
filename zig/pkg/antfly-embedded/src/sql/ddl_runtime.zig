@@ -59,12 +59,14 @@ pub fn execute(alloc: std.mem.Allocator, backend: catalog.Backend, statement: as
                 .database => "CREATE DATABASE",
                 .namespace => "CREATE SCHEMA",
                 .tablespace => "CREATE TABLESPACE",
+                .index => "CREATE INDEX",
                 .table => unreachable,
             },
             .drop => switch (ddl.kind) {
                 .database => "DROP DATABASE",
                 .namespace => "DROP SCHEMA",
                 .tablespace => "DROP TABLESPACE",
+                .index => "DROP INDEX",
                 .table => unreachable,
             },
             .rename, .set_tablespace => switch (ddl.kind) {
@@ -72,6 +74,7 @@ pub fn execute(alloc: std.mem.Allocator, backend: catalog.Backend, statement: as
                 .namespace => "ALTER SCHEMA",
                 .tablespace => "ALTER TABLESPACE",
                 .table => "ALTER TABLE",
+                .index => "ALTER INDEX",
             },
         },
     }, .mutation_outcome = outcome.mutation_outcome, .receipt = outcome.receipt };
@@ -436,9 +439,9 @@ test "SQL schema DDL preserves index ownership defaults and unrelated metadata" 
         "ALTER TABLE items ALTER COLUMN title SET DEFAULT 'unknown'",
         "ALTER TABLE items ALTER COLUMN title DROP DEFAULT",
         "ALTER TABLE items DROP COLUMN enabled",
-        "DROP INDEX items_id ON items",
+        "DROP INDEX items_id",
         "CREATE UNIQUE INDEX items_lower_title ON items ((lower(title))) WHERE title IS NOT NULL",
-        "DROP INDEX items_lower_title ON items",
+        "DROP INDEX items_lower_title",
     };
     for (commands, 0..) |command, i| {
         var compiled = try @import("compiler.zig").compile(alloc, command, .{});

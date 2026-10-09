@@ -121,6 +121,8 @@ pub const Adapter = struct {
     context: operation.RequestContext,
     database: []const u8 = "default",
     namespace: []const u8 = "public",
+    /// Borrowed from the pinned connection request, never retained by a plan.
+    ddl_search_path: ?*const @import("../pgwire/search_path.zig").Path = null,
     decision_provider: ?@import("antfly_local_sources").functions_decisions.DecisionProvider = null,
     /// Pgwire retains the original durable owner scope independently of its
     /// mutable, freshly authorized lookup namespace. HTTP leaves this null.
@@ -590,7 +592,7 @@ pub const Adapter = struct {
 
     fn ddl(ptr: *anyopaque, alloc: std.mem.Allocator, input: catalog.Ddl) !catalog.DdlOutcome {
         const self: *Adapter = @ptrCast(@alignCast(ptr));
-        return @import("sql_catalog.zig").execute(self.server, self.identity.*, self.context, self.database, self.namespace, alloc, input);
+        return @import("sql_catalog.zig").executeWithPath(self.server, self.identity.*, self.context, self.database, self.namespace, alloc, input, self.ddl_search_path);
     }
 
     fn checkpoint(ptr: *anyopaque) !void {

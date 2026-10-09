@@ -2449,7 +2449,7 @@ const LocalStandaloneMetadata = struct {
         return try server.write_source.prepareReplicaRetirements(alloc, targets);
     }
 
-    fn systemCatalogAdmitted(ptr: *anyopaque, alloc: std.mem.Allocator, context: antfly.public_api.operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+    fn systemCatalogAdmitted(ptr: *anyopaque, alloc: std.mem.Allocator, context: antfly.public_api.operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) anyerror![]u8 {
         const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
         try context.ensureActive();
         if (call == .lake_index_lifecycle_read) return getLakeIndexLifecycle(ptr, alloc, call.lake_index_lifecycle_read, context);
@@ -2839,6 +2839,18 @@ const LocalStandaloneMetadata = struct {
                     alloc.free(names);
                 }
                 return std.json.Stringify.valueAlloc(alloc, system_catalog.ResolvedMany{ .revision = revision, .tables = tables, .logical_names = names }, .{});
+            },
+            .relation_schema_mutate => |request| {
+                if (!context.setting_admin) return error.Forbidden;
+                try context.ensureActive();
+                try request.validate();
+                const store = self.lifecycle_store orelse return error.UnsupportedOperation;
+                const before = (try store.getTable(alloc, group_ids.main_metadata_group_id, request.guard.owner.table_id)) orelse return error.CatalogGenerationChanged;
+                defer antfly.metadata.table_manager.freeTable(alloc, before);
+                if (try antfly.public_api.tables.schemaVersion(before.schema_json) != request.guard.owner.schema_version) return error.CatalogGenerationChanged;
+                const after = try antfly.public_api.tables.applySchemaMutationRecord(alloc, &before, .replace, request.schema_json);
+                defer antfly.metadata.table_manager.freeTable(alloc, after);
+                return systemCatalogAdmitted(ptr, alloc, context, .{ .relation_replace = .{ .guard = request.guard, .expected = before, .replacement = after } });
             },
             .relation_replace => |request| {
                 if (!context.setting_admin) return error.Forbidden;

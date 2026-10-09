@@ -295,7 +295,7 @@ pub const Column = struct {
 pub const CreateTable = struct { table: Name, columns: []const Column, constraints: []const SchemaChange = &.{}, if_not_exists: bool = false, tablespace: ?[]const u8 = null };
 pub const DropTable = struct { table: Name, if_exists: bool = false };
 pub const CatalogDdl = struct {
-    kind: enum { database, namespace, tablespace, table },
+    kind: enum { database, namespace, tablespace, table, index },
     action: enum { create, drop, rename, set_tablespace, alter_schema, truncate },
     name: Name,
     new_name: ?[]const u8 = null,
@@ -306,6 +306,10 @@ pub const CatalogDdl = struct {
     truncate_tables: []const Name = &.{},
     restart_identity: bool = false,
     cascade: bool = false,
+    /// Index names are namespace relations, not names of their owning table.
+    index_table: ?Name = null,
+    index_targets: []const Name = &.{},
+    concurrently: bool = false,
 };
 pub const SchemaChange = union(enum) {
     drop_constraint: []const u8,
