@@ -308,6 +308,22 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     inference_owner_control.addImport("antfly_platform", antfly_imports.platform);
     inference_owner_admission.addImport("inference_execution_control", inference_owner_control);
+    const local_child_root = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/api/runnable_local_child.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    local_child_root.addImport("antfly_runtime_abi", antfly_imports.runtime_abi);
+    local_child_root.addImport("antfly_local_sources", inference_owner_sources);
+    const local_child_tests = b.addTest(.{
+        .name = "local-child-owner-tests",
+        .root_module = local_child_root,
+        .filters = &.{"local child receiver"},
+        .max_rss = 2 * 1024 * 1024 * 1024,
+    });
+    b.step("antfly-local-child-owner-test", "Verify local SQL child receiver lifetime and independent worker execution")
+        .dependOn(&b.addRunArtifact(local_child_tests).step);
     const inference_owner_root = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/api/runnable_inference_test_root.zig"),
         .target = target,

@@ -846,8 +846,22 @@ pub const Adapter = struct {
                 adapter.cleanup_phase.?.execution.activateCleanup() catch |err| return runtime.error_abi.statusFromError(err);
                 return .ok;
             }
+            fn reserveChild(raw: *anyopaque, options: *const runtime.runnable_abi.ChildStart) callconv(.c) runtime.error_abi.Status {
+                options.validate() catch |err| return runtime.error_abi.statusFromError(err);
+                const adapter: *Adapter = @ptrCast(@alignCast(raw));
+                // Capture/revalidate on the coordinator before publication.
+                // Children receive independent execution/IO state, never this
+                // Adapter's mutable read guard. Operator fanout still requires
+                // independent child backend adapters and policy fences.
+                checkpoint(raw) catch |err| return runtime.error_abi.statusFromError(err);
+                const memory = adapter.server.request_memory orelse return runtime.error_abi.statusFromError(error.ExecutionWaitUnsupported);
+                const current = adapter.runnable orelse return runtime.error_abi.statusFromError(error.InvalidRunnableTransition);
+                const parent = current.entry orelse return runtime.error_abi.statusFromError(error.InvalidRunnableTransition);
+                @import("runnable_local_child.zig").reserve(current, memory.allocator(parent.class == .control), options) catch |err| return runtime.error_abi.statusFromError(err);
+                return .ok;
+            }
         };
-        return .{ .context = self, .cpu_slots = entry.slots, .parent_class = @intCast(@backingInt(entry.class)), .checkpoint = Callback.check, .park = Callback.park, .enter = Callback.enter, .reserve_cleanup = if (self.cleanup_phase != null) Callback.reserveCleanup else null, .activate_cleanup = if (self.cleanup_phase != null) Callback.activateCleanup else null };
+        return .{ .context = self, .cpu_slots = entry.slots, .parent_class = @intCast(@backingInt(entry.class)), .checkpoint = Callback.check, .park = Callback.park, .enter = Callback.enter, .reserve_cleanup = if (self.cleanup_phase != null) Callback.reserveCleanup else null, .activate_cleanup = if (self.cleanup_phase != null) Callback.activateCleanup else null, .reserve_child = Callback.reserveChild };
     }
 
     fn spillWaitEnd(ptr: *anyopaque) !void {
