@@ -6975,6 +6975,17 @@ test "system catalog restore namespace projections bind names and skip artifact 
     try std.testing.expectError(error.InvalidCatalogRecord, RaftApplyStore.relationRestoreSourceKey(try std.fmt.bufPrint(&buf, "{s}table:07", .{prefix}), group));
 }
 
+fn applyRestoreTransitionForTest(store: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, command: TransitionCommand) !void {
+    // Direct transaction fixtures still require the production command's
+    // buffered outcome boundary so journal rollback restores both effects.
+    var outcome: CommittedApplyOutcome = .{ .alloc = std.testing.allocator, .collect_transition_deltas = false };
+    defer outcome.deinit();
+    const previous = store.active_outcome;
+    if (previous == null) store.active_outcome = &outcome;
+    defer store.active_outcome = previous;
+    try store.applyTransitionCommandTxn(txn, group_id, command);
+}
+
 fn applyRestoreStagingForTest(store: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, command: restore_staging.Command) !void {
     const bytes = try std.json.Stringify.valueAlloc(std.testing.allocator, command, .{});
     defer std.testing.allocator.free(bytes);
@@ -6982,7 +6993,7 @@ fn applyRestoreStagingForTest(store: *RaftApplyStore, txn: *docstore.DocStore.Tx
     defer std.testing.allocator.free(wire);
     var decoded = (try decodeTransitionCommand(std.testing.allocator, wire)).?;
     defer decoded.deinit(std.testing.allocator);
-    try store.applyTransitionCommandTxn(txn, group_id, decoded);
+    try applyRestoreTransitionForTest(store, txn, group_id, decoded);
 }
 
 test "relational integrity restore staging rewrite draft survives restart and freezes only exact pre-pin intent" {
@@ -7036,6 +7047,7 @@ fn testRewriteDraft(cancel: bool, compound: bool) !void {
         try store.applyStandaloneCommand(group, .{ .upsert_table = original });
         try store.applyStandaloneCommand(group, .{ .upsert_range = original_range });
         try store.applyStandaloneCommand(group, .{ .initialize_metadata_incarnation = "01010101010101010101010101010101".* });
+        try adoptRelationWriterForTest(&store, alloc, group);
         {
             var tracked = try store.store.beginWriteTxn();
             errdefer tracked.abort();
@@ -7063,7 +7075,7 @@ fn testRewriteDraft(cancel: bool, compound: bool) !void {
                 var key_buf: [256]u8 = undefined;
                 const key = try restoreJobKeyForGroup(&key_buf, group, user_key);
                 try cancelled_txn.put(key, "already canceled");
-                try store.applyTransitionCommandTxn(&cancelled_txn, group, decoded);
+                try applyRestoreTransitionForTest(&store, &cancelled_txn, group, decoded);
                 var plan_key_buf: [256]u8 = undefined;
                 try std.testing.expectError(error.NotFound, cancelled_txn.get(try restore_staging.jobKey(&plan_key_buf, group, id)));
                 try std.testing.expectEqualStrings("already canceled", try cancelled_txn.get(key));
@@ -7074,7 +7086,7 @@ fn testRewriteDraft(cancel: bool, compound: bool) !void {
                 targets[0].replace.?.table.description = "stale expected definition";
                 const stale_json = try std.json.Stringify.valueAlloc(alloc, draft, .{});
                 defer alloc.free(stale_json);
-                try store.applyTransitionCommandTxn(&failed_txn, group, .{ .create_restore_job_with_staging = .{ .key = user_key, .value = user_value, .plan_json = stale_json } });
+                try applyRestoreTransitionForTest(&store, &failed_txn, group, .{ .create_restore_job_with_staging = .{ .key = user_key, .value = user_value, .plan_json = stale_json } });
                 targets[0].replace.?.table.description = "";
                 var key_buf: [256]u8 = undefined;
                 try std.testing.expectError(error.NotFound, failed_txn.get(try restoreJobKeyForGroup(&key_buf, group, user_key)));
@@ -7082,14 +7094,14 @@ fn testRewriteDraft(cancel: bool, compound: bool) !void {
                 // A rejected/cancelled reservation cannot leave a user-visible
                 // accepted job with no recoverable source plan.
                 try applyRestoreStagingForTest(&store, &failed_txn, group, .{ .id = id, .action = .cancel_reservation });
-                try store.applyTransitionCommandTxn(&failed_txn, group, decoded);
+                try applyRestoreTransitionForTest(&store, &failed_txn, group, decoded);
                 try std.testing.expectError(error.NotFound, failed_txn.get(try restoreJobKeyForGroup(&key_buf, group, user_key)));
             }
             // Aborting a fully successful mutation rolls both sides back.
             {
                 var rolled_back = try store.store.beginWriteTxn();
                 defer rolled_back.abort();
-                try store.applyTransitionCommandTxn(&rolled_back, group, decoded);
+                try applyRestoreTransitionForTest(&store, &rolled_back, group, decoded);
                 var key_buf: [256]u8 = undefined;
                 _ = try rolled_back.get(try restoreJobKeyForGroup(&key_buf, group, user_key));
                 _ = try rolled_back.get(try restore_staging.jobKey(&key_buf, group, id));
@@ -7101,10 +7113,10 @@ fn testRewriteDraft(cancel: bool, compound: bool) !void {
             const plan_json = try std.json.Stringify.valueAlloc(alloc, draft, .{});
             defer alloc.free(plan_json);
             const command: TransitionCommand = .{ .create_restore_job_with_staging = .{ .key = user_key, .value = user_value, .plan_json = plan_json } };
-            try store.applyTransitionCommandTxn(&txn, group, command);
+            try applyRestoreTransitionForTest(&store, &txn, group, command);
             var replay = command;
             replay.create_restore_job_with_staging.value = "rejected late replacement";
-            try store.applyTransitionCommandTxn(&txn, group, replay);
+            try applyRestoreTransitionForTest(&store, &txn, group, replay);
             var key_buf: [256]u8 = undefined;
             try std.testing.expectEqualStrings(user_value, try txn.get(try restoreJobKeyForGroup(&key_buf, group, user_key)));
         } else try applyRestoreStagingForTest(&store, &txn, group, .{ .id = id, .action = .reserve, .plan = draft });
@@ -7124,6 +7136,7 @@ fn testRewriteDraft(cancel: bool, compound: bool) !void {
         try std.testing.expect(std.mem.indexOf(u8, row, "schema_rewrite") != null);
     }
     try std.testing.expectEqual(.preparing_sources, (try store.loadRestoreStagingProgress(alloc, group, id)).?.state);
+    try verifyRelationRecoveryForTest(&store, alloc, group);
     const namespace_ready = try reconcileRestoreNamesForTest(&store, alloc, try relation_reconciliation.State.init(group, try relation_reconciliation.nextJobId(null), .{ .incarnation = @splat(1), .revision = 2 }));
     const namespace_source_cut = blk: {
         var read = try store.store.beginReadTxn();
@@ -7181,6 +7194,7 @@ fn testRewriteDraft(cancel: bool, compound: bool) !void {
         try std.testing.expectError(error.NotFound, txn.get(try tableKeyForGroup(&buf, group, targets[0].table.table_id)));
         try txn.commit();
         try std.testing.expectEqual(.canceled, (try store.loadRestoreStagingProgress(alloc, group, id)).?.state);
+        try verifyRelationRecoveryForTest(&store, alloc, group);
         return;
     }
     {
@@ -7225,6 +7239,7 @@ fn testRewriteDraft(cancel: bool, compound: bool) !void {
     const progress = (try store.loadRestoreStagingProgress(alloc, group, id)).?;
     try std.testing.expectEqual(.importing, progress.state);
     try std.testing.expectEqual(@as(u64, 3), progress.revision);
+    try verifyRelationRecoveryForTest(&store, alloc, group);
     var recovered = (try store.loadRestoreStaging(alloc, group, id)).?;
     defer recovered.deinit();
     try std.testing.expectEqualDeep(artifacts[0], recovered.value.plan.targets[0].source_artifacts[0]);
@@ -7341,6 +7356,7 @@ test "relational integrity restore staging publishes all targets only after exac
     var store = try RaftApplyStore.init(alloc, .{ .root_dir = root });
     defer store.deinit();
     const group_id = group_ids.main_metadata_group_id;
+    try adoptRelationWriterForTest(&store, alloc, group_id);
     var targets = [_]restore_staging.Target{
         .{ .source_table_id = 1, .table = .{ .table_id = 11, .name = "new_parent", .schema_json = "{}" }, .ranges = &.{.{ .table_id = 11, .group_id = 701, .range_id = 701, .doc_identity_shard_id = 701, .doc_identity_range_id = 701, .start_key = "" }} },
         .{ .source_table_id = 2, .table = .{ .table_id = 12, .name = "new_child", .schema_json = "{}" }, .ranges = &.{.{ .table_id = 12, .group_id = 702, .range_id = 702, .doc_identity_shard_id = 702, .doc_identity_range_id = 702, .start_key = "" }} },
@@ -7362,6 +7378,16 @@ test "relational integrity restore staging publishes all targets only after exac
     var key_buf: [catalog_name_key_buffer_bytes]u8 = undefined;
     const reservation = try txn.get(try restore_staging.nameKey(&key_buf, group_id, targets[0].table.name));
     try std.testing.expectEqualSlices(u8, &plan.id, reservation);
+    var registry: relation_names.Store(docstore.DocStore.Txn) = .{ .txn = &txn, .alloc = alloc, .group_id = group_id };
+    for (targets) |target| {
+        const key: relation_names.Key = .{ .namespace_id = target.catalog_binding.?.parent_id, .name = target.catalog_binding.?.name };
+        const entry = (try registry.getEntry(key)).?;
+        try std.testing.expect(entry.active == null);
+        try std.testing.expectEqual(target.table.table_id, entry.pending.?.table_id);
+        try std.testing.expectEqualSlices(u8, &plan.id, &entry.pending.?.publication_id);
+        try std.testing.expect((try registry.getClaim(key)) == null);
+    }
+    try verifyRelationCheckpointTxn(alloc, &txn);
     for (targets) |target| try std.testing.expect(!try store.relationalParentsExistTxn(&txn, group_id, target.table));
     const hidden = try store.listTablesTxn(alloc, &txn, group_id);
     defer store.freeTables(alloc, hidden);
@@ -7419,6 +7445,9 @@ test "relational integrity restore staging publishes all targets only after exac
         defer binding.deinit();
         try std.testing.expectEqual(target.table.table_id, binding.value.id);
         try std.testing.expectEqualStrings(target.table.name, binding.value.storage_name);
+        const entry = (try registry.getEntry(.{ .namespace_id = binding.value.parent_id, .name = binding.value.name })).?;
+        try std.testing.expectEqual(target.table.table_id, entry.active.?.table_id);
+        try std.testing.expect(entry.pending == null);
         _ = try txn.get(try rangeKeyForGroup(&key_buf, group_id, target.ranges[0].group_id));
         try std.testing.expectError(error.NotFound, txn.get(try restore_staging.nameKey(&key_buf, group_id, target.table.name)));
     }
@@ -7426,9 +7455,13 @@ test "relational integrity restore staging publishes all targets only after exac
     try applyRestoreStagingForTest(&store, &txn, group_id, .{ .id = plan.id, .action = .begin_cancel, .expected_revision = 3 });
     try txn.commit();
     txn_open = false;
+    try verifyRelationRecoveryForTest(&store, alloc, group_id);
+    store.deinit();
+    store = try RaftApplyStore.init(alloc, .{ .root_dir = root });
     var loaded = (try store.loadRestoreStaging(alloc, group_id, plan.id)).?;
     defer loaded.deinit();
     try std.testing.expectEqual(restore_staging.State.published, loaded.value.state);
+    try verifyRelationRecoveryForTest(&store, alloc, group_id);
 }
 
 test "relational integrity restore staging portable FK cannot publish before exact mapped parent admission receipt" {
@@ -17289,7 +17322,7 @@ pub const RaftApplyStore = struct {
             self.base_len = key.len;
             if (self.cached) |*job| job.deinit();
             self.cached = null;
-            self.cached = try relationRestoreLoadActiveJob(self.a, self.txn, self.group_id, id);
+            self.cached = try relationRestoreLoadActiveJob(self.a, self.txn, self.group_id, id, true);
             self.loaded_jobs += 1;
         }
         pub fn nextAfter(self: *@This(), after: []const u8) !?relation_reconciliation.SourceRow {
@@ -17500,10 +17533,16 @@ pub const RaftApplyStore = struct {
         };
         if (!std.mem.eql(u8, value, &id)) return error.InvalidCatalogRecord;
     }
-    fn relationRestoreLoadActiveJob(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, id: [16]u8) !std.json.Parsed(RelationRestoreProjection) {
+    fn relationOptional(reader: anytype, key: []const u8) !?[]const u8 {
+        return reader.get(key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+    }
+    fn relationRestoreLoadActiveJob(a: std.mem.Allocator, txn: anytype, group_id: u64, id: [16]u8, comptime check_progress: bool) !std.json.Parsed(RelationRestoreProjection) {
         var buf: [256]u8 = undefined;
         try relationRestoreRequirePointer(txn, try restore_staging.activeKey(&buf, group_id, id), id);
-        const bytes = (try stagingGet(txn, try restore_staging.jobKey(&buf, group_id, id))) orelse return error.InvalidCatalogRecord;
+        const bytes = (try relationOptional(txn, try restore_staging.jobKey(&buf, group_id, id))) orelse return error.InvalidCatalogRecord;
         if (bytes.len == 0 or bytes.len > restore_staging.max_encoded_bytes) return error.InvalidCatalogRecord;
         var job = std.json.parseFromSlice(RelationRestoreProjection, a, bytes, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch |err| switch (err) {
             error.OutOfMemory => return err,
@@ -17512,7 +17551,11 @@ pub const RaftApplyStore = struct {
         errdefer job.deinit();
         if (!std.mem.eql(u8, &job.value.plan.id, &id)) return error.InvalidCatalogRecord;
         _ = try relationRestoreSourceDigest(job.value.plan);
-        const progress_bytes = (try stagingGet(txn, try restore_staging.progressKey(&buf, group_id, id))) orelse return error.InvalidCatalogRecord;
+        // The namespace before-reader deliberately excludes receipt/progress
+        // records. Its authority is the captured active pointer and immutable
+        // plan, never the transaction's newer runtime progress projection.
+        if (!check_progress) return job;
+        const progress_bytes = (try relationOptional(txn, try restore_staging.progressKey(&buf, group_id, id))) orelse return error.InvalidCatalogRecord;
         if (progress_bytes.len > 1024) return error.InvalidCatalogRecord;
         var progress = std.json.parseFromSlice(restore_staging.Progress, a, progress_bytes, .{}) catch |err| switch (err) {
             error.OutOfMemory => return err,
@@ -17524,63 +17567,83 @@ pub const RaftApplyStore = struct {
     }
     /// One projection per active plan and one canonical target per old/new
     /// alias. A 64-target page must not require 128 independent owner cuts.
-    const RelationRestoreProofCache = struct {
-        const Target = struct { plan_id: [16]u8, index: usize, canonical_id: u64 };
-        const Proof = struct { plan_id: [16]u8, target: RelationRestoreProjection.Target, canonical_id: u64 };
-        a: std.mem.Allocator,
-        txn: *docstore.DocStore.Txn,
-        group_id: u64,
-        jobs: std.AutoHashMapUnmanaged([16]u8, std.json.Parsed(RelationRestoreProjection)) = .empty,
-        aliases: std.AutoHashMapUnmanaged(u64, Target) = .empty,
-        fn deinit(self: *@This()) void {
-            var jobs = self.jobs.valueIterator();
-            while (jobs.next()) |job| job.deinit();
-            self.jobs.deinit(self.a);
-            self.aliases.deinit(self.a);
-        }
-        fn lookup(self: *@This(), table_id: u64, state: relation_reconciliation.State) !?Proof {
-            if (!self.aliases.contains(table_id)) {
+    const RelationRestoreProofCache = RelationRestoreOwnerCache(docstore.DocStore.Txn);
+    fn RelationRestoreOwnerCache(comptime Reader: type) type {
+        return struct {
+            const Target = struct { plan_id: [16]u8, index: usize, canonical_id: u64 };
+            const Proof = struct { plan_id: [16]u8, target: RelationRestoreProjection.Target, canonical_id: u64 };
+            a: std.mem.Allocator,
+            txn: *Reader,
+            group_id: u64,
+            check_progress: bool = true,
+            jobs: std.AutoHashMapUnmanaged([16]u8, std.json.Parsed(RelationRestoreProjection)) = .empty,
+            aliases: std.AutoHashMapUnmanaged(u64, Target) = .empty,
+            fn deinit(self: *@This()) void {
+                var jobs = self.jobs.valueIterator();
+                while (jobs.next()) |job| job.deinit();
+                self.jobs.deinit(self.a);
+                self.aliases.deinit(self.a);
+            }
+            fn loadJob(self: *@This(), id: [16]u8) !bool {
+                if (self.jobs.contains(id)) return true;
                 var buf: [256]u8 = undefined;
-                const fresh_pointer = try stagingGet(self.txn, try restore_staging.identityKey(&buf, self.group_id, .table, table_id));
-                const pointer = fresh_pointer orelse
-                    (try stagingGet(self.txn, try restore_staging.identityKey(&buf, self.group_id, .old_table, table_id))) orelse return null;
-                if (pointer.len == 24) {
-                    if (fresh_pointer != null) return error.InvalidCatalogRecord;
-                    return null; // Published predecessor tombstone.
-                }
-                if (pointer.len != 16 or std.mem.allEqual(u8, pointer, 0)) return error.InvalidCatalogRecord;
-                const id: [16]u8 = pointer[0..16].*;
-                const active = (try stagingGet(self.txn, try restore_staging.activeKey(&buf, self.group_id, id))) orelse return null;
+                const active = (try relationOptional(self.txn, try restore_staging.activeKey(&buf, self.group_id, id))) orelse return false;
                 if (!std.mem.eql(u8, active, &id)) return error.InvalidCatalogRecord;
-                if (!self.jobs.contains(id)) {
-                    if (self.jobs.count() == restore_staging.max_active_attempts) return error.CatalogCommandTooLarge;
-                    var job = try relationRestoreLoadActiveJob(self.a, self.txn, self.group_id, id);
-                    var transferred = false;
-                    defer if (!transferred) job.deinit();
-                    try self.jobs.put(self.a, id, job);
-                    transferred = true;
-                    for (job.value.plan.targets, 0..) |target, index| {
-                        const value: Target = .{ .plan_id = id, .index = index, .canonical_id = target.table.table_id };
-                        const fresh = try self.aliases.getOrPut(self.a, target.table.table_id);
-                        if (fresh.found_existing) return error.InvalidCatalogRecord;
-                        fresh.value_ptr.* = value;
-                        if (target.replace) |old| {
-                            const prior = try self.aliases.getOrPut(self.a, old.table.table_id);
-                            if (prior.found_existing) return error.InvalidCatalogRecord;
-                            prior.value_ptr.* = value;
-                        }
+                if (self.jobs.count() == restore_staging.max_active_attempts) return error.CatalogCommandTooLarge;
+                var job = if (self.check_progress)
+                    try relationRestoreLoadActiveJob(self.a, self.txn, self.group_id, id, true)
+                else
+                    try relationRestoreLoadActiveJob(self.a, self.txn, self.group_id, id, false);
+                var transferred = false;
+                defer if (!transferred) job.deinit();
+                try self.jobs.put(self.a, id, job);
+                transferred = true;
+                for (job.value.plan.targets, 0..) |target, index| {
+                    const value: Target = .{ .plan_id = id, .index = index, .canonical_id = target.table.table_id };
+                    const fresh = try self.aliases.getOrPut(self.a, target.table.table_id);
+                    if (fresh.found_existing) return error.InvalidCatalogRecord;
+                    fresh.value_ptr.* = value;
+                    if (target.replace) |old| {
+                        const prior = try self.aliases.getOrPut(self.a, old.table.table_id);
+                        if (prior.found_existing) return error.InvalidCatalogRecord;
+                        prior.value_ptr.* = value;
                     }
                 }
+                return true;
             }
-            const alias = self.aliases.get(table_id) orelse return error.InvalidCatalogRecord;
-            var base_buf: [256]u8 = undefined;
-            var bookmark_buf: [relation_reconciliation.max_cursor_bytes]u8 = undefined;
-            const bookmark = try std.fmt.bufPrint(&bookmark_buf, "{s}:{x:0>4}", .{ try restore_staging.activeKey(&base_buf, self.group_id, alias.plan_id), alias.index });
-            if (state.phase == .building and std.mem.order(u8, bookmark, state.cursor()) == .gt) return null;
-            const job = self.jobs.get(alias.plan_id) orelse return error.InvalidCatalogRecord;
-            return .{ .plan_id = alias.plan_id, .target = job.value.plan.targets[alias.index], .canonical_id = alias.canonical_id };
-        }
-    };
+            fn addJobTargets(self: *@This(), id: [16]u8, ids: *std.AutoHashMapUnmanaged(u64, void)) !void {
+                if (!try self.loadJob(id)) return;
+                for (self.jobs.get(id).?.value.plan.targets) |target| {
+                    try addRelationTableId(self.a, ids, target.table.table_id);
+                    if (target.replace) |old| try addRelationTableId(self.a, ids, old.table.table_id);
+                }
+            }
+            fn lookup(self: *@This(), table_id: u64, state: ?relation_reconciliation.State) !?Proof {
+                if (!self.aliases.contains(table_id)) {
+                    var buf: [256]u8 = undefined;
+                    const fresh_pointer = try relationOptional(self.txn, try restore_staging.identityKey(&buf, self.group_id, .table, table_id));
+                    const pointer = fresh_pointer orelse
+                        (try relationOptional(self.txn, try restore_staging.identityKey(&buf, self.group_id, .old_table, table_id))) orelse return null;
+                    if (pointer.len == 24) {
+                        if (fresh_pointer != null) return error.InvalidCatalogRecord;
+                        return null; // Published predecessor tombstone.
+                    }
+                    if (pointer.len != 16 or std.mem.allEqual(u8, pointer, 0)) return error.InvalidCatalogRecord;
+                    const id: [16]u8 = pointer[0..16].*;
+                    if (!try self.loadJob(id)) return null;
+                }
+                const alias = self.aliases.get(table_id) orelse return error.InvalidCatalogRecord;
+                if (state) |cut| {
+                    var base_buf: [256]u8 = undefined;
+                    var bookmark_buf: [relation_reconciliation.max_cursor_bytes]u8 = undefined;
+                    const bookmark = try std.fmt.bufPrint(&bookmark_buf, "{s}:{x:0>4}", .{ try restore_staging.activeKey(&base_buf, self.group_id, alias.plan_id), alias.index });
+                    if (cut.phase == .building and std.mem.order(u8, bookmark, cut.cursor()) == .gt) return null;
+                }
+                const job = self.jobs.get(alias.plan_id) orelse return error.InvalidCatalogRecord;
+                return .{ .plan_id = alias.plan_id, .target = job.value.plan.targets[alias.index], .canonical_id = alias.canonical_id };
+            }
+        };
+    }
     /// Target belongs to an owned job projection loaded from this same pinned
     /// reader. Pointer checks are dependencies, not independent plan authority.
     fn relationRestoreTargetSnapshot(a: std.mem.Allocator, reader: anytype, group_id: u64, id: [16]u8, target: RelationRestoreProjection.Target, contributions: bool) !RelationSnapshot {
@@ -17597,6 +17660,16 @@ pub const RaftApplyStore = struct {
         var before: ?relation_names.TableCut.Definition = null;
         if (target.replace) |old| {
             try relationRestoreRequirePointer(reader, try restore_staging.identityKey(&buf, group_id, .old_table, old.table.table_id), id);
+            if (try relationOptional(reader, try fk_generation_publication.key(&buf, group_id, old.table.table_id))) |bytes| {
+                if (bytes.len == 0 or bytes.len > fk_generation_publication.max_bytes) return error.InvalidCatalogRecord;
+                var fk = std.json.parseFromSlice(RelationFkProjection, a, bytes, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
+                    error.OutOfMemory => return err,
+                    else => return error.InvalidCatalogRecord,
+                };
+                defer fk.deinit();
+                try validateRelationFkSource(fk.value, old.table.table_id);
+                if (relationFkReserved(fk.value.phase)) return error.InvalidCatalogRecord;
+            }
             const bytes = reader.get(try tableKeyForGroup(&buf, group_id, old.table.table_id)) catch |err| switch (err) {
                 error.NotFound => return error.InvalidCatalogRecord,
                 else => return err,
@@ -18076,6 +18149,10 @@ pub const RaftApplyStore = struct {
         var ids: std.AutoHashMapUnmanaged(u64, void) = .empty;
         defer ids.deinit(self.alloc);
         var before_reader = journal.beforeReader();
+        var before_restores: RelationRestoreOwnerCache(command_journal.Journal.BeforeReader) = .{ .a = self.alloc, .txn = &before_reader, .group_id = group_id, .check_progress = false };
+        defer before_restores.deinit();
+        var after_restores: RelationRestoreProofCache = .{ .a = self.alloc, .txn = txn, .group_id = group_id };
+        defer after_restores.deinit();
         var source_changed: ?bool = null;
         var keys = journal.capture.keys.keyIterator();
         while (keys.next()) |key| {
@@ -18104,28 +18181,61 @@ pub const RaftApplyStore = struct {
                     true else after != null;
                 if (changed) try addRelationTableId(self.alloc, &ids, id);
             }
+            if (try relationRestoreSourceKey(key.*, group_id)) |source| {
+                if (source_changed == null) {
+                    const prior = try relation_reconciliation.readSourceRevision(&before_reader, group_id);
+                    source_changed = prior == 0 or prior != try relation_reconciliation.readSourceRevision(txn, group_id);
+                }
+                if (!source_changed.?) continue;
+                if (try capturedRelationSemanticChanged(self.alloc, txn, group_id, journal, key.*)) switch (source) {
+                    .table, .old_table => |id| try addRelationTableId(self.alloc, &ids, id),
+                    .active, .job => |id| {
+                        try before_restores.addJobTargets(id, &ids);
+                        try after_restores.addJobTargets(id, &ids);
+                    },
+                    .name => {
+                        if (journal.originals.get(key.*) orelse null) |value| {
+                            if (value.len != 16) return error.InvalidCatalogRecord;
+                            try before_restores.addJobTargets(value[0..16].*, &ids);
+                        }
+                        if (try stagingGet(txn, key.*)) |value| {
+                            if (value.len != 16) return error.InvalidCatalogRecord;
+                            const id: [16]u8 = value[0..16].*;
+                            try after_restores.addJobTargets(id, &ids);
+                        }
+                    },
+                };
+            }
             if (include_registry and try relation_names.Key.fromStorageKey(key.*, group_id) != null) {
                 if (journal.originals.get(key.*)) |before| if (before) |bytes| try addRelationEntryTableIds(self.alloc, &ids, bytes);
                 if (try stagingGet(txn, key.*)) |bytes| try addRelationEntryTableIds(self.alloc, &ids, bytes);
             }
         }
-        var publication = relation_names.Publication.init(self.alloc);
-        defer publication.deinit();
+        var builder = relation_names.Plan.Builder.init(self.alloc);
+        defer builder.deinit();
+        var before_sources: std.AutoHashMapUnmanaged(u64, RelationWriterSourceStamp) = .empty;
+        defer before_sources.deinit(self.alloc);
+        var after_sources: std.AutoHashMapUnmanaged(u64, RelationWriterSourceStamp) = .empty;
+        defer after_sources.deinit(self.alloc);
         var tables = ids.keyIterator();
         while (tables.next()) |id| {
-            var before = relationWriterSnapshot(self.alloc, &before_reader, group_id, id.*, true) catch |err| switch (err) {
+            // A tampered physical pointer cannot hide a still-active plan
+            // known by the opposite cut. Load that exact plan before alias
+            // deduplication; target projection verifies all its dependencies.
+            const prior = try before_restores.lookup(id.*, null);
+            const next = try after_restores.lookup(id.*, null);
+            if (prior) |proof| _ = try after_restores.loadJob(proof.plan_id);
+            if (next) |proof| _ = try before_restores.loadJob(proof.plan_id);
+            const before = appendRelationWriterSource(self.alloc, &before_reader, group_id, id.*, true, &before_restores, &before_sources, &builder, .before) catch |err| switch (err) {
                 error.CatalogAlreadyExists, error.InvalidCatalogName => return error.InvalidCatalogRecord,
                 else => return err,
             };
-            defer before.deinit();
-            var after = relationWriterSnapshot(self.alloc, txn, group_id, id.*, !before.bound) catch |err| switch (err) {
+            _ = appendRelationWriterSource(self.alloc, txn, group_id, id.*, !before.bound, &after_restores, &after_sources, &builder, .after) catch |err| switch (err) {
                 error.InvalidCatalogRecord, error.InvalidCatalogName => return error.InvalidSchemaUpdateRequest,
                 else => return err,
             };
-            defer after.deinit();
-            try publication.stage(id.*, before.claims(), after.claims());
         }
-        var plan = try publication.compile();
+        var plan = try builder.finish();
         errdefer plan.deinit();
         if (include_registry) {
             keys = journal.capture.keys.keyIterator();
@@ -18134,6 +18244,34 @@ pub const RaftApplyStore = struct {
             };
         }
         return plan;
+    }
+    const RelationWriterSourceStamp = struct { bound: bool, nonempty: bool, plan_id: ?[16]u8 };
+    fn appendRelationWriterSource(a: std.mem.Allocator, reader: anytype, group: u64, id: u64, allow_legacy: bool, restores: anytype, seen: *std.AutoHashMapUnmanaged(u64, RelationWriterSourceStamp), builder: *relation_names.Plan.Builder, comptime side: anytype) !RelationWriterSourceStamp {
+        const proof = try restores.lookup(id, null);
+        const canonical = if (proof) |value| value.canonical_id else id;
+        const plan_id: ?[16]u8 = if (proof) |value| value.plan_id else null;
+        if (seen.get(canonical)) |prior| {
+            if (!std.meta.eql(prior.plan_id, plan_id) or (!allow_legacy and prior.nonempty and !prior.bound)) return error.InvalidCatalogRecord;
+            return prior;
+        }
+        var cut = if (proof) |value|
+            try relationRestoreTargetSnapshot(a, reader, group, value.plan_id, value.target, false)
+        else
+            try relationWriterSnapshot(a, reader, group, id, allow_legacy);
+        defer cut.deinit();
+        const stamp: RelationWriterSourceStamp = .{ .bound = cut.bound, .nonempty = cut.claims().len != 0, .plan_id = plan_id };
+        if (!allow_legacy and stamp.nonempty and !stamp.bound) return error.InvalidCatalogRecord;
+        try builder.append(side, cut.claims());
+        try seen.put(a, canonical, stamp);
+        return stamp;
+    }
+    fn capturedRelationSemanticChanged(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, journal: *command_journal.Journal, key: []const u8) !bool {
+        const before = journal.originals.get(key) orelse null;
+        const after = try stagingGet(txn, key);
+        return if (before) |old| if (after) |next|
+            !std.mem.eql(u8, old, next) and !std.mem.eql(u8, &try relationSourceValueDigest(a, group, key, old), &try relationSourceValueDigest(a, group, key, next))
+        else
+            true else after != null;
     }
     fn addRelationTableId(a: std.mem.Allocator, ids: *std.AutoHashMapUnmanaged(u64, void), id: u64) !void {
         if (ids.count() >= relation_names.max_claims and !ids.contains(id)) return error.CatalogCommandTooLarge;
@@ -27376,6 +27514,18 @@ fn validateRelationSnapshotCut(alloc: std.mem.Allocator, group_id: u64, rows: []
         return;
     }
     if (!std.mem.eql(u8, writer.?, "AFRW01")) return error.InvalidMetadataSnapshot;
+    var restores: RaftApplyStore.RelationRestoreOwnerCache(Reader) = .{ .a = alloc, .txn = &reader, .group_id = group_id };
+    defer restores.deinit();
+    var restored: std.AutoHashMapUnmanaged(u64, void) = .empty;
+    defer restored.deinit(alloc);
+    for (rows) |row| {
+        if (cancelled) |flag| if (flag.load(.acquire)) return error.SnapshotBuildCancelled;
+        const source = (try RaftApplyStore.relationRestoreSourceKey(row.key, group_id)) orelse continue;
+        switch (source) {
+            .active => |id| if (!try restores.loadJob(id)) return error.InvalidMetadataSnapshot,
+            else => {},
+        }
+    }
     var expected: usize = 0;
     for (rows) |row| {
         if (cancelled) |flag| if (flag.load(.acquire)) return error.SnapshotBuildCancelled;
@@ -27389,13 +27539,14 @@ fn validateRelationSnapshotCut(alloc: std.mem.Allocator, group_id: u64, rows: []
         const prefix = try tablePrefixForGroup(&buf, group_id);
         const count = if (std.mem.startsWith(u8, row.key, prefix)) blk: {
             const id = (try RaftApplyStore.capturedRelationTableId(row.key, group_id)) orelse return error.InvalidMetadataSnapshot;
-            break :blk try verifyRelationTableCut(alloc, &reader, group_id, id);
+            break :blk try verifyRelationWriterTableCut(alloc, &reader, group_id, id, &restores, &restored);
         } else if (try RaftApplyStore.relationInitialWorkTableId(row.key, group_id)) |id|
             try verifyRelationInitialCut(alloc, &reader, group_id, id)
         else
             continue;
         expected = std.math.add(usize, expected, count) catch return error.InvalidMetadataSnapshot;
     }
+    expected = std.math.add(usize, expected, try verifyRelationRestoreRemainder(alloc, &reader, group_id, &restores, &restored, cancelled)) catch return error.InvalidMetadataSnapshot;
     if (expected != received) return error.InvalidMetadataSnapshot;
 }
 
@@ -27403,6 +27554,27 @@ fn verifyRelationTableCut(alloc: std.mem.Allocator, reader: anytype, group_id: u
     var table = try RaftApplyStore.relationWriterSnapshot(alloc, reader, group_id, table_id, true);
     defer table.deinit();
     return verifyRelationClaims(alloc, reader, group_id, table.claims());
+}
+fn verifyRelationWriterTableCut(alloc: std.mem.Allocator, reader: anytype, group: u64, table_id: u64, restores: anytype, seen: *std.AutoHashMapUnmanaged(u64, void)) !usize {
+    if (try restores.lookup(table_id, null)) |proof| return verifyRelationRestoreTarget(alloc, reader, group, proof.plan_id, proof.target, seen);
+    return verifyRelationTableCut(alloc, reader, group, table_id);
+}
+fn verifyRelationRestoreTarget(alloc: std.mem.Allocator, reader: anytype, group: u64, plan_id: [16]u8, target: RaftApplyStore.RelationRestoreProjection.Target, seen: *std.AutoHashMapUnmanaged(u64, void)) !usize {
+    if (seen.contains(target.table.table_id)) return 0;
+    var cut = try RaftApplyStore.relationRestoreTargetSnapshot(alloc, reader, group, plan_id, target, false);
+    defer cut.deinit();
+    const count = try verifyRelationClaims(alloc, reader, group, cut.claims());
+    try seen.put(alloc, target.table.table_id, {});
+    return count;
+}
+fn verifyRelationRestoreRemainder(alloc: std.mem.Allocator, reader: anytype, group: u64, restores: anytype, seen: *std.AutoHashMapUnmanaged(u64, void), cancelled: ?*const std.atomic.Value(bool)) !usize {
+    var count: usize = 0;
+    var jobs = restores.jobs.valueIterator();
+    while (jobs.next()) |job| for (job.value.plan.targets) |target| {
+        if (cancelled) |flag| if (flag.load(.acquire)) return error.SnapshotBuildCancelled;
+        count = std.math.add(usize, count, try verifyRelationRestoreTarget(alloc, reader, group, job.value.plan.id, target, seen)) catch return error.InvalidCatalogRecord;
+    };
+    return count;
 }
 fn verifyRelationInitialCut(alloc: std.mem.Allocator, reader: anytype, group_id: u64, table_id: u64) !usize {
     var hidden = try RaftApplyStore.relationInitialSnapshot(alloc, reader, group_id, table_id);
@@ -27427,6 +27599,20 @@ fn verifyRelationGroupTxn(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn,
     var cursor = try txn.openCursor();
     defer cursor.close();
     var buf: [160]u8 = undefined;
+    var restores: RaftApplyStore.RelationRestoreProofCache = .{ .a = alloc, .txn = txn, .group_id = group_id };
+    defer restores.deinit();
+    var restored: std.AutoHashMapUnmanaged(u64, void) = .empty;
+    defer restored.deinit(alloc);
+    const active = try restore_staging.activePrefix(&buf, group_id);
+    var active_row = try cursor.seekAtOrAfter(active);
+    while (active_row) |row| : (active_row = try cursor.next()) {
+        if (!std.mem.startsWith(u8, row.key, active)) break;
+        const source = (try RaftApplyStore.relationRestoreSourceKey(row.key, group_id)) orelse return error.InvalidCatalogRecord;
+        switch (source) {
+            .active => |id| if (!try restores.loadJob(id)) return error.InvalidCatalogRecord,
+            else => return error.InvalidCatalogRecord,
+        }
+    }
     var expected: usize = 0;
     const tables = try tablePrefixForGroup(&buf, group_id);
     var entry = try cursor.seekAtOrAfter(tables);
@@ -27435,7 +27621,10 @@ fn verifyRelationGroupTxn(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn,
         const id = (try RaftApplyStore.capturedRelationTableId(row.key, group_id)) orelse return error.InvalidCatalogRecord;
         var scratch = std.heap.ArenaAllocator.init(alloc);
         defer scratch.deinit();
-        expected = std.math.add(usize, expected, try verifyRelationTableCut(scratch.allocator(), txn, group_id, id)) catch return error.InvalidCatalogRecord;
+        // Cache/seen allocations must outlive this one-table scratch arena.
+        if (try restores.lookup(id, null)) |proof| {
+            expected = std.math.add(usize, expected, try verifyRelationRestoreTarget(alloc, txn, group_id, proof.plan_id, proof.target, &restored)) catch return error.InvalidCatalogRecord;
+        } else expected = std.math.add(usize, expected, try verifyRelationTableCut(scratch.allocator(), txn, group_id, id)) catch return error.InvalidCatalogRecord;
     }
     const initial = try fk_generation_publication.initialWorkPrefixForGroup(&buf, group_id);
     entry = try cursor.seekAtOrAfter(initial);
@@ -27465,6 +27654,7 @@ fn verifyRelationGroupTxn(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn,
         _ = try relation_names.Entry.decode(row.value);
         received += 1;
     }
+    expected = std.math.add(usize, expected, try verifyRelationRestoreRemainder(alloc, txn, group_id, &restores, &restored, null)) catch return error.InvalidCatalogRecord;
     if (expected != received) return error.InvalidCatalogRecord;
 }
 

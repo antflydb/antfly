@@ -241,6 +241,7 @@ pub fn transitionMutatesRelationSource(command: anytype) bool {
     return switch (command) {
         .apply_system_catalog,
         .apply_restore_staging,
+        .create_restore_job_with_staging,
         .apply_fk_generation_publication,
         .apply_fk_initial_create,
         .upsert_table,

@@ -1883,6 +1883,34 @@ The final native gate passes 170 catalog tests plus 22 linked tests; inventory,
 source-catalog, formatting and whitespace checks pass. Restore producer-plan
 composition, automatic adoption, capability/lifecycle barriers and atomic root
 serving remain unfinished. Original SQL dispositions and counts are unchanged.
+Restore producers now compose exact active and pending namespace entries in
+the same native command transaction, including compound user-job admission.
+Before and after sources are independently deduplicated by canonical target;
+old/new physical aliases share one owned active-plan projection. The command
+builder retains only copied names and typed entries in one transferred arena,
+releasing each decoded schema cut immediately. Receipt-only changes at an
+unchanged tracked source clock still skip projection. The journal's before
+reader derives authority from captured active pointers and immutable plans,
+not the newer runtime progress record. Cross-cut plan loading prevents a
+tampered physical pointer from hiding a still-active producer reservation.
+Snapshot/checkpoint verification shares the full restore-target projector,
+including fresh targets with no public table row. It scans active jobs, not
+terminal history, rejects overlapping FK reservations, and derives each target
+once across predecessor/successor aliases. Snapshot cancellation is checked
+between remaining restore targets. Real replacement reservation, artifact
+freeze and cancellation fixtures now enable writer ownership, as does the
+multi-target fresh publication fixture. These fixtures exercise pending-only
+visibility, exact owner promotion, snapshot/checkpoint validation and restart.
+Builder tests cover borrowed-name retirement, duplicate cuts and exhaustive
+allocation faults. This closes restore producer composition, not automatic
+writer adoption, capability/lifecycle barriers, atomic root serving or public
+unqualified index resolution. Original SQL dispositions remain unchanged.
+Final validation passes 170 native catalog tests, 22 linked storage tests,
+6 coordinator tests and the 74 pure namespace/reconciliation tests (cached
+unchanged component gates on the final run). Inventory, control-catalog,
+formatting and whitespace checks pass. An initial combined compile exhausted
+local disk space; after removing only obsolete generated binaries/objects, the
+final native and component gates passed separately.
 The owned table-cut projector can now combine an exact predecessor definition
 with a plan-fenced successor definition in expected linear time. It retains
 old-only active names, both owners for shared names and pending-only new names,

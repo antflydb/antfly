@@ -600,6 +600,56 @@ pub const Plan = struct {
     before_by_name: Map,
     after_by_name: Map,
 
+    /// Assemble independently deduplicated authoritative before/after sources.
+    /// Only names and typed entries survive projection; decoded table/schema
+    /// arenas can be released immediately. Finish transfers this one arena.
+    pub const Builder = struct {
+        arena: std.heap.ArenaAllocator,
+        before: std.ArrayList(Claim) = .empty,
+        after: std.ArrayList(Claim) = .empty,
+        live: bool = true,
+        pub fn init(a: A) Builder {
+            return .{ .arena = .init(a) };
+        }
+        pub fn deinit(self: *Builder) void {
+            if (self.live) self.arena.deinit();
+            self.* = undefined;
+        }
+        pub fn append(self: *Builder, comptime side: enum { before, after }, claims: []const Claim) !void {
+            std.debug.assert(self.live);
+            const list = &@field(self, @tagName(side));
+            if (claims.len > max_claims - list.items.len) return error.CatalogCommandTooLarge;
+            const a = self.arena.allocator();
+            try list.ensureUnusedCapacity(a, claims.len);
+            for (claims) |claim| {
+                if (claim.reservation) return error.InvalidCatalogRecord;
+                try claim.key.validate();
+                const entry = try claim.entry();
+                const key: Key = .{ .namespace_id = claim.key.namespace_id, .name = try a.dupe(u8, claim.key.name) };
+                list.appendAssumeCapacity(try Claim.fromEntry(key, entry));
+            }
+        }
+        pub fn finish(self: *Builder) !Plan {
+            std.debug.assert(self.live);
+            self.live = false;
+            var arena = self.arena;
+            errdefer arena.deinit();
+            if (self.before.items.len > max_claims or self.after.items.len > max_claims) return error.CatalogCommandTooLarge;
+            const a = arena.allocator();
+            var old: Map = .empty;
+            var next: Map = .empty;
+            inline for (.{ .{ self.before.items, &old, false }, .{ self.after.items, &next, true } }) |side| {
+                try side[1].ensureTotalCapacity(a, @intCast(side[0].len));
+                for (side[0]) |claim| {
+                    const found = side[1].getOrPutAssumeCapacity(claim.key);
+                    if (found.found_existing) return if (side[2]) error.CatalogAlreadyExists else error.InvalidCatalogRecord;
+                    found.value_ptr.* = try claim.entry();
+                }
+            }
+            return .{ .arena = arena, .before = self.before.items, .after = self.after.items, .before_by_name = old, .after_by_name = next };
+        }
+    };
+
     pub fn init(a: A, before: []const Claim, after: []const Claim) !Plan {
         if (before.len > max_claims or after.len > max_claims) return error.CatalogCommandTooLarge;
         var arena = std.heap.ArenaAllocator.init(a);
@@ -843,10 +893,34 @@ test "catalog compound writer publications retain reservations through replaceme
             var plan = try p.compile();
             defer plan.deinit();
             try std.testing.expectEqual(@as(u64, 8), plan.after_by_name.get(table_key).?.pending.?.table_id);
+            var builder = Plan.Builder.init(alloc);
+            defer builder.deinit();
+            try builder.append(.before, prior);
+            try builder.append(.after, proposed);
+            var transferred = try builder.finish();
+            defer transferred.deinit();
+            try std.testing.expect(transferred.after_by_name.get(table_key).?.eql(plan.after_by_name.get(table_key).?));
         }
     };
     var no_resize = std.testing.FailingAllocator.init(a, .{ .resize_fail_index = 0 });
     try std.testing.checkAllAllocationFailures(no_resize.allocator(), Fault.run, .{ before.claims, reserved.claims });
+}
+
+test "catalog writer builder owns projected names and consumes failed duplicate cuts" {
+    const a = std.testing.allocator;
+    var name = "old_name".*;
+    var builder = Plan.Builder.init(a);
+    defer builder.deinit();
+    try builder.append(.before, &.{testClaim(2, &name, 7, 1, .table)});
+    @memset(&name, 'x');
+    var plan = try builder.finish();
+    defer plan.deinit();
+    try std.testing.expectEqualStrings("old_name", plan.before[0].key.name);
+    const claim = testClaim(2, "duplicate", 7, 1, .index);
+    var duplicate = Plan.Builder.init(a);
+    defer duplicate.deinit();
+    try duplicate.append(.after, &.{ claim, claim });
+    try std.testing.expectError(error.CatalogAlreadyExists, duplicate.finish());
 }
 
 test "catalog relation received cuts verify without repairing stale or omitted effects" {
