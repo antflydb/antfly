@@ -1600,7 +1600,7 @@ pub fn loadRunTableBorrowedAllocWithStorage(
 
 pub fn loadRunTableBorrowedAllocWithStorageAndAdmission(storage: storage_io.Storage, allocator: Allocator, path: []const u8, control: ?@import("../../common/read_admission.zig").Port) !lsm_table_file.BorrowedDecoded {
     if (control) |budget| try budget.checkpoint();
-    const raw_table = storage.readFileAlloc(allocator, path, max_run_file_read_bytes) catch |err| {
+    const raw_table = (if (control) |budget| storage.readFileAllocWithAdmission(allocator, path, max_run_file_read_bytes, budget) else storage.readFileAlloc(allocator, path, max_run_file_read_bytes)) catch |err| {
         logReadFileFailure(storage, path, max_run_file_read_bytes, "loadRunTableBorrowedAllocWithStorage", err);
         return err;
     };
@@ -1616,7 +1616,7 @@ pub fn loadRunTableIndexAllocWithStorageAndAdmission(storage: storage_io.Storage
     if (control) |budget| try budget.checkpoint();
     const footer = try loadRunFooterWithStorage(storage, allocator, path);
     if (control) |budget| try budget.checkpoint();
-    const metadata_bytes = try storage.readFileRangeAlloc(allocator, path, footer.metadata_offset, footer.metadata_len);
+    const metadata_bytes = if (control) |budget| try storage.readFileRangeAllocWithAdmission(allocator, path, footer.metadata_offset, footer.metadata_len, budget) else try storage.readFileRangeAlloc(allocator, path, footer.metadata_offset, footer.metadata_len);
     defer allocator.free(metadata_bytes);
     return try lsm_table_file.decodeIndexFromFooterAllocWithAdmission(allocator, footer, metadata_bytes, control);
 }

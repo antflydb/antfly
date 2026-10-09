@@ -21,6 +21,7 @@ const builtin = @import("builtin");
 const platform = @import("antfly_platform");
 const byte_copy = @import("../../common/byte_copy.zig");
 const fs_paths = @import("antfly_runtime_fs").fs_paths;
+const read_admission = @import("../../common/read_admission.zig");
 const threaded_io_limits = @import("antfly_runtime_fs").threaded_io_limits;
 
 const Allocator = std.mem.Allocator;
@@ -586,6 +587,8 @@ pub const Storage = struct {
         begin_read_file_range_alloc: ?*const fn (*anyopaque, Allocator, []const u8, u64, usize) anyerror!RangeReadFuture = null,
         begin_read_file_range_alloc_with_runtime: ?*const fn (*anyopaque, ?ReadRuntime, Allocator, []const u8, u64, usize) anyerror!RangeReadFuture = null,
         read_file_range_into: ?*const fn (*anyopaque, []const u8, u64, []u8) anyerror!void = null,
+        /// Native providers loan CPU only for the physical positional read.
+        read_file_range_into_with_admission: ?*const fn (*anyopaque, []const u8, u64, []u8, read_admission.Port) anyerror!void = null,
         read_file_range_at_most_into: ?*const fn (*anyopaque, []const u8, u64, []u8) anyerror!usize = null,
         file_size: *const fn (*anyopaque, []const u8) anyerror!u64,
         /// Reads an exact suffix and reports the size already observed while
@@ -642,6 +645,33 @@ pub const Storage = struct {
 
     pub fn readFileRangeAlloc(self: Storage, allocator: Allocator, path: []const u8, offset: u64, len: usize) ![]u8 {
         return self.vtable.read_file_range_alloc(self.ptr, allocator, path, offset, len);
+    }
+
+    pub fn readFileRangeAllocWithAdmission(self: Storage, allocator: Allocator, path: []const u8, offset: u64, len: usize, control: read_admission.Port) ![]u8 {
+        try control.checkpoint();
+        const out = try allocator.alloc(u8, len);
+        errdefer allocator.free(out);
+        if (self.vtable.read_file_range_into_with_admission) |read| {
+            try read(self.ptr, path, offset, out, control);
+        } else try self.readFileRangeInto(allocator, path, offset, out);
+        try control.checkpoint();
+        return out;
+    }
+
+    pub fn readFileAllocWithAdmission(self: Storage, allocator: Allocator, path: []const u8, max_bytes: usize, control: read_admission.Port) ![]u8 {
+        try control.checkpoint();
+        const size = try self.fileSize(path);
+        if (size > max_bytes) return error.StreamTooLong;
+        const len = std.math.cast(usize, size) orelse return error.StreamTooLong;
+        const out = try self.readFileRangeAllocWithAdmission(allocator, path, 0, len, control);
+        errdefer allocator.free(out);
+        // Preserve the immutable-size check; a growing file cannot publish an
+        // admitted prefix as though it were a complete artifact.
+        const final_size = try self.fileSize(path);
+        if (final_size > size) return error.StreamTooLong;
+        if (final_size < size) return error.EndOfStream;
+        try control.checkpoint();
+        return out;
     }
 
     pub fn beginReadFileRangeAlloc(self: Storage, allocator: Allocator, path: []const u8, offset: u64, len: usize) !RangeReadFuture {
@@ -1366,6 +1396,22 @@ else
             const entry = try self.retain(namespace, io, path);
             defer self.release(io, entry);
             try readAllAtOffset(entry.fd, out, offset);
+        }
+
+        fn readRangeIntoWithAdmission(self: *FdCache, namespace: u64, io: std.Io, path: []const u8, offset: u64, out: []u8, control: read_admission.Port) !void {
+            try control.checkpoint();
+            const entry = try self.retain(namespace, io, path);
+            defer self.release(io, entry);
+            if (out.len == 0) {
+                try control.checkpoint();
+                return;
+            }
+            // Descriptor/cache preparation and the destination allocation have
+            // already completed with CPU charged. Keep the FD use through end.
+            if (try control.executionWait()) |boundary| {
+                try boundary.run(readAllAtOffset, .{ entry.fd, out, offset });
+            } else try readAllAtOffset(entry.fd, out, offset);
+            try control.checkpoint();
         }
 
         fn readRangeAtMostInto(self: *FdCache, namespace: u64, io: std.Io, path: []const u8, offset: u64, out: []u8) !usize {
@@ -2287,6 +2333,7 @@ else blk: {
                 .read_file_range_alloc = readFileRangeAlloc,
                 .begin_read_file_range_alloc_with_runtime = beginReadFileRangeAllocWithRuntime,
                 .read_file_range_into = readFileRangeInto,
+                .read_file_range_into_with_admission = readFileRangeIntoWithAdmission,
                 .read_file_range_at_most_into = readFileRangeAtMostInto,
                 .file_size = fileSize,
                 .read_file_trailer_alloc = readFileTrailerAlloc,
@@ -2406,6 +2453,16 @@ else blk: {
                     .threaded => |*threaded| try readFileRangeWithIoInto(threaded.io(), path, offset, out),
                     .evented => |*evented| try readFileRangeWithIoInto(evented.io(), path, offset, out),
                 };
+            }
+
+            fn readFileRangeIntoWithAdmission(ptr: *anyopaque, path: []const u8, offset: u64, out: []u8, control: read_admission.Port) !void {
+                const self: *NativeStorage = @ptrCast(@alignCast(ptr));
+                if (comptime supports_posix_fd_cache) {
+                    const state = try self.state.retain();
+                    defer state.release();
+                    return state.fdCache().readRangeIntoWithAdmission(state.cache_namespace, state.threaded.io(), path, offset, out, control);
+                }
+                try readFileRangeInto(ptr, path, offset, out);
             }
 
             fn readFileRangeAtMostInto(ptr: *anyopaque, path: []const u8, offset: u64, out: []u8) !usize {
@@ -2588,6 +2645,7 @@ else blk: {
             .read_file_range_alloc = readFileRangeAlloc,
             .begin_read_file_range_alloc_with_runtime = beginReadFileRangeAllocWithRuntime,
             .read_file_range_into = readFileRangeInto,
+            .read_file_range_into_with_admission = readFileRangeIntoWithAdmission,
             .read_file_range_at_most_into = readFileRangeAtMostInto,
             .file_size = fileSize,
             .read_file_trailer_alloc = readFileTrailerAlloc,
@@ -2724,6 +2782,16 @@ else blk: {
                 return try retained.fdCache().readRangeInto(retained.cache_namespace, retained.threaded.io(), path, offset, out);
             }
             return try readFileRangeWithIoInto(retained.threaded.io(), path, offset, out);
+        }
+
+        fn readFileRangeIntoWithAdmission(ptr: *anyopaque, path: []const u8, offset: u64, out: []u8, control: read_admission.Port) !void {
+            const state: *NativeStorageState = @ptrCast(@alignCast(ptr));
+            const retained = try state.retain();
+            defer retained.release();
+            if (comptime supports_posix_fd_cache) {
+                return retained.fdCache().readRangeIntoWithAdmission(retained.cache_namespace, retained.threaded.io(), path, offset, out, control);
+            }
+            try readFileRangeInto(ptr, path, offset, out);
         }
 
         fn readFileRangeAtMostInto(ptr: *anyopaque, path: []const u8, offset: u64, out: []u8) !usize {

@@ -7334,7 +7334,7 @@ pub const Backend = struct {
         if (control) |budget| try budget.checkpoint();
         const storage = self.storage.?;
         if (storage.vtable.open_leased_immutable_source == null) {
-            const bytes = try storage.readFileRangeAlloc(a, path, offset, len);
+            const bytes = if (control) |budget| try storage.readFileRangeAllocWithAdmission(a, path, offset, len, budget) else try storage.readFileRangeAlloc(a, path, offset, len);
             errdefer a.free(bytes);
             if (control) |budget| try budget.checkpoint();
             return bytes;

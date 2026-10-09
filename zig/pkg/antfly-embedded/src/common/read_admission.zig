@@ -14,6 +14,7 @@ pub const Payload = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
     dispatch: Boundary.Dispatch = Boundary.local_dispatch,
+    execution_wait: ?@import("execution_wait.zig").Boundary = null,
 };
 pub const Port = extern struct {
     contract: native.TypeContract = .of(Payload),
@@ -31,6 +32,12 @@ pub const Port = extern struct {
         const payload: *const Payload = @ptrCast(@alignCast(self.payload));
         if (!payload.vtable_contract.matches(.of(VTable))) return error.UnsupportedVersion;
         try Boundary.call("checkpoint", payload.dispatch, payload.vtable.checkpoint, .{payload.ptr});
+    }
+    /// Only providers that perform physical I/O may use this boundary.
+    pub fn executionWait(self: Port) !?@import("execution_wait.zig").Boundary {
+        try self.checkpoint();
+        const payload: *const Payload = @ptrCast(@alignCast(self.payload));
+        return payload.execution_wait;
     }
     pub fn waitForProgress(self: Port) !void {
         try self.checkpoint();
@@ -54,7 +61,11 @@ pub fn Adapter(comptime Budget: type) type {
             try self.budget.waitForProgress();
         }
         pub fn payload(self: *@This()) Payload {
-            return .{ .ptr = self, .vtable = &.{ .checkpoint = checkpoint, .wait_for_progress = wait } };
+            const T = switch (@typeInfo(Budget)) {
+                .pointer => |pointer| pointer.child,
+                else => Budget,
+            };
+            return .{ .ptr = self, .vtable = &.{ .checkpoint = checkpoint, .wait_for_progress = wait }, .execution_wait = if (@hasDecl(T, "executionBoundary")) self.budget.executionBoundary() else null };
         }
     };
 }

@@ -657,7 +657,7 @@ pub const Cache = struct {
         try budget.checkpoint();
         // The immutable file must still fit the admitted size. A changed file
         // cannot obtain extra bytes or silently publish a different snapshot.
-        const raw = try storage.readFileAlloc(self.allocator, path, input_bytes);
+        const raw = try storage.readFileAllocWithAdmission(self.allocator, path, input_bytes, budget);
         var raw_owned = true;
         errdefer if (raw_owned) self.allocator.free(raw);
         if (raw.len != input_bytes) return error.EndOfStream;

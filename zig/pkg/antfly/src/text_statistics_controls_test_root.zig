@@ -224,3 +224,160 @@ test "text statistics trusted controls retain original authority during primary 
         try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
     };
 }
+
+test "text statistics trusted controls loan CPU only during native physical file reads" {
+    const storage_io = sources.storage_lsm_backend_storage_io;
+    const admission = sources.common_read_admission;
+    const Budget = sources.common_read_execution_budget.Budget(types.SearchRequest, checkReadBudget);
+    const Case = enum { success, cancel, expire, shutdown, io_failure, shutdown_and_io_failure };
+    const Probe = struct {
+        budget: *Budget,
+        storage: *storage_io.NativeStorage,
+        scheduler: *native.Scheduler,
+        canceled: *std.atomic.Value(bool),
+        case: Case,
+        begins: usize = 0,
+        ends: usize = 0,
+        pub fn checkpoint(self: *@This()) !void {
+            try self.budget.checkpoint();
+        }
+        pub fn waitForProgress(self: *@This()) !void {
+            try self.budget.waitForProgress();
+        }
+        pub fn executionBoundary(self: *@This()) ?sources.common_execution_wait.Boundary {
+            return .{ .ptr = self, .begin = begin, .end = end };
+        }
+        fn begin(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.budget.executionBoundary().?.beginWait();
+            self.begins += 1;
+            try std.testing.expect(self.storage.snapshotStats().fd_admitted_descriptors > 0);
+            const stats = self.scheduler.stats();
+            try std.testing.expectEqual(@as(usize, 0), stats.runnable_slots);
+            try std.testing.expectEqual(@as(usize, 1), stats.resource_blocked);
+            try std.testing.expectEqual(@as(usize, 1), stats.operations);
+            try std.testing.expectEqual(@as(u64, 23), stats.retained_bytes);
+            var control: native.Execution = .{};
+            defer control.finish();
+            try control.start(self.scheduler, .{ .io = std.testing.io }, .control);
+            try control.checkpoint();
+            control.finish();
+            switch (self.case) {
+                .success, .io_failure => {},
+                .cancel => self.canceled.store(true, .release),
+                .expire => try std.testing.io.sleep(.fromMilliseconds(100), .awake),
+                .shutdown, .shutdown_and_io_failure => self.scheduler.close(),
+            }
+        }
+        fn end(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.ends += 1;
+            // The file use survives the syscall AND rejected resumption.
+            try std.testing.expect(self.storage.snapshotStats().fd_admitted_descriptors > 0);
+            try self.budget.executionBoundary().?.endWait();
+        }
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const a = std.testing.allocator;
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/physical-statistics-read", .{tmp.sub_path});
+    defer a.free(path);
+    for ([_]native.Class{ .query, .inference }) |phase| for (std.enums.values(Case)) |case| {
+        var storage = try storage_io.NativeStorage.init(a, .threaded);
+        defer storage.deinit();
+        const view = storage.storage();
+        try view.writeFileAbsolute(path, "alpha beta");
+        var scheduler = try native.Scheduler.init(.{ .slots = 2, .control_slots = 1 });
+        defer scheduler.close();
+        var canceled = std.atomic.Value(bool).init(false);
+        var parent: native.Execution = .{};
+        defer parent.finish();
+        const deadline = clock.monotonicNs() + (if (case == .expire) @as(u64, 50) else 60000) * std.time.ns_per_ms;
+        try parent.start(&scheduler, .{ .io = std.testing.io, .native_now_ns = clock.monotonicNs, .deadline_ns = deadline, .retained_bytes = 23, .cancellation = .{ .ptr = &canceled, .requested = requested } }, phase);
+        var read: Read = .{ .execution = &parent, .allocator = a };
+        const team = try read.team();
+        var budget: Budget = .{ .controls = .{ .execution_runnable = team.borrow, .execution_deadline_ns = deadline, .cancellation = .{ .ptr = &canceled, .is_cancelled_fn = requested } }, .io = std.testing.io };
+        var probe: Probe = .{ .budget = &budget, .storage = &storage, .scheduler = &scheduler, .canceled = &canceled, .case = case };
+        var adapter = admission.Adapter(*Probe){ .budget = &probe };
+        const payload = adapter.payload();
+        const port = admission.Port.init(&payload);
+        const physical_failure = case == .io_failure or case == .shutdown_and_io_failure;
+        const result = view.readFileRangeAllocWithAdmission(a, path, 0, if (physical_failure) 11 else 10, port);
+        switch (case) {
+            .success => {
+                const bytes = try result;
+                defer a.free(bytes);
+                try std.testing.expectEqualStrings("alpha beta", bytes);
+                try std.testing.expectEqual(@as(usize, 1), scheduler.stats().runnable_slots);
+            },
+            .cancel => try std.testing.expectError(error.Canceled, result),
+            .expire => try std.testing.expectError(error.DeadlineExceeded, result),
+            .shutdown, .shutdown_and_io_failure => try std.testing.expectError(error.SchedulerClosed, result),
+            .io_failure => try std.testing.expectError(error.EndOfStream, result),
+        }
+        try std.testing.expectEqual(@as(usize, 1), probe.begins);
+        try std.testing.expectEqual(@as(usize, 1), probe.ends);
+        try std.testing.expectEqual(phase, try parent.retainedClass());
+        try std.testing.expectEqual(@as(?u64, deadline), parent.entry.?.options.deadline_ns);
+        try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 23), scheduler.stats().retained_bytes);
+        parent.finish();
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+    };
+}
+
+test "text statistics trusted controls keep memory copies charged and reject older admission payloads" {
+    const storage_io = sources.storage_lsm_backend_storage_io;
+    const admission = sources.common_read_admission;
+    const Fixture = struct {
+        execution: *native.Execution,
+        checks: usize = 0,
+        begins: usize = 0,
+        fn checkpoint(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.checks += 1;
+            try self.execution.checkpoint();
+        }
+        fn begin(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.begins += 1;
+            return error.TestUnexpectedResult;
+        }
+        fn end(_: *anyopaque) !void {
+            return error.TestUnexpectedResult;
+        }
+    };
+    const a = std.testing.allocator;
+    var scheduler = try native.Scheduler.init(.{ .slots = 2, .control_slots = 1 });
+    defer scheduler.close();
+    var parent: native.Execution = .{};
+    defer parent.finish();
+    try parent.start(&scheduler, .{ .io = std.testing.io, .retained_bytes = 23 }, .query);
+    var fixture: Fixture = .{ .execution = &parent };
+    const vtable: admission.VTable = .{ .checkpoint = Fixture.checkpoint };
+    const payload: admission.Payload = .{ .ptr = &fixture, .vtable = &vtable, .execution_wait = .{ .ptr = &fixture, .begin = Fixture.begin, .end = Fixture.end } };
+    const port = admission.Port.init(&payload);
+    var memory = storage_io.MemoryStorage.init(a);
+    defer memory.deinit();
+    const view = memory.storage();
+    try view.writeFileAbsolute("/virtual", "alpha beta");
+    const bytes = try view.readFileRangeAllocWithAdmission(a, "/virtual", 0, 10, port);
+    defer a.free(bytes);
+    try std.testing.expectEqualStrings("alpha beta", bytes);
+    try std.testing.expectEqual(@as(usize, 0), fixture.begins);
+    try std.testing.expectEqual(@as(usize, 1), scheduler.stats().runnable_slots);
+    const LegacyPayload = struct {
+        vtable_contract: runtime.native_abi.TypeContract = .of(admission.VTable),
+        ptr: *anyopaque,
+        vtable: *const admission.VTable,
+        dispatch: admission.Boundary.Dispatch = admission.Boundary.local_dispatch,
+    };
+    const legacy: LegacyPayload = .{ .ptr = &fixture, .vtable = &vtable };
+    const rejected: admission.Port = .{ .contract = .of(LegacyPayload), .payload = &legacy };
+    const checks = fixture.checks;
+    try std.testing.expectError(error.UnsupportedVersion, rejected.checkpoint());
+    try std.testing.expectError(error.UnsupportedVersion, rejected.executionWait());
+    try std.testing.expectEqual(checks, fixture.checks);
+    try std.testing.expectEqual(@as(usize, 0), fixture.begins);
+}
