@@ -133,6 +133,21 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     ndjson_read_owner_run.addArg("--require-no-skips");
     b.step("antfly-ndjson-read-owner-test", "Verify one NDJSON execution owner preserves catalog, permission and original deadline semantics")
         .dependOn(&ndjson_read_owner_run.step);
+    const retrieval_read_owner_tests = b.addTest(.{
+        .name = "retrieval-read-owner-tests",
+        .root_module = options.api_http_runtime_test_mod,
+        .filters = &.{
+            "retrieval catalog read owns or borrows one original query execution",
+            "semantic query planning reuses equivalent embeddings across tables and isolates principals",
+            "api http server serves retrieval agent response envelope",
+        },
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 17 else 7) * 1024 * 1024 * 1024,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const retrieval_read_owner_run = b.addRunArtifact(retrieval_read_owner_tests);
+    retrieval_read_owner_run.addArg("--require-no-skips");
+    b.step("antfly-retrieval-read-owner-test", "Verify agent read ownership and synchronous semantic inference grant propagation")
+        .dependOn(&retrieval_read_owner_run.step);
     const physical_metadata_root = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/physical_resource_metadata_test_root.zig"),
         .target = target,
