@@ -16673,7 +16673,6 @@ pub const ApiHttpServer = struct {
         self: *ApiHttpServer,
         pending: *const PendingIndexInstallationSnapshot,
     ) IndexInstallationReconcileResult {
-        const writes = self.table_writes orelse return .complete;
         const alloc = self.state_alloc;
         // Accepted reconciliation owns its attempt deadline, independent of
         // the ingress lifetime; no request-borrowed callback reaches this job.

@@ -1477,31 +1477,9 @@ test "SQL blocking results transfer sorted operators and deliver bounded continu
                     seen += 1;
                 }
             } else {
-                try std.testing.expect(stream.spool.?.sorted != null);
-                try std.testing.expectEqual(@as(usize, 0), @as(usize, @intCast(stream.spool.?.rows.size)));
+                seen += result.output.rows.len;
             }
-            const reads = fixture.calls;
-            var seen: usize = 0;
-            while (true) {
-                var result = try stream.next(7);
-                defer result.deinit();
-                try std.testing.expect(result.output.rows.len <= 7);
-                if (expected == 1000) {
-                    for (result.output.rows) |row| {
-                        try std.testing.expectEqual(@as(i64, @intCast(999 - seen)), row[0].integer);
-                        seen += 1;
-                    }
-                } else {
-                    seen += result.output.rows.len;
-                }
-                if (result.exhausted) break;
-            }
-            try std.testing.expectEqual(expected, seen);
-            try std.testing.expectEqual(reads, fixture.calls);
-            try std.testing.expect(stream.budget.peak <= 256 * 1024);
-            fixture.cancel = true;
-            try std.testing.expectError(error.QueryCanceled, stream.next(1));
-            try std.testing.expect(stream.spool == null);
+            if (result.exhausted) break;
         }
         try std.testing.expectEqual(expected, seen);
         try std.testing.expectEqual(reads, fixture.calls);

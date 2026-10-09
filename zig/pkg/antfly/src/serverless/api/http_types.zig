@@ -46,8 +46,6 @@ pub const HttpRequest = struct {
     cancellation: cancellation_mod.CancellationToken = .none,
     /// Original native monotonic deadline; nested work may shorten it.
     deadline_ns: ?u64 = null,
-
-    deadline_ns: ?u64 = null,
     deadline_io: @FieldType(@import("antfly_local_sources").api_operation.RequestContext, "deadline_io") = null,
     pub fn context(self: HttpRequest) @import("antfly_local_sources").api_operation.RequestContext {
         return .{ .cancellation = self.cancellation, .deadline_ns = self.deadline_ns, .deadline_io = self.deadline_io };

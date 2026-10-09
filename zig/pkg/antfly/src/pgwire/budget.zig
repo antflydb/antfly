@@ -341,6 +341,6 @@ test "pgwire nested connection budgets serialize concurrent allocation and recla
         }
     }
     try std.testing.expect(!worker.failure.load(.acquire));
-    try std.testing.expectEqual(@as(usize, 0), budget.used);
-    try std.testing.expectEqual(@as(usize, 0), parent.used);
+    try std.testing.expectEqual(@as(usize, 0), budget.used.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), parent.used.load(.acquire));
 }
