@@ -1381,6 +1381,39 @@ from current SQL extraction is not repaired by naming this inventory check a ful
 
 ## Concrete remaining reviews
 
+### Namespace relation ownership publication boundary
+
+`system_catalog/relation_names.zig` now provides an owned, bounded before/after
+claim planner and a point-store adapter over the metadata owner's existing
+transaction. Tables, access indexes and constraint-owned indexes share a
+namespace-qualified name space. Claims retain table identity, exact schema
+epoch/digest, publication identity and reserved/active/retiring phase. Keys are
+length-delimited UTF-8, preserving quoted names without delimiter ambiguity.
+Records have an explicit durable format and reject unknown tags or versions.
+Validation performs one point lookup per distinct name in the before/after cut; it never
+scans unrelated tables. Replaying a stale cut is not accepted merely because
+the same table ID and name still exist. Unchanged cuts issue no writes.
+
+`zig build system-catalog-relation-test system-catalog-relation-store-test`
+checks collisions, namespaces, ownership phases, epoch fences, allocation
+faults, exact encoding and real metadata transaction abort/restart behavior.
+The storage regression injects failure after deleting an old claim and updating
+the schema, then verifies that abort restores both across restart. Independent
+PostgreSQL oracle coverage checks table/index namespace collisions, equal index
+names in distinct schemas, quoted names, and constraint-owned index retirement.
+
+This is the shared publication mechanism, not completed runtime activation.
+It still must be called by every table/schema writer, FK publication and restore
+path, with namespace binding and claims committed in the same metadata cut.
+Rebuild/verification from authoritative bindings and table definitions, serving
+capability barriers, authorized point resolution, and DROP/REINDEX integration
+remain required before unqualified index DDL is enabled. The registry must not
+become a second independently committed catalog, nor may a table scan replace
+the missing point-resolution path. No original case is credited for this
+component work; the count remains 466 implemented / 911 unresolved.
+
+### Remaining query and mutation activation
+
 JSONB path extraction now shares strict typed binding and immutable traversal
 between `jsonb_extract_path` and `jsonb_extract_path_text`. Missing components
 and SQL NULL do not skip evaluation of later arguments; JSON null remains a

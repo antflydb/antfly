@@ -349,6 +349,15 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     // is independent of the executor's per-statement memory admission tests.
     run_sql_tests.step.max_rss = 384 * 1024 * 1024;
     b.step("sql-test", "Run SQL compilation, catalog binding, and native execution contract tests").dependOn(&run_sql_tests.step);
+    const relation_name_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/system_catalog/relation_names.zig"),
+        .target = target,
+        .optimize = optimize,
+    }) });
+    const run_relation_name_tests = b.addRunArtifact(relation_name_tests);
+    b.step("system-catalog-relation-test", "Test namespace ownership and atomic catalog publication plans")
+        .dependOn(&run_relation_name_tests.step);
+    run_sql_tests.step.dependOn(&run_relation_name_tests.step);
     const pgwire_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/pgwire_test_root.zig"),
         .target = target,

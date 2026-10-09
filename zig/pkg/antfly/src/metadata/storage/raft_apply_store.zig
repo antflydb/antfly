@@ -61,6 +61,100 @@ const fk_initial_retirement_wire = @import("../fk_initial_retirement_wire.zig");
 const store_root_enrollment = @import("../store_root_enrollment.zig");
 
 pub const AppliedMetadataCheckpoint = apply_contract.AppliedMetadataCheckpoint;
+test "system catalog relation namespace transaction rolls back with schema and persists across restart" {
+    const a = std.testing.allocator;
+    const names = @import("antfly_local_sources").system_catalog_relation_names;
+    const FaultStore = struct {
+        base: *names.Store(docstore.DocStore.Txn),
+        pub fn getClaim(self: *@This(), key: names.Key) !?names.Owner {
+            return self.base.getClaim(key);
+        }
+        pub fn deleteClaim(self: *@This(), key: names.Key) !void {
+            return self.base.deleteClaim(key);
+        }
+        pub fn putClaim(_: *@This(), _: names.Key, _: names.Owner) !void {
+            return error.InjectedNamespaceWriteFailure;
+        }
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/relation-namespace", .{tmp.sub_path});
+    defer a.free(root);
+    const old_schema = "{\"version\":1}";
+    const new_schema = "{\"version\":2}";
+    var old_digest: [32]u8 = undefined;
+    var new_digest: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash(old_schema, &old_digest, .{});
+    std.crypto.hash.Blake3.hash(new_schema, &new_digest, .{});
+    const old: names.Claim = .{ .key = .{ .namespace_id = 2, .name = "email_key" }, .owner = .{ .table_id = 7, .schema_version = 1, .schema_digest = old_digest, .kind = .index } };
+    const next: names.Claim = .{ .key = .{ .namespace_id = 3, .name = "renamed_key" }, .owner = .{ .table_id = 7, .schema_version = 2, .schema_digest = new_digest, .kind = .index } };
+    const table: metadata.TableRecord = .{ .table_id = 7, .name = "items", .schema_json = old_schema };
+    var replacement = table;
+    replacement.schema_json = new_schema;
+    var key_buf: [160]u8 = undefined;
+    const table_key = try tableKeyForGroup(&key_buf, 1, 7);
+    var seed = try names.Plan.init(a, &.{}, &.{old});
+    defer seed.deinit();
+    var transition = try names.Plan.init(a, &.{old}, &.{next});
+    defer transition.deinit();
+    {
+        var store = try RaftApplyStore.init(a, .{ .root_dir = root });
+        defer store.deinit();
+        {
+            var txn = try store.store.beginWriteTxn();
+            errdefer txn.abort();
+            var registry: names.Store(docstore.DocStore.Txn) = .{ .txn = &txn, .alloc = a, .group_id = 1 };
+            try seed.apply(&registry);
+            try store.putTableRecordTxn(&txn, 1, table_key, table);
+            try txn.commit();
+        }
+        {
+            var txn = try store.store.beginWriteTxn();
+            defer txn.abort();
+            var registry: names.Store(docstore.DocStore.Txn) = .{ .txn = &txn, .alloc = a, .group_id = 1 };
+            try store.putTableRecordTxn(&txn, 1, table_key, replacement);
+            var fault: FaultStore = .{ .base = &registry };
+            try std.testing.expectError(error.InjectedNamespaceWriteFailure, transition.apply(&fault));
+            try std.testing.expect((try registry.getClaim(old.key)) == null);
+            // The schema has changed and the old name has been deleted, but
+            // the replacement write failed. Abort must restore the whole cut.
+        }
+    }
+    {
+        var store = try RaftApplyStore.init(a, .{ .root_dir = root });
+        defer store.deinit();
+        {
+            var txn = try store.store.beginReadTxn();
+            defer txn.abort();
+            var registry: names.Store(docstore.DocStore.Txn) = .{ .txn = &txn, .alloc = a, .group_id = 1 };
+            try std.testing.expect((try registry.getClaim(old.key)).?.eql(old.owner));
+            try std.testing.expect((try registry.getClaim(next.key)) == null);
+            const actual = try decodeTableRecord(a, try txn.get(table_key));
+            defer metadata_table_manager.freeTable(a, actual);
+            try std.testing.expectEqualStrings(old_schema, actual.schema_json);
+        }
+        {
+            var txn = try store.store.beginWriteTxn();
+            errdefer txn.abort();
+            var registry: names.Store(docstore.DocStore.Txn) = .{ .txn = &txn, .alloc = a, .group_id = 1 };
+            try transition.apply(&registry);
+            try store.putTableRecordTxn(&txn, 1, table_key, replacement);
+            try txn.commit();
+        }
+    }
+    var recovered = try RaftApplyStore.init(a, .{ .root_dir = root });
+    defer recovered.deinit();
+    var txn = try recovered.store.beginWriteTxn();
+    defer txn.abort();
+    var registry: names.Store(docstore.DocStore.Txn) = .{ .txn = &txn, .alloc = a, .group_id = 1 };
+    try std.testing.expect((try registry.getClaim(old.key)) == null);
+    try std.testing.expect((try registry.getClaim(next.key)).?.eql(next.owner));
+    try std.testing.expectError(error.CatalogGenerationChanged, transition.apply(&registry));
+    const actual = try decodeTableRecord(a, try txn.get(table_key));
+    defer metadata_table_manager.freeTable(a, actual);
+    try std.testing.expectEqualStrings(new_schema, actual.schema_json);
+}
+
 const checkpoint_magic = "AMCKPT\x00\x00";
 const checkpoint_encoded_len = 26;
 fn encodeMetadataCheckpoint(value: AppliedMetadataCheckpoint) [checkpoint_encoded_len]u8 {

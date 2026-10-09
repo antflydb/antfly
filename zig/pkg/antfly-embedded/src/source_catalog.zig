@@ -594,6 +594,7 @@ pub const storage_vector_payload_store = @import("storage/vector_payload_store.z
 pub const storage_vector_wal_view = @import("storage/vector_wal_view.zig");
 pub const storage_wal = @import("storage/wal.zig");
 pub const system_catalog_domain = @import("system_catalog/domain.zig");
+pub const system_catalog_relation_names = @import("system_catalog/relation_names.zig");
 pub const system_catalog_policies = @import("system_catalog/policies.zig");
 pub const system_catalog_settings = @import("system_catalog/settings.zig");
 pub const template = @import("template.zig");

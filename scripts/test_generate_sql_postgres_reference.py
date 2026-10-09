@@ -1834,6 +1834,56 @@ class PostgresReferenceTest(unittest.TestCase):
                 self.db.execute("SELECT _id,n FROM named_items").fetchall(),
             )
 
+    def test_relation_names_share_one_namespace_and_constraint_index_ownership(self):
+        import psycopg
+
+        with self.db.transaction(force_rollback=True):
+            self.db.execute("CREATE SCHEMA relation_scope_a")
+            self.db.execute("CREATE SCHEMA relation_scope_b")
+            self.db.execute(
+                "CREATE TABLE relation_scope_a.items(id integer, email text)"
+            )
+            self.db.execute(
+                "CREATE TABLE relation_scope_a.other(id integer, email text)"
+            )
+            self.db.execute(
+                "CREATE TABLE relation_scope_b.items(id integer, email text)"
+            )
+            self.db.execute("CREATE INDEX access_key ON relation_scope_a.items(email)")
+            self.db.execute("CREATE INDEX access_key ON relation_scope_b.items(email)")
+            for ddl in (
+                "CREATE INDEX access_key ON relation_scope_a.other(email)",
+                "CREATE TABLE relation_scope_a.access_key(id integer)",
+                "CREATE INDEX items ON relation_scope_a.other(email)",
+            ):
+                with self.subTest(ddl=ddl), self.assertRaises(psycopg.Error) as caught:
+                    with self.db.transaction():
+                        self.db.execute(ddl)
+                self.assertEqual("42P07", caught.exception.sqlstate)
+            self.db.execute(
+                "ALTER TABLE relation_scope_a.items ADD CONSTRAINT email_owner UNIQUE(email)"
+            )
+            with self.assertRaises(psycopg.Error) as caught:
+                with self.db.transaction():
+                    self.db.execute("DROP INDEX relation_scope_a.email_owner")
+            self.assertEqual("2BP01", caught.exception.sqlstate)
+            self.db.execute(
+                "ALTER TABLE relation_scope_a.items DROP CONSTRAINT email_owner"
+            )
+            self.db.execute("CREATE INDEX email_owner ON relation_scope_a.other(email)")
+            self.db.execute(
+                'CREATE INDEX "quoted.index:名" ON relation_scope_a.items(id)'
+            )
+            self.assertEqual(
+                [
+                    ("relation_scope_a", "access_key"),
+                    ("relation_scope_b", "access_key"),
+                ],
+                self.db.execute(
+                    "SELECT n.nspname,c.relname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.relname='access_key' AND n.nspname IN ('relation_scope_a','relation_scope_b') ORDER BY n.nspname"
+                ).fetchall(),
+            )
+
     def test_unique_indexes_are_inference_arbiters_not_named_constraints(self):
         import psycopg
 
