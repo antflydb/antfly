@@ -391,6 +391,7 @@ const LiveEmitter = struct {
     sink: ?EventSink = null,
     alloc: std.mem.Allocator,
     next_step_index: usize = 0,
+    active_pipeline: ?struct { index: usize, step: AgentStep } = null,
     // Buffered transcripts replay the same event schema with final results.
     replay_result: ?RetrievalAgentResult = null,
 
@@ -562,6 +563,33 @@ const LiveEmitter = struct {
         });
     }
 
+    fn beginPipeline(self: *LiveEmitter, step: AgentStep) !void {
+        if (self.sink == null) return;
+        std.debug.assert(self.active_pipeline == null);
+        const index = self.next_step_index;
+        self.next_step_index += 1;
+        self.active_pipeline = .{ .index = index, .step = step };
+        const id = try std.fmt.allocPrint(self.alloc, "step_{d}", .{index});
+        defer self.alloc.free(id);
+        try self.emitValue("step_started", .{ .id = id, .kind = step.kind, .name = step.name, .action = step.action });
+    }
+
+    fn finishPipeline(self: *LiveEmitter, failed: bool) !void {
+        const pending = self.active_pipeline orelse return;
+        self.active_pipeline = null;
+        const id = try std.fmt.allocPrint(self.alloc, "step_{d}", .{pending.index});
+        defer self.alloc.free(id);
+        const step = pending.step;
+        try self.emitValue("step_completed", .{
+            .id = id,
+            .kind = step.kind,
+            .name = step.name,
+            .action = step.action,
+            .status = if (failed) metadata_openapi.AgentStepStatus.@"error" else step.status,
+            .details = step.details,
+        });
+    }
+
     fn emitHits(self: *LiveEmitter, hits: []const QueryHit, tree_search: bool) !void {
         if (self.sink == null) return;
         if (tree_search) try self.emitTreeProgress(hits);
@@ -598,6 +626,7 @@ fn finishAgentResult(
     result: RetrievalAgentResult,
     live: *LiveEmitter,
 ) !EncodedResponse {
+    try live.finishPipeline(false);
     try live.emitDone(result);
     if (format == .sse and live.sink != null) {
         // Events were written under transport backpressure. Do not retain or
@@ -605,6 +634,21 @@ fn finishAgentResult(
         return .{ .content_type = "text/event-stream", .body = try alloc.dupe(u8, "") };
     }
     return try encodeAgentResult(alloc, format, result);
+}
+
+pub const RetryableReadFailure = struct {
+    @"error": []const u8 = "ReadUnavailable",
+    code: []const u8 = "read_unavailable",
+    message: []const u8 = "retrieval read temporarily unavailable; retry the request",
+    retryable: bool = true,
+    retry_after_ms: u32 = 1000,
+};
+
+pub fn retryableReadFailure(err: anyerror) ?RetryableReadFailure {
+    return switch (err) {
+        error.IdentityReadGenerationChanged, error.StorageReadTemporarilyUnavailable, error.TopologyChanged => .{},
+        else => null,
+    };
 }
 
 /// Every terminal failure uses the same delivery decision as completion.
@@ -616,7 +660,15 @@ fn failAgentResult(
     err: anyerror,
     kind: enum { retrieval, generation },
 ) !EncodedResponse {
+    try live.finishPipeline(true);
     if (format == .json) return err;
+    if (if (kind == .retrieval) retryableReadFailure(err) else null) |payload| {
+        try live.emitValue("error", payload);
+        return .{
+            .content_type = "text/event-stream",
+            .body = if (live.sink != null) try alloc.dupe(u8, "") else try encodeSseError(alloc, payload),
+        };
+    }
     if (err == error.GenerationCapacityUnavailable) {
         const payload = connections_api.generationCapacityFailure();
         try live.emitValue("error", payload);
@@ -952,13 +1004,20 @@ fn executeInternal(
         try std.fmt.allocPrint(arena, "executed 1 retrieval query", .{})
     else
         try std.fmt.allocPrint(arena, "executed {d} retrieval queries", .{retrieval_queries.len});
-    try appendStep(arena, &steps_list, &live, .{
+    const pipeline_step: AgentStep = .{
         .kind = .planning,
         .name = "pipeline",
         .action = action,
         .status = .success,
         .details = try buildPipelineStepDetails(arena, retrieval_queries, selected_query_indices, broadened_from_decision),
-    });
+    };
+    try steps_list.append(arena, pipeline_step);
+    if (model_directed) {
+        try live.emitStep(pipeline_step);
+    } else {
+        // Preserve result step order, but report success only after retrieval.
+        try live.beginPipeline(pipeline_step);
+    }
     if (agentic_mode and !model_directed) {
         try appendStep(arena, &steps_list, &live, .{
             .kind = .tool_call,
@@ -1509,6 +1568,8 @@ fn executeInternal(
             }
         }
     }
+
+    try live.finishPipeline(false);
 
     if (!model_directed and agentic_mode and hit_list.items.len == 0 and retrieval_queries.len > 1 and !broadened_from_decision and clarification_state.interactive and clarification_state.remaining > 0 and hasUnattemptedAgenticCandidate(candidate_scores, attempted_query_indices)) {
         try appendStep(arena, &steps_list, &live, .{
@@ -12600,4 +12661,102 @@ fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *con
         break :blk repeated;
     };
     return &result;
+}
+
+test "retrieval agent live pipeline spans retrieval and finishes before generation" {
+    const Fixture = struct {
+        started: bool = false,
+        completed: bool = false,
+        generated: bool = false,
+        fn emit(ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, json: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            var parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
+            defer parsed.deinit();
+            if (parsed.value != .object) return;
+            const step = parsed.value.object.get("name") orelse return;
+            if (step != .string or !std.mem.eql(u8, step.string, "pipeline")) return;
+            if (std.mem.eql(u8, name, "step_started")) {
+                try std.testing.expect(!self.started);
+                self.started = true;
+            }
+            if (std.mem.eql(u8, name, "step_completed")) {
+                try std.testing.expect(self.started and !self.completed);
+                try std.testing.expectEqualStrings("success", parsed.value.object.get("status").?.string);
+                self.completed = true;
+            }
+        }
+        fn query(ptr: *anyopaque, alloc: std.mem.Allocator, _: []const u8, _: []const u8) !query_api.QueryResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(self.started and !self.completed);
+            return .{ .json = try alloc.dupe(u8,
+                \\{"responses":[{"status":200,"hits":{"hits":[{"_id":"doc:a","_score":1,"_source":{"text":"alpha"}}]}}]}
+            ) };
+        }
+        fn generate(ptr: *anyopaque, alloc: std.mem.Allocator, _: []const generating.ChainLink, _: []const generating.ChatMessage) !generating.GenerateResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(self.completed);
+            self.generated = true;
+            return .{ .content = try alloc.dupe(u8, "alpha"), .allocator = alloc };
+        }
+    };
+    var fixture: Fixture = .{};
+    const body =
+        \\{"query":"find alpha","stream":true,"generator":{"provider":"antfly","model":"local"},"steps":{"classification":{},"generation":{}},"queries":[{"table":"docs","full_text_search":{"query":"alpha"}}]}
+    ;
+    const response = try executeWithEventSink(std.testing.allocator, .{ .ptr = &fixture, .vtable = &.{ .run_query = Fixture.query } }, .{ .ptr = &fixture, .vtable = &.{ .execute_chain = Fixture.generate } }, body, .{ .ptr = &fixture, .emit_json_fn = Fixture.emit });
+    defer std.testing.allocator.free(response.body);
+    try std.testing.expect(fixture.started and fixture.completed and fixture.generated);
+}
+
+test "retrieval agent live pipeline fails with stable retryable read error" {
+    const Fixture = struct {
+        failure: anyerror,
+        fn query(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8) !query_api.QueryResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.failure;
+        }
+    };
+    const body =
+        \\{"query":"find alpha","stream":true,"steps":{"classification":{}},"queries":[{"table":"docs","full_text_search":{"query":"alpha"}}]}
+    ;
+    for ([_]anyerror{ error.IdentityReadGenerationChanged, error.StorageReadTemporarilyUnavailable, error.TopologyChanged }) |failure| {
+        var fixture: Fixture = .{ .failure = failure };
+        const runner: QueryRunner = .{ .ptr = &fixture, .vtable = &.{ .run_query = Fixture.query } };
+        var transcript: SseTranscript = .{};
+        defer transcript.bytes.deinit(std.testing.allocator);
+        const response = try executeWithEventSink(std.testing.allocator, runner, null, body, .{ .ptr = &transcript, .emit_json_fn = SseTranscript.emit });
+        defer std.testing.allocator.free(response.body);
+        const events = try parseSseEventsAlloc(std.testing.allocator, transcript.bytes.items);
+        defer std.testing.allocator.free(events);
+        var pipeline_started = false;
+        var pipeline_failed = false;
+        for (events) |event| {
+            if (std.mem.eql(u8, event.event, "step_started") or std.mem.eql(u8, event.event, "step_completed")) {
+                var value = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, event.data, .{});
+                defer value.deinit();
+                if (!std.mem.eql(u8, value.value.object.get("name").?.string, "pipeline")) continue;
+                if (std.mem.eql(u8, event.event, "step_started")) pipeline_started = true else {
+                    try std.testing.expect(pipeline_started and !pipeline_failed);
+                    try std.testing.expectEqualStrings("error", value.value.object.get("status").?.string);
+                    pipeline_failed = true;
+                }
+            }
+            if (std.mem.eql(u8, event.event, "error")) try std.testing.expect(pipeline_failed);
+        }
+        try std.testing.expect(pipeline_failed);
+        try std.testing.expectEqual(@as(usize, 0), countSseEvents(events, "hit"));
+        try std.testing.expectEqual(@as(usize, 0), countSseEvents(events, "generation"));
+        try std.testing.expectEqual(@as(usize, 0), countSseEvents(events, "done"));
+        var payload = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, firstSseEventData(events, "error").?, .{});
+        defer payload.deinit();
+        try std.testing.expectEqualStrings("ReadUnavailable", payload.value.object.get("error").?.string);
+        try std.testing.expectEqualStrings("read_unavailable", payload.value.object.get("code").?.string);
+        try std.testing.expect(payload.value.object.get("retryable").?.bool);
+        try std.testing.expectEqual(@as(i64, 1000), payload.value.object.get("retry_after_ms").?.integer);
+        const buffered = try execute(std.testing.allocator, runner, null, body);
+        defer std.testing.allocator.free(buffered.body);
+        const buffered_events = try parseSseEventsAlloc(std.testing.allocator, buffered.body);
+        defer std.testing.allocator.free(buffered_events);
+        try std.testing.expectEqualStrings(firstSseEventData(events, "error").?, firstSseEventData(buffered_events, "error").?);
+    }
 }
