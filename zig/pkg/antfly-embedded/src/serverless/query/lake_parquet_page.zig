@@ -2920,10 +2920,10 @@ const Reader = struct {
 
     fn readFieldHeader(self: *Reader, previous_field_id: *i16) !?Field {
         const raw = try self.readByte();
-        const field_type: CompactType = @fromBackingInt(@intCast(raw & 0x0f));
+        const field_type: CompactType = std.enums.fromInt(CompactType, @as(u4, @intCast(raw & 0x0f))) orelse return error.InvalidParquetPage;
         if (field_type == .stop) return null;
         const delta: i16 = @intCast(raw >> 4);
-        const field_id = if (delta == 0) try self.readI16() else previous_field_id.* + delta;
+        const field_id = if (delta == 0) try self.readI16() else std.math.add(i16, previous_field_id.*, delta) catch return error.InvalidParquetPage;
         previous_field_id.* = field_id;
         return .{ .id = field_id, .type = field_type };
     }
@@ -2948,11 +2948,11 @@ const Reader = struct {
     }
 
     fn readI16(self: *Reader) !i16 {
-        return @intCast(zigzagDecode(try self.readVarintU64()));
+        return std.math.cast(i16, zigzagDecode(try self.readVarintU64())) orelse error.InvalidParquetPage;
     }
 
     fn readI32(self: *Reader) !i32 {
-        return @intCast(zigzagDecode(try self.readVarintU64()));
+        return std.math.cast(i32, zigzagDecode(try self.readVarintU64())) orelse error.InvalidParquetPage;
     }
 
     fn readByte(self: *Reader) !u8 {
@@ -2971,6 +2971,7 @@ const Reader = struct {
         var result: u64 = 0;
         while (true) {
             const byte = try self.readByte();
+            if (shift == 63 and byte & 0xfe != 0) return error.InvalidParquetPage;
             result |= (@as(u64, byte & 0x7f) << shift);
             if ((byte & 0x80) == 0) return result;
             if (shift >= 63) return error.InvalidParquetPage;
@@ -3003,8 +3004,8 @@ const Reader = struct {
                 const count = try self.readVarintUsize();
                 if (count == 0) return;
                 const types = try self.readByte();
-                const key_type: CompactType = @fromBackingInt(@intCast(types >> 4));
-                const value_type: CompactType = @fromBackingInt(@intCast(types & 0x0f));
+                const key_type: CompactType = std.enums.fromInt(CompactType, @as(u4, @intCast(types >> 4))) orelse return error.InvalidParquetPage;
+                const value_type: CompactType = std.enums.fromInt(CompactType, @as(u4, @intCast(types & 0x0f))) orelse return error.InvalidParquetPage;
                 for (0..count) |_| {
                     try self.skip(key_type);
                     try self.skip(value_type);
@@ -3023,7 +3024,7 @@ const Reader = struct {
 
     fn readListHeader(self: *Reader) !struct { elem_type: CompactType, len: usize } {
         const raw = try self.readByte();
-        const elem_type: CompactType = @fromBackingInt(@intCast(raw & 0x0f));
+        const elem_type: CompactType = std.enums.fromInt(CompactType, @as(u4, @intCast(raw & 0x0f))) orelse return error.InvalidParquetPage;
         const inline_len = raw >> 4;
         const len = if (inline_len == 15) try self.readVarintUsize() else inline_len;
         return .{ .elem_type = elem_type, .len = len };
@@ -3041,6 +3042,7 @@ const LevelReader = struct {
             if (self.cursor >= self.bytes.len) return error.InvalidParquetPage;
             const byte = self.bytes[self.cursor];
             self.cursor += 1;
+            if (shift == 63 and byte & 0xfe != 0) return error.InvalidParquetPage;
             result |= (@as(u64, byte & 0x7f) << shift);
             if ((byte & 0x80) == 0) return result;
             if (shift >= 63) return error.InvalidParquetPage;
@@ -4307,4 +4309,17 @@ test "parquet legacy PLAIN_DICTIONARY dictionary pages decode plain values" {
     var invalid = header;
     invalid.encoding = .rle_dictionary;
     try std.testing.expectError(error.UnsupportedParquetPage, invalid.validatePlainDictionary());
+}
+
+test "external lake malformed Parquet compact page headers return errors" {
+    for (13..16) |tag| {
+        var reader: Reader = .{ .bytes = &.{@intCast(tag)} };
+        var previous: i16 = 0;
+        try std.testing.expectError(error.InvalidParquetPage, reader.readFieldHeader(&previous));
+    }
+    var wide: Reader = .{ .bytes = &.{ 0xff, 0xff, 0xff, 0xff, 0x7f } };
+    try std.testing.expectError(error.InvalidParquetPage, wide.readI32());
+    var delta: Reader = .{ .bytes = &.{0xf5} };
+    var previous: i16 = std.math.maxInt(i16);
+    try std.testing.expectError(error.InvalidParquetPage, delta.readFieldHeader(&previous));
 }

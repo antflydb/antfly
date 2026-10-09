@@ -241,7 +241,7 @@ pub export fn antfly_inference_rewrite_json(h: ?*anyopaque, request_json: capi.S
 
 /// Uses the model-independent DecideRequest/DecideResponse contract.
 pub export fn antfly_inference_decide_json(h: ?*anyopaque, request_json: capi.Slice, out: ?*capi.Buffer) capi.ErrorCode {
-    return invoke(h, .post, "decide", request_json.bytes(), out);
+    return invoke(h, .post, "decisions", request_json.bytes(), out);
 }
 
 pub export fn antfly_inference_extract_json(h: ?*anyopaque, request_json: capi.Slice, out: ?*capi.Buffer) capi.ErrorCode {
@@ -746,7 +746,7 @@ test "capi inference decide validates requests and preserves error bodies" {
     try std.testing.expect(std.mem.indexOf(u8, testBuffer(out), "INVALID_REQUEST") != null);
     db.antfly_buffer_free(&out);
     const request =
-        \\{"model":"nobody/no-such-model","state":"Refund requested","questions":{"refund":{"type":"noul","instructions":"Does this ask for a refund?"}}}
+        \\{"model":"nobody/no-such-model","input":"Refund requested","questions":[{"name":"refund","type":"predicate","instructions":"Does this ask for a refund?"}]}
     ;
     try std.testing.expectEqual(capi.ErrorCode.not_found, antfly_inference_decide_json(handle, testSlice(request), &out));
     defer db.antfly_buffer_free(&out);

@@ -2522,32 +2522,44 @@ def test_native_remote_indexed_metadata_predicates_above_id_list_limit(tmp_path)
     objects.mkdir(parents=True)
     count = 100003
     input_file = tmp_path / "predicates.parquet"
-    pq.write_table(
-        pa.table(
-            {
-                "body": ["common"] * count,
-                "sparse_native": ['{"1":1}'] * count,
-                "amount": range(count),
-                "big_integer": [9007199254740992, 9007199254740993]
-                + [9007199254740994] * (count - 2),
-                "time_text": ["2026-01-01T01:00:00+01:00", "2026-01-01T00:30:00Z"]
-                + ["2026-01-01T00:00:00Z"] * (count - 2),
-                "category": ["story", "story"] + ["comment"] * (count - 2),
-                "label": ["other"] * (count - 1) + ["kept"],
-            }
-        ),
-        input_file,
-        row_group_size=4096,
-        compression="snappy",
-        write_page_index=True,
+    data_table = pa.table(
+        {
+            "body": ["common early rarefirst"]
+            + ["common early"] * (count - 1001)
+            + ["common late"] * 999
+            + ["common late rarelast"],
+            "sparse_native": ['{"1":1}'] * count,
+            "amount": range(count),
+            "sort_rank": [0, 1] + list(range(2, count - 1)) + [0],
+            "big_integer": [9007199254740992, 9007199254740993]
+            + [9007199254740994] * (count - 2),
+            "event_time": pa.array(
+                [-1, 0, 1] + [2] * (count - 3), type=pa.timestamp("ns", tz="UTC")
+            ),
+            "time_text": ["2026-01-01T01:00:00+01:00", "2026-01-01T00:30:00Z"]
+            + ["2026-01-01T00:00:00Z"] * (count - 2),
+            "category": ["story", "story"] + ["comment"] * (count - 2),
+            "label": ["other"] * (count - 1) + ["kept"],
+        }
     )
-    payload = input_file.read_bytes()
-    (objects / "part.parquet").write_bytes(
-        b"AFOBJ001"
-        + struct.pack("<QI", len(payload), 0)
-        + hashlib.sha256(payload).hexdigest().encode()
-        + payload
-    )
+    for name, offset, length in (
+        ("a", 0, count // 2),
+        ("b", count // 2, count - count // 2),
+    ):
+        pq.write_table(
+            data_table.slice(offset, length),
+            input_file,
+            row_group_size=4096,
+            compression="snappy",
+            write_page_index=True,
+        )
+        payload = input_file.read_bytes()
+        (objects / f"{name}.parquet").write_bytes(
+            b"AFOBJ001"
+            + struct.pack("<QI", len(payload), 0)
+            + hashlib.sha256(payload).hexdigest().encode()
+            + payload
+        )
     server = StandaloneAntflyServer(binary, "127.0.0.1", 0)
     failed = True
     try:
@@ -2571,6 +2583,47 @@ def test_native_remote_indexed_metadata_predicates_above_id_list_limit(tmp_path)
                 "num_shards": 1,
                 "schema": {
                     "storage_mode": "relational",
+                    "default_type": "doc",
+                    "document_schemas": {
+                        "doc": {
+                            "schema": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "properties": {
+                                    "body": {
+                                        "type": "string",
+                                        "x-antfly-field": {"type": "text"},
+                                    },
+                                    "amount": {
+                                        "type": "integer",
+                                        "x-antfly-field": {
+                                            "type": "number",
+                                            "sortable": True,
+                                        },
+                                    },
+                                    "sort_rank": {
+                                        "type": "integer",
+                                        "x-antfly-field": {
+                                            "type": "number",
+                                            "sortable": True,
+                                        },
+                                    },
+                                    "big_integer": {"type": "integer"},
+                                    "event_time": {
+                                        "type": "datetime",
+                                        "x-antfly-field": {
+                                            "type": "datetime",
+                                            "sortable": True,
+                                        },
+                                    },
+                                    "time_text": {"type": "string"},
+                                    "category": {"type": "string"},
+                                    "label": {"type": "string"},
+                                    "sparse_native": {"type": "string"},
+                                },
+                            }
+                        }
+                    },
                     "base_source": {
                         "kind": "external",
                         "table_id": "indexed-predicates",
@@ -2578,17 +2631,55 @@ def test_native_remote_indexed_metadata_predicates_above_id_list_limit(tmp_path)
                         "uri": root.as_uri(),
                     },
                     "relational_indexes": [
-                        {"name": "amount_idx", "keys": [{"column": "amount"}]},
+                        {
+                            "name": "amount_idx",
+                            "keys": [{"column": "amount", "nulls": "first"}],
+                        },
+                        {
+                            "name": "amount_desc_idx",
+                            "keys": [
+                                {
+                                    "column": "amount",
+                                    "direction": "desc",
+                                    "nulls": "last",
+                                }
+                            ],
+                        },
+                        {
+                            "name": "event_time_idx",
+                            "keys": [{"column": "event_time", "nulls": "first"}],
+                        },
+                        {
+                            "name": "event_time_desc_idx",
+                            "keys": [
+                                {
+                                    "column": "event_time",
+                                    "direction": "desc",
+                                    "nulls": "last",
+                                }
+                            ],
+                        },
                         {
                             "name": "big_integer_idx",
                             "keys": [{"column": "big_integer"}],
                         },
                         {"name": "time_text_idx", "keys": [{"column": "time_text"}]},
                         {"name": "category_idx", "keys": [{"column": "category"}]},
+                        {
+                            "name": "category_amount_idx",
+                            "keys": [
+                                {"column": "category"},
+                                {"column": "amount", "nulls": "first"},
+                            ],
+                        },
+                        {
+                            "name": "rank_idx",
+                            "keys": [{"column": "sort_rank", "nulls": "first"}],
+                        },
                     ],
                 },
                 "indexes": {
-                    "body_text": {"type": "full_text", "field": "body"},
+                    "body_text": {"type": "full_text"},
                     "sparse_native": {
                         "type": "embeddings",
                         "external": True,
@@ -2673,6 +2764,48 @@ def test_native_remote_indexed_metadata_predicates_above_id_list_limit(tmp_path)
         assert counted["hits"]["total"] == {"value": count - 2, "relation": "exact"}, (
             counted
         )
+        # Broad indexed metadata must refine selective text candidates without
+        # changing BM25 statistics, exact counts, exclusions, or segment offsets.
+        # These terms live in different files/native segments.
+        for term, amount, matches in (
+            ("rarefirst", 0, False),
+            ("rarelast", count - 1, True),
+        ):
+            search = {"term": term, "field": "body"}
+            unfiltered = query({"match_all": {}}, full_text_search=search)
+            assert [h["_source"]["amount"] for h in unfiltered["hits"]["hits"]] == [
+                amount
+            ]
+            selected = query(broad, full_text_search=search)
+            assert [h["_source"]["amount"] for h in selected["hits"]["hits"]] == (
+                [amount] if matches else []
+            )
+            if matches:
+                assert selected["hits"]["hits"][0]["_score"] == pytest.approx(
+                    unfiltered["hits"]["hits"][0]["_score"], abs=1e-6
+                )
+            exact = query(
+                broad, full_text_search=search, count=True, fields=[], limit=0
+            )
+            assert exact["hits"]["total"] == {
+                "value": int(matches),
+                "relation": "exact",
+            }
+            excluded = call(
+                "POST",
+                "/tables/indexed_predicates/query",
+                {
+                    "full_text_search": search,
+                    "exclusion_query": broad,
+                    "count": True,
+                    "fields": [],
+                    "limit": 0,
+                },
+            )
+            assert excluded["hits"]["total"] == {
+                "value": int(not matches),
+                "relation": "exact",
+            }
         # A selective amount index can supply candidates while category remains
         # residual; exact count must not confuse that superset with final matches.
         selective_and = {
@@ -2777,6 +2910,756 @@ def test_native_remote_indexed_metadata_predicates_above_id_list_limit(tmp_path)
         assert [h["_source"]["amount"] for h in sparse_point["hits"]["hits"]] == [
             count - 1
         ], sparse_point
+        for weight in (-1, 0):
+            signed = call(
+                "POST",
+                "/tables/indexed_predicates/query",
+                {
+                    "embeddings": {
+                        "sparse_native": {"indices": [1], "values": [weight]}
+                    },
+                    "indexes": ["sparse_native"],
+                    "fields": ["amount"],
+                    "limit": 3,
+                    "filter_query": {"term": {"field": "amount", "value": count - 1}},
+                },
+            )
+            assert [h["_source"]["amount"] for h in signed["hits"]["hits"]] == [
+                count - 1
+            ], signed
+            assert signed["hits"]["hits"][0]["_score"] == weight, signed
+        selective_sort = query(
+            point, order_by=[{"field": "amount"}], limit=1, profile=True
+        )
+        assert [h["_source"]["amount"] for h in selective_sort["hits"]["hits"]] == [
+            count - 1
+        ], selective_sort
+        assert (
+            selective_sort["profile"]["sort"]["candidate_source"]
+            != "ordered_lake_index"
+        ), selective_sort
+        assert selective_sort["profile"]["sort"]["ordered_scanned_count"] == 0, (
+            selective_sort
+        )
+        sparse_residual = call(
+            "POST",
+            "/tables/indexed_predicates/query",
+            {
+                "embeddings": {"sparse_native": {"indices": [1], "values": [1]}},
+                "indexes": ["sparse_native"],
+                "fields": ["amount"],
+                "limit": 3,
+                "filter_query": {
+                    "conjuncts": [point, {"prefix": {"path": "/label", "value": "ke"}}]
+                },
+            },
+        )
+        assert [h["_source"]["amount"] for h in sparse_residual["hits"]["hits"]] == [
+            count - 1
+        ], sparse_residual
+        rejected_residual = call(
+            "POST",
+            "/tables/indexed_predicates/query",
+            {
+                "embeddings": {"sparse_native": {"indices": [1], "values": [1]}},
+                "indexes": ["sparse_native"],
+                "fields": ["amount"],
+                "limit": 3,
+                "filter_query": {
+                    "conjuncts": [point, {"prefix": {"path": "/label", "value": "no"}}]
+                },
+            },
+        )
+        assert rejected_residual["hits"]["hits"] == [], rejected_residual
+        for descending, expected in (
+            (False, list(range(7, 10))),
+            (True, list(range(count - 8, count - 11, -1))),
+        ):
+            ordered = query(
+                {"match_all": {}},
+                order_by=[{"field": "amount", "desc": descending}],
+                offset=7,
+                limit=3,
+                profile=True,
+            )
+            assert [
+                h["_source"]["amount"] for h in ordered["hits"]["hits"]
+            ] == expected, ordered
+            assert ordered["hits"]["total"] == {"value": count, "relation": "exact"}, (
+                ordered
+            )
+            profile = ordered["profile"]["sort"]
+            assert profile["candidate_source"] == "ordered_lake_index", profile
+            assert profile["candidate_count"] <= 11, profile
+            assert profile["ordered_scanned_count"] <= 11, profile
+            continued = query(
+                {"match_all": {}},
+                order_by=[{"field": "amount", "desc": descending}],
+                search_after=ordered["hits"]["hits"][-1]["_sort"],
+                remote_snapshot=ordered["remote_snapshot"],
+                limit=3,
+                profile=True,
+            )
+            following = (
+                list(range(count - 11, count - 14, -1))
+                if descending
+                else list(range(10, 13))
+            )
+            assert [
+                h["_source"]["amount"] for h in continued["hits"]["hits"]
+            ] == following, continued
+            assert (
+                continued["profile"]["sort"]["candidate_source"] == "ordered_lake_index"
+            ), continued
+            assert continued["profile"]["sort"]["ordered_scanned_count"] <= 5, continued
+            previous = query(
+                {"match_all": {}},
+                order_by=[{"field": "amount", "desc": descending}],
+                search_before=continued["hits"]["hits"][0]["_sort"],
+                remote_snapshot=continued["remote_snapshot"],
+                limit=3,
+                profile=True,
+            )
+            assert [
+                h["_source"]["amount"] for h in previous["hits"]["hits"]
+            ] == expected, previous
+            assert (
+                previous["profile"]["sort"]["candidate_source"] == "ordered_lake_index"
+            ), previous
+            assert previous["profile"]["sort"]["ordered_scanned_count"] <= 5, previous
+        prefixed = query(
+            {
+                "conjuncts": [
+                    {"term": {"field": "category", "value": "comment"}},
+                    {"range": {"amount": {"gte": 2}}},
+                ]
+            },
+            order_by=[{"field": "amount"}],
+            limit=3,
+            profile=True,
+        )
+        assert [h["_source"]["amount"] for h in prefixed["hits"]["hits"]] == [
+            2,
+            3,
+            4,
+        ], prefixed
+        assert (
+            prefixed["profile"]["sort"]["candidate_source"] == "ordered_lake_index"
+        ), prefixed
+        continued = query(
+            {
+                "conjuncts": [
+                    {"term": {"field": "category", "value": "comment"}},
+                    {"range": {"amount": {"gte": 2}}},
+                ]
+            },
+            order_by=[{"field": "amount"}],
+            limit=3,
+            profile=True,
+            search_after=prefixed["hits"]["hits"][-1]["_sort"],
+            remote_snapshot=prefixed["remote_snapshot"],
+        )
+        assert [h["_source"]["amount"] for h in continued["hits"]["hits"]] == [
+            5,
+            6,
+            7,
+        ], continued
+        assert (
+            continued["profile"]["sort"]["candidate_source"] == "ordered_lake_index"
+        ), continued
+        assert continued["profile"]["sort"]["ordered_scanned_count"] <= 5, continued
+        if count > 10000:
+            skewed = call(
+                "POST",
+                "/tables/indexed_predicates/query",
+                {
+                    "full_text_search": {"term": "late", "field": "body"},
+                    "fields": ["amount"],
+                    "order_by": [{"field": "amount"}],
+                    "limit": 3,
+                    "profile": True,
+                },
+            )
+            assert [h["_source"]["amount"] for h in skewed["hits"]["hits"]] == list(
+                range(count - 1000, count - 997)
+            ), skewed
+            assert skewed["hits"]["total"] == {"value": 1000, "relation": "exact"}, (
+                skewed
+            )
+            assert (
+                skewed["profile"]["sort"]["candidate_source"]
+                == "ordered_lake_index_then_text_postings"
+            ), skewed
+            assert skewed["profile"]["sort"]["ordered_scanned_count"] <= 1024, skewed
+        tied = query(
+            {"match_all": {}}, order_by=[{"field": "sort_rank"}], limit=1, profile=True
+        )
+        zeros = (
+            query({"term": {"field": "amount", "value": 0}})["hits"]["hits"]
+            + query(point)["hits"]["hits"]
+        )
+        assert [h["_source"]["amount"] for h in tied["hits"]["hits"]] == [
+            sorted(zeros, key=lambda h: h["_id"])[0]["_source"]["amount"]
+        ], tied
+        assert tied["profile"]["sort"]["candidate_source"] == "ordered_lake_index", tied
+        assert tied["profile"]["sort"]["candidate_count"] <= 4, tied
+        dates = query(
+            {"match_all": {}}, order_by=[{"field": "event_time"}], limit=2, profile=True
+        )
+        assert [h["_source"]["amount"] for h in dates["hits"]["hits"]] == [0, 1], dates
+        assert (
+            dates["hits"]["hits"][0]["_sort"][0] == "1969-12-31T23:59:59.999999999Z"
+        ), dates
+        assert dates["profile"]["sort"]["candidate_source"] == "ordered_lake_index", (
+            dates
+        )
+        following_dates = query(
+            {"match_all": {}},
+            order_by=[{"field": "event_time"}],
+            limit=1,
+            profile=True,
+            search_after=dates["hits"]["hits"][-1]["_sort"],
+            remote_snapshot=dates["remote_snapshot"],
+        )
+        assert [h["_source"]["amount"] for h in following_dates["hits"]["hits"]] == [
+            2
+        ], following_dates
+        prior_dates = query(
+            {"match_all": {}},
+            order_by=[{"field": "event_time"}],
+            limit=2,
+            profile=True,
+            search_before=following_dates["hits"]["hits"][0]["_sort"],
+            remote_snapshot=dates["remote_snapshot"],
+        )
+        assert [h["_source"]["amount"] for h in prior_dates["hits"]["hits"]] == [
+            0,
+            1,
+        ], prior_dates
+        assert prior_dates["profile"]["sort"]["ordered_scanned_count"] <= 4, prior_dates
+        # Almost the entire archive shares one timestamp. Complete public-ID
+        # seeks must deliver pages without walking that 100,000-row tie group.
+        tie_filter = {
+            "range": {"event_time": {"gte": "1970-01-01T00:00:00.000000002Z"}}
+        }
+        for primary_desc in (False, True):
+            # The public contract requires an ascending final _id tie-breaker.
+            tie_order = [
+                {"field": "event_time", "desc": primary_desc},
+                {"field": "_id"},
+            ]
+            first_tie = query(tie_filter, order_by=tie_order, limit=3, profile=True)
+            first_ids = [hit["_id"] for hit in first_tie["hits"]["hits"]]
+            assert len(first_ids) == 3 and first_ids == sorted(first_ids), first_tie
+            assert (
+                first_tie["profile"]["sort"]["candidate_source"] == "ordered_lake_index"
+            ), first_tie
+            assert first_tie["profile"]["sort"]["ordered_scanned_count"] <= 4, first_tie
+            next_tie = query(
+                tie_filter,
+                order_by=tie_order,
+                limit=3,
+                profile=True,
+                search_after=first_tie["hits"]["hits"][-1]["_sort"],
+                remote_snapshot=first_tie["remote_snapshot"],
+            )
+            next_ids = [hit["_id"] for hit in next_tie["hits"]["hits"]]
+            assert len(next_ids) == 3 and not set(first_ids) & set(next_ids), next_tie
+            assert first_ids + next_ids == sorted(first_ids + next_ids), next_tie
+            assert next_tie["profile"]["sort"]["ordered_scanned_count"] <= 4, next_tie
+            previous_tie = query(
+                tie_filter,
+                order_by=tie_order,
+                limit=3,
+                profile=True,
+                search_before=next_tie["hits"]["hits"][0]["_sort"],
+                remote_snapshot=next_tie["remote_snapshot"],
+            )
+            assert [hit["_id"] for hit in previous_tie["hits"]["hits"]] == first_ids, (
+                previous_tie
+            )
+            assert previous_tie["profile"]["sort"]["ordered_scanned_count"] <= 4, (
+                previous_tie
+            )
+        native_dates = call(
+            "POST",
+            "/tables/indexed_predicates/query",
+            {
+                "full_text_search": {
+                    "field": "event_time",
+                    "start": "1969-12-31T23:59:59.999999999Z",
+                    "end": "1970-01-01T00:00:00.000000001Z",
+                },
+                "fields": ["amount"],
+                "limit": 10,
+            },
+        )
+        assert {h["_source"]["amount"] for h in native_dates["hits"]["hits"]} == {
+            0,
+            1,
+        }, native_dates
+        signed_temporal = {
+            "range": {
+                "event_time": {
+                    "gte": "1970-01-01T00:00:00Z",
+                    "lt": "1970-01-01T01:00:00.000000002+01:00",
+                }
+            }
+        }
+        for predicate in (
+            signed_temporal,
+            {
+                "bool": {
+                    "should": [signed_temporal, {"match_all": {}}],
+                    "minimum_should_match": 2,
+                }
+            },
+        ):
+            dated = query(predicate, count=True, fields=[], limit=0)
+            assert dated["hits"]["total"] == {"value": 2, "relation": "exact"}, dated
+        failed = False
+    finally:
+        server.stop(test_failed=failed)
+
+
+def _parquet_with_bloom_for_42(payload):
+    """Add a standard Bloom to one PyArrow column without changing its data pages.
+
+    PyArrow does not write Blooms. Preserve its compact-Thrift footer verbatim,
+    inserting only the two standard ColumnMetaData fields and the Bloom payload.
+    The fixed mask is XXH64(seed=0) over little-endian INT64 42, split-block salts.
+    """
+    footer_len = struct.unpack("<I", payload[-8:-4])[0]
+    footer_start = len(payload) - 8 - footer_len
+    footer = payload[footer_start:-8]
+    position = 0
+    insertion = None
+
+    def varint():
+        nonlocal position
+        value = shift = 0
+        while True:
+            byte = footer[position]
+            position += 1
+            value |= (byte & 127) << shift
+            if byte < 128:
+                return value
+            shift += 7
+
+    def value(kind, path):
+        nonlocal position, insertion
+        if kind in (1, 2):
+            return
+        if kind == 3:
+            position += 1
+        elif kind in (4, 5, 6):
+            varint()
+        elif kind == 7:
+            position += 8
+        elif kind == 8:
+            length = varint()
+            position += length
+        elif kind in (9, 10):
+            header = footer[position]
+            position += 1
+            length = varint() if header >> 4 == 15 else header >> 4
+            for _ in range(length):
+                if header & 15 in (1, 2):
+                    position += 1
+                else:
+                    value(header & 15, path)
+        elif kind == 12:
+            field = 0
+            while footer[position]:
+                header = footer[position]
+                position += 1
+                if header >> 4:
+                    field += header >> 4
+                else:
+                    encoded = varint()
+                    field = (encoded >> 1) ^ -(encoded & 1)
+                assert path != (4, 1, 3) or field not in (14, 15)
+                value(header & 15, (*path, field))
+            if path == (4, 1, 3):
+                assert insertion is None
+                insertion = position
+            position += 1
+        else:
+            raise AssertionError(f"Unexpected PyArrow footer type {kind}")
+
+    value(12, ())
+    assert position == len(footer) and insertion is not None
+
+    def encode_varint(number):
+        result = bytearray()
+        while number >= 128:
+            result.append((number & 127) | 128)
+            number >>= 7
+        result.append(number)
+        return bytes(result)
+
+    bloom = bytes.fromhex("15401c1c00001c1c00001c1c000000") + bytes.fromhex(
+        "0001000080000000000000400040000000040000008000000000000810000000"
+    )
+    fields = b"\x06\x1c" + encode_varint(footer_start << 1)
+    fields += b"\x05\x1e" + encode_varint(len(bloom) << 1)
+    footer = footer[:insertion] + fields + footer[insertion:]
+    return (
+        payload[:footer_start]
+        + bloom
+        + footer
+        + struct.pack("<I", len(footer))
+        + b"PAR1"
+    )
+
+
+def test_parquet_embedded_bloom_skips_unreadable_data_pages(tmp_path):
+    """An absent equality succeeds without decoding pages; a present value reads them."""
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
+    input_file = tmp_path / "bloom.parquet"
+    pq.write_table(
+        pa.table({"amount": pa.array([42] * 100, type=pa.int64())}),
+        input_file,
+        use_dictionary=False,
+        compression=None,
+        write_statistics=False,
+    )
+    payload = _parquet_with_bloom_for_42(input_file.read_bytes())
+    # Independent reader accepts the extended footer and original data pages.
+    input_file.write_bytes(payload)
+    assert pq.read_table(input_file)["amount"].to_pylist() == [42] * 100
+    footer_start = len(payload) - 8 - struct.unpack("<I", payload[-8:-4])[0]
+    bloom_start = footer_start - 47
+    corrupt = payload[:4] + b"\xff" * (bloom_start - 4) + payload[bloom_start:]
+    for name, data in (("valid", payload), ("unreadable", corrupt)):
+        objects = tmp_path / name / "buckets" / "antfly" / "objects"
+        objects.mkdir(parents=True)
+        (objects / "part.parquet").write_bytes(
+            b"AFOBJ001"
+            + struct.pack("<QI", len(data), 0)
+            + hashlib.sha256(data).hexdigest().encode()
+            + data
+        )
+    server = StandaloneAntflyServer(binary, "127.0.0.1", 0)
+    failed = True
+    try:
+
+        def call(path, body):
+            return requests.post(
+                server.api_url + path,
+                json=body,
+                auth=("admin", AUTH_BOOTSTRAP_PASSWORD),
+                timeout=60,
+            )
+
+        for name in ("valid", "unreadable"):
+            attached = call(
+                f"/tables/bloom_{name}",
+                {
+                    "num_shards": 1,
+                    "schema": {
+                        "storage_mode": "relational",
+                        "base_source": {
+                            "kind": "external",
+                            "table_id": name,
+                            "format": "parquet",
+                            "uri": (tmp_path / name).as_uri(),
+                        },
+                    },
+                },
+            )
+            assert attached.ok, attached.text + server.debug_logs()
+            absent = call(
+                "/sql",
+                {"statement": f"SELECT amount FROM bloom_{name} WHERE amount = 43"},
+            )
+            assert absent.ok, absent.text + server.debug_logs()
+            assert absent.json()["rows"] == []
+        present = call(
+            "/sql",
+            {"statement": "SELECT amount FROM bloom_valid WHERE amount = 42 LIMIT 1"},
+        )
+        assert present.ok and present.json()["rows"] == [["42"]], present.text
+        try:
+            unreadable = call(
+                "/sql",
+                {
+                    "statement": "SELECT amount FROM bloom_unreadable WHERE amount = 42 LIMIT 1"
+                },
+            )
+            assert not unreadable.ok, unreadable.text
+        except requests.exceptions.ConnectionError:
+            # A decode error after streaming headers closes the response.
+            assert server.proc.poll() is None, server.debug_logs()
+        failed = False
+    finally:
+        server.stop(test_failed=failed)
+
+
+def test_remote_ordered_scan_budget_counts_rows_without_text_ordinals(tmp_path):
+    """Rows omitted from the text corpus still consume the physical probe budget."""
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
+    root = tmp_path / "ordered-physical-budget"
+    objects = root / "buckets" / "antfly" / "objects"
+    objects.mkdir(parents=True)
+    input_file = tmp_path / "budget.parquet"
+    pq.write_table(
+        pa.table(
+            {
+                "body": pa.array([None] * 2048 + ["common"] * 100, type=pa.string()),
+                "amount": pa.array([None] * 2048 + list(range(100)), type=pa.int64()),
+            }
+        ),
+        input_file,
+        row_group_size=256,
+    )
+    payload = input_file.read_bytes()
+    (objects / "part.parquet").write_bytes(
+        b"AFOBJ001"
+        + struct.pack("<QI", len(payload), 0)
+        + hashlib.sha256(payload).hexdigest().encode()
+        + payload
+    )
+    server = StandaloneAntflyServer(binary, "127.0.0.1", 0)
+    failed = True
+    try:
+
+        def call(method, path, body=None):
+            response = requests.request(
+                method,
+                server.api_url + path,
+                json=body,
+                auth=("admin", AUTH_BOOTSTRAP_PASSWORD),
+                timeout=120,
+            )
+            assert response.ok, response.text + server.debug_logs()
+            value = response.json()
+            return value["responses"][0] if "responses" in value else value
+
+        call(
+            "POST",
+            "/tables/physical_budget",
+            {
+                "num_shards": 1,
+                "schema": {
+                    "storage_mode": "relational",
+                    "default_type": "doc",
+                    "document_schemas": {
+                        "doc": {
+                            "schema": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "properties": {
+                                    "body": {
+                                        "type": "string",
+                                        "x-antfly-field": {"type": "text"},
+                                    },
+                                    "amount": {
+                                        "type": "integer",
+                                        "x-antfly-field": {
+                                            "type": "number",
+                                            "sortable": True,
+                                        },
+                                    },
+                                },
+                            }
+                        }
+                    },
+                    "base_source": {
+                        "kind": "external",
+                        "table_id": "physical-budget",
+                        "format": "parquet",
+                        "uri": root.as_uri(),
+                    },
+                    "relational_indexes": [
+                        {
+                            "name": "amount_idx",
+                            "keys": [{"column": "amount", "nulls": "first"}],
+                        }
+                    ],
+                },
+                "indexes": {"body_text": {"type": "full_text"}},
+            },
+        )
+        deadline = time.monotonic() + 120
+        while not call("GET", "/tables/physical_budget/indexes/body_text")["status"][
+            "readiness"
+        ]["queryable"]:
+            assert time.monotonic() < deadline, server.debug_logs()
+            time.sleep(0.1)
+        result = call(
+            "POST",
+            "/tables/physical_budget/query",
+            {
+                "full_text_search": {"term": "common", "field": "body"},
+                "fields": ["amount"],
+                "limit": 3,
+                "order_by": [{"field": "amount", "desc": False}],
+                "profile": True,
+            },
+        )
+        assert [hit["_source"]["amount"] for hit in result["hits"]["hits"]] == [
+            0,
+            1,
+            2,
+        ], result
+        profile = result["profile"]["sort"]
+        assert profile["candidate_source"] == "ordered_lake_index_then_text_postings", (
+            result
+        )
+        assert profile["ordered_scanned_count"] <= 1024, result
+        failed = False
+    finally:
+        server.stop(test_failed=failed)
+
+
+def test_native_sparse_metadata_filters_preserve_quantized_scores_and_ranking(tmp_path):
+    """Selective index plans share posting weights with unfiltered search."""
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    root = tmp_path / "source"
+    objects = root / "buckets" / "antfly" / "objects"
+    objects.mkdir(parents=True)
+    data = tmp_path / "source.parquet"
+    pq.write_table(
+        pa.table(
+            {
+                "amount": [0, 1, 2],
+                "sparse_native": [
+                    json.dumps({"1": w, "2": 1e20, "3": -1e20}) for w in (1, 1.1, 100)
+                ],
+            }
+        ),
+        data,
+    )
+    payload = data.read_bytes()
+    (objects / "part.parquet").write_bytes(
+        b"AFOBJ001"
+        + struct.pack("<QI", len(payload), 0)
+        + hashlib.sha256(payload).hexdigest().encode()
+        + payload
+    )
+    server = StandaloneAntflyServer(
+        resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN))),
+        "127.0.0.1",
+        0,
+    )
+    failed = True
+    try:
+
+        def call(method, path, body=None):
+            r = requests.request(
+                method,
+                server.api_url + path,
+                json=body,
+                auth=("admin", AUTH_BOOTSTRAP_PASSWORD),
+                timeout=90,
+            )
+            assert r.ok, r.text + server.debug_logs()
+            v = r.json()
+            return v["responses"][0] if "responses" in v else v
+
+        call(
+            "POST",
+            "/tables/review_sparse",
+            {
+                "num_shards": 1,
+                "schema": {
+                    "storage_mode": "relational",
+                    "default_type": "doc",
+                    "document_schemas": {
+                        "doc": {
+                            "schema": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "properties": {
+                                    "amount": {"type": "integer"},
+                                    "sparse_native": {"type": "string"},
+                                },
+                            }
+                        }
+                    },
+                    "base_source": {
+                        "kind": "external",
+                        "table_id": "review-sparse",
+                        "format": "parquet",
+                        "uri": root.as_uri(),
+                    },
+                    "relational_indexes": [
+                        {"name": "amount_idx", "keys": [{"column": "amount"}]}
+                    ],
+                },
+                "indexes": {
+                    "sparse_native": {
+                        "type": "embeddings",
+                        "external": True,
+                        "sparse": True,
+                    }
+                },
+            },
+        )
+        deadline = time.monotonic() + 90
+        while not call("GET", "/tables/review_sparse/indexes/sparse_native")["status"][
+            "readiness"
+        ]["queryable"]:
+            assert time.monotonic() < deadline
+            time.sleep(0.1)
+        base = {
+            "embeddings": {"sparse_native": {"indices": [1], "values": [1]}},
+            "indexes": ["sparse_native"],
+            "fields": ["amount"],
+            "limit": 3,
+        }
+        all_hits = call("POST", "/tables/review_sparse/query", base)["hits"]["hits"]
+        overflow = requests.post(
+            server.api_url + "/tables/review_sparse/query",
+            json=dict(
+                base,
+                embeddings={
+                    "sparse_native": {
+                        "indices": [2, 3],
+                        "values": [1e20, 1e20],
+                    }
+                },
+            ),
+            auth=("admin", AUTH_BOOTSTRAP_PASSWORD),
+            timeout=90,
+        )
+        assert not overflow.ok, overflow.text
+        # A valid query must still work after rejecting finite-input overflow.
+        assert (
+            call("POST", "/tables/review_sparse/query", base)["hits"]["hits"]
+            == all_hits
+        )
+        selected = call(
+            "POST",
+            "/tables/review_sparse/query",
+            dict(base, filter_query={"term": {"path": "/amount", "value": 1}}),
+        )["hits"]["hits"]
+        original = next(h for h in all_hits if h["_source"]["amount"] == 1)
+        assert original["_score"] == selected[0]["_score"]
+        ranged = call(
+            "POST",
+            "/tables/review_sparse/query",
+            dict(base, filter_query={"range": {"path": "/amount", "gte": 0, "lt": 2}}),
+        )["hits"]["hits"]
+        expected = [h for h in all_hits if h["_source"]["amount"] < 2]
+        assert [(h["_id"], h["_score"]) for h in expected] == [
+            (h["_id"], h["_score"]) for h in ranged
+        ]
+        server.restart()
+        reopened = call(
+            "POST",
+            "/tables/review_sparse/query",
+            dict(base, filter_query={"range": {"path": "/amount", "gte": 0, "lt": 2}}),
+        )["hits"]["hits"]
+        assert [(h["_id"], h["_score"]) for h in ranged] == [
+            (h["_id"], h["_score"]) for h in reopened
+        ]
         failed = False
     finally:
         server.stop(test_failed=failed)

@@ -2308,7 +2308,7 @@ pub fn matchMappingTypeName(value: std.json.Value) ?[]const u8 {
 
 fn inferDynamicTemplateMatchType(value: std.json.Value) ?[]const u8 {
     return switch (value) {
-        .string => |text| if (parseRfc3339ToNs(text) != null or isValidDate(text)) "date" else "string",
+        .string => |text| if (datetime.parseDateTimeToSignedNs(text) != null) "date" else "string",
         .integer, .float, .number_string => "number",
         .bool => "boolean",
         .object => "object",
@@ -2373,9 +2373,9 @@ pub fn fieldTypeAcceptsRuntimeValue(field_type: AntflyType, value: std.json.Valu
         .numeric => jsonNumberIsFinite(value),
         .boolean => value == .bool,
         .datetime => switch (value) {
-            .string => |text| parseDateTimeToNs(text) != null,
-            .integer => |timestamp_ns| timestamp_ns >= 0,
-            .number_string => |timestamp_ns| (std.fmt.parseUnsigned(u64, timestamp_ns, 10) catch null) != null,
+            .string => |text| datetime.parseDateTimeToSignedNs(text) != null,
+            .integer => true,
+            .number_string => |timestamp_ns| (std.fmt.parseInt(i128, timestamp_ns, 10) catch null) != null,
             else => false,
         },
         .geopoint => jsonValueIsMappedGeoPoint(value),

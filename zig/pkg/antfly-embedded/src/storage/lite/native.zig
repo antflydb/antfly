@@ -1820,6 +1820,7 @@ pub const LockMode = enum {
 };
 
 pub const OpenOptions = struct {
+    externally_locked: bool = false,
     /// Owner read-only opens wait for in-place service; primitives default to fail-fast.
     wait_for_reader_lock: bool = false,
     internal_reader: bool = false,
@@ -2483,6 +2484,8 @@ pub const NativeFile = struct {
     path: []u8,
     file: std.Io.File,
     writer_lock_file: ?std.Io.File = null,
+    /// The embedded connection layer holds the path lease around complete calls.
+    externally_locked: bool = false,
     header: Header,
     transaction_header: ?Header = null,
     transaction_writes: ?*TransactionWrites = null,
@@ -2587,13 +2590,13 @@ pub const NativeFile = struct {
         errdefer allocator.free(owned_path);
 
         var writer_lock_file: ?std.Io.File = null;
-        if (!opts.read_only) {
+        if (!opts.read_only and !opts.externally_locked) {
             const writer_lock = try acquireWriterLock(allocator, io, path);
             writer_lock_file = writer_lock.file;
         }
         errdefer if (writer_lock_file) |lock_file| lock_file.close(io);
 
-        const opened_file = try openDataFile(io, path, if (opts.read_only) (if (opts.internal_reader) .internal_reader else .reader) else .writer, opts.wait_for_reader_lock);
+        const opened_file = try openDataFile(io, path, if (opts.read_only) (if (opts.internal_reader or opts.externally_locked) .internal_reader else .reader) else .writer, opts.wait_for_reader_lock);
         const file = opened_file.file;
         errdefer file.close(io);
 
@@ -2610,6 +2613,7 @@ pub const NativeFile = struct {
             .path = owned_path,
             .file = file,
             .writer_lock_file = writer_lock_file,
+            .externally_locked = opts.externally_locked,
             .header = header,
             .read_only = opts.read_only,
             .no_sync = opts.no_sync,
@@ -2747,6 +2751,14 @@ pub const NativeFile = struct {
         };
         if (resource_manager) |manager| result.page_cache.attachResourceManager(manager);
         return result;
+    }
+
+    /// Relinquish lifetime ownership after the embedded connection finishes initialization.
+    /// No mutation may run until its caller holds lockWriterPath again.
+    pub fn releaseWriterOwnership(self: *NativeFile) void {
+        if (self.writer_lock_file) |file| file.close(self.runtime());
+        self.writer_lock_file = null;
+        self.externally_locked = true;
     }
 
     pub fn close(self: *NativeFile) void {
@@ -7780,7 +7792,7 @@ pub const NativeFile = struct {
             self.namespace_directory_delta_depth = 0;
         }
         if (changed) next.commit_sequence = previous.checkpoints[previous.active_checkpoint].commit_sequence + 1;
-        if (!durable and !self.no_sync) {
+        if (!durable and !self.no_sync and !self.externally_locked) {
             defer self.notifyPublication();
             // Keep the last durable checkpoint slots intact until an explicit
             // durability barrier. Readers on this handle see the new roots;
@@ -8210,6 +8222,68 @@ pub fn lockWriterPathWithIo(allocator: Allocator, io: std.Io, path: []const u8) 
     };
 }
 
+/// Read-only embedded calls coordinate with commits without reserving a writer.
+pub fn lockReaderPathWithIo(allocator: Allocator, io: std.Io, path: []const u8) !PathWriterLock {
+    const lock_path = try writerLockPathAlloc(allocator, io, path);
+    defer allocator.free(lock_path);
+    const file = std.Io.Dir.cwd().openFile(io, lock_path, .{
+        .mode = .read_only,
+        .lock = .shared,
+        .lock_nonblocking = true,
+    }) catch |err| switch (err) {
+        error.FileNotFound => blk: {
+            // A distributed snapshot may have no sidecar and live on read-only
+            // media. Every sidecar creator must exclude fallback inode readers,
+            // including a reader installing the sidecar after media changes.
+            var exclusive_inode = true;
+            const data = std.Io.Dir.cwd().openFile(io, path, .{
+                .mode = .read_only,
+                .lock = .exclusive,
+                .lock_nonblocking = true,
+            }) catch |inode_err| switch (inode_err) {
+                error.WouldBlock, error.FileBusy => blk_data: {
+                    exclusive_inode = false;
+                    break :blk_data try std.Io.Dir.cwd().openFile(io, path, .{
+                        .mode = .read_only,
+                        .lock = .shared,
+                        .lock_nonblocking = true,
+                    });
+                },
+                else => return inode_err,
+            };
+            var keep_data = false;
+            defer if (!keep_data) data.close(io);
+            // A writer may have installed the sidecar before our inode fence.
+            if (std.Io.Dir.cwd().openFile(io, lock_path, .{
+                .mode = .read_only,
+                .lock = .shared,
+                .lock_nonblocking = true,
+            })) |existing| break :blk existing else |open_err| {
+                if (open_err != error.FileNotFound) return open_err;
+            }
+            if (!exclusive_inode) {
+                keep_data = true;
+                break :blk data;
+            }
+            break :blk std.Io.Dir.cwd().createFile(io, lock_path, .{
+                .read = true,
+                .truncate = false,
+                .lock = .shared,
+                .lock_nonblocking = true,
+            }) catch |create_err| switch (create_err) {
+                error.AccessDenied, error.ReadOnlyFileSystem => {
+                    try data.lock(io, .shared);
+                    keep_data = true;
+                    break :blk data;
+                },
+                else => return create_err,
+            };
+        },
+        else => return err,
+    };
+    return .{ .io_impl = undefined, .borrowed_io = io, .file = file };
+}
+
 fn openDataFile(io: std.Io, path: []const u8, lock_mode: LockMode, wait_for_reader_lock: bool) !LockFile {
     const file = std.Io.Dir.cwd().openFile(io, path, .{
         .mode = if (lock_mode != .writer) .read_only else .read_write,
@@ -8243,6 +8317,25 @@ fn createDataFile(io: std.Io, path: []const u8, opts: CreateDataFileOptions) !st
 fn acquireWriterLock(allocator: Allocator, io: std.Io, path: []const u8) !LockFile {
     const lock_path = try writerLockPathAlloc(allocator, io, path);
     defer allocator.free(lock_path);
+    if (std.Io.Dir.cwd().openFile(io, lock_path, .{
+        .mode = .read_write,
+        .lock = .exclusive,
+        .lock_nonblocking = true,
+    })) |existing| return .{ .file = existing } else |err| {
+        if (err != error.FileNotFound) return err;
+    }
+    // Readers of sidecar-free snapshots hold this inode shared. Exclude them
+    // before installing the sidecar so switching lock authorities cannot race
+    // a reader's header/catalog capture, even if directory permissions change.
+    const data = std.Io.Dir.cwd().openFile(io, path, .{
+        .mode = .read_only,
+        .lock = .exclusive,
+        .lock_nonblocking = true,
+    }) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => return err,
+    };
+    defer if (data) |held| held.close(io);
     const file = std.Io.Dir.cwd().createFile(io, lock_path, .{
         .read = true,
         .truncate = false,
@@ -8290,7 +8383,7 @@ fn pathsReferToSameExistingFile(allocator: Allocator, io: std.Io, a: []const u8,
     return std.mem.eql(u8, a_real, b_real);
 }
 
-fn realPathAlloc(allocator: Allocator, io: std.Io, path: []const u8) ![:0]u8 {
+pub fn realPathAlloc(allocator: Allocator, io: std.Io, path: []const u8) ![:0]u8 {
     if (std.fs.path.isAbsolute(path)) {
         return try std.Io.Dir.realPathFileAbsoluteAlloc(io, path, allocator);
     }

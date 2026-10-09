@@ -2554,6 +2554,7 @@ pub const HealthSource = struct {
             try health_metrics.appendPromMetric(writer, "antfly_http_hard_disconnect_cancellations_total", "counter", "Public requests cancelled after a hard transport failure", http.peer_disconnects_total);
             try health_metrics.appendPromMetric(writer, "antfly_http_active_peer_observers", "gauge", "Public request sockets registered for hard-disconnect observation", http.active_peer_observers);
         }
+        try antfly.common.prometheus.appendLakeCacheMetrics(writer, api_request_stats.lake_range_cache, api_request_stats.lake_disk_cache);
         try health_metrics.appendPromMetric(writer, "antfly_query_embedding_cache_hits_total", "counter", "Query embedding cache hits", api_request_stats.query_embedding_cache.hits);
         try health_metrics.appendPromMetric(writer, "antfly_query_embedding_cache_misses_total", "counter", "Query embedding cache producer misses", api_request_stats.query_embedding_cache.misses);
         try health_metrics.appendPromMetric(writer, "antfly_query_embedding_cache_coalesced_waiters_total", "counter", "Query embedding requests coalesced behind an in-flight producer", api_request_stats.query_embedding_cache.coalesced_waiters);

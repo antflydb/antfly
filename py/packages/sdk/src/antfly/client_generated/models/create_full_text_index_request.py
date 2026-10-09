@@ -27,6 +27,10 @@ class CreateFullTextIndexRequest:
         description (str | Unset): Optional description of the index and its purpose
         version (int | Unset): Version of the index implementation. Defaults to 0. Default: 0.
         enrichments (list[EnrichmentConfig] | Unset): Inline managed enrichment definitions required by this index.
+        store_source (bool | Unset): Opt in to retaining the indexed source projection in serverless full-text sidecars
+            for cold highlighting. With field set, only that field is retained; otherwise the index source projection is
+            retained. Increases index storage and build work. Omit or set false to hydrate highlights from the source table.
+            Provisioned indexes already retain source independently. Default: False.
         sources (list[FullTextArtifactIndexSource] | Unset): Chunk or textual asset streams indexed together; every
             artifact record is an independent full-text member. A source-local field overrides the shared index-level field
             for that stream. Artifact names must be unique. Requires index_capabilities.artifact_sources=true and is
@@ -72,6 +76,7 @@ class CreateFullTextIndexRequest:
     description: str | Unset = UNSET
     version: int | Unset = 0
     enrichments: list[EnrichmentConfig] | Unset = UNSET
+    store_source: bool | Unset = False
     sources: list[FullTextArtifactIndexSource] | Unset = UNSET
     mem_only: bool | Unset = UNSET
     field: str | Unset = UNSET
@@ -92,6 +97,8 @@ class CreateFullTextIndexRequest:
             for enrichments_item_data in self.enrichments:
                 enrichments_item = enrichments_item_data.to_dict()
                 enrichments.append(enrichments_item)
+
+        store_source = self.store_source
 
         sources: list[dict[str, Any]] | Unset = UNSET
         if not isinstance(self.sources, Unset):
@@ -123,6 +130,8 @@ class CreateFullTextIndexRequest:
             field_dict["version"] = version
         if enrichments is not UNSET:
             field_dict["enrichments"] = enrichments
+        if store_source is not UNSET:
+            field_dict["store_source"] = store_source
         if sources is not UNSET:
             field_dict["sources"] = sources
         if mem_only is not UNSET:
@@ -158,6 +167,8 @@ class CreateFullTextIndexRequest:
 
                 enrichments.append(enrichments_item)
 
+        store_source = d.pop("store_source", UNSET)
+
         _sources = d.pop("sources", UNSET)
         sources: list[FullTextArtifactIndexSource] | Unset = UNSET
         if _sources is not UNSET:
@@ -185,6 +196,7 @@ class CreateFullTextIndexRequest:
             description=description,
             version=version,
             enrichments=enrichments,
+            store_source=store_source,
             sources=sources,
             mem_only=mem_only,
             field=field,

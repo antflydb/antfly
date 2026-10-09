@@ -69,7 +69,9 @@ pub const ObjectStorageRangeReader = struct {
         });
         defer result.deinit(alloc);
         if (result.body.len != len) return error.InvalidLakeRangeRead;
-        return try alloc.dupe(u8, result.body);
+        const bytes = result.body;
+        result.body = &.{};
+        return bytes;
     }
 
     fn readPlannedRangeAlloc(
@@ -93,7 +95,11 @@ pub const ObjectStorageRangeReader = struct {
         if (result.body.len != len) return error.InvalidLakeRangeRead;
         try validatePlannedObjectMetadata(read, result.metadata, result.conditional_etag_verified);
         try validatePlannedObjectChecksum(read, result.metadata, result.body);
-        return try alloc.dupe(u8, result.body);
+        // GetResult owns this allocation independently of its metadata. Move
+        // it after verification instead of copying each cold response again.
+        const bytes = result.body;
+        result.body = &.{};
+        return bytes;
     }
 
     fn getObjectWithRetry(
@@ -566,13 +572,14 @@ test "lake object storage range reader validates full object checksums" {
     try std.testing.expectError(error.PreconditionFailed, mismatched_scoped_reader.parquetReader().readPlannedAlloc(alloc, partial_read));
 }
 
-test "object storage range reader retries transient planned reads only" {
+test "lake object storage range reader retries transient planned reads without copying the response" {
     const alloc = std.testing.allocator;
     const FlakyObjectStorage = struct {
         body: []const u8,
         fail_count: usize,
         get_attempts: usize = 0,
         last_if_match: ?[]const u8 = null,
+        last_body: usize = 0,
 
         fn client(self: *@This()) object_storage.ObjectStorage {
             return .{
@@ -610,8 +617,10 @@ test "object storage range reader retries transient planned reads only" {
             const start: usize = std.math.cast(usize, range.offset) orelse return error.InvalidLakeRangeRead;
             const read_len: usize = std.math.cast(usize, len) orelse return error.InvalidLakeRangeRead;
             if (start > self.body.len or read_len > self.body.len - start) return error.InvalidRange;
+            const body = try a.dupe(u8, self.body[start..][0..read_len]);
+            self.last_body = @intFromPtr(body.ptr);
             return .{
-                .body = try a.dupe(u8, self.body[start..][0..read_len]),
+                .body = body,
                 .metadata = .{
                     .bucket = try a.dupe(u8, bucket),
                     .key = try a.dupe(u8, key),
@@ -658,6 +667,7 @@ test "object storage range reader retries transient planned reads only" {
     defer alloc.free(bytes);
     try std.testing.expectEqualStrings("456789", bytes);
     try std.testing.expectEqual(@as(usize, 3), flaky.get_attempts);
+    try std.testing.expectEqual(flaky.last_body, @intFromPtr(bytes.ptr));
     try std.testing.expectEqualStrings("etag-a", flaky.last_if_match.?);
 
     flaky.fail_count = 10;

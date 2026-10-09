@@ -63,7 +63,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         if (wanted.kind != .sparse_segment) continue;
         try provider.context.ensureActive();
         var binding = wanted.binding;
-        binding.index_config_hash = try std.fmt.allocPrint(ca, "native-sparse-checkpoint-v2:{s}", .{binding.index_config_hash});
+        binding.index_config_hash = try std.fmt.allocPrint(ca, "native-sparse-checkpoint-v8:{s}", .{binding.index_config_hash});
         const public_config = try std.json.Stringify.valueAlloc(ca, configs.object.get(wanted.name) orelse return error.InvalidTableIndexMetadata, .{});
         const recipe = state.recipe(table, public_config);
         var producer = try @import("lake_vector_enrichment.zig").Producer.init(a, wanted.name, wanted.build_spec.?.sparse.sparse_column, configs.object.get(wanted.name).?, provider.embedding_options);

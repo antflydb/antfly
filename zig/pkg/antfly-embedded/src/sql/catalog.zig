@@ -111,6 +111,7 @@ pub const Scan = struct {
     /// Snapshot-bound remote candidates. null means a full scan; an empty
     /// slice means no rows. Consumers retain ranking separately from physical
     /// hydration order. The lake cursor owns and validates the selection.
+    physical_selection: ?@import("../serverless/query/lake_row_selection.zig").Selection = null,
     row_refs: ?[]const @import("../storage/rowsource/types.zig").RowRef = null,
     /// Require a READY schema-bound index. Unlike auto_index this must fail
     /// closed; the coordinated owner read returns one exact-span proof.

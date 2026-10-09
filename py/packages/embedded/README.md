@@ -219,18 +219,18 @@ format, not JSON, and always return raw `bytes`.
 A `Database` is safe for concurrent use by multiple threads; share one
 handle rather than opening one per thread. `libantfly` runs in serialized
 threading mode (`antfly_embedded.threading_mode() ==
-antfly_embedded.THREADING_SERIALIZED`): reads such as `search()`, `lookup()`,
-and `scan()` run in parallel with each other and with writes, `batch()` and
-transaction calls on one handle queue instead of failing with `BusyError`,
-and schema or index changes wait for in-flight calls. `close()` waits for
+antfly_embedded.THREADING_SERIALIZED`). Lite calls queue on a connection and
+coordinate with other connections to the file. Streaming SQL cursors retain
+their original snapshots while other connections publish new commits. Schema
+or index changes wait for in-flight calls. `close()` waits for
 in-flight calls on other threads to finish; calls made after `close()`
 raise `InvalidArgumentError`. See `zig/CAPI.md`'s "Thread Safety" section
 for the full C ABI contract.
 
-Only one writer handle may be open per file at a time, across processes.
-Pass `busy_timeout=<seconds or datetime.timedelta>` to `create()`/`open()`
-to wait for another writer to close instead of failing immediately with
-`BusyError`, like `sqlite3_busy_timeout`.
+Multiple writable Lite connections may remain open, including across processes.
+Native operations queue within a process and take a kernel writer lease across
+processes. Pass `busy_timeout=<seconds or datetime.timedelta>` to `create()`/`open()`
+to wait for a competing operation. Closing one connection leaves others usable.
 
 ## Graph edges and index readiness
 
@@ -331,3 +331,44 @@ Tests that need `libantfly` skip cleanly when it cannot be found, unless
 `tests/test_conformance.py` runs every case in
 `zig/pkg/antfly-embedded/capi-conformance/cases/*.json` through this public API, the
 same declarative cases the Go and Rust bindings run.
+
+## SQL and multiple tables
+
+The PEP 249 interface provides independent connections, native streaming
+cursors, positional `:1`, `:2`, … parameters (also accepting native `$1` syntax), and SQLSTATE-bearing exceptions:
+
+```python
+from antfly_embedded import dbapi
+
+connection = dbapi.connect("app.aflite")
+cursor = connection.cursor()
+cursor.execute("CREATE TABLE people (id BIGINT PRIMARY KEY, name TEXT)")
+cursor.execute("INSERT INTO people (id,name) VALUES (:1,:2)", (1, "Ada"))
+connection.commit()
+for row in cursor.execute("SELECT id,name FROM people"):
+    print(row)
+connection.close()
+```
+
+Connections own independent native handles and use READ COMMITTED transactions.
+By default, the first data statement starts a transaction; `commit()` and
+`rollback()` finish it. `autocommit=True` executes statements independently.
+DDL outside an active transaction commits immediately. Closing a connection
+discards its staged writes. `fetchmany`, `fetchall`, and iteration read every
+cursor page, including queries longer than 128 rows. Integers preserve all
+signed 64 bits. SQL NULL maps to `None`; JSON maps to Python values.
+
+`Database.create_table`, `list_tables`, `open_table`, and `drop_table` expose
+the same catalog for document workloads. Table handles reuse all existing
+document, schema, index, enrichment, and search methods. Close them before
+dropping a table; database close invalidates them.
+
+Portable `.afb` archives back up the entire database: its table catalog,
+schemas, documents, indexes, enrichments, and constraint records. Call backup
+on the database handle. Restore publishes all tables together into either
+Lite or directory storage; import requires an empty database with no open
+table handles, SQL sessions, or cursors. Table handles cannot export or import
+backups.
+
+See [the native SQL contract](../../../zig/CAPI.md#database-sql) for
+savepoints, supported isolation, and unknown commit outcomes.

@@ -57,8 +57,8 @@ def create_fixture(models_dir: Path) -> str:
     }
     manifest = {
         "type": "classifier",
-        "tasks": ["extract", "decide"],
-        "capabilities": ["classification", "typed_decisions"],
+        "tasks": ["decide"],
+        "capabilities": ["typed_decisions"],
         "inputs": ["text"],
     }
     vocabulary = {

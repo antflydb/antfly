@@ -3,6 +3,7 @@ from pathlib import Path
 import pytest
 
 from fix_generated_client import (
+    EMBED_REQUEST,
     FILES,
     NDJSON_HEADER,
     NDJSON_RESPONSE,
@@ -28,6 +29,15 @@ def write_generated_files(root: Path, signature_count: int) -> None:
             "response = client.get_httpx_client().request(**kwargs)\n"
             "response = await client.get_async_httpx_client().request(**kwargs)\n"
         )
+    path = root / EMBED_REQUEST
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "        input_: list[str] | str\n"
+        + "        if isinstance(self.input_, list):\n" * 3
+        + "        model_identity = self.model_identity\n"
+        + "                input_type_1 = cast(list[str], data)\n"
+        + "            return cast(\n"
+    )
 
 
 def test_required_ndjson_body_is_not_made_optional(tmp_path: Path) -> None:

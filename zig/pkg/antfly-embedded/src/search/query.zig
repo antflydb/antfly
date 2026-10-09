@@ -202,7 +202,7 @@ pub const BoolFilter = struct {
 
         // Process must clauses (AND)
         for (self.must) |clause| {
-            var clause_bm = try clause.executeWithOffset(alloc, seg, doc_offset);
+            var clause_bm = if (clause == .doc_num) try clause.doc_num.refine(alloc, seg, doc_offset, if (result) |*r| r else null) else try clause.executeWithOffset(alloc, seg, doc_offset);
             if (result) |*r| {
                 r.andWith(&clause_bm);
                 clause_bm.deinit();
@@ -233,7 +233,7 @@ pub const BoolFilter = struct {
 
         // Process must_not clauses (ANDNOT)
         for (self.must_not) |clause| {
-            var clause_bm = try clause.executeWithOffset(alloc, seg, doc_offset);
+            var clause_bm = if (clause == .doc_num) try clause.doc_num.refine(alloc, seg, doc_offset, &result.?) else try clause.executeWithOffset(alloc, seg, doc_offset);
             defer clause_bm.deinit();
             result.?.andNotWith(&clause_bm);
         }
@@ -1569,8 +1569,8 @@ fn collectFuzzyCandidateTerms(
 /// Start/end are unix nanoseconds (caller parses ISO8601 before constructing).
 pub const DateRangeFilter = struct {
     field: []const u8,
-    start_ns: ?u64 = null,
-    end_ns: ?u64 = null,
+    start_ns: ?i128 = null,
+    end_ns: ?i128 = null,
     inclusive_start: bool = true,
     inclusive_end: bool = false,
     boost: f32 = 1.0,
@@ -1582,13 +1582,13 @@ pub const DateRangeFilter = struct {
         var result = roaring.RoaringBitmap.init(alloc);
         errdefer result.deinit();
 
-        if (reader.value_type != .u64_val) return result;
+        if (reader.value_type != .u64_val and reader.value_type != .datetime_ns) return result;
         var cursor = typed_dv.TypedDocValuesReader.Cursor.init(&reader);
         defer cursor.deinit();
         while (try cursor.next()) |entry| {
             if (entry.doc_id >= seg.reader.doc_count) return error.InvalidSegment;
             const doc_id = entry.doc_id;
-            const val = @as(?@TypeOf(entry.value.u64_val), entry.value.u64_val);
+            const val: ?i128 = if (entry.value == .datetime_ns) entry.value.datetime_ns else entry.value.u64_val;
             if (val) |v| {
                 const above_start = if (self.start_ns) |s|
                     (if (self.inclusive_start) v >= s else v > s)
@@ -1725,23 +1725,37 @@ pub const DocIdFilter = struct {
     }
 };
 
+/// Request-owned exact membership producer. A required Boolean clause may
+/// supply its already-matched local candidates; the producer returns only
+/// matching local ordinals in an owned bitmap. Its owner outlives every
+/// synchronous filter pass.
+pub const DocNumProducer = struct {
+    ptr: *anyopaque,
+    produce: *const fn (*anyopaque, Allocator, u32, u32, ?*const roaring.RoaringBitmap) anyerror!roaring.RoaringBitmap,
+};
+
 /// Global numeric document filter: matches documents by snapshot-global doc ID.
 pub const DocNumFilter = struct {
     doc_nums: []const u32,
     bitmap: ?*const roaring.RoaringBitmap = null,
+    producer: ?DocNumProducer = null,
 
     pub fn executeWithOffset(self: DocNumFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry, doc_offset: u32) FilterError!roaring.RoaringBitmap {
+        return self.refine(alloc, seg, doc_offset, null);
+    }
+    pub fn refine(self: DocNumFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry, doc_offset: u32, candidates: ?*const roaring.RoaringBitmap) FilterError!roaring.RoaringBitmap {
+        if (self.producer) |producer| {
+            if (self.bitmap != null or self.doc_nums.len != 0) return error.InvalidArgument;
+            return producer.produce(producer.ptr, alloc, doc_offset, seg.reader.doc_count, candidates);
+        }
         var result = roaring.RoaringBitmap.init(alloc);
         errdefer result.deinit();
 
         const upper = doc_offset + seg.reader.doc_count;
         if (self.bitmap) |bitmap| {
-            var it = bitmap.iterator();
-            it.seek(doc_offset);
-            while (it.next()) |doc_num| {
-                if (doc_num >= upper) break;
-                if (doc_num >= doc_offset) try result.add(doc_num - doc_offset);
-            }
+            result.deinit();
+            result = roaring.RoaringBitmap.init(alloc);
+            result = try bitmap.sliceRebased(alloc, doc_offset, upper);
         }
         for (self.doc_nums) |doc_num| {
             if (doc_num < doc_offset or doc_num >= upper) continue;
@@ -1879,10 +1893,10 @@ pub fn countFilterIntersection(
 
         const next_offset = std.math.add(u32, doc_offset, seg.reader.doc_count) catch
             return error.CountOverflow;
-        var shifted = try local.addOffset(doc_offset);
-        defer shifted.deinit();
-        shifted.andWith(global_docs);
-        total = std.math.add(usize, total, shifted.cardinality()) catch return error.CountOverflow;
+        var selected = try global_docs.sliceRebased(alloc, doc_offset, next_offset);
+        defer selected.deinit();
+        local.andWith(&selected);
+        total = std.math.add(usize, total, local.cardinality()) catch return error.CountOverflow;
         doc_offset = next_offset;
     }
     return total;
@@ -1902,6 +1916,16 @@ pub fn countFilter(
     var total: usize = 0;
     var doc_offset: u32 = 0;
     for (snap.segments) |*seg| {
+        const next_offset = std.math.add(u32, doc_offset, seg.reader.doc_count) catch return error.CountOverflow;
+        if (filter == .doc_num and filter.doc_num.bitmap != null and filter.doc_num.producer == null and filter.doc_num.doc_nums.len == 0) {
+            seg.shared.lockDeletionShared();
+            defer seg.shared.unlockDeletionShared();
+            if (seg.shared.deleted == null) {
+                total = std.math.add(usize, total, filter.doc_num.bitmap.?.rangeCardinality(doc_offset, next_offset)) catch return error.CountOverflow;
+                doc_offset = next_offset;
+                continue;
+            }
+        }
         var bm = try filter.executeWithOffset(alloc, seg, doc_offset);
         defer bm.deinit();
 

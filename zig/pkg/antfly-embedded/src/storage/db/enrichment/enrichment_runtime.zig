@@ -7189,7 +7189,19 @@ fn runForegroundCatchUpPassOwned(
     runtime.mutex.unlock(io);
     if (already_failed) return;
     try scavengeSharedPdfConsumerAttempts(runtime);
-    const pending = try enrichment_worker.collectPendingDocumentGroups(runtime.alloc, runtime.replay_source, runtime.applied_sequence);
+    // A worker pass checkpoints a complete bounded prefix. Rebuilding and
+    // sorting the full remaining corpus on every retry makes discovery cost
+    // grow with ingestion backlog instead of the work this pass can publish.
+    // Cap distinct work at 128 documents while letting repeated updates
+    // coalesce across up to 4096 records before paying for another checkpoint.
+    // The byte limit also bounds discovery of large repeated-update records;
+    // one complete record may exceed either soft limit.
+    const replay_window = try runtime.replay_source.collectEnrichmentDocumentGroupsWindow(runtime.alloc, runtime.applied_sequence, .{
+        .max_records = 4096,
+        .max_document_groups = 128,
+        .max_input_bytes = 4 * 1024 * 1024,
+    });
+    const pending = replay_window.groups;
     defer enrichment_worker.freePendingDocumentGroups(runtime.alloc, pending);
     var replay_cursor_assets = try loadReplayCursorForPass(runtime, runtime.applied_sequence, .assets);
     defer if (replay_cursor_assets) |*cursor| cursor.deinit(runtime.alloc);
@@ -7213,9 +7225,10 @@ fn runForegroundCatchUpPassOwned(
     };
     try drain_result;
     try replay_lease_guard.check();
-    if (pending.len == 0) {
-        max_seen = target_sequence;
-    }
+    // Empty records still consume a bounded window. Advance only through the
+    // scanned prefix; an empty group list does not prove the tail is empty.
+    max_seen = @max(max_seen, replay_window.last_sequence);
+    if (pending.len == 0 and replay_window.last_sequence == 0) max_seen = target_sequence;
 
     if (max_seen > runtime.applied_sequence) {
         setActiveFailureFingerprint(runtime, 0);
@@ -11492,6 +11505,13 @@ pub fn servicePendingArtifactUnitJobs(runtime: *EnrichmentRuntime, document: []c
     const store = runtime.artifact_store orelse return;
     if (runtime.config.root_incarnation == 0) return;
     const unit_jobs = @import("../artifact_unit_jobs.zig");
+    {
+        // Most documents have no unit outbox. Check absence with point reads
+        // before acquiring a cursor-capable primary snapshot.
+        var probe = try store.beginProbeTxnWithBlockCacheAdmission(.transient);
+        defer probe.abort();
+        if (!try unit_jobs.documentMayHaveJobs(&probe, runtime.config.root_incarnation, document)) return;
+    }
     var budget = if (runtime.config.resource_manager orelse runtime.index_manager.resource_manager) |manager|
         resource_manager_mod.BudgetedAllocator.init(manager, .document_extraction_working_set, runtime.alloc, 1)
     else
@@ -30774,9 +30794,14 @@ const AllocatedStoreReader = struct {
     alloc: Allocator,
 
     pub fn read(self: *@This(), key: []const u8) ![]u8 {
-        var txn = try self.runtime.store.beginRead();
+        // This read returns one owned value and needs no transaction-wide
+        // snapshot. A short point lease avoids retaining a full read view
+        // while copying the source value for the caller.
+        var txn = try self.runtime.store.beginProbe();
         defer txn.abort();
-        return self.alloc.dupe(u8, try txn.get(key));
+        // The lease ends after the owned copy. Ordinary probe gets already
+        // copy values, which would duplicate large source documents twice.
+        return self.alloc.dupe(u8, try txn.getLeased(key));
     }
 
     fn readDocument(self: *@This(), key: []const u8) ![]u8 {
@@ -30786,6 +30811,66 @@ const AllocatedStoreReader = struct {
         return try self.runtime.index_manager.materializeStoredValueAlloc(self.alloc, key, raw);
     }
 };
+
+test "enrichment point reads avoid mutable backlog snapshots and return owned current values" {
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
+    const lsm = @import("../../lsm_backend.zig");
+    var backend = lsm.Backend.init(alloc, .{ .read_snapshot_rotate_mutable_bytes = std.math.maxInt(usize) });
+    defer backend.close();
+    var store = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    defer store.deinit();
+    var document_store = try @import("../../docstore.zig").DocStore.openRuntime(alloc, &store);
+    defer document_store.close();
+    {
+        var write = try store.beginWrite();
+        for (0..512) |i| {
+            var key_buf: [32]u8 = undefined;
+            const key = try std.fmt.bufPrint(&key_buf, "doc:{d}", .{i});
+            try write.put(key, "original");
+        }
+        try write.commit();
+    }
+    var runtime = EnrichmentRuntime{
+        .alloc = alloc,
+        .store = store,
+        .artifact_store = &document_store,
+        .io_impl = null,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = undefined,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{ .root_incarnation = 1 },
+        .ownership = undefined,
+    };
+    var reader = AllocatedStoreReader{ .runtime = &runtime, .alloc = alloc };
+    const before = backend.snapshotMaintenanceStats().mutable_snapshot_clone_calls;
+    const before_read = backend.snapshotReadStats();
+    const owned = try reader.read("doc:0");
+    defer alloc.free(owned);
+    const after_read = backend.snapshotReadStats();
+    try std.testing.expectEqual(before_read.point_value_copies, after_read.point_value_copies);
+    try std.testing.expectEqual(before_read.point_value_borrows + 1, after_read.point_value_borrows);
+    {
+        var write = try store.beginWrite();
+        try write.put("doc:0", "updated");
+        try write.commit();
+    }
+    for (0..32) |_| {
+        try servicePendingArtifactUnitJobs(&runtime, "doc:0", .{});
+        const current = try reader.read("doc:0");
+        defer alloc.free(current);
+        try std.testing.expectEqualStrings("updated", current);
+    }
+    try std.testing.expectEqualStrings("original", owned);
+    try std.testing.expectError(error.NotFound, reader.read("missing"));
+    try std.testing.expectEqual(before, backend.snapshotMaintenanceStats().mutable_snapshot_clone_calls);
+}
 
 fn storeGetAlloc(runtime: anytype, key: []const u8) ![]u8 {
     if (comptime @hasDecl(@typeInfo(@TypeOf(runtime)).pointer.child, "getAlloc")) return runtime.getAlloc(key);

@@ -5934,26 +5934,11 @@ pub const CivilDate = struct {
     day: i64,
 };
 
-pub fn formatRfc3339Ns(alloc: std.mem.Allocator, value_ns: u64) ![]u8 {
-    const secs_total: u64 = @divFloor(value_ns, std.time.ns_per_s);
-    const nanos: u64 = @mod(value_ns, std.time.ns_per_s);
-    const days: i64 = @intCast(@divFloor(secs_total, 86_400));
-    const secs_of_day: u64 = @mod(secs_total, 86_400);
-    const date = civilFromDays(days);
-    const year: u64 = @intCast(date.year);
-    const month: u64 = @intCast(date.month);
-    const day: u64 = @intCast(date.day);
-    const hour: u64 = secs_of_day / 3_600;
-    const minute: u64 = (secs_of_day % 3_600) / 60;
-    const second: u64 = secs_of_day % 60;
-    if (nanos == 0) {
-        return try std.fmt.allocPrint(alloc, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z", .{
-            year, month, day, hour, minute, second,
-        });
-    }
-    return try std.fmt.allocPrint(alloc, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}.{d:0>9}Z", .{
-        year, month, day, hour, minute, second, nanos,
-    });
+pub fn formatRfc3339Ns(alloc: std.mem.Allocator, value_ns: i128) ![]u8 {
+    const text = try @import("../datetime.zig").formatDateTimeSignedNsAlloc(alloc, value_ns);
+    if (@mod(value_ns, std.time.ns_per_s) != 0) return text;
+    defer alloc.free(text);
+    return try std.fmt.allocPrint(alloc, "{s}Z", .{text[0..19]});
 }
 
 pub fn civilFromDays(days_since_epoch: i64) CivilDate {

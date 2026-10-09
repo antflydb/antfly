@@ -30,6 +30,35 @@ const A = std.mem.Allocator;
 pub const metadata_version: u16 = 8;
 pub const max_root_bytes = 4 * 1024 * 1024;
 pub const max_segments = 262144;
+/// Source duplication is an explicit per-index policy. The complete config
+/// participates in the recipe and binding hash, fencing old artifacts.
+pub fn storesSource(config: std.json.Value) !bool {
+    if (config != .object) return error.InvalidNativeLakeTextCorpus;
+    const value = config.object.get("store_source") orelse return false;
+    if (value != .bool) return error.InvalidNativeLakeTextCorpus;
+    return value.bool;
+}
+/// Older builders may have accepted unknown config fields while still
+/// omitting source. A distinct authenticated recipe attests actual production,
+/// without changing the native format or invalidating source-free artifacts.
+pub fn sourceRecipe(table: local.common_topology_records.TableRecord, config: []const u8, store_source: bool) [32]u8 {
+    const original = state.recipe(table, config);
+    if (!store_source) return original;
+    var hash = std.crypto.hash.Blake3.init(.{});
+    hash.update("native-lake-text-stored-source-v1");
+    hash.update(&original);
+    var digest: [32]u8 = undefined;
+    hash.final(&digest);
+    return digest;
+}
+
+test "external lake stored source recipe attests production without changing source free identity" {
+    const table: local.common_topology_records.TableRecord = .{ .table_id = 7, .name = "lake", .schema_json = "schema" };
+    const config = "{\"store_source\":true}";
+    const old = state.recipe(table, config);
+    try std.testing.expectEqual(old, sourceRecipe(table, config, false));
+    try std.testing.expect(!std.mem.eql(u8, &old, &sourceRecipe(table, config, true)));
+}
 pub const physical = @import("lake_index_physical_ordinals.zig");
 pub const FileGroup = struct {
     file: state.File,
@@ -241,6 +270,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         defer arena.deinit();
         const ca = arena.allocator();
         const config = try std.json.parseFromSliceLeaky(std.json.Value, ca, spec.config_json, .{});
+        const store_source = try storesSource(config);
         const selected_field: ?[]const u8 = if (config.object.get("field")) |field| if (field == .string) field.string else null else null;
         var binding = want.binding;
         if (selected_field == null) {
@@ -249,7 +279,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             binding.column_bindings = paths;
         }
         binding.index_config_hash = try std.fmt.allocPrint(ca, "native-text-corpus-v6:{s}", .{want.binding.index_config_hash});
-        const recipe = state.recipe(table, spec.config_json);
+        const recipe = sourceRecipe(table, spec.config_json, store_source);
         const prior = for (reusable) |declaration| {
             if (declaration.artifact.kind == .text_segment and declaration.artifact.metadata_version == metadata_version and std.mem.eql(u8, declaration.name, want.name) and rebuild.bindingsEqual(declaration.binding, binding)) break declaration;
         } else null;
@@ -324,20 +354,21 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
                     previous_id = id[0..96].*;
                     input_bytes +|= id.len + 128;
                     const before = builder.batch().docs.len;
-                    try builder.appendSourceDoc(.{ .key = id, .root = root, .stored_data = "", .typed_source = null });
+                    const stored_data = if (store_source) try std.json.Stringify.valueAlloc(ba, root, .{}) else "";
+                    try builder.appendSourceDoc(.{ .key = id, .root = root, .stored_data = stored_data, .typed_source = null });
                     if (builder.batch().docs.len != before) {
                         if (ref != .external) return error.InvalidNativeLakeTextCorpus;
                         try ordinals.add(ref.external.row_group_ordinal, ref.external.row_ordinal);
                     }
                     if (builder.batch().docs.len >= 65536 or input_bytes >= 8 * 1024 * 1024 or batch_arena.queryCapacity() >= 24 * 1024 * 1024) {
-                        try flush(a, ca, store, builder.batch(), analysis, &segments, cancellation);
+                        try flush(a, ca, store, builder.batch(), analysis, &segments, cancellation, store_source);
                         _ = batch_arena.reset(.free_all);
                         builder = mapper.TextProjectionBatchBuilder.initWithSelectedField(batch_arena.allocator(), analysis, runtime, null, selected_field);
                         input_bytes = 0;
                     }
                 }
             }
-            try flush(a, ca, store, builder.batch(), analysis, &segments, cancellation);
+            try flush(a, ca, store, builder.batch(), analysis, &segments, cancellation, store_source);
             try ordinals.flush();
             group.rows = ordinals.blocks.items;
             group.segments = try ca.dupe(artifacts.ChunkRef, segments.items[first_segment..]);
@@ -374,14 +405,14 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
     }
     return declarations.toOwnedSlice(out);
 }
-fn flush(a: A, out: A, store: *stores.ArtifactStore, batch: mapper.TextProjectionBatch, analysis: local.introducer.TextAnalysisConfig, segments: *std.ArrayList(artifacts.ChunkRef), cancellation: Cancellation) !void {
+fn flush(a: A, out: A, store: *stores.ArtifactStore, batch: mapper.TextProjectionBatch, analysis: local.introducer.TextAnalysisConfig, segments: *std.ArrayList(artifacts.ChunkRef), cancellation: Cancellation, store_source: bool) !void {
     try cancellation.check();
     // Version 8 attests ascending producer identities inside each file group.
     // Segment construction preserves input order; the predicate consumer may seek.
     for (batch.docs, 0..) |doc, i| {
         if (i != 0 and std.mem.order(u8, batch.docs[i - 1].id, doc.id) != .lt) return error.InvalidNativeLakeTextCorpus;
     }
-    const encoded = try mapper.buildTextSegmentsFromProjectionBatch(a, batch, analysis, .{ .target_segment_bytes = 8 * 1024 * 1024, .target_build_memory_bytes = 32 * 1024 * 1024, .store_document_source = false });
+    const encoded = try mapper.buildTextSegmentsFromProjectionBatch(a, batch, analysis, .{ .target_segment_bytes = 8 * 1024 * 1024, .target_build_memory_bytes = 32 * 1024 * 1024, .store_document_source = store_source });
     defer mapper.freeTextSegments(a, encoded);
     for (encoded) |bytes| {
         try cancellation.check();

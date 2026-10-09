@@ -1452,8 +1452,8 @@ test "Lite raw rows fail closed during row-policy owner transition" {
     try std.testing.expectEqual(capi.ErrorCode.unsupported, antfly_db_lookup_json(handle_ptr, .fromSlice("a"), &out));
     try std.testing.expectEqual(capi.ErrorCode.unsupported, antfly_db_get_raw(handle_ptr, .fromSlice("a"), &out));
     try std.testing.expectEqual(capi.ErrorCode.unsupported, antfly_db_scan_json(handle_ptr, .fromSlice("{}"), &out));
-    try std.testing.expectEqual(capi.ErrorCode.unsupported, antfly_db_sql_json(handle_ptr, .fromSlice("items"), .fromSlice("{\"statement\":\"SELECT 1\"}"), &out));
-    try std.testing.expectEqual(capi.ErrorCode.unsupported, antfly_db_sql_json(handle_ptr, .fromSlice("items"), .fromSlice("{\"statement\":\"CREATE TABLE blocked (id INT)\"}"), &out));
+    try std.testing.expectEqual(capi.ErrorCode.unsupported, antfly_db_sql_json(handle_ptr, .fromSlice("{\"statement\":\"SELECT 1\"}"), &out));
+    try std.testing.expectEqual(capi.ErrorCode.unsupported, antfly_db_sql_json(handle_ptr, .fromSlice("{\"statement\":\"CREATE TABLE blocked (id INT)\"}"), &out));
     var timestamp: u64 = 0;
     try std.testing.expectEqual(capi.ErrorCode.unsupported, antfly_db_get_timestamp(handle_ptr, .fromSlice("a"), &timestamp));
     try std.testing.expect(out.ptr == null);
@@ -1476,7 +1476,7 @@ test "capi SQL document mutations preserve undeclared fields and typed null sema
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_batch_json(handle, .fromSlice("{\"inserts\":{\"a\":{\"n\":9007199254740993,\"extra\":true}}}"), &inserted));
     defer freeRawBuffer(inserted.ptr, inserted.len);
     var response: capi.Buffer = .{};
-    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_sql_json(handle, .fromSlice("items"), .fromSlice("{\"statement\":\"SELECT n FROM items WHERE _id='a'\"}"), &response));
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_sql_json(handle, .fromSlice("{\"statement\":\"SELECT n FROM \\\"default\\\" WHERE _id='a'\"}"), &response));
     defer freeRawBuffer(response.ptr, response.len);
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, response.ptr.?[0..response.len], .{});
     defer parsed.deinit();
@@ -1484,15 +1484,15 @@ test "capi SQL document mutations preserve undeclared fields and typed null sema
     try std.testing.expectEqual(@as(usize, 1), rows.len);
     try std.testing.expectEqualStrings("9007199254740993", rows[0].array.items[0].string);
     for ([_][]const u8{
-        "UPDATE items SET n=n+1, j='null' WHERE _id='a' RETURNING n,j",
-        "INSERT INTO items (_id,n,j) VALUES ('b',2,NULL) RETURNING n,j",
-        "INSERT INTO items (_id,n) VALUES ('c',2) RETURNING j",
-        "UPDATE items SET j=NULL WHERE _id='a' RETURNING j",
+        "UPDATE \"default\" SET n=n+1, j='null' WHERE _id='a' RETURNING n,j",
+        "INSERT INTO \"default\" (_id,n,j) VALUES ('b',2,NULL) RETURNING n,j",
+        "INSERT INTO \"default\" (_id,n) VALUES ('c',2) RETURNING j",
+        "UPDATE \"default\" SET j=NULL WHERE _id='a' RETURNING j",
     }) |statement| {
         const body = try std.json.Stringify.valueAlloc(alloc, .{ .statement = statement }, .{});
         defer alloc.free(body);
         var updated: capi.Buffer = .{};
-        const status = antfly_db_sql_json(handle, .fromSlice("items"), .fromSlice(body), &updated);
+        const status = antfly_db_sql_json(handle, .fromSlice(body), &updated);
         defer freeRawBuffer(updated.ptr, updated.len);
         if (status != .ok) std.debug.print("document mutation error: {s}\n", .{updated.ptr.?[0..updated.len]});
         try std.testing.expectEqual(capi.ErrorCode.ok, status);
@@ -1516,7 +1516,7 @@ test "capi SQL document mutations preserve undeclared fields and typed null sema
         try std.testing.expect(!value.value.object.contains("j"));
     }
     var deleted: capi.Buffer = .{};
-    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_sql_json(handle, .fromSlice("items"), .fromSlice("{\"statement\":\"DELETE FROM items WHERE _id='a' RETURNING n\"}"), &deleted));
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_sql_json(handle, .fromSlice("{\"statement\":\"DELETE FROM \\\"default\\\" WHERE _id='a' RETURNING n\"}"), &deleted));
     defer freeRawBuffer(deleted.ptr, deleted.len);
 }
 
@@ -1533,11 +1533,11 @@ test "capi SQL document validation rejects an entire mutation before publication
         \\{"version":1,"enforce_types":true,"default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"n":{"type":"integer","minimum":0}},"required":["n"],"additionalProperties":true}}}}
     )));
     var response: capi.Buffer = .{};
-    const status = antfly_db_sql_json(handle, .fromSlice("items"), .fromSlice("{\"statement\":\"INSERT INTO items (_id,n) VALUES ('valid',1),('invalid',-1) RETURNING n\"}"), &response);
+    const status = antfly_db_sql_json(handle, .fromSlice("{\"statement\":\"INSERT INTO \\\"default\\\" (_id,n) VALUES ('valid',1),('invalid',-1) RETURNING n\"}"), &response);
     defer freeRawBuffer(response.ptr, response.len);
     try std.testing.expect(status != .ok);
     var count: capi.Buffer = .{};
-    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_sql_json(handle, .fromSlice("items"), .fromSlice("{\"statement\":\"SELECT COUNT(*) FROM items\"}"), &count));
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_sql_json(handle, .fromSlice("{\"statement\":\"SELECT COUNT(*) FROM \\\"default\\\"\"}"), &count));
     defer freeRawBuffer(count.ptr, count.len);
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, count.ptr.?[0..count.len], .{});
     defer parsed.deinit();
@@ -1715,17 +1715,17 @@ test "capi SQL RETURNING uses native defaults generated values and versioned pre
     ;
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_set_schema_json(handle, .fromSlice(schema)));
     for ([_]struct { statement: []const u8, expected: []const u8 }{
-        .{ .statement = "INSERT INTO items (_id,a) VALUES ('a',3) RETURNING total", .expected = "5" },
-        .{ .statement = "INSERT INTO items (_id,a) VALUES ('a',1) ON CONFLICT (_id) DO UPDATE SET a=excluded.a+items.a RETURNING total", .expected = "6" },
-        .{ .statement = "INSERT INTO items (_id,a) VALUES ('a',99) ON CONFLICT (_id) DO NOTHING RETURNING total", .expected = "empty" },
-        .{ .statement = "INSERT INTO items (_id,a) VALUES ('a',99) ON CONFLICT DO NOTHING RETURNING total", .expected = "empty" },
-        .{ .statement = "UPDATE items SET a=4 WHERE _id='a' RETURNING items.total", .expected = "6" },
-        .{ .statement = "DELETE FROM items WHERE _id='a' RETURNING total", .expected = "6" },
+        .{ .statement = "INSERT INTO \"default\" (_id,a) VALUES ('a',3) RETURNING total", .expected = "5" },
+        .{ .statement = "INSERT INTO \"default\" (_id,a) VALUES ('a',1) ON CONFLICT (_id) DO UPDATE SET a=excluded.a+\"default\".a RETURNING total", .expected = "6" },
+        .{ .statement = "INSERT INTO \"default\" (_id,a) VALUES ('a',99) ON CONFLICT (_id) DO NOTHING RETURNING total", .expected = "empty" },
+        .{ .statement = "INSERT INTO \"default\" (_id,a) VALUES ('a',99) ON CONFLICT DO NOTHING RETURNING total", .expected = "empty" },
+        .{ .statement = "UPDATE \"default\" SET a=4 WHERE _id='a' RETURNING \"default\".total", .expected = "6" },
+        .{ .statement = "DELETE FROM \"default\" WHERE _id='a' RETURNING total", .expected = "6" },
     }) |case| {
         const request = try std.json.Stringify.valueAlloc(alloc, .{ .statement = case.statement }, .{});
         defer alloc.free(request);
         var response: capi.Buffer = .{};
-        const status = antfly_db_sql_json(handle, .fromSlice("items"), .fromSlice(request), &response);
+        const status = antfly_db_sql_json(handle, .fromSlice(request), &response);
         defer freeRawBuffer(response.ptr, response.len);
         if (status != .ok) std.debug.print("SQL RETURNING native failure: {s}\n", .{response.ptr.?[0..response.len]});
         try std.testing.expectEqual(capi.ErrorCode.ok, status);
@@ -1741,7 +1741,7 @@ test "capi SQL RETURNING uses native defaults generated values and versioned pre
         try std.testing.expectEqualStrings(case.expected, rows[0].array.items[0].string);
     }
     var generated: capi.Buffer = .{};
-    const status = antfly_db_sql_json(handle, .fromSlice("items"), .fromSlice("{\"statement\":\"INSERT INTO items (a) VALUES (3),(3) RETURNING _id,total\"}"), &generated);
+    const status = antfly_db_sql_json(handle, .fromSlice("{\"statement\":\"INSERT INTO \\\"default\\\" (a) VALUES (3),(3) RETURNING _id,total\"}"), &generated);
     defer freeRawBuffer(generated.ptr, generated.len);
     try std.testing.expectEqual(capi.ErrorCode.ok, status);
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, generated.ptr.?[0..generated.len], .{});
@@ -1769,24 +1769,24 @@ test "capi SQL uses native typed snapshots and atomic mutations" {
     ;
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_set_schema_json(handle_ptr, .fromSlice(schema_json)));
     const requests = [_][]const u8{
-        \\{"statement":"INSERT INTO items (_id,id) VALUES ('a',$1)","parameters":["9007199254740993"]}
+        \\{"statement":"INSERT INTO \"default\" (_id,id) VALUES ('a',$1)","parameters":["9007199254740993"]}
         ,
-        \\{"statement":"SELECT id FROM items WHERE _id='a'"}
+        \\{"statement":"SELECT id FROM \"default\" WHERE _id='a'"}
         ,
-        \\{"statement":"UPDATE items SET id=id+1 WHERE _id='a'"}
+        \\{"statement":"UPDATE \"default\" SET id=id+1 WHERE _id='a'"}
         ,
-        \\{"statement":"SELECT id FROM items WHERE _id='a'"}
+        \\{"statement":"SELECT id FROM \"default\" WHERE _id='a'"}
         ,
     };
     for (requests, 0..) |request, index| {
         var out: capi.Buffer = .{};
-        try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_sql_json(handle_ptr, .fromSlice("items"), .fromSlice(request), &out));
+        try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_sql_json(handle_ptr, .fromSlice(request), &out));
         defer freeRawBuffer(out.ptr, out.len);
         if (index == 1) try std.testing.expect(std.mem.indexOf(u8, out.ptr.?[0..out.len], "9007199254740993") != null);
         if (index == 3) try std.testing.expect(std.mem.indexOf(u8, out.ptr.?[0..out.len], "9007199254740994") != null);
     }
     var joined: capi.Buffer = .{};
-    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_sql_json(handle_ptr, .fromSlice("items"), .fromSlice("{\"statement\":\"SELECT l.id, r.id FROM items AS l JOIN items AS r ON l.id=r.id\"}"), &joined));
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_sql_json(handle_ptr, .fromSlice("{\"statement\":\"SELECT l.id, r.id FROM \\\"default\\\" AS l JOIN \\\"default\\\" AS r ON l.id=r.id\"}"), &joined));
     defer freeRawBuffer(joined.ptr, joined.len);
     const joined_json = try std.json.parseFromSlice(std.json.Value, alloc, joined.ptr.?[0..joined.len], .{});
     defer joined_json.deinit();
@@ -1795,10 +1795,10 @@ test "capi SQL uses native typed snapshots and atomic mutations" {
     try std.testing.expectEqualStrings("9007199254740994", joined_rows[0].array.items[0].string);
     try std.testing.expectEqualStrings("9007199254740994", joined_rows[0].array.items[1].string);
     var inserted_json_null: capi.Buffer = .{};
-    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_sql_json(handle_ptr, .fromSlice("items"), .fromSlice("{\"statement\":\"INSERT INTO items (_id,id,j) VALUES ('b',2,CAST('null' AS json))\"}"), &inserted_json_null));
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_sql_json(handle_ptr, .fromSlice("{\"statement\":\"INSERT INTO \\\"default\\\" (_id,id,j) VALUES ('b',2,CAST('null' AS json))\"}"), &inserted_json_null));
     defer freeRawBuffer(inserted_json_null.ptr, inserted_json_null.len);
     var null_projection: capi.Buffer = .{};
-    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_sql_json(handle_ptr, .fromSlice("items"), .fromSlice("{\"statement\":\"SELECT j FROM items ORDER BY _id\"}"), &null_projection));
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_sql_json(handle_ptr, .fromSlice("{\"statement\":\"SELECT j FROM \\\"default\\\" ORDER BY _id\"}"), &null_projection));
     defer freeRawBuffer(null_projection.ptr, null_projection.len);
     const projected = try std.json.parseFromSlice(std.json.Value, alloc, null_projection.ptr.?[0..null_projection.len], .{});
     defer projected.deinit();
@@ -1810,7 +1810,7 @@ test "capi SQL uses native typed snapshots and atomic mutations" {
     try std.testing.expect(projected_nulls[0].array.items[0].bool);
     try std.testing.expect(!projected_nulls[1].array.items[0].bool);
     var rejected: capi.Buffer = .{};
-    try std.testing.expectEqual(capi.ErrorCode.unsupported, antfly_db_sql_json(handle_ptr, .fromSlice("items"), .fromSlice("{\"statement\":\"BEGIN\"}"), &rejected));
+    try std.testing.expectEqual(capi.ErrorCode.unsupported, antfly_db_sql_json(handle_ptr, .fromSlice("{\"statement\":\"BEGIN\"}"), &rejected));
     defer freeRawBuffer(rejected.ptr, rejected.len);
     try std.testing.expect(std.mem.indexOf(u8, rejected.ptr.?[0..rejected.len], "0A000") != null);
 }
@@ -1957,7 +1957,7 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     defer cleanupTestFile(invalid_snapshot_path);
     defer cleanupTestFile(invalid_snapshot_file_path);
 
-    try std.testing.expectEqual(@as(u32, 2), antfly_abi_version());
+    try std.testing.expectEqual(public.abi_version, antfly_abi_version());
     try std.testing.expectEqualStrings("ANTFLY_OK", std.mem.span(antfly_error_code_name(@backingInt(capi.ErrorCode.ok))));
     try std.testing.expectEqualStrings("ANTFLY_INVALID_ARGUMENT", std.mem.span(antfly_error_code_name(@backingInt(capi.ErrorCode.invalid_argument))));
     try std.testing.expectEqualStrings("ANTFLY_OUTCOME_UNKNOWN", std.mem.span(antfly_error_code_name(@backingInt(capi.ErrorCode.outcome_unknown))));
@@ -2363,7 +2363,7 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     defer antfly_db_close(concurrent_readonly_handle);
     try std.testing.expectEqual(db_mod.OpenOptions.OpenMode.query_readonly, asHandle(concurrent_readonly_handle).?.open_mode);
     var second_writer_handle: ?*anyopaque = null;
-    try std.testing.expectEqual(capi.ErrorCode.busy, antfly_lite_open(src_path, &second_writer_handle));
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open(src_path, &second_writer_handle));
     defer antfly_db_close(second_writer_handle);
     var concurrent_lookup: capi.Buffer = .{};
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_lookup_json(concurrent_readonly_handle, .{
@@ -2406,7 +2406,7 @@ test "capi lite opens exports imports checks and vacuums aflite" {
         .len = "doc:capi-pinned".len,
     }, &pinned_snapshot_lookup));
     defer freeRawBuffer(pinned_snapshot_lookup.ptr, pinned_snapshot_lookup.len);
-    try std.testing.expect(std.mem.indexOf(u8, pinned_snapshot_lookup.ptr.?[0..pinned_snapshot_lookup.len], "\"pinned-before\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pinned_snapshot_lookup.ptr.?[0..pinned_snapshot_lookup.len], "\"pinned-after-b\"") != null);
 
     var pinned_writer_lookup: capi.Buffer = .{};
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_lookup_json(src_handle, .{
@@ -2443,7 +2443,7 @@ test "capi lite opens exports imports checks and vacuums aflite" {
         .len = "doc:capi-pinned".len,
     }, &retired_reader_lookup));
     defer freeRawBuffer(retired_reader_lookup.ptr, retired_reader_lookup.len);
-    try std.testing.expect(std.mem.indexOf(u8, retired_reader_lookup.ptr.?[0..retired_reader_lookup.len], "\"pinned-before\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, retired_reader_lookup.ptr.?[0..retired_reader_lookup.len], "\"pinned-after-b\"") != null);
     antfly_db_close(concurrent_status_handle);
     concurrent_status_handle = null;
     antfly_db_close(concurrent_readonly_handle);

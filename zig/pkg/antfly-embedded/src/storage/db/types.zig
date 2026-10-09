@@ -15,6 +15,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+pub const SparseOrdinalLookup = @import("../../sparse/ordinal_lookup.zig").Lookup;
 const graph_mod = @import("../../graph/graph.zig");
 const traversal_mod = @import("../../graph/traversal.zig");
 const paths_mod = @import("../../graph/paths.zig");
@@ -1090,8 +1091,8 @@ pub const TextQuery = union(enum) {
     },
     date_range: struct {
         field: []const u8,
-        start_ns: ?u64 = null,
-        end_ns: ?u64 = null,
+        start_ns: ?i128 = null,
+        end_ns: ?i128 = null,
         inclusive_start: bool = true,
         inclusive_end: bool = false,
         boost: f32 = 1.0,
@@ -1319,8 +1320,8 @@ pub const Query = union(enum) {
     },
     date_range: struct {
         field: []const u8,
-        start_ns: ?u64 = null,
-        end_ns: ?u64 = null,
+        start_ns: ?i128 = null,
+        end_ns: ?i128 = null,
         inclusive_start: bool = true,
         inclusive_end: bool = false,
         boost: f32 = 1.0,
@@ -1943,7 +1944,11 @@ pub const SearchRequest = struct {
     // avoid converting text-native doc nums through shard ordinals and back.
     resolved_text_doc_filter: ?*const anyopaque = null,
     /// Request-local native metadata membership, never serialized to workers.
-    native_key_predicate: ?struct { ptr: *anyopaque, allows: *const fn (*anyopaque, []const u8) anyerror!bool } = null,
+    native_key_predicate: ?struct {
+        ptr: *anyopaque,
+        allows: *const fn (*anyopaque, []const u8) anyerror!bool,
+        select_ordinals: ?*const fn (*anyopaque, Allocator, SparseOrdinalLookup) anyerror!?@import("../../encoding/roaring.zig").RoaringBitmap = null,
+    } = null,
     resolved_doc_filter_owned: bool = false,
     resolved_doc_filter_wire_context: ?ResolvedDocFilterWireContext = null,
     /// Request-local authorization hook used only by the distributed graph
@@ -2801,6 +2806,7 @@ pub const SortProfile = struct {
     sorted_segment_scanned_count: u64 = 0,
     sorted_segment_scan_budget: u64 = 0,
     candidate_count: u64 = 0,
+    ordered_scanned_count: u64 = 0,
     cursor_rejected_count: u64 = 0,
     admitted_count: u64 = 0,
     replaced_count: u64 = 0,

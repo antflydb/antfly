@@ -64,8 +64,8 @@ class QueryRequest:
     Attributes:
         lake_read (LakeReadRequirement | Unset):
         remote_snapshot (str | Unset): Opaque retained snapshot token returned by an ordered native or external-table
-            query. Echo with search_after or search_before. Native and lake cuts expire within 60 seconds; missing, expired
-            or incompatible generations return 409.
+            query. Echo with search_after or search_before. Native and lake cuts expire within the configured retention
+            period (default five minutes; maximum one hour); missing, expired or incompatible generations return 409.
         evaluate (QueryEvaluation | Unset): Evaluate expressions after global retrieval merging, before final
             offset/limit. Candidates require candidate_count; matches require
             max_rows and fail if the full qualifying population exceeds that budget.

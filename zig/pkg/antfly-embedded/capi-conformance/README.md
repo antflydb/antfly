@@ -106,3 +106,13 @@ Values written as JSON objects in a case (`value`, `request`, `config`,
 | `close` | | closes the current handle; only `reopen` or `restore_open` may follow | none |
 
 `batch` timestamps are nanoseconds and must increase within a case.
+
+### SQL driver conformance
+
+`sql/cases.json` is shared by Go's database/sql tests, Python's PEP 249 tests,
+Rust's SQLx tests, and TypeScript's connection tests. Expected integer cells
+are decimal strings. Cases cover positional binding, exact int64, booleans,
+text, JSON, NULL, and SQLSTATE. Driver tests additionally exercise transaction
+isolation, savepoints, foreign keys, catalog reopen, and streaming past 128
+rows. Run Rust with `--features libantfly,sqlx --test sqlx`; the other packages
+discover SQL tests with their ordinary native-library test commands.

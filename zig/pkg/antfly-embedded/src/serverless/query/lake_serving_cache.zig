@@ -39,7 +39,7 @@ pub const Cache = struct {
     tick: u64 = 0,
     persistent: ?parquet.PersistentObjectRangeCache = null,
     persistent_mutex: std.Io.Mutex = .init,
-    persistent_attempted: bool = false,
+    persistent_retry_after_ns: i96 = 0,
     persistent_ready: std.atomic.Value(bool) = .init(false),
 
     const Mapping = struct {
@@ -62,36 +62,53 @@ pub const Cache = struct {
         }
     };
 
-    /// Configure once before reads. The server owns the worker and drains it
+    /// Publish one disk owner. The server owns the worker and drains it
     /// after cursors are quiescent; a request never owns cache I/O state.
     pub fn ensurePersistent(self: *Cache, io: std.Io, root: []const u8, policy: parquet.PersistentObjectRangeCachePolicy, resources: parquet.PersistentObjectRangeCacheResources) !void {
-        try self.persistent_mutex.lock(io);
-        defer self.persistent_mutex.unlock(io);
         try policy.validate();
         if (root.len == 0) return error.InvalidPersistentObjectRangeCachePolicy;
-        if (self.persistent_attempted) return;
+        if (self.persistent_ready.load(.acquire)) return;
+        // Another request may be inventorying a large cache. Reads can use
+        // RAM/source rather than queue behind optional cache startup I/O.
+        if (!self.persistent_mutex.tryLock()) return;
+        defer self.persistent_mutex.unlock(io);
+        if (self.persistent_ready.load(.acquire)) return;
+        const now = std.Io.Clock.now(.awake, io).nanoseconds;
+        if (now < self.persistent_retry_after_ns) return;
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        self.stats.disk_init_attempts +|= 1;
+        self.mutex.unlock();
         var coordinated = resources;
         coordinated.reclaim_idle = .{ .ptr = self, .reclaim_one = reclaimIdleMapping };
         self.persistent = parquet.PersistentObjectRangeCache.initWithPolicyAndResources(io, root, policy, coordinated) catch |err| {
             if (err == error.Canceled) return err;
             // Local cache availability is never source/readiness authority.
-            // Report the reason once and continue serving through RAM/source.
+            // Retry transient ownership, worker, or filesystem failures without
+            // repeating startup inventory I/O or warnings for every request.
             while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
             self.stats.disk_unavailable = @errorName(err);
+            self.stats.disk_init_failures +|= 1;
             self.mutex.unlock();
             std.log.scoped(.lake_cache).warn("persistent cache unavailable; serving through RAM/source: {s}", .{@errorName(err)});
-            self.persistent_attempted = true;
+            self.persistent_retry_after_ns = now +| 30 * std.time.ns_per_s;
             return;
         };
-        self.persistent_attempted = true;
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        self.stats.disk_unavailable = null;
+        self.mutex.unlock();
         self.persistent_ready.store(true, .release);
     }
 
     pub fn persistentStats(self: *Cache) ?parquet.PersistentObjectRangeCacheStats {
         // Status must not wait for startup inventory I/O. Once published, the
         // disk owner is immutable until server readers/status calls quiesce.
+        return if (self.persistentCache()) |disk| disk.statsSnapshot() else null;
+    }
+    /// A retry may publish the disk owner while older RAM-only readers are
+    /// running. Acquire publication before touching the optional owner.
+    fn persistentCache(self: *Cache) ?*parquet.PersistentObjectRangeCache {
         if (!self.persistent_ready.load(.acquire)) return null;
-        return self.persistent.?.statsSnapshot();
+        return &self.persistent.?;
     }
 
     const Flight = struct { key: []u8, event: std.Io.Event = .unset, refs: usize = 1 };
@@ -136,12 +153,40 @@ pub const Cache = struct {
         protected_stored_bytes: usize = 0,
         evictions: u64 = 0,
         disk_unavailable: ?[]const u8 = null,
+        disk_init_attempts: u64 = 0,
+        disk_init_failures: u64 = 0,
         disk_hits: u64 = 0,
         mapping_hits: u64 = 0,
         disk_bytes: u64 = 0,
         provider_reads: u64 = 0,
         provider_bytes: u64 = 0,
+        completed_queries: u64 = 0,
+        query_total_ns: u64 = 0,
+        query_publication_ns: u64 = 0,
+        query_search_ns: u64 = 0,
+        /// Nested in search/delivery: includes residual and final hydration.
+        query_hydration_ns: u64 = 0,
+        query_delivery_ns: u64 = 0,
     };
+    pub const QueryPhases = struct {
+        total_ns: u64,
+        publication_ns: u64,
+        search_ns: u64,
+        hydration_ns: u64,
+        delivery_ns: u64,
+    };
+    /// Per-request durations, not global cache deltas (other queries can run
+    /// concurrently). Status exports these counters without per-query logs.
+    pub fn recordQuery(self: *Cache, phases: QueryPhases) void {
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.mutex.unlock();
+        self.stats.completed_queries +|= 1;
+        self.stats.query_total_ns +|= phases.total_ns;
+        self.stats.query_publication_ns +|= phases.publication_ns;
+        self.stats.query_search_ns +|= phases.search_ns;
+        self.stats.query_hydration_ns +|= phases.hydration_ns;
+        self.stats.query_delivery_ns +|= phases.delivery_ns;
+    }
     fn recordRead(self: *Cache, disk: bool, bytes: usize) void {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
         defer self.mutex.unlock();
@@ -251,7 +296,7 @@ pub const Cache = struct {
         try context.ensureActive();
         const key = try immutableKey(a, scope, identity, length, digest);
         defer a.free(key);
-        if (self.persistent) |*disk| if (try disk.readMapped(a, key, length, digest, context)) |mapped| {
+        if (self.persistentCache()) |disk| if (try disk.readMapped(a, key, length, digest, context)) |mapped| {
             self.recordRead(true, mapped.bytes.len);
             return .{ .mapped = mapped };
         };
@@ -315,7 +360,7 @@ pub const Cache = struct {
             try context.ensureActive();
             return .{ .mapping = value };
         }
-        if (self.persistent) |*disk| if (try disk.readMapped(a, key, length, digest, context)) |value| {
+        if (self.persistentCache()) |disk| if (try disk.readMapped(a, key, length, digest, context)) |value| {
             self.recordRead(true, length);
             var lease = self.admitMapping(key, value);
             errdefer lease.deinit();
@@ -334,7 +379,7 @@ pub const Cache = struct {
         if (verified.value.bytes.ptr != verified.owner.bytes.ptr or verified.value.bytes.len != verified.owner.bytes.len or verified.value.bytes.len != length or !std.mem.eql(u8, &verified.value.digest, &digest)) return error.ArtifactIntegrityMismatch;
         const key = try immutableKey(a, scope, identity, length, digest);
         defer a.free(key);
-        if (self.persistent) |*disk| _ = disk.enqueueWrite(key, verified.value.bytes);
+        if (self.persistentCache()) |disk| _ = disk.enqueueWrite(key, verified.value.bytes);
         self.store(key, verified.value.bytes) catch {};
         if (self.pin(key)) |value| {
             errdefer value.release();
@@ -356,7 +401,7 @@ pub const Cache = struct {
         const resident = self.entries.contains(key) or self.mappings.contains(key);
         self.mutex.unlock();
         if (resident) return true;
-        if (self.persistent) |*disk| if (try disk.readMapped(a, key, length, digest, context)) |value| {
+        if (self.persistentCache()) |disk| if (try disk.readMapped(a, key, length, digest, context)) |value| {
             var lease = self.admitMapping(key, value);
             lease.deinit();
             return true;
@@ -459,7 +504,7 @@ pub const Cache = struct {
         }
         defer if (claim) |active| self.finish(active, context.io.?);
         if (claim != null) if (try self.lookup(a, key)) |bytes| return bytes;
-        const disk_bytes = if (self.persistent) |*disk| try disk.readAlloc(a, key, length) else null;
+        const disk_bytes = if (self.persistentCache()) |disk| try disk.readAlloc(a, key, length) else null;
         if (disk_bytes) |bytes| {
             var actual: [32]u8 = undefined;
             std.crypto.hash.sha2.Sha256.hash(bytes, &actual, .{});
@@ -485,7 +530,7 @@ pub const Cache = struct {
         self.stats.provider_reads +|= traffic.requests;
         self.stats.provider_bytes +|= traffic.bytes;
         self.mutex.unlock();
-        if (self.persistent) |*disk| _ = disk.enqueueWrite(key, bytes);
+        if (self.persistentCache()) |disk| _ = disk.enqueueWrite(key, bytes);
         self.store(key, bytes) catch {};
         return bytes;
     }
@@ -720,14 +765,14 @@ pub const Reader = struct {
         // The credential-scoped, versioned key is identical in both tiers.
         // Disk corruption/missing entries are misses inside the persistent
         // cache; an allocation failure still belongs to this request.
-        const disk_bytes = if (self.cache.persistent) |*disk| try disk.readAlloc(alloc, key, read.range.len) else null;
+        const disk_bytes = if (self.cache.persistentCache()) |disk| try disk.readAlloc(alloc, key, read.range.len) else null;
         const bytes = disk_bytes orelse try self.base.parquetReader().readPlannedAlloc(alloc, read);
         self.cache.recordRead(disk_bytes != null, bytes.len);
         errdefer alloc.free(bytes);
         try self.context.ensureActive();
         // Cache admission is optional and never turns a successful read into
         // an allocation failure in a long-lived shared owner.
-        if (disk_bytes == null) if (self.cache.persistent) |*disk| {
+        if (disk_bytes == null) if (self.cache.persistentCache()) |disk| {
             _ = disk.enqueueWrite(key, bytes);
         };
         self.cache.store(key, bytes) catch {};
@@ -1103,11 +1148,21 @@ test "external lake serving RAM protects metadata under broad scan pressure" {
     try std.testing.expectEqual(@as(usize, 12), cache.snapshot().stored_bytes);
 }
 
-test "external lake disk cache initialization failure preserves source reads" {
+test "external lake disk cache initialization failure preserves source reads and retries after cooldown" {
     const a = std.testing.allocator;
     var io_impl = std.Io.Threaded.init(a, .{});
     defer io_impl.deinit();
-    const io = io_impl.io();
+    const Clock = struct {
+        var awake_ns: i96 = 0;
+        fn now(_: ?*anyopaque, clock: std.Io.Clock) std.Io.Timestamp {
+            if (clock == .awake) return .{ .nanoseconds = awake_ns };
+            return std.testing.io.vtable.now(std.testing.io.userdata, clock);
+        }
+    };
+    Clock.awake_ns = 0;
+    var vtable = io_impl.io().vtable.*;
+    vtable.now = Clock.now;
+    const io: std.Io = .{ .userdata = io_impl.io().userdata, .vtable = &vtable };
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(io, .{ .sub_path = "not-a-directory", .data = "file" });
@@ -1115,6 +1170,13 @@ test "external lake disk cache initialization failure preserves source reads" {
     defer a.free(root);
     var cache = Cache.init(a);
     defer cache.deinit();
+    {
+        try std.testing.expect(cache.persistent_mutex.tryLock());
+        defer cache.persistent_mutex.unlock(io);
+        try cache.ensurePersistent(io, root, .{}, .{});
+        try std.testing.expectEqual(@as(u64, 0), cache.snapshot().disk_init_attempts);
+        try std.testing.expect(cache.persistentStats() == null);
+    }
     try cache.ensurePersistent(io, root, .{}, .{});
     try std.testing.expect(cache.persistent == null);
     try std.testing.expect(cache.snapshot().disk_unavailable != null);
@@ -1130,6 +1192,41 @@ test "external lake disk cache initialization failure preserves source reads" {
     defer lease.release();
     try std.testing.expectEqualStrings("data", lease.bytes);
     try std.testing.expectEqual(@as(u64, 1), cache.snapshot().provider_reads);
+    try std.testing.expectEqual(@as(u64, 1), cache.snapshot().disk_init_attempts);
+    try std.testing.expectEqual(@as(u64, 1), cache.snapshot().disk_init_failures);
+    // A repaired directory must not trigger repeated inventory scans inside
+    // the cooldown. Advance the injected Io clock instead of sleeping.
+    try tmp.dir.deleteFile(io, "not-a-directory");
+    try cache.ensurePersistent(io, root, .{}, .{});
+    try std.testing.expect(cache.persistent == null);
+    Clock.awake_ns = 30 * std.time.ns_per_s;
+    try cache.ensurePersistent(io, root, .{}, .{});
+    try std.testing.expect(cache.persistent != null);
+    try std.testing.expect(cache.snapshot().disk_unavailable == null);
+    try std.testing.expectEqual(@as(u64, 2), cache.snapshot().disk_init_attempts);
+    try cache.ensurePersistent(io, root, .{}, .{});
+    try std.testing.expectEqual(@as(u64, 2), cache.snapshot().disk_init_attempts);
+    try std.testing.expectEqual(.enqueued, cache.persistent.?.enqueueWrite("recovered", "data"));
+    cache.persistent.?.flush();
+    try std.testing.expectEqual(@as(usize, 1), cache.persistentStats().?.writes_completed);
+}
+
+test "external lake query phase counters retain nested hydration and saturate" {
+    var cache = Cache.init(std.testing.allocator);
+    defer cache.deinit();
+    const phases: Cache.QueryPhases = .{ .total_ns = 100, .publication_ns = 20, .search_ns = 50, .hydration_ns = 30, .delivery_ns = 30 };
+    cache.recordQuery(phases);
+    cache.recordQuery(phases);
+    const stats = cache.snapshot();
+    try std.testing.expectEqual(@as(u64, 2), stats.completed_queries);
+    try std.testing.expectEqual(@as(u64, 200), stats.query_total_ns);
+    try std.testing.expectEqual(@as(u64, 40), stats.query_publication_ns);
+    try std.testing.expectEqual(@as(u64, 100), stats.query_search_ns);
+    try std.testing.expectEqual(@as(u64, 60), stats.query_hydration_ns);
+    try std.testing.expectEqual(@as(u64, 60), stats.query_delivery_ns);
+    cache.stats.query_total_ns = std.math.maxInt(u64);
+    cache.recordQuery(phases);
+    try std.testing.expectEqual(std.math.maxInt(u64), cache.snapshot().query_total_ns);
 }
 
 test "external lake immutable block leases borrow RAM and pin bytes through eviction pressure" {

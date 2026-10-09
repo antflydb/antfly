@@ -91,7 +91,7 @@ pub const OpenOptions = extern struct {
     inference_combined_budget_mb: u32 = 0,
     inference_kv_budget_mb: u32 = 0,
     inference_scratch_budget_mb: u32 = 0,
-    // Milliseconds to keep retrying an open while another writer holds the
+    // Milliseconds to retry an operation while another writer holds the
     // database's writer lock (ANTFLY_BUSY), like sqlite3_busy_timeout. 0
     // fails immediately.
     busy_timeout_ms: u64 = 0,

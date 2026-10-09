@@ -69,8 +69,8 @@ class GlobalStatefulQueryRequest:
     Attributes:
         lake_read (LakeReadRequirement | Unset):
         remote_snapshot (str | Unset): Opaque retained snapshot token returned by an ordered native or external-table
-            query. Echo with search_after or search_before. Native and lake cuts expire within 60 seconds; missing, expired
-            or incompatible generations return 409.
+            query. Echo with search_after or search_before. Native and lake cuts expire within the configured retention
+            period (default five minutes; maximum one hour); missing, expired or incompatible generations return 409.
         evaluate (QueryEvaluation | Unset): Evaluate expressions after global retrieval merging, before final
             offset/limit. Candidates require candidate_count; matches require
             max_rows and fail if the full qualifying population exceeds that budget.
@@ -398,9 +398,9 @@ class GlobalStatefulQueryRequest:
             lists after visibility resolution. Required for score ordering; shared corpus BM25 is not implemented. Constant
             60, equal source weights.
         source_cursor (str | Unset): Opaque composed continuation retaining per-leaf native generations or archive
-            publications and accepted WAL cuts for up to 60 seconds from their creation. Publication and restart preserve
-            the cut. Authorization, policy, recipe, source and table incarnation changes invalidate it. Leaf
-            search_after/search_before tuples are unsupported.
+            publications and accepted WAL cuts for the configured retention period from their creation (default five
+            minutes; maximum one hour). Publication and restart preserve the cut. Authorization, policy, recipe, source and
+            table incarnation changes invalidate it. Leaf search_after/search_before tuples are unsupported.
     """
 
     lake_read: LakeReadRequirement | Unset = UNSET

@@ -318,6 +318,7 @@ const Entry = struct {
     arena: std.heap.ArenaAllocator,
     writer: ?local.index.IndexWriter = null,
     seekable: bool = false,
+    identities: @import("lake_index_text_predicate.zig").Identities = undefined,
     analysis: local.introducer.TextAnalysisConfig = .{},
     selected_field: ?[]const u8 = null,
     schema: ?local.storage_schema.TableSchema = null,
@@ -415,6 +416,9 @@ const Entry = struct {
         defer self.allocator.free(ordered_ids);
         for (root.segments, ordered_ids) |segment, *id| id.* = self.segments.get(segment.artifact_id).?.id;
         try self.writer.?.orderImmutableSegments(ordered_ids);
+        const snapshot = self.writer.?.acquireSnapshot();
+        defer snapshot.release();
+        self.identities = try @import("lake_index_text_predicate.zig").Identities.init(a, root, snapshot);
         if (self.resource_manager) |manager| self.writer.?.attachResourceManager(manager);
     }
     fn loadSegment(loader: *corpus.CachedSegments, a: A, ref: artifacts.ChunkRef, cancellation: Cancellation, id: u64) anyerror!local.index.ReplacementSegmentData {
@@ -455,11 +459,11 @@ const Entry = struct {
         }
     };
     fn source(self: *Entry, store: stores.ArtifactStore, cached: artifacts.CachedRead, context: Context, cancellation: Cancellation) !local.storage_db_query_search_exec.PinnedTextSource {
-        if (!self.seekable) return .{ .snapshot = self.writer.?.acquireSnapshot(), .name = self.name, .text_analysis = self.analysis, .runtime_schema = self.schema, .selected_field = self.selected_field, .owner = self, .release_owner = releaseSource };
+        if (!self.seekable) return .{ .snapshot = self.writer.?.acquireSnapshot(), .name = self.name, .text_analysis = self.analysis, .runtime_schema = self.schema, .selected_field = self.selected_field, .provider_metadata = &self.identities, .owner = self, .release_owner = releaseSource };
         const lease = self.allocator.create(QueryLease) catch return error.NativeLakeTextCacheBusy;
         errdefer self.allocator.destroy(lease);
         lease.* = .{ .entry = self, .read = .{ .store = store, .cache = cached, .context = context, .cancellation = cancellation, .resource_manager = self.resource_manager } };
-        return .{ .read_context = &lease.read, .snapshot = self.writer.?.acquireSnapshotWithReadContext(&lease.read) catch |err| return if (err == error.OutOfMemory) error.NativeLakeTextCacheBusy else err, .name = self.name, .text_analysis = self.analysis, .runtime_schema = self.schema, .selected_field = self.selected_field, .owner = lease, .release_owner = QueryLease.release };
+        return .{ .read_context = &lease.read, .snapshot = self.writer.?.acquireSnapshotWithReadContext(&lease.read) catch |err| return if (err == error.OutOfMemory) error.NativeLakeTextCacheBusy else err, .name = self.name, .text_analysis = self.analysis, .runtime_schema = self.schema, .selected_field = self.selected_field, .provider_metadata = &self.identities, .owner = lease, .release_owner = QueryLease.release };
     }
     fn releaseSource(raw: *anyopaque) void {
         const self: *Entry = @ptrCast(@alignCast(raw));

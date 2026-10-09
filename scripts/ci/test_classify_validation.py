@@ -37,6 +37,14 @@ class ClassifyValidationTests(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertTrue(classify([path])["sdk"])
 
+    def test_sdk_scratch_owner_changes_run_the_sdk_suite(self) -> None:
+        for path in (
+            "scripts/ci/disposable_cargo_target.sh",
+            "scripts/ci/test_disposable_cargo_target.py",
+        ):
+            with self.subTest(path=path):
+                self.assertTrue(classify([path])["sdk"])
+
     def test_lite_binding_changes_run_the_sdk_suite(self) -> None:
         for path in (
             "go/pkg/embedded/lite_cgo.go",
