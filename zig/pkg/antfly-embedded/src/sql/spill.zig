@@ -25,6 +25,21 @@ const native_spill_supported = @import("builtin").os.tag != .freestanding;
 pub const none = std.math.maxInt(u64);
 const frame_bytes = 25;
 const snappy = @import("../encoding/snappy.zig");
+const Runnable = @import("../common/runnable_scheduler.zig");
+
+fn childWaitBegin(raw: *anyopaque) !void {
+    const execution: *Runnable.Execution = @ptrCast(@alignCast(raw));
+    try execution.checkpoint();
+    try execution.park(.resource_blocked);
+}
+fn childWaitEnd(raw: *anyopaque) !void {
+    const execution: *Runnable.Execution = @ptrCast(@alignCast(raw));
+    const entry = execution.entry orelse return error.InvalidRunnableTransition;
+    try execution.enter(entry.class);
+}
+fn childWait(execution: *Runnable.Execution) @import("execution_wait.zig").Boundary {
+    return .{ .ptr = execution, .begin = childWaitBegin, .end = childWaitEnd };
+}
 
 pub const Manager = struct {
     patterns: std.ArrayList(*scalar.PatternSet) = .empty,
@@ -46,6 +61,9 @@ pub const Manager = struct {
     buffer_bytes: usize = 4096,
     async_writes: bool = true,
     parallel_work: bool = true,
+    /// Sort jobs own independent CPU/IO scopes. Shared quota and directory
+    /// lifetime remain here; child file callbacks never access parent policy.
+    cpu_scope: ?@import("parallel_scheduler.zig").ExecutionScope = null,
     wait: ?@import("execution_wait.zig").Boundary = null,
     compression: enum { none, snappy } = .snappy,
     compressed_records: u64 = 0,
@@ -68,6 +86,24 @@ pub const Manager = struct {
         // revalidates authority after execution was relinquished during I/O.
         if (self.wait != null) try self.check();
         return result;
+    }
+    fn performFor(self: *Manager, execution: ?*Runnable.Execution, comptime operation: anytype, args: anytype) anyerror!@typeInfo(@typeInfo(@TypeOf(operation)).@"fn".return_type.?).error_union.payload {
+        if (execution) |child| return @import("execution_wait.zig").run(childWait(child), operation, args);
+        return self.perform(operation, args);
+    }
+    fn performOwnedFor(self: *Manager, execution: ?*Runnable.Execution, comptime operation: anytype, args: anytype, comptime discard: anytype, discard_args: anytype) anyerror!@typeInfo(@typeInfo(@TypeOf(operation)).@"fn".return_type.?).error_union.payload {
+        if (execution) |child| return @import("execution_wait.zig").runOwned(childWait(child), operation, args, discard, discard_args);
+        return self.performOwned(operation, args, discard, discard_args);
+    }
+    fn lockFor(self: *Manager, execution: ?*Runnable.Execution) !void {
+        if (execution == null and self.cpu_scope == null) return self.lock();
+        const boundary = if (execution) |child| childWait(child) else self.cpu_scope.?.wait;
+        // Directory creation holds this lock across physical I/O. A contending
+        // task must release CPU so the lock owner can reacquire its grant.
+        while (!self.mutex.tryLock()) {
+            try self.checkFor(execution);
+            try @import("execution_wait.zig").run(boundary, std.Io.sleep, .{ self.io, std.Io.Duration.fromMilliseconds(1), .awake });
+        }
     }
     fn performOwned(self: *Manager, comptime operation: anytype, args: anytype, comptime discard: anytype, discard_args: anytype) anyerror!@typeInfo(@typeInfo(@TypeOf(operation)).@"fn".return_type.?).error_union.payload {
         const result = try @import("execution_wait.zig").runOwned(self.wait, operation, args, discard, discard_args);
@@ -152,14 +188,18 @@ pub const Manager = struct {
     pub fn check(self: *Manager) !void {
         try self.checkpoint(self.context);
     }
-    fn open(self: *Manager) !void {
+    fn checkFor(self: *Manager, execution: ?*Runnable.Execution) !void {
+        if (execution) |child| return child.checkpoint();
+        return self.check();
+    }
+    fn open(self: *Manager, execution: ?*Runnable.Execution) !void {
         if (comptime !native_spill_supported) return error.SqlProgramLimitExceeded;
         if (self.dir != null) return;
-        try self.check();
+        try self.checkFor(execution);
         var random: [16]u8 = undefined;
         try self.io.randomSecure(&random);
         _ = try std.fmt.bufPrint(&self.directory_name, "antfly-sql-{s}", .{std.fmt.bytesToHex(random, .lower)});
-        const opened = try self.performOwned(openPrivateDirectory, .{ self.io, self.root, &self.directory_name }, PrivateDirectory.discard, .{ self.io, &self.directory_name });
+        const opened = try self.performOwnedFor(execution, openPrivateDirectory, .{ self.io, self.root, &self.directory_name }, PrivateDirectory.discard, .{ self.io, &self.directory_name });
         self.dir = opened.dir;
         self.parent = opened.parent;
     }
@@ -209,19 +249,22 @@ pub const Manager = struct {
         file.close(io);
     }
     pub fn create(self: *Manager) !File {
+        return self.createFor(null);
+    }
+    fn createFor(self: *Manager, execution: ?*Runnable.Execution) !File {
         // Freestanding builds have no native spill directory. Keep bounded
         // in-memory SQL available and report its existing limit on overflow.
         if (comptime !native_spill_supported) return error.SqlProgramLimitExceeded;
-        self.lock();
+        try self.lockFor(execution);
         defer self.mutex.unlock();
-        try self.open();
+        try self.open(execution);
         if (self.files >= 64) return error.SqlProgramLimitExceeded;
         self.sequence += 1;
         var name: [24]u8 = undefined;
         const text = try std.fmt.bufPrint(&name, "{d}", .{self.sequence});
-        const file = try self.performOwned(createPrivateFile, .{ self.dir.?, self.io, text }, discardPrivateFile, .{self.io});
+        const file = try self.performOwnedFor(execution, createPrivateFile, .{ self.dir.?, self.io, text }, discardPrivateFile, .{self.io});
         self.files += 1;
-        return .{ .manager = self, .file = file, .id = self.sequence };
+        return .{ .manager = self, .file = file, .id = self.sequence, .execution = execution };
     }
     pub fn deinit(self: *Manager) void {
         const protection = self.io.swapCancelProtection(.blocked);
@@ -250,6 +293,9 @@ pub const Manager = struct {
 pub const Decoded = struct { row: Row, next: u64, matched: bool, following: u64 };
 pub const File = struct {
     manager: *Manager,
+    /// Borrowed only while this file is exclusively owned by a physical child.
+    /// Clear before transferring the file or retiring the child's task scope.
+    execution: ?*Runnable.Execution = null,
     file: std.Io.File,
     id: u64,
     size: u64 = 0,
@@ -264,6 +310,12 @@ pub const File = struct {
     spare: []u8 = &.{},
     pending: ?*WriteJob = null,
     write_job: ?*WriteJob = null,
+    fn check(self: *File) !void {
+        try self.manager.checkFor(self.execution);
+    }
+    fn perform(self: *File, comptime operation: anytype, args: anytype) anyerror!@typeInfo(@typeInfo(@TypeOf(operation)).@"fn".return_type.?).error_union.payload {
+        return self.manager.performFor(self.execution, operation, args);
+    }
     const WriteJob = struct {
         io: std.Io,
         file: std.Io.File,
@@ -287,10 +339,10 @@ pub const File = struct {
     fn submit(self: *File) !void {
         if (self.write_len == 0) return;
         try self.awaitWrite();
-        try self.manager.check();
-        if (self.manager.async_writes and self.manager.parallel_work and self.manager.wait == null and self.write_buffer.len >= 4096 and self.write_len >= self.write_buffer.len / 2) {
+        try self.check();
+        if (self.execution == null and self.manager.async_writes and self.manager.parallel_work and self.manager.wait == null and self.write_buffer.len >= 4096 and self.write_len >= self.write_buffer.len / 2) {
             const job = self.prepareAsync() orelse {
-                try self.manager.perform(std.Io.File.writePositionalAll, .{ self.file, self.manager.io, self.write_buffer[0..self.write_len], self.write_start });
+                try self.perform(std.Io.File.writePositionalAll, .{ self.file, self.manager.io, self.write_buffer[0..self.write_len], self.write_start });
                 self.manager.increment("write_calls", 1);
                 self.write_len = 0;
                 return;
@@ -307,7 +359,7 @@ pub const File = struct {
             self.write_buffer = self.spare;
             self.spare = &.{};
         } else {
-            try self.manager.perform(std.Io.File.writePositionalAll, .{ self.file, self.manager.io, self.write_buffer[0..self.write_len], self.write_start });
+            try self.perform(std.Io.File.writePositionalAll, .{ self.file, self.manager.io, self.write_buffer[0..self.write_len], self.write_start });
         }
         self.manager.increment("write_calls", 1);
         self.write_len = 0;
@@ -344,7 +396,7 @@ pub const File = struct {
         if (self.write_len != 0 and offset != self.write_start + self.write_len) try self.submit();
         if (bytes.len > self.write_buffer.len) {
             try self.flush();
-            try self.manager.perform(std.Io.File.writePositionalAll, .{ self.file, self.manager.io, bytes, offset });
+            try self.perform(std.Io.File.writePositionalAll, .{ self.file, self.manager.io, bytes, offset });
             self.manager.increment("write_calls", 1);
             return;
         }
@@ -357,7 +409,7 @@ pub const File = struct {
         try self.flush();
         if (self.read_buffer.len == 0) self.read_buffer = try self.manager.allocator().alloc(u8, @max(1, self.buffer_bytes orelse self.manager.buffer_bytes));
         if (bytes.len > self.read_buffer.len) {
-            const count = try self.manager.perform(std.Io.File.readPositionalAll, .{ self.file, self.manager.io, bytes, offset });
+            const count = try self.perform(std.Io.File.readPositionalAll, .{ self.file, self.manager.io, bytes, offset });
             self.manager.increment("read_calls", 1);
             self.manager.increment("read_bytes", count);
             if (count != bytes.len) return error.InvalidSqlSpill;
@@ -366,7 +418,7 @@ pub const File = struct {
         if (self.read_start == none or offset < self.read_start or offset - self.read_start > self.read_len or bytes.len > self.read_len -| (offset - self.read_start)) {
             self.read_start = offset;
             self.read_len = @intCast(@min(self.read_buffer.len, self.size - offset));
-            const count = try self.manager.perform(std.Io.File.readPositionalAll, .{ self.file, self.manager.io, self.read_buffer[0..self.read_len], offset });
+            const count = try self.perform(std.Io.File.readPositionalAll, .{ self.file, self.manager.io, self.read_buffer[0..self.read_len], offset });
             self.manager.increment("read_calls", 1);
             self.manager.increment("read_bytes", count);
             if (count != self.read_len) return error.InvalidSqlSpill;
@@ -390,7 +442,7 @@ pub const File = struct {
         self.closed = true;
     }
     pub fn append(self: *File, row: Row, link: u64) !u64 {
-        try self.manager.check();
+        try self.check();
         var bytes: std.ArrayList(u8) = .empty;
         defer bytes.deinit(self.manager.allocator());
         var encoder: Encoder = .{ .manager = self.manager, .a = self.manager.allocator(), .bytes = &bytes, .limit = self.manager.max_record_bytes };
@@ -426,7 +478,7 @@ pub const File = struct {
         return offset;
     }
     pub fn read(self: *File, a: Allocator, offset: u64) !Decoded {
-        try self.manager.check();
+        try self.check();
         if (offset > self.size or self.size - offset < frame_bytes) return error.InvalidSqlSpill;
         var frame: [frame_bytes]u8 = undefined;
         try self.bufferedRead(offset, &frame);
@@ -458,7 +510,7 @@ pub const File = struct {
     }
     /// Fixed-size operator state/index pages share the statement disk quota.
     pub fn writeRaw(self: *File, offset: u64, bytes: []const u8) !void {
-        try self.manager.check();
+        try self.check();
         if (offset > self.size) return error.InvalidSqlSpill;
         const end = std.math.add(u64, offset, bytes.len) catch return error.SqlProgramLimitExceeded;
         const growth = end -| self.size;
@@ -469,12 +521,12 @@ pub const File = struct {
         self.manager.increment("written_bytes", bytes.len);
     }
     pub fn readRaw(self: *File, offset: u64, bytes: []u8) !void {
-        try self.manager.check();
+        try self.check();
         if (offset > self.size or bytes.len > self.size - offset) return error.InvalidSqlSpill;
         try self.bufferedRead(offset, bytes);
     }
     pub fn match(self: *File, offset: u64) !void {
-        try self.manager.check();
+        try self.check();
         if (offset > self.size or self.size - offset < frame_bytes) return error.InvalidSqlSpill;
         var flag: [1]u8 = undefined;
         try self.bufferedRead(offset + 24, &flag);
@@ -726,7 +778,10 @@ pub const Sequential = struct {
     read_first: u64 = 0,
     read_offset: u64 = 0,
     pub fn init(manager: *Manager, bytes: usize) !Sequential {
-        return .{ .file = try manager.create(), .block_bytes = @max(128, @min(bytes, manager.max_record_bytes / 4)), .write_arena = .init(manager.allocator()), .read_arena = .init(manager.allocator()) };
+        return initFor(manager, bytes, null);
+    }
+    fn initFor(manager: *Manager, bytes: usize, execution: ?*Runnable.Execution) !Sequential {
+        return .{ .file = try manager.createFor(execution), .block_bytes = @max(128, @min(bytes, manager.max_record_bytes / 4)), .write_arena = .init(manager.allocator()), .read_arena = .init(manager.allocator()) };
     }
     pub fn close(self: *Sequential) void {
         self.pending.deinit(self.file.manager.allocator());
@@ -736,7 +791,7 @@ pub const Sequential = struct {
     }
     pub fn append(self: *Sequential, row: Row, link: u64) !u64 {
         if (link != none) return error.InvalidSqlSpill;
-        try self.file.manager.check();
+        try self.file.check();
         var bytes: usize = @sizeOf(Row);
         for (row.values) |value| bytes +|= try operators.datumBytes(value);
         for (row.keys) |value| bytes +|= try operators.datumBytes(value);
@@ -767,7 +822,7 @@ pub const Sequential = struct {
         try self.flush();
         var begin: usize = 0;
         while (begin < values.len()) {
-            try self.file.manager.check();
+            try self.file.check();
             var scratch = std.heap.ArenaAllocator.init(self.file.manager.allocator());
             defer scratch.deinit();
             const a = scratch.allocator();
@@ -1564,9 +1619,15 @@ pub const Sequential = struct {
     }
 };
 
+fn discardRun(_: Allocator, value: Sequential) void {
+    var file = value;
+    file.close();
+}
+
 pub const Sort = struct {
     const Entry = struct { normalized: ?@import("sort_key.zig").Key, position: usize, ordinal: u64 };
     manager: *Manager,
+    execution: ?*Runnable.Execution = null,
     a: Allocator,
     orders: []const operators.Order,
     memory_bytes: usize,
@@ -1606,6 +1667,19 @@ pub const Sort = struct {
             for (self.inputs[0..self.count], pointers[0..self.count]) |*file, *pointer| pointer.* = &file.*.?;
             return self.sort.mergeMany(pointers[0..self.count]);
         }
+        fn runChild(self: *MergeJob, execution: *Runnable.Execution) anyerror!Sequential {
+            self.sort.execution = execution;
+            defer self.sort.execution = null;
+            for (self.inputs[0..self.count]) |*file| file.*.?.file.execution = execution;
+            defer {
+                for (self.inputs[0..self.count]) |*file| file.*.?.file.execution = null;
+            }
+            var result = try self.run();
+            // Result arenas and file quotas borrow the stable statement owner;
+            // no receiver may escape the worker's physical task lifetime.
+            result.file.execution = null;
+            return result;
+        }
         fn close(self: *MergeJob) void {
             if (self.task) |*task| {
                 if (task.cancel(self.sort.manager.io)) |result| {
@@ -1624,11 +1698,18 @@ pub const Sort = struct {
         task: ?@import("parallel_scheduler.zig").Task(anyerror!Sequential) = null,
         fn run(self: *RunJob) anyerror!Sequential {
             try self.sort.sortRows();
-            var file = try Sequential.init(self.sort.manager, self.sort.blockBytes());
+            var file = try Sequential.initFor(self.sort.manager, self.sort.blockBytes(), self.sort.execution);
             errdefer file.close();
             try self.sort.writeRows(&file);
             try file.seal();
             return file;
+        }
+        fn runChild(self: *RunJob, execution: *Runnable.Execution) anyerror!Sequential {
+            self.sort.execution = execution;
+            defer self.sort.execution = null;
+            var result = try self.run();
+            result.file.execution = null;
+            return result;
         }
         fn destroy(self: *RunJob) void {
             const a = self.sort.a;
@@ -1649,7 +1730,7 @@ pub const Sort = struct {
     pub fn init(a: Allocator, manager: *Manager, orders: []const operators.Order, memory_bytes: usize) Sort {
         _ = a;
         const backing = manager.allocator();
-        return .{ .manager = manager, .a = backing, .orders = orders, .memory_bytes = memory_bytes, .parallel_runs = manager.parallel_work, .arena = std.heap.ArenaAllocator.init(backing), .values = .init(backing), .keys = .init(backing) };
+        return .{ .manager = manager, .a = backing, .orders = orders, .memory_bytes = memory_bytes, .parallel_runs = manager.parallel_work or manager.cpu_scope != null, .arena = std.heap.ArenaAllocator.init(backing), .values = .init(backing), .keys = .init(backing) };
     }
     pub fn deinit(self: *Sort) void {
         if (self.pending_run) |job| {
@@ -1702,7 +1783,8 @@ pub const Sort = struct {
         if (self.rows.items.len < 1024) return false;
         const first = self.rows.items[0].normalized orelse return false;
         if (!first.complete) return false;
-        for (self.rows.items) |row| {
+        for (self.rows.items, 0..) |row, index| {
+            if (index % 256 == 0) if (self.execution) |child| try child.checkpoint();
             const key = row.normalized orelse return false;
             if (!key.complete or key.types != first.types or key.len != first.len) return false;
         }
@@ -1714,9 +1796,13 @@ pub const Sort = struct {
         // by complete memcomparable bytes. Mixed/truncated keys use pdq.
         var pass: usize = 8 + first.len;
         while (pass != 0) {
+            if (self.execution) |child| try child.checkpoint();
             pass -= 1;
             var counts: [256]usize = @splat(0);
-            for (source) |row| counts[radixByte(row, pass, first.len)] += 1;
+            for (source, 0..) |row, index| {
+                if (index % 256 == 0) if (self.execution) |child| try child.checkpoint();
+                counts[radixByte(row, pass, first.len)] += 1;
+            }
             if (for (counts) |count| {
                 if (count == source.len) break true;
             } else false) continue;
@@ -1726,7 +1812,8 @@ pub const Sort = struct {
                 start.* = offset;
                 offset += count;
             }
-            for (source) |row| {
+            for (source, 0..) |row, index| {
+                if (index % 256 == 0) if (self.execution) |child| try child.checkpoint();
                 const byte = radixByte(row, pass, first.len);
                 target[offsets[byte]] = row;
                 offsets[byte] += 1;
@@ -1766,6 +1853,37 @@ pub const Sort = struct {
         };
         var comparator: Comparator = .{ .sort = self, .scratch = .init(self.a) };
         defer comparator.scratch.deinit();
+        if (self.execution) |child| {
+            // The comparator of pdq cannot return cancellation. Use fallible
+            // merge passes on children so a denied checkpoint stops CPU work
+            // immediately, instead of continuing comparisons without a grant.
+            const scratch = try self.a.alloc(Entry, self.rows.items.len);
+            defer self.a.free(scratch);
+            var width: usize = 1;
+            while (width < self.rows.items.len) : (width = width *| 2) {
+                var start: usize = 0;
+                while (start < self.rows.items.len) {
+                    const middle = @min(self.rows.items.len, start +| width);
+                    const end = @min(self.rows.items.len, middle +| width);
+                    var left = start;
+                    var right = middle;
+                    for (scratch[start..end], start..) |*out, index| {
+                        if (index % 256 == 0) try child.checkpoint();
+                        _ = comparator.scratch.reset(.retain_capacity);
+                        if (left < middle and (right == end or try comparator.compare(comparator.scratch.allocator(), self.rows.items[left], self.rows.items[right]))) {
+                            out.* = self.rows.items[left];
+                            left += 1;
+                        } else {
+                            out.* = self.rows.items[right];
+                            right += 1;
+                        }
+                    }
+                    start = end;
+                }
+                @memcpy(self.rows.items, scratch);
+            }
+            return;
+        }
         std.sort.pdq(Entry, self.rows.items, &comparator, Comparator.less);
         if (comparator.err) |err| return err;
     }
@@ -1791,10 +1909,17 @@ pub const Sort = struct {
     fn flush(self: *Sort) !void {
         try self.collectRun();
         if (self.rows.items.len == 0) return;
-        if (self.parallel_runs and self.manager.parallel_work and self.memory_bytes >= 128 * 1024) {
+        if (self.parallel_runs and (self.manager.parallel_work or self.manager.cpu_scope != null) and self.memory_bytes >= 128 * 1024) {
             const job = try self.a.create(RunJob);
             job.* = .{ .sort = .{ .manager = self.manager, .a = self.a, .orders = self.orders, .memory_bytes = self.memory_bytes / 2, .arena = self.arena, .rows = self.rows, .values = self.values, .keys = self.keys, .parallel_runs = false } };
-            if (self.manager.submit(self.estimated +| self.blockBytes() * 4, RunJob.run, .{job})) |task| {
+            const submitted = if (self.manager.cpu_scope) |scope|
+                scope.submit(self.estimated +| self.blockBytes() * 4, self.a, RunJob.runChild, .{job}, discardRun) catch |err| {
+                    self.a.destroy(job);
+                    return err;
+                }
+            else
+                self.manager.submit(self.estimated +| self.blockBytes() * 4, RunJob.run, .{job});
+            if (submitted) |task| {
                 job.task = task;
                 self.pending_run = job;
                 self.parallel_runs_started += 1;
@@ -1897,7 +2022,7 @@ pub const Sort = struct {
     }
     fn mergeMany(self: *Sort, inputs: []const *Sequential) !Sequential {
         std.debug.assert(inputs.len >= 2 and inputs.len <= self.fanIn());
-        var output = try Sequential.init(self.manager, self.blockBytes());
+        var output = try Sequential.initFor(self.manager, self.blockBytes(), self.execution);
         errdefer output.close();
         var arenas: [8]std.heap.ArenaAllocator = undefined;
         var heads: [8]?Decoded = @splat(null);
@@ -1906,7 +2031,7 @@ pub const Sort = struct {
         for (inputs, arenas[0..inputs.len], heads[0..inputs.len]) |file, *arena, *head|
             head.* = if (file.size != 0) try self.readRun(file, arena.allocator(), 0) else null;
         while (true) {
-            try self.manager.check();
+            try self.manager.checkFor(self.execution);
             var selected: ?usize = null;
             for (heads[0..inputs.len], 0..) |head, index| if (head) |value| {
                 if (selected == null or (try operators.compareRows(value.row, heads[selected.?].?.row, self.orders)) == .lt) selected = index;
@@ -1952,7 +2077,10 @@ pub const Sort = struct {
                     self.runs[index] = null;
                 }
                 claimed += width;
-                job.task = self.manager.submit(self.memory_bytes / 2, MergeJob.run, .{job});
+                job.task = if (self.manager.cpu_scope) |scope|
+                    try scope.submit(self.memory_bytes / 2, self.a, MergeJob.runChild, .{job}, discardRun)
+                else
+                    self.manager.submit(self.memory_bytes / 2, MergeJob.run, .{job});
                 if (job.task != null) self.parallel_merges_started += 1;
             }
             var failure: ?anyerror = null;
@@ -2432,6 +2560,109 @@ test "SQL parallel sort runs preserve stable order and join on early close" {
     }
 }
 
+test "SQL scoped spill sort children preserve exact runs and retire files on original failures" {
+    const Mode = enum { success, early_close, canceled, deadline, revoked };
+    const Clock = struct {
+        var now_ns: std.atomic.Value(u64) = .init(0);
+        fn now() u64 {
+            return now_ns.load(.acquire);
+        }
+    };
+    const Fixture = struct {
+        execution: *Runnable.Execution,
+        revoked: bool = false,
+        waits: usize = 0,
+        checks: usize = 0,
+        fn requested(raw: *const anyopaque) bool {
+            return @as(*const std.atomic.Value(bool), @ptrCast(@alignCast(raw))).load(.acquire);
+        }
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            // Every callback to the mutable coordinator must own its CPU grant.
+            // Physical child files use only their independent execution.
+            try std.testing.expectEqual(Runnable.State.running, self.execution.entry.?.state);
+            try self.execution.checkpoint();
+            self.checks += 1;
+        }
+        fn begin(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try check(raw);
+            self.waits += 1;
+            try self.execution.park(.resource_blocked);
+        }
+        fn end(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.execution.enter(.query);
+            if (self.revoked) return error.Forbidden;
+        }
+    };
+    for (std.enums.values(Mode)) |mode| {
+        Clock.now_ns.store(0, .release);
+        var owner = try Runnable.Scheduler.init(.{ .slots = 2, .checkpoint_budget = 1 });
+        var canceled: std.atomic.Value(bool) = .init(false);
+        var execution: Runnable.Execution = .{};
+        try execution.start(&owner, .{ .io = std.testing.io, .deadline_ns = 10, .native_now_ns = Clock.now, .cancellation = .{ .ptr = &canceled, .requested = Fixture.requested } }, .query);
+        defer execution.finish();
+        var fixture = Fixture{ .execution = &execution };
+        const boundary = @import("execution_wait.zig").Boundary{ .ptr = &fixture, .begin = Fixture.begin, .end = Fixture.end };
+        var budget: @import("memory_budget.zig") = .{ .backing = std.testing.allocator, .limit = 4 * 1024 * 1024 };
+        const a = budget.allocator();
+        {
+            var manager = Manager{ .alloc = a, .io = std.testing.io, .context = &fixture, .checkpoint = Fixture.check, .wait = boundary, .parallel_work = false, .async_writes = false, .cpu_scope = .{ .execution = &execution, .allocator = std.testing.allocator, .io = std.testing.io, .wait = boundary } };
+            defer manager.deinit();
+            {
+                var sort = Sort.init(a, &manager, &.{.{}}, 256 * 1024);
+                defer sort.deinit();
+                for (0..2048) |index| {
+                    const value = Datum.json(.{ .integer = @intCast(2047 - index) });
+                    try sort.add(.{ .values = &.{value}, .keys = &.{value}, .ordinal = index });
+                }
+                try sort.flush();
+                try std.testing.expect(sort.pending_run != null);
+                try std.testing.expect(sort.parallel_runs_started != 0);
+                try std.testing.expectEqual(@as(usize, 1), execution.entry.?.children);
+                var health: Runnable.Execution = .{};
+                try health.start(&owner, .{ .io = std.testing.io, .allow_wait = false }, .control);
+                try health.checkpoint();
+                health.finish();
+                switch (mode) {
+                    .early_close => {},
+                    .canceled => {
+                        canceled.store(true, .release);
+                        try std.testing.expectError(error.Canceled, sort.collectRun());
+                    },
+                    .deadline => {
+                        Clock.now_ns.store(10, .release);
+                        try std.testing.expectError(error.DeadlineExceeded, sort.collectRun());
+                    },
+                    .revoked => {
+                        fixture.revoked = true;
+                        try std.testing.expectError(error.Forbidden, sort.collectRun());
+                    },
+                    .success => {
+                        var scratch = std.heap.ArenaAllocator.init(a);
+                        defer scratch.deinit();
+                        for (0..2048) |index| {
+                            _ = scratch.reset(.retain_capacity);
+                            const row = (try sort.next(scratch.allocator())).?;
+                            try std.testing.expectEqual(@as(i64, @intCast(index)), row.values[0].value.integer);
+                            try std.testing.expectEqual(@as(u64, 2047 - index), row.ordinal);
+                        }
+                        try std.testing.expect((try sort.next(a)) == null);
+                        for (sort.outputs[0..sort.output_count]) |file| if (file) |value| try std.testing.expect(value.file.execution == null);
+                    },
+                }
+            }
+            try std.testing.expectEqual(@as(usize, 0), manager.files);
+            try std.testing.expectEqual(@as(u64, 0), manager.live_bytes);
+            try std.testing.expectEqual(@as(usize, 0), execution.entry.?.children);
+        }
+        try std.testing.expectEqual(@as(usize, 0), budget.live);
+        try std.testing.expectEqual(@as(usize, 0), owner.stats().child_operations);
+        try std.testing.expectEqual(@as(u64, 0), owner.stats().retained_bytes);
+    }
+}
+
 test "SQL radix sort preserves native key direction and ordinal ties" {
     const a = std.testing.allocator;
     const Hook = struct {
@@ -2497,6 +2728,73 @@ test "SQL independent merge compaction jobs preserve sorted output and release f
         try std.testing.expect(sort.parallel_merges_started >= 2);
     }
     try std.testing.expectEqual(@as(usize, 0), manager.files);
+}
+
+test "SQL scoped spill merge children share quotas and detach every transferred file" {
+    const Fixture = struct {
+        execution: *Runnable.Execution,
+        revoked: bool = false,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(Runnable.State.running, self.execution.entry.?.state);
+            try self.execution.checkpoint();
+        }
+        fn begin(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try check(raw);
+            try self.execution.park(.resource_blocked);
+        }
+        fn end(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.execution.enter(.query);
+            if (self.revoked) return error.Forbidden;
+        }
+    };
+    for ([_]bool{ false, true }) |revoked| {
+        var owner = try Runnable.Scheduler.init(.{ .slots = 2, .checkpoint_budget = 1 });
+        var execution: Runnable.Execution = .{};
+        try execution.start(&owner, .{ .io = std.testing.io }, .query);
+        defer execution.finish();
+        var fixture = Fixture{ .execution = &execution };
+        const a = std.testing.allocator;
+        const boundary = @import("execution_wait.zig").Boundary{ .ptr = &fixture, .begin = Fixture.begin, .end = Fixture.end };
+        var manager = Manager{ .alloc = a, .io = std.testing.io, .context = &fixture, .checkpoint = Fixture.check, .parallel_work = false, .async_writes = false, .wait = boundary, .cpu_scope = .{ .execution = &execution, .allocator = a, .io = std.testing.io, .wait = boundary } };
+        defer manager.deinit();
+        {
+            var sort = Sort.init(a, &manager, &.{.{}}, 1024 * 1024);
+            defer sort.deinit();
+            sort.merge_fan_in = 2;
+            for (0..8) |run| {
+                var file = try Sequential.init(&manager, 4096);
+                errdefer file.close();
+                for (0..128) |i| _ = try file.append(.{ .values = &.{}, .keys = &.{Datum.json(.{ .integer = @intCast(i * 8 + run) })}, .ordinal = i * 8 + run }, none);
+                try file.seal();
+                sort.runs[run] = file;
+            }
+            fixture.revoked = revoked;
+            if (revoked) {
+                try std.testing.expectError(error.Forbidden, sort.compactParallel());
+            } else {
+                var scratch = std.heap.ArenaAllocator.init(a);
+                defer scratch.deinit();
+                var count: usize = 0;
+                while (true) {
+                    _ = scratch.reset(.retain_capacity);
+                    const row = (try sort.next(scratch.allocator())) orelse break;
+                    try std.testing.expectEqual(@as(i64, @intCast(count)), row.keys[0].value.integer);
+                    count += 1;
+                }
+                try std.testing.expectEqual(@as(usize, 1024), count);
+                for (sort.outputs[0..sort.output_count]) |file| if (file) |value| try std.testing.expect(value.file.execution == null);
+            }
+            try std.testing.expect(sort.parallel_merges_started >= 2);
+            try std.testing.expectEqual(@as(usize, 0), execution.entry.?.children);
+        }
+        try std.testing.expectEqual(@as(usize, 0), manager.files);
+        try std.testing.expectEqual(@as(u64, 0), manager.live_bytes);
+        try std.testing.expectEqual(@as(usize, 0), owner.stats().child_operations);
+        try std.testing.expectEqual(@as(u64, 0), owner.stats().retained_bytes);
+    }
 }
 
 test "SQL spill creation waits retire acquired handles after failed resume or authority check" {

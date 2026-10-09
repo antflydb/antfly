@@ -158,7 +158,7 @@ fn runBound(alloc: std.mem.Allocator, arena: std.mem.Allocator, backend: catalog
     var manager: ?@import("spill.zig").Manager = null;
     defer if (manager) |*owned| owned.deinit();
     if (backend.spill_manager == null and limits.spill_bytes != 0) if (backend.execution_io orelse backend.spill_io) |io| {
-        manager = .{ .alloc = alloc, .io = io, .parallel_work = backend.execution_io != null and backend.spill_wait == null, .async_writes = backend.execution_io != null and backend.spill_wait == null, .wait = backend.spill_wait, .context = backend.ptr, .checkpoint = backend.vtable.checkpoint, .root = limits.spill_root, .max_bytes = limits.spill_bytes, .buffer_bytes = @min(4096, @max(128, limits.retained_bytes / 512)), .max_record_bytes = @max(@as(usize, 1024), @min(@as(usize, 4 * 1024 * 1024), limits.retained_bytes / 32)) };
+        manager = .{ .alloc = alloc, .io = io, .parallel_work = backend.execution_io != null and backend.spill_wait == null, .cpu_scope = backend.cpu_scope, .async_writes = backend.execution_io != null and backend.spill_wait == null, .wait = backend.spill_wait, .context = backend.ptr, .checkpoint = backend.vtable.checkpoint, .root = limits.spill_root, .max_bytes = limits.spill_bytes, .buffer_bytes = @min(4096, @max(128, limits.retained_bytes / 512)), .max_record_bytes = @max(@as(usize, 1024), @min(@as(usize, 4 * 1024 * 1024), limits.retained_bytes / 32)) };
     };
     const context = Context{ .alloc = alloc, .arena = arena, .backend = backend, .binding = binding, .parameters = parameters, .limits = limits, .spill = backend.spill_manager orelse if (manager) |*owned| owned else null, .sink = sink };
     return context.run(compiled.statement);

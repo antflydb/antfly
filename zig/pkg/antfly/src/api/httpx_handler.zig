@@ -16946,7 +16946,8 @@ test "SQL protected executor cleanup owner reserves independent reaper and recla
     try std.testing.expectEqual(@as(i64, 0), cleanup_stats.get("retained").?.integer);
     api.deinit();
     closed = true;
-    try std.testing.expect(api.sqlCleanupStats() == null);
+    // The server lifetime has ended. Verify worker retirement through the
+    // independent backend owner, rather than accessing the destroyed server.
     try std.testing.expectEqual(@as(usize, 0), runtime.ptr().laneStats().reserved_workers);
 }
 
