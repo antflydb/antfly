@@ -169,6 +169,64 @@
       "Production arenas may amortize allocator-call savings",
       "Sorted-by-run and large-L0 directory planning retain the existing path",
       "Fixed cursor stack storage and 24 bytes per read-order tree node trade against per-batch heap work"
+    ],
+    "measurement_commit": "4f8427650256e997629f2f3540f18691142a9ac9",
+    "packing_measurements_note": "Historical per-batch packing measurements. The owner_packing_and_single_point_followup section records the replacement design."
+  },
+  "owner_packing_and_single_point_followup": {
+    "merged_main_commit": "ebff19444d",
+    "comparison_commit": "4f8427650256e997629f2f3540f18691142a9ac9",
+    "sparse_owned_batches": {
+      "batches": 1000,
+      "requested_keys_per_batch": 16,
+      "hits_per_batch": 1,
+      "value_bytes": 1024,
+      "before": {
+        "retained_payload_bytes": 16384000,
+        "result_allocations": 1000,
+        "payload_budget_2048": "OutOfMemory"
+      },
+      "after": {
+        "retained_payload_bytes": 1031168,
+        "result_allocations": 66,
+        "payload_budget_2048": "success"
+      },
+      "metadata": "held allocation metadata prewarmed; payload remains alive across every batch",
+      "design": "Packing state belongs to the result owner; small slabs grow geometrically from actual copied demand. Optional spare capacity falls back to exact-size storage. Published values never move."
+    },
+    "warm_single_directory_points": {
+      "lookups": 9600,
+      "overlapping_l0_runs": 64,
+      "entries_per_run": 192,
+      "before": {
+        "elapsed_ns_samples": [
+          20142192000
+        ],
+        "planning_allocations": 28800
+      },
+      "after": {
+        "elapsed_ns_samples": [
+          108727000
+        ],
+        "planning_allocations": 0
+      },
+      "design": "Single-run lookups retain the established block loader and direct large-value lease adoption. With multiple overlapping runs, warm deciding candidates stop read-order traversal immediately; cold candidates prepare bounded asynchronous windows, consume results in visibility order and cancel remaining speculative reads after a deciding result. Preserve the bounds-index planner for unsupported directories or L0 counts greater than 64.",
+      "limitations": "Synthetic maximum supported L0 overlap, latest-run hits, warm MemoryStorage, Debug. This does not establish end-to-end speedup."
+    },
+    "bounds": {
+      "initial_small_slab_bytes": 256,
+      "max_slab_bytes": 16384,
+      "max_packed_value_bytes": 1024
+    },
+    "coverage": [
+      "Sparse misses with one copied result per batch",
+      "Live values across slab growth and repeated batches",
+      "Optional capacity fallback with tight result budgets",
+      "Allocation failure cleanup and stale cursor reset",
+      "Direct versus planned single reads across namespaces, tombstones, empty values and a 65-run backlog",
+      "Cold overlapping candidates still issue concurrent reads and cancel superseded reads",
+      "Result allocation ownership transfer resets source packing state",
+      "Single-run reads retain cache allocator ownership and direct large-value lease adoption"
     ]
   }
 }
