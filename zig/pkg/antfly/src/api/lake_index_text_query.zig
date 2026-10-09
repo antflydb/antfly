@@ -39,6 +39,7 @@ pub fn executeWithDelivery(a: A, server: *server_api.ApiHttpServer, table: local
     };
 }
 fn executePinned(a: A, server: *server_api.ApiHttpServer, table: local.common_topology_records.TableRecord, req: types.SearchRequest, request: local.api_operation.RequestContext, delivery: ?local.api_query_response.Delivery) !?local.api_query.QueryResponse {
+    const query_started = @import("antfly_platform").time.monotonicNs();
     var schema = (try local.serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc(a, table.schema_json)) orelse return null;
     defer schema.deinit(a);
     // Graph and search aggregation execution require their own native ports;
@@ -90,6 +91,7 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, table: local.common_to
     owner.files = metadata.files;
     owner.private_files = metadata.private_files;
     owner.private_digests = metadata.private_digests;
+    const publication_finished = @import("antfly_platform").time.monotonicNs();
     var effective = req;
     effective.cancellation = .{ .ptr = &owner, .is_cancelled_fn = Execution.canceled };
     const has_vectors = effective.dense != null or effective.sparse != null or effective.dense_queries.len != 0 or effective.sparse_queries.len != 0;
@@ -113,14 +115,14 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, table: local.common_to
     // Retrieval/ranking for these requests needs identities and scores only.
     // Hydrate the final page once, after all result movement, into retained column pages.
     if (owner.typed_delivery) execution_req.include_stored = false;
-    const started = @import("antfly_platform").time.monotonicNs();
     var result = if (execution_req.full_text_queries.len != 0 or execution_req.sparse_queries.len != 0 or execution_req.dense_queries.len != 0)
         try search.searchComposed(a, execution_req, .{ .ctx = &owner, .search_text_query = Execution.searchText, .search_text = Execution.dispatchText, .search_dense = Execution.searchDense, .search_sparse = Execution.searchSparse, .clone_named_set = Execution.cloneSet, .fuse_named_sets = Execution.fuseSets, .attach_graph_results = Execution.attachGraph })
     else if (execution_req.dense) |dense| try Execution.searchDense(&owner, a, execution_req, dense) else if (execution_req.sparse) |sparse| try Execution.searchSparse(&owner, a, execution_req, sparse) else if (execution_req.full_text) |text| try Execution.searchText(&owner, a, execution_req, text) else try Execution.dispatchText(&owner, a, execution_req);
     defer result.deinit();
+    const search_finished = @import("antfly_platform").time.monotonicNs();
     if (!owner.typed_delivery) try owner.attachHighlights(a, effective, &result);
     try context.ensureActive();
-    var meta: local.api_query.QueryResponseMeta = .{ .remote_snapshot = &snapshot_token, .shard_count = 1, .took_ms = @intCast((@import("antfly_platform").time.monotonicNs() -| started) / std.time.ns_per_ms) };
+    var meta: local.api_query.QueryResponseMeta = .{ .remote_snapshot = &snapshot_token, .shard_count = 1, .took_ms = @intCast((@import("antfly_platform").time.monotonicNs() -| query_started) / std.time.ns_per_ms) };
     defer meta.deinit(a);
     try @import("query_post_processing.zig").applyQueryPostProcessing(a, effective, &result, &meta, .{ .source_table = table.name, .backend_runtime = server.cfg.backend_runtime, .secret_store = server.cfg.secret_store, .remote_content = server.cfg.remote_content });
     var prepared_delivery = delivery;
@@ -133,8 +135,17 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, table: local.common_to
         if (!effective.count_only and (effective.include_stored or effective.highlight != null)) try owner.hydrateTyped(a, result.hits);
         try owner.attachHighlights(a, effective, &result);
     }
-    meta.took_ms = @intCast((@import("antfly_platform").time.monotonicNs() -| started) / std.time.ns_per_ms);
-    return try local.api_query.encodeQueryResponsesWithDelivery(a, table.name, effective, meta, result, prepared_delivery);
+    meta.took_ms = @intCast((@import("antfly_platform").time.monotonicNs() -| query_started) / std.time.ns_per_ms);
+    const response = try local.api_query.encodeQueryResponsesWithDelivery(a, table.name, effective, meta, result, prepared_delivery);
+    const finished = @import("antfly_platform").time.monotonicNs();
+    server.lake_read_cache.recordQuery(.{
+        .total_ns = finished -| query_started,
+        .publication_ns = publication_finished -| query_started,
+        .search_ns = search_finished -| publication_finished,
+        .hydration_ns = owner.hydration_ns,
+        .delivery_ns = finished -| search_finished,
+    });
+    return response;
 }
 const Execution = struct {
     server: *server_api.ApiHttpServer,
@@ -153,6 +164,7 @@ const Execution = struct {
     predicate_exclusion_json: []const u8 = "",
     predicate_allow_partial: bool = true,
     delivery_request: ?types.SearchRequest = null,
+    hydration_ns: u64 = 0,
     highlight_pins: std.ArrayList(search.PinnedTextSource) = .empty,
     highlight_queries: ?[]const search.HighlightQuery = null,
     arena: A,
@@ -652,6 +664,8 @@ const Execution = struct {
     }
     fn loadSelected(comptime T: type, raw: ?*anyopaque, a: A, keys: []const []const u8, selected_fields: ?[]const []const u8) ![]?T {
         const self = from(raw);
+        const hydration_started = @import("antfly_platform").time.monotonicNs();
+        defer self.hydration_ns +|= @import("antfly_platform").time.monotonicNs() -| hydration_started;
         try self.context.ensureActive();
         const result = try a.alloc(?T, keys.len);
         @memset(result, null);

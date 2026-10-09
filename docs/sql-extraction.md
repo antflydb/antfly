@@ -371,6 +371,40 @@ unselected files, row groups and pages and preserve Iceberg delete filtering.
 Authenticated page/block reads share the scoped persistent lake cache, whose
 contents never replace current source or authorization proof.
 
+Cold-query qualification separates persistent-byte reuse from decoded runtime
+warmup. Request status exposes `lake_range_cache` and `lake_disk_cache`; inspect
+`disk_unavailable`, `disk_init_attempts`, and `disk_init_failures` before treating
+an empty disk directory as a query performance problem. Optional disk startup
+failures preserve RAM/source reads and retry after a 30-second awake-clock
+cooldown. Concurrent requests do not wait behind cache inventory startup.
+The disk counters include `write_errors`, `last_write_error`, `writes_dropped`,
+`queued_entries`, and `writes_completed`, distinguishing a failed worker write
+from bounded admission or a write that has not yet drained. A disabled cache or
+an enabled cache without a resolvable root does not start a disk owner; configure
+`lake_cache.root` explicitly when the node has no local storage base directory.
+
+To qualify a deployment, issue the same highlighted query against one pinned
+publication, wait for queued writes to drain, and record provider requests/bytes,
+disk hits, and elapsed time. Restart using the same persistent cache volume and
+credentials and repeat, then separately repeat with an empty cache directory.
+Compare counter deltas on an otherwise idle node: shared cache traffic counters
+are not per-request attribution. Completed indexed-search queries also accumulate
+publication, search, hydration, delivery, and total nanoseconds without query-log
+spam. Hydration is nested inside search/delivery, so these counters must not all
+be summed. Decoded structures still rebuild after restart; persisted immutable
+artifacts and Parquet ranges can be reused. This procedure is deployment
+qualification, not a claim that a particular GCS startup failure is diagnosed.
+
+Cold Parquet reads transfer verified object-response ownership without another
+body copy and reuse a header probe when it already contains the complete page.
+The projected-page restart regression asserts four cold provider requests and
+zero additional requests after reopening the same disk cache with the provider
+unavailable, while excluding a 512-KiB unselected column. This is deterministic
+request-count evidence, not a latency benchmark. Highlight text still comes from
+the required Parquet projection: storing display/highlight fields in an index
+sidecar remains a separate storage-format/build-policy decision, and is not
+enabled implicitly by these cache changes.
+
 Reader authority lives in native metadata independently of definition CAS.
 One renewable publication lease per process/session amortizes concurrent reads,
 protects an old generation across replacement and DROP, and fences every cache
