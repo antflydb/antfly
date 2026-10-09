@@ -79,8 +79,8 @@ Portable `.afb` backups are storage-neutral:
   swaps out an existing one. A failed or interrupted restore leaves the
   destination holding either the complete old or the complete new database,
   never a partial or missing one. Replacing a directory database that any
-  process has open (through libantfly or otherwise), or a Lite file that has
-  an open writer, fails with `ANTFLY_BUSY`; so does opening a directory
+  process has open (through libantfly or otherwise), or a Lite file whose
+  writer lease is held, fails with `ANTFLY_BUSY`; so does opening a directory
   database while a restore publishes it. `ANTFLY_OUTCOME_UNKNOWN` means the
   new database was published but its crash durability could not be confirmed.
 
@@ -243,13 +243,34 @@ This is stronger than `sqlite3_close`, where using a closed connection is
 undefined. Bindings may still track their own handle state to report a
 closed handle before crossing the ABI.
 
-Across handles and processes the Lite model matches SQLite in WAL mode: one
-writer and any number of readers per file. The writer lock is taken when a
-writer handle opens and held until it closes. A second writer open fails
-with `ANTFLY_BUSY` immediately, or, when `busy_timeout_ms` is set in
-`antfly_open_options`, retries with capped
-exponential backoff until the timeout elapses, like `sqlite3_busy_timeout`.
-Read-only and status-only opens never contend for the writer lock.
+Lite embedded handles are independent connections. Any number of writable,
+read-only, and status-only connections may remain open to the same file.
+Opening an existing file does not reserve its writer. Complete native operations
+queue on a canonical file gate within a process, and a kernel path lease
+coordinates operations between processes. A writable operation owns the lease
+through its durable publication; SQL COMMIT retains it through the complete
+coordinator/participant recovery boundary. A competing process returns
+`ANTFLY_BUSY`, or waits up to `busy_timeout_ms`. Read-only calls use a shared
+lease. Calls on writable connections currently use an exclusive lease even
+for reads, a conservative policy that serializes those calls across processes.
+Read-only snapshots without a lock sidecar also open from read-only directories
+or media. Their calls use a shared inode fence when sidecar creation is denied;
+every sidecar creator takes the exclusive inode fence before installing it.
+Reopened native writers discover pending generated enrichment in the durable
+journals of all tables and resume it under their connection lease.
+
+After an external commit or atomic file replacement, a connection reopens its
+cached runtime before the next operation. Streaming SQL cursors retain the
+runtime and immutable pages they originally pinned; retiring that runtime
+releases caches without flushing them over a newer generation. Read-only
+connections observe new commits at operation boundaries. Automatic enrichment,
+TTL, and reclamation maintenance run under the same connection lease.
+
+This follows SQLite's separation of connection lifetime from writer ownership;
+it does not claim SQLite WAL concurrency or change Antfly SQL's existing
+READ COMMITTED transaction semantics. Low-level storage owners used by the
+standalone CLI/server retain their exclusive owner contract; a connection waits
+for an active owner at operation time, not at open time.
 
 Every thread that calls into `libantfly` needs at least
 `ANTFLY_MIN_THREAD_STACK_SIZE` (8 MiB) of native stack. The storage engine
