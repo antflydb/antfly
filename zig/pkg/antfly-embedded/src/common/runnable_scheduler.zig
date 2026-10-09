@@ -44,6 +44,10 @@ pub const Config = struct {
 
 pub const Entry = struct {
     options: admission.Options,
+    /// Parent and all of its original clock/cancellation owners remain stable
+    /// until this entry's owning finish, including stopped and blocked work.
+    parent: ?*Entry = null,
+    children: usize = 0,
     class: Class,
     slots: usize = 1,
     bytes: u64 = 0,
@@ -92,6 +96,7 @@ pub const Scheduler = struct {
 
     pub const Stats = struct {
         operations: usize = 0,
+        child_operations: usize = 0,
         retained_bytes: u64 = 0,
         control_operations: usize = 0,
         control_retained_bytes: u64 = 0,
@@ -216,6 +221,35 @@ pub const Scheduler = struct {
         const now = e.options.now();
         self.lock();
         defer self.mutex.unlock();
+        if (e.parent != null) return error.InvalidRunnableTransition;
+        try self.submitLocked(e, now);
+    }
+
+    /// Reserve a child before publishing its task. Each child uses the same
+    /// finite operation/byte registry and fair CPU queue, with independent
+    /// park/yield state. Its IO must be an independently owned worker lane;
+    /// every deadline, clock and cancellation borrow comes from the parent.
+    pub fn submitChild(self: *Scheduler, parent: *Entry, child: *Entry, io: std.Io) !void {
+        try self.checkAuthority(parent);
+        const now = parent.options.now();
+        self.lock();
+        defer self.mutex.unlock();
+        if (parent == child or parent.scheduler != self or parent.state != .running or parent.retainedPhase() or
+            child.state != .fresh or child.scheduler != null or child.parent != null or child.children != 0 or parent.slots != 1) return error.InvalidRunnableTransition;
+        try self.checkAncestorsLocked(parent);
+        if (child.bytes < @sizeOf(Entry)) return error.InvalidRunnableDemand;
+        child.options = parent.options;
+        child.options.io = io;
+        child.options.retained_bytes = child.bytes;
+        child.class = parent.class;
+        child.slots = 1;
+        try self.submitLocked(child, now);
+        child.parent = parent;
+        parent.children += 1;
+        self.metrics.child_operations += 1;
+    }
+
+    fn submitLocked(self: *Scheduler, e: *Entry, now: u64) !void {
         if (e.state != .fresh or e.scheduler != null) return error.InvalidRunnableTransition;
         const capacity = if (e.class == .control) self.config.control_slots else self.config.slots - self.config.control_slots;
         if (self.closed) return error.SchedulerClosed;
@@ -250,6 +284,21 @@ pub const Scheduler = struct {
         e.waited = e.state == .queued;
     }
 
+    fn checkAuthority(self: *Scheduler, e: *const Entry) !void {
+        try e.options.check();
+        self.lock();
+        defer self.mutex.unlock();
+        try self.checkAncestorsLocked(e);
+    }
+
+    fn checkAncestorsLocked(self: *Scheduler, e: *const Entry) !void {
+        var ancestor = e.parent;
+        while (ancestor) |parent| : (ancestor = parent.parent) {
+            if (parent.scheduler != self) return error.InvalidRunnableTransition;
+            if (parent.state == .stopped) return parent.failure orelse error.InvalidRunnableTransition;
+        }
+    }
+
     pub fn state(self: *Scheduler, e: *const Entry) State {
         self.lock();
         defer self.mutex.unlock();
@@ -260,7 +309,7 @@ pub const Scheduler = struct {
     /// cannot use this API to discard retained completion/cleanup consumers.
     pub fn wait(self: *Scheduler, e: *Entry) !void {
         self.lock();
-        const completing = e.scheduler == self and e.retainedPhase();
+        const completing = e.scheduler == self and (e.retainedPhase() or e.children != 0);
         self.mutex.unlock();
         if (completing) return self.waitRetained(e);
         return self.waitImpl(e, false);
@@ -311,7 +360,7 @@ pub const Scheduler = struct {
             self.mutex.unlock();
         }
         while (true) {
-            options.check() catch |err| {
+            self.checkAuthority(e) catch |err| {
                 self.failWait(e, err, retain);
                 return err;
             };
@@ -329,7 +378,7 @@ pub const Scheduler = struct {
                 return error.RunnableWaitTimeout;
             }
             if (s == .running and (!closed or completing)) {
-                options.check() catch |err| {
+                self.checkAuthority(e) catch |err| {
                     self.failWait(e, err, retain);
                     return err;
                 };
@@ -387,7 +436,7 @@ pub const Scheduler = struct {
         const now = e.options.now();
         self.lock();
         defer self.mutex.unlock();
-        if (e.scheduler != self or e.state != .running) return error.InvalidRunnableTransition;
+        if (e.scheduler != self or e.state != .running or e.children != 0) return error.InvalidRunnableTransition;
         const capacity = if (e.class == .control) self.config.control_slots else self.config.slots - self.config.control_slots;
         if (slots == 0 or slots > capacity) return error.InvalidRunnableDemand;
         // Only a separately reserved/activated retained phase may resize
@@ -451,6 +500,7 @@ pub const Scheduler = struct {
         if (e.scheduler != self) return error.InvalidRunnableTransition;
         if (self.closed and !e.retainedPhase()) return error.SchedulerClosed;
         if (e.state != .resource_blocked and e.state != .output_blocked) return error.InvalidRunnableTransition;
+        if ((e.children != 0 or e.parent != null) and class != e.class) return error.InvalidRunnableTransition;
         // Retained completion/cleanup cannot promote its capacity partition.
         if (e.retainedPhase() and class != e.class) return error.InvalidRunnableTransition;
         const capacity = if (class == .control) self.config.control_slots else self.config.slots - self.config.control_slots;
@@ -471,7 +521,7 @@ pub const Scheduler = struct {
         defer self.mutex.unlock();
         if (e.scheduler != self or e.state != .running or
             (e.class != .write and e.class != .control) or
-            e.completion_options != null or e.retainedPhase()) return error.InvalidRunnableTransition;
+            e.completion_options != null or e.retainedPhase() or e.parent != null) return error.InvalidRunnableTransition;
         if (self.closed) return error.SchedulerClosed;
         if (completion.retained_bytes > e.bytes) return error.InvalidRunnableDemand;
         var options = completion;
@@ -506,7 +556,7 @@ pub const Scheduler = struct {
         try cleanup.check();
         self.lock();
         defer self.mutex.unlock();
-        if (e.scheduler != self or e.state != .running or e.cleanup_options != null or e.retainedPhase()) return error.InvalidRunnableTransition;
+        if (e.scheduler != self or e.state != .running or e.cleanup_options != null or e.retainedPhase() or e.parent != null) return error.InvalidRunnableTransition;
         if (self.closed) return error.SchedulerClosed;
         if (cleanup.retained_bytes > e.bytes) return error.InvalidRunnableDemand;
         var options = cleanup;
@@ -530,7 +580,7 @@ pub const Scheduler = struct {
         try cleanup.check();
         self.lock();
         defer self.mutex.unlock();
-        if (e.scheduler != self or e.retainedPhase()) return error.InvalidRunnableTransition;
+        if (e.scheduler != self or e.retainedPhase() or e.children != 0 or e.parent != null) return error.InvalidRunnableTransition;
         switch (e.state) {
             .running => {},
             .queued => self.unlink(e),
@@ -568,7 +618,7 @@ pub const Scheduler = struct {
         try completion.check();
         self.lock();
         defer self.mutex.unlock();
-        if (e.scheduler != self or e.state != .running or e.retainedPhase()) return error.InvalidRunnableTransition;
+        if (e.scheduler != self or e.state != .running or e.retainedPhase() or e.children != 0 or e.parent != null) return error.InvalidRunnableTransition;
         if (self.closed) return error.SchedulerClosed;
         const options = e.completion_options orelse return error.InvalidRunnableTransition;
         e.options = options;
@@ -581,7 +631,7 @@ pub const Scheduler = struct {
         self.lock();
         defer self.mutex.unlock();
         if (e.scheduler == null) return;
-        std.debug.assert(e.scheduler == self);
+        std.debug.assert(e.scheduler == self and e.children == 0);
         switch (e.state) {
             .queued => self.unlink(e),
             .running => self.used[@backingInt(e.class)] -= e.slots,
@@ -595,6 +645,12 @@ pub const Scheduler = struct {
         e.all_previous = null;
         self.metrics.operations -= 1;
         self.metrics.retained_bytes -= e.bytes;
+        if (e.parent) |parent| {
+            std.debug.assert(parent.scheduler == self and parent.children != 0);
+            parent.children -= 1;
+            self.metrics.child_operations -= 1;
+            e.parent = null;
+        }
         if (e.reserved_control) {
             self.metrics.control_operations -= 1;
             self.metrics.control_retained_bytes -= e.bytes;
@@ -708,6 +764,21 @@ pub const Execution = struct {
         self.resume_generation +%= 1;
         self.quantum_start_ns = options.now();
     }
+    /// Stable child metadata and the independent worker IO must outlive every
+    /// physical task join. Finishing the parent with live children is invalid.
+    pub fn startChild(self: *Execution, parent: *Execution, io: std.Io, retained_bytes: u64) !void {
+        if (self.entry != null or self == parent) return error.InvalidRunnableTransition;
+        const parent_entry = if (parent.entry) |*entry| entry else return error.InvalidRunnableTransition;
+        const owner = try schedulerFor(parent_entry, true);
+        if (retained_bytes < @sizeOf(Execution)) return error.InvalidRunnableDemand;
+        self.entry = .{ .options = parent_entry.options, .class = parent_entry.class, .bytes = retained_bytes };
+        errdefer self.finish();
+        try owner.submitChild(parent_entry, &self.entry.?, io);
+        try owner.wait(&self.entry.?);
+        self.resume_generation +%= 1;
+        self.quantum_start_ns = self.entry.?.options.now();
+    }
+
     fn schedulerFor(e: *Entry, comptime needs_running: bool) !*Scheduler {
         const owner = e.scheduler orelse return error.InvalidRunnableTransition;
         owner.lock();
@@ -726,7 +797,7 @@ pub const Execution = struct {
         if (slots == 0) return error.InvalidRunnableDemand;
         const e = if (self.entry) |*entry| entry else return;
         const owner = try schedulerFor(e, true);
-        try e.options.check();
+        try owner.checkAuthority(e);
         try owner.resizeTeam(e, slots);
         try owner.waitRetained(e);
         self.resume_generation +%= 1;
@@ -736,7 +807,7 @@ pub const Execution = struct {
     pub fn checkpoint(self: *Execution) !void {
         const e = if (self.entry) |*entry| entry else return;
         const owner = try schedulerFor(e, true);
-        try e.options.check();
+        try owner.checkAuthority(e);
         self.checkpoints +|= 1;
         if (self.checkpoints < owner.config.checkpoint_budget and
             e.options.now() -| self.quantum_start_ns < @as(u64, owner.config.quantum_ms) * std.time.ns_per_ms) return;
@@ -767,7 +838,7 @@ pub const Execution = struct {
     pub fn reserveCompletion(self: *Execution, completion: admission.Options) !void {
         const e = if (self.entry) |*entry| entry else return error.ExecutionWaitUnsupported;
         const owner = try schedulerFor(e, true);
-        try e.options.check();
+        try owner.checkAuthority(e);
         try owner.reserveCompletion(e, completion);
     }
     pub fn activateCompletion(self: *Execution) !void {
@@ -776,7 +847,7 @@ pub const Execution = struct {
         // Activation must precede acceptance and may not escape a foreground
         // fence which has already failed. Afterwards only completion fences
         // govern the still-retained root.
-        try e.options.check();
+        try owner.checkAuthority(e);
         const options = e.completion_options orelse return error.InvalidRunnableTransition;
         try options.check();
         try owner.activateCompletion(e);
@@ -2145,4 +2216,269 @@ test "runnable scheduler cleanup activation budget cannot replace active durable
     try std.testing.expect(!write.entry.?.cleanup_active);
     try std.testing.expectEqual(@as(?u64, 1000), write.entry.?.options.deadline_ns);
     try std.testing.expectEqual(@as(u64, 19), owner.stats().retained_bytes);
+}
+
+test "runnable scheduler children independently park yield and retain their parent through nested finish" {
+    var owner = try Scheduler.init(.{ .slots = 5, .checkpoint_budget = 1 });
+    defer owner.close();
+    var parent: Execution = .{};
+    defer parent.finish();
+    try parent.start(&owner, .{ .io = std.testing.io, .retained_bytes = 17 }, .query);
+    var first: Execution = .{};
+    defer first.finish();
+    try first.startChild(&parent, std.testing.io, @sizeOf(Execution));
+    var second: Execution = .{};
+    defer second.finish();
+    try second.startChild(&parent, std.testing.io, @sizeOf(Execution));
+    var nested: Execution = .{};
+    defer nested.finish();
+    try nested.startChild(&first, std.testing.io, @sizeOf(Execution));
+    try std.testing.expectEqual(@as(usize, 4), owner.stats().runnable_slots);
+    try std.testing.expectEqual(@as(usize, 3), owner.stats().child_operations);
+    try std.testing.expectEqual(@as(usize, 2), parent.entry.?.children);
+    try std.testing.expectEqual(@as(usize, 1), first.entry.?.children);
+    try parent.park(.resource_blocked);
+    try first.park(.output_blocked);
+    const parent_generation = parent.resume_generation;
+    try second.checkpoint();
+    try nested.checkpoint();
+    try std.testing.expectEqual(parent_generation, parent.resume_generation);
+    try std.testing.expectEqual(@as(usize, 2), owner.stats().runnable_slots);
+    try std.testing.expectEqual(@as(usize, 4), owner.stats().operations);
+    try std.testing.expectError(error.InvalidRunnableTransition, owner.reclassifyBlocked(&parent.entry.?, .control));
+    try parent.enter(.query);
+    try first.enter(.query);
+    try std.testing.expectError(error.InvalidRunnableTransition, parent.resizeTeam(2));
+    nested.finish();
+    first.finish();
+    try std.testing.expectEqual(@as(usize, 1), parent.entry.?.children);
+    second.finish();
+    try std.testing.expectEqual(@as(usize, 0), parent.entry.?.children);
+    parent.finish();
+    try std.testing.expectEqual(@as(usize, 0), owner.stats().operations);
+    try std.testing.expectEqual(@as(usize, 0), owner.stats().child_operations);
+    try std.testing.expectEqual(@as(u64, 0), owner.stats().retained_bytes);
+}
+
+test "runnable scheduler children share bounded reservation and leave control capacity available" {
+    var owner = try Scheduler.init(.{ .slots = 4, .max_operations = 6, .max_bytes = 128 * 1024 });
+    defer owner.close();
+    var parent: Execution = .{};
+    defer parent.finish();
+    try parent.start(&owner, .{ .io = std.testing.io, .retained_bytes = 19 }, .inference);
+    var first: Execution = .{};
+    defer first.finish();
+    var second: Execution = .{};
+    defer second.finish();
+    try first.startChild(&parent, std.testing.io, @sizeOf(Execution));
+    try second.startChild(&parent, std.testing.io, @sizeOf(Execution));
+    try first.park(.resource_blocked);
+    try second.park(.output_blocked);
+    const retained = owner.stats().retained_bytes;
+    var rejected: Execution = .{};
+    defer rejected.finish();
+    try std.testing.expectError(error.SchedulerFull, rejected.startChild(&parent, std.testing.io, @sizeOf(Execution)));
+    try std.testing.expect(rejected.entry == null);
+    try std.testing.expectEqual(@as(usize, 2), parent.entry.?.children);
+    try std.testing.expectEqual(retained, owner.stats().retained_bytes);
+    var health: Execution = .{};
+    defer health.finish();
+    try health.start(&owner, .{ .io = std.testing.io, .allow_wait = false, .retained_bytes = 1 }, .control);
+    try health.checkpoint();
+    try std.testing.expectEqual(@as(usize, 1), owner.stats().control_slots);
+    owner.close();
+    try std.testing.expectError(error.SchedulerClosed, first.enter(.inference));
+    try std.testing.expectEqual(retained + 1, owner.stats().retained_bytes);
+    try std.testing.expectEqual(@as(usize, 2), parent.entry.?.children);
+    second.finish();
+    first.finish();
+    parent.finish();
+    health.finish();
+    try std.testing.expectEqual(@as(u64, 0), owner.stats().retained_bytes);
+    try std.testing.expectEqual(@as(usize, 0), owner.stats().operations);
+}
+
+test "runnable scheduler children inherit original deadline cancellation and stopped ancestor cause" {
+    const Clock = struct {
+        var value: u64 = 0;
+        fn now() u64 {
+            return value;
+        }
+    };
+    const Cancel = struct {
+        fn requested(raw: *const anyopaque) bool {
+            return @as(*const bool, @ptrCast(@alignCast(raw))).*;
+        }
+    };
+    for ([_]anyerror{ error.Canceled, error.DeadlineExceeded, error.RunnableWaitTimeout }) |failure| {
+        Clock.value = 0;
+        var canceled = false;
+        var owner = try Scheduler.init(.{ .slots = 4, .checkpoint_budget = 1 });
+        defer owner.close();
+        var parent: Execution = .{};
+        defer parent.finish();
+        try parent.start(&owner, .{ .io = std.testing.io, .retained_bytes = 23, .deadline_ns = 100, .native_now_ns = Clock.now, .cancellation = .{ .ptr = &canceled, .requested = Cancel.requested } }, .query);
+        var child: Execution = .{};
+        defer child.finish();
+        try child.startChild(&parent, std.testing.io, @sizeOf(Execution));
+        try std.testing.expectEqual(parent.entry.?.options.deadline_ns, child.entry.?.options.deadline_ns);
+        const retained = owner.stats().retained_bytes;
+        try child.park(.resource_blocked);
+        if (failure == error.Canceled) canceled = true else if (failure == error.DeadlineExceeded) Clock.value = 100 else owner.failWait(&parent.entry.?, failure, true);
+        try std.testing.expectError(failure, child.enter(.query));
+        try std.testing.expectEqual(State.stopped, child.entry.?.state);
+        try std.testing.expectEqual(@as(usize, 1), parent.entry.?.children);
+        try std.testing.expectEqual(retained, owner.stats().retained_bytes);
+        try std.testing.expectError(failure, child.checkpoint());
+        child.finish();
+        try std.testing.expectEqual(@as(usize, 0), parent.entry.?.children);
+    }
+}
+
+test "runnable scheduler children do not inherit completion cleanup or capacity promotion" {
+    var owner = try Scheduler.init(.{ .slots = 4 });
+    defer owner.close();
+    var parent: Execution = .{};
+    defer parent.finish();
+    const until = @as(u64, @intCast(std.Io.Clock.awake.now(std.testing.io).nanoseconds)) + 10 * std.time.ns_per_s;
+    try parent.start(&owner, .{ .io = std.testing.io, .retained_bytes = 32 }, .write);
+    try parent.reserveCompletion(.{ .io = std.testing.io, .deadline_ns = until });
+    try parent.reserveCleanup(.{ .io = std.testing.io, .deadline_ns = until });
+    var child: Execution = .{};
+    defer child.finish();
+    try child.startChild(&parent, std.testing.io, @sizeOf(Execution));
+    try std.testing.expect(child.entry.?.completion_options == null);
+    try std.testing.expect(child.entry.?.cleanup_options == null);
+    try std.testing.expectError(error.InvalidRunnableTransition, parent.activateCompletion());
+    try std.testing.expectError(error.InvalidRunnableTransition, parent.activateCleanup());
+    try std.testing.expectError(error.InvalidRunnableTransition, child.reserveCompletion(.{ .io = std.testing.io, .deadline_ns = until }));
+    try std.testing.expectError(error.InvalidRunnableTransition, child.reserveCleanup(.{ .io = std.testing.io, .deadline_ns = until }));
+    try child.park(.resource_blocked);
+    try std.testing.expectError(error.InvalidRunnableTransition, child.enter(.control));
+    child.finish();
+    try parent.activateCompletion();
+    var denied: Execution = .{};
+    defer denied.finish();
+    try std.testing.expectError(error.InvalidRunnableTransition, denied.startChild(&parent, std.testing.io, @sizeOf(Execution)));
+    try std.testing.expect(denied.entry == null);
+}
+
+test "runnable scheduler children reject malformed reuse before changing existing authority" {
+    var owner = try Scheduler.init(.{ .slots = 4 });
+    defer owner.close();
+    var root = testEntry(.query, 1, 37);
+    defer owner.finish(&root);
+    try owner.submit(&root);
+    try owner.wait(&root);
+    try std.testing.expectError(error.InvalidRunnableTransition, owner.submitChild(&root, &root, std.testing.io));
+    try std.testing.expectEqual(@as(u64, 37), root.bytes);
+    try std.testing.expectEqual(Class.query, root.class);
+    try std.testing.expect(root.parent == null);
+    var existing = testEntry(.inference, 1, @sizeOf(Entry));
+    defer owner.finish(&existing);
+    try owner.submit(&existing);
+    try owner.wait(&existing);
+    try std.testing.expectError(error.InvalidRunnableTransition, owner.submitChild(&root, &existing, std.testing.io));
+    try std.testing.expectEqual(Class.inference, existing.class);
+    try std.testing.expect(existing.parent == null);
+    try std.testing.expectEqual(@as(usize, 0), root.children);
+    try std.testing.expectEqual(@as(usize, 0), owner.stats().child_operations);
+}
+
+test "runnable scheduler child fairness preserves an older independent root ahead of later fanout" {
+    var owner = try Scheduler.init(.{ .slots = 3 });
+    defer owner.close();
+    var parent = testEntry(.query, 1, 31);
+    defer owner.finish(&parent);
+    try owner.submit(&parent);
+    try owner.wait(&parent);
+    var first = testEntry(.query, 1, @sizeOf(Entry));
+    defer owner.finish(&first);
+    try owner.submitChild(&parent, &first, std.testing.io);
+    try owner.wait(&first);
+    var independent = testEntry(.query, 1, 41);
+    defer owner.finish(&independent);
+    try owner.submit(&independent);
+    var later = testEntry(.query, 1, @sizeOf(Entry));
+    defer owner.finish(&later);
+    try owner.submitChild(&parent, &later, std.testing.io);
+    try std.testing.expectEqual(State.queued, owner.state(&independent));
+    try std.testing.expectEqual(State.queued, owner.state(&later));
+    try owner.block(&first, .resource_blocked);
+    try owner.wait(&independent);
+    try std.testing.expectEqual(State.queued, owner.state(&later));
+    try std.testing.expectEqual(@as(usize, 2), parent.children);
+    owner.finish(&independent);
+    try owner.wait(&later);
+    owner.finish(&later);
+    owner.finish(&first);
+    try std.testing.expectEqual(@as(usize, 0), parent.children);
+}
+
+test "runnable scheduler child physical worker join retains original parent and bytes after cancellation" {
+    const Cancel = struct {
+        fn requested(raw: *const anyopaque) bool {
+            return @as(*const std.atomic.Value(bool), @ptrCast(@alignCast(raw))).load(.acquire);
+        }
+    };
+    const Worker = struct {
+        child: *Execution,
+        body: []u8,
+        parked: std.Io.Event = .unset,
+        go: std.Io.Event = .unset,
+        freed: std.atomic.Value(bool) = .init(false),
+        fn run(self: *@This()) !void {
+            defer {
+                std.testing.allocator.free(self.body);
+                self.freed.store(true, .release);
+            }
+            try self.child.park(.resource_blocked);
+            self.parked.set(std.testing.io);
+            self.go.waitUncancelable(std.testing.io);
+            try self.child.enter(.query);
+        }
+    };
+    var canceled: std.atomic.Value(bool) = .init(false);
+    var owner = try Scheduler.init(.{ .slots = 3, .checkpoint_budget = 1 });
+    defer owner.close();
+    var parent: Execution = .{};
+    defer parent.finish();
+    try parent.start(&owner, .{ .io = std.testing.io, .retained_bytes = 43, .cancellation = .{ .ptr = &canceled, .requested = Cancel.requested } }, .query);
+    var child: Execution = .{};
+    defer child.finish();
+    const child_bytes = @sizeOf(Execution) + 64;
+    try child.startChild(&parent, std.testing.io, child_bytes);
+    const body = try std.testing.allocator.alloc(u8, 64);
+    var body_published = false;
+    defer if (!body_published) std.testing.allocator.free(body);
+    var worker = Worker{ .child = &child, .body = body };
+    var future = try std.testing.io.concurrent(Worker.run, .{&worker});
+    body_published = true;
+    defer {
+        worker.go.set(std.testing.io);
+        future.await(std.testing.io) catch {};
+    }
+    try worker.parked.waitTimeout(std.testing.io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+    try parent.checkpoint();
+    canceled.store(true, .release);
+    var health: Execution = .{};
+    defer health.finish();
+    try health.start(&owner, .{ .io = std.testing.io, .allow_wait = false }, .control);
+    try health.checkpoint();
+    try std.testing.expect(!worker.freed.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 43 + child_bytes), owner.stats().retained_bytes);
+    try std.testing.expectEqual(@as(usize, 1), parent.entry.?.children);
+    worker.go.set(std.testing.io);
+    try std.testing.expectError(error.Canceled, future.await(std.testing.io));
+    try std.testing.expect(worker.freed.load(.acquire));
+    // Physical completion is distinct from owning metadata retirement.
+    try std.testing.expectEqual(@as(u64, 43 + child_bytes), owner.stats().retained_bytes);
+    try std.testing.expectEqual(@as(usize, 1), owner.stats().child_operations);
+    child.finish();
+    try std.testing.expectEqual(@as(u64, 43), owner.stats().retained_bytes);
+    try std.testing.expectEqual(@as(usize, 0), parent.entry.?.children);
+    health.finish();
+    parent.finish();
+    try std.testing.expectEqual(@as(usize, 0), owner.stats().operations);
+    try std.testing.expectEqual(@as(u64, 0), owner.stats().retained_bytes);
 }
