@@ -2,9 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 const std = @import("std");
 const motion = @import("h264_motion.zig");
+const MarkCommand = struct { operation: u32, first: u32 = 0, second: u32 = 0 };
 fn PictureFor(comptime Sample: type) type {
     return struct {
         long_term: ?u32 = null,
+        field_long: [2]?u32 = .{ null, null },
         planar: []Sample,
         motions: [2][]motion.Motion,
         frame_num: u32,
@@ -50,9 +52,10 @@ pub fn StateFor(comptime Sample: type) type {
         previous_num: u32 = 0,
         adaptive: bool = false,
         current_long: ?u32 = null,
+        max_field_long: ?u32 = null,
         commands: [32]Command = undefined,
         command_count: usize = 0,
-        pub const Command = struct { operation: u32, first: u32 = 0, second: u32 = 0 };
+        pub const Command = MarkCommand;
         pub fn marking(self: *Self, bits: *@import("h264_bits.zig").Bits, idr: bool) !void {
             self.command_count = 0;
             self.current_long = null;
@@ -61,6 +64,7 @@ pub fn StateFor(comptime Sample: type) type {
             if (idr) {
                 _ = try bits.read(1);
                 if (try bits.read(1) != 0) self.current_long = 0;
+                self.max_field_long = self.current_long;
                 return;
             }
             self.adaptive = try bits.read(1) != 0;
@@ -72,7 +76,7 @@ pub fn StateFor(comptime Sample: type) type {
                 var command = Command{ .operation = operation };
                 if (operation == 1 or operation == 2 or operation == 3 or operation == 4 or operation == 6) command.first = try bits.ue();
                 if (operation == 3) command.second = try bits.ue();
-                if ((operation == 2 or operation == 6) and command.first > 15 or operation == 3 and command.second > 15 or operation == 4 and command.first > 16) return error.UnsupportedVideoProfile;
+                if ((operation == 2 and command.first > (if (self.field_picture) @as(u32, 31) else 15) or operation == 6 and command.first > 15) or operation == 3 and command.second > 15 or operation == 4 and command.first > 16) return error.UnsupportedVideoProfile;
                 self.commands[self.command_count] = command;
                 self.command_count += 1;
             }
@@ -146,15 +150,23 @@ pub fn StateFor(comptime Sample: type) type {
             self.field_counts = .{ 0, 0 };
             for (0..2) |list| for (0..2) |phase| {
                 const frames = if (list == 0) self.list0 else self.list1;
+                var parity_frames = [2][16]usize{ frames, frames };
+                if (phase == 1) for (0..2) |field_side| {
+                    for (0..self.count) |i| for (i + 1..self.count) |j| {
+                        const al = self.pictures[parity_frames[field_side][i]].field_long[field_side] orelse std.math.maxInt(u32);
+                        const bl = self.pictures[parity_frames[field_side][j]].field_long[field_side] orelse std.math.maxInt(u32);
+                        if (bl < al) std.mem.swap(usize, &parity_frames[field_side][i], &parity_frames[field_side][j]);
+                    };
+                };
                 var cursors: [2]usize = .{ 0, 0 };
                 var wanted = parity;
                 while (true) {
                     var found: ?usize = null;
                     for (0..2) |_| {
                         while (cursors[wanted] < self.count) {
-                            const i = frames[cursors[wanted]];
+                            const i = parity_frames[wanted][cursors[wanted]];
                             cursors[wanted] += 1;
-                            if (i < self.count and self.pictures[i].fields[wanted] and (self.pictures[i].long_term != null) == (phase == 1)) {
+                            if (i < self.count and self.pictures[i].fields[wanted] and (self.pictures[i].field_long[wanted] != null) == (phase == 1)) {
                                 found = i;
                                 break;
                             }
@@ -191,7 +203,7 @@ pub fn StateFor(comptime Sample: type) type {
                 for (self.pictures[0..self.count], 0..) |pic, i| for (0..2) |parity| {
                     if (!pic.fields[parity]) continue;
                     const same: u32 = @intFromBool(parity == self.field_parity);
-                    const matches = if (operation == 2) (if (pic.long_term) |long| long * 2 + same == number else false) else pic.long_term == null and (pic.frame_num * 2 + same) % maximum == number;
+                    const matches = if (operation == 2) (if (pic.field_long[parity]) |long| long * 2 + same == number else false) else pic.field_long[parity] == null and (pic.frame_num * 2 + same) % maximum == number;
                     if (matches) target = @intCast(i * 2 + parity);
                 };
                 const encoded = target orelse return error.MissingVideoReference;
@@ -217,24 +229,133 @@ pub fn StateFor(comptime Sample: type) type {
                 break :blk (if (list == 0) self.list0 else self.list1)[frame_index];
             };
             if (index >= self.count) return error.MissingVideoReference;
+            const pic = self.pictures[index];
+            if (self.field_picture) {
+                if (!pic.fields[@as(usize, self.field_lists[list][reference]) % 2]) return error.MissingVideoReference;
+            } else if (!self.field_mode and (!pic.fields[0] or !pic.fields[1] or pic.field_long[0] != pic.field_long[1])) return error.MissingVideoReference;
             return index;
         }
         pub fn referenceParity(self: *Self, list: usize, reference: usize) !usize {
             _ = try self.referenceIndex(list, reference);
             return if (self.field_picture) @as(usize, self.field_lists[list][reference]) % 2 else self.field_parity ^ (reference % 2);
         }
+        pub fn referenceLong(self: *Self, list: usize, reference: usize) !bool {
+            const pic = self.pictures[try self.referenceIndex(list, reference)];
+            return if (self.field_mode or self.field_picture) pic.field_long[try self.referenceParity(list, reference)] != null else pic.long_term != null;
+        }
         pub fn referenceCount(self: *Self, list: usize) usize {
             return if (self.field_picture) self.field_counts[list] else self.list_count * (if (self.field_mode) @as(usize, 2) else 1);
         }
+        fn refreshPicture(pic: *Picture) void {
+            pic.long_term = null;
+            var has_short = false;
+            var poc: i32 = std.math.maxInt(i32);
+            for (0..2) |parity| if (pic.fields[parity]) {
+                poc = @min(poc, pic.field_poc[parity]);
+                if (pic.field_long[parity]) |long| {
+                    pic.long_term = if (pic.long_term) |old| @min(old, long) else long;
+                } else has_short = true;
+            };
+            if (has_short) {
+                pic.long_term = null;
+                poc = std.math.maxInt(i32);
+                for (0..2) |parity| if (pic.fields[parity] and pic.field_long[parity] == null) {
+                    poc = @min(poc, pic.field_poc[parity]);
+                };
+            }
+            pic.poc = poc;
+        }
+        fn pruneFields(self: *Self, allocator: std.mem.Allocator) void {
+            var i: usize = 0;
+            while (i < self.count) {
+                if (!self.pictures[i].fields[0] and !self.pictures[i].fields[1]) self.remove(allocator, i) else {
+                    refreshPicture(&self.pictures[i]);
+                    i += 1;
+                }
+            }
+        }
+        /// MMCO 3/6 preserve the other field of the target complementary pair.
+        fn replaceFieldLong(self: *Self, allocator: std.mem.Allocator, number: u32, preserve: ?u32) void {
+            for (self.pictures[0..self.count]) |*pic| {
+                if (preserve != null and pic.id == preserve.?) continue;
+                for (0..2) |parity| if (pic.fields[parity] and pic.field_long[parity] == number) {
+                    pic.fields[parity] = false;
+                };
+            }
+            self.pruneFields(allocator);
+        }
+        fn markFields(self: *Self, allocator: std.mem.Allocator) !bool {
+            var reset = false;
+            for (self.commands[0..self.command_count]) |command| switch (command.operation) {
+                1, 3 => {
+                    const maximum: u32 = @as(u32, 1) << @as(u5, @intCast(self.frame_bits + 1));
+                    if (command.first >= maximum) return error.MalformedVideoPacket;
+                    const number = (self.current_num * 2 + 1 + maximum - command.first - 1) % maximum;
+                    var target: ?struct { id: u32, parity: usize } = null;
+                    for (self.pictures[0..self.count]) |pic| for (0..2) |parity| {
+                        const same: u32 = @intFromBool(parity == self.field_parity);
+                        if (pic.fields[parity] and pic.field_long[parity] == null and (pic.frame_num * 2 + same) % maximum == number) target = .{ .id = pic.id, .parity = parity };
+                    };
+                    const found = target orelse return error.MissingVideoReference;
+                    if (command.operation == 3) {
+                        if (self.max_field_long == null or command.second > self.max_field_long.?) return error.MalformedVideoPacket;
+                        self.replaceFieldLong(allocator, command.second, found.id);
+                    }
+                    for (self.pictures[0..self.count]) |*pic| if (pic.id == found.id) {
+                        if (command.operation == 1) pic.fields[found.parity] = false else {
+                            if (pic.fields[1 - found.parity] and pic.field_long[1 - found.parity] != null and pic.field_long[1 - found.parity].? != command.second) return error.MalformedVideoPacket;
+                            pic.field_long[found.parity] = command.second;
+                        }
+                    };
+                },
+                2 => {
+                    var found = false;
+                    for (self.pictures[0..self.count]) |*pic| for (0..2) |parity| {
+                        const same: u32 = @intFromBool(parity == self.field_parity);
+                        if (pic.fields[parity] and pic.field_long[parity] != null and pic.field_long[parity].? * 2 + same == command.first) {
+                            pic.fields[parity] = false;
+                            found = true;
+                        }
+                    };
+                    if (!found) return error.MissingVideoReference;
+                },
+                4 => {
+                    self.max_field_long = if (command.first == 0) null else command.first - 1;
+                    for (self.pictures[0..self.count]) |*pic| for (0..2) |parity| {
+                        if (pic.fields[parity] and pic.field_long[parity] != null and pic.field_long[parity].? >= command.first) pic.fields[parity] = false;
+                    };
+                },
+                5 => {
+                    self.deinit(allocator);
+                    self.max_field_long = null;
+                    reset = true;
+                },
+                6 => {
+                    if (self.max_field_long == null or command.first > self.max_field_long.?) return error.MalformedVideoPacket;
+                    var preserve: ?u32 = null;
+                    for (self.pictures[0..self.count]) |pic| if (pic.frame_num == self.current_num and pic.fields[1 - self.field_parity] and !pic.fields[self.field_parity]) {
+                        preserve = pic.id;
+                    };
+                    self.replaceFieldLong(allocator, command.first, preserve);
+                    self.current_long = command.first;
+                },
+                else => return error.MalformedVideoPacket,
+            };
+            self.pruneFields(allocator);
+            return reset;
+        }
         pub fn commit(self: *Self, allocator: std.mem.Allocator, planar: []const Sample, motions: [2][]const motion.Motion, max_refs: usize) !void {
             if (!self.reference or max_refs == 0) return;
+            for (self.commands[0..self.command_count]) |command| {
+                if (command.operation == 4 and command.first > max_refs) return error.MalformedVideoPacket;
+            }
             var list_ids: [2][16]u32 = @splat(@splat(std.math.maxInt(u32)));
             for (0..self.list_count) |i| {
                 if (self.list0[i] < self.count) list_ids[0][i] = self.pictures[self.list0[i]].id;
                 if (self.list1[i] < self.count) list_ids[1][i] = self.pictures[self.list1[i]].id;
             }
-            var reset = false;
-            for (self.commands[0..self.command_count]) |command| {
+            var reset = if (self.field_picture) try self.markFields(allocator) else false;
+            if (!self.field_picture) for (self.commands[0..self.command_count]) |command| {
                 switch (command.operation) {
                     1, 3 => {
                         const maximum: u32 = @as(u32, 1) << @as(u5, @intCast(self.frame_bits));
@@ -248,25 +369,24 @@ pub fn StateFor(comptime Sample: type) type {
                         if (id == null) return error.MissingVideoReference;
                         if (command.operation == 3) self.removeLong(allocator, command.second);
                         for (self.pictures[0..self.count], 0..) |*pic, i| if (pic.id == id.?) {
-                            if (command.operation == 1) self.remove(allocator, i) else pic.long_term = command.second;
+                            if (command.operation == 1) self.remove(allocator, i) else {
+                                pic.long_term = command.second;
+                                pic.field_long = @splat(command.second);
+                            }
                             break;
                         };
                     },
                     2 => self.removeLong(allocator, command.first),
                     4 => {
-                        var i: usize = 0;
-                        while (i < self.count) {
-                            if (self.pictures[i].long_term) |n| {
-                                if (n >= command.first) {
-                                    self.remove(allocator, i);
-                                    continue;
-                                }
-                            }
-                            i += 1;
-                        }
+                        self.max_field_long = if (command.first == 0) null else command.first - 1;
+                        for (self.pictures[0..self.count]) |*pic| for (0..2) |parity| {
+                            if (pic.fields[parity] and pic.field_long[parity] != null and pic.field_long[parity].? >= command.first) pic.fields[parity] = false;
+                        };
+                        self.pruneFields(allocator);
                     },
                     5 => {
                         self.deinit(allocator);
+                        self.max_field_long = null;
                         reset = true;
                     },
                     6 => {
@@ -275,10 +395,47 @@ pub fn StateFor(comptime Sample: type) type {
                     },
                     else => unreachable,
                 }
+            };
+            if (reset) {
+                self.current_num = 0;
+                if (self.field_picture) self.current_field_poc[self.field_parity] = 0 else self.current_field_poc = .{ 0, 0 };
+                self.current_poc = 0;
+                self.previous_num = 0;
+                self.frame_offset = 0;
+                self.previous_lsb = 0;
+                self.previous_msb = 0;
+            }
+            var short_complement = false;
+            if (self.field_picture) for (self.pictures[0..self.count]) |pic| {
+                if (pic.frame_num == self.current_num and pic.fields[1 - self.field_parity] and !pic.fields[self.field_parity] and pic.field_long[1 - self.field_parity] == null) short_complement = true;
+            };
+            if (!self.adaptive and !short_complement) {
+                var used: usize = 0;
+                for (self.pictures[0..self.count]) |pic| {
+                    var short = false;
+                    var long = false;
+                    for (0..2) |parity| if (pic.fields[parity]) {
+                        if (pic.field_long[parity] == null) short = true else long = true;
+                    };
+                    used += @intFromBool(short) + @as(usize, @intFromBool(long));
+                }
+                if (used >= max_refs) {
+                    var oldest: ?usize = null;
+                    var oldest_num: i32 = std.math.maxInt(i32);
+                    const maximum: i32 = @as(i32, 1) << @as(u5, @intCast(self.frame_bits));
+                    for (self.pictures[0..self.count], 0..) |pic, i| if (pic.long_term == null) {
+                        const n = @as(i32, @intCast(pic.frame_num)) - (if (pic.frame_num > self.current_num) maximum else 0);
+                        if (n < oldest_num) {
+                            oldest_num = n;
+                            oldest = i;
+                        }
+                    };
+                    self.remove(allocator, oldest orelse return error.MissingVideoReference);
+                }
             }
             var complementary: ?usize = null;
             if (self.field_picture) for (self.pictures[0..self.count], 0..) |pic, i| {
-                if (pic.frame_num == self.current_num and (!pic.fields[0] or !pic.fields[1])) {
+                if (pic.frame_num == self.current_num and pic.fields[1 - self.field_parity] and !pic.fields[self.field_parity]) {
                     complementary = i;
                     break;
                 }
@@ -291,35 +448,15 @@ pub fn StateFor(comptime Sample: type) type {
                 @memcpy(pic.planar, planar);
                 @memcpy(pic.meta, self.current_meta);
                 for (0..2) |list| @memcpy(pic.motions[list], motions[list]);
-                pic.fields = self.current_fields;
-                pic.poc = self.current_poc;
-                pic.field_poc = self.current_field_poc;
+                if (pic.field_long[1 - self.field_parity] != null and self.current_long != null and pic.field_long[1 - self.field_parity].? != self.current_long.?) return error.MalformedVideoPacket;
+                pic.fields[self.field_parity] = true;
+                pic.field_poc[self.field_parity] = self.current_field_poc[self.field_parity];
+                pic.field_long[self.field_parity] = self.current_long;
                 pic.list_ids = list_ids;
-                pic.long_term = self.current_long;
+                refreshPicture(pic);
                 return;
             }
-            if (complementary == null and !self.adaptive and self.count >= max_refs) {
-                var oldest: ?usize = null;
-                var oldest_num: i32 = std.math.maxInt(i32);
-                const maximum: i32 = @as(i32, 1) << @as(u5, @intCast(self.frame_bits));
-                for (self.pictures[0..self.count], 0..) |pic, i| if (pic.long_term == null) {
-                    const n = @as(i32, @intCast(pic.frame_num)) - (if (pic.frame_num > self.current_num) maximum else 0);
-                    if (n < oldest_num) {
-                        oldest_num = n;
-                        oldest = i;
-                    }
-                };
-                self.remove(allocator, oldest orelse return error.MissingVideoReference);
-            }
             if (complementary == null and self.count >= max_refs) return error.MalformedVideoPacket;
-            if (reset) {
-                self.current_num = 0;
-                self.current_poc = 0;
-                self.previous_num = 0;
-                self.frame_offset = 0;
-                self.previous_lsb = 0;
-                self.previous_msb = 0;
-            }
             const owned = try allocator.dupe(Sample, planar);
             errdefer allocator.free(owned);
             const motion0 = try allocator.dupe(motion.Motion, motions[0]);
@@ -328,7 +465,7 @@ pub fn StateFor(comptime Sample: type) type {
             errdefer allocator.free(motion1);
             const owned_meta = try allocator.dupe(@import("h264_entropy.zig").Meta, self.current_meta);
             errdefer allocator.free(owned_meta);
-            self.pictures[self.count] = .{ .fields = self.current_fields, .meta = owned_meta, .paired = self.paired, .planar = owned, .motions = .{ motion0, motion1 }, .long_term = self.current_long, .frame_num = self.current_num, .poc = self.current_poc, .field_poc = self.current_field_poc, .id = self.next_id, .list_ids = list_ids };
+            self.pictures[self.count] = .{ .fields = self.current_fields, .meta = owned_meta, .paired = self.paired, .planar = owned, .motions = .{ motion0, motion1 }, .long_term = self.current_long, .field_long = .{ if (self.current_fields[0]) self.current_long else null, if (self.current_fields[1]) self.current_long else null }, .frame_num = self.current_num, .poc = self.current_poc, .field_poc = self.current_field_poc, .id = self.next_id, .list_ids = list_ids };
             self.next_id += 1;
             self.count += 1;
         }

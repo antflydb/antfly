@@ -351,9 +351,12 @@ Store dated benchmark receipts separately from these living contracts.
 ## Open decisions
 
 - Final content-part fields and capability advertisement after PR #1014 settles.
-- Extension order beyond the qualified Baseline IDR/Intra16x16/I_PCM subset:
-  active deblocking, Intra4x4 and inter prediction, then CABAC/B-frames; each needs
-  broader independent corpora. CAVLC table provenance and BSD license are pinned.
+- Broader production-stream qualification beyond the implemented static H.264
+  tool subset documented in `lib/video/VIDEO.md`. Multi-slice, CAVLC/CABAC I/P/B,
+  scaling matrices, native depth/chroma, MBAFF, consecutive standalone PAFF fields
+  and field MMCO 1–6 are implemented. Non-consecutive/non-complementary field
+  pairs and dynamic parameter sets remain outside the declared subset. CAVLC
+  table provenance and BSD license are pinned.
 - Reference decoder RGB conversion policy, VFR sampling compatibility, and
   accepted cross-backend numerical/retrieval tolerances.
 - Admission estimates for opaque hardware decoder allocations, minimum surface

@@ -89,7 +89,7 @@ fn direct(syntax: *Syntax, state: anytype, motions: [2][]motion.Motion, stride: 
     var selected = refs;
     var vectors = predictors;
     if (spatial) {
-        const zero = state.pictures[try state.referenceIndex(1, 0)].long_term == null and col.value.reference == 0 and @abs(col.value.vector.x) <= 1 and @abs(col.value.vector.y) <= 1;
+        const zero = !(try state.referenceLong(1, 0)) and col.value.reference == 0 and @abs(col.value.vector.x) <= 1 and @abs(col.value.vector.y) <= 1;
         for (0..2) |list| if (selected[list] == 0 and zero) {
             vectors[list] = .{};
         };
@@ -104,8 +104,7 @@ fn direct(syntax: *Syntax, state: anytype, motions: [2][]motion.Motion, stride: 
                 break;
             };
             if (!found) return error.MissingVideoReference;
-            const first = state.pictures[try state.referenceIndex(0, @intCast(selected[0]))];
-            const scale = if (first.long_term != null) @as(i32, 256) else weights.distance(currentPoc(state), try referencePoc(state, 0, @intCast(selected[0])), col.poc);
+            const scale = if ((try state.referenceLong(0, @intCast(selected[0])))) @as(i32, 256) else weights.distance(currentPoc(state), try referencePoc(state, 0, @intCast(selected[0])), col.poc);
             vectors[0] = .{ .x = (scale * col.value.vector.x + 128) >> 8, .y = (scale * col.value.vector.y + 128) >> 8 };
             vectors[1] = .{ .x = vectors[0].x - col.value.vector.x, .y = vectors[0].y - col.value.vector.y };
         }
@@ -138,7 +137,7 @@ fn compensate(syntax: *Syntax, state: anytype, planes: anytype, motions: [2][]mo
                 value = switch (state.weight_mode) {
                     .none => @intCast((@as(u32, values[0]) + values[1] + 1) / 2),
                     .explicit => weights.pairDepth(values[0], values[1], state.weights[0][@as(usize, @intCast(m[0].reference)) / (if (state.field_mode and !state.field_picture) @as(usize, 2) else 1)][p], state.weights[1][@as(usize, @intCast(m[1].reference)) / (if (state.field_mode and !state.field_picture) @as(usize, 2) else 1)][p], bit_depth),
-                    .implicit => if (state.pictures[try state.referenceIndex(0, @intCast(m[0].reference))].long_term != null or state.pictures[try state.referenceIndex(1, @intCast(m[1].reference))].long_term != null) @intCast((@as(u32, values[0]) + values[1] + 1) / 2) else weights.implicitDepth(values[0], values[1], currentPoc(state), try referencePoc(state, 0, @intCast(m[0].reference)), try referencePoc(state, 1, @intCast(m[1].reference)), bit_depth),
+                    .implicit => if ((try state.referenceLong(0, @intCast(m[0].reference))) or (try state.referenceLong(1, @intCast(m[1].reference)))) @intCast((@as(u32, values[0]) + values[1] + 1) / 2) else weights.implicitDepth(values[0], values[1], currentPoc(state), try referencePoc(state, 0, @intCast(m[0].reference)), try referencePoc(state, 1, @intCast(m[1].reference)), bit_depth),
                 };
             } else {
                 const list: usize = if (m[0].reference >= 0) 0 else 1;

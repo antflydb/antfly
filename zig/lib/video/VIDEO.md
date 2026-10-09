@@ -328,7 +328,7 @@ For the original two-second fixture, preparing overlapping windows together give
 Depth two retains at most 24,576 staged RGBA bytes; completed unique patch outputs
 occupy 221,184 bytes. These are asserted logical work/resource counts, not latency
 or embedding benchmarks. Resident vision/projector/backbone/pooling still await
-PR #1014; PAFF field marking/standalone field packets and NVIDIA NVDEC/CUDA remain independent follow-ups.
+PR #1014; NVIDIA NVDEC/CUDA and expanded native-depth Metal imports remain independent follow-ups.
 
 ## Implemented independent efficiency and portable H.264 work
 
@@ -368,7 +368,7 @@ Implemented tools include:
 
 - Multiple I/P/B slices, with per-slice entropy, prediction availability and filter
   boundaries. Missing and overlapping primary macroblocks fail explicitly. Work
-  includes redundant slices in the default 256-slice-per-packet limit.
+  includes redundant slices in the default 256-slice-per-picture limit.
 - All seven progressive Baseline FMO maps, including dynamic map directions and
   explicit maps; ASO reconstructs by macroblock ownership instead of arrival order.
   Redundant copies are consumed when a primary picture exists; they do not replace
@@ -380,14 +380,19 @@ Implemented tools include:
   separate Cb/Cr QP offsets, lossless transform bypass and high-depth clipping.
 - P/B partitions, skip, spatial/temporal direct, quarter-pel interpolation,
   explicit/implicit weighting, reference list reordering, sliding-window marking
-  and bounded frame MMCO commands. POC types 0, 1 and 2 are supported.
+  and bounded frame/field MMCO commands. POC types 0, 1 and 2 are supported.
 - Mixed MBAFF frame/field macroblock pairs, with sample-accurate neighbours,
   field/frame motion scaling, parity-aware chroma motion, field scans, separate
   field POCs and mixed-boundary deblocking. Fields use views over woven storage.
-- PAFF complementary field pairs carried together in an indexed packet. The
-  first field is filtered and admitted as a reference before the second field;
-  completion updates the same DPB allocation. Default field reference lists and
-  field list reordering include previous and current-first-field references.
+- PAFF complementary field pairs carried together in an indexed packet or as
+  complete fields in two consecutive packets, including bottom-first pairs. The
+  first field is filtered and admitted before second-field prediction; completion
+  updates the same DPB allocation. Default field reference lists and reordering
+  include previous and current-first-field references. Field MMCO 1–6 apply to
+  individual fields, preserving an unaffected complement, resolving long-term
+  index conflicts, enforcing the long-term index bound and resetting POC/frame
+  state for MMCO 5. Direct prediction and weighting use the selected field's
+  reference status.
 - Cropping, emulation prevention and full/video-range signaling. Output PTS and
   duration come from the indexed packet.
 
@@ -407,6 +412,16 @@ of Source/Reader/frame lifetime. Decode receipts count actual dependency packets
 payload bytes rather than only selected packets. The default dependency span is capped
 at 256 packets and the SPS reference count at 16 pictures.
 
+Selecting either standalone field packet produces the same completed woven
+picture. When selection ends at the first field, decode reads exactly one following
+packet to obtain its complement; dependency, packet, slice and allocation limits
+include that work. The default slice bound applies to the assembled picture,
+including both field packets. Pending samples and metadata reuse the reconstruction
+workspace. No incomplete field is published. Output PTS is the earlier field PTS,
+and duration spans both packet presentation intervals. Batch callbacks preserve
+all requested slots, including selections of both packets in one pair. Missing or
+mismatched complements fail and release partial references, leases and admission.
+
 Geometry/packet/reference workspace bounds are checked before reconstruction;
 `max_decode_bytes` also enforces the actual decode allocator high-water limit.
 Reference samples, picture/slice metadata, FMO storage and both lists' motion metadata are included in the conservative
@@ -414,13 +429,12 @@ workspace estimate. Cancellation is checked during RBSP copying, macroblocks,
 filtering and output rows. Shared output admission remains held until Frame destruction;
 batch callback failure frees the output, decoded-picture buffer and packet leases.
 
-This remains a declared tool subset. Standalone PAFF fields in separate indexed
-packets, non-complementary pairs, PAFF adaptive/long-term marking, separate colour
-planes, monochrome, unequal component depths, frame-number gaps, SP/SI, other
+This remains a declared tool subset. Non-complementary or non-consecutive PAFF
+pairs, a field spread over multiple packets, separate colour planes, monochrome, unequal component depths, frame-number gaps, SP/SI, other
 profiles, data partitions and dynamic parameter sets remain explicit rejections.
 MBAFF frame MMCO remains available. No deinterlacing policy is applied: interlaced
 output preserves woven samples. Capability `portable_h264_decode` is true with
-`static-avc1-profile-subset-multislice-8to14bit-420-422-444-mbaff-paff-pairs`; callers
+`static-avc1-profile-subset-multislice-8to14bit-420-422-444-mbaff-paff-pairs-field-packets-mmco`; callers
 must preserve that qualification. No OpenH264, x264 or FFmpeg runtime is linked.
 
 Native-depth host preparation validates plane geometry and converts into the
@@ -445,6 +459,15 @@ license are in [third-party notices](THIRD_PARTY_NOTICES.md).
 
 Current platform results are recorded in
 [testdata/h264-advanced-validation.md](testdata/h264-advanced-validation.md).
+
+A further 30 PAFF packet vectors and their native sample hashes are recorded in
+[testdata/h264-paff-packets-oracle.json](testdata/h264-paff-packets-oracle.json).
+They cover standalone CAVLC/CABAC PCM, bottom-first pairs, field I/P/B selection,
+long-term list reordering, IDR long-term fields and MMCO 1–6 at 8/10/14 bits.
+FFmpeg matches independently known samples without frame-rate duplication.
+Tests also cover signed timestamps, missing/mismatched complements, bounded
+lookahead, duplicate callback slots, cancellation after the first field and
+exhaustive standalone-reference allocation failures.
 
 The expanded fixture receipt is
 [testdata/h264-advanced-oracle.json](testdata/h264-advanced-oracle.json). Independent

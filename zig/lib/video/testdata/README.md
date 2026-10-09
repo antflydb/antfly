@@ -147,8 +147,9 @@ contains field macroblocks.
 samples. FFmpeg confirms 8/9/10/12/14-bit vectors, including first-field references,
 PAFF list reordering, spatial/temporal B prediction and distinct Cb/Cr QPs. The 11/13-bit vectors use normative
 known values because FFmpeg lacks corresponding native pixel formats. Field pairs
-start with an IDR field and use a non-IDR complementary second field. Standalone
-fields in separate indexed packets are outside the current video API qualifier.
+start with an IDR field and use a non-IDR complementary second field. Complete
+standalone fields in consecutive indexed packets are covered by the PAFF packet
+receipt below.
 
 All seven `h264-groups-*` maps use known PCM samples and descending first-macroblock
 arrival order, including both dynamic-map directions. `h264-redundant*` checks
@@ -172,3 +173,20 @@ Tables 9-25–9-33 and 9-43, from `pdftotext -layout` output. It verifies every
 extended initial state against the pinned base table and rejects duplicate/missing
 field-context rows. Each aliased initial state gets independently evolving CABAC
 storage at runtime. No reference encoder/decoder is linked into the library.
+
+
+`h264-paff-packets-oracle.json` adds 30 independently known native sample vectors
+checked by FFmpeg with frame-rate passthrough. They cover CAVLC/CABAC standalone
+fields, bottom-first pairs, I/P/B pictures, previous/current-field prediction,
+long-term list reordering, IDR long-term fields and field MMCO 1–6, in 8-bit
+4:2:0, 10-bit 4:2:2 and 14-bit 4:4:4. Paired-packet variants ensure the same field
+marking behaves identically without a packet boundary. Each standalone packet
+holds one complete field; the fixture mux preserves separate samples and signed
+composition offsets. Known output has one woven picture per complementary pair.
+
+Regenerate with `python3 scripts/generate_h264_paff_packets.py`. The shared
+advanced-vector helpers can be imported without regenerating other fixtures.
+Runtime validation includes field-specific reference identities, long PicNum 31,
+callback slots for either field, actual dependency counts, signed presentation
+intervals, resource limits, mismatched/missing complements and cancellation or
+allocation failure after retaining a first field.

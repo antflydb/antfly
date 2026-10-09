@@ -337,6 +337,10 @@ def interlaced_pcm(
     sample_offset=0,
     frame_num=0,
     idr_first=True,
+    marking=None,
+    idr_long=False,
+    bottom_first=False,
+    cabac=False,
 ):
     sx, sy = (1 if chroma == 3 else 2), (2 if chroma == 1 else 1)
     w, h = width // 16, height // 32
@@ -371,7 +375,8 @@ def interlaced_pcm(
     sps.fixed(0, 2)
     pps.ue(0)
     pps.ue(0)
-    pps.fixed(0, 2)
+    pps.fixed(cabac, 1)
+    pps.fixed(0, 1)
     for _ in range(3):
         pps.ue(0)
     pps.fixed(0, 3)
@@ -381,7 +386,8 @@ def interlaced_pcm(
     pps.fixed(0, 2)
     output = sps.nal(0x67) + pps.nal(0x68)
     planes = [[0] * (width * height // (1 if p == 0 else sx * sy)) for p in range(3)]
-    for parity in range(2 if paff else 1):
+    first_side = 1 if bottom_first else 0
+    for parity in ((1, 0) if bottom_first else (0, 1)) if paff else (0,):
         bits = Bits()
         bits.ue(0)
         bits.ue(2)
@@ -390,18 +396,39 @@ def interlaced_pcm(
         bits.fixed(paff, 1)
         if paff:
             bits.fixed(parity, 1)
-        if idr_first and (not paff or parity == 0):
+        if idr_first and (not paff or parity == first_side):
             bits.ue(0)
-        bits.fixed(0, 2 if idr_first and (not paff or parity == 0) else 1)
+        if idr_first and (not paff or parity == first_side):
+            bits.fixed(0, 1)
+            bits.fixed(idr_long, 1)
+        else:
+            commands = marking[parity] if marking else []
+            bits.fixed(bool(commands), 1)
+            for operation, first, second in commands:
+                bits.ue(operation)
+                if operation in (1, 2, 3, 4, 6):
+                    bits.ue(first)
+                if operation == 3:
+                    bits.ue(second)
+            if commands:
+                bits.ue(0)
         bits.se(0)
         bits.ue(1)
+        if cabac:
+            assert paff
+            bits.align(1)
+        coder = Cabac(bits) if cabac else None
         for address in range(w * h * (1 if paff else 2)):
             pair = address if paff else address // 2
             bottom = parity if paff else address % 2
             field = paff or all_fields or (pair % 3 == 1)
             if not paff and address % 2 == 0:
                 bits.fixed(field, 1)
-            bits.ue(25)
+            if coder:
+                coder.bin(3 + (address % w != 0) + (address >= w), 1)
+                coder.terminate(1)
+            else:
+                bits.ue(25)
             bits.align()
             for p in range(3):
                 px, py = (1, 1) if p == 0 else (sx, sy)
@@ -418,7 +445,13 @@ def interlaced_pcm(
                         )
                         bits.fixed(value, depth)
                         planes[p][physical_y * stride + x] = value
-        output += bits.nal(0x65 if idr_first and (not paff or parity == 0) else 0x41)
+            if coder:
+                coder.restart()
+                coder.terminate(address + 1 == w * h)
+        output += bits.nal(
+            0x65 if idr_first and (not paff or parity == first_side) else 0x41,
+            stop=not cabac,
+        )
     known = planes[0] + [v for pair in zip(planes[1], planes[2]) for v in pair]
     word = "H" if depth > 8 else "B"
     return output, struct.pack("<" + word * len(known), *known)
@@ -746,6 +779,8 @@ def validate_known(work, mp4, known, depth, chroma, width, height):
         "error",
         "-i",
         str(mp4),
+        "-fps_mode",
+        "passthrough",
         "-pix_fmt",
         fmt,
         "-f",
@@ -769,136 +804,119 @@ def validate_known(work, mp4, known, depth, chroma, width, height):
     return "FFmpeg native planar samples match independently known values"
 
 
-receipts = []
-with tempfile.TemporaryDirectory(prefix="antfly-h264-advanced-") as tmp:
-    work = Path(tmp)
-    for name, cabac, poc in [("h264-cabac-pcm", True, 2), ("h264-poc1-pcm", False, 1)]:
-        annex = work / (name + ".264")
-        annex.write_bytes(pcm_vector(cabac, poc))
-        mp4, nv12 = DATA / (name + ".mp4"), DATA / (name + ".nv12")
-        run(
-            "ffmpeg",
-            "-y",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-framerate",
-            "4",
-            "-i",
-            str(annex),
-            "-c",
-            "copy",
-            "-bsf:v",
-            "filter_units=remove_types=7|8",
-            str(mp4),
-        )
-        run(
-            "ffmpeg",
-            "-y",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-i",
-            str(mp4),
-            "-pix_fmt",
-            "nv12",
-            "-f",
-            "rawvideo",
-            str(nv12),
-        )
-        assert nv12.stat().st_size == 64 * 48 * 3 // 2 * 4
-        receipts.append(
-            dict(
-                name=name,
-                cabac=cabac,
-                poc_type=poc,
-                mp4_sha256=hashlib.sha256(mp4.read_bytes()).hexdigest(),
-                nv12_sha256=hashlib.sha256(nv12.read_bytes()).hexdigest(),
-            )
-        )
-    for kind in range(7):
-        for direction in range(2 if kind in (3, 4, 5) else 1):
-            name = f"h264-groups-{kind}-{direction}"
+if __name__ == "__main__":
+    receipts = []
+    with tempfile.TemporaryDirectory(prefix="antfly-h264-advanced-") as tmp:
+        work = Path(tmp)
+        for name, cabac, poc in [
+            ("h264-cabac-pcm", True, 2),
+            ("h264-poc1-pcm", False, 1),
+        ]:
             annex = work / (name + ".264")
-            encoded, known = grouped_vector(kind, bool(direction))
-            annex.write_bytes(encoded)
+            annex.write_bytes(pcm_vector(cabac, poc))
             mp4, nv12 = DATA / (name + ".mp4"), DATA / (name + ".nv12")
-            mp4.write_bytes(mux_pcm(encoded))
-            nv12.write_bytes(known)
+            run(
+                "ffmpeg",
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-framerate",
+                "4",
+                "-i",
+                str(annex),
+                "-c",
+                "copy",
+                "-bsf:v",
+                "filter_units=remove_types=7|8",
+                str(mp4),
+            )
+            run(
+                "ffmpeg",
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                str(mp4),
+                "-pix_fmt",
+                "nv12",
+                "-f",
+                "rawvideo",
+                str(nv12),
+            )
+            assert nv12.stat().st_size == 64 * 48 * 3 // 2 * 4
             receipts.append(
                 dict(
                     name=name,
-                    map_type=kind,
-                    direction=direction,
-                    oracle="known PCM samples, H.264 8.2.2 mapping; standalone ISO BMFF mux",
+                    cabac=cabac,
+                    poc_type=poc,
+                    mp4_sha256=hashlib.sha256(mp4.read_bytes()).hexdigest(),
+                    nv12_sha256=hashlib.sha256(nv12.read_bytes()).hexdigest(),
+                )
+            )
+        for kind in range(7):
+            for direction in range(2 if kind in (3, 4, 5) else 1):
+                name = f"h264-groups-{kind}-{direction}"
+                annex = work / (name + ".264")
+                encoded, known = grouped_vector(kind, bool(direction))
+                annex.write_bytes(encoded)
+                mp4, nv12 = DATA / (name + ".mp4"), DATA / (name + ".nv12")
+                mp4.write_bytes(mux_pcm(encoded))
+                nv12.write_bytes(known)
+                receipts.append(
+                    dict(
+                        name=name,
+                        map_type=kind,
+                        direction=direction,
+                        oracle="known PCM samples, H.264 8.2.2 mapping; standalone ISO BMFF mux",
+                        mp4_sha256=hashlib.sha256(mp4.read_bytes()).hexdigest(),
+                        nv12_sha256=hashlib.sha256(known).hexdigest(),
+                    )
+                )
+        for missing in (False, True):
+            name = "h264-redundant" + ("-missing-primary" if missing else "")
+            encoded, known = grouped_vector(1, redundant=True, missing=missing)
+            mp4, native = DATA / (name + ".mp4"), DATA / (name + ".nv12")
+            mp4.write_bytes(mux_pcm(encoded))
+            native.write_bytes(known)
+            receipts.append(
+                dict(
+                    name=name,
+                    oracle="known primary PCM samples, redundant copies do not replace them",
                     mp4_sha256=hashlib.sha256(mp4.read_bytes()).hexdigest(),
                     nv12_sha256=hashlib.sha256(known).hexdigest(),
                 )
             )
-    for missing in (False, True):
-        name = "h264-redundant" + ("-missing-primary" if missing else "")
-        encoded, known = grouped_vector(1, redundant=True, missing=missing)
-        mp4, native = DATA / (name + ".mp4"), DATA / (name + ".nv12")
-        mp4.write_bytes(mux_pcm(encoded))
-        native.write_bytes(known)
-        receipts.append(
-            dict(
-                name=name,
-                oracle="known primary PCM samples, redundant copies do not replace them",
-                mp4_sha256=hashlib.sha256(mp4.read_bytes()).hexdigest(),
-                nv12_sha256=hashlib.sha256(known).hexdigest(),
-            )
-        )
-    for paff, depth, chroma, all_fields in (
-        (False, 8, 1, False),
-        (False, 10, 2, False),
-        (False, 10, 3, True),
-        (True, 8, 1, True),
-        (True, 12, 2, True),
-        (True, 14, 3, True),
-    ):
-        name = f"h264-{'paff' if paff else 'mbaff'}-pcm-{depth}-{chroma}"
-        encoded, known = interlaced_pcm(paff, depth, chroma, all_fields)
-        mp4, native = DATA / (name + ".mp4"), DATA / (name + ".nv12")
-        mp4.write_bytes(mux_pcm(encoded, 64, 64))
-        native.write_bytes(known)
-        validation = validate_known(work, mp4, known, depth, chroma, 64, 64)
-        receipts.append(
-            dict(
-                name=name,
-                bit_depth=depth,
-                chroma_format=chroma,
-                oracle=validation,
-                mp4_sha256=hashlib.sha256(mp4.read_bytes()).hexdigest(),
-                nv12_sha256=hashlib.sha256(known).hexdigest(),
-            )
-        )
-    for depth, chroma in ((8, 1), (10, 2), (14, 3)):
-        name = f"h264-paff-prediction-{depth}-{chroma}"
-        packets, known = paff_prediction(depth, chroma)
-        mp4, native = DATA / (name + ".mp4"), DATA / (name + ".nv12")
-        mp4.write_bytes(mux_pcm(packets, 64, 64))
-        native.write_bytes(known)
-        validation = validate_known(work, mp4, known, depth, chroma, 64, 64)
-        receipts.append(
-            dict(
-                name=name,
-                bit_depth=depth,
-                chroma_format=chroma,
-                oracle=validation
-                + ", PAFF previous/current-first-field references and list reordering",
-                mp4_sha256=hashlib.sha256(mp4.read_bytes()).hexdigest(),
-                nv12_sha256=hashlib.sha256(known).hexdigest(),
-            )
-        )
-    for depth, chroma in ((8, 1), (10, 2), (14, 3)):
-        for spatial in (False, True):
-            name = (
-                f"h264-paff-b-{depth}-{chroma}-{'spatial' if spatial else 'temporal'}"
-            )
-            packets, known = paff_b(depth, chroma, spatial)
+        for paff, depth, chroma, all_fields in (
+            (False, 8, 1, False),
+            (False, 10, 2, False),
+            (False, 10, 3, True),
+            (True, 8, 1, True),
+            (True, 12, 2, True),
+            (True, 14, 3, True),
+        ):
+            name = f"h264-{'paff' if paff else 'mbaff'}-pcm-{depth}-{chroma}"
+            encoded, known = interlaced_pcm(paff, depth, chroma, all_fields)
             mp4, native = DATA / (name + ".mp4"), DATA / (name + ".nv12")
-            mp4.write_bytes(mux_pcm(packets, 64, 64, [0, 1, -1]))
+            mp4.write_bytes(mux_pcm(encoded, 64, 64))
+            native.write_bytes(known)
+            validation = validate_known(work, mp4, known, depth, chroma, 64, 64)
+            receipts.append(
+                dict(
+                    name=name,
+                    bit_depth=depth,
+                    chroma_format=chroma,
+                    oracle=validation,
+                    mp4_sha256=hashlib.sha256(mp4.read_bytes()).hexdigest(),
+                    nv12_sha256=hashlib.sha256(known).hexdigest(),
+                )
+            )
+        for depth, chroma in ((8, 1), (10, 2), (14, 3)):
+            name = f"h264-paff-prediction-{depth}-{chroma}"
+            packets, known = paff_prediction(depth, chroma)
+            mp4, native = DATA / (name + ".mp4"), DATA / (name + ".nv12")
+            mp4.write_bytes(mux_pcm(packets, 64, 64))
             native.write_bytes(known)
             validation = validate_known(work, mp4, known, depth, chroma, 64, 64)
             receipts.append(
@@ -907,198 +925,219 @@ with tempfile.TemporaryDirectory(prefix="antfly-h264-advanced-") as tmp:
                     bit_depth=depth,
                     chroma_format=chroma,
                     oracle=validation
-                    + ", spatial/temporal B skip and field list order",
+                    + ", PAFF previous/current-first-field references and list reordering",
                     mp4_sha256=hashlib.sha256(mp4.read_bytes()).hexdigest(),
                     nv12_sha256=hashlib.sha256(known).hexdigest(),
                 )
             )
-    for depth in (9, 11, 12, 13, 14):
-        for chroma in (1, 2, 3):
-            name = f"h264-intra-dc-{depth}-{chroma}"
-            encoded, known = intra_dc(depth, chroma)
-            mp4, native = DATA / (name + ".mp4"), DATA / (name + ".nv12")
-            mp4.write_bytes(mux_pcm(encoded, 16, 16))
-            native.write_bytes(known)
-            validation = validate_known(work, mp4, known, depth, chroma, 16, 16)
-            receipts.append(
-                dict(
-                    name=name,
-                    bit_depth=depth,
-                    chroma_format=chroma,
-                    oracle=validation
-                    + ", Intra16 DC level +1, luma QPprime 48: midpoint+10",
-                    mp4_sha256=hashlib.sha256(mp4.read_bytes()).hexdigest(),
-                    nv12_sha256=hashlib.sha256(known).hexdigest(),
-                )
-            )
-    name = "h264-intra-dc-offsets-14-3"
-    encoded, known = intra_dc(14, 3, 2)
-    mp4, native = DATA / (name + ".mp4"), DATA / (name + ".nv12")
-    mp4.write_bytes(mux_pcm(encoded, 16, 16))
-    native.write_bytes(known)
-    validation = validate_known(work, mp4, known, 14, 3, 16, 16)
-    receipts.append(
-        dict(
-            name=name,
-            bit_depth=14,
-            chroma_format=3,
-            oracle=validation + ", Cb/Cr QPprime 48/50 gives midpoint+10/+13",
-            mp4_sha256=hashlib.sha256(mp4.read_bytes()).hexdigest(),
-            nv12_sha256=hashlib.sha256(known).hexdigest(),
-        )
-    )
-    for chroma, depth, interlaced, filtered, lossless in tuple(
-        (*case, False)
-        for case in (
-            (1, 10, False, True),
-            (2, 8, False, True),
-            (2, 10, False, True),
-            (3, 8, False, True),
-            (3, 10, False, True),
-            (1, 8, True, True),
-            (1, 10, True, True),
-            (1, 8, True, False),
-            (1, 10, True, False),
-        )
-    ) + (
-        (1, 8, False, True, True),
-        (2, 10, False, True, True),
-        (3, 8, False, True, True),
-        (3, 10, False, True, True),
-    ):
-        for cabac in (False, True):
-            name = f"h264-high{depth}{'-lossless' if lossless else ''}{'-mbaff' if interlaced else ''}{'-unfiltered' if not filtered else ''}{f'-{420 if chroma == 1 else 422 if chroma == 2 else 444}' if chroma != 1 else ''}-{'cabac' if cabac else 'cavlc'}"
-            width, height, frames = 128, 96, 12
-            raw = work / (name + ".yuv")
-            samples = []
-            for frame in range(frames):
-                for plane in range(3):
-                    pw, ph = (
-                        (width, height)
-                        if plane == 0
-                        else (
-                            width // (1 if chroma == 3 else 2),
-                            height // (2 if chroma == 1 else 1),
-                        )
+        for depth, chroma in ((8, 1), (10, 2), (14, 3)):
+            for spatial in (False, True):
+                name = f"h264-paff-b-{depth}-{chroma}-{'spatial' if spatial else 'temporal'}"
+                packets, known = paff_b(depth, chroma, spatial)
+                mp4, native = DATA / (name + ".mp4"), DATA / (name + ".nv12")
+                mp4.write_bytes(mux_pcm(packets, 64, 64, [0, 1, -1]))
+                native.write_bytes(known)
+                validation = validate_known(work, mp4, known, depth, chroma, 64, 64)
+                receipts.append(
+                    dict(
+                        name=name,
+                        bit_depth=depth,
+                        chroma_format=chroma,
+                        oracle=validation
+                        + ", spatial/temporal B skip and field list order",
+                        mp4_sha256=hashlib.sha256(mp4.read_bytes()).hexdigest(),
+                        nv12_sha256=hashlib.sha256(known).hexdigest(),
                     )
-                    for y in range(ph):
-                        for x in range(pw):
-                            if interlaced and x < pw // 2:
-                                value = (
-                                    (x + frame * (3 if y % 2 == 0 else -2)) * 7
-                                    + (y // 2) * 11
-                                    + plane * 217
-                                    + (y % 2) * (1 << (depth - 1))
-                                )
-                            else:
-                                value = (
-                                    (x + frame * 3) * 7
-                                    + y * 11
-                                    + plane * 217
-                                    + ((x // 9 + y // 13) % 2) * 371
-                                )
-                            samples.append(value % (1 << depth))
-            raw.write_bytes(
-                struct.pack("<" + ("H" if depth > 8 else "B") * len(samples), *samples)
-            )
-            mp4, native = DATA / (name + ".mp4"), DATA / (name + ".nv12")
-            run(
-                "ffmpeg",
-                "-y",
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-f",
-                "rawvideo",
-                "-pix_fmt",
-                (
-                    f"yuv{420 if chroma == 1 else 422 if chroma == 2 else 444}p{depth}le"
-                    if depth > 8
-                    else f"yuv{420 if chroma == 1 else 422 if chroma == 2 else 444}p"
-                ),
-                "-s",
-                f"{width}x{height}",
-                "-r",
-                "4",
-                "-i",
-                str(raw),
-                "-frames:v",
-                str(frames),
-                "-c:v",
-                "libx264",
-                "-profile:v",
-                "high444"
-                if lossless
-                else (
-                    ("high10" if depth > 8 else "high")
-                    if chroma == 1
-                    else "high422"
-                    if chroma == 2
-                    else "high444"
-                ),
-                "-x264-params",
-                f"no-deblock={int(not filtered)}:interlaced={int(interlaced)}:tff={int(interlaced)}:threads=1:qp={0 if lossless else 23}:keyint=12:bframes=2:ref=3:weightp=2:weightb=1:cabac={int(cabac)}:slice-max-mbs=5:cqm=jvt",
-                str(mp4),
-            )
-            oracle = work / (name + ".decoded")
-            run(
-                "ffmpeg",
-                "-y",
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-i",
-                str(mp4),
-                "-pix_fmt",
-                (
-                    f"yuv{420 if chroma == 1 else 422 if chroma == 2 else 444}p{depth}le"
-                    if depth > 8
-                    else f"yuv{420 if chroma == 1 else 422 if chroma == 2 else 444}p"
-                ),
-                "-f",
-                "rawvideo",
-                str(oracle),
-            )
-            word = "H" if depth > 8 else "B"
-            decoded = struct.unpack(
-                "<" + word * (oracle.stat().st_size // (2 if depth > 8 else 1)),
-                oracle.read_bytes(),
-            )
-            output = []
-            size = width * height
-            for frame in range(frames):
-                sub_y = 2 if chroma == 1 else 1
-                sub_x = 1 if chroma == 3 else 2
-                start = frame * (size + 2 * size // (sub_x * sub_y))
-                output.extend(decoded[start : start + size])
-                for i in range(size // (sub_x * sub_y)):
-                    output.extend(
-                        (
-                            decoded[start + size + i],
-                            decoded[start + size + size // (sub_x * sub_y) + i],
-                        )
-                    )
-            native.write_bytes(struct.pack("<" + word * len(output), *output))
-            receipts.append(
-                dict(
-                    name=name,
-                    bit_depth=depth,
-                    chroma_format=chroma,
-                    cabac=cabac,
-                    oracle="FFmpeg native planar samples, interleaved without quantization",
-                    mp4_sha256=hashlib.sha256(mp4.read_bytes()).hexdigest(),
-                    nv12_sha256=hashlib.sha256(native.read_bytes()).hexdigest(),
                 )
-            )
-    (DATA / "h264-advanced-oracle.json").write_text(
-        json.dumps(
+        for depth in (9, 11, 12, 13, 14):
+            for chroma in (1, 2, 3):
+                name = f"h264-intra-dc-{depth}-{chroma}"
+                encoded, known = intra_dc(depth, chroma)
+                mp4, native = DATA / (name + ".mp4"), DATA / (name + ".nv12")
+                mp4.write_bytes(mux_pcm(encoded, 16, 16))
+                native.write_bytes(known)
+                validation = validate_known(work, mp4, known, depth, chroma, 16, 16)
+                receipts.append(
+                    dict(
+                        name=name,
+                        bit_depth=depth,
+                        chroma_format=chroma,
+                        oracle=validation
+                        + ", Intra16 DC level +1, luma QPprime 48: midpoint+10",
+                        mp4_sha256=hashlib.sha256(mp4.read_bytes()).hexdigest(),
+                        nv12_sha256=hashlib.sha256(known).hexdigest(),
+                    )
+                )
+        name = "h264-intra-dc-offsets-14-3"
+        encoded, known = intra_dc(14, 3, 2)
+        mp4, native = DATA / (name + ".mp4"), DATA / (name + ".nv12")
+        mp4.write_bytes(mux_pcm(encoded, 16, 16))
+        native.write_bytes(known)
+        validation = validate_known(work, mp4, known, 14, 3, 16, 16)
+        receipts.append(
             dict(
-                ffmpeg=subprocess.check_output(
-                    ["ffmpeg", "-version"], text=True
-                ).splitlines()[0],
-                cases=receipts,
-            ),
-            indent=2,
+                name=name,
+                bit_depth=14,
+                chroma_format=3,
+                oracle=validation + ", Cb/Cr QPprime 48/50 gives midpoint+10/+13",
+                mp4_sha256=hashlib.sha256(mp4.read_bytes()).hexdigest(),
+                nv12_sha256=hashlib.sha256(known).hexdigest(),
+            )
         )
-        + "\n"
-    )
+        for chroma, depth, interlaced, filtered, lossless in tuple(
+            (*case, False)
+            for case in (
+                (1, 10, False, True),
+                (2, 8, False, True),
+                (2, 10, False, True),
+                (3, 8, False, True),
+                (3, 10, False, True),
+                (1, 8, True, True),
+                (1, 10, True, True),
+                (1, 8, True, False),
+                (1, 10, True, False),
+            )
+        ) + (
+            (1, 8, False, True, True),
+            (2, 10, False, True, True),
+            (3, 8, False, True, True),
+            (3, 10, False, True, True),
+        ):
+            for cabac in (False, True):
+                name = f"h264-high{depth}{'-lossless' if lossless else ''}{'-mbaff' if interlaced else ''}{'-unfiltered' if not filtered else ''}{f'-{420 if chroma == 1 else 422 if chroma == 2 else 444}' if chroma != 1 else ''}-{'cabac' if cabac else 'cavlc'}"
+                width, height, frames = 128, 96, 12
+                raw = work / (name + ".yuv")
+                samples = []
+                for frame in range(frames):
+                    for plane in range(3):
+                        pw, ph = (
+                            (width, height)
+                            if plane == 0
+                            else (
+                                width // (1 if chroma == 3 else 2),
+                                height // (2 if chroma == 1 else 1),
+                            )
+                        )
+                        for y in range(ph):
+                            for x in range(pw):
+                                if interlaced and x < pw // 2:
+                                    value = (
+                                        (x + frame * (3 if y % 2 == 0 else -2)) * 7
+                                        + (y // 2) * 11
+                                        + plane * 217
+                                        + (y % 2) * (1 << (depth - 1))
+                                    )
+                                else:
+                                    value = (
+                                        (x + frame * 3) * 7
+                                        + y * 11
+                                        + plane * 217
+                                        + ((x // 9 + y // 13) % 2) * 371
+                                    )
+                                samples.append(value % (1 << depth))
+                raw.write_bytes(
+                    struct.pack(
+                        "<" + ("H" if depth > 8 else "B") * len(samples), *samples
+                    )
+                )
+                mp4, native = DATA / (name + ".mp4"), DATA / (name + ".nv12")
+                run(
+                    "ffmpeg",
+                    "-y",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-f",
+                    "rawvideo",
+                    "-pix_fmt",
+                    (
+                        f"yuv{420 if chroma == 1 else 422 if chroma == 2 else 444}p{depth}le"
+                        if depth > 8
+                        else f"yuv{420 if chroma == 1 else 422 if chroma == 2 else 444}p"
+                    ),
+                    "-s",
+                    f"{width}x{height}",
+                    "-r",
+                    "4",
+                    "-i",
+                    str(raw),
+                    "-frames:v",
+                    str(frames),
+                    "-c:v",
+                    "libx264",
+                    "-profile:v",
+                    "high444"
+                    if lossless
+                    else (
+                        ("high10" if depth > 8 else "high")
+                        if chroma == 1
+                        else "high422"
+                        if chroma == 2
+                        else "high444"
+                    ),
+                    "-x264-params",
+                    f"no-deblock={int(not filtered)}:interlaced={int(interlaced)}:tff={int(interlaced)}:threads=1:qp={0 if lossless else 23}:keyint=12:bframes=2:ref=3:weightp=2:weightb=1:cabac={int(cabac)}:slice-max-mbs=5:cqm=jvt",
+                    str(mp4),
+                )
+                oracle = work / (name + ".decoded")
+                run(
+                    "ffmpeg",
+                    "-y",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-i",
+                    str(mp4),
+                    "-pix_fmt",
+                    (
+                        f"yuv{420 if chroma == 1 else 422 if chroma == 2 else 444}p{depth}le"
+                        if depth > 8
+                        else f"yuv{420 if chroma == 1 else 422 if chroma == 2 else 444}p"
+                    ),
+                    "-f",
+                    "rawvideo",
+                    str(oracle),
+                )
+                word = "H" if depth > 8 else "B"
+                decoded = struct.unpack(
+                    "<" + word * (oracle.stat().st_size // (2 if depth > 8 else 1)),
+                    oracle.read_bytes(),
+                )
+                output = []
+                size = width * height
+                for frame in range(frames):
+                    sub_y = 2 if chroma == 1 else 1
+                    sub_x = 1 if chroma == 3 else 2
+                    start = frame * (size + 2 * size // (sub_x * sub_y))
+                    output.extend(decoded[start : start + size])
+                    for i in range(size // (sub_x * sub_y)):
+                        output.extend(
+                            (
+                                decoded[start + size + i],
+                                decoded[start + size + size // (sub_x * sub_y) + i],
+                            )
+                        )
+                native.write_bytes(struct.pack("<" + word * len(output), *output))
+                receipts.append(
+                    dict(
+                        name=name,
+                        bit_depth=depth,
+                        chroma_format=chroma,
+                        cabac=cabac,
+                        oracle="FFmpeg native planar samples, interleaved without quantization",
+                        mp4_sha256=hashlib.sha256(mp4.read_bytes()).hexdigest(),
+                        nv12_sha256=hashlib.sha256(native.read_bytes()).hexdigest(),
+                    )
+                )
+        (DATA / "h264-advanced-oracle.json").write_text(
+            json.dumps(
+                dict(
+                    ffmpeg=subprocess.check_output(
+                        ["ffmpeg", "-version"], text=True
+                    ).splitlines()[0],
+                    cases=receipts,
+                ),
+                indent=2,
+            )
+            + "\n"
+        )

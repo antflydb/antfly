@@ -879,3 +879,221 @@ test "video H264 High422 rejects 444 profile mismatch before allocation" {
     defer reader.track.avcc = original;
     try std.testing.expectError(error.UnsupportedVideoProfile, video.h264.decodeFrame(a, &reader, 0, .{}));
 }
+
+const paff_packet_cases = .{
+    .{ "h264-paff-split-packets-8-1", @embedFile("../testdata/h264-paff-split-packets-8-1.mp4"), @embedFile("../testdata/h264-paff-split-packets-8-1.nv12"), true },
+    .{ "h264-paff-long-paired-8-1", @embedFile("../testdata/h264-paff-long-paired-8-1.mp4"), @embedFile("../testdata/h264-paff-long-paired-8-1.nv12"), false },
+    .{ "h264-paff-long-packets-8-1", @embedFile("../testdata/h264-paff-long-packets-8-1.mp4"), @embedFile("../testdata/h264-paff-long-packets-8-1.nv12"), true },
+    .{ "h264-paff-adaptive-paired-8-1", @embedFile("../testdata/h264-paff-adaptive-paired-8-1.mp4"), @embedFile("../testdata/h264-paff-adaptive-paired-8-1.nv12"), false },
+    .{ "h264-paff-adaptive-packets-8-1", @embedFile("../testdata/h264-paff-adaptive-packets-8-1.mp4"), @embedFile("../testdata/h264-paff-adaptive-packets-8-1.nv12"), true },
+    .{ "h264-paff-cabac-packets-8-1", @embedFile("../testdata/h264-paff-cabac-packets-8-1.mp4"), @embedFile("../testdata/h264-paff-cabac-packets-8-1.nv12"), true },
+    .{ "h264-paff-bottom-packets-8-1", @embedFile("../testdata/h264-paff-bottom-packets-8-1.mp4"), @embedFile("../testdata/h264-paff-bottom-packets-8-1.nv12"), true },
+    .{ "h264-paff-idr-long-packets-8-1", @embedFile("../testdata/h264-paff-idr-long-packets-8-1.mp4"), @embedFile("../testdata/h264-paff-idr-long-packets-8-1.nv12"), true },
+    .{ "h264-paff-b-spatial-packets-8-1", @embedFile("../testdata/h264-paff-b-spatial-packets-8-1.mp4"), @embedFile("../testdata/h264-paff-b-spatial-packets-8-1.nv12"), true },
+    .{ "h264-paff-b-temporal-packets-8-1", @embedFile("../testdata/h264-paff-b-temporal-packets-8-1.mp4"), @embedFile("../testdata/h264-paff-b-temporal-packets-8-1.nv12"), true },
+    .{ "h264-paff-split-packets-10-2", @embedFile("../testdata/h264-paff-split-packets-10-2.mp4"), @embedFile("../testdata/h264-paff-split-packets-10-2.nv12"), true },
+    .{ "h264-paff-long-paired-10-2", @embedFile("../testdata/h264-paff-long-paired-10-2.mp4"), @embedFile("../testdata/h264-paff-long-paired-10-2.nv12"), false },
+    .{ "h264-paff-long-packets-10-2", @embedFile("../testdata/h264-paff-long-packets-10-2.mp4"), @embedFile("../testdata/h264-paff-long-packets-10-2.nv12"), true },
+    .{ "h264-paff-adaptive-paired-10-2", @embedFile("../testdata/h264-paff-adaptive-paired-10-2.mp4"), @embedFile("../testdata/h264-paff-adaptive-paired-10-2.nv12"), false },
+    .{ "h264-paff-adaptive-packets-10-2", @embedFile("../testdata/h264-paff-adaptive-packets-10-2.mp4"), @embedFile("../testdata/h264-paff-adaptive-packets-10-2.nv12"), true },
+    .{ "h264-paff-cabac-packets-10-2", @embedFile("../testdata/h264-paff-cabac-packets-10-2.mp4"), @embedFile("../testdata/h264-paff-cabac-packets-10-2.nv12"), true },
+    .{ "h264-paff-bottom-packets-10-2", @embedFile("../testdata/h264-paff-bottom-packets-10-2.mp4"), @embedFile("../testdata/h264-paff-bottom-packets-10-2.nv12"), true },
+    .{ "h264-paff-idr-long-packets-10-2", @embedFile("../testdata/h264-paff-idr-long-packets-10-2.mp4"), @embedFile("../testdata/h264-paff-idr-long-packets-10-2.nv12"), true },
+    .{ "h264-paff-b-spatial-packets-10-2", @embedFile("../testdata/h264-paff-b-spatial-packets-10-2.mp4"), @embedFile("../testdata/h264-paff-b-spatial-packets-10-2.nv12"), true },
+    .{ "h264-paff-b-temporal-packets-10-2", @embedFile("../testdata/h264-paff-b-temporal-packets-10-2.mp4"), @embedFile("../testdata/h264-paff-b-temporal-packets-10-2.nv12"), true },
+    .{ "h264-paff-split-packets-14-3", @embedFile("../testdata/h264-paff-split-packets-14-3.mp4"), @embedFile("../testdata/h264-paff-split-packets-14-3.nv12"), true },
+    .{ "h264-paff-long-paired-14-3", @embedFile("../testdata/h264-paff-long-paired-14-3.mp4"), @embedFile("../testdata/h264-paff-long-paired-14-3.nv12"), false },
+    .{ "h264-paff-long-packets-14-3", @embedFile("../testdata/h264-paff-long-packets-14-3.mp4"), @embedFile("../testdata/h264-paff-long-packets-14-3.nv12"), true },
+    .{ "h264-paff-adaptive-paired-14-3", @embedFile("../testdata/h264-paff-adaptive-paired-14-3.mp4"), @embedFile("../testdata/h264-paff-adaptive-paired-14-3.nv12"), false },
+    .{ "h264-paff-adaptive-packets-14-3", @embedFile("../testdata/h264-paff-adaptive-packets-14-3.mp4"), @embedFile("../testdata/h264-paff-adaptive-packets-14-3.nv12"), true },
+    .{ "h264-paff-cabac-packets-14-3", @embedFile("../testdata/h264-paff-cabac-packets-14-3.mp4"), @embedFile("../testdata/h264-paff-cabac-packets-14-3.nv12"), true },
+    .{ "h264-paff-bottom-packets-14-3", @embedFile("../testdata/h264-paff-bottom-packets-14-3.mp4"), @embedFile("../testdata/h264-paff-bottom-packets-14-3.nv12"), true },
+    .{ "h264-paff-idr-long-packets-14-3", @embedFile("../testdata/h264-paff-idr-long-packets-14-3.mp4"), @embedFile("../testdata/h264-paff-idr-long-packets-14-3.nv12"), true },
+    .{ "h264-paff-b-spatial-packets-14-3", @embedFile("../testdata/h264-paff-b-spatial-packets-14-3.mp4"), @embedFile("../testdata/h264-paff-b-spatial-packets-14-3.nv12"), true },
+    .{ "h264-paff-b-temporal-packets-14-3", @embedFile("../testdata/h264-paff-b-temporal-packets-14-3.mp4"), @embedFile("../testdata/h264-paff-b-temporal-packets-14-3.nv12"), true },
+};
+
+test "video H264 PAFF standalone packets and field MMCO match independent native samples" {
+    const Receipt = struct { cases: []const struct { name: []const u8, mp4_sha256: []const u8, nv12_sha256: []const u8 } };
+    const receipt = try std.json.parseFromSlice(Receipt, a, @embedFile("../testdata/h264-paff-packets-oracle.json"), .{ .ignore_unknown_fields = true });
+    defer receipt.deinit();
+    try std.testing.expectEqual(paff_packet_cases.len, receipt.value.cases.len);
+    inline for (paff_packet_cases, 0..) |pair, case_index| {
+        try std.testing.expectEqualStrings(pair[0], receipt.value.cases[case_index].name);
+        inline for (.{ pair[1], pair[2] }, 0..) |bytes, file_index| {
+            var hash: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(bytes, &hash, .{});
+            try std.testing.expectEqualStrings(if (file_index == 0) receipt.value.cases[case_index].mp4_sha256 else receipt.value.cases[case_index].nv12_sha256, &std.fmt.bytesToHex(hash, .lower));
+        }
+        var pool = media.admission.Pool{ .limits = .{ .host_bytes = 32 * 1024 * 1024 } };
+        var src = media.source.Source{ .allocator = a, .admission_pool = &pool, .identity = pair[0], .storage = .{ .borrowed = pair[1] } };
+        var reader = try media.mp4.Reader.init(a, &src, .{ .max_index_bytes = 65536 });
+        defer reader.deinit();
+        const per_picture: usize = if (pair[3]) 2 else 1;
+        const size = pair[2].len / (reader.packets.len / per_picture);
+        const retained = pool.snapshot();
+        for (reader.packets, 0..) |_, i| {
+            var frame = video.h264.decodeFrame(a, &reader, i, .{}) catch |err| {
+                std.debug.print("PAFF case {s}, packet {d}: {s}\n", .{ pair[0], i, @errorName(err) });
+                return err;
+            };
+            const ordinal: usize = @intCast(@divExact(reader.packets[i / per_picture * per_picture].pts, @as(i64, @intCast(per_picture))));
+            try std.testing.expectEqualSlices(u8, pair[2][ordinal * size ..][0..size], frame.nv12);
+            try std.testing.expectEqual(@as(i64, @intCast(ordinal * per_picture)), frame.pts);
+            try std.testing.expectEqual(@as(u32, @intCast(per_picture)), frame.duration);
+            try std.testing.expectEqual((i / per_picture + 1) * per_picture, frame.decoded_packets);
+            frame.deinit();
+            try std.testing.expectEqual(retained, pool.snapshot());
+        }
+    }
+}
+
+test "video H264 PAFF standalone selection completes once and preserves callback slots" {
+    const bytes = @embedFile("../testdata/h264-paff-split-packets-14-3.mp4");
+    const known = @embedFile("../testdata/h264-paff-split-packets-14-3.nv12");
+    var src = media.source.Source{ .allocator = a, .identity = "paff-selection", .storage = .{ .borrowed = bytes } };
+    var reader = try media.mp4.Reader.init(a, &src, .{});
+    defer reader.deinit();
+    const Collector = struct {
+        visited: [4]bool = @splat(false),
+        fn publish(context: *anyopaque, slot: usize, frame: *const video.h264.Frame) !void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            const ordinal: usize = if (slot % 2 == 0) 2 else 0;
+            const size = known.len / 3;
+            try std.testing.expectEqualSlices(u8, known[ordinal * size ..][0..size], frame.nv12);
+            try std.testing.expectEqual(@as(i64, @intCast(ordinal * 2)), frame.pts);
+            try std.testing.expect(!self.visited[slot]);
+            self.visited[slot] = true;
+        }
+    };
+    var collector = Collector{};
+    const stats = try video.h264.decodeSelected(a, &reader, &.{ 4, 0, 5, 1 }, .{}, &collector, Collector.publish);
+    try std.testing.expectEqual(@as(usize, 6), stats.decoded_packets);
+    var payload: u64 = 0;
+    for (reader.packets) |packet| payload += packet.size;
+    try std.testing.expectEqual(payload, stats.payload_bytes);
+    for (collector.visited) |visited| try std.testing.expect(visited);
+    try std.testing.expectError(error.ResourceLimitExceeded, video.h264.decodeFrame(a, &reader, 0, .{ .max_dependency_packets = 1 }));
+    try std.testing.expectError(error.ResourceLimitExceeded, video.h264.decodeFrame(a, &reader, 0, .{ .max_slices = 1 }));
+    const packets = reader.packets;
+    reader.packets = packets[0..1];
+    defer reader.packets = packets;
+    try std.testing.expectError(error.IncompleteVideoPicture, video.h264.decodeFrame(a, &reader, 0, .{}));
+}
+
+test "video H264 PAFF standalone allocation failures release partial field references" {
+    const Harness = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var src = media.source.Source{ .allocator = allocator, .identity = "paff-failures", .storage = .{ .borrowed = @embedFile("../testdata/h264-paff-long-packets-14-3.mp4") } };
+            var reader = try media.mp4.Reader.init(allocator, &src, .{});
+            defer reader.deinit();
+            var frame = try video.h264.decodeFrame(allocator, &reader, reader.packets.len - 1, .{});
+            defer frame.deinit();
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Harness.run, .{});
+}
+
+test "video H264 PAFF field marking preserves complementary identities and long PicNum 31" {
+    const State = @import("h264_references.zig").State;
+    const Motion = @import("h264_motion.zig").Motion;
+    const planar: [24]u8 = @splat(0);
+    const motions = [_]Motion{.{ .decoded = true }};
+    const pair = [2][]const Motion{ &motions, &motions };
+    var state = State{ .reference = true, .field_picture = true, .paired = true };
+    defer state.deinit(a);
+    for (0..2) |parity| {
+        state.field_parity = parity;
+        state.current_fields = .{ parity == 0, parity == 1 };
+        state.current_field_poc[parity] = @intCast(parity);
+        state.order(4);
+        try referenceMarking(&state, &.{});
+        try state.commit(a, &planar, pair, 16);
+    }
+    const original_id = state.pictures[0].id;
+    state.current_num = 1;
+    state.field_parity = 0;
+    state.current_fields = .{ true, false };
+    state.order(4);
+    try referenceMarking(&state, &.{ .{ .operation = 4, .first = 16 }, .{ .operation = 3, .first = 1, .second = 15 }, .{ .operation = 6, .first = 14 } });
+    try state.commit(a, &planar, pair, 16);
+    try std.testing.expectEqual(original_id, state.pictures[0].id);
+    try std.testing.expectEqual(@as(?u32, 15), state.pictures[0].field_long[0]);
+    try std.testing.expectEqual(@as(?u32, null), state.pictures[0].field_long[1]);
+    try std.testing.expect(state.pictures[0].fields[1]);
+    state.order(4);
+    state.orderFields(0, false);
+    try std.testing.expectEqual(@as(u8, 1), state.field_lists[0][0]); // old bottom remains short-term
+    try std.testing.expectEqual(@as(u8, 2), state.field_lists[0][1]); // long index 14 before 15
+    try std.testing.expectEqual(@as(u8, 0), state.field_lists[0][2]);
+    state.field_parity = 1;
+    state.current_fields = .{ false, true };
+    try referenceMarking(&state, &.{ .{ .operation = 3, .first = 1, .second = 15 }, .{ .operation = 6, .first = 14 } });
+    try state.commit(a, &planar, pair, 16);
+    try std.testing.expectEqual(@as(?u32, 15), state.pictures[0].field_long[1]);
+    try std.testing.expectEqual(@as(?u32, 14), state.pictures[1].long_term);
+    const complementary_id = state.pictures[1].id;
+    state.current_num = 2;
+    state.field_parity = 0;
+    state.current_fields = .{ true, false };
+    state.order(4);
+    try referenceMarking(&state, &.{ .{ .operation = 2, .first = 31 }, .{ .operation = 6, .first = 14 } });
+    try state.commit(a, &planar, pair, 16);
+    try std.testing.expectEqual(@as(usize, 2), state.count);
+    try std.testing.expectEqual(original_id, state.pictures[0].id);
+    try std.testing.expect(!state.pictures[0].fields[0] and state.pictures[0].fields[1]);
+    for (state.pictures[0..state.count]) |pic| try std.testing.expect(pic.id != complementary_id);
+    const current_id = state.pictures[1].id;
+    state.field_parity = 1;
+    state.current_fields = .{ false, true };
+    state.order(4);
+    try referenceMarking(&state, &.{ .{ .operation = 2, .first = 31 }, .{ .operation = 6, .first = 14 } });
+    try state.commit(a, &planar, pair, 16);
+    try std.testing.expectEqual(@as(usize, 1), state.count);
+    try std.testing.expectEqual(current_id, state.pictures[0].id);
+    try std.testing.expect(state.pictures[0].fields[0] and state.pictures[0].fields[1]);
+    state.current_num = 3;
+    try referenceMarking(&state, &.{ .{ .operation = 4, .first = 0 }, .{ .operation = 6, .first = 0 } });
+    try std.testing.expectError(error.MalformedVideoPacket, state.commit(a, &planar, pair, 16));
+    try referenceMarking(&state, &.{.{ .operation = 4, .first = 2 }});
+    try std.testing.expectError(error.MalformedVideoPacket, state.commit(a, &planar, pair, 1));
+}
+
+test "video H264 PAFF standalone mismatched complement and cancellation release admission" {
+    const bytes = @embedFile("../testdata/h264-paff-split-packets-14-3.mp4");
+    const known = @embedFile("../testdata/h264-paff-split-packets-14-3.nv12");
+    var src = media.source.Source{ .allocator = a, .identity = "paff-cancellation", .storage = .{ .borrowed = bytes } };
+    var reader = try media.mp4.Reader.init(a, &src, .{});
+    defer reader.deinit();
+    var pool = media.admission.Pool{ .limits = .{ .host_bytes = 1024 * 1024 } };
+    src.admission_pool = &pool;
+    const retained = src.retained_bytes;
+    const original = reader.packets[1];
+    reader.packets[1] = reader.packets[3];
+    try std.testing.expectError(error.MixedVideoPictures, video.h264.decodeFrame(a, &reader, 0, .{}));
+    try std.testing.expectEqual(media.admission.Resources{}, pool.snapshot());
+    try std.testing.expectEqual(retained, src.retained_bytes);
+    reader.packets[1] = original;
+    const Cancel = struct {
+        input: *media.source.Source,
+        after_reads: usize,
+        fn check(ctx: ?*const anyopaque) !void {
+            const self: *const @This() = @ptrCast(@alignCast(ctx.?));
+            if (self.input.reads >= self.after_reads) return error.Cancelled;
+        }
+    };
+    const cancel = Cancel{ .input = &src, .after_reads = src.reads + 3 };
+    src.control = .{ .context = &cancel, .check_fn = Cancel.check };
+    try std.testing.expectError(error.Cancelled, video.h264.decodeFrame(a, &reader, 0, .{}));
+    try std.testing.expectEqual(media.admission.Resources{}, pool.snapshot());
+    try std.testing.expectEqual(retained, src.retained_bytes);
+    src.control = .{};
+    reader.packets[0].pts = -4;
+    reader.packets[1].pts = -3;
+    var frame = try video.h264.decodeFrame(a, &reader, 1, .{});
+    try std.testing.expectEqual(@as(i64, -4), frame.pts);
+    try std.testing.expectEqual(@as(u32, 2), frame.duration);
+    try std.testing.expectEqualSlices(u8, known[0 .. known.len / 3], frame.nv12);
+    frame.deinit();
+    try std.testing.expectEqual(media.admission.Resources{}, pool.snapshot());
+}
