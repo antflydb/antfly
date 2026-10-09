@@ -1151,7 +1151,7 @@ fn executeInternal(
             });
         }
 
-        const query_json = try encodeQueryValueForRetrievalQuery(
+        const query_json = encodeQueryValueForRetrievalQuery(
             alloc,
             runner,
             raw_query,
@@ -1161,7 +1161,8 @@ fn executeInternal(
             classification_result,
             retrieval_query_index,
             .initial,
-        );
+        ) catch |err|
+            return failAgentResult(alloc, format, &live, err, .retrieval);
         defer alloc.free(query_json);
 
         const query_hits = cachedProbeResults(candidate_scores, retrieval_query_index, query_json) orelse
@@ -1183,7 +1184,7 @@ fn executeInternal(
                 .details = try buildRefineQueryStepDetails(arena, retrieval_query, retrieval_query_index),
             });
 
-            const followup_query_json = try encodeQueryValueForRetrievalQuery(
+            const followup_query_json = encodeQueryValueForRetrievalQuery(
                 alloc,
                 runner,
                 raw_query,
@@ -1193,7 +1194,8 @@ fn executeInternal(
                 classification_result,
                 retrieval_query_index,
                 .followup,
-            );
+            ) catch |err|
+                return failAgentResult(alloc, format, &live, err, .retrieval);
             defer alloc.free(followup_query_json);
 
             const followup_hits = runQueryAndExtractHits(alloc, arena, runner, table_name, followup_query_json, request.query, retrieval_query.tree_search != null, false) catch |err|
@@ -1287,7 +1289,7 @@ fn executeInternal(
                     .details = try buildTreeExpansionStepDetails(arena, retrieval_query, retrieval_query_index, tree_plan),
                 });
 
-                const expanded_query_json = try encodeQueryValueForRetrievalQuery(
+                const expanded_query_json = encodeQueryValueForRetrievalQuery(
                     alloc,
                     runner,
                     raw_query,
@@ -1297,7 +1299,8 @@ fn executeInternal(
                     classification_result,
                     retrieval_query_index,
                     .followup,
-                );
+                ) catch |err|
+                    return failAgentResult(alloc, format, &live, err, .retrieval);
                 defer alloc.free(expanded_query_json);
 
                 const expanded_hits = runQueryAndExtractHits(alloc, arena, runner, table_name, expanded_query_json, request.query, true, false) catch |err|
@@ -1370,7 +1373,7 @@ fn executeInternal(
                     ),
                 });
 
-                const refined_query_json = try encodeQueryValueForRetrievalQueryWithText(
+                const refined_query_json = encodeQueryValueForRetrievalQueryWithText(
                     alloc,
                     runner,
                     raw_query,
@@ -1381,7 +1384,8 @@ fn executeInternal(
                     retrieval_query_index,
                     .evaluation,
                     refined_query,
-                );
+                ) catch |err|
+                    return failAgentResult(alloc, format, &live, err, .retrieval);
                 defer alloc.free(refined_query_json);
 
                 const refined_hits = runQueryAndExtractHits(alloc, arena, runner, table_name, refined_query_json, request.query, retrieval_query.tree_search != null, false) catch |err|
@@ -12711,52 +12715,64 @@ test "retrieval agent live pipeline spans retrieval and finishes before generati
 test "retrieval agent live pipeline fails with stable retryable read error" {
     const Fixture = struct {
         failure: anyerror,
+        scan_calls: usize = 0,
         fn query(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8) !query_api.QueryResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.failure;
+        }
+        fn scan(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: u32, _: ?[]const u8, _: ?[]const u8) !QueryRunner.KeyPage {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.scan_calls += 1;
             return self.failure;
         }
     };
     const body =
         \\{"query":"find alpha","stream":true,"steps":{"classification":{}},"queries":[{"table":"docs","full_text_search":{"query":"alpha"}}]}
     ;
+    const tree_body =
+        \\{"query":"find alpha","stream":true,"queries":[{"table":"docs"}],"steps":{"retrieval":{"navigation":{"index":"doc_hierarchy","start_nodes":"$roots","max_depth":2,"query_index":0,"strategy":"tree","selection":"ranked"}}}}
+    ;
     for ([_]anyerror{ error.IdentityReadGenerationChanged, error.StorageReadTemporarilyUnavailable, error.TopologyChanged }) |failure| {
-        var fixture: Fixture = .{ .failure = failure };
-        const runner: QueryRunner = .{ .ptr = &fixture, .vtable = &.{ .run_query = Fixture.query } };
-        var transcript: SseTranscript = .{};
-        defer transcript.bytes.deinit(std.testing.allocator);
-        const response = try executeWithEventSink(std.testing.allocator, runner, null, body, .{ .ptr = &transcript, .emit_json_fn = SseTranscript.emit });
-        defer std.testing.allocator.free(response.body);
-        const events = try parseSseEventsAlloc(std.testing.allocator, transcript.bytes.items);
-        defer std.testing.allocator.free(events);
-        var pipeline_started = false;
-        var pipeline_failed = false;
-        for (events) |event| {
-            if (std.mem.eql(u8, event.event, "step_started") or std.mem.eql(u8, event.event, "step_completed")) {
-                var value = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, event.data, .{});
-                defer value.deinit();
-                if (!std.mem.eql(u8, value.value.object.get("name").?.string, "pipeline")) continue;
-                if (std.mem.eql(u8, event.event, "step_started")) pipeline_started = true else {
-                    try std.testing.expect(pipeline_started and !pipeline_failed);
-                    try std.testing.expectEqualStrings("error", value.value.object.get("status").?.string);
-                    pipeline_failed = true;
+        for ([_][]const u8{ body, tree_body }, 0..) |request_body, phase| {
+            var fixture: Fixture = .{ .failure = failure };
+            const runner: QueryRunner = .{ .ptr = &fixture, .vtable = &.{ .run_query = Fixture.query, .scan_key_page = Fixture.scan } };
+            var transcript: SseTranscript = .{};
+            defer transcript.bytes.deinit(std.testing.allocator);
+            const response = try executeWithEventSink(std.testing.allocator, runner, null, request_body, .{ .ptr = &transcript, .emit_json_fn = SseTranscript.emit });
+            defer std.testing.allocator.free(response.body);
+            const events = try parseSseEventsAlloc(std.testing.allocator, transcript.bytes.items);
+            defer std.testing.allocator.free(events);
+            var pipeline_started = false;
+            var pipeline_failed = false;
+            for (events) |event| {
+                if (std.mem.eql(u8, event.event, "step_started") or std.mem.eql(u8, event.event, "step_completed")) {
+                    var value = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, event.data, .{});
+                    defer value.deinit();
+                    if (!std.mem.eql(u8, value.value.object.get("name").?.string, "pipeline")) continue;
+                    if (std.mem.eql(u8, event.event, "step_started")) pipeline_started = true else {
+                        try std.testing.expect(pipeline_started and !pipeline_failed);
+                        try std.testing.expectEqualStrings("error", value.value.object.get("status").?.string);
+                        pipeline_failed = true;
+                    }
                 }
+                if (std.mem.eql(u8, event.event, "error")) try std.testing.expect(pipeline_failed);
             }
-            if (std.mem.eql(u8, event.event, "error")) try std.testing.expect(pipeline_failed);
+            try std.testing.expect(pipeline_failed);
+            try std.testing.expectEqual(@as(usize, phase), fixture.scan_calls);
+            try std.testing.expectEqual(@as(usize, 0), countSseEvents(events, "hit"));
+            try std.testing.expectEqual(@as(usize, 0), countSseEvents(events, "generation"));
+            try std.testing.expectEqual(@as(usize, 0), countSseEvents(events, "done"));
+            var payload = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, firstSseEventData(events, "error").?, .{});
+            defer payload.deinit();
+            try std.testing.expectEqualStrings("ReadUnavailable", payload.value.object.get("error").?.string);
+            try std.testing.expectEqualStrings("read_unavailable", payload.value.object.get("code").?.string);
+            try std.testing.expect(payload.value.object.get("retryable").?.bool);
+            try std.testing.expectEqual(@as(i64, 1000), payload.value.object.get("retry_after_ms").?.integer);
+            const buffered = try execute(std.testing.allocator, runner, null, request_body);
+            defer std.testing.allocator.free(buffered.body);
+            const buffered_events = try parseSseEventsAlloc(std.testing.allocator, buffered.body);
+            defer std.testing.allocator.free(buffered_events);
+            try std.testing.expectEqualStrings(firstSseEventData(events, "error").?, firstSseEventData(buffered_events, "error").?);
         }
-        try std.testing.expect(pipeline_failed);
-        try std.testing.expectEqual(@as(usize, 0), countSseEvents(events, "hit"));
-        try std.testing.expectEqual(@as(usize, 0), countSseEvents(events, "generation"));
-        try std.testing.expectEqual(@as(usize, 0), countSseEvents(events, "done"));
-        var payload = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, firstSseEventData(events, "error").?, .{});
-        defer payload.deinit();
-        try std.testing.expectEqualStrings("ReadUnavailable", payload.value.object.get("error").?.string);
-        try std.testing.expectEqualStrings("read_unavailable", payload.value.object.get("code").?.string);
-        try std.testing.expect(payload.value.object.get("retryable").?.bool);
-        try std.testing.expectEqual(@as(i64, 1000), payload.value.object.get("retry_after_ms").?.integer);
-        const buffered = try execute(std.testing.allocator, runner, null, body);
-        defer std.testing.allocator.free(buffered.body);
-        const buffered_events = try parseSseEventsAlloc(std.testing.allocator, buffered.body);
-        defer std.testing.allocator.free(buffered_events);
-        try std.testing.expectEqualStrings(firstSseEventData(events, "error").?, firstSseEventData(buffered_events, "error").?);
     }
 }
