@@ -15582,6 +15582,11 @@ test "distributed graph fans out per-group expand and hydrate with worker io" {
             try std.testing.expect(req.timeout_ms != null);
             try std.testing.expect(req.cancellation != null);
             try state.verifyChild(req.execution_runnable);
+            const local_graph = @import("antfly_local_sources").api_local_graph;
+            const search_req = try local_graph.frontierItemToSearchRequest(alloc, req, req.frontier[0]);
+            defer local_graph.freeExpandSearchRequest(alloc, search_req);
+            try state.verifyChild(search_req.execution_runnable);
+            try @import("antfly_local_sources").api_local_query_contract.checkQueryDeadline(search_req);
             _ = state.expand_calls.fetchAdd(1, .monotonic);
             const active = state.expand_active.fetchAdd(1, .monotonic) + 1;
             defer _ = state.expand_active.fetchSub(1, .monotonic);
@@ -15636,6 +15641,10 @@ test "distributed graph fans out per-group expand and hydrate with worker io" {
             try std.testing.expect(req.timeout_ms != null);
             try std.testing.expect(req.cancellation != null);
             try state.verifyChild(req.execution_runnable);
+            const contract = @import("antfly_local_sources").api_local_query_contract;
+            const search_req = contract.graphHydrateSearchRequest(req);
+            try state.verifyChild(search_req.execution_runnable);
+            try contract.checkQueryDeadline(search_req);
             _ = state.hydrate_calls.fetchAdd(1, .monotonic);
             const active = state.hydrate_active.fetchAdd(1, .monotonic) + 1;
             defer _ = state.hydrate_active.fetchSub(1, .monotonic);
@@ -15754,6 +15763,7 @@ test "distributed graph fans out per-group expand and hydrate with worker io" {
         }
 
         cancellation.store(true, .release);
+        try std.testing.expectError(if (capacity == 0) error.Cancelled else error.Canceled, @import("antfly_local_sources").api_local_query_contract.checkQueryDeadline(req));
         try std.testing.expectError(if (capacity == 0) error.Cancelled else error.Canceled, executeCrossRange(
             std.testing.allocator,
             FakeCatalog.iface(),

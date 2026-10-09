@@ -2911,6 +2911,7 @@ fn logExactSortBudgetRejection(
 }
 
 fn checkSearchRequestDeadline(req: types.SearchRequest) !void {
+    if (req.execution_runnable) |grant| try grant.checkpoint();
     if (req.cancellation) |cancellation| {
         if (cancellation.isCancelled()) return error.Cancelled;
     }

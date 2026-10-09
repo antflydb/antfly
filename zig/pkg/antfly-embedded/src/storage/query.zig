@@ -217,6 +217,7 @@ pub fn executeStorageKernelGraphEdges(
     const control_req = db_mod.types.SearchRequest{
         .identity_read_generation = req.identity_read_generation,
         .execution_deadline_ns = req.execution_deadline_ns orelse local_graph.executionDeadlineFromTimeoutMs(req.timeout_ms),
+        .execution_runnable = req.execution_runnable,
         .cancellation = req.cancellation,
     };
     try checkQueryDeadline(control_req);

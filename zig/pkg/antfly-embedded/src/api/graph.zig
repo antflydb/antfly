@@ -879,6 +879,7 @@ pub fn frontierItemToSearchRequest(
         .resolved_doc_filter = req.resolved_doc_filter,
         .resolved_doc_filter_wire_context = req.resolved_doc_filter_wire_context,
         .execution_deadline_ns = req.execution_deadline_ns orelse executionDeadlineFromTimeoutMs(req.timeout_ms),
+        .execution_runnable = req.execution_runnable,
         .cancellation = req.cancellation,
     };
 }
