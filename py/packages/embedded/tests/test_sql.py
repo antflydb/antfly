@@ -54,8 +54,10 @@ def test_numeric_parameters_and_type_categories(require_native, aflite_path):
         c = connection.cursor()
         c.execute("SELECT CAST(:1 AS BIGINT) AS n, ':2' AS literal -- :3\n", (9007199254740993,))
         assert c.fetchall() == [(9007199254740993, ":2")]
-        assert c.description[0][1] == dbapi.NUMBER
-        assert c.description[1][1] == dbapi.STRING
+        description = c.description
+        assert description is not None
+        assert description[0][1] == dbapi.NUMBER
+        assert description[1][1] == dbapi.STRING
         with pytest.raises(dbapi.DataError):
             c.execute("SELECT :1", (float("nan"),))
         with pytest.raises(dbapi.DataError):
@@ -273,6 +275,8 @@ c.close()
             text=True,
         )
         try:
+            assert process.stdout is not None
+            assert process.stderr is not None
             assert process.stdout.readline().strip() == "prepared", process.stderr.read()
             try:
                 process.communicate(timeout=delay)
