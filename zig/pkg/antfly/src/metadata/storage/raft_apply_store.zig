@@ -115,6 +115,45 @@ test "system catalog relation namespace transaction classifies only canonical af
     try std.testing.expectEqual(@as(?u64, std.math.maxInt(u64)), try system_catalog_storage.tableIdFromRecordKey(prefix ++ "18446744073709551615", 41));
 }
 
+/// Fixtures explicitly model the already capability-fenced bootstrap. This is
+/// not an automatic migration or a production writer-adoption entry point.
+fn adoptRelationWriterForTest(store: *RaftApplyStore, a: std.mem.Allocator, group: u64) !void {
+    var txn = try store.store.beginWriteTxn();
+    errdefer txn.abort();
+    var cursor = try txn.openCursor();
+    var cursor_open = true;
+    defer if (cursor_open) cursor.close();
+    var buf: [160]u8 = undefined;
+    const prefix = try tablePrefixForGroup(&buf, group);
+    var row = try cursor.seekAtOrAfter(prefix);
+    while (row) |item| : (row = try cursor.next()) {
+        if (!std.mem.startsWith(u8, item.key, prefix)) break;
+        const id = (try RaftApplyStore.capturedRelationTableId(item.key, group)).?;
+        var cut = try RaftApplyStore.relationWriterSnapshot(a, &txn, group, id, true);
+        defer cut.deinit();
+        var plan = try relation_names.Plan.init(a, &.{}, cut.claims());
+        defer plan.deinit();
+        var registry: relation_names.Store(docstore.DocStore.Txn) = .{ .txn = &txn, .alloc = a, .group_id = group };
+        try plan.apply(&registry);
+    }
+    cursor.close();
+    cursor_open = false;
+    try txn.put(try RaftApplyStore.relationWriterKeyForGroup(&buf, group), "AFRW01");
+    try verifyRelationCheckpointTxn(a, &txn);
+    try txn.commit();
+}
+
+fn verifyRelationRecoveryForTest(store: *RaftApplyStore, a: std.mem.Allocator, group: u64) !void {
+    const snapshot = try store.snapshotBuilder().buildSnapshot(a, group);
+    defer a.free(snapshot);
+    const rows = try decodeMetadataSnapshotAlloc(a, snapshot);
+    defer freeMetadataSnapshotRows(a, rows);
+    try validateMetadataSnapshotRows(a, group, rows);
+    var read = try store.store.beginReadTxn();
+    defer read.abort();
+    try verifyRelationCheckpointTxn(a, &read);
+}
+
 test "system catalog compound writer registry never hides successor reservations from admission or checkpoint validation" {
     const a = std.testing.allocator;
     const group: u64 = 41;
@@ -2706,6 +2745,7 @@ test "system catalog relation namespace transaction FK generation publication be
         try seed.commit();
     }
     try store.applyStandaloneCommand(group_id, .{ .upsert_range = child_range });
+    try adoptRelationWriterForTest(&store, alloc, group_id);
     // Adopt source tracking before the first pending generation. These writes
     // model the already capability-fenced adoption command, not writer serving.
     {
@@ -2781,6 +2821,7 @@ test "system catalog relation namespace transaction FK generation publication be
         try policy_txn.commit();
     }
     try store.applyStandaloneCommand(group_id, .{ .apply_fk_generation_publication = begin });
+    try verifyRelationRecoveryForTest(&store, alloc, group_id);
     const reserved_epoch = blk: {
         var txn = try store.store.beginReadTxn();
         defer txn.abort();
@@ -2792,6 +2833,8 @@ test "system catalog relation namespace transaction FK generation publication be
         try std.testing.expectEqual(@as(u32, 1), entry.active.?.schema_version);
         try std.testing.expectEqual(@as(u32, 2), entry.pending.?.schema_version);
         try std.testing.expectEqualSlices(u8, &id, &entry.pending.?.publication_id);
+        var registry: relation_names.Store(docstore.DocStore.Txn) = .{ .txn = &txn, .alloc = alloc, .group_id = group_id };
+        try std.testing.expect((try registry.getEntry(cut.claims()[0].key)).?.eql(entry));
         break :blk epoch;
     };
     const reserved_source_cut = blk: {
@@ -2923,6 +2966,17 @@ test "system catalog relation namespace transaction FK generation publication be
         const receipt_bytes = try std.json.Stringify.valueAlloc(alloc, receipt_only, .{});
         defer alloc.free(receipt_bytes);
         try txn.put(key, receipt_bytes);
+        {
+            var no_allocations = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+            const saved_alloc = store.alloc;
+            store.alloc = no_allocations.allocator();
+            defer store.alloc = saved_alloc;
+            var unchanged_plan = try store.capturedRelationsPlanTxn(&txn, group_id, &journal, false);
+            defer unchanged_plan.deinit();
+            try std.testing.expectEqual(@as(usize, 0), unchanged_plan.before.len);
+            try std.testing.expectEqual(@as(usize, 0), unchanged_plan.after.len);
+            try std.testing.expectEqual(@as(usize, 0), no_allocations.alloc_index);
+        }
         try RaftApplyStore.verifyRelationSourceDeltaTxn(alloc, &txn, group_id, &journal);
         receipt_only.plan.id[0] ^= 1;
         const forged_bytes = try std.json.Stringify.valueAlloc(alloc, receipt_only, .{});
@@ -3473,7 +3527,9 @@ test "system catalog relation namespace transaction FK generation publication in
         try relation_reconciliation.advanceSource(&policy_txn, group_id);
         try policy_txn.commit();
     }
+    try adoptRelationWriterForTest(&store, alloc, group_id);
     try store.applyStandaloneCommand(group_id, .{ .apply_fk_initial_create = begin });
+    try verifyRelationRecoveryForTest(&store, alloc, group_id);
     const hidden_epoch = blk: {
         var txn = try store.store.beginReadTxn();
         defer txn.abort();
@@ -3484,6 +3540,9 @@ test "system catalog relation namespace transaction FK generation publication in
         try std.testing.expectEqualStrings(plan.logical_name, hidden.claims()[0].key.name);
         const entry = try hidden.claims()[0].entry();
         try std.testing.expect(entry.active == null);
+        var registry: relation_names.Store(docstore.DocStore.Txn) = .{ .txn = &txn, .alloc = alloc, .group_id = group_id };
+        try std.testing.expect((try registry.getClaim(hidden.claims()[0].key)) == null);
+        try std.testing.expect((try registry.getEntry(hidden.claims()[0].key)).?.eql(entry));
         try std.testing.expectEqualSlices(u8, &plan.id, &entry.pending.?.publication_id);
         const Probe = struct {
             fn run(probe_alloc: std.mem.Allocator, reader: *docstore.DocStore.Txn, metadata_group: u64, table_id: u64) !void {
@@ -4074,7 +4133,10 @@ test "system catalog relation namespace transaction FK generation publication in
         var retired = try RaftApplyStore.relationInitialSnapshot(alloc, &txn, group_id, candidate.child.table_id);
         defer retired.deinit();
         try std.testing.expectEqual(@as(usize, 0), retired.claims().len);
+        var registry: relation_names.Store(docstore.DocStore.Txn) = .{ .txn = &txn, .alloc = alloc, .group_id = group_id };
+        try std.testing.expect((try registry.getEntry(.{ .namespace_id = plan.namespace_id, .name = plan.logical_name })) == null);
     }
+    try verifyRelationRecoveryForTest(&recovered, alloc, group_id);
     var retirement_page = try recovered.fkInitialRetirementPage(alloc, group_id, 30, null, 1);
     defer retirement_page.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), retirement_page.items.len);
@@ -17414,7 +17476,10 @@ pub const RaftApplyStore = struct {
         return relationFkSourceDigest(parsed.value, table_id);
     }
     fn relationReconciliationSnapshot(a: std.mem.Allocator, reader: anytype, group_id: u64, table_id: u64) !RelationSnapshot {
-        const active = try relationSnapshotMode(a, reader, group_id, table_id, true, true);
+        return relationWriterSnapshot(a, reader, group_id, table_id, true);
+    }
+    fn relationWriterSnapshot(a: std.mem.Allocator, reader: anytype, group_id: u64, table_id: u64, allow_legacy: bool) !RelationSnapshot {
+        const active = try relationSnapshotMode(a, reader, group_id, table_id, allow_legacy, true);
         if (active.cut != null) return active;
         return relationInitialSnapshot(a, reader, group_id, table_id);
     }
@@ -18010,9 +18075,35 @@ pub const RaftApplyStore = struct {
     fn capturedRelationsPlanTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, journal: *command_journal.Journal, include_registry: bool) !relation_names.Plan {
         var ids: std.AutoHashMapUnmanaged(u64, void) = .empty;
         defer ids.deinit(self.alloc);
+        var before_reader = journal.beforeReader();
+        var source_changed: ?bool = null;
         var keys = journal.capture.keys.keyIterator();
         while (keys.next()) |key| {
             if (try capturedRelationTableId(key.*, group_id)) |id| try addRelationTableId(self.alloc, &ids, id);
+            const publication_id = (try relationFkSourceTableId(key.*, group_id)) orelse
+                (try relationInitialSourceTableId(key.*, group_id)) orelse
+                (try relationInitialWorkTableId(key.*, group_id));
+            if (publication_id) |id| {
+                if (source_changed == null) {
+                    const prior = try relation_reconciliation.readSourceRevision(&before_reader, group_id);
+                    source_changed = prior == 0 or prior != try relation_reconciliation.readSourceRevision(txn, group_id);
+                }
+                // Native producers advance the tracked clock atomically on
+                // every semantic change. Replay independently verifies that
+                // invariant before committing. At an unchanged tracked clock,
+                // receipts need neither job/schema decoding nor owner cuts.
+                if (!source_changed.?) continue;
+                const before = journal.originals.get(key.*) orelse null;
+                const after = try stagingGet(txn, key.*);
+                // Receipt/progress churn does not change a namespace cut.
+                // Compare the same semantic projection used by source epochs,
+                // not raw JSON envelopes or only the producer's phase tag.
+                const changed = if (before) |old| if (after) |next|
+                    !std.mem.eql(u8, old, next) and !std.mem.eql(u8, &try relationSourceValueDigest(self.alloc, group_id, key.*, old), &try relationSourceValueDigest(self.alloc, group_id, key.*, next))
+                else
+                    true else after != null;
+                if (changed) try addRelationTableId(self.alloc, &ids, id);
+            }
             if (include_registry and try relation_names.Key.fromStorageKey(key.*, group_id) != null) {
                 if (journal.originals.get(key.*)) |before| if (before) |bytes| try addRelationEntryTableIds(self.alloc, &ids, bytes);
                 if (try stagingGet(txn, key.*)) |bytes| try addRelationEntryTableIds(self.alloc, &ids, bytes);
@@ -18020,15 +18111,14 @@ pub const RaftApplyStore = struct {
         }
         var publication = relation_names.Publication.init(self.alloc);
         defer publication.deinit();
-        var before_reader = journal.beforeReader();
         var tables = ids.keyIterator();
         while (tables.next()) |id| {
-            var before = relationSnapshot(self.alloc, &before_reader, group_id, id.*, true) catch |err| switch (err) {
+            var before = relationWriterSnapshot(self.alloc, &before_reader, group_id, id.*, true) catch |err| switch (err) {
                 error.CatalogAlreadyExists, error.InvalidCatalogName => return error.InvalidCatalogRecord,
                 else => return err,
             };
             defer before.deinit();
-            var after = relationSnapshot(self.alloc, txn, group_id, id.*, !before.bound) catch |err| switch (err) {
+            var after = relationWriterSnapshot(self.alloc, txn, group_id, id.*, !before.bound) catch |err| switch (err) {
                 error.InvalidCatalogRecord, error.InvalidCatalogName => return error.InvalidSchemaUpdateRequest,
                 else => return err,
             };
@@ -27297,22 +27387,36 @@ fn validateRelationSnapshotCut(alloc: std.mem.Allocator, group_id: u64, rows: []
             defer binding.deinit();
         }
         const prefix = try tablePrefixForGroup(&buf, group_id);
-        if (!std.mem.startsWith(u8, row.key, prefix)) continue;
-        const id = (try RaftApplyStore.capturedRelationTableId(row.key, group_id)) orelse return error.InvalidMetadataSnapshot;
-        expected = std.math.add(usize, expected, try verifyRelationTableCut(alloc, &reader, group_id, id)) catch return error.InvalidMetadataSnapshot;
+        const count = if (std.mem.startsWith(u8, row.key, prefix)) blk: {
+            const id = (try RaftApplyStore.capturedRelationTableId(row.key, group_id)) orelse return error.InvalidMetadataSnapshot;
+            break :blk try verifyRelationTableCut(alloc, &reader, group_id, id);
+        } else if (try RaftApplyStore.relationInitialWorkTableId(row.key, group_id)) |id|
+            try verifyRelationInitialCut(alloc, &reader, group_id, id)
+        else
+            continue;
+        expected = std.math.add(usize, expected, count) catch return error.InvalidMetadataSnapshot;
     }
     if (expected != received) return error.InvalidMetadataSnapshot;
 }
 
 fn verifyRelationTableCut(alloc: std.mem.Allocator, reader: anytype, group_id: u64, table_id: u64) !usize {
-    var table = try RaftApplyStore.relationSnapshot(alloc, reader, group_id, table_id, true);
+    var table = try RaftApplyStore.relationWriterSnapshot(alloc, reader, group_id, table_id, true);
     defer table.deinit();
+    return verifyRelationClaims(alloc, reader, group_id, table.claims());
+}
+fn verifyRelationInitialCut(alloc: std.mem.Allocator, reader: anytype, group_id: u64, table_id: u64) !usize {
+    var hidden = try RaftApplyStore.relationInitialSnapshot(alloc, reader, group_id, table_id);
+    defer hidden.deinit();
+    if (hidden.claims().len == 0) return error.InvalidCatalogRecord;
+    return verifyRelationClaims(alloc, reader, group_id, hidden.claims());
+}
+fn verifyRelationClaims(alloc: std.mem.Allocator, reader: anytype, group_id: u64, claims: []const relation_names.Claim) !usize {
     var registry: relation_names.Store(@TypeOf(reader.*)) = .{ .txn = reader, .alloc = alloc, .group_id = group_id };
-    for (table.claims()) |claim| {
+    for (claims) |claim| {
         const entry = (try registry.getEntry(claim.key)) orelse return error.InvalidCatalogRecord;
         if (!entry.eql(try claim.entry())) return error.InvalidCatalogRecord;
     }
-    return table.claims().len;
+    return claims.len;
 }
 
 /// Offline checkpoint verification. Cursors lend bytes; only one table's
@@ -27332,6 +27436,17 @@ fn verifyRelationGroupTxn(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn,
         var scratch = std.heap.ArenaAllocator.init(alloc);
         defer scratch.deinit();
         expected = std.math.add(usize, expected, try verifyRelationTableCut(scratch.allocator(), txn, group_id, id)) catch return error.InvalidCatalogRecord;
+    }
+    const initial = try fk_generation_publication.initialWorkPrefixForGroup(&buf, group_id);
+    entry = try cursor.seekAtOrAfter(initial);
+    while (entry) |row| : (entry = try cursor.next()) {
+        if (!std.mem.startsWith(u8, row.key, initial)) break;
+        const id = (try RaftApplyStore.relationInitialWorkTableId(row.key, group_id)) orelse return error.InvalidCatalogRecord;
+        var scratch = std.heap.ArenaAllocator.init(alloc);
+        defer scratch.deinit();
+        // A hidden work row may never double-count a public table. Its exact
+        // reservation pointers and absence of public identity are dependencies.
+        expected = std.math.add(usize, expected, try verifyRelationInitialCut(scratch.allocator(), txn, group_id, id)) catch return error.InvalidCatalogRecord;
     }
     const bindings = try system_catalog_storage.tableRecordPrefixForGroup(&buf, group_id);
     entry = try cursor.seekAtOrAfter(bindings);

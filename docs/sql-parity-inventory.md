@@ -1860,6 +1860,29 @@ and reconciliation tests, inventory, source-catalog, formatting and whitespace
 checks pass. This unifies writer mechanics, not automatic adoption: native
 producer-plan composition, capability/lifecycle barriers and root serving
 remain unfinished. No original SQL parity case receives completion credit.
+FK generation and hidden-create producers now compose their durable plans into
+the same native writer transaction as physical metadata and registry entries.
+Captured publication/work keys select only affected tables; exact predecessor
+and successor cuts include pending-only names and complete schema/publication
+identity. Ordinary table and binding writers use that same projector, preserving
+the existing prohibition on silently dropping a bound logical identity.
+At an unchanged tracked source clock, receipt-only writer preparation does not
+decode jobs or schemas and performs zero preparer allocations. Untracked groups
+and mixed changed batches retain semantic digest comparisons; authenticated
+replay independently verifies source-clock integrity before committing, including
+the unchanged-clock forged-plan regression.
+Snapshot and checkpoint verification now include hidden active-work ranges and
+complete FK publication cuts, sharing exact entry verification with public
+tables. Hidden/public identity overlap fails closed rather than being counted
+twice; terminal history is not scanned as hidden work. Actual FK lifecycle
+fixtures explicitly bootstrap writer ownership, verify reservation entries and
+active-read invisibility, validate snapshots/checkpoints, and retire hidden names
+after cancellation across restart. The bootstrap helper is test-only, not an
+automatic migration or serving capability.
+The final native gate passes 170 catalog tests plus 22 linked tests; inventory,
+source-catalog, formatting and whitespace checks pass. Restore producer-plan
+composition, automatic adoption, capability/lifecycle barriers and atomic root
+serving remain unfinished. Original SQL dispositions and counts are unchanged.
 The owned table-cut projector can now combine an exact predecessor definition
 with a plan-fenced successor definition in expected linear time. It retains
 old-only active names, both owners for shared names and pending-only new names,
