@@ -76,9 +76,13 @@ supports filesystem, S3 and GCS. Capture seals the complete document, index and
 vector generation, transfers authenticated 4 MiB chunks, and conditionally commits
 one immutable manifest before returning a usable cursor. Table/shard/range identity,
 recipe, expiry and artifact location remain authoritative; credential rotation does
-not change native cursor identity. A replacement owner reconstructs a missing
-local generation from verified chunks into staging, seals its new local inventory,
-and atomically installs a disposable read cache. It never recaptures current rows.
+not change native cursor identity. A replacement owner opens a missing local
+generation through an authenticated remote manifest. Primary, index and vector
+payload reads fetch the chunks they need through read-only storage leases; a
+32-entry cache bounds retained chunk bytes to 128 MiB per open reader. Recovery
+does not reconstruct the complete generation on local disk or recapture current
+rows. Repository adapters without the remote-read capability retain the complete
+verified staging-transfer fallback.
 Missing or corrupt authoritative data fails with a catalog conflict.
 
 Immutable SST/vector extents reuse expiring chunk inventories across captures;

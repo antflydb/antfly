@@ -31,8 +31,8 @@ const max_manifest_bytes = 16 * 1024 * 1024;
 const cache_window_ms: u64 = std.time.ms_per_hour;
 const LocalCommit = struct { version: u16 = 1, domain: [32]u8, request: cut.Request, namespace: Namespace };
 const CachedFile = struct { domain: [32]u8, expires_ms: u64, source: local.storage_db_native_backup_seal.File, chunks: []const Ref };
-const Ref = struct { artifact_id: []const u8, byte_len: u64, checksum: []const u8 };
-const File = struct { path: []const u8, size: u64, chunks: []const Ref };
+const Ref = port.remote_storage.Chunk;
+const File = port.remote_storage.File;
 const Manifest = struct { version: u16 = 1, request: cut.Request, namespace: Namespace, sequence: u64, files: []const File };
 pub const Repository = struct {
     a: A,
@@ -106,7 +106,7 @@ pub const Repository = struct {
         if (self.owned_base_dir) |value| self.a.free(value);
     }
     pub fn capability(self: *Repository) port.Port {
-        const vtable: port.VTable = .{ .publish = publish, .recover = recover };
+        const vtable: port.VTable = .{ .publish = publish, .recover = recover, .open_read = openRead };
         return .{ .limits = self.limits, .ptr = self, .vtable = &vtable, .dispatch = @import("antfly_local_sources").runtime_callback_abi.Boundary(port.VTable).local_dispatch };
     }
     fn from(raw: *anyopaque) *Repository {
@@ -396,6 +396,31 @@ pub const Repository = struct {
         try self.markCommitted(a, io, root, request, namespace);
         try cancellation.check();
     }
+    fn readChunk(raw: *anyopaque, a: A, ref: Ref, cancellation: Cancellation) ![]u8 {
+        const self: *Repository = @ptrCast(@alignCast(raw));
+        var store = self.store.artifactStore();
+        store.allocator = a;
+        return store.getVerifiedAllocWithCancellation(ref.artifact_id, @intCast(ref.byte_len), ref.checksum, cancellation) catch |err| switch (err) {
+            error.NotFound, error.ObjectNotFound, error.FileNotFound, error.ArtifactIntegrityMismatch => error.CatalogGenerationChanged,
+            else => err,
+        };
+    }
+    fn openRead(raw: *anyopaque, io: std.Io, root: []const u8, request: cut.Request, namespace: Namespace, cancellation: Cancellation) !port.StorageLease {
+        const self: *Repository = @ptrCast(@alignCast(raw));
+        var arena = std.heap.ArenaAllocator.init(self.a);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const manifest = try checkedManifest(a, try self.readManifest(a, request, namespace, cancellation), request, namespace);
+        const expected_domain = try self.domain(a, namespace);
+        for (manifest.files) |file| for (file.chunks) |ref| {
+            const scope = (try artifacts.uploadScopeFromArtifactId(ref.artifact_id)) orelse return error.CatalogGenerationChanged;
+            if (!std.mem.eql(u8, &scope.domain, &expected_domain) or scope.fencingToken() < request.expires_ms or scope.fencingToken() > request.expires_ms +| 2 * cache_window_ms) return error.CatalogGenerationChanged;
+        };
+        const expiry = @import("antfly_platform").time.monotonicNs() +| (request.expires_ms -| cut.nowMs()) * std.time.ns_per_ms;
+        const control: cut.Control = .{ .parent = cancellation, .deadline_ns = if (request.timeout_ms) |value| @min(expiry, @import("antfly_platform").time.monotonicNs() +| value *| std.time.ns_per_ms) else expiry };
+        const reader = try port.remote_storage.Reader.create(self.a, io, root, manifest.files, .{ .ptr = self, .read = readChunk }, control);
+        return reader.lease();
+    }
     fn recover(raw: *anyopaque, io: std.Io, root: []const u8, request: cut.Request, namespace: Namespace, cancellation: Cancellation) !void {
         const self = from(raw);
         var arena = std.heap.ArenaAllocator.init(self.a);
@@ -498,6 +523,16 @@ test "external lake native repository reuses immutable extents and collects expi
     try repository.capability().recover(io, recovered, first, namespace, .none);
     const recovered_bytes = try local.storage_db_native_backup.readFileAlloc(scratch, io, try std.fmt.allocPrint(scratch, "{s}/immutable.sst", .{recovered}), 1024);
     try std.testing.expectEqualStrings("original immutable extent", recovered_bytes);
+    // A virtual reader needs only the manifest, never a recovered directory.
+    const virtual_root = try std.fmt.allocPrint(scratch, "{s}/virtual", .{directory.path()});
+    var remote = (try repository.capability().openRead(io, virtual_root, first, namespace, .none)).?;
+    defer remote.deinit();
+    const virtual_file = try std.fmt.allocPrint(scratch, "{s}/immutable.sst", .{virtual_root});
+    const remote_bytes = try remote.view.readFileRangeAlloc(a, virtual_file, 9, 9);
+    defer a.free(remote_bytes);
+    try std.testing.expectEqualStrings("immutable", remote_bytes);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, virtual_root, .{}));
+    try std.testing.expectError(error.ReadOnly, remote.view.writeFileAbsolute(virtual_file, "replacement"));
     var store = repository.store.artifactStore();
     const retained = @import("native_retained_cut.zig");
     const table = .{ .table_id = @as(u64, 7), .schema_json = "{}", .read_schema_json = "{}", .indexes_json = "{}" };
@@ -505,6 +540,11 @@ test "external lake native repository reuses immutable extents and collects expi
     const capability = try retained.save(a, &store, identity, io, table, cut.nowMs(), .none);
     defer a.free(capability);
     try store.delete(first_manifest.files[0].chunks[0].artifact_id);
+    // An uncached reader detects authoritative loss when it reads a page.
+    // Open itself only authenticates the manifest and chunk references.
+    var lost = (try repository.capability().openRead(io, virtual_root, second, namespace, .none)).?;
+    defer lost.deinit();
+    try std.testing.expectError(error.CatalogGenerationChanged, lost.view.readFileRangeAlloc(a, virtual_file, 0, 1));
     const missing = try std.fmt.allocPrint(scratch, "{s}/missing", .{directory.path()});
     try std.testing.expectError(error.CatalogGenerationChanged, repository.capability().recover(io, missing, second, namespace, .none));
     // A complete transfer remains scoped until both logical cuts and their
@@ -535,6 +575,7 @@ test "external lake native repository honors check-only cancellation tokens" {
     const token: Cancellation = .{ .ptr = &stopped, .check_fn = Stop.check };
     try std.testing.expectError(error.Canceled, repository.capability().publish(std.testing.io, directory.path(), request, .{ .table_id = 7, .shard_id = 1 }, token));
     try std.testing.expectError(error.Canceled, repository.capability().recover(std.testing.io, directory.path(), request, .{ .table_id = 7, .shard_id = 1 }, token));
+    try std.testing.expectError(error.Canceled, repository.capability().openRead(std.testing.io, directory.path(), request, .{ .table_id = 7, .shard_id = 1 }, token));
 }
 
 test "external lake native cut admission counts shared extents and rejects existing over-budget cuts" {

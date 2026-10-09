@@ -361,6 +361,9 @@ def test_mutable_native_cursor_survives_updates_deletes_and_restart(
             3,
             4,
         ]
+        # Replacement readers fetch authenticated pages from the manifest;
+        # resuming a cursor must not copy the complete generation back to disk.
+        assert not list((tmp_path / "data").rglob("query-cut.json"))
         # Losing both copies fails closed while the public capability remains.
         for manifest in (tmp_path / "data").rglob("query-cut.json"):
             shutil.rmtree(manifest.parent)

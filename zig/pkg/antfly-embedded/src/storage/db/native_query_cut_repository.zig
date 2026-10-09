@@ -6,9 +6,12 @@ const std = @import("std");
 const Request = @import("native_query_cut_contract.zig").Request;
 const Namespace = @import("doc_identity_namespace.zig").Namespace;
 const Cancellation = @import("antfly_cancellation").CancellationToken;
+pub const remote_storage = @import("native_query_remote_storage.zig");
+pub const StorageLease = @import("../lsm_backend/storage_io.zig").Storage.Lease;
 pub const VTable = struct {
     publish: *const fn (*anyopaque, std.Io, []const u8, Request, Namespace, Cancellation) anyerror!void,
     recover: *const fn (*anyopaque, std.Io, []const u8, Request, Namespace, Cancellation) anyerror!void,
+    open_read: ?*const fn (*anyopaque, std.Io, []const u8, Request, Namespace, Cancellation) anyerror!StorageLease = null,
 };
 const Boundary = @import("../../runtime_callback_abi.zig").Boundary(VTable);
 pub const Port = struct {
@@ -21,5 +24,9 @@ pub const Port = struct {
     }
     pub fn recover(self: Port, io: std.Io, root: []const u8, request: Request, namespace: Namespace, cancellation: Cancellation) !void {
         return Boundary.call("recover", self.dispatch, self.vtable.recover, .{ self.ptr, io, root, request, namespace, cancellation });
+    }
+    pub fn openRead(self: Port, io: std.Io, root: []const u8, request: Request, namespace: Namespace, cancellation: Cancellation) !?StorageLease {
+        const open = self.vtable.open_read orelse return null;
+        return try Boundary.call("open_read", self.dispatch, open, .{ self.ptr, io, root, request, namespace, cancellation });
     }
 };

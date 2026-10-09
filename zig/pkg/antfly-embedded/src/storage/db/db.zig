@@ -2957,6 +2957,7 @@ test "db optional row policy authority preserves scoped secret denial and outage
 
 pub const DB = struct {
     retained_query_lease: ?@import("native_query_cut.zig").Guard = null,
+    retained_remote_query_lease: ?@import("native_query_cut_repository.zig").StorageLease = null,
     /// Shared local mutation state outlives foreground and recovery execution.
     local_execution: *LocalExecutionState,
     /// Monolithic managed opens retain the process verifier until workers drain.
@@ -4808,19 +4809,33 @@ pub const DB = struct {
 
     fn openSourceVectors(self: *DB, create: bool) !void {
         if (self.local_execution.source_vectors.load(.acquire) != null) return;
-        if (self.primary_backend != .lsm or self.physical_root_mode != .filesystem_managed or
+        const external_read = self.open_mode == .query_readonly and
+            self.physical_root_mode == .external_backend and !create;
+        if (self.primary_backend != .lsm or (!external_read and self.physical_root_mode != .filesystem_managed) or
             self.local_execution.replication_write_gate != null or self.local_execution.replication_async_batch_mirror != null or self.local_execution.replication_async_effect_mirror != null)
             return error.VectorStoreRequiresLocalSingleShardTable;
-        const storage = try self.alloc.create(lsm_backend_mod.NativeStorage);
-        errdefer self.alloc.destroy(storage);
-        storage.* = try lsm_backend_mod.NativeStorage.init(self.alloc, .threaded);
-        errdefer storage.deinit();
+        var native: ?*lsm_backend_mod.NativeStorage = null;
+        errdefer if (native) |owned| {
+            owned.deinit();
+            self.alloc.destroy(owned);
+        };
+        const storage = if (external_read)
+            self.primary_lsm_storage orelse return error.VectorStoreRequiresLocalSingleShardTable
+        else owned: {
+            const value = try self.alloc.create(lsm_backend_mod.NativeStorage);
+            value.* = lsm_backend_mod.NativeStorage.init(self.alloc, .threaded) catch |err| {
+                self.alloc.destroy(value);
+                return err;
+            };
+            native = value;
+            break :owned value.storage();
+        };
         const root = try std.fs.path.join(self.alloc, &.{ self.core.path, "source-vectors" });
         defer self.alloc.free(root);
         if (!create) {
             const current = try std.fs.path.join(self.alloc, &.{ root, "CURRENT" });
             defer self.alloc.free(current);
-            _ = storage.storage().fileSize(current) catch |err| switch (err) {
+            _ = storage.fileSize(current) catch |err| switch (err) {
                 error.FileNotFound => return error.MissingVectorPayloadStore,
                 else => return err,
             };
@@ -4829,11 +4844,11 @@ pub const DB = struct {
         errdefer self.alloc.destroy(source);
         var source_policy = vector_payload_store_mod.Store.OpenPolicy.fromEnvironment();
         source_policy.inventory_read_only = self.open_mode != .query_readonly;
-        source.* = try vector_payload_store_mod.Store.openManagedWithPolicy(self.alloc, self.core.index_manager.resource_manager, storage.storage(), root, openModeRequiresReadOnlyBackends(self.open_mode), source_policy);
+        source.* = try vector_payload_store_mod.Store.openManagedWithPolicy(self.alloc, self.core.index_manager.resource_manager, storage, root, openModeRequiresReadOnlyBackends(self.open_mode), source_policy);
         errdefer source.deinit();
-        source.enableBackgroundCollection();
+        if (!external_read) source.enableBackgroundCollection();
         source.ann_reference_root = try std.fs.path.join(source.alloc, &.{ self.core.index_manager.base_path, "vector-blocks" });
-        self.source_vector_storage = storage;
+        self.source_vector_storage = native;
         self.local_execution.source_vectors.store(source, .release);
         if (self.local_execution.table_storage.dense_embeddings == .vector_store) {
             self.core.store.configurePayloadPolicy(source.interface(), false, null);
@@ -5900,6 +5915,8 @@ pub const DB = struct {
         self.generation_read_lease = null;
         if (self.retained_query_lease) |*lease| lease.deinit();
         self.retained_query_lease = null;
+        if (self.retained_remote_query_lease) |*lease| lease.deinit();
+        self.retained_remote_query_lease = null;
         if (self.owned_backend_runtime) |*runtime| runtime.deinit();
         if (self.owned_resource_manager) |manager| {
             manager.deinit(self.alloc);
@@ -19359,6 +19376,26 @@ pub const DB = struct {
         var guarded = true;
         defer if (guarded) guard.deinit();
         if (!try snapshotPathExists(io, path)) if (self.backend_runtime.query_cut_repository) |repository| {
+            if (try repository.openRead(io, path, request, self.core.identity_namespace, cancellation)) |opened| {
+                var lease = opened;
+                errdefer lease.deinit();
+                // The remote manifest is immutable. No local capture or
+                // collection can change it, so opening pages must not hold
+                // the filesystem publication guard across provider I/O.
+                guard.deinit();
+                guarded = false;
+                var readonly = try DB.open(self.alloc, path, .{
+                    .open_mode = .query_readonly,
+                    .physical_root_mode = .external_backend,
+                    .storage = lease.view,
+                    .backend_runtime = self.backend_runtime,
+                    .identity_namespace = self.core.identity_namespace,
+                });
+                errdefer readonly.close();
+                try control.token().check();
+                readonly.retained_remote_query_lease = lease;
+                return readonly;
+            }
             try cut.admit(self.alloc, io, self.core.path, request.id, repository.limits, control.token());
             try repository.recover(io, path, request, self.core.identity_namespace, control.token());
             errdefer std.Io.Dir.cwd().deleteTree(io, path) catch {};
