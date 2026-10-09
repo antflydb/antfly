@@ -1650,6 +1650,7 @@ pub const ManagedEmbedder = struct {
             const end = try densePartBatchEnd(alloc, capabilities, attachment_transport, items, offset, .{
                 .model = entry.model,
                 .model_identity = if (entry.model_identity.len > 0) entry.model_identity else null,
+                .dimensions = if (dims > 0) dims else null,
                 .task_type = if (entry.antfly_provider) |local|
                     if (local.embed_dense_parts_with_context != null) EmbeddingTaskType.retrieval_document.canonical() else null
                 else
@@ -2135,6 +2136,7 @@ fn embeddingRequestContext(entry: *const ManagedEmbeddingEntry, task_type: Embed
         },
         .task_type = task_type,
         .model_identity = if (entry.model_identity.len > 0) entry.model_identity else null,
+        .dimensions = if (entry.dimensions > 0) entry.dimensions else null,
         .instruction = if (task_type == .retrieval_query and entry.query_instruction.len > 0) entry.query_instruction else null,
     };
 }
@@ -2260,6 +2262,7 @@ fn applyAntflyEmbeddingRequestControls(
         @max(@as(u64, 1), (remaining_ns +| std.time.ns_per_ms - 1) / std.time.ns_per_ms),
     );
     provider.model_identity = if (entry.model_identity.len > 0) entry.model_identity else null;
+    provider.requested_dense_dimensions = if (entry.dimensions > 0) entry.dimensions else null;
     if (provider.model_identity != null) provider.numeric_dense_dimensions = null;
     provider.setRequestCancellation(entry.cancellation);
     provider.setRequestTimeoutMs(timeout_ms);
@@ -2467,6 +2470,7 @@ pub fn testEmbeddingProviderDeadlines() !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try context.check();
             try std.testing.expect(context.request.deadline_ns != null);
+            try std.testing.expectEqual(@as(?u32, 3), context.dimensions);
             self.context_calls += 1;
             const vectors = try alloc.alloc([]f32, texts.len);
             errdefer alloc.free(vectors);
@@ -5826,7 +5830,7 @@ fn densePartBatchEnd(
 
 test "managed embedder metadata sizing matches wire JSON at every prefix" {
     const alloc = std.testing.allocator;
-    const options = embedding_wire.Options{ .model = "model\"\\\nλ", .task_type = "RETRIEVAL_DOCUMENT", .instruction = "\x00instruction" };
+    const options = embedding_wire.Options{ .dimensions = 128, .model = "model\"\\\nλ", .task_type = "RETRIEVAL_DOCUMENT", .instruction = "\x00instruction" };
     var parts: [105]template_mod.ContentPart = undefined;
     var wire_parts: [105]template_mod.ContentPart = undefined;
     var payloads: [105]httpx.attachment_envelope.Attachment = undefined;
@@ -5845,6 +5849,7 @@ test "managed embedder metadata sizing matches wire JSON at every prefix" {
         const json = try std.json.Stringify.valueAlloc(alloc, .{
             .model = options.model,
             .model_identity = options.model_identity,
+            .dimensions = options.dimensions,
             .parts = wire_parts[0 .. i + 1],
             .attachment_count = attachments,
             .task_type = options.task_type,
@@ -10147,4 +10152,63 @@ test "managed embedder declared dimensions skip temporary Bedrock cache construc
     try std.testing.expectEqual(@as(u32, 2), dimensions);
     try std.testing.expectEqual(@as(usize, 0), runtime.bedrock_credentials.by_region.count());
     try std.testing.expect(runtime.http_client.load(.acquire) == null);
+}
+
+test "managed embedder propagates requested dimensions and pins across HTTP text and media transports" {
+    const a = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const Probe = struct {
+        const identity = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        fn request(req: httpx.testing_mod.RequestInfo) !void {
+            var envelope: ?httpx.attachment_envelope.Envelope = null;
+            defer if (envelope) |*owned| owned.deinit();
+            const bytes = if (std.mem.eql(u8, req.header("Content-Type") orelse "", httpx.attachment_envelope.content_type)) blk: {
+                envelope = try httpx.attachment_envelope.parseAlloc(std.testing.allocator, req.body, .{});
+                break :blk envelope.?.metadata;
+            } else req.body;
+            const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, bytes, .{});
+            defer parsed.deinit();
+            try std.testing.expectEqual(@as(i64, 128), parsed.value.object.get("dimensions").?.integer);
+            try std.testing.expectEqualStrings(identity, parsed.value.object.get("model_identity").?.string);
+        }
+        fn run(alloc: std.mem.Allocator, test_io: std.Io, base: []const u8, failure: *?anyerror) std.Io.Cancelable!void {
+            var client = httpx.Client.initWithConfig(alloc, test_io, .{ .keep_alive = false });
+            defer client.deinit();
+            var provider = antfly_provider_mod.Provider.init(alloc, &client, base);
+            defer provider.deinit();
+            provider.model_identity = identity;
+            provider.requested_dense_dimensions = 128;
+            provider.numeric_dense_dimensions = 128;
+            for (0..3) |kind| {
+                provider.setFramedAttachments(kind == 2);
+                var result = (if (kind == 0)
+                    provider.embedWithTask(alloc, "embeddinggemma2", &.{"test"}, "RETRIEVAL_DOCUMENT", null)
+                else
+                    provider.embedParts(alloc, "embeddinggemma2", &.{.{ .binary = .{ .mime_type = "image/png", .data = "test" } }})) catch |err| {
+                    failure.* = err;
+                    return;
+                };
+                defer result.deinit();
+                std.testing.expectEqual(@as(usize, 128), result.dimension) catch |err| {
+                    failure.* = err;
+                    return;
+                };
+            }
+        }
+    };
+    var vector: [128]f32 = @splat(0);
+    vector[0] = 1;
+    const body = try std.json.Stringify.valueAlloc(a, .{ .model_identity = Probe.identity, .data = [_]struct { embedding: []const f32 }{.{ .embedding = &vector }} }, .{});
+    defer a.free(body);
+    var server = try httpx.TestServer.start(a, io, &.{.{ .method = .POST, .path = "/embed", .max_uses = 3, .assert_request = Probe.request, .respond = .{ .body = body } }});
+    defer server.deinit();
+    var failure: ?anyerror = null;
+    var group = std.Io.Group.init;
+    defer group.cancel(io);
+    try group.concurrent(io, Probe.run, .{ a, io, server.baseUrl(), &failure });
+    for (0..3) |_| try server.handleOne();
+    try group.await(io);
+    if (failure) |err| return err;
 }

@@ -4355,6 +4355,21 @@ pub const Node = struct {
         self.model_manager.detachPromptCacheResourceUsageObserver();
     }
 
+    /// Resize linked results with the HTTP recipe; leave ownership unchanged on failure.
+    pub fn applyDenseEmbeddingDimensions(self: *Node, allocator: std.mem.Allocator, io: std.Io, model_name: []const u8, vectors: [][]f32, requested: ?u32) !void {
+        const dimensions = requested orelse return;
+        if (dimensions == 0) return error.InvalidEmbeddingDimensions;
+        for (vectors) |vector| {
+            if (vector.len != dimensions) break;
+        } else return;
+        const path = try self.resolveModelPath(io, model_name, "embedders");
+        defer self.allocator.free(path);
+        var manifest = try manifest_mod.loadFromDir(allocator, path);
+        defer manifest.deinit();
+        if (manifest.embedding_style == .embedding_gemma2 and !@import("../architectures/embedding_gemma2.zig").validDimension(dimensions)) return error.InvalidEmbeddingDimensions;
+        try resizeDenseEmbeddingBatch(allocator, vectors, dimensions, manifest.normalize);
+    }
+
     pub fn embedDenseTextsDirect(
         self: *Node,
         allocator: std.mem.Allocator,
@@ -32478,6 +32493,26 @@ fn publishNumericFrame(ctx: *httpx.Context, frame: []u8) !httpx.Response {
     return response;
 }
 
+fn resizeDenseEmbeddingBatch(allocator: std.mem.Allocator, vectors: [][]f32, dimensions: usize, renormalize: bool) !void {
+    if (dimensions == 0) return error.InvalidEmbeddingDimensions;
+    for (vectors) |vector| if (dimensions > vector.len) return error.InvalidEmbeddingDimensions;
+    const replacements = try allocator.alloc(?[]f32, vectors.len);
+    defer allocator.free(replacements);
+    @memset(replacements, null);
+    errdefer for (replacements) |replacement| if (replacement) |vector| allocator.free(vector);
+    for (vectors, replacements) |source, *replacement| {
+        if (source.len == dimensions) continue;
+        const vector = try allocator.alloc(f32, dimensions);
+        replacement.* = vector;
+        const scale = truncatedEmbeddingScale(source, dimensions, renormalize);
+        for (vector, source[0..dimensions]) |*dest, value| dest.* = @floatCast(@as(f64, value) * scale);
+    }
+    for (vectors, replacements) |*vector, replacement| if (replacement) |new_vector| {
+        allocator.free(vector.*);
+        vector.* = new_vector;
+    };
+}
+
 fn buildDenseNumericFrame(alloc: std.mem.Allocator, embeddings: []const []const f32, requested_dimensions: ?usize, renormalize: bool) ![]u8 {
     if (embeddings.len == 0) return error.InvalidEmbeddingResponse;
     const dimensions = requested_dimensions orelse embeddings[0].len;
@@ -35875,4 +35910,38 @@ test "embeddinggemma2 ordered media matches official F32 oracle" {
         try std.testing.expect(max_abs <= @as(f64, if (metal) 1e-3 else 1e-4));
     }
     try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
+}
+
+test "embeddinggemma2 linked reduced dimensions match HTTP and preserve ownership on allocation failure" {
+    const Runner = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var vectors: [2][]f32 = undefined;
+            vectors[0] = try a.alloc(f32, 768);
+            defer a.free(vectors[0]);
+            vectors[1] = try a.alloc(f32, 768);
+            defer a.free(vectors[1]);
+            for (&vectors) |vector| {
+                @memset(vector, 0);
+                vector[0] = 0.3;
+                vector[1] = 0.4;
+                vector[767] = 0.5;
+            }
+            const before = vectors;
+            resizeDenseEmbeddingBatch(a, &vectors, 128, true) catch |err| {
+                try std.testing.expectEqual(before[0].ptr, vectors[0].ptr);
+                try std.testing.expectEqual(before[1].ptr, vectors[1].ptr);
+                return err;
+            };
+            for (vectors) |vector| {
+                try std.testing.expectEqual(@as(usize, 128), vector.len);
+                try std.testing.expectApproxEqAbs(@as(f32, 0.6), vector[0], 1e-6);
+                try std.testing.expectApproxEqAbs(@as(f32, 0.8), vector[1], 1e-6);
+            }
+            // Already-sized results need no model lookup or new allocation.
+            var node: Node = undefined;
+            try node.applyDenseEmbeddingDimensions(a, std.testing.io, "unused", &vectors, 128);
+            try std.testing.expectError(error.InvalidEmbeddingDimensions, resizeDenseEmbeddingBatch(a, &vectors, 256, true));
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }

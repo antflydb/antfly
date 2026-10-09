@@ -968,6 +968,7 @@ pub fn inferenceProviderEmbedDenseTextsWithContext(
         .texts = texts,
         .task_type = context.task_type.canonical(),
         .model_identity = context.model_identity,
+        .dimensions = context.dimensions,
         .instruction = context.instruction,
     }, context.request.deadline_ns, context.request.cancellation orelse .none);
 }
@@ -1014,6 +1015,7 @@ pub fn inferenceProviderEmbedDenseParts(
         null,
         null,
         null,
+        null,
         .none,
     );
 }
@@ -1035,6 +1037,7 @@ pub fn inferenceProviderEmbedDensePartsWithContext(
         context.task_type.canonical(),
         context.instruction,
         context.model_identity,
+        context.dimensions,
         context.request.deadline_ns,
         context.request.cancellation orelse .none,
     );
@@ -1049,6 +1052,7 @@ pub fn inferenceProviderEmbedDensePartsBorrowed(
     task_type: ?[]const u8,
     instruction: ?[]const u8,
     model_identity: ?[]const u8,
+    dimensions: ?u32,
     deadline_ns: ?u64,
     cancellation: CancellationToken,
 ) ![][]f32 {
@@ -1084,6 +1088,7 @@ pub fn inferenceProviderEmbedDensePartsBorrowed(
             .task_type = task_type,
             .instruction = instruction,
             .model_identity = model_identity,
+            .dimensions = dimensions,
         },
         deadline_ns,
         payload_storage[0..payload_count],

@@ -240,7 +240,7 @@ pub const Runtime = struct {
                     const actual = root.get("model_identity") orelse return error.InvalidDecisionOutput;
                     if (actual != .string or !std.mem.eql(u8, actual.string, expected)) return error.InvalidDecisionOutput;
                 }
-                const normalized = try decisions.normalizeResponseWithCapabilities(a, job.request.questions, job.response.?, job.cfg.resolvedCapabilities());
+                const normalized = try decisions.normalizeResponseWithConfig(a, job.request.questions, job.response.?, job.cfg);
                 const usage = normalized.object.get("usage").?.object;
                 if (self.profile_allocator) |stats_a| {
                     const model = normalized.object.get("model").?.string;
@@ -414,7 +414,7 @@ test "decision functions EmbeddingGemma 2 HTTP preserves identity calibration an
             try std.testing.expectEqualStrings("choice", root.get("questions").?.array.items[0].object.get("type").?.string);
         }
     };
-    const response = "{\"model\":\"embeddinggemma2\",\"model_identity\":\"" ++ Check.identity ++ "\",\"answers\":[{\"name\":\"answer\",\"type\":\"choice\",\"choice\":\"account\",\"decision_method\":\"embedding_similarity\",\"similarity_metric\":\"cosine\",\"prototype_set_hash\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"similarities\":[{\"value\":\"account\",\"similarity\":0.8},{\"value\":\"billing\",\"similarity\":0.1}],\"margin\":0.7,\"status\":\"selected\"}],\"usage\":{\"input_tokens\":2,\"output_tokens\":0}}";
+    const response = "{\"model\":\"embeddinggemma2\",\"model_identity\":\"" ++ Check.identity ++ "\",\"answers\":[{\"name\":\"answer\",\"type\":\"choice\",\"choice\":\"account\",\"decision_method\":\"embedding_similarity\",\"similarity_metric\":\"cosine\",\"prototype_set_hash\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"similarities\":[{\"value\":\"account\",\"similarity\":0.8},{\"value\":\"billing\",\"similarity\":0.1}],\"margin\":0.7,\"calibration_id\":\"routing_v1\",\"status\":\"selected\"}],\"usage\":{\"input_tokens\":2,\"output_tokens\":0}}";
     var server = try httpx.TestServer.start(a, io, &.{
         .{ .method = .POST, .path = "/decisions", .max_uses = 1, .assert_request = Check.request, .respond = .{ .body = response } },
     });

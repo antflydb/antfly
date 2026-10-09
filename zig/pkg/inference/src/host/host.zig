@@ -229,6 +229,7 @@ test "standalone provider ABI rejects cancellation before dispatch" {
 
 const ModelTextsRequest = struct {
     model_identity: ?[]const u8 = null,
+    dimensions: ?u32 = null,
     model: []const u8,
     texts: []const []const u8,
     task_type: ?[]const u8 = null,
@@ -237,6 +238,7 @@ const ModelTextsRequest = struct {
 
 const ModelPartsRequest = struct {
     model_identity: ?[]const u8 = null,
+    dimensions: ?u32 = null,
     model: []const u8,
     parts: []const template_content.ContentPart,
     attachment_count: usize = 0,
@@ -1054,6 +1056,11 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
                     parsed.value.model,
                     parsed.value.texts,
                 );
+            state.node.applyDenseEmbeddingDimensions(alloc, state.io, parsed.value.model, result, parsed.value.dimensions) catch |err| {
+                for (result) |values| alloc.free(values);
+                alloc.free(result);
+                return err;
+            };
             if (context.out_numeric_result != null) {
                 errdefer {
                     for (result) |values| alloc.free(values);
@@ -1103,6 +1110,11 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
                 if (operation == .embed_dense_parts_with_context) parsed.value.task_type else null,
                 if (operation == .embed_dense_parts_with_context) parsed.value.instruction else null,
             );
+            state.node.applyDenseEmbeddingDimensions(alloc, state.io, parsed.value.model, result, parsed.value.dimensions) catch |err| {
+                for (result) |values| alloc.free(values);
+                alloc.free(result);
+                return err;
+            };
             if (context.out_numeric_result != null) {
                 errdefer {
                     for (result) |values| alloc.free(values);
@@ -2385,7 +2397,7 @@ fn localAntflyEmbedDenseTextsWithContext(
 ) anyerror![][]f32 {
     const node: *inference.server.Node = @ptrCast(@alignCast(ptr));
     var adapter = LocalInferenceControlAdapter{ .context = context };
-    return try node.embedDenseTextsDirectWithExecutionControlAndTask(
+    const result = try node.embedDenseTextsDirectWithExecutionControlAndTask(
         alloc,
         context.request.io,
         adapter.control(),
@@ -2394,6 +2406,12 @@ fn localAntflyEmbedDenseTextsWithContext(
         context.task_type.canonical(),
         context.instruction,
     );
+    errdefer {
+        for (result) |vector| alloc.free(vector);
+        alloc.free(result);
+    }
+    try node.applyDenseEmbeddingDimensions(alloc, context.request.io, model, result, context.dimensions);
+    return result;
 }
 
 fn localAntflyEmbedDensePartsWithExecutionContext(
@@ -2495,7 +2513,7 @@ fn localAntflyEmbedDensePartsWithContext(
     context: request_types.EmbeddingRequestContext,
 ) anyerror![][]f32 {
     var adapter = LocalInferenceControlAdapter{ .context = context };
-    return try localAntflyEmbedDensePartsWithExecutionContext(
+    const result = try localAntflyEmbedDensePartsWithExecutionContext(
         ptr,
         alloc,
         model,
@@ -2505,6 +2523,13 @@ fn localAntflyEmbedDensePartsWithContext(
         context.task_type.canonical(),
         context.instruction,
     );
+    errdefer {
+        for (result) |vector| alloc.free(vector);
+        alloc.free(result);
+    }
+    const node: *inference.server.Node = @ptrCast(@alignCast(ptr));
+    try node.applyDenseEmbeddingDimensions(alloc, context.request.io, model, result, context.dimensions);
+    return result;
 }
 
 fn localAntflyEmbedSparseTexts(

@@ -296,6 +296,21 @@ pub fn normalizeResponse(a: std.mem.Allocator, questions: Json, source: Json) !J
 
 // The allowed result contract is supplied by trusted decider configuration;
 // a provider's response cannot opt itself into accepting uncalibrated scores.
+/// Resolve defaults through the provider serializer so response validation and
+/// upstream execution use exactly the same per-question acceptance policy.
+pub fn normalizeResponseWithConfig(a: std.mem.Allocator, questions: Json, source: Json, cfg: DeciderConfig) !Json {
+    if (cfg.decision_method != .embedding_similarity) return normalizeResponseWithCapabilities(a, questions, source, cfg.resolvedCapabilities());
+    const bytes = try wireRequest(a, cfg, "validation", questions);
+    defer a.free(bytes);
+    const wire = try std.json.parseFromSlice(Json, a, bytes, .{});
+    defer wire.deinit();
+    var effective = try publicQuestions(a, wire.value.object.get("questions").?);
+    for (effective.object.values()) |*question| {
+        if (!question.object.contains("embedding_options")) try put(a, question, "embedding_options", jsonObject());
+    }
+    return normalizeResponseWithCapabilities(a, effective, source, cfg.resolvedCapabilities());
+}
+
 pub fn normalizeResponseWithCapabilities(a: std.mem.Allocator, questions: Json, source: Json, caps: Capabilities) !Json {
     const private = try contract.internalResponse(a, source);
     return contract.publicResponse(a, try normalizeLegacy(a, questions, private, caps));
@@ -326,6 +341,13 @@ fn normalizeLegacy(a: std.mem.Allocator, questions: Json, source: Json, caps: Ca
             if (method != .string or !std.mem.eql(u8, method.string, "embedding_similarity") or !caps.embedding_similarity or (kind != .choice and kind != .multi_choice)) return error.InvalidDecisionOutput;
             inline for (.{ "confidence", "confidence_method", "act_probability", "probabilities", "noul", "probability" }) |field|
                 if (answer.object.contains(field)) return error.InvalidDecisionOutput;
+            const configured = spec.get("embedding_options");
+            const acceptance = if (configured) |options| contract.scoring.Options.parse(options) catch return error.InvalidDecisionOutput else contract.scoring.Options{};
+            if (acceptance.calibration_id) |expected| {
+                const actual = text(answer.object.get("calibration_id") orelse return error.InvalidDecisionOutput) catch return error.InvalidDecisionOutput;
+                if (!std.mem.eql(u8, actual, expected)) return error.InvalidDecisionOutput;
+            }
+            const manual_policy = configured != null and acceptance.calibration_id == null;
             const prototype_hash = text(answer.object.get("prototype_set_hash") orelse return error.InvalidDecisionOutput) catch return error.InvalidDecisionOutput;
             if (prototype_hash.len != 64) return error.InvalidDecisionOutput;
             for (prototype_hash) |c| if (!std.ascii.isDigit(c) and (c < 'a' or c > 'f')) return error.InvalidDecisionOutput;
@@ -373,6 +395,11 @@ fn normalizeLegacy(a: std.mem.Allocator, questions: Json, source: Json, caps: Ca
                 const margin = try number(answer.object.get("margin") orelse return error.InvalidDecisionOutput);
                 if (@abs(margin - expected_margin) > 1e-6) return error.InvalidDecisionOutput;
                 const status = try text(answer.object.get("status") orelse return error.InvalidDecisionOutput);
+                if (manual_policy) {
+                    const ambiguous = acceptance.min_margin != null and expected_margin < acceptance.min_margin.?;
+                    const expected_status = if (ambiguous) "abstained" else if (expected_count == 0) "empty" else "selected";
+                    if (!std.mem.eql(u8, status, expected_status)) return error.InvalidDecisionOutput;
+                }
                 if (std.mem.eql(u8, status, "abstained")) {
                     if (selected.array.items.len != 0 or !std.mem.eql(u8, try text(answer.object.get("abstention_reason") orelse return error.InvalidDecisionOutput), "min_margin")) return error.InvalidDecisionOutput;
                 } else if (!std.mem.eql(u8, status, if (expected_count == 0) "empty" else "selected") or selected.array.items.len != expected_count) return error.InvalidDecisionOutput;
@@ -383,6 +410,14 @@ fn normalizeLegacy(a: std.mem.Allocator, questions: Json, source: Json, caps: Ca
             if (@abs(margin - (best - second)) > 1e-6) return error.InvalidDecisionOutput;
             const status = try text(answer.object.get("status") orelse return error.InvalidDecisionOutput);
             const choice = answer.object.get("choice") orelse return error.InvalidDecisionOutput;
+            if (manual_policy) {
+                const reason: ?[]const u8 = if (best - second <= 1e-6) "tie" else if (acceptance.min_similarity != null and best < acceptance.min_similarity.?) "min_similarity" else if (acceptance.min_margin != null and best - second < acceptance.min_margin.?) "min_margin" else null;
+                if (reason) |expected| {
+                    if (!std.mem.eql(u8, status, "abstained")) return error.InvalidDecisionOutput;
+                    const actual = text(answer.object.get("abstention_reason") orelse return error.InvalidDecisionOutput) catch return error.InvalidDecisionOutput;
+                    if (!std.mem.eql(u8, actual, expected)) return error.InvalidDecisionOutput;
+                } else if (!std.mem.eql(u8, status, "selected")) return error.InvalidDecisionOutput;
+            }
             if (std.mem.eql(u8, status, "selected")) {
                 if (best - second <= 1e-6 or choice != .string or !std.mem.eql(u8, choice.string, best_label)) return error.InvalidDecisionOutput;
             } else if (std.mem.eql(u8, status, "abstained")) {
@@ -642,4 +677,66 @@ test "decision provider named arrays isolate calibration and validate empty mult
     const answer = &changed.object.getPtr("answers").?.array.items[0];
     try put(a, answer, "choices", try std.json.parseFromSliceLeaky(Json, a, "[\"a\"]", .{}));
     try std.testing.expectError(error.InvalidDecisionOutput, normalizeResponseWithCapabilities(a, multi, changed, cfg.resolvedCapabilities()));
+}
+
+test "decision provider embeddinggemma2 validates effective manual acceptance and calibration identity" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var questions = try std.json.parseFromSliceLeaky(Json, a,
+        \\{"answer":{"type":"choice","instructions":"Route","criteria":{"a":"Account","b":"Billing"}}}
+    , .{});
+    var response = try std.json.parseFromSliceLeaky(Json, a,
+        \\{"model":"embeddinggemma2","answers":[{"name":"answer","type":"choice","choice":"a","decision_method":"embedding_similarity","similarity_metric":"cosine","prototype_set_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","similarities":[{"value":"a","similarity":0.51},{"value":"b","similarity":0.5}],"margin":0.01,"status":"selected"}],"usage":{"input_tokens":2,"output_tokens":0}}
+    , .{});
+    var cfg = DeciderConfig{ .provider = .antfly, .model = "embeddinggemma2", .decision_method = .embedding_similarity, .embedding_options = .{ .min_similarity = 0.8, .min_margin = 0.2 } };
+    try std.testing.expectError(error.InvalidDecisionOutput, normalizeResponseWithConfig(a, questions, response, cfg));
+    const spec = questions.object.getPtr("answer").?;
+    try put(a, spec, "embedding_options", try std.json.parseFromSliceLeaky(Json, a, "{\"min_similarity\":0.4,\"min_margin\":0.001}", .{}));
+    _ = try normalizeResponseWithConfig(a, questions, response, cfg);
+    const answer = &response.object.getPtr("answers").?.array.items[0];
+    try put(a, answer, "choice", .null);
+    try put(a, answer, "status", .{ .string = "abstained" });
+    try put(a, answer, "abstention_reason", .{ .string = "min_margin" });
+    try std.testing.expectError(error.InvalidDecisionOutput, normalizeResponseWithConfig(a, questions, response, cfg));
+    try put(a, spec, "embedding_options", try std.json.parseFromSliceLeaky(Json, a, "{\"min_similarity\":0.8,\"min_margin\":0.2}", .{}));
+    try std.testing.expectError(error.InvalidDecisionOutput, normalizeResponseWithConfig(a, questions, response, cfg));
+    try put(a, answer, "abstention_reason", .{ .string = "min_similarity" });
+    _ = try normalizeResponseWithConfig(a, questions, response, cfg);
+    try put(a, spec, "embedding_options", try std.json.parseFromSliceLeaky(Json, a, "{\"min_margin\":0.2}", .{}));
+    try put(a, answer, "abstention_reason", .{ .string = "min_margin" });
+    _ = try normalizeResponseWithConfig(a, questions, response, cfg);
+    _ = spec.object.swapRemove("embedding_options");
+    cfg.embedding_options = .{ .calibration_id = "routing_v1" };
+    try std.testing.expectError(error.InvalidDecisionOutput, normalizeResponseWithConfig(a, questions, response, cfg));
+    try put(a, answer, "calibration_id", .{ .string = "wrong_policy" });
+    try std.testing.expectError(error.InvalidDecisionOutput, normalizeResponseWithConfig(a, questions, response, cfg));
+    try put(a, answer, "calibration_id", .{ .string = "routing_v1" });
+    _ = try normalizeResponseWithConfig(a, questions, response, cfg);
+}
+
+test "decision provider embeddinggemma2 validates multi choice configured margins and explicit overrides" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var questions = try std.json.parseFromSliceLeaky(Json, a,
+        \\{"tags":{"type":"multi_choice","instructions":"Tags","criteria":{"a":"Account","b":"Billing"},"similarity_thresholds":0.5}}
+    , .{});
+    var response = try std.json.parseFromSliceLeaky(Json, a,
+        \\{"model":"embeddinggemma2","answers":[{"name":"tags","type":"multi_choice","choices":["a"],"decision_method":"embedding_similarity","similarity_metric":"cosine","prototype_set_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","similarities":[{"value":"a","similarity":0.51},{"value":"b","similarity":0.2}],"similarity_thresholds":{"a":0.5,"b":0.5},"margin":0.01,"status":"selected"}],"usage":{"input_tokens":2,"output_tokens":0}}
+    , .{});
+    const cfg = DeciderConfig{ .provider = .antfly, .model = "embeddinggemma2", .decision_method = .embedding_similarity, .embedding_options = .{ .min_similarity = 0.4, .min_margin = 0.1 } };
+    try std.testing.expectError(error.InvalidDecisionOutput, normalizeResponseWithConfig(a, questions, response, cfg));
+    const answer = &response.object.getPtr("answers").?.array.items[0];
+    const selected = answer.object.get("choices").?;
+    try put(a, answer, "choices", .{ .array = .init(a) });
+    try put(a, answer, "status", .{ .string = "abstained" });
+    try put(a, answer, "abstention_reason", .{ .string = "min_margin" });
+    _ = try normalizeResponseWithConfig(a, questions, response, cfg);
+    try put(a, questions.object.getPtr("tags").?, "embedding_options", jsonObject());
+    try std.testing.expectError(error.InvalidDecisionOutput, normalizeResponseWithConfig(a, questions, response, cfg));
+    try put(a, answer, "choices", selected);
+    try put(a, answer, "status", .{ .string = "selected" });
+    _ = answer.object.swapRemove("abstention_reason");
+    _ = try normalizeResponseWithConfig(a, questions, response, cfg);
 }
