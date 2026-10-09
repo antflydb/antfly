@@ -22,6 +22,8 @@ const names = @import("relation_names.zig");
 const A = std.mem.Allocator;
 const job_prefix = "\x00\x00__metadata__:sql_relation_reconciliation:v1:";
 const candidate_prefix = "\x00\x00__metadata_derived__:sql_relation_candidate:v1:";
+const retirement_prefix = "\x00\x00__metadata__:sql_relation_retirement:v1:";
+const root_prefix = "\x00\x00__metadata__:sql_relation_root:v1:";
 pub const max_cursor_bytes = 512;
 pub const max_tables_per_page = 64;
 pub const max_page_bytes = 4 * 1024 * 1024;
@@ -34,6 +36,82 @@ pub const Epoch = struct {
     }
 };
 pub const Phase = enum(u8) { building = 1, verifying_source = 2, verifying_candidate = 3, ready = 4 };
+/// Generation IDs are big-endian monotonic counters, allocated by CAS from
+/// the retained current job. They are never recycled, including after GC.
+pub const Generation = struct {
+    group_id: u64,
+    job_id: [16]u8,
+    const magic = "AFRG01";
+    pub const encoded_len = magic.len + 8 + 16;
+    pub fn of(state: *const State) Generation {
+        return .{ .group_id = state.group_id, .job_id = state.job_id };
+    }
+    pub fn eql(self: Generation, other: Generation) bool {
+        return self.group_id == other.group_id and std.mem.eql(u8, &self.job_id, &other.job_id);
+    }
+    fn validate(self: Generation) !void {
+        if (self.group_id == 0 or std.mem.allEqual(u8, &self.job_id, 0)) return error.InvalidCatalogRecord;
+    }
+    pub fn encode(self: Generation) ![encoded_len]u8 {
+        try self.validate();
+        var bytes: [encoded_len]u8 = undefined;
+        @memcpy(bytes[0..magic.len], magic);
+        std.mem.writeInt(u64, bytes[magic.len..][0..8], self.group_id, .big);
+        @memcpy(bytes[magic.len + 8 ..], &self.job_id);
+        return bytes;
+    }
+    pub fn decode(bytes: []const u8) !Generation {
+        if (bytes.len != encoded_len or !std.mem.eql(u8, bytes[0..magic.len], magic)) return error.InvalidCatalogRecord;
+        const result: Generation = .{ .group_id = std.mem.readInt(u64, bytes[magic.len..][0..8], .big), .job_id = bytes[magic.len + 8 ..][0..16].* };
+        try result.validate();
+        return result;
+    }
+};
+pub fn nextJobId(prior: ?*const State) ![16]u8 {
+    const last: u128 = if (prior) |state| blk: {
+        try state.validate();
+        break :blk std.mem.readInt(u128, &state.job_id, .big);
+    } else 0;
+    const next = std.math.add(u128, last, 1) catch return error.CatalogGenerationExhausted;
+    var bytes: [16]u8 = undefined;
+    std.mem.writeInt(u128, &bytes, next, .big);
+    return bytes;
+}
+pub const Retirement = struct {
+    generation: Generation,
+    cursor_len: u16 = 0,
+    cursor_bytes: [max_cursor_bytes]u8 = @splat(0),
+    const magic = "AFRT01";
+    pub const encoded_len = magic.len + 8 + 16 + 2 + max_cursor_bytes;
+    pub fn init(generation: Generation) Retirement {
+        return .{ .generation = generation };
+    }
+    pub fn cursor(self: *const Retirement) []const u8 {
+        return self.cursor_bytes[0..self.cursor_len];
+    }
+    pub fn encode(self: *const Retirement) ![encoded_len]u8 {
+        try self.generation.validate();
+        if (self.cursor_len > max_cursor_bytes or !std.mem.allEqual(u8, self.cursor_bytes[self.cursor_len..], 0)) return error.InvalidCatalogRecord;
+        if (self.cursor_len != 0) _ = try decodeCandidateGenerationKey(self.cursor(), self.generation);
+        var bytes: [encoded_len]u8 = undefined;
+        @memcpy(bytes[0..magic.len], magic);
+        std.mem.writeInt(u64, bytes[magic.len..][0..8], self.generation.group_id, .big);
+        @memcpy(bytes[magic.len + 8 ..][0..16], &self.generation.job_id);
+        std.mem.writeInt(u16, bytes[magic.len + 24 ..][0..2], self.cursor_len, .big);
+        @memcpy(bytes[magic.len + 26 ..], &self.cursor_bytes);
+        return bytes;
+    }
+    pub fn decode(bytes: []const u8) !Retirement {
+        if (bytes.len != encoded_len or !std.mem.eql(u8, bytes[0..magic.len], magic)) return error.InvalidCatalogRecord;
+        const result: Retirement = .{
+            .generation = .{ .group_id = std.mem.readInt(u64, bytes[magic.len..][0..8], .big), .job_id = bytes[magic.len + 8 ..][0..16].* },
+            .cursor_len = std.mem.readInt(u16, bytes[magic.len + 24 ..][0..2], .big),
+            .cursor_bytes = bytes[magic.len + 26 ..][0..max_cursor_bytes].*,
+        };
+        _ = try result.encode();
+        return result;
+    }
+};
 pub const Totals = struct {
     rows: u64 = 0,
     claims: u64 = 0,
@@ -128,10 +206,14 @@ pub fn jobKey(buf: []u8, group: u64) ![]const u8 {
 }
 pub fn candidatePrefix(buf: []u8, state: *const State) ![]const u8 {
     try state.validate();
+    return candidateGenerationPrefix(buf, Generation.of(state));
+}
+fn candidateGenerationPrefix(buf: []u8, generation: Generation) ![]const u8 {
+    try generation.validate();
     if (buf.len < candidate_prefix.len + 24) return error.NoSpaceLeft;
     @memcpy(buf[0..candidate_prefix.len], candidate_prefix);
-    std.mem.writeInt(u64, buf[candidate_prefix.len..][0..8], state.group_id, .big);
-    @memcpy(buf[candidate_prefix.len + 8 ..][0..16], &state.job_id);
+    std.mem.writeInt(u64, buf[candidate_prefix.len..][0..8], generation.group_id, .big);
+    @memcpy(buf[candidate_prefix.len + 8 ..][0..16], &generation.job_id);
     return buf[0 .. candidate_prefix.len + 24];
 }
 pub fn candidateKey(buf: []u8, state: *const State, key: names.Key) ![]const u8 {
@@ -145,8 +227,11 @@ pub fn candidateKey(buf: []u8, state: *const State, key: names.Key) ![]const u8 
     return buf[0..end];
 }
 fn decodeCandidateKey(bytes: []const u8, state: *const State) !names.Key {
+    return decodeCandidateGenerationKey(bytes, Generation.of(state));
+}
+fn decodeCandidateGenerationKey(bytes: []const u8, generation: Generation) !names.Key {
     var buf: [max_cursor_bytes]u8 = undefined;
-    const prefix = try candidatePrefix(&buf, state);
+    const prefix = try candidateGenerationPrefix(&buf, generation);
     if (!std.mem.startsWith(u8, bytes, prefix) or bytes.len < prefix.len + 10) return error.InvalidCatalogRecord;
     const tail = bytes[prefix.len..];
     if (tail.len != 10 + @as(usize, std.mem.readInt(u16, tail[8..10], .big))) return error.InvalidCatalogRecord;
@@ -155,9 +240,25 @@ fn decodeCandidateKey(bytes: []const u8, state: *const State) !names.Key {
     return key;
 }
 
-/// The caller must prove that the job ID is fresh (never reuse an abandoned
-/// candidate ID), and fence the authoritative source epoch in this transaction.
-/// A replacement job leaves its old candidate isolated for bounded GC.
+pub fn rootKey(buf: []u8, group: u64) ![]const u8 {
+    if (group == 0) return error.InvalidCatalogRecord;
+    if (buf.len < root_prefix.len + 8) return error.NoSpaceLeft;
+    @memcpy(buf[0..root_prefix.len], root_prefix);
+    std.mem.writeInt(u64, buf[root_prefix.len..][0..8], group, .big);
+    return buf[0 .. root_prefix.len + 8];
+}
+pub fn retirementKey(buf: []u8, generation: Generation) ![]const u8 {
+    try generation.validate();
+    if (buf.len < retirement_prefix.len + 24) return error.NoSpaceLeft;
+    @memcpy(buf[0..retirement_prefix.len], retirement_prefix);
+    std.mem.writeInt(u64, buf[retirement_prefix.len..][0..8], generation.group_id, .big);
+    @memcpy(buf[retirement_prefix.len + 8 ..][0..16], &generation.job_id);
+    return buf[0 .. retirement_prefix.len + 24];
+}
+
+/// Fence the authoritative source epoch in the caller's write transaction.
+/// The retained job is also a generation high-water mark: never delete it.
+/// Replacement atomically retires the old candidate; errors require abort.
 pub fn start(txn: anytype, state: *const State, current_epoch: Epoch, prior: ?[]const u8) !void {
     try checkEpoch(state, current_epoch);
     if (state.phase != .building or state.cursor_len != 0 or !totalsEqual(state.pass, .{})) return error.InvalidCatalogRecord;
@@ -167,20 +268,120 @@ pub fn start(txn: anytype, state: *const State, current_epoch: Epoch, prior: ?[]
         if (err == error.NotFound) break :blk null;
         return err;
     };
+    var retired: ?Generation = null;
     if (prior) |expected| {
         if (found == null or !std.mem.eql(u8, expected, found.?)) return error.CatalogGenerationChanged;
         const old = try State.decode(expected);
         if (old.group_id != state.group_id) return error.InvalidCatalogRecord;
-        if (std.mem.eql(u8, &old.job_id, &state.job_id)) return error.CatalogGenerationChanged;
+        if (std.mem.order(u8, &old.job_id, &state.job_id) != .lt) return error.CatalogGenerationChanged;
+        retired = Generation.of(&old);
     } else if (found != null) return error.CatalogGenerationChanged;
     var candidate_buf: [max_cursor_bytes]u8 = undefined;
     if (try txn.hasPrefix(try candidatePrefix(&candidate_buf, state))) return error.CatalogGenerationChanged;
+    if (retired) |generation| {
+        var retirement_buf: [128]u8 = undefined;
+        const retired_key = try retirementKey(&retirement_buf, generation);
+        const existing = txn.get(retired_key) catch |err| blk: {
+            if (err == error.NotFound) break :blk null;
+            return err;
+        };
+        if (existing != null) return error.InvalidCatalogRecord;
+        const retirement = Retirement.init(generation);
+        try txn.put(retired_key, &(try retirement.encode()));
+    }
     const bytes = try state.encode();
     try txn.put(key, &bytes);
 }
 
 pub const SourceRow = struct { key: []const u8, table_id: u64, claims: []const names.Claim };
 pub const CandidateRow = struct { key: []const u8, value: []const u8 };
+/// An exclusive lexical cursor is committed with every deletion page, so LSM
+/// tombstones preceding it are not repeatedly traversed after churn/restart.
+/// No O(catalog-size) key list or indefinitely retained per-generation tombstone
+/// is needed. The current job high-water mark prevents ABA after intent removal.
+pub const GarbagePage = struct {
+    arena: std.heap.ArenaAllocator,
+    before: Retirement,
+    rows: []const CandidateRow,
+    pub fn prepare(a: A, before: Retirement, source: anytype) !GarbagePage {
+        _ = try before.encode();
+        var arena = std.heap.ArenaAllocator.init(a);
+        errdefer arena.deinit();
+        const owned = arena.allocator();
+        var rows: std.ArrayList(CandidateRow) = .empty;
+        var after: []const u8 = before.cursor();
+        while (rows.items.len < max_tables_per_page) {
+            const row: CandidateRow = (try source.nextAfter(after)) orelse break;
+            if (row.key.len > max_cursor_bytes or std.mem.order(u8, after, row.key) != .lt) return error.InvalidCatalogRecord;
+            _ = try decodeCandidateGenerationKey(row.key, before.generation);
+            _ = try names.Owner.decode(row.value);
+            const key = try owned.dupe(u8, row.key);
+            try rows.append(owned, .{ .key = key, .value = try owned.dupe(u8, row.value) });
+            after = key;
+        }
+        return .{ .arena = arena, .before = before, .rows = try rows.toOwnedSlice(owned) };
+    }
+    pub fn deinit(self: *GarbagePage) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+    /// Returns true only when the retired range and intent are both removed.
+    /// The active root and high-water mark are read in this SAME transaction;
+    /// publication must likewise fence its current ready job before root swap.
+    /// Snapshot readers must pin their metadata transaction across root lookup
+    /// and ownership reads. Any error requires abort, including delete failure.
+    pub fn apply(self: *const GarbagePage, txn: anytype) !bool {
+        if (self.rows.len > max_tables_per_page) return error.CatalogCommandTooLarge;
+        const generation = self.before.generation;
+        var retirement_buf: [128]u8 = undefined;
+        const key = try retirementKey(&retirement_buf, generation);
+        const bytes = txn.get(key) catch |err| {
+            if (err == error.NotFound) return error.CatalogGenerationChanged;
+            return err;
+        };
+        if (!std.mem.eql(u8, &(try self.before.encode()), bytes)) return error.CatalogGenerationChanged;
+        var job_buf: [128]u8 = undefined;
+        const current = try State.decode(try txn.get(try jobKey(&job_buf, generation.group_id)));
+        if (current.group_id != generation.group_id) return error.InvalidCatalogRecord;
+        if (std.mem.order(u8, &generation.job_id, &current.job_id) != .lt) return error.CatalogGenerationChanged;
+        var root_buf: [128]u8 = undefined;
+        const root = txn.get(try rootKey(&root_buf, generation.group_id)) catch |err| blk: {
+            if (err == error.NotFound) break :blk null;
+            return err;
+        };
+        if (root) |value| {
+            const published = try Generation.decode(value);
+            if (published.group_id != generation.group_id or std.mem.order(u8, &published.job_id, &current.job_id) == .gt) return error.InvalidCatalogRecord;
+            if (published.eql(generation)) return error.CatalogGenerationChanged;
+        }
+        // Check every exact before-image before deleting any candidate entry.
+        var after = self.before;
+        for (self.rows) |row| {
+            _ = try decodeCandidateGenerationKey(row.key, generation);
+            if (std.mem.order(u8, after.cursor(), row.key) != .lt) return error.InvalidCatalogRecord;
+            after.cursor_len = @intCast(row.key.len);
+            @memset(&after.cursor_bytes, 0);
+            @memcpy(after.cursor_bytes[0..row.key.len], row.key);
+            const found = txn.get(row.key) catch |err| {
+                if (err == error.NotFound) return error.CatalogGenerationChanged;
+                return err;
+            };
+            if (!std.mem.eql(u8, row.value, found)) return error.CatalogGenerationChanged;
+        }
+        for (self.rows) |row| try txn.delete(row.key);
+        var prefix_buf: [max_cursor_bytes]u8 = undefined;
+        const prefix = try candidateGenerationPrefix(&prefix_buf, generation);
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        var remaining = try cursor.seekAtOrAfter(if (after.cursor_len == 0) prefix else after.cursor());
+        if (remaining) |entry| if (std.mem.eql(u8, entry.key, after.cursor())) {
+            remaining = try cursor.next();
+        };
+        const done = if (remaining) |entry| !std.mem.startsWith(u8, entry.key, prefix) else true;
+        if (done) try txn.delete(key) else try txn.put(key, &(try after.encode()));
+        return done;
+    }
+};
 pub const Page = struct {
     plan: names.Plan,
     before: State,
@@ -541,6 +742,32 @@ const TestTxn = struct {
         while (keys.next()) |key| if (std.mem.startsWith(u8, key.*, prefix)) return true;
         return false;
     }
+    pub fn openCursor(self: *TestTxn) !Cursor {
+        return .{ .txn = self };
+    }
+    const Cursor = struct {
+        txn: *TestTxn,
+        last: []const u8 = "",
+        pub fn close(_: *@This()) void {}
+        pub fn seekAtOrAfter(self: *@This(), key: []const u8) !?CandidateRow {
+            return self.find(key, false);
+        }
+        pub fn next(self: *@This()) !?CandidateRow {
+            return self.find(self.last, true);
+        }
+        fn find(self: *@This(), key: []const u8, exclusive: bool) ?CandidateRow {
+            var entries = self.txn.values.iterator();
+            var best: ?CandidateRow = null;
+            while (entries.next()) |entry| {
+                const order = std.mem.order(u8, entry.key_ptr.*, key);
+                if (order == .lt or (exclusive and order == .eq)) continue;
+                if (best == null or std.mem.order(u8, entry.key_ptr.*, best.?.key) == .lt)
+                    best = .{ .key = entry.key_ptr.*, .value = entry.value_ptr.* };
+            }
+            if (best) |entry| self.last = entry.key;
+            return best;
+        }
+    };
 };
 
 test "relation reconciliation fences replacement jobs and rejects reused candidates" {
@@ -562,13 +789,18 @@ test "relation reconciliation fences replacement jobs and rejects reused candida
     try start(&txn, &next, test_epoch, &before);
     try std.testing.expectError(error.CatalogGenerationChanged, page.apply(&txn, test_epoch));
     const next_encoded = try next.encode();
-    // An abandoned candidate cannot be reused even when it is not the current
-    // job. This is a prefix seek in the native store, not a candidate scan.
+    // The retained high-water mark rejects older IDs even after replacement.
     try std.testing.expectError(error.CatalogGenerationChanged, start(&txn, &initial, test_epoch, &next_encoded));
     var old_candidates: CandidateStore(TestTxn) = .{ .txn = &txn, .state = &initial };
     try std.testing.expect(try old_candidates.getClaim(test_claims[0].key) != null);
     var new_candidates: CandidateStore(TestTxn) = .{ .txn = &txn, .state = &next };
     try std.testing.expect((try new_candidates.getClaim(test_claims[0].key)) == null);
+    const future = try State.init(41, try nextJobId(&next), test_epoch);
+    // A higher ID must also have an empty prefix: one native prefix seek,
+    // rather than scanning all existing or abandoned candidate generations.
+    var dirty_buf: [max_cursor_bytes]u8 = undefined;
+    try txn.put(try candidateKey(&dirty_buf, &future, test_claims[0].key), &(try test_owner.encode()));
+    try std.testing.expectError(error.CatalogGenerationChanged, start(&txn, &future, test_epoch, &next_encoded));
 }
 
 test "relation reconciliation rejects collisions crossing page boundaries" {
@@ -653,4 +885,104 @@ test "relation reconciliation claim budget retains the unadmitted source row" {
     try std.testing.expectEqual(@as(usize, 1), second.claims.len);
     try std.testing.expectEqual(@as(u64, 2), second.after.expected.rows);
     try std.testing.expectEqual(@as(u64, names.max_claims + 1), second.after.expected.claims);
+}
+
+test "relation reconciliation garbage collection fences roots exact values and generation reuse" {
+    const a = std.testing.allocator;
+    var txn = TestTxn.init();
+    defer txn.deinit();
+    const initial = try State.init(41, try nextJobId(null), test_epoch);
+    try start(&txn, &initial, test_epoch, null);
+    var source: TestSource = .{ .rows = &test_rows };
+    var build = try Page.prepareSource(a, initial, test_epoch, &source);
+    defer build.deinit();
+    try build.apply(&txn, test_epoch);
+    const other_group = try State.init(42, initial.job_id, test_epoch);
+    try start(&txn, &other_group, test_epoch, null);
+    var other_build = try Page.prepareSource(a, other_group, test_epoch, &source);
+    defer other_build.deinit();
+    try other_build.apply(&txn, test_epoch);
+    const next = try State.init(41, try nextJobId(&build.after), test_epoch);
+    try start(&txn, &next, test_epoch, &(try build.after.encode()));
+    var candidate_buf: [max_cursor_bytes]u8 = undefined;
+    const candidate_key = try candidateKey(&candidate_buf, &initial, test_claims[0].key);
+    const value = try test_owner.encode();
+    const rows = [_]CandidateRow{.{ .key = candidate_key, .value = &value }};
+    var candidates: TestCandidates = .{ .rows = &rows };
+    var garbage = try GarbagePage.prepare(a, Retirement.init(Generation.of(&initial)), &candidates);
+    defer garbage.deinit();
+    var root_buf: [128]u8 = undefined;
+    const root_key = try rootKey(&root_buf, initial.group_id);
+    try txn.put(root_key, &(try Generation.of(&initial).encode()));
+    try std.testing.expectError(error.CatalogGenerationChanged, garbage.apply(&txn));
+    try std.testing.expectEqualSlices(u8, &value, try txn.get(candidate_key));
+    try txn.put(root_key, "unknown-root-format");
+    try std.testing.expectError(error.InvalidCatalogRecord, garbage.apply(&txn));
+    try txn.delete(root_key);
+    var forged = test_owner;
+    forged.schema_digest[0] ^= 1;
+    try txn.put(candidate_key, &(try forged.encode()));
+    try std.testing.expectError(error.CatalogGenerationChanged, garbage.apply(&txn));
+    try txn.put(candidate_key, &value);
+    try std.testing.expect(try garbage.apply(&txn));
+    var other_candidates: CandidateStore(TestTxn) = .{ .txn = &txn, .state = &other_group };
+    try std.testing.expect(try other_candidates.getClaim(test_claims[0].key) != null);
+    try std.testing.expectError(error.NotFound, txn.get(candidate_key));
+    var retirement_buf: [128]u8 = undefined;
+    try std.testing.expectError(error.NotFound, txn.get(try retirementKey(&retirement_buf, Generation.of(&initial))));
+    try std.testing.expectError(error.CatalogGenerationChanged, garbage.apply(&txn));
+    // GC removed both data and intent, but retained the one per-group high-
+    // water mark. Older IDs cannot be resurrected without a tombstone leak.
+    try std.testing.expectError(error.CatalogGenerationChanged, start(&txn, &initial, test_epoch, &(try next.encode())));
+    const final = try State.init(41, try nextJobId(&next), test_epoch);
+    try start(&txn, &final, test_epoch, &(try next.encode()));
+    var empty: TestCandidates = .{ .rows = &.{} };
+    var empty_gc = try GarbagePage.prepare(a, Retirement.init(Generation.of(&next)), &empty);
+    defer empty_gc.deinit();
+    try std.testing.expect(try empty_gc.apply(&txn));
+    var max = final;
+    max.job_id = @splat(255);
+    try std.testing.expectError(error.CatalogGenerationExhausted, nextJobId(&max));
+    const encoded = try Generation.of(&final).encode();
+    try std.testing.expect((try Generation.decode(&encoded)).eql(Generation.of(&final)));
+    try std.testing.expectError(error.InvalidCatalogRecord, Generation.decode(encoded[0 .. encoded.len - 1]));
+}
+
+test "relation reconciliation garbage preparation unwinds allocation faults" {
+    const T = struct {
+        fn run(a: A) !void {
+            const state = try State.init(41, try nextJobId(null), test_epoch);
+            var buf: [max_cursor_bytes]u8 = undefined;
+            const key = try candidateKey(&buf, &state, test_claims[0].key);
+            const value = try test_owner.encode();
+            const rows = [_]CandidateRow{.{ .key = key, .value = &value }};
+            var source: TestCandidates = .{ .rows = &rows };
+            var page = try GarbagePage.prepare(a, Retirement.init(Generation.of(&state)), &source);
+            defer page.deinit();
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, T.run, .{});
+}
+
+test "relation reconciliation retirement cursor rejects foreign and noncanonical bytes" {
+    const state = try State.init(41, try nextJobId(null), test_epoch);
+    var retirement = Retirement.init(Generation.of(&state));
+    const encoded = try retirement.encode();
+    const decoded = try Retirement.decode(&encoded);
+    try std.testing.expectEqualSlices(u8, &encoded, &(try decoded.encode()));
+    retirement.cursor_bytes[0] = 1;
+    try std.testing.expectError(error.InvalidCatalogRecord, retirement.encode());
+    retirement = Retirement.init(Generation.of(&state));
+    var other = state;
+    other.group_id = 42;
+    const key = try candidateKey(&retirement.cursor_bytes, &other, test_claims[0].key);
+    retirement.cursor_len = @intCast(key.len);
+    try std.testing.expectError(error.InvalidCatalogRecord, retirement.encode());
+    retirement = Retirement.init(Generation.of(&state));
+    const own_key = try candidateKey(&retirement.cursor_bytes, &state, test_claims[0].key);
+    retirement.cursor_len = @intCast(own_key.len);
+    const valid = try retirement.encode();
+    const round_trip = try Retirement.decode(&valid);
+    try std.testing.expectEqualSlices(u8, own_key, round_trip.cursor());
+    try std.testing.expectError(error.InvalidCatalogRecord, Retirement.decode(valid[0 .. valid.len - 1]));
 }

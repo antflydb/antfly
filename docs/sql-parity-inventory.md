@@ -1489,8 +1489,8 @@ within 16-KiB verifier scratch; no whole-catalog map or user-row scan is added.
 Valid multi-group/index checkpoints preserve exact ownership across restart.
 `system_catalog/relation_reconciliation.zig` adds an isolated, durable
 candidate-job protocol rather than backfilling the active registry in place.
-Its binary job state pins a source incarnation/revision and a globally unique
-candidate identity. Source preparation is bounded by 64 tables, 8192 claims
+Its binary job state pins a source incarnation/revision and a monotonic
+candidate generation. Source preparation is bounded by 64 tables, 8192 claims
 and 4 MiB of logical page bytes; its owned collision plan is prepared outside
 apply. Apply point-checks the exact prior job state and current source epoch,
 then commits candidate claims and the continuation cursor in the caller's
@@ -1507,9 +1507,25 @@ native-store restart after each page. Preparation against a million-table
 generated source processes one 64-table page within 64 KiB scratch. Native
 coverage mixes document and relational/index definitions and rereads owners
 when a candidate changes after preparation. This is not installed as a
-background metadata service yet: authoritative epoch wiring, pending-generation
-reservation sources, Raft command/snapshot/replay integration, bounded abandoned
-candidate GC, capability barriers and atomic active-root publication still
+background metadata service yet. Job replacement now atomically creates a
+retirement intent for the previous generation. Bounded GC prepares at most
+64 candidate entries and checks the retained job high-water mark, exact
+retirement identity, published-root identity and all entry before-images in
+its caller's write transaction. It cannot delete a published generation, and
+deletion failures require transaction abort. An exclusive lexical cursor is
+persisted with every delete page; the next page seeks past processed keys,
+avoiding repeated traversal of the deleted prefix's LSM tombstones. The last page
+removes its retirement intent, while the one retained job per group prevents
+ID reuse after cleanup without permanent per-generation tombstones. Native
+coverage injects failures during deletions, cursor updates, replacement admission
+and final-intent removal; it verifies rollback, resumes the last GC page after
+reopening the store and checks that a pinned MVCC reader
+can still read a deleted current-key version. Malformed roots, generation
+exhaustion and stale GC delivery fail closed. Snapshot/replay retention of
+the high-water mark and intents remains an activation prerequisite, not an
+already-installed runtime feature. Authoritative epoch wiring, pending-generation
+reservation sources, Raft command/snapshot/replay integration, GC scheduling,
+capability barriers and atomic active-root publication still
 precede writer adoption and SQL point resolution. No original SQL case is
 credited for this protocol component.
 FK publication and restore command envelopes use the same admission boundary,

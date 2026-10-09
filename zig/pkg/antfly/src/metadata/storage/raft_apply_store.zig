@@ -745,9 +745,11 @@ test "system catalog relation namespace transaction reconciliation is isolated a
         const Candidates = struct {
             cursor: docstore.DocStore.Txn.CursorAdapter,
             prefix: []const u8,
+            expected_start: ?[]const u8 = null,
             started: bool = false,
             pub fn nextAfter(self: *@This(), after: []const u8) !?r.CandidateRow {
                 const row = (if (!self.started) blk: {
+                    if (self.expected_start) |expected| try std.testing.expectEqualSlices(u8, expected, after);
                     self.started = true;
                     const found = (try self.cursor.seekAtOrAfter(if (after.len == 0) self.prefix else after)) orelse return null;
                     break :blk if (std.mem.eql(u8, found.key, after)) try self.cursor.next() else found;
@@ -762,6 +764,12 @@ test "system catalog relation namespace transaction reconciliation is isolated a
             pub fn get(self: *@This(), key: []const u8) ![]const u8 {
                 return self.txn.get(key);
             }
+            pub fn hasPrefix(self: *@This(), prefix: []const u8) !bool {
+                return self.txn.hasPrefix(prefix);
+            }
+            pub fn openCursor(self: *@This()) !docstore.DocStore.Txn.CursorAdapter {
+                return self.txn.openCursor();
+            }
             pub fn put(self: *@This(), key: []const u8, value: []const u8) !void {
                 if (std.mem.eql(u8, key, self.job_key)) return error.InjectedJobWriteFailure;
                 try self.txn.put(key, value);
@@ -770,6 +778,36 @@ test "system catalog relation namespace transaction reconciliation is isolated a
                 try self.txn.delete(key);
             }
         };
+        const GcFault = struct {
+            txn: *docstore.DocStore.Txn,
+            deletes: usize = 0,
+            pub fn get(self: *@This(), key: []const u8) ![]const u8 {
+                return self.txn.get(key);
+            }
+            pub fn hasPrefix(self: *@This(), prefix: []const u8) !bool {
+                return self.txn.hasPrefix(prefix);
+            }
+            pub fn openCursor(self: *@This()) !docstore.DocStore.Txn.CursorAdapter {
+                return self.txn.openCursor();
+            }
+            pub fn put(self: *@This(), key: []const u8, value: []const u8) !void {
+                try self.txn.put(key, value);
+            }
+            pub fn delete(self: *@This(), key: []const u8) !void {
+                self.deletes += 1;
+                if (self.deletes == 3) return error.InjectedCandidateDeleteFailure;
+                try self.txn.delete(key);
+            }
+        };
+        fn garbage(store: *RaftApplyStore, state: *const r.State) !r.GarbagePage {
+            var read = try store.store.beginReadTxn();
+            defer read.abort();
+            var buf: [r.max_cursor_bytes]u8 = undefined;
+            const retirement = try r.Retirement.decode(try read.get(try r.retirementKey(&buf, r.Generation.of(state))));
+            var candidates: Candidates = .{ .cursor = try read.openCursor(), .prefix = try r.candidatePrefix(&buf, state), .expected_start = retirement.cursor() };
+            defer candidates.cursor.close();
+            return r.GarbagePage.prepare(std.testing.allocator, retirement, &candidates);
+        }
     };
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -813,6 +851,68 @@ test "system catalog relation namespace transaction reconciliation is isolated a
             try std.testing.expectEqual(@as(u64, r.max_tables_per_page + 1), state.expected.rows);
             try std.testing.expectEqual(@as(u64, r.max_tables_per_page + 2), state.expected.claims);
             try std.testing.expectEqual(@as(usize, 6), pages);
+            const successor = try r.State.init(group, try r.nextJobId(&state), epoch);
+            {
+                var txn = try store.store.beginWriteTxn();
+                defer txn.abort();
+                var fault: T.Fault = .{ .txn = &txn, .job_key = job_key };
+                try std.testing.expectError(error.InjectedJobWriteFailure, r.start(&fault, &successor, epoch, &(try state.encode())));
+                var buf: [128]u8 = undefined;
+                _ = try txn.get(try r.retirementKey(&buf, r.Generation.of(&state)));
+                try std.testing.expectEqualSlices(u8, &(try state.encode()), try txn.get(job_key));
+            }
+            {
+                var txn = try store.store.beginWriteTxn();
+                errdefer txn.abort();
+                var buf: [128]u8 = undefined;
+                try std.testing.expectError(error.NotFound, txn.get(try r.retirementKey(&buf, r.Generation.of(&state))));
+                try r.start(&txn, &successor, epoch, &(try state.encode()));
+                try txn.commit();
+            }
+            var garbage = try T.garbage(&store, &state);
+            defer garbage.deinit();
+            try std.testing.expectEqual(@as(usize, r.max_tables_per_page), garbage.rows.len);
+            {
+                var txn = try store.store.beginWriteTxn();
+                defer txn.abort();
+                var buf: [128]u8 = undefined;
+                // A published root remains protected even after a newer
+                // reconciliation job creates its retirement intent.
+                try txn.put(try r.rootKey(&buf, group), &(try r.Generation.of(&state).encode()));
+                try std.testing.expectError(error.CatalogGenerationChanged, garbage.apply(&txn));
+                _ = try txn.get(garbage.rows[0].key);
+            }
+            {
+                var txn = try store.store.beginWriteTxn();
+                defer txn.abort();
+                var fault: T.GcFault = .{ .txn = &txn };
+                try std.testing.expectError(error.InjectedCandidateDeleteFailure, garbage.apply(&fault));
+                try std.testing.expectError(error.NotFound, txn.get(garbage.rows[0].key));
+            }
+            {
+                var txn = try store.store.beginWriteTxn();
+                defer txn.abort();
+                var buf: [128]u8 = undefined;
+                const retirement_key = try r.retirementKey(&buf, r.Generation.of(&state));
+                var fault: T.Fault = .{ .txn = &txn, .job_key = retirement_key };
+                // All page deletes succeed; persisting the cursor fails.
+                try std.testing.expectError(error.InjectedJobWriteFailure, garbage.apply(&fault));
+                try std.testing.expectError(error.NotFound, txn.get(garbage.rows[0].key));
+                const prior = try r.Retirement.decode(try txn.get(retirement_key));
+                try std.testing.expectEqual(@as(u16, 0), prior.cursor_len);
+            }
+            {
+                var txn = try store.store.beginWriteTxn();
+                errdefer txn.abort();
+                // Aborting the failed page retained both entries and intent.
+                _ = try txn.get(garbage.rows[0].key);
+                try std.testing.expect(!try garbage.apply(&txn));
+                try txn.commit();
+            }
+            // Metadata snapshot readers keep the old generation alive through
+            // MVCC, even after GC removes the current physical-key versions.
+            var pinned: r.CandidateStore(docstore.DocStore.Txn) = .{ .txn = &read, .state = &state };
+            try std.testing.expect(try pinned.getClaim(.{ .namespace_id = system_catalog.default_namespace_id, .name = "table_0" }) != null);
             break;
         }
         var prefix_buf: [r.max_cursor_bytes]u8 = undefined;
@@ -882,6 +982,44 @@ test "system catalog relation namespace transaction reconciliation is isolated a
         }
         pages += 1;
         try std.testing.expect(pages <= 6);
+    }
+    {
+        // Reopen after the first committed GC page. Its exclusive cursor is
+        // durable, so we do not walk the deleted prefix's LSM tombstones.
+        var store = try RaftApplyStore.init(a, .{ .root_dir = root });
+        defer store.deinit();
+        var garbage = try T.garbage(&store, &initial);
+        defer garbage.deinit();
+        try std.testing.expectEqual(@as(usize, 2), garbage.rows.len);
+        try std.testing.expect(garbage.before.cursor_len != 0);
+        {
+            var txn = try store.store.beginWriteTxn();
+            defer txn.abort();
+            var fault: T.GcFault = .{ .txn = &txn };
+            // Two entry deletes succeed; the intent delete fails. Aborting
+            // must retain the complete final page and its retirement intent.
+            try std.testing.expectError(error.InjectedCandidateDeleteFailure, garbage.apply(&fault));
+            try std.testing.expectError(error.NotFound, txn.get(garbage.rows[0].key));
+            var buf: [128]u8 = undefined;
+            _ = try txn.get(try r.retirementKey(&buf, r.Generation.of(&initial)));
+        }
+        var txn = try store.store.beginWriteTxn();
+        errdefer txn.abort();
+        _ = try txn.get(garbage.rows[0].key);
+        try std.testing.expect(try garbage.apply(&txn));
+        try txn.commit();
+    }
+    {
+        var store = try RaftApplyStore.init(a, .{ .root_dir = root });
+        defer store.deinit();
+        var txn = try store.store.beginWriteTxn();
+        defer txn.abort();
+        var buf: [r.max_cursor_bytes]u8 = undefined;
+        try std.testing.expect(!try txn.hasPrefix(try r.candidatePrefix(&buf, &initial)));
+        try std.testing.expectError(error.NotFound, txn.get(try r.retirementKey(&buf, r.Generation.of(&initial))));
+        const current = try r.State.decode(try txn.get(job_key));
+        try std.testing.expectEqualSlices(u8, &(try r.nextJobId(&initial)), &current.job_id);
+        try std.testing.expectError(error.CatalogGenerationChanged, r.start(&txn, &initial, epoch, &(try current.encode())));
     }
 }
 
