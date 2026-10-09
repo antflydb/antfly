@@ -24,6 +24,9 @@ pub const Context = struct {
     deadline_ns: ?u64 = null,
     cancellation: ?storage.CancellationToken = null,
     checkpoint: ?struct { ptr: *anyopaque, check: *const fn (*anyopaque) anyerror!void } = null,
+    /// Original read authority is independent of CPU ownership and may be
+    /// polled while parked. Its callback must not acquire a runnable grant.
+    authority: ?struct { ptr: *anyopaque, check: *const fn (*anyopaque) anyerror!void } = null,
     execution: ?*@import("../../common/runnable_scheduler.zig").Execution = null,
     wait: ?@import("../../sql/execution_wait.zig").Boundary = null,
     pub fn withExecution(self: Context, execution: *@import("../../common/runnable_scheduler.zig").Execution) Context {
@@ -40,6 +43,7 @@ pub const Context = struct {
         if (self.cancellation) |token| try token.check();
         if (self.deadline_ns) |deadline| if (@import("antfly_platform").time.monotonicNs() >= deadline) return error.DeadlineExceeded;
         if (self.execution) |execution| try execution.checkLifetime();
+        if (self.authority) |hook| try hook.check(hook.ptr);
     }
     pub fn ensureActive(self: Context) !void {
         try self.checkLifetime();
@@ -329,4 +333,40 @@ test "lake SQL borrowed lifetime polling ignores another worker IO cancellation 
     try execution.park(.resource_blocked);
     scheduler.close();
     try std.testing.expectError(error.SchedulerClosed, context.checkLifetime());
+}
+
+test "lake SQL lifetime authority survives execution binding without borrowing original CPU" {
+    const Runnable = @import("../../common/runnable_scheduler.zig");
+    const Fixture = struct {
+        revoked: bool = false,
+        checks: usize = 0,
+        borrowed: usize = 0,
+        fn authority(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.checks += 1;
+            if (self.revoked) return error.LakeIndexReaderLeaseExpired;
+        }
+        fn parentCPU(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.borrowed += 1;
+            return error.BorrowedParentCpu;
+        }
+    };
+    var scheduler = try Runnable.Scheduler.init(.{ .slots = 2 });
+    var execution: Runnable.Execution = .{};
+    try execution.start(&scheduler, .{ .io = std.testing.io }, .query);
+    defer execution.finish();
+    var fixture: Fixture = .{};
+    const original: Context = .{ .checkpoint = .{ .ptr = &fixture, .check = Fixture.parentCPU }, .authority = .{ .ptr = &fixture, .check = Fixture.authority } };
+    const active = original.withExecution(&execution);
+    try active.ensureActive();
+    try execution.park(.resource_blocked);
+    try active.checkLifetime();
+    try std.testing.expectEqual(@as(usize, 0), scheduler.stats().runnable_slots);
+    fixture.revoked = true;
+    try std.testing.expectError(error.LakeIndexReaderLeaseExpired, active.checkLifetime());
+    try std.testing.expectError(error.LakeIndexReaderLeaseExpired, active.ensureActive());
+    try std.testing.expectEqual(@as(usize, 0), fixture.borrowed);
+    try std.testing.expectEqual(@as(usize, 4), fixture.checks);
+    try std.testing.expectEqual(@as(usize, 0), scheduler.stats().runnable_slots);
 }

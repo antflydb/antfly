@@ -21,6 +21,7 @@ test {
     _ = @import("serverless/artifacts/store.zig");
     _ = @import("api/lake_index_aggregate_artifact.zig");
     _ = @import("api/lake_index_aggregate_composition.zig");
+    _ = @import("api/lake_index_reader_lease.zig");
     _ = @import("serverless/manifest/fs_store.zig");
     _ = @import("serverless/manifest/remote_store.zig");
     _ = object_storage;
