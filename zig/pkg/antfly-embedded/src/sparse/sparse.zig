@@ -1479,11 +1479,52 @@ fn publishDocMapLocators(a: Allocator, txn: anytype, segment: u64, data: []const
     _ = try forEachDocMapEntry(data, &context, Context.visit);
     try maps.flush(txn);
 }
+// A published generation retains its intent until every locator is refreshed.
+// During that gap, point-read only these in-flight roots and native ordinals;
+// never consult unpublished staging or scan document-map payloads.
+fn pendingForwardBytes(txn: anytype, locator: DocMapLocator, doc_id: []const u8) !?[]const u8 {
+    var cursor = try txn.openCursor();
+    defer cursor.close();
+    var next = try cursor.seekAtOrAfter(&.{0x12});
+    while (next) |intent| {
+        if (intent.key.len != 9 or intent.key[0] != 0x12) break;
+        const id = std.mem.readInt(u64, intent.key[1..9], .big);
+        var key: [16]u8 = undefined;
+        const root = txn.get(docMapSegmentKey(&key, id)) catch |err| switch (err) {
+            error.NotFound => {
+                next = try cursor.next();
+                continue;
+            },
+            else => return err,
+        };
+        if (pagedDocMap(root)) {
+            const data = txn.get(&docMapEntryKey(id, locator.num)) catch |err| switch (err) {
+                error.NotFound => {
+                    next = try cursor.next();
+                    continue;
+                },
+                else => return err,
+            };
+            if (data.len < 4) return error.InvalidSparseDocMapSegment;
+            const len = std.mem.readInt(u32, data[0..4], .little);
+            if (len > data.len - 4) return error.InvalidSparseDocMapSegment;
+            if (std.mem.eql(u8, data[4..][0..len], doc_id) and
+                try segmentIncarnation(txn, id, SEGMENT_FORMAT_VERSION, locator.num, true) == locator.epoch)
+            {
+                const forward = data[4 + len ..];
+                if (try decodeFwdDocNum(forward) != locator.num) return error.InvalidSparseDocMapSegment;
+                return forward;
+            }
+        }
+        next = try cursor.next();
+    }
+    return null;
+}
 fn locatedForwardBytes(txn: anytype, doc_id: []const u8) !?[]const u8 {
     const locator = (try readLocator(txn, doc_id)) orelse return null;
     var key: [16]u8 = undefined;
     const root = txn.get(docMapSegmentKey(&key, locator.segment)) catch |err| switch (err) {
-        error.NotFound => return null,
+        error.NotFound => return pendingForwardBytes(txn, locator, doc_id),
         else => return err,
     };
     const paged = pagedDocMap(root);
@@ -2985,7 +3026,7 @@ pub const SparseIndex = struct {
                 if (entry.value.len < 4) return error.InvalidSparseDocMapSegment;
                 const len = std.mem.readInt(u32, entry.value[0..4], .little);
                 if (len > entry.value.len - 4) return error.InvalidSparseDocMapSegment;
-                if (len < 255) {
+                if (len < 256) {
                     var epoch_key: [17]u8 = undefined;
                     const wanted = segmentIncarnationKey(&epoch_key, id, doc, true);
                     const proof = (try epochs.seekAtOrAfter(wanted)) orelse return error.InvalidSparseDocMapSegment;
@@ -6950,7 +6991,8 @@ test "sparse staged generations hide partial output recover intents and retain o
     defer cleanupTmp(path);
     var index = try SparseIndex.open(a, path, .{});
     defer index.close();
-    for ([_][]const u8{ "a", "b" }) |id| try index.batchWithOptions(&.{.{ .doc_id = id, .vec = .{ .indices = &.{1}, .values = &.{2} } }}, &.{}, .{ .prefer_bulk_build = true, .assume_new_doc_ids = true });
+    const long_id: [255]u8 = @splat('x');
+    for ([_][]const u8{ "a", "b", &long_id }) |id| try index.batchWithOptions(&.{.{ .doc_id = id, .vec = .{ .indices = &.{1}, .values = &.{2} } }}, &.{}, .{ .prefer_bulk_build = true, .assume_new_doc_ids = true });
     var task = (try index.beginSegmentCompactionTask(a, .{ .min_segments = 2, .scratch = .{ .io = std.testing.io, .directory = "/tmp" } })).?;
     defer task.deinit(a);
     for (task.sources) |source| {
@@ -6962,6 +7004,9 @@ test "sparse staged generations hide partial output recover intents and retain o
         try std.testing.expectEqual(@as(usize, 0), source.incarnations.len);
     }
     var old = try index.beginReadTxn();
+    var locator_key: [256]u8 = undefined;
+    const old_locator = try a.dupe(u8, try old.get(locatorKey(&locator_key, "a")));
+    defer a.free(old_locator);
     var old_open = true;
     defer if (old_open) old.abort();
     var result = try SparseIndex.executeSegmentCompactionTask(a, &task, 1);
@@ -6980,7 +7025,7 @@ test "sparse staged generations hide partial output recover intents and retain o
     const query: SparseVector = .{ .indices = &.{1}, .values = &.{1} };
     const partial = try index.search(a, &query, 5);
     defer SparseIndex.freeResults(a, partial);
-    try std.testing.expectEqual(@as(usize, 2), partial.len);
+    try std.testing.expectEqual(@as(usize, 3), partial.len);
     try index.recoverCompactionIntents();
     {
         var txn = try index.beginReadTxn();
@@ -6992,7 +7037,7 @@ test "sparse staged generations hide partial output recover intents and retain o
         try std.testing.expectError(error.NotFound, txn.get(&SparseIndex.pendingKey(abandoned)));
     }
     try std.testing.expect(try index.finishSegmentCompactionTask(&task, &result));
-    for ([_][]const u8{ "a", "b" }) |id| {
+    for ([_][]const u8{ "a", "b", &long_id }) |id| {
         var txn = try index.beginReadTxn();
         defer txn.abort();
         try std.testing.expect((try locatedForwardBytes(&txn, id)) != null);
@@ -7004,9 +7049,17 @@ test "sparse staged generations hide partial output recover intents and retain o
         errdefer txn.abort();
         const locator = (try readLocator(&txn, "a")).?;
         var key: [256]u8 = undefined;
-        try txn.delete(locatorKey(&key, "a"));
+        try txn.put(locatorKey(&key, "a"), old_locator);
         try txn.put(&SparseIndex.pendingKey(locator.segment), &.{});
         try txn.commit();
+    }
+    {
+        var read = try index.beginReadTxn();
+        defer read.abort();
+        const forward = try index.lookupFwdEntryByDocIdAlloc(a, &read, "a");
+        defer a.free(forward.term_ids);
+        defer a.free(forward.weights);
+        try std.testing.expectEqual(@as(usize, 1), forward.term_ids.len);
     }
     old.abort();
     old_open = false;
@@ -7019,13 +7072,13 @@ test "sparse staged generations hide partial output recover intents and retain o
     }
     const hits = try index.search(a, &query, 5);
     defer SparseIndex.freeResults(a, hits);
-    try std.testing.expectEqual(@as(usize, 2), hits.len);
+    try std.testing.expectEqual(@as(usize, 3), hits.len);
     // A later compatibility compaction must consume the paged document map too.
     try index.batchWithOptions(&.{.{ .doc_id = "c", .vec = .{ .indices = &.{1}, .values = &.{2} } }}, &.{}, .{ .prefer_bulk_build = true, .assume_new_doc_ids = true });
     try std.testing.expect(try index.compactSegmentsWithOptions(a, .{ .min_segments = 2 }));
     const next_hits = try index.search(a, &query, 5);
     defer SparseIndex.freeResults(a, next_hits);
-    try std.testing.expectEqual(@as(usize, 3), next_hits.len);
+    try std.testing.expectEqual(@as(usize, 4), next_hits.len);
     var read = try index.beginReadTxn();
     defer read.abort();
     try std.testing.expect((try locatedForwardBytes(&read, "a")) != null);

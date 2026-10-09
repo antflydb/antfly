@@ -360,7 +360,9 @@ records under a small document-map root. Legacy blobs remain readable. Locator
 refresh follows publication in bounded transactions, resumes from durable intents
 after a crash, and checks current incarnation
 and tombstones under the write gate; until refresh finishes, the ordinary fallback
-resolves the published document-map root. Physical-to-native mappings retain the
+resolves the published document-map root by ordinal through the small in-flight
+intent directory, including read-only snapshots. The complete-locator fast-miss
+fence therefore remains valid during refresh. Physical-to-native mappings retain the
 same identities throughout compaction.
 
 Bloom lookahead uses up to four independent row-group jobs on the shared scheduler.

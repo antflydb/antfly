@@ -89,9 +89,9 @@ pub fn runtimeCompileMaxRss(unit: RuntimeLibraryUnit, profile: CompileMemoryProf
         // v0.2.1-rc0 release build, while the integrated HA API kernel
         // reached 8.10 GB in a clean aarch64-linux-musl ReleaseFast
         // build. Linux retains 10 GiB. October's native lake codegen reached
-        // 15.10 GB on macOS, exceeding 14 GiB. Reserve 18 GiB to retain at
-        // least 25% headroom over that measured peak.
-        .api_kernel => @as(usize, if (target.os.tag == .macos) 18 else 10) * 1024 * 1024 * 1024,
+        // 19.81 GB on macOS with paged native maintenance. Reserve 24 GiB
+        // to retain at least 25% headroom over that measured peak.
+        .api_kernel => @as(usize, if (target.os.tag == .macos) 24 else 10) * 1024 * 1024 * 1024,
         // September's macOS 20 GiB claim is below the reported 22–23 GB
         // compiler peak. 28 GiB includes >=25% headroom at 23 decimal GB.
         // Keep the measured Linux profiles separate. The other macOS bumps
@@ -124,6 +124,8 @@ pub fn runtimeCompileMaxRss(unit: RuntimeLibraryUnit, profile: CompileMemoryProf
 test "macOS reservations cover reported storage peak and prevent unsafe overlap" {
     const macos = try std.zig.system.resolveTargetQuery(std.testing.io, .{ .cpu_arch = .aarch64, .os_tag = .macos });
     const profile: CompileMemoryProfile = .{ .host = macos, .target = macos, .optimize = .fast, .strip = false, .cpu_inference = true };
+    const reported_api_bytes: usize = 19_808_337_920;
+    try std.testing.expect(runtimeCompileMaxRss(.api_kernel, profile) >= reported_api_bytes + reported_api_bytes / 4);
     const reported_storage_bytes: usize = 23_000_000_000;
     const storage = runtimeCompileMaxRss(.storage_kernel, profile);
     try std.testing.expect(storage >= reported_storage_bytes + reported_storage_bytes / 4);
