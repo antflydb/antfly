@@ -1252,6 +1252,77 @@ components:
       schema:
         type: string
   schemas:
+    LakeCatalogCreateRequest:
+      type: object
+      additionalProperties: false
+      required: [commit_id, schema]
+      properties:
+        commit_id:
+          type: string
+          minLength: 1
+          maxLength: 256
+          description: Stable identifier reused with exactly the same request after timeout or restart.
+        schema:
+          type: object
+          additionalProperties: true
+          description: Iceberg schema including schema-id and persistent field IDs.
+        partition-spec:
+          type: object
+          additionalProperties: true
+        write-order:
+          type: object
+          additionalProperties: true
+        properties:
+          type: object
+          additionalProperties:
+            type: string
+    LakeCatalogCommitRequest:
+      type: object
+      additionalProperties: false
+      required: [commit_id, expected_metadata_location, requirements, updates]
+      properties:
+        commit_id:
+          type: string
+          minLength: 1
+          maxLength: 256
+        expected_metadata_location:
+          type: string
+          minLength: 1
+        requirements:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+          description: Standard Iceberg REST table requirements, validated against the authoritative state.
+        updates:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+          description: Standard Iceberg REST metadata updates. Upload data/delete/manifest files before committing. A lake commit does not establish Antfly index visibility.
+    LakeCatalogResponse:
+      type: object
+      required: [state]
+      properties:
+        state:
+          type: string
+          enum: [loaded, lake_committed, committed, not_committed, unknown]
+        commit_id:
+          type: string
+        request_hash:
+          type: string
+          description: Opaque request digest for outcome resolution.
+        metadata_location:
+          type: string
+        metadata:
+          type: object
+          additionalProperties: true
+        binding_ready:
+          type: boolean
+          description: False if lake creation committed but native schema binding still needs the same initialization request replayed.
+        searchable:
+          type: boolean
+          description: A catalog commit alone does not make a matching index publication searchable.
     ChatGPTAuthorize:
       type: object
       properties:
@@ -11739,6 +11810,157 @@ components:
               - $ref: "#/components/schemas/TableStorageUnreadableError"
 
 paths:
+  /tables/{tableName}/lake/catalog:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      operationId: getLakeCatalog
+      tags: [table_management]
+      summary: getLakeCatalog
+      description: Native Iceberg catalog operation for managed or external REST authority. Catalog mutations require table admin permission and iceberg_writer policy. These endpoints commit already prepared lake files; they do not perform ordinary row mutations or imply index publication.
+      responses:
+        "200":
+          description: Authoritative catalog result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LakeCatalogResponse"
+        "400":
+          description: Invalid or unsupported catalog request
+        "403":
+          description: Unauthorized catalog operation
+        "404":
+          description: Table or lake catalog not found
+        "409":
+          description: Binding, incarnation, or commit conflict
+        "503":
+          description: Catalog authority unavailable
+        "504":
+          description: Request deadline exceeded
+    post:
+      operationId: initializeLakeCatalog
+      tags: [table_management]
+      summary: initializeLakeCatalog
+      description: Native Iceberg catalog operation for managed or external REST authority. Catalog mutations require table admin permission and iceberg_writer policy. These endpoints commit already prepared lake files; they do not perform ordinary row mutations or imply index publication.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LakeCatalogCreateRequest"
+      responses:
+        "200":
+          description: Authoritative catalog result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LakeCatalogResponse"
+        "202":
+          description: Commit outcome is uncertain; resolve or retry the same commit ID and request. Do not checkpoint or delete files yet.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LakeCatalogResponse"
+        "400":
+          description: Invalid or unsupported catalog request
+        "403":
+          description: Unauthorized catalog operation
+        "404":
+          description: Table or lake catalog not found
+        "409":
+          description: Binding, incarnation, or commit conflict
+        "503":
+          description: Catalog authority unavailable
+        "504":
+          description: Request deadline exceeded
+  /tables/{tableName}/lake/commits:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      operationId: commitLakeCatalog
+      tags: [table_management]
+      summary: commitLakeCatalog
+      description: Native Iceberg catalog operation for managed or external REST authority. Catalog mutations require table admin permission and iceberg_writer policy. These endpoints commit already prepared lake files; they do not perform ordinary row mutations or imply index publication.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LakeCatalogCommitRequest"
+      responses:
+        "200":
+          description: Authoritative catalog result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LakeCatalogResponse"
+        "202":
+          description: Commit outcome is uncertain; resolve or retry the same commit ID and request. Do not checkpoint or delete files yet.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LakeCatalogResponse"
+        "400":
+          description: Invalid or unsupported catalog request
+        "403":
+          description: Unauthorized catalog operation
+        "404":
+          description: Table or lake catalog not found
+        "409":
+          description: Binding, incarnation, or commit conflict
+        "503":
+          description: Catalog authority unavailable
+        "504":
+          description: Request deadline exceeded
+  /tables/{tableName}/lake/commits/{commitId}:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: commitId
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: request_hash
+        in: query
+        required: true
+        schema:
+          type: string
+    get:
+      operationId: getLakeCommitOutcome
+      tags: [table_management]
+      summary: getLakeCommitOutcome
+      description: Native Iceberg catalog operation for managed or external REST authority. Catalog mutations require table admin permission and iceberg_writer policy. These endpoints commit already prepared lake files; they do not perform ordinary row mutations or imply index publication.
+      responses:
+        "200":
+          description: Authoritative catalog result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LakeCatalogResponse"
+        "400":
+          description: Invalid or unsupported catalog request
+        "403":
+          description: Unauthorized catalog operation
+        "404":
+          description: Table or lake catalog not found
+        "409":
+          description: Binding, incarnation, or commit conflict
+        "503":
+          description: Catalog authority unavailable
+        "504":
+          description: Request deadline exceeded
   /status:
     get:
       summary: Get cluster status

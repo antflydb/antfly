@@ -8362,6 +8362,41 @@ pub const AntflyApiHandler = struct {
         return ctx.response.build();
     }
 
+    pub fn getLakeCatalog(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
+        return self.lakeCatalogRequest(ctx, table_name, .{ .action = .load });
+    }
+
+    pub fn initializeLakeCatalog(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
+        return self.lakeCatalogRequest(ctx, table_name, .{ .action = .create, .body = (try ctx.body()) orelse "" });
+    }
+
+    pub fn commitLakeCatalog(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
+        return self.lakeCatalogRequest(ctx, table_name, .{ .action = .commit, .body = (try ctx.body()) orelse "" });
+    }
+
+    pub fn getLakeCommitOutcome(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, commit_id: []const u8, params: metadata_server_openapi.server.GetLakeCommitOutcomeParams) !httpx.Response {
+        const id = (try decodePathParamOrBadRequest(ctx, commit_id)) orelse return ctx.response.build();
+        defer ctx.allocator.free(id);
+        return self.lakeCatalogRequest(ctx, table_name, .{ .action = .resolve, .commit_id = id, .request_hash = params.request_hash });
+    }
+
+    fn lakeCatalogRequest(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, request: @import("lake_catalog_http.zig").Request) !httpx.Response {
+        var identity: ?AuthenticatedIdentity = null;
+        defer if (identity) |*value| value.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &identity)) |response| return response;
+        const binding = (try self.resolvePublicTableBinding(ctx, table_name, &identity)) orelse return ctx.response.build();
+        defer binding.deinit(ctx.allocator);
+        var response = @import("lake_catalog_http.zig").execute(ctx.allocator, self.api_server, binding.physical, binding.table_id, identity, operationContext(ctx, identity), request) catch |err| {
+            if (err == error.Canceled or err == error.Cancelled) return error.Canceled;
+            return jsonErrorResponse(ctx, @import("lake_catalog_http.zig").errorStatus(err), @errorName(err));
+        };
+        defer response.deinit(ctx.allocator);
+        _ = ctx.status(response.status);
+        try ctx.setHeader("content-type", "application/json");
+        _ = ctx.response.body(response.body);
+        return ctx.response.build();
+    }
+
     pub fn lookupKey(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, key: []const u8, params: metadata_server_openapi.server.LookupKeyParams) !httpx.Response {
         return self.lookupKeyImpl(ctx, table_name, key, params) catch |err| {
             switch (err) {

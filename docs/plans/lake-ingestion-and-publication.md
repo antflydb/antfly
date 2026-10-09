@@ -107,6 +107,52 @@ ingestion, and write capabilities may differ for the same provider.
 
 ## Table ownership and write modes
 
+### Catalog authority decision
+
+Implement both an Antfly-managed catalog and an external Iceberg REST catalog
+behind one capability-driven contract. Use the managed catalog for HN and other
+Antfly-owned archives; allow customers to retain the existing authoritative
+catalog for shared lakes. Neither choice changes the object-store provider or
+requires indexes to exist only on local disk. Data files, index artifacts,
+publication manifests, and recovery records are durable remote objects; local
+disk and memory contain disposable serving caches.
+
+| Concern | Antfly-managed authority | External Iceberg REST authority |
+| --- | --- | --- |
+| Setup | Antfly owns the table's durable catalog head in its configured object location | A configured catalog connection identifies the existing namespace and table |
+| Commit | Antfly validates expected state and changes the head conditionally after writing immutable metadata | Antfly sends requirements and updates; the service validates and writes committed metadata |
+| Other writers | Writers must participate in Antfly's catalog protocol | Other lake engines use the same catalog authority |
+| Operations | Antfly owns fencing, commit validation, recovery, retention, and compatibility | Adds service availability/authentication dependencies and capability negotiation |
+| Serverless | Catalog head and recovery state survive worker loss in object storage | External service owns the durable commit authority; Antfly recovery state remains remote |
+| Interoperability | Iceberg files are interoperable; a standard REST server is a separate future exposure of the managed authority | Standard REST client interoperability, subject to discovered server capabilities |
+
+For REST, a client uploads data/delete files and submits commit requirements and
+metadata updates. It does not independently replace the metadata head. Conflicts
+require refresh and replanning; timeouts require outcome resolution before replay.
+Credential vending, remote signing, idempotent retries, and multi-table commits
+are negotiated capabilities, not assumptions. See the
+[Iceberg REST protocol](https://iceberg.apache.org/docs/latest/rest-protocol/).
+
+For managed authority, an object-store CAS is the atomic publication primitive,
+not a substitute for Iceberg validation. Validate table identity, requirements,
+schema/spec/sort references, snapshot and sequence evolution, and immutable
+metadata before replacing the head. Preserve unknown commit outcomes and prevent
+stale writers from publishing. The existing private object-table catalog is an
+Antfly WAL/publication projection, not an Iceberg catalog. See the
+[Iceberg specification](https://iceberg.apache.org/spec/).
+
+The shared contract resolves and pins metadata, conditionally commits changes,
+resolves uncertain outcomes, declares capabilities, and identifies ownership and
+credential scope. Object storage, format, catalog authority, and deployment remain
+independent choices. Both catalog adapters must feed the existing lake inventory
+and index publication machinery rather than establishing a second serving path.
+
+Lake commit and index publication remain separate milestones. Expose durably
+accepted, lake-committed, and searchable watermarks. Recover a crash between lake
+commit and index publication, and retire recent mutations only after a complete
+matching publication. A persistent Lite ingestion worker is valid; an ephemeral
+worker's local state cannot be the sole authority for serverless durability.
+
 1. **Externally managed attachment.** The external catalog owns table commits.
    Antfly follows committed snapshots, stores its own derived indexes, and
    queries base files in place. No complete row import is required. Default row
@@ -347,8 +393,8 @@ cutover guarantee before its underlying protocol is qualified.
 
 - Source-resource API versus extensions to existing table replication sources;
   connection reuse, status routes, and compatibility migration.
-- Catalog adapters and initial managed-table commit authority; external
-  multi-writer support and source conflict policies.
+- External-writer row conflict policies and optional REST exposure of the managed
+  catalog; both managed and external REST catalog adapters are required.
 - Recent-tier realization per deployment, transaction scope, text corpus scoring,
   and bounded exact query behavior when archive indexes lag.
 - Plain-Parquet manifest protocol, key/schema requirements, and hook receipts.

@@ -352,7 +352,7 @@ fn serializeSchemaFormat(alloc: Allocator, schema: TableSchema, format_version: 
     try validateRelationalSchema(alloc, schema);
     if (schema.external_base_source) |source| {
         if (schema.storage_mode != .relational) return error.InvalidSchema;
-        try source.binding.validateReadOnlyMvp();
+        try source.binding.validateSupported();
     }
     if (format_version < 12 and (schema.declared_fields.len != 0 or schema.exact_fields.len != 0)) {
         return error.InvalidSchema;
@@ -1013,7 +1013,7 @@ fn deserializeSchemaOwned(alloc: Allocator, data: []const u8) !TableSchema {
         var parsed = try std.json.parseFromSlice(@import("../serverless/external_source/catalog_binding.zig").Binding, alloc, bytes, .{ .allocate = .alloc_always });
         defer parsed.deinit();
         if (storage_mode != .relational) return error.InvalidSchema;
-        try parsed.value.validateReadOnlyMvp();
+        try parsed.value.validateSupported();
         const borrowed: @import("../serverless/external_source/schema_binding.zig").OwnedExternalTableBinding = .{ .binding = parsed.value, .table_id = undefined, .source_uri = undefined, .schema_fingerprint = undefined };
         break :blk try @import("../serverless/external_source/schema_binding.zig").cloneAlloc(alloc, borrowed);
     } else blk: {

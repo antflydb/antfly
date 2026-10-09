@@ -20,6 +20,8 @@ from .aggregation_request import AggregationRequest
 from .aggregation_request_sub_aggregations import AggregationRequestSubAggregations
 from .aggregation_result import AggregationResult
 from .aggregation_type import AggregationType
+from .algebraic_aggregate_config import AlgebraicAggregateConfig
+from .algebraic_aggregate_config_op import AlgebraicAggregateConfigOp
 from .algebraic_aggregation_join import AlgebraicAggregationJoin
 from .algebraic_aggregation_join_kind import AlgebraicAggregationJoinKind
 from .algebraic_index_config import AlgebraicIndexConfig
@@ -309,6 +311,7 @@ from .external_lake_snapshot_selector_mode import ExternalLakeSnapshotSelectorMo
 from .external_lake_table_source import ExternalLakeTableSource
 from .external_lake_table_source_format import ExternalLakeTableSourceFormat
 from .external_lake_table_source_kind import ExternalLakeTableSourceKind
+from .external_lake_table_source_object_mutability import ExternalLakeTableSourceObjectMutability
 from .external_lake_table_source_write_policy import ExternalLakeTableSourceWritePolicy
 from .extraction_attribute_group import ExtractionAttributeGroup
 from .extraction_attribute_label import ExtractionAttributeLabel
@@ -934,6 +937,19 @@ from .join_profile import JoinProfile
 from .join_strategy import JoinStrategy
 from .join_type import JoinType
 from .key_range import KeyRange
+from .lake_catalog_commit_request import LakeCatalogCommitRequest
+from .lake_catalog_commit_request_requirements_item import LakeCatalogCommitRequestRequirementsItem
+from .lake_catalog_commit_request_updates_item import LakeCatalogCommitRequestUpdatesItem
+from .lake_catalog_config import LakeCatalogConfig
+from .lake_catalog_config_type import LakeCatalogConfigType
+from .lake_catalog_create_request import LakeCatalogCreateRequest
+from .lake_catalog_create_request_partition_spec import LakeCatalogCreateRequestPartitionSpec
+from .lake_catalog_create_request_properties import LakeCatalogCreateRequestProperties
+from .lake_catalog_create_request_schema import LakeCatalogCreateRequestSchema
+from .lake_catalog_create_request_write_order import LakeCatalogCreateRequestWriteOrder
+from .lake_catalog_response import LakeCatalogResponse
+from .lake_catalog_response_metadata import LakeCatalogResponseMetadata
+from .lake_catalog_response_state import LakeCatalogResponseState
 from .legacy_graph_document_query import LegacyGraphDocumentQuery
 from .legacy_graph_node_selector import LegacyGraphNodeSelector
 from .legacy_graph_query import LegacyGraphQuery
@@ -1318,6 +1334,7 @@ from .table_status import TableStatus
 from .table_storage_mode import TableStorageMode
 from .table_storage_settings import TableStorageSettings
 from .table_storage_settings_dense_embeddings import TableStorageSettingsDenseEmbeddings
+from .table_storage_settings_engine import TableStorageSettingsEngine
 from .table_storage_unreadable_error import TableStorageUnreadableError
 from .table_storage_unreadable_error_code import TableStorageUnreadableErrorCode
 from .tablespace_catalog_record import TablespaceCatalogRecord
@@ -1442,6 +1459,8 @@ __all__ = (
     "AggregationRequestSubAggregations",
     "AggregationResult",
     "AggregationType",
+    "AlgebraicAggregateConfig",
+    "AlgebraicAggregateConfigOp",
     "AlgebraicAggregationJoin",
     "AlgebraicAggregationJoinKind",
     "AlgebraicIndexConfig",
@@ -1729,6 +1748,7 @@ __all__ = (
     "ExternalLakeTableSource",
     "ExternalLakeTableSourceFormat",
     "ExternalLakeTableSourceKind",
+    "ExternalLakeTableSourceObjectMutability",
     "ExternalLakeTableSourceWritePolicy",
     "ExtractionAttributeGroup",
     "ExtractionAttributeLabel",
@@ -2346,6 +2366,19 @@ __all__ = (
     "JoinStrategy",
     "JoinType",
     "KeyRange",
+    "LakeCatalogCommitRequest",
+    "LakeCatalogCommitRequestRequirementsItem",
+    "LakeCatalogCommitRequestUpdatesItem",
+    "LakeCatalogConfig",
+    "LakeCatalogConfigType",
+    "LakeCatalogCreateRequest",
+    "LakeCatalogCreateRequestPartitionSpec",
+    "LakeCatalogCreateRequestProperties",
+    "LakeCatalogCreateRequestSchema",
+    "LakeCatalogCreateRequestWriteOrder",
+    "LakeCatalogResponse",
+    "LakeCatalogResponseMetadata",
+    "LakeCatalogResponseState",
     "LegacyGraphDocumentQuery",
     "LegacyGraphNodeSelector",
     "LegacyGraphQuery",
@@ -2729,6 +2762,7 @@ __all__ = (
     "TableStorageMode",
     "TableStorageSettings",
     "TableStorageSettingsDenseEmbeddings",
+    "TableStorageSettingsEngine",
     "TableStorageUnreadableError",
     "TableStorageUnreadableErrorCode",
     "TavilySearchConfig",

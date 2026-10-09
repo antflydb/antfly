@@ -332,3 +332,46 @@ Run local correctness tests with the existing lake/iceberg E2E environment:
 ```sh
 uv run --project zig/e2e/antfly --extra lake --extra iceberg pytest -q examples/hackernews/tests
 ```
+
+## Native managed or REST catalog
+
+The native table's `base_source.catalog` selects either `{"type":"managed"}`
+or an external REST catalog. Configuration and durability tradeoffs are described
+in [Native Iceberg catalog authorities](../../docs/design/lake-catalogs.md).
+Generate a complete HN table definition with
+`configure_catalog.py --warehouse gs://BUCKET/hackernews --source-connection hn_source --mode managed`.
+For REST, use `--mode rest --rest-connection hn_catalog --rest-uri https://catalog.example.com`
+and optionally set `--rest-namespace`, `--rest-name`, and `--rest-warehouse`.
+POST the resulting JSON to `/db/v1/tables/hackernews`.
+
+Create the Antfly table first with explicit HN document columns,
+`write_policy: iceberg_writer`, a table-root URI and an `auto` schema fingerprint.
+The first native catalog initialization finalizes that fingerprint.
+
+```sh
+uv run --project examples/hackernews python examples/hackernews/ingest.py \
+  --state /private/tmp/hackernews-writer \
+  --warehouse gs://YOUR-DURABLE-BUCKET/hackernews \
+  --native-endpoint http://localhost:8080/db/v1 \
+  --native-table hackernews run
+```
+
+Set `ANTFLY_API_KEY` in the worker environment when API authentication is enabled.
+Both modes use PyIceberg to produce bounded Parquet files and manifests, then
+commit through Antfly. The worker retains exact pending requests in Antfly Lite
+before sending them. A lost response is recovered before another plan is built.
+Native mode does not write `version-hint.text`; the selected native catalog is
+the sole authority. Backup and restore compare its immutable metadata location
+and table UUID, and reject a checkpoint after the archive advances.
+
+Catalog commit success does not itself publish searchable text/metadata indexes.
+The native WAL-to-Parquet writer and general CDC adapters remain subsequent
+parts of the ingestion design.
+
+Native catalog wire qualification (local S3 protocol fixture and independent
+PyIceberg REST authority, with real manifests/Parquet and daemon restarts):
+
+```sh
+ANTFLY_NATIVE_BINARY=/path/to/antfly ANTFLY_LIBRARY=/path/to/libantfly.dylib \
+  uv run --project examples/hackernews pytest -q examples/hackernews/tests/test_catalog_http.py
+```

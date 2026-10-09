@@ -27011,6 +27011,15 @@ pub fn requiredPermissionForRequest(alloc: std.mem.Allocator, method: http_commo
     if (std.mem.eql(u8, path, routes.Routes.tables)) return switch (method) {
         .GET, .POST, .PUT, .DELETE => null,
     };
+    if (std.mem.startsWith(u8, path, "/tables/")) {
+        const remainder = path["/tables/".len..];
+        if (std.mem.indexOfScalar(u8, remainder, '/')) |separator| {
+            const suffix = remainder[separator + 1 ..];
+            if (std.mem.eql(u8, suffix, "lake/catalog") or std.mem.eql(u8, suffix, "lake/commits") or std.mem.startsWith(u8, suffix, "lake/commits/")) {
+                if (method == .GET or method == .POST) return try tablePermission(alloc, remainder[0..separator], if (method == .GET) .read else .admin);
+            }
+        }
+    }
     if (routes.Routes.matchTableLookup(path)) |lookup| return try tablePermission(alloc, lookup.table_name, .read);
     if (routes.Routes.matchTableDestinationAuthorization(path)) |adoption| return try tablePermission(alloc, adoption.table_name, .admin);
     if (routes.Routes.matchTableQuery(path)) |query| return try tablePermission(alloc, query.table_name, .read);

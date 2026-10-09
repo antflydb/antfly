@@ -5989,6 +5989,126 @@ pub const KeyRange = struct {
     }
 };
 
+pub const LakeCatalogCommitRequest = struct {
+    commit_id: []const u8,
+    expected_metadata_location: []const u8,
+    /// Standard Iceberg REST table requirements, validated against the authoritative state.
+    requirements: []const std.json.ArrayHashMap(std.json.Value),
+    /// Standard Iceberg REST metadata updates. Upload data/delete/manifest files before committing. A lake commit does not establish Antfly index visibility.
+    updates: []const std.json.ArrayHashMap(std.json.Value),
+};
+
+pub const LakeCatalogCreateRequest = struct {
+    /// Stable identifier reused with exactly the same request after timeout or restart.
+    commit_id: []const u8,
+    /// Iceberg schema including schema-id and persistent field IDs.
+    schema: std.json.ArrayHashMap(std.json.Value),
+    partition_spec: ?std.json.ArrayHashMap(std.json.Value) = null,
+    write_order: ?std.json.ArrayHashMap(std.json.Value) = null,
+    properties: ?std.json.ArrayHashMap([]const u8) = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "commit_id", "commit_id", false },
+        .{ "schema", "schema", false },
+        .{ "partition-spec", "partition_spec", true },
+        .{ "write-order", "write_order", true },
+        .{ "properties", "properties", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("commit_id");
+        try jw.write(self.commit_id);
+        try jw.objectField("schema");
+        try jw.write(self.schema);
+        if (self.partition_spec) |value| {
+            try jw.objectField("partition-spec");
+            try jw.write(value);
+        }
+        if (self.write_order) |value| {
+            try jw.objectField("write-order");
+            try jw.write(value);
+        }
+        if (self.properties) |value| {
+            try jw.objectField("properties");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const LakeCatalogResponse = struct {
+    state: []const u8,
+    commit_id: ?[]const u8 = null,
+    /// Opaque request digest for outcome resolution.
+    request_hash: ?[]const u8 = null,
+    metadata_location: ?[]const u8 = null,
+    metadata: ?std.json.ArrayHashMap(std.json.Value) = null,
+    /// False if lake creation committed but native schema binding still needs the same initialization request replayed.
+    binding_ready: ?bool = null,
+    /// A catalog commit alone does not make a matching index publication searchable.
+    searchable: ?bool = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "state", "state", false },
+        .{ "commit_id", "commit_id", true },
+        .{ "request_hash", "request_hash", true },
+        .{ "metadata_location", "metadata_location", true },
+        .{ "metadata", "metadata", true },
+        .{ "binding_ready", "binding_ready", true },
+        .{ "searchable", "searchable", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("state");
+        try jw.write(self.state);
+        if (self.commit_id) |value| {
+            try jw.objectField("commit_id");
+            try jw.write(value);
+        }
+        if (self.request_hash) |value| {
+            try jw.objectField("request_hash");
+            try jw.write(value);
+        }
+        if (self.metadata_location) |value| {
+            try jw.objectField("metadata_location");
+            try jw.write(value);
+        }
+        if (self.metadata) |value| {
+            try jw.objectField("metadata");
+            try jw.write(value);
+        }
+        if (self.binding_ready) |value| {
+            try jw.objectField("binding_ready");
+            try jw.write(value);
+        }
+        if (self.searchable) |value| {
+            try jw.objectField("searchable");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 /// Status of a completed linear merge page. Successful responses are atomic and use "success"; failures are returned as non-2xx HTTP responses.
 pub const LinearMergePageStatus = enum {
     success,

@@ -43,6 +43,7 @@ pub const OpenedObjectStoreResolver = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
+        load_catalog: ?*const fn (*const anyopaque, Allocator, catalog_binding.Binding, external_source.lake_catalog.types.Context) anyerror!external_source.lake_catalog.types.Table = null,
         open: *const fn (
             ptr: *anyopaque,
             alloc: Allocator,
@@ -94,6 +95,8 @@ pub const RemoteUriObjectStoreResolver = struct {
 };
 
 pub const ResolverOptions = struct {
+    catalog_options: @import("antfly_local_sources").serverless_lake_host.OpenOptions = .{},
+    catalog_context: external_source.lake_catalog.types.Context = .{},
     file_bucket: []const u8 = "antfly",
     object_uri_base: ?[]const u8 = null,
     footer_probe_bytes: u64 = 64 * 1024,
@@ -138,7 +141,7 @@ pub const Resolver = struct {
         try scope.validate();
         try request.cancellation.check();
         const binding = request.binding;
-        try binding.validateReadOnlyMvp();
+        try binding.validateSupported();
 
         var opened_store = try self.object_store_resolver.openAlloc(alloc, binding, .{
             .file_bucket = self.options.file_bucket,
@@ -147,7 +150,10 @@ pub const Resolver = struct {
         var read_authority = @import("external_source_read_authority.zig").ReadAuthority{ .inner = opened_store.client, .cancellation = request.cancellation };
         var discovered_source = opened_store;
         discovered_source.client = read_authority.client();
-        var inventory = try inventoryForBindingAlloc(alloc, binding, discovered_source, self.options);
+        var options = self.options;
+        options.catalog_options.catalog_resolver = if (self.object_store_resolver.vtable.load_catalog) |load| .{ .ptr = self.object_store_resolver.ptr, .load_fn = load } else null;
+        options.catalog_context.cancellation = if (request.cancellation.ptr != null and request.cancellation.is_cancelled_fn != null) .{ .ptr = request.cancellation.ptr.?, .is_cancelled_fn = request.cancellation.is_cancelled_fn.? } else null;
+        var inventory = try inventoryForBindingAlloc(alloc, binding, discovered_source, options);
         defer inventory.deinit(alloc);
 
         const artifact_name = try std.fmt.allocPrint(alloc, "{s}.external-files", .{request.table_name});
@@ -201,7 +207,9 @@ fn inventoryForBindingAlloc(
             break :blk enriched;
         },
         .iceberg => blk: {
-            const metadata_uri = try icebergMetadataUriForOpenedStoreAlloc(
+            var catalog_table = if (binding.catalog != null) try source_options.catalog_options.resolveCatalog(alloc, binding, opened_store, source_options.catalog_context) else null;
+            defer if (catalog_table) |*table| table.deinit(alloc);
+            const metadata_uri = if (catalog_table) |table| try alloc.dupe(u8, table.metadata_location) else try icebergMetadataUriForOpenedStoreAlloc(
                 alloc,
                 opened_store.client,
                 opened_store.bucket,
@@ -212,13 +220,14 @@ fn inventoryForBindingAlloc(
                 source_options.max_listing_objects,
             );
             defer alloc.free(metadata_uri);
-            var snapshot = try lake_iceberg_snapshot.readSnapshotInventoryAndDeletePlanAlloc(alloc, .{
+            const snapshot_request: lake_iceberg_snapshot.SnapshotReadRequest = .{
                 .client = opened_store.client,
                 .source_id = binding.table_id,
                 .metadata_uri = metadata_uri,
                 .requested_snapshot_id = binding.snapshot_mode.pinnedSnapshotId(),
                 .limits = source_options.iceberg_read_limits,
-            });
+            };
+            var snapshot = if (catalog_table) |table| try lake_iceberg_snapshot.planSnapshotInventoryAndDeletePlanFromMetadataAlloc(alloc, snapshot_request, table.metadata_json) else try lake_iceberg_snapshot.readSnapshotInventoryAndDeletePlanAlloc(alloc, snapshot_request);
             defer snapshot.deinit(alloc);
             try lake_iceberg_snapshot.pinInventoryDataFileObjectVersions(
                 alloc,

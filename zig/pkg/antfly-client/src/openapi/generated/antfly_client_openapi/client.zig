@@ -392,6 +392,10 @@ pub const GetDocumentArtifactManifestParams = struct {
     detail: ?[]const u8 = null,
 };
 
+pub const GetLakeCommitOutcomeParams = struct {
+    request_hash: []const u8,
+};
+
 /// Success payload selected by HTTP status, never by trial-decoding another status's schema.
 pub const UpdateSchemaResponse = union(enum) {
     status_200: types.Table,
@@ -3028,6 +3032,70 @@ pub const Client = struct {
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
         return ApiResponse(types.IndexMaintenanceResponse).fromResponse(self.allocator, &resp);
+    }
+
+    /// getLakeCatalog
+    /// GET /db/v1/tables/{tableName}/lake/catalog
+    pub fn getLakeCatalog(self: *@This(), table_name: []const u8) !ApiResponse(types.LakeCatalogResponse) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/lake/catalog", .{ self.base_url, encoded_table_name });
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.LakeCatalogResponse).fromResponse(self.allocator, &resp);
+    }
+
+    /// initializeLakeCatalog
+    /// POST /db/v1/tables/{tableName}/lake/catalog
+    pub fn initializeLakeCatalog(self: *@This(), table_name: []const u8, body: types.LakeCatalogCreateRequest) !ApiResponse(types.LakeCatalogResponse) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/lake/catalog", .{ self.base_url, encoded_table_name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.LakeCatalogResponse).fromResponse(self.allocator, &resp);
+    }
+
+    /// commitLakeCatalog
+    /// POST /db/v1/tables/{tableName}/lake/commits
+    pub fn commitLakeCatalog(self: *@This(), table_name: []const u8, body: types.LakeCatalogCommitRequest) !ApiResponse(types.LakeCatalogResponse) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/lake/commits", .{ self.base_url, encoded_table_name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.LakeCatalogResponse).fromResponse(self.allocator, &resp);
+    }
+
+    /// getLakeCommitOutcome
+    /// GET /db/v1/tables/{tableName}/lake/commits/{commitId}
+    pub fn getLakeCommitOutcome(self: *@This(), table_name: []const u8, commit_id: []const u8, params: GetLakeCommitOutcomeParams) !ApiResponse(types.LakeCatalogResponse) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_commit_id = try httpx.PercentEncoding.encode(self.allocator, commit_id);
+        defer self.allocator.free(encoded_commit_id);
+        var url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/lake/commits/{s}", .{ self.base_url, encoded_table_name, encoded_commit_id });
+        defer self.allocator.free(url);
+        var query_buf = std.ArrayListUnmanaged(u8).empty;
+        defer query_buf.deinit(self.allocator);
+        var sep: u8 = '?';
+        const encoded_query_value_request_hash = try httpx.PercentEncoding.encode(self.allocator, params.request_hash);
+        defer self.allocator.free(encoded_query_value_request_hash);
+        try query_buf.appendSlice(self.allocator, &.{sep});
+        try query_buf.appendSlice(self.allocator, "request_hash=");
+        try query_buf.appendSlice(self.allocator, encoded_query_value_request_hash);
+        sep = '&';
+        if (query_buf.items.len > 0) {
+            const new_url = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ url, query_buf.items });
+            self.allocator.free(url);
+            url = new_url;
+        }
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.LakeCatalogResponse).fromResponse(self.allocator, &resp);
     }
 
     /// Synchronize data from external sources (Shopify, Postgres, S3) using a linear merge

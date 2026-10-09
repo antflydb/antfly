@@ -526,3 +526,69 @@ test "lake SQL object table native API binds storage and fails closed on policy 
     source.unavailable = true;
     try std.testing.expectError(error.RowPolicyCatalogChanged, server.tryObjectTableRequest("docs", .post, "batch", "{\"inserts\":{\"b\":{\"body\":\"beta\"}}}", null, .{}));
 }
+
+test "lake SQL native catalog initialization commits and restart retain authoritative metadata" {
+    const a = std.testing.allocator;
+    const local = @import("antfly_local_sources");
+    const metadata = @import("../metadata/table_manager.zig");
+    const metadata_api = @import("../metadata/api.zig");
+    const api = @import("lake_catalog_http.zig");
+    const Source = struct {
+        table: [1]metadata.TableRecord,
+        fn snapshot(raw: *anyopaque, ctx: operation.RequestContext) !?metadata_api.AdminSnapshot {
+            try ctx.ensureActive();
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return .{ .status = .{ .metadata_group_id = 1, .metrics = .{} }, .tables = &self.table, .ranges = &.{}, .stores = &.{}, .placement_intents = &.{}, .split_transitions = &.{}, .merge_transitions = &.{} };
+        }
+        fn free(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+        fn replace(raw: *anyopaque, expected: metadata.TableRecord, replacement: metadata.TableRecord) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (!metadata.tableDefinitionsEqual(self.table[0], expected)) return error.TableGenerationChanged;
+            const owned = try std.testing.allocator.dupe(u8, replacement.schema_json);
+            std.testing.allocator.free(self.table[0].schema_json);
+            self.table[0].schema_json = owned;
+        }
+    };
+    var directory = try local.common_test_directory.TestDirectory.init("native-catalog-api");
+    defer directory.cleanup();
+    const uri = try std.fmt.allocPrint(a, "file://{s}/warehouse", .{directory.path()});
+    defer a.free(uri);
+    var schema = try std.json.parseFromSlice(std.json.Value, a, Fixture.native_schema, .{});
+    defer schema.deinit();
+    const base_source = try std.json.Stringify.valueAlloc(a, .{ .kind = "external", .format = "iceberg", .uri = uri, .table_id = "hn", .schema_fingerprint = "auto", .write_policy = "iceberg_writer", .catalog = .{ .type = "managed" } }, .{});
+    defer a.free(base_source);
+    var base = try std.json.parseFromSlice(std.json.Value, a, base_source, .{});
+    defer base.deinit();
+    try schema.value.object.put(schema.arena.allocator(), "base_source", base.value);
+    var source: Source = .{ .table = .{.{ .table_id = 7, .name = "hn", .schema_json = try std.json.Stringify.valueAlloc(a, schema.value, .{}), .indexes_json = "{}" }} };
+    defer a.free(source.table[0].schema_json);
+    var backend = try local.storage_background_runtime.BackendRuntimeHandle.init(a, .{});
+    defer backend.deinit();
+    const status_source: server_mod.StatusSource = .{ .ptr = &source, .vtable = &.{ .status = undefined, .linearizable_snapshot = Source.snapshot, .free_admin_snapshot = Source.free, .replace_table_definition = Source.replace } };
+    const reads_source: reads.TableReadSource = .{ .ptr = &source, .vtable = &.{ .lookup = undefined, .scan = undefined, .query = undefined } };
+    var server = server_mod.ApiHttpServer.init(a, .{ .backend_runtime = backend.ptr(), .deployment_mode = .standalone }, status_source, reads_source, null);
+    defer server.deinit();
+    try std.testing.expectError(error.LakeTableNotFound, api.execute(a, &server, "hn", 7, null, .{}, .{ .action = .load }));
+    const body = "{\"commit_id\":\"initialize\",\"schema\":{\"type\":\"struct\",\"schema-id\":0,\"fields\":[{\"id\":1,\"name\":\"amount\",\"type\":\"long\",\"required\":false}]}}";
+    var initial = try api.execute(a, &server, "hn", 7, null, .{}, .{ .action = .create, .body = body });
+    defer initial.deinit(a);
+    try std.testing.expectEqual(@as(u16, 200), initial.status);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, initial.body, .{});
+    defer parsed.deinit();
+    const commit_body = try std.json.Stringify.valueAlloc(a, .{ .commit_id = "update", .expected_metadata_location = parsed.value.object.get("metadata_location").?.string, .requirements = .{}, .updates = .{.{ .action = "set-properties", .updates = .{ .owner = "hackernews" } }} }, .{});
+    defer a.free(commit_body);
+    var committed = try api.execute(a, &server, "hn", 7, null, .{}, .{ .action = .commit, .body = commit_body });
+    defer committed.deinit(a);
+    try std.testing.expectEqual(@as(u16, 200), committed.status);
+    var outcome = try std.json.parseFromSlice(std.json.Value, a, committed.body, .{});
+    defer outcome.deinit();
+    var restarted = server_mod.ApiHttpServer.init(a, .{ .backend_runtime = backend.ptr(), .deployment_mode = .standalone }, status_source, reads_source, null);
+    defer restarted.deinit();
+    var replay = try api.execute(a, &restarted, "hn", 7, null, .{}, .{ .action = .commit, .body = commit_body });
+    defer replay.deinit(a);
+    try std.testing.expectEqualStrings(committed.body, replay.body);
+    var resolved = try api.execute(a, &restarted, "hn", 7, null, .{}, .{ .action = .resolve, .commit_id = "update", .request_hash = outcome.value.object.get("request_hash").?.string });
+    defer resolved.deinit(a);
+    try std.testing.expect(std.mem.indexOf(u8, resolved.body, "committed") != null);
+    try std.testing.expectError(error.TableGenerationChanged, api.execute(a, &restarted, "hn", 8, null, .{}, .{ .action = .commit, .body = commit_body }));
+}

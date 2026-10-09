@@ -1225,6 +1225,41 @@ pub fn parseRetryIndexBody(allocator: std.mem.Allocator, body: []const u8) !std.
     return std.json.parseFromSlice(antfly_indexes_openapi.IndexMaintenanceRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
+/// getLakeCatalog
+pub const GetLakeCatalogPathParams = struct {
+    table_name: []const u8,
+};
+
+/// initializeLakeCatalog
+pub const InitializeLakeCatalogPathParams = struct {
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for initializeLakeCatalog.
+pub fn parseInitializeLakeCatalogBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.LakeCatalogCreateRequest) {
+    return std.json.parseFromSlice(types.LakeCatalogCreateRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// commitLakeCatalog
+pub const CommitLakeCatalogPathParams = struct {
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for commitLakeCatalog.
+pub fn parseCommitLakeCatalogBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.LakeCatalogCommitRequest) {
+    return std.json.parseFromSlice(types.LakeCatalogCommitRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// getLakeCommitOutcome
+pub const GetLakeCommitOutcomePathParams = struct {
+    table_name: []const u8,
+    commit_id: []const u8,
+};
+
+pub const GetLakeCommitOutcomeParams = struct {
+    request_hash: []const u8,
+};
+
 /// Synchronize data from external sources (Shopify, Postgres, S3) using a linear merge
 pub const LinearMergePathParams = struct {
     /// Name of the table
@@ -1667,6 +1702,10 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/tables/{tableName}/indexes/{indexName}/graph-metrics/{metricName}:{action}", .operation_id = "executeGraphMetricAction", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/indexes/{indexName}/repair", .operation_id = "repairIndex", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/indexes/{indexName}/retry", .operation_id = "retryIndex", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "GET", .path = "/tables/{tableName}/lake/catalog", .operation_id = "getLakeCatalog", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/tables/{tableName}/lake/catalog", .operation_id = "initializeLakeCatalog", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/tables/{tableName}/lake/commits", .operation_id = "commitLakeCatalog", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "GET", .path = "/tables/{tableName}/lake/commits/{commitId}", .operation_id = "getLakeCommitOutcome", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/merge", .operation_id = "linearMerge", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/query", .operation_id = "queryTable", .request_body = .buffered, .streaming_response = true },
     .{ .method = "POST", .path = "/tables/{tableName}/repair/control-jobs", .operation_id = "startTableRepairControlJob", .request_body = .buffered, .streaming_response = false },
@@ -1838,6 +1877,10 @@ pub const routes = [_]Route{
 //   fn executeGraphMetricAction(self: *Impl, ctx: *httpx.Context, table_name: []const u8, index_name: []const u8, metric_name: []const u8, action: []const u8) !httpx.Response
 //   fn repairIndex(self: *Impl, ctx: *httpx.Context, table_name: []const u8, index_name: []const u8) !httpx.Response
 //   fn retryIndex(self: *Impl, ctx: *httpx.Context, table_name: []const u8, index_name: []const u8) !httpx.Response
+//   fn getLakeCatalog(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn initializeLakeCatalog(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn commitLakeCatalog(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn getLakeCommitOutcome(self: *Impl, ctx: *httpx.Context, table_name: []const u8, commit_id: []const u8, params: GetLakeCommitOutcomeParams) !httpx.Response
 //   fn linearMerge(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn queryTable(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn startTableRepairControlJob(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response

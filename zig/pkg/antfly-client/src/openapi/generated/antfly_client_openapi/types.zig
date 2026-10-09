@@ -11656,18 +11656,20 @@ pub const ExternalLakeSnapshotSelector = struct {
     }
 };
 
-/// Read-only authoritative Parquet or Iceberg source. A serving statement pins its inventory and object versions before returning rows.
+/// Authoritative Parquet or Iceberg source. A serving statement pins its inventory and object versions before returning rows. Iceberg catalog commits require an explicit writable catalog binding; ordinary row mutations remain unsupported.
 pub const ExternalLakeTableSource = struct {
     kind: []const u8,
     table_id: []const u8,
     format: []const u8,
     uri: []const u8,
     schema_fingerprint: ?[]const u8 = null,
+    /// iceberg_writer authorizes explicit Iceberg catalog commits and requires catalog plus a current snapshot selector. It does not enable ordinary row batch writes.
     write_policy: ?[]const u8 = null,
     /// Set immutable only when data files are never replaced at an existing URI. Allows authenticated provider-version proofs from retained index generations to be reused for unchanged data files. Metadata and delete files are still verified.
     object_mutability: ?[]const u8 = null,
     credentials: ?ExternalLakeCredentialRef = null,
     snapshot: ?ExternalLakeSnapshotSelector = null,
+    catalog: ?LakeCatalogConfig = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -11680,6 +11682,7 @@ pub const ExternalLakeTableSource = struct {
         .{ "object_mutability", "object_mutability", true },
         .{ "credentials", "credentials", true },
         .{ "snapshot", "snapshot", true },
+        .{ "catalog", "catalog", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -11718,6 +11721,10 @@ pub const ExternalLakeTableSource = struct {
         }
         if (self.snapshot) |value| {
             try jw.objectField("snapshot");
+            try jw.write(value);
+        }
+        if (self.catalog) |value| {
+            try jw.objectField("catalog");
             try jw.write(value);
         }
         try jw.endObject();
@@ -26823,6 +26830,186 @@ pub const KeyRange = struct {
     }
 };
 
+pub const LakeCatalogCommitRequest = struct {
+    commit_id: []const u8,
+    expected_metadata_location: []const u8,
+    /// Standard Iceberg REST table requirements, validated against the authoritative state.
+    requirements: []const std.json.ArrayHashMap(std.json.Value),
+    /// Standard Iceberg REST metadata updates. Upload data/delete/manifest files before committing. A lake commit does not establish Antfly index visibility.
+    updates: []const std.json.ArrayHashMap(std.json.Value),
+};
+
+/// Catalog authority is independent of S3/GCS storage and deployment. managed uses a conditional durable head under the table root. rest uses a named HTTP connection; raw secrets are forbidden. Omit to retain explicit metadata URI/version-hint discovery.
+pub const LakeCatalogConfig = struct {
+    type: []const u8,
+    /// Required for rest. Named external_io/http connection with lake_catalog_read and, for commits, lake_catalog_write capabilities.
+    connection: ?[]const u8 = null,
+    /// Required for rest; catalog base URI whose origin must be allowed by the named connection.
+    uri: ?[]const u8 = null,
+    /// Required nonempty namespace components for rest.
+    namespace: ?[]const []const u8 = null,
+    /// Required table name for rest, distinct from Antfly's logical table name.
+    name: ?[]const u8 = null,
+    /// Optional REST config warehouse selector. Other fields must be omitted for managed.
+    warehouse: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "connection", "connection", true },
+        .{ "uri", "uri", true },
+        .{ "namespace", "namespace", true },
+        .{ "name", "name", true },
+        .{ "warehouse", "warehouse", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.connection) |value| {
+            try jw.objectField("connection");
+            try jw.write(value);
+        }
+        if (self.uri) |value| {
+            try jw.objectField("uri");
+            try jw.write(value);
+        }
+        if (self.namespace) |value| {
+            try jw.objectField("namespace");
+            try jw.write(value);
+        }
+        if (self.name) |value| {
+            try jw.objectField("name");
+            try jw.write(value);
+        }
+        if (self.warehouse) |value| {
+            try jw.objectField("warehouse");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const LakeCatalogCreateRequest = struct {
+    /// Stable identifier reused with exactly the same request after timeout or restart.
+    commit_id: []const u8,
+    /// Iceberg schema including schema-id and persistent field IDs.
+    schema: std.json.ArrayHashMap(std.json.Value),
+    partition_spec: ?std.json.ArrayHashMap(std.json.Value) = null,
+    write_order: ?std.json.ArrayHashMap(std.json.Value) = null,
+    properties: ?std.json.ArrayHashMap([]const u8) = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "commit_id", "commit_id", false },
+        .{ "schema", "schema", false },
+        .{ "partition-spec", "partition_spec", true },
+        .{ "write-order", "write_order", true },
+        .{ "properties", "properties", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("commit_id");
+        try jw.write(self.commit_id);
+        try jw.objectField("schema");
+        try jw.write(self.schema);
+        if (self.partition_spec) |value| {
+            try jw.objectField("partition-spec");
+            try jw.write(value);
+        }
+        if (self.write_order) |value| {
+            try jw.objectField("write-order");
+            try jw.write(value);
+        }
+        if (self.properties) |value| {
+            try jw.objectField("properties");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const LakeCatalogResponse = struct {
+    state: []const u8,
+    commit_id: ?[]const u8 = null,
+    /// Opaque request digest for outcome resolution.
+    request_hash: ?[]const u8 = null,
+    metadata_location: ?[]const u8 = null,
+    metadata: ?std.json.ArrayHashMap(std.json.Value) = null,
+    /// False if lake creation committed but native schema binding still needs the same initialization request replayed.
+    binding_ready: ?bool = null,
+    /// A catalog commit alone does not make a matching index publication searchable.
+    searchable: ?bool = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "state", "state", false },
+        .{ "commit_id", "commit_id", true },
+        .{ "request_hash", "request_hash", true },
+        .{ "metadata_location", "metadata_location", true },
+        .{ "metadata", "metadata", true },
+        .{ "binding_ready", "binding_ready", true },
+        .{ "searchable", "searchable", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("state");
+        try jw.write(self.state);
+        if (self.commit_id) |value| {
+            try jw.objectField("commit_id");
+            try jw.write(value);
+        }
+        if (self.request_hash) |value| {
+            try jw.objectField("request_hash");
+            try jw.write(value);
+        }
+        if (self.metadata_location) |value| {
+            try jw.objectField("metadata_location");
+            try jw.write(value);
+        }
+        if (self.metadata) |value| {
+            try jw.objectField("metadata");
+            try jw.write(value);
+        }
+        if (self.binding_ready) |value| {
+            try jw.objectField("binding_ready");
+            try jw.write(value);
+        }
+        if (self.searchable) |value| {
+            try jw.objectField("searchable");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 /// Deprecated free-form graph filter accepted by the v0.2 compatibility contract.
 pub const LegacyGraphDocumentQuery = std.json.ArrayHashMap(std.json.Value);
 
@@ -39961,7 +40148,7 @@ pub const TableSchema = struct {
     /// Backend-managed schema generation used for migrations. Omit it from create and update requests.
     version: ?u32 = null,
     storage_mode: ?TableStorageMode = null,
-    /// External tables require relational storage mode and are read-only. Omit for native tables.
+    /// External tables require relational storage mode. Ordinary row writes are read-only; an explicit iceberg_writer catalog binding permits Iceberg file commits. Omit for native tables.
     base_source: ?ExternalLakeTableSource = null,
     /// Immutable typed expressions applied only to absent columns on new writes, never explicit null. Defaults cannot reference columns. A column cannot have both a default and a generated expression. Omission or [] declares none. Relational tables only.
     column_defaults: ?[]const RelationalColumnExpression = null,

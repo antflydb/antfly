@@ -4,6 +4,79 @@
  */
 
 export interface paths {
+    "/db/v1/tables/{tableName}/lake/catalog": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        /**
+         * getLakeCatalog
+         * @description Native Iceberg catalog operation for managed or external REST authority. Catalog mutations require table admin permission and iceberg_writer policy. These endpoints commit already prepared lake files; they do not perform ordinary row mutations or imply index publication.
+         */
+        get: operations["getLakeCatalog"];
+        put?: never;
+        /**
+         * initializeLakeCatalog
+         * @description Native Iceberg catalog operation for managed or external REST authority. Catalog mutations require table admin permission and iceberg_writer policy. These endpoints commit already prepared lake files; they do not perform ordinary row mutations or imply index publication.
+         */
+        post: operations["initializeLakeCatalog"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/lake/commits": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * commitLakeCatalog
+         * @description Native Iceberg catalog operation for managed or external REST authority. Catalog mutations require table admin permission and iceberg_writer policy. These endpoints commit already prepared lake files; they do not perform ordinary row mutations or imply index publication.
+         */
+        post: operations["commitLakeCatalog"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/lake/commits/{commitId}": {
+        parameters: {
+            query: {
+                request_hash: string;
+            };
+            header?: never;
+            path: {
+                tableName: string;
+                commitId: string;
+            };
+            cookie?: never;
+        };
+        /**
+         * getLakeCommitOutcome
+         * @description Native Iceberg catalog operation for managed or external REST authority. Catalog mutations require table admin permission and iceberg_writer policy. These endpoints commit already prepared lake files; they do not perform ordinary row mutations or imply index publication.
+         */
+        get: operations["getLakeCommitOutcome"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/db/v1/status": {
         parameters: {
             query?: never;
@@ -4458,6 +4531,50 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        LakeCatalogCreateRequest: {
+            /** @description Stable identifier reused with exactly the same request after timeout or restart. */
+            commit_id: string;
+            /** @description Iceberg schema including schema-id and persistent field IDs. */
+            schema: {
+                [key: string]: unknown;
+            };
+            "partition-spec"?: {
+                [key: string]: unknown;
+            };
+            "write-order"?: {
+                [key: string]: unknown;
+            };
+            properties?: {
+                [key: string]: string;
+            };
+        };
+        LakeCatalogCommitRequest: {
+            commit_id: string;
+            expected_metadata_location: string;
+            /** @description Standard Iceberg REST table requirements, validated against the authoritative state. */
+            requirements: {
+                [key: string]: unknown;
+            }[];
+            /** @description Standard Iceberg REST metadata updates. Upload data/delete/manifest files before committing. A lake commit does not establish Antfly index visibility. */
+            updates: {
+                [key: string]: unknown;
+            }[];
+        };
+        LakeCatalogResponse: {
+            /** @enum {string} */
+            state: "loaded" | "lake_committed" | "committed" | "not_committed" | "unknown";
+            commit_id?: string;
+            /** @description Opaque request digest for outcome resolution. */
+            request_hash?: string;
+            metadata_location?: string;
+            metadata?: {
+                [key: string]: unknown;
+            };
+            /** @description False if lake creation committed but native schema binding still needs the same initialization request replayed. */
+            binding_ready?: boolean;
+            /** @description A catalog commit alone does not make a matching index publication searchable. */
+            searchable?: boolean;
+        };
         ChatGPTAuthorize: {
             connection_id?: string;
         };
@@ -10188,6 +10305,8 @@ export interface components {
             } | string[];
         };
         QueryRequest: {
+            /** @description Opaque remote index snapshot token returned by a previous query. Required when replaying search_after or search_before against an external table; a changed publication returns 409. */
+            remote_snapshot?: string;
             evaluate?: components["schemas"]["QueryEvaluation"];
             table_target?: components["schemas"]["CatalogTableTarget"];
             /**
@@ -11479,6 +11598,8 @@ export interface components {
         };
         /** @description Fields shared by canonical and stateful query result envelopes. */
         QueryResultBase: {
+            /** @description Opaque remote publication and schema fence to echo with ordered pagination. This token does not grant access or retain the publication. */
+            remote_snapshot?: string;
             /** @description Function evaluation scope, population, usage, and scoped aggregations. */
             evaluation?: {
                 [key: string]: unknown;
@@ -13646,10 +13767,20 @@ export interface components {
             algebraic_planning?: components["schemas"]["GraphAlgebraicPlanningConfig"];
             resolvers?: components["schemas"]["GraphResolverConfig"][];
         };
-        /** @description Schema-derived algebraic sidecar configuration. Public requests may opt into schema derivation, while materializations remain engine-owned. */
+        AlgebraicAggregateConfig: {
+            name: string;
+            /** @enum {string} */
+            op: "count" | "sum" | "avg" | "min" | "max";
+            group_by?: string[];
+            /** @description Required except for count. Omitted count means COUNT(*); a supplied column means COUNT(column), excluding SQL NULL values. */
+            measure?: string;
+        };
+        /** @description Schema-derived algebraic index capabilities with optional declarative aggregate recipes. Physical materialization state remains engine-owned. */
         AlgebraicIndexConfig: {
-            /** @description When true, derive the algebraic capability sidecar from the table schema. Internal fields and materialization definitions are not public API. */
+            /** @description When true, derive typed fields and capabilities from the table schema. Physical fields, laws, joins and state remain engine-owned. */
             derive_from_schema?: boolean;
+            /** @description Desired exact aggregate recipes over schema column names. Eligible SQL automatically reuses complete, snapshot-bound materializations; unsupported SQL shapes retain scanning. */
+            aggregates?: components["schemas"]["AlgebraicAggregateConfig"][];
         };
         /** @enum {string} */
         RelationalExpressionOp: "literal" | "column" | "add" | "subtract" | "multiply" | "divide" | "negate" | "concat" | "coalesce" | "lower_ascii" | "upper_ascii" | "eq" | "ne" | "gt" | "gte" | "lt" | "lte" | "is_null" | "is_not_null" | "is_distinct" | "is_not_distinct" | "and" | "or" | "not";
@@ -13874,7 +14005,22 @@ export interface components {
             /** @description Required for object_version_digest; pins a Parquet object inventory. */
             digest?: string;
         };
-        /** @description Read-only authoritative Parquet or Iceberg source. A serving statement pins its inventory and object versions before returning rows. */
+        /** @description Catalog authority is independent of S3/GCS storage and deployment. managed uses a conditional durable head under the table root. rest uses a named HTTP connection; raw secrets are forbidden. Omit to retain explicit metadata URI/version-hint discovery. */
+        LakeCatalogConfig: {
+            /** @enum {string} */
+            type: "managed" | "rest";
+            /** @description Required for rest. Named external_io/http connection with lake_catalog_read and, for commits, lake_catalog_write capabilities. */
+            connection?: string;
+            /** @description Required for rest; catalog base URI whose origin must be allowed by the named connection. */
+            uri?: string;
+            /** @description Required nonempty namespace components for rest. */
+            namespace?: string[];
+            /** @description Required table name for rest, distinct from Antfly's logical table name. */
+            name?: string;
+            /** @description Optional REST config warehouse selector. Other fields must be omitted for managed. */
+            warehouse?: string;
+        };
+        /** @description Authoritative Parquet or Iceberg source. A serving statement pins its inventory and object versions before returning rows. Iceberg catalog commits require an explicit writable catalog binding; ordinary row mutations remain unsupported. */
         ExternalLakeTableSource: {
             /** @enum {string} */
             kind: "external";
@@ -13885,12 +14031,20 @@ export interface components {
             /** @default auto */
             schema_fingerprint?: string;
             /**
+             * @description iceberg_writer authorizes explicit Iceberg catalog commits and requires catalog plus a current snapshot selector. It does not enable ordinary row batch writes.
              * @default read_only
              * @enum {string}
              */
-            write_policy?: "read_only";
+            write_policy?: "read_only" | "iceberg_writer";
+            /**
+             * @description Set immutable only when data files are never replaced at an existing URI. Allows authenticated provider-version proofs from retained index generations to be reused for unchanged data files. Metadata and delete files are still verified.
+             * @default mutable
+             * @enum {string}
+             */
+            object_mutability?: "mutable" | "immutable";
             credentials?: components["schemas"]["ExternalLakeCredentialRef"];
             snapshot?: components["schemas"]["ExternalLakeSnapshotSelector"];
+            catalog?: components["schemas"]["LakeCatalogConfig"];
         };
         RelationalColumnExpression: {
             column: string;
@@ -14186,7 +14340,7 @@ export interface components {
              */
             readonly version?: number;
             storage_mode?: components["schemas"]["TableStorageMode"];
-            /** @description External tables require relational storage mode and are read-only. Omit for native tables. */
+            /** @description External tables require relational storage mode. Ordinary row writes are read-only; an explicit iceberg_writer catalog binding permits Iceberg file commits. Omit for native tables. */
             base_source?: components["schemas"]["ExternalLakeTableSource"];
             /**
              * @description Immutable typed expressions applied only to absent columns on new
@@ -20960,6 +21114,291 @@ export interface components {
 }
 export type $defs = Record<string, never>;
 export interface operations {
+    getLakeCatalog: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Authoritative catalog result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LakeCatalogResponse"];
+                };
+            };
+            /** @description Invalid or unsupported catalog request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Unauthorized catalog operation */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Table or lake catalog not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Binding, incarnation, or commit conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Catalog authority unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Request deadline exceeded */
+            504: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    initializeLakeCatalog: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["LakeCatalogCreateRequest"];
+            };
+        };
+        responses: {
+            /** @description Authoritative catalog result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LakeCatalogResponse"];
+                };
+            };
+            /** @description Commit outcome is uncertain; resolve or retry the same commit ID and request. Do not checkpoint or delete files yet. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LakeCatalogResponse"];
+                };
+            };
+            /** @description Invalid or unsupported catalog request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Unauthorized catalog operation */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Table or lake catalog not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Binding, incarnation, or commit conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Catalog authority unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Request deadline exceeded */
+            504: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    commitLakeCatalog: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["LakeCatalogCommitRequest"];
+            };
+        };
+        responses: {
+            /** @description Authoritative catalog result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LakeCatalogResponse"];
+                };
+            };
+            /** @description Commit outcome is uncertain; resolve or retry the same commit ID and request. Do not checkpoint or delete files yet. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LakeCatalogResponse"];
+                };
+            };
+            /** @description Invalid or unsupported catalog request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Unauthorized catalog operation */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Table or lake catalog not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Binding, incarnation, or commit conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Catalog authority unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Request deadline exceeded */
+            504: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    getLakeCommitOutcome: {
+        parameters: {
+            query: {
+                request_hash: string;
+            };
+            header?: never;
+            path: {
+                tableName: string;
+                commitId: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Authoritative catalog result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LakeCatalogResponse"];
+                };
+            };
+            /** @description Invalid or unsupported catalog request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Unauthorized catalog operation */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Table or lake catalog not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Binding, incarnation, or commit conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Catalog authority unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Request deadline exceeded */
+            504: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
     getStatus: {
         parameters: {
             query?: never;
@@ -23908,7 +24347,10 @@ export interface operations {
                  * @description Read consistency for the lookup. The default `read_index` routes to
                  *     the primary for linearizable reads. `stale` allows a hot standby to
                  *     serve the lookup at its safe-read LSN.
-                 *     Owned object document tables support only explicit `stale` reads of published generations. The default `read_index` and `leader_lease` are rejected with HTTP 400. Use `sync_level=full_index` on writes to wait for publication before a stale lookup.
+                 *     Owned object document tables support only explicit `stale` reads of
+                 *     published generations. The default `read_index` and `leader_lease`
+                 *     are rejected with HTTP 400. Use `sync_level=full_index` on writes to
+                 *     wait for publication before a stale lookup.
                  */
                 consistency?: "read_index" | "leader_lease" | "stale";
             };

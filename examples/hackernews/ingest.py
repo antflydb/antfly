@@ -159,14 +159,26 @@ class Publisher:
         return version
 
 
-def publish(state, directory, warehouse, project=None):
+def publish(
+    state,
+    directory,
+    warehouse,
+    project=None,
+    native_endpoint=None,
+    native_table="hackernews",
+):
+    from native_catalog import NativeCatalog
     import pyarrow as pa
     import pyarrow.parquet as pq
     import uuid
     from pyiceberg.expressions import In
     from pyiceberg.io.pyarrow import schema_to_pyarrow
 
-    catalog = HackernewsCatalog(state, warehouse)
+    catalog = (
+        NativeCatalog(state, warehouse, native_endpoint, native_table)
+        if native_endpoint
+        else HackernewsCatalog(state, warehouse)
+    )
     catalog.create_namespace_if_not_exists("hackernews")
     schema = arrow_schema()
     table = catalog.create_table_if_not_exists(
@@ -182,14 +194,22 @@ def publish(state, directory, warehouse, project=None):
     pending = state.get("publication", "")
     if pending:
         journal = json.loads(pending)
-        if journal["warehouse"] != warehouse:
+        if (
+            journal["warehouse"] != warehouse
+            or journal.get("native_endpoint") != native_endpoint
+            or journal.get("native_table", "hackernews") != native_table
+        ):
             raise RuntimeError("pending publication belongs to a different warehouse")
         months = journal["months"]
     else:
         months = state.dirty_months()
         if not months:
             return None
-        _, generation = publisher.read("metadata/version-hint.text")
+        _, generation = (
+            (None, None)
+            if native_endpoint
+            else publisher.read("metadata/version-hint.text")
+        )
         # Retry copy-on-write replacements; never append duplicate HN IDs.
         # PyIceberg 0.12 cannot stream RecordBatchReader into partitioned
         # tables. Write bounded month-homogeneous Parquet files, then register
@@ -216,6 +236,8 @@ def publish(state, directory, warehouse, project=None):
                 transaction.add_files(files)
         journal = {
             "warehouse": warehouse,
+            "native_endpoint": native_endpoint,
+            "native_table": native_table,
             "metadata_uri": table.metadata_location,
             "months": months,
             "expected": generation,
@@ -225,9 +247,13 @@ def publish(state, directory, warehouse, project=None):
         # makes failed/lost pointer writes replayable without metadata collisions.
         with state.transaction():
             state.set("publication", json.dumps(journal))
-    with table.io.new_input(journal["metadata_uri"]).open() as source:
-        metadata = source.read()
-    version = publisher.commit(metadata, journal["expected"])
+    if native_endpoint:
+        # The native catalog commit above is the sole lake authority.
+        version = journal["snapshot_id"]
+    else:
+        with table.io.new_input(journal["metadata_uri"]).open() as source:
+            metadata = source.read()
+        version = publisher.commit(metadata, journal["expected"])
     with state.transaction():
         for month in months:
             state.db.delete("dirty:" + month)
@@ -242,7 +268,28 @@ def publish(state, directory, warehouse, project=None):
     }
 
 
-def backup_state(state, directory, backup_root, warehouse, project=None):
+def archive_authority(
+    warehouse, project=None, native_endpoint=None, native_table="hackernews"
+):
+    if native_endpoint:
+        from native_catalog import NativeCatalog
+
+        catalog = NativeCatalog(None, warehouse, native_endpoint, native_table)
+        value = catalog._request("GET", "/lake/catalog")
+        # Immutable metadata location also fences same-snapshot property commits.
+        return value["metadata_location"].encode(), value["metadata"]["table-uuid"]
+    return Publisher(warehouse, project).read("metadata/version-hint.text")
+
+
+def backup_state(
+    state,
+    directory,
+    backup_root,
+    warehouse,
+    project=None,
+    native_endpoint=None,
+    native_table="hackernews",
+):
     """Upload one stable Lite snapshot, then CAS a manifest; no credentials."""
     import hashlib
     import shutil
@@ -250,14 +297,16 @@ def backup_state(state, directory, backup_root, warehouse, project=None):
     import uuid
 
     store = Publisher(backup_root, project)
-    source_pointer, source_generation = Publisher(warehouse, project).read(
-        "metadata/version-hint.text"
+    source_pointer, source_generation = archive_authority(
+        warehouse, project, native_endpoint, native_table
     )
     _, expected = store.read("latest.json")
     checkpoint = uuid.uuid4().hex
     manifest = {
         "checkpoint": checkpoint,
         "warehouse": warehouse,
+        "native_endpoint": native_endpoint,
+        "native_table": native_table,
         "source_pointer": (source_pointer or b"").decode(),
         "source_generation": source_generation,
         "files": {},
@@ -290,7 +339,14 @@ def backup_state(state, directory, backup_root, warehouse, project=None):
     return manifest
 
 
-def restore_state(directory, backup_root, warehouse, project=None):
+def restore_state(
+    directory,
+    backup_root,
+    warehouse,
+    project=None,
+    native_endpoint=None,
+    native_table="hackernews",
+):
     import hashlib
     import os
     import shutil
@@ -303,10 +359,14 @@ def restore_state(directory, backup_root, warehouse, project=None):
     if body is None:
         raise RuntimeError("no published checkpoint")
     manifest = json.loads(body)
-    if manifest["warehouse"] != warehouse:
+    if (
+        manifest["warehouse"] != warehouse
+        or manifest.get("native_endpoint") != native_endpoint
+        or manifest.get("native_table", "hackernews") != native_table
+    ):
         raise RuntimeError("checkpoint warehouse mismatch")
-    pointer, pointer_generation = Publisher(warehouse, project).read(
-        "metadata/version-hint.text"
+    pointer, pointer_generation = archive_authority(
+        warehouse, project, native_endpoint, native_table
     )
     if (pointer or b"").decode() != manifest[
         "source_pointer"
@@ -362,6 +422,10 @@ def main():
         "--warehouse", required=True, help="Dedicated gs:// or file:// Iceberg root"
     )
     parser.add_argument("--project", default="antfly-dev-01")
+    parser.add_argument(
+        "--native-endpoint", help="Antfly API root, e.g. http://localhost:8080/db/v1"
+    )
+    parser.add_argument("--native-table", default="hackernews")
     parser.add_argument("--batch-size", type=int, default=1000)
     parser.add_argument(
         "--backup-root", help="Dedicated gs:// or file:// state checkpoint root"
@@ -393,7 +457,12 @@ def main():
             print(
                 json.dumps(
                     restore_state(
-                        args.state, args.backup_root, args.warehouse, args.project
+                        args.state,
+                        args.backup_root,
+                        args.warehouse,
+                        args.project,
+                        args.native_endpoint,
+                        args.native_table,
                     )
                 )
             )
@@ -401,7 +470,14 @@ def main():
         state = State(args.state / "ingestion.aflite")
         try:
             if state.get("publication", ""):
-                publish(state, args.state, args.warehouse, args.project)
+                publish(
+                    state,
+                    args.state,
+                    args.warehouse,
+                    args.project,
+                    args.native_endpoint,
+                    args.native_table,
+                )
             if args.command == "backup":
                 print(
                     json.dumps(
@@ -411,6 +487,8 @@ def main():
                             args.backup_root,
                             args.warehouse,
                             args.project,
+                            args.native_endpoint,
+                            args.native_table,
                         )
                     )
                 )
@@ -422,7 +500,12 @@ def main():
                     result = None
                     if time.monotonic() >= next_publication:
                         result = publish(
-                            state, args.state, args.warehouse, args.project
+                            state,
+                            args.state,
+                            args.warehouse,
+                            args.project,
+                            args.native_endpoint,
+                            args.native_table,
                         )
                         next_publication = time.monotonic() + args.publish_interval
                     print(
@@ -433,7 +516,14 @@ def main():
                 state.backfill(args.parquet, args.batch_size)
             elif args.command == "poll":
                 print(json.dumps({"fetched": state.poll(firebase, args.batch_size)}))
-            result = publish(state, args.state, args.warehouse, args.project)
+            result = publish(
+                state,
+                args.state,
+                args.warehouse,
+                args.project,
+                args.native_endpoint,
+                args.native_table,
+            )
             print(json.dumps(result))
         finally:
             state.db.close()

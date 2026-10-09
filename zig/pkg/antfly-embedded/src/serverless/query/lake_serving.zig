@@ -403,9 +403,11 @@ pub const ServingSource = struct {
                 .schema_fingerprint = binding.schema_fingerprint,
             }),
             .iceberg => blk: {
-                const uri = try icebergMetadataUriForOpenedStoreAlloc(alloc, client, store.bucket, store.prefix, binding.source_uri, base);
+                var catalog_table = if (binding.catalog != null) try options.resolveCatalog(alloc, binding, store, context) else null;
+                defer if (catalog_table) |*table| table.deinit(alloc);
+                const uri = if (catalog_table) |table| try alloc.dupe(u8, table.metadata_location) else try icebergMetadataUriForOpenedStoreAlloc(alloc, client, store.bucket, store.prefix, binding.source_uri, base);
                 defer alloc.free(uri);
-                const metadata_bytes = try @import("lake_iceberg_snapshot.zig").readFullObjectAlloc(alloc, &client, null, uri, .iceberg_metadata, null, 16 * 1024 * 1024);
+                const metadata_bytes = if (catalog_table) |table| try alloc.dupe(u8, table.metadata_json) else try @import("lake_iceberg_snapshot.zig").readFullObjectAlloc(alloc, &client, null, uri, .iceberg_metadata, null, 16 * 1024 * 1024);
                 defer alloc.free(metadata_bytes);
                 var snapshot: @import("lake_iceberg_snapshot.zig").SnapshotWithDeletePlan = undefined;
                 if (cache) |shared| {

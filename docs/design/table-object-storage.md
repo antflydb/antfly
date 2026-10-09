@@ -225,3 +225,9 @@ Existing lake API and catalog suites cover source reads and sidecar publication.
 
 Direct embedded storage APIs require a hosted object runtime and reject the object
 engine rather than opening a local DB with different durability semantics.
+
+## Iceberg catalog authority
+
+See [Native Iceberg catalog authorities](lake-catalogs.md) for managed object-store
+and external REST configuration, durable commit recovery and the boundary between
+Iceberg commits and searchable index publication.
