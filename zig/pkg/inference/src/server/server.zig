@@ -19943,7 +19943,7 @@ pub const Node = struct {
         for (input.array.items, groups) |raw, *group| {
             group.* = try parseEmbeddingGroup(self, a, manifest, raw, &retained, &budget, .{ .io = io, .control = control }, &.{});
             try grouped.validateGroup(group.*, options);
-            try validateEmbeddingGroupContract(contract, group.*, groups.len);
+            try validateEmbeddingGroupContract(contract, group.*, groups.len, control);
         }
         var handle = try self.model_manager.acquireFromDirWithControl(path, control);
         defer handle.release();
@@ -19993,7 +19993,7 @@ pub const Node = struct {
                     groups[index] = null;
                     break :preflight;
                 };
-                validateEmbeddingGroupContract(contract, groups[index].?, groups.len) catch |err| {
+                validateEmbeddingGroupContract(contract, groups[index].?, groups.len, control) catch |err| {
                     if (request.error_policy == .fail_fast) return err;
                     try errors.append(a, embedItemFailure(index, err, "input"));
                     groups[index] = null;
@@ -23330,6 +23330,7 @@ fn appendResolvedInferenceCapabilities(
         accepts_document,
     );
 
+    const accepts_video = executor_kind == .grouped_dense_embedding and accepts_image;
     try buf.appendSlice(allocator, ",\"inference_capabilities\":{\"version\":4,\"task\":");
     try jsonEncodeString(buf, allocator, resolved_task);
     try buf.appendSlice(allocator, ",\"input_modalities\":[");
@@ -23339,6 +23340,7 @@ fn appendResolvedInferenceCapabilities(
         .{ accepts_image, "image" },
         .{ accepts_audio, "audio" },
         .{ accepts_document, "document" },
+        .{ accepts_video, "video" },
     }) |modality| {
         if (!modality[0]) continue;
         if (modality_index > 0) try buf.append(allocator, ',');
@@ -23363,6 +23365,8 @@ fn appendResolvedInferenceCapabilities(
         .{ accepts_audio and audio_mod.canDecodeMime("audio/caf"), "audio/caf" },
         .{ accepts_audio and audio_mod.canDecodeMime("audio/basic"), "audio/basic" },
         .{ accepts_document, "application/pdf" },
+        .{ accepts_video, "video/mp4" },
+        .{ accepts_video, "video/quicktime" },
     }) |mime| {
         if (!mime[0]) continue;
         if (mime_index > 0) try buf.append(allocator, ',');
@@ -30861,6 +30865,8 @@ const ParsedDenseEmbedInputs = struct {
     texts: std.ArrayListUnmanaged(ParsedTextEmbedInput) = .empty,
     images: std.ArrayListUnmanaged(ParsedBinaryEmbedInput) = .empty,
     audio: std.ArrayListUnmanaged(ParsedBinaryEmbedInput) = .empty,
+    videos: std.ArrayListUnmanaged(ParsedBinaryEmbedInput) = .empty,
+    allow_video: bool = false,
     parse_errors: std.ArrayListUnmanaged(EmbedItemError) = .empty,
     total_count: usize = 0,
 
@@ -30870,6 +30876,8 @@ const ParsedDenseEmbedInputs = struct {
         self.images.deinit(allocator);
         for (self.audio.items) |item| if (item.owned) allocator.free(@constCast(item.bytes));
         self.audio.deinit(allocator);
+        for (self.videos.items) |item| if (item.owned) allocator.free(@constCast(item.bytes));
+        self.videos.deinit(allocator);
         self.parse_errors.deinit(allocator);
     }
 };
@@ -31681,6 +31689,12 @@ fn appendDenseEmbedBinary(
         return;
     }
 
+    if (std.ascii.eqlIgnoreCase(mime_type, "video/mp4") or std.ascii.eqlIgnoreCase(mime_type, "video/quicktime")) {
+        if (!parsed.allow_video or manifest.embedding_style != .embedding_gemma2 or !model_caps.modelAcceptsInput(manifest, "image")) return error.ModelDoesNotSupportVideoInput;
+        try parsed.videos.append(allocator, .{ .index = index, .bytes = bytes, .mime_type = mime_type, .owned = owned });
+        return;
+    }
+
     return error.UnsupportedMediaMimeType;
 }
 
@@ -31783,7 +31797,7 @@ fn hasGroupedEmbeddingInput(input: std.json.Value) bool {
     return false;
 }
 
-fn validateEmbeddingGroupContract(contract: ResolvedInferenceExecutorContract, group: @import("../pipelines/embedding_gemma2.zig").Group, count: usize) !void {
+fn validateEmbeddingGroupContract(contract: ResolvedInferenceExecutorContract, group: @import("../pipelines/embedding_gemma2.zig").Group, count: usize, control: InferenceExecutionControl) !void {
     var text_bytes: usize = if (group.title) |title| title.len else 0;
     var media_bytes: usize = 0;
     var pixels: u64 = 0;
@@ -31809,6 +31823,12 @@ fn validateEmbeddingGroupContract(contract: ResolvedInferenceExecutorContract, g
             has_image = true;
             pixels += try raster.pixels();
         },
+        .video => |bytes| {
+            media_parts += 1;
+            media_bytes += bytes.len;
+            has_image = true;
+            pixels += try @import("../pipelines/embedding_gemma2_video.zig").inspectPixels(bytes, control);
+        },
         .audio => |bytes| {
             media_parts += 1;
             media_bytes += bytes.len;
@@ -31819,6 +31839,8 @@ fn validateEmbeddingGroupContract(contract: ResolvedInferenceExecutorContract, g
 }
 
 fn parseEmbeddingGroup(self: *Node, a: std.mem.Allocator, manifest: *const manifest_mod.ModelManifest, raw: std.json.Value, retained: *ParsedDenseEmbedInputs, budget: *RequestMediaBudget, context: InferenceDownloadRequestContext, attachments: []const httpx.attachment_envelope.Attachment) !@import("../pipelines/embedding_gemma2.zig").Group {
+    retained.allow_video = true;
+    defer retained.allow_video = false;
     const grouped = @import("../pipelines/embedding_gemma2.zig");
     if (raw != .object) return error.InvalidEmbeddingGroup;
     for (raw.object.keys()) |key| if (!std.mem.eql(u8, key, "content") and !std.mem.eql(u8, key, "title")) return error.InvalidEmbeddingGroup;
@@ -31833,8 +31855,9 @@ fn parseEmbeddingGroup(self: *Node, a: std.mem.Allocator, manifest: *const manif
         const texts = retained.texts.items.len;
         const images = retained.images.items.len;
         const audio = retained.audio.items.len;
+        const videos = retained.videos.items.len;
         try appendDenseEmbedInput(self, a, manifest, retained, part, 0, budget, context, attachments);
-        if (retained.texts.items.len > texts) dest.* = .{ .text = retained.texts.items[texts].text } else if (retained.images.items.len > images) dest.* = .{ .image = retained.images.items[images].bytes } else if (retained.audio.items.len > audio) dest.* = .{ .audio = retained.audio.items[audio].bytes } else return error.InvalidEmbeddingGroup;
+        if (retained.texts.items.len > texts) dest.* = .{ .text = retained.texts.items[texts].text } else if (retained.images.items.len > images) dest.* = .{ .image = retained.images.items[images].bytes } else if (retained.audio.items.len > audio) dest.* = .{ .audio = retained.audio.items[audio].bytes } else if (retained.videos.items.len > videos) dest.* = .{ .video = retained.videos.items[videos].bytes } else return error.InvalidEmbeddingGroup;
     }
     return .{ .title = title, .content = parts };
 }
@@ -31853,7 +31876,8 @@ fn embedInputParseErrorMessage(err: anyerror) []const u8 {
         error.MediaContentPartMissingMimeType => "media content part missing 'mime_type' field",
         error.InvalidMediaBase64 => "invalid base64 media data",
         error.MediaDataMimeTypeMismatch => "media data URI mime_type does not match content part mime_type",
-        error.UnsupportedMediaMimeType => "media content part must have an image/* or audio/* mime_type",
+        error.UnsupportedMediaMimeType => "unsupported media MIME type; video groups accept video/mp4 or video/quicktime",
+        error.ModelDoesNotSupportVideoInput => "video requires an ordered EmbeddingGemma 2 content group",
         error.ModelDoesNotSupportTextInput => "model does not support text input",
         error.ModelDoesNotSupportImageInput => "model does not support image input",
         error.ModelDoesNotSupportAudioInput => "model does not support audio input",
@@ -31875,6 +31899,40 @@ fn embedDenseInputFailure(err: anyerror) EmbedDenseInputFailure {
         .message = "insufficient inference capacity is currently available",
     };
     return switch (err) {
+        error.UnsupportedVideoCodec,
+        error.UnsupportedVideoProfile,
+        error.UnsupportedVideoNal,
+        error.UnsupportedVideoDisplay,
+        error.UnsupportedVideoColor,
+        error.MalformedVideoPacket,
+        error.MalformedVideoConfig,
+        error.MissingVideoReference,
+        error.UnsupportedDynamicGeometry,
+        error.IncompleteVideoPicture,
+        error.IncompleteVideoSlice,
+        error.MissingPrimaryVideoSlice,
+        error.MixedVideoPictures,
+        error.OverlappingVideoSlices,
+        error.UnsupportedDynamicVideoConfig,
+        error.EmptyVideo,
+        error.EmptyVideoTrack,
+        error.InvalidSamplingMetadata,
+        error.SamplingOverflow,
+        error.TimestampOverflow,
+        error.MalformedMedia,
+        error.MissingMovieMetadata,
+        error.NoRandomAccessPoint,
+        error.UnsupportedDataReference,
+        error.UnsupportedDisplayGeometry,
+        error.UnsupportedEncryptedMedia,
+        error.UnsupportedFragmentedMp4,
+        error.UnsupportedHybridMp4,
+        error.UnsupportedInterlacedVideo,
+        error.UnsupportedSampleDescription,
+        error.UnsupportedSampleSize,
+        error.UnsupportedTimeline,
+        error.UnsupportedContainer,
+        => .{ .status = 400, .code = "INVALID_VIDEO", .message = "unsupported or corrupt video input" },
         error.ImageDecodeFailed => .{
             .status = 400,
             .code = "INVALID_IMAGE",
@@ -32047,6 +32105,7 @@ fn embedInputItemFailure(index: usize, err: anyerror) EmbedItemError {
         error.ModelDoesNotSupportTextInput,
         error.ModelDoesNotSupportImageInput,
         error.ModelDoesNotSupportAudioInput,
+        error.ModelDoesNotSupportVideoInput,
         => .{
             .index = @intCast(index),
             .code = "UNSUPPORTED_INPUT_MODALITY",
@@ -36004,4 +36063,159 @@ test "embeddinggemma2 linked reduced dimensions match HTTP and preserve ownershi
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+}
+
+test "embeddinggemma2 pretrained video matches official F32 oracle" {
+    const model = platform.env.getenv("ANTFLY_EMBEDDINGGEMMA2_MODEL") orelse return error.SkipZigTest;
+    const oracle = platform.env.getenv("ANTFLY_EMBEDDINGGEMMA2_VIDEO_ORACLE") orelse return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const metal = platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_METAL");
+    var node = try Node.init(a, .{ .models_dir = std.fs.path.dirname(model).?, .allow_unknown_models = true, .process_termination_available = true, .generation_budget_overrides = .{ .host_limit_bytes = 6 * 1024 * 1024 * 1024, .backend_limit_bytes = 12 * 1024 * 1024 * 1024, .combined_limit_bytes = 18 * 1024 * 1024 * 1024, .scratch_limit_bytes = 8 * 1024 * 1024 * 1024 } });
+    defer node.deinit();
+    try node.attachIo(std.testing.io);
+    node.session_manager.required_backend = if (metal) .metal else .native;
+    node.model_manager.session_manager.required_backend = if (metal) .metal else .native;
+    var handle = try node.model_manager.acquireFromDirWithControl(model, node.extractionExecutionControl(null));
+    defer handle.release();
+    const loaded = handle.get();
+    const file = @import("../util/c_file.zig");
+    const json = try file.readFile(a, oracle);
+    defer a.free(json);
+    const reference = try std.json.parseFromSlice(std.json.Value, a, json, .{});
+    defer reference.deinit();
+    try std.testing.expectEqualStrings("914f7f89142e33e77833254d9c9b90c3cef7303b", reference.value.object.get("revision").?.string);
+    try std.testing.expectEqualStrings("float32", reference.value.object.get("precision").?.string);
+    const grouped = @import("../pipelines/embedding_gemma2.zig");
+    const media = @import("antfly_media");
+    const video = @import("../pipelines/embedding_gemma2_video.zig");
+    const Row = struct { name: []const u8, tokens: usize, cosine: f64, max_abs: f64, norm: f64 };
+    var rows: std.ArrayList(Row) = .empty;
+    defer rows.deinit(a);
+    var failures: usize = 0;
+    for (reference.value.object.get("cases").?.array.items) |case| {
+        const name = case.object.get("name").?.string;
+        if (platform.env.getenv("ANTFLY_EMBEDDINGGEMMA2_CASE")) |selected| if (!std.mem.eql(u8, selected, name)) continue;
+        var bytes: std.ArrayList([]u8) = .empty;
+        defer {
+            for (bytes.items) |value| a.free(value);
+            bytes.deinit(a);
+        }
+        var parts: std.ArrayList(grouped.Part) = .empty;
+        defer parts.deinit(a);
+        if (std.mem.eql(u8, name, "text_video")) try parts.append(a, .{ .text = "Describe the action." });
+        for (case.object.get("videos").?.array.items, case.object.get("selected_frames").?.array.items, 0..) |filename, selections, i| {
+            const path = try std.fs.path.join(a, &.{ std.fs.path.dirname(oracle).?, filename.string });
+            defer a.free(path);
+            const clip = try file.readFile(a, path);
+            try bytes.append(a, clip);
+            try parts.append(a, .{ .video = clip });
+            var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = clip }, .identity = path };
+            var reader = try media.mp4.Reader.init(a, &source, .{});
+            defer reader.deinit();
+            const indexes = try video.select(a, &reader);
+            defer a.free(indexes);
+            try std.testing.expectEqual(selections.array.items.len, indexes.len);
+            // Compare logical presentation ordinal, including duplicate selections
+            // and B-picture decode/presentation reordering.
+            for (indexes, selections.array.items) |index, ordinal| {
+                var rank: usize = 0;
+                for (reader.packets, 0..) |packet, j| if (packet.pts < reader.packets[index].pts or (packet.pts == reader.packets[index].pts and j < index)) {
+                    rank += 1;
+                };
+                try std.testing.expectEqual(@as(usize, @intCast(ordinal.integer)), rank);
+            }
+            if (std.mem.eql(u8, name, "two_videos") and i == 0) try parts.append(a, .{ .text = "Compare these clips." });
+        }
+        if (std.mem.eql(u8, name, "video_text")) try parts.append(a, .{ .text = "Describe the action." });
+        const result = try grouped.embed(a, loaded.session, loaded.getTokenizer(), .{ .content = parts.items }, .{}, loaded.embeddingExecutionLock(), node.extractionExecutionControl(null));
+        defer a.free(result.vector);
+        try std.testing.expectEqual(case.object.get("token_ids").?.array.items.len, result.input_tokens);
+        var expected: [768]f32 = undefined;
+        var max_abs: f64 = 0;
+        var norm: f64 = 0;
+        for (&expected, case.object.get("embedding").?.array.items, result.vector) |*dest, value, actual| {
+            dest.* = @floatCast(value.float);
+            max_abs = @max(max_abs, @abs(value.float - actual));
+            norm += @as(f64, actual) * actual;
+        }
+        const cosine = try @import("antfly_decisions").scoring.cosine(result.vector, &expected, 768);
+        std.debug.print("embeddinggemma2 video={s} metal={} tokens={d} cosine={d:.9} max_abs={d:.9}\n", .{ name, metal, result.input_tokens, cosine, max_abs });
+        try rows.append(a, .{ .name = name, .tokens = result.input_tokens, .cosine = cosine, .max_abs = max_abs, .norm = @sqrt(norm) });
+        failures += @intFromBool(cosine < @as(f64, if (metal) 0.9999 else 0.99999) or max_abs > @as(f64, if (metal) 1e-3 else 1e-4));
+        try std.testing.expectApproxEqAbs(@as(f64, 1), @sqrt(norm), 1e-5);
+
+        if (std.mem.eql(u8, name, "text_video")) {
+            const encoded = try a.alloc(u8, std.base64.standard.Encoder.calcSize(bytes.items[0].len));
+            defer a.free(encoded);
+            _ = std.base64.standard.Encoder.encode(encoded, bytes.items[0]);
+            const body = try std.fmt.allocPrint(a, "{{\"model\":\"{s}\",\"dimensions\":128,\"input\":[{{\"content\":[{{\"type\":\"text\",\"text\":\"Describe the action.\"}},{{\"type\":\"media\",\"data\":\"{s}\",\"mime_type\":\"video/mp4\"}}]}}]}}", .{ std.fs.path.basename(model), encoded });
+            defer a.free(body);
+            var request = try httpx.Request.init(a, .POST, "/ai/v1/embed");
+            defer request.deinit();
+            request.body = body;
+            var ctx = httpx.Context.init(a, std.testing.io, &request);
+            defer ctx.deinit();
+            var response = try node.createEmbedding(&ctx);
+            defer response.deinit();
+            errdefer std.debug.print("pretrained video HTTP status={d} body={s}\n", .{ response.status.code, response.body orelse "" });
+            try std.testing.expectEqual(@as(u16, 200), response.status.code);
+            const value = try std.json.parseFromSlice(std.json.Value, a, response.body.?, .{});
+            defer value.deinit();
+            const vector = value.value.object.get("data").?.array.items[0].object.get("embedding").?.array.items;
+            try std.testing.expectEqual(@as(usize, 128), vector.len);
+            var denominator: f64 = 0;
+            for (result.vector[0..128]) |v| denominator += @as(f64, v) * v;
+            for (vector, result.vector[0..128]) |v, expected_value| try std.testing.expectApproxEqAbs(@as(f64, expected_value) / @sqrt(denominator), v.float, 1e-5);
+            try std.testing.expectEqual(@as(usize, 64), value.value.object.get("model_identity").?.string.len);
+            try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
+        }
+    }
+    try std.testing.expect(rows.items.len != 0);
+    if (platform.env.getenv("ANTFLY_EMBEDDINGGEMMA2_VIDEO_REPORT")) |path| {
+        const report = try std.json.Stringify.valueAlloc(a, .{ .backend = if (metal) "metal" else "native", .model_identity = loaded.embedding_identity, .cases = rows.items, .failures = failures }, .{ .whitespace = .indent_2 });
+        defer a.free(report);
+        try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data = report });
+    }
+    try std.testing.expectEqual(@as(usize, 0), failures);
+}
+
+test "embeddinggemma2 video MIME is accepted only inside family ordered groups" {
+    const a = std.testing.allocator;
+    var input_names = [_][]const u8{ "text", "image", "audio" };
+    const manifest = manifest_mod.ModelManifest{ .allocator = a, .embedding_style = .embedding_gemma2, .inputs = &input_names };
+    var parsed = ParsedDenseEmbedInputs{};
+    defer parsed.deinit(a);
+    try std.testing.expectError(error.ModelDoesNotSupportVideoInput, appendDenseEmbedBinary(a, &manifest, &parsed, "mp4", "video/mp4", 0, false));
+    parsed.allow_video = true;
+    try appendDenseEmbedBinary(a, &manifest, &parsed, "mp4", "video/mp4", 0, false);
+    try std.testing.expectEqual(@as(usize, 1), parsed.videos.items.len);
+    var other = manifest;
+    other.embedding_style = .qwen3_embedding;
+    try std.testing.expectError(error.ModelDoesNotSupportVideoInput, appendDenseEmbedBinary(a, &other, &parsed, "mp4", "video/mp4", 0, false));
+    try std.testing.expectError(error.UnsupportedMediaMimeType, appendDenseEmbedBinary(a, &manifest, &parsed, "webm", "video/webm", 0, false));
+    try std.testing.expectEqual(@as(u16, 400), embedDenseInputFailure(error.UnsupportedVideoColor).status);
+}
+
+test "embeddinggemma2 ordered video parser keeps borrowed attachment and caption order" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const raw = try std.json.parseFromSlice(std.json.Value, alloc, "{\"content\":[{\"type\":\"attachment\",\"attachment_index\":0},{\"type\":\"text\",\"text\":\"caption\"}]}", .{});
+    defer raw.deinit();
+    var names = [_][]const u8{ "text", "image", "audio" };
+    const manifest = manifest_mod.ModelManifest{ .allocator = alloc, .embedding_style = .embedding_gemma2, .inputs = &names };
+    var retained = ParsedDenseEmbedInputs{};
+    defer retained.deinit(alloc);
+    var node: Node = undefined;
+    node.config = .{};
+    var budget = RequestMediaBudget.init(64 * 1024 * 1024);
+    const clip = @embedFile("../testdata/video/mjpeg.mov");
+    const group = try parseEmbeddingGroup(&node, alloc, &manifest, raw.value, &retained, &budget, .{ .io = std.testing.io }, &.{.{ .mime_type = "video/quicktime", .data = clip }});
+    try std.testing.expectEqual(@as(usize, 2), group.content.len);
+    try std.testing.expect(group.content[0] == .video and group.content[0].video.ptr == @as([]const u8, clip).ptr);
+    try std.testing.expectEqualStrings("caption", group.content[1].text);
+    try std.testing.expect(!retained.videos.items[0].owned and !retained.allow_video);
+    try @import("../pipelines/embedding_gemma2.zig").validateGroup(group, .{});
+    try std.testing.expect((try @import("../pipelines/embedding_gemma2_video.zig").inspectPixels(clip, .{})) > 0);
 }

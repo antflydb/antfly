@@ -1515,6 +1515,17 @@ pub fn build(b: *std.Build) void {
     // Tests
     const suite = workflows_tests.create(workflow_ctx);
     const tests = suite.tests;
+    b.step("test-embeddinggemma2", "Run the filtered inference suite for EmbeddingGemma 2 qualification").dependOn(&suite.run_tests.step);
+    const video_model_root = b.createModule(.{ .root_source_file = b.path("src/inference_internal.zig"), .target = target, .optimize = optimize });
+    var video_imports = inference_internal_mod.import_table.iterator();
+    while (video_imports.next()) |entry| video_model_root.addImport(entry.key_ptr.*, entry.value_ptr.*);
+    video_model_root.addImport("inference_internal", video_model_root);
+    runtime_build.configureRuntimeLinks(b, video_model_root, target, runtime_config.backend, runtime_config.paths);
+    runtime_build.applyCBindings(video_model_root, runtime_graph.c_bindings);
+    video_model_root.link_libc = runtime_config.backend.link_libc;
+    const video_model_tests = b.addTest(.{ .root_module = video_model_root, .filters = &.{ "embeddinggemma2 video", "embeddinggemma2 Metal video" } });
+    b.step("check-video-model", "Compile video model qualification for cross-platform checks").dependOn(&video_model_tests.step);
+    b.step("test-video-model", "Qualify video processor, token layout and native/Metal buffer lifetime without checkpoint weights").dependOn(&b.addRunArtifact(video_model_tests).step);
     const run_cli_tests = suite.run_cli_tests;
 
     const bge_m3_e2e_bench_tests = bge_benchmark.tests;
@@ -1731,6 +1742,11 @@ pub fn build(b: *std.Build) void {
     tok_test_step.dependOn(&run_tok_tests.step);
     tok_test_step.dependOn(&run_hf_tok_tests.step);
 
+    @import("antfly_media").support.addTests(b, b.path(b.fmt("{s}/lib/media", .{shared_lib_root})), target, optimize);
+    @import("antfly_video").support.addTests(b, b.path(b.fmt("{s}/lib/video", .{shared_lib_root})), target, optimize);
+    default_test_step.dependOn(&b.top_level_steps.get("test-media").?.step);
+    default_test_step.dependOn(&b.top_level_steps.get("test-video").?.step);
+
     const audio_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path(b.fmt("{s}/lib/audio/audio_test_root.zig", .{shared_lib_root})),
@@ -1752,6 +1768,7 @@ pub fn build(b: *std.Build) void {
             .optimize = .safe,
         }),
     });
+    @import("antfly_media").support.attach(b, audio_open_corpus.root_module, b.path(b.fmt("{s}/lib/media", .{shared_lib_root})));
     audio_open_corpus.root_module.link_libc = true;
     const run_audio_open_corpus = b.addRunArtifact(audio_open_corpus);
     run_audio_open_corpus.addPassthruArgs();
@@ -1766,6 +1783,7 @@ pub fn build(b: *std.Build) void {
             .optimize = .fast,
         }),
     });
+    @import("antfly_media").support.attach(b, audio_xiph_corpora_e2e.root_module, b.path(b.fmt("{s}/lib/media", .{shared_lib_root})));
     audio_xiph_corpora_e2e.root_module.link_libc = true;
     const audio_xiph_corpora_e2e_step = b.step("audio-xiph-corpora-e2e", "Build the lib/audio upstream Xiph corpora e2e runner");
     audio_xiph_corpora_e2e_step.dependOn(&audio_xiph_corpora_e2e.step);
@@ -1791,6 +1809,7 @@ pub fn build(b: *std.Build) void {
             .optimize = .fast,
         }),
     });
+    @import("antfly_media").support.attach(b, audio_misc_corpora_e2e.root_module, b.path(b.fmt("{s}/lib/media", .{shared_lib_root})));
     audio_misc_corpora_e2e.root_module.link_libc = true;
     const audio_misc_corpora_e2e_step = b.step("audio-misc-corpora-e2e", "Build the lib/audio external MP3/AAC/MP4 corpora e2e runner");
     audio_misc_corpora_e2e_step.dependOn(&audio_misc_corpora_e2e.step);
@@ -2049,6 +2068,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    @import("antfly_media").support.attach(b, audio_module_tests_all.root_module, b.path(b.fmt("{s}/lib/media", .{shared_lib_root})));
     audio_module_tests_all.root_module.link_libc = true;
     audio_module_test_step.dependOn(&b.addRunArtifact(audio_module_tests_all).step);
 
@@ -2062,6 +2082,7 @@ pub fn build(b: *std.Build) void {
             }),
             .filters = &.{filter},
         });
+        @import("antfly_media").support.attach(b, audio_module_tests.root_module, b.path(b.fmt("{s}/lib/media", .{shared_lib_root})));
         audio_module_tests.root_module.link_libc = true;
         const run_audio_module_tests = b.addRunArtifact(audio_module_tests);
         audio_module_test_step.dependOn(&run_audio_module_tests.step);

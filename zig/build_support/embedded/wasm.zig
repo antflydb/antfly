@@ -382,6 +382,7 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
         .target = wasm_target,
         .optimize = optimize,
     });
+    @import("antfly_media").support.attach(b, wasm_inference_audio_mod, b.path("lib/media"));
     const inference_wasm_inference_mod = b.createModule(.{
         .root_source_file = b.path("pkg/inference/src/wasm_entry.zig"),
         .target = wasm_target,

@@ -1,0 +1,1 @@
+{"clock": "media PTS, movie edit disabled", "ffmpeg": "ffmpeg version 9.0.2 Copyright (c) 2000-2026 the FFmpeg developers", "frames": 66, "height": 480, "input_sha256": "4f74ea595201ba3372c3430eb1b94372dcc70f95372ad82fbcf7083f9363e3cb", "native_pixel_format": "yuv420p", "result": "all native sample hashes match", "width": 854}

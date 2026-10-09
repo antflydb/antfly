@@ -63627,6 +63627,17 @@ static void *termite_metal_buffer_alloc_new(
     }
 }
 
+// Borrow the runtime device; retain a completed external preparation buffer.
+void *termite_metal_decode_runtime_device(termite_metal_decode_runtime *runtime) {
+    return runtime == NULL ? NULL : (__bridge void *)runtime->device;
+}
+void *termite_metal_buffer_retain_external(termite_metal_decode_runtime *runtime, void *handle, size_t length) {
+    if (runtime == NULL || handle == NULL || length == 0) return NULL;
+    id<MTLBuffer> buffer = (__bridge id<MTLBuffer>)handle;
+    if (buffer.device != runtime->device || buffer.length < length) return NULL;
+    return (__bridge_retained void *)buffer;
+}
+
 void *termite_metal_buffer_alloc(termite_metal_decode_runtime *runtime, size_t length, int storage_mode) {
     if (runtime == NULL || runtime->device == nil || length == 0) return NULL;
     // In-frame reuse: serve a same-or-larger released private buffer from the

@@ -332,6 +332,8 @@ pub fn create(config: Config) Graph {
         .optimize = optimize,
     });
 
+    @import("antfly_media").support.attach(b, inference_audio_mod, b.path(pathJoin(b, paths.shared_lib_root, "lib/media")));
+
     const inference_chunker_mod = addOrCreateModule(b, config.register_public_modules, "inference_chunker", .{
         .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "lib/chunker/src/mod.zig")),
         .target = target,
@@ -384,6 +386,9 @@ pub fn create(config: Config) Graph {
         .reader_config_mod = reader_config_mod,
         .inference_client_mod = inference_client_mod,
     });
+    const media_mod = inference_audio_mod.import_table.get("antfly_media").?;
+    inference_mod.addImport("antfly_media", media_mod);
+    @import("antfly_video").support.attach(b, inference_mod, b.path(pathJoin(b, paths.shared_lib_root, "lib/video")), .{ .media = media_mod, .image = image_mod });
     inference_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
     inference_mod.addImport("antfly_extraction_openapi", extraction_openapi_mod);
     inference_mod.addImport("antfly_extracting", extracting_mod);
@@ -406,6 +411,8 @@ pub fn create(config: Config) Graph {
     inference_internal_mod.addImport("inference_fixed_tokenizer_data", inference_fixed_tokenizer_data_mod);
     inference_internal_mod.addImport("antfly_image", image_mod);
     inference_internal_mod.addImport("inference_audio", inference_audio_mod);
+    inference_internal_mod.addImport("antfly_media", media_mod);
+    inference_internal_mod.addImport("antfly_video", inference_mod.import_table.get("antfly_video").?);
     inference_internal_mod.addImport("ml", ml_mod);
     inference_internal_mod.addImport("ml_tabular", ml_tabular_mod);
     if (pjrt_mod) |pjrt| inference_internal_mod.addImport("pjrt", pjrt);
@@ -784,7 +791,7 @@ fn addOrCreateModule(b: *std.Build, register_public_modules: bool, name: []const
     return b.createModule(options);
 }
 
-fn configureRuntimeLinks(
+pub fn configureRuntimeLinks(
     b: *std.Build,
     module: *std.Build.Module,
     target: std.Build.ResolvedTarget,

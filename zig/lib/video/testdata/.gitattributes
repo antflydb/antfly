@@ -1,0 +1,3 @@
+# Raw decoded planes must not undergo text/newline conversion.
+*.nv12 binary
+*.rgba binary

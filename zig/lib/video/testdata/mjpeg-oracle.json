@@ -1,0 +1,66 @@
+{
+  "provenance": "Original Apache-2.0 testsrc2: 8 complete baseline 4:4:4 JPEG samples, 64x48, 4 FPS. FFmpeg RGBA oracle uses neighbor chroma upsampling; no runtime FFmpeg dependency.",
+  "ffmpeg": "ffmpeg version 9.0.2 Copyright (c) 2000-2026 the FFmpeg developers",
+  "packets": [
+    {
+      "pts": 0,
+      "dts": 0,
+      "size": "2549",
+      "pos": "36"
+    },
+    {
+      "pts": 4096,
+      "dts": 4096,
+      "size": "2556",
+      "pos": "2585"
+    },
+    {
+      "pts": 8192,
+      "dts": 8192,
+      "size": "2546",
+      "pos": "5141"
+    },
+    {
+      "pts": 12288,
+      "dts": 12288,
+      "size": "2585",
+      "pos": "7687"
+    },
+    {
+      "pts": 16384,
+      "dts": 16384,
+      "size": "2622",
+      "pos": "10272"
+    },
+    {
+      "pts": 20480,
+      "dts": 20480,
+      "size": "2632",
+      "pos": "12894"
+    },
+    {
+      "pts": 24576,
+      "dts": 24576,
+      "size": "2687",
+      "pos": "15526"
+    },
+    {
+      "pts": 28672,
+      "dts": 28672,
+      "size": "2658",
+      "pos": "18213"
+    }
+  ],
+  "files": [
+    {
+      "file": "mjpeg.mov",
+      "bytes": 21608,
+      "sha256": "333c49a606751e093df1e379ad3046bdf85f0eb05d22ac1888ab199f34eb145f"
+    },
+    {
+      "file": "mjpeg.rgba",
+      "bytes": 98304,
+      "sha256": "d09d3dd66957ae6bc617ea470d62ac43153063bd9205fc867443f106919f9bba"
+    }
+  ]
+}

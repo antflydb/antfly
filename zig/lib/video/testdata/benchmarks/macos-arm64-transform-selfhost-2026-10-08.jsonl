@@ -1,0 +1,10 @@
+{"sample":0,"blocks":1000000,"scalar_ns":8168458,"simd_ns":13536417,"checksum":38939283536}
+{"sample":1,"blocks":1000000,"scalar_ns":8158666,"simd_ns":13464667,"checksum":38939283536}
+{"sample":2,"blocks":1000000,"scalar_ns":8155791,"simd_ns":13463417,"checksum":38939283536}
+{"sample":3,"blocks":1000000,"scalar_ns":8159958,"simd_ns":13495958,"checksum":38939283536}
+{"sample":4,"blocks":1000000,"scalar_ns":8295250,"simd_ns":13646625,"checksum":38939283536}
+{"sample":5,"blocks":1000000,"scalar_ns":9202167,"simd_ns":14076583,"checksum":38939283536}
+{"sample":6,"blocks":1000000,"scalar_ns":8539250,"simd_ns":13817417,"checksum":38939283536}
+{"sample":7,"blocks":1000000,"scalar_ns":7955709,"simd_ns":13446291,"checksum":38939283536}
+{"sample":8,"blocks":1000000,"scalar_ns":7798333,"simd_ns":13999208,"checksum":38939283536}
+{"sample":9,"blocks":1000000,"scalar_ns":8310291,"simd_ns":13695750,"checksum":38939283536}

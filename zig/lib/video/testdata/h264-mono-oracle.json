@@ -1,0 +1,40 @@
+{
+  "cases": [
+    {
+      "name": "h264-mono-8-cavlc",
+      "bit_depth": 8,
+      "mp4_sha256": "1f8de14e80a645eb522146e0acdd34ec9b0710a63e3b1f47add6cc81f5b5f6ac",
+      "sha256": "1408606840c8cf56a5cd7353ec912494413f88663eeaa9b2d5b55927aaf8557c"
+    },
+    {
+      "name": "h264-mono-8-cabac",
+      "bit_depth": 8,
+      "mp4_sha256": "052297358855b4ed7980d49b5e8ac85f68ec63b84b22fdb465cc6b859bc8854b",
+      "sha256": "1408606840c8cf56a5cd7353ec912494413f88663eeaa9b2d5b55927aaf8557c"
+    },
+    {
+      "name": "h264-mono-10-cavlc",
+      "bit_depth": 10,
+      "mp4_sha256": "7e16b1c1765a4ec547cd0decdfd0195b55477fa3fd87c6694330f1c6dabc0972",
+      "sha256": "681e0e57f23225c899307c92c7ce56d78e4bd4e1aa88c1b252938da5a2fd10bc"
+    },
+    {
+      "name": "h264-mono-10-cabac",
+      "bit_depth": 10,
+      "mp4_sha256": "33238565fe7061de9c7985718adeb2a025535c6bbd0b3f2c10f453144ee9ef31",
+      "sha256": "681e0e57f23225c899307c92c7ce56d78e4bd4e1aa88c1b252938da5a2fd10bc"
+    },
+    {
+      "name": "h264-mono-14-cavlc",
+      "bit_depth": 14,
+      "mp4_sha256": "1e8448981b8c4cb2732bf1f641f84318d92a6c9bd84bd1dea3aa39b30728f851",
+      "sha256": "0e04fb78203d1893eb09f11317c89cc9ae1a275398ca10f723e665f20678a2b6"
+    },
+    {
+      "name": "h264-mono-14-cabac",
+      "bit_depth": 14,
+      "mp4_sha256": "0b79af40b65e94cee25f2558506b467296666dffbd356288af2f68b11c20f7a1",
+      "sha256": "0e04fb78203d1893eb09f11317c89cc9ae1a275398ca10f723e665f20678a2b6"
+    }
+  ]
+}

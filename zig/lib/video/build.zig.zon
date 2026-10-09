@@ -1,0 +1,13 @@
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
+.{
+    .name = .antfly_video,
+    .version = "0.0.1",
+    .fingerprint = 0xa3d231e5c71dcbcd,
+    .minimum_zig_version = "0.17.0",
+    .dependencies = .{
+        .antfly_media = .{ .path = "../media" },
+        .antfly_platform = .{ .path = "../platform" },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "build_support.zig", "video_test_root.zig", "video_benchmark_root.zig", "video_import_test_root.zig", "VIDEO.md", "THIRD_PARTY_NOTICES.md", "src", "testdata", "scripts" },
+}

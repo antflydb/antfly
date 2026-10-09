@@ -87,6 +87,8 @@ pub fn create(b: *std.Build) ?Artifacts {
     const conformance_fixtures = shared.conformance_fixtures;
     const target = shared.target;
     const optimize = shared.optimize;
+    @import("antfly_media").support.addTests(b, b.path("lib/media"), target, optimize);
+    @import("antfly_video").support.addTests(b, b.path("lib/video"), target, optimize);
     const vopr_mod = shared.vopr_mod;
     const strip = shared.strip;
     const lmdb_backend = shared.lmdb_backend;
@@ -717,6 +719,8 @@ pub fn create(b: *std.Build) ?Artifacts {
     lib_test_step.dependOn(&run_png_tests.step);
     lib_test_step.dependOn(&run_jpeg2000_decode_tests.step);
     lib_test_step.dependOn(&run_lib_pdf_tests.step);
+    lib_test_step.dependOn(&b.top_level_steps.get("test-media").?.step);
+    lib_test_step.dependOn(&b.top_level_steps.get("test-video").?.step);
     lib_test_step.dependOn(&run_lib_scraping_tests.step);
     lib_test_step.dependOn(&run_hf_tokenizer_tests.step);
     lib_test_step.dependOn(platform_test_step);

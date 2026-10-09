@@ -3089,7 +3089,6 @@ pub const LoadedModel = struct {
         for (optional_sessions, 1..) |session, index| {
             if (session) |component| close_scopes[index] = component.beginClose();
         }
-        defer for (&close_scopes) |*scope| scope.deinit();
         self.native_generation_graph_cache.deinit();
         self.prompt_prefix_cache.deinit();
         self.session.close();
@@ -3105,17 +3104,6 @@ pub const LoadedModel = struct {
         if (self.visual_projection_resource_lease) |*lease| lease.release();
         if (self.audio_projection_resource_lease) |*lease| lease.release();
         if (self.whisper_prompt_cache) |*cache| cache.deinit();
-        if (self.hf_tok) |ht| ht.deinitSelf();
-        if (self.sp_tok) |sp| {
-            sp.deinit();
-            self.allocator.destroy(sp);
-        }
-        if (self.tokenizer_resource_lease) |*lease| lease.release();
-        if (self.chat_tmpl) |ct| {
-            var ct_mut = @constCast(ct);
-            ct_mut.deinit();
-            self.allocator.destroy(ct_mut);
-        }
         if (self.shared_moe_cache) |cache| {
             cache.deinit();
             self.allocator.destroy(cache);
@@ -3131,6 +3119,21 @@ pub const LoadedModel = struct {
         if (self.cleanup_head) |head| {
             head.deinit();
             self.allocator.destroy(head);
+        }
+        // All session/cache/prefetch driver cleanup has returned. End protection
+        // before unrelated host tokenizer/template destruction: large vocabularies
+        // under Debug allocation tracking can otherwise trigger a false restart.
+        for (&close_scopes) |*scope| scope.deinit();
+        if (self.hf_tok) |ht| ht.deinitSelf();
+        if (self.sp_tok) |sp| {
+            sp.deinit();
+            self.allocator.destroy(sp);
+        }
+        if (self.tokenizer_resource_lease) |*lease| lease.release();
+        if (self.chat_tmpl) |ct| {
+            var ct_mut = @constCast(ct);
+            ct_mut.deinit();
+            self.allocator.destroy(ct_mut);
         }
         if (self.resource_lease) |*lease| lease.release();
         self.manifest.deinit();
@@ -13115,6 +13118,49 @@ test "model manager teardown dormant ticket covers nested close without allocati
     scope.deinit();
     try std.testing.expectEqual(@as(usize, 0), domain.watchdog.entries.items.len);
     try std.testing.expectEqual(@as(usize, 1), domain.refs.load(.acquire));
+}
+
+test "model manager teardown disarms driver protection before host tokenizer destruction" {
+    const allocator = std.testing.allocator;
+    var manager = ModelManager.init(allocator, .{ .allocator = allocator, .preferred_backends = &.{.native} });
+    defer manager.deinit();
+    manager.configureAdmissionLimits(.{ .host_limit_bytes = 64 });
+    try manager.ensureResourceOwnerReady();
+    var probe = TeardownTestProbe{};
+    const model = try teardownTestModel(&manager, &probe);
+    const Observer = struct {
+        domain: *TeardownDomain,
+        checking: bool = false,
+        frees: usize = 0,
+        fn alloc(_: *anyopaque, len: usize, alignment: std.mem.Alignment, ret: usize) ?[*]u8 {
+            return std.testing.allocator.rawAlloc(len, alignment, ret);
+        }
+        fn resize(_: *anyopaque, memory: []u8, alignment: std.mem.Alignment, len: usize, ret: usize) bool {
+            return std.testing.allocator.rawResize(memory, alignment, len, ret);
+        }
+        fn remap(_: *anyopaque, memory: []u8, alignment: std.mem.Alignment, len: usize, ret: usize) ?[*]u8 {
+            return std.testing.allocator.rawRemap(memory, alignment, len, ret);
+        }
+        fn free(raw: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.checking) {
+                if (self.domain.watchdog.entries.items.len != 0)
+                    @panic("driver teardown protection extends into host tokenizer destruction");
+                self.frees += 1;
+            }
+            std.testing.allocator.rawFree(memory, alignment, ret);
+        }
+        const vtable = std.mem.Allocator.VTable{ .alloc = alloc, .resize = resize, .remap = remap, .free = free };
+    };
+    var observer = Observer{ .domain = manager.teardown_domain.? };
+    model.hf_tok = try hf_tokenizer.HfTokenizer.loadFromBytes(.{ .ptr = &observer, .vtable = &Observer.vtable },
+        \\{"version":"1.0","model":{"type":"BPE","vocab":{"<unk>":0},"merges":[]}}
+    );
+    observer.checking = true;
+    manager.destroyLoadedModel(model);
+    try std.testing.expect(probe.closed);
+    try std.testing.expect(observer.frees != 0);
+    try std.testing.expectEqual(runtime.tier.memory.AdmissionAmounts{}, manager.admissionController().snapshot());
 }
 
 test "model manager teardown raw session retains monitor and offline driver IO after manager" {

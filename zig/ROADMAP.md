@@ -179,6 +179,10 @@ Primary references:
 - [lib/regex/REGEX.md](lib/regex/REGEX.md)
 - [lib/image/IMAGE.md](lib/image/IMAGE.md)
 - [lib/audio/AUDIO.md](lib/audio/AUDIO.md)
+- [lib/media/MEDIA.md](lib/media/MEDIA.md) — implemented media foundation and planned reader contracts
+- [lib/video/VIDEO.md](lib/video/VIDEO.md) — frame selection, Apple decode/surfaces, and CPU/Metal preparation
+- [Native video inference plan](../docs/plans/native-video-inference.md) — media/video library phases delivered;
+  EmbeddingGemma 2 integration and Metal qualification planned
 
 Near-term goals:
 - keep reusable libraries documented where their implementation lives
@@ -330,6 +334,12 @@ file's own title and a one-line description taken from its first paragraph.
 
 ### Inference
 
+- [lib/media/MEDIA.md](lib/media/MEDIA.md) — Shared media container foundation,
+  packet ownership, and timeline contracts.
+- [lib/video/VIDEO.md](lib/video/VIDEO.md) — Frame selection, native Apple decode, leased
+  surfaces, CPU/Metal preparation, and planned NVIDIA/software backends.
+- [Native video inference plan](../docs/plans/native-video-inference.md) —
+  Media/video library phases delivered; EmbeddingGemma 2 integration and Metal qualification planned.
 - [MANAGERS.md](MANAGERS.md) — Resource and model manager design: why Antfly
   has three cooperating process services.
 - [INFERENCE_CACHING.md](INFERENCE_CACHING.md) — Inference caching: the two

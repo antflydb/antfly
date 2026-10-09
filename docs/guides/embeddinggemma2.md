@@ -1,9 +1,9 @@
 # EmbeddingGemma 2 embeddings and similarity decisions
 
 Antfly runs the open Hugging Face `google/embeddinggemma-2` safetensors checkpoint
-on native CPU and Metal. Text, images, audio and ordered combinations share the
-same embedding space. Video, CUDA, ONNX, PJRT and WebGPU are excluded from this
-implementation. The original EmbeddingGemma, GLiNER, Laya and Jev routes retain
+on native CPU and Metal. Text, images, audio, video and ordered combinations share the
+same embedding space. Video accepts qualified MP4/MOV through ordered groups.
+CUDA, ONNX, PJRT and WebGPU are excluded from this implementation. The original EmbeddingGemma, GLiNER, Laya and Jev routes retain
 their existing contracts.
 
 ## Checkpoint and numerical contract
@@ -22,7 +22,7 @@ A managed registry reference is
 `hf:google/embeddinggemma-2:safetensors@914f7f89142e33e77833254d9c9b90c3cef7303b`.
 
 The runtime validates the text, vision and audio geometry and weight shapes,
-tokenizer BOS/EOS and media tokens, and the pinned image/audio processor. It
+tokenizer BOS/EOS and media tokens, and the pinned image/audio/video processor. It
 accepts BF16 or F32 weights, converts BF16 values exactly to F32, and uses F32
 activations and accumulation on both supported backends. Quantized and implicit
 F16 execution are rejected for this family.
@@ -719,3 +719,34 @@ Earlier focused Debug qualification also verifies that config-probe allocation f
 preserve GLiNER's model-stage HTTP error and metric classification, release
 admission, and allow a subsequent request to recover. The comparison report
 records the initial diagnostic failure and its final passing regression.
+
+
+## Video groups
+
+Submit MP4 or MOV as a `media` part in an ordered group, for example:
+
+```json
+{"model":"embeddinggemma2","input":[{"content":[{"type":"text","text":"Describe the action"},{"type":"media","data":"<base64 MP4>","mime_type":"video/mp4"}]}]}
+```
+
+The existing SDK media types accept these MIME bytes. Binary attachment envelopes
+can carry `video/mp4` or `video/quicktime` without base64 expansion. A group returns
+one joint embedding for its ordered text and selected frames. Audio must be an
+explicit separate part. Frames sample at 1 FPS with a uniform 32-frame cap over the
+whole clip, up to 140 soft tokens each; total wrappers, media and text must fit 8192.
+Video-only groups do not add a text task prefix. Flat video and WebM decoding are
+unsupported. Native CPU uses pure Zig H.264/MJPEG; Metal prefers VideoToolbox for
+eligible static H.264 and consumes completed Metal prepared patch buffers directly.
+Existing vision/projector host boundaries remain. The current model display policy
+requires square pixels, no rotation and supported SDR color metadata (BT.601 default
+when absent); declared VUI/container matrix or range conflicts fail explicitly.
+Six pinned pretrained F32 video cases qualify native CPU and Metal numerical
+parity, including ordered mixed groups, repeated frames and HTTP dimensions.
+JPEG RGB uses the independent Pillow/libjpeg reference policy; default FFmpeg
+MJPEG IDCT can differ. See the [pretrained receipt](../../zig/lib/video/testdata/video-pretrained-validation.md)
+and [VIDEO.md](../../zig/lib/video/VIDEO.md#embeddinggemma-2-model-adapter-2026-10-09).
+
+Model FPS sampling currently requires progressive one-picture-per-sample AVC
+(Baseline/Main/High-family) or MJPEG. PAFF/MBAFF and Extended-profile partition
+transport remain library capabilities; the model adapter rejects them until a
+logical-picture index qualifies their frame-count/FPS semantics.

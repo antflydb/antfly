@@ -118,6 +118,7 @@ pub fn parseConfig(allocator: std.mem.Allocator, bytes: []const u8) !Config {
         try requireString(vision_rope.object, "rope_type", "axial");
         try requireNumber(vision_rope.object, "rope_theta", 100);
         try requireNumber(root, "image_token_id", 258880);
+        try requireNumber(root, "video_token_id", 258884);
         try requireNumber(root, "boi_token_id", 255999);
         try requireNumber(root, "eoi_token_id", 258882);
         try requireNumber(root, "vision_soft_tokens_per_image", 280);
