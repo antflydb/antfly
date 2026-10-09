@@ -548,12 +548,32 @@ pub const Socket = struct {
 
     /// Receives data into the buffer, returning bytes received (0 = EOF).
     pub fn recv(self: *Self, buffer: []u8) !usize {
+        return self.recvControlled(buffer, .{});
+    }
+
+    /// Borrowed controls belong to this calling task, never to the shared
+    /// connection or its reader task. Only the physical receive parks CPU;
+    /// TLS processing and response decoding resume after this call returns.
+    /// A failed reentry rejects the result even if bytes reached the buffer.
+    pub fn recvControlled(self: *Self, buffer: []u8, control: WriteControl) !usize {
         if (buffer.len == 0) return 0;
+        return control.withWait(Socket.recvControlledInner, .{ self, buffer, control });
+    }
+
+    fn recvControlledInner(self: *Self, buffer: []u8, control: WriteControl) !usize {
+        defer if (control.active() and self.native_timeouts and !is_windows)
+            self.setNativeTimeout(posix.SO.RCVTIMEO, self.recv_timeout_ms orelse 0) catch {};
         const operation_deadline_ms = self.socketOperationDeadline(.recv);
         while (true) {
             try self.checkRequestCancellation();
+            try control.check();
             const wait = try self.operationWait(operation_deadline_ms);
-            const received = self.netReadWithTimeout(buffer, wait.timeout_ms) catch |err| {
+            // Keep a single receive and the original deadline. Polling with
+            // competing read futures can consume then discard stream bytes.
+            // The connection owner's watchdog interrupts semantic cancellation.
+            const timeout_ms = try control.timeout(wait.timeout_ms);
+            const received = self.netReadWithTimeout(buffer, timeout_ms) catch |err| {
+                try control.check();
                 if (err == error.Canceled) self.io.recancel();
                 try self.checkRequestCancellation();
                 if (err == error.Timeout or err == error.WouldBlock) {
@@ -563,6 +583,7 @@ pub const Socket = struct {
                 return error.RecvFailed;
             };
             try self.checkRequestDeadline();
+            try control.check();
             return received;
         }
     }
@@ -768,7 +789,7 @@ pub const Socket = struct {
 
     /// Sets the receive timeout in milliseconds.
     pub fn setRecvTimeout(self: *Self, ms: u64) !void {
-        if (self.native_timeouts) return self.setNativeTimeout(posix.SO.RCVTIMEO, ms);
+        if (self.native_timeouts) try self.setNativeTimeout(posix.SO.RCVTIMEO, ms);
         self.recv_timeout_ms = if (ms == 0) null else ms;
     }
 
@@ -936,6 +957,9 @@ pub const SocketIoReader = struct {
     socket: *Socket,
     reader_iface: Io.Reader,
     last_read_error: ?anyerror = null,
+    /// Borrowed by this reader only. A multiplexed connection reader must use
+    /// its own authority rather than retain any individual stream's grant.
+    control: WriteControl = .{},
 
     pub fn init(socket: *Socket, buffer: []u8) SocketIoReader {
         return .{
@@ -947,6 +971,12 @@ pub const SocketIoReader = struct {
                 .end = 0,
             },
         };
+    }
+
+    pub fn initControlled(socket: *Socket, buffer: []u8, control: WriteControl) SocketIoReader {
+        var result = init(socket, buffer);
+        result.control = control;
+        return result;
     }
 
     fn parent(r: *Io.Reader) *SocketIoReader {
@@ -962,7 +992,7 @@ pub const SocketIoReader = struct {
         // Route TLS transport reads through Socket.recv so absolute request
         // deadlines and per-request kernel timeout resets apply consistently.
         p.last_read_error = null;
-        const n = p.socket.recv(dest[0]) catch |err| {
+        const n = p.socket.recvControlled(dest[0], p.control) catch |err| {
             p.last_read_error = err;
             return error.ReadFailed;
         };
@@ -2464,4 +2494,78 @@ test "Socket output wait ownership restores CPU before formatting and rejects fa
     const incomplete = WriteControl{ .ptr = &state, .wait_begin_fn = State.begin };
     try std.testing.expectError(error.InvalidOutputWait, incomplete.withWait(State.operation, .{&state}));
     try std.testing.expectEqual(@as(usize, 0), state.begins);
+}
+
+test "Socket controlled receive fences physical input and rejects denied publication" {
+    if (is_windows) return error.SkipZigTest;
+    const State = struct {
+        mode: enum { success, begin_failure, end_failure, canceled_after_read, deadline_after_read, io_timeout },
+        buffer: *[1]u8,
+        parked: bool = false,
+        begins: usize = 0,
+        ends: usize = 0,
+        fn check(raw: ?*anyopaque) WriteControl.Error!void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.buffer[0] != 'r') return;
+            if (self.mode == .canceled_after_read) return error.Canceled;
+            if (self.mode == .deadline_after_read) return error.Timeout;
+        }
+        fn begin(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try std.testing.expect(!self.parked);
+            self.begins += 1;
+            if (self.mode == .begin_failure) return error.SchedulerClosed;
+            self.parked = true;
+        }
+        fn end(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try std.testing.expect(self.parked);
+            self.ends += 1;
+            if (self.mode == .end_failure) return error.DeadlineExceeded;
+            self.parked = false;
+        }
+    };
+    const io = std.testing.io;
+    for ([_]bool{ false, true }) |use_adapter| for (std.enums.values(@FieldType(State, "mode"))) |mode| {
+        var listener = try TcpListener.init(.{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } }, io);
+        defer listener.deinit();
+        var sender = try Socket.connect(listener.getLocalAddress(), io);
+        defer sender.close();
+        var accepted = try listener.accept();
+        defer accepted.socket.close();
+        try accepted.socket.setRecvTimeout(50);
+        var buffer: [1]u8 = .{0};
+        var state: State = .{ .mode = mode, .buffer = &buffer };
+        const control: WriteControl = .{ .ptr = &state, .check_fn = State.check, .wait_begin_fn = State.begin, .wait_end_fn = State.end };
+        if (mode != .io_timeout) try sender.sendAll("r");
+        var reader_buffer: [0]u8 = .{};
+        var reader = SocketIoReader.initControlled(&accepted.socket, &reader_buffer, control);
+        const result = if (use_adapter) blk: {
+            const count = reader.reader_iface.readSliceShort(&buffer) catch |err| break :blk @as(anyerror!usize, reader.last_read_error orelse err);
+            break :blk @as(anyerror!usize, count);
+        } else accepted.socket.recvControlled(&buffer, control);
+        switch (mode) {
+            .success => {
+                try std.testing.expectEqual(@as(usize, 1), try result);
+                try std.testing.expect(!state.parked);
+            },
+            .begin_failure => {
+                try std.testing.expectError(error.SchedulerClosed, result);
+                try std.testing.expectEqual(@as(u8, 0), buffer[0]);
+                // Denied entry performed no receive; the original byte remains.
+                try std.testing.expectEqual(@as(usize, 1), try accepted.socket.recv(&buffer));
+            },
+            .end_failure => try std.testing.expectError(error.DeadlineExceeded, result),
+            .canceled_after_read => try std.testing.expectError(error.Canceled, result),
+            .deadline_after_read, .io_timeout => try std.testing.expectError(error.Timeout, result),
+        }
+        try std.testing.expectEqual(@as(usize, 1), state.begins);
+        try std.testing.expectEqual(@as(usize, if (mode == .begin_failure) 0 else 1), state.ends);
+        try std.testing.expectEqual(mode == .end_failure, state.parked);
+        if (mode != .io_timeout) try std.testing.expectEqual(@as(u8, 'r'), buffer[0]);
+        // No callback or CPU transition occurs for an empty receive.
+        _ = try accepted.socket.recvControlled(buffer[0..0], control);
+        try std.testing.expectEqual(@as(usize, 1), state.begins);
+        try std.testing.expectEqual(@as(usize, 0), reader.reader_iface.end);
+    };
 }
