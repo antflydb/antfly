@@ -34,7 +34,7 @@ pub fn encode(a: A, block: []const u8) !?[]u8 {
     var maximum: u32 = 0;
     for (1..info.count) |i| {
         const gap = std.mem.readInt(u32, block[21 + i * 4 ..][0..4], .little);
-        if (gap == 0) return error.InvalidChunk;
+        if (gap == 0) return null; // Keep valid legacy repeated ordinals verbatim.
         maximum = @max(maximum, gap);
     }
     const width: u8 = @intCast(32 - @clz(maximum));
@@ -149,6 +149,11 @@ test "sparse packed transport rejects malformed lengths gaps and widths and clea
             raw[8] = 1;
             std.mem.writeInt(u32, raw[9..13], count, .little);
             for (1..count) |i| std.mem.writeInt(u32, raw[21 + i * 4 ..][0..4], 1, .little);
+            // V1 also represents repeated ordinals. Packing positive gaps is
+            // optional and must preserve the raw representation for those.
+            std.mem.writeInt(u32, raw[25..29], 0, .little);
+            try std.testing.expect((try encode(a, &raw)) == null);
+            std.mem.writeInt(u32, raw[25..29], 1, .little);
             const encoded = (try encode(a, &raw)).?;
             defer a.free(encoded);
             const restored = try decode(a, encoded);
