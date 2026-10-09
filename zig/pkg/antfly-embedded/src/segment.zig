@@ -1570,6 +1570,77 @@ pub const SegmentReader = struct {
         return self.v4StoredDocLocation(doc);
     }
 
+    /// Read a bounded document-table span through one block and its lookahead
+    /// row, resolving each block's offsets once. Merge eligibility uses
+    /// these rows without retaining any metadata beyond this call.
+    fn storedLocationMetadataBatch(self: *const SegmentReader, start_doc: u32, out: []V4StoredDocLocation) !usize {
+        return self.storedLocationMetadataBatchKnownFirst(start_doc, out, null);
+    }
+
+    fn storedLocationMetadataBatchKnownFirst(self: *const SegmentReader, start_doc: u32, out: []V4StoredDocLocation, known_first: ?V4StoredDocLocation) !usize {
+        const count = @min(out.len, self.doc_count -| start_doc);
+        if (count == 0) return 0;
+        if (count > stored_fields_block_doc_target + 1) return error.InvalidSegment;
+        const native = self.native orelse {
+            for (out[0..count], 0..) |*location, i| {
+                location.* = (try self.v4StoredDocLocation(start_doc + @as(u32, @intCast(i)))) orelse return error.InvalidSegment;
+                if (location.block_idx != out[0].block_idx) return i + 1;
+            }
+            return count;
+        };
+        const range = &native.range;
+        if (range.num_blocks == 0) return 0;
+        const metadata_source = native.metadata_cache.?.borrowedSource();
+        var entries: [(stored_fields_block_doc_target + 1) * stored_fields_v4_doc_entry_size]u8 = undefined;
+        // The eligibility caller already read the first row. Its raw size
+        // predicts the remaining block capacity, without a duplicate lookup.
+        // Varying document sizes may exceed that estimate; extend geometrically
+        // while rows remain in this block, always within the 129-row bound.
+        const first = known_first orelse (try self.storedLocationMetadata(start_doc)) orelse return error.InvalidSegment;
+        out[0] = first;
+        var loaded: usize = 1;
+        var batch_size: usize = @max(1, @as(usize, @intCast(@as(u64, stored_fields_block_raw_target) / (@as(u64, first.raw_len) + 4))));
+        const offsets_start = range.stored_offset + 21 + @as(u64, range.doc_count) * stored_fields_v4_doc_entry_size;
+        var previous_block = first.block_idx;
+        var block_start = first.block_start;
+        var block_end = first.block_end;
+        for (out[0..count], 0..) |*location, i| {
+            if (i == 0) continue;
+            if (i == loaded) {
+                const end = @min(count, loaded + batch_size);
+                try metadata_source.readInto(range.stored_offset + 21 + (@as(u64, start_doc) + loaded) * stored_fields_v4_doc_entry_size, entries[loaded * stored_fields_v4_doc_entry_size .. end * stored_fields_v4_doc_entry_size]);
+                loaded = end;
+                batch_size = @min(count, batch_size * 4);
+            }
+            const entry = entries[i * stored_fields_v4_doc_entry_size ..][0..stored_fields_v4_doc_entry_size];
+            const id_offset = std.mem.readInt(u64, entry[0..8], .little);
+            const id_length = std.mem.readInt(u32, entry[8..12], .little);
+            const block = std.mem.readInt(u32, entry[12..16], .little);
+            if (block >= range.num_blocks or id_offset > range.id_bytes_length or id_length > range.id_bytes_length - id_offset) return error.InvalidSegment;
+            if (previous_block != block) {
+                var offsets: [16]u8 = @splat(0);
+                if (block == 0) try metadata_source.readInto(offsets_start, offsets[8..]) else try metadata_source.readInto(offsets_start + @as(u64, block - 1) * 8, &offsets);
+                const start = std.mem.readInt(u64, offsets[0..8], .little);
+                const end = std.mem.readInt(u64, offsets[8..16], .little);
+                if (start >= end or end > range.stored_length - range.stored_metadata_length) return error.InvalidSegment;
+                block_start = @intCast(range.stored_offset + range.stored_metadata_length + start);
+                block_end = @intCast(range.stored_offset + range.stored_metadata_length + end);
+                previous_block = block;
+            }
+            location.* = .{
+                .id = &.{},
+                .id_length = id_length,
+                .block_idx = block,
+                .block_start = block_start,
+                .block_end = block_end,
+                .doc_offset = std.mem.readInt(u32, entry[16..20], .little),
+                .raw_len = std.mem.readInt(u32, entry[20..24], .little),
+            };
+            if (block != out[0].block_idx) return i + 1;
+        }
+        return count;
+    }
+
     fn nativeStoredLocationMode(self: *const SegmentReader, doc: u32, identity_allocator: ?Allocator, read_identity: bool) !?V4StoredDocLocation {
         const native = self.native.?;
         const range = &native.range;
@@ -3532,16 +3603,18 @@ fn copyableStoredBlockDocs(input: MergeInput, start_doc_id: u32) !?u32 {
 fn copyableStoredBlockDocsWithMetadata(input: MergeInput, start_doc_id: u32, locations: ?[]SegmentReader.V4StoredDocLocation) !?u32 {
     const reader = input.reader;
     if (reader.storedMetadata()[0] != stored_fields_version_block_compressed) return null;
+    // Reject partial prefixes before reading the following document-table span.
     const first = (try reader.storedLocationMetadata(start_doc_id)) orelse return null;
     if (first.doc_offset != 0) return null;
+    var batch: [stored_fields_block_doc_target + 1]SegmentReader.V4StoredDocLocation = undefined;
+    const length = try reader.storedLocationMetadataBatchKnownFirst(start_doc_id, &batch, first);
+    if (length == 0) return null;
 
     var count: u32 = 0;
     var raw_bytes: usize = 0;
-    var doc_id = start_doc_id;
-    while (doc_id < reader.doc_count) : (doc_id += 1) {
-        const loc = (try reader.storedLocationMetadata(doc_id)) orelse return null;
+    for (batch[0..length], 0..) |loc, index| {
         if (loc.block_idx != first.block_idx) break;
-        if (input.isDeleted(doc_id)) return null;
+        if (input.isDeleted(start_doc_id + @as(u32, @intCast(index)))) return null;
         if (loc.block_start != first.block_start or loc.block_end != first.block_end) return null;
         if (count >= stored_fields_block_doc_target) return null;
         if (locations) |out| out[count] = loc;
@@ -9487,4 +9560,119 @@ test "external lake sorted datetime compaction promotes legacy unsigned sort dom
     try std.testing.expectEqual(typed_dv.ValueType.datetime_ns, values.value_type);
     try std.testing.expectEqual(@as(i128, -9_007_199_254_740_993), (try values.getDateTimeNs(0)).?);
     try std.testing.expectEqual(@as(i128, 9_007_199_254_740_993), (try values.getDateTimeNs(1)).?);
+}
+
+test "stored block metadata batches preserve rows and bound warm cache probes" {
+    const a = std.testing.allocator;
+    var writer = SegmentWriter.init(a);
+    defer writer.deinit();
+    for (0..384) |doc| {
+        var id: [32]u8 = undefined;
+        try writer.addStoredDoc(try std.fmt.bufPrint(&id, "doc-{d}", .{doc}), "small stored document");
+    }
+    const bytes = try writer.build();
+    defer a.free(bytes);
+    const State = struct {
+        bytes: []const u8,
+        fn read(raw: *anyopaque, offset: u64, out: []u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            @memcpy(out, self.bytes[@intCast(offset)..][0..out.len]);
+        }
+        fn close(_: *anyopaque) void {}
+    };
+    var state = State{ .bytes = bytes };
+    var reader = try SegmentReader.initSource(a, .{ .ranges = .{ .ptr = &state, .length = bytes.len, .read_into = State.read, .close = State.close } });
+    defer reader.deinit();
+    const cache = &reader.native.?.metadata_cache.?;
+    // Warm-cache clock increments measure probes/locking, not backing reads.
+    for (0..384) |doc| _ = try reader.storedLocationMetadata(@intCast(doc));
+    var rows: [stored_fields_block_doc_target + 1]SegmentReader.V4StoredDocLocation = undefined;
+    for ([_]u32{ 0, 128, 256, 383 }) |start| {
+        const count = try reader.storedLocationMetadataBatch(start, &rows);
+        try std.testing.expectEqual(@min(rows.len, 384 - start), count);
+        for (rows[0..count], 0..) |row, i| {
+            const point = (try reader.storedLocationMetadata(start + @as(u32, @intCast(i)))).?;
+            try std.testing.expectEqual(point.id_length, row.id_length);
+            try std.testing.expectEqual(point.block_idx, row.block_idx);
+            try std.testing.expectEqual(point.block_start, row.block_start);
+            try std.testing.expectEqual(point.block_end, row.block_end);
+            try std.testing.expectEqual(point.doc_offset, row.doc_offset);
+            try std.testing.expectEqual(point.raw_len, row.raw_len);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), try reader.storedLocationMetadataBatch(384, &rows));
+    try std.testing.expectEqual(@as(usize, 0), try reader.storedLocationMetadataBatch(std.math.maxInt(u32), &rows));
+    var too_many: [stored_fields_block_doc_target + 2]SegmentReader.V4StoredDocLocation = undefined;
+    try std.testing.expectError(error.InvalidSegment, reader.storedLocationMetadataBatch(0, &too_many));
+    var probes: [2]usize = undefined;
+    for ([_]bool{ false, true }, 0..) |batch, variant| {
+        const before = cache.cache.clock;
+        const start = @import("antfly_platform").time.monotonicNs();
+        for (0..100) |_| {
+            if (batch) {
+                try std.testing.expectEqual(@as(?u32, 128), try copyableStoredBlockDocsWithMetadata(.{ .reader = &reader }, 0, rows[0..128]));
+            } else {
+                const first = (try reader.storedLocationMetadata(0)).?;
+                var count: u32 = 0;
+                while (count < reader.doc_count) : (count += 1) {
+                    const row = (try reader.storedLocationMetadata(count)).?;
+                    if (row.block_idx != first.block_idx) break;
+                    rows[count] = row;
+                }
+                try std.testing.expectEqual(@as(u32, 128), count);
+            }
+        }
+        probes[variant] = @intCast(cache.cache.clock - before);
+        std.debug.print("LITE_STORED_METADATA batch={any} rounds=100 cache_probes={d} elapsed_ns={d} table_scratch_bytes={d}\n", .{ batch, probes[variant], @import("antfly_platform").time.monotonicNs() - start, if (batch) @as(usize, (stored_fields_block_doc_target + 1) * stored_fields_v4_doc_entry_size) else 24 });
+    }
+    try std.testing.expect(probes[1] < probes[0] / 16);
+    const before_prefix = cache.cache.clock;
+    try std.testing.expectEqual(@as(?u32, null), try copyableStoredBlockDocsWithMetadata(.{ .reader = &reader }, 1, rows[0..128]));
+    try std.testing.expect(cache.cache.clock - before_prefix <= 3);
+    var memory = try SegmentReader.init(a, bytes);
+    defer memory.deinit();
+    try std.testing.expectEqual(@as(usize, 129), try memory.storedLocationMetadataBatch(0, &rows));
+}
+
+test "stored metadata batches adapt to short blocks and changing document sizes" {
+    const a = std.testing.allocator;
+    var writer = SegmentWriter.init(a);
+    defer writer.deinit();
+    const large = try a.alloc(u8, stored_fields_block_raw_target);
+    defer a.free(large);
+    @memset(large, 'x');
+    for (0..264) |doc| {
+        var id: [32]u8 = undefined;
+        try writer.addStoredDoc(try std.fmt.bufPrint(&id, "doc-{d}", .{doc}), if (doc < 8) large else "small");
+    }
+    const bytes = try writer.build();
+    defer a.free(bytes);
+    const State = struct {
+        bytes: []const u8,
+        fn read(raw: *anyopaque, offset: u64, out: []u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            @memcpy(out, self.bytes[@intCast(offset)..][0..out.len]);
+        }
+        fn close(_: *anyopaque) void {}
+    };
+    var state = State{ .bytes = bytes };
+    var reader = try SegmentReader.initSource(a, .{ .ranges = .{ .ptr = &state, .length = bytes.len, .read_into = State.read, .close = State.close } });
+    defer reader.deinit();
+    var rows: [129]SegmentReader.V4StoredDocLocation = undefined;
+    for ([_]u32{ 0, 1, 7, 8, 136, 263 }) |start| {
+        const count = try reader.storedLocationMetadataBatch(start, &rows);
+        try std.testing.expectEqual(@as(usize, if (start < 8) 2 else if (start == 263) 1 else if (start == 136) 128 else 129), count);
+        for (rows[0..count], 0..) |row, i| {
+            const point = (try reader.storedLocationMetadata(start + @as(u32, @intCast(i)))).?;
+            try std.testing.expectEqual(point.block_idx, row.block_idx);
+            try std.testing.expectEqual(point.raw_len, row.raw_len);
+            try std.testing.expectEqual(point.doc_offset, row.doc_offset);
+        }
+    }
+    const first = (try reader.storedLocationMetadata(0)).?;
+    const before = reader.native.?.metadata_cache.?.cache.clock;
+    for (0..100) |_| try std.testing.expectEqual(@as(usize, 2), try reader.storedLocationMetadataBatchKnownFirst(0, &rows, first));
+    const probes = reader.native.?.metadata_cache.?.cache.clock - before;
+    try std.testing.expect(probes <= 200);
+    std.debug.print("LITE_SHORT_STORED_METADATA rounds=100 cache_probes={d} table_bytes_per_block=24 previous_table_bytes_per_block=3096\n", .{probes});
 }
