@@ -171,6 +171,10 @@ check_lite_bindings() {
   section "Checking the Rust Lite binding"
   cargo test --locked --manifest-path "$repo_root/rs/Cargo.toml" \
     --package antfly-embedded --package antfly-embedded-sys
+  # The SQLx driver is optional; compile it here so its MSRV and API stay
+  # covered even though its integration tests need a native libantfly.
+  cargo test --locked --manifest-path "$repo_root/rs/Cargo.toml" \
+    --package antfly-embedded --features sqlx
 }
 
 check_release() {
