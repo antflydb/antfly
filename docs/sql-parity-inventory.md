@@ -1760,9 +1760,25 @@ revision counters, placement and progress-only phases. Reservations survive
 canceling until canceled, and disappear when metadata publishes the child (not
 only after installation acknowledgements). Native coverage exercises real FK
 begin/receipt transitions, candidate forgery, same-clock plan substitution,
-bounded receipt-skipping and scratch reuse/allocation faults. Initial hidden
-CREATE and restore-plan sources remain unfinished, as do producer reservation
-admission and serving/publication capability barriers.
+bounded receipt-skipping and scratch reuse/allocation faults.
+Hidden FK-bearing CREATE plans also participate through their existing active
+work index, not a scan of terminal publication history. The lexical source
+cursor consumes that range before public table rows, retaining bounded pages,
+exclusive resume and lookahead rewind across the range boundary. Each hidden
+cut verifies the exact work/plan ID, namespace hierarchy, absent public table
+and binding, and ownership of both logical and physical name reservations.
+Its names remain pending-only through `published_hidden` and cancellation;
+the final publish/cancel transaction retires the active-work entry and advances
+the source epoch. Plan/name/work effects are included in replay and equal-clock
+snapshot source comparisons, while receipt progress and support-seal changes
+that do not change the child's name/schema cut do not force a rebuild.
+Native tests check 64-row cuts and document-table handoff, backward retries,
+unchanged preparation allocations after 1000 terminal plans, real hidden
+CREATE authority/replay checks, reservation forgery, exhaustive allocation
+faults, and cancellation retirement across restart. Projection validates the
+plan identity separately from semantic hashing so schema bytes are not hashed
+again merely to select the source cut. Restore-plan sources remain unfinished,
+as do producer reservation admission and serving/publication capability barriers.
 Multi-peer coordinator failover/fault coverage remains to be extended alongside
 serving activation. Pending-generation reservation sources,
 capability barriers and atomic active-root publication still
