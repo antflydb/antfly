@@ -26,6 +26,7 @@ fn initTeam(execution: *scheduler.Execution, allocator: std.mem.Allocator) !runt
             .enter = unsupportedPhase,
             .resize_team = resize,
             .check_lifetime = lifetime,
+            .current_class = currentClass,
         },
         // Protected terminal SQL work must leave the health reserve available.
         .maximum_slots = if (entry.class == .control) 1 else owner.config.slots - owner.config.control_slots,
@@ -36,6 +37,11 @@ fn initTeam(execution: *scheduler.Execution, allocator: std.mem.Allocator) !runt
 fn lifetime(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {
     const execution: *scheduler.Execution = @ptrCast(@alignCast(raw));
     execution.checkLifetime() catch |err| return runtime.error_abi.statusFromError(err);
+    return .ok;
+}
+fn currentClass(raw: *anyopaque, out: *c_int) callconv(.c) runtime.error_abi.Status {
+    const execution: *scheduler.Execution = @ptrCast(@alignCast(raw));
+    out.* = @intCast(@backingInt(execution.retainedClass() catch |err| return runtime.error_abi.statusFromError(err)));
     return .ok;
 }
 
@@ -80,6 +86,7 @@ pub const Completion = struct {
         value.borrow.activate_completion = activate;
         value.borrow.completion_remaining_ns = remaining;
         value.borrow.check_lifetime = @This().lifetime;
+        value.borrow.current_class = @This().currentClass;
         value.borrow.checkpoint = check;
         value.borrow.park = park;
         value.borrow.enter = enter;
@@ -132,6 +139,10 @@ pub const Completion = struct {
     }
     fn lifetime(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {
         from(raw).execution.checkLifetime() catch |err| return runtime.error_abi.statusFromError(err);
+        return .ok;
+    }
+    fn currentClass(raw: *anyopaque, out: *c_int) callconv(.c) runtime.error_abi.Status {
+        out.* = @intCast(@backingInt(from(raw).execution.retainedClass() catch |err| return runtime.error_abi.statusFromError(err)));
         return .ok;
     }
     fn check(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {

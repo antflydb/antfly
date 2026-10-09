@@ -40,10 +40,15 @@ const Receiver = struct {
             .reserve_child = reserveNested,
             .activate_child = activate,
             .check_lifetime = lifetime,
+            .current_class = currentClass,
         };
     }
     fn lifetime(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {
         from(raw).execution.checkLifetime() catch |err| return runtime.error_abi.statusFromError(err);
+        return .ok;
+    }
+    fn currentClass(raw: *anyopaque, out: *c_int) callconv(.c) runtime.error_abi.Status {
+        out.* = @intCast(@backingInt(from(raw).execution.retainedClass() catch |err| return runtime.error_abi.statusFromError(err)));
         return .ok;
     }
     fn check(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {

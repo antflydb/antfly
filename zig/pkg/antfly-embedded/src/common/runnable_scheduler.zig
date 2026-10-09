@@ -767,6 +767,7 @@ pub const Execution = struct {
     pub const Borrow = struct {
         ptr: *anyopaque,
         class: Class,
+        current_class: ?*const fn (*anyopaque) anyerror!Class = null,
         checkpoint: *const fn (*anyopaque) anyerror!void,
         check_lifetime: *const fn (*anyopaque) anyerror!void,
         park: *const fn (*anyopaque, State) anyerror!void,
@@ -782,8 +783,12 @@ pub const Execution = struct {
     }
 
     pub fn retainedClass(self: *const Execution) !Class {
-        if (self.borrowed) |borrow| return borrow.class;
-        return (self.entry orelse return error.InvalidRunnableTransition).class;
+        if (self.borrowed) |borrow| return if (borrow.current_class) |current| current(borrow.ptr) else borrow.class;
+        const entry = if (self.entry) |*value| value else return error.InvalidRunnableTransition;
+        const owner = entry.scheduler orelse return error.InvalidRunnableTransition;
+        owner.lock();
+        defer owner.mutex.unlock();
+        return entry.class;
     }
 
     pub fn start(self: *Execution, scheduler: ?*Scheduler, options: admission.Options, class: Class) !void {

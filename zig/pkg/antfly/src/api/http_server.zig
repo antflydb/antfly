@@ -5512,7 +5512,7 @@ pub const ApiHttpServer = struct {
         }
         fn dispatch(ptr: *anyopaque, alloc: std.mem.Allocator, source: table_reads.TableReadSource, table: []const u8, body: []const u8, filter: ?[]const u8, deadline: ?u64, cancellation: ?CancellationToken) anyerror![]u8 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            const result = try self.server.executePublicTableQueryDispatchWithIdentity(alloc, source, table, body, filter, self.identity, deadline, cancellation, null, null, self.resolver);
+            const result = try self.server.executePublicTableQueryDispatchWithIdentity(alloc, source, table, body, filter, self.identity, deadline, cancellation, null, null, self.resolver, null);
             return result.json;
         }
         fn build(ptr: *anyopaque, alloc: std.mem.Allocator, table: []const u8, value: std.json.Value, deadline: ?u64, cancellation: ?CancellationToken) anyerror!query_api.OwnedQueryRequest {
@@ -5537,6 +5537,7 @@ pub const ApiHttpServer = struct {
             null,
             execution_deadline_ns,
             cancellation,
+            null,
             null,
             null,
             null,
@@ -14525,6 +14526,7 @@ pub const ApiHttpServer = struct {
             null,
             null,
             null,
+            null,
         );
         return response.json;
     }
@@ -14586,6 +14588,7 @@ pub const ApiHttpServer = struct {
                 response_label,
                 bound_join,
                 resolver,
+                null,
             ) catch |err| switch (err) {
                 error.DocIdentityNamespaceMismatch,
                 error.IdentityReadGenerationChanged,
@@ -14713,6 +14716,7 @@ pub const ApiHttpServer = struct {
         body: []const u8,
         borrowed_identity: ?AuthenticatedIdentity,
     ) !query_api.QueryResponse {
+        const normalized = try context.platformDeadline();
         _ = try system_catalog.Target.literal(logical_name);
         const source = self.table_reads orelse return error.TableNotFound;
         var identity = try cloneCatalogIdentity(self.alloc, borrowed_identity);
@@ -14720,7 +14724,7 @@ pub const ApiHttpServer = struct {
         var catalog_arena = std.heap.ArenaAllocator.init(self.alloc);
         defer catalog_arena.deinit();
         var resolver = CatalogQueryResolver{ .arena = catalog_arena.allocator() };
-        var binding = try self.bindCatalogQuery(alloc, context, logical_name, body, &identity, &resolver);
+        var binding = try self.bindCatalogQuery(alloc, normalized, logical_name, body, &identity, &resolver);
         defer binding.deinit();
         const row_filter = try resolveEffectiveRowFilterJson(alloc, identity, binding.physical);
         defer if (row_filter) |value| alloc.free(value);
@@ -14731,11 +14735,12 @@ pub const ApiHttpServer = struct {
             body,
             row_filter,
             identity,
-            context.deadline_ns,
-            context.cancellation,
+            normalized.deadline_ns,
+            normalized.cancellation,
             binding.label,
             if (binding.join) |*join| join else null,
             &resolver,
+            normalized.execution_team,
         ) catch |err| {
             if (query_api.isPublicQueryValidationError(err)) return error.InvalidRetrievalAgentRequest;
             return err;
@@ -14755,6 +14760,7 @@ pub const ApiHttpServer = struct {
         response_label: ?[]const u8,
         bound_join: ?*const distributed_join.ParsedSupportedJoinRequest,
         catalog_resolver: ?*CatalogQueryResolver,
+        execution_team: ?*@import("antfly_runtime_abi").runnable_abi.Team,
     ) !query_api.QueryResponse {
         var catalog_arena = std.heap.ArenaAllocator.init(alloc);
         defer catalog_arena.deinit();
@@ -14777,6 +14783,7 @@ pub const ApiHttpServer = struct {
                 response_label,
                 resolver,
                 resolver.delivery,
+                execution_team,
             ) catch |err| switch (err) {
                 error.InvalidQueryRequest,
                 error.InvalidFilterQueryRequest,
@@ -15453,7 +15460,7 @@ pub const ApiHttpServer = struct {
         response_label: ?[]const u8,
         catalog_resolver: ?*CatalogQueryResolver,
     ) !query_api.QueryResponse {
-        return self.executePlainPublicTableQueryWithDelivery(alloc, source, table_name, body, row_filter_json, authenticated_identity, request_deadline_ns, query_embedding_security_scope, cancellation, response_label, catalog_resolver, null);
+        return self.executePlainPublicTableQueryWithDelivery(alloc, source, table_name, body, row_filter_json, authenticated_identity, request_deadline_ns, query_embedding_security_scope, cancellation, response_label, catalog_resolver, null, null);
     }
 
     fn executePlainPublicTableQueryWithDelivery(
@@ -15470,6 +15477,7 @@ pub const ApiHttpServer = struct {
         response_label: ?[]const u8,
         catalog_resolver: ?*CatalogQueryResolver,
         delivery: ?@import("antfly_local_sources").api_query_response.Delivery,
+        execution_team: ?*@import("antfly_runtime_abi").runnable_abi.Team,
     ) !query_api.QueryResponse {
         var catalog_arena = std.heap.ArenaAllocator.init(alloc);
         defer catalog_arena.deinit();
@@ -15531,7 +15539,7 @@ pub const ApiHttpServer = struct {
         } else if (authenticated_identity) |*identity| {
             attachGraphTableReadAuthorizer(&query_req.req, identity);
         }
-        const lake_request: api_operation.RequestContext = .{ .deadline_ns = request_deadline_ns, .cancellation = cancellation orelse .none };
+        const lake_request: api_operation.RequestContext = .{ .deadline_ns = request_deadline_ns, .cancellation = cancellation orelse .none, .execution_team = execution_team };
         if (try self.queryTableDefinition(resolver.arena, resolver, table_name, lake_request)) |table| {
             if (try @import("lake_index_text_query.zig").executeWithDelivery(alloc, self, table, query_req.req, lake_request, delivery)) |result| return result;
         }
@@ -56867,6 +56875,7 @@ test "api http server executes direct foreign table aggregations through registr
         dummy_source,
         "pg_customers",
         unsupported_body,
+        null,
         null,
         null,
         null,

@@ -22,7 +22,7 @@ pub const Cleanup = struct {
 
     pub fn borrowed(self: *Cleanup) !abi.Borrowed {
         const entry = self.execution.entry orelse return error.InvalidRunnableTransition;
-        return .{ .context = self, .cpu_slots = entry.slots, .parent_class = @intCast(@backingInt(entry.class)), .checkpoint = check, .park = park, .enter = enter, .reserve_cleanup = reserve, .activate_cleanup = activate, .check_lifetime = lifetime };
+        return .{ .context = self, .cpu_slots = entry.slots, .parent_class = @intCast(@backingInt(entry.class)), .checkpoint = check, .park = park, .enter = enter, .reserve_cleanup = reserve, .activate_cleanup = activate, .check_lifetime = lifetime, .current_class = currentClass };
     }
 
     fn from(raw: *anyopaque) *Cleanup {
@@ -62,6 +62,10 @@ pub const Cleanup = struct {
     }
     fn lifetime(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {
         from(raw).execution.checkLifetime() catch |err| return runtime.error_abi.statusFromError(err);
+        return .ok;
+    }
+    fn currentClass(raw: *anyopaque, out: *c_int) callconv(.c) runtime.error_abi.Status {
+        out.* = @intCast(@backingInt(from(raw).execution.retainedClass() catch |err| return runtime.error_abi.statusFromError(err)));
         return .ok;
     }
     fn check(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {

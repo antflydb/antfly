@@ -47,6 +47,16 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, table: local.common_to
     if (req.full_text != null and req.query != .match_all) return error.UnsupportedQueryRequest;
     const normalized = try request.platformDeadline();
     var context: Context = .{ .io = server.embedding_provider_runtime.io, .deadline_ns = normalized.deadline_ns, .cancellation = local.storage_object_storage.CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) };
+    var execution: local.common_request_admission.runnable_scheduler.Execution = .{};
+    defer execution.finish();
+    var execution_bridge: ?@import("runnable_native_borrow.zig").Bridge = if (normalized.execution_team) |team|
+        try @import("runnable_native_borrow.zig").Bridge.init(&team.borrow, team.allocator)
+    else
+        null;
+    if (execution_bridge) |*bridge| {
+        try bridge.bind(&execution);
+        context = context.withExecution(&execution);
+    }
     const authority = server.source.lakeIndexLifecycleAuthority(request) orelse return error.ExternalLakeIndexUnavailable;
     var state = try local.metadata_lake_index_catalog.parse(a, table.lake_index_catalog_json);
     defer state.deinit();

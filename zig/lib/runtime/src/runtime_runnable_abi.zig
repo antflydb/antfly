@@ -9,7 +9,7 @@ const native = @import("runtime_native_abi.zig");
 const errors = @import("runtime_error_abi.zig");
 const http = @import("runtime_http_abi.zig");
 
-pub const abi_version: u32 = 10;
+pub const abi_version: u32 = 11;
 pub const Class = enum(c_int) { query, write, inference, background, control };
 pub const Wait = enum(c_int) { resource, output };
 
@@ -127,6 +127,9 @@ pub const Owner = extern struct {
     /// May run on a physical borrower while this capsule is parked. It checks
     /// retained cancellation/deadline/shutdown state without acquiring CPU.
     check_lifetime: ?*const fn (*anyopaque) callconv(.c) errors.Status = null,
+    /// Observe the retained current phase without acquiring CPU. The original
+    /// parent class in a borrow remains the authority for returning a transfer.
+    current_class: ?*const fn (*anyopaque, *c_int) callconv(.c) errors.Status = null,
 
     pub fn checkLifetime(self: Owner, handle: *anyopaque) !void {
         if (!self.valid()) return error.UnsupportedVersion;
@@ -257,6 +260,16 @@ pub const Borrowed = extern struct {
     /// May run on a physical borrower while this capsule is parked. It checks
     /// retained cancellation/deadline/shutdown state without acquiring CPU.
     check_lifetime: ?*const fn (*anyopaque) callconv(.c) errors.Status = null,
+    current_class: ?*const fn (*anyopaque, *c_int) callconv(.c) errors.Status = null,
+
+    pub fn currentClass(self: Borrowed) !Class {
+        try self.validate();
+        const callback = self.current_class orelse return error.UnsupportedOperation;
+        var class: c_int = undefined;
+        const status = callback(self.context, &class);
+        if (!status.isOk()) return errors.errorFromStatus(status);
+        return std.enums.fromInt(Class, class) orelse error.InvalidArgument;
+    }
 
     pub fn checkLifetime(self: Borrowed) !void {
         try self.validate();
@@ -361,6 +374,7 @@ pub const Borrowed = extern struct {
             .reserve_child = owner.reserve_child,
             .activate_child = owner.activate_child,
             .check_lifetime = owner.check_lifetime,
+            .current_class = owner.current_class,
         };
         try borrow.validate();
         return borrow;
@@ -796,4 +810,34 @@ test "runnable lifetime ABI never substitutes CPU checkpoint for parked lifetime
     borrow.struct_size -= 1;
     try std.testing.expectError(error.UnsupportedVersion, borrow.checkLifetime());
     try std.testing.expectEqual(@as(usize, 4), fake.calls);
+}
+
+test "runnable lifetime ABI observes current phase without replacing parent authority" {
+    const Fake = struct {
+        phase: c_int = @backingInt(Class.inference),
+        calls: usize = 0,
+        fn check(_: *anyopaque) callconv(.c) errors.Status {
+            return errors.statusFromError(error.InvalidRunnableTransition);
+        }
+        fn transition(_: *anyopaque, _: c_int) callconv(.c) errors.Status {
+            return errors.statusFromError(error.InvalidRunnableTransition);
+        }
+        fn current(raw: *anyopaque, out: *c_int) callconv(.c) errors.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            out.* = self.phase;
+            return .ok;
+        }
+    };
+    var fake: Fake = .{};
+    var borrowed: Borrowed = .{ .context = &fake, .cpu_slots = 1, .parent_class = @backingInt(Class.query), .checkpoint = Fake.check, .park = Fake.transition, .enter = Fake.transition };
+    try std.testing.expectError(error.UnsupportedOperation, borrowed.currentClass());
+    borrowed.current_class = Fake.current;
+    try std.testing.expectEqual(Class.inference, try borrowed.currentClass());
+    try std.testing.expectEqual(@backingInt(Class.query), borrowed.parent_class);
+    fake.phase = 999;
+    try std.testing.expectError(error.InvalidArgument, borrowed.currentClass());
+    borrowed.version -= 1;
+    try std.testing.expectError(error.UnsupportedVersion, borrowed.currentClass());
+    try std.testing.expectEqual(@as(usize, 2), fake.calls);
 }

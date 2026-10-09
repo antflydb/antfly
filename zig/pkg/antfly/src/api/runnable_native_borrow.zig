@@ -19,7 +19,7 @@ pub const Bridge = struct {
         const borrow = try abi.Borrowed.read(raw);
         // A native physical read polls lifetime while parked. Substituting its
         // CPU checkpoint would reject valid parked reads or reacquire CPU.
-        if (borrow.check_lifetime == null) return error.UnsupportedOperation;
+        if (borrow.check_lifetime == null or borrow.current_class == null) return error.UnsupportedOperation;
         return .{ .borrow = borrow, .allocator = allocator };
     }
 
@@ -27,7 +27,8 @@ pub const Bridge = struct {
     pub fn bind(self: *Bridge, execution: *native.Execution) !void {
         try execution.bindBorrowed(.{
             .ptr = self,
-            .class = try classFromAbi(self.borrow.parent_class),
+            .class = try currentClass(self),
+            .current_class = currentClass,
             .checkpoint = checkpoint,
             .check_lifetime = lifetime,
             .park = park,
@@ -47,6 +48,9 @@ pub const Bridge = struct {
     }
     fn lifetime(raw: *anyopaque) !void {
         try from(raw).borrow.checkLifetime();
+    }
+    fn currentClass(raw: *anyopaque) !native.Class {
+        return classFromAbi(@backingInt(try from(raw).borrow.currentClass()));
     }
     fn park(raw: *anyopaque, state: native.State) !void {
         const wait: abi.Wait = switch (state) {
@@ -123,7 +127,7 @@ const TestAuthority = struct {
         original_dispatch(a, b, c, d, e, f);
     }
     fn borrowed(self: *@This()) abi.Borrowed {
-        return .{ .context = self, .cpu_slots = 1, .parent_class = @backingInt(abi.Class.query), .checkpoint = check, .park = park, .enter = enter, .reserve_child = reserve, .check_lifetime = lifetime };
+        return .{ .context = self, .cpu_slots = 1, .parent_class = @backingInt(abi.Class.query), .checkpoint = check, .park = park, .enter = enter, .reserve_child = reserve, .check_lifetime = lifetime, .current_class = currentClass };
     }
     fn owner(raw: *anyopaque) *@This() {
         return @ptrCast(@alignCast(raw));
@@ -134,6 +138,10 @@ const TestAuthority = struct {
     }
     fn lifetime(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {
         owner(raw).execution.checkLifetime() catch |err| return runtime.error_abi.statusFromError(err);
+        return .ok;
+    }
+    fn currentClass(raw: *anyopaque, out: *c_int) callconv(.c) runtime.error_abi.Status {
+        out.* = @intCast(@backingInt(owner(raw).execution.retainedClass() catch |err| return runtime.error_abi.statusFromError(err)));
         return .ok;
     }
     fn park(raw: *anyopaque, reason: c_int) callconv(.c) runtime.error_abi.Status {
@@ -302,6 +310,9 @@ test "native execution borrow refuses legacy lifetime and duplicate root binding
     port.check_lifetime = null;
     try std.testing.expectError(error.UnsupportedOperation, Bridge.init(&port, std.testing.allocator));
     port.check_lifetime = TestAuthority.lifetime;
+    port.current_class = null;
+    try std.testing.expectError(error.UnsupportedOperation, Bridge.init(&port, std.testing.allocator));
+    port.current_class = TestAuthority.currentClass;
     var bridge = try Bridge.init(&port, std.testing.allocator);
     var parent: native.Execution = .{};
     try bridge.bind(&parent);
@@ -310,4 +321,32 @@ test "native execution borrow refuses legacy lifetime and duplicate root binding
     try std.testing.expectError(error.InvalidRunnableTransition, parent.activateChild());
     try std.testing.expectError(error.UnsupportedOperation, parent.resizeTeam(2));
     try std.testing.expectEqual(@as(usize, 1), owner.stats().operations);
+}
+
+test "native execution borrow resumes the current phase without promoting saved parent class" {
+    for ([_]native.Class{ .inference, .background }) |phase| {
+        var owner = try native.Scheduler.init(.{ .slots = 2 });
+        var original: native.Execution = .{};
+        try original.start(&owner, .{ .io = std.testing.io, .retained_bytes = 17 }, .query);
+        defer original.finish();
+        var authority: TestAuthority = .{ .execution = &original };
+        var port = authority.borrowed();
+        var bridge = try Bridge.init(&port, std.testing.allocator);
+        var execution: native.Execution = .{};
+        try bridge.bind(&execution);
+        defer execution.finish();
+        const query_grants = owner.stats().grants[@backingInt(native.Class.query)];
+        try original.park(.resource_blocked);
+        try original.enter(phase);
+        try std.testing.expectEqual(@backingInt(abi.Class.query), port.parent_class);
+        try std.testing.expectEqual(phase, try execution.retainedClass());
+        try execution.park(.resource_blocked);
+        try execution.checkLifetime();
+        try std.testing.expectEqual(@as(usize, 0), owner.stats().runnable_slots);
+        try execution.enter(try execution.retainedClass());
+        try std.testing.expectEqual(phase, try original.retainedClass());
+        try std.testing.expectEqual(query_grants, owner.stats().grants[@backingInt(native.Class.query)]);
+        try std.testing.expectEqual(@as(usize, 1), owner.stats().operations);
+        try std.testing.expectEqual(@as(u64, 17), owner.stats().retained_bytes);
+    }
 }

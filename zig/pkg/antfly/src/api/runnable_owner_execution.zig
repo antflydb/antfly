@@ -15,7 +15,7 @@ pub const State = struct {
     cleanup_in_use: std.atomic.Value(bool) = .init(false),
 
     pub fn port(self: *State) abi.Owner {
-        return .{ .context = &self.owner, .retain = retain, .release = release, .start = start, .checkpoint = checkpoint, .park = park, .enter = enter, .finish = finish, .resize_team = resizeTeam, .reserve_completion = reserveCompletion, .activate_completion = activateCompletion, .reserve_cleanup = reserveCleanup, .activate_cleanup = activateCleanup, .completion_remaining_ns = completionRemaining, .reserve_child = reserveChild, .activate_child = activateChild, .check_lifetime = checkLifetime };
+        return .{ .context = &self.owner, .retain = retain, .release = release, .start = start, .checkpoint = checkpoint, .park = park, .enter = enter, .finish = finish, .resize_team = resizeTeam, .reserve_completion = reserveCompletion, .activate_completion = activateCompletion, .reserve_cleanup = reserveCleanup, .activate_cleanup = activateCleanup, .completion_remaining_ns = completionRemaining, .reserve_child = reserveChild, .activate_child = activateChild, .check_lifetime = checkLifetime, .current_class = currentClass };
     }
 };
 
@@ -127,6 +127,10 @@ fn activateChild(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {
 
 fn checkLifetime(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {
     capsule(raw).execution.checkLifetime() catch |err| return runtime.error_abi.statusFromError(err);
+    return .ok;
+}
+fn currentClass(raw: *anyopaque, out: *c_int) callconv(.c) runtime.error_abi.Status {
+    out.* = @intCast(@backingInt(capsule(raw).execution.retainedClass() catch |err| return runtime.error_abi.statusFromError(err)));
     return .ok;
 }
 fn checkpoint(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {

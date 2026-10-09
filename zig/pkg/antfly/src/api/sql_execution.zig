@@ -196,6 +196,7 @@ pub const Adapter = struct {
 
     pub fn execute(self: *Adapter, alloc: std.mem.Allocator, compiled: *const @import("antfly_local_sources").sql_compiler.Compiled, parameters: []const std.json.Value, limits: @import("antfly_local_sources").sql_runtime.Limits, guarded_backend: ?catalog.Backend) !@import("antfly_local_sources").sql_runtime.Result {
         var write_team: ?@import("antfly_runtime_abi").runnable_abi.Team = null;
+        var read_team: ?@import("antfly_runtime_abi").runnable_abi.Team = null;
         const previous_team = self.context.execution_team;
         defer self.context.execution_team = previous_team;
         const participates_in_commit = switch (compiled.statement) {
@@ -206,6 +207,15 @@ pub const Adapter = struct {
             if (self.write_execution) |execution| {
                 write_team = try self.writeTeam(execution);
                 self.context.execution_team = &write_team.?;
+            }
+        }
+        if (previous_team == null and (compiled.statement == .select or compiled.statement == .explain)) {
+            if (self.providerRunnable()) |borrow| {
+                // Local retrieval callbacks borrow this same read owner. Its
+                // adapter revalidates the read fence on the coordinator, while
+                // child capsules retain independent worker state until joining.
+                read_team = .{ .borrow = borrow, .maximum_slots = borrow.cpu_slots, .allocator = self.server.alloc };
+                self.context.execution_team = &read_team.?;
             }
         }
         if (self.runnable != null and (compiled.statement == .select or compiled.statement == .explain)) try self.beginReadFence();
@@ -817,6 +827,12 @@ pub const Adapter = struct {
         if (self.cleanup_phase == null) self.cleanup_phase = @import("runnable_local_cleanup.zig").Cleanup.init(execution) catch null;
         const Callback = struct {
             const runtime = @import("antfly_runtime_abi");
+            fn currentClass(raw: *anyopaque, out: *c_int) callconv(.c) runtime.error_abi.Status {
+                const adapter: *Adapter = @ptrCast(@alignCast(raw));
+                const execution = adapter.runnable orelse return runtime.error_abi.statusFromError(error.InvalidRunnableTransition);
+                out.* = @intCast(@backingInt(execution.retainedClass() catch |err| return runtime.error_abi.statusFromError(err)));
+                return .ok;
+            }
             fn lifetime(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {
                 const adapter: *Adapter = @ptrCast(@alignCast(raw));
                 const execution = adapter.runnable orelse return runtime.error_abi.statusFromError(error.InvalidRunnableTransition);
@@ -884,7 +900,7 @@ pub const Adapter = struct {
                 return .ok;
             }
         };
-        return .{ .context = self, .cpu_slots = entry.slots, .parent_class = @intCast(@backingInt(entry.class)), .checkpoint = Callback.check, .park = Callback.park, .enter = Callback.enter, .reserve_cleanup = if (self.cleanup_phase != null) Callback.reserveCleanup else null, .activate_cleanup = if (self.cleanup_phase != null) Callback.activateCleanup else null, .reserve_child = Callback.reserveChild, .check_lifetime = Callback.lifetime };
+        return .{ .context = self, .cpu_slots = entry.slots, .parent_class = @intCast(@backingInt(entry.class)), .checkpoint = Callback.check, .park = Callback.park, .enter = Callback.enter, .reserve_cleanup = if (self.cleanup_phase != null) Callback.reserveCleanup else null, .activate_cleanup = if (self.cleanup_phase != null) Callback.activateCleanup else null, .reserve_child = Callback.reserveChild, .check_lifetime = Callback.lifetime, .current_class = Callback.currentClass };
     }
 
     fn spillWaitEnd(ptr: *anyopaque) !void {
