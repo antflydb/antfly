@@ -147,8 +147,8 @@ describeWithLibrary("Inference", () => {
         await expect(
           inf.decideRaw({
             model: "no/such-model",
-            state: "refund",
-            questions: { refund: { type: "noul", instructions: "Refund?" } },
+            input: "refund",
+            questions: [{ name: "refund", type: "predicate", instructions: "Refund?" }],
           })
         ).rejects.toMatchObject({ body: { error: "MODEL_NOT_FOUND" } });
       } finally {
@@ -169,44 +169,55 @@ describeWithLibrary("Inference", () => {
       ).trim();
       const request = {
         model,
-        state: "Refund the duplicate charge.",
-        questions: {
-          route: {
+        input: "Refund the duplicate charge.",
+        questions: [
+          {
+            name: "route",
             type: "choice",
             instructions: "Which team?",
-            criteria: { billing: "Charges", support: "Product" },
+            choices: [
+              { value: "billing", description: "Charges" },
+              { value: "support", description: "Product" },
+            ],
           },
-          urgency: {
+          {
+            name: "urgency",
             type: "score",
             instructions: "How urgent?",
-            criteria: ["Routine", "Soon", "Immediate"],
+            levels: [{ label: "Routine" }, { label: "Soon" }, { label: "Immediate" }],
           },
-          refund: { type: "noul", instructions: "Refund requested?" },
-        },
+          { name: "refund", type: "predicate", instructions: "Refund requested?" },
+        ],
       };
       const inf = await Inference.open({ modelsDir });
       try {
         const result = await inf.decide(request);
         expect(result).toMatchObject({
           model,
-          answers: {
-            route: {
+          answers: [
+            {
+              name: "route",
               type: "choice",
+              decision_method: "typed",
               choice: "billing",
-              probabilities: { billing: 0.5, support: 0.5 },
+              probabilities: [
+                { value: "billing", probability: 0.5 },
+                { value: "support", probability: 0.5 },
+              ],
             },
-            urgency: {
+            {
+              name: "urgency",
               type: "score",
+              decision_method: "typed",
               score: expect.closeTo(1),
-              legend: { "0": "Routine", "1": "Soon", "2": "Immediate" },
-              probabilities: {
-                "0": expect.closeTo(1 / 3),
-                "1": expect.closeTo(1 / 3),
-                "2": expect.closeTo(1 / 3),
-              },
+              probabilities: [
+                { value: 0, label: "Routine", probability: expect.closeTo(1 / 3) },
+                { value: 1, label: "Soon", probability: expect.closeTo(1 / 3) },
+                { value: 2, label: "Immediate", probability: expect.closeTo(1 / 3) },
+              ],
             },
-            refund: { type: "noul", noul: 0.5 },
-          },
+            { name: "refund", type: "predicate", decision_method: "typed", probability: 0.5 },
+          ],
           usage: { input_tokens: expect.any(Number), output_tokens: 0 },
         });
         const raw = await inf.decideRaw(JSON.stringify(request));

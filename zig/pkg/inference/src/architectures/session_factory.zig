@@ -45,6 +45,7 @@ const boundary_resident = @import("../ops/gliner_boundary_resident.zig");
 const bert_arch = @import("bert.zig");
 const modern_bert_arch = @import("modern_bert.zig");
 const nomic_bert_arch = @import("nomic_bert.zig");
+const embedding_gemma2_arch = @import("embedding_gemma2.zig");
 const layoutlmv3_arch = @import("layoutlmv3.zig");
 const t5_arch = @import("t5.zig");
 const gpt_arch = @import("gpt.zig");
@@ -248,13 +249,14 @@ fn shouldUseGpuHostedEagerDenseLoad(
 fn shouldPreferGpuHostedF32DenseTensors(arch_config: ArchConfig) bool {
     return switch (arch_config) {
         .gpt => |cfg| cfg.family == .gemma,
-        .layoutlmv3 => true,
+        .layoutlmv3, .embedding_gemma2 => true,
         else => false,
     };
 }
 
 fn shouldForceGpuHostedF32DenseTensorByName(arch_config: ArchConfig, name: []const u8) bool {
     if (!shouldPreferGpuHostedF32DenseTensors(arch_config)) return false;
+    if (arch_config == .embedding_gemma2) return true;
     const is_large_non_linear_weight = std.mem.startsWith(u8, name, "vision_tower.") or
         std.mem.startsWith(u8, name, "multi_modal_projector.") or
         std.mem.endsWith(u8, name, "token_embd.weight");
@@ -454,6 +456,7 @@ const ArchType = enum {
     bert,
     modern_bert,
     nomic_bert,
+    embedding_gemma2,
     deberta,
     t5,
     gpt,
@@ -472,6 +475,7 @@ const ArchConfig = union(ArchType) {
     bert: bert.Config,
     modern_bert: modern_bert_arch.Config,
     nomic_bert: nomic_bert_arch.Config,
+    embedding_gemma2: embedding_gemma2_arch.Config,
     deberta: deberta_mod.Config,
     t5: t5_mod.Config,
     gpt: gpt_mod.Config,
@@ -865,6 +869,10 @@ pub fn createNativeSessionWithTaskOverride(allocator: std.mem.Allocator, model_p
             direct_quant_enabled = false;
         }
     }
+    if (arch_config == .embedding_gemma2) {
+        direct_quant_enabled = false;
+        try embedding_gemma2_arch.validateWeights(allocator, store, arch_config.embedding_gemma2);
+    }
     const laya_q8 = try layaQuantizesWeights(arch_config);
     if (arch_config == .gliner_modern_bert) {
         try gliner_encoder.validateDecisionWeights(store, arch_config.gliner_modern_bert);
@@ -897,7 +905,7 @@ pub fn createNativeSessionWithTaskOverride(allocator: std.mem.Allocator, model_p
         .bert => |cfg| cfg.effectivePrefix(),
         .modern_bert => if (is_gliner_span_modern) "encoder" else "",
         .gliner_modern_bert => "",
-        .nomic_bert => "",
+        .nomic_bert, .embedding_gemma2 => "",
         .deberta => "deberta",
         .t5 => "", // T5 weights use full names (encoder.block.0.*, decoder.block.0.*)
         .gpt => "", // GPT weights use full names (model.layers.0.*, h.0.*)
@@ -1177,6 +1185,7 @@ pub fn createPjrtSessionWithTaskOverride(allocator: std.mem.Allocator, model_pat
     defer mf.deinit();
 
     var arch_config = try detectArchitecture(allocator, model_path, mf);
+    if (arch_config == .embedding_gemma2) return error.UnsupportedBackend;
     if (arch_config == .gliner_boundary) return error.UnsupportedGlinerBoundaryBackend;
     var store = try tensor_store_mod.openFromManifest(allocator, mf);
     if (mf.usesGgufWeights()) {
@@ -1195,7 +1204,7 @@ pub fn createPjrtSessionWithTaskOverride(allocator: std.mem.Allocator, model_pat
         .bert => |cfg| cfg.effectivePrefix(),
         .modern_bert => if (is_gliner_span_modern) "encoder" else "",
         .gliner_modern_bert => "",
-        .nomic_bert => "",
+        .nomic_bert, .embedding_gemma2 => "",
         .deberta => "deberta",
         .t5 => "",
         .gpt => "",
@@ -2349,7 +2358,7 @@ fn loadSafetensorsIntoResident(
         try transposeGpt2Conv1dResidentGpuHostedWeights(allocator, resident_weights, stream);
     }
     return switch (arch_config) {
-        .t5, .gpt, .whisper, .florence, .clip, .clap, .modern_bert, .gliner_modern_bert, .nomic_bert => "",
+        .t5, .gpt, .whisper, .florence, .clip, .clap, .modern_bert, .gliner_modern_bert, .nomic_bert, .embedding_gemma2 => "",
         .gliner, .gliner_boundary => "encoder",
         .deberta => "deberta",
         .layoutlmv3 => "layoutlmv3",
@@ -2407,6 +2416,7 @@ fn createGpuHostedSessionWithTaskOverride(
     const model_weight_bytes = estimateNativeWeightBytes(allocator, mf) catch 0;
 
     var arch_config = try detectArchitecture(allocator, model_path, mf);
+    if (arch_config == .embedding_gemma2 and backend_type != .metal) return error.UnsupportedEmbeddingGemma2Backend;
     if (arch_config == .gliner_boundary and backend_type != .metal) return error.UnsupportedGlinerBoundaryBackend;
     var boundary_identity: ?boundary_bundle.Identity = null;
     var gliner_decision_identity: ?gliner_decide_qualification.Identity = null;
@@ -2492,6 +2502,7 @@ fn createGpuHostedSessionWithTaskOverride(
             try validateNativeBoundaryWeights(allocator, mf, arch_config.gliner_boundary, tensor_store.?);
             boundary_identity = try captureBoundaryIdentity(&mf, tensor_store.?);
         }
+        if (arch_config == .embedding_gemma2) try embedding_gemma2_arch.validateWeights(allocator, tensor_store.?, arch_config.embedding_gemma2);
         gliner_decision_identity = try captureGlinerDecisionIdentity(&mf, tensor_store.?);
         const source = (try tensor_store.?.weightSource()) orelse return error.NoDenseWeightSource;
         const all_names = try source.listNames(allocator);
@@ -2509,7 +2520,7 @@ fn createGpuHostedSessionWithTaskOverride(
                 .bert => |cfg| cfg.effectivePrefix(),
                 .modern_bert => if (is_gliner_span_modern) "encoder" else "",
                 .gliner_modern_bert => "",
-                .nomic_bert => "",
+                .nomic_bert, .embedding_gemma2 => "",
                 .deberta => "deberta",
                 else => "",
             };
@@ -2797,6 +2808,10 @@ fn detectArchitectureWithGgufFile(
                 cfg.gliner_quantized_weights = try glinerGgufMatricesQuantized(allocator, mf, parsed_gguf);
                 try applyGlinerLabelTokenIds(allocator, model_path, mf, &cfg);
                 return .{ .gliner = cfg };
+            }
+            if (embedding_gemma2_arch.isModel(model_type)) {
+                if (mf.usesGgufWeights()) return error.UnsupportedEmbeddingGemma2Precision;
+                return .{ .embedding_gemma2 = try embedding_gemma2_arch.parseConfig(allocator, config_bytes) };
             }
             if (modern_bert_arch.isModernBertModel(model_type)) {
                 return .{ .modern_bert = try modern_bert_arch.parseConfig(allocator, config_bytes) };
@@ -4119,6 +4134,23 @@ fn normalizeWeightKey(store_kind: tensor_store_mod.StoreKind, arch_config: ArchC
     };
 }
 
+test "GLiNER ModernBERT composite heads and Laya decision heads keep their own namespaces" {
+    const span = ArchConfig{ .modern_bert = .{} };
+    const laya = ArchConfig{ .modern_bert = .{ .laya = .{} } };
+    var buf: [256]u8 = undefined;
+    for ([_][]const u8{ "classifier.0.weight", "span_rep.weight", "count_embed.weight" }) |key|
+        try std.testing.expectEqualStrings(key, try normalizeWeightKey(.safetensors, span, key, &buf));
+    for ([_][]const u8{ "type_emb.weight", "head.layers.0.self_attn.in_proj_weight", "scorer.1.weight", "act_head.0.weight" }) |key| {
+        var expected: [256]u8 = undefined;
+        try std.testing.expectEqualStrings(try std.fmt.bufPrint(&expected, "model.{s}", .{key}), try normalizeWeightKey(.safetensors, laya, key, &buf));
+    }
+    for ([_]ArchConfig{ span, laya }) |config| {
+        try std.testing.expectEqualStrings("model.embeddings.tok_embeddings.weight", try normalizeWeightKey(.safetensors, config, "encoder.embeddings.tok_embeddings.weight", &buf));
+        try std.testing.expectEqualStrings("model.layers.0.attn.Wqkv.weight", try normalizeWeightKey(.safetensors, config, "layers.0.attn.Wqkv.weight", &buf));
+        try std.testing.expectEqualStrings("model.scorer.1.weight", try normalizeWeightKey(.safetensors, config, "model.scorer.1.weight", &buf));
+    }
+}
+
 fn refineGemma4AttentionKEqualVFromGgufTensors(config: *gpt_mod.Config, file: *const gguf_mod.format.File) void {
     if (config.family != .gemma or !config.usesGemmaSlidingAttention()) return;
 
@@ -4616,6 +4648,7 @@ fn refineGptConfigFromStore(
 }
 
 fn shouldLazyLoadWeight(store_kind: tensor_store_mod.StoreKind, arch_config: ArchConfig, key: []const u8) bool {
+    if (arch_config == .embedding_gemma2) return true;
     if (store_kind != .gguf) return false;
     return switch (arch_config) {
         .gpt => |cfg| cfg.usesMoe() and (std.mem.indexOf(u8, key, ".block_sparse_moe.experts.") != null or (cfg.family == .deepseek_v4 and std.mem.indexOf(u8, key, ".mlp.experts.") != null)),
@@ -5500,7 +5533,7 @@ fn sessionDirectQuantEnabled(
             .fp32, .fp16_encoder => false,
         } else false;
     }
-    return direct_quant_enabled and !usesDenseF32EncoderBudget(manifest, arch_config);
+    return direct_quant_enabled and arch_config != .embedding_gemma2 and !usesDenseF32EncoderBudget(manifest, arch_config);
 }
 
 fn recommendedGpuHostedBgeM3BudgetFloor(model_weight_bytes: u64) runtime.tier.memory.Limits {
@@ -6030,25 +6063,23 @@ fn makeMetalHostedComputeBackend(
     if (!build_options.enable_metal) return error.MetalNotEnabled;
     const compute = try allocator.create(MetalCompute);
     errdefer allocator.destroy(compute);
-    compute.* = if (self.io) |io_handle|
-        try MetalCompute.initWithIoAndKernelJitScopeAndLoadContext(
-            allocator,
-            gpuBackendData(self),
-            run_budget,
-            io_handle,
-            self.kernel_jit_config,
-            self.metal_jit_scope,
-            self.kernel_jit_load_context,
-        )
-    else
-        try MetalCompute.initWithKernelJitScopeAndLoadContext(
-            allocator,
-            gpuBackendData(self),
-            run_budget,
-            self.kernel_jit_config,
-            self.metal_jit_scope,
-            self.kernel_jit_load_context,
-        );
+    try compute.initInPlaceWithKernelJitOptions(
+        allocator,
+        gpuBackendData(self),
+        run_budget,
+        self.io,
+        .{
+            .config = self.kernel_jit_config,
+            .scope = self.metal_jit_scope,
+            .load_context = self.kernel_jit_load_context,
+        },
+    );
+    compute.require_f32_linears = self.arch_config == .embedding_gemma2;
+    // The shared provider belongs to this model, and init holds its execution
+    // lease. Configure encoder normalization before any device work is queued.
+    if (compute.provider_impl.raw_decode_runtime) |raw| {
+        @import("../backends/metal_runtime.zig").termite_metal_decode_runtime_set_embeddinggemma2_rms_norm(raw, @intFromBool(self.arch_config == .embedding_gemma2));
+    }
     return compute.ownedComputeBackend();
 }
 
@@ -7773,7 +7804,7 @@ fn archRunResident(ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.A
     const self: *ArchSession = @ptrCast(@alignCast(ptr));
     if (self.task == .classifier or self.task == .extractor) return null;
     switch (self.arch_config) {
-        .bert, .modern_bert, .nomic_bert => {},
+        .bert, .modern_bert, .nomic_bert, .embedding_gemma2 => {},
         else => return null,
     }
     const bert_inputs = try parseBertRunInputs(inputs);
@@ -7803,6 +7834,7 @@ fn archRunResident(ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.A
             bert_inputs.batch,
             bert_inputs.seq_len,
         ),
+        .embedding_gemma2 => |cfg| try embedding_gemma2_arch.forwardCT(cb, allocator, cfg, bert_inputs.input_ids, bert_inputs.attention_mask, bert_inputs.batch, bert_inputs.seq_len),
         .nomic_bert => |cfg| try nomic_bert_arch.forwardCT(
             cb,
             allocator,
@@ -7916,6 +7948,7 @@ fn makeComputeBackend(
             if (self.arch_config == .gliner_boundary or self.arch_config == .bert)
                 compute.quantized_activation_policy = .strict_f32;
             compute.borrow_bf16_linear_weights = self.arch_config == .gpt and self.arch_config.gpt.family == .qwen3;
+            compute.cache_embeddinggemma2_bf16_weights = self.arch_config == .embedding_gemma2;
             break :blk compute.computeBackend();
         },
         .metal => try makeGpuHostedComputeBackend(self, allocator, run_budget),
@@ -8301,6 +8334,12 @@ pub fn getComputeBackend(session: Session, allocator: std.mem.Allocator) !ops.Co
     return cb;
 }
 
+pub fn getEmbeddingGemma2Config(session: Session) ?embedding_gemma2_arch.Config {
+    if (session.vtable != &arch_vtable) return null;
+    const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
+    return if (self.arch_config == .embedding_gemma2) self.arch_config.embedding_gemma2 else null;
+}
+
 /// Incremental native Whisper decoder bound to one session for the duration
 /// of one transcription. Holds the compute backend (and on shared GPU
 /// backends its execution lease) and the session's execution gate, so it
@@ -8441,6 +8480,7 @@ pub fn getComputeBackendBorrowingSharedProvider(session: Session, allocator: std
             .load_context = self.kernel_jit_load_context,
         },
     );
+    compute.require_f32_linears = self.arch_config == .embedding_gemma2;
     var cb = compute.ownedComputeBackend();
     errdefer cb.deinit();
     try cb.beginRequest();
@@ -9185,7 +9225,7 @@ pub fn supportsResidentTextEncoder(session: Session) bool {
     if (session.vtable != &arch_vtable) return false;
     const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
     return switch (self.arch_config) {
-        .bert, .modern_bert, .nomic_bert => true,
+        .bert, .modern_bert, .nomic_bert, .embedding_gemma2 => true,
         else => false,
     };
 }
@@ -9676,6 +9716,19 @@ fn archRunImpl(
             const result = try allocator.alloc(Tensor, 1);
             result[0] = output_tensor;
             return result;
+        },
+        .embedding_gemma2 => |cfg| {
+            if (self.task != .generic) return error.UnsupportedArchitectureTask;
+            const bi = try parseBertRunInputs(inputs);
+            const result_ct = try embedding_gemma2_arch.forwardCT(&cb, allocator, cfg, bi.input_ids, bi.attention_mask, bi.batch, bi.seq_len);
+            defer cb.free(result_ct);
+            const values = try cb.toFloat32(result_ct, allocator);
+            defer allocator.free(values);
+            var tensor = try Tensor.initFloat32(allocator, "last_hidden_state", &.{ @intCast(bi.batch), @intCast(bi.seq_len), @intCast(cfg.embedding_dim) }, values);
+            errdefer tensor.deinit();
+            const outputs = try allocator.alloc(Tensor, 1);
+            outputs[0] = tensor;
+            return outputs;
         },
         .modern_bert => |cfg| {
             if (cfg.laya) |laya| {
@@ -10761,6 +10814,13 @@ fn archRunGeometry(ptr: *anyopaque, inputs: @import("../backends/session.zig").S
             else
                 try whisperStageWorkspace(batch, input_seq, input_seq, cfg.hidden_size, cfg.num_attention_heads, cfg.intermediate_size * 2);
             break :blk count;
+        },
+        .embedding_gemma2 => |cfg| blk: {
+            if (input_seq > embedding_gemma2_arch.max_tokens) return error.InvalidEmbeddingInputLength;
+            // Live activations, expanded GQA, streamed PLE, and host/output
+            // copies. Attention scores use fixed tiles, never tokens squared.
+            workspace_bytes = try std.math.mul(usize, try std.math.mul(usize, batch, input_seq), 64 * 1024);
+            break :blk cfg.embedding_dim;
         },
         .nomic_bert => |cfg| cfg.hidden_size,
         .t5 => |cfg| cfg.d_model,

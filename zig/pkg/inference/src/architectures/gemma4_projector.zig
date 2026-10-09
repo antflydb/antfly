@@ -18,6 +18,7 @@ const audio = @import("../pipelines/audio.zig");
 const inference_audio = @import("inference_audio");
 const platform = @import("antfly_platform");
 const image = @import("../pipelines/image.zig");
+const antfly_image = @import("antfly_image");
 const ops = @import("../ops/ops.zig");
 const gguf_metadata = @import("../gguf/metadata.zig");
 const gguf_format = @import("../gguf/format.zig");
@@ -103,6 +104,7 @@ const AudioConfig = struct {
     attention_context_right: usize = 0,
     attention_logit_cap: f32 = 50.0,
     attention_invalid_logits_value: f32 = -1.0e9,
+    exclude_farthest_key: bool = false,
     gradient_clipping: f32 = 1.0e10,
 
     fn headDim(self: AudioConfig) usize {
@@ -229,7 +231,7 @@ pub const ProjectorStore = struct {
 const ProjectorWeights = struct {
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
-    gguf: *tensor_store_mod.GgufStore,
+    gguf: ?*tensor_store_mod.GgufStore,
     /// The model-owned store when the request has one (its clamp-bound
     /// cache); null for callers that bring a bare GGUF store.
     owner: ?*ProjectorStore,
@@ -237,6 +239,50 @@ const ProjectorWeights = struct {
 
     fn init(cb: *const ComputeBackend, allocator: std.mem.Allocator, gguf: *tensor_store_mod.GgufStore, owner: ?*ProjectorStore) ProjectorWeights {
         return .{ .cb = cb, .allocator = allocator, .gguf = gguf, .owner = owner };
+    }
+
+    fn initHuggingFace(cb: *const ComputeBackend, allocator: std.mem.Allocator) ProjectorWeights {
+        return .{ .cb = cb, .allocator = allocator, .gguf = null, .owner = null };
+    }
+
+    fn weightCt(self: *ProjectorWeights, tensor_name: []const u8) !CT {
+        if (self.gguf) |gguf| return loadWeightCt(self.cb, self.allocator, gguf, tensor_name);
+        const mapped = try @import("embedding_gemma2_media_weights.zig").name(self.allocator, tensor_name);
+        defer self.allocator.free(mapped);
+        return self.cb.getWeight(mapped);
+    }
+
+    fn linearCt(self: *ProjectorWeights, tensor_name: []const u8, in_dim: usize, out_dim: usize) !CT {
+        if (self.gguf) |gguf| return loadLinearWeightCt(self.cb, self.allocator, gguf, tensor_name, in_dim, out_dim);
+        const tensor = try self.weightCt(tensor_name);
+        errdefer self.cb.free(tensor);
+        if (!(try self.cb.tensorShapeMatches(tensor, &.{ @intCast(out_dim), @intCast(in_dim) }) orelse false)) return error.InvalidTensorShape;
+        return tensor;
+    }
+
+    fn tensorF32(self: *ProjectorWeights, tensor_name: []const u8) !ProjectorF32 {
+        if (self.gguf) |gguf| {
+            const tensor = try loadTensorF32(gguf, tensor_name);
+            return .{ .allocator = self.allocator, .gguf = tensor, .data = tensor.data, .shape = tensor.shape };
+        }
+        const tensor = try self.weightCt(tensor_name);
+        defer self.cb.free(tensor);
+        const values = try self.cb.toFloat32(tensor, self.allocator);
+        errdefer self.allocator.free(values);
+        return .{ .allocator = self.allocator, .data = values, .shape = try self.cb.tensorShape(tensor, self.allocator) };
+    }
+
+    fn optionalF32(self: *ProjectorWeights, tensor_name: []const u8) !?ProjectorF32 {
+        if (self.gguf) |gguf| {
+            const tensor = (try loadOptionalTensorF32(gguf, tensor_name)) orelse return null;
+            return .{ .allocator = self.allocator, .gguf = tensor, .data = tensor.data, .shape = tensor.shape };
+        }
+        const mapped = @import("embedding_gemma2_media_weights.zig").name(self.allocator, tensor_name) catch |err| switch (err) {
+            error.InvalidEmbeddingGemma2Weight => return null,
+            else => return err,
+        };
+        self.allocator.free(mapped);
+        return try self.tensorF32(tensor_name);
     }
 
     pub fn deinit(self: *ProjectorWeights) void {
@@ -264,7 +310,83 @@ const ProjectorWeights = struct {
         try self.entries.put(self.allocator, key, tensor);
         return tensor;
     }
+
+    fn releaseCompletedNativeLayer(self: *ProjectorWeights) void {
+        // Native HF execution is synchronous and the returned layer output
+        // owns its storage. Keeping every widened layer weight would turn
+        // request scratch into a second F32 copy of the entire media tower.
+        // Metal retains identity-based slots; GGUF keeps its existing cache.
+        if (self.gguf == null and self.cb.kind() == .native) self.deinit();
+    }
 };
+
+const ProjectorF32 = struct {
+    allocator: std.mem.Allocator,
+    gguf: ?LoadedF32 = null,
+    data: []const f32,
+    shape: []const i64,
+    fn deinit(self: *ProjectorF32) void {
+        if (self.gguf) |*tensor| tensor.deinit() else {
+            self.allocator.free(self.data);
+            self.allocator.free(self.shape);
+        }
+    }
+};
+
+/// Original Hugging Face tower weights, using the shared native/Metal kernels.
+pub fn encodeEmbeddingGemma2Image(cb: *const ComputeBackend, allocator: std.mem.Allocator, bytes: []const u8) !EncodedImage {
+    var weights = ProjectorWeights.initHuggingFace(cb, allocator);
+    defer weights.deinit();
+    return encodeSingleImage(cb, allocator, &weights, embeddingGemma2ImageConfig(), bytes);
+}
+
+/// Renderer-owned pixels share the encoded-image projector after decoding.
+pub fn encodeEmbeddingGemma2Raster(cb: *const ComputeBackend, allocator: std.mem.Allocator, raster: antfly_image.BorrowedRasterAttachment) !EncodedImage {
+    const view = try raster.imageView();
+    try image.DecodeLimits.inference_default.validate(view.width, view.height);
+    var weights = ProjectorWeights.initHuggingFace(cb, allocator);
+    defer weights.deinit();
+    return encodeSingleImageView(cb, allocator, &weights, embeddingGemma2ImageConfig(), view);
+}
+
+/// One image marker pair plus the tokenizer's BOS/EOS tokens.
+pub fn embeddingGemma2RasterSequenceLength(raster: antfly_image.BorrowedRasterAttachment) !usize {
+    try raster.validate();
+    try image.DecodeLimits.inference_default.validate(raster.width, raster.height);
+    return targetGeometry(embeddingGemma2ImageConfig(), raster.width, raster.height).tokenCount() + 4;
+}
+
+fn embeddingGemma2ImageConfig() Config {
+    return .{
+        .text_hidden = 512,
+        .vision_hidden = 768,
+        .intermediate_size = 3072,
+        .block_count = 16,
+        .head_count = 12,
+        .image_size = 0,
+        .patch_size = 16,
+        .layer_norm_eps = 1e-6,
+        .image_mean = .{ 0, 0, 0 },
+        .image_std = .{ 1, 1, 1 },
+        .position_embeddings_per_axis = 10240,
+    };
+}
+
+pub fn encodeEmbeddingGemma2Audio(cb: *const ComputeBackend, allocator: std.mem.Allocator, bytes: []const u8) !EncodedAudio {
+    var weights = ProjectorWeights.initHuggingFace(cb, allocator);
+    defer weights.deinit();
+    return encodeSingleAudio(cb, allocator, &weights, .{
+        .text_hidden = 512,
+        .audio_hidden = 1024,
+        .output_hidden = 1536,
+        .exclude_farthest_key = true,
+        .intermediate_size = 4096,
+        .block_count = 12,
+        .head_count = 8,
+        .mel_bins = 128,
+        .layer_norm_eps = 1e-6,
+    }, bytes);
+}
 
 const ClampSpec = struct {
     input_min: ?f32 = null,
@@ -368,7 +490,7 @@ fn encodeProjectedImagesWithWeights(
     store: *ProjectorWeights,
     images: []const []const u8,
 ) !ProjectedImages {
-    const cfg = try parseConfig(&store.gguf.parsed);
+    const cfg = try parseConfig(&store.gguf.?.parsed);
 
     var all_embeddings = std.ArrayListUnmanaged(f32).empty;
     errdefer all_embeddings.deinit(allocator);
@@ -430,7 +552,7 @@ fn encodeProjectedAudioWithWeights(
     store: *ProjectorWeights,
     audio_clips: []const []const u8,
 ) !ProjectedAudio {
-    const cfg = try parseAudioConfig(&store.gguf.parsed);
+    const cfg = try parseAudioConfig(&store.gguf.?.parsed);
 
     var all_embeddings = std.ArrayListUnmanaged(f32).empty;
     errdefer all_embeddings.deinit(allocator);
@@ -462,6 +584,38 @@ const EncodedAudio = struct {
     tokens: usize,
 };
 
+// Real-model tests can compare the producer boundaries from the pinned
+// upstream implementation. This hook is absent from production builds.
+fn embeddingGemma2Stage(a: std.mem.Allocator, name: []const u8, values: []const f32) !void {
+    if (comptime !@import("builtin").is_test) return;
+    const directory = platform.env.getenv("ANTFLY_EMBEDDINGGEMMA2_STAGES") orelse return;
+    const path = try std.fmt.allocPrint(a, "{s}/{s}.f32", .{ directory, name });
+    defer a.free(path);
+    const bytes = try @import("../util/c_file.zig").readFile(a, path);
+    defer a.free(bytes);
+    if (bytes.len != values.len * 4) return error.InvalidTensorShape;
+    var dot: f64 = 0;
+    var aa: f64 = 0;
+    var bb: f64 = 0;
+    var max_abs: f64 = 0;
+    for (values, 0..) |actual, i| {
+        const expected = std.mem.bytesToValue(f32, bytes[i * 4 ..][0..4]);
+        dot += @as(f64, actual) * expected;
+        aa += @as(f64, actual) * actual;
+        bb += @as(f64, expected) * expected;
+        max_abs = @max(max_abs, @abs(@as(f64, actual) - expected));
+    }
+    std.debug.print("embeddinggemma2 stage={s} cosine={d:.9} max_abs={d:.9}\n", .{ name, dot / @sqrt(aa * bb), max_abs });
+}
+
+fn embeddingGemma2StageTensor(cb: *const ComputeBackend, a: std.mem.Allocator, name: []const u8, tensor: CT) !void {
+    if (comptime !@import("builtin").is_test) return;
+    if (platform.env.getenv("ANTFLY_EMBEDDINGGEMMA2_STAGES") == null) return;
+    const values = try cb.toFloat32(tensor, a);
+    defer a.free(values);
+    try embeddingGemma2Stage(a, name, values);
+}
+
 fn encodeSingleAudio(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
@@ -485,6 +639,7 @@ fn encodeSingleAudio(
 
     var features = try prepareGemma4AudioFeatures(allocator, audio_bytes, cfg.mel_bins);
     defer features.deinit();
+    if (store.gguf == null) try embeddingGemma2Stage(allocator, "audio_features", features.data);
     audioProfileMark(.features);
 
     // From the conv stack to the output projection every op runs on device
@@ -500,6 +655,7 @@ fn encodeSingleAudio(
 
     var subsampled = try audioSubsample(cb, allocator, store, cfg, &features);
     defer subsampled.deinit(allocator);
+    if (store.gguf == null) try embeddingGemma2StageTensor(cb, allocator, "audio_subsample", subsampled.hidden);
     audioProfileMark(.subsample);
 
     var hidden = subsampled.hidden;
@@ -511,7 +667,7 @@ fn encodeSingleAudio(
         for (per_dim_names.items) |name| allocator.free(name);
         per_dim_names.deinit(allocator);
     }
-    var per_dim_tensors = std.ArrayListUnmanaged(LoadedF32).empty;
+    var per_dim_tensors = std.ArrayListUnmanaged(ProjectorF32).empty;
     defer {
         for (per_dim_tensors.items) |*tensor| tensor.deinit();
         per_dim_tensors.deinit(allocator);
@@ -526,7 +682,7 @@ fn encodeSingleAudio(
             errdefer allocator.free(name);
             try per_dim_names.append(allocator, name);
         }
-        var per_dim = try loadTensorF32(store.gguf, name);
+        var per_dim = try store.tensorF32(name);
         {
             errdefer per_dim.deinit();
             try per_dim_tensors.append(allocator, per_dim);
@@ -537,14 +693,21 @@ fn encodeSingleAudio(
     defer layer_inputs.deinit(cb);
 
     for (0..cfg.block_count) |layer| {
+        try cb.checkExecutionControl();
         const next = try audioLayer(cb, allocator, store, cfg, hidden, &layer_inputs, layer);
         cb.free(hidden);
         hidden = next;
+        store.releaseCompletedNativeLayer();
+        if (store.gguf == null) {
+            var name_buf: [128]u8 = undefined;
+            try embeddingGemma2StageTensor(cb, allocator, try fmt(&name_buf, "audio_layer_{d}", .{layer}), hidden);
+        }
     }
 
     const output = try audioLinearWithBias(cb, allocator, store, hidden, "a.pre_encode.out", subsampled.seq_len, cfg.audio_hidden, cfg.output_hidden);
     cb.free(hidden);
     defer cb.free(output);
+    if (store.gguf == null) try embeddingGemma2StageTensor(cb, allocator, "audio_output", output);
 
     const normed = try cb.rmsNorm(output, layer_inputs.ones, cfg.output_hidden, cfg.layer_norm_eps);
     defer cb.free(normed);
@@ -559,6 +722,7 @@ fn encodeSingleAudio(
 
     const projected_data = try cb.toFloat32(projected, allocator);
     defer allocator.free(projected_data);
+    if (store.gguf == null) try embeddingGemma2Stage(allocator, "audio_projected", projected_data);
     audioProfileMark(.readback);
     if (profile_enabled) profile.finish(subsampled.seq_len);
     const valid_count = countTrue(subsampled.valid_mask);
@@ -603,7 +767,7 @@ fn encodeUnifiedDirectAudio(
     // llama.cpp's Gemma4UnifiedMultimodalEmbedder graph.
     const normed = try rmsNormNoScaleCt(cb, allocator, frame_ct, token_count, cfg.raw_samples_per_token, cfg.layer_norm_eps);
     defer cb.free(normed);
-    const projection_w = try loadLinearWeightCt(cb, allocator, store.gguf, "mm.a.input_projection.weight", cfg.raw_samples_per_token, cfg.text_hidden);
+    const projection_w = try store.linearCt("mm.a.input_projection.weight", cfg.raw_samples_per_token, cfg.text_hidden);
     defer cb.free(projection_w);
     const projected = try cb.linearNoBias(normed, projection_w, token_count, cfg.raw_samples_per_token, cfg.text_hidden);
     defer cb.free(projected);
@@ -980,7 +1144,7 @@ fn channelNormRelu(
     }
     const conv_data = try cb.toFloat32(input, allocator);
     defer allocator.free(conv_data);
-    var norm = try loadTensorF32(store.gguf, norm_name);
+    var norm = try store.tensorF32(norm_name);
     defer norm.deinit();
     try layerNormChannelsRelu(conv_data, 1, channels, height, width, norm.data, eps);
     const shape = [_]i32{ 1, @intCast(channels), @intCast(height), @intCast(width) };
@@ -1027,8 +1191,18 @@ fn encodeSingleImage(
     const decoded = try image.decode(allocator, image_bytes);
     defer decoded.deinit(allocator);
 
+    return encodeSingleImageView(cb, allocator, store, cfg, .{ .data = decoded.data, .width = decoded.width, .height = decoded.height, .format = .rgb8 });
+}
+
+fn encodeSingleImageView(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    store: *ProjectorWeights,
+    cfg: Config,
+    decoded: image.ImageU8,
+) !EncodedImage {
     const geometry = targetGeometry(cfg, decoded.width, decoded.height);
-    const pixel_values = try image.preprocessDecodedRectScaledWithResample(
+    const pixel_values = try image.preprocessImageViewRectScaledWithResample(
         allocator,
         decoded,
         @intCast(geometry.width),
@@ -1036,7 +1210,7 @@ fn encodeSingleImage(
         cfg.image_mean,
         cfg.image_std,
         1.0 / 255.0,
-        .bilinear,
+        if (store.gguf == null) .torchvision_bicubic else .bilinear,
     );
     defer allocator.free(pixel_values);
 
@@ -1048,21 +1222,29 @@ fn encodeSingleImage(
 
     const hidden_shape = [_]i32{ @intCast(geometry.grid_x * geometry.grid_y), @intCast(cfg.vision_hidden) };
     var hidden = try cb.fromFloat32Shape(positioned, &hidden_shape);
-    errdefer cb.free(hidden);
+    var hidden_live = true;
+    errdefer if (hidden_live) cb.free(hidden);
 
     for (0..cfg.block_count) |layer| {
+        try cb.checkExecutionControl();
         const next = try encoderBlock(cb, allocator, store, cfg, hidden, geometry, layer);
         cb.free(hidden);
         hidden = next;
+        store.releaseCompletedNativeLayer();
+        if (store.gguf == null) {
+            var name_buf: [128]u8 = undefined;
+            try embeddingGemma2StageTensor(cb, allocator, try fmt(&name_buf, "image_layer_{d}", .{layer}), hidden);
+        }
     }
 
     const hidden_data = try cb.toFloat32(hidden, allocator);
     cb.free(hidden);
+    hidden_live = false;
     defer allocator.free(hidden_data);
 
     const pooled = try averagePoolSpatial(allocator, hidden_data, cfg, geometry);
     defer allocator.free(pooled);
-    try applyOptionalStandardization(allocator, store.gguf, pooled, cfg);
+    if (store.gguf) |gguf| try applyOptionalStandardization(allocator, gguf, pooled, cfg);
 
     const pooled_shape = [_]i32{ @intCast(geometry.tokenCount()), @intCast(cfg.vision_hidden) };
     const pooled_ct = try cb.fromFloat32Shape(pooled, &pooled_shape);
@@ -1070,10 +1252,11 @@ fn encodeSingleImage(
     const normed_pooled = try rmsNormNoScaleCt(cb, allocator, pooled_ct, geometry.tokenCount(), cfg.vision_hidden, cfg.layer_norm_eps);
     defer cb.free(normed_pooled);
 
-    const projection_w = try loadLinearWeightCt(cb, allocator, store.gguf, "mm.input_projection.weight", cfg.vision_hidden, cfg.text_hidden);
+    const projection_w = try store.linearCt("mm.input_projection.weight", cfg.vision_hidden, cfg.text_hidden);
     defer cb.free(projection_w);
     const projected = try cb.linearNoBias(normed_pooled, projection_w, geometry.tokenCount(), cfg.vision_hidden, cfg.text_hidden);
     defer cb.free(projected);
+    if (store.gguf == null) try embeddingGemma2StageTensor(cb, allocator, "image_projected", projected);
 
     return .{
         .embeddings = try cb.toFloat32(projected, allocator),
@@ -1100,7 +1283,7 @@ fn encodeUnifiedDirectImage(
         cfg.image_mean,
         cfg.image_std,
         1.0 / 255.0,
-        .bilinear,
+        if (store.gguf == null) .torchvision_bicubic else .bilinear,
     );
     defer allocator.free(pixel_values);
 
@@ -1112,7 +1295,7 @@ fn encodeUnifiedDirectImage(
     const patch_shape = [_]i32{ @intCast(geometry.tokenCount()), @intCast(patch_dim) };
     const patch_ct = try cb.fromFloat32Shape(patches, &patch_shape);
     defer cb.free(patch_ct);
-    const patch_w = try loadLinearWeightCt(cb, allocator, store.gguf, "v.patch_embd.weight", patch_dim, cfg.vision_hidden);
+    const patch_w = try store.linearCt("v.patch_embd.weight", patch_dim, cfg.vision_hidden);
     defer cb.free(patch_w);
     const patch_projected = try cb.linearNoBias(patch_ct, patch_w, geometry.tokenCount(), patch_dim, cfg.vision_hidden);
     defer cb.free(patch_projected);
@@ -1129,7 +1312,7 @@ fn encodeUnifiedDirectImage(
     defer cb.free(hidden_ct);
     const normed = try rmsNormNoScaleCt(cb, allocator, hidden_ct, geometry.tokenCount(), cfg.vision_hidden, cfg.layer_norm_eps);
     defer cb.free(normed);
-    const projection_w = try loadLinearWeightCt(cb, allocator, store.gguf, "mm.input_projection.weight", cfg.vision_hidden, cfg.text_hidden);
+    const projection_w = try store.linearCt("mm.input_projection.weight", cfg.vision_hidden, cfg.text_hidden);
     defer cb.free(projection_w);
     const projected = try cb.linearNoBias(normed, projection_w, geometry.tokenCount(), cfg.vision_hidden, cfg.text_hidden);
     defer cb.free(projected);
@@ -1184,9 +1367,9 @@ fn applyLayerNormFromTensors(
     defer allocator.free(weight_name);
     const bias_name = try std.fmt.allocPrint(allocator, "{s}.bias", .{prefix});
     defer allocator.free(bias_name);
-    var weight = try loadTensorF32(store.gguf, weight_name);
+    var weight = try store.tensorF32(weight_name);
     defer weight.deinit();
-    var bias = try loadTensorF32(store.gguf, bias_name);
+    var bias = try store.tensorF32(bias_name);
     defer bias.deinit();
     try layerNormRowsInPlace(data, rows, dim, weight.data, bias.data, eps);
 }
@@ -1227,7 +1410,7 @@ fn addBiasFromTensor(
     name: []const u8,
 ) !void {
     _ = allocator;
-    var bias = try loadTensorF32(store.gguf, name);
+    var bias = try store.tensorF32(name);
     defer bias.deinit();
     if (data.len != rows * dim or bias.data.len != dim) return error.InvalidTensorShape;
     for (0..rows) |row| {
@@ -1463,6 +1646,7 @@ fn audioLayer(
     const rows = inputs.valid_mask.len;
     const ff1 = try audioFeedForward(cb, allocator, store, cfg, input, rows, layer, false);
     defer cb.free(ff1);
+    if (store.gguf == null and layer == 0) try embeddingGemma2StageTensor(cb, allocator, "audio_0_feed_forward1", ff1);
     audioProfileMark(.ffn);
 
     var buf: [128]u8 = undefined;
@@ -1472,6 +1656,7 @@ fn audioLayer(
     audioProfileMark(.norms);
     const attn = try audioSelfAttention(cb, allocator, store, cfg, normed, inputs, layer);
     defer cb.free(attn);
+    if (store.gguf == null and layer == 0) try embeddingGemma2StageTensor(cb, allocator, "audio_0_self_attn", attn);
     audioProfileMark(.attn_out);
     const attn_post = try projectorVectorWeightCt(cb, allocator, store, try fmt(&buf, "a.blk.{d}.attn_post_norm.weight", .{layer}), cfg.audio_hidden);
     const attn_normed = try cb.rmsNorm(attn, attn_post, cfg.audio_hidden, cfg.layer_norm_eps);
@@ -1482,9 +1667,11 @@ fn audioLayer(
 
     const lconv = try audioLightConv(cb, allocator, store, cfg, res_attn, rows, layer);
     defer cb.free(lconv);
+    if (store.gguf == null and layer == 0) try embeddingGemma2StageTensor(cb, allocator, "audio_0_lconv1d", lconv);
     audioProfileMark(.lconv);
     const ff2 = try audioFeedForward(cb, allocator, store, cfg, lconv, rows, layer, true);
     defer cb.free(ff2);
+    if (store.gguf == null and layer == 0) try embeddingGemma2StageTensor(cb, allocator, "audio_0_feed_forward2", ff2);
     audioProfileMark(.ffn);
     const out_norm = try projectorVectorWeightCt(cb, allocator, store, try fmt(&buf, "a.blk.{d}.ln2.weight", .{layer}), cfg.audio_hidden);
     const out = try cb.rmsNorm(ff2, out_norm, cfg.audio_hidden, cfg.layer_norm_eps);
@@ -1783,7 +1970,13 @@ fn projectorConv2dWeightCt(
         in_channels: usize,
         out_channels: usize,
         fn call(self: @This()) !CT {
-            const host = try loadConv2dWeightCt(self.cb, self.allocator, self.store.gguf, self.name, self.kernel_h, self.kernel_w, self.in_channels, self.out_channels);
+            if (self.store.gguf == null) {
+                const tensor = try self.store.weightCt(self.name);
+                errdefer self.cb.free(tensor);
+                if (!(try self.cb.tensorShapeMatches(tensor, &.{ @intCast(self.out_channels), @intCast(self.in_channels), @intCast(self.kernel_h), @intCast(self.kernel_w) }) orelse false)) return error.InvalidTensorShape;
+                return self.cb.ensureDeviceResidentOwned(tensor);
+            }
+            const host = try loadConv2dWeightCt(self.cb, self.allocator, self.store.gguf.?, self.name, self.kernel_h, self.kernel_w, self.in_channels, self.out_channels);
             return self.cb.ensureDeviceResidentOwned(host);
         }
     };
@@ -1929,7 +2122,7 @@ fn audioLinearWithBias(
     }
     const data = try cb.toFloat32(linear, allocator);
     defer allocator.free(data);
-    var bias = try loadTensorF32(store.gguf, bias_name);
+    var bias = try store.tensorF32(bias_name);
     defer bias.deinit();
     if (bias.data.len != out_dim or data.len != rows * out_dim) return error.InvalidTensorShape;
     for (0..rows) |row| {
@@ -1984,13 +2177,13 @@ fn depthwiseCausalConv1d(
     const input_data = try cb.toFloat32(input, allocator);
     defer allocator.free(input_data);
     if (input_data.len != rows * hidden) return error.InvalidTensorShape;
-    var weight = try loadTensorF32(store.gguf, weight_name);
+    var weight = try store.tensorF32(weight_name);
     defer weight.deinit();
     if (weight.data.len != kernel_size * hidden or weight.shape.len < 2) return error.InvalidTensorShape;
     const d0: usize = @intCast(weight.shape[0]);
     const d1: usize = @intCast(weight.shape[1]);
     const kernel_first = d0 == kernel_size and d1 == hidden;
-    const hidden_first = d0 == hidden and d1 == kernel_size;
+    const hidden_first = d0 == hidden and (d1 == kernel_size or (store.gguf == null and weight.shape.len == 3 and d1 == 1 and weight.shape[2] == kernel_size));
     if (!kernel_first and !hidden_first) return error.InvalidTensorShape;
 
     const out = try allocator.alloc(f32, rows * hidden);
@@ -2039,12 +2232,17 @@ fn depthwiseConvWeightCt(
                     self.cb.free(resident);
                 } else |_| {}
             }
-            var weight = try loadTensorF32(self.store.gguf, self.name);
+            var weight = try self.store.tensorF32(self.name);
             defer weight.deinit();
             if (weight.data.len != self.kernel_size * self.hidden or weight.shape.len < 2) return error.InvalidTensorShape;
             const d0: usize = @intCast(weight.shape[0]);
             const d1: usize = @intCast(weight.shape[1]);
             const shape = [_]i32{ @intCast(self.kernel_size), @intCast(self.hidden) };
+            if (self.store.gguf == null and weight.shape.len == 3 and d0 == self.hidden and d1 == 1 and weight.shape[2] == self.kernel_size) {
+                const transposed = try transposeMatrix(self.allocator, weight.data, self.hidden, self.kernel_size);
+                defer self.allocator.free(transposed);
+                return self.cb.fromFloat32Shape(transposed, &shape);
+            }
             if (d0 == self.kernel_size and d1 == self.hidden) return self.cb.fromFloat32Shape(weight.data, &shape);
             if (d0 == self.hidden and d1 == self.kernel_size) {
                 const transposed = try transposeMatrix(self.allocator, weight.data, self.hidden, self.kernel_size);
@@ -2069,6 +2267,7 @@ fn audioLocalAttentionParams(cfg: AudioConfig, rows: usize) ops.Gemma4AudioLocal
         .k_scale = audioKeyScale(),
         .logit_cap = cfg.attention_logit_cap,
         .invalid_value = cfg.attention_invalid_logits_value,
+        .exclude_farthest_key = cfg.exclude_farthest_key,
     };
 }
 
@@ -2117,7 +2316,7 @@ pub fn audioLocalAttentionReference(
                     continue;
                 }
                 const k_idx: usize = @intCast(k_idx_signed);
-                if (!valid_mask[k_idx] or k_idx > q_idx or q_idx - k_idx > past) {
+                if (!valid_mask[k_idx] or k_idx > q_idx or q_idx - k_idx > past - @intFromBool(params.exclude_farthest_key)) {
                     scores[c] = params.invalid_value;
                     continue;
                 }
@@ -2486,7 +2685,28 @@ fn patchEmbed(
     defer allocator.free(scaled_pixels);
     for (scaled_pixels) |*value| value.* = 2.0 * (value.* - 0.5);
 
-    const patch_w = try loadWeightCt(cb, allocator, store.gguf, "v.patch_embd.weight");
+    if (store.gguf == null) {
+        // HF's patch linear flattens [patch_y, patch_x, channel]. GGUF's
+        // convolution uses [channel, patch_y, patch_x]; preserve the source
+        // layout instead of reinterpreting a same-size matrix.
+        const patch_count = geometry.grid_x * geometry.grid_y;
+        const patch_dim = cfg.patch_size * cfg.patch_size * 3;
+        const pixels = try allocator.alloc(f32, patch_count * patch_dim);
+        defer allocator.free(pixels);
+        for (0..geometry.grid_y) |gy| for (0..geometry.grid_x) |gx| for (0..cfg.patch_size) |py| for (0..cfg.patch_size) |px| for (0..3) |c| {
+            pixels[((gy * geometry.grid_x + gx) * patch_dim) + (py * cfg.patch_size + px) * 3 + c] = scaled_pixels[c * geometry.height * geometry.width + (gy * cfg.patch_size + py) * geometry.width + gx * cfg.patch_size + px];
+        };
+        try embeddingGemma2Stage(allocator, "image_patches", pixels);
+        const input = try deviceResidentFromFloat32(cb, pixels, &.{ @intCast(patch_count), @intCast(patch_dim) });
+        defer cb.free(input);
+        const w = try store.linearCt("v.patch_embd.weight", patch_dim, cfg.vision_hidden);
+        defer cb.free(w);
+        const projected = try cb.linearNoBias(input, w, patch_count, patch_dim, cfg.vision_hidden);
+        defer cb.free(projected);
+        return cb.toFloat32(projected, allocator);
+    }
+
+    const patch_w = try store.weightCt("v.patch_embd.weight");
     defer cb.free(patch_w);
     const zero_bias = try allocator.alloc(f32, cfg.vision_hidden);
     defer allocator.free(zero_bias);
@@ -2555,7 +2775,7 @@ fn addPositionEmbeddingsInPlace(
     geometry: Geometry,
 ) !void {
     _ = allocator;
-    var pos = try loadTensorF32(store.gguf, "v.position_embd.weight");
+    var pos = try store.tensorF32("v.position_embd.weight");
     defer pos.deinit();
     const hidden_first = pos.shape.len == 3 and
         pos.shape[0] == @as(i64, @intCast(cfg.vision_hidden)) and
@@ -2673,28 +2893,28 @@ fn encoderBlock(
     const total = geometry.grid_x * geometry.grid_y;
     var buf: [128]u8 = undefined;
 
-    const ln1 = try loadWeightCt(cb, allocator, store.gguf, try fmt(&buf, "v.blk.{d}.ln1.weight", .{layer}));
+    const ln1 = try store.weightCt(try fmt(&buf, "v.blk.{d}.ln1.weight", .{layer}));
     defer cb.free(ln1);
     const normed1 = try cb.rmsNorm(input, ln1, cfg.vision_hidden, cfg.layer_norm_eps);
     defer cb.free(normed1);
 
     const attn = try selfAttention(cb, allocator, store, cfg, normed1, geometry, layer, &buf);
     defer cb.free(attn);
-    const attn_post = try loadWeightCt(cb, allocator, store.gguf, try fmt(&buf, "v.blk.{d}.attn_post_norm.weight", .{layer}));
+    const attn_post = try store.weightCt(try fmt(&buf, "v.blk.{d}.attn_post_norm.weight", .{layer}));
     defer cb.free(attn_post);
     const attn_normed = try cb.rmsNorm(attn, attn_post, cfg.vision_hidden, cfg.layer_norm_eps);
     defer cb.free(attn_normed);
     const res1 = try cb.add(input, attn_normed);
     errdefer cb.free(res1);
 
-    const ln2 = try loadWeightCt(cb, allocator, store.gguf, try fmt(&buf, "v.blk.{d}.ln2.weight", .{layer}));
+    const ln2 = try store.weightCt(try fmt(&buf, "v.blk.{d}.ln2.weight", .{layer}));
     defer cb.free(ln2);
     const normed2 = try cb.rmsNorm(res1, ln2, cfg.vision_hidden, cfg.layer_norm_eps);
     defer cb.free(normed2);
 
     const ffn = try feedForward(cb, allocator, store, cfg, normed2, total, layer, &buf);
     defer cb.free(ffn);
-    const ffn_post = try loadWeightCt(cb, allocator, store.gguf, try fmt(&buf, "v.blk.{d}.ffn_post_norm.weight", .{layer}));
+    const ffn_post = try store.weightCt(try fmt(&buf, "v.blk.{d}.ffn_post_norm.weight", .{layer}));
     defer cb.free(ffn_post);
     const ffn_normed = try cb.rmsNorm(ffn, ffn_post, cfg.vision_hidden, cfg.layer_norm_eps);
     defer cb.free(ffn_normed);
@@ -2720,7 +2940,7 @@ fn selfAttention(
     var q = try linearNoBiasMaybeClipped(cb, allocator, store, input, try fmt(buf, "v.blk.{d}.attn_q", .{layer}), total, cfg.vision_hidden, cfg.vision_hidden);
     errdefer cb.free(q);
     {
-        const q_norm_w = try loadWeightCt(cb, allocator, store.gguf, try fmt(buf, "v.blk.{d}.attn_q_norm.weight", .{layer}));
+        const q_norm_w = try store.weightCt(try fmt(buf, "v.blk.{d}.attn_q_norm.weight", .{layer}));
         defer cb.free(q_norm_w);
         const normed = try rmsNormHeadChunksAnd2dRope(cb, allocator, q, q_norm_w, total, cfg.vision_hidden, head_dim, geometry, cfg.layer_norm_eps, cfg.rope_theta, true);
         cb.free(q);
@@ -2731,7 +2951,7 @@ fn selfAttention(
     var k = try linearNoBiasMaybeClipped(cb, allocator, store, input, try fmt(buf, "v.blk.{d}.attn_k", .{layer}), total, cfg.vision_hidden, cfg.vision_hidden);
     errdefer cb.free(k);
     {
-        const k_norm_w = try loadWeightCt(cb, allocator, store.gguf, try fmt(buf, "v.blk.{d}.attn_k_norm.weight", .{layer}));
+        const k_norm_w = try store.weightCt(try fmt(buf, "v.blk.{d}.attn_k_norm.weight", .{layer}));
         defer cb.free(k_norm_w);
         const normed = try rmsNormHeadChunksAnd2dRope(cb, allocator, k, k_norm_w, total, cfg.vision_hidden, head_dim, geometry, cfg.layer_norm_eps, cfg.rope_theta, false);
         cb.free(k);
@@ -2971,7 +3191,7 @@ fn projectorVectorWeightCt(
                     self.cb.free(resident);
                 } else |_| {}
             }
-            return loadWeightCt(self.cb, self.allocator, self.store.gguf, self.name);
+            return self.store.weightCt(self.name);
         }
     };
     return store.cached(name, Load{ .cb = cb, .allocator = allocator, .store = store, .name = name, .len = len });
@@ -3016,13 +3236,13 @@ fn linearNoBiasMaybeClipped(
     const output_max_name = try std.fmt.allocPrint(allocator, "{s}.output_max", .{prefix});
     defer allocator.free(output_max_name);
 
-    var input_min = try loadOptionalTensorF32(store.gguf, input_min_name);
+    var input_min = try store.optionalF32(input_min_name);
     defer if (input_min) |*tensor| tensor.deinit();
-    var input_max = try loadOptionalTensorF32(store.gguf, input_max_name);
+    var input_max = try store.optionalF32(input_max_name);
     defer if (input_max) |*tensor| tensor.deinit();
-    var output_min = try loadOptionalTensorF32(store.gguf, output_min_name);
+    var output_min = try store.optionalF32(output_min_name);
     defer if (output_min) |*tensor| tensor.deinit();
-    var output_max = try loadOptionalTensorF32(store.gguf, output_max_name);
+    var output_max = try store.optionalF32(output_max_name);
     defer if (output_max) |*tensor| tensor.deinit();
 
     var linear_input = input;
@@ -3152,7 +3372,7 @@ fn projectorLinearWeightCt(
                     self.cb.free(resident);
                 } else |_| {}
             }
-            return loadLinearWeightCt(self.cb, self.allocator, self.store.gguf, self.name, self.in_dim, self.out_dim);
+            return self.store.linearCt(self.name, self.in_dim, self.out_dim);
         }
     };
     return store.cached(name, Load{ .cb = cb, .allocator = allocator, .store = store, .name = name, .in_dim = in_dim, .out_dim = out_dim });
@@ -3425,7 +3645,7 @@ test "model-owned projector store serves requests with their own allocators" {
         defer first_arena.deinit();
         var weights = ProjectorWeights.init(undefined, first_arena.allocator(), projector.gguf, projector);
         defer weights.entries.deinit(first_arena.allocator());
-        var tensor = try loadTensorF32(weights.gguf, "a.blk.0.ffn_up.weight");
+        var tensor = try loadTensorF32(weights.gguf.?, "a.blk.0.ffn_up.weight");
         defer tensor.deinit();
         try std.testing.expectEqual(@as(usize, 2), tensor.data.len);
         const spec = (try weights.owner.?.clampSpec("a.blk.0.ffn_up")) orelse return error.TestUnexpectedResult;

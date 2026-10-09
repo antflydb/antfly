@@ -399,7 +399,7 @@ discarding its samples. A completed campaign also exits unsuccessfully when
 the aggregate or any per-cell performance guard fails; its complete report
 and raw samples remain available.
 
-`/decide` accepts optional `long_document` with `mode`, `window_words`,
+`/decisions` accepts optional `long_document` with `mode`, `window_words`,
 `overlap_words`, and `max_windows`. Omission keeps over-limit rejection.
 Window mode is limited to qualified boundary decision models; Decide-1B keeps
 its native context policy. Preload configuration accepts `cuda_precision`:

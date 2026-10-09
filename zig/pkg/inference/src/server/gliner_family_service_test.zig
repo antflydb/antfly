@@ -191,7 +191,7 @@ fn dispatchExtraction(a: Allocator, node: *Node, raw: []const u8) !httpx.Respons
 }
 
 fn dispatchDecide(a: Allocator, node: *Node, raw: []const u8) !httpx.Response {
-    var request = try httpx.Request.init(a, .POST, "/ai/v1/decide");
+    var request = try httpx.Request.init(a, .POST, "/ai/v1/decisions");
     defer request.deinit();
     request.body = raw;
     var context = httpx.Context.init(a, std.testing.io, &request);
@@ -329,10 +329,7 @@ fn linkedDecisionModel(a: Allocator, temporary: *std.testing.TmpDir, source: []c
 }
 
 fn decisionRequest(a: Allocator, captured: []const u8, model_name: []const u8) ![]u8 {
-    var parsed = try std.json.parseFromSlice(Value, a, captured, .{ .duplicate_field_behavior = .@"error" });
-    defer parsed.deinit();
-    try parsed.value.object.put(parsed.arena.allocator(), "model", .{ .string = model_name });
-    return std.json.Stringify.valueAlloc(a, parsed.value, .{});
+    return @import("gliner_decision_fixture.zig").requestJson(a, captured, model_name);
 }
 
 fn probability(map: std.json.ObjectMap, name: []const u8, expected: f64) !void {
@@ -344,7 +341,8 @@ fn expectDecision(a: Allocator, json: []const u8, model_name: []const u8, id: []
     defer parsed.deinit();
     const root = parsed.value.object;
     try std.testing.expectEqualStrings(model_name, root.get("model").?.string);
-    const answers = root.get("answers").?.object;
+    const normalized = try @import("gliner_decision_fixture.zig").comparisonValue(parsed.arena.allocator(), parsed.value);
+    const answers = normalized.object.get("answers").?.object;
     if (std.mem.eql(u8, id, "described_prompt_choice")) {
         const action = answers.get("action").?.object;
         try std.testing.expectEqualStrings("choice", action.get("type").?.string);

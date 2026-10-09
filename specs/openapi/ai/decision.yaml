@@ -1,0 +1,597 @@
+openapi: 3.0.3
+info:
+  title: Antfly Decisions API
+  version: v1alpha1
+  description: Standalone named choices, multi-label selections, scores and predicate judgments. Extraction
+    retains entity, relation, attribute, structured-record and ordinary classification workflows.
+paths: {}
+components:
+  schemas:
+    EmbeddingDecisionOptions:
+      type: object
+      additionalProperties: false
+      properties:
+        task_type:
+          type: string
+          enum:
+          - CLUSTERING
+          - CLASSIFICATION
+          default: CLUSTERING
+          description: Prompt profile for the decision input and category prototypes. The embedding endpoint
+            also accepts task_type; decision routing restricts it to these two profiles.
+        dimensions:
+          type: integer
+          enum:
+          - 768
+          - 512
+          - 256
+          - 128
+          default: 768
+          description: Truncate and renormalize embeddings to this dimension before cosine scoring.
+      description: Request-wide embedding geometry defaults. Acceptance thresholds and calibration belong
+        to individual questions.
+    EmbeddingDecisionAcceptance:
+      type: object
+      additionalProperties: false
+      properties:
+        calibration_id:
+          type: string
+          pattern: ^[A-Za-z0-9_-]{1,64}$
+          description: Public API identifier for a server-side fitted threshold artifact at model/calibrations/{id}.json.
+            The server verifies qualification and the exact asset identity, prompt profile, dimensions,
+            renderer and this question's label/prototype set. Mutually exclusive with manual thresholds;
+            never produces probabilities.
+        min_similarity:
+          type: number
+          minimum: -1
+          maximum: 1
+          description: For a single choice, abstain when the highest cosine similarity is below this value.
+            It is a similarity threshold, not an accuracy or probability estimate.
+        min_margin:
+          type: number
+          minimum: 0
+          maximum: 2
+          description: For a single choice, require this gap between the highest and second-highest cosine
+            similarities. For multi_choice, require every score to be at least this distance from its
+            own selection threshold; otherwise abstain.
+      description: Question-specific acceptance policy for embedding similarity. Trained decision models
+        reject it.
+    DecisionChoice:
+      type: object
+      additionalProperties: false
+      required:
+      - value
+      properties:
+        value: &id001
+          type: string
+          minLength: 1
+        description:
+          type: string
+          minLength: 1
+        examples:
+          type: array
+          items:
+            type: string
+            minLength: 1
+          minItems: 1
+          maxItems: 32
+      description: Local decision models use string choice identifiers. Embedding category examples replace
+        the description with their normalized centroid; trained models reject examples.
+    DecisionLevel:
+      type: object
+      additionalProperties: false
+      required:
+      - label
+      properties:
+        label: *id001
+        description:
+          type: string
+          minLength: 1
+      description: Ordered score level, from lowest to highest. Results assign zero-based numeric values
+        to these levels.
+    ChoiceDecisionQuestion:
+      type: object
+      additionalProperties: false
+      required:
+      - type
+      - name
+      - instructions
+      - choices
+      properties:
+        type:
+          type: string
+          enum:
+          - choice
+        name: *id001
+        instructions: *id001
+        choices:
+          type: array
+          items:
+            $ref: '#/components/schemas/DecisionChoice'
+          minItems: 2
+          maxItems: 64
+        embedding_options:
+          $ref: '#/components/schemas/EmbeddingDecisionAcceptance'
+    MultiChoiceDecisionQuestion:
+      type: object
+      additionalProperties: false
+      required:
+      - type
+      - name
+      - instructions
+      - choices
+      properties:
+        type:
+          type: string
+          enum:
+          - multi_choice
+        name: *id001
+        instructions: *id001
+        choices:
+          type: array
+          items:
+            $ref: '#/components/schemas/DecisionChoice'
+          minItems: 2
+          maxItems: 64
+        embedding_options:
+          $ref: '#/components/schemas/EmbeddingDecisionAcceptance'
+        similarity_thresholds:
+          description: Required raw cosine cutoff for every choice, either one common cutoff or a complete
+            choice-to-cutoff map. Alternatively supply a qualified question-specific calibration_id. Mutually
+            exclusive with calibration_id. Scores equal to their cutoff are selected.
+          oneOf:
+          - &id002
+            type: number
+            minimum: -1
+            maximum: 1
+          - type: object
+            additionalProperties: *id002
+      description: Antfly multi-label extension for embedding similarity; selected, empty and abstained
+        are distinct results.
+    ScoreDecisionQuestion:
+      type: object
+      additionalProperties: false
+      required:
+      - type
+      - name
+      - instructions
+      - levels
+      properties:
+        type:
+          type: string
+          enum:
+          - score
+        name: *id001
+        instructions: *id001
+        levels:
+          type: array
+          items:
+            $ref: '#/components/schemas/DecisionLevel'
+          minItems: 2
+          maxItems: 64
+    PredicateDecisionQuestion:
+      type: object
+      additionalProperties: false
+      required:
+      - type
+      - name
+      - instructions
+      properties:
+        type:
+          type: string
+          enum:
+          - predicate
+        name: *id001
+        instructions: *id001
+      description: Estimate whether the condition in instructions holds for the input. The trained answer
+        reports probability in [0,1].
+    DecideQuestion:
+      oneOf:
+      - $ref: '#/components/schemas/ChoiceDecisionQuestion'
+      - $ref: '#/components/schemas/MultiChoiceDecisionQuestion'
+      - $ref: '#/components/schemas/ScoreDecisionQuestion'
+      - $ref: '#/components/schemas/PredicateDecisionQuestion'
+    DecisionInput:
+      type: object
+      additionalProperties: false
+      required:
+      - input
+      properties:
+        id: *id001
+        input:
+          type: string
+          minLength: 1
+          maxLength: 1048576
+    DecideLongDocument:
+      type: object
+      additionalProperties: false
+      description: Explicit windowing for qualified boundary decision models. Span and embedding decision models reject window mode. Omission preserves rejection of over-limit text.
+      properties:
+        mode:
+          type: string
+          enum: [reject, window]
+          default: reject
+          x-go-type-skip-optional-pointer: false
+        window_words:
+          type: integer
+          minimum: 1
+          maximum: 4096
+          default: 1024
+          x-go-type-skip-optional-pointer: false
+        overlap_words:
+          type: integer
+          minimum: 0
+          maximum: 4095
+          default: 32
+          x-go-type-skip-optional-pointer: false
+          description: Must be smaller than window_words. Only valid in window mode.
+        max_windows:
+          type: integer
+          minimum: 1
+          maximum: 128
+          default: 128
+          x-go-type-skip-optional-pointer: false
+    DecideRequest:
+      type: object
+      additionalProperties: false
+      required:
+      - model
+      - questions
+      properties:
+        model: *id001
+        model_identity:
+          type: string
+          pattern: ^[0-9a-f]{64}$
+          description: Pin the exact EmbeddingGemma 2 assets and embedding recipe.
+        input:
+          type: string
+          minLength: 1
+          maxLength: 1048576
+        inputs:
+          type: array
+          items:
+            $ref: '#/components/schemas/DecisionInput'
+          minItems: 1
+          maxItems: 128
+        long_document:
+          $ref: '#/components/schemas/DecideLongDocument'
+        questions:
+          type: array
+          items:
+            $ref: '#/components/schemas/DecideQuestion'
+          minItems: 1
+          maxItems: 64
+        embedding_options:
+          $ref: '#/components/schemas/EmbeddingDecisionOptions'
+      description: Supply exactly one of input (single text) or inputs (Antfly batch extension). Question
+        names must be unique. Single text and named question arrays follow OpenAI Decisions conventions;
+        local models support text input and string choice values. Request bodies are bounded at 16 MiB.
+    DecisionUsage:
+      type: object
+      additionalProperties: false
+      required:
+      - input_tokens
+      - output_tokens
+      properties:
+        input_tokens:
+          type: integer
+          minimum: 0
+          description: Encoded tokens including repeated input text for split model tasks.
+        output_tokens:
+          type: integer
+          minimum: 0
+          description: Zero for classifiers, which generate no tokens.
+    DecisionChoiceProbability:
+      type: object
+      additionalProperties: false
+      required:
+      - value
+      - probability
+      properties:
+        value: *id001
+        probability:
+          type: number
+          minimum: 0
+          maximum: 1
+    DecisionLevelProbability:
+      type: object
+      additionalProperties: false
+      required:
+      - label
+      - value
+      - probability
+      properties:
+        label: *id001
+        value:
+          type: integer
+          minimum: 0
+        probability:
+          type: number
+          minimum: 0
+          maximum: 1
+    TrainedChoiceAnswer:
+      type: object
+      additionalProperties: false
+      required:
+      - name
+      - type
+      - decision_method
+      - choice
+      - probabilities
+      - confidence
+      - confidence_method
+      properties:
+        name: *id001
+        type:
+          type: string
+          enum:
+          - choice
+        decision_method:
+          type: string
+          enum:
+          - typed
+        confidence: &id003
+          type: number
+          minimum: 0
+          maximum: 1
+          description: Model diagnostic; entropy confidence is not the probability that the chosen label
+            is correct.
+        confidence_method: &id004
+          type: string
+          enum:
+          - normalized_inverse_entropy
+          - max_probability
+        act_probability: &id005
+          type: number
+          minimum: 0
+          maximum: 1
+          description: Applicable action-head diagnostic. It does not authorize or execute an action.
+        choice: *id001
+        probabilities:
+          type: array
+          items:
+            $ref: '#/components/schemas/DecisionChoiceProbability'
+          minItems: 2
+    TrainedScoreAnswer:
+      type: object
+      additionalProperties: false
+      required:
+      - name
+      - type
+      - decision_method
+      - score
+      - probabilities
+      - confidence
+      - confidence_method
+      properties:
+        name: *id001
+        type:
+          type: string
+          enum:
+          - score
+        decision_method:
+          type: string
+          enum:
+          - typed
+        confidence: *id003
+        confidence_method: *id004
+        act_probability: *id005
+        score:
+          type: number
+          minimum: 0
+        probabilities:
+          type: array
+          items:
+            $ref: '#/components/schemas/DecisionLevelProbability'
+          minItems: 2
+    TrainedPredicateAnswer:
+      type: object
+      additionalProperties: false
+      required:
+      - name
+      - type
+      - decision_method
+      - probability
+      properties:
+        name: *id001
+        type:
+          type: string
+          enum:
+          - predicate
+        decision_method:
+          type: string
+          enum:
+          - typed
+        confidence: *id003
+        confidence_method: *id004
+        act_probability: *id005
+        probability:
+          type: number
+          minimum: 0
+          maximum: 1
+          description: The model-estimated probability that the condition in instructions holds.
+    DecisionSimilarity:
+      type: object
+      additionalProperties: false
+      required:
+      - value
+      - similarity
+      properties:
+        value: *id001
+        similarity: *id002
+    EmbeddingChoiceAnswer:
+      type: object
+      additionalProperties: false
+      required:
+      - name
+      - type
+      - decision_method
+      - similarity_metric
+      - similarities
+      - margin
+      - status
+      - prototype_set_hash
+      - choice
+      properties:
+        name: *id001
+        type:
+          type: string
+          enum:
+          - choice
+        decision_method:
+          type: string
+          enum:
+          - embedding_similarity
+        similarity_metric:
+          type: string
+          enum:
+          - cosine
+          description: Cosine is fixed for this embedding recipe and its threshold artifacts. Index distance
+            settings are independent.
+        similarities:
+          type: array
+          items:
+            $ref: '#/components/schemas/DecisionSimilarity'
+          minItems: 2
+        margin:
+          type: number
+          minimum: 0
+          maximum: 2
+        status:
+          type: string
+          enum:
+          - selected
+          - abstained
+        prototype_set_hash:
+          type: string
+          pattern: ^[0-9a-f]{64}$
+        calibration_id:
+          type: string
+        abstention_reason:
+          type: string
+          enum:
+          - tie
+          - min_similarity
+          - min_margin
+        choice:
+          type: string
+          nullable: true
+          description: Selected identifier, or null on abstention.
+      description: Raw cosine scores are neither probabilities nor confidence. Empty means no label met
+        its threshold; abstained means the requested margin could not be established.
+    EmbeddingMultiChoiceAnswer:
+      type: object
+      additionalProperties: false
+      required:
+      - name
+      - type
+      - decision_method
+      - similarity_metric
+      - similarities
+      - margin
+      - status
+      - prototype_set_hash
+      - choices
+      - similarity_thresholds
+      properties:
+        name: *id001
+        type:
+          type: string
+          enum:
+          - multi_choice
+        decision_method:
+          type: string
+          enum:
+          - embedding_similarity
+        similarity_metric:
+          type: string
+          enum:
+          - cosine
+          description: Cosine is fixed for this embedding recipe and its threshold artifacts. Index distance
+            settings are independent.
+        similarities:
+          type: array
+          items:
+            $ref: '#/components/schemas/DecisionSimilarity'
+          minItems: 2
+        margin:
+          type: number
+          minimum: 0
+          maximum: 2
+        status:
+          type: string
+          enum:
+          - selected
+          - empty
+          - abstained
+        prototype_set_hash:
+          type: string
+          pattern: ^[0-9a-f]{64}$
+        calibration_id:
+          type: string
+        abstention_reason:
+          type: string
+          enum:
+          - tie
+          - min_similarity
+          - min_margin
+        choices:
+          type: array
+          items: *id001
+        similarity_thresholds:
+          type: object
+          additionalProperties:
+            type: number
+            minimum: -1
+            maximum: 1
+          description: Effective cosine selection threshold for every choice, including fitted calibration
+            thresholds.
+      description: Raw cosine scores are neither probabilities nor confidence. Empty means no label met
+        its threshold; abstained means the requested margin could not be established.
+    DecideAnswer:
+      oneOf:
+      - $ref: '#/components/schemas/TrainedChoiceAnswer'
+      - $ref: '#/components/schemas/TrainedScoreAnswer'
+      - $ref: '#/components/schemas/TrainedPredicateAnswer'
+      - $ref: '#/components/schemas/EmbeddingChoiceAnswer'
+      - $ref: '#/components/schemas/EmbeddingMultiChoiceAnswer'
+    DecisionBatchItem:
+      type: object
+      additionalProperties: false
+      required:
+      - input_index
+      - answers
+      properties:
+        input_index:
+          type: integer
+          minimum: 0
+        id: *id001
+        answers:
+          type: array
+          items:
+            $ref: '#/components/schemas/DecideAnswer'
+    DecideResponse:
+      type: object
+      additionalProperties: false
+      required:
+      - model
+      - usage
+      properties:
+        model:
+          type: string
+        model_identity:
+          type: string
+        renderer_version:
+          type: string
+        answers:
+          type: array
+          items:
+            $ref: '#/components/schemas/DecideAnswer'
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/DecisionBatchItem'
+        usage:
+          $ref: '#/components/schemas/DecisionUsage'
+      description: Single-input responses have answers. Batch responses have data in input order, with
+        one named answer array per input and aggregate usage.

@@ -1,10 +1,10 @@
 # Laya typed decisions
 
 Laya models answer classification questions without generating text. Antfly serves
-prepared Laya checkpoints through `/ai/v1/decide` using the model-independent
+prepared Laya checkpoints through `/ai/v1/decisions` using the model-independent
 [typed decision contract](decisions.md). They appear under deciders in model
-discovery and also support `/ai/v1/extract` with `schema_version: 2` and
-extraction provider `antfly`.
+discovery. Standalone typed decisions use `/decisions`; extraction keeps ordinary
+classification alongside entities, relations, attributes and structured records.
 
 Prepare a checkpoint from a local upstream download, or from a pinned Hugging
 Face revision:
@@ -28,116 +28,72 @@ internal batches. The English checkpoint was validated on NVIDIA L4 using fatbin
 artifacts. Portable PTX requires a driver compatible with the CUDA toolkit used
 to generate it.
 
-For decisions, submit the following to `/ai/v1/decide` (or pass the same JSON to
+For decisions, submit the following to `/ai/v1/decisions` (or pass the same JSON to
 `antfly_inference_decide_json` / Rust `Inference::decide`):
 
 ```json
 {
   "model": "laya",
-  "state": "Find the document about refunds.",
-  "questions": {
-    "tool": {
+  "questions": [
+    {
+      "name": "tool",
       "type": "choice",
       "instructions": "Which tool should handle the request?",
-      "criteria": {
-        "search": "Find documents matching a topic",
-        "fetch_document": "Retrieve a document with a known ID",
-        "no_tool": "Respond without a tool"
-      }
+      "choices": [
+        {
+          "value": "search",
+          "description": "Find documents matching a topic"
+        },
+        {
+          "value": "fetch_document",
+          "description": "Retrieve a document with a known ID"
+        },
+        {
+          "value": "no_tool",
+          "description": "Respond without a tool"
+        }
+      ]
     },
-    "urgency": {
+    {
+      "name": "urgency",
       "type": "score",
       "instructions": "How urgent is this request?",
-      "criteria": ["Routine", "Soon", "Immediate"]
+      "levels": [
+        {
+          "label": "0",
+          "description": "Routine"
+        },
+        {
+          "label": "1",
+          "description": "Soon"
+        },
+        {
+          "label": "2",
+          "description": "Immediate"
+        }
+      ]
     },
-    "tool_needed": {
-      "type": "noul",
+    {
+      "name": "tool_needed",
+      "type": "predicate",
       "instructions": "Answering requires retrieving external information."
     }
-  }
+  ],
+  "input": "Find the document about refunds."
 }
 ```
 
-The response has named `answers`: `choice` and its distribution, an expected
-zero-based `score` with its distribution and legend, and the `noul` true
-probability. See the [decision guide](decisions.md) for HTTP command hooks,
-embedded inference, and SQL providers.
+The response has a named `answers` array: `choice` and its probability
+array, an expected zero-based `score` and labeled probability array, and a
+`predicate` true `probability`. Confidence and `confidence_method` remain model
+diagnostics. `act_probability` preserves the auxiliary action-head output for
+Laya checkpoints; OpenDecider-nano has no action head. Decisions do not execute
+a tool. Applications validate arguments and apply their action policy.
 
-## Extraction compatibility
-
-The extraction form remains available at `/ai/v1/extract` for callers using
-classification schemas and extraction metadata:
-
-
-```json
-{
-  "model": "laya",
-  "schema_version": 2,
-  "inputs": [{"id": "request-1", "content": "Find the document about refunds."}],
-  "schema": {
-    "classifications": [
-      {
-        "name": "tool",
-        "mode": "single",
-        "instruction": "Which tool should handle the request?",
-        "labels": ["search", "fetch_document", "no_tool"],
-        "label_definitions": {
-          "search": {"description": "Find documents matching a topic"},
-          "fetch_document": {"description": "Retrieve a document with a known ID"},
-          "no_tool": {"description": "Respond without a tool"}
-        }
-      },
-      {
-        "name": "urgency",
-        "mode": "ordinal",
-        "instruction": "How urgent is this request?",
-        "labels": ["routine", "soon", "immediate"]
-      },
-      {
-        "name": "tool_needed",
-        "mode": "boolean",
-        "instruction": "Does answering require retrieving external information?",
-        "labels": ["false", "true"]
-      }
-    ]
-  }
-}
-```
-
-`single` maps to Laya `choice`, `ordinal` to `score`, and `boolean` to `noul`.
-Boolean labels must be exactly `false`, then `true`. Each task requires a name,
-an instruction (`prompt` is an alias), and 2–20 distinct labels. Ordinal labels
-are ordered from lowest to highest; descriptions, when present, supply rubric
-text. Per-input `schema` and `options` replace the corresponding shared values.
-
-Each output contains compatible `classifications` entries with the selected
-label and its probability, plus `decisions` with:
-
-- The full probability distribution in request label order.
-- `expected_value` for ordinal tasks, on the zero-based level scale.
-- `true_probability` for boolean tasks.
-- `confidence` and `confidence_method`. Choice and ordinal confidence measures
-  normalized inverse entropy; boolean confidence is the larger class probability.
-- `act_probability`, the auxiliary action-head output, for models that have
-  one (Laya checkpoints; not OpenDecider-nano).
-
-The action probability does not execute a tool. An agent can consume these
-results to select a tool or a bounded argument; application state, another
-extractor, or a generator supplies free-form arguments. The application validates
-and executes the resulting call.
-
-The current Laya executor accepts text-only classification schemas. It rejects
-multi-label tasks, entities, relations, structures, examples, constraints,
-windowing, and unsupported options. `top_k`, when supplied, must be 1. Full
-probabilities are always available in `decisions`. Entire batches are validated
-and tokenized before inference. Inputs that exceed the checkpoint token budget,
-including question and option tokens, are rejected instead of silently truncated.
-Up to 128 inputs, 64 tasks per input, and 512 total tasks are accepted, subject
-to the server's memory and executor limits.
-
-Checkpoint selection is explicit. Benchmark application-specific accuracy and
-calibration before choosing thresholds; model confidence does not establish that
-a tool choice is correct. This integration does not change the GLiNER v2 executor.
+Batches use `inputs` with optional IDs; results preserve input order and IDs in
+`data` with aggregate token usage. See the [decision guide](decisions.md) for
+HTTP, CLI, embedded inference and SQL examples. The unreleased extraction
+`decisions` output and Boolean decision modes have been removed.
 
 ## OpenDecider-nano
 

@@ -1275,9 +1275,24 @@ pub fn preprocessDecodedRectScaledWithResample(
     rescale_factor: f32,
     resample: Resample,
 ) ![]f32 {
+    return preprocessImageViewRectScaledWithResample(allocator, toSharedImage(img), target_width, target_height, mean, std_dev, rescale_factor, resample);
+}
+
+/// Rectangular preprocessing of borrowed pixels; honors format and row stride
+/// without copying or retaining the full source image.
+pub fn preprocessImageViewRectScaledWithResample(
+    allocator: std.mem.Allocator,
+    img: ImageU8,
+    target_width: u32,
+    target_height: u32,
+    mean: [3]f32,
+    std_dev: [3]f32,
+    rescale_factor: f32,
+    resample: Resample,
+) ![]f32 {
     var values = try shared.preprocessDecodedRectWithResample(
         allocator,
-        toSharedImage(img),
+        img,
         target_width,
         target_height,
         mean,
@@ -2547,4 +2562,21 @@ test "clip batch preprocessing drains workers before returning an image error" {
             .{ 1, 1, 1 },
         ));
     }
+}
+
+test "embeddinggemma2 raster rectangular bicubic matches decoded RGB and releases scratch on failure" {
+    const Runner = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var rgb = [_]u8{ 255, 0, 0, 0, 255, 0, 0, 0, 255, 7, 8, 9 };
+            const rgba = [_]u8{ 255, 0, 0, 255, 0, 255, 0, 255, 91, 92, 93, 94, 0, 0, 255, 255, 7, 8, 9, 255, 81, 82, 83, 84 };
+            const raster = antfly_image.BorrowedRasterAttachment{ .bytes = &rgba, .width = 2, .height = 2, .stride_bytes = 12 };
+            const expected = try preprocessDecodedRectScaledWithResample(a, .{ .data = &rgb, .width = 2, .height = 2, .channels = 3 }, 7, 5, .{ 0, 0, 0 }, .{ 1, 1, 1 }, 1.0 / 255.0, .torchvision_bicubic);
+            defer a.free(expected);
+            const actual = try preprocessImageViewRectScaledWithResample(a, try raster.imageView(), 7, 5, .{ 0, 0, 0 }, .{ 1, 1, 1 }, 1.0 / 255.0, .torchvision_bicubic);
+            defer a.free(actual);
+            try std.testing.expectEqualSlices(f32, expected, actual);
+        }
+    };
+    try Runner.run(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }

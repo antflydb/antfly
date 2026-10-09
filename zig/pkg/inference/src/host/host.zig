@@ -228,6 +228,8 @@ test "standalone provider ABI rejects cancellation before dispatch" {
 }
 
 const ModelTextsRequest = struct {
+    model_identity: ?[]const u8 = null,
+    dimensions: ?u32 = null,
     model: []const u8,
     texts: []const []const u8,
     task_type: ?[]const u8 = null,
@@ -235,6 +237,8 @@ const ModelTextsRequest = struct {
 };
 
 const ModelPartsRequest = struct {
+    model_identity: ?[]const u8 = null,
+    dimensions: ?u32 = null,
     model: []const u8,
     parts: []const template_content.ContentPart,
     attachment_count: usize = 0,
@@ -1046,6 +1050,8 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
         .embed_dense_texts, .embed_dense_texts_with_context => blk: {
             var parsed = try std.json.parseFromSlice(ModelTextsRequest, alloc, request_json, .{ .ignore_unknown_fields = true });
             defer parsed.deinit();
+            var identity_handle = if (parsed.value.model_identity) |expected| try state.node.pinEmbeddingModelIdentity(alloc, state.io, parsed.value.model, expected, execution_control) else null;
+            defer if (identity_handle) |*handle| handle.release();
             const result = if (operation == .embed_dense_texts_with_context)
                 try state.node.embedDenseTextsDirectWithExecutionControlAndTask(
                     state.alloc,
@@ -1064,6 +1070,11 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
                     parsed.value.model,
                     parsed.value.texts,
                 );
+            state.node.applyDenseEmbeddingDimensions(alloc, state.io, parsed.value.model, result, parsed.value.dimensions) catch |err| {
+                for (result) |values| alloc.free(values);
+                alloc.free(result);
+                return err;
+            };
             if (context.out_numeric_result != null) {
                 errdefer {
                     for (result) |values| alloc.free(values);
@@ -1101,6 +1112,8 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
                 context.attachment_refs_len,
             );
             defer alloc.free(parts);
+            var identity_handle = if (parsed.value.model_identity) |expected| try state.node.pinEmbeddingModelIdentity(alloc, state.io, parsed.value.model, expected, execution_control) else null;
+            defer if (identity_handle) |*handle| handle.release();
             const result = try localAntflyEmbedDensePartsWithExecutionContext(
                 &state.node,
                 alloc,
@@ -1111,6 +1124,11 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
                 if (operation == .embed_dense_parts_with_context) parsed.value.task_type else null,
                 if (operation == .embed_dense_parts_with_context) parsed.value.instruction else null,
             );
+            state.node.applyDenseEmbeddingDimensions(alloc, state.io, parsed.value.model, result, parsed.value.dimensions) catch |err| {
+                for (result) |values| alloc.free(values);
+                alloc.free(result);
+                return err;
+            };
             if (context.out_numeric_result != null) {
                 errdefer {
                     for (result) |values| alloc.free(values);
@@ -1463,6 +1481,8 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
                 .decoded_pixels = pixels,
                 .max_media_parts_per_item = 1,
             });
+            var identity_handle = if (decoded.metadata.value.model_identity) |expected| try state.node.pinEmbeddingModelIdentity(alloc, state.io, decoded.metadata.value.model, expected, execution_control) else null;
+            defer if (identity_handle) |*handle| handle.release();
             const vectors = try state.node.embedDenseRastersDirectWithExecutionControl(
                 alloc,
                 state.io,
@@ -1470,6 +1490,11 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
                 decoded.metadata.value.model,
                 decoded.images,
             );
+            state.node.applyDenseEmbeddingDimensions(alloc, state.io, decoded.metadata.value.model, vectors, decoded.metadata.value.dimensions) catch |err| {
+                for (vectors) |vector| alloc.free(vector);
+                alloc.free(vectors);
+                return err;
+            };
             if (context.out_numeric_result != null) {
                 errdefer {
                     for (vectors) |vector| alloc.free(vector);
@@ -2393,7 +2418,7 @@ fn localAntflyEmbedDenseTextsWithContext(
 ) anyerror![][]f32 {
     const node: *inference.server.Node = @ptrCast(@alignCast(ptr));
     var adapter = LocalInferenceControlAdapter{ .context = context };
-    return try node.embedDenseTextsDirectWithExecutionControlAndTask(
+    const result = try node.embedDenseTextsDirectWithExecutionControlAndTask(
         alloc,
         context.request.io,
         adapter.control(),
@@ -2402,6 +2427,12 @@ fn localAntflyEmbedDenseTextsWithContext(
         context.task_type.canonical(),
         context.instruction,
     );
+    errdefer {
+        for (result) |vector| alloc.free(vector);
+        alloc.free(result);
+    }
+    try node.applyDenseEmbeddingDimensions(alloc, context.request.io, model, result, context.dimensions);
+    return result;
 }
 
 fn localAntflyEmbedDensePartsWithExecutionContext(
@@ -2503,7 +2534,7 @@ fn localAntflyEmbedDensePartsWithContext(
     context: request_types.EmbeddingRequestContext,
 ) anyerror![][]f32 {
     var adapter = LocalInferenceControlAdapter{ .context = context };
-    return try localAntflyEmbedDensePartsWithExecutionContext(
+    const result = try localAntflyEmbedDensePartsWithExecutionContext(
         ptr,
         alloc,
         model,
@@ -2513,6 +2544,13 @@ fn localAntflyEmbedDensePartsWithContext(
         context.task_type.canonical(),
         context.instruction,
     );
+    errdefer {
+        for (result) |vector| alloc.free(vector);
+        alloc.free(result);
+    }
+    const node: *inference.server.Node = @ptrCast(@alignCast(ptr));
+    try node.applyDenseEmbeddingDimensions(alloc, context.request.io, model, result, context.dimensions);
+    return result;
 }
 
 fn localAntflyEmbedSparseTexts(
@@ -3643,3 +3681,25 @@ const PullProgressReporter = struct {
         if (callback(self.context.progress_context, &view) == 0) self.cancelled.store(true, .release);
     }
 };
+
+test "standalone raster embedding control preserves dimensions pins and borrowed strides" {
+    const a = std.testing.allocator;
+    const identity: [64]u8 = @splat('a');
+    const bytes = [_]u8{ 255, 0, 0, 255, 0, 255, 0, 255, 91, 92, 93, 94 };
+    const metadata = try std.json.Stringify.valueAlloc(a, inference_bridge.ReadRasterImagesRequest{
+        .model = "embeddinggemma2",
+        .model_identity = &identity,
+        .dimensions = 128,
+        .raster_count = 1,
+        .rasters = &.{.{ .width = 2, .height = 1, .stride_bytes = 12, .format = .rgba8 }},
+    }, .{});
+    defer a.free(metadata);
+    const payloads = [_]inference_bridge.ProviderBinaryPayload{.{ .bytes = inference_bridge.String.init(&bytes), .content_type = inference_bridge.String.init("image/x-antfly-rgba8") }};
+    const refs = [_]inference_bridge.ProviderAttachmentRef{.{ .attachment_index = 0 }};
+    var decoded = try decodeReadRasterImagesProviderRequest(a, metadata, &payloads, 1, &refs, 1);
+    defer decoded.deinit(a);
+    try std.testing.expectEqual(@as(?u32, 128), decoded.metadata.value.dimensions);
+    try std.testing.expectEqualStrings(&identity, decoded.metadata.value.model_identity.?);
+    try std.testing.expectEqual(@as(usize, 12), decoded.images[0].stride_bytes);
+    try std.testing.expectEqual(@intFromPtr(bytes[0..].ptr), @intFromPtr(decoded.images[0].bytes.ptr));
+}

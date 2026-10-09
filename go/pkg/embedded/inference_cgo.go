@@ -366,7 +366,7 @@ func (inf *Inference) Rewrite(request []byte) ([]byte, error) {
 }
 
 // Decide answers named choice, ordinal score, and Boolean questions
-// via the inference API's POST /ai/v1/decide.
+// via the inference API's POST /ai/v1/decisions.
 func (inf *Inference) Decide(request []byte) ([]byte, error) {
 	return inf.call(request, func(handle unsafe.Pointer, input C.antfly_slice, out *C.antfly_buffer) C.antfly_error_code {
 		return C.antfly_inference_decide_json((*C.antfly_inference)(handle), input, out)

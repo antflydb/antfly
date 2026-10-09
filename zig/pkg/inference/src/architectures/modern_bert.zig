@@ -2143,6 +2143,42 @@ test "ModernBERT rejects declared semantics its fused kernels do not implement" 
     }
 }
 
+test "ModernBERT accepts prepared Laya legacy position metadata without changing RoPE" {
+    const prefix =
+        \\{"model_type":"modernbert","hidden_size":64,"num_hidden_layers":2,
+        \\"num_attention_heads":1,"intermediate_size":96,"max_position_embeddings":128,
+        \\"global_rope_theta":160000,"local_rope_theta":10000,
+        \\"laya":{"head_layers":2,"max_len":128,"head_max_len":64},
+    ;
+    const baseline = try parseConfig(std.testing.allocator, prefix ++ "\"attention_bias\":false}");
+    for ([_][]const u8{ "\"sans_pos\"", "\"absolute\"", "null", "false", "\"relative\"" }) |position_type| {
+        const json = try std.fmt.allocPrint(std.testing.allocator, "{s}\"position_embedding_type\":{s}}}", .{ prefix, position_type });
+        defer std.testing.allocator.free(json);
+        const config = try parseConfig(std.testing.allocator, json);
+        try std.testing.expectEqualDeep(baseline, config);
+        try std.testing.expect(config.laya != null);
+        try std.testing.expect(!config.rope_interleaved);
+        try std.testing.expectEqual(CheckpointLayout.huggingface_fused_qkv_no_bias, config.checkpoint_layout);
+    }
+    for ([_][]const u8{
+        "\"position_embedding_type\":\"absolute\",\"hidden_activation\":\"relu\"}",
+        "\"position_embedding_type\":\"absolute\",\"attention_bias\":true}",
+        "\"position_embedding_type\":\"absolute\",\"mlp_bias\":true}",
+        "\"position_embedding_type\":\"absolute\",\"norm_bias\":true}",
+    }) |suffix| {
+        const json = try std.mem.concat(std.testing.allocator, u8, &.{ prefix, suffix });
+        defer std.testing.allocator.free(json);
+        try std.testing.expectError(error.UnsupportedModernBertConfig, parseConfig(std.testing.allocator, json));
+    }
+    try std.testing.expectError(error.InvalidLayaConfig, parseConfig(std.testing.allocator,
+        \\{"model_type":"modernbert","position_embedding_type":"absolute","laya":null}
+    ));
+    try std.testing.expectError(error.InvalidLayaConfig, parseConfig(std.testing.allocator,
+        \\{"model_type":"modernbert","position_embedding_type":"absolute","max_position_embeddings":128,
+        \\"laya":{"max_len":512,"head_max_len":64}}
+    ));
+}
+
 test "HuggingFace ModernBERT fused checkpoint omits layer zero attention norm and all biases" {
     const allocator = std.testing.allocator;
     var store = native_compute.WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };

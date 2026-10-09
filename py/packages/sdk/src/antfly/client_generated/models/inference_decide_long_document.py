@@ -13,8 +13,8 @@ T = TypeVar("T", bound="InferenceDecideLongDocument")
 
 @_attrs_define
 class InferenceDecideLongDocument:
-    """Explicit windowing for qualified boundary decision models. Span decision models use their native context and reject
-    window mode. Omission preserves rejection of over-limit text.
+    """Explicit windowing for qualified boundary decision models. Span and embedding decision models reject window mode.
+    Omission preserves rejection of over-limit text.
 
         Attributes:
             mode (InferenceDecideLongDocumentMode | Unset):  Default: InferenceDecideLongDocumentMode.REJECT.

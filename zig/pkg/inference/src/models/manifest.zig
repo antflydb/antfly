@@ -203,6 +203,7 @@ pub const EmbeddingStyle = enum {
     jina_v5,
     /// Qwen3-Embedding trailing-EOS last-token pooling.
     qwen3_embedding,
+    embedding_gemma2,
 };
 
 /// Tracks which executable fields were declared by Antfly-owned
@@ -278,6 +279,8 @@ pub const listing_compatibility_sidecars = [_][]const u8{
     "modules.json",
     "1_Pooling/config.json",
     "config_sentence_transformers.json",
+    "processor_config.json",
+    "tokenizer_config.json",
 };
 
 /// Resolved model configuration loaded from a model directory.
@@ -405,6 +408,7 @@ pub const ModelManifest = struct {
     add_eos_token: bool = false,
 
     pub fn maxTextSequenceLength(self: *const ModelManifest) usize {
+        if (self.embedding_style == .embedding_gemma2) return 8192;
         if (self.gliner_boundary_config) |config| return config.max_len;
         const position_id_mode: bert.PositionIdMode = if (self.bert_model_type == .roberta)
             .roberta_padding
@@ -504,6 +508,8 @@ pub const ModelManifest = struct {
     }
 
     pub fn hasCapability(self: *const ModelManifest, cap: []const u8) bool {
+        if (self.embedding_style == .embedding_gemma2 and std.mem.eql(u8, cap, "embedding_similarity")) return true;
+
         if (!self.hasSupportedGlinerRuntime()) return false;
         for (self.capabilities) |c| {
             if (std.mem.eql(u8, c, cap)) return true;
@@ -1404,8 +1410,9 @@ fn loadFromCatalog(allocator: std.mem.Allocator, catalog: *const ArtifactCatalog
         if (manifest.gliner_architecture == .span) manifest.gliner_span_tokenizer_digest = boundary_bundle.Digest.of(tok_bytes);
         // This scan only discovers GLiNER markers. Keep the fresh file read
         // and its errors, but avoid building a vocabulary-sized JSON tree for
-        // explicitly declared Qwen3 embedders that cannot use those markers.
-        if (!canSkipQwen3EmbedderGlinerTokenScan(&manifest, model_dir_path, tok_bytes)) {
+        // known embedders that cannot use those markers. EmbeddingGemma 2's
+        // tokenizer contract is still validated during admitted construction.
+        if (!canSkipEmbedderGlinerTokenScan(&manifest, model_dir_path, tok_bytes)) {
             try ignoreNonResourceMetadataError(parseTokenizerJsonSpecialTokens(&manifest, allocator, tok_bytes));
         }
     }
@@ -1775,6 +1782,25 @@ fn applySentenceTransformersPrompts(
 }
 
 fn applyImplicitModelTypeHints(manifest: *ModelManifest, model_dir_path: []const u8) !void {
+    if (@import("../architectures/embedding_gemma2.zig").isModel(manifest.config_model_arch)) {
+        if (manifest.model_type != .embedder or manifest.embedding_style != .embedding_gemma2 or
+            manifest.pooling != .mean or !manifest.normalize) return error.InvalidEmbeddingTaskProfile;
+        // Architecture evidence fixes the primary role even when secondary
+        // classification/decision tasks are declared by a bundle.
+        manifest.model_type_origin = .config;
+        if (manifest.inputs.len == 0) try setManifestInputs(manifest.allocator, manifest, &.{"text"});
+        for (manifest.inputs) |input| if (!std.mem.eql(u8, input, "text") and !std.mem.eql(u8, input, "image") and !std.mem.eql(u8, input, "audio")) return error.InvalidModelManifest;
+        try removeManifestStrings(manifest.allocator, &manifest.tasks, &.{ "extract", "classify" });
+        try removeManifestStrings(manifest.allocator, &manifest.capabilities, &.{ "typed_decisions", "classification", "extraction" });
+        try appendManifestStrings(manifest.allocator, &manifest.tasks, &.{ "embed", "decide" });
+        try appendManifestStrings(manifest.allocator, &manifest.capabilities, &.{"embedding_similarity"});
+        return;
+    }
+    if (manifest.laya_declared and manifest.hasCapability("typed_decisions")) {
+        try removeManifestStrings(manifest.allocator, &manifest.tasks, &.{ "extract", "classify" });
+        try removeManifestStrings(manifest.allocator, &manifest.capabilities, &.{ "classification", "extraction" });
+        try appendManifestStrings(manifest.allocator, &manifest.tasks, &.{"decide"});
+    }
     if (inferGlinerModelType(manifest, model_dir_path)) |gliner_type| {
         if (manifest.gliner_model_type.len > 0 and !std.mem.eql(u8, manifest.gliner_model_type, gliner_type)) {
             manifest.allocator.free(manifest.gliner_model_type);
@@ -2657,6 +2683,28 @@ fn parseConfigJson(manifest: *ModelManifest, allocator: std.mem.Allocator, json_
             }
         }
     }
+    if (obj.get("model_type")) |mt| {
+        if (mt == .string and @import("../architectures/embedding_gemma2.zig").isModel(mt.string)) {
+            const cfg = try @import("../architectures/embedding_gemma2.zig").parseConfig(allocator, json_bytes);
+            if (manifest.model_manifest_declarations.embedding_style and manifest.embedding_style != .embedding_gemma2) return error.InvalidEmbeddingTaskProfile;
+            manifest.embedding_style = .embedding_gemma2;
+            manifest.model_type = .embedder;
+            manifest.hidden_size = @intCast(cfg.embedding_dim);
+            manifest.intermediate_size = @intCast(cfg.intermediate_size);
+            manifest.num_hidden_layers = @intCast(cfg.num_hidden_layers);
+            manifest.num_attention_heads = @intCast(cfg.num_attention_heads);
+            manifest.bert_vocab_size = @intCast(cfg.vocab_size);
+            manifest.max_position_embeddings = 8192;
+            manifest.pooling = .mean;
+            manifest.normalize = true;
+            for (manifest.inputs) |input| {
+                if ((std.mem.eql(u8, input, "image") and !cfg.vision) or (std.mem.eql(u8, input, "audio") and !cfg.audio)) return error.InvalidEmbeddingTaskProfile;
+            }
+            if (!manifest.model_manifest_declarations.inputs) {
+                try setManifestInputs(allocator, manifest, if (cfg.vision and cfg.audio) &.{ "text", "image", "audio" } else if (cfg.vision) &.{ "text", "image" } else if (cfg.audio) &.{ "text", "audio" } else &.{"text"});
+            }
+        }
+    }
 }
 
 fn parseSentenceTransformersPoolingConfig(manifest: *ModelManifest, allocator: std.mem.Allocator, json_bytes: []const u8) !void {
@@ -2666,6 +2714,9 @@ fn parseSentenceTransformersPoolingConfig(manifest: *ModelManifest, allocator: s
     if (parsed.value != .object) return;
     const obj = parsed.value.object;
     var selected: ?PoolingStrategy = null;
+    if (obj.get("pooling_mode")) |mode| {
+        if (mode == .string and std.mem.eql(u8, mode.string, "mean")) selected = .mean;
+    }
 
     if (jsonBool(obj.get("pooling_mode_cls_token"))) selected = .cls;
     if (jsonBool(obj.get("pooling_mode_mean_tokens"))) {
@@ -2737,6 +2788,21 @@ fn parseListingConfigJson(manifest: *ModelManifest, allocator: std.mem.Allocator
                 if (manifest.model_type == .embedder) manifest.model_type = .classifier;
             } else if (std.mem.eql(u8, s, "jina_embeddings_v5")) {
                 manifest.model_type = .embedder;
+            }
+        }
+    }
+
+    if (obj.get("model_type")) |mt| {
+        if (mt == .string and @import("../architectures/embedding_gemma2.zig").isModel(mt.string)) {
+            const cfg = try @import("../architectures/embedding_gemma2.zig").parseConfig(allocator, json_bytes);
+            manifest.model_type = .embedder;
+            manifest.embedding_style = .embedding_gemma2;
+            manifest.hidden_size = 768;
+            manifest.max_position_embeddings = 8192;
+            manifest.pooling = .mean;
+            manifest.normalize = true;
+            if (!manifest.model_manifest_declarations.inputs) {
+                try setManifestInputs(allocator, manifest, if (cfg.vision and cfg.audio) &.{ "text", "image", "audio" } else if (cfg.vision) &.{ "text", "image" } else if (cfg.audio) &.{ "text", "audio" } else &.{"text"});
             }
         }
     }
@@ -2927,7 +2993,7 @@ fn parseEmbeddingTaskContractJson(value: std.json.Value) !EmbeddingTaskContract 
 
 fn parseEmbeddingStyleJson(value: std.json.Value) !EmbeddingStyle {
     if (value != .string) return error.InvalidEmbeddingTaskProfile;
-    inline for (.{ "none", "jina_v5", "qwen3_embedding" }) |name| {
+    inline for (.{ "none", "jina_v5", "qwen3_embedding", "embedding_gemma2" }) |name| {
         if (std.mem.eql(u8, value.string, name)) return @field(EmbeddingStyle, name);
     }
     return error.InvalidEmbeddingTaskProfile;
@@ -3661,6 +3727,47 @@ fn setManifestInputs(allocator: std.mem.Allocator, manifest: *ModelManifest, inp
     manifest.inputs = owned;
 }
 
+fn removeManifestStrings(allocator: std.mem.Allocator, field: *[][]const u8, removals: []const []const u8) !void {
+    var count: usize = 0;
+    for (field.*) |existing| {
+        for (removals) |removal| {
+            if (std.mem.eql(u8, existing, removal)) break;
+        } else count += 1;
+    }
+    if (count == field.len) return;
+    const next = try allocator.alloc([]const u8, count);
+    var index: usize = 0;
+    for (field.*) |existing| {
+        for (removals) |removal| {
+            if (std.mem.eql(u8, existing, removal)) {
+                allocator.free(existing);
+                break;
+            }
+        } else {
+            next[index] = existing;
+            index += 1;
+        }
+    }
+    allocator.free(field.*);
+    field.* = next;
+}
+
+fn appendManifestStrings(allocator: std.mem.Allocator, field: *[][]const u8, additions: []const []const u8) !void {
+    for (additions) |addition| {
+        for (field.*) |existing| {
+            if (std.mem.eql(u8, existing, addition)) break;
+        } else {
+            const owned = try allocator.dupe(u8, addition);
+            errdefer allocator.free(owned);
+            const next = try allocator.alloc([]const u8, field.len + 1);
+            @memcpy(next[0..field.len], field.*);
+            next[field.len] = owned;
+            if (field.len > 0) allocator.free(field.*);
+            field.* = next;
+        }
+    }
+}
+
 const ResolvedClipclapGgufPair = struct {
     clip_path: []const u8,
     clap_path: []const u8,
@@ -3885,6 +3992,11 @@ fn hasEmbeddingExecutionContract(manifest: *const ModelManifest) bool {
 }
 
 fn finalizeEmbeddingProfile(manifest: *ModelManifest) !void {
+    if (manifest.embedding_style == .embedding_gemma2) {
+        if ((manifest.embedding_profile.query.declared and !std.mem.eql(u8, manifest.embedding_profile.query.prefix, "task: search result | query: ")) or
+            (manifest.embedding_profile.document.declared and !std.mem.eql(u8, manifest.embedding_profile.document.prefix, "title: none | text: ")) or
+            manifest.embedding_profile.instruction_template.len != 0) return error.InvalidEmbeddingTaskProfile;
+    }
     // Embedding transforms are an execution contract, not descriptive metadata.
     // Validate the final resolved type after all manifests, sidecars, and bundle
     // hints have been applied so contradictory sources cannot publish a model
@@ -3910,6 +4022,13 @@ fn finalizeEmbeddingProfile(manifest: *ModelManifest) !void {
                 try setEmbeddingProfilePrefix(manifest, .query, "Query: ");
             if (!manifest.embedding_profile.document.declared)
                 try setEmbeddingProfilePrefix(manifest, .document, "Document: ");
+        },
+        .embedding_gemma2 => {
+            markEmbeddingTaskProfileRequired(manifest);
+            if (!manifest.embedding_profile.query.declared)
+                try setEmbeddingProfilePrefix(manifest, .query, "task: search result | query: ");
+            if (!manifest.embedding_profile.document.declared)
+                try setEmbeddingProfilePrefix(manifest, .document, "title: none | text: ");
         },
         .none => {},
     }
@@ -3980,29 +4099,34 @@ fn setGlinerSpecialToken(manifest: *ModelManifest, content: []const u8, token_id
     if (std.mem.eql(u8, content, "[SEP_TEXT]")) manifest.gliner_token_sep_text = token_id;
 }
 
-fn canSkipQwen3EmbedderGlinerTokenScan(manifest: *const ModelManifest, model_dir_path: []const u8, tokenizer_json: []const u8) bool {
-    if (!manifest.model_manifest_declarations.model_type or manifest.model_type != .embedder or
-        !manifest.model_manifest_declarations.embedding_style or manifest.embedding_style != .qwen3_embedding)
-        return false;
+fn canSkipEmbedderGlinerTokenScan(manifest: *const ModelManifest, model_dir_path: []const u8, tokenizer_json: []const u8) bool {
+    if (manifest.model_type != .embedder) return false;
+    const gemma2 = manifest.embedding_style == .embedding_gemma2 and
+        @import("../architectures/embedding_gemma2.zig").isModel(manifest.config_model_arch);
+    const qwen3 = manifest.model_manifest_declarations.model_type and
+        manifest.model_manifest_declarations.embedding_style and manifest.embedding_style == .qwen3_embedding;
+    if (!gemma2 and !qwen3) return false;
     // Preserve wrapper and multitask models, including GLiNER inferred from
     // only a path/config hint plus the markers in tokenizer.json.
     if (manifest.gliner_model_type.len > 0 or hasGlinerPathHint(model_dir_path) or
         manifest.gliner_head_gguf_path != null or manifest.gliner_head_safetensors_path != null or
         manifest.tasks.len > 0 or manifest.capabilities.len > 0)
         return false;
-    if (manifest.config_model_arch.len > 0 and !std.mem.eql(u8, manifest.config_model_arch, "qwen3")) return false;
-    // GGUF metadata can still reveal a wrapper architecture after this scan.
-    // Skip only when the scan cannot discover a marker, including markers
-    // encoded with JSON Unicode escapes. Escaped backslash vocabulary entries
-    // such as "\\\\u" do not qualify unless followed by four hexadecimal digits.
-    // Search for the first byte with the vectorized scalar finder. Short
-    // substring searches otherwise compare every vocabulary byte per marker.
+    if (!gemma2 and manifest.config_model_arch.len > 0 and !std.mem.eql(u8, manifest.config_model_arch, "qwen3")) return false;
+    // Keep a fresh conservative scan. EmbeddingGemma 2 checks both literal
+    // brackets and Unicode escapes in one pass over its large vocabulary.
+    if (gemma2) return embeddingGemma2GlinerMarkersAbsent(tokenizer_json);
+    return glinerMarkersAbsentLegacy(tokenizer_json, false);
+}
+
+fn glinerMarkersAbsentLegacy(tokenizer_json: []const u8, gemma2: bool) bool {
     var remaining = tokenizer_json;
     while (std.mem.indexOfScalar(u8, remaining, '[')) |offset| {
         const candidate = remaining[offset..];
         inline for (.{ "[P]", "[C]", "[E]", "[R]", "[SEP_TEXT]" }) |marker| {
             if (std.mem.startsWith(u8, candidate, marker)) return false;
         }
+        if (gemma2 and (std.mem.startsWith(u8, candidate, "[L]") or std.mem.startsWith(u8, candidate, "[SEP_STRUCT]"))) return false;
         remaining = candidate[1..];
     }
     remaining = tokenizer_json;
@@ -4010,9 +4134,83 @@ fn canSkipQwen3EmbedderGlinerTokenScan(manifest: *const ModelManifest, model_dir
         remaining = remaining[offset + 1 ..];
         if (remaining.len >= 5 and remaining[0] == 'u' and
             std.ascii.isHex(remaining[1]) and std.ascii.isHex(remaining[2]) and
-            std.ascii.isHex(remaining[3]) and std.ascii.isHex(remaining[4])) return false;
+            std.ascii.isHex(remaining[3]) and std.ascii.isHex(remaining[4]))
+        {
+            if (!gemma2) return false;
+            // Every GLiNER marker is ASCII. An unrelated escaped control
+            // character (present in the official vocabulary) cannot become
+            // part of a marker. Keep the full parser whenever an escape can
+            // encode a marker byte, including mixed literal/escaped markers.
+            const codepoint = std.fmt.parseInt(u16, remaining[1..5], 16) catch unreachable;
+            if (codepoint <= 127 and std.mem.indexOfScalar(u8, "[]PCERLS_TXU", @intCast(codepoint)) != null) return false;
+        }
     }
     return true;
+}
+
+fn embeddingGemma2GlinerMarkerAt(bytes: []const u8, index: usize) bool {
+    const candidate = bytes[index..];
+    if (candidate[0] == '[') {
+        inline for (.{ "[P]", "[C]", "[E]", "[R]", "[L]", "[SEP_TEXT]", "[SEP_STRUCT]" }) |marker| {
+            if (std.mem.startsWith(u8, candidate, marker)) return true;
+        }
+        return false;
+    }
+    if (candidate[0] != '\\') return false;
+    const tail = candidate[1..];
+    if (tail.len < 5 or tail[0] != 'u' or !std.ascii.isHex(tail[1]) or
+        !std.ascii.isHex(tail[2]) or !std.ascii.isHex(tail[3]) or !std.ascii.isHex(tail[4])) return false;
+    const codepoint = std.fmt.parseInt(u16, tail[1..5], 16) catch unreachable;
+    // Any escaped ASCII marker byte conservatively takes the JSON parser,
+    // including mixed literal/escaped markers and escaped backslashes.
+    return codepoint <= 127 and std.mem.indexOfScalar(u8, "[]PCERLS_TXU", @intCast(codepoint)) != null;
+}
+
+fn embeddingGemma2GlinerMarkersAbsent(bytes: []const u8) bool {
+    var index: usize = 0;
+    while (index + 32 <= bytes.len) : (index += 32) {
+        const value: @Vector(32, u8) = bytes[index..][0..32].*;
+        var hits = @as(u32, @bitCast(value == @as(@Vector(32, u8), @splat('[')))) |
+            @as(u32, @bitCast(value == @as(@Vector(32, u8), @splat('\\'))));
+        while (hits != 0) {
+            const lane = @ctz(hits);
+            if (embeddingGemma2GlinerMarkerAt(bytes, index + lane)) return false;
+            hits &= hits - 1;
+        }
+    }
+    while (index < bytes.len) : (index += 1) {
+        if (embeddingGemma2GlinerMarkerAt(bytes, index)) return false;
+    }
+    return true;
+}
+
+// Match the independent retained conservative scanner across vector boundaries
+// and truncated escapes; actual fresh-file and wrapper tests remain below.
+test "embeddinggemma2 tokenizer fused scan preserves every conservative marker boundary" {
+    const fragments = [_][]const u8{
+        "{}",        "[P]",       "[C]",        "[E]",              "[R]",     "[L]",     "[SEP_TEXT]",     "[SEP_STRUCT]",
+        "\\u005bP]", "[\\u0050]", "[P\\u005D]", "[SEP_\\u0054EXT]", "\\u0000", "\\u00e9", "\\ud83d\\ude00", "\\u00G0",
+        "\\u",       "[P",        "[SEP_",
+    };
+    var bytes: [192]u8 = undefined;
+    for (0..96) |offset| {
+        for (fragments) |fragment| {
+            @memset(&bytes, 'a');
+            @memcpy(bytes[offset..][0..fragment.len], fragment);
+            try std.testing.expectEqual(glinerMarkersAbsentLegacy(&bytes, true), embeddingGemma2GlinerMarkersAbsent(&bytes));
+            for (0..fragment.len + 1) |cut| {
+                const partial = bytes[0 .. offset + cut];
+                try std.testing.expectEqual(glinerMarkersAbsentLegacy(partial, true), embeddingGemma2GlinerMarkersAbsent(partial));
+            }
+        }
+    }
+    var generator = std.Random.DefaultPrng.init(17);
+    const random = generator.random();
+    for (0..10000) |_| {
+        random.bytes(&bytes);
+        const partial = bytes[0..random.intRangeAtMost(usize, 0, bytes.len)];
+        try std.testing.expectEqual(glinerMarkersAbsentLegacy(partial, true), embeddingGemma2GlinerMarkersAbsent(partial));
+    }
 }
 
 fn parseTokenizerJsonSpecialTokens(manifest: *ModelManifest, allocator: std.mem.Allocator, json_bytes: []const u8) !void {
@@ -4229,6 +4427,34 @@ test "parseModelManifestJson parses inputs array" {
     try std.testing.expect(manifest.hasInput("image"));
     try std.testing.expectEqual(Sparse3DOutputLayout.seq_batch, manifest.sparse_3d_output_layout.?);
     try std.testing.expectEqual(ModelTypeOrigin.manifest, manifest.model_type_origin);
+}
+
+test "decisions public discovery removes stale extraction roles from standalone deciders" {
+    const a = std.testing.allocator;
+    var laya = ModelManifest{ .allocator = a };
+    defer laya.deinit();
+    try parseModelManifestJson(&laya, a,
+        \\{"type":"classifier","tasks":["extract","classify"],"capabilities":["classification","typed_decisions"],"inputs":["text"]}
+    );
+    laya.laya_declared = true;
+    try applyImplicitModelTypeHints(&laya, "/models/local/laya");
+    try std.testing.expect(laya.hasTask("decide"));
+    try std.testing.expect(!laya.hasTask("extract") and !laya.hasTask("classify"));
+    try std.testing.expect(laya.hasCapability("typed_decisions") and !laya.hasCapability("classification"));
+
+    var embedding = ModelManifest{ .allocator = a };
+    defer embedding.deinit();
+    try parseModelManifestJson(&embedding, a,
+        \\{"type":"embedder","tasks":["extract","decide"],"capabilities":["classification","typed_decisions"],"inputs":["text"]}
+    );
+    embedding.config_model_arch = try a.dupe(u8, "embedding_gemma2");
+    embedding.embedding_style = .embedding_gemma2;
+    embedding.pooling = .mean;
+    embedding.normalize = true;
+    try applyImplicitModelTypeHints(&embedding, "/models/local/embeddinggemma2");
+    try std.testing.expect(embedding.hasTask("embed") and embedding.hasTask("decide"));
+    try std.testing.expect(!embedding.hasTask("extract"));
+    try std.testing.expect(embedding.hasCapability("embedding_similarity") and !embedding.hasCapability("typed_decisions"));
 }
 
 test "explicit GLiNER label-marker decision head is extraction-v2 classification only" {
@@ -5302,6 +5528,46 @@ test "manifest detects gliner gguf head sidecar" {
     try std.testing.expect(std.mem.endsWith(u8, manifest.gliner_head_gguf_path.?, "gliner_head.gguf"));
 }
 
+test "embeddinggemma2 unused tokenizer scan preserves wrappers fresh reads and file errors" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const base = ModelManifest{ .allocator = allocator, .model_type = .embedder, .embedding_style = .embedding_gemma2, .config_model_arch = "embedding_gemma2" };
+    try std.testing.expect(canSkipEmbedderGlinerTokenScan(&base, "/models/embeddinggemma2", "{}"));
+    inline for (.{ "[P]", "[L]", "[SEP_STRUCT]", "\\u005bP]", "[\\u0050]", "[P\\u005D]", "[SEP_\\u0054EXT]" }) |marker| {
+        try std.testing.expect(!canSkipEmbedderGlinerTokenScan(&base, "/models/embeddinggemma2", marker));
+    }
+    inline for (.{ "\\u001b[", "\\u0000", "\\u00e9", "\\ud83d\\ude00" }) |fragment| {
+        try std.testing.expect(canSkipEmbedderGlinerTokenScan(&base, "/models/embeddinggemma2", fragment));
+    }
+    try std.testing.expect(!canSkipEmbedderGlinerTokenScan(&base, "/models/gliner/embeddinggemma2", "{}"));
+    var unknown = base;
+    unknown.config_model_arch = "future_embedding_gemma";
+    try std.testing.expect(!canSkipEmbedderGlinerTokenScan(&unknown, "/models/embeddinggemma2", "{}"));
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = @embedFile("../architectures/embedding_gemma2_config.json") });
+    try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer.json", .data = "{\"added_tokens\":[]}" });
+    const model_dir = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(model_dir);
+    {
+        var manifest = try loadFromDir(allocator, model_dir);
+        defer manifest.deinit();
+        try std.testing.expectEqual(EmbeddingStyle.embedding_gemma2, manifest.embedding_style);
+        try std.testing.expectEqual(@as(i32, 0), manifest.gliner_token_p);
+    }
+    // Fresh files containing wrapper markers must take the original parser.
+    try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer.json", .data = "{\"added_tokens\":[{\"id\":42,\"content\":\"[P]\"}]}" });
+    {
+        var manifest = try loadFromDir(allocator, model_dir);
+        defer manifest.deinit();
+        try std.testing.expectEqual(@as(i32, 42), manifest.gliner_token_p);
+    }
+    const oversized = try tmp.dir.createFile(io, "tokenizer.json", .{});
+    defer oversized.close(io);
+    try oversized.setLength(io, 100 * 1024 * 1024 + 1);
+    try std.testing.expectError(error.FileTooLarge, loadFromDir(allocator, model_dir));
+}
+
 test "Qwen3 embedder tokenizer scan policy preserves wrappers and undeclared models" {
     const base = ModelManifest{
         .allocator = std.testing.allocator,
@@ -5309,17 +5575,17 @@ test "Qwen3 embedder tokenizer scan policy preserves wrappers and undeclared mod
         .embedding_style = .qwen3_embedding,
         .model_manifest_declarations = .{ .model_type = true, .embedding_style = true },
     };
-    try std.testing.expect(canSkipQwen3EmbedderGlinerTokenScan(&base, "/models/qwen", "{}"));
-    try std.testing.expect(canSkipQwen3EmbedderGlinerTokenScan(&base, "/models/qwen", "{\"vocab\":{\"\\\\u\":10}}"));
+    try std.testing.expect(canSkipEmbedderGlinerTokenScan(&base, "/models/qwen", "{}"));
+    try std.testing.expect(canSkipEmbedderGlinerTokenScan(&base, "/models/qwen", "{\"vocab\":{\"\\\\u\":10}}"));
     inline for (.{ "[", "[[P", "[SEP_TEXT", "\\", "\\u", "\\u123", "\\u12g4", "[X][p]\\n" }) |fragment| {
-        try std.testing.expect(canSkipQwen3EmbedderGlinerTokenScan(&base, "/models/qwen", fragment));
+        try std.testing.expect(canSkipEmbedderGlinerTokenScan(&base, "/models/qwen", fragment));
     }
     inline for (.{ "[P]", "[C]", "[E]", "[R]", "[SEP_TEXT]", "\\u005bP]", "[\\u0050]", "[P\\u005D" }) |marker| {
-        try std.testing.expect(!canSkipQwen3EmbedderGlinerTokenScan(&base, "/models/qwen", marker));
+        try std.testing.expect(!canSkipEmbedderGlinerTokenScan(&base, "/models/qwen", marker));
     }
-    try std.testing.expect(!canSkipQwen3EmbedderGlinerTokenScan(&base, "/models/qwen", "[[X][SEP_TEXT]"));
-    try std.testing.expect(!canSkipQwen3EmbedderGlinerTokenScan(&base, "/models/qwen", "\\\\u005B"));
-    try std.testing.expect(!canSkipQwen3EmbedderGlinerTokenScan(&base, "/models/GLiNER-wrapper/qwen", "{}"));
+    try std.testing.expect(!canSkipEmbedderGlinerTokenScan(&base, "/models/qwen", "[[X][SEP_TEXT]"));
+    try std.testing.expect(!canSkipEmbedderGlinerTokenScan(&base, "/models/qwen", "\\\\u005B"));
+    try std.testing.expect(!canSkipEmbedderGlinerTokenScan(&base, "/models/GLiNER-wrapper/qwen", "{}"));
     var variants = @as([9]ModelManifest, @splat(base));
     variants[0].model_manifest_declarations.model_type = false;
     variants[1].model_manifest_declarations.embedding_style = false;
@@ -5331,11 +5597,11 @@ test "Qwen3 embedder tokenizer scan policy preserves wrappers and undeclared mod
     variants[7].gliner_head_safetensors_path = "head.safetensors";
     var extra_tasks = [_][]const u8{"extract"};
     variants[8].tasks = &extra_tasks;
-    for (&variants) |*manifest| try std.testing.expect(!canSkipQwen3EmbedderGlinerTokenScan(manifest, "/models/qwen", "{}"));
+    for (&variants) |*manifest| try std.testing.expect(!canSkipEmbedderGlinerTokenScan(manifest, "/models/qwen", "{}"));
     var extra_capabilities = [_][]const u8{"extraction"};
     var multitask = base;
     multitask.capabilities = &extra_capabilities;
-    try std.testing.expect(!canSkipQwen3EmbedderGlinerTokenScan(&multitask, "/models/qwen", "{}"));
+    try std.testing.expect(!canSkipEmbedderGlinerTokenScan(&multitask, "/models/qwen", "{}"));
 }
 
 test "Qwen3 embedder unused tokenizer scan preserves fresh manifests GGUF and file errors" {

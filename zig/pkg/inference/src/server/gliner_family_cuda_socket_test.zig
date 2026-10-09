@@ -41,7 +41,7 @@ fn queuedCancellation(node: *Node, transport: *Loopback, directory: []const u8, 
     defer if (open) peer.close();
     try peer.setSendTimeout(5_000);
     var buffer: [256]u8 = undefined;
-    const header = try std.fmt.bufPrint(&buffer, "POST /ai/v1/decide HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{body.len});
+    const header = try std.fmt.bufPrint(&buffer, "POST /ai/v1/decisions HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{body.len});
     try peer.sendAll(header);
     try peer.sendAll(body);
     const deadline = platform.time.monotonicNs() + 5 * std.time.ns_per_s;
@@ -83,7 +83,7 @@ fn queuedCancellation(node: *Node, transport: *Loopback, directory: []const u8, 
 }
 
 fn response(transport: *Loopback, bytes: []const u8) ![]u8 {
-    var result = try transport.request(.POST, "/ai/v1/decide", bytes);
+    var result = try transport.request(.POST, "/ai/v1/decisions", bytes);
     defer result.deinit();
     errdefer std.debug.print("family CUDA HTTP: {d} {s}\n", .{ result.status.code, result.body orelse "<absent>" });
     try std.testing.expectEqual(@as(u16, 200), result.status.code);
@@ -159,11 +159,11 @@ test "GLiNER family CUDA typed decisions through concurrent HTTP sockets" {
         defer a.free(state);
         const body = try std.json.Stringify.valueAlloc(a, .{
             .model = std.fs.path.basename(directory),
-            .state = state,
+            .input = state,
             .questions = .{
-                .intent = .{ .type = "choice", .instructions = "What does the customer need?", .criteria = .{ .refund = "Refund a payment", .support = "Technical support" } },
-                .urgency = .{ .type = "score", .instructions = "How urgent is the request?", .criteria = [_][]const u8{ "Routine", "Urgent" } },
-                .act = .{ .type = "noul", .instructions = "Does the customer need assistance?" },
+                .{ .name = "intent", .type = "choice", .instructions = "What does the customer need?", .choices = .{ .{ .value = "refund", .description = "Refund a payment" }, .{ .value = "support", .description = "Technical support" } } },
+                .{ .name = "urgency", .type = "score", .instructions = "How urgent is the request?", .levels = .{ .{ .label = "routine", .description = "Routine" }, .{ .label = "urgent", .description = "Urgent" } } },
+                .{ .name = "act", .type = "predicate", .instructions = "Does the customer need assistance?" },
             },
         }, .{});
         errdefer a.free(body);

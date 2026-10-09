@@ -3,6 +3,7 @@
 
 const std = @import("std");
 const antfly_chunking_api_openapi = @import("antfly_chunking_api_openapi");
+const antfly_decision_openapi = @import("antfly_decision_openapi");
 const antfly_generating_openapi = @import("antfly_generating_openapi");
 
 /// Load-time residency policy for the qualified Gemma 4 26B-A4B Q4_0 Metal or CUDA runtime. On qualified SM89 CUDA, auto resolves to resident and fails closed unless its envelope fits.
@@ -789,184 +790,13 @@ pub const Credentials = struct {
     }
 };
 
-pub const DecideAnswer = struct {
-    type: []const u8,
-    choice: ?[]const u8 = null,
-    score: ?f64 = null,
-    noul: ?f64 = null,
-    legend: ?std.json.ArrayHashMap([]const u8) = null,
-    probabilities: ?std.json.ArrayHashMap(f64) = null,
+pub const DecideAnswer = antfly_decision_openapi.DecideAnswer;
 
-    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
-    pub const openApiFieldMetadata = .{
-        .{ "type", "type", false },
-        .{ "choice", "choice", true },
-        .{ "score", "score", true },
-        .{ "noul", "noul", true },
-        .{ "legend", "legend", true },
-        .{ "probabilities", "probabilities", true },
-    };
+pub const DecideQuestion = antfly_decision_openapi.DecideQuestion;
 
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
-    }
+pub const DecideRequest = antfly_decision_openapi.DecideRequest;
 
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        try jw.beginObject();
-        try jw.objectField("type");
-        try jw.write(self.type);
-        if (self.choice) |value| {
-            try jw.objectField("choice");
-            try jw.write(value);
-        }
-        if (self.score) |value| {
-            try jw.objectField("score");
-            try jw.write(value);
-        }
-        if (self.noul) |value| {
-            try jw.objectField("noul");
-            try jw.write(value);
-        }
-        if (self.legend) |value| {
-            try jw.objectField("legend");
-            try jw.write(value);
-        }
-        if (self.probabilities) |value| {
-            try jw.objectField("probabilities");
-            try jw.write(value);
-        }
-        try jw.endObject();
-    }
-};
-
-/// Explicit windowing for qualified boundary decision models. Span decision models use their native context and reject window mode. Omission preserves rejection of over-limit text.
-pub const DecideLongDocument = struct {
-    mode: ?[]const u8 = null,
-    window_words: ?i64 = null,
-    /// Must be smaller than window_words. Only valid in window mode.
-    overlap_words: ?i64 = null,
-    max_windows: ?i64 = null,
-
-    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
-    pub const openApiFieldMetadata = .{
-        .{ "mode", "mode", true },
-        .{ "window_words", "window_words", true },
-        .{ "overlap_words", "overlap_words", true },
-        .{ "max_windows", "max_windows", true },
-    };
-
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        try jw.beginObject();
-        if (self.mode) |value| {
-            try jw.objectField("mode");
-            try jw.write(value);
-        }
-        if (self.window_words) |value| {
-            try jw.objectField("window_words");
-            try jw.write(value);
-        }
-        if (self.overlap_words) |value| {
-            try jw.objectField("overlap_words");
-            try jw.write(value);
-        }
-        if (self.max_windows) |value| {
-            try jw.objectField("max_windows");
-            try jw.write(value);
-        }
-        try jw.endObject();
-    }
-};
-
-pub const DecideQuestion = struct {
-    type: []const u8,
-    instructions: []const u8,
-    /// Choice uses option IDs mapped to descriptions; score uses ordered descriptions; noul omits criteria.
-    criteria: ?std.json.Value = null,
-
-    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
-    pub const openApiFieldMetadata = .{
-        .{ "type", "type", false },
-        .{ "instructions", "instructions", false },
-        .{ "criteria", "criteria", true },
-    };
-
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        try jw.beginObject();
-        try jw.objectField("type");
-        try jw.write(self.type);
-        try jw.objectField("instructions");
-        try jw.write(self.instructions);
-        if (self.criteria) |value| {
-            try jw.objectField("criteria");
-            try jw.write(value);
-        }
-        try jw.endObject();
-    }
-};
-
-pub const DecideRequest = struct {
-    model: []const u8,
-    state: []const u8,
-    long_document: ?DecideLongDocument = null,
-    questions: std.json.ArrayHashMap(DecideQuestion),
-
-    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
-    pub const openApiFieldMetadata = .{
-        .{ "model", "model", false },
-        .{ "state", "state", false },
-        .{ "long_document", "long_document", true },
-        .{ "questions", "questions", false },
-    };
-
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        try jw.beginObject();
-        try jw.objectField("model");
-        try jw.write(self.model);
-        try jw.objectField("state");
-        try jw.write(self.state);
-        if (self.long_document) |value| {
-            try jw.objectField("long_document");
-            try jw.write(value);
-        }
-        try jw.objectField("questions");
-        try jw.write(self.questions);
-        try jw.endObject();
-    }
-};
-
-pub const DecideResponse = struct {
-    model: []const u8,
-    answers: std.json.ArrayHashMap(DecideAnswer),
-    usage: std.json.Value,
-};
+pub const DecideResponse = antfly_decision_openapi.DecideResponse;
 
 pub const DictateRequest = struct {
     /// Transcriber model from models_dir/transcribers/.
@@ -1563,17 +1393,19 @@ pub const DocumentTokenClassificationResult = struct {
     score: f32,
 };
 
-/// OpenAI-compatible embedding request with inference multimodal content-part extension
+/// OpenAI-compatible embedding request with inference multimodal content-part extension. EmbeddingGemma 2 text encoding uses official task prefixes, a shared 8192-token limit, mean pooling including prompt tokens, and normalized vectors.
 pub const EmbedRequest = struct {
+    /// Optional exact asset identity pin. A mismatch returns 409 before inference.
+    model_identity: ?[]const u8 = null,
     /// Model name to use for embedding generation
     model: []const u8,
-    /// Input content to embed. Supports: - a single string - an array of strings - an array of OpenAI-style content parts for multimodal embedding
+    /// Input content to embed. Supports: - a single string - an array of strings - an array of OpenAI-style content parts for multimodal embedding - an array of ordered groups for EmbeddingGemma 2, one vector per group
     input: std.json.Value,
     /// Encoding format for the embeddings (only "float" supported)
     encoding_format: ?[]const u8 = null,
-    /// Optional truncation size for dense embeddings. Must be a positive integer no larger than the model embedding size. For normalized models the truncated vector is L2-re-normalized (Matryoshka semantics, matching the OpenAI dimensions parameter). Not supported for sparse models.
+    /// Optional truncation size for dense embeddings. EmbeddingGemma 2 supports 768, 512, 256, or 128 only. Must be a positive integer no larger than the model embedding size. For normalized models the truncated vector is L2-re-normalized (Matryoshka semantics, matching the OpenAI dimensions parameter). Not supported for sparse models.
     dimensions: ?i64 = null,
-    /// Optional embedding task type using Google embedding task-type names. For Jina v5 text embeddings, query-side tasks use the query prefix and RETRIEVAL_DOCUMENT uses the document prefix. For Qwen3-Embedding models, RETRIEVAL_QUERY uses the model's built-in web-retrieval instruction, RETRIEVAL_DOCUMENT is embedded raw, and every other task type requires an explicit instruction.
+    /// Optional embedding task type using Google embedding task-type names. EmbeddingGemma 2 uses the official prefix for each listed task, defaulting to RETRIEVAL_DOCUMENT. For Jina v5 text embeddings, query-side tasks use the query prefix and RETRIEVAL_DOCUMENT uses the document prefix. For Qwen3-Embedding models, RETRIEVAL_QUERY uses the model's built-in web-retrieval instruction, RETRIEVAL_DOCUMENT is embedded raw, and every other task type requires an explicit instruction.
     task_type: ?[]const u8 = null,
     /// Task description for instruction-aware embedding models (Qwen3-Embedding), rendered inside the query instruction wrapper ("Instruct: {instruction}\nQuery:{input}"). Optional for RETRIEVAL_QUERY, which has a model-owned default; required for other non-document task types; rejected for document tasks and models without instruction support.
     instruction: ?[]const u8 = null,
@@ -1584,6 +1416,7 @@ pub const EmbedRequest = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "model_identity", "model_identity", true },
         .{ "model", "model", false },
         .{ "input", "input", false },
         .{ "encoding_format", "encoding_format", true },
@@ -1604,6 +1437,10 @@ pub const EmbedRequest = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.model_identity) |value| {
+            try jw.objectField("model_identity");
+            try jw.write(value);
+        }
         try jw.objectField("model");
         try jw.write(self.model);
         try jw.objectField("input");
@@ -1638,6 +1475,8 @@ pub const EmbedRequest = struct {
 
 /// OpenAI-compatible embedding response with a polymorphic `embedding` field for dense or sparse vectors
 pub const EmbedResponse = struct {
+    /// EmbeddingGemma 2 SHA256 identity of actual weights, tokenizer, processor and recipe. Dimensions and retrieval roles must also match index configuration.
+    model_identity: ?[]const u8 = null,
     /// Object type, always "list"
     object: []const u8,
     /// List of embedding objects
@@ -1651,6 +1490,7 @@ pub const EmbedResponse = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "model_identity", "model_identity", true },
         .{ "object", "object", false },
         .{ "data", "data", false },
         .{ "model", "model", false },
@@ -1669,6 +1509,10 @@ pub const EmbedResponse = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.model_identity) |value| {
+            try jw.objectField("model_identity");
+            try jw.write(value);
+        }
         try jw.objectField("object");
         try jw.write(self.object);
         try jw.objectField("data");
@@ -1694,6 +1538,40 @@ pub const EmbeddingBatchSummary = struct {
     total: i64,
     succeeded: i64,
     failed: i64,
+};
+
+pub const EmbeddingDecisionOptions = antfly_decision_openapi.EmbeddingDecisionOptions;
+
+/// EmbeddingGemma 2 ordered text, image and audio parts producing one joint vector. Video is unsupported. The expanded sequence including all media soft tokens must fit 8192 tokens.
+pub const EmbeddingGroup = struct {
+    /// Document title, allowed only with RETRIEVAL_DOCUMENT and at least one text part.
+    title: ?[]const u8 = null,
+    content: []const antfly_generating_openapi.ContentPart,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "title", "title", true },
+        .{ "content", "content", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.title) |value| {
+            try jw.objectField("title");
+            try jw.write(value);
+        }
+        try jw.objectField("content");
+        try jw.write(self.content);
+        try jw.endObject();
+    }
 };
 
 /// Per-input embedding failure for error_policy=per_item responses
@@ -3122,7 +3000,7 @@ pub const ModelsResponse = struct {
     embedders: std.json.ArrayHashMap(ModelInfo),
     /// Available extractor models (models with 'extraction' capability)
     extractors: std.json.ArrayHashMap(ModelInfo),
-    /// Models declaring the decide task and typed_decisions capability
+    /// Models declaring the decide task and either typed_decisions or embedding_similarity capability
     deciders: std.json.ArrayHashMap(ModelInfo),
     /// Available generator/LLM models from models_dir/generators/
     generators: std.json.ArrayHashMap(ModelInfo),

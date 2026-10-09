@@ -335,6 +335,8 @@ pub fn runFromArgs(
         try runServer(allocator, init.io, command_args);
     } else if (std.mem.eql(u8, command, "embed")) {
         try inference.native_embed.main(allocator, init.io, command_args);
+    } else if (std.mem.eql(u8, command, "decisions") or std.mem.eql(u8, command, "extract")) {
+        try inference.native_decide.main(allocator, init.io, command_args, std.mem.eql(u8, command, "extract"));
     } else if (std.mem.eql(u8, command, "classify")) {
         try inference.native_classify.main(allocator, init.io, command_args);
     } else if (std.mem.eql(u8, command, "rerank")) {
@@ -803,6 +805,8 @@ fn printUsage(usage_name: []const u8) void {
         \\Commands:
         \\  run       Start the inference server
         \\  embed     Run native text/image/audio embedding from the command line
+        \\  decisions Run structured choice decisions using a JSON request
+        \\  extract   Run version 2 extraction using a JSON request
         \\  classify  Run native text classification from the command line
         \\  rerank    Run native text reranking from the command line
         \\  generate  Run native text generation from the command line

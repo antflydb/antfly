@@ -763,7 +763,8 @@ test "gliner boundary long executor profile includes effective caps and excludes
     left.joint_solver.profile = .native;
     var fourth = std.crypto.hash.sha2.Sha256.init(.{});
     hashOptions(&fourth, left);
-    try std.testing.expect(!std.mem.eql(u8, &third_digest, &fourth.finalResult()));
+    const fourth_digest = fourth.finalResult();
+    try std.testing.expect(!std.mem.eql(u8, &third_digest, &fourth_digest));
 }
 
 test "gliner boundary long executor profile preserves declared policy across workspace growth" {
