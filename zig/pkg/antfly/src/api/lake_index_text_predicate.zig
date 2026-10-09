@@ -296,6 +296,9 @@ fn PredicateResolver(comptime Set: type) type {
             a: A,
             resolver: Self,
             predicate: rows.Predicate,
+            arena: std.heap.ArenaAllocator,
+            conditions: []const Condition,
+            work_budget: u64,
             cache: LiveRowsCache = .{},
             materialized: ?Bitmap = null,
             spent_work: u64 = 0,
@@ -305,14 +308,29 @@ fn PredicateResolver(comptime Set: type) type {
                 if (self.materialized) |*bitmap| bitmap.deinit();
                 self.cache.deinit(self.a);
                 self.predicate.deinit();
+                self.arena.deinit();
                 self.a.destroy(self);
+            }
+            fn materialize(self: *@This()) !void {
+                // Preserve the whole-condition planner's scan/intersection
+                // alternatives instead of forcing an expensive index walk.
+                var exact = self.resolver;
+                exact.allow_partial = false;
+                if (try exact.planConditions(self.a, self.conditions)) |resolved| {
+                    if (!resolved.exact) {
+                        var rejected = resolved.bitmap;
+                        rejected.deinit();
+                        return error.InvalidNativeLakeRowIndex;
+                    }
+                    self.materialized = resolved.bitmap;
+                } else self.materialized = try self.resolver.consume(self.a, &self.predicate);
             }
             fn produce(raw: *anyopaque, a: A, offset: u32, count: u32, candidates: ?*const Bitmap) anyerror!Bitmap {
                 const self: *@This() = @ptrCast(@alignCast(raw));
                 try self.resolver.context.ensureActive();
                 if (self.materialized == null) {
                     const work = if (candidates) |selected| std.math.mul(u64, selected.cardinality(), point_work) catch std.math.maxInt(u64) else std.math.maxInt(u64);
-                    if (candidates != null and work <= self.predicate.work -| self.spent_work) {
+                    if (candidates != null and work <= self.work_budget -| self.spent_work) {
                         self.spent_work +|= work;
                         var result = Bitmap.init(a);
                         errdefer result.deinit();
@@ -323,7 +341,7 @@ fn PredicateResolver(comptime Set: type) type {
                             if (checked % 64 == 0) try self.resolver.context.ensureActive();
                             if (local_ordinal >= count) return error.InvalidNativeLakeTextCorpus;
                             if (!self.predicate.canProbeMembership()) {
-                                self.materialized = try self.resolver.consume(self.a, &self.predicate);
+                                try self.materialize();
                                 const slice = try self.materialized.?.sliceRebased(a, offset, @as(u64, offset) + count);
                                 result.deinit();
                                 return slice;
@@ -338,7 +356,7 @@ fn PredicateResolver(comptime Set: type) type {
                     // segment/count pass. Point work is bounded by this plan's
                     // estimated cost, including when selective segments precede
                     // a broad segment.
-                    self.materialized = try self.resolver.consume(self.a, &self.predicate);
+                    try self.materialize();
                 }
                 return self.materialized.?.sliceRebased(a, offset, @as(u64, offset) + count);
             }
@@ -362,8 +380,20 @@ fn PredicateResolver(comptime Set: type) type {
                 predicate.deinit();
                 return .{ .bitmap = bitmap };
             }
+            var owned = std.heap.ArenaAllocator.init(a);
+            errdefer owned.deinit();
+            const ca = owned.allocator();
+            const copied = try ca.alloc(Condition, conditions.items.len);
+            for (conditions.items, copied) |condition, *out| {
+                out.* = condition;
+                out.column = try ca.dupe(u8, condition.column);
+                const bytes = try std.json.Stringify.valueAlloc(ca, condition.value, .{});
+                out.value = try std.json.parseFromSliceLeaky(std.json.Value, ca, bytes, .{ .allocate = .alloc_always, .parse_numbers = false });
+                if (condition.value == .integer or condition.value == .float) out.value = condition.value;
+            }
+            const work_budget = @min(predicate.work, rows.predicateScanWork(self.source, copied) orelse std.math.maxInt(u64));
             const owner = try a.create(ProducerOwner);
-            owner.* = .{ .a = a, .resolver = self, .predicate = predicate };
+            owner.* = .{ .a = a, .resolver = self, .predicate = predicate, .arena = owned, .conditions = copied, .work_budget = work_budget };
             return .{ .bitmap = Bitmap.init(a), .producer = .{ .ptr = owner, .produce = ProducerOwner.produce }, .owner = owner, .close = ProducerOwner.close };
         }
         fn value(self: Self, a: A, pa: A, input: Compiled, depth: usize, allow_scan: bool) anyerror!?PredicateResult {

@@ -1050,8 +1050,9 @@ its immutable compressed row-set tree. A broad exact whole-index conjunction
 can defer membership until the text filter has supplied segment-local candidates.
 Those candidates invert through the shared native-to-physical directory and
 point-probe the authenticated reverse tree against the same tuple bounds. Point
-work is capped across all segments/count passes by the estimated full-membership
-cost; exceeding it materializes one compressed bitmap for every later pass.
+work is capped across all segments/count passes by the cheaper index/scan
+full-membership estimate; exceeding it uses the existing exact scan/index/
+intersection planner and materializes one compressed bitmap for every later pass.
 Complex Boolean predicates and residual expressions retain the existing planner.
 Both selective and broad materializations seek the tuple bounds in the immutable
 compressed row-set tree. Contiguous per-tuple/file/group physical blocks encode

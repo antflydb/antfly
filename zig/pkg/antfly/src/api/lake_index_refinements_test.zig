@@ -169,7 +169,11 @@ test "external lake overlapping text generations share every physical segment on
     for (full.segments) |segment| reserved += segment.byte_len;
     for ([_][2]usize{ .{ 0, 1 }, .{ 0, 2 }, .{ 1, 2 } }, 0..) |pair, phase| {
         var root = full;
-        root.file_groups = &.{};
+        root.manifests = &.{};
+        // Keep the delete-aware directory aligned with each overlapping
+        // generation; current metadata never admits unbound native ordinals.
+        const groups = [_]@import("lake_index_native_text.zig").FileGroup{ full.file_groups[pair[0]], full.file_groups[pair[1]] };
+        root.file_groups = &groups;
         const segments = [_]@import("lake_index_aggregate_artifact.zig").ChunkRef{ full.segments[pair[0]], full.segments[pair[1]] };
         root.segments = &segments;
         const bytes = try std.json.Stringify.valueAlloc(ca, root, .{});

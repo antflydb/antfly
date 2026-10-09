@@ -504,7 +504,9 @@ bounded reusable path scratch, and live-row cache until every scoring/count pass
 finishes. Errors and cancellation propagate through the native filter contract.
 
 The admission model charges 64 work units per point probe and never spends more
-point work than the existing full-membership estimate across segments and passes.
+point work than the cheaper index/scan full-membership estimate across segments
+and passes. On fallback the existing whole-condition planner still chooses among
+exact scan, whole-index, and separate-index intersection plans.
 An independent 8 MiB authenticated page-read allowance switches plans before
 another worst-case reverse-tree path could exceed it, preserving the existing
 full-materialization read budget. If candidates are broad or either probe budget
@@ -528,8 +530,14 @@ seeing their original epoch values after a newer publication.
 
 Fresh bitmap seeks now binary-search container keys. A local ReleaseFast CPU
 measurement of one million probes into 50 million dense ordinals improved from
-383,519,375 ns to 10,352,833 ns (about 37x). This is one kernel measurement with
+383,519,375 ns to 9,662,500 ns (about 40x). This is one kernel measurement with
 concurrent compilation active, not remote query latency or archive throughput.
 Run `zig build lake-bitmap-seek-bench -Doptimize=ReleaseFast` to reproduce the
 current kernel and compare its checksum against prepared rank/select.
 The captured sample is in `bench/baselines/native-lake-bitmap-seeks.json`.
+
+Validation of these refinements after merging `origin/main` through `df65a4c8e8`:
+the native reader suite passed 358 tests, sparse passed 62, bitmap encoding passed
+31, and lake integration passed 113 embedded and 98 API tests, with zero leaks.
+The overlapping-generation fixture retains its authenticated physical directory
+while selecting shared segments; production metadata validation remains strict.
