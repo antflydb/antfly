@@ -121,6 +121,25 @@ string and boolean stable keys are supported. Accepted visibility is not enabled
 for connection/session/prepared or transactional modes, or timestamp/numeric keys.
 Existing SQL scan and memory budgets still apply.
 
+The intended extension to accepted SQL visibility uses a transaction-pinned
+read contract. A transaction binds each writable lake table's incarnation,
+committed snapshot and accepted WAL watermark on its first read of that table.
+Subsequent statements, including prepared execution, reuse those cuts and add
+the transaction's own final write images. Changes accepted by other writers
+after that watermark remain invisible, even if background publication advances
+the committed snapshot. Repeated aliases share the same cut. A prepared plan
+binds table identity; execution binds visibility through the active transaction,
+rather than freezing rows when the statement is prepared.
+
+These cuts belong to the durable session authority, survive request boundaries,
+and retain their source files until transaction completion or lease expiry.
+Commit, rollback and session teardown release the cuts; savepoint rollback
+changes the transaction's write overlay without recapturing its base read cut.
+Recovery must restore the exact pinned snapshot and watermark or fail the
+transaction explicitly. It must never substitute the latest published source.
+Outside a transaction, each accepted statement obtains its own cut. This is the
+agreed implementation contract; the transactional extension is still pending.
+
 Writable-lake search requests accept `lake_read` with `visibility: "accepted"` or
 `"published"`, an optional `through` receipt (`table_id`, `object_generation`,
 `wal_lsn`) and `wait_ms` from 0 to 60000. Change acceptance includes those receipt
