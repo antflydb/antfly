@@ -258,7 +258,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const fanout_owner_tests = b.addTest(.{
         .name = "runnable-fanout-owner-tests",
         .root_module = fanout_owner_root,
-        .filters = &.{ "fanout owner retains joined result slots", "remote wait restores the original request phase", "algebraic partial ownership survives failure" },
+        .filters = &.{ "fanout owner retains joined result slots", "remote wait restores the original request phase", "owner transition sleep releases CPU", "algebraic partial ownership survives failure" },
         .max_rss = 3 * 1024 * 1024 * 1024,
     });
     b.step("antfly-runnable-fanout-owner-test", "Verify independent child result ownership and original phase through joining and rejected resumption")

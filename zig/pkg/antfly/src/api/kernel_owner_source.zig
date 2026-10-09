@@ -2994,6 +2994,7 @@ pub const ProvisionedKernelOwnerSource = struct {
     }
 
     const ReadControls = struct {
+        execution_runnable: ?@import("antfly_runtime_abi").runnable_abi.Borrowed = null,
         execution_deadline_ns: ?u64 = null,
         execution_io: ?@import("antfly_runtime_abi").io_abi.Borrow = null,
         cancellation: ?db_types.CancellationToken = null,
@@ -3001,7 +3002,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         allow_deferred_catalog: bool = false,
 
         fn from(req: anytype) ReadControls {
-            return .{ .execution_deadline_ns = req.execution_deadline_ns, .execution_io = if (@hasField(@TypeOf(req), "execution_io")) req.execution_io else null, .cancellation = req.cancellation };
+            return .{ .execution_runnable = if (@hasField(@TypeOf(req), "execution_runnable")) req.execution_runnable else null, .execution_deadline_ns = req.execution_deadline_ns, .execution_io = if (@hasField(@TypeOf(req), "execution_io")) req.execution_io else null, .cancellation = req.cancellation };
         }
 
         fn catalogBudget(self: ReadControls, catalog: table_catalog.CatalogSource) table_catalog.RoutingBudget {
@@ -3011,6 +3012,10 @@ pub const ProvisionedKernelOwnerSource = struct {
         }
 
         fn check(self: ReadControls) !void {
+            if (self.execution_runnable) |borrow| {
+                try borrow.validate();
+                try @import("runnable_fanout_owner.zig").checked(borrow.checkpoint(borrow.context));
+            }
             const context: request_operation.RequestContext = .{
                 .deadline_ns = self.execution_deadline_ns,
                 .deadline_io = self.execution_io,
@@ -3803,7 +3808,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         const deadline_ns = platform_time.monotonicNs() +| 5 * std.time.ns_per_s;
         while (true) {
             try controls.check();
-            try wait_io.sleep(std.Io.Duration.fromMilliseconds(1), .awake);
+            try @import("runnable_fanout_owner.zig").sleepForProgress(controls.execution_runnable, wait_io, .fromMilliseconds(1));
             try controls.check();
             return self.acquireDescriptorOnce(group_id, table_name, path, descriptor, if (exclusive) .exclusive else .shared, residency, controls) catch |err| switch (err) {
                 error.StorageKernelOwnerStaleDescriptor => return err,

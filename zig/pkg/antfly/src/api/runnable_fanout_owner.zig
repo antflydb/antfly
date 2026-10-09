@@ -98,6 +98,15 @@ pub const RemoteWait = struct {
     }
 };
 
+/// A bounded owner-transition retry is a resource wait, not CPU work. Retain
+/// the original operation while releasing its runnable slot for the sleep.
+pub fn sleepForProgress(parent: ?abi.Borrowed, io: std.Io, duration: std.Io.Duration) !void {
+    var wait = RemoteWait{ .borrow = parent };
+    if (wait.boundary()) |boundary| {
+        try boundary.run(std.Io.sleep, .{ io, duration, std.Io.Clock.awake });
+    } else try io.sleep(duration, .awake);
+}
+
 pub fn checked(status: runtime.error_abi.Status) !void {
     if (!status.isOk()) return runtime.error_abi.errorFromStatus(status);
 }
@@ -271,4 +280,71 @@ test "remote wait restores the original request phase and rejects stopped author
 
 test {
     _ = @import("algebraic_partial_ownership.zig");
+}
+
+test "owner transition sleep releases CPU and preserves original authority before retry" {
+    const native = @import("antfly_local_sources").common_request_admission.runnable_scheduler;
+    const Case = enum { success, cancel, expire, shutdown, sleep_failure, shutdown_and_sleep_failure };
+    const Fixture = struct {
+        scheduler: *native.Scheduler,
+        canceled: *std.atomic.Value(bool),
+        case: Case,
+        calls: usize = 0,
+        fn requested(raw: *const anyopaque) bool {
+            return @as(*const std.atomic.Value(bool), @ptrCast(@alignCast(raw))).load(.acquire);
+        }
+        fn sleep(raw: ?*anyopaque, _: std.Io.Timeout) std.Io.Cancelable!void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            const stats = self.scheduler.stats();
+            std.debug.assert(stats.runnable_slots == 0 and stats.resource_blocked == 1);
+            std.debug.assert(stats.operations == 1 and stats.retained_bytes == 23);
+            var control: native.Execution = .{};
+            defer control.finish();
+            control.start(self.scheduler, .{ .io = std.testing.io }, .control) catch unreachable;
+            control.checkpoint() catch unreachable;
+            control.finish();
+            switch (self.case) {
+                .success => try std.testing.io.sleep(.fromMilliseconds(1), .awake),
+                .cancel => self.canceled.store(true, .release),
+                .expire => try std.testing.io.sleep(.fromMilliseconds(100), .awake),
+                .shutdown => self.scheduler.close(),
+                .sleep_failure => return error.Canceled,
+                .shutdown_and_sleep_failure => {
+                    self.scheduler.close();
+                    return error.Canceled;
+                },
+            }
+        }
+    };
+    for ([_]native.Class{ .query, .inference }) |phase| for (std.enums.values(Case)) |case| {
+        var scheduler = try native.Scheduler.init(.{ .slots = 2, .control_slots = 1 });
+        defer scheduler.close();
+        var canceled = std.atomic.Value(bool).init(false);
+        var root: native.Execution = .{};
+        defer root.finish();
+        const deadline = @as(u64, @intCast(std.Io.Clock.awake.now(std.testing.io).nanoseconds)) + 50 * std.time.ns_per_ms;
+        try root.start(&scheduler, .{ .io = std.testing.io, .deadline_ns = deadline, .retained_bytes = 23, .cancellation = .{ .ptr = &canceled, .requested = Fixture.requested } }, phase);
+        var read = @import("runnable_local_read.zig").Read{ .execution = &root, .allocator = std.testing.allocator };
+        const team = try read.team();
+        var fixture: Fixture = .{ .scheduler = &scheduler, .canceled = &canceled, .case = case };
+        var vtable = std.testing.io.vtable.*;
+        vtable.sleep = Fixture.sleep;
+        const io: std.Io = .{ .userdata = &fixture, .vtable = &vtable };
+        const result = sleepForProgress(team.borrow, io, .fromMilliseconds(1));
+        switch (case) {
+            .success => try result,
+            .cancel, .sleep_failure => try std.testing.expectError(error.Canceled, result),
+            .expire => try std.testing.expectError(error.DeadlineExceeded, result),
+            .shutdown, .shutdown_and_sleep_failure => try std.testing.expectError(error.SchedulerClosed, result),
+        }
+        try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+        try std.testing.expectEqual(phase, try root.retainedClass());
+        try std.testing.expectEqual(@as(?u64, deadline), root.entry.?.options.deadline_ns);
+        try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 23), scheduler.stats().retained_bytes);
+        root.finish();
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+    };
 }
