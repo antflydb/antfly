@@ -2068,6 +2068,33 @@ The final-source gate passes 172 native catalog, 22 linked storage and 14
 coordinator/service tests (63/63 build steps), with no failures or leaks; pure
 name/reconciliation gates succeed from cache. Inventory integrity, control-catalog,
 formatting and whitespace checks pass. No original cases are reclassified.
+Metadata preparation now has an explicit retry contract through SnapshotBuilder,
+MetadataStateMachine, routed apply and the queued Raft adapter. Native receiver
+admission exposes a distinct pending-proof outcome before transaction/mutex
+entry; ordinary contention, allocation failures and catalog corruption are not
+implicitly retried. A queued MultiRaft fault trace retains later reads of the
+blocked group while completing another group's reads, and does not swallow
+unexpected failures. Metadata-wrapper coverage checks that three preparation
+deferrals emit neither durable-apply completion nor delegated ReadStates.
+The control-only metadata facade now shares the native pool through a typed,
+fixed-layout ABI for one-page preparation, cancellation, expiry and blocking
+teardown. Requests carry canonical State bytes; responses contain only scalar
+evidence and an optional canonical Generation. Native snapshots and cursors
+never cross the boundary, teardown performs no serialization/allocation, and
+the public service retains only a storage-free evidence observation. Pending
+preparation has distinct append-only identities in both runtime failure ABIs.
+Opaque-owner tests cover malformed/null/version/group/operation requests,
+completed-proof reuse, expiry/close, stale generations and error identity.
+These additions do not activate publication. Capability/lifecycle barriers,
+receiver proof consumption, snapshot-prefix replay amortization and public SQL
+resolution still require integration; no original parity case is reclassified.
+Final-source validation passes all 97 build steps: 172 native catalog, 428 Raft,
+22 linked storage and 15 coordinator/service tests, plus the real cross-archive
+owner regression, with no failures or leaks. Runtime error transport passes
+25 tests, the storage failure registry passes all three round-trip/uniqueness
+tests, and the released storage-status identity fingerprint is unchanged.
+Inventory integrity, control-source catalog, formatting and whitespace gates
+pass; the original 475/136/73/902 dispositions remain unchanged.
 The owned table-cut projector can now combine an exact predecessor definition
 with a plan-fenced successor definition in expected linear time. It retains
 old-only active names, both owners for shared names and pending-only new names,

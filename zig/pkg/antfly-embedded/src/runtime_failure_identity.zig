@@ -122,6 +122,7 @@ const mappings = [_]Mapping{
 
     .{ .status = .relational_expression_overflow, .err = error.RelationalExpressionOverflow },
     .{ .status = .sql_feature_not_supported, .err = error.SqlFeatureNotSupported },
+    .{ .status = .catalog_publication_proof_pending, .err = error.CatalogPublicationProofPending },
     .{ .status = .relational_expression_division_by_zero, .err = error.RelationalExpressionDivisionByZero },
     .{ .status = .relational_expression_budget_exceeded, .err = error.RelationalExpressionBudgetExceeded },
     .{ .status = .relational_index_key_too_large, .err = error.RelationalIndexKeyTooLarge },

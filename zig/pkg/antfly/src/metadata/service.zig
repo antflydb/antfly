@@ -48,7 +48,7 @@ const metadata_storage = @import("storage/mod.zig");
 // The native store owns replica-local scan resources. This is only the
 // leader's latest observation, never a second independently prepared proof.
 const RelationPublicationPreparation = struct {
-    proof: ?metadata_storage.RaftApplyStore.RelationPublicationProof = null,
+    proof: ?@import("storage/raft_apply_contract.zig").RelationPublicationEvidence = null,
     fn cancel(self: *@This()) void {
         self.* = .{};
     }
@@ -4118,7 +4118,9 @@ fn runRelationReconciliationRound(service: anytype) !void {
                 try self.store.cancelRelationPublicationProof(self.service.metadata_group_id);
                 return false;
             }
-            self.service.relation_publication_preparation.proof = try self.store.stepRelationPublicationProof(state, now_ns);
+            if (try self.store.stepRelationPublicationProof(state, now_ns)) |proof| {
+                self.service.relation_publication_preparation.proof = .{ .state = proof.state, .applied_index = proof.applied_index, .root = proof.root };
+            }
             return self.service.relation_publication_preparation.proof == null;
         }
         pub fn cancelPublication(self: *@This()) void {

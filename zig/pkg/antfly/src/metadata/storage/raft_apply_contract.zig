@@ -38,6 +38,14 @@ pub const AppliedMetadataCheckpoint = struct {
     }
 };
 
+/// Scalar observation only. Native scan ownership and final publication
+/// admission stay in the storage owner; receiving this is not apply authority.
+pub const RelationPublicationEvidence = struct {
+    state: @import("antfly_local_sources").system_catalog_relation_reconciliation.State,
+    applied_index: u64,
+    root: ?@import("antfly_local_sources").system_catalog_relation_reconciliation.Generation,
+};
+
 pub const TableTransitionFence = struct {
     generation: u64 = 0,
     active_count: u32 = 0,

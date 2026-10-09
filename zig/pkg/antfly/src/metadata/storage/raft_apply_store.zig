@@ -7116,7 +7116,11 @@ test "system catalog restore reconciliation authenticates source phases and cano
         // The replica pool owns the actual native snapshots, not a second
         // leader-only copy. Each call advances at most one page.
         const lifetime = relation_worker.publication_snapshot_lifetime_ns;
-        try std.testing.expect((try store.stepRelationPublicationProof(ready, 0)) == null);
+        try std.testing.expectError(error.CatalogPublicationProofPending, store.requireRelationPublicationProof(ready, 0));
+        try std.testing.expect(store.snapshotBuilder().isApplyRetryable(group, error.CatalogPublicationProofPending));
+        try std.testing.expect(!store.snapshotBuilder().isApplyRetryable(group, error.ResourceTemporarilyUnavailable));
+        try std.testing.expect(!store.snapshotBuilder().isApplyRetryable(group, error.InvalidCatalogRecord));
+        try std.testing.expect(!store.snapshotBuilder().isApplyRetryable(group, error.OutOfMemory));
         var slot_index: usize = 0;
         while (store.relation_publication_pool.slots[slot_index] == null or store.relation_publication_pool.slots[slot_index].?.group != group) : (slot_index += 1) {}
         const preparation = &store.relation_publication_pool.slots[slot_index].?.preparation;
@@ -10716,6 +10720,7 @@ pub const RaftApplyStore = struct {
                 .prepare_snapshot = prepareSnapshot,
                 .install_snapshot = installSnapshotFromRaft,
                 .apply_batch = applyBatch,
+                .is_apply_retryable = isApplyRetryable,
             },
         };
     }
@@ -17114,6 +17119,12 @@ pub const RaftApplyStore = struct {
         try self.writeBatch(batch.group_id, batch.commit_index, batch.entries_bytes);
     }
 
+    fn isApplyRetryable(_: *anyopaque, _: u64, err: anyerror) bool {
+        // This error is emitted only by pre-transaction bounded preparation.
+        // In particular, never hide corruption or general storage failures.
+        return err == error.CatalogPublicationProofPending;
+    }
+
     fn writeBatch(self: *RaftApplyStore, group_id: u64, commit_index: u64, entries_bytes: []const u8) !void {
         var outcome = try self.applyCommittedBatchInternal(group_id, commit_index, entries_bytes, false);
         defer outcome.deinit();
@@ -17571,6 +17582,18 @@ pub const RaftApplyStore = struct {
     pub fn cancelRelationPublicationProof(self: *RaftApplyStore, group: u64) !void {
         try self.relation_publication_pool.cancel(self.io_impl.io(), group);
     }
+
+    /// Receiver admission must call this before acquiring apply_mutex or
+    /// mutating the applied watermark. Pending work is safe to retry through
+    /// the Raft per-group continuation queue; it is never an apply receipt.
+    pub fn requireRelationPublicationProof(self: *RaftApplyStore, expected: relation_reconciliation.State, now_ns: u64) !RelationPublicationProof {
+        const proof = self.stepRelationPublicationProof(expected, now_ns) catch |err| switch (err) {
+            error.ResourceTemporarilyUnavailable => return error.CatalogPublicationProofPending,
+            else => return err,
+        };
+        return proof orelse error.CatalogPublicationProofPending;
+    }
+
     pub fn closeRelationPublicationProof(self: *RaftApplyStore, group: u64) void {
         self.relation_publication_pool.cancelBlocking(self.io_impl.io(), group);
     }

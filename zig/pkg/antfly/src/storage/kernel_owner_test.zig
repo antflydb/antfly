@@ -3631,9 +3631,41 @@ test "opaque metadata relation reconciliation work retains owned cuts across pro
         }
         const ready = (try store.relationReconciliationWork(group)).current.?;
         try std.testing.expectEqual(r.Phase.ready, ready.phase);
+        var evidence: ?@import("../metadata/storage/raft_apply_contract.zig").RelationPublicationEvidence = null;
+        for (0..16) |round| {
+            evidence = try store.stepRelationPublicationProof(ready, round);
+            if (evidence != null) break;
+        }
+        try std.testing.expect(evidence != null);
+        try std.testing.expect(std.meta.eql(ready, evidence.?.state));
+        try std.testing.expect(evidence.?.root == null);
+        try std.testing.expect(std.meta.eql(evidence, try store.stepRelationPublicationProof(ready, 17)));
+        try std.testing.expect(store.snapshotBuilder().isApplyRetryable(group, error.CatalogPublicationProofPending));
+        try std.testing.expectError(error.CatalogPublicationProofPending, error_identity.statusToError(error_identity.statusFromError(error.CatalogPublicationProofPending)));
+        try std.testing.expect(!store.snapshotBuilder().isApplyRetryable(group, error.ResourceTemporarilyUnavailable));
+        var result: abi.MetadataRelationPublicationResult = .{ .ready = 1 };
+        try std.testing.expectEqual(abi.Status.invalid_argument, abi.antfly_metadata_apply_store_relation_publication(store.handle, &.{
+            .group_id = group,
+            .expected_state = .{ .len = r.State.encoded_len },
+        }, &result));
+        try std.testing.expectEqual(@as(u8, 0), result.ready);
+        const encoded_ready = try ready.encode();
+        try std.testing.expectEqual(abi.Status.invalid_argument, abi.antfly_metadata_apply_store_relation_publication(store.handle, &.{
+            .group_id = group + 1,
+            .expected_state = .fromSlice(&encoded_ready),
+        }, &result));
+        try std.testing.expectEqual(abi.Status.invalid_argument, abi.antfly_metadata_apply_store_relation_publication(store.handle, &.{
+            .operation = @fromBackingInt(@intCast(99)),
+        }, &result));
+        try std.testing.expectEqual(abi.Status.invalid_abi, abi.antfly_metadata_apply_store_relation_publication(store.handle, &.{ .version = abi.abi_version + 1 }, &result));
+        try store.cancelRelationPublicationProof(group);
+        _ = try store.stepRelationPublicationProof(ready, 18);
+        try store.expireRelationPublicationProofs(18 + 60 * std.time.ns_per_s);
+        store.closeRelationPublicationProof(group);
         try std.testing.expect(std.meta.eql(initial, before.current.?));
         const next = try r.State.init(group, try r.nextJobId(&ready), ready.epoch);
         try T.apply(&store, .{ .start = .{ .next = next, .prior = ready } });
+        try std.testing.expectError(error.CatalogGenerationChanged, store.stepRelationPublicationProof(ready, 19));
         const retired = try store.relationReconciliationWork(group);
         try std.testing.expect(retired.garbage.?.generation.eql(r.Generation.of(&ready)));
         try T.apply(&store, .{ .garbage = retired.garbage.? });

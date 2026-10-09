@@ -57,6 +57,7 @@ pub const QueuedApplyWorker = struct {
                 .enqueue_apply = enqueueApply,
                 .drain = drain,
                 .abort = abort,
+                .is_apply_retryable = isApplyRetryable,
             },
         };
     }
@@ -120,6 +121,11 @@ pub const QueuedApplyWorker = struct {
             task.deinit(self.alloc);
         }
         return .{ .completed = completed };
+    }
+
+    fn isApplyRetryable(ptr: *anyopaque, group_id: core.types.GroupId, err: anyerror) bool {
+        const self: *QueuedApplyWorker = @ptrCast(@alignCast(ptr));
+        return self.state_machine.isApplyRetryable(group_id, err);
     }
 
     fn abort(ptr: *anyopaque) void {
