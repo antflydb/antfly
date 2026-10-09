@@ -1352,3 +1352,106 @@ test "API kernel create enforces owner I/O capabilities and preserves their life
         try Probe.run(std.testing.io);
     }
 }
+
+test "API kernel create keeps SQL lanes owner-produced through saturation and shutdown" {
+    const background = @import("antfly_local_sources").storage_background_runtime;
+    const worker = @import("sql_worker_lease.zig");
+    var runtime = try background.BackendRuntimeHandle.init(std.testing.allocator, .{ .backend = .io_threaded, .lane_limits = .{ .worker_capacity = 32 } });
+    defer runtime.deinit();
+    const cfg: server_mod.ApiHttpServerConfig = .{
+        .backend_runtime = runtime.ptr(),
+        .runnable_policy = .{ .slots = 2, .max_operations = 8 },
+        .query_max_concurrent_requests = 4,
+        .write_max_concurrent_requests = 1,
+        .query_waiting = .{ .max_wait_ms = 100, .max_queued_requests = 2, .max_queued_bytes = 1024 * 1024 },
+    };
+    var token: u8 = 0;
+    const Stub = struct {
+        fn status(_: *anyopaque) anyerror!metadata_api.MetadataStatus {
+            return error.UnsupportedOperation;
+        }
+        fn blocked(io: std.Io, gate: *std.Io.Event) void {
+            gate.wait(io) catch {};
+        }
+        fn probe(io: std.Io) !void {
+            try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(io, "/antfly-kernel-sql-lane-missing", .{}));
+        }
+    };
+    const source: server_mod.StatusSource = .{ .ptr = &token, .vtable = &.{ .status = Stub.status } };
+    const reads: ?table_reads.TableReadSource = null;
+    const writes: ?table_writes.TableWriteSource = null;
+    var alloc = std.testing.allocator;
+    const owner_alloc = abi.memory_abi.Allocator.fromStd(&alloc);
+    var handle: ?*anyopaque = null;
+    var request_alloc: ?*const abi.memory_abi.Allocator = null;
+    var general = abi.native_abi.IoBorrow.init(&std.testing.io);
+    const producer = worker.factory(runtime.ptr()).?;
+    const borrows: abi.RuntimeIoBorrows = .{ .api = &general, .api_network = &general, .api_filesystem = &general, .durable = &general, .sql_execution = &general, .sql_control = &general, .sql_workers = &producer };
+    try std.testing.expect(create(&.{
+        .abi_version = abi.abi_version,
+        .owner_alloc = &owner_alloc,
+        .cfg = &cfg,
+        .cfg_contract = .of(server_mod.ApiHttpServerConfig),
+        .runtime_io = &borrows,
+        .source = &source,
+        .source_contract = .of(server_mod.StatusSource),
+        .table_reads = &reads,
+        .table_reads_contract = .of(?table_reads.TableReadSource),
+        .table_writes = &writes,
+        .table_writes_contract = .of(?table_writes.TableWriteSource),
+        .flags = CreateContext.fallible_init,
+        .out_handle = &handle,
+        .out_request_alloc = &request_alloc,
+    }).isOk());
+    defer if (handle) |active| destroy(active);
+    const state: *ServerState = @ptrCast(@alignCast(handle.?));
+    // Explicit imported SQL capabilities must take precedence over raw runtime
+    // state. Restore the pointer before unrelated shutdown paths use it.
+    state.server.cfg.backend_runtime = @ptrFromInt(0x1000);
+    defer if (handle != null) {
+        state.server.cfg.backend_runtime = runtime.ptr();
+    };
+    const control = try state.server.sqlControlIo();
+    const foreground = try state.server.sqlExecutionIo();
+    const cleanup_io = try state.server.sqlCleanupIo();
+    try std.testing.expect(state.server.sqlQueryWaitingEnabled());
+    const reaper = try state.server.sqlCleanupOwner();
+    state.server.cfg.backend_runtime = runtime.ptr();
+    try std.testing.expect(reaper == state.server.sql_cleanup_runtime.?);
+    try std.testing.expect(state.server.sql_workers.?.native == null);
+    try std.testing.expect(state.server.sql_control_workers.?.native == null);
+    try std.testing.expect(state.server.sql_cleanup_workers.?.native == null);
+    try std.testing.expect(state.server.sql_cleanup_reaper_workers.?.native == null);
+    try std.testing.expect(foreground.userdata != cleanup_io.userdata and foreground.userdata != control.userdata);
+    try std.testing.expectEqual(@as(usize, 25), runtime.ptr().laneStats().reserved_workers);
+    var foreground_gate: std.Io.Event = .unset;
+    var cleanup_gate: std.Io.Event = .unset;
+    var foreground_jobs: std.Io.Group = .{};
+    var foreground_open = true;
+    defer if (foreground_open) {
+        foreground_gate.set(std.testing.io);
+        foreground_jobs.wait(foreground);
+    };
+    var cleanup_jobs: std.Io.Group = .{};
+    var cleanup_open = true;
+    defer if (cleanup_open) {
+        cleanup_gate.set(std.testing.io);
+        cleanup_jobs.wait(cleanup_io);
+    };
+    for (0..state.server.sql_workers.?.capacity) |_| try foreground_jobs.concurrent(foreground, Stub.blocked, .{ foreground, &foreground_gate });
+    for (0..state.server.sql_cleanup_workers.?.capacity) |_| try cleanup_jobs.concurrent(cleanup_io, Stub.blocked, .{ cleanup_io, &cleanup_gate });
+    try std.testing.expectError(error.ConcurrencyUnavailable, foreground.concurrent(Stub.probe, .{foreground}));
+    try std.testing.expectError(error.ConcurrencyUnavailable, cleanup_io.concurrent(Stub.probe, .{cleanup_io}));
+    var control_job = try control.concurrent(Stub.probe, .{control});
+    try control_job.await(control);
+    foreground_gate.set(std.testing.io);
+    foreground_jobs.wait(foreground);
+    foreground_open = false;
+    cleanup_gate.set(std.testing.io);
+    cleanup_jobs.wait(cleanup_io);
+    cleanup_open = false;
+    destroy(handle.?);
+    handle = null;
+    try std.testing.expectEqual(@as(usize, 0), runtime.ptr().laneStats().reserved_workers);
+    try std.testing.expectEqual(@as(usize, 0), runtime.ptr().laneStats().worker_active_leases);
+}

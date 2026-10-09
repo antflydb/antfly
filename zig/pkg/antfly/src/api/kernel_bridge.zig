@@ -906,3 +906,26 @@ test "linked transport admits a streaming body before the kernel pulls it" {
     try std.testing.expect(FakeKernel.saw_body);
     try std.testing.expectEqual(@as(usize, 1), body_state.calls);
 }
+
+test "API kernel create host bridge supplies SQL worker capabilities and retires startup reservation" {
+    const background = @import("antfly_local_sources").storage_background_runtime;
+    var runtime = try background.BackendRuntimeHandle.init(std.testing.allocator, .{ .backend = .io_threaded, .lane_limits = .{ .worker_capacity = 32 } });
+    defer runtime.deinit();
+    var token: u8 = 0;
+    const Stub = struct {
+        fn status(_: *anyopaque) anyerror!@import("../metadata/api.zig").MetadataStatus {
+            return error.UnsupportedOperation;
+        }
+    };
+    const source: server_mod.StatusSource = .{ .ptr = &token, .vtable = &.{ .status = Stub.status } };
+    var server = try OpaqueApiHttpServer.initWithConfig(std.testing.allocator, .{ .backend_runtime = runtime.ptr(), .runnable_policy = .{ .slots = 2, .max_operations = 8 } }, source, null, null);
+    var live = true;
+    defer if (live) server.deinit();
+    // Force the real opaque producer/receiver setup even in test builds, where
+    // the ordinary ApiHttpServer alias otherwise chooses direct codegen.
+    try std.testing.expectEqual(@as(usize, 5), runtime.ptr().laneStats().reserved_workers);
+    server.deinit();
+    live = false;
+    try std.testing.expectEqual(@as(usize, 0), runtime.ptr().laneStats().reserved_workers);
+    try std.testing.expectEqual(@as(usize, 0), runtime.ptr().laneStats().worker_active_leases);
+}
