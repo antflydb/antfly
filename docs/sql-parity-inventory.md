@@ -34,6 +34,28 @@ and deliberate rejections must be distinguished.
 
 ## Provenance and scope
 
+### Native capture-capable regular expressions
+
+SQL now uses the native Zig `antfly_regex.captures` interface in `lib/regex`.
+The vendored C engine and bridge have been removed. The existing byte/FST
+interface is unchanged; SQL retains flag parsing, error translation, bounded
+pattern/replacement caches and statement/cursor ownership in its adapter.
+Immutable Unicode programs use explicit caller allocation and work/cancellation
+budgets, with separate match-extent selection and capture dissection. Cached
+reachability frontiers bound repeated split/assertion work; backreferences use
+heap-admitted continuations and do not claim linear complexity.
+
+Independent PostgreSQL C-collation fixtures verify 37 original span contracts,
+962 capture/syntax witnesses, ten global-occurrence contracts and sixteen
+replacement contracts. All 1,025 contracts also pass twice in freestanding
+WASM with no host imports. Native tests cover allocation faults, cancellation,
+quota recovery, immutable program sharing and zero additional warm-owner
+allocations. Fourfold subject growth (4,096 to 16,384 characters) stays within
+fivefold charged work for the qualified capture, ambiguity, late-failure and
+unbounded-assertion shapes. These are component qualifications, not a proof of
+all PostgreSQL syntax, arbitrary collations or additional original-case credit;
+the disposition totals above are unchanged.
+
 ### Parsed JSON cardinality, C-collation casing and regex operators
 
 `jsonb_array_length` reads the immutable parsed array's cardinality directly,

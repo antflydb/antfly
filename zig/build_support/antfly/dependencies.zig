@@ -597,6 +597,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     regex_mod.addImport("antfly_fst", fst_mod);
     regex_mod.addImport("antfly_platform", platform_mod);
     const sql_regex_mod = @import("../../lib/sql_regex/build.zig").createModule(b, target, optimize, b.path("lib/sql_regex"));
+    regex_mod.addImport("antfly_capture_regex", sql_regex_mod.import_table.get("antfly_capture_regex").?);
     const jsonschema_mod = b.createModule(.{
         .root_source_file = b.path("lib/jsonschema/src/mod.zig"),
         .target = target,

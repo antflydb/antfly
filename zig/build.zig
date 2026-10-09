@@ -269,9 +269,13 @@ pub fn create(b: *std.Build) ?Artifacts {
     const run_lib_regex_tests = b.addRunArtifact(lib_regex_tests);
     const lib_regex_test_step = b.step("lib-regex-test", "Run standalone lib/regex tests");
     lib_regex_test_step.dependOn(&run_lib_regex_tests.step);
+    const capture_regex_tests = b.addTest(.{ .root_module = regex_mod.import_table.get("antfly_capture_regex").? });
+    const run_capture_regex_tests = b.addRunArtifact(capture_regex_tests);
+    lib_regex_test_step.dependOn(&run_capture_regex_tests.step);
 
     const sql_regex_tests = b.addTest(.{ .root_module = @import("lib/sql_regex/build.zig").createModule(b, target, optimize, b.path("lib/sql_regex")) });
-    b.step("sql-regex-test", "Run PostgreSQL ARE backend ownership and span contracts").dependOn(&b.addRunArtifact(sql_regex_tests).step);
+    const run_sql_regex_tests = b.addRunArtifact(sql_regex_tests);
+    b.step("sql-regex-test", "Run native PostgreSQL-compatible regex ownership and span contracts").dependOn(&run_sql_regex_tests.step);
     b.step("sql-regex-check", "Compile PostgreSQL ARE backend contracts for the selected target").dependOn(&sql_regex_tests.step);
 
     const numeric_tests = b.addTest(.{
@@ -710,6 +714,8 @@ pub fn create(b: *std.Build) ?Artifacts {
     unit_test_step.dependOn(&b.addRunArtifact(openapi_docs_test).step);
     unit_test_step.dependOn(&run_sql_tests.step);
     unit_test_step.dependOn(&run_exact_float_tests.step);
+    unit_test_step.dependOn(&run_capture_regex_tests.step);
+    unit_test_step.dependOn(&run_sql_regex_tests.step);
     unit_test_step.dependOn(&run_pgwire_tests.step);
     unit_test_step.dependOn(&pdf_integration.run.step);
     // HTTP client lifecycle tests belong to lib-test; keep their focused target.

@@ -44,6 +44,41 @@ export fn antfly_sql_regex_smoke() u32 {
 export fn antfly_sql_regex_replacement_smoke() u32 {
     return runReplacements() catch 0;
 }
+export fn antfly_sql_regex_capture_smoke() u32 {
+    return runCaptures() catch 0;
+}
+fn runCaptures() !u32 {
+    var memory = std.heap.FixedBufferAllocator.init(&buffer);
+    const backing = memory.allocator();
+    const golden = try std.json.parseFromSlice(Golden, backing, @embedFile("testdata/capture-postgres.json"), .{});
+    defer golden.deinit();
+    if (golden.value.format != 1 or !std.mem.eql(u8, golden.value.collation, "C")) return error.InvalidReference;
+    for (golden.value.entries) |case| {
+        // Reclaim the entire case even when the backing allocator is a fixed
+        // buffer; individual tracked allocations need not be freed LIFO.
+        var arena = std.heap.ArenaAllocator.init(backing);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var budget: regex.Budget = .{};
+        const flags = try regex.Flags.parse(case.options, false);
+        if (flags.native != case.flags) return error.WrongFlags;
+        var program = try regex.Program.compile(a, case.pattern, flags.native, .{}, &budget);
+        defer program.deinit();
+        if (program.captures != case.captures) return error.WrongCaptures;
+        var subject = try regex.Subject.init(a, case.input);
+        defer subject.deinit();
+        const spans = try a.alloc(regex.Span, case.spans.len);
+        if (case.matched != try program.find(subject, case.start, spans, &budget)) return error.WrongMatch;
+        for (spans, case.spans) |actual, expected| {
+            if (actual.start != expected.start or actual.end != expected.end) return error.WrongSpan;
+            const text = try subject.slice(actual);
+            if (expected.text) |value| {
+                if (!std.mem.eql(u8, value, text orelse return error.MissingMatch)) return error.WrongText;
+            } else if (text != null) return error.UnexpectedMatch;
+        }
+    }
+    return @intCast(golden.value.entries.len);
+}
 fn runReplacements() !u32 {
     var memory = std.heap.FixedBufferAllocator.init(&buffer);
     const a = memory.allocator();

@@ -1,93 +1,59 @@
-# PostgreSQL regular-expression backend
+# Native SQL regular expressions
 
-This is the PostgreSQL ARE backend for the public SQL regex scalar functions,
-not the byte/FST matcher used by search. Execution-owned statement/cursor lanes
-provide bounded pattern and replacement caches. Component tests alone do not
-establish original corpus-case coverage; five conflict mutations additionally
-have mounted native storage/postimage evidence.
+SQL regex functions use the capture-capable native Zig interface in
+`lib/regex/src/captures.zig`, exported as `antfly_regex.captures`. This is
+separate from the byte-oriented matcher and FST automaton: those retain their
+existing syntax, matching guarantees and search-index pruning contracts.
+There are no vendored C sources, C bridge, host-libc or host-locale dependencies.
 
-The vendored Henry Spencer/PostgreSQL ARE core is pinned to upstream commit
-`1370a7832a2ab7bda5625fd1f0448808b534cd50` (REL_18_STABLE). C files originate
-in `src/backend/regex`; headers originate in `src/include/regex`. Original
-copyright notices and the PostgreSQL COPYRIGHT file are retained.
+## Execution architecture
 
-Adaptations are intentionally isolated and documented:
+- Immutable Unicode-scalar programs expose typed syntax, case and newline
+  options, character spans, caller allocators and explicit work/cancellation
+  budgets. Errors are generic engine errors, translated at the SQL boundary.
+- Regular matching merges equivalent Thompson states, including substring
+  starts. Match extent is selected independently of capture dissection.
+- Capture extraction follows ordered subtree preferences and positive-minimum
+  repetition's final-copy binding. Width bounds and cached reverse-reachability
+  frontiers avoid restarting a matcher for every candidate split. Small
+  frontiers are inline and do not populate an execution-sized heap cache.
+- Backreferences use an explicit bounded continuation stack. Regular capture
+  subtrees bind deterministically before subsequent backreferences; alternative
+  extents are admitted lazily from reusable forward frontiers. Nonregular
+  patterns do not inherit a linear-time guarantee.
+- Lookaround retains the original subject/anchor domain. Bounded local probes
+  handle small assertions; execution-owned forward/reverse assertion frontiers
+  prevent repeated failed unbounded assertions from rescanning each suffix.
+- The SQL adapter retains bounded pattern/replacement LRUs and reusable
+  allocation size classes. Live and idle scratch jointly obey actual-byte
+  admission. Failed allocation, quota or cancellation exposes no partial spans
+  or replacement output. No pattern retains a request budget or mutable matcher.
 
-- `regcustom.h` selects the caller-owned portability layer; the original server
-  configuration remains present under a disabled conditional.
-- `regex.h` omits host regex types and PostgreSQL server headers in standalone
-  mode. Exported engine symbols are namespaced by the portability header.
-- `regcomp.c` selects a deterministic C-collation adapter. Locale classes and
-  case handling are ASCII as in PostgreSQL C, but subjects, literals, dot,
-  captures and offsets operate on Unicode codepoints. Other collations are not
-  implemented and must not silently inherit host locale behavior.
-- `regc_nfa.c` unwinds cancellation through each function's native return type.
-  All native sort callers fail compilation rather than consuming a partially
-  sorted arc array. The allocation-free heapsort itself charges comparisons
-  and exchanges and can unwind cancellation inside a sort.
-- `rege_dfa.c` checks work on cached character transitions and backreference
-  loops, not just cache misses. DFA state/arc traversal, cache comparison bytes,
-  eviction-chain traversal and backreference lengths consume work. `regexec.c`
-  also charges backreference dissection, repetition verification/backtracking,
-  capture-vector initialization and final DFA scans. Recursive capture clearing
-  has its own stack/work guard. Repetition failures release their endpoint arrays
-  before returning, and canceled/quota-refused reallocation preserves the old
-  allocation. Sticky request errors prohibit exposing partial
-  successful results. Upstream parsing and match precedence are retained.
+Classes and case folding deliberately follow PostgreSQL C collation (ASCII
+classification/case, Unicode subjects and offsets). Other collations are not
+implemented. Work and memory limits may reject expensive expressions; no claim
+is made that every backreference or capture shape has linear complexity.
 
-Native allocations use a bounded caller allocator with complete ownership
-tracking, including failed compilations. Class caches are per compilation and
-freed before publishing the pattern. Matching uses separate scratch owners, so
-compiled patterns do not retain a request budget or mutable matching state.
-Execution-owned scratch reuses power-of-two size classes between rows and
-occurrences. Physical cached and live blocks together obey the heap limit;
-admission reclaims idle classes, and failures reset all borrowed request state.
-No per-pattern mutable execution state is shared across concurrent callers.
-The execution-owned Session LRU admits at most eight patterns and a caller-set
-cache-byte budget. A miss reserves the complete compilation heap allowance
-before allocating, not just the eventual NFA size. Keys are owned and include
-ordered compilation flags; failed compilations publish no entry. The session
-and its scratch must be closed with the statement/cursor, never stored on a
-shared immutable prepared program. Use a reclaiming owner allocator, not the
-per-row arena. Native and WASM tests exercise warm reuse and bounded eviction;
-1,000 repeated warm rows compile once and allocate no further native scratch.
-Character-to-byte maps use a 32-bit checkpoint per 64 codepoints, rather than a
-machine-word offset per character. Conversion examines at most 63 decoded
-codepoints per boundary. Searches retain the original subject for anchor and
-lookbehind semantics.
+## Validation
 
-Run `zig build sql-regex-test` from `zig/`, or `zig build test` here, with Zig
-0.17. Regenerate/check the independent fixture
-from the repository root using `scripts/generate_sql_regex_reference.py --check
-zig/lib/sql_regex/src/testdata/postgres.json` in the existing psycopg environment.
-The oracle requires PostgreSQL 18+ and explicitly validates its C locale.
-The span fixture now includes thirteen additional ordered-flag contracts. Native
-and WASM gates parse the textual options and verify the resulting compile flags
-against the independent PostgreSQL results. Flag transitions follow the pinned
-server implementation, including its actual `e` transition; this is checked with
-the installed PostgreSQL oracle rather than inferred from flag descriptions.
-The additional `--global-matches --check
-zig/lib/sql_regex/src/testdata/global-postgres.json` fixture verifies ten global
-occurrence contracts (26 matches), including empty matches, Unicode positions,
-anchors, lookbehind and unmatched captures, using PostgreSQL count/substr/instr.
-The `--replacements --check
-zig/lib/sql_regex/src/testdata/replacement-postgres.json` fixture verifies sixteen
-PostgreSQL replacement contracts. Replacement plans own their text and tokenize
-escapes once; streaming expansion never materializes a match list. Output growth
-obeys the byte cap, all copying consumes work, and cancellation exposes no partial
-result. Unknown escapes remain literal; unmatched/nonexistent groups expand empty.
+Run `zig build sql-regex-test` from `zig/`, or `zig build test` here.
+`zig build test -Doptimize=ReleaseFast` also runs a checked warm-owner benchmark.
+Scaling regressions cover 4,096/16,384-character captures, ambiguous repetition,
+late failures and unbounded assertions; fourfold input must stay within fivefold
+charged work.
 
-The backend has no host-libc dependency. Memory/string helpers and allocation-free
-heapsort are compiled freestanding without builtin libc substitution. Run
-`zig build test -Dtarget=wasm32-freestanding` here to execute all 63 PostgreSQL
-contracts twice in a WASM module with no host imports. Native concurrency uses
-thread-local call context; single-threaded WASM saves/restores per-instance
-context for nested synchronous invocations. The C call must never yield.
+The independent PostgreSQL 18+ C-collation fixtures include 37 original span,
+962 capture/syntax, 10 global-occurrence and 16 replacement contracts. They are
+not proofs of all PostgreSQL syntax or original SQL corpus cases. The native
+gate also sweeps allocation faults and cancellation checkpoints, tests warm
+cache reuse, and shares immutable patterns across independent std.Io workers.
 
-Public binding, strict SQL NULLs, overload/error mapping and statement/cursor
-ownership have independent PostgreSQL scalar and native integration tests.
-Remaining work includes the full compile/runtime work-accounting audit,
-non-C collations and broader original mounted corpus campaigns. Cancellation
-enumeration covers every observed compile/match/replacement checkpoint for both
-greedy and shortest backreference repetition, with clean retry and leak checks;
-it is not an exhaustive proof of every native path.
+Use `scripts/generate_sql_regex_reference.py --capture-campaign --check
+zig/lib/sql_regex/src/testdata/capture-postgres.json` in the psycopg environment
+to recheck the expanded oracle. The existing span, global and replacement
+fixtures have their corresponding generator modes. Freestanding WASM tests
+verify PostgreSQL results without any host imports.
+
+SQL binding, NULLs, overloads, diagnostics and statement/cursor ownership retain
+their separate integration gates. This backend replacement does not award
+additional original corpus-case credit.

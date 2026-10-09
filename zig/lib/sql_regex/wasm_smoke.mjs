@@ -9,4 +9,7 @@ assert.equal(instance.exports.antfly_sql_regex_smoke(), 47);
 assert.equal(instance.exports.antfly_sql_regex_smoke(), 47, "reopening must not retain native context state");
 assert.equal(instance.exports.antfly_sql_regex_replacement_smoke(), 16);
 assert.equal(instance.exports.antfly_sql_regex_replacement_smoke(), 16);
-console.log("63 PostgreSQL ARE contracts passed twice in import-free freestanding WASM");
+const captures = JSON.parse(readFileSync(new URL("src/testdata/capture-postgres.json", import.meta.url))).entries.length;
+assert.equal(instance.exports.antfly_sql_regex_capture_smoke(), captures);
+assert.equal(instance.exports.antfly_sql_regex_capture_smoke(), captures, "reopening must not retain native matcher state");
+console.log(`${47 + 16 + captures} PostgreSQL regex contracts passed twice in import-free freestanding WASM`);

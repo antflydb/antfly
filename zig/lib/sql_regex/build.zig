@@ -23,9 +23,6 @@ pub fn build(b: *std.Build) void {
 
 pub fn createModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, root: std.Build.LazyPath) *std.Build.Module {
     const module = b.createModule(.{ .root_source_file = root.path(b, "src/mod.zig"), .target = target, .optimize = optimize, .link_libc = false, .single_threaded = if (target.result.cpu.arch.isWasm()) true else null });
-    module.addIncludePath(root.path(b, "vendor"));
-    const common_flags: []const []const u8 = &.{ "-std=c11", "-ffreestanding", "-fno-builtin", "-DNDEBUG", "-Wall", "-Wextra", "-Wno-unused-parameter", "-Wno-sign-compare", "-Werror" };
-    const flags = if (target.result.cpu.arch.isWasm()) b.allocator.dupe([]const u8, common_flags ++ &[_][]const u8{"-DANTFLY_REGEX_SINGLE_THREADED=1"}) catch @panic("OOM") else common_flags;
-    for ([_][]const u8{ "vendor/regcomp.c", "vendor/regexec.c", "vendor/regfree.c", "port/bridge.c", "port/memory.c" }) |file| module.addCSourceFile(.{ .file = root.path(b, file), .flags = flags });
+    module.addImport("antfly_capture_regex", b.createModule(.{ .root_source_file = root.path(b, "../regex/src/captures.zig"), .target = target, .optimize = optimize, .link_libc = false }));
     return module;
 }
