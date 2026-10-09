@@ -395,6 +395,7 @@ const Context = struct {
     }
 };
 const Map = std.HashMapUnmanaged(Key, Owner, Context, 80);
+pub const EntryMap = std.HashMapUnmanaged(Key, Entry, Context, 80);
 
 /// Owned CAS over the whole active/reserved cut. Validate every affected name
 /// before the first write. The caller supplies ONE pinned metadata transaction
