@@ -570,5 +570,10 @@ The authorized incremental budget is $150; the dry run estimated 19,372,806,880
 bytes. The pinned October 9 export completed with 47,717,307 live story/comment
 rows in 334 Parquet objects (21,195,813,507 compressed bytes). Full-archive index
 and latency qualification and an HN public deployment are still outstanding.
+For a full archive, use `regional.py --modes indexed --cycles 1` to give the
+metadata-index build its own bounded pod lifetime. Run `--modes text-only` with
+a separate artifact prefix afterward. The default runs both modes in one pod;
+its lifetime must cover both builds and their queries. Single-mode reports mark
+`cross_mode_comparison` false, so they do not establish agreement between modes.
 The first durable generation's transfer latency and automatic background warming
 must be qualified separately from ordinary unordered search latency.

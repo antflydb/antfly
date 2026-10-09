@@ -53,6 +53,13 @@ def main():
     parser.add_argument("--revision", required=True, help="Binary source revision")
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument(
+        "--modes",
+        nargs="+",
+        choices=("text-only", "indexed"),
+        default=["text-only", "indexed"],
+        help="Run modes separately when a full-archive build needs its own pod lifetime",
+    )
+    parser.add_argument(
         "--cycles", type=int, default=2, help="Empty-cache/restart cycles per table"
     )
     parser.add_argument("--expected-rows", type=int, default=10000)
@@ -63,6 +70,8 @@ def main():
     parser.add_argument("--disk", default="4Gi")
     parser.add_argument("--concurrency", type=int, default=4)
     args = parser.parse_args()
+    if len(set(args.modes)) != len(args.modes):
+        parser.error("modes must not contain duplicates")
     if not args.binary.is_file():
         parser.error("binary must be an existing Linux executable")
     if args.cycles < 1 or args.repeats < 1:
@@ -183,7 +192,7 @@ def main():
         )
         run(kubectl + ["exec", pod_name, "--", "chmod", "+x", "/workspace/antfly"])
         reports = {}
-        for mode in ("text-only", "indexed"):
+        for mode in args.modes:
             command = kubectl + [
                 "exec",
                 "-i",
@@ -271,7 +280,7 @@ def main():
                 )
         expected = [
             (hit["_source"]["hn_id"], hit["_score"])
-            for hit in reports["text-only"][0]["first_response"]["hits"]["hits"]
+            for hit in reports[args.modes[0]][0]["first_response"]["hits"]["hits"]
         ]
         for cycles in reports.values():
             for cycle in cycles:
@@ -297,6 +306,8 @@ def main():
             "revision": args.revision,
             "binary_sha256": digest.hexdigest(),
             "runs": reports,
+            "modes": args.modes,
+            "cross_mode_comparison": len(args.modes) > 1,
             "row_count": args.expected_rows,
             "note": "Pinned regional qualification; compare only matching source, resources and optimization.",
         }
