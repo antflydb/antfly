@@ -909,7 +909,7 @@ fn executeInternal(
         true;
     if (selection) |value| {
         if (allow_probe_selection and value.indices == null and value.candidate_scores != null and (value.question != null or value.incomplete_reason != null)) {
-            selection = try maybeProbeAgenticSelection(
+            selection = maybeProbeAgenticSelection(
                 alloc,
                 arena,
                 runner,
@@ -918,7 +918,7 @@ fn executeInternal(
                 mandatory_predicates,
                 classification_result,
                 value,
-            );
+            ) catch |err| return failAgentResult(alloc, format, &live, err, .retrieval);
         }
     }
     const selected_query_indices = if (selection) |value| value.indices else null;
@@ -1439,7 +1439,7 @@ fn executeInternal(
                 else => true,
             };
             if (allow_agentic_fallback) {
-                if (try planNextAgenticFallback(
+                if (planNextAgenticFallback(
                     alloc,
                     arena,
                     runner,
@@ -1449,7 +1449,7 @@ fn executeInternal(
                     classification_result,
                     candidate_scores,
                     attempted_query_indices,
-                )) |fallback_plan| {
+                ) catch |err| return failAgentResult(alloc, format, &live, err, .retrieval)) |fallback_plan| {
                     candidate_scores = fallback_plan.candidate_scores;
                     const planner_decision = decideAgenticPlannerAction(
                         evaluation_trigger,
@@ -5655,7 +5655,7 @@ fn maybeProbeAgenticSelection(
         if (candidate_index >= retrieval_queries.len) continue;
         const retrieval_query = retrieval_queries[candidate_index];
         if (!isProbeableRetrievalQuery(retrieval_query)) continue;
-        const query_json = try encodeQueryValueForRetrievalQuery(
+        const query_json = encodeQueryValueForRetrievalQuery(
             alloc,
             runner,
             raw_queries[candidate_index],
@@ -5665,7 +5665,12 @@ fn maybeProbeAgenticSelection(
             classification_result,
             candidate_index,
             .initial,
-        );
+        ) catch |err| {
+            // Probes are optional. Treat preparation read churn like a
+            // failed probe query, without swallowing other preparation errors.
+            if (retryableReadFailure(err) != null) continue;
+            return err;
+        };
         defer alloc.free(query_json);
 
         var query_response = runner.runQuery(
@@ -5816,7 +5821,7 @@ fn probeAgenticFallbackCandidates(
         if (candidate_index >= retrieval_queries.len) continue;
         const retrieval_query = retrieval_queries[candidate_index];
         if (!isProbeableRetrievalQuery(retrieval_query)) continue;
-        const query_json = try encodeQueryValueForRetrievalQuery(
+        const query_json = encodeQueryValueForRetrievalQuery(
             alloc,
             runner,
             raw_queries[candidate_index],
@@ -5826,7 +5831,12 @@ fn probeAgenticFallbackCandidates(
             classification_result,
             candidate_index,
             .initial,
-        );
+        ) catch |err| {
+            // Keep fallback probing optional when root discovery races a
+            // publication, just as when the probe query itself fails.
+            if (retryableReadFailure(err) != null) continue;
+            return err;
+        };
         defer alloc.free(query_json);
 
         var query_response = runner.runQuery(
@@ -12773,6 +12783,59 @@ test "retrieval agent live pipeline fails with stable retryable read error" {
             const buffered_events = try parseSseEventsAlloc(std.testing.allocator, buffered.body);
             defer std.testing.allocator.free(buffered_events);
             try std.testing.expectEqualStrings(firstSseEventData(events, "error").?, firstSseEventData(buffered_events, "error").?);
+        }
+    }
+}
+
+test "retrieval agent optional probes tolerate preparation read churn and preserve other failures" {
+    const Fixture = struct {
+        failure: anyerror,
+        scan_calls: usize = 0,
+        query_calls: usize = 0,
+        fn scan(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: u32, _: ?[]const u8, _: ?[]const u8) !QueryRunner.KeyPage {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.scan_calls += 1;
+            return self.failure;
+        }
+        fn query(ptr: *anyopaque, alloc: std.mem.Allocator, _: []const u8, _: []const u8) !query_api.QueryResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.query_calls += 1;
+            return .{ .json = try alloc.dupe(u8, "{\"responses\":[]}") };
+        }
+    };
+    const queries = [_]RetrievalQueryRequest{
+        .{ .table = "docs", .tree_search = .{ .index = "hierarchy", .start = .{ .selector = "$roots" } } },
+        .{ .table = "docs" },
+    };
+    const raw_queries = [_]std.json.Value{ .{ .object = .empty }, .{ .object = .empty } };
+    const predicates = [_]MandatoryPredicates{ .{}, .{} };
+    const scores = [_]AgenticCandidateScore{
+        .{ .index = 0, .strategy = .tree, .score = 20 },
+        .{ .index = 1, .strategy = .metadata, .score = 20 },
+    };
+    for ([_]anyerror{ error.IdentityReadGenerationChanged, error.StorageReadTemporarilyUnavailable, error.TopologyChanged, error.OutOfMemory }) |failure| {
+        for ([_]bool{ false, true }) |fallback| {
+            var arena_impl = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer arena_impl.deinit();
+            const arena = arena_impl.allocator();
+            var fixture: Fixture = .{ .failure = failure };
+            const runner: QueryRunner = .{ .ptr = &fixture, .vtable = &.{ .run_query = Fixture.query, .scan_key_page = Fixture.scan } };
+            const probed = if (fallback)
+                probeAgenticFallbackCandidates(std.testing.allocator, arena, runner, &raw_queries, &queries, &predicates, null, &scores, &.{ false, false })
+            else blk: {
+                const selected = maybeProbeAgenticSelection(std.testing.allocator, arena, runner, &raw_queries, &queries, &predicates, null, .{ .candidate_scores = &scores }) catch |err| break :blk @as(anyerror![]const AgenticCandidateScore, err);
+                break :blk @as(anyerror![]const AgenticCandidateScore, selected.?.candidate_scores.?);
+            };
+            if (failure == error.OutOfMemory) {
+                try std.testing.expectError(error.OutOfMemory, probed);
+                try std.testing.expectEqual(@as(usize, 0), fixture.query_calls);
+            } else {
+                const result = try probed;
+                try std.testing.expect(result[0].probe_hits == null);
+                try std.testing.expectEqual(@as(?i64, 0), result[1].probe_hits);
+                try std.testing.expectEqual(@as(usize, 1), fixture.query_calls);
+            }
+            try std.testing.expectEqual(@as(usize, 1), fixture.scan_calls);
         }
     }
 }
