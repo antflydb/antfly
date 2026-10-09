@@ -285,7 +285,16 @@ pub const Scheduler = struct {
     }
 
     fn checkAuthority(self: *Scheduler, e: *const Entry) !void {
-        try e.options.check();
+        e.options.check() catch |err| {
+            // A parent worker's IO cancellation may be independent of the
+            // explicit token copied into children. Publish its observed cause
+            // to the retained family before returning to that worker.
+            self.lock();
+            const family_owned = e.scheduler == self and (e.children != 0 or e.parent != null);
+            self.mutex.unlock();
+            if (family_owned) self.failWait(@constCast(e), err, true);
+            return err;
+        };
         self.lock();
         defer self.mutex.unlock();
         try self.checkAncestorsLocked(e);
@@ -743,6 +752,7 @@ pub const NodeOwner = struct {
 /// own ownership before sharing this capsule's adapter; it is not a gang lease.
 pub const Execution = struct {
     entry: ?Entry = null,
+    child_pending: bool = false,
     quantum_start_ns: u64 = 0,
     checkpoints: u32 = 0,
     /// Changes only after a successful grant. Readers use it to invalidate
@@ -767,16 +777,38 @@ pub const Execution = struct {
     /// Stable child metadata and the independent worker IO must outlive every
     /// physical task join. Finishing the parent with live children is invalid.
     pub fn startChild(self: *Execution, parent: *Execution, io: std.Io, retained_bytes: u64) !void {
-        if (self.entry != null or self == parent) return error.InvalidRunnableTransition;
+        try self.reserveChild(parent, io, retained_bytes);
+        errdefer self.finish();
+        try self.activateChild();
+    }
+
+    /// Reserve before task publication without waiting for CPU on the parent
+    /// coordinator. The independent worker activates after publication.
+    pub fn reserveChild(self: *Execution, parent: *Execution, io: std.Io, retained_bytes: u64) !void {
+        if (self.entry != null or self == parent or parent.child_pending) return error.InvalidRunnableTransition;
         const parent_entry = if (parent.entry) |*entry| entry else return error.InvalidRunnableTransition;
         const owner = try schedulerFor(parent_entry, true);
         if (retained_bytes < @sizeOf(Execution)) return error.InvalidRunnableDemand;
         self.entry = .{ .options = parent_entry.options, .class = parent_entry.class, .bytes = retained_bytes };
         errdefer self.finish();
         try owner.submitChild(parent_entry, &self.entry.?, io);
-        try owner.wait(&self.entry.?);
+        self.child_pending = true;
+    }
+
+    /// Published task ownership survives rejected activation until physical
+    /// join and owning finish. This cannot replay an already activated child.
+    pub fn activateChild(self: *Execution) !void {
+        const e = if (self.entry) |*entry| entry else return error.InvalidRunnableTransition;
+        if (!self.child_pending or e.parent == null) {
+            _ = try schedulerFor(e, false);
+            return error.InvalidRunnableTransition;
+        }
+        self.child_pending = false;
+        const owner = try schedulerFor(e, false);
+        try owner.waitRetained(e);
         self.resume_generation +%= 1;
-        self.quantum_start_ns = self.entry.?.options.now();
+        self.quantum_start_ns = e.options.now();
+        self.checkpoints = 0;
     }
 
     fn schedulerFor(e: *Entry, comptime needs_running: bool) !*Scheduler {
@@ -794,6 +826,7 @@ pub const Execution = struct {
     /// resize, park, checkpoint or finish. Physical IO ownership and accepted
     /// durable completion require their separate capabilities.
     pub fn resizeTeam(self: *Execution, slots: usize) !void {
+        if (self.child_pending) return error.InvalidRunnableTransition;
         if (slots == 0) return error.InvalidRunnableDemand;
         const e = if (self.entry) |*entry| entry else return;
         const owner = try schedulerFor(e, true);
@@ -805,6 +838,7 @@ pub const Execution = struct {
         self.checkpoints = 0;
     }
     pub fn checkpoint(self: *Execution) !void {
+        if (self.child_pending) return error.InvalidRunnableTransition;
         const e = if (self.entry) |*entry| entry else return;
         const owner = try schedulerFor(e, true);
         try owner.checkAuthority(e);
@@ -818,11 +852,13 @@ pub const Execution = struct {
         self.checkpoints = 0;
     }
     pub fn park(self: *Execution, reason: State) !void {
+        if (self.child_pending) return error.InvalidRunnableTransition;
         const e = if (self.entry) |*entry| entry else return;
         const owner = try schedulerFor(e, false);
         try owner.block(e, reason);
     }
     pub fn enter(self: *Execution, class: Class) !void {
+        if (self.child_pending) return error.InvalidRunnableTransition;
         const e = if (self.entry) |*entry| entry else return;
         const owner = try schedulerFor(e, false);
         try owner.reclassifyBlocked(e, class);
@@ -892,6 +928,7 @@ pub const Execution = struct {
     pub fn finish(self: *Execution) void {
         if (self.entry) |*e| if (e.scheduler) |owner| owner.finish(e);
         self.entry = null;
+        self.child_pending = false;
     }
 };
 
@@ -2480,5 +2517,35 @@ test "runnable scheduler child physical worker join retains original parent and 
     health.finish();
     parent.finish();
     try std.testing.expectEqual(@as(usize, 0), owner.stats().operations);
+    try std.testing.expectEqual(@as(u64, 0), owner.stats().retained_bytes);
+}
+
+test "runnable scheduler child observes original parent worker IO cancellation without a separate token" {
+    const Context = struct {
+        var cancelled: bool = false;
+        fn check(_: ?*anyopaque) std.Io.Cancelable!void {
+            if (cancelled) return error.Canceled;
+        }
+    };
+    var vtable = std.testing.io.vtable.*;
+    vtable.checkCancel = Context.check;
+    const parent_io: std.Io = .{ .userdata = std.testing.io.userdata, .vtable = &vtable };
+    Context.cancelled = false;
+    var owner = try Scheduler.init(.{ .slots = 3 });
+    defer owner.close();
+    var parent: Execution = .{};
+    defer parent.finish();
+    try parent.start(&owner, .{ .io = parent_io, .retained_bytes = 13 }, .query);
+    var child: Execution = .{};
+    defer child.finish();
+    try child.startChild(&parent, std.testing.io, @sizeOf(Execution));
+    Context.cancelled = true;
+    try std.testing.expectError(error.Canceled, parent.checkpoint());
+    try std.testing.expectEqual(State.stopped, parent.entry.?.state);
+    try std.testing.expectError(error.Canceled, child.checkpoint());
+    try std.testing.expectEqual(@as(usize, 2), owner.stats().operations);
+    try std.testing.expectEqual(@as(usize, 1), parent.entry.?.children);
+    child.finish();
+    parent.finish();
     try std.testing.expectEqual(@as(u64, 0), owner.stats().retained_bytes);
 }

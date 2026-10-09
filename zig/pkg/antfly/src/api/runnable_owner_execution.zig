@@ -15,7 +15,7 @@ pub const State = struct {
     cleanup_in_use: std.atomic.Value(bool) = .init(false),
 
     pub fn port(self: *State) abi.Owner {
-        return .{ .context = &self.owner, .retain = retain, .release = release, .start = start, .checkpoint = checkpoint, .park = park, .enter = enter, .finish = finish, .resize_team = resizeTeam, .reserve_completion = reserveCompletion, .activate_completion = activateCompletion, .reserve_cleanup = reserveCleanup, .activate_cleanup = activateCleanup, .completion_remaining_ns = completionRemaining };
+        return .{ .context = &self.owner, .retain = retain, .release = release, .start = start, .checkpoint = checkpoint, .park = park, .enter = enter, .finish = finish, .resize_team = resizeTeam, .reserve_completion = reserveCompletion, .activate_completion = activateCompletion, .reserve_cleanup = reserveCleanup, .activate_cleanup = activateCleanup, .completion_remaining_ns = completionRemaining, .reserve_child = reserveChild, .activate_child = activateChild };
     }
 };
 
@@ -98,6 +98,33 @@ fn startChecked(raw: *anyopaque, options: *const abi.Start) !void {
     }, std.enums.fromInt(runnable.Class, options.class) orelse return error.InvalidArgument, options.slots);
     options.out_handle.* = value;
 }
+fn reserveChild(raw: *anyopaque, options: *const abi.ChildStart) callconv(.c) runtime.error_abi.Status {
+    reserveChildChecked(raw, options) catch |err| return runtime.error_abi.statusFromError(err);
+    return .ok;
+}
+fn reserveChildChecked(raw: *anyopaque, options: *const abi.ChildStart) !void {
+    try options.validate();
+    const parent = capsule(raw);
+    if (parent.cleanup) return error.UnsupportedOperation;
+    const owner = parent.state;
+    try owner.owner.retain();
+    errdefer owner.owner.release();
+    const value = try owner.owner_alloc.create(Capsule);
+    errdefer owner.owner_alloc.destroy(value);
+    value.* = .{ .state = owner, .io = try options.io.receive(), .clock_io = null, .cancellation = .{} };
+    errdefer value.execution.finish();
+    const bytes = std.math.add(u64, options.retained_bytes, @sizeOf(Capsule)) catch return error.InvalidRunnableDemand;
+    try value.execution.reserveChild(&parent.execution, value.io.io(), bytes);
+    options.out_child.* = .{
+        .borrow = try abi.Borrowed.fromOwner(owner.port(), value, 1, @fromBackingInt(@intCast(@backingInt(value.execution.entry.?.class)))),
+        .finish = finish,
+    };
+}
+fn activateChild(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {
+    capsule(raw).execution.activateChild() catch |err| return runtime.error_abi.statusFromError(err);
+    return .ok;
+}
+
 fn checkpoint(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {
     capsule(raw).execution.checkpoint() catch |err| return runtime.error_abi.statusFromError(err);
     return .ok;
@@ -758,4 +785,148 @@ test "runnable execution completion ABI checks foreground fences and denies clea
         }
         try std.testing.expectEqual(@as(usize, 1), owner.owner.scheduler.stats().operations);
     }
+}
+
+test "runnable execution port child reservation publishes before worker CPU and retains original authority through physical join" {
+    const Worker = struct {
+        child: *abi.Child,
+        ready: std.Io.Event = .unset,
+        go: std.Io.Event = .unset,
+        fn run(self: *@This()) !void {
+            try self.child.activate();
+            try checked(self.child.borrow.park(self.child.borrow.context, @backingInt(abi.Wait.resource)));
+            self.ready.set(std.testing.io);
+            self.go.waitUncancelable(std.testing.io);
+            try checked(self.child.borrow.enter(self.child.borrow.context, @backingInt(abi.Class.query)));
+        }
+        fn checked(status: runtime.error_abi.Status) !void {
+            if (!status.isOk()) return runtime.error_abi.errorFromStatus(status);
+        }
+        fn requested(raw: ?*const anyopaque) callconv(.c) u8 {
+            return @intFromBool(@as(*const std.atomic.Value(bool), @ptrCast(@alignCast(raw.?))).load(.acquire));
+        }
+    };
+    for ([_]?anyerror{ null, error.Canceled, error.DeadlineExceeded }) |failure| {
+        TestClock.now_ns = 0;
+        var canceled: std.atomic.Value(bool) = .init(false);
+        var owner: State = .{ .owner_alloc = std.testing.allocator, .owner = try runnable.NodeOwner.init(.{ .slots = 2 }), .native_now_ns = TestClock.now };
+        defer owner.owner.tryDeinit() catch @panic("owner leaked");
+        const port = owner.port();
+        const io = std.testing.io;
+        const io_borrow = runtime.native_abi.IoBorrow.init(&io);
+        var parent: ?*anyopaque = null;
+        try Worker.checked(port.start(port.context, &.{ .io = &io_borrow, .class = @backingInt(abi.Class.query), .has_deadline = 1, .native_deadline = 1, .deadline_ns = 10, .cancellation = .{ .context = &canceled, .is_cancelled = Worker.requested }, .out_handle = &parent }));
+        defer port.finish(parent.?);
+        const parent_borrow = try abi.Borrowed.fromOwner(port, parent.?, 1, .query);
+        var child: abi.Child = undefined;
+        try parent_borrow.reserveChild(&.{ .io = &io_borrow, .retained_bytes = 41, .out_child = &child });
+        defer child.deinit();
+        try std.testing.expect(capsule(child.borrow.context).execution.child_pending);
+        try std.testing.expectEqual(runnable.State.queued, capsule(child.borrow.context).execution.entry.?.state);
+        try std.testing.expectEqual(@as(usize, 1), capsule(parent.?).execution.entry.?.children);
+        try std.testing.expectError(error.InvalidRunnableTransition, Worker.checked(child.borrow.checkpoint(child.borrow.context)));
+        const charged = owner.owner.scheduler.stats().retained_bytes;
+        try Worker.checked(port.park(parent.?, @backingInt(abi.Wait.resource)));
+        var worker = Worker{ .child = &child };
+        var future = try std.testing.io.concurrent(Worker.run, .{&worker});
+        defer {
+            worker.go.set(std.testing.io);
+            future.await(std.testing.io) catch {};
+        }
+        try worker.ready.waitTimeout(std.testing.io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+        try Worker.checked(port.enter(parent.?, @backingInt(abi.Class.query)));
+        try std.testing.expectEqual(charged, owner.owner.scheduler.stats().retained_bytes);
+        var health: ?*anyopaque = null;
+        try Worker.checked(port.start(port.context, &.{ .io = &io_borrow, .class = @backingInt(abi.Class.control), .allow_wait = 0, .out_handle = &health }));
+        defer port.finish(health.?);
+        try Worker.checked(port.checkpoint(health.?));
+        try Worker.checked(port.park(parent.?, @backingInt(abi.Wait.resource)));
+        if (failure) |err| {
+            if (err == error.Canceled) canceled.store(true, .release) else TestClock.now_ns = 10;
+        }
+        worker.go.set(std.testing.io);
+        if (failure) |err| try std.testing.expectError(err, future.await(std.testing.io)) else try future.await(std.testing.io);
+        try std.testing.expectEqual(@as(usize, 1), owner.owner.scheduler.stats().child_operations);
+        try std.testing.expectEqual(@as(usize, 1), capsule(parent.?).execution.entry.?.children);
+        if (failure) |err| try std.testing.expectError(err, child.activate()) else try std.testing.expectError(error.InvalidRunnableTransition, child.activate());
+        child.deinit();
+        try std.testing.expectEqual(@as(usize, 0), capsule(parent.?).execution.entry.?.children);
+        try std.testing.expectEqual(@as(usize, 0), owner.owner.scheduler.stats().child_operations);
+    }
+}
+
+test "runnable execution port child allocation failures preserve parent and exact owner leases" {
+    const Fixture = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            var owner: State = .{ .owner_alloc = alloc, .owner = try runnable.NodeOwner.init(.{ .slots = 3 }), .native_now_ns = TestClock.now };
+            defer owner.owner.tryDeinit() catch @panic("owner leaked");
+            const port = owner.port();
+            const io = std.testing.io;
+            const io_borrow = runtime.native_abi.IoBorrow.init(&io);
+            var parent: ?*anyopaque = null;
+            const status = port.start(port.context, &.{ .io = &io_borrow, .class = @backingInt(abi.Class.query), .out_handle = &parent });
+            if (!status.isOk()) return runtime.error_abi.errorFromStatus(status);
+            defer port.finish(parent.?);
+            const before = owner.owner.scheduler.stats();
+            var child: abi.Child = undefined;
+            port.reserveChild(parent.?, &.{ .io = &io_borrow, .out_child = &child }) catch |err| {
+                try std.testing.expectEqual(before.retained_bytes, owner.owner.scheduler.stats().retained_bytes);
+                try std.testing.expectEqual(@as(usize, 0), capsule(parent.?).execution.entry.?.children);
+                try std.testing.expectEqual(@as(usize, 1), owner.owner.borrowers);
+                return err;
+            };
+            defer child.deinit();
+            try child.activate();
+            try std.testing.expectEqual(@as(usize, 2), owner.owner.borrowers);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
+test "runnable execution port pending child shutdown retains stopped cause and publication ownership" {
+    var owner: State = .{ .owner_alloc = std.testing.allocator, .owner = try runnable.NodeOwner.init(.{ .slots = 2 }), .native_now_ns = TestClock.now };
+    defer owner.owner.tryDeinit() catch @panic("owner leaked");
+    const port = owner.port();
+    const io = std.testing.io;
+    const io_borrow = runtime.native_abi.IoBorrow.init(&io);
+    var parent: ?*anyopaque = null;
+    try std.testing.expect(port.start(port.context, &.{ .io = &io_borrow, .class = @backingInt(abi.Class.query), .out_handle = &parent }).isOk());
+    defer port.finish(parent.?);
+    var child: abi.Child = undefined;
+    try port.reserveChild(parent.?, &.{ .io = &io_borrow, .out_child = &child });
+    defer child.deinit();
+    const bytes = owner.owner.scheduler.stats().retained_bytes;
+    owner.owner.close();
+    try std.testing.expectError(error.SchedulerClosed, child.activate());
+    try std.testing.expectError(error.SchedulerClosed, child.activate());
+    const check = child.borrow.checkpoint(child.borrow.context);
+    try std.testing.expectEqual(error.SchedulerClosed, runtime.error_abi.errorFromStatus(check));
+    try std.testing.expectEqual(bytes, owner.owner.scheduler.stats().retained_bytes);
+    try std.testing.expectEqual(@as(usize, 1), capsule(parent.?).execution.entry.?.children);
+    try std.testing.expectEqual(@as(usize, 2), owner.owner.borrowers);
+    child.deinit();
+    try std.testing.expectEqual(@as(usize, 0), capsule(parent.?).execution.entry.?.children);
+    try std.testing.expectEqual(@as(usize, 1), owner.owner.borrowers);
+}
+
+test "runnable execution port child invalid prefix and overflowing ownership leave parent unchanged" {
+    var owner: State = .{ .owner_alloc = std.testing.allocator, .owner = try runnable.NodeOwner.init(.{ .slots = 3 }), .native_now_ns = TestClock.now };
+    defer owner.owner.tryDeinit() catch @panic("owner leaked");
+    const port = owner.port();
+    const io = std.testing.io;
+    const io_borrow = runtime.native_abi.IoBorrow.init(&io);
+    var parent: ?*anyopaque = null;
+    try std.testing.expect(port.start(port.context, &.{ .io = &io_borrow, .class = @backingInt(abi.Class.query), .out_handle = &parent }).isOk());
+    defer port.finish(parent.?);
+    const before = owner.owner.scheduler.stats();
+    var child: abi.Child = undefined;
+    var request: abi.ChildStart = .{ .io = &io_borrow, .out_child = &child, .version = 8 };
+    try std.testing.expectError(error.UnsupportedVersion, port.reserveChild(parent.?, &request));
+    request.version = abi.abi_version;
+    request.retained_bytes = std.math.maxInt(u64);
+    try std.testing.expectError(error.InvalidRunnableDemand, port.reserveChild(parent.?, &request));
+    try std.testing.expectEqual(before.retained_bytes, owner.owner.scheduler.stats().retained_bytes);
+    try std.testing.expectEqual(before.operations, owner.owner.scheduler.stats().operations);
+    try std.testing.expectEqual(@as(usize, 0), capsule(parent.?).execution.entry.?.children);
+    try std.testing.expectEqual(@as(usize, 1), owner.owner.borrowers);
 }

@@ -202,6 +202,19 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("antfly-completion-budget-abi-test", "Verify completion budget ABI version and authority checks")
         .dependOn(&b.addRunArtifact(completion_budget_abi_tests).step);
+    const runnable_child_abi_tests = b.addTest(.{
+        .name = "runnable-child-abi-tests",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("lib/runtime/src/runtime_runnable_abi.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+        .filters = &.{"runnable child ABI"},
+        .max_rss = 2 * 1024 * 1024 * 1024,
+    });
+    b.step("antfly-runnable-child-abi-test", "Verify child reservation ABI prefixes and inherited authority")
+        .dependOn(&b.addRunArtifact(runnable_child_abi_tests).step);
     const decision_budget_root = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/api/decision_recovery_budget.zig"),
         .target = target,

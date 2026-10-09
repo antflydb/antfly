@@ -9,7 +9,7 @@ const native = @import("runtime_native_abi.zig");
 const errors = @import("runtime_error_abi.zig");
 const http = @import("runtime_http_abi.zig");
 
-pub const abi_version: u32 = 8;
+pub const abi_version: u32 = 9;
 pub const Class = enum(c_int) { query, write, inference, background, control };
 pub const Wait = enum(c_int) { resource, output };
 
@@ -87,6 +87,20 @@ pub const Cleanup = extern struct {
     }
 };
 
+/// Prepublication child ownership. The independent worker IO is retained
+/// through physical join and finish. Root clock/cancellation inputs remain
+/// borrowed through every child finish; no new query authority is accepted.
+pub const ChildStart = extern struct {
+    version: u32 = abi_version,
+    struct_size: u32 = @sizeOf(@This()),
+    io: *const native.IoBorrow,
+    retained_bytes: u64 = 0,
+    out_child: *Child,
+    pub fn validate(self: *const ChildStart) !void {
+        if (self.version != abi_version or self.struct_size != @sizeOf(ChildStart)) return error.UnsupportedVersion;
+    }
+};
+
 pub const Owner = extern struct {
     version: u32 = abi_version,
     struct_size: u32 = @sizeOf(@This()),
@@ -108,6 +122,8 @@ pub const Owner = extern struct {
     /// Remaining time in the already activated completion's original clock.
     /// Observing this budget conveys no admission or fresh deadline authority.
     completion_remaining_ns: ?*const fn (*anyopaque, *u64) callconv(.c) errors.Status = null,
+    reserve_child: ?*const fn (*anyopaque, *const ChildStart) callconv(.c) errors.Status = null,
+    activate_child: ?*const fn (*anyopaque) callconv(.c) errors.Status = null,
 
     pub fn reserveCompletion(self: Owner, handle: *anyopaque, options: *const Completion) !void {
         if (!self.valid()) return error.UnsupportedVersion;
@@ -146,6 +162,20 @@ pub const Owner = extern struct {
         if (!self.valid()) return error.UnsupportedVersion;
         const callback = self.activate_cleanup orelse return error.UnsupportedOperation;
         const status = callback(handle);
+        if (!status.isOk()) return errors.errorFromStatus(status);
+    }
+
+    pub fn reserveChild(self: Owner, parent: *anyopaque, options: *const ChildStart) !void {
+        if (!self.valid()) return error.UnsupportedVersion;
+        try options.validate();
+        const callback = self.reserve_child orelse return error.UnsupportedOperation;
+        const status = callback(parent, options);
+        if (!status.isOk()) return errors.errorFromStatus(status);
+    }
+    pub fn activateChild(self: Owner, child: *anyopaque) !void {
+        if (!self.valid()) return error.UnsupportedVersion;
+        const callback = self.activate_child orelse return error.UnsupportedOperation;
+        const status = callback(child);
         if (!status.isOk()) return errors.errorFromStatus(status);
     }
 
@@ -212,6 +242,22 @@ pub const Borrowed = extern struct {
     /// Remaining time in the already activated completion's original clock.
     /// Observing this budget conveys no admission or fresh deadline authority.
     completion_remaining_ns: ?*const fn (*anyopaque, *u64) callconv(.c) errors.Status = null,
+    reserve_child: ?*const fn (*anyopaque, *const ChildStart) callconv(.c) errors.Status = null,
+    activate_child: ?*const fn (*anyopaque) callconv(.c) errors.Status = null,
+
+    pub fn reserveChild(self: Borrowed, options: *const ChildStart) !void {
+        try self.validate();
+        try options.validate();
+        const callback = self.reserve_child orelse return error.UnsupportedOperation;
+        const status = callback(self.context, options);
+        if (!status.isOk()) return errors.errorFromStatus(status);
+    }
+    pub fn activateChild(self: Borrowed) !void {
+        try self.validate();
+        const callback = self.activate_child orelse return error.UnsupportedOperation;
+        const status = callback(self.context);
+        if (!status.isOk()) return errors.errorFromStatus(status);
+    }
 
     pub fn reserveCompletion(self: Borrowed, options: *const Completion) !void {
         try self.validate();
@@ -292,9 +338,39 @@ pub const Borrowed = extern struct {
             .reserve_cleanup = owner.reserve_cleanup,
             .activate_cleanup = owner.activate_cleanup,
             .completion_remaining_ns = owner.completion_remaining_ns,
+            .reserve_child = owner.reserve_child,
+            .activate_child = owner.activate_child,
         };
         try borrow.validate();
         return borrow;
+    }
+};
+
+/// Move-only owned child token. The parent and its foreign IO/clock/cancel
+/// inputs remain retained through this token's physical join and deinit.
+pub const Child = extern struct {
+    version: u32 = abi_version,
+    struct_size: u32 = @sizeOf(@This()),
+    borrow: Borrowed,
+    finish: *const fn (*anyopaque) callconv(.c) void,
+    active: u8 = 1,
+    reserved: [7]u8 = @splat(0),
+    pub fn validate(self: *const Child) !void {
+        if (self.version != abi_version or self.struct_size != @sizeOf(Child)) return error.UnsupportedVersion;
+        if (self.active != 1 or !std.mem.allEqual(u8, &self.reserved, 0)) return error.InvalidRunnableTransition;
+        try self.borrow.validate();
+    }
+    pub fn activate(self: *Child) !void {
+        try self.validate();
+        try self.borrow.activateChild();
+    }
+    /// Call only after task publication has been abandoned or every physical
+    /// consumer has joined. CPU stop/timeout is not proof of physical finish.
+    pub fn deinit(self: *Child) void {
+        if (self.active == 0) return;
+        self.validate() catch @panic("invalid owned runnable child");
+        self.active = 0;
+        self.finish(self.borrow.context);
     }
 };
 
@@ -648,4 +724,20 @@ test "completion ABI cleanup activation budget rejects legacy semantics before d
     options.reserved = @splat(0);
     try borrowed.reserveCleanup(&options);
     try std.testing.expectEqual(@as(usize, 1), fake.calls);
+}
+
+test "runnable child ABI rejects legacy prefixes before borrowing worker IO or callbacks" {
+    const Header = extern struct { version: u32, struct_size: u32 };
+    var header: Header align(@alignOf(ChildStart)) = .{ .version = 8, .struct_size = @sizeOf(ChildStart) };
+    const start: *const ChildStart = @ptrCast(&header);
+    try std.testing.expectError(error.UnsupportedVersion, start.validate());
+    header.version = abi_version;
+    header.struct_size = @sizeOf(Header);
+    try std.testing.expectError(error.UnsupportedVersion, start.validate());
+    var child_header: Header align(@alignOf(Child)) = .{ .version = 8, .struct_size = @sizeOf(Child) };
+    const child: *const Child = @ptrCast(&child_header);
+    try std.testing.expectError(error.UnsupportedVersion, child.validate());
+    child_header.version = abi_version;
+    child_header.struct_size = @sizeOf(Header);
+    try std.testing.expectError(error.UnsupportedVersion, child.validate());
 }
