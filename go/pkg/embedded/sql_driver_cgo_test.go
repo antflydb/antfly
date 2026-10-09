@@ -1,0 +1,195 @@
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
+//go:build cgo && libantfly
+
+package embedded
+
+import (
+	"bytes"
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"reflect"
+	"strconv"
+	"testing"
+)
+
+func TestSQLConformance(t *testing.T) {
+	raw, err := os.ReadFile("../../../zig/pkg/antfly-embedded/capi-conformance/sql/cases.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cases []struct {
+		Statement  string            `json:"statement"`
+		Parameters []json.RawMessage `json:"parameters"`
+		Rows       [][]any           `json:"rows"`
+		State      string            `json:"sqlstate"`
+	}
+	if err = json.Unmarshal(raw, &cases); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("antfly", "file:"+filepath.Join(t.TempDir(), "sql.aflite")+"?no_sync=1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	for _, c := range cases {
+		args := make([]any, len(c.Parameters))
+		for i, p := range c.Parameters {
+			d := json.NewDecoder(bytes.NewReader(p))
+			d.UseNumber()
+			var v any
+			if err = d.Decode(&v); err != nil {
+				t.Fatal(err)
+			}
+			switch value := v.(type) {
+			case json.Number:
+				n, e := value.Int64()
+				if e != nil {
+					f, floatErr := value.Float64()
+					if floatErr != nil {
+						t.Fatal(floatErr)
+					}
+					args[i] = f
+				} else {
+					args[i] = n
+				}
+			case map[string]any, []any:
+				args[i] = p
+			default:
+				args[i] = v
+			}
+		}
+		if c.State != "" {
+			_, err = db.Query(c.Statement, args...)
+			var e *SQLError
+			if !errors.As(err, &e) || e.Code != c.State {
+				t.Fatalf("state %s: %v", c.State, err)
+			}
+			continue
+		}
+		if c.Rows == nil {
+			if _, err = db.Exec(c.Statement, args...); err != nil {
+				t.Fatalf("%s: %v", c.Statement, err)
+			}
+			continue
+		}
+		rows, e := db.Query(c.Statement, args...)
+		if e != nil {
+			t.Fatal(e)
+		}
+		cols, _ := rows.Columns()
+		var actual [][]any
+		for rows.Next() {
+			values := make([]any, len(cols))
+			ptrs := make([]any, len(cols))
+			for i := range values {
+				ptrs[i] = &values[i]
+			}
+			if e = rows.Scan(ptrs...); e != nil {
+				t.Fatal(e)
+			}
+			for i, v := range values {
+				switch value := v.(type) {
+				case int64:
+					values[i] = strconv.FormatInt(value, 10)
+				case []byte:
+					if e = json.Unmarshal(value, &values[i]); e != nil {
+						t.Fatal(e)
+					}
+				}
+			}
+			actual = append(actual, values)
+		}
+		if err = rows.Err(); err != nil {
+			t.Fatal(err)
+		}
+		rows.Close()
+		if !reflect.DeepEqual(actual, c.Rows) {
+			t.Fatalf("got %#v want %#v", actual, c.Rows)
+		}
+	}
+}
+
+func TestSQLSessionsAndStreaming(t *testing.T) {
+	db, err := sql.Open("antfly", "file:"+filepath.Join(t.TempDir(), "sessions.aflite")+"?no_sync=1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(2)
+	if _, err = db.Exec("CREATE TABLE numbers (n BIGINT)"); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := db.BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 300; i++ {
+		if _, err = tx.Exec("INSERT INTO numbers (_id,n) VALUES ($1,$2)", fmt.Sprintf("row:%04d", i), int64(i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rows, err := db.Query("SELECT n FROM numbers")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rows.Next() {
+		t.Fatal("uncommitted rows visible")
+	}
+	rows.Close()
+	if err = tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	rows, err = db.Query("SELECT n FROM numbers ORDER BY _id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	n := 0
+	for rows.Next() {
+		var v int64
+		if err = rows.Scan(&v); err != nil {
+			t.Fatal(err)
+		}
+		if v != int64(n) {
+			t.Fatalf("row %d: %d", n, v)
+		}
+		n++
+	}
+	if err = rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if n != 300 {
+		t.Fatalf("streamed %d rows", n)
+	}
+}
+
+func TestSQLPoolRecoversAfterFailedCommit(t *testing.T) {
+	db, err := sql.Open("antfly", "file:"+filepath.Join(t.TempDir(), "failed.aflite")+"?no_sync=1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	if _, err = db.Exec("CREATE TABLE numbers (n BIGINT)"); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = tx.Exec("SELECT n FROM missing_table"); err == nil {
+		t.Fatal("missing table succeeded")
+	}
+	if err = tx.Commit(); err == nil {
+		t.Fatal("aborted transaction committed")
+	}
+	if _, err = db.Exec("INSERT INTO numbers (n) VALUES (1)"); err != nil {
+		t.Fatalf("pooled connection retained failed transaction: %v", err)
+	}
+}
