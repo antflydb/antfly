@@ -379,7 +379,20 @@ test "SQL JSON array allocator references survive program and codec owner moves"
     defer program.deinit();
     var constants = program.constant_arrays.valueIterator();
     const cached = constants.next().?.*;
-    try std.testing.expectEqual(@intFromPtr(program.arena), @intFromPtr(cached.elements[0].value.array.allocator.ptr));
+    const allocator_ptr = cached.elements[0].value.array.allocator.ptr;
+    const pinned_owner = for (program.constant_pool.?.regions.items) |region| {
+        if (@intFromPtr(region) == @intFromPtr(allocator_ptr)) break region;
+    } else return error.UnpinnedConstantAllocator;
+    try std.testing.expectEqual(@intFromPtr(pinned_owner), @intFromPtr(allocator_ptr));
+    var moved_program = program;
+    var moved_constants = moved_program.constant_arrays.valueIterator();
+    const moved_cached = moved_constants.next().?.*;
+    const moved_allocator = moved_cached.elements[0].value.array.allocator;
+    const probe = try moved_allocator.alloc(u8, 256);
+    defer moved_allocator.free(probe);
+    @memset(probe, 7);
+    try std.testing.expectEqual(@as(u8, 7), probe[255]);
+    try std.testing.expectEqual(@as(usize, 2), moved_cached.elements[0].value.array.items.len);
     var owned = try text.decode(a, .jsonb, "{\"[1,2]\"}", .{});
     defer owned.deinit();
     try std.testing.expectEqual(@intFromPtr(owned.arena), @intFromPtr(owned.value.elements[0].value.array.allocator.ptr));

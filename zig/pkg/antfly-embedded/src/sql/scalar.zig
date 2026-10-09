@@ -186,6 +186,15 @@ pub const BindLimits = struct {
     parameters: usize = 1024,
     invocation: ?*@import("parameter_binding.zig").Invocation = null,
     assignment: bool = false,
+    /// Speculative caches share one bound-program allocation/work allowance.
+    /// Exhaustion disables further preparation; row execution remains bounded
+    /// by its own invocation limits and never inherits speculative failures.
+    constant_bytes: usize = 4 * 1024 * 1024,
+    constant_steps: usize = 1024 * 1024,
+    /// Unknown literal input functions are binding work, not speculative
+    /// execution. Keep them mandatory even when optional caches are disabled.
+    input_bytes: usize = 4 * 1024 * 1024,
+    input_steps: usize = 1024 * 1024,
 };
 const decisions = @import("../functions/decisions.zig");
 pub const DecisionDemand = struct { instruction: u32, function: decisions.Function, args: []const Json };
@@ -220,6 +229,7 @@ fn regexFunction(function: Function) ?regex_functions.Function {
 
 pub const Instruction = struct {
     type: Type,
+    input_function: bool = false,
     operation: union(enum) {
         literal: Json,
         column: u32,
@@ -235,6 +245,12 @@ pub const Instruction = struct {
 };
 
 const TextTranslation = std.AutoHashMapUnmanaged(u21, []const u8);
+
+const ConstantPool = struct {
+    memory: @import("memory_budget.zig"),
+    regions: std.ArrayList(*std.heap.ArenaAllocator) = .empty,
+    remaining: usize,
+};
 
 pub const Program = struct {
     arena: *std.heap.ArenaAllocator,
@@ -255,43 +271,98 @@ pub const Program = struct {
     constant_arrays: std.AutoHashMapUnmanaged(u32, *const arrays.Value) = .empty,
     constant_numerics: std.AutoHashMapUnmanaged(u32, *const @import("numeric_value.zig").Value) = .empty,
     constant_memberships: std.AutoHashMapUnmanaged(u32, *arrays.Membership) = .empty,
+    constant_pool: ?*ConstantPool = null,
+    constant_inputs: std.AutoHashMapUnmanaged(u32, Datum) = .empty,
 
-    fn literalInstruction(self: *const Program, index: u32) bool {
+    fn literalInstruction(self: *const Program, index: u32, earlier: []const bool) bool {
         return switch (self.instructions[index].operation) {
             .literal => true,
-            .cast => |cast| self.literalInstruction(cast.operand),
-            .unary => |unary| self.literalInstruction(unary.operand),
+            .cast => |cast| earlier[cast.operand],
+            .unary => |unary| earlier[unary.operand],
             .call => |call| blk: {
                 switch (call.function) {
                     .@"$array", .string_to_array, .abs, .ceil, .floor, .round, .trunc, .sign, .mod, .sqrt => {},
                     else => break :blk false,
                 }
-                for (call.args) |arg| if (!self.literalInstruction(arg)) break :blk false;
+                for (call.args) |arg| if (!earlier[arg]) break :blk false;
                 break :blk true;
             },
             else => false,
         };
     }
 
-    fn prepareConstantArrays(self: *Program, a: Allocator) !void {
-        for (self.instructions, 0..) |instruction, index| {
-            if (instruction.type.kind == .number and instruction.type.element_type == .numeric and self.literalInstruction(@intCast(index))) {
-                const value = self.prepareInstruction(a, @intCast(index)) catch |err| switch (err) {
-                    // Preparing a pure function is an optimization, not an
-                    // execution demand. Unreachable CASE/COALESCE branches
-                    // must not acquire a square-root domain error here.
-                    error.SqlInvalidPowerArgument, error.NumericModifierNotPreparable => continue,
-                    else => return err,
-                };
-                if (value.numeric) |number| try self.constant_numerics.put(a, @intCast(index), number);
-                continue;
+    fn prepareConstantArrays(self: *Program, a: Allocator, limits: BindLimits) !void {
+        for (self.instructions) |instruction| {
+            if (instruction.input_function or instruction.type.kind == .array or (instruction.type.kind == .number and instruction.type.element_type == .numeric)) break;
+        } else return;
+        // Bound instructions are topological: classify purity once instead of
+        // repeatedly walking overlapping constant subtrees during preparation.
+        const pure = try a.alloc(bool, self.instructions.len);
+        for (pure, 0..) |*value, index| value.* = self.literalInstruction(@intCast(index), pure[0..index]);
+        const pool = try a.create(ConstantPool);
+        pool.* = .{
+            .memory = .{ .backing = self.arena.child_allocator, .limit = limits.input_bytes, .monotonic = true },
+            .remaining = limits.input_steps,
+        };
+        self.constant_pool = pool;
+        for (0..2) |phase| {
+            const input_validation = phase == 0;
+            if (!input_validation) {
+                pool.memory.limit = std.math.add(usize, pool.memory.footprint(), limits.constant_bytes) catch return error.SqlProgramLimitExceeded;
+                pool.remaining = limits.constant_steps;
             }
-            if (instruction.type.kind != .array or !self.literalInstruction(@intCast(index))) continue;
-            const value = self.prepareInstruction(a, @intCast(index)) catch |err| switch (err) {
-                error.SqlInvalidPowerArgument, error.NumericModifierNotPreparable => continue,
-                else => return err,
-            };
-            if (value.array) |array| try self.constant_arrays.put(a, @intCast(index), array);
+            for (self.instructions, 0..) |instruction, index| {
+                const is_numeric = instruction.type.kind == .number and instruction.type.element_type == .numeric;
+                if (input_validation) {
+                    if (!instruction.input_function and !(is_numeric and instruction.operation == .literal)) continue;
+                } else {
+                    if ((!is_numeric and instruction.type.kind != .array) or !pure[index]) continue;
+                    if (self.constant_numerics.contains(@intCast(index))) continue;
+                }
+                if (pool.remaining == 0 or pool.memory.footprint() >= pool.memory.limit) {
+                    if (input_validation) return error.SqlProgramLimitExceeded;
+                    break;
+                }
+                // Roll back unpublished scratch, and adopt successful regions
+                // without cloning cells/limbs or retaining a stack allocator.
+                const region = try a.create(std.heap.ArenaAllocator);
+                region.* = std.heap.ArenaAllocator.init(pool.memory.allocator());
+                var adopted = false;
+                defer if (!adopted) region.deinit();
+                var context: Evaluator = .{
+                    .program = self,
+                    .alloc = region.allocator(),
+                    .cells = &.{},
+                    .parameters = &.{},
+                    .typed_parameters = self.preparedValues(),
+                    .constant_preparation = true,
+                    .input_validation = input_validation,
+                    .limits = .{ .steps = pool.remaining, .output_bytes = @min(1024 * 1024, pool.memory.limit -| pool.memory.footprint()) },
+                };
+                const value = context.runDatum(@intCast(index), 0) catch |err| {
+                    pool.remaining -|= context.steps;
+                    if (input_validation) return if (err == error.OutOfMemory and pool.memory.isExhausted()) error.SqlProgramLimitExceeded else err;
+                    // A cache miss is not an execution demand. Only data errors
+                    // and speculative admission may defer; real OOM and internal
+                    // program/binding failures still abort publication.
+                    if (err == error.SqlProgramLimitExceeded or err == error.NumericModifierNotPreparable or
+                        (err == error.OutOfMemory and pool.memory.isExhausted()) or
+                        std.mem.startsWith(u8, @import("errors.zig").describe(err).code, "22")) continue;
+                    return err;
+                };
+                pool.remaining -|= context.steps;
+                if (!input_validation and value.numeric == null and value.array == null) continue;
+                if (region.state.used_list != null) {
+                    try pool.regions.append(a, region);
+                    adopted = true;
+                }
+                if (input_validation and instruction.input_function) {
+                    try self.constant_inputs.put(a, @intCast(index), value);
+                } else {
+                    if (value.numeric) |number| try self.constant_numerics.put(a, @intCast(index), number);
+                    if (value.array) |array| try self.constant_arrays.put(a, @intCast(index), array);
+                }
+            }
         }
         for (self.instructions) |instruction| {
             if (instruction.operation != .call) continue;
@@ -300,15 +371,33 @@ pub const Program = struct {
             const source = if (call.function == .@"$overlaps" and self.constant_arrays.contains(call.args[1])) call.args[1] else call.args[0];
             if (self.constant_memberships.contains(source)) continue;
             const array = self.constant_arrays.get(source) orelse continue;
+            if (pool.remaining == 0 or pool.memory.footprint() >= pool.memory.limit) break;
             const index = try a.create(arrays.Membership);
-            index.* = try arrays.Membership.init(a, array.*, .{});
+            var work: arrays.Budget = .{ .remaining = pool.remaining };
+            index.* = arrays.Membership.initWithBudget(pool.memory.allocator(), array.*, .{
+                .bytes = pool.memory.limit -| pool.memory.footprint(),
+            }, &work) catch |err| {
+                pool.remaining = work.remaining;
+                if (err == error.SqlProgramLimitExceeded or (err == error.OutOfMemory and pool.memory.isExhausted())) continue;
+                return err;
+            };
+            pool.remaining = work.remaining;
+            errdefer index.deinit();
             try self.constant_memberships.put(a, source, index);
         }
     }
 
-    pub fn deinit(self: *Program) void {
+    fn releaseConstants(self: *Program) void {
         var memberships = self.constant_memberships.valueIterator();
         while (memberships.next()) |index| index.*.deinit();
+        if (self.constant_pool) |pool| {
+            for (pool.regions.items) |region| region.deinit();
+            std.debug.assert(pool.memory.live == 0);
+        }
+    }
+
+    pub fn deinit(self: *Program) void {
+        self.releaseConstants();
         const backing = self.arena.child_allocator;
         self.arena.deinit();
         backing.destroy(self.arena);
@@ -318,11 +407,6 @@ pub const Program = struct {
     /// Cells use the ordinal order supplied to bind(), including unselected
     /// NULL placeholders. Borrowed scalar results remain valid while the
     /// program, cells and parameters live; computed strings use alloc.
-    fn prepareInstruction(self: *const Program, alloc: Allocator, index: u32) !Datum {
-        var context: Evaluator = .{ .program = self, .alloc = alloc, .cells = &.{}, .parameters = &.{}, .typed_parameters = self.preparedValues(), .limits = .{}, .constant_preparation = true };
-        return context.runDatum(index, 0);
-    }
-
     pub fn evaluateInstruction(self: *const Program, alloc: Allocator, index: u32, parameters: []const Json) !Datum {
         var context: Evaluator = .{ .program = self, .alloc = alloc, .cells = &.{}, .parameters = parameters, .typed_parameters = self.preparedValues(), .limits = .{} };
         return context.runDatum(index, 0);
@@ -577,7 +661,8 @@ fn bindDescriptors(alloc: Allocator, expression: *const ast.Scalar, columns: []c
         .settings = settings,
         .translations = binder.translations,
     };
-    try program.prepareConstantArrays(binder.alloc);
+    errdefer program.releaseConstants();
+    try program.prepareConstantArrays(binder.alloc, limits);
     if (limits.invocation) |invocation| try invocation.register(&program);
     program.arena = arena;
     return program;
@@ -790,7 +875,7 @@ test "SQL typed containment prepares immutable indexes and releases allocation f
             try std.testing.expectError(error.SqlProgramLimitExceeded, program.evaluate(arena.allocator(), &.{}, &.{ .{ .string = "read,NULL,write" }, .{ .string = "," }, .{ .string = "NULL" } }, .{ .steps = 5 }));
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Faults.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Faults.run, .{});
     var compiled = try @import("compiler.zig").compileScalar(std.testing.allocator, "string_to_array('read write',' ') @> ARRAY['read']", .{});
     defer compiled.deinit();
     var program = try bind(std.testing.allocator, compiled.expression, &.{}, &.{}, .{});
@@ -1082,6 +1167,98 @@ test "SQL multidimensional column constructors preserve bounds and admit heap sc
     try std.testing.expectError(error.SqlArraySubscriptError, program.evaluate(arena.allocator(), &.{ Datum.typedArray(&lower_zero), Datum.typedArray(&lower_one) }, &.{}, .{}));
     try std.testing.expectError(error.SqlArraySubscriptError, program.evaluate(arena.allocator(), &.{ Datum{}, Datum.typedArray(&lower_one) }, &.{}, .{}));
     try std.testing.expectError(error.SqlProgramLimitExceeded, program.evaluate(arena.allocator(), &.{ Datum.typedArray(&six), Datum.typedArray(&six) }, &.{}, .{}));
+}
+
+test "SQL constant preparation preserves PostgreSQL input validation and lazy runtime errors" {
+    const a = std.testing.allocator;
+    const Entry = struct { sql: []const u8, expected: ?[]const u8 = null, @"error": ?[]const u8 = null };
+    var fixture = try std.json.parseFromSlice(struct { reference: []const u8, entries: []const Entry }, a, @embedFile("fixtures/sql_constant_preparation_reference.json"), .{});
+    defer fixture.deinit();
+    const Check = struct {
+        fn run(alloc: Allocator, sql: []const u8, limits: BindLimits) ![]u8 {
+            var compiled = try @import("compiler.zig").compileScalar(alloc, sql, .{});
+            defer compiled.deinit();
+            var program = try bind(alloc, compiled.expression, &.{}, &.{}, limits);
+            defer program.deinit();
+            var region = std.heap.ArenaAllocator.init(alloc);
+            defer region.deinit();
+            const r = region.allocator();
+            const value = try program.evaluate(r, &.{}, &.{}, .{});
+            if (value.numeric) |number| {
+                var context: @import("numeric_value.zig").Context = .{ .alloc = r };
+                return alloc.dupe(u8, try @import("numeric_value.zig").format(&context, number.*));
+            }
+            var writer: std.Io.Writer.Allocating = .init(r);
+            try @import("array_text.zig").encode(value.array.?.*, &writer.writer, .{});
+            return alloc.dupe(u8, writer.written());
+        }
+    };
+    for (fixture.value.entries) |entry| for ([_]BindLimits{ .{}, .{ .constant_bytes = 0, .constant_steps = 0 } }) |limits| {
+        errdefer std.debug.print("Constant preparation fixture: {s}\n", .{entry.sql});
+        const actual = Check.run(a, entry.sql, limits) catch |err| {
+            try std.testing.expectEqualStrings(entry.@"error" orelse return err, @import("errors.zig").describe(err).code);
+            continue;
+        };
+        defer a.free(actual);
+        try std.testing.expectEqualStrings(entry.expected orelse return error.ExpectedPostgresRejection, actual);
+    };
+}
+
+test "SQL constant preparation owns adopted regions and unwinds every allocation fault" {
+    const Faults = struct {
+        fn run(alloc: Allocator) !void {
+            var compiled = try @import("compiler.zig").compileScalar(alloc, "CASE WHEN flag THEN CAST(ARRAY[32768] AS smallint[]) ELSE ARRAY[1::smallint,2,NULL] END", .{});
+            defer compiled.deinit();
+            var program = try bind(alloc, compiled.expression, &.{.{ .name = "flag", .type = .boolean }}, &.{}, .{});
+            defer program.deinit();
+            const good = try program.evaluate(std.testing.failing_allocator, &.{Datum.json(.{ .bool = false })}, &.{}, .{});
+            try std.testing.expectEqual(@as(i64, 1), good.array.?.elements[0].value.integer);
+            try std.testing.expect(good.array.?.elements[2].sql_null);
+            try std.testing.expect(program.constant_pool.?.memory.footprint() <= 8 * 1024 * 1024);
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Faults.run, .{});
+}
+
+test "SQL constant cache admission is bounded and does not change execution demand" {
+    const a = std.testing.allocator;
+    var compiled = try @import("compiler.zig").compileScalar(a, "ARRAY[1,2,3]", .{});
+    defer compiled.deinit();
+    var program = try bind(a, compiled.expression, &.{}, &.{}, .{ .constant_bytes = 1, .constant_steps = 1 });
+    defer program.deinit();
+    try std.testing.expectEqual(@as(u32, 0), program.constant_arrays.count());
+    var region = std.heap.ArenaAllocator.init(a);
+    defer region.deinit();
+    const result = try program.evaluate(region.allocator(), &.{}, &.{}, .{});
+    try std.testing.expectEqual(@as(usize, 3), result.array.?.elements.len);
+    try std.testing.expectError(error.SqlProgramLimitExceeded, program.evaluate(region.allocator(), &.{}, &.{}, .{ .steps = 0 }));
+    var input = try @import("compiler.zig").compileScalar(a, "'{1,2,NULL}'::integer[]", .{});
+    defer input.deinit();
+    try std.testing.expectError(error.SqlProgramLimitExceeded, bind(a, input.expression, &.{}, &.{}, .{ .input_steps = 0 }));
+    var mandatory = try bind(a, input.expression, &.{}, &.{}, .{ .constant_bytes = 0, .constant_steps = 0 });
+    defer mandatory.deinit();
+    try std.testing.expect(mandatory.constant_inputs.count() != 0);
+    const borrowed = try mandatory.evaluate(std.testing.failing_allocator, &.{}, &.{}, .{});
+    try std.testing.expectEqual(@as(usize, 3), borrowed.array.?.elements.len);
+    try std.testing.expectError(error.SqlProgramLimitExceeded, mandatory.evaluate(std.testing.failing_allocator, &.{}, &.{}, .{ .output_bytes = 0 }));
+}
+
+test "SQL constant input and modifier caches retain zero-allocation repeated execution" {
+    const a = std.testing.allocator;
+    var compiled = try @import("compiler.zig").compileScalar(a, "'[-2:0]={12.345,NULL,-12.345}'::numeric(4,2)[]", .{});
+    defer compiled.deinit();
+    var program = try bind(a, compiled.expression, &.{}, &.{}, .{});
+    defer program.deinit();
+    const before = program.constant_pool.?.memory.footprint();
+    const start = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
+    const first = try program.evaluate(std.testing.failing_allocator, &.{}, &.{}, .{});
+    for (0..10000) |_| {
+        const next = try program.evaluate(std.testing.failing_allocator, &.{}, &.{}, .{});
+        try std.testing.expectEqual(first.array, next.array);
+    }
+    try std.testing.expectEqual(@as(i32, -2), first.array.?.dimensions[0].lower);
+    try std.testing.expectEqual(before, program.constant_pool.?.memory.footprint());
+    std.debug.print("SQL immutable constant regions: rows=10000 scratch_bytes=0 retained_bytes={} elapsed_ns={}\n", .{ before, std.Io.Clock.now(.awake, std.testing.io).nanoseconds - start });
 }
 
 test "SQL array casts match PostgreSQL rejection diagnostics" {
@@ -2564,6 +2741,7 @@ const Binder = struct {
             },
         };
         if (self.instructions.items.len >= self.limits.nodes) return error.SqlProgramLimitExceeded;
+        instruction.input_function = expression.* == .cast and expression.cast.operand.* == .literal and expression.cast.operand.literal == .string;
         const index: u32 = @intCast(self.instructions.items.len);
         try self.instructions.append(self.alloc, instruction);
         if (kind.element_type == .numeric and expected == .number and
@@ -2637,6 +2815,7 @@ const Evaluator = struct {
     // Constant caching is speculative: modifier overflow in an unselected
     // branch must remain an execution-time error, not a binding-time error.
     constant_preparation: bool = false,
+    input_validation: bool = false,
 
     fn charge(self: *Evaluator, bytes: usize) !void {
         if (bytes > self.limits.output_bytes -| self.bytes) return error.SqlProgramLimitExceeded;
@@ -2678,6 +2857,10 @@ const Evaluator = struct {
                     try self.charge(@sizeOf(arrays.Value) + prepared.elements.len * @sizeOf(arrays.Element) + prepared.dimensions.len * @sizeOf(arrays.Dimension));
                     break :blk Datum.typedArray(prepared);
                 };
+                if (self.program.constant_inputs.get(index)) |input| {
+                    if (input.array) |array| try self.charge(@sizeOf(arrays.Value) + array.elements.len * @sizeOf(arrays.Element) + array.dimensions.len * @sizeOf(arrays.Dimension));
+                    break :blk if (!self.input_validation and cast.numeric_modifier != null) try self.constrainNumeric(input, cast.numeric_modifier.?) else input;
+                }
                 const datum = try self.runDatum(cast.operand, depth + 1);
                 if (datum.sql_null) break :blk .{};
                 if (cast.type == .array) {
@@ -2688,10 +2871,10 @@ const Evaluator = struct {
                         const value = try self.alloc.create(arrays.Value);
                         value.* = decoded.value;
                         const converted = Datum.typedArray(value);
-                        break :blk if (cast.numeric_modifier) |modifier| try self.constrainNumeric(converted, modifier) else converted;
+                        break :blk if (!self.input_validation and cast.numeric_modifier != null) try self.constrainNumeric(converted, cast.numeric_modifier.?) else converted;
                     }
                     const converted = try self.castArray(datum, cast.element_type orelse return error.InvalidSqlProgram);
-                    break :blk if (cast.numeric_modifier) |modifier| try self.constrainNumeric(converted, modifier) else converted;
+                    break :blk if (!self.input_validation and cast.numeric_modifier != null) try self.constrainNumeric(converted, cast.numeric_modifier.?) else converted;
                 }
                 if (datum.array != null) return error.SqlTypeMismatch;
                 if (cast.element_type) |target| {
@@ -2699,7 +2882,7 @@ const Evaluator = struct {
                     const source_element = source.element_type orelse (if (source.kind == null or source.kind == .datetime or source.kind == .number) null else try arrayElementType(source.kind.?));
                     if (source_element == .jsonb and datum.value == .null and target != .text and target != .jsonb) break :blk .{};
                     const converted = try self.castDatumBuiltin(datum, source_element, target);
-                    break :blk if (cast.numeric_modifier) |modifier| try self.constrainNumeric(converted, modifier) else converted;
+                    break :blk if (!self.input_validation and cast.numeric_modifier != null) try self.constrainNumeric(converted, cast.numeric_modifier.?) else converted;
                 }
                 if (datum.numeric != null) break :blk try self.castDatumBuiltin(datum, .numeric, try arrayElementType(cast.type));
                 if (cast.type == .string and self.program.instructions[cast.operand].type.kind == .json) break :blk Datum.json(.{ .string = try self.jsonText(datum.value) });

@@ -6524,3 +6524,38 @@ The final test asserts that rejection and separately constructs a domain-valid
 wrong generated value. No production validation was relaxed to make it pass.
 Formatting, whitespace and the storage control-catalog check pass. No original
 inventory dispositions or public feature claims are changed by this unit.
+
+### Bounded immutable constant preparation and PostgreSQL lazy demand
+
+Binding now separates mandatory unknown-literal input functions from optional
+constant evaluation. Invalid raw array input still fails in an unselected
+branch, while errors from typed runtime conversions and NUMERIC modifiers stay
+lazy. Disabling optional preparation does not disable input validation or change
+which runtime branches are demanded. Genuine backing allocation failures and
+internal errors are not hidden as optimization misses.
+
+Constant arrays, exact numbers and membership indexes share bounded work and
+allocation cohorts per bound program. Purity is classified in one topological
+pass rather than repeatedly walking overlapping subtrees. Successful regions
+are adopted without cloning; their arena owners remain heap-stable because
+JSONB DOM containers retain allocator pointers. Program moves preserve those
+owners, and failed publication unwinds regions and membership indexes. These
+are per-program bounds, not statement-wide preparation/cancellation admission.
+
+An independent PostgreSQL 18 oracle verifies 16 values and SQLSTATEs. Native
+tests run each case with optional caches both enabled and disabled, exercise
+exhaustive allocation failures, enforce preparation/output quotas, and retain
+the owner-move regression. A 10,000-row Debug repeated-execution fixture uses
+zero evaluation allocations and 936 bytes of constant backing storage (not
+total program memory); its approximately 2.25 ms is a local sample, not a
+production latency claim. The full SQL gate passes 625 local and 226 server
+tests with three existing skips and no failures or leaks.
+
+The schema-expression gate also passes 74 local and six server tests, with no
+failures or leaks. Formatting, oracle script lint and the storage control-catalog
+check pass. Unrelated HTTP discovery changes are preserved and not included.
+
+Durable dynamic array constructors, element-changing durable casts, non-NULL
+SQL array defaults and broader array operations remain unfinished. Original
+inventory dispositions are unchanged; cache correctness is not evidence of
+activating those cases.
