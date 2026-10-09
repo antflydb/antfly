@@ -340,7 +340,7 @@ pub const Program = struct {
                     .limits = .{ .steps = pool.remaining, .output_bytes = @min(1024 * 1024, pool.memory.limit -| pool.memory.footprint()) },
                 };
                 const value = context.runDatum(@intCast(index), 0) catch |err| {
-                    pool.remaining -|= context.steps;
+                    pool.remaining -|= context.usedSteps();
                     if (input_validation) return if (err == error.OutOfMemory and pool.memory.isExhausted()) error.SqlProgramLimitExceeded else err;
                     // A cache miss is not an execution demand. Only data errors
                     // and speculative admission may defer; real OOM and internal
@@ -350,7 +350,7 @@ pub const Program = struct {
                         std.mem.startsWith(u8, @import("errors.zig").describe(err).code, "22")) continue;
                     return err;
                 };
-                pool.remaining -|= context.steps;
+                pool.remaining -|= context.usedSteps();
                 if (!input_validation and value.numeric == null and value.array == null) continue;
                 if (region.state.used_list != null) {
                     try pool.regions.append(a, region);
@@ -1525,7 +1525,7 @@ fn mixedNumberQuantified(value: arrays.Value, probe: arrays.Element, op: arrays.
             unknown = true;
             continue;
         }
-        const accepted = op.accepts(try compare(probe.value, element.value));
+        const accepted = op.accepts(try compareWithBudget(probe.value, element.value, work));
         if (accepted != every) return accepted;
     }
     return if (unknown) null else every;
@@ -2822,6 +2822,136 @@ test "SQL array assignment casts match the PostgreSQL builtin matrix without rel
     try std.testing.expectError(error.SqlProgramLimitExceeded, assignArray(arena.allocator(), Datum.typedArray(&input.value), .text, .{ .steps = 0 }));
 }
 
+test "SQL shared scalar work owner charges nested kernels once and retains admission failure" {
+    var none = std.heap.FixedBufferAllocator.init(&.{});
+    var vm: Evaluator = .{ .program = undefined, .alloc = none.allocator(), .cells = &.{}, .parameters = &.{}, .limits = .{ .steps = 40, .output_bytes = 0 } };
+    var arithmetic_work = vm.numericContext();
+    try arithmetic_work.charge(7);
+    var logical = vm.workBudget();
+    try logical.consume(11);
+    try vm.workOwner().charge(13);
+    try std.testing.expectEqual(@as(usize, 31), vm.usedSteps());
+    try std.testing.expectEqual(@as(usize, 9), vm.remainingSteps());
+    try std.testing.expectError(error.SqlProgramLimitExceeded, vm.charge(1));
+    // A fresh nested context must not hide a failed enclosing invocation.
+    var next = vm.numericContext();
+    try std.testing.expectError(error.SqlProgramLimitExceeded, next.charge(0));
+    try std.testing.expectError(error.SqlProgramLimitExceeded, logical.consume(0));
+    try std.testing.expectEqual(@as(usize, 31), vm.usedSteps());
+}
+
+test "SQL shared scalar work owner cancels NULL heavy casts quantifiers and patterns" {
+    const a = std.testing.allocator;
+    const Control = struct {
+        calls: usize = 0,
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            if (self.calls == 2) return error.QueryCanceled;
+        }
+    };
+    const elements: [1024]arrays.Element = @splat(.{});
+    for ([_]struct { sql: []const u8, kind: arrays.ElementType }{
+        .{ .sql = "CAST(items AS bigint[])", .kind = .int32 },
+        .{ .sql = "NULL = ANY(items)", .kind = .numeric },
+        .{ .sql = "'hello' LIKE ANY(items)", .kind = .text },
+    }) |case| {
+        var compiled = try @import("compiler.zig").compileScalar(a, case.sql, .{});
+        defer compiled.deinit();
+        var program = try bind(a, compiled.expression, &.{.{ .name = "items", .type = .array, .element_type = case.kind }}, &.{}, .{});
+        defer program.deinit();
+        var input = try arrays.Value.init(case.kind, &.{.{ .length = elements.len, .lower = -9 }}, &elements, .{});
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const cells = [_]Datum{Datum.typedArray(&input)};
+        var control: Control = .{};
+        var vm: Evaluator = .{ .program = &program, .alloc = arena.allocator(), .cells = &cells, .parameters = &.{}, .limits = .{ .checkpoint = Control.check, .checkpoint_context = &control } };
+        try std.testing.expectError(error.QueryCanceled, vm.runDatum(@intCast(program.instructions.len - 1), 0));
+        try std.testing.expectEqual(@as(usize, 2), control.calls);
+        try std.testing.expect(vm.usedSteps() <= 257);
+        // Cancellation survives both another VM entry and another kernel.
+        try std.testing.expectError(error.QueryCanceled, vm.runDatum(0, 0));
+        var work = vm.workBudget();
+        try std.testing.expectError(error.QueryCanceled, work.consume(0));
+        try std.testing.expectEqual(@as(usize, 2), control.calls);
+    }
+}
+
+test "SQL shared scalar work owner bounds wide JSON comparison validation and nested limits without allocation" {
+    const Control = struct {
+        calls: usize = 0,
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            if (self.calls == 2) return error.QueryCanceled;
+        }
+    };
+    var cells: [1024]Json = @splat(.{ .integer = 7 });
+    const value: Json = .{ .array = .fromOwnedSlice(std.testing.allocator, &cells) };
+    for ([_]bool{ false, true }) |comparison_mode| {
+        var none = std.heap.FixedBufferAllocator.init(&.{});
+        var control: Control = .{};
+        var vm: Evaluator = .{ .program = undefined, .alloc = none.allocator(), .cells = &.{}, .parameters = &.{}, .limits = .{ .checkpoint = Control.check, .checkpoint_context = &control } };
+        if (comparison_mode) {
+            try std.testing.expectError(error.QueryCanceled, vm.compareValues(Datum.json(value), Datum.json(value)));
+        } else {
+            try std.testing.expectError(error.QueryCanceled, vm.validateJson(value, 0));
+        }
+        try std.testing.expectEqual(@as(usize, 2), control.calls);
+        try std.testing.expect(vm.usedSteps() <= 257);
+        try std.testing.expectError(error.QueryCanceled, vm.compareJson(.null, .null));
+        try std.testing.expectEqual(@as(usize, 0), none.end_index);
+    }
+    // Independent local contexts still share the exact enclosing admission.
+    var none = std.heap.FixedBufferAllocator.init(&.{});
+    var vm: Evaluator = .{ .program = undefined, .alloc = none.allocator(), .cells = &.{}, .parameters = &.{}, .limits = .{ .steps = 10 } };
+    var one = vm.numericContext();
+    try one.charge(6);
+    var two = vm.workBudget();
+    try two.consume(4);
+    var three = vm.numericContext();
+    try std.testing.expectError(error.SqlProgramLimitExceeded, three.charge(1));
+    try std.testing.expectError(error.SqlProgramLimitExceeded, two.consume(0));
+    try std.testing.expectEqual(@as(usize, 10), vm.usedSteps());
+}
+
+test "SQL shared scalar work owner retains zero allocation rows and linear array work" {
+    const a = std.testing.allocator;
+    var compiled = try @import("compiler.zig").compileScalar(a, "n + 1", .{});
+    defer compiled.deinit();
+    var program = try bind(a, compiled.expression, &.{.{ .name = "n", .type = .integer, .element_type = .int64 }}, &.{}, .{});
+    defer program.deinit();
+    const cells = [_]Datum{Datum.json(.{ .integer = 987 })};
+    var none = std.heap.FixedBufferAllocator.init(&.{});
+    const started = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
+    for (0..10000) |_| {
+        var vm: Evaluator = .{ .program = &program, .alloc = none.allocator(), .cells = &cells, .parameters = &.{}, .limits = .{} };
+        const result = try vm.runDatum(@intCast(program.instructions.len - 1), 0);
+        try std.testing.expectEqual(@as(i64, 988), result.value.integer);
+        try std.testing.expectEqual(@as(usize, 3), vm.usedSteps());
+    }
+    try std.testing.expectEqual(@as(usize, 0), none.end_index);
+    std.debug.print("SQL shared scalar work: rows=10000 work=30000 allocated_bytes=0 elapsed_ns={}\n", .{std.Io.Clock.now(.awake, std.testing.io).nanoseconds - started});
+    var measured: [2]usize = undefined;
+    for ([_]usize{ 128, 1024 }, &measured) |count, *work_count| {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const values = try arena.allocator().alloc(arrays.Element, count);
+        @memset(values, .{});
+        var input = try arrays.Value.init(.int32, &.{.{ .length = @intCast(count), .lower = -11 }}, values, .{});
+        var vm: Evaluator = .{ .program = undefined, .alloc = arena.allocator(), .cells = &.{}, .parameters = &.{}, .limits = .{} };
+        const result = try vm.castArray(Datum.typedArray(&input), .int64);
+        try std.testing.expectEqual(@as(i32, -11), result.array.?.dimensions[0].lower);
+        try std.testing.expectEqual(std.math.Order.eq, try vm.compareValues(result, result));
+        work_count.* = vm.usedSteps();
+        try std.testing.expect(work_count.* >= count);
+        try std.testing.expect(work_count.* <= count * 8 + 64);
+    }
+    try std.testing.expect(measured[1] >= measured[0] * 7);
+    try std.testing.expect(measured[1] <= measured[0] * 8 + 64);
+    std.debug.print("SQL shared array cast/compare work: rows=128 work={} rows=1024 work={}\n", .{ measured[0], measured[1] });
+}
+
 const Evaluator = struct {
     program: *const Program,
     alloc: Allocator,
@@ -2829,7 +2959,7 @@ const Evaluator = struct {
     parameters: []const Json,
     typed_parameters: ?[]const Datum = null,
     limits: EvalLimits,
-    steps: usize = 0,
+    work_owner: ?@import("numeric_value.zig").Context = null,
     pattern_steps: usize = 0,
     bytes: usize = 0,
     // Constant caching is speculative: modifier overflow in an unselected
@@ -2837,8 +2967,44 @@ const Evaluator = struct {
     constant_preparation: bool = false,
     input_validation: bool = false,
 
+    /// One invocation owns all VM, JSON, array and exact-arithmetic work.
+    /// Nested codecs may impose tighter local limits, never a fresh request
+    /// budget or cancellation identity. Failure remains sticky across them.
+    fn workOwner(self: *Evaluator) *@import("numeric_value.zig").Context {
+        if (self.work_owner == null) self.work_owner = .{
+            .alloc = self.alloc,
+            .remaining = self.limits.steps,
+            .checkpoint = self.limits.checkpoint,
+            .ptr = self.limits.checkpoint_context,
+        };
+        return &self.work_owner.?;
+    }
+
+    fn remainingSteps(self: *Evaluator) usize {
+        return @intCast(self.workOwner().remaining);
+    }
+
+    fn usedSteps(self: *Evaluator) usize {
+        return self.limits.steps -| self.remainingSteps();
+    }
+
+    fn workBudget(self: *Evaluator) arrays.Budget {
+        return .{ .remaining = self.remainingSteps(), .shared = self.workOwner() };
+    }
+
+    fn compareValues(self: *Evaluator, left: Datum, right: Datum) !std.math.Order {
+        var work = self.workBudget();
+        return compareDatumsWithBudget(left, right, &work);
+    }
+
+    fn compareJson(self: *Evaluator, left: Json, right: Json) !std.math.Order {
+        var work = self.workBudget();
+        return compareWithBudget(left, right, &work);
+    }
+
     fn charge(self: *Evaluator, bytes: usize) !void {
-        if (bytes > self.limits.output_bytes -| self.bytes) return error.SqlProgramLimitExceeded;
+        try self.workOwner().charge(0);
+        if (bytes > self.limits.output_bytes -| self.bytes) return self.workOwner().limit();
         self.bytes += bytes;
     }
 
@@ -2849,9 +3015,8 @@ const Evaluator = struct {
     }
 
     fn runDatum(self: *Evaluator, index: u32, depth: usize) anyerror!Datum {
-        if (depth >= self.limits.depth or self.steps >= self.limits.steps) return error.SqlProgramLimitExceeded;
-        if (self.steps % 256 == 0) if (self.limits.checkpoint) |poll| try poll(self.limits.checkpoint_context);
-        self.steps += 1;
+        if (depth >= self.limits.depth) return self.workOwner().limit();
+        try self.workOwner().charge(1);
         const instruction = self.program.instructions[index];
         if (self.program.constant_numerics.get(index)) |number| return Datum.typedNumeric(number);
         var result: Datum = switch (instruction.operation) {
@@ -2885,8 +3050,7 @@ const Evaluator = struct {
                 if (datum.sql_null) break :blk .{};
                 if (cast.type == .array) {
                     if (datum.array == null and datum.value == .string) {
-                        const decoded = try @import("array_text.zig").decodeLeaky(self.alloc, cast.element_type orelse return error.InvalidSqlProgram, datum.value.string, .{ .values = .{ .bytes = self.limits.output_bytes -| self.bytes, .work = self.limits.steps -| self.steps } });
-                        self.steps += decoded.work;
+                        const decoded = try @import("array_text.zig").decodeLeaky(self.alloc, cast.element_type orelse return error.InvalidSqlProgram, datum.value.string, .{ .values = .{ .bytes = self.limits.output_bytes -| self.bytes, .work = self.remainingSteps() }, .context = self.workOwner() });
                         try self.charge(decoded.allocated_bytes + @sizeOf(arrays.Value));
                         const value = try self.alloc.create(arrays.Value);
                         value.* = decoded.value;
@@ -2967,10 +3131,8 @@ const Evaluator = struct {
                 const right = try self.runDatum(binary.right, depth + 1);
                 if (left.sql_null or right.sql_null) break :blk .{};
                 if (left.array != null or right.array != null) return error.SqlTypeMismatch;
-                var work: @import("json_order.zig").Budget = .{ .remaining = self.limits.steps -| self.steps };
-                const before = work.remaining;
+                var work = self.workBudget();
                 const joined = try @import("json_concat.zig").concat(self.alloc, left.value, right.value, self.limits.output_bytes -| self.bytes, &work);
-                self.steps += before - work.remaining;
                 try self.charge(joined.allocated_bytes);
                 break :blk Datum.json(joined.value);
             } else if (binary.op == .eq or binary.op == .neq or binary.op == .lt or binary.op == .lte or binary.op == .gt or binary.op == .gte or binary.op == .is_distinct or binary.op == .is_not_distinct) blk: {
@@ -2983,11 +3145,11 @@ const Evaluator = struct {
                     if (right.numeric != null) right = try self.castDatumBuiltin(right, .numeric, .float64);
                 }
                 if (binary.op == .is_distinct or binary.op == .is_not_distinct) {
-                    const equal = if (left.sql_null or right.sql_null) left.sql_null and right.sql_null else (try compareDatums(left, right)) == .eq;
+                    const equal = if (left.sql_null or right.sql_null) left.sql_null and right.sql_null else (try self.compareValues(left, right)) == .eq;
                     break :blk Datum.json(.{ .bool = equal == (binary.op == .is_not_distinct) });
                 }
                 if (left.sql_null or right.sql_null) break :blk .{};
-                break :blk Datum.json(comparison(binary.op, try compareDatums(left, right)));
+                break :blk Datum.json(comparison(binary.op, try self.compareValues(left, right)));
             } else Datum.fromJson(try self.runLegacy(index, depth)),
             .case_when => |case| blk: {
                 for (case.branches) |branch| {
@@ -3008,7 +3170,7 @@ const Evaluator = struct {
                         unknown = true;
                         continue;
                     }
-                    if ((try compareDatums(operand, value)) == .eq) break :blk Datum.json(.{ .bool = !list.negated });
+                    if ((try self.compareValues(operand, value)) == .eq) break :blk Datum.json(.{ .bool = !list.negated });
                 }
                 break :blk if (unknown) .{} else Datum.json(.{ .bool = list.negated });
             },
@@ -3043,14 +3205,12 @@ const Evaluator = struct {
                             if (left.array.?.elements.len == 0) break :blk right;
                             if (right.array.?.elements.len == 0) break :blk left;
                         }
-                        var work: arrays.Budget = .{ .remaining = self.limits.steps -| self.steps };
-                        const before = work.remaining;
+                        var work = self.workBudget();
                         const limits: arrays.Limits = .{ .bytes = self.limits.output_bytes -| self.bytes };
                         const prepend = call.function == .array_prepend;
                         const input = if (prepend) right else left;
                         const empty: arrays.Value = .{ .element_type = instruction.type.element_type.?, .dimensions = &.{}, .elements = &.{} };
                         const output = if (call.function == .array_cat) try left.array.?.concatenate(self.alloc, right.array.?.*, limits, &work) else try (input.array orelse &empty).append(self.alloc, if (prepend) left else right, prepend, limits, &work);
-                        self.steps += before - work.remaining;
                         try self.charge(@sizeOf(arrays.Value) + output.dimensions.len * @sizeOf(arrays.Dimension) + output.elements.len * @sizeOf(arrays.Element));
                         const owned = try self.alloc.create(arrays.Value);
                         owned.* = output;
@@ -3064,20 +3224,17 @@ const Evaluator = struct {
                         const third = if (call.args.len == 3) try self.runDatum(call.args[2], depth + 1) else Datum{};
                         if (input.sql_null) break :blk .{};
                         const array = input.array orelse return error.SqlTypeMismatch;
-                        var work: arrays.Budget = .{ .remaining = self.limits.steps -| self.steps };
-                        const before = work.remaining;
+                        var work = self.workBudget();
                         if (call.function == .array_position) {
                             if (array.dimensions.len > 1) return error.UnsupportedSqlShape;
                             if (array.elements.len == 0) break :blk .{};
                             if (call.args.len == 3 and third.sql_null) return error.SqlNullValueNotAllowed;
                             const start = if (call.args.len == 3) std.math.cast(i32, third.value.integer) orelse return error.SqlNumericOutOfRange else null;
                             const answer = if (call.args.len == 2 and self.program.constant_memberships.contains(call.args[0])) try self.program.constant_memberships.get(call.args[0]).?.firstPosition(needle, &work) else try array.position(needle, start, &work);
-                            self.steps += before - work.remaining;
                             break :blk if (answer) |value| Datum.json(.{ .integer = value }) else .{};
                         }
                         const limits: arrays.Limits = .{ .bytes = self.limits.output_bytes -| self.bytes };
                         const output = if (call.function == .array_positions) try array.positions(self.alloc, needle, limits, &work) else try array.transform(self.alloc, needle, if (call.function == .array_remove) null else third, limits, &work);
-                        self.steps += before - work.remaining;
                         try self.charge(@sizeOf(arrays.Value) + output.dimensions.len * @sizeOf(arrays.Dimension) + output.elements.len * @sizeOf(arrays.Element));
                         const owned = try self.alloc.create(arrays.Value);
                         owned.* = output;
@@ -3102,10 +3259,8 @@ const Evaluator = struct {
                         const null_text = if (call.args.len == 3) try self.runDatum(call.args[2], depth + 1) else Datum{};
                         if (input.sql_null) break :blk .{};
                         if (input.value != .string or (!delimiter.sql_null and delimiter.value != .string) or (!null_text.sql_null and null_text.value != .string)) return error.SqlTypeMismatch;
-                        var work: arrays.Budget = .{ .remaining = self.limits.steps -| self.steps };
-                        const initial = work.remaining;
+                        var work = self.workBudget();
                         const output = try @import("text_array.zig").split(self.alloc, input.value.string, if (delimiter.sql_null) null else delimiter.value.string, if (null_text.sql_null) null else null_text.value.string, self.limits.output_bytes -| self.bytes, &work);
-                        self.steps += initial - work.remaining;
                         try self.charge(output.bytes);
                         break :blk Datum.typedArray(output.value);
                     },
@@ -3115,10 +3270,8 @@ const Evaluator = struct {
                         const null_text = if (call.args.len == 3) try self.runDatum(call.args[2], depth + 1) else Datum{};
                         if (input.sql_null or delimiter.sql_null) break :blk .{};
                         if (delimiter.value != .string or (!null_text.sql_null and null_text.value != .string)) return error.SqlTypeMismatch;
-                        var work: arrays.Budget = .{ .remaining = self.limits.steps -| self.steps };
-                        const initial = work.remaining;
+                        var work = self.workBudget();
                         const text = try @import("text_array.zig").join(self.alloc, input.array orelse return error.SqlTypeMismatch, delimiter.value.string, if (null_text.sql_null) null else null_text.value.string, self.limits.output_bytes -| self.bytes, &work);
-                        self.steps += initial - work.remaining;
                         try self.charge(text.len);
                         break :blk Datum.json(.{ .string = text });
                     },
@@ -3126,8 +3279,7 @@ const Evaluator = struct {
                         const left = try self.runDatum(call.args[0], depth + 1);
                         const right = try self.runDatum(call.args[1], depth + 1);
                         if (left.sql_null or right.sql_null) break :blk .{};
-                        var work: arrays.Budget = .{ .remaining = self.limits.steps -| self.steps };
-                        const initial = work.remaining;
+                        var work = self.workBudget();
                         const accepted = if (call.function == .jsonb_exists) exists: {
                             if (left.array != null or right.value != .string) return error.SqlTypeMismatch;
                             break :exists try @import("json_containment.zig").exists(left.value, right.value.string, &work);
@@ -3144,7 +3296,6 @@ const Evaluator = struct {
                             try self.charge(membership.budget.live + @sizeOf(arrays.Membership));
                             break :contains if (call.function == .@"$overlaps") try membership.overlaps(if (swapped) array.* else other.*, &work) else try membership.contains(other.*, &work);
                         } else try @import("json_containment.zig").contains(left.value, right.value, &work, 0);
-                        self.steps += initial - work.remaining;
                         break :blk Datum.json(.{ .bool = accepted });
                     },
                     .@"$array" => {
@@ -3183,9 +3334,7 @@ const Evaluator = struct {
                         const exact_number = probe.numeric != null or array.element_type == .numeric;
                         const element: arrays.Element = if (exact_number) probe else if (probe.sql_null) .{} else arrays.Element.json(try self.convert(probe.value, if (mixed_number) .number else arrayScalarType(array.element_type)));
                         const accepted = if (exact_number) try self.numericQuantified(probe, array.*, compare_op, every.bool) else ordinary: {
-                            var work: arrays.Budget = .{ .remaining = self.limits.steps -| self.steps };
-                            const initial = work.remaining;
-                            defer self.steps += initial - work.remaining;
+                            var work = self.workBudget();
                             break :ordinary if (mixed_number) try mixedNumberQuantified(array.*, element, compare_op, every.bool, &work) else try array.quantified(element, compare_op, if (every.bool) .all else .any, &work);
                         };
                         break :blk if (accepted) |value| Datum.json(.{ .bool = value }) else .{};
@@ -3222,10 +3371,8 @@ const Evaluator = struct {
                         const create = if (call.args.len == 4) try self.runDatum(call.args[3], depth + 1) else Datum.json(.{ .bool = true });
                         if (target.sql_null or path.sql_null or replacement.sql_null or create.sql_null) break :blk .{};
                         if (target.array != null or replacement.array != null or create.array != null or create.value != .bool) return error.SqlTypeMismatch;
-                        var work: @import("json_order.zig").Budget = .{ .remaining = self.limits.steps -| self.steps };
-                        const before = work.remaining;
+                        var work = self.workBudget();
                         const changed = try @import("json_path_update.zig").set(self.alloc, target.value, path.array orelse return error.SqlTypeMismatch, replacement.value, create.value.bool, self.limits.output_bytes -| self.bytes, &work);
-                        self.steps += before - work.remaining;
                         try self.charge(changed.allocated_bytes);
                         break :blk Datum.json(changed.value);
                     },
@@ -3319,14 +3466,14 @@ const Evaluator = struct {
                     .nullif => {
                         const left = try self.runDatum(call.args[0], depth + 1);
                         const right = try self.runDatum(call.args[1], depth + 1);
-                        break :blk if (left.sql_null or (!right.sql_null and (try compareDatums(left, right)) == .eq)) .{} else left;
+                        break :blk if (left.sql_null or (!right.sql_null and (try self.compareValues(left, right)) == .eq)) .{} else left;
                     },
                     .greatest, .least => {
                         var best: Datum = .{};
                         for (call.args) |arg| {
                             const datum = try self.runDatum(arg, depth + 1);
                             if (datum.sql_null) continue;
-                            if (best.sql_null or (try compareDatums(datum, best)) == (if (call.function == .greatest) std.math.Order.gt else .lt)) best = datum;
+                            if (best.sql_null or (try self.compareValues(datum, best)) == (if (call.function == .greatest) std.math.Order.gt else .lt)) best = datum;
                         }
                         break :blk best;
                     },
@@ -3395,7 +3542,7 @@ const Evaluator = struct {
                     break :blk if (left == .null or right == .null) .null else .{ .bool = !decisive };
                 }
                 if (binary.op == .is_distinct or binary.op == .is_not_distinct) {
-                    const equal = if (left == .null or right == .null) left == .null and right == .null else (try compare(left, right)) == .eq;
+                    const equal = if (left == .null or right == .null) left == .null and right == .null else (try self.compareJson(left, right)) == .eq;
                     break :blk .{ .bool = equal == (binary.op == .is_not_distinct) };
                 }
                 if (left == .null or right == .null) break :blk .null;
@@ -3403,7 +3550,7 @@ const Evaluator = struct {
                     .add, .subtract, .multiply, .divide, .modulo => try arithmetic(binary.op, left, right),
                     .concat => try self.concat(&.{ left, right }, false),
                     .like, .ilike => .{ .bool = try self.like(left, right, binary.op == .ilike) },
-                    .eq, .neq, .lt, .lte, .gt, .gte => comparison(binary.op, try compare(left, right)),
+                    .eq, .neq, .lt, .lte, .gt, .gte => comparison(binary.op, try self.compareJson(left, right)),
                     else => unreachable,
                 };
             },
@@ -3434,16 +3581,18 @@ const Evaluator = struct {
         return writer.toOwnedSlice();
     }
 
-    fn validateJson(self: *Evaluator, value: Json, depth: usize) error{ SqlProgramLimitExceeded, SqlTypeMismatch }!usize {
-        if (depth >= self.limits.depth or self.steps >= self.limits.steps) return error.SqlProgramLimitExceeded;
-        self.steps += 1;
+    fn validateJson(self: *Evaluator, value: Json, depth: usize) anyerror!usize {
+        if (depth >= self.limits.depth) return self.workOwner().limit();
+        try self.workOwner().charge(1);
         var size: usize = 8;
         switch (value) {
             .string => |string| {
                 if (!std.unicode.utf8ValidateSlice(string)) return error.SqlTypeMismatch;
                 size = string.len;
             },
-            .number_string => |string| size = string.len,
+            .number_string => |string| {
+                size = string.len;
+            },
             .array => |array| for (array.items) |item| {
                 size +|= try self.validateJson(item, depth + 1);
             },
@@ -3452,7 +3601,7 @@ const Evaluator = struct {
             },
             else => {},
         }
-        if (size > self.limits.output_bytes) return error.SqlProgramLimitExceeded;
+        if (size > self.limits.output_bytes) return self.workOwner().limit();
         return size;
     }
 
@@ -3496,10 +3645,8 @@ const Evaluator = struct {
             },
             .json => if (value == .string) blk: {
                 try self.charge(value.string.len);
-                var work: json_order.Budget = .{ .remaining = self.limits.steps -| self.steps };
-                const initial = work.remaining;
+                var work = self.workBudget();
                 const parsed = try json_order.parseTextLeaky(self.alloc, value.string, &work);
-                self.steps += initial - work.remaining;
                 break :blk parsed;
             } else value,
         };
@@ -3519,8 +3666,6 @@ const Evaluator = struct {
             child.* = try self.runDatum(arg, depth);
             const shape: []const arrays.Dimension = if (child.sql_null) &.{} else (child.array orelse return error.SqlTypeMismatch).dimensions;
             var context = self.numericContext();
-            const before = context.remaining;
-            defer self.steps += @intCast(before - context.remaining);
             try context.charge(1 + shape.len);
             try admitted.append(shape);
         }
@@ -3533,8 +3678,7 @@ const Evaluator = struct {
         var at: usize = 0;
         for (children) |child| if (child.array) |array| {
             for (array.elements) |element| {
-                if (self.steps >= self.limits.steps) return error.SqlProgramLimitExceeded;
-                self.steps += 1;
+                try self.workOwner().charge(1);
                 cells[at] = if (element.sql_null) .{} else try self.castDatumBuiltin(element, array.element_type, kind);
                 at += 1;
             }
@@ -3542,14 +3686,13 @@ const Evaluator = struct {
         const shape = try self.alloc.alloc(arrays.Dimension, rank);
         @memcpy(shape, stacked.axes[0..rank]);
         const value = try self.alloc.create(arrays.Value);
-        var work: arrays.Budget = .{ .remaining = self.limits.steps -| self.steps };
-        const initial = work.remaining;
+        var work = self.workBudget();
         value.* = try arrays.Value.initWithBudget(kind, shape, cells, .{}, &work);
-        self.steps += initial - work.remaining;
         return Datum.typedArray(value);
     }
 
     fn castArray(self: *Evaluator, datum: Datum, target: arrays.ElementType) !Datum {
+        try self.workOwner().charge(0);
         if (datum.sql_null) return datum;
         const source = datum.array orelse return error.UnsupportedSqlShape;
         if (source.element_type == target) return datum;
@@ -3557,12 +3700,12 @@ const Evaluator = struct {
         try self.charge(@sizeOf(arrays.Value) + source.elements.len * @sizeOf(arrays.Element));
         const cells = try self.alloc.alloc(arrays.Element, source.elements.len);
         for (source.elements, cells) |element, *cell| {
-            if (self.steps >= self.limits.steps) return error.SqlProgramLimitExceeded;
-            self.steps += 1;
+            try self.workOwner().charge(1);
             cell.* = if (element.sql_null or (source.element_type == .jsonb and element.value == .null and target != .text and target != .jsonb)) .{} else try self.castDatumBuiltin(element, source.element_type, target);
         }
         const value = try self.alloc.create(arrays.Value);
-        value.* = try arrays.Value.init(target, source.dimensions, cells, .{});
+        var work = self.workBudget();
+        value.* = try arrays.Value.initWithBudget(target, source.dimensions, cells, .{ .bytes = self.limits.output_bytes }, &work);
         return Datum.typedArray(value);
     }
 
@@ -3574,14 +3717,10 @@ const Evaluator = struct {
             try self.charge(@sizeOf(arrays.Value) + source.elements.len * @sizeOf(arrays.Element));
             const cells = try self.alloc.alloc(arrays.Element, source.elements.len);
             for (source.elements, cells) |element, *cell| {
-                if (self.steps >= self.limits.steps) return error.SqlProgramLimitExceeded;
-                if (self.steps % 256 == 0) if (self.limits.checkpoint) |poll| try poll(self.limits.checkpoint_context);
-                self.steps += 1;
+                try self.workOwner().charge(1);
                 cell.* = try self.constrainNumeric(element, modifier);
             }
-            var work: arrays.Budget = .{ .remaining = self.limits.steps -| self.steps };
-            const before = work.remaining;
-            defer self.steps += before - work.remaining;
+            var work = self.workBudget();
             const result = try arrays.Value.initWithBudget(.numeric, source.dimensions, cells, .{}, &work);
             const owner = try self.alloc.create(arrays.Value);
             owner.* = result;
@@ -3590,8 +3729,6 @@ const Evaluator = struct {
         const exact = @import("numeric_value.zig");
         const input = datum.numeric orelse return error.InvalidSqlProgram;
         var context = self.numericContext();
-        const before = context.remaining;
-        defer self.steps += @intCast(before - context.remaining);
         var result = exact.applyTypeModifier(&context, input.*, modifier) catch |err| switch (err) {
             error.InvalidSqlNumber => return if (self.constant_preparation) error.NumericModifierNotPreparable else error.SqlNumericOutOfRange,
             else => return err,
@@ -3606,11 +3743,10 @@ const Evaluator = struct {
     fn numericContext(self: *Evaluator) @import("numeric_value.zig").Context {
         return .{
             .alloc = self.alloc,
-            .remaining = self.limits.steps -| self.steps,
+            .remaining = self.remainingSteps(),
             .max_output_bytes = self.limits.output_bytes -| self.bytes,
             .max_groups = (self.limits.output_bytes -| self.bytes) / 2,
-            .checkpoint = self.limits.checkpoint,
-            .ptr = self.limits.checkpoint_context,
+            .parent = self.workOwner(),
         };
     }
 
@@ -3618,8 +3754,6 @@ const Evaluator = struct {
         const exact = @import("numeric_value.zig");
         const number = datum.numeric orelse return error.SqlTypeMismatch;
         var context = self.numericContext();
-        const before = context.remaining;
-        defer self.steps += @intCast(before - context.remaining);
         const text = try exact.format(&context, number.*);
         try self.charge(text.len);
         return if (number.kind == .finite) .{ .number_string = text } else .{ .string = text };
@@ -3655,8 +3789,6 @@ const Evaluator = struct {
         // Evaluate both arguments before borrowing the remaining work budget.
         // Nested scale expressions must not receive a second copy of it.
         var ctx = self.numericContext();
-        const before = ctx.remaining;
-        defer self.steps += @intCast(before - ctx.remaining);
         var result = if (function == .sqrt) try exact.squareRoot(&ctx, value) else try exact.quantize(&ctx, value, scale, if (function == .round) .half_away else .truncate);
         errdefer result.deinit();
         if (function == .ceil or function == .floor) {
@@ -3680,23 +3812,20 @@ const Evaluator = struct {
         const needle = if (!probe.sql_null and floating) try self.castDatumBuiltin(probe, null, .float64) else probe;
         var unknown = false;
         for (array.elements) |element| {
-            if (self.steps >= self.limits.steps) return error.SqlProgramLimitExceeded;
-            self.steps += 1;
+            try self.workOwner().charge(1);
             if (needle.sql_null or element.sql_null) {
                 unknown = true;
                 continue;
             }
             const order = if (floating) float: {
                 const right = try self.castDatumBuiltin(element, array.element_type, .float64);
-                break :float try compare(needle.value, right.value);
+                break :float try self.compareJson(needle.value, right.value);
             } else logical: {
                 var left_storage: [5]u16 = undefined;
                 var right_storage: [5]u16 = undefined;
                 const left = if (needle.numeric) |value| value.* else if (needle.value == .integer) exact.integerView(needle.value.integer, &left_storage) else return error.SqlTypeMismatch;
                 const right = if (element.numeric) |value| value.* else if (element.value == .integer) exact.integerView(element.value.integer, &right_storage) else return error.SqlTypeMismatch;
                 var context = self.numericContext();
-                const before = context.remaining;
-                defer self.steps += @intCast(before - context.remaining);
                 break :logical try exact.order(&context, left, right);
             };
             const accepted = op.accepts(order);
@@ -3708,8 +3837,6 @@ const Evaluator = struct {
     fn numericArithmetic(self: *Evaluator, operation: ast.Scalar.Binary, left: Datum, right: Datum) !Datum {
         const exact = @import("numeric_value.zig");
         var context = self.numericContext();
-        const before = context.remaining;
-        defer self.steps += @intCast(before - context.remaining);
         var result = switch (operation) {
             .add => try exact.add(&context, left.numeric.?.*, right.numeric.?.*),
             .subtract => try exact.subtract(&context, left.numeric.?.*, right.numeric.?.*),
@@ -3726,12 +3853,11 @@ const Evaluator = struct {
     }
 
     fn castDatumBuiltin(self: *Evaluator, datum: Datum, source: ?arrays.ElementType, target: arrays.ElementType) !Datum {
+        try self.workOwner().charge(0);
         if (datum.sql_null) return .{};
         if (datum.numeric != null and target == .numeric) return datum;
         const exact = @import("numeric_value.zig");
         var ctx = self.numericContext();
-        const before = ctx.remaining;
-        defer self.steps += @intCast(before - ctx.remaining);
         if (target == .numeric) {
             var buffer: [20]u8 = undefined;
             var owned = switch (datum.value) {
@@ -3768,8 +3894,7 @@ const Evaluator = struct {
     fn castBuiltin(self: *Evaluator, value: Json, source: ?arrays.ElementType, target: arrays.ElementType) !Json {
         if (value == .string or value == .number_string) {
             const length = if (value == .string) value.string.len else value.number_string.len;
-            if (length > self.limits.steps -| self.steps) return error.SqlProgramLimitExceeded;
-            self.steps += length;
+            try self.workOwner().charge(length);
         }
         if (source == .jsonb and target != .jsonb and target != .text) {
             if (value == .null or value == .array or value == .object or value == .string) return error.SqlTypeMismatch;
@@ -3783,19 +3908,15 @@ const Evaluator = struct {
                     if (source == .jsonb or source == null) {
                         var buffer: [347]u8 = undefined;
                         const text = try std.fmt.float.render(&buffer, number, .{ .mode = .decimal });
-                        var work: arrays.Budget = .{ .remaining = self.limits.steps -| self.steps };
-                        const initial = work.remaining;
+                        var work = self.workBudget();
                         const integer = try json_order.roundedInteger(text, &work);
-                        self.steps += initial - work.remaining;
                         break :blk try builtin_cast.checkedInteger(integer, target);
                     }
                     break :blk try builtin_cast.floatingInteger(number, target);
                 },
                 .number_string => |text| blk: {
-                    var work: arrays.Budget = .{ .remaining = self.limits.steps -| self.steps };
-                    const initial = work.remaining;
+                    var work = self.workBudget();
                     const result = try json_order.roundedInteger(text, &work);
-                    self.steps += initial - work.remaining;
                     break :blk result;
                 },
                 .string => |text| try builtin_cast.integerText(text, target),
@@ -3870,8 +3991,7 @@ const Evaluator = struct {
                 if (operand == .null) return .null;
                 var unknown = false;
                 for (array.elements) |pattern| {
-                    if (self.steps >= self.limits.steps) return error.SqlProgramLimitExceeded;
-                    self.steps += 1;
+                    try self.workOwner().charge(1);
                     if (pattern.sql_null) {
                         unknown = true;
                         continue;
@@ -3893,8 +4013,7 @@ const Evaluator = struct {
                 while (true) {
                     _ = scratch.reset(.free_all);
                     const pattern = (try source.next(source.ptr, scratch.allocator(), &offset)) orelse break;
-                    if (self.steps >= self.limits.steps) return error.SqlProgramLimitExceeded;
-                    self.steps += 1;
+                    try self.workOwner().charge(1);
                     if (pattern.sql_null) {
                         saw_null = true;
                         continue;
@@ -3908,8 +4027,7 @@ const Evaluator = struct {
             if (operand == .null) return .null;
             var saw_null = false;
             for (patterns) |pattern| {
-                if (self.steps >= self.limits.steps) return error.SqlProgramLimitExceeded;
-                self.steps += 1;
+                try self.workOwner().charge(1);
                 if (pattern == .null) {
                     saw_null = true;
                     continue;
@@ -3936,7 +4054,7 @@ const Evaluator = struct {
             for (args) |arg| {
                 const value = try self.run(arg, depth);
                 if (value == .null) continue;
-                if (best == .null or (try compare(value, best)) == (if (function == .greatest) std.math.Order.gt else .lt)) best = value;
+                if (best == .null or (try self.compareJson(value, best)) == (if (function == .greatest) std.math.Order.gt else .lt)) best = value;
             }
             return best;
         }
@@ -3954,7 +4072,7 @@ const Evaluator = struct {
         }
         var values: [7]Json = @splat(.null);
         for (args, 0..) |arg, i| values[i] = try self.run(arg, depth);
-        if (function == .nullif) return if (values[0] == .null or (values[1] != .null and (try compare(values[0], values[1])) == .eq)) .null else values[0];
+        if (function == .nullif) return if (values[0] == .null or (values[1] != .null and (try self.compareJson(values[0], values[1])) == .eq)) .null else values[0];
         for (values[0..args.len]) |value| if (value == .null) return .null;
         if (regexFunction(function)) |regex| {
             const lease = if (self.limits.regex_execution) |owner| try owner.acquire() else null;
@@ -4132,8 +4250,7 @@ const Evaluator = struct {
                 defer characters.deinit(self.alloc);
                 var character_iterator = (std.unicode.Utf8View.init(trim_chars) catch return error.SqlTypeMismatch).iterator();
                 while (character_iterator.nextCodepoint()) |codepoint| {
-                    if (self.steps >= self.limits.steps) return error.SqlProgramLimitExceeded;
-                    self.steps += 1;
+                    try self.workOwner().charge(1);
                     try characters.put(self.alloc, codepoint, {});
                 }
                 var iterator = (std.unicode.Utf8View.init(text_value) catch return error.SqlTypeMismatch).iterator();
@@ -4141,8 +4258,7 @@ const Evaluator = struct {
                 var end: usize = 0;
                 var leading = true;
                 while (iterator.nextCodepointSlice()) |bytes| {
-                    if (self.steps >= self.limits.steps) return error.SqlProgramLimitExceeded;
-                    self.steps += 1;
+                    try self.workOwner().charge(1);
                     const trimmed = characters.contains(std.unicode.utf8Decode(bytes) catch return error.SqlTypeMismatch);
                     const after = @intFromPtr(bytes.ptr) - @intFromPtr(text_value.ptr) + bytes.len;
                     if (leading and trimmed) begin = after else leading = false;
@@ -4367,9 +4483,14 @@ fn compareIntFloat(integer: i64, number: f64) !std.math.Order {
     return std.math.order(@as(f64, @floatFromInt(truncated)), number);
 }
 pub fn compare(left: Json, right: Json) !std.math.Order {
+    var budget: json_order.Budget = .{};
+    return compareWithBudget(left, right, &budget);
+}
+
+pub fn compareWithBudget(left: Json, right: Json, budget: *json_order.Budget) !std.math.Order {
+    try budget.consume(1);
     if (left == .array or left == .object or left == .number_string or right == .array or right == .object or right == .number_string) {
-        var budget: json_order.Budget = .{};
-        return json_order.compare(left, right, &budget, 0);
+        return json_order.compare(left, right, budget, 0);
     }
     if (left == .null or right == .null) return if (left == .null and right == .null) .eq else if (left == .null) .lt else .gt;
     if (left == .integer and right == .integer) return std.math.order(left.integer, right.integer);
@@ -4380,10 +4501,14 @@ pub fn compare(left: Json, right: Json) !std.math.Order {
         _ = try asFloat(right);
         return std.math.order(left.float, right.float);
     }
-    if (left == .string and right == .string) return std.mem.order(u8, left.string, right.string);
+    if (left == .string and right == .string) {
+        // Immutable borrowed operands can prove equality by identity. Do not
+        // scan (or validate as an output) a discarded wide source twice.
+        if (left.string.ptr == right.string.ptr and left.string.len == right.string.len) return .eq;
+        return budget.orderBytes(left.string, right.string);
+    }
     if (left == .bool and right == .bool) return std.math.order(@intFromBool(left.bool), @intFromBool(right.bool));
-    var budget: json_order.Budget = .{};
-    return json_order.compare(left, right, &budget, 0);
+    return json_order.compare(left, right, budget, 0);
 }
 
 pub fn semanticHash(value: Json) !u64 {
@@ -4395,19 +4520,25 @@ pub fn semanticHash(value: Json) !u64 {
 /// payload. NULL ordering here matches array element ordering; row operators
 /// apply their explicit NULLS FIRST/LAST before calling this helper.
 pub fn compareDatums(left: Datum, right: Datum) anyerror!std.math.Order {
+    var work: json_order.Budget = .{};
+    return compareDatumsWithBudget(left, right, &work);
+}
+
+pub fn compareDatumsWithBudget(left: Datum, right: Datum, work: *json_order.Budget) anyerror!std.math.Order {
+    try work.consume(1);
     if (left.sql_null or right.sql_null) return if (left.sql_null == right.sql_null) .eq else if (left.sql_null) .gt else .lt;
     if (left.numeric) |number| {
         var none = std.heap.FixedBufferAllocator.init(&.{});
-        var ctx: @import("numeric_value.zig").Context = .{ .alloc = none.allocator() };
+        var ctx = work.numericContext(none.allocator());
+        defer work.remaining = @intCast(ctx.remaining);
         return @import("numeric_value.zig").order(&ctx, number.*, (right.numeric orelse return error.SqlTypeMismatch).*);
     }
     if (right.numeric != null) return error.SqlTypeMismatch;
     if (left.array) |array| {
-        var work: json_order.Budget = .{};
-        return array.compare((right.array orelse return error.SqlTypeMismatch).*, &work);
+        return array.compare((right.array orelse return error.SqlTypeMismatch).*, work);
     }
     if (right.array != null) return error.SqlTypeMismatch;
-    return compare(left.value, right.value);
+    return compareWithBudget(left.value, right.value, work);
 }
 
 pub fn semanticHashDatum(value: Datum) anyerror!u64 {

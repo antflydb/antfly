@@ -52,6 +52,37 @@ array-valued ordered index keys remain guarded. These architectural and
 component proofs do not activate original corpus cases or change the audited
 448 implemented / 136 rejected / 73 superseded / 929 unresolved dispositions.
 
+### Shared scalar work and cancellation ownership
+
+One scalar VM invocation now owns instruction, JSON, typed-array and exact
+arithmetic admission. Nested codecs and comparisons borrow that owner instead
+of restarting a work budget or reconciling successful work only after return.
+NULL-heavy casts, quantified predicates and pattern sets poll the same request
+control. Cancellation and work/output admission failures remain sticky across
+subsequent VM entries and nested kernels. Real allocator OOM remains distinct
+from a deterministic quota failure. JSON output-size/UTF-8 validation retains
+its independent contract; discarded intermediate values are not validated as
+outputs. Immutable identical string views compare by identity without scanning
+or allocating, while actual byte comparisons are metered.
+
+Array text input carries one optional owner across shape discovery, decoding,
+typed validation and owned-allocation admission. Both parsing passes poll
+bounded byte progress, including NULL cells and whitespace, and cancellation
+after allocation releases the unpublished owned decoder. Regression tests
+exercise pre-allocation and post-allocation cancellation, shared exact work
+accounting, exhausted nested contexts, real OOM versus quota, and allocation-free
+JSON comparison/validation. A zero-capacity allocator verifies ordinary scalar
+rows allocate nothing: 10,000 `n + 1` evaluations use exactly 30,000 work units.
+The 128/1,024-element cast/comparison runs use 389/3,077 units, checking linear
+work rather than claiming a production latency improvement. The independent
+`test_generate_sql_array_text_reference.py` oracle verifies all nineteen text
+inputs against PostgreSQL's complete binary array representation and all
+nineteen error fixtures against their exact SQLSTATEs. Native tests consume
+the same fixtures; no reference is regenerated merely to accept a discrepancy.
+These are invocation-local guarantees, not a claim of a single statement-wide
+budget across independent VM invocations or replacement of regex's separate
+pattern-work admission. This infrastructure changes no original dispositions.
+
 ### Compatibility standard
 
 PostgreSQL is the SQL compatibility standard for this work. Its behavior governs

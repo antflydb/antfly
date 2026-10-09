@@ -22,7 +22,13 @@ const builtin_cast = @import("builtin_cast.zig");
 const uuid = @import("../common/uuid.zig");
 const MemoryBudget = @import("memory_budget.zig");
 const A = std.mem.Allocator;
-pub const Options = struct { values: arrays.Limits = .{}, wire_bytes: usize = 8 * 1024 * 1024 };
+pub const Options = struct {
+    values: arrays.Limits = .{},
+    wire_bytes: usize = 8 * 1024 * 1024,
+    /// Borrowed invocation identity, retained across both parsing passes and
+    /// typed validation. Local limits cannot restart this parent's budget.
+    context: ?*@import("numeric_value.zig").Context = null,
+};
 pub const Decoded = struct { value: arrays.Value, allocated_bytes: usize, work: usize };
 
 /// An unbuffered escaping adapter lets JSONB serialization write directly to
@@ -114,12 +120,18 @@ fn writeValue(value: arrays.Value, writer: *std.Io.Writer) !void {
 /// touching the destination. Emission streams with bounded (rank <= 6) stack
 /// depth and zero allocations, including escaped JSONB and non-finite floats.
 pub fn encode(value: arrays.Value, writer: *std.Io.Writer, options: Options) !void {
-    var work: arrays.Budget = .{ .remaining = options.values.work };
+    return encodeInner(value, writer, options) catch |err| return sharedFailure(options, err);
+}
+
+fn encodeInner(value: arrays.Value, writer: *std.Io.Writer, options: Options) !void {
+    var work: arrays.Budget = .{ .remaining = options.values.work, .shared = options.context };
+    try work.consume(0);
     const canonical = try arrays.Value.initWithBudget(value.element_type, value.dimensions, value.elements, options.values, &work);
     if (canonical.dimensions.len != value.dimensions.len) return error.InvalidSqlArrayShape;
     var size: std.Io.Writer.Discarding = .init(&.{});
     try writeValue(value, &size.writer);
     if (size.count > options.wire_bytes or size.count > work.remaining / 2) return error.SqlProgramLimitExceeded;
+    try work.consume(@as(usize, @intCast(size.count)) * 2);
     try writeValue(value, writer);
 }
 
@@ -159,7 +171,16 @@ const Reader = struct {
     scratch: []u8 = &.{},
     alloc: A = undefined,
     kind: arrays.ElementType = undefined,
-    work: *arrays.Budget = undefined,
+    work: *arrays.Budget,
+    accounted: usize = 0,
+
+    fn account(self: *Reader, finish: bool) !void {
+        const count = self.at - self.accounted;
+        if (finish or count >= 256) {
+            try self.work.consume(count);
+            self.accounted = self.at;
+        }
+    }
 
     fn take(self: *Reader, byte: u8) bool {
         if (self.at < self.bytes.len and self.bytes[self.at] == byte) {
@@ -168,14 +189,21 @@ const Reader = struct {
         }
         return false;
     }
-    fn space(self: *Reader) void {
-        while (self.at < self.bytes.len and std.mem.indexOfScalar(u8, builtin_cast.whitespace, self.bytes[self.at]) != null) self.at += 1;
+    fn space(self: *Reader) !void {
+        while (self.at < self.bytes.len and std.mem.indexOfScalar(u8, builtin_cast.whitespace, self.bytes[self.at]) != null) {
+            try self.account(false);
+            self.at += 1;
+        }
+        try self.account(false);
     }
     fn bound(self: *Reader) !i32 {
         const start = self.at;
         if (self.at < self.bytes.len and (self.bytes[self.at] == '-' or self.bytes[self.at] == '+')) self.at += 1;
         const digits = self.at;
-        while (self.at < self.bytes.len and std.ascii.isDigit(self.bytes[self.at])) self.at += 1;
+        while (self.at < self.bytes.len and std.ascii.isDigit(self.bytes[self.at])) {
+            try self.account(false);
+            self.at += 1;
+        }
         if (self.at == digits) return error.SqlInvalidTextRepresentation;
         return std.fmt.parseInt(i32, self.bytes[start..self.at], 10) catch return error.SqlProgramLimitExceeded;
     }
@@ -186,6 +214,7 @@ const Reader = struct {
         var escaped = false;
         var closed = !quoted;
         while (self.at < self.bytes.len) {
+            try self.account(false);
             const byte = self.bytes[self.at];
             if (byte == '\\') {
                 escaped = true;
@@ -208,6 +237,7 @@ const Reader = struct {
         }
         if (!closed or (!quoted and end == start)) return error.SqlInvalidTextRepresentation;
         const raw = self.bytes[start..end];
+        try self.work.consume(raw.len);
         var decoded = raw.len;
         var at: usize = 0;
         while (at < raw.len) : (at += 1) if (raw[at] == '\\') {
@@ -218,15 +248,15 @@ const Reader = struct {
     }
     fn array(self: *Reader, depth: usize) anyerror!Shape {
         if (depth >= 6) return error.SqlProgramLimitExceeded;
-        self.space();
+        try self.space();
         if (!self.take('{')) return error.SqlInvalidTextRepresentation;
-        self.space();
+        try self.space();
         var result: Shape = .{};
         if (self.take('}')) return result;
         const nested = self.at < self.bytes.len and self.bytes[self.at] == '{';
         var child_shape: ?Shape = null;
         while (true) {
-            self.space();
+            try self.space();
             if (self.at == self.bytes.len or nested != (self.bytes[self.at] == '{')) return error.SqlInvalidTextRepresentation;
             if (nested) {
                 const child = try self.array(depth + 1);
@@ -235,13 +265,14 @@ const Reader = struct {
                 } else child_shape = child;
             } else {
                 const cell = try self.token();
+                try self.work.consume(1);
                 if (self.count >= self.limit) return error.SqlProgramLimitExceeded;
                 if (cell.escaped) self.max_escape = @max(self.max_escape, cell.decoded_len);
                 if (self.cells) |cells| cells[self.count] = if (cell.sql_null) .{} else try decodeElement(self.alloc, self.kind, cell.text(self.scratch), self.work);
                 self.count += 1;
             }
             result.lengths[0] = std.math.add(u32, result.lengths[0], 1) catch return error.SqlProgramLimitExceeded;
-            self.space();
+            try self.space();
             if (self.take('}')) break;
             if (!self.take(',')) return error.SqlInvalidTextRepresentation;
         }
@@ -283,10 +314,21 @@ pub fn decodeElementLeaky(a: A, kind: arrays.ElementType, text: []const u8, work
 /// both success and error, like parseFromSliceLeaky. No allocator references
 /// escape: the local budget bounds all requested allocations, including JSONB.
 pub fn decodeLeaky(a: A, kind: arrays.ElementType, bytes: []const u8, options: Options) !Decoded {
-    if (bytes.len > options.wire_bytes or bytes.len > options.values.work / 2) return error.SqlProgramLimitExceeded;
+    return decodeLeakyInner(a, kind, bytes, options) catch |err| return sharedFailure(options, err);
+}
+
+fn sharedFailure(options: Options, err: anyerror) anyerror {
+    return if (err == error.SqlProgramLimitExceeded and options.context != null) options.context.?.limit() else err;
+}
+
+fn decodeLeakyInner(a: A, kind: arrays.ElementType, bytes: []const u8, options: Options) !Decoded {
+    var work: arrays.Budget = .{ .remaining = options.values.work, .shared = options.context };
+    try work.consume(0);
+    if (bytes.len > options.wire_bytes or bytes.len > options.values.work / 2) return if (options.context) |context| context.limit() else error.SqlProgramLimitExceeded;
+    try work.consume(bytes.len);
     if (!std.unicode.utf8ValidateSlice(bytes) or std.mem.indexOfScalar(u8, bytes, 0) != null) return error.SqlInvalidTextEncoding;
-    var reader: Reader = .{ .bytes = bytes, .limit = options.values.elements };
-    reader.space();
+    var reader: Reader = .{ .bytes = bytes, .limit = options.values.elements, .work = &work };
+    try reader.space();
     var declared: [6]arrays.Dimension = undefined;
     var rank: usize = 0;
     while (reader.take('[')) {
@@ -301,12 +343,13 @@ pub fn decodeLeaky(a: A, kind: arrays.ElementType, bytes: []const u8, options: O
         if (length > std.math.maxInt(i32) or @as(i64, lower) + length > std.math.maxInt(i32)) return error.SqlProgramLimitExceeded;
         declared[rank] = .{ .lower = lower, .length = @intCast(length) };
         rank += 1;
-        reader.space();
+        try reader.space();
     }
     if (rank != 0 and !reader.take('=')) return error.SqlInvalidTextRepresentation;
     const body = reader.at;
     const shape = try reader.array(0);
-    reader.space();
+    try reader.space();
+    try reader.account(true);
     if (reader.at != bytes.len) return error.SqlInvalidTextRepresentation;
     if (rank != 0) {
         if (rank != shape.rank) return error.SqlInvalidTextRepresentation;
@@ -315,39 +358,92 @@ pub fn decodeLeaky(a: A, kind: arrays.ElementType, bytes: []const u8, options: O
         rank = shape.rank;
         for (declared[0..rank], shape.lengths[0..rank]) |*dimension, length| dimension.* = .{ .length = length };
     }
-    const work = std.math.add(usize, bytes.len * 2, reader.count) catch return error.SqlProgramLimitExceeded;
-    if (work > options.values.work) return error.SqlProgramLimitExceeded;
     var budget: MemoryBudget = .{ .backing = a, .limit = options.values.bytes };
-    return decodeAdmitted(&budget, kind, bytes, options, body, declared[0..rank], reader.count, reader.max_escape, work) catch |err| return quotaError(&budget, err);
+    return decodeAdmitted(&budget, kind, bytes, options, body, declared[0..rank], reader.count, reader.max_escape, &work) catch |err| {
+        const mapped = quotaError(&budget, err);
+        return if (mapped == error.SqlProgramLimitExceeded and options.context != null) options.context.?.limit() else mapped;
+    };
 }
 
-fn decodeAdmitted(budget: *MemoryBudget, kind: arrays.ElementType, bytes: []const u8, options: Options, body: usize, dimensions: []const arrays.Dimension, count: usize, escape_bytes: usize, work: usize) !Decoded {
+test "SQL array text shared work owner cancels both passes and retains failures without leaked ownership" {
+    const a = std.testing.allocator;
+    var text: [5121]u8 = undefined;
+    text[0] = '{';
+    for (0..1024) |index| {
+        @memcpy(text[1 + index * 5 ..][0..4], "NULL");
+        text[5 + index * 5] = if (index == 1023) '}' else ',';
+    }
+    const Control = struct {
+        calls: usize = 0,
+        stop: usize,
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            if (self.calls == self.stop) return error.QueryCanceled;
+        }
+    };
+    const backing = try a.alloc(u8, 512 * 1024);
+    defer a.free(backing);
+    for ([_]usize{ 2, 50 }) |stop| {
+        var fixed = std.heap.FixedBufferAllocator.init(backing);
+        var control: Control = .{ .stop = stop };
+        var context: @import("numeric_value.zig").Context = .{ .alloc = fixed.allocator(), .checkpoint = Control.check, .ptr = &control };
+        try std.testing.expectError(error.QueryCanceled, decodeLeaky(fixed.allocator(), .int64, &text, .{ .context = &context }));
+        try std.testing.expectEqual(stop, control.calls);
+        if (stop == 2) try std.testing.expectEqual(@as(usize, 0), fixed.end_index) else try std.testing.expect(fixed.end_index > 0);
+        const retained = fixed.end_index;
+        const remaining = context.remaining;
+        try std.testing.expectError(error.QueryCanceled, decodeLeaky(fixed.allocator(), .int64, "{1}", .{ .context = &context }));
+        try std.testing.expectEqual(retained, fixed.end_index);
+        try std.testing.expectEqual(remaining, context.remaining);
+        try std.testing.expectEqual(stop, control.calls);
+    }
+    // Owned adaptation must unwind allocations after decoding has started.
+    var control: Control = .{ .stop = 50 };
+    var context: @import("numeric_value.zig").Context = .{ .alloc = a, .checkpoint = Control.check, .ptr = &control };
+    try std.testing.expectError(error.QueryCanceled, decode(a, .int64, &text, .{ .context = &context }));
+}
+
+test "SQL array text shared work owner distinguishes real OOM from sticky quota exhaustion" {
+    var none = std.heap.FixedBufferAllocator.init(&.{});
+    var context: @import("numeric_value.zig").Context = .{ .alloc = none.allocator() };
+    try std.testing.expectError(error.OutOfMemory, decodeLeaky(none.allocator(), .int64, "{1,NULL,2}", .{ .context = &context }));
+    try std.testing.expect(context.failure == null);
+    try std.testing.expectError(error.SqlProgramLimitExceeded, decodeLeaky(none.allocator(), .int64, "{1,NULL,2}", .{ .values = .{ .bytes = 0 }, .context = &context }));
+    try std.testing.expectEqual(error.SqlProgramLimitExceeded, context.failure.?);
+    const remaining = context.remaining;
+    try std.testing.expectError(error.SqlProgramLimitExceeded, decodeLeaky(none.allocator(), .int64, "{1}", .{ .context = &context }));
+    try std.testing.expectEqual(remaining, context.remaining);
+}
+
+fn decodeAdmitted(budget: *MemoryBudget, kind: arrays.ElementType, bytes: []const u8, options: Options, body: usize, dimensions: []const arrays.Dimension, count: usize, escape_bytes: usize, work: *arrays.Budget) !Decoded {
     const a = budget.allocator();
     const cells = try a.alloc(arrays.Element, count);
     const scratch = try a.alloc(u8, escape_bytes);
-    var validation: arrays.Budget = .{ .remaining = options.values.work - work };
-    var reader: Reader = .{ .bytes = bytes, .at = body, .limit = options.values.elements, .cells = cells, .scratch = scratch, .alloc = a, .kind = kind, .work = &validation };
+    var reader: Reader = .{ .bytes = bytes, .at = body, .accounted = body, .limit = options.values.elements, .cells = cells, .scratch = scratch, .alloc = a, .kind = kind, .work = work };
     _ = try reader.array(0);
+    try reader.account(true);
     const owned_dimensions = try a.dupe(arrays.Dimension, dimensions);
     if (kind == .jsonb) for (cells) |*cell| if (!cell.sql_null) {
-        try @import("json_order.zig").rehomeArrayAllocators(&cell.value, budget.backing, &validation, 0);
+        try @import("json_order.zig").rehomeArrayAllocators(&cell.value, budget.backing, work, 0);
     };
-    const value = try arrays.Value.initWithBudget(kind, owned_dimensions, cells, options.values, &validation);
+    const value = try arrays.Value.initWithBudget(kind, owned_dimensions, cells, options.values, work);
     a.free(scratch);
-    return .{ .value = value, .allocated_bytes = budget.live, .work = options.values.work - validation.remaining };
+    return .{ .value = value, .allocated_bytes = budget.live, .work = options.values.work - work.remaining };
 }
 
 /// Stable owned ingress form. The outer budget also accounts arena capacity,
 /// not only requested cell/JSON bytes. Failure destroys the unpublished owner.
 pub fn decode(backing: A, kind: arrays.ElementType, bytes: []const u8, options: Options) !arrays.Owned {
+    if (options.context) |context| try context.charge(0);
     const budget = try backing.create(MemoryBudget);
     errdefer backing.destroy(budget);
     budget.* = .{ .backing = backing, .limit = options.values.bytes };
-    const arena = budget.allocator().create(std.heap.ArenaAllocator) catch |err| return quotaError(budget, err);
+    const arena = budget.allocator().create(std.heap.ArenaAllocator) catch |err| return sharedFailure(options, quotaError(budget, err));
     errdefer budget.allocator().destroy(arena);
     arena.* = std.heap.ArenaAllocator.init(budget.allocator());
     errdefer arena.deinit();
-    const decoded = decodeLeaky(arena.allocator(), kind, bytes, options) catch |err| return quotaError(budget, err);
+    const decoded = decodeLeaky(arena.allocator(), kind, bytes, options) catch |err| return sharedFailure(options, quotaError(budget, err));
     return .{ .value = decoded.value, .arena = arena, .budget = budget };
 }
 
