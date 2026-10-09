@@ -1089,6 +1089,42 @@ pub fn build(b: *std.Build) void {
     );
     metal_prefill_bucket_bench_step.dependOn(&run_metal_prefill_bucket_bench.step);
 
+    const embeddinggemma2_bench = b.addExecutable(.{
+        .name = "antfly-embeddinggemma2-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench/embeddinggemma2.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    embeddinggemma2_bench.root_module.addImport("build_options", build_options_mod);
+    embeddinggemma2_bench.root_module.addImport("inference_internal", inference_internal_mod);
+    runtime_graph.identities.addImports(embeddinggemma2_bench.root_module);
+    embeddinggemma2_bench.root_module.link_libc = true;
+    const install_embeddinggemma2_bench = b.addInstallArtifact(embeddinggemma2_bench, .{});
+    b.step("build-embeddinggemma2-bench", "Build the prepared-text encoder benchmark without running it").dependOn(&install_embeddinggemma2_bench.step);
+    const run_embeddinggemma2_bench = b.addRunArtifact(embeddinggemma2_bench);
+    run_embeddinggemma2_bench.addPassthruArgs();
+    b.step("bench-embeddinggemma2", "Run the synchronized prepared-text encoder benchmark").dependOn(&run_embeddinggemma2_bench.step);
+
+    const embeddinggemma2_attention_check = b.addExecutable(.{
+        .name = "antfly-embeddinggemma2-attention-check",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench/embeddinggemma2_attention.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    embeddinggemma2_attention_check.root_module.addImport("build_options", build_options_mod);
+    embeddinggemma2_attention_check.root_module.addImport("inference_internal", inference_internal_mod);
+    runtime_graph.identities.addImports(embeddinggemma2_attention_check.root_module);
+    embeddinggemma2_attention_check.root_module.link_libc = true;
+    const install_embeddinggemma2_attention_check = b.addInstallArtifact(embeddinggemma2_attention_check, .{});
+    b.step("build-embeddinggemma2-attention-check", "Build independent sampled 8K attention parity checks").dependOn(&install_embeddinggemma2_attention_check.step);
+    const run_embeddinggemma2_attention_check = b.addRunArtifact(embeddinggemma2_attention_check);
+    run_embeddinggemma2_attention_check.addPassthruArgs();
+    b.step("check-embeddinggemma2-attention", "Check full 8K attention against independently computed F64 rows").dependOn(&run_embeddinggemma2_attention_check.step);
+
     const metal_bench_exe = b.addExecutable(.{
         .name = "antfly-inference-metal-bench",
         .root_module = b.createModule(.{

@@ -1,0 +1,487 @@
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Private typed-classification adapters behind root.zig.
+const std = @import("std");
+const Value = std.json.Value;
+const Allocator = std.mem.Allocator;
+
+pub const Kind = enum { choice, score, noul };
+pub const Question = struct {
+    name: []const u8,
+    kind: Kind,
+    instructions: []const u8,
+    labels: []const []const u8,
+    descriptions: []const []const u8,
+    examples: []const []const []const u8 = &.{},
+};
+pub const Request = struct {
+    model: []const u8,
+    model_identity: ?[]const u8 = null,
+    state: []const u8,
+    questions: []Question,
+    embedding_options: ?@import("embedding.zig").Options = null,
+};
+
+pub const ExecutionContract = enum {
+    span_marker,
+    boundary,
+    laya,
+
+    fn usesClassifications(self: ExecutionContract) bool {
+        return self == .span_marker or self == .boundary;
+    }
+};
+
+fn object(v: Value) !std.json.ObjectMap {
+    return if (v == .object) v.object else error.InvalidDecideRequest;
+}
+fn nonempty(v: Value) ![]const u8 {
+    if (v != .string or !std.unicode.utf8ValidateSlice(v.string) or std.mem.trim(u8, v.string, " \r\n\t").len == 0) return error.InvalidDecideRequest;
+    return v.string;
+}
+fn outputObject(v: Value) !std.json.ObjectMap {
+    return if (v == .object) v.object else error.InvalidDecideOutput;
+}
+fn outputNonempty(v: Value) ![]const u8 {
+    if (v != .string or !std.unicode.utf8ValidateSlice(v.string) or std.mem.trim(u8, v.string, " \r\n\t").len == 0) return error.InvalidDecideOutput;
+    return v.string;
+}
+fn onlyKeys(map: std.json.ObjectMap, allowed: []const []const u8) !void {
+    for (map.keys()) |key| {
+        for (allowed) |candidate| {
+            if (std.mem.eql(u8, key, candidate)) break;
+        } else return error.InvalidDecideRequest;
+    }
+}
+
+pub fn parse(a: Allocator, json: []const u8) !Request {
+    if (json.len > 16 * 1024 * 1024) return error.DecideRequestLimitExceeded;
+    const parsed = std.json.parseFromSlice(Value, a, json, .{ .duplicate_field_behavior = .@"error" }) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidDecideRequest,
+    };
+    // The request owns parsed strings through the caller's request arena.
+    const root = try object(parsed.value);
+    try onlyKeys(root, &.{ "model", "model_identity", "state", "questions", "embedding_options" });
+    const model = try nonempty(root.get("model") orelse return error.InvalidDecideRequest);
+    const model_identity: ?[]const u8 = if (root.get("model_identity")) |value| blk: {
+        const identity = try nonempty(value);
+        if (identity.len != 64) return error.InvalidDecideRequest;
+        for (identity) |c| if (!std.ascii.isDigit(c) and (c < 'a' or c > 'f')) return error.InvalidDecideRequest;
+        break :blk identity;
+    } else null;
+    const state = try nonempty(root.get("state") orelse return error.InvalidDecideRequest);
+    if (state.len > 1024 * 1024) return error.DecideRequestLimitExceeded;
+    const questions = try object(root.get("questions") orelse return error.InvalidDecideRequest);
+    if (questions.count() == 0 or questions.count() > 64) return error.DecideRequestLimitExceeded;
+    const out = try a.alloc(Question, questions.count());
+    for (questions.keys(), questions.values(), out) |name, raw, *question| {
+        if (name.len == 0 or !std.unicode.utf8ValidateSlice(name)) return error.InvalidDecideRequest;
+        const fields = try object(raw);
+        try onlyKeys(fields, &.{ "type", "instructions", "criteria" });
+        const type_name = try nonempty(fields.get("type") orelse return error.InvalidDecideRequest);
+        const kind = std.meta.stringToEnum(Kind, type_name) orelse return error.InvalidDecideRequest;
+        const instructions = try nonempty(fields.get("instructions") orelse return error.InvalidDecideRequest);
+        const criteria = fields.get("criteria");
+        var labels: [][]const u8 = undefined;
+        var descriptions: [][]const u8 = undefined;
+        var examples: []const []const []const u8 = &.{};
+        switch (kind) {
+            .choice => {
+                const choices = try object(criteria orelse return error.InvalidDecideRequest);
+                if (choices.count() < 2 or choices.count() > 64) return error.InvalidDecideRequest;
+                labels = try a.alloc([]const u8, choices.count());
+                descriptions = try a.alloc([]const u8, choices.count());
+                const choice_examples = try a.alloc([]const []const u8, choices.count());
+                examples = choice_examples;
+                for (choices.keys(), choices.values(), labels, descriptions, choice_examples) |label, description, *dest_label, *dest_description, *dest_examples| {
+                    if (label.len == 0 or !std.unicode.utf8ValidateSlice(label)) return error.InvalidDecideRequest;
+                    dest_label.* = label;
+                    dest_examples.* = &.{};
+                    if (description == .string) {
+                        dest_description.* = try nonempty(description);
+                    } else {
+                        const definition = try object(description);
+                        try onlyKeys(definition, &.{ "description", "examples" });
+                        const raw_examples = definition.get("examples") orelse return error.InvalidDecideRequest;
+                        if (raw_examples != .array or raw_examples.array.items.len == 0 or raw_examples.array.items.len > 32) return error.InvalidDecideRequest;
+                        const inputs = try a.alloc([]const u8, raw_examples.array.items.len);
+                        for (inputs, raw_examples.array.items) |*dest, value| dest.* = try nonempty(value);
+                        dest_examples.* = inputs;
+                        dest_description.* = if (definition.get("description")) |v| try nonempty(v) else label;
+                    }
+                }
+            },
+            .score => {
+                const levels = criteria orelse return error.InvalidDecideRequest;
+                if (levels != .array or levels.array.items.len < 2 or levels.array.items.len > 64) return error.InvalidDecideRequest;
+                labels = try a.alloc([]const u8, levels.array.items.len);
+                descriptions = try a.alloc([]const u8, levels.array.items.len);
+                for (levels.array.items, labels, descriptions, 0..) |description, *label, *dest, index| {
+                    label.* = try std.fmt.allocPrint(a, "{d}", .{index});
+                    dest.* = try nonempty(description);
+                }
+            },
+            .noul => {
+                if (criteria != null) return error.InvalidDecideRequest;
+                labels = try a.dupe([]const u8, &.{ "false", "true" });
+                descriptions = try a.dupe([]const u8, &.{ "False", "True" });
+            },
+        }
+        question.* = .{ .name = name, .kind = kind, .instructions = instructions, .labels = labels, .descriptions = descriptions, .examples = examples };
+    }
+    return .{ .model = model, .model_identity = model_identity, .state = state, .questions = out, .embedding_options = if (root.get("embedding_options")) |v| try @import("embedding.zig").Options.parse(v) else null };
+}
+
+fn put(a: Allocator, map: *std.json.ObjectMap, key: []const u8, value: Value) !void {
+    try map.put(a, key, value);
+}
+fn string(s: []const u8) Value {
+    return .{ .string = s };
+}
+
+pub const ExtractionInput = struct {
+    json: []u8,
+    schema_bytes: usize,
+};
+
+/// Produce an extraction v2 request and the exact serialized schema size used
+/// by inference.limits.max_schema_bytes. GLiNER's top_k includes every option.
+pub fn extractionInput(a: Allocator, request: Request, contract: ExecutionContract) !ExtractionInput {
+    const input = try extractionValue(a, request, contract);
+    return .{ .json = try std.json.Stringify.valueAlloc(a, input.value, .{}), .schema_bytes = input.schema_bytes };
+}
+
+pub const ExtractionValue = struct { value: Value, schema_bytes: usize };
+
+/// Trusted internal envelope. The original Decide request is limited to 1 MiB;
+/// all generated nesting is fixed and parseValue still enforces schema/text limits.
+pub fn extractionValue(a: Allocator, request: Request, contract: ExecutionContract) !ExtractionValue {
+    const classifications = contract.usesClassifications();
+    var root: std.json.ObjectMap = .empty;
+    try put(a, &root, "schema_version", .{ .integer = 2 });
+    try put(a, &root, "model", string(request.model));
+    var input: std.json.ObjectMap = .empty;
+    try put(a, &input, "content", string(request.state));
+    var inputs: std.array_list.Managed(Value) = .init(a);
+    try inputs.append(.{ .object = input });
+    try put(a, &root, "inputs", .{ .array = inputs });
+    var schema: std.json.ObjectMap = .empty;
+    var tasks: std.array_list.Managed(Value) = .init(a);
+    for (request.questions) |question| {
+        var task: std.json.ObjectMap = .empty;
+        try put(a, &task, "name", string(question.name));
+        try put(a, &task, if (classifications) "prompt" else "instruction", string(question.instructions));
+        if (!classifications) try put(a, &task, "mode", string(switch (question.kind) {
+            .choice => "single",
+            .score => "ordinal",
+            .noul => "boolean",
+        }));
+        if (classifications) try put(a, &task, "top_k", .{ .integer = @intCast(question.labels.len) });
+        var labels: std.array_list.Managed(Value) = .init(a);
+        var definitions: std.json.ObjectMap = .empty;
+        for (question.labels, question.descriptions) |label, description| {
+            try labels.append(string(label));
+            var definition: std.json.ObjectMap = .empty;
+            try put(a, &definition, "description", string(description));
+            try put(a, &definitions, label, .{ .object = definition });
+        }
+        try put(a, &task, "labels", .{ .array = labels });
+        try put(a, &task, "label_definitions", .{ .object = definitions });
+        try tasks.append(.{ .object = task });
+    }
+    try put(a, &schema, "classifications", .{ .array = tasks });
+    const schema_json = try std.json.Stringify.valueAlloc(a, Value{ .object = schema }, .{});
+    try put(a, &root, "schema", .{ .object = schema });
+    if (classifications) {
+        var options: std.json.ObjectMap = .empty;
+        try put(a, &options, "include_confidence", .{ .bool = true });
+        try put(a, &root, "options", .{ .object = options });
+    }
+    return .{
+        .value = .{ .object = root },
+        .schema_bytes = schema_json.len,
+    };
+}
+
+fn number(v: Value) !f64 {
+    return switch (v) {
+        .integer => @floatFromInt(v.integer),
+        .float => v.float,
+        .number_string => std.fmt.parseFloat(f64, v.number_string) catch return error.InvalidDecideOutput,
+        else => error.InvalidDecideOutput,
+    };
+}
+
+fn tokenCount(v: Value) !Value {
+    if (v != .integer or v.integer < 0) return error.InvalidDecideOutput;
+    return v;
+}
+
+/// Translate both executors' distributions with one decision presenter.
+pub fn responseJson(a: Allocator, request: Request, extraction_json: []const u8, contract: ExecutionContract) ![]u8 {
+    const parsed = std.json.parseFromSlice(Value, a, extraction_json, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidDecideOutput,
+    };
+    return std.json.Stringify.valueAlloc(a, try responseValue(a, request, parsed.value, contract), .{});
+}
+
+pub fn responseClassifications(a: Allocator, request: Request, classifications: anytype, prompt_tokens: usize) ![]u8 {
+    return std.json.Stringify.valueAlloc(a, try responseClassificationsValue(a, request, classifications, prompt_tokens), .{});
+}
+
+/// Present typed classifier results without an extraction JSON round trip.
+pub fn responseClassificationsValue(a: Allocator, request: Request, classifications: anytype, prompt_tokens: usize) !Value {
+    var rows: std.array_list.Managed(Value) = .init(a);
+    for (classifications) |classification| for (classification.labels) |label| {
+        var row: std.json.ObjectMap = .empty;
+        try put(a, &row, "name", string(classification.name));
+        try put(a, &row, "label", string(label.label));
+        try put(a, &row, "score", .{ .float = label.confidence });
+        try rows.append(.{ .object = row });
+    };
+    var item: std.json.ObjectMap = .empty;
+    try put(a, &item, "classifications", .{ .array = rows });
+    var data: std.array_list.Managed(Value) = .init(a);
+    try data.append(.{ .object = item });
+    var usage: std.json.ObjectMap = .empty;
+    try put(a, &usage, "prompt_tokens", .{ .integer = @intCast(prompt_tokens) });
+    try put(a, &usage, "completion_tokens", .{ .integer = 0 });
+    var root: std.json.ObjectMap = .empty;
+    try put(a, &root, "data", .{ .array = data });
+    try put(a, &root, "usage", .{ .object = usage });
+    return responseValue(a, request, .{ .object = root }, .span_marker);
+}
+
+fn responseValue(a: Allocator, request: Request, value: Value, contract: ExecutionContract) !Value {
+    const classifications = contract.usesClassifications();
+    const root = try outputObject(value);
+    const data = root.get("data") orelse return error.InvalidDecideOutput;
+    if (data != .array or data.array.items.len != 1) return error.InvalidDecideOutput;
+    const item = try outputObject(data.array.items[0]);
+    const rows = item.get(if (classifications) "classifications" else "decisions") orelse return error.InvalidDecideOutput;
+    if (rows != .array) return error.InvalidDecideOutput;
+    var expected_rows: usize = 0;
+    for (request.questions) |question| expected_rows += if (classifications) question.labels.len else 1;
+    if (rows.array.items.len != expected_rows) return error.InvalidDecideOutput;
+    var answers: std.json.ObjectMap = .empty;
+    for (request.questions, 0..) |question, question_index| {
+        const probabilities = try a.alloc(f64, question.labels.len);
+        @memset(probabilities, -1);
+        const raw_probabilities = if (classifications) rows.array.items else blk: {
+            const row = try outputObject(rows.array.items[question_index]);
+            const row_name = try outputNonempty(row.get("name") orelse return error.InvalidDecideOutput);
+            if (!std.mem.eql(u8, row_name, question.name)) return error.InvalidDecideOutput;
+            const values = row.get("probabilities") orelse return error.InvalidDecideOutput;
+            if (values != .array or values.array.items.len != question.labels.len) return error.InvalidDecideOutput;
+            break :blk values.array.items;
+        };
+        for (raw_probabilities) |raw_probability| {
+            const entry = try outputObject(raw_probability);
+            if (classifications) {
+                const row_name = try outputNonempty(entry.get("name") orelse return error.InvalidDecideOutput);
+                if (!std.mem.eql(u8, row_name, question.name)) continue;
+            }
+            const label = try outputNonempty(entry.get("label") orelse return error.InvalidDecideOutput);
+            const probability = try number(entry.get(if (classifications) "score" else "probability") orelse return error.InvalidDecideOutput);
+            if (!std.math.isFinite(probability) or probability < 0 or probability > 1) return error.InvalidDecideOutput;
+            for (question.labels, probabilities) |expected, *dest| {
+                if (std.mem.eql(u8, label, expected)) {
+                    if (dest.* >= 0) return error.InvalidDecideOutput;
+                    dest.* = probability;
+                    break;
+                }
+            } else return error.InvalidDecideOutput;
+        }
+        var distribution: std.json.ObjectMap = .empty;
+        var total: f64 = 0;
+        var best: usize = 0;
+        var expected: f64 = 0;
+        for (question.labels, probabilities, 0..) |label, probability, index| {
+            if (probability < 0) return error.InvalidDecideOutput;
+            total += probability;
+            expected += @as(f64, @floatFromInt(index)) * probability;
+            if (probability > probabilities[best]) best = index;
+            try put(a, &distribution, label, .{ .float = probability });
+        }
+        if (@abs(total - 1) > 0.01) return error.InvalidDecideOutput;
+        var answer: std.json.ObjectMap = .empty;
+        try put(a, &answer, "type", string(@tagName(question.kind)));
+        var entropy: f64 = 0;
+        for (probabilities) |p| if (p > 0) {
+            entropy -= p * @log(p);
+        };
+        const confidence = std.math.clamp(1 - entropy / @log(@as(f64, @floatFromInt(probabilities.len))), 0, 1);
+        try put(a, &answer, "confidence", .{ .float = confidence });
+        try put(a, &answer, "confidence_method", string("normalized_inverse_entropy"));
+        if (!classifications) {
+            const diagnostics = rows.array.items[question_index].object;
+            if (diagnostics.get("confidence")) |raw| {
+                const n = try number(raw);
+                if (!std.math.isFinite(n) or n < 0 or n > 1) return error.InvalidDecideOutput;
+                try put(a, &answer, "confidence", .{ .float = n });
+                const method = try outputNonempty(diagnostics.get("confidence_method") orelse return error.InvalidDecideOutput);
+                if (!std.mem.eql(u8, method, "normalized_inverse_entropy") and !std.mem.eql(u8, method, "max_probability")) return error.InvalidDecideOutput;
+                try put(a, &answer, "confidence_method", string(method));
+            }
+            if (diagnostics.get("act_probability")) |raw| {
+                const n = try number(raw);
+                if (!std.math.isFinite(n) or n < 0 or n > 1) return error.InvalidDecideOutput;
+                try put(a, &answer, "act_probability", .{ .float = n });
+            }
+        }
+        switch (question.kind) {
+            .choice => try put(a, &answer, "choice", string(question.labels[best])),
+            .score => {
+                try put(a, &answer, "score", .{ .float = expected });
+                var legend: std.json.ObjectMap = .empty;
+                for (question.labels, question.descriptions) |label, description| try put(a, &legend, label, string(description));
+                try put(a, &answer, "legend", .{ .object = legend });
+            },
+            .noul => try put(a, &answer, "noul", .{ .float = probabilities[1] }),
+        }
+        if (question.kind != .noul) try put(a, &answer, "probabilities", .{ .object = distribution });
+        try put(a, &answers, question.name, .{ .object = answer });
+    }
+    var output: std.json.ObjectMap = .empty;
+    try put(a, &output, "model", string(request.model));
+    try put(a, &output, "answers", .{ .object = answers });
+    const usage = try outputObject(root.get("usage") orelse return error.InvalidDecideOutput);
+    var out_usage: std.json.ObjectMap = .empty;
+    try put(a, &out_usage, "input_tokens", try tokenCount(usage.get("prompt_tokens") orelse return error.InvalidDecideOutput));
+    try put(a, &out_usage, "output_tokens", try tokenCount(usage.get("completion_tokens") orelse return error.InvalidDecideOutput));
+    try put(a, &output, "usage", .{ .object = out_usage });
+    return .{ .object = output };
+}
+
+test "decide validates questions before building an extraction request" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const valid =
+        \\{"model":"m","state":"A refund is needed","questions":{"intent":{"type":"choice","instructions":"Intent?","criteria":{"refund":"Refund","other":"Other"}},"urgency":{"type":"score","instructions":"When?","criteria":["Later","Now"]},"act":{"type":"noul","instructions":"Act?"}}}
+    ;
+    const request = try parse(a, valid);
+    try std.testing.expectEqual(@as(usize, 3), request.questions.len);
+    const laya = try extractionInput(a, request, .laya);
+    try std.testing.expect(std.mem.indexOf(u8, laya.json, "\"mode\":\"ordinal\"") != null);
+    const gliner = try extractionInput(a, request, .span_marker);
+    try std.testing.expect(std.mem.indexOf(u8, gliner.json, "\"top_k\":2") != null);
+    const boundary = try extractionInput(a, request, .boundary);
+    try std.testing.expect(std.mem.indexOf(u8, boundary.json, "\"top_k\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, boundary.json, "\"prompt\":\"Intent?\"") != null);
+    const longer_state = try a.alloc(u8, 4096);
+    @memset(longer_state, 'x');
+    var longer_request = request;
+    longer_request.state = longer_state;
+    for ([_]ExecutionContract{ .laya, .span_marker, .boundary }) |contract| {
+        const short = try extractionInput(a, request, contract);
+        const long = try extractionInput(a, longer_request, contract);
+        var parsed = try std.json.parseFromSlice(Value, a, short.json, .{});
+        defer parsed.deinit();
+        const actual_schema = try std.json.Stringify.valueAlloc(a, parsed.value.object.get("schema").?, .{});
+        try std.testing.expectEqual(actual_schema.len, short.schema_bytes);
+        try std.testing.expectEqual(short.schema_bytes, long.schema_bytes);
+        try std.testing.expect(long.json.len > short.json.len + 4000);
+    }
+    try std.testing.expectError(error.InvalidDecideRequest, parse(a,
+        \\{"model":"m","state":"x","questions":{"q":{"type":"noul","instructions":"?","criteria":[]}}}
+    ));
+    try std.testing.expectError(error.InvalidDecideRequest, parse(a,
+        \\{"model":"m","state":"x","questions":{"q":{"type":"choice","instructions":"?","criteria":{"a":"A","a":"B"}}}}
+    ));
+}
+
+test "decide presents complete Laya span and boundary distributions" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const request = try parse(a,
+        \\{"model":"m","state":"x","questions":{"intent":{"type":"choice","instructions":"Intent?","criteria":{"refund":"Refund","other":"Other"}},"urgency":{"type":"score","instructions":"When?","criteria":["Later","Now"]},"act":{"type":"noul","instructions":"Act?"}}}
+    );
+    const laya =
+        \\{"data":[{"decisions":[{"name":"intent","probabilities":[{"label":"refund","probability":0.8},{"label":"other","probability":0.2}]},{"name":"urgency","probabilities":[{"label":"0","probability":0.25},{"label":"1","probability":0.75}]},{"name":"act","probabilities":[{"label":"false","probability":0.1},{"label":"true","probability":0.9}]}]}],"usage":{"prompt_tokens":10,"completion_tokens":0}}
+    ;
+    const span =
+        \\{"data":[{"classifications":[{"name":"intent","label":"other","score":0.2},{"name":"intent","label":"refund","score":0.8},{"name":"urgency","label":"0","score":0.25},{"name":"urgency","label":"1","score":0.75},{"name":"act","label":"false","score":0.1},{"name":"act","label":"true","score":0.9}]}],"usage":{"prompt_tokens":10,"completion_tokens":0}}
+    ;
+    const Label = struct { label: []const u8, confidence: f32 };
+    const Classification = struct { name: []const u8, multi_label: bool, labels: []const Label };
+    const typed = try responseClassifications(a, request, @as([]const Classification, &.{
+        .{ .name = "intent", .multi_label = false, .labels = &.{ .{ .label = "other", .confidence = 0.2 }, .{ .label = "refund", .confidence = 0.8 } } },
+        .{ .name = "urgency", .multi_label = false, .labels = &.{ .{ .label = "0", .confidence = 0.25 }, .{ .label = "1", .confidence = 0.75 } } },
+        .{ .name = "act", .multi_label = false, .labels = &.{ .{ .label = "false", .confidence = 0.1 }, .{ .label = "true", .confidence = 0.9 } } },
+    }), 10);
+    for ([_][]const u8{ typed, try responseJson(a, request, laya, .laya), try responseJson(a, request, span, .span_marker), try responseJson(a, request, span, .boundary) }) |json| {
+        var parsed = try std.json.parseFromSlice(Value, a, json, .{});
+        defer parsed.deinit();
+        const answers = parsed.value.object.get("answers").?.object;
+        try std.testing.expectEqualStrings("refund", answers.get("intent").?.object.get("choice").?.string);
+        try std.testing.expectApproxEqAbs(@as(f64, 0.75), answers.get("urgency").?.object.get("score").?.float, 0.00001);
+        try std.testing.expectApproxEqAbs(@as(f64, 0.9), answers.get("act").?.object.get("noul").?.float, 0.00001);
+    }
+}
+
+test "decide reports malformed executor responses as output failures" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const request = try parse(a,
+        \\{"model":"m","state":"x","questions":{"act":{"type":"noul","instructions":"Act?"}}}
+    );
+    for ([_][]const u8{
+        "not json",
+        "[]",
+        "{\"data\":[null]}",
+        "{\"data\":[{\"decisions\":[null]}]}",
+        "{\"data\":[{\"decisions\":[{\"name\":42,\"probabilities\":[]}]}]}",
+        "{\"data\":[{\"decisions\":[{\"name\":\"act\",\"probabilities\":[null,null]}]}]}",
+    }) |malformed| try std.testing.expectError(error.InvalidDecideOutput, responseJson(a, request, malformed, .laya));
+    const valid_decision = "{\"data\":[{\"decisions\":[{\"name\":\"act\",\"probabilities\":[{\"label\":\"false\",\"probability\":0.25},{\"label\":\"true\",\"probability\":0.75}]}]}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":0}}";
+    _ = try responseJson(a, request, valid_decision, .laya);
+    for ([_][]const u8{
+        "\"prompt_tokens\":\"10\",\"completion_tokens\":0",
+        "\"prompt_tokens\":-1,\"completion_tokens\":0",
+        "\"prompt_tokens\":10,\"completion_tokens\":0.5",
+    }) |invalid_usage| {
+        const response = try std.fmt.allocPrint(
+            a,
+            "{{\"data\":[{{\"decisions\":[{{\"name\":\"act\",\"probabilities\":[{{\"label\":\"false\",\"probability\":0.25}},{{\"label\":\"true\",\"probability\":0.75}}]}}]}}],\"usage\":{{{s}}}}}",
+            .{invalid_usage},
+        );
+        try std.testing.expectError(error.InvalidDecideOutput, responseJson(a, request, response, .laya));
+    }
+}
+
+test "decide typed presenter rejects missing duplicate unknown and nonfinite labels" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const request = try parse(a,
+        \\{"model":"m","state":"x","questions":{"act":{"type":"noul","instructions":"Act?"}}}
+    );
+    const Label = struct { label: []const u8, confidence: f32 };
+    const Classification = struct { name: []const u8, multi_label: bool, labels: []const Label };
+    const cases = [_][]const Label{
+        &.{.{ .label = "false", .confidence = 1 }},
+        &.{ .{ .label = "false", .confidence = 0.5 }, .{ .label = "false", .confidence = 0.5 } },
+        &.{ .{ .label = "false", .confidence = 0.5 }, .{ .label = "unknown", .confidence = 0.5 } },
+        &.{ .{ .label = "false", .confidence = 0.5 }, .{ .label = "true", .confidence = std.math.nan(f32) } },
+        &.{ .{ .label = "false", .confidence = 0.5 }, .{ .label = "true", .confidence = 0.3 } },
+    };
+    for (cases) |labels| try std.testing.expectError(error.InvalidDecideOutput, responseClassifications(a, request, @as([]const Classification, &.{.{ .name = "act", .multi_label = false, .labels = labels }}), 10));
+}

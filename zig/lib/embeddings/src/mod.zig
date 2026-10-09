@@ -104,6 +104,7 @@ pub const Config = struct {
     rate_limit: ?openapi.RateLimitConfig = null,
     provider: Provider,
     model: []const u8 = "",
+    model_identity: []const u8 = "",
     request_format: []const u8 = "",
     url: []const u8 = "",
     api_key: ?[]const u8 = null,
@@ -130,6 +131,7 @@ pub const Config = struct {
             .rate_limit = self.rate_limit,
             .provider = self.provider,
             .model = if (self.model.len > 0) try alloc.dupe(u8, self.model) else "",
+            .model_identity = if (self.model_identity.len > 0) try alloc.dupe(u8, self.model_identity) else "",
             .request_format = if (self.request_format.len > 0) try alloc.dupe(u8, self.request_format) else "",
             .url = if (self.url.len > 0) try alloc.dupe(u8, self.url) else "",
             .api_key = if (self.api_key) |api_key| try alloc.dupe(u8, api_key) else null,
@@ -152,6 +154,7 @@ pub const Config = struct {
 
     pub fn deinit(self: *Config, alloc: Allocator) void {
         if (self.model.len > 0) alloc.free(self.model);
+        if (self.model_identity.len > 0) alloc.free(self.model_identity);
         if (self.request_format.len > 0) alloc.free(self.request_format);
         if (self.url.len > 0) alloc.free(self.url);
         if (self.api_key) |api_key| alloc.free(api_key);
@@ -168,6 +171,10 @@ pub const Config = struct {
     }
 
     pub fn validate(self: Config) !void {
+        if (self.model_identity.len > 0) {
+            if (self.provider != .antfly or self.model_identity.len != 64) return error.InvalidEmbedderConfig;
+            for (self.model_identity) |c| if (!(c >= '0' and c <= '9') and !(c >= 'a' and c <= 'f')) return error.InvalidEmbedderConfig;
+        }
         switch (self.provider) {
             .antfly => {},
             else => if (self.model.len == 0) return error.InvalidEmbedderConfig,
@@ -253,6 +260,7 @@ pub fn configFromOpenApi(alloc: Allocator, generated: openapi.EmbedderConfig) !C
         .rate_limit = generated.rate_limit,
         .provider = std.meta.stringToEnum(Provider, provider_name) orelse return error.InvalidEmbedderConfig,
         .model = if (generated.model) |model| try alloc.dupe(u8, model) else "",
+        .model_identity = if (generated.model_identity) |identity| try alloc.dupe(u8, identity) else "",
         .request_format = if (generated.request_format) |request_format| try alloc.dupe(u8, request_format) else "",
         .url = if (generated.url) |url|
             try alloc.dupe(u8, url)
@@ -304,6 +312,7 @@ pub fn openApiFromConfig(cfg: Config) openapi.EmbedderConfig {
             .antfly => if (cfg.url.len > 0) cfg.url else null,
             else => null,
         },
+        .model_identity = if (cfg.model_identity.len > 0) cfg.model_identity else null,
         .api_key = cfg.api_key,
         .project_id = if (cfg.project_id.len > 0) cfg.project_id else null,
         .location = if (cfg.location.len > 0) cfg.location else null,

@@ -107,6 +107,8 @@ from .chat_message import ChatMessage
 from .chat_message_role import ChatMessageRole
 from .chat_tool_name import ChatToolName
 from .chat_tools_config import ChatToolsConfig
+from .choice_decision_question import ChoiceDecisionQuestion
+from .choice_decision_question_type import ChoiceDecisionQuestionType
 from .chunk_options import ChunkOptions
 from .chunker_config import ChunkerConfig
 from .chunker_config_full_text_index import ChunkerConfigFullTextIndex
@@ -201,6 +203,14 @@ from .data_shape_decl import DataShapeDecl
 from .data_shape_kind import DataShapeKind
 from .database_catalog_record import DatabaseCatalogRecord
 from .date_range_string_query import DateRangeStringQuery
+from .decision_batch_item import DecisionBatchItem
+from .decision_choice import DecisionChoice
+from .decision_choice_probability import DecisionChoiceProbability
+from .decision_input import DecisionInput
+from .decision_level import DecisionLevel
+from .decision_level_probability import DecisionLevelProbability
+from .decision_similarity import DecisionSimilarity
+from .decision_usage import DecisionUsage
 from .delete_artifact_enrichment_response_201 import DeleteArtifactEnrichmentResponse201
 from .dense_native_storage_phase import DenseNativeStoragePhase
 from .dense_repair_backpressure_error import DenseRepairBackpressureError
@@ -253,8 +263,25 @@ from .edges_response import EdgesResponse
 from .embedder_config import EmbedderConfig
 from .embedder_config_inputs_item import EmbedderConfigInputsItem
 from .embedder_provider import EmbedderProvider
+from .embedding_choice_answer import EmbeddingChoiceAnswer
+from .embedding_choice_answer_abstention_reason import EmbeddingChoiceAnswerAbstentionReason
+from .embedding_choice_answer_decision_method import EmbeddingChoiceAnswerDecisionMethod
+from .embedding_choice_answer_similarity_metric import EmbeddingChoiceAnswerSimilarityMetric
+from .embedding_choice_answer_status import EmbeddingChoiceAnswerStatus
+from .embedding_choice_answer_type import EmbeddingChoiceAnswerType
+from .embedding_decision_acceptance import EmbeddingDecisionAcceptance
+from .embedding_decision_options import EmbeddingDecisionOptions
+from .embedding_decision_options_dimensions import EmbeddingDecisionOptionsDimensions
+from .embedding_decision_options_task_type import EmbeddingDecisionOptionsTaskType
 from .embedding_index_activity import EmbeddingIndexActivity
 from .embedding_index_activity_phase import EmbeddingIndexActivityPhase
+from .embedding_multi_choice_answer import EmbeddingMultiChoiceAnswer
+from .embedding_multi_choice_answer_abstention_reason import EmbeddingMultiChoiceAnswerAbstentionReason
+from .embedding_multi_choice_answer_decision_method import EmbeddingMultiChoiceAnswerDecisionMethod
+from .embedding_multi_choice_answer_similarity_metric import EmbeddingMultiChoiceAnswerSimilarityMetric
+from .embedding_multi_choice_answer_similarity_thresholds import EmbeddingMultiChoiceAnswerSimilarityThresholds
+from .embedding_multi_choice_answer_status import EmbeddingMultiChoiceAnswerStatus
+from .embedding_multi_choice_answer_type import EmbeddingMultiChoiceAnswerType
 from .embedding_retrieval_config import EmbeddingRetrievalConfig
 from .embedding_source_coverage_status import EmbeddingSourceCoverageStatus
 from .embedding_type_1 import EmbeddingType1
@@ -351,9 +378,6 @@ from .extraction_constraint_not import ExtractionConstraintNot
 from .extraction_constraint_not_type import ExtractionConstraintNotType
 from .extraction_constraint_or import ExtractionConstraintOr
 from .extraction_constraint_or_type import ExtractionConstraintOrType
-from .extraction_decision import ExtractionDecision
-from .extraction_decision_confidence_method import ExtractionDecisionConfidenceMethod
-from .extraction_decision_type import ExtractionDecisionType
 from .extraction_decoder_options import ExtractionDecoderOptions
 from .extraction_decoder_options_algorithm import ExtractionDecoderOptionsAlgorithm
 from .extraction_entity import ExtractionEntity
@@ -392,7 +416,6 @@ from .extraction_joint_schema import ExtractionJointSchema
 from .extraction_joint_schema_entities import ExtractionJointSchemaEntities
 from .extraction_joint_schema_relations import ExtractionJointSchemaRelations
 from .extraction_label_definition import ExtractionLabelDefinition
-from .extraction_label_probability import ExtractionLabelProbability
 from .extraction_long_document_metadata import ExtractionLongDocumentMetadata
 from .extraction_long_document_metadata_classification_aggregation import (
     ExtractionLongDocumentMetadataClassificationAggregation,
@@ -756,18 +779,8 @@ from .inference_connection import InferenceConnection
 from .inference_connection_models import InferenceConnectionModels
 from .inference_content_security_config import InferenceContentSecurityConfig
 from .inference_credentials import InferenceCredentials
-from .inference_decide_answer import InferenceDecideAnswer
-from .inference_decide_answer_legend import InferenceDecideAnswerLegend
-from .inference_decide_answer_probabilities import InferenceDecideAnswerProbabilities
-from .inference_decide_answer_type import InferenceDecideAnswerType
-from .inference_decide_question import InferenceDecideQuestion
-from .inference_decide_question_criteria_type_0 import InferenceDecideQuestionCriteriaType0
-from .inference_decide_question_type import InferenceDecideQuestionType
 from .inference_decide_request import InferenceDecideRequest
-from .inference_decide_request_questions import InferenceDecideRequestQuestions
 from .inference_decide_response import InferenceDecideResponse
-from .inference_decide_response_answers import InferenceDecideResponseAnswers
-from .inference_decide_response_usage import InferenceDecideResponseUsage
 from .inference_dictate_request import InferenceDictateRequest
 from .inference_dictate_response import InferenceDictateResponse
 from .inference_dictate_response_object import InferenceDictateResponseObject
@@ -785,6 +798,7 @@ from .inference_embed_request_task_type import InferenceEmbedRequestTaskType
 from .inference_embed_response import InferenceEmbedResponse
 from .inference_embed_response_object import InferenceEmbedResponseObject
 from .inference_embedding_batch_summary import InferenceEmbeddingBatchSummary
+from .inference_embedding_group import InferenceEmbeddingGroup
 from .inference_embedding_item_error import InferenceEmbeddingItemError
 from .inference_embedding_item_error_stage import InferenceEmbeddingItemErrorStage
 from .inference_embedding_object import InferenceEmbeddingObject
@@ -992,6 +1006,11 @@ from .multi_batch_request_tables import MultiBatchRequestTables
 from .multi_batch_response import MultiBatchResponse
 from .multi_batch_response_status import MultiBatchResponseStatus
 from .multi_batch_response_tables import MultiBatchResponseTables
+from .multi_choice_decision_question import MultiChoiceDecisionQuestion
+from .multi_choice_decision_question_similarity_thresholds_type_1 import (
+    MultiChoiceDecisionQuestionSimilarityThresholdsType1,
+)
+from .multi_choice_decision_question_type import MultiChoiceDecisionQuestionType
 from .multi_match_body import MultiMatchBody
 from .multi_match_body_type import MultiMatchBodyType
 from .multi_match_query import MultiMatchQuery
@@ -1033,6 +1052,8 @@ from .pattern_step import PatternStep
 from .permission import Permission
 from .permission_type import PermissionType
 from .phrase_query import PhraseQuery
+from .predicate_decision_question import PredicateDecisionQuestion
+from .predicate_decision_question_type import PredicateDecisionQuestionType
 from .prefix_query import PrefixQuery
 from .prune_stats import PruneStats
 from .pruner import Pruner
@@ -1059,7 +1080,7 @@ from .query_evaluation_where import QueryEvaluationWhere
 from .query_expression import QueryExpression
 from .query_expression_call import QueryExpressionCall
 from .query_expression_criteria_type_0 import QueryExpressionCriteriaType0
-from .query_expression_questions import QueryExpressionQuestions
+from .query_expression_questions_item import QueryExpressionQuestionsItem
 from .query_filter_error import QueryFilterError
 from .query_filter_error_error import QueryFilterErrorError
 from .query_filter_error_field import QueryFilterErrorField
@@ -1219,6 +1240,8 @@ from .runtime_decl_mode import RuntimeDeclMode
 from .scan_keys_request import ScanKeysRequest
 from .scoped_row_filter import ScopedRowFilter
 from .scoped_row_filter_filter import ScopedRowFilterFilter
+from .score_decision_question import ScoreDecisionQuestion
+from .score_decision_question_type import ScoreDecisionQuestionType
 from .secret_entry import SecretEntry
 from .secret_list import SecretList
 from .secret_status import SecretStatus
@@ -1361,6 +1384,18 @@ from .topology_changed_error import TopologyChangedError
 from .topology_changed_error_action import TopologyChangedErrorAction
 from .topology_changed_error_error import TopologyChangedErrorError
 from .topology_changed_error_status import TopologyChangedErrorStatus
+from .trained_choice_answer import TrainedChoiceAnswer
+from .trained_choice_answer_confidence_method import TrainedChoiceAnswerConfidenceMethod
+from .trained_choice_answer_decision_method import TrainedChoiceAnswerDecisionMethod
+from .trained_choice_answer_type import TrainedChoiceAnswerType
+from .trained_predicate_answer import TrainedPredicateAnswer
+from .trained_predicate_answer_confidence_method import TrainedPredicateAnswerConfidenceMethod
+from .trained_predicate_answer_decision_method import TrainedPredicateAnswerDecisionMethod
+from .trained_predicate_answer_type import TrainedPredicateAnswerType
+from .trained_score_answer import TrainedScoreAnswer
+from .trained_score_answer_confidence_method import TrainedScoreAnswerConfidenceMethod
+from .trained_score_answer_decision_method import TrainedScoreAnswerDecisionMethod
+from .trained_score_answer_type import TrainedScoreAnswerType
 from .transaction_begin_request import TransactionBeginRequest
 from .transaction_begin_response import TransactionBeginResponse
 from .transaction_commit_request import TransactionCommitRequest
@@ -1542,6 +1577,8 @@ __all__ = (
     "ChatMessageRole",
     "ChatToolName",
     "ChatToolsConfig",
+    "ChoiceDecisionQuestion",
+    "ChoiceDecisionQuestionType",
     "ChunkerConfig",
     "ChunkerConfigFullTextIndex",
     "ChunkerProvider",
@@ -1636,6 +1673,14 @@ __all__ = (
     "DataShapeDecl",
     "DataShapeKind",
     "DateRangeStringQuery",
+    "DecisionBatchItem",
+    "DecisionChoice",
+    "DecisionChoiceProbability",
+    "DecisionInput",
+    "DecisionLevel",
+    "DecisionLevelProbability",
+    "DecisionSimilarity",
+    "DecisionUsage",
     "DeleteArtifactEnrichmentResponse201",
     "DenseNativeStoragePhase",
     "DenseRepairBackpressureError",
@@ -1686,8 +1731,25 @@ __all__ = (
     "EmbedderConfig",
     "EmbedderConfigInputsItem",
     "EmbedderProvider",
+    "EmbeddingChoiceAnswer",
+    "EmbeddingChoiceAnswerAbstentionReason",
+    "EmbeddingChoiceAnswerDecisionMethod",
+    "EmbeddingChoiceAnswerSimilarityMetric",
+    "EmbeddingChoiceAnswerStatus",
+    "EmbeddingChoiceAnswerType",
+    "EmbeddingDecisionAcceptance",
+    "EmbeddingDecisionOptions",
+    "EmbeddingDecisionOptionsDimensions",
+    "EmbeddingDecisionOptionsTaskType",
     "EmbeddingIndexActivity",
     "EmbeddingIndexActivityPhase",
+    "EmbeddingMultiChoiceAnswer",
+    "EmbeddingMultiChoiceAnswerAbstentionReason",
+    "EmbeddingMultiChoiceAnswerDecisionMethod",
+    "EmbeddingMultiChoiceAnswerSimilarityMetric",
+    "EmbeddingMultiChoiceAnswerSimilarityThresholds",
+    "EmbeddingMultiChoiceAnswerStatus",
+    "EmbeddingMultiChoiceAnswerType",
     "EmbeddingRetrievalConfig",
     "EmbeddingsIndexConfig",
     "EmbeddingsIndexStats",
@@ -1784,9 +1846,6 @@ __all__ = (
     "ExtractionConstraintNotType",
     "ExtractionConstraintOr",
     "ExtractionConstraintOrType",
-    "ExtractionDecision",
-    "ExtractionDecisionConfidenceMethod",
-    "ExtractionDecisionType",
     "ExtractionDecoderOptions",
     "ExtractionDecoderOptionsAlgorithm",
     "ExtractionEntity",
@@ -1825,7 +1884,6 @@ __all__ = (
     "ExtractionJointSchemaEntities",
     "ExtractionJointSchemaRelations",
     "ExtractionLabelDefinition",
-    "ExtractionLabelProbability",
     "ExtractionLongDocumentMetadata",
     "ExtractionLongDocumentMetadataClassificationAggregation",
     "ExtractionLongDocumentMetadataDuplicateScore",
@@ -2183,18 +2241,8 @@ __all__ = (
     "InferenceConnectionModels",
     "InferenceContentSecurityConfig",
     "InferenceCredentials",
-    "InferenceDecideAnswer",
-    "InferenceDecideAnswerLegend",
-    "InferenceDecideAnswerProbabilities",
-    "InferenceDecideAnswerType",
-    "InferenceDecideQuestion",
-    "InferenceDecideQuestionCriteriaType0",
-    "InferenceDecideQuestionType",
     "InferenceDecideRequest",
-    "InferenceDecideRequestQuestions",
     "InferenceDecideResponse",
-    "InferenceDecideResponseAnswers",
-    "InferenceDecideResponseUsage",
     "InferenceDictateRequest",
     "InferenceDictateResponse",
     "InferenceDictateResponseObject",
@@ -2205,6 +2253,7 @@ __all__ = (
     "InferenceDictationTranscript",
     "InferenceDictationWord",
     "InferenceEmbeddingBatchSummary",
+    "InferenceEmbeddingGroup",
     "InferenceEmbeddingItemError",
     "InferenceEmbeddingItemErrorStage",
     "InferenceEmbeddingObject",
@@ -2415,6 +2464,9 @@ __all__ = (
     "MultiBatchResponse",
     "MultiBatchResponseStatus",
     "MultiBatchResponseTables",
+    "MultiChoiceDecisionQuestion",
+    "MultiChoiceDecisionQuestionSimilarityThresholdsType1",
+    "MultiChoiceDecisionQuestionType",
     "MultiMatchBody",
     "MultiMatchBodyType",
     "MultiMatchQuery",
@@ -2456,6 +2508,8 @@ __all__ = (
     "Permission",
     "PermissionType",
     "PhraseQuery",
+    "PredicateDecisionQuestion",
+    "PredicateDecisionQuestionType",
     "PrefixQuery",
     "Pruner",
     "PruneStats",
@@ -2482,7 +2536,7 @@ __all__ = (
     "QueryExpression",
     "QueryExpressionCall",
     "QueryExpressionCriteriaType0",
-    "QueryExpressionQuestions",
+    "QueryExpressionQuestionsItem",
     "QueryFilterError",
     "QueryFilterErrorError",
     "QueryFilterErrorField",
@@ -2642,6 +2696,8 @@ __all__ = (
     "ScanKeysRequest",
     "ScopedRowFilter",
     "ScopedRowFilterFilter",
+    "ScoreDecisionQuestion",
+    "ScoreDecisionQuestionType",
     "SecretEntry",
     "SecretList",
     "SecretStatus",
@@ -2784,6 +2840,18 @@ __all__ = (
     "TopologyChangedErrorAction",
     "TopologyChangedErrorError",
     "TopologyChangedErrorStatus",
+    "TrainedChoiceAnswer",
+    "TrainedChoiceAnswerConfidenceMethod",
+    "TrainedChoiceAnswerDecisionMethod",
+    "TrainedChoiceAnswerType",
+    "TrainedPredicateAnswer",
+    "TrainedPredicateAnswerConfidenceMethod",
+    "TrainedPredicateAnswerDecisionMethod",
+    "TrainedPredicateAnswerType",
+    "TrainedScoreAnswer",
+    "TrainedScoreAnswerConfidenceMethod",
+    "TrainedScoreAnswerDecisionMethod",
+    "TrainedScoreAnswerType",
     "TransactionBeginRequest",
     "TransactionBeginResponse",
     "TransactionCommitRequest",

@@ -1978,6 +1978,16 @@ case receives completion credit from this preparation work.
 The combined final gate passes 170 native catalog tests, 22 linked storage
 tests and all 10 coordinator tests without failures or leaks (57/57 build
 steps). Inventory, control-catalog, formatting and whitespace checks pass.
+The branch also merges main's EmbeddingGemma/decision-response changes through
+`d409767dc7`. The sole conflict was the generated Go client's compressed
+OpenAPI blob; regenerating from the merged specification preserves both SQL
+contracts and the new inference types. The complete Go SDK suite passes with
+loopback test servers enabled. The focused SQL decision/INSERT gate passes all
+28 contracts across compiler, native runtime, streaming, conditional provider
+evaluation, mutation atomicity, allocation faults and request validation.
+Post-merge native validation also passes 170 catalog, 22 linked storage and
+10 coordinator tests (57/57 build steps), with inventory, control-catalog,
+formatting and whitespace checks passing on the merged tree.
 The owned table-cut projector can now combine an exact predecessor definition
 with a plan-fenced successor definition in expected linear time. It retains
 old-only active names, both owners for shared names and pending-only new names,

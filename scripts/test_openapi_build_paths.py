@@ -36,6 +36,26 @@ with patch.object(sys, "path", [str(Path(__file__).resolve().parent), *sys.path]
 
 
 class OpenApiBuildPathsTest(unittest.TestCase):
+    def test_decisions_have_one_public_endpoint_and_no_extraction_aliases(self):
+        joined = join_public_openapi.join_specs()
+        self.assertIn("/ai/v1/decisions", joined["paths"])
+        self.assertNotIn("/ai/v1/decide", joined["paths"])
+        schemas = joined["components"]["schemas"]
+        request = schemas["InferenceDecideRequest"]
+        self.assertEqual(request["properties"]["questions"]["type"], "array")
+        self.assertIn("input", request["properties"])
+        self.assertNotIn("state", request["properties"])
+        self.assertNotIn("decisions", schemas["ExtractionObject"]["properties"])
+        self.assertNotIn("embedding", schemas["ExtractionOptions"]["properties"])
+        self.assertNotIn("similarity_thresholds", schemas["ExtractionClassificationSchema"]["properties"])
+        self.assertNotIn("similarity", schemas["ExtractionClassification"]["properties"])
+        self.assertEqual(schemas["ExtractionClassificationSchema"]["properties"]["mode"]["enum"], ["single", "multi"])
+        acceptance = schemas["EmbeddingDecisionAcceptance"]["properties"]
+        self.assertIn("calibration_id", acceptance)
+        self.assertIn("second-highest", acceptance["min_margin"]["description"])
+        answer_refs = schemas["InferenceDecideAnswer"]["oneOf"]
+        self.assertEqual(len(answer_refs), 5)
+
     def test_joined_relational_query_preserves_optional_zero_epoch(self):
         # Exercise the authoritative metadata input and join pipeline, not a
         # manually modified generated root spec that make generate overwrites.
