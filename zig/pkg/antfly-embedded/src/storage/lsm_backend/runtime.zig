@@ -6362,6 +6362,8 @@ const AsyncPointBlockRead = struct {
     decoded_handle: ?cache_mod.Handle = null,
     future: ?storage_io.RangeReadFuture = null,
     shared_block: ?*BatchAsyncBlock = null,
+    // Borrowed only within the synchronous batch; physical futures never retain it.
+    control: ?read_admission.Port = null,
 
     fn release(self: *AsyncPointBlockRead) void {
         if (self.shared_block) |block| {
@@ -6419,6 +6421,7 @@ const BatchAsyncBlocks = struct {
     allocator: Allocator,
     scratch_allocator: ?Allocator = null,
     limit: usize = max_point_async_stack_reads,
+    control: ?read_admission.Port = null,
     decoded_bytes: usize = 0,
     prefix_key_bytes: usize = 0,
 
@@ -6564,10 +6567,39 @@ fn prepareAsyncPointBlockRead(
     key: []const u8,
     shared: ?*BatchAsyncBlocks,
 ) !?AsyncPointBlockRead {
+    return prepareAsyncPointBlockReadWithAdmission(backend, runs, candidate, namespace, key, shared, null);
+}
+
+fn prepareAsyncPointBlockReadWithAdmission(
+    backend: anytype,
+    runs: []Run,
+    candidate: PointRunCandidate,
+    namespace: backend_types.Namespace,
+    key: []const u8,
+    shared: ?*BatchAsyncBlocks,
+    control: ?read_admission.Port,
+) !?AsyncPointBlockRead {
+    if (control) |budget| try budget.checkpoint();
+    var read = (try prepareAsyncPointBlockReadControlled(backend, runs, candidate, namespace, key, shared, control)) orelse return null;
+    errdefer read.release();
+    read.control = control;
+    if (control) |budget| try budget.checkpoint();
+    return read;
+}
+
+fn prepareAsyncPointBlockReadControlled(
+    backend: anytype,
+    runs: []Run,
+    candidate: PointRunCandidate,
+    namespace: backend_types.Namespace,
+    key: []const u8,
+    shared: ?*BatchAsyncBlocks,
+    control: ?read_admission.Port,
+) !?AsyncPointBlockRead {
     const cache = backend.options.cache orelse return null;
     const run = &runs[candidate.run_index];
     const path = run.path orelse return null;
-    var index_handle = try loadRunTableIndexHandle(backend, run);
+    var index_handle = try loadRunTableIndexHandleWithAdmission(backend, run, control);
     errdefer index_handle.release();
     const index = index_handle.runTableIndex();
     const block_index = index.findBlockIndex(namespace.name, key) orelse {
@@ -6614,7 +6646,7 @@ fn prepareAsyncPointBlockRead(
         };
     };
     if (shared) |pool| pool.prepareInsert();
-    if (cache.retainRunTableBlock(path, run.id, backend.root_generation, absolute_offset, physical_len)) |handle| {
+    if (try cache.retainRunTableBlockWithAdmission(path, run.id, backend.root_generation, absolute_offset, physical_len, control)) |handle| {
         backend.recordSharedBlockCacheHit();
         return .{
             .candidate = candidate,
@@ -6632,7 +6664,7 @@ fn prepareAsyncPointBlockRead(
             .decoded_handle = handle,
         };
     }
-    if (cache.retainRunTablePhysicalBlock(path, run.id, backend.root_generation, absolute_offset, physical_len)) |handle| {
+    if (try cache.retainRunTablePhysicalBlockWithAdmission(path, run.id, backend.root_generation, absolute_offset, physical_len, control)) |handle| {
         backend.recordSharedBlockCacheHit();
         return .{
             .candidate = candidate,
@@ -6652,7 +6684,10 @@ fn prepareAsyncPointBlockRead(
     }
 
     backend.recordSharedBlockCacheMiss();
-    var future = try backend.storage.?.beginReadFileRangeAllocWithRuntime(backend.options.read_runtime, cache.valueAllocator(), path, absolute_offset, physical_len);
+    var future = if (control) |budget|
+        try backend.storage.?.beginReadFileRangeAllocWithAdmission(backend.options.read_runtime, cache.valueAllocator(), path, absolute_offset, physical_len, budget)
+    else
+        try backend.storage.?.beginReadFileRangeAllocWithRuntime(backend.options.read_runtime, cache.valueAllocator(), path, absolute_offset, physical_len);
     errdefer future.cancel();
     return .{
         .candidate = candidate,
@@ -6682,21 +6717,21 @@ fn payloadForAsyncPointRead(
     var future = read.future orelse return error.RunStateUnavailable;
     read.future = null;
     const start_ns = backend.readStatsNowNs();
-    const bytes = future.wait() catch |err| {
+    const bytes = (if (read.control) |control| future.waitWithAdmission(cache.valueAllocator(), control) else future.wait()) catch |err| {
         backend.recordPointRunAsyncWait(backend.readStatsElapsedNs(start_ns));
         return err;
     };
     const elapsed_ns = backend.readStatsElapsedNs(start_ns);
     backend.recordPointRunAsyncWait(elapsed_ns);
     backend.recordTableBlockLoad(bytes.len, elapsed_ns);
-    lsm_table_file.validateBlockPayload(bytes, read.checksum) catch |err| {
+    lsm_table_file.validateBlockPayloadWithAdmission(bytes, read.checksum, read.control) catch |err| {
         cache.valueAllocator().free(bytes);
         return err;
     };
     read.physical_handle = if (read.retain_block)
-        try cache.putRunTablePhysicalBlock(read.path, read.run_id, read.generation, read.absolute_offset, read.physical_len, bytes)
+        try cache.putRunTablePhysicalBlockWithAdmission(read.path, read.run_id, read.generation, read.absolute_offset, read.physical_len, bytes, read.control)
     else
-        try cache.putTransientRunTablePhysicalBlock(read.path, read.run_id, read.generation, read.absolute_offset, read.physical_len, bytes);
+        try cache.putTransientRunTablePhysicalBlockWithAdmission(read.path, read.run_id, read.generation, read.absolute_offset, read.physical_len, bytes, read.control);
     return read.physical_handle.?.runTablePhysicalBlock();
 }
 
@@ -6824,6 +6859,7 @@ fn consumeAsyncPointReadWithScratch(
     shared: ?*BatchAsyncBlocks,
     scratch: Allocator,
 ) !?AsyncPointLookupResult {
+    if (read.control) |budget| try budget.checkpoint();
     backend.recordPointRunSurvivorRead();
     if (read.status == .known_miss) {
         backend.recordPointRunSurvivorMiss();
@@ -6992,7 +7028,7 @@ fn startBatchAsyncPointSlot(
     const candidate = slot.candidates.next(runs, levels, namespace, keys[slot.key_index]) orelse return false;
     backend.recordRunProbe();
     recordPointRunPrecheck(backend);
-    var prepared = (try prepareAsyncPointBlockRead(backend, runs, candidate, namespace, keys[slot.key_index], shared)) orelse return error.RunStateUnavailable;
+    var prepared = (try prepareAsyncPointBlockReadWithAdmission(backend, runs, candidate, namespace, keys[slot.key_index], shared, shared.control)) orelse return error.RunStateUnavailable;
     if (prepared.status != .known_miss) recordPointRunPrecheckSurvivor(backend);
     if (prepared.status == .future) issued_count.* += 1;
     if (prepared.status != .known_miss and prepared.shared_block == null) {
@@ -7030,6 +7066,7 @@ fn fillBatchAsyncPointSlot(
     shared: *BatchAsyncBlocks,
 ) !bool {
     while (next_key.* < keys.len) {
+        if (shared.control) |budget| try budget.checkpoint();
         const i = next_key.*;
         next_key.* += 1;
         const key = keys[i];
@@ -7073,6 +7110,26 @@ fn readManySortedPointFromSnapshotAsync(
     backend_locked: bool,
     result_lifetime: PointResultLifetime,
 ) !?BatchCursorReadResult {
+    return readManySortedPointFromSnapshotAsyncWithAdmission(backend, mutable, immutable_memtables, runs, l0_groups, levels, allocator, held_values, namespace, keys, values, backend_locked, result_lifetime, null);
+}
+
+fn readManySortedPointFromSnapshotAsyncWithAdmission(
+    backend: anytype,
+    mutable: anytype,
+    immutable_memtables: []const *const State,
+    runs: []Run,
+    l0_groups: []const RunGroup,
+    levels: []const RunLevel,
+    allocator: Allocator,
+    held_values: *std.ArrayListUnmanaged([]u8),
+    namespace: backend_types.Namespace,
+    keys: []const []const u8,
+    values: []?[]const u8,
+    backend_locked: bool,
+    result_lifetime: PointResultLifetime,
+    control: ?read_admission.Port,
+) !?BatchCursorReadResult {
+    if (control) |budget| try budget.checkpoint();
     if (backend_locked or keys.len < 2 or backend.storage == null or backend.options.cache == null) return null;
     const async_lease = acquirePointAsyncBatchLease(backend);
     defer releasePointAsyncBatchLease(backend, async_lease);
@@ -7086,7 +7143,7 @@ fn readManySortedPointFromSnapshotAsync(
     defer if (decode_budget) |*budget| budget.deinit();
     var scratch = PointReadScratch.init(backend);
     defer scratch.deinit();
-    var shared: BatchAsyncBlocks = .{ .allocator = if (decode_budget) |*budget| budget.allocator() else runtimeScratchAllocator(allocator), .scratch_allocator = scratch.allocator(), .limit = configured_limit };
+    var shared: BatchAsyncBlocks = .{ .allocator = if (decode_budget) |*budget| budget.allocator() else runtimeScratchAllocator(allocator), .scratch_allocator = scratch.allocator(), .limit = configured_limit, .control = control };
     defer shared.deinit();
     var slots: [max_point_async_stack_reads]BatchAsyncPointSlot = undefined;
     for (slots[0..configured_limit]) |*slot| slot.* = .{};
@@ -7104,6 +7161,7 @@ fn readManySortedPointFromSnapshotAsync(
         const slot = &slots[cursor];
         cursor = (cursor + 1) % configured_limit;
         if (!slot.active) continue;
+        if (control) |budget| try budget.checkpoint();
         const key_index = slot.key_index;
         const deciding_run_index = slot.read.candidate.run_index;
         scratch.resetDenial();
@@ -7129,6 +7187,7 @@ fn readManySortedPointFromSnapshotAsync(
         if (!try fillBatchAsyncPointSlot(backend, mutable, immutable_memtables, runs, l0_groups, levels, allocator, held_values, namespace, keys, values, result_lifetime, &next_key, &result, slot, &issued_count, &shared)) active_slots -= 1;
     }
     backend.recordPointRunAsyncBatch(issued_count);
+    if (control) |budget| try budget.checkpoint();
     return result;
 }
 
@@ -11661,4 +11720,47 @@ test "lsm shared cold async batch promotes within a tight aggregate budget" {
     try std.testing.expectEqual(@as(u64, 1), backend.snapshotReadStats().table_block_loads - before);
     try std.testing.expect(manager.snapshot().memory.peak_bytes <= 24 * 1024);
     try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.accounting_errors);
+}
+
+/// Exercises the real fixed-size shared pipeline without exporting an authority
+/// borrow into a persistent read handle. Runtime callers still need forwarding.
+pub fn qualifyControlledAsyncBatch(control: read_admission.Port) !void {
+    if (!builtin.is_test) @compileError("test fixture only");
+    const B = @import("../lsm_backend.zig").Backend;
+    const a = std.testing.allocator;
+    var storage = storage_io.MemoryStorage.init(a);
+    defer storage.deinit();
+    var cache = cache_mod.Cache.init(a, 1024 * 1024);
+    defer cache.deinit();
+    var backend = try B.open(a, "/controlled-async-batch", .{ .storage = storage.storage(), .cache = &cache, .flush_threshold = 1, .max_concurrent_point_block_reads = 16 });
+    defer backend.close();
+    var store = try backend.runtimeStore(a, .{ .name = "docs" });
+    defer store.deinit();
+    var key_bytes: [16][64]u8 = undefined;
+    var keys: [16][]const u8 = undefined;
+    var write = try store.beginWrite();
+    for (&keys, 0..) |*key, i| {
+        key.* = try std.fmt.bufPrint(&key_bytes[i], "document:long-shared-prefix-for-compression:{d:0>4}", .{i});
+        try write.put(key.*, key.*);
+    }
+    try write.commit();
+    var runs = [_]Run{backend.runs.at(0).*};
+    var handle = try loadRunTableIndexHandle(&backend, &runs[0]);
+    try std.testing.expectEqual(@as(usize, 1), handle.runTableIndex().blocks.len);
+    handle.release();
+    const groups = try buildL0RunGroups(a, &runs);
+    defer deinitRunGroups(a, groups);
+    const levels = try buildLowerLevels(a, &runs);
+    defer a.free(levels);
+    const empty: State = .{};
+    var values: [16]?[]const u8 = @splat(null);
+    var held: std.ArrayListUnmanaged([]u8) = .empty;
+    defer releaseHeldValues(&held, a);
+    const before = backend.snapshotReadStats().table_block_loads;
+    const result = (try readManySortedPointFromSnapshotAsyncWithAdmission(&backend, &empty, &.{}, &runs, groups, levels, a, &held, .{ .name = "docs" }, &keys, &values, false, .snapshot_pinned, control)).?;
+    try std.testing.expectEqual(keys.len, result.hits);
+    try std.testing.expectEqual(@as(usize, 0), result.misses);
+    try std.testing.expectEqual(@as(u64, 1), backend.snapshotReadStats().table_block_loads - before);
+    cache.invalidatePrefix("/controlled-async-batch");
+    for (values, keys) |value, key| try std.testing.expectEqualStrings(key, value.?);
 }

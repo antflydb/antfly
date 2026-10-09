@@ -556,6 +556,10 @@ pub const Cache = struct {
         return self.retainWithBlock(path, run_id, generation, .run_table_physical_block, block_offset, block_len);
     }
 
+    pub fn retainRunTablePhysicalBlockWithAdmission(self: *Cache, path: []const u8, run_id: u64, generation: u64, block_offset: u64, block_len: u32, control: ?read_admission.Port) !?Handle {
+        return self.retainWithBlockControlled(path, run_id, generation, .run_table_physical_block, block_offset, block_len, control);
+    }
+
     pub fn retainRunTableRawWithAdmission(self: *Cache, path: []const u8, run_id: u64, generation: u64, control: ?read_admission.Port) !?Handle {
         return self.retainWithBlockControlled(path, run_id, generation, .run_table_raw, 0, 0, control);
     }
@@ -919,6 +923,15 @@ pub const Cache = struct {
     }
     pub fn putTransientRunTableBlockWithAdmission(self: *Cache, path: []const u8, run_id: u64, generation: u64, block_offset: u64, block_len: u32, block: []u8, control: ?read_admission.Port) !Handle {
         const handle = try self.putWithBlockControlled(path, run_id, generation, .{ .run_table_block = block }, estimateRawTableCost(path, block), block_offset, block_len, true, control);
+        return self.finishPublicationWithAdmission(handle, control);
+    }
+
+    pub fn putRunTablePhysicalBlockWithAdmission(self: *Cache, path: []const u8, run_id: u64, generation: u64, block_offset: u64, block_len: u32, block: []u8, control: ?read_admission.Port) !Handle {
+        const handle = try self.putWithBlockControlled(path, run_id, generation, .{ .run_table_physical_block = block }, estimateRawTableCost(path, block), block_offset, block_len, false, control);
+        return self.finishPublicationWithAdmission(handle, control);
+    }
+    pub fn putTransientRunTablePhysicalBlockWithAdmission(self: *Cache, path: []const u8, run_id: u64, generation: u64, block_offset: u64, block_len: u32, block: []u8, control: ?read_admission.Port) !Handle {
+        const handle = try self.putWithBlockControlled(path, run_id, generation, .{ .run_table_physical_block = block }, estimateRawTableCost(path, block), block_offset, block_len, true, control);
         return self.finishPublicationWithAdmission(handle, control);
     }
 
