@@ -1,36 +1,95 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
 const std = @import("std");
+const layout = @import("h264_layout.zig");
 const motion = @import("h264_motion.zig");
 const weights = @import("h264_weights.zig");
 const Syntax = @import("h264_entropy.zig").Syntax;
-const State = @import("h264_references.zig").State;
 const Part = struct { x: usize, y: usize, width: usize, height: usize, group: usize, mask: u2 = 1, direct: bool = false };
-fn neighbor(motions: []const motion.Motion, stride: usize, x: usize, y: usize, top: bool) motion.Motion {
-    if (if (top) y == 0 else x == 0) return .{};
-    return motions[(y - @as(usize, @intFromBool(top))) * stride + x - @as(usize, @intFromBool(!top))];
+fn readMotion(syntax: *Syntax, motions: []const motion.Motion, x: i32, y: i32, require_decoded: bool, top: bool) ?motion.Motion {
+    const point = layout.cellSample(syntax.meta, syntax.width, syntax.chroma_format, syntax.paired, syntax.field, syntax.parity, 0, x * 4, y * 4 + (if (top) @as(i32, 3) else 0)) orelse return null;
+    const meta = syntax.meta[point.mb];
+    if (meta.kind == 255 or meta.slice_id != syntax.slice_id) return null;
+    var m = motions[point.index];
+    if ((require_decoded and !m.decoded) or m.reference == -2) return null;
+    if (syntax.meta[point.mb].field != syntax.field) {
+        if (syntax.field) {
+            m.vector.y = @divTrunc(m.vector.y, 2);
+            m.difference.y = @divTrunc(m.difference.y, 2);
+            if (m.reference >= 0) m.reference *= 2;
+        } else {
+            m.vector.y *= 2;
+            m.difference.y *= 2;
+            if (m.reference >= 0) m.reference = @divTrunc(m.reference, 2);
+        }
+    }
+    return m;
 }
-fn fill(motions: []motion.Motion, stride: usize, x: usize, y: usize, part: Part, value: motion.Motion) void {
+fn candidate(syntax: *Syntax, motions: []const motion.Motion, x: i32, y: i32, top: bool) ?motion.Motion {
+    return readMotion(syntax, motions, x, y, true, top);
+}
+fn neighbor(syntax: *Syntax, motions: []const motion.Motion, stride: usize, x: usize, y: usize, top: bool) motion.Motion {
+    _ = stride;
+    return readMotion(syntax, motions, @as(i32, @intCast(x)) - @as(i32, @intFromBool(!top)), @as(i32, @intCast(y)) - @as(i32, @intFromBool(top)), false, top) orelse .{};
+}
+fn median(a: i32, b: i32, c: i32) i32 {
+    return a + b + c - @min(a, @min(b, c)) - @max(a, @max(b, c));
+}
+fn predictor(syntax: *Syntax, motions: []const motion.Motion, stride: usize, x: usize, y: usize, width: usize, height: usize, reference: i8, skipped: bool) motion.Vector {
+    _ = stride;
+    const ix: i32 = @intCast(x);
+    const iy: i32 = @intCast(y);
+    const a = candidate(syntax, motions, ix - 1, iy, false);
+    const b = candidate(syntax, motions, ix, iy - 1, true);
+    const c = candidate(syntax, motions, ix + @as(i32, @intCast(width)), iy - 1, true) orelse candidate(syntax, motions, ix - 1, iy - 1, true);
+    if (skipped and (a == null or b == null or (a.?.reference == 0 and a.?.vector.x == 0 and a.?.vector.y == 0) or (b.?.reference == 0 and b.?.vector.x == 0 and b.?.vector.y == 0))) return .{};
+    if (width == 4 and height == 2) {
+        const preferred = if (y % 4 == 0) b else a;
+        if (preferred) |m| if (m.reference == reference) return m.vector;
+    }
+    if (width == 2 and height == 4) {
+        const preferred = if (x % 4 == 0) a else c;
+        if (preferred) |m| if (m.reference == reference) return m.vector;
+    }
+    if (b == null and c == null) return if (a) |m| m.vector else .{};
+    var matched: usize = 0;
+    var selected = motion.Vector{};
+    for ([_]?motion.Motion{ a, b, c }) |value| if (value) |m| if (m.reference == reference) {
+        matched += 1;
+        selected = m.vector;
+    };
+    if (matched == 1) return selected;
+    const av = if (a) |m| m.vector else motion.Vector{};
+    const bv = if (b) |m| m.vector else motion.Vector{};
+    const cv = if (c) |m| m.vector else motion.Vector{};
+    return .{ .x = median(av.x, bv.x, cv.x), .y = median(av.y, bv.y, cv.y) };
+}
+fn fill(syntax: *Syntax, motions: []motion.Motion, stride: usize, x: usize, y: usize, part: Part, value: motion.Motion) void {
+    _ = stride;
     for (0..part.height) |row| for (0..part.width) |column| {
-        motions[(y + part.y + row) * stride + x + part.x + column] = value;
+        motions[syntax.cellIndex(0, x + part.x + column, y + part.y + row)] = value;
     };
 }
-fn colocated(state: *State, stride: usize, mx: usize, my: usize, part: Part, direct8: bool) !struct { value: motion.Motion, id: u32, poc: i32 } {
-    if (state.list_count == 0 or state.list1[0] >= state.count) return error.MissingVideoReference;
-    const pic = state.pictures[state.list1[0]];
+fn colocated(syntax: *Syntax, state: anytype, stride: usize, mx: usize, my: usize, part: Part, direct8: bool) !struct { value: motion.Motion, id: u32, poc: i32 } {
+    const pic = state.pictures[try state.referenceIndex(1, 0)];
     const x = if (direct8) part.x / 2 * 3 else part.x;
     const y = if (direct8) part.y / 2 * 3 else part.y;
-    const index = (my + y) * stride + mx + x;
+    const point = layout.cell(pic.meta, stride * 4, 1, pic.paired, syntax.field, try state.referenceParity(1, 0), 0, @intCast(mx + x), @intCast(my + y)) orelse return error.MalformedVideoPacket;
+    const index = point.index;
     const list: usize = if (pic.motions[0][index].reference >= 0) 0 else 1;
-    const m = pic.motions[list][index];
-    return .{ .value = m, .id = if (m.reference >= 0) pic.list_ids[list][@intCast(m.reference)] else std.math.maxInt(u32), .poc = pic.poc };
+    var m = pic.motions[list][index];
+    if (pic.meta[point.mb].field != syntax.field) {
+        m.vector.y = if (syntax.field) @divTrunc(m.vector.y, 2) else m.vector.y * 2;
+    }
+    const id = if (syntax.field) m.identity / 4 * 4 + 2 + (if (m.identity % 4 >= 2) m.identity % 2 else syntax.parity) else m.identity / 4 * 4;
+    return .{ .value = m, .id = if (m.reference >= 0) @as(u32, @intCast(id)) else std.math.maxInt(u32), .poc = if (syntax.field) pic.field_poc[try state.referenceParity(1, 0)] else pic.poc };
 }
-fn direct(state: *State, motions: [2][]motion.Motion, stride: usize, mx: usize, my: usize, part: Part, spatial: bool, direct8: bool, refs: [2]i8, predictors: [2]motion.Vector) !void {
-    const col = try colocated(state, stride, mx, my, part, direct8);
+fn direct(syntax: *Syntax, state: anytype, motions: [2][]motion.Motion, stride: usize, mx: usize, my: usize, part: Part, spatial: bool, direct8: bool, refs: [2]i8, predictors: [2]motion.Vector) !void {
+    const col = try colocated(syntax, state, stride, mx, my, part, direct8);
     var selected = refs;
     var vectors = predictors;
     if (spatial) {
-        const zero = state.pictures[state.list1[0]].long_term == null and col.value.reference == 0 and @abs(col.value.vector.x) <= 1 and @abs(col.value.vector.y) <= 1;
+        const zero = state.pictures[try state.referenceIndex(1, 0)].long_term == null and col.value.reference == 0 and @abs(col.value.vector.x) <= 1 and @abs(col.value.vector.y) <= 1;
         for (0..2) |list| if (selected[list] == 0 and zero) {
             vectors[list] = .{};
         };
@@ -39,56 +98,73 @@ fn direct(state: *State, motions: [2][]motion.Motion, stride: usize, mx: usize, 
         vectors = .{ .{}, .{} };
         if (col.value.reference >= 0) {
             var found = false;
-            for (0..state.list_count) |i| if (state.list0[i] < state.count and state.pictures[state.list0[i]].id == col.id) {
+            for (0..state.referenceCount(0)) |i| if (try identity(state, 0, @intCast(i)) == col.id) {
                 selected[0] = @intCast(i);
                 found = true;
                 break;
             };
             if (!found) return error.MissingVideoReference;
-            const first = state.pictures[state.list0[@intCast(selected[0])]];
-            const scale = if (first.long_term != null) @as(i32, 256) else weights.distance(state.current_poc, first.poc, col.poc);
+            const first = state.pictures[try state.referenceIndex(0, @intCast(selected[0]))];
+            const scale = if (first.long_term != null) @as(i32, 256) else weights.distance(currentPoc(state), try referencePoc(state, 0, @intCast(selected[0])), col.poc);
             vectors[0] = .{ .x = (scale * col.value.vector.x + 128) >> 8, .y = (scale * col.value.vector.y + 128) >> 8 };
             vectors[1] = .{ .x = vectors[0].x - col.value.vector.x, .y = vectors[0].y - col.value.vector.y };
         }
     }
-    for (0..2) |list| fill(motions[list], stride, mx, my, part, .{ .decoded = true, .direct = true, .reference = selected[list], .vector = vectors[list] });
+    for (0..2) |list| fill(syntax, motions[list], stride, mx, my, part, .{ .decoded = true, .identity = try identity(state, list, selected[list]), .direct = true, .reference = selected[list], .vector = vectors[list] });
 }
-fn compensate(state: *State, planes: [3][]u8, motions: [2][]motion.Motion, width: usize, height: usize, mx: usize, my: usize, part: Part) !void {
-    const m = [2]motion.Motion{ motions[0][(my + part.y) * (width / 4) + mx + part.x], motions[1][(my + part.y) * (width / 4) + mx + part.x] };
-    var references: [2][3][]const u8 = undefined;
+fn compensate(syntax: *Syntax, state: anytype, planes: anytype, motions: [2][]motion.Motion, width: usize, height: usize, mx: usize, my: usize, part: Part, bit_depth: u8, chroma_format: u8) !void {
+    const m = [2]motion.Motion{ motions[0][syntax.cellIndex(0, mx + part.x, my + part.y)], motions[1][syntax.cellIndex(0, mx + part.x, my + part.y)] };
+    const Sample = layout.Sample(@TypeOf(planes[0]));
+    var references: [2][3]layout.View(Sample) = undefined;
     for (0..2) |list| if (m[list].reference >= 0) {
-        references[list] = try state.planes(list, @intCast(m[list].reference), width, height);
+        const reference: usize = @intCast(m[list].reference);
+        const data = try state.planes(list, reference, width, height);
+        for (0..3) |p| references[list][p] = .{ .data = data[p], .width = width / (if (p == 0 or chroma_format == 3) @as(usize, 1) else 2), .height = height / (if (p == 0 or chroma_format != 1) @as(usize, 1) else 2) / (if (state.field_mode) @as(usize, 2) else 1), .field = state.field_mode, .parity = try state.referenceParity(list, reference) };
     };
     if (m[0].reference < 0 and m[1].reference < 0) return error.MissingVideoReference;
     for (0..3) |p| {
-        const divisor: usize = if (p == 0) 1 else 2;
+        const divisor: usize = if (p == 0 or chroma_format == 3) 1 else 2;
         const stride = width / divisor;
-        for (0..part.height * 4 / divisor) |row| for (0..part.width * 4 / divisor) |column| {
+        const sub_y: usize = if (p == 0 or chroma_format >= 2) 1 else 2;
+        for (0..part.height * 4 / sub_y) |row| for (0..part.width * 4 / divisor) |column| {
             const x = (mx + part.x) * 4 / divisor + column;
-            const y = (my + part.y) * 4 / divisor + row;
-            var values: [2]u8 = .{ 0, 0 };
+            const y = (my + part.y) * 4 / sub_y + row;
+            var values: [2]Sample = .{ 0, 0 };
             for (0..2) |list| if (m[list].reference >= 0) {
-                values[list] = motion.pixel(references[list][p], stride, x, y, m[list].vector, p != 0);
+                values[list] = motion.pixel(references[list][p], stride, x, y, .{ .x = m[list].vector.x, .y = m[list].vector.y * (if (p != 0 and chroma_format == 2) @as(i32, 2) else 1) + (if (p != 0 and chroma_format == 1 and state.field_mode) 2 * (@as(i32, @intCast(state.field_parity)) - @as(i32, @intCast(references[list][p].parity))) else 0) }, p != 0 and chroma_format != 3, bit_depth);
             };
-            var value: u8 = undefined;
+            var value: Sample = undefined;
             if (m[0].reference >= 0 and m[1].reference >= 0) {
                 value = switch (state.weight_mode) {
-                    .none => @intCast((@as(u16, values[0]) + values[1] + 1) / 2),
-                    .explicit => weights.pair(values[0], values[1], state.weights[0][@intCast(m[0].reference)][p], state.weights[1][@intCast(m[1].reference)][p]),
-                    .implicit => if (state.pictures[state.list0[@intCast(m[0].reference)]].long_term != null or state.pictures[state.list1[@intCast(m[1].reference)]].long_term != null) @intCast((@as(u16, values[0]) + values[1] + 1) / 2) else weights.implicit(values[0], values[1], state.current_poc, state.pictures[state.list0[@intCast(m[0].reference)]].poc, state.pictures[state.list1[@intCast(m[1].reference)]].poc),
+                    .none => @intCast((@as(u32, values[0]) + values[1] + 1) / 2),
+                    .explicit => weights.pairDepth(values[0], values[1], state.weights[0][@as(usize, @intCast(m[0].reference)) / (if (state.field_mode and !state.field_picture) @as(usize, 2) else 1)][p], state.weights[1][@as(usize, @intCast(m[1].reference)) / (if (state.field_mode and !state.field_picture) @as(usize, 2) else 1)][p], bit_depth),
+                    .implicit => if (state.pictures[try state.referenceIndex(0, @intCast(m[0].reference))].long_term != null or state.pictures[try state.referenceIndex(1, @intCast(m[1].reference))].long_term != null) @intCast((@as(u32, values[0]) + values[1] + 1) / 2) else weights.implicitDepth(values[0], values[1], currentPoc(state), try referencePoc(state, 0, @intCast(m[0].reference)), try referencePoc(state, 1, @intCast(m[1].reference)), bit_depth),
                 };
             } else {
                 const list: usize = if (m[0].reference >= 0) 0 else 1;
-                value = if (state.weight_mode == .explicit) weights.single(values[list], state.weights[list][@intCast(m[list].reference)][p]) else values[list];
+                value = if (state.weight_mode == .explicit) weights.singleDepth(values[list], state.weights[list][@as(usize, @intCast(m[list].reference)) / (if (state.field_mode and !state.field_picture) @as(usize, 2) else 1)][p], bit_depth) else values[list];
             }
-            planes[p][y * stride + x] = value;
+            layout.put(planes[p], y * stride + x, value);
         };
     }
 }
-pub fn predict(syntax: *Syntax, state: *State, planes: [3][]u8, motions: [2][]motion.Motion, width: usize, height: usize, kind: u32, active: [2]usize, skipped: bool, spatial: bool, direct8: bool) !bool {
+fn identity(state: anytype, list: usize, reference: i8) !u32 {
+    if (reference < 0) return std.math.maxInt(u32);
+    const index = try state.referenceIndex(list, @intCast(reference));
+    return state.pictures[index].id * 4 + (if (state.field_mode) @as(u32, @intCast(2 + try state.referenceParity(list, @intCast(reference)))) else 0);
+}
+fn currentPoc(state: anytype) i32 {
+    return if (state.field_mode) state.current_field_poc[state.field_parity] else state.current_poc;
+}
+fn referencePoc(state: anytype, list: usize, reference: usize) !i32 {
+    const pic = state.pictures[try state.referenceIndex(list, reference)];
+    return if (state.field_mode) pic.field_poc[try state.referenceParity(list, reference)] else pic.poc;
+}
+
+pub fn predict(syntax: *Syntax, state: anytype, planes: anytype, motions: [2][]motion.Motion, width: usize, height: usize, kind: u32, active: [2]usize, skipped: bool, spatial: bool, direct8: bool, bit_depth: u8, chroma_format: u8) !bool {
     const b = syntax.slice_type == 1;
-    const mx = syntax.mb % (width / 16) * 4;
-    const my = syntax.mb / (width / 16) * 4;
+    const mx = syntax.x;
+    const my = syntax.y;
     const stride = width / 4;
     var parts: [16]Part = undefined;
     var count: usize = 0;
@@ -130,13 +206,13 @@ pub fn predict(syntax: *Syntax, state: *State, planes: [3][]u8, motions: [2][]mo
     var direct_predictions: [2]motion.Vector = .{ .{}, .{} };
     if (b and spatial) {
         for (0..2) |list| {
-            const a = neighbor(motions[list], stride, mx, my, false);
-            const top = neighbor(motions[list], stride, mx, my, true);
-            const c = motion.available(motions[list], stride, @intCast(mx + 4), @as(i32, @intCast(my)) - 1) orelse motion.available(motions[list], stride, @as(i32, @intCast(mx)) - 1, @as(i32, @intCast(my)) - 1) orelse motion.Motion{};
+            const a = neighbor(syntax, motions[list], stride, mx, my, false);
+            const top = neighbor(syntax, motions[list], stride, mx, my, true);
+            const c = candidate(syntax, motions[list], @intCast(mx + 4), @as(i32, @intCast(my)) - 1, true) orelse candidate(syntax, motions[list], @as(i32, @intCast(mx)) - 1, @as(i32, @intCast(my)) - 1, true) orelse motion.Motion{};
             for ([_]motion.Motion{ a, top, c }) |m| if (m.decoded and m.reference >= 0 and (direct_refs[list] < 0 or m.reference < direct_refs[list])) {
                 direct_refs[list] = m.reference;
             };
-            if (direct_refs[list] >= 0) direct_predictions[list] = motion.predictor(motions[list], stride, mx, my, 4, 4, direct_refs[list], false);
+            if (direct_refs[list] >= 0) direct_predictions[list] = predictor(syntax, motions[list], stride, mx, my, 4, 4, direct_refs[list], false);
         }
         if (direct_refs[0] < 0 and direct_refs[1] < 0) direct_refs = .{ 0, 0 };
     }
@@ -151,39 +227,39 @@ pub fn predict(syntax: *Syntax, state: *State, planes: [3][]u8, motions: [2][]mo
         if (part.direct or part.mask & (@as(u2, 1) << @as(u1, @intCast(list))) == 0) continue;
         const bx = mx + part.x;
         const by = my + part.y;
-        const left = neighbor(motions[list], stride, bx, by, false);
-        const top = neighbor(motions[list], stride, bx, by, true);
+        const left = neighbor(syntax, motions[list], stride, bx, by, false);
+        const top = neighbor(syntax, motions[list], stride, bx, by, true);
         references[list][g] = if (skipped or (!b and kind == 4)) 0 else try syntax.reference(active[list], if (left.direct) -1 else left.reference, if (top.direct) -1 else top.reference);
         for (parts[0..count]) |p| if (p.group == g) {
             for (0..p.height) |row| for (0..p.width) |column| {
-                motions[list][(my + p.y + row) * stride + mx + p.x + column].reference = references[list][g];
+                motions[list][syntax.cellIndex(0, mx + p.x + column, my + p.y + row)].reference = references[list][g];
             };
         };
     };
     // Direct motion is inferred before parsing neighbouring MVD contexts.
     for (parts[0..count]) |part| if (part.direct) {
-        try direct(state, motions, stride, mx, my, part, spatial, direct8, direct_refs, direct_predictions);
+        try direct(syntax, state, motions, stride, mx, my, part, spatial, direct8, direct_refs, direct_predictions);
     };
     for (0..if (b) @as(usize, 2) else 1) |list| for (parts[0..count]) |part| {
         if (part.direct) continue;
         if (references[list][part.group] < 0) {
-            fill(motions[list], stride, mx, my, part, .{ .decoded = true });
+            fill(syntax, motions[list], stride, mx, my, part, .{ .decoded = true });
             continue;
         }
         const bx = mx + part.x;
         const by = my + part.y;
-        const left = neighbor(motions[list], stride, bx, by, false);
-        const top = neighbor(motions[list], stride, bx, by, true);
-        const prediction = motion.predictor(motions[list], stride, bx, by, part.width, part.height, references[list][part.group], skipped);
+        const left = neighbor(syntax, motions[list], stride, bx, by, false);
+        const top = neighbor(syntax, motions[list], stride, bx, by, true);
+        const prediction = predictor(syntax, motions[list], stride, bx, by, part.width, part.height, references[list][part.group], skipped);
         const dx = if (skipped) 0 else try syntax.mvd(0, @as(u32, if (left.reference >= 0) @abs(left.difference.x) else 0) + if (top.reference >= 0) @abs(top.difference.x) else 0);
         const dy = if (skipped) 0 else try syntax.mvd(1, @as(u32, if (left.reference >= 0) @abs(left.difference.y) else 0) + if (top.reference >= 0) @abs(top.difference.y) else 0);
         const mv = motion.Vector{ .x = prediction.x + dx, .y = prediction.y + dy };
         if (mv.x < -32768 or mv.x > 32767 or mv.y < -32768 or mv.y > 32767) return error.MalformedVideoPacket;
-        fill(motions[list], stride, mx, my, part, .{ .decoded = true, .reference = references[list][part.group], .vector = mv, .difference = .{ .x = dx, .y = dy } });
+        fill(syntax, motions[list], stride, mx, my, part, .{ .identity = try identity(state, list, references[list][part.group]), .decoded = true, .reference = references[list][part.group], .vector = mv, .difference = .{ .x = dx, .y = dy } });
     };
     if (!b) for (parts[0..count]) |part| {
-        fill(motions[1], stride, mx, my, part, .{ .decoded = true });
+        fill(syntax, motions[1], stride, mx, my, part, .{ .decoded = true });
     };
-    for (parts[0..count]) |part| try compensate(state, planes, motions, width, height, mx, my, part);
+    for (parts[0..count]) |part| try compensate(syntax, state, planes, motions, width, height, mx, my, part, bit_depth, chroma_format);
     return allow8;
 }

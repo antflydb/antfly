@@ -72,15 +72,27 @@ fn sourcePoint(x: usize, y: usize, width: usize, height: usize, rotation: Rotati
         .clockwise270 => .{ width - 1 - y, x },
     };
 }
-fn rgb(planes: [2]apple.Plane, x: usize, y: usize, format: apple.Format, matrix: Matrix) [3]u8 {
-    var luma: f32 = @floatFromInt(planes[0].bytes[y * planes[0].stride + x]);
-    const uv = (y / 2) * planes[1].stride + (x / 2) * 2;
-    var u: f32 = @as(f32, @floatFromInt(planes[1].bytes[uv])) - 128;
-    var v: f32 = @as(f32, @floatFromInt(planes[1].bytes[uv + 1])) - 128;
+fn hostSample(bytes: []const u8, offset: usize, bit_depth: u8) u16 {
+    return if (bit_depth == 8) bytes[offset] else std.mem.readInt(u16, bytes[offset..][0..2], .little);
+}
+fn rgb(planes: [2]apple.Plane, x: usize, y: usize, format: apple.Format, matrix: Matrix, bit_depth: u8, chroma_format: u8) [3]u8 {
+    const bytes: usize = if (bit_depth == 8) 1 else 2;
+    const scale: f32 = @floatFromInt(@as(u32, 1) << @as(u5, @intCast(bit_depth - 8)));
+    var luma: f32 = @as(f32, @floatFromInt(hostSample(planes[0].bytes, y * planes[0].stride + x * bytes, bit_depth))) / scale;
+    const sub_x: usize = if (chroma_format == 3) 1 else 2;
+    const uv = (y / (if (chroma_format == 1) @as(usize, 2) else 1)) * planes[1].stride + (x / sub_x) * 2 * bytes;
+    var u: f32 = @as(f32, @floatFromInt(hostSample(planes[1].bytes, uv, bit_depth))) / scale - 128;
+    var v: f32 = @as(f32, @floatFromInt(hostSample(planes[1].bytes, uv + bytes, bit_depth))) / scale - 128;
     if (format == .nv12_video) {
         luma = (luma - 16) * (255.0 / 219.0);
         u *= 255.0 / 224.0;
         v *= 255.0 / 224.0;
+    } else if (bit_depth != 8) {
+        const maximum: f32 = @floatFromInt((@as(u32, 1) << @as(u5, @intCast(bit_depth))) - 1);
+        const full_scale = 255 * scale / maximum;
+        luma *= full_scale;
+        u *= full_scale;
+        v *= full_scale;
     }
     const values: [3]f32 = if (matrix == .bt709)
         .{ luma + 1.5748 * v, luma - 0.187324 * u - 0.468124 * v, luma + 1.8556 * u }
@@ -93,17 +105,21 @@ fn rgb(planes: [2]apple.Plane, x: usize, y: usize, format: apple.Format, matrix:
 /// Reference path deliberately materializes host RGB. Production Metal path
 /// imports NV12 and keeps both resize passes and patch packing on device.
 pub const HostSurface = struct {
+    /// Right-aligned little-endian u16 samples when depth exceeds 8.
+    bit_depth: u8 = 8,
+    chroma_format: u8 = 1,
     width: u32,
     height: u32,
     format: apple.Format,
     planes: [2]apple.Plane,
     pub fn validate(self: HostSurface) !void {
+        if (self.bit_depth < 8 or self.bit_depth > 14 or self.chroma_format < 1 or self.chroma_format > 3) return error.UnsupportedSurfaceFormat;
         if (self.width == 0 or self.height == 0) return error.InvalidVideoGeometry;
         if (self.width > 16_384 or self.height > 16_384) return error.ResourceLimitExceeded;
         for (self.planes, 0..) |plane, i| {
-            const width = if (i == 0) self.width else (self.width + 1) / 2;
-            const height = if (i == 0) self.height else (self.height + 1) / 2;
-            const row = try std.math.mul(usize, width, if (i == 0) @as(usize, 1) else 2);
+            const width = if (i == 0 or self.chroma_format == 3) self.width else (self.width + 1) / 2;
+            const height = if (i == 0 or self.chroma_format >= 2) self.height else (self.height + 1) / 2;
+            const row = try std.math.mul(usize, width, (if (i == 0) @as(usize, 1) else 2) * (if (self.bit_depth == 8) @as(usize, 1) else 2));
             const size = try std.math.mul(usize, plane.stride, height);
             if (plane.width != width or plane.height != height or plane.stride < row or plane.bytes.len < size) return error.UnsupportedSurfaceFormat;
         }
@@ -131,7 +147,7 @@ pub fn referenceHost(allocator: std.mem.Allocator, host: HostSurface, options: O
         try control.check();
         for (0..width) |x| {
             const point = sourcePoint(x, y, host.width, host.height, options.rotation);
-            @memcpy(bytes[(y * width + x) * 3 ..][0..3], &rgb(host.planes, point[0], point[1], host.format, options.matrix));
+            @memcpy(bytes[(y * width + x) * 3 ..][0..3], &rgb(host.planes, point[0], point[1], host.format, options.matrix, host.bit_depth, host.chroma_format));
         }
     }
     return prepareRgb(allocator, bytes, width, height, g, options, control);

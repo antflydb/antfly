@@ -135,6 +135,78 @@ cli_cases = [
         None,
     ),
 ]
+cli_cases += [
+    (
+        "h264-high-jvt",
+        128,
+        96,
+        12,
+        "high",
+        "cqm=jvt:bframes=2:b-adapt=0:b-pyramid=none:ref=3:weightp=2:weightb=1",
+        None,
+    ),
+    (
+        "h264-high-custom",
+        128,
+        96,
+        12,
+        "high",
+        "cqm4iy="
+        + ",".join(str(7 + (i * 11) % 31) for i in range(16))
+        + ":cqm4py="
+        + ",".join(str(11 + (i * 7) % 41) for i in range(16))
+        + ":cqm4ic="
+        + ",".join(str(9 + (i * 13) % 29) for i in range(16))
+        + ":cqm4pc="
+        + ",".join(str(13 + (i * 5) % 37) for i in range(16))
+        + ":cqm8iy="
+        + ",".join(str(8 + (i * 7) % 43) for i in range(64))
+        + ":cqm8py="
+        + ",".join(str(9 + (i * 11) % 47) for i in range(64))
+        + ":bframes=2:b-adapt=0:b-pyramid=none:ref=3:weightp=2:weightb=1",
+        None,
+    ),
+]
+
+cli_cases += [
+    (
+        "h264-baseline-slices",
+        128,
+        96,
+        12,
+        "baseline",
+        "slice-max-mbs=5:bframes=0:ref=2:weightp=0",
+        None,
+    ),
+    (
+        "h264-high-slices",
+        128,
+        96,
+        12,
+        "high",
+        "slice-max-mbs=5:bframes=2:b-adapt=0:b-pyramid=none:ref=3:weightp=2:weightb=1:cqm=jvt",
+        None,
+    ),
+    (
+        "h264-high-constrained",
+        128,
+        96,
+        12,
+        "high",
+        "slice-max-mbs=5:constrained-intra=1:bframes=2:b-adapt=0:b-pyramid=none:ref=3:weightp=2:weightb=1",
+        None,
+    ),
+    (
+        "h264-high-slice-threads",
+        128,
+        96,
+        12,
+        "high",
+        "threads=3:sliced-threads=1:slices=3:bframes=2:b-adapt=0:b-pyramid=none:ref=3:weightp=2:weightb=1",
+        None,
+    ),
+]
+
 with tempfile.TemporaryDirectory(prefix="antfly-h264-tools-") as tmp:
     work = Path(tmp)
     flags = shlex.split(

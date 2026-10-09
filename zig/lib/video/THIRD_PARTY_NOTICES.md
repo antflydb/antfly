@@ -31,3 +31,12 @@ CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
 LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN
 ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 POSSIBILITY OF SUCH DAMAGE.
+
+## H.264 normative mappings
+
+`src/h264_cabac_extensions.zig`, field scans/context increments,
+`src/h264_chroma422.zig`, scaling fallback rules and FMO maps are factual mappings
+from [ITU-T H.264 (08/2021)](https://www.itu.int/rec/T-REC-H.264-202108-I/en).
+The independently written Zig implementation and synthetic fixture generators
+remain Apache-2.0. Extended CABAC initial states are aliases into the existing
+pinned OpenH264 base table above; that table retains its BSD-2-Clause notice.

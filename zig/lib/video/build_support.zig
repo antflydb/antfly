@@ -41,7 +41,8 @@ pub fn addTests(b: *std.Build, root: std.Build.LazyPath, target: std.Build.Resol
     const module = b.createModule(.{ .root_source_file = root.path(b, "video_test_root.zig"), .target = target, .optimize = optimize });
     configure(b, module, root, target, null);
     if (target.result.os.tag == .macos) module.addCSourceFile(.{ .file = root.path(b, "src/backends/apple_video_test.m"), .flags = &.{"-fobjc-arc"} });
-    const tests = b.addTest(.{ .root_module = module });
+    const filter = b.option([]const u8, "video-test-filter", "Run video tests matching this substring");
+    const tests = b.addTest(.{ .root_module = module, .filters = if (filter) |value| &.{value} else &.{} });
     b.step("test-video", "Run video selection, decode, surface and preparation tests").dependOn(&b.addRunArtifact(tests).step);
     b.step("check-video", "Compile video tests without executing them").dependOn(&tests.step);
     addImportCheck(b, root, target, optimize);

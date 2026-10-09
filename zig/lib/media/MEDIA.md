@@ -67,6 +67,24 @@ now stages decoded RGBA into a bounded Metal preparation queue on macOS, preserv
 the same owned window/PTS metadata. This remains video orchestration; media has
 no device or model dependency.
 
+The pure Zig H.264 lane now qualifies bounded multi-slice static `avc1`, mixed
+MBAFF, paired PAFF access units carried together in a packet, custom scaling
+matrices, POC type 1, FMO/ASO/redundant copies and native 8–14-bit 4:2:0/4:2:2/4:4:4
+samples under the profile/tool limits in [VIDEO.md](../video/VIDEO.md#implemented-independent-efficiency-and-portable-h264-work).
+Container indexing preserves codec bytes and sample timing; it does not infer
+support from an `avc1` label or split/merge standalone fields. The software decoder
+verifies both complementary fields before publishing a woven picture and admits
+the first field before second-field prediction. Output depth/chroma and plane
+strides are explicit; high-depth samples remain little-endian `u16` through decode.
+Dynamic parameter sets and unqualified field marking fail explicitly. The Apple
+hardware/Metal NV12 route retains its 8-bit 4:2:0 qualifier.
+
+Shared admission reservations can now resize atomically. Configuration parsing
+shrinks its temporary reservation to the live explicit FMO map, keeps it charged
+through seek probing and reconstruction, and releases it after freeing that map.
+Growth denial preserves the prior reservation. Slice, pixel, packet, dependency
+and allocator high-water limits remain independent of shared admission limits.
+
 WebM video indexing and version-pinned object-store transport adapters are now
 implemented below. Sequential unknown-length sources, live fragment ingestion,
 Cues-based seeking and general encrypted/dynamic-description support remain planned.

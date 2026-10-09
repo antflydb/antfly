@@ -128,3 +128,47 @@ SHA-256 and retains its BSD-2-Clause license:
 ```sh
 python3 zig/lib/video/scripts/generate_h264_cabac_tables.py /path/to/common_tables.cpp
 ```
+
+### Multiple slices, fields and native sample formats
+
+`h264-high-jvt`, `h264-high-custom`, `h264-baseline-slices`, `h264-high-slices`,
+`h264-high-constrained` and `h264-high-slice-threads` extend the tool receipt with
+custom/default matrices, constrained prediction and slice boundaries. The advanced
+receipt records every encoded file and native sample output:
+[h264-advanced-oracle.json](h264-advanced-oracle.json).
+
+`h264-high8/high10-*` include 4:2:2/4:4:4, lossless transform bypass and actual mixed
+MBAFF fields, with CAVLC/CABAC, I/P/B pictures, multi-slice JVT matrices and filtered
+and unfiltered variants. FFmpeg decodes at native planar depth, then the generator
+interleaves Cb/Cr without quantization. Tests assert that the MBAFF corpus actually
+contains field macroblocks.
+
+`h264-paff-*`, `h264-mbaff-pcm-*` and `h264-intra-dc-*` have independently known
+samples. FFmpeg confirms 8/9/10/12/14-bit vectors, including first-field references,
+PAFF list reordering, spatial/temporal B prediction and distinct Cb/Cr QPs. The 11/13-bit vectors use normative
+known values because FFmpeg lacks corresponding native pixel formats. Field pairs
+start with an IDR field and use a non-IDR complementary second field. Standalone
+fields in separate indexed packets are outside the current video API qualifier.
+
+All seven `h264-groups-*` maps use known PCM samples and descending first-macroblock
+arrival order, including both dynamic-map directions. `h264-redundant*` checks
+primary-picture preservation and the explicit missing-primary error. FFmpeg does
+not implement FMO, so these vectors are qualified against normative maps and known
+PCM sample placement instead of being presented as FFmpeg conformance evidence.
+The standalone ISO BMFF muxer preserves configurations ordinary muxers reject.
+
+The `.nv12` suffix is historical: consult each receipt's `bit_depth` and
+`chroma_format`. Native-depth files contain tightly packed Y then interleaved
+Cb/Cr, using right-aligned little-endian `u16` above 8 bits. Field output is woven;
+there is no implicit deinterlacing.
+
+```sh
+python3 zig/lib/video/scripts/generate_h264_advanced_vectors.py
+python3 zig/lib/video/scripts/generate_h264_cabac_extensions.py /path/to/h264-202108-layout.txt
+```
+
+The extension generator reads factual mappings from ITU-T H.264 (08/2021),
+Tables 9-25–9-33 and 9-43, from `pdftotext -layout` output. It verifies every
+extended initial state against the pinned base table and rejects duplicate/missing
+field-context rows. Each aliased initial state gets independently evolving CABAC
+storage at runtime. No reference encoder/decoder is linked into the library.

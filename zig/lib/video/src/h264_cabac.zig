@@ -8,19 +8,26 @@ pub const Decoder = struct {
     bits: *Bits,
     range: u32 = 510,
     offset: u32,
-    state: [460]u8,
+    state: [1024]u8,
     pub fn init(bits: *Bits, qp: i32, init_idc: usize) !Decoder {
         if (init_idc > 3) return error.MalformedVideoPacket;
         while (bits.position % 8 != 0) if (try bits.read(1) != 1) return error.MalformedVideoPacket;
         var decoder = Decoder{ .bits = bits, .offset = 0, .state = undefined };
-        for (0..460) |i| {
-            const params = tables.initial[i][init_idc];
+        for (0..1024) |i| {
+            const index = if (i < 460) i else @as(usize, @import("h264_cabac_extensions.zig").initial_alias[i - 460]);
+            const params = tables.initial[index][init_idc];
             const pre = std.math.clamp((@as(i32, params[0]) * qp >> 4) + params[1], 1, 126);
             decoder.state[i] = @intCast(if (pre <= 63) (63 - pre) * 2 else (pre - 64) * 2 + 1);
         }
         for (0..9) |_| decoder.offset = (decoder.offset << 1) | try decoder.bit();
         if (decoder.offset >= 510) return error.MalformedVideoPacket;
         return decoder;
+    }
+    pub fn restart(self: *Decoder) !void {
+        self.range = 510;
+        self.offset = 0;
+        for (0..9) |_| self.offset = (self.offset << 1) | try self.bit();
+        if (self.offset >= 510) return error.MalformedVideoPacket;
     }
     fn bit(self: *Decoder) !u32 {
         if (self.bits.position >= self.bits.bytes.len * 8) return error.MalformedVideoPacket;
@@ -71,7 +78,7 @@ pub const Decoder = struct {
         if (extra == 13) {
             var k: usize = 0;
             while (try self.bypass() != 0) {
-                if (k >= 14) return error.MalformedVideoPacket;
+                if (k >= 21) return error.MalformedVideoPacket;
                 extra += @as(u32, 1) << @as(u5, @intCast(k));
                 k += 1;
             }
@@ -79,7 +86,7 @@ pub const Decoder = struct {
             for (0..k) |_| suffix = (suffix << 1) | try self.bypass();
             extra += suffix;
         }
-        if (extra > 32766) return error.MalformedVideoPacket;
+        if (extra > (1 << 21) - 2) return error.MalformedVideoPacket;
         return @intCast(extra);
     }
 };

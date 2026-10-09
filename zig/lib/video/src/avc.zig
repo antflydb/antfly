@@ -5,19 +5,29 @@ const std = @import("std");
 /// The initial VideoToolbox lane qualifies 8-bit 4:2:0 Baseline/Main/High.
 /// The platform validates full SPS syntax and geometry before session creation.
 pub fn validateConfig(config: []const u8) !void {
+    return validate(config, false);
+}
+pub fn validatePortableConfig(config: []const u8) !void {
+    return validate(config, true);
+}
+fn validate(config: []const u8, portable: bool) !void {
     if (config.len < 7 or config[0] != 1) return error.MalformedVideoConfig;
-    if (config[1] != 66 and config[1] != 77 and config[1] != 100) return error.UnsupportedVideoProfile;
+    if (config[1] != 66 and config[1] != 77 and config[1] != 100 and !(portable and (config[1] == 110 or config[1] == 122 or config[1] == 244))) return error.UnsupportedVideoProfile;
     const n = config[5] & 31;
     if (n == 0) return error.MalformedVideoConfig;
     var cursor: usize = 6;
     for (0..n) |_| {
         const sps = try readSet(config, &cursor);
         if (sps.len < 4 or sps[0] & 31 != 7 or sps[1] != config[1]) return error.MalformedVideoConfig;
-        if (config[1] == 100) {
+        if (config[1] >= 100) {
             var bits = Bits{ .bytes = sps[4..] };
             _ = try bits.ue(); // seq_parameter_set_id
-            if (try bits.ue() != 1) return error.UnsupportedVideoProfile;
-            if (try bits.ue() != 0 or try bits.ue() != 0) return error.UnsupportedVideoProfile;
+            const chroma = try bits.ue();
+            if (!portable and chroma != 1) return error.UnsupportedVideoProfile;
+            if (chroma == 3) _ = try bits.bit(); // separate_colour_plane_flag; core qualifies it
+            const depth0 = try bits.ue();
+            const depth1 = try bits.ue();
+            if (!portable and (depth0 != 0 or depth1 != 0)) return error.UnsupportedVideoProfile;
         }
     }
     if (cursor >= config.len) return error.MalformedVideoConfig;
@@ -29,8 +39,8 @@ pub fn validateConfig(config: []const u8) !void {
         if (pps[0] & 31 != 8) return error.MalformedVideoConfig;
     }
     if (cursor < config.len) {
-        if (config[1] != 100 or config.len - cursor < 4) return error.MalformedVideoConfig;
-        if (config[cursor] & 3 != 1 or config[cursor + 1] & 7 != 0 or config[cursor + 2] & 7 != 0) return error.UnsupportedVideoProfile;
+        if (config[1] < 100 or config.len - cursor < 4) return error.MalformedVideoConfig;
+        if ((!portable and config[cursor] & 3 != 1) or (!portable and (config[cursor + 1] & 7 != 0 or config[cursor + 2] & 7 != 0))) return error.UnsupportedVideoProfile;
         const extensions = config[cursor + 3];
         cursor += 4;
         for (0..extensions) |_| _ = try readSet(config, &cursor);

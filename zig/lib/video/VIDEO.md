@@ -216,7 +216,7 @@ of eight selections (six unique outputs), with CPU/Metal value comparisons,
 depth-one/two bounds, source teardown, late cancellation/retry, sink failures and
 allocation-failure campaigns. Portable planner tests execute on WASI; Linux
 compiles the planner, window reuse and CPU preparation without Apple dependencies.
-The Linux H.264 subset below is implemented; additional H.264 tools and CUDA/NVDEC remain stage 4 work. Model-specific tokens,
+The expanded Linux H.264 subset below is implemented; remaining profile tools and CUDA/NVDEC remain stage 4 work. Model-specific tokens,
 resident vision/backbone/pooling and retrieval parity still depend on PR #1014.
 
 ## Implemented portable MJPEG lane
@@ -328,7 +328,7 @@ For the original two-second fixture, preparing overlapping windows together give
 Depth two retains at most 24,576 staged RGBA bytes; completed unique patch outputs
 occupy 221,184 bytes. These are asserted logical work/resource counts, not latency
 or embedding benchmarks. Resident vision/projector/backbone/pooling still await
-PR #1014; additional H.264 tools and NVIDIA NVDEC/CUDA remain independent follow-ups.
+PR #1014; PAFF field marking/standalone field packets and NVIDIA NVDEC/CUDA remain independent follow-ups.
 
 ## Implemented independent efficiency and portable H.264 work
 
@@ -359,25 +359,46 @@ Native worker tests qualify atomic contention; overlapping output lifetimes,
 late cancellation, allocation failures and retry qualify release ordering.
 
 `h264.decodeFrame` and `h264.decodeSelected` are pure Zig decoders available on
-Linux, macOS and WASI. The declared subset is progressive 8-bit 4:2:0
-Baseline/Main/High, one static SPS/PPS and one complete I/P/B slice per packet.
+Linux, macOS and WASI. The declared static `avc1` subset accepts Baseline, Main,
+High, High 10, High 4:2:2 and High 4:4:4 Predictive configurations. Sample depth is
+8–14 bits with equal luma/chroma depth; profile-specific limits still apply
+(High is 8-bit, High 10/High 4:2:2 are at most 10-bit). Chroma may be 4:2:0,
+4:2:2 or 4:4:4. One SPS/PPS and stable geometry remain required.
 Implemented tools include:
 
-- CAVLC and CABAC entropy decoding, including CABAC initialization contexts and
-  bounded zero-word padding. I_PCM is supported with CAVLC.
-- All Intra4x4/Intra8x8/Intra16x16 and chroma prediction modes, 4x4/8x8 integer
-  transforms and quantization, and in-loop luma/chroma deblocking.
-- P/B macroblock and sub-macroblock partitions, skip, spatial/temporal direct
-  prediction, quarter-pel luma and eighth-pel chroma interpolation with edge extension.
-- Explicit weighted prediction and implicit B-picture weighting; short/long-term
-  reference lists, list reordering, sliding-window marking and bounded MMCO commands.
-- Frame-number and POC type 0/2 wrap, crop offsets, emulation prevention and
-  full/video-range signaling. Output PTS/duration comes from the indexed packet.
+- Multiple I/P/B slices, with per-slice entropy, prediction availability and filter
+  boundaries. Missing and overlapping primary macroblocks fail explicitly. Work
+  includes redundant slices in the default 256-slice-per-packet limit.
+- All seven progressive Baseline FMO maps, including dynamic map directions and
+  explicit maps; ASO reconstructs by macroblock ownership instead of arrival order.
+  Redundant copies are consumed when a primary picture exists; they do not replace
+  it or provide recovery after a missing primary picture.
+- CAVLC/CABAC, including field significance contexts, 4:2:2 DC codewords,
+  independent 4:4:4 component contexts, CABAC I_PCM restart and bounded padding.
+- Intra4x4/Intra8x8/Intra16x16 and chroma prediction, constrained intra prediction,
+  4x4/8x8 transforms, custom SPS/PPS scaling matrices and both fallback rules,
+  separate Cb/Cr QP offsets, lossless transform bypass and high-depth clipping.
+- P/B partitions, skip, spatial/temporal direct, quarter-pel interpolation,
+  explicit/implicit weighting, reference list reordering, sliding-window marking
+  and bounded frame MMCO commands. POC types 0, 1 and 2 are supported.
+- Mixed MBAFF frame/field macroblock pairs, with sample-accurate neighbours,
+  field/frame motion scaling, parity-aware chroma motion, field scans, separate
+  field POCs and mixed-boundary deblocking. Fields use views over woven storage.
+- PAFF complementary field pairs carried together in an indexed packet. The
+  first field is filtered and admitted as a reference before the second field;
+  completion updates the same DPB allocation. Default field reference lists and
+  field list reordering include previous and current-first-field references.
+- Cropping, emulation prevention and full/video-range signaling. Output PTS and
+  duration come from the indexed packet.
 
 `decodeFrame` replays the dependency span from a verified IDR to the selected
-packet and returns owned tightly packed NV12 with `Frame.host()`. `decodeSelected`
+packet and returns owned semiplanar Y + interleaved Cb/Cr with `Frame.host()`.
+`Frame.nv12` retains its existing name: read `bit_depth` and `chroma_format` rather
+than assuming NV12. Above 8 bits samples are right-aligned little-endian `u16`;
+4:2:2 and 4:4:4 have their corresponding chroma dimensions. `Frame.host()` supplies
+byte strides and native-depth metadata. `decodeSelected`
 keeps one bounded decoded-picture buffer across the selected span, decodes each
-packet once, and publishes borrowed NV12 pictures during a callback. Callback slots
+packet once, and publishes borrowed native semiplanar pictures during a callback. Callback slots
 retain the caller's selection order, including B-picture presentation order; the
 callback must copy/prepare the picture before returning and must not destroy it.
 `software.prepareWindows` uses this batch path to share reference reconstruction and
@@ -388,18 +409,26 @@ at 256 packets and the SPS reference count at 16 pictures.
 
 Geometry/packet/reference workspace bounds are checked before reconstruction;
 `max_decode_bytes` also enforces the actual decode allocator high-water limit.
-Reference planes and both lists' motion metadata are included in the conservative
+Reference samples, picture/slice metadata, FMO storage and both lists' motion metadata are included in the conservative
 workspace estimate. Cancellation is checked during RBSP copying, macroblocks,
 filtering and output rows. Shared output admission remains held until Frame destruction;
 batch callback failure frees the output, decoded-picture buffer and packet leases.
 
-This remains a declared tool subset, not a full H.264 conformance claim. Multiple
-slices, FMO/ASO, interlacing/MBAFF, scaling matrices, transform bypass, CABAC I_PCM,
-constrained intra prediction, redundant slices, POC type 1, differing chroma QP offsets,
-higher bit depths/chroma, dynamic parameter sets and other profiles fail closed.
-Capability `portable_h264_decode` is true with explicit descriptor
-`progressive-8bit-420-baseline-main-high-single-slice-ipb`; callers must preserve
-that qualification. No OpenH264, x264 or FFmpeg runtime is linked.
+This remains a declared tool subset. Standalone PAFF fields in separate indexed
+packets, non-complementary pairs, PAFF adaptive/long-term marking, separate colour
+planes, monochrome, unequal component depths, frame-number gaps, SP/SI, other
+profiles, data partitions and dynamic parameter sets remain explicit rejections.
+MBAFF frame MMCO remains available. No deinterlacing policy is applied: interlaced
+output preserves woven samples. Capability `portable_h264_decode` is true with
+`static-avc1-profile-subset-multislice-8to14bit-420-422-444-mbaff-paff-pairs`; callers
+must preserve that qualification. No OpenH264, x264 or FFmpeg runtime is linked.
+
+Native-depth host preparation validates plane geometry and converts into the
+existing RGB8 processor policy before resizing/packing; decoded samples retain
+full depth. Full-range conversion uses the actual sample maximum. Direct Metal
+NV12 import and the Apple hardware configuration qualifier retain their existing
+8-bit 4:2:0 contract. Additional Metal native-depth/chroma imports, CUDA/NVDEC and
+model-specific execution remain separately qualified work.
 
 Independent x264/FFmpeg vectors cover intra prediction, CAVLC/CABAC 8x8 transforms,
 filtered/cropped/low-QP pictures, P/B pictures, spatial and temporal direct prediction,
@@ -413,6 +442,24 @@ exhaustive reference-allocation failures have portable tests. This is coding-too
 qualification on generated vectors, not a broad production-stream corpus. CAVLC and
 CABAC constants come from pinned Cisco OpenH264 BSD-2-Clause tables; the revision and
 license are in [third-party notices](THIRD_PARTY_NOTICES.md).
+
+Current platform results are recorded in
+[testdata/h264-advanced-validation.md](testdata/h264-advanced-validation.md).
+
+The expanded fixture receipt is
+[testdata/h264-advanced-oracle.json](testdata/h264-advanced-oracle.json). Independent
+FFmpeg comparisons cover mixed MBAFF I/P/B pictures at 8/10 bits with CAVLC/CABAC,
+filtering, multi-slice custom matrices, lossless 4:2:0/4:2:2/4:4:4 streams, paired
+PAFF references/list reordering, spatial/temporal B prediction and compressed native 9/12/14-bit DC vectors.
+Known-sample normative vectors cover FMO/ASO/redundancy and 11/13-bit output, which
+FFmpeg's pixel formats do not represent. Qualification includes slice holes and
+overlap, malformed scaling lists, both scaling fallback rules, separate chroma QP,
+negative high-depth chroma QP, shared reservation resizing and exhaustive allocation
+failure cleanup across fields, explicit maps and high-depth component buffers.
+CABAC extension aliases and field offsets are regenerated from
+[ITU-T H.264 (08/2021)](https://www.itu.int/rec/T-REC-H.264-202108-I/en); the generator
+rejects duplicate/missing table rows before writing constants.
+
 
 Codec work remains independent of EmbeddingGemma 2 tokens and model execution.
 
