@@ -5937,7 +5937,7 @@ test "lite snapshot admission preserves original cancellation while the backend 
     defer store.close();
     // Warm the stable generation so the new reader path doesn't need the
     // writer mutex. Its other publication locks still obey caller admission.
-    var initial = try Txn.openRead(&store, "");
+    var initial = try Txn.openRead(&store);
     initial.abort();
     const Lock = enum { generation, reader };
     const Failure = enum { cancellation, deadline };
@@ -6000,7 +6000,7 @@ test "lite snapshot admission preserves original cancellation while the backend 
                 budget.unlock();
                 // No rejected call may retain the shared generation lock or
                 // reader mutex. A fresh original scope can retry immediately.
-                var retry = try Txn.openRead(&store, "");
+                var retry = try Txn.openRead(&store);
                 retry.abort();
                 try std.testing.expectEqual(@as(usize, 0), store.read_generation.?.references);
             }
