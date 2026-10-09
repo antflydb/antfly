@@ -191,11 +191,19 @@ const Execution = struct {
         const self: *Execution = @ptrCast(@alignCast(raw));
         var result: types.SparseOrdinalSelection = .{};
         errdefer result.deinit();
+        // Materialize only inexpensive masks. Broad constraints are checked
+        // against reached native identities inside bounded DAAT scoring.
         if (self.vector_include) |*include| {
+            if (include.boundedCardinality(4096) == null) {
+                result.residual = true;
+                return result;
+            }
             // Subtract in physical space before resolving a selective include;
             // a broad exclusion need not be converted for one included row.
             result.include = try self.selectSparseSet(a, lookup, include, if (self.vector_exclude) |*exclude| exclude else null);
-        } else if (self.vector_exclude) |*exclude| result.exclude = try self.selectSparseSet(a, lookup, exclude, null);
+        } else if (self.vector_exclude) |*exclude| {
+            if (exclude.boundedCardinality(4096) == null) result.residual = true else result.exclude = try self.selectSparseSet(a, lookup, exclude, null);
+        }
         return result;
     }
     fn selectSparseSet(self: *Execution, a: A, lookup: types.SparseOrdinalLookup, selection_set: *const @import("lake_index_physical_set.zig").Set, subtract: ?*const @import("lake_index_physical_set.zig").Set) !local.encoding_roaring.RoaringBitmap {
@@ -1154,4 +1162,49 @@ test "external lake typed delivery separates final projection from residual pred
     req.hierarchy_include_source = false;
     req.evaluation_limit = 1;
     try std.testing.expect(!canDeliverTypedSource(req));
+}
+
+test "external lake sparse predicate planning defers broad masks and subtracts selective includes" {
+    const a = std.testing.allocator;
+    const Set = @import("lake_index_physical_set.zig").Set;
+    // Only the predicate-planning fields are needed; no HTTP/server is opened.
+    var execution: Execution = undefined;
+    execution.vector_include = null;
+    execution.vector_exclude = Set.init(a);
+    defer execution.vector_exclude.?.deinit();
+    execution.private_digests = .empty;
+    defer execution.private_digests.deinit(a);
+    execution.context = .{ .io = std.testing.io };
+    const digest: [64]u8 = @splat('0');
+    try execution.private_digests.put(a, "file", &digest);
+    try execution.vector_exclude.?.addBlock(.{ .file = "file", .group = 0, .base = 0, .selection = .{ .interval = .{ .lower = 0, .count = 100000 } } });
+    const Lookup = struct {
+        calls: usize = 0,
+        fn one(raw: *anyopaque, _: []const u8) !?u32 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return 42;
+        }
+        fn block(_: *anyopaque, _: A, _: []const u8, _: u32, _: *const local.encoding_roaring.RoaringBitmap, _: *local.encoding_roaring.RoaringBitmap) !bool {
+            return false;
+        }
+    };
+    var lookup: Lookup = .{};
+    const native: types.SparseOrdinalLookup = .{ .ptr = &lookup, .one = Lookup.one, .block = Lookup.block };
+    var broad = (try Execution.selectSparseConstraints(&execution, a, native)).?;
+    defer broad.deinit();
+    try std.testing.expect(broad.residual and broad.include == null and broad.exclude == null);
+    try std.testing.expectEqual(@as(usize, 0), lookup.calls);
+    execution.vector_include = Set.init(a);
+    defer execution.vector_include.?.deinit();
+    try execution.vector_include.?.addRow("file", 0, 7);
+    var empty = (try Execution.selectSparseConstraints(&execution, a, native)).?;
+    defer empty.deinit();
+    try std.testing.expect(!empty.residual and empty.include.?.isEmpty());
+    try std.testing.expectEqual(@as(usize, 0), lookup.calls);
+    try execution.vector_include.?.addRow("file", 0, 150000);
+    var point = (try Execution.selectSparseConstraints(&execution, a, native)).?;
+    defer point.deinit();
+    try std.testing.expect(!point.residual and point.include.?.contains(42));
+    try std.testing.expectEqual(@as(usize, 1), lookup.calls);
 }

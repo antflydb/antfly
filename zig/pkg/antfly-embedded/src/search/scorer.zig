@@ -301,6 +301,7 @@ pub const WANDScorer = struct {
         const idf = @log(1.0 + (n - df + 0.5) / (df + 0.5));
 
         var iter_owned = iter;
+        errdefer iter_owned.deinit();
         // BM25 scoring doesn't read positions; flip the iterator into the
         // fast path so `next()` skips the per-doc varint walk over positions.
         // Saves real wall time on phrase-aware indexes when the query is
@@ -1319,4 +1320,25 @@ test "WAND membership seeks preserve selective single multi and unbounded scorin
         try std.testing.expectEqual(@as(u32, 7001), collector.base.hits.items[0].doc_id);
         try std.testing.expect(collector.calls <= 4);
     };
+}
+
+test "WAND failed term admission releases owned metadata" {
+    const Owner = struct {
+        refs: usize = 1,
+        fn retain(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.refs += 1;
+        }
+        fn release(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.refs -= 1;
+        }
+    };
+    var owner: Owner = .{};
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var wand = WANDScorer.init(failing.allocator(), 1, 1, 1, .{});
+    defer wand.deinit();
+    const iterator: inverted.PostingsIterator = .{ .alloc = std.testing.allocator, .is_one_hit = true, .metadata_owner = .{ .ptr = &owner, .retain = Owner.retain, .release = Owner.release } };
+    try std.testing.expectError(error.OutOfMemory, wand.addTerm(iterator, 1, null, 1024, 0));
+    try std.testing.expectEqual(@as(usize, 0), owner.refs);
 }

@@ -2638,6 +2638,8 @@ def test_native_remote_indexed_metadata_predicates_above_id_list_limit(tmp_path)
             assert [h["_source"]["amount"] for h in selected["hits"]["hits"]] == ([amount] if matches else [])
             if matches:
                 assert selected["hits"]["hits"][0]["_score"] == pytest.approx(unfiltered["hits"]["hits"][0]["_score"], abs=1e-6)
+            overlapping = query(broad, full_text_search=search, exclusion_query=broad)
+            assert overlapping["hits"]["hits"] == [], overlapping
             exact = query(broad, full_text_search=search, count=True, fields=[], limit=0)
             assert exact["hits"]["total"] == {"value": int(matches), "relation": "exact"}
             excluded = call("POST", "/tables/indexed_predicates/query", {

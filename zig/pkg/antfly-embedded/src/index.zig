@@ -1090,6 +1090,64 @@ pub const IndexSnapshot = struct {
         return self.searchInternal(alloc, field, terms, k, override, bm25_config, null);
     }
 
+    pub const TextSegmentPlan = struct {
+        segment_idx: usize,
+        doc_offset: u32,
+        score_upper_bound: f32,
+    };
+    /// Shared filtered/unfiltered segment bounds. Global statistics are supplied
+    /// once by the query; document offsets remain stable after score ordering.
+    pub fn planTextSegments(self: *const IndexSnapshot, alloc: Allocator, field: []const u8, terms: []const []const u8, term_doc_freqs: []const u32, global_doc_count: u32, avg_dl: f32, bm25_config: inverted.BM25Config) ![]TextSegmentPlan {
+        // Computing query-specific bounds opens every segment dictionary and
+        // walks each term's block-max table before opening them again for
+        // scoring. On a healthy tiered index (normally <= 10 segments), that
+        // fixed work costs more than it saves. Reserve global segment ordering
+        // for genuinely fragmented snapshots where pruning can amortize the
+        // prepass; WAND still performs block-level pruning inside every
+        // segment in the normal production state.
+        const use_segment_bound_planning = self.segments.len > 16;
+
+        const plans = try alloc.alloc(TextSegmentPlan, self.segments.len);
+        errdefer alloc.free(plans);
+        var doc_offset: u32 = 0;
+        for (self.segments, 0..) |*seg, segment_idx| {
+            var upper_bound: f32 = std.math.inf(f32);
+            if (use_segment_bound_planning) {
+                upper_bound = 0;
+                if (try seg.reader.invertedIndexScoped(alloc, field)) |opened| {
+                    var inv_reader = opened;
+                    defer inv_reader.deinit();
+                    for (terms, 0..) |term, term_idx| {
+                        const lookup_result = (try inv_reader.lookup(term)) orelse continue;
+                        const df = if (term_doc_freqs[term_idx] != 0) term_doc_freqs[term_idx] else lookup_result.docFreq();
+                        upper_bound += switch (lookup_result) {
+                            .postings => |p| if (p.block_max) |block_max|
+                                block_max.maxImpactAll(global_doc_count, df, avg_dl, bm25_config)
+                            else
+                                inverted.bm25MaxScore(global_doc_count, df, bm25_config),
+                            .one_hit => |hit| inverted.bm25Score(1, hit.norm_bits, global_doc_count, df, avg_dl, bm25_config),
+                        };
+                    }
+                }
+            }
+            plans[segment_idx] = .{
+                .segment_idx = segment_idx,
+                .doc_offset = doc_offset,
+                .score_upper_bound = upper_bound,
+            };
+            doc_offset = std.math.add(u32, doc_offset, seg.reader.doc_count) catch return error.CountOverflow;
+        }
+        if (use_segment_bound_planning) {
+            std.mem.sort(TextSegmentPlan, plans, {}, struct {
+                fn lessThan(_: void, a: TextSegmentPlan, b: TextSegmentPlan) bool {
+                    if (a.score_upper_bound == b.score_upper_bound) return a.segment_idx < b.segment_idx;
+                    return a.score_upper_bound > b.score_upper_bound;
+                }
+            }.lessThan);
+        }
+        return plans;
+    }
+
     fn searchInternal(
         self: *const IndexSnapshot,
         alloc: Allocator,
@@ -1122,62 +1180,8 @@ pub const IndexSnapshot = struct {
         var collector = scorer_mod.TopKCollector.init(alloc, k);
         defer collector.deinit();
 
-        // Computing query-specific bounds opens every segment dictionary and
-        // walks each term's block-max table before opening them again for
-        // scoring. On a healthy tiered index (normally <= 10 segments), that
-        // fixed work costs more than it saves. Reserve global segment ordering
-        // for genuinely fragmented snapshots where pruning can amortize the
-        // prepass; WAND still performs block-level pruning inside every
-        // segment in the normal production state.
-        const use_segment_bound_planning = self.segments.len > 16;
-
-        const SegmentPlan = struct {
-            segment_idx: usize,
-            doc_offset: u32,
-            score_upper_bound: f32,
-        };
-        var single_plan_storage: [1]SegmentPlan = undefined;
-        const plans = if (self.segments.len <= single_plan_storage.len)
-            single_plan_storage[0..self.segments.len]
-        else
-            try alloc.alloc(SegmentPlan, self.segments.len);
-        defer if (self.segments.len > single_plan_storage.len) alloc.free(plans);
-        var doc_offset: u32 = 0;
-        for (self.segments, 0..) |*seg, segment_idx| {
-            var upper_bound: f32 = std.math.inf(f32);
-            if (use_segment_bound_planning) {
-                upper_bound = 0;
-                if (try seg.reader.invertedIndexScoped(alloc, field)) |opened| {
-                    var inv_reader = opened;
-                    defer inv_reader.deinit();
-                    for (terms, 0..) |term, term_idx| {
-                        const lookup_result = (try inv_reader.lookup(term)) orelse continue;
-                        const df = if (term_doc_freqs[term_idx] != 0) term_doc_freqs[term_idx] else lookup_result.docFreq();
-                        upper_bound += switch (lookup_result) {
-                            .postings => |p| if (p.block_max) |block_max|
-                                block_max.maxImpactAll(global_doc_count, df, avg_dl, bm25_config)
-                            else
-                                inverted.bm25MaxScore(global_doc_count, df, bm25_config),
-                            .one_hit => |hit| inverted.bm25Score(1, hit.norm_bits, global_doc_count, df, avg_dl, bm25_config),
-                        };
-                    }
-                }
-            }
-            plans[segment_idx] = .{
-                .segment_idx = segment_idx,
-                .doc_offset = doc_offset,
-                .score_upper_bound = upper_bound,
-            };
-            doc_offset = std.math.add(u32, doc_offset, seg.reader.doc_count) catch return error.CountOverflow;
-        }
-        if (use_segment_bound_planning) {
-            std.mem.sort(SegmentPlan, plans, {}, struct {
-                fn lessThan(_: void, a: SegmentPlan, b: SegmentPlan) bool {
-                    if (a.score_upper_bound == b.score_upper_bound) return a.segment_idx < b.segment_idx;
-                    return a.score_upper_bound > b.score_upper_bound;
-                }
-            }.lessThan);
-        }
+        const plans = try self.planTextSegments(alloc, field, terms, term_doc_freqs, global_doc_count, avg_dl, bm25_config);
+        defer alloc.free(plans);
         if (diagnostics) |diag| diag.segments_considered +|= @intCast(plans.len);
 
         for (plans) |plan| {

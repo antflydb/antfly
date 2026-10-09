@@ -27,6 +27,8 @@ pub const Lookup = struct {
 /// ordinal; an empty include admits none. Exclusions never require constructing
 /// the potentially archive-sized complement.
 pub const Selection = struct {
+    /// Unmaterialized constraints remain exact candidate predicates.
+    residual: bool = false,
     include: ?Bitmap = null,
     exclude: ?Bitmap = null,
     pub fn deinit(self: *Selection) void {

@@ -28,6 +28,7 @@ pub const Cursor = struct {
     group_arena: std.heap.ArenaAllocator,
     file_arena: std.heap.ArenaAllocator,
     directory: ?tree.Cursor = null,
+    pending: ?tree.Cursor.Record = null,
     reader: *ordered.Reader,
     digests: []const [32]u8,
     lower: []const u8,
@@ -104,14 +105,17 @@ pub const Cursor = struct {
         if (self.exhausted) return false;
         _ = self.group_arena.reset(.retain_capacity);
         const ca = self.group_arena.allocator();
-        const cursor = &self.directory.?;
-        const first = (try cursor.next()) orelse {
+        const first = (self.pending orelse try self.directory.?.next()) orelse {
             self.exhausted = true;
             return false;
         };
+        self.pending = null;
         if (first.key.len < 4) return error.InvalidNativeLakeRowIndex;
         self.group = try ca.dupe(u8, first.key[0 .. first.key.len - 4]);
+        var cache_key: ?[32]u8 = null;
         if (self.reader.cached) |cached| {
+            try cached.context.ensureActive();
+            try self.reader.pages.cancellation.check();
             var hash = std.crypto.hash.Blake3.init(.{});
             hash.update("antfly.native-public-tie-files.v1");
             hash.update(&cached.scope);
@@ -129,17 +133,43 @@ pub const Cursor = struct {
             }
             var key: [32]u8 = undefined;
             hash.final(&key);
+            cache_key = key;
+            if (cached.cache.decoded.lookup(key)) |lease| {
+                defer lease.release();
+                const value: *const GroupFiles = @ptrCast(@alignCast(lease.item.payload.extension));
+                self.files = try ca.dupe(u32, value.files);
+                // Only a warm group needs a seek. A cold scan keeps its existing
+                // directory pages and the first record of the following group.
+                self.directory.?.deinit();
+                self.directory = null;
+                self.directory = if (self.reverse)
+                    try tree.Cursor.initReverse(self.a, self.reader.pages.store(), self.reader.root.ties, self.lower, self.group)
+                else if (try orderedSuccessor(ca, self.group)) |end|
+                    try tree.Cursor.init(self.a, self.reader.pages.store(), self.reader.root.ties, end, self.upper)
+                else blk: {
+                    self.exhausted = true;
+                    break :blk null;
+                };
+                self.seekBoundary();
+                return true;
+            }
+        }
+        self.files = try self.readGroup(ca, first);
+        // Small groups already fit in a directory page: reseeking a cached one
+        // would cost more reads than sequential traversal. Reserve residency
+        // for groups whose encoded records span pages.
+        if (self.files.len > tree.target_page_bytes / (self.group.len + 32)) if (self.reader.cached) |cached| {
             const Loader = struct {
-                cursor: *Cursor,
+                files: []const u32,
                 fn load(raw: *anyopaque, item: *local.serverless_query_lake_decoded_cache.Item) !void {
                     const ctx: *@This() = @ptrCast(@alignCast(raw));
                     const alloc = item.arena.allocator();
                     const value = try alloc.create(GroupFiles);
-                    value.files = try ctx.cursor.readGroup(alloc);
+                    value.files = try alloc.dupe(u32, ctx.files);
                     item.payload = .{ .extension = value };
                 }
             };
-            var loader: Loader = .{ .cursor = self };
+            var loader: Loader = .{ .files = self.files };
             const Check = struct {
                 parent: local.serverless_query_lake_read_context.Context,
                 token: @import("antfly_cancellation").CancellationToken,
@@ -152,40 +182,32 @@ pub const Cursor = struct {
             var check: Check = .{ .parent = cached.context, .token = self.reader.pages.cancellation };
             var context = cached.context;
             context.checkpoint = .{ .ptr = &check, .check = Check.check };
-            const lease = try cached.cache.decoded.acquire(key, 512 * 1024, context, .{ .ptr = &loader, .load = Loader.load });
-            defer lease.release();
-            const value: *const GroupFiles = @ptrCast(@alignCast(lease.item.payload.extension));
-            self.files = try ca.dupe(u32, value.files);
-        } else self.files = try self.readGroup(ca);
-        // A cache hit performs a tree seek past this tuple instead of revisiting
-        // its per-file directory entries. The next group remains discoverable.
-        cursor.deinit();
-        self.directory = null;
-        self.directory = if (self.reverse)
-            try tree.Cursor.initReverse(self.a, self.reader.pages.store(), self.reader.root.ties, self.lower, self.group)
-        else
-            try tree.Cursor.init(self.a, self.reader.pages.store(), self.reader.root.ties, (try orderedSuccessor(ca, self.group)) orelse {
-                self.exhausted = true;
-                self.file_position = 0;
-                return true;
-            }, self.upper);
-        self.file_position = 0;
+            const lease = try cached.cache.decoded.acquire(cache_key.?, 512 * 1024, context, .{ .ptr = &loader, .load = Loader.load });
+            lease.release();
+        };
+        self.seekBoundary();
         return true;
     }
     const GroupFiles = struct { files: []const u32 };
-    fn readGroup(self: *Cursor, a: A) ![]const u32 {
-        const upper = try orderedSuccessor(a, self.group);
-        defer if (upper) |end| a.free(end);
-        var cursor = try tree.Cursor.init(self.a, self.reader.pages.store(), self.reader.root.ties, self.group, upper);
-        defer cursor.deinit();
+    fn readGroup(self: *Cursor, a: A, first: tree.Cursor.Record) ![]const u32 {
         var files: std.ArrayList(u32) = .empty;
         errdefer files.deinit(a);
-        while (try cursor.next()) |record| {
-            if (record.key.len != self.group.len + 4 or !std.mem.eql(u8, record.key[0..self.group.len], self.group)) return error.InvalidNativeLakeRowIndex;
+        var record_next: ?tree.Cursor.Record = first;
+        while (record_next) |record| {
+            if (files.items.len % 256 == 0) {
+                try self.reader.pages.cancellation.check();
+                if (self.reader.cached) |cached| try cached.context.ensureActive();
+            }
+            if (record.key.len < 4) return error.InvalidNativeLakeRowIndex;
+            if (record.key.len != self.group.len + 4 or !std.mem.eql(u8, record.key[0..self.group.len], self.group)) {
+                self.pending = record;
+                break;
+            }
             if (record.value.len != 8 or std.mem.readInt(u64, record.value[0..8], .big) == 0) return error.InvalidNativeLakeRowIndex;
             const slot = std.mem.readInt(u32, record.key[record.key.len - 4 ..][0..4], .big);
             if (slot >= self.digests.len or files.items.len >= self.reader.root.files.len) return error.InvalidNativeLakeRowIndex;
             try files.append(a, slot);
+            record_next = try self.directory.?.next();
         }
         const Order = struct {
             digests: []const [32]u8,
@@ -195,6 +217,23 @@ pub const Cursor = struct {
         };
         std.mem.sort(u32, files.items, Order{ .digests = self.digests }, Order.less);
         return files.toOwnedSlice(a);
+    }
+    fn seekBoundary(self: *Cursor) void {
+        self.file_position = 0;
+        const boundary = self.boundary orelse return;
+        if (!std.mem.eql(u8, self.group, boundary)) return;
+        const digest = self.digests[self.boundary_file.?];
+        var lo: usize = 0;
+        var hi = self.files.len;
+        // Lower bound in traversal order, including the boundary file itself:
+        // its row-coordinate seek decides which rows remain admissible.
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            const pos = if (self.reverse_ids) self.files.len - mid - 1 else mid;
+            const relation = std.mem.order(u8, &self.digests[self.files[pos]], &digest);
+            if (relation == (if (self.reverse_ids) std.math.Order.gt else .lt)) lo = mid + 1 else hi = mid;
+        }
+        self.file_position = lo;
     }
     fn openFile(self: *Cursor, slot: u32) !bool {
         _ = self.file_arena.reset(.retain_capacity);
