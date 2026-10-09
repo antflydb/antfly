@@ -81,6 +81,24 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("antfly-table-write-execution-contract-test", "Verify retained table-write teams across private callback dispatch")
         .dependOn(&b.addRunArtifact(table_write_execution_tests).step);
+    const lake_store_opening_root = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/lake_store_opening_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configureConsumer(b, lake_store_opening_root);
+    lake_store_opening_root.addImport("antfly_source_root", lake_store_opening_root);
+    const lake_store_opening_tests = b.addTest(.{
+        .name = "lake-store-opening-tests",
+        .root_module = lake_store_opening_root,
+        .filters = &.{"lake store opening"},
+        .max_rss = 3 * 1024 * 1024 * 1024,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const lake_store_opening_run = b.addRunArtifact(lake_store_opening_tests);
+    lake_store_opening_run.addArg("--require-no-skips");
+    b.step("antfly-lake-store-opening-test", "Verify lake provider and partial allocation ownership on opening failure")
+        .dependOn(&lake_store_opening_run.step);
     const physical_metadata_root = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/physical_resource_metadata_test_root.zig"),
         .target = target,
