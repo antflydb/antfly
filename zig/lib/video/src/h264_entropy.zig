@@ -5,9 +5,12 @@ const layout = @import("h264_layout.zig");
 const h264 = @import("h264.zig");
 const Bits = @import("h264_bits.zig").Bits;
 const Cabac = @import("h264_cabac.zig").Decoder;
-pub const Meta = struct { field: bool = false, slice_id: usize = std.math.maxInt(usize), filter: u2 = 0, alpha: i8 = 0, beta: i8 = 0, transform8: bool = false, direct: bool = false, kind: u8 = 255, chroma: u8 = 0, cbp: u8 = 0, dc: u8 = 0 };
+pub const Meta = struct { si: bool = false, switching_slice: bool = false, field: bool = false, slice_id: usize = std.math.maxInt(usize), filter: u2 = 0, alpha: i8 = 0, beta: i8 = 0, transform8: bool = false, direct: bool = false, kind: u8 = 255, chroma: u8 = 0, cbp: u8 = 0, dc: u8 = 0 };
 pub const Syntax = struct {
     bits: *Bits,
+    partitioned: bool = false,
+    intra_bits: ?*Bits = null,
+    inter_bits: ?*Bits = null,
     cabac: ?Cabac,
     meta: []Meta,
     counts: [3][]u8,
@@ -29,6 +32,10 @@ pub const Syntax = struct {
     pub fn init(bits: *Bits, use_cabac: bool, qp: i32, slice_type: u32, init_idc: usize, meta: []Meta, counts: [3][]u8, width: usize) !Syntax {
         return .{ .bits = bits, .cabac = if (use_cabac) try Cabac.init(bits, qp, if (slice_type == 2) 0 else init_idc + 1) else null, .meta = meta, .counts = counts, .width = width, .slice_type = slice_type };
     }
+    pub fn residualBits(self: *Syntax) !*Bits {
+        if (!self.partitioned) return self.bits;
+        return (if (self.meta[self.mb].kind <= 25) self.intra_bits else self.inter_bits) orelse error.MissingVideoPartition;
+    }
     pub fn location(self: *Syntax, plane: usize, x: i32, y: i32) ?layout.Cell {
         return layout.cellSample(self.meta, self.width, self.chroma_format, self.paired, self.field, self.parity, plane, x * 4, y * 4 + (if (y < @as(i32, @intCast(self.y / (if (plane != 0 and self.chroma_format == 1) @as(usize, 2) else 1)))) @as(i32, 3) else 0));
     }
@@ -43,7 +50,7 @@ pub const Syntax = struct {
     pub fn available(self: *Syntax, plane: usize, x: i32, y: i32, intra: bool) bool {
         const point = self.location(plane, x, y) orelse return false;
         const m = self.meta[point.mb];
-        return m.kind != 255 and m.slice_id == self.slice_id and (!intra or !self.constrained or m.kind <= 25);
+        return m.kind != 255 and m.slice_id == self.slice_id and (!intra or !self.constrained or (m.kind <= 25 and (!m.si or self.meta[self.mb].si)));
     }
     pub fn coefficientContext(self: *Syntax, plane: usize, x: usize, y: usize) usize {
         const left = self.available(plane, @as(i32, @intCast(x)) - 1, @intCast(y), false);
@@ -131,7 +138,7 @@ pub const Syntax = struct {
     pub fn cbp(self: *Syntax, intra: bool) !u32 {
         const c = if (self.cabac) |*decoder| decoder else {
             const code = try self.bits.ue();
-            if (self.chroma_format == 3) {
+            if (self.chroma_format == 0 or self.chroma_format == 3) {
                 const intra_map = [_]u8{ 15, 0, 7, 11, 13, 14, 3, 5, 10, 12, 1, 2, 4, 8, 6, 9 };
                 const inter_map = [_]u8{ 0, 1, 2, 4, 8, 3, 5, 10, 12, 15, 7, 11, 13, 14, 6, 9 };
                 if (code >= 16) return error.MalformedVideoPacket;
@@ -154,7 +161,7 @@ pub const Syntax = struct {
             const b = self.cbpNeighbor(bx, by - 1, true, result);
             result |= try c.bin(73 + a + 2 * b) << @as(u5, @intCast(i));
         }
-        if (self.chroma_format == 3) return result;
+        if (self.chroma_format == 0 or self.chroma_format == 3) return result;
         const a: u32 = @intFromBool(if (left) |m| m.kind == 25 or m.cbp >> 4 != 0 else false);
         const b: u32 = @intFromBool(if (top) |m| m.kind == 25 or m.cbp >> 4 != 0 else false);
         if (try c.bin(77 + a + 2 * b) != 0) {
@@ -190,7 +197,7 @@ pub const Syntax = struct {
     /// Category: 0 luma DC, 1 I16 AC, 2 luma4, 3 chroma DC, 4 chroma AC.
     pub fn coeff(self: *Syntax, nc: usize, max: usize, category: usize, plane: usize, x: usize, y: usize) !h264.Residual {
         const c = if (self.cabac) |*decoder| decoder else {
-            const result = try h264.cavlcResidual(self.bits, nc, max, category == 3);
+            const result = try h264.cavlcResidual(try self.residualBits(), nc, max, category == 3);
             try self.validateLevels(&result.values);
             return result;
         };
@@ -369,7 +376,7 @@ pub const Syntax = struct {
                 const bx = x + i % 2;
                 const by = y + i / 2;
                 const nc = self.coefficientContext(plane, bx, by);
-                const block = try h264.cavlcResidual(self.bits, nc, 16, false);
+                const block = try h264.cavlcResidual(try self.residualBits(), nc, 16, false);
                 self.counts[plane][self.cellIndex(plane, bx, by)] = block.total;
                 for (0..16) |j| values[scan[4 * j + i]] = block.values[j];
             }

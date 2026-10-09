@@ -28,9 +28,10 @@ pub fn Workspace(comptime Sample: type, comptime Header: type) type {
         pts: ?i64 = null,
         end: i64 = 0,
         pub fn init(allocator: std.mem.Allocator, pixels: usize, sub: usize, groups: usize, selections: usize) !Self {
-            const planar = try allocator.alloc(Sample, pixels + 2 * pixels / sub);
+            const chroma_pixels = if (sub == 0) @as(usize, 0) else pixels / sub;
+            const planar = try allocator.alloc(Sample, pixels + 2 * chroma_pixels);
             errdefer allocator.free(planar);
-            const counts = try allocator.alloc(u8, (pixels + 2 * pixels / sub) / 16);
+            const counts = try allocator.alloc(u8, (pixels + 2 * chroma_pixels) / 16);
             errdefer allocator.free(counts);
             const modes = try allocator.alloc(u8, pixels / 16);
             errdefer allocator.free(modes);

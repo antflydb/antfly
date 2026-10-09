@@ -18,12 +18,17 @@ pub const Options = struct {
     max_pending_pictures: usize = 16,
     /// Per reconstructed picture, including both standalone PAFF field packets.
     max_slices: usize = 256,
+    max_parameter_packets: usize = 4096,
+    max_parameter_bytes: usize = 4 * 1024 * 1024,
+    max_configurations: usize = 256,
 };
-const Config = struct {
+pub const Config = struct {
     profile: u32,
     bit_depth: u8,
     bypass_allowed: bool,
     chroma_format: u8,
+    separate_planes: bool = false,
+    selected_plane: u2 = 0,
     groups: @import("h264_groups.zig").Groups,
     redundant: bool,
     scaling: @import("h264_scaling.zig").Matrices,
@@ -32,6 +37,7 @@ const Config = struct {
     frame_only: bool,
     mbaff: bool,
     max_refs: usize,
+    gaps_allowed: bool,
     active0: usize,
     active1: usize,
     weighted_p: bool,
@@ -59,8 +65,19 @@ const Config = struct {
     full_range: bool,
     bottom_poc: bool,
     qp: i32,
+    qs: i32,
     chroma_offset: i32,
     deblock_present: bool,
+    pub fn independent(self: Config, plane: u2) Config {
+        var result = self;
+        result.chroma_format = 0;
+        result.selected_plane = plane;
+        result.scaling.four[0] = self.scaling.four[plane];
+        result.scaling.four[3] = self.scaling.four[3 + @as(usize, plane)];
+        result.scaling.eight[0] = self.scaling.eight[@as(usize, plane) * 2];
+        result.scaling.eight[1] = self.scaling.eight[@as(usize, plane) * 2 + 1];
+        return result;
+    }
 };
 pub const Frame = struct {
     allocator: std.mem.Allocator,
@@ -84,8 +101,8 @@ pub const Frame = struct {
     pub fn host(self: *const Frame) preparation.HostSurface {
         const bytes: usize = if (self.bit_depth == 8) 1 else 2;
         const size = @as(usize, self.width) * self.height * bytes;
-        const sub_x: u32 = if (self.chroma_format == 3) 1 else 2;
-        return .{ .chroma_format = self.chroma_format, .bit_depth = self.bit_depth, .width = self.width, .height = self.height, .format = if (self.full_range) .nv12_full else .nv12_video, .planes = .{ .{ .bytes = self.nv12[0..size], .width = self.width, .height = self.height, .stride = self.width * bytes }, .{ .bytes = self.nv12[size..], .width = self.width / sub_x, .height = self.height / (if (self.chroma_format == 1) @as(u32, 2) else 1), .stride = self.width * 2 / sub_x * bytes } } };
+        const sub_x: u32 = if (self.chroma_format == 0 or self.chroma_format == 3) 1 else 2;
+        return .{ .chroma_format = self.chroma_format, .bit_depth = self.bit_depth, .width = self.width, .height = self.height, .format = if (self.full_range) .nv12_full else .nv12_video, .planes = .{ .{ .bytes = self.nv12[0..size], .width = self.width, .height = self.height, .stride = self.width * bytes }, .{ .bytes = self.nv12[size..], .width = if (self.chroma_format == 0) 0 else self.width / sub_x, .height = if (self.chroma_format == 0) 0 else self.height / (if (self.chroma_format == 1) @as(u32, 2) else 1), .stride = if (self.chroma_format == 0) 0 else self.width * 2 / sub_x * bytes } } };
     }
     pub fn deinit(self: *Frame) void {
         self.allocator.free(self.nv12);
@@ -102,7 +119,7 @@ fn nalSet(config: []const u8, cursor: *usize) ![]const u8 {
     cursor.* += size;
     return nal;
 }
-fn configParse(allocator: std.mem.Allocator, config: []const u8) !Config {
+pub fn configParse(allocator: std.mem.Allocator, config: []const u8) !Config {
     try @import("avc.zig").validatePortableConfig(config);
     if (config[5] & 31 != 1) return error.UnsupportedVideoProfile;
     var cursor: usize = 6;
@@ -120,14 +137,15 @@ fn configParse(allocator: std.mem.Allocator, config: []const u8) !Config {
     var bit_depth: u8 = 8;
     var bypass_allowed = false;
     var chroma_format: u8 = 1;
+    var separate_planes = false;
     if (profile == 100 or profile == 110 or profile == 122 or profile == 244) {
         const chroma = try bits.ue();
-        if (chroma < 1 or chroma > 3 or (profile < 122 and chroma != 1) or (profile == 122 and chroma > 2)) return error.UnsupportedVideoProfile;
+        if (chroma > 3 or (profile < 122 and chroma > 1) or (profile == 122 and chroma > 2)) return error.UnsupportedVideoProfile;
         chroma_format = @intCast(chroma);
-        if (chroma == 3 and try bits.read(1) != 0) return error.UnsupportedVideoProfile;
+        if (chroma == 3) separate_planes = try bits.read(1) != 0;
         const depth_y = try bits.ue();
         const depth_c = try bits.ue();
-        if (depth_y != depth_c or depth_y > 6 or (profile == 100 and depth_y != 0) or ((profile == 110 or profile == 122) and depth_y > 2)) return error.UnsupportedVideoProfile;
+        if ((chroma != 0 and depth_y != depth_c) or depth_y > 6 or depth_c > 6 or (profile == 100 and depth_y != 0) or ((profile == 110 or profile == 122) and depth_y > 2)) return error.UnsupportedVideoProfile;
         bit_depth = @intCast(depth_y + 8);
         bypass_allowed = try bits.read(1) != 0;
         if (bypass_allowed and profile != 244) return error.MalformedVideoConfig;
@@ -154,7 +172,8 @@ fn configParse(allocator: std.mem.Allocator, config: []const u8) !Config {
         for (poc_offsets[0..poc_cycle]) |*offset| offset.* = try bits.se();
     } else if (poc != 2) return error.MalformedVideoConfig;
     const max_refs = try bits.ue();
-    if (max_refs > 16 or try bits.read(1) != 0) return error.UnsupportedVideoProfile;
+    if (max_refs > 16) return error.UnsupportedVideoProfile;
+    const gaps_allowed = try bits.read(1) != 0;
     const mbs_width = try bits.ue() + 1;
     const mbs_height = try bits.ue() + 1;
     if (mbs_width > 1024 or mbs_height > 1024) return error.UnsupportedVideoProfile;
@@ -175,7 +194,7 @@ fn configParse(allocator: std.mem.Allocator, config: []const u8) !Config {
     const coded_width: usize = mbs_width * 16;
     const coded_height: usize = mbs_height * 16 * (if (frame_only) @as(usize, 1) else 2);
     const sub_y: usize = (if (chroma_format == 1) @as(usize, 2) else 1) * (if (frame_only) @as(usize, 1) else 2);
-    const sub_x: usize = if (chroma_format == 3) 1 else 2;
+    const sub_x: usize = if (chroma_format == 0 or chroma_format == 3) 1 else 2;
     if (left + right >= coded_width / sub_x or (top + bottom) * sub_y >= coded_height) return error.MalformedVideoConfig;
     var full_range = false;
     if (try bits.read(1) != 0) full_range = try vui(&bits);
@@ -193,7 +212,7 @@ fn configParse(allocator: std.mem.Allocator, config: []const u8) !Config {
     const bottom_poc = try p.read(1) != 0;
     const groups = try @import("h264_groups.zig").Groups.parse(&p, allocator, mbs_width, mbs_height);
     errdefer groups.deinit(allocator);
-    if (groups.count != 1 and profile != 66) return error.MalformedVideoConfig;
+    if (groups.count != 1 and profile != 66 and profile != 88) return error.MalformedVideoConfig;
     const active0 = try p.ue() + 1;
     const active1 = try p.ue() + 1;
     if (active0 > 16 or active1 > 16) return error.UnsupportedVideoProfile;
@@ -202,7 +221,8 @@ fn configParse(allocator: std.mem.Allocator, config: []const u8) !Config {
     if (weighted_b == 3 or (profile == 66 and (weighted_p or weighted_b != 0))) return error.MalformedVideoConfig;
     const qp = try p.se() + 26;
     if (qp < -6 * @as(i32, bit_depth - 8) or qp > 51) return error.MalformedVideoConfig;
-    _ = try p.se();
+    const qs = try p.se() + 26;
+    if (qs < 0 or qs > 51) return error.MalformedVideoConfig;
     const chroma_offset = try p.se();
     if (chroma_offset < -12 or chroma_offset > 12) return error.MalformedVideoConfig;
     const deblock_present = try p.read(1) != 0;
@@ -218,7 +238,7 @@ fn configParse(allocator: std.mem.Allocator, config: []const u8) !Config {
         if (chroma_offset1 < -12 or chroma_offset1 > 12) return error.MalformedVideoConfig;
     }
     try p.finish();
-    return .{ .bypass_allowed = bypass_allowed, .frame_only = frame_only, .mbaff = mbaff, .chroma_format = chroma_format, .bit_depth = bit_depth, .groups = groups, .redundant = redundant, .constrained = constrained, .scaling = scaling, .chroma_offset1 = chroma_offset1, .profile = profile, .max_refs = max_refs, .active0 = active0, .active1 = active1, .weighted_p = weighted_p, .weighted_b = weighted_b, .direct8 = direct8, .transform8 = transform8, .cabac = cabac, .id = id, .pps = pps_id, .frame_bits = frame_bits, .poc_type = poc, .poc_zero = poc_zero, .poc_nonref = poc_nonref, .poc_bottom = poc_bottom, .poc_cycle = poc_cycle, .poc_offsets = poc_offsets, .poc_bits = poc_bits, .coded_width = coded_width, .coded_height = coded_height, .width = coded_width - sub_x * (left + right), .height = coded_height - sub_y * (top + bottom), .left = sub_x * left, .top = sub_y * top, .full_range = full_range, .bottom_poc = bottom_poc, .qp = qp, .chroma_offset = chroma_offset, .deblock_present = deblock_present };
+    return .{ .bypass_allowed = bypass_allowed, .frame_only = frame_only, .mbaff = mbaff, .chroma_format = chroma_format, .separate_planes = separate_planes, .bit_depth = bit_depth, .groups = groups, .redundant = redundant, .constrained = constrained, .scaling = scaling, .chroma_offset1 = chroma_offset1, .profile = profile, .max_refs = max_refs, .gaps_allowed = gaps_allowed, .active0 = active0, .active1 = active1, .weighted_p = weighted_p, .weighted_b = weighted_b, .direct8 = direct8, .transform8 = transform8, .cabac = cabac, .id = id, .pps = pps_id, .frame_bits = frame_bits, .poc_type = poc, .poc_zero = poc_zero, .poc_nonref = poc_nonref, .poc_bottom = poc_bottom, .poc_cycle = poc_cycle, .poc_offsets = poc_offsets, .poc_bits = poc_bits, .coded_width = coded_width, .coded_height = coded_height, .width = coded_width - sub_x * (left + right), .height = coded_height - sub_y * (top + bottom), .left = sub_x * left, .top = sub_y * top, .full_range = full_range, .bottom_poc = bottom_poc, .qp = qp, .qs = qs, .chroma_offset = chroma_offset, .deblock_present = deblock_present };
 }
 fn hrd(bits: *Bits) !void {
     const count = try bits.ue() + 1;
@@ -449,26 +469,7 @@ fn bypassAdd(plane: anytype, stride: usize, x: usize, y: usize, width: usize, he
     };
 }
 fn inverseAdd(plane: anytype, stride: usize, x: usize, y: usize, coefficients: [16]i64, bit_depth: u8) void {
-    var temp: [16]i64 = undefined;
-    var result: [16]i64 = undefined;
-    for (0..4) |row| {
-        const p = coefficients[row * 4 ..][0..4];
-        const a = p[0] + p[2];
-        const b = p[0] - p[2];
-        const c = (p[1] >> 1) - p[3];
-        const d = p[1] + (p[3] >> 1);
-        temp[row * 4 ..][0..4].* = .{ a + d, b + c, b - c, a - d };
-    }
-    for (0..4) |column| {
-        const a = temp[column] + temp[8 + column];
-        const b = temp[column] - temp[8 + column];
-        const c = (temp[4 + column] >> 1) - temp[12 + column];
-        const d = temp[4 + column] + (temp[12 + column] >> 1);
-        result[column] = a + d;
-        result[4 + column] = b + c;
-        result[8 + column] = b - c;
-        result[12 + column] = a - d;
-    }
+    const result = @import("h264_transform4.zig").scalar(coefficients);
     for (0..4) |row| for (0..4) |column| {
         const offset = (y + row) * stride + x + column;
         layout.put(plane, offset, clipSample(layout.Sample(@TypeOf(plane)), @as(i64, layout.get(plane, offset)) + ((result[row * 4 + column] + 32) >> 6), bit_depth));
@@ -511,6 +512,7 @@ fn reorder(bits: *Bits, state: anytype, frame_bits: usize, active: usize) !void 
             break;
         };
         const target = found orelse return error.MissingVideoReference;
+        if (state.pictures[target].non_existing) return error.MissingVideoReference;
         var updated: [16]usize = undefined;
         var count: usize = 0;
         for (state.list0[0..insertion]) |i| {
@@ -533,6 +535,7 @@ fn reorder(bits: *Bits, state: anytype, frame_bits: usize, active: usize) !void 
 const PictureHeader = struct {
     frame_num: u32,
     frame_offset: i32,
+    pps: u32,
     poc: i32,
     idr: bool,
     reference: bool,
@@ -550,16 +553,18 @@ fn predictionNeighbors(syntax: *@import("h264_entropy.zig").Syntax, plane: usize
     const by: i32 = @intCast(y / 4);
     return .{ .top = syntax.available(plane, bx, by - 1, true), .left = syntax.available(plane, bx - 1, by, true), .corner = syntax.available(plane, bx - 1, by - 1, true), .top_right = right };
 }
-fn decodeSlice(allocator: std.mem.Allocator, nal: []const u8, cfg: Config, physical_planes: anytype, counts: [3][]u8, modes: []u8, qps: []u8, metadata: []@import("h264_entropy.zig").Meta, motions: []@import("h264_motion.zig").Motion, motions1: []@import("h264_motion.zig").Motion, references: anytype, headers: *[2]?PictureHeader, group_map: []u8, control: media.source.Control) !void {
+fn decodeSlice(allocator: std.mem.Allocator, nal: []const u8, cfg: Config, physical_planes: anytype, counts: [3][]u8, modes: []u8, qps: []u8, metadata: []@import("h264_entropy.zig").Meta, motions: []@import("h264_motion.zig").Motion, motions1: []@import("h264_motion.zig").Motion, references: anytype, headers: *[2]?PictureHeader, group_map: []u8, control: media.source.Control, partitions: *@import("h264_partitions.zig").Registry) !void {
     var bits = try Bits.initSlice(allocator, nal, control, cfg.cabac);
     defer bits.deinit();
     const first_mb = try bits.ue();
     const encoded_type = try bits.ue();
     if (encoded_type > 9) return error.MalformedVideoPacket;
-    const slice_type = encoded_type % 5;
-    if (slice_type != 2 and slice_type != 0 and slice_type != 1) return error.UnsupportedVideoProfile;
+    const wire_type = encoded_type % 5;
+    if (wire_type >= 3 and (cfg.profile != 88 or cfg.cabac or cfg.bit_depth != 8 or cfg.chroma_format != 1)) return error.UnsupportedVideoProfile;
+    const slice_type = if (wire_type == 3) @as(u32, 0) else if (wire_type == 4) @as(u32, 2) else wire_type;
     if (cfg.profile == 66 and slice_type == 1) return error.MalformedVideoPacket;
     if (try bits.ue() != cfg.pps) return error.MalformedVideoPacket;
+    if (cfg.separate_planes and try bits.read(2) != cfg.selected_plane) return error.MixedVideoPictures;
     const frame_num = try bits.read(cfg.frame_bits);
     const field_pic = !cfg.frame_only and try bits.read(1) != 0;
     const bottom = field_pic and try bits.read(1) != 0;
@@ -574,7 +579,7 @@ fn decodeSlice(allocator: std.mem.Allocator, nal: []const u8, cfg: Config, physi
     if (first_address >= picture_mbs) return error.MalformedVideoPacket;
     const idr = nal[0] & 31 == 5;
     const reference = nal[0] & 0x60 != 0;
-    if (header.*) |previous| if (previous.frame_num != frame_num or previous.idr != idr or previous.reference != reference or previous.field_pic != field_pic or previous.bottom != bottom) {
+    if (header.*) |previous| if (previous.pps != cfg.pps or previous.frame_num != frame_num or previous.idr != idr or previous.reference != reference or previous.field_pic != field_pic or previous.bottom != bottom) {
         return error.MixedVideoPictures;
     };
     references.reference = reference;
@@ -593,9 +598,14 @@ fn decodeSlice(allocator: std.mem.Allocator, nal: []const u8, cfg: Config, physi
         references.previous_lsb = 0;
         references.previous_msb = 0;
         references.previous_num = 0;
+        references.previous_reference_num = 0;
         references.frame_offset = 0;
     }
     references.frame_bits = cfg.frame_bits;
+    // The qualified inter-picture PAFF extension can encounter earlier
+    // unfinished frame numbers after later fields. Preserve that ordering when
+    // gaps were not declared; declared gaps use normative inference.
+    if (!idr and first_picture and (cfg.gaps_allowed or !field_pic)) try references.inferGaps(allocator, frame_num, cfg, control);
     const frame_offset = if (header.*) |previous| previous.frame_offset else if (headers[1 - parity]) |other| other.frame_offset else blk: {
         if (references.previous_num > frame_num) references.frame_offset = std.math.add(i32, references.frame_offset, @as(i32, 1) << @as(u5, @intCast(cfg.frame_bits))) catch return error.TimestampOverflow;
         references.previous_num = frame_num;
@@ -678,7 +688,7 @@ fn decodeSlice(allocator: std.mem.Allocator, nal: []const u8, cfg: Config, physi
     }
     references.weight_mode = .none;
     if ((slice_type == 0 and cfg.weighted_p) or (slice_type == 1 and cfg.weighted_b == 1)) {
-        references.weights = try @import("h264_weights.zig").parse(&bits, .{ active0, active1 }, slice_type == 1);
+        references.weights = try @import("h264_weights.zig").parseForChroma(&bits, .{ active0, active1 }, slice_type == 1, cfg.chroma_format);
         references.weight_mode = .explicit;
     } else if (slice_type == 1 and cfg.weighted_b == 2) references.weight_mode = .implicit;
     try references.marking(&bits, idr);
@@ -694,6 +704,13 @@ fn decodeSlice(allocator: std.mem.Allocator, nal: []const u8, cfg: Config, physi
     const depth_offset: i32 = 6 * @as(i32, cfg.bit_depth - 8);
     var qp = cfg.qp + try bits.se() + depth_offset;
     if (qp < 0 or qp > 51 + depth_offset) return error.MalformedVideoPacket;
+    const switching = wire_type == 4 or (wire_type == 3 and try bits.read(1) != 0);
+    const qs: usize = if (wire_type >= 3) blk: {
+        const value = cfg.qs + try bits.se();
+        if (value < 0 or value > 51) return error.MalformedVideoPacket;
+        break :blk @intCast(value);
+    } else 0;
+    const chroma_qs = [2]usize{ chromaQp(@intCast(qs), cfg.chroma_offset), chromaQp(@intCast(qs), cfg.chroma_offset1) };
     const filter = if (cfg.deblock_present) try bits.ue() else 0;
     if (filter > 2) return error.MalformedVideoPacket;
     var alpha_offset: i32 = 0;
@@ -712,8 +729,17 @@ fn decodeSlice(allocator: std.mem.Allocator, nal: []const u8, cfg: Config, physi
         return error.MixedVideoPictures;
     };
     if (first_slice and group_map.len != 0) cfg.groups.build(group_map, cfg.coded_width / 16, group_cycle);
-    header.* = .{ .frame_num = frame_num, .frame_offset = frame_offset, .poc = references.current_poc, .idr = idr, .reference = reference, .idr_id = idr_id, .group_cycle = group_cycle, .field_pic = field_pic, .bottom = bottom, .adaptive = references.adaptive, .current_long = references.current_long, .commands = references.commands, .command_count = references.command_count };
+    header.* = .{ .pps = cfg.pps, .frame_num = frame_num, .frame_offset = frame_offset, .poc = references.current_poc, .idr = idr, .reference = reference, .idr_id = idr_id, .group_cycle = group_cycle, .field_pic = field_pic, .bottom = bottom, .adaptive = references.adaptive, .current_long = references.current_long, .commands = references.commands, .command_count = references.command_count };
+    const partitioned = nal[0] & 31 == 2;
+    if (partitioned and (cfg.cabac or cfg.profile != 88)) return error.MalformedVideoPacket;
+    const partition_id = if (partitioned) try bits.ue() else 0;
+    if (partition_id >= picture_mbs) return error.MalformedVideoPacket;
     var syntax = try @import("h264_entropy.zig").Syntax.init(&bits, cfg.cabac, std.math.clamp(qp - depth_offset, 0, 51), slice_type, init_idc, metadata, counts, cfg.coded_width);
+    if (partitioned) {
+        syntax.partitioned = true;
+        syntax.intra_bits = try partitions.take(partition_id, 3, redundant);
+        syntax.inter_bits = try partitions.take(partition_id, 4, redundant);
+    }
     syntax.slice_id = first_mb;
     syntax.constrained = cfg.constrained;
     syntax.chroma_format = cfg.chroma_format;
@@ -805,11 +831,15 @@ fn decodeSlice(allocator: std.mem.Allocator, nal: []const u8, cfg: Config, physi
         references.field_mode = field;
         references.field_parity = current_parity;
         const scan4 = if (field) [_]usize{ 0, 4, 1, 8, 12, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15 } else zigzag;
-        const encoded_kind: u32 = if (skipped) 0 else try syntax.kind();
+        const wire_kind: u32 = if (skipped) 0 else try syntax.kind();
+        const si_mb = wire_type == 4 and wire_kind == 0;
+        const encoded_kind: u32 = if (wire_type == 4 and wire_kind != 0) wire_kind - 1 else wire_kind;
         const inter = (slice_type == 0 and encoded_kind < 5) or (slice_type == 1 and encoded_kind < 23);
         const kind = if (inter) @as(u32, 26) else encoded_kind - @as(u32, if (slice_type == 0) 5 else if (slice_type == 1) 23 else 0);
         if ((!inter and kind > 25) or (skipped and !inter)) return error.UnsupportedVideoProfile;
         metadata[mb].kind = @intCast(if (skipped) 27 else kind);
+        metadata[mb].switching_slice = wire_type >= 3;
+        metadata[mb].si = si_mb;
         if (!inter) {
             for (0..4) |row| for (0..4) |column| {
                 motions[syntax.cellIndex(0, x / 4 + column, y / 4 + row)] = .{ .decoded = true };
@@ -817,7 +847,9 @@ fn decodeSlice(allocator: std.mem.Allocator, nal: []const u8, cfg: Config, physi
             };
         }
         const allow8 = if (inter) try @import("h264_inter.zig").predict(&syntax, references, planes, .{ motions, motions1 }, cfg.coded_width, cfg.coded_height, encoded_kind, .{ active0 * (if (field and mbaff) @as(usize, 2) else 1), active1 * (if (field and mbaff) @as(usize, 2) else 1) }, skipped, spatial_direct, cfg.direct8, cfg.bit_depth, cfg.chroma_format) else true;
+        const sp_mb = (wire_type == 3 and inter) or si_mb;
         if (skipped) {
+            if (sp_mb) @import("h264_switching.zig").skipped(planes, cfg.coded_width, x, y, @intCast(qp), qs, .{ chromaQp(qp, cfg.chroma_offset), chromaQp(qp, cfg.chroma_offset1) }, chroma_qs, switching);
             qps[mb] = @intCast(qp);
             for (0..4) |row| for (0..4) |col| {
                 modes[syntax.cellIndex(0, x / 4 + col, y / 4 + row)] = 2;
@@ -834,18 +866,19 @@ fn decodeSlice(allocator: std.mem.Allocator, nal: []const u8, cfg: Config, physi
             // CABAC flush completes the arithmetic byte before PCM samples;
             // its unused low bits can be nonzero (including x264's flush bit).
             // CAVLC carries explicit pcm_alignment_zero_bit syntax instead.
-            while (bits.position % 8 != 0) {
-                const padding = try bits.read(1);
+            const pcm_bits = try syntax.residualBits();
+            while (pcm_bits.position % 8 != 0) {
+                const padding = try pcm_bits.read(1);
                 if (syntax.cabac == null and padding != 0) return error.MalformedVideoPacket;
             }
-            for (0..3) |plane| {
+            for (0..if (cfg.chroma_format == 0) @as(usize, 1) else 3) |plane| {
                 const size: usize = if (plane == 0) 16 else 16 / sub_x;
                 const stride = if (plane == 0) cfg.coded_width else cfg.coded_width / sub_x;
                 const px = if (plane == 0) x else x / sub_x;
                 const py = if (plane == 0) y else y / sub_y;
                 const height = if (plane == 0) 16 else 16 / sub_y;
                 for (0..height) |row| for (0..size) |column| {
-                    layout.put(planes[plane], (py + row) * stride + px + column, @intCast(try bits.read(cfg.bit_depth)));
+                    layout.put(planes[plane], (py + row) * stride + px + column, @intCast(try pcm_bits.read(cfg.bit_depth)));
                 };
                 for (0..height / 4) |row| for (0..size / 4) |col| {
                     counts[plane][syntax.cellIndex(plane, px / 4 + col, py / 4 + row)] = 16;
@@ -867,7 +900,7 @@ fn decodeSlice(allocator: std.mem.Allocator, nal: []const u8, cfg: Config, physi
         if (!inter and kind > 24) return error.UnsupportedVideoProfile;
         const value = if (inter) @as(u32, 0) else kind -| 1;
         const mode = value % 4;
-        var cbp_chroma = if (cfg.chroma_format == 3) @as(u32, 0) else value / 4 % 3;
+        var cbp_chroma = if ((cfg.chroma_format == 0 or cfg.chroma_format == 3)) @as(u32, 0) else value / 4 % 3;
         var cbp_luma: u32 = if (value / 12 != 0) 15 else 0;
         var use8 = kind == 0 and cfg.transform8 and try syntax.transform8();
         metadata[mb].transform8 = use8;
@@ -890,7 +923,7 @@ fn decodeSlice(allocator: std.mem.Allocator, nal: []const u8, cfg: Config, physi
         } else for (0..4) |row| for (0..4) |col| {
             modes[syntax.cellIndex(0, x / 4 + col, y / 4 + row)] = 2;
         };
-        const chroma_mode = if (inter or cfg.chroma_format == 3) @as(u32, 0) else try syntax.chroma();
+        const chroma_mode = if (inter or cfg.chroma_format == 0 or cfg.chroma_format == 3) @as(u32, 0) else try syntax.chroma();
         if (chroma_mode > 3) return error.MalformedVideoPacket;
         metadata[mb].chroma = @intCast(chroma_mode);
         if (kind == 0 or inter) {
@@ -911,7 +944,7 @@ fn decodeSlice(allocator: std.mem.Allocator, nal: []const u8, cfg: Config, physi
         qps[mb] = @intCast(qp);
         const bypass = cfg.bypass_allowed and qp == 0;
         const cqs = [2]usize{ chromaQpDepth(qp, cfg.chroma_offset, depth_offset), chromaQpDepth(qp, cfg.chroma_offset1, depth_offset) };
-        if (cfg.chroma_format != 3 and !inter) {
+        if (cfg.chroma_format != 0 and cfg.chroma_format != 3 and !inter) {
             try predict(planes[1], cfg.coded_width / 2, x / 2, y / sub_y, 8, chroma_mode, true, 16 / sub_y, cfg.bit_depth, predictionNeighbors(&syntax, 1, x / 2, y / sub_y, false));
             try predict(planes[2], cfg.coded_width / 2, x / 2, y / sub_y, 8, chroma_mode, true, 16 / sub_y, cfg.bit_depth, predictionNeighbors(&syntax, 2, x / 2, y / sub_y, false));
         }
@@ -967,10 +1000,12 @@ fn decodeSlice(allocator: std.mem.Allocator, nal: []const u8, cfg: Config, physi
                     counts[plane][syntax.cellIndex(plane, bx, by)] = ac.total;
                     for (0..if (kind == 0 or inter) @as(usize, 16) else 15) |j| {
                         const position = scan4[j + @as(usize, if (kind == 0 or inter) 0 else 1)];
-                        coefficients[position] = if (bypass) ac.values[j] else dequant(ac.values[j], q, position, cfg.scaling.four[plane + (if (inter) @as(usize, 3) else 0)][position]);
+                        coefficients[position] = if (bypass or sp_mb) ac.values[j] else dequant(ac.values[j], q, position, cfg.scaling.four[plane + (if (inter) @as(usize, 3) else 0)][position]);
                     }
                 }
-                if (bypass) {
+                if (sp_mb) {
+                    @import("h264_switching.zig").luma(planes[plane], cfg.coded_width, bx * 4, by * 4, coefficients, q, qs, switching);
+                } else if (bypass) {
                     if (kind != 0 and !inter) {
                         for (0..4) |row| for (0..4) |col| {
                             bypass_mb[(point[1] * 4 + row) * 16 + point[0] * 4 + col] = coefficients[row * 4 + col];
@@ -980,8 +1015,9 @@ fn decodeSlice(allocator: std.mem.Allocator, nal: []const u8, cfg: Config, physi
             }
             if (bypass and kind != 0 and !inter) bypassAdd(planes[plane], cfg.coded_width, x, y, 16, 16, &bypass_mb, mode, cfg.bit_depth);
         }
-        if (cfg.chroma_format != 3) {
+        if (cfg.chroma_format != 0 and cfg.chroma_format != 3) {
             var chroma_dc: [2][8]i64 = @splat(@splat(0));
+            var sp_dc: [2][4]i64 = @splat(@splat(0));
             if (cbp_chroma != 0) for (0..2) |p| {
                 const cq = cqs[p];
                 const n: usize = 8 / sub_y;
@@ -990,6 +1026,10 @@ fn decodeSlice(allocator: std.mem.Allocator, nal: []const u8, cfg: Config, physi
                 // DC 2x4 uses the ordinary zigzag restricted to a 2x4 matrix.
                 const scan = [_]usize{ 0, 2, 1, 4, 6, 3, 5, 7 };
                 for (0..n) |i| d[if (n == 4) i else scan[i]] = r.values[i];
+                if (sp_mb) {
+                    for (0..4) |i| sp_dc[p][i] = d[i];
+                    continue;
+                }
                 if (bypass) {
                     chroma_dc[p] = d;
                     continue;
@@ -1005,6 +1045,7 @@ fn decodeSlice(allocator: std.mem.Allocator, nal: []const u8, cfg: Config, physi
             };
             for (1..3) |p| {
                 var raw_chroma: [128]i64 = undefined;
+                var sp_levels: [4][16]i64 = @splat(@splat(0));
                 if (bypass) @memset(&raw_chroma, 0);
                 for (0..8 / sub_y) |i| {
                     const cq = cqs[p - 1];
@@ -1016,14 +1057,17 @@ fn decodeSlice(allocator: std.mem.Allocator, nal: []const u8, cfg: Config, physi
                     if (cbp_chroma == 2) {
                         const ac = try syntax.coeff(syntax.coefficientContext(p, bx, by), 15, 4, p, bx, by);
                         counts[p][syntax.cellIndex(p, bx, by)] = ac.total;
-                        for (0..15) |j| coefficients[scan4[j + 1]] = if (bypass) ac.values[j] else dequant(ac.values[j], cq, scan4[j + 1], cfg.scaling.four[if (inter) p + 3 else p][scan4[j + 1]]);
+                        for (0..15) |j| coefficients[scan4[j + 1]] = if (bypass or sp_mb) ac.values[j] else dequant(ac.values[j], cq, scan4[j + 1], cfg.scaling.four[if (inter) p + 3 else p][scan4[j + 1]]);
                     }
-                    if (bypass) {
+                    if (sp_mb) {
+                        sp_levels[i] = coefficients;
+                    } else if (bypass) {
                         for (0..4) |row| for (0..4) |col| {
                             raw_chroma[(i / 2 * 4 + row) * 8 + i % 2 * 4 + col] = coefficients[row * 4 + col];
                         };
                     } else inverseAdd(planes[p], stride, bx * 4, by * 4, coefficients, cfg.bit_depth);
                 }
+                if (sp_mb) @import("h264_switching.zig").chroma(planes[p], cfg.coded_width / 2, x / 2, y / 2, sp_levels, sp_dc[p - 1], cqs[p - 1], chroma_qs[p - 1], switching);
                 if (bypass) bypassAdd(planes[p], cfg.coded_width / 2, x / 2, y / sub_y, 8, 16 / sub_y, raw_chroma[0 .. 128 / sub_y], if (inter) null else if (chroma_mode == 1) @as(u32, 1) else if (chroma_mode == 2) @as(u32, 0) else null, cfg.bit_depth);
             }
         }
@@ -1042,10 +1086,15 @@ pub fn decodeFrame(allocator: std.mem.Allocator, reader: *media.mp4.Reader, inde
     try reader.input.control.check();
     if (reader.track.codec != .avc) return error.UnsupportedVideoCodec;
     if (index >= reader.packets.len) return error.InvalidPacketIndex;
+    if (reader.track.inband_parameter_sets) {
+        const session = try @import("h264_dynamic.zig").Session.init(allocator, reader, options);
+        defer session.deinit();
+        return session.decodeFrame(index);
+    }
     const packet = reader.packets[index];
     if (packet.size > options.max_packet_bytes) return error.ResourceLimitExceeded;
     var budget = @import("decode_budget.zig").Budget{ .backing = allocator, .limit = options.max_decode_bytes };
-    return decodeBudget(&budget, reader, &.{index}, options, null, null) catch |err| {
+    return decodeBudget(&budget, reader, &.{index}, options, null, null, null) catch |err| {
         return if (err == error.OutOfMemory and budget.denied) error.ResourceLimitExceeded else err;
     };
 }
@@ -1060,14 +1109,25 @@ pub fn decodeSelected(allocator: std.mem.Allocator, reader: *media.mp4.Reader, i
     for (indexes) |index| if (index >= reader.packets.len) {
         return error.InvalidPacketIndex;
     };
+    if (reader.track.inband_parameter_sets) {
+        const session = try @import("h264_dynamic.zig").Session.init(allocator, reader, options);
+        defer session.deinit();
+        return session.decodeSelected(indexes, callback_context, callback);
+    }
     var budget = @import("decode_budget.zig").Budget{ .backing = allocator, .limit = options.max_decode_bytes };
-    var frame = decodeBudget(&budget, reader, indexes, options, callback_context, callback) catch |err| {
+    var frame = decodeBudget(&budget, reader, indexes, options, callback_context, callback, null) catch |err| {
         return if (err == error.OutOfMemory and budget.denied) error.ResourceLimitExceeded else err;
     };
     defer frame.deinit();
     return .{ .decoded_packets = frame.decoded_packets, .payload_bytes = frame.payload_bytes, .decode_high_water = frame.decode_high_water };
 }
-fn decodeBudget(budget: *@import("decode_budget.zig").Budget, reader: *media.mp4.Reader, indexes: []const usize, options: Options, callback_context: ?*anyopaque, callback: ?SelectionCallback) !Frame {
+pub fn decodeWithConfigurations(allocator: std.mem.Allocator, reader: *media.mp4.Reader, indexes: []const usize, options: Options, callback_context: ?*anyopaque, callback: ?SelectionCallback, configurations: @import("h264_dynamic.zig").Context) !Frame {
+    if (indexes.len == 0 or indexes.len > options.max_dependency_packets) return error.ResourceLimitExceeded;
+    for (indexes) |index| if (index >= reader.packets.len) return error.InvalidPacketIndex;
+    var budget = @import("decode_budget.zig").Budget{ .backing = allocator, .limit = options.max_decode_bytes };
+    return decodeBudget(&budget, reader, indexes, options, callback_context, callback, configurations) catch |err| return if (err == error.OutOfMemory and budget.denied) error.ResourceLimitExceeded else err;
+}
+fn decodeBudget(budget: *@import("decode_budget.zig").Budget, reader: *media.mp4.Reader, indexes: []const usize, options: Options, callback_context: ?*anyopaque, callback: ?SelectionCallback, configurations: ?@import("h264_dynamic.zig").Context) !Frame {
     var index: usize = 0;
     var first_index: usize = reader.packets.len;
     for (indexes) |selected| {
@@ -1080,12 +1140,13 @@ fn decodeBudget(budget: *@import("decode_budget.zig").Budget, reader: *media.mp4
     const cfg = try configParse(allocator, reader.track.avcc);
     defer cfg.groups.deinit(allocator);
     try config_reservation.resize(.{ .host_bytes = if (cfg.groups.explicit) |map| map.len else 0 });
-    return if (cfg.bit_depth == 8) decodeConfigured(u8, cfg, &config_reservation, budget, reader, indexes, options, callback_context, callback, index, first_index) else decodeConfigured(u16, cfg, &config_reservation, budget, reader, indexes, options, callback_context, callback, index, first_index);
+    if (cfg.separate_planes) return if (cfg.bit_depth == 8) decodeSeparated(u8, cfg, &config_reservation, budget, reader, indexes, options, callback_context, callback, index, first_index, configurations) else decodeSeparated(u16, cfg, &config_reservation, budget, reader, indexes, options, callback_context, callback, index, first_index, configurations);
+    return if (cfg.bit_depth == 8) decodeConfigured(u8, cfg, &config_reservation, budget, reader, indexes, options, callback_context, callback, index, first_index, configurations) else decodeConfigured(u16, cfg, &config_reservation, budget, reader, indexes, options, callback_context, callback, index, first_index, configurations);
 }
 /// PAFF reset packets may contain an IDR first field and a non-IDR
 /// complementary second field. Hardware seeking keeps the stricter avc.isIdr.
 fn isDependencyReset(allocator: std.mem.Allocator, cfg: Config, bytes: []const u8, length_bytes: u3, input: *media.source.Source) !bool {
-    if (try @import("avc.zig").isIdr(bytes, length_bytes)) {
+    if (try @import("avc.zig").isPortableIdr(bytes, length_bytes)) {
         if (cfg.frame_only) return true;
         var reservation = if (input.admission_pool) |pool| try pool.acquire(.{ .host_bytes = bytes.len }) else media.admission.Token{};
         defer reservation.deinit();
@@ -1122,7 +1183,9 @@ fn isDependencyReset(allocator: std.mem.Allocator, cfg: Config, bytes: []const u
         defer bits.deinit();
         _ = try bits.ue();
         const slice_type = try bits.ue();
-        if (try bits.ue() != cfg.pps or try bits.read(cfg.frame_bits) != 0 or try bits.read(1) != 1) return false;
+        if (try bits.ue() != cfg.pps) return false;
+        if (cfg.separate_planes and try bits.read(2) != cfg.selected_plane) continue;
+        if (try bits.read(cfg.frame_bits) != 0 or try bits.read(1) != 1) return false;
         const parity = try bits.read(1);
         if (first_parity == null) {
             if (kind != 5 or slice_type % 5 != 2 or nal[0] & 0x60 == 0) return false;
@@ -1154,18 +1217,20 @@ fn extendAssembly(reader: *media.mp4.Reader, start: usize, current: usize, end: 
     }
     end.* += 1;
 }
-const Prefix = struct { frame_num: u32, field: bool, parity: usize, reference: bool, idr: bool, idr_id: u32 };
+const Prefix = struct { plane: u2 = 0, frame_num: u32, field: bool, parity: usize, reference: bool, idr: bool, idr_id: u32 };
 fn slicePrefix(allocator: std.mem.Allocator, cfg: Config, nal: []const u8, control: media.source.Control) !Prefix {
     var bits = try Bits.initSlice(allocator, nal, control, cfg.cabac);
     defer bits.deinit();
     _ = try bits.ue();
     _ = try bits.ue();
     if (try bits.ue() != cfg.pps) return error.MalformedVideoPacket;
+    const plane: u2 = if (cfg.separate_planes) @intCast(try bits.read(2)) else 0;
+    if (plane > 2) return error.MalformedVideoPacket;
     const frame_num = try bits.read(cfg.frame_bits);
     const field = !cfg.frame_only and try bits.read(1) != 0;
     const parity: usize = if (field) @intCast(try bits.read(1)) else 0;
     const idr = nal[0] & 31 == 5;
-    return .{ .frame_num = frame_num, .field = field, .parity = parity, .reference = nal[0] & 0x60 != 0, .idr = idr, .idr_id = if (idr) try bits.ue() else 0 };
+    return .{ .plane = plane, .frame_num = frame_num, .field = field, .parity = parity, .reference = nal[0] & 0x60 != 0, .idr = idr, .idr_id = if (idr) try bits.ue() else 0 };
 }
 fn restoreMarking(references: anytype, workspace: anytype, header: PictureHeader, parity: usize, mbaff: bool) void {
     references.current_pair = workspace.id;
@@ -1185,7 +1250,8 @@ fn restoreMarking(references: anytype, workspace: anytype, header: PictureHeader
     // Motion identities, rather than list positions, retain prediction identity.
     references.list_count = 0;
 }
-fn decodeConfigured(comptime Sample: type, cfg: Config, config_reservation: *media.admission.Token, budget: *@import("decode_budget.zig").Budget, reader: *media.mp4.Reader, indexes: []const usize, options: Options, callback_context: ?*anyopaque, callback: ?SelectionCallback, index: usize, first_index: usize) !Frame {
+fn decodeConfigured(comptime Sample: type, initial_cfg: Config, config_reservation: *media.admission.Token, budget: *@import("decode_budget.zig").Budget, reader: *media.mp4.Reader, indexes: []const usize, options: Options, callback_context: ?*anyopaque, callback: ?SelectionCallback, index: usize, first_index: usize, configurations: ?@import("h264_dynamic.zig").Context) !Frame {
+    var cfg = initial_cfg;
     const allocator = budget.allocator();
     var output_packet = reader.packets[index];
     if (cfg.width != reader.track.width or cfg.height != reader.track.height) return error.UnsupportedDynamicGeometry;
@@ -1197,7 +1263,7 @@ fn decodeConfigured(comptime Sample: type, cfg: Config, config_reservation: *med
         if (dependency_count >= options.max_dependency_packets) return error.ResourceLimitExceeded;
         dependency_count += 1;
         if (reader.packets[start].size > options.max_packet_bytes) return error.ResourceLimitExceeded;
-        if (reader.packets[start].sync) {
+        if (reader.packets[start].sync or configurations != null) {
             var probe = try reader.readPacket(start);
             defer probe.deinit();
             if (try isDependencyReset(allocator, cfg, probe.bytes, reader.track.nal_length_bytes, reader.input)) break;
@@ -1213,17 +1279,20 @@ fn decodeConfigured(comptime Sample: type, cfg: Config, config_reservation: *med
     }
     const sub_y: usize = if (cfg.chroma_format == 1) 2 else 1;
     const sub_x: usize = if (cfg.chroma_format == 3) 1 else 2;
-    const output_size = (cfg.width * cfg.height + 2 * (cfg.width / sub_x) * (cfg.height / sub_y)) * @sizeOf(Sample);
-    const planar_size = (coded_pixels + 2 * coded_pixels / (sub_x * sub_y)) * @sizeOf(Sample);
-    const count_size = (coded_pixels + 2 * coded_pixels / (sub_x * sub_y)) / 16;
+    const chroma_pixels: usize = if (cfg.chroma_format == 0) 0 else coded_pixels / (sub_x * sub_y);
+    const output_size = (cfg.width * cfg.height + (if (cfg.chroma_format == 0) @as(usize, 0) else 2 * (cfg.width / sub_x) * (cfg.height / sub_y))) * @sizeOf(Sample);
+    const planar_size = (coded_pixels + 2 * chroma_pixels) * @sizeOf(Sample);
+    const count_size = (coded_pixels + 2 * chroma_pixels) / 16;
     const mode_size = coded_pixels / 16;
     const qp_size = coded_pixels / 256;
     const motion_size = coded_pixels / 16 * @sizeOf(@import("h264_motion.zig").Motion);
-    const reference_size = (planar_size + 2 * motion_size + qp_size * @sizeOf(@import("h264_entropy.zig").Meta) + @sizeOf(usize)) * cfg.max_refs;
-    const group_size = if (cfg.groups.count > 1) qp_size else 0;
+    const reference_size = (planar_size + 2 * motion_size + qp_size * @sizeOf(@import("h264_entropy.zig").Meta) + @sizeOf(usize)) * @max(cfg.max_refs, @as(usize, @intFromBool(cfg.gaps_allowed)));
+    const group_size = if (cfg.groups.count > 1 or configurations != null) qp_size else 0;
     const explicit_size = if (cfg.groups.explicit) |map| map.len else 0;
     const meta_size = group_size + explicit_size + qp_size * @sizeOf(@import("h264_entropy.zig").Meta);
     var peak = try std.math.add(usize, indexes.len, try std.math.add(usize, try std.math.add(usize, planar_size + mode_size + qp_size + meta_size + 2 * motion_size + reference_size, output_size), try std.math.add(usize, count_size, try std.math.add(usize, try std.math.mul(usize, max_packet, 2), reader.track.avcc.len * 2))));
+    if (options.max_slices > 4096) return error.ResourceLimitExceeded;
+    if (cfg.profile == 88) peak = try std.math.add(usize, peak, options.max_slices * 2 * @import("h264_partitions.zig").Registry.entry_bytes);
     if (peak > options.max_decode_bytes) return error.ResourceLimitExceeded;
     var reservation = if (reader.input.admission_pool) |pool| try pool.acquire(.{ .host_bytes = output_size }) else media.admission.Token{};
     errdefer reservation.deinit();
@@ -1235,7 +1304,7 @@ fn decodeConfigured(comptime Sample: type, cfg: Config, config_reservation: *med
     const snapshot_size = reference_size + @sizeOf(Workspace.State);
     var workspaces: [16]?Workspace = @splat(null);
     defer for (&workspaces) |*slot| if (slot.*) |*workspace| workspace.deinit(allocator);
-    workspaces[0] = try Workspace.init(allocator, coded_pixels, sub_x * sub_y, group_size, indexes.len);
+    workspaces[0] = try Workspace.init(allocator, coded_pixels, if (cfg.chroma_format == 0) 0 else sub_x * sub_y, group_size, indexes.len);
     var references = @import("h264_references.zig").StateFor(Sample){ .chroma_format = cfg.chroma_format };
     defer references.deinit(allocator);
     const output = try allocator.alloc(u8, output_size);
@@ -1251,7 +1320,9 @@ fn decodeConfigured(comptime Sample: type, cfg: Config, config_reservation: *med
         var input_packet = try reader.readPacket(packet_index);
         defer input_packet.deinit();
         if (reader.packets[packet_index].size > options.max_packet_bytes) return error.ResourceLimitExceeded;
-        try @import("avc.zig").validatePacket(input_packet.bytes, reader.track.nal_length_bytes);
+        if (configurations != null) try @import("avc.zig").validatePortablePacket(input_packet.bytes, reader.track.nal_length_bytes) else try @import("avc.zig").validatePacket(input_packet.bytes, reader.track.nal_length_bytes);
+        var partitions = try @import("h264_partitions.zig").Registry.init(allocator, input_packet.bytes, reader.track.nal_length_bytes, cfg.redundant, options.max_slices, reader.input.control);
+        defer partitions.deinit();
         var cursor: usize = 0;
         var packet_picture: ?u32 = null;
         while (cursor < input_packet.bytes.len) {
@@ -1262,9 +1333,17 @@ fn decodeConfigured(comptime Sample: type, cfg: Config, config_reservation: *med
             const nal = input_packet.bytes[cursor..][0..size];
             cursor += size;
             switch (nal[0] & 31) {
-                1, 5 => {
+                1, 2, 5 => {
                     if (nal[0] & 31 == 5 and nal[0] & 0x60 == 0) return error.MalformedVideoPacket;
+                    if (configurations) |registry| {
+                        const plane = cfg.selected_plane;
+                        cfg = try registry.session.configAt(registry.base + packet_index);
+                        if (cfg.separate_planes) {
+                            cfg = cfg.independent(plane);
+                        }
+                    }
                     const prefix = try slicePrefix(allocator, cfg, nal, reader.input.control);
+                    if (cfg.separate_planes and prefix.plane != cfg.selected_plane) continue;
                     var found: ?usize = null;
                     for (&workspaces, 0..) |*slot, i| if (slot.*) |*workspace| {
                         if (!workspace.active) continue;
@@ -1297,7 +1376,7 @@ fn decodeConfigured(comptime Sample: type, cfg: Config, config_reservation: *med
                             peak = try std.math.add(usize, peak, workspace_size);
                             if (peak > options.max_decode_bytes) return error.ResourceLimitExceeded;
                             try transient.resize(.{ .host_bytes = peak - output_size - config_reservation.resources.host_bytes });
-                            workspaces[free] = try Workspace.init(allocator, coded_pixels, sub_x * sub_y, group_size, indexes.len);
+                            workspaces[free] = try Workspace.init(allocator, coded_pixels, if (cfg.chroma_format == 0) 0 else sub_x * sub_y, group_size, indexes.len);
                         }
                         workspaces[free].?.reset(next_picture_id);
                         next_picture_id += 1;
@@ -1315,11 +1394,11 @@ fn decodeConfigured(comptime Sample: type, cfg: Config, config_reservation: *med
                     const first_part = workspace.pts == null;
                     workspace.pts = if (workspace.pts) |pts| @min(pts, part.pts) else part.pts;
                     workspace.end = if (first_part) part_end else @max(workspace.end, part_end);
-                    const planes = [3][]Sample{ workspace.planar[0..coded_pixels], workspace.planar[coded_pixels..][0 .. coded_pixels / (sub_x * sub_y)], workspace.planar[coded_pixels + coded_pixels / (sub_x * sub_y) ..] };
-                    const counts = [3][]u8{ workspace.counts[0 .. coded_pixels / 16], workspace.counts[coded_pixels / 16 ..][0 .. coded_pixels / (16 * sub_x * sub_y)], workspace.counts[coded_pixels / 16 + coded_pixels / (16 * sub_x * sub_y) ..] };
+                    const planes = [3][]Sample{ workspace.planar[0..coded_pixels], workspace.planar[coded_pixels..][0..chroma_pixels], workspace.planar[coded_pixels + chroma_pixels ..] };
+                    const counts = [3][]u8{ workspace.counts[0 .. coded_pixels / 16], workspace.counts[coded_pixels / 16 ..][0 .. chroma_pixels / 16], workspace.counts[coded_pixels / 16 + chroma_pixels / 16 ..] };
                     const prediction = workspace.snapshot orelse &references;
                     prediction.current_pair = workspace.id;
-                    try decodeSlice(allocator, nal, cfg, planes, counts, workspace.modes, workspace.qps, workspace.metadata, workspace.motions[0], workspace.motions[1], prediction, &workspace.headers, workspace.groups, reader.input.control);
+                    try decodeSlice(allocator, nal, cfg, planes, counts, workspace.modes, workspace.qps, workspace.metadata, workspace.motions[0], workspace.motions[1], prediction, &workspace.headers, workspace.groups, reader.input.control, &partitions);
                     const header = workspace.headers[prefix.parity].?;
                     const covered = workspace.covers(prefix.field, prefix.parity, cfg.coded_width);
                     if (covered and !workspace.committed[prefix.parity]) {
@@ -1347,10 +1426,14 @@ fn decodeConfigured(comptime Sample: type, cfg: Config, config_reservation: *med
                         workspace.snapshot = snapshot;
                     }
                 },
-                6, 9, 12 => {},
+                3, 4, 6, 9, 12 => {},
+                7, 8 => if (configurations == null) {
+                    return error.UnsupportedDynamicVideoConfig;
+                },
                 else => return error.UnsupportedVideoProfile,
             }
         }
+        try partitions.finish();
         decoded_packets += 1;
         payload_bytes += reader.packets[packet_index].size;
         if (packet_picture == null) for (indexes) |wanted| if (wanted == packet_index) return error.UnsupportedVideoProfile;
@@ -1368,24 +1451,20 @@ fn decodeConfigured(comptime Sample: type, cfg: Config, config_reservation: *med
                 output_packet.pts = workspace.pts.?;
                 output_packet.duration = std.math.cast(u32, std.math.sub(i64, workspace.end, output_packet.pts) catch return error.TimestampOverflow) orelse return error.TimestampOverflow;
             }
-            const planes = [3][]Sample{ workspace.planar[0..coded_pixels], workspace.planar[coded_pixels..][0 .. coded_pixels / (sub_x * sub_y)], workspace.planar[coded_pixels + coded_pixels / (sub_x * sub_y) ..] };
+            const planes = [3][]Sample{ workspace.planar[0..coded_pixels], workspace.planar[coded_pixels..][0..chroma_pixels], workspace.planar[coded_pixels + chroma_pixels ..] };
             if (selected) {
                 for (0..cfg.height) |y| {
                     try reader.input.control.check();
-                    for (0..cfg.width) |x| {
-                        const value = planes[0][(y + cfg.top) * cfg.coded_width + cfg.left + x];
-                        if (Sample == u8) output[y * cfg.width + x] = value else std.mem.writeInt(u16, output[(y * cfg.width + x) * 2 ..][0..2], value, .little);
-                    }
+                    const source_start = (y + cfg.top) * cfg.coded_width + cfg.left;
+                    const target_start = y * cfg.width * @sizeOf(Sample);
+                    @import("h264_pixels.zig").row(Sample, output[target_start..][0 .. cfg.width * @sizeOf(Sample)], planes[0][source_start..][0..cfg.width]);
                 }
-                for (0..cfg.height / sub_y) |y| {
+                for (0..if (cfg.chroma_format == 0) @as(usize, 0) else cfg.height / sub_y) |y| {
                     try reader.input.control.check();
-                    for (0..cfg.width / sub_x) |x| {
-                        for (0..2) |p| {
-                            const value = planes[p + 1][(y + cfg.top / sub_y) * (cfg.coded_width / sub_x) + x + cfg.left / sub_x];
-                            const offset = cfg.width * cfg.height + y * (cfg.width / sub_x) * 2 + x * 2 + p;
-                            if (Sample == u8) output[offset] = value else std.mem.writeInt(u16, output[offset * 2 ..][0..2], value, .little);
-                        }
-                    }
+                    const width = cfg.width / sub_x;
+                    const source_start = (y + cfg.top / sub_y) * (cfg.coded_width / sub_x) + cfg.left / sub_x;
+                    const target_start = (cfg.width * cfg.height + y * width * 2) * @sizeOf(Sample);
+                    @import("h264_pixels.zig").interleave(Sample, output[target_start..][0 .. width * 2 * @sizeOf(Sample)], planes[1][source_start..][0..width], planes[2][source_start..][0..width]);
                 }
                 if (callback) |publish| {
                     const metadata_frame = Frame{ .interlaced = !cfg.frame_only, .field_macroblocks = field_macroblocks, .chroma_format = cfg.chroma_format, .bit_depth = cfg.bit_depth, .allocator = budget.backing, .nv12 = output, .width = @intCast(cfg.width), .height = @intCast(cfg.height), .pts = output_packet.pts, .duration = output_packet.duration, .timescale = reader.track.timescale, .full_range = cfg.full_range, .decode_high_water = budget.peak, .decoded_packets = decoded_packets, .payload_bytes = payload_bytes };
@@ -1398,4 +1477,88 @@ fn decodeConfigured(comptime Sample: type, cfg: Config, config_reservation: *med
         };
     }
     return .{ .interlaced = !cfg.frame_only, .field_macroblocks = field_macroblocks, .chroma_format = cfg.chroma_format, .bit_depth = cfg.bit_depth, .reservation = reservation, .allocator = budget.backing, .nv12 = output, .width = @intCast(cfg.width), .height = @intCast(cfg.height), .pts = output_packet.pts, .duration = output_packet.duration, .timescale = reader.track.timescale, .full_range = cfg.full_range, .decode_high_water = budget.peak, .decoded_packets = decoded_packets, .payload_bytes = payload_bytes };
+}
+
+/// Three independent monochrome prediction lanes. Each lane decodes the shared
+/// dependency span once; selected native planes are retained under one budget
+/// until all three have been reconstructed and can be published as 4:4:4.
+fn decodeSeparated(comptime Sample: type, cfg: Config, config_reservation: *media.admission.Token, budget: *@import("decode_budget.zig").Budget, reader: *media.mp4.Reader, indexes: []const usize, options: Options, callback_context: ?*anyopaque, callback: ?SelectionCallback, index: usize, first_index: usize, configurations: ?@import("h264_dynamic.zig").Context) !Frame {
+    const allocator = budget.allocator();
+    const plane_bytes = try std.math.mul(usize, cfg.width * cfg.height, @sizeOf(Sample));
+    const frame_bytes = try std.math.mul(usize, plane_bytes, 3);
+    const retained_bytes = try std.math.mul(usize, frame_bytes, indexes.len);
+    var retained_reservation = if (reader.input.admission_pool) |pool| try pool.acquire(.{ .host_bytes = try std.math.add(usize, retained_bytes, indexes.len * @sizeOf(Frame)) }) else media.admission.Token{};
+    defer retained_reservation.deinit();
+    const retained = try allocator.alloc(u8, retained_bytes);
+    defer allocator.free(retained);
+    const metadata = try allocator.alloc(Frame, indexes.len);
+    defer allocator.free(metadata);
+    const Capture = struct {
+        bytes: []u8,
+        metadata: []Frame,
+        plane_bytes: usize,
+        plane: usize = 0,
+        fn publish(capture_context: *anyopaque, slot: usize, frame: *const Frame) !void {
+            const self: *@This() = @ptrCast(@alignCast(capture_context));
+            if (frame.nv12.len != self.plane_bytes) return error.UnsupportedDynamicGeometry;
+            const start = slot * self.plane_bytes * 3 + self.plane * self.plane_bytes;
+            @memcpy(self.bytes[start..][0..self.plane_bytes], frame.nv12);
+            if (self.plane == 0) {
+                self.metadata[slot] = frame.*;
+                self.metadata[slot].reservation = .{};
+            } else if (frame.pts != self.metadata[slot].pts or frame.duration != self.metadata[slot].duration or frame.width != self.metadata[slot].width or frame.height != self.metadata[slot].height) return error.MixedVideoPictures;
+        }
+    };
+    var capture = Capture{ .bytes = retained, .metadata = metadata, .plane_bytes = plane_bytes };
+    var packets: usize = 0;
+    var payload: u64 = 0;
+    for (0..3) |plane| {
+        capture.plane = plane;
+        const lane_cfg = cfg.independent(@intCast(plane));
+        var lane = try decodeConfigured(Sample, lane_cfg, config_reservation, budget, reader, indexes, options, &capture, Capture.publish, index, first_index, configurations);
+        packets += lane.decoded_packets;
+        payload += lane.payload_bytes;
+        // This internal frame dies before the budget; account its storage free.
+        lane.allocator = allocator;
+        lane.deinit();
+    }
+    var output_reservation = if (reader.input.admission_pool) |pool| try pool.acquire(.{ .host_bytes = frame_bytes }) else media.admission.Token{};
+    errdefer output_reservation.deinit();
+    const output = try allocator.alloc(u8, frame_bytes);
+    errdefer allocator.free(output);
+    var last_slot: usize = 0;
+    for (indexes, 0..) |selected, slot| {
+        if (selected == index) last_slot = slot;
+        const planar = retained[slot * frame_bytes ..][0..frame_bytes];
+        @memcpy(output[0..plane_bytes], planar[0..plane_bytes]);
+        for (0..plane_bytes / @sizeOf(Sample)) |i| {
+            const word = @sizeOf(Sample);
+            @memcpy(output[plane_bytes + i * 2 * word ..][0..word], planar[plane_bytes + i * word ..][0..word]);
+            @memcpy(output[plane_bytes + (i * 2 + 1) * word ..][0..word], planar[2 * plane_bytes + i * word ..][0..word]);
+        }
+        var frame = metadata[slot];
+        frame.chroma_format = 3;
+        frame.nv12 = output;
+        frame.decoded_packets = packets;
+        frame.payload_bytes = payload;
+        frame.decode_high_water = budget.peak;
+        if (callback) |publish| try publish(callback_context.?, slot, &frame);
+    }
+    // Return the largest selected packet even when the request slots are unordered.
+    const planar = retained[last_slot * frame_bytes ..][0..frame_bytes];
+    @memcpy(output[0..plane_bytes], planar[0..plane_bytes]);
+    for (0..plane_bytes / @sizeOf(Sample)) |i| {
+        const word = @sizeOf(Sample);
+        @memcpy(output[plane_bytes + i * 2 * word ..][0..word], planar[plane_bytes + i * word ..][0..word]);
+        @memcpy(output[plane_bytes + (i * 2 + 1) * word ..][0..word], planar[2 * plane_bytes + i * word ..][0..word]);
+    }
+    var frame = metadata[last_slot];
+    frame.allocator = budget.backing;
+    frame.reservation = output_reservation;
+    frame.chroma_format = 3;
+    frame.nv12 = output;
+    frame.decoded_packets = packets;
+    frame.payload_bytes = payload;
+    frame.decode_high_water = budget.peak;
+    return frame;
 }

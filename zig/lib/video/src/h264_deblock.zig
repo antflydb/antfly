@@ -76,7 +76,7 @@ pub fn picture(planes: anytype, width: usize, qps: []const u8, meta: []const @im
         const parity = mb / mb_width % 2;
         try control.check();
         if (meta[mb].kind == 255 or meta[mb].filter == 1) continue;
-        for (0..2) |direction| for (0..3) |p| {
+        for (0..2) |direction| for (0..if (chroma_format == 0) @as(usize, 1) else 3) |p| {
             const chroma = p != 0 and chroma_format != 3;
             const sx: usize = if (chroma) 2 else 1;
             const sy: usize = if (chroma and chroma_format == 1) 2 else 1;
@@ -113,7 +113,7 @@ pub fn picture(planes: anytype, width: usize, qps: []const u8, meta: []const @im
                     const average = (current_q + adjacent_q + 1) >> 1;
                     const ai: usize = @intCast(std.math.clamp(average + meta[mb].alpha, 0, 51));
                     const bi: usize = @intCast(std.math.clamp(average + meta[mb].beta, 0, 51));
-                    const intra = meta[mb].kind <= 25 or meta[neighbor].kind <= 25;
+                    const intra = meta[mb].kind <= 25 or meta[neighbor].kind <= 25 or meta[mb].switching_slice or meta[neighbor].switching_slice;
                     const strength: usize = if (intra) (if (e == 0 and (direction == 0 or (!field and !meta[neighbor].field))) @as(usize, 4) else 3) else if (counts[0][pc.index] != 0 or counts[0][qc.index] != 0) 2 else if (field != meta[neighbor].field or different(motions, pc.index, qc.index, if (field) @as(u32, 2) else 4)) 1 else 0;
                     if (strength == 0) continue;
                     const clipping = if (strength == 1) tc1[ai] else if (strength == 2) tc2[ai] else tc3[ai];

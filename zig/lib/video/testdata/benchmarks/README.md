@@ -54,3 +54,50 @@ and allocation peaks; its tiny synthetic input and Docker VM remain unsuitable f
 production capacity estimates.
 
 High-profile fixture SHA-256: `ff3779dc9357543752834e69f4bc3122efbc16f2a89a56efe2518423f88d2e99`.
+
+## Full-trailer and portable SIMD expansion
+
+The Sintel receipts use the pinned 52.2-second original 854×480, 24fps trailer
+(source/attribution in [fixture README](../README.md)), Zig 0.17.0 ReleaseSafe,
+LLVM, macOS ARM64, and two overlapping sampled windows yielding 38 unique prepared
+pictures. Dependency decoding covers intervening pictures; the reported frame rate
+counts selected prepared pictures, not every decoded dependency. Preparation is
+384×384 with BT.709. Each route has one cold and only two warm samples; p50/p95
+are descriptive observations, not stable capacity estimates. Source container indexing
+is excluded from setup, and no tensor GPU readback occurs in the Metal benchmark.
+
+```sh
+zig build bench-video -Doptimize=ReleaseSafe -Dvideo-use-llvm=true \
+  -Dbenchmark-input=/absolute/path/sintel_trailer-480p.mp4 \
+  -Dbenchmark-size=384 -Dbenchmark-iterations=3
+# Add -Dbenchmark-backend=cpu for the pure Zig software/CPU route.
+```
+
+The Metal receipt includes completed command execution time, retained coefficient
+reuse, process peak RSS and device aggregate allocation. VideoToolbox internal
+allocation is unobservable (`decode_live_peak_bytes=0`); neither process RSS nor
+aggregate Metal allocation is a measured per-request peak GPU allocation. CPU
+receipts report the decoder allocator's actual high-water usage separately.
+
+`macos-arm64-packing-llvm-2026-10-08.jsonl` measures 32×1920×1080 4:2:2 u16 plane
+packing (132,710,400 output bytes) over ten samples. Portable Zig vector packing
+measures roughly 6.5–8.6ms versus 17.8–20.8ms scalar. Explicit vectors are enabled
+for LLVM, with scalar fallback for other Zig backends. This microbenchmark measures
+packing alone, not total decode acceleration. Run `zig run -OReleaseSafe -fllvm
+src/pixels_benchmark.zig` and qualify LLVM branches with
+`zig build test-video -Dvideo-test-llvm=true -Dvideo-test-filter=SIMD`.
+
+`macos-arm64-transform-selfhost-2026-10-08.jsonl` compares one million 4×4 inverse
+blocks. The vector candidate is slower (~13.5ms versus ~8.2ms scalar), so it remains
+disabled in decoding. Run `zig run -OReleaseSafe src/transform_benchmark.zig`.
+Measurements apply to this compiler/backend and host; repeat on deployment hardware.
+
+The full-trailer receipts separate selected `frames` from actual
+`dependency_packets`: CPU reconstructs 1,251 packets for 38 selected pictures,
+while verified-IDR hardware planning submits 933. Warm completion is about 28.1–28.3s
+for software/CPU and 326–327ms for VideoToolbox/Metal on this host. This comparison
+includes different dependency plans as well as different decoders/preparers. CPU
+allocator high water is 12,140,140 bytes, while process RSS includes retained 384×384
+patch tensors (~91MB total). These observations identify dependency-span reduction
+and prediction/entropy work as future software performance targets; SIMD packing
+alone does not make software match hardware throughput.

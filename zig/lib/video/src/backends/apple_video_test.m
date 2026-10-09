@@ -28,3 +28,19 @@ void *av_test_surface_create(const uint8_t *bytes, uint32_t width, uint32_t heig
     }
 }
 void av_test_surface_destroy(void *p) { if (p) CVPixelBufferRelease(p); }
+// Test-only producer for direct integer texture imports; caller owns one retain.
+void *av_test_native_texture(void *device, const uint8_t *bytes, uint32_t width,
+    uint32_t height, size_t stride, uint32_t depth, uint32_t channels) {
+    @autoreleasepool {
+        id<MTLDevice> d = (__bridge id<MTLDevice>)device;
+        MTLPixelFormat format = depth == 8 ? (channels == 1 ? MTLPixelFormatR8Uint : MTLPixelFormatRG8Uint)
+            : (channels == 1 ? MTLPixelFormatR16Uint : MTLPixelFormatRG16Uint);
+        MTLTextureDescriptor *desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format width:width height:height mipmapped:NO];
+        desc.storageMode = MTLStorageModeShared; desc.usage = MTLTextureUsageShaderRead;
+        id<MTLTexture> texture = [d newTextureWithDescriptor:desc];
+        if (!texture) return NULL;
+        [texture replaceRegion:MTLRegionMake2D(0, 0, width, height) mipmapLevel:0 withBytes:bytes bytesPerRow:stride];
+        return (__bridge_retained void *)texture;
+    }
+}
+void av_test_native_texture_destroy(void *p) { if (p) { id object = (__bridge_transfer id)p; (void)object; } }

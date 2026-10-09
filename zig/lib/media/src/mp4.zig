@@ -19,6 +19,7 @@ pub const Limits = struct {
 pub const Codec = enum { avc, mjpeg };
 pub const Track = struct {
     codec: Codec = .avc,
+    inband_parameter_sets: bool = false,
     id: u32,
     timescale: u32,
     width: u16,
@@ -307,8 +308,8 @@ const Parser = struct {
         var cursor: usize = 8;
         for (0..count) |_| {
             const b = try self.box(bytes, cursor);
-            if (b.typ == tag("avc1") or b.typ == tag("jpeg")) {
-                const codec: Codec = if (b.typ == tag("avc1")) .avc else .mjpeg;
+            if (b.typ == tag("avc1") or b.typ == tag("avc3") or b.typ == tag("jpeg")) {
+                const codec: Codec = if (b.typ != tag("jpeg")) .avc else .mjpeg;
                 if (count != 1) return error.UnsupportedSampleDescription;
                 if (b.payload.len < 78) return error.MalformedMedia;
                 const width = u16be(b.payload[24..26]);
@@ -349,7 +350,7 @@ const Parser = struct {
                     nal_len = @as(u3, @intCast(config[4] & 3)) + 1;
                     if (nal_len == 3) return error.MalformedMedia;
                 } else if (avcc != null) return error.MalformedMedia;
-                t.track = .{ .codec = codec, .id = 0, .timescale = 0, .width = width, .height = height, .avcc = config, .nal_length_bytes = nal_len, .pixel_aspect = .{ .horizontal = horizontal, .vertical = vertical }, .color_info = color, .display_matrix = @splat(0) };
+                t.track = .{ .inband_parameter_sets = b.typ == tag("avc3"), .codec = codec, .id = 0, .timescale = 0, .width = width, .height = height, .avcc = config, .nal_length_bytes = nal_len, .pixel_aspect = .{ .horizontal = horizontal, .vertical = vertical }, .color_info = color, .display_matrix = @splat(0) };
             }
             cursor = b.end;
         }

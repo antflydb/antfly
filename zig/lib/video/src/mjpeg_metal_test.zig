@@ -6,6 +6,8 @@ const video = @import("mod.zig");
 const a = std.testing.allocator;
 extern fn av_test_device_create() ?*anyopaque;
 extern fn av_test_device_destroy(*anyopaque) void;
+extern fn av_test_native_texture(*anyopaque, [*]const u8, u32, u32, usize, u32, u32) ?*anyopaque;
+extern fn av_test_native_texture_destroy(*anyopaque) void;
 const clip = @embedFile("../testdata/mjpeg.mov");
 fn source() media.source.Source {
     return .{ .allocator = a, .identity = "mjpeg-metal-v1", .storage = .{ .borrowed = clip } };
@@ -241,4 +243,80 @@ test "video shared output admission denies another request until result destruct
     var retry = try video.mjpeg_metal.prepareWindows(a, std.testing.io, &reader, &clips, &metal, options);
     retry.deinit();
     try std.testing.expectEqual(media.admission.Resources{ .device_bytes = 4096 }, pool.snapshot());
+}
+
+test "video Metal native depth and chroma preparation owns planes and matches CPU" {
+    if (@import("builtin").os.tag != .macos) return error.SkipZigTest;
+    const device = av_test_device_create() orelse return error.MetalPreparationUnavailable;
+    defer av_test_device_destroy(device);
+    var metal = try video.preparation.Metal.init(device);
+    defer metal.deinit();
+    const width = 80;
+    const height = 64;
+    for ([_]u8{ 8, 10, 14 }) |depth| {
+        for ([_]u8{ 1, 2, 3 }) |chroma| {
+            const sample_bytes: usize = if (depth == 8) 1 else 2;
+            const cw: usize = if (chroma == 3) width else width / 2;
+            const ch: usize = if (chroma == 1) height / 2 else height;
+            const ys = width * sample_bytes + 8;
+            const uvs = cw * 2 * sample_bytes + 8;
+            const y = try a.alloc(u8, ys * height);
+            defer a.free(y);
+            const uv = try a.alloc(u8, uvs * ch);
+            defer a.free(uv);
+            @memset(y, 0);
+            @memset(uv, 0);
+            for (0..height) |row| for (0..width) |x| {
+                const value: u16 = @intCast((row * 41 + x * 19) % (@as(usize, 1) << @as(u4, @intCast(depth))));
+                if (depth == 8) y[row * ys + x] = @intCast(value) else std.mem.writeInt(u16, y[row * ys + x * 2 ..][0..2], value, .little);
+            };
+            for (0..ch) |row| for (0..cw * 2) |x| {
+                const value: u16 = @intCast((row * 23 + x * 61 + 53) % (@as(usize, 1) << @as(u4, @intCast(depth))));
+                if (depth == 8) uv[row * uvs + x] = @intCast(value) else std.mem.writeInt(u16, uv[row * uvs + x * 2 ..][0..2], value, .little);
+            };
+            for (std.enums.values(video.preparation.Rotation)) |rotation| for ([_]bool{ false, true }) |full| {
+                const options = video.preparation.Options{ .width = 96, .height = 48, .rotation = rotation, .matrix = if (full) .bt601 else .bt709, .centered = full };
+                const host = video.preparation.HostSurface{ .width = width, .height = height, .bit_depth = depth, .chroma_format = chroma, .format = if (full) .nv12_full else .nv12_video, .planes = .{ .{ .bytes = y, .width = width, .height = height, .stride = ys }, .{ .bytes = uv, .width = cw, .height = ch, .stride = uvs } } };
+                const expected = try video.preparation.referenceHost(a, host, options, .{});
+                defer a.free(expected);
+                var result = try metal.submitHost(a, host, options, .{});
+                defer result.deinit();
+                try std.testing.expectEqual(y.len + uv.len, result.native_staging_bytes);
+                const native_y = av_test_native_texture(device, y.ptr, width, height, ys, depth, 1) orelse return error.MetalPreparationUnavailable;
+                const native_uv = av_test_native_texture(device, uv.ptr, @intCast(cw), @intCast(ch), uvs, depth, 2) orelse {
+                    av_test_native_texture_destroy(native_y);
+                    return error.MetalPreparationUnavailable;
+                };
+                var direct = metal.submitNative(a, .{ .y = native_y, .uv = native_uv, .width = width, .height = height, .bit_depth = depth, .chroma_format = chroma, .full_range = full }, options, .{}) catch |err| {
+                    av_test_native_texture_destroy(native_y);
+                    av_test_native_texture_destroy(native_uv);
+                    return err;
+                };
+                defer direct.deinit();
+                // The submitted command retains both producer textures.
+                av_test_native_texture_destroy(native_y);
+                av_test_native_texture_destroy(native_uv);
+                try std.testing.expectEqual(@as(usize, 0), direct.native_staging_bytes);
+                if (rotation == .clockwise270 and full) {
+                    // Both submissions must own their source independently of
+                    // the producer's host storage by the time submit returns.
+                    @memset(y, 0);
+                    @memset(uv, 0);
+                }
+                try direct.wait(std.testing.io, .{});
+                try direct.releaseSource();
+                const direct_values = try direct.readback(a);
+                defer a.free(direct_values);
+                try compare(expected, direct_values);
+                try result.wait(std.testing.io, .{});
+                try result.releaseSource();
+                const actual = try result.readback(a);
+                defer a.free(actual);
+                compare(expected, actual) catch |err| {
+                    std.debug.print("native Metal depth {d} chroma {d} rotation {s} full {any}\n", .{ depth, chroma, @tagName(rotation), full });
+                    return err;
+                };
+            };
+        }
+    }
 }

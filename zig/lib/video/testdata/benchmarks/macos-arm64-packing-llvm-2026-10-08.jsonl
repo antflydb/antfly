@@ -1,0 +1,10 @@
+{"sample":0,"frames":32,"width":1920,"height":1080,"chroma":422,"storage_bits":16,"output_bytes":132710400,"scalar_ns":18328458,"simd_ns":7338292}
+{"sample":1,"frames":32,"width":1920,"height":1080,"chroma":422,"storage_bits":16,"output_bytes":132710400,"scalar_ns":18121208,"simd_ns":8057584}
+{"sample":2,"frames":32,"width":1920,"height":1080,"chroma":422,"storage_bits":16,"output_bytes":132710400,"scalar_ns":17824416,"simd_ns":8138042}
+{"sample":3,"frames":32,"width":1920,"height":1080,"chroma":422,"storage_bits":16,"output_bytes":132710400,"scalar_ns":19335333,"simd_ns":8310625}
+{"sample":4,"frames":32,"width":1920,"height":1080,"chroma":422,"storage_bits":16,"output_bytes":132710400,"scalar_ns":18192125,"simd_ns":6555458}
+{"sample":5,"frames":32,"width":1920,"height":1080,"chroma":422,"storage_bits":16,"output_bytes":132710400,"scalar_ns":18146750,"simd_ns":8550458}
+{"sample":6,"frames":32,"width":1920,"height":1080,"chroma":422,"storage_bits":16,"output_bytes":132710400,"scalar_ns":20757750,"simd_ns":7851042}
+{"sample":7,"frames":32,"width":1920,"height":1080,"chroma":422,"storage_bits":16,"output_bytes":132710400,"scalar_ns":18599166,"simd_ns":8092584}
+{"sample":8,"frames":32,"width":1920,"height":1080,"chroma":422,"storage_bits":16,"output_bytes":132710400,"scalar_ns":18651167,"simd_ns":7033750}
+{"sample":9,"frames":32,"width":1920,"height":1080,"chroma":422,"storage_bits":16,"output_bytes":132710400,"scalar_ns":18277958,"simd_ns":6541584}

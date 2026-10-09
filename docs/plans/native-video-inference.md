@@ -318,7 +318,7 @@ on Linux and WASI and supplies shared-window host patches. See the detailed
 and [media contracts](../../zig/lib/media/MEDIA.md#implemented-independent-container-and-source-extensions).
 
 Remaining: NVDEC/device preparation with separately qualified CUDA model execution;
-H.264 inter/Intra4x4/deblocking/CABAC and other tools; unknown-sized/live containers,
+broader codec qualification and unsupported transition/tool combinations; streaming protocol integration,
 WebM video decoders, HEVC, VP9 and AV1. Each route requires separate qualification.
 
 Exit: capability-specific decoder, processor, and model qualification for each
@@ -371,3 +371,27 @@ Store dated benchmark receipts separately from these living contracts.
 When the cross-cutting rollout completes, move lasting serving/inference
 contracts into the appropriate inference design and guide documents, preserve
 dated evidence under history, and remove this plan per the documentation rules.
+
+### Independent codec/container expansion — delivered 2026-10-08
+
+The portable H.264 route now adds bounded IDR-delimited SPS/geometry epochs,
+non-IDR PPS changes, frame-number gap inference, monochrome, independent colour
+planes, Extended-profile data partitions and 8-bit 4:2:0 SP/SI. FFmpeg qualifies
+native samples and media clocks on original Sintel content and profile variants;
+official JM decoder receipts qualify tools FFmpeg cannot decode reliably. Differential
+checks, deterministic mutations, pure Zig coverage-guided targets, allocation failures
+and cancellation supplement generated vectors. This remains an explicitly bounded
+tool qualification; see [the expansion receipt](../../zig/lib/video/testdata/h264-expansion-validation.md).
+
+Metal imports native integer textures at 8–14 bits and 4:2:0/4:2:2/4:4:4 and can
+stage native host planes without a CPU RGB conversion. The hardware VideoToolbox
+and CoreVideo contract remains 8-bit 4:2:0. Portable SIMD is enabled for measured
+LLVM row packing; scalar transforms remain after a slower vector experiment.
+Full-trailer completed CPU/GPU measurements accompany kernel receipts.
+
+Shared media now supports validated WebM Cues, unknown-size Cluster boundaries,
+bounded sequential spooling and immutable caller-framed live fMP4 segments. This
+adds neither VP8/VP9/AV1 decoding nor an automatic network streaming protocol.
+Remaining work includes non-IDR SPS transitions, cross-packet data partition assembly,
+broader mixed-tool corpus qualification, hardware P010 import, VP-family decoding,
+CUDA/NVDEC, and model/API integration after the independent model dependency merges.

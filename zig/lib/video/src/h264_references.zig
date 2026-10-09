@@ -6,6 +6,7 @@ const MarkCommand = struct { operation: u32, first: u32 = 0, second: u32 = 0 };
 fn PictureFor(comptime Sample: type) type {
     return struct {
         owners: *usize,
+        non_existing: bool = false,
         pair_id: ?u32 = null,
         long_term: ?u32 = null,
         field_long: [2]?u32 = .{ null, null },
@@ -53,12 +54,51 @@ pub fn StateFor(comptime Sample: type) type {
         frame_bits: usize = 4,
         frame_offset: i32 = 0,
         previous_num: u32 = 0,
+        previous_reference_num: u32 = 0,
         adaptive: bool = false,
         current_long: ?u32 = null,
         max_field_long: ?u32 = null,
         commands: [32]Command = undefined,
         command_count: usize = 0,
         pub const Command = MarkCommand;
+        /// H.264 8.2.5.2: inferred frames occupy the DPB without sample storage.
+        pub fn inferGaps(self: *Self, allocator: std.mem.Allocator, number: u32, cfg: @import("h264.zig").Config, control: @import("antfly_media").source.Control) !void {
+            const maximum: u32 = @as(u32, 1) << @as(u5, @intCast(cfg.frame_bits));
+            var missing = (self.previous_reference_num + 1) % maximum;
+            if (number == self.previous_reference_num or number == missing) return;
+            if (!cfg.gaps_allowed) return error.MissingVideoReference;
+            while (missing != number) : (missing = (missing + 1) % maximum) {
+                try control.check();
+                if (self.previous_num > missing) self.frame_offset = std.math.add(i32, self.frame_offset, @intCast(maximum)) catch return error.TimestampOverflow;
+                self.previous_num = missing;
+                self.current_num = missing;
+                self.current_pair = null;
+                self.reference = true;
+                self.field_picture = false;
+                self.paired = false;
+                self.current_fields = .{ true, true };
+                self.current_meta = &.{};
+                self.command_count = 0;
+                self.adaptive = false;
+                self.current_long = null;
+                self.list_count = 0;
+                var poc: i64 = 0;
+                if (cfg.poc_type == 2) poc = (@as(i64, self.frame_offset) + missing) * 2;
+                if (cfg.poc_type == 1 and cfg.poc_cycle != 0) {
+                    const absolute = @as(i64, self.frame_offset) + missing;
+                    if (absolute > 0) {
+                        var total: i64 = 0;
+                        for (cfg.poc_offsets[0..cfg.poc_cycle]) |offset| total += offset;
+                        poc = @divTrunc(absolute - 1, @as(i64, @intCast(cfg.poc_cycle))) * total;
+                        for (cfg.poc_offsets[0 .. @as(usize, @intCast(@mod(absolute - 1, @as(i64, @intCast(cfg.poc_cycle))))) + 1]) |offset| poc += offset;
+                    }
+                }
+                self.current_poc = std.math.cast(i32, poc) orelse return error.TimestampOverflow;
+                self.current_field_poc = .{ self.current_poc, std.math.cast(i32, poc + (if (cfg.poc_type == 1) @as(i64, cfg.poc_bottom) else 0)) orelse return error.TimestampOverflow };
+                try self.commit(allocator, &.{}, .{ &.{}, &.{} }, @max(cfg.max_refs, 1));
+                self.pictures[self.count - 1].non_existing = true;
+            }
+        }
         pub fn marking(self: *Self, bits: *@import("h264_bits.zig").Bits, idr: bool) !void {
             self.command_count = 0;
             self.current_long = null;
@@ -137,16 +177,17 @@ pub fn StateFor(comptime Sample: type) type {
             self.list1 = self.list0;
         }
         pub fn orderB(self: *Self) void {
-            self.list_count = self.count;
+            self.list_count = 0;
             self.list0 = @splat(16);
             self.list1 = @splat(16);
-            for (0..self.count) |i| {
-                self.list0[i] = i;
-                self.list1[i] = i;
-            }
+            for (0..self.count) |i| if (!self.pictures[i].non_existing) {
+                self.list0[self.list_count] = i;
+                self.list1[self.list_count] = i;
+                self.list_count += 1;
+            };
             for (0..2) |list| {
                 const indexes = if (list == 0) &self.list0 else &self.list1;
-                for (0..self.count) |i| for (i + 1..self.count) |j| {
+                for (0..self.list_count) |i| for (i + 1..self.list_count) |j| {
                     const a = self.pictures[indexes[i]].poc;
                     const b = self.pictures[indexes[j]].poc;
                     const af = if (list == 0) a < self.current_poc else a > self.current_poc;
@@ -158,7 +199,7 @@ pub fn StateFor(comptime Sample: type) type {
                     if (ordered) std.mem.swap(usize, &indexes[i], &indexes[j]);
                 };
             }
-            if (!self.field_picture and self.count > 1 and std.mem.eql(usize, self.list0[0..self.count], self.list1[0..self.count])) std.mem.swap(usize, &self.list1[0], &self.list1[1]);
+            if (!self.field_picture and self.list_count > 1 and std.mem.eql(usize, self.list0[0..self.list_count], self.list1[0..self.list_count])) std.mem.swap(usize, &self.list1[0], &self.list1[1]);
         }
         pub fn orderFields(self: *Self, parity: usize, b_slice: bool) void {
             self.field_parity = parity;
@@ -168,7 +209,7 @@ pub fn StateFor(comptime Sample: type) type {
                 const frames = if (list == 0) self.list0 else self.list1;
                 var parity_frames = [2][16]usize{ frames, frames };
                 if (phase == 1) for (0..2) |field_side| {
-                    for (0..self.count) |i| for (i + 1..self.count) |j| {
+                    for (0..self.list_count) |i| for (i + 1..self.list_count) |j| {
                         const al = self.pictures[parity_frames[field_side][i]].field_long[field_side] orelse std.math.maxInt(u32);
                         const bl = self.pictures[parity_frames[field_side][j]].field_long[field_side] orelse std.math.maxInt(u32);
                         if (bl < al) std.mem.swap(usize, &parity_frames[field_side][i], &parity_frames[field_side][j]);
@@ -179,7 +220,7 @@ pub fn StateFor(comptime Sample: type) type {
                 while (true) {
                     var found: ?usize = null;
                     for (0..2) |_| {
-                        while (cursors[wanted] < self.count) {
+                        while (cursors[wanted] < self.list_count) {
                             const i = parity_frames[wanted][cursors[wanted]];
                             cursors[wanted] += 1;
                             if (i < self.count and self.pictures[i].fields[wanted] and (self.pictures[i].field_long[wanted] != null) == (phase == 1)) {
@@ -223,6 +264,7 @@ pub fn StateFor(comptime Sample: type) type {
                     if (matches) target = @intCast(i * 2 + parity);
                 };
                 const encoded = target orelse return error.MissingVideoReference;
+                if (self.pictures[encoded / 2].non_existing) return error.MissingVideoReference;
                 var next = self.field_lists[list];
                 next[insertion] = encoded;
                 var cursor = insertion + 1;
@@ -244,7 +286,7 @@ pub fn StateFor(comptime Sample: type) type {
                 if (frame_index >= self.list_count) return error.MissingVideoReference;
                 break :blk (if (list == 0) self.list0 else self.list1)[frame_index];
             };
-            if (index >= self.count) return error.MissingVideoReference;
+            if (index >= self.count or self.pictures[index].non_existing) return error.MissingVideoReference;
             const pic = self.pictures[index];
             if (self.field_picture) {
                 if (!pic.fields[@as(usize, self.field_lists[list][reference]) % 2]) return error.MissingVideoReference;
@@ -314,6 +356,7 @@ pub fn StateFor(comptime Sample: type) type {
                     };
                     const found = target orelse return error.MissingVideoReference;
                     if (command.operation == 3) {
+                        for (self.pictures[0..self.count]) |pic| if (pic.id == found.id and pic.non_existing) return error.MissingVideoReference;
                         if (self.max_field_long == null or command.second > self.max_field_long.?) return error.MalformedVideoPacket;
                         self.replaceFieldLong(allocator, command.second, found.id);
                     }
@@ -361,7 +404,9 @@ pub fn StateFor(comptime Sample: type) type {
             return reset;
         }
         pub fn commit(self: *Self, allocator: std.mem.Allocator, planar: []const Sample, motions: [2][]const motion.Motion, max_refs: usize) !void {
-            if (!self.reference or max_refs == 0) return;
+            if (!self.reference) return;
+            self.previous_reference_num = self.current_num;
+            if (max_refs == 0) return;
             for (self.commands[0..self.command_count]) |command| {
                 if (command.operation == 4 and command.first > max_refs) return error.MalformedVideoPacket;
             }
@@ -383,7 +428,10 @@ pub fn StateFor(comptime Sample: type) type {
                             break;
                         };
                         if (id == null) return error.MissingVideoReference;
-                        if (command.operation == 3) self.removeLong(allocator, command.second);
+                        if (command.operation == 3) {
+                            for (self.pictures[0..self.count]) |pic| if (pic.id == id.? and pic.non_existing) return error.MissingVideoReference;
+                            self.removeLong(allocator, command.second);
+                        }
                         for (self.pictures[0..self.count], 0..) |*pic, i| if (pic.id == id.?) {
                             if (command.operation == 1) self.remove(allocator, i) else {
                                 pic.long_term = command.second;
@@ -417,6 +465,7 @@ pub fn StateFor(comptime Sample: type) type {
                 if (self.field_picture) self.current_field_poc[self.field_parity] = 0 else self.current_field_poc = .{ 0, 0 };
                 self.current_poc = 0;
                 self.previous_num = 0;
+                self.previous_reference_num = 0;
                 self.frame_offset = 0;
                 self.previous_lsb = 0;
                 self.previous_msb = 0;
@@ -511,7 +560,8 @@ pub fn StateFor(comptime Sample: type) type {
             const pixels = width * height;
             const sub_y: usize = if (self.chroma_format == 1) 2 else 1;
             const sub_x: usize = if (self.chroma_format == 3) 1 else 2;
-            return .{ picture[0..pixels], picture[pixels..][0 .. pixels / (sub_x * sub_y)], picture[pixels + pixels / (sub_x * sub_y) ..] };
+            const chroma_pixels = if (self.chroma_format == 0) @as(usize, 0) else pixels / (sub_x * sub_y);
+            return .{ picture[0..pixels], picture[pixels..][0..chroma_pixels], picture[pixels + chroma_pixels ..] };
         }
     };
 }

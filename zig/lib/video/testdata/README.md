@@ -208,3 +208,39 @@ Receipt member lists define exact packet membership; auxiliary packets use a dis
 PTS to catch accidental inclusion in output timing. Tests validate every member
 selection, callback slots, pending/slice/dependency limits, missing and duplicate
 fragments, cancellation, reference copy-on-write and exhaustive allocation failures.
+
+## Expanded codec qualification and asset attribution
+
+`h264-sintel-original.mp4` is a stream-copy excerpt of the public Sintel trailer,
+not an Apache-2.0 synthetic fixture. Sintel © Blender Foundation /
+[durian.blender.org](https://durian.blender.org/about/), licensed
+[CC BY 3.0](https://creativecommons.org/licenses/by/3.0/). Source:
+[480p trailer](https://download.blender.org/durian/trailer/sintel_trailer-480p.mp4).
+Source SHA-256: `b670602fa00934ca27c4351bb0efe7ea7a07fae57284e44226025eeed7c51254`.
+The excerpt removes audio and copies video (`ffmpeg -ss 10 -i SOURCE -t 2 -an
+-c:v copy OUTPUT`); keyframe preroll yields 66 pictures. Its oracle records exact
+native sample hashes and media PTS, with movie edit lists disabled in FFmpeg.
+The original source edit clock remains independently preserved by the native reader.
+
+`h264-jm-*.mp4` are resized/re-encoded derivatives of four pictures beginning at
+12 seconds in the same CC BY 3.0 source; retain the above attribution and license.
+`scripts/generate_h264_jm.py` requires a locally built official
+[JM 19.0](https://iphome.hhi.de/suehring/tml/download/jm19.0.zip) tree and the pinned
+source. It invokes the encoder and independent decoder and hashes decoder output.
+JM encoder reconstruction is explicitly not used as the sample oracle. No JM code
+or binary is included or linked. Receipts pin both elementary and MP4 bytes,
+component format/depth and sample hashes. Cases cover data partitions, separate
+planes at 8/10/14 bits, primary SP, switching SP and SI.
+
+The monochrome, dynamic epoch and frame-gap fixtures remain original Apache-2.0
+normative synthetic assets. Their generators and receipts record construction and
+independent FFmpeg checks where supported. These focused cases qualify bounded
+paths rather than all possible combinations of syntax tools.
+
+For additional real-content profiles, run `scripts/qualify_h264_corpus.py` with
+`--source SOURCE --native zig-out/bin/video-qualification --output DIRECTORY`.
+It records exact FFmpeg/libx264 commands, content hashes and full-frame differential
+results for Baseline/Main/High10/High444. External corpus artifacts are not fetched
+or generated during normal tests. See [expansion validation](h264-expansion-validation.md).
+
+JM monochrome cases additionally qualify compressed CABAC 8-bit and CAVLC 10-bit I/P pictures. JM writes neutral 4:2:0 chroma for monochrome output; these receipts hash only each native Y plane without converting range/depth.

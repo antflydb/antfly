@@ -67,7 +67,7 @@ now stages decoded RGBA into a bounded Metal preparation queue on macOS, preserv
 the same owned window/PTS metadata. This remains video orchestration; media has
 no device or model dependency.
 
-The pure Zig H.264 lane now qualifies bounded multi-slice static `avc1`, mixed
+The pure Zig H.264 lane now qualifies bounded multi-slice `avc1`/`avc3`, mixed
 MBAFF, PAFF pairs carried together or as fields split across indexed packets,
 custom scaling matrices, POC type 1, FMO/ASO/redundant copies and native 8–14-bit 4:2:0/4:2:2/4:4:4
 samples under the profile/tool limits in [VIDEO.md](../video/VIDEO.md#implemented-independent-efficiency-and-portable-h264-work).
@@ -76,8 +76,9 @@ support from an `avc1` label or assemble field pictures itself. The software dec
 verifies both complementary fields before publishing a woven picture and admits
 the first field before second-field prediction. Output depth/chroma and plane
 strides are explicit; high-depth samples remain little-endian `u16` through decode.
-The decoder supports individual field MMCO 1–6; malformed marking, dynamic
-parameter sets and non-complementary pairs fail explicitly. A bounded decoder
+The decoder supports individual field MMCO 1–6; malformed marking and non-complementary pairs fail explicitly. Portable dynamic
+parameter-set epochs, monochrome/separate planes, gaps, SP/SI and data partitions
+are qualified with the bounds described in VIDEO.md. A bounded decoder
 assembly extension buffers pairs across unrelated coded pictures, preserving
 packet membership and frozen prediction references under shared admission. This
 extension is qualified separately from H.264 consecutive-access-unit semantics;
@@ -91,8 +92,9 @@ Growth denial preserves the prior reservation. Slice, pixel, packet, dependency
 and allocator high-water limits remain independent of shared admission limits.
 
 WebM video indexing and version-pinned object-store transport adapters are now
-implemented below. Sequential unknown-length sources, live fragment ingestion,
-Cues-based seeking and general encrypted/dynamic-description support remain planned.
+implemented below, together with bounded sequential spooling, caller-framed live
+fragment ingestion and Cues seeking. General encrypted/dynamic-description support
+remains planned.
 
 Tests use six original synthetic MP4 fixtures with hashed FFprobe receipts,
 including B-frames, VFR, rotation, audio/video tracks, signed composition offsets,
@@ -142,10 +144,11 @@ Segment. It retains Tracks metadata, reads bounded element/block prefixes and
 skips full codec payloads during indexing. Packets retain signed nanosecond PTS,
 optional default/BlockDuration, keyframe hints, invisible/discardable flags and
 absolute codec-payload offsets. No decode timestamp is invented. Known-size
-Clusters, SimpleBlock and BlockGroup are supported; the Segment may have unknown
-size when the Source length is known. Laced video, content encodings, dynamic
-CodecState, interlacing, unknown-size Clusters and non-unit TrackTimestampScale
-are rejected. Index availability does not advertise a VP8/VP9/AV1 decoder.
+and unknown-size Clusters, SimpleBlock and BlockGroup are supported; the Segment
+may have unknown size when the Source length is known. Unknown Cluster boundaries
+are found by parsing element headers until the next Segment child, never by scanning
+codec payload for signatures. Laced video, content encodings, dynamic CodecState,
+interlacing and non-unit TrackTimestampScale are rejected. Index availability does not advertise a VP8/VP9/AV1 decoder.
 The [Matroska element definitions](https://www.matroska.org/technical/elements.html)
 are the container reference; the VP9 fixture independently matches FFprobe.
 
@@ -322,3 +325,37 @@ cancelled read, stale-source, and retained-packet lifetime checks.
 Completion requires unchanged qualified audio semantics, bounded metadata/read
 memory, and packet/timeline parity for the declared container scope. These
 contracts are not a claim that every MP4 or WebM stream is supported.
+
+## Cues, sequential input and live fragments
+
+`webm.Reader.cues` retains validated CueTime/track/Cluster positions bounded by
+`max_cues`. `seek(pts)` uses the cue at or before the request, with a sync-packet
+fallback when Cues are absent. Positions must resolve to the selected track's
+indexed visible sync packet; malformed targets, duplicate times, unsupported
+codec-state changes and budget excess fail. A container sync hint is not proof
+of a codec dependency reset. VP8/VP9/AV1 decoding is still unavailable.
+
+`stream.Sequential` adapts a non-seekable reader. `stream.collect` explicitly
+spools to a bounded immutable `Snapshot`, handling short reads, final EOF, cancellation
+and invalid provider counts. Zero bytes mean final EOF; temporary unavailability
+must return an error. Byte/read/chunk limits prevent indefinite buffering; exact
+byte-limit EOF is checked with a one-byte probe. Shared admission reserves the spool
+bound and shrinks to owned storage. This is completed-input spooling, not an unbounded
+live seek abstraction. Snapshot addresses stay stable; release Readers and packet
+leases before snapshot destruction. Provider context and initial identity are borrowed.
+
+`live_mp4.Ingest` owns an initialization snapshot and accepts arbitrary partial
+arrival chunks. The caller invokes `finishSegment` at an explicit segment envelope
+boundary; only complete supported moof/mdat segments are published. Emitted `Segment`
+values own immutable backing, a Reader, and distinct ordinal source identities.
+Earlier packet leases survive subsequent arrivals. Segment count, aggregate ingested
+bytes, pending bytes, identity bytes and index limits bound retention. Pending-buffer
+growth charges both old and new allocations during copying. DTS replay/regression
+and changed track/configuration/geometry fail; failed validation retains pending
+input for retry or `discardSegment`. This does not implement network/HLS/DASH framing,
+indefinite sessions, encrypted samples or initialization reconfiguration. Consumers
+must release retained Segments to keep shared budgets available.
+
+MP4 `avc3` descriptions expose `Track.inband_parameter_sets`; packet offsets and
+clock indexing are unchanged. Dynamic portable codec decoding uses the video
+parameter registry rather than altering media parsing or Apple hardware policy.

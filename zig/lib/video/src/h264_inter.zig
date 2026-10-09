@@ -121,7 +121,7 @@ fn compensate(syntax: *Syntax, state: anytype, planes: anytype, motions: [2][]mo
         for (0..3) |p| references[list][p] = .{ .data = data[p], .width = width / (if (p == 0 or chroma_format == 3) @as(usize, 1) else 2), .height = height / (if (p == 0 or chroma_format != 1) @as(usize, 1) else 2) / (if (state.field_mode) @as(usize, 2) else 1), .field = state.field_mode, .parity = try state.referenceParity(list, reference) };
     };
     if (m[0].reference < 0 and m[1].reference < 0) return error.MissingVideoReference;
-    for (0..3) |p| {
+    for (0..if (chroma_format == 0) @as(usize, 1) else 3) |p| {
         const divisor: usize = if (p == 0 or chroma_format == 3) 1 else 2;
         const stride = width / divisor;
         const sub_y: usize = if (p == 0 or chroma_format >= 2) 1 else 2;

@@ -1273,3 +1273,209 @@ test "video H264 PAFF assembly ignores auxiliary timing and rejects duplicate fr
     try std.testing.expectError(error.Cancelled, video.h264.decodeFrame(a, &reader, 0, .{}));
     try std.testing.expectEqual(media.admission.Resources{}, pool.snapshot());
 }
+
+test "video H264 original Sintel stream matches FFmpeg decoded frame hashes" {
+    const bytes = @embedFile("../testdata/h264-sintel-original.mp4");
+    const Receipt = struct { clip_sha256: []const u8, frames: []const struct { media_pts: i64, sha256: []const u8 } };
+    const receipt = try std.json.parseFromSlice(Receipt, a, @embedFile("../testdata/h264-sintel-original-oracle.json"), .{ .ignore_unknown_fields = true });
+    defer receipt.deinit();
+    var hash: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &hash, .{});
+    try std.testing.expectEqualStrings(receipt.value.clip_sha256, &std.fmt.bytesToHex(hash, .lower));
+    var src = media.source.Source{ .allocator = a, .identity = "sintel-original", .storage = .{ .borrowed = bytes } };
+    var reader = try media.mp4.Reader.init(a, &src, .{});
+    defer reader.deinit();
+    for ([_]usize{ 0, 5, 12, reader.packets.len - 1 }) |index| {
+        var frame = try video.h264.decodeFrame(a, &reader, index, .{ .max_decode_bytes = 512 * 1024 * 1024 });
+        defer frame.deinit();
+        try std.testing.expectEqual(reader.packets[index].pts, frame.pts);
+        std.crypto.hash.sha2.Sha256.hash(frame.nv12, &hash, .{});
+        var matched = false;
+        for (receipt.value.frames) |expected| if (expected.media_pts == reader.packets[index].media_pts) {
+            try std.testing.expectEqualStrings(expected.sha256, &std.fmt.bytesToHex(hash, .lower));
+            matched = true;
+            break;
+        };
+
+        try std.testing.expect(matched);
+    }
+}
+
+test "video dynamic H264 geometry depth chroma and non-IDR PPS changes match native oracles" {
+    const Receipt = struct { cases: []const struct { mp4_sha256: []const u8, frames: []const struct { width: u32, height: u32, bit_depth: u8, chroma_format: u8, sha256: []const u8 } } };
+    const receipt = try std.json.parseFromSlice(Receipt, a, @embedFile("../testdata/h264-dynamic-oracle.json"), .{ .ignore_unknown_fields = true });
+    defer receipt.deinit();
+    inline for (.{ @embedFile("../testdata/h264-dynamic-geometry.mp4"), @embedFile("../testdata/h264-dynamic-pps.mp4") }, 0..) |bytes, ordinal| {
+        var hash: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(bytes, &hash, .{});
+        try std.testing.expectEqualStrings(receipt.value.cases[ordinal].mp4_sha256, &std.fmt.bytesToHex(hash, .lower));
+        var src = media.source.Source{ .allocator = a, .identity = "dynamic-avc3", .storage = .{ .borrowed = bytes } };
+        var reader = try media.mp4.Reader.init(a, &src, .{});
+        defer reader.deinit();
+        try std.testing.expect(reader.track.inband_parameter_sets);
+        const session = try video.h264_dynamic.Session.init(a, &reader, .{});
+        defer session.deinit();
+        for (receipt.value.cases[ordinal].frames, 0..) |expected, index| {
+            var frame = try session.decodeFrame(index);
+            defer frame.deinit();
+            try std.testing.expectEqual(expected.width, frame.width);
+            try std.testing.expectEqual(expected.height, frame.height);
+            try std.testing.expectEqual(expected.bit_depth, frame.bit_depth);
+            try std.testing.expectEqual(expected.chroma_format, frame.chroma_format);
+            std.crypto.hash.sha2.Sha256.hash(frame.nv12, &hash, .{});
+            try std.testing.expectEqualStrings(expected.sha256, &std.fmt.bytesToHex(hash, .lower));
+        }
+        const Collector = struct {
+            count: usize = 0,
+            fn publish(ctx: *anyopaque, slot: usize, frame: *const video.h264.Frame) !void {
+                const self: *@This() = @ptrCast(@alignCast(ctx));
+                try std.testing.expectEqual(([_]i64{ 2, 0, 1, 2 })[slot], frame.pts);
+                self.count += 1;
+            }
+        };
+        var collector = Collector{};
+        _ = try video.h264.decodeSelected(a, &reader, &.{ 2, 0, 1, 2 }, .{}, &collector, Collector.publish);
+        try std.testing.expectEqual(@as(usize, 4), collector.count);
+        try std.testing.expectError(error.ResourceLimitExceeded, video.h264_dynamic.Session.init(a, &reader, .{ .max_parameter_bytes = 1 }));
+        try std.testing.expectError(error.ResourceLimitExceeded, video.h264_dynamic.Session.init(a, &reader, .{ .max_parameter_packets = 2 }));
+    }
+}
+test "video dynamic H264 registry and geometry reconstruction unwind allocation failures" {
+    const Harness = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var src = media.source.Source{ .allocator = allocator, .identity = "dynamic-failures", .storage = .{ .borrowed = @embedFile("../testdata/h264-dynamic-geometry.mp4") } };
+            var reader = try media.mp4.Reader.init(allocator, &src, .{});
+            defer reader.deinit();
+            var frame = try video.h264.decodeFrame(allocator, &reader, 2, .{});
+            defer frame.deinit();
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Harness.run, .{});
+}
+
+test "video monochrome native depth CAVLC and CABAC PAFF samples match FFmpeg" {
+    const Receipt = struct { cases: []const struct { bit_depth: u8, mp4_sha256: []const u8, sha256: []const u8 } };
+    const receipt = try std.json.parseFromSlice(Receipt, a, @embedFile("../testdata/h264-mono-oracle.json"), .{ .ignore_unknown_fields = true });
+    defer receipt.deinit();
+    inline for (.{ @embedFile("../testdata/h264-mono-8-cavlc.mp4"), @embedFile("../testdata/h264-mono-8-cabac.mp4"), @embedFile("../testdata/h264-mono-10-cavlc.mp4"), @embedFile("../testdata/h264-mono-10-cabac.mp4"), @embedFile("../testdata/h264-mono-14-cavlc.mp4"), @embedFile("../testdata/h264-mono-14-cabac.mp4") }, 0..) |bytes, index| {
+        const expected = receipt.value.cases[index];
+        var hash: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(bytes, &hash, .{});
+        try std.testing.expectEqualStrings(expected.mp4_sha256, &std.fmt.bytesToHex(hash, .lower));
+        var src = media.source.Source{ .allocator = a, .identity = "mono", .storage = .{ .borrowed = bytes } };
+        var reader = try media.mp4.Reader.init(a, &src, .{});
+        defer reader.deinit();
+        var frame = try video.h264.decodeFrame(a, &reader, 0, .{});
+        defer frame.deinit();
+        try std.testing.expectEqual(@as(u8, 0), frame.chroma_format);
+        try std.testing.expectEqual(expected.bit_depth, frame.bit_depth);
+        std.crypto.hash.sha2.Sha256.hash(frame.nv12, &hash, .{});
+        try std.testing.expectEqualStrings(expected.sha256, &std.fmt.bytesToHex(hash, .lower));
+        try frame.host().validate();
+        const prepared = try video.preparation.referenceHost(a, frame.host(), .{ .width = 48, .height = 48, .matrix = .bt709 }, .{});
+        defer a.free(prepared);
+        for (prepared) |value| try std.testing.expect(std.math.isFinite(value));
+    }
+}
+
+test "video H264 declared frame gaps preserve native PCM pictures" {
+    const Receipt = struct { cases: []const struct { mp4_sha256: []const u8, frames: []const []const u8 } };
+    const receipt = try std.json.parseFromSlice(Receipt, a, @embedFile("../testdata/h264-gaps-oracle.json"), .{ .ignore_unknown_fields = true });
+    defer receipt.deinit();
+    inline for (.{ @embedFile("../testdata/h264-gaps-poc1-cavlc.mp4"), @embedFile("../testdata/h264-gaps-poc1-cabac.mp4"), @embedFile("../testdata/h264-gaps-poc2-cavlc.mp4"), @embedFile("../testdata/h264-gaps-poc2-cabac.mp4") }, 0..) |bytes, ordinal| {
+        var hash: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(bytes, &hash, .{});
+        try std.testing.expectEqualStrings(receipt.value.cases[ordinal].mp4_sha256, &std.fmt.bytesToHex(hash, .lower));
+        var src = media.source.Source{ .allocator = a, .identity = "gaps", .storage = .{ .borrowed = bytes } };
+        var reader = try media.mp4.Reader.init(a, &src, .{});
+        defer reader.deinit();
+        for (receipt.value.cases[ordinal].frames, 0..) |expected, index| {
+            var frame = try video.h264.decodeFrame(a, &reader, index, .{});
+            defer frame.deinit();
+            std.crypto.hash.sha2.Sha256.hash(frame.nv12, &hash, .{});
+            try std.testing.expectEqualStrings(expected, &std.fmt.bytesToHex(hash, .lower));
+        }
+    }
+}
+
+test "video H264 inferred gap DPB wraparound marking and missing samples" {
+    const bytes = @embedFile("../testdata/h264-gaps-poc2-cavlc.mp4");
+    var src = media.source.Source{ .allocator = a, .identity = "gap-state", .storage = .{ .borrowed = bytes } };
+    var reader = try media.mp4.Reader.init(a, &src, .{});
+    defer reader.deinit();
+    const cfg = try video.h264.configParse(a, reader.track.avcc);
+    defer cfg.groups.deinit(a);
+    var refs = @import("h264_references.zig").State{ .previous_reference_num = 14, .previous_num = 14, .frame_bits = 4 };
+    defer refs.deinit(a);
+    try refs.inferGaps(a, 2, cfg, .{});
+    try std.testing.expectEqual(@as(usize, 1), refs.count);
+    try std.testing.expectEqual(@as(u32, 1), refs.pictures[0].frame_num);
+    try std.testing.expect(refs.pictures[0].non_existing);
+    try std.testing.expectEqual(@as(i32, 16), refs.frame_offset);
+    refs.order(4);
+    try std.testing.expectError(error.MissingVideoReference, refs.planes(0, 0, 64, 48));
+    refs.orderB();
+    try std.testing.expectEqual(@as(usize, 0), refs.list_count);
+    var cloned = refs.clone();
+    defer cloned.deinit(a);
+    try std.testing.expectEqual(@as(usize, 2), refs.pictures[0].owners.*);
+}
+
+test "video H264 JM decoder qualifies partitions separate planes SP and SI" {
+    const Receipt = struct { mp4_sha256: []const u8, bit_depth: u8, chroma_format: u8, frames: []const []const u8 };
+    inline for (.{ "partitions", "mono-8", "mono-10", "separate", "separate-10", "separate-14", "primary-sp", "secondary-sp", "si" }) |name| {
+        const receipt = try std.json.parseFromSlice(Receipt, a, @embedFile("../testdata/h264-jm-" ++ name ++ "-oracle.json"), .{ .ignore_unknown_fields = true });
+        defer receipt.deinit();
+        const bytes = @embedFile("../testdata/h264-jm-" ++ name ++ ".mp4");
+        var hash: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(bytes, &hash, .{});
+        try std.testing.expectEqualStrings(receipt.value.mp4_sha256, &std.fmt.bytesToHex(hash, .lower));
+        var src = media.source.Source{ .allocator = a, .identity = name, .storage = .{ .borrowed = bytes } };
+        var reader = try media.mp4.Reader.init(a, &src, .{});
+        defer reader.deinit();
+        for (receipt.value.frames, 0..) |expected, index| {
+            var frame = video.h264.decodeFrame(a, &reader, index, .{}) catch |err| {
+                std.debug.print("JM {s} packet {d}: {s}\n", .{ name, index, @errorName(err) });
+                return err;
+            };
+            defer frame.deinit();
+            try std.testing.expectEqual(receipt.value.bit_depth, frame.bit_depth);
+            try std.testing.expectEqual(receipt.value.chroma_format, frame.chroma_format);
+            std.crypto.hash.sha2.Sha256.hash(frame.nv12, &hash, .{});
+            std.testing.expectEqualStrings(expected, &std.fmt.bytesToHex(hash, .lower)) catch |err| {
+                std.debug.print("JM sample mismatch {s} packet {d}\n", .{ name, index });
+                return err;
+            };
+        }
+        const Capture = struct {
+            expected: []const []const u8,
+            count: usize = 0,
+            fn publish(context_value: *anyopaque, slot: usize, frame: *const video.h264.Frame) !void {
+                const self: *@This() = @ptrCast(@alignCast(context_value));
+                const selected = [_]usize{ 3, 0, 2, 3 };
+                var digest: [32]u8 = undefined;
+                std.crypto.hash.sha2.Sha256.hash(frame.nv12, &digest, .{});
+                try std.testing.expectEqualStrings(self.expected[selected[slot]], &std.fmt.bytesToHex(digest, .lower));
+                self.count += 1;
+            }
+        };
+        var capture = Capture{ .expected = receipt.value.frames };
+        const stats = try video.h264.decodeSelected(a, &reader, &.{ 3, 0, 2, 3 }, .{}, &capture, Capture.publish);
+        try std.testing.expectEqual(@as(usize, 4), capture.count);
+        try std.testing.expectEqual(@as(usize, if (receipt.value.chroma_format == 3) 12 else 4), stats.decoded_packets);
+    }
+}
+
+test "video H264 JM advanced reconstruction allocation failures and admission unwind" {
+    const Harness = struct {
+        fn run(allocator: std.mem.Allocator, bytes: []const u8) !void {
+            var src = media.source.Source{ .allocator = allocator, .identity = "jm-failures", .storage = .{ .borrowed = bytes } };
+            var reader = try media.mp4.Reader.init(allocator, &src, .{});
+            defer reader.deinit();
+            var frame = try video.h264.decodeFrame(allocator, &reader, 3, .{});
+            frame.deinit();
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Harness.run, .{@as([]const u8, @embedFile("../testdata/h264-jm-partitions.mp4"))});
+    try std.testing.checkAllAllocationFailures(a, Harness.run, .{@as([]const u8, @embedFile("../testdata/h264-jm-separate-14.mp4"))});
+}

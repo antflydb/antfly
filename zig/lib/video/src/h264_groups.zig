@@ -61,6 +61,10 @@ pub const Groups = struct {
         return value;
     }
     pub fn build(self: Groups, map: []u8, width: usize, change: usize) void {
+        if (self.count == 1) {
+            @memset(map, 0);
+            return;
+        }
         const height = map.len / width;
         switch (self.kind) {
             0 => {

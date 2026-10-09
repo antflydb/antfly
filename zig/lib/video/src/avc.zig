@@ -12,7 +12,7 @@ pub fn validatePortableConfig(config: []const u8) !void {
 }
 fn validate(config: []const u8, portable: bool) !void {
     if (config.len < 7 or config[0] != 1) return error.MalformedVideoConfig;
-    if (config[1] != 66 and config[1] != 77 and config[1] != 100 and !(portable and (config[1] == 110 or config[1] == 122 or config[1] == 244))) return error.UnsupportedVideoProfile;
+    if (config[1] != 66 and config[1] != 77 and config[1] != 100 and !(portable and (config[1] == 88 or config[1] == 110 or config[1] == 122 or config[1] == 244))) return error.UnsupportedVideoProfile;
     const n = config[5] & 31;
     if (n == 0) return error.MalformedVideoConfig;
     var cursor: usize = 6;
@@ -93,6 +93,12 @@ const Bits = struct {
 /// Static avc1 parameter sets only. Reject in-band changes before OS decoding,
 /// rather than allowing a larger/different frame to bypass metadata admission.
 pub fn validatePacket(bytes: []const u8, length_bytes: u3) !void {
+    return validatePacketPolicy(bytes, length_bytes, false);
+}
+pub fn validatePortablePacket(bytes: []const u8, length_bytes: u3) !void {
+    return validatePacketPolicy(bytes, length_bytes, true);
+}
+fn validatePacketPolicy(bytes: []const u8, length_bytes: u3, dynamic: bool) !void {
     if (length_bytes != 1 and length_bytes != 2 and length_bytes != 4) return error.MalformedVideoPacket;
     var cursor: usize = 0;
     var count: usize = 0;
@@ -103,7 +109,7 @@ pub fn validatePacket(bytes: []const u8, length_bytes: u3) !void {
         cursor += length_bytes;
         if (size == 0 or size > bytes.len - cursor or bytes[cursor] & 128 != 0) return error.MalformedVideoPacket;
         const kind = bytes[cursor] & 31;
-        if (kind == 7 or kind == 8 or kind == 13 or kind == 15) return error.UnsupportedDynamicVideoConfig;
+        if ((kind == 7 or kind == 8) and !dynamic or kind == 13 or kind == 15) return error.UnsupportedDynamicVideoConfig;
         if (kind == 0 or kind >= 16) return error.UnsupportedVideoNal;
         count += 1;
         if (count > 4096) return error.ResourceLimitExceeded;
@@ -124,7 +130,13 @@ test "AVC rejects malformed lengths and in-band parameter changes before decode"
 /// recovery-point SEI and container sync flags alone do not establish that.
 /// Full slice syntax is still validated by the actual decoder.
 pub fn isIdr(bytes: []const u8, length_bytes: u3) !bool {
-    try validatePacket(bytes, length_bytes);
+    return isIdrPolicy(bytes, length_bytes, false);
+}
+pub fn isPortableIdr(bytes: []const u8, length_bytes: u3) !bool {
+    return isIdrPolicy(bytes, length_bytes, true);
+}
+fn isIdrPolicy(bytes: []const u8, length_bytes: u3, dynamic: bool) !bool {
+    try validatePacketPolicy(bytes, length_bytes, dynamic);
     var cursor: usize = 0;
     var has_idr = false;
     while (cursor < bytes.len) {

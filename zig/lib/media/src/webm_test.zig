@@ -75,3 +75,117 @@ test "webm rejects video lacing instead of returning the lace as one picture" {
     try std.testing.expectError(error.UnsupportedVideoLacing, webm.Reader.init(a, &bad, .{}));
     try std.testing.expectEqual(@as(usize, 0), bad.retained_bytes);
 }
+
+fn unknownClusters(allocator: std.mem.Allocator) ![]u8 {
+    const changed = try allocator.dupe(u8, clip);
+    errdefer allocator.free(changed);
+    var src = input();
+    var reader = try webm.Reader.init(allocator, &src, .{});
+    defer reader.deinit();
+    var previous: ?u64 = null;
+    for (reader.packets) |packet| {
+        if (previous == packet.cluster_offset) continue;
+        previous = packet.cluster_offset;
+        const offset: usize = @intCast(packet.cluster_offset);
+        const ebml = @import("ebml.zig");
+        const id = try ebml.readElementId(changed, offset);
+        const size = try ebml.readVint(changed, offset + id.len);
+        @memset(changed[offset + id.len ..][0..size.len], 255);
+        changed[offset + id.len] = @as(u8, 255) >> @as(u3, @intCast(size.len - 1));
+    }
+    return changed;
+}
+test "webm unknown-size Clusters preserve packets and validated Cues seek hints" {
+    const changed = try unknownClusters(a);
+    defer a.free(changed);
+    var src = source.Source{ .allocator = a, .identity = "unknown-clusters", .storage = .{ .borrowed = changed } };
+    var reader = try webm.Reader.init(a, &src, .{});
+    defer reader.deinit();
+    var original = input();
+    var reference = try webm.Reader.init(a, &original, .{});
+    defer reference.deinit();
+    try std.testing.expectEqualSlices(webm.Packet, reference.packets, reader.packets);
+    try std.testing.expect(reader.cues.len != 0);
+    for (reader.cues) |cue| {
+        try std.testing.expectEqual(cue.packet_index, try reader.seek(cue.pts));
+        try std.testing.expectEqual(cue.packet_index, try reader.seek(cue.pts + 1));
+        try std.testing.expect(reader.packets[cue.packet_index].sync);
+    }
+    try std.testing.expectError(error.MissingVideoReference, reader.seek(-1));
+    const Harness = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            const bytes = try unknownClusters(allocator);
+            defer allocator.free(bytes);
+            var s = source.Source{ .allocator = allocator, .identity = "unknown-failures", .storage = .{ .borrowed = bytes } };
+            var r = try webm.Reader.init(allocator, &s, .{});
+            r.deinit();
+            try std.testing.expectEqual(@as(usize, 0), s.retained_bytes);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Harness.run, .{});
+}
+test "webm Cues budgets and fallback without Cues" {
+    var src = input();
+    try std.testing.expectError(error.ResourceLimitExceeded, webm.Reader.init(a, &src, .{ .max_cues = 0 }));
+    try std.testing.expectEqual(@as(usize, 0), src.retained_bytes);
+    const changed = try a.dupe(u8, clip);
+    defer a.free(changed);
+    const ebml = @import("ebml.zig");
+    const header = try ebml.readElementHeader(changed, 0);
+    const segment = try ebml.readElementHeader(changed, header.data_end.?);
+    var cursor = segment.data_start;
+    while (cursor < changed.len) {
+        const child = try ebml.readElementHeader(changed, cursor);
+        if (child.id == 0x1c53bb6b) changed[cursor + 3] = 0x6c;
+        cursor = child.data_end.?;
+    }
+    src.storage = .{ .borrowed = changed };
+    var reader = try webm.Reader.init(a, &src, .{});
+    defer reader.deinit();
+    try std.testing.expectEqual(@as(usize, 0), reader.cues.len);
+    try std.testing.expectEqual(@as(usize, 0), try reader.seek(1));
+}
+
+test "webm unknown-size consecutive Clusters terminate at sibling headers" {
+    const ebml = @import("ebml.zig");
+    var original = input();
+    var baseline = try webm.Reader.init(a, &original, .{});
+    defer baseline.deinit();
+    const offset: usize = @intCast(baseline.packets[0].cluster_offset);
+    const cluster = try ebml.readElementHeader(clip, offset);
+    const end = cluster.data_end.?;
+    const unknown = try unknownClusters(a);
+    defer a.free(unknown);
+    // Insertion changes later Cluster offsets. Remove stale Cues from this
+    // constructed boundary case; Cues seeking is independently qualified.
+    const first_known = try ebml.readElementHeader(clip, 0);
+    const segment_known = try ebml.readElementHeader(clip, first_known.data_end.?);
+    var child_offset = segment_known.data_start;
+    while (child_offset < clip.len) {
+        const child = try ebml.readElementHeader(clip, child_offset);
+        if (child.id == 0x1c53bb6b) unknown[child_offset + 3] = 0x6c;
+        child_offset = child.data_end.?;
+    }
+    var first_packets: usize = 0;
+    for (baseline.packets) |packet| if (packet.cluster_offset == offset) {
+        first_packets += 1;
+    };
+    const repeated = try a.alloc(u8, unknown.len + end - offset);
+    defer a.free(repeated);
+    @memcpy(repeated[0..end], unknown[0..end]);
+    @memcpy(repeated[end..][0 .. end - offset], unknown[offset..end]);
+    @memcpy(repeated[end + end - offset ..], unknown[end..]);
+    const first = try ebml.readElementHeader(repeated, 0);
+    const id = try ebml.readElementId(repeated, first.data_end.?);
+    const size_offset = first.data_end.? + id.len;
+    const size = try ebml.readVint(repeated, size_offset);
+    @memset(repeated[size_offset..][0..size.len], 255);
+    repeated[size_offset] = @as(u8, 255) >> @as(u3, @intCast(size.len - 1));
+    var src = source.Source{ .allocator = a, .identity = "two-live-clusters", .storage = .{ .borrowed = repeated } };
+    var reader = try webm.Reader.init(a, &src, .{});
+    defer reader.deinit();
+    try std.testing.expectEqual(baseline.packets.len + first_packets, reader.packets.len);
+    try std.testing.expectEqual(@as(u64, end), reader.packets[first_packets].cluster_offset);
+    try std.testing.expectEqual(@as(usize, 0), reader.cues.len);
+    for (reader.cues) |cue| try std.testing.expectEqual(cue.packet_index, try reader.seek(cue.pts));
+}

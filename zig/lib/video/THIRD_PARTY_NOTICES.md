@@ -40,3 +40,15 @@ from [ITU-T H.264 (08/2021)](https://www.itu.int/rec/T-REC-H.264-202108-I/en).
 The independently written Zig implementation and synthetic fixture generators
 remain Apache-2.0. Extended CABAC initial states are aliases into the existing
 pinned OpenH264 base table above; that table retains its BSD-2-Clause notice.
+
+## Sintel qualification assets
+
+`testdata/h264-sintel-original.mp4` and `testdata/h264-jm-*.mp4` contain an excerpt
+or resized/re-encoded derivatives of Sintel © Blender Foundation /
+[durian.blender.org](https://durian.blender.org/about/), under
+[Creative Commons Attribution 3.0](https://creativecommons.org/licenses/by/3.0/).
+The original excerpt copies video and removes audio; JM derivatives resize frames
+and re-encode them for codec qualification. Source hashes, modification details,
+attribution and offline regeneration instructions are in [testdata/README.md](testdata/README.md).
+These media assets retain CC BY 3.0 rather than the code's Apache-2.0 license.
+The official JM reference software is invoked offline but is not vendored or linked.

@@ -1,0 +1,23 @@
+{
+  "date": "2026-10-08",
+  "zig": "0.17.0",
+  "reconstruction": {
+    "runs": 2265,
+    "unique_runs": 50,
+    "instrumented_edges": 17923,
+    "covered_edges": 4644,
+    "percent": 25.91,
+    "cache": "fresh",
+    "command": "zig build fuzz-video -Dvideo-fuzz-filter=reconstruction --fuzz=2000"
+  },
+  "parameter_sets": {
+    "runs": 2259,
+    "unique_runs": 55,
+    "instrumented_edges": 9644,
+    "covered_edges": 738,
+    "percent": 7.65,
+    "cache": "fresh",
+    "command": "zig build fuzz-video -Dvideo-fuzz-filter=\"parameter sets\" --fuzz=2000"
+  },
+  "result": "completed without failure; bounded short campaigns, not comprehensive fuzz qualification"
+}

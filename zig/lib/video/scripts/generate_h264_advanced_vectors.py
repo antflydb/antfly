@@ -122,7 +122,7 @@ class Cabac:
             self.normalize()
 
 
-def configuration(cabac=False, poc=2, width=64, height=48):
+def configuration(cabac=False, poc=2, width=64, height=48, gaps=False):
     sps = Bits()
     for value in (77 if cabac else 66, 0, 10):
         sps.fixed(value, 8)
@@ -137,7 +137,7 @@ def configuration(cabac=False, poc=2, width=64, height=48):
         sps.se(2)
         sps.se(2)
     sps.ue(1)
-    sps.fixed(0, 1)
+    sps.fixed(gaps, 1)
     sps.ue(width // 16 - 1)
     sps.ue(height // 16 - 1)
     for value in (1, 1, 0, 0):
@@ -157,15 +157,17 @@ def configuration(cabac=False, poc=2, width=64, height=48):
     return sps, pps
 
 
-def pcm_vector(cabac, poc, width=64, height=48, frames=4):
-    sps, pps = configuration(cabac, poc, width, height)
+def pcm_vector(
+    cabac, poc, width=64, height=48, frames=4, frame_numbers=None, gaps=False
+):
+    sps, pps = configuration(cabac, poc, width, height, gaps)
     output = sps.nal(0x67) + pps.nal(0x68)
     rng = random.Random(2026)
     for frame in range(frames):
         bits = Bits()
         for value in (0, 2, 0):
             bits.ue(value)
-        bits.fixed(frame, 4)
+        bits.fixed(frame if frame_numbers is None else frame_numbers[frame], 4)
         if frame == 0:
             bits.ue(0)
         if poc == 1:
@@ -386,7 +388,10 @@ def interlaced_pcm(
     pps.fixed(1, 1)
     pps.fixed(0, 2)
     output = sps.nal(0x67) + pps.nal(0x68)
-    planes = [[0] * (width * height // (1 if p == 0 else sx * sy)) for p in range(3)]
+    planes = [
+        [0] * (width * height // (1 if p == 0 else sx * sy))
+        for p in range(1 if chroma == 0 else 3)
+    ]
     first_side = 1 if bottom_first else 0
     for parity in ((1, 0) if bottom_first else (0, 1)) if paff else (0,):
         size = w * h * (1 if paff else 2)
@@ -441,7 +446,7 @@ def interlaced_pcm(
                 else:
                     bits.ue(25)
                 bits.align()
-                for p in range(3):
+                for p in range(1 if chroma == 0 else 3):
                     px, py = (1, 1) if p == 0 else (sx, sy)
                     edge_x, edge_y = 16 // px, 16 // py
                     stride = width // px
@@ -463,12 +468,17 @@ def interlaced_pcm(
                 0x65 if idr_first and (not paff or parity == first_side) else 0x41,
                 stop=not cabac,
             )
-    known = planes[0] + [v for pair in zip(planes[1], planes[2]) for v in pair]
+    known = (
+        planes[0]
+        if chroma == 0
+        else planes[0] + [v for pair in zip(planes[1], planes[2]) for v in pair]
+    )
     word = "H" if depth > 8 else "B"
     return output, struct.pack("<" + word * len(known), *known)
 
 
-def mux_pcm(annex, width=64, height=48, composition_offsets=None):
+def mux_pcm(annex, width=64, height=48, composition_offsets=None, sample_entry="avc1"):
+    assert sample_entry in ("avc1", "avc3")
     """Minimal ISO BMFF muxer; supports tools FFmpeg intentionally rejects."""
 
     def box(kind, payload):
@@ -483,7 +493,12 @@ def mux_pcm(annex, width=64, height=48, composition_offsets=None):
     annexes = annex if isinstance(annex, list) else [annex]
     nals = annexes[0].split(b"\x00\x00\x00\x01")[1:]
     sps, pps = nals[:2]
-    packets = [b"".join(integers(len(nal)) + nal for nal in nals[2:])]
+    packets = [
+        b"".join(
+            integers(len(nal)) + nal
+            for nal in (nals[2:] if sample_entry == "avc1" else nals)
+        )
+    ]
     packets += [
         b"".join(
             integers(len(nal)) + nal for nal in part.split(b"\x00\x00\x00\x01")[1:]
@@ -516,7 +531,10 @@ def mux_pcm(annex, width=64, height=48, composition_offsets=None):
     def movie(offset):
         stbl = box(
             "stbl",
-            box("stsd", integers(0, 1) + box("avc1", bytes(visual) + box("avcC", avcc)))
+            box(
+                "stsd",
+                integers(0, 1) + box(sample_entry, bytes(visual) + box("avcC", avcc)),
+            )
             + full("stts", 1, count, 1)
             + full("stsc", 1, 1, count, 1)
             + full("stsz", 0, count, *(len(part) for part in packets))

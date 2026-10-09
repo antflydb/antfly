@@ -10,6 +10,8 @@ extern fn av_preparer_destroy(*anyopaque) void;
 extern fn av_coefficients_create(*anyopaque, [*]const u32, usize, [*]const i32, usize, [*]const u32, usize, [*]const i32, usize, *?*anyopaque) i32;
 extern fn av_coefficients_destroy(*anyopaque) void;
 extern fn av_prepare_submit(*anyopaque, *anyopaque, [*]const u32, *anyopaque, *?*anyopaque) i32;
+extern fn av_prepare_native_submit(*anyopaque, *anyopaque, *anyopaque, [*]const u32, *anyopaque, *?*anyopaque) i32;
+extern fn av_prepare_host_submit(*anyopaque, [*]const u8, usize, [*]const u8, usize, [*]const u32, *anyopaque, *?*anyopaque) i32;
 extern fn av_prepare_rgba_submit(*anyopaque, [*]const u8, usize, [*]const u32, *anyopaque, *?*anyopaque) i32;
 extern fn av_prepared_gpu_seconds(*anyopaque) f64;
 extern fn av_preparer_device_bytes(*anyopaque) u64;
@@ -81,8 +83,8 @@ fn rgb(planes: [2]apple.Plane, x: usize, y: usize, format: apple.Format, matrix:
     var luma: f32 = @as(f32, @floatFromInt(hostSample(planes[0].bytes, y * planes[0].stride + x * bytes, bit_depth))) / scale;
     const sub_x: usize = if (chroma_format == 3) 1 else 2;
     const uv = (y / (if (chroma_format == 1) @as(usize, 2) else 1)) * planes[1].stride + (x / sub_x) * 2 * bytes;
-    var u: f32 = @as(f32, @floatFromInt(hostSample(planes[1].bytes, uv, bit_depth))) / scale - 128;
-    var v: f32 = @as(f32, @floatFromInt(hostSample(planes[1].bytes, uv + bytes, bit_depth))) / scale - 128;
+    var u: f32 = if (chroma_format == 0) 0 else @as(f32, @floatFromInt(hostSample(planes[1].bytes, uv, bit_depth))) / scale - 128;
+    var v: f32 = if (chroma_format == 0) 0 else @as(f32, @floatFromInt(hostSample(planes[1].bytes, uv + bytes, bit_depth))) / scale - 128;
     if (format == .nv12_video) {
         luma = (luma - 16) * (255.0 / 219.0);
         u *= 255.0 / 224.0;
@@ -113,10 +115,14 @@ pub const HostSurface = struct {
     format: apple.Format,
     planes: [2]apple.Plane,
     pub fn validate(self: HostSurface) !void {
-        if (self.bit_depth < 8 or self.bit_depth > 14 or self.chroma_format < 1 or self.chroma_format > 3) return error.UnsupportedSurfaceFormat;
+        if (self.bit_depth < 8 or self.bit_depth > 14 or self.chroma_format > 3) return error.UnsupportedSurfaceFormat;
         if (self.width == 0 or self.height == 0) return error.InvalidVideoGeometry;
         if (self.width > 16_384 or self.height > 16_384) return error.ResourceLimitExceeded;
         for (self.planes, 0..) |plane, i| {
+            if (i == 1 and self.chroma_format == 0) {
+                if (plane.width != 0 or plane.height != 0 or plane.stride != 0 or plane.bytes.len != 0) return error.UnsupportedSurfaceFormat;
+                continue;
+            }
             const width = if (i == 0 or self.chroma_format == 3) self.width else (self.width + 1) / 2;
             const height = if (i == 0 or self.chroma_format >= 2) self.height else (self.height + 1) / 2;
             const row = try std.math.mul(usize, width, (if (i == 0) @as(usize, 1) else 2) * (if (self.bit_depth == 8) @as(usize, 1) else 2));
@@ -299,10 +305,49 @@ pub const Metal = struct {
         defer scope.deinit();
         const g = try geometry(surface.width, surface.height, options);
         const uploaded = try self.ensureCoefficients(allocator, surface.width, surface.height, g, options, control);
-        const params = [_]u32{ surface.width, surface.height, g.width, g.height, @backingInt(options.rotation), @backingInt(options.matrix), @intFromBool(surface.format == .nv12_full), @intFromBool(options.centered) };
+        const params = [_]u32{ surface.width, surface.height, g.width, g.height, @backingInt(options.rotation), @backingInt(options.matrix), @intFromBool(surface.format == .nv12_full), @intFromBool(options.centered), 8, 1 };
         var out: ?*anyopaque = null;
         if (av_prepare_submit(self.handle, surface.handle, &params, self.coefficients.?, &out) != 0) return error.MetalPreparationFailed;
         return .{ .handle = out.?, .geometry = g, .coefficient_staging_bytes = uploaded };
+    }
+    /// Caller-owned integer Metal plane textures on this preparer's device.
+    /// R8/RG8Uint or R16/RG16Uint contain right-aligned native samples. The
+    /// command retains textures until completion, without pixel readback/copy.
+    pub const NativeSurface = struct {
+        y: *anyopaque,
+        uv: *anyopaque,
+        width: u32,
+        height: u32,
+        bit_depth: u8,
+        chroma_format: u8,
+        full_range: bool = false,
+    };
+    pub fn submitNative(self: *Metal, allocator: std.mem.Allocator, surface: NativeSurface, options: Options, control: media.source.Control) !Prepared {
+        if (!supported) return error.UnsupportedVideoBackend;
+        try control.check();
+        if (surface.bit_depth < 8 or surface.bit_depth > 14 or surface.chroma_format < 1 or surface.chroma_format > 3) return error.UnsupportedSurfaceFormat;
+        const g = try geometry(surface.width, surface.height, options);
+        const uploaded = try self.ensureCoefficients(allocator, surface.width, surface.height, g, options, control);
+        const params = [_]u32{ surface.width, surface.height, g.width, g.height, @backingInt(options.rotation), @backingInt(options.matrix), @intFromBool(surface.full_range), @intFromBool(options.centered), surface.bit_depth, surface.chroma_format };
+        var out: ?*anyopaque = null;
+        if (av_prepare_native_submit(self.handle, surface.y, surface.uv, &params, self.coefficients.?, &out) != 0) return error.MetalPreparationFailed;
+        return .{ .handle = out.?, .geometry = g, .coefficient_staging_bytes = uploaded };
+    }
+    /// Upload native planes directly, without host RGB conversion. Metal owns
+    /// its copies before return; padded byte strides remain explicit.
+    pub fn submitHost(self: *Metal, allocator: std.mem.Allocator, surface: HostSurface, options: Options, control: media.source.Control) !Prepared {
+        if (!supported) return error.UnsupportedVideoBackend;
+        try control.check();
+        try surface.validate();
+        if (surface.chroma_format == 0) return error.UnsupportedSurfaceFormat;
+        const g = try geometry(surface.width, surface.height, options);
+        const size = try std.math.add(usize, surface.planes[0].bytes.len, surface.planes[1].bytes.len);
+        if (size > options.max_host_staging_bytes) return error.ResourceLimitExceeded;
+        const uploaded = try self.ensureCoefficients(allocator, surface.width, surface.height, g, options, control);
+        const params = [_]u32{ surface.width, surface.height, g.width, g.height, @backingInt(options.rotation), @backingInt(options.matrix), @intFromBool(surface.format == .nv12_full), @intFromBool(options.centered), surface.bit_depth, surface.chroma_format };
+        var out: ?*anyopaque = null;
+        if (av_prepare_host_submit(self.handle, surface.planes[0].bytes.ptr, surface.planes[0].stride, surface.planes[1].bytes.ptr, surface.planes[1].stride, &params, self.coefficients.?, &out) != 0) return error.MetalPreparationFailed;
+        return .{ .handle = out.?, .geometry = g, .native_staging_bytes = size, .coefficient_staging_bytes = uploaded };
     }
     /// Copies tightly packed RGBA into owned Metal storage before returning.
     /// The producer may free its input immediately. Alpha/matrix are ignored
@@ -317,7 +362,7 @@ pub const Metal = struct {
         if (bytes.len != size) return error.InvalidVideoGeometry;
         if (size > options.max_host_staging_bytes) return error.ResourceLimitExceeded;
         const uploaded = try self.ensureCoefficients(allocator, width, height, g, options, control);
-        const params = [_]u32{ width, height, g.width, g.height, @backingInt(options.rotation), 0, 0, @intFromBool(options.centered) };
+        const params = [_]u32{ width, height, g.width, g.height, @backingInt(options.rotation), 0, 0, @intFromBool(options.centered), 8, 1 };
         var out: ?*anyopaque = null;
         if (av_prepare_rgba_submit(self.handle, bytes.ptr, bytes.len, &params, self.coefficients.?, &out) != 0) return error.MetalPreparationFailed;
         return .{ .handle = out.?, .geometry = g, .rgba_staging_bytes = bytes.len, .coefficient_staging_bytes = uploaded };
@@ -330,6 +375,7 @@ pub const Prepared = struct {
     geometry: Geometry,
     /// Logical bytes copied by newBufferWithBytes, not physical PCIe/DMA bytes.
     rgba_staging_bytes: usize = 0,
+    native_staging_bytes: usize = 0,
     coefficient_staging_bytes: usize = 0,
     pub fn wait(self: *const Prepared, io: std.Io, control: media.source.Control) !void {
         if (!supported) return error.UnsupportedVideoBackend;

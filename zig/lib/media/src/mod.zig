@@ -7,6 +7,8 @@ pub const webm_audio = @import("webm_audio.zig");
 pub const objectstore = @import("objectstore.zig");
 pub const remote = @import("remote.zig");
 pub const admission = @import("admission.zig");
+pub const live_mp4 = @import("live_mp4.zig");
+pub const stream = @import("stream.zig");
 pub const source = @import("source.zig");
 pub const timeline = @import("timeline.zig");
 pub const webm = @import("webm.zig");
@@ -15,6 +17,8 @@ test {
     _ = isobmff;
     _ = ebml;
     _ = source;
+    _ = stream;
+    _ = live_mp4;
     _ = admission;
     _ = remote;
     _ = timeline;

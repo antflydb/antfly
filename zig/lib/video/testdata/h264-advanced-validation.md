@@ -38,3 +38,5 @@ prediction after DPB eviction, copy-on-write completion and exhaustive allocatio
 failures for snapshots and multiple pending workspaces. Non-complementary pairs
 remain rejected. Higher-depth/chroma Metal imports and CUDA/model integration
 remain separate work.
+
+The subsequent codec/container/native-Metal/SIMD expansion and current platform results are recorded in [h264-expansion-validation.md](h264-expansion-validation.md). Earlier counts above qualify the prior static tool subset.

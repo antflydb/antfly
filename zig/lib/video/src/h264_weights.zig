@@ -5,8 +5,11 @@ const Bits = @import("h264_bits.zig").Bits;
 pub const Weight = struct { denominator: u3 = 0, weight: i16 = 1, offset: i16 = 0 };
 pub const Table = [2][32][3]Weight;
 pub fn parse(bits: *Bits, active: [2]usize, b_slice: bool) !Table {
+    return parseForChroma(bits, active, b_slice, 1);
+}
+pub fn parseForChroma(bits: *Bits, active: [2]usize, b_slice: bool, chroma_format: u8) !Table {
     const luma = try bits.ue();
-    const chroma = try bits.ue();
+    const chroma = if (chroma_format == 0) 0 else try bits.ue();
     if (luma > 7 or chroma > 7) return error.MalformedVideoPacket;
     var table: Table = @splat(@splat(@splat(.{})));
     for (0..if (b_slice) @as(usize, 2) else 1) |list| for (0..active[list]) |reference| {
@@ -15,7 +18,7 @@ pub fn parse(bits: *Bits, active: [2]usize, b_slice: bool) !Table {
             table[list][reference][p] = .{ .denominator = @intCast(denominator), .weight = @as(i16, 1) << @as(u4, @intCast(denominator)) };
         }
         if (try bits.read(1) != 0) table[list][reference][0] = try read(bits, luma);
-        if (try bits.read(1) != 0) for (1..3) |p| {
+        if (chroma_format != 0 and try bits.read(1) != 0) for (1..3) |p| {
             table[list][reference][p] = try read(bits, chroma);
         };
     };

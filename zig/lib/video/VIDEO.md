@@ -450,20 +450,47 @@ workspace estimate. Cancellation is checked during RBSP copying, macroblocks,
 filtering and output rows. Shared output admission remains held until Frame destruction;
 batch callback failure frees the output, decoded-picture buffer and packet leases.
 
-This remains a declared tool subset. Non-complementary PAFF
-pairs, separate colour planes, monochrome, unequal component depths, frame-number gaps, SP/SI, other
-profiles, data partitions and dynamic parameter sets remain explicit rejections.
-MBAFF frame MMCO remains available. No deinterlacing policy is applied: interlaced
-output preserves woven samples. Capability `portable_h264_decode` is true with
-`static-avc1-profile-subset-multislice-8to14bit-420-422-444-mbaff-paff-pairs-field-packets-mmco-buffered-assembly`; callers
-must preserve that qualification. No OpenH264, x264 or FFmpeg runtime is linked.
+This remains a qualified tool subset. The portable route accepts avc1/avc3,
+8–14-bit monochrome and 4:2:0/4:2:2/4:4:4, separate colour planes, declared
+frame-number gaps, Extended-profile CAVLC data partitions and 8-bit 4:2:0 SP/SI.
+Unequal component depths outside monochrome, additional profiles and unsupported
+parameter transitions fail explicitly. Interlaced output preserves woven samples;
+no deinterlacing policy is applied. Capability `portable_h264_subset` is
+`qualified-avc1-avc3-8to14bit-mono-420-422-444-dynamic-idr-separate-planes-sp-si-partitions-mbaff-paff`.
+No OpenH264, x264, JM or FFmpeg runtime is linked.
+
+`h264_dynamic.Session` scans a bounded parameter-set registry and records decode
+epochs. SPS/geometry/depth/chroma changes require an IDR; PPS changes with unchanged
+SPS may occur between predicted pictures. Limits bound probe packets, retained
+parameter bytes and configurations. Probe counters are separate from dependency
+decode counters. A selected request may span epochs and retain duplicate/unordered
+callback slots. Dynamic indexing supports avc3 sample entries; it does not silently
+reinterpret a changed container track description. Static Apple hardware planning
+continues to reject in-band reconfiguration.
+
+Separate colour planes reconstruct through three independent monochrome DPB
+passes, then combine owned native samples; receipts count all three passes and
+payload reads. Frame gaps infer bounded non-existing references with POC and sliding
+marking; attempting to predict from unavailable samples fails. B/C data partitions
+must accompany their A partitions in the same container access-unit packet; association
+uses slice identity, not NAL ordering. Missing, duplicate and orphan partitions fail.
+SP/SI reconstruction and deblocking are checked against the official JM 19.0 decoder,
+including switching SP. These qualifications do not promise every possible combination
+of these tools. See [expansion validation](testdata/h264-expansion-validation.md).
 
 Native-depth host preparation validates plane geometry and converts into the
 existing RGB8 processor policy before resizing/packing; decoded samples retain
-full depth. Full-range conversion uses the actual sample maximum. Direct Metal
-NV12 import and the Apple hardware configuration qualifier retain their existing
-8-bit 4:2:0 contract. Additional Metal native-depth/chroma imports, CUDA/NVDEC and
-model-specific execution remain separately qualified work.
+full depth. Monochrome uses neutral chroma in CPU preparation. `Metal.submitNative`
+imports caller-owned R8/RG8Uint or R16/RG16Uint integer textures for 8–14-bit
+4:2:0/4:2:2/4:4:4, retaining both until command/output destruction. Samples are
+right-aligned, and chroma plane dimensions must match the declared subsampling.
+`submitHost` stages owned native integer planes without a CPU RGB conversion;
+`native_staging_bytes` and the host staging bound cover this copy. Both routes reuse
+cached bicubic coefficients and match CPU preparation across range and rotation.
+Monochrome Metal import is explicitly unsupported. VideoToolbox/CoreVideo NV12
+imports and the Apple hardware qualifier retain their 8-bit 4:2:0 contract; expanded
+integer textures do not advertise P010/CoreVideo or high-depth hardware decoding.
+CUDA/NVDEC and model execution remain separate work.
 
 Independent x264/FFmpeg vectors cover intra prediction, CAVLC/CABAC 8x8 transforms,
 filtered/cropped/low-QP pictures, P/B pictures, spatial and temporal direct prediction,
@@ -473,8 +500,9 @@ encoder settings and presentation picture types are recorded in
 [testdata/h264-tools-oracle.json](testdata/h264-tools-oracle.json). Weight rounding,
 coincident-POC fallback, all six short/long-term marking operations, packet mutation,
 dependency limits, callback cancellation and
-exhaustive reference-allocation failures have portable tests. This is coding-tool
-qualification on generated vectors, not a broad production-stream corpus. CAVLC and
+exhaustive reference-allocation failures have portable tests. The corpus also includes an original Sintel stream-copy excerpt and real-content
+Baseline/Main/High10/High444 differential runs. This is bounded qualification,
+not a guarantee of universal production-stream compatibility. CAVLC and
 CABAC constants come from pinned Cisco OpenH264 BSD-2-Clause tables; the revision and
 license are in [third-party notices](THIRD_PARTY_NOTICES.md).
 
@@ -714,3 +742,28 @@ cancellation recovery. Compare short clips and long sparse/windowed inputs on
 identical source/model bytes. Performance acceptance belongs to the
 [implementation plan](../../../docs/plans/native-video-inference.md), and requires
 end-to-end evidence rather than a demux-only microbenchmark.
+
+### Corpus qualification and measured portable SIMD
+
+`zig build qualify-video -Dqualify-input=/absolute/path/input.mp4` emits native
+sample hashes and media/source clocks for every packet in a bounded MP4 corpus.
+`scripts/qualify_h264.py INPUT NATIVE.jsonl` compares FFmpeg native-depth sample
+hashes by media PTS with movie edits disabled, without range/depth conversion.
+`scripts/qualify_h264_corpus.py` reproduces pinned real-content profile variants.
+FFmpeg and JM are offline oracle tools only. `qualify-mode=mutate` runs deterministic
+bounded container/packet mutations with cancellation and allocation limits.
+`zig build fuzz-video --fuzz=2000` exercises pure Zig coverage-guided reconstruction
+and parameter parsing without platform shims; `-Dvideo-fuzz-filter=SUBSTRING`
+selects a target. Short campaigns supplement differential tests; they do not establish
+complete decoder coverage or security qualification.
+
+Native sample row copies and UV packing use Zig `@Vector`/`@shuffle` with LLVM;
+tail rows and other compiler backends use scalar code. The measured 1080p packing
+candidate improved throughput, while a measured 4×4 transform candidate was slower
+and remains disabled. Differential/randomized tests cover signed overflow fallback,
+unaligned byte output, crop strides and vector tails. Benchmark receipts and exact
+compiler/backend limitations live in [benchmarks](testdata/benchmarks/README.md).
+Use `-Dvideo-use-llvm=true`, `-Dbenchmark-backend=cpu`, `-Dbenchmark-iterations=N`
+and `-Dbenchmark-size=384` to compare completed real-clip routes at realistic
+preparation geometry. Output reports completed wall/GPU times and process/allocator
+peaks; aggregate device allocation is not a per-request GPU peak.
