@@ -366,6 +366,8 @@ fence therefore remains valid during refresh. Physical-to-native mappings retain
 same identities throughout compaction.
 
 Bloom lookahead uses up to four independent row-group jobs on the shared scheduler.
+It starts before the first matching group, covers all-negative cursor scans, and
+advances a monotonic plan position to avoid submitting duplicate probes.
 Credential-scoped, immutable cache keys coalesce speculative and required range
 reads. Every worker joins before inventory/descriptors are released and inherits
 request cancellation/deadlines. A negative Bloom result prevents speculative data
