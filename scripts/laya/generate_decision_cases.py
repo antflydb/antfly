@@ -268,6 +268,11 @@ def main() -> None:
     parser.add_argument("--max-tokens", type=int, default=1100)
     parser.add_argument("--temperature", type=float, default=0.8)
     parser.add_argument("--seed", type=int, default=20261005)
+    parser.add_argument(
+        "--id-prefix",
+        default="syn",
+        help="case id prefix; give each generation run its own",
+    )
     args = parser.parse_args()
 
     from mlx_lm import batch_generate, load
@@ -307,7 +312,7 @@ def main() -> None:
                 out.write(
                     json.dumps(
                         {
-                            "id": f"syn_{workflow}_{written:06d}",
+                            "id": f"{args.id_prefix}_{workflow}_{written:06d}",
                             "workflow": workflow,
                             "state": case["state"],
                             "questions": case["questions"],
