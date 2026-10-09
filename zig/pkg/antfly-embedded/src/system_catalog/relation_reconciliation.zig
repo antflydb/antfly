@@ -256,6 +256,140 @@ pub fn retirementKey(buf: []u8, generation: Generation) ![]const u8 {
     return buf[0 .. retirement_prefix.len + 24];
 }
 
+pub const RecordKind = enum { job, root, retirement, candidate };
+pub fn allGroupsPrefix(kind: RecordKind) []const u8 {
+    return switch (kind) {
+        .job => job_prefix,
+        .root => root_prefix,
+        .retirement => retirement_prefix,
+        .candidate => candidate_prefix,
+    };
+}
+pub fn groupPrefix(buf: []u8, kind: RecordKind, group: u64) ![]const u8 {
+    if (group == 0) return error.InvalidCatalogRecord;
+    const prefix = allGroupsPrefix(kind);
+    if (buf.len < prefix.len + 8) return error.NoSpaceLeft;
+    @memcpy(buf[0..prefix.len], prefix);
+    std.mem.writeInt(u64, buf[prefix.len..][0..8], group, .big);
+    return buf[0 .. prefix.len + 8];
+}
+pub fn candidatesForGroup(buf: []u8, group: u64) ![]const u8 {
+    return groupPrefix(buf, .candidate, group);
+}
+pub fn retirementsForGroup(buf: []u8, group: u64) ![]const u8 {
+    return groupPrefix(buf, .retirement, group);
+}
+pub const Record = struct { kind: RecordKind, group_id: u64, generation: ?Generation = null };
+pub fn classify(key: []const u8) !?Record {
+    inline for (std.meta.tags(RecordKind)) |kind| {
+        const prefix = allGroupsPrefix(kind);
+        if (std.mem.startsWith(u8, key, prefix)) {
+            const tail = key[prefix.len..];
+            if (tail.len < 8) return error.InvalidCatalogRecord;
+            const group = std.mem.readInt(u64, tail[0..8], .big);
+            if (group == 0) return error.InvalidCatalogRecord;
+            switch (kind) {
+                .job, .root => {
+                    if (tail.len != 8) return error.InvalidCatalogRecord;
+                    return .{ .kind = kind, .group_id = group };
+                },
+                .retirement, .candidate => {
+                    if (tail.len < 24) return error.InvalidCatalogRecord;
+                    const generation: Generation = .{ .group_id = group, .job_id = tail[8..24].* };
+                    try generation.validate();
+                    if (kind == .retirement) {
+                        if (tail.len != 24) return error.InvalidCatalogRecord;
+                    } else _ = try decodeCandidateGenerationKey(key, generation);
+                    return .{ .kind = kind, .group_id = group, .generation = generation };
+                },
+            }
+        }
+    }
+    return null;
+}
+fn optionalGet(reader: anytype, key: []const u8) !?[]const u8 {
+    return reader.get(key) catch |err| {
+        if (err == error.NotFound) return null;
+        return err;
+    };
+}
+
+/// A streaming consistency verifier shared by borrowed snapshot maps and
+/// pinned checkpoint transactions. It owns no catalog-size map or schema DOM.
+/// Candidate state remains immutable/unpublished: root activation and mutable
+/// active-generation verification must be wired before serving is enabled.
+pub fn Verifier(comptime Reader: type) type {
+    return struct {
+        reader: *Reader,
+        group_id: u64,
+        current: ?State,
+        root: ?Generation,
+        claims: u64 = 0,
+        claim_hash: [32]u8 = @splat(0),
+        pub fn init(reader: *Reader, group: u64) !@This() {
+            var buf: [128]u8 = undefined;
+            const current = if (try optionalGet(reader, try jobKey(&buf, group))) |bytes| try State.decode(bytes) else null;
+            if (current) |state| if (state.group_id != group) return error.InvalidCatalogRecord;
+            const root = if (try optionalGet(reader, try rootKey(&buf, group))) |bytes| try Generation.decode(bytes) else null;
+            var result: @This() = .{ .reader = reader, .group_id = group, .current = current, .root = root };
+            if (root) |generation| {
+                if (generation.group_id != group) return error.InvalidCatalogRecord;
+                if (try result.retirementFor(generation)) |retired| {
+                    // GC must never have progressed into a published root.
+                    if (retired.cursor_len != 0) return error.InvalidCatalogRecord;
+                } else if (current.?.phase != .ready) return error.InvalidCatalogRecord;
+            }
+            return result;
+        }
+        fn retirementFor(self: *@This(), generation: Generation) !?Retirement {
+            const current = self.current orelse return error.InvalidCatalogRecord;
+            const order = std.mem.order(u8, &generation.job_id, &current.job_id);
+            if (generation.group_id != self.group_id or order == .gt) return error.InvalidCatalogRecord;
+            if (order == .eq) return null;
+            var buf: [128]u8 = undefined;
+            const bytes = (try optionalGet(self.reader, try retirementKey(&buf, generation))) orelse return error.InvalidCatalogRecord;
+            const retired = try Retirement.decode(bytes);
+            if (!retired.generation.eql(generation)) return error.InvalidCatalogRecord;
+            return retired;
+        }
+        pub fn feed(self: *@This(), key: []const u8, value: []const u8) !void {
+            const record = (try classify(key)) orelse return;
+            if (record.group_id != self.group_id) return error.InvalidCatalogRecord;
+            switch (record.kind) {
+                .job => {
+                    const state = try State.decode(value);
+                    if (self.current == null or !std.mem.eql(u8, &(try self.current.?.encode()), &(try state.encode()))) return error.InvalidCatalogRecord;
+                },
+                .root => {
+                    if (self.root == null or !(try Generation.decode(value)).eql(self.root.?)) return error.InvalidCatalogRecord;
+                },
+                .retirement => {
+                    const retired = try Retirement.decode(value);
+                    if (!retired.generation.eql(record.generation.?)) return error.InvalidCatalogRecord;
+                    if (try self.retirementFor(retired.generation) == null) return error.InvalidCatalogRecord;
+                },
+                .candidate => {
+                    const generation = record.generation.?;
+                    const owner = try names.Owner.decode(value);
+                    const logical = try decodeCandidateGenerationKey(key, generation);
+                    if (try self.retirementFor(generation)) |retired| {
+                        if (std.mem.order(u8, retired.cursor(), key) != .lt) return error.InvalidCatalogRecord;
+                    } else {
+                        self.claims = std.math.add(u64, self.claims, 1) catch return error.InvalidCatalogRecord;
+                        addClaimHash(&self.claim_hash, try claimHash(.{ .key = logical, .owner = owner }));
+                    }
+                },
+            }
+        }
+        pub fn finish(self: *const @This()) !void {
+            if (self.current) |state| {
+                const expected = if (state.phase == .building) state.pass else state.expected;
+                if (self.claims != expected.claims or !std.mem.eql(u8, &self.claim_hash, &expected.claim_hash)) return error.InvalidCatalogRecord;
+            } else if (self.claims != 0) return error.InvalidCatalogRecord;
+        }
+    };
+}
+
 /// Fence the authoritative source epoch in the caller's write transaction.
 /// The retained job is also a generation high-water mark: never delete it.
 /// Replacement atomically retires the old candidate; errors require abort.
@@ -985,4 +1119,75 @@ test "relation reconciliation retirement cursor rejects foreign and noncanonical
     const round_trip = try Retirement.decode(&valid);
     try std.testing.expectEqualSlices(u8, own_key, round_trip.cursor());
     try std.testing.expectError(error.InvalidCatalogRecord, Retirement.decode(valid[0 .. valid.len - 1]));
+}
+
+test "relation reconciliation stored cut verification rejects missing forged and orphan state" {
+    const T = struct {
+        fn verify(txn: *TestTxn, group: u64) !void {
+            var verifier = try Verifier(TestTxn).init(txn, group);
+            var rows = txn.values.iterator();
+            while (rows.next()) |row| {
+                const record = (try classify(row.key_ptr.*)) orelse continue;
+                if (record.group_id == group) try verifier.feed(row.key_ptr.*, row.value_ptr.*);
+            }
+            try verifier.finish();
+        }
+    };
+    const a = std.testing.allocator;
+    var txn = TestTxn.init();
+    defer txn.deinit();
+    const initial = try State.init(41, try nextJobId(null), test_epoch);
+    try start(&txn, &initial, test_epoch, null);
+    var source: TestSource = .{ .rows = &test_rows };
+    var page = try Page.prepareSource(a, initial, test_epoch, &source);
+    defer page.deinit();
+    try page.apply(&txn, test_epoch);
+    try T.verify(&txn, 41);
+    var buf: [max_cursor_bytes]u8 = undefined;
+    const key = try candidateKey(&buf, &initial, test_claims[0].key);
+    const owner = try test_owner.encode();
+    try txn.delete(key);
+    try std.testing.expectError(error.InvalidCatalogRecord, T.verify(&txn, 41));
+    var forged = test_owner;
+    forged.schema_digest[0] ^= 1;
+    try txn.put(key, &(try forged.encode()));
+    try std.testing.expectError(error.InvalidCatalogRecord, T.verify(&txn, 41));
+    try txn.put(key, &owner);
+    var extra_buf: [max_cursor_bytes]u8 = undefined;
+    const extra = try candidateKey(&extra_buf, &initial, .{ .namespace_id = 5, .name = "extra" });
+    try txn.put(extra, &owner);
+    try std.testing.expectError(error.InvalidCatalogRecord, T.verify(&txn, 41));
+    try txn.delete(extra);
+    const successor = try State.init(41, try nextJobId(&initial), test_epoch);
+    try start(&txn, &successor, test_epoch, &(try page.after.encode()));
+    try T.verify(&txn, 41);
+    var retirement_buf: [128]u8 = undefined;
+    const retirement_key = try retirementKey(&retirement_buf, Generation.of(&initial));
+    var retired = Retirement.init(Generation.of(&initial));
+    retired.cursor_len = @intCast(key.len);
+    @memcpy(retired.cursor_bytes[0..key.len], key);
+    try txn.put(retirement_key, &(try retired.encode()));
+    try std.testing.expectError(error.InvalidCatalogRecord, T.verify(&txn, 41));
+    retired = Retirement.init(Generation.of(&initial));
+    try txn.put(retirement_key, &(try retired.encode()));
+    try txn.delete(retirement_key);
+    try std.testing.expectError(error.InvalidCatalogRecord, T.verify(&txn, 41));
+    try txn.put(retirement_key, &(try retired.encode()));
+    var job_buf: [128]u8 = undefined;
+    const job_key = try jobKey(&job_buf, 41);
+    try txn.delete(job_key);
+    try std.testing.expectError(error.InvalidCatalogRecord, T.verify(&txn, 41));
+    try txn.put(job_key, &(try successor.encode()));
+    var root_buf: [128]u8 = undefined;
+    const root_key = try rootKey(&root_buf, 41);
+    try txn.put(root_key, &(try Generation.of(&successor).encode()));
+    try std.testing.expectError(error.InvalidCatalogRecord, T.verify(&txn, 41));
+    try txn.put(root_key, &(try Generation.of(&initial).encode()));
+    try T.verify(&txn, 41);
+    try std.testing.expectError(error.InvalidCatalogRecord, classify(job_key[0 .. job_key.len - 1]));
+    var verifier = try Verifier(TestTxn).init(&txn, 41);
+    var foreign = initial;
+    foreign.group_id = 42;
+    const foreign_key = try candidateKey(&buf, &foreign, test_claims[0].key);
+    try std.testing.expectError(error.InvalidCatalogRecord, verifier.feed(foreign_key, &owner));
 }

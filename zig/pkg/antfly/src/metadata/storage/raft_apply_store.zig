@@ -614,22 +614,7 @@ test "system catalog relation namespace transaction checkpoint export and import
         // Simulate an authenticated artifact whose framing/checksum is valid
         // but whose producer emitted an inconsistent semantic ownership cut.
         fn rawArtifact(store: *RaftApplyStore, path: []const u8) !RaftApplyStore.metadata_hot_standby.CheckpointArtifact {
-            const io = store.io_impl.io();
-            var txn = try store.store.beginReadTxn();
-            defer txn.abort();
-            var file = try std.Io.Dir.cwd().createFile(io, path, .{ .exclusive = true });
-            defer file.close(io);
-            var writer: RaftApplyStore.metadata_hot_standby.CheckpointWriter = .{ .file = file, .io = io };
-            try writer.write("AFMCHK01");
-            var cursor = try txn.openCursor();
-            defer cursor.close();
-            var entry = try cursor.first();
-            while (entry) |row| : (entry = try cursor.next()) {
-                try writer.write(&try RaftApplyStore.metadata_hot_standby.checkpointHeader(row.key.len, row.value.len));
-                try writer.write(row.key);
-                try writer.write(row.value);
-            }
-            return writer.finish();
+            return rawMetadataCheckpointForTest(store, path);
         }
     };
     var tmp = std.testing.tmpDir(.{});
@@ -678,6 +663,27 @@ test "system catalog relation namespace transaction checkpoint export and import
         registry.group_id = 43;
         try std.testing.expectEqual(@as(u64, 13), (try registry.getClaim(.{ .namespace_id = system_catalog.default_namespace_id, .name = "other_adopted_group" })).?.table_id);
     }
+}
+
+// Deliberately bypass semantic export validation to exercise receiver-side
+// rejection of correctly framed artifacts from an incompatible producer.
+fn rawMetadataCheckpointForTest(store: *RaftApplyStore, path: []const u8) !RaftApplyStore.metadata_hot_standby.CheckpointArtifact {
+    const io = store.io_impl.io();
+    var txn = try store.store.beginReadTxn();
+    defer txn.abort();
+    var file = try std.Io.Dir.cwd().createFile(io, path, .{ .exclusive = true });
+    defer file.close(io);
+    var writer: RaftApplyStore.metadata_hot_standby.CheckpointWriter = .{ .file = file, .io = io };
+    try writer.write("AFMCHK01");
+    var cursor = try txn.openCursor();
+    defer cursor.close();
+    var entry = try cursor.first();
+    while (entry) |row| : (entry = try cursor.next()) {
+        try writer.write(&try RaftApplyStore.metadata_hot_standby.checkpointHeader(row.key.len, row.value.len));
+        try writer.write(row.key);
+        try writer.write(row.value);
+    }
+    return writer.finish();
 }
 
 test "system catalog relation namespace transaction checkpoint verification uses bounded per-table scratch" {
@@ -913,6 +919,23 @@ test "system catalog relation namespace transaction reconciliation is isolated a
             // MVCC, even after GC removes the current physical-key versions.
             var pinned: r.CandidateStore(docstore.DocStore.Txn) = .{ .txn = &read, .state = &state };
             try std.testing.expect(try pinned.getClaim(.{ .namespace_id = system_catalog.default_namespace_id, .name = "table_0" }) != null);
+            {
+                var latest = try store.store.beginReadTxn();
+                defer latest.abort();
+                try verifyReconciliationCheckpointTxn(&latest);
+                const partial = try store.buildMetadataSnapshotTxn(a, &latest, group, null);
+                defer a.free(partial);
+                const snapshot_rows = try decodeMetadataSnapshotAlloc(a, partial);
+                defer freeMetadataSnapshotRows(a, snapshot_rows);
+                var remaining: usize = 0;
+                var cursor_preserved = false;
+                for (snapshot_rows) |row| if (try r.classify(row.key)) |record| {
+                    if (record.kind == .candidate) remaining += 1;
+                    if (record.kind == .retirement) cursor_preserved = (try r.Retirement.decode(row.value)).cursor_len != 0;
+                };
+                try std.testing.expectEqual(@as(usize, 2), remaining);
+                try std.testing.expect(cursor_preserved);
+            }
             break;
         }
         var prefix_buf: [r.max_cursor_bytes]u8 = undefined;
@@ -1021,6 +1044,189 @@ test "system catalog relation namespace transaction reconciliation is isolated a
         try std.testing.expectEqualSlices(u8, &(try r.nextJobId(&initial)), &current.job_id);
         try std.testing.expectError(error.CatalogGenerationChanged, r.start(&txn, &initial, epoch, &(try current.encode())));
     }
+}
+
+test "system catalog relation namespace transaction snapshots and checkpoints retain reconciliation fences" {
+    const r = relation_reconciliation;
+    const a = std.testing.allocator;
+    const group: u64 = 41;
+    const epoch: r.Epoch = .{ .incarnation = @splat(1), .revision = 17 };
+    const initial = try r.State.init(group, try r.nextJobId(null), epoch);
+    const T = struct {
+        const Source = struct {
+            row: r.SourceRow,
+            pub fn nextAfter(self: *@This(), after: []const u8) !?r.SourceRow {
+                return if (std.mem.order(u8, after, self.row.key) == .lt) self.row else null;
+            }
+        };
+        const Candidates = struct {
+            row: r.CandidateRow,
+            pub fn nextAfter(self: *@This(), after: []const u8) !?r.CandidateRow {
+                return if (std.mem.order(u8, after, self.row.key) == .lt) self.row else null;
+            }
+        };
+        fn alter(snapshot: []const u8, key: ?[]const u8, value: ?[]const u8) ![]u8 {
+            const rows = try decodeMetadataSnapshotAlloc(std.testing.allocator, snapshot);
+            defer freeMetadataSnapshotRows(std.testing.allocator, rows);
+            var selected: std.ArrayList(docstore.OwnedKVPair) = .empty;
+            defer selected.deinit(std.testing.allocator);
+            const owned_value = if (value) |bytes| try std.testing.allocator.dupe(u8, bytes) else null;
+            defer if (owned_value) |bytes| std.testing.allocator.free(bytes);
+            var matched = false;
+            for (rows) |row| {
+                const replace = if (key) |needle| std.mem.eql(u8, needle, row.key) else (try r.classify(row.key)) != null;
+                if (replace) {
+                    matched = true;
+                    if (owned_value) |bytes| try selected.append(std.testing.allocator, .{ .key = row.key, .value = bytes });
+                } else try selected.append(std.testing.allocator, row);
+            }
+            try std.testing.expect(matched);
+            return encodeMetadataSnapshot(std.testing.allocator, selected.items);
+        }
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const source_root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/rec-snapshot-source", .{tmp.sub_path});
+    defer a.free(source_root);
+    const target_root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/rec-snapshot-target", .{tmp.sub_path});
+    defer a.free(target_root);
+    const imported_root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/rec-checkpoint-target", .{tmp.sub_path});
+    defer a.free(imported_root);
+    const artifact_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/rec-checkpoint.afhc", .{tmp.sub_path});
+    defer a.free(artifact_path);
+    const bad_artifact_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/rec-bad-checkpoint.afhc", .{tmp.sub_path});
+    defer a.free(bad_artifact_path);
+    const bad_imported_root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/rec-bad-checkpoint-target", .{tmp.sub_path});
+    defer a.free(bad_imported_root);
+    var job_buf: [128]u8 = undefined;
+    const job_key = try r.jobKey(&job_buf, group);
+    var root_key_buf: [128]u8 = undefined;
+    const root_key = try r.rootKey(&root_key_buf, group);
+    var candidate_buf: [r.max_cursor_bytes]u8 = undefined;
+    const claim_key: relation_names.Key = .{ .namespace_id = system_catalog.default_namespace_id, .name = "items" };
+    const candidate_key = try r.candidateKey(&candidate_buf, &initial, claim_key);
+    var cut = try relation_names.TableCut.init(a, .{ .namespace_id = system_catalog.default_namespace_id, .table_id = 7, .name = "items", .schema_json = "{}" });
+    defer cut.deinit();
+    const snapshot = blk: {
+        var source = try RaftApplyStore.init(a, .{ .root_dir = source_root });
+        defer source.deinit();
+        try source.applyStandaloneCommand(group, .{ .upsert_table = .{ .table_id = 7, .name = "items", .schema_json = "{}" } });
+        var physical_buf: [160]u8 = undefined;
+        var rows: T.Source = .{ .row = .{ .key = try tableKeyForGroup(&physical_buf, group, 7), .table_id = 7, .claims = cut.claims } };
+        var page = try r.Page.prepareSource(a, initial, epoch, &rows);
+        defer page.deinit();
+        var verified = try r.Page.prepareSource(a, page.after, epoch, &rows);
+        defer verified.deinit();
+        const owner = try cut.claims[0].owner.encode();
+        var candidates: T.Candidates = .{ .row = .{ .key = candidate_key, .value = &owner } };
+        var ready = try r.Page.prepareCandidate(a, verified.after, epoch, &candidates);
+        defer ready.deinit();
+        {
+            var txn = try source.store.beginWriteTxn();
+            errdefer txn.abort();
+            try r.start(&txn, &initial, epoch, null);
+            try page.apply(&txn, epoch);
+            try verified.apply(&txn, epoch);
+            try ready.apply(&txn, epoch);
+            // Exercise retention of the root identity after the complete
+            // candidate protocol. This is not SQL serving/writer activation.
+            try txn.put(root_key, &(try r.Generation.of(&initial).encode()));
+            try txn.commit();
+        }
+        var read = try source.store.beginReadTxn();
+        defer read.abort();
+        break :blk try source.buildMetadataSnapshotTxn(a, &read, group, null);
+    };
+    defer a.free(snapshot);
+    var retirement_buf: [128]u8 = undefined;
+    const retirement_key = try r.retirementKey(&retirement_buf, r.Generation.of(&initial));
+    const successor = try r.State.init(group, try r.nextJobId(&initial), epoch);
+    const artifact = blk: {
+        var target = try RaftApplyStore.init(a, .{ .root_dir = target_root });
+        defer target.deinit();
+        for ([_]?[]const u8{ candidate_key, job_key }) |missing| {
+            const bad = try T.alter(snapshot, missing, null);
+            defer a.free(bad);
+            try std.testing.expectError(error.InvalidMetadataSnapshot, RaftApplyStore.installSnapshotFromRaft(&target, a, group, 10, bad));
+        }
+        try std.testing.expectEqual(@as(u64, 0), try target.durableAppliedIndex(group));
+        try RaftApplyStore.installSnapshotFromRaft(&target, a, group, 10, snapshot);
+        {
+            var read = try target.store.beginReadTxn();
+            defer read.abort();
+            try verifyReconciliationCheckpointTxn(&read);
+            var claims: r.CandidateStore(docstore.DocStore.Txn) = .{ .txn = &read, .state = &initial };
+            try std.testing.expect((try claims.getClaim(claim_key)).?.eql(cut.claims[0].owner));
+        }
+        const missing_high_water = try T.alter(snapshot, null, null);
+        defer a.free(missing_high_water);
+        try std.testing.expectError(error.InvalidMetadataSnapshot, RaftApplyStore.installSnapshotFromRaft(&target, a, group, 20, missing_high_water));
+        const missing_root = try T.alter(snapshot, root_key, null);
+        defer a.free(missing_root);
+        try std.testing.expectError(error.InvalidMetadataSnapshot, RaftApplyStore.installSnapshotFromRaft(&target, a, group, 20, missing_root));
+        var forged = cut.claims[0].owner;
+        forged.schema_digest[0] ^= 1;
+        const forged_claim = try T.alter(snapshot, candidate_key, &(try forged.encode()));
+        defer a.free(forged_claim);
+        try std.testing.expectError(error.InvalidMetadataSnapshot, RaftApplyStore.installSnapshotFromRaft(&target, a, group, 20, forged_claim));
+        {
+            var read = try target.store.beginReadTxn();
+            defer read.abort();
+            var incompatible = try r.State.decode(try read.get(job_key));
+            incompatible.epoch.incarnation = @splat(2);
+            const wrong_epoch = try T.alter(snapshot, job_key, &(try incompatible.encode()));
+            defer a.free(wrong_epoch);
+            try std.testing.expectError(error.InvalidMetadataSnapshot, RaftApplyStore.installSnapshotFromRaft(&target, a, group, 20, wrong_epoch));
+        }
+        {
+            var txn = try target.store.beginWriteTxn();
+            errdefer txn.abort();
+            const prior = try a.dupe(u8, try txn.get(job_key));
+            defer a.free(prior);
+            try r.start(&txn, &successor, epoch, prior);
+            try txn.commit();
+        }
+        try std.testing.expectError(error.InvalidMetadataSnapshot, RaftApplyStore.installSnapshotFromRaft(&target, a, group, 20, snapshot));
+        try std.testing.expectEqual(@as(u64, 10), try target.durableAppliedIndex(group));
+        {
+            var txn = try target.store.beginWriteTxn();
+            errdefer txn.abort();
+            try txn.delete(retirement_key);
+            try txn.commit();
+        }
+        try std.testing.expectError(error.InvalidMetadataHACheckpoint, target.exportHotStandbyCheckpoint(target.io_impl.io(), bad_artifact_path));
+        const corrupt = try rawMetadataCheckpointForTest(&target, bad_artifact_path);
+        {
+            var rejected = try RaftApplyStore.init(a, .{ .root_dir = bad_imported_root });
+            defer rejected.deinit();
+            try std.testing.expectError(error.InvalidMetadataHACheckpoint, rejected.importHotStandbyCheckpoint(rejected.io_impl.io(), bad_artifact_path, corrupt.size_bytes));
+            try std.testing.expectError(error.MetadataHACheckpointTargetNotEmpty, rejected.importHotStandbyCheckpoint(rejected.io_impl.io(), bad_artifact_path, corrupt.size_bytes));
+        }
+        {
+            var txn = try target.store.beginWriteTxn();
+            errdefer txn.abort();
+            const retired = r.Retirement.init(r.Generation.of(&initial));
+            try txn.put(retirement_key, &(try retired.encode()));
+            try txn.commit();
+        }
+        break :blk try target.exportHotStandbyCheckpoint(target.io_impl.io(), artifact_path);
+    };
+    {
+        var imported = try RaftApplyStore.init(a, .{ .root_dir = imported_root });
+        defer imported.deinit();
+        try imported.importHotStandbyCheckpoint(imported.io_impl.io(), artifact_path, artifact.size_bytes);
+    }
+    var recovered = try RaftApplyStore.init(a, .{ .root_dir = imported_root });
+    defer recovered.deinit();
+    var read = try recovered.store.beginReadTxn();
+    defer read.abort();
+    try std.testing.expectEqualSlices(u8, &(try successor.encode()), try read.get(job_key));
+    try std.testing.expect((try r.Generation.decode(try read.get(root_key))).eql(r.Generation.of(&initial)));
+    const retired = try r.Retirement.decode(try read.get(retirement_key));
+    try std.testing.expect(retired.generation.eql(r.Generation.of(&initial)));
+    var claims: r.CandidateStore(docstore.DocStore.Txn) = .{ .txn = &read, .state = &initial };
+    try std.testing.expect((try claims.getClaim(claim_key)).?.eql(cut.claims[0].owner));
+    try verifyReconciliationCheckpointTxn(&read);
 }
 
 test "system catalog relation namespace transaction rolls back with schema and persists across restart" {
@@ -14104,6 +14310,10 @@ pub const RaftApplyStore = struct {
         system_catalog,
         relation_writer,
         relation_names,
+        relation_reconciliation,
+        relation_candidates,
+        relation_retirements,
+        relation_root,
         topology_activation,
         metadata_incarnation,
         split_transition,
@@ -14165,6 +14375,10 @@ pub const RaftApplyStore = struct {
         .{ .projection = .system_catalog, .key = .{ .prefix = system_catalog_storage.prefixForGroup } },
         .{ .projection = .relation_writer, .key = .{ .point = relationWriterKeyForGroup } },
         .{ .projection = .relation_names, .key = .{ .prefix = relation_names.Key.prefixForGroup } },
+        .{ .projection = .relation_reconciliation, .key = .{ .point = relation_reconciliation.jobKey } },
+        .{ .projection = .relation_candidates, .key = .{ .prefix = relation_reconciliation.candidatesForGroup } },
+        .{ .projection = .relation_retirements, .key = .{ .prefix = relation_reconciliation.retirementsForGroup } },
+        .{ .projection = .relation_root, .key = .{ .point = relation_reconciliation.rootKey } },
         .{ .projection = .metadata_incarnation, .key = .{ .point = metadataIncarnationKeyForGroup } },
         .{ .projection = .split_transition, .key = .{ .prefix = splitTransitionPrefixForGroup } },
         .{ .projection = .merge_transition, .key = .{ .prefix = mergeTransitionPrefixForGroup } },
@@ -14292,7 +14506,9 @@ pub const RaftApplyStore = struct {
         };
         // Table publication and DROP update lifecycle roots in the same cut.
         return if ((mask & metadataSnapshotProjectionBit(.table)) != 0)
-            mask | metadataSnapshotProjectionBit(.lake_index_lifecycle) | metadataSnapshotProjectionBit(.relation_writer) | metadataSnapshotProjectionBit(.relation_names)
+            mask | metadataSnapshotProjectionBit(.lake_index_lifecycle) | metadataSnapshotProjectionBit(.relation_writer) | metadataSnapshotProjectionBit(.relation_names) |
+                metadataSnapshotProjectionBit(.relation_reconciliation) | metadataSnapshotProjectionBit(.relation_candidates) |
+                metadataSnapshotProjectionBit(.relation_retirements) | metadataSnapshotProjectionBit(.relation_root)
         else
             mask;
     }
@@ -14375,6 +14591,17 @@ pub const RaftApplyStore = struct {
         defer freeMetadataSnapshotRows(alloc, rows);
         try validateMetadataSnapshotRows(alloc, group_id, rows);
 
+        var reconciliation_key_buf: [128]u8 = undefined;
+        const reconciliation_key = try relation_reconciliation.jobKey(&reconciliation_key_buf, group_id);
+        const incoming_reconciliation: ?relation_reconciliation.State = for (rows) |row| {
+            if (std.mem.eql(u8, row.key, reconciliation_key)) break try relation_reconciliation.State.decode(row.value);
+        } else null;
+        var root_key_buf: [128]u8 = undefined;
+        const root_key = try relation_reconciliation.rootKey(&root_key_buf, group_id);
+        const incoming_root: ?relation_reconciliation.Generation = for (rows) |row| {
+            if (std.mem.eql(u8, row.key, root_key)) break try relation_reconciliation.Generation.decode(row.value);
+        } else null;
+
         const checkpoint = AppliedMetadataCheckpoint.fromInput(commit_index, .snapshot, encoded);
         const io = self.io_impl.io();
         self.apply_mutex.lockUncancelable(io);
@@ -14384,6 +14611,17 @@ pub const RaftApplyStore = struct {
         const existing = blk: {
             var read_txn = try self.store.beginReadTxn();
             defer read_txn.abort();
+            if (try stagingGet(&read_txn, reconciliation_key)) |bytes| {
+                const local = try relation_reconciliation.State.decode(bytes);
+                const incoming = incoming_reconciliation orelse return error.InvalidMetadataSnapshot;
+                if (local.group_id != group_id or std.mem.order(u8, &incoming.job_id, &local.job_id) == .lt or
+                    (std.mem.eql(u8, &incoming.job_id, &local.job_id) and !incoming.epoch.eql(local.epoch))) return error.InvalidMetadataSnapshot;
+            }
+            if (try stagingGet(&read_txn, root_key)) |bytes| {
+                const local = try relation_reconciliation.Generation.decode(bytes);
+                const incoming = incoming_root orelse return error.InvalidMetadataSnapshot;
+                if (local.group_id != group_id or std.mem.order(u8, &incoming.job_id, &local.job_id) == .lt) return error.InvalidMetadataSnapshot;
+            }
             if (try relationWriterEnabledTxn(&read_txn, group_id)) {
                 var writer_buf: [160]u8 = undefined;
                 const writer_key = try relationWriterKeyForGroup(&writer_buf, group_id);
@@ -24067,16 +24305,19 @@ fn validateRelationSnapshotCut(alloc: std.mem.Allocator, group_id: u64, rows: []
         }
     };
     var reader: Reader = .{ .values = values };
+    var reconciliation = try relation_reconciliation.Verifier(Reader).init(&reader, group_id);
     var buf: [160]u8 = undefined;
     const writer = values.get(try RaftApplyStore.relationWriterKeyForGroup(&buf, group_id));
     var received: usize = 0;
     for (rows) |row| {
         if (cancelled) |flag| if (flag.load(.acquire)) return error.SnapshotBuildCancelled;
+        try reconciliation.feed(row.key, row.value);
         if (try relation_names.Key.fromStorageKey(row.key, group_id) != null) {
             _ = try relation_names.Owner.decode(row.value);
             received += 1;
         }
     }
+    try reconciliation.finish();
     if (writer == null) {
         if (received != 0) return error.InvalidMetadataSnapshot;
         return;
@@ -24157,6 +24398,7 @@ fn verifyRelationCheckpointTxn(alloc: std.mem.Allocator, txn: *docstore.DocStore
 }
 
 fn verifyRelationCheckpointGroupsTxn(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn) !void {
+    try verifyReconciliationCheckpointTxn(txn);
     var cursor = try txn.openCursor();
     defer cursor.close();
     // Registry keys are grouped by binary group ID. Check each marker once,
@@ -24180,6 +24422,47 @@ fn verifyRelationCheckpointGroupsTxn(alloc: std.mem.Allocator, txn: *docstore.Do
         var buf: [160]u8 = undefined;
         if (group == 0 or !std.mem.eql(u8, row.key, try RaftApplyStore.relationWriterKeyForGroup(&buf, group))) return error.InvalidCatalogRecord;
         try verifyRelationGroupTxn(alloc, txn, group);
+    }
+}
+
+fn verifyReconciliationGroupTxn(txn: *docstore.DocStore.Txn, group: u64) !void {
+    const r = relation_reconciliation;
+    var verifier = try r.Verifier(docstore.DocStore.Txn).init(txn, group);
+    var cursor = try txn.openCursor();
+    defer cursor.close();
+    inline for (std.meta.tags(r.RecordKind)) |kind| {
+        var buf: [128]u8 = undefined;
+        const prefix = try r.groupPrefix(&buf, kind, group);
+        var entry = try cursor.seekAtOrAfter(prefix);
+        while (entry) |row| : (entry = try cursor.next()) {
+            if (!std.mem.startsWith(u8, row.key, prefix)) break;
+            try verifier.feed(row.key, row.value);
+        }
+    }
+    try verifier.finish();
+}
+fn verifyReconciliationCheckpointTxn(txn: *docstore.DocStore.Txn) !void {
+    const r = relation_reconciliation;
+    var cursor = try txn.openCursor();
+    defer cursor.close();
+    // One group at a time. The second pass detects orphan groups that a scan
+    // driven only by current jobs would otherwise never discover.
+    inline for (std.meta.tags(r.RecordKind)) |kind| {
+        const prefix = r.allGroupsPrefix(kind);
+        var previous_group: ?u64 = null;
+        var entry = try cursor.seekAtOrAfter(prefix);
+        while (entry) |row| : (entry = try cursor.next()) {
+            if (!std.mem.startsWith(u8, row.key, prefix)) break;
+            const record = (try r.classify(row.key)) orelse return error.InvalidCatalogRecord;
+            if (previous_group != record.group_id) {
+                if (kind == .job) try verifyReconciliationGroupTxn(txn, record.group_id) else {
+                    var buf: [128]u8 = undefined;
+                    const state = try r.State.decode(try txn.get(try r.jobKey(&buf, record.group_id)));
+                    if (state.group_id != record.group_id) return error.InvalidCatalogRecord;
+                }
+                previous_group = record.group_id;
+            }
+        }
     }
 }
 

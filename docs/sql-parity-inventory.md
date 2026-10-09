@@ -1521,10 +1521,24 @@ coverage injects failures during deletions, cursor updates, replacement admissio
 and final-intent removal; it verifies rollback, resumes the last GC page after
 reopening the store and checks that a pinned MVCC reader
 can still read a deleted current-key version. Malformed roots, generation
-exhaustion and stale GC delivery fail closed. Snapshot/replay retention of
-the high-water mark and intents remains an activation prerequisite, not an
-already-installed runtime feature. Authoritative epoch wiring, pending-generation
-reservation sources, Raft command/snapshot/replay integration, GC scheduling,
+exhaustion and stale GC delivery fail closed. Raft snapshot projections now
+retain current jobs, candidate generations, retirement cursors and root
+identities. A shared streaming verifier checks strict binary key/value
+identities, current-generation fingerprints/cardinality, retirement ancestry,
+remaining keys beyond GC cursors and root references without another catalog
+map. Snapshot validation borrows its existing row map and runs before the
+install apply lock; locked point checks prevent removal/downgrade of the local
+job high-water mark, job-epoch reuse and root downgrade. Checkpoint export and
+unpublished import use the same verifier, scanning one group at a time and
+detecting orphan groups not reachable from a job-only scan. Native regressions
+preserve candidates and roots through snapshot/install/checkpoint/restart,
+retain a partial GC cursor with only its two remaining entries, reject missing
+or forged claims and missing job/retirement records, and reject a correctly
+framed incompatible checkpoint on import. A failed installing root remains
+unusable as a fresh target. This is recovery consistency for unpublished
+reconciliation state, not SQL serving or mutable active-root activation.
+Authoritative epoch wiring, pending-generation reservation sources,
+Raft job commands, bounded binary-effect replay verification, GC scheduling,
 capability barriers and atomic active-root publication still
 precede writer adoption and SQL point resolution. No original SQL case is
 credited for this protocol component.
