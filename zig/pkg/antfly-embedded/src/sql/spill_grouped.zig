@@ -645,7 +645,7 @@ test "SQL parallel aggregate keys remain owned after output blocks and workers c
 
 test "SQL scoped partition reducers preserve exact aggregates and physically join original failures" {
     const Runnable = @import("../common/runnable_scheduler.zig");
-    const Mode = enum { success, exact, early_close, canceled, deadline, revoked, registry_full };
+    const Mode = enum { success, exact, skew, early_close, canceled, deadline, revoked, registry_full };
     const Clock = struct {
         var now_ns: std.atomic.Value(u64) = .init(0);
         fn now() u64 {
@@ -656,12 +656,19 @@ test "SQL scoped partition reducers preserve exact aggregates and physically joi
         execution: *Runnable.Execution,
         revoked: bool = false,
         waits: usize = 0,
+        invalid_callbacks: std.atomic.Value(usize) = .init(0),
         fn requested(raw: *const anyopaque) bool {
             return @as(*const std.atomic.Value(bool), @ptrCast(@alignCast(raw))).load(.acquire);
         }
         fn check(raw: *anyopaque) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            try std.testing.expectEqual(Runnable.State.running, self.execution.entry.?.state);
+            const state = self.execution.entry.?.state;
+            if (state != .running and state != .stopped) {
+                _ = self.invalid_callbacks.fetchAdd(1, .monotonic);
+                return error.TestUnexpectedCoordinatorCallback;
+            }
+            // Cleanup may observe an already canceled family. Preserve that
+            // original error while separately detecting worker misuse.
             try self.execution.checkpoint();
             if (self.revoked) return error.Forbidden;
         }
@@ -692,16 +699,34 @@ test "SQL scoped partition reducers preserve exact aggregates and physically joi
         {
             var grouped = try Grouped.init(a, &manager, &.{ .{ .kind = .count }, .{ .kind = .sum, .input_type = .integer } }, 1, 1024 * 1024);
             defer grouped.deinit();
-            for (0..4096) |index| {
-                try grouped.add(&.{Datum.json(.{ .integer = @intCast(index % 512) })}, &.{ Datum.json(.{ .integer = 1 }), Datum.json(.{ .integer = 3 }) }, index);
+            var keys: [512]i64 = undefined;
+            var candidate: i64 = 0;
+            for (&keys, 0..) |*key, index| {
+                if (mode == .skew) {
+                    while (true) : (candidate += 1) {
+                        var hash = std.hash.Wyhash.init(0);
+                        var encoded: [9]u8 = undefined;
+                        encoded[0] = 0;
+                        std.mem.writeInt(u64, encoded[1..9], try scalar.semanticHash(.{ .integer = candidate }), .little);
+                        hash.update(&encoded);
+                        if (hash.final() % 8 == 0) break;
+                    }
+                    key.* = candidate;
+                    candidate += 1;
+                } else key.* = @intCast(index);
             }
+            for (0..4096) |index| {
+                try grouped.add(&.{Datum.json(.{ .integer = keys[index % 512] })}, &.{ Datum.json(.{ .integer = 1 }), Datum.json(.{ .integer = 3 }) }, index);
+            }
+            for (&grouped.partitions) |*file| if (file.*) |*open| try open.seal();
+            const input_written = manager.written_bytes;
             try grouped.startReductions(mode == .exact);
             if (mode == .registry_full) {
                 try std.testing.expectEqual(@as(usize, 0), grouped.reductions_started);
                 try std.testing.expectEqual(@as(usize, 0), execution.entry.?.children);
             } else {
-                try std.testing.expect(grouped.reductions_started >= 2);
-                try std.testing.expect(execution.entry.?.children >= 2);
+                try std.testing.expect(grouped.reductions_started >= @as(usize, if (mode == .skew) 1 else 2));
+                try std.testing.expect(execution.entry.?.children >= @as(usize, if (mode == .skew) 1 else 2));
             }
             var health: Runnable.Execution = .{};
             try health.start(&scheduler, .{ .io = std.testing.io, .allow_wait = false }, .control);
@@ -723,14 +748,15 @@ test "SQL scoped partition reducers preserve exact aggregates and physically joi
                     fixture.revoked = true;
                     try std.testing.expectError(error.Forbidden, grouped.nextBatch(output.allocator(), 64, false));
                 },
-                .success, .exact, .registry_full => {
+                .success, .exact, .skew, .registry_full => {
                     var seen: [512]bool = @splat(false);
                     var count: usize = 0;
                     while (true) {
                         _ = output.reset(.retain_capacity);
                         const batch = (try grouped.nextBatch(output.allocator(), 17, mode == .exact)) orelse break;
                         for (batch.ordinals, 0..) |ordinal, lane| {
-                            const key: usize = @intCast((try batch.keys.cell(output.allocator(), lane, 0)).value.integer);
+                            const key: usize = @intCast(ordinal);
+                            try std.testing.expectEqual(keys[key], (try batch.keys.cell(output.allocator(), lane, 0)).value.integer);
                             try std.testing.expect(!seen[key]);
                             seen[key] = true;
                             try std.testing.expectEqual(@as(u64, key), ordinal);
@@ -748,9 +774,11 @@ test "SQL scoped partition reducers preserve exact aggregates and physically joi
                     }
                     try std.testing.expectEqual(@as(usize, 512), count);
                     for (seen) |present| try std.testing.expect(present);
+                    if (mode == .skew) try std.testing.expect(manager.written_bytes > input_written);
                 },
             }
         }
+        try std.testing.expectEqual(@as(usize, 0), fixture.invalid_callbacks.load(.acquire));
         try std.testing.expectEqual(@as(usize, 0), manager.files);
         try std.testing.expectEqual(@as(u64, 0), manager.live_bytes);
         try std.testing.expectEqual(@as(usize, 0), scheduler.stats().child_operations);
