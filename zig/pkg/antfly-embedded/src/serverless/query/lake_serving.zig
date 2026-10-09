@@ -861,7 +861,7 @@ test "lake SQL statement capture suspends metadata IO and detaches pinned source
         // Source-lifetime cancellation/expiry must be checked independently of
         // the optional CPU scope's token and clock.
         const source_only = case == .original_cancel or case == .original_deadline;
-        try execution.start(&scheduler, .{ .io = std.testing.io, .native_now_ns = Clock.now, .deadline_ns = 10, .cancellation = if (source_only) .{} else .{ .ptr = &signal, .requested = Clock.requested } }, .query);
+        try execution.start(&scheduler, .{ .io = std.testing.io, .native_now_ns = Clock.now, .deadline_ns = 10, .cancellation = if (source_only) null else .{ .ptr = &signal, .requested = Clock.requested } }, .query);
         defer execution.finish();
         var fixture: Fixture = .{ .base = base, .vtable = base.vtable.*, .scheduler = &scheduler, .signal = &signal, .case = case };
         const schema: storage_schema.TableSchema = .{ .storage_mode = .relational, .external_base_source = .{
