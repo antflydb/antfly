@@ -1961,7 +1961,7 @@ test "lake SQL coordinator receivers cover streaming materialized count and repe
             var result = try @import("runtime.zig").execute(a, fixture.backend(), &compiled, &.{}, .{});
             defer result.deinit();
             try std.testing.expectEqual(expected, result.output.rows.len);
-            if (expected == 1) try std.testing.expectEqual(@as(i64, 3), result.output.rows[0][0].integer);
+            if (expected == 1) try std.testing.expectEqualStrings("3", result.output.rows[0][0].string);
         }
         try std.testing.expect(lake.source.scanner.shared_reader.?.request_store == null);
         try std.testing.expect(lake.meter.parked_reads.load(.acquire) > 0);
