@@ -135,7 +135,9 @@ pub const WriteControl = struct {
         try self.check();
         const begin = self.wait_begin_fn orelse {
             if (self.wait_end_fn != null) return error.InvalidOutputWait;
-            return @call(.auto, function, args);
+            const result = @call(.auto, function, args);
+            try self.check();
+            return result;
         };
         const end = self.wait_end_fn orelse return error.InvalidOutputWait;
         try begin(self.ptr);
@@ -259,6 +261,11 @@ pub fn resolveAddress(io: Io, host: []const u8, port: u16) !Address {
 /// Literal and DNS results pass through the same policy so callers can pin
 /// SSRF checks to the address that is actually connected.
 pub fn resolveAddressFiltered(io: Io, host: []const u8, port: u16, filter: ?AddressFilter) !Address {
+    return resolveAddressFilteredControlled(io, host, port, filter, .{});
+}
+
+pub fn resolveAddressFilteredControlled(io: Io, host: []const u8, port: u16, filter: ?AddressFilter, control: WriteControl) !Address {
+    try control.check();
     if (Address.resolve(io, host, port)) |addr| {
         if (filter) |policy| {
             if (!policy.accepts(addr)) return error.AddressRejected;
@@ -270,10 +277,10 @@ pub fn resolveAddressFiltered(io: Io, host: []const u8, port: u16, filter: ?Addr
     var canonical_name_buffer: [HostName.max_len]u8 = undefined;
     var lookup_buffer: [32]HostName.LookupResult = undefined;
     var lookup_queue: Io.Queue(HostName.LookupResult) = .init(&lookup_buffer);
-    try HostName.lookup(host_name, io, &lookup_queue, .{
+    try control.withWait(HostName.lookup, .{ host_name, io, &lookup_queue, HostName.LookupOptions{
         .port = port,
         .canonical_name_buffer = &canonical_name_buffer,
-    });
+    } });
     var saw_address = false;
     while (true) {
         const result = lookup_queue.getOne(io) catch |err| switch (err) {
