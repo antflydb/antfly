@@ -194,3 +194,7 @@ test "external lake native cursor capability fences recipe incarnation scope and
     table.indexes_json = "{\"changed\":{}}";
     try std.testing.expectError(error.CatalogGenerationChanged, retained.load(arena.allocator(), &store, @splat(1), token, table, 101, .none));
 }
+
+test {
+    _ = @import("native_repartition_test.zig");
+}

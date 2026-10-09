@@ -94,14 +94,26 @@ Small remote owner registry records let the supervised collector discover expire
 generations after local owner loss or table deletion. Each pass handles one owner
 with a bounded deletion budget; registry records remain as discovery witnesses.
 This adapter still requires filesystem-managed LSM checkpoints and compatible
-native projection codecs. It provides relocation to a replacement owner with the
-same logical shard/range identity, rather than repartitioning a retained generation.
+native projection codecs. A retained request can carry its authenticated original
+namespace and open that generation on a replacement range in the same table
+incarnation. Each original namespace gets a separate cache root, preserving its
+physical document identities. Creation cannot capture a different owner's live
+namespace. Distributed cursor routing still needs a retained original range cover
+and exactly one execution per original range after split/merge; the storage reader
+capability alone does not provide that routing contract.
 Query capture briefly closes write admission while derivations converge and
 manifests are sealed; deadlines, cancellation and WAL/capacity admission bound
 this work. The retained files never hold an apply lock across cursor pages.
-A first durable publication can transfer a full generation: background prewarming,
-remote-native checkpoint references and measured cold-publication latency remain
-necessary qualification work before claiming that portability is latency-neutral.
+The shared maintenance scheduler warms coherent private generations in bounded
+8 MiB upload turns with a ten-second I/O deadline. Capture has a two-second
+admission deadline. Chunk progress survives restart; foreground captures reuse
+immutable extent proofs. Failed turns back off, and close cancels and joins the
+worker. One private local generation is retained while uploading, then released;
+warming is disabled when configured capacity allows only one cut. The repository
+commits no readable manifest until every file is uploaded and revalidated.
+First capture can still require a complete generation when hints are cold.
+Remote-native checkpoint references and measured cold-publication latency remain
+necessary before claiming that portability is latency-neutral.
 
 Overlay keys are flat integer, string or boolean fields; numeric/timestamp key
 normalization is not enabled yet. The changes input must retain one unique latest
@@ -196,8 +208,11 @@ compact, WAL GC and optional managed-catalog vacuum stages. A conditional object
 ledger stores the exact operation request before work, leases, completion, retries and
 backoff, so restart resumes the same operation. `POST /tables/{table}/lake/maintenance`
 with `{"action":"status"}` reports the policy and durable progress. Scheduling does
-not expand the existing compaction limits. Automatic vacuum requires explicit exclusive
-ownership and remains disabled for REST catalogs with external metadata writers.
+keeps each compaction turn within its row/byte limits while a durable file,
+row-group and row cursor resumes a larger selection across restarts. Output pages
+are immutable; final publication retains the original parent requirement. Confirmed
+parent conflicts terminate the job; unknown outcomes replay the exact intent.
+Automatic vacuum requires explicit exclusive ownership and remains disabled for REST catalogs with external metadata writers.
 
 Example policy (serialized as the Iceberg property value):
 
@@ -387,7 +402,9 @@ searchable publication; WAL retirement waits for coverage and retained readers.
 
 Keep dry-run planning and explicit operator overrides. Enforce the existing bounded
 job limits or extend them through separately qualified streaming algorithms;
-automatic scheduling alone does not remove current compaction size limits.
+durable compaction progress removes the former total-input row/byte limit, while
+metadata manifests, decoded Parquet pages, output count and progress documents
+remain bounded. Oversized metadata manifests still require a streaming selector.
 Expose job backlog, last success, failures and retained bytes.
 
 Snapshot/file GC protects active readers, retained cursors, publication intents,

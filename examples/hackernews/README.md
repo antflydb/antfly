@@ -411,7 +411,11 @@ expire explicitly if their archive/WAL cut changes.
 
 Use the table admin maintenance endpoint for bounded jobs. Dry runs are the
 default; reuse an operation ID to resume the exact operation after interruption.
-Compaction commits automatically wake searchable publication.
+Compaction commits automatically wake searchable publication. Compaction now
+resumes large files across bounded turns; repeat the same request until
+`complete: true`. `scanned_rows` counts physical input progress, including deleted
+rows. `conflicted: true` means the parent changed and no rewrite was published;
+start a fresh operation ID so it rereads the current parent.
 
 ```sh
 ANTFLY_URL=http://localhost:8080/db/v1

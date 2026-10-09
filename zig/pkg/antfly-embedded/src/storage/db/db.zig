@@ -2958,6 +2958,7 @@ test "db optional row policy authority preserves scoped secret denial and outage
 pub const DB = struct {
     retained_query_lease: ?@import("native_query_cut.zig").Guard = null,
     retained_remote_query_lease: ?@import("native_query_cut_repository.zig").StorageLease = null,
+    native_query_warming: @import("native_query_warming.zig").Owner = .{},
     /// Shared local mutation state outlives foreground and recovery execution.
     local_execution: *LocalExecutionState,
     /// Monolithic managed opens retain the process verifier until workers drain.
@@ -5801,6 +5802,7 @@ pub const DB = struct {
         // Stop background workers before tearing down stores, runtimes, and
         // index state they may inspect.
         self.async_context.background_closing.store(true, .release);
+        self.native_query_warming.stop(self.backend_runtime);
         self.local_execution.schema_reconcile.stop();
         self.stopArtifactRepairMetadataWorker();
         self.artifact_producer_scheduler.deinit(self.alloc);
@@ -19330,7 +19332,11 @@ pub const DB = struct {
     /// A durable generation for cursor pages: no apply/read lease escapes
     /// capture, and resume never falls back to a fresh live generation.
     pub fn captureQueryCut(self: *DB, request: @import("native_query_cut.zig").Request, cancellation: types.CancellationToken) !void {
+        return self.captureQueryCutInternal(request, cancellation, true);
+    }
+    fn captureQueryCutInternal(self: *DB, request: @import("native_query_cut.zig").Request, cancellation: types.CancellationToken, publish: bool) !void {
         try request.validate(@import("native_query_cut.zig").nowMs());
+        _ = try request.namespace(self.core.identity_namespace);
         if (!request.create or request.table_id != self.core.identity_namespace.table_id) return error.CatalogGenerationChanged;
         const io = self.backend_runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable;
         const remaining = request.expires_ms -| @import("native_query_cut.zig").nowMs();
@@ -19358,17 +19364,73 @@ pub const DB = struct {
             };
         };
         try @import("native_query_cut.zig").admit(self.alloc, io, self.core.path, request.id, if (self.backend_runtime.query_cut_repository) |repository| repository.limits else .{}, token);
-        if (self.backend_runtime.query_cut_repository) |repository| {
+        if (publish) if (self.backend_runtime.query_cut_repository) |repository| {
             try repository.publish(io, root, request, self.core.identity_namespace, token);
-        }
+        };
     }
+    fn warmNativeCheckpoint(raw: *anyopaque, cancellation: types.CancellationToken) !bool {
+        const self: *DB = @ptrCast(@alignCast(raw));
+        const cut = @import("native_query_cut.zig");
+        const repository = self.backend_runtime.query_cut_repository orelse return true;
+        const io = self.backend_runtime.filesystemIo() orelse return true;
+        const now = cut.nowMs();
+        const state_path = try std.fmt.allocPrint(self.alloc, "{s}.query-pins/.warming.json", .{self.core.path});
+        defer self.alloc.free(state_path);
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const State = struct { request: cut.Request, sequence: u64, complete: bool = false, next_ms: u64 = 0 };
+        var state: ?State = if (@import("native_backup.zig").readFileAlloc(a, io, state_path, 4096)) |bytes|
+            try std.json.parseFromSliceLeaky(State, a, bytes, .{})
+        else |err| switch (err) {
+            error.FileNotFound => null,
+            else => return err,
+        };
+        const sequence = self.core.nextDerivedSequence();
+        if (state) |value| if (value.request.table_id != self.core.identity_namespace.table_id or (!value.complete and !try snapshotPathExists(io, try cut.pathAlloc(a, self.core.path, value.request.id)))) {
+            state = null;
+        };
+        if (state) |value| if (value.complete and value.next_ms > now and value.sequence == sequence) return true;
+        if (state == null or state.?.complete or state.?.request.expires_ms <= now +| 15000) {
+            // Keep one private warm cut; it never consumes all foreground cut
+            // capacity. Completed cuts are discarded after publishing hints.
+            if (state) |value| {
+                var guard = try cut.lock(self.alloc, io, self.core.path, cancellation);
+                defer guard.deinit();
+                try std.Io.Dir.cwd().deleteTree(io, try cut.pathAlloc(a, self.core.path, value.request.id));
+            }
+            var nonce: [32]u8 = undefined;
+            try io.randomSecure(&nonce);
+            const id = std.fmt.bytesToHex(nonce, .lower);
+            state = .{ .request = .{ .id = try a.dupe(u8, &id), .table_id = self.core.identity_namespace.table_id, .expires_ms = now +| @import("native_query_cut_contract.zig").max_ttl_ms, .create = true, .timeout_ms = 2000 }, .sequence = sequence };
+            // The parent directory is created by capture; persist only once
+            // the coherent local generation is sealed.
+            try self.captureQueryCutInternal(state.?.request, cancellation, false);
+            _ = try @import("native_backup.zig").writeFileDurable(io, state_path, try std.json.Stringify.valueAlloc(a, state.?, .{}));
+        }
+        const root = try cut.pathAlloc(a, self.core.path, state.?.request.id);
+        const control: cut.Control = .{ .parent = cancellation, .deadline_ns = monotonicTimeNs() +| 10 * std.time.ns_per_s };
+        const completed = try repository.warm(io, root, state.?.request, self.core.identity_namespace, control.token(), 8 * 1024 * 1024);
+        if (completed) {
+            state.?.complete = true;
+            state.?.next_ms = now +| 60000;
+            _ = try @import("native_backup.zig").writeFileDurable(io, state_path, try std.json.Stringify.valueAlloc(a, state.?, .{}));
+            var guard = try cut.lock(self.alloc, io, self.core.path, cancellation);
+            defer guard.deinit();
+            try std.Io.Dir.cwd().deleteTree(io, root);
+        }
+        return completed;
+    }
+
     pub fn openQueryCut(self: *DB, request: @import("native_query_cut.zig").Request, cancellation: types.CancellationToken) !DB {
         const cut = @import("native_query_cut.zig");
         try request.validate(cut.nowMs());
-        if (request.table_id != self.core.identity_namespace.table_id) return error.CatalogGenerationChanged;
+        const origin = try request.namespace(self.core.identity_namespace);
+        const cache_id = try request.cacheId(self.alloc, self.core.identity_namespace);
+        defer self.alloc.free(cache_id);
         if (request.create) try self.captureQueryCut(request, cancellation);
         const io = self.backend_runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable;
-        const path = try cut.pathAlloc(self.alloc, self.core.path, request.id);
+        const path = try cut.pathAlloc(self.alloc, self.core.path, cache_id);
         defer self.alloc.free(path);
         const expiry_deadline = monotonicTimeNs() +| (request.expires_ms -| cut.nowMs()) * std.time.ns_per_ms;
         const control: cut.Control = .{ .parent = cancellation, .deadline_ns = if (request.timeout_ms) |value| @min(monotonicTimeNs() +| value *| std.time.ns_per_ms, expiry_deadline) else expiry_deadline };
@@ -19376,7 +19438,7 @@ pub const DB = struct {
         var guarded = true;
         defer if (guarded) guard.deinit();
         if (!try snapshotPathExists(io, path)) if (self.backend_runtime.query_cut_repository) |repository| {
-            if (try repository.openRead(io, path, request, self.core.identity_namespace, cancellation)) |opened| {
+            if (try repository.openRead(io, path, request, origin, cancellation)) |opened| {
                 var lease = opened;
                 errdefer lease.deinit();
                 // The remote manifest is immutable. No local capture or
@@ -19389,28 +19451,28 @@ pub const DB = struct {
                     .physical_root_mode = .external_backend,
                     .storage = lease.view,
                     .backend_runtime = self.backend_runtime,
-                    .identity_namespace = self.core.identity_namespace,
+                    .identity_namespace = origin,
                 });
                 errdefer readonly.close();
                 try control.token().check();
                 readonly.retained_remote_query_lease = lease;
                 return readonly;
             }
-            try cut.admit(self.alloc, io, self.core.path, request.id, repository.limits, control.token());
-            try repository.recover(io, path, request, self.core.identity_namespace, control.token());
+            try cut.admit(self.alloc, io, self.core.path, cache_id, repository.limits, control.token());
+            try repository.recover(io, path, request, origin, control.token());
             errdefer std.Io.Dir.cwd().deleteTree(io, path) catch {};
-            try cut.admit(self.alloc, io, self.core.path, request.id, repository.limits, control.token());
+            try cut.admit(self.alloc, io, self.core.path, cache_id, repository.limits, control.token());
         };
-        var reader = try cut.readLease(self.alloc, io, self.core.path, request.id, control.token());
+        var reader = try cut.readLease(self.alloc, io, self.core.path, cache_id, control.token());
         guard.deinit();
         guarded = false;
         var transferred = false;
         defer if (!transferred) reader.deinit();
-        try cut.validate(self.alloc, io, path, request, self.core.identity_namespace, control.token());
+        try cut.validate(self.alloc, io, path, request, origin, control.token());
         var readonly = try DB.open(self.alloc, path, .{
             .open_mode = .query_readonly,
             .backend_runtime = self.backend_runtime,
-            .identity_namespace = self.core.identity_namespace,
+            .identity_namespace = origin,
             .prefer_existing_identity_namespace = true,
         });
         errdefer readonly.close();
@@ -30486,6 +30548,10 @@ pub const DB = struct {
     pub fn startQuarantineRetryWorkerIfNeeded(self: *DB) void {
         if (comptime !builtin.is_test and (builtin.single_threaded or builtin.os.tag == .freestanding)) return;
         if (!builtin.is_test and (!self.local_execution.optional_runtime_workers_enabled or self.open_mode != .writer)) return;
+        if (self.open_mode == .writer and self.physical_root_mode == .filesystem_managed and self.primary_backend == .lsm and
+            self.core.identity_namespace.table_id != 0 and self.backend_runtime.query_cut_repository != null and
+            self.backend_runtime.query_cut_repository.?.vtable.warm != null and self.backend_runtime.query_cut_repository.?.limits.max_cuts > 1)
+            self.native_query_warming.start(.{ .ptr = self, .runtime = self.backend_runtime, .turn = warmNativeCheckpoint });
         self.quarantine_recovery.start(.{
             .ptr = self,
             .runtime = self.backend_runtime,

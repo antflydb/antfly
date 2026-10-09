@@ -1275,16 +1275,32 @@ def test_native_catalog_file_commit_read_and_restart(tmp_path, mode, native_rows
                 },
             )
             assert planned["input_files"] >= 2, planned
-            compacted = call(
-                "POST",
-                maintenance,
-                {
-                    "action": "compact",
-                    "operation_id": "wire-compaction",
-                    "dry_run": False,
-                },
-            )
+            compact_request = {
+                "action": "compact",
+                "operation_id": "wire-compaction",
+                "dry_run": False,
+                "max_rows": 1,
+            }
+            compacted = call("POST", maintenance, compact_request)
+            assert not compacted["complete"] and not compacted["committed"], compacted
+            assert compacted["scanned_rows"] == 1, compacted
+            parent = call("GET", "/tables/hn/lake/catalog")["metadata_location"]
+            stop()
+            start()
+            for _ in range(32):
+                previous = compacted["scanned_rows"]
+                compacted = call("POST", maintenance, compact_request)
+                assert 0 <= compacted["scanned_rows"] - previous <= 1, compacted
+                if compacted["complete"]:
+                    break
+                assert (
+                    call("GET", "/tables/hn/lake/catalog")["metadata_location"]
+                    == parent
+                )
+            else:
+                pytest.fail(f"compaction failed to finish bounded turns: {compacted}")
             assert compacted["committed"], compacted
+            assert compacted["complete"] and not compacted["conflicted"], compacted
             assert (
                 call(
                     "POST",
@@ -1298,6 +1314,30 @@ def test_native_catalog_file_commit_read_and_restart(tmp_path, mode, native_rows
                 == compacted
             )
             catalog.load_table("hackernews.items").metadata.model_dump()
+            assert call(
+                "POST", "/sql", {"statement": "SELECT amount FROM hn ORDER BY amount"}
+            )["rows"] == [["3"], ["4"], ["5"]]
+            conflict_request = dict(
+                compact_request, operation_id="wire-conflicted-compaction"
+            )
+            pending = call("POST", maintenance, conflict_request)
+            assert not pending["complete"], pending
+            catalog.load_table("hackernews.items").transaction().set_properties(
+                {"qualification.concurrent-writer": "preserved"}
+            ).commit_transaction()
+            for _ in range(32):
+                pending = call("POST", maintenance, conflict_request)
+                if pending["complete"]:
+                    break
+            assert pending["complete"] and pending["conflicted"], pending
+            assert not pending["committed"], pending
+            assert call("POST", maintenance, conflict_request) == pending
+            assert (
+                call("GET", "/tables/hn/lake/catalog")["metadata"]["properties"][
+                    "qualification.concurrent-writer"
+                ]
+                == "preserved"
+            )
             assert call(
                 "POST", "/sql", {"statement": "SELECT amount FROM hn ORDER BY amount"}
             )["rows"] == [["3"], ["4"], ["5"]]

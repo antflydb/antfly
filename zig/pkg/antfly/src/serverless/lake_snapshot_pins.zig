@@ -53,6 +53,12 @@ pub const Store = struct {
         return std.fmt.parseInt(u64, value.body, 10);
     }
     pub fn acquire(self: Store, a: A, snapshot: []const u8, now: u64) !u64 {
+        return self.acquireFor(a, snapshot, now, duration_ns);
+    }
+    /// Durable maintenance keeps its input alive between bounded turns.
+    /// Abandoned work expires; retirement still wins the final admission race.
+    pub fn acquireFor(self: Store, a: A, snapshot: []const u8, now: u64, duration: u64) !u64 {
+        if (duration == 0 or duration > std.time.ns_per_day) return error.LakeSnapshotReadLeaseExpired;
         if (now == 0 or snapshot.len == 0) return error.LakeSnapshotReadLeaseExpired;
         for (0..16) |_| {
             try self.context.ensureActive();
@@ -64,7 +70,7 @@ pub const Store = struct {
             var previous = try self.get(a, "pins", snapshot);
             defer if (previous) |*value| value.deinit(self.client.allocator);
             const old = if (previous) |value| try std.fmt.parseInt(u64, value.body, 10) else 0;
-            const desired = try std.math.add(u64, now, duration_ns);
+            const desired = try std.math.add(u64, now, duration);
             const deadline_ns = @max(old, desired);
             if (deadline_ns != old) {
                 const bytes = try std.fmt.allocPrint(a, "{d}", .{deadline_ns});

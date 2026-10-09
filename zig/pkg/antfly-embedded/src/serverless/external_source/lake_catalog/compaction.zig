@@ -56,6 +56,14 @@ pub fn currentList(a: A, table: t.Table, files: rows.Files) !iceberg.ManifestLis
 /// Row/byte limits include physical rows before delete filtering.
 pub fn select(a: A, table: t.Table, files: rows.Files, max_rows: u64, max_bytes: u64) !Selection {
     if (max_rows == 0 or max_rows > 16384 or max_bytes == 0 or max_bytes > 32 * 1024 * 1024) return error.InvalidLakeMaintenanceLimits;
+    return selectBounded(a, table, files, max_rows, max_bytes, 32);
+}
+/// Select a whole manifest independently of the per-turn scan/output budget.
+/// The durable coordinator rewrites its files over many bounded turns.
+pub fn selectResumable(a: A, table: t.Table, files: rows.Files) !Selection {
+    return selectBounded(a, table, files, std.math.maxInt(u64), std.math.maxInt(u64), 32);
+}
+fn selectBounded(a: A, table: t.Table, files: rows.Files, max_rows: u64, max_bytes: u64, max_manifests: usize) !Selection {
     const list = try currentList(a, table, files);
     var manifests: std.ArrayList([]const u8) = .empty;
     var paths: std.ArrayList([]const u8) = .empty;
@@ -82,7 +90,7 @@ pub fn select(a: A, table: t.Table, files: rows.Files, max_rows: u64, max_bytes:
         if (entry.content != .data) continue;
         // Large manifests remain immutable; another pass/operator can split
         // them. Never allocate an unbounded decoded manifest to select a job.
-        if (entry.manifest_length > 4 * 1024 * 1024 or manifests.items.len == 32) {
+        if (entry.manifest_length > 4 * 1024 * 1024 or manifests.items.len == max_manifests) {
             all = false;
             continue;
         }
@@ -107,8 +115,26 @@ pub fn select(a: A, table: t.Table, files: rows.Files, max_rows: u64, max_bytes:
     if (all and paths.items.len == 0 and max_delete_sequence > 0) rewrites_deletes = true;
     return .{ .manifests = manifests.items, .files = paths.items, .all_data = all, .rewrites_deletes = rewrites_deletes, .input_rows = count, .input_bytes = size };
 }
+pub const Output = struct { uri: []const u8, rows: u64, bytes: u64 };
+pub fn writeOutput(a: A, table: t.Table, files: rows.Files, operation: []const u8, part: u64, live: []const V) !Output {
+    const root = try m.parse(a, table.metadata_json);
+    const data = try parquet.encode(a, try rows.schema(a, root), live, files.context);
+    const uri = try rows.upload(a, files, try std.fmt.allocPrint(a, "data/antfly-compact-{s}-{d}-{s}.parquet", .{ t.digestHex(operation), part, t.digestHex(data) }), data);
+    return .{ .uri = uri, .rows = live.len, .bytes = data.len };
+}
 pub fn prepare(a: A, table: t.Table, files: rows.Files, selection: Selection, live: []const V, timestamp: i64) !rows.Prepared {
-    if ((selection.manifests.len == 0 and !selection.all_data) or live.len > selection.input_rows) return error.InvalidLakeCompaction;
+    if (live.len > selection.input_rows) return error.InvalidLakeCompaction;
+    const operation = try std.json.Stringify.valueAlloc(a, .{ "compaction-v1", table.metadata_location, selection.manifests }, .{});
+    const output: []const Output = if (live.len == 0) &.{} else &.{try writeOutput(a, table, files, operation, 0, live)};
+    return prepareOutputs(a, table, files, selection, output, timestamp);
+}
+/// Final publication only occurs after the complete selected input was scanned.
+/// Output pages are immutable; retries retain the original parent requirement.
+pub fn prepareOutputs(a: A, table: t.Table, files: rows.Files, selection: Selection, outputs: []const Output, timestamp: i64) !rows.Prepared {
+    if (selection.manifests.len == 0 and !selection.all_data) return error.InvalidLakeCompaction;
+    var output_rows: u64 = 0;
+    for (outputs) |output| output_rows = try std.math.add(u64, output_rows, output.rows);
+    if (output_rows > selection.input_rows) return error.InvalidLakeCompaction;
     const root = try m.parse(a, table.metadata_json);
     const parent = try m.int(try m.get(root, "current-snapshot-id"));
     const previous_sequence = try m.int(try m.get(root, "last-sequence-number"));
@@ -162,13 +188,20 @@ pub fn prepare(a: A, table: t.Table, files: rows.Files, selection: Selection, li
         try manifests.append(a, try rows.listEntry(a, entry));
     }
     if (removed != selection.manifests.len) return error.InvalidLakeCompaction;
-    if (live.len != 0) {
-        const data = try parquet.encode(a, s, live, files.context);
-        const uri = try rows.upload(a, files, try std.fmt.allocPrint(a, "data/antfly-compact-{s}.parquet", .{digest}), data);
-        const record = try json(a, .{ .status = 1, .snapshot_id = snapshot, .sequence_number = sequence, .file_sequence_number = sequence, .data_file = .{ .content = 0, .file_path = uri, .file_format = "PARQUET", .partition = V{ .object = .empty }, .record_count = live.len, .file_size_in_bytes = data.len } });
-        const manifest = try avro.ocf(a, avro.entry_schema, &.{record}, &.{ .{ .key = "schema", .value = try std.json.Stringify.valueAlloc(a, s, .{}) }, .{ .key = "partition-spec", .value = "[]" }, .{ .key = "partition-spec-id", .value = try std.fmt.allocPrint(a, "{d}", .{spec_id}) }, .{ .key = "format-version", .value = "2" }, .{ .key = "content", .value = "data" } });
-        const path = try rows.upload(a, files, try std.fmt.allocPrint(a, "metadata/antfly-compact-{s}.avro", .{digest}), manifest);
-        try manifests.append(a, try json(a, .{ .manifest_path = path, .manifest_length = manifest.len, .partition_spec_id = spec_id, .content = 0, .sequence_number = sequence, .min_sequence_number = sequence, .added_snapshot_id = snapshot, .added_files_count = 1, .existing_files_count = 0, .deleted_files_count = 0, .added_rows_count = live.len, .existing_rows_count = 0, .deleted_rows_count = 0 }));
+    var part: usize = 0;
+    while (part < outputs.len) {
+        const end = @min(outputs.len, part + 128);
+        var records: std.ArrayList(V) = .empty;
+        var count: u64 = 0;
+        for (outputs[part..end]) |output| {
+            if (output.rows == 0 or output.bytes == 0) return error.InvalidLakeCompaction;
+            count = try std.math.add(u64, count, output.rows);
+            try records.append(a, try json(a, .{ .status = 1, .snapshot_id = snapshot, .sequence_number = sequence, .file_sequence_number = sequence, .data_file = .{ .content = 0, .file_path = output.uri, .file_format = "PARQUET", .partition = V{ .object = .empty }, .record_count = output.rows, .file_size_in_bytes = output.bytes } }));
+        }
+        const manifest = try avro.ocf(a, avro.entry_schema, records.items, &.{ .{ .key = "schema", .value = try std.json.Stringify.valueAlloc(a, s, .{}) }, .{ .key = "partition-spec", .value = "[]" }, .{ .key = "partition-spec-id", .value = try std.fmt.allocPrint(a, "{d}", .{spec_id}) }, .{ .key = "format-version", .value = "2" }, .{ .key = "content", .value = "data" } });
+        const path = try rows.upload(a, files, try std.fmt.allocPrint(a, "metadata/antfly-compact-{s}-{d}.avro", .{ digest, part }), manifest);
+        try manifests.append(a, try json(a, .{ .manifest_path = path, .manifest_length = manifest.len, .partition_spec_id = spec_id, .content = 0, .sequence_number = sequence, .min_sequence_number = sequence, .added_snapshot_id = snapshot, .added_files_count = records.items.len, .existing_files_count = 0, .deleted_files_count = 0, .added_rows_count = count, .existing_rows_count = 0, .deleted_rows_count = 0 }));
+        part = end;
     }
     const list = try avro.ocf(a, avro.list_schema, manifests.items, &.{ .{ .key = "format-version", .value = "2" }, .{ .key = "snapshot-id", .value = try std.fmt.allocPrint(a, "{d}", .{snapshot}) }, .{ .key = "sequence-number", .value = try std.fmt.allocPrint(a, "{d}", .{sequence}) } });
     const path = try rows.upload(a, files, try std.fmt.allocPrint(a, "metadata/antfly-compact-{s}-list.avro", .{digest}), list);
@@ -219,4 +252,49 @@ test "lake compaction bounded passes retain sequences and retire only obsolete e
         try std.testing.expectEqualStrings("b3", try m.str(try m.get(try m.get(root, "properties"), "antfly.cdc.checkpoint")));
         try std.testing.expectEqualStrings("3", try m.str(try m.get(try m.get(root, "properties"), "antfly.wal.coverage")));
     }
+}
+
+test "lake compaction resumable selection and output manifests exceed turn limits safely" {
+    const objectstore = @import("objectstore");
+    const alloc = std.testing.allocator;
+    var memory = objectstore.MemoryClient.init(alloc);
+    defer memory.deinit();
+    var authority: @import("managed.zig").Managed = .{ .client = memory.client(), .bucket = "archive", .prefix = "hn", .source_uri = "s3://archive/hn" };
+    var table = try authority.create(alloc, "init", "{\"schema\":{\"type\":\"struct\",\"schema-id\":0,\"fields\":[{\"id\":1,\"name\":\"id\",\"type\":\"long\",\"required\":true}]}}", 1);
+    defer table.deinit(alloc);
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const files: rows.Files = .{ .client = memory.client(), .bucket = "archive", .prefix = "hn", .uri = "s3://archive/hn" };
+    const images = try a.alloc(V, 129);
+    const changes = try a.alloc(rows.Batch.Change, images.len);
+    for (images, changes, 0..) |*image, *change, n| {
+        image.* = try json(a, .{ .id = n });
+        change.* = .{ .op = .upsert, .row = image.* };
+    }
+    const prepared = try rows.prepare(a, table, files, .{ .batch_id = "initial", .source = "hook", .epoch = "1", .checkpoint = "1", .key_fields = &.{"id"}, .changes = changes }, 1, 2);
+    const committed = try authority.commit(alloc, .{ .id = "initial", .expected_metadata_location = table.metadata_location, .body = prepared.body, .timestamp_ms = 2 });
+    table.deinit(alloc);
+    table = committed;
+    const bounded = try select(a, table, files, 1, 1024 * 1024);
+    try std.testing.expectEqual(@as(u64, 0), bounded.input_rows);
+    const selection = try selectResumable(a, table, files);
+    try std.testing.expectEqual(@as(u64, 129), selection.input_rows);
+    const outputs = try a.alloc(Output, images.len);
+    for (outputs, images, 0..) |*output, image, n| output.* = try writeOutput(a, table, files, "resumable", n, &.{image});
+    const rewritten = try prepareOutputs(a, table, files, selection, outputs, 3);
+    const next = try authority.commit(alloc, .{ .id = "resumable", .expected_metadata_location = table.metadata_location, .body = rewritten.body, .timestamp_ms = 3 });
+    table.deinit(alloc);
+    table = next;
+    const list = try currentList(a, table, files);
+    var total: u64 = 0;
+    var data_manifests: usize = 0;
+    for (list.entries) |entry| if (entry.content == .data) {
+        data_manifests += 1;
+        const manifest = try iceberg.parseDataManifestAlloc(a, try rows.read(a, files, entry.manifest_path));
+        try std.testing.expect(manifest.entries.len <= 128);
+        for (manifest.entries) |file| total += file.record_count;
+    };
+    try std.testing.expectEqual(@as(usize, 2), data_manifests);
+    try std.testing.expectEqual(@as(u64, 129), total);
 }

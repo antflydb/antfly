@@ -106,7 +106,7 @@ pub const Repository = struct {
         if (self.owned_base_dir) |value| self.a.free(value);
     }
     pub fn capability(self: *Repository) port.Port {
-        const vtable: port.VTable = .{ .publish = publish, .recover = recover, .open_read = openRead };
+        const vtable: port.VTable = .{ .publish = publish, .recover = recover, .open_read = openRead, .warm = warm };
         return .{ .limits = self.limits, .ptr = self, .vtable = &vtable, .dispatch = @import("antfly_local_sources").runtime_callback_abi.Boundary(port.VTable).local_dispatch };
     }
     fn from(raw: *anyopaque) *Repository {
@@ -261,7 +261,7 @@ pub const Repository = struct {
         try cancellation.check();
         return if (page.next_continuation_token != null) try a.dupe(u8, key_bytes) else null;
     }
-    fn cachedFile(a: A, io: std.Io, path: []const u8, expected_domain: [32]u8, expires: u64, source: local.storage_db_native_backup_seal.File) !?[]const Ref {
+    fn cachedFile(a: A, io: std.Io, path: []const u8, expected_domain: [32]u8, expires: u64, source: local.storage_db_native_backup_seal.File, complete: bool) !?[]const Ref {
         const bytes = local.storage_db_native_backup.readFileAlloc(a, io, path, max_manifest_bytes) catch |err| switch (err) {
             error.FileNotFound => return null,
             else => return err,
@@ -276,7 +276,7 @@ pub const Repository = struct {
             if (!std.mem.eql(u8, &scope.domain, &expected_domain) or scope.fencingToken() != expires) return null;
             size = std.math.add(u64, size, ref.byte_len) catch return null;
         }
-        if (size != source.size) return null;
+        if (size > source.size or (complete and size != source.size)) return null;
         return cached.chunks;
     }
     fn safePath(path: []const u8) bool {
@@ -298,6 +298,13 @@ pub const Repository = struct {
         _ = try local.storage_db_native_backup.writeFileDurable(io, path, bytes);
     }
     fn publish(raw: *anyopaque, io: std.Io, root: []const u8, request: cut.Request, namespace: Namespace, cancellation: Cancellation) !void {
+        _ = try publishLimited(raw, io, root, request, namespace, cancellation, std.math.maxInt(u64));
+    }
+    fn warm(raw: *anyopaque, io: std.Io, root: []const u8, request: cut.Request, namespace: Namespace, cancellation: Cancellation, max_bytes: u64) !bool {
+        if (max_bytes < chunk_bytes or max_bytes > 32 * 1024 * 1024) return error.InvalidQueryRequest;
+        return publishLimited(raw, io, root, request, namespace, cancellation, max_bytes);
+    }
+    fn publishLimited(raw: *anyopaque, io: std.Io, root: []const u8, request: cut.Request, namespace: Namespace, cancellation: Cancellation, max_bytes: u64) !bool {
         const self = from(raw);
         var arena = std.heap.ArenaAllocator.init(self.a);
         defer arena.deinit();
@@ -306,7 +313,7 @@ pub const Repository = struct {
         try cut.validate(a, io, root, request, namespace, cancellation);
         if (try self.localCommit(a, io, root, request, namespace)) {
             try cancellation.check();
-            return;
+            return true;
         }
         try self.register(a, namespace, cancellation);
         try self.collect(namespace, cut.nowMs(), cancellation);
@@ -315,7 +322,7 @@ pub const Repository = struct {
             _ = try checkedManifest(a, bytes, request, namespace);
             try self.markCommitted(a, io, root, request, namespace);
             try cancellation.check();
-            return;
+            return true;
         } else |err| if (err != error.CatalogGenerationChanged) return err;
         try cut.validate(a, io, root, request, namespace, cancellation);
         const bytes = try local.storage_db_native_backup.readFileAlloc(a, io, try std.fmt.allocPrint(a, "{s}/query-cut.json", .{root}), max_manifest_bytes);
@@ -332,6 +339,7 @@ pub const Repository = struct {
         const buffer = try self.a.alloc(u8, chunk_bytes);
         defer self.a.free(buffer);
         var files: std.ArrayListUnmanaged(File) = .empty;
+        var uploaded: u64 = 0;
         var total: u64 = 0;
         var reference_bytes: usize = 0;
         for (pinned.files) |file| {
@@ -345,7 +353,7 @@ pub const Repository = struct {
             const refs_estimate = std.math.cast(usize, (file.size / chunk_bytes + 1) * 512 + file.path.len) orelse return error.QueryCandidateBudgetExceeded;
             reference_bytes = std.math.add(usize, reference_bytes, refs_estimate) catch return error.QueryCandidateBudgetExceeded;
             if (reference_bytes > max_manifest_bytes) return error.QueryCandidateBudgetExceeded;
-            if (try cachedFile(a, io, cache_path, generation_domain, chunk_expiry, file)) |cached| {
+            if (try cachedFile(a, io, cache_path, generation_domain, chunk_expiry, file, true)) |cached| {
                 try files.append(a, .{ .path = file.path, .size = file.size, .chunks = cached });
                 continue;
             }
@@ -358,14 +366,24 @@ pub const Repository = struct {
             defer source.close(io);
             var chunks: std.ArrayListUnmanaged(Ref) = .empty;
             var offset: u64 = 0;
+            if (try cachedFile(a, io, cache_path, generation_domain, chunk_expiry, file, false)) |prefix_refs| {
+                try chunks.appendSlice(a, prefix_refs);
+                for (prefix_refs) |ref| offset += ref.byte_len;
+            }
             while (offset < file.size) {
                 try cancellation.check();
                 const wanted: usize = @intCast(@min(chunk_bytes, file.size - offset));
+                if (wanted > max_bytes - uploaded) {
+                    const cached = try std.json.Stringify.valueAlloc(a, CachedFile{ .domain = generation_domain, .expires_ms = chunk_expiry, .source = file, .chunks = chunks.items }, .{});
+                    _ = try local.storage_db_native_backup.writeFileDurable(io, cache_path, cached);
+                    return false;
+                }
                 if (try source.readPositionalAll(io, buffer[0..wanted], offset) != wanted) return error.CatalogGenerationChanged;
                 var metadata = try store.putScoped(scope, buffer[0..wanted], cancellation);
                 defer metadata.deinit(store.allocator);
                 try chunks.append(a, .{ .artifact_id = try a.dupe(u8, metadata.artifact_id), .byte_len = metadata.byte_len, .checksum = try a.dupe(u8, metadata.checksum) });
                 offset += wanted;
+                uploaded += wanted;
             }
             const refs = try chunks.toOwnedSlice(a);
             try files.append(a, .{ .path = file.path, .size = file.size, .chunks = refs });
@@ -387,7 +405,7 @@ pub const Repository = struct {
                     if (!std.mem.eql(u8, existing, manifest)) return error.CatalogGenerationChanged;
                     try self.markCommitted(a, io, root, request, namespace);
                     try cancellation.check();
-                    return;
+                    return true;
                 },
                 else => return err,
             }
@@ -395,6 +413,7 @@ pub const Repository = struct {
         result.deinit(self.store.opened.client.allocator);
         try self.markCommitted(a, io, root, request, namespace);
         try cancellation.check();
+        return true;
     }
     fn readChunk(raw: *anyopaque, a: A, ref: Ref, cancellation: Cancellation) ![]u8 {
         const self: *Repository = @ptrCast(@alignCast(raw));
@@ -556,6 +575,44 @@ test "external lake native repository reuses immutable extents and collects expi
     try std.testing.expectError(error.CatalogGenerationChanged, repository.readManifest(scratch, first, namespace, .none));
     try std.testing.expectError(error.CatalogGenerationChanged, repository.readManifest(scratch, second, namespace, .none));
     try std.testing.expectError(error.CatalogGenerationChanged, retained.load(scratch, &store, identity, capability, table, cut.nowMs(), .none));
+}
+
+test "external lake native repository warming resumes bounded uploads after restart" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var directory = try local.common_test_directory.TestDirectory.init("native-cut-warming");
+    defer directory.cleanup();
+    var repository = try Repository.init(a, null, null, .standalone, directory.path());
+    defer repository.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const id: [64]u8 = @splat('d');
+    const namespace: Namespace = .{ .table_id = 7, .shard_id = 1, .range_id = 1 };
+    const request: cut.Request = .{ .id = &id, .table_id = 7, .expires_ms = cut.nowMs() + 300_000, .create = true };
+    const root = try std.fmt.allocPrint(scratch, "{s}/{s}", .{ directory.path(), id });
+    try fs.createDirPathPortable(io, root);
+    const bytes = try scratch.alloc(u8, 2 * chunk_bytes + 17);
+    @memset(bytes, 42);
+    _ = try local.storage_db_native_backup.writeFileDurable(io, try std.fmt.allocPrint(scratch, "{s}/immutable.sst", .{root}), bytes);
+    try cut.finish(a, io, root, request, namespace, 1, .none);
+    try std.testing.expectError(error.InvalidQueryRequest, repository.capability().warm(io, root, request, namespace, .none, chunk_bytes - 1));
+    try std.testing.expect(!try repository.capability().warm(io, root, request, namespace, .none, chunk_bytes));
+    try std.testing.expectError(error.CatalogGenerationChanged, repository.readManifest(scratch, request, namespace, .none));
+    repository.deinit();
+    repository = try Repository.init(a, null, null, .standalone, directory.path());
+    try std.testing.expect(!try repository.capability().warm(io, root, request, namespace, .none, chunk_bytes));
+    try std.testing.expectError(error.CatalogGenerationChanged, repository.readManifest(scratch, request, namespace, .none));
+    try std.testing.expect(try repository.capability().warm(io, root, request, namespace, .none, chunk_bytes));
+    const manifest = try Repository.checkedManifest(scratch, try repository.readManifest(scratch, request, namespace, .none), request, namespace);
+    try std.testing.expectEqual(@as(usize, 3), manifest.files[0].chunks.len);
+    // A foreground capture after warming uses the already committed generation.
+    try repository.capability().publish(io, root, request, namespace, .none);
+    var remote = (try repository.capability().openRead(io, try std.fmt.allocPrint(scratch, "{s}/remote", .{directory.path()}), request, namespace, .none)).?;
+    defer remote.deinit();
+    const tail = try remote.view.readFileRangeAlloc(a, try std.fmt.allocPrint(scratch, "{s}/remote/immutable.sst", .{directory.path()}), 2 * chunk_bytes, 17);
+    defer a.free(tail);
+    try std.testing.expectEqualSlices(u8, bytes[2 * chunk_bytes ..], tail);
 }
 
 test "external lake native repository honors check-only cancellation tokens" {

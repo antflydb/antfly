@@ -12,6 +12,7 @@ pub const VTable = struct {
     publish: *const fn (*anyopaque, std.Io, []const u8, Request, Namespace, Cancellation) anyerror!void,
     recover: *const fn (*anyopaque, std.Io, []const u8, Request, Namespace, Cancellation) anyerror!void,
     open_read: ?*const fn (*anyopaque, std.Io, []const u8, Request, Namespace, Cancellation) anyerror!StorageLease = null,
+    warm: ?*const fn (*anyopaque, std.Io, []const u8, Request, Namespace, Cancellation, u64) anyerror!bool = null,
 };
 const Boundary = @import("../../runtime_callback_abi.zig").Boundary(VTable);
 pub const Port = struct {
@@ -28,5 +29,9 @@ pub const Port = struct {
     pub fn openRead(self: Port, io: std.Io, root: []const u8, request: Request, namespace: Namespace, cancellation: Cancellation) !?StorageLease {
         const open = self.vtable.open_read orelse return null;
         return try Boundary.call("open_read", self.dispatch, open, .{ self.ptr, io, root, request, namespace, cancellation });
+    }
+    pub fn warm(self: Port, io: std.Io, root: []const u8, request: Request, namespace: Namespace, cancellation: Cancellation, max_bytes: u64) !bool {
+        const callback = self.vtable.warm orelse return true;
+        return Boundary.call("warm", self.dispatch, callback, .{ self.ptr, io, root, request, namespace, cancellation, max_bytes });
     }
 };

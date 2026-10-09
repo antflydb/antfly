@@ -544,12 +544,23 @@ successful compaction commit.
 
 Compaction scans delete-aware live rows from whole selected manifests in one
 pinned parent snapshot and writes standard native Parquet/manifests. Per-pass
-limits are 16,384 physical rows, 32 MiB input and 32 manifests; oversized external
-manifests/files are skipped. Oldest sequences are selected first. Untouched files
+limits are 16,384 physical rows and 32 MiB of output row images. Selection admits
+up to 32 whole manifests independently of those per-turn limits. A durable cursor
+records input file, row group and next physical row; immutable output pages and
+CAS progress survive restart. Large input files can span many turns, including
+turns that consume only deleted rows. Metadata manifests above 4 MiB remain
+skipped, decoded pages remain bounded, and one job admits at most 65,536 output
+files and a 32 MiB progress document. Final output manifests contain at most 128
+files each. The pinned parent has a renewable 24-hour retirement lease. Oldest sequences are selected first. Untouched files
 retain their sequence numbers. Equality-delete manifests are removed only when
 all remaining data sequences prove those deletes obsolete; position deletes
 remain unless the full data inventory is rewritten. Exact durable catalog intents
-are replayed after interruptions, without rebasing ambiguous commits.
+are replayed after interruptions, without rebasing ambiguous commits. The result
+includes `complete`, `committed`, `conflicted`, `scanned_rows` and `output_files`.
+Repeat the same operation ID until `complete`. A confirmed parent conflict marks
+the job complete without publication; a fresh operation must read and rewrite a
+fresh parent. Scheduler cycles use new operation IDs; obsolete images are never
+transplanted into a newer parent.
 
 Vacuum first expires unprotected Iceberg snapshots through the catalog CAS,
 then marks retained snapshot file graphs and sweeps only unreachable objects
