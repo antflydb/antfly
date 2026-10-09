@@ -61,7 +61,9 @@ Both backends report model identity
 ## Executed validation
 
 - CPU Debug: one selected test, passed; all six cases and HTTP assertions completed,
-  including allocation/leak checks. CPU ReleaseSafe: one selected test, passed.
+  including allocation/leak checks. CPU and Metal ReleaseSafe: each selected one
+  test and passed all six cases plus HTTP. Optimized Metal errors match the Debug
+  table above; maximum is 2.69e-7.
 - Linux ARM64 musl and wasm32-wasi qualification tool: both compile successfully.
   WASI executed all eight colorful MJPEG pictures and matched the independent RGB
   SHA256 above.
@@ -85,8 +87,10 @@ CPU Debug executable SHA256:
 `1c20fed7f77589dcffcf14db2191539eb5ed73e6ed16cfe38412a1cb9e1ab090`.
 CPU ReleaseSafe executable SHA256:
 `7cf02bf856ee8797a26d93e548c17c34b644026b991e62d8a3d6b4e9579e1312`.
-These CPU numerical runs precede the teardown-scope fix; the final Metal regression
-run below exercises that process-required driver boundary.
+Metal ReleaseSafe executable SHA256:
+`78b030a4975bd9c56b629c7157aa39f7882f37d3aa0cd4cf7361f7e586d17953`.
+CPU and optimized Metal numerical runs precede the teardown-scope fix; the final
+Metal Debug regression run below exercises that process-required driver boundary.
 
 Final Metal Debug: eight selected tests, seven passed, one explicit unconfigured
 supervised-child fixture skip; zero failures. The pretrained test covers all six
