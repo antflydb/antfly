@@ -16962,6 +16962,7 @@ test "SQL protected executor cleanup diagnostics and control worker progress dur
         owner: *owners.State,
         handle: *anyopaque,
         released: *std.atomic.Value(usize),
+        retired: *std.atomic.Value(usize),
         body: ?[]u8 = null,
         refs: std.atomic.Value(usize) = .init(1),
         ready: std.Io.Event = .unset,
@@ -16998,8 +16999,12 @@ test "SQL protected executor cleanup diagnostics and control worker progress dur
             self.memory.allocator().free(self.body.?);
             self.body = null;
         }
-        fn retire(_: *anyopaque) !void {
-            return error.UnexpectedFailureRetirement;
+        fn retire(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            // Successful cleanup still has a mandatory metadata retirement
+            // fence. An error here intentionally retains the registry slot.
+            if (self.body != null) return error.PhysicalCleanupIncomplete;
+            _ = self.retired.fetchAdd(1, .release);
         }
     };
     const Shutdown = struct {
@@ -17068,12 +17073,13 @@ test "SQL protected executor cleanup diagnostics and control worker progress dur
     defer owner.owner.deinit();
     var memory: allocation.Shared = .{ .child = std.heap.smp_allocator, .limit = 16384 };
     var released: std.atomic.Value(usize) = .init(0);
+    var retired: std.atomic.Value(usize) = .init(0);
     const io_borrow = abi.native_abi.IoBorrow.init(&cleanup_io);
     const port = owner.port();
     var handle: ?*anyopaque = null;
     try Fixture.checked(port.start(port.context, &.{ .io = &io_borrow, .class = @backingInt(abi.runnable_abi.Class.query), .has_deadline = 1, .native_deadline = 1, .deadline_ns = 10, .out_handle = &handle }));
     const fixture = try memory.allocator().create(Fixture);
-    fixture.* = .{ .memory = &memory, .owner = &owner, .handle = handle.?, .released = &released };
+    fixture.* = .{ .memory = &memory, .owner = &owner, .handle = handle.?, .released = &released, .retired = &retired };
     const borrow = try abi.runnable_abi.Borrowed.fromOwner(port, handle.?, 1, .query);
     var reservation = try active.registry.reserve(cleanup_io, borrow, &.{ .io = &io_borrow, .native_deadline = 1, .deadline_ns = 100 }, fixture, .{ .retain = Fixture.retain, .release = Fixture.release, .cleanup = Fixture.cleanup, .retire = Fixture.retire });
     fixture.body = try memory.allocator().alloc(u8, 64);
@@ -17122,7 +17128,7 @@ test "SQL protected executor cleanup diagnostics and control worker progress dur
     shutdown_joined = true;
     api_closed = true;
     try std.testing.expect(shutdown.done.load(.acquire));
-    try std.testing.expect(api.sqlCleanupStats() == null);
+    try std.testing.expectEqual(@as(usize, 1), retired.load(.acquire));
     try std.testing.expectEqual(@as(usize, 1), released.load(.acquire));
     try std.testing.expectEqual(@as(usize, 0), memory.stats().used_bytes);
     try std.testing.expectEqual(@as(usize, 0), owner.owner.scheduler.stats().operations);
