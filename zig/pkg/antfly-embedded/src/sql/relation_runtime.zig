@@ -920,7 +920,7 @@ fn Engine(comptime Context: type) type {
                 const native_values = if (batch == .columns) blk: {
                     const pointers = try a.alloc(*const scalar.Program, programs.len);
                     for (programs, pointers) |*program, *pointer| pointer.* = program;
-                    break :blk @import("vector_eval.zig").evaluateColumnsManyScheduled(a, pointers, batch.columns.page, batch.columns.definitions, self.engine.context.parameters, self.engine.context.backend.execution_io) catch |err| {
+                    break :blk @import("vector_eval.zig").evaluateColumnsManyWithScope(a, pointers, batch.columns.page, batch.columns.definitions, self.engine.context.parameters, self.engine.context.backend.execution_io, self.engine.context.backend.cpu_scope) catch |err| {
                         if (errors == null) return err;
                         break :blk null;
                     };
@@ -1167,7 +1167,7 @@ fn Engine(comptime Context: type) type {
             pending_failure: ?anyerror = null,
 
             fn iface(self: *Adapter) catalog.Backend {
-                return .{ .execution_io = self.engine.context.backend.execution_io, .spill_io = self.engine.context.backend.spill_io, .spill_wait = self.engine.context.backend.spill_wait, .spill_manager = self.engine.context.spill, .ptr = self, .decision_provider = self.engine.context.backend.decision_provider, .pinned_statement_snapshot = true, .vtable = &.{ .resolve = resolve, .scan = scan, .open_scan = open, .mutate = mutate, .checkpoint = Adapter.checkpoint } };
+                return .{ .execution_io = self.engine.context.backend.execution_io, .cpu_scope = self.engine.context.backend.cpu_scope, .spill_io = self.engine.context.backend.spill_io, .spill_wait = self.engine.context.backend.spill_wait, .spill_manager = self.engine.context.spill, .ptr = self, .decision_provider = self.engine.context.backend.decision_provider, .pinned_statement_snapshot = true, .vtable = &.{ .resolve = resolve, .scan = scan, .open_scan = open, .mutate = mutate, .checkpoint = Adapter.checkpoint } };
             }
             fn resolve(ptr: *anyopaque, _: Allocator, _: @import("ast.zig").Name, _: catalog.Action) !catalog.Table {
                 const self: *Adapter = @ptrCast(@alignCast(ptr));

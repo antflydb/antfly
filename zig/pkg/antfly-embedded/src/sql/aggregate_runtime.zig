@@ -97,7 +97,7 @@ fn addRows(context: anytype, bound: *const binding.Bound, grouped: *operators.Gr
 // scalar instructions construct a temporary input row; retained aggregate
 // inputs contain the computed values, never the complete input row matrix.
 fn columnValues(context: anytype, bound: *const binding.Bound, a: std.mem.Allocator, page: catalog.ColumnPage, program: *const scalar.Program) ![]const Datum {
-    if (try @import("vector_eval.zig").evaluateColumnsScheduled(a, program, page, bound.input.columns, context.parameters, context.backend.execution_io)) |values| return values;
+    if (try @import("vector_eval.zig").evaluateColumnsWithScope(a, program, page, bound.input.columns, context.parameters, context.backend.execution_io, context.backend.cpu_scope)) |values| return values;
     const values = try a.alloc(Datum, page.selection.len);
     for (values, 0..) |*value, index| value.* = try context.evaluate(a, program.*, try bound.input.columnCells(a, page, index));
     return values;
@@ -126,7 +126,7 @@ pub fn addColumns(context: anytype, bound: *const binding.Bound, grouped: *opera
         for (bound.inputs) |input| if (input) |slot| {
             try cohort.append(a, &bound.input.projections[slot].?);
         };
-        const outputs = try @import("vector_eval.zig").evaluateColumnsEncodedMany(a, cohort.items, accepted, bound.input.columns, context.parameters, context.backend.execution_io);
+        const outputs = try @import("vector_eval.zig").evaluateColumnsEncodedManyWithScope(a, cohort.items, accepted, bound.input.columns, context.parameters, context.backend.execution_io, context.backend.cpu_scope);
         const key_batches = try a.alloc(Batch, bound.group_count);
         const input_batches = try a.alloc(Batch, bound.inputs.len);
         for (key_batches, cohort.items[0..key_batches.len], outputs[0..key_batches.len]) |*batch, program, output| {
@@ -158,7 +158,7 @@ pub fn addColumns(context: anytype, bound: *const binding.Bound, grouped: *opera
     for (bound.inputs, bound.filters) |input, filter| if (filter == null) if (input) |slot| {
         try programs.append(a, &bound.input.projections[slot].?);
     };
-    const vectors = try @import("vector_eval.zig").evaluateColumnsManyScheduled(a, programs.items, accepted, bound.input.columns, context.parameters, context.backend.execution_io);
+    const vectors = try @import("vector_eval.zig").evaluateColumnsManyWithScope(a, programs.items, accepted, bound.input.columns, context.parameters, context.backend.execution_io, context.backend.cpu_scope);
     for (programs.items, vectors) |program, *vector| if (vector.* == null) {
         @constCast(vector).* = try columnValues(context, bound, a, accepted, program);
     };
@@ -198,7 +198,7 @@ pub fn addColumns(context: anytype, bound: *const binding.Bound, grouped: *opera
                 try slots.append(a, index);
             } else for (positions.items) |position| inputs[index][position] = Datum.json(.{ .integer = 1 });
         }
-        const outputs = try @import("vector_eval.zig").evaluateColumnsManyScheduled(a, cohort.items, selected, bound.input.columns, context.parameters, context.backend.execution_io);
+        const outputs = try @import("vector_eval.zig").evaluateColumnsManyWithScope(a, cohort.items, selected, bound.input.columns, context.parameters, context.backend.execution_io, context.backend.cpu_scope);
         for (cohort.items, outputs, slots.items) |program, optional, slot| {
             const values = optional orelse try columnValues(context, bound, a, selected, program);
             for (positions.items, values) |index, value| inputs[slot][index] = value;

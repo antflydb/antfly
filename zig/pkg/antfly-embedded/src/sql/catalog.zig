@@ -324,6 +324,9 @@ pub const AggregatePartialCursor = struct {
 
 pub const Backend = struct {
     execution_io: ?std.Io = null,
+    /// Independent scheduler children for pure kernels over immutable columns.
+    /// This does not enable concurrent access to this backend's mutable state.
+    cpu_scope: ?@import("parallel_scheduler.zig").ExecutionScope = null,
     /// Serial spill I/O is independent of parallel compute ownership. A
     /// scheduled single-worker adapter can retain spilling without launching
     /// children that share its mutable execution capsule.

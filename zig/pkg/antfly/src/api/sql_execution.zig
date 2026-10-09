@@ -699,8 +699,22 @@ pub const Adapter = struct {
         try self.context.ensureActive();
     }
 
+    fn cpuScope(self: *Adapter) ?@import("antfly_local_sources").sql_parallel_scheduler.ExecutionScope {
+        if (self.serial_execution or self.read_guard == null) return null;
+        const execution = self.runnable orelse return null;
+        const entry = execution.entry orelse return null;
+        if (entry.class != .query or entry.slots != 1 or entry.cleanup_active or entry.completion_active) return null;
+        const memory = self.server.request_memory orelse return null;
+        return .{
+            .execution = execution,
+            .allocator = memory.allocator(false),
+            .io = self.server.embedding_provider_runtime.io,
+            .wait = .{ .ptr = self, .begin = spillWaitBegin, .end = spillWaitEnd },
+        };
+    }
+
     pub fn backend(self: *Adapter) catalog.Backend {
-        return .{ .execution_io = if (self.runnable == null and !self.serial_execution) self.server.embedding_provider_runtime.io else null, .spill_io = if (self.runnable != null or self.serial_execution) self.server.embedding_provider_runtime.io else null, .spill_wait = if (self.runnable != null) .{ .ptr = self, .begin = spillWaitBegin, .end = spillWaitEnd } else null, .ptr = self, .decision_provider = self.decision_provider, .predicate_only_mutations = true, .atomic_statement_read_set = self.active_transaction != null and self.range_reads != null, .coordinated_point_reads = self.active_transaction != null and self.range_reads != null, .coordinated_index_reads = self.active_transaction != null and self.range_reads != null and (self.staged == null or self.staged.?.tables.len == 0), .dynamic_statement_read_set = self.dynamic_snapshot != null, .vtable = &.{ .resolve_conflict_owners = resolveConflictOwners, .generate_row_id = generateRowId, .resolve = resolve, .scan = scan, .supports_scan_order = true, .open_scan = openScan, .aggregate_partials = openAggregatePartials, .open_statement = openStatement, .mutate = mutate, .mutate_prepared = mutatePrepared, .prepare_mutations = prepareMutations, .ddl = ddl, .checkpoint = checkpoint } };
+        return .{ .cpu_scope = self.cpuScope(), .execution_io = if (self.runnable == null and !self.serial_execution) self.server.embedding_provider_runtime.io else null, .spill_io = if (self.runnable != null or self.serial_execution) self.server.embedding_provider_runtime.io else null, .spill_wait = if (self.runnable != null) .{ .ptr = self, .begin = spillWaitBegin, .end = spillWaitEnd } else null, .ptr = self, .decision_provider = self.decision_provider, .predicate_only_mutations = true, .atomic_statement_read_set = self.active_transaction != null and self.range_reads != null, .coordinated_point_reads = self.active_transaction != null and self.range_reads != null, .coordinated_index_reads = self.active_transaction != null and self.range_reads != null and (self.staged == null or self.staged.?.tables.len == 0), .dynamic_statement_read_set = self.dynamic_snapshot != null, .vtable = &.{ .resolve_conflict_owners = resolveConflictOwners, .generate_row_id = generateRowId, .resolve = resolve, .scan = scan, .supports_scan_order = true, .open_scan = openScan, .aggregate_partials = openAggregatePartials, .open_statement = openStatement, .mutate = mutate, .mutate_prepared = mutatePrepared, .prepare_mutations = prepareMutations, .ddl = ddl, .checkpoint = checkpoint } };
     }
 
     pub fn settingCapture(self: *Adapter) @FieldType(catalog.Backend, "setting_capture") {

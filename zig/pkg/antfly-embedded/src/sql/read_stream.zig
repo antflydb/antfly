@@ -907,7 +907,7 @@ pub const Stream = struct {
             for (values, 0..) |*value, index| value.* = try encoded.cell(a, index, 0);
             return values;
         }
-        if (try @import("vector_eval.zig").evaluateColumnsScheduled(a, program, page, self.context.binding.scalars.columns, self.context.parameters, self.context.backend.execution_io)) |values| return values;
+        if (try @import("vector_eval.zig").evaluateColumnsWithScope(a, program, page, self.context.binding.scalars.columns, self.context.parameters, self.context.backend.execution_io, self.context.backend.cpu_scope)) |values| return values;
         const values = try a.alloc(@import("scalar.zig").Datum, page.selection.len);
         var scratch = std.heap.ArenaAllocator.init(self.budget.allocator());
         defer scratch.deinit();
@@ -1024,7 +1024,7 @@ pub const Stream = struct {
             try programs.append(a, program);
             try slots.append(a, index);
         };
-        const evaluated = try @import("vector_eval.zig").evaluateColumnsEncodedMany(a, programs.items, selected, self.context.binding.scalars.columns, self.context.parameters, self.context.backend.execution_io);
+        const evaluated = try @import("vector_eval.zig").evaluateColumnsEncodedManyWithScope(a, programs.items, selected, self.context.binding.scalars.columns, self.context.parameters, self.context.backend.execution_io, self.context.backend.cpu_scope);
         for (evaluated, programs.items, slots.items) |values, program, index| {
             if (values) |batch| {
                 projections[index] = batch;
