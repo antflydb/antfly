@@ -110,6 +110,16 @@ fn awaitQueued(server: *http.ApiHttpServer) !void {
     }
 }
 
+fn holdQueryAdmission(server: *http.ApiHttpServer) !admission.Lease {
+    // ReadyForQuery acknowledges protocol progress before the response owner's
+    // physical retirement. Wait on the same bounded admission queue instead of
+    // assuming its retained lease has already been released by another worker.
+    return server.query_admission.acquire(.{
+        .io = io,
+        .deadline_ns = @intCast(std.Io.Clock.awake.now(io).addDuration(.fromSeconds(3)).nanoseconds),
+    });
+}
+
 pub fn qualify(server: *http.ApiHttpServer, storage: *resources.ResourceManager) !void {
     // A watchdog bounds the entire native socket qualification, including a
     // regression that loses ReadyForQuery or fails to join listener shutdown.
@@ -211,7 +221,7 @@ fn run(server: *http.ApiHttpServer, storage: *resources.ResourceManager, done: *
     const exact = try first.query("SELECT id FROM usage_records WHERE _id = 'a'", 'I', null);
     try std.testing.expect(exact.exact_integer);
     {
-        var held = server.query_admission.tryAcquireLease().?;
+        var held = try holdQueryAdmission(server);
         defer held.release();
         try second.send('Q', "SELECT id FROM usage_records\x00");
         try awaitQueued(server);
@@ -239,7 +249,7 @@ fn run(server: *http.ApiHttpServer, storage: *resources.ResourceManager, done: *
         }
     }
     // Shutdown must cancel and join an actual socket query in admission wait.
-    var held = server.query_admission.tryAcquireLease().?;
+    var held = try holdQueryAdmission(server);
     defer held.release();
     try second.send('Q', "SELECT id FROM usage_records\x00");
     try awaitQueued(server);
