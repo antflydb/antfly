@@ -548,9 +548,25 @@ pub const ActiveMemTable = struct {
         var ordered: ActiveMemTable = .{};
         errdefer ordered.deinit(allocator);
         for (self.entries.items) |entry| {
-            var retained = try cloneEntry(allocator, entry);
-            errdefer retained.deinit(allocator);
-            try ordered.upsertMove(allocator, retained);
+            // Reserve nodes before borrowing shared bytes. Do not attach an
+            // account to a source entry until every fallible edit has finished.
+            try ordered.ordered.prepare(allocator);
+            var retained = if (entry.shared) |owner|
+                if (owner.account == null) entry.retainShared() else try initSharedEntry(allocator, namespaceOf(entry), entry.key, entry.value, entry.tombstone)
+            else
+                try initSharedEntry(allocator, namespaceOf(entry), entry.key, entry.value, entry.tombstone);
+            ordered.ordered.putPrepared(allocator, retained);
+            retained.deinit(allocator);
+        }
+        if (ordered.ordered.root) |root| {
+            var cursor: OrderedIndex.Cursor = .{};
+            for (0..root.count) |i| {
+                const owner = cursor.at(root, i).shared.?;
+                std.debug.assert(owner.account == null);
+                owner.account = ordered.ordered.account.?;
+                owner.account.?.charge(owner.allocation_len);
+            }
+            ordered.logical_bytes = root.bytes - root.count * (@sizeOf(OrderedIndex.Node) + @sizeOf(SharedEntry)) + root.count * @sizeOf(OwnedEntry);
         }
         std.mem.swap(ActiveMemTable, self, &ordered);
         ordered.deinit(allocator);
@@ -1696,6 +1712,7 @@ test "writer overlay promotion preserves flat state on every allocation failure"
             try live.upsert(a, .{ .name = "docs" }, "a", "", true);
             live.enableOrdered(a) catch |err| {
                 try std.testing.expect(!live.ordered_enabled);
+                for (live.entries.items) |entry| try std.testing.expect(entry.shared.?.account == null);
                 try std.testing.expectEqual(@as(usize, 3), live.entryCount());
                 try std.testing.expectEqualStrings("old", try live.get(.{ .name = "docs" }, "b"));
                 return err;
@@ -1709,4 +1726,44 @@ test "writer overlay promotion preserves flat state on every allocation failure"
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
+test "writer overlay promotion retries preserve shared payloads and accounts" {
+    const Budget = @import("../lite/test_allocator.zig").BudgetAllocator;
+    var failures: usize = 0;
+    for (0..128) |offset| {
+        var budget = Budget{ .backing = std.testing.allocator };
+        var fail = std.testing.FailingAllocator.init(budget.allocator(), .{ .fail_index = std.math.maxInt(usize) });
+        const a = fail.allocator();
+        var live: ActiveMemTable = .{ .ordered_enabled = false };
+        defer live.deinit(a);
+        var original: [8][*]u8 = undefined;
+        const value: [4096]u8 = @splat('x');
+        for (0..8) |i| {
+            const key: [1]u8 = .{@intCast(i)};
+            try live.upsert(a, .{}, &key, &value, false);
+            original[i] = live.entryAt(i).value.ptr;
+            try std.testing.expect(live.entryAt(i).shared.?.account == null);
+        }
+        fail.fail_index = fail.alloc_index + offset;
+        live.enableOrdered(a) catch |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            var changed: usize = 0;
+            for (0..8) |i| {
+                try std.testing.expect(original[i] == live.entryAt(i).value.ptr);
+                if (live.entryAt(i).shared.?.account != null) changed += 1;
+            }
+            try std.testing.expectEqual(@as(usize, 0), changed);
+            failures += 1;
+            fail.fail_index = std.math.maxInt(usize);
+            try live.enableOrdered(a);
+            var copied: usize = 0;
+            for (0..8) |i| if (original[i] != live.entryAt(i).value.ptr) {
+                copied += 1;
+            };
+            try std.testing.expectEqual(@as(usize, 0), copied);
+        };
+        for (0..8) |i| try std.testing.expect(original[i] == live.entryAt(i).value.ptr);
+    }
+    try std.testing.expect(failures > 0);
 }

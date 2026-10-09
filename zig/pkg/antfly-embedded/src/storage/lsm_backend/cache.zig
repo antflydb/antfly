@@ -507,12 +507,15 @@ pub const Cache = struct {
                 continue;
             }
 
+            // Own the key before publishing a map slot. An OOM must not
+            // leave an uninitialized pending entry for waiters or cleanup.
+            const owned_key = try copyKey(self.allocator, key);
+            errdefer self.allocator.free(owned_key.path);
             const gop = try shard.pending_loads.getOrPutContextAdapted(self.allocator, key, KeyContext{}, KeyContext{});
-            if (!gop.found_existing) {
-                gop.key_ptr.* = try copyKey(self.allocator, key);
-                gop.value_ptr.* = .{};
-                return;
-            }
+            std.debug.assert(!gop.found_existing);
+            gop.key_ptr.* = owned_key;
+            gop.value_ptr.* = .{};
+            return;
         }
     }
 
@@ -1667,4 +1670,20 @@ test "cache invalidates ownership move prefix without reviving pinned generation
     try std.testing.expectEqual(@as(usize, 2), cache.entryCount());
     old_handle.release();
     try std.testing.expectEqual(@as(usize, 1), cache.entryCount());
+}
+
+test "cache pending load allocation failure leaves no published entry" {
+    const Fixture = struct {
+        fn run(a: Allocator) !void {
+            var cache = try Cache.initFallible(a, 1024);
+            defer cache.deinit();
+            cache.beginLoad("run-1", 1, 1, .run_table_index) catch |err| {
+                try std.testing.expectEqual(@as(usize, 0), cache.pendingLoadCountForTests());
+                return err;
+            };
+            cache.finishLoad("run-1", 1, 1, .run_table_index);
+            try std.testing.expectEqual(@as(usize, 0), cache.pendingLoadCountForTests());
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
 }

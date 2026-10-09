@@ -111,9 +111,33 @@
       "after_heap_allocations": 0,
       "after_bytes_per_slot": 88,
       "scope": "Candidate state only; fixed in-flight slots replace per-key state, resolution flags, and materialized key/run pairs. Payload IO and cache handles retain their existing costs."
+    },
+    "directory_all_mutable_overlapping_runs": {
+      "keys": 128,
+      "overlapping_runs": 256,
+      "before_planning_mutable_membership_checks": 32768,
+      "after_planning_mutable_membership_checks": 128,
+      "measurement": "Before: isolated review fixture. After: once-per-key classification; run traversal excludes resolved keys."
+    },
+    "async_same_physical_block": {
+      "keys": 16,
+      "physical_blocks": 1,
+      "before_physical_loads": 16,
+      "after_physical_loads": 1,
+      "shared_decode_per_block_cap_bytes": 65536,
+      "shared_decode_total_cap_bytes": 262144
+    },
+    "overlay_promotion_retry": {
+      "entries": 8,
+      "value_bytes": 4096,
+      "before_failure_assigned_accounts": 1,
+      "before_retry_copied_value_bytes": 4096,
+      "after_failure_assigned_accounts": 0,
+      "after_retry_copied_value_bytes": 0
     }
   },
   "scope": "Deterministic allocation, directory traversal, admission, and isolated Debug timing fixtures, not query throughput or a 2 GiB soak. Caller-owned mutable values, captured read-layout pointer arrays, payload IO/cache ownership, and first-use overlay promotion still have costs. Directory planning and index metadata reuse bounded resource-charged arenas; async candidate metadata has fixed stack storage.",
   "followup_comparison_commit": "cc48e4652c375181f3cfc2d7a540a75cf38848c5",
-  "remaining_wins_comparison_commit": "6c2674dce1c6a498d047a1231cf7f847ae173c1a"
+  "remaining_wins_comparison_commit": "6c2674dce1c6a498d047a1231cf7f847ae173c1a",
+  "review_followup_comparison_commit": "4eb332cedfd147c13ed4088e1404fa6c5b1ac576"
 }
