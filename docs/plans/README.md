@@ -15,6 +15,7 @@ linking back to the current documentation. See [placement rules](../README.md#pl
 ## Proposed work
 
 - [Lake ingestion, change capture, and publication](lake-ingestion-and-publication.md)
+- [Composed query sources and recent/archive visibility](composed-query-sources.md)
 - [Agentic warehouse memory](agentic-warehouse-memory.md)
 - [Operator standalone mode](operator-standalone-mode.md)
 - [Pipelined query API](pipelined-query-api.md)

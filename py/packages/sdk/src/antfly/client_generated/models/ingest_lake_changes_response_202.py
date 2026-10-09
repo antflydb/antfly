@@ -17,11 +17,15 @@ class IngestLakeChangesResponse202:
     Attributes:
         state (str | Unset):
         wal_lsn (int | Unset):
+        table_id (int | Unset):
+        object_generation (int | Unset):
         searchable (bool | Unset):
     """
 
     state: str | Unset = UNSET
     wal_lsn: int | Unset = UNSET
+    table_id: int | Unset = UNSET
+    object_generation: int | Unset = UNSET
     searchable: bool | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
@@ -29,6 +33,10 @@ class IngestLakeChangesResponse202:
         state = self.state
 
         wal_lsn = self.wal_lsn
+
+        table_id = self.table_id
+
+        object_generation = self.object_generation
 
         searchable = self.searchable
 
@@ -39,6 +47,10 @@ class IngestLakeChangesResponse202:
             field_dict["state"] = state
         if wal_lsn is not UNSET:
             field_dict["wal_lsn"] = wal_lsn
+        if table_id is not UNSET:
+            field_dict["table_id"] = table_id
+        if object_generation is not UNSET:
+            field_dict["object_generation"] = object_generation
         if searchable is not UNSET:
             field_dict["searchable"] = searchable
 
@@ -51,11 +63,17 @@ class IngestLakeChangesResponse202:
 
         wal_lsn = d.pop("wal_lsn", UNSET)
 
+        table_id = d.pop("table_id", UNSET)
+
+        object_generation = d.pop("object_generation", UNSET)
+
         searchable = d.pop("searchable", UNSET)
 
         ingest_lake_changes_response_202 = cls(
             state=state,
             wal_lsn=wal_lsn,
+            table_id=table_id,
+            object_generation=object_generation,
             searchable=searchable,
         )
 

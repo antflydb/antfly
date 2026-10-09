@@ -9235,6 +9235,11 @@ pub const ApiHttpServer = struct {
         defer arena.deinit();
         const alloc = if (resolver) |cache| cache.arena else arena.allocator();
         const table = (try self.queryTableDefinition(alloc, resolver, table_name, .{ .deadline_ns = query_req.execution_deadline_ns, .cancellation = query_req.cancellation orelse .none })) orelse return;
+        if (query_req.lake_read != null) {
+            var binding = (try @import("antfly_local_sources").serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc(self.alloc, table.schema_json)) orelse return error.UnsupportedQueryRequest;
+            defer binding.deinit(self.alloc);
+            if (binding.binding.write_policy != .iceberg_writer) return error.UnsupportedQueryRequest;
+        }
         try tables_api.routeQueryRequestToActiveReadIndex(self.alloc, &table, query_req);
         query_req.prepared_read_table_id = table.table_id;
     }
@@ -14032,7 +14037,11 @@ pub const ApiHttpServer = struct {
         var local_catalog = CatalogQueryResolver{ .arena = catalog_arena.allocator() };
         const resolver = catalog_resolver orelse &local_catalog;
 
-        const retry_timeout_ns: u64 = if (self.table_writes != null) 5 * std.time.ns_per_s else 0;
+        const ReadInput = struct { lake_read: ?struct { wait_ms: u32 = 5000 } = null };
+        var read_input = std.json.parseFromSlice(ReadInput, alloc, body, .{ .ignore_unknown_fields = true }) catch return error.InvalidQueryRequest;
+        defer read_input.deinit();
+        if (read_input.value.lake_read) |read| if (read.wait_ms > 60000) return error.InvalidQueryRequest;
+        const retry_timeout_ns: u64 = if (read_input.value.lake_read) |read| @as(u64, read.wait_ms) * std.time.ns_per_ms else if (self.table_writes != null) 5 * std.time.ns_per_s else 0;
         const retry_poll_ns = 50 * std.time.ns_per_ms;
         const retry_io = self.sharedApiIo();
         const start_ns = retryMonotonicNs(retry_io);
@@ -14054,6 +14063,7 @@ pub const ApiHttpServer = struct {
                 bound_join,
                 resolver,
             ) catch |err| switch (err) {
+                error.IndexRebuilding,
                 error.DocIdentityNamespaceMismatch,
                 error.IdentityReadGenerationChanged,
                 error.StorageReadTemporarilyUnavailable,
@@ -14821,6 +14831,7 @@ pub const ApiHttpServer = struct {
     }
 
     fn validateSupportedForeignPublicQueryRequest(request: anytype) !void {
+        if (request.lake_read != null) return error.UnsupportedQueryRequest;
         if (request.full_text_search != null) return error.UnsupportedQueryRequest;
         if (request.full_text_index != null) return error.UnsupportedQueryRequest;
         if (request.semantic_search != null) return error.UnsupportedQueryRequest;
@@ -16270,6 +16281,12 @@ pub const ApiHttpServer = struct {
                 // transactions remain. The next pass resolves fresh authority
                 // before building indexes for the newly committed snapshot.
                 ingested = try @import("../serverless/lake_ingestion.zig").drain(std.heap.smp_allocator, source_binding.binding, ingest_options, context);
+                // Maintenance failures never block draining or publication.
+                const maintained = @import("lake_maintenance_scheduler.zig").run(std.heap.smp_allocator, self, table, source_binding.binding, ingest_options, context) catch |err| failed: {
+                    std.log.warn("native lake maintenance deferred table={s} err={s}", .{ table.name, @errorName(err) });
+                    break :failed false;
+                };
+                ingested = ingested or maintained;
             }
         }
         const has_rows = if (schema.relational_indexes) |indexes| indexes.value.len != 0 else false;
@@ -21571,6 +21588,78 @@ pub const ApiHttpServer = struct {
         authenticated_identity: ?AuthenticatedIdentity,
         cancellation: ?*const http_common.RequestCancellation,
     ) !contextual_operations.OwnedResponse {
+        const composed = @import("composed_query.zig");
+        if (composed.hasSource(self.alloc, body) catch false) {
+            const source_root = try std.json.parseFromSlice(std.json.Value, self.alloc, body, .{});
+            defer source_root.deinit();
+            const source_value = source_root.value.object.get("source").?;
+            const overlay = source_value == .object and source_value.object.contains("overlay");
+            const deadline = query_contract.queryExecutionDeadlineNsFromBody(self.alloc, body) catch return self.publicQueryOperationErrorResponse("", body, error.InvalidQueryRequest);
+            const Runner = struct {
+                server: *ApiHttpServer,
+                overlay: bool,
+                deadline: ?u64,
+                identity: ?AuthenticatedIdentity,
+                cancellation: ?*const http_common.RequestCancellation,
+                fn checkpoint(raw: *anyopaque) !void {
+                    const runner: *@This() = @ptrCast(@alignCast(raw));
+                    if (runner.cancellation) |cancel| if (cancel.isCancelled()) return error.Cancelled;
+                    try ensureRequestDeadline(runner.deadline);
+                }
+                fn execute(raw: *anyopaque, a: std.mem.Allocator, name: []const u8, query: []const u8) !contextual_operations.OwnedResponse {
+                    const runner: *@This() = @ptrCast(@alignCast(raw));
+                    if (!admittedTablePermissionAllowed(runner.identity, name, .read)) return contextual_operations.jsonErrorAlloc(a, 403, "forbidden");
+                    var arena = std.heap.ArenaAllocator.init(a);
+                    defer arena.deinit();
+                    const scratch = arena.allocator();
+                    const leaf_query = if (runner.deadline) |leaf_deadline| blk: {
+                        try checkpoint(raw);
+                        const remaining_ms = (leaf_deadline -| @import("antfly_platform").time.monotonicNs()) / std.time.ns_per_ms;
+                        var request = try std.json.parseFromSliceLeaky(std.json.Value, scratch, query, .{});
+                        try request.object.put(scratch, "timeout_ms", .{ .integer = @intCast(remaining_ms) });
+                        break :blk try std.json.Stringify.valueAlloc(scratch, request, .{});
+                    } else query;
+                    var identity = try cloneCatalogIdentity(a, runner.identity);
+                    defer if (identity) |*owned| owned.deinit(a);
+                    var resolver = CatalogQueryResolver{ .arena = scratch };
+                    const context: @import("antfly_local_sources").api_operation.RequestContext = .{ .deadline_ns = runner.deadline, .cancellation = if (runner.cancellation) |cancel| cancel.token() else .none };
+                    var binding = runner.server.bindCatalogQuery(a, context, name, leaf_query, &identity, &resolver) catch |err| return runner.server.publicQueryOperationErrorResponse(name, leaf_query, err);
+                    defer binding.deinit();
+                    var before = (try runner.server.source.linearizableSnapshot(context)) orelse return error.UnsupportedQueryRequest;
+                    defer runner.server.source.freeAdminSnapshot(&before);
+                    const bound = tables_api.findTableByName(&before, binding.physical) orelse return error.CatalogGenerationChanged;
+                    if (runner.overlay) if (try resolveEffectiveRowFilterJson(a, identity, binding.physical)) |filter| {
+                        a.free(filter);
+                        return error.UnsupportedQueryRequest;
+                    };
+                    var response = try runner.server.handleAdmittedResolvedTableQueryWithContentTypeCancellation(binding.physical, leaf_query, null, identity, runner.cancellation, binding.label, if (binding.join) |*value| value else null, &resolver, binding.dispatch);
+                    if (response.status != 200) return response;
+                    errdefer response.deinit(runner.server.alloc);
+                    var after = (try runner.server.source.linearizableSnapshot(context)) orelse return error.UnsupportedQueryRequest;
+                    defer runner.server.source.freeAdminSnapshot(&after);
+                    const current = tables_api.findTableByName(&after, binding.physical) orelse return error.CatalogGenerationChanged;
+                    if (bound.table_id != current.table_id or bound.object_storage_generation != current.object_storage_generation or bound.storage.engine != current.storage.engine) return error.CatalogGenerationChanged;
+                    var parsed = try std.json.parseFromSliceLeaky(std.json.Value, scratch, response.body, .{});
+                    const publication_bytes = if (bound.lake_index_catalog_json.len != 0) published: {
+                        var index_state = try @import("antfly_local_sources").metadata_lake_index_catalog.parse(scratch, bound.lake_index_catalog_json);
+                        defer index_state.deinit();
+                        break :published try std.json.Stringify.valueAlloc(scratch, index_state.value.published, .{});
+                    } else "null";
+                    const identity_json = try std.json.Stringify.valueAlloc(scratch, .{ .id = bound.table_id, .generation = bound.object_storage_generation, .schema = &localDigest(bound.schema_json), .publication = &localDigest(publication_bytes) }, .{});
+                    const value = try std.json.parseFromSliceLeaky(std.json.Value, scratch, identity_json, .{});
+                    for (parsed.object.getPtr("responses").?.array.items) |*result| try result.object.put(scratch, "_composed_identity", value);
+                    const encoded = try std.json.Stringify.valueAlloc(runner.server.alloc, parsed, .{});
+                    runner.server.alloc.free(response.body);
+                    response.body = encoded;
+                    return response;
+                }
+                fn localDigest(bytes: []const u8) [64]u8 {
+                    return @import("antfly_local_sources").serverless_external_source_mod.lake_catalog.types.digestHex(bytes);
+                }
+            };
+            var runner: Runner = .{ .server = self, .identity = authenticated_identity, .cancellation = cancellation, .overlay = overlay, .deadline = deadline };
+            return composed.execute(self.alloc, body, .{ .ptr = &runner, .execute = Runner.execute, .checkpoint = Runner.checkpoint }) catch |err| return self.publicQueryOperationErrorResponse("", body, err);
+        }
         return try self.handlePublicTableMultiQueryWithCancellation(null, body, authenticated_identity, cancellation, null, null);
     }
 

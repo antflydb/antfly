@@ -16,6 +16,7 @@
 """Run with ANTFLY_NATIVE_BINARY=/absolute/path/to/antfly for wire qualification."""
 
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -328,8 +329,14 @@ def test_native_catalog_file_commit_read_and_restart(tmp_path, mode, native_rows
             {"Content-Type": "application/json"},
             method=method,
         )
-        with urlopen(request, timeout=30) as response:
-            return json.load(response)
+        try:
+            with urlopen(request, timeout=30) as response:
+                return json.load(response)
+        except HTTPError as error:
+            payload = error.read()
+            error.read = io.BytesIO(payload).read
+            error.add_note(payload.decode("utf-8", errors="replace"))
+            raise
 
     def start():
         nonlocal process
@@ -391,7 +398,13 @@ def test_native_catalog_file_commit_read_and_restart(tmp_path, mode, native_rows
                             "schema": {
                                 "type": "object",
                                 "properties": {
-                                    "amount": {"type": "integer"},
+                                    "amount": {
+                                        "type": "integer",
+                                        "x-antfly-field": {
+                                            "type": "numeric",
+                                            "sortable": True,
+                                        },
+                                    },
                                     "body": {"type": "string"},
                                 },
                                 "additionalProperties": False,
@@ -408,9 +421,7 @@ def test_native_catalog_file_commit_read_and_restart(tmp_path, mode, native_rows
                         "catalog": catalog_config,
                     },
                 },
-                "indexes": {"body_text": {"type": "full_text", "field": "body"}}
-                if native_rows
-                else {},
+                "indexes": {"body_text": {"type": "full_text"}} if native_rows else {},
             },
         )
         catalog = NativeCatalog(state, warehouse, endpoint, "hn")
@@ -506,6 +517,131 @@ def test_native_catalog_file_commit_read_and_restart(tmp_path, mode, native_rows
                 if time.monotonic() >= deadline:
                     pytest.fail(json.dumps(found))
                 time.sleep(0.1)
+            if mode == "managed":
+                current_uri = warehouse + "/current"
+                call(
+                    "POST",
+                    "/tables/hn_current",
+                    {
+                        "schema": {
+                            "storage_mode": "relational",
+                            "default_type": "row",
+                            "relational_indexes": [
+                                {"name": "amount_idx", "keys": [{"column": "amount"}]}
+                            ],
+                            "document_schemas": {
+                                "row": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "amount": {
+                                                "type": "integer",
+                                                "x-antfly-field": {
+                                                    "type": "numeric",
+                                                    "sortable": True,
+                                                },
+                                            },
+                                            "body": {"type": "string"},
+                                            "deleted": {"type": "boolean"},
+                                        },
+                                        "additionalProperties": False,
+                                    }
+                                }
+                            },
+                            "base_source": {
+                                "kind": "external",
+                                "format": "iceberg",
+                                "uri": current_uri,
+                                "credentials": {"ref": "objects", "scope": "hn"},
+                                "table_id": "hn_current",
+                                "write_policy": "iceberg_writer",
+                                "catalog": {"type": "managed"},
+                            },
+                        },
+                        "indexes": {"body_text": {"type": "full_text"}},
+                    },
+                )
+                current_state = State(tmp_path / "current.aflite")
+                try:
+                    current_catalog = NativeCatalog(
+                        current_state, current_uri, endpoint, "hn_current"
+                    )
+                    current_catalog._load_file_io = lambda *args, **kwargs: LocalS3IO()
+                    current_schema = pa.schema(
+                        [
+                            pa.field("amount", pa.int64()),
+                            pa.field("body", pa.string()),
+                            pa.field("deleted", pa.bool_()),
+                        ]
+                    )
+                    current_table = current_catalog.create_table(
+                        "hackernews.items",
+                        current_schema,
+                        location=current_uri,
+                        properties={"format-version": "2"},
+                    )
+                    current_table.append(
+                        pa.table(
+                            {
+                                "amount": [1, 2, 4],
+                                "body": ["nonmatching edit", "", "original recent"],
+                                "deleted": [False, True, False],
+                            },
+                            schema=current_schema,
+                        )
+                    )
+                finally:
+                    current_state.db.close()
+                deadline = time.monotonic() + 90
+                while True:
+                    try:
+                        ready = call(
+                            "POST",
+                            "/tables/hn_current/query",
+                            {"full_text_search": {"match": "recent", "field": "body"}},
+                        )
+                        if len(ready["responses"][0]["hits"]["hits"]) == 1:
+                            break
+                    except HTTPError as error:
+                        assert error.code in (409, 422, 503), error.read().decode()
+                    assert time.monotonic() < deadline
+                    time.sleep(0.1)
+                composed = {
+                    "source": {
+                        "overlay": {
+                            "base": {"table": "hn"},
+                            "changes": {"table": "hn_current"},
+                            "key": ["amount"],
+                        }
+                    },
+                    "source_ranking": "rrf",
+                    "full_text_search": {"match": "original", "field": "body"},
+                    "fields": ["amount"],
+                    "limit": 1,
+                }
+                combined = call("POST", "/query", composed)["responses"][0]
+                assert combined["hits"]["total"]["value"] == 2, combined
+                assert combined["hits"]["hits"][0]["_source"]["amount"] == 3, combined
+                second = call(
+                    "POST",
+                    "/query",
+                    dict(composed, source_cursor=combined["next_source_cursor"]),
+                )["responses"][0]
+                assert second["hits"]["hits"][0]["_source"]["amount"] == 4, second
+                ordered = call(
+                    "POST",
+                    "/query",
+                    {
+                        "source": {"union": [{"table": "hn"}, {"table": "hn_current"}]},
+                        "full_text_search": {"match": "original", "field": "body"},
+                        "order_by": [{"field": "amount"}],
+                        "fields": ["amount"],
+                        "limit": 10,
+                    },
+                )["responses"][0]
+                assert [
+                    hit["_source"]["amount"] for hit in ordered["hits"]["hits"]
+                ] == [1, 2, 3, 4], ordered
             authority.block_native_data = True
         if native_rows:
             batch = {
@@ -527,11 +663,15 @@ def test_native_catalog_file_commit_read_and_restart(tmp_path, mode, native_rows
                 ],
             }
             accepted = call("POST", "/tables/hn/lake/changes", batch)
-            assert accepted == {
+            assert {
+                key: accepted[key] for key in ("state", "wal_lsn", "searchable")
+            } == {
                 "state": "accepted",
                 "wal_lsn": 1 + wal_offset,
                 "searchable": False,
             }
+            assert accepted["table_id"] > 0
+            assert accepted["object_generation"] >= 0
             assert call("POST", "/tables/hn/lake/changes", batch) == accepted
             # A caller restart immediately after acceptance must not strand WAL.
             stop()
@@ -583,6 +723,75 @@ def test_native_catalog_file_commit_read_and_restart(tmp_path, mode, native_rows
                 assert call("POST", "/sql", {"statement": "SELECT COUNT(*) FROM hn"})[
                     "rows"
                 ] == [["3"]]
+                assert call(
+                    "POST",
+                    "/sql",
+                    {
+                        "statement": "SELECT amount FROM hn ORDER BY amount",
+                        "lake_visibility": "accepted",
+                    },
+                )["rows"] == [["1"], ["3"], ["4"]]
+                assert call(
+                    "POST",
+                    "/sql",
+                    {
+                        "statement": "SELECT COUNT(*) FROM hn WHERE amount = 2",
+                        "lake_visibility": "accepted",
+                    },
+                )["rows"] == [["0"]]
+                assert call(
+                    "POST",
+                    "/sql",
+                    {
+                        "statement": "SELECT a.amount FROM hn a JOIN hn b ON a.amount=b.amount ORDER BY a.amount",
+                        "lake_visibility": "accepted",
+                    },
+                )["rows"] == [["1"], ["3"], ["4"]]
+                published = call(
+                    "POST",
+                    "/tables/hn/query",
+                    {
+                        "full_text_search": {"match": "original", "field": "body"},
+                        "fields": ["amount"],
+                        "lake_read": {"visibility": "published"},
+                    },
+                )
+                assert len(published["responses"][0]["hits"]["hits"]) == 3
+                receipt = {
+                    key: accepted[key]
+                    for key in ("table_id", "object_generation", "wal_lsn")
+                }
+                with pytest.raises(HTTPError) as lagging:
+                    call(
+                        "POST",
+                        "/tables/hn/query",
+                        {
+                            "full_text_search": {"match": "original", "field": "body"},
+                            "lake_read": {
+                                "visibility": "published",
+                                "through": receipt,
+                                "wait_ms": 0,
+                            },
+                        },
+                    )
+                assert lagging.value.code == 503, lagging.value.read().decode()
+                with pytest.raises(HTTPError) as wrong_incarnation:
+                    call(
+                        "POST",
+                        "/tables/hn/query",
+                        {
+                            "full_text_search": {"match": "comet", "field": "body"},
+                            "lake_read": {
+                                "through": dict(
+                                    receipt, table_id=receipt["table_id"] + 1
+                                ),
+                                "wait_ms": 0,
+                            },
+                        },
+                    )
+                assert wrong_incarnation.value.code == 409, (
+                    wrong_incarnation.value.read().decode()
+                )
                 authority.block_native_data = False
             deadline = time.monotonic() + 180
             while True:
@@ -781,6 +990,47 @@ def test_native_catalog_file_commit_read_and_restart(tmp_path, mode, native_rows
             assert call("POST", "/sql", {"statement": "SELECT COUNT(*) FROM hn"})[
                 "rows"
             ] == [["3"]]
+            if native_rows == "overlay" and mode == "managed":
+                # Opt-in scheduling uses durable object-store progress and
+                # resumes after a process restart without a manual job call.
+                table = catalog.load_table("hackernews.items")
+                table.transaction().set_properties(
+                    {
+                        "antfly.maintenance.policy": json.dumps(
+                            {
+                                "enabled": True,
+                                "compact": False,
+                                "wal_gc": True,
+                                "interval_ms": 60000,
+                                "max_deleted": 1,
+                            }
+                        )
+                    }
+                ).commit_transaction()
+                stop()
+                start()
+                deadline = time.monotonic() + 180
+                while True:
+                    scheduled = call("POST", maintenance, {"action": "status"})
+                    progress = scheduled.get("state")
+                    if progress and progress.get("last_result"):
+                        assert not progress.get("last_error"), scheduled
+                        assert json.loads(progress["last_result"])["complete"], (
+                            scheduled
+                        )
+                        break
+                    assert time.monotonic() < deadline, (
+                        tmp_path / "server.log"
+                    ).read_text()[-5000:]
+                    time.sleep(0.2)
+                stop()
+                start()
+                assert (
+                    call("POST", maintenance, {"action": "status"})["state"][
+                        "last_result"
+                    ]
+                    == progress["last_result"]
+                )
     finally:
         if process and process.poll() is None:
             stop()

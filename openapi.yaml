@@ -2005,6 +2005,12 @@ paths:
                   wal_lsn:
                     type: integer
                     format: uint64
+                  table_id:
+                    type: integer
+                    format: uint64
+                  object_generation:
+                    type: integer
+                    format: uint64
                   searchable:
                     type: boolean
         '400':
@@ -2049,7 +2055,6 @@ paths:
               type: object
               required:
                 - action
-                - operation_id
               properties:
                 action:
                   type: string
@@ -2057,10 +2062,12 @@ paths:
                     - compact
                     - vacuum
                     - wal_gc
+                    - status
                 operation_id:
                   type: string
                   minLength: 1
                   maxLength: 256
+                  description: Required for compact/vacuum/wal_gc; omitted for scheduler status.
                 dry_run:
                   type: boolean
                   default: true
@@ -12870,6 +12877,15 @@ components:
 
         memory, and encoded results to a 16 MiB allocation budget.
       properties:
+        lake_visibility:
+          type: string
+          enum:
+            - committed
+            - accepted
+          default: committed
+          description: Direct read-only statement visibility for writable Iceberg sources. Accepted pins
+            typed WAL changes over the committed snapshot; unavailable coverage fails closed. Not supported
+            with sessions, connections or prepared execution.
         statement:
           type: string
           minLength: 1
@@ -22037,6 +22053,44 @@ components:
               maxItems: 64
               items:
                 type: string
+    LakeReadReceipt:
+      type: object
+      additionalProperties: false
+      required:
+        - table_id
+        - object_generation
+        - wal_lsn
+      properties:
+        table_id:
+          type: integer
+          format: uint64
+        object_generation:
+          type: integer
+          format: uint64
+        wal_lsn:
+          type: integer
+          format: uint64
+    LakeReadRequirement:
+      type: object
+      additionalProperties: false
+      properties:
+        visibility:
+          type: string
+          enum:
+            - accepted
+            - published
+          description: Accepted requires current WAL visibility; vector/hybrid reads wait for matching
+            publication. Published explicitly permits the retained archive generation. Applies to native
+            writable Iceberg reads.
+        through:
+          $ref: '#/components/schemas/LakeReadReceipt'
+        wait_ms:
+          type: integer
+          format: uint32
+          minimum: 0
+          maximum: 60000
+          description: Bounded readiness wait, default 5000 ms when lake_read is supplied; also bounded
+            by query timeout and cancellation.
     QueryRequest:
       type: object
       not:
@@ -22206,6 +22260,8 @@ components:
                   - required:
                       - remote_snapshot
       properties:
+        lake_read:
+          $ref: '#/components/schemas/LakeReadRequirement'
         remote_snapshot:
           type: string
           description: Opaque remote index snapshot token returned by a previous query. Required when
@@ -23068,8 +23124,59 @@ components:
                 - union: Include nodes from both search and graph results
 
                 - intersection: Only include nodes appearing in both
+    ComposedTableSource:
+      type: object
+      additionalProperties: false
+      required:
+        - table
+      properties:
+        table:
+          type: string
+          minLength: 1
+          description: Literal native table name. Each source is independently authorized.
+    ComposedSourceOverlay:
+      type: object
+      additionalProperties: false
+      required:
+        - base
+        - changes
+        - key
+      properties:
+        base:
+          $ref: '#/components/schemas/ComposedTableSource'
+        changes:
+          $ref: '#/components/schemas/ComposedTableSource'
+        key:
+          type: array
+          minItems: 1
+          maxItems: 8
+          items:
+            type: string
+            minLength: 1
+        tombstone_field:
+          type: string
+          default: deleted
+          description: Boolean field on change rows; true hides the base row. Changes must retain one
+            latest row/tombstone per stable key. Row-policy identities are currently unsupported for keyed
+            composition.
+    ComposedQuerySource:
+      type: object
+      additionalProperties: false
+      properties:
+        union:
+          type: array
+          minItems: 2
+          maxItems: 16
+          items:
+            $ref: '#/components/schemas/ComposedTableSource'
+        overlay:
+          $ref: '#/components/schemas/ComposedSourceOverlay'
+      description: Specify exactly one of union or overlay. Union preserves duplicates and table provenance;
+        overlay suppresses base keys using unfiltered change lookups before global ordering. Disjoint
+        RRF unions support the first 4096 global positions over exact leaf totals. Overlays and field
+        ordering require complete matching sets of at most 4096 per input; larger sets fail without truncation.
     GlobalStatefulQueryRequest:
-      description: A stateful global query. The target table is required on this route.
+      description: A stateful global query. Specify a table target or a composed source.
       allOf:
         - $ref: '#/components/schemas/StatefulQueryRequest'
         - type: object
@@ -23077,9 +23184,20 @@ components:
             table:
               type: string
               minLength: 1
-              description: Name of the table to query.
-          required:
-            - table
+              description: Name of the table to query; mutually exclusive with source.
+            source:
+              $ref: '#/components/schemas/ComposedQuerySource'
+            source_ranking:
+              type: string
+              enum:
+                - rrf
+              description: Explicit reciprocal rank scoring across source lists after visibility resolution.
+                Required for score ordering; shared corpus BM25 is not implemented. Constant 60, equal
+                source weights.
+            source_cursor:
+              type: string
+              description: Opaque composed result continuation. Expires when source identity or the observed
+                ordered matching result changes. Leaf search_after/search_before tuples are unsupported.
     Analyses:
       x-go-type-skip-optional-pointer: false
       type: object
@@ -23962,6 +24080,10 @@ components:
         - _id
         - _score
       properties:
+        _table:
+          type: string
+          description: Source table provenance for composed query hits; equal IDs from union inputs remain
+            distinct.
         _computed:
           type: object
           additionalProperties: true
@@ -24194,6 +24316,16 @@ components:
         - took
         - status
       properties:
+        source_ranking:
+          type: string
+          enum:
+            - rrf
+            - ordered
+          description: Ranking contract for a composed result.
+        next_source_cursor:
+          type: string
+          description: Opaque continuation for composed queries. Pass as source_cursor; expires if the
+            observed result or source identity changes.
         remote_snapshot:
           type: string
           description: Opaque remote publication and schema fence to echo with ordered pagination. This

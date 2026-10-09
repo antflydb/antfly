@@ -5,6 +5,8 @@ Antfly supports two explicit catalog authorities for an external Iceberg table:
 with commits through an existing Iceberg REST service. Both use the same native
 lake reader, index builder and table authorization. The ingestion and publication
 roadmap is in [lake-ingestion-and-publication](../plans/lake-ingestion-and-publication.md).
+The proposed query and operations extensions are in
+[Composed query sources and recent/archive visibility](../plans/composed-query-sources.md).
 
 ## Choosing an authority
 

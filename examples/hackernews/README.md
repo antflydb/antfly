@@ -364,9 +364,10 @@ Native mode does not write `version-hint.text`; the selected native catalog is
 the sole authority. Backup and restore compare its immutable metadata location
 and table UUID, and reject a checkpoint after the archive advances.
 
-Catalog commit success does not itself publish searchable text/metadata indexes.
-The native WAL-to-Parquet writer and general CDC adapters remain subsequent
-parts of the ingestion design.
+Catalog commitment and searchable text/predicate publication are separate
+recoverable steps. Native commits wake the supervised publication worker. The
+`--native-rows` mode below additionally uses Antfly's WAL-to-Parquet writer;
+additional vendor-specific CDC adapters remain extensions of the ingestion design.
 
 Native catalog wire qualification (local S3 protocol fixture and independent
 PyIceberg REST authority, with real manifests/Parquet and daemon restarts):
@@ -395,11 +396,17 @@ search visibility; use catalog coverage and index readiness to observe progress.
 
 ## Native recent search and maintenance
 
+Each worker targets one logical table. Separate current/history workers can use
+the fixed creation-time cohorts described below; rolling cutoff migration is
+not automatic. The recent overlay below is bounded pending publication work.
+JSON source composition, SQL/vector visibility and automated maintenance are described in
+[Composed query sources and recent/archive visibility](../../docs/plans/composed-query-sources.md).
+
 `--native-rows` sends complete transactions to Antfly's durable lake WAL. Once a
 baseline text/predicate index is published, native text search also includes the
 accepted WAL suffix while Parquet/catalog/index publication catches up. Stable
 keys hide replaced/deleted archive rows before ranking. The overlay survives
-restart; SQL continues to read the committed Iceberg snapshot. Search cursors
+restart; direct SQL SELECT can opt into accepted WAL visibility. Search cursors
 expire explicitly if their archive/WAL cut changes.
 
 Use the table admin maintenance endpoint for bounded jobs. Dry runs are the
@@ -429,3 +436,64 @@ The example bucket's eight-day lifecycle is independent of those pins, so it is
 unsuitable for durable deployment. See the
 [design's maintenance contracts](../../docs/plans/lake-ingestion-and-publication.md#compaction-and-garbage-collection)
 for bounds, snapshot retention and restart recovery.
+
+
+## Composed current and historical search
+
+The global query endpoint can combine two existing tables in one result set:
+
+```sh
+curl -fsS -X POST "$ANTFLY_URL/query" -H 'Content-Type: application/json' -d '{
+  "source":{"union":[{"table":"hackernews_current"},{"table":"hackernews_history"}]},
+  "source_ranking":"rrf",
+  "full_text_search":{"match":"distributed databases","field":"body"},
+  "limit":20
+}'
+```
+
+Union preserves both copies of overlapping records and includes `_table` provenance.
+Use disjoint creation-time cohorts, routing edits and deletes to the owning table,
+or explicitly configure `source.overlay` with retained latest rows/tombstones in
+the changes table. Run separate ingestion workers with separate state directories and immutable
+`--created-before CUTOVER_EPOCH` (history) / `--created-after CUTOVER_EPOCH` (current)
+boundaries, together with `--native-rows`, separate `--native-table` values and
+separate warehouse roots. `configure_catalog.py --table-id` gives each source its
+own identity. Both workers retain normalized source rows so partial moderation
+responses preserve original creation time. Missing creation time fails until
+reconciled. Cohort changes on a used state directory are rejected; the worker
+does not provision a rolling date boundary or migrate rows automatically.
+The HTTP fixtures exercise an independent historical/current pair and keyed
+precedence, including a newer nonmatching edit and a retained deleted record.
+
+RRF uses independent source ranks, not shared BM25 statistics. Disjoint RRF union
+supports the first 4096 global result positions with exact leaf totals. Keyed
+overlays and field ordering currently require complete matching sets of at most
+4096 rows per table. `next_source_cursor` is supplied as `source_cursor` for the
+next page and expires when its observed candidate cut changes. Read the
+[composition design and limits](../../docs/plans/composed-query-sources.md#implemented-contracts)
+before exposing all-time search over a full archive.
+
+Direct HTTP SQL SELECT can use `"lake_visibility":"accepted"` to include the
+bounded durable WAL suffix after restart; committed visibility remains the default.
+Search can use `"lake_read":{"visibility":"published"}` to explicitly select a
+published archive, or add a `through` receipt from `/lake/changes` and `wait_ms`
+to require minimum coverage. Accepted vector queries currently wait for matching
+archive publication; recent vector/enrichment segments remain future work.
+
+Set the Iceberg string property `antfly.maintenance.policy` to a JSON policy such
+as `{"enabled":true,"compact":true,"wal_gc":true,"vacuum":false}` to enable
+bounded supervised maintenance. Query durable policy/progress with:
+
+```sh
+curl -fsS -X POST "$ANTFLY_URL/tables/hackernews/lake/maintenance" \
+  -H 'Content-Type: application/json' -d '{"action":"status"}'
+```
+
+Scheduling resumes saved operation requests after restart. It retains the existing
+job limits and ownership/reader protections; automatic REST-catalog vacuum remains
+disabled because external metadata writers need a separate retirement protocol.
+
+The generated full-text index consumes the row schema so its declared sortable
+columns have native doc values. Searching with `field: "body"` still restricts
+text matching to that field. A field-specific text index consumes only that field
+and cannot sort by an unrelated column merely because a predicate index exists.

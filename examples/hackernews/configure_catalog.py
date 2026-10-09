@@ -14,6 +14,7 @@ def main():
         "--warehouse", required=True, help="Dedicated s3:// or gs:// table root"
     )
     parser.add_argument("--source-connection", required=True)
+    parser.add_argument("--table-id", default="hackernews")
     parser.add_argument("--mode", choices=("managed", "rest"), required=True)
     parser.add_argument("--rest-connection")
     parser.add_argument("--rest-uri")
@@ -41,6 +42,8 @@ def main():
         field.name: {"type": "integer" if pa.types.is_integer(field.type) else "string"}
         for field in arrow_schema()
     }
+    for column in ("hn_id", "created_at", "points"):
+        properties[column]["x-antfly-field"] = {"type": "numeric", "sortable": True}
     print(
         json.dumps(
             {
@@ -70,7 +73,7 @@ def main():
                     "base_source": {
                         "kind": "external",
                         "format": "iceberg",
-                        "table_id": "hackernews",
+                        "table_id": args.table_id,
                         "uri": args.warehouse,
                         "credentials": {"ref": args.source_connection},
                         "schema_fingerprint": "auto",
@@ -78,7 +81,7 @@ def main():
                         "catalog": catalog,
                     },
                 },
-                "indexes": {"body_text": {"type": "full_text", "field": "body"}},
+                "indexes": {"body_text": {"type": "full_text"}},
             },
             indent=2,
         )

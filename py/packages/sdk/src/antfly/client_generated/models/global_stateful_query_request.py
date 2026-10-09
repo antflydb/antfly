@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any, TypeVar, cast
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
+from ..models.global_stateful_query_request_source_ranking import GlobalStatefulQueryRequestSourceRanking
 from ..models.stateful_query_request_expand_strategy import StatefulQueryRequestExpandStrategy
 from ..types import UNSET, Unset
 
@@ -14,6 +15,7 @@ if TYPE_CHECKING:
     from ..models.bool_field_query import BoolFieldQuery
     from ..models.boolean_query import BooleanQuery
     from ..models.catalog_table_target import CatalogTableTarget
+    from ..models.composed_query_source import ComposedQuerySource
     from ..models.conjunction_query import ConjunctionQuery
     from ..models.date_range_string_query import DateRangeStringQuery
     from ..models.disjunction_query import DisjunctionQuery
@@ -28,6 +30,7 @@ if TYPE_CHECKING:
     from ..models.graph_queries import GraphQueries
     from ..models.ip_range_query import IPRangeQuery
     from ..models.join_clause import JoinClause
+    from ..models.lake_read_requirement import LakeReadRequirement
     from ..models.match_all_query import MatchAllQuery
     from ..models.match_none_query import MatchNoneQuery
     from ..models.match_phrase_query import MatchPhraseQuery
@@ -61,10 +64,10 @@ T = TypeVar("T", bound="GlobalStatefulQueryRequest")
 
 @_attrs_define
 class GlobalStatefulQueryRequest:
-    """A stateful global query. The target table is required on this route.
+    """A stateful global query. Specify a table target or a composed source.
 
     Attributes:
-        table (str): Name of the table to query. Example: wikipedia.
+        lake_read (LakeReadRequirement | Unset):
         remote_snapshot (str | Unset): Opaque remote index snapshot token returned by a previous query. Required when
             replaying search_after or search_before against an external table; a changed publication returns 409.
         evaluate (QueryEvaluation | Unset): Evaluate expressions after global retrieval merging, before final
@@ -74,6 +77,7 @@ class GlobalStatefulQueryRequest:
             be combined with evaluation. NULL inputs skip inference; errors fail.
         table_target (CatalogTableTarget | Unset): An explicit native table target. Components are literal names; dots
             do not qualify a string table name.
+        table (str | Unset): Name of the table to query; mutually exclusive with source. Example: wikipedia.
         query (QueryRequestQuery | Unset): Canonical public query AST. Prefer this field for new clients.
 
             Boolean clauses are normalized before planning:
@@ -384,12 +388,22 @@ class GlobalStatefulQueryRequest:
             Strategy for merging legacy graph results with search results:
             - union: Include nodes from both search and graph results
             - intersection: Only include nodes appearing in both
+        source (ComposedQuerySource | Unset): Specify exactly one of union or overlay. Union preserves duplicates and
+            table provenance; overlay suppresses base keys using unfiltered change lookups before global ordering. Disjoint
+            RRF unions support the first 4096 global positions over exact leaf totals. Overlays and field ordering require
+            complete matching sets of at most 4096 per input; larger sets fail without truncation.
+        source_ranking (GlobalStatefulQueryRequestSourceRanking | Unset): Explicit reciprocal rank scoring across source
+            lists after visibility resolution. Required for score ordering; shared corpus BM25 is not implemented. Constant
+            60, equal source weights.
+        source_cursor (str | Unset): Opaque composed result continuation. Expires when source identity or the observed
+            ordered matching result changes. Leaf search_after/search_before tuples are unsupported.
     """
 
-    table: str
+    lake_read: LakeReadRequirement | Unset = UNSET
     remote_snapshot: str | Unset = UNSET
     evaluate: QueryEvaluation | Unset = UNSET
     table_target: CatalogTableTarget | Unset = UNSET
+    table: str | Unset = UNSET
     query: QueryRequestQuery | Unset = UNSET
     full_text_search: (
         BooleanQuery
@@ -511,6 +525,9 @@ class GlobalStatefulQueryRequest:
     foreign_sources: QueryRequestForeignSources | Unset = UNSET
     graph_searches: StatefulQueryRequestGraphSearches | Unset = UNSET
     expand_strategy: StatefulQueryRequestExpandStrategy | Unset = UNSET
+    source: ComposedQuerySource | Unset = UNSET
+    source_ranking: GlobalStatefulQueryRequestSourceRanking | Unset = UNSET
+    source_cursor: str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -540,7 +557,9 @@ class GlobalStatefulQueryRequest:
         from ..models.term_range_query import TermRangeQuery
         from ..models.wildcard_query import WildcardQuery
 
-        table = self.table
+        lake_read: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.lake_read, Unset):
+            lake_read = self.lake_read.to_dict()
 
         remote_snapshot = self.remote_snapshot
 
@@ -551,6 +570,8 @@ class GlobalStatefulQueryRequest:
         table_target: dict[str, Any] | Unset = UNSET
         if not isinstance(self.table_target, Unset):
             table_target = self.table_target.to_dict()
+
+        table = self.table
 
         query: dict[str, Any] | Unset = UNSET
         if not isinstance(self.query, Unset):
@@ -833,19 +854,29 @@ class GlobalStatefulQueryRequest:
         if not isinstance(self.expand_strategy, Unset):
             expand_strategy = self.expand_strategy.value
 
+        source: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.source, Unset):
+            source = self.source.to_dict()
+
+        source_ranking: str | Unset = UNSET
+        if not isinstance(self.source_ranking, Unset):
+            source_ranking = self.source_ranking.value
+
+        source_cursor = self.source_cursor
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update(
-            {
-                "table": table,
-            }
-        )
+        field_dict.update({})
+        if lake_read is not UNSET:
+            field_dict["lake_read"] = lake_read
         if remote_snapshot is not UNSET:
             field_dict["remote_snapshot"] = remote_snapshot
         if evaluate is not UNSET:
             field_dict["evaluate"] = evaluate
         if table_target is not UNSET:
             field_dict["table_target"] = table_target
+        if table is not UNSET:
+            field_dict["table"] = table
         if query is not UNSET:
             field_dict["query"] = query
         if full_text_search is not UNSET:
@@ -920,6 +951,12 @@ class GlobalStatefulQueryRequest:
             field_dict["graph_searches"] = graph_searches
         if expand_strategy is not UNSET:
             field_dict["expand_strategy"] = expand_strategy
+        if source is not UNSET:
+            field_dict["source"] = source
+        if source_ranking is not UNSET:
+            field_dict["source_ranking"] = source_ranking
+        if source_cursor is not UNSET:
+            field_dict["source_cursor"] = source_cursor
 
         return field_dict
 
@@ -929,6 +966,7 @@ class GlobalStatefulQueryRequest:
         from ..models.bool_field_query import BoolFieldQuery
         from ..models.boolean_query import BooleanQuery
         from ..models.catalog_table_target import CatalogTableTarget
+        from ..models.composed_query_source import ComposedQuerySource
         from ..models.conjunction_query import ConjunctionQuery
         from ..models.date_range_string_query import DateRangeStringQuery
         from ..models.disjunction_query import DisjunctionQuery
@@ -943,6 +981,7 @@ class GlobalStatefulQueryRequest:
         from ..models.graph_queries import GraphQueries
         from ..models.ip_range_query import IPRangeQuery
         from ..models.join_clause import JoinClause
+        from ..models.lake_read_requirement import LakeReadRequirement
         from ..models.match_all_query import MatchAllQuery
         from ..models.match_none_query import MatchNoneQuery
         from ..models.match_phrase_query import MatchPhraseQuery
@@ -971,7 +1010,12 @@ class GlobalStatefulQueryRequest:
         from ..models.wildcard_query import WildcardQuery
 
         d = dict(src_dict)
-        table = d.pop("table")
+        _lake_read = d.pop("lake_read", UNSET)
+        lake_read: LakeReadRequirement | Unset
+        if isinstance(_lake_read, Unset):
+            lake_read = UNSET
+        else:
+            lake_read = LakeReadRequirement.from_dict(_lake_read)
 
         remote_snapshot = d.pop("remote_snapshot", UNSET)
 
@@ -988,6 +1032,8 @@ class GlobalStatefulQueryRequest:
             table_target = UNSET
         else:
             table_target = CatalogTableTarget.from_dict(_table_target)
+
+        table = d.pop("table", UNSET)
 
         _query = d.pop("query", UNSET)
         query: QueryRequestQuery | Unset
@@ -1867,11 +1913,28 @@ class GlobalStatefulQueryRequest:
         else:
             expand_strategy = StatefulQueryRequestExpandStrategy(_expand_strategy)
 
+        _source = d.pop("source", UNSET)
+        source: ComposedQuerySource | Unset
+        if isinstance(_source, Unset):
+            source = UNSET
+        else:
+            source = ComposedQuerySource.from_dict(_source)
+
+        _source_ranking = d.pop("source_ranking", UNSET)
+        source_ranking: GlobalStatefulQueryRequestSourceRanking | Unset
+        if isinstance(_source_ranking, Unset):
+            source_ranking = UNSET
+        else:
+            source_ranking = GlobalStatefulQueryRequestSourceRanking(_source_ranking)
+
+        source_cursor = d.pop("source_cursor", UNSET)
+
         global_stateful_query_request = cls(
-            table=table,
+            lake_read=lake_read,
             remote_snapshot=remote_snapshot,
             evaluate=evaluate,
             table_target=table_target,
+            table=table,
             query=query,
             full_text_search=full_text_search,
             full_text_index=full_text_index,
@@ -1909,6 +1972,9 @@ class GlobalStatefulQueryRequest:
             foreign_sources=foreign_sources,
             graph_searches=graph_searches,
             expand_strategy=expand_strategy,
+            source=source,
+            source_ranking=source_ranking,
+            source_cursor=source_cursor,
         )
 
         global_stateful_query_request.additional_properties = d

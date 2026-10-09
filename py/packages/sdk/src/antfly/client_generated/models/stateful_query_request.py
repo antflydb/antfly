@@ -28,6 +28,7 @@ if TYPE_CHECKING:
     from ..models.graph_queries import GraphQueries
     from ..models.ip_range_query import IPRangeQuery
     from ..models.join_clause import JoinClause
+    from ..models.lake_read_requirement import LakeReadRequirement
     from ..models.match_all_query import MatchAllQuery
     from ..models.match_none_query import MatchNoneQuery
     from ..models.match_phrase_query import MatchPhraseQuery
@@ -65,6 +66,7 @@ class StatefulQueryRequest:
     the stateful public transport boundary for the v0.2 transition window.
 
         Attributes:
+            lake_read (LakeReadRequirement | Unset):
             remote_snapshot (str | Unset): Opaque remote index snapshot token returned by a previous query. Required when
                 replaying search_after or search_before against an external table; a changed publication returns 409.
             evaluate (QueryEvaluation | Unset): Evaluate expressions after global retrieval merging, before final
@@ -388,6 +390,7 @@ class StatefulQueryRequest:
                 - intersection: Only include nodes appearing in both
     """
 
+    lake_read: LakeReadRequirement | Unset = UNSET
     remote_snapshot: str | Unset = UNSET
     evaluate: QueryEvaluation | Unset = UNSET
     table_target: CatalogTableTarget | Unset = UNSET
@@ -541,6 +544,10 @@ class StatefulQueryRequest:
         from ..models.term_query import TermQuery
         from ..models.term_range_query import TermRangeQuery
         from ..models.wildcard_query import WildcardQuery
+
+        lake_read: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.lake_read, Unset):
+            lake_read = self.lake_read.to_dict()
 
         remote_snapshot = self.remote_snapshot
 
@@ -838,6 +845,8 @@ class StatefulQueryRequest:
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update({})
+        if lake_read is not UNSET:
+            field_dict["lake_read"] = lake_read
         if remote_snapshot is not UNSET:
             field_dict["remote_snapshot"] = remote_snapshot
         if evaluate is not UNSET:
@@ -943,6 +952,7 @@ class StatefulQueryRequest:
         from ..models.graph_queries import GraphQueries
         from ..models.ip_range_query import IPRangeQuery
         from ..models.join_clause import JoinClause
+        from ..models.lake_read_requirement import LakeReadRequirement
         from ..models.match_all_query import MatchAllQuery
         from ..models.match_none_query import MatchNoneQuery
         from ..models.match_phrase_query import MatchPhraseQuery
@@ -971,6 +981,13 @@ class StatefulQueryRequest:
         from ..models.wildcard_query import WildcardQuery
 
         d = dict(src_dict)
+        _lake_read = d.pop("lake_read", UNSET)
+        lake_read: LakeReadRequirement | Unset
+        if isinstance(_lake_read, Unset):
+            lake_read = UNSET
+        else:
+            lake_read = LakeReadRequirement.from_dict(_lake_read)
+
         remote_snapshot = d.pop("remote_snapshot", UNSET)
 
         _evaluate = d.pop("evaluate", UNSET)
@@ -1868,6 +1885,7 @@ class StatefulQueryRequest:
             expand_strategy = StatefulQueryRequestExpandStrategy(_expand_strategy)
 
         stateful_query_request = cls(
+            lake_read=lake_read,
             remote_snapshot=remote_snapshot,
             evaluate=evaluate,
             table_target=table_target,

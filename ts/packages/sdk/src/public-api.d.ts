@@ -4765,6 +4765,12 @@ export interface components {
          *     memory, and encoded results to a 16 MiB allocation budget.
          */
         SQLRequest: {
+            /**
+             * @description Direct read-only statement visibility for writable Iceberg sources. Accepted pins typed WAL changes over the committed snapshot; unavailable coverage fails closed. Not supported with sessions, connections or prepared execution.
+             * @default committed
+             * @enum {string}
+             */
+            lake_visibility?: "committed" | "accepted";
             /** @description A single SQL statement. */
             statement: string;
             /** @description Positional JSON parameter values, including null. */
@@ -10348,7 +10354,29 @@ export interface components {
                 [key: string]: string;
             } | string[];
         };
+        LakeReadReceipt: {
+            /** Format: uint64 */
+            table_id: number;
+            /** Format: uint64 */
+            object_generation: number;
+            /** Format: uint64 */
+            wal_lsn: number;
+        };
+        LakeReadRequirement: {
+            /**
+             * @description Accepted requires current WAL visibility; vector/hybrid reads wait for matching publication. Published explicitly permits the retained archive generation. Applies to native writable Iceberg reads.
+             * @enum {string}
+             */
+            visibility?: "accepted" | "published";
+            through?: components["schemas"]["LakeReadReceipt"];
+            /**
+             * Format: uint32
+             * @description Bounded readiness wait, default 5000 ms when lake_read is supplied; also bounded by query timeout and cancellation.
+             */
+            wait_ms?: number;
+        };
         QueryRequest: {
+            lake_read?: components["schemas"]["LakeReadRequirement"];
             /** @description Opaque remote index snapshot token returned by a previous query. Required when replaying search_after or search_before against an external table; a changed publication returns 409. */
             remote_snapshot?: string;
             evaluate?: components["schemas"]["QueryEvaluation"];
@@ -10920,10 +10948,37 @@ export interface components {
              */
             expand_strategy?: "union" | "intersection";
         };
-        /** @description A stateful global query. The target table is required on this route. */
-        GlobalStatefulQueryRequest: components["schemas"]["StatefulQueryRequest"] & {
-            /** @description Name of the table to query. */
+        ComposedTableSource: {
+            /** @description Literal native table name. Each source is independently authorized. */
             table: string;
+        };
+        ComposedSourceOverlay: {
+            base: components["schemas"]["ComposedTableSource"];
+            changes: components["schemas"]["ComposedTableSource"];
+            key: string[];
+            /**
+             * @description Boolean field on change rows; true hides the base row. Changes must retain one latest row/tombstone per stable key. Row-policy identities are currently unsupported for keyed composition.
+             * @default deleted
+             */
+            tombstone_field?: string;
+        };
+        /** @description Specify exactly one of union or overlay. Union preserves duplicates and table provenance; overlay suppresses base keys using unfiltered change lookups before global ordering. Disjoint RRF unions support the first 4096 global positions over exact leaf totals. Overlays and field ordering require complete matching sets of at most 4096 per input; larger sets fail without truncation. */
+        ComposedQuerySource: {
+            union?: components["schemas"]["ComposedTableSource"][];
+            overlay?: components["schemas"]["ComposedSourceOverlay"];
+        };
+        /** @description A stateful global query. Specify a table target or a composed source. */
+        GlobalStatefulQueryRequest: components["schemas"]["StatefulQueryRequest"] & {
+            /** @description Name of the table to query; mutually exclusive with source. */
+            table?: string;
+            source?: components["schemas"]["ComposedQuerySource"];
+            /**
+             * @description Explicit reciprocal rank scoring across source lists after visibility resolution. Required for score ordering; shared corpus BM25 is not implemented. Constant 60, equal source weights.
+             * @enum {string}
+             */
+            source_ranking?: "rrf";
+            /** @description Opaque composed result continuation. Expires when source identity or the observed ordered matching result changes. Leaf search_after/search_before tuples are unsupported. */
+            source_cursor?: string;
         };
         Analyses: {
             pca?: boolean;
@@ -11505,6 +11560,8 @@ export interface components {
         };
         /** @description A single query result hit */
         QueryHit: {
+            /** @description Source table provenance for composed query hits; equal IDs from union inputs remain distinct. */
+            _table?: string;
             /** @description Named query-time computed values, separate from stored source. */
             _computed?: {
                 [key: string]: unknown;
@@ -11642,6 +11699,13 @@ export interface components {
         };
         /** @description Fields shared by canonical and stateful query result envelopes. */
         QueryResultBase: {
+            /**
+             * @description Ranking contract for a composed result.
+             * @enum {string}
+             */
+            source_ranking?: "rrf" | "ordered";
+            /** @description Opaque continuation for composed queries. Pass as source_cursor; expires if the observed result or source identity changes. */
+            next_source_cursor?: string;
             /** @description Opaque remote publication and schema fence to echo with ordered pagination. This token does not grant access or retain the publication. */
             remote_snapshot?: string;
             /** @description Function evaluation scope, population, usage, and scoped aggregations. */
@@ -21338,6 +21402,10 @@ export interface operations {
                         state?: string;
                         /** Format: uint64 */
                         wal_lsn?: number;
+                        /** Format: uint64 */
+                        table_id?: number;
+                        /** Format: uint64 */
+                        object_generation?: number;
                         searchable?: boolean;
                     };
                 };
@@ -21399,8 +21467,9 @@ export interface operations {
             content: {
                 "application/json": {
                     /** @enum {string} */
-                    action: "compact" | "vacuum" | "wal_gc";
-                    operation_id: string;
+                    action: "compact" | "vacuum" | "wal_gc" | "status";
+                    /** @description Required for compact/vacuum/wal_gc; omitted for scheduler status. */
+                    operation_id?: string;
                     /** @default true */
                     dry_run?: boolean;
                     /** @default false */

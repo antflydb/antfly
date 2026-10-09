@@ -17,7 +17,7 @@ class MaintainLakeTableBody:
     """
     Attributes:
         action (MaintainLakeTableBodyAction):
-        operation_id (str):
+        operation_id (str | Unset): Required for compact/vacuum/wal_gc; omitted for scheduler status.
         dry_run (bool | Unset):  Default: True.
         exclusive_ownership (bool | Unset):  Default: False.
         max_rows (int | Unset):  Default: 16384.
@@ -28,7 +28,7 @@ class MaintainLakeTableBody:
     """
 
     action: MaintainLakeTableBodyAction
-    operation_id: str
+    operation_id: str | Unset = UNSET
     dry_run: bool | Unset = True
     exclusive_ownership: bool | Unset = False
     max_rows: int | Unset = 16384
@@ -62,9 +62,10 @@ class MaintainLakeTableBody:
         field_dict.update(
             {
                 "action": action,
-                "operation_id": operation_id,
             }
         )
+        if operation_id is not UNSET:
+            field_dict["operation_id"] = operation_id
         if dry_run is not UNSET:
             field_dict["dry_run"] = dry_run
         if exclusive_ownership is not UNSET:
@@ -87,7 +88,7 @@ class MaintainLakeTableBody:
         d = dict(src_dict)
         action = MaintainLakeTableBodyAction(d.pop("action"))
 
-        operation_id = d.pop("operation_id")
+        operation_id = d.pop("operation_id", UNSET)
 
         dry_run = d.pop("dry_run", UNSET)
 

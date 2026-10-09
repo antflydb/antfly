@@ -109,6 +109,7 @@ fn rejectTransactionalDdl(statement: ast.Statement) !void {
 }
 
 pub const Adapter = struct {
+    lake_visibility: enum { committed, accepted } = .committed,
     /// A transport may consume borrowed result columns within the same policy,
     /// settings and snapshot scope as ordinary execution. Mutation and active
     /// transaction paths continue to own their acknowledgement result.
@@ -175,6 +176,7 @@ pub const Adapter = struct {
     }
 
     pub fn execute(self: *Adapter, alloc: std.mem.Allocator, compiled: *const @import("antfly_local_sources").sql_compiler.Compiled, parameters: []const std.json.Value, limits: @import("antfly_local_sources").sql_runtime.Limits, guarded_backend: ?catalog.Backend) !@import("antfly_local_sources").sql_runtime.Result {
+        if (self.lake_visibility == .accepted and (compiled.statement != .select or self.session_id != null or self.connection_id != null or guarded_backend != null)) return error.UnsupportedSqlExecution;
         var zig017_return_error: ?anyerror = null;
         var decision_runtime: ?@import("antfly_local_sources").functions_runtime.Runtime = null;
         const previous_provider = self.decision_provider;
@@ -625,6 +627,7 @@ pub const Adapter = struct {
         if (binding.external_base_source != null and action != .read and action != .admin) return error.ExternalLakeReadOnly;
         if (binding.external_base_source != null) binding.external_indexes = .{
             .catalog_json = definition.lake_index_catalog_json,
+            .object_generation = definition.object_storage_generation,
             .indexes_json = definition.indexes_json,
             .schema_json = definition.schema_json,
             .desired = @import("antfly_local_sources").metadata_lake_index_catalog.desiredFingerprint(.{
@@ -874,7 +877,7 @@ pub const Adapter = struct {
     };
     fn openAggregatePartials(raw: *anyopaque, a: std.mem.Allocator, table: catalog.Table, recipe: @import("antfly_local_sources").sql_aggregate_materialization.Recipe) !?catalog.AggregatePartialCursor {
         const self: *Adapter = @ptrCast(@alignCast(raw));
-        if (table.external_base_source == null or table.external_indexes == null) return null;
+        if (self.lake_visibility == .accepted or table.external_base_source == null or table.external_indexes == null) return null;
         const local = @import("antfly_local_sources");
         const artifact_api = @import("lake_index_aggregate_artifact.zig");
         var scratch = std.heap.ArenaAllocator.init(a);
@@ -983,6 +986,8 @@ pub const Adapter = struct {
         cursors: []catalog.Cursor,
         sources: std.AutoHashMapUnmanaged(u64, *@import("antfly_local_sources").serverless_query_lake_serving.ServingSource) = .empty,
         opened: usize = 0,
+        overlays: std.AutoHashMapUnmanaged(u64, *const @import("lake_sql_overlay.zig").Cut) = .empty,
+        overlay_arena: ?std.heap.ArenaAllocator = null,
         native: ?catalog.StatementRead = null,
         fn close(raw: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(raw));
@@ -994,6 +999,8 @@ pub const Adapter = struct {
                 self.alloc.destroy(source.*);
             }
             self.sources.deinit(self.alloc);
+            self.overlays.deinit(self.alloc);
+            if (self.overlay_arena) |*arena| arena.deinit();
             self.alloc.free(self.cursors);
             self.alloc.destroy(self);
         }
@@ -1029,10 +1036,31 @@ pub const Adapter = struct {
                 errdefer alloc.destroy(source);
                 const schema: @import("antfly_local_sources").storage_schema.TableSchema = .{ .storage_mode = .relational, .external_base_source = request.table.external_base_source };
                 const normalized = try self.context.platformDeadline();
-                const lake_options: @import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions = .{ .node_config = self.server.cfg.node_config, .secret_store = self.server.cfg.secret_store };
+                const lake_options: @import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions = .{ .node_config = self.server.cfg.node_config, .secret_store = self.server.cfg.secret_store, .catalog_table_id = request.table.id, .catalog_generation = if (request.table.external_indexes) |indexes| indexes.object_generation else 0 };
                 source.* = try @import("antfly_local_sources").serverless_query_lake_serving.ServingSource.openCached(alloc, schema, lake_options.lakeOptions(), .{ .io = self.server.embedding_provider_runtime.io, .deadline_ns = normalized.deadline_ns, .cancellation = @import("antfly_local_sources").storage_object_storage.CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) }, &self.server.lake_read_cache);
                 errdefer source.deinit();
                 try source.attachCache(&self.server.lake_read_cache, request.table.external_base_source.?.binding, .{ .io = self.server.embedding_provider_runtime.io, .deadline_ns = normalized.deadline_ns, .cancellation = @import("antfly_local_sources").storage_object_storage.CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) });
+                if (self.lake_visibility == .accepted and schema.external_base_source.?.binding.write_policy == .iceberg_writer) {
+                    if (owner.overlay_arena == null) owner.overlay_arena = .init(alloc);
+                    const oa = owner.overlay_arena.?.allocator();
+                    const binding = schema.external_base_source.?.binding;
+                    const context: @import("antfly_local_sources").serverless_query_lake_read_context.Context = .{ .io = self.server.embedding_provider_runtime.io, .deadline_ns = normalized.deadline_ns, .cancellation = @import("antfly_local_sources").storage_object_storage.CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) };
+                    var current = try @import("../serverless/configured_object_store_support.zig").executeLakeCatalogAlloc(alloc, binding, lake_options, context, .load);
+                    defer current.deinit(alloc);
+                    const root = try @import("antfly_local_sources").serverless_external_source_mod.lake_catalog.metadata.parse(oa, current.table.metadata_json);
+                    const cut = try @import("lake_search_overlay.zig").snapshotCoverage(root, source.inventory.snapshot_id);
+                    const pending = try @import("../serverless/lake_ingestion.zig").pending(oa, binding, lake_options, context, cut);
+                    for (pending.key_fields) |key| {
+                        const kind = (try request.table.column(key)).type;
+                        if (kind != .integer and kind != .string and kind != .boolean) return error.UnsupportedSqlExecution;
+                    }
+                    const overlay = try oa.create(@import("lake_sql_overlay.zig").Cut);
+                    overlay.* = try @import("lake_sql_overlay.zig").Cut.init(oa, pending);
+                    if (pending.changes.len != 0) {
+                        try @import("lake_search_overlay.zig").requireNativeAncestry(root, source.inventory.snapshot_id);
+                        try owner.overlays.put(alloc, request.table.id, overlay);
+                    }
+                }
                 try owner.sources.put(alloc, request.table.id, source);
             } else try native.append(scratch.allocator(), request);
         }
@@ -1040,7 +1068,12 @@ pub const Adapter = struct {
         var native_index: usize = 0;
         for (requests, owner.cursors) |request, *cursor| {
             if (request.table.external_base_source != null) {
-                cursor.* = if (request.request.index_range != null)
+                cursor.* = if (owner.overlays.get(request.table.id)) |cut| overlay: {
+                    const physical = try @import("lake_sql_overlay.zig").physicalRequest(owner.overlay_arena.?.allocator(), request.request, cut.*);
+                    const child = (try @import("lake_index_sql_rows.zig").tryOpenAuto(alloc, self.server, request.table, physical, self.context, owner.sources.get(request.table.id).?)) orelse try @import("lake_sql_cursor.zig").openPinned(alloc, request.table, physical, self.context, owner.sources.get(request.table.id).?);
+                    errdefer child.close(child.ptr);
+                    break :overlay try @import("lake_sql_overlay.zig").wrap(alloc, child, request.table, request.request, cut, self.context);
+                } else if (request.request.index_range != null)
                     try @import("lake_index_sql_rows.zig").openPinned(alloc, self.server, request.table, request.request, self.context, owner.sources.get(request.table.id).?)
                 else
                     (try @import("lake_index_sql_rows.zig").tryOpenAuto(alloc, self.server, request.table, request.request, self.context, owner.sources.get(request.table.id).?)) orelse fallback: {

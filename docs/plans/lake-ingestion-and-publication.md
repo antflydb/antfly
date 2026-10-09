@@ -2,7 +2,10 @@
 
 Status: architecture and implementation contracts, captured 2026-10-08. The
 native transaction ingestion section describes the implementation in PR #1025;
-recent text overlays and bounded compaction/GC are implemented; additional managed connectors remain proposed.
+recent text overlays and bounded compaction/GC are implemented. JSON source
+composition, opt-in accepted SQL visibility, receipt-aware publication waits,
+automated maintenance, and remaining extensions are described in
+[Composed query sources and recent/archive visibility](composed-query-sources.md).
 Existing behavior remains documented in
 [LAKES.md](../../zig/LAKES.md), [REMOTE_TABLE_SERVING.md](../../zig/REMOTE_TABLE_SERVING.md),
 [CDC.md](../../zig/CDC.md), and [SERVERLESS.md](../../zig/SERVERLESS.md).
@@ -12,9 +15,10 @@ Existing behavior remains documented in
 Antfly already reads remote Parquet/Iceberg snapshots and maintains native
 indexes over external rows. Its serverless path also has durable WAL ingest and
 publication of Antfly-owned artifacts; native row-fragment publication is a
-separate existing foundation. These capabilities do not yet constitute a
-general writable Parquet/Iceberg table backend with managed source connectors,
-catalog commits, recent/archive merging, and compaction.
+separate existing foundation. Native writable Iceberg now adds catalog commits,
+bounded recent text visibility, JSON union/keyed composition, opt-in accepted
+SQL visibility and scheduled bounded compaction/GC. Recent vector segments,
+retained cross-table cursor cuts and additional managed connectors remain extensions.
 
 The long-term goal is one table/query contract for externally owned lakes and
 Antfly-owned data, with a shared durable ingestion path for application writes,
@@ -300,6 +304,12 @@ must respect catalog retention and readers in other engines as well as Antfly.
 
 ## Unified recent/archive query semantics
 
+The [composed-source proposal](composed-query-sources.md) defines a proposed JSON
+DSL for disjoint unions and keyed overlays, including ranking, authorization,
+cursors, SQL visibility, and a two-table HN rollout. Existing SQL relational
+composition and JSON multi-query responses are foundations, not proof of a shared
+ranked corpus or accepted-change visibility across independent tables.
+
 A statement pins an archive snapshot, a compatible index publication, and a
 recent-change watermark. Newer keyed changes replace historical versions;
 tombstones suppress historical rows. Apply that visibility rule before filters,
@@ -497,16 +507,22 @@ The archive must be an ancestor of the current head through native WAL or
 compaction transitions: an unpublished external writer commit requires archive
 publication. Cursors bind both archive publication and accepted tail; a changed
 cut invalidates the cursor rather than silently moving pagination to newer rows.
-The overlay is reconstructed from durable WAL after restart. SQL continues to
-read a committed Iceberg snapshot. Vector searches with a pending text overlay
-are rejected until matching publication; no uncomputed embedding is fabricated.
+The overlay is reconstructed from durable WAL after restart. Direct SQL SELECT
+requests can opt into `lake_visibility: "accepted"`; session/transaction modes
+retain committed visibility. `lake_read` selects accepted or published search
+visibility and optional receipt coverage with a bounded readiness wait. Pending
+vector queries wake and wait for matching publication; recent vector segments
+and asynchronous enrichment remain future work. See the
+[implemented contracts](composed-query-sources.md#implemented-contracts).
 
 ### Compaction and garbage collection
 
 `POST /tables/{tableName}/lake/maintenance` accepts `action` (`compact`, `vacuum`,
-`wal_gc`), a stable `operation_id`, and defaults to `dry_run: true`. Maintenance
-is explicitly invoked; it is not an automatically provisioned vendor scheduler.
-Run passes from an operator/job until complete. Publication is woken after a
+`wal_gc`, `status`), a stable `operation_id` for mutating/planning jobs, and defaults
+to `dry_run: true`. Jobs can be invoked explicitly or scheduled through the
+Iceberg `antfly.maintenance.policy` property. Durable CAS progress resumes after
+restart; `status` reports that progress without an operation ID. Scheduling is
+opt-in and does not provision vendor resources. Publication is woken after a
 successful compaction commit.
 
 ```json

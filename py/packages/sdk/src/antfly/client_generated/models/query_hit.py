@@ -27,6 +27,8 @@ class QueryHit:
     Attributes:
         field_id (str): ID of the record.
         field_score (float): Relevance score of the hit, normalized so higher values always rank first.
+        field_table (str | Unset): Source table provenance for composed query hits; equal IDs from union inputs remain
+            distinct.
         field_computed (QueryHitComputed | Unset): Named query-time computed values, separate from stored source.
         field_distance (float | Unset): Raw vector distance for direct dense-vector hits; lower values are better.
             For a source group ranked by dense descendants, this is the distance of
@@ -52,6 +54,7 @@ class QueryHit:
 
     field_id: str
     field_score: float
+    field_table: str | Unset = UNSET
     field_computed: QueryHitComputed | Unset = UNSET
     field_distance: float | Unset = UNSET
     field_index_scores: QueryHitIndexScores | Unset = UNSET
@@ -66,6 +69,8 @@ class QueryHit:
         field_id = self.field_id
 
         field_score = self.field_score
+
+        field_table = self.field_table
 
         field_computed: dict[str, Any] | Unset = UNSET
         if not isinstance(self.field_computed, Unset):
@@ -105,6 +110,8 @@ class QueryHit:
                 "_score": field_score,
             }
         )
+        if field_table is not UNSET:
+            field_dict["_table"] = field_table
         if field_computed is not UNSET:
             field_dict["_computed"] = field_computed
         if field_distance is not UNSET:
@@ -137,6 +144,8 @@ class QueryHit:
         field_id = d.pop("_id")
 
         field_score = d.pop("_score")
+
+        field_table = d.pop("_table", UNSET)
 
         _field_computed = d.pop("_computed", UNSET)
         field_computed: QueryHitComputed | Unset
@@ -187,6 +196,7 @@ class QueryHit:
         query_hit = cls(
             field_id=field_id,
             field_score=field_score,
+            field_table=field_table,
             field_computed=field_computed,
             field_distance=field_distance,
             field_index_scores=field_index_scores,

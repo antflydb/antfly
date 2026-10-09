@@ -2224,6 +2224,12 @@ fn applyCommonSearchRequestOptions(
         }
     }
 
+    if (comptime @hasField(@TypeOf(request), "lake_read")) if (request.lake_read) |read| {
+        req.lake_read = .{
+            .visibility = if (read.visibility) |visibility| if (std.mem.eql(u8, visibility, "accepted")) .accepted else if (std.mem.eql(u8, visibility, "published")) .published else return error.InvalidQueryRequest else .accepted,
+            .through = if (read.through) |receipt| .{ .table_id = receipt.table_id, .object_generation = receipt.object_generation, .wal_lsn = receipt.wal_lsn } else null,
+        };
+    };
     if (request.offset) |offset| req.offset = @intCast(offset);
     if (request.count) |count| req.count_only = count;
     if (request.remote_snapshot) |snapshot| {

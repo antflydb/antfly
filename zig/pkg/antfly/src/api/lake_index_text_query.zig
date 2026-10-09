@@ -62,6 +62,19 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, table: local.common_to
     const oa = overlay_arena.allocator();
     var overlay: ?overlay_api.Overlay = null;
     var source_schema = schema;
+    const published_only = if (req.lake_read) |read| read.visibility == .published else false;
+    if (req.lake_read) |read| {
+        if (schema.binding.write_policy != .iceberg_writer) return error.UnsupportedQueryRequest;
+        if (read.through) |receipt| {
+            if (receipt.table_id != table.table_id or receipt.object_generation != table.object_storage_generation) return error.CatalogGenerationChanged;
+            if (server.cfg.node_config == null or server.cfg.node_config.?.storage.artifacts.connection == null) return error.UnsupportedQueryRequest;
+        }
+    }
+    if (published_only) {
+        const base_id = publication.base_source.external_iceberg.snapshot_id;
+        source_schema.binding.write_policy = .read_only;
+        source_schema.binding.snapshot_mode = if (std.mem.startsWith(u8, base_id, "empty:")) .current else .{ .snapshot_id = base_id };
+    }
     if (schema.binding.write_policy == .iceberg_writer and server.cfg.node_config != null and server.cfg.node_config.?.storage.artifacts.connection != null) {
         const catalog = local.serverless_external_source_mod.lake_catalog;
         var current = try @import("../serverless/configured_object_store_support.zig").executeLakeCatalogAlloc(a, schema.binding, options, context, .load);
@@ -69,7 +82,11 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, table: local.common_to
         const root = try catalog.metadata.parse(oa, current.table.metadata_json);
         const base_id = publication.base_source.external_iceberg.snapshot_id;
         const cut = try overlay_api.snapshotCoverage(root, base_id);
-        const pending = try @import("../serverless/lake_ingestion.zig").pending(oa, schema.binding, options, context, cut);
+        if (published_only) {
+            if (req.lake_read.?.through) |receipt| if (cut < receipt.wal_lsn) return error.IndexRebuilding;
+        }
+        const pending = if (!published_only) try @import("../serverless/lake_ingestion.zig").pending(oa, schema.binding, options, context, cut) else @import("../serverless/lake_ingestion.zig").Pending{ .lsn = cut, .key_fields = &.{}, .changes = &.{} };
+        if (req.lake_read) |read| if (read.through) |receipt| if (pending.lsn < receipt.wal_lsn) return error.IndexRebuilding;
         if (pending.changes.len != 0) {
             try overlay_api.requireNativeAncestry(root, base_id);
             overlay = try overlay_api.Overlay.init(oa, pending);
@@ -126,7 +143,10 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, table: local.common_to
     const has_text = for (owner.declarations) |declaration| {
         if (declaration.artifact.kind == .text_segment) break true;
     } else false;
-    if (has_vectors and owner.overlay != null) return error.UnsupportedQueryRequest;
+    if (has_vectors and owner.overlay != null) {
+        server.notifyLakeCommit(table.name) catch {};
+        return error.IndexRebuilding;
+    }
     if (has_vectors) {
         const resolver: @import("lake_index_text_predicate.zig").PhysicalResolver = .{ .server = server, .table = sql_table, .source = &source, .context = normalized, .store = store.artifactStore(), .store_identity = store.identity, .read_context = context, .pinned = .{ .artifacts = store.artifactStore(), .store_identity = store.identity, .domain = owner.domain, .declarations = owner.declarations, .read_context = context } };
         if (effective.filter_query_json.len != 0) {

@@ -141,6 +141,9 @@ from .cohere_reranker_config import CohereRerankerConfig
 from .cohere_reranker_config_provider import CohereRerankerConfigProvider
 from .committed_mutation_outcome import CommittedMutationOutcome
 from .committed_mutation_outcome_status import CommittedMutationOutcomeStatus
+from .composed_query_source import ComposedQuerySource
+from .composed_source_overlay import ComposedSourceOverlay
+from .composed_table_source import ComposedTableSource
 from .confidence_step_config import ConfidenceStepConfig
 from .configure_extension_request import ConfigureExtensionRequest
 from .conjunction_query import ConjunctionQuery
@@ -492,6 +495,7 @@ from .get_current_user_response_200_metadata_type_0 import GetCurrentUserRespons
 from .get_document_artifact_manifest_detail import GetDocumentArtifactManifestDetail
 from .get_table_storage_migration_response_200 import GetTableStorageMigrationResponse200
 from .global_stateful_query_request import GlobalStatefulQueryRequest
+from .global_stateful_query_request_source_ranking import GlobalStatefulQueryRequestSourceRanking
 from .google_embedder_config import GoogleEmbedderConfig
 from .google_embedder_config_provider import GoogleEmbedderConfigProvider
 from .google_generator_config import GoogleGeneratorConfig
@@ -955,6 +959,9 @@ from .lake_catalog_create_request_write_order import LakeCatalogCreateRequestWri
 from .lake_catalog_response import LakeCatalogResponse
 from .lake_catalog_response_metadata import LakeCatalogResponseMetadata
 from .lake_catalog_response_state import LakeCatalogResponseState
+from .lake_read_receipt import LakeReadReceipt
+from .lake_read_requirement import LakeReadRequirement
+from .lake_read_requirement_visibility import LakeReadRequirementVisibility
 from .legacy_graph_document_query import LegacyGraphDocumentQuery
 from .legacy_graph_node_selector import LegacyGraphNodeSelector
 from .legacy_graph_query import LegacyGraphQuery
@@ -1111,6 +1118,7 @@ from .query_result_base_aggregations import QueryResultBaseAggregations
 from .query_result_base_analyses import QueryResultBaseAnalyses
 from .query_result_base_evaluation import QueryResultBaseEvaluation
 from .query_result_base_graph_metric_results import QueryResultBaseGraphMetricResults
+from .query_result_base_source_ranking import QueryResultBaseSourceRanking
 from .query_score_details import QueryScoreDetails
 from .query_strategy import QueryStrategy
 from .query_string_query import QueryStringQuery
@@ -1268,6 +1276,7 @@ from .sql_prepare_request import SQLPrepareRequest
 from .sql_prepared_execution_request import SQLPreparedExecutionRequest
 from .sql_prepared_response import SQLPreparedResponse
 from .sql_request import SQLRequest
+from .sql_request_lake_visibility import SQLRequestLakeVisibility
 from .sql_response import SQLResponse
 from .sql_setting_database_default import SqlSettingDatabaseDefault
 from .sql_setting_mutation_drop import SqlSettingMutationDrop
@@ -1588,6 +1597,9 @@ __all__ = (
     "CohereRerankerConfigProvider",
     "CommittedMutationOutcome",
     "CommittedMutationOutcomeStatus",
+    "ComposedQuerySource",
+    "ComposedSourceOverlay",
+    "ComposedTableSource",
     "ConfidenceStepConfig",
     "ConfigureExtensionRequest",
     "ConjunctionQuery",
@@ -1931,6 +1943,7 @@ __all__ = (
     "GetDocumentArtifactManifestDetail",
     "GetTableStorageMigrationResponse200",
     "GlobalStatefulQueryRequest",
+    "GlobalStatefulQueryRequestSourceRanking",
     "GoogleEmbedderConfig",
     "GoogleEmbedderConfigProvider",
     "GoogleGeneratorConfig",
@@ -2392,6 +2405,9 @@ __all__ = (
     "LakeCatalogResponse",
     "LakeCatalogResponseMetadata",
     "LakeCatalogResponseState",
+    "LakeReadReceipt",
+    "LakeReadRequirement",
+    "LakeReadRequirementVisibility",
     "LegacyGraphDocumentQuery",
     "LegacyGraphNodeSelector",
     "LegacyGraphQuery",
@@ -2546,6 +2562,7 @@ __all__ = (
     "QueryResultBaseAnalyses",
     "QueryResultBaseEvaluation",
     "QueryResultBaseGraphMetricResults",
+    "QueryResultBaseSourceRanking",
     "QueryScoreDetails",
     "QueryStrategy",
     "QueryStringQuery",
@@ -2705,6 +2722,7 @@ __all__ = (
     "SQLPreparedResponse",
     "SQLPrepareRequest",
     "SQLRequest",
+    "SQLRequestLakeVisibility",
     "SQLResponse",
     "SqlSettingDatabaseDefault",
     "SqlSettingMutationDrop",

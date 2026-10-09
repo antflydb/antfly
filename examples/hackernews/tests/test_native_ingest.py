@@ -85,3 +85,55 @@ def test_native_changes_keeps_pending_transaction_when_endpoint_changes(
         native_ingest.publish(state, "http://other/db/v1", "hn")
     assert state.get("native_changes_request") == pending
     state.db.close()
+
+
+def test_native_cohorts_route_edits_and_deletes_by_retained_creation_time(
+    tmp_path, monkeypatch
+):
+    state = State(tmp_path / "history.aflite")
+    state.put({"id": 1, "type": "story", "title": "old", "time": 10})
+    state.put({"id": 2, "type": "story", "title": "recent", "time": 20})
+    sent = []
+
+    def success(request, **kwargs):
+        sent.append(json.loads(request.data))
+        return Accepted(len(sent))
+
+    monkeypatch.setattr(native_ingest, "urlopen", success)
+    native_ingest.publish(state, "http://antfly/db/v1", "history", created_before=20)
+    assert [change["row"]["hn_id"] for change in sent[0]["changes"]] == [1]
+    assert not list(state.db.entries("change:"))
+    state.put({"id": 1, "deleted": True})
+    state.put({"id": 2, "points": 10})
+    native_ingest.publish(state, "http://antfly/db/v1", "history", created_before=20)
+    assert sent[1]["changes"] == [{"op": "delete", "row": {"hn_id": 1}}]
+    with pytest.raises(RuntimeError, match="boundaries cannot change"):
+        native_ingest.publish(
+            state, "http://antfly/db/v1", "history", created_before=21
+        )
+    state.db.close()
+
+
+def test_native_cohort_consumes_only_foreign_markers_without_a_false_checkpoint(
+    tmp_path, monkeypatch
+):
+    state = State(tmp_path / "current.aflite")
+    state.put({"id": 1, "type": "story", "time": 10})
+    monkeypatch.setattr(
+        native_ingest,
+        "urlopen",
+        lambda *args, **kwargs: pytest.fail(
+            "foreign cohort must not submit a transaction"
+        ),
+    )
+    assert (
+        native_ingest.publish(state, "http://antfly/db/v1", "current", created_after=20)
+        is None
+    )
+    assert not list(state.db.entries("change:"))
+    assert not state.get("native_changes_checkpoint", "")
+    state.put({"id": 2, "deleted": True})
+    with pytest.raises(RuntimeError, match="original creation time"):
+        native_ingest.publish(state, "http://antfly/db/v1", "current", created_after=20)
+    assert list(state.db.entries("change:"))
+    state.db.close()

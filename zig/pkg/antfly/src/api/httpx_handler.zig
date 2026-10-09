@@ -5906,6 +5906,7 @@ pub const AntflyApiHandler = struct {
         var preparation_budget: SQLMemoryBudget = .{ .backing = ctx.allocator, .limit = 8 << 20 };
         const preparation_alloc = preparation_budget.allocator();
         const Input = struct {
+            lake_visibility: enum { committed, accepted } = .committed,
             statement: ?[]const u8 = null,
             parameters: ?[]const std.json.Value = null,
             database: ?[]const u8 = null,
@@ -5921,6 +5922,7 @@ pub const AntflyApiHandler = struct {
         };
         defer parsed.deinit();
         const request = parsed.value;
+        if (request.lake_visibility == .accepted and mode != .statement) return ctx.status(400).json(sql_wire.SQLDiagnostic{ .code = "0A000", .message = "accepted lake visibility requires a direct read-only statement" });
         const statement = request.statement orelse "";
         if (mode == .prepare and statement.len > @import("sql_prepared.zig").max_statement_bytes) return ctx.status(400).json(sql_wire.SQLDiagnostic{ .code = "54000", .message = "prepared SQL statement exceeds 64 KiB" });
         if (mode == .statement or mode == .prepare) {
@@ -5966,7 +5968,10 @@ pub const AntflyApiHandler = struct {
             };
         };
         var job = SQLJob{
-            .adapter = .{ .server = self.api_server, .identity = &identity, .context = tableMutationContext(ctx, &identity), .database = request.database orelse "default", .namespace = request.namespace orelse "public", .session_id = request.session_id, .connection_id = connection_id, .inherit_session_database = request.database == null, .inherit_session_namespace = request.namespace == null },
+            .adapter = .{ .lake_visibility = switch (request.lake_visibility) {
+                .committed => .committed,
+                .accepted => .accepted,
+            }, .server = self.api_server, .identity = &identity, .context = tableMutationContext(ctx, &identity), .database = request.database orelse "default", .namespace = request.namespace orelse "public", .session_id = request.session_id, .connection_id = connection_id, .inherit_session_database = request.database == null, .inherit_session_namespace = request.namespace == null },
             .statement = statement,
             .prepared_mode = mode,
             .prepared_id = prepared_id,
@@ -6099,7 +6104,7 @@ pub const AntflyApiHandler = struct {
         if (try self.acquirePublicOperation(ctx, "globalQuery")) |response| return response;
         defer self.releasePublicOperation("globalQuery");
         var cancellation = requestCancellation(ctx);
-        if (isNdjsonContentType(ctx.header("content-type"))) {
+        if (isNdjsonContentType(ctx.header("content-type")) or (@import("composed_query.zig").hasSource(ctx.allocator, body_data) catch false)) {
             var resp = try self.api_server.handleAdmittedPublicGlobalMultiQueryWithCancellation(
                 body_data,
                 authenticated_identity,

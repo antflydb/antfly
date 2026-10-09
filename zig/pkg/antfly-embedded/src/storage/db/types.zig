@@ -1848,6 +1848,10 @@ pub const SearchRequest = struct {
     index_name: ?[]const u8 = null,
     primary_text_index_name: ?[]const u8 = null,
     remote_snapshot: ?[]const u8 = null,
+    lake_read: ?struct {
+        visibility: enum { accepted, published } = .accepted,
+        through: ?struct { table_id: u64, object_generation: u64, wal_lsn: u64 } = null,
+    } = null,
     aggregations_json: []const u8 = "",
     count_only: bool = false,
     profile: bool = false,
@@ -2016,6 +2020,7 @@ const hierarchy_children_rejected_fields = [_][]const u8{
     "index_name",
     "primary_text_index_name",
     "remote_snapshot",
+    "lake_read",
     "aggregations_json",
     "count_only",
     "profile",

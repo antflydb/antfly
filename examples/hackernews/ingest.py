@@ -168,6 +168,8 @@ def publish(
     native_table="hackernews",
     native_rows=False,
     batch_size=1000,
+    created_before=None,
+    created_after=None,
 ):
     from native_catalog import NativeCatalog
     import pyarrow as pa
@@ -192,7 +194,14 @@ def publish(
             location=warehouse,
             properties={"format-version": "2"},
         )
-        return publish_changes(state, native_endpoint, native_table, batch_size)
+        return publish_changes(
+            state,
+            native_endpoint,
+            native_table,
+            batch_size,
+            created_before,
+            created_after,
+        )
 
     catalog = (
         NativeCatalog(state, warehouse, native_endpoint, native_table)
@@ -451,6 +460,16 @@ def main():
         action="store_true",
         help="Send row CDC; Antfly owns WAL, Parquet and searchable publication",
     )
+    parser.add_argument(
+        "--created-before",
+        type=int,
+        help="Native rows created before this fixed epoch-second boundary (exclusive)",
+    )
+    parser.add_argument(
+        "--created-after",
+        type=int,
+        help="Native rows created at or after this fixed epoch-second boundary (inclusive)",
+    )
     parser.add_argument("--batch-size", type=int, default=1000)
     parser.add_argument(
         "--backup-root", help="Dedicated gs:// or file:// state checkpoint root"
@@ -471,6 +490,10 @@ def main():
     sub.add_parser("restore")
     sub.add_parser("run")
     args = parser.parse_args()
+    if (
+        args.created_before is not None or args.created_after is not None
+    ) and not args.native_rows:
+        parser.error("creation-time cohorts require --native-rows")
     if args.native_rows and not args.native_endpoint:
         parser.error("--native-rows requires --native-endpoint")
     if args.native_rows and args.batch_size > 16384:
@@ -508,6 +531,8 @@ def main():
                     args.native_table,
                     args.native_rows,
                     args.batch_size,
+                    args.created_before,
+                    args.created_after,
                 )
             if args.command == "backup":
                 print(
@@ -539,6 +564,8 @@ def main():
                             args.native_table,
                             args.native_rows,
                             args.batch_size,
+                            args.created_before,
+                            args.created_after,
                         )
                         next_publication = time.monotonic() + args.publish_interval
                     print(
@@ -558,6 +585,8 @@ def main():
                 args.native_table,
                 args.native_rows,
                 args.batch_size,
+                args.created_before,
+                args.created_after,
             )
             print(json.dumps(result))
         finally:

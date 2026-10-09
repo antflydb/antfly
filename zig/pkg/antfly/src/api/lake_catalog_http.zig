@@ -61,7 +61,7 @@ pub fn execute(a: A, server: *server_api.ApiHttpServer, physical: []const u8, ex
     if (request.action == .changes) {
         const lsn = try @import("../serverless/lake_ingestion.zig").accept(a, source.binding, options, lake_context, request.body);
         server.notifyLakeCommit(physical) catch |err| std.log.warn("lake ingestion wakeup deferred table={s} err={s}", .{ physical, @errorName(err) });
-        return .{ .status = 202, .body = try std.json.Stringify.valueAlloc(a, .{ .state = "accepted", .wal_lsn = lsn, .searchable = false }, .{}) };
+        return .{ .status = 202, .body = try std.json.Stringify.valueAlloc(a, .{ .state = "accepted", .wal_lsn = lsn, .table_id = table.table_id, .object_generation = table.object_storage_generation, .searchable = false }, .{}) };
     }
     if (!mutation) {
         const call: configured.CatalogOperation = if (request.action == .load) .load else .{ .resolve = .{ .id = request.commit_id, .hash = request.request_hash } };
