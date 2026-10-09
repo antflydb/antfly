@@ -1770,6 +1770,24 @@ The regression fails against the previous insert-only check and passes with the
 fix. The final native catalog gate passes 166 tests plus 22 linked storage tests,
 with no failures or leaks; formatting, whitespace, source-catalog and inventory
 integrity checks also pass.
+Restore namespace inputs now participate in the same transactional source epoch
+and equal-clock snapshot/replay proofs as public tables and FK publications.
+A names-only projection binds the immutable plan identity, target definitions,
+logical namespace/name bindings and exact replacement definitions. Artifact DOMs,
+receipt counters, placement and runtime progress are excluded. Canonical active,
+physical-name and old/new identity reservation keys are included; snapshot proof
+scans seek those key families instead of visiting owner receipt histories.
+Reservation admission and final retirement advance the source clock in their
+existing metadata transaction. Artifact freeze compares semantic cuts, reusing
+the already parsed predecessor plan; unchanged receipt/progress commands do not
+run additional namespace projection work. A native projection regression reads
+512 KiB of ignored artifact data using 32 KiB of scratch and exercises allocation
+faults, identity/name changes and malformed reservation keys. Actual rewrite
+admission/cancellation fixtures check clock changes across restart, and artifact
+sealing retains both the clock and complete source fingerprint. This is source
+fencing, not source-stream activation: the active-restore target cursor, native
+candidate ownership derivation, admission/serving barriers and root publication
+remain unfinished. No original SQL parity case receives completion credit.
 The owned table-cut projector can now combine an exact predecessor definition
 with a plan-fenced successor definition in expected linear time. It retains
 old-only active names, both owners for shared names and pending-only new names,

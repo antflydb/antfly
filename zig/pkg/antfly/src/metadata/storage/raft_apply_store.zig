@@ -6536,6 +6536,57 @@ test "metadata backup cohort atomically admits immutable plans and releases exac
     try std.testing.expectEqual(@as(usize, 0), page.len);
 }
 
+test "system catalog restore namespace projections bind names and skip artifact payloads" {
+    const a = std.testing.allocator;
+    const group = group_ids.main_metadata_group_id;
+    const id: [16]u8 = @splat(9);
+    var targets = [_]RaftApplyStore.RelationRestoreProjection.Target{.{
+        .table = .{ .table_id = 8, .name = "physical_new", .schema_json = "{\"version\":2}" },
+        .catalog_binding = .{ .kind = .table, .parent_id = 5, .name = "orders" },
+        .replace = .{ .table = .{ .table_id = 7, .name = "physical_old", .schema_json = "{\"version\":1}" } },
+    }};
+    const projection: RaftApplyStore.RelationRestoreProjection = .{ .plan = .{ .id = id, .targets = &targets } };
+    const expected = try RaftApplyStore.relationRestoreSourceDigest(projection.plan);
+    const json = try std.json.Stringify.valueAlloc(a, projection, .{});
+    defer a.free(json);
+    const plan_json = try std.json.Stringify.valueAlloc(a, projection.plan, .{});
+    defer a.free(plan_json);
+    const noise = try a.alloc(u8, 512 * 1024);
+    defer a.free(noise);
+    @memset(noise, 'x');
+    const oversized_dom = try std.mem.concat(a, u8, &.{ "{\"ignored_artifacts\":\"", noise, "\",\"revision\":999,\"state\":\"published\",\"plan\":", plan_json, "}" });
+    defer a.free(oversized_dom);
+    var scratch: [32 * 1024]u8 = undefined;
+    var bounded = std.heap.FixedBufferAllocator.init(&scratch);
+    try std.testing.expectEqualSlices(u8, &expected, &try RaftApplyStore.relationRestoreSourceValueDigest(bounded.allocator(), oversized_dom, id));
+    var buf: [256]u8 = undefined;
+    try std.testing.expectEqualSlices(u8, &expected, &try RaftApplyStore.relationSourceValueDigest(a, group, try restore_staging.jobKey(&buf, group, id), json));
+    try std.testing.expectError(error.InvalidCatalogRecord, RaftApplyStore.relationRestoreSourceValueDigest(a, json, @splat(8)));
+    const Probe = struct {
+        fn prepare(alloc: std.mem.Allocator, input: []const u8, plan_id: [16]u8) !void {
+            _ = try RaftApplyStore.relationRestoreSourceValueDigest(alloc, input, plan_id);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Probe.prepare, .{ json, id });
+    targets[0].table.schema_json = "{\"version\":3}";
+    try std.testing.expect(!std.mem.eql(u8, &expected, &try RaftApplyStore.relationRestoreSourceDigest(projection.plan)));
+    targets[0].table.schema_json = "{\"version\":2}";
+    targets[0].catalog_binding.?.parent_id = 6;
+    try std.testing.expect(!std.mem.eql(u8, &expected, &try RaftApplyStore.relationRestoreSourceDigest(projection.plan)));
+    targets[0].catalog_binding.?.parent_id = 5;
+    targets[0].replace.?.table.schema_json = "{\"version\":0}";
+    try std.testing.expect(!std.mem.eql(u8, &expected, &try RaftApplyStore.relationRestoreSourceDigest(projection.plan)));
+    try std.testing.expect(try RaftApplyStore.relationSourceKey(group, try restore_staging.activeKey(&buf, group, id)));
+    try std.testing.expectError(error.InvalidCatalogRecord, RaftApplyStore.relationSourceValueDigest(a, group, try restore_staging.activeKey(&buf, group, id), &@as([16]u8, @splat(8))));
+    try std.testing.expect(!try RaftApplyStore.relationSourceKey(group, try restore_staging.progressKey(&buf, group, id)));
+    try std.testing.expect(!try RaftApplyStore.relationSourceKey(group, try restore_staging.receiptKey(&buf, group, id, .validating, 8)));
+    try std.testing.expect(!try RaftApplyStore.relationSourceKey(group, try restore_staging.identityKey(&buf, group, .group, 8)));
+    try std.testing.expect(try RaftApplyStore.relationSourceKey(group, try restore_staging.identityKey(&buf, group, .old_table, 7)));
+    var prefix_buf: [160]u8 = undefined;
+    const prefix = try restore_staging.prefix(&prefix_buf, group);
+    try std.testing.expectError(error.InvalidCatalogRecord, RaftApplyStore.relationRestoreSourceKey(try std.fmt.bufPrint(&buf, "{s}table:07", .{prefix}), group));
+}
+
 fn applyRestoreStagingForTest(store: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, command: restore_staging.Command) !void {
     const bytes = try std.json.Stringify.valueAlloc(std.testing.allocator, command, .{});
     defer std.testing.allocator.free(bytes);
@@ -6596,6 +6647,12 @@ fn testRewriteDraft(cancel: bool, compound: bool) !void {
         defer store.deinit();
         try store.applyStandaloneCommand(group, .{ .upsert_table = original });
         try store.applyStandaloneCommand(group, .{ .upsert_range = original_range });
+        {
+            var tracked = try store.store.beginWriteTxn();
+            errdefer tracked.abort();
+            try relation_reconciliation.advanceSource(&tracked, group);
+            try tracked.commit();
+        }
         const user_key = restore_job_logical_prefix ++ "0000000000000007";
         const user_value = "{\"job_id\":7,\"attempt_id\":1,\"staging_attempt_id\":1,\"source_kind\":\"schema_rewrite\",\"phase\":\"queued\"}";
         if (compound) {
@@ -6663,6 +6720,7 @@ fn testRewriteDraft(cancel: bool, compound: bool) !void {
             try std.testing.expectEqualStrings(user_value, try txn.get(try restoreJobKeyForGroup(&key_buf, group, user_key)));
         } else try applyRestoreStagingForTest(&store, &txn, group, .{ .id = id, .action = .reserve, .plan = draft });
         try std.testing.expect(try restoreStagingLocksTableTxn(&txn, group, original.table_id));
+        try std.testing.expectEqual(@as(u64, 2), try relation_reconciliation.readSourceRevision(&txn, group));
         try txn.commit();
         var projection = try store.captureProvisioningCatalog(alloc, group);
         defer projection.deinit(alloc);
@@ -6677,6 +6735,11 @@ fn testRewriteDraft(cancel: bool, compound: bool) !void {
         try std.testing.expect(std.mem.indexOf(u8, row, "schema_rewrite") != null);
     }
     try std.testing.expectEqual(.preparing_sources, (try store.loadRestoreStagingProgress(alloc, group, id)).?.state);
+    const namespace_source_cut = blk: {
+        var read = try store.store.beginReadTxn();
+        defer read.abort();
+        break :blk try RaftApplyStore.relationSourceCutTxn(alloc, &read, group, 2);
+    };
     const artifacts = [_]restore_staging.SourceArtifact{.{ .target_group_id = 401, .source_namespace = source.fence.namespace, .format = .portable, .snapshot_path = "cut/source.afb2", .artifact_size_bytes = 100, .artifact_sha256 = @splat(7), .rewrite = .{ .program_digest = @splat(6), .retained_pin = source.pin(), .snapshot_certificate = @splat(7), .retained_epoch = 1, .retained_start = 8, .source_applied_index = 20, .source_scope = source } }};
     targets[0].source_artifacts = &artifacts;
     draft.preparing_sources = false;
@@ -6687,6 +6750,8 @@ fn testRewriteDraft(cancel: bool, compound: bool) !void {
         var txn = try store.store.beginWriteTxn();
         errdefer txn.abort();
         try applyRestoreStagingForTest(&store, &txn, group, .{ .id = id, .action = .begin_cancel, .expected_revision = 1 });
+        try std.testing.expectEqual(@as(u64, 2), try relation_reconciliation.readSourceRevision(&txn, group));
+        try std.testing.expect(namespace_source_cut.eql(try RaftApplyStore.relationSourceCutTxn(alloc, &txn, group, 2)));
         // No target generation was ever provisioned. Its invented receipt
         // cannot satisfy cancellation of an actual admitted source pin.
         try applyRestoreStagingForTest(&store, &txn, group, .{ .id = id, .action = .canceled, .expected_revision = 2, .receipt = .{ .group_id = 401, .range_id = 401, .plan_digest = draft_digest, .completion_digest = @splat(1) } });
@@ -6696,6 +6761,7 @@ fn testRewriteDraft(cancel: bool, compound: bool) !void {
         try std.testing.expectEqual(@as(u32, 0), pending.value.completed_owners);
         try applyRestoreStagingForTest(&store, &txn, group, .{ .id = id, .action = .canceled, .expected_revision = 2, .receipt = .{ .group_id = 301, .range_id = 301, .plan_digest = draft_digest, .completion_digest = @splat(2) } });
         try applyRestoreStagingForTest(&store, &txn, group, .{ .id = id, .action = .finish_cancel, .expected_revision = 2 });
+        try std.testing.expectEqual(@as(u64, 3), try relation_reconciliation.readSourceRevision(&txn, group));
         try applyRestoreStagingForTest(&store, &txn, group, .{ .id = id, .action = .freeze_rewrite, .expected_revision = 1, .plan = draft });
         try std.testing.expect(!try restoreStagingLocksTableTxn(&txn, group, original.table_id));
         _ = try txn.get(try tableKeyForGroup(&buf, group, original.table_id));
@@ -6712,6 +6778,7 @@ fn testRewriteDraft(cancel: bool, compound: bool) !void {
         try applyRestoreStagingForTest(&store, &txn, group, .{ .id = id, .action = .freeze_rewrite, .expected_revision = 1, .plan = draft });
         try applyRestoreStagingForTest(&store, &txn, group, .{ .id = id, .action = .rewrite_source_ready, .expected_revision = 1, .source_artifact = artifacts[0] });
         try applyRestoreStagingForTest(&store, &txn, group, .{ .id = id, .action = .rewrite_source_ready, .expected_revision = 1, .source_artifact = artifacts[0] });
+        try std.testing.expectEqual(@as(u64, 2), try relation_reconciliation.readSourceRevision(&txn, group));
         try txn.commit();
     }
     store.deinit();
@@ -6738,6 +6805,8 @@ fn testRewriteDraft(cancel: bool, compound: bool) !void {
         try std.testing.expectEqual(.preparing_sources, progress.value.state);
         try applyRestoreStagingForTest(&store, &txn, group, .{ .id = id, .action = .freeze_rewrite, .expected_revision = 2, .plan = draft });
         try applyRestoreStagingForTest(&store, &txn, group, .{ .id = id, .action = .freeze_rewrite, .expected_revision = 2, .plan = draft });
+        try std.testing.expectEqual(@as(u64, 2), try relation_reconciliation.readSourceRevision(&txn, group));
+        try std.testing.expect(namespace_source_cut.eql(try RaftApplyStore.relationSourceCutTxn(alloc, &txn, group, 2)));
         try txn.commit();
     }
     const progress = (try store.loadRestoreStagingProgress(alloc, group, id)).?;
@@ -16845,6 +16914,85 @@ pub const RaftApplyStore = struct {
         if (active.cut != null) return active;
         return relationInitialSnapshot(a, reader, group_id, table_id);
     }
+    /// Project namespace inputs, not potentially large artifact/receipt DOMs.
+    /// These records are already admitted by the complete restore validator.
+    const RelationRestoreProjection = struct {
+        plan: struct { id: [16]u8, targets: []const Target },
+        const Target = struct {
+            table: RelationFkProjection.Table,
+            catalog_binding: ?struct { kind: system_catalog.Kind, parent_id: u64, name: []const u8 } = null,
+            replace: ?struct { table: RelationFkProjection.Table } = null,
+        };
+    };
+    fn relationRestoreSourceDigest(plan: anytype) ![32]u8 {
+        if (std.mem.allEqual(u8, &plan.id, 0) or plan.targets.len == 0 or plan.targets.len > 128) return error.InvalidCatalogRecord;
+        var hash = std.crypto.hash.Blake3.init(.{});
+        hash.update("antfly.relation-restore-source.v1");
+        hash.update(&plan.id);
+        var length: [8]u8 = undefined;
+        std.mem.writeInt(u64, &length, plan.targets.len, .big);
+        hash.update(&length);
+        for (plan.targets) |target| {
+            if (target.table.table_id == 0 or target.table.name.len == 0) return error.InvalidCatalogRecord;
+            hash.update(&relationTableSourceDigest(target.table.table_id, target.table.name, target.table.schema_json));
+            hash.update(&.{@intFromBool(target.catalog_binding != null)});
+            if (target.catalog_binding) |binding| {
+                if (binding.kind != .table) return error.InvalidCatalogRecord;
+                try (relation_names.Key{ .namespace_id = binding.parent_id, .name = binding.name }).validate();
+                var header: [16]u8 = undefined;
+                std.mem.writeInt(u64, header[0..8], binding.parent_id, .big);
+                std.mem.writeInt(u64, header[8..16], binding.name.len, .big);
+                hash.update(&header);
+                hash.update(binding.name);
+            }
+            hash.update(&.{@intFromBool(target.replace != null)});
+            if (target.replace) |old| {
+                if (old.table.table_id == 0 or old.table.table_id == target.table.table_id or old.table.name.len == 0) return error.InvalidCatalogRecord;
+                hash.update(&relationTableSourceDigest(old.table.table_id, old.table.name, old.table.schema_json));
+            }
+        }
+        var digest: [32]u8 = undefined;
+        hash.final(&digest);
+        return digest;
+    }
+    fn relationRestoreSourceValueDigest(a: std.mem.Allocator, bytes: []const u8, id: [16]u8) ![32]u8 {
+        if (bytes.len == 0 or bytes.len > restore_staging.max_encoded_bytes) return error.InvalidCatalogRecord;
+        var parsed = std.json.parseFromSlice(RelationRestoreProjection, a, bytes, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return error.InvalidCatalogRecord,
+        };
+        defer parsed.deinit();
+        if (!std.mem.eql(u8, &id, &parsed.value.plan.id)) return error.InvalidCatalogRecord;
+        return relationRestoreSourceDigest(parsed.value.plan);
+    }
+    const RelationRestoreSourceKey = union(enum) { job: [16]u8, active: [16]u8, name, table: u64, old_table: u64 };
+    fn relationRestoreSourceKey(key: []const u8, group_id: u64) !?RelationRestoreSourceKey {
+        var buf: [160]u8 = undefined;
+        const prefix = try restore_staging.prefix(&buf, group_id);
+        if (!std.mem.startsWith(u8, key, prefix)) return null;
+        const tail = key[prefix.len..];
+        inline for (.{ "job", "active" }) |kind| if (std.mem.startsWith(u8, tail, kind ++ ":")) {
+            const hex = tail[kind.len + 1 ..];
+            if (hex.len != 32) return error.InvalidCatalogRecord;
+            for (hex) |byte| if (!(byte >= '0' and byte <= '9') and !(byte >= 'a' and byte <= 'f')) return error.InvalidCatalogRecord;
+            var id: [16]u8 = undefined;
+            _ = std.fmt.hexToBytes(&id, hex) catch return error.InvalidCatalogRecord;
+            if (std.mem.allEqual(u8, &id, 0)) return error.InvalidCatalogRecord;
+            return @unionInit(RelationRestoreSourceKey, kind, id);
+        };
+        if (std.mem.startsWith(u8, tail, "name:")) {
+            if (tail.len == "name:".len) return error.InvalidCatalogRecord;
+            return .name;
+        }
+        inline for (.{ "table", "old_table" }) |kind| if (std.mem.startsWith(u8, tail, kind ++ ":")) {
+            const digits = tail[kind.len + 1 ..];
+            if (digits.len == 0 or digits[0] == '0') return error.InvalidCatalogRecord;
+            for (digits) |byte| if (byte < '0' or byte > '9') return error.InvalidCatalogRecord;
+            const id = std.fmt.parseInt(u64, digits, 10) catch return error.InvalidCatalogRecord;
+            return @unionInit(RelationRestoreSourceKey, kind, id);
+        };
+        return null; // Receipts, progress and group reservations are not names.
+    }
     const RelationInitialProjection = struct {
         phase: fk_generation_publication.InitialPhase,
         plan: struct {
@@ -16982,6 +17130,7 @@ pub const RaftApplyStore = struct {
             try relationInitialSourceTableId(key, group_id) != null or
             try relationInitialWorkTableId(key, group_id) != null or
             try relationInitialNameSourceKey(key, group_id) or
+            try relationRestoreSourceKey(key, group_id) != null or
             (std.mem.startsWith(u8, key, prefix) and std.mem.startsWith(u8, key[prefix.len..], "record:"));
     }
     const RelationSourceCut = struct {
@@ -17025,6 +17174,15 @@ pub const RaftApplyStore = struct {
         return digest;
     }
     fn relationSourceValueDigest(a: std.mem.Allocator, group: u64, key: []const u8, bytes: []const u8) ![32]u8 {
+        if (try relationRestoreSourceKey(key, group)) |source| switch (source) {
+            .job => |id| return relationRestoreSourceValueDigest(a, bytes, id),
+            .active => |id| if (!std.mem.eql(u8, &id, bytes)) return error.InvalidCatalogRecord,
+            .name, .table => if (bytes.len != 16 or std.mem.allEqual(u8, bytes, 0)) return error.InvalidCatalogRecord,
+            .old_table => {
+                if ((bytes.len != 16 and bytes.len != 24) or std.mem.allEqual(u8, bytes[0..16], 0)) return error.InvalidCatalogRecord;
+                if (bytes.len == 24 and std.mem.readInt(u64, bytes[16..24], .little) == 0) return error.InvalidCatalogRecord;
+            },
+        };
         if (try capturedRelationTableId(key, group)) |id| {
             const table = try borrowTableProjection(bytes, .schema);
             if (table.table_id != id) return error.InvalidCatalogRecord;
@@ -17050,6 +17208,7 @@ pub const RaftApplyStore = struct {
         var initial_work_buf: [160]u8 = undefined;
         var initial_name_buf: [160]u8 = undefined;
         var initial_physical_buf: [160]u8 = undefined;
+        var restore_buf: [160]u8 = undefined;
         const tables = try tablePrefixForGroup(&table_buf, group_id);
         const records = try std.fmt.bufPrint(&record_buf, "{s}record:", .{try system_catalog_storage.prefixForGroup(&catalog_buf, group_id)});
         var cursor = try txn.openCursor();
@@ -17057,6 +17216,18 @@ pub const RaftApplyStore = struct {
         for ([_][]const u8{ tables, records, try fk_generation_publication.prefixForGroup(&fk_buf, group_id), try fk_generation_publication.initialPrefixForGroup(&initial_buf, group_id), try fk_generation_publication.initialWorkPrefixForGroup(&initial_work_buf, group_id), try fk_generation_publication.initialNamePrefixForGroup(&initial_name_buf, group_id), try fk_generation_publication.initialPhysicalNamePrefixForGroup(&initial_physical_buf, group_id) }) |prefix| {
             var entry = try cursor.seekAtOrAfter(prefix);
             while (entry) |row| : (entry = try cursor.next()) {
+                if (!std.mem.startsWith(u8, row.key, prefix)) break;
+                try result.feed(a, group_id, row.key, row.value);
+            }
+        }
+        const restore_prefix = try restore_staging.prefix(&restore_buf, group_id);
+        var kind_buf: [192]u8 = undefined;
+        for ([_][]const u8{ "job", "active", "name", "table", "old_table" }) |kind| {
+            // Seek past receipt/progress histories rather than visiting every
+            // owner acknowledgement just to discard it from the proof.
+            const prefix = try std.fmt.bufPrint(&kind_buf, "{s}{s}:", .{ restore_prefix, kind });
+            var restore_row = try cursor.seekAtOrAfter(prefix);
+            while (restore_row) |row| : (restore_row = try cursor.next()) {
                 if (!std.mem.startsWith(u8, row.key, prefix)) break;
                 try result.feed(a, group_id, row.key, row.value);
             }
@@ -18697,6 +18868,14 @@ pub const RaftApplyStore = struct {
         const job_key = try restore_staging.jobKey(&job_key_buf, group_id, command.id);
         var progress_key_buf: [256]u8 = undefined;
         const progress_key = try restore_staging.progressKey(&progress_key_buf, group_id, command.id);
+        const source_tracked = switch (command.action) {
+            .reserve, .freeze_rewrite, .publish, .finish_cancel => try relation_reconciliation.readSourceRevision(txn, group_id) != 0,
+            else => false, // Receipt/progress traffic cannot change names.
+        };
+        var previous_source_digest: ?[32]u8 = null;
+        var namespace_active_buf: [256]u8 = undefined;
+        const namespace_active_key = try restore_staging.activeKey(&namespace_active_buf, group_id, command.id);
+        const previous_active = if (source_tracked) try stagingGet(txn, namespace_active_key) != null else false;
         const current = try stagingGet(txn, job_key);
         if (command.action == .cancel_reservation) {
             // A durable attempt exists before reserve is sent. Tombstone even
@@ -18786,6 +18965,7 @@ pub const RaftApplyStore = struct {
             const existing = current orelse return;
             var job = try std.json.parseFromSlice(restore_staging.Job, self.alloc, existing, .{});
             defer job.deinit();
+            if (source_tracked) previous_source_digest = try relationRestoreSourceDigest(job.value.plan);
             const progress_bytes = (try stagingGet(txn, progress_key)) orelse return error.InvalidRestoreStaging;
             var progress = try std.json.parseFromSlice(restore_staging.Progress, self.alloc, progress_bytes, .{});
             defer progress.deinit();
@@ -19164,6 +19344,15 @@ pub const RaftApplyStore = struct {
             const value = try std.json.Stringify.valueAlloc(self.alloc, next, .{});
             defer self.alloc.free(value);
             try txn.put(progress_key, value);
+        }
+        if (source_tracked) {
+            const next_digest = if (command.action == .reserve or command.action == .freeze_rewrite) blk: {
+                const next_job = (try stagingGet(txn, job_key)) orelse return error.InvalidCatalogRecord;
+                break :blk try relationRestoreSourceValueDigest(self.alloc, next_job, command.id);
+            } else previous_source_digest.?;
+            const next_active = try stagingGet(txn, namespace_active_key) != null;
+            if (previous_source_digest == null or previous_active != next_active or
+                !std.mem.eql(u8, &previous_source_digest.?, &next_digest)) try relation_reconciliation.advanceSource(txn, group_id);
         }
         self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = job_key });
         self.notifyProjectionListeners(.{ .kind = .restore_job, .metadata_group_id = group_id });
