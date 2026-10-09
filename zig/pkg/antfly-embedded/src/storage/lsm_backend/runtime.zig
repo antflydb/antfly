@@ -103,6 +103,13 @@ const BlockPin = union(enum) {
         }
         self.* = undefined;
     }
+    fn releaseForAdmittedRead(self: *@This(), deferred: bool) void {
+        switch (self.*) {
+            .cached => |*handle| if (deferred) handle.releaseToCache() else handle.release(),
+            .local => |payload| payload.release(),
+        }
+        self.* = undefined;
+    }
 };
 
 /// One owner-wide bound for cursor and point-result borrowing.
@@ -162,6 +169,7 @@ const SourceBlockLease = union(enum) {
             .none => {},
             .owned => |*owned| owned.release(),
             .cached => |*handle| if (deferred) handle.releaseToCache() else handle.release(),
+            .local => |payload| payload.release(),
         }
         self.* = .none;
     }
@@ -1437,7 +1445,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
             }
             if (self.source_blocks[source_index].retainPin()) |retained_block| {
                 var retained = retained_block;
-                errdefer self.returnCachePin(&retained);
+                errdefer retained.releaseForAdmittedRead(self.defer_pin_returns);
                 try held_blocks.append(self.backend.allocator, retained);
                 if (self.source_result_retention.len != 0) self.source_result_retention[source_index] = .pinned;
                 return true;

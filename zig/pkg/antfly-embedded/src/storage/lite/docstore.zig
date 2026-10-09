@@ -5926,3 +5926,84 @@ test "lite budget allocator accounts concurrent allocation resize and cleanup" {
     try std.testing.expect(budget.peak > 0);
     try std.testing.expect(budget.alloc_calls >= 4 * 1024);
 }
+
+test "lite snapshot admission preserves original cancellation while the backend lock is held: generation and reader publication" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "bounded-read-publication.aflite");
+    defer a.free(path);
+    var store = try Store.create(a, path, true);
+    defer store.close();
+    // Warm the stable generation so the new reader path doesn't need the
+    // writer mutex. Its other publication locks still obey caller admission.
+    var initial = try Txn.openRead(&store, "");
+    initial.abort();
+    const Lock = enum { generation, reader };
+    const Failure = enum { cancellation, deadline };
+    const Budget = struct {
+        store: *Store,
+        io: std.Io,
+        lock: Lock,
+        failure: Failure,
+        rejected: bool = false,
+        release: bool = false,
+        held: bool = true,
+        waits: usize = 0,
+        pub fn checkpoint(self: *@This()) !void {
+            if (self.rejected) return switch (self.failure) {
+                .cancellation => error.Canceled,
+                .deadline => error.DeadlineExceeded,
+            };
+        }
+        fn unlock(self: *@This()) void {
+            if (!self.held) return;
+            switch (self.lock) {
+                .generation => self.store.generation_lock.unlock(self.io),
+                .reader => self.store.read_mutex.unlock(self.io),
+            }
+            self.held = false;
+        }
+        pub fn waitForProgress(self: *@This()) !void {
+            self.waits += 1;
+            if (self.release) self.unlock() else self.rejected = true;
+        }
+    };
+    const io = store.file.runtime();
+    inline for (.{ Lock.generation, Lock.reader }) |lock| {
+        inline for (.{ Failure.cancellation, Failure.deadline }) |failure| {
+            for ([_]bool{ false, true }) |release| {
+                var budget: Budget = .{ .store = &store, .io = io, .lock = lock, .failure = failure, .release = release };
+                switch (lock) {
+                    .generation => try std.testing.expect(store.generation_lock.tryLock(io)),
+                    .reader => try std.testing.expect(store.read_mutex.tryLock()),
+                }
+                defer budget.unlock();
+                var adapter = read_admission.Adapter(*Budget){ .budget = &budget };
+                const payload = adapter.payload();
+                const control = read_admission.Port.init(&payload);
+                const result = Txn.openReadWithAdmission(&store, "", control);
+                try std.testing.expectEqual(@as(usize, 1), budget.waits);
+                if (release) {
+                    var read = try result;
+                    try std.testing.expect(!budget.held);
+                    try std.testing.expectEqual(@as(usize, 1), store.read_generation.?.references);
+                    read.abort();
+                } else {
+                    switch (failure) {
+                        .cancellation => try std.testing.expectError(error.Canceled, result),
+                        .deadline => try std.testing.expectError(error.DeadlineExceeded, result),
+                    }
+                    try std.testing.expect(budget.held);
+                    try std.testing.expectEqual(@as(usize, 0), store.read_generation.?.references);
+                }
+                budget.unlock();
+                // No rejected call may retain the shared generation lock or
+                // reader mutex. A fresh original scope can retry immediately.
+                var retry = try Txn.openRead(&store, "");
+                retry.abort();
+                try std.testing.expectEqual(@as(usize, 0), store.read_generation.?.references);
+            }
+        }
+    }
+}
