@@ -20,6 +20,7 @@ const std = @import("std");
 const A = std.mem.Allocator;
 pub const max_claims = 8192;
 pub const max_name_bytes = 256;
+const key_prefix = "\x00\x00__metadata_derived__:sql_relation_names:v1:";
 
 pub const Kind = enum(u8) { table = 1, index = 2, constraint_index = 3 };
 pub const Phase = enum(u8) { reserved = 1, active = 2, retiring = 3 };
@@ -97,7 +98,7 @@ pub const Key = struct {
     pub fn storageKeyAlloc(self: Key, a: A, group_id: u64) ![]u8 {
         try self.validate();
         if (group_id == 0) return error.InvalidCatalogRecord;
-        const prefix = "\x00\x00__metadata_derived__:sql_relation_names:v1:";
+        const prefix = key_prefix;
         const bytes = try a.alloc(u8, prefix.len + 18 + self.name.len);
         @memcpy(bytes[0..prefix.len], prefix);
         std.mem.writeInt(u64, bytes[prefix.len..][0..8], group_id, .big);
@@ -105,6 +106,19 @@ pub const Key = struct {
         std.mem.writeInt(u16, bytes[prefix.len + 16 ..][0..2], @intCast(self.name.len), .big);
         @memcpy(bytes[prefix.len + 18 ..], self.name);
         return bytes;
+    }
+    /// Borrow the logical name from an authenticated effect key. A relation
+    /// record in another group is not an unrelated key: reject cross-group
+    /// ownership effects rather than omitting them from replay validation.
+    pub fn fromStorageKey(bytes: []const u8, group_id: u64) !?Key {
+        if (!std.mem.startsWith(u8, bytes, key_prefix)) return null;
+        const tail = bytes[key_prefix.len..];
+        if (tail.len < 18 or group_id == 0 or std.mem.readInt(u64, tail[0..8], .big) != group_id) return error.InvalidCatalogRecord;
+        const length = std.mem.readInt(u16, tail[16..18], .big);
+        if (tail.len != 18 + @as(usize, length)) return error.InvalidCatalogRecord;
+        const key: Key = .{ .namespace_id = std.mem.readInt(u64, tail[8..16], .big), .name = tail[18..] };
+        try key.validate();
+        return key;
     }
 };
 pub const Claim = struct { key: Key, owner: Owner };
@@ -307,6 +321,18 @@ pub const Plan = struct {
             try txn.putClaim(claim.key, claim.owner);
         }
     }
+    /// Verify a received final cut without synthesizing missing effects. The
+    /// sender's authenticated schema and ownership rows must agree exactly;
+    /// silently repairing replay would hide incompatible producer behavior.
+    pub fn verifyPublished(self: *const Plan, reader: anytype) !void {
+        for (self.after) |claim| {
+            const current = (try reader.getClaim(claim.key)) orelse return error.CatalogGenerationChanged;
+            if (!current.eql(claim.owner)) return error.CatalogGenerationChanged;
+        }
+        for (self.before) |claim| if (!self.after_by_name.contains(claim.key)) {
+            if (try reader.getClaim(claim.key)) |_| return error.CatalogGenerationChanged;
+        };
+    }
 };
 
 /// One metadata transaction may change a table's schema, binding and
@@ -405,6 +431,43 @@ const TestStore = struct {
         return error.InvalidCatalogRecord;
     }
 };
+
+test "catalog relation received cuts verify without repairing stale or omitted effects" {
+    const a = std.testing.allocator;
+    const old = testClaim(2, "old", 7, 1, .index);
+    const next = testClaim(2, "next", 7, 2, .index);
+    var plan = try Plan.init(a, &.{old}, &.{next});
+    defer plan.deinit();
+    var store: TestStore = .{};
+    defer store.rows.deinit(a);
+    try store.putClaim(old.key, old.owner);
+    const writes = store.writes;
+    try std.testing.expectError(error.CatalogGenerationChanged, plan.verifyPublished(&store));
+    try std.testing.expectEqual(writes, store.writes);
+    try store.putClaim(next.key, next.owner);
+    try std.testing.expectError(error.CatalogGenerationChanged, plan.verifyPublished(&store));
+    try store.deleteClaim(old.key);
+    try plan.verifyPublished(&store);
+    var stale = next.owner;
+    stale.schema_digest[0] ^= 1;
+    try store.putClaim(next.key, stale);
+    try std.testing.expectError(error.CatalogGenerationChanged, plan.verifyPublished(&store));
+}
+
+test "catalog relation effect keys decode canonically and reject cross-group records" {
+    const a = std.testing.allocator;
+    const key: Key = .{ .namespace_id = 2, .name = "quoted.index:name" };
+    const encoded = try key.storageKeyAlloc(a, 41);
+    defer a.free(encoded);
+    const decoded = (try Key.fromStorageKey(encoded, 41)).?;
+    try std.testing.expect(Context.eql(.{}, key, decoded));
+    try std.testing.expectError(error.InvalidCatalogRecord, Key.fromStorageKey(encoded, 42));
+    try std.testing.expectError(error.InvalidCatalogRecord, Key.fromStorageKey(encoded[0 .. encoded.len - 1], 41));
+    try std.testing.expectError(error.InvalidCatalogRecord, Key.fromStorageKey(key_prefix, 41));
+    try std.testing.expect((try Key.fromStorageKey("unrelated", 41)) == null);
+    encoded[key_prefix.len + 17] += 1;
+    try std.testing.expectError(error.InvalidCatalogRecord, Key.fromStorageKey(encoded, 41));
+}
 fn testClaim(namespace: u64, name: []const u8, table: u64, version: u32, kind: Kind) Claim {
     return .{ .key = .{ .namespace_id = namespace, .name = name }, .owner = .{ .table_id = table, .schema_version = version, .schema_digest = @splat(@intCast(version)), .kind = kind } };
 }

@@ -33,9 +33,21 @@ pub const Journal = struct {
     parent: ?*Capture = null,
     attached: bool = false,
     started: bool = false,
+    verification_filter: ?struct {
+        group_id: u64,
+        call: *const fn (u64, []const u8) anyerror!bool,
+    } = null,
 
     pub fn init(a: std.mem.Allocator, txn: *Txn) Journal {
         return .{ .txn = txn, .arena = .init(a), .capture = Capture.init(a) };
+    }
+    /// Replay verification needs before images only for authoritative inputs
+    /// and ownership effects, not unrelated status/report payloads. This mode
+    /// cannot perform command rollback: on failure abort the enclosing txn.
+    pub fn initVerification(a: std.mem.Allocator, txn: *Txn, group_id: u64, filter: *const fn (u64, []const u8) anyerror!bool) Journal {
+        var journal = init(a, txn);
+        journal.verification_filter = .{ .group_id = group_id, .call = filter };
+        return journal;
     }
     /// Attach only after the journal reaches its stable address. Detach before
     /// ending the transaction. Abandoning an attached journal requires aborting
@@ -74,6 +86,7 @@ pub const Journal = struct {
         const self: *Journal = @ptrCast(@alignCast(ptr));
         if (!std.mem.startsWith(u8, key, "\x00\x00__metadata__:") and
             !std.mem.startsWith(u8, key, "\x00\x00__metadata_derived__:")) return error.MetadataCommandMutationScope;
+        if (self.verification_filter) |filter| if (!try filter.call(filter.group_id, key)) return;
         if (self.originals.contains(key)) return;
         if (self.originals.count() == max_keys) return error.MetadataCommandTooLarge;
         const before = self.txn.get(key) catch |err| switch (err) {
@@ -103,7 +116,7 @@ pub const Journal = struct {
     /// Restore first-touch values, including earlier commands' pending puts.
     /// An I/O or allocation failure requires aborting the enclosing transaction.
     pub fn rollback(self: *Journal) !void {
-        if (!self.attached) return error.InvalidMetadataCommandJournal;
+        if (!self.attached or self.verification_filter != null) return error.InvalidMetadataCommandJournal;
         self.detach();
         self.txn.mutation_capture = null;
         defer self.txn.mutation_capture = self.parent;

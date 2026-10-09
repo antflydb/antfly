@@ -1451,10 +1451,25 @@ retirement. Strict affected-key classification rejects malformed IDs.
 
 The marker is not installed automatically and is not a serving capability.
 Verified bootstrap/migration must establish the authoritative ownership cut
-before adopting writers. FK publication and restore command envelopes use the
-same admission boundary, but pending-generation name reservations, standalone
-legacy standby/import paths and full distributed publication fault coverage
-still require activation work. No public unqualified index DDL is enabled.
+before adopting writers. Released standalone JSON table-create replay now
+derives ownership from its final binding/topology cut before committing its
+source receipt. A collision leaves table, ranges and receipt unchanged.
+Binary replay on an adopted receiver instead verifies the authenticated
+sender's complete before/after cut: missing claims, retained retired names,
+forged digests, unrelated injected claims, cross-group ownership records and writer-marker
+removal fail closed. It never repairs missing sender effects. Rejected effects
+publish no reader notifications or replay receipt; a valid retry and restart
+retain the exact final cut. Validation point-reads only affected tables/names
+and retains the existing bounded streaming decoder and transaction boundary.
+Replay's verification-only journal copies before-images only for table,
+binding and ownership records, not unrelated status/report payloads. A 256-KiB
+unrelated payload is overwritten under 16-KiB journal allocator headroom;
+filtered journals explicitly reject command-local rollback, requiring outer
+transaction abort on verification failure.
+FK publication and restore command envelopes use the same admission boundary,
+but pending-generation name reservations, initial adoption/checkpoint
+verification and full distributed publication fault coverage still require
+activation work. No public unqualified index DDL is enabled.
 Rebuild/verification from authoritative bindings and table definitions, serving
 capability barriers, authorized point resolution, and DROP/REINDEX integration
 remain required before unqualified index DDL is enabled. The registry must not
