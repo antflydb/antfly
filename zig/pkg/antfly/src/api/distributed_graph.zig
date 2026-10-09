@@ -15726,6 +15726,7 @@ test "distributed graph fans out per-group expand and hydrate with worker io" {
 
         try std.testing.expectEqual(@as(u32, 2), state.expand_calls.load(.monotonic));
         try std.testing.expectEqual(@as(u32, 2), state.hydrate_calls.load(.monotonic));
+        if (capacity != 0) std.debug.print("graph capacity={d} peak expand={d} hydrate={d} operations={d} runnable={d} bytes={d}\n", .{ capacity, state.max_expand_active.load(.monotonic), state.max_hydrate_active.load(.monotonic), scheduler.stats().operations, scheduler.stats().runnable_slots, scheduler.stats().retained_bytes });
         if (capacity == 2) {
             try std.testing.expectEqual(@as(u32, 1), state.max_expand_active.load(.monotonic));
             try std.testing.expectEqual(@as(u32, 1), state.max_hydrate_active.load(.monotonic));
