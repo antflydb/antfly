@@ -1031,6 +1031,116 @@ test "system catalog relation namespace transaction page intents preserve replic
     try std.testing.expect(std.meta.eql(final, try T.state(&recovered)));
 }
 
+test "system catalog relation namespace transaction permanent source conflicts converge and survive recovery" {
+    const a = std.testing.allocator;
+    const r = relation_reconciliation;
+    const group: u64 = 41;
+    const T = struct {
+        fn control(store: *RaftApplyStore, command: relation_control.Command) !void {
+            const bytes = try command.encodeAlloc(a);
+            defer a.free(bytes);
+            try store.applyStandaloneCommand(group, .{ .apply_relation_reconciliation = bytes });
+        }
+        fn snapshot(store: *RaftApplyStore) ![]u8 {
+            var read = try store.store.beginReadTxn();
+            defer read.abort();
+            return store.buildMetadataSnapshotTxn(a, &read, group, null);
+        }
+    };
+    for ([_]usize{ 2, r.max_tables_per_page + 1 }) |count| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const owned = arena.allocator();
+        const root = try std.fmt.allocPrint(owned, ".zig-cache/tmp/{s}/failed-source", .{tmp.sub_path});
+        const peer_root = try std.fmt.allocPrint(owned, ".zig-cache/tmp/{s}/failed-source-peer", .{tmp.sub_path});
+        const identity = "11111111111111111111111111111111".*;
+        const proof: topology_protocol.Activation = .{ .version = topology_protocol.relation_reconciliation_version, .incarnation = identity, .member_count = 1, .membership_fingerprint = @splat(7) };
+        const activation = try std.json.Stringify.valueAlloc(owned, proof, .{});
+        const conflicting_schema =
+            \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"email":{"type":"keyword"}},"additionalProperties":false}}},"relational_indexes":[{"name":"shared_key","keys":[{"column":"email"}]}]}
+        ;
+        // Decimal physical table keys put ID 9 last in the 65-table cut.
+        const last_id: u64 = if (count == 2) 2 else 9;
+        const tables = try owned.alloc(metadata.TableRecord, count);
+        for (tables, 0..) |*table, i| table.* = .{ .table_id = i + 1, .name = try std.fmt.allocPrint(owned, "table_{d}", .{i + 1}), .schema_json = if (i + 1 == 1 or i + 1 == last_id) conflicting_schema else "{}" };
+        var failed: r.State = undefined;
+        {
+            var owner = try RaftApplyStore.init(a, .{ .root_dir = root });
+            defer owner.deinit();
+            var peer = try RaftApplyStore.init(a, .{ .root_dir = peer_root });
+            defer peer.deinit();
+            for ([_]*RaftApplyStore{ &owner, &peer }) |store| {
+                try store.applyStandaloneCommand(group, .{ .initialize_metadata_incarnation = identity });
+                try store.replaceStandaloneCatalog(group, try store.standaloneRevision(), tables, &.{}, "{}");
+                try store.applyStandaloneCommand(group, .{ .activate_topology_protocol = activation });
+                try T.control(store, .{ .adopt = proof });
+                const work = try store.relationReconciliationWork(group);
+                const initial = try r.State.init(group, try r.nextJobId(null), work.epoch.?);
+                try T.control(store, .{ .start = .{ .next = initial } });
+                if (count != 2) try T.control(store, .{ .advance = initial });
+            }
+            const before = (try owner.relationReconciliationWork(group)).current.?;
+            const prior_snapshot = try T.snapshot(&owner);
+            defer a.free(prior_snapshot);
+            const intent = try (relation_control.Command{ .advance = before }).encodeAlloc(a);
+            defer a.free(intent);
+            const frame = try encodeTransitionCommand(a, .{ .apply_relation_reconciliation = intent });
+            defer a.free(frame);
+            const neighbor = try encodeTransitionCommand(a, .{ .upsert_node = .{ .node_id = 99, .role = "data" } });
+            defer a.free(neighbor);
+            try T.control(&owner, .{ .advance = before });
+            var outcome = try MetadataReplayTest.apply(&peer, group, &.{ .{ .term = 1, .index = 1, .data = frame }, .{ .term = 1, .index = 2, .data = frame }, .{ .term = 1, .index = 3, .data = neighbor } });
+            defer outcome.deinit();
+            failed = (try owner.relationReconciliationWork(group)).current.?;
+            var expected = before;
+            expected.failure = .name_conflict;
+            try std.testing.expect(std.meta.eql(expected, failed));
+            try std.testing.expect(std.meta.eql(failed, (try peer.relationReconciliationWork(group)).current.?));
+            try std.testing.expectEqual(@as(u64, if (count == 2) 0 else 64), failed.pass.rows);
+            try std.testing.expectEqual(@as(u64, 3), try peer.durableAppliedIndex(group));
+            try std.testing.expectError(error.CatalogGenerationChanged, T.control(&owner, .{ .advance = before }));
+            for ([_]*RaftApplyStore{ &owner, &peer }) |store| {
+                var read = try store.store.beginReadTxn();
+                defer read.abort();
+                try verifyReconciliationGroupTxn(&read, group);
+                try std.testing.expectEqual(@as(u64, 1), try r.readSourceRevision(&read, group));
+                var buf: [128]u8 = undefined;
+                var candidates: r.CandidateStore(docstore.DocStore.Txn) = .{ .txn = &read, .state = &failed };
+                const last_name = try std.fmt.bufPrint(&buf, "table_{d}", .{last_id});
+                try std.testing.expect(try candidates.getClaim(.{ .namespace_id = system_catalog.default_namespace_id, .name = last_name }) == null);
+            }
+            // A newer snapshot cannot erase a terminal failure for the same
+            // generation, even though its source and partial claims are valid.
+            try std.testing.expectError(error.InvalidMetadataSnapshot, RaftApplyStore.installSnapshotFromRaft(&owner, a, group, 100, prior_snapshot));
+            const snapshot = try T.snapshot(&owner);
+            defer a.free(snapshot);
+            try RaftApplyStore.installSnapshotFromRaft(&peer, a, group, 100, snapshot);
+        }
+        var recovered = try RaftApplyStore.init(a, .{ .root_dir = peer_root });
+        defer recovered.deinit();
+        const work = try recovered.relationReconciliationWork(group);
+        try std.testing.expect(std.meta.eql(failed, work.current.?));
+        var fixed = tables[last_id - 1];
+        fixed.schema_json = "{}";
+        try recovered.applyStandaloneCommand(group, .{ .upsert_table = fixed });
+        const changed = try recovered.relationReconciliationWork(group);
+        try std.testing.expect(changed.epoch.?.revision > failed.epoch.revision);
+        const replacement = try r.State.init(group, try r.nextJobId(&failed), changed.epoch.?);
+        try T.control(&recovered, .{ .start = .{ .next = replacement, .prior = failed } });
+        var steps: usize = 0;
+        while (true) {
+            const current = (try recovered.relationReconciliationWork(group)).current.?;
+            try std.testing.expectEqual(r.FailureReason.none, current.failure);
+            if (current.phase == .ready) break;
+            try T.control(&recovered, .{ .advance = current });
+            steps += 1;
+            try std.testing.expect(steps <= 6);
+        }
+    }
+}
+
 test "system catalog relation namespace transaction replay verification skips unrelated before-image payloads" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -8082,6 +8192,7 @@ pub const RaftApplyStore = struct {
     apply_mutex: std.Io.Mutex = .init,
     active_outcome: ?*CommittedApplyOutcome = null,
     active_relation_page: ?*const relation_reconciliation.Page = null,
+    active_relation_failure: ?*const relation_reconciliation.FailurePlan = null,
     active_relation_garbage: ?*const relation_reconciliation.GarbagePage = null,
     verified_catalog_groups: std.AutoHashMapUnmanaged(u64, void) = .empty,
     read_only: bool = false,
@@ -8854,6 +8965,7 @@ pub const RaftApplyStore = struct {
 
     pub fn applyStandaloneCommand(self: *RaftApplyStore, group_id: u64, command: TransitionCommand) !void {
         var page: ?relation_reconciliation.Page = null;
+        var failure: ?relation_reconciliation.FailurePlan = null;
         defer if (page) |*value| value.deinit();
         var garbage: ?relation_reconciliation.GarbagePage = null;
         defer if (garbage) |*value| value.deinit();
@@ -8861,7 +8973,11 @@ pub const RaftApplyStore = struct {
             const intent = try relation_control.Command.decode(command.apply_relation_reconciliation);
             if (intent == .advance) {
                 if (intent.advance.group_id != group_id) return error.InvalidRelationReconciliationCommand;
-                page = try self.prepareRelationReconciliationPage(self.alloc, intent.advance);
+                page = self.prepareRelationReconciliationPage(self.alloc, intent.advance) catch |err| blk: {
+                    const reason = relation_reconciliation.FailureReason.fromError(err) orelse return err;
+                    failure = .{ .before = intent.advance, .reason = reason };
+                    break :blk null;
+                };
             }
             if (intent == .garbage) {
                 if (intent.garbage.generation.group_id != group_id) return error.InvalidRelationReconciliationCommand;
@@ -8874,6 +8990,9 @@ pub const RaftApplyStore = struct {
         std.debug.assert(self.active_relation_page == null);
         self.active_relation_page = if (page) |*value| value else null;
         defer self.active_relation_page = null;
+        std.debug.assert(self.active_relation_failure == null);
+        self.active_relation_failure = if (failure) |*value| value else null;
+        defer self.active_relation_failure = null;
         std.debug.assert(self.active_relation_garbage == null);
         self.active_relation_garbage = if (garbage) |*value| value else null;
         defer self.active_relation_garbage = null;
@@ -15268,6 +15387,8 @@ pub const RaftApplyStore = struct {
                 const incoming = incoming_reconciliation orelse return error.InvalidMetadataSnapshot;
                 if (local.group_id != group_id or std.mem.order(u8, &incoming.job_id, &local.job_id) == .lt or
                     (std.mem.eql(u8, &incoming.job_id, &local.job_id) and !incoming.epoch.eql(local.epoch))) return error.InvalidMetadataSnapshot;
+                if (std.mem.eql(u8, &incoming.job_id, &local.job_id) and local.failure != .none and
+                    !std.meta.eql(local, incoming)) return error.InvalidMetadataSnapshot;
             }
             if (try stagingGet(&read_txn, root_key)) |bytes| {
                 const local = try relation_reconciliation.Generation.decode(bytes);
@@ -15576,6 +15697,9 @@ pub const RaftApplyStore = struct {
             std.debug.assert(self.active_relation_page == null);
             self.active_relation_page = if (prepared.page) |*page| page else null;
             defer self.active_relation_page = null;
+            std.debug.assert(self.active_relation_failure == null);
+            self.active_relation_failure = if (prepared.failure) |*failure| failure else null;
+            defer self.active_relation_failure = null;
             std.debug.assert(self.active_relation_garbage == null);
             self.active_relation_garbage = if (prepared.garbage) |*page| page else null;
             defer self.active_relation_garbage = null;
@@ -15743,9 +15867,22 @@ pub const RaftApplyStore = struct {
             },
             .advance => |expected| {
                 if (expected.group_id != group_id) return error.InvalidRelationReconciliationCommand;
-                const page = self.active_relation_page orelse return error.CatalogGenerationChanged;
-                if (!std.mem.eql(u8, &(try expected.encode()), &(try page.before.encode()))) return error.CatalogGenerationChanged;
-                try page.apply(txn, try relationSourceEpochTxn(txn, group_id));
+                const epoch = try relationSourceEpochTxn(txn, group_id);
+                if (self.active_relation_failure) |failure| {
+                    if (!std.meta.eql(expected, failure.before)) return error.CatalogGenerationChanged;
+                    try failure.apply(txn, epoch);
+                } else {
+                    const page = self.active_relation_page orelse return error.CatalogGenerationChanged;
+                    if (!std.meta.eql(expected, page.before)) return error.CatalogGenerationChanged;
+                    page.apply(txn, epoch) catch |err| {
+                        // Plan.validate rejects a cross-page name collision
+                        // before any candidate writes. Resource/storage and
+                        // corruption errors must still abort the entire txn.
+                        if (err != error.CatalogAlreadyExists) return err;
+                        const failure: relation_reconciliation.FailurePlan = .{ .before = expected, .reason = .name_conflict };
+                        try failure.apply(txn, epoch);
+                    };
+                }
                 self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = try relation_reconciliation.jobKey(&buf, group_id) });
             },
             .garbage => |expected| {
@@ -15764,6 +15901,7 @@ pub const RaftApplyStore = struct {
         epoch: ?relation_reconciliation.Epoch = null,
         root: ?relation_reconciliation.Generation = null,
         page: ?relation_reconciliation.Page = null,
+        failure: ?relation_reconciliation.FailurePlan = null,
         page_attempted: bool = false,
         garbage: ?relation_reconciliation.GarbagePage = null,
         garbage_intent: ?relation_reconciliation.Retirement = null,
@@ -15851,7 +15989,11 @@ pub const RaftApplyStore = struct {
             result.page = prepareRelationReconciliationPageTxn(self.alloc, &read, expected) catch |err| switch (err) {
                 // Stale or conflicting committed proposals must not poison
                 // the metadata log. Hard corruption and IO/OOM abort apply.
-                error.CatalogGenerationChanged, error.CatalogSourceUntracked, error.CatalogAlreadyExists => null,
+                error.CatalogGenerationChanged, error.CatalogSourceUntracked => null,
+                error.CatalogAlreadyExists, error.CatalogCommandTooLarge => blk: {
+                    result.failure = .{ .before = expected, .reason = relation_reconciliation.FailureReason.fromError(err).? };
+                    break :blk null;
+                },
                 else => return err,
             };
         }

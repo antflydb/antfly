@@ -1646,7 +1646,26 @@ the opaque client/JSON projection through adoption, all empty-catalog phases,
 retirement, GC and reopen, retaining earlier owned cuts across mutations:
 `zig build antfly-storage-owner-test -Dstorage-owner-test-filter='opaque metadata relation reconciliation work'`.
 Observation does not adopt tracking, schedule work or publish a serving root.
-Leader scheduling, durable failure reporting and end-to-end coordinator
+Permanent source conflicts and per-source-row admission limits now record a
+bounded terminal reason in the retained job, without discarding its last
+committed phase/cursor/fingerprints or partially adding the rejected page.
+Each replica derives the failure from its own pinned source; advance intents
+carry no leader-supplied failure claim. Cross-page ownership collisions are
+checked before candidate writes. Failure publication uses the same job/epoch
+CAS and atomic metadata/outbox commit as successful pages. Resource, I/O,
+corruption and stale-generation errors are not reclassified as permanent source
+failures. Failed generations cannot advance or have their reason/progress
+rewritten; authenticated replay and newer snapshot installation retain that
+terminal fence. New generations may reconcile corrected source epochs and
+retire failed partial candidates normally. The unpublished job format is now
+`AFRC02`; no compatibility decoder is added for this PR's unpublished format.
+Pure tests verify stale/failing writes, immutable failure replay, strict reason
+decoding and partial-candidate fingerprints. Native two-replica tests cover
+same-page/cross-page conflicts, duplicate commands with surviving neighbors,
+snapshot downgrade rejection, reopen and successful rebuild after a source fix.
+The opaque storage-owner regression also reads the durable failure through the
+compiled control projection and checks it after reopen.
+Leader scheduling and end-to-end coordinator
 retries remain to be wired. Pending-generation reservation sources, GC scheduling,
 capability barriers and atomic active-root publication still
 precede writer adoption and SQL point resolution. No original SQL case is

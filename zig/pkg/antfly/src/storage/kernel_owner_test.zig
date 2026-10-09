@@ -3641,6 +3641,19 @@ test "opaque metadata relation reconciliation work retains owned cuts across pro
         try std.testing.expect(expected.garbage == null and expected.root == null);
         try std.testing.expect(std.meta.eql(next, expected.current.?));
         try std.testing.expect(retired.garbage != null);
+        const conflicting_schema =
+            \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"email":{"type":"keyword"}},"additionalProperties":false}}},"relational_indexes":[{"name":"shared_key","keys":[{"column":"email"}]}]}
+        ;
+        try store.applyStandaloneCommand(group, .{ .upsert_table = .{ .table_id = 1, .name = "one", .schema_json = conflicting_schema } });
+        try store.applyStandaloneCommand(group, .{ .upsert_table = .{ .table_id = 2, .name = "two", .schema_json = conflicting_schema } });
+        const changed = try store.relationReconciliationWork(group);
+        const attempt = try r.State.init(group, try r.nextJobId(&next), changed.epoch.?);
+        try T.apply(&store, .{ .start = .{ .next = attempt, .prior = next } });
+        try T.apply(&store, .{ .advance = attempt });
+        expected = try store.relationReconciliationWork(group);
+        try std.testing.expectEqual(r.FailureReason.name_conflict, expected.current.?.failure);
+        try std.testing.expectEqual(@as(u64, 0), expected.current.?.pass.claims);
+        try std.testing.expect(std.meta.eql(next, changed.current.?));
     }
     var recovered = try metadata_apply_client.RaftApplyStore.init(a, .{ .root_dir = path, .no_sync = true });
     defer recovered.deinit();

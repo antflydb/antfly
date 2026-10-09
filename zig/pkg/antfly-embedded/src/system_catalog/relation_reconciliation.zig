@@ -37,6 +37,20 @@ pub const Epoch = struct {
     }
 };
 pub const Phase = enum(u8) { building = 1, verifying_source = 2, verifying_candidate = 3, ready = 4 };
+/// Permanent for this exact source epoch, not a resource/transport failure.
+/// Retain the phase/cursor/totals so recovery can verify partial candidates.
+pub const FailureReason = enum(u8) {
+    none = 0,
+    name_conflict = 1,
+    source_limit = 2,
+    pub fn fromError(err: anyerror) ?FailureReason {
+        return switch (err) {
+            error.CatalogAlreadyExists => .name_conflict,
+            error.CatalogCommandTooLarge => .source_limit,
+            else => null,
+        };
+    }
+};
 /// Generation IDs are big-endian monotonic counters, allocated by CAS from
 /// the retained current job. They are never recycled, including after GC.
 pub const Generation = struct {
@@ -127,6 +141,7 @@ pub const State = struct {
     job_id: [16]u8,
     epoch: Epoch,
     phase: Phase = .building,
+    failure: FailureReason = .none,
     cursor_len: u16 = 0,
     cursor_bytes: [max_cursor_bytes]u8 = @splat(0),
     expected: Totals = .{},
@@ -147,6 +162,7 @@ pub const State = struct {
         @memcpy(self.cursor_bytes[0..bytes.len], bytes);
     }
     fn validate(self: *const State) !void {
+        if (self.phase == .ready and self.failure != .none) return error.InvalidCatalogRecord;
         if (self.group_id == 0 or std.mem.allEqual(u8, &self.job_id, 0) or
             std.mem.allEqual(u8, &self.epoch.incarnation, 0) or self.cursor_len > max_cursor_bytes or
             !std.mem.allEqual(u8, self.cursor_bytes[self.cursor_len..], 0)) return error.InvalidCatalogRecord;
@@ -158,14 +174,14 @@ pub const State = struct {
         if (self.phase != .building and self.pass.claims > self.expected.claims) return error.InvalidCatalogRecord;
         if (self.phase == .ready and (self.cursor_len != 0 or !totalsEqual(self.pass, .{}))) return error.InvalidCatalogRecord;
     }
-    const magic = "AFRC01";
-    pub const encoded_len = magic.len + 8 + 16 + 16 + 8 + 1 + 2 + max_cursor_bytes + 2 * (8 + 8 + 32 + 32);
+    const magic = "AFRC02";
+    pub const encoded_len = magic.len + 8 + 16 + 16 + 8 + 2 + 2 + max_cursor_bytes + 2 * (8 + 8 + 32 + 32);
     pub fn encode(self: *const State) ![encoded_len]u8 {
         try self.validate();
         var out: [encoded_len]u8 = undefined;
         @memcpy(out[0..magic.len], magic);
         var offset: usize = magic.len;
-        inline for (.{ self.group_id, self.job_id, self.epoch.incarnation, self.epoch.revision, @as(u8, @backingInt(self.phase)), self.cursor_len, self.cursor_bytes, self.expected.rows, self.expected.claims, self.expected.source_hash, self.expected.claim_hash, self.pass.rows, self.pass.claims, self.pass.source_hash, self.pass.claim_hash }) |value| {
+        inline for (.{ self.group_id, self.job_id, self.epoch.incarnation, self.epoch.revision, @as(u8, @backingInt(self.phase)), @as(u8, @backingInt(self.failure)), self.cursor_len, self.cursor_bytes, self.expected.rows, self.expected.claims, self.expected.source_hash, self.expected.claim_hash, self.pass.rows, self.pass.claims, self.pass.source_hash, self.pass.claim_hash }) |value| {
             const T = @TypeOf(value);
             const size = @sizeOf(T);
             switch (@typeInfo(T)) {
@@ -181,8 +197,9 @@ pub const State = struct {
         if (bytes.len != encoded_len or !std.mem.eql(u8, bytes[0..magic.len], magic)) return error.InvalidCatalogRecord;
         var out: State = undefined;
         var phase: u8 = undefined;
+        var failure: u8 = undefined;
         var offset: usize = magic.len;
-        inline for (.{ &out.group_id, &out.job_id, &out.epoch.incarnation, &out.epoch.revision, &phase, &out.cursor_len, &out.cursor_bytes, &out.expected.rows, &out.expected.claims, &out.expected.source_hash, &out.expected.claim_hash, &out.pass.rows, &out.pass.claims, &out.pass.source_hash, &out.pass.claim_hash }) |ptr| {
+        inline for (.{ &out.group_id, &out.job_id, &out.epoch.incarnation, &out.epoch.revision, &phase, &failure, &out.cursor_len, &out.cursor_bytes, &out.expected.rows, &out.expected.claims, &out.expected.source_hash, &out.expected.claim_hash, &out.pass.rows, &out.pass.claims, &out.pass.source_hash, &out.pass.claim_hash }) |ptr| {
             const T = @typeInfo(@TypeOf(ptr)).pointer.child;
             const size = @sizeOf(T);
             ptr.* = switch (@typeInfo(T)) {
@@ -193,6 +210,7 @@ pub const State = struct {
             offset += size;
         }
         out.phase = std.enums.fromInt(Phase, phase) orelse return error.InvalidCatalogRecord;
+        out.failure = std.enums.fromInt(FailureReason, failure) orelse return error.InvalidCatalogRecord;
         try out.validate();
         return out;
     }
@@ -496,6 +514,7 @@ pub fn ReplayVerifier(comptime Before: type, comptime After: type) type {
                 const next = current orelse return error.InvalidCatalogRecord;
                 if (prior.group_id != group or std.mem.order(u8, &prior.job_id, &next.job_id) == .gt) return error.InvalidCatalogRecord;
                 if (std.mem.eql(u8, &prior.job_id, &next.job_id)) {
+                    if (prior.failure != .none and !std.meta.eql(prior, next)) return error.InvalidCatalogRecord;
                     if (!prior.epoch.eql(next.epoch) or @backingInt(next.phase) < @backingInt(prior.phase)) return error.InvalidCatalogRecord;
                     if (prior.phase != .building and !totalsEqual(prior.expected, next.expected)) return error.InvalidCatalogRecord;
                     if (prior.phase == next.phase and (next.pass.rows < prior.pass.rows or next.pass.claims < prior.pass.claims or
@@ -617,7 +636,7 @@ pub fn ReplayVerifier(comptime Before: type, comptime After: type) type {
 /// Replacement atomically retires the old candidate; errors require abort.
 pub fn start(txn: anytype, state: *const State, current_epoch: Epoch, prior: ?[]const u8) !void {
     try checkEpoch(state, current_epoch);
-    if (state.phase != .building or state.cursor_len != 0 or !totalsEqual(state.pass, .{})) return error.InvalidCatalogRecord;
+    if (state.failure != .none or state.phase != .building or state.cursor_len != 0 or !totalsEqual(state.pass, .{})) return error.InvalidCatalogRecord;
     var buf: [128]u8 = undefined;
     const key = try jobKey(&buf, state.group_id);
     const found = txn.get(key) catch |err| blk: {
@@ -650,6 +669,24 @@ pub fn start(txn: anytype, state: *const State, current_epoch: Epoch, prior: ?[]
 }
 
 pub const SourceRow = struct { key: []const u8, table_id: u64, claims: []const names.Claim };
+/// Derived locally from a permanent source error, never accepted as a leader
+/// assertion. Recording it changes only the job record in the caller's txn.
+/// Stale epochs/CAS and all write errors require the caller to abort.
+pub const FailurePlan = struct {
+    before: State,
+    reason: FailureReason,
+    pub fn apply(self: *const FailurePlan, txn: anytype, epoch: Epoch) !void {
+        try checkEpoch(&self.before, epoch);
+        if (self.reason == .none or self.before.phase == .ready) return error.InvalidCatalogRecord;
+        var buf: [128]u8 = undefined;
+        const key = try jobKey(&buf, self.before.group_id);
+        const found = (try optionalGet(txn, key)) orelse return error.CatalogGenerationChanged;
+        if (!std.mem.eql(u8, &(try self.before.encode()), found)) return error.CatalogGenerationChanged;
+        var after = self.before;
+        after.failure = self.reason;
+        try txn.put(key, &(try after.encode()));
+    }
+};
 pub const CandidateRow = struct { key: []const u8, value: []const u8 };
 /// An exclusive lexical cursor is committed with every deletion page, so LSM
 /// tombstones preceding it are not repeatedly traversed after churn/restart.
@@ -912,7 +949,7 @@ fn CandidateWriter(comptime Txn: type) type {
 }
 fn checkEpoch(state: *const State, epoch: Epoch) !void {
     try state.validate();
-    if (!state.epoch.eql(epoch)) return error.CatalogGenerationChanged;
+    if (state.failure != .none or !state.epoch.eql(epoch)) return error.CatalogGenerationChanged;
 }
 fn totalsEqual(left: Totals, right: Totals) bool {
     return left.rows == right.rows and left.claims == right.claims and std.mem.eql(u8, &left.source_hash, &right.source_hash) and std.mem.eql(u8, &left.claim_hash, &right.claim_hash);
@@ -1001,11 +1038,75 @@ test "relation reconciliation binary state rejects unknown and noncanonical byte
     bad[6 + 8 + 16 + 16 + 8] = 99;
     try std.testing.expectError(error.InvalidCatalogRecord, State.decode(&bad));
     bad = encoded;
-    bad[6 + 8 + 16 + 16 + 8 + 1 + 2] = 1;
+    bad[6 + 8 + 16 + 16 + 8 + 2 + 2] = 1;
+    try std.testing.expectError(error.InvalidCatalogRecord, State.decode(&bad));
+    bad = encoded;
+    bad[6 + 8 + 16 + 16 + 8 + 1] = 99;
     try std.testing.expectError(error.InvalidCatalogRecord, State.decode(&bad));
     try std.testing.expectError(error.InvalidCatalogRecord, State.decode(encoded[0 .. encoded.len - 1]));
     try std.testing.expectError(error.InvalidCatalogRecord, State.init(0, @splat(3), test_epoch));
     try std.testing.expectError(error.InvalidCatalogRecord, State.init(41, @splat(0), test_epoch));
+}
+
+test "relation reconciliation permanent failure is fenced terminal and retains verifiable candidates" {
+    const a = std.testing.allocator;
+    var txn = TestTxn.init();
+    defer txn.deinit();
+    const initial = try State.init(41, try nextJobId(null), test_epoch);
+    try start(&txn, &initial, test_epoch, null);
+    var source: TestSource = .{ .rows = &test_rows };
+    var page = try Page.prepareSource(a, initial, test_epoch, &source);
+    defer page.deinit();
+    try page.apply(&txn, test_epoch);
+    const failure: FailurePlan = .{ .before = page.after, .reason = .name_conflict };
+    var moved = test_epoch;
+    moved.revision += 1;
+    try std.testing.expectError(error.CatalogGenerationChanged, failure.apply(&txn, moved));
+    const stale: FailurePlan = .{ .before = initial, .reason = .name_conflict };
+    try std.testing.expectError(error.CatalogGenerationChanged, stale.apply(&txn, test_epoch));
+    const Fault = struct {
+        base: *TestTxn,
+        pub fn get(self: *@This(), key: []const u8) ![]const u8 {
+            return self.base.get(key);
+        }
+        pub fn put(_: *@This(), _: []const u8, _: []const u8) !void {
+            return error.InjectedWriteFailure;
+        }
+    };
+    var fault: Fault = .{ .base = &txn };
+    try std.testing.expectError(error.InjectedWriteFailure, failure.apply(&fault, test_epoch));
+    var buf: [128]u8 = undefined;
+    const key = try jobKey(&buf, 41);
+    try std.testing.expectEqualSlices(u8, &(try page.after.encode()), try txn.get(key));
+    try failure.apply(&txn, test_epoch);
+    const failed = try State.decode(try txn.get(key));
+    var expected = page.after;
+    expected.failure = .name_conflict;
+    try std.testing.expect(std.meta.eql(expected, failed));
+    try std.testing.expectError(error.CatalogGenerationChanged, failure.apply(&txn, test_epoch));
+    try std.testing.expectError(error.CatalogGenerationChanged, Page.prepareSource(a, failed, test_epoch, &source));
+    var verifier = try Verifier(TestTxn).init(&txn, 41);
+    var entries = txn.values.iterator();
+    while (entries.next()) |entry| try verifier.feed(entry.key_ptr.*, entry.value_ptr.*);
+    try verifier.finish();
+    var cleared = TestTxn.init();
+    defer cleared.deinit();
+    entries = txn.values.iterator();
+    while (entries.next()) |entry| try cleared.put(entry.key_ptr.*, entry.value_ptr.*);
+    try cleared.put(key, &(try page.after.encode()));
+    {
+        var replay = try ReplayVerifier(TestTxn, TestTxn).init(a, &cleared, &txn, 41);
+        defer replay.deinit();
+        try replay.feed(key);
+        try replay.finish();
+    }
+    try std.testing.expectError(error.InvalidCatalogRecord, ReplayVerifier(TestTxn, TestTxn).init(a, &txn, &cleared, 41));
+    const successor = try State.init(41, try nextJobId(&failed), moved);
+    try start(&txn, &successor, moved, &(try failed.encode()));
+    try std.testing.expectEqual(FailureReason.none, (try State.decode(try txn.get(key))).failure);
+    for ([_]anyerror{ error.OutOfMemory, error.InputOutput, error.InvalidCatalogRecord, error.CatalogGenerationChanged }) |err|
+        try std.testing.expect(FailureReason.fromError(err) == null);
+    try std.testing.expectEqual(FailureReason.source_limit, FailureReason.fromError(error.CatalogCommandTooLarge).?);
 }
 
 test "relation reconciliation requires source and independent candidate verification" {

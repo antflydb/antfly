@@ -87,7 +87,7 @@ pub const Command = union(enum(u8)) {
 
 fn validateAdvance(state: r.State) !void {
     _ = try state.encode();
-    if (state.phase == .ready or state.epoch.revision == 0) return error.InvalidRelationReconciliationCommand;
+    if (state.failure != .none or state.phase == .ready or state.epoch.revision == 0) return error.InvalidRelationReconciliationCommand;
 }
 fn validateActivation(proof: protocol.Activation) !void {
     if (proof.version != protocol.relation_reconciliation_version or proof.member_count == 0 or
@@ -95,7 +95,7 @@ fn validateActivation(proof: protocol.Activation) !void {
 }
 fn validateStart(next: r.State, prior: ?r.State) !void {
     _ = try next.encode();
-    if (next.phase != .building or next.cursor_len != 0 or next.pass.rows != 0 or next.pass.claims != 0 or
+    if (next.failure != .none or next.phase != .building or next.cursor_len != 0 or next.pass.rows != 0 or next.pass.claims != 0 or
         !std.mem.allEqual(u8, &next.pass.source_hash, 0) or !std.mem.allEqual(u8, &next.pass.claim_hash, 0)) return error.InvalidRelationReconciliationCommand;
     if (prior) |state| {
         _ = try state.encode();
@@ -130,6 +130,13 @@ test "system catalog relation namespace transaction coordinator intents are boun
     var untracked = state;
     untracked.epoch.revision = 0;
     try std.testing.expectError(error.InvalidRelationReconciliationCommand, (Command{ .advance = untracked }).encodeAlloc(a));
+    var failed = state;
+    failed.failure = .name_conflict;
+    try std.testing.expectError(error.InvalidRelationReconciliationCommand, (Command{ .advance = failed }).encodeAlloc(a));
+    try std.testing.expectError(error.InvalidRelationReconciliationCommand, (Command{ .start = .{ .next = failed } }).encodeAlloc(a));
+    const replacement = try (Command{ .start = .{ .next = next, .prior = failed } }).encodeAlloc(a);
+    defer a.free(replacement);
+    try std.testing.expect(std.meta.eql(failed, (try Command.decode(replacement)).start.prior.?));
     const Fault = struct {
         fn run(alloc: std.mem.Allocator, command: Command) !void {
             const bytes = try command.encodeAlloc(alloc);
